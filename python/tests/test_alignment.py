@@ -161,3 +161,41 @@ def test_block_scaled_chunks_need_an_aligned_scale_tensor_too(tr):
     assert flags(y.split([3, 5], axis=0)) == [True, False]  # data 96 B (ok) but scales 6 B
     assert flags(y.split([8], axis=0)) == [True]
     assert flags(tr.val(Tensor[16, 64, packed]).split([8, 8], axis=0)) == [True, True]  # scales 16 B
+
+
+# Splitting along the blocked axis itself: a chunk that starts `before` elements in has its scales at
+# element cdiv(before, block) of the scale tensor, not at `before`.
+@pytest.mark.parametrize(
+    "dtype,shape,axis,sizes,expected",
+    [
+        # e4m3 data (1 byte) with 1 byte scales, block 32 along the last axis of a single row
+        (BlockScaled(e4m3, ue8m0, 32), (1, 1024), 1, [32, 992], [True, False]),  # data 32 B, scales 1 B
+        (BlockScaled(e4m3, ue8m0, 32), (1, 1024), 1, [64, 960], [True, False]),  # data 64 B, scales 2 B
+        (BlockScaled(e4m3, ue8m0, 32), (1, 1024), 1, [256, 768], [True, False]),  # data 256 B, scales 8 B
+        (BlockScaled(e4m3, ue8m0, 32), (1, 1024), 1, [512, 512], [True, True]),  # data 512 B, scales 16 B
+        (BlockScaled(e4m3, ue8m0, 32), (1, 1024), 1, [512, 256, 256], [True, True, False]),  # scales 16 B, then 24 B
+        # the same on a rank-1 tensor with a non-negative blocked axis
+        (BlockScaled(e4m3, ue8m0, 32, axis=0), (1024,), 0, [32, 992], [True, False]),
+        (BlockScaled(e4m3, ue8m0, 32, axis=0), (1024,), 0, [512, 512], [True, True]),
+        # e2m1 data packs two elements per byte: 32 elements are 16 B of data but still 1 B of scales
+        (BlockScaled(e2m1, ue8m0, 32), (1, 1024), 1, [32, 992], [True, False]),
+        (BlockScaled(e2m1, ue8m0, 32), (1, 1024), 1, [512, 512], [True, True]),  # data 256 B, scales 16 B
+        # a larger block moves the scale offset further down
+        (BlockScaled(e4m3, ue8m0, 128), (1, 2048), 1, [512, 1536], [True, False]),  # data 512 B, scales 4 B
+        (BlockScaled(e4m3, ue8m0, 128), (1, 2048), 1, [1024, 1024], [True, False]),  # data 1024 B, scales 8 B
+    ],
+)
+def test_splitting_along_the_blocked_axis_aligns_the_scale_tensor_by_blocks_not_elements(tr, dtype, shape, axis, sizes, expected):
+    x = tr.val(Tensor[(*shape, dtype)])
+    chunks = x.split(sizes, axis=axis)
+    assert flags(chunks) == expected
+
+
+def test_a_blocked_axis_chunk_with_aligned_data_but_misaligned_scales_is_a_view(tr):
+    mx = BlockScaled(e4m3, ue8m0, 32)
+    first, second = tr.val(Tensor[1, 1024, mx]).split([32, 992], axis=1)
+    # `second` starts 32 data bytes in (aligned) but at scale byte 1 (not aligned): counting scale
+    # elements as data elements (a scale offset of 32 instead of cdiv(32, 32) = 1) would call it aligned
+    assert first.type.contiguous
+    assert not second.type.contiguous and second.type == Tensor[1, 992, mx].as_view()
+    assert second.type.shape[1] == 992
