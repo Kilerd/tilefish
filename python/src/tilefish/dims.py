@@ -138,6 +138,8 @@ class DimExpr:
                 out.add(atom)
             elif isinstance(atom, _CDiv):
                 out |= atom.num.free_dims() | atom.den.free_dims()
+            elif isinstance(atom, _NextPow2):
+                out |= atom.arg.free_dims()
         return frozenset(out)
 
     def named_dims(self) -> "dict[str, Dim]":
@@ -400,6 +402,36 @@ class _CDiv(DimExpr):
         return f"cdiv({self.num}, {self.den})"
 
 
+class _NextPow2(DimExpr):
+    """The smallest power of two that is at least ``arg``, when ``arg`` is not static.
+
+    It exists so a lowered kernel's ``BLOCK`` constexpr can be derived from a bucketed
+    dimension: a bucket spec substitutes the bucket and gets a static value (see ``next_pow2``).
+    """
+
+    __slots__ = ("arg",)
+
+    def __init__(self, arg: DimExpr) -> None:
+        object.__setattr__(self, "arg", arg)
+        object.__setattr__(self, "_terms", ((self, 1),))
+        object.__setattr__(self, "_const", 0)
+
+    def __reduce__(self) -> Any:
+        return (_NextPow2, (self.arg,))
+
+    def _atom_key(self) -> tuple:
+        return ("next_pow2", self.arg._key)
+
+    def _atom_divisor(self, known: "Mapping[DimExpr, int] | None") -> int:
+        return (known or {}).get(self, 1)
+
+    def _subst_atom(self, mapping: "Mapping[Dim, Any]") -> DimExpr:
+        return as_dim(next_pow2(self.arg.subst(mapping)))
+
+    def __str__(self) -> str:
+        return f"next_pow2({self.arg})"
+
+
 class Dim(DimExpr):
     """A named dimension.
 
@@ -556,6 +588,18 @@ def cdiv(a: Any, b: Any) -> Any:
         if k is not None:
             return DimExpr.const(k)
     return _CDiv(da, db)
+
+
+def next_pow2(x: Any) -> Any:
+    """The smallest power of two that is at least ``x`` (an int gives an int; a symbolic dimension stays symbolic)."""
+    if _is_int(x):
+        if x < 1:
+            raise TilefishTypeError(f"next_pow2: expected a positive int, got {x}")
+        return 1 << (x - 1).bit_length()
+    d = as_dim(x).folded()
+    if d.is_static:
+        return DimExpr.const(next_pow2(d.value))
+    return _NextPow2(d)
 
 
 def dim_text(d: DimExpr) -> str:
