@@ -39,9 +39,13 @@ carries the largest power of two (up to 1024) the factors prove between them.
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
 
-Both templates: offsets are ``i32`` (a tensor must have fewer than 2**31 elements), no loops, no
-strides (a View, a ``split`` or a call to a declared operator is rejected), ``num_stages = 3``
-in the spec (irrelevant without loops).
+Both templates: offsets are ``i32``, so a tensor may have at most ``2**31 - 1`` elements. A tensor
+that provably has more is rejected (rule ``index-range``; the largest bucket of a bucketed
+dimension counts, and every dimension is at least 1). A tensor whose size has no static bound
+(a dynamic dimension) gets a ``max_elements`` precondition in every spec, holding the argument,
+its shape and the bound, which a host checks at launch; a tensor that is statically small gets
+none. The generated code is the same either way. No loops, no strides (a View, a ``split`` or a
+call to a declared operator is rejected), ``num_stages = 3`` in the spec (irrelevant without loops).
 
 Parameters of the generated function, in this order: the kernel's own parameters under their own
 names (tensors are pointers, ``const`` parameters are ``tl.constexpr`` with the declared default
@@ -49,6 +53,18 @@ as the spec's constant, runtime dimension parameters are ``i32``), one output po
 value (``out``, or ``out0``, ``out1``, ... for several), then the template's parameters. A
 generated name that collides with a kernel parameter is suffixed (``mask_1``). Constexpr values come
 from the spec (``compile_specs(lowered.extern)``), not from defaults in the source.
+
+A kernel parameter whose name the generated module itself uses (``tl``, ``triton``, ``float``) or
+that Triton's JIT launcher takes as a launch option (``grid``, ``warmup``, ``debug``, ``num_warps``,
+``num_stages``, ``num_ctas``, ``maxnreg``) is renamed with a numeric suffix (``tl_1``), in the
+generated function, the extern stub and every spec alike: a spec's signature must name the
+function's own parameters, so the spec cannot keep the original name. The module header says which
+parameter became which; every other parameter keeps its name.
+
+The elementwise ``n`` is recorded in the spec as ``count_of``: the tensor argument whose element
+count (the product of its shape entries) the scalar carries, so a host computes it without knowing
+the kernel. When the product is affine the scalar's ``dim`` is that product (the spec validator
+checks it); otherwise ``dim`` is a fresh name and ``count_of`` is the only definition.
 
 Numerics contract
 -----------------
@@ -117,6 +133,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from ._specvalid import MAX_ELEMENTS
 from .aot import CompileSpec, compile_specs
 from .decorators import ExternOp, KernelOp
 from .dims import Dim, DimExpr, as_dim, cdiv, next_pow2
@@ -135,6 +152,10 @@ NUM_STAGES = 3
 NUM_WARPS = (1, 2, 4, 8, 16, 32)
 DEFAULT_MODULE = "tilefish_generated"
 TEMPLATES = ("elementwise", "row")
+INDEX_MAX = MAX_ELEMENTS  # offsets are i32: a tensor has at most 2**31 - 1 elements
+# Names a kernel parameter cannot keep in the generated function: what the module itself uses, and what
+# Triton's JIT launcher takes as launch options (a parameter of that name could not be passed by keyword).
+_RESERVED = frozenset({"tl", "triton", "float", "grid", "warmup", "debug", "num_warps", "num_stages", "num_ctas", "maxnreg"})
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")  # ASCII only, like the identifiers a compile spec accepts
 _MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
@@ -253,6 +274,65 @@ def _shape_text(shape: "Iterable[DimExpr]") -> str:
     return "[" + ", ".join(str(d) for d in shape) + "]"
 
 
+# -- how many elements a tensor can have ---------------------------------------------------------------
+
+
+def _atom_bounds(atom: DimExpr) -> "tuple[int, int | None]":
+    """Smallest and largest value of a symbolic dimension (``None``: no upper bound). Dimensions are positive."""
+    if isinstance(atom, Dim):
+        if atom.buckets:
+            return min(atom.buckets), max(atom.buckets)  # a binary exists for these sizes only
+        return (atom.divisible_by or 1), None
+    num, den = getattr(atom, "num", None), getattr(atom, "den", None)
+    if num is None or den is None:  # pragma: no cover - the other atoms never appear in a shape
+        return 1, None
+    n_lo, n_hi = _bounds(num)
+    d_lo, d_hi = _bounds(den)
+    lo = max(1, -(-n_lo // d_hi)) if d_hi else 1
+    return lo, (None if n_hi is None else -(-n_hi // max(d_lo, 1)))  # cdiv
+
+
+def _bounds(d: DimExpr) -> "tuple[int, int | None]":
+    """Interval of an affine dimension expression: ``(lowest, highest or None)``."""
+    d = d.folded()
+    lo: "int | None" = d.offset
+    hi: "int | None" = d.offset
+    for atom, coef in d.terms:
+        a_lo, a_hi = _atom_bounds(atom)
+        if coef > 0:
+            lo_t, hi_t = coef * a_lo, None if a_hi is None else coef * a_hi
+        else:
+            lo_t, hi_t = (None if a_hi is None else coef * a_hi), coef * a_lo
+        lo = None if lo is None or lo_t is None else lo + lo_t
+        hi = None if hi is None or hi_t is None else hi + hi_t
+    return (1 if lo is None else max(1, lo)), hi
+
+
+def _numel_bounds(shape: "Iterable[DimExpr]") -> "tuple[int, int | None]":
+    """Fewest and most elements a tensor of this shape can have (``None``: unbounded)."""
+    lo = 1
+    hi: "int | None" = 1
+    for d in shape:
+        d_lo, d_hi = _bounds(d)
+        lo *= d_lo
+        hi = None if hi is None or d_hi is None else hi * d_hi
+    return lo, hi
+
+
+def _check_index_range(name: str, values: "list[Value]") -> None:
+    """Reject a tensor that has more elements than i32 offsets reach, whatever the dynamic sizes are."""
+    for v in values:
+        lo, hi = _numel_bounds(v.type.shape)
+        if lo > INDEX_MAX or (hi is not None and hi > INDEX_MAX):
+            what = f"{lo} elements" if lo == hi else f"at least {lo} elements" if lo > INDEX_MAX else f"up to {hi} elements (its largest bucket)"
+            raise _fail(
+                name,
+                None,
+                "index-range",
+                f"{_label(v)} has {what}, more than the {INDEX_MAX} that the i32 offsets of a generated kernel reach",
+            )
+
+
 # -- checks that do not depend on the template --------------------------------------------------
 
 
@@ -306,6 +386,7 @@ def _check_common(op: KernelOp) -> None:
     for v in graph.outputs:
         if not v.type.contiguous:
             raise _fail(name, None, "view-value", f"the returned {_label(v)} is a View; strided views are not lowered")
+    _check_index_range(name, _all_values(graph))
 
 
 def _check_node_dtypes(kernel: str, n: Node) -> None:
@@ -707,9 +788,9 @@ def _grid_text(grid: "tuple[DimExpr, ...]") -> str:
 # -- code generation ------------------------------------------------------------------------------
 
 
-def _scalar_text(s: Scalar) -> str:
+def _scalar_text(s: Scalar, rename: "dict[str, str]") -> str:
     if s.name is not None:
-        return s.name
+        return rename.get(s.name, s.name)
     v = s.value
     if isinstance(v, float):
         if math.isnan(v):
@@ -727,11 +808,14 @@ def _is_self_store(n: Node) -> bool:
 class _Body:
     """Emits the statements of the kernel body, one local per SSA value."""
 
-    def __init__(self, op: KernelOp, layout: _Layout, names: _Names, out_names: "list[str]") -> None:
+    def __init__(
+        self, op: KernelOp, layout: _Layout, names: _Names, out_names: "list[str]", rename: "dict[str, str]"
+    ) -> None:
         self.graph = op.graph
         self.layout = layout
         self.names = names
         self.out_names = out_names
+        self.rename = rename  # kernel parameter name -> its name in the generated function, where they differ
         self.params = {p.name: p for p in op.graph.inputs}
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
@@ -746,7 +830,7 @@ class _Body:
         self.lines.append(f"    {text}" + (f"  # {comment}" if comment else ""))
 
     def operand(self, x: "Value | Scalar") -> str:
-        return self.var[x] if isinstance(x, Value) else _scalar_text(x)
+        return self.var[x] if isinstance(x, Value) else _scalar_text(x, self.rename)
 
     def run(self) -> "list[str]":
         graph, layout = self.graph, self.layout
@@ -767,7 +851,7 @@ class _Body:
             if p.access != "out" and p in reads:
                 v = self.local()
                 self.var[p] = v
-                self.emit(f"{v} = {layout.load(p.name, p)}", p.name)
+                self.emit(f"{v} = {layout.load(self.rename.get(p.name, p.name), p)}", p.name)
         for n in graph.nodes:
             if n.op == "store":
                 self.store(n, last_store)
@@ -793,7 +877,7 @@ class _Body:
             self.emit(f"# {label} {name}: stored onto itself, nothing to write")
         elif last_store[name] is n:
             what = "final version" if param.access == "inout" else "written once"
-            self.emit(self.layout.store(name, param, self.var[value]), f"{label} {name}, {what}")
+            self.emit(self.layout.store(self.rename.get(name, name), param, self.var[value]), f"{label} {name}, {what}")
         else:
             self.emit(f"# {label} {name}: superseded by a later store")
 
@@ -892,7 +976,9 @@ def lower(
 def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warps: "int | None") -> LoweredKernel:
     graph = op.graph
     user = list(op.signature.params)
-    names = _Names({p.name for p in user} | {"tl", "triton", "float"})
+    names = _Names({p.name for p in user} | _RESERVED)
+    # a kernel parameter that has the name of something the generated module uses would shadow it
+    rename = {p.name: names.fresh(p.name) for p in user if p.name in _RESERVED}
     out_names = (
         [names.fresh("out")] if len(graph.outputs) == 1 else [names.fresh(f"out{k}") for k in range(len(graph.outputs))]
     )
@@ -912,21 +998,31 @@ def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warp
     # the parameters of the generated function and of its typed stub, in order
     decls: list[str] = []
     params: list[Param] = []
+    max_elements: dict[str, int] = {}  # tensors whose size no static bound keeps within i32 offsets
     for p in user:
-        params.append(_reindexed(p, len(params)))
-        decls.append(f"{p.name}: tl.constexpr" if p.kind == "const" else p.name)
+        new = rename.get(p.name, p.name)
+        params.append(_reindexed(p, len(params), new))
+        decls.append(f"{new}: tl.constexpr" if p.kind == "const" else new)
+        if p.kind == "tensor" and _numel_bounds(p.type.shape)[1] is None:  # type: ignore[union-attr]
+            max_elements[new] = INDEX_MAX
     for k, v in enumerate(graph.outputs):
         params.append(Param(out_names[k], len(params), "tensor", "out", type=v.type))
         decls.append(out_names[k])
+        if _numel_bounds(v.type.shape)[1] is None:
+            max_elements[out_names[k]] = INDEX_MAX
     for e in extras:
-        params.append(_reindexed(e.param, len(params)))
+        params.append(_reindexed(e.param, len(params), e.param.name))
         decls.append(f"{e.name}: tl.constexpr" if e.constexpr else e.name)
+    element_counts: dict[str, str] = {}
+    if layout.template == "elementwise":  # n is the element count of every tensor: say which one a host reads it from
+        element_counts[layout.n_name] = next(p.name for p in params if p.kind == "tensor")  # type: ignore[attr-defined]
 
-    body = _Body(op, layout, names, out_names).run()
+    body = _Body(op, layout, names, out_names, rename).run()
     header = [
         f"Generated by tilefish.lower from the kernel '{op.name}'. Do not edit.",
         *layout.header(),
         f"num_warps: {num_warps}",
+        *[f"parameter '{old}' of the kernel is '{new}' here (the name is used by this module)" for old, new in rename.items()],
         "Numerics contract: see the docstring of tilefish.lower.",
     ]
     lines = [f"# {h}" for h in header]
@@ -943,13 +1039,15 @@ def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warp
         num_warps,
         NUM_STAGES,
         layout.grid,
+        max_elements=max_elements,
+        element_counts=element_counts,
     )
     return LoweredKernel(op.name, fn_name, module, layout.template, source, extern, num_warps, op)
 
 
-def _reindexed(p: Param, index: int) -> Param:
+def _reindexed(p: Param, index: int, name: str) -> Param:
     return Param(
-        p.name,
+        name,
         index,
         p.kind,
         p.access,

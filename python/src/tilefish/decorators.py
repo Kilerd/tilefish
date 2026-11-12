@@ -380,6 +380,15 @@ class ExternOp(Op):
     The stub's parameters, in declaration order, are the Triton kernel's
     parameters: tensors are pointers, a parameter annotated with a runtime
     ``Dim`` is an ``i32`` scalar, a ``const`` parameter is a ``constexpr``.
+
+    Two optional facts exist for kernels that tilefish generated (``@tilefish.extern`` never sets them,
+    so the specs of a hand-written kernel say nothing about its indexing):
+
+    * ``max_elements`` maps tensor parameters to the largest element count the kernel can index (its
+      offsets are ``i32``); every spec of the op then carries a ``max_elements`` precondition on those
+      arguments, which a host checks at launch.
+    * ``element_counts`` maps runtime scalar parameters to the tensor parameter whose element count (the
+      product of its shape) the scalar carries; the spec records how a host computes the value.
     """
 
     kind = "extern"
@@ -393,12 +402,28 @@ class ExternOp(Op):
         num_warps: int,
         num_stages: int,
         grid: Any,
+        *,
+        max_elements: "dict[str, int] | None" = None,
+        element_counts: "dict[str, str] | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         self.triton = triton
         self.num_warps = num_warps
         self.num_stages = num_stages
         self.grid: tuple[DimExpr, ...] | None = self._eval_grid(grid)
+        by_name = {p.name: p for p in signature.params}
+        self.max_elements: dict[str, int] = dict(max_elements or {})
+        for k, v in self.max_elements.items():
+            if k not in by_name or by_name[k].kind != "tensor":
+                raise TilefishDeclarationError(f"extern '{name}': max_elements: '{k}' is not a tensor parameter")
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise TilefishDeclarationError(f"extern '{name}': max_elements['{k}'] must be a positive int, got {v!r}")
+        self.element_counts: dict[str, str] = dict(element_counts or {})
+        for k, v in self.element_counts.items():
+            if k not in by_name or by_name[k].kind != "dim":
+                raise TilefishDeclarationError(f"extern '{name}': element_counts: '{k}' is not a runtime scalar parameter")
+            if v not in by_name or by_name[v].kind != "tensor":
+                raise TilefishDeclarationError(f"extern '{name}': element_counts['{k}'] must name a tensor parameter, got {v!r}")
 
     @property
     def triton_module(self) -> str:
