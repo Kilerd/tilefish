@@ -176,7 +176,11 @@ def shared_sizes(elf: Elf, symbol: str) -> "tuple[int, int]":
     """``(declared, reserved)``: the bytes of static shared memory the kernel ``symbol`` declares, and the bytes the driver reserves.
 
     They are the sizes of the ``NOBITS`` sections ``.nv.shared.<symbol>`` and ``.nv.shared.reserved.0`` (0 when
-    absent): what a launch adds to the dynamic shared memory when it checks the total against the device.
+    absent). A fact about the file, not what the driver enforces: a launch is checked against the driver's own figure
+    (``CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES``, see :mod:`tilefish._cuda`), which is smaller. Measured on an sm_103 device: a
+    Triton kernel with a 1024-byte ``.nv.shared.<symbol>`` section reports 0 static bytes (the section is the per-block system
+    reserve the device's opt-in maximum already excludes), and a hand-written one with 4096 static bytes has a 5120-byte section
+    and reports 4096.
     """
     declared = elf.section(f".nv.shared.{symbol}")
     reserved = elf.section(".nv.shared.reserved.0")

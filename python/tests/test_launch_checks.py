@@ -579,8 +579,9 @@ def test_two_loads_of_one_cubin_with_another_launch_are_not_the_same_kernel():
         dataclasses.replace(base, launch=LaunchAttributes(0, 0, True, (1, 1, 1), 1, False)),
         dataclasses.replace(base, launch=LaunchAttributes(0, 0, False, (2, 1, 1), 2, False)),
         dataclasses.replace(base, spec=dataclasses.replace(spec, block=(64, 1, 1))),
+        dataclasses.replace(base, spec=dataclasses.replace(spec, args=(dataclasses.replace(spec.args[0], name="renamed"), *spec.args[1:]))),
     ]
     keys = {load_key(b, 0) for b in [base, *same_cubin]} | {load_key(base, 1)}
     assert all(b.cubin == base.cubin for b in same_cubin)
-    assert len(keys) == 7  # the cubin alone does not identify a launch: shared memory, symbol, launch fields, block, device
+    assert len(keys) == 8  # the cubin alone does not identify a launch: shared memory, symbol, launch fields, block, ABI, device
     assert load_key(base, 0) == load_key(fake_build(spec), 0)

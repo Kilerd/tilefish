@@ -232,7 +232,7 @@ def test_shared_memory_beyond_the_device_is_refused(tmp_path):
     doc = json.loads((tmp_path / "manifest.json").read_text())
     doc["kernels"][0]["shared"] = 1 << 22
     (tmp_path / "manifest.json").write_text(json.dumps(doc))
-    with pytest.raises(TilefishRuntimeError, match=r"needs 1024 bytes of static and 4194304 bytes of dynamic shared memory .* more than the \d+ bytes a block may use"):
+    with pytest.raises(TilefishRuntimeError, match=r"needs 0 bytes of static and 4194304 bytes of dynamic shared memory, more than the \d+ bytes a block may use"):
         tilefish.run(softmax, x, mode="replay", manifest=tmp_path)
     assert torch.isfinite(tilefish.run(softmax, x, mode="jit")).all()
 

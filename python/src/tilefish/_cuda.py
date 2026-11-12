@@ -11,7 +11,12 @@ A launch is checked before it reaches the driver, because a wrong one does not f
 argument reads whatever follows the array, an ``i32`` out of range wraps, a grid beyond the device's limits is an
 error, and too little shared memory makes the kernel fault and poison the context (every later call fails). So
 :class:`LoadedKernel` checks the arguments against the ABI (count, kinds, ranges), the grid against the device's
-maximum grid dimensions, and the shared memory (static plus dynamic) against the device's opt-in maximum.
+maximum grid dimensions, and the shared memory against what the driver enforces: the function's static shared memory
+(``CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES``, as the driver reports it once the module is loaded) plus the dynamic shared
+memory of the manifest must not exceed the device's opt-in maximum per block (``MAX_SHARED_MEMORY_PER_BLOCK_OPTIN``).
+That is measured, not assumed: a Triton kernel whose ELF has a ``.nv.shared.<symbol>`` section of 1024 bytes reports 0
+static bytes and the driver takes a dynamic size of exactly the opt-in maximum; a hand-written kernel with 4096 bytes of
+static shared memory reports 4096 and takes the opt-in maximum minus 4096, and not a byte more.
 
 The driver binding is ``cuda-python`` (``cuda.bindings.driver``), imported when first needed.
 """
@@ -19,10 +24,10 @@ The driver binding is ``cuda-python`` (``cuda.bindings.driver``), imported when 
 from __future__ import annotations
 
 import ctypes
+import json
 import threading
 from typing import TYPE_CHECKING, Any, Sequence
 
-from ._elf import parse_elf, shared_sizes
 from .errors import TilefishRuntimeError
 
 if TYPE_CHECKING:
@@ -76,8 +81,9 @@ def refuse_unsupported(built: "BuiltKernel") -> None:
 def load_key(built: "BuiltKernel", device_index: int) -> "tuple[Any, ...]":
     """What makes two loads the same: the cubin, the device, and everything the launch is made of.
 
-    Two entries with one cubin but another symbol, shared memory, launch attributes or block are different
-    kernels as far as a launch is concerned, so a cached one is never reused for them.
+    Two entries with one cubin but another symbol, shared memory, launch attributes, block or ABI are different
+    kernels as far as a launch is concerned (the ABI is what the arguments of a launch are checked and packed by, and what
+    the loaded function's parameters are checked against), so a cached one is never reused for them.
     """
     launch = built.launch.to_dict()
     return (
@@ -87,6 +93,7 @@ def load_key(built: "BuiltKernel", device_index: int) -> "tuple[Any, ...]":
         built.shared,
         tuple((k, tuple(v) if isinstance(v, list) else v) for k, v in sorted(launch.items())),
         tuple(built.spec.block),
+        json.dumps(built.abi(), sort_keys=True),
     )
 
 
@@ -102,9 +109,14 @@ class LoadedKernel:
                 "no CUDA context is current on this thread; touch the device with torch first (for example "
                 "torch.zeros(1, device='cuda'))"
             )
+        (device,) = _check(drv.cuCtxGetDevice(), "cuCtxGetDevice")
+        if int(device) != device_index:
+            raise TilefishRuntimeError(
+                f"'{built.stem}' ({built.arch}) is to be loaded for device {device_index}, but the current CUDA context is on "
+                f"device {int(device)}: make that device current first (with torch.cuda.device({device_index}))"
+            )
         self.built = built
         self.device_index = device_index
-        (device,) = _check(drv.cuCtxGetDevice(), "cuCtxGetDevice")
         self.grid_limits = tuple(
             int(
                 _check(
@@ -118,20 +130,28 @@ class LoadedKernel:
             drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device),
             "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
         )
-        declared, reserved = shared_sizes(parse_elf(built.cubin), built.symbol)
-        if declared + reserved + built.shared > int(optin):
-            raise TilefishRuntimeError(
-                f"'{built.stem}' ({built.arch}) needs {declared} bytes of static and {built.shared} bytes of dynamic shared "
-                f"memory (and the driver reserves {reserved}), more than the {int(optin)} bytes a block may use on this device"
-            )
         (self.module,) = _check(drv.cuModuleLoadData(built.cubin), f"cuModuleLoadData({built.stem})")
-        (self.function,) = _check(
-            drv.cuModuleGetFunction(self.module, built.symbol.encode("utf-8")), f"cuModuleGetFunction({built.symbol})"
-        )
-        if built.shared > DEFAULT_SHARED_LIMIT:
-            attr = drv.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
-            _check(drv.cuFuncSetAttribute(self.function, attr, built.shared), "cuFuncSetAttribute(max dynamic shared)")
-        self._check_params()
+        try:
+            (self.function,) = _check(
+                drv.cuModuleGetFunction(self.module, built.symbol.encode("utf-8")), f"cuModuleGetFunction({built.symbol})"
+            )
+            (static,) = _check(
+                drv.cuFuncGetAttribute(drv.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, self.function),
+                "cuFuncGetAttribute(SHARED_SIZE_BYTES)",
+            )
+            self.static_shared = int(static)
+            if self.static_shared + built.shared > int(optin):
+                raise TilefishRuntimeError(
+                    f"'{built.stem}' ({built.arch}) needs {self.static_shared} bytes of static and {built.shared} bytes of dynamic "
+                    f"shared memory, more than the {int(optin)} bytes a block may use on this device"
+                )
+            if built.shared > DEFAULT_SHARED_LIMIT:
+                attr = drv.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+                _check(drv.cuFuncSetAttribute(self.function, attr, built.shared), "cuFuncSetAttribute(max dynamic shared)")
+            self._check_params()
+        except BaseException:
+            drv.cuModuleUnload(self.module)  # a kernel that is refused must not stay loaded
+            raise
         self.block = tuple(built.spec.block)
         abi = built.abi()
         self._abi = abi["params"]
