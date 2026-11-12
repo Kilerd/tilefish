@@ -707,14 +707,60 @@ def test_elementwise_names_step_aside_too():
     assert spec.grid == "(cdiv(256*M, 1024),)"
 
 
-def test_names_the_generated_code_uses_are_not_reused():
+def test_parameters_named_like_what_the_module_uses_are_renamed_everywhere():
+    """A parameter called ``tl``, ``float`` or ``triton`` would shadow the module's own names: it is renamed with a
+    suffix in the function, in the extern stub and in the spec (a spec's signature names the function's parameters)."""
+
     @tilefish.kernel
-    def clash(tl: Tensor[M, D, f32], float: Tensor[M, D, f32], triton: Tensor[M, D, f32]) -> Tensor[M, D, f32]:
-        return tl + float + triton
+    def clash(
+        tl: Tensor[M, D, f32],
+        float: Tensor[M, D, f32],
+        triton: Tensor[M, D, f32],
+        num_warps: Tensor[M, D, f32],
+        *,
+        grid: const[f32] = 2.0,
+    ) -> Tensor[M, 1, f32]:
+        return tilefish.max(tl * grid + float - triton * num_warps, axis=-1, keepdims=True)  # emits float("-inf")
 
     lowered = clash.lower()
-    ast.parse(lowered.source)
-    assert "tl_1" not in lowered.source  # parameters keep their names; it is the generated code that avoids them
+    tree = ast.parse(lowered.source)
+    (fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    args = [a.arg for a in fn.args.args]
+    assert args == ["tl_1", "float_1", "triton_1", "num_warps_1", "grid_1", "out", "D", "BLOCK_D"]
+    assert [p.name for p in lowered.extern.signature.params] == args
+    (spec,) = compile_specs(lowered.extern)
+    assert list(spec.signature) == args and [a.name for a in spec.args] == args
+    assert spec.constants[(4,)] == 2.0 and spec.signature["grid_1"] == "constexpr"
+    # the module's own names still mean what they should
+    src = body(lowered)
+    assert "v0 = tl.load(tl_1 + offs, mask=mask, other=0)  # tl" in src
+    assert 'v8 = tl.max(tl.where(mask, v7, float("-inf")), axis=0)' in src
+    assert "v4 = v0 * grid_1" in src
+    names = {n.id for stmt in fn.body for n in ast.walk(stmt) if isinstance(n, ast.Name)}
+    assert not names & {"tl_1", "float_1", "triton_1"} - set(args)  # everything it reads is a parameter or a local
+    assert {a for a in args} & {"tl", "float", "triton", "grid", "num_warps"} == set()
+    header = lowered.source.splitlines()[:8]
+    assert "# parameter 'tl' of the kernel is 'tl_1' here (the name is used by this module)" in header
+    # deterministic, and the names the kernel already uses are not taken
+    assert clash.lower().source == lowered.source
+
+    @tilefish.kernel
+    def crowded(tl: Tensor[M, D, f32], tl_1: Tensor[M, D, f32]) -> Tensor[M, D, f32]:
+        return tl + tl_1
+
+    assert [p.name for p in crowded.lower().extern.signature.params][:3] == ["tl_2", "tl_1", "out"]
+
+
+def test_renamed_parameters_keep_stores_and_outputs_consistent():
+    @tilefish.kernel
+    def inout(tl: tilefish.InOut[Tensor[M, D, f32]], float: Tensor[M, D, f32]):
+        tl[...] = tl + float
+
+    lowered = inout.lower()
+    src = body(lowered)
+    assert "tl.store(tl_1 + offs, v2, mask=mask)  # InOut tl, final version" in src
+    assert [p.name for p in lowered.extern.signature.params][:2] == ["tl_1", "float_1"]
+    assert lowered.extern.signature.params[0].access == "inout"
 
 
 def test_elementwise_count_is_the_product_of_the_shape():

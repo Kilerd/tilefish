@@ -54,6 +54,13 @@ value (``out``, or ``out0``, ``out1``, ... for several), then the template's par
 generated name that collides with a kernel parameter is suffixed (``mask_1``). Constexpr values come
 from the spec (``compile_specs(lowered.extern)``), not from defaults in the source.
 
+A kernel parameter whose name the generated module itself uses (``tl``, ``triton``, ``float``) or
+that Triton's JIT launcher takes as a launch option (``grid``, ``warmup``, ``debug``, ``num_warps``,
+``num_stages``, ``num_ctas``, ``maxnreg``) is renamed with a numeric suffix (``tl_1``), in the
+generated function, the extern stub and every spec alike: a spec's signature must name the
+function's own parameters, so the spec cannot keep the original name. The module header says which
+parameter became which; every other parameter keeps its name.
+
 The elementwise ``n`` is recorded in the spec as ``count_of``: the tensor argument whose element
 count (the product of its shape entries) the scalar carries, so a host computes it without knowing
 the kernel. When the product is affine the scalar's ``dim`` is that product (the spec validator
@@ -963,7 +970,7 @@ def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warp
     user = list(op.signature.params)
     names = _Names({p.name for p in user} | _RESERVED)
     # a kernel parameter that has the name of something the generated module uses would shadow it
-    rename: dict[str, str] = {}
+    rename = {p.name: names.fresh(p.name) for p in user if p.name in _RESERVED}
     out_names = (
         [names.fresh("out")] if len(graph.outputs) == 1 else [names.fresh(f"out{k}") for k in range(len(graph.outputs))]
     )

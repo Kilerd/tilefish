@@ -237,3 +237,21 @@ def test_a_returned_input_is_copied():
     out = blank(15, ft.float32)
     run(identity.lower(), {"x": x, "out": out}, {"M": 3}, scalars={"n": 15})
     assert out.data == x.data
+
+
+def test_parameters_named_like_the_modules_own_names_still_run():
+    """``tl`` and ``float`` are what the generated code calls: renamed parameters must not shadow them."""
+    M = Dim("M")
+
+    @tilefish.kernel
+    def clash(tl: Tensor[M, 7, f32], float: Tensor[M, 7, f32], triton: Tensor[M, 7, f32]) -> Tensor[M, 1, f32]:
+        return tilefish.max(tl - float + triton, axis=-1, keepdims=True)  # float("-inf") masks the padded lanes
+
+    lowered = clash.lower()
+    rng = random.Random(9)
+    a, b, c = (rand_buf(rng, 3 * 7, ft.float32) for _ in range(3))
+    out = blank(3, ft.float32)
+    run(lowered, {"tl_1": a, "float_1": b, "triton_1": c, "out": out}, {"M": 3})
+    ra, rb, rc = rows(a.data, 7), rows(b.data, 7), rows(c.data, 7)
+    want = [max(x - y + z for x, y, z in zip(ra[r], rb[r], rc[r])) for r in range(3)]
+    close(out.data, want, rtol=1e-6)
