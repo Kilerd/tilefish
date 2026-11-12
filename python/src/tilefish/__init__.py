@@ -29,11 +29,13 @@ from .errors import (
     TilefishAttributeError,
     TilefishDeclarationError,
     TilefishError,
+    TilefishLoweringError,
     TilefishPicklingError,
     TilefishSpecError,
     TilefishTypeError,
 )
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
+from .lower import LoweredKernel, lower
 from .ops import exp, gelu, rsqrt, silu, sqrt
 from .ops import reduce_mean as mean
 from .trace import Const, Value
@@ -61,6 +63,7 @@ __all__ = [
     "InOut",
     "KernelOp",
     "LibraryOp",
+    "LoweredKernel",
     "Node",
     "Op",
     "Out",
@@ -71,6 +74,7 @@ __all__ = [
     "TilefishAttributeError",
     "TilefishDeclarationError",
     "TilefishError",
+    "TilefishLoweringError",
     "TilefishPicklingError",
     "TilefishSpecError",
     "TilefishTypeError",
@@ -92,6 +96,7 @@ __all__ = [
     "i64",
     "kernel",
     "library",
+    "lower",
     "mean",
     "rsqrt",
     "silu",

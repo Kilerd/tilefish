@@ -199,17 +199,33 @@ class GraphOp(Op):
 
 
 class KernelOp(GraphOp):
-    """A kernel whose body tilefish understands (traced and type-checked; not lowered yet)."""
+    """A kernel whose body tilefish understands: traced, type-checked, and lowerable to Triton source.
+
+    ``num_warps`` (``None`` for the template's default rule) is the launch warp count the
+    lowering uses; see :func:`tilefish.lower`.
+    """
 
     kind = "kernel"
 
+    def __init__(
+        self, fn: Callable[..., Any], name: str, signature: Signature, graph: Graph, num_warps: "int | None" = None
+    ) -> None:
+        super().__init__(fn, name, signature, graph)
+        self.num_warps = num_warps
 
-def _declare_traced(fn: Callable[..., Any], name: str | None, cls: type, kind: str) -> Any:
+    def lower(self, **options: Any) -> Any:
+        """Lower this kernel to Triton source: ``tilefish.lower(self, **options)``."""
+        from .lower import lower
+
+        return lower(self, **options)
+
+
+def _declare_traced(fn: Callable[..., Any], name: str | None, cls: type, kind: str, **options: Any) -> Any:
     nm = name or fn.__name__
     sig = parse_signature(fn, what=kind, name=nm, check_derivable=(kind == "kernel"))
     graph = _trace_body(fn, sig, nm, kind)
     sig = _with_traced_returns(sig, graph, kind, nm)
-    return cls(fn, nm, sig, graph)
+    return cls(fn, nm, sig, graph, **options)
 
 
 def _check_decorator_arg(deco: str, fn: Any) -> None:
@@ -227,12 +243,19 @@ def graph(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> A
     return _declare_traced(fn, name, GraphOp, "graph")
 
 
-def kernel(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
-    """``@tilefish.kernel``: trace and type-check a kernel body (no lowering in M1)."""
+def kernel(fn: Callable[..., Any] | None = None, *, name: str | None = None, num_warps: int | None = None) -> Any:
+    """``@tilefish.kernel``: trace and type-check a kernel body; ``.lower()`` turns it into Triton source.
+
+    ``num_warps`` overrides the lowering's default warp count (a power of two from 1 to 32).
+    """
     _check_decorator_arg("kernel", fn)
+    if num_warps is not None and (
+        isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS
+    ):
+        raise TilefishDeclarationError(f"kernel: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
     if fn is None:
-        return lambda f: _declare_traced(f, name, KernelOp, "kernel")
-    return _declare_traced(fn, name, KernelOp, "kernel")
+        return lambda f: _declare_traced(f, name, KernelOp, "kernel", num_warps=num_warps)
+    return _declare_traced(fn, name, KernelOp, "kernel", num_warps=num_warps)
 
 
 # -- extern -----------------------------------------------------------------------------------
