@@ -236,3 +236,105 @@ def test_the_documented_star_pattern_keeps_declaration_order():
 
     assert [p.name for p in e.signature.params] == ["x", "BLOCK", "y", "n"]
     assert "bare ``*``" in tilefish.extern.__doc__ and "keyword" in tilefish.extern.__doc__
+
+
+# -- wrappers: the parameter list comes from wherever it exists in the .fn chain ------------------------------------------------------
+
+
+class Wrapper:
+    """An autotuner or heuristics wrapper: it may expose arg_names but not params, or neither."""
+
+    def __init__(self, fn, arg_names=None, params=None):
+        self.fn = fn
+        if arg_names is not None:
+            self.arg_names = list(arg_names)
+        if params is not None:
+            self.params = params
+
+
+def _params(names, constexpr):
+    return [types.SimpleNamespace(name=n, is_constexpr=c) for n, c in zip(names, constexpr)]
+
+
+NAMES = ["X", "n", "BLOCK"]
+
+
+def test_an_autotuner_with_arg_names_but_no_params_still_gets_the_constexpr_check_from_the_jit_below_it():
+    jit = FakeKernel("my_kernels", "k", NAMES, constexpr=[False, False, True])
+    tuned = Wrapper(jit, arg_names=NAMES)  # arg_names but no params: the first level that has arg_names
+    nn = Dim("nn")
+
+    @tilefish.extern(triton=tuned, grid=(1,))
+    def ok(X: Tensor[nn, bf16], n: nn, BLOCK: const = 64): ...
+
+    assert ok.triton == "my_kernels:k"
+    with pytest.raises(
+        tilefish.TilefishDeclarationError,
+        match=r"parameter 'BLOCK' is not a const in the stub but a constexpr in the Triton kernel",
+    ):
+
+        @tilefish.extern(triton=tuned, grid=(1,))
+        def stub_runtime(X: Tensor[nn, bf16], n: nn, BLOCK: nn): ...
+
+    with pytest.raises(
+        tilefish.TilefishDeclarationError,
+        match=r"parameter 'n' is a const in the stub but not a constexpr in the Triton kernel",
+    ):
+
+        @tilefish.extern(triton=tuned, grid=(1,))
+        def stub_const(X: Tensor[nn, bf16], n: const = 4, BLOCK: const = 64): ...
+
+
+def test_a_heuristics_wrapper_over_an_autotuner_over_a_jit_is_checked_too():
+    jit = FakeKernel("my_kernels", "k", NAMES, constexpr=[False, False, True])
+    chain = Wrapper(Wrapper(jit, arg_names=NAMES), arg_names=NAMES)  # heuristics(autotuner(jit))
+    nn = Dim("nn")
+
+    @tilefish.extern(triton=chain, grid=(1,))
+    def ok(X: Tensor[nn, bf16], n: nn, BLOCK: const = 64): ...
+
+    with pytest.raises(tilefish.TilefishDeclarationError, match="not a const in the stub but a constexpr"):
+
+        @tilefish.extern(triton=chain, grid=(1,))
+        def wrong(X: Tensor[nn, bf16], n: nn, BLOCK: nn): ...
+
+    # params only, found on a wrapper that has no arg_names: names come from the params
+    only_params = Wrapper(types.SimpleNamespace(__module__="my_kernels", __name__="k"), params=_params(NAMES, [False, False, True]))
+
+    @tilefish.extern(triton=only_params, grid=(1,))
+    def ok2(X: Tensor[nn, bf16], n: nn, BLOCK: const = 64): ...
+
+    with pytest.raises(tilefish.TilefishDeclarationError, match="first difference at position 0"):
+
+        @tilefish.extern(triton=only_params, grid=(1,))
+        def renamed(Y: Tensor[nn, bf16], n: nn, BLOCK: const = 64): ...
+
+
+def test_wrappers_that_disagree_about_the_kernel_are_rejected():
+    jit = FakeKernel("my_kernels", "k", NAMES, constexpr=[False, False, True])
+
+    other_names = Wrapper(jit, arg_names=["X", "m", "BLOCK"])
+    with pytest.raises(tilefish.TilefishDeclarationError, match=r"disagree about its parameter names"):
+        tilefish.extern(triton=other_names, grid=(1,))
+
+    other_flags = Wrapper(
+        FakeKernel("my_kernels", "k", NAMES, constexpr=[False, False, True]),
+        arg_names=NAMES,
+        params=_params(NAMES, [False, True, True]),
+    )
+    with pytest.raises(tilefish.TilefishDeclarationError, match=r"disagree about its constexpr flags"):
+        tilefish.extern(triton=other_flags, grid=(1,))
+
+    params_vs_names = Wrapper(jit, params=_params(["X", "n", "OTHER"], [False, False, True]))
+    with pytest.raises(tilefish.TilefishDeclarationError, match=r"disagree about its parameter names"):
+        tilefish.extern(triton=params_vs_names, grid=(1,))
+
+    short_flags = types.SimpleNamespace(
+        __module__="my_kernels", __name__="k", arg_names=NAMES, params=_params(NAMES[:2], [False, False])
+    )
+    with pytest.raises(tilefish.TilefishDeclarationError, match="3 parameter names but 2 constexpr flags|disagree"):
+        tilefish.extern(triton=short_flags, grid=(1,))
+
+    broken = types.SimpleNamespace(__module__="my_kernels", __name__="k", arg_names=5)
+    with pytest.raises(tilefish.TilefishDeclarationError, match="not a list"):
+        tilefish.extern(triton=broken, grid=(1,))

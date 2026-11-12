@@ -262,7 +262,7 @@ def test_split_equal_chunks(tr):
 
 
 def test_split_symbolic_dimension(tr):
-    n = Dim("n")
+    n = Dim("n", divisible_by=8)  # 8 bf16 elements are 16 bytes: every chunk starts aligned
     a, b, c = tr.val(Tensor[3 * n, bf16]).split(n, axis=0)
     assert a.type == b.type == c.type == Tensor[n, bf16]
 
@@ -302,7 +302,10 @@ def test_store_into_inout(tr):
     r = tr.val(Tensor[M, D, f32]) + 1
     res[...] = r
     node = tr.nodes[-1]
-    assert node.op == "store" and node.inputs == (res, r) and node.attrs == {"target": "residual"} and node.outputs == ()
+    assert node.op == "store" and node.inputs == (res, r) and node.attrs == {"target": "residual"}
+    # a store copies: its output is a fresh value, the parameter's new version
+    (version,) = node.outputs
+    assert version is not r and version.type == res.type and res.live is version
 
 
 def test_store_errors(tr):
@@ -413,25 +416,37 @@ def test_dimension_mismatch_in_broadcast_shows_constraints_when_names_collide(tr
 # -- versions: reading after a store ----------------------------------------------------------------------
 
 
-def test_reading_an_inout_param_after_a_store_reads_the_stored_value(tr):
+def test_reading_an_inout_param_after_a_store_reads_the_stored_copy(tr):
     res = tr.val(Tensor[M, D, f32], name="res", access="inout")
     r = res + 1
     assert tr.nodes[-1].inputs[0] is res  # before the store it reads the parameter
     res[...] = r
+    version1 = res.live
+    assert version1 is not r and version1 is not res  # a store makes a fresh value: a copy
     z = res * 2
-    assert tr.nodes[-1].inputs[0] is r  # after the store it reads what was stored
+    assert tr.nodes[-1].inputs[0] is version1  # after the store it reads the new version
     res[...] = z
+    version2 = res.live
+    assert version2 is not z and version2 is not version1
     w = tilefish.silu(res)
-    assert tr.nodes[-1].inputs == (z,)
+    assert tr.nodes[-1].inputs == (version2,)
     assert w.type == res.type
-    assert res.live is z
+    assert [n.op for n in tr.nodes] == ["add", "store", "mul", "store", "silu"]
+    assert tr.nodes[1].outputs == (version1,) and tr.nodes[3].outputs == (version2,)
 
 
-def test_storing_a_value_into_itself_does_not_loop(tr):
+def test_storing_a_value_into_itself_makes_a_copy_and_does_not_loop(tr):
     res = tr.val(Tensor[M, f32], name="res", access="inout")
     res[...] = res
-    assert res.live is res
+    assert res.live is not res
+    assert tr.nodes[-1].inputs == (res, res)
     assert (res + 1).type == res.type
+
+
+def test_storing_into_an_out_param_has_no_version(tr):
+    y = tr.val(Tensor[M, f32], name="y", access="out")
+    y[...] = tr.val(Tensor[M, f32])
+    assert tr.nodes[-1].op == "store" and tr.nodes[-1].outputs == ()
 
 
 def test_out_params_stay_write_only_before_and_after_a_store(tr):
@@ -491,3 +506,15 @@ def test_a_view_cannot_be_stored(tr):
     with pytest.raises(TilefishTypeError, match=r"expected Tensor\[4, 4, f32\], got View\[4, 4, f32\].*strided view cannot be stored"):
         res[...] = c
     res[...] = c * 1  # computing from it is fine
+
+
+def test_split_needs_at_least_one_whole_chunk(tr):
+    x = tr.val(Tensor[M, 10, f32])
+    for bad in (-5, -10, 0):
+        with pytest.raises(TilefishTypeError, match="split: axis 1 of .* is not a whole number of chunks"):
+            x.split(bad, axis=1)
+    n = Dim("n")
+    y = tr.val(Tensor[3 * n, bf16])
+    with pytest.raises(TilefishTypeError, match="not a whole number of chunks"):
+        y.split(-n, axis=0)  # the ratio is -3, not a chunk count
+    assert len(y.split(n, axis=0)) == 3

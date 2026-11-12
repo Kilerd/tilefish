@@ -34,8 +34,11 @@ def test_transformer_block_traces_and_type_checks(block):
     ]
     assert g.inputs[0].access == "inout"
     # returning the residual stream returns what was stored into it
-    assert g.outputs == (g.nodes[-1].inputs[1],)
-    assert g.nodes[-1].inputs[0] is g.inputs[0]
+    store = g.nodes[-1]
+    assert store.op == "store" and store.inputs[0] is g.inputs[0]
+    assert g.outputs == (store.outputs[0],)  # the stream's new version
+    assert g.finals == {"x": store.outputs[0]}
+    assert "  final x = %" in str(g)
     assert g.outputs[0].type == Tensor[T, D, bf16]
     assert g.nodes[1].output_types == (Tensor[T, 6144, bf16],)  # the fused qkv projection
     assert g.nodes[2].inputs == (g.nodes[1].outputs[0],)  # attention takes it whole: one pointer

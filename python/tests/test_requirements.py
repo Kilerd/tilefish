@@ -300,9 +300,14 @@ def test_aliasing_is_checked_on_the_newest_version():
 
         @tilefish.graph
         def g(x: InOut[Tensor[M, bf16]]):
-            r = x * 1
-            x[...] = r  # x now holds r
-            return two_in_one_out(r, x)
+            two_inout(x.live, x)  # the parameter and its newest version are the same tensor
+
+    with pytest.raises(TilefishTypeError, match="the same tensor"):
+
+        @tilefish.graph
+        def g2(x: InOut[Tensor[M, bf16]], z: InOut[Tensor[M, bf16]]):
+            two_inout(x, z)  # x and z are updated in place: the newest versions are what aliasing is checked on
+            two_in_one_out(z.live, z)
 
 
 def test_an_inout_argument_gets_a_new_version_that_later_reads_see():
@@ -474,3 +479,114 @@ def test_a_value_from_another_trace_is_rejected_as_a_call_argument():
         gemm_bf16(foreign, w)  # the first tensor argument decides which trace the call belongs to
     assert [n.op for n in b.nodes] == []  # nothing was recorded in either trace by the failed calls
     assert [n.op for n in a.nodes] == ["gemm_bf16"]
+
+
+# -- bucket sets: subset, superset, partial overlap and disjoint behave the same directly and through nesting -----------------
+
+Wide = Dim("Wide", buckets=[32, 64, 128])  # a superset of per_bucket's [32, 64]
+Partial = Dim("Partial", buckets=[64, 256])  # overlaps in 64 only
+Other = Dim("Other", buckets=[128, 256])  # nothing in common
+Within = Dim("Within", buckets=[32])
+
+
+def test_bucket_sets_directly_and_through_a_nested_graph_are_treated_alike():
+    Mg = Dim("Mg")
+
+    @tilefish.graph
+    def inner_b(x: Tensor[Mg, bf16]):
+        return per_bucket(x)
+
+    for caller_dim, runtime_checked in ((Wide, True), (Partial, True), (Within, False)):
+        @tilefish.graph
+        def via_direct(x: Tensor[caller_dim, bf16]):
+            return per_bucket(x)
+
+        @tilefish.graph
+        def via_nested(x: Tensor[caller_dim, bf16]):
+            return inner_b(x)
+
+        for g in (via_direct, via_nested):
+            reqs = g.graph.requirements
+            if runtime_checked:
+                (r,) = reqs
+                assert isinstance(r, BucketRequirement) and r.dim == caller_dim and r.buckets == (32, 64)
+            else:
+                assert reqs == ()  # a subset is statically satisfied
+
+    for g_fn in (per_bucket, inner_b):
+        with pytest.raises(TilefishTypeError, match=r"is bucketed over \[32, 64\] but Other has buckets \[128, 256\] \(no bucket in common\)|body.*Other has buckets \[128, 256\] \(no bucket in common\)"):
+
+            @tilefish.graph
+            def disjoint(x: Tensor[Other, bf16]):
+                return g_fn(x)
+
+
+def test_the_nested_requirement_names_the_callee_and_the_original_site():
+    Mg = Dim("Mg")
+
+    @tilefish.graph
+    def inner_b(x: Tensor[Mg, bf16]):
+        return per_bucket(x)
+
+    @tilefish.graph
+    def outer(x: Tensor[Wide, bf16]):
+        return inner_b(x)
+
+    assert outer.graph.requirements == (
+        BucketRequirement(Wide, (32, 64), "inner_b (its body: per_bucket: argument 'x')"),
+    )
+    assert "Wide in [32, 64]  (required by inner_b (its body: per_bucket: argument 'x'))" in str(outer.graph)
+
+
+# -- a nested graph that returns a view: the view survives instantiation ----------------------------------------------------------
+
+
+def test_a_view_returned_by_a_nested_graph_is_still_rejected_by_declared_operators():
+    @tilefish.graph
+    def returns_view(x: Tensor[M, 8, bf16]):
+        a, _ = x.split(4, axis=1)
+        return a
+
+    assert returns_view.signature.returns[0].contiguous is False
+
+    @tilefish.graph
+    def through_the_call(x: Tensor[M, 8, bf16]):
+        return returns_view(x)
+
+    assert through_the_call.graph.outputs[0].type == Tensor[M, 4, bf16].as_view()
+
+    with pytest.raises(TilefishTypeError, match=r"scale: argument 'x' is a strided view \(View\[M, 4, bf16\]\)"):
+
+        @tilefish.graph
+        def passes_it_on(x: Tensor[M, 8, bf16]):
+            return scale(returns_view(x))
+
+    @tilefish.graph
+    def materialized(x: Tensor[M, 8, bf16]):
+        return scale(returns_view(x) + 0)
+
+    assert materialized.graph.outputs[0].type == Tensor[M, 4, bf16]
+
+
+# -- an Out parameter cannot be read at a call site ---------------------------------------------------------------------------------
+
+
+def test_an_out_param_cannot_be_passed_as_a_call_argument():
+    with pytest.raises(TilefishTypeError, match=r"scale: argument 'x' reads Out parameter 'y', which is write-only"):
+
+        @tilefish.kernel
+        def before(x: Tensor[M, 4, bf16], y: Out[Tensor[M, 4, bf16]]):
+            scale(y)
+
+    with pytest.raises(TilefishTypeError, match=r"reads Out parameter 'y', which is write-only"):
+
+        @tilefish.kernel
+        def after(x: Tensor[M, 4, bf16], y: Out[Tensor[M, 4, bf16]]):
+            y[...] = x
+            scale(y)  # not even after it was written
+
+    with pytest.raises(TilefishTypeError, match=r"two_in_one_out: argument 'b' reads Out parameter 'y'"):
+
+        @tilefish.kernel
+        def as_inout(x: Tensor[M, bf16], y: Out[Tensor[M, bf16]]):
+            two_in_one_out(x, y)

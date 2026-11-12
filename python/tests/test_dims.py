@@ -293,3 +293,24 @@ def test_constraints_are_spelled_out_when_names_collide():
     assert describe_pair(plain, constrained) == ("Dim('K')", "Dim('K', divisible_by=32)")
     assert describe_pair(Dim("M"), Dim("N")) == ("M", "N")
     assert describe_pair(2 * plain, 2 * constrained) == ("2*K with Dim('K')", "2*K with Dim('K', divisible_by=32)")
+
+
+# -- division guards ----------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("divisor", [0, -1, -2])
+def test_floordiv_needs_a_positive_static_divisor(divisor):
+    with pytest.raises(TilefishTypeError, match="the divisor must be a positive static int"):
+        Dim("M") // divisor
+    with pytest.raises(TilefishTypeError, match="the divisor must be a positive static int"):
+        Dim("D", 4) // divisor
+    with pytest.raises(TilefishTypeError, match="the divisor must be a positive static int"):
+        DimExpr.const(7) // divisor
+    with pytest.raises(TilefishTypeError, match="the divisor must be a positive static int"):
+        (4 * Dim("M")) // divisor
+
+
+def test_floordiv_by_a_symbolic_divisor_is_rejected():
+    with pytest.raises(TilefishTypeError, match="the divisor must be a positive static int"):
+        Dim("M") // Dim("N")
+    assert Dim("D", 12) // Dim("E", 4) == 3  # a static Dim is a static divisor

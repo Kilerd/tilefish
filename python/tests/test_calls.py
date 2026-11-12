@@ -255,10 +255,20 @@ def test_bucketed_signature_dim():
         def bad(a: Tensor[48, bf16]):
             return per_bucket(a)
 
-    with pytest.raises(TilefishTypeError, match=r"S is bucketed over \[32, 64\] but Wide has buckets \[32, 64, 128\]"):
+    # a superset (or a partial overlap) is checked at run time: a requirement, not an error
+    @tilefish.graph
+    def superset(a: Tensor[wide, bf16]):
+        return per_bucket(a)
+
+    assert [str(r) for r in superset.graph.requirements] == [
+        "Wide in [32, 64]  (required by per_bucket: argument 'x')"
+    ]
+    # disjoint bucket sets can never match
+    disjoint = Dim("Disjoint", buckets=[128, 256])
+    with pytest.raises(TilefishTypeError, match=r"S is bucketed over \[32, 64\] but Disjoint has buckets \[128, 256\] \(no bucket in common\)"):
 
         @tilefish.graph
-        def bad2(a: Tensor[wide, bf16]):
+        def bad2(a: Tensor[disjoint, bf16]):
             return per_bucket(a)
 
 
