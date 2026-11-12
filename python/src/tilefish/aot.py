@@ -261,8 +261,18 @@ class CompileSpec:
         return self.triton.split(":", 1)[1]
 
     def _fingerprint(self) -> str:
-        """A hash of everything that is serialized, types included (``1``, ``1.0`` and ``True`` differ)."""
-        return hashlib.sha256(json.dumps(self.to_dict(), sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()
+        """A hash of everything that is serialized, types included (``1``, ``1.0`` and ``True`` differ).
+
+        Object keys are sorted, except where their order means something: ``signature`` is the argument
+        order Triton sees (``constants`` and ``attrs`` are keyed by index into it) and ``buckets`` is the
+        order of the bucketed dimensions. Those are hashed as lists of items, so reordering them in place
+        changes the fingerprint. Every other order-carrying field (``args``, ``launch_params``,
+        ``preconditions``, the entries of ``grid``) is already a list or a string in ``to_dict``.
+        """
+        doc = self.to_dict()
+        doc["signature"] = [[k, v] for k, v in self.signature.items()]
+        doc["buckets"] = [[k, v] for k, v in self.buckets.items()]
+        return hashlib.sha256(json.dumps(doc, sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()
 
     @property
     def verified(self) -> bool:
