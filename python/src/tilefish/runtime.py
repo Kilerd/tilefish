@@ -353,7 +353,15 @@ def _run_jit(prep: _Prepared) -> None:
     _check_jit_function(fn, prep.spec)
     args = [v for _, _, v in _launch_values(prep)]
     with torch.cuda.device(_device_index(torch, prep.device)):
-        fn[prep.grid](*args, num_warps=prep.spec.num_warps, num_stages=prep.spec.num_stages)
+        try:
+            fn[prep.grid](*args, num_warps=prep.spec.num_warps, num_stages=prep.spec.num_stages)
+        except RuntimeError as e:
+            if "C compiler" in str(e):  # Triton compiles a small C launcher for every kernel it runs
+                raise TilefishRuntimeError(
+                    f"jit mode needs a C compiler for Triton's launcher, and none was found ({e}); install gcc or set CC "
+                    "(replay mode needs none)"
+                ) from e
+            raise
 
 
 _options = threading.local()

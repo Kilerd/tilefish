@@ -49,6 +49,7 @@ from lower_cases import T, gelu_exact, layernorm, softmax, swiglu  # noqa: E402
 import tilefish  # noqa: E402
 from tilefish import Dim, Tensor, bf16, const, f32  # noqa: E402
 from tilefish import runtime  # noqa: E402
+from tilefish._elf import parse_elf  # noqa: E402
 from tilefish.aot import build  # noqa: E402
 
 BF16, F32 = torch.bfloat16, torch.float32
@@ -451,42 +452,61 @@ def test_the_largest_buckets_warp_count_changes_the_numerics_of_a_small_bucket()
 # -- FMA contraction on the goldens (data for the lead) ---------------------------------------------------------------------------------
 
 
-def golden_cases(rmsnorm):
+def golden_cases(rmsnorm, seed):
     return [
-        ("softmax", softmax, (randn((257, 1000), F32, 0, scale=3.0),)),
-        ("layernorm", layernorm, (randn((257, 768), BF16, 0), randn((768,), BF16, 100), randn((768,), BF16, 200))),
-        ("residual_add_rmsnorm", rmsnorm, (randn((257, 2560), BF16, 0), randn((257, 2560), F32, 50), randn((2560,), BF16, 100))),
-        ("gelu_exact", gelu_exact, (randn((1 << 20,), BF16, 0, scale=3.0),)),
-        ("swiglu", swiglu, (randn((257, 3072), BF16, 0, scale=2.0), randn((257, 3072), BF16, 100))),
+        ("softmax", softmax, (randn((257, 1000), F32, seed, scale=3.0),)),
+        ("layernorm", layernorm, (randn((257, 768), BF16, seed), randn((768,), BF16, seed + 100), randn((768,), BF16, seed + 200))),
+        ("residual_add_rmsnorm", rmsnorm, (randn((257, 2560), BF16, seed), randn((257, 2560), F32, seed + 50), randn((2560,), BF16, seed + 100))),
+        ("gelu_exact", gelu_exact, (randn((1 << 20,), BF16, seed, scale=3.0),)),
+        ("swiglu", swiglu, (randn((257, 3072), BF16, seed, scale=2.0), randn((257, 3072), BF16, seed + 100))),
     ]
 
 
 def test_fma_contraction_of_the_goldens(rmsnorm):
     """Build every golden with ``enable_fp_fusion`` True (what ``compile_specs`` asks for) and False, and compare.
 
-    Measured on sm_103 (Triton 3.5.1): the numbers are printed; the table is in the report of the change that
-    added this test. The assertions are structural: switching contraction off never adds an FMA, and the two builds
-    stay within the tolerance of the reference.
+    Measured on sm_103 (Triton 3.5.1), seeds 0 to 2; the numbers are printed (run with ``-s``):
+
+    =====================  ===================  ==========================================  =====================
+    golden                 FMA instructions     elements that differ, contraction on / off  machine code
+    =====================  ===================  ==========================================  =====================
+    softmax                0 / 0                0 of 257000                                 identical
+    layernorm              15 / 0               3 to 8 of 197376 (one bf16 ULP)             differs
+    residual_add_rmsnorm   4 / 0 (``f32x2``)    1 to 2 of 657920; the InOut f32: 0          differs
+    gelu_exact             56 / 56 (erf's own)  0 of 1048576                                identical
+    swiglu                 0 / 0                0 of 789504                                 differs
+    =====================  ===================  ==========================================  =====================
+
+    (swiglu's instructions differ without an FMA: ``-fmad false`` also keeps ptxas from fusing other pairs; its
+    results stay the same.) The assertions are structural: switching contraction off never adds an FMA, and both
+    builds stay within the tolerance of the reference. ``compile_specs`` still asks for the default (contraction
+    on); this test only reports what switching it off would change.
     """
-    for name, kernel, args in golden_cases(rmsnorm):
-        on, off = built(kernel), built(kernel, enable_fp_fusion=False)
+    for seed in (0, 1, 2):
+        for name, kernel, args in golden_cases(rmsnorm, seed):
+            on, off = built(kernel), built(kernel, enable_fp_fusion=False)
 
-        def count(b):
-            return sum(v for k, v in instructions(b.ptx).items() if k.startswith("fma."))
+            def count(b):
+                return sum(v for k, v in instructions(b.ptx).items() if k.startswith("fma."))
 
-        out_on = replay_all(kernel, args, {})
-        out_off = replay_all(kernel, args, {"enable_fp_fusion": False})
-        out_ref = replay_all(kernel, args, None)
-        report = []
-        for label, a, b in zip(["out", *[f"inout{i}" for i in range(len(out_on) - 1)]], out_on, out_off):
-            same = differing(a, b)
-            report.append(f"{label}: {same} of {a.numel()} elements differ ({100 * same / a.numel():.3f}%), max ULP {error(a, b)[0]}")
-        print(f"{name}: fma instructions on={count(on)} off={count(off)}; code digests {'equal' if on.sha256_code == off.sha256_code else 'differ'}; " + "; ".join(report))
-        assert count(off) <= count(on)
-        for a, b, r in zip(out_on, out_off, out_ref):
-            for built_output in (a, b):
-                ulp, absolute, _, _ = error(built_output, r)
-                assert (absolute <= 3e-5) if name == "gelu_exact" else (ulp <= (64 if built_output.dtype == F32 else 2)), name
+            def text(b):
+                elf = parse_elf(b.cubin)
+                return elf.data(elf.section(f".text.{b.symbol}"))
+
+            out_on = replay_all(kernel, args, {})
+            out_off = replay_all(kernel, args, {"enable_fp_fusion": False})
+            out_ref = replay_all(kernel, args, None)
+            report = []
+            for label, a, b in zip(["out", *[f"inout{i}" for i in range(len(out_on) - 1)]], out_on, out_off):
+                same = differing(a, b)
+                report.append(f"{label}: {same} of {a.numel()} elements differ, max ULP {error(a, b)[0]}")
+            same_code = "identical" if text(on) == text(off) else "differs"
+            print(f"seed {seed} {name}: fma on={count(on)} off={count(off)}, machine code {same_code}; " + "; ".join(report))
+            assert count(off) <= count(on)
+            for a, b, r in zip(out_on, out_off, out_ref):
+                for built_output in (a, b):
+                    ulp, absolute, _, _ = error(built_output, r)
+                    assert (absolute <= 3e-5) if name == "gelu_exact" else (ulp <= (64 if built_output.dtype == F32 else 2)), name
 
 
 def replay_all(kernel, args, options):

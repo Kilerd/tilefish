@@ -146,7 +146,7 @@ Notes (the facts behind the table):
    FMA, for bf16. Without contraction it is ``mul.rn`` then ``add.rn`` (two roundings). The two results differ
    in 23% of random elements (22.9% in bf16, 23.4% in f32), and the contracted one is exactly the correctly
    rounded value of the exact product and sum. Contraction also changes the bytes of the goldens that have a
-   contractable ``a * b + c`` (layernorm: 3 of 197376 elements, one bf16 ULP; the README rmsnorm: 1 of 657920);
+   contractable ``a * b + c`` (layernorm: 3 to 8 of 197376 elements, one bf16 ULP; the README rmsnorm: 1 to 2 of 657920);
    softmax, gelu and swiglu come out byte-identical either way.
 3. **Scalars.** Triton 3.5.1 keeps the dtype of the tensor: a python float or a constexpr float combined with
    a bf16 tensor is bf16 (``tl.static_assert`` in a compiled kernel says so), and the scalar is rounded to
