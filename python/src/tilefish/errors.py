@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pickle
+
 
 class TilefishError(Exception):
     """Base class of every error raised by tilefish."""
@@ -24,3 +26,7 @@ class TilefishSpecError(TilefishError, ValueError):
 
 class TilefishAttributeError(TilefishError, AttributeError):
     """An attribute or method that traced values do not have (in M1)."""
+
+
+class TilefishPicklingError(TilefishError, pickle.PicklingError):
+    """A declared operator cannot be pickled by reference (it is not a module-level object)."""

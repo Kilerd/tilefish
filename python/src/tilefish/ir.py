@@ -78,7 +78,9 @@ class Node:
 
     A call's ``outputs`` are the declared return values, then the ``Out``
     parameters, then one new version of each ``InOut`` argument (after the
-    call, reading that argument reads the new version).
+    call, reading that argument reads the new version). A ``store`` into an
+    ``InOut`` parameter has one output, the parameter's new version (a store
+    copies its value; it has no output for an ``Out`` parameter).
     """
 
     __slots__ = ("op", "inputs", "attrs", "outputs")
@@ -130,7 +132,8 @@ class Graph:
         consts: Mapping[str, Any],
         nodes: Iterable[Node],
         outputs: "Iterable[Value]",
-        requirements: Iterable[Requirement],
+        requirements: "Iterable[Requirement | BucketRequirement]",
+        finals: "Mapping[str, Value] | None" = None,
     ) -> None:
         self.name = name
         self.kind = kind
@@ -139,6 +142,8 @@ class Graph:
         self.nodes = tuple(nodes)
         self.outputs = tuple(outputs)
         self.requirements = tuple(requirements)
+        # The last version of every InOut parameter the body modified, by parameter name.
+        self.finals: dict[str, "Value"] = dict(finals or {})
 
     @property
     def symbols(self) -> tuple:
@@ -167,6 +172,8 @@ class Graph:
         lines = [f"{self.kind} {self.name}({', '.join(params)}) -> ({outs}):"]
         lines += [f"  {n}" for n in self.nodes]
         lines.append("  return " + ", ".join(v.ref for v in self.outputs))
+        for name, v in self.finals.items():
+            lines.append(f"  final {name} = {v.ref}")
         for r in self.requirements:
             lines.append(f"  requires {r}")
         return "\n".join(lines)

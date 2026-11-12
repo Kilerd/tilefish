@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import inspect
 import re
+import sys
 from typing import Any, Callable
 
 from .dims import DimExpr, as_dim
 from .dtypes import DType
-from .errors import TilefishDeclarationError, TilefishError, TilefishTypeError
+from .errors import TilefishDeclarationError, TilefishError, TilefishPicklingError, TilefishTypeError
 from .ir import Graph
 from .signature import MISSING, Param, Signature, call_op, parse_signature
 from .trace import Const, TraceContext, Value
@@ -43,8 +44,23 @@ class Op:
         """Validate a ``const`` argument supplied at a call site."""
         return value
 
+    def __copy__(self) -> "Op":
+        return self  # a declared operator is immutable
+
+    def __deepcopy__(self, memo: Any) -> "Op":
+        return self
+
     def __reduce__(self) -> Any:
-        # Declared operators are module-level objects: copy and pickle them by reference.
+        # Declared operators are module-level objects: pickle them by reference.
+        obj: Any = sys.modules.get(self.__module__)
+        for part in self.__qualname__.split("."):
+            obj = getattr(obj, part, None)
+        if "<locals>" in self.__qualname__ or obj is not self:
+            raise TilefishPicklingError(
+                f"cannot pickle {self.kind} op '{self.name}': operators are pickled by reference, so it must be a "
+                f"module-level object reachable as {self.__module__}.{self.__qualname__} "
+                "(it is defined inside a function or was rebound)"
+            )
         return self.__qualname__
 
     def __str__(self) -> str:
@@ -101,7 +117,8 @@ def _trace_body(fn: Callable[..., Any], signature: Signature, name: str, kind: s
                     f"kernel '{name}': {label} parameter '{v.name}' is never written; assign it with "
                     f"{v.name}[...] = value (or pass it to an in-place operator)"
                 )
-    return Graph(name, kind, inputs, consts, ctx.nodes, outputs, ctx.requirements)
+    finals = {v.name: v.live for v in inputs if v.access == "inout" and v.live is not v}
+    return Graph(name, kind, inputs, consts, ctx.nodes, outputs, ctx.requirements, finals)
 
 
 def _name_scope(e: TilefishError, kind: str, name: str) -> None:
@@ -220,7 +237,7 @@ def kernel(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> 
 
 # -- extern -----------------------------------------------------------------------------------
 
-_TRITON_REF = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
+_TRITON_REF = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*\Z")
 _NUM_WARPS = (1, 2, 4, 8, 16, 32)
 
 
@@ -261,15 +278,45 @@ def _triton_target(obj: Any) -> _TritonTarget:
         raise TilefishDeclarationError(
             f"extern: triton= takes a 'module:function' string or a kernel object, got {obj!r}"
         )
-    for cand in chain:
-        names = getattr(cand, "arg_names", None)
-        if names is not None:
+    # Take the parameter list from wherever it exists in the chain; wrappers that disagree are an error.
+    names_at: list[tuple[str, list[str]]] = []
+    flags_at: list[tuple[str, list[bool]]] = []
+    try:
+        for cand in chain:
+            label = type(cand).__name__
+            names = getattr(cand, "arg_names", None)
+            if names is not None:
+                names_at.append((label, [str(n) for n in names]))
             params = getattr(cand, "params", None)
-            flags = None
             if params is not None and all(hasattr(pr, "is_constexpr") for pr in params):
-                flags = [bool(pr.is_constexpr) for pr in params]
-            return _TritonTarget(ref, [str(n) for n in names], flags)
-    return _TritonTarget(ref)
+                flags_at.append((label, [bool(pr.is_constexpr) for pr in params]))
+                if all(hasattr(pr, "name") for pr in params):
+                    names_at.append((f"{label}.params", [str(pr.name) for pr in params]))
+    except TypeError:
+        raise TilefishDeclarationError(
+            f"extern: the kernel object for '{ref}' has an arg_names or params attribute that is not a list"
+        ) from None
+    names = _consensus(ref, "parameter names", names_at)
+    flags = _consensus(ref, "constexpr flags", flags_at)
+    if names is not None and flags is not None and len(names) != len(flags):
+        raise TilefishDeclarationError(
+            f"extern: the kernel object for '{ref}' lists {len(names)} parameter names but {len(flags)} "
+            "constexpr flags"
+        )
+    return _TritonTarget(ref, names, flags)
+
+
+def _consensus(ref: str, what: str, found: "list[tuple[str, list]]") -> "list | None":
+    if not found:
+        return None
+    first_label, first = found[0]
+    for label, other in found[1:]:
+        if other != first:
+            raise TilefishDeclarationError(
+                f"extern: the wrappers around the Triton kernel '{ref}' disagree about its {what}: "
+                f"{first_label} says {first}, {label} says {other}"
+            )
+    return first
 
 
 def _check_against_kernel(name: str, sig: Signature, target: _TritonTarget) -> None:

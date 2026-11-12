@@ -29,6 +29,7 @@ from .errors import (
     TilefishAttributeError,
     TilefishDeclarationError,
     TilefishError,
+    TilefishPicklingError,
     TilefishSpecError,
     TilefishTypeError,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "TilefishAttributeError",
     "TilefishDeclarationError",
     "TilefishError",
+    "TilefishPicklingError",
     "TilefishSpecError",
     "TilefishTypeError",
     "Value",
