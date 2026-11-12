@@ -43,7 +43,9 @@ class Requirement:
     origin: str
 
     def __str__(self) -> str:
-        return f"{self.dim} % {self.divisor} == 0  (required by {self.origin})"
+        # `%` binds tighter than `+`: a sum or a scaled dimension needs parentheses to read as intended
+        dim = str(self.dim) if self.dim.is_atom else f"({self.dim})"
+        return f"{dim} % {self.divisor} == 0  (required by {self.origin})"
 
 
 @dataclass(frozen=True)
