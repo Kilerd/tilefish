@@ -27,7 +27,7 @@ _SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 def _require_value(op: str, label: str, x: Any) -> Value:
     """Check that ``x`` is a readable traced tensor and return the version a read sees now.
 
-    A parameter reads its newest version; a value that an in-place call consumed cannot be read.
+    A parameter reads its newest version; a value that an in-place call or a store consumed cannot be read.
     """
     if not isinstance(x, Value):
         raise TilefishTypeError(f"{op}: {label} must be a traced tensor value, got {type(x).__name__} ({x!r})")
@@ -188,9 +188,9 @@ def cast(x: Value, dtype: DType) -> Value:
 
     A cast to the dtype the tensor already has emits no node and behaves exactly like reading the
     tensor at that point: it returns the version that is current at the time of the cast, and that
-    version does not follow later updates (an in-place call consumes it and reading it then raises;
-    a later store into the parameter leaves it as it was). This holds before a parameter's first
-    store as well as after it.
+    version does not follow later updates: a later in-place call or store into the parameter consumes
+    it, and reading it then raises (the updated tensor is its ``.live``). This holds before a
+    parameter's first store as well as after it.
     """
     x = _require_value("to", "the tensor", x)
     if isinstance(dtype, BlockScaled) or isinstance(x.dtype, BlockScaled):
@@ -387,6 +387,12 @@ def store(target: Any, key: Any, value: Any) -> None:
     and their order never rests on node order alone. Storing a parameter into itself (``x[...] = x``)
     is a copy onto itself: it is recorded like any store, but it is not a write, so it does not satisfy
     a kernel's check that every ``Out``/``InOut`` parameter is written.
+
+    A store overwrites the buffer of the version it replaces, so that version is *consumed*, exactly as
+    by an in-place call: reading an older version of the parameter afterwards (a ``.live`` taken
+    earlier, a no-op cast of the parameter) raises and points to ``.live``, instead of needing a hidden
+    copy at lowering time. The name of the parameter follows its newest version. The stored ``value`` is
+    only copied and is not consumed (``x[...] = x`` is the one case where it is the replaced version).
     """
     if not isinstance(target, Value):
         raise TilefishTypeError(f"store: target must be a traced tensor, got {type(target).__name__}")
@@ -412,5 +418,8 @@ def store(target: Any, key: Any, value: Any) -> None:
     if value is not current:  # `x[...] = x` copies a tensor onto itself: a node, but not a write
         target.ctx.written.add(target)
     if outs:
+        # the store overwrites the buffer of the version it replaces: that version is consumed, like by an
+        # in-place call (a stored value is only copied, not consumed). The name of the parameter follows.
+        current._consumed_by = (target.ctx.nodes[-1], target.name)
         current._latest = outs[0]
         target._latest = outs[0]

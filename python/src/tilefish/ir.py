@@ -90,9 +90,10 @@ class Node:
 
     A ``store`` into a parameter has the target's current version as its first
     input and the stored value as its second (``store(%current, %value)``). For
-    an ``InOut`` parameter it has one output, the parameter's new version (a
-    store copies its value, and consumes nothing); for an ``Out`` parameter,
-    which has no versions, it has no output.
+    an ``InOut`` parameter it has one output, the parameter's new version; like
+    an in-place call it consumes the version it replaces (the stored value is
+    only copied, not consumed); for an ``Out`` parameter, which has no
+    versions, it has no output.
     """
 
     __slots__ = ("op", "inputs", "attrs", "outputs")

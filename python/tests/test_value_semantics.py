@@ -1,8 +1,8 @@
-"""Values have value semantics: an in-place call consumes the version it reads, and a no-op cast is a read.
+"""Values have value semantics: an in-place call or a store consumes the version it replaces, and a no-op cast is a read.
 
 A parameter's name follows its newest version. Every other value (a temporary, a split chunk, an older
-version) is immutable: once an in-place call consumed it, reading it raises instead of silently
-reading storage that was updated.
+version) is immutable: once an in-place call or a store consumed it, reading it raises instead of
+silently reading storage that was updated.
 """
 
 import pytest
@@ -255,85 +255,222 @@ def test_the_docs_say_so():
 # -- a no-op cast reads the value at that point ------------------------------------------------------------------------------------------------
 
 
-def test_a_noop_cast_is_a_read_at_that_point_before_the_first_store():
+def update_in_place(x, y):
+    inplace(x)
+
+
+def update_by_store(x, y):
+    x[...] = y
+
+
+UPDATES = pytest.mark.parametrize(
+    "update,consumer",
+    [
+        (update_in_place, "the in-place call to 'inplace' (InOut parameter 'x')"),
+        (update_by_store, "the store into 'x'"),
+    ],
+    ids=["in-place-call", "store"],
+)
+FIRST_STORE = pytest.mark.parametrize("first_store", [False, True], ids=["before-first-store", "after-first-store"])
+
+
+@FIRST_STORE
+def test_a_noop_cast_is_a_read_at_that_point(first_store):
     @tilefish.graph
-    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
-        c = x.to(bf16)  # no-op: the value x has right now
-        x[...] = y  # a store gives x a new version ...
-        a = c + 0  # ... which c does not follow
-        x[...] = z
-        b = c + 0  # nor this one
-        return a, b, x
+    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16]):
+        if first_store:
+            x[...] = y
+        c = x.to(bf16)  # no-op: the version x has right now
+        a = c + 0  # reading it is reading that version
+        b = c + 1  # as often as you like
+        return a, b
 
-    graph = g.graph
-    x = graph.inputs[0]
-    store1, add_a, store2, add_b = graph.nodes
-    assert add_a.inputs[0] is x and add_b.inputs[0] is x  # both read the parameter as it was passed in
-    assert store1.inputs[0] is x and store2.inputs[0] is store1.outputs[0]
-    assert graph.outputs[2] is store2.outputs[0]  # the name x reads the newest version
+    nodes = g.graph.nodes
+    seen = nodes[0].outputs[0] if first_store else g.graph.inputs[0]  # the store's version, or x as passed in
+    assert nodes[-2].inputs[0] is seen and nodes[-1].inputs[0] is seen
 
 
-def test_a_noop_cast_is_a_read_at_that_point_after_the_first_store():
-    @tilefish.graph
-    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
-        x[...] = y
-        c = x.to(bf16)  # no-op: the version the store made
-        x[...] = z  # a later store ...
-        a = c + 0  # ... leaves it as it was
-        return a, x
-
-    store1, store2, add_a = g.graph.nodes[0], g.graph.nodes[1], g.graph.nodes[2]
-    assert add_a.inputs[0] is store1.outputs[0]
-    assert g.graph.outputs[1] is store2.outputs[0]
-
-
-@pytest.mark.parametrize("first_store", [False, True], ids=["before-first-store", "after-first-store"])
-def test_a_noop_cast_does_not_follow_a_later_in_place_update(first_store):
-    with pytest.raises(TilefishTypeError, match=STALE) as info:
+@UPDATES
+@FIRST_STORE
+def test_a_noop_cast_does_not_follow_a_later_update_and_reading_it_raises(first_store, update, consumer):
+    with pytest.raises(TilefishTypeError, match=r"reads %\w+, which .* already consumed") as info:
 
         @tilefish.graph
         def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16]):
             if first_store:
                 x[...] = y
             c = x.to(bf16)
-            inplace(x)  # consumes the version c read
+            update(x, y)  # consumes the version c read
             return c + 0  # c does not silently become the update
 
-    assert "in-place call to 'inplace' (InOut parameter 'x')" in str(info.value)
-    assert "`.live`" in str(info.value)
+    text = str(info.value)
+    assert f"which {consumer} already consumed" in text
+    assert "`.live`" in text
 
 
-@pytest.mark.parametrize("first_store", [False, True], ids=["before-first-store", "after-first-store"])
-def test_the_updated_tensor_after_a_noop_cast_is_reached_through_live_or_the_name(first_store):
+@UPDATES
+@FIRST_STORE
+def test_the_updated_tensor_after_a_noop_cast_is_reached_through_live_or_the_name(first_store, update, consumer):
     @tilefish.graph
     def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16]):
         if first_store:
             x[...] = y
         c = x.to(bf16)
-        inplace(x)
+        update(x, y)
         return c.live + 0, x + 0
 
-    *_, bump, add_c, add_x = g.graph.nodes
-    assert add_c.inputs[0] is new_version(bump) and add_x.inputs[0] is new_version(bump)
+    *_, write, add_c, add_x = g.graph.nodes
+    assert add_c.inputs[0] is new_version(write) and add_x.inputs[0] is new_version(write)
 
 
-def test_a_noop_cast_is_the_same_before_and_after_the_first_store():
-    """The cast of a parameter is a reference to its current version in both cases, never the parameter itself."""
+def test_a_noop_cast_is_a_reference_before_the_first_store_and_the_version_after_it():
+    """The cast of a parameter is its current version in both cases, never the parameter object itself."""
 
     @tilefish.graph
     def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16]):
         before = x.to(bf16)
         assert before is not x  # not the parameter, whose name follows later updates
         assert before.type == x.type and before.ref == x.ref and not before.is_param
+        assert before.live is x
+        a = before + 0
         x[...] = y
         after = x.to(bf16)
         assert after is x.live  # already a version, immutable like any value
         assert after.live is after
-        return before + 0, after + 0
+        return a, after + 0
 
-    store, add_before, add_after = g.graph.nodes
+    add_before, store, add_after = g.graph.nodes
     assert add_before.inputs[0] is g.graph.inputs[0]  # the parameter as it was passed in
     assert add_after.inputs[0] is store.outputs[0]  # the version the store made
+
+
+# -- a store consumes the version it replaces, like an in-place call ------------------------------------------------------------------------
+
+
+def test_reading_an_older_version_of_a_parameter_after_a_store_raises():
+    with pytest.raises(TilefishTypeError, match=r"which the store into 'x' already consumed.*`\.live` \(here %1\)") as info:
+
+        @tilefish.graph
+        def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+            x[...] = y
+            v1 = x.live  # the version the first store made
+            x[...] = z  # overwrites it
+            return v1 + 1
+
+    assert "in graph 'g': add (+): left operand reads %0" in str(info.value)
+    assert "a store overwrites its target" in str(info.value)
+
+
+def test_the_store_that_consumed_a_version_is_named_in_the_message_for_every_kind_of_read():
+    for use in (lambda v: v + 1, lambda v: tilefish.silu(v), lambda v: v.to(f32), lambda v: combine(v, v), lambda v: inplace(v)):
+        with pytest.raises(TilefishTypeError, match=r"the store into 'x' already consumed"):
+
+            @tilefish.graph
+            def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+                x[...] = y
+                v1 = x.live
+                x[...] = z
+                use(v1)
+
+
+def test_the_parameter_name_follows_its_newest_version_through_stores():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+        x[...] = y
+        a = x + 0
+        x[...] = z
+        b = x + 0
+        return a, b, x
+
+    s1, a, s2, b = g.graph.nodes
+    assert a.inputs[0] is s1.outputs[0] and b.inputs[0] is s2.outputs[0]
+    assert g.graph.outputs == (a.outputs[0], b.outputs[0], s2.outputs[0])
+
+
+def test_the_live_version_of_a_consumed_version_reads_the_newest():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+        x[...] = y
+        v1 = x.live
+        x[...] = z
+        return v1.live + 1  # the explicit way to the new version
+
+    s1, s2, add = g.graph.nodes
+    assert add.inputs[0] is s2.outputs[0]
+
+
+def test_the_stored_value_is_copied_and_not_consumed():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16]):
+        r = y + 1
+        x[...] = r  # copies r into x
+        x[...] = r  # and again: r is still a readable value
+        return r + 1, y + 2  # y and r are untouched
+
+    add, s1, s2, add_r, add_y = g.graph.nodes
+    assert s1.inputs == (g.graph.inputs[0], add.outputs[0])
+    assert s2.inputs == (s1.outputs[0], add.outputs[0])
+    assert add_r.inputs[0] is add.outputs[0]
+
+
+def test_a_stored_parameter_value_is_not_consumed_but_the_target_is():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]], y: InOut[Tensor[M, bf16]]):
+        x[...] = y  # y is only copied
+        v1 = x.live
+        y[...] = x  # x's newest version is only copied; y's old version is replaced
+        return y + 0, v1 + 0  # v1 is still x's newest version: nothing replaced it
+
+    graph = g.graph
+    sx, sy, add_y, add_v1 = graph.nodes
+    assert sy.inputs == (graph.inputs[1], sx.outputs[0])
+    assert add_v1.inputs[0] is sx.outputs[0]
+
+
+def test_a_self_store_consumes_the_version_it_copies_onto_itself():
+    with pytest.raises(TilefishTypeError, match=r"the store into 'x' already consumed"):
+
+        @tilefish.graph
+        def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16]):
+            x[...] = y
+            v1 = x.live
+            x[...] = x  # v1 is both the stored value and the version that is replaced
+            return v1 + 0
+
+
+def test_an_out_parameter_has_no_versions_to_consume():
+    @tilefish.kernel
+    def k(x: Tensor[M, bf16], y: tilefish.Out[Tensor[M, bf16]]):
+        y[...] = x
+        y[...] = x + 1
+
+    assert k.graph.ops() == ["store", "add", "store"]
+
+
+def test_a_store_consumes_the_pinned_reference_of_a_noop_cast_and_a_store_after_it_does_too():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+        c0 = x.to(bf16)  # a reference to x as passed in
+        a = c0 + 0  # fine while nothing replaced it
+        x[...] = y  # consumes it
+        c1 = x.to(bf16)  # the store's version
+        b = c1 + 0
+        x[...] = z  # consumes that one too
+        return a, b, x
+
+    add_a, s1, add_b, s2 = g.graph.nodes
+    assert add_a.inputs[0] is g.graph.inputs[0] and add_b.inputs[0] is s1.outputs[0]
+
+    for stale in ("c0", "c1"):
+        with pytest.raises(TilefishTypeError, match=r"the store into 'x' already consumed"):
+
+            @tilefish.graph
+            def h(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+                c0 = x.to(bf16)
+                x[...] = y
+                c1 = x.to(bf16)
+                x[...] = z
+                return (c0 if stale == "c0" else c1) + 0
 
 
 def test_a_noop_cast_of_the_cast_and_other_uses():

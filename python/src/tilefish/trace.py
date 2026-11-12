@@ -163,8 +163,9 @@ class Value:
       in-place call (a call that passes it as an ``InOut`` argument) *consumes* it and produces a new
       version, which only :attr:`live` reaches: reading the consumed value afterwards raises
       :class:`~tilefish.errors.TilefishTypeError` naming the call, instead of silently reading
-      storage that was updated. A store (``param[...] = v``) copies ``v``; it neither consumes ``v``
-      nor the version of the parameter it replaces.
+      storage that was updated. A store (``param[...] = v``) consumes the version of the parameter it
+      replaces in the same way, because it overwrites that buffer: reading an older version of the
+      parameter after the store raises too. The stored value ``v`` is copied and not consumed.
     """
 
     __slots__ = ("ctx", "name", "type", "access", "is_param", "_latest", "_consumed_by", "_pinned")
@@ -228,9 +229,14 @@ class Value:
         consumed = target._consumed_by
         if consumed is not None:
             node, param = consumed
+            if node.op == "store":
+                what = f"the store into '{param}'"
+                why = "a store overwrites its target with a new version and the old value is gone"
+            else:
+                what = f"the in-place call to '{node.op}' (InOut parameter '{param}')"
+                why = "an in-place call replaces its argument with a new version and the old value is gone"
             raise TilefishTypeError(
-                f"{use} reads {self.ref}, which the in-place call to '{node.op}' (InOut parameter '{param}') already "
-                f"consumed: an in-place call replaces its argument with a new version and the old value is gone. "
+                f"{use} reads {self.ref}, which {what} already consumed: {why}. "
                 f"Read the updated tensor with `.live` (here {target.live.ref}) instead"
             )
         return target
