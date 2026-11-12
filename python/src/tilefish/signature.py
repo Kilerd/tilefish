@@ -340,14 +340,8 @@ class _Unifier:
                     raise TilefishTypeError(
                         f"{origin}: {var} is bucketed over {list(var.buckets)} but dimension {axis} is {value.value}"
                     )
-            elif isinstance(value, Dim) and value.buckets:
-                extra = [b for b in value.buckets if b not in var.buckets]
-                if extra:
-                    raise TilefishTypeError(
-                        f"{origin}: {var} is bucketed over {list(var.buckets)} but {value} has "
-                        f"buckets {list(value.buckets)} (not covered: {extra})"
-                    )
             else:
+                _check_buckets_overlap(origin, str(var), var.buckets, value)
                 self.ctx.require_bucket(value, var.buckets, origin)
         self.bindings[var] = value
         self.bound_by[var] = f"argument '{pname}'"
@@ -377,6 +371,19 @@ class _Unifier:
             )
         return TensorType(
             [d.subst(self.bindings) for d in t.shape], t.dtype, known=self.ctx.known, contiguous=t.contiguous
+        )
+
+
+def _check_buckets_overlap(origin: str, name: str, buckets: "tuple[int, ...]", value: DimExpr) -> None:
+    """A bucketed dim passed to a bucketed callee dim: the bucket sets must at least overlap.
+
+    A subset needs nothing; a superset or a partial overlap becomes a bucket requirement (a runtime
+    check that the value is one of the callee's buckets); disjoint sets can never match.
+    """
+    if isinstance(value, Dim) and value.buckets and not set(value.buckets) & set(buckets):
+        raise TilefishTypeError(
+            f"{origin}: {name} is bucketed over {list(buckets)} but {value} has buckets "
+            f"{list(value.buckets)} (no bucket in common)"
         )
 
 
@@ -433,6 +440,7 @@ def _apply_callee_requirement(
                     f"but this call binds it to {expr.value}"
                 )
         else:
+            _check_buckets_overlap(f"{op.name}: its body ({r.origin})", str(r.dim), r.buckets, expr)
             ctx.require_bucket(expr, r.buckets, origin)
 
 
@@ -499,7 +507,7 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
         if not at.contiguous:
             raise TilefishTypeError(
                 f"{op.name}: argument '{p.name}' is a strided view ({at}); strided views arrive in M2, "
-                "pass the unsplit tensor"
+                "pass the unsplit tensor (a chunk that does not start on a 16-byte boundary is a view too)"
             )
         if at.rank != pt.rank:
             raise TilefishTypeError(
