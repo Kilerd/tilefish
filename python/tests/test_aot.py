@@ -551,6 +551,7 @@ def test_specs_round_trip_through_dict_and_json():
     assert back.constants == {(1,): 64, (4,): float("-inf")}
     assert back.attrs[(0,)] == PTR16 and isinstance(back.block, tuple)
     assert back.launch_params[-1].value == 0
+    back.verify_against(mixed_order)  # a spec read back must be verified before it feeds triton.compile
     assert back.ast_source_inputs().constants == {(1,): 64, (4,): float("-inf")}
 
     @tilefish.extern(triton="m:f", grid=(1,))

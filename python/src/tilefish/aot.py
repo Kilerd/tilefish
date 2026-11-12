@@ -37,7 +37,11 @@ and self-consistent, which does not mean it is the spec of any particular declar
 self-consistent edit, such as a constexpr value changed in ``constants`` and in ``args`` alike,
 still validates and would select a different binary). Before compiling from or launching with a
 stored spec, call ``spec.verify_against(op)``: it regenerates the spec from the declaration and
-requires an exact match, naming the first field that differs. Every spec also carries
+requires an exact match, naming the first field that differs. ``ast_source_inputs()`` enforces
+this: it raises on a spec that is not :attr:`~CompileSpec.verified`. Specs from ``compile_specs`` are
+verified; specs from ``from_dict`` / ``from_json`` start unverified and become verified after a
+successful ``verify_against`` (editing one afterwards, even inside its dicts, withdraws it). The flag
+is never serialized. Every spec also carries
 ``declaration_digest``, a sha256 over the canonical declaration (see :func:`declaration_digest`),
 which a tool without the declaration at hand can compare.
 
@@ -243,6 +247,10 @@ class CompileSpec:
     # sha256 of the canonical declaration this spec was generated from (see declaration_digest). ``None`` for
     # a spec read from schema 1, which has none: such a spec cannot be verified, only regenerated.
     declaration_digest: str | None = None
+    # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
+    # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
+    # shown, and not in to_dict, so it never round-trips as "verified".
+    _verified: str | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def triton_module(self) -> str:
@@ -252,8 +260,50 @@ class CompileSpec:
     def triton_function(self) -> str:
         return self.triton.split(":", 1)[1]
 
+    def _fingerprint(self) -> str:
+        """A hash of everything that is serialized, types included (``1``, ``1.0`` and ``True`` differ)."""
+        return hashlib.sha256(json.dumps(self.to_dict(), sort_keys=True, allow_nan=False).encode("utf-8")).hexdigest()
+
+    @property
+    def verified(self) -> bool:
+        """Whether this spec is known to be what its declaration generates, and has not changed since.
+
+        A spec from :func:`compile_specs` is verified. A spec from :meth:`from_dict` or :meth:`from_json`
+        starts unverified and becomes verified after a successful :meth:`verify_against`. Editing it
+        (including the dicts inside it) afterwards makes it unverified again.
+        """
+        if self._verified is None:
+            return False
+        try:
+            return self._fingerprint() == self._verified
+        except (TypeError, ValueError):
+            return False
+
+    def _mark_verified(self) -> None:
+        object.__setattr__(self, "_verified", self._fingerprint())
+
     def ast_source_inputs(self) -> AstSourceInputs:
-        """The ``signature``/``attrs``/``constants`` and compile options, as fresh copies."""
+        """The ``signature``/``attrs``/``constants`` and compile options, as fresh copies.
+
+        Only a :attr:`verified` spec may be used to compile: a spec that came from ``from_dict`` or
+        ``from_json`` must pass :meth:`verify_against` first, otherwise this raises
+        :class:`TilefishSpecError`. (Specs from :func:`compile_specs` are verified already.)
+        """
+        if not self.verified:
+            if self._verified is not None:
+                raise TilefishSpecError(
+                    f"compile spec '{self.stem}' was modified after it was verified; call spec.verify_against(op) "
+                    "again (or regenerate it with compile_specs(op))"
+                )
+            if not self.verifiable:
+                raise TilefishSpecError(
+                    f"compile spec '{self.stem}' is schema {LEGACY_SCHEMA} and has not been verified, and it cannot "
+                    "be: regenerate it with compile_specs(op)"
+                )
+            raise TilefishSpecError(
+                f"compile spec '{self.stem}' has not been verified against its declaration, so it must not be "
+                "compiled: call spec.verify_against(op) first (a spec from compile_specs(op) is already verified)"
+            )
         return AstSourceInputs(
             signature=dict(self.signature),
             attrs=copy.deepcopy(self.attrs),
@@ -355,7 +405,11 @@ class CompileSpec:
 
         A spec read from schema 1 has no digest and no constexpr dtypes, so it cannot be verified:
         this raises, and the spec has to be regenerated with :func:`compile_specs`.
+
+        On success the spec becomes :attr:`verified`, which :meth:`ast_source_inputs` requires; a failed
+        call leaves it unverified.
         """
+        object.__setattr__(self, "_verified", None)
         if self.declaration_digest is None:
             raise TilefishSpecError(
                 f"compile spec '{self.stem}' is schema {LEGACY_SCHEMA}: it has no declaration digest and no "
@@ -379,6 +433,7 @@ class CompileSpec:
                 f"compile spec '{self.stem}' does not match the declaration of extern op '{op.name}': "
                 f"first difference at {path}: the spec has {_show(got)}, the declaration gives {_show(want)}"
             )
+        self._mark_verified()
 
     @classmethod
     def from_json(cls, text: str) -> "CompileSpec":
@@ -648,7 +703,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
     launch = [LaunchParam(a.name, a.type) for a in args if a.kind != "constexpr"]
     launch += [LaunchParam("global_scratch", "u64", 0), LaunchParam("profile_scratch", "u64", 0)]
     stem = op.name + "".join(f".{d.name}{v}" for d, v in mapping.items())
-    return CompileSpec(
+    spec = CompileSpec(
         stem=stem,
         op=op.name,
         triton=op.triton,
@@ -665,6 +720,8 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         buckets={d.name: v for d, v in mapping.items()},
         declaration_digest=digest,
     )
+    spec._mark_verified()  # generated from the declaration just now
+    return spec
 
 
 def compile_specs(op: ExternOp) -> list[CompileSpec]:

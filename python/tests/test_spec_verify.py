@@ -451,18 +451,21 @@ def test_schema_1_specs_are_still_read_but_cannot_be_verified():
     old = CompileSpec.from_dict(doc)
     assert old.schema == 1 and not old.verifiable and old.declaration_digest is None
     assert old.signature == SPEC.signature and old.constants == SPEC.constants and old.attrs == SPEC.attrs
-    assert old.ast_source_inputs() == SPEC.ast_source_inputs()  # still usable as before
     assert all(a.dtype is None for a in old.args if a.kind == "constexpr")
+    assert not old.verified
     with pytest.raises(TilefishSpecError, match=r"schema 1.*cannot be verified.*regenerate it with compile_specs") as info:
         old.verify_against(kernel)
     assert "kernel.S16" in str(info.value)
+    # and it cannot feed a compile either: there is nothing to verify it with
+    with pytest.raises(TilefishSpecError, match=r"schema 1 and has not been verified.*regenerate it with compile_specs"):
+        old.ast_source_inputs()
     # it is written back as schema 1, not silently upgraded to a schema 2 it cannot back up
     assert old.to_dict() == doc
     assert CompileSpec.from_json(old.to_json()) == old
     # regenerating gives a verifiable spec for the same binary
     fresh = {s.stem: s for s in compile_specs(kernel)}[old.stem]
     fresh.verify_against(kernel)
-    assert fresh.ast_source_inputs() == old.ast_source_inputs()
+    assert fresh.verified and fresh.ast_source_inputs().constants == old.constants
 
 
 def test_every_schema_1_document_of_every_binary_is_read():
