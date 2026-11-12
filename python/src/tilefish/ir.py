@@ -79,13 +79,20 @@ class Node:
     (``library``/``extern``/``kernel``/``graph``).
 
     A call's ``outputs`` are the declared return values, then the ``Out``
-    parameters, then one new version of each ``InOut`` argument (after the
-    call, reading that argument reads the new version). A ``store`` into a
-    parameter has the target's current version as its first input and the stored
-    value as its second (``store(%current, %value)``), which links consecutive
-    versions of the target by dataflow. For an ``InOut`` parameter it has one
-    output, the parameter's new version (a store copies its value; it has no
-    output for an ``Out`` parameter, which has no versions).
+    parameters, then one new version of each ``InOut`` argument. The call
+    *consumes* the version of each ``InOut`` argument it takes as an input and
+    replaces it with the new one: after the call, the argument's name (for a
+    parameter) reads the new version, and any other value that was consumed
+    can no longer be read. The consumed input is the argument's *current*
+    version, so consecutive updates form a chain through the inputs and
+    outputs of the nodes that write it. Updating a split chunk in place
+    produces a new version of the chunk only; the parent is not modified.
+
+    A ``store`` into a parameter has the target's current version as its first
+    input and the stored value as its second (``store(%current, %value)``). For
+    an ``InOut`` parameter it has one output, the parameter's new version (a
+    store copies its value, and consumes nothing); for an ``Out`` parameter,
+    which has no versions, it has no output.
     """
 
     __slots__ = ("op", "inputs", "attrs", "outputs")

@@ -161,7 +161,22 @@ class _AccessMarker:
 
 
 class InOut(_AccessMarker):
-    """``InOut[Tensor[...]]``: the operator reads and writes this tensor in place."""
+    """``InOut[Tensor[...]]``: the operator reads and writes this tensor in place.
+
+    Tensors have value semantics in a traced body. A call that passes a tensor as an ``InOut`` argument
+    *consumes* the version it reads and produces a new one (the call node's last outputs, one per
+    ``InOut`` argument; see :class:`~tilefish.ir.Node`):
+
+    * Reading the name of an ``InOut`` *parameter* afterwards reads the new version, so a body sees
+      what it has stored or updated.
+    * Any other tensor (a temporary, a split chunk, an older version) is an immutable value: reading
+      it after the call raises :class:`~tilefish.errors.TilefishTypeError` naming the call; the updated
+      tensor is its ``.live`` version.
+    * An in-place update of a **split chunk** does not change the chunk's parent. The type calls a chunk
+      along a non-leading axis a "view", but it is a value: the parent keeps its own version and the
+      update exists only as the chunk's new version (lowering copies; there is no write-through).
+    * Passing an ``InOut`` argument that is a read-only input of the enclosing graph is an error.
+    """
 
     mode = "inout"
 

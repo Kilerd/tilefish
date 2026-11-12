@@ -25,12 +25,15 @@ _SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 
 
 def _require_value(op: str, label: str, x: Any) -> Value:
-    """Check that ``x`` is a readable traced tensor and return its newest version."""
+    """Check that ``x`` is a readable traced tensor and return the version a read sees now.
+
+    A parameter reads its newest version; a value that an in-place call consumed cannot be read.
+    """
     if not isinstance(x, Value):
         raise TilefishTypeError(f"{op}: {label} must be a traced tensor value, got {type(x).__name__} ({x!r})")
     if x.access == "out":
         raise TilefishTypeError(f"{op}: {label} reads Out parameter '{x.name}', which is write-only")
-    return x.live
+    return x._current(f"{op}: {label}")
 
 
 def _require_computable(op: str, label: str, x: Value, *, floating: bool = False) -> DType:
@@ -181,7 +184,14 @@ def sqrt(x: Value) -> Value:
 
 
 def cast(x: Value, dtype: DType) -> Value:
-    """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point."""
+    """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point.
+
+    A cast to the dtype the tensor already has emits no node and behaves exactly like reading the
+    tensor at that point: it returns the version that is current at the time of the cast, and that
+    version does not follow later updates (an in-place call consumes it and reading it then raises;
+    a later store into the parameter leaves it as it was). This holds before a parameter's first
+    store as well as after it.
+    """
     x = _require_value("to", "the tensor", x)
     if isinstance(dtype, BlockScaled) or isinstance(x.dtype, BlockScaled):
         raise TilefishTypeError(
@@ -190,7 +200,7 @@ def cast(x: Value, dtype: DType) -> Value:
     if not isinstance(dtype, DType):
         raise TilefishTypeError(f"to: expected a dtype such as f32 or bf16, got {dtype!r}")
     if dtype == x.dtype:
-        return x
+        return x._reference()
     rounding = x.dtype.is_narrowing_to(dtype)
     (out,) = x.ctx.emit("cast", [x], {"to": dtype, "rounding": rounding}, [x.type.with_dtype(dtype)])
     return out
@@ -254,6 +264,11 @@ def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
     Splitting along a non-leading axis gives *views* (slabs at an offset with
     the parent's strides), typed non-contiguous: they can feed traced
     elementwise and reduction ops but cannot be passed to a declared operator.
+
+    A chunk is a value, even where its type says "view": an in-place call on a chunk (a call that takes
+    it as an ``InOut`` argument) consumes that chunk and produces a new version of the chunk. It does
+    **not** change the parent, which keeps its own version, and the siblings are untouched. Lowering
+    copies; there is no write-through to the parent.
     """
     x = _require_value("split", "the tensor", x)
     if isinstance(axis, bool) or not isinstance(axis, int) or not -x.rank <= axis < x.rank:

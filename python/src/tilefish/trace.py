@@ -154,12 +154,20 @@ _UNSUPPORTED = {
 class Value:
     """A traced tensor: carries a :class:`TensorType` and records every operation on it.
 
-    After ``param[...] = v`` (or an in-place call), reading ``param`` reads the
-    new version, so a body sees what it has stored. ``Out`` parameters are
-    write-only.
+    Values have value semantics, with one exception: the *name* of an ``InOut`` or ``Out`` parameter.
+
+    * A parameter's name follows its newest version. After ``param[...] = v`` (or an in-place call),
+      reading ``param`` reads the new version, so a body sees what it has stored. ``Out`` parameters
+      are write-only.
+    * Every other value (a temporary, a split chunk, an older version) is an immutable SSA value. An
+      in-place call (a call that passes it as an ``InOut`` argument) *consumes* it and produces a new
+      version, which only :attr:`live` reaches: reading the consumed value afterwards raises
+      :class:`~tilefish.errors.TilefishTypeError` naming the call, instead of silently reading
+      storage that was updated. A store (``param[...] = v``) copies ``v``; it neither consumes ``v``
+      nor the version of the parameter it replaces.
     """
 
-    __slots__ = ("ctx", "name", "type", "access", "is_param", "_latest")
+    __slots__ = ("ctx", "name", "type", "access", "is_param", "_latest", "_consumed_by", "_pinned")
     _tf_operand = True
 
     def __init__(self, ctx: TraceContext, name: str, type: TensorType, access: str, is_param: bool) -> None:
@@ -168,7 +176,12 @@ class Value:
         self.type = type
         self.access = access
         self.is_param = is_param
+        # the version that replaced this one: a store into the parameter, or an in-place call
         self._latest: Value | None = None
+        # the in-place call that consumed this value and the InOut parameter it was passed as
+        self._consumed_by: tuple[Node, str] | None = None
+        # set on a reference to one specific version of an InOut parameter (see _reference)
+        self._pinned: Value | None = None
 
     # -- inspection ---------------------------------------------------------
 
@@ -190,11 +203,51 @@ class Value:
 
     @property
     def live(self) -> "Value":
-        """The newest version of this value (itself unless it was stored into or updated in place)."""
-        v = self
+        """The newest version of this value (itself unless it was stored into or updated in place).
+
+        This is the explicit way to the updated tensor after an in-place call consumed a value.
+        """
+        v = self._pinned if self._pinned is not None else self
         while v._latest is not None:
             v = v._latest
         return v
+
+    def _current(self, use: str) -> "Value":
+        """The SSA value a read through this Python object sees right now (what operands and arguments use).
+
+        A parameter's name reads its newest version. Anything else reads itself, unless an in-place
+        call already consumed it: that raises, naming the call and how to reach the new version.
+        ``use`` says who is reading, for the message (``"add (+): left operand"``).
+        """
+        if self._pinned is not None:
+            target = self._pinned
+        elif self.is_param:
+            return self.live
+        else:
+            target = self
+        consumed = target._consumed_by
+        if consumed is not None:
+            node, param = consumed
+            raise TilefishTypeError(
+                f"{use} reads {self.ref}, which the in-place call to '{node.op}' (InOut parameter '{param}') already "
+                f"consumed: an in-place call replaces its argument with a new version and the old value is gone. "
+                f"Read the updated tensor with `.live` (here {target.live.ref}) instead"
+            )
+        return target
+
+    def _reference(self) -> "Value":
+        """This very version as an object that does not follow later updates of a parameter.
+
+        A temporary, a chunk or a version is already a value, and a read-only parameter is never
+        updated, so those are returned as they are. The name of an ``InOut`` parameter follows its
+        newest version, so a reference to the version it has *now* is a separate object that reads
+        exactly that version (and, like any value, raises once an in-place call has consumed it).
+        """
+        if not (self.is_param and self.access == "inout"):
+            return self
+        ref = Value(self.ctx, self.name, self.type, "in", False)
+        ref._pinned = self
+        return ref
 
     @property
     def producer(self) -> Node | None:

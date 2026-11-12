@@ -108,7 +108,8 @@ def _trace_body(fn: Callable[..., Any], signature: Signature, name: str, kind: s
             raise TilefishTypeError(f"{kind} '{name}': returned value {r.ref} belongs to a different trace")
         if r.access == "out":
             raise TilefishTypeError(f"{kind} '{name}': cannot return Out parameter '{r.name}' (it is write-only)")
-    outputs = tuple(r.live for r in outputs)  # a returned InOut parameter is the value stored into it
+    # a returned InOut parameter is the value stored into it; a value an in-place call consumed cannot be returned
+    outputs = tuple(r._current(f"{kind} '{name}': the returned value") for r in outputs)
     if kind == "kernel":
         for v in inputs:
             if v.access in ("out", "inout") and v not in ctx.written:
