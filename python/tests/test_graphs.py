@@ -62,7 +62,9 @@ def test_mlp_traces_to_the_expected_node_list():
 
     assert split.inputs == gemm_up.outputs
     assert split.attrs == {"axis": 1, "sizes": (F, F)}
-    assert split.output_types == (Tensor[M, F, bf16], Tensor[M, F, bf16])
+    # splitting along a non-leading axis gives strided views, typed as such
+    assert split.output_types == (Tensor[M, F, bf16].as_view(),) * 2
+    assert [t.contiguous for t in split.output_types] == [False, False]
 
     assert cast_g.inputs == (split.outputs[0],) and cast_g.output_types == (Tensor[M, F, f32],)
     assert silu.inputs == cast_g.outputs and silu.output_types == (Tensor[M, F, f32],)
@@ -82,7 +84,7 @@ def test_mlp_signature_and_text():
     assert mlp.signature.returns == (Tensor[M, H, bf16],)
     text = str(mlp.graph)
     assert text.startswith("graph mlp(%x: Tensor[M, H, bf16], %w_gu: Tensor[6144, H, blockscaled(e4m3, ue8m0, 32)]")
-    assert "%1: Tensor[M, F, bf16], %2: Tensor[M, F, bf16] = split(%0) {axis=1, sizes=(F, F)}" in text
+    assert "%1: View[M, F, bf16], %2: View[M, F, bf16] = split(%0) {axis=1, sizes=(F, F)}" in text
     assert "%7: Tensor[M, F, bf16] = cast(%6) {to=bf16, rounding=true}  # rounding point" in text
     assert text.endswith("return %8")
 

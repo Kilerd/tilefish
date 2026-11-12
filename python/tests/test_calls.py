@@ -467,7 +467,7 @@ def test_extern_declaration_errors():
         @tilefish.extern(triton="m:f", grid=lambda q: (q,))
         def e3(x: Tensor[M, bf16]): ...
 
-    with pytest.raises(TilefishDeclarationError, match="num_warps must be a positive int"):
+    with pytest.raises(TilefishDeclarationError, match="num_warps must be a power of two"):
         tilefish.extern(triton="m:f", num_warps=0)
 
 

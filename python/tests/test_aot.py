@@ -146,7 +146,9 @@ def test_bucketed_constexpr_expands_to_one_spec_per_bucket():
         assert s.signature == {"X": "*bf16", "Y": "*bf16", "BLOCK_S": "constexpr", "BLOCK_D": "constexpr"}
         assert s.attrs == {(0,): PTR16, (1,): PTR16}
         assert (s.num_warps, s.num_stages) == (4, 2)
-        assert s.grid == "(S, 20)"  # the static D folds: cdiv(2560, 128)
+    # exact buckets: the bucket value is substituted in the grid, and the static D folds
+    assert [s.grid for s in specs] == ["(32, 20)", "(64, 20)", "(128, 20)"]
+    assert [s.args[0].shape for s in specs] == [("32", "2560"), ("64", "2560"), ("128", "2560")]
     bucket = [p.to_dict() for p in specs[1].preconditions if p.kind == "bucket"]
     assert bucket == [{"kind": "bucket", "dim": "S", "value": 64, "buckets": [32, 64, 128]}]
 
@@ -362,3 +364,229 @@ def test_precondition_to_dict_omits_unset_fields():
         "axis": 0,
         "value": 8,
     }
+
+
+# -- argument indices with constexpr and keyword-only parameters before pointers and runtime dims ------------------
+
+nk = Dim("nk", divisible_by=16)
+
+
+@tilefish.extern(triton="my_kernels:mixed", grid=lambda nk: (nk,))
+def mixed_order(
+    x: Tensor[nk, bf16],
+    *,  # Python needs this: a parameter without a default may not follow one with a default
+    B: const = 64,
+    y: Out[Tensor[nk, bf16]],
+    cnt: nk,
+    E: const[f32] = float("-inf"),
+    w: InOut[Tensor[nk, f32]],
+    t: 2 * nk,
+    u: nk + 1,
+    v: nk - 16,
+): ...
+
+
+def test_argument_indices_follow_declaration_order_across_constexprs_and_keyword_only_params():
+    (spec,) = compile_specs(mixed_order)
+    assert list(spec.signature.items()) == [
+        ("x", "*bf16"),  # 0
+        ("B", "constexpr"),  # 1
+        ("y", "*bf16"),  # 2
+        ("cnt", "i32"),  # 3
+        ("E", "constexpr"),  # 4
+        ("w", "*fp32"),  # 5
+        ("t", "i32"),  # 6
+        ("u", "i32"),  # 7
+        ("v", "i32"),  # 8
+    ]
+    assert [(a.index, a.name, a.kind) for a in spec.args] == [
+        (0, "x", "pointer"),
+        (1, "B", "constexpr"),
+        (2, "y", "pointer"),
+        (3, "cnt", "scalar"),
+        (4, "E", "constexpr"),
+        (5, "w", "pointer"),
+        (6, "t", "scalar"),
+        (7, "u", "scalar"),
+        (8, "v", "scalar"),
+    ]
+    assert spec.constants == {(1,): 64, (4,): float("-inf")}
+    # pointers 0, 2, 5; cnt (nk), t (2*nk) and v (nk - 16) are multiples of 16; u (nk + 1) is not
+    assert set(spec.attrs) == {(0,), (2,), (3,), (5,), (6,), (8,)}
+    assert all(v == PTR16 for v in spec.attrs.values())
+    # launch parameters: the non-constexpr names in order, then the two scratch slots
+    assert [p.name for p in spec.launch_params] == ["x", "y", "cnt", "w", "t", "u", "v", "global_scratch", "profile_scratch"]
+    assert spec.grid == "(nk,)"
+    inp = spec.ast_source_inputs()
+    assert list(inp.signature_by_index) == list(range(9))
+    assert inp.constants == {(1,): 64, (4,): float("-inf")}
+
+
+def test_keyword_only_declaration_still_calls_with_the_documented_convention():
+    @tilefish.graph
+    def g(a: Tensor[nk, bf16], b: InOut[Tensor[nk, f32]]):
+        return mixed_order(a, w=b)  # arguments after the * are passed by keyword
+
+    (node,) = g.graph.nodes
+    assert node.attrs["inout"] == ("w",)
+    assert node.inputs == (g.graph.inputs[0], g.graph.inputs[1])
+    assert node.attrs["consts"]["B"] == 64
+    assert g.graph.outputs[0] is node.outputs[0]  # y; the new version of w is the last output
+    assert len(node.outputs) == 2
+
+    with pytest.raises(tilefish.TilefishTypeError, match="missing a required.*argument: 'w'"):
+
+        @tilefish.graph
+        def bad(a: Tensor[nk, bf16], b: InOut[Tensor[nk, f32]]):
+            return mixed_order(a)
+
+
+def test_python_forbids_a_bare_param_after_a_default_so_the_star_is_needed():
+    with pytest.raises(SyntaxError):
+        compile("def k(x, B=64, y): pass", "<test>", "exec")
+
+
+# -- bucket semantics are exact -------------------------------------------------------------------------------------------
+
+NH = Dim("NH", 32)
+Sb = Dim("S", buckets=[32, 64, 128])
+
+
+def test_static_dims_fold_in_the_grid_and_in_shapes():
+    @tilefish.extern(triton="m:f", grid=lambda S, NH: (S, NH))
+    def runtime_s(x: Tensor[Sb, NH, bf16], y: Out[Tensor[Sb, NH, bf16]], s: Sb, nh: const = NH): ...
+
+    (spec,) = compile_specs(runtime_s)  # S is only a runtime argument here, so no expansion
+    assert spec.stem == "runtime_s"
+    assert spec.grid == "(S, 32)"
+    assert spec.args[0].shape == ("S", "32")
+    assert spec.constants == {(3,): 32}
+
+    @tilefish.extern(triton="m:f", grid=lambda S, NH: (tilefish.cdiv(S, NH),))
+    def cd(x: Tensor[Sb, NH, bf16]): ...
+
+    assert cd.grid_string == "(cdiv(S, 32),)"
+
+    @tilefish.extern(triton="m:f", grid=lambda S, NH: (S, 2 * NH, NH + 0))
+    def arith(x: Tensor[Sb, NH, bf16]): ...
+
+    assert arith.grid_string == "(S, 64, 32)"
+
+
+def test_bucketed_specs_substitute_the_bucket_everywhere_it_is_used():
+    @tilefish.extern(triton="m:f", grid=lambda S, NH: (S, NH))
+    def a(x: Tensor[Sb, NH, bf16], y: Out[Tensor[Sb, NH, bf16]], nh: const = NH, B: const = Sb): ...
+
+    specs = compile_specs(a)
+    assert [s.stem for s in specs] == ["a.S32", "a.S64", "a.S128"]
+    assert [s.grid for s in specs] == ["(32, 32)", "(64, 32)", "(128, 32)"]
+    assert [s.constants for s in specs] == [{(2,): 32, (3,): 32}, {(2,): 32, (3,): 64}, {(2,): 32, (3,): 128}]
+    assert [s.args[0].shape for s in specs] == [("32", "32"), ("64", "32"), ("128", "32")]
+
+
+def test_grid_and_derived_constants_agree_per_bucket():
+    @tilefish.extern(triton="m:f", grid=lambda S, BLOCK: (tilefish.cdiv(S, BLOCK),))
+    def b(x: Tensor[Sb, bf16], BLOCK: const = tilefish.cdiv(Sb, 4)): ...
+
+    specs = compile_specs(b)
+    assert [s.constants[(1,)] for s in specs] == [8, 16, 32]  # cdiv(S, 4)
+    assert [s.grid for s in specs] == ["(4,)", "(4,)", "(4,)"]  # cdiv(S, cdiv(S, 4)), concrete per bucket
+
+    @tilefish.extern(triton="m:f", grid=lambda S, BLOCK: (tilefish.cdiv(S, BLOCK), 1))
+    def c(x: Tensor[Sb, bf16], BLOCK: const = 16): ...
+
+    (only,) = compile_specs(c)  # no constexpr is derived from S, so S stays a runtime dimension
+    assert only.grid == "(cdiv(S, 16), 1)"
+
+
+def test_a_bucket_precondition_means_the_dimension_equals_the_bucket():
+    @tilefish.extern(triton="m:f", grid=(1,))
+    def a(x: Tensor[Sb, bf16], B: const = Sb): ...
+
+    spec = compile_specs(a)[1]
+    (bucket,) = [p for p in spec.preconditions if p.kind == "bucket"]
+    assert bucket.to_dict() == {"kind": "bucket", "dim": "S", "value": 64, "buckets": [32, 64, 128]}
+    assert "exact" in Dim.__doc__ and "pad" in Dim.__doc__  # documented on Dim
+    assert "equals" in Precondition.__doc__
+
+
+def test_bucketed_grid_must_stay_positive():
+    @tilefish.extern(triton="m:f", grid=lambda S: (S - 32,))
+    def a(x: Tensor[Sb, bf16], B: const = Sb): ...
+
+    with pytest.raises(TilefishSpecError, match="non-positive size 0"):
+        compile_specs(a)
+
+
+# -- JSON: strict, tagged non-finite floats, round trip ---------------------------------------------------------------------
+
+
+def test_non_finite_floats_become_tagged_values_in_strict_json():
+    (spec,) = compile_specs(mixed_order)
+    text = spec.to_json()
+    doc = json.loads(text, parse_constant=lambda c: pytest.fail(f"non-standard JSON constant {c}"))
+    assert doc["constants"] == {"1": 64, "4": {"float": "-inf"}}
+    assert doc["args"][4]["value"] == {"float": "-inf"}
+    json.dumps(spec.to_dict(), allow_nan=False)  # strict
+    assert "Infinity" not in text and "NaN" not in text
+
+    @tilefish.extern(triton="m:f", grid=(1,))
+    def special(x: Tensor[nk, bf16], A: const[f32] = float("inf"), B: const[f32] = float("nan"), C: const[f32] = -1.5): ...
+
+    (s2,) = compile_specs(special)
+    doc2 = json.loads(s2.to_json())
+    assert doc2["constants"] == {"1": {"float": "inf"}, "2": {"float": "nan"}, "3": -1.5}
+
+
+def test_specs_round_trip_through_dict_and_json():
+    import math
+
+    specs = [*compile_specs(mixed_order), *compile_specs(gelu), *compile_specs(rmsnorm), *compile_specs(qkv_rope)]
+    assert len(specs) == 6
+    for spec in specs:
+        assert CompileSpec.from_json(spec.to_json()) == spec
+        assert CompileSpec.from_dict(spec.to_dict()) == spec
+        assert CompileSpec.from_json(spec.to_json(indent=None)).to_dict() == spec.to_dict()
+    back = CompileSpec.from_json(compile_specs(mixed_order)[0].to_json())
+    assert back.constants == {(1,): 64, (4,): float("-inf")}
+    assert back.attrs[(0,)] == PTR16 and isinstance(back.block, tuple)
+    assert back.launch_params[-1].value == 0
+    assert back.ast_source_inputs().constants == {(1,): 64, (4,): float("-inf")}
+
+    @tilefish.extern(triton="m:f", grid=(1,))
+    def with_nan(x: Tensor[nk, bf16], A: const[f32] = float("nan")): ...
+
+    (s,) = compile_specs(with_nan)
+    assert math.isnan(CompileSpec.from_json(s.to_json()).constants[(1,)])
+
+
+def test_from_dict_rejects_an_unknown_schema():
+    doc = compile_specs(gelu)[0].to_dict()
+    doc["schema"] = 99
+    with pytest.raises(TilefishSpecError, match="unsupported compile spec schema 99"):
+        CompileSpec.from_dict(doc)
+
+
+# -- launch parameters of the extern declaration --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("warps", [1, 2, 4, 8, 16, 32])
+def test_valid_num_warps(warps):
+    @tilefish.extern(triton="m:f", num_warps=warps, grid=(1,))
+    def e(x: Tensor[nk, bf16]): ...
+
+    assert compile_specs(e)[0].block == (32 * warps, 1, 1)
+
+
+@pytest.mark.parametrize("warps", [0, 3, 5, 6, 7, 12, 33, 64, -4, True, 4.0, "4", None])
+def test_invalid_num_warps(warps):
+    with pytest.raises(tilefish.TilefishDeclarationError, match="num_warps must be a power of two from 1 to 32"):
+        tilefish.extern(triton="m:f", num_warps=warps, grid=(1,))
+
+
+@pytest.mark.parametrize("grid", [(0,), (-1,), (4, 0), (2, 2, -3), lambda nk: (nk - nk,)])
+def test_static_grid_sizes_must_be_at_least_one(grid):
+    with pytest.raises(tilefish.TilefishDeclarationError, match="grid sizes must be at least 1"):
+
+        @tilefish.extern(triton="m:f", grid=grid)
+        def e(x: Tensor[nk, bf16]): ...

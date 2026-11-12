@@ -75,3 +75,41 @@ def test_identity_and_repr():
 )
 def test_narrowing_casts(src, dst, narrowing):
     assert src.is_narrowing_to(dst) is narrowing
+
+
+# For every source dtype, the destination dtypes that represent all of its values exactly (the others round,
+# saturate or truncate). Written out by hand from the formats, not derived from the implementation.
+LOSSLESS = {
+    bf16: {bf16, f32},  # f16 has fewer exponent bits
+    f16: {f16, f32},  # bf16 has fewer mantissa bits
+    f32: {f32},
+    i32: {i32, i64},  # 31 magnitude bits do not fit a float significand
+    i64: {i64},
+    u8: {u8, i32, i64, bf16, f16, f32},  # 8 bits fit the 8-bit bf16 significand
+    e4m3: {e4m3, bf16, f16, f32},  # e5m2 has fewer mantissa bits
+    e5m2: {e5m2, bf16, f16, f32},  # e4m3 has fewer exponent bits
+    e2m1: {e2m1, e4m3, e5m2, bf16, f16, f32},  # ue8m0 is unsigned
+    ue8m0: {ue8m0, bf16, f32},  # f16 has too few exponent bits
+}
+
+
+def test_lossless_table_covers_every_dtype():
+    assert set(LOSSLESS) == set(ALL)
+    assert len(ALL) == 10
+
+
+@pytest.mark.parametrize("src", ALL, ids=str)
+@pytest.mark.parametrize("dst", ALL, ids=str)
+def test_every_dtype_pair_against_the_table(src, dst):
+    lossless = dst in LOSSLESS[src]
+    assert dst.can_represent(src) is lossless
+    assert src.is_narrowing_to(dst) is (src != dst and not lossless)
+
+
+def test_dtypes_survive_copy_and_pickle_as_the_same_object():
+    import copy
+    import pickle
+
+    for d in ALL:
+        assert copy.deepcopy(d) is d
+        assert pickle.loads(pickle.dumps(d)) is d

@@ -30,7 +30,7 @@ def test_readme_mlp(ns):
     M, H, F = ns["M"], ns["H"], ns["F"]
     assert g.ops() == ["gemm", "split", "cast", "silu", "cast", "mul", "cast", "gemm"]
     assert g.outputs[0].type == Tensor[M, H, bf16]
-    assert g.nodes[1].output_types == (Tensor[M, F, bf16],) * 2
+    assert g.nodes[1].output_types == (Tensor[M, F, bf16].as_view(),) * 2
     assert len(g.rounding_points()) == 1
 
 

@@ -23,7 +23,6 @@ def test_transformer_block_traces_and_type_checks(block):
     assert g.ops() == [
         "rmsnorm",
         "gemm",
-        "split",
         "attention",
         "gemm",
         "add_rmsnorm",
@@ -34,10 +33,13 @@ def test_transformer_block_traces_and_type_checks(block):
         "store",
     ]
     assert g.inputs[0].access == "inout"
-    assert g.outputs == (g.inputs[0],)
+    # returning the residual stream returns what was stored into it
+    assert g.outputs == (g.nodes[-1].inputs[1],)
+    assert g.nodes[-1].inputs[0] is g.inputs[0]
     assert g.outputs[0].type == Tensor[T, D, bf16]
-    assert g.nodes[2].output_types == (Tensor[T, D, bf16],) * 3  # q, k, v
-    assert g.nodes[7].output_types == (Tensor[T, F, bf16],)
+    assert g.nodes[1].output_types == (Tensor[T, 6144, bf16],)  # the fused qkv projection
+    assert g.nodes[2].inputs == (g.nodes[1].outputs[0],)  # attention takes it whole: one pointer
+    assert g.nodes[6].output_types == (Tensor[T, F, bf16],)
     assert g.requirements == ()
     assert g.symbols == (T,)
     assert g.rounding_points() == ()
@@ -60,5 +62,6 @@ def test_extern_specs_of_the_example(block):
     assert gelu.attrs[(2,)] == [["tt.divisibility", 16]]  # 5504 * T is a multiple of 16
     (attention,) = tilefish.aot.compile_specs(block["attention"])
     assert attention.signature["n_tokens"] == "i32"
-    assert attention.constants == {(5,): 128, (6,): 0.08838834764831845}
-    assert (4,) not in attention.attrs  # T has no divisibility, so n_tokens carries no hint
+    assert list(attention.signature) == ["qkv", "o", "n_tokens", "HEAD_DIM", "sm_scale"]
+    assert attention.constants == {(3,): 128, (4,): 0.08838834764831845}
+    assert (2,) not in attention.attrs  # T has no divisibility, so n_tokens carries no hint

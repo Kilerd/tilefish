@@ -54,15 +54,33 @@ def test_int_scalar_with_int_tensor_and_float_scalar_rejected(tr):
         tr.val(Tensor[M, tilefish.u8]) + 300
 
 
-def test_const_params_adopt_the_tensor_dtype(tr):
+def test_untyped_consts_adopt_the_tensor_dtype(tr):
     x = tr.val(Tensor[M, bf16])
-    eps = Const("eps", 1e-6, f32)
-    r = x + eps
+    scale = Const("scale", 0.5, None)
+    r = x + scale
     assert r.type == Tensor[M, bf16]
-    assert tr.nodes[0].inputs[1] == Scalar(1e-6, bf16, "eps")
-    assert (eps * x).type == x.type
+    assert tr.nodes[0].inputs[1] == Scalar(0.5, bf16, "scale")
+    assert (scale * x).type == x.type
     with pytest.raises(TilefishTypeError, match="no value at trace time"):
         x + Const("none", None, None)
+
+
+def test_typed_consts_must_match_the_tensor_dtype(tr):
+    eps = Const("eps", 1e-6, f32)
+    assert (tr.val(Tensor[M, f32]) + eps).type == Tensor[M, f32]
+    assert tr.nodes[0].inputs[1] == Scalar(1e-6, f32, "eps")
+    x = tr.val(Tensor[M, bf16])
+    with pytest.raises(
+        TilefishTypeError,
+        match=r"add \(\+\): right operand const 'eps' is const\[f32\] but the other operand has dtype bf16.*\.to\(f32\)",
+    ):
+        x + eps
+    with pytest.raises(TilefishTypeError, match=r"mul \(\*\): left operand const 'eps' is const\[f32\]"):
+        eps * x
+    # the user writes the cast, like for tensors
+    assert (x.to(f32) + eps).type == Tensor[M, f32]
+    # untyped python literals still adopt the tensor dtype
+    assert (x + 1e-6).type == x.type
 
 
 def test_const_with_const_is_rejected():
@@ -236,7 +254,7 @@ def test_split_equal_chunks(tr):
     F = Dim("F", 3072)
     x = tr.val(Tensor[M, 2 * F, bf16])
     g, u = x.split(F, axis=-1)
-    assert g.type == u.type == Tensor[M, F, bf16]
+    assert g.type == u.type == Tensor[M, F, bf16].as_view()  # a slab of the last axis is a view
     (node,) = tr.nodes
     assert node.op == "split" and node.attrs == {"axis": 1, "sizes": (F, F)}
     assert node.outputs == (g, u)
@@ -252,7 +270,7 @@ def test_split_symbolic_dimension(tr):
 def test_split_explicit_sizes(tr):
     x = tr.val(Tensor[M, 100, f32])
     q, k = x.split([60, 40], axis=1)
-    assert q.type == Tensor[M, 60, f32] and k.type == Tensor[M, 40, f32]
+    assert q.type == Tensor[M, 60, f32].as_view() and k.type == Tensor[M, 40, f32].as_view()
     with pytest.raises(TilefishTypeError, match="add up to 90 but axis 1"):
         x.split([60, 30], axis=1)
 
@@ -318,3 +336,158 @@ def test_value_is_not_indexable_iterable_or_truthy(tr):
     with pytest.raises(TilefishTypeError, match="truth value"):
         if x:
             pass
+
+
+# -- operators and attributes outside the M1 language ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "use",
+    [
+        lambda x: -x,
+        lambda x: +x,
+        lambda x: abs(x),
+        lambda x: x**2,
+        lambda x: 2**x,
+        lambda x: x @ x,
+        lambda x: x > 0,
+        lambda x: x <= 1,
+        lambda x: x // 2,
+        lambda x: x % 2,
+        lambda x: len(x),
+        lambda x: int(x),
+        lambda x: float(x),
+        lambda x: range(x),
+        lambda x: ~x,
+        lambda x: x & x,
+        lambda x: x << 1,
+    ],
+)
+def test_unsupported_operators_raise_tilefish_errors(tr, use):
+    x = tr.val(Tensor[M, f32])
+    with pytest.raises(TilefishTypeError, match="not supported in M1"):
+        use(x)
+
+
+def test_unknown_attributes_are_tilefish_errors_and_still_attribute_errors(tr):
+    x = tr.val(Tensor[M, f32])
+    for name in ("T", "reshape", "view", "transpose", "size", "item"):
+        with pytest.raises(tilefish.TilefishAttributeError, match=f"no attribute '{name}'"):
+            getattr(x, name)
+    with pytest.raises(tilefish.TilefishError):
+        x.reshape(1)
+    assert not hasattr(x, "anything")  # AttributeError subclass: hasattr/getattr defaults keep working
+    assert getattr(x, "anything", 7) == 7
+
+
+def test_method_arity_errors_are_tilefish_errors(tr):
+    x = tr.val(Tensor[M, f32])
+    with pytest.raises(TilefishTypeError, match=r"to: needs a dtype"):
+        x.to()
+    with pytest.raises(TilefishTypeError, match=r"split: needs a size and an axis"):
+        x.split(2)
+    with pytest.raises(TilefishTypeError, match=r"split: needs a size and an axis"):
+        x.split()
+    with pytest.raises(TilefishTypeError, match=r"split: sizes must be ints or dimensions"):
+        x.split("a", axis=0)
+    with pytest.raises(TilefishTypeError, match="split: axis 'a' is invalid"):
+        x.split(2, axis="a")
+
+
+def test_split_sizes_must_be_positive(tr):
+    x = tr.val(Tensor[M, 10, f32])
+    with pytest.raises(TilefishTypeError, match="split: chunk type is invalid"):
+        x.split([11, -1], axis=1)
+    with pytest.raises(TilefishTypeError, match="split: chunk type is invalid"):
+        x.split([10, 0], axis=1)
+
+
+def test_dimension_mismatch_in_broadcast_shows_constraints_when_names_collide(tr):
+    plain, constrained = Dim("K"), Dim("K", divisible_by=32)
+    x = tr.val(Tensor[M, plain, f32])
+    y = tr.val(Tensor[M, constrained, f32])
+    with pytest.raises(TilefishTypeError, match=r"dimension Dim\('K'\) vs Dim\('K', divisible_by=32\) at axis -1"):
+        x + y
+
+
+# -- versions: reading after a store ----------------------------------------------------------------------
+
+
+def test_reading_an_inout_param_after_a_store_reads_the_stored_value(tr):
+    res = tr.val(Tensor[M, D, f32], name="res", access="inout")
+    r = res + 1
+    assert tr.nodes[-1].inputs[0] is res  # before the store it reads the parameter
+    res[...] = r
+    z = res * 2
+    assert tr.nodes[-1].inputs[0] is r  # after the store it reads what was stored
+    res[...] = z
+    w = tilefish.silu(res)
+    assert tr.nodes[-1].inputs == (z,)
+    assert w.type == res.type
+    assert res.live is z
+
+
+def test_storing_a_value_into_itself_does_not_loop(tr):
+    res = tr.val(Tensor[M, f32], name="res", access="inout")
+    res[...] = res
+    assert res.live is res
+    assert (res + 1).type == res.type
+
+
+def test_out_params_stay_write_only_before_and_after_a_store(tr):
+    y = tr.val(Tensor[M, f32], name="y", access="out")
+    with pytest.raises(TilefishTypeError, match="Out parameter 'y', which is write-only"):
+        y + 1
+    y[...] = tr.val(Tensor[M, f32])
+    with pytest.raises(TilefishTypeError, match="Out parameter 'y', which is write-only"):
+        tilefish.exp(y)
+    with pytest.raises(TilefishTypeError, match="Out parameter 'y', which is write-only"):
+        tilefish.sum(y)
+    with pytest.raises(TilefishTypeError, match="Out parameter 'y', which is write-only"):
+        y.to(bf16)
+    with pytest.raises(TilefishTypeError, match="Out parameter 'y', which is write-only"):
+        y.split(1, axis=0)
+    out2 = tr.val(Tensor[M, f32], name="z", access="out")
+    with pytest.raises(TilefishTypeError, match="write-only"):
+        out2[...] = y
+
+
+# -- strided views ------------------------------------------------------------------------------------------
+
+
+def test_split_along_a_leading_axis_is_contiguous_and_along_another_axis_is_a_view(tr):
+    x = tr.val(Tensor[4, 8, f32])
+    a, b = x.split(2, axis=0)
+    assert a.type.contiguous and a.type == Tensor[2, 8, f32]
+    c, d = x.split(4, axis=1)
+    assert not c.type.contiguous
+    assert c.type == Tensor[4, 4, f32].as_view()
+    assert c.type != Tensor[4, 4, f32]
+    assert repr(c.type) == "View[4, 4, f32]" and repr(a.type) == "Tensor[2, 8, f32]"
+    # size-1 leading dimensions keep a slab contiguous
+    assert tr.val(Tensor[1, 8, f32]).split(4, axis=1)[0].type.contiguous
+    assert not tr.val(Tensor[M, 8, f32]).split(4, axis=1)[0].type.contiguous
+    # a slab of a view, and a slab of a contiguous chunk along another axis
+    assert not c.split(2, axis=0)[0].type.contiguous
+    assert not a.split(4, axis=1)[0].type.contiguous
+
+
+def test_views_flow_into_elementwise_ops_reductions_and_casts(tr):
+    x = tr.val(Tensor[4, 8, f32])
+    c, _ = x.split(4, axis=1)
+    contiguous = Tensor[4, 4, f32]
+    assert (c * 2).type == contiguous
+    assert (c + c).type == contiguous
+    assert tilefish.silu(c).type == contiguous
+    assert tilefish.sum(c, axis=0).type == Tensor[4, f32]
+    assert c.to(bf16).type == Tensor[4, 4, bf16]
+    assert c.to(f32) is c  # a no-op cast stays the view itself
+    assert c.type.materialized() == contiguous and contiguous.materialized() is contiguous
+
+
+def test_a_view_cannot_be_stored(tr):
+    res = tr.val(Tensor[4, 4, f32], name="res", access="inout")
+    c, _ = tr.val(Tensor[4, 8, f32]).split(4, axis=1)
+    with pytest.raises(TilefishTypeError, match=r"expected Tensor\[4, 4, f32\], got View\[4, 4, f32\].*strided view cannot be stored"):
+        res[...] = c
+    res[...] = c * 1  # computing from it is fine
