@@ -68,7 +68,9 @@ checks it); otherwise ``dim`` is a fresh name and ``count_of`` is the only defin
 
 Numerics contract
 -----------------
-Every choice below is part of the contract; changing one later is a breaking change.
+Every choice below is part of the contract; changing one later is a breaking change. Every PTX fact in
+it was checked on the PTX that Triton 3.5.1 and ptxas 12.9.86 produce for sm_103, and is asserted on a GPU
+by ``tests/test_gpu_numerics.py`` (the numbers in the notes are measured there).
 
 ==========================  ==========================================================  =====================================
 IR                          Generated source                                            Numerics
@@ -76,10 +78,9 @@ IR                          Generated source                                    
 load of a tensor            ``tl.load(p + offs, mask=mask, other=0)``                   storage dtype, never pre-cast; masked
                                                                                          lanes read 0. ``[R]``/``[R, 1]``:
                                                                                          ``tl.load(p + row)``, no mask.
-``x.to(dt)``                ``v.to(tl.<dt>)``, exactly where the IR has the cast        Triton's default conversion (float
-                                                                                         downcasts round to nearest even,
-                                                                                         float to int truncates toward zero);
-                                                                                         no ``fp_downcast_rounding`` argument.
+``x.to(dt)``                ``v.to(tl.<dt>)``, exactly where the IR has the cast        Triton's default conversion, with the
+                                                                                         out-of-range behavior of note 1; no
+                                                                                         ``fp_downcast_rounding`` argument.
                                                                                          A narrowing cast gets ``# rounding
                                                                                          point``. Nothing else is ever cast.
 store                       ``tl.store(p + offs, v, mask=mask)``                        the IR value as is (its dtype equals
@@ -91,36 +92,95 @@ store                       ``tl.store(p + offs, v, mask=mask)``                
                                                                                          writes nothing.
                                                                                          A returned value is written to its
                                                                                          own output pointer (a copy).
-python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and           Triton gives a scalar the dtype of
-                            ``nan`` as ``float("inf")``), an int literal, or the            the tensor it meets, which is the
-                            ``const`` parameter's name                                      dtype the IR gave it.
+python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and           the scalar takes the dtype of the
+                            ``nan`` as ``float("inf")``), an int literal, or the            tensor it meets and is rounded to it:
+                            ``const`` parameter's name                                      no promotion (note 3).
 ``a + b``, ``a - b``,       ``a + b``, ``a - b``, ``a * b``                                 dtypes f32, f16, bf16, i32, i64.
-``a * b``                                                                                    FMA contraction is up to the
-                                                                                         compiler (``enable_fp_fusion``).
-``a / b``                   ``a / b``                                                       f32 only (Triton divides f16/bf16 in
-                                                                                         f32 and returns f32). Triton's ``/``
-                                                                                         is ``div.full.f32`` on NVIDIA, not
-                                                                                         IEEE round to nearest.
-``rsqrt(x)``                ``tl.rsqrt(x)``                                                 f32 only; libdevice, approximate.
-``exp(x)``                  ``tl.exp(x)``                                                   f32 only; fast exp (``ex2.approx``).
-``sqrt(x)``                 ``tl.sqrt_rn(x)``                                               f32 only; IEEE round to nearest.
+``a * b``                                                                                    ``a * b + c`` is one FMA, one
+                                                                                         rounding (note 2).
+``a / b``                   ``a / b``                                                       f32 only (note 4): ``div.full.f32``,
+                                                                                         not IEEE division.
+``rsqrt(x)``                ``tl.rsqrt(x)``                                                 f32 only; approximate (note 5).
+``exp(x)``                  ``tl.exp(x)``                                                   f32 only; fast exp (note 5).
+``sqrt(x)``                 ``tl.sqrt_rn(x)``                                               f32 only; IEEE round to nearest, but
+                                                                                         subnormals flush to zero (note 5).
 ``silu(x)``                 ``x * tl.sigmoid(x)``                                           f32 only; ``tl.sigmoid`` is
                                                                                          ``1 / (1 + tl.exp(-x))``.
 ``gelu(x)``                 ``0.5 * x * (1.0 + tl.math.erf(x * 0.7071067811865476))``       f32 only; exact erf form, evaluated
-                                                                                         left to right.
+                                                                                         left to right (note 5).
 ``sum(x, axis=-1)``         ``tl.sum(tl.where(mask, x, 0.0), axis=0)``                      f32 only. The reduction is over all
                                                                                          ``BLOCK_D`` lanes; masked lanes are
                                                                                          set to 0 explicitly (intermediates
                                                                                          such as ``exp(x)`` or ``x - mean``
-                                                                                         are not 0 there). Order is Triton's.
-``mean(x, axis=-1)``        ``tl.sum(tl.where(mask, x, 0.0), axis=0) / D``                  f32 only; ``D`` is the constexpr.
-``max(x, axis=-1)``         ``tl.max(tl.where(mask, x, float("-inf")), axis=0)``            f32 only; masked lanes are ``-inf``.
+                                                                                         are not 0 there). The order is
+                                                                                         Triton's, and depends on
+                                                                                         ``num_warps`` (note 6).
+``mean(x, axis=-1)``        ``tl.sum(tl.where(mask, x, 0.0), axis=0) / D``                  f32 only; ``D`` is the constexpr:
+                                                                                         ``sum * f32(1 / D)`` (note 4).
+``max(x, axis=-1)``         ``tl.max(tl.where(mask, x, float("-inf")), axis=0)``            f32 only; masked lanes are ``-inf``
+                                                                                         (``float("-inf")`` compiles: JIT and
+                                                                                         AOT, ``0fFF800000`` in the PTX).
 ==========================  ==========================================================  =====================================
 
 Reductions are f32 only because Triton accumulates a narrower dtype in the narrow dtype, which
 the IR does not say; cast to f32 first (the README kernel does). Every SSA value is one local
 (``v0``, ``v1``, ... in IR order: the loaded parameters first, then one per node), and a comment
 marks each rounding point.
+
+Notes (the facts behind the table):
+
+1. **Casts.** Float to ``f16``/``bf16`` is ``cvt.rn.f16x2.f32`` / ``cvt.rn.bf16x2.f32``: round to nearest even,
+   overflow to infinity (65520 is the first f32 that becomes ``inf`` in f16), NaN stays NaN; the same bytes as
+   torch's cast. Float to integer truncates toward zero and, out of range, **saturates**: ``i32`` is
+   ``cvt.rzi.s32.f32`` (NaN is 0), ``i64`` is ``cvt.rzi.s64.f32`` (NaN is ``-2**63``, not 0). Float to ``u8`` is
+   ``cvt.rzi.u16.f32`` followed by keeping the **low byte**: the value is truncated and clamped to [0, 65535]
+   (negative and NaN give 0), then reduced modulo 256, so ``-1.5`` is 0, ``255.5`` is 255, ``256`` is 0,
+   ``300`` is 44, ``1000`` is 232 and anything from 65535 up (infinity included) is 255. It neither
+   saturates at 255 nor wraps like C. Float to ``e4m3`` / ``e5m2`` is ``cvt.rn.satfinite.e4m3x2.f32`` /
+   ``cvt.rn.satfinite.e5m2x2.f32``: round to nearest even and **saturate** at the largest finite value (448,
+   57344), infinities included; NaN stays NaN. torch's ``.to`` differs on out-of-range values (``-1.5``
+   to ``u8`` is 255, 1000 to ``e4m3`` is NaN, 1e5 to ``e5m2`` is ``inf``), so the ``reference`` mode implements
+   this table instead of torch's cast.
+2. **FMA contraction.** Triton compiles with ``enable_fp_fusion=True`` (``compile_specs`` does not change that), so
+   ``a * b + c`` is one FMA with one rounding: ``fma.rn.f32`` for f32 and ``fma.rn.bf16x2``, a native packed bf16
+   FMA, for bf16. Without contraction it is ``mul.rn`` then ``add.rn`` (two roundings). The two results differ
+   in 23% of random elements (22.9% in bf16, 23.4% in f32), and the contracted one is exactly the correctly
+   rounded value of the exact product and sum. Contraction also changes the bytes of the goldens that have a
+   contractable ``a * b + c`` (layernorm: 3 of 197376 elements, one bf16 ULP; the README rmsnorm: 1 of 657920);
+   softmax, gelu and swiglu come out byte-identical either way.
+3. **Scalars.** Triton 3.5.1 keeps the dtype of the tensor: a python float or a constexpr float combined with
+   a bf16 tensor is bf16 (``tl.static_assert`` in a compiled kernel says so), and the scalar is rounded to
+   bf16 first (0.1 becomes 0.10009765625). Nothing is promoted to f32: ``x * 0.1 + eps`` on bf16 is a single
+   ``fma.rn.bf16x2`` (or ``mul.rn.bf16x2`` and ``add.rn.bf16x2`` without contraction), with no ``cvt`` to f32.
+   The one exception is ``/``, which Triton does in f32 for bf16 and f16 and returns as f32; that is why a
+   division of those dtypes is rejected.
+4. **Division.** ``a / b`` is ``div.full.f32``, never ``div.rn.f32``: the numerator times an approximate
+   reciprocal, at most 2 ULP from the correctly rounded quotient (measured: 2 ULP, 29% of random elements
+   differ, relative error below 1.8e-7). With a constant divisor (``x / D`` with ``D`` a constexpr or a
+   literal) the PTX is the same ``div.full.f32`` (Triton does not strength-reduce it), but the machine code
+   behind it is a multiply by the f32 reciprocal: the result is bit-identical to ``x * f32(1 / c)`` for
+   every constant tried (4M inputs each), and differs from correctly rounded division in 15% to 58%
+   of random inputs (33% for 768, 58% for 1000); only a power of two is exact. ``mean`` is ``sum * f32(1 / D)``
+   for the same reason.
+5. **Math functions.** ``tl.sqrt_rn`` is ``sqrt.rn.ftz.f32``: the correctly rounded square root for every normal
+   input (the same bytes as torch's), but a subnormal input is treated as zero, so ``sqrt(1e-40)`` is 0, not
+   1e-20; it is not ``sqrt.rn.f32``. ``tl.rsqrt`` is ``rsqrt.approx.ftz.f32`` (up to 2 ULP, 22% of inputs off the
+   correctly rounded value; a subnormal input is zero). ``tl.exp`` is ``ex2.approx.f32`` of
+   ``x * 1.4426950216293335`` (log2 e as an f32): the product is rounded before the exponentiation, so the
+   error grows with ``|x|`` (3 ULP for ``|x| < 2``, 27 ULP up to ``|x| = 40``). ``tl.math.erf`` (also
+   ``tl.erf``) exists and links: libdevice's ``__nv_erff`` is inlined (no ``call`` is left in the PTX) as a
+   polynomial of ``fma.rn.ftz.f32`` and ``ex2.approx.ftz.f32``, which flush subnormals; its FMAs are explicit, so
+   they do not depend on ``enable_fp_fusion``. The exact gelu cancels for large negative inputs (``1 + erf`` is
+   a difference of two numbers near 1), so its relative error there is large (128 bf16 ULP on values near
+   zero), though its absolute error stays below 1.6e-5.
+6. **Reduction order and ``num_warps``.** The tree a reduction adds in depends on how many warps the block has,
+   so the same kernel on the same data is not byte-identical across ``num_warps`` (129 rows with D = 96: 17 to 59
+   rows differ from the 1-warp result in f32, depending on the kernel; with D = 1000: 28 to 125), though
+   always within a few ULP of the others and of torch's sum. A bucketed ``D`` has one ``num_warps`` for all its
+   binaries, from its largest bucket, so a small bucket runs with more warps than its own size would get (a
+   ``D = 96`` bucket of a kernel whose largest bucket is 2048 runs with 8 warps instead of 1: 25 of 129 rows
+   differ in the last bits). The result is correct either way, only a different, equally valid rounding. A
+   spec fixes ``num_warps``, so ``jit``, ``replay`` and a generated host all agree.
 """
 
 from __future__ import annotations
@@ -202,7 +262,7 @@ class LoweredKernel:
     num_warps: int
     kernel: "KernelOp | None" = None
 
-    def run(self, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
+    def run(self, /, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
         """``tilefish.run(self, *args, mode=mode, **kwargs)``."""
         from .runtime import run
 

@@ -11,8 +11,11 @@ into a typed IR, and Triton ahead-of-time compile specs for `extern` kernels,
 in pure Python with no dependencies. On `main` (after 0.0.1) a `@kernel` also
 lowers to Triton source, as a row kernel or an elementwise kernel
 (`tilefish.lower`), with its numerics contract written down in the module.
-Nothing is compiled yet: no cubins, no generated hosts, and the
-`tilefish build` command below is still the plan. The Rust crate is a name
+With the `gpu` extra (`pip install "tilefish[gpu]"`: torch, Triton,
+cuda-python) a compile spec builds into a cubin (`tilefish.aot.build`, with a
+manifest and a digest of the machine code) and a kernel runs from Python in
+the three modes below (`tilefish.run`). There are no generated hosts, and the
+`tilefish build` command is still the plan. The Rust crate is a name
 reservation.
 
 ## Why
@@ -121,9 +124,21 @@ The Python side has three modes:
 | `reference` | the same bodies interpreted with torch | an oracle, compared within a tolerance |
 | `replay` | the built binaries, through the CUDA driver | the exact machine code the C++ and Rust hosts run |
 
+```python
+y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay")   # or residual_add_rmsnorm.run(...)
+```
+
+Arguments are torch tensors, matched to the signature the way a call is
+matched in a trace: inputs and `InOut` tensors are passed (an `InOut` tensor
+is updated in place), `Out` tensors are allocated and returned. Before a
+launch every precondition of the binary is checked (dtypes, static sizes,
+`divisible_by`, 16-byte aligned pointers, contiguity), and a bucketed
+dimension must equal a bucket exactly: there is no padding.
+
 CI asserts that `jit` and `replay` agree byte for byte, and that `replay`
-stays within tolerance of `reference`. An experiment that passes in `replay`
-is, kernel for kernel, what production runs.
+stays within tolerance of `reference`, on a GPU (the tests marked `gpu`).
+An experiment that passes in `replay` is, kernel for kernel, what production
+runs.
 
 ## Rewrites that know about rounding
 
