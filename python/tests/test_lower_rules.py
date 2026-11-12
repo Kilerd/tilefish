@@ -24,7 +24,7 @@ from tilefish import (
     u8,
     ue8m0,
 )
-from tilefish.aot import compile_specs
+from tilefish.aot import CompileSpec, compile_specs
 
 M = Dim("M")
 D = Dim("D", 256)
@@ -198,6 +198,53 @@ def test_inout_parameter_is_written_with_its_final_version_only():
     assert "v1 = v0 * 2.0" in src and "v2 = v1 + 1.0" in src  # the second read is the first store's value, not a reload
 
 
+def test_a_store_names_its_parameter_through_the_chain_of_versions():
+    """A store's first input is the version it replaces: the IR links versions by dataflow, the lowering follows the chain."""
+
+    @tilefish.kernel
+    def chain(x: InOut[Tensor[M, D, f32]], y: Out[Tensor[M, D, f32]]):
+        x[...] = x + 1.0
+        x[...] = x * 2.0
+        x[...] = x - 3.0
+        y[...] = x
+        y[...] = x * 0.5
+
+    stores = [n for n in chain.graph.nodes if n.op == "store"]
+    assert [n.attrs["target"] for n in stores] == ["x", "x", "x", "y", "y"]
+    assert stores[1].inputs[0] is stores[0].outputs[0] and stores[2].inputs[0] is stores[1].outputs[0]  # the chain
+    assert stores[0].inputs[0] is chain.graph.inputs[0] and stores[4].inputs[0] is chain.graph.inputs[1]
+    src = body(chain.lower())
+    assert [line for line in src if "tl.store" in line] == [
+        "tl.store(x + offs, v3, mask=mask)  # InOut x, final version",
+        "tl.store(y + offs, v4, mask=mask)  # Out y, written once",
+    ]
+    assert src.count("# InOut x: superseded by a later store") == 2
+    assert src.count("# Out y: superseded by a later store") == 1
+    assert "v3 = v2 - 3.0" in src  # the third store's value is what x holds at the end
+
+
+def test_a_self_store_is_not_a_write():
+    @tilefish.kernel
+    def k(x: InOut[Tensor[M, D, f32]]):
+        x[...] = x * 2.0
+        x[...] = x  # copies the tensor onto itself
+
+    src = body(k.lower())
+    assert [line for line in src if "tl.store" in line] == ["tl.store(x + offs, v1, mask=mask)  # InOut x, final version"]
+    assert "# InOut x: stored onto itself, nothing to write" in src
+    assert "# InOut x: superseded by a later store" not in src  # the self-store does not make the real store a stale one
+
+
+def test_an_inout_parameter_that_is_only_stored_is_not_loaded():
+    @tilefish.kernel
+    def overwrite(x: InOut[Tensor[M, D, f32]], y: Tensor[M, D, f32]):
+        x[...] = y * 2.0
+
+    src = body(overwrite.lower())
+    assert [line for line in src if "tl.load" in line] == ["v0 = tl.load(y + offs, mask=mask, other=0)  # y"]
+    assert "tl.store(x + offs, v1, mask=mask)  # InOut x, final version" in src
+
+
 def test_returning_an_inout_parameter_copies_the_final_version_to_the_output():
     @tilefish.kernel
     def bump(x: InOut[Tensor[M, D, f32]]) -> Tensor[M, D, f32]:
@@ -301,6 +348,12 @@ def test_bucketed_d_gives_one_spec_per_bucket():
     assert lowered.template == "row"
     specs = compile_specs(lowered.extern)
     assert [s.stem for s in specs] == ["rms.Hb256", "rms.Hb1000", "rms.Hb4096"]
+    assert all(s.verified for s in specs) and len({s.declaration_digest for s in specs}) == 1  # one declaration
+    for spec in specs:  # a stored spec is checked against the declaration: next_pow2 is part of what is digested
+        back = CompileSpec.from_json(spec.to_json())
+        assert not back.verified
+        back.verify_against(lowered.extern)
+        assert back.verified and back.ast_source_inputs().constants == spec.ast_source_inputs().constants
     assert [s.constants for s in specs] == [{(3,): 256, (4,): 256}, {(3,): 1000, (4,): 1024}, {(3,): 4096, (4,): 4096}]
     # one source for all buckets; one num_warps for the set, from the largest bucket (4096 lanes: 16 warps)
     assert {s.num_warps for s in specs} == {16} and lowered.num_warps == 16

@@ -72,7 +72,7 @@ from ._specvalid import (
     validate_spec,
 )
 from .decorators import ExternOp, grid_to_string
-from .dims import Dim, DimExpr
+from .dims import Dim, DimExpr, _NextPow2
 from .dtypes import BlockScaled
 from .errors import TilefishError, TilefishSpecError
 from .signature import MISSING
@@ -517,6 +517,8 @@ def _canonical_dim(d: DimExpr) -> Any:
 def _canonical_atom(a: DimExpr) -> Any:
     if isinstance(a, Dim):
         return {"dim": a.name, "divisible_by": a.divisible_by, "buckets": None if a.buckets is None else list(a.buckets)}
+    if isinstance(a, _NextPow2):  # the BLOCK constexpr a lowered kernel derives from a bucketed dimension
+        return {"next_pow2": _canonical_dim(a.arg)}
     return {"cdiv": [_canonical_dim(a.num), _canonical_dim(a.den)]}  # type: ignore[attr-defined]
 
 

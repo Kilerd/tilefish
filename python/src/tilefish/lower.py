@@ -70,7 +70,9 @@ store                       ``tl.store(p + offs, v, mask=mask)``                
                                                                                          the target's). ``[R]``: no mask.
                                                                                          An ``Out`` or ``InOut`` parameter
                                                                                          is written once, with its final
-                                                                                         version; earlier stores are elided.
+                                                                                         version; earlier stores are elided
+                                                                                         and a self-store (``x[...] = x``)
+                                                                                         writes nothing.
                                                                                          A returned value is written to its
                                                                                          own output pointer (a copy).
 python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and           Triton gives a scalar the dtype of
@@ -709,6 +711,11 @@ def _scalar_text(s: Scalar) -> str:
     return repr(v)
 
 
+def _is_self_store(n: Node) -> bool:
+    """``x[...] = x``: the stored value is the version the store replaces."""
+    return n.inputs[0] is n.inputs[1]
+
+
 class _Body:
     """Emits the statements of the kernel body, one local per SSA value."""
 
@@ -717,6 +724,7 @@ class _Body:
         self.layout = layout
         self.names = names
         self.out_names = out_names
+        self.params = {p.name: p for p in op.graph.inputs}
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
         self._count = 0
@@ -740,7 +748,9 @@ class _Body:
         last_store: dict[str, Node] = {}
         for n in graph.nodes:
             if n.op == "store":
-                last_store[n.inputs[0].name] = n  # type: ignore[union-attr]
+                # a store's first input is the version it replaces, so the parameter is named by the node
+                if not _is_self_store(n):  # copying a tensor onto itself writes nothing
+                    last_store[n.attrs["target"]] = n
                 reads.add(n.inputs[1])  # type: ignore[arg-type]
             else:
                 reads.update(i for i in n.inputs if isinstance(i, Value))
@@ -764,16 +774,20 @@ class _Body:
         return self.lines
 
     def store(self, n: Node, last_store: "dict[str, Node]") -> None:
-        target, value = n.inputs
-        assert isinstance(target, Value) and isinstance(value, Value)
+        _, value = n.inputs
+        assert isinstance(value, Value)
         if n.outputs:  # an InOut parameter: reading it from here on reads the stored value
             self.var[n.outputs[0]] = self.var[value]
-        label = "InOut" if target.access == "inout" else "Out"
-        if last_store[target.name] is n:
-            what = "final version" if target.access == "inout" else "written once"
-            self.emit(self.layout.store(target.name, target, self.var[value]), f"{label} {target.name}, {what}")
+        name = n.attrs["target"]
+        param = self.params[name]
+        label = "InOut" if param.access == "inout" else "Out"
+        if _is_self_store(n):
+            self.emit(f"# {label} {name}: stored onto itself, nothing to write")
+        elif last_store[name] is n:
+            what = "final version" if param.access == "inout" else "written once"
+            self.emit(self.layout.store(name, param, self.var[value]), f"{label} {name}, {what}")
         else:
-            self.emit(f"# {label} {target.name}: superseded by a later store")
+            self.emit(f"# {label} {name}: superseded by a later store")
 
     def expression(self, n: Node) -> str:
         op = n.op

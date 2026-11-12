@@ -263,6 +263,32 @@ def test_compile_specs_of_the_generated_extern(cases, name):
     assert CompileSpec.from_json(spec.to_json()).to_dict() == spec.to_dict()
 
 
+@pytest.mark.parametrize("name", NAMES)
+def test_specs_are_verified_and_usable_for_compiling(cases, name):
+    lowered = cases[name].lower()
+    specs = lowered.specs()
+    assert [s.to_json() for s in specs] == [s.to_json() for s in compile_specs(lowered.extern)]
+    for spec in specs:
+        assert spec.verified and spec.declaration_digest
+        inputs = spec.ast_source_inputs()  # refuses an unverified spec
+        assert inputs.signature == EXPECTED[name]["signature"] and inputs.constants == EXPECTED[name]["constants"]
+        assert inputs.options == {"num_warps": EXPECTED[name]["num_warps"], "num_stages": 3}
+        back = CompileSpec.from_json(spec.to_json())
+        assert not back.verified
+        with pytest.raises(tilefish.TilefishSpecError, match="verify_against"):
+            back.ast_source_inputs()
+        back.verify_against(lowered.extern)  # the generated stub is an ordinary declaration
+        assert back.verified and back.ast_source_inputs().constants == inputs.constants
+
+
+def test_a_typed_const_keeps_its_dtype_in_the_spec(cases):
+    (spec,) = compile_specs(cases["layernorm"].lower().extern)
+    eps = next(a for a in spec.args if a.name == "eps")
+    assert eps.dtype == "f32" and eps.value == 1e-5 and isinstance(eps.value, float)
+    d = next(a for a in spec.args if a.name == "D")
+    assert d.dtype is None and d.value == 768 and isinstance(d.value, int)  # generated constexprs are untyped
+
+
 def test_module_name_is_chosen_by_the_caller(cases):
     lowered = cases["softmax"].lower(module="my_pkg.kernels.softmax")
     assert lowered.ref == "my_pkg.kernels.softmax:tf_softmax"
