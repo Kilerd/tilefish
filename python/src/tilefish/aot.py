@@ -1,9 +1,9 @@
-"""Ahead-of-time compile specs for ``extern`` Triton kernels.
+"""Ahead-of-time compile specs for ``extern`` Triton kernels, and their builds.
 
 ``compile_specs(op)`` derives, from the types of an ``extern`` declaration,
 everything Triton's ahead-of-time compiler needs, one :class:`CompileSpec`
-per bucket combination. Nothing here imports triton; a later step feeds a
-spec to it:
+per bucket combination. Producing and reading specs imports no triton;
+:func:`build` feeds a spec to it (lazily, when it is called):
 
 .. code-block:: python
 
@@ -11,6 +11,10 @@ spec to it:
     src = ASTSource(fn, signature=inp.signature, constexprs=None, attrs=inp.attrs)
     src.constants = inp.constants
     triton.compile(src, target=GPUTarget("cuda", arch, 32), options=inp.options)
+
+``build(spec, arch=...)`` is exactly this and returns a :class:`BuiltKernel` (cubin, PTX, symbol, shared
+memory, ``sha256`` of the file and ``sha256_code`` of the machine code, toolchain versions);
+:func:`write_manifest` writes the ABI, grid rule and digests of built kernels as JSON for a host.
 
 Conventions (all from the declaration, nothing guessed at compile time):
 
@@ -736,3 +740,8 @@ def compile_specs(op: ExternOp) -> list[CompileSpec]:
     combos = itertools.product(*(d.buckets for d in dims)) if dims else [()]  # type: ignore[arg-type]
     digest = declaration_digest(op)
     return [_build(op, dict(zip(dims, combo)), digest) for combo in combos]
+
+
+# The build step lives in _build.py. It needs nothing from this module at import time, so importing it last
+# is safe, and `tilefish.aot.build` reads as the ahead-of-time API next to `compile_specs`.
+from ._build import BuiltKernel, LaunchAttributes, build, manifest_dict, write_manifest  # noqa: E402,F401

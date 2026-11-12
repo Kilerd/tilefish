@@ -44,3 +44,33 @@ class TilefishAttributeError(TilefishError, AttributeError):
 
 class TilefishPicklingError(TilefishError, pickle.PicklingError):
     """A declared operator cannot be pickled by reference (it is not a module-level object)."""
+
+
+class TilefishBuildError(TilefishError, RuntimeError):
+    """A compile spec could not be built into a binary.
+
+    Triton is missing or too old, the compiler failed, the binary does not match the ABI its spec promises,
+    or the ELF file is malformed.
+    """
+
+
+class TilefishRuntimeError(TilefishError, RuntimeError):
+    """A kernel cannot be run.
+
+    There is no CUDA, the mode is unknown, a binary needs launch attributes the replay does not set, a driver
+    call failed, or the mode has nothing to run for this operator (``reference`` of an ``extern``).
+    """
+
+
+class TilefishPreconditionError(TilefishRuntimeError):
+    """An argument violates a precondition of the binary it would run on (the types and the compile spec).
+
+    ``kind`` names the rule: ``"dtype"``, ``"rank"``, ``"shape"``, ``"static_size"``, ``"divisible"``,
+    ``"bucket"``, ``"pointer_alignment"``, ``"contiguous"``, ``"device"`` or ``"alias"``. ``arg`` is the
+    argument it is about, when there is one.
+    """
+
+    def __init__(self, message: str, *, kind: str, arg: "str | None" = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.arg = arg
