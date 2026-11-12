@@ -8,8 +8,10 @@ Thin Python, C++ and Rust hosts are generated from the same signatures.
 **Status: early preview (0.0.1 on PyPI).** The Python package type-checks:
 tensor types and block-scaled formats, the four declarations below, tracing
 into a typed IR, and Triton ahead-of-time compile specs for `extern` kernels,
-in pure Python with no dependencies. Nothing is lowered or compiled yet: no
-Triton code generation, no cubins, no generated hosts, and the
+in pure Python with no dependencies. On `main` (after 0.0.1) a `@kernel` also
+lowers to Triton source, as a row kernel or an elementwise kernel
+(`tilefish.lower`), with its numerics contract written down in the module.
+Nothing is compiled yet: no cubins, no generated hosts, and the
 `tilefish build` command below is still the plan. The Rust crate is a name
 reservation.
 
