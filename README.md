@@ -29,8 +29,9 @@ it and reason about it.
 ## What it looks like
 
 ```python
-import tilefish as tf
-from tilefish import Dim, Tensor, InOut, Out, const, bf16, f32
+import tilefish
+from tilefish import Dim, Tensor, InOut, Out, BlockScaled, const
+from tilefish import bf16, f32, e4m3, e2m1, ue8m0
 
 M = Dim("M")                          # runtime dimension
 D = Dim("D", 2560)                    # static: baked into the binary
@@ -39,13 +40,13 @@ F = Dim("F", 3072)
 K = Dim("K", divisible_by=32)         # constraint, checked at build time
 N = Dim("N", divisible_by=128)
 
-mxfp8 = tf.BlockScaled(elem=tf.e4m3, scale=tf.ue8m0, block=32, axis=-1)
-mxfp4 = tf.BlockScaled(elem=tf.e2m1, scale=tf.ue8m0, block=32, axis=-1)
-nvfp4 = tf.BlockScaled(elem=tf.e2m1, scale=tf.e4m3, block=16, global_scale=f32)
+mxfp8 = BlockScaled(elem=e4m3, scale=ue8m0, block=32, axis=-1)
+mxfp4 = BlockScaled(elem=e2m1, scale=ue8m0, block=32, axis=-1)
+nvfp4 = BlockScaled(elem=e2m1, scale=e4m3, block=16, global_scale=f32)
 
 # A kernel whose body tilefish understands: it can be fused, and it is
 # lowered to Triton.
-@tf.kernel
+@tilefish.kernel
 def residual_add_rmsnorm(
     x: Tensor[M, D, bf16],
     residual: InOut[Tensor[M, D, f32]],
@@ -54,24 +55,25 @@ def residual_add_rmsnorm(
 ) -> Tensor[M, D, bf16]:
     r = residual + x.to(f32)
     residual[...] = r
-    rstd = tf.rsqrt(tf.mean(r * r, axis=-1) + eps)
+    rstd = tilefish.rsqrt(tilefish.mean(r * r, axis=-1) + eps)
     return (r * rstd * w.to(f32)).to(bf16)      # the only rounding point
 
 # An existing hand-written kernel, unchanged, given a type.
 n = Dim("n", divisible_by=16)
 
-@tf.extern(triton=my_kernels.gelu, num_warps=4, grid=lambda n: (tf.cdiv(n, 1024),))
+@tilefish.extern(triton=my_kernels.gelu, num_warps=4,
+                 grid=lambda n: (tilefish.cdiv(n, 1024),))
 def gelu(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]]): ...
 
 # A library operator: opaque body, typed signature, pluggable epilogue.
-@tf.library("gemm", acc=f32)
+@tilefish.library("gemm", acc=f32)
 def gemm(a: Tensor[M, K, bf16], b: Tensor[N, K, mxfp8]) -> Tensor[M, N, bf16]: ...
 
 # A model is ordinary Python over typed values.
-@tf.graph
+@tilefish.graph
 def mlp(x: Tensor[M, H, bf16], w_gu: Tensor[2 * F, H, mxfp8], w_d: Tensor[H, F, mxfp8]):
     g, u = gemm(x, w_gu).split(F, axis=-1)
-    a = (tf.silu(g.to(f32)) * u.to(f32)).to(bf16)
+    a = (tilefish.silu(g.to(f32)) * u.to(f32)).to(bf16)
     return gemm(a, w_d)
 ```
 
