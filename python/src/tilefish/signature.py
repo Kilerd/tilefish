@@ -14,9 +14,10 @@ import typing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
-from .dims import Dim, DimExpr
+from .dims import Dim, DimExpr, describe_pair, dim_text
 from .dtypes import DType
-from .errors import TilefishDeclarationError, TilefishTypeError
+from .errors import TilefishDeclarationError, TilefishError, TilefishTypeError
+from .ir import BucketRequirement, Requirement
 from .trace import Const, TraceContext, Value
 from .types import ConstType, Marked, TensorType, const
 
@@ -323,41 +324,47 @@ class _Unifier:
         return True
 
     def _bind(self, var: Dim, value: DimExpr, pname: str, axis: int) -> None:
+        origin = self._origin(pname)
         k = var.divisible_by
         if k:
             if value.is_static:
                 if value.value % k:
                     raise TilefishTypeError(
-                        f"{self._origin(pname)}: {var} requires divisible_by={k} but dimension {axis} is {value.value}"
+                        f"{origin}: {var} requires divisible_by={k} but dimension {axis} is {value.value}"
                     )
             else:
-                self.ctx.require_divisible(value, k, self._origin(pname))
+                self.ctx.require_divisible(value, k, origin)
         if var.buckets:
             if value.is_static:
                 if value.value not in var.buckets:
                     raise TilefishTypeError(
-                        f"{self._origin(pname)}: {var} is bucketed over {list(var.buckets)} but dimension {axis} is "
-                        f"{value.value}"
+                        f"{origin}: {var} is bucketed over {list(var.buckets)} but dimension {axis} is {value.value}"
                     )
             elif isinstance(value, Dim) and value.buckets:
                 extra = [b for b in value.buckets if b not in var.buckets]
                 if extra:
                     raise TilefishTypeError(
-                        f"{self._origin(pname)}: {var} is bucketed over {list(var.buckets)} but {value} has "
+                        f"{origin}: {var} is bucketed over {list(var.buckets)} but {value} has "
                         f"buckets {list(value.buckets)} (not covered: {extra})"
                     )
+            else:
+                self.ctx.require_bucket(value, var.buckets, origin)
         self.bindings[var] = value
         self.bound_by[var] = f"argument '{pname}'"
 
     def _mismatch(
         self, pname: str, axis: int, pattern: DimExpr, expected: DimExpr, actual: DimExpr, atype: TensorType
     ) -> None:
+        actual_text, expected_text = describe_pair(actual.folded(), expected.folded())
         required = str(pattern)
-        value = str(expected.value) if expected.is_static else str(expected)
-        if required != value:
-            required += f" = {value}"
-        text = f"{self._origin(pname)} ({atype}): dimension {axis} is {actual}, but the signature requires {required}"
-        notes = [f"{v} was bound to {self.bindings[v]} by {self.bound_by[v]}" for v in pattern.free_dims() if v in self.bindings]
+        if required != expected_text:
+            required += f" = {expected_text}"
+        text = f"{self._origin(pname)} ({atype}): dimension {axis} is {actual_text}, but the signature requires {required}"
+        notes = [
+            f"{v} was bound to {dim_text(self.bindings[v])} by {self.bound_by[v]}"
+            for v in pattern.free_dims()
+            if v in self.bindings
+        ]
         if notes:
             text += " (" + "; ".join(sorted(notes)) + ")"
         raise TilefishTypeError(text)
@@ -368,13 +375,20 @@ class _Unifier:
             raise TilefishTypeError(
                 f"{self.op.name}: cannot infer dimension(s) {', '.join(sorted(d.name for d in free))} of {what}"
             )
-        return TensorType([d.subst(self.bindings) for d in t.shape], t.dtype, known=self.ctx.known)
+        return TensorType(
+            [d.subst(self.bindings) for d in t.shape], t.dtype, known=self.ctx.known, contiguous=t.contiguous
+        )
 
 
 def _check_const_arg(op: "Op", p: Param, value: Any) -> Any:
     if isinstance(value, Const):
         if value.value is None:
             raise TilefishTypeError(f"{op.name}: argument '{p.name}': const '{value.name}' has no value at trace time")
+        if value.dtype is not None and p.const_dtype is not None and value.dtype != p.const_dtype:
+            raise TilefishTypeError(
+                f"{op.name}: argument '{p.name}' is const[{p.const_dtype}] but '{value.name}' is const[{value.dtype}]; "
+                "there is no implicit conversion between typed constants"
+            )
         value = value.value
     if isinstance(value, DimExpr):
         if not value.is_static:
@@ -396,6 +410,32 @@ def _check_const_arg(op: "Op", p: Param, value: Any) -> Any:
     return value
 
 
+def _apply_callee_requirement(
+    op: "Op", r: "Requirement | BucketRequirement", bindings: dict[Dim, DimExpr], ctx: TraceContext
+) -> None:
+    """A graph or kernel body recorded a requirement on its own dims: restate it at this call site."""
+    expr = r.dim.subst(bindings)
+    origin = f"{op.name} (its body: {r.origin})"
+    if isinstance(r, Requirement):
+        if expr.is_static:
+            if expr.value % r.divisor:
+                raise TilefishTypeError(
+                    f"{op.name}: its body requires {r.dim} to be divisible by {r.divisor} ({r.origin}), "
+                    f"but this call binds it to {expr.value}"
+                )
+        else:
+            ctx.require_divisible(expr, r.divisor, origin)
+    else:
+        if expr.is_static:
+            if expr.value not in r.buckets:
+                raise TilefishTypeError(
+                    f"{op.name}: its body requires {r.dim} to be one of {list(r.buckets)} ({r.origin}), "
+                    f"but this call binds it to {expr.value}"
+                )
+        else:
+            ctx.require_bucket(expr, r.buckets, origin)
+
+
 def call_op(op: "Op", args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     """Type-check a call to a declared operator inside a trace and emit its node."""
     sig = op.signature
@@ -415,12 +455,22 @@ def call_op(op: "Op", args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         raise TilefishTypeError(
             f"{op.name}: can only be called inside a graph or kernel body, with traced tensor arguments"
         )
+    snapshot = ctx.snapshot()
+    try:
+        return _call(op, bound.arguments, ctx)
+    except TilefishError:
+        ctx.restore(snapshot)  # a failed call leaves no requirements behind
+        raise
 
+
+def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
+    sig = op.signature
     unifier = _Unifier(op, ctx)
     inputs: list[Value] = []
-    inout: list[str] = []
+    seen: dict[int, tuple[str, str]] = {}  # id of the live value -> (parameter, access)
+    inout_args: list[tuple[Param, Value]] = []
     for p in sig.tensor_inputs:
-        arg = bound.arguments[p.name]
+        arg = arguments[p.name]
         pt = p.type
         assert pt is not None
         if not isinstance(arg, Value):
@@ -432,14 +482,25 @@ def call_op(op: "Op", args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
             raise TilefishTypeError(f"{op.name}: argument '{p.name}' belongs to a different trace")
         if arg.access == "out":
             raise TilefishTypeError(f"{op.name}: argument '{p.name}' reads Out parameter '{arg.name}', which is write-only")
-        if p.access == "inout":
-            if arg.is_param and arg.access == "in":
-                raise TilefishTypeError(
-                    f"{op.name}: argument '{p.name}' is written in place but '{arg.name}' is a read-only input; "
-                    "declare it InOut[...] in the enclosing signature"
-                )
-            inout.append(p.name)
-        at = arg.type
+        if p.access == "inout" and arg.is_param and arg.access == "in":
+            raise TilefishTypeError(
+                f"{op.name}: argument '{p.name}' is written in place but '{arg.name}' is a read-only input; "
+                "declare it InOut[...] in the enclosing signature"
+            )
+        live = arg.live
+        other = seen.get(id(live))
+        if other is not None and "inout" in (other[1], p.access):
+            raise TilefishTypeError(
+                f"{op.name}: arguments '{other[0]}' and '{p.name}' are the same tensor ({live.ref}) but one is "
+                "written in place: an InOut parameter cannot alias another argument"
+            )
+        seen.setdefault(id(live), (p.name, p.access))
+        at = live.type
+        if not at.contiguous:
+            raise TilefishTypeError(
+                f"{op.name}: argument '{p.name}' is a strided view ({at}); strided views arrive in M2, "
+                "pass the unsplit tensor"
+            )
         if at.rank != pt.rank:
             raise TilefishTypeError(
                 f"{op.name}: argument '{p.name}': expected rank {pt.rank} ({pt}), got rank {at.rank} ({at})"
@@ -451,29 +512,43 @@ def call_op(op: "Op", args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
             )
         for axis, (pd, ad) in enumerate(zip(pt.shape, at.shape)):
             unifier.add(p.name, axis, pd, ad, at)
-        inputs.append(arg)
+        inputs.append(live)
+        if p.access == "inout":
+            inout_args.append((p, arg))
     unifier.solve()
 
     consts: dict[str, Any] = {}
     for p in sig.consts:
-        value = bound.arguments[p.name]
+        value = arguments[p.name]
         if value is p.default:
             consts[p.name] = value  # the declared default, validated at declaration
         else:
             consts[p.name] = op.check_const(p, _check_const_arg(op, p, value))
+
+    callee = getattr(op, "graph", None)
+    if callee is not None:
+        for r in callee.requirements:
+            _apply_callee_requirement(op, r, unifier.bindings, ctx)
 
     out_types: list[TensorType] = []
     for i, r in enumerate(sig.returns):
         out_types.append(unifier.instantiate(r, f"return value {i}"))
     for p in sig.tensor_outputs:
         out_types.append(unifier.instantiate(p.type, f"Out parameter '{p.name}'"))  # type: ignore[arg-type]
+    n_results = len(out_types)
+    for p, _ in inout_args:
+        out_types.append(unifier.instantiate(p.type, f"InOut parameter '{p.name}'"))  # type: ignore[arg-type]
 
     attrs: dict[str, Any] = {"kind": op.kind, **op.node_attrs()}
     if consts:
         attrs["consts"] = consts
-    if inout:
-        attrs["inout"] = tuple(inout)
+    if inout_args:
+        attrs["inout"] = tuple(p.name for p, _ in inout_args)
     outs = ctx.emit(op.name, inputs, attrs, out_types)
-    if not outs:
+    for (_, arg), version in zip(inout_args, outs[n_results:]):
+        arg._latest = version  # reading the argument now reads the updated tensor
+        ctx.written.add(arg)
+    results = outs[:n_results]
+    if not results:
         return None
-    return outs[0] if len(outs) == 1 else outs
+    return results[0] if len(results) == 1 else results

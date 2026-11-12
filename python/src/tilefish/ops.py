@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from .dims import DimExpr, as_dim
+from .dims import DimExpr, as_dim, describe_pair
 from .dtypes import BlockScaled, DType
-from .errors import TilefishTypeError
+from .errors import TilefishError, TilefishTypeError
 from .ir import Scalar
 from .trace import Const, TraceContext, Value
 from .types import TensorType
@@ -24,11 +24,12 @@ _SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 
 
 def _require_value(op: str, label: str, x: Any) -> Value:
+    """Check that ``x`` is a readable traced tensor and return its newest version."""
     if not isinstance(x, Value):
         raise TilefishTypeError(f"{op}: {label} must be a traced tensor value, got {type(x).__name__} ({x!r})")
     if x.access == "out":
         raise TilefishTypeError(f"{op}: {label} reads Out parameter '{x.name}', which is write-only")
-    return x
+    return x.live
 
 
 def _require_computable(op: str, label: str, x: Value, *, floating: bool = False) -> DType:
@@ -53,6 +54,12 @@ def _scalar_operand(op: str, label: str, x: Any, dtype: DType) -> Scalar:
         name, value = x.name, x.value
         if value is None:
             raise TilefishTypeError(f"{op}: {label} const parameter '{x.name}' has no value at trace time; give it a default")
+        if x.dtype is not None and x.dtype != dtype:
+            raise TilefishTypeError(
+                f"{op}: {label} const '{x.name}' is const[{x.dtype}] but the other operand has dtype {dtype}; "
+                f"there is no implicit conversion: cast the tensor with .to({x.dtype}) or declare the const as "
+                f"const[{dtype}] (an untyped const adopts the tensor dtype)"
+            )
     elif isinstance(x, DimExpr) and x.is_static:
         value = x.value
     else:
@@ -90,8 +97,9 @@ def broadcast_shapes(op: str, a: TensorType, b: TensorType) -> tuple[DimExpr, ..
         elif db.is_static and db.value == 1:
             out.append(da)
         else:
+            ta, tb = describe_pair(da, db)
             raise TilefishTypeError(
-                f"{op}: cannot broadcast {a} with {b}: dimension {da} vs {db} at axis -{i} "
+                f"{op}: cannot broadcast {a} with {b}: dimension {ta} vs {tb} at axis -{i} "
                 "(shapes align on trailing dimensions; only a size-1 dimension broadcasts)"
             )
     out.reverse()
@@ -103,28 +111,32 @@ def broadcast_shapes(op: str, a: TensorType, b: TensorType) -> tuple[DimExpr, ..
 
 def binary(op: str, left: Any, right: Any) -> Value:
     """``left <op> right`` for ``op`` in ``add``, ``sub``, ``mul``, ``div``."""
-    sym = _SYMBOLS[op]
-    named = f"{op} ({sym})"
-    vals = [(lab, x) for lab, x in (("left operand", left), ("right operand", right)) if isinstance(x, Value)]
-    if not vals:
+    named = f"{op} ({_SYMBOLS[op]})"
+    sides = [("left operand", left), ("right operand", right)]
+    ctx: TraceContext | None = None
+    resolved: list[Any] = []
+    for lab, x in sides:
+        if isinstance(x, Value):
+            if ctx is None:
+                ctx = x.ctx
+            elif x.ctx is not ctx:
+                raise TilefishTypeError(f"{named}: {lab} belongs to a different trace")
+            x = _require_value(named, lab, x)
+        resolved.append(x)
+    if ctx is None:
         raise TilefishTypeError(f"{named}: at least one operand must be a traced tensor value")
-    ctx: TraceContext = vals[0][1].ctx
-    for lab, x in vals:
-        _require_value(named, lab, x)
-        if x.ctx is not ctx:
-            raise TilefishTypeError(f"{named}: {lab} belongs to a different trace")
-    tensor_dtypes = []
-    for lab, x in vals:
-        tensor_dtypes.append(_require_computable(named, lab, x, floating=(op == "div")))
-    if len(vals) == 2 and vals[0][1].dtype != vals[1][1].dtype:
+    tensors = [(lab, x) for (lab, _), x in zip(sides, resolved) if isinstance(x, Value)]
+    dtypes = [_require_computable(named, lab, x, floating=(op == "div")) for lab, x in tensors]
+    if len(tensors) == 2 and tensors[0][1].dtype != tensors[1][1].dtype:
         raise TilefishTypeError(
-            f"{named}: no implicit promotion between tensor dtypes: left operand is {vals[0][1].type}, "
-            f"right operand is {vals[1][1].type}; cast one side explicitly with .to(dtype)"
+            f"{named}: no implicit promotion between tensor dtypes: left operand is {tensors[0][1].type}, "
+            f"right operand is {tensors[1][1].type}; cast one side explicitly with .to(dtype)"
         )
-    dtype = tensor_dtypes[0]
-    operands = []
-    for lab, x in (("left operand", left), ("right operand", right)):
-        operands.append(x if isinstance(x, Value) else _scalar_operand(named, lab, x, dtype))
+    dtype = dtypes[0]
+    operands = [
+        x if isinstance(x, Value) else _scalar_operand(named, lab, x, dtype)
+        for (lab, _), x in zip(sides, resolved)
+    ]
     shapes = [o.type for o in operands if isinstance(o, Value)]
     shape = shapes[0].shape if len(shapes) == 1 else broadcast_shapes(named, shapes[0], shapes[1])
     (out,) = ctx.emit(op, operands, {}, [TensorType(shape, dtype)])
@@ -135,9 +147,9 @@ def binary(op: str, left: Any, right: Any) -> Value:
 
 
 def _unary(op: str, x: Any) -> Value:
-    _require_value(op, "argument 'x'", x)
+    x = _require_value(op, "argument 'x'", x)
     _require_computable(op, "argument 'x'", x, floating=True)
-    (out,) = x.ctx.emit(op, [x], {}, [x.type])
+    (out,) = x.ctx.emit(op, [x], {}, [x.type.materialized()])
     return out
 
 
@@ -169,7 +181,7 @@ def sqrt(x: Value) -> Value:
 
 def cast(x: Value, dtype: DType) -> Value:
     """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point."""
-    _require_value("to", "the tensor", x)
+    x = _require_value("to", "the tensor", x)
     if isinstance(dtype, BlockScaled) or isinstance(x.dtype, BlockScaled):
         raise TilefishTypeError(
             f"to: casting {x.type} to {dtype!r} involves a block-scaled format; quantize/dequantize is not part of M1"
@@ -203,7 +215,7 @@ def _normalize_axes(op: str, x: Value, axis: Any) -> tuple[int, ...]:
 
 
 def _reduce(op: str, x: Any, axis: Any, keepdims: bool) -> Value:
-    _require_value(op, "argument 'x'", x)
+    x = _require_value(op, "argument 'x'", x)
     _require_computable(op, "argument 'x'", x, floating=(op == "mean"))
     axes = _normalize_axes(op, x, axis)
     shape: list[DimExpr] = []
@@ -236,14 +248,26 @@ def reduce_max(x: Value, axis: Any = None, keepdims: bool = False) -> Value:
 
 
 def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
-    """Split ``axis`` into equal chunks of ``size``, or into chunks of the sizes in a list."""
-    _require_value("split", "the tensor", x)
+    """Split ``axis`` into equal chunks of ``size``, or into chunks of the sizes in a list.
+
+    Splitting along a non-leading axis gives *views* (slabs at an offset with
+    the parent's strides), typed non-contiguous: they can feed traced
+    elementwise and reduction ops but cannot be passed to a declared operator.
+    """
+    x = _require_value("split", "the tensor", x)
     if isinstance(axis, bool) or not isinstance(axis, int) or not -x.rank <= axis < x.rank:
         raise TilefishTypeError(f"split: axis {axis!r} is invalid for {x.type} (rank {x.rank})")
     ax = axis % x.rank
     dim = x.shape[ax]
+
+    def as_size(s: Any) -> DimExpr:
+        try:
+            return as_dim(s)
+        except TilefishTypeError:
+            raise TilefishTypeError(f"split: sizes must be ints or dimensions, got {s!r}") from None
+
     if isinstance(size, (list, tuple)):
-        sizes = [as_dim(s) for s in size]
+        sizes = [as_size(s) for s in size]
         total = DimExpr.const(0)
         for s in sizes:
             total = total + s
@@ -252,20 +276,22 @@ def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
                 f"split: sizes {[str(s) for s in sizes]} add up to {total} but axis {axis} of {x.type} has size {dim}"
             )
     else:
-        chunk = as_dim(size)
+        chunk = as_size(size)
         count = dim.exact_div(chunk)
         if count is None or count < 1:
             raise TilefishTypeError(
                 f"split: axis {axis} of {x.type} has size {dim}, which is not a whole number of chunks of size {chunk}"
             )
         sizes = [chunk] * count
+    # A slab along axis ax is contiguous only when everything before that axis has size 1.
+    contiguous = x.type.contiguous and all(d.is_static and d.value == 1 for d in x.shape[:ax])
     out_types = []
     for s in sizes:
         shape = list(x.shape)
         shape[ax] = s
         try:
-            out_types.append(TensorType(shape, x.dtype, known=x.ctx.known))
-        except TilefishTypeError as e:
+            out_types.append(TensorType(shape, x.dtype, known=x.ctx.known, contiguous=contiguous))
+        except TilefishError as e:
             raise TilefishTypeError(f"split: chunk type is invalid: {e}") from None
     return x.ctx.emit("split", [x], {"axis": ax, "sizes": tuple(sizes)}, out_types)
 
@@ -274,7 +300,10 @@ def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
 
 
 def store(target: Any, key: Any, value: Any) -> None:
-    """``param[...] = value``: write ``value`` into an ``InOut``/``Out`` parameter."""
+    """``param[...] = value``: write ``value`` into an ``InOut``/``Out`` parameter.
+
+    Afterwards, reading an ``InOut`` parameter reads ``value``.
+    """
     if not isinstance(target, Value):
         raise TilefishTypeError(f"store: target must be a traced tensor, got {type(target).__name__}")
     if not (key is Ellipsis or (isinstance(key, slice) and key == slice(None))):
@@ -283,12 +312,17 @@ def store(target: Any, key: Any, value: Any) -> None:
         raise TilefishTypeError(
             f"store into '{target.name}': parameter is read-only; declare it InOut[...] or Out[...] to write it"
         )
-    _require_value("store", "the stored value", value)
+    value = _require_value("store", "the stored value", value)
     if value.ctx is not target.ctx:
         raise TilefishTypeError(f"store into '{target.name}': the stored value belongs to a different trace")
     if value.type != target.type:
-        raise TilefishTypeError(
-            f"store into '{target.name}': expected {target.type}, got {value.type}"
-            + ("; stores do not cast implicitly, use .to(dtype)" if value.dtype != target.dtype else "")
-        )
+        hint = ""
+        if not value.type.contiguous:
+            hint = "; a strided view cannot be stored (strided views arrive in M2): combine it in an elementwise op first"
+        elif value.dtype != target.dtype:
+            hint = "; stores do not cast implicitly, use .to(dtype)"
+        raise TilefishTypeError(f"store into '{target.name}': expected {target.type}, got {value.type}{hint}")
     target.ctx.emit("store", [target, value], {"target": target.name}, [])
+    target.ctx.written.add(target)
+    if target.access == "inout" and value is not target:
+        target._latest = value

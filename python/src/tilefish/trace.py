@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
-from .dims import DimExpr
+from .dims import Dim, DimExpr
 from .dtypes import DType
-from .errors import TilefishTypeError
-from .ir import Node, Requirement
+from .errors import TilefishAttributeError, TilefishTypeError
+from .ir import BucketRequirement, Node, Requirement
 from .types import AnyDType, TensorType
 
 if TYPE_CHECKING:
     from .ir import Scalar
+
+
+class _Missing:
+    def __repr__(self) -> str:
+        return "<missing>"
+
+
+_MISSING = _Missing()
 
 
 class TraceContext:
@@ -21,9 +30,11 @@ class TraceContext:
         self.name = name
         self.kind = kind
         self.nodes: list[Node] = []
-        self.requirements: list[Requirement] = []
+        self.requirements: list[Requirement | BucketRequirement] = []
         # Divisors established by requirements, keyed by dimension expression.
         self.known: dict[DimExpr, int] = {}
+        # Parameters (Out/InOut) that a store or an in-place call has written.
+        self.written: set[Value] = set()
         self._next_id = 0
 
     def new_value(
@@ -50,6 +61,17 @@ class TraceContext:
         self.nodes.append(Node(op, inputs, attrs, outs))
         return outs
 
+    # -- facts about dimensions ---------------------------------------------
+
+    def snapshot(self) -> tuple:
+        """The dimension facts, to roll back when a call fails half way."""
+        return (len(self.requirements), dict(self.known))
+
+    def restore(self, snap: tuple) -> None:
+        count, known = snap
+        del self.requirements[count:]
+        self.known = known
+
     def is_divisible(self, expr: DimExpr, k: int) -> bool:
         return expr.is_divisible_by(k, self.known)
 
@@ -59,23 +81,27 @@ class TraceContext:
             return
         self.requirements.append(Requirement(expr, k, origin))
         prev = self.known.get(expr, 1)
-        self.known[expr] = prev * k // _gcd(prev, k)
+        self.known[expr] = prev * k // math.gcd(prev, k)
 
-
-def _gcd(a: int, b: int) -> int:
-    while b:
-        a, b = b, a % b
-    return a
+    def require_bucket(self, expr: DimExpr, buckets: tuple[int, ...], origin: str) -> None:
+        """Record that ``expr`` must be one of ``buckets`` (a bucketed callee dimension bound to it)."""
+        if isinstance(expr, Dim) and expr.buckets and set(expr.buckets) <= set(buckets):
+            return
+        req = BucketRequirement(expr, tuple(buckets), origin)
+        if not any(isinstance(r, BucketRequirement) and r.dim == expr and r.buckets == req.buckets for r in self.requirements):
+            self.requirements.append(req)
 
 
 class Const:
     """A ``const`` parameter as seen inside a traced body.
 
-    It combines with tensors and adopts their dtype. ``value`` is the declared
-    default (``None`` when there is none).
+    It combines with tensors. An untyped ``const`` adopts the dtype of the
+    tensor it meets; a typed one (``const[f32]``) must match it, like a tensor
+    would. ``value`` is the declared default (``None`` when there is none).
     """
 
     __slots__ = ("name", "value", "dtype")
+    _tf_operand = True
 
     def __init__(self, name: str, value: Any, dtype: DType | None) -> None:
         self.name = name
@@ -95,10 +121,46 @@ class Const:
     __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __truediv__ = __rtruediv__ = _binop
 
 
-class Value:
-    """A traced tensor: carries a :class:`TensorType` and records every operation on it."""
+# Operators a traced tensor does not support in M1, with what to do instead.
+_UNSUPPORTED = {
+    "__neg__": ("negation (-x)", "write 0 - x or x * -1"),
+    "__pos__": ("unary plus (+x)", "just use x"),
+    "__abs__": ("abs()", "there is no abs op yet"),
+    "__pow__": ("exponentiation (**)", "multiply explicitly, or use exp, sqrt or rsqrt"),
+    "__rpow__": ("exponentiation (**)", "multiply explicitly, or use exp, sqrt or rsqrt"),
+    "__matmul__": ("matrix multiplication (@)", "declare a library op such as gemm and call it"),
+    "__rmatmul__": ("matrix multiplication (@)", "declare a library op such as gemm and call it"),
+    "__floordiv__": ("floor division (//)", "use / on floating-point tensors"),
+    "__rfloordiv__": ("floor division (//)", "use / on floating-point tensors"),
+    "__mod__": ("modulo (%)", "there is no modulo op yet"),
+    "__rmod__": ("modulo (%)", "there is no modulo op yet"),
+    "__lt__": ("comparison (<)", "comparisons and masks are not part of the traced ops yet"),
+    "__le__": ("comparison (<=)", "comparisons and masks are not part of the traced ops yet"),
+    "__gt__": ("comparison (>)", "comparisons and masks are not part of the traced ops yet"),
+    "__ge__": ("comparison (>=)", "comparisons and masks are not part of the traced ops yet"),
+    "__and__": ("bitwise and (&)", "there are no bitwise ops yet"),
+    "__or__": ("bitwise or (|)", "there are no bitwise ops yet"),
+    "__xor__": ("bitwise xor (^)", "there are no bitwise ops yet"),
+    "__invert__": ("bitwise not (~)", "there are no bitwise ops yet"),
+    "__lshift__": ("shift (<<)", "there are no bitwise ops yet"),
+    "__rshift__": ("shift (>>)", "there are no bitwise ops yet"),
+    "__len__": ("len()", "use .shape"),
+    "__int__": ("int()", "a traced tensor has no value at trace time"),
+    "__float__": ("float()", "a traced tensor has no value at trace time"),
+    "__index__": ("use as an index or in range()", "a traced tensor has no value at trace time"),
+}
 
-    __slots__ = ("ctx", "name", "type", "access", "is_param")
+
+class Value:
+    """A traced tensor: carries a :class:`TensorType` and records every operation on it.
+
+    After ``param[...] = v`` (or an in-place call), reading ``param`` reads the
+    new version, so a body sees what it has stored. ``Out`` parameters are
+    write-only.
+    """
+
+    __slots__ = ("ctx", "name", "type", "access", "is_param", "_latest")
+    _tf_operand = True
 
     def __init__(self, ctx: TraceContext, name: str, type: TensorType, access: str, is_param: bool) -> None:
         self.ctx = ctx
@@ -106,6 +168,7 @@ class Value:
         self.type = type
         self.access = access
         self.is_param = is_param
+        self._latest: Value | None = None
 
     # -- inspection ---------------------------------------------------------
 
@@ -126,6 +189,14 @@ class Value:
         return self.type.rank
 
     @property
+    def live(self) -> "Value":
+        """The newest version of this value (itself unless it was stored into or updated in place)."""
+        v = self
+        while v._latest is not None:
+            v = v._latest
+        return v
+
+    @property
     def producer(self) -> Node | None:
         for n in self.ctx.nodes:
             if any(o is self for o in n.outputs):
@@ -135,18 +206,31 @@ class Value:
     def __repr__(self) -> str:
         return f"Value({self.ref}: {self.type})"
 
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):  # protocol probing (copy, pickle, ...) must see a plain AttributeError
+            raise AttributeError(name)
+        raise TilefishAttributeError(
+            f"traced tensor {self.ref} ({self.type}) has no attribute '{name}': in M1 a tensor has "
+            ".shape, .dtype, .rank, .to(dtype), .split(size, axis), .sum/.mean/.max(axis, keepdims) "
+            "and the operators + - * /"
+        )
+
     # -- methods ------------------------------------------------------------
 
-    def to(self, dtype: DType) -> "Value":
+    def to(self, dtype: Any = _MISSING) -> "Value":
         """Cast to ``dtype``. A narrowing cast is flagged as a rounding point in the IR."""
         from . import ops
 
+        if dtype is _MISSING:
+            raise TilefishTypeError("to: needs a dtype, e.g. x.to(bf16)")
         return ops.cast(self, dtype)
 
-    def split(self, size: Any, axis: int) -> "tuple[Value, ...]":
+    def split(self, size: Any = _MISSING, axis: Any = _MISSING) -> "tuple[Value, ...]":
         """Split ``axis`` into equal chunks of ``size`` (or into chunks of the given sizes)."""
         from . import ops
 
+        if size is _MISSING or axis is _MISSING:
+            raise TilefishTypeError("split: needs a size and an axis, e.g. x.split(size, axis=-1)")
         return ops.split(self, size, axis)
 
     def sum(self, axis: Any = None, keepdims: bool = False) -> "Value":
@@ -224,3 +308,15 @@ class Value:
         raise TilefishTypeError(f"the truth value of the traced tensor {self.ref} is not defined")
 
     __hash__ = object.__hash__
+
+
+def _unsupported_method(dunder: str, what: str, hint: str) -> Any:
+    def method(self: Value, *args: Any) -> Any:
+        raise TilefishTypeError(f"{what} on tensor {self.ref} ({self.type}) is not supported in M1; {hint}")
+
+    method.__name__ = dunder
+    return method
+
+
+for _dunder, (_what, _hint) in _UNSUPPORTED.items():
+    setattr(Value, _dunder, _unsupported_method(_dunder, _what, _hint))

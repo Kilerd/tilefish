@@ -46,6 +46,18 @@ class Requirement:
         return f"{self.dim} % {self.divisor} == 0  (required by {self.origin})"
 
 
+@dataclass(frozen=True)
+class BucketRequirement:
+    """A symbolic dimension must be one of the bucket values of a bucketed callee dimension."""
+
+    dim: DimExpr
+    buckets: tuple[int, ...]
+    origin: str
+
+    def __str__(self) -> str:
+        return f"{self.dim} in {list(self.buckets)}  (required by {self.origin})"
+
+
 def _fmt_attr(v: Any) -> str:
     if isinstance(v, (tuple, list)):
         return "(" + ", ".join(_fmt_attr(x) for x in v) + ("," if len(v) == 1 else "") + ")"
@@ -63,6 +75,10 @@ class Node:
     ``attrs["rounding"]`` says whether the cast can lose information (a
     *rounding point*); calls to declared operators carry ``attrs["kind"]``
     (``library``/``extern``/``kernel``/``graph``).
+
+    A call's ``outputs`` are the declared return values, then the ``Out``
+    parameters, then one new version of each ``InOut`` argument (after the
+    call, reading that argument reads the new version).
     """
 
     __slots__ = ("op", "inputs", "attrs", "outputs")
