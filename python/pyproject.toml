@@ -12,11 +12,17 @@ classifiers = ["Development Status :: 2 - Pre-Alpha"]
 [project.urls]
 Repository = "https://github.com/Kilerd/tilefish"
 
+[project.optional-dependencies]
+# Building cubins and running kernels (tilefish.aot.build, tilefish.run). The core package needs none of these,
+# and `import tilefish` never imports them.
+gpu = ["torch>=2.9", "triton>=3.5", "cuda-python>=12.8"]
+
 [dependency-groups]
 dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["gpu: needs a CUDA device with torch, triton and cuda-python; skipped automatically when any is missing"]
 
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14"]
