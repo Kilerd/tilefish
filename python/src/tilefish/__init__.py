@@ -8,6 +8,7 @@ but not lowered yet.
 """
 
 from . import aot
+from . import ops as _ops
 from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp, Op, extern, graph, kernel, library
 from .dims import Dim, DimExpr, cdiv
 from .dtypes import (
@@ -25,23 +26,30 @@ from .dtypes import (
     ue8m0,
 )
 from .errors import (
+    TilefishAttributeError,
     TilefishDeclarationError,
     TilefishError,
     TilefishSpecError,
     TilefishTypeError,
 )
-from .ir import Graph, Node, Requirement, Scalar
+from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .ops import exp, gelu, rsqrt, silu, sqrt
-from .ops import reduce_max as max  # noqa: A001 - tilefish.max(x, axis, keepdims) reduces
 from .ops import reduce_mean as mean
-from .ops import reduce_sum as sum  # noqa: A001 - tilefish.sum(x, axis, keepdims) reduces
 from .trace import Const, Value
 from .types import InOut, Out, Tensor, TensorType, const
 
 __version__ = "0.0.0"
 
+# Reductions with numpy semantics. They share a name with a builtin, so they are not in
+# __all__ (`from tilefish import *` must not shadow the builtins); use tilefish.sum etc.
+sum = _ops.reduce_sum  # noqa: A001
+max = _ops.reduce_max  # noqa: A001
+
+# `sum` and `max` are deliberately not in __all__: `from tilefish import *` must not shadow
+# the builtins. They stay reachable as tilefish.sum and tilefish.max.
 __all__ = [
     "BlockScaled",
+    "BucketRequirement",
     "Const",
     "DType",
     "Dim",
@@ -59,6 +67,7 @@ __all__ = [
     "Scalar",
     "Tensor",
     "TensorType",
+    "TilefishAttributeError",
     "TilefishDeclarationError",
     "TilefishError",
     "TilefishSpecError",
@@ -81,12 +90,10 @@ __all__ = [
     "i64",
     "kernel",
     "library",
-    "max",
     "mean",
     "rsqrt",
     "silu",
     "sqrt",
-    "sum",
     "u8",
     "ue8m0",
 ]

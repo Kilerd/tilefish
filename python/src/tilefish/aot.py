@@ -20,6 +20,13 @@ Conventions (all from the declaration, nothing guessed at compile time):
   indices: ``{(3,): 1024}`` and ``{(0,): [["tt.divisibility", 16]]}``.
 * Every pointer is assumed 16-byte aligned, and so is every ``i32`` argument
   whose dimension is provably a multiple of 16.
+* Bucket semantics are exact: in a spec for bucket ``b`` the bucketed dimension
+  is replaced by ``b`` in the grid, in the shapes and in every constant derived
+  from it, and the spec requires the dimension to equal ``b`` at launch (the
+  host picks the smallest bucket that fits and pads).
+* Static dimensions are rendered as their values (``(S, 32)``, never ``(S, NH)``).
+* In JSON, a non-finite float is the tagged value ``{"float": "inf"}`` /
+  ``"-inf"`` / ``"nan"``, so the output is always strict JSON.
 """
 
 from __future__ import annotations
@@ -27,10 +34,11 @@ from __future__ import annotations
 import copy
 import itertools
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
-from .decorators import ExternOp
+from .decorators import ExternOp, grid_to_string
 from .dims import Dim, DimExpr
 from .dtypes import BlockScaled
 from .errors import TilefishSpecError
@@ -38,6 +46,19 @@ from .signature import MISSING
 
 ALIGNMENT = 16  # bytes; the value of every "tt.divisibility" attribute
 SCHEMA_VERSION = 1
+
+
+def _encode(v: Any) -> Any:
+    """A scalar for JSON: non-finite floats become ``{"float": "inf" | "-inf" | "nan"}``."""
+    if isinstance(v, float) and not math.isfinite(v):
+        return {"float": "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")}
+    return v
+
+
+def _decode(v: Any) -> Any:
+    if isinstance(v, dict) and set(v) == {"float"}:
+        return float(v["float"])
+    return v
 
 
 @dataclass(frozen=True)
@@ -49,7 +70,9 @@ class Precondition:
     * ``"pointer_alignment"``: argument ``arg`` (index ``index``) is aligned to ``bytes``;
     * ``"divisible"``: runtime argument ``arg`` (carrying ``dim``) is a multiple of ``by``;
     * ``"static_size"``: axis ``axis`` of tensor argument ``arg`` equals ``value``;
-    * ``"bucket"``: dimension ``dim`` fell in the bucket ``value`` (of ``buckets``) this binary serves.
+    * ``"bucket"``: dimension ``dim`` equals ``value`` exactly. ``value`` is the bucket this
+      binary was compiled for and ``buckets`` lists every bucket, so a host can pick the
+      smallest one that is at least the real size and pad up to it.
     """
 
     kind: str
@@ -70,6 +93,13 @@ class Precondition:
                 out[k] = list(v) if isinstance(v, tuple) else v
         return out
 
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "Precondition":
+        kw = dict(d)
+        if kw.get("buckets") is not None:
+            kw["buckets"] = tuple(kw["buckets"])
+        return cls(**kw)
+
 
 @dataclass(frozen=True)
 class ArgSpec:
@@ -81,19 +111,30 @@ class ArgSpec:
     type: str  # the Triton signature entry
     access: str | None = None  # pointers: "in" | "inout" | "out"
     dtype: str | None = None  # pointers: element dtype
-    shape: tuple[str, ...] | None = None  # pointers: dimension expressions, as strings
+    shape: tuple[str, ...] | None = None  # pointers: dimension expressions, as strings (static dims as values)
     dim: str | None = None  # scalars: the dimension expression whose value is passed
     value: Any = None  # constexprs: the compiled-in value
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"index": self.index, "name": self.name, "kind": self.kind, "type": self.type}
-        for k in ("access", "dtype", "dim", "value"):
+        for k in ("access", "dtype", "dim"):
             v = getattr(self, k)
             if v is not None:
                 out[k] = v
+        if self.value is not None:
+            out["value"] = _encode(self.value)
         if self.shape is not None:
             out["shape"] = list(self.shape)
         return out
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ArgSpec":
+        kw = dict(d)
+        if kw.get("shape") is not None:
+            kw["shape"] = tuple(kw["shape"])
+        if "value" in kw:
+            kw["value"] = _decode(kw["value"])
+        return cls(**kw)
 
 
 @dataclass(frozen=True)
@@ -109,6 +150,10 @@ class LaunchParam:
         if self.value is not None:
             out["value"] = self.value
         return out
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "LaunchParam":
+        return cls(**d)
 
 
 @dataclass(frozen=True)
@@ -128,6 +173,14 @@ class AstSourceInputs:
     @property
     def signature_by_index(self) -> dict[int, str]:
         return dict(enumerate(self.signature.values()))
+
+
+def _key_to_str(k: tuple[int, ...]) -> str:
+    return ",".join(str(i) for i in k)
+
+
+def _key_from_str(k: str) -> tuple[int, ...]:
+    return tuple(int(i) for i in k.split(","))
 
 
 @dataclass(frozen=True)
@@ -169,12 +222,9 @@ class CompileSpec:
     def to_dict(self) -> dict[str, Any]:
         """A JSON-compatible manifest skeleton (no machine-code hashes yet).
 
-        Tuple keys become strings: ``{(3,): 1024}`` is ``{"3": 1024}``.
+        Tuple keys become strings: ``{(3,): 1024}`` is ``{"3": 1024}``. A
+        non-finite float is encoded as ``{"float": "inf" | "-inf" | "nan"}``.
         """
-
-        def key(k: tuple[int, ...]) -> str:
-            return ",".join(str(i) for i in k)
-
         return {
             "schema": SCHEMA_VERSION,
             "stem": self.stem,
@@ -183,8 +233,8 @@ class CompileSpec:
             "buckets": dict(self.buckets),
             "args": [a.to_dict() for a in self.args],
             "signature": dict(self.signature),
-            "constants": {key(k): v for k, v in self.constants.items()},
-            "attrs": {key(k): copy.deepcopy(v) for k, v in self.attrs.items()},
+            "constants": {_key_to_str(k): _encode(v) for k, v in self.constants.items()},
+            "attrs": {_key_to_str(k): copy.deepcopy(v) for k, v in self.attrs.items()},
             "num_warps": self.num_warps,
             "num_stages": self.num_stages,
             "grid": self.grid,
@@ -194,7 +244,34 @@ class CompileSpec:
         }
 
     def to_json(self, indent: int | None = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
+        """Strict JSON (never ``NaN``/``Infinity``)."""
+        return json.dumps(self.to_dict(), indent=indent, allow_nan=False)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "CompileSpec":
+        """The inverse of :meth:`to_dict`."""
+        if d.get("schema") != SCHEMA_VERSION:
+            raise TilefishSpecError(f"unsupported compile spec schema {d.get('schema')!r} (expected {SCHEMA_VERSION})")
+        return cls(
+            stem=d["stem"],
+            op=d["op"],
+            triton=d["triton"]["ref"],
+            signature=dict(d["signature"]),
+            constants={_key_from_str(k): _decode(v) for k, v in d["constants"].items()},
+            attrs={_key_from_str(k): copy.deepcopy(v) for k, v in d["attrs"].items()},
+            num_warps=d["num_warps"],
+            num_stages=d["num_stages"],
+            grid=d["grid"],
+            block=tuple(d["block"]),  # type: ignore[arg-type]
+            launch_params=tuple(LaunchParam.from_dict(p) for p in d["launch_params"]),
+            preconditions=tuple(Precondition.from_dict(p) for p in d["preconditions"]),
+            args=tuple(ArgSpec.from_dict(a) for a in d["args"]),
+            buckets=dict(d.get("buckets", {})),
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> "CompileSpec":
+        return cls.from_dict(json.loads(text))
 
 
 def _bucket_dims(op: ExternOp) -> list[Dim]:
@@ -237,9 +314,8 @@ def _build(op: ExternOp, mapping: dict[Dim, int]) -> CompileSpec:
             for axis, d in enumerate(t.shape):
                 if d.is_static:
                     preconditions.append(Precondition("static_size", arg=p.name, index=i, axis=axis, value=d.value))
-            args.append(
-                ArgSpec(i, p.name, "pointer", ptr, access=p.access, dtype=str(t.dtype), shape=tuple(str(d) for d in t.shape))
-            )
+            shape = tuple(str(d.subst(mapping).folded()) for d in t.shape)  # bucket values and static dims, folded
+            args.append(ArgSpec(i, p.name, "pointer", ptr, access=p.access, dtype=str(t.dtype), shape=shape))
         elif p.kind == "dim":
             assert p.dim is not None
             signature[p.name] = "i32"
@@ -262,6 +338,12 @@ def _build(op: ExternOp, mapping: dict[Dim, int]) -> CompileSpec:
     for d, v in mapping.items():
         preconditions.append(Precondition("bucket", dim=d.name, value=v, buckets=d.buckets))
 
+    assert op.grid is not None
+    grid = tuple(g.subst(mapping).folded() for g in op.grid)  # exact buckets: the bucket value, folded
+    for g in grid:
+        if g.is_static and g.value < 1:
+            raise TilefishSpecError(f"extern op '{op.name}': the grid has a non-positive size {g} for {mapping}")
+
     launch = [LaunchParam(a.name, a.type) for a in args if a.kind != "constexpr"]
     launch += [LaunchParam("global_scratch", "u64", 0), LaunchParam("profile_scratch", "u64", 0)]
     stem = op.name + "".join(f".{d.name}{v}" for d, v in mapping.items())
@@ -274,7 +356,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int]) -> CompileSpec:
         attrs=attrs,
         num_warps=op.num_warps,
         num_stages=op.num_stages,
-        grid=op.grid_string,  # type: ignore[arg-type]
+        grid=grid_to_string(grid),
         block=(32 * op.num_warps, 1, 1),
         launch_params=tuple(launch),
         preconditions=tuple(preconditions),
@@ -290,5 +372,5 @@ def compile_specs(op: ExternOp) -> list[CompileSpec]:
     if op.grid is None:
         raise TilefishSpecError(f"extern op '{op.name}' has no grid; pass grid=... to @tilefish.extern")
     dims = _bucket_dims(op)
-    combos = itertools.product(*(d.buckets for d in dims)) if dims else [()]
+    combos = itertools.product(*(d.buckets for d in dims)) if dims else [()]  # type: ignore[arg-type]
     return [_build(op, dict(zip(dims, combo))) for combo in combos]

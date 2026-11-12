@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from .dims import DimExpr, as_dim
 from .dtypes import DType
-from .errors import TilefishDeclarationError, TilefishTypeError
+from .errors import TilefishDeclarationError, TilefishError, TilefishTypeError
 from .ir import Graph
 from .signature import MISSING, Param, Signature, call_op, parse_signature
 from .trace import Const, TraceContext, Value
@@ -29,6 +29,8 @@ class Op:
         self.signature = signature
         self.__doc__ = getattr(fn, "__doc__", None)
         self.__wrapped__ = fn
+        self.__module__ = getattr(fn, "__module__", None)  # type: ignore[assignment]
+        self.__qualname__ = getattr(fn, "__qualname__", name)
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return call_op(self, args, kwargs)
@@ -40,6 +42,10 @@ class Op:
     def check_const(self, param: Param, value: Any) -> Any:
         """Validate a ``const`` argument supplied at a call site."""
         return value
+
+    def __reduce__(self) -> Any:
+        # Declared operators are module-level objects: copy and pickle them by reference.
+        return self.__qualname__
 
     def __str__(self) -> str:
         return f"{self.kind} {self.name}{self.signature}"
@@ -66,7 +72,11 @@ def _trace_body(fn: Callable[..., Any], signature: Signature, name: str, kind: s
             consts[p.name] = const_param
         else:
             kwargs[p.name] = p.dim
-    result = fn(**kwargs)
+    try:
+        result = fn(**kwargs)
+    except TilefishError as e:
+        _name_scope(e, kind, name)
+        raise
     if result is None:
         outputs: tuple[Value, ...] = ()
     elif isinstance(result, Value):
@@ -82,7 +92,25 @@ def _trace_body(fn: Callable[..., Any], signature: Signature, name: str, kind: s
             raise TilefishTypeError(f"{kind} '{name}': returned value {r.ref} belongs to a different trace")
         if r.access == "out":
             raise TilefishTypeError(f"{kind} '{name}': cannot return Out parameter '{r.name}' (it is write-only)")
+    outputs = tuple(r.live for r in outputs)  # a returned InOut parameter is the value stored into it
+    if kind == "kernel":
+        for v in inputs:
+            if v.access in ("out", "inout") and v not in ctx.written:
+                label = "Out" if v.access == "out" else "InOut"
+                raise TilefishTypeError(
+                    f"kernel '{name}': {label} parameter '{v.name}' is never written; assign it with "
+                    f"{v.name}[...] = value (or pass it to an in-place operator)"
+                )
     return Graph(name, kind, inputs, consts, ctx.nodes, outputs, ctx.requirements)
+
+
+def _name_scope(e: TilefishError, kind: str, name: str) -> None:
+    """Prefix an error raised while tracing a body with the graph or kernel it happened in (once)."""
+    if getattr(e, "_tf_scoped", False):
+        return
+    e._tf_scoped = True  # type: ignore[attr-defined]
+    first = str(e.args[0]) if e.args else str(e)
+    e.args = (f"in {kind} '{name}': {first}", *e.args[1:])
 
 
 def _with_traced_returns(signature: Signature, graph: Graph, kind: str, name: str) -> Signature:
@@ -167,8 +195,16 @@ def _declare_traced(fn: Callable[..., Any], name: str | None, cls: type, kind: s
     return cls(fn, nm, sig, graph)
 
 
+def _check_decorator_arg(deco: str, fn: Any) -> None:
+    if fn is not None and not callable(fn):
+        raise TilefishDeclarationError(
+            f"@tilefish.{deco} decorates a function: write @tilefish.{deco} or @tilefish.{deco}(name=...), got {fn!r}"
+        )
+
+
 def graph(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
     """``@tilefish.graph``: trace and type-check a model body."""
+    _check_decorator_arg("graph", fn)
     if fn is None:
         return lambda f: _declare_traced(f, name, GraphOp, "graph")
     return _declare_traced(fn, name, GraphOp, "graph")
@@ -176,6 +212,7 @@ def graph(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> A
 
 def kernel(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
     """``@tilefish.kernel``: trace and type-check a kernel body (no lowering in M1)."""
+    _check_decorator_arg("kernel", fn)
     if fn is None:
         return lambda f: _declare_traced(f, name, KernelOp, "kernel")
     return _declare_traced(fn, name, KernelOp, "kernel")
@@ -184,21 +221,77 @@ def kernel(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> 
 # -- extern -----------------------------------------------------------------------------------
 
 _TRITON_REF = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
+_NUM_WARPS = (1, 2, 4, 8, 16, 32)
 
 
-def _triton_ref(obj: Any) -> str:
+class _TritonTarget:
+    """What ``extern(triton=...)`` says about the kernel: a reference and, when known, its parameters."""
+
+    def __init__(self, ref: str, arg_names: "list[str] | None" = None, constexpr: "list[bool] | None" = None) -> None:
+        self.ref = ref
+        self.arg_names = arg_names
+        self.constexpr = constexpr
+
+
+def _triton_target(obj: Any) -> _TritonTarget:
+    """Resolve ``triton=``: a ``"module:function"`` string or a kernel object.
+
+    For an object, the innermost ``.fn`` that has a ``__module__`` and a
+    ``__name__`` names the kernel (a ``triton.JITFunction`` wraps the Python
+    function, an autotuner wraps the JIT function). If the object
+    exposes the kernel's parameter list (duck-typed, nothing is imported:
+    ``arg_names``, and ``params[i].is_constexpr`` when present) it is returned
+    so the stub can be checked against it.
+    """
     if isinstance(obj, str):
         if not _TRITON_REF.match(obj):
             raise TilefishDeclarationError(f"extern: triton={obj!r} must look like 'module:function'")
-        return obj
-    for cand in (obj, getattr(obj, "fn", None)):  # triton.JITFunction keeps the python function in .fn
+        return _TritonTarget(obj)
+    chain = [obj]  # an autotuner wraps the JIT function, which wraps the python function
+    while len(chain) < 4 and getattr(chain[-1], "fn", None) is not None:
+        chain.append(chain[-1].fn)
+    ref = None
+    for cand in reversed(chain):  # the innermost function that has a module and a name
         module = getattr(cand, "__module__", None)
         fname = getattr(cand, "__name__", None)
         if isinstance(module, str) and isinstance(fname, str):
-            return f"{module}:{fname}"
-    raise TilefishDeclarationError(
-        f"extern: triton= takes a 'module:function' string or a function object, got {obj!r}"
-    )
+            ref = f"{module}:{fname}"
+            break
+    if ref is None:
+        raise TilefishDeclarationError(
+            f"extern: triton= takes a 'module:function' string or a kernel object, got {obj!r}"
+        )
+    for cand in chain:
+        names = getattr(cand, "arg_names", None)
+        if names is not None:
+            params = getattr(cand, "params", None)
+            flags = None
+            if params is not None and all(hasattr(pr, "is_constexpr") for pr in params):
+                flags = [bool(pr.is_constexpr) for pr in params]
+            return _TritonTarget(ref, [str(n) for n in names], flags)
+    return _TritonTarget(ref)
+
+
+def _check_against_kernel(name: str, sig: Signature, target: _TritonTarget) -> None:
+    """The stub must list the Triton kernel's parameters, same names, same order, const <=> constexpr."""
+    if target.arg_names is None:
+        return
+    stub = [p.name for p in sig.params]
+    if stub != target.arg_names:
+        diff = next((i for i, (a, b) in enumerate(zip(stub, target.arg_names)) if a != b), min(len(stub), len(target.arg_names)))
+        raise TilefishDeclarationError(
+            f"extern op '{name}': the stub's parameters {stub} do not match the parameters of the Triton kernel "
+            f"'{target.ref}' {target.arg_names} (first difference at position {diff}); the stub lists the kernel's "
+            "parameters in order"
+        )
+    if target.constexpr is not None:
+        for p, is_constexpr in zip(sig.params, target.constexpr):
+            if (p.kind == "const") != is_constexpr:
+                raise TilefishDeclarationError(
+                    f"extern op '{name}': parameter '{p.name}' is "
+                    f"{'a const in the stub' if p.kind == 'const' else 'not a const in the stub'} but "
+                    f"{'a constexpr' if is_constexpr else 'not a constexpr'} in the Triton kernel '{target.ref}'"
+                )
 
 
 class ExternOp(Op):
@@ -240,8 +333,7 @@ class ExternOp(Op):
         """The launch grid as a string expression over dimension names, e.g. ``(cdiv(n, 1024),)``."""
         if self.grid is None:
             return None
-        body = ", ".join(str(g) for g in self.grid)
-        return f"({body},)" if len(self.grid) == 1 else f"({body})"
+        return grid_to_string(self.grid)
 
     def node_attrs(self) -> dict[str, Any]:
         return {"triton": self.triton}
@@ -258,18 +350,21 @@ class ExternOp(Op):
         table: dict[str, Any] = {}
         for p in self.signature.params:
             if p.kind == "const" and p.default is not MISSING:
-                table[p.name] = p.default
+                table[p.name] = p.default.folded() if isinstance(p.default, DimExpr) else p.default
             elif p.kind == "dim":
                 table[p.name] = p.dim
         # dimension names take priority over parameter names
         for p in self.signature.params:
             if p.kind == "tensor":
-                for d in p.type.shape:  # type: ignore[union-attr]
-                    table.update(d.named_dims())
+                dims = [d.named_dims() for d in p.type.shape]  # type: ignore[union-attr]
             elif p.kind == "dim":
-                table.update(p.dim.named_dims())  # type: ignore[union-attr]
+                dims = [p.dim.named_dims()]  # type: ignore[union-attr]
             elif isinstance(p.default, DimExpr):
-                table.update(p.default.named_dims())
+                dims = [p.default.named_dims()]
+            else:
+                continue
+            for named in dims:
+                table.update({k: v.folded() for k, v in named.items()})  # a static Dim is its value
         return table
 
     def _eval_grid(self, grid: Any) -> "tuple[DimExpr, ...] | None":
@@ -290,32 +385,71 @@ class ExternOp(Op):
                         f"extern '{self.name}': grid parameter '{pname}' is not a dimension or constant of the "
                         f"signature (available: {', '.join(sorted(table)) or 'none'})"
                     )
-            grid = grid(**kwargs)
+            try:
+                grid = grid(**kwargs)
+            except TilefishError as e:
+                raise TilefishDeclarationError(f"extern '{self.name}': the grid callable failed: {e}") from None
         if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3:
             raise TilefishDeclarationError(
                 f"extern '{self.name}': grid must be a tuple of 1 to 3 sizes, got {grid!r}"
             )
         try:
-            return tuple(as_dim(g) for g in grid)
+            entries = tuple(as_dim(g).folded() for g in grid)
         except TilefishTypeError:
             raise TilefishDeclarationError(
                 f"extern '{self.name}': grid entries must be ints or dimension expressions, got {grid!r}"
             ) from None
+        for g in entries:
+            if g.is_static and g.value < 1:
+                raise TilefishDeclarationError(f"extern '{self.name}': grid sizes must be at least 1, got {grid!r}")
+        return entries
+
+
+def grid_to_string(grid: "tuple[DimExpr, ...]") -> str:
+    """Render a grid as a tuple expression: ``(M,)``, ``(S, 32)``."""
+    body = ", ".join(str(g) for g in grid)
+    return f"({body},)" if len(grid) == 1 else f"({body})"
 
 
 def extern(
-    *,
-    triton: Any,
+    *args: Any,
+    triton: Any = None,
     num_warps: int = 4,
     num_stages: int = 3,
     grid: Any = None,
     name: str | None = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
-    """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel."""
-    ref = _triton_ref(triton)
-    for label, val in (("num_warps", num_warps), ("num_stages", num_stages)):
-        if isinstance(val, bool) or not isinstance(val, int) or val < 1:
-            raise TilefishDeclarationError(f"extern: {label} must be a positive int, got {val!r}")
+    """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
+
+    It always takes arguments (``@tilefish.extern`` without parentheses is an
+    error). ``triton`` is a ``"module:function"`` string or a kernel object;
+    ``grid`` is a callable over dimension and constant names, or a tuple.
+
+    The decorated stub lists **the Triton kernel's parameters, in order**:
+    a ``Tensor``/``InOut``/``Out`` is a pointer, a parameter annotated with a
+    runtime ``Dim`` is an ``i32``, a ``const`` is a ``constexpr`` (it needs a
+    default: the compiled-in value). Python forbids a parameter without a
+    default after one with a default, so when a constexpr comes before other
+    parameters, put a bare ``*`` before it::
+
+        @tilefish.extern(triton="my_kernels:k", grid=lambda n: (n,))
+        def k(x: Tensor[n, bf16], *, BLOCK: const = 64, y: Out[Tensor[n, bf16]], n_elem: n): ...
+
+    Declaration order is still the kernel's argument order (``x``, ``BLOCK``,
+    ``y``, ``n_elem``); arguments after the ``*`` are passed by keyword at call
+    sites. When ``triton`` is a kernel object that exposes ``arg_names`` (and
+    ``params[i].is_constexpr``), the stub is checked against it.
+    """
+    if args or triton is None:
+        raise TilefishDeclarationError(
+            '@tilefish.extern takes arguments: write @tilefish.extern(triton="module:function", grid=...), '
+            "not a bare @tilefish.extern"
+        )
+    target = _triton_target(triton)
+    if isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS:
+        raise TilefishDeclarationError(f"extern: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
+    if isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1:
+        raise TilefishDeclarationError(f"extern: num_stages must be a positive int, got {num_stages!r}")
 
     def deco(fn: Callable[..., Any]) -> ExternOp:
         nm = name or fn.__name__
@@ -329,6 +463,7 @@ def extern(
                 raise TilefishDeclarationError(
                     f"extern op '{nm}': const parameter '{p.name}' needs a default, the value compiled in as constexpr"
                 )
-        return ExternOp(fn, nm, sig, ref, num_warps, num_stages, grid)
+        _check_against_kernel(nm, sig, target)
+        return ExternOp(fn, nm, sig, target.ref, num_warps, num_stages, grid)
 
     return deco
