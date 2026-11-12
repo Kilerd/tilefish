@@ -168,7 +168,8 @@ class LoweredKernel:
 
     ``extern`` is an :class:`~tilefish.decorators.ExternOp` for the generated function: pass it to
     :func:`tilefish.aot.compile_specs` to get its compile specs (one per bucket of a bucketed
-    ``D``). Its triton reference is ``module:fn_name``.
+    ``D``). Its triton reference is ``module:fn_name``. ``kernel`` is the ``@tilefish.kernel`` it was
+    lowered from, which the ``reference`` mode of :func:`tilefish.run` interprets.
     """
 
     name: str
@@ -178,6 +179,13 @@ class LoweredKernel:
     source: str
     extern: ExternOp
     num_warps: int
+    kernel: "KernelOp | None" = None
+
+    def run(self, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
+        """``tilefish.run(self, *args, mode=mode, **kwargs)``."""
+        from .runtime import run
+
+        return run(self, *args, mode=mode, **kwargs)
 
     @property
     def ref(self) -> str:
@@ -936,7 +944,7 @@ def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warp
         NUM_STAGES,
         layout.grid,
     )
-    return LoweredKernel(op.name, fn_name, module, layout.template, source, extern, num_warps)
+    return LoweredKernel(op.name, fn_name, module, layout.template, source, extern, num_warps, op)
 
 
 def _reindexed(p: Param, index: int) -> Param:

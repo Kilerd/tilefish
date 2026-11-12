@@ -27,10 +27,13 @@ from .dtypes import (
 )
 from .errors import (
     TilefishAttributeError,
+    TilefishBuildError,
     TilefishDeclarationError,
     TilefishError,
     TilefishLoweringError,
     TilefishPicklingError,
+    TilefishPreconditionError,
+    TilefishRuntimeError,
     TilefishSpecError,
     TilefishTypeError,
 )
@@ -38,6 +41,7 @@ from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import exp, gelu, rsqrt, silu, sqrt
 from .ops import reduce_mean as mean
+from .runtime import run
 from .trace import Const, Value
 from .types import InOut, Out, Tensor, TensorType, const
 
@@ -72,10 +76,13 @@ __all__ = [
     "Tensor",
     "TensorType",
     "TilefishAttributeError",
+    "TilefishBuildError",
     "TilefishDeclarationError",
     "TilefishError",
     "TilefishLoweringError",
     "TilefishPicklingError",
+    "TilefishPreconditionError",
+    "TilefishRuntimeError",
     "TilefishSpecError",
     "TilefishTypeError",
     "Value",
@@ -99,6 +106,7 @@ __all__ = [
     "lower",
     "mean",
     "rsqrt",
+    "run",
     "silu",
     "sqrt",
     "u8",
