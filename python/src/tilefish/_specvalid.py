@@ -15,8 +15,9 @@ import math
 import re
 from typing import Any
 
+from .dims import Dim, DimExpr, cdiv
 from .dtypes import ALL_DTYPES
-from .errors import TilefishSpecError
+from .errors import TilefishError, TilefishSpecError
 
 SCHEMA_VERSION = 1
 ALIGNMENT = 16
@@ -103,7 +104,13 @@ def same_scalar(a: Any, b: Any) -> bool:
 
 
 class _ExprParser:
-    """ints, identifiers, ``cdiv(a, b)``, ``+ - * //``, unary minus, parentheses. Never evaluated."""
+    """ints, identifiers, ``cdiv(a, b)``, ``+ - * //``, unary minus, parentheses. Never evaluated as code.
+
+    Alongside the check, every sub-expression is folded with the same dimension algebra that
+    ``compile_specs`` uses (:class:`~tilefish.dims.DimExpr`), so a grid entry that is a constant,
+    including ``1 - 1`` or ``n - n``, is known. Its methods return the folded value, or ``None`` when
+    the expression is outside the affine language (two symbolic factors, an inexact ``//``).
+    """
 
     MAX_LEN, MAX_TOKENS, MAX_DEPTH = 512, 256, 24
 
@@ -140,42 +147,64 @@ class _ExprParser:
         if self.peek() is not None:
             bad(f"{self.where} {self.text!r}: unexpected {self.peek()!r}")
 
-    def expr(self, depth: int = 0) -> None:
-        self.term(depth)
+    def _fold(self, fn: Any, *operands: "DimExpr | None") -> "DimExpr | None":
+        """Apply a dimension operation; ``None`` when an operand is opaque or the result is not affine."""
+        if any(o is None for o in operands):
+            return None
+        try:
+            return fn(*operands)
+        except TilefishError:
+            return None
+
+    def _positive_divisor(self, divisor: "DimExpr | None", what: str) -> None:
+        if divisor is not None and divisor.is_static and divisor.value < 1:
+            bad(f"{self.where} {self.text!r}: {what} by {divisor.value} (the divisor must be positive)")
+
+    def expr(self, depth: int = 0) -> "DimExpr | None":
+        acc = self.term(depth)
         while self.peek() in ("+", "-"):
-            self.take()
-            self.term(depth)
+            op = self.take()
+            rhs = self.term(depth)
+            acc = self._fold((lambda a, b: a + b) if op == "+" else (lambda a, b: a - b), acc, rhs)
+        return acc
 
-    def term(self, depth: int) -> None:
-        self.factor(depth)
+    def term(self, depth: int) -> "DimExpr | None":
+        acc = self.factor(depth)
         while self.peek() in ("*", "//"):
-            self.take()
-            self.factor(depth)
+            op = self.take()
+            rhs = self.factor(depth)
+            if op == "*":
+                acc = self._fold(lambda a, b: a * b, acc, rhs)
+            else:
+                self._positive_divisor(rhs, "division")
+                acc = self._fold(lambda a, b: a // b, acc, rhs)
+        return acc
 
-    def factor(self, depth: int) -> None:
+    def factor(self, depth: int) -> "DimExpr | None":
         if depth > self.MAX_DEPTH:
             bad(f"{self.where} is nested too deeply")
         tok = self.take()
         if tok == "-":
-            return self.factor(depth + 1)
+            return self._fold(lambda a: -a, self.factor(depth + 1))
         if tok.isascii() and tok.isdigit():
-            return None
+            return DimExpr.const(int(tok))
         if tok == "(":
-            self.expr(depth + 1)
+            inner = self.expr(depth + 1)
             self.take(")")
-            return None
+            return inner
         if _IDENT.match(tok):
             if tok == "cdiv":
                 self.take("(")
-                self.expr(depth + 1)
+                num = self.expr(depth + 1)
                 self.take(",")
-                self.expr(depth + 1)
+                den = self.expr(depth + 1)
                 self.take(")")
-            elif self.peek() == "(":
+                self._positive_divisor(den, "cdiv")
+                return self._fold(cdiv, num, den)
+            if self.peek() == "(":
                 bad(f"{self.where} {self.text!r}: only cdiv(a, b) may be called, not {tok}(...)")
-            else:
-                self.ids.add(tok)
-            return None
+            self.ids.add(tok)
+            return Dim(tok)
         return bad(f"{self.where} {self.text!r}: unexpected {tok!r}")
 
 
@@ -188,13 +217,15 @@ def parse_expression(text: Any, where: str) -> "set[str]":
 
 
 def parse_grid(text: Any) -> "set[str]":
-    """Check a grid such as ``(M,)`` or ``(cdiv(S, 16), 32)``; return its identifiers."""
+    """Check a grid such as ``(M,)`` or ``(cdiv(S, 16), 32)``; return its identifiers.
+
+    Like ``compile_specs``, it rejects a static entry below 1 (``(0,)``, ``(-1,)``, ``(n - n, 4)``).
+    """
     p = _ExprParser(text, "grid")
     p.take("(")
-    entries, trailing = 0, False
+    entries, trailing = [], False
     while True:
-        p.expr()
-        entries += 1
+        entries.append(p.expr())
         if p.peek() == ",":
             p.take()
             if p.peek() == ")":
@@ -204,10 +235,13 @@ def parse_grid(text: Any) -> "set[str]":
             break
     p.take(")")
     p.done()
-    if not 1 <= entries <= 3:
+    if not 1 <= len(entries) <= 3:
         bad(f"grid {text!r} must have 1 to 3 entries")
-    if entries == 1 and not trailing:
+    if len(entries) == 1 and not trailing:
         bad(f"grid {text!r}: a single entry needs a trailing comma, like (n,)")
+    for position, entry in enumerate(entries):
+        if entry is not None and entry.is_static and entry.value < 1:
+            bad(f"grid {text!r}: entry {position} is the static size {entry.value}; grid sizes must be at least 1")
     return p.ids
 
 
