@@ -287,3 +287,75 @@ def test_a_float_to_fp8_cast_stays_and_is_documented_as_satfinite():
     low = cast_kernel(f32, e4m3).lower()
     assert "v1 = v0.to(tl.float8e4nv)  # rounding point" in low.source
     assert "satfinite" in importlib.import_module("tilefish.lower").__doc__  # the numerics contract says what the cast does
+
+
+# -- the source of a generated kernel -----------------------------------------------------------------------------------------------------
+
+
+def test_the_source_sha256_of_a_generated_kernel_round_trips_and_is_verified():
+    import hashlib
+
+    low = layernorm.lower()
+    (spec,) = low.specs()
+    doc = json.loads(spec.to_json())
+    assert doc["source_sha256"] == spec.source_sha256 == low.source_sha256 == hashlib.sha256(low.source.encode("utf-8")).hexdigest()
+    back = CompileSpec.from_json(spec.to_json())
+    assert back.source_sha256 == low.source_sha256 and back == spec and back.to_dict() == spec.to_dict()
+    back.verify_against(low.extern)
+    other = copy.deepcopy(doc)
+    other["source_sha256"] = "0" * 64  # a valid spec, of other source: not this declaration's
+    with pytest.raises(TilefishSpecError, match="first difference at source_sha256"):
+        CompileSpec.from_dict(other).verify_against(low.extern)
+    removed = copy.deepcopy(doc)
+    del removed["source_sha256"]
+    assert CompileSpec.from_dict(removed).source_sha256 is None  # (optional in a document)
+    with pytest.raises(TilefishSpecError, match="first difference at source_sha256"):
+        CompileSpec.from_dict(removed).verify_against(low.extern)
+
+
+def test_an_extern_has_no_source_sha256_and_a_generated_kernel_always_has_one():
+    assert "source_sha256" not in compile_specs(scale)[0].to_dict() and compile_specs(scale)[0].source_sha256 is None
+    for k in (layernorm, softmax):
+        assert len(k.lower().specs()[0].source_sha256) == 64
+
+
+def test_the_source_sha256_is_in_the_declaration_digest_and_the_fingerprint():
+    ext = layernorm.lower().extern
+
+    def make(value):
+        return ExternOp(ext.fn, ext.name, ext.signature, ext.triton, ext.num_warps, ext.num_stages, ext.grid, source_sha256=value)
+
+    a, b = "a" * 64, "b" * 64
+    assert len({declaration_digest(make(a)), declaration_digest(make(b)), declaration_digest(make(None))}) == 3
+    sa, sb = compile_specs(make(a))[0], compile_specs(make(b))[0]
+    assert sa.declaration_digest != sb.declaration_digest and sa._fingerprint() != sb._fingerprint()
+    assert sa.source_sha256 == a and sa.to_dict()["source_sha256"] == a
+    stale = dataclasses.replace(sa, source_sha256=b)  # an edit of a verified spec is not verified
+    assert not stale.verified
+
+
+def test_the_source_sha256_of_an_extern_must_be_a_sha256():
+    ext = layernorm.lower().extern
+
+    def make(value):
+        return ExternOp(ext.fn, ext.name, ext.signature, ext.triton, ext.num_warps, ext.num_stages, ext.grid, source_sha256=value)
+
+    assert make("0123456789abcdef" * 4).source_sha256 == "0123456789abcdef" * 4
+    for bad in ("", "a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 63 + "\n", "a" * 64 + "\n", " " + "a" * 63, 5, b"a" * 64, ["a" * 64]):
+        with pytest.raises(TilefishDeclarationError, match="source_sha256 must be 64 lowercase hex digits"):
+            make(bad)
+
+
+def test_the_source_sha256_of_a_serialized_spec_must_be_a_sha256():
+    (spec,) = layernorm.lower().specs()
+    doc = json.loads(spec.to_json())
+    for bad in ("", "a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 64 + "\n", 5, None, ["a" * 64]):
+        d = copy.deepcopy(doc)
+        d["source_sha256"] = bad
+        with pytest.raises(TilefishSpecError, match="source_sha256 must be 64 lowercase hex digits"):
+            CompileSpec.from_dict(d)
+    legacy = copy.deepcopy(doc)  # schema 1 has no such key
+    legacy["schema"] = 1
+    del legacy["declaration_digest"]
+    with pytest.raises(TilefishSpecError, match="unknown fields .*source_sha256"):
+        CompileSpec.from_dict(legacy)

@@ -12,6 +12,7 @@ No ``from __future__ import annotations`` here: tilefish evaluates annotations a
 import dataclasses
 import hashlib
 import json
+import os
 
 import pytest
 from built_fakes import FAKE_SOURCE_DIGEST, fake_build, rowop, scale
@@ -21,6 +22,7 @@ import tilefish
 from tilefish import Dim, Manifest, Out, Tensor, TilefishBuildError, TilefishManifestError, TilefishRuntimeError, bf16, const, f32
 from tilefish._elf import code_digest, parse_elf
 from tilefish._manifest import manifest_digest
+from tilefish._source import SOURCE_DIGEST_KIND
 from tilefish.aot import compile_specs, write_manifest
 from tilefish.runtime import _load_manifest
 
@@ -337,7 +339,21 @@ def test_an_entry_without_a_source_digest_needs_a_pin(tmp_path):
 
 def test_the_source_digest_of_an_entry_is_labelled(directory):
     entry = json.loads((directory / "manifest.json").read_text())["kernels"][0]
-    assert entry["source_digest"] == SRC and entry["source_digest_kind"] == "triton.JITFunction.cache_key"
+    assert entry["source_digest"] == SRC and entry["source_digest_kind"] == SOURCE_DIGEST_KIND == "tilefish.module-sources.v1"
+
+
+def test_a_source_digest_of_another_kind_says_nothing_about_the_files(tmp_path):
+    """An older tilefish recorded Triton's ``cache_key`` there; it cannot be compared with a digest of files."""
+    (spec,) = compile_specs(scale)
+    write_manifest([fake_build(spec)], tmp_path / "manifest.json", cubins=True)
+    edit_manifest(tmp_path, lambda d: d["kernels"][0].update(source_digest_kind="triton.JITFunction.cache_key"))
+    m = Manifest.load(tmp_path)
+    with pytest.raises(TilefishManifestError, match=r"source digest is of kind 'triton.JITFunction.cache_key', not 'tilefish.module-sources.v1'"):
+        m.built_kernel(spec, "sm_90", source_digest=SRC)  # the same hash, the other kind: not taken as a match
+    assert m.built_kernel(spec, "sm_90", source_digest=SRC, pinned=True).stem == "scale"  # only a pin vouches for it
+    edit_manifest(tmp_path, lambda d: d["kernels"][0].pop("source_digest_kind"))
+    with pytest.raises(TilefishManifestError, match="is of kind None"):
+        Manifest.load(tmp_path).built_kernel(spec, "sm_90", source_digest=SRC)
 
 
 # -- the digest of the manifest --------------------------------------------------------------------------------------------------------
@@ -508,9 +524,9 @@ def test_a_cubin_name_that_is_a_symlink_out_of_the_directory_is_not_written_thro
     elsewhere.write_bytes(b"precious")
     build = fake_build(spec)
     (out / build.cubin_name).symlink_to(elsewhere)
-    with pytest.raises(TilefishBuildError, match="is not inside"):
+    with pytest.raises(TilefishBuildError, match="is a symbolic link; refusing to write through it"):
         build.write_cubin(out)
-    assert elsewhere.read_bytes() == b"precious"
+    assert elsewhere.read_bytes() == b"precious" and (out / build.cubin_name).is_symlink()
 
 
 def test_an_extern_name_is_a_plain_identifier():
@@ -605,3 +621,140 @@ def test_a_minimal_cubin_with_its_code_section_loads(tmp_path):
     (spec,) = compile_specs(scale)
     write_manifest([fake_build(spec, cubin=only_debug, shared=0)], tmp_path / "manifest.json", cubins=True)
     assert Manifest.load(tmp_path).get("scale", "sm_90").sha256_code == code_digest(only_debug)
+
+
+# -- strict JSON and typed fields ---------------------------------------------------------------------------------------------------------
+
+
+def manifest_text(directory):
+    return (directory / "manifest.json").read_text()
+
+
+def test_an_object_with_the_same_key_twice_is_refused(directory):
+    """Parsers disagree about which of two equal keys wins: an attacker picks the one a check reads and a host does not."""
+    text = manifest_text(directory)
+    (directory / "manifest.json").write_text(text.replace('"shared": 16', '"shared": 16, "shared": 0', 1))
+    with pytest.raises(TilefishManifestError, match="an object has the key 'shared' twice"):
+        Manifest.load(directory)
+    (directory / "manifest.json").write_text('{"schema": 1, "schema": 1, "kernels": []}')
+    with pytest.raises(TilefishManifestError, match="the key 'schema' twice"):
+        Manifest.load(directory)
+
+
+@pytest.mark.parametrize("number", ["1e999", "-1e999", "1E400", "123456789e999999"])
+def test_a_number_that_does_not_fit_a_float_is_refused_when_the_manifest_is_read(directory, number):
+    (directory / "manifest.json").write_text(manifest_text(directory).replace('"shared": 16', f'"shared": {number}', 1))
+    with pytest.raises(TilefishManifestError, match=r"not strict JSON: the number .* does not fit a float"):
+        Manifest.load(directory)
+
+
+def test_the_digest_of_a_document_with_an_infinite_number_is_a_manifest_error_not_a_value_error(directory):
+    doc = json.loads(manifest_text(directory))
+    doc["kernels"][0]["shared"] = float("inf")
+    with pytest.raises(TilefishManifestError, match="cannot be digested"):
+        manifest_digest(doc)
+    m = Manifest.load(directory)
+    m.doc["kernels"][0]["constexprs"][0]["value"] = float("nan")  # a loaded manifest whose document was edited in memory
+    with pytest.raises(TilefishManifestError, match="cannot be digested"):
+        m.digest
+    with pytest.raises(TilefishManifestError, match="cannot be digested"):
+        manifest_digest({"schema": 1})  # no kernels at all
+
+
+@pytest.mark.parametrize("field", ["toolchain", "options", "launch"])
+@pytest.mark.parametrize("value", [None, [], "triton 3.5.1", 3])
+def test_a_field_that_must_be_an_object_is_one(directory, field, value):
+    edit_manifest(directory, lambda d: d["kernels"][0].update({field: value}))
+    with pytest.raises(TilefishManifestError, match=rf"'scale' \(sm_90\): '{field}' must be an object"):
+        Manifest.load(directory)
+
+
+def test_a_manifest_that_is_not_utf8_or_is_nested_too_deeply_is_a_manifest_error(tmp_path):
+    (tmp_path / "manifest.json").write_bytes(b'{"schema": 1, "kernels": [], "x": "\xff\xfe"}')
+    with pytest.raises(TilefishManifestError, match="cannot read the manifest"):
+        Manifest.load(tmp_path)
+    (tmp_path / "manifest.json").write_text("[" * 100000 + "]" * 100000)
+    with pytest.raises(TilefishManifestError, match="nested too deeply|not valid JSON"):
+        Manifest.load(tmp_path)
+
+
+def test_a_malformed_entry_is_a_manifest_error_whatever_raised_inside(directory):
+    spec, _ = specs()
+    m = Manifest.load(directory)
+    m.get("scale", "sm_90").entry["shared"] = "sixteen"  # a loaded manifest whose entry was edited in memory
+    with pytest.raises(TilefishManifestError, match="the manifest entry is malformed: ValueError"):
+        m.built_kernel(spec, "sm_90", source_digest=SRC)
+
+
+# -- writing: no link is followed, a file appears whole -----------------------------------------------------------------------------------
+
+
+def test_a_manifest_that_is_a_symlink_is_not_written_through(tmp_path):
+    (spec,) = compile_specs(scale)
+    outside = tmp_path / "outside.json"
+    outside.write_text("precious")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "manifest.json").symlink_to(outside)
+    with pytest.raises(TilefishBuildError, match="manifest.json' is a symbolic link; refusing to write through it"):
+        write_manifest([fake_build(spec)], out / "manifest.json", cubins=True)
+    assert outside.read_text() == "precious" and not list(out.glob("*.cubin"))  # and not a cubin either: nothing is written before the checks pass
+
+
+def test_a_dangling_manifest_symlink_is_refused_too(tmp_path):
+    (spec,) = compile_specs(scale)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "manifest.json").symlink_to(tmp_path / "nowhere" / "created.json")
+    for merge in (False, True):
+        with pytest.raises(TilefishBuildError, match="is a symbolic link"):
+            write_manifest([fake_build(spec)], out / "manifest.json", cubins=True, merge=merge)
+    assert not (tmp_path / "nowhere").exists()
+
+
+def test_a_symlinked_cubin_stops_the_whole_write_before_any_file_is_written(directory, tmp_path):
+    before = manifest_text(directory)
+    elsewhere = tmp_path / "elsewhere.bin"
+    elsewhere.write_bytes(b"precious")
+    victim = directory / "scale.sm_90.cubin"
+    victim.unlink()
+    victim.symlink_to(elsewhere)
+    built = [fake_build(s, cubin=cubin_like(code=b"\x0b" * 64)) for s in compile_specs(rowop)]
+    built.append(fake_build(compile_specs(scale)[0], cubin=cubin_like(code=b"\x0c" * 64)))
+    with pytest.raises(TilefishBuildError, match="scale.sm_90.cubin' is a symbolic link"):
+        write_manifest(built, directory / "manifest.json", cubins=True)
+    assert elsewhere.read_bytes() == b"precious" and manifest_text(directory) == before
+    assert cubin_of(directory, "rowop.S32").read_bytes() == cubin_like()  # the rowop cubins that came first in the list were not rewritten
+
+
+def test_a_file_is_written_whole_or_not_at_all(directory, monkeypatch):
+    before = manifest_text(directory)
+    (spec,) = compile_specs(scale)
+    other = fake_build(spec, arch="sm_100")
+
+    def fail(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(OSError, match="disk full"):
+        write_manifest([other], directory / "manifest.json", cubins=True, merge=True)
+    monkeypatch.undo()
+    assert manifest_text(directory) == before  # the old manifest is intact ...
+    assert sorted(p.name for p in directory.iterdir()) == sorted(["manifest.json", "scale.sm_90.cubin", "rowop.S32.sm_90.cubin", "rowop.S64.sm_90.cubin"])  # ... and no temporary file is left
+
+
+def test_written_files_are_world_readable_and_have_no_temporary_siblings(tmp_path):
+    (spec,) = compile_specs(scale)
+    write_manifest([fake_build(spec)], tmp_path / "manifest.json", cubins=True)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["manifest.json", "scale.sm_90.cubin"]
+    for p in tmp_path.iterdir():
+        assert p.stat().st_mode & 0o777 == 0o644
+
+
+def test_the_document_a_write_returns_is_the_one_whose_digest_a_load_finds(directory):
+    from tilefish._build import write_manifest_doc
+
+    (spec,) = compile_specs(scale)
+    path, written = write_manifest_doc([fake_build(spec, arch="sm_100")], directory / "manifest.json", cubins=True, merge=True)
+    assert path == directory / "manifest.json" and len(written["kernels"]) == 4  # the merged document, not only the new entry
+    assert manifest_digest(written) == Manifest.load(directory).digest

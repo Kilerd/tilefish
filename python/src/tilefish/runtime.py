@@ -38,10 +38,15 @@ and refuses
   preconditions, options, declaration digest): a binary never runs under assumptions it was not compiled for;
 * a stale binary. A generated kernel's spec carries ``source_sha256``, the sha256 of the generated Triton source, so a
   kernel redeclared with another body but the same name and signature does not match its old manifest. A
-  hand-written ``extern`` has no source in its declaration: the entry records Triton's ``JITFunction.cache_key``
-  (the function's text, the ``cache_key`` of the ``@triton.jit`` functions it calls, its start line and the
-  ``tl.constexpr`` globals it reads; see :class:`~tilefish.aot.BuiltKernel`) and ``replay`` recomputes it from the
-  importable kernel. Where it cannot (the module does not import without Triton) it refuses, unless ``pin=`` is given.
+  hand-written ``extern`` has no source in its declaration: the entry records a *source digest*, a sha256 over the
+  text of the file of the kernel's module, of every user module file reachable from that module's globals (modules it
+  imports, modules of the functions and objects it holds, recursively; not ``triton``, ``torch``, ``tilefish`` or the
+  standard library) and the Triton version (:mod:`tilefish._source`), and ``replay`` recomputes it from the importable
+  kernel. Any edit to a reachable file, a comment included, makes it differ: export again and pin the new manifest.
+  Where it cannot be recomputed (the module does not import without Triton) ``replay`` refuses, unless ``pin=`` is given.
+  (Triton's ``cache_key`` is not used: it misses a ``tl.constexpr`` read as a module attribute, a dtype alias and
+  constants in helper modules. For the same reason every ``jit`` and ``export`` build compiles from scratch and never
+  reads Triton's disk cache.)
 
 Trust. Without ``pin=`` the directory is trusted: the digests in a manifest are written next to the files they
 describe, so whoever can write the directory can rewrite both and make ``replay`` run any binary. ``pin=`` is the
@@ -72,8 +77,8 @@ import weakref
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from . import _cuda
-from ._build import BuiltKernel, build, resolve_triton, write_manifest
+from . import _cuda, _source
+from ._build import BuiltKernel, build, resolve_triton, write_manifest_doc
 from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
@@ -92,7 +97,7 @@ from ._launch import (
 from .aot import CompileSpec, compile_specs
 from .decorators import ExternOp, KernelOp, Op
 from .dims import Dim, DimExpr
-from ._manifest import MANIFEST_NAME, Manifest
+from ._manifest import MANIFEST_NAME, Manifest, manifest_digest
 from .errors import (
     TilefishBuildError,
     TilefishError,
@@ -403,12 +408,20 @@ def _capability(torch: Any, device_index: int) -> int:
     return major * 10 + minor
 
 
+def _source_key(spec: CompileSpec, fn: Any) -> Any:
+    """What tells two functions with one spec apart in the cache of builds: the spec's source, or the digest of the kernel's files."""
+    if spec.source_sha256 is not None:
+        return spec.source_sha256
+    digest = _source.source_digest(fn)
+    return digest if digest is not None else ("object", id(fn))
+
+
 def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKernel:
     """The (cached, in memory) build of ``spec`` for the architecture of device ``device_index``."""
     torch = _torch()
     cap = _capability(torch, device_index)
     extra = dict(getattr(_options, "value", {}))
-    key = (spec.stem, cap, spec.declaration_digest, spec._fingerprint(), getattr(fn, "cache_key", None), tuple(sorted(extra.items())))
+    key = (spec.stem, cap, spec.declaration_digest, spec._fingerprint(), _source_key(spec, fn), tuple(sorted(extra.items())))
     with _lock:
         built = _builds.get(key)
     if built is None:
@@ -467,20 +480,19 @@ def _load_manifest(manifest: Any) -> Manifest:
 
 
 def _current_source_digest(spec: CompileSpec) -> "str | None":
-    """Triton's ``cache_key`` of the hand-written kernel a spec names, recomputed from the importable function.
+    """The source digest of the hand-written kernel a spec names, recomputed from the importable function's files.
 
     ``None`` when it cannot be (the module does not import, which includes a module that imports Triton when Triton is
-    not installed, or the object has no ``cache_key``). A spec of a generated kernel has its source in the spec itself.
+    not installed, or a file it reaches cannot be read). A spec of a generated kernel has its source in the spec itself.
     """
     try:
         fn = resolve_triton(spec.triton)
     except TilefishBuildError:
         return None
     try:
-        key = getattr(fn, "cache_key", None)
-    except Exception:  # noqa: BLE001 - Triton raises when the kernel references something it cannot hash
+        return _source.source_digest(fn)
+    except Exception:  # noqa: BLE001 - whatever an object in a module namespace raises when it is looked at
         return None
-    return key if isinstance(key, str) else None
 
 
 def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
@@ -531,9 +543,15 @@ def export(
     kernels stay, and a new binary replaces the entry of the same stem and architecture. An existing entry that is a
     different binary (other machine code, declaration, source or options) is replaced only with ``overwrite=True``.
 
+    Every build compiles from scratch (Triton's disk cache is not read) and the files of a hand-written kernel must be
+    the ones the process imported (see :func:`tilefish.aot.build`). Files are written through temporary files and
+    renamed, and a symbolic link where a file goes is refused.
+
     Returns the loaded and verified :class:`~tilefish.aot.Manifest`: ``.directory``, ``.path`` and ``.digest``, the
     digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
     ``run(..., mode="replay", manifest=directory, pin=digest)`` to refuse a directory that was changed after the export.
+    The digest is the one of the manifest that was written from the builds in memory; the directory is read back and
+    must have the same digest, or this raises :class:`~tilefish.errors.TilefishManifestError`.
     """
     items = list(ops) if isinstance(ops, (list, tuple)) else [ops]
     if arch is None:
@@ -548,8 +566,15 @@ def export(
         target = _target(op)
         for spec in target.compile_specs():
             built.append(build(spec, arch=cap, fn=target.jit_function(spec)))
-    path = write_manifest(built, pathlib.Path(directory) / MANIFEST_NAME, cubins=True, merge=True, overwrite=overwrite)
-    return Manifest.load(path)
+    path, written = write_manifest_doc(built, pathlib.Path(directory) / MANIFEST_NAME, cubins=True, merge=True, overwrite=overwrite)
+    loaded = Manifest.load(path)
+    expected = manifest_digest(written)
+    if loaded.digest != expected:
+        raise TilefishManifestError(
+            f"the manifest in {str(path.parent)!r} has digest {loaded.digest} when it is read back, but the manifest that was "
+            f"written has digest {expected}: the directory changed while it was being exported"
+        )
+    return loaded
 
 
 def run(op: Any, /, *args: Any, mode: str = "jit", manifest: Any = None, pin: "str | None" = None, **kwargs: Any) -> Any:

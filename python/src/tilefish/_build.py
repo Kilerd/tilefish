@@ -11,29 +11,35 @@ Triton is imported inside the functions that need it, so ``import tilefish`` nev
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import importlib
 import json
+import os
 import pathlib
 import re
 import subprocess
+import tempfile
+import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 from ._elf import parse_elf, code_digest
+from . import _source
+from ._source import SOURCE_DIGEST_KIND
 from .errors import TilefishBuildError, TilefishManifestError
 
 if TYPE_CHECKING:
     from .aot import CompileSpec
 
 MANIFEST_SCHEMA = 1
-SOURCE_DIGEST_KIND = "triton.JITFunction.cache_key"
 MIN_TRITON = (3, 5)
 _ARCH = re.compile(r"(?:sm_?)?([0-9]{2,3})a?\Z")
 _ENTRY = re.compile(r"\.entry\s+(\w+)\s*\(")
 _PTX_PARAM = re.compile(r"\.param\s+\.(\w+)")
 _PTX_TARGET = re.compile(r"^\s*\.target\s+(\S+)", re.M)
 _MISSING = object()
+_compile_lock = threading.Lock()  # a Triton knob is process-wide state: one compile at a time while it is set
 
 # the PTX type of each kind of launch parameter (all the AOT specs produce): a pointer is 64 bits, an i32 is 32
 _PTX_TYPES = {"pointer": ("u64", 8), "scalar": ("u32", 4)}
@@ -138,6 +144,33 @@ def _check_jit_function(fn: Any, spec: "CompileSpec") -> None:
         )
 
 
+def refuse_symlink(path: pathlib.Path) -> None:
+    """Raise :class:`~tilefish.errors.TilefishBuildError` when ``path`` is a symbolic link (dangling or not)."""
+    if path.is_symlink():
+        raise TilefishBuildError(f"{str(path)!r} is a symbolic link; refusing to write through it (remove it, or write elsewhere)")
+
+
+def write_file(path: pathlib.Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` through a temporary file in the same directory and an atomic rename.
+
+    A symbolic link at ``path`` is refused. The rename never follows a link, so even a link created between the
+    check and the rename is replaced, not written through; the temporary file is removed when anything fails.
+    """
+    refuse_symlink(path)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 @dataclass(frozen=True)
 class LaunchAttributes:
     """What the binary asks of the launch, besides grid, block and shared memory (all from Triton's metadata)."""
@@ -228,13 +261,11 @@ class BuiltKernel:
     different directories have the same ``sha256_code`` and may differ in ``sha256``, because the debug
     information holds the build path. ``options`` are the options handed to ``triton.compile``.
 
-    ``source_digest`` is Triton's ``JITFunction.cache_key`` of the kernel at build time, or ``None`` for a binary
-    that was not built here (a loaded manifest entry without one). ``cache_key`` is a sha256 of the text of the
-    function, of the ``cache_key`` of every ``@triton.jit`` function it calls (transitively), of the line number
-    where the function starts, and of the values of the ``tl.constexpr`` globals it reads. It does not cover
-    other Python globals (Triton only compares their values at launch), the Triton version, or the compile
-    options; and it changes when the function merely moves in its file. It is what tells a manifest of a
-    hand-written kernel that its source was edited, which no declaration can.
+    ``source_digest`` is the source digest of a hand-written kernel at build time (:func:`tilefish._source.source_digest`:
+    a sha256 over the text of the kernel's module file, of every user module file reachable from its globals, and the
+    Triton version), or ``None`` for a binary of a generated kernel (its spec carries ``source_sha256``), for one that
+    was not built here, and for a kernel whose files cannot be read. It is what tells a manifest of a hand-written
+    kernel that its source was edited, which no declaration can; any edit to a reachable file changes it.
     """
 
     spec: "CompileSpec"
@@ -266,17 +297,23 @@ class BuiltKernel:
         """Write the cubin to ``<directory>/<stem>.<arch>.cubin`` and return the path.
 
         The file name must be a plain name inside ``directory`` (a stem or an arch with a separator or ``..`` in it
-        would write elsewhere), or this raises :class:`~tilefish.errors.TilefishBuildError`.
+        would write elsewhere) and must not be a symbolic link, or this raises :class:`~tilefish.errors.TilefishBuildError`.
+        The file is written to a temporary file in ``directory`` and renamed into place, so a reader sees the old
+        file or the new one, and nothing is written through a link.
         """
+        directory = pathlib.Path(directory)
+        path = self.cubin_path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        write_file(path, self.cubin)
+        return path
+
+    def cubin_path(self, directory: "str | pathlib.Path") -> pathlib.Path:
+        """``<directory>/<cubin_name>``, after checking that the name is a plain file name and no symbolic link is in the way."""
         name = self.cubin_name
         if pathlib.PurePath(name).name != name or name.startswith(".") or "\0" in name or "\\" in name:
             raise TilefishBuildError(f"the cubin file name {name!r} is not a plain file name; refusing to write outside the directory")
-        directory = pathlib.Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / name
-        if path.resolve().parent != directory.resolve():
-            raise TilefishBuildError(f"the cubin path {str(path)!r} is not inside {str(directory)!r}; refusing to write it")
-        path.write_bytes(self.cubin)
+        path = pathlib.Path(directory) / name
+        refuse_symlink(path)
         return path
 
     def abi(self) -> dict[str, Any]:
@@ -327,12 +364,82 @@ def _check_abi(spec: "CompileSpec", ptx: str, symbol: str) -> None:
         )
 
 
+@contextlib.contextmanager
+def _always_compile(triton: Any) -> "Iterator[None]":
+    """Make ``triton.compile`` compile, never read its disk cache, for the duration of the block.
+
+    Triton's disk cache is keyed by ``JITFunction.cache_key``, which does not see everything that changes a binary (a
+    ``tl.constexpr`` read as a module attribute, a dtype alias, a constant in a helper module), so a changed kernel could
+    be served its old cubin. A build that goes into a manifest, and a jit build, must be what the source says.
+
+    The knob is process-wide: builds are serialized while it is set, and a Triton kernel that other code of the same
+    process compiles in the meantime compiles from scratch too (slower, never wrong). It is put back as it was.
+    """
+    knobs = getattr(triton, "knobs", None)
+    compilation = getattr(knobs, "compilation", None)
+    if compilation is None or not hasattr(compilation, "always_compile"):
+        raise TilefishBuildError(
+            f"this Triton ({triton.__version__}) has no knobs.compilation.always_compile, which a build needs to be sure it "
+            f"does not get a stale binary from Triton's cache (tilefish needs >= {'.'.join(map(str, MIN_TRITON))})"
+        )
+    with _compile_lock:
+        previous = compilation.always_compile
+        compilation.always_compile = True
+        try:
+            yield
+        finally:
+            compilation.always_compile = previous
+
+
+def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "str | None":
+    """Check that the source behind ``jit`` is the one the spec is for and return its source digest (``None``: not recorded).
+
+    A generated kernel's spec carries ``source_sha256``: the file of the function's module must have exactly that
+    sha256 (for a lowered kernel that file is the generated source), whatever got imported from ``sys.path`` or was
+    passed as ``fn``. A hand-written kernel's source digest is computed (:func:`tilefish._source.source_digest`) and, when
+    the caller knows what it must be (``expected``), compared. For both the lines the process imported must be the ones
+    in the file now.
+    """
+    reached = _source.reachable(jit)
+    if spec.source_sha256 is not None:
+        path = _source.function_file(jit)
+        if path is None:
+            raise TilefishBuildError(
+                f"cannot check the source of '{spec.triton}' against the compile spec '{spec.stem}': the function is not "
+                "defined in a Python source file"
+            )
+        try:
+            found = _source.file_sha256(path)
+        except OSError as e:
+            raise TilefishBuildError(f"cannot read {path!r}, the source of '{spec.triton}': {e}") from e
+        if found != spec.source_sha256:
+            raise TilefishBuildError(
+                f"'{spec.triton}' comes from {path!r}, whose sha256 is {found}, but the compile spec '{spec.stem}' is for "
+                f"Triton source with sha256 {spec.source_sha256}: the file is not the source this kernel generates now (a stale "
+                "LoweredKernel.write(directory) output on sys.path, or another function passed as fn). Refusing to build "
+                "it, as the manifest would say it is the new source"
+            )
+        if reached is not None:
+            _source.check_imported_lines(reached.functions)
+        return None
+    if reached is not None:
+        _source.check_imported_lines(reached.functions)
+    digest = _source.digest_of(reached)
+    if digest is not None and expected is not None and digest != expected:
+        raise TilefishBuildError(
+            f"the source of '{spec.triton}' has digest {digest}, but {expected} was expected: it is not the source the "
+            "caller meant to build"
+        )
+    return digest
+
+
 def build(
     spec: "CompileSpec",
     *,
     arch: "int | str",
     fn: Any = None,
     options: "Mapping[str, Any] | None" = None,
+    source_digest: "str | None" = None,
 ) -> BuiltKernel:
     """Compile one spec to a cubin for ``arch`` (``"sm_103"`` or ``103``) with Triton.
 
@@ -347,12 +454,21 @@ def build(
     each one is checked against the metadata Triton returns, because Triton silently ignores an option it does
     not know. The result is checked against the spec: the options in effect, the symbol, and the parameters of
     the PTX entry (the ABI). Raises :class:`~tilefish.errors.TilefishBuildError`.
+
+    The source is checked before anything is compiled. A spec with a ``source_sha256`` (a generated kernel) is built only
+    from a function whose module file has exactly that sha256, so a stale file on ``sys.path`` (or another ``fn``) cannot
+    be stamped with the digest of source it is not. For a hand-written kernel the result records the source digest of its
+    files (:attr:`BuiltKernel.source_digest`), which must equal ``source_digest`` when that is given. In both cases the
+    lines of the kernel's functions that the process imported must be the ones in their files now, or the build is
+    refused (restart or reload). The compile itself never reads Triton's disk cache: the cache key does not cover everything
+    that changes a binary, so a build would not be sure to be what the source says.
     """
     cap = parse_arch(arch)
     inp = spec.ast_source_inputs()  # raises TilefishSpecError for a spec that is not verified
     triton = _import_triton()
-    jit =fn if fn is not None else resolve_triton(spec.triton)
+    jit = fn if fn is not None else resolve_triton(spec.triton)
     _check_jit_function(jit, spec)
+    recorded_digest = _check_source(jit, spec, source_digest)
     opts: dict[str, Any] = {**inp.options, **dict(options or {})}
 
     from triton.backends.compiler import GPUTarget
@@ -361,7 +477,8 @@ def build(
     src = ASTSource(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
     src.constants = inp.constants
     try:
-        compiled = triton.compile(src, target=GPUTarget("cuda", cap, 32), options=opts)
+        with _always_compile(triton):
+            compiled = triton.compile(src, target=GPUTarget("cuda", cap, 32), options=opts)
     except Exception as e:  # noqa: BLE001 - a compile failure of any kind is a build error, with Triton's message
         raise TilefishBuildError(f"Triton could not compile '{spec.stem}' ({spec.triton}) for sm_{cap}: {type(e).__name__}: {e}") from e
 
@@ -399,7 +516,7 @@ def build(
         ptx_target=target.group(1) if target else "",
         options=opts,
         launch=_launch_attributes(md),
-        source_digest=getattr(jit, "cache_key", None),
+        source_digest=recorded_digest,
     )
 
 
@@ -464,7 +581,7 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     }
     if "source_sha256" in spec_part:
         entry["source_sha256"] = spec_part["source_sha256"]
-    if b.source_digest is not None:  # Triton's cache_key of the kernel: what a hand-written kernel's source is checked by
+    if b.source_digest is not None:  # the digest of the files of a hand-written kernel: what its source is checked by
         entry["source_digest"] = b.source_digest
         entry["source_digest_kind"] = SOURCE_DIGEST_KIND
     return entry
@@ -503,10 +620,13 @@ def write_manifest(
     ``grid`` (an expression over the dimension names, with ``cdiv(a, b)``), ``block``, ``shared``, ``launch``
     (scratch sizes, PDL, cluster and cooperative flags: all zero or false for a binary a plain
     ``cuLaunchKernel`` can run), ``constexprs``, ``preconditions`` (what a host checks before it launches),
-    ``declaration_digest`` and, for a generated kernel, ``source_sha256`` (the Triton source it was built from),
-    ``source_digest`` (Triton's ``cache_key`` of the kernel), ``sha256`` (the file) and ``sha256_code`` (the machine
-    code, independent of the build directory), and the ``toolchain`` (Triton and ptxas versions). With
-    ``cubins=True`` the cubins are written next to the manifest under the file names the manifest gives.
+    ``declaration_digest`` and, for a generated kernel, ``source_sha256`` (the Triton source it was built from), for a
+    hand-written one ``source_digest`` (the digest of its files, see :mod:`tilefish._source`), ``sha256`` (the file) and
+    ``sha256_code`` (the machine code, independent of the build directory), and the ``toolchain`` (Triton and ptxas
+    versions). With ``cubins=True`` the cubins are written next to the manifest under the file names the manifest gives.
+
+    Every file is written to a temporary file in its directory and renamed into place, and a symbolic link where a file
+    is to go (``manifest.json`` or a cubin, dangling or not) is refused before anything is written.
 
     The manifest as a whole has a digest (:attr:`tilefish.aot.Manifest.digest`) that a host can pin.
 
@@ -515,12 +635,26 @@ def write_manifest(
     entry that is a *different* binary (other machine code, declaration, source, options or shared memory) is not
     replaced unless ``overwrite=True``; a merge into a manifest that does not verify is an error.
     """
+    return write_manifest_doc(built, path, cubins=cubins, merge=merge, overwrite=overwrite)[0]
+
+
+def write_manifest_doc(
+    built: "Iterable[BuiltKernel]",
+    path: "str | pathlib.Path",
+    *,
+    cubins: bool = False,
+    merge: bool = False,
+    overwrite: bool = False,
+) -> "tuple[pathlib.Path, dict[str, Any]]":
+    """:func:`write_manifest`, returning the path and the manifest document that was written (what ``export`` checks the directory against)."""
     entries = list(built)
     doc = manifest_dict(entries)
     keys = [(e["stem"], e["arch"]) for e in doc["kernels"]]
     if len(set(keys)) != len(keys):
         raise TilefishBuildError("a manifest needs one build per (stem, arch); some appear twice")
     path = pathlib.Path(path)
+    refuse_symlink(path)
+    targets = [b.cubin_path(path.parent) for b in entries] if cubins else []  # every name is checked before a byte is written
     if merge and path.exists():
         from ._manifest import Manifest
 
@@ -542,8 +676,7 @@ def write_manifest(
             kept.append(new)
         doc["kernels"] = kept + list(new_by_key.values())
     path.parent.mkdir(parents=True, exist_ok=True)
-    if cubins:
-        for b in entries:
-            b.write_cubin(path.parent)
-    path.write_text(json.dumps(doc, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    return path
+    for b, target in zip(entries, targets):
+        write_file(target, b.cubin)
+    write_file(path, (json.dumps(doc, indent=2, allow_nan=False) + "\n").encode("utf-8"))
+    return path, doc

@@ -16,10 +16,14 @@ block, launch fields, toolchain); a caller that holds it from a trusted place (a
 
 Source. The compile spec of a generated kernel carries ``source_sha256``, the sha256 of the Triton source it was built
 from, and a replay refuses an entry built from another source (a kernel redeclared with another body but the same name
-and signature). A hand-written ``extern`` has no source in its declaration, so the entry records Triton's
-``JITFunction.cache_key`` (see :class:`~tilefish.aot.BuiltKernel`) and a replay recomputes it from the importable kernel
-and refuses a mismatch; where it cannot (Triton or the module is not importable), it refuses unless the caller pinned
-the manifest, which says that the caller vouches for it.
+and signature). A hand-written ``extern`` has no source in its declaration, so the entry records a source digest (a sha256
+over the files the kernel is made of and the Triton version, see :mod:`tilefish._source`) and a replay recomputes it from
+the importable kernel and refuses a mismatch; where it cannot (Triton or the module is not importable), it refuses unless
+the caller pinned the manifest, which says that the caller vouches for it.
+
+The file is read as strict JSON: no ``NaN`` or ``Infinity``, no number that does not fit a float, no object with the same
+key twice (which parsers disagree about), and every field a replay reads has the type it needs, so a malformed
+manifest is a :class:`~tilefish.errors.TilefishManifestError` and never a bare ``KeyError`` or ``AttributeError``.
 
 Nothing here needs Triton, torch or a GPU: it is the part of a host that is just files and digests.
 """
@@ -28,11 +32,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import pathlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ._build import MANIFEST_SCHEMA, BuiltKernel, LaunchAttributes, spec_entry
+from ._source import SOURCE_DIGEST_KIND
 from ._elf import code_digest, parse_elf, uses_shared
 from .errors import TilefishBuildError, TilefishManifestError
 
@@ -52,8 +58,11 @@ def manifest_digest(doc: "dict[str, Any]") -> str:
     source digests), the build facts (symbol, shared memory, launch attributes, toolchain, architecture) and the
     digests of the cubin file and of its machine code. The top-level ``tilefish`` version is not part of it.
     """
-    kernels = sorted(doc["kernels"], key=lambda e: (str(e.get("stem")), str(e.get("arch"))))
-    text = json.dumps({"schema": doc["schema"], "kernels": kernels}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    try:
+        kernels = sorted(doc["kernels"], key=lambda e: (str(e.get("stem")), str(e.get("arch"))))
+        text = json.dumps({"schema": doc["schema"], "kernels": kernels}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (ValueError, TypeError, AttributeError, KeyError) as e:  # a number that is not finite, a value JSON cannot hold, a malformed entry
+        raise TilefishManifestError(f"the manifest cannot be digested, it is not plain JSON data: {type(e).__name__}: {e}") from e
     return hashlib.sha256(DIGEST_TAG + text.encode("utf-8")).hexdigest()
 
 
@@ -79,6 +88,22 @@ class Artifact:
 
 def _reject_constant(constant: str) -> Any:
     raise TilefishManifestError(f"the manifest is not strict JSON: it contains the constant {constant}")
+
+
+def _parse_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise TilefishManifestError(f"the manifest is not strict JSON: the number {text} does not fit a float")
+    return value
+
+
+def _no_duplicate_keys(pairs: "list[tuple[str, Any]]") -> "dict[str, Any]":
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise TilefishManifestError(f"the manifest is not strict JSON: an object has the key {key!r} twice")
+        out[key] = value
+    return out
 
 
 class Manifest:
@@ -109,10 +134,14 @@ class Manifest:
         manifest_path = path / MANIFEST_NAME if path.is_dir() else path
         try:
             text = manifest_path.read_text(encoding="utf-8")
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
             raise TilefishManifestError(f"cannot read the manifest {str(manifest_path)!r}: {e}") from e
         try:
-            doc = json.loads(text, parse_constant=_reject_constant)
+            doc = json.loads(text, parse_constant=_reject_constant, parse_float=_parse_float, object_pairs_hook=_no_duplicate_keys)
+        except RecursionError as e:
+            raise TilefishManifestError(f"the manifest {str(manifest_path)!r} is nested too deeply to be read") from e
+        except TilefishManifestError:
+            raise
         except ValueError as e:
             raise TilefishManifestError(f"the manifest {str(manifest_path)!r} is not valid JSON: {e}") from e
         if not isinstance(doc, dict) or doc.get("schema") != MANIFEST_SCHEMA or not isinstance(doc.get("kernels"), list):
@@ -162,6 +191,9 @@ class Manifest:
             )
         if elf.section(f".text.{entry['symbol']}") is None:
             raise TilefishManifestError(f"'{stem}' ({arch}): {name!r} has no code section '.text.{entry['symbol']}'")
+        for field in ("options", "toolchain", "launch"):
+            if not isinstance(entry[field], dict):
+                raise TilefishManifestError(f"'{stem}' ({arch}): '{field}' must be an object, got {entry[field]!r}")
         shared = entry["shared"]
         if isinstance(shared, bool) or not isinstance(shared, int) or shared < 0:
             raise TilefishManifestError(f"'{stem}' ({arch}): shared must be a non-negative integer, got {shared!r}")
@@ -223,23 +255,26 @@ class Manifest:
             launch = LaunchAttributes.from_dict(entry["launch"])
         except (KeyError, TypeError, ValueError) as e:
             raise TilefishManifestError(f"'{spec.stem}' ({arch}): the launch attributes are malformed: {e}") from e
-        return BuiltKernel(
-            spec=spec,
-            arch=arch,
-            cubin=artifact.cubin,
-            ptx="",
-            symbol=entry["symbol"],
-            shared=int(entry["shared"]),
-            num_warps=int(entry["num_warps"]),
-            sha256=entry["sha256"],
-            sha256_code=entry["sha256_code"],
-            triton_version=str(toolchain.get("triton", "")),
-            ptxas_version=str(toolchain.get("ptxas", "")),
-            ptx_target=str(entry.get("ptx_target", "")),
-            options=dict(entry["options"]),
-            launch=launch,
-            source_digest=entry.get("source_digest"),
-        )
+        try:
+            return BuiltKernel(
+                spec=spec,
+                arch=arch,
+                cubin=artifact.cubin,
+                ptx="",
+                symbol=entry["symbol"],
+                shared=int(entry["shared"]),
+                num_warps=int(entry["num_warps"]),
+                sha256=entry["sha256"],
+                sha256_code=entry["sha256_code"],
+                triton_version=str(toolchain.get("triton", "")),
+                ptxas_version=str(toolchain.get("ptxas", "")),
+                ptx_target=str(entry.get("ptx_target", "")),
+                options=dict(entry["options"]),
+                launch=launch,
+                source_digest=entry.get("source_digest"),
+            )
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise TilefishManifestError(f"'{spec.stem}' ({arch}): the manifest entry is malformed: {type(e).__name__}: {e}") from e
 
     @staticmethod
     def _check_source(spec: "CompileSpec", arch: str, entry: "dict[str, Any]", source_digest: "str | None", pinned: bool) -> None:
@@ -254,17 +289,23 @@ class Manifest:
                 )
             return
         recorded = entry.get("source_digest")
+        kind = entry.get("source_digest_kind")
+        if recorded is not None and kind != SOURCE_DIGEST_KIND:
+            recorded = None  # a digest of another definition (an older tilefish) says nothing about the files now
+            unusable = f"the manifest entry's source digest is of kind {kind!r}, not {SOURCE_DIGEST_KIND!r}"
+        else:
+            unusable = "the manifest entry records no source digest"
         if source_digest is not None and recorded is not None and source_digest != recorded:
             raise TilefishManifestError(
-                f"the manifest entry for {where} was built from Triton kernel source with cache_key {recorded}, but "
-                f"'{spec.triton}' now has cache_key {source_digest}: the kernel changed since the manifest was written, so "
-                "its binary is stale; export it again"
+                f"the manifest entry for {where} was built from kernel files with source digest {recorded}, but the files of "
+                f"'{spec.triton}' now have source digest {source_digest}: the kernel, or a module it uses, changed since the "
+                "manifest was written, so its binary is stale; export it again (and pin the new manifest)"
             )
         if source_digest is None or recorded is None:
             if pinned:
                 return  # the caller vouches for the manifest
             why = (
-                "the manifest entry records no source digest"
+                unusable
                 if recorded is None
                 else f"the source digest of '{spec.triton}' cannot be recomputed here (Triton or the module is not importable)"
             )

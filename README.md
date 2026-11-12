@@ -143,20 +143,46 @@ cubin that `jit` builds has the `sha256_code` of the one in the manifest.
 `replay` refuses a cubin whose digests are not the manifest's, a manifest
 entry that is not what the operator's compile spec asks for, and a stale
 binary: a kernel redeclared with another body but the same name and signature
-does not replay its old binary (a generated kernel's spec carries the sha256 of
-its Triton source; a hand-written `extern` is checked by Triton's
-`JITFunction.cache_key`, recomputed at replay, which needs the kernel to be
-importable, or a pin). It also refuses `shared` memory the cubin and the device
-cannot have, an argument list that does not fit the ABI, and a grid beyond the
-device's limits.
+does not replay its old binary. A generated kernel's spec carries the sha256 of
+its Triton source. A hand-written `extern` has no source in its declaration,
+so its manifest entry records a *source digest*: a sha256 over the text of the
+file of the kernel's module, of every user module file reachable from that
+module's globals (the modules it imports, and the modules of the functions and
+objects it holds, recursively; not `triton`, `torch`, `tilefish` or the
+standard library) and the Triton version. `replay` recomputes it, which needs
+the kernel to be importable, or a pin. Triton's own `cache_key` is not used: it
+does not see a `tl.constexpr` read as a module attribute (`cfg.SCALE`), a dtype
+alias or a constant in a helper module, so none of them would make a stale
+binary look stale. For the same reason every `jit` and `export` build compiles
+from scratch and never reads Triton's disk cache (about 35 to 130 ms per binary
+on a B300, once per process for `jit`).
+
+**Any edit to a file a hand-written kernel reaches, a comment included, means
+exporting again and pinning the new manifest.** The digest is of the files on
+disk, so a process that edited a file after importing it must reload before it
+builds (a build refuses a function whose imported lines are not the file's), and
+it does not see a value that a program assigned to a module attribute at run
+time. `build` also refuses source that is not its spec's: a stale
+`LoweredKernel.write` output on `sys.path`, or another function passed as `fn`.
+
+`replay` also refuses `shared` memory the cubin and the device cannot have (the
+driver's static shared memory of the function plus the manifest's dynamic size
+must fit the device's opt-in maximum), an argument list that does not fit the
+ABI, and a grid beyond the device's limits. The manifest is read as strict JSON
+(no duplicate keys, no `NaN`, no number that does not fit a float), files are
+written through a temporary file and renamed, and a symbolic link where a file
+is to go is refused.
 
 **Trust.** Without `pin=` a replay trusts the directory: the digests sit next
 to the files they describe, so whoever can write the directory can rewrite
 both. `export` returns the manifest with its `digest`, a sha256 over every
-entry; keep it somewhere you trust and pass it as `pin=` to refuse a directory
-that changed. Triton's own JIT launcher, which specializes on argument values,
-is not a mode. Neither `jit` nor `replay` needs a C compiler, and a `replay` of
-a generated kernel needs neither Triton nor `ptxas`.
+entry, and checks that the directory it wrote has that digest; keep it somewhere
+you trust and pass it as `pin=` to refuse a directory that changed. A pin
+vouches for the manifest, not for a source digest that is known to differ, and
+not for a `shared` that is nonzero but too small for the kernel (nothing but the
+manifest says how much it needs). Triton's own JIT launcher, which specializes
+on argument values, is not a mode. Neither `jit` nor `replay` needs a C
+compiler, and a `replay` of a generated kernel needs neither Triton nor `ptxas`.
 
 CI asserts, on a GPU (the tests marked `gpu`), that a `jit`-built cubin has the
 digest of the manifest's, that `jit` and `replay` agree byte for byte, and that

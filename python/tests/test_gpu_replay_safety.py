@@ -1,8 +1,13 @@
 """What a replay must not do, on a real GPU: run stale code, trust a directory blindly, launch what does not fit.
 
 * A kernel redeclared with another body but the same name and signature does not replay the old manifest's binary:
-  a generated kernel carries the sha256 of its Triton source in its spec, a hand-written one the ``cache_key`` of its
-  Triton function in its manifest entry, which a replay recomputes (or refuses, unless the manifest is pinned).
+  a generated kernel carries the sha256 of its Triton source in its spec, a hand-written one the digest of its files
+  (the module of the kernel and every user module it reaches, plus the Triton version) in its manifest entry, which a
+  replay recomputes (or refuses, unless the manifest is pinned). What Triton's ``cache_key`` does not see (a constexpr
+  read as a module attribute, a dtype alias, a constant in a helper module two levels away) is covered, and no build
+  reads Triton's disk cache.
+* ``build`` refuses source that is not the spec's: a stale generated file on ``sys.path``, another function passed as
+  ``fn``, a module whose file was edited after the process imported it.
 * A manifest can be pinned by its digest; the architecture it runs on is the device's; ``shared`` is checked against
   the cubin and the device before a launch that would fault and poison the context; a launch is checked against the
   ABI and the device's limits; ``export`` merges into an existing directory.
@@ -44,6 +49,7 @@ from tilefish import (  # noqa: E402
     f32,
     runtime,
 )
+from tilefish import _source  # noqa: E402
 from tilefish._elf import parse_elf  # noqa: E402
 from tilefish.aot import build  # noqa: E402
 from tilefish.dims import as_dim, cdiv  # noqa: E402
@@ -129,7 +135,7 @@ def test_a_hand_written_kernel_with_another_body_does_not_replay_the_old_binary(
     write_ext_module(ext_dir, "2.0")
     manifest = runtime.export(ext_scale, tmp_path / "m")
     entry = json.loads((manifest.directory / "manifest.json").read_text())["kernels"][0]
-    assert entry["source_digest_kind"] == "triton.JITFunction.cache_key" and len(entry["source_digest"]) == 64
+    assert entry["source_digest_kind"] == _source.SOURCE_DIGEST_KIND and len(entry["source_digest"]) == 64
     assert "source_sha256" not in entry  # an extern's declaration contains no source
     assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory), x * 2)
     assert torch.equal(tilefish.run(ext_scale, x, mode="jit"), x * 2)
@@ -142,8 +148,9 @@ def test_a_hand_written_kernel_with_another_body_does_not_replay_the_old_binary(
     write_ext_module(ext_dir, "3.0")
     with pytest.raises(TilefishManifestError) as e:
         tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory)
-    new_key = sys.modules["ext_scale_mod"].ext_scale_kernel.cache_key
-    assert entry["source_digest"] in str(e.value) and new_key in str(e.value) and "stale" in str(e.value)
+    new_digest = _source.source_digest(sys.modules["ext_scale_mod"].ext_scale_kernel)
+    assert new_digest != entry["source_digest"]
+    assert entry["source_digest"] in str(e.value) and new_digest in str(e.value) and "stale" in str(e.value)
     with pytest.raises(TilefishManifestError, match="stale"):  # a pin vouches for the manifest, not for a source that is known to differ
         tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, pin=manifest.digest)
     assert torch.equal(tilefish.run(ext_scale, x, mode="jit"), x * 3)
@@ -563,3 +570,310 @@ def test_a_declared_constraint_is_checked_before_a_binary_is_chosen():
     with pytest.raises(TilefishPreconditionError, match="no padding") as e:
         tilefish.run(two_constraints, torch.zeros(32, 40, device="cuda"), mode="jit")
     assert e.value.kind == "bucket"
+
+
+# -- H1: what Triton's cache_key does not see ------------------------------------------------------------------------------------------------
+
+HK_FILES = {
+    "hk_kernel": (
+        "import triton\n"
+        "import triton.language as tl\n"
+        "\n"
+        "import hk_cfg\n"
+        "import hk_helper_a\n"
+        "\n"
+        "\n"
+        "@triton.jit\n"
+        "def hk_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):\n"
+        "    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
+        "    mask = offsets < n_elements\n"
+        "    x = tl.load(x_ptr + offsets, mask=mask)\n"
+        "    y = hk_helper_a.apply(x.to(hk_cfg.DT)) * hk_cfg.SCALE\n"
+        "    tl.store(y_ptr + offsets, y, mask=mask)\n"
+    ),
+    "hk_cfg": "import triton.language as tl\n\nSCALE = tl.constexpr(@SCALE@)\nDT = tl.@DT@\n",
+    "hk_helper_a": "import triton\nimport triton.language as tl\n\nimport hk_helper_b\n\n\n@triton.jit\ndef apply(x):\n    return x + hk_helper_b.OFFSET\n",
+    "hk_helper_b": "import triton.language as tl\n\nOFFSET = tl.constexpr(@OFFSET@)\n",
+}
+HK_BASE = {"SCALE": "2.0", "DT": "float32", "OFFSET": "0.0"}
+HK_MODULES = tuple(HK_FILES)
+
+HkN = Dim("HkN", divisible_by=16)
+
+
+@tilefish.extern(triton="hk_kernel:hk_kernel", num_warps=4, grid=lambda HkN: (cdiv(HkN, 256),))
+def hk(x_ptr: Tensor[HkN, f32], y_ptr: Out[Tensor[HkN, f32]], n_elements: HkN, *, BLOCK: tilefish.const = 256): ...
+
+
+class HkProject:
+    """Four modules: the kernel's, ``cfg`` (a constexpr and a dtype alias), and a helper that reads a constexpr of a helper below it."""
+
+    def __init__(self, directory):
+        self.directory = directory
+
+    def write(self, **values):
+        values = {**HK_BASE, **values}
+        for name, text in HK_FILES.items():
+            for key, value in values.items():
+                text = text.replace(f"@{key}@", value)
+            (self.directory / f"{name}.py").write_text(text)
+
+    def load(self):
+        """Import the modules from their files as they are now, as a new process would."""
+        for name in HK_MODULES:
+            sys.modules.pop(name, None)
+        importlib.invalidate_caches()
+        linecache.clearcache()
+        return importlib.import_module("hk_kernel")
+
+
+@pytest.fixture
+def hkp(tmp_path, monkeypatch):
+    directory = tmp_path / "hk"
+    directory.mkdir()
+    monkeypatch.syspath_prepend(str(directory))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)  # an edit of one byte within a second must not meet a stale .pyc
+    yield HkProject(directory)
+    for name in HK_MODULES:
+        sys.modules.pop(name, None)
+
+
+def hk_expected(x, values):
+    """What the kernel computes: ``(x.to(DT) + OFFSET) * SCALE``, with the roundings of its dtype."""
+    values = {**HK_BASE, **values}
+    t = {"float32": torch.float32, "bfloat16": torch.bfloat16}[values["DT"]]
+    return ((x.to(t) + float(values["OFFSET"])) * float(values["SCALE"])).float()
+
+
+HK_EDITS = [
+    ("a constexpr read as a module attribute (cfg.SCALE)", {"SCALE": "3.0"}),
+    ("a dtype alias (cfg.DT)", {"DT": "bfloat16"}),
+    ("a constant in a helper module two levels away", {"OFFSET": "1.0"}),
+]
+
+
+@pytest.mark.parametrize("label, edit", HK_EDITS, ids=[label for label, _ in HK_EDITS])
+def test_an_edit_in_a_module_the_kernel_reaches_is_not_replayed_stale_with_or_without_a_pin(hkp, tmp_path, label, edit):
+    """What Triton's ``cache_key`` misses: it is the same before and after these edits, so its disk cache would serve the old cubin too."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024  # exact in f32, not in bf16
+    hkp.write()
+    hkp.load()
+    old = hk_expected(x, {})
+    manifest = runtime.export(hk, tmp_path / "m")
+    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=manifest.directory), old)
+    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=manifest.digest), old)
+    assert torch.equal(tilefish.run(hk, x, mode="jit"), old)
+    entry = manifest.get("hk", ARCH).entry
+    assert sorted(_source.reachable(sys.modules["hk_kernel"].hk_kernel).files) == sorted(HK_MODULES)
+    new = hk_expected(x, edit)
+    assert not torch.equal(old, new)  # the edit changes the result: serving the old binary is visible
+
+    hkp.write(**edit)
+    hkp.load()
+    new_digest = _source.source_digest(sys.modules["hk_kernel"].hk_kernel)
+    assert new_digest != entry["source_digest"]
+    for pin in (None, manifest.digest):  # refused with and without the pin of the old manifest
+        with pytest.raises(TilefishManifestError) as e:
+            tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=pin)
+        assert entry["source_digest"] in str(e.value) and new_digest in str(e.value) and "stale" in str(e.value) and "export it again" in str(e.value)
+    assert torch.equal(tilefish.run(hk, x, mode="jit"), new)  # not the old binary, from the build cache or from Triton's disk cache
+    again = runtime.export(hk, tmp_path / "m", overwrite=True)
+    assert again.digest != manifest.digest and again.get("hk", ARCH).entry["source_digest"] == new_digest
+    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=again.directory, pin=again.digest), new)
+    assert same_bytes(tilefish.run(hk, x, mode="replay", manifest=again.directory), tilefish.run(hk, x, mode="jit"))
+
+
+def test_the_old_exports_binary_is_not_what_a_new_export_of_the_edited_kernel_writes(hkp, tmp_path):
+    """``export`` is stale too when Triton's cache serves the cubin: two exports from two sources must differ in machine code."""
+    hkp.write()
+    hkp.load()
+    first = runtime.export(hk, tmp_path / "one")
+    hkp.write(SCALE="3.0")
+    hkp.load()
+    second = runtime.export(hk, tmp_path / "two")
+    assert first.get("hk", ARCH).entry["sha256_code"] != second.get("hk", ARCH).entry["sha256_code"]
+
+
+def test_a_file_edited_after_the_process_imported_it_is_not_built(hkp, tmp_path):
+    """The digest is of the files on disk, so a build refuses a function the process holds in an older version."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    hkp.write()
+    hkp.load()
+    runtime.export(hk, tmp_path / "m")
+    source = hkp.directory / "hk_kernel.py"
+    source.write_text(source.read_text().replace("* hk_cfg.SCALE", "* hk_cfg.SCALE * 1.0"))  # edited, not reloaded
+    runtime.clear_caches()
+    with pytest.raises(TilefishBuildError, match=r"'hk_kernel' was imported from an older version of '.*hk_kernel.py'.*Restart the process, or reload"):
+        runtime.export(hk, tmp_path / "again", overwrite=True)
+    with pytest.raises(TilefishBuildError, match="older version"):
+        tilefish.run(hk, x, mode="jit")
+    hkp.load()  # reloaded: fine
+    assert torch.equal(tilefish.run(hk, x, mode="jit"), hk_expected(x, {}))
+    helper = hkp.directory / "hk_helper_a.py"
+    helper.write_text(helper.read_text() + "\n")  # a helper's function is checked too: appending changes no line of it ...
+    runtime.clear_caches()
+    assert torch.equal(tilefish.run(hk, x, mode="jit"), hk_expected(x, {}))
+    helper.write_text("# moved\n" + helper.read_text())  # ... but a line above it moves it
+    runtime.clear_caches()
+    with pytest.raises(TilefishBuildError, match=r"'apply' was imported from an older version"):
+        tilefish.run(hk, x, mode="jit")
+
+
+# -- H2: build() stamps a source digest on what it compiled ---------------------------------------------------------------------------------------
+
+
+def test_a_stale_generated_file_on_sys_path_is_not_built_as_the_new_kernel(tmp_path, monkeypatch):
+    old, new = scale_kernel(2.0), scale_kernel(3.0)  # the same name and signature, another body
+    src = tmp_path / "src"
+    low_old, low_new = old.lower(), new.lower()
+    assert low_old.module == low_new.module and low_old.source_sha256 != low_new.source_sha256
+    path = low_old.write(src)  # what an earlier run left behind
+    monkeypatch.syspath_prepend(str(src))
+    sys.modules.pop(low_new.module, None)
+    (spec,) = low_new.specs()
+    with pytest.raises(TilefishBuildError) as e:
+        build(spec, arch=ARCH)  # fn=None: imports `module:fn` from sys.path
+    message = str(e.value)
+    assert str(path) in message and low_old.source_sha256 in message and low_new.source_sha256 in message and "stale" in message
+    with pytest.raises(TilefishBuildError, match="the file is not the source this kernel generates now"):
+        runtime.export(low_new.extern, tmp_path / "d")  # the same path through export
+    assert not (tmp_path / "d" / "manifest.json").exists()  # nothing was written
+    # the matching file builds
+    low_new.write(src)
+    sys.modules.pop(low_new.module, None)
+    importlib.invalidate_caches()
+    linecache.clearcache()
+    built = build(spec, arch=ARCH)
+    assert built.source_digest is None and len(built.cubin) > 0  # a generated kernel's spec carries its source; the entry does not need a digest
+
+
+def test_another_function_passed_as_fn_is_not_built_as_the_spec_s_kernel(tmp_path):
+    old, new = scale_kernel(2.0), scale_kernel(3.0)
+    (spec,) = new.lower().specs()
+    stale = runtime.load_lowered(old.lower())  # a JITFunction with the very parameters of the spec, and another body
+    with pytest.raises(TilefishBuildError, match=r"whose sha256 is .*, but the compile spec 'scale_k' is for Triton source with sha256 " + spec.source_sha256):
+        build(spec, arch=ARCH, fn=stale)
+    assert build(spec, arch=ARCH, fn=runtime.load_lowered(new.lower())).symbol
+
+
+def test_a_generated_file_edited_after_it_was_imported_is_not_built(tmp_path, monkeypatch):
+    """The file now has the spec's source, but the module in ``sys.modules`` is the old one."""
+    old, new = scale_kernel(2.0), scale_kernel(3.0)
+    src = tmp_path / "src"
+    low_old, low_new = old.lower(), new.lower()
+    low_old.write(src)
+    monkeypatch.syspath_prepend(str(src))
+    sys.modules.pop(low_new.module, None)
+    importlib.invalidate_caches()
+    imported = importlib.import_module(low_new.module)  # the old source
+    low_new.write(src)  # the file is overwritten with the new one, the process keeps the old function
+    linecache.clearcache()
+    (spec,) = low_new.specs()
+    with pytest.raises(TilefishBuildError, match=r"was imported from an older version of .*Restart the process, or reload"):
+        build(spec, arch=ARCH, fn=getattr(imported, low_new.fn_name))
+
+
+def test_build_compares_the_source_digest_it_is_given(ext_dir):
+    write_ext_module(ext_dir, "2.0")
+    (spec,) = compile_specs_of(ext_scale)
+    digest = _source.source_digest(sys.modules["ext_scale_mod"].ext_scale_kernel)
+    assert build(spec, arch=ARCH).source_digest == build(spec, arch=ARCH, source_digest=digest).source_digest == digest
+    with pytest.raises(TilefishBuildError, match=rf"has digest {digest}, but {'0' * 64} was expected"):
+        build(spec, arch=ARCH, source_digest="0" * 64)
+
+
+def compile_specs_of(op):
+    from tilefish.aot import compile_specs
+
+    return compile_specs(op)
+
+
+def test_an_entry_of_a_generated_kernel_needs_no_source_digest_and_one_of_an_extern_has_one(ext_dir, tmp_path):
+    write_ext_module(ext_dir, "2.0")
+    generated = runtime.export(softmax, tmp_path / "g").get("softmax", ARCH).entry
+    assert "source_sha256" in generated and "source_digest" not in generated and "source_digest_kind" not in generated
+    handwritten = runtime.export(ext_scale, tmp_path / "e").get("ext_scale", ARCH).entry
+    assert "source_digest" in handwritten and "source_sha256" not in handwritten
+
+
+def test_a_generated_kernels_build_key_is_its_spec_and_an_externs_is_its_files(ext_dir, monkeypatch):
+    """A generated kernel carries its source in its spec, so a call does not read any file; a hand-written one is keyed by its digest."""
+    x = randn((7, 1000), torch.float32, 0)
+    y = randn((64,), torch.float32, 0)
+    write_ext_module(ext_dir, "2.0")
+    runtime.clear_caches()
+
+    def boom(fn):
+        raise AssertionError("a file was read for the key of a generated kernel")
+
+    monkeypatch.setattr(_source, "source_digest", boom)
+    assert torch.isfinite(tilefish.run(softmax, x, mode="jit")).all()  # builds, and runs again from the cache, without a digest
+    assert torch.isfinite(tilefish.run(softmax, x, mode="jit")).all()
+    with pytest.raises(AssertionError, match="a file was read"):
+        tilefish.run(ext_scale, y, mode="jit")
+    monkeypatch.undo()
+    assert torch.equal(tilefish.run(ext_scale, y, mode="jit"), y * 2)
+
+
+# -- no build reads Triton's disk cache ---------------------------------------------------------------------------------------------------------
+
+
+def test_every_build_compiles_from_scratch_and_puts_the_knob_back(monkeypatch):
+    low = softmax.lower()
+    (spec,) = low.specs()
+    fn = runtime.load_lowered(low)
+    knob = triton.knobs.compilation
+    seen = []
+
+    def spy(*a, **k):
+        seen.append(knob.always_compile)
+        return REAL_COMPILE(*a, **k)
+
+    monkeypatch.setattr(triton, "compile", spy)
+    assert knob.always_compile is False
+    build(spec, arch=ARCH, fn=fn)
+    assert seen == [True] and knob.always_compile is False
+    knob.always_compile = True  # a caller that set it itself finds it as it was
+    try:
+        build(spec, arch=ARCH, fn=fn)
+        assert seen == [True, True] and knob.always_compile is True
+    finally:
+        knob.always_compile = False
+
+    def boom(*a, **k):
+        seen.append(knob.always_compile)
+        raise RuntimeError("compiler exploded")
+
+    monkeypatch.setattr(triton, "compile", boom)
+    with pytest.raises(TilefishBuildError, match="compiler exploded"):
+        build(spec, arch=ARCH, fn=fn)
+    assert seen[-1] is True and knob.always_compile is False  # restored when the compile fails too
+
+
+def test_a_build_does_not_reuse_the_binary_in_triton_s_disk_cache(monkeypatch, tmp_path):
+    """The same cache key, other content: a cache that was written for the old kernel must not be served for the new one."""
+    monkeypatch.setattr(triton.knobs.cache, "dir", str(tmp_path / "cache"))
+    low = softmax.lower()
+    (spec,) = low.specs()
+    fn = runtime.load_lowered(low)
+    first = build(spec, arch=ARCH, fn=fn)
+    cached = list((tmp_path / "cache").rglob("*.cubin"))
+    assert cached  # Triton wrote it
+    for p in cached:
+        p.write_bytes(b"not a cubin: poisoned")  # what a stale or damaged entry looks like
+    second = build(spec, arch=ARCH, fn=fn)  # a cache hit would hand back the poisoned file
+    assert second.sha256_code == first.sha256_code and second.cubin[:4] == b"\x7fELF"
+
+
+# -- export checks the directory it wrote against the builds in memory ------------------------------------------------------------------------------------
+
+
+def test_export_returns_the_digest_of_what_it_built_and_checks_the_directory_against_it(tmp_path, monkeypatch):
+    runtime.export(softmax, tmp_path)
+    merged = runtime.export(gelu_exact, tmp_path)  # merged with an entry that was read from the directory
+    assert merged.digest == Manifest.load(tmp_path).digest
+    monkeypatch.setattr(runtime, "manifest_digest", lambda doc: "0" * 64)  # what the in-memory document would have said, if it differed
+    with pytest.raises(TilefishManifestError, match=r"has digest [0-9a-f]{64} when it is read back, but the manifest that was written has digest " + "0" * 64):
+        runtime.export(gelu_exact, tmp_path)
+
+
