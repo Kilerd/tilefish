@@ -3,8 +3,13 @@
 M1: the type system (dtypes, dims, tensor types, block-scaled formats), the
 operator declarations (``extern``, ``library``, ``kernel``, ``graph``),
 tracing into a typed IR with type checking, and Triton ahead-of-time compile
-specs for ``extern`` kernels (:mod:`tilefish.aot`). Kernel bodies are checked
-but not lowered yet.
+specs for ``extern`` kernels (:mod:`tilefish.aot`).
+
+M2: a ``kernel`` lowers to Triton source (:func:`lower`); a compile spec builds into a
+cubin with a manifest (:func:`tilefish.aot.build`, :func:`tilefish.aot.write_manifest`); and
+:func:`run` runs a kernel or an extern on torch tensors in the modes ``jit``, ``replay`` (the built
+cubin through the CUDA driver, what a C++ or Rust host runs) and ``reference`` (the IR interpreted
+with torch). Importing tilefish imports neither torch nor Triton; the ``gpu`` extra installs them.
 """
 
 from . import aot

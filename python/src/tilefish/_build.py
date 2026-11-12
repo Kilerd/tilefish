@@ -237,6 +237,8 @@ class BuiltKernel:
                 entry["access"] = a.access
             else:
                 entry["dim"] = a.dim
+                if a.count_of is not None:  # the value is the element count of that pointer argument
+                    entry["count_of"] = a.count_of
             params.append(entry)
         scratch = [
             {"slot": len(params) + k, "name": p.name, "type": p.type, "ptx_type": "u64", "size": 8, "value": p.value}

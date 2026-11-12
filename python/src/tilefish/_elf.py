@@ -6,7 +6,9 @@ builds of the same kernel from different directories differ byte for byte while 
 :func:`code_digest` is a sha256 that ignores exactly that: it covers the identity fields of the ELF
 header and every section that is not debug information (name, type, flags, sizes, link and contents),
 and skips ``.debug_*`` and ``.nv_debug_*`` together with their wrapped variants (``.rela.debug_line``, the
-mercury copies ``.nv.merc.debug_line`` and ``.nv.merc.rela.debug_line``, ...).
+mercury copies ``.nv.merc.debug_line`` and ``.nv.merc.rela.debug_line``, ...). In a cubin built by Triton
+from two directories exactly the debug sections differ: ``.debug_line``, ``.nv_debug_ptx_txt``,
+``.rela.debug_line`` and their ``.nv.merc.*`` copies, all of which hold the path of the source.
 
 The walk is strict: anything that is not a well-formed little-endian ELF64 file with a section header
 table whose sections lie inside the file is a :class:`~tilefish.errors.TilefishBuildError`. Nothing is
@@ -82,6 +84,7 @@ class Elf:
     flags: int
     sections: "tuple[Section, ...]"
     blob: bytes
+    shstrndx: int = 0  # the index of the section name table
 
     def data(self, section: Section) -> bytes:
         """The contents of a section (empty for a ``NOBITS`` section, which has none in the file)."""
@@ -154,7 +157,7 @@ def parse_elf(blob: "bytes | bytearray | memoryview") -> Elf:
         except UnicodeDecodeError:
             _bad(f"section {i}: its name is not valid UTF-8")
         sections.append(Section(i, name, typ, sh_flags, addr, offset, sz, link, info, addralign, entsize))
-    return Elf(bytes(ident), e_type, machine, version, flags, tuple(sections), blob)
+    return Elf(bytes(ident), e_type, machine, version, flags, tuple(sections), blob, shstrndx)
 
 
 def _reference(elf: Elf, value: int, *, resolve: bool) -> bytes:
@@ -171,12 +174,17 @@ def code_digest(cubin: "bytes | bytearray | memoryview") -> str:
     and flags, which carry the target architecture) and, for every section after the null section that is
     not a debug section (see :func:`is_debug_section`), its name, type, flags, address, size, alignment,
     entry size, its ``sh_link`` and ``sh_info`` (as section names where they name a section) and its
-    contents (nothing for ``NOBITS``). File offsets are not covered. It is the same for two builds of one
+    contents (nothing for ``NOBITS``). File offsets are not covered, and neither is the section name table
+    itself (``.shstrtab``): it only spells the names, which are hashed section by section, and it also
+    spells the names of the debug sections. It is the same for two builds of one
     kernel with the same options from different directories, and different when any instruction, constant,
     size or symbol changes.
 
     The section order and indices are part of the layout, so a build with different line-info settings
     (which adds or removes debug sections and shifts the indices in the symbol table) has another digest.
+    So does a build with other ptxas options: ``.note.nv.tkinfo`` is not a debug section, and it records the
+    ptxas version and command line (``-arch sm_103a -fmad false``), so two cubins with the same instructions
+    but built with different flags are told apart.
     """
     elf = parse_elf(cubin)
     h = hashlib.sha256()
@@ -189,7 +197,7 @@ def code_digest(cubin: "bytes | bytearray | memoryview") -> str:
     put(elf.ident)
     h.update(struct.pack("<HHII", elf.type, elf.machine, elf.version, elf.flags))
     for s in elf.sections[1:]:
-        if is_debug_section(s.name):
+        if is_debug_section(s.name) or s.index == elf.shstrndx:
             continue
         put(s.name.encode("utf-8"))
         h.update(struct.pack("<IQQQQQ", s.type, s.flags, s.addr, s.size, s.addralign, s.entsize))

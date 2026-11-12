@@ -66,7 +66,7 @@ class TilefishPreconditionError(TilefishRuntimeError):
     """An argument violates a precondition of the binary it would run on (the types and the compile spec).
 
     ``kind`` names the rule: ``"dtype"``, ``"rank"``, ``"shape"``, ``"static_size"``, ``"divisible"``,
-    ``"bucket"``, ``"pointer_alignment"``, ``"contiguous"``, ``"device"`` or ``"alias"``. ``arg`` is the
+    ``"bucket"``, ``"pointer_alignment"``, ``"max_elements"``, ``"contiguous"``, ``"device"`` or ``"alias"``. ``arg`` is the
     argument it is about, when there is one.
     """
 

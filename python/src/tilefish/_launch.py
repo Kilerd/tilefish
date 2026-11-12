@@ -10,6 +10,7 @@ raises :class:`~tilefish.errors.TilefishPreconditionError` before anything runs.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -293,6 +294,15 @@ def check_spec_preconditions(
                     kind="static_size",
                     arg=pre.arg,
                 )
+        elif pre.kind == "max_elements":  # a generated kernel indexes with i32
+            count = math.prod(infos[pre.arg].shape)  # type: ignore[index]
+            if count > pre.value:  # type: ignore[operator]
+                raise TilefishPreconditionError(
+                    f"argument '{pre.arg}' has {count} elements (shape {list(infos[pre.arg].shape)}), more than the "  # type: ignore[index]
+                    f"{pre.value} that the i32 offsets of '{spec.stem}' reach",
+                    kind="max_elements",
+                    arg=pre.arg,
+                )
         elif pre.kind == "bucket":
             if buckets and by_name.get(pre.dim) != pre.value:  # type: ignore[arg-type]
                 raise TilefishPreconditionError(
@@ -301,6 +311,8 @@ def check_spec_preconditions(
                     kind="bucket",
                     arg=pre.dim,
                 )
+        else:  # a precondition this runtime cannot check must not be skipped
+            raise TilefishRuntimeError(f"'{spec.stem}' has a precondition of kind {pre.kind!r}, which this runtime does not know")
 
 
 def check_i32(scalars: "Mapping[str, int]") -> None:

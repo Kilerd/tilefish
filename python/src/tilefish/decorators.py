@@ -36,7 +36,7 @@ class Op:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return call_op(self, args, kwargs)
 
-    def run(self, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
+    def run(self, /, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
         """``tilefish.run(self, *args, mode=mode, **kwargs)``: run this kernel or extern on torch tensors.
 
         ``mode`` is ``"jit"``, ``"replay"`` or ``"reference"``; see :mod:`tilefish.runtime`.

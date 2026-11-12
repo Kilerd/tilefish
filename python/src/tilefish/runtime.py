@@ -8,24 +8,31 @@ allocated, ``const`` parameters are compiled in (a call may restate their value,
 result is what the call returns when traced: a kernel's returned values, then its ``Out`` tensors; an
 extern's ``Out`` tensors; ``None``, one tensor or a tuple.
 
-==========  ===============================================================================================
-mode        what runs
-==========  ===============================================================================================
-``jit``     the Triton JIT function, launched with the spec's constexprs, ``num_warps``, ``num_stages`` and grid
-``replay``  the cubin that :func:`tilefish.aot.build` produces for the device's architecture, loaded with
-            ``cuModuleLoadData`` and launched with ``cuLaunchKernel`` on torch's current stream, with
-            ``kernelParams`` laid out as the manifest's ABI says: exactly what a C++ or Rust host does
+=============  ============================================================================================
+mode           what runs
+=============  ============================================================================================
+``jit``        the Triton JIT function, launched with the spec's constexprs, ``num_warps``, ``num_stages``
+               and grid
+``replay``     the cubin that :func:`tilefish.aot.build` produces for the device's architecture, loaded with
+               ``cuModuleLoadData`` and launched with ``cuLaunchKernel`` on torch's current stream, with
+               ``kernelParams`` laid out as the manifest's ABI says: exactly what a C++ or Rust host does
 ``reference``  the traced IR interpreted with torch (:mod:`tilefish._reference`); a kernel only, an
-            extern has no IR to interpret
-==========  ===============================================================================================
+               extern has no IR to interpret
+=============  ============================================================================================
 
 Before ``jit`` and ``replay`` launch, every precondition of the binary is checked (dtypes, static sizes,
-``divisible_by``, 16-byte aligned pointers, contiguity, aliasing); a bucketed dimension must equal one bucket
-value exactly, there is no padding. ``reference`` checks the types, not the alignment or the buckets.
+``divisible_by``, 16-byte aligned pointers, contiguity, aliasing, ``max_elements`` of a generated kernel); a
+bucketed dimension must equal one bucket value exactly, there is no padding. ``reference`` checks the types,
+not the alignment or the buckets.
+
+``jit`` compiles the same source with Triton's usual specializations (an ``i32`` argument equal to 1 becomes
+a constant, divisibility by 16 is assumed wherever it happens to hold, not only where the spec proves it), so
+its machine code can differ from the binary of the spec in addressing and vectorization; the computation is
+the same, and the gpu tests assert that the outputs and the in-place tensors are byte-identical.
 
 The first ``replay`` of a spec builds it (cached by stem, architecture, declaration digest, spec content and
 kernel source), so it needs Triton and ``ptxas``; everything here imports torch, Triton and cuda-python
-only when it runs.
+only when it runs. Running ``jit`` also needs a C compiler (Triton builds its launcher); ``replay`` does not.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import atexit
 import contextlib
 import hashlib
 import importlib.util
+import math
 import pathlib
 import shutil
 import sys
@@ -72,6 +80,7 @@ MODES = ("jit", "replay", "reference")
 _lock = threading.Lock()
 _builds: "dict[tuple, BuiltKernel]" = {}
 _lowered: "weakref.WeakKeyDictionary[KernelOp, LoweredKernel]" = weakref.WeakKeyDictionary()
+_specs: "weakref.WeakKeyDictionary[ExternOp, list[CompileSpec]]" = weakref.WeakKeyDictionary()  # an op is immutable
 _modules: "dict[str, Any]" = {}  # sha256 of a lowered source -> the imported JITFunction
 _gen_root: "list[pathlib.Path]" = []
 
@@ -115,7 +124,14 @@ class _Target:
 
     def compile_specs(self) -> "list[CompileSpec]":
         if self.specs is None:
-            self.specs = compile_specs(self.launch_extern())
+            extern = self.launch_extern()
+            with _lock:
+                specs = _specs.get(extern)
+            if specs is None:
+                specs = compile_specs(extern)
+                with _lock:
+                    _specs[extern] = specs
+            self.specs = specs
         return self.specs
 
     def jit_function(self, spec: CompileSpec) -> Any:
@@ -231,6 +247,17 @@ def _declared_consts(sig: Signature, explicit: "dict[str, Any]") -> None:
                 )
 
 
+def _extern_names(target: _Target, extern: ExternOp) -> "dict[str, str]":
+    """Public parameter name -> its name in the launched kernel.
+
+    A lowered kernel's stub lists the kernel's own parameters first, in order, but renames those that
+    collide with names the generated module uses (``tl``, ``grid``, ...).
+    """
+    if target.kernel is None:
+        return {p.name: p.name for p in extern.signature.params}
+    return {p.name: q.name for p, q in zip(target.kernel.signature.params, extern.signature.params)}
+
+
 def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> _Prepared:
     torch = _torch()
     extern = target.launch_extern()
@@ -238,41 +265,50 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]")
     check_dim_constraints(call.dims)
     specs = target.compile_specs()
     spec = select_spec(target.name, specs, call.dims)
-    check_consts(spec, call.consts)
+    names = _extern_names(target, extern)
+    check_consts(spec, {names[k]: v for k, v in call.consts.items()})
     device = _device_of(call.infos, call.tensors)
     if getattr(device, "type", None) != "cuda":
         raise TilefishRuntimeError(f"jit and replay run on a CUDA device; the tensors are on {device}")
 
-    # tensors of the launched kernel: the supplied ones by name, and every Out (allocated here)
-    tensors = dict(call.tensors)
-    results: "list[Any]" = []
-    user = len(target.kernel.signature.params) if target.kernel is not None else None
+    # the tensors of the launched kernel, by its parameter names: the supplied ones, and every Out (allocated here)
+    tensors = {names[k]: v for k, v in call.tensors.items()}
     out_params = [p for p in extern.signature.params if p.kind == "tensor" and p.access == "out"]
-    allocated: "dict[str, Any]" = {}
-    for p in out_params:
-        allocated[p.name] = _alloc(torch, p, call.dims, device, f"Out parameter '{p.name}'")
+    allocated = {p.name: _alloc(torch, p, call.dims, device, f"Out parameter '{p.name}'") for p in out_params}
     tensors.update(allocated)
     if target.kernel is not None:
-        # the lowered stub lists the kernel's own parameters, then one output per returned value
-        assert user is not None
+        # a kernel returns its returned values, then its Out tensors; the stub lists the kernel's own
+        # parameters (the Out ones among them), then one output per returned value
+        user = len(target.kernel.signature.params)
         returned = [p for p in extern.signature.params[user:] if p.kind == "tensor" and p.access == "out"]
         results = [allocated[p.name] for p in returned]
-        results += [allocated[p.name] for p in target.kernel.signature.tensor_outputs]
+        results += [allocated[names[p.name]] for p in target.kernel.signature.tensor_outputs]
     else:
         results = [allocated[p.name] for p in out_params]
 
     infos = {name: tensor_info(name, t) for name, t in tensors.items()}
+    by_name = {p.name: p for p in extern.signature.params}
     scalars: "dict[str, int]" = {}
-    for p in extern.signature.params:
-        if p.kind != "dim":
+    for a in spec.args:
+        if a.kind != "scalar":
             continue
+        p = by_name[a.name]
         assert p.dim is not None
         v = eval_dim(p.dim, call.dims)
-        if v is None:
-            v = _derive_dim(target, p, call)
-            if isinstance(p.dim, Dim):
-                call.dims[p.dim] = v  # the grid may be written over it
-        scalars[p.name] = v
+        if a.count_of is not None:  # a generated kernel's n: the element count of that tensor argument
+            count = math.prod(infos[a.count_of].shape)
+            if v is not None and v != count:
+                raise TilefishPreconditionError(
+                    f"runtime argument '{a.name}' is {p.dim} = {v}, but the tensor '{a.count_of}' has {count} elements",
+                    kind="shape",
+                    arg=a.name,
+                )
+            if v is None and isinstance(p.dim, Dim):
+                call.dims[p.dim] = count  # the grid may be written over it
+            v = count
+        elif v is None:
+            raise TilefishRuntimeError(f"cannot determine the runtime argument '{a.name}' ({p.dim}) from the tensor shapes")
+        scalars[a.name] = v
     check_dim_constraints(call.dims)
     check_i32(scalars)
     written = {p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in"}
@@ -281,16 +317,6 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]")
     assert extern.grid is not None
     grid = eval_grid(spec, extern.grid, call.dims)
     return _Prepared(target, spec, str(device), tensors, scalars, grid, results)
-
-
-def _derive_dim(target: _Target, p: Param, call: Any) -> int:
-    """A runtime dimension no tensor shape determines: the element count of the elementwise template's ``n``."""
-    if target.lowered is not None and target.lowered.template == "elementwise":
-        n = 1
-        for s in next(iter(call.infos.values())).shape:
-            n *= s
-        return n
-    raise TilefishRuntimeError(f"cannot determine the runtime argument '{p.name}' ({p.dim}) from the tensor shapes")
 
 
 def _launch_values(prep: _Prepared) -> "list[tuple[str, str, Any]]":
@@ -325,7 +351,7 @@ def _run_jit(prep: _Prepared) -> None:
     fn = prep.target.jit_function(prep.spec)
     _import_triton()
     _check_jit_function(fn, prep.spec)
-    args =[v for _, _, v in _launch_values(prep)]
+    args = [v for _, _, v in _launch_values(prep)]
     with torch.cuda.device(_device_index(torch, prep.device)):
         fn[prep.grid](*args, num_warps=prep.spec.num_warps, num_stages=prep.spec.num_stages)
 
@@ -410,7 +436,7 @@ def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, 
     return _result(returned + outs)
 
 
-def run(op: Any, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
+def run(op: Any, /, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
     """Run a kernel or an extern op on tensors. See the module docstring for the three modes.
 
     ``op`` is a ``@tilefish.kernel`` (or its :class:`~tilefish.lower.LoweredKernel`) or an ``@tilefish.extern`` whose
