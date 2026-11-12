@@ -1,0 +1,9 @@
+[package]
+name = "tilefish"
+version = "0.0.0"
+edition = "2024"
+description = "Typed tensor DSL for GPU kernels: shapes, dtypes and quantization formats in the type, one compiled artifact for Python, C++ and Rust hosts. Name reservation, nothing usable yet."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Kilerd/tilefish"
+keywords = ["gpu", "cuda", "dsl", "tensor", "quantization"]
+categories = ["compilers", "science"]

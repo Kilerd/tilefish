@@ -1,0 +1,16 @@
+[project]
+name = "tilefish"
+version = "0.0.0"
+description = "Typed tensor DSL for GPU kernels: shapes, dtypes and quantization formats in the type, one compiled artifact for Python, C++ and Rust hosts. Name reservation, nothing usable yet."
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+authors = [{ name = "Kilerd Chan" }]
+readme = "README.md"
+classifiers = ["Development Status :: 1 - Planning"]
+
+[project.urls]
+Repository = "https://github.com/Kilerd/tilefish"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14"]
+build-backend = "uv_build"
