@@ -31,33 +31,45 @@ Conventions (all from the declaration, nothing guessed at compile time):
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import itertools
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
+from ._specvalid import (
+    ALIGNMENT,
+    SCHEMA_VERSION,
+    decode_scalar,
+    validate_arg,
+    validate_launch_param,
+    validate_precondition,
+    validate_spec,
+)
 from .decorators import ExternOp, grid_to_string
 from .dims import Dim, DimExpr
 from .dtypes import BlockScaled
-from .errors import TilefishSpecError
+from .errors import TilefishError, TilefishSpecError
 from .signature import MISSING
 
-ALIGNMENT = 16  # bytes; the value of every "tt.divisibility" attribute
-SCHEMA_VERSION = 1
+
+@contextlib.contextmanager
+def _malformed() -> Iterator[None]:
+    """Serialized specs are untrusted: anything that is not a tilefish error becomes a TilefishSpecError."""
+    try:
+        yield
+    except TilefishError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError, OverflowError, RecursionError) as e:
+        raise TilefishSpecError(f"malformed compile spec: {type(e).__name__}: {e}") from None
 
 
 def _encode(v: Any) -> Any:
     """A scalar for JSON: non-finite floats become ``{"float": "inf" | "-inf" | "nan"}``."""
     if isinstance(v, float) and not math.isfinite(v):
         return {"float": "nan" if math.isnan(v) else ("inf" if v > 0 else "-inf")}
-    return v
-
-
-def _decode(v: Any) -> Any:
-    if isinstance(v, dict) and set(v) == {"float"}:
-        return float(v["float"])
     return v
 
 
@@ -95,10 +107,13 @@ class Precondition:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Precondition":
-        kw = dict(d)
-        if kw.get("buckets") is not None:
-            kw["buckets"] = tuple(kw["buckets"])
-        return cls(**kw)
+        """The inverse of :meth:`to_dict`; strict about fields and types."""
+        with _malformed():
+            validate_precondition(d)
+            kw = dict(d)
+            if kw.get("buckets") is not None:
+                kw["buckets"] = tuple(kw["buckets"])
+            return cls(**kw)
 
 
 @dataclass(frozen=True)
@@ -129,12 +144,15 @@ class ArgSpec:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ArgSpec":
-        kw = dict(d)
-        if kw.get("shape") is not None:
-            kw["shape"] = tuple(kw["shape"])
-        if "value" in kw:
-            kw["value"] = _decode(kw["value"])
-        return cls(**kw)
+        """The inverse of :meth:`to_dict`; strict about fields and types."""
+        with _malformed():
+            validate_arg(d)
+            kw = dict(d)
+            if kw.get("shape") is not None:
+                kw["shape"] = tuple(kw["shape"])
+            if "value" in kw:
+                kw["value"] = decode_scalar(kw["value"], "arg value")
+            return cls(**kw)
 
 
 @dataclass(frozen=True)
@@ -153,7 +171,9 @@ class LaunchParam:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "LaunchParam":
-        return cls(**d)
+        with _malformed():
+            validate_launch_param(d)
+            return cls(**d)
 
 
 @dataclass(frozen=True)
@@ -249,29 +269,46 @@ class CompileSpec:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CompileSpec":
-        """The inverse of :meth:`to_dict`."""
-        if d.get("schema") != SCHEMA_VERSION:
-            raise TilefishSpecError(f"unsupported compile spec schema {d.get('schema')!r} (expected {SCHEMA_VERSION})")
-        return cls(
-            stem=d["stem"],
-            op=d["op"],
-            triton=d["triton"]["ref"],
-            signature=dict(d["signature"]),
-            constants={_key_from_str(k): _decode(v) for k, v in d["constants"].items()},
-            attrs={_key_from_str(k): copy.deepcopy(v) for k, v in d["attrs"].items()},
-            num_warps=d["num_warps"],
-            num_stages=d["num_stages"],
-            grid=d["grid"],
-            block=tuple(d["block"]),  # type: ignore[arg-type]
-            launch_params=tuple(LaunchParam.from_dict(p) for p in d["launch_params"]),
-            preconditions=tuple(Precondition.from_dict(p) for p in d["preconditions"]),
-            args=tuple(ArgSpec.from_dict(a) for a in d["args"]),
-            buckets=dict(d.get("buckets", {})),
-        )
+        """The inverse of :meth:`to_dict`, for untrusted input.
+
+        Besides strict fields and types, the whole spec must be consistent: the signature agrees
+        with the args, constants sit at the constexpr indices, attrs are exactly the pointers and
+        the runtime scalars with a divisibility precondition (value ``[["tt.divisibility", 16]]``),
+        ``num_warps`` is a power of two up to 32 and ``block`` follows it, the launch parameters
+        are the non-constexpr args plus the two zero scratch slots, the Triton reference is
+        ``module.path:identifier``, and the grid parses under a restricted grammar (ints, this
+        spec's dimension names, ``cdiv(a, b)``, ``+ - * //``, parentheses; it is never evaluated).
+        Any violation is a :class:`TilefishSpecError`.
+        """
+        with _malformed():
+            validate_spec(d)
+            return cls(
+                stem=d["stem"],
+                op=d["op"],
+                triton=d["triton"]["ref"],
+                signature=dict(d["signature"]),
+                constants={_key_from_str(k): decode_scalar(v, "constant") for k, v in d["constants"].items()},
+                attrs={_key_from_str(k): copy.deepcopy(v) for k, v in d["attrs"].items()},
+                num_warps=d["num_warps"],
+                num_stages=d["num_stages"],
+                grid=d["grid"],
+                block=tuple(d["block"]),  # type: ignore[arg-type]
+                launch_params=tuple(LaunchParam.from_dict(p) for p in d["launch_params"]),
+                preconditions=tuple(Precondition.from_dict(p) for p in d["preconditions"]),
+                args=tuple(ArgSpec.from_dict(a) for a in d["args"]),
+                buckets=dict(d["buckets"]),
+            )
 
     @classmethod
     def from_json(cls, text: str) -> "CompileSpec":
-        return cls.from_dict(json.loads(text))
+        """Parse strict JSON (``NaN`` and ``Infinity`` literals are rejected) and validate it like :meth:`from_dict`."""
+
+        def reject(constant: str) -> Any:
+            raise TilefishSpecError(f"malformed compile spec: the JSON constant {constant} is not allowed")
+
+        with _malformed():
+            doc = json.loads(text, parse_constant=reject)
+        return cls.from_dict(doc)
 
 
 def _bucket_dims(op: ExternOp) -> list[Dim]:
