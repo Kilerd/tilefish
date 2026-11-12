@@ -25,12 +25,15 @@ _SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 
 
 def _require_value(op: str, label: str, x: Any) -> Value:
-    """Check that ``x`` is a readable traced tensor and return its newest version."""
+    """Check that ``x`` is a readable traced tensor and return the version a read sees now.
+
+    A parameter reads its newest version; a value that an in-place call or a store consumed cannot be read.
+    """
     if not isinstance(x, Value):
         raise TilefishTypeError(f"{op}: {label} must be a traced tensor value, got {type(x).__name__} ({x!r})")
     if x.access == "out":
         raise TilefishTypeError(f"{op}: {label} reads Out parameter '{x.name}', which is write-only")
-    return x.live
+    return x._current(f"{op}: {label}")
 
 
 def _require_computable(op: str, label: str, x: Value, *, floating: bool = False) -> DType:
@@ -181,7 +184,14 @@ def sqrt(x: Value) -> Value:
 
 
 def cast(x: Value, dtype: DType) -> Value:
-    """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point."""
+    """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point.
+
+    A cast to the dtype the tensor already has emits no node and behaves exactly like reading the
+    tensor at that point: it returns the version that is current at the time of the cast, and that
+    version does not follow later updates: a later in-place call or store into the parameter consumes
+    it, and reading it then raises (the updated tensor is its ``.live``). This holds before a
+    parameter's first store as well as after it.
+    """
     x = _require_value("to", "the tensor", x)
     if isinstance(dtype, BlockScaled) or isinstance(x.dtype, BlockScaled):
         raise TilefishTypeError(
@@ -190,7 +200,7 @@ def cast(x: Value, dtype: DType) -> Value:
     if not isinstance(dtype, DType):
         raise TilefishTypeError(f"to: expected a dtype such as f32 or bf16, got {dtype!r}")
     if dtype == x.dtype:
-        return x
+        return x._reference()
     rounding = x.dtype.is_narrowing_to(dtype)
     (out,) = x.ctx.emit("cast", [x], {"to": dtype, "rounding": rounding}, [x.type.with_dtype(dtype)])
     return out
@@ -254,6 +264,11 @@ def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
     Splitting along a non-leading axis gives *views* (slabs at an offset with
     the parent's strides), typed non-contiguous: they can feed traced
     elementwise and reduction ops but cannot be passed to a declared operator.
+
+    A chunk is a value, even where its type says "view": an in-place call on a chunk (a call that takes
+    it as an ``InOut`` argument) consumes that chunk and produces a new version of the chunk. It does
+    **not** change the parent, which keeps its own version, and the siblings are untouched. Lowering
+    copies; there is no write-through to the parent.
     """
     x = _require_value("split", "the tensor", x)
     if isinstance(axis, bool) or not isinstance(axis, int) or not -x.rank <= axis < x.rank:
@@ -366,6 +381,18 @@ def store(target: Any, key: Any, value: Any) -> None:
     the parameter see; ``value`` itself is untouched, and later in-place
     updates of ``value`` or of the parameter do not affect each other. A
     read-only input can never become writable through a store.
+
+    The store node takes the parameter's *current* version as its first input and the stored value as
+    its second, so consecutive versions are linked by dataflow (``store(%v1, %src)`` produces ``%v2``)
+    and their order never rests on node order alone. Storing a parameter into itself (``x[...] = x``)
+    is a copy onto itself: it is recorded like any store, but it is not a write, so it does not satisfy
+    a kernel's check that every ``Out``/``InOut`` parameter is written.
+
+    A store overwrites the buffer of the version it replaces, so that version is *consumed*, exactly as
+    by an in-place call: reading an older version of the parameter afterwards (a ``.live`` taken
+    earlier, a no-op cast of the parameter) raises and points to ``.live``, instead of needing a hidden
+    copy at lowering time. The name of the parameter follows its newest version. The stored ``value`` is
+    only copied and is not consumed (``x[...] = x`` is the one case where it is the replaced version).
     """
     if not isinstance(target, Value):
         raise TilefishTypeError(f"store: target must be a traced tensor, got {type(target).__name__}")
@@ -385,8 +412,14 @@ def store(target: Any, key: Any, value: Any) -> None:
         elif value.dtype != target.dtype:
             hint = "; stores do not cast implicitly, use .to(dtype)"
         raise TilefishTypeError(f"store into '{target.name}': expected {target.type}, got {value.type}{hint}")
+    current = target.live  # the version this store replaces (for an Out parameter, which has no versions: itself)
     versions = [target.type] if target.access == "inout" else []
-    outs = target.ctx.emit("store", [target, value], {"target": target.name}, versions)
-    target.ctx.written.add(target)
+    outs = target.ctx.emit("store", [current, value], {"target": target.name}, versions)
+    if value is not current:  # `x[...] = x` copies a tensor onto itself: a node, but not a write
+        target.ctx.written.add(target)
     if outs:
+        # the store overwrites the buffer of the version it replaces: that version is consumed, like by an
+        # in-place call (a stored value is only copied, not consumed). The name of the parameter follows.
+        current._consumed_by = (target.ctx.nodes[-1], target.name)
+        current._latest = outs[0]
         target._latest = outs[0]

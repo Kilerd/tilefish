@@ -6,7 +6,14 @@ types, then cross-field consistency (the signature agrees with the args, the
 constants sit at the constexpr indices, the attributes are backed by
 preconditions, the launch parameters follow the args, ...). Every violation is
 a :class:`~tilefish.errors.TilefishSpecError`. Grid and dimension strings are
-parsed with a small restricted grammar and never evaluated.
+parsed with a small restricted grammar and never evaluated as code (the grid is
+folded with the dimension algebra, so a static entry below 1 is rejected, as
+``compile_specs`` does).
+
+This checks that a spec is well formed and consistent with itself, not that it
+is the spec of any declaration: for that, ``CompileSpec.verify_against(op)``
+regenerates it. Schema 1 documents are still read; schema 2 adds the
+``declaration_digest`` and the constexpr ``dtype``.
 """
 
 from __future__ import annotations
@@ -15,10 +22,13 @@ import math
 import re
 from typing import Any
 
+from .dims import Dim, DimExpr, cdiv
 from .dtypes import ALL_DTYPES
-from .errors import TilefishSpecError
+from .errors import TilefishError, TilefishSpecError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # what to_dict writes: schema 1 plus constexpr dtypes and the declaration digest
+LEGACY_SCHEMA = 1  # still read, but such a spec has no declaration digest and cannot be verified
+SCHEMAS = (LEGACY_SCHEMA, SCHEMA_VERSION)
 ALIGNMENT = 16
 NUM_WARPS = (1, 2, 4, 8, 16, 32)
 MAX_STAGES = 16
@@ -27,6 +37,7 @@ _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 _STEM = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
 _REF = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*):([A-Za-z_][A-Za-z0-9_]*)\Z")
 _INDEX = re.compile(r"^[0-9]{1,6}\Z")
+_DIGEST = re.compile(r"^[0-9a-f]{64}\Z")
 _TOKEN = re.compile(r"[ ]*([0-9]{1,12}|[A-Za-z_][A-Za-z0-9_]*|//|[-+*(),])")
 
 POINTER_TYPES = {d.triton_ptr for d in ALL_DTYPES.values()}
@@ -36,6 +47,7 @@ TOP_KEYS = (
     "schema stem op triton buckets args signature constants attrs num_warps num_stages grid block "
     "launch_params preconditions"
 ).split()
+TOP_KEYS_V2 = [*TOP_KEYS, "declaration_digest"]
 PRE_FIELDS = {
     "pointer_alignment": {"arg", "index", "bytes"},
     "divisible": {"arg", "index", "dim", "by"},
@@ -103,7 +115,13 @@ def same_scalar(a: Any, b: Any) -> bool:
 
 
 class _ExprParser:
-    """ints, identifiers, ``cdiv(a, b)``, ``+ - * //``, unary minus, parentheses. Never evaluated."""
+    """ints, identifiers, ``cdiv(a, b)``, ``+ - * //``, unary minus, parentheses. Never evaluated as code.
+
+    Alongside the check, every sub-expression is folded with the same dimension algebra that
+    ``compile_specs`` uses (:class:`~tilefish.dims.DimExpr`), so a grid entry that is a constant,
+    including ``1 - 1`` or ``n - n``, is known. Its methods return the folded value, or ``None`` when
+    the expression is outside the affine language (two symbolic factors, an inexact ``//``).
+    """
 
     MAX_LEN, MAX_TOKENS, MAX_DEPTH = 512, 256, 24
 
@@ -140,42 +158,64 @@ class _ExprParser:
         if self.peek() is not None:
             bad(f"{self.where} {self.text!r}: unexpected {self.peek()!r}")
 
-    def expr(self, depth: int = 0) -> None:
-        self.term(depth)
+    def _fold(self, fn: Any, *operands: "DimExpr | None") -> "DimExpr | None":
+        """Apply a dimension operation; ``None`` when an operand is opaque or the result is not affine."""
+        if any(o is None for o in operands):
+            return None
+        try:
+            return fn(*operands)
+        except TilefishError:
+            return None
+
+    def _positive_divisor(self, divisor: "DimExpr | None", what: str) -> None:
+        if divisor is not None and divisor.is_static and divisor.value < 1:
+            bad(f"{self.where} {self.text!r}: {what} by {divisor.value} (the divisor must be positive)")
+
+    def expr(self, depth: int = 0) -> "DimExpr | None":
+        acc = self.term(depth)
         while self.peek() in ("+", "-"):
-            self.take()
-            self.term(depth)
+            op = self.take()
+            rhs = self.term(depth)
+            acc = self._fold((lambda a, b: a + b) if op == "+" else (lambda a, b: a - b), acc, rhs)
+        return acc
 
-    def term(self, depth: int) -> None:
-        self.factor(depth)
+    def term(self, depth: int) -> "DimExpr | None":
+        acc = self.factor(depth)
         while self.peek() in ("*", "//"):
-            self.take()
-            self.factor(depth)
+            op = self.take()
+            rhs = self.factor(depth)
+            if op == "*":
+                acc = self._fold(lambda a, b: a * b, acc, rhs)
+            else:
+                self._positive_divisor(rhs, "division")
+                acc = self._fold(lambda a, b: a // b, acc, rhs)
+        return acc
 
-    def factor(self, depth: int) -> None:
+    def factor(self, depth: int) -> "DimExpr | None":
         if depth > self.MAX_DEPTH:
             bad(f"{self.where} is nested too deeply")
         tok = self.take()
         if tok == "-":
-            return self.factor(depth + 1)
+            return self._fold(lambda a: -a, self.factor(depth + 1))
         if tok.isascii() and tok.isdigit():
-            return None
+            return DimExpr.const(int(tok))
         if tok == "(":
-            self.expr(depth + 1)
+            inner = self.expr(depth + 1)
             self.take(")")
-            return None
+            return inner
         if _IDENT.match(tok):
             if tok == "cdiv":
                 self.take("(")
-                self.expr(depth + 1)
+                num = self.expr(depth + 1)
                 self.take(",")
-                self.expr(depth + 1)
+                den = self.expr(depth + 1)
                 self.take(")")
-            elif self.peek() == "(":
+                self._positive_divisor(den, "cdiv")
+                return self._fold(cdiv, num, den)
+            if self.peek() == "(":
                 bad(f"{self.where} {self.text!r}: only cdiv(a, b) may be called, not {tok}(...)")
-            else:
-                self.ids.add(tok)
-            return None
+            self.ids.add(tok)
+            return Dim(tok)
         return bad(f"{self.where} {self.text!r}: unexpected {tok!r}")
 
 
@@ -188,13 +228,15 @@ def parse_expression(text: Any, where: str) -> "set[str]":
 
 
 def parse_grid(text: Any) -> "set[str]":
-    """Check a grid such as ``(M,)`` or ``(cdiv(S, 16), 32)``; return its identifiers."""
+    """Check a grid such as ``(M,)`` or ``(cdiv(S, 16), 32)``; return its identifiers.
+
+    Like ``compile_specs``, it rejects a static entry below 1 (``(0,)``, ``(-1,)``, ``(n - n, 4)``).
+    """
     p = _ExprParser(text, "grid")
     p.take("(")
-    entries, trailing = 0, False
+    entries, trailing = [], False
     while True:
-        p.expr()
-        entries += 1
+        entries.append(p.expr())
         if p.peek() == ",":
             p.take()
             if p.peek() == ")":
@@ -204,10 +246,13 @@ def parse_grid(text: Any) -> "set[str]":
             break
     p.take(")")
     p.done()
-    if not 1 <= entries <= 3:
+    if not 1 <= len(entries) <= 3:
         bad(f"grid {text!r} must have 1 to 3 entries")
-    if entries == 1 and not trailing:
+    if len(entries) == 1 and not trailing:
         bad(f"grid {text!r}: a single entry needs a trailing comma, like (n,)")
+    for position, entry in enumerate(entries):
+        if entry is not None and entry.is_static and entry.value < 1:
+            bad(f"grid {text!r}: entry {position} is the static size {entry.value}; grid sizes must be at least 1")
     return p.ids
 
 
@@ -238,7 +283,8 @@ def validate_precondition(d: Any) -> None:
             bad(f"bucket precondition buckets must be a sorted list of distinct positive ints, got {b!r}")
 
 
-def validate_arg(d: Any) -> None:
+def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
+    """Check one serialized argument. From schema 2 on a constexpr may carry its declared ``dtype``."""
     _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "dim", "value"])
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
@@ -251,7 +297,8 @@ def validate_arg(d: Any) -> None:
         "scalar": {"dtype", "dim"},
         "constexpr": {"value"},
     }[kind]
-    if present != expected:
+    optional = {"dtype"} if kind == "constexpr" and schema >= SCHEMA_VERSION else set()
+    if not expected <= present <= expected | optional:
         bad(f"arg {d['name']} ({kind}) must have exactly the fields {sorted(expected)}, has {sorted(present)}")
     if kind == "pointer":
         dtype = ALL_DTYPES.get(d["dtype"]) if isinstance(d["dtype"], str) else None
@@ -271,6 +318,8 @@ def validate_arg(d: Any) -> None:
         if ty != "constexpr":
             bad(f"arg {d['name']}: a constexpr's type must be 'constexpr', got {ty!r}")
         decode_scalar(d["value"], f"arg {d['name']} value")
+        if "dtype" in d and (not isinstance(d["dtype"], str) or d["dtype"] not in ALL_DTYPES):
+            bad(f"arg {d['name']}: a constexpr's dtype must be one of {sorted(ALL_DTYPES)}, got {d['dtype']!r}")
 
 
 def validate_launch_param(d: Any) -> None:
@@ -286,9 +335,14 @@ def validate_spec(d: Any) -> None:
     """Strict structure, then cross-field consistency of a serialized compile spec."""
     if not isinstance(d, dict):
         bad(f"a spec must be an object, got {type(d).__name__}")
-    if d.get("schema") != SCHEMA_VERSION:
-        raise TilefishSpecError(f"unsupported compile spec schema {d.get('schema')!r} (expected {SCHEMA_VERSION})")
-    _keys(d, "spec", TOP_KEYS)
+    schema = d.get("schema")
+    if not is_int(schema) or schema not in SCHEMAS:
+        raise TilefishSpecError(
+            f"unsupported compile spec schema {schema!r} (this version reads schemas {LEGACY_SCHEMA} and {SCHEMA_VERSION})"
+        )
+    _keys(d, "spec", TOP_KEYS_V2 if schema >= SCHEMA_VERSION else TOP_KEYS)
+    if schema >= SCHEMA_VERSION and not (isinstance(d["declaration_digest"], str) and _DIGEST.match(d["declaration_digest"])):
+        bad(f"declaration_digest must be 64 lowercase hex digits (a sha256), got {d['declaration_digest']!r}")
 
     # names
     op = _ident(d["op"], "op")
@@ -320,7 +374,7 @@ def validate_spec(d: Any) -> None:
     names: list[str] = []
     dims: set[str] = set(buckets)
     for position, a in enumerate(args):
-        validate_arg(a)
+        validate_arg(a, schema)
         if a["index"] != position:
             bad(f"arg {a['name']} has index {a['index']} but is at position {position}")
         names.append(a["name"])

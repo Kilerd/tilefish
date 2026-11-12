@@ -260,6 +260,67 @@ def test_anything_outside_the_grammar_is_rejected_and_never_evaluated(grid):
     rejects(lambda d: d.update(grid=grid))
 
 
+@pytest.mark.parametrize(
+    "grid",
+    [
+        "(0,)",
+        "(-1,)",
+        "(4, 0)",
+        "(2, 2, -3)",
+        "(1 - 1,)",
+        "(2 - 3, 4)",
+        "(-(2),)",
+        "(cdiv(0, 4),)",
+        "(0 // 4,)",
+        "(0 * 5, 1)",
+        "(n - n,)",  # cancels to the static size 0
+        "(S, n - n - 1)",
+        "(2 * n - 2 * n,)",
+        "(cdiv(n - n, 16),)",
+        "(" + "0" * 12 + ",)",
+    ],
+)
+def test_a_static_grid_entry_below_one_is_rejected_like_compile_specs_does(grid):
+    rejects(lambda d: d.update(grid=grid), "grid sizes must be at least 1")
+    with pytest.raises(TilefishSpecError, match="grid sizes must be at least 1"):
+        parse_grid(grid)
+
+
+def test_the_validator_and_compile_specs_agree_on_static_grids():
+    def declare(grid):
+        @tilefish.extern(triton="m:f", grid=grid)
+        def e(x: Tensor[n, bf16]): ...
+
+        return e
+
+    for sizes in [(1,), (0,), (-1,), (4, 0), (8, 1, 1), (2, 2, -3)]:
+        text = "(" + ", ".join(map(str, sizes)) + ("," if len(sizes) == 1 else "") + ")"
+        if min(sizes) >= 1:
+            assert declare(sizes).grid_string == text
+            assert CompileSpec.from_dict(tampered(lambda d: d.update(grid=text))).grid == text
+        else:
+            with pytest.raises(tilefish.TilefishDeclarationError, match="grid sizes must be at least 1"):
+                declare(sizes)
+            rejects(lambda d: d.update(grid=text), "grid sizes must be at least 1")
+
+    # a bucket that makes an entry static is caught when the spec is generated
+    @tilefish.extern(triton="m:f", grid=lambda S: (S - 16,))
+    def at_zero(x: Tensor[S, bf16], B: const = S): ...
+
+    with pytest.raises(TilefishSpecError, match="non-positive size 0"):
+        compile_specs(at_zero)
+
+
+@pytest.mark.parametrize("grid", ["(1,)", "(n - n + 1,)", "(2 - 1, 4)", "(S - 1, 1)", "(cdiv(1, 4),)", "(cdiv(n, 16), 1)", "(n * 0 + 3,)"])
+def test_static_grid_entries_of_at_least_one_and_symbolic_entries_are_accepted(grid):
+    assert CompileSpec.from_dict(tampered(lambda d: d.update(grid=grid))).grid == grid
+
+
+@pytest.mark.parametrize("grid", ["(S // 0,)", "(cdiv(S, 0),)", "(cdiv(S, -4),)", "(S // -2,)", "(1 // 0, 1)"])
+def test_dividing_by_a_non_positive_constant_is_malformed(grid):
+    rejects(lambda d: d.update(grid=grid), "the divisor must be positive")
+
+
 def test_grid_identifiers_must_be_dimensions_of_this_spec():
     rejects(lambda d: d.update(grid="(S, m)"), "not dimensions of this spec")
     rejects(lambda d: d.update(grid="(cdiv(Q, 2),)"), "not dimensions of this spec")

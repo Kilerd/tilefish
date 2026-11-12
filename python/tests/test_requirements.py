@@ -590,3 +590,38 @@ def test_an_out_param_cannot_be_passed_as_a_call_argument():
         @tilefish.kernel
         def as_inout(x: Tensor[M, bf16], y: Out[Tensor[M, bf16]]):
             two_in_one_out(x, y)
+
+
+# -- requirement texts are unambiguous -----------------------------------------------------------------------------------------------
+
+
+def test_requirement_texts_parenthesize_everything_that_is_not_a_single_dimension():
+    B, S, L = Dim("B"), Dim("S"), Dim("L", divisible_by=4)
+    cases = [
+        (B, 32, "B % 32 == 0"),
+        (L, 8, "L % 8 == 0"),
+        (2 * B + 16, 32, "(2*B + 16) % 32 == 0"),
+        (2 * B, 16, "(2*B) % 16 == 0"),
+        (B + S, 8, "(B + S) % 8 == 0"),
+        (B - 1, 8, "(B - 1) % 8 == 0"),
+        (-B, 8, "(-B) % 8 == 0"),
+        (tilefish.cdiv(B, 4), 8, "cdiv(B, 4) % 8 == 0"),
+        (tilefish.cdiv(B, 4) + 1, 8, "(cdiv(B, 4) + 1) % 8 == 0"),
+    ]
+    for dim, divisor, want in cases:
+        assert str(Requirement(dim, divisor, "somewhere")) == f"{want}  (required by somewhere)"
+
+
+def test_a_requirement_on_a_compound_dimension_prints_with_parentheses_in_the_graph_dump():
+    Bq = Dim("Bq")
+
+    @tilefish.library("needs_32")
+    def needs_32(x: Tensor[K, bf16]) -> Tensor[K, bf16]: ...
+
+    @tilefish.graph
+    def h(x: Tensor[2 * Bq + 16, bf16]):
+        return needs_32(x)
+
+    (req,) = h.graph.requirements
+    assert str(req) == "(2*Bq + 16) % 32 == 0  (required by needs_32: argument 'x')"
+    assert "  requires (2*Bq + 16) % 32 == 0  (required by needs_32: argument 'x')" in str(h.graph)

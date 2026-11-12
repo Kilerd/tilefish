@@ -476,7 +476,7 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
     unifier = _Unifier(op, ctx)
     inputs: list[Value] = []
     seen: dict[int, tuple[str, str]] = {}  # id of the live value -> (parameter, access)
-    inout_args: list[tuple[Param, Value]] = []
+    inout_args: list[tuple[Param, Value, Value]] = []  # parameter, the argument as given, the version it reads
     for p in sig.tensor_inputs:
         arg = arguments[p.name]
         pt = p.type
@@ -495,7 +495,7 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
                 f"{op.name}: argument '{p.name}' is written in place but '{arg.name}' is a read-only input; "
                 "declare it InOut[...] in the enclosing signature"
             )
-        live = arg.live
+        live = arg._current(f"{op.name}: argument '{p.name}'")  # raises for a value an in-place call consumed
         other = seen.get(id(live))
         if other is not None and "inout" in (other[1], p.access):
             raise TilefishTypeError(
@@ -522,7 +522,7 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
             unifier.add(p.name, axis, pd, ad, at)
         inputs.append(live)
         if p.access == "inout":
-            inout_args.append((p, arg))
+            inout_args.append((p, arg, live))
     unifier.solve()
 
     consts: dict[str, Any] = {}
@@ -544,18 +544,24 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
     for p in sig.tensor_outputs:
         out_types.append(unifier.instantiate(p.type, f"Out parameter '{p.name}'"))  # type: ignore[arg-type]
     n_results = len(out_types)
-    for p, _ in inout_args:
+    for p, _, _ in inout_args:
         out_types.append(unifier.instantiate(p.type, f"InOut parameter '{p.name}'"))  # type: ignore[arg-type]
 
     attrs: dict[str, Any] = {"kind": op.kind, **op.node_attrs()}
     if consts:
         attrs["consts"] = consts
     if inout_args:
-        attrs["inout"] = tuple(p.name for p, _ in inout_args)
+        attrs["inout"] = tuple(p.name for p, _, _ in inout_args)
     outs = ctx.emit(op.name, inputs, attrs, out_types)
-    for (_, arg), version in zip(inout_args, outs[n_results:]):
-        arg._latest = version  # reading the argument now reads the updated tensor
-        ctx.written.add(arg)
+    node = ctx.nodes[-1]
+    for (p, arg, read), version in zip(inout_args, outs[n_results:]):
+        # The call consumes the version it read and replaces it: a temporary, a chunk or an older version
+        # is a value, so reading it again raises; a parameter's name follows its newest version.
+        read._consumed_by = (node, p.name)
+        read._latest = version
+        if arg is not read and arg._pinned is None:
+            arg._latest = version  # the parameter's name now reads the updated tensor
+        ctx.written.update((arg, read))
     results = outs[:n_results]
     if not results:
         return None

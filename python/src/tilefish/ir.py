@@ -43,7 +43,9 @@ class Requirement:
     origin: str
 
     def __str__(self) -> str:
-        return f"{self.dim} % {self.divisor} == 0  (required by {self.origin})"
+        # `%` binds tighter than `+`: a sum or a scaled dimension needs parentheses to read as intended
+        dim = str(self.dim) if self.dim.is_atom else f"({self.dim})"
+        return f"{dim} % {self.divisor} == 0  (required by {self.origin})"
 
 
 @dataclass(frozen=True)
@@ -77,10 +79,21 @@ class Node:
     (``library``/``extern``/``kernel``/``graph``).
 
     A call's ``outputs`` are the declared return values, then the ``Out``
-    parameters, then one new version of each ``InOut`` argument (after the
-    call, reading that argument reads the new version). A ``store`` into an
-    ``InOut`` parameter has one output, the parameter's new version (a store
-    copies its value; it has no output for an ``Out`` parameter).
+    parameters, then one new version of each ``InOut`` argument. The call
+    *consumes* the version of each ``InOut`` argument it takes as an input and
+    replaces it with the new one: after the call, the argument's name (for a
+    parameter) reads the new version, and any other value that was consumed
+    can no longer be read. The consumed input is the argument's *current*
+    version, so consecutive updates form a chain through the inputs and
+    outputs of the nodes that write it. Updating a split chunk in place
+    produces a new version of the chunk only; the parent is not modified.
+
+    A ``store`` into a parameter has the target's current version as its first
+    input and the stored value as its second (``store(%current, %value)``). For
+    an ``InOut`` parameter it has one output, the parameter's new version; like
+    an in-place call it consumes the version it replaces (the stored value is
+    only copied, not consumed); for an ``Out`` parameter, which has no
+    versions, it has no output.
     """
 
     __slots__ = ("op", "inputs", "attrs", "outputs")
