@@ -11,6 +11,12 @@ classifiers = ["Development Status :: 1 - Planning"]
 [project.urls]
 Repository = "https://github.com/Kilerd/tilefish"
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14"]
 build-backend = "uv_build"
