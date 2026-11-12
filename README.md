@@ -55,7 +55,7 @@ def residual_add_rmsnorm(
 ) -> Tensor[M, D, bf16]:
     r = residual + x.to(f32)
     residual[...] = r
-    rstd = tilefish.rsqrt(tilefish.mean(r * r, axis=-1) + eps)
+    rstd = tilefish.rsqrt(tilefish.mean(r * r, axis=-1, keepdims=True) + eps)
     return (r * rstd * w.to(f32)).to(bf16)      # the only rounding point
 
 # An existing hand-written kernel, unchanged, given a type.
@@ -63,7 +63,8 @@ n = Dim("n", divisible_by=16)
 
 @tilefish.extern(triton=my_kernels.gelu, num_warps=4,
                  grid=lambda n: (tilefish.cdiv(n, 1024),))
-def gelu(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]]): ...
+def gelu(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]],
+         n_elem: n, BLOCK: const = 1024): ...
 
 # A library operator: opaque body, typed signature, pluggable epilogue.
 @tilefish.library("gemm", acc=f32)
