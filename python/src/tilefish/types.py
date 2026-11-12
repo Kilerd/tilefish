@@ -16,9 +16,11 @@ class TensorType:
     """The type of a tensor: a shape of dimension expressions and a dtype.
 
     Tensors are row-major; the type has no stride component yet, only the
-    flag ``contiguous``. A value is non-contiguous when it is a *view* into
-    another tensor, which is what splitting along a non-leading axis gives (a
-    slab at a byte offset with the parent's strides). Views may flow into
+    flag ``contiguous``, which also promises a pointer aligned to 16 bytes (the
+    contract of every declared operator's pointer arguments). A value is
+    non-contiguous when it is a *view* into another tensor: a split along a
+    non-leading axis (a slab with the parent's strides), or a chunk that does
+    not provably start on a 16-byte boundary. Views may flow into
     traced elementwise and reduction ops, but cannot be passed to a declared
     operator until strided views arrive. All comparison goes through
     :meth:`_key`, so real strides can replace the flag without touching callers.

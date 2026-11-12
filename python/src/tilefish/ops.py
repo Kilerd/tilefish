@@ -8,9 +8,10 @@ There is no implicit promotion between tensor dtypes; python scalars and
 
 from __future__ import annotations
 
-from typing import Any
+import math
+from typing import Any, Sequence
 
-from .dims import DimExpr, as_dim, describe_pair
+from .dims import DimExpr, as_dim, cdiv, describe_pair
 from .dtypes import BlockScaled, DType
 from .errors import TilefishError, TilefishTypeError
 from .ir import Scalar
@@ -283,26 +284,88 @@ def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
                 f"split: axis {axis} of {x.type} has size {dim}, which is not a whole number of chunks of size {chunk}"
             )
         sizes = [chunk] * count
-    # A slab along axis ax is contiguous only when everything before that axis has size 1.
-    contiguous = x.type.contiguous and all(d.is_static and d.value == 1 for d in x.shape[:ax])
+    # A slab along axis ax is contiguous only when everything before that axis has size 1, and it is a
+    # contiguous *aligned* tensor only when it starts on a 16-byte boundary (the contract of every pointer).
+    dense = x.type.contiguous and all(d.is_static and d.value == 1 for d in x.shape[:ax])
     out_types = []
     for s in sizes:
         shape = list(x.shape)
         shape[ax] = s
         try:
-            out_types.append(TensorType(shape, x.dtype, known=x.ctx.known, contiguous=contiguous))
+            out_types.append(TensorType(shape, x.dtype, known=x.ctx.known, contiguous=dense))
         except TilefishError as e:
             raise TilefishTypeError(f"split: chunk type is invalid: {e}") from None
+    if dense:
+        aligned = _aligned_chunks(x, ax, sizes)
+        out_types = [t if ok else t.as_view() for t, ok in zip(out_types, aligned)]
     return x.ctx.emit("split", [x], {"axis": ax, "sizes": tuple(sizes)}, out_types)
+
+
+def _mul(a: "DimExpr | None", b: "DimExpr | None") -> "DimExpr | None":
+    """Product of two affine dimensions, or ``None`` when it is not affine (two symbolic factors)."""
+    if a is None or b is None:
+        return None
+    try:
+        return a * b
+    except TilefishTypeError:
+        return None
+
+
+def _product(dims: "Sequence[DimExpr]") -> "DimExpr | None":
+    out: DimExpr | None = DimExpr.const(1)
+    for d in dims:
+        out = _mul(out, d)
+    return out
+
+
+def _starts_aligned(offset: "DimExpr | None", bits: int, known: Any) -> bool:
+    """Whether ``offset`` elements of ``bits`` bits provably span a multiple of 16 bytes."""
+    if offset is None:
+        return False
+    return offset.is_divisible_by(128 // math.gcd(bits, 128), known)
+
+
+def _aligned_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> list[bool]:
+    """For a split of a dense tensor, whether each chunk starts on a 16-byte boundary.
+
+    A chunk starts ``(sizes before it) * (product of the dims after the axis)`` elements in. For a
+    block-scaled tensor the scale tensor's chunk must be aligned as well.
+    """
+    t = x.type
+    dtype = t.dtype
+    data_bits = dtype.elem.bits if isinstance(dtype, BlockScaled) else dtype.bits
+    known = x.ctx.known
+    inner = _product(t.shape[ax + 1 :])
+    scale_inner = None
+    blocked = None
+    if isinstance(dtype, BlockScaled):
+        blocked = dtype.normalized_axis(t.rank)
+        scale_inner = _product(dtype.scale_shape(t.shape, known)[ax + 1 :])
+    flags: list[bool] = []
+    before = DimExpr.const(0)
+    for size in sizes:
+        ok = before.is_static and before.value == 0  # the first chunk starts at the tensor's own (aligned) pointer
+        if not ok:
+            ok = _starts_aligned(_mul(before, inner), data_bits, known)
+            if ok and isinstance(dtype, BlockScaled):
+                scale_before = as_dim(cdiv(before, dtype.block)) if ax == blocked else before
+                ok = _starts_aligned(_mul(scale_before, scale_inner), dtype.scale.bits, known)
+        flags.append(ok)
+        before = before + size
+    return flags
 
 
 # -- stores ----------------------------------------------------------------------------
 
 
 def store(target: Any, key: Any, value: Any) -> None:
-    """``param[...] = value``: write ``value`` into an ``InOut``/``Out`` parameter.
+    """``param[...] = value``: copy ``value`` into an ``InOut``/``Out`` parameter.
 
-    Afterwards, reading an ``InOut`` parameter reads ``value``.
+    A store has copy semantics. For an ``InOut`` parameter the store node
+    yields a fresh value, the parameter's new version, which later reads of
+    the parameter see; ``value`` itself is untouched, and later in-place
+    updates of ``value`` or of the parameter do not affect each other. A
+    read-only input can never become writable through a store.
     """
     if not isinstance(target, Value):
         raise TilefishTypeError(f"store: target must be a traced tensor, got {type(target).__name__}")
@@ -322,7 +385,8 @@ def store(target: Any, key: Any, value: Any) -> None:
         elif value.dtype != target.dtype:
             hint = "; stores do not cast implicitly, use .to(dtype)"
         raise TilefishTypeError(f"store into '{target.name}': expected {target.type}, got {value.type}{hint}")
-    target.ctx.emit("store", [target, value], {"target": target.name}, [])
+    versions = [target.type] if target.access == "inout" else []
+    outs = target.ctx.emit("store", [target, value], {"target": target.name}, versions)
     target.ctx.written.add(target)
-    if target.access == "inout" and value is not target:
-        target._latest = value
+    if outs:
+        target._latest = outs[0]
