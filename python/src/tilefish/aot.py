@@ -28,7 +28,9 @@ Conventions (all from the declaration, nothing guessed at compile time):
 * In JSON, a non-finite float is the tagged value ``{"float": "inf"}`` /
   ``"-inf"`` / ``"nan"``, so the output is always strict JSON.
 * A constexpr declared ``const[f32]`` records its dtype (``"dtype": "f32"``), so it differs from
-  an untyped ``const`` with the same value after a round trip.
+  an untyped ``const`` with the same value after a round trip. Its compiled-in value follows the
+  dtype: a float dtype is always a float (``const[f32] = S`` in bucket 16 is ``16.0``), an integer
+  dtype always an int (a non-integral value is an error). An untyped ``const`` keeps its value as is.
 
 A spec that was read back from JSON is not trusted: ``from_dict`` checks that it is well formed
 and self-consistent, which does not mean it is the spec of any particular declaration (a
@@ -477,6 +479,31 @@ def _canonical_dtype(t: Any) -> Any:
     return {"name": t.name, "kind": t.kind, "bits": t.bits, "pointer": t.triton_ptr, "scalar": t.triton_scalar}
 
 
+def _typed_const(op_name: str, p: Any, value: Any) -> Any:
+    """The compiled-in value of a constexpr, following its declared dtype (an untyped const is unchanged).
+
+    ``const[f32]`` is always a float (``16`` from a bucket becomes ``16.0``); an integer dtype is always an
+    int, and a value with a fractional part or no finite value is rejected.
+    """
+    dtype = p.const_dtype
+    if dtype is None or isinstance(value, bool):
+        return value
+    try:
+        if dtype.is_float:
+            return float(value)
+        if dtype.is_int:
+            if isinstance(value, float) and not value.is_integer():
+                raise TilefishSpecError(
+                    f"extern op '{op_name}': constexpr '{p.name}' is const[{dtype}] but its value {value!r} is not an integer"
+                )
+            return int(value)
+    except OverflowError:
+        raise TilefishSpecError(
+            f"extern op '{op_name}': constexpr '{p.name}': the value {value!r} does not fit const[{dtype}]"
+        ) from None
+    return value
+
+
 def _canonical_value(v: Any) -> Any:
     """A constexpr default, tagged with its python type: ``True``, ``1`` and ``1.0`` are three different constants."""
     if v is MISSING:
@@ -513,7 +540,10 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
             entry["dim"] = _canonical_dim(p.dim)
         else:
             entry["dtype"] = None if p.const_dtype is None else _canonical_dtype(p.const_dtype)
-            entry["default"] = _canonical_value(p.default)
+            # a scalar default is hashed as the typed value a spec compiles in; a dimension expression is
+            # resolved per bucket (and typed then), so it is hashed with its dtype above
+            typed = p.default if isinstance(p.default, DimExpr) or p.default is MISSING else _typed_const(op.name, p, p.default)
+            entry["default"] = _canonical_value(typed)
         params.append(entry)
     return {
         "format": DIGEST_FORMAT,
@@ -600,6 +630,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                 if not resolved.is_static:  # pragma: no cover - _bucket_dims rejects this earlier
                     raise TilefishSpecError(f"extern op '{op.name}': constexpr '{p.name}' is not static: {resolved}")
                 value = resolved.value
+            value = _typed_const(op.name, p, value)  # const[f32] = S compiles in 16.0, not 16
             signature[p.name] = "constexpr"
             constants[(i,)] = value
             dtype = None if p.const_dtype is None else str(p.const_dtype)  # the declared const[dtype], if any
