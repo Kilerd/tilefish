@@ -9,6 +9,8 @@ coefficients, normalized so that structurally equal expressions compare equal
 
 A static :class:`Dim` (``Dim("D", 2560)``) is just a named constant: it
 participates in arithmetic as its value and compares equal to that value.
+Anything that is rendered for a host (grid expressions, shapes in a manifest)
+uses :meth:`DimExpr.folded`, which replaces a static ``Dim`` by its value.
 """
 
 from __future__ import annotations
@@ -25,6 +27,11 @@ def _is_int(x: Any) -> bool:
 
 def _lcm(a: int, b: int) -> int:
     return a * b // math.gcd(a, b)
+
+
+def _is_tf_operand(x: Any) -> bool:
+    """Traced tensors and consts mark themselves so a dimension defers to their reflected operators."""
+    return bool(getattr(type(x), "_tf_operand", False))
 
 
 class DimExpr:
@@ -57,6 +64,9 @@ class DimExpr:
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(f"{type(self).__name__} is immutable")
 
+    def __reduce__(self) -> Any:
+        return (_rebuild_expr, (self._terms, self._const))
+
     # -- inspection ---------------------------------------------------------
 
     @property
@@ -72,6 +82,19 @@ class DimExpr:
 
     def __int__(self) -> int:
         return self.value
+
+    def __index__(self) -> int:
+        if self._terms:
+            raise TilefishTypeError(
+                f"dimension {self} is symbolic and cannot be used as an integer (range(), indexing, ...)"
+            )
+        return self._const
+
+    def folded(self) -> "DimExpr":
+        """The same dimension with a static ``Dim`` replaced by its plain value (names do not leak to hosts)."""
+        if not self._terms and type(self) is not DimExpr:
+            return DimExpr.const(self._const)
+        return self
 
     @property
     def terms(self) -> "tuple[tuple[DimExpr, int], ...]":
@@ -136,6 +159,8 @@ class DimExpr:
                 repl = mapping.get(atom, atom)
             else:
                 repl = atom._subst_atom(mapping)
+            if coef == 1 and not self._const and len(self._terms) == 1:
+                return as_dim(repl)  # a lone atom becomes its replacement as is (a static Dim keeps its name)
             acc = acc + as_dim(repl) * coef
         return acc
 
@@ -196,19 +221,27 @@ class DimExpr:
             terms[atom] = terms.get(atom, 0) + sign * coef
         return DimExpr._make(terms, self._const + sign * other._const)
 
+    def _bad_operand(self, symbol: str, other: Any) -> Any:
+        if _is_tf_operand(other):
+            return NotImplemented  # let the tensor's reflected operator handle it
+        raise TilefishTypeError(
+            f"cannot apply '{symbol}' to dimension {self} and {type(other).__name__} {other!r}: "
+            "dimensions combine with ints and other dimensions"
+        )
+
     def __add__(self, other: Any) -> "DimExpr":
         o = _coerce(other)
-        return NotImplemented if o is None else self._combine(o, 1)
+        return self._bad_operand("+", other) if o is None else self._combine(o, 1)
 
     __radd__ = __add__
 
     def __sub__(self, other: Any) -> "DimExpr":
         o = _coerce(other)
-        return NotImplemented if o is None else self._combine(o, -1)
+        return self._bad_operand("-", other) if o is None else self._combine(o, -1)
 
     def __rsub__(self, other: Any) -> "DimExpr":
         o = _coerce(other)
-        return NotImplemented if o is None else o._combine(self, -1)
+        return self._bad_operand("-", other) if o is None else o._combine(self, -1)
 
     def __neg__(self) -> "DimExpr":
         return DimExpr._make({a: -c for a, c in self._terms}, -self._const)
@@ -219,7 +252,7 @@ class DimExpr:
     def __mul__(self, other: Any) -> "DimExpr":
         o = _coerce(other)
         if o is None:
-            return NotImplemented
+            return self._bad_operand("*", other)
         if o.is_static:
             k = o._const
             return DimExpr._make({a: c * k for a, c in self._terms}, self._const * k)
@@ -235,7 +268,7 @@ class DimExpr:
     def __floordiv__(self, other: Any) -> "DimExpr":
         o = _coerce(other)
         if o is None:
-            return NotImplemented
+            return self._bad_operand("//", other)
         if not o.is_static or o._const <= 0:
             raise TilefishTypeError(f"cannot divide {self} by {o}: the divisor must be a positive static int")
         if self.is_static:
@@ -246,6 +279,58 @@ class DimExpr:
                 f"{self} // {o} is not an affine expression (not provably exact); use cdiv() instead"
             )
         return q
+
+    # Operators that are not part of the affine language: a clear error instead of a bare TypeError.
+
+    def _unsupported(self, what: str, hint: str) -> Any:
+        raise TilefishTypeError(f"{what} on dimension {self} is not supported in M1; {hint}")
+
+    def __truediv__(self, other: Any) -> Any:
+        return self._unsupported("true division (/)", "use // for an exact division or tilefish.cdiv(a, b)")
+
+    def __rtruediv__(self, other: Any) -> Any:
+        return self._unsupported("true division (/)", "use // for an exact division or tilefish.cdiv(a, b)")
+
+    def __rfloordiv__(self, other: Any) -> Any:
+        return self._unsupported("floor division by a dimension (//)", "dimension arithmetic is affine")
+
+    def __mod__(self, other: Any) -> Any:
+        if self.is_static and _coerce(other) is not None and _coerce(other).is_static:  # type: ignore[union-attr]
+            return DimExpr.const(self._const % _coerce(other)._const)  # type: ignore[union-attr]
+        return self._unsupported("modulo (%)", "ask is_divisible_by(k) instead")
+
+    def __rmod__(self, other: Any) -> Any:
+        return self._unsupported("modulo (%)", "dimension arithmetic is affine")
+
+    def __pow__(self, other: Any) -> Any:
+        return self._unsupported("exponentiation (**)", "dimension arithmetic is affine")
+
+    def __rpow__(self, other: Any) -> Any:
+        return self._unsupported("exponentiation (**)", "dimension arithmetic is affine")
+
+    def __abs__(self) -> Any:
+        return self._unsupported("abs()", "dimension arithmetic is affine")
+
+    def __float__(self) -> Any:
+        return self._unsupported("float()", "use .value on a static dimension")
+
+    def _compare(self, other: Any, symbol: str, test: Any) -> Any:
+        o = _coerce(other)
+        if o is not None and self.is_static and o.is_static:
+            return test(self._const, o._const)
+        return self._unsupported(f"comparison ({symbol})", "only static dimensions can be ordered; use == for equality")
+
+    def __lt__(self, other: Any) -> Any:
+        return self._compare(other, "<", lambda a, b: a < b)
+
+    def __le__(self, other: Any) -> Any:
+        return self._compare(other, "<=", lambda a, b: a <= b)
+
+    def __gt__(self, other: Any) -> Any:
+        return self._compare(other, ">", lambda a, b: a > b)
+
+    def __ge__(self, other: Any) -> Any:
+        return self._compare(other, ">=", lambda a, b: a >= b)
 
     # -- comparison / hashing ----------------------------------------------
 
@@ -284,6 +369,10 @@ class DimExpr:
         return f"DimExpr({self})"
 
 
+def _rebuild_expr(terms: "tuple[tuple[DimExpr, int], ...]", const: int) -> DimExpr:
+    return DimExpr._make(dict(terms), const)
+
+
 class _CDiv(DimExpr):
     """Ceiling division that could not be folded to an affine expression."""
 
@@ -294,6 +383,9 @@ class _CDiv(DimExpr):
         object.__setattr__(self, "den", den)
         object.__setattr__(self, "_terms", ((self, 1),))
         object.__setattr__(self, "_const", 0)
+
+    def __reduce__(self) -> Any:
+        return (_CDiv, (self.num, self.den))
 
     def _atom_key(self) -> tuple:
         return ("cdiv", self.num._key, self.den._key)
@@ -320,6 +412,14 @@ class Dim(DimExpr):
     at every call; a static ``Dim`` is a literal. In a ``graph`` signature the
     dynamic dims are the graph's symbolic inputs. Two dynamic dims are the
     same dimension when name, ``divisible_by`` and ``buckets`` all agree.
+
+    **Bucket semantics are exact.** A binary built for bucket ``b`` is
+    compiled for, and must be launched with, a dimension equal to exactly
+    ``b``: the host picks the smallest bucket that is at least the real size
+    and pads its buffers up to it (padding is the host's job, not tilefish's).
+    In an ahead-of-time spec the bucketed dim is replaced by ``b`` in the grid,
+    in the shapes and in every constant derived from it, and the spec carries a
+    ``bucket`` precondition ``dim == b``.
     """
 
     __slots__ = ("name", "divisible_by", "buckets")
@@ -344,7 +444,14 @@ class Dim(DimExpr):
         if buckets is not None:
             if value is not None:
                 raise TilefishDeclarationError(f"Dim {name!r}: a static dim cannot also have buckets")
-            bucket_tuple = tuple(buckets)
+            if isinstance(buckets, (str, bytes)):
+                raise TilefishDeclarationError(f"Dim {name!r}: buckets must be a list of ints, got {buckets!r}")
+            try:
+                bucket_tuple = tuple(buckets)
+            except TypeError:
+                raise TilefishDeclarationError(
+                    f"Dim {name!r}: buckets must be a list of ints such as [32, 64, 128], got {buckets!r}"
+                ) from None
             if not bucket_tuple:
                 raise TilefishDeclarationError(f"Dim {name!r}: buckets must not be empty")
             if any(not _is_int(b) or b < 1 for b in bucket_tuple):
@@ -375,6 +482,9 @@ class Dim(DimExpr):
             object.__setattr__(self, "_terms", ((self, 1),))
             object.__setattr__(self, "_const", 0)
 
+    def __reduce__(self) -> Any:
+        return (_rebuild_dim, (self.name, self._const if self.is_static else None, self.divisible_by, self.buckets))
+
     def _atom_key(self) -> tuple:
         return ("dim", self.name, self.divisible_by or 0, self.buckets or ())
 
@@ -399,6 +509,10 @@ class Dim(DimExpr):
         return f"Dim({', '.join(parts)})"
 
 
+def _rebuild_dim(name: str, value: "int | None", divisible_by: "int | None", buckets: "tuple[int, ...] | None") -> Dim:
+    return Dim(name, value, divisible_by=divisible_by, buckets=buckets)
+
+
 def _coerce(x: Any) -> DimExpr | None:
     if isinstance(x, DimExpr):
         return x
@@ -420,13 +534,13 @@ def cdiv(a: Any, b: Any) -> Any:
 
     Ints give an int. With dimension expressions the result folds to a static
     value or an exact affine quotient when it can, and is a symbolic
-    ``cdiv(a, b)`` node otherwise.
+    ``cdiv(a, b)`` node otherwise. A static ``Dim`` operand counts as its value.
     """
     if _is_int(a) and _is_int(b):
         if b <= 0:
             raise TilefishTypeError(f"cdiv: divisor must be positive, got {b}")
         return -(-a // b)
-    da, db = as_dim(a), as_dim(b)
+    da, db = as_dim(a).folded(), as_dim(b).folded()
     if db.is_static:
         if db._const <= 0:
             raise TilefishTypeError(f"cdiv: divisor must be positive, got {db}")
@@ -442,3 +556,23 @@ def cdiv(a: Any, b: Any) -> Any:
         if k is not None:
             return DimExpr.const(k)
     return _CDiv(da, db)
+
+
+def dim_text(d: DimExpr) -> str:
+    """Readable text for a dimension; a constrained symbolic ``Dim`` shows its constraints."""
+    if isinstance(d, Dim) and d.is_dynamic and (d.divisible_by is not None or d.buckets is not None):
+        return repr(d)
+    return str(d)
+
+
+def describe_pair(a: DimExpr, b: DimExpr) -> tuple[str, str]:
+    """Texts for two dimensions that differ, spelling out constraints when the names alone would not tell them apart."""
+    ta, tb = str(a), str(b)
+    if ta != tb:
+        return dim_text(a), dim_text(b)
+
+    def detailed(d: DimExpr) -> str:
+        free = sorted(d.free_dims(), key=lambda x: x.name)
+        return repr(d) if isinstance(d, Dim) else f"{d} with " + ", ".join(repr(f) for f in free)
+
+    return detailed(a), detailed(b)

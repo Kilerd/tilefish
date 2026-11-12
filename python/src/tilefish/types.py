@@ -15,15 +15,20 @@ AnyDType = Union[DType, BlockScaled]
 class TensorType:
     """The type of a tensor: a shape of dimension expressions and a dtype.
 
-    Tensors are contiguous and row-major; the type has no stride component
-    yet. All comparison goes through :meth:`_key`, so a layout can be added to
-    the key later without touching callers.
+    Tensors are row-major; the type has no stride component yet, only the
+    flag ``contiguous``. A value is non-contiguous when it is a *view* into
+    another tensor, which is what splitting along a non-leading axis gives (a
+    slab at a byte offset with the parent's strides). Views may flow into
+    traced elementwise and reduction ops, but cannot be passed to a declared
+    operator until strided views arrive. All comparison goes through
+    :meth:`_key`, so real strides can replace the flag without touching callers.
     """
 
-    __slots__ = ("shape", "dtype")
+    __slots__ = ("shape", "dtype", "contiguous")
 
     shape: tuple[DimExpr, ...]
     dtype: AnyDType
+    contiguous: bool
 
     def __init__(
         self,
@@ -31,6 +36,7 @@ class TensorType:
         dtype: AnyDType,
         *,
         known: "Mapping[DimExpr, int] | None" = None,
+        contiguous: bool = True,
     ) -> None:
         if not isinstance(dtype, (DType, BlockScaled)):
             raise TilefishDeclarationError(
@@ -49,6 +55,7 @@ class TensorType:
             dims.append(dim)
         object.__setattr__(self, "shape", tuple(dims))
         object.__setattr__(self, "dtype", dtype)
+        object.__setattr__(self, "contiguous", bool(contiguous))
         if isinstance(dtype, BlockScaled):
             dtype.check_shape(self.shape, known)
 
@@ -74,10 +81,20 @@ class TensorType:
         return None
 
     def with_dtype(self, dtype: AnyDType) -> "TensorType":
+        """The same shape with another dtype, as a fresh contiguous tensor."""
         return TensorType(self.shape, dtype)
 
     def with_shape(self, shape: Sequence[Any]) -> "TensorType":
+        """Another shape of the same dtype, as a fresh contiguous tensor."""
         return TensorType(shape, self.dtype)
+
+    def as_view(self) -> "TensorType":
+        """The same shape and dtype as a non-contiguous view."""
+        return TensorType(self.shape, self.dtype, contiguous=False)
+
+    def materialized(self) -> "TensorType":
+        """The same shape and dtype as a fresh contiguous tensor."""
+        return self if self.contiguous else TensorType(self.shape, self.dtype)
 
     def free_dims(self) -> frozenset:
         out: frozenset = frozenset()
@@ -87,7 +104,10 @@ class TensorType:
 
     def _key(self) -> tuple:
         dtype = self.dtype.normalized(self.rank) if isinstance(self.dtype, BlockScaled) else self.dtype
-        return (self.shape, dtype)
+        return (self.shape, dtype, self.contiguous)
+
+    def __reduce__(self) -> Any:
+        return (_rebuild_tensor_type, (self.shape, self.dtype, self.contiguous))
 
     def __eq__(self, other: Any) -> bool:
         if not isinstance(other, TensorType):
@@ -98,9 +118,14 @@ class TensorType:
         return hash(self._key())
 
     def __repr__(self) -> str:
-        return "Tensor[" + ", ".join([*(str(d) for d in self.shape), str(self.dtype)]) + "]"
+        head = "Tensor" if self.contiguous else "View"
+        return head + "[" + ", ".join([*(str(d) for d in self.shape), str(self.dtype)]) + "]"
 
     __str__ = __repr__
+
+
+def _rebuild_tensor_type(shape: Any, dtype: AnyDType, contiguous: bool) -> TensorType:
+    return TensorType(shape, dtype, contiguous=contiguous)
 
 
 class Tensor:

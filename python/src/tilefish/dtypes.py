@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .errors import TilefishDeclarationError, TilefishTypeError
 
@@ -82,10 +82,24 @@ class DType:
         """True when casting ``self`` -> ``dst`` can round, saturate or truncate."""
         return dst != self and not dst.can_represent(self)
 
+    def __reduce__(self) -> Any:
+        fields = (
+            self.name, self.bits, self.kind, self.triton_ptr, self.triton_scalar,
+            self.exp_bits, self.man_bits, self.signed, self.computable,
+        )  # fmt: skip
+        return (_rebuild_dtype, fields)
+
     def __repr__(self) -> str:
         return self.name
 
     __str__ = __repr__
+
+
+def _rebuild_dtype(*fields: Any) -> DType:
+    """Unpickling and deep copies of a built-in dtype give back the dtype object itself."""
+    built = DType(*fields)
+    canonical = ALL_DTYPES.get(built.name)
+    return canonical if canonical == built else built
 
 
 bf16 = DType("bf16", 16, "float", "*bf16", "bf16", exp_bits=8, man_bits=7)

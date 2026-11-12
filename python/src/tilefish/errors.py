@@ -20,3 +20,7 @@ class TilefishDeclarationError(TilefishError, ValueError):
 
 class TilefishSpecError(TilefishError, ValueError):
     """A declaration cannot be turned into an ahead-of-time compile spec."""
+
+
+class TilefishAttributeError(TilefishError, AttributeError):
+    """An attribute or method that traced values do not have (in M1)."""
