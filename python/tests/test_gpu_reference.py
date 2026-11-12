@@ -1,5 +1,6 @@
-"""``replay`` against ``reference``, on a real GPU: the binaries agree with the torch interpretation of the IR
-within a documented tolerance, per golden.
+"""``replay`` against ``reference``, on a real GPU: the prebuilt binaries of a manifest directory agree with the
+torch interpretation of the IR within a documented tolerance, per golden. (``jit`` runs the same machine code, see
+``test_gpu_byte_identity.py``, so the numbers hold for it too.)
 
 The reference follows the numerics contract of ``tilefish.lower`` node by node (casts only where the IR has
 them, math in the IR's dtypes, scalars rounded to the tensor's dtype, a constant divisor as a multiply by
@@ -53,6 +54,7 @@ from gpu_util import differing, error, randn, same_bytes  # noqa: E402
 from lower_cases import gelu_exact, layernorm, softmax, swiglu  # noqa: E402
 
 import tilefish  # noqa: E402
+from tilefish import runtime  # noqa: E402
 
 BF16, F32 = torch.bfloat16, torch.float32
 SEEDS = (0, 1, 2)
@@ -67,12 +69,18 @@ def rmsnorm():
     return ns["residual_add_rmsnorm"]
 
 
-def both(op, *args):
-    """The binary's result and the reference's, from the same inputs; in-place tensors are returned too."""
+@pytest.fixture(scope="module")
+def manifest(tmp_path_factory, rmsnorm):
+    """The five goldens built into a manifest directory, as a host would load them."""
+    return runtime.export([softmax, layernorm, rmsnorm, gelu_exact, swiglu], tmp_path_factory.mktemp("goldens")).parent
+
+
+def both(manifest, op, *args):
+    """The replayed binary's result and the reference's, from the same inputs; in-place tensors are returned too."""
     out = {}
     for mode in ("replay", "reference"):
         clones = [a.clone() if torch.is_tensor(a) else a for a in args]
-        out[mode] = (tilefish.run(op, *clones, mode=mode), clones)
+        out[mode] = (tilefish.run(op, *clones, mode=mode, **({"manifest": manifest} if mode == "replay" else {})), clones)
     return out
 
 
@@ -81,10 +89,10 @@ def report(name, e):
     print(f"{name}: max ULP {ulp}, max abs error {absolute:.3g}, {count} of {total} elements differ")
 
 
-def test_softmax():
+def test_softmax(manifest):
     worst = [0, 0.0]
     for seed in SEEDS:
-        r = both(softmax, randn((257, 1000), F32, seed, scale=3.0))
+        r = both(manifest, softmax, randn((257, 1000), F32, seed, scale=3.0))
         e = error(r["replay"][0], r["reference"][0])
         report(f"softmax seed {seed}", e)
         worst = [max(worst[0], e[0]), max(worst[1], e[1])]
@@ -93,19 +101,19 @@ def test_softmax():
     assert worst[0] <= 64 and worst[1] <= 5e-7
 
 
-def test_layernorm():
+def test_layernorm(manifest):
     for seed in SEEDS:
         args = (randn((257, 768), BF16, seed), randn((768,), BF16, seed + 100), randn((768,), BF16, seed + 200))
-        r = both(layernorm, *args)
+        r = both(manifest, layernorm, *args)
         e = error(r["replay"][0], r["reference"][0])
         report(f"layernorm seed {seed}", e)
         assert e[0] <= 2 and e[1] <= 2 ** -6 and e[2] <= 0.001 * e[3]
 
 
-def test_residual_add_rmsnorm(rmsnorm):
+def test_residual_add_rmsnorm(rmsnorm, manifest):
     for seed in SEEDS:
         args = (randn((257, 2560), BF16, seed), randn((257, 2560), F32, seed + 50), randn((2560,), BF16, seed + 100))
-        r = both(rmsnorm, *args)
+        r = both(manifest, rmsnorm, *args)
         e_out = error(r["replay"][0], r["reference"][0])
         e_residual = error(r["replay"][1][1], r["reference"][1][1])
         report(f"rmsnorm out seed {seed}", e_out)
@@ -115,25 +123,25 @@ def test_residual_add_rmsnorm(rmsnorm):
         assert same_bytes(r["replay"][1][1], r["reference"][1][1])
 
 
-def test_gelu_exact():
+def test_gelu_exact(manifest):
     for seed in SEEDS:
-        r = both(gelu_exact, randn((1 << 20,), BF16, seed, scale=3.0))
+        r = both(manifest, gelu_exact, randn((1 << 20,), BF16, seed, scale=3.0))
         e = error(r["replay"][0], r["reference"][0])
         report(f"gelu seed {seed}", e)
         assert e[1] <= 3e-5 and e[2] <= 0.03 * e[3]
 
 
-def test_swiglu():
+def test_swiglu(manifest):
     for seed in SEEDS:
-        r = both(swiglu, randn((257, 3072), BF16, seed, scale=2.0), randn((257, 3072), BF16, seed + 100))
+        r = both(manifest, swiglu, randn((257, 3072), BF16, seed, scale=2.0), randn((257, 3072), BF16, seed + 100))
         e = error(r["replay"][0], r["reference"][0])
         report(f"swiglu seed {seed}", e)
         assert e[0] <= 2 and e[1] <= 2 ** -6 and e[2] <= 0.001 * e[3]
 
 
-def test_the_reference_is_deterministic_and_does_not_depend_on_the_binary():
+def test_the_reference_is_deterministic_and_does_not_depend_on_the_binary(manifest):
     args = (randn((17, 1000), F32, 0, scale=3.0),)
     a = tilefish.run(softmax, *args, mode="reference")
     b = tilefish.run(softmax, *args, mode="reference")
     assert same_bytes(a, b)
-    assert differing(a, tilefish.run(softmax, *args, mode="replay")) > 0
+    assert differing(a, tilefish.run(softmax, *args, mode="replay", manifest=manifest)) > 0

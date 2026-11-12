@@ -1,16 +1,21 @@
 """The central claim of tilefish's Python side, on a real GPU: ``replay`` runs the exact machine code that a C++
 or Rust host would load, and it agrees byte for byte with ``jit``.
 
-``jit`` launches the Triton JIT function; ``replay`` builds the cubin from the compile spec (``aot.build``),
-loads it with ``cuModuleLoadData`` and launches it with ``cuLaunchKernel`` and the ABI of the manifest. Both
-get the same inputs; the outputs *and* the tensors that are updated in place are compared as raw bytes
-(``t.view(torch.uint8)``, ``torch.equal``), over several shapes and seeds, for
+``jit`` builds the current source through its compile spec (``aot.build``, in memory) and launches the binary
+through the CUDA driver; ``replay`` loads the prebuilt cubins of a manifest directory (``runtime.export``), checks
+them against the digests of the manifest and launches them through the same driver path. Both get the same inputs;
+the outputs *and* the tensors that are updated in place are compared as raw bytes (``t.view(torch.uint8)``,
+``torch.equal``), over several shapes and seeds, for
 
 * the five goldens of the lowering (softmax, layernorm, the README's residual add + rmsnorm with its
   ``InOut`` tensor, the exact gelu, swiglu),
 * a row kernel with a bucketed row length, over each of its buckets (one binary per bucket, no padding),
 * two hand-written Triton kernels declared with ``extern`` (an rmsnorm and an exact-erf gelu), and an
   in-place ``y += alpha * x``.
+
+The other half of the gate is the machine code: a cubin that ``jit`` builds has the ``sha256_code`` of the one in
+the manifest, also when the manifest was written by another process from another directory
+(``test_gpu_build.py``). Triton's native JIT launcher is compared too, as a test-only helper (``native_jit.py``).
 """
 
 import pytest
@@ -24,6 +29,7 @@ pytest.importorskip("cuda.bindings.driver")
 import gpu_kernels  # noqa: E402
 from conftest import REPO_ROOT, make_my_kernels, readme_snippet  # noqa: E402
 from gpu_util import randn, same_bytes  # noqa: E402
+from native_jit import native_jit  # noqa: E402
 from lower_cases import M, T, gelu_exact, layernorm, softmax, swiglu  # noqa: E402
 
 import tilefish  # noqa: E402
@@ -139,18 +145,31 @@ def tensors_of(result):
     return list(result) if isinstance(result, tuple) else [result]
 
 
-def run_in(mode, op, args):
+@pytest.fixture(scope="module")
+def exported(tmp_path_factory):
+    """``exported(op)``: the manifest directory with every binary of ``op``, built once per operator."""
+    cache = {}
+
+    def get(op):
+        if id(op) not in cache:
+            cache[id(op)] = runtime.export(op, tmp_path_factory.mktemp("manifest")).parent
+        return cache[id(op)]
+
+    return get
+
+
+def run_in(mode, op, args, runner=None, **kw):
     """Run on clones of the arguments (so that every mode starts from the same bytes); return the results and the clones."""
     clones = [a.clone() if torch.is_tensor(a) else a for a in args]
-    return tilefish.run(op, *clones, mode=mode), clones
+    return (runner or (lambda *a, **k: tilefish.run(op, *a, mode=mode, **k)))(*clones, **kw), clones
 
 
 @pytest.mark.parametrize("name, op, make, size, seed", list(all_runs()))
-def test_jit_and_replay_agree_byte_for_byte(name, op, make, size, seed, request):
+def test_jit_and_replay_agree_byte_for_byte(name, op, make, size, seed, request, exported):
     op = request.getfixturevalue("readme_kernel") if op == "readme" else op()
     args = make(size, seed)
     jit, jit_args = run_in("jit", op, args)
-    replay, replay_args = run_in("replay", op, args)
+    replay, replay_args = run_in("replay", op, args, manifest=exported(op))
 
     outs_jit, outs_replay = tensors_of(jit), tensors_of(replay)
     assert len(outs_jit) == len(outs_replay)
@@ -169,100 +188,150 @@ def test_jit_and_replay_agree_byte_for_byte(name, op, make, size, seed, request)
             assert not same_bytes(a, original), f"{name}: the in-place argument '{pname}' was not updated"
 
 
-def test_replay_runs_a_built_cubin_not_the_jit_function():
+def test_jit_builds_in_memory_and_replay_loads_the_manifests_cubin(tmp_path):
+    from tilefish import _cuda
+
     args = args_softmax(7, 0)
     runtime.clear_caches()
     assert not runtime._builds
     tilefish.run(softmax, *args, mode="jit")
-    assert not runtime._builds  # jit builds nothing
-    tilefish.run(softmax, *args, mode="replay")
-    (built,) = runtime._builds.values()
-    assert built.cubin[:4] == b"\x7fELF" and built.symbol == "tf_softmax"
-    from tilefish import _cuda
+    (built,) = runtime._builds.values()  # jit built the current source through its spec, in memory ...
+    assert built.cubin[:4] == b"\x7fELF" and built.symbol == "tf_softmax" and built.ptx.startswith("//")
+    assert [k.built.sha256 for k in _cuda._loaded.values()] == [built.sha256]  # ... and launched that binary
+    assert not list(tmp_path.iterdir())  # nothing is written
 
-    assert [k.built.sha256 for k in _cuda._loaded.values()] == [built.sha256]  # that cubin is what was loaded
+    directory = runtime.export(softmax, tmp_path).parent
+    runtime.clear_caches()
+    tilefish.run(softmax, *args, mode="replay", manifest=directory)
+    assert not runtime._builds  # replay builds nothing
+    (loaded,) = _cuda._loaded.values()
+    assert loaded.built.cubin == (directory / built.cubin_name).read_bytes()
+    assert loaded.built.ptx == ""  # the manifest carries the cubin, not the PTX
+    assert loaded.built.sha256_code == built.sha256_code  # the same machine code as the in-memory build
 
 
-def test_op_run_and_lowered_run_are_the_same_as_tilefish_run():
+def test_triton_native_jit_computes_the_same_bytes_too(exported):
+    """Triton's own launcher specializes on argument values, so this is a comparison, not a mode."""
+    for name, op, make, sizes in cases():
+        if op == "readme" or name.startswith(("out_and", "renamed")):
+            continue
+        fn = op()
+        args = make(sizes[1], 0)
+        native, native_args = run_in("jit", fn, args, runner=lambda *a, fn=fn: native_jit(fn, *a))
+        replay, replay_args = run_in("replay", fn, args, manifest=exported(fn))
+        for a, b in zip(tensors_of(native) + native_args, tensors_of(replay) + replay_args):
+            assert same_bytes(a, b), name
+
+
+@pytest.fixture
+def go(exported):
+    """``go(mode, op, *args, **kw)``: ``tilefish.run`` in a mode, with the manifest of the operator for ``replay``."""
+
+    def call(mode, op, *args, **kw):
+        if mode == "replay":
+            kw["manifest"] = exported(op)
+        return tilefish.run(op, *args, mode=mode, **kw)
+
+    return call
+
+
+def test_op_run_and_lowered_run_are_the_same_as_tilefish_run(exported):
     args = args_layernorm(5, 3)
-    a = tilefish.run(layernorm, *args, mode="replay")
-    assert same_bytes(a, layernorm.run(*args, mode="replay"))
-    assert same_bytes(a, layernorm.lower().run(*args, mode="replay"))
+    manifest = exported(layernorm)
+    a = tilefish.run(layernorm, *args, mode="replay", manifest=manifest)
+    assert same_bytes(a, layernorm.run(*args, mode="replay", manifest=manifest))
+    assert same_bytes(a, layernorm.lower().run(*args, mode="replay", manifest=manifest))
     assert same_bytes(a, tilefish.run(layernorm.lower(), *args, mode="jit"))
+    assert same_bytes(a, layernorm.run(*args))  # jit is the default mode
 
 
-def test_results_are_returned_as_in_a_trace():
+def test_results_are_returned_as_in_a_trace(go):
     x = randn((64,), F32, 0)
-    returned, out = tilefish.run(out_and_return, x, mode="replay")  # the returned value, then the Out tensor
-    assert same_bytes(returned, x - 0.5) and same_bytes(out, x * 2.0 + 1.0)
-    (only,) = [tilefish.run(gpu_kernels.gelu_erf, randn((16,), BF16, 0), mode="replay")]  # an extern: its Out tensors
-    assert only.shape == (16,) and only.dtype == BF16
+    for mode in ("jit", "replay"):
+        returned, out = go(mode, out_and_return, x)  # the returned value, then the Out tensor
+        assert same_bytes(returned, x - 0.5) and same_bytes(out, x * 2.0 + 1.0)
+        only = go(mode, gpu_kernels.gelu_erf, randn((16,), BF16, 0))  # an extern: its Out tensors
+        assert only.shape == (16,) and only.dtype == BF16
 
 
-def test_the_cuda_stream_is_torchs_current_stream():
-    # replay launches on torch's current stream, so it orders with torch's own kernels without a synchronize
+@pytest.mark.parametrize("mode", ["jit", "replay"])
+def test_the_cuda_stream_is_torchs_current_stream(mode, go):
+    # both modes launch on torch's current stream, so they order with torch's own kernels without a synchronize
     x = randn((1 << 20,), BF16, 1, scale=3.0)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())  # x exists before the side stream reads it
     with torch.cuda.stream(stream):
         y = x * 1.0
-        out = tilefish.run(gpu_kernels.gelu_erf, y, mode="replay")
+        out = go(mode, gpu_kernels.gelu_erf, y)
         z = out.float() + 1.0
     stream.synchronize()
     expected = tilefish.run(gpu_kernels.gelu_erf, x, mode="jit").float() + 1.0
     assert same_bytes(z, expected)
 
 
+def test_a_manifest_is_required_by_replay_and_only_by_replay(exported):
+    from tilefish import TilefishRuntimeError
+
+    x = randn((16,), BF16, 0)
+    with pytest.raises(TilefishRuntimeError, match="replay runs prebuilt cubins from a manifest directory"):
+        tilefish.run(gpu_kernels.gelu_erf, x, mode="replay")
+    with pytest.raises(TilefishRuntimeError, match="manifest= is for mode='replay'"):
+        tilefish.run(gpu_kernels.gelu_erf, x, mode="jit", manifest=exported(gpu_kernels.gelu_erf))
+    with pytest.raises(TilefishRuntimeError, match="manifest= is for mode='replay'"):
+        tilefish.run(layernorm, *args_layernorm(2, 0), mode="reference", manifest=exported(layernorm))
+
+
 # -- preconditions, on real tensors ---------------------------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("mode", ["jit", "replay"])
-def test_a_misaligned_pointer_is_refused_before_launch(mode):
+def test_a_misaligned_pointer_is_refused_before_launch(mode, go):
     base = randn((64 + 8,), BF16, 0)
     misaligned = base[4 : 4 + 64]  # 8 bytes past a 16-byte boundary
     assert misaligned.data_ptr() % 16 == 8
     with pytest.raises(TilefishPreconditionError, match="not aligned to 16 bytes") as e:
-        tilefish.run(gpu_kernels.gelu_erf, misaligned, mode=mode)
+        go(mode, gpu_kernels.gelu_erf, misaligned)
     assert e.value.kind == "pointer_alignment"
 
 
 @pytest.mark.parametrize("mode", ["jit", "replay"])
-def test_a_size_that_is_not_a_bucket_is_refused_there_is_no_padding(mode):
+def test_a_size_that_is_not_a_bucket_is_refused_there_is_no_padding(mode, go):
     x, w = args_bucketed(96)(3, 0)
-    tilefish.run(bucketed_rms, x, w, mode=mode)
+    go(mode, bucketed_rms, x, w)
     with pytest.raises(TilefishPreconditionError, match="no padding") as e:
-        tilefish.run(bucketed_rms, randn((3, 100), BF16, 0), randn((100,), BF16, 1), mode=mode)
+        go(mode, bucketed_rms, randn((3, 100), BF16, 0), randn((100,), BF16, 1))
     assert e.value.kind == "bucket"
     assert "[96, 512, 1000]" in str(e.value)
 
 
 @pytest.mark.parametrize("mode", ["jit", "replay"])
-def test_other_preconditions_are_refused_too(mode):
+def test_other_preconditions_are_refused_too(mode, go):
     x = randn((60,), BF16, 0)
     with pytest.raises(TilefishPreconditionError, match="divisible_by=16") as e:
-        tilefish.run(gpu_kernels.gelu_erf, x, mode=mode)
+        go(mode, gpu_kernels.gelu_erf, x)
     assert e.value.kind == "divisible"
     with pytest.raises(TilefishPreconditionError, match="dtype") as e:
-        tilefish.run(gpu_kernels.gelu_erf, randn((64,), F32, 0), mode=mode)
+        go(mode, gpu_kernels.gelu_erf, randn((64,), F32, 0))
     assert e.value.kind == "dtype"
     with pytest.raises(TilefishPreconditionError, match="not contiguous") as e:
-        tilefish.run(gpu_kernels.gelu_erf, randn((64, 2), BF16, 0)[:, 0], mode=mode)
+        go(mode, gpu_kernels.gelu_erf, randn((64, 2), BF16, 0)[:, 0])
     assert e.value.kind == "contiguous"
     with pytest.raises(TilefishPreconditionError, match="requires 2048") as e:
-        tilefish.run(gpu_kernels.rmsnorm, randn((3, 2000), BF16, 0), randn((2000,), BF16, 1), mode=mode)
+        go(mode, gpu_kernels.rmsnorm, randn((3, 2000), BF16, 0), randn((2000,), BF16, 1))
     assert e.value.kind == "static_size"
     with pytest.raises(TilefishPreconditionError, match="overlaps") as e:
         a = randn((64,), F32, 0)
-        tilefish.run(gpu_kernels.axpy, a, a, mode=mode)
+        go(mode, gpu_kernels.axpy, a, a)
     assert e.value.kind == "alias"
     with pytest.raises(TilefishTypeError, match="cannot be changed"):
-        tilefish.run(gpu_kernels.rmsnorm, *args_rmsnorm_extern(3, 0), EPS=1e-3, mode=mode)
+        go(mode, gpu_kernels.rmsnorm, *args_rmsnorm_extern(3, 0), EPS=1e-3)
 
 
-def test_cpu_tensors_do_not_run_on_a_binary():
+def test_cpu_tensors_do_not_run_on_a_binary(go):
     from tilefish import TilefishRuntimeError
 
-    with pytest.raises(TilefishRuntimeError, match="CUDA device"):
-        tilefish.run(gpu_kernels.gelu_erf, torch.zeros(16, dtype=BF16), mode="replay")
+    for mode in ("jit", "replay"):
+        with pytest.raises(TilefishRuntimeError, match="CUDA device"):
+            go(mode, gpu_kernels.gelu_erf, torch.zeros(16, dtype=BF16))
     with pytest.raises(TilefishPreconditionError, match="different devices"):
-        tilefish.run(layernorm, torch.zeros(2, 768, dtype=BF16), randn((768,), BF16, 0), randn((768,), BF16, 1), mode="jit")
+        go("jit", layernorm, torch.zeros(2, 768, dtype=BF16), randn((768,), BF16, 0), randn((768,), BF16, 1))

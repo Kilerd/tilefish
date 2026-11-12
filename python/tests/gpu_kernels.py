@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 import tilefish
-from tilefish import Dim, InOut, Out, Tensor, bf16, const, f32
+from tilefish import Dim, InOut, Out, Tensor, bf16, const, f32, i32, i64, u8
 
 # -- an rmsnorm over rows of a static width ------------------------------------------------------------------------------------
 
@@ -61,6 +61,42 @@ Count = Dim("Count", divisible_by=16)
 
 @tilefish.extern(triton=gelu_erf_kernel, num_warps=4, grid=lambda Count: (tilefish.cdiv(Count, 1024),))
 def gelu_erf(x_ptr: Tensor[Count, bf16], y_ptr: Out[Tensor[Count, bf16]], n_elements: Count, *, BLOCK: const = 1024): ...
+
+
+# -- float to integer casts, as Triton does them ---------------------------------------------------------------------------------------
+
+
+@triton.jit
+def cast_to_u8_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    tl.store(y_ptr + offsets, tl.load(x_ptr + offsets, mask=mask).to(tl.uint8), mask=mask)
+
+
+@triton.jit
+def cast_to_i32_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    tl.store(y_ptr + offsets, tl.load(x_ptr + offsets, mask=mask).to(tl.int32), mask=mask)
+
+
+@triton.jit
+def cast_to_i64_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elements
+    tl.store(y_ptr + offsets, tl.load(x_ptr + offsets, mask=mask).to(tl.int64), mask=mask)
+
+
+@tilefish.extern(triton=cast_to_u8_kernel, num_warps=4, grid=lambda Count: (tilefish.cdiv(Count, 1024),))
+def cast_to_u8(x_ptr: Tensor[Count, f32], y_ptr: Out[Tensor[Count, u8]], n_elements: Count, *, BLOCK: const = 1024): ...
+
+
+@tilefish.extern(triton=cast_to_i32_kernel, num_warps=4, grid=lambda Count: (tilefish.cdiv(Count, 1024),))
+def cast_to_i32(x_ptr: Tensor[Count, f32], y_ptr: Out[Tensor[Count, i32]], n_elements: Count, *, BLOCK: const = 1024): ...
+
+
+@tilefish.extern(triton=cast_to_i64_kernel, num_warps=4, grid=lambda Count: (tilefish.cdiv(Count, 1024),))
+def cast_to_i64(x_ptr: Tensor[Count, f32], y_ptr: Out[Tensor[Count, i64]], n_elements: Count, *, BLOCK: const = 1024): ...
 
 
 # -- the dtype of a python float or a constexpr float combined with a bf16 tensor ------------------------------------------------

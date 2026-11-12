@@ -69,6 +69,9 @@ def tr():
 
 
 def readme_snippet() -> str:
+    """The code block of the README that declares the design's kernels; the test that needs it is skipped without a README."""
+    if not (REPO_ROOT / "README.md").exists():
+        pytest.skip("README.md is not available (not running from a source checkout)")
     text = (REPO_ROOT / "README.md").read_text()
     m = re.search(r"## What it looks like\n\n```python\n(.*?)```", text, re.S)
     assert m, "README.md has no python block under '## What it looks like'"

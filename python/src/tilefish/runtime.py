@@ -11,28 +11,31 @@ extern's ``Out`` tensors; ``None``, one tensor or a tuple.
 =============  ============================================================================================
 mode           what runs
 =============  ============================================================================================
-``jit``        the Triton JIT function, launched with the spec's constexprs, ``num_warps``, ``num_stages``
-               and grid
-``replay``     the cubin that :func:`tilefish.aot.build` produces for the device's architecture, loaded with
-               ``cuModuleLoadData`` and launched with ``cuLaunchKernel`` on torch's current stream, with
-               ``kernelParams`` laid out as the manifest's ABI says: exactly what a C++ or Rust host does
+``jit``        the current source, built through its compile spec (``spec.ast_source_inputs()``, the path
+               of :func:`tilefish.aot.build`) in memory, cached by digest, and launched through the CUDA
+               driver
+``replay``     the prebuilt cubins of a manifest directory (``manifest=``, written by
+               :func:`export` or ``write_manifest(..., cubins=True)``), loaded with ``cuModuleLoadData``
+               and launched through the same driver path: exactly what a C++ or Rust host does
 ``reference``  the traced IR interpreted with torch (:mod:`tilefish._reference`); a kernel only, an
                extern has no IR to interpret
 =============  ============================================================================================
 
-Before ``jit`` and ``replay`` launch, every precondition of the binary is checked (dtypes, static sizes,
-``divisible_by``, 16-byte aligned pointers, contiguity, aliasing, ``max_elements`` of a generated kernel); a
-bucketed dimension must equal one bucket value exactly, there is no padding. ``reference`` checks the types,
-not the alignment or the buckets.
+``jit`` and ``replay`` launch the same way, so they run the same machine code whenever the cubin was built from
+the same source with the same toolchain: a cubin that ``jit`` builds has the ``sha256_code`` of the one in the
+manifest, and the outputs are byte-identical (both are checked on a GPU by the tests). Triton's own JIT launcher is
+not a mode: it applies value specializations (an ``i32`` equal to 1 becomes a constant, divisibility by 16 is
+assumed wherever it happens to hold) that make its machine code differ from the spec's binary. Neither mode needs a
+C compiler (Triton's JIT launcher does, to build a stub); ``replay`` needs neither Triton nor ``ptxas``, only a
+manifest directory and the CUDA driver.
 
-``jit`` compiles the same source with Triton's usual specializations (an ``i32`` argument equal to 1 becomes
-a constant, divisibility by 16 is assumed wherever it happens to hold, not only where the spec proves it), so
-its machine code can differ from the binary of the spec in addressing and vectorization; the computation is
-the same, and the gpu tests assert that the outputs and the in-place tensors are byte-identical.
-
-The first ``replay`` of a spec builds it (cached by stem, architecture, declaration digest, spec content and
-kernel source), so it needs Triton and ``ptxas``; everything here imports torch, Triton and cuda-python
-only when it runs. Running ``jit`` also needs a C compiler (Triton builds its launcher); ``replay`` does not.
+``replay`` loads a manifest when it is first used, and refuses a cubin whose ``sha256`` or ``sha256_code`` is not
+the manifest's, and a manifest entry that is not what the compile spec of the operator asks for (ABI, grid,
+block, constants, preconditions, options, declaration digest): a binary never runs under assumptions it was not
+compiled for. Before ``jit`` and ``replay`` launch, every precondition of the binary is checked (dtypes, static
+sizes, ``divisible_by``, 16-byte aligned pointers, contiguity, aliasing, ``max_elements`` of a generated kernel);
+a bucketed dimension must equal one bucket value exactly, there is no padding. ``reference`` checks the types, not
+the alignment or the buckets. Everything here imports torch, Triton and cuda-python only when it runs.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ import contextlib
 import hashlib
 import importlib.util
 import math
+import os
 import pathlib
 import shutil
 import sys
@@ -52,7 +56,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from . import _cuda
-from ._build import BuiltKernel, _check_jit_function, _import_triton, build, resolve_triton
+from ._build import BuiltKernel, build, resolve_triton, write_manifest
 from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
@@ -71,7 +75,15 @@ from ._launch import (
 from .aot import CompileSpec, compile_specs
 from .decorators import ExternOp, KernelOp, Op
 from .dims import Dim, DimExpr
-from .errors import TilefishBuildError, TilefishError, TilefishPreconditionError, TilefishRuntimeError, TilefishTypeError
+from ._manifest import MANIFEST_NAME, Manifest
+from .errors import (
+    TilefishBuildError,
+    TilefishError,
+    TilefishManifestError,
+    TilefishPreconditionError,
+    TilefishRuntimeError,
+    TilefishTypeError,
+)
 from .lower import LoweredKernel, lower
 from .signature import MISSING, Param, Signature
 
@@ -81,6 +93,7 @@ _lock = threading.Lock()
 _builds: "dict[tuple, BuiltKernel]" = {}
 _lowered: "weakref.WeakKeyDictionary[KernelOp, LoweredKernel]" = weakref.WeakKeyDictionary()
 _specs: "weakref.WeakKeyDictionary[ExternOp, list[CompileSpec]]" = weakref.WeakKeyDictionary()  # an op is immutable
+_manifests: "dict[tuple, Manifest]" = {}  # a loaded manifest directory, until a file in it changes
 _modules: "dict[str, Any]" = {}  # sha256 of a lowered source -> the imported JITFunction
 _gen_root: "list[pathlib.Path]" = []
 
@@ -97,6 +110,7 @@ def clear_caches() -> None:
     """Forget every built kernel and unload every loaded module (for tests and for rebuilding after a toolchain change)."""
     with _lock:
         _builds.clear()
+        _manifests.clear()
     try:
         _cuda.unload_all()
     except TilefishError:
@@ -346,34 +360,18 @@ def _device_index(torch: Any, device: str) -> int:
     return d.index if d.index is not None else torch.cuda.current_device()
 
 
-def _run_jit(prep: _Prepared) -> None:
-    torch = _torch()
-    fn = prep.target.jit_function(prep.spec)
-    _import_triton()
-    _check_jit_function(fn, prep.spec)
-    args = [v for _, _, v in _launch_values(prep)]
-    with torch.cuda.device(_device_index(torch, prep.device)):
-        try:
-            fn[prep.grid](*args, num_warps=prep.spec.num_warps, num_stages=prep.spec.num_stages)
-        except RuntimeError as e:
-            if "C compiler" in str(e):  # Triton compiles a small C launcher for every kernel it runs
-                raise TilefishRuntimeError(
-                    f"jit mode needs a C compiler for Triton's launcher, and none was found ({e}); install gcc or set CC "
-                    "(replay mode needs none)"
-                ) from e
-            raise
-
-
 _options = threading.local()
 
 
 @contextlib.contextmanager
 def build_options(**options: Any) -> "Iterator[None]":
-    """Extra Triton compile options for the ``replay`` builds made inside the block (on this thread).
+    """Extra Triton compile options for the ``jit`` builds made inside the block (on this thread).
 
-    An experiment, not a mode: ``with build_options(enable_fp_fusion=False): run(op, ..., mode="replay")``
-    replays a binary compiled without FMA contraction. The options are part of the cache key and are
-    recorded in the :class:`~tilefish.aot.BuiltKernel`. ``jit`` mode is not affected.
+    An experiment, not a mode: ``with build_options(enable_fp_fusion=False): run(op, ..., mode="jit")`` runs a
+    binary compiled without FMA contraction. (A lowered kernel asks for that itself with
+    ``@tilefish.kernel(fp_fusion=False)``; this is for an ``extern``, whose spec says nothing about it.) The options
+    are part of the cache key and are recorded in the :class:`~tilefish.aot.BuiltKernel`, and they make the build
+    differ from the compile spec, so a manifest written from it is refused by ``replay``.
     """
     previous = getattr(_options, "value", {})
     _options.value = {**previous, **options}
@@ -383,11 +381,15 @@ def build_options(**options: Any) -> "Iterator[None]":
         _options.value = previous
 
 
-def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKernel:
-    """The (cached) build of ``spec`` for the architecture of device ``device_index``."""
-    torch = _torch()
+def _capability(torch: Any, device_index: int) -> int:
     major, minor = torch.cuda.get_device_capability(device_index)
-    cap = major * 10 + minor
+    return major * 10 + minor
+
+
+def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKernel:
+    """The (cached, in memory) build of ``spec`` for the architecture of device ``device_index``."""
+    torch = _torch()
+    cap = _capability(torch, device_index)
     extra = dict(getattr(_options, "value", {}))
     key = (spec.stem, cap, spec.declaration_digest, spec._fingerprint(), getattr(fn, "cache_key", None), tuple(sorted(extra.items())))
     with _lock:
@@ -399,13 +401,11 @@ def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKern
     return built
 
 
-def _run_replay(prep: _Prepared) -> None:
+def _launch_built(prep: _Prepared, built: BuiltKernel, index: int) -> None:
+    """Launch a binary through the CUDA driver on torch's current stream, with the ABI of the manifest."""
     torch = _torch()
-    index = _device_index(torch, prep.device)
-    fn = prep.target.jit_function(prep.spec)
-    built = build_for_device(prep.spec, fn, index)
     if built.spec.block != prep.spec.block or built.num_warps != prep.spec.num_warps:
-        raise TilefishRuntimeError(f"the build of '{prep.spec.stem}' disagrees with its spec about num_warps")
+        raise TilefishRuntimeError(f"the binary of '{prep.spec.stem}' disagrees with its spec about num_warps")
     args: "list[tuple[str, int]]" = []
     for kind, _, v in _launch_values(prep):
         if kind == "pointer":
@@ -416,6 +416,45 @@ def _run_replay(prep: _Prepared) -> None:
         loaded = _cuda.load(built, index)
         stream = torch.cuda.current_stream(index).cuda_stream
         loaded.launch(prep.grid, args, stream)
+
+
+def _run_jit(prep: _Prepared) -> None:
+    """Build the current source through the compile spec, in memory, and launch that binary."""
+    torch = _torch()
+    index = _device_index(torch, prep.device)
+    fn = prep.target.jit_function(prep.spec)
+    _launch_built(prep, build_for_device(prep.spec, fn, index), index)
+
+
+def _load_manifest(manifest: Any) -> Manifest:
+    """A :class:`Manifest` from a directory, a manifest file or a loaded manifest (a directory is cached until a file in it changes)."""
+    if isinstance(manifest, Manifest):
+        return manifest
+    try:
+        path = pathlib.Path(manifest)
+    except TypeError:
+        raise TilefishRuntimeError(f"manifest= takes a directory or a Manifest, got {manifest!r}") from None
+    directory = path if path.is_dir() else path.parent
+    try:
+        stamp = tuple(sorted((e.name, e.stat().st_mtime_ns, e.stat().st_size) for e in os.scandir(directory) if e.is_file()))
+    except OSError as e:
+        raise TilefishManifestError(f"cannot read the manifest directory {str(directory)!r}: {e}") from e
+    key = (str(path.resolve()), stamp)
+    with _lock:
+        loaded = _manifests.get(key)
+    if loaded is None:
+        loaded = Manifest.load(path)
+        with _lock:
+            _manifests[key] = loaded
+    return loaded
+
+
+def _run_replay(prep: _Prepared, manifest: Manifest) -> None:
+    """Launch the prebuilt cubin of the manifest for this spec and this device's architecture."""
+    torch = _torch()
+    index = _device_index(torch, prep.device)
+    built = manifest.built_kernel(prep.spec, f"sm_{_capability(torch, index)}")
+    _launch_built(prep, built, index)
 
 
 def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:
@@ -444,17 +483,51 @@ def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, 
     return _result(returned + outs)
 
 
-def run(op: Any, /, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
+def export(ops: Any, directory: "str | os.PathLike[str]", *, arch: "int | str | None" = None) -> pathlib.Path:
+    """Build every binary of one or several kernels and externs and write them as a manifest directory.
+
+    For each compile spec of each operator (one per bucket) the cubin is built for ``arch`` (default: the
+    architecture of the current CUDA device) and ``<directory>/manifest.json`` is written together with the
+    cubins, which is what ``tilefish.run(..., mode="replay", manifest=directory)`` loads, and what a C++ or Rust
+    host reads. Returns the path of the manifest.
+    """
+    items = list(ops) if isinstance(ops, (list, tuple)) else [ops]
+    if arch is None:
+        torch = _torch()
+        cap = _capability(torch, torch.cuda.current_device())
+    else:
+        from ._build import parse_arch
+
+        cap = parse_arch(arch)
+    built: "list[BuiltKernel]" = []
+    for op in items:
+        target = _target(op)
+        for spec in target.compile_specs():
+            built.append(build(spec, arch=cap, fn=target.jit_function(spec)))
+    return write_manifest(built, pathlib.Path(directory) / MANIFEST_NAME, cubins=True)
+
+
+def run(op: Any, /, *args: Any, mode: str = "jit", manifest: Any = None, **kwargs: Any) -> Any:
     """Run a kernel or an extern op on tensors. See the module docstring for the three modes.
 
     ``op`` is a ``@tilefish.kernel`` (or its :class:`~tilefish.lower.LoweredKernel`) or an ``@tilefish.extern`` whose
-    Triton function can be imported. ``mode`` is ``"jit"``, ``"replay"`` or ``"reference"`` and is the only
-    keyword that is not an argument of ``op`` (an operator that has a parameter called ``mode`` takes it
-    positionally). Raises :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks a
-    precondition of the binary, and :class:`~tilefish.errors.TilefishRuntimeError` when the call cannot run.
+    Triton function can be imported. ``mode`` is ``"jit"``, ``"replay"`` or ``"reference"``. ``manifest`` is the
+    directory (or the :class:`~tilefish.aot.Manifest`) that ``"replay"`` loads its cubins from, and is required
+    there and nowhere else. ``mode`` and ``manifest`` are the only keywords that are not arguments of ``op`` (an
+    operator with a parameter of one of those names takes it positionally). Raises
+    :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks a precondition of the binary,
+    :class:`~tilefish.errors.TilefishManifestError` when the manifest is not what was built or not what the
+    operator asks for, and :class:`~tilefish.errors.TilefishRuntimeError` when the call cannot run.
     """
     if mode not in MODES:
         raise TilefishRuntimeError(f"unknown mode {mode!r}: use one of {', '.join(MODES)}")
+    if mode == "replay" and manifest is None:
+        raise TilefishRuntimeError(
+            "replay runs prebuilt cubins from a manifest directory: pass manifest=<directory> (write one with "
+            "tilefish.runtime.export(op, directory) or tilefish.aot.write_manifest(built, path, cubins=True))"
+        )
+    if mode != "replay" and manifest is not None:
+        raise TilefishRuntimeError(f"manifest= is for mode='replay'; mode {mode!r} builds or interprets the kernel itself")
     target = _target(op)
     if mode == "reference":
         return _run_reference(target, args, kwargs)
@@ -462,5 +535,5 @@ def run(op: Any, /, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
     if mode == "jit":
         _run_jit(prep)
     else:
-        _run_replay(prep)
+        _run_replay(prep, _load_manifest(manifest))
     return _result(prep.results)

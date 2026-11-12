@@ -805,3 +805,4 @@ def compile_specs(op: ExternOp) -> list[CompileSpec]:
 # The build step lives in _build.py. It needs nothing from this module at import time, so importing it last
 # is safe, and `tilefish.aot.build` reads as the ahead-of-time API next to `compile_specs`.
 from ._build import BuiltKernel, LaunchAttributes, build, manifest_dict, write_manifest  # noqa: E402,F401
+from ._manifest import Manifest  # noqa: E402,F401

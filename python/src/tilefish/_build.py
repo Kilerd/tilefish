@@ -163,6 +163,18 @@ class LaunchAttributes:
             out.append("launch_cooperative_grid=True")
         return out
 
+    @classmethod
+    def from_dict(cls, d: "Mapping[str, Any]") -> "LaunchAttributes":
+        """The inverse of :meth:`to_dict`."""
+        return cls(
+            global_scratch_size=int(d["global_scratch_size"]),
+            profile_scratch_size=int(d["profile_scratch_size"]),
+            launch_pdl=bool(d["launch_pdl"]),
+            cluster_dims=tuple(int(c) for c in d["cluster_dims"]),  # type: ignore[arg-type]
+            num_ctas=int(d["num_ctas"]),
+            cooperative=bool(d["cooperative"]),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "global_scratch_size": self.global_scratch_size,
@@ -172,6 +184,38 @@ class LaunchAttributes:
             "num_ctas": self.num_ctas,
             "cooperative": self.cooperative,
         }
+
+
+def abi_of(spec: "CompileSpec") -> dict[str, Any]:
+    """The launch ABI a spec promises: ``params`` (the non-constexpr arguments, in declaration order, one
+    ``kernelParams`` slot each) followed by the two ``scratch`` slots, which a launch passes as null 64-bit pointers."""
+    params: list[dict[str, Any]] = []
+    for a in spec.args:
+        if a.kind == "constexpr":
+            continue
+        ptx_type, size = _PTX_TYPES[a.kind]
+        entry: dict[str, Any] = {
+            "slot": len(params),
+            "index": a.index,
+            "name": a.name,
+            "kind": a.kind,
+            "type": a.type,
+            "ptx_type": ptx_type,
+            "size": size,
+        }
+        if a.kind == "pointer":
+            entry["dtype"] = a.dtype
+            entry["access"] = a.access
+        else:
+            entry["dim"] = a.dim
+            if a.count_of is not None:  # the value is the element count of that pointer argument
+                entry["count_of"] = a.count_of
+        params.append(entry)
+    scratch = [
+        {"slot": len(params) + k, "name": p.name, "type": p.type, "ptx_type": "u64", "size": 8, "value": p.value}
+        for k, p in enumerate(spec.launch_params[len(params) :])
+    ]
+    return {"params": params, "scratch": scratch}
 
 
 @dataclass(frozen=True, eq=False)
@@ -216,35 +260,8 @@ class BuiltKernel:
         return path
 
     def abi(self) -> dict[str, Any]:
-        """The launch ABI: ``params`` (the non-constexpr arguments, in declaration order, one ``kernelParams`` slot each)
-        followed by the two ``scratch`` slots, which a launch passes as null 64-bit pointers."""
-        params: list[dict[str, Any]] = []
-        for a in self.spec.args:
-            if a.kind == "constexpr":
-                continue
-            ptx_type, size = _PTX_TYPES[a.kind]
-            entry: dict[str, Any] = {
-                "slot": len(params),
-                "index": a.index,
-                "name": a.name,
-                "kind": a.kind,
-                "type": a.type,
-                "ptx_type": ptx_type,
-                "size": size,
-            }
-            if a.kind == "pointer":
-                entry["dtype"] = a.dtype
-                entry["access"] = a.access
-            else:
-                entry["dim"] = a.dim
-                if a.count_of is not None:  # the value is the element count of that pointer argument
-                    entry["count_of"] = a.count_of
-            params.append(entry)
-        scratch = [
-            {"slot": len(params) + k, "name": p.name, "type": p.type, "ptx_type": "u64", "size": 8, "value": p.value}
-            for k, p in enumerate(self.spec.launch_params[len(params) :])
-        ]
-        return {"params": params, "scratch": scratch}
+        """The launch ABI of the spec; see :func:`abi_of`."""
+        return abi_of(self.spec)
 
     def __repr__(self) -> str:
         return (
@@ -368,10 +385,10 @@ def build(
 # -- the manifest ---------------------------------------------------------------------------------------------------------
 
 
-def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
+def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
+    """The part of a manifest entry that the compile spec alone determines (a replay checks it against the operator's spec)."""
     from .aot import _encode
 
-    spec = b.spec
     constexprs = []
     for a in spec.args:
         if a.kind != "constexpr":
@@ -383,22 +400,40 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     return {
         "stem": spec.stem,
         "op": spec.op,
+        "abi": abi_of(spec),
+        "grid": spec.grid,
+        "block": list(spec.block),
+        "num_warps": spec.num_warps,
+        "num_stages": spec.num_stages,
+        "constexprs": constexprs,
+        "buckets": dict(spec.buckets),
+        "preconditions": [p.to_dict() for p in spec.preconditions],
+        "options": dict(spec.ast_source_inputs().options),
+        "declaration_digest": spec.declaration_digest,
+    }
+
+
+def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
+    spec_part = spec_entry(b.spec)
+    return {
+        "stem": spec_part["stem"],
+        "op": spec_part["op"],
         "arch": b.arch,
         "ptx_target": b.ptx_target,
         "symbol": b.symbol,
         "cubin": b.cubin_name,
-        "abi": b.abi(),
-        "grid": spec.grid,
-        "block": list(spec.block),
+        "abi": spec_part["abi"],
+        "grid": spec_part["grid"],
+        "block": spec_part["block"],
         "shared": b.shared,
         "num_warps": b.num_warps,
-        "num_stages": spec.num_stages,
+        "num_stages": spec_part["num_stages"],
         "launch": b.launch.to_dict(),
-        "constexprs": constexprs,
-        "buckets": dict(spec.buckets),
-        "preconditions": [p.to_dict() for p in spec.preconditions],
+        "constexprs": spec_part["constexprs"],
+        "buckets": spec_part["buckets"],
+        "preconditions": spec_part["preconditions"],
         "options": dict(b.options),
-        "declaration_digest": spec.declaration_digest,
+        "declaration_digest": spec_part["declaration_digest"],
         "sha256": b.sha256,
         "sha256_code": b.sha256_code,
         "toolchain": {"triton": b.triton_version, "ptxas": b.ptxas_version},

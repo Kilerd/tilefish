@@ -29,6 +29,7 @@ Summary of what the tests below pin down:
 """
 
 import collections
+import dataclasses
 import re
 
 import pytest
@@ -44,13 +45,13 @@ import gpu_kernels  # noqa: E402
 import triton.language as tl  # noqa: E402
 from conftest import REPO_ROOT, make_my_kernels, readme_snippet  # noqa: E402
 from gpu_util import differing, error, randn, same_bytes  # noqa: E402
-from lower_cases import T, gelu_exact, layernorm, softmax, swiglu  # noqa: E402
+from lower_cases import D, M, T, gelu_exact, layernorm, softmax, swiglu  # noqa: E402
 
 import tilefish  # noqa: E402
 from tilefish import Dim, Tensor, bf16, const, f32  # noqa: E402
 from tilefish import runtime  # noqa: E402
 from tilefish._elf import parse_elf  # noqa: E402
-from tilefish.aot import build  # noqa: E402
+from tilefish.aot import build, compile_specs  # noqa: E402
 
 BF16, F32 = torch.bfloat16, torch.float32
 CAP = torch.cuda.get_device_capability()
@@ -81,7 +82,7 @@ def instructions(ptx):
 def replay(kernel, *args, **options):
     clones = [a.clone() if torch.is_tensor(a) else a for a in args]
     with runtime.build_options(**options):
-        return tilefish.run(kernel, *clones, mode="replay")
+        return tilefish.run(kernel, *clones, mode="jit")
 
 
 def probe(values, dtype=F32):
@@ -200,7 +201,7 @@ def test_float_minus_inf_works_in_jit_and_in_the_binary():
     x = randn((9, 1000), F32, 0, scale=2.0, shift=-1000.0)
     jit = tilefish.run(softmax, x, mode="jit")
     assert torch.isfinite(jit).all() and torch.allclose(jit.sum(-1), torch.ones(9, device="cuda"), atol=1e-5)
-    assert same_bytes(jit, tilefish.run(softmax, x, mode="replay"))
+    assert same_bytes(jit, tilefish.run(softmax, x, mode="jit"))
     # and a literal -inf in the input is a masked-out element
     y = randn((3, 1000), F32, 1)
     y[:, 5] = float("-inf")
@@ -212,38 +213,48 @@ def test_float_minus_inf_works_in_jit_and_in_the_binary():
 
 
 def cast_runs(kernel, values):
+    """The binary's result (``jit``) and the reference's on the probe values, trimmed to the values (the probe is padded to 16)."""
     x = probe(values)
-    outputs = {m: tilefish.run(kernel, x, mode=m) for m in ("jit", "replay", "reference")}
-    n = len(values)
-    return x, {m: o[:n] for m, o in outputs.items()}, outputs
+    outputs = {m: tilefish.run(kernel, x, mode=m) for m in ("jit", "reference")}
+    return x, {m: o[: len(values)] for m, o in outputs.items()}
+
+
+def test_a_float_to_integer_cast_is_not_lowered():
+    """The measured behavior below is why: it is not one a contract should promise, so the lowering rejects it."""
+    for kernel in (cast_cases.to_u8, cast_cases.to_i32, cast_cases.to_i64):
+        with pytest.raises(tilefish.TilefishLoweringError) as e:
+            kernel.lower()
+        assert e.value.rule == "cast.float-to-int" and "not supported yet" in str(e.value)
 
 
 @pytest.mark.parametrize(
-    "kernel, instruction, values, expected",
+    "extern, instruction, values, expected",
     [
-        (cast_cases.to_u8, "cvt.rzi.u16.f32", cast_cases.U8_INPUT, cast_cases.U8_OUTPUT),
-        (cast_cases.to_i32, "cvt.rzi.s32.f32", cast_cases.I32_INPUT, cast_cases.I32_OUTPUT),
-        (cast_cases.to_i64, "cvt.rzi.s64.f32", cast_cases.I64_INPUT, cast_cases.I64_OUTPUT),
+        (gpu_kernels.cast_to_u8, "cvt.rzi.u16.f32", cast_cases.U8_INPUT, cast_cases.U8_OUTPUT),
+        (gpu_kernels.cast_to_i32, "cvt.rzi.s32.f32", cast_cases.I32_INPUT, cast_cases.I32_OUTPUT),
+        (gpu_kernels.cast_to_i64, "cvt.rzi.s64.f32", cast_cases.I64_INPUT, cast_cases.I64_OUTPUT),
     ],
 )
-def test_float_to_integer_casts(kernel, instruction, values, expected):
-    assert instructions(built(kernel).ptx)[instruction] > 0
-    x, out, _ = cast_runs(kernel, values)
-    assert out["replay"].tolist() == expected
-    assert same_bytes(out["jit"], out["replay"]) and same_bytes(out["reference"], out["replay"])  # the reference follows
+def test_what_triton_does_for_a_float_to_integer_cast(extern, instruction, values, expected):
+    """A hand-written Triton kernel (``x.to(tl.uint8)`` and so on) on sm_103: truncation, then saturation, and a low byte for u8."""
+    (spec,) = compile_specs(extern)
+    assert instructions(build(spec, arch=ARCH).ptx)[instruction] > 0
+    out = tilefish.run(extern, probe(values), mode="jit")[: len(values)]
+    assert out.tolist() == expected
 
 
 def test_float_to_u8_is_neither_saturating_nor_the_cast_torch_does():
     # u8: the value is converted to a 16-bit unsigned integer (saturating there) and the low byte is kept
-    x, out, _ = cast_runs(cast_cases.to_u8, cast_cases.U8_INPUT)
-    by_value = dict(zip(cast_cases.U8_INPUT, out["replay"].tolist()))
+    x = probe(cast_cases.U8_INPUT)
+    out = tilefish.run(gpu_kernels.cast_to_u8, x, mode="jit")[: len(cast_cases.U8_INPUT)]
+    by_value = dict(zip(cast_cases.U8_INPUT, out.tolist()))
     assert by_value[255.5] == 255 and by_value[256.0] == 0 and by_value[300.0] == 44  # wraps modulo 256 up to 65535 ...
     assert by_value[65536.0] == 255 and by_value[1e10] == 255 and by_value[float("inf")] == 255  # ... then 65535 & 255
     assert by_value[-1.0] == 0 and by_value[-1000.0] == 0 and by_value[float("-inf")] == 0  # negative: 0
-    assert out["replay"][cast_cases.U8_INPUT.index(cast_cases.NAN)] == 0  # NaN: 0
+    assert out[cast_cases.U8_INPUT.index(cast_cases.NAN)] == 0  # NaN: 0
     torch_cast = x.to(torch.uint8)[: len(cast_cases.U8_INPUT)]
     assert torch_cast[cast_cases.U8_INPUT.index(-1.5)] == 255 and torch_cast[cast_cases.U8_INPUT.index(65536.0)] == 0
-    assert not torch.equal(torch_cast, out["replay"])
+    assert not torch.equal(torch_cast, out)
 
 
 @pytest.mark.parametrize(
@@ -253,13 +264,13 @@ def test_float_to_u8_is_neither_saturating_nor_the_cast_torch_does():
         (cast_cases.to_e5m2, "cvt.rn.satfinite.e5m2x2.f32", cast_cases.E5M2_TABLE, torch.float8_e5m2, {1e5: 0x7C, float("inf"): 0x7C}),
     ],
 )
-def test_float_to_fp8_saturates_to_the_largest_finite_value(kernel, instruction, table, torch_dtype, torch_says):
+def test_float_to_fp8_is_satfinite_in_the_binary_and_in_the_reference(kernel, instruction, table, torch_dtype, torch_says):
     assert instructions(built(kernel).ptx)[instruction] > 0
     values = [v for v, _ in table]
-    x, out, _ = cast_runs(kernel, values)
-    bytes_out = out["replay"].view(torch.uint8).tolist()
-    assert bytes_out == [b for _, b in table]
-    assert out["jit"].view(torch.uint8).tolist() == bytes_out and out["reference"].view(torch.uint8).tolist() == bytes_out
+    x, out = cast_runs(kernel, values)
+    bytes_out = out["jit"].view(torch.uint8).tolist()
+    assert bytes_out == [b for _, b in table]  # saturates at 448 / 57344, infinities included; NaN stays NaN
+    assert out["reference"].view(torch.uint8).tolist() == bytes_out  # the reference models it
     torch_bytes = dict(zip(values, x.to(torch_dtype).view(torch.uint8)[: len(values)].tolist()))
     for value, byte in torch_says.items():  # torch overflows to NaN (e4m3) or infinity (e5m2) instead
         assert torch_bytes[value] == byte
@@ -270,14 +281,14 @@ def test_float_to_fp8_saturates_to_the_largest_finite_value(kernel, instruction,
 def test_float_to_half_types_round_to_nearest_even_and_overflow_to_infinity(kernel, dtype):
     instruction = "cvt.rn.f16x2.f32" if dtype == torch.float16 else "cvt.rn.bf16x2.f32"
     assert instructions(built(kernel).ptx)[instruction] > 0
-    x, out, _ = cast_runs(kernel, cast_cases.HALF_INPUT)
+    x, out = cast_runs(kernel, cast_cases.HALF_INPUT)
     n = len(cast_cases.HALF_INPUT)
     finite = ~torch.isnan(x[:n])
-    assert same_bytes(out["replay"][finite], x[:n][finite].to(dtype))  # the same bytes as torch's cast
-    assert torch.isnan(out["replay"][~finite]).all()
-    assert same_bytes(out["reference"], out["replay"]) and same_bytes(out["jit"], out["replay"])
+    assert same_bytes(out["jit"][finite], x[:n][finite].to(dtype))  # the same bytes as torch's cast
+    assert torch.isnan(out["jit"][~finite]).all()
+    assert same_bytes(out["reference"], out["jit"])
     if dtype == torch.float16:
-        values = dict(zip(cast_cases.HALF_INPUT, out["replay"].tolist()))
+        values = dict(zip(cast_cases.HALF_INPUT, out["jit"].tolist()))
         assert values[65519.0] == 65504.0 and values[65520.0] == float("inf")  # round to nearest, ties to even
 
 
@@ -408,7 +419,7 @@ def test_the_warp_count_changes_the_order_of_a_reduction_and_so_the_bytes(d, def
     xs = randn((129, d), F32, 0, scale=3.0)
     xb, wb = randn((129, d), BF16, 1), randn((d,), BF16, 2)
     for kernel, args in ((softmax_rows, (xs,)), (normalize_rows, (xb, wb))):
-        results = {w: tilefish.run(tilefish.lower(kernel, num_warps=w), *args, mode="replay") for w in (1, 2, 4, 8, 16, 32)}
+        results = {w: tilefish.run(tilefish.lower(kernel, num_warps=w), *args, mode="jit") for w in (1, 2, 4, 8, 16, 32)}
         reference = tilefish.run(kernel, *args, mode="reference")
         rows = {w: int((r.view(torch.uint8) != results[1].view(torch.uint8)).any(-1).sum()) for w, r in results.items()}
         print(f"D={d} {kernel.name}: rows (of 129) that differ from num_warps=1: {rows}")
@@ -418,35 +429,141 @@ def test_the_warp_count_changes_the_order_of_a_reduction_and_so_the_bytes(d, def
         assert rows[1] == 0
 
 
-def test_the_largest_buckets_warp_count_changes_the_numerics_of_a_small_bucket():
-    """A bucketed row length has one ``num_warps`` for all its binaries (from the largest bucket)."""
-    small, large = Dim("Dsmall", 96), Dim("Dbuckets", buckets=[96, 2048])
+def row_normalizer(d_dim):
+    """The same normalization over rows of ``d_dim`` (a static or a bucketed dimension)."""
     rows = Dim("R")
 
     @tilefish.kernel
-    def static_rows(x: Tensor[rows, small, bf16], w: Tensor[small, bf16], *, eps: const[f32] = 1e-5) -> Tensor[rows, small, f32]:
+    def normalize(x: Tensor[rows, d_dim, bf16], w: Tensor[d_dim, bf16], *, eps: const[f32] = 1e-5) -> Tensor[rows, d_dim, f32]:
         xf = x.to(f32)
         d_ = xf - tilefish.mean(xf, axis=-1, keepdims=True)
         var = tilefish.mean(d_ * d_, axis=-1, keepdims=True)
         return d_ * tilefish.rsqrt(var + eps) * w.to(f32)
 
-    @tilefish.kernel
-    def bucketed_rows(x: Tensor[rows, large, bf16], w: Tensor[large, bf16], *, eps: const[f32] = 1e-5) -> Tensor[rows, large, f32]:
-        xf = x.to(f32)
-        d_ = xf - tilefish.mean(xf, axis=-1, keepdims=True)
-        var = tilefish.mean(d_ * d_, axis=-1, keepdims=True)
-        return d_ * tilefish.rsqrt(var + eps) * w.to(f32)
+    return normalize
 
-    alone, shared = static_rows.lower(), bucketed_rows.lower()
-    assert alone.num_warps == 1 and shared.num_warps == 8  # 2048 lanes: one warp per 256
-    assert {s.num_warps for s in shared.specs()} == {8}  # the D = 96 binary has 8 warps for 128 lanes
+
+def test_each_bucket_has_the_warps_of_its_own_size_so_its_bits_do_not_depend_on_the_other_buckets():
+    """The D = 96 binary is the same whichever other buckets are declared, and the same as a kernel with D = 96 alone."""
+    alone = row_normalizer(Dim("D", 96))
+    with_2048 = row_normalizer(Dim("D", buckets=[96, 2048]))
+    with_512 = row_normalizer(Dim("D", buckets=[96, 512]))
+    low_alone, low_2048, low_512 = alone.lower(), with_2048.lower(), with_512.lower()
+    assert low_alone.num_warps == 1  # 128 lanes: one warp per 256, at least 1
+    assert [s.num_warps for s in low_2048.specs()] == [1, 8] and low_2048.bucket_num_warps == {".D96": 1, ".D2048": 8}
+    assert [s.num_warps for s in low_512.specs()] == [1, 2]
+    assert low_2048.specs()[0].num_warps == low_alone.specs()[0].num_warps == 1
     x, w = randn((129, 96), BF16, 0), randn((96,), BF16, 1)
-    one_warp = tilefish.run(static_rows, x, w, mode="replay")
-    eight_warps = tilefish.run(bucketed_rows, x, w, mode="replay")  # the same computation, the D = 96 binary of the bucketed kernel
-    wrong_rows = int((one_warp.view(torch.uint8) != eight_warps.view(torch.uint8)).any(-1).sum())
-    print(f"D=96 with 1 warp or with the 8 warps of the largest bucket: {wrong_rows} of 129 rows differ")
-    assert wrong_rows > 0
-    assert (one_warp - eight_warps).abs().max() < 2e-6  # both correct, differing in the last bits
+    results = [tilefish.run(k, x, w, mode="jit") for k in (alone, with_2048, with_512)]
+    assert same_bytes(results[0], results[1]) and same_bytes(results[0], results[2])  # the same bits at D = 96
+    # and the larger bucket does run with the warps its own size gets
+    big = randn((9, 2048), BF16, 0), randn((2048,), BF16, 1)
+    assert (tilefish.run(with_2048, *big, mode="jit") - tilefish.run(with_2048, *big, mode="reference")).abs().max() < 2e-6
+
+
+def test_an_explicit_num_warps_pins_every_bucket():
+    d_dim = Dim("D", buckets=[96, 512, 2048])
+    rows = Dim("R")
+
+    @tilefish.kernel(num_warps=2)
+    def pinned(x: Tensor[rows, d_dim, bf16]) -> Tensor[rows, d_dim, f32]:
+        xf = x.to(f32)
+        return xf - tilefish.mean(xf, axis=-1, keepdims=True)
+
+    low = pinned.lower()
+    assert {s.num_warps for s in low.specs()} == {2} and low.bucket_num_warps == {}
+    assert {s.num_warps for s in pinned.lower(num_warps=4).specs()} == {4}
+    x = randn((5, 512), BF16, 0)
+    assert (tilefish.run(low, x, mode="jit") - tilefish.run(pinned, x, mode="reference")).abs().max() < 2e-6
+
+
+# -- FMA contraction as part of the spec ---------------------------------------------------------------------------------------------------
+
+
+def contraction_free(kernel):
+    return kernel.lower(fp_fusion=False)
+
+
+def test_the_default_spec_names_triton_default_and_changes_no_machine_code(rmsnorm):
+    """``enable_fp_fusion=True`` is written into every spec of a generated kernel; it is Triton's default, so the cubin is the same."""
+    for name, kernel in (("softmax", softmax), ("layernorm", layernorm), ("gelu_exact", gelu_exact), ("swiglu", swiglu), ("rmsnorm", rmsnorm)):
+        low = kernel.lower()
+        (spec,) = low.specs()
+        assert spec.enable_fp_fusion is True and spec.ast_source_inputs().options["enable_fp_fusion"] is True
+        explicit = build(spec, arch=ARCH, fn=runtime.load_lowered(low))
+        assert explicit.options["enable_fp_fusion"] is True
+        implicit_spec = dataclasses.replace(spec, enable_fp_fusion=None)  # the spec as it was before the key existed
+        implicit_spec._mark_verified()
+        assert "enable_fp_fusion" not in implicit_spec.ast_source_inputs().options
+        implicit = build(implicit_spec, arch=ARCH, fn=runtime.load_lowered(low))
+        assert "enable_fp_fusion" not in implicit.options
+        assert explicit.sha256_code == implicit.sha256_code, name  # not one byte of machine code differs
+        assert explicit.ptx.count("fma.") == implicit.ptx.count("fma.")
+
+
+def test_fp_fusion_false_is_a_different_spec_and_a_different_binary():
+    on, off = layernorm.lower(), layernorm.lower(fp_fusion=False)
+    (spec_on,), (spec_off,) = on.specs(), off.specs()
+    assert spec_off.enable_fp_fusion is False and spec_off.ast_source_inputs().options["enable_fp_fusion"] is False
+    assert spec_on.declaration_digest != spec_off.declaration_digest  # part of the digest of the declaration
+    assert on.source == off.source.replace("# fp_fusion: False (no FMA contraction: a * b + c rounds twice)\n", "")  # same code
+    b_on, b_off = built(on), built(off)
+    assert b_on.options["enable_fp_fusion"] is True and b_off.options["enable_fp_fusion"] is False
+    assert b_on.sha256_code != b_off.sha256_code
+    assert instructions(b_on.ptx)["fma.rn.f32"] > 0 and instructions(b_off.ptx)["fma.rn.f32"] == 0
+
+
+@tilefish.kernel(fp_fusion=False)
+def layernorm_strict(x: Tensor[M, D, bf16], w: Tensor[D, bf16], b: Tensor[D, bf16], *, eps: const[f32] = 1e-5) -> Tensor[M, D, bf16]:
+    xf = x.to(f32)
+    mean = tilefish.mean(xf, axis=-1, keepdims=True)
+    d = xf - mean
+    var = tilefish.mean(d * d, axis=-1, keepdims=True)
+    rstd = tilefish.rsqrt(var + eps)
+    y = d * rstd * w.to(f32) + b.to(f32)
+    return y.to(bf16)
+
+
+@tilefish.kernel
+def affine_tail(x: Tensor[M, D, f32], mean: Tensor[M, 1, f32], rstd: Tensor[M, 1, f32], w: Tensor[D, f32], b: Tensor[D, f32]) -> Tensor[M, D, f32]:
+    """The tail of layernorm, ``(x - mean) * rstd * w + b`` in f32, with the statistics given: no reduction, no rsqrt."""
+    return (x - mean) * rstd * w + b
+
+
+@tilefish.kernel(fp_fusion=False)
+def affine_tail_strict(x: Tensor[M, D, f32], mean: Tensor[M, 1, f32], rstd: Tensor[M, 1, f32], w: Tensor[D, f32], b: Tensor[D, f32]) -> Tensor[M, D, f32]:
+    return (x - mean) * rstd * w + b
+
+
+def test_fp_fusion_false_matches_a_two_rounding_reference_exactly_where_the_default_does_not():
+    """The layernorm tail ``d * rstd * w + b`` with the statistics as inputs, so that nothing but the contraction is in play."""
+    args = (randn((257, 768), F32, 0), randn((257, 1), F32, 1), randn((257, 1), F32, 2).abs() + 0.5, randn((768,), F32, 3), randn((768,), F32, 4))
+    x, mean, rstd, w, b = args
+    two_roundings = (((x - mean) * rstd) * w) + b  # torch rounds every operation
+    one_rounding_at_the_end = (((x - mean) * rstd).double() * w.double() + b.double()).float()  # (x - mean) * rstd, then one FMA
+    default = tilefish.run(affine_tail, *args, mode="jit")
+    strict = tilefish.run(affine_tail_strict, *args, mode="jit")
+    assert same_bytes(strict, two_roundings)  # exactly
+    assert same_bytes(default, one_rounding_at_the_end)  # exactly, one rounding for the last multiply-add
+    assert not same_bytes(default, two_roundings)
+    print(f"affine tail: contraction changes {differing(default, strict)} of {default.numel()} elements; the strict build matches the two-rounding reference exactly")
+    assert same_bytes(strict, tilefish.run(affine_tail, *args, mode="reference"))  # reference mode rounds twice, like the strict build
+
+
+def test_fp_fusion_false_on_layernorm_itself():
+    """The golden itself, with its reduction order and ``rsqrt.approx``: what strict rounding changes (data)."""
+    changed = 0
+    for seed in (0, 1, 2):
+        args = (randn((257, 768), BF16, seed), randn((768,), BF16, seed + 100), randn((768,), BF16, seed + 200))
+        default = tilefish.run(layernorm, *args, mode="jit")
+        strict = tilefish.run(layernorm_strict, *args, mode="jit")
+        reference = tilefish.run(layernorm, *args, mode="reference")
+        a = differing(default, strict)
+        print(f"layernorm seed {seed}: contraction changes {a} of {default.numel()} elements; mismatches with the reference: default {differing(default, reference)}, strict {differing(strict, reference)}")
+        changed += a
+        assert error(strict, default)[0] <= 1 and error(strict, reference)[0] <= 2
+    assert 0 < changed  # the layernorm tail does round differently, in a few elements, by one bf16 step
+    assert instructions(built(layernorm_strict).ptx)["fma.rn.f32"] == 0
 
 
 # -- FMA contraction on the goldens (data for the lead) ---------------------------------------------------------------------------------
@@ -516,7 +633,7 @@ def replay_all(kernel, args, options):
         result = tilefish.run(kernel, *clones, mode="reference")
     else:
         with runtime.build_options(**options):
-            result = tilefish.run(kernel, *clones, mode="replay")
+            result = tilefish.run(kernel, *clones, mode="jit")
     outs = [result] if torch.is_tensor(result) else list(result or [])
     inouts = [c for c, p in zip(clones, [p for p in kernel.signature.params if p.kind == "tensor" and p.access != "out"]) if p.access == "inout"]
     return outs + inouts

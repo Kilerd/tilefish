@@ -43,6 +43,7 @@ from .errors import (
     TilefishSpecError,
     TilefishTypeError,
 )
+from ._manifest import Manifest
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import exp, gelu, rsqrt, silu, sqrt
@@ -74,6 +75,7 @@ __all__ = [
     "KernelOp",
     "LibraryOp",
     "LoweredKernel",
+    "Manifest",
     "Node",
     "Op",
     "Out",

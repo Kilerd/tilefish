@@ -120,12 +120,14 @@ The Python side has three modes:
 
 | mode | what runs | used for |
 |---|---|---|
-| `jit` | Triton JIT from the current source | iterating on a kernel |
+| `jit` | the current source, built through its compile spec (the path of the build) in memory and launched through the CUDA driver | iterating on a kernel |
 | `reference` | the same bodies interpreted with torch | an oracle, compared within a tolerance |
-| `replay` | the built binaries, through the CUDA driver | the exact machine code the C++ and Rust hosts run |
+| `replay` | the prebuilt cubins of a manifest directory, checked against its digests, through the CUDA driver | the exact machine code the C++ and Rust hosts run |
 
 ```python
-y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay")   # or residual_add_rmsnorm.run(...)
+y = tilefish.run(residual_add_rmsnorm, x, residual, w)                        # jit
+tilefish.runtime.export(residual_add_rmsnorm, "build/")                        # cubins and manifest.json
+y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/")
 ```
 
 Arguments are torch tensors, matched to the signature the way a call is
@@ -135,10 +137,17 @@ launch every precondition of the binary is checked (dtypes, static sizes,
 `divisible_by`, 16-byte aligned pointers, contiguity), and a bucketed
 dimension must equal a bucket exactly: there is no padding.
 
-CI asserts that `jit` and `replay` agree byte for byte, and that `replay`
-stays within tolerance of `reference`, on a GPU (the tests marked `gpu`).
-An experiment that passes in `replay` is, kernel for kernel, what production
-runs.
+`jit` and `replay` launch the same way, so they run the same machine code: a
+cubin that `jit` builds has the `sha256_code` of the one in the manifest, and
+`replay` refuses a cubin whose digests are not the manifest's, or a manifest
+entry that is not what the operator's compile spec asks for. Triton's own JIT
+launcher, which specializes on argument values, is not a mode. Neither `jit`
+nor `replay` needs a C compiler, and `replay` needs neither Triton nor `ptxas`.
+
+CI asserts, on a GPU (the tests marked `gpu`), that a `jit`-built cubin has the
+digest of the manifest's, that `jit` and `replay` agree byte for byte, and that
+`replay` stays within tolerance of `reference`. An experiment that passes in
+`replay` is, kernel for kernel, what production runs.
 
 ## Rewrites that know about rounding
 
