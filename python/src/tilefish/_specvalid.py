@@ -53,7 +53,9 @@ PRE_FIELDS = {
     "divisible": {"arg", "index", "dim", "by"},
     "static_size": {"arg", "index", "axis", "value"},
     "bucket": {"dim", "value", "buckets"},
+    "max_elements": {"arg", "index", "shape", "value"},  # schema 2; only kernels that tilefish generated
 }
+MAX_ELEMENTS = 2**31 - 1  # the limit of i32 offsets, the only bound a max_elements precondition may carry
 
 
 def bad(msg: str) -> Any:
@@ -259,6 +261,38 @@ def parse_grid(text: Any) -> "set[str]":
 # -- the pieces ----------------------------------------------------------------------------------------------------------
 
 
+def _value_of(text: str, where: str) -> "DimExpr | None":
+    """The affine dimension expression ``text`` denotes (``None`` when it is not affine)."""
+    p = _ExprParser(text, where)
+    value = p.expr()
+    p.done()
+    return value
+
+
+def _check_count_of(scalar: dict, by_name: dict) -> None:
+    """``count_of`` names a pointer argument; the scalar is the product of that pointer's shape.
+
+    When the product is affine the scalar's ``dim`` must be exactly that expression. When it is not
+    (two symbolic sizes), ``dim`` is a fresh dimension name, and ``count_of`` is how a host gets the value.
+    """
+    where = f"arg {scalar['name']} count_of"
+    target = by_name.get(scalar["count_of"])
+    if target is None or target["kind"] != "pointer":
+        bad(f"{where} {scalar['count_of']!r} must name a pointer argument")
+    product: "DimExpr | None" = DimExpr.const(1)
+    for i, entry in enumerate(target["shape"]):
+        factor = _value_of(entry, f"{where} shape[{i}]")
+        try:
+            product = None if factor is None or product is None else product * factor
+        except TilefishError:
+            product = None
+    if product is not None:
+        if _value_of(scalar["dim"], f"{where} dim") != product:
+            bad(f"{where}: arg {scalar['name']} carries {scalar['dim']!r} but the shape of {scalar['count_of']} has {product} elements")
+    elif not _IDENT.match(scalar["dim"]):
+        bad(f"{where}: the element count of {scalar['count_of']} is not an affine expression, so arg {scalar['name']} must carry a fresh dimension name, got {scalar['dim']!r}")
+
+
 def validate_precondition(d: Any) -> None:
     if not isinstance(d, dict) or d.get("kind") not in PRE_FIELDS:
         bad(f"precondition kind must be one of {sorted(PRE_FIELDS)}, got {d.get('kind') if isinstance(d, dict) else d!r}")
@@ -277,6 +311,14 @@ def validate_precondition(d: Any) -> None:
     for k in ("value", "by", "bytes"):
         if k in d:
             _int(d[k], f"{kind} precondition {k}", 1)
+    if kind == "max_elements":
+        if d["value"] != MAX_ELEMENTS:
+            bad(f"max_elements precondition value must be {MAX_ELEMENTS} (the limit of i32 offsets), got {d['value']!r}")
+        shape = d["shape"]
+        if not isinstance(shape, list):
+            bad("max_elements precondition shape must be a list of dimension strings")
+        for i, dim in enumerate(shape):
+            parse_expression(dim, f"max_elements precondition shape[{i}]")
     if "buckets" in d:
         b = d["buckets"]
         if not isinstance(b, list) or not b or any(not is_int(x) or x < 1 for x in b) or b != sorted(set(b)):
@@ -285,7 +327,7 @@ def validate_precondition(d: Any) -> None:
 
 def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     """Check one serialized argument. From schema 2 on a constexpr may carry its declared ``dtype``."""
-    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "dim", "value"])
+    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "dim", "value", "count_of"])
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
     kind, ty = d["kind"], d["type"]
@@ -298,6 +340,8 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         "constexpr": {"value"},
     }[kind]
     optional = {"dtype"} if kind == "constexpr" and schema >= SCHEMA_VERSION else set()
+    if kind == "scalar" and schema >= SCHEMA_VERSION:
+        optional = {"count_of"}  # the pointer argument whose element count this scalar carries
     if not expected <= present <= expected | optional:
         bad(f"arg {d['name']} ({kind}) must have exactly the fields {sorted(expected)}, has {sorted(present)}")
     if kind == "pointer":
@@ -314,6 +358,8 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         if ty != "i32" or d["dtype"] != "i32":
             bad(f"arg {d['name']}: a runtime scalar must be i32, got {ty!r}/{d['dtype']!r}")
         parse_expression(d["dim"], f"arg {d['name']} dim")
+        if "count_of" in d:
+            _ident(d["count_of"], f"arg {d['name']} count_of")
     else:
         if ty != "constexpr":
             bad(f"arg {d['name']}: a constexpr's type must be 'constexpr', got {ty!r}")
@@ -387,6 +433,11 @@ def validate_spec(d: Any) -> None:
     scalars = [a for a in args if a["kind"] == "scalar"]
     constexprs = [a for a in args if a["kind"] == "constexpr"]
 
+    # a scalar that carries an element count: the pointer's shape says how to compute it
+    for a in scalars:
+        if "count_of" in a:
+            _check_count_of(a, by_name)
+
     # signature <=> args
     sig = d["signature"]
     if not isinstance(sig, dict) or list(sig.items()) != [(a["name"], a["type"]) for a in args]:
@@ -413,10 +464,13 @@ def validate_spec(d: Any) -> None:
         bad("preconditions must be a list")
     aligned: set[int] = set()
     divisible: set[int] = set()
+    limited: set[int] = set()
     bucket_pres: dict[str, int] = {}
     for p in pres:
         validate_precondition(p)
         kind = p["kind"]
+        if kind == "max_elements" and schema < SCHEMA_VERSION:
+            bad(f"a max_elements precondition needs schema {SCHEMA_VERSION}, this spec is schema {schema}")
         if kind == "bucket":
             if p["dim"] in bucket_pres or buckets.get(p["dim"]) != p["value"] or p["value"] not in p["buckets"]:
                 bad(f"bucket precondition for {p['dim']} disagrees with the spec's buckets")
@@ -434,6 +488,10 @@ def validate_spec(d: Any) -> None:
                 bad(f"divisible must be by a multiple of {ALIGNMENT}, once, on a runtime scalar with its own dim ({p['arg']})")
             divisible.add(p["index"])
             dims |= parse_expression(p["dim"], "divisible dim")
+        elif kind == "max_elements":
+            if a["kind"] != "pointer" or p["index"] in limited or p["shape"] != a["shape"]:
+                bad(f"max_elements must be once, on a pointer argument, with that argument's own shape ({p['arg']})")
+            limited.add(p["index"])
         else:  # static_size
             if a["kind"] != "pointer" or p["axis"] >= len(a["shape"]) or a["shape"][p["axis"]] != str(p["value"]):
                 bad(f"static_size of {p['arg']} axis {p['axis']} does not match its shape")

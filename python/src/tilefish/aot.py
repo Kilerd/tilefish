@@ -45,6 +45,16 @@ is never serialized. Every spec also carries
 ``declaration_digest``, a sha256 over the canonical declaration (see :func:`declaration_digest`),
 which a tool without the declaration at hand can compare.
 
+Kernels that tilefish generated (``tilefish.lower``) add two optional facts to their specs, both
+schema 2 only and never present in the specs of a hand-written ``extern``: a ``max_elements``
+precondition per tensor whose element count is not statically bounded (the generated code indexes
+with ``i32``; see :class:`Precondition`), and ``count_of`` on a runtime scalar that carries the element
+count of a tensor argument (see :class:`ArgSpec`).
+
+The fingerprint behind ``verified`` keeps the order of what carries order: ``signature`` (the argument
+order Triton sees) and ``buckets`` are hashed as lists, so reordering either in place withdraws the
+verification, like editing any other field.
+
 Schema 2 (this version) adds the digest and the constexpr dtypes to schema 1. Schema 1 specs are
 still read, but they have neither, so they are *unverifiable*: ``verify_against`` refuses them
 and the spec has to be regenerated with :func:`compile_specs`.
@@ -107,7 +117,11 @@ class Precondition:
     * ``"static_size"``: axis ``axis`` of tensor argument ``arg`` equals ``value``;
     * ``"bucket"``: dimension ``dim`` equals ``value`` exactly. ``value`` is the bucket this
       binary was compiled for and ``buckets`` lists every bucket, so a host can pick the
-      smallest one that is at least the real size and pad up to it.
+      smallest one that is at least the real size and pad up to it;
+    * ``"max_elements"`` (kernels that tilefish generated, which index with ``i32``): the number of
+      elements of tensor argument ``arg``, the product of its ``shape`` entries evaluated at launch,
+      is at most ``value`` (``2**31 - 1``). A tensor whose size is statically small has no such
+      precondition.
     """
 
     kind: str
@@ -119,10 +133,11 @@ class Precondition:
     by: int | None = None
     bytes: int | None = None
     buckets: tuple[int, ...] | None = None
+    shape: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
-        for k in ("kind", "arg", "index", "axis", "value", "dim", "by", "bytes", "buckets"):
+        for k in ("kind", "arg", "index", "axis", "value", "dim", "by", "bytes", "buckets", "shape"):
             v = getattr(self, k)
             if v is not None:
                 out[k] = list(v) if isinstance(v, tuple) else v
@@ -134,8 +149,9 @@ class Precondition:
         with _malformed():
             validate_precondition(d)
             kw = dict(d)
-            if kw.get("buckets") is not None:
-                kw["buckets"] = tuple(kw["buckets"])
+            for k in ("buckets", "shape"):
+                if kw.get(k) is not None:
+                    kw[k] = tuple(kw[k])
             return cls(**kw)
 
 
@@ -152,10 +168,13 @@ class ArgSpec:
     shape: tuple[str, ...] | None = None  # pointers: dimension expressions, as strings (static dims as values)
     dim: str | None = None  # scalars: the dimension expression whose value is passed
     value: Any = None  # constexprs: the compiled-in value
+    # scalars of a generated kernel only: the pointer argument whose element count (the product of its shape
+    # entries) this scalar carries, so a host computes the value without knowing the kernel
+    count_of: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"index": self.index, "name": self.name, "kind": self.kind, "type": self.type}
-        for k in ("access", "dtype", "dim"):
+        for k in ("access", "dtype", "dim", "count_of"):
             v = getattr(self, k)
             if v is not None:
                 out[k] = v
@@ -612,7 +631,7 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
             typed = p.default if isinstance(p.default, DimExpr) or p.default is MISSING else _typed_const(op.name, p, p.default)
             entry["default"] = _canonical_value(typed)
         params.append(entry)
-    return {
+    doc: dict[str, Any] = {
         "format": DIGEST_FORMAT,
         "op": op.name,
         "triton": op.triton,
@@ -621,6 +640,12 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         "grid": None if op.grid is None else [_canonical_dim(g) for g in op.grid],
         "params": params,
     }
+    # only kernels that tilefish generated have these; leaving them out otherwise keeps every other digest as it was
+    if op.max_elements:
+        doc["max_elements"] = dict(sorted(op.max_elements.items()))
+    if op.element_counts:
+        doc["element_counts"] = dict(sorted(op.element_counts.items()))
+    return doc
 
 
 def declaration_digest(op: ExternOp) -> str:
@@ -681,6 +706,9 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                 if d.is_static:
                     preconditions.append(Precondition("static_size", arg=p.name, index=i, axis=axis, value=d.value))
             shape = tuple(str(d.subst(mapping).folded()) for d in t.shape)  # bucket values and static dims, folded
+            limit = op.max_elements.get(p.name)  # only for kernels tilefish generated (i32 indexing)
+            if limit is not None:
+                preconditions.append(Precondition("max_elements", arg=p.name, index=i, value=limit, shape=shape))
             args.append(ArgSpec(i, p.name, "pointer", ptr, access=p.access, dtype=str(t.dtype), shape=shape))
         elif p.kind == "dim":
             assert p.dim is not None
@@ -688,7 +716,9 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
             if p.dim.is_divisible_by(ALIGNMENT):
                 attrs[(i,)] = [["tt.divisibility", ALIGNMENT]]
                 preconditions.append(Precondition("divisible", arg=p.name, index=i, dim=str(p.dim), by=ALIGNMENT))
-            args.append(ArgSpec(i, p.name, "scalar", "i32", dtype="i32", dim=str(p.dim)))
+            args.append(
+                ArgSpec(i, p.name, "scalar", "i32", dtype="i32", dim=str(p.dim), count_of=op.element_counts.get(p.name))
+            )
         else:
             assert p.default is not MISSING
             value = p.default
