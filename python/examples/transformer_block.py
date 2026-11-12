@@ -68,9 +68,7 @@ def swiglu(
 
 @tilefish.extern(triton="my_kernels:attention", num_warps=4, num_stages=2, grid=lambda T: (T, 16))
 def attention(
-    q: Tensor[T, D, bf16],
-    k: Tensor[T, D, bf16],
-    v: Tensor[T, D, bf16],
+    qkv: Tensor[T, 3 * D, bf16],  # the fused projection: q, k and v side by side, one pointer
     o: Out[Tensor[T, D, bf16]],
     n_tokens: T,
     HEAD_DIM: const = 128,
@@ -94,8 +92,8 @@ def gemm_mxfp8(a: Tensor[M, K, bf16], b: Tensor[N, K, mxfp8]) -> Tensor[M, N, bf
 
 def attention_sublayer(x, w_norm, w_qkv, w_o):
     h = rmsnorm(x, w_norm)
-    q, k, v = gemm(h, w_qkv).split(D, axis=-1)
-    return gemm(attention(q, k, v), w_o)
+    qkv = gemm(h, w_qkv)
+    return gemm(attention(qkv), w_o)
 
 
 @tilefish.graph
