@@ -23,9 +23,10 @@ compile spec per bucket); ``R`` is dynamic and only appears in the grid. Prologu
 ``D`` and ``BLOCK_D = next_pow2(D)`` are ``tl.constexpr`` parameters. ``[R, D]`` tensors are
 addressed with ``offs``, ``[D]`` with ``cols``, per-row tensors with ``row``. ``[D]`` tensors are
 read-only (storing one from every row program would race). ``num_warps`` is one warp per 256
-lanes of ``BLOCK_D``: ``clamp(BLOCK_D // 256, 1, 16)`` (a bucketed ``D`` uses its largest
-bucket, because a spec set has one ``num_warps``); ``@tilefish.kernel(num_warps=...)`` or
-``lower(num_warps=...)`` overrides it.
+lanes of ``BLOCK_D``: ``clamp(BLOCK_D // 256, 1, 16)``, and each bucket of a bucketed ``D`` gets the
+warps of its own ``BLOCK_D`` (the spec of the ``D = 96`` binary says 1 warp whether or not a
+``D = 4096`` bucket is declared, so the bits of a binary never depend on the other buckets; note 6).
+``@tilefish.kernel(num_warps=N)`` or ``lower(num_warps=N)`` pins ``N`` for every bucket.
 
 **elementwise** (grid ``(cdiv(n, 1024),)``). Every tensor has the same shape, flattened to
 ``n = prod(shape)``; no broadcasting except python and ``const`` scalars; no reductions. ``n`` is a
@@ -46,6 +47,12 @@ dimension counts, and every dimension is at least 1). A tensor whose size has no
 its shape and the bound, which a host checks at launch; a tensor that is statically small gets
 none. The generated code is the same either way. No loops, no strides (a View, a ``split`` or a
 call to a declared operator is rejected), ``num_stages = 3`` in the spec (irrelevant without loops).
+
+Compile options in every spec of a generated kernel: ``num_warps`` and ``num_stages``, and
+``enable_fp_fusion``, always written out: ``True``, which is Triton's default (the machine code is
+byte-identical to a spec without the key), or ``False`` for ``@tilefish.kernel(fp_fusion=False)`` /
+``lower(fp_fusion=False)``, which compiles without FMA contraction (note 2). The key is part of the
+declaration digest and of what ``verify_against`` checks; a hand-written ``extern`` never has it.
 
 Parameters of the generated function, in this order: the kernel's own parameters under their own
 names (tensors are pointers, ``const`` parameters are ``tl.constexpr`` with the declared default
@@ -78,9 +85,10 @@ IR                          Generated source                                    
 load of a tensor            ``tl.load(p + offs, mask=mask, other=0)``                   storage dtype, never pre-cast; masked
                                                                                          lanes read 0. ``[R]``/``[R, 1]``:
                                                                                          ``tl.load(p + row)``, no mask.
-``x.to(dt)``                ``v.to(tl.<dt>)``, exactly where the IR has the cast        Triton's default conversion, with the
-                                                                                         out-of-range behavior of note 1; no
-                                                                                         ``fp_downcast_rounding`` argument.
+``x.to(dt)``                ``v.to(tl.<dt>)``, exactly where the IR has the cast        Triton's default conversion (note 1);
+                                                                                         no ``fp_downcast_rounding`` argument.
+                                                                                         A float to integer cast is rejected
+                                                                                         (rule ``cast.float-to-int``).
                                                                                          A narrowing cast gets ``# rounding
                                                                                          point``. Nothing else is ever cast.
 store                       ``tl.store(p + offs, v, mask=mask)``                        the IR value as is (its dtype equals
@@ -96,8 +104,8 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
                             ``nan`` as ``float("inf")``), an int literal, or the            tensor it meets and is rounded to it:
                             ``const`` parameter's name                                      no promotion (note 3).
 ``a + b``, ``a - b``,       ``a + b``, ``a - b``, ``a * b``                                 dtypes f32, f16, bf16, i32, i64.
-``a * b``                                                                                    ``a * b + c`` is one FMA, one
-                                                                                         rounding (note 2).
+``a * b``                                                                                    ``a * b + c`` may round once, as
+                                                                                         one FMA (note 2).
 ``a / b``                   ``a / b``                                                       f32 only (note 4): ``div.full.f32``,
                                                                                          not IEEE division.
 ``rsqrt(x)``                ``tl.rsqrt(x)``                                                 f32 only; approximate (note 5).
@@ -131,23 +139,28 @@ Notes (the facts behind the table):
 
 1. **Casts.** Float to ``f16``/``bf16`` is ``cvt.rn.f16x2.f32`` / ``cvt.rn.bf16x2.f32``: round to nearest even,
    overflow to infinity (65520 is the first f32 that becomes ``inf`` in f16), NaN stays NaN; the same bytes as
-   torch's cast. Float to integer truncates toward zero and, out of range, **saturates**: ``i32`` is
-   ``cvt.rzi.s32.f32`` (NaN is 0), ``i64`` is ``cvt.rzi.s64.f32`` (NaN is ``-2**63``, not 0). Float to ``u8`` is
-   ``cvt.rzi.u16.f32`` followed by keeping the **low byte**: the value is truncated and clamped to [0, 65535]
-   (negative and NaN give 0), then reduced modulo 256, so ``-1.5`` is 0, ``255.5`` is 255, ``256`` is 0,
-   ``300`` is 44, ``1000`` is 232 and anything from 65535 up (infinity included) is 255. It neither
-   saturates at 255 nor wraps like C. Float to ``e4m3`` / ``e5m2`` is ``cvt.rn.satfinite.e4m3x2.f32`` /
-   ``cvt.rn.satfinite.e5m2x2.f32``: round to nearest even and **saturate** at the largest finite value (448,
-   57344), infinities included; NaN stays NaN. torch's ``.to`` differs on out-of-range values (``-1.5``
-   to ``u8`` is 255, 1000 to ``e4m3`` is NaN, 1e5 to ``e5m2`` is ``inf``), so the ``reference`` mode implements
-   this table instead of torch's cast.
-2. **FMA contraction.** Triton compiles with ``enable_fp_fusion=True`` (``compile_specs`` does not change that), so
-   ``a * b + c`` is one FMA with one rounding: ``fma.rn.f32`` for f32 and ``fma.rn.bf16x2``, a native packed bf16
-   FMA, for bf16. Without contraction it is ``mul.rn`` then ``add.rn`` (two roundings). The two results differ
-   in 23% of random elements (22.9% in bf16, 23.4% in f32), and the contracted one is exactly the correctly
-   rounded value of the exact product and sum. Contraction also changes the bytes of the goldens that have a
-   contractable ``a * b + c`` (layernorm: 3 to 8 of 197376 elements, one bf16 ULP; the README rmsnorm: 1 to 2 of 657920);
-   softmax, gelu and swiglu come out byte-identical either way.
+   torch's cast. Float to ``e4m3`` / ``e5m2`` is ``cvt.rn.satfinite.e4m3x2.f32`` / ``cvt.rn.satfinite.e5m2x2.f32``:
+   round to nearest even and **satfinite**, saturating at the largest finite value (448, 57344) with
+   infinities included, where torch overflows to NaN (1000 to ``e4m3``) or infinity (1e5 to ``e5m2``); NaN stays
+   NaN. The ``reference`` mode models ``satfinite``, not torch's cast. Integer to float and integer to integer
+   casts are the plain conversions. A **float to integer cast is rejected** by the lowering (rule
+   ``cast.float-to-int``), because its rounding and saturation modes are not supported yet; what Triton does,
+   measured for a hand-written kernel on sm_103, is the reason: ``i32`` is ``cvt.rzi.s32.f32`` (truncation toward zero,
+   saturating, NaN is 0), ``i64`` is ``cvt.rzi.s64.f32`` (the same, but NaN is ``-2**63``), and ``u8`` is
+   ``cvt.rzi.u16.f32`` followed by keeping the low byte: truncated and clamped to [0, 65535] (negative and NaN
+   give 0), then reduced modulo 256, so ``-1.5`` is 0, ``255.5`` is 255, ``256`` is 0, ``300`` is 44, ``1000`` is
+   232 and anything from 65535 up is 255; it neither saturates at 255 nor wraps like C. torch differs again
+   (``-1.5`` to ``u8`` is 255).
+2. **FMA contraction.** A generated kernel asks Triton for ``enable_fp_fusion=True`` (Triton's default, written
+   into the spec), so ``a * b + c`` **may round once**: it is one FMA, ``fma.rn.f32`` for f32 and ``fma.rn.bf16x2``,
+   a native packed bf16 FMA, for bf16. With ``@tilefish.kernel(fp_fusion=False)`` it is ``mul.rn`` then ``add.rn``
+   (two roundings, "strict"). The two results differ in 23% of random elements (22.9% in bf16, 23.4% in f32), and
+   the contracted one is exactly the correctly rounded value of the exact product and sum. For the tail of layernorm,
+   ``(x - mean) * rstd * w + b`` in f32, contraction changes 25.7% of the elements and the strict build matches a
+   reference that rounds every operation exactly. On the goldens contraction changes the bytes of the ones that
+   have a contractable ``a * b + c`` (layernorm: 3 to 8 of 197376 elements, one bf16 ULP; the README rmsnorm: 1 to 2
+   of 657920); softmax, gelu and swiglu come out byte-identical either way. The explicit FMAs inside libdevice's
+   ``erf`` stay with ``fp_fusion=False``.
 3. **Scalars.** Triton 3.5.1 keeps the dtype of the tensor: a python float or a constexpr float combined with
    a bf16 tensor is bf16 (``tl.static_assert`` in a compiled kernel says so), and the scalar is rounded to
    bf16 first (0.1 becomes 0.10009765625). Nothing is promoted to f32: ``x * 0.1 + eps`` on bf16 is a single
@@ -176,11 +189,12 @@ Notes (the facts behind the table):
 6. **Reduction order and ``num_warps``.** The tree a reduction adds in depends on how many warps the block has,
    so the same kernel on the same data is not byte-identical across ``num_warps`` (129 rows with D = 96: 17 to 59
    rows differ from the 1-warp result in f32, depending on the kernel; with D = 1000: 28 to 125), though
-   always within a few ULP of the others and of torch's sum. A bucketed ``D`` has one ``num_warps`` for all its
-   binaries, from its largest bucket, so a small bucket runs with more warps than its own size would get (a
-   ``D = 96`` bucket of a kernel whose largest bucket is 2048 runs with 8 warps instead of 1: 25 of 129 rows
-   differ in the last bits). The result is correct either way, only a different, equally valid rounding. A
-   spec fixes ``num_warps``, so ``jit``, ``replay`` and a generated host all agree.
+   always within a few ULP of the others and of torch's sum. That is why each bucket of a bucketed ``D`` has the
+   warps of its own ``BLOCK_D``: the ``D = 96`` binary has 1 warp (128 lanes) whichever other buckets are declared
+   and has the same bits as a kernel whose ``D`` is 96 alone, instead of the warps of the largest bucket (which
+   made a ``D = 96`` bucket next to a ``D = 2048`` one run with 8 warps and differ from the 1-warp result in 25
+   of 129 rows). A spec fixes ``num_warps``, so ``jit``, ``replay`` and a generated host all agree, and
+   ``num_warps=N`` pins one value for every bucket.
 """
 
 from __future__ import annotations
@@ -267,6 +281,17 @@ class LoweredKernel:
         from .runtime import run
 
         return run(self, *args, mode=mode, **kwargs)
+
+    @property
+    def fp_fusion(self) -> bool:
+        """Whether the specs ask Triton for FMA contraction (``enable_fp_fusion``)."""
+        return bool(self.extern.fp_fusion)
+
+    @property
+    def bucket_num_warps(self) -> "dict[str, int]":
+        """The warp count of each bucket by stem suffix (``{".D96": 1, ".D1000": 4}``); empty when ``num_warps`` is
+        one value for every binary (an unbucketed kernel, or one that pins it)."""
+        return dict(self.extern.bucket_num_warps)
 
     @property
     def ref(self) -> str:
@@ -491,6 +516,16 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
         dst = n.outputs[0].type.dtype
         _check_dtype(kernel, f"the source of {n}", src)
         _check_dtype(kernel, f"the target of {n}", dst)
+        if src.is_float and dst.is_int:
+            raise _fail(
+                kernel,
+                None,
+                "cast.float-to-int",
+                f"{n}: casting {src} to {dst} is not lowered: the rounding and saturation modes of a float to integer "
+                "cast are not supported yet (Triton truncates toward zero and, out of range, saturates or keeps only "
+                "the low byte, depending on the integer type; see note 1 of the numerics contract). Round or clamp "
+                "explicitly in a typed op once one exists, or declare the kernel with extern",
+            )
     elif n.op != "store":
         raise _fail(kernel, None, "unsupported-op", f"the op '{n.op}' is not lowered")
 
@@ -539,6 +574,10 @@ class _Layout:
 
     def default_num_warps(self) -> int:
         raise NotImplementedError
+
+    def bucket_num_warps(self) -> "dict[str, int]":
+        """The warp count the template's rule gives each bucket of a bucketed dimension, by stem suffix (``".D96"``)."""
+        return {}
 
     def header(self) -> "list[str]":
         raise NotImplementedError
@@ -705,7 +744,18 @@ class _RowLayout(_Layout):
         ]
 
     def default_num_warps(self) -> int:
-        return max(1, min(ROW_MAX_WARPS, self.block_max // ROW_LANES_PER_WARP))
+        return _row_warps(self.block_max)
+
+    def bucket_num_warps(self) -> "dict[str, int]":
+        """One warp count per bucket of ``D``, from the ``BLOCK_D`` of that bucket alone (none for a static ``D``)."""
+        if self.D.is_static:
+            return {}
+        free = sorted(self.D.free_dims(), key=lambda x: x.name)  # the order compile_specs walks the buckets in
+        out: dict[str, int] = {}
+        for combo in itertools.product(*(x.buckets for x in free)):  # type: ignore[misc]
+            value = self.D.subst(dict(zip(free, combo))).value
+            out["".join(f".{x.name}{v}" for x, v in zip(free, combo))] = _row_warps(next_pow2(value))
+        return out
 
     def header(self) -> "list[str]":
         d = f"{self.D} (static)" if self.D.is_static else f"{self.D} (bucketed)"
@@ -729,6 +779,11 @@ class _RowLayout(_Layout):
             return f"tl.max(tl.where({self.mask}, {a}, float(\"-inf\")), axis=0)"
         total = f"tl.sum(tl.where({self.mask}, {a}, 0.0), axis=0)"
         return total if op == "sum" else f"{total} / {self.D_name}"
+
+
+def _row_warps(block: int) -> int:
+    """The row template's warp rule: one warp per 256 lanes of ``BLOCK_D``, between 1 and 16."""
+    return max(1, min(ROW_MAX_WARPS, block // ROW_LANES_PER_WARP))
 
 
 def _max_block(kernel: str, d: DimExpr) -> int:
@@ -997,6 +1052,7 @@ def lower(
     module: "str | None" = None,
     template: "str | None" = None,
     num_warps: "int | None" = None,
+    fp_fusion: "bool | None" = None,
 ) -> LoweredKernel:
     """Lower a ``@tilefish.kernel`` to Triton source.
 
@@ -1004,12 +1060,18 @@ def lower(
     ``"tilefish_generated.<kernel name>"``); the Triton reference is ``module:tf_<name>``.
     ``template`` forces ``"row"`` or ``"elementwise"``; by default the elementwise template is
     tried first and then the row template. ``num_warps`` overrides the kernel's own
-    ``num_warps=`` and the template's rule. Raises :class:`~tilefish.errors.TilefishLoweringError`
+    ``num_warps=`` and the template's rule, and pins the warp count of every bucket; without either,
+    each bucket of a bucketed ``D`` gets the warps of its own size. ``fp_fusion`` overrides the kernel's
+    own ``fp_fusion=`` (``False``: no FMA contraction). Raises :class:`~tilefish.errors.TilefishLoweringError`
     when the body fits no template.
     """
     module, fn_name = _check_names(op, module)
     if template is not None and template not in TEMPLATES:
         raise TilefishLoweringError(f"lower: template must be 'row' or 'elementwise', got {template!r}", rule="template")
+    if fp_fusion is None:
+        fp_fusion = op.fp_fusion
+    if not isinstance(fp_fusion, bool):
+        raise TilefishLoweringError(f"lower: fp_fusion must be True or False, got {fp_fusion!r}", rule="fp-fusion")
     if num_warps is None:
         num_warps = op.num_warps
     if num_warps is not None and (isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in NUM_WARPS):
@@ -1024,7 +1086,7 @@ def lower(
         except TilefishLoweringError as e:
             errors.append(e)
             continue
-        return _assemble(op, layout, module, fn_name, num_warps)
+        return _assemble(op, layout, module, fn_name, num_warps, fp_fusion)
     if len(errors) == 1:
         raise errors[0]
     detail = "; ".join(f"{e.rule}: {str(e).split('failed: ', 1)[-1]}" for e in errors)
@@ -1033,7 +1095,9 @@ def lower(
     )
 
 
-def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warps: "int | None") -> LoweredKernel:
+def _assemble(
+    op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warps: "int | None", fp_fusion: bool
+) -> LoweredKernel:
     graph = op.graph
     user = list(op.signature.params)
     names = _Names({p.name for p in user} | _RESERVED)
@@ -1052,8 +1116,15 @@ def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warp
             assert p.dim is not None
             taken_dims.update(p.dim.named_dims())
     extras = layout.extras(names, taken_dims)
+    bucket_warps: dict[str, int] = {}
     if num_warps is None:
-        num_warps = layout.default_num_warps()
+        num_warps = layout.default_num_warps()  # for a bucketed D: the largest bucket's, which no binary of a bucket falls back to
+        bucket_warps = layout.bucket_num_warps()  # each bucket has the warps of its own BLOCK_D
+    warps_header = (
+        f"num_warps: {num_warps}"
+        if not bucket_warps
+        else "num_warps: " + ", ".join(f"{w} for {s.lstrip('.')}" for s, w in bucket_warps.items())
+    )
 
     # the parameters of the generated function and of its typed stub, in order
     decls: list[str] = []
@@ -1081,7 +1152,8 @@ def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warp
     header = [
         f"Generated by tilefish.lower from the kernel '{op.name}'. Do not edit.",
         *layout.header(),
-        f"num_warps: {num_warps}",
+        warps_header,
+        *(["fp_fusion: False (no FMA contraction: a * b + c rounds twice)"] if not fp_fusion else []),
         *[f"parameter '{old}' of the kernel is '{new}' here (the name is used by this module)" for old, new in rename.items()],
         "Numerics contract: see the docstring of tilefish.lower.",
     ]
@@ -1101,6 +1173,8 @@ def _assemble(op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warp
         layout.grid,
         max_elements=max_elements,
         element_counts=element_counts,
+        fp_fusion=fp_fusion,
+        bucket_num_warps=bucket_warps,
     )
     return LoweredKernel(op.name, fn_name, module, layout.template, source, extern, num_warps, op)
 

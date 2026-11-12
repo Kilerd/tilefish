@@ -355,8 +355,12 @@ def test_bucketed_d_gives_one_spec_per_bucket():
         back.verify_against(lowered.extern)
         assert back.verified and back.ast_source_inputs().constants == spec.ast_source_inputs().constants
     assert [s.constants for s in specs] == [{(3,): 256, (4,): 256}, {(3,): 1000, (4,): 1024}, {(3,): 4096, (4,): 4096}]
-    # one source for all buckets; one num_warps for the set, from the largest bucket (4096 lanes: 16 warps)
-    assert {s.num_warps for s in specs} == {16} and lowered.num_warps == 16
+    # one source for all buckets; each bucket has the warps of its own BLOCK_D (one per 256 lanes): 256 -> 1,
+    # 1000 -> 1024 lanes -> 4, 4096 -> 16. `lowered.num_warps` is the largest bucket's.
+    assert [s.num_warps for s in specs] == [1, 4, 16] and lowered.num_warps == 16
+    assert [s.block for s in specs] == [(32, 1, 1), (128, 1, 1), (512, 1, 1)]
+    assert lowered.bucket_num_warps == {".Hb256": 1, ".Hb1000": 4, ".Hb4096": 16}
+    assert "num_warps: 1 for Hb256, 4 for Hb1000, 16 for Hb4096" in lowered.source.splitlines()[3]
     assert [s.buckets for s in specs] == [{"Hb": 256}, {"Hb": 1000}, {"Hb": 4096}]
     assert [a.shape for a in specs[1].args if a.kind == "pointer"] == [("M", "1000"), ("1000",), ("M", "1000")]
     assert [(p.kind, p.dim, p.value) for p in specs[1].preconditions if p.kind == "bucket"] == [("bucket", "Hb", 1000)]

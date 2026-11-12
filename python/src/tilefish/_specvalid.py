@@ -386,9 +386,12 @@ def validate_spec(d: Any) -> None:
         raise TilefishSpecError(
             f"unsupported compile spec schema {schema!r} (this version reads schemas {LEGACY_SCHEMA} and {SCHEMA_VERSION})"
         )
-    _keys(d, "spec", TOP_KEYS_V2 if schema >= SCHEMA_VERSION else TOP_KEYS)
+    # enable_fp_fusion exists in schema 2 only, and only in the specs of kernels that tilefish generated
+    _keys(d, "spec", TOP_KEYS_V2 if schema >= SCHEMA_VERSION else TOP_KEYS, ["enable_fp_fusion"] if schema >= SCHEMA_VERSION else [])
     if schema >= SCHEMA_VERSION and not (isinstance(d["declaration_digest"], str) and _DIGEST.match(d["declaration_digest"])):
         bad(f"declaration_digest must be 64 lowercase hex digits (a sha256), got {d['declaration_digest']!r}")
+    if "enable_fp_fusion" in d and not isinstance(d["enable_fp_fusion"], bool):
+        bad(f"enable_fp_fusion must be true or false, got {d['enable_fp_fusion']!r}")
 
     # names
     op = _ident(d["op"], "op")

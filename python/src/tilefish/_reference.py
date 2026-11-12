@@ -3,10 +3,10 @@
 It is an oracle for the Triton binaries, written to follow the numerics contract of :mod:`tilefish.lower`
 node by node:
 
-* a cast happens exactly where the IR has one (``.to(dtype)``, nowhere else), with the out-of-range
-  behavior the contract states (float to ``u8`` clamps to ``[0, 65535]`` and keeps the low byte, to
-  ``i32``/``i64`` saturates, to ``e4m3``/``e5m2`` saturates to the largest finite value; NaN as the
-  contract says), which is not what torch does for those casts;
+* a cast happens exactly where the IR has one (``.to(dtype)``, nowhere else); a cast to ``e4m3`` or ``e5m2``
+  is ``satfinite`` like the binaries (saturating at 448 and 57344, where torch gives NaN or infinity), and the
+  half types round to nearest even like torch. A float to integer cast is torch's, which is a plain truncation
+  in range; the lowering rejects it (rule ``cast.float-to-int``), so no binary has a behavior to compare with;
 * every other operation runs in the dtype the IR gave its result, and a python scalar or ``const`` is a 0-d
   tensor of that dtype (a bf16 tensor combined with a float scalar rounds the scalar to bf16 first, as
   Triton does);
@@ -57,33 +57,17 @@ def reciprocal(torch: Any, value: float, dtype: Any, device: Any) -> Any:
 
 
 def cast(torch: Any, x: Any, src: Any, dst: Any) -> Any:
-    """``x.to(dst)`` with the semantics of Triton's ``.to`` on the GPU, including out of range values.
+    """``x.to(dst)``, with ``satfinite`` for the fp8 types.
 
-    ``src`` and ``dst`` are tilefish dtypes. Float to ``u8``: the value is truncated toward zero, clamped
-    to [0, 65535] (negative and NaN give 0) and the low 8 bits are kept. Float to ``i32``: truncation toward
-    zero, saturating at the ends of the range, NaN is 0. Float to ``i64``: the same, but NaN is the most
-    negative value. Float to ``e4m3`` / ``e5m2``: round to nearest even, saturating at the largest finite
-    value (448, 57344) instead of overflowing to NaN or infinity; NaN stays NaN.
+    ``src`` and ``dst`` are tilefish dtypes. Float to ``e4m3`` / ``e5m2``: round to nearest even, saturating at
+    the largest finite value (448, 57344), infinities included, instead of overflowing to NaN or infinity as
+    torch does; NaN stays NaN. Every other cast is torch's (a float to integer cast is not lowered, see
+    ``cast.float-to-int``, so only its in-range truncation toward zero is meaningful here).
     """
     target = torch_dtype(torch, dst)
-    if not src.is_float:
-        return x.to(target)
-    name = dst.name
-    if name == "u8":
-        y = torch.nan_to_num(x.to(torch.float32), nan=0.0).clamp(0.0, 65535.0).trunc().to(torch.int32)
-        return (y & 0xFF).to(torch.uint8)
-    if name == "i32":
-        y = torch.nan_to_num(x.to(torch.float32), nan=0.0).clamp(-(2.0**31), 2.0**31).trunc().to(torch.int64)
-        return y.clamp(-(2**31), 2**31 - 1).to(torch.int32)
-    if name == "i64":
-        f = x.to(torch.float32)
-        y = f.clamp(-(2.0**63), 2.0**63)
-        r = y.trunc().to(torch.int64)  # 2**63 itself overflows the conversion: handled below
-        r = torch.where(y >= 2.0**63, torch.full_like(r, 2**63 - 1), r)
-        return torch.where(torch.isnan(f), torch.full_like(r, -(2**63)), r)
-    if name == "e4m3":
+    if src.is_float and dst.name == "e4m3":
         return x.to(torch.float32).clamp(-_E4M3_MAX, _E4M3_MAX).to(target)
-    if name == "e5m2":
+    if src.is_float and dst.name == "e5m2":
         return x.to(torch.float32).clamp(-_E5M2_MAX, _E5M2_MAX).to(target)
     return x.to(target)
 

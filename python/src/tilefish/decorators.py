@@ -212,16 +212,25 @@ class KernelOp(GraphOp):
     """A kernel whose body tilefish understands: traced, type-checked, and lowerable to Triton source.
 
     ``num_warps`` (``None`` for the template's default rule) is the launch warp count the
-    lowering uses; see :func:`tilefish.lower`.
+    lowering uses, for every bucket; ``fp_fusion`` says whether ``a * b + c`` may be contracted
+    into one FMA with one rounding (``True``, Triton's default) or must round twice (``False``);
+    see :func:`tilefish.lower`.
     """
 
     kind = "kernel"
 
     def __init__(
-        self, fn: Callable[..., Any], name: str, signature: Signature, graph: Graph, num_warps: "int | None" = None
+        self,
+        fn: Callable[..., Any],
+        name: str,
+        signature: Signature,
+        graph: Graph,
+        num_warps: "int | None" = None,
+        fp_fusion: bool = True,
     ) -> None:
         super().__init__(fn, name, signature, graph)
         self.num_warps = num_warps
+        self.fp_fusion = fp_fusion
 
     def lower(self, **options: Any) -> Any:
         """Lower this kernel to Triton source: ``tilefish.lower(self, **options)``."""
@@ -253,19 +262,29 @@ def graph(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> A
     return _declare_traced(fn, name, GraphOp, "graph")
 
 
-def kernel(fn: Callable[..., Any] | None = None, *, name: str | None = None, num_warps: int | None = None) -> Any:
+def kernel(
+    fn: Callable[..., Any] | None = None,
+    *,
+    name: str | None = None,
+    num_warps: int | None = None,
+    fp_fusion: bool = True,
+) -> Any:
     """``@tilefish.kernel``: trace and type-check a kernel body; ``.lower()`` turns it into Triton source.
 
-    ``num_warps`` overrides the lowering's default warp count (a power of two from 1 to 32).
+    ``num_warps`` pins the warp count of every binary (a power of two from 1 to 32); without it the
+    lowering's rule gives each binary its own. ``fp_fusion=False`` compiles without FMA contraction, so that
+    ``a * b + c`` rounds the product and then the sum (the default, ``True``, lets the compiler round once).
     """
     _check_decorator_arg("kernel", fn)
     if num_warps is not None and (
         isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS
     ):
         raise TilefishDeclarationError(f"kernel: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
+    if not isinstance(fp_fusion, bool):
+        raise TilefishDeclarationError(f"kernel: fp_fusion must be True or False, got {fp_fusion!r}")
     if fn is None:
-        return lambda f: _declare_traced(f, name, KernelOp, "kernel", num_warps=num_warps)
-    return _declare_traced(fn, name, KernelOp, "kernel", num_warps=num_warps)
+        return lambda f: _declare_traced(f, name, KernelOp, "kernel", num_warps=num_warps, fp_fusion=fp_fusion)
+    return _declare_traced(fn, name, KernelOp, "kernel", num_warps=num_warps, fp_fusion=fp_fusion)
 
 
 # -- extern -----------------------------------------------------------------------------------
@@ -381,14 +400,19 @@ class ExternOp(Op):
     parameters: tensors are pointers, a parameter annotated with a runtime
     ``Dim`` is an ``i32`` scalar, a ``const`` parameter is a ``constexpr``.
 
-    Two optional facts exist for kernels that tilefish generated (``@tilefish.extern`` never sets them,
-    so the specs of a hand-written kernel say nothing about its indexing):
+    Four optional facts exist for kernels that tilefish generated (``@tilefish.extern`` never sets them,
+    so the specs of a hand-written kernel say nothing about its indexing, its contraction or a warp count
+    per bucket):
 
     * ``max_elements`` maps tensor parameters to the largest element count the kernel can index (its
       offsets are ``i32``); every spec of the op then carries a ``max_elements`` precondition on those
       arguments, which a host checks at launch.
     * ``element_counts`` maps runtime scalar parameters to the tensor parameter whose element count (the
       product of its shape) the scalar carries; the spec records how a host computes the value.
+    * ``fp_fusion`` (``True`` or ``False``) puts ``enable_fp_fusion`` into the compile options of every
+      spec; ``None`` leaves the option out, which is Triton's default (contraction on).
+    * ``bucket_num_warps`` maps a bucket's stem suffix (``".D96"``) to its warp count, so that each
+      binary of a bucketed op has the warps for its own size; a bucket without an entry has ``num_warps``.
     """
 
     kind = "extern"
@@ -405,6 +429,8 @@ class ExternOp(Op):
         *,
         max_elements: "dict[str, int] | None" = None,
         element_counts: "dict[str, str] | None" = None,
+        fp_fusion: "bool | None" = None,
+        bucket_num_warps: "dict[str, int] | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         self.triton = triton
@@ -424,6 +450,19 @@ class ExternOp(Op):
                 raise TilefishDeclarationError(f"extern '{name}': element_counts: '{k}' is not a runtime scalar parameter")
             if v not in by_name or by_name[v].kind != "tensor":
                 raise TilefishDeclarationError(f"extern '{name}': element_counts['{k}'] must name a tensor parameter, got {v!r}")
+        if fp_fusion is not None and not isinstance(fp_fusion, bool):
+            raise TilefishDeclarationError(f"extern '{name}': fp_fusion must be True, False or None, got {fp_fusion!r}")
+        self.fp_fusion: "bool | None" = fp_fusion
+        self.bucket_num_warps: dict[str, int] = dict(bucket_num_warps or {})
+        for k, v in self.bucket_num_warps.items():
+            if not isinstance(k, str) or not re.fullmatch(r"(\.[A-Za-z_][A-Za-z0-9_]*[0-9]+)+", k):
+                raise TilefishDeclarationError(
+                    f"extern '{name}': bucket_num_warps keys are stem suffixes such as '.D96', got {k!r}"
+                )
+            if isinstance(v, bool) or not isinstance(v, int) or v not in _NUM_WARPS:
+                raise TilefishDeclarationError(
+                    f"extern '{name}': bucket_num_warps['{k}'] must be a power of two from 1 to 32, got {v!r}"
+                )
 
     @property
     def triton_module(self) -> str:

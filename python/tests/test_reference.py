@@ -159,20 +159,15 @@ def probe(values):
 
 
 # What the binaries do (measured on an sm_103 GPU, asserted there by test_gpu_numerics.py): the tables of cast_cases.
-def test_float_to_u8_clamps_to_16_bits_and_keeps_the_low_byte():
-    y = tilefish.run(cast_cases.to_u8, probe(cast_cases.U8_INPUT), mode="reference")
-    assert y.dtype == torch.uint8
-    assert y[: len(cast_cases.U8_INPUT)].tolist() == cast_cases.U8_OUTPUT
-
-
-def test_float_to_i32_saturates_and_nan_is_zero():
-    y = tilefish.run(cast_cases.to_i32, probe(cast_cases.I32_INPUT), mode="reference")
-    assert y[: len(cast_cases.I32_INPUT)].tolist() == cast_cases.I32_OUTPUT
-
-
-def test_float_to_i64_saturates_and_nan_is_the_most_negative_value():
-    y = tilefish.run(cast_cases.to_i64, probe(cast_cases.I64_INPUT), mode="reference")
-    assert y[: len(cast_cases.I64_INPUT)].tolist() == cast_cases.I64_OUTPUT
+# A float to integer cast is not lowered, so the reference has no binary to follow there: it is torch's cast.
+def test_a_float_to_integer_cast_is_torchs_and_truncates_toward_zero_in_range():
+    values = [0.0, 0.5, 1.9, 127.5, 200.9, 254.9]
+    x = probe(values)
+    for kernel, dtype in ((cast_cases.to_i32, torch.int32), (cast_cases.to_i64, torch.int64), (cast_cases.to_u8, torch.uint8)):
+        y = tilefish.run(kernel, x, mode="reference")
+        assert y.dtype == dtype and y[: len(values)].tolist() == [0, 0, 1, 127, 200, 254]
+    signed = tilefish.run(cast_cases.to_i32, probe([-1.9, -0.5]), mode="reference")
+    assert signed[:2].tolist() == [-1, 0]
 
 
 @pytest.mark.parametrize("kernel, table", [(cast_cases.to_e4m3, cast_cases.E4M3_TABLE), (cast_cases.to_e5m2, cast_cases.E5M2_TABLE)])

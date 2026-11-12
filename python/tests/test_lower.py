@@ -272,7 +272,8 @@ def test_specs_are_verified_and_usable_for_compiling(cases, name):
         assert spec.verified and spec.declaration_digest
         inputs = spec.ast_source_inputs()  # refuses an unverified spec
         assert inputs.signature == EXPECTED[name]["signature"] and inputs.constants == EXPECTED[name]["constants"]
-        assert inputs.options == {"num_warps": EXPECTED[name]["num_warps"], "num_stages": 3}
+        # a generated kernel writes Triton's default contraction out, so that it is part of the spec
+        assert inputs.options == {"num_warps": EXPECTED[name]["num_warps"], "num_stages": 3, "enable_fp_fusion": True}
         back = CompileSpec.from_json(spec.to_json())
         assert not back.verified
         with pytest.raises(tilefish.TilefishSpecError, match="verify_against"):

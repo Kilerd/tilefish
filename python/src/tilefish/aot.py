@@ -234,7 +234,7 @@ class AstSourceInputs:
     signature: dict[str, str]
     attrs: dict[tuple[int, ...], list[list[Any]]]
     constants: dict[tuple[int, ...], Any]
-    options: dict[str, int]
+    options: dict[str, Any]
 
     @property
     def signature_by_index(self) -> dict[int, str]:
@@ -270,6 +270,9 @@ class CompileSpec:
     # sha256 of the canonical declaration this spec was generated from (see declaration_digest). ``None`` for
     # a spec read from schema 1, which has none: such a spec cannot be verified, only regenerated.
     declaration_digest: str | None = None
+    # Triton's ``enable_fp_fusion`` for a kernel that tilefish generated: ``True`` is Triton's default, written out;
+    # ``False`` asks for no FMA contraction. ``None`` (every ``extern``) leaves the option out of the compile options.
+    enable_fp_fusion: bool | None = None
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
@@ -337,11 +340,14 @@ class CompileSpec:
                 f"compile spec '{self.stem}' has not been verified against its declaration, so it must not be "
                 "compiled: call spec.verify_against(op) first (a spec from compile_specs(op) is already verified)"
             )
+        options: dict[str, Any] = {"num_warps": self.num_warps, "num_stages": self.num_stages}
+        if self.enable_fp_fusion is not None:
+            options["enable_fp_fusion"] = self.enable_fp_fusion
         return AstSourceInputs(
             signature=dict(self.signature),
             attrs=copy.deepcopy(self.attrs),
             constants=dict(self.constants),
-            options={"num_warps": self.num_warps, "num_stages": self.num_stages},
+            options=options,
         )
 
     @property
@@ -381,6 +387,8 @@ class CompileSpec:
         }
         if self.declaration_digest is not None:
             doc["declaration_digest"] = self.declaration_digest
+        if self.enable_fp_fusion is not None:
+            doc["enable_fp_fusion"] = self.enable_fp_fusion
         return doc
 
     def to_json(self, indent: int | None = 2) -> str:
@@ -423,6 +431,7 @@ class CompileSpec:
                 args=tuple(ArgSpec.from_dict(a) for a in d["args"]),
                 buckets=dict(d["buckets"]),
                 declaration_digest=d.get("declaration_digest"),
+                enable_fp_fusion=d.get("enable_fp_fusion"),
             )
 
     def verify_against(self, op: ExternOp) -> None:
@@ -649,6 +658,10 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc["max_elements"] = dict(sorted(op.max_elements.items()))
     if op.element_counts:
         doc["element_counts"] = dict(sorted(op.element_counts.items()))
+    if op.fp_fusion is not None:
+        doc["fp_fusion"] = op.fp_fusion
+    if op.bucket_num_warps:
+        doc["bucket_num_warps"] = dict(sorted(op.bucket_num_warps.items()))
     return doc
 
 
@@ -748,7 +761,9 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
 
     launch = [LaunchParam(a.name, a.type) for a in args if a.kind != "constexpr"]
     launch += [LaunchParam("global_scratch", "u64", 0), LaunchParam("profile_scratch", "u64", 0)]
-    stem = op.name + "".join(f".{d.name}{v}" for d, v in mapping.items())
+    suffix = "".join(f".{d.name}{v}" for d, v in mapping.items())
+    stem = op.name + suffix
+    num_warps = op.bucket_num_warps.get(suffix, op.num_warps)  # only a kernel that tilefish generated has one per bucket
     spec = CompileSpec(
         stem=stem,
         op=op.name,
@@ -756,15 +771,16 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         signature=signature,
         constants=constants,
         attrs=attrs,
-        num_warps=op.num_warps,
+        num_warps=num_warps,
         num_stages=op.num_stages,
         grid=grid_to_string(grid),
-        block=(32 * op.num_warps, 1, 1),
+        block=(32 * num_warps, 1, 1),
         launch_params=tuple(launch),
         preconditions=tuple(preconditions),
         args=tuple(args),
         buckets={d.name: v for d, v in mapping.items()},
         declaration_digest=digest,
+        enable_fp_fusion=op.fp_fusion,
     )
     spec._mark_verified()  # generated from the declaration just now
     return spec
@@ -779,7 +795,11 @@ def compile_specs(op: ExternOp) -> list[CompileSpec]:
     dims = _bucket_dims(op)
     combos = itertools.product(*(d.buckets for d in dims)) if dims else [()]  # type: ignore[arg-type]
     digest = declaration_digest(op)
-    return [_build(op, dict(zip(dims, combo)), digest) for combo in combos]
+    specs = [_build(op, dict(zip(dims, combo)), digest) for combo in combos]
+    unused = sorted(set(op.bucket_num_warps) - {s.stem[len(op.name) :] for s in specs})
+    if unused:
+        raise TilefishSpecError(f"extern op '{op.name}': bucket_num_warps names buckets that the op does not have: {unused}")
+    return specs
 
 
 # The build step lives in _build.py. It needs nothing from this module at import time, so importing it last

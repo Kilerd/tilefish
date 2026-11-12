@@ -62,6 +62,11 @@ class TilefishRuntimeError(TilefishError, RuntimeError):
     """
 
 
+class TilefishManifestError(TilefishRuntimeError):
+    """A manifest directory cannot be replayed: a file is missing or malformed, a cubin does not match the digests
+    the manifest records, or the binary is not the one the compile spec of the operator asks for."""
+
+
 class TilefishPreconditionError(TilefishRuntimeError):
     """An argument violates a precondition of the binary it would run on (the types and the compile spec).
 
