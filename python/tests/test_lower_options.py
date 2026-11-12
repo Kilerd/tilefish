@@ -208,7 +208,7 @@ def test_enable_fp_fusion_in_a_serialized_spec_is_validated():
     legacy = copy.deepcopy(doc)  # schema 1 has no such key
     legacy["schema"] = 1
     del legacy["declaration_digest"]
-    with pytest.raises(TilefishSpecError, match="unknown fields \\['enable_fp_fusion'\\]"):
+    with pytest.raises(TilefishSpecError, match="unknown fields .*enable_fp_fusion"):
         CompileSpec.from_dict(legacy)
 
 

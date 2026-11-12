@@ -325,7 +325,8 @@ def test_max_elements_must_sit_on_a_pointer_and_needs_schema_2(softmax_doc):
     old = copy.deepcopy(softmax_doc)
     old["schema"] = 1
     del old["declaration_digest"]
-    old.pop("enable_fp_fusion", None)  # a schema 1 spec has neither
+    old.pop("enable_fp_fusion", None)  # a schema 1 spec has neither, nor a source digest
+    old.pop("source_sha256", None)
     with pytest.raises(TilefishSpecError, match="needs schema 2"):
         CompileSpec.from_dict(old)
 
@@ -418,7 +419,8 @@ def test_count_of_is_validated():
     old = json.loads(nonaffine.to_json())
     old["schema"] = 1
     del old["declaration_digest"]
-    old.pop("enable_fp_fusion", None)  # a schema 1 spec has neither
+    old.pop("enable_fp_fusion", None)  # a schema 1 spec has neither, nor a source digest
+    old.pop("source_sha256", None)
     old["preconditions"] = [p for p in old["preconditions"] if p["kind"] != "max_elements"]
     with pytest.raises(TilefishSpecError, match="must have exactly the fields"):
         CompileSpec.from_dict(old)  # schema 1 has no count_of

@@ -290,6 +290,7 @@ def kernel(
 # -- extern -----------------------------------------------------------------------------------
 
 _TRITON_REF = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*\Z")
+_OP_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")  # ASCII only: an op name is part of a stem, which is part of a file name
 _NUM_WARPS = (1, 2, 4, 8, 16, 32)
 
 
@@ -400,9 +401,9 @@ class ExternOp(Op):
     parameters: tensors are pointers, a parameter annotated with a runtime
     ``Dim`` is an ``i32`` scalar, a ``const`` parameter is a ``constexpr``.
 
-    Four optional facts exist for kernels that tilefish generated (``@tilefish.extern`` never sets them,
-    so the specs of a hand-written kernel say nothing about its indexing, its contraction or a warp count
-    per bucket):
+    Five optional facts exist for kernels that tilefish generated (``@tilefish.extern`` never sets them,
+    so the specs of a hand-written kernel say nothing about its indexing, its contraction, a warp count
+    per bucket or its source):
 
     * ``max_elements`` maps tensor parameters to the largest element count the kernel can index (its
       offsets are ``i32``); every spec of the op then carries a ``max_elements`` precondition on those
@@ -413,6 +414,10 @@ class ExternOp(Op):
       spec; ``None`` leaves the option out, which is Triton's default (contraction on).
     * ``bucket_num_warps`` maps a bucket's stem suffix (``".D96"``) to its warp count, so that each
       binary of a bucketed op has the warps for its own size; a bucket without an entry has ``num_warps``.
+    * ``source_sha256`` is the sha256 of the generated Triton source (deterministic for one IR). It is in the
+      declaration digest and in every spec, so a binary built from another body of the same kernel is not the
+      binary of this declaration. A hand-written kernel's source is a Python function that is not part of the
+      declaration; a manifest records Triton's own digest of it instead (see ``tilefish.aot.build``).
     """
 
     kind = "extern"
@@ -431,6 +436,7 @@ class ExternOp(Op):
         element_counts: "dict[str, str] | None" = None,
         fp_fusion: "bool | None" = None,
         bucket_num_warps: "dict[str, int] | None" = None,
+        source_sha256: "str | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         self.triton = triton
@@ -453,6 +459,9 @@ class ExternOp(Op):
         if fp_fusion is not None and not isinstance(fp_fusion, bool):
             raise TilefishDeclarationError(f"extern '{name}': fp_fusion must be True, False or None, got {fp_fusion!r}")
         self.fp_fusion: "bool | None" = fp_fusion
+        if source_sha256 is not None and not (isinstance(source_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", source_sha256)):
+            raise TilefishDeclarationError(f"extern '{name}': source_sha256 must be 64 lowercase hex digits, got {source_sha256!r}")
+        self.source_sha256: "str | None" = source_sha256
         self.bucket_num_warps: dict[str, int] = dict(bucket_num_warps or {})
         for k, v in self.bucket_num_warps.items():
             if not isinstance(k, str) or not re.fullmatch(r"(\.[A-Za-z_][A-Za-z0-9_]*[0-9]+)+", k):
@@ -595,8 +604,16 @@ def extern(
     if isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1:
         raise TilefishDeclarationError(f"extern: num_stages must be a positive int, got {num_stages!r}")
 
+    if name is not None and (not isinstance(name, str) or not _OP_NAME.fullmatch(name)):
+        raise TilefishDeclarationError(
+            f"extern: name must be a plain identifier (ASCII letters, digits and underscores, not starting with a digit): "
+            f"it becomes a file name in a manifest directory, so {name!r} is not allowed"
+        )
+
     def deco(fn: Callable[..., Any]) -> ExternOp:
         nm = name or fn.__name__
+        if not _OP_NAME.fullmatch(nm):
+            raise TilefishDeclarationError(f"extern: the function name {nm!r} is not a plain identifier; pass name=... to give the op one")
         sig = parse_signature(fn, what="extern op", name=nm, allow_dim_const_defaults=True)
         if sig.returns:
             raise TilefishDeclarationError(

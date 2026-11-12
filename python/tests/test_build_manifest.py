@@ -136,7 +136,7 @@ def test_manifest_content():
     assert [first["stem"], second["stem"]] == ["rowop.S32", "rowop.S64"]
     assert first["symbol"] == "tf_k" and first["arch"] == "sm_90" and first["ptx_target"] == "sm_90a"
     assert first["cubin"] == "rowop.S32.sm_90.cubin"
-    assert first["grid"] == "(M,)" and first["block"] == [64, 1, 1] and first["shared"] == 0
+    assert first["grid"] == "(M,)" and first["block"] == [64, 1, 1] and first["shared"] == 16
     assert first["buckets"] == {"S": 32} and second["buckets"] == {"S": 64}
     assert first["constexprs"] == [
         {"index": 2, "name": "EPS", "value": 1e-05, "dtype": "f32"},

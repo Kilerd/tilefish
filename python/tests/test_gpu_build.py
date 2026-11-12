@@ -212,7 +212,7 @@ def test_replay_refuses_a_cubin_that_was_changed_after_it_was_built(tmp_path, lo
     from tilefish import TilefishManifestError
 
     low = lowered["softmax"]
-    directory = runtime.export(low, tmp_path).parent
+    directory = runtime.export(low, tmp_path).directory
     x = torch.randn(7, 1000, device="cuda")
     expected = tilefish.run(low, x, mode="replay", manifest=directory)  # fine as built
     cubin_path = next(directory.glob("*.cubin"))
@@ -242,21 +242,21 @@ def test_replay_needs_the_architecture_and_the_spec_the_manifest_was_built_for(t
     low = lowered["softmax"]
     x = torch.randn(7, 1000, device="cuda")
     other = "sm_80" if ARCH != "sm_80" else "sm_90"
-    elsewhere = runtime.export(low, tmp_path / "elsewhere", arch=other).parent
+    elsewhere = runtime.export(low, tmp_path / "elsewhere", arch=other).directory
     with pytest.raises(TilefishManifestError, match=f"no binary for 'softmax' on {ARCH} \\(it has {other}\\)"):
         tilefish.run(low, x, mode="replay", manifest=elsewhere)
-    here = runtime.export(low, tmp_path / "here").parent
+    here = runtime.export(low, tmp_path / "here").directory
     with pytest.raises(TilefishManifestError, match="no binary for 'layernorm'"):
         tilefish.run(layernorm, *(torch.zeros(s, device="cuda", dtype=torch.bfloat16) for s in ((5, 768), (768,), (768,))), mode="replay", manifest=here)
     # a binary built from a different declaration of the same name is not accepted either
-    strict = runtime.export(softmax.lower(fp_fusion=False), tmp_path / "strict").parent
-    with pytest.raises(TilefishManifestError, match="not what the compile spec asks for"):
+    strict = runtime.export(softmax.lower(fp_fusion=False), tmp_path / "strict").directory
+    with pytest.raises(TilefishManifestError, match="was built from kernel source with sha256"):
         tilefish.run(low, x, mode="replay", manifest=strict)
 
 
 def test_replay_needs_neither_triton_nor_ptxas_nor_a_c_compiler(tmp_path, lowered):
     """A host needs the driver and the files. The child cannot import triton, has no compiler on its PATH and no ptxas."""
-    directory = runtime.export(lowered["softmax"], tmp_path / "m").parent
+    directory = runtime.export(lowered["softmax"], tmp_path / "m").directory
     child = (
         "import sys\n"
         "sys.modules['triton'] = None  # `import triton` raises ImportError, and find_spec('triton') finds nothing\n"

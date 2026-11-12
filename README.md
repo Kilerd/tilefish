@@ -122,12 +122,13 @@ The Python side has three modes:
 |---|---|---|
 | `jit` | the current source, built through its compile spec (the path of the build) in memory and launched through the CUDA driver | iterating on a kernel |
 | `reference` | the same bodies interpreted with torch | an oracle, compared within a tolerance |
-| `replay` | the prebuilt cubins of a manifest directory, checked against its digests, through the CUDA driver | the exact machine code the C++ and Rust hosts run |
+| `replay` | the prebuilt cubins of a manifest directory, checked against its digests, through the CUDA driver; the directory is trusted unless you pin its digest | the exact machine code the C++ and Rust hosts run |
 
 ```python
 y = tilefish.run(residual_add_rmsnorm, x, residual, w)                        # jit
-tilefish.runtime.export(residual_add_rmsnorm, "build/")                        # cubins and manifest.json
+m = tilefish.runtime.export(residual_add_rmsnorm, "build/")                    # cubins and manifest.json
 y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/")
+y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/", pin=m.digest)
 ```
 
 Arguments are torch tensors, matched to the signature the way a call is
@@ -138,16 +139,30 @@ launch every precondition of the binary is checked (dtypes, static sizes,
 dimension must equal a bucket exactly: there is no padding.
 
 `jit` and `replay` launch the same way, so they run the same machine code: a
-cubin that `jit` builds has the `sha256_code` of the one in the manifest, and
-`replay` refuses a cubin whose digests are not the manifest's, or a manifest
-entry that is not what the operator's compile spec asks for. Triton's own JIT
-launcher, which specializes on argument values, is not a mode. Neither `jit`
-nor `replay` needs a C compiler, and `replay` needs neither Triton nor `ptxas`.
+cubin that `jit` builds has the `sha256_code` of the one in the manifest.
+`replay` refuses a cubin whose digests are not the manifest's, a manifest
+entry that is not what the operator's compile spec asks for, and a stale
+binary: a kernel redeclared with another body but the same name and signature
+does not replay its old binary (a generated kernel's spec carries the sha256 of
+its Triton source; a hand-written `extern` is checked by Triton's
+`JITFunction.cache_key`, recomputed at replay, which needs the kernel to be
+importable, or a pin). It also refuses `shared` memory the cubin and the device
+cannot have, an argument list that does not fit the ABI, and a grid beyond the
+device's limits.
+
+**Trust.** Without `pin=` a replay trusts the directory: the digests sit next
+to the files they describe, so whoever can write the directory can rewrite
+both. `export` returns the manifest with its `digest`, a sha256 over every
+entry; keep it somewhere you trust and pass it as `pin=` to refuse a directory
+that changed. Triton's own JIT launcher, which specializes on argument values,
+is not a mode. Neither `jit` nor `replay` needs a C compiler, and a `replay` of
+a generated kernel needs neither Triton nor `ptxas`.
 
 CI asserts, on a GPU (the tests marked `gpu`), that a `jit`-built cubin has the
 digest of the manifest's, that `jit` and `replay` agree byte for byte, and that
-`replay` stays within tolerance of `reference`. An experiment that passes in
-`replay` is, kernel for kernel, what production runs.
+`replay` stays within tolerance of `reference` (tolerances per input
+distribution, in the test). An experiment that passes in `replay` is, kernel
+for kernel, what production runs.
 
 ## Rewrites that know about rounding
 

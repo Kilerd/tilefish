@@ -21,12 +21,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 from ._elf import parse_elf, code_digest
-from .errors import TilefishBuildError
+from .errors import TilefishBuildError, TilefishManifestError
 
 if TYPE_CHECKING:
     from .aot import CompileSpec
 
 MANIFEST_SCHEMA = 1
+SOURCE_DIGEST_KIND = "triton.JITFunction.cache_key"
 MIN_TRITON = (3, 5)
 _ARCH = re.compile(r"(?:sm_?)?([0-9]{2,3})a?\Z")
 _ENTRY = re.compile(r"\.entry\s+(\w+)\s*\(")
@@ -226,6 +227,14 @@ class BuiltKernel:
     ``sha256_code`` only the machine code (see :func:`tilefish._elf.code_digest`): two builds of one kernel from
     different directories have the same ``sha256_code`` and may differ in ``sha256``, because the debug
     information holds the build path. ``options`` are the options handed to ``triton.compile``.
+
+    ``source_digest`` is Triton's ``JITFunction.cache_key`` of the kernel at build time, or ``None`` for a binary
+    that was not built here (a loaded manifest entry without one). ``cache_key`` is a sha256 of the text of the
+    function, of the ``cache_key`` of every ``@triton.jit`` function it calls (transitively), of the line number
+    where the function starts, and of the values of the ``tl.constexpr`` globals it reads. It does not cover
+    other Python globals (Triton only compares their values at launch), the Triton version, or the compile
+    options; and it changes when the function merely moves in its file. It is what tells a manifest of a
+    hand-written kernel that its source was edited, which no declaration can.
     """
 
     spec: "CompileSpec"
@@ -242,6 +251,7 @@ class BuiltKernel:
     ptx_target: str  # the ``.target`` of the PTX: "sm_103a"
     options: "dict[str, Any]"
     launch: LaunchAttributes
+    source_digest: "str | None" = None
 
     @property
     def stem(self) -> str:
@@ -253,9 +263,19 @@ class BuiltKernel:
         return f"{self.spec.stem}.{self.arch}.cubin"
 
     def write_cubin(self, directory: "str | pathlib.Path") -> pathlib.Path:
-        """Write the cubin to ``<directory>/<stem>.<arch>.cubin`` and return the path."""
-        path = pathlib.Path(directory) / self.cubin_name
-        path.parent.mkdir(parents=True, exist_ok=True)
+        """Write the cubin to ``<directory>/<stem>.<arch>.cubin`` and return the path.
+
+        The file name must be a plain name inside ``directory`` (a stem or an arch with a separator or ``..`` in it
+        would write elsewhere), or this raises :class:`~tilefish.errors.TilefishBuildError`.
+        """
+        name = self.cubin_name
+        if pathlib.PurePath(name).name != name or name.startswith(".") or "\0" in name or "\\" in name:
+            raise TilefishBuildError(f"the cubin file name {name!r} is not a plain file name; refusing to write outside the directory")
+        directory = pathlib.Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        if path.resolve().parent != directory.resolve():
+            raise TilefishBuildError(f"the cubin path {str(path)!r} is not inside {str(directory)!r}; refusing to write it")
         path.write_bytes(self.cubin)
         return path
 
@@ -379,6 +399,7 @@ def build(
         ptx_target=target.group(1) if target else "",
         options=opts,
         launch=_launch_attributes(md),
+        source_digest=getattr(jit, "cache_key", None),
     )
 
 
@@ -397,7 +418,7 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
         if a.dtype is not None:
             c["dtype"] = a.dtype
         constexprs.append(c)
-    return {
+    entry: dict[str, Any] = {
         "stem": spec.stem,
         "op": spec.op,
         "abi": abi_of(spec),
@@ -411,11 +432,14 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
         "options": dict(spec.ast_source_inputs().options),
         "declaration_digest": spec.declaration_digest,
     }
+    if spec.source_sha256 is not None:  # a generated kernel: the sha256 of the Triton source it was built from
+        entry["source_sha256"] = spec.source_sha256
+    return entry
 
 
 def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     spec_part = spec_entry(b.spec)
-    return {
+    entry = {
         "stem": spec_part["stem"],
         "op": spec_part["op"],
         "arch": b.arch,
@@ -438,6 +462,12 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         "sha256_code": b.sha256_code,
         "toolchain": {"triton": b.triton_version, "ptxas": b.ptxas_version},
     }
+    if "source_sha256" in spec_part:
+        entry["source_sha256"] = spec_part["source_sha256"]
+    if b.source_digest is not None:  # Triton's cache_key of the kernel: what a hand-written kernel's source is checked by
+        entry["source_digest"] = b.source_digest
+        entry["source_digest_kind"] = SOURCE_DIGEST_KIND
+    return entry
 
 
 def manifest_dict(built: "Iterable[BuiltKernel]") -> dict[str, Any]:
@@ -451,26 +481,69 @@ def manifest_dict(built: "Iterable[BuiltKernel]") -> dict[str, Any]:
     }
 
 
-def write_manifest(built: "Iterable[BuiltKernel]", path: "str | pathlib.Path", *, cubins: bool = False) -> pathlib.Path:
+def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
+    """What makes an existing manifest entry a different binary from a new one for the same stem and arch (``None``: the same)."""
+    for key in ("sha256_code", "declaration_digest", "source_sha256", "source_digest", "options", "shared"):
+        if old.get(key) != new.get(key):
+            return key
+    return None
+
+
+def write_manifest(
+    built: "Iterable[BuiltKernel]",
+    path: "str | pathlib.Path",
+    *,
+    cubins: bool = False,
+    merge: bool = False,
+    overwrite: bool = False,
+) -> pathlib.Path:
     """Write the manifest of built kernels as strict JSON to ``path`` and return it.
 
     For each kernel: ``stem``, ``symbol``, ``abi`` (``params`` in launch order, then the two ``scratch`` slots),
     ``grid`` (an expression over the dimension names, with ``cdiv(a, b)``), ``block``, ``shared``, ``launch``
     (scratch sizes, PDL, cluster and cooperative flags: all zero or false for a binary a plain
     ``cuLaunchKernel`` can run), ``constexprs``, ``preconditions`` (what a host checks before it launches),
-    ``sha256`` (the file) and ``sha256_code`` (the machine code, independent of the build directory), and the
-    ``toolchain`` (Triton and ptxas versions). With ``cubins=True`` the cubins are written next to the
-    manifest under the file names the manifest gives.
+    ``declaration_digest`` and, for a generated kernel, ``source_sha256`` (the Triton source it was built from),
+    ``source_digest`` (Triton's ``cache_key`` of the kernel), ``sha256`` (the file) and ``sha256_code`` (the machine
+    code, independent of the build directory), and the ``toolchain`` (Triton and ptxas versions). With
+    ``cubins=True`` the cubins are written next to the manifest under the file names the manifest gives.
+
+    The manifest as a whole has a digest (:attr:`tilefish.aot.Manifest.digest`) that a host can pin.
+
+    With ``merge=True`` the entries of a manifest that already exists at ``path`` are kept (those for other
+    architectures, other kernels), and the new ones replace the entry of the same stem and architecture. An existing
+    entry that is a *different* binary (other machine code, declaration, source, options or shared memory) is not
+    replaced unless ``overwrite=True``; a merge into a manifest that does not verify is an error.
     """
     entries = list(built)
     doc = manifest_dict(entries)
-    stems = [e["stem"] + "." + e["arch"] for e in doc["kernels"]]
-    if len(set(stems)) != len(stems):
+    keys = [(e["stem"], e["arch"]) for e in doc["kernels"]]
+    if len(set(keys)) != len(keys):
         raise TilefishBuildError("a manifest needs one build per (stem, arch); some appear twice")
     path = pathlib.Path(path)
+    if merge and path.exists():
+        from ._manifest import Manifest
+
+        existing = Manifest.load(path)
+        new_by_key = dict(zip(keys, doc["kernels"]))
+        kept: list[dict[str, Any]] = []
+        for old in existing.doc["kernels"]:
+            key = (old["stem"], old["arch"])
+            new = new_by_key.pop(key, None)
+            if new is None:
+                kept.append(old)
+                continue
+            why = _conflicts(old, new)
+            if why is not None and not overwrite:
+                raise TilefishManifestError(
+                    f"the manifest {str(path)!r} already has a different binary for '{key[0]}' on {key[1]} ({why} differs); "
+                    "pass overwrite=True to replace it"
+                )
+            kept.append(new)
+        doc["kernels"] = kept + list(new_by_key.values())
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(doc, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     if cubins:
         for b in entries:
             b.write_cubin(path.parent)
+    path.write_text(json.dumps(doc, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return path

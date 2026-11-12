@@ -199,6 +199,7 @@ Notes (the facts behind the table):
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import keyword
 import math
@@ -286,6 +287,11 @@ class LoweredKernel:
     def fp_fusion(self) -> bool:
         """Whether the specs ask Triton for FMA contraction (``enable_fp_fusion``)."""
         return bool(self.extern.fp_fusion)
+
+    @property
+    def source_sha256(self) -> str:
+        """The sha256 of :attr:`source`: it is in the declaration digest and in every spec, and a manifest records it."""
+        return str(self.extern.source_sha256)
 
     @property
     def bucket_num_warps(self) -> "dict[str, int]":
@@ -1175,6 +1181,7 @@ def _assemble(
         element_counts=element_counts,
         fp_fusion=fp_fusion,
         bucket_num_warps=bucket_warps,
+        source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
     )
     return LoweredKernel(op.name, fn_name, module, layout.template, source, extern, num_warps, op)
 

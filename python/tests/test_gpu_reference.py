@@ -72,7 +72,7 @@ def rmsnorm():
 @pytest.fixture(scope="module")
 def manifest(tmp_path_factory, rmsnorm):
     """The five goldens built into a manifest directory, as a host would load them."""
-    return runtime.export([softmax, layernorm, rmsnorm, gelu_exact, swiglu], tmp_path_factory.mktemp("goldens")).parent
+    return runtime.export([softmax, layernorm, rmsnorm, gelu_exact, swiglu], tmp_path_factory.mktemp("goldens")).directory
 
 
 def both(manifest, op, *args):

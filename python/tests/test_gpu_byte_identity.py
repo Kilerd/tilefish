@@ -152,7 +152,7 @@ def exported(tmp_path_factory):
 
     def get(op):
         if id(op) not in cache:
-            cache[id(op)] = runtime.export(op, tmp_path_factory.mktemp("manifest")).parent
+            cache[id(op)] = runtime.export(op, tmp_path_factory.mktemp("manifest")).directory
         return cache[id(op)]
 
     return get
@@ -200,7 +200,7 @@ def test_jit_builds_in_memory_and_replay_loads_the_manifests_cubin(tmp_path):
     assert [k.built.sha256 for k in _cuda._loaded.values()] == [built.sha256]  # ... and launched that binary
     assert not list(tmp_path.iterdir())  # nothing is written
 
-    directory = runtime.export(softmax, tmp_path).parent
+    directory = runtime.export(softmax, tmp_path).directory
     runtime.clear_caches()
     tilefish.run(softmax, *args, mode="replay", manifest=directory)
     assert not runtime._builds  # replay builds nothing

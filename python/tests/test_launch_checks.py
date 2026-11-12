@@ -20,6 +20,7 @@ from tilefish import (
     TilefishRuntimeError,
     TilefishTypeError,
     bf16,
+    const,
     f32,
 )
 from tilefish._launch import (
@@ -425,3 +426,161 @@ def test_reference_of_an_extern_says_there_is_no_ir():
 def test_kernels_externs_and_lowered_kernels_have_run():
     assert callable(layernorm.run) and callable(copy.run) and callable(layernorm.lower().run)
     assert tilefish.run is tilefish.runtime.run
+
+
+# -- checks that a mutation of the launch code must trip ------------------------------------------------------------------------------
+
+
+@tilefish.extern(triton="my_kernels:flagged", grid=lambda n: (n,))
+def flagged(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]], n_elem: n, *, FLAG: const = 1, ON: const = True, SCALE: const[f32] = 2.0): ...
+
+
+def test_a_constexpr_of_another_type_is_not_the_same_constant():
+    (spec,) = compile_specs(flagged)
+    check_consts(spec, {"FLAG": 1, "ON": True, "SCALE": 2.0})
+    check_consts(spec, {"SCALE": 2})  # an int for a const[f32] is the same number
+    with pytest.raises(TilefishTypeError, match="constexpr 'FLAG' is compiled into 'flagged' as 1; it cannot be changed to True"):
+        check_consts(spec, {"FLAG": True})  # True == 1, but a bool is not the int that was compiled in
+    with pytest.raises(TilefishTypeError, match="constexpr 'ON' is compiled into 'flagged' as True; it cannot be changed to 1"):
+        check_consts(spec, {"ON": 1})
+    with pytest.raises(TilefishTypeError, match="cannot be changed to 3.0"):
+        check_consts(spec, {"SCALE": 3.0})
+
+
+def test_the_declared_constants_of_a_kernel_follow_the_same_rule():
+    from tilefish.runtime import _declared_consts
+
+    @tilefish.kernel
+    def with_flags(x: Tensor[T, f32], *, count: const = 1, on: const = True) -> Tensor[T, f32]:
+        return x * 2.0
+
+    _declared_consts(with_flags.signature, {"count": 1, "on": True})
+    with pytest.raises(TilefishTypeError, match="constexpr 'count' is compiled in as 1; it cannot be changed to True"):
+        _declared_consts(with_flags.signature, {"count": True})
+    with pytest.raises(TilefishTypeError, match="constexpr 'on' is compiled in as True; it cannot be changed to 1"):
+        _declared_consts(with_flags.signature, {"on": 1})
+    with pytest.raises(TilefishTypeError, match="cannot be changed to 2"):
+        _declared_consts(with_flags.signature, {"count": 2})
+
+
+def test_a_grid_of_nothing_is_refused():
+    lowered = gelu_exact.lower()
+    (spec,) = lowered.specs()
+    n_dim = next(p.dim for p in lowered.extern.signature.params if p.kind == "dim")
+    assert eval_grid(spec, lowered.extern.grid, {n_dim: 1}) == (1,)
+    with pytest.raises(TilefishRuntimeError, match=r"the grid \(cdiv\(T, 1024\),\) of 'gelu_exact' is 0 here; every grid size must be at least 1"):
+        eval_grid(spec, lowered.extern.grid, {n_dim: 0})
+    with pytest.raises(TilefishRuntimeError, match="is -1 here"):
+        eval_grid(spec, (n_dim - 2,), {n_dim: 1})
+
+
+def stand_in(spec_arch="sm_90"):
+    """A loaded kernel without a driver, for the checks that run before one is needed."""
+    from built_fakes import fake_build
+
+    from tilefish import _cuda
+
+    (spec,) = compile_specs(flagged)
+    k = object.__new__(_cuda.LoadedKernel)
+    k.built = fake_build(spec, arch=spec_arch)
+    k._abi = k.built.abi()["params"]
+    k.grid_limits = (2**31 - 1, 65535, 65535)
+    k.block = (128, 1, 1)
+    return k
+
+
+GOOD = [("pointer", 0x7F0000000000), ("pointer", 0x7F0000100000), ("scalar", 4096)]
+
+
+def test_a_launch_is_checked_against_the_abi_before_the_driver_is_called():
+    k = stand_in()
+    assert k._check_launch((8,), GOOD) == (8, 1, 1)
+    assert k._check_launch((8, 2), GOOD) == (8, 2, 1) and k._check_launch((8, 2, 3), GOOD) == (8, 2, 3)
+    assert [p["name"] for p in k._abi] == ["x", "y", "n_elem"]
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (GOOD[:2], r"'flagged' takes 3 arguments \(x, y, n_elem\), got 2"),
+        ([], r"takes 3 arguments .*, got 0"),
+        (GOOD + [("scalar", 1)], r"takes 3 arguments .*, got 4"),
+        ([("scalar", 1), GOOD[1], GOOD[2]], r"argument 0 \('x'\) is a pointer in the ABI, but a 'scalar' was passed"),
+        ([GOOD[0], GOOD[1], ("pointer", 5)], r"argument 2 \('n_elem'\) is a scalar in the ABI, but a 'pointer' was passed"),
+        ([GOOD[0], GOOD[1], ("i32", 5)], r"argument 2 .* but a 'i32' was passed"),
+        ([GOOD[0], GOOD[1], 5], r"argument 2 \('n_elem'\) must be a \(kind, value\) pair"),
+        ([GOOD[0], GOOD[1], ("scalar",)], r"must be a \(kind, value\) pair"),
+        ([GOOD[0], GOOD[1], ("scalar", 4.0)], r"argument 2 \('n_elem'\) must be an int, got 4.0"),
+        ([GOOD[0], GOOD[1], ("scalar", True)], r"must be an int, got True"),
+        ([GOOD[0], GOOD[1], ("scalar", None)], r"must be an int, got None"),
+        ([("pointer", -1), GOOD[1], GOOD[2]], r"argument 0 \('x'\) is -1, outside the 64-bit address range"),
+        ([("pointer", 2**64), GOOD[1], GOOD[2]], r"is 18446744073709551616, outside the 64-bit address range"),
+        ([GOOD[0], GOOD[1], ("scalar", 2**31)], r"argument 2 \('n_elem'\) is 2147483648, outside the 32-bit signed integer range"),
+        ([GOOD[0], GOOD[1], ("scalar", -(2**31) - 1)], r"outside the 32-bit signed integer range"),
+    ],
+)
+def test_a_launch_that_does_not_fit_the_abi_is_refused(args, message):
+    k = stand_in()
+    with pytest.raises(TilefishRuntimeError, match=message):
+        k._check_launch((8,), args)
+    with pytest.raises(TilefishRuntimeError, match=message):
+        k.launch((8,), args, stream=0)  # launch() checks first: nothing reaches the driver (there is none here)
+
+
+def test_the_ends_of_the_ranges_are_accepted():
+    k = stand_in()
+    for good in (("scalar", 2**31 - 1), ("scalar", -(2**31)), ("scalar", 0)):
+        assert k._check_launch((1,), [GOOD[0], GOOD[1], good]) == (1, 1, 1)
+    assert k._check_launch((1,), [("pointer", 0), ("pointer", 2**64 - 1), GOOD[2]]) == (1, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "grid, message",
+    [
+        ((0,), r"the grid \(0,\) has 0 blocks along X, but this device takes 1 to 2147483647 there"),
+        ((-1,), r"has -1 blocks along X"),
+        ((2**31,), r"has 2147483648 blocks along X"),
+        ((2**32 + 1,), r"along X"),
+        ((1, 65536), r"has 65536 blocks along Y, but this device takes 1 to 65535"),
+        ((1, 1, 65536), r"has 65536 blocks along Z"),
+        ((1, 0), r"has 0 blocks along Y"),
+        ((), r"the grid must be one to three integers"),
+        ((1, 1, 1, 1), r"the grid must be one to three integers"),
+        ((1.5,), r"the grid must be one to three integers"),
+        ((True,), r"the grid must be one to three integers"),
+    ],
+)
+def test_a_grid_the_device_cannot_take_is_refused(grid, message):
+    k = stand_in()
+    with pytest.raises(TilefishRuntimeError, match=message):
+        k._check_launch(grid, GOOD)
+
+
+def test_the_limits_of_the_grid_are_the_devices():
+    k = stand_in()
+    k.grid_limits = (100, 7, 3)
+    assert k._check_launch((100, 7, 3), GOOD) == (100, 7, 3)
+    for grid in ((101,), (1, 8), (1, 1, 4)):
+        with pytest.raises(TilefishRuntimeError, match="this device takes"):
+            k._check_launch(grid, GOOD)
+
+
+def test_two_loads_of_one_cubin_with_another_launch_are_not_the_same_kernel():
+    from built_fakes import fake_build
+
+    from tilefish._build import LaunchAttributes
+    from tilefish._cuda import load_key
+
+    (spec,) = compile_specs(flagged)
+    base = fake_build(spec)
+    same_cubin = [
+        dataclasses.replace(base, shared=32),
+        dataclasses.replace(base, symbol="tf_other"),
+        dataclasses.replace(base, launch=LaunchAttributes(0, 0, True, (1, 1, 1), 1, False)),
+        dataclasses.replace(base, launch=LaunchAttributes(0, 0, False, (2, 1, 1), 2, False)),
+        dataclasses.replace(base, spec=dataclasses.replace(spec, block=(64, 1, 1))),
+    ]
+    keys = {load_key(b, 0) for b in [base, *same_cubin]} | {load_key(base, 1)}
+    assert all(b.cubin == base.cubin for b in same_cubin)
+    assert len(keys) == 7  # the cubin alone does not identify a launch: shared memory, symbol, launch fields, block, device
+    assert load_key(base, 0) == load_key(fake_build(spec), 0)

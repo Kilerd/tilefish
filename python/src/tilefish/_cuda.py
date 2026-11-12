@@ -7,6 +7,12 @@ arguments in declaration order (a pointer as a 64-bit value, an ``i32`` as a 32-
 scratch slots as null 64-bit pointers. Nothing else is set up, so a binary that wants more (scratch memory,
 programmatic dependent launch, clusters, a cooperative launch) is refused by :func:`load` before it runs.
 
+A launch is checked before it reaches the driver, because a wrong one does not fail cleanly: a missing
+argument reads whatever follows the array, an ``i32`` out of range wraps, a grid beyond the device's limits is an
+error, and too little shared memory makes the kernel fault and poison the context (every later call fails). So
+:class:`LoadedKernel` checks the arguments against the ABI (count, kinds, ranges), the grid against the device's
+maximum grid dimensions, and the shared memory (static plus dynamic) against the device's opt-in maximum.
+
 The driver binding is ``cuda-python`` (``cuda.bindings.driver``), imported when first needed.
 """
 
@@ -16,15 +22,18 @@ import ctypes
 import threading
 from typing import TYPE_CHECKING, Any, Sequence
 
+from ._elf import parse_elf, shared_sizes
 from .errors import TilefishRuntimeError
 
 if TYPE_CHECKING:
     from ._build import BuiltKernel
 
 DEFAULT_SHARED_LIMIT = 48 * 1024  # dynamic shared memory above this needs cuFuncSetAttribute
+INT32_MIN, INT32_MAX = -(1 << 31), (1 << 31) - 1
+UINT64_MAX = (1 << 64) - 1
 
 _lock = threading.Lock()
-_loaded: "dict[tuple[str, int], LoadedKernel]" = {}
+_loaded: "dict[tuple, LoadedKernel]" = {}
 
 
 def _driver() -> Any:
@@ -64,6 +73,23 @@ def refuse_unsupported(built: "BuiltKernel") -> None:
         )
 
 
+def load_key(built: "BuiltKernel", device_index: int) -> "tuple[Any, ...]":
+    """What makes two loads the same: the cubin, the device, and everything the launch is made of.
+
+    Two entries with one cubin but another symbol, shared memory, launch attributes or block are different
+    kernels as far as a launch is concerned, so a cached one is never reused for them.
+    """
+    launch = built.launch.to_dict()
+    return (
+        built.sha256,
+        device_index,
+        built.symbol,
+        built.shared,
+        tuple((k, tuple(v) if isinstance(v, list) else v) for k, v in sorted(launch.items())),
+        tuple(built.spec.block),
+    )
+
+
 class LoadedKernel:
     """A kernel function loaded from a cubin into the current CUDA context (one per device)."""
 
@@ -78,6 +104,26 @@ class LoadedKernel:
             )
         self.built = built
         self.device_index = device_index
+        (device,) = _check(drv.cuCtxGetDevice(), "cuCtxGetDevice")
+        self.grid_limits = tuple(
+            int(
+                _check(
+                    drv.cuDeviceGetAttribute(getattr(drv.CUdevice_attribute, f"CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_{axis}"), device),
+                    f"cuDeviceGetAttribute(MAX_GRID_DIM_{axis})",
+                )[0]
+            )
+            for axis in "XYZ"
+        )
+        (optin,) = _check(
+            drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device),
+            "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+        )
+        declared, reserved = shared_sizes(parse_elf(built.cubin), built.symbol)
+        if declared + reserved + built.shared > int(optin):
+            raise TilefishRuntimeError(
+                f"'{built.stem}' ({built.arch}) needs {declared} bytes of static and {built.shared} bytes of dynamic shared "
+                f"memory (and the driver reserves {reserved}), more than the {int(optin)} bytes a block may use on this device"
+            )
         (self.module,) = _check(drv.cuModuleLoadData(built.cubin), f"cuModuleLoadData({built.stem})")
         (self.function,) = _check(
             drv.cuModuleGetFunction(self.module, built.symbol.encode("utf-8")), f"cuModuleGetFunction({built.symbol})"
@@ -87,6 +133,8 @@ class LoadedKernel:
             _check(drv.cuFuncSetAttribute(self.function, attr, built.shared), "cuFuncSetAttribute(max dynamic shared)")
         self._check_params()
         self.block = tuple(built.spec.block)
+        abi = built.abi()
+        self._abi = abi["params"]
 
     def _check_params(self) -> None:
         """The loaded function must take the parameters of the manifest's ABI (count and sizes), when the driver can say."""
@@ -108,16 +156,53 @@ class LoadedKernel:
                 f"manifest says {expected}"
             )
 
+    def _check_launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]") -> "tuple[int, int, int]":
+        name = f"'{self.built.stem}'"
+        if len(args) != len(self._abi):
+            raise TilefishRuntimeError(
+                f"{name} takes {len(self._abi)} arguments ({', '.join(p['name'] for p in self._abi)}), got {len(args)}"
+            )
+        for position, (param, arg) in enumerate(zip(self._abi, args)):
+            if not isinstance(arg, tuple) or len(arg) != 2:
+                raise TilefishRuntimeError(f"{name} argument {position} ('{param['name']}') must be a (kind, value) pair, got {arg!r}")
+            kind, value = arg
+            if kind != param["kind"]:
+                raise TilefishRuntimeError(
+                    f"{name} argument {position} ('{param['name']}') is a {param['kind']} in the ABI, but a {kind!r} was passed"
+                )
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TilefishRuntimeError(f"{name} argument {position} ('{param['name']}') must be an int, got {value!r}")
+            lo, hi = (0, UINT64_MAX) if kind == "pointer" else (INT32_MIN, INT32_MAX)
+            if not lo <= value <= hi:
+                raise TilefishRuntimeError(
+                    f"{name} argument {position} ('{param['name']}') is {value}, outside the {'64-bit address' if kind == 'pointer' else '32-bit signed integer'} "
+                    f"range {lo}..{hi} the binary takes"
+                )
+        dims = tuple(grid)
+        if not 1 <= len(dims) <= 3 or any(isinstance(g, bool) or not isinstance(g, int) for g in dims):
+            raise TilefishRuntimeError(f"{name}: the grid must be one to three integers, got {tuple(grid)!r}")
+        padded = dims + (1,) * (3 - len(dims))
+        for axis, (g, limit) in enumerate(zip(padded, self.grid_limits)):
+            if not 1 <= g <= limit:
+                raise TilefishRuntimeError(
+                    f"{name}: the grid {dims} has {g} blocks along {'XYZ'[axis]}, but this device takes 1 to {limit} there"
+                )
+        return padded  # type: ignore[return-value]
+
     def launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]", stream: int) -> None:
         """Launch on ``stream`` (a ``CUstream`` handle as an int). ``args`` are ``("pointer", address)`` or ``("scalar", i32)``
-        in the manifest's order; the two scratch slots are appended here."""
+        in the manifest's order; the two scratch slots are appended here.
+
+        The arguments are checked against the ABI first (count, kinds, ranges) and the grid against the device's
+        limits; a mismatch is a :class:`~tilefish.errors.TilefishRuntimeError` and nothing is launched.
+        """
+        g = self._check_launch(grid, args)
         drv = _driver()
         values: list[Any] = []
         for kind, v in args:
             values.append(ctypes.c_uint64(v) if kind == "pointer" else ctypes.c_int32(v))
         values += [ctypes.c_uint64(0), ctypes.c_uint64(0)]  # global_scratch, profile_scratch
         slots = (ctypes.c_void_p * len(values))(*[ctypes.addressof(v) for v in values])
-        g = tuple(grid) + (1,) * (3 - len(grid))
         b = self.block
         _check(
             drv.cuLaunchKernel(
@@ -129,7 +214,7 @@ class LoadedKernel:
 
 def load(built: "BuiltKernel", device_index: int) -> LoadedKernel:
     """The loaded kernel for this binary on this device, loading it the first time. The device's context must be current."""
-    key = (built.sha256, device_index)
+    key = load_key(built, device_index)
     with _lock:
         k = _loaded.get(key)
         if k is None:

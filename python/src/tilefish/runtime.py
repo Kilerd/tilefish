@@ -26,15 +26,32 @@ the same source with the same toolchain: a cubin that ``jit`` builds has the ``s
 manifest, and the outputs are byte-identical (both are checked on a GPU by the tests). Triton's own JIT launcher is
 not a mode: it applies value specializations (an ``i32`` equal to 1 becomes a constant, divisibility by 16 is
 assumed wherever it happens to hold) that make its machine code differ from the spec's binary. Neither mode needs a
-C compiler (Triton's JIT launcher does, to build a stub); ``replay`` needs neither Triton nor ``ptxas``, only a
-manifest directory and the CUDA driver.
+C compiler (Triton's JIT launcher does, to build a stub). ``replay`` of a generated kernel needs neither Triton nor
+``ptxas``, only a manifest directory and the CUDA driver.
 
-``replay`` loads a manifest when it is first used, and refuses a cubin whose ``sha256`` or ``sha256_code`` is not
-the manifest's, and a manifest entry that is not what the compile spec of the operator asks for (ABI, grid,
-block, constants, preconditions, options, declaration digest): a binary never runs under assumptions it was not
-compiled for. Before ``jit`` and ``replay`` launch, every precondition of the binary is checked (dtypes, static
-sizes, ``divisible_by``, 16-byte aligned pointers, contiguity, aliasing, ``max_elements`` of a generated kernel);
-a bucketed dimension must equal one bucket value exactly, there is no padding. ``reference`` checks the types, not
+What ``replay`` checks. It loads the manifest when it is first used (and again when a file in the directory changes)
+and refuses
+
+* a cubin whose ``sha256`` or ``sha256_code`` is not the manifest's, a file name that leaves the directory, a kernel
+  that uses shared memory with ``shared = 0``, and a launch that does not fit the device (shared memory, grid);
+* a manifest entry that is not what the compile spec of the operator asks for (ABI, grid, block, constants,
+  preconditions, options, declaration digest): a binary never runs under assumptions it was not compiled for;
+* a stale binary. A generated kernel's spec carries ``source_sha256``, the sha256 of the generated Triton source, so a
+  kernel redeclared with another body but the same name and signature does not match its old manifest. A
+  hand-written ``extern`` has no source in its declaration: the entry records Triton's ``JITFunction.cache_key``
+  (the function's text, the ``cache_key`` of the ``@triton.jit`` functions it calls, its start line and the
+  ``tl.constexpr`` globals it reads; see :class:`~tilefish.aot.BuiltKernel`) and ``replay`` recomputes it from the
+  importable kernel. Where it cannot (the module does not import without Triton) it refuses, unless ``pin=`` is given.
+
+Trust. Without ``pin=`` the directory is trusted: the digests in a manifest are written next to the files they
+describe, so whoever can write the directory can rewrite both and make ``replay`` run any binary. ``pin=`` is the
+digest of the whole manifest (``Manifest.digest``, returned by :func:`export`): hold it somewhere you trust (a build
+log, a lock file) and a changed directory is refused. A pin vouches for the manifest, not for the machine code
+being correct.
+
+Before ``jit`` and ``replay`` launch, every precondition of the binary is checked (dtypes, static sizes,
+``divisible_by``, 16-byte aligned pointers, contiguity, aliasing, ``max_elements`` of a generated kernel); a
+bucketed dimension must equal one bucket value exactly, there is no padding. ``reference`` checks the types, not
 the alignment or the buckets. Everything here imports torch, Triton and cuda-python only when it runs.
 """
 
@@ -449,11 +466,29 @@ def _load_manifest(manifest: Any) -> Manifest:
     return loaded
 
 
-def _run_replay(prep: _Prepared, manifest: Manifest) -> None:
+def _current_source_digest(spec: CompileSpec) -> "str | None":
+    """Triton's ``cache_key`` of the hand-written kernel a spec names, recomputed from the importable function.
+
+    ``None`` when it cannot be (the module does not import, which includes a module that imports Triton when Triton is
+    not installed, or the object has no ``cache_key``). A spec of a generated kernel has its source in the spec itself.
+    """
+    try:
+        fn = resolve_triton(spec.triton)
+    except TilefishBuildError:
+        return None
+    try:
+        key = getattr(fn, "cache_key", None)
+    except Exception:  # noqa: BLE001 - Triton raises when the kernel references something it cannot hash
+        return None
+    return key if isinstance(key, str) else None
+
+
+def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
     """Launch the prebuilt cubin of the manifest for this spec and this device's architecture."""
     torch = _torch()
     index = _device_index(torch, prep.device)
-    built = manifest.built_kernel(prep.spec, f"sm_{_capability(torch, index)}")
+    source = _current_source_digest(prep.spec) if prep.spec.source_sha256 is None else None
+    built = manifest.built_kernel(prep.spec, f"sm_{_capability(torch, index)}", source_digest=source, pinned=pinned)
     _launch_built(prep, built, index)
 
 
@@ -483,13 +518,22 @@ def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, 
     return _result(returned + outs)
 
 
-def export(ops: Any, directory: "str | os.PathLike[str]", *, arch: "int | str | None" = None) -> pathlib.Path:
+def export(
+    ops: Any, directory: "str | os.PathLike[str]", *, arch: "int | str | None" = None, overwrite: bool = False
+) -> Manifest:
     """Build every binary of one or several kernels and externs and write them as a manifest directory.
 
     For each compile spec of each operator (one per bucket) the cubin is built for ``arch`` (default: the
-    architecture of the current CUDA device) and ``<directory>/manifest.json`` is written together with the
-    cubins, which is what ``tilefish.run(..., mode="replay", manifest=directory)`` loads, and what a C++ or Rust
-    host reads. Returns the path of the manifest.
+    architecture of the current CUDA device) and written to ``directory`` together with ``manifest.json``, which is
+    what ``tilefish.run(..., mode="replay", manifest=directory)`` loads, and what a C++ or Rust host reads.
+
+    An existing manifest in ``directory`` is merged, not replaced: its entries for other architectures and other
+    kernels stay, and a new binary replaces the entry of the same stem and architecture. An existing entry that is a
+    different binary (other machine code, declaration, source or options) is replaced only with ``overwrite=True``.
+
+    Returns the loaded and verified :class:`~tilefish.aot.Manifest`: ``.directory``, ``.path`` and ``.digest``, the
+    digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
+    ``run(..., mode="replay", manifest=directory, pin=digest)`` to refuse a directory that was changed after the export.
     """
     items = list(ops) if isinstance(ops, (list, tuple)) else [ops]
     if arch is None:
@@ -504,20 +548,25 @@ def export(ops: Any, directory: "str | os.PathLike[str]", *, arch: "int | str | 
         target = _target(op)
         for spec in target.compile_specs():
             built.append(build(spec, arch=cap, fn=target.jit_function(spec)))
-    return write_manifest(built, pathlib.Path(directory) / MANIFEST_NAME, cubins=True)
+    path = write_manifest(built, pathlib.Path(directory) / MANIFEST_NAME, cubins=True, merge=True, overwrite=overwrite)
+    return Manifest.load(path)
 
 
-def run(op: Any, /, *args: Any, mode: str = "jit", manifest: Any = None, **kwargs: Any) -> Any:
+def run(op: Any, /, *args: Any, mode: str = "jit", manifest: Any = None, pin: "str | None" = None, **kwargs: Any) -> Any:
     """Run a kernel or an extern op on tensors. See the module docstring for the three modes.
 
     ``op`` is a ``@tilefish.kernel`` (or its :class:`~tilefish.lower.LoweredKernel`) or an ``@tilefish.extern`` whose
     Triton function can be imported. ``mode`` is ``"jit"``, ``"replay"`` or ``"reference"``. ``manifest`` is the
     directory (or the :class:`~tilefish.aot.Manifest`) that ``"replay"`` loads its cubins from, and is required
-    there and nowhere else. ``mode`` and ``manifest`` are the only keywords that are not arguments of ``op`` (an
-    operator with a parameter of one of those names takes it positionally). Raises
-    :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks a precondition of the binary,
-    :class:`~tilefish.errors.TilefishManifestError` when the manifest is not what was built or not what the
-    operator asks for, and :class:`~tilefish.errors.TilefishRuntimeError` when the call cannot run.
+    there and nowhere else. ``pin`` (replay only) is the digest of the manifest (``Manifest.digest``, what ``export``
+    returns): a manifest with any other digest is refused, so the directory is trusted only as far as the digest
+    you hold; without it the directory itself is trusted. For a hand-written kernel whose source digest cannot be
+    recomputed, ``pin`` is also the explicit statement that you vouch for the manifest. ``mode``, ``manifest`` and
+    ``pin`` are the only keywords that are not arguments of ``op`` (an operator with a parameter of one of those
+    names takes it positionally). Raises :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks
+    a precondition of the binary, :class:`~tilefish.errors.TilefishManifestError` when the manifest is not what was
+    built, not what the operator asks for, or not the pinned one, and :class:`~tilefish.errors.TilefishRuntimeError`
+    when the call cannot run.
     """
     if mode not in MODES:
         raise TilefishRuntimeError(f"unknown mode {mode!r}: use one of {', '.join(MODES)}")
@@ -528,12 +577,25 @@ def run(op: Any, /, *args: Any, mode: str = "jit", manifest: Any = None, **kwarg
         )
     if mode != "replay" and manifest is not None:
         raise TilefishRuntimeError(f"manifest= is for mode='replay'; mode {mode!r} builds or interprets the kernel itself")
+    if mode != "replay" and pin is not None:
+        raise TilefishRuntimeError(f"pin= is for mode='replay' (it pins a manifest); mode {mode!r} has none")
+    if pin is not None and not (isinstance(pin, str) and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin)):
+        raise TilefishRuntimeError(f"pin= is the 64 lowercase hex digits of a manifest digest, got {pin!r}")
     target = _target(op)
     if mode == "reference":
         return _run_reference(target, args, kwargs)
+    loaded = None
+    if mode == "replay":
+        loaded = _load_manifest(manifest)
+        if pin is not None and loaded.digest != pin:
+            raise TilefishManifestError(
+                f"the manifest in {str(loaded.directory)!r} has digest {loaded.digest}, but pin= says {pin}: "
+                "it is not the manifest that was pinned (it was changed, or it is another export)"
+            )
     prep = _prepare(target, args, kwargs)
     if mode == "jit":
         _run_jit(prep)
     else:
-        _run_replay(prep, _load_manifest(manifest))
+        assert loaded is not None
+        _run_replay(prep, loaded, pinned=pin is not None)
     return _result(prep.results)

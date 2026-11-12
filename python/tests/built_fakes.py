@@ -26,6 +26,9 @@ def scale(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]], n_elem: n, *, ALPHA: cons
 def rowop(x: Tensor[M, S, f32], y: Out[Tensor[M, S, f32]], *, EPS: const[f32] = 1e-5, BLOCK: const = tilefish.dims.next_pow2(S)): ...
 
 
+FAKE_SOURCE_DIGEST = hashlib.sha256(b"the source of a hand-written kernel").hexdigest()  # what an extern's cache_key stands in as
+
+
 def fake_build(spec, *, arch="sm_90", cubin=None, launch=None, **kw):
     """A ``BuiltKernel`` of ``spec`` around a small ELF file (its symbol is ``tf_k``); ``kw`` overrides any field."""
     cubin = cubin_like() if cubin is None else cubin
@@ -35,7 +38,7 @@ def fake_build(spec, *, arch="sm_90", cubin=None, launch=None, **kw):
         cubin=cubin,
         ptx=".version 8.8\n.target sm_90a\n",
         symbol="tf_k",
-        shared=0,
+        shared=16,
         num_warps=spec.num_warps,
         sha256=hashlib.sha256(cubin).hexdigest(),
         sha256_code=code_digest(cubin),
@@ -44,6 +47,7 @@ def fake_build(spec, *, arch="sm_90", cubin=None, launch=None, **kw):
         ptx_target="sm_90a",
         options=spec.ast_source_inputs().options,
         launch=launch or LaunchAttributes(0, 0, False, (1, 1, 1), 1, False),
+        source_digest=FAKE_SOURCE_DIGEST,
     )
     values.update(kw)
     return BuiltKernel(**values)

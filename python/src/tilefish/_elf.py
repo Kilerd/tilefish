@@ -160,6 +160,29 @@ def parse_elf(blob: "bytes | bytearray | memoryview") -> Elf:
     return Elf(bytes(ident), e_type, machine, version, flags, tuple(sections), blob, shstrndx)
 
 
+def uses_shared(elf: Elf, symbol: str) -> bool:
+    """Whether the kernel ``symbol`` uses shared memory: it has a ``.nv.shared.<symbol>`` section.
+
+    Triton gives a kernel that needs shared memory dynamic shared memory (an ``extern`` array), and ptxas then
+    emits that section (a ``NOBITS`` section of 1024 bytes for sm_90 and later, of size 0 for sm_80: its size says
+    nothing about how much the code addresses); a kernel that needs none has no such section. Checked on
+    sm_80, sm_90, sm_100, sm_103 and sm_120 for a softmax (shared) and a gelu (not). The ELF does not say how much
+    dynamic shared memory the code addresses: that is the ``shared`` the build recorded, which a launch has to pass.
+    """
+    return elf.section(f".nv.shared.{symbol}") is not None
+
+
+def shared_sizes(elf: Elf, symbol: str) -> "tuple[int, int]":
+    """``(declared, reserved)``: the bytes of static shared memory the kernel ``symbol`` declares, and the bytes the driver reserves.
+
+    They are the sizes of the ``NOBITS`` sections ``.nv.shared.<symbol>`` and ``.nv.shared.reserved.0`` (0 when
+    absent): what a launch adds to the dynamic shared memory when it checks the total against the device.
+    """
+    declared = elf.section(f".nv.shared.{symbol}")
+    reserved = elf.section(".nv.shared.reserved.0")
+    return (declared.size if declared is not None else 0, reserved.size if reserved is not None else 0)
+
+
 def _reference(elf: Elf, value: int, *, resolve: bool) -> bytes:
     """A link or info field as the section it names (so that moving debug sections does not change it), else as a number."""
     if resolve and 0 < value < len(elf.sections):

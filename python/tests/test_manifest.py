@@ -2,8 +2,11 @@
 
 A manifest is written by ``write_manifest(built, path, cubins=True)`` and read by ``Manifest.load``, which checks
 every cubin against the digests the manifest records; ``Manifest.built_kernel(spec, arch)`` then checks that the
-entry is what a compile spec asks for. No triton and no GPU: the cubins are small ELF files made by hand. On a GPU,
-``test_gpu_byte_identity.py`` and ``test_gpu_build.py`` replay real ones.
+entry is what a compile spec asks for, and that it was built from the current source of the kernel. No triton and no
+GPU: the cubins are small ELF files made by hand. On a GPU, ``test_gpu_byte_identity.py`` and ``test_gpu_build.py``
+replay real ones.
+
+No ``from __future__ import annotations`` here: tilefish evaluates annotations at declaration.
 """
 
 import dataclasses
@@ -11,14 +14,17 @@ import hashlib
 import json
 
 import pytest
-from built_fakes import fake_build, rowop, scale
+from built_fakes import FAKE_SOURCE_DIGEST, fake_build, rowop, scale
 from elf_builder import S, SHT_PROGBITS, build_elf, cubin_like
 
 import tilefish
-from tilefish import Manifest, TilefishManifestError, TilefishRuntimeError
+from tilefish import Dim, Manifest, Out, Tensor, TilefishBuildError, TilefishManifestError, TilefishRuntimeError, bf16, const, f32
 from tilefish._elf import code_digest, parse_elf
+from tilefish._manifest import manifest_digest
 from tilefish.aot import compile_specs, write_manifest
 from tilefish.runtime import _load_manifest
+
+SRC = FAKE_SOURCE_DIGEST
 
 
 @pytest.fixture
@@ -49,7 +55,7 @@ def test_load_reads_every_binary_and_verifies_it(directory):
     assert m.get("scale", "sm_90").cubin == cubin_like() and m.get("scale", "sm_90").sha256_code == code_digest(cubin_like())
     assert ("rowop.S64", "sm_90") in m and ("rowop.S64", "sm_100") not in m and m.get("scale", "sm_100") is None
     assert Manifest.load(directory / "manifest.json").directory == directory  # the file itself works too
-    assert "3 binaries" in repr(m)
+    assert m.path == directory / "manifest.json" and "3 binaries" in repr(m)
 
 
 def test_load_is_the_same_through_tilefish_and_aot(directory):
@@ -71,6 +77,9 @@ def test_load_is_the_same_through_tilefish_and_aot(directory):
         (lambda d: d["kernels"][0].update(cubin=""), "plain file name"),
         (lambda d: d["kernels"][0].update(cubin="missing.cubin"), "cannot read the cubin 'missing.cubin'"),
         (lambda d: d["kernels"][0].update(symbol="tf_other"), "no code section '.text.tf_other'"),
+        (lambda d: d["kernels"][0].update(shared=-1), "shared must be a non-negative integer"),
+        (lambda d: d["kernels"][0].update(shared=True), "shared must be a non-negative integer"),
+        (lambda d: d["kernels"][0].update(shared="16"), "shared must be a non-negative integer"),
     ],
 )
 def test_load_refuses_a_malformed_manifest(directory, change, message):
@@ -126,6 +135,40 @@ def test_load_refuses_a_file_that_is_not_an_elf_cubin(directory):
         Manifest.load(directory)
 
 
+# -- shared memory --------------------------------------------------------------------------------------------------------------------
+
+
+def test_a_kernel_that_uses_shared_memory_needs_shared_in_the_manifest(directory):
+    """With ``shared = 0`` the launch would give the kernel no dynamic shared memory and it would fault."""
+    edit_manifest(directory, lambda d: d["kernels"][0].update(shared=0))
+    with pytest.raises(TilefishManifestError, match=r"has a shared memory section \('.nv.shared.tf_k'\).* shared = 0"):
+        Manifest.load(directory)
+
+
+def test_the_section_is_what_says_a_kernel_uses_shared_memory_not_its_size(tmp_path):
+    """On sm_80 the section of a kernel that uses shared memory has size 0; the section's presence is the signal."""
+    (spec,) = compile_specs(scale)
+    for shared_section in (1024, 0):
+        write_manifest([fake_build(spec, cubin=cubin_like(shared=shared_section), shared=0)], tmp_path / "manifest.json", cubins=True)
+        with pytest.raises(TilefishManifestError, match="has a shared memory section"):
+            Manifest.load(tmp_path)
+        write_manifest([fake_build(spec, cubin=cubin_like(shared=shared_section), shared=16)], tmp_path / "manifest.json", cubins=True)
+        assert Manifest.load(tmp_path).built_kernel(spec, "sm_90", source_digest=SRC).shared == 16
+
+
+def test_a_kernel_without_shared_memory_may_have_shared_zero(tmp_path):
+    (spec,) = compile_specs(scale)
+    plain = cubin_like(shared=None)
+    assert parse_elf(plain).section(".nv.shared.tf_k") is None
+    write_manifest([fake_build(spec, cubin=plain, shared=0)], tmp_path / "manifest.json", cubins=True)
+    assert Manifest.load(tmp_path).built_kernel(spec, "sm_90", source_digest=SRC).shared == 0
+
+
+def test_shared_memory_of_the_manifest_is_what_the_binary_has(directory):
+    spec, _ = specs()
+    assert Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC).shared == 16
+
+
 # -- the binary for a spec ---------------------------------------------------------------------------------------------------------
 
 
@@ -136,58 +179,64 @@ def specs():
 def test_built_kernel_is_the_binary_for_a_spec(directory):
     spec, (s32, s64) = specs()
     m = Manifest.load(directory)
-    b = m.built_kernel(spec, "sm_90")
+    b = m.built_kernel(spec, "sm_90", source_digest=SRC)
     assert b.spec is spec and b.arch == "sm_90" and b.symbol == "tf_k" and b.cubin == cubin_like()
     assert b.ptx == "" and b.sha256 == hashlib.sha256(b.cubin).hexdigest() and b.sha256_code == code_digest(b.cubin)
-    assert b.num_warps == 4 and b.shared == 0 and b.options == {"num_warps": 4, "num_stages": 3}
+    assert b.num_warps == 4 and b.shared == 16 and b.options == {"num_warps": 4, "num_stages": 3} and b.source_digest == SRC
     assert b.launch.replay_blockers() == [] and b.triton_version == "3.5.1" and "V12.9.86" in b.ptxas_version
     assert b.abi() == fake_build(spec).abi()
-    assert m.built_kernel(s64, "sm_90").stem == "rowop.S64"
+    assert m.built_kernel(s64, "sm_90", source_digest=SRC).stem == "rowop.S64"
 
 
 def test_built_kernel_needs_the_architecture(directory):
     spec, (s32, _) = specs()
     m = Manifest.load(directory)
     with pytest.raises(TilefishManifestError, match=r"no binary for 'scale' on sm_100 \(it has sm_90\)"):
-        m.built_kernel(spec, "sm_100")
+        m.built_kernel(spec, "sm_100", source_digest=SRC)
     with pytest.raises(TilefishManifestError, match=r"no binary for 'other' on sm_90 \(it has \['rowop.S32', 'rowop.S64', 'scale'\]\)"):
         renamed = dataclasses.replace(spec, stem="other")
         renamed._mark_verified()
-        m.built_kernel(renamed, "sm_90")
+        m.built_kernel(renamed, "sm_90", source_digest=SRC)
 
 
-@pytest.mark.parametrize(
-    "change, difference",
-    [
-        (lambda e: e.update(grid="(n,)"), "grid"),
-        (lambda e: e.update(block=[64, 1, 1]), "block"),
-        (lambda e: e.update(num_warps=8), "num_warps"),
-        (lambda e: e["constexprs"][1].update(value=512), "constexprs[1].value"),
-        (lambda e: e["abi"]["params"][0].update(dtype="f32"), "abi.params[0].dtype"),
-        (lambda e: e["abi"]["scratch"].pop(), "abi.scratch"),
-        (lambda e: e["preconditions"].pop(), "preconditions"),
-        (lambda e: e.update(declaration_digest="0" * 64), "declaration_digest"),
-        (lambda e: e["options"].update(enable_fp_fusion=False), "options.enable_fp_fusion"),
-        (lambda e: e["options"].update(num_stages=2), "options.num_stages"),
-        (lambda e: e.update(buckets={"S": 32}), "buckets.S"),
-    ],
-)
+ENTRY_CHANGES = [
+    (lambda e: e.update(grid="(n,)"), "grid"),
+    (lambda e: e.update(block=[64, 1, 1]), "block"),
+    (lambda e: e.update(num_warps=8), "num_warps"),
+    (lambda e: e["constexprs"][1].update(value=512), "constexprs[1].value"),
+    (lambda e: e["abi"]["params"][0].update(dtype="f32"), "abi.params[0].dtype"),
+    (lambda e: e["abi"]["scratch"].pop(), "abi.scratch"),
+    (lambda e: e["preconditions"].pop(), "preconditions"),
+    (lambda e: e.update(declaration_digest="0" * 64), "declaration_digest"),
+    (lambda e: e["options"].update(enable_fp_fusion=False), "options.enable_fp_fusion"),
+    (lambda e: e["options"].update(num_stages=2), "options.num_stages"),
+    (lambda e: e.update(buckets={"S": 32}), "buckets.S"),
+]
+
+
+@pytest.mark.parametrize("change, difference", ENTRY_CHANGES)
 def test_built_kernel_refuses_an_entry_that_is_not_what_the_spec_asks_for(directory, change, difference):
     edit_manifest(directory, lambda d: change(d["kernels"][0]))
     spec, _ = specs()
     m = Manifest.load(directory)  # still a perfectly good manifest: the cubins are what was built
     with pytest.raises(TilefishManifestError, match=r"not what the compile spec asks for: first difference at " + difference.replace("[", r"\[").replace("]", r"\]")):
-        m.built_kernel(spec, "sm_90")
+        m.built_kernel(spec, "sm_90", source_digest=SRC)
+
+
+@pytest.mark.parametrize("key", ["op", "abi", "grid", "block", "num_warps", "num_stages", "constexprs", "buckets", "preconditions", "declaration_digest"])
+def test_an_entry_that_lacks_a_field_of_the_spec_is_not_taken_to_agree_with_it(directory, key):
+    """A missing field must not read as "whatever the spec says": the entry has to say it."""
+    edit_manifest(directory, lambda d: d["kernels"][0].pop(key))
+    spec, _ = specs()
+    with pytest.raises(TilefishManifestError, match=r"not what the compile spec asks for: first difference at " + key):
+        Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC)
 
 
 def test_built_kernel_refuses_a_binary_of_another_declaration(directory):
     """The same stem, another extern (here with a different constexpr default): the declaration digest and the constants differ."""
-    import tilefish as tf
-    from tilefish import Dim, Out, Tensor, bf16, const, f32
-
     n = Dim("n", divisible_by=16)
 
-    @tf.extern(triton="my_kernels:scale", num_warps=4, grid=lambda n: (tf.cdiv(n, 256),), name="scale")
+    @tilefish.extern(triton="my_kernels:scale", num_warps=4, grid=lambda n: (tilefish.cdiv(n, 256),), name="scale")
     def scale_with_another_alpha(
         x: Tensor[n, bf16], y: Out[Tensor[n, bf16]], n_elem: n, *, ALPHA: const[f32] = 2.0, BLOCK: const = 256
     ): ...
@@ -195,17 +244,299 @@ def test_built_kernel_refuses_a_binary_of_another_declaration(directory):
     (spec,) = compile_specs(scale_with_another_alpha)
     assert spec.stem == "scale"
     with pytest.raises(TilefishManifestError, match="not what the compile spec asks for"):
-        Manifest.load(directory).built_kernel(spec, "sm_90")
+        Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC)
 
 
 def test_launch_attributes_that_replay_cannot_set_up_are_kept_for_the_driver_check(directory):
     edit_manifest(directory, lambda d: d["kernels"][0]["launch"].update(global_scratch_size=64, launch_pdl=True))
     spec, _ = specs()
-    b = Manifest.load(directory).built_kernel(spec, "sm_90")
+    b = Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC)
     assert b.launch.replay_blockers() == ["global_scratch_size=64", "launch_pdl=True"]  # refused when it is loaded into the driver
     edit_manifest(directory, lambda d: d["kernels"][0].update(launch={"global_scratch_size": 0}))
     with pytest.raises(TilefishManifestError, match="launch attributes are malformed"):
-        Manifest.load(directory).built_kernel(spec, "sm_90")
+        Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC)
+
+
+# -- the source: a stale binary is refused ----------------------------------------------------------------------------------------------
+
+
+def rows_body(factor):
+    """The same kernel (name, signature) with another body: the p1 scenario."""
+    rows = Dim("R")
+    d = Dim("D", 64)
+
+    @tilefish.kernel(name="scale_k")
+    def scale_k(x: Tensor[rows, d, f32]) -> Tensor[rows, d, f32]:
+        return x * factor
+
+    return scale_k
+
+
+def test_a_generated_kernel_with_another_body_is_not_the_manifests_binary(tmp_path):
+    old, new = rows_body(2.0).lower(), rows_body(3.0).lower()
+    assert old.specs()[0].stem == new.specs()[0].stem == "scale_k"  # the same name, the same signature ...
+    assert old.source_sha256 != new.source_sha256  # ... another source
+    assert old.specs()[0].declaration_digest != new.specs()[0].declaration_digest
+    write_manifest([fake_build(s, symbol="tf_k") for s in old.specs()], tmp_path / "manifest.json", cubins=True)
+    m = Manifest.load(tmp_path)
+    (old_spec,), (new_spec,) = old.specs(), new.specs()
+    assert m.built_kernel(old_spec, "sm_90").spec is old_spec  # the manifest is fine for the kernel it was built from
+    with pytest.raises(TilefishManifestError) as e:
+        m.built_kernel(new_spec, "sm_90")
+    message = str(e.value)
+    assert old.source_sha256 in message and new.source_sha256 in message  # both hashes are named
+    assert "'scale_k' (sm_90)" in message and "changed since the manifest was written" in message and "stale" in message
+
+
+def test_a_generated_kernels_entry_records_its_source(tmp_path):
+    low = rows_body(2.0).lower()
+    write_manifest([fake_build(s) for s in low.specs()], tmp_path / "manifest.json", cubins=True)
+    entry = json.loads((tmp_path / "manifest.json").read_text())["kernels"][0]
+    assert entry["source_sha256"] == low.source_sha256 == hashlib.sha256(low.source.encode()).hexdigest()
+    assert entry["declaration_digest"] == low.specs()[0].declaration_digest
+
+
+def test_an_entry_without_the_source_of_a_generated_kernel_is_refused(tmp_path):
+    low = rows_body(2.0).lower()
+    write_manifest([fake_build(s) for s in low.specs()], tmp_path / "manifest.json", cubins=True)
+    edit_manifest(tmp_path, lambda d: d["kernels"][0].pop("source_sha256"))
+    with pytest.raises(TilefishManifestError, match="was built from kernel source with sha256 None"):
+        Manifest.load(tmp_path).built_kernel(low.specs()[0], "sm_90")
+
+
+def test_a_hand_written_kernels_source_digest_must_match(directory):
+    spec, _ = specs()
+    m = Manifest.load(directory)
+    assert m.built_kernel(spec, "sm_90", source_digest=SRC).stem == "scale"
+    other = hashlib.sha256(b"an edited kernel").hexdigest()
+    with pytest.raises(TilefishManifestError) as e:
+        m.built_kernel(spec, "sm_90", source_digest=other)
+    assert SRC in str(e.value) and other in str(e.value) and "my_kernels:scale" in str(e.value) and "stale" in str(e.value)
+    with pytest.raises(TilefishManifestError, match="stale"):
+        m.built_kernel(spec, "sm_90", source_digest=other, pinned=True)  # a pin does not excuse a digest that is known to differ
+
+
+def test_without_a_recomputed_source_digest_a_hand_written_kernel_needs_a_pin(directory):
+    spec, _ = specs()
+    m = Manifest.load(directory)
+    with pytest.raises(TilefishManifestError, match=r"cannot tell whether the binary for 'scale' \(sm_90\) was built from the current source .*cannot be recomputed here"):
+        m.built_kernel(spec, "sm_90")
+    assert m.built_kernel(spec, "sm_90", pinned=True).stem == "scale"  # the caller vouches for the manifest
+
+
+def test_an_entry_without_a_source_digest_needs_a_pin(tmp_path):
+    (spec,) = compile_specs(scale)
+    write_manifest([fake_build(spec, source_digest=None)], tmp_path / "manifest.json", cubins=True)
+    entry = json.loads((tmp_path / "manifest.json").read_text())["kernels"][0]
+    assert "source_digest" not in entry and "source_digest_kind" not in entry
+    m = Manifest.load(tmp_path)
+    with pytest.raises(TilefishManifestError, match="the manifest entry records no source digest"):
+        m.built_kernel(spec, "sm_90", source_digest=SRC)
+    assert m.built_kernel(spec, "sm_90", source_digest=SRC, pinned=True).source_digest is None
+
+
+def test_the_source_digest_of_an_entry_is_labelled(directory):
+    entry = json.loads((directory / "manifest.json").read_text())["kernels"][0]
+    assert entry["source_digest"] == SRC and entry["source_digest_kind"] == "triton.JITFunction.cache_key"
+
+
+# -- the digest of the manifest --------------------------------------------------------------------------------------------------------
+
+
+def test_the_manifest_has_a_digest_of_everything_in_it(directory):
+    m = Manifest.load(directory)
+    assert len(m.digest) == 64 and set(m.digest) <= set("0123456789abcdef")
+    assert m.digest == manifest_digest(json.loads((directory / "manifest.json").read_text())) == Manifest.load(directory).digest
+
+
+def test_the_digest_does_not_depend_on_formatting_order_or_the_tilefish_version(directory):
+    m = Manifest.load(directory)
+    doc = json.loads((directory / "manifest.json").read_text())
+    reordered = {"kernels": list(reversed([dict(reversed(list(k.items()))) for k in doc["kernels"]])), "tilefish": "9.9.9", "schema": doc["schema"]}
+    assert manifest_digest(reordered) == m.digest
+    (directory / "manifest.json").write_text(json.dumps(doc, indent=4, sort_keys=True))
+    assert Manifest.load(directory).digest == m.digest
+
+
+DIGEST_CHANGES = [
+    ("shared", lambda e: e.update(shared=32)),
+    ("block", lambda e: e.update(block=[64, 1, 1])),
+    ("launch", lambda e: e["launch"].update(cluster_dims=[2, 1, 1])),
+    ("launch pdl", lambda e: e["launch"].update(launch_pdl=True)),
+    ("toolchain", lambda e: e["toolchain"].update(ptxas="another ptxas")),
+    ("symbol", lambda e: e.update(symbol="tf_k")),  # (the same: not a change)
+    ("sha256", lambda e: e.update(sha256="0" * 64)),
+    ("sha256_code", lambda e: e.update(sha256_code="0" * 64)),
+    ("source_digest", lambda e: e.update(source_digest="1" * 64)),
+    ("declaration_digest", lambda e: e.update(declaration_digest="2" * 64)),
+    ("options", lambda e: e["options"].update(num_stages=2)),
+    ("abi", lambda e: e["abi"]["params"][0].update(access="out")),
+    ("grid", lambda e: e.update(grid="(n,)")),
+    ("constexprs", lambda e: e["constexprs"][0].update(value=1.0)),
+    ("preconditions", lambda e: e["preconditions"].pop()),
+    ("arch", lambda e: e.update(arch="sm_100")),
+    ("an entry", lambda e: None),
+]
+
+
+@pytest.mark.parametrize("label, change", DIGEST_CHANGES)
+def test_the_digest_changes_with_every_field_of_every_entry(directory, label, change):
+    doc = json.loads((directory / "manifest.json").read_text())
+    before = manifest_digest(doc)
+    if label == "an entry":
+        doc["kernels"].pop()
+    else:
+        change(doc["kernels"][0])
+    if label == "symbol":
+        assert manifest_digest(doc) == before  # the entry already had this symbol
+    else:
+        assert manifest_digest(doc) != before
+
+
+def test_the_digest_of_a_different_set_of_binaries_differs(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    write_manifest([fake_build(s) for s in compile_specs(scale)], a / "manifest.json", cubins=True)
+    write_manifest([fake_build(s, cubin=cubin_like(code=b"\x07" * 64)) for s in compile_specs(scale)], b / "manifest.json", cubins=True)
+    assert Manifest.load(a).digest != Manifest.load(b).digest
+
+
+def test_a_pinned_replay_refuses_another_digest(directory):
+    pin = Manifest.load(directory).digest
+    wrong = "f" * 64 if pin[0] != "f" else "e" * 64
+    with pytest.raises(TilefishManifestError, match=f"has digest {pin}, but pin= says {wrong}"):
+        tilefish.run(scale, mode="replay", manifest=directory, pin=wrong)
+    edit_manifest(directory, lambda d: d["kernels"][0].update(shared=32))  # a change the file digests do not see
+    changed = Manifest.load(directory)
+    assert changed.digest != pin
+    with pytest.raises(TilefishManifestError, match="it is not the manifest that was pinned"):
+        tilefish.run(scale, mode="replay", manifest=directory, pin=pin)
+
+
+def test_pin_is_a_digest_and_belongs_to_replay(directory):
+    for bad in ("abc", 5, "G" * 64, "A" * 64, ""):
+        with pytest.raises(TilefishRuntimeError, match="pin= is the 64 lowercase hex digits"):
+            tilefish.run(scale, mode="replay", manifest=directory, pin=bad)
+    for mode in ("jit", "reference"):
+        with pytest.raises(TilefishRuntimeError, match="pin= is for mode='replay'"):
+            tilefish.run(scale, mode=mode, pin="a" * 64)
+
+
+# -- writing: merge, overwrite and safe names ------------------------------------------------------------------------------------------
+
+
+def test_merging_keeps_the_other_architectures_and_kernels(directory):
+    (spec,) = compile_specs(scale)
+    other_arch = fake_build(spec, arch="sm_100", cubin=cubin_like(code=b"\x09" * 64))
+    path = write_manifest([other_arch], directory / "manifest.json", cubins=True, merge=True)
+    m = Manifest.load(path)
+    assert sorted((a.stem, a.arch) for a in m.artifacts) == [("rowop.S32", "sm_90"), ("rowop.S64", "sm_90"), ("scale", "sm_100"), ("scale", "sm_90")]
+    assert m.get("scale", "sm_90").cubin == cubin_like() and m.get("scale", "sm_100").cubin == other_arch.cubin
+
+
+def test_without_merge_the_manifest_is_replaced(directory):
+    (spec,) = compile_specs(scale)
+    write_manifest([fake_build(spec, arch="sm_100")], directory / "manifest.json", cubins=True)
+    assert [(a.stem, a.arch) for a in Manifest.load(directory).artifacts] == [("scale", "sm_100")]
+
+
+def test_a_new_build_of_the_same_binary_replaces_its_entry(directory):
+    (spec,) = compile_specs(scale)
+    rebuilt = fake_build(spec, cubin=cubin_like(debug="/a/longer/other/path.py"))  # same machine code, another build path
+    assert rebuilt.sha256 != Manifest.load(directory).get("scale", "sm_90").entry["sha256"]
+    write_manifest([rebuilt], directory / "manifest.json", cubins=True, merge=True)
+    m = Manifest.load(directory)
+    assert len(m.artifacts) == 3 and m.get("scale", "sm_90").entry["sha256"] == rebuilt.sha256
+
+
+@pytest.mark.parametrize(
+    "change, what",
+    [
+        ({"cubin": cubin_like(code=b"\x05" * 64)}, "sha256_code"),
+        ({"shared": 32}, "shared"),
+        ({"source_digest": hashlib.sha256(b"edited").hexdigest()}, "source_digest"),
+    ],
+)
+def test_a_conflicting_binary_replaces_an_entry_only_with_overwrite(directory, change, what):
+    (spec,) = compile_specs(scale)
+    different = fake_build(spec, **change)
+    before = Manifest.load(directory).digest
+    with pytest.raises(TilefishManifestError, match=rf"already has a different binary for 'scale' on sm_90 \({what} differs\); pass overwrite=True"):
+        write_manifest([different], directory / "manifest.json", cubins=True, merge=True)
+    assert Manifest.load(directory).digest == before  # nothing was written
+    write_manifest([different], directory / "manifest.json", cubins=True, merge=True, overwrite=True)
+    assert Manifest.load(directory).digest != before
+
+
+def test_a_merge_into_a_manifest_that_does_not_verify_is_an_error(directory):
+    cubin_of(directory).write_bytes(b"damaged")
+    (spec,) = compile_specs(scale)
+    with pytest.raises(TilefishManifestError, match="sha256"):
+        write_manifest([fake_build(spec, arch="sm_100")], directory / "manifest.json", cubins=True, merge=True)
+
+
+def test_the_cubins_are_written_inside_the_directory(tmp_path):
+    (spec,) = compile_specs(scale)
+    for stem in ("../evil", "a/b", "a\\b", ".hidden", "x\0y"):
+        evil = dataclasses.replace(spec, stem=stem)
+        evil._mark_verified()
+        with pytest.raises(TilefishBuildError, match="not a plain file name"):
+            fake_build(evil).write_cubin(tmp_path / "out")
+        with pytest.raises(TilefishBuildError, match="not a plain file name"):
+            write_manifest([fake_build(evil)], tmp_path / "m" / "manifest.json", cubins=True)
+    for arch in ("../sm_90", "sm/90"):
+        with pytest.raises(TilefishBuildError, match="not a plain file name"):
+            fake_build(spec, arch=arch).write_cubin(tmp_path / "out")
+    assert not (tmp_path / "evil.sm_90.cubin").exists() and not list((tmp_path / "out").glob("*"))
+    assert fake_build(spec).write_cubin(tmp_path / "out").parent == tmp_path / "out"
+
+
+def test_a_directory_that_is_a_symlink_elsewhere_is_still_the_directory(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    (spec,) = compile_specs(scale)
+    assert fake_build(spec).write_cubin(link).resolve().parent == real.resolve()
+
+
+def test_a_cubin_name_that_is_a_symlink_out_of_the_directory_is_not_written_through(tmp_path):
+    """A plain file name can still be a symlink that is already in the directory; writing would follow it."""
+    (spec,) = compile_specs(scale)
+    out = tmp_path / "out"
+    out.mkdir()
+    elsewhere = tmp_path / "elsewhere.bin"
+    elsewhere.write_bytes(b"precious")
+    build = fake_build(spec)
+    (out / build.cubin_name).symlink_to(elsewhere)
+    with pytest.raises(TilefishBuildError, match="is not inside"):
+        build.write_cubin(out)
+    assert elsewhere.read_bytes() == b"precious"
+
+
+def test_an_extern_name_is_a_plain_identifier():
+    for bad in ("../evil", "a/b", "a b", "a\nb", "a.b", "", "1abc", "naïve", "a\x00b", "-x", "x;y"):
+        with pytest.raises(tilefish.TilefishDeclarationError, match="name must be a plain identifier"):
+
+            @tilefish.extern(triton="my_kernels:scale", grid=lambda n: (n,), name=bad)
+            def stub(x: Tensor[Dim("n", divisible_by=16), bf16], n_elem: Dim("n", divisible_by=16)): ...
+
+    with pytest.raises(tilefish.TilefishDeclarationError, match="name must be a plain identifier"):
+        tilefish.extern(triton="my_kernels:scale", grid=lambda n: (n,), name=3)
+
+    @tilefish.extern(triton="my_kernels:scale", grid=lambda n: (n,), name="_ok_Name_9")
+    def stub(x: Tensor[Dim("n", divisible_by=16), bf16], n_elem: Dim("n", divisible_by=16)): ...
+
+    assert stub.name == "_ok_Name_9"
+
+
+def test_an_extern_function_name_that_is_not_ascii_needs_a_name():
+    """Without ``name=`` the function's name is the op name, and Python allows identifiers that are no file name here."""
+
+    def naïve(x: Tensor[Dim("n", divisible_by=16), bf16], n_elem: Dim("n", divisible_by=16)): ...
+
+    with pytest.raises(tilefish.TilefishDeclarationError, match=r"function name 'naïve' is not a plain identifier"):
+        tilefish.extern(triton="my_kernels:scale", grid=lambda n: (n,))(naïve)
+    assert tilefish.extern(triton="my_kernels:scale", grid=lambda n: (n,), name="naive")(naïve).name == "naive"
 
 
 # -- run(): the manifest argument --------------------------------------------------------------------------------------------------------
@@ -261,15 +592,16 @@ def test_a_generated_kernels_manifest_names_its_contraction_and_its_warps_per_bu
     doc = json.loads((tmp_path / "manifest.json").read_text())
     assert [(k["stem"], k["num_warps"], k["block"]) for k in doc["kernels"]] == [("rows.Hb64", 1, [32, 1, 1]), ("rows.Hb4096", 16, [512, 1, 1])]
     assert all(k["options"] == {"num_warps": k["num_warps"], "num_stages": 3, "enable_fp_fusion": True} for k in doc["kernels"])
+    assert all(k["source_sha256"] == rows.lower().source_sha256 for k in doc["kernels"])
     m = Manifest.load(tmp_path)
     assert [m.built_kernel(s, "sm_90").num_warps for s in specs_] == [1, 16]
     strict = rows.lower(fp_fusion=False).specs()
-    with pytest.raises(TilefishManifestError, match="first difference at options.enable_fp_fusion"):
+    with pytest.raises(TilefishManifestError, match="stale|first difference at"):
         m.built_kernel(strict[0], "sm_90")
 
 
 def test_a_minimal_cubin_with_its_code_section_loads(tmp_path):
     only_debug = build_elf([S(".text.tf_k", SHT_PROGBITS, data=b"\1\2\3\4"), S(".debug_line", data=b"x")])
     (spec,) = compile_specs(scale)
-    write_manifest([fake_build(spec, cubin=only_debug)], tmp_path / "manifest.json", cubins=True)
+    write_manifest([fake_build(spec, cubin=only_debug, shared=0)], tmp_path / "manifest.json", cubins=True)
     assert Manifest.load(tmp_path).get("scale", "sm_90").sha256_code == code_digest(only_debug)

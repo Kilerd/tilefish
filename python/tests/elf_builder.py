@@ -102,8 +102,11 @@ def build_elf(
     return header + body + headers
 
 
-def cubin_like(*, debug="path/a.py", code=b"\x01\x02\x03\x04" * 16, gap=0, debug_first=False, **kw):
-    """A small file shaped like a Mercury cubin: code and constants, symbol tables, and debug sections that hold ``debug``."""
+def cubin_like(*, debug="path/a.py", code=b"\x01\x02\x03\x04" * 16, gap=0, debug_first=False, shared=1024, **kw):
+    """A small file shaped like a Mercury cubin: code and constants, symbol tables, and debug sections that hold ``debug``.
+
+    ``shared`` is the size of the shared memory section ``.nv.shared.tf_k`` of the kernel: 1024 as on sm_90 and later, ``0``
+    for the empty section of sm_80, ``None`` for a kernel that uses no shared memory (no section)."""
     dbg = debug.encode()
     debug_sections = [
         S(".debug_line", data=b"line:" + dbg),
@@ -117,7 +120,7 @@ def cubin_like(*, debug="path/a.py", code=b"\x01\x02\x03\x04" * 16, gap=0, debug
         S(".symtab", SHT_SYMTAB, data=b"\0" * 48, link=".strtab", info=2, align=8, entsize=24),
         S(".nv.info.tf_k", 0x70000000, flags=SHF_INFO_LINK, data=b"\x04\x2f\x08\x00" * 4, link=".symtab", info=".text.tf_k", align=4),
         S(".text.tf_k", SHT_PROGBITS, flags=SHF_ALLOC | SHF_EXECINSTR, data=code, link=".symtab", info=1, align=128),
-        S(".nv.shared.tf_k", SHT_NOBITS, flags=SHF_ALLOC | 0x1, size=1024, align=16),
+        *([S(".nv.shared.tf_k", SHT_NOBITS, flags=SHF_ALLOC | 0x1, size=shared, align=16)] if shared is not None else []),
         S(".nv.constant0.tf_k", SHT_PROGBITS, flags=SHF_ALLOC, data=b"\0" * 32, align=4),
     ]
     sections = [*debug_sections, *code_sections] if debug_first else [*code_sections, *debug_sections]

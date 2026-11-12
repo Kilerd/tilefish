@@ -53,7 +53,12 @@ Kernels that tilefish generated (``tilefish.lower``) add two optional facts to t
 schema 2 only and never present in the specs of a hand-written ``extern``: a ``max_elements``
 precondition per tensor whose element count is not statically bounded (the generated code indexes
 with ``i32``; see :class:`Precondition`), and ``count_of`` on a runtime scalar that carries the element
-count of a tensor argument (see :class:`ArgSpec`).
+count of a tensor argument (see :class:`ArgSpec`). Two more facts of a generated kernel sit at the top level of its
+spec (schema 2 only too): ``enable_fp_fusion`` (Triton's FMA contraction option, always written out for a generated
+kernel) and ``source_sha256`` (the sha256 of the generated Triton source, so that a kernel redeclared with another
+body but the same name and signature is not the kernel a stored binary was built from). Both are in the declaration
+digest and in what ``verify_against`` compares. The warp count of a bucketed generated kernel is per bucket (each
+spec has its own ``num_warps`` and ``block``).
 
 The fingerprint behind ``verified`` keeps the order of what carries order: ``signature`` (the argument
 order Triton sees) and ``buckets`` are hashed as lists, so reordering either in place withdraws the
@@ -273,6 +278,10 @@ class CompileSpec:
     # Triton's ``enable_fp_fusion`` for a kernel that tilefish generated: ``True`` is Triton's default, written out;
     # ``False`` asks for no FMA contraction. ``None`` (every ``extern``) leaves the option out of the compile options.
     enable_fp_fusion: bool | None = None
+    # sha256 of the generated Triton source, for a kernel that tilefish generated (``None`` for every ``extern``, whose
+    # source is a Python function the declaration does not contain). It is in the declaration digest, so a binary built
+    # from another body of a kernel with the same name and signature is not the binary of this spec.
+    source_sha256: str | None = None
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
@@ -389,6 +398,8 @@ class CompileSpec:
             doc["declaration_digest"] = self.declaration_digest
         if self.enable_fp_fusion is not None:
             doc["enable_fp_fusion"] = self.enable_fp_fusion
+        if self.source_sha256 is not None:
+            doc["source_sha256"] = self.source_sha256
         return doc
 
     def to_json(self, indent: int | None = 2) -> str:
@@ -432,6 +443,7 @@ class CompileSpec:
                 buckets=dict(d["buckets"]),
                 declaration_digest=d.get("declaration_digest"),
                 enable_fp_fusion=d.get("enable_fp_fusion"),
+                source_sha256=d.get("source_sha256"),
             )
 
     def verify_against(self, op: ExternOp) -> None:
@@ -660,6 +672,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc["element_counts"] = dict(sorted(op.element_counts.items()))
     if op.fp_fusion is not None:
         doc["fp_fusion"] = op.fp_fusion
+    if op.source_sha256 is not None:
+        doc["source_sha256"] = op.source_sha256
     if op.bucket_num_warps:
         doc["bucket_num_warps"] = dict(sorted(op.bucket_num_warps.items()))
     return doc
@@ -781,6 +795,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         buckets={d.name: v for d, v in mapping.items()},
         declaration_digest=digest,
         enable_fp_fusion=op.fp_fusion,
+        source_sha256=op.source_sha256,
     )
     spec._mark_verified()  # generated from the declaration just now
     return spec
