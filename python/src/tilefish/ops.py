@@ -366,6 +366,12 @@ def store(target: Any, key: Any, value: Any) -> None:
     the parameter see; ``value`` itself is untouched, and later in-place
     updates of ``value`` or of the parameter do not affect each other. A
     read-only input can never become writable through a store.
+
+    The store node takes the parameter's *current* version as its first input and the stored value as
+    its second, so consecutive versions are linked by dataflow (``store(%v1, %src)`` produces ``%v2``)
+    and their order never rests on node order alone. Storing a parameter into itself (``x[...] = x``)
+    is a copy onto itself: it is recorded like any store, but it is not a write, so it does not satisfy
+    a kernel's check that every ``Out``/``InOut`` parameter is written.
     """
     if not isinstance(target, Value):
         raise TilefishTypeError(f"store: target must be a traced tensor, got {type(target).__name__}")
@@ -385,8 +391,11 @@ def store(target: Any, key: Any, value: Any) -> None:
         elif value.dtype != target.dtype:
             hint = "; stores do not cast implicitly, use .to(dtype)"
         raise TilefishTypeError(f"store into '{target.name}': expected {target.type}, got {value.type}{hint}")
+    current = target.live  # the version this store replaces (for an Out parameter, which has no versions: itself)
     versions = [target.type] if target.access == "inout" else []
-    outs = target.ctx.emit("store", [target, value], {"target": target.name}, versions)
-    target.ctx.written.add(target)
+    outs = target.ctx.emit("store", [current, value], {"target": target.name}, versions)
+    if value is not current:  # `x[...] = x` copies a tensor onto itself: a node, but not a write
+        target.ctx.written.add(target)
     if outs:
+        current._latest = outs[0]
         target._latest = outs[0]

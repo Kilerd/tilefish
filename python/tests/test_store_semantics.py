@@ -6,7 +6,7 @@ import pickle
 import pytest
 
 import tilefish
-from tilefish import Dim, InOut, Tensor, TilefishTypeError, bf16
+from tilefish import Dim, InOut, Out, Tensor, TilefishTypeError, bf16
 
 M = Dim("M")
 
@@ -149,7 +149,7 @@ def test_two_stores_in_a_row_keep_only_the_last_version():
     graph = g.graph
     first, second = graph.nodes
     assert first.inputs == (graph.inputs[0], graph.inputs[1])
-    assert second.inputs == (graph.inputs[0], graph.inputs[2])
+    assert second.inputs == (first.outputs[0], graph.inputs[2])  # the second store replaces the first one's version
     assert graph.outputs == (second.outputs[0],) and graph.finals == {"x": second.outputs[0]}
 
 
@@ -172,6 +172,155 @@ def test_kernels_follow_the_same_rules():
 
     assert swap.graph.finals.keys() == {"x", "y"}
     assert swap.graph.outputs == (swap.graph.finals["x"],)
+
+
+# -- consecutive versions are linked by dataflow ----------------------------------------------------------------------------
+
+
+def producer_chain(node):
+    """Every node a node depends on, through the inputs alone (never through node order)."""
+    seen, todo = [], [node]
+    while todo:
+        n = todo.pop()
+        for v in n.inputs:
+            p = getattr(v, "producer", None)
+            if p is not None and p not in seen:
+                seen.append(p)
+                todo.append(p)
+    return seen
+
+
+def test_a_store_takes_the_targets_current_version_as_its_first_input():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+        x[...] = y  # replaces the parameter as passed in
+        x[...] = z  # replaces the first store's version
+        inplace(x)  # updates the second store's version
+        x[...] = y  # replaces the update's version
+        return x
+
+    graph = g.graph
+    x, y, z = graph.inputs
+    s1, s2, bump, s3 = graph.nodes
+    assert s1.inputs == (x, y)
+    assert s2.inputs == (s1.outputs[0], z)
+    assert bump.inputs == (s2.outputs[0],)
+    assert s3.inputs == (bump.outputs[0], y)
+    assert graph.outputs == (s3.outputs[0],) and graph.finals == {"x": s3.outputs[0]}
+
+
+def test_the_order_of_updates_follows_from_the_inputs_alone():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+        x[...] = y
+        x[...] = z
+        inplace(x)
+        x[...] = y
+
+    s1, s2, bump, s3 = g.graph.nodes
+    # each update depends, through dataflow, on every earlier update of the same target
+    assert producer_chain(s2) == [s1]
+    assert producer_chain(bump) == [s2, s1]
+    assert producer_chain(s3) == [bump, s2, s1]
+    # so a schedule that puts the updates in another order breaks an edge
+    shuffled = [s3, bump, s2, s1]
+    position = {id(n): i for i, n in enumerate(shuffled)}
+    assert any(position[id(dep)] > position[id(n)] for n in shuffled for dep in producer_chain(n))
+
+
+def test_an_out_parameter_has_no_versions_so_a_store_takes_the_parameter_itself():
+    @tilefish.kernel
+    def k(x: Tensor[M, bf16], y: Out[Tensor[M, bf16]]):
+        y[...] = x
+        y[...] = x + 1
+
+    s1, add, s2 = k.graph.nodes
+    y = k.graph.inputs[1]
+    assert s1.inputs == (y, k.graph.inputs[0]) and s1.outputs == ()
+    assert s2.inputs == (y, add.outputs[0]) and s2.outputs == ()
+
+
+def test_the_dump_shows_the_chain_of_versions():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]], y: Tensor[M, bf16], z: Tensor[M, bf16]):
+        x[...] = y
+        x[...] = z
+        inplace(x)
+
+    s1, s2, bump = g.graph.nodes
+    lines = str(g.graph).splitlines()
+    assert f"  {s1.outputs[0].ref}: Tensor[M, bf16] = store(%x, %y) {{target=x}}" in lines
+    assert f"  {s2.outputs[0].ref}: Tensor[M, bf16] = store({s1.outputs[0].ref}, %z) {{target=x}}" in lines
+    assert f"  {bump.outputs[0].ref}: Tensor[M, bf16] = inplace({s2.outputs[0].ref}) {{kind=library, inout=(x,)}}" in lines
+    assert f"  final x = {bump.outputs[0].ref}" in lines
+
+
+# -- a self-store is not a write ------------------------------------------------------------------------------------------------------
+
+
+def test_storing_a_parameter_into_itself_is_still_recorded_as_a_copy():
+    @tilefish.graph
+    def g(x: InOut[Tensor[M, bf16]]):
+        x[...] = x
+        return x
+
+    (store,) = g.graph.nodes
+    assert store.inputs == (g.graph.inputs[0], g.graph.inputs[0])
+    assert g.graph.outputs == (store.outputs[0],)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        lambda x: x.__setitem__(Ellipsis, x),
+        lambda x: x.__setitem__(slice(None), x),
+        lambda x: x.__setitem__(Ellipsis, x.live),
+        lambda x: x.__setitem__(Ellipsis, x.to(bf16)),  # a no-op cast reads x
+    ],
+    ids=["ellipsis", "slice", "live", "noop-cast"],
+)
+def test_a_kernel_that_only_stores_a_parameter_into_itself_never_wrote_it(body):
+    with pytest.raises(TilefishTypeError, match="kernel 'k': InOut parameter 'x' is never written"):
+
+        @tilefish.kernel
+        def k(x: InOut[Tensor[M, bf16]]):
+            body(x)
+
+
+def test_a_self_store_after_a_real_write_or_next_to_one_is_fine():
+    @tilefish.library("poke")
+    def poke(a: InOut[Tensor[M, bf16]]): ...
+
+    @tilefish.kernel
+    def after_update(x: InOut[Tensor[M, bf16]]):
+        poke(x)  # a real write
+        x[...] = x  # a self-store of the updated version
+
+    @tilefish.kernel
+    def two_params(x: InOut[Tensor[M, bf16]], y: InOut[Tensor[M, bf16]]):
+        x[...] = x  # not a write ...
+        y[...] = x  # ... this one is a write of y ...
+        x[...] = y + 1  # ... and this one of x
+
+    assert after_update.graph.ops() == ["poke", "store"]
+    assert two_params.graph.ops() == ["store", "store", "add", "store"]
+
+
+def test_a_parameter_that_is_only_copied_onto_itself_is_reported_even_next_to_a_real_write():
+    with pytest.raises(TilefishTypeError, match="InOut parameter 'x' is never written"):
+
+        @tilefish.kernel
+        def k(x: InOut[Tensor[M, bf16]], y: InOut[Tensor[M, bf16]]):
+            x[...] = x
+            y[...] = y + 0  # y is written; x still is not
+
+
+def test_storing_a_computed_copy_is_a_write_even_if_the_values_are_equal():
+    @tilefish.kernel
+    def k(x: InOut[Tensor[M, bf16]]):
+        x[...] = x + 0
+
+    assert k.graph.ops() == ["add", "store"]
 
 
 # -- the IR dump shows the final version of every modified InOut -----------------------------------------------------------

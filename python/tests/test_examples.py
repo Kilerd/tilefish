@@ -35,7 +35,11 @@ def test_transformer_block_traces_and_type_checks(block):
     assert g.inputs[0].access == "inout"
     # returning the residual stream returns what was stored into it
     store = g.nodes[-1]
-    assert store.op == "store" and store.inputs[0] is g.inputs[0]
+    add_rmsnorm = g.nodes[4]
+    assert store.op == "store"
+    # the store overwrites the version add_rmsnorm left in x (y, then the new version of the InOut residual)
+    assert store.inputs[0] is add_rmsnorm.outputs[1] and store.inputs[0] is not g.inputs[0]
+    assert g.nodes[-2].inputs[0] is add_rmsnorm.outputs[1]  # `x + mlp` reads it too
     assert g.outputs == (store.outputs[0],)  # the stream's new version
     assert g.finals == {"x": store.outputs[0]}
     assert "  final x = %" in str(g)

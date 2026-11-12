@@ -80,9 +80,12 @@ class Node:
 
     A call's ``outputs`` are the declared return values, then the ``Out``
     parameters, then one new version of each ``InOut`` argument (after the
-    call, reading that argument reads the new version). A ``store`` into an
-    ``InOut`` parameter has one output, the parameter's new version (a store
-    copies its value; it has no output for an ``Out`` parameter).
+    call, reading that argument reads the new version). A ``store`` into a
+    parameter has the target's current version as its first input and the stored
+    value as its second (``store(%current, %value)``), which links consecutive
+    versions of the target by dataflow. For an ``InOut`` parameter it has one
+    output, the parameter's new version (a store copies its value; it has no
+    output for an ``Out`` parameter, which has no versions).
     """
 
     __slots__ = ("op", "inputs", "attrs", "outputs")
