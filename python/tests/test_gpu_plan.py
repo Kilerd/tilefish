@@ -172,6 +172,76 @@ def test_an_in_place_graph_updates_the_callers_tensor_in_the_order_of_the_ir_in_
             tilefish.run(pm.accumulate, a, a)  # the in-place tensor must not also be an input
 
 
+PTX = pathlib.Path(__file__).resolve().parent / "ptx"
+B = tilefish.Dim("B", buckets=[8, 24])
+Nn = tilefish.Dim("Nn")
+
+
+@tilefish.extern(ptx=PTX / "axpy_f32.ptx", symbol="axpy_f32", block=(128,), grid=lambda Nn: (tilefish.cdiv(Nn, 128),))
+def axpy(x: tilefish.Tensor[Nn, tilefish.f32], y: tilefish.Tensor[Nn, tilefish.f32], out: tilefish.Out[tilefish.Tensor[Nn, tilefish.f32]], n_elem: Nn, alpha: tilefish.const[tilefish.f32] = 2.0): ...
+
+
+@tilefish.extern(ptx=PTX / "strided_copy_bf16.ptx", symbol="strided_copy_bf16", block=(64,), grid=lambda B: (B,), index_bits=64)
+def strided_copy(
+    x: tilefish.Strided[tilefish.Tensor[B, 64, tilefish.bf16]], y: tilefish.Out[tilefish.Tensor[B, 64, tilefish.bf16]], *, cols: tilefish.const[tilefish.i32] = 64, x_s0: tilefish.StrideOf("x", 0)
+): ...
+
+
+@tilefish.graph
+def prebuilt(
+    x: tilefish.Tensor[B, 64, tilefish.f32], y: tilefish.Tensor[B, 64, tilefish.f32], w: tilefish.Tensor[B, 128, tilefish.bf16]
+) -> tuple[tilefish.Tensor[B * 64, tilefish.f32], tilefish.Tensor[B, 64, tilefish.bf16]]:
+    z = axpy(x.reshape(B * 64), y.reshape(B * 64))  # a prebuilt PTX with a fixed float argument, on views
+    left, _ = w.split(64, axis=-1)  # a column block of w: a view with a row stride of 128
+    return z, strided_copy(left)  # a prebuilt PTX with a 64-bit stride scalar
+
+
+def test_a_graph_of_prebuilt_binaries_plans_exports_and_replays_like_one_of_triton_kernels(tmp_path):
+    from gpu_util import randn
+
+    p = runtime.export(prebuilt, tmp_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert {e["kind"] for e in manifest["kernels"]} == {"binary"} and {e["stem"] for e in manifest["kernels"]} == {"axpy", "strided_copy"}
+    assert [s["entry"] for s in p.steps(B=24)] == ["axpy", "strided_copy"]
+    for b in (8, 24):
+        x, y = randn((b, 64), torch.float32, seed=b), randn((b, 64), torch.float32, seed=b + 1)
+        w = randn((b, 128), BF16, seed=b + 2)
+        jit = tilefish.run(prebuilt, x, y, w)
+        rep = tilefish.run(prebuilt, x, y, w, mode="replay", plan=tmp_path, pin=p.digest)
+        z, c = tilefish.run(axpy, x.view(-1), y.view(-1)), tilefish.run(strided_copy, w[:, :64])
+        assert same_bytes(jit[0], rep[0]) and same_bytes(jit[1], rep[1])
+        assert same_bytes(rep[0], z) and same_bytes(rep[1], c)
+        assert same_bytes(rep[0], 2.0 * x.view(-1) + y.view(-1)) and same_bytes(rep[1], w[:, :64])
+
+
+def test_reference_mode_takes_a_device_scalar_as_an_int_and_a_missing_reference_is_named(weights):
+    m = 32
+    x = pm.activations(m, seed=9)
+    w = [weights[k] for k in pm.WEIGHT_NAMES]
+    from_int = tilefish.run(pm.block, x, 7, *w, mode="reference")
+    from_tensor = tilefish.run(pm.block, x, torch.tensor([7], dtype=torch.int32, device="cuda"), *w, mode="reference")
+    assert same_bytes(from_int, from_tensor)
+
+    @tilefish.extern(triton="gpu_kernels_p2:attention_kernel", num_warps=4, grid=lambda S: (S, pm.HEADS), name="attention_without_a_reference")
+    def no_reference(
+        q: tilefish.Strided[tilefish.Tensor[pm.S, pm.HEADS, pm.D_HEAD, tilefish.bf16], 16], k: tilefish.Strided[tilefish.Tensor[pm.S, pm.HEADS, pm.D_HEAD, tilefish.bf16], 16],
+        v: tilefish.Strided[tilefish.Tensor[pm.S, pm.HEADS, pm.D_HEAD, tilefish.bf16], 16], o: tilefish.Out[tilefish.Tensor[pm.S, pm.HEADS, pm.D_HEAD, tilefish.bf16]],
+        n_valid: tilefish.DevScalar[tilefish.i32], q_s0: tilefish.StrideOf("q", 0, divisible_by=8), q_s1: tilefish.StrideOf("q", 1, divisible_by=8),
+        k_s0: tilefish.StrideOf("k", 0, divisible_by=8), k_s1: tilefish.StrideOf("k", 1, divisible_by=8), v_s0: tilefish.StrideOf("v", 0, divisible_by=8),
+        v_s1: tilefish.StrideOf("v", 1, divisible_by=8), rows: pm.S, DH: tilefish.const = pm.D_HEAD, BLOCK: tilefish.const = 128,
+    ): ...
+
+    @tilefish.graph
+    def with_it(
+        x: tilefish.Tensor[pm.M, pm.D, tilefish.bf16], n: tilefish.DevScalar[tilefish.i32], w_qkv: tilefish.Tensor[3 * pm.D_MODEL, pm.D_MODEL, tilefish.bf16], b_qkv: tilefish.Tensor[3 * pm.D_MODEL, tilefish.bf16]
+    ):
+        fused = pm.gemm_qkv(x, w_qkv, b_qkv).reshape(pm.M, 3, pm.HEADS, pm.D_HEAD)
+        return no_reference(fused[:, 0], fused[:, 1], fused[:, 2], n)
+
+    with pytest.raises(TilefishRuntimeError, match="needs a reference for the extern op 'attention_without_a_reference'"):
+        tilefish.run(with_it, x, 7, w[1], w[2], mode="reference")
+
+
 def test_n_is_a_device_scalar_the_one_binary_reads_so_the_same_arena_serves_every_value(exported, weights):
     directory, p = exported
     m = 64

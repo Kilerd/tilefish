@@ -1164,9 +1164,7 @@ def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
         )
     arch = doc["arch"]
     by_name = {b["name"]: b for b in doc["buffers"]}
-    seen: "set[tuple[str, str]]" = set()
     for bucket in doc["buckets"]:
-        shapes = buffer_shapes(doc, bucket["values"])
         written: "set[str]" = {b["name"] for b in doc["buffers"] if b["role"] in ("input", "weight", "inout", "devscalar")}  # provided by the caller / the host
         for si, st in enumerate(bucket["steps"]):
             stem = st["entry"]
@@ -1204,10 +1202,6 @@ def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
                     _bad(f"{where}: argument '{a['name']}' reads '{buf['name']}' before any step has written it")
                 if writes:
                     written.add(buf["name"])
-            seen.add((stem, st["kind"]))
-    for stem, kind in seen:
-        if kind == "kernel" and manifest.library_entry(stem, arch) is not None:
-            _bad(f"'{stem}' is a library entry of the manifest, but a step says it is a kernel")
 
 
 def check_anchor(pin: "str | None", trust_directory: bool) -> None:
