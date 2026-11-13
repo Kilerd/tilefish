@@ -3,7 +3,8 @@
 //!
 //! A port of `validate_entry` of `python/src/tilefish/_library.py`. An entry has exactly the fields of [`ENTRY_KEYS`], each of the type it
 //! needs, and the redundant ones must agree: the dtypes, the cuBLAS-level problem (the `T`/`N` transposes, the leading dimensions)
-//! and the shapes of the operands follow from `impl`, `m`, `n` and `k`. The pinned algorithm is 64 bytes (128 lowercase hex digits) that
+//! and the shapes of the operands follow from `impl`, `m`, `n` and `k`. `n` and `k` are multiples of 8, as the declaration of the operation
+//! asks (`check_declaration`: every bf16 row starts on 16 bytes). The pinned algorithm is 64 bytes (128 lowercase hex digits) that
 //! only the library that made them can judge: running one is [`crate::gemm`].
 
 use serde::Deserialize;
@@ -12,8 +13,8 @@ use serde_json::{Map, Value};
 use crate::error::{Error, Result};
 use crate::expr::{Symbols, parse_expr};
 use crate::manifest::{
-    ALIGNMENT, Access, DimInfo, MAX_ELEMENTS, Param, ParamKind, Precondition, ShapeDim, is_arch, is_digest, is_ident,
-    is_stem, parse_dims, parse_shape, precondition_of, want_ident, want_int,
+    ALIGNMENT, Access, DimInfo, MAX_ELEMENTS, Param, ParamKind, Precondition, ShapeDim, by_name, is_arch, is_digest,
+    is_ident, is_stem, parse_dims, parse_shape, precondition_of, want_ident, want_int,
 };
 use crate::tensor::DType;
 
@@ -96,7 +97,7 @@ impl LibraryEntry {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub(crate) struct RawLibrary {
     stem: String,
     op: String,
@@ -128,13 +129,13 @@ pub(crate) struct RawLibrary {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawLibraryAbi {
     params: Vec<RawLibraryParam>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawLibraryParam {
     index: u64,
     name: String,
@@ -142,6 +143,13 @@ struct RawLibraryParam {
     dtype: String,
     access: String,
     shape: Vec<Value>,
+}
+
+// each from a JSON object only, as Python reads them (`validate_entry`, `_keys`): not a list of the values by position
+by_name! {
+    RawLibrary => RawLibrary::deserialize, "a library entry";
+    RawLibraryAbi => RawLibraryAbi::deserialize, "abi";
+    RawLibraryParam => RawLibraryParam::deserialize, "a parameter of abi.params";
 }
 
 /// An integer field from 1 to `2**31 - 1` (a size, or a leading dimension, of cuBLASLt's `int32` world).
@@ -203,6 +211,15 @@ impl LibraryEntry {
         ];
         if ld != [k, k, n, n] {
             return Err("the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)".to_owned());
+        }
+        // what Python's declaration asks of N and K (`check_declaration`; M may be any size): every row of a, b and the result starts on 16 bytes
+        for (name, size) in [("n", n), ("k", k)] {
+            if size % 8 != 0 {
+                return Err(format!(
+                    "{name} = {size} must be a multiple of 8: a, b and the result are bf16 rows of k and n elements, and every row starts \
+                     on 16 bytes (a declaration of the GEMM gives N and K divisible_by=8, buckets that are multiples of 8, or such a static size)"
+                ));
+            }
         }
         if (raw.transa.as_str(), raw.transb.as_str()) != ("T", "N") {
             return Err(format!(

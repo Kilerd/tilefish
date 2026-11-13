@@ -134,7 +134,7 @@ pub enum Error {
     #[error("{0}")]
     Unsupported(String),
     /// The call does not fit the kernel's signature (a missing tensor, an unknown scalar or dimension, a value that
-    /// the signature determines and the call also gives).
+    /// the signature determines and the call also gives, bucket values that name a dimension twice).
     #[error("{0}")]
     Launch(String),
     /// A cuBLASLt call failed: the call and the `cublasStatus_t` it returned.

@@ -458,12 +458,14 @@ fn a_runtime_scalar_is_in_the_range_of_a_signed_32_bit_integer_edges_included() 
 
 #[test]
 fn a_scalar_counts_the_elements_of_the_tensor_it_names_and_not_of_another() {
-    // mm, with `m` the element count of `c_ptr` (M*N) and `k` the element count of `b_ptr` (K*N): three tensors of three sizes
+    // mm, with `m` the element count of `c_ptr` (M*N) and `k` the element count of `b_ptr` (K*N): three tensors of three sizes. A product of
+    // two symbolic sizes is not affine, so each carries a fresh dimension name (Python's `_check_count_of`), which only its count binds
     let (_copy, plan) = edited("mm", |e| {
-        for (name, dim, target) in [("m", "MmM*MmN", "c_ptr"), ("k", "MmK*MmN", "b_ptr")] {
+        for (name, dim, target) in [("m", "Mc", "c_ptr"), ("k", "Kb", "b_ptr")] {
             param(e, name)["dim"] = dim.into();
             param(e, name)["count_of"] = target.into();
             precondition(e, "divisible", name)["dim"] = dim.into();
+            e["dims"][dim] = serde_json::json!({});
         }
     });
     let args = [t(A, &[128, 64], DType::F16), t(B, &[64, 256], DType::F16), t(C, &[128, 256], DType::F32)];

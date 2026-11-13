@@ -169,6 +169,47 @@ impl Expr {
     pub fn static_value(&self) -> Option<i128> {
         self.affine()?.as_constant()
     }
+
+    /// The expression with every dimension that has a value in `values` replaced by that value: Python's `subst`, before the result is
+    /// folded (`3*Db + M` with `Db = 96` is `3*96 + M`, which folds to `M + 288`).
+    pub fn subst(&self, values: &[Option<i64>]) -> Expr {
+        let sub = |e: &Expr| Box::new(e.subst(values));
+        match self {
+            Expr::Num(n) => Expr::Num(*n),
+            Expr::Var(i) => values.get(*i).copied().flatten().map_or(Expr::Var(*i), |v| Expr::Num(i128::from(v))),
+            Expr::Neg(a) => Expr::Neg(sub(a)),
+            Expr::Add(a, b) => Expr::Add(sub(a), sub(b)),
+            Expr::Sub(a, b) => Expr::Sub(sub(a), sub(b)),
+            Expr::Mul(a, b) => Expr::Mul(sub(a), sub(b)),
+            Expr::FloorDiv(a, b) => Expr::FloorDiv(sub(a), sub(b)),
+            Expr::CDiv(a, b) => Expr::CDiv(sub(a), sub(b)),
+        }
+    }
+
+    /// The folded form of the expression as a text that two expressions share exactly when Python's `DimExpr` says they are equal (its
+    /// `_key`): the constant and the coefficient of every atom, where an atom is a dimension or a `cdiv` that does not fold, which is known by
+    /// the folded forms of its operands (so `3072*M` is `M*3072`, and `cdiv(M + 96, 16)` is `cdiv(96 + M, 16)`). `None` when the expression
+    /// is not affine (two symbolic factors, a `//` that is not exact), where Python's `_value_of` gives `None`.
+    pub fn folded_key(&self) -> Option<String> {
+        let affine = self.affine()?;
+        let mut terms: BTreeMap<String, i128> = BTreeMap::new();
+        for (atom, c) in &affine.terms {
+            let key = match atom {
+                Atom::Var(i) => format!("d{i}"),
+                Atom::Opaque(e) => match e.as_ref() {
+                    Expr::CDiv(a, b) => format!("cdiv({}, {})", a.folded_key()?, b.folded_key()?),
+                    other => format!("{other:?}"), // (the affine form keeps no other expression whole)
+                },
+            };
+            let sum = terms.entry(key).or_insert(0);
+            *sum = sum.checked_add(*c)?;
+        }
+        let mut out = affine.c.to_string();
+        for (atom, c) in terms.into_iter().filter(|(_, c)| *c != 0) {
+            out.push_str(&format!(" + {c}*{atom}"));
+        }
+        Some(out)
+    }
 }
 
 /// An atom of an affine form: a dimension, or an expression that cannot be folded (a `cdiv` that is not exact).
@@ -730,5 +771,41 @@ mod tests {
         assert!(parse_expr("n * n", "e", &mut s).unwrap().affine().is_none());
         assert!(parse_expr("n // 2", "e", &mut s).unwrap().affine().is_none());
         assert_eq!(parse_expr("(2*n) // 2", "e", &mut s).unwrap().affine().unwrap().coefficient(0), 1);
+    }
+
+    #[test]
+    fn two_expressions_are_equal_when_python_says_their_dim_exprs_are() {
+        let mut s = Symbols::default();
+        let mut key = |text: &str| parse_expr(text, "e", &mut s).unwrap().folded_key();
+        assert_eq!(key("3072*M"), key("M*3072"));
+        assert_eq!(key("M + 1 + N"), key("N + (1 + M)"));
+        assert_eq!(key("2*(M + N) - N"), key("N + 2*M"));
+        assert_eq!(key("cdiv(M + 96, 16)"), key("cdiv(96 + M, 16)"));
+        assert_eq!(key("2*cdiv(M, 16) - cdiv(M, 16)"), key("cdiv(M, 16)"));
+        assert_eq!(key("cdiv(4*M, 2)"), key("2*M"));
+        assert_eq!(key("1000"), key("999 + 1"));
+        assert_ne!(key("3072*M"), key("1536*M"));
+        assert_ne!(key("M"), key("N"));
+        assert_ne!(key("cdiv(M, 16)"), key("cdiv(M, 8)"));
+        assert_ne!(key("cdiv(M, 16)"), key("M // 16"));
+        assert_eq!(key("M*N"), None);
+        assert_eq!(key("M // 3"), None);
+    }
+
+    #[test]
+    fn a_substitution_replaces_the_dimensions_that_have_a_value_and_keeps_the_others() {
+        let mut s = Symbols::default();
+        for name in ["M", "Db"] {
+            s.intern(name).unwrap();
+        }
+        let values = [None, Some(96)];
+        let mut key =
+            |text: &str, values: &[Option<i64>]| parse_expr(text, "e", &mut s).unwrap().subst(values).folded_key();
+        assert_eq!(key("M*Db", &values), key("96*M", &[]));
+        assert_eq!(key("Db", &values), key("96", &[]));
+        assert_eq!(key("cdiv(Db + M, 16)", &values), key("cdiv(M + 96, 16)", &[]));
+        assert_eq!(key("cdiv(Db, 16)", &values), key("6", &[]));
+        assert_eq!(key("M*Db", &[]), None, "two symbolic factors");
+        assert_ne!(key("Db", &[]), key("96", &[]), "a dimension without its value is not the value");
     }
 }

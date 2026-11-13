@@ -299,6 +299,21 @@ fn a_library_entry_that_is_not_what_python_writes_is_refused() {
     }
 }
 
+#[test]
+fn n_and_k_are_multiples_of_eight_as_the_declaration_asks() {
+    // Python's `check_declaration`: every row of a, b and the result starts on 16 bytes (M may be any size)
+    assert!(read(&[], &[gemm(false, 32, 8, 8), gemm(true, 64, 3072, 1024), gemm(false, 320, 1024, 3072)]).is_ok());
+    for (n, k, why) in
+        [(1020, 1024, "n = 1020"), (1024, 1028, "k = 1028"), (4, 1024, "n = 4"), (1024, 1, "k = 1"), (12, 12, "n = 12")]
+    {
+        for bias in [false, true] {
+            let message = refusal(&[], &[gemm(bias, 32, n, k)]);
+            assert!(message.contains(why) && message.contains("must be a multiple of 8"), "{n}, {k}: {message}");
+            assert!(message.contains("library entry #0"), "{message}");
+        }
+    }
+}
+
 // -- the digest --------------------------------------------------------------------------------------------------------------------
 
 #[test]
