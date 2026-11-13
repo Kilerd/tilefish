@@ -598,6 +598,27 @@ def load(x: Any) -> Value:
     return out
 
 
+# -- copies ----------------------------------------------------------------------------
+
+
+def copy(x: Any) -> Value:
+    """``tilefish.copy(x)``: a new contiguous tensor with the elements of ``x`` (its shape and dtype), for a graph body.
+
+    Values are immutable, so a copy is only needed where *storage* matters: a launch plan makes it a **copy step**, a device-to-device copy of
+    the dense bytes of ``x`` (a tensor, or a dense view of one: a ``select`` of the first axis, a chunk of a ``split`` along it, a reshape) into a
+    buffer of its own. The copy is then an intermediate that an in-place call may update (``InOut``) or write over (``MayAlias``), where ``x``,
+    a parameter of the graph, is the caller's and is never written. ``param[...] = x`` into an ``InOut`` parameter is a copy step too.
+    A view that is not dense (a permutation, a column block) cannot be copied this way: a plan refuses it (compute from it with an operator).
+    A lowered kernel has no copy: in a kernel body a value is already its own.
+    """
+    x = _require_value("copy", "the tensor", x)
+    t = x.type
+    if isinstance(t.dtype, BlockScaled):
+        raise TilefishTypeError(f"copy: {x.ref} is block-scaled ({t}); block-scaled tensors are not copied yet")
+    (out,) = x.ctx.emit("copy", [x], {}, [TensorType(t.shape, t.dtype)])
+    return out
+
+
 # -- stores ----------------------------------------------------------------------------
 
 

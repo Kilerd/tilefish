@@ -153,12 +153,12 @@ magnitude, so that every language reads the same number); a file larger than
 
 ### 7.1 The fields
 
-`buckets[i].steps` is a list (the same length in every bucket) of objects with the fields `entry kind args` and, for kind `library` only, `workspace`:
+`buckets[i].steps` is a list (the same length in every bucket) of objects with the fields `entry kind args` and, for kind `library` only, `workspace`; a step of kind `copy` has exactly the fields `kind args` (section 7.5):
 
 | field | type and rule |
 |---|---|
 | `entry` | string: the stem of a manifest entry (`rmsnorm`, `attention`, `gemm_qkv.M64`: an identifier, then `.<Dim><value>` per bucketed dimension of the operator). It is the entry's own bucket, which differs between buckets of the plan for an operator whose binaries are bucketed. |
-| `kind` | `"kernel"`: an entry of the manifest's `kernels` (Triton or prebuilt binary). `"library"`: an entry of its `library` (a pinned GEMM). The manifest must have the entry **for `arch`** in that section. |
+| `kind` | `"kernel"`: an entry of the manifest's `kernels` (Triton or prebuilt binary). `"library"`: an entry of its `library` (a pinned GEMM). The manifest must have the entry **for `arch`** in that section. `"copy"`: a device-to-device copy (section 7.5), which names no entry. |
 | `args` | non-empty list, one object per **pointer parameter of the entry's `abi.params`, in order** (a kernel's scalar and `fixed` parameters are not arguments: the host derives them). Names in one step are distinct. |
 | `workspace` | present exactly when `kind` is `"library"`: the name of the buffer of role `workspace`. |
 
@@ -203,11 +203,34 @@ the shapes of the views.
   (a pointer with access `out`; an `inout` pointer on a buffer not yet written is refused);
 * **every `output` is written** by some step of every bucket (a returned value no step writes would come back as whatever its tensor held).
 
+A copy step (section 7.5) has no entry: of the rules above it has the last two, its `src` read (written before) and its `dst` written.
+
 ### 7.4 What the rules of `validate_doc` say about steps and buckets (no manifest needed)
 
 * every bucket has the same number of steps, and **in step `k` the `kind`, the `workspace` and, for every argument, the `name` and the `binding` are the same in every bucket**; only
   `entry` and the views' numbers may differ between buckets;
-* every `binding` is a buffer; a `workspace` is the buffer of role `workspace`; a `view` is well formed and inside its buffer at that bucket.
+* every `binding` is a buffer; a `workspace` is the buffer of role `workspace`; a `view` is well formed and inside its buffer at that bucket;
+* a copy step is what section 7.5 says, at every bucket.
+
+### 7.5 Copy steps
+
+A step of kind `"copy"` is `{"kind": "copy", "args": [{"name": "src", ...}, {"name": "dst", ...}]}`: exactly those two fields (no `entry`: it launches no binary; no
+`workspace`), and exactly two arguments, named `src` and then `dst`, each a buffer and optionally a view of it, as any argument. At every bucket:
+
+* each of `src` and `dst` is **dense**: the whole buffer, or a view whose axes of a size other than 1 have the row-major strides (one run of elements, from the view's
+  `offset`);
+* the two have **the same dtype** (their buffers') and **the same number of elements** (their shapes may differ: a copy is of bytes);
+* `dst` is a buffer a step may write (`intermediate`, `output`, `inout`), and in one buffer the two runs of elements do not overlap.
+
+**What a host does.** The copy is `cuMemcpyDtoDAsync(address(dst) + dst.offset * itemsize, address(src) + src.offset * itemsize, count * itemsize)` on the plan's stream, in
+its place among the steps; with the real addresses the two runs of bytes must not overlap (two externals that overlap are refused before, section 9). A stream that is being
+captured records it as a memcpy node, so a plan with copy steps captures in a CUDA graph as before.
+
+**Where they come from.** `tilefish.copy(x)` in a graph body (a new tensor of its own: a copy step from `x`, a tensor or a dense view of one, into a fresh intermediate, which
+an in-place call may then update, where `x`, a parameter, is the caller's and never written), and `param[...] = value` into an `InOut` parameter of the graph (a copy step
+into the caller's tensor; `param[...] = param` is no step). A copy of a view that is not dense (a permutation, a column block) is refused when the plan is made.
+A reader that predates copy steps (the published crate 0.0.2, tilefish 0.0.4) refuses a plan that has one (`kind` must be `kernel` or `library`); a plan without one is
+what it always was.
 
 ## 8. Order, liveness and reuse
 
@@ -350,7 +373,8 @@ A graph body that a plan cannot make is refused by `tilefish.plan` with the rule
 
 * **arithmetic traced in the graph body** (`x + y`, a cast, a reduction, a load): a plan launches declared operators; put it in a `@tilefish.kernel`. Views (`reshape`, `permute`, `select`, `split`,
   `x[i]`) are fine. There is no fusion in this version: the steps are the calls the graph makes.
-* a **`store`** into a parameter (a copy), an **`Out`** parameter of the graph and a runtime **`Dim`** parameter: a graph's results are its returned values.
+* an **`Out`** parameter of the graph (and so a `store` into one) and a runtime **`Dim`** parameter: a graph's results are its returned values (a `store` into an `InOut`
+  parameter is a copy step, section 7.5), and a `tilefish.copy` of a view that is not dense;
 * a call to **another graph** (it is not inlined yet).
 * an **in-place call on a view** of another tensor (the IR says updating a view does not change its parent; a plan has no copy to make that true), and a view **read after its tensor was updated
   in place**.
@@ -393,6 +417,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | the walk, the steps and views, the buffers, roles, buckets, the refusals of section 12 | `test_plan.py` |
 | a step that reads three views with one stride pair; a step whose dimension only its `Out` buffer has (section 5) | `test_shared_strides.py`, `test_output_dims.py`; on a GPU `test_gpu_shared_strides.py`, `test_gpu_output_dims.py` |
 | a result written over its input (`MayAlias`, section 8) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
+| copy steps (`tilefish.copy`, a store into an `InOut` parameter; section 7.5) | `test_plan_copy.py`; on a GPU `test_gpu_plan_copy.py`; the Rust reader: `python_plans.json` (`copy ...` documents) |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |
 | the document of section 13 | `test_plan_docs.py` |

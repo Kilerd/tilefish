@@ -58,6 +58,7 @@ from ._manifest import Manifest
 from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
+from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in __all__, `from tilefish import *` must not shadow the module copy
 from .ops import exp, gelu, load, rsqrt, silu, sqrt
 from .ops import reduce_mean as mean
 from .runtime import capture, run

@@ -303,6 +303,10 @@ class Backend:
     def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]", stream: int) -> None:
         raise NotImplementedError
 
+    def copy(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        """Copy ``nbytes`` bytes of device memory from ``src`` to ``dst`` on ``stream`` (a copy step of the plan; captured as a memcpy node)."""
+        raise NotImplementedError
+
     def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
         raise NotImplementedError
 
@@ -445,6 +449,11 @@ class TorchBackend(Backend):
     def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]", stream: int) -> None:
         loaded.launch(grid, args, stream)
 
+    def copy(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        from . import _cuda
+
+        _cuda.copy_async(dst, src, nbytes, stream)
+
     def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
         from . import _library
 
@@ -524,8 +533,32 @@ class _Arena:
 
 
 @dataclass
+class _CopyBound:
+    """A copy step at one bucket: ``nbytes`` bytes from ``src`` (byte ``src_offset`` of that buffer) to ``dst`` (byte ``dst_offset``)."""
+
+    src: str
+    src_offset: int
+    dst: str
+    dst_offset: int
+    nbytes: int
+
+    @classmethod
+    def of(cls, args: "Sequence[Mapping[str, Any]]", shapes: "Mapping[str, tuple[str, tuple[int, ...]]]") -> "_CopyBound":
+        (src_shape, _, src_off), (dst_shape, _, dst_off) = (_plan.copy_view(a, shapes) for a in args)
+        itemsize = _plan.ITEMSIZE[shapes[args[0]["binding"]][0]]
+        return cls(args[0]["binding"], src_off * itemsize, args[1]["binding"], dst_off * itemsize, math.prod(src_shape) * itemsize)
+
+    def check(self, bases: "Mapping[str, int]") -> "tuple[int, int, int]":
+        """``(src, dst, nbytes)`` with the real addresses: the two runs of bytes must not overlap (externals that overlap are refused before this)."""
+        src, dst, n = bases[self.src] + self.src_offset, bases[self.dst] + self.dst_offset, self.nbytes
+        if src < dst + n and dst < src + n:
+            raise TilefishPreconditionError(f"the copy from '{self.src}' to '{self.dst}' overlaps itself", kind="alias", arg=self.dst)
+        return src, dst, n
+
+
+@dataclass
 class _StepRT:
-    bound: Bound
+    bound: "Bound | _CopyBound"
     loaded: Any  # the loaded kernel of a kernel step
     order: "tuple[tuple[str, str], ...]"  # (kind, name) of the arguments of a launch, in the ABI's order
     algo: "str | None"  # the pinned algorithm of a library step
@@ -701,6 +734,9 @@ class PlanRunner:
         callees = self.plan._callees
         steps: "list[_StepRT]" = []
         for i, st in enumerate(steps_doc):
+            if st["kind"] == "copy":  # a device-to-device copy: no binary to build or load
+                steps.append(_StepRT(_CopyBound.of(st["args"], shapes), None, (), None, None))
+                continue
             callee = callees.get(st["entry"])
             where = f"graph '{self.plan.name}' at {values or 'its only size'}, step #{i} ({st['entry']})"
             if callee is None:
@@ -853,7 +889,10 @@ class PlanRunner:
             for b, source, on_device in call.slots:
                 be.write_devscalar(call.arena.handle, b["offset"], b["dtype"], source, on_device)
         for st, real in zip(call.rt.steps, call.checked):
-            if st.algo is not None:
+            if isinstance(st.bound, _CopyBound):
+                src, dst, nbytes = real
+                be.copy(dst, src, nbytes, stream)
+            elif st.algo is not None:
                 names = [a for a in st.bound.names]
                 a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
                 bias = real[names[2]].ptr if len(names) == 4 else None
@@ -1395,6 +1434,16 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
     with torch.no_grad():
         for index, n in enumerate(g.nodes):
             kind = n.attrs.get("kind")
+            if kind is None and n.op == "copy":  # a new tensor of its own
+                env[n.outputs[0]] = env[n.inputs[0]].contiguous().clone()  # type: ignore[index]
+                continue
+            if kind is None and n.op == "store":  # `param[...] = value` into an InOut parameter: the caller's tensor gets the value
+                target = env[n.inputs[0]]  # type: ignore[index]
+                if n.inputs[1] is not n.inputs[0]:
+                    target.copy_(env[n.inputs[1]])  # type: ignore[index]
+                for o in n.outputs:
+                    env[o] = target
+                continue
             if kind is None:
                 x = env[n.inputs[0]]  # type: ignore[index]
                 if n.op == "reshape":

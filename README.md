@@ -375,7 +375,12 @@ declares `r_out: Out[Tensor[M, D, f32], MayAlias("r")]`: a launch (Python or Rus
 other overlap, and a plan writes `r_out` over `r` when nothing reads that `r` after the call (a whole intermediate, no later reader, not returned), with no
 buffer of its own; otherwise the result gets one, so the values are the same either way (manifest schema 3, section 5.4; `docs/plan-schema-1.md`, section 8).
 
-A plan launches declared operators and views. Arithmetic traced in the graph body, a `store`, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
+**Copy steps.** `r = tilefish.copy(x)` in a graph is a step of kind `copy`: the dense bytes of `x` (a tensor, or a dense view such as `x[1]`) copied into a
+buffer of its own with `cuMemcpyDtoDAsync`, a memcpy node in a CUDA graph. The copy is an intermediate an in-place call may update, where `x`, the caller's,
+is never written. `state[...] = r` into an `InOut` parameter is a copy step into the caller's tensor. A copy of a view that is not dense is refused when the
+plan is made (`docs/plan-schema-1.md`, section 7.5).
+
+A plan launches declared operators and views. Arithmetic traced in the graph body, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
 tensor was updated in place are refused with the rule that says so; there is no fusion in a plan yet. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation rules, the
 digest) for the host that will run it without Python.
 

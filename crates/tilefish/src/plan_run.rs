@@ -143,6 +143,12 @@ impl DevScalar {
 pub(crate) enum Ready<'r> {
     Kernel(&'r Kernel, Box<Prepared>),
     Gemm(&'r Gemm, Call),
+    /// A copy step: `bytes` bytes from `src` to `dst`, checked to be inside their buffers and not to overlap.
+    Copy {
+        src: u64,
+        dst: u64,
+        bytes: usize,
+    },
 }
 
 /// The value of one device scalar, at its slot of the arena.
@@ -158,6 +164,8 @@ struct Slot {
 enum Op {
     Kernel(Kernel),
     Gemm(Gemm),
+    /// A copy step: no binary.
+    Copy,
 }
 
 /// One pointer argument of a step at one bucket: the buffer, the shape, and the view (none: the whole buffer, dense).
@@ -402,6 +410,7 @@ impl PlanRun {
             for st in &bucket.steps {
                 let key = (st.kind == StepKind::Library, st.entry.clone());
                 let op = match ops.get(&key) {
+                    _ if st.kind == StepKind::Copy => Op::Copy, // a device-to-device copy: nothing to load
                     Some(op) => op.clone(),
                     None => {
                         let op = match st.kind {
@@ -412,6 +421,7 @@ impl PlanRun {
                                 Op::Kernel(kernel)
                             }
                             StepKind::Library => Op::Gemm(plan.manifest().gemm(&ctx, &st.entry, &[], arch)?),
+                            StepKind::Copy => unreachable!("a copy step loads nothing"),
                         };
                         ops.insert(key, op.clone());
                         op
@@ -843,7 +853,8 @@ impl PlanRun {
             |i: usize| combo.shapes[i].iter().product::<usize>() as u64 * plan.buffers()[i].dtype.size() as u64;
         let mut ready = Vec::with_capacity(bucket.steps.len());
         for (si, step) in bucket.steps.iter().enumerate() {
-            let what = format!("step #{si} ({}) at {}", step.stem, describe_values(&combo.values));
+            let stem = if matches!(step.op, Op::Copy) { "copy" } else { step.stem.as_str() };
+            let what = format!("step #{si} ({stem}) at {}", describe_values(&combo.values));
             let mut args: Vec<TensorArg<'_>> = Vec::with_capacity(step.args.len() + 1);
             for a in &step.args {
                 let region = ffi::plan::check_region(bound.bases[a.buffer], region_bytes(a.buffer), inner.device);
@@ -864,6 +875,20 @@ impl PlanRun {
                     let region = ffi::plan::check_region(bound.bases[*w], region_bytes(*w), inner.device);
                     args.push(TensorArg::new(region, shape, DType::U8, Access::InOut).map_err(|e| in_step(e, &what))?);
                     Ready::Gemm(gemm, gemm.check_call(&args).map_err(|e| in_step(e, &what))?)
+                }
+                Op::Copy => {
+                    // the dense bytes of src into dst: each was made a tensor of its region above (so it lies inside its buffer), and the
+                    // reader checked that both are dense, of one dtype and one count; with the real addresses they must not overlap
+                    let bytes = args[0].shape.iter().product::<usize>() * args[0].dtype.size();
+                    let (src, dst) = (args[0].ptr, args[1].ptr);
+                    if src < dst + bytes as u64 && dst < src + bytes as u64 {
+                        return Err(Error::precondition(
+                            PreconditionKind::Alias,
+                            Some("dst"),
+                            format!("{what}: the source and the destination of the copy overlap"),
+                        ));
+                    }
+                    Ready::Copy { src, dst, bytes }
                 }
             });
         }

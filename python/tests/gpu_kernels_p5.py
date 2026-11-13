@@ -6,13 +6,14 @@ do (``host_ops`` imports it with a stand-in for Triton where there is none). No 
 * ``add_into``: ``r_out = r + x`` and ``y = 0.5 * r_out`` per row of 64 f32, where ``r_out`` may be written over ``r``
   (``Out[..., MayAlias("r")]``: every program loads its row of ``r`` before it stores the same row of ``r_out``). ``residual_chain`` is a graph
   that makes the residual in the arena and updates it with two calls, which a plan makes in place (one buffer for the three versions).
+* ``copy_steps``: a graph with two copy steps, ``tilefish.copy`` of a dense view into the arena and a store into an ``InOut`` parameter.
 """
 
 import triton
 import triton.language as tl
 
 import tilefish
-from tilefish import Dim, MayAlias, Out, Tensor, const, f32
+from tilefish import Dim, InOut, MayAlias, Out, Tensor, const, f32
 
 Rb = Dim("Rb", buckets=[8, 24])  # the rows of the plans
 
@@ -53,3 +54,16 @@ def residual_chain(x: Tensor[Rb, 64, f32]):
     y1, r = add_into(x, r)
     y2, r = add_into(y1, r)
     return y2, r
+
+
+# -- copy steps -------------------------------------------------------------------------------------------------------------------------------
+
+
+@tilefish.graph
+def copy_steps(x: Tensor[2, Rb, 64, f32], state: InOut[Tensor[Rb, 64, f32]]):
+    """``x[1]`` (a dense view at an offset) copied into the arena with ``tilefish.copy``, updated in place there (``add_into`` writes over the copy, which
+    nothing reads after it), and stored into the caller's ``state`` (a store into an ``InOut`` parameter): two copy steps around one launch."""
+    r = tilefish.copy(x[1])
+    y, r = add_into(x[0], r)
+    state[...] = r
+    return y

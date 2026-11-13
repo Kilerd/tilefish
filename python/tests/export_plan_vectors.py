@@ -157,6 +157,7 @@ def mutations():
         ("a later bucket", setter(["buckets", 2, "steps", 0, "entry"], "nothing")),
         ("an output no step writes", lambda d: [b["steps"][8]["args"][2].update(binding="t0") for b in d["buckets"]]),
     ]
+    out += copy_mutations()
     # shape expressions: the same sizes, written so that Python's dimension algebra folds them (accepted) or cannot (refused)
     for text in ("2*M//2", "M + 0", "M*1", "(M+M)//2", "M//1", "cdiv(M, 1)", "cdiv(2*M, 2)", "M - M + M", "-(-M)", "cdiv(M, 2) * 2", "M*M//M",
                  "cdiv(M*M, M)", "M // 2 * 2", "M // 0", "cdiv(M, 0)", "M - 2*M + 2*M", "N", "M+N-N", "((M))", "M//2+M//2", "2*(M//2)", "M  "):
@@ -164,6 +165,71 @@ def mutations():
     for text in ("256", "2*128", "0+256", "M - M + 256", "cdiv(512, 2)", "513//2", "cdiv(511, 2)", "256*1*1", "-(-256)", "128 + 128 "):
         out.append((f"static shape {text!r}", setter(["buffers", 2, "shape"], [text])))
     return out
+
+
+def arg(name, binding, view=None):
+    out = {"name": name, "binding": binding}
+    if view is not None:
+        out["view"] = view
+    return out
+
+
+def copy_step(src, dst, *extra):
+    """A copy step made per bucket: ``src`` and ``dst`` are ``(binding, view(rows) or None)``; ``extra`` are more keys (refused)."""
+
+    def make(rows):
+        step = {"kind": "copy", "args": [arg("src", src[0], src[1] and src[1](rows)), arg("dst", dst[0], dst[1] and dst[1](rows))]}
+        for k, v in extra:
+            step[k] = v
+        return step
+
+    return make
+
+
+def with_step(make, at=None, buckets=None):
+    """Every bucket (or the ones of index in ``buckets``) gets the step ``make(M)``, appended or inserted at ``at``."""
+
+    def apply(doc):
+        for i, b in enumerate(doc["buckets"]):
+            if buckets is not None and i not in buckets:
+                continue
+            step = make(b["values"]["M"])
+            b["steps"].insert(len(b["steps"]) if at is None else at, step)
+
+    return apply
+
+
+def copy_mutations():
+    """Copy steps (``kind: "copy"``) added to the block's plan: valid ones (a whole buffer, a dense view, into an output, two runs of one
+    buffer apart), and every rule both readers hold one to: the fields, the two arguments in order, dense, one dtype and one count, no overlap
+    in one buffer, a destination a step may write, a source written before, the same step in every bucket."""
+    dense = lambda offset: lambda m: {"shape": [m, 256], "strides": [256, 1], "offset": offset(m)}  # noqa: E731
+    strided = lambda m: {"shape": [m, 256], "strides": [768, 1], "offset": 0}  # noqa: E731
+    whole = None
+    return [
+        ("copy of an input", with_step(copy_step(("x", whole), ("t0", whole)))),
+        ("copy into an output", with_step(copy_step(("t0", whole), ("out0", whole)))),
+        ("copy of a dense view", with_step(copy_step(("t1", dense(lambda m: 0)), ("t0", whole)))),
+        ("copy of a dense view at an offset", with_step(copy_step(("t1", dense(lambda m: 2 * m * 256)), ("t0", whole)))),
+        ("copy within a buffer, apart", with_step(copy_step(("t1", dense(lambda m: 0)), ("t1", dense(lambda m: m * 256))))),
+        ("copy within a buffer, overlapping", with_step(copy_step(("t1", dense(lambda m: 0)), ("t1", dense(lambda m: 128))))),
+        ("copy of a view that is not dense", with_step(copy_step(("t1", strided), ("t0", whole)))),
+        ("copy of another count", with_step(copy_step(("t1", whole), ("t0", whole)))),
+        ("copy of a device scalar", with_step(copy_step(("n", whole), ("t0", whole)))),
+        ("copy into an input", with_step(copy_step(("t0", whole), ("x", whole)))),
+        ("copy into a weight", with_step(copy_step(("t0", dense(lambda m: 0)), ("w_ln1", whole)))),
+        ("copy into a device scalar", with_step(copy_step(("x", whole), ("n", whole)))),
+        ("copy of the workspace", with_step(copy_step(("workspace", whole), ("t0", whole)))),
+        ("copy with an entry", with_step(copy_step(("x", whole), ("t0", whole), ("entry", "copy")))),
+        ("copy with a workspace", with_step(copy_step(("x", whole), ("t0", whole), ("workspace", "workspace")))),
+        ("copy with its arguments swapped", with_step(lambda m: {"kind": "copy", "args": [arg("dst", "t0"), arg("src", "x")]})),
+        ("copy with one argument", with_step(lambda m: {"kind": "copy", "args": [arg("src", "x")]})),
+        ("copy with three arguments", with_step(lambda m: {"kind": "copy", "args": [arg("src", "x"), arg("dst", "t0"), arg("dst2", "t1")]})),
+        ("copy reads before it is written", with_step(copy_step(("t8", whole), ("t0", whole)), at=0)),
+        ("copy writes before it is read", with_step(copy_step(("x", whole), ("t0", whole)), at=0)),
+        ("copy in one bucket only", with_step(copy_step(("x", whole), ("t0", whole)), buckets=[1])),
+        ("copy kind is not a string", with_step(lambda m: {"kind": ["copy"], "args": [arg("src", "x"), arg("dst", "t0")]})),
+    ]
 
 
 def leaves(node, path=()):
