@@ -543,6 +543,40 @@ fn refusals_launch_nothing() {
     println!("rust plan gate: {refused} refusals (loading and calls), none of which launched anything");
 }
 
+/// The per-thread default stream is refused by a plan as by a single launch: as the stream an instantiation allocates its arena on (which
+/// orders every launch of the run), as the stream of a launch or a capture, and as the owner of an external.
+#[test]
+fn the_per_thread_default_stream_is_refused_by_a_plan() {
+    let gpu = Gpu::new();
+    let plan = plan_named("block");
+    let lp = load(&plan);
+    let per_thread = gpu.ctx.per_thread_stream();
+    let is_refused = |e: Error, what: &str| {
+        assert!(matches!(&e, Error::Launch(why) if why.contains("per-thread default stream")), "{what}: {e:?}");
+    };
+    is_refused(lp.instantiate_all(&per_thread).unwrap_err(), "an instantiation on the per-thread stream");
+    let run = lp.instantiate(&gpu.stream, &[("M", 64)]).unwrap();
+    let case = plan["cases"].as_array().unwrap().iter().find(|c| c["bucket"]["M"] == 64).unwrap();
+    let values = devscalars(case);
+    let mut exts = upload(&gpu.stream, case);
+    is_refused(run.launch(&per_thread, &mut args(&mut exts, false), &named(&values)).unwrap_err(), "a launch on it");
+    is_refused(run.capture(&per_thread, args(&mut exts, false), &named(&values)).unwrap_err(), "a capture on it");
+    let mut owned = upload(&per_thread, case);
+    per_thread.synchronize().unwrap();
+    is_refused(run.launch(&gpu.stream, &mut args(&mut owned, false), &named(&values)).unwrap_err(), "externals of it");
+    gpu.ctx.synchronize().unwrap();
+    for e in exts.iter().chain(&owned).filter(|e| e.role == "output") {
+        assert!(
+            gpu.stream.clone_dtoh(&e.slice).unwrap().iter().all(|b| *b == 0),
+            "a refused launch wrote '{}'",
+            e.name
+        );
+    }
+    println!(
+        "rust plan gate: the per-thread default stream is refused (instantiate, launch, capture, the owner of an external)"
+    );
+}
+
 /// The used memory of the device's default memory pool (what cudarc allocates from) and the free memory of the device.
 fn memory(ctx: &CudaContext) -> (u64, u64, usize) {
     ctx.bind_to_thread().unwrap();

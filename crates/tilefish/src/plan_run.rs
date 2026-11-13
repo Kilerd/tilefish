@@ -318,6 +318,8 @@ fn tracked(
 
 impl PlanRun {
     fn new(plan: &LaunchPlan, stream: &Arc<CudaStream>, buckets: &[usize]) -> Result<Self> {
+        // the arena's stream orders every launch of the run against the others: it cannot be the per-thread default stream (`ffi::refuse_per_thread`)
+        ffi::refuse_per_thread(stream, std::iter::empty())?;
         let ctx = Arc::clone(stream.context());
         let arch = Arch::of_context(&ctx)?;
         if arch.to_string() != plan.arch() {
@@ -901,6 +903,7 @@ impl PlanRun {
         devscalars: &[(&str, DevScalar)],
     ) -> Result<CapturedPlan<'ext>> {
         self.check_stream(stream)?;
+        ffi::refuse_per_thread(stream, externals.iter().map(|(_, t)| t))?;
         let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
         if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
             return Err(Error::Launch(

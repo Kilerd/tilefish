@@ -926,7 +926,8 @@ fn a_safe_launch_of_slices_on_a_capturing_stream_is_an_error_and_not_a_graph() {
 
 /// The same in a context that never made a stream of its own and uses `ctx.per_thread_stream()`: cudarc does not track events there, so
 /// no wait of its can make the driver refuse the launch, and the kernel used to be captured with the slices' addresses. `CudaGraph::launch`
-/// is safe, so a replay after the slices are freed wrote into memory that something else had been given.
+/// is safe, so a replay after the slices are freed wrote into memory that something else had been given. (Since the review of M3.2 the
+/// per-thread default stream is refused by every safe launch, captured or not: both launches below are refused, for that reason.)
 #[test]
 fn a_safe_launch_of_slices_on_a_capturing_per_thread_stream_is_an_error_and_not_a_graph() {
     let manifest = manifest();
@@ -941,12 +942,11 @@ fn a_safe_launch_of_slices_on_a_capturing_per_thread_stream_is_an_error_and_not_
     let mut y = s.alloc_zeros::<u8>(n * 2).unwrap();
     s.synchronize().unwrap();
 
-    // the launch works outside a capture, and writes what is not the 1.5s that the reused memory will hold below
+    // outside a capture the launch is refused too: the per-thread default stream is refused by every safe launch
     let (xt, yt) =
         (TensorRef::<Bf16>::from_cuda(&x, &shape).unwrap(), TensorMut::<Bf16>::from_cuda(&mut y, &shape).unwrap());
-    launcher.launch(&s, xt, yt).unwrap();
-    s.synchronize().unwrap();
-    assert_ne!(s.clone_dtoh(&y).unwrap(), ones);
+    let e = launcher.launch(&s, xt, yt).expect_err("a launch on the per-thread default stream");
+    assert!(e.to_string().contains("per-thread default stream"), "{e}");
 
     let (xt, yt) =
         (TensorRef::<Bf16>::from_cuda(&x, &shape).unwrap(), TensorMut::<Bf16>::from_cuda(&mut y, &shape).unwrap());
@@ -971,7 +971,93 @@ fn a_safe_launch_of_slices_on_a_capturing_per_thread_stream_is_an_error_and_not_
         "a graph captured from a launch of slices wrote into memory allocated after they were freed"
     );
     let e = refused.expect_err("the launch of slices was captured");
-    assert!(matches!(&e, Error::Launch(why) if why.contains("capturing") && why.contains("launch_raw")), "{e:?}");
+    assert!(matches!(&e, Error::Launch(why) if why.contains("per-thread default stream")), "{e:?}");
+}
+
+/// The per-thread default stream is refused by every safe launch (the review of M3.2): its handle, `CU_STREAM_PER_THREAD`, is 0x2 in every
+/// thread and names another stream in each, so a slice allocated on thread A's per-thread stream and launched on thread B's looked like a
+/// slice of the launch stream, neither the wait of A's stream for the kernel nor the wait of the writer for A's stream was made, and the slice
+/// was freed (and its memory reused) under the kernel: the reviewer's repro wrote into reallocated memory in 10 of 10 rounds. Here it is
+/// refused and writes nothing, and so is every other use of the handle: as the launch stream on one thread, as the owner of a slice launched
+/// on a stream of `new_stream`, for a GEMM. The legacy default stream (`ctx.default_stream()`) launches.
+#[test]
+fn the_per_thread_default_stream_is_refused() {
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let launcher = generated::GeluErf::load(&manifest, &gpu.ctx).unwrap();
+    let n = Race::N;
+    let ones = (0..n).flat_map(|_| 0x3FC0u16.to_le_bytes()).collect::<Vec<u8>>(); // bf16 1.5
+    let shape = [n];
+    let per_thread = |e: Result<(), Error>, what: &str| {
+        let e = e.expect_err(what);
+        assert!(matches!(&e, Error::Launch(why) if why.contains("per-thread default stream")), "{what}: {e:?}");
+    };
+    // -- the repro: the slices are thread A's (allocated on its per-thread stream), the launch is thread B's, on its per-thread stream
+    let a = gpu.ctx.per_thread_stream();
+    let x = a.clone_htod(&ones).unwrap();
+    let mut y = a.alloc_zeros::<u8>(n * 2).unwrap();
+    a.synchronize().unwrap();
+    let launched = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let b = gpu.ctx.per_thread_stream();
+                launcher.launch(
+                    &b,
+                    TensorRef::<Bf16>::from_cuda(&x, &shape)?,
+                    TensorMut::<Bf16>::from_cuda(&mut y, &shape)?,
+                )
+            })
+            .join()
+            .unwrap()
+    });
+    per_thread(launched, "a launch on thread B's per-thread stream of thread A's slices");
+    // -- on one thread: the per-thread stream as the launch stream, and as the owner of slices launched elsewhere
+    let (xs, mut ys) = (gpu.stream.clone_htod(&ones).unwrap(), gpu.stream.alloc_zeros::<u8>(n * 2).unwrap());
+    let refused = launcher.launch(
+        &a,
+        TensorRef::<Bf16>::from_cuda(&xs, &shape).unwrap(),
+        TensorMut::<Bf16>::from_cuda(&mut ys, &shape).unwrap(),
+    );
+    per_thread(refused, "a launch on the per-thread stream of slices of a stream of new_stream");
+    let refused = launcher.launch(
+        &gpu.stream,
+        TensorRef::<Bf16>::from_cuda(&x, &shape).unwrap(),
+        TensorMut::<Bf16>::from_cuda(&mut y, &shape).unwrap(),
+    );
+    per_thread(refused, "a launch on a stream of new_stream of slices of the per-thread stream");
+    gpu.ctx.synchronize().unwrap();
+    assert!(a.clone_dtoh(&y).unwrap().iter().all(|b| *b == 0), "a refused launch wrote its output");
+    assert!(gpu.stream.clone_dtoh(&ys).unwrap().iter().all(|b| *b == 0), "a refused launch wrote its output");
+    // -- a GEMM (the same ordering, `enqueue_gemm`)
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let cases = cases();
+    let case =
+        cases_where(&cases, |c| is_gemm(c) && tensors_json(c).len() == 3).into_iter().next().expect("a GEMM case");
+    let gemm = manifest.gemm(&gpu.ctx, case["stem"].as_str().unwrap(), &[], arch).unwrap();
+    let mut workspace = gemm.alloc_workspace(&gpu.stream).unwrap();
+    let mut tensors = tensors_of(&gpu, &case);
+    let ws_shape = [workspace.len()];
+    let mut args: Vec<TensorArg<'_>> = Vec::new();
+    let last = tensors.len() - 1;
+    for (i, (_, buf)) in tensors.iter_mut().enumerate() {
+        args.push(if i == last { m::<Bf16>(buf).unwrap().into_arg() } else { r::<Bf16>(buf).unwrap().into_arg() });
+    }
+    args.push(TensorMut::<U8>::from_cuda(&mut workspace, &ws_shape).unwrap().into_arg());
+    per_thread(gemm.launch(&a, &mut args), "a GEMM on the per-thread stream");
+    drop(args);
+    // -- the legacy default stream is one stream per context: it launches
+    let legacy = gpu.ctx.default_stream();
+    launcher
+        .launch(
+            &legacy,
+            TensorRef::<Bf16>::from_cuda(&xs, &shape).unwrap(),
+            TensorMut::<Bf16>::from_cuda(&mut ys, &shape).unwrap(),
+        )
+        .expect("the legacy default stream launches");
+    gpu.ctx.synchronize().unwrap();
+    assert!(gpu.stream.clone_dtoh(&ys).unwrap() != vec![0u8; n * 2]);
+    println!(
+        "rust gate: the per-thread default stream is refused (across threads, as the launch stream, as a slice's owner, for a GEMM)"
+    );
 }
 
 /// `launch_raw` makes the kernel's context current for the call, and puts back what was current: nothing, on a thread that had no

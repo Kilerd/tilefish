@@ -30,9 +30,12 @@
 //!   every slice that the kernel writes and whose owning stream is not the launch stream, the launch stream waits for an event recorded
 //!   on the owning stream at that moment. The owning stream has waited for the end of every earlier launch of this crate that used the
 //!   slice (previous item), so the writer runs after all of them, readers and writers, on whatever streams.
+//! * **The per-thread default stream is refused** (`ctx.per_thread_stream()`), as the launch stream and as the stream a slice is owned by:
+//!   its handle is the same in every thread and names another stream in each, so a slice of one thread's per-thread stream launched on
+//!   another thread's would look like a slice of the launch stream, and none of the waits below would be made.
 //! * **A launch of slices is refused while a stream is capturing a CUDA graph** (the launch stream, or a stream a slice is freed on):
 //!   a graph holds addresses and nothing that keeps the slice alive, and `CudaGraph::launch` is safe. cudarc alone does not refuse
-//!   it: a context that never made a stream of its own (it uses `per_thread_stream`, or the default stream) has no events to wait on,
+//!   it: a context that never made a stream of its own (it uses the default stream, or a stream of another library) has no events to wait on,
 //!   and the kernel would be captured. Capture uses regions (`unsafe` [`DevicePtr::from_raw`](crate::DevicePtr::from_raw)) and
 //!   [`Kernel::launch_raw`](crate::Kernel::launch_raw).
 //! * **An error from a launch** is not a promise that the kernel was not enqueued: a driver error can come after it (cudarc's launch

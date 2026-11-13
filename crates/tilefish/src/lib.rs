@@ -158,10 +158,14 @@
 //!   [`Kernel::launch`] with regions on a cudarc stream captures too. A graph holds the addresses it captured and nothing that keeps the memory alive, so the
 //!   contract of `from_raw` includes that the graph is not replayed after the memory is gone. **A launch of tensors made of slices is
 //!   refused while the launch stream, or a stream a slice is freed on, is capturing** (an `Error::Launch`; in every context: cudarc's
-//!   own waits would only refuse it in one that tracks events, and a kernel launched on `ctx.per_thread_stream()` would otherwise be
-//!   captured with the slices' addresses, and a replay after the free would write into reused memory). There is nothing to switch
+//!   own waits would only refuse it in one that tracks events, and a kernel launched on a stream of a context that
+//!   tracks nothing would otherwise be captured with the slices' addresses, and a replay after the free would write into reused memory). There is nothing to switch
 //!   off: do not turn cudarc's event tracking off to capture slices, it leaves exactly the graph that outlives its memory. **A whole launch
 //!   plan is captured safely** with [`PlanRun::capture`] (below): the graph it returns borrows what it captured.
+//! * **The per-thread default stream is refused** by every safe launch (`ctx.per_thread_stream()`, the handle `CU_STREAM_PER_THREAD`), as
+//!   the launch stream and as the stream a slice is owned by: its handle is the same in every thread and names another stream in each, so
+//!   the ordering above cannot be made across threads (a slice of one thread's per-thread stream launched on another's would look like
+//!   a slice of the launch stream, and could be freed under the kernel). Use `ctx.new_stream()` or `ctx.default_stream()`.
 //!
 //! # Launch plans
 //!

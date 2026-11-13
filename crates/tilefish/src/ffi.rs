@@ -254,6 +254,7 @@ pub(crate) fn ordered(
     tensors: &mut [TensorArg<'_>],
     work: impl FnOnce(&mut [TensorArg<'_>], bool) -> Result<Option<CudaEvent>>,
 ) -> Result<()> {
+    refuse_per_thread(stream, tensors.iter())?;
     refuse_capture(stream, tensors)?;
     let across = |t: &TensorArg<'_>| t.owner.as_ref().is_some_and(|owner| owner.cu_stream() != stream.cu_stream());
     let owners = distinct_owners(tensors.iter().filter(|t| across(t)));
@@ -330,14 +331,57 @@ fn settle<Owner, Event>(
     }
 }
 
+/// The handle of the per-thread default stream (`CU_STREAM_PER_THREAD`, what cudarc's `CudaContext::per_thread_stream` wraps).
+const PER_THREAD_STREAM: usize = 0x2;
+
+/// Whether a stream handle is the per-thread default stream's: the same handle in every thread, naming another stream in each.
+pub(crate) fn is_per_thread(handle: sys::CUstream) -> bool {
+    handle as usize == PER_THREAD_STREAM
+}
+
+/// Refuse the per-thread default stream (`ctx.per_thread_stream()`) as the stream of a safe launch, and as the stream a slice of one of
+/// `tensors` is owned by (allocated and freed on).
+///
+/// Its handle, `CU_STREAM_PER_THREAD`, is the same in every thread and names that thread's own stream: two of them compare equal, so a slice
+/// owned by one thread's per-thread stream and launched on another thread's would count as being on the launch stream, and neither the wait
+/// of the owning stream for the end of the kernel nor the wait of a writer for the owning stream would be made (the slice could be freed, and
+/// its memory reused, under the kernel); and a wait enqueued on the handle from another thread than the owner's waits on that other thread's
+/// stream. The owning stream of a slice cannot be named from another thread, so the ordering this crate promises cannot be made: the launch
+/// is refused. The legacy default stream (`ctx.default_stream()`, one stream per context) and the streams of `ctx.new_stream()` are fine.
+/// (`unsafe` `launch_raw` takes any handle, under its contract.)
+pub(crate) fn refuse_per_thread<'t, 'a: 't>(
+    stream: &CudaStream,
+    tensors: impl Iterator<Item = &'t TensorArg<'a>>,
+) -> Result<()> {
+    if is_per_thread(stream.cu_stream()) {
+        return Err(Error::Launch(format!(
+            "the launch stream is {PER_THREAD}, which is refused: {PER_THREAD_WHY}. Launch on a stream of `ctx.new_stream()`, or on \
+             `ctx.default_stream()`"
+        )));
+    }
+    for t in tensors {
+        if t.owner.as_ref().is_some_and(|owner| is_per_thread(owner.cu_stream())) {
+            return Err(Error::Launch(format!(
+                "a tensor is made of a slice allocated on {PER_THREAD}, which is refused: {PER_THREAD_WHY}. Allocate it on a stream of \
+                 `ctx.new_stream()`, or on `ctx.default_stream()`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+const PER_THREAD: &str = "the per-thread default stream (`ctx.per_thread_stream()`, the handle `CU_STREAM_PER_THREAD`)";
+const PER_THREAD_WHY: &str = "its handle is the same in every thread and names another stream in each, so the launch cannot be \
+    ordered against the uses (and the free) of a slice from other threads";
+
 /// Refuse a launch of tensors made of cudarc slices while `stream`, or a stream a slice is freed on, is capturing a CUDA graph.
 ///
 /// A graph holds the addresses of the memory its kernels use, and nothing that keeps that memory alive: `CudaGraph::launch` is safe
 /// and runs the kernel again with those addresses wherever the graph is launched, after the slices are freed and their memory is
 /// used by something else. Whether a launch of slices is refused during a capture is not something cudarc's tracking decides: it
 /// waits on events when its context has more than one stream and tracks events, and then the driver refuses the launch on a capturing
-/// stream (`CUDA_ERROR_STREAM_CAPTURE_ISOLATION`), but a context that never made a stream of its own (`per_thread_stream`,
-/// `default_stream`) has no such events, and the kernel would be captured. So the capture is looked for here, in every mode. Regions
+/// stream (`CUDA_ERROR_STREAM_CAPTURE_ISOLATION`), but a context that never made a stream of its own (it uses
+/// `default_stream`, or a stream of another library) has no such events, and the kernel would be captured. So the capture is looked for here, in every mode. Regions
 /// the host vouched for (`DevicePtr::from_raw`) are not looked at: capture is what they are for, and their contract says that the
 /// graph is not replayed after the memory is gone.
 ///
@@ -604,5 +648,15 @@ mod tests {
         let (_, synchronized, result) = run(Err(boom("launch")), &[], &[]);
         assert_eq!(synchronized, 0, "stream order orders the free after the kernel, enqueued or not");
         assert_eq!(result.unwrap_err().to_string(), boom("launch").to_string());
+    }
+
+    #[test]
+    fn only_the_per_thread_default_stream_is_the_per_thread_handle() {
+        // cudarc's `per_thread_stream` is the handle 0x2 in every thread; the legacy default stream is null (and `CU_STREAM_LEGACY`, 0x1, is
+        // one stream per context too); a stream of `new_stream` is a pointer the driver made
+        assert!(is_per_thread(0x2 as sys::CUstream));
+        assert!(!is_per_thread(std::ptr::null_mut()));
+        assert!(!is_per_thread(0x1 as sys::CUstream));
+        assert!(!is_per_thread(0x7f00_dead_beef_usize as sys::CUstream));
     }
 }
