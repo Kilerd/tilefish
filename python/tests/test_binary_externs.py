@@ -401,9 +401,16 @@ def test_a_cubin_entry_has_no_toolchain(tmp_path):
     def kern(x: Tensor[16, f32], y: Out[Tensor[16, f32]]): ...
 
     m, spec = manifest_of(tmp_path, kern)
-    entry = json.loads((tmp_path / "m" / "manifest.json").read_text())["kernels"][0]
-    assert entry["binary"] == {"source": "cubin"} and entry["toolchain"] == {} and entry["source_digest"] == SHA(k.read_bytes())
+    doc = json.loads((tmp_path / "m" / "manifest.json").read_text())
+    entry = doc["kernels"][0]
+    assert entry["binary"] == {"source": "cubin"} and entry["toolchain"] == {} and entry["source_digest"] == SHA(k.read_bytes()) == entry["sha256"]
     assert m.built_kernel(spec, "sm_90").binary_build == {"source": "cubin"}
+    # a cubin used as it is is its own source: a source_digest that is not the sha256 of the file is refused when the manifest is read (as Rust does),
+    # whatever the declaration says (the replay's comparison with the declaration comes later, and only for its own operator)
+    entry["source_digest"] = "ab" * 32
+    (tmp_path / "m" / "manifest.json").write_text(json.dumps(doc))
+    with pytest.raises(TilefishManifestError, match=r"'k' \(sm_90\): a cubin used as it is is its own source, so its source_digest is the sha256 of the cubin file"):
+        Manifest.load(tmp_path / "m")
 
 
 def test_a_replay_refuses_an_entry_built_from_other_bytes_or_for_another_kind(tmp_path, op, ptx):

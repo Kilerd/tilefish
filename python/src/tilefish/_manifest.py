@@ -324,6 +324,11 @@ class Manifest:
                 )
             if entry.get("source_sha256") is not None:
                 raise TilefishManifestError(f"'{stem}' ({arch}): a prebuilt binary has no source_sha256 (that is the source of a generated Triton kernel)")
+            if b["source"] == "cubin" and entry["source_digest"] != entry["sha256"]:  # as the Rust reader (manifest.rs): the file is the source
+                raise TilefishManifestError(
+                    f"'{stem}' ({arch}): a cubin used as it is is its own source, so its source_digest is the sha256 of the cubin file "
+                    f"({entry['sha256']}), not {entry['source_digest']!r}"
+                )
         # the digests of the source, as the Rust reader reads them (crates/tilefish/src/manifest.rs): a field that is there is a string
         # of 64 lowercase hex digits (a JSON null is as absent), and a source digest and its kind come together
         for field in ("source_sha256", "source_digest"):

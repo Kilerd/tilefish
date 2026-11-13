@@ -327,7 +327,7 @@ document tilefish writes next to a build and the host does not read):
   `shared` not a non-negative int; `toolchain`, `launch`, `abi`, `options` not objects; `abi.scratch_slots` present and not `2`/`0` by kind;
   `source_sha256`/`source_digest` not 64 lowercase hex digits; `source_digest` and `source_digest_kind` not both present or both absent;
   for `binary`: `binary` not exactly one of `{"source":"cubin"}` and `{"source":"ptx","ptxas_flags":[strings]}`, `source_digest_kind` not
-  `"tilefish.binary.v1"`, no `source_digest`, a `source_sha256`; the cubin file name not a plain file name; the cubin's `sha256`, `sha256_code` or
+  `"tilefish.binary.v1"`, no `source_digest`, a `source_sha256`, a cubin used as it is whose `source_digest` is not its `sha256`; the cubin file name not a plain file name; the cubin's `sha256`, `sha256_code` or
   `.text.<symbol>` section wrong; for `triton` the shared-memory section rule.
 * the ABI (a host that reads without a spec checks these itself; Python checks them by comparing the entry with the compile spec, and `_specvalid`
   checks them in the spec): `params` kinds in `pointer`/`scalar`/`fixed`; a `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
