@@ -65,7 +65,7 @@ from ._planrun import CapturedPlan
 from .trace import Const, Value
 from .types import DevScalar, InOut, Out, StrideOf, Strided, Tensor, TensorType, const
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 # Reductions with numpy semantics. They share a name with a builtin, so they are not in
 # __all__ (`from tilefish import *` must not shadow the builtins); use tilefish.sum etc.
