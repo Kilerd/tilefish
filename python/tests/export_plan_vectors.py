@@ -155,6 +155,7 @@ def mutations():
         ("written then read", lambda d: (d["buckets"][0]["steps"][0]["args"][2].update(binding="t5"), d["buckets"][0]["steps"][1]["args"][0].update(binding="t5"))),
         ("workspace too small", lambda d: d["buffers"][-1].update(bytes=1000, shape=[1000])),
         ("a later bucket", setter(["buckets", 2, "steps", 0, "entry"], "nothing")),
+        ("an output no step writes", lambda d: [b["steps"][8]["args"][2].update(binding="t0") for b in d["buckets"]]),
     ]
     # shape expressions: the same sizes, written so that Python's dimension algebra folds them (accepted) or cannot (refused)
     for text in ("2*M//2", "M + 0", "M*1", "(M+M)//2", "M//1", "cdiv(M, 1)", "cdiv(2*M, 2)", "M - M + M", "-(-M)", "cdiv(M, 2) * 2", "M*M//M",

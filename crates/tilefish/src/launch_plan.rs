@@ -892,7 +892,7 @@ fn validate(doc: &Value) -> Check<Validated> {
 
 /// Every step of every bucket against the manifest (Python's `check_against_manifest`): the digest, the entry for the plan's architecture in
 /// the section the step says, the pointers of its ABI against the arguments (count, names, dtype, rank, which buffers may be written, the
-/// device scalars), the workspace of a library step, and that a buffer is written before it is read.
+/// device scalars), the workspace of a library step, that a buffer is written before it is read, and that every output is written by a step of every bucket.
 fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
     if manifest.digest() != v.manifest_digest {
         return refuse(format!(
@@ -989,6 +989,18 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
                     written.insert(a.buffer);
                 }
             }
+        }
+        // a result no step writes would be returned as whatever the caller's tensor held: every returned value is written by a step of every
+        // bucket
+        let unwritten = v
+            .outputs
+            .iter()
+            .find(|o| v.buffers.iter().position(|b| b.name == **o).is_none_or(|i| !written.contains(&i)));
+        if let Some(output) = unwritten {
+            return refuse(format!(
+                "bucket {}: no step writes the output '{output}' (every returned value is written by a step of every bucket)",
+                describe_values(&bucket.values)
+            ));
         }
     }
     Ok(())
