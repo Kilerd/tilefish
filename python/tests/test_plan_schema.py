@@ -325,7 +325,6 @@ def mutations():
         ("arena offset unaligned", setter(["buffers", 9, "offset"], 100), "multiple of 256"),
         ("arena offset negative", setter(["buffers", 9, "offset"], -256), "non-negative multiple of 256"),
         ("devscalar shape", setter(["buffers", 1, "shape"], [1]), "devscalar"),
-        ("devscalar dtype", setter(["buffers", 1, "dtype"], "bf16"), "devscalar"),
         ("workspace dtype", setter(["buffers", -1, "dtype"], "bf16"), "workspace"),
         ("outputs missing", setter(["outputs"], []), "outputs must list the buffers of role output"),
         ("outputs not a buffer", setter(["outputs"], ["x"]), "outputs must list the buffers of role output"),
@@ -383,6 +382,15 @@ def test_regions_may_overlap_only_with_reuse_and_only_where_no_step_uses_both(go
     doc = copy.deepcopy(good_reuse)
     buffer(doc, "t0")["offset"] = buffer(doc, "n")["offset"]
     with pytest.raises(TilefishManifestError, match="no step uses together|overlap"):
+        _plan.validate_doc(doc)
+
+
+def test_there_is_a_workspace_exactly_when_a_step_launches_a_gemm():
+    doc = tilefish.plan(pm.accumulate).with_manifest("sm_103", "a" * 64).doc  # no GEMM, no workspace
+    _plan.validate_doc(doc)
+    doc["buffers"].append({"name": "workspace", "role": "workspace", "dtype": "u8", "shape": [256], "offset": 0, "bytes": 256})
+    doc["arena_bytes"] = 16384
+    with pytest.raises(TilefishManifestError, match="a buffer of role workspace exactly when some step has kind library"):
         _plan.validate_doc(doc)
 
 

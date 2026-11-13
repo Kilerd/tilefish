@@ -32,6 +32,10 @@ assumed wherever it happens to hold) that make its machine code differ from the 
 C compiler (Triton's JIT launcher does, to build a stub). ``replay`` of a generated kernel needs neither Triton nor
 ``ptxas``, only a manifest directory and the CUDA driver.
 
+A ``@tilefish.graph`` runs through its launch plan (:mod:`tilefish._plan`, :mod:`tilefish._planrun`, ``docs/plan-schema-1.md``): ``jit`` builds the plan's binaries in memory, ``replay`` runs the
+plan of a directory that :func:`export` wrote (``plan=``, with ``pin=`` the plan's digest, which pins the manifest and so every binary), ``reference`` composes the references of its
+ops in torch. Every step's preconditions are checked before the first launch, a run allocates and waits for nothing, and a replay can be captured in a CUDA graph.
+
 What ``replay`` checks. It loads the manifest when it is first used (and again when a file in the directory changes)
 and refuses
 
@@ -226,10 +230,10 @@ def _target(op: Any) -> _Target:
         return _Target(op.name, op.signature, None, op, None)
     if isinstance(op, Op):
         raise TilefishRuntimeError(
-            f"cannot run the {op.kind} op '{op.name}': only @tilefish.kernel and @tilefish.extern run for now "
-            "(library operators and graphs have no runtime yet)"
+            f"cannot run the {op.kind} op '{op.name}': @tilefish.kernel, @tilefish.extern, a @tilefish.library with an impl and a @tilefish.graph run "
+            "(a library operator that is only a signature has no runtime)"
         )
-    raise TilefishRuntimeError(f"tilefish.run takes a kernel or an extern op, got {op!r}")
+    raise TilefishRuntimeError(f"tilefish.run takes a kernel or an extern op (or a library op with an impl, or a graph), got {op!r}")
 
 
 def load_lowered(lowered: LoweredKernel) -> Any:

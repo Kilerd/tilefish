@@ -16,6 +16,9 @@ M3.2 (P1): strided views (``reshape``, ``permute``, ``select``, ``split`` give v
 strides as ``StrideOf`` scalars), device scalars (``DevScalar[dtype]``, read with :func:`load`), prebuilt PTX and cubin externs
 (``extern(ptx=...)``, ``extern(cubin=...)``), a cuBLASLt GEMM as a ``library`` op with a pinned algorithm, and manifest schema 3
 (``docs/manifest-schema-3.md``).
+
+M3.2 (P2): :func:`plan` compiles a graph into a static launch plan with an arena memory plan per shape bucket (:mod:`tilefish._plan`), :func:`tilefish.runtime.export` writes it as
+``plan.json`` next to the manifest (``docs/plan-schema-1.md``), and :func:`run` of a graph executes it in ``jit``, ``replay`` and ``reference`` modes, capturable in a CUDA graph.
 """
 
 from . import aot

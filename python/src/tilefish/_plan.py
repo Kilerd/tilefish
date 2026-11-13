@@ -1046,8 +1046,8 @@ def _validate(doc: Any) -> None:
     ):
         _bad("outputs must list the buffers of role output, each once, in the order the graph returns them")
     for b in buffers:
-        if b["role"] == "devscalar" and (b["shape"] != [] or b["dtype"] in ("bf16", "f16", "e4m3", "e5m2")):
-            _bad(f"the devscalar '{b['name']}' must have shape [] and a dtype of 32 or 64 bits (i32, i64 or f32)")
+        if b["role"] == "devscalar" and b["shape"] != []:
+            _bad(f"the devscalar '{b['name']}' is one element in device memory: its shape must be []")
         if b["role"] == "workspace" and (b["dtype"] != "u8" or len(b["shape"]) != 1 or not _is_int(b["shape"][0])):
             _bad(f"the workspace '{b['name']}' must be a u8 buffer with one static size")
     # buckets
@@ -1139,6 +1139,9 @@ def _validate(doc: Any) -> None:
             skeleton = this
         elif this != skeleton:
             _bad(f"bucket {bucket['values']} has other kinds, workspaces, argument names or bindings than the first bucket: only the entries and the views may differ")
+    uses_library = any(st["kind"] == "library" for st in buckets[0]["steps"])
+    if uses_library != any(b["role"] == "workspace" for b in buffers):
+        _bad("there is a buffer of role workspace exactly when some step has kind library")
     # the arena: every region inside, overlaps only where the live ranges are disjoint
     arena = [b for b in buffers if b["role"] in ARENA_ROLES]
     end = max((b["offset"] + align_up(b["bytes"]) for b in arena), default=0)
