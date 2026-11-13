@@ -27,6 +27,10 @@ is used for its own); the files persist there, next to the manifest the caller e
 is there while it is imported. Its declarations are the real ones: the Triton function is named by its module and name, and that is all a
 declaration records of it.
 
+``gluon_ops()`` is the Gluon externs of ``gluon_kernels.py`` (``row_dot`` and ``row_dot_fma``: a layout-pinned row reduction over two views read with
+one ``i32`` stride, declared with ``enable_fp_fusion=False`` and ``True``); importing them needs Triton's Gluon, so only the gate and the gpu tests
+call it, and the committed fixtures do not have them.
+
 ``export_rust_fixtures.py`` builds these into the fixtures of the crate, and ``rust_gate.py`` runs them in Python (``replay``) and in Rust.
 
 No ``from __future__ import annotations`` here: tilefish evaluates annotations at declaration.
@@ -175,6 +179,13 @@ def make_gemm(name, n, k, bias):
     def gemm(a: Tensor[Mb, k, bf16], b: Tensor[n, k, bf16]) -> Tensor[Mb, n, bf16]: ...
 
     return gemm
+
+
+def gluon_ops():
+    """``{name: extern}``: the Gluon kernels of ``gluon_kernels.py`` (which imports ``triton.experimental.gluon``)."""
+    import gluon_kernels
+
+    return {"row_dot": gluon_kernels.row_dot, "row_dot_fma": gluon_kernels.row_dot_fma}
 
 
 def gemm_name(n, k, bias):

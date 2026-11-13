@@ -33,7 +33,7 @@
 //! `the_gate_has_a_case_for_every_feature_of_schema_3`, `refusals_of_schema_3`, `graph_capture_of_a_strided_kernel_and_of_a_gemm`,
 //! `a_gemm_of_slices_on_a_capturing_stream_...`, the free of the slices of a GEMM and of a strided kernel on another stream,
 //! `a_written_view_lands_at_its_offset_and_nowhere_else` and `a_gemm_whose_algorithm_needs_a_workspace_...`. M3.3 adds
-//! `the_gate_has_a_case_for_every_feature_of_m3_3` and `views_that_share_a_stride_must_all_have_it`.
+//! `the_gate_has_a_case_for_every_feature_of_m3_3` and `views_that_share_a_stride_must_all_have_it`, and `the_gate_has_a_gluon_kernel`.
 
 #[allow(dead_code)]
 mod generated {
@@ -1254,6 +1254,47 @@ fn the_gate_has_a_case_for_every_feature_of_m3_3() {
             |p| matches!(&p.kind, tilefish::ParamKind::Pointer { access: Access::In, shape, .. } if !shape.is_empty()),
         );
         assert!(!reads_b, "{stem}: the kernel reads no tensor that has B");
+    }
+}
+
+/// A Gluon kernel (`@tilefish.extern(gluon=...)`, `python/tests/gluon_kernels.py`) is a `triton` entry like any other, whose source digest is of
+/// the TTGIR Gluon's frontend builds (`tilefish.gluon-ir.v1`). The gate runs `row_dot` and `row_dot_fma` (a layout-pinned row reduction, without and
+/// with FMA contraction) for each bucket of their columns, over the two halves of one tensor (two views read with one `i32` row stride) and over two
+/// tensors of their own; `byte_identity` holds their bytes to Python's. A committed fixture has no Gluon kernel: with one as the manifest there is
+/// nothing to check here.
+#[test]
+fn the_gate_has_a_gluon_kernel() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no Gluon kernel");
+        return;
+    }
+    let arch = cases["arch"].as_str().unwrap().to_owned();
+    let manifest = manifest();
+    for op in ["row_dot", "row_dot_fma"] {
+        for c in [128u64, 256] {
+            let stem = format!("{op}.Cb{c}");
+            let entry = manifest.entry(&stem, &arch).unwrap_or_else(|| panic!("the gate's manifest has no {stem}"));
+            assert_eq!(entry.kind, tilefish::EntryKind::Triton, "{stem}");
+            assert_eq!(entry.source_digest_kind.as_deref(), Some("tilefish.gluon-ir.v1"), "{stem}");
+            assert_eq!(entry.enable_fp_fusion, Some(op == "row_dot_fma"), "{stem}");
+            match &entry.param("s_row").expect("the row stride").kind {
+                tilefish::ParamKind::Scalar { ty, stride_of, .. } => {
+                    assert_eq!(
+                        (*ty, stride_of.len()),
+                        (tilefish::ScalarType::I32, 2),
+                        "{stem}: one i32 stride of two views"
+                    )
+                }
+                other => panic!("{stem}: s_row is {other:?}"),
+            }
+            let halves = cases_where(&cases, |cs| {
+                cs["stem"] == stem.as_str()
+                    && tensors_json(cs)[..2].iter().all(|t| t["strides"] == serde_json::json!([2 * c, 1]))
+                    && tensors_json(cs)[..2].iter().map(|t| t["offset"].as_u64().unwrap()).collect::<Vec<_>>() == [0, c]
+            });
+            assert!(halves.len() >= 3, "{stem}: the gate has no case of the two halves of one tensor");
+        }
     }
 }
 
