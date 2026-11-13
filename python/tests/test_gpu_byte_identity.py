@@ -29,11 +29,12 @@ pytest.importorskip("cuda.bindings.driver")
 import gpu_kernels  # noqa: E402
 from conftest import REPO_ROOT, make_my_kernels, readme_snippet  # noqa: E402
 from gpu_util import randn, same_bytes  # noqa: E402
+from host_ops import bucketed_rms  # noqa: E402  (shared with the Rust host's gate)
 from native_jit import native_jit  # noqa: E402
-from lower_cases import M, T, gelu_exact, layernorm, softmax, swiglu  # noqa: E402
+from lower_cases import T, gelu_exact, layernorm, softmax, swiglu  # noqa: E402
 
 import tilefish  # noqa: E402
-from tilefish import Dim, Out, Tensor, TilefishPreconditionError, TilefishTypeError, bf16, const, f32  # noqa: E402
+from tilefish import Out, Tensor, TilefishPreconditionError, TilefishTypeError, bf16, const, f32  # noqa: E402
 from tilefish import runtime  # noqa: E402
 
 BF16, F32 = torch.bfloat16, torch.float32
@@ -49,16 +50,6 @@ def readme_kernel():
     ns = {"my_kernels": make_my_kernels()}
     exec(compile(readme_snippet(), "README.md", "exec"), ns)
     return ns["residual_add_rmsnorm"]
-
-
-Db = Dim("Db", buckets=[96, 512, 1000])
-
-
-@tilefish.kernel
-def bucketed_rms(x: Tensor[M, Db, bf16], w: Tensor[Db, bf16], *, eps: const[f32] = 1e-5) -> Tensor[M, Db, bf16]:
-    xf = x.to(f32)
-    mean_square = tilefish.mean(xf * xf, axis=-1, keepdims=True)
-    return (xf * tilefish.rsqrt(mean_square + eps) * w.to(f32)).to(bf16)
 
 
 @tilefish.kernel
