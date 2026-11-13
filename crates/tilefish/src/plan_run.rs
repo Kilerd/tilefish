@@ -1,0 +1,1083 @@
+//! Running a launch plan: one arena, the steps in order, the device scalars, and a CUDA graph capture that cannot outlive what it captured.
+//!
+//! [`LaunchPlan::instantiate`] makes a [`PlanRun`]: every kernel and GEMM of the chosen bucket combinations loaded once (and each function
+//! loaded eagerly, `cuFuncLoad`), the address-independent preconditions of every step checked (the binding of the dimensions, the exact
+//! bucket of every entry, the grids against the device, the workspace a pinned algorithm needs), and the **arena** allocated once: a
+//! `CudaSlice<u8>` of `arena_bytes` bytes on the stream the plan is instantiated with, which holds the intermediates, the slots of the device
+//! scalars and the cuBLASLt workspace at the offsets of the plan. Nothing is allocated after that.
+//!
+//! [`PlanRun::launch`] takes the externals by name (tensors of cudarc slices, `TensorRef` for what the plan reads and `TensorMut` for what it
+//! writes) and a value for every device scalar, binds the dimensions from the externals' shapes and selects the bucket (exactly one of the
+//! plan's), checks every step of it with the real addresses (**before the first launch: a refusal launches nothing and writes nothing**),
+//! writes the device scalars into their slots on the stream, and launches the steps in order. The externals are ordered against other
+//! streams as a single launch's tensors are ([`Kernel::launch`]): cudarc's tracking on the launch stream, each slice's own stream waiting for
+//! the end of the plan, a written slice's own stream waited for first; and the arena is ordered the same way, as a slice that every launch
+//! writes, owned by the stream it was allocated on: two launches of one instantiation on two streams run one after the other.
+//!
+//! [`PlanRun::capture`] makes a [`CapturedPlan`]: the same checks, then the steps captured in a CUDA graph on the stream. The graph holds
+//! addresses: the arena's (the `CapturedPlan` holds the instantiation, so the arena outlives the graph) and the externals' (the `CapturedPlan`
+//! **borrows** the externals for its lifetime `'ext`, so no slice the graph captured can be freed while the graph can be replayed: that is a
+//! compile error). [`CapturedPlan::replay`] is safe, and ordered as a launch is. The externals keep their addresses; their contents may change
+//! between replays: an external given as a `TensorMut` is written through [`CapturedPlan::external_mut`], and a device scalar is set with
+//! [`CapturedPlan::set_devscalar`] (its slot is written on the stream right before the next replay, so a launch or another graph of the same
+//! instantiation in between does not change what this graph reads).
+//!
+//! What is not this module's: the ordering of a use of an external that is not a launch of this crate (cudarc's tracking, or the host's), as
+//! everywhere in the crate.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus};
+use cudarc::driver::{CudaContext, CudaEvent, CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut};
+
+use crate::error::{Error, PreconditionKind, Result};
+use crate::expr::{Expr, MAX_DIMS, Pattern, Solved, Symbols, Unsolvable};
+use crate::ffi;
+use crate::gemm::{Call, Gemm};
+use crate::kernel::{Arch, Kernel};
+use crate::launch_plan::{BufferRole, LaunchPlan, StepKind, describe_values};
+use crate::manifest::{Access, ShapeDim};
+use crate::memory::sealed;
+use crate::plan::Prepared;
+use crate::tensor::{Backing, DType, TensorArg, TensorMut, U8};
+
+/// The value of a device scalar (a buffer of role `devscalar`), which a launch writes into its slot of the arena.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DevScalar {
+    /// An integer, for a device scalar of an integer dtype (`i32`, `i64`, `u8`): it must fit the dtype.
+    Int(i64),
+    /// A float, for a device scalar of dtype `f32`.
+    F32(f32),
+    /// The bits of one element of any dtype, in the low bytes (`bf16` 1.0 is `Bits(0x3f80)`): the bits above the element's size must be 0.
+    Bits(u64),
+}
+
+impl From<i32> for DevScalar {
+    fn from(v: i32) -> Self {
+        Self::Int(i64::from(v))
+    }
+}
+
+impl From<i64> for DevScalar {
+    fn from(v: i64) -> Self {
+        Self::Int(v)
+    }
+}
+
+impl From<u8> for DevScalar {
+    fn from(v: u8) -> Self {
+        Self::Int(i64::from(v))
+    }
+}
+
+impl From<f32> for DevScalar {
+    fn from(v: f32) -> Self {
+        Self::F32(v)
+    }
+}
+
+impl DevScalar {
+    /// The little-endian bytes of the value as one element of `dtype`.
+    fn encode(self, dtype: DType, name: &str) -> Result<Vec<u8>> {
+        let refused = |why: String| {
+            Error::precondition(PreconditionKind::Shape, Some(name), format!("the device scalar '{name}' {why}"))
+        };
+        let range = match dtype {
+            DType::I32 => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+            DType::I64 => Some((i64::MIN, i64::MAX)),
+            DType::U8 => Some((0, 255)),
+            _ => None,
+        };
+        match (self, range) {
+            (Self::Int(v), Some((lo, hi))) => {
+                if !(lo..=hi).contains(&v) {
+                    return Err(refused(format!(
+                        "is {v}, which is not an integer that fits {} ({lo} to {hi})",
+                        dtype.name()
+                    )));
+                }
+                Ok(v.to_le_bytes()[..dtype.size()].to_vec())
+            }
+            (Self::F32(v), _) if dtype == DType::F32 => Ok(v.to_le_bytes().to_vec()),
+            (Self::Bits(bits), _) => {
+                let size = dtype.size();
+                if size < 8 && bits >> (8 * size) != 0 {
+                    return Err(refused(format!(
+                        "is given the bits {bits:#x}, more than the {size} bytes of one {}",
+                        dtype.name()
+                    )));
+                }
+                Ok(bits.to_le_bytes()[..size].to_vec())
+            }
+            (other, _) => Err(refused(format!(
+                "is {}, which is not a value of its dtype {} (an integer dtype takes DevScalar::Int, f32 DevScalar::F32, any dtype DevScalar::Bits)",
+                match other {
+                    Self::Int(v) => format!("the integer {v}"),
+                    Self::F32(v) => format!("the f32 {v}"),
+                    Self::Bits(b) => format!("the bits {b:#x}"),
+                },
+                dtype.name()
+            ))),
+        }
+    }
+}
+
+/// The launch of one step, checked: what [`ffi::plan::enqueue_steps`] launches.
+pub(crate) enum Ready<'r> {
+    Kernel(&'r Kernel, Box<Prepared>),
+    Gemm(&'r Gemm, Call),
+}
+
+/// The value of one device scalar, at its slot of the arena.
+#[derive(Debug, Clone)]
+struct Slot {
+    name: String,
+    offset: u64,
+    dtype: DType,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+enum Op {
+    Kernel(Kernel),
+    Gemm(Gemm),
+}
+
+/// One pointer argument of a step at one bucket: the buffer, the shape, and the view (none: the whole buffer, dense).
+#[derive(Debug)]
+struct ArgRun {
+    buffer: usize,
+    shape: Vec<usize>,
+    view: Option<(Vec<usize>, usize)>,
+    dtype: DType,
+    access: Access,
+}
+
+#[derive(Debug)]
+struct StepRun {
+    stem: String,
+    op: Op,
+    args: Vec<ArgRun>,
+    /// A library step's workspace: its buffer and its shape (`[bytes]`).
+    workspace: Option<(usize, [usize; 1])>,
+}
+
+#[derive(Debug)]
+struct BucketRun {
+    /// The index of the combination in the plan.
+    index: usize,
+    steps: Vec<StepRun>,
+}
+
+#[derive(Debug)]
+struct Arena {
+    slice: Option<CudaSlice<u8>>,
+    /// Whose device scalar values the slots hold: the id of a `CapturedPlan`, or 0 (a launch, or nothing yet).
+    slots_of: u64,
+}
+
+#[derive(Debug)]
+struct Instance {
+    plan: LaunchPlan,
+    context: Arc<CudaContext>,
+    /// The stream the arena was allocated on, and is freed on: a launch elsewhere is ordered against it, as a slice's own stream is.
+    home: Arc<CudaStream>,
+    device: i32,
+    arena: Mutex<Arena>,
+    arena_addr: u64,
+    buckets: Vec<BucketRun>,
+    by_name: HashMap<String, usize>,
+    /// The dimensions, numbered in the order of the plan's `dims` (what the externals' shapes bind).
+    syms: Symbols,
+    /// The shape of every external, as patterns over the dimensions (empty for an arena buffer).
+    patterns: Vec<Vec<Pattern>>,
+    captures: AtomicU64,
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        // The arena's own stream has waited for the end of every launch and replay of this instantiation made on another stream, and has the
+        // ones made on it: when it is idle nothing of the plan runs, so unloading the modules, destroying the cuBLASLt handles and freeing the
+        // arena (which the fields do next) cannot happen under a step. A failure cannot be reported from a destructor.
+        let _ = self.home.synchronize();
+    }
+}
+
+impl Instance {
+    fn lock_arena(&self) -> MutexGuard<'_, Arena> {
+        self.arena.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// A launch plan instantiated on a device: its kernels and GEMMs loaded, its arena allocated. Cheap to clone (the clones share the
+/// instantiation and its arena); it can be shared between threads. See the module docs.
+#[derive(Debug, Clone)]
+pub struct PlanRun {
+    inner: Arc<Instance>,
+}
+
+/// What a call binds: the bucket, the address of every buffer, the values of the device scalars.
+struct Bound {
+    /// The index into `Instance::buckets`.
+    bucket: usize,
+    bases: Vec<u64>,
+    slots: Vec<Slot>,
+}
+
+impl LaunchPlan {
+    /// Instantiate the plan for the bucket combination `values` (one value per dimension, `&[]` for a plan without dimensions): load every
+    /// kernel and GEMM of its steps in the context of `stream`, check every step's preconditions that do not depend on an address, and
+    /// allocate the arena on `stream` (which it is freed on; a launch on that stream needs no extra ordering). The device must be of the
+    /// plan's architecture.
+    pub fn instantiate(&self, stream: &Arc<CudaStream>, values: &[(&str, u64)]) -> Result<PlanRun> {
+        let Some(index) = self.bucket_index(values) else {
+            let all: Vec<String> = self.buckets().iter().map(|b| describe_values(&b.values)).collect();
+            return Err(Error::precondition(
+                PreconditionKind::Bucket,
+                None,
+                format!(
+                    "the plan of graph '{}' has no bucket {values:?}: its buckets are {}",
+                    self.graph(),
+                    all.join(", ")
+                ),
+            ));
+        };
+        PlanRun::new(self, stream, &[index])
+    }
+
+    /// Instantiate the plan for every bucket combination: one arena serves all of them (a buffer is at the same offset in every bucket).
+    pub fn instantiate_all(&self, stream: &Arc<CudaStream>) -> Result<PlanRun> {
+        let all: Vec<usize> = (0..self.buckets().len()).collect();
+        PlanRun::new(self, stream, &all)
+    }
+}
+
+fn in_step(e: Error, what: &str) -> Error {
+    match e {
+        Error::Precondition { kind, arg, message } => {
+            Error::Precondition { kind, arg, message: format!("{what}: {message}") }
+        }
+        Error::Launch(m) => Error::Launch(format!("{what}: {m}")),
+        Error::Unsupported(m) => Error::Unsupported(format!("{what}: {m}")),
+        other => other,
+    }
+}
+
+/// Write `bytes` at byte `at` of written cudarc memory, on `stream` (cudarc's copy from the host, which orders it after the memory's
+/// earlier uses on any stream and records it as a write).
+fn write_bytes(memory: &mut dyn sealed::Write, stream: &Arc<CudaStream>, at: u64, bytes: &[u8]) -> Result<()> {
+    let missing = || Error::Launch("a slot of a device scalar is outside the arena".to_owned());
+    let mut all = memory.bytes_mut().ok_or_else(missing)?;
+    let at = usize::try_from(at).map_err(|_| missing())?;
+    let mut part = all.try_slice_mut(at..at + bytes.len()).ok_or_else(missing)?;
+    stream.memcpy_htod(bytes, &mut part).map_err(Error::driver("cuMemcpyHtoDAsync"))
+}
+
+/// The work of a launch or a replay, inside `ffi::ordered` (which refused a capturing stream and made `stream` wait for what a written slice's
+/// own stream holds): the device scalars into their slots (the arena is the last tensor), cudarc's tracking of every slice on `stream` (a
+/// wait for the earlier writes, and reads for a write; the use recorded when the guards are dropped, after the work), the work, and the event
+/// after it when an owning stream is not `stream`.
+fn tracked(
+    stream: &Arc<CudaStream>,
+    tensors: &mut [TensorArg<'_>],
+    slots: &[Slot],
+    want_end: bool,
+    work: impl FnOnce(&CudaStream) -> Result<()>,
+) -> Result<Option<CudaEvent>> {
+    if !slots.is_empty() {
+        let Some(TensorArg { backing: Backing::Write(arena), .. }) = tensors.last_mut() else {
+            return Err(Error::Launch("a plan with device scalars has no arena".to_owned()));
+        };
+        for slot in slots {
+            write_bytes(&mut **arena, stream, slot.offset, &slot.bytes)?;
+        }
+    }
+    let mut guards = Vec::with_capacity(tensors.len());
+    for tensor in tensors.iter_mut() {
+        match &mut tensor.backing {
+            Backing::Raw => {}
+            Backing::Read(memory) => guards.push(memory.sync_read(stream)),
+            Backing::Write(memory) => guards.push(memory.sync_write(stream)),
+        }
+    }
+    work(stream)?;
+    let end = if want_end {
+        Some(
+            stream
+                .record_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))
+                .map_err(Error::driver("cuEventRecord"))?,
+        )
+    } else {
+        None
+    };
+    drop(guards);
+    Ok(end)
+}
+
+impl PlanRun {
+    fn new(plan: &LaunchPlan, stream: &Arc<CudaStream>, buckets: &[usize]) -> Result<Self> {
+        let ctx = Arc::clone(stream.context());
+        let arch = Arch::of_context(&ctx)?;
+        if arch.to_string() != plan.arch() {
+            return Err(Error::Unsupported(format!(
+                "the plan of graph '{}' was built for {}, but the CUDA device {} of the stream is {arch}",
+                plan.graph(),
+                plan.arch(),
+                ctx.ordinal()
+            )));
+        }
+        let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
+        if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+            return Err(Error::Launch(
+                "a plan is not instantiated while its stream captures a CUDA graph: its arena would be allocated inside the capture".to_owned(),
+            ));
+        }
+        if plan.dims().len() > MAX_DIMS {
+            return Err(Error::Unsupported(format!(
+                "the plan of graph '{}' has {} dimensions; this host binds at most {MAX_DIMS}",
+                plan.graph(),
+                plan.dims().len()
+            )));
+        }
+        let buffers = plan.buffers();
+        let mut syms = Symbols::default();
+        for (name, _) in plan.dims() {
+            syms.intern(name).map_err(Error::Unsupported)?;
+        }
+        let mut patterns = Vec::with_capacity(buffers.len());
+        for b in buffers {
+            let mut axes = Vec::new();
+            if b.role.is_external() {
+                for (axis, d) in b.shape.iter().enumerate() {
+                    axes.push(match d {
+                        ShapeDim::Static(n) => Pattern::new(&n.to_string(), Expr::Num(i128::from(*n))),
+                        ShapeDim::Expr(e) => {
+                            Pattern::parse(e, &format!("the shape of '{}' axis {axis}", b.name), &mut syms)
+                                .map_err(Error::Plan)?
+                        }
+                    });
+                }
+            }
+            patterns.push(axes);
+        }
+        let by_name: HashMap<String, usize> = buffers.iter().enumerate().map(|(i, b)| (b.name.clone(), i)).collect();
+
+        // -- every entry of the chosen buckets, loaded once (and its function loaded now, not inside a capture)
+        let mut ops: HashMap<(bool, String), Op> = HashMap::new();
+        let mut runs = Vec::with_capacity(buckets.len());
+        for &index in buckets {
+            let bucket = &plan.buckets()[index];
+            let mut steps = Vec::with_capacity(bucket.steps.len());
+            for st in &bucket.steps {
+                let key = (st.kind == StepKind::Library, st.entry.clone());
+                let op = match ops.get(&key) {
+                    Some(op) => op.clone(),
+                    None => {
+                        let op = match st.kind {
+                            StepKind::Kernel => {
+                                let kernel = plan.manifest().kernel(&ctx, &st.entry, &[], arch)?;
+                                ctx.bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+                                ffi::plan::load_function(kernel.function())?;
+                                Op::Kernel(kernel)
+                            }
+                            StepKind::Library => Op::Gemm(plan.manifest().gemm(&ctx, &st.entry, &[], arch)?),
+                        };
+                        ops.insert(key, op.clone());
+                        op
+                    }
+                };
+                let args = st
+                    .args
+                    .iter()
+                    .map(|a| {
+                        let buffer = &buffers[a.buffer];
+                        let (shape, view) = match &a.view {
+                            Some(v) => (v.shape.clone(), Some((v.strides.clone(), v.offset))),
+                            None => (bucket.shapes[a.buffer].clone(), None),
+                        };
+                        let access = if buffer.role.is_writable() { Access::InOut } else { Access::In };
+                        ArgRun { buffer: a.buffer, shape, view, dtype: buffer.dtype, access }
+                    })
+                    .collect();
+                let workspace = st.workspace_buffer.map(|w| (w, [bucket.shapes[w][0]]));
+                steps.push(StepRun { stem: st.entry.clone(), op, args, workspace });
+            }
+            runs.push(BucketRun { index, steps });
+        }
+
+        // -- the arena, once
+        let arena_bytes = usize::try_from(plan.arena_bytes())
+            .map_err(|_| Error::Unsupported("the arena does not fit the address space".to_owned()))?;
+        let slice = if arena_bytes > 0 {
+            Some(stream.alloc_zeros::<u8>(arena_bytes).map_err(Error::driver("cuMemAllocAsync"))?)
+        } else {
+            None
+        };
+        let arena_addr = slice.as_ref().map_or(0, |s| sealed::Memory::region(s).addr);
+        if !arena_addr.is_multiple_of(crate::launch_plan::ARENA_ALIGNMENT) {
+            return Err(Error::Unsupported(format!(
+                "the arena was allocated at {arena_addr:#x}, which is not aligned to {} bytes",
+                crate::launch_plan::ARENA_ALIGNMENT
+            )));
+        }
+        let run = Self {
+            inner: Arc::new(Instance {
+                plan: plan.clone(),
+                context: ctx.clone(),
+                home: Arc::clone(stream),
+                device: ctx.ordinal() as i32,
+                arena: Mutex::new(Arena { slice, slots_of: 0 }),
+                arena_addr,
+                buckets: runs,
+                by_name,
+                syms,
+                patterns,
+                captures: AtomicU64::new(0),
+            }),
+        };
+        // -- every step's preconditions that no address can change, with made-up addresses for the externals (Python's virtual ones, distinct
+        // per buffer): a refusal comes now, not at the first launch
+        for (k, bucket) in run.inner.buckets.iter().enumerate() {
+            let bases: Vec<u64> = buffers
+                .iter()
+                .enumerate()
+                .map(|(i, b)| match b.offset {
+                    Some(offset) => arena_addr + offset,
+                    None => ((i as u64) + 1) << 44,
+                })
+                .collect();
+            run.ready(&Bound { bucket: k, bases, slots: Vec::new() })
+                .map_err(|e| in_step(e, &format!("at {}", describe_values(&plan.buckets()[bucket.index].values))))?;
+        }
+        Ok(run)
+    }
+
+    /// The plan.
+    pub fn plan(&self) -> &LaunchPlan {
+        &self.inner.plan
+    }
+
+    /// The context the plan is instantiated in: a launch is on a stream of it.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.inner.context
+    }
+
+    /// The stream the arena was allocated on (and is freed on).
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.inner.home
+    }
+
+    /// The bytes of the arena.
+    pub fn arena_bytes(&self) -> u64 {
+        self.inner.plan.arena_bytes()
+    }
+
+    /// The bucket combinations the run was instantiated for.
+    pub fn buckets(&self) -> Vec<&[(String, u64)]> {
+        self.inner.buckets.iter().map(|b| self.inner.plan.buckets()[b.index].values.as_slice()).collect()
+    }
+
+    fn check_stream(&self, stream: &CudaStream) -> Result<()> {
+        if **stream.context() != *self.inner.context {
+            return Err(Error::Launch(format!(
+                "the stream is in another CUDA context than the one the plan of graph '{}' is instantiated in: use a stream of that context",
+                self.inner.plan.graph()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Bind a call: the externals by name, the device scalars by name, the dimensions and the bucket, the address of every buffer. Every check
+    /// of an external is made here (and none of a step): see [`PlanRun::launch`].
+    fn bind(&self, externals: &[(&str, TensorArg<'_>)], devscalars: &[(&str, DevScalar)]) -> Result<Bound> {
+        let inner = &*self.inner;
+        let plan = &inner.plan;
+        let buffers = plan.buffers();
+        let graph = plan.graph();
+        let list = |keep: &dyn Fn(BufferRole) -> bool| -> String {
+            buffers
+                .iter()
+                .filter(|b| keep(b.role))
+                .map(|b| format!("{} ({})", b.name, b.role))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        // -- the names
+        let mut given: Vec<Option<usize>> = vec![None; buffers.len()];
+        for (k, (name, _)) in externals.iter().enumerate() {
+            match inner.by_name.get(*name).copied() {
+                None => {
+                    return Err(Error::Launch(format!(
+                        "'{name}' is not a buffer of the plan of graph '{graph}'; its externals are {}",
+                        list(&|r| r.is_external())
+                    )));
+                }
+                Some(i) if buffers[i].role == BufferRole::Devscalar => {
+                    return Err(Error::Launch(format!(
+                        "'{name}' is a device scalar: give its value with the device scalars, not a tensor (its slot is in the arena)"
+                    )));
+                }
+                Some(i) if !buffers[i].role.is_external() => {
+                    return Err(Error::Launch(format!(
+                        "'{name}' is the {} '{name}' of the plan, which lives in its arena: a call gives the externals only ({})",
+                        buffers[i].role,
+                        list(&|r| r.is_external())
+                    )));
+                }
+                Some(i) if given[i].is_some() => {
+                    return Err(Error::Launch(format!("the external '{name}' is given twice")));
+                }
+                Some(i) => given[i] = Some(k),
+            }
+        }
+        if let Some(missing) = (0..buffers.len()).find(|i| buffers[*i].role.is_external() && given[*i].is_none()) {
+            return Err(Error::Launch(format!(
+                "the external '{}' ({}) of graph '{graph}' is missing: a call gives every one of {}",
+                buffers[missing].name,
+                buffers[missing].role,
+                list(&|r| r.is_external())
+            )));
+        }
+        let mut values: Vec<Option<DevScalar>> = vec![None; buffers.len()];
+        for (name, value) in devscalars {
+            match inner.by_name.get(*name).copied() {
+                Some(i) if buffers[i].role == BufferRole::Devscalar => {
+                    if values[i].is_some() {
+                        return Err(Error::Launch(format!("the device scalar '{name}' is given twice")));
+                    }
+                    values[i] = Some(*value);
+                }
+                _ => {
+                    return Err(Error::Launch(format!(
+                        "'{name}' is not a device scalar of the plan of graph '{graph}'; its device scalars are [{}]",
+                        list(&|r| r == BufferRole::Devscalar)
+                    )));
+                }
+            }
+        }
+        let mut slots = Vec::new();
+        for (i, b) in buffers.iter().enumerate().filter(|(_, b)| b.role == BufferRole::Devscalar) {
+            let Some(value) = values[i] else {
+                return Err(Error::Launch(format!(
+                    "the device scalar '{}' of graph '{graph}' has no value: a call gives every one of [{}]",
+                    b.name,
+                    list(&|r| r == BufferRole::Devscalar)
+                )));
+            };
+            let offset = b.offset.expect("a device scalar lives in the arena");
+            slots.push(Slot { name: b.name.clone(), offset, dtype: b.dtype, bytes: value.encode(b.dtype, &b.name)? });
+        }
+
+        // -- each external on its own: device, context, dtype, rank, density, and that the plan may write it
+        let tensor = |i: usize| &externals[given[i].expect("checked above")].1;
+        for (i, b) in buffers.iter().enumerate().filter(|(_, b)| b.role.is_external()) {
+            let t = tensor(i);
+            let name = b.name.as_str();
+            if t.device != inner.device || t.context.is_some_and(|c| c != inner.context.cu_ctx() as usize) {
+                return Err(Error::precondition(
+                    PreconditionKind::Device,
+                    Some(name),
+                    format!(
+                        "the external '{name}' is memory of device {} or of another CUDA context than the plan's (device {})",
+                        t.device, inner.device
+                    ),
+                ));
+            }
+            if t.dtype != b.dtype {
+                return Err(Error::precondition(
+                    PreconditionKind::Dtype,
+                    Some(name),
+                    format!("the external '{name}' has dtype {}, but the plan has {}", t.dtype.name(), b.dtype.name()),
+                ));
+            }
+            if t.shape.len() != b.shape.len() {
+                return Err(Error::precondition(
+                    PreconditionKind::Rank,
+                    Some(name),
+                    format!(
+                        "the external '{name}' has rank {} (shape {:?}), but the plan has rank {} ({})",
+                        t.shape.len(),
+                        t.shape,
+                        b.shape.len(),
+                        b.shape.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+                    ),
+                ));
+            }
+            if let Some(strides) = t.strides
+                && !dense(t.shape, strides)
+            {
+                return Err(Error::precondition(
+                    PreconditionKind::Contiguous,
+                    Some(name),
+                    format!(
+                        "the external '{name}' is not contiguous (shape {:?}, strides {strides:?}): a tensor of a plan is dense and row-major",
+                        t.shape
+                    ),
+                ));
+            }
+            if b.role.is_writable() && t.access == Access::In {
+                return Err(Error::precondition(
+                    PreconditionKind::Access,
+                    Some(name),
+                    format!(
+                        "the external '{name}' is a read-only tensor, but the plan writes it ({}): give a TensorMut",
+                        b.role
+                    ),
+                ));
+            }
+        }
+
+        // -- the dimensions, bound from the shapes of the parameters (as a single launch binds them), and the bucket
+        let mut dims: Vec<Option<i64>> = vec![None; inner.syms.len()];
+        let mut pending: Vec<(usize, usize, i64)> = Vec::new();
+        for (i, b) in buffers.iter().enumerate().filter(|(_, b)| b.role.is_parameter()) {
+            for (axis, size) in tensor(i).shape.iter().enumerate() {
+                let actual = i64::try_from(*size).map_err(|_| {
+                    Error::precondition(PreconditionKind::Shape, Some(&b.name), "a size does not fit 64 bits")
+                })?;
+                pending.push((i, axis, actual));
+            }
+        }
+        loop {
+            let mut progress = false;
+            let mut rest = Vec::with_capacity(pending.len());
+            for (i, axis, actual) in pending {
+                let pattern = &inner.patterns[i][axis];
+                let solved = match pattern.expr.static_value() {
+                    // an expression that folds to a constant (`4`, `M - M + 4`) is checked as one
+                    Some(expected) if expected == i128::from(actual) => Ok(Solved::Checked),
+                    Some(expected) => {
+                        Err(Unsolvable::Mismatch { expected: i64::try_from(expected).unwrap_or(i64::MAX) })
+                    }
+                    None => pattern.solve_from(actual, &dims, 1),
+                };
+                match solved {
+                    Ok(Solved::Checked) => progress = true,
+                    Ok(Solved::Bound(var, value)) => {
+                        dims[var] = Some(value);
+                        progress = true;
+                    }
+                    Ok(Solved::Stuck) => rest.push((i, axis, actual)),
+                    Err(e) => return Err(self.unsolvable(i, axis, actual, e)),
+                }
+            }
+            pending = rest;
+            if pending.is_empty() || !progress {
+                break;
+            }
+        }
+        let mut chosen: Vec<(&str, u64)> = Vec::with_capacity(plan.dims().len());
+        for (d, (name, allowed)) in plan.dims().iter().enumerate() {
+            let Some(value) = dims[d] else {
+                return Err(Error::precondition(
+                    PreconditionKind::Bucket,
+                    Some(name),
+                    format!("the dimension {name} of graph '{graph}' is not determined by the externals"),
+                ));
+            };
+            if value < 1 || !allowed.contains(&(value as u64)) {
+                return Err(Error::precondition(
+                    PreconditionKind::Bucket,
+                    Some(name),
+                    format!(
+                        "dimension {name} is {value}, which is not one of the buckets {allowed:?} of the plan of graph '{graph}'; a bucketed \
+                         dimension must equal a bucket exactly (there is no padding: pad or slice in the host)"
+                    ),
+                ));
+            }
+            chosen.push((name.as_str(), value as u64));
+        }
+        let index = plan.bucket_index(&chosen).expect("every combination of the dims is a bucket");
+        let Some(bucket) = inner.buckets.iter().position(|b| b.index == index) else {
+            let have: Vec<String> =
+                inner.buckets.iter().map(|b| describe_values(&plan.buckets()[b.index].values)).collect();
+            return Err(Error::precondition(
+                PreconditionKind::Bucket,
+                chosen.first().map(|(n, _)| *n),
+                format!(
+                    "the externals select the bucket {} of graph '{graph}', but this run was instantiated for {} only: instantiate the plan for it \
+                     (LaunchPlan::instantiate, or instantiate_all)",
+                    describe_values(&plan.buckets()[index].values),
+                    have.join(", ")
+                ),
+            ));
+        };
+        let shapes = &plan.buckets()[index].shapes;
+
+        // -- every external has its shape at the bucket; none overlaps the arena, and none that is written overlaps another
+        let arena = (u128::from(inner.arena_addr), u128::from(inner.arena_addr) + u128::from(plan.arena_bytes()));
+        let mut ranges: Vec<(usize, u128, u128)> = Vec::new();
+        for (i, b) in buffers.iter().enumerate().filter(|(_, b)| b.role.is_external()) {
+            let t = tensor(i);
+            if t.shape != shapes[i].as_slice() {
+                return Err(Error::precondition(
+                    PreconditionKind::Shape,
+                    Some(&b.name),
+                    format!(
+                        "the external '{}' has shape {:?}, but at {} the plan has {:?}",
+                        b.name,
+                        t.shape,
+                        describe_values(&plan.buckets()[index].values),
+                        shapes[i]
+                    ),
+                ));
+            }
+            let bytes = shapes[i].iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128)) * b.dtype.size() as u128;
+            let (lo, hi) = (u128::from(t.ptr), u128::from(t.ptr) + bytes);
+            if plan.arena_bytes() > 0 && lo < arena.1 && arena.0 < hi {
+                return Err(Error::precondition(
+                    PreconditionKind::Alias,
+                    Some(&b.name),
+                    format!(
+                        "'{}' overlaps the arena of the plan (the memory the plan keeps its intermediates, device scalars and workspace in): a \
+                         tensor of the caller must not be in it",
+                        b.name
+                    ),
+                ));
+            }
+            ranges.push((i, lo, hi));
+        }
+        for &(w, lo, hi) in ranges.iter().filter(|(i, _, _)| buffers[*i].role.is_writable()) {
+            if let Some(&(other, _, _)) = ranges.iter().find(|(o, olo, ohi)| *o != w && lo < *ohi && *olo < hi) {
+                return Err(Error::precondition(
+                    PreconditionKind::Alias,
+                    Some(&buffers[w].name),
+                    format!(
+                        "'{}' is written by the plan but overlaps '{}': the tensors of a plan must not alias when one of them is written",
+                        buffers[w].name, buffers[other].name
+                    ),
+                ));
+            }
+        }
+        let bases = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| match b.offset {
+                Some(offset) => inner.arena_addr + offset,
+                None => tensor(i).ptr,
+            })
+            .collect();
+        Ok(Bound { bucket, bases, slots })
+    }
+
+    fn unsolvable(&self, buffer: usize, axis: usize, actual: i64, e: Unsolvable) -> Error {
+        let b = &self.inner.plan.buffers()[buffer];
+        let pattern = &self.inner.patterns[buffer][axis];
+        let head = format!("the external '{}' has size {actual} on axis {axis}", b.name);
+        let name = Some(b.name.as_str());
+        match e {
+            Unsolvable::Mismatch { expected } if pattern.is_static => Error::precondition(
+                PreconditionKind::StaticSize,
+                name,
+                format!("{head}, but the plan has {expected} there"),
+            ),
+            Unsolvable::Mismatch { expected } => Error::precondition(
+                PreconditionKind::Shape,
+                name,
+                format!("{head}, but the plan has {} = {expected} there", pattern.text),
+            ),
+            Unsolvable::NotWhole { var, target, coefficient } => Error::precondition(
+                PreconditionKind::Shape,
+                name,
+                format!(
+                    "{head}, which cannot be {} (it would need {} = {target}/{coefficient})",
+                    pattern.text,
+                    self.inner.syms.name(var)
+                ),
+            ),
+            Unsolvable::NotPositive { var, value } => Error::precondition(
+                PreconditionKind::Shape,
+                name,
+                format!(
+                    "{head}, which cannot be {} (it would need {} = {value})",
+                    pattern.text,
+                    self.inner.syms.name(var)
+                ),
+            ),
+            Unsolvable::Eval(message) => Error::Launch(format!("{head}: {message}")),
+        }
+    }
+
+    /// Every step of the bound bucket checked with the addresses of the call, as a single launch is checked: the grid and the parameters of
+    /// each kernel, the addresses of each GEMM. A refusal is the step's, and nothing is launched.
+    fn ready(&self, bound: &Bound) -> Result<Vec<Ready<'_>>> {
+        let inner = &*self.inner;
+        let plan = &inner.plan;
+        let bucket = &inner.buckets[bound.bucket];
+        let combo = &plan.buckets()[bucket.index];
+        let region_bytes =
+            |i: usize| combo.shapes[i].iter().product::<usize>() as u64 * plan.buffers()[i].dtype.size() as u64;
+        let mut ready = Vec::with_capacity(bucket.steps.len());
+        for (si, step) in bucket.steps.iter().enumerate() {
+            let what = format!("step #{si} ({}) at {}", step.stem, describe_values(&combo.values));
+            let mut args: Vec<TensorArg<'_>> = Vec::with_capacity(step.args.len() + 1);
+            for a in &step.args {
+                let region = ffi::plan::check_region(bound.bases[a.buffer], region_bytes(a.buffer), inner.device);
+                let arg = match &a.view {
+                    Some((strides, offset)) => {
+                        TensorArg::new_strided(region, &a.shape, strides, *offset, a.dtype, a.access)
+                    }
+                    None => TensorArg::new(region, &a.shape, a.dtype, a.access),
+                };
+                args.push(arg.map_err(|e| in_step(e, &what))?);
+            }
+            ready.push(match &step.op {
+                Op::Kernel(kernel) => {
+                    Ready::Kernel(kernel, Box::new(kernel.check(&args).map_err(|e| in_step(e, &what))?))
+                }
+                Op::Gemm(gemm) => {
+                    let (w, shape) = step.workspace.as_ref().expect("a library step has a workspace");
+                    let region = ffi::plan::check_region(bound.bases[*w], region_bytes(*w), inner.device);
+                    args.push(TensorArg::new(region, shape, DType::U8, Access::InOut).map_err(|e| in_step(e, &what))?);
+                    Ready::Gemm(gemm, gemm.check_call(&args).map_err(|e| in_step(e, &what))?)
+                }
+            });
+        }
+        Ok(ready)
+    }
+
+    /// Check a call as [`PlanRun::launch`] does, and launch nothing.
+    pub fn check(&self, externals: &[(&str, TensorArg<'_>)], devscalars: &[(&str, DevScalar)]) -> Result<()> {
+        let bound = self.bind(externals, devscalars)?;
+        self.ready(&bound).map(drop)
+    }
+
+    /// Run the plan on `stream`: the externals by name (`TensorRef` for a buffer the plan reads, `TensorMut` for one it writes: an `output` or
+    /// an `inout`), a value for every device scalar.
+    ///
+    /// The checks, all before anything is enqueued (**a refusal launches nothing and writes nothing**, not even a device scalar): every external
+    /// is given once and nothing else is; each is on the plan's device and in its context, has the dtype and the rank of its buffer, is dense,
+    /// and may be written where the plan writes it; the dimensions are bound from the shapes of the parameters (`3*M` against 192 gives
+    /// `M = 64`), every one is bound to one of its buckets, and the bucket is one the run was instantiated for; every external has its buffer's
+    /// shape at the bucket, none overlaps the arena, and none that is written overlaps another; and every step is checked with the real
+    /// addresses as a single launch of its entry is. Then the device scalars are written into their slots, on `stream`, and the steps are
+    /// launched in order on `stream`: nothing is allocated.
+    ///
+    /// Ordering: as for [`Kernel::launch`], for every external made of a cudarc slice (cudarc's tracking on `stream`, the slice's own stream
+    /// waiting for the end of the plan, a written slice's own stream waited for first), and for the arena, which every launch writes: a
+    /// launch on another stream than the one the run was instantiated on waits for that stream first, and that stream waits for the end of
+    /// the launch, so two launches of one run, or a launch and a replay, never overlap. A launch is refused while `stream`, or a stream an
+    /// external or the arena is freed on, captures a CUDA graph ([`PlanRun::capture`] is how a plan is captured). An `Err` from a driver
+    /// call may come after some steps were enqueued, as for a single launch.
+    pub fn launch(
+        &self,
+        stream: &Arc<CudaStream>,
+        externals: &mut [(&str, TensorArg<'_>)],
+        devscalars: &[(&str, DevScalar)],
+    ) -> Result<()> {
+        self.check_stream(stream)?;
+        let bound = self.bind(externals, devscalars)?;
+        let ready = self.ready(&bound)?;
+        let shape = [self.inner.plan.arena_bytes() as usize];
+        let mut arena = self.inner.lock_arena();
+        let launched = {
+            let mut tensors: Vec<TensorArg<'_>> = externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
+            if let Some(slice) = arena.slice.as_mut() {
+                tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
+            }
+            let slots = bound.slots.as_slice();
+            ffi::ordered(stream, &mut tensors, |tensors, want_end| {
+                tracked(stream, tensors, slots, want_end, |stream| ffi::plan::enqueue_steps(stream, &ready))
+            })
+        };
+        arena.slots_of = 0;
+        launched
+    }
+
+    /// Capture the plan in a CUDA graph on `stream`, for the bucket the externals select: the returned [`CapturedPlan`] holds the graph and this
+    /// instantiation (its arena), and **borrows the externals for `'ext`**, so the graph cannot be replayed after any memory it captured is
+    /// gone: a slice an external is made of cannot be dropped, or moved, while the `CapturedPlan` lives.
+    ///
+    /// Everything [`PlanRun::launch`] checks is checked first (a refusal captures nothing); then the steps are captured on `stream`
+    /// (`CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`), which must not be capturing already. Nothing runs, and nothing is allocated: the workspace and
+    /// the device scalars are in the arena, every function and handle was loaded when the plan was instantiated. `devscalars` are the values the
+    /// first replay reads (see [`CapturedPlan::set_devscalar`]).
+    pub fn capture<'ext>(
+        &self,
+        stream: &Arc<CudaStream>,
+        externals: Vec<(&str, TensorArg<'ext>)>,
+        devscalars: &[(&str, DevScalar)],
+    ) -> Result<CapturedPlan<'ext>> {
+        self.check_stream(stream)?;
+        let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
+        if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+            return Err(Error::Launch(
+                "the stream is capturing a CUDA graph already: a plan is captured on a stream that is not".to_owned(),
+            ));
+        }
+        let bound = self.bind(&externals, devscalars)?;
+        let ready = self.ready(&bound)?;
+        stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(Error::driver("cuStreamBeginCapture"))?;
+        let enqueued = ffi::plan::enqueue_steps(stream, &ready);
+        // the capture is ended whatever happened, so that the stream is usable again (a graph of a failed capture is dropped)
+        let ended = stream.end_capture(CUgraphInstantiate_flags(0)).map_err(Error::driver("cuStreamEndCapture"));
+        enqueued?;
+        let graph = ended?.ok_or_else(|| Error::Launch("the capture made no graph".to_owned()))?;
+        drop(ready);
+        let id = self.inner.captures.fetch_add(1, Ordering::Relaxed) + 1;
+        Ok(CapturedPlan {
+            graph,
+            captured_on: Arc::clone(stream),
+            run: self.clone(),
+            bucket: bound.bucket,
+            externals: externals.into_iter().map(|(n, t)| (n.to_owned(), t)).collect(),
+            slots: bound.slots,
+            id,
+            current: false,
+        })
+    }
+}
+
+/// Whether a tensor of this shape and these element strides is dense and row-major, the strides of its size-1 axes not looked at (torch's
+/// `is_contiguous`).
+fn dense(shape: &[usize], strides: &[usize]) -> bool {
+    let mut expected = 1u128;
+    for (n, s) in shape.iter().zip(strides).rev() {
+        if *n == 1 {
+            continue;
+        }
+        if *s as u128 != expected {
+            return false;
+        }
+        expected = expected.saturating_mul(*n as u128);
+    }
+    true
+}
+
+/// A launch plan captured in a CUDA graph, for one bucket and one set of externals: replayed with [`CapturedPlan::replay`].
+///
+/// It owns the graph and the instantiation it was captured from (so the arena outlives the graph), and borrows the externals for `'ext` (so
+/// their memory outlives it too). A graph holds addresses, not contents: write new contents into the externals between replays (through
+/// [`CapturedPlan::external_mut`], for an external given as a `TensorMut`), and set the device scalars with [`CapturedPlan::set_devscalar`].
+pub struct CapturedPlan<'ext> {
+    // the graph first: it is destroyed before the instantiation it captured (and the borrows end after both)
+    graph: CudaGraph,
+    captured_on: Arc<CudaStream>,
+    run: PlanRun,
+    bucket: usize,
+    externals: Vec<(String, TensorArg<'ext>)>,
+    slots: Vec<Slot>,
+    /// Distinct among the captures of one instantiation: whose device scalar values the arena's slots hold.
+    id: u64,
+    /// Whether the slots hold this graph's values (set by a replay, cleared by `set_devscalar`).
+    current: bool,
+}
+
+impl std::fmt::Debug for CapturedPlan<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedPlan")
+            .field("graph", &self.run.inner.plan.graph())
+            .field("bucket", &self.bucket())
+            .field("externals", &self.externals.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'ext> CapturedPlan<'ext> {
+    /// The instantiation the graph was captured from.
+    pub fn run(&self) -> &PlanRun {
+        &self.run
+    }
+
+    /// The bucket combination the graph runs.
+    pub fn bucket(&self) -> &[(String, u64)] {
+        let inner = &self.run.inner;
+        &inner.plan.buckets()[inner.buckets[self.bucket].index].values
+    }
+
+    /// Replay the graph on `stream` (a stream of the plan's context; the one it was captured on, or another).
+    ///
+    /// The device scalars are written into their slots first, on `stream`, when the slots do not hold this graph's values (it was never
+    /// replayed, a value was set, or a launch or another graph of the instantiation wrote them since). The externals and the arena are ordered
+    /// exactly as for [`PlanRun::launch`]: a replay is refused while a stream captures, waits for the earlier uses of what it writes, and the
+    /// streams the externals and the arena are freed on wait for its end.
+    pub fn replay(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        self.run.check_stream(stream)?;
+        let inner = &*self.run.inner;
+        let shape = [inner.plan.arena_bytes() as usize];
+        let mut arena = inner.lock_arena();
+        let write = !(self.current && arena.slots_of == self.id);
+        let replayed = {
+            let mut tensors: Vec<TensorArg<'_>> = self.externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
+            if let Some(slice) = arena.slice.as_mut() {
+                tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
+            }
+            let slots: &[Slot] = if write { &self.slots } else { &[] };
+            let (graph, captured_on) = (&self.graph, &self.captured_on);
+            ffi::ordered(stream, &mut tensors, |tensors, want_end| {
+                tracked(stream, tensors, slots, want_end, |stream| ffi::plan::launch_graph(graph, captured_on, stream))
+            })
+        };
+        match replayed {
+            Ok(()) => {
+                if write {
+                    arena.slots_of = self.id;
+                    self.current = true;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                arena.slots_of = 0; // what the slots hold is not known: the next replay writes them
+                Err(e)
+            }
+        }
+    }
+
+    /// Set the value of the device scalar `name` for the next replays. It is written into its slot of the arena by the next replay, on that
+    /// replay's stream, before the graph.
+    pub fn set_devscalar(&mut self, name: &str, value: impl Into<DevScalar>) -> Result<()> {
+        let Some(slot) = self.slots.iter_mut().find(|s| s.name == name) else {
+            let names: Vec<&str> = self.slots.iter().map(|s| s.name.as_str()).collect();
+            return Err(Error::Launch(format!(
+                "'{name}' is not a device scalar of the plan; its device scalars are {names:?}"
+            )));
+        };
+        slot.bytes = value.into().encode(slot.dtype, name)?;
+        self.current = false;
+        Ok(())
+    }
+
+    fn external_arg(&self, name: &str) -> Result<&TensorArg<'ext>> {
+        self.externals.iter().find(|(n, _)| n == name).map(|(_, t)| t).ok_or_else(|| {
+            let names: Vec<&str> = self.externals.iter().map(|(n, _)| n.as_str()).collect();
+            Error::Launch(format!("'{name}' is not an external of the captured plan; its externals are {names:?}"))
+        })
+    }
+
+    /// The memory the external `name` was made of (the whole cudarc slice or view, as bytes), to read: an output after a replay, say. Reading
+    /// it through cudarc on any stream is ordered after the replays by cudarc's tracking (the replays record their use on the slice).
+    pub fn external(&self, name: &str) -> Result<CudaView<'_, u8>> {
+        let missing = || Error::Launch(format!("the memory of the external '{name}' has no bytes to view"));
+        match &self.external_arg(name)?.backing {
+            Backing::Read(memory) => memory.bytes_from(0).ok_or_else(missing),
+            Backing::Write(memory) => memory.bytes().ok_or_else(missing),
+            Backing::Raw => Err(Error::Launch(format!(
+                "the external '{name}' is a region the host vouched for (DevicePtr::from_raw): its memory is the host's"
+            ))),
+        }
+    }
+
+    /// The memory the external `name` was made of (the whole cudarc slice or view, as bytes), to write new contents into between replays: an
+    /// input, say. Only an external given as a `TensorMut` (an exclusive borrow) can be written while the graph holds it. A write through
+    /// cudarc is ordered after the replays that read the memory, and before the next one, by cudarc's tracking.
+    pub fn external_mut(&mut self, name: &str) -> Result<CudaViewMut<'_, u8>> {
+        self.external_arg(name)?;
+        let position = self.externals.iter().position(|(n, _)| n == name).expect("an external");
+        match &mut self.externals[position].1.backing {
+            Backing::Write(memory) => memory
+                .bytes_mut()
+                .ok_or_else(|| Error::Launch(format!("the memory of the external '{name}' has no bytes to view"))),
+            Backing::Read(_) => Err(Error::Launch(format!(
+                "the external '{name}' was given read-only (a TensorRef: a shared borrow, which other code may read too): give a TensorMut to \
+                 write it between replays"
+            ))),
+            Backing::Raw => Err(Error::Launch(format!(
+                "the external '{name}' is a region the host vouched for (DevicePtr::from_raw): its memory is the host's"
+            ))),
+        }
+    }
+}

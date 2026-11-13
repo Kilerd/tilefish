@@ -83,7 +83,7 @@ pub enum Error {
     #[error("{0}")]
     Manifest(String),
     /// The pin is not a sha256 in lowercase hex.
-    #[error("the pin must be the 64 lowercase hex digits of a manifest digest, got {0:?}")]
+    #[error("the pin must be the 64 lowercase hex digits of a digest (of a manifest, or of a plan), got {0:?}")]
     BadPin(String),
     /// The manifest has another digest than the pinned one.
     #[error(
@@ -93,6 +93,24 @@ pub enum Error {
     PinMismatch {
         /// Where the manifest was read from.
         directory: String,
+        /// The digest of what was read.
+        found: String,
+        /// The digest that was pinned.
+        pinned: String,
+    },
+    /// A launch plan (`plan.json`) is refused: it is not strict JSON of schema `tilefish.plan.v1`, a rule of the format does not hold
+    /// (`docs/plan-schema-1.md`), it was edited after it was written, or it was built against another manifest than the one next to it, or a
+    /// step is not what the manifest's entry says.
+    #[error("{0}")]
+    Plan(String),
+    /// The plan has another digest than the pinned one.
+    #[error(
+        "the plan in {path:?} has digest {found}, but the pin is {pinned}: it is not the plan that was pinned (it was changed, or it is \
+         another export)"
+    )]
+    PlanPinMismatch {
+        /// Where the plan was read from.
+        path: String,
         /// The digest of what was read.
         found: String,
         /// The digest that was pinned.

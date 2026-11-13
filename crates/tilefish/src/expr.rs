@@ -241,6 +241,24 @@ impl Affine {
         Some(Self { c: self.c / d, terms: self.terms.iter().map(|(a, c)| (a.clone(), c / d)).collect() })
     }
 
+    /// The value of the affine form under `dims` (`None` while an atom it keeps mentions an unbound dimension): what Python's `subst` of the
+    /// folded expression gives, so a dimension that cancels (`M + N - N`) needs no value.
+    pub fn eval(&self, dims: &[Option<i64>]) -> Result<Option<i64>, String> {
+        let mut acc = self.c;
+        for (atom, c) in &self.terms {
+            let value = match atom {
+                Atom::Var(i) => dims.get(*i).copied().flatten(),
+                Atom::Opaque(e) => e.eval(dims)?,
+            };
+            let Some(value) = value else { return Ok(None) };
+            acc = c
+                .checked_mul(i128::from(value))
+                .and_then(|p| acc.checked_add(p))
+                .ok_or("a dimension expression overflows")?;
+        }
+        i64::try_from(acc).map(Some).map_err(|_| format!("the value {acc} does not fit 64 bits"))
+    }
+
     /// The coefficient of the dimension `var` (0 when it does not occur as an atom of its own).
     pub fn coefficient(&self, var: usize) -> i128 {
         self.terms.iter().find(|(a, _)| *a == Atom::Var(var)).map_or(0, |(_, c)| *c)

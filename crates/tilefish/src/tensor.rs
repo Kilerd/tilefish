@@ -305,6 +305,26 @@ impl<'a> TensorArg<'a> {
         self.ptr
     }
 
+    /// The same tensor, borrowing this one: for a call that hands it to a launch and keeps it (a written slice is reborrowed exclusively).
+    pub(crate) fn reborrow(&mut self) -> TensorArg<'_> {
+        TensorArg {
+            ptr: self.ptr,
+            shape: self.shape,
+            strides: self.strides,
+            byte_offset: self.byte_offset,
+            dtype: self.dtype,
+            device: self.device,
+            context: self.context,
+            owner: self.owner.clone(),
+            access: self.access,
+            backing: match &mut self.backing {
+                Backing::Raw => Backing::Raw,
+                Backing::Read(memory) => Backing::Read(*memory),
+                Backing::Write(memory) => Backing::Write(&mut **memory),
+            },
+        }
+    }
+
     /// The shape.
     pub fn shape(&self) -> &'a [usize] {
         self.shape

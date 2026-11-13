@@ -160,17 +160,68 @@
 //!   refused while the launch stream, or a stream a slice is freed on, is capturing** (an `Error::Launch`; in every context: cudarc's
 //!   own waits would only refuse it in one that tracks events, and a kernel launched on `ctx.per_thread_stream()` would otherwise be
 //!   captured with the slices' addresses, and a replay after the free would write into reused memory). There is nothing to switch
-//!   off: do not turn cudarc's event tracking off to capture slices, it leaves exactly the graph that outlives its memory.
+//!   off: do not turn cudarc's event tracking off to capture slices, it leaves exactly the graph that outlives its memory. **A whole launch
+//!   plan is captured safely** with [`PlanRun::capture`] (below): the graph it returns borrows what it captured.
+//!
+//! # Launch plans
+//!
+//! A *launch plan* (`plan.json`, `docs/plan-schema-1.md`) is a `@tilefish.graph` compiled by Python into, for every bucket of its dimensions,
+//! the ordered launches of manifest entries over the caller's tensors (the *externals*) and one *arena* (the intermediates, the device scalars,
+//! the cuBLASLt workspace). [`LaunchPlan::load`] reads and verifies it (a pin, the digests, every rule of the format, the manifest it was built
+//! against, every step against its entry); [`LaunchPlan::instantiate`] loads its kernels and GEMMs and allocates the arena, once;
+//! [`PlanRun::launch`] runs a whole forward pass, checking every step before the first launch; [`PlanRun::capture`] captures it in a CUDA
+//! graph, a [`CapturedPlan`] that owns the instantiation and borrows the externals, so its safe [`CapturedPlan::replay`] can never run on
+//! memory that is gone.
+//!
+//! ```no_run
+//! use tilefish::cudarc::driver::CudaContext;
+//! use tilefish::{Bf16, DevScalar, LaunchPlan, Pin, TensorMut, TensorRef};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # if !tilefish::driver_available() { return Ok(()); }
+//! let plan = LaunchPlan::load("build/", Pin::Digest("<the digest of the plan, which tilefish.runtime.export returned>"))?;
+//! let ctx = CudaContext::new(0)?;
+//! let stream = ctx.new_stream()?;
+//! let run = plan.instantiate_all(&stream)?; // every bucket: the binaries, the arena; nothing is allocated after this
+//! // (a graph of one input `x`, one returned value `out0` and one device scalar `n`; the weights would be more `TensorRef`s)
+//! let (x_shape, y_shape) = ([64usize, 256], [64usize, 256]);
+//! let (mut x, mut y) = (stream.alloc_zeros::<u8>(64 * 256 * 2)?, stream.alloc_zeros::<u8>(64 * 256 * 2)?);
+//! // one forward pass: the bucket is the one the shapes select (M = 64), the device scalar is written into its slot first
+//! run.launch(
+//!     &stream,
+//!     &mut [
+//!         ("x", TensorRef::<Bf16>::from_cuda(&x, &x_shape)?.into_arg()),
+//!         ("out0", TensorMut::<Bf16>::from_cuda(&mut y, &y_shape)?.into_arg()),
+//!     ],
+//!     &[("n", DevScalar::Int(64))],
+//! )?;
+//! // the same, captured: the graph borrows x and y, so they cannot be freed while it can be replayed
+//! let mut graph = run.capture(
+//!     &stream,
+//!     vec![
+//!         ("x", TensorMut::<Bf16>::from_cuda(&mut x, &x_shape)?.into_arg()), // a TensorMut: rewritten between replays
+//!         ("out0", TensorMut::<Bf16>::from_cuda(&mut y, &y_shape)?.into_arg()),
+//!     ],
+//!     &[("n", DevScalar::Int(64))],
+//! )?;
+//! graph.replay(&stream)?;
+//! stream.memcpy_htod(&vec![0u8; 64 * 256 * 2], &mut graph.external_mut("x")?)?; // new contents, the same address
+//! graph.set_devscalar("n", 17)?;
+//! graph.replay(&stream)?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # `unsafe`
 //!
-//! The CUDA driver is cudarc's safe layer (contexts, modules, functions, attributes, streams, the launch builder), with two calls to
-//! `cudarc::driver::sys` in this crate, the probe of [`driver_available`] and the query of the parameter sizes of a loaded function
-//! (`cuFuncGetParamInfo`); cuBLASLt is cudarc's `cublaslt::result` and `sys` (its safe `CudaBlasLT::matmul` always runs the heuristic and
-//! cannot take a pinned algorithm). There is no hand-written driver FFI. A kernel or a GEMM holds the context it was loaded in
+//! The CUDA driver is cudarc's safe layer (contexts, modules, functions, attributes, streams, the launch builder, graphs), with three calls to
+//! `cudarc::driver::sys` in this crate, the probe of [`driver_available`], the query of the parameter sizes of a loaded function
+//! (`cuFuncGetParamInfo`) and the eager load of a function of a plan (`cuFuncLoad`), and one to `cudarc::driver::result`, the launch of a
+//! captured graph on another stream than its own; cuBLASLt is cudarc's `cublaslt::result` and `sys` (its safe `CudaBlasLT::matmul` always runs
+//! the heuristic and cannot take a pinned algorithm). There is no hand-written driver FFI. A kernel or a GEMM holds the context it was loaded in
 //! ([`Manifest::kernel`] and [`Manifest::gemm`] take an `&Arc<CudaContext>`), and so keeps it, its module (or its cuBLASLt handle) and its
-//! function alive. The host takes on obligations in exactly two places (and the items of `src/region.rs`, `src/ffi.rs` and
-//! `src/ffi/cublaslt.rs`, the only ones with `unsafe`, each say why they are sound):
+//! function alive. The host takes on obligations in exactly two places (and the items of `src/region.rs`, `src/ffi.rs`,
+//! `src/ffi/cublaslt.rs` and `src/ffi/plan.rs`, the only ones with `unsafe`, each say why they are sound):
 //!
 //! * [`DevicePtr::from_raw`] (`unsafe`): the host vouches for a region of device memory, by address, byte length, device and lifetime:
 //!   that it is allocated there, and stays allocated (and is not raced on) until every launch that was given a tensor made of it has
@@ -198,10 +249,12 @@ mod ffi;
 mod gemm;
 pub mod json;
 mod kernel;
+mod launch_plan;
 mod library;
 mod manifest;
 mod memory;
 mod plan;
+mod plan_run;
 mod region;
 mod tensor;
 
@@ -210,6 +263,10 @@ pub use error::{Error, PreconditionKind, Result};
 pub use ffi::driver_available;
 pub use gemm::{Gemm, cublaslt_version};
 pub use kernel::{Arch, CUstream, CudaContext, CudaStream, Kernel};
+pub use launch_plan::{
+    ARENA_ALIGNMENT, BufferRole, LaunchPlan, PLAN_NAME, PLAN_SCHEMA, PlanArg, PlanBucket, PlanBuffer, PlanStep,
+    PlanView, StepKind, plan_digest,
+};
 pub use library::{LibraryEntry, LibraryImpl};
 pub use manifest::{
     Access, BinarySource, Constexpr, DimInfo, Entry, EntryKind, FixedValue, LaunchAttributes, MANIFEST_NAME,
@@ -218,6 +275,7 @@ pub use manifest::{
 };
 pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, Plan, Prepared};
+pub use plan_run::{CapturedPlan, DevScalar, PlanRun};
 pub use region::DevicePtr;
 pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, TensorArg, TensorMut, TensorRef, U8};
 
@@ -451,4 +509,115 @@ mod safety_doctests {
     /// impl CudaRead for Mine {} // a CudaRead is a type of this crate's list: the supertrait cannot be named, let alone implemented
     /// ```
     fn from_cuda_takes_cudarcs_memory_and_nothing_else() {}
+
+    /// A captured plan borrows the externals it captured: the graph cannot outlive one of them, so it can never be replayed on memory that
+    /// was freed (and reused).
+    ///
+    /// ```no_run
+    /// use tilefish::cudarc::driver::CudaContext;
+    /// use tilefish::{Bf16, LaunchPlan, Pin, TensorMut, TensorRef};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let plan = LaunchPlan::load("build/", Pin::TrustDirectory)?;
+    /// let ctx = CudaContext::new(0)?;
+    /// let stream = ctx.new_stream()?;
+    /// let run = plan.instantiate_all(&stream)?;
+    /// let shape = [64usize, 256];
+    /// let (x, mut y) = (stream.alloc_zeros::<u8>(64 * 256 * 2)?, stream.alloc_zeros::<u8>(64 * 256 * 2)?);
+    /// let externals = vec![
+    ///     ("x", TensorRef::<Bf16>::from_cuda(&x, &shape)?.into_arg()),
+    ///     ("out0", TensorMut::<Bf16>::from_cuda(&mut y, &shape)?.into_arg()),
+    /// ];
+    /// let mut graph = run.capture(&stream, externals, &[])?;
+    /// graph.replay(&stream)?;
+    /// drop(graph);
+    /// drop(x); // after the graph is gone
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use tilefish::cudarc::driver::CudaContext;
+    /// use tilefish::{Bf16, LaunchPlan, Pin, TensorMut, TensorRef};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let plan = LaunchPlan::load("build/", Pin::TrustDirectory)?;
+    /// let ctx = CudaContext::new(0)?;
+    /// let stream = ctx.new_stream()?;
+    /// let run = plan.instantiate_all(&stream)?;
+    /// let shape = [64usize, 256];
+    /// let (x, mut y) = (stream.alloc_zeros::<u8>(64 * 256 * 2)?, stream.alloc_zeros::<u8>(64 * 256 * 2)?);
+    /// let externals = vec![
+    ///     ("x", TensorRef::<Bf16>::from_cuda(&x, &shape)?.into_arg()),
+    ///     ("out0", TensorMut::<Bf16>::from_cuda(&mut y, &shape)?.into_arg()),
+    /// ];
+    /// let mut graph = run.capture(&stream, externals, &[])?;
+    /// drop(x); // the graph holds its address
+    /// graph.replay(&stream)?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use tilefish::cudarc::driver::CudaContext;
+    /// use tilefish::{Bf16, LaunchPlan, Pin, TensorMut, TensorRef};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let plan = LaunchPlan::load("build/", Pin::TrustDirectory)?;
+    /// let ctx = CudaContext::new(0)?;
+    /// let stream = ctx.new_stream()?;
+    /// let run = plan.instantiate_all(&stream)?;
+    /// let shape = [64usize, 256];
+    /// let mut y = stream.alloc_zeros::<u8>(64 * 256 * 2)?;
+    /// let mut graph = {
+    ///     let x = stream.alloc_zeros::<u8>(64 * 256 * 2)?;
+    ///     let externals = vec![
+    ///         ("x", TensorRef::<Bf16>::from_cuda(&x, &shape)?.into_arg()),
+    ///         ("out0", TensorMut::<Bf16>::from_cuda(&mut y, &shape)?.into_arg()),
+    ///     ];
+    ///     run.capture(&stream, externals, &[])?
+    /// }; // x is freed here, and the graph would outlive it
+    /// graph.replay(&stream)?;
+    /// # Ok(()) }
+    /// ```
+    fn a_captured_plan_cannot_outlive_an_external() {}
+
+    /// An external that a captured plan holds is written between replays through the captured plan, and only so: the host's own exclusive
+    /// borrow of it is the graph's for as long as the graph lives.
+    ///
+    /// ```no_run
+    /// use tilefish::cudarc::driver::CudaContext;
+    /// use tilefish::{Bf16, LaunchPlan, Pin, TensorMut};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let plan = LaunchPlan::load("build/", Pin::TrustDirectory)?;
+    /// let ctx = CudaContext::new(0)?;
+    /// let stream = ctx.new_stream()?;
+    /// let run = plan.instantiate_all(&stream)?;
+    /// let shape = [64usize, 256];
+    /// let (mut x, mut y) = (stream.alloc_zeros::<u8>(64 * 256 * 2)?, stream.alloc_zeros::<u8>(64 * 256 * 2)?);
+    /// let externals = vec![
+    ///     ("x", TensorMut::<Bf16>::from_cuda(&mut x, &shape)?.into_arg()),
+    ///     ("out0", TensorMut::<Bf16>::from_cuda(&mut y, &shape)?.into_arg()),
+    /// ];
+    /// let mut graph = run.capture(&stream, externals, &[])?;
+    /// stream.memcpy_htod(&vec![0u8; 64 * 256 * 2], &mut graph.external_mut("x")?)?;
+    /// graph.replay(&stream)?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use tilefish::cudarc::driver::CudaContext;
+    /// use tilefish::{Bf16, LaunchPlan, Pin, TensorMut};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let plan = LaunchPlan::load("build/", Pin::TrustDirectory)?;
+    /// let ctx = CudaContext::new(0)?;
+    /// let stream = ctx.new_stream()?;
+    /// let run = plan.instantiate_all(&stream)?;
+    /// let shape = [64usize, 256];
+    /// let (mut x, mut y) = (stream.alloc_zeros::<u8>(64 * 256 * 2)?, stream.alloc_zeros::<u8>(64 * 256 * 2)?);
+    /// let externals = vec![
+    ///     ("x", TensorMut::<Bf16>::from_cuda(&mut x, &shape)?.into_arg()),
+    ///     ("out0", TensorMut::<Bf16>::from_cuda(&mut y, &shape)?.into_arg()),
+    /// ];
+    /// let mut graph = run.capture(&stream, externals, &[])?;
+    /// stream.memcpy_htod(&vec![0u8; 64 * 256 * 2], &mut x)?; // the graph holds the exclusive borrow of x
+    /// graph.replay(&stream)?;
+    /// # Ok(()) }
+    /// ```
+    fn an_external_of_a_captured_plan_is_written_through_it() {}
 }

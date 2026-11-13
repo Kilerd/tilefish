@@ -25,6 +25,7 @@ use crate::plan::{MAX_PARAMS, NOT_A_TENSOR, Prepared};
 use crate::tensor::{Backing, TensorArg};
 
 pub(crate) mod cublaslt;
+pub(crate) mod plan;
 
 #[cfg(target_endian = "big")]
 compile_error!("tilefish packs a 32-bit kernel argument into the low bytes of a 64-bit slot: little-endian hosts only");
@@ -100,6 +101,30 @@ pub(crate) fn bytes_of_view_mut<'a, E>(view: &'a mut CudaViewMut<'_, E>, from: u
     // SAFETY: as in `bytes_of_slice_mut`.
     let all = unsafe { view.transmute_mut::<u8>(bytes) }?;
     all.chunks_exact_mut(1).nth(usize::try_from(from).ok()?)
+}
+
+/// All the bytes of a cudarc slice that is written, as a view of its whole length (sharing its events).
+#[allow(unsafe_code)]
+pub(crate) fn all_bytes_of_slice_mut<E>(slice: &mut CudaSlice<E>) -> Option<CudaViewMut<'_, u8>> {
+    let bytes = slice.num_bytes();
+    // SAFETY: as in `bytes_of_slice_mut`: a `u8` has no invalid bit pattern and no alignment, and the view covers exactly the bytes of the
+    // slice.
+    unsafe { slice.transmute_mut::<u8>(bytes) }
+}
+
+/// All the bytes of a mutable view of cudarc's, as a view that is read.
+#[allow(unsafe_code)]
+pub(crate) fn all_bytes_of_view_mut<'a, E>(view: &'a CudaViewMut<'_, E>) -> Option<CudaView<'a, u8>> {
+    // SAFETY: as in `bytes_of_slice`.
+    unsafe { view.transmute::<u8>(view.num_bytes()) }
+}
+
+/// All the bytes of a mutable view of cudarc's, as a view that may be written.
+#[allow(unsafe_code)]
+pub(crate) fn all_bytes_of_view_mut_mut<'a, E>(view: &'a mut CudaViewMut<'_, E>) -> Option<CudaViewMut<'a, u8>> {
+    let bytes = view.num_bytes();
+    // SAFETY: as in `bytes_of_slice_mut`.
+    unsafe { view.transmute_mut::<u8>(bytes) }
 }
 
 /// What a launch pushes for one tensor: the value in the slot (a region), the slice itself, or a view of it from the first element on.

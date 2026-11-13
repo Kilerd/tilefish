@@ -21,6 +21,7 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
   ``"strides"`` (element strides, as torch reports them; ``ptr`` is the address of the first element) when it is a view; ``params`` are the values of the
   ``kernelParams``: pointers are addresses, ``i32`` and ``i64`` scalars their integer, a fixed argument its integer or the IEEE bits of an ``f32``, and a Triton
   kernel's two null scratch slots follow (a prebuilt binary has none);
+* ``python_plans.json``: plan documents and what Python decides of each (``export_plan_vectors.py``);
 * ``python_manifests.in``: ``MANIFESTS``, small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
   alphabets; schema 3 with kernels and library entries in every order, every field it added, the spelling of floats, non-ASCII text escaped and as it is,
   and the schemas ``3.0``, ``true``, ``"3"`` and ``4``) and their ``manifest_digest``, which has its own tag per schema; and ``MANIFEST_ERRORS``, documents
@@ -36,6 +37,7 @@ import random
 import struct
 import sys
 
+from export_plan_vectors import plan_vectors_json
 from elf_builder import SHF_ALLOC, SHF_EXECINSTR, SHT_NOBITS, SHT_PROGBITS, S, build_elf, cubin_like
 
 from fake_torch import dense_strides
@@ -641,6 +643,7 @@ def main(argv=None):
         ("python_elf.in", elfs()),
         ("python_manifests.in", manifest_digests()),
         ("python_launches.json", launches_json()),
+        ("python_plans.json", plan_vectors_json()),
     ):
         (directory / name).write_text(text, encoding="utf-8")
 

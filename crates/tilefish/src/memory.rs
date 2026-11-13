@@ -107,6 +107,13 @@ pub(crate) mod sealed {
         /// What cudarc's `device_ptr_mut(stream)` does besides giving the address: `stream` waits for the memory's last read and write, and
         /// the guard, dropped, records the write on the memory's `write` event on `stream`.
         fn sync_write<'b>(&'b mut self, stream: &'b CudaStream) -> SyncOnDrop<'b>;
+
+        /// All the bytes of the memory, as a view that is read (it shares the events of the memory: cudarc orders a use of it as a use of
+        /// the memory).
+        fn bytes(&self) -> Option<CudaView<'_, u8>>;
+
+        /// All the bytes of the memory, as a view that may be written (it shares the events of the memory).
+        fn bytes_mut(&mut self) -> Option<CudaViewMut<'_, u8>>;
     }
 }
 
@@ -190,6 +197,14 @@ impl<E> sealed::Write for CudaSlice<E> {
     fn sync_write<'b>(&'b mut self, stream: &'b CudaStream) -> SyncOnDrop<'b> {
         self.device_ptr_mut(stream).1
     }
+
+    fn bytes(&self) -> Option<CudaView<'_, u8>> {
+        crate::ffi::bytes_of_slice(self, 0)
+    }
+
+    fn bytes_mut(&mut self) -> Option<CudaViewMut<'_, u8>> {
+        crate::ffi::all_bytes_of_slice_mut(self)
+    }
 }
 
 impl<E> sealed::Write for CudaViewMut<'_, E> {
@@ -203,5 +218,13 @@ impl<E> sealed::Write for CudaViewMut<'_, E> {
 
     fn sync_write<'b>(&'b mut self, stream: &'b CudaStream) -> SyncOnDrop<'b> {
         self.device_ptr_mut(stream).1
+    }
+
+    fn bytes(&self) -> Option<CudaView<'_, u8>> {
+        crate::ffi::all_bytes_of_view_mut(self)
+    }
+
+    fn bytes_mut(&mut self) -> Option<CudaViewMut<'_, u8>> {
+        crate::ffi::all_bytes_of_view_mut_mut(self)
     }
 }
