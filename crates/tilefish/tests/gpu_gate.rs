@@ -3,7 +3,7 @@
 //!
 //! Built only with `--features gpu-gate`, and needs
 //!
-//! * `TILEFISH_GATE_GENERATED` (at compile time): the launchers `tilefish.hosts.rust.emit` wrote for the manifest;
+//! * `TILEFISH_GATE_GENERATED` (at compile time): the launchers `tilefish.hosts.rust.emit` wrote for the manifest (with `embed=True`);
 //! * `TILEFISH_GATE_DIR` (at run time): the directory `rust_gate.py prepare` filled: `manifest/` (the manifest directory),
 //!   `cases.json` (each case: the launcher, its tensors, the files of its inputs and of the outputs Python's `replay`
 //!   gave) and the raw bytes of every tensor.
@@ -15,17 +15,17 @@
 //! python rust_gate.py compare $WORK
 //! ```
 //!
-//! The tests: `byte_identity` runs every case and writes every tensor after the launch (outputs, and the inputs, so
-//! that an `InOut` tensor that was updated in place is compared too); `refusals` shows that Rust refuses what Python
-//! refuses (a precondition, a tampered cubin, a wrong pin, a manifest of another architecture); `graph_capture` launches
-//! inside a CUDA graph capture and runs the graph.
+//! The tests: `byte_identity` runs every case and writes every tensor after the launch (outputs, and the inputs, so that an `InOut`
+//! tensor that was updated in place is compared too), through tensors made of cudarc slices (no `unsafe`) and the safe `launch` on a
+//! cudarc stream; `refusals` shows that Rust refuses what Python refuses (a precondition, a tensor that does not fit its region, a
+//! tampered cubin, a wrong pin, a manifest of another architecture); `graph_capture` launches inside a CUDA graph capture, with the
+//! safe `launch` and with `unsafe launch_raw`, and runs the graphs.
 
 #[allow(dead_code)]
 mod generated {
     include!(env!("TILEFISH_GATE_GENERATED"));
 }
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -33,7 +33,8 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _};
 use serde_json::Value;
 use tilefish::{
-    Arch, Bf16, DevicePtr, Error, F16, F32, Manifest, Pin, PreconditionKind, TensorMut, TensorRef, elf::sha256_hex,
+    Arch, Bf16, DevicePtr, Element, Error, F16, F32, Manifest, Pin, PreconditionKind, TensorMut, TensorRef,
+    elf::sha256_hex,
 };
 
 fn gate_dir() -> PathBuf {
@@ -61,88 +62,99 @@ impl Gpu {
         Self { stream: ctx.new_stream().expect("a stream") }
     }
 
-    fn raw(&self) -> sys::CUstream {
-        self.stream.cu_stream()
-    }
-
     fn upload(&self, bytes: &[u8]) -> Buf {
-        let slice = self.stream.clone_htod(bytes).expect("upload");
-        Buf::new(self, slice)
+        Buf { slice: self.stream.clone_htod(bytes).expect("upload"), shape: Vec::new() }
     }
 
     fn zeros(&self, nbytes: usize) -> Buf {
-        Buf::new(self, self.stream.alloc_zeros::<u8>(nbytes).expect("alloc"))
+        Buf { slice: self.stream.alloc_zeros::<u8>(nbytes).expect("alloc"), shape: Vec::new() }
     }
 
     fn download(&self, buf: &Buf) -> Vec<u8> {
         self.stream.synchronize().expect("synchronize");
         self.stream.clone_dtoh(&buf.slice).expect("download")
     }
+
+    /// The region of a buffer, as a raw pointer: only for what a safe constructor cannot do (a misaligned address, a region that
+    /// lies about its length, a tensor made before a graph capture without cudarc's event tracking).
+    ///
+    /// # Safety
+    ///
+    /// The buffer must outlive every launch that uses the region, and the length is the buffer's own unless the test says it lies.
+    unsafe fn region(&self, buf: &Buf, len: u64) -> DevicePtr {
+        // SAFETY: the address is the buffer's, on device 0; see the contract above for the rest.
+        unsafe { DevicePtr::from_raw(buf.slice.device_ptr(&self.stream).0, len, 0) }
+    }
 }
 
-/// A device buffer and its address (taken once, outside of any launch).
+/// A device buffer of bytes and the shape of the tensor it holds.
 struct Buf {
     slice: CudaSlice<u8>,
-    addr: u64,
     shape: Vec<usize>,
 }
 
 impl Buf {
-    fn new(gpu: &Gpu, slice: CudaSlice<u8>) -> Self {
-        let addr = slice.device_ptr(&gpu.stream).0;
-        Self { slice, addr, shape: Vec::new() }
-    }
-
     fn shaped(mut self, shape: &[usize]) -> Self {
         self.shape = shape.to_vec();
         self
     }
 
-    fn ptr(&self) -> DevicePtr {
-        // SAFETY: the buffer is alive as long as `self`, on device 0, and the test sizes it for its shape.
-        unsafe { DevicePtr::from_raw(self.addr) }
+    fn nbytes(&self) -> u64 {
+        self.slice.len() as u64
     }
+}
 
-    fn input<T: tilefish::Element>(&self) -> TensorRef<'_, T> {
-        TensorRef::new(self.ptr(), &self.shape, 0)
-    }
+/// A read-only tensor over a buffer, as cudarc sees it from `stream`: no `unsafe`, and refused when the shape does not fit.
+fn r<'a, T: Element>(b: &'a Buf, s: &'a CudaStream) -> Result<TensorRef<'a, T>, Error> {
+    TensorRef::from_cuda(&b.slice, s, &b.shape)
+}
 
-    fn output<T: tilefish::Element>(&self) -> TensorMut<'_, T> {
-        TensorMut::new(self.ptr(), &self.shape, 0)
-    }
+/// A tensor the kernel writes, over a buffer.
+fn m<'a, T: Element>(b: &'a mut Buf, s: &'a CudaStream) -> Result<TensorMut<'a, T>, Error> {
+    TensorMut::from_cuda(&mut b.slice, s, &b.shape)
 }
 
 fn read(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// Launch the launcher a case names, on typed tensors: a launcher whose signature changed does not compile.
-fn launch(gpu: &Gpu, manifest: &Manifest, launcher: &str, t: &HashMap<String, Buf>) -> Result<(), Error> {
+/// Launch the launcher a case names, on typed tensors made of cudarc slices: a launcher whose signature changed does not compile.
+/// `bufs` are the tensors of the case in the order of the launcher's parameters.
+fn launch(gpu: &Gpu, manifest: &Manifest, launcher: &str, bufs: &mut [Buf]) -> Result<(), Error> {
     use generated::*;
-    let s = gpu.raw();
-    let (i, o) = (Buf::input::<F32>, Buf::output::<F32>);
-    let (ib, ob) = (Buf::input::<Bf16>, Buf::output::<Bf16>);
-    match launcher {
-        "Softmax" => Softmax::load(manifest)?.launch(s, i(&t["x"]), o(&t["out"])),
-        "Layernorm" => Layernorm::load(manifest)?.launch(s, ib(&t["x"]), ib(&t["w"]), ib(&t["b"]), ob(&t["out"])),
-        "ResidualAddRmsnorm" => {
-            ResidualAddRmsnorm::load(manifest)?.launch(s, ib(&t["x"]), o(&t["residual"]), ib(&t["w"]), ob(&t["out"]))
+    let s: &CudaStream = &gpu.stream;
+    match (launcher, bufs) {
+        ("Softmax", [x, o]) => Softmax::load(manifest)?.launch(s, r::<F32>(x, s)?, m::<F32>(o, s)?),
+        ("Layernorm", [x, w, b, o]) => {
+            Layernorm::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, r::<Bf16>(b, s)?, m::<Bf16>(o, s)?)
         }
-        "GeluExact" => GeluExact::load(manifest)?.launch(s, ib(&t["x"]), ob(&t["out"])),
-        "Swiglu" => Swiglu::load(manifest)?.launch(s, ib(&t["gate"]), ib(&t["up"]), ob(&t["out"])),
-        "BucketedRmsDb96" => BucketedRmsDb96::load(manifest)?.launch(s, ib(&t["x"]), ib(&t["w"]), ob(&t["out"])),
-        "BucketedRmsDb512" => BucketedRmsDb512::load(manifest)?.launch(s, ib(&t["x"]), ib(&t["w"]), ob(&t["out"])),
-        "BucketedRmsDb1000" => BucketedRmsDb1000::load(manifest)?.launch(s, ib(&t["x"]), ib(&t["w"]), ob(&t["out"])),
-        "Rmsnorm" => Rmsnorm::load(manifest)?.launch(s, ib(&t["x_ptr"]), ib(&t["w_ptr"]), ob(&t["y_ptr"])),
-        "GeluErf" => GeluErf::load(manifest)?.launch(s, ib(&t["x_ptr"]), ob(&t["y_ptr"])),
-        "Axpy" => Axpy::load(manifest)?.launch(s, i(&t["x_ptr"]), o(&t["y_ptr"])),
-        "Mm" => Mm::load(manifest)?.launch(
+        ("ResidualAddRmsnorm", [x, res, w, o]) => ResidualAddRmsnorm::load(manifest)?.launch(
             s,
-            Buf::input::<F16>(&t["a_ptr"]),
-            Buf::input::<F16>(&t["b_ptr"]),
-            o(&t["c_ptr"]),
+            r::<Bf16>(x, s)?,
+            m::<F32>(res, s)?,
+            r::<Bf16>(w, s)?,
+            m::<Bf16>(o, s)?,
         ),
-        other => panic!("the gate does not know the launcher {other}"),
+        ("GeluExact", [x, o]) => GeluExact::load(manifest)?.launch(s, r::<Bf16>(x, s)?, m::<Bf16>(o, s)?),
+        ("Swiglu", [g, u, o]) => {
+            Swiglu::load(manifest)?.launch(s, r::<Bf16>(g, s)?, r::<Bf16>(u, s)?, m::<Bf16>(o, s)?)
+        }
+        ("BucketedRmsDb96", [x, w, o]) => {
+            BucketedRmsDb96::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
+        }
+        ("BucketedRmsDb512", [x, w, o]) => {
+            BucketedRmsDb512::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
+        }
+        ("BucketedRmsDb1000", [x, w, o]) => {
+            BucketedRmsDb1000::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
+        }
+        ("Rmsnorm", [x, w, y]) => {
+            Rmsnorm::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(y, s)?)
+        }
+        ("GeluErf", [x, y]) => GeluErf::load(manifest)?.launch(s, r::<Bf16>(x, s)?, m::<Bf16>(y, s)?),
+        ("Axpy", [x, y]) => Axpy::load(manifest)?.launch(s, r::<F32>(x, s)?, m::<F32>(y, s)?),
+        ("Mm", [a, b, c]) => Mm::load(manifest)?.launch(s, r::<F16>(a, s)?, r::<F16>(b, s)?, m::<F32>(c, s)?),
+        (other, bufs) => panic!("the gate does not know the launcher {other} with {} tensors", bufs.len()),
     }
 }
 
@@ -175,14 +187,12 @@ fn run_cases(gpu: &Gpu, manifest: &Manifest, subdir: &str) -> usize {
     let mut ran = 0;
     for case in cases["cases"].as_array().unwrap() {
         let id = case["id"].as_str().unwrap();
-        let names: Vec<String> =
-            case["tensors"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
-        let map: HashMap<String, Buf> = tensors_of(gpu, case).into_iter().collect();
-        launch(gpu, manifest, case["launcher"].as_str().unwrap(), &map).unwrap_or_else(|e| panic!("{id}: {e}"));
+        let (names, mut bufs): (Vec<String>, Vec<Buf>) = tensors_of(gpu, case).into_iter().unzip();
+        launch(gpu, manifest, case["launcher"].as_str().unwrap(), &mut bufs).unwrap_or_else(|e| panic!("{id}: {e}"));
         let case_dir = out_dir.join(id);
         std::fs::create_dir_all(&case_dir).unwrap();
-        for name in &names {
-            std::fs::write(case_dir.join(format!("{name}.bin")), gpu.download(&map[name])).unwrap();
+        for (name, buf) in names.iter().zip(&bufs) {
+            std::fs::write(case_dir.join(format!("{name}.bin")), gpu.download(buf)).unwrap();
         }
         ran += 1;
     }
@@ -233,6 +243,7 @@ fn kind(e: &Error) -> PreconditionKind {
 #[test]
 fn refusals() {
     let (gpu, manifest) = (Gpu::new(), manifest());
+    let s: &CudaStream = &gpu.stream;
     let mut refused = 0;
     let mut check = |what: &str, ok: bool| {
         assert!(ok, "{what}");
@@ -240,12 +251,34 @@ fn refusals() {
         println!("rust gate: refused: {what}");
     };
 
+    // a tensor whose shape needs more bytes than its region has is refused when it is made, whatever the launch would have done
+    let small = gpu.zeros(64);
+    // SAFETY: the region is the buffer's own, and it outlives the (refused) constructions.
+    let region = unsafe { gpu.region(&small, small.nbytes()) };
+    let e = TensorRef::<F32>::new(region, &[2_200_000, 1000]).unwrap_err();
+    check(
+        "a tensor larger than its region (raw pointer)",
+        matches!(&e, Error::Launch(m) if m.contains("needs 8800000000 bytes")),
+    );
+    let e = TensorRef::<F32>::from_cuda(&small.slice, s, &[17]).unwrap_err();
+    check(
+        "a tensor larger than its slice (cudarc)",
+        matches!(&e, Error::Launch(m) if m.contains("needs 68 bytes, but its region has 64")),
+    );
+    check(
+        "a sub-region that does not fit",
+        region.offset(65).is_err() && region.slice(32, 33).is_err() && region.slice(32, 32).is_ok(),
+    );
+
     // a misaligned pointer (8 bytes past a 16-byte boundary): nothing is launched, the output stays untouched
-    let (x, y) = (gpu.upload(&vec![1u8; 2 * 4096 + 64]), gpu.upload(&vec![0xAAu8; 2 * 4096]));
-    let misaligned = Buf { slice: gpu.zeros(1).slice, addr: x.addr + 8, shape: vec![4096] };
-    let y = y.shaped(&[4096]);
+    let x = gpu.upload(&vec![1u8; 2 * 4096 + 64]);
+    let mut y = gpu.upload(&vec![0xAAu8; 2 * 4096]).shaped(&[4096]);
+    // SAFETY: the region is the buffer's own, shifted inside it; both outlive the call.
+    let shifted = unsafe { gpu.region(&x, x.nbytes()) }.offset(8).unwrap();
+    let xs = [4096usize];
+    let misaligned = TensorRef::<Bf16>::new(shifted, &xs).unwrap();
     let launcher = generated::GeluErf::load(&manifest).unwrap();
-    let e = launcher.launch(gpu.raw(), misaligned.input::<Bf16>(), y.output::<Bf16>()).unwrap_err();
+    let e = launcher.launch(s, misaligned, m::<Bf16>(&mut y, s).unwrap()).unwrap_err();
     check(
         "a misaligned pointer",
         kind(&e) == PreconditionKind::PointerAlignment && e.to_string().contains("not aligned to 16 bytes"),
@@ -253,77 +286,87 @@ fn refusals() {
     check("... and nothing was written", gpu.download(&y).iter().all(|b| *b == 0xAA));
 
     // a size the binary has baked in
-    let rows = gpu.zeros(3 * 2000 * 2).shaped(&[3, 2000]);
+    let mut rows = gpu.zeros(3 * 2000 * 2).shaped(&[3, 2000]);
     let w = gpu.zeros(2000 * 2).shaped(&[2000]);
-    let e = generated::Rmsnorm::load(&manifest).unwrap().launch(
-        gpu.raw(),
-        rows.input::<Bf16>(),
-        w.input::<Bf16>(),
-        rows.output::<Bf16>(),
-    );
-    let e = e.unwrap_err();
+    let x2 = gpu.zeros(3 * 2000 * 2).shaped(&[3, 2000]);
+    let e = generated::Rmsnorm::load(&manifest)
+        .unwrap()
+        .launch(s, r::<Bf16>(&x2, s).unwrap(), r::<Bf16>(&w, s).unwrap(), m::<Bf16>(&mut rows, s).unwrap())
+        .unwrap_err();
     check("a wrong static size", kind(&e) == PreconditionKind::StaticSize && e.to_string().contains("requires 2048"));
 
     // a bucketed dimension that is not the bucket: there is no padding
-    let (x, w, o) = (
+    let (x, w, mut o) = (
         gpu.zeros(3 * 100 * 2).shaped(&[3, 100]),
         gpu.zeros(100 * 2).shaped(&[100]),
         gpu.zeros(3 * 100 * 2).shaped(&[3, 100]),
     );
     let e = generated::BucketedRmsDb96::load(&manifest)
         .unwrap()
-        .launch(gpu.raw(), x.input::<Bf16>(), w.input::<Bf16>(), o.output::<Bf16>())
+        .launch(s, r::<Bf16>(&x, s).unwrap(), r::<Bf16>(&w, s).unwrap(), m::<Bf16>(&mut o, s).unwrap())
         .unwrap_err();
     check("a wrong bucket", kind(&e) == PreconditionKind::Bucket && e.to_string().contains("no padding"));
 
-    // more elements than a generated kernel's 32-bit offsets reach. The shape is only claimed: the buffers are small, and the
-    // second one's address is put far from the first so that the claimed extents do not overlap (they would be refused as an
-    // alias first). The call is refused before anything is launched, so no byte past the buffers is touched.
+    // more elements than a generated kernel's 32-bit offsets reach. A safe constructor cannot make this tensor over a small buffer,
+    // so the test vouches falsely on purpose, with two regions far apart (they would be refused as an alias first): the call is
+    // refused before the driver sees it, and not a byte past the buffers is touched.
     let big = [2_200_000usize, 1000];
-    let a = gpu.zeros(64).shaped(&big);
-    let b = Buf { slice: gpu.zeros(64).slice, addr: a.addr + (1 << 36), shape: big.to_vec() };
+    let (a, b) = (gpu.zeros(64), gpu.zeros(64));
+    // SAFETY: deliberately false lengths; the launch below is refused by `max_elements` before anything reaches the device.
+    let (ra, rb) = unsafe {
+        (
+            DevicePtr::from_raw(a.slice.device_ptr(s).0, 8_800_000_000, 0),
+            DevicePtr::from_raw((1 << 36) + a.slice.device_ptr(s).0, 8_800_000_000, 0),
+        )
+    };
     let e = generated::Softmax::load(&manifest)
         .unwrap()
-        .launch(gpu.raw(), a.input::<F32>(), b.output::<F32>())
+        .launch(s, TensorRef::<F32>::new(ra, &big).unwrap(), TensorMut::<F32>::new(rb, &big).unwrap())
         .unwrap_err();
     check("max_elements", kind(&e) == PreconditionKind::MaxElements);
+    drop(b);
 
     // a runtime dimension that is not a multiple of 16, and a written tensor that aliases another
     let a = gpu.zeros(64 * 2).shaped(&[60]);
-    let b = gpu.zeros(64 * 2).shaped(&[60]);
+    let mut b = gpu.zeros(64 * 2).shaped(&[60]);
     let e = generated::GeluErf::load(&manifest)
         .unwrap()
-        .launch(gpu.raw(), a.input::<Bf16>(), b.output::<Bf16>())
+        .launch(s, r::<Bf16>(&a, s).unwrap(), m::<Bf16>(&mut b, s).unwrap())
         .unwrap_err();
     check("divisible_by", kind(&e) == PreconditionKind::Divisible);
-    let a = gpu.zeros(4096 * 4).shaped(&[4096]);
-    let e =
-        generated::Axpy::load(&manifest).unwrap().launch(gpu.raw(), a.input::<F32>(), a.output::<F32>()).unwrap_err();
+    let mut a = gpu.zeros(4096 * 4).shaped(&[4096]);
+    // SAFETY: two tensors over one buffer is the point of the test (it is refused as an alias before any launch); the buffer outlives it.
+    let same = unsafe { gpu.region(&a, a.nbytes()) };
+    let sh = [4096usize];
+    let e = generated::Axpy::load(&manifest)
+        .unwrap()
+        .launch(s, TensorRef::<F32>::new(same, &sh).unwrap(), m::<F32>(&mut a, s).unwrap())
+        .unwrap_err();
     check("an in-place tensor that aliases another", kind(&e) == PreconditionKind::Alias);
 
     // a dimension that is not a multiple of what the binary assumes (mm: MmM is a multiple of 128, and so is the 2-D grid's x)
-    let (a, b, c) = (
+    let (a, b, mut c) = (
         gpu.zeros(100 * 64 * 2).shaped(&[100, 64]),
         gpu.zeros(64 * 128 * 2).shaped(&[64, 128]),
         gpu.zeros(100 * 128 * 4).shaped(&[100, 128]),
     );
     let e = generated::Mm::load(&manifest)
         .unwrap()
-        .launch(gpu.raw(), a.input::<F16>(), b.input::<F16>(), c.output::<F32>())
+        .launch(s, r::<F16>(&a, s).unwrap(), r::<F16>(&b, s).unwrap(), m::<F32>(&mut c, s).unwrap())
         .unwrap_err();
     check(
         "divisible_by of a dimension (MmM = 100)",
         kind(&e) == PreconditionKind::Divisible && e.to_string().contains("MmM"),
     );
     // tensors that disagree about a dimension (mm: the K of a is 64, the K of b is 128)
-    let (a, b, c) = (
+    let (a, b, mut c) = (
         gpu.zeros(128 * 64 * 2).shaped(&[128, 64]),
         gpu.zeros(128 * 128 * 2).shaped(&[128, 128]),
         gpu.zeros(128 * 128 * 4).shaped(&[128, 128]),
     );
     let e = generated::Mm::load(&manifest)
         .unwrap()
-        .launch(gpu.raw(), a.input::<F16>(), b.input::<F16>(), c.output::<F32>())
+        .launch(s, r::<F16>(&a, s).unwrap(), r::<F16>(&b, s).unwrap(), m::<F32>(&mut c, s).unwrap())
         .unwrap_err();
     check(
         "tensors that disagree about a dimension",
@@ -381,56 +424,81 @@ fn refusals() {
     println!("rust gate: {refused} refusals checked");
 }
 
+/// Launch inside a CUDA graph capture, and run the graph: with the safe `launch` on the cudarc stream and with `unsafe launch_raw`
+/// on its raw handle. The tensors are made before the capture (cudarc's event tracking does not run inside it).
 #[test]
 fn graph_capture() {
     let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
     // the first gelu_erf case of the gate: its inputs, and the bytes Python's replay computed
     let case = cases["cases"].as_array().unwrap().iter().find(|c| c["launcher"] == "GeluErf").expect("a GeluErf case");
     let mut tensors = tensors_of(&gpu, case).into_iter();
-    let (x, mut y) = (tensors.next().unwrap(), tensors.next().unwrap());
-    assert_eq!((x.0.as_str(), y.0.as_str()), ("x_ptr", "y_ptr"));
-    let (x, y_name) = (x.1, y.0.clone());
-    let y_buf = &mut y.1;
+    let ((x_name, x), (y_name, mut y)) = (tensors.next().unwrap(), tensors.next().unwrap());
+    assert_eq!((x_name.as_str(), y_name.as_str()), ("x_ptr", "y_ptr"));
     let expect = read(&gate_dir().join(case["tensors"][1]["expect"].as_str().unwrap()));
-    assert_eq!(y_name, "y_ptr");
     let launcher = generated::GeluErf::load(&manifest).unwrap(); // loads the module: not allowed during capture
     gpu.stream.synchronize().unwrap();
+    let stream = gpu.stream.cu_stream();
 
-    let stream = gpu.raw();
-    let mut graph: sys::CUgraph = std::ptr::null_mut();
-    // SAFETY (the driver calls below): `stream` is a live stream of the current context; the graph handles come from the driver.
-    unsafe {
-        let begin = sys::cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
-        assert_eq!(begin, sys::CUresult::CUDA_SUCCESS, "cuStreamBeginCapture");
-    }
-    let launched = launcher.launch(stream, x.input::<Bf16>(), y_buf.output::<Bf16>());
-    unsafe {
-        let end = sys::cuStreamEndCapture(stream, &mut graph);
-        assert_eq!(end, sys::CUresult::CUDA_SUCCESS, "cuStreamEndCapture");
-    }
-    launched.expect("the launch is captured");
-    assert!(gpu.download(y_buf).iter().all(|b| *b == 0), "a captured launch runs nothing: the output is untouched");
-
-    let mut exec: sys::CUgraphExec = std::ptr::null_mut();
-    unsafe {
-        assert_eq!(
-            sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0),
-            sys::CUresult::CUDA_SUCCESS,
-            "cuGraphInstantiate"
-        );
-    }
-    for run in 0..3 {
-        // the graph computes the output again each time: clear it first
-        gpu.stream.memset_zeros(&mut y_buf.slice).unwrap();
+    for raw in [false, true] {
+        // SAFETY: the buffers outlive the graph's launches (they are used until the end of this function).
+        let (xr, yr) = unsafe { (gpu.region(&x, x.nbytes()), gpu.region(&y, y.nbytes())) };
+        let mut graph: sys::CUgraph = std::ptr::null_mut();
+        // SAFETY (the driver calls below): `stream` is a live stream of the current context; the graph handles come from the driver.
         unsafe {
-            assert_eq!(sys::cuGraphLaunch(exec, stream), sys::CUresult::CUDA_SUCCESS, "cuGraphLaunch");
+            let begin =
+                sys::cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+            assert_eq!(begin, sys::CUresult::CUDA_SUCCESS, "cuStreamBeginCapture");
         }
-        let got = gpu.download(y_buf);
-        assert_eq!(got, expect, "run {run}: the graph's output is Python's replay, byte for byte");
+        let launched = if raw {
+            // SAFETY: `stream` is the handle of a stream of the kernel's context, which is current; the buffers outlive the graph.
+            unsafe {
+                launcher.launch_raw(
+                    stream,
+                    TensorRef::<Bf16>::new(xr, &x.shape).unwrap(),
+                    TensorMut::<Bf16>::new(yr, &y.shape).unwrap(),
+                )
+            }
+        } else {
+            launcher.launch(
+                &gpu.stream,
+                TensorRef::<Bf16>::new(xr, &x.shape).unwrap(),
+                TensorMut::<Bf16>::new(yr, &y.shape).unwrap(),
+            )
+        };
+        unsafe {
+            let end = sys::cuStreamEndCapture(stream, &mut graph);
+            assert_eq!(end, sys::CUresult::CUDA_SUCCESS, "cuStreamEndCapture");
+        }
+        launched.expect("the launch is captured");
+        assert!(gpu.download(&y).iter().all(|b| *b == 0), "a captured launch runs nothing: the output is untouched");
+
+        let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(
+                sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0),
+                sys::CUresult::CUDA_SUCCESS,
+                "cuGraphInstantiate"
+            );
+        }
+        for run in 0..3 {
+            // the graph computes the output again each time: clear it first
+            gpu.stream.memset_zeros(&mut y.slice).unwrap();
+            unsafe {
+                assert_eq!(sys::cuGraphLaunch(exec, stream), sys::CUresult::CUDA_SUCCESS, "cuGraphLaunch");
+            }
+            let got = gpu.download(&y);
+            assert_eq!(
+                got, expect,
+                "launch_raw {raw}, run {run}: the graph's output is Python's replay, byte for byte"
+            );
+        }
+        unsafe {
+            let _ = sys::cuGraphExecDestroy(exec);
+            let _ = sys::cuGraphDestroy(graph);
+        }
+        gpu.stream.memset_zeros(&mut y.slice).unwrap();
     }
-    unsafe {
-        let _ = sys::cuGraphExecDestroy(exec);
-        let _ = sys::cuGraphDestroy(graph);
-    }
-    println!("rust gate: a launch captured in a CUDA graph ran 3 times and matched Python's replay");
+    println!(
+        "rust gate: a launch captured in a CUDA graph (launch, and launch_raw) ran 3 times each and matched Python's replay"
+    );
 }

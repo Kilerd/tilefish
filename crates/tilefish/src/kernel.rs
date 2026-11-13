@@ -9,12 +9,14 @@
 //! plus the manifest's dynamic shared memory must fit the device's opt-in maximum per block, and the loaded function must
 //! take the parameters the ABI says. A launch is checked by [`Plan::prepare`], and then against the device's maximum grid.
 //!
-//! A launch goes on the stream the caller gives (a raw `CUstream`), so it also works inside a CUDA graph capture: the
-//! driver copies `kernelParams` at the call.
+//! A launch goes on the stream the caller gives (cudarc's `CudaStream`, checked to be of the kernel's context; or, for a handle that
+//! nothing owns, `unsafe` [`Kernel::launch_raw`]), so it also works inside a CUDA graph capture: the driver copies `kernelParams`
+//! at the call.
 
 use std::fmt;
 use std::sync::{Arc, Weak};
 
+pub use cudarc::driver::CudaStream;
 pub use cudarc::driver::sys::CUstream;
 
 use crate::error::{Error, Result};
@@ -135,17 +137,32 @@ impl Kernel {
 
     /// Check the call and launch the kernel on `stream`.
     ///
-    /// The launch is asynchronous, as any launch is: `stream` orders it with the host's other work, and the tensors must
-    /// stay allocated until it has run. `stream` may be capturing a CUDA graph: the call is captured like any kernel node.
-    /// The CUDA context the kernel was loaded in must be current on this thread.
-    pub fn launch(&self, stream: CUstream, tensors: &[TensorArg<'_>]) -> Result<()> {
-        let mut prepared = self.check(tensors)?;
-        if !ffi::is_current(self.loaded.context) {
+    /// The stream must be a stream of the context the kernel was loaded in (checked); that context is made current on this thread,
+    /// as cudarc does for its own calls. The launch is asynchronous, as any launch is: `stream` orders it with the host's other work.
+    /// `stream` may be capturing a CUDA graph: the call is captured like any kernel node. For a raw handle that cudarc does not
+    /// own, see [`Kernel::launch_raw`].
+    pub fn launch(&self, stream: &CudaStream, tensors: &[TensorArg<'_>]) -> Result<()> {
+        if stream.context().cu_ctx() as usize != self.loaded.context {
             return Err(Error::Launch(format!(
-                "'{}' was loaded in another CUDA context than the one that is current on this thread: make its context current first",
+                "the stream is in another CUDA context than the one '{}' was loaded in: launch it on a stream of that context",
                 self.loaded.stem
             )));
         }
+        stream
+            .context()
+            .bind_to_thread()
+            .map_err(|e| Error::Launch(format!("cannot make the context of the stream current: {e}")))?;
+        self.launch_on(stream.cu_stream(), tensors)
+    }
+
+    /// The context the kernel was loaded in, as an address.
+    pub(crate) fn context(&self) -> usize {
+        self.loaded.context
+    }
+
+    /// Check the call and launch on `stream`, which the caller has vouched for.
+    pub(crate) fn launch_on(&self, stream: CUstream, tensors: &[TensorArg<'_>]) -> Result<()> {
+        let mut prepared = self.check(tensors)?;
         let (block, shared) = (self.plan.block(), self.plan.shared());
         self.loaded.function.launch(prepared.grid, block, shared, stream, &mut prepared.values, prepared.count)
     }

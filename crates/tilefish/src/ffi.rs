@@ -6,41 +6,153 @@
 //! function against the manifest's ABI, `cuDeviceGetAttribute` for the limits of the device, and `cuLaunchKernel` with
 //! `kernelParams` laid out as the ABI says. The bindings are `cudarc::driver::sys`, loaded at run time.
 //!
-//! Every function here is safe to call: the invariants of a raw pointer (a device address) are carried by
-//! [`DevicePtr`], which can only be made with an `unsafe` constructor, and a launch is made of values that the
+//! The obligations a host takes on are in two places, and nowhere else: [`DevicePtr::from_raw`] (the host vouches for a region of
+//! device memory: where it is, how many bytes, on which device, and that it outlives the launches that use it) and
+//! [`Kernel::launch_raw`] (the host vouches for a raw `CUstream` handle). Everything built from them is checked: a tensor is
+//! refused when its shape needs more bytes than its pointer vouches for, and the safe [`Kernel::launch`] takes cudarc's
+//! `CudaStream`, which owns its handle. The other functions here are safe to call: a launch is made of values that the
 //! callers have already checked.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
 use cudarc::driver::sys;
+use cudarc::driver::{CudaStream, DevicePtr as CudarcDevicePtr, DevicePtrMut, SyncOnDrop};
 
 use crate::error::{Error, Result};
+use crate::kernel::Kernel;
+use crate::tensor::TensorArg;
 
 #[cfg(target_endian = "big")]
 compile_error!("tilefish packs a 32-bit kernel argument into the low bytes of a 64-bit slot: little-endian hosts only");
 
-/// An address in device memory.
+/// A region of device memory: its address, how many bytes of it the holder vouches for, and the device it is on.
 ///
-/// A host that makes one asserts that the memory behind it is valid for the kernels that are given it; that is why
-/// [`DevicePtr::from_raw`] is `unsafe`, and why everything built from a `DevicePtr` can be safe.
+/// A tensor is made from one (`TensorRef::new`, `TensorMut::new`, [`TensorArg::new`]) and is refused when its shape needs more bytes
+/// than the region has, so no launch can be made to read or write past what the host vouched for. The host vouches by calling
+/// [`DevicePtr::from_raw`], which is `unsafe`; [`DevicePtr::offset`] and [`DevicePtr::slice`] make smaller regions of a region, checked.
+/// A region from a cudarc `CudaSlice` or `CudaView` needs no `unsafe`: its length is known (`TensorRef::from_cuda`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DevicePtr(u64);
+pub struct DevicePtr {
+    addr: u64,
+    len: u64,
+    device: i32,
+}
 
 impl DevicePtr {
-    /// A device pointer from a raw address (`CUdeviceptr`).
+    /// The region of `len_bytes` bytes at `addr` (a `CUdeviceptr`) in the memory of the device with ordinal `device_ordinal`.
     ///
     /// # Safety
     ///
-    /// `ptr` must be the address of device memory that stays allocated, on the device the tensor is declared on, for as
-    /// long as any launch that uses it is in flight, and it must hold as many elements as the shape of the tensor says.
-    pub unsafe fn from_raw(ptr: u64) -> Self {
-        Self(ptr)
+    /// The caller vouches that
+    ///
+    /// * `addr .. addr + len_bytes` is allocated device memory of the device `device_ordinal` (not host memory, not a freed or
+    ///   not yet allocated address), writable if a [`TensorMut`](crate::TensorMut) is made of it;
+    /// * it stays allocated, and is not reused, until every launch that was given a tensor made of it has completed on the device
+    ///   (a launch is asynchronous: its stream orders it, it is not finished when `launch` returns);
+    /// * nothing else writes it while a launch that reads it is in flight, or reads it while one that writes it is.
+    ///
+    /// Tilefish checks the rest: that a tensor fits the region, that the tensors of a call do not overlap where one is written, and
+    /// the alignment the binary was compiled for.
+    pub unsafe fn from_raw(addr: u64, len_bytes: u64, device_ordinal: i32) -> Self {
+        Self { addr, len: len_bytes, device: device_ordinal }
     }
 
     /// The raw address.
     pub fn addr(self) -> u64 {
-        self.0
+        self.addr
+    }
+
+    /// How many bytes of memory the region has.
+    pub fn len_bytes(self) -> u64 {
+        self.len
+    }
+
+    /// The ordinal of the device the memory is on.
+    pub fn device(self) -> i32 {
+        self.device
+    }
+
+    /// The region that starts `bytes` bytes into this one and runs to its end; an error when it starts past the end.
+    pub fn offset(self, bytes: u64) -> Result<Self> {
+        if bytes > self.len {
+            return Err(Error::Launch(format!(
+                "an offset of {bytes} bytes is past the end of a region of {} bytes",
+                self.len
+            )));
+        }
+        let addr = self
+            .addr
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Launch("an offset past the end of the address space".to_owned()))?;
+        Ok(Self { addr, len: self.len - bytes, device: self.device })
+    }
+
+    /// The region of `len_bytes` bytes that starts `bytes` bytes into this one; an error when it does not fit.
+    pub fn slice(self, bytes: u64, len_bytes: u64) -> Result<Self> {
+        let end = bytes.checked_add(len_bytes).filter(|end| *end <= self.len);
+        if end.is_none() {
+            return Err(Error::Launch(format!(
+                "bytes {bytes}..{bytes}+{len_bytes} are not within a region of {} bytes",
+                self.len
+            )));
+        }
+        let addr = self
+            .addr
+            .checked_add(bytes)
+            .ok_or_else(|| Error::Launch("an offset past the end of the address space".to_owned()))?;
+        Ok(Self { addr, len: len_bytes, device: self.device })
+    }
+}
+
+/// The region a cudarc slice (or view) owns, and the guard that cudarc's event tracking wants kept until the launch is enqueued.
+///
+/// SAFETY of the `from_raw`: `slice` owns `num_bytes()` bytes at its device address, in the context of its stream, and the borrow the
+/// caller holds keeps it alive; the guard makes cudarc record the use on `stream`, so that freeing the slice waits for the launch.
+pub(crate) fn region_of<'a, E, S: CudarcDevicePtr<E>>(
+    slice: &'a S,
+    stream: &'a CudaStream,
+) -> (DevicePtr, SyncOnDrop<'a>) {
+    let (addr, guard) = slice.device_ptr(stream);
+    let len = slice.num_bytes() as u64;
+    let device = slice.stream().context().ordinal() as i32;
+    // SAFETY: see above.
+    (unsafe { DevicePtr::from_raw(addr, len, device) }, guard)
+}
+
+/// As [`region_of`], for a region that will be written.
+pub(crate) fn region_of_mut<'a, E, S: DevicePtrMut<E>>(
+    slice: &'a mut S,
+    stream: &'a CudaStream,
+) -> (DevicePtr, SyncOnDrop<'a>) {
+    let len = slice.num_bytes() as u64;
+    let device = slice.stream().context().ordinal() as i32;
+    let (addr, guard) = slice.device_ptr_mut(stream);
+    // SAFETY: as in `region_of`.
+    (unsafe { DevicePtr::from_raw(addr, len, device) }, guard)
+}
+
+impl Kernel {
+    /// Check the call and launch the kernel on a raw `CUstream`.
+    ///
+    /// What [`Kernel::launch`] does for a stream that cudarc owns, for a handle that nothing owns: another library's stream, or the
+    /// stream that a CUDA graph is being captured on (the call is captured like any kernel node).
+    ///
+    /// # Safety
+    ///
+    /// * `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in (a handle from another context, a destroyed
+    ///   stream or a pointer that is not a stream is undefined behavior in the driver), and it must stay valid until this returns;
+    /// * that context must be current on this thread (it is checked, and refused if not);
+    /// * the tensors keep the obligations of [`DevicePtr::from_raw`]: their memory must stay allocated until the launch has completed
+    ///   on `stream`, which this call does not wait for.
+    pub unsafe fn launch_raw(&self, stream: sys::CUstream, tensors: &[TensorArg<'_>]) -> Result<()> {
+        if !is_current(self.context()) {
+            return Err(Error::Launch(format!(
+                "'{}' was loaded in another CUDA context than the one that is current on this thread: make its context current first",
+                self.stem()
+            )));
+        }
+        self.launch_on(stream, tensors)
     }
 }
 

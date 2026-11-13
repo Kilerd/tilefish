@@ -22,8 +22,8 @@ What the module holds, in order:
   ``load_embedded()``, which verifies them like a directory and pins them to ``MANIFEST_DIGEST``.
 * one struct per stem. ``STEM`` and ``BUCKETS`` name the binary (bucket semantics are exact: ``BucketedRms96`` and
   ``BucketedRms512`` are different structs and there is no padding), ``SHAPES`` the declared shape of every tensor,
-  ``load(&Manifest)`` loads the binary for the current device and ``launch(stream, tensors...)`` checks the call and
-  launches on a raw ``CUstream`` (also inside a CUDA graph capture).
+  ``load(&Manifest)`` loads the binary for the current device and ``launch(&CudaStream, tensors...)`` checks the call and
+  launches (also inside a CUDA graph capture), and ``unsafe launch_raw(CUstream, tensors...)`` does the same on a raw handle.
 
 The output is deterministic: the same manifest gives the same bytes. Nothing in it depends on where the manifest was
 written, except the ``include_bytes!`` paths with ``embed=True``.
@@ -272,7 +272,8 @@ def _render_binary(b: _Binary) -> str:
     out.append("    /// The loaded kernel.\n")
     out.append("    pub fn kernel(&self) -> &Kernel {\n        &self.kernel\n    }\n\n")
     doc = [
-        "Check the call and launch the kernel on `stream` (a raw `CUstream`: it may be capturing a CUDA graph).",
+        "Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be",
+        "capturing a CUDA graph).",
         "",
         "Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the",
         "bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched",
@@ -280,11 +281,28 @@ def _render_binary(b: _Binary) -> str:
     ]
     out.append(_doc_comment(doc, "    "))
     out.append("    #[allow(clippy::too_many_arguments, non_snake_case)]\n")
-    out.append("    pub fn launch(\n        &self,\n        stream: CUstream,\n")
+    out.append("    pub fn launch(\n        &self,\n        stream: &CudaStream,\n")
     for p in tensor_params:
         out.append(f"        {p},\n")
     out.append("    ) -> Result<(), Error> {\n")
     out.append(f"        self.kernel.launch(stream, &[{args}])\n")
+    out.append("    }\n\n")
+    raw_doc = [
+        "Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.",
+        "",
+        "# Safety",
+        "",
+        "`stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and",
+        "the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).",
+    ]
+    out.append(_doc_comment(raw_doc, "    "))
+    out.append("    #[allow(clippy::too_many_arguments, non_snake_case)]\n")
+    out.append("    pub unsafe fn launch_raw(\n        &self,\n        stream: CUstream,\n")
+    for p in tensor_params:
+        out.append(f"        {p},\n")
+    out.append("    ) -> Result<(), Error> {\n")
+    out.append("        // SAFETY: the caller vouches for the stream, as this function's contract says.\n")
+    out.append(f"        unsafe {{ self.kernel.launch_raw(stream, &[{args}]) }}\n")
     out.append("    }\n}\n")
     return "".join(out)
 
@@ -294,7 +312,7 @@ def render(manifest: Manifest, *, ops: "Iterable[Any]" = (), embed: bool = False
     binaries = _group(manifest)
     _check_declarations(binaries, ops)
     elements = sorted({RUST_ELEMENTS[p["dtype"]] for b in binaries for p in b.params})
-    uses = ["Arch", "CUstream", "Error", "Kernel", "Manifest"]
+    uses = ["Arch", "CUstream", "CudaStream", "Error", "Kernel", "Manifest"]
     if embed:
         uses.append("Pin")
     if any(p["access"] == "in" for b in binaries for p in b.params):

@@ -141,8 +141,8 @@ fn a_damaged_expression_is_an_error_never_a_panic() {
                 if let Ok(plan) = manifest.plan("gelu_erf", &[], Arch::sm(103)) {
                     let shape = [4096usize];
                     // SAFETY: the address is never dereferenced.
-                    let ptr = unsafe { tilefish::DevicePtr::from_raw(0x1000) };
-                    let a = tilefish::TensorArg::new(ptr, &shape, tilefish::DType::Bf16, 0);
+                    let ptr = unsafe { tilefish::DevicePtr::from_raw(0x1000, 8192, 0) };
+                    let a = tilefish::TensorArg::new(ptr, &shape, tilefish::DType::Bf16).unwrap();
                     let _ = plan.prepare(&[a, a], None);
                 }
             }

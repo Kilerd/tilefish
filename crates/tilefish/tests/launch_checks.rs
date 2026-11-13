@@ -34,8 +34,9 @@ macro_rules! typed {
 }
 
 fn t<'a>(addr: u64, shape: &'a [usize], dtype: DType) -> TensorArg<'a> {
-    // SAFETY: these addresses are never dereferenced: `prepare` only looks at the number.
-    TensorArg::new(unsafe { DevicePtr::from_raw(addr) }, shape, dtype, 0)
+    // SAFETY: these addresses are never dereferenced: `prepare` only looks at the number. The region is as long as the tensor.
+    let ptr = unsafe { DevicePtr::from_raw(addr, shape.iter().product::<usize>() as u64 * dtype.size() as u64, 0) };
+    TensorArg::new(ptr, shape, dtype).unwrap()
 }
 
 const A: u64 = 0x7000_0000_0000;
@@ -45,6 +46,9 @@ const D: u64 = 0x7000_3000_0000;
 // two addresses that are far enough apart for tensors of gigabytes
 const BIG_A: u64 = 0x1000_0000_0000;
 const BIG_B: u64 = 0x2000_0000_0000;
+// two addresses for tensors of up to 2^63 bytes: a tensor at LOW ends before HIGH
+const LOW: u64 = 1 << 20;
+const HIGH: u64 = 1 << 63;
 
 /// A device like the B300's: 2^31 - 1 blocks along x, 65535 along y and z.
 const DEVICE: DeviceInfo = DeviceInfo { ordinal: 0, max_grid: [(1 << 31) - 1, 65535, 65535] };
@@ -370,4 +374,171 @@ fn a_grid_that_is_not_a_positive_size_is_refused() {
     let shape = [1usize, 1000];
     let e = plan.prepare(&[t(A, &shape, DType::F32), t(B, &shape, DType::F32)], Some(&DEVICE)).unwrap_err();
     assert!(matches!(&e, Error::Launch(m) if m.contains("must be at least 1")), "{e}");
+}
+
+// -- the runtime scalars: what they count, their divisor, their 32-bit range ----------------------------------------------------------------
+
+/// The plan of `stem` in a copy of the fixture whose entry `change` edited (read without a pin: the edit changes the digest).
+fn edited(stem: &str, change: impl FnOnce(&mut serde_json::Value)) -> (Copy, Plan) {
+    let copy = Copy::of("sm_103");
+    copy.edit_json(|doc| change(Copy::entry(doc, stem)));
+    let manifest = Manifest::load(&copy.dir, Pin::TrustDirectory).expect("the edit is a manifest that reads");
+    let plan = manifest.plan(stem, &[], Arch::sm(103)).unwrap();
+    (copy, plan)
+}
+
+fn param<'a>(entry: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {
+    entry["abi"]["params"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == name).expect("a parameter")
+}
+
+fn precondition<'a>(entry: &'a mut serde_json::Value, kind: &str, arg: &str) -> &'a mut serde_json::Value {
+    entry["preconditions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["kind"] == kind && p["arg"] == arg)
+        .expect("a precondition")
+}
+
+#[test]
+fn a_runtime_scalar_that_is_not_a_multiple_of_its_divisor_is_refused_whatever_its_dimensions_say() {
+    // swiglu's `n` is 3072*M and M is not declared divisible by anything: only the scalar's own precondition can refuse. With the
+    // divisor 2048 (3072 is not a multiple of it), M = 1 is refused and M = 2 is not.
+    let (_copy, plan) = edited("swiglu", |e| precondition(e, "divisible", "n")["by"] = 2048.into());
+    let call = |m: usize| {
+        let shape = [m, 3072];
+        let args = [t(A, &shape, DType::Bf16), t(B, &shape, DType::Bf16), t(C, &shape, DType::Bf16)];
+        plan.prepare(&args, Some(&DEVICE)).map(|p| p.params().to_vec())
+    };
+    let e = call(1).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Divisible);
+    let text = e.to_string();
+    assert!(
+        text.contains("runtime argument 'n'") && text.contains("is 3072") && text.contains("not a multiple of 2048"),
+        "{text}"
+    );
+    assert_eq!(call(2).unwrap(), [A, B, C, 6144, 0, 0]);
+    assert_eq!(kind(&call(3).unwrap_err()), PreconditionKind::Divisible);
+    assert!(call(4).is_ok());
+    // the unmodified entry: a multiple of 16 for every M
+    let shape = [1usize, 3072];
+    let args = [t(A, &shape, DType::Bf16), t(B, &shape, DType::Bf16), t(C, &shape, DType::Bf16)];
+    assert!(typed!(Swiglu).prepare(&args, Some(&DEVICE)).is_ok());
+}
+
+#[test]
+fn a_runtime_scalar_is_in_the_range_of_a_signed_32_bit_integer_edges_included() {
+    // gelu_erf with `n_elements = Count - 4096`, then `Count + 15`: the value is 0 (accepted), -16, 2^31 - 1 (accepted) and 2^31 + 15
+    // (2^31 - 1 is odd: the scalar's divisor goes, so that the range is all that is left to refuse it)
+    let shaped = |dim: &str| {
+        edited("gelu_erf", |e| {
+            param(e, "n_elements")["dim"] = dim.into();
+            e["preconditions"].as_array_mut().unwrap().retain(|p| p["kind"] != "divisible");
+        })
+    };
+    let call = |plan: &Plan, count: usize| {
+        let shape = [count];
+        plan.prepare(&[t(BIG_A, &shape, DType::Bf16), t(BIG_B, &shape, DType::Bf16)], Some(&DEVICE))
+    };
+    let (_copy, low) = shaped("Count - 4096");
+    assert_eq!(call(&low, 4096).unwrap().params(), [BIG_A, BIG_B, 0, 0, 0], "zero is in the range");
+    let e = call(&low, 4080).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Shape);
+    assert!(e.to_string().contains("is -16") && e.to_string().contains("32-bit signed"), "{e}");
+    assert_eq!(call(&low, 4112).unwrap().params()[2], 16);
+    let (_copy, high) = shaped("Count + 15");
+    let top = (1usize << 31) - 16;
+    assert_eq!(call(&high, top).unwrap().params()[2], i32::MAX as u64, "2^31 - 1 is in the range");
+    let e = call(&high, top + 16).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Shape);
+    assert!(e.to_string().contains(&format!("is {}", (1u64 << 31) + 15)), "{e}");
+    let (_copy, exact) = shaped("Count");
+    assert!(call(&exact, top).is_ok() && call(&exact, top + 16).is_err());
+}
+
+#[test]
+fn a_scalar_counts_the_elements_of_the_tensor_it_names_and_not_of_another() {
+    // mm, with `m` the element count of `c_ptr` (M*N) and `k` the element count of `b_ptr` (K*N): three tensors of three sizes
+    let (_copy, plan) = edited("mm", |e| {
+        for (name, dim, target) in [("m", "MmM*MmN", "c_ptr"), ("k", "MmK*MmN", "b_ptr")] {
+            param(e, name)["dim"] = dim.into();
+            param(e, name)["count_of"] = target.into();
+            precondition(e, "divisible", name)["dim"] = dim.into();
+        }
+    });
+    let args = [t(A, &[128, 64], DType::F16), t(B, &[64, 256], DType::F16), t(C, &[128, 256], DType::F32)];
+    let prepared = plan.prepare(&args, Some(&DEVICE)).unwrap();
+    // a: 128*64 = 8192, b: 64*256 = 16384, c: 128*256 = 32768
+    assert_eq!(prepared.params(), [A, B, C, 32768, 256, 16384, 0, 0]);
+    // a scalar whose dimension is not what its tensor holds says so, and names the tensor and the count
+    let (_copy, plan) = edited("mm", |e| {
+        param(e, "n")["dim"] = "MmN".into();
+        param(e, "n")["count_of"] = "a_ptr".into();
+    });
+    let e = plan.prepare(&args, Some(&DEVICE)).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Shape);
+    let text = e.to_string();
+    assert!(
+        text.contains("runtime argument 'n' is MmN = 256") && text.contains("the tensor 'a_ptr' has 8192 elements"),
+        "{text}"
+    );
+}
+
+// -- sizes at the edges of 64 bits -----------------------------------------------------------------------------------------------------
+
+#[test]
+fn shapes_of_two_to_the_sixtieth_and_element_counts_of_two_to_the_sixty_third_are_refused_and_never_wrap() {
+    // gelu_erf over 2^60 bf16 elements: the count and the bytes fit, the scalar does not fit 32 bits
+    let plan = typed!(GeluErf);
+    let n = 1usize << 60;
+    let e = refused(&plan, &[t(BIG_A, &[n], DType::Bf16), t(BIG_B, &[n], DType::Bf16)]);
+    assert_eq!(kind(&e), PreconditionKind::Shape);
+    assert!(e.to_string().contains("32-bit signed"), "{e}");
+    // softmax over (2^59, 4): its second axis is a static 1000 in the manifest
+    let plan = typed!(Softmax);
+    let big = n / 2;
+    let e = refused(&plan, &[t(BIG_A, &[big, 4], DType::F32), t(BIG_B, &[big, 4], DType::F32)]);
+    assert_eq!(kind(&e), PreconditionKind::StaticSize);
+    // (2^50, 1000) elements: more than the i32 offsets of a generated kernel reach
+    let rows = 1usize << 50;
+    let e = refused(&plan, &[t(LOW, &[rows, 1000], DType::F32), t(HIGH, &[rows, 1000], DType::F32)]);
+    assert_eq!(kind(&e), PreconditionKind::MaxElements);
+
+    // one-byte pointers are the only ones for which 2^63 elements fit a region: gelu_erf and softmax with u8 tensors
+    let (_copy, bytes) = edited("gelu_erf", |e| {
+        for name in ["x_ptr", "y_ptr"] {
+            param(e, name)["dtype"] = "u8".into();
+            param(e, name)["type"] = "*u8".into();
+        }
+    });
+    let count = |count: usize| {
+        bytes.prepare(&[t(BIG_A, &[count], DType::U8), t(BIG_B, &[count], DType::U8)], Some(&DEVICE)).unwrap_err()
+    };
+    // 2^63 - 1 elements (the largest count that fits an i64) get past the count: it is not a multiple of 16
+    let e = count(i64::MAX as usize);
+    assert_eq!(kind(&e), PreconditionKind::Divisible, "{e}");
+    assert!(e.to_string().contains("dimension Count is 9223372036854775807"), "{e}");
+    // 2^63 elements are more than 64 bits can count
+    let e = count(1usize << 63);
+    assert_eq!(kind(&e), PreconditionKind::Shape);
+    assert!(e.to_string().contains("more elements than fit 64 bits"), "{e}");
+    let e = count(usize::MAX);
+    assert!(e.to_string().contains("more elements than fit 64 bits"), "{e}");
+    // 2^62 elements are a count, and then too many for a 32-bit scalar
+    let e = count(1usize << 62);
+    assert!(e.to_string().contains("32-bit signed"), "{e}");
+    // the same for two axes: 2^54 rows of 1000 bytes is 1.8e19 elements, 2^53 rows is 9.0e18
+    let (_copy, bytes) = edited("softmax", |e| {
+        for name in ["x", "out"] {
+            param(e, name)["dtype"] = "u8".into();
+            param(e, name)["type"] = "*u8".into();
+        }
+    });
+    let rows = |rows: usize| {
+        bytes
+            .prepare(&[t(LOW, &[rows, 1000], DType::U8), t(HIGH, &[rows, 1000], DType::U8)], Some(&DEVICE))
+            .unwrap_err()
+    };
+    assert!(rows(1 << 54).to_string().contains("more elements than fit 64 bits"));
+    assert_eq!(kind(&rows(1 << 53)), PreconditionKind::MaxElements);
 }

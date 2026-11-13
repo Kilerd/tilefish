@@ -37,8 +37,15 @@ fn every_launch_is_decided_as_python_decides_it() {
             .zip(&shapes)
             .map(|(t, shape)| {
                 let dtype = DType::from_name(t["dtype"].as_str().unwrap()).unwrap();
-                // SAFETY: the address is never dereferenced: `prepare` only looks at the number.
-                TensorArg::new(unsafe { DevicePtr::from_raw(t["ptr"].as_u64().unwrap()) }, shape, dtype, 0)
+                // SAFETY: the address is never dereferenced: `prepare` only looks at the number. The region is as long as the tensor.
+                let region = unsafe {
+                    DevicePtr::from_raw(
+                        t["ptr"].as_u64().unwrap(),
+                        shape.iter().product::<usize>() as u64 * dtype.size() as u64,
+                        0,
+                    )
+                };
+                TensorArg::new(region, shape, dtype).unwrap()
             })
             .collect();
         let plan = manifest.plan(stem, &[], Arch::sm(103)).unwrap();

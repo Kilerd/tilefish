@@ -7,21 +7,27 @@
 //! exact bytes Python's `replay` runs.
 //!
 //! ```no_run
-//! use tilefish::{Arch, Manifest, Pin, TensorArg, DType, DevicePtr};
+//! use tilefish::cudarc::driver::CudaContext;
+//! use tilefish::{Arch, Bf16, Manifest, Pin, TensorMut, TensorRef};
 //!
-//! # fn main() -> tilefish::Result<()> {
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // 1. Read and verify the directory. Production pins the digest of the manifest; `Pin::TrustDirectory` trusts the
 //! //    directory's own digests, which whoever can write the directory can rewrite.
 //! let manifest = Manifest::load("build/", Pin::Digest("<the digest `tilefish.runtime.export` returned>"))?;
 //!
 //! // 2. Load the binary for the current device. (A CUDA context must be current: cudarc's `CudaContext::new` binds one.)
+//! let ctx = CudaContext::new(0)?;
+//! let stream = ctx.new_stream()?;
 //! let kernel = manifest.kernel("gelu_erf", &[], Arch::current()?)?;
 //!
-//! // 3. Launch on your own stream. Every precondition of the binary is checked first.
-//! # let (x, y, stream): (DevicePtr, DevicePtr, tilefish::CUstream) = unimplemented!();
+//! // 3. Launch on a stream of that context. Every precondition of the binary is checked first. The tensors are made of cudarc
+//! //    slices, whose length is known: no `unsafe`, and a shape that does not fit its slice is an error, not a launch.
+//! let (x, mut y) = (stream.alloc_zeros::<u8>(4096 * 2)?, stream.alloc_zeros::<u8>(4096 * 2)?);
 //! let shape = [4096usize];
-//! let tensors = [TensorArg::new(x, &shape, DType::Bf16, 0), TensorArg::new(y, &shape, DType::Bf16, 0)];
-//! kernel.launch(stream, &tensors)?; // the dimensions and the runtime scalar come from the shapes
+//! // (keep them until the launch is enqueued: a tensor made of a cudarc slice holds cudarc's event tracking)
+//! let x_tensor = TensorRef::<Bf16>::from_cuda(&x, &stream, &shape)?;
+//! let y_tensor = TensorMut::<Bf16>::from_cuda(&mut y, &stream, &shape)?;
+//! kernel.launch(&stream, &[x_tensor.arg(), y_tensor.arg()])?; // the dimensions and the runtime scalar come from the shapes
 //! # Ok(())
 //! # }
 //! ```
@@ -43,8 +49,18 @@
 //!
 //! # `unsafe`
 //!
-//! Only the [`DevicePtr`] constructor is `unsafe`: it is where the host says that an address is device memory that will
-//! stay valid. The driver calls are in one module that is not part of the public API.
+//! The driver calls are in one module that is not part of the public API, and the host takes on obligations in exactly two places:
+//!
+//! * [`DevicePtr::from_raw`] (`unsafe`): the host vouches for a region of device memory, by address, byte length and device: that it
+//!   is allocated there, and stays allocated (and is not raced on) until every launch that was given a tensor made of it has completed.
+//!   A tensor is *refused* when its shape needs more bytes than its region has, and the sub-regions (`offset`, `slice`) are checked, so
+//!   a launch cannot reach past what was vouched for. A tensor over a cudarc `CudaSlice` or `CudaView` needs no `unsafe`
+//!   ([`TensorRef::from_cuda`]): its length is known and the borrow keeps it alive.
+//! * [`Kernel::launch_raw`] (`unsafe`): the host vouches for a raw `CUstream` (a valid handle of the kernel's context). The safe
+//!   [`Kernel::launch`] takes cudarc's [`CudaStream`] and checks that it is of the kernel's context.
+//!
+//! Everything else is safe: a launch is checked against the manifest (shapes, dtypes, alignment, aliasing, buckets, grid) before it
+//! reaches the driver, and nothing is launched when a check fails.
 
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -61,9 +77,10 @@ mod manifest;
 mod plan;
 mod tensor;
 
+pub use cudarc;
 pub use error::{Error, PreconditionKind, Result};
 pub use ffi::DevicePtr;
-pub use kernel::{Arch, CUstream, Kernel};
+pub use kernel::{Arch, CUstream, CudaStream, Kernel};
 pub use manifest::{
     Access, Constexpr, Entry, LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin,
     Precondition, manifest_digest,
