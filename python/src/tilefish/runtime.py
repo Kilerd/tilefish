@@ -687,7 +687,7 @@ def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, 
         outs.append(t)
     written = {p.name for p in kernel.signature.params if p.kind == "tensor" and p.access != "in"}
     check_no_alias({n: tensor_info(n, t) for n, t in tensors.items()}, written)
-    returned = interpret(kernel, tensors)
+    returned = interpret(kernel, tensors, call.dims)
     return _result(returned + outs)
 
 

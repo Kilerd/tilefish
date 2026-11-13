@@ -134,6 +134,22 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
 ``max(x, axis=-1)``         ``tl.max(tl.where(mask, x, float("-inf")), axis=0)``            f32 only; masked lanes are ``-inf``
                                                                                          (``float("-inf")`` compiles: JIT and
                                                                                          AOT, ``0fFF800000`` in the PTX).
+``a == b``, ``a != b``,     ``a == b`` ... ``a >= b``; a scalar of a bf16, f16, u8 or       a mask (``bool_``, Triton's ``int1``).
+``a < b``, ``a <= b``,      i64 operand is a typed constant, ``tl.cast(c, tl.bfloat16)``,   IEEE: ``-0.0 == +0.0``, a NaN is
+``a > b``, ``a >= b``       and a literal is written already rounded to that dtype         unordered (every comparison with one is
+                                                                                         false except ``!=``, which is true).
+                                                                                         Exact; the scalar is rounded to the
+                                                                                         operand's dtype first (note 7).
+``m & n``, ``m | n``,       ``m & n``, ``m | n``, ``m ^ n``, ``~m``                         masks only (no bitwise ops on numbers)
+``m ^ n``, ``~m``
+``where(m, a, b)``          ``tl.where(m, a, b)`` (scalars typed as for a comparison)       a select: the bits of the chosen
+                                                                                         operand, unchanged (NaN payloads,
+                                                                                         ``-0.0``; note 7).
+``iota(x, axis)``           row template: ``row`` (``[R, 1]``, ``[R]``) or ``cols``         ``i32``, exact; ``dtype=i64`` adds
+                            (``[D]``); elementwise: ``offs``                                ``.to(tl.int64)``.
+``mask.to(dt)``             ``m.to(tl.<dt>)``                                               exactly 0 or 1 (zero extension,
+                                                                                         ``uitofp``); a cast *to* a mask is
+                                                                                         refused (write ``x != 0``).
 ==========================  ==========================================================  =====================================
 
 Reductions are f32 only because Triton accumulates a narrower dtype in the narrow dtype, which
@@ -202,6 +218,21 @@ Notes (the facts behind the table):
    of 129 rows). A spec fixes ``num_warps``, so ``jit``, ``replay`` and a generated host all agree, and
    ``num_warps=N`` pins one value for every bucket.
 
+7. **Comparisons, masks and ``where``.** A comparison gives a mask (``tilefish.bool_``), which is a value inside the body only: it
+   has no arithmetic and no storage type (a parameter or a result is never a mask; store one with ``.to(u8)``, read it back with
+   ``m != 0``). Masks combine with ``& | ^ ~``. Float comparisons are IEEE 754 ones, the same as torch's: ``==`` is ``oeq``, ``!=`` is
+   ``une`` (so ``x != x`` is the NaN test), ``<`` ``<=`` ``>`` ``>=`` are ordered, and ``-0.0 == +0.0``. The operands have one dtype;
+   a python number or a ``const`` takes it and is **rounded to it first**, as in arithmetic (note 3). Triton itself does not do that
+   for a comparison: it widens a bf16 or f16 tensor to f32 and compares it with the f32 literal unrounded, so ``x > 0.1`` with
+   ``x = bf16(0.1) = 0.10009765625`` is true in a hand-written kernel and false in torch. The lowering therefore writes such a scalar
+   as a typed constant, ``tl.cast(0.10009765625, tl.bfloat16)``, with a literal already rounded to the dtype (through f32, as torch
+   rounds a python float), so the comparison is exact whatever Triton widens to; a ``const`` is ``tl.cast(name, tl.bfloat16)``
+   (rounded by Triton from the f32 constant, also through f32, except for a value outside the normal f32 range, which Triton keeps
+   in f64 and rounds once). A ``u8`` or ``i64`` scalar is typed the same way, so nothing is promoted. ``where`` is a select
+   (``selp``): the result has the bits of the operand it picks, a NaN's payload and the sign of a zero included. ``iota`` and the
+   casts of a mask (0 or 1) are exact. The ``reference`` mode does all of these in torch with the scalar rounded the same way, so it
+   is byte-identical to the binary.
+
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
 accumulator dtype (a numerics-changing rewrite in the README's terms), and two binaries that differ in ``num_warps`` are not
@@ -226,6 +257,7 @@ import keyword
 import math
 import pathlib
 import re
+import struct
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -266,12 +298,18 @@ _TL = {
     "u8": "uint8",
     "e4m3": "float8e4nv",
     "e5m2": "float8e5",
+    "bool": "int1",  # a mask: a value inside the body, never loaded or stored
 }
 _ARITHMETIC = frozenset({"f32", "bf16", "f16", "i32", "i64"})
 _MATH = frozenset({"f32"})
 _BINARY = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
+_COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+_LOGICAL = {"and": "&", "or": "|", "xor": "^"}
 _UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu")
 _REDUCTIONS = ("sum", "mean", "max")
+# Triton's own type of a python literal: a scalar of any other dtype is written as a typed constant (tl.cast(0.1, tl.bfloat16)),
+# because Triton compares a bf16 or f16 tensor with a float literal in f32 (the literal is not rounded to the tensor's dtype first)
+_LITERAL_DTYPES = frozenset({"f32", "i32"})
 
 _FULL, _COL, _ROW = "full", "col", "row"  # row template: [R, D], [D], [R] / [R, 1]
 _SCALAR, _DEV = "scalar", "devscalar"  # rank 0: a value read from a DevScalar (broadcast), and the DevScalar parameter itself (a pointer to one element)
@@ -457,8 +495,8 @@ def _check_common(op: KernelOp) -> None:
                 name,
                 None,
                 "declared-op-call",
-                f"the body calls the {n.attrs['kind']} op '{n.op}'; only the built-in ops (+ - * /, silu, gelu, rsqrt, "
-                "exp, sqrt, .to, sum, mean, max and stores) are lowered",
+                f"the body calls the {n.attrs['kind']} op '{n.op}'; only the built-in ops (+ - * /, comparisons, & | ^ ~ of masks, "
+                "where, iota, silu, gelu, rsqrt, exp, sqrt, .to, sum, mean, max, load and stores) are lowered",
             )
         if n.op == "split":
             views = [str(t) for t in n.output_types if not t.contiguous]
@@ -542,6 +580,9 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
             )
     elif n.op == "load":
         _check_dtype(kernel, f"the DevScalar read by {n}", n.outputs[0].type.dtype)
+    elif n.op in _COMPARE or n.op in _LOGICAL or n.op in ("not", "where", "iota"):
+        for v in (*n.outputs, *(i for i in n.inputs if isinstance(i, Value))):
+            _check_dtype(kernel, f"{v.ref} of {n}", v.type.dtype)
     elif n.op != "store":
         raise _fail(kernel, None, "unsupported-op", f"the op '{n.op}' is not lowered")
 
@@ -605,6 +646,10 @@ class _Layout:
         raise NotImplementedError
 
     def reduce(self, op: str, a: str) -> str:
+        raise NotImplementedError
+
+    def iota(self, v: Value) -> str:
+        """The index each lane of ``v`` (the result of ``iota``) holds along the axis it counts, as ``i32``."""
         raise NotImplementedError
 
 
@@ -805,6 +850,9 @@ class _RowLayout(_Layout):
         total = f"tl.sum(tl.where({self.mask}, {a}, 0.0), axis=0)"
         return total if op == "sum" else f"{total} / {self.D_name}"
 
+    def iota(self, v: Value) -> str:
+        return self.row if self.cls[v] == _ROW else self.cols  # [R, 1] or [R]: the row; [D]: the column
+
 
 def _row_warps(block: int) -> int:
     """The row template's warp rule: one warp per 256 lanes of ``BLOCK_D``, between 1 and 16."""
@@ -906,6 +954,9 @@ class _ElementwiseLayout(_Layout):
     def reduce(self, op: str, a: str) -> str:  # pragma: no cover - rejected in __init__
         raise AssertionError("the elementwise template has no reductions")
 
+    def iota(self, v: Value) -> str:
+        return self.offs  # the result has the kernel's shape, which is rank 1 (every other iota is broadcast, which this template refuses)
+
 
 def _product(shape: "tuple[DimExpr, ...]") -> "DimExpr | None":
     """``prod(shape)`` as a dimension expression, or ``None`` when it is not affine (two symbolic factors)."""
@@ -947,6 +998,29 @@ def _scalar_text(s: Scalar, rename: "dict[str, str]") -> str:
     return repr(v)
 
 
+def _round_float(value: float, dtype: str) -> float:
+    """A python float rounded to nearest even in ``dtype`` (``f32``, ``bf16`` or ``f16``) through f32, as torch rounds one; NaN stays NaN."""
+    if math.isnan(value) or math.isinf(value):
+        return value
+    try:
+        (f,) = struct.unpack("<f", struct.pack("<f", value))
+    except OverflowError:  # rounds beyond the largest f32
+        return math.copysign(math.inf, value)
+    if dtype == "f32":
+        return f
+    if dtype == "f16":
+        try:
+            (h,) = struct.unpack("<e", struct.pack("<e", f))
+        except OverflowError:
+            return math.copysign(math.inf, f)
+        return float(h)
+    assert dtype == "bf16", dtype
+    (b,) = struct.unpack("<I", struct.pack("<f", f))
+    b = ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) << 16 & 0xFFFFFFFF  # round to nearest even on the upper 16 bits (overflow gives inf)
+    (r,) = struct.unpack("<f", struct.pack("<I", b))
+    return r
+
+
 def _is_self_store(n: Node) -> bool:
     """``x[...] = x``: the stored value is the version the store replaces."""
     return n.inputs[0] is n.inputs[1]
@@ -978,6 +1052,16 @@ class _Body:
 
     def operand(self, x: "Value | Scalar") -> str:
         return self.var[x] if isinstance(x, Value) else _scalar_text(x, self.rename)
+
+    def typed(self, x: "Value | Scalar") -> str:
+        """An operand of a comparison or a ``where``: a scalar of a dtype that is not Triton's own literal type is a typed constant,
+        so that it is rounded to its dtype (Triton would compare a bf16 tensor with an f32 literal, unrounded). A literal is written
+        already rounded (through f32, as torch rounds a python float), so the constant is exact whatever Triton makes of it."""
+        if not isinstance(x, Scalar) or x.dtype.name in _LITERAL_DTYPES:
+            return self.operand(x)
+        if x.name is None and x.dtype.is_float:
+            x = Scalar(_round_float(float(x.value), x.dtype.name), x.dtype)
+        return f"tl.cast({self.operand(x)}, tl.{_TL[x.dtype.name]})"
 
     def run(self) -> "list[str]":
         graph, layout = self.graph, self.layout
@@ -1034,7 +1118,18 @@ class _Body:
             ptr = n.inputs[0]
             assert isinstance(ptr, Value)
             return f"tl.load({self.rename.get(ptr.name, ptr.name)})"
+        if op in _COMPARE:
+            return f"{self.typed(n.inputs[0])} {_COMPARE[op]} {self.typed(n.inputs[1])}"
+        if op == "where":
+            return f"tl.where({self.operand(n.inputs[0])}, {self.typed(n.inputs[1])}, {self.typed(n.inputs[2])})"
+        if op == "iota":
+            index = self.layout.iota(n.outputs[0])
+            return index if n.outputs[0].type.dtype.name == "i32" else f"{index}.to(tl.{_TL[n.outputs[0].type.dtype.name]})"
         a = [self.operand(i) for i in n.inputs]
+        if op in _LOGICAL:
+            return f"{a[0]} {_LOGICAL[op]} {a[1]}"
+        if op == "not":
+            return f"~{a[0]}"
         if op in _BINARY:
             return f"{a[0]} {_BINARY[op]} {a[1]}"
         if op == "rsqrt":

@@ -29,6 +29,7 @@ from .dtypes import (
     BlockScaled,
     DType,
     bf16,
+    bool_,
     e2m1,
     e4m3,
     e5m2,
@@ -58,7 +59,7 @@ from ._manifest import Manifest
 from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
-from .ops import exp, gelu, load, rsqrt, silu, sqrt
+from .ops import exp, gelu, iota, load, rsqrt, silu, sqrt, where
 from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
@@ -117,6 +118,7 @@ __all__ = [
     "Value",
     "aot",
     "bf16",
+    "bool_",
     "capture",
     "cdiv",
     "const",
@@ -131,6 +133,7 @@ __all__ = [
     "graph",
     "i32",
     "i64",
+    "iota",
     "kernel",
     "library",
     "load",
@@ -143,4 +146,5 @@ __all__ = [
     "sqrt",
     "u8",
     "ue8m0",
+    "where",
 ]

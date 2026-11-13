@@ -25,7 +25,7 @@ class DType:
 
     name: str
     bits: int
-    kind: str  # "float" | "int" | "uint"
+    kind: str  # "float" | "int" | "uint" | "bool"
     triton_ptr: str
     triton_scalar: str | None = None
     exp_bits: int = 0  # floats only
@@ -40,6 +40,11 @@ class DType:
     @property
     def is_int(self) -> bool:
         return self.kind in ("int", "uint")
+
+    @property
+    def is_bool(self) -> bool:
+        """Whether this is :data:`bool_`, the type of a mask (what a comparison gives) inside a kernel body."""
+        return self.kind == "bool"
 
     @property
     def elems_per_byte(self) -> int:
@@ -60,6 +65,10 @@ class DType:
         """True when every value of ``src`` is exactly representable in ``self``."""
         if src == self:
             return True
+        if src.is_bool:  # a mask is 0 or 1, which every type represents
+            return True
+        if self.is_bool:  # a mask comes from a comparison (x != 0), never from a cast
+            return False
         if self.is_float:
             if src.is_float:
                 return (
@@ -98,7 +107,7 @@ class DType:
 def _rebuild_dtype(*fields: Any) -> DType:
     """Unpickling and deep copies of a built-in dtype give back the dtype object itself."""
     built = DType(*fields)
-    canonical = ALL_DTYPES.get(built.name)
+    canonical = ALL_DTYPES.get(built.name, bool_ if built.name == "bool" else None)
     return canonical if canonical == built else built
 
 
@@ -114,6 +123,12 @@ e5m2 = DType("e5m2", 8, "float", "*fp8e5", "fp8e5", exp_bits=5, man_bits=2, comp
 e2m1 = DType("e2m1", 4, "float", "*u8", None, exp_bits=2, man_bits=1, computable=False)
 # 8-bit unsigned power-of-two scale (exponent only).
 ue8m0 = DType("ue8m0", 8, "float", "*u8", None, exp_bits=8, man_bits=0, signed=False, computable=False)
+
+# The type of a mask: what a comparison (==, !=, <, <=, >, >=) gives, what &, |, ^ and ~ combine and what tilefish.where selects
+# with. It is a value inside a kernel body only. It has no arithmetic, and it is not a storage type: no parameter, result or manifest
+# entry has it (so it is not in ALL_DTYPES). A mask is stored as a number with .to(u8) (0 or 1) and read back with a comparison
+# (m != 0). Triton's int1.
+bool_ = DType("bool", 8, "bool", "*i1", "i1", signed=False, computable=False)
 
 ALL_DTYPES: Mapping[str, DType] = {
     d.name: d for d in (bf16, f16, f32, i32, i64, u8, e4m3, e5m2, e2m1, ue8m0)

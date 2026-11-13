@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._launch import TORCH_DTYPE_NAMES
+from ._launch import TORCH_DTYPE_NAMES, eval_dim
 from .decorators import KernelOp
 from .errors import TilefishRuntimeError
 from .ir import Scalar
@@ -36,6 +36,7 @@ from .trace import Value
 
 _E4M3_MAX = 448.0
 _E5M2_MAX = 57344.0
+_COMPARE = {"eq": "eq", "ne": "ne", "lt": "lt", "le": "le", "gt": "gt", "ge": "ge"}  # IR op -> torch function
 
 
 def _torch() -> Any:
@@ -47,6 +48,8 @@ def _torch() -> Any:
 
 
 def torch_dtype(torch: Any, dt: Any) -> Any:
+    if dt.name == "bool":  # a mask: a value inside the body only
+        return torch.bool
     return getattr(torch, TORCH_DTYPE_NAMES[dt.name].split(".")[1])
 
 
@@ -72,10 +75,11 @@ def cast(torch: Any, x: Any, src: Any, dst: Any) -> Any:
     return x.to(target)
 
 
-def interpret(kernel: KernelOp, tensors: "dict[str, Any]") -> "list[Any]":
+def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int] | None" = None) -> "list[Any]":
     """Evaluate the kernel body on ``tensors`` (name -> tensor, every parameter; ``Out`` ones are filled in place).
 
-    Returns the returned values as fresh tensors, in order. ``InOut`` and ``Out`` tensors are written in place.
+    ``dims`` are the dimensions the call bound (``iota`` counts up to one of them). Returns the returned values as fresh tensors, in
+    order. ``InOut`` and ``Out`` tensors are written in place.
     """
     torch = _torch()
     graph = kernel.graph
@@ -110,6 +114,20 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]") -> "list[Any]":
             (out,) = n.outputs
             if op == "load":  # the one element of a DevScalar, as a 0-d tensor (it broadcasts like the kernel's scalar does)
                 r = a[0].reshape(())
+            elif op in _COMPARE:  # IEEE comparisons (a NaN is unordered: only != is true), the scalar rounded to the IR dtype
+                r = getattr(torch, _COMPARE[op])(a[0], a[1])
+            elif op in ("and", "or", "xor"):
+                r = getattr(torch, f"logical_{op}")(a[0], a[1])
+            elif op == "not":
+                r = torch.logical_not(a[0])
+            elif op == "where":  # a select: the chosen operand's bits as they are
+                r = torch.where(a[0], a[1], a[2])
+            elif op == "iota":
+                size = eval_dim(n.attrs["dim"], dims or {})
+                if size is None:
+                    raise TilefishRuntimeError(f"reference mode: the size {n.attrs['dim']} that iota counts along is not determined by the arguments")
+                shape = [size] + [1] * (out.type.rank - 1)
+                r = torch.arange(size, dtype=torch_dtype(torch, out.type.dtype), device=device).reshape(shape)
             elif op == "add":
                 r = a[0] + a[1]
             elif op == "sub":

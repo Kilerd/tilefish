@@ -134,14 +134,6 @@ _UNSUPPORTED = {
     "__rfloordiv__": ("floor division (//)", "use / on floating-point tensors"),
     "__mod__": ("modulo (%)", "there is no modulo op yet"),
     "__rmod__": ("modulo (%)", "there is no modulo op yet"),
-    "__lt__": ("comparison (<)", "comparisons and masks are not part of the traced ops yet"),
-    "__le__": ("comparison (<=)", "comparisons and masks are not part of the traced ops yet"),
-    "__gt__": ("comparison (>)", "comparisons and masks are not part of the traced ops yet"),
-    "__ge__": ("comparison (>=)", "comparisons and masks are not part of the traced ops yet"),
-    "__and__": ("bitwise and (&)", "there are no bitwise ops yet"),
-    "__or__": ("bitwise or (|)", "there are no bitwise ops yet"),
-    "__xor__": ("bitwise xor (^)", "there are no bitwise ops yet"),
-    "__invert__": ("bitwise not (~)", "there are no bitwise ops yet"),
     "__lshift__": ("shift (<<)", "there are no bitwise ops yet"),
     "__rshift__": ("shift (>>)", "there are no bitwise ops yet"),
     "__len__": ("len()", "use .shape"),
@@ -271,7 +263,8 @@ class Value:
         raise TilefishAttributeError(
             f"traced tensor {self.ref} ({self.type}) has no attribute '{name}': a tensor has "
             ".shape, .dtype, .rank, .to(dtype), .split(size, axis), the views .reshape(*dims), .permute(*axes), .select(axis, i) "
-            "and x[i], .sum/.mean/.max(axis, keepdims) and the operators + - * /"
+            "and x[i], .sum/.mean/.max(axis, keepdims), the operators + - * /, the comparisons == != < <= > >= (a mask) and, "
+            "on masks, & | ^ ~"
         )
 
     # -- methods ------------------------------------------------------------
@@ -366,6 +359,75 @@ class Value:
         from . import ops
 
         return ops.binary("div", other, self)
+
+    # comparisons give a mask (bool_); a reflected comparison (0.5 < x) arrives here as its mirror (x > 0.5)
+
+    def __eq__(self, other: Any) -> "Value":  # type: ignore[override]
+        from . import ops
+
+        return ops.compare("eq", self, other)
+
+    def __ne__(self, other: Any) -> "Value":  # type: ignore[override]
+        from . import ops
+
+        return ops.compare("ne", self, other)
+
+    def __lt__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.compare("lt", self, other)
+
+    def __le__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.compare("le", self, other)
+
+    def __gt__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.compare("gt", self, other)
+
+    def __ge__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.compare("ge", self, other)
+
+    # masks combine with & | ^ ~ (logical, on masks only: integers have no bitwise ops yet)
+
+    def __and__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("and", self, other)
+
+    def __rand__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("and", other, self)
+
+    def __or__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("or", self, other)
+
+    def __ror__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("or", other, self)
+
+    def __xor__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("xor", self, other)
+
+    def __rxor__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("xor", other, self)
+
+    def __invert__(self) -> "Value":
+        from . import ops
+
+        return ops.logical_not(self)
 
     def __setitem__(self, key: Any, value: Any) -> None:
         from . import ops

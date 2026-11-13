@@ -213,6 +213,7 @@ def parse_signature(
                 raise TilefishDeclarationError(
                     f"{where}: parameter '{pname}' is Strided[...], which only an extern op can take (a {what} takes contiguous tensors)"
                 )
+            require_storable(where, f"parameter '{pname}'", ann.type)
             param = Param(pname, index, "tensor", "in", type=ann.type, keyword_only=kw, strided=True, align=ann.align)
         elif isinstance(ann, StrideOf):
             if not allow_strided:
@@ -275,6 +276,15 @@ def parse_signature(
     return result
 
 
+def require_storable(where: str, label: str, t: TensorType) -> None:
+    """A tensor that lives in memory (a parameter or a result) has a storage dtype: a mask (``bool_``) is a value inside a body only."""
+    if isinstance(t.dtype, DType) and t.dtype.is_bool:
+        raise TilefishDeclarationError(
+            f"{where}: {label} is {t!r}, a mask: a mask is a value inside a kernel body and has no storage type here. Store it as a "
+            "number with .to(u8) (0 or 1) and read it back with a comparison (m != 0)"
+        )
+
+
 def _require_contiguous(where: str, what: str, label: str, t: TensorType) -> None:
     """A tensor annotation that is not ``Strided[...]`` is a contiguous tensor: row-major strides, offset 0, 16-byte aligned.
 
@@ -282,6 +292,7 @@ def _require_contiguous(where: str, what: str, label: str, t: TensorType) -> Non
     assumes of a graph's parameters, and what the Rust host checks. A ``TensorType`` with other strides, an offset or no alignment would
     say otherwise and be believed by nothing, so it is refused here: a parameter that takes a view is ``Strided[...]``.
     """
+    require_storable(where, label, t)
     offset = t.offset
     dense = t.strides is None and offset is not None and offset.is_static and offset.value == 0
     if dense and t.contiguous:
