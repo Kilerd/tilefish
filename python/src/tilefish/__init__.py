@@ -19,6 +19,12 @@ strides as ``StrideOf`` scalars), device scalars (``DevScalar[dtype]``, read wit
 
 M3.2 (P2): :func:`plan` compiles a graph into a static launch plan with an arena memory plan per shape bucket (:mod:`tilefish._plan`), :func:`tilefish.runtime.export` writes it as
 ``plan.json`` next to the manifest (``docs/plan-schema-1.md``), and :func:`run` of a graph executes it in ``jit``, ``replay`` and ``reference`` modes, capturable in a CUDA graph.
+
+M3.3: a lowered kernel compares (a mask, :data:`bool_`), selects (:func:`where`), counts positions (:func:`iota`, integer ``//`` and ``%``),
+reduces to an index (:func:`argmax`, :func:`argmin`), gathers and scatters rows (:func:`gather_rows`, :func:`scatter_rows`), takes
+:func:`sin` and :func:`cos`, keeps a NaN's payload in a cast (``x.to(bf16, nan="preserve")``) and broadcasts an operand over the leading
+axes; a graph materialises a view (:func:`contiguous`) and the patches of a convolution (:func:`im2col`). The numerics contract of each is in
+:mod:`tilefish.lower` (notes 7 to 11) and :mod:`tilefish._copyops`.
 """
 
 from . import aot
