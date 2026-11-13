@@ -209,33 +209,43 @@ def pair():
     return s, x1, z1
 
 
-def rounds_on_two_streams(s, x1, z1, rounds):
-    """``three_x`` on one stream and ``tripled`` on another, enqueued back to back with no synchronization: the number of rounds whose results are wrong."""
+def rounds_on_two_streams(s, x1, z1, rounds, spin):
+    """``three_x`` on one stream and ``tripled`` on another, every round enqueued back to back with no synchronization until the last: the number of
+    rounds whose results are wrong. With ``spin``, both streams start with a spin of the same length, behind which the host enqueues every round, so when
+    the spins end the two streams' work is released together and overlaps however fast the GPU is (a large GPU finishes one run before the host has
+    enqueued the next, and without the spin would never overlap them; a small one overlaps them without it)."""
     s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
-    wrong = 0
+    torch.cuda.synchronize()
+    for stream in (s1, s2) if spin else ():
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(50_000_000)  # tens of milliseconds of one thread spinning: far longer than enqueueing every round
+    results = []
     for _ in range(rounds):
-        torch.cuda.synchronize()
         with torch.cuda.stream(s1):
             y1 = s.run(three_x, x1)
         with torch.cuda.stream(s2):
             y2 = s.run(tripled, z1)
-        torch.cuda.synchronize()
-        wrong += int(not same_bytes(y1, x1 * 3.0) or not same_bytes(y2, z1 * 3.0))
-    return wrong
+        results.append((y1, y2))
+    torch.cuda.synchronize()
+    return sum(int(not same_bytes(y1, x1 * 3.0) or not same_bytes(y2, z1 * 3.0)) for y1, y2 in results)
 
 
 def test_two_plans_of_a_shared_arena_on_two_streams_run_one_after_the_other(pair, monkeypatch):
     s, x1, z1 = pair
-    rounds = 10
-    ordered = rounds_on_two_streams(s, x1, z1, rounds)
+    rounds = 20
+
+    def both():  # the rounds enqueued behind a spin and without one: each provokes the race on some GPU
+        return rounds_on_two_streams(s, x1, z1, rounds, spin=True) + rounds_on_two_streams(s, x1, z1, rounds, spin=False)
+
+    ordered = both()
 
     def unordered(be, arena, stream, capturing, work):  # the negative control: no wait for the order event, no record
         work()
 
     monkeypatch.setattr(_planrun, "_ordered", unordered)
-    raced = rounds_on_two_streams(s, x1, z1, rounds)
+    raced = both()
     monkeypatch.undo()
-    print(f"\n[shared arena] two plans on two streams, {rounds} rounds: {ordered} wrong with the arena's order event, {raced} wrong without it")
+    print(f"\n[shared arena] two plans on two streams, 2 x {rounds} rounds: {ordered} wrong with the arena's order event, {raced} wrong without it")
     assert ordered == 0
     assert raced > 0, "the negative control saw no race: the test would not see one either"
 
