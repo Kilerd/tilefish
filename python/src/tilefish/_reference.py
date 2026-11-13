@@ -14,7 +14,9 @@ node by node:
   (``div.full.f32`` of a constant divisor is a multiply by the correctly rounded f32 reciprocal), and so
   is ``mean`` (``sum / D``);
 * reductions are torch's; ``argmax`` and ``argmin`` follow the contract (the first NaN, else the first extreme value), written out in torch;
-* comparisons, masks, ``where`` and ``iota`` are torch's, with a scalar rounded to the IR dtype as above: exact, like the binary.
+* comparisons, masks, ``where`` and ``iota`` are torch's, with a scalar rounded to the IR dtype as above: exact, like the binary;
+* ``gather_rows`` and ``scatter_rows`` are torch indexing with the out-of-range policy of the call: raw copies, exact (where a scatter's
+  indices in range are distinct; with duplicates neither the binary nor the reference says which row lands).
 
 What stays different, and what a tolerance has to cover, is everything the binary does approximately:
 ``/`` between tensors (``div.full.f32``), ``exp`` (``ex2.approx``), ``rsqrt``, ``erf`` (libdevice), the
@@ -125,6 +127,15 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 if n.inputs[0] is not n.inputs[1]:  # `x[...] = x` writes nothing
                     final[n.attrs["target"]] = value
                 continue
+            if op == "scatter_rows":  # rows copied to the index, the others kept; an index out of range is skipped
+                dst, idx, src = (env[i] for i in n.inputs)  # type: ignore[index]
+                idx = idx.long()
+                ok = (idx >= 0) & (idx < dst.shape[0])
+                value = dst.clone()
+                value[idx[ok]] = src[ok]
+                env[n.outputs[0]] = value
+                final[n.attrs["target"]] = value
+                continue
             if "kind" in n.attrs:
                 raise TilefishRuntimeError(
                     f"reference mode does not interpret the call to the {n.attrs['kind']} op '{op}' inside kernel "
@@ -148,6 +159,15 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                     raise TilefishRuntimeError(f"reference mode: the size {n.attrs['dim']} that iota counts along is not determined by the arguments")
                 shape = [size] + [1] * (out.type.rank - 1)
                 r = torch.arange(size, dtype=torch_dtype(torch, out.type.dtype), device=device).reshape(shape)
+            elif op == "gather_rows":  # a raw copy of rows; out of range: a row of zeros (all bits clear), or the nearest row
+                table, idx = a[0], a[1].long()
+                rows = table.shape[0]
+                if n.attrs["oob"] == "clamp":
+                    r = table[idx.clamp(0, rows - 1)]
+                else:
+                    ok = (idx >= 0) & (idx < rows)
+                    r = table[torch.where(ok, idx, torch.zeros_like(idx))]
+                    r = torch.where(ok.reshape(*ok.shape, *([1] * (table.dim() - 1))), r, torch.zeros((), dtype=r.dtype, device=r.device))
             elif op in ("argmax", "argmin"):
                 (ax,) = n.attrs["axes"]
                 r = arg_reduce(torch, a[0], ax, n.attrs["keepdims"], op == "argmax", torch_dtype(torch, n.attrs["dtype"]))

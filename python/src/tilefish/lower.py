@@ -11,8 +11,9 @@ naming the rule that failed (``rule`` attribute). Without ``template=`` the elem
 is tried first, then the row template.
 
 **row** (``R`` rows, one program per row, grid ``(R,)``). Every tensor is ``[R, D]``, ``[D]``
-(shared by all rows), ``[R]`` or ``[R, 1]`` (one value per row). Reductions (``sum``, ``mean``,
-``max``) run over the last axis of an ``[R, D]`` tensor only. ``D`` is static, or bucketed (one
+(shared by all rows), ``[R]`` or ``[R, 1]`` (one value per row), except a table of ``gather_rows`` or
+``scatter_rows`` (``[N, D]`` or ``[N]``, addressed by an index; note 9). Reductions (``sum``, ``mean``,
+``max``, ``argmax``, ``argmin``) run over the last axis of an ``[R, D]`` tensor only. ``D`` is static, or bucketed (one
 compile spec per bucket); ``R`` is dynamic and only appears in the grid. Prologue::
 
     row = tl.program_id(0)
@@ -29,7 +30,8 @@ warps of its own ``BLOCK_D`` (the spec of the ``D = 96`` binary says 1 warp whet
 ``@tilefish.kernel(num_warps=N)`` or ``lower(num_warps=N)`` pins ``N`` for every bucket.
 
 **elementwise** (grid ``(cdiv(n, 1024),)``). Every tensor has the same shape, flattened to
-``n = prod(shape)``; no broadcasting except python and ``const`` scalars; no reductions. ``n`` is a
+``n = prod(shape)`` (but an ``[N]`` table of ``gather_rows`` / ``scatter_rows``, addressed by an index);
+no broadcasting except python and ``const`` scalars; no reductions. ``n`` is a
 runtime ``i32`` parameter whose dimension is that product (``3072*M``), so a spec says how to
 compute it and ``compile_specs`` emits ``tt.divisibility`` when the product is provably a multiple
 of 16. When the product is not affine (two symbolic dimensions), ``n`` gets a fresh dimension that
@@ -154,6 +156,13 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
 ``argmin(x, -1, dtype=)``   masked lanes), then ``tl.min`` of ``cols`` where the row        else the first extreme value
                             holds it, or where it holds a NaN (note 8)                      (``-0.0 == +0.0``); torch's rule.
                                                                                          ``dtype`` is ``i32`` or ``i64``.
+``gather_rows(x, idx,       ``ok = (i >= 0) & (i < x_rows)``, then                          a raw copy (the loaded bits are the
+oob="zero" | "clamp")``     ``tl.load(x + i * D + cols, mask=mask & ok, other=0)``;         stored bits). Out of range: a row of
+                            ``clamp``: ``i = tl.minimum(tl.maximum(i, 0), x_rows - 1)``     ``+0.0`` (``zero``) or row 0 / N - 1
+                            (an ``[N]`` table: ``x + i``)                                   (``clamp``); note 9.
+``scatter_rows(dst, idx,    ``tl.store(dst + i * D + cols, src, mask=mask & ok)``           a raw copy; a row whose index is out
+src, oob="skip")``                                                                          of range is not written; indices in
+                                                                                         range must be distinct (note 9).
 ==========================  ==========================================================  =====================================
 
 Reductions are f32 only because Triton accumulates a narrower dtype in the narrow dtype, which
@@ -247,6 +256,21 @@ Notes (the facts behind the table):
    extreme), and a max or a min is exact and independent of the reduction tree: unlike ``sum``, the result does not depend on
    ``num_warps`` (whatever ``tl.max`` does with a NaN or with the two zeros, the lanes are then picked by equality and the NaN test).
    Only the row template has it, along the last axis.
+9. **Gathers and scatters of rows.** ``gather_rows(x, idx, oob=...)`` is ``x[idx]`` along the first axis and ``scatter_rows(dst, idx, src,
+   oob="skip")`` is ``dst[idx] = src`` in place (an index copy). Both are raw copies: a value is loaded and stored with no arithmetic, so a
+   NaN keeps its payload and a zero its sign. The table ``x`` is a read-only ``Tensor[...]`` parameter and ``dst`` an ``InOut`` parameter
+   that nothing else in the kernel reads or writes (rules ``gather.table``, ``scatter.target``): their rows are addressed by the index,
+   not by the program, so the template does not fit them to its shapes. A table is ``[N, D]`` with the row template's ``D`` (one program
+   per index, which reads or writes one row; ``idx`` is ``[R]``) or ``[N]`` (any template; element by element). An index is an ``i32``,
+   ``i64`` or ``u8`` tensor of device data, which nothing checks before the kernel reads it, so what an index outside ``[0, N)`` does is
+   part of the call and has no default: ``"zero"`` loads a row of ``+0.0`` (all bits clear; the load is masked, nothing out of range is
+   read), ``"clamp"`` loads row 0 or ``N - 1``, and a scatter's ``"skip"`` writes nothing for that row. A negative index is out of range
+   (no wrap-around). There is no unchecked mode: the check is one compare per row. ``N`` is a parameter after the template's own
+   (``<x>_rows``: a ``tl.constexpr`` when ``N`` is static or bucketed, a runtime ``i32`` when it is dynamic). The offset is ``i32``: the
+   index is checked (or clamped) first, and ``N * D`` is held to ``2**31 - 1`` elements like every tensor's size (rule ``index-range``, a
+   ``max_elements`` precondition when it is dynamic), so ``i * D + cols`` fits. The indices in range of one scatter must be distinct:
+   two programs that write one row race, and which bytes land is not defined (torch's ``index_copy_`` does not define it either).
+   Rows of ``dst`` that no index names keep their bytes.
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -512,7 +536,7 @@ def _check_common(op: KernelOp) -> None:
                 None,
                 "declared-op-call",
                 f"the body calls the {n.attrs['kind']} op '{n.op}'; only the built-in ops (+ - * /, comparisons, & | ^ ~ of masks, "
-                "where, iota, silu, gelu, rsqrt, exp, sqrt, .to, sum, mean, max, load and stores) are lowered",
+                "where, iota, silu, gelu, rsqrt, exp, sqrt, .to, sum, mean, max, argmax, argmin, gather_rows, scatter_rows, load and stores) are lowered",
             )
         if n.op == "split":
             views = [str(t) for t in n.output_types if not t.contiguous]
@@ -596,11 +620,86 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
             )
     elif n.op == "load":
         _check_dtype(kernel, f"the DevScalar read by {n}", n.outputs[0].type.dtype)
-    elif n.op in _COMPARE or n.op in _LOGICAL or n.op in ("not", "where", "iota") or n.op in _ARG_REDUCTIONS:
+    elif n.op in _COMPARE or n.op in _LOGICAL or n.op in ("not", "where", "iota", "gather_rows", "scatter_rows") or n.op in _ARG_REDUCTIONS:
         for v in (*n.outputs, *(i for i in n.inputs if isinstance(i, Value))):
             _check_dtype(kernel, f"{v.ref} of {n}", v.type.dtype)
     elif n.op != "store":
         raise _fail(kernel, None, "unsupported-op", f"the op '{n.op}' is not lowered")
+
+
+# -- tables: the parameters a gather reads or a scatter writes at computed rows ---------------------------------------------------
+
+
+@dataclass
+class _Tables:
+    """The parameters that ``gather_rows`` reads and ``scatter_rows`` writes at computed rows (note 9).
+
+    ``params`` maps each to ``"gather"`` or ``"scatter"``, in the order the kernel declares them; ``only`` are those that nothing else in the
+    body reads (the prologue does not load them and the template does not fit them to its shapes: their rows are addressed by the index);
+    ``versions`` are the versions of the targets that the scatters make (written in place, read by nothing).
+    """
+
+    params: "dict[Value, str]"
+    only: "set[Value]"
+    versions: "set[Value]"
+
+    def skip(self, v: Value) -> bool:
+        """Whether the template leaves ``v`` out of its shapes: a table that only the index addresses, or the version a scatter makes."""
+        return v in self.only or v in self.versions
+
+
+def _tables(op: KernelOp) -> _Tables:
+    graph, name = op.graph, op.name
+    found: dict[Value, str] = {}
+    versions: set[Value] = set()
+    for n in graph.nodes:
+        if n.op == "gather_rows":
+            x = n.inputs[0]
+            assert isinstance(x, Value)
+            if not (x.is_param and x.access == "in") or x.type.devscalar:
+                raise _fail(
+                    name,
+                    None,
+                    "gather.table",
+                    f"{n}: the table {_label(x)} is not a read-only tensor parameter of the kernel. A gather reads rows of a tensor in memory "
+                    "at indices computed in the kernel, so its table is a Tensor[...] parameter: a computed value has no rows in memory, and "
+                    "a parameter the kernel writes would race with the reads of the other row programs",
+                )
+            found.setdefault(x, "gather")
+        elif n.op == "scatter_rows":
+            t = n.inputs[0]
+            assert isinstance(t, Value)
+            if not (t.is_param and t.access == "inout") or t in found:
+                raise _fail(
+                    name,
+                    None,
+                    "scatter.target",
+                    f"{n}: the target '{n.attrs['target']}' is written before this scatter (by a store or another scatter). The rows of a "
+                    "scatter target are written at indices computed in every program, so one scatter is its only write",
+                )
+            found[t] = "scatter"
+            versions.add(n.outputs[0])
+    for t in found:
+        if t.type.rank > 2:
+            raise _fail(
+                name, None, "table-rank", f"{_label(t)} has rank {t.type.rank}; a gather or a scatter addresses rows of a [N, D] or [N] tensor"
+            )
+    used: set[Value] = set()
+    for n in graph.nodes:
+        ins = n.inputs[1:] if n.op in ("gather_rows", "scatter_rows") else n.inputs
+        used.update(i for i in ins if isinstance(i, Value))
+    used.update(graph.outputs)
+    for t, kind in found.items():
+        if kind == "scatter" and (t in used or used & versions):
+            raise _fail(
+                name,
+                None,
+                "scatter.target",
+                f"the scatter target {_label(t)} is also read, stored into or returned by the kernel. Its rows are written at indices "
+                "computed in every program, so any other access races with them: a scatter is the only use of its target",
+            )
+    ordered = {v: found[v] for v in graph.inputs if v in found}
+    return _Tables(ordered, {t for t in ordered if t not in used}, versions)
 
 
 # -- names --------------------------------------------------------------------------------------
@@ -668,6 +767,35 @@ class _Layout:
         """The index each lane of ``v`` (the result of ``iota``) holds along the axis it counts, as ``i32``."""
         raise NotImplementedError
 
+    # -- tables (gather_rows, scatter_rows) --------------------------------------------------------------------------------------
+
+    tables: _Tables
+    rows_name: "dict[Value, str]"
+
+    def table_extras(self, names: _Names) -> "list[_Extra]":
+        """One parameter per table, after the template's own: its number of rows ``N``, which an index is checked against. A ``tl.constexpr``
+        when ``N`` is static or bucketed (one binary per bucket), a runtime ``i32`` when it is dynamic."""
+        self.rows_name = {}
+        out = []
+        for t in self.tables.params:
+            n = t.type.shape[0].folded()
+            nm = self.rows_name[t] = names.fresh(f"{t.name}_rows")
+            if n.is_static:
+                out.append(_Extra(nm, True, _const_param(nm, n.value)))
+            elif all(d.buckets for d in n.free_dims()):
+                out.append(_Extra(nm, True, _const_param(nm, n)))
+            else:
+                out.append(_Extra(nm, False, Param(nm, 0, "dim", dim=n)))
+        return out
+
+    def row_offset(self, t: Value, i: str) -> str:
+        """The offset of the element (row ``i`` of the table ``t``) that a lane reads or writes: ``i`` for a rank-1 table."""
+        return i
+
+    def row_mask(self, v: Value, ok: "str | None") -> "str | None":
+        """The mask of a gather that makes ``v`` (or of a scatter of ``v``), with the index check ``ok`` (``None``: none)."""
+        raise NotImplementedError
+
 
 def _const_param(name: str, default: Any) -> Param:
     return Param(name, 0, "const", default=default, keyword_only=True)
@@ -676,9 +804,10 @@ def _const_param(name: str, default: Any) -> Param:
 class _RowLayout(_Layout):
     template = "row"
 
-    def __init__(self, op: KernelOp) -> None:
+    def __init__(self, op: KernelOp, tables: _Tables) -> None:
         graph, name = op.graph, op.name
-        values = _all_values(graph)
+        self.tables = tables
+        values = [v for v in _all_values(graph) if not tables.skip(v)]
         for v in values:
             if v.type.rank > 2:
                 raise _fail(
@@ -769,7 +898,7 @@ class _RowLayout(_Layout):
                         f"{n.op} of {_label(src)}: a reduction needs an [R, D] input, this tensor is one value per row",
                     )
         for p in graph.inputs:
-            if p.access != "in" and self.cls[p] == _COL:
+            if p.access != "in" and self.cls.get(p) == _COL:
                 raise _fail(
                     name,
                     "row",
@@ -792,6 +921,15 @@ class _RowLayout(_Layout):
                     "row",
                     "row.scalar-output",
                     f"the returned {_label(v)} is a scalar (read from a DevScalar); combine it with a tensor first",
+                )
+        for n in graph.nodes:
+            if n.op == "scatter_rows" and self.cls[n.inputs[1]] == _COL:  # type: ignore[index]
+                raise _fail(
+                    name,
+                    "row",
+                    "row.scatter-index",
+                    f"{n}: the index has shape [D], so every row program would write the same elements (a race); a scatter's index "
+                    "is [R] (one row each) or [R, D]",
                 )
         self.grid = (self.R.folded(),)
 
@@ -819,7 +957,16 @@ class _RowLayout(_Layout):
         return [
             _Extra(self.D_name, True, _const_param(self.D_name, d_default)),
             _Extra(self.BLOCK_name, True, _const_param(self.BLOCK_name, block_default)),
+            *self.table_extras(names),
         ]
+
+    def row_offset(self, t: Value, i: str) -> str:
+        return f"{i} * {self.D_name} + {self.cols}" if t.type.rank == 2 else i
+
+    def row_mask(self, v: Value, ok: "str | None") -> "str | None":
+        if self.cls[v] == _ROW:  # one element per row program: only the index check
+            return ok
+        return self.mask if ok is None else f"{self.mask} & {ok}"
 
     def prologue(self) -> "list[str]":
         return [
@@ -894,9 +1041,19 @@ def _max_block(kernel: str, d: DimExpr) -> int:
 class _ElementwiseLayout(_Layout):
     template = "elementwise"
 
-    def __init__(self, op: KernelOp) -> None:
+    def __init__(self, op: KernelOp, tables: _Tables) -> None:
         graph, name = op.graph, op.name
-        all_values = _all_values(graph)
+        self.tables = tables
+        for t in tables.params:
+            if t.type.rank != 1:
+                raise _fail(
+                    name,
+                    "elementwise",
+                    "elementwise.table-rank",
+                    f"{_label(t)} is a table of rows [N, D]; the elementwise template gathers and scatters elements of an [N] table, a "
+                    "row of [N, D] is one program of the row template",
+                )
+        all_values = [v for v in _all_values(graph) if not tables.skip(v)]
         for v in all_values:
             if v.type.rank == 0 and v.is_param and not v.type.devscalar:
                 raise _fail(name, "elementwise", "elementwise.same-shape", f"{_label(v)} has rank 0; give it a shape, or declare a DevScalar")
@@ -942,7 +1099,11 @@ class _ElementwiseLayout(_Layout):
         return [
             _Extra(self.n_name, False, Param(self.n_name, 0, "dim", dim=self.n_dim)),
             _Extra(self.BLOCK_name, True, _const_param(self.BLOCK_name, ELEMENTWISE_BLOCK)),
+            *self.table_extras(names),
         ]
+
+    def row_mask(self, v: Value, ok: "str | None") -> "str | None":
+        return self.mask if ok is None else f"{self.mask} & {ok}"
 
     def prologue(self) -> "list[str]":
         return [
@@ -1091,17 +1252,21 @@ class _Body:
                 if not _is_self_store(n):  # copying a tensor onto itself writes nothing
                     last_store[n.attrs["target"]] = n
                 reads.add(n.inputs[1])  # type: ignore[arg-type]
+            elif n.op == "scatter_rows":  # like a store, its first input is the version it replaces
+                reads.update(i for i in n.inputs[1:] if isinstance(i, Value))
             else:
                 reads.update(i for i in n.inputs if isinstance(i, Value))
         reads.update(graph.outputs)
         for p in graph.inputs:  # inputs first, in declaration order; an Out parameter is never read, a DevScalar only by tilefish.load
-            if p.access != "out" and p in reads and not p.type.devscalar:
+            if p.access != "out" and p in reads and not p.type.devscalar and p not in layout.tables.only:  # a table is read by its gathers
                 v = self.local()
                 self.var[p] = v
                 self.emit(f"{v} = {layout.load(self.rename.get(p.name, p.name), p)}", p.name)
         for n in graph.nodes:
             if n.op == "store":
                 self.store(n, last_store)
+            elif n.op == "scatter_rows":
+                self.scatter(n)
             else:
                 (out,) = n.outputs
                 v = self.local()
@@ -1127,6 +1292,48 @@ class _Body:
             self.emit(self.layout.store(self.rename.get(name, name), param, self.var[value]), f"{label} {name}, {what}")
         else:
             self.emit(f"# {label} {name}: superseded by a later store")
+
+    def row_index(self, n: Node, base: str) -> "tuple[str, str | None]":
+        """The row a gather or a scatter addresses, as ``i32``, and the name of the check that it is in range (``None`` for ``clamp``,
+        whose index always is): the statements that compute them are emitted here (note 9)."""
+        t, idx = n.inputs[0], n.inputs[1]
+        assert isinstance(t, Value) and isinstance(idx, Value)
+        rows = self.layout.rows_name[t]  # the table parameter itself (a scatter replaces the parameter, never a later version)
+        a = self.var[idx]
+        dt = idx.type.dtype.name
+        if dt == "u8":  # zero extension: exact
+            wide = self.names.fresh(f"{base}_idx")
+            self.emit(f"{wide} = {a}.to(tl.int32)")
+            a, dt = wide, "i32"
+        if n.attrs["oob"] == "clamp":
+            i = self.names.fresh(f"{base}_i")
+            self.emit(f"{i} = tl.minimum(tl.maximum({a}, 0), {rows} - 1)" + ("" if dt == "i32" else ".to(tl.int32)"), "clamped into [0, N)")
+            return i, None
+        ok = self.names.fresh(f"{base}_ok")
+        self.emit(f"{ok} = ({a} >= 0) & ({a} < {rows})", "in range")
+        if dt == "i32":
+            return a, ok
+        i = self.names.fresh(f"{base}_i")
+        self.emit(f"{i} = {a}.to(tl.int32)", "the offset is i32 where the index is in range (an i64 out of range is masked)")
+        return i, ok
+
+    def gather(self, n: Node, v: str) -> str:
+        t = n.inputs[0]
+        assert isinstance(t, Value)
+        i, ok = self.row_index(n, v)
+        mask = self.layout.row_mask(n.outputs[0], ok)
+        ptr = f"{self.rename.get(t.name, t.name)} + {self.layout.row_offset(t, i)}"
+        return f"tl.load({ptr})" if mask is None else f"tl.load({ptr}, mask={mask}, other=0)"
+
+    def scatter(self, n: Node) -> None:
+        dst, _, src = n.inputs
+        assert isinstance(dst, Value) and isinstance(src, Value)
+        base = self.names.fresh(f"s_{dst.name}")
+        i, ok = self.row_index(n, base)
+        mask = self.layout.row_mask(src, ok)
+        ptr = f"{self.rename.get(dst.name, dst.name)} + {self.layout.row_offset(dst, i)}"
+        store = f"tl.store({ptr}, {self.var[src]})" if mask is None else f"tl.store({ptr}, {self.var[src]}, mask={mask})"
+        self.emit(store, f"InOut {dst.name}: rows written at the index")
 
     def arg_reduce(self, n: Node, v: str) -> str:
         """``argmax`` / ``argmin`` of an ``[R, D]`` value along the row (the row template; note 8): the index of the first lane that
@@ -1164,6 +1371,8 @@ class _Body:
         op = n.op
         if op in _ARG_REDUCTIONS:
             return self.arg_reduce(n, v)
+        if op == "gather_rows":
+            return self.gather(n, v)
         if op == "load":  # one element from device memory, broadcast: no mask, no offsets
             ptr = n.inputs[0]
             assert isinstance(ptr, Value)
@@ -1260,10 +1469,11 @@ def lower(
             f"lower: num_warps must be a power of two from 1 to 32, got {num_warps!r}", rule="num-warps"
         )
     _check_common(op)
+    tables = _tables(op)
     errors: list[TilefishLoweringError] = []
     for t in (template,) if template else TEMPLATES:
         try:
-            layout = _ElementwiseLayout(op) if t == "elementwise" else _RowLayout(op)
+            layout = _ElementwiseLayout(op, tables) if t == "elementwise" else _RowLayout(op, tables)
         except TilefishLoweringError as e:
             errors.append(e)
             continue
@@ -1326,8 +1536,11 @@ def _assemble(
         params.append(_reindexed(e.param, len(params), e.param.name))
         decls.append(f"{e.name}: tl.constexpr" if e.constexpr else e.name)
     element_counts: dict[str, str] = {}
-    if layout.template == "elementwise":  # n is the element count of every tensor: say which one a host reads it from
-        element_counts[layout.n_name] = next(p.name for p in params if p.kind == "tensor" and not p.type.devscalar)  # type: ignore[attr-defined,union-attr]
+    if layout.template == "elementwise":  # n is the element count of every tensor (but a table): say which one a host reads it from
+        tables = {rename.get(t.name, t.name) for t in layout.tables.only}
+        element_counts[layout.n_name] = next(
+            p.name for p in params if p.kind == "tensor" and not p.type.devscalar and p.name not in tables  # type: ignore[union-attr]
+        )
 
     body = _Body(op, layout, names, out_names, rename).run()
     header = [

@@ -1,5 +1,5 @@
-"""Traced built-in operations: elementwise arithmetic, comparisons and masks (``where``, ``iota``), unary math, casts, reductions, views (split,
-reshape, permute, select), loads of a DevScalar, store.
+"""Traced built-in operations: elementwise arithmetic, comparisons and masks (``where``, ``iota``), unary math, casts, reductions (and
+``argmax`` / ``argmin``), gathers and scatters of rows, views (split, reshape, permute, select), loads of a DevScalar, store.
 
 Every function here takes traced :class:`~tilefish.trace.Value` operands,
 type-checks them, appends a node to the trace and returns new ``Value``s.
@@ -761,6 +761,88 @@ def getitem(x: Any, key: Any) -> Value:
     if out is x:  # x[:] and x[...] name the tensor itself
         return x._reference()
     return out
+
+
+# -- gather and scatter of rows -----------------------------------------------------------------------
+
+GATHER_OOB = ("zero", "clamp")
+SCATTER_OOB = ("skip",)
+
+
+def _index_operand(op: str, idx: Any) -> Value:
+    idx = _require_value(op, "the index", idx)
+    dt = idx.dtype
+    if not (isinstance(dt, DType) and dt.is_int):
+        raise TilefishTypeError(f"{op}: the index {idx.ref} is {idx.type}; an index is an integer tensor (i32, i64 or u8)")
+    if idx.rank == 0:
+        raise TilefishTypeError(f"{op}: the index {idx.ref} has rank 0; give it a shape ([R] for R rows)")
+    return idx
+
+
+def _oob(op: str, oob: Any, allowed: "tuple[str, ...]") -> str:
+    if oob is _REQUIRED:
+        raise TilefishTypeError(
+            f"{op}: say what an index out of range does: oob={' or '.join(repr(a) for a in allowed)} (an index is device data, which "
+            "nothing checks before the kernel reads it)"
+        )
+    if oob not in allowed:
+        raise TilefishTypeError(f"{op}: oob must be {' or '.join(repr(a) for a in allowed)}, got {oob!r}")
+    return str(oob)
+
+
+def gather_rows(x: Any, idx: Any, *, oob: Any = _REQUIRED) -> Value:
+    """``x[idx]`` along the first axis: ``out[i..., :] = x[idx[i...], :]``, a raw copy of the rows (NaN payloads, signed zeros as they are).
+
+    ``x`` is ``[N, ...]`` (in a lowered kernel a read-only parameter, ``[N, D]`` or ``[N]``) and ``idx`` an integer tensor; the result has
+    the shape ``idx.shape + x.shape[1:]`` and the dtype of ``x``. An index is device data, so what an index outside ``[0, N)`` does is part of
+    the call: ``oob="zero"`` gives a row of zeros (``+0.0``, all bits clear), ``oob="clamp"`` the nearest row (0 or ``N - 1``). An embedding
+    lookup is ``gather_rows(table, ids, oob="zero")``.
+    """
+    named = "gather_rows"
+    x = _require_value(named, "the table", x)
+    if isinstance(x.dtype, BlockScaled):
+        raise TilefishTypeError(f"{named}: {x.ref} is block-scaled ({x.type}); a gather of data and scales is not supported yet")
+    if x.rank == 0:
+        raise TilefishTypeError(f"{named}: the table {x.ref} has rank 0; it has no rows")
+    if isinstance(x.dtype, DType) and x.dtype.is_bool:
+        raise TilefishTypeError(f"{named}: the table {x.ref} is a mask, which is not in memory")
+    idx = _index_operand(named, idx)
+    if idx.ctx is not x.ctx:
+        raise TilefishTypeError(f"{named}: the table and the index belong to different traces")
+    policy = _oob(named, oob, GATHER_OOB)
+    (out,) = x.ctx.emit(named, [x, idx], {"oob": policy}, [TensorType((*idx.shape, *x.shape[1:]), x.dtype)])
+    return out
+
+
+def scatter_rows(dst: Any, idx: Any, src: Any, *, oob: Any = _REQUIRED) -> None:
+    """``dst[idx] = src`` along the first axis, in place: ``dst[idx[i...], :] = src[i..., :]``, a raw copy; the rows of ``dst`` that no index
+    names keep their bytes (an index copy).
+
+    ``dst`` is an ``InOut`` parameter ``[N, ...]``, ``idx`` an integer tensor and ``src`` has the shape ``idx.shape + dst.shape[1:]`` and the dtype
+    of ``dst``. ``oob="skip"`` (required) says that a source row whose index is outside ``[0, N)`` is not written. The indices in range must
+    be distinct: two sources for one row race, and which bytes land is not defined (as in torch's ``index_copy_``). Like a store, the call
+    replaces the version of ``dst`` it writes; the parameter's name then reads the new one.
+    """
+    named = "scatter_rows"
+    if not isinstance(dst, Value):
+        raise TilefishTypeError(f"{named}: the target must be a traced tensor, got {type(dst).__name__}")
+    if not dst.is_param or dst.access != "inout":
+        what = "an Out parameter, whose rows that no index names would be left unwritten" if dst.access == "out" else "not an InOut parameter"
+        raise TilefishTypeError(f"{named}: the target {dst.ref} ({dst.type}) is {what}; declare it InOut[...] (the rows not named keep their bytes)")
+    idx = _index_operand(named, idx)
+    src = _require_value(named, "the source", src)
+    if src.ctx is not dst.ctx or idx.ctx is not dst.ctx:
+        raise TilefishTypeError(f"{named}: the target, the index and the source belong to different traces")
+    want = TensorType((*idx.shape, *dst.shape[1:]), dst.dtype)
+    if src.type != want:
+        raise TilefishTypeError(f"{named}: the source is {src.type}, but rows of {dst.type} indexed by {idx.type} are {want}")
+    policy = _oob(named, oob, SCATTER_OOB)
+    current = dst.live  # the version this scatter replaces
+    (new,) = dst.ctx.emit(named, [current, idx, src], {"target": dst.name, "oob": policy}, [dst.type])
+    dst.ctx.written.add(dst)
+    current._consumed_by = (dst.ctx.nodes[-1], dst.name)
+    current._latest = new
+    dst._latest = new
 
 
 # -- DevScalar ---------------------------------------------------------------------------------

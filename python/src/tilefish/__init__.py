@@ -59,7 +59,7 @@ from ._manifest import Manifest
 from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
-from .ops import argmax, argmin, exp, gelu, iota, load, rsqrt, silu, sqrt, where
+from .ops import argmax, argmin, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sqrt, where
 from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
@@ -131,6 +131,7 @@ __all__ = [
     "extern",
     "f16",
     "f32",
+    "gather_rows",
     "gelu",
     "graph",
     "i32",
@@ -144,6 +145,7 @@ __all__ = [
     "plan",
     "rsqrt",
     "run",
+    "scatter_rows",
     "silu",
     "sqrt",
     "u8",
