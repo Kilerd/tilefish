@@ -357,6 +357,8 @@ A reasonable order for the Rust lane, each step testable against Python on a GPU
 3. device scalars (a pointer with shape `[]`), then strided pointers (`strides`, `offset`, `stride_of`, `max_extent`, canonical strides, the
    ranges). Gates: `test_gpu_devscalar.py`, `test_gpu_strided.py` (an aligned and an unaligned offset, an expanded view, a transposed one).
 4. `library` entries: version check, algorithm validation, workspace, the launch (`test_gpu_gemm.py`: byte-identical across two processes and to `jit`).
+5. launch plans (`docs/plan-schema-1.md`): `plan.json` pins a manifest and orders the launches of its entries over one arena, so a host runs a whole forward from it, capturable in a CUDA graph
+   (`test_gpu_plan.py`; the golden fixtures `python/tests/golden/plans/` have the digests to reproduce).
 
 ## 13. Where it is tested
 
