@@ -37,7 +37,9 @@ What this is not: a defence against someone who can write the cache directory. A
 (a cubin with its digests) passes the checks, as an entry of Triton's own cache would; a manifest is the thing to pin
 (``Manifest.digest``), and ``build(..., cache=False)`` never reads or writes the cache. It is also only as exact as the source
 digest: a dependency that digest does not reach (a function held in a container, an import inside a function body; see
-:mod:`tilefish._source`) is not part of the key either.
+:mod:`tilefish._source`) is not part of the key either. And the toolchain is its version strings: a locally patched Triton that
+keeps its version string is not told apart (Triton's own ``triton_key`` hashes its sources and ``libtriton.so``, 220 ms on a
+B300, once per process, which would cost more than a hit saves; a development build carries its commit in the version).
 """
 
 from __future__ import annotations
