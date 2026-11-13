@@ -24,7 +24,7 @@ use serde_json::{Map, Value};
 
 use crate::elf::{Elf, sha256_hex};
 use crate::error::{Error, PreconditionKind, Result};
-use crate::expr::{Symbols, parse_expr, parse_grid};
+use crate::expr::{Expr, Symbols, parse_expr, parse_grid};
 use crate::gemm::CachedGemm;
 use crate::json::{canonical, parse_strict, type_name};
 use crate::kernel::Cached;
@@ -1544,15 +1544,7 @@ impl Entry {
                 ParamKind::Scalar { dim, count_of, stride_of, .. } => {
                     parse_expr(dim, &format!("parameter {} dim", p.name), syms)?;
                     if let Some(target) = count_of {
-                        match self.param(target).map(|t| &t.kind) {
-                            Some(ParamKind::Pointer { .. }) => {}
-                            _ => {
-                                return Err(format!(
-                                    "parameter {} count_of {target:?} must name a pointer parameter",
-                                    p.name
-                                ));
-                            }
-                        }
+                        self.check_count_of(&p.name, dim, target, syms)?;
                     }
                     if let Some(StrideOf { arg, axis }) = stride_of {
                         let Some(ParamKind::Pointer { view: Some(view), .. }) = self.param(arg).map(|t| &t.kind) else {
@@ -1721,6 +1713,127 @@ impl Entry {
             let unnamed: Vec<&str> = (self.dims.len()..syms.len()).map(|i| syms.name(i)).collect();
             return Err(format!(
                 "dims does not name {unnamed:?}, which the declared shapes, the strides, the scalars or the grid mention"
+            ));
+        }
+        // a max_elements precondition is on the shape of its argument, with the bucket values in
+        for pre in &self.preconditions {
+            if let Precondition::MaxElements { arg, shape, .. } = pre {
+                self.check_max_elements_shape(arg, shape, syms)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The value of each bucketed dimension, by the number `syms` gives its name (`None` for every other dimension).
+    fn bucket_values(&self, syms: &Symbols) -> std::result::Result<Vec<Option<i64>>, String> {
+        let mut values = vec![None; syms.len()];
+        for (name, value) in &self.buckets {
+            if let Some(i) = syms.find(name) {
+                let value =
+                    i64::try_from(*value).map_err(|_| format!("the bucket {name} = {value} does not fit 64 bits"))?;
+                values[i] = Some(value);
+            }
+        }
+        Ok(values)
+    }
+
+    /// Axis `axis` of the declared shape of pointer `arg` with the bucket values in: what Python's compile spec has as the axis of the
+    /// argument's `shape` (the text of the folded expression), which the manifest does not carry.
+    fn bucketed_axis(
+        &self,
+        arg: &str,
+        axis: usize,
+        d: &ShapeDim,
+        values: &[Option<i64>],
+        syms: &mut Symbols,
+    ) -> std::result::Result<Expr, String> {
+        Ok(match d {
+            ShapeDim::Static(n) => Expr::Num(i128::from(*n)),
+            ShapeDim::Expr(e) => parse_expr(e, &format!("parameter {arg} shape[{axis}]"), syms)?.subst(values),
+        })
+    }
+
+    /// The declared shape of a pointer and, when the entry is bucketed, the bucket values that go into it, for a message.
+    fn shape_text(&self, shape: &[ShapeDim]) -> String {
+        let axes: Vec<String> = shape.iter().map(ToString::to_string).collect();
+        let buckets: Vec<String> = self.buckets.iter().map(|(d, v)| format!("{d} = {v}")).collect();
+        if buckets.is_empty() {
+            format!("[{}]", axes.join(", "))
+        } else {
+            format!("[{}] (with {})", axes.join(", "), buckets.join(", "))
+        }
+    }
+
+    /// Python's `_check_count_of`: a scalar that carries the element count of a pointer (`count_of`) carries the product of that pointer's
+    /// shape, with the bucket values in. When the product is affine the scalar's `dim` must be that expression (as Python's `DimExpr`
+    /// compares two: `3072*M` is `M*3072`); when it is not (two symbolic sizes), `dim` must be a fresh dimension name, and `count_of` is how a
+    /// host gets its value.
+    fn check_count_of(
+        &self,
+        name: &str,
+        dim: &str,
+        target: &str,
+        syms: &mut Symbols,
+    ) -> std::result::Result<(), String> {
+        let Some(ParamKind::Pointer { shape, .. }) = self.param(target).map(|t| &t.kind) else {
+            return Err(format!("parameter {name} count_of {target:?} must name a pointer parameter"));
+        };
+        let values = self.bucket_values(syms)?;
+        let mut product = Expr::Num(1);
+        for (axis, d) in shape.iter().enumerate() {
+            let factor = self.bucketed_axis(target, axis, d, &values, syms)?;
+            product = Expr::Mul(Box::new(product), Box::new(factor));
+        }
+        match product.folded_key() {
+            Some(count) => {
+                if parse_expr(dim, &format!("parameter {name} dim"), syms)?.folded_key() != Some(count) {
+                    return Err(format!(
+                        "parameter {name} is the element count of {target} (count_of), the product of its shape {}, but it carries {dim:?}, \
+                         which is another expression: it must carry that product",
+                        self.shape_text(shape)
+                    ));
+                }
+            }
+            None if !is_ident(dim) => {
+                return Err(format!(
+                    "parameter {name} is the element count of {target} (count_of), and the product of its shape {} is not an affine \
+                     expression, so it must carry a fresh dimension name, got {dim:?}",
+                    self.shape_text(shape)
+                ));
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Python's `p["shape"] == a["shape"]` of a `max_elements` precondition: its shape is the declared shape of its argument with the
+    /// bucket values in, axis by axis. Python compares the texts of the compile spec, which the manifest does not carry; the expressions are
+    /// compared as Python's `DimExpr` compares them, which for the folded texts Python writes is the same.
+    fn check_max_elements_shape(
+        &self,
+        arg: &str,
+        limited: &[String],
+        syms: &mut Symbols,
+    ) -> std::result::Result<(), String> {
+        let Some(ParamKind::Pointer { shape, .. }) = self.param(arg).map(|p| &p.kind) else {
+            return Err(format!("a max_elements precondition refers to {arg}, which is not a pointer argument"));
+        };
+        let values = self.bucket_values(syms)?;
+        let mut agrees = limited.len() == shape.len();
+        for (axis, (d, text)) in shape.iter().zip(limited).enumerate() {
+            let declared = self.bucketed_axis(arg, axis, d, &values, syms)?;
+            let said = parse_expr(text, &format!("max_elements precondition shape[{axis}]"), syms)?;
+            agrees &= match (declared.folded_key(), said.folded_key()) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => declared == said, // (no declaration has an axis that is not affine: then the same expression)
+                _ => false,
+            };
+        }
+        if !agrees {
+            return Err(format!(
+                "the max_elements precondition of {arg} has the shape {limited:?}, but the declared shape of {arg} is {}: a max_elements \
+                 precondition is on its argument's own shape",
+                self.shape_text(shape)
             ));
         }
         Ok(())

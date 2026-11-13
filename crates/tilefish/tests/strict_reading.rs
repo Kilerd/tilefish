@@ -566,6 +566,134 @@ fn the_bucket_of_a_bucketed_entry_is_in_dims_and_agrees_with_the_precondition() 
     }
 }
 
+/// Make the runtime scalar `name` of an entry carry `dim` (and its divisible precondition, if it has one, say so).
+fn carry(entry: &mut serde_json::Value, name: &str, dim: &str) {
+    for p in entry["abi"]["params"].as_array_mut().unwrap().iter_mut().filter(|p| p["name"] == name) {
+        p["dim"] = dim.into();
+    }
+    for p in entry["preconditions"].as_array_mut().unwrap().iter_mut() {
+        if p["kind"] == "divisible" && p["arg"] == name {
+            p["dim"] = dim.into();
+        }
+    }
+}
+
+/// A runtime scalar `n` that counts the elements of `x`, added after the last parameter of `bucketed_rms.Db96` (`x` is `[M, Db]`, `Db = 96`).
+fn count_x(entry: &mut serde_json::Value, dim: &str) {
+    let next_index = entry["constexprs"].as_array().unwrap().len() + entry["abi"]["params"].as_array().unwrap().len();
+    let params = entry["abi"]["params"].as_array_mut().unwrap();
+    let slot = params.len();
+    params.push(serde_json::json!({"slot": slot, "index": next_index, "name": "n", "kind": "scalar", "type": "i32", "ptx_type": "u32",
+                                   "size": 4, "dim": dim, "count_of": "x"}));
+    for (k, s) in entry["abi"]["scratch"].as_array_mut().unwrap().iter_mut().enumerate() {
+        s["slot"] = (slot + 1 + k).into();
+    }
+}
+
+#[test]
+fn a_scalar_that_counts_the_elements_of_a_pointer_carries_the_product_of_its_shape() {
+    // Python's `_check_count_of`: when the product of the shape (with the bucket values in) is affine, the scalar carries that expression, as
+    // `DimExpr` compares two; when it is not (two symbolic sizes), the scalar carries a fresh dimension name
+    type Change = fn(&mut serde_json::Value);
+    let cases: [(&str, &str, Change, Option<&str>); 11] = [
+        // swiglu's `n` counts `gate` [M, 3072]
+        ("3072*M spelled M*3072", "swiglu", |e| carry(e, "n", "M*3072"), None),
+        ("half the product", "swiglu", |e| carry(e, "n", "1536*M"), Some("it must carry that product")),
+        ("the product and more", "swiglu", |e| carry(e, "n", "3072*M + 16"), Some("it must carry that product")),
+        ("one axis of it", "swiglu", |e| carry(e, "n", "M"), Some("it must carry that product")),
+        // gelu_exact's `n` counts `x` [T]: a fresh name is not the count of a shape whose product is affine
+        ("twice the count", "gelu_exact", |e| carry(e, "n", "2*T"), Some("it must carry that product")),
+        ("a fresh name", "gelu_exact", |e| carry(e, "n", "Count"), Some("it must carry that product")),
+        // bucketed_rms at Db = 96: x [M, Db] has 96*M elements, which is what the compile spec's shape [M, 96] says
+        ("the product with the bucket in", "bucketed_rms.Db96", |e| count_x(e, "96*M"), None),
+        (
+            "the product with the bucket's name",
+            "bucketed_rms.Db96",
+            |e| count_x(e, "M*Db"),
+            Some("it must carry that product"),
+        ),
+        (
+            "a fresh name for an affine product",
+            "bucketed_rms.Db96",
+            |e| count_x(e, "n"),
+            Some("it must carry that product"),
+        ),
+        // mm's `m` made the count of `c_ptr` [MmM, MmN], whose product is not affine
+        (
+            "a fresh name for a product that is not affine",
+            "mm",
+            |e| {
+                carry(e, "m", "Mc");
+                e["abi"]["params"][3]["count_of"] = "c_ptr".into();
+                e["dims"]["Mc"] = serde_json::json!({});
+            },
+            None,
+        ),
+        (
+            "the product that is not affine",
+            "mm",
+            |e| {
+                carry(e, "m", "MmM*MmN");
+                e["abi"]["params"][3]["count_of"] = "c_ptr".into();
+            },
+            Some("must carry a fresh dimension name"),
+        ),
+    ];
+    for (what, stem, change, refusal) in cases {
+        let copy = Copy::of("sm_103");
+        copy.edit_json(|doc| change(Copy::entry(doc, stem)));
+        match refusal {
+            None => assert!(trust(&copy).is_ok(), "{what}: {:?}", trust(&copy).err()),
+            Some(why) => {
+                let message = refused(&copy);
+                assert!(message.contains(why) && message.contains("count_of"), "{what}: {message}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_max_elements_precondition_is_on_the_shape_of_its_argument_with_the_bucket_values_in() {
+    // Python's `p["shape"] == a["shape"]`: the precondition says the declared shape of its argument, axis by axis, with each bucket's value
+    type Change = fn(&mut serde_json::Value);
+    let cases: [(&str, &str, Change, bool); 8] = [
+        ("another static size", "softmax", |e| shape_of_limit(e, "x", serde_json::json!(["M", "999"])), false),
+        ("an axis fewer", "softmax", |e| shape_of_limit(e, "x", serde_json::json!(["M"])), false),
+        ("an axis more", "softmax", |e| shape_of_limit(e, "x", serde_json::json!(["M", "1000", "1"])), false),
+        ("the axes swapped", "mm", |e| shape_of_limit(e, "a_ptr", serde_json::json!(["MmK", "MmM"])), false),
+        (
+            "the name of the bucket",
+            "bucketed_rms.Db96",
+            |e| shape_of_limit(e, "x", serde_json::json!(["M", "Db"])),
+            false,
+        ),
+        (
+            "another bucket's value",
+            "bucketed_rms.Db96",
+            |e| shape_of_limit(e, "x", serde_json::json!(["M", "512"])),
+            false,
+        ),
+        ("the bucket's value", "bucketed_rms.Db96", |e| shape_of_limit(e, "out", serde_json::json!(["M", "96"])), true),
+        ("the same expression", "swiglu", |e| shape_of_limit(e, "gate", serde_json::json!(["M", "3072"])), true),
+    ];
+    for (what, stem, change, accepted) in cases {
+        let copy = Copy::of("sm_103");
+        copy.edit_json(|doc| change(Copy::entry(doc, stem)));
+        if accepted {
+            assert!(trust(&copy).is_ok(), "{what}: {:?}", trust(&copy).err());
+        } else {
+            let message = refused(&copy);
+            assert!(message.contains("its argument's own shape"), "{what}: {message}");
+        }
+    }
+}
+
+/// Set the shape of the max_elements precondition of `arg`.
+fn shape_of_limit(entry: &mut serde_json::Value, arg: &str, shape: serde_json::Value) {
+    let pres = entry["preconditions"].as_array_mut().unwrap();
+    pres.iter_mut().find(|p| p["kind"] == "max_elements" && p["arg"] == arg).expect("a max_elements")["shape"] = shape;
+}
+
 #[test]
 fn a_scalar_has_a_dim_and_no_shape() {
     let copy = Copy::of("sm_103");
