@@ -399,6 +399,51 @@ def reduce_max(x: Value, axis: Any = None, keepdims: bool = False) -> Value:
     return _reduce("max", x, axis, keepdims)
 
 
+class _Required:
+    def __repr__(self) -> str:
+        return "<required>"
+
+
+_REQUIRED: Any = _Required()
+
+
+def _arg_reduce(op: str, x: Any, axis: Any, dtype: Any, keepdims: Any) -> Value:
+    x = _require_value(op, "argument 'x'", x)
+    _require_computable(op, "argument 'x'", x)
+    if x.rank == 0:
+        raise TilefishTypeError(f"{op}: {x.ref} ({x.type}) has rank 0, so it has no axis to reduce")
+    if isinstance(axis, bool) or not isinstance(axis, int):
+        raise TilefishTypeError(f"{op}: axis must be one int (the index of one axis is returned), got {axis!r}")
+    (ax,) = _normalize_axes(op, x, axis)
+    if dtype is _REQUIRED:
+        raise TilefishTypeError(f"{op}: say the index type: dtype=i32 or dtype=i64 (it is part of the result's type)")
+    if dtype not in _INDEX_DTYPES:
+        raise TilefishTypeError(f"{op}: dtype must be i32 or i64, got {dtype!r}")
+    if not isinstance(keepdims, bool):
+        raise TilefishTypeError(f"{op}: keepdims must be True or False, got {keepdims!r}")
+    shape = [as_dim(1) if i == ax else d for i, d in enumerate(x.shape)] if keepdims else [d for i, d in enumerate(x.shape) if i != ax]
+    (out,) = x.ctx.emit(op, [x], {"axes": (ax,), "keepdims": keepdims, "dtype": dtype}, [TensorType(shape, dtype)])
+    return out
+
+
+def argmax(x: Any, axis: Any = -1, *, dtype: Any = _REQUIRED, keepdims: Any = False) -> Value:
+    """The index of the maximum along ``axis``, as ``dtype`` (``i32`` or ``i64``, required).
+
+    Exact, and the same as torch's ``argmax``: the first maximum wins (``-0.0`` and ``+0.0`` are equal, so the first of them); a NaN is
+    larger than every number, so the first NaN wins; a row of ``-inf`` gives 0. A bf16 or f16 value is compared as its (exact) f32 value.
+    """
+    return _arg_reduce("argmax", x, axis, dtype, keepdims)
+
+
+def argmin(x: Any, axis: Any = -1, *, dtype: Any = _REQUIRED, keepdims: Any = False) -> Value:
+    """The index of the minimum along ``axis``, as ``dtype`` (``i32`` or ``i64``, required).
+
+    Exact, and the same as torch's ``argmin``: the first minimum wins (``-0.0`` and ``+0.0`` are equal); a NaN wins here too (torch's
+    rule: a NaN propagates through min and max alike), so the first NaN; a row of ``+inf`` gives 0.
+    """
+    return _arg_reduce("argmin", x, axis, dtype, keepdims)
+
+
 # -- split ---------------------------------------------------------------------------
 
 

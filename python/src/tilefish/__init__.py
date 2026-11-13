@@ -59,7 +59,7 @@ from ._manifest import Manifest
 from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
-from .ops import exp, gelu, iota, load, rsqrt, silu, sqrt, where
+from .ops import argmax, argmin, exp, gelu, iota, load, rsqrt, silu, sqrt, where
 from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
@@ -117,6 +117,8 @@ __all__ = [
     "TilefishTypeError",
     "Value",
     "aot",
+    "argmax",
+    "argmin",
     "bf16",
     "bool_",
     "capture",

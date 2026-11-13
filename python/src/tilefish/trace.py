@@ -263,7 +263,7 @@ class Value:
         raise TilefishAttributeError(
             f"traced tensor {self.ref} ({self.type}) has no attribute '{name}': a tensor has "
             ".shape, .dtype, .rank, .to(dtype), .split(size, axis), the views .reshape(*dims), .permute(*axes), .select(axis, i) "
-            "and x[i], .sum/.mean/.max(axis, keepdims), the operators + - * /, the comparisons == != < <= > >= (a mask) and, "
+            "and x[i], .sum/.mean/.max(axis, keepdims), .argmax/.argmin(axis, dtype=...), the operators + - * /, the comparisons == != < <= > >= (a mask) and, "
             "on masks, & | ^ ~"
         )
 
@@ -317,6 +317,18 @@ class Value:
         from . import ops
 
         return ops.reduce_max(self, axis, keepdims)
+
+    def argmax(self, axis: Any = -1, *, dtype: Any = None, keepdims: bool = False) -> "Value":
+        """``tilefish.argmax(self, axis, dtype=..., keepdims=...)``: the index of the first maximum (a NaN wins)."""
+        from . import ops
+
+        return ops.argmax(self, axis, dtype=ops._REQUIRED if dtype is None else dtype, keepdims=keepdims)
+
+    def argmin(self, axis: Any = -1, *, dtype: Any = None, keepdims: bool = False) -> "Value":
+        """``tilefish.argmin(self, axis, dtype=..., keepdims=...)``: the index of the first minimum (a NaN wins)."""
+        from . import ops
+
+        return ops.argmin(self, axis, dtype=ops._REQUIRED if dtype is None else dtype, keepdims=keepdims)
 
     # -- operators ----------------------------------------------------------
 

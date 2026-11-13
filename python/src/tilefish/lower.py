@@ -150,6 +150,10 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
 ``mask.to(dt)``             ``m.to(tl.<dt>)``                                               exactly 0 or 1 (zero extension,
                                                                                          ``uitofp``); a cast *to* a mask is
                                                                                          refused (write ``x != 0``).
+``argmax(x, -1, dtype=)``   row template only: ``tl.max`` of the row (``-inf`` in the       exact and order-free: the first NaN,
+``argmin(x, -1, dtype=)``   masked lanes), then ``tl.min`` of ``cols`` where the row        else the first extreme value
+                            holds it, or where it holds a NaN (note 8)                      (``-0.0 == +0.0``); torch's rule.
+                                                                                         ``dtype`` is ``i32`` or ``i64``.
 ==========================  ==========================================================  =====================================
 
 Reductions are f32 only because Triton accumulates a narrower dtype in the narrow dtype, which
@@ -232,6 +236,17 @@ Notes (the facts behind the table):
    (``selp``): the result has the bits of the operand it picks, a NaN's payload and the sign of a zero included. ``iota`` and the
    casts of a mask (0 or 1) are exact. The ``reference`` mode does all of these in torch with the scalar rounded the same way, so it
    is byte-identical to the binary.
+8. **``argmax`` and ``argmin``.** The result is the index (``dtype=i32`` or ``i64``, which the call must say) of the winner of a strict
+   total order on (value, index): a NaN beats every number (``+inf`` included, for ``argmax`` and ``argmin`` alike), two NaNs or two
+   equal values (``-0.0`` and ``+0.0`` are equal) go to the lower index, otherwise the larger (``argmax``) or smaller (``argmin``) value
+   wins. So the first NaN wins, then the first extreme value; a row of ``-inf`` gives 0 for ``argmax``. This is torch's rule
+   (``torch.argmax`` / ``torch.argmin`` on CUDA); it is not ``tl.argmax``'s, whose combine lets a NaN win only from one side, so its
+   answer depends on the tree. A bf16 or f16 value is widened to f32 (exact), an integer is compared as it is (``u8`` unsigned). The
+   lowering is three or four reductions over the row, every one a ``tl.max`` or ``tl.min`` (whether there is a NaN; the extreme over the
+   valid lanes, the masked lanes being ``-inf`` / ``+inf`` or the integer type's bound; the smallest ``cols`` that holds the NaN or the
+   extreme), and a max or a min is exact and independent of the reduction tree: unlike ``sum``, the result does not depend on
+   ``num_warps`` (whatever ``tl.max`` does with a NaN or with the two zeros, the lanes are then picked by equality and the NaN test).
+   Only the row template has it, along the last axis.
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -307,6 +322,7 @@ _COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="
 _LOGICAL = {"and": "&", "or": "|", "xor": "^"}
 _UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu")
 _REDUCTIONS = ("sum", "mean", "max")
+_ARG_REDUCTIONS = ("argmax", "argmin")
 # Triton's own type of a python literal: a scalar of any other dtype is written as a typed constant (tl.cast(0.1, tl.bfloat16)),
 # because Triton compares a bf16 or f16 tensor with a float literal in f32 (the literal is not rounded to the tensor's dtype first)
 _LITERAL_DTYPES = frozenset({"f32", "i32"})
@@ -580,7 +596,7 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
             )
     elif n.op == "load":
         _check_dtype(kernel, f"the DevScalar read by {n}", n.outputs[0].type.dtype)
-    elif n.op in _COMPARE or n.op in _LOGICAL or n.op in ("not", "where", "iota"):
+    elif n.op in _COMPARE or n.op in _LOGICAL or n.op in ("not", "where", "iota") or n.op in _ARG_REDUCTIONS:
         for v in (*n.outputs, *(i for i in n.inputs if isinstance(i, Value))):
             _check_dtype(kernel, f"{v.ref} of {n}", v.type.dtype)
     elif n.op != "store":
@@ -687,7 +703,7 @@ class _RowLayout(_Layout):
                 "binary, so it must be static (Dim('D', 2560)) or bucketed (Dim('D', buckets=[...]))",
             )
         for n in graph.nodes:
-            if n.op in _REDUCTIONS:
+            if n.op in _REDUCTIONS or n.op in _ARG_REDUCTIONS:
                 src = n.inputs[0]
                 assert isinstance(src, Value)
                 axes = n.attrs["axes"]
@@ -742,7 +758,7 @@ class _RowLayout(_Layout):
                 else:
                     raise self._shape_error(name, v)
         for n in graph.nodes:
-            if n.op in _REDUCTIONS:
+            if n.op in _REDUCTIONS or n.op in _ARG_REDUCTIONS:
                 src = n.inputs[0]
                 assert isinstance(src, Value)
                 if self.cls[src] != _FULL:
@@ -888,7 +904,7 @@ class _ElementwiseLayout(_Layout):
         if not values:
             raise _fail(name, "elementwise", "elementwise.no-tensor", "the kernel has no tensors")
         for n in graph.nodes:
-            if n.op in _REDUCTIONS:
+            if n.op in _REDUCTIONS or n.op in _ARG_REDUCTIONS:
                 raise _fail(
                     name, "elementwise", "elementwise.reduction", f"{n.op} is a reduction; the elementwise template has none"
                 )
@@ -1091,7 +1107,7 @@ class _Body:
                 v = self.local()
                 self.var[out] = v
                 rounding = "rounding point" if n.is_rounding_point else ""
-                self.emit(f"{v} = {self.expression(n)}", rounding)
+                self.emit(f"{v} = {self.expression(n, v)}", rounding)  # an expression may emit the statements it needs first
         for k, v in enumerate(graph.outputs):
             self.emit(layout.store(self.out_names[k], v, self.var[v]), f"return value {k}")
         return self.lines
@@ -1112,8 +1128,42 @@ class _Body:
         else:
             self.emit(f"# {label} {name}: superseded by a later store")
 
-    def expression(self, n: Node) -> str:
+    def arg_reduce(self, n: Node, v: str) -> str:
+        """``argmax`` / ``argmin`` of an ``[R, D]`` value along the row (the row template; note 8): the index of the first lane that
+        holds the extreme value, or of the first NaN when the row has one. Every reduction here is a max or a min, which are exact
+        and do not depend on the order of the tree."""
+        layout = self.layout
+        assert isinstance(layout, _RowLayout)
+        mask, cols, block = layout.mask, layout.cols, layout.BLOCK_name
+        x = n.inputs[0]
+        assert isinstance(x, Value)
+        dt = x.type.dtype
+        a = self.var[x]
+        largest = n.op == "argmax"
+        extreme = "tl.max" if largest else "tl.min"
+        if dt.name in ("bf16", "f16"):  # widened to f32, exactly
+            wide = self.names.fresh(f"{v}_x")
+            self.emit(f"{wide} = {a}.to(tl.float32)", "exact")
+            a = wide
+        best, hit = self.names.fresh(f"{v}_best"), self.names.fresh(f"{v}_hit")
+        if dt.is_float:
+            nan = self.names.fresh(f"{v}_nan")
+            sentinel = 'float("-inf")' if largest else 'float("inf")'
+            self.emit(f"{nan} = ({a} != {a}) & {mask}", "a NaN wins")
+            self.emit(f"{best} = {extreme}(tl.where({mask}, {a}, {sentinel}), axis=0)")
+            self.emit(f"{hit} = tl.where(tl.max({nan}.to(tl.int32), axis=0) > 0, {nan}, ({a} == {best}) & {mask})")
+        else:
+            lo, hi = dt.int_range()
+            self.emit(f"{best} = {extreme}(tl.where({mask}, {a}, {self.typed(Scalar(lo if largest else hi, dt))}), axis=0)")
+            self.emit(f"{hit} = ({a} == {best}) & {mask}")
+        index = f"tl.min(tl.where({hit}, {cols}, {block}), axis=0)"  # the first lane that holds it
+        out = n.outputs[0].type.dtype.name
+        return index if out == "i32" else f"{index}.to(tl.{_TL[out]})"
+
+    def expression(self, n: Node, v: str = "") -> str:
         op = n.op
+        if op in _ARG_REDUCTIONS:
+            return self.arg_reduce(n, v)
         if op == "load":  # one element from device memory, broadcast: no mask, no offsets
             ptr = n.inputs[0]
             assert isinstance(ptr, Value)

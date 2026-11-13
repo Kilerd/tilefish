@@ -13,7 +13,8 @@ node by node:
 * ``x / c`` with a scalar or ``const`` divisor is ``x * f32(1 / c)``, which is what the binary computes
   (``div.full.f32`` of a constant divisor is a multiply by the correctly rounded f32 reciprocal), and so
   is ``mean`` (``sum / D``);
-* reductions are torch's.
+* reductions are torch's; ``argmax`` and ``argmin`` follow the contract (the first NaN, else the first extreme value), written out in torch;
+* comparisons, masks, ``where`` and ``iota`` are torch's, with a scalar rounded to the IR dtype as above: exact, like the binary.
 
 What stays different, and what a tolerance has to cover, is everything the binary does approximately:
 ``/`` between tensors (``div.full.f32``), ``exp`` (``ex2.approx``), ``rsqrt``, ``erf`` (libdevice), the
@@ -75,6 +76,25 @@ def cast(torch: Any, x: Any, src: Any, dst: Any) -> Any:
     return x.to(target)
 
 
+def arg_reduce(torch: Any, x: Any, axis: int, keepdim: bool, largest: bool, dtype: Any) -> Any:
+    """``argmax`` (``largest``) or ``argmin`` along ``axis`` by the contract (note 8 of :mod:`tilefish.lower`), written out in torch rather
+    than trusted to ``torch.argmax``: the first NaN wins when there is one, else the first position of the extreme value (``-0.0 == +0.0``)."""
+    n = x.shape[axis]
+    position = torch.arange(n, device=x.device).reshape([n if i == axis else 1 for i in range(x.dim())])
+    if x.is_floating_point():
+        v = x.float()  # exact for bf16 and f16
+        nan = torch.isnan(v)
+        fill = float("-inf") if largest else float("inf")
+        clean = torch.where(nan, torch.full_like(v, fill), v)
+        best = clean.amax(dim=axis, keepdim=True) if largest else clean.amin(dim=axis, keepdim=True)
+        hit = torch.where(nan.any(dim=axis, keepdim=True), nan, v == best)
+    else:
+        best = x.amax(dim=axis, keepdim=True) if largest else x.amin(dim=axis, keepdim=True)
+        hit = x == best
+    first = torch.where(hit, position, torch.full_like(position, n)).amin(dim=axis, keepdim=keepdim)
+    return first.to(dtype)
+
+
 def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int] | None" = None) -> "list[Any]":
     """Evaluate the kernel body on ``tensors`` (name -> tensor, every parameter; ``Out`` ones are filled in place).
 
@@ -128,6 +148,9 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                     raise TilefishRuntimeError(f"reference mode: the size {n.attrs['dim']} that iota counts along is not determined by the arguments")
                 shape = [size] + [1] * (out.type.rank - 1)
                 r = torch.arange(size, dtype=torch_dtype(torch, out.type.dtype), device=device).reshape(shape)
+            elif op in ("argmax", "argmin"):
+                (ax,) = n.attrs["axes"]
+                r = arg_reduce(torch, a[0], ax, n.attrs["keepdims"], op == "argmax", torch_dtype(torch, n.attrs["dtype"]))
             elif op == "add":
                 r = a[0] + a[1]
             elif op == "sub":
