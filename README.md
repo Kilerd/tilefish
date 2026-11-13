@@ -351,6 +351,31 @@ layout, `num_warps`, body or constant is another binary, and `replay` refuses a 
 `triton=` (or a `triton.jit` one as `gluon=`) is refused with the argument to use: at the declaration for a kernel object, at the build for a
 `"module:function"` string. The manifest entry is a `triton` entry (Triton compiled it; it has the two scratch slots), so a host launches it like any other.
 
+**An implementation per architecture.** The fastest kernel that gives the bits a model needs can differ by GPU: Triton lowers the same `tl.dot` to other
+instructions on other architectures, and those may add the products of a wide dot in another order. One declaration can say so:
+
+```python
+@tilefish.extern(
+    by_arch={
+        "sm_103": tilefish.impl(triton=my_kernels.row_sum_tiled, num_warps=8, consts={"ROWS": 4}),
+        "sm_120": tilefish.impl(triton=my_kernels.row_sum, num_warps=4),
+    },
+    fallback=None,                                       # or a tilefish.impl(...) for every other architecture
+    grid=lambda R, ROWS: (tilefish.cdiv(R, ROWS),),      # an impl may have its own grid=
+)
+def row_sum(x: Tensor[R, 1024, f32], y: Out[Tensor[R, f32]], n_rows: R, ROWS: const = 1): ...
+```
+
+The op is one typed signature for a graph, a plan, a caller and `reference=` mode. `export` builds the implementation of the target architecture (`arch=`,
+or the device's), `jit` the one of the device's, and both refuse an architecture that has neither its own nor a `fallback`. Each implementation is a Triton or
+Gluon kernel with its own compile options (`num_warps`, `num_stages`, `enable_fp_fusion`), constexpr values (`consts=`) and `grid=`; every one takes the stub's
+parameters and has the same launch ABI, buckets, dimensions and preconditions, which the declaration checks, so a plan is the same document whichever runs
+and a host launches each the same way. Each is an op of its own (`row_sum.for_arch("sm_103")`, `tilefish.aot.compile_specs(row_sum, arch=103)`): its key is in
+its declaration digest and its compile specs, and its manifest entries record it (`"implementation": "sm_103"`, or `"fallback"`;
+`docs/manifest-schema-3.md`, section 4.1). `replay` selects the implementation of the device's architecture as the export did, so an entry of another
+implementation, or of one that changed (its kernel, options, constants or grid), is refused as stale; another architecture's implementation changing
+leaves this architecture's manifest valid. The Rust crate reads the field (`Entry::implementation`) and launches the entry of its device's architecture.
+
 **A pinned cuBLASLt GEMM.** `@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")` over `(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) ->
 Tensor[M, N, bf16]` computes `a @ b.T` with an f32 accumulator and one rounding (`impl="cublaslt.gemm_bias"` adds `bias: Tensor[N, bf16]`, added in f32 before it).
 For each `(M, N, K, bias)` (`M` from its buckets) the algorithm that cuBLASLt's heuristic ranks first under a fixed workspace limit (8 519 680 bytes,

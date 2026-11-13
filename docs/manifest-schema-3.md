@@ -29,6 +29,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | `dims` | names from shapes, scalars and the grid | also the stride dimensions and the offset dimension of a strided pointer |
 | library | none | a pinned cuBLASLt GEMM, for one device (its architecture and SM count): `library` entries (no file) |
 | library entry (0.0.5) | — | three optional fields, present only when not the default: `heuristic`, `algo_source`, `allow_bf16_reduction` (section 9.1) |
+| kernel entry (0.0.5, crate 0.0.3) | — | an optional `implementation`: which implementation of an operator declared with an implementation per architecture the binary is (section 4.1) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -107,6 +108,36 @@ Validation rules that are new (Python: `Manifest._read`):
   it does not apply**: a hand-written kernel with *static* shared memory has that section too, and the declaration (`shared`) says how much
   *dynamic* shared memory it addresses; the loader's check (static + dynamic ≤ the device's opt-in maximum) is the guard.
 * `toolchain` for `binary` is `{}` (a cubin used as it is) or `{"ptxas": <the `--version` text>}` (PTX that was assembled).
+
+### 4.1 An implementation per architecture: `implementation` (tilefish 0.0.5, crate 0.0.3)
+
+An operator declared with an implementation per architecture (`@tilefish.extern(by_arch={"sm_103": tilefish.impl(...), "sm_120": ...},
+fallback=...)`: one typed signature, and for each architecture a Triton or Gluon kernel with its own compile options, constexpr values and grid) has, on
+each architecture, the binaries of the implementation of that architecture: the one declared for it, else the `fallback`, and an architecture with
+neither is refused by the export (and by `jit` and `replay`). The entry of such a binary is a `triton` entry with one more field:
+
+| field | type and rule |
+|---|---|
+| `implementation` | optional string: `arch` (the entry's own architecture: the implementation declared for it) or `"fallback"`. Absent (or `null`) for an operator with one implementation. Only on a `triton` entry. |
+
+* **What the implementations share, and what they do not.** Every implementation of an operator has the same stems (binaries) and, per stem, the same
+  `kind`, `abi`, `buckets`, `dims` and `preconditions` (Python refuses a declaration that does not, `decorators._check_implementations`): a host and a plan
+  launch any of them the same way. What may differ is how the kernel is compiled and launched: `grid`, `block`, `num_warps`, `num_stages`, `constexprs`,
+  `options`, the source digest, and the `declaration_digest`.
+* **Identity.** The implementation's key is in its declaration (`_canonical_declaration` adds `"implementation"`), so in its `declaration_digest` and in
+  its compile specs (`"implementation"`), and the entry records it. Like every field it is in the manifest digest. The declaration digest of one
+  implementation covers that implementation only: a manifest is per architecture, so another implementation for another architecture leaves this
+  entry what it was, and a changed implementation for this architecture (its kernel, its options, its constexpr values, its grid, or the map sending this
+  architecture to another implementation or to the fallback) makes it stale.
+* **Replay.** Python's `replay` selects the implementation of the device's architecture as the export did, and refuses an entry whose `implementation`
+  is not that one (`Manifest.built_kernel`: "was built from the implementation 'sm_103' ..., but the declaration now runs its implementation 'fallback'
+  on sm_103"), whose declaration digest is not that implementation's, or whose IR digest is not the one its kernel compiles to now; pinned or not.
+* **A plan** names the entry by its stem, which is the same for every implementation, so the plan of a graph is one document whatever runs: the
+  architecture of the plan selects the binaries (its manifest has the entries of that architecture), and Python's planner binds each step with every
+  implementation.
+* **Readers.** Both readers refuse an `implementation` that is not the entry's `arch` or `"fallback"` (another architecture, another string, a value that is
+  not a string) or that is on a `binary` entry. The Rust host reads it into `Entry::implementation` and needs nothing else from it: it launches the entry of its
+  device's architecture, as for any operator.
 
 ## 5. The ABI
 
@@ -457,7 +488,8 @@ document tilefish writes next to a build and the host does not read):
 * every kernel entry: a `kind` that is not `triton`/`binary`; a missing `stem`, `arch`, `symbol`, `cubin`, `sha256`, `sha256_code`, `shared`, `launch`,
   `toolchain`; `options` missing on `triton` and present on `binary`; `num_warps`/`num_stages` present on `binary`; `binary` missing on `binary`;
   `shared` not a non-negative int; `toolchain`, `launch`, `abi`, `options` not objects; `abi.scratch_slots` present and not `2`/`0` by kind;
-  `source_sha256`/`source_digest` not 64 lowercase hex digits; `source_digest` and `source_digest_kind` not both present or both absent;
+  `source_sha256`/`source_digest` not 64 lowercase hex digits; `source_digest` and `source_digest_kind` not both present or both absent; an
+  `implementation` (section 4.1) that is not the entry's `arch` or `"fallback"`, or on a `binary` entry;
   for `binary`: `binary` not exactly one of `{"source":"cubin"}` and `{"source":"ptx","ptxas_flags":[strings]}`, `source_digest_kind` not
   `"tilefish.binary.v1"`, no `source_digest`, a `source_sha256`, a cubin used as it is whose `source_digest` is not its `sha256`; the cubin file name not a plain file name; the cubin's `sha256`, `sha256_code` or
   `.text.<symbol>` section wrong; for `triton` the shared-memory section rule.
@@ -526,6 +558,8 @@ and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter th
 * The function the driver loads must take the parameter sizes of the ABI (`cuFuncGetParamInfo`, as Python checks at load, for every kernel).
 * An entry may name at most 32 dimensions (a strided pointer has one per axis and one for its offset), and its expressions are folded in 128 bits
   (section 7.1); Python's reader holds both.
+* `implementation` (section 4.1) is read into `Entry::implementation` (`Option<String>`), held to the rule of section 10, and used for nothing else: the
+  crate loads the entry of the device's architecture, which is the implementation the export chose for it.
 
 **Launching a kernel** (`plan.rs`). The steps of section 5.1, in Python's order: shapes, strides and scalars bind the dimensions (then the `out` tensors bind
 the dimensions those leave unbound, section 7), `divisible_by`, the exact
@@ -565,7 +599,10 @@ ranges are checked (kind `shape`); `launch` gives no value, so it is refused for
 
 **The emitter** (`tilefish.hosts.rust`). It writes a struct for each kernel (Triton or prebuilt: `launch` takes every pointer as a `TensorRef` or `TensorMut`;
 stride scalars and `fixed` arguments are not parameters) and for each library entry (`launch` takes `a`, `b`, `bias`, `out`, `workspace`; `gemm()`, `M`, `N`, `K`,
-`BIAS`, `WORKSPACE_BYTES`, `PINNED_WITH`), with the digest of the manifest embedded. It refuses what the reader refuses.
+`BIAS`, `WORKSPACE_BYTES`, `PINNED_WITH`), with the digest of the manifest embedded. It refuses what the reader refuses. The entries of one stem on several
+architectures must agree on everything but the device, except that the entries of an operator with an implementation per architecture (each with an
+`implementation`) may differ in what section 4.1 lets differ; the docs of the struct then say each architecture's implementation, grid, block and
+constexprs, and `ops=` checks each entry against the implementation its architecture selects.
 
 **Launch plans** (not read by the crate yet). `docs/plan-schema-1.md`: `plan.json` pins a manifest and orders the launches of its entries over one arena, so a host runs a whole forward from it, capturable in a CUDA graph (`test_gpu_plan.py`; the golden fixtures `python/tests/golden/plans/` have the digests to reproduce).
 
@@ -585,12 +622,13 @@ stride scalars and `fixed` arguments are not parameters) and for each library en
 | its optional fields (section 9.1): the posture, imported algorithms, bf16 split-K partial sums | `test_library_options.py`, `test_cublaslt.py`; on a GPU `test_gpu_cublaslt.py` (torch's bytes, the opt-in), `test_gpu_gemm.py` (jit and replay) |
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
 | `options.enable_fp_fusion` of a hand-written kernel (`@tilefish.extern(enable_fp_fusion=...)`) | `test_lower_options.py`; on a GPU `test_gpu_extern_fusion.py` |
+| `implementation`: an operator with an implementation per architecture (section 4.1) | `test_per_arch.py`; on a GPU `test_gpu_per_arch.py` (and the Rust gate) |
 
 The Rust crate (`crates/tilefish/tests/`):
 
 | what | tests |
 |---|---|
-| strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs` (the optional fields of section 9.1 too), `schema3.rs` (synthetic manifests, `common/synthetic.rs`) |
+| strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs` (the optional fields of section 9.1 too), `schema3.rs` (synthetic manifests, `common/synthetic.rs`; `implementation` of section 4.1) |
 | views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
 | on a GPU, byte identity with Python's `replay` of every feature, the refusals, graph capture of a GEMM and of a strided kernel, the hazards of other streams | `gpu_gate.rs` with `python/tests/rust_gate.py` |

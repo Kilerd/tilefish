@@ -57,7 +57,11 @@ nothing is allocated in a launch and it can be captured in a CUDA graph). An
 entry says how its algorithm was chosen (`LibraryEntry::heuristic`,
 `algo_source`: the heuristic under tilefish's or torch's posture, or imported),
 and an algorithm whose split-K adds its partial sums in bf16 is run only for an
-entry that opts in (`allow_bf16_reduction`).
+entry that opts in (`allow_bf16_reduction`). The entry of an operator declared
+with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
+which one it is (`Entry::implementation`: its own architecture, or
+`"fallback"`); the crate launches the entry of the device's architecture, as
+for any operator.
 cudarc opens `libcublasLt.so.12` by name: where cuBLASLt comes from a Python
 wheel (`nvidia-cublas`, torch's), put that wheel's `nvidia/cublas/lib` on
 `LD_LIBRARY_PATH`. A missing library is an error, and another build of it is
