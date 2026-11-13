@@ -232,7 +232,7 @@ def test_an_edit_in_any_file_the_kernel_reaches_is_a_miss_and_runs_the_new_code(
 
 
 def test_a_constant_a_module_computes_when_it_is_imported_is_part_of_the_key(compiles, project, monkeypatch):
-    """The files do not change, so the source digest does not; the process holds another constant, so the binary differs."""
+    """The files do not change; the process holds another constant, so the IR differs, and so does the binary: never the cached one."""
     x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
     project.write(gc_cfg=[("tl.constexpr(2.0)", 'tl.constexpr(float(__import__("os").environ["GC_SCALE"]))')])
     for scale, count in (("2.0", 1), ("3.0", 2), ("2.0", 2), ("3.0", 2)):
@@ -244,20 +244,19 @@ def test_a_constant_a_module_computes_when_it_is_imported_is_part_of_the_key(com
     assert len(entries()) == 2
 
 
-def test_an_edit_that_was_not_reloaded_never_reaches_the_cache(compiles, project):
-    """The process holds the old values and the disk the new: no key is made, so no entry can hold the one under the other's digest."""
+def test_an_edit_that_was_not_reloaded_is_cached_under_the_ir_the_process_holds(compiles, project):
+    """The process holds the old values and the disk has the new: what is compiled, cached and run is what the process holds, under
+    its own IR digest, and a process that loads the file gets its own entry."""
     x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
     project.write()
     project.load()
     assert torch.equal(tilefish.run(gc, x, mode="jit"), expected(x))
-    listed = [p.read_bytes() for p in entries()]
     project.write(gc_helper_b=[("tl.constexpr(0.0)", "tl.constexpr(1.0)")])  # edited, not reloaded
     runtime.clear_caches()
-    with pytest.raises(TilefishBuildError, match=r"module 'gc_helper_b' changed on disk since it was imported .*reload it or restart"):
-        tilefish.run(gc, x, mode="jit")
-    assert len(compiles) == 1 and [p.read_bytes() for p in entries()] == listed
-    project.load()
+    assert torch.equal(tilefish.run(gc, x, mode="jit"), expected(x)) and len(compiles) == 1  # the entry of what the process holds
+    project.load()  # a fresh process: the edited file
     assert torch.equal(tilefish.run(gc, x, mode="jit"), expected(x, offset="1.0")) and len(compiles) == 2
+    assert len(entries()) == 2
 
 
 # -- a damaged entry -------------------------------------------------------------------------------------------------------------------
@@ -422,14 +421,14 @@ def test_a_closure_variable_is_part_of_what_the_cache_and_the_export_say_a_kerne
     load()
     assert torch.equal(tilefish.run(clo, x, mode="jit"), x * 2.0) and len(compiles) == 1
     first = runtime.export(clo, tmp_path / "two")
-    assert len(compiles) == 1  # the cache: the same files and the same value
+    assert len(compiles) == 1  # the cache: the same IR
     monkeypatch.setenv("CLO_S", "3.0")
     load()  # a new process: the same files, another value in the cell
     assert torch.equal(tilefish.run(clo, x, mode="jit"), x * 3.0)  # not the cached binary of 2.0
     assert len(compiles) == 2 and len(entries()) == 2
     # a replay of the manifest made under 2.0, here, would compile another binary than the one in it: refused, with the pin or not
     for kwargs in ({"pin": first.digest}, {"trust_directory": True}):
-        with pytest.raises(tilefish.TilefishManifestError, match="source digest.*a closure variable"):
+        with pytest.raises(tilefish.TilefishManifestError, match=r"built from Triton IR with digest .* now compiles to IR with digest .*stale"):
             tilefish.run(clo, x, mode="replay", manifest=first.directory, **kwargs)
     # and the export here stamps the binary of 3.0, which replays here
     second = runtime.export(clo, tmp_path / "three")
@@ -438,15 +437,3 @@ def test_a_closure_variable_is_part_of_what_the_cache_and_the_export_say_a_kerne
     monkeypatch.setenv("CLO_S", "2.0")
     load()
     assert torch.equal(tilefish.run(clo, x, mode="replay", manifest=first.directory, pin=first.digest), x * 2.0)  # the same value: accepted
-
-
-def test_a_closure_variable_that_has_no_stable_repr_is_refused_by_a_real_build(compiles, closure, tmp_path):
-    load, directory = closure
-    (directory / "clo_kernel.py").write_text(CLO_FILE.replace('S = tl.constexpr(float(os.environ["CLO_S"]))', 'S = [float(os.environ["CLO_S"])]').replace("x * S", "x * S[0]"))
-    load()
-    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
-    with pytest.raises(TilefishBuildError, match=r"closure variable 'S' of the Triton function 'clo_k' holds a list.*module-level constant.*const parameter"):
-        tilefish.run(clo, x, mode="jit")
-    with pytest.raises(TilefishBuildError, match="closure variable 'S'"):
-        runtime.export(clo, tmp_path / "m")
-    assert len(compiles) == 0 and entries() == []

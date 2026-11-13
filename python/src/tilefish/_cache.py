@@ -1,9 +1,9 @@
-"""tilefish's own on-disk cache of builds, keyed by tilefish's own digests and verified on every read.
+"""tilefish's own on-disk cache of builds, keyed by the Triton IR of the kernel and verified on every read.
 
-``build`` compiles from scratch (``always_compile``): Triton's disk cache is keyed by ``JITFunction.cache_key``, which
-does not see a ``tl.constexpr`` read as a module attribute, a dtype alias or a constant in a helper module, so it could
-serve the cubin of an older kernel (see :mod:`tilefish._source`). That costs about 35 to 130 ms per binary. This cache
-gives repeated builds of unchanged sources their speed back without trusting Triton's key.
+``build`` compiles from scratch (``always_compile``): Triton's disk cache is keyed by ``JITFunction.cache_key``, which does not see
+a ``tl.constexpr`` read as a module attribute, through ``getattr``, from a class, a ``triton.constexpr_function`` that reads the
+environment, and so on, so it could serve the cubin of another kernel. That costs 25 to 75 ms per binary on a B300. This cache gives
+repeated builds their speed back without trusting Triton's key, and without guessing what Python state Triton reads.
 
 Where. ``$TILEFISH_CACHE_DIR`` when that is set (an empty value switches the cache off), else ``~/.cache/tilefish``. The
 entries are ``<dir>/builds/<key[:2]>/<key>.json``. Nothing evicts them; delete the directory to start again.
@@ -12,26 +12,37 @@ The key is a sha256 over
 
 * the cache recipe (:data:`CACHE_RECIPE`, a number that is bumped whenever tilefish changes what goes into a binary) and the version
   of tilefish;
-* the declaration digest and the fingerprint of the compile spec (everything that goes into ``triton.compile``: the
-  signature, the constants, the attributes, the grid and block, the launch parameters);
-* the identity of the source: ``source_sha256`` of a generated kernel (the sha256 of the Triton source its spec was made
-  from) or the *source digest* of a hand-written one (:func:`tilefish._source.source_digest`: the files it reaches and the
-  Triton version);
-* the architecture, the Triton version, the ``ptxas`` version, the environment variables that Triton itself says
-  invalidate its cache, and the compile options in effect (the spec's and any a caller added);
-* the scalars and Triton constants (``tl.constexpr``, dtypes) that the kernel's jit functions read from module attributes, as
-  the process holds them: a source digest is of files, and a module may compute a value when it is imported (from the
-  environment, from a device query) that is not in any file. The same file with another value is another binary and another key.
+* the **IR digest** (:mod:`tilefish._ir`): the TTIR that Triton's frontend builds for the kernel in this process, without locations
+  or names. It stands for the kernel: the body, every constant the kernel reads by any route, the jit functions it calls. It is the
+  only thing that says which kernel it is; nothing is looked for in source files, namespaces or closures;
+* what the stages after the IR take besides it: the compile options in effect (the spec's and any a caller added), the target
+  architecture, the Triton version, the ``ptxas`` version, and the Triton settings that change code generation
+  (:func:`codegen_environment`, listed below).
 
-``build`` checks that the process holds the files it digests (an edited module that was not reloaded, a reassigned
-constant) *before* it computes the key, so a stale process cannot be served an entry for a source it does not run, nor
-store one under the digest of a source it did not compile. A kernel whose source digest cannot be computed is not cached.
+``codegen_environment`` is, for Triton 3.5.1: every environment variable whose name starts with ``TRITON_``, ``MLIR_``, ``LLVM_``,
+``NVPTX_``, ``AMDGCN_``, ``DISABLE_``, ``ENABLE_`` or ``ALLOW_``, or is ``USE_IR_LOC``, except those that are known not to change the
+code (:data:`NOT_CODEGEN`: cache and dump directories, the tools' paths whose version is in the key, the launcher's paths,
+debugging and autotuning switches, remote cache settings). That is a superset of the 30 variables that Triton's own
+``get_cache_invalidating_env_vars()`` lists (``DISABLE_LLVM_OPT``, ``DISABLE_MMA_V3``, ``DISABLE_MMA_V5``, ``DISABLE_PTXAS_OPT``,
+``TRITON_DEFAULT_FP_FUSION``, ``TRITON_F32_DEFAULT``, ``TRITON_DISABLE_LINE_INFO``, ``TRITON_ENABLE_ASAN``, ``TRITON_OVERRIDE_ARCH``,
+``USE_IR_LOC``, ``LLVM_PASS_PLUGIN_PATH``, the dump and timing switches, ...), and it has the ones that list does not:
+``TRITON_LIBDEVICE_PATH``, ``TRITON_MOCK_PTX_VERSION``, ``TRITON_KERNEL_OVERRIDE`` (a build refuses it), ``TRITON_FRONT_END_DEBUGGING``,
+``TRITON_ALLOW_NON_CONSTEXPR_GLOBALS``, ``TRITON_ENABLE_EXPERIMENTAL_CONSAN``. A variable that a later Triton adds is in the key
+unless :data:`NOT_CODEGEN` names it: a missing entry in that list can only cost a miss. Next to the variables, the *effective* value
+of each codegen knob as ``triton.knobs`` reports it (a program may set a knob without the environment): ``compilation`` (``override``,
+``use_ir_loc``, ``enable_asan``, ``disable_line_info``, ``front_end_debugging``, ``allow_non_constexpr_globals``,
+``enable_experimental_consan``), ``language`` (``fp32_default``, ``default_fp_fusion``), ``nvidia`` (``disable_ptxas_opt``,
+``mock_ptx_version``, ``libdevice_path``), and the sha256 of the file that ``libdevice_path`` names.
 
-The value is one JSON file: the cubin (base64), the PTX, and what ``build`` returns besides them. A read recomputes
+A kernel that Triton's frontend cannot build has no digest, so it has no key (``build`` raises). The IR is computed *before* the cache
+is looked up, so the lookup costs a run of the frontend (2 to 4 ms), and a binary is only ever stored under the digest of the IR it
+was compiled from (``build`` compiles from a source that records the IR it was given, and refuses a mismatch).
+
+The value is one JSON file: the cubin (base64), the PTX, the IR digest, and what ``build`` returns besides them. A read recomputes
 everything it can instead of believing the file: the ``sha256`` of the cubin, its ``sha256_code`` (the machine code, by
 parsing the ELF file), the sha256 of the PTX, the entry point and its parameters against the spec (the ABI check of a
-fresh build), the options and the versions against what is being built. Anything that is not as it was written is a miss
-with a :class:`~tilefish.errors.TilefishCacheWarning` and the kernel is built again (and the entry rewritten); the cache
+fresh build), the options, the IR digest and the versions against what is being built. Anything that is not as it was written is a
+miss with a :class:`~tilefish.errors.TilefishCacheWarning` and the kernel is built again (and the entry rewritten); the cache
 never hands back a binary it could not check, and it never fails a build.
 
 Never fails a build, also when warnings are errors. The warning is a :class:`~tilefish.errors.TilefishCacheWarning`, and under
@@ -46,11 +57,10 @@ entry goes is refused.
 
 What this is not: a defence against someone who can write the cache directory. An entry that was rewritten *consistently*
 (a cubin with its digests) passes the checks, as an entry of Triton's own cache would; a manifest is the thing to pin
-(``Manifest.digest``), and ``build(..., cache=False)`` never reads or writes the cache. It is also only as exact as the source
-digest: a dependency that digest does not reach (a function held in a container, an import inside a function body; see
-:mod:`tilefish._source`) is not part of the key either. And the toolchain is its version strings: a locally patched Triton that
-keeps its version string is not told apart (Triton's own ``triton_key`` hashes its sources and ``libtriton.so``, 220 ms on a
-B300, once per process, which would cost more than a hit saves; a development build carries its commit in the version).
+(``Manifest.digest``), and ``build(..., cache=False)`` never reads or writes the cache. The toolchain is its version strings: a
+locally patched Triton that keeps its version string is not told apart (Triton's own ``triton_key`` hashes its sources and
+``libtriton.so``, 220 ms on a B300, once per process, which would cost more than a hit saves; a development build carries its
+commit in the version).
 """
 
 from __future__ import annotations
@@ -69,13 +79,13 @@ from ._build import BuiltKernel, LaunchAttributes, _check_abi, write_file
 from ._elf import code_digest, parse_elf
 from .errors import TilefishBuildError, TilefishCacheWarning
 
-CACHE_FORMAT = "tilefish.build-cache.v1"
+CACHE_FORMAT = "tilefish.build-cache.v2"
 # The recipe: what tilefish does to turn a compile spec into a binary (how a spec becomes the inputs of ``triton.compile``, the
-# options it adds, the ABI it checks, how a generated kernel's source is written, what a source digest covers). It is part of every
+# options it adds, the ABI it checks, how a generated kernel's source is written, how the IR digest is made). It is part of every
 # key, so a change of any of that must bump it: an entry made by an older recipe is then not found, instead of served as the binary
 # of the new one. The tilefish version is part of the key as well (a release can change what goes into a binary without anyone
 # remembering to bump this).
-CACHE_RECIPE = 2
+CACHE_RECIPE = 3  # 3: a binary is keyed by the IR digest of its kernel (the source digest of 2 is gone), and by the Triton knobs that change code generation
 ENV_DIR = "TILEFISH_CACHE_DIR"
 _TAG = b"tilefish.build-cache-key.v1\0"
 _warned_writes: "set[str]" = set()
@@ -112,43 +122,119 @@ def cache_directory() -> "pathlib.Path | None":
         return None
 
 
-def triton_environment() -> "dict[str, str]":
-    """The environment variables that Triton says invalidate its own cache, as it reads them (empty where it cannot say)."""
-    try:
-        from triton._C.libtriton import get_cache_invalidating_env_vars
+_ENV_PREFIXES = ("TRITON_", "MLIR_", "LLVM_", "NVPTX_", "AMDGCN_", "DISABLE_", "ENABLE_", "ALLOW_")
+# Environment variables of those families that do not change the code Triton generates: where its caches and dumps go, the
+# tools whose *version* is in the key (``ptxas``) or that only disassemble (``cuobjdump``, ``nvdisasm``), the paths the launcher
+# stub is built from (tilefish never builds one), debugging, autotuning and remote cache switches. A variable that is not named
+# here is part of the key.
+NOT_CODEGEN = frozenset(
+    {
+        "TRITON_CACHE_DIR",
+        "TRITON_HOME",
+        "TRITON_DUMP_DIR",
+        "TRITON_OVERRIDE_DIR",
+        "TRITON_CACHE_MANAGER",
+        "TRITON_REMOTE_CACHE_BACKEND",
+        "TRITON_REDIS_KEY_FORMAT",
+        "TRITON_REDIS_HOST",
+        "TRITON_REDIS_PORT",
+        "TRITON_PTXAS_PATH",
+        "TRITON_CUOBJDUMP_PATH",
+        "TRITON_NVDISASM_PATH",
+        "TRITON_CUDACRT_PATH",
+        "TRITON_CUDART_PATH",
+        "TRITON_LIBCUDA_PATH",
+        "TRITON_LIBHIP_PATH",
+        "TRITON_CUPTI_LIB_PATH",
+        "TRITON_INTERPRET",
+        "TRITON_DEBUG",
+        "TRITON_PRINT_AUTOTUNING",
+        "TRITON_CACHE_AUTOTUNING",
+        "TRITON_KERNEL_DUMP",
+        "TRITON_STORE_BINARY_ONLY",
+        "TRITON_ALWAYS_COMPILE",
+        "TRITON_DUMP_PTXAS_LOG",
+        "TRITON_PROFILE",
+        "TRITON_BUILD_WITH_CCACHE",
+        "TRITON_BUILD_WITH_CLANG_LLD",
+    }
+)
+_KNOBS = {
+    "compilation": (
+        "override",
+        "use_ir_loc",
+        "enable_asan",
+        "disable_line_info",
+        "front_end_debugging",
+        "allow_non_constexpr_globals",
+        "enable_experimental_consan",
+    ),
+    "language": ("fp32_default", "default_fp_fusion"),
+    "nvidia": ("disable_ptxas_opt", "mock_ptx_version", "libdevice_path"),
+}
 
-        return {str(k): str(v) for k, v in dict(get_cache_invalidating_env_vars()).items()}
-    except Exception:  # noqa: BLE001 - not Triton, or a Triton that does not have it: no extra key
-        return {}
+
+def codegen_environment() -> "dict[str, Any]":
+    """What Triton's later stages read from the environment and its knobs, as it is now (see the module docstring for the list).
+
+    ``env`` is the environment variables of the codegen families, ``knobs`` the effective value of each codegen knob as
+    ``triton.knobs`` reports it (a knob can be set by a program without the environment), and ``libdevice`` the sha256 of the
+    libdevice file when ``TRITON_LIBDEVICE_PATH`` (or the knob) names one. Empty where Triton is not importable.
+    """
+    out: dict[str, Any] = {
+        "env": {
+            k: v
+            for k, v in sorted(os.environ.items())
+            if (k.startswith(_ENV_PREFIXES) or k == "USE_IR_LOC") and k not in NOT_CODEGEN
+        }
+    }
+    try:
+        import triton
+    except ImportError:
+        return out
+    knobs: dict[str, str] = {}
+    libdevice_path = None
+    for group, names in _KNOBS.items():
+        holder = getattr(getattr(triton, "knobs", None), group, None)
+        for name in names:
+            try:
+                value = getattr(holder, name)
+                knobs[f"{group}.{name}"] = repr(value)
+                if (group, name) == ("nvidia", "libdevice_path"):
+                    libdevice_path = value
+            except Exception as e:  # noqa: BLE001 - a knob this Triton does not have, or one that raises: said, so that it is in the key
+                knobs[f"{group}.{name}"] = f"<{type(e).__name__}>"
+    out["knobs"] = knobs
+    if libdevice_path:
+        try:
+            with open(libdevice_path, "rb") as f:
+                out["libdevice"] = hashlib.sha256(f.read()).hexdigest()
+        except Exception as e:  # noqa: BLE001
+            out["libdevice"] = f"<unreadable: {type(e).__name__}>"
+    return out
 
 
 def cache_key(
-    spec: Any,
     *,
     arch: int,
-    source: "tuple[str, str]",
+    ir_digest: str,
     triton_version: str,
     ptxas_version: str,
     options: "Mapping[str, Any]",
-    environment: "Mapping[str, str]",
-    values: "Mapping[str, str]",
+    environment: "Mapping[str, Any]",
 ) -> str:
-    """The key of a build (see the module docstring): ``source`` is ``("source_sha256" | "source_digest", value)``;
-    ``values`` are the module constants the kernel reads, as the process holds them (:func:`tilefish._source.values_read`)."""
+    """The key of a build (see the module docstring): the IR digest and what the stages after the IR take besides it."""
     from . import __version__
 
     doc = {
         "recipe": CACHE_RECIPE,
         "tilefish": __version__,
-        "declaration_digest": spec.declaration_digest,
-        "spec": spec._fingerprint(),
-        "source": list(source),
+        "ir": ir_digest,
         "arch": int(arch),
         "triton": triton_version,
         "ptxas": ptxas_version,
         "environment": dict(environment),
         "options": dict(options),
-        "values": dict(values),
     }
     text = json.dumps(doc, sort_keys=True, separators=(",", ":"), allow_nan=False, default=repr)
     return hashlib.sha256(_TAG + text.encode("utf-8")).hexdigest()
@@ -159,7 +245,7 @@ def encode(key: str, built: BuiltKernel) -> bytes:
     doc = {
         "format": CACHE_FORMAT,
         "key": key,
-        "stem": built.spec.stem,
+        "ir_digest": built.ir_digest,
         "arch": built.arch,
         "symbol": built.symbol,
         "shared": built.shared,
@@ -198,7 +284,7 @@ def decode(
     options: "Mapping[str, Any]",
     triton_version: str,
     ptxas_version: str,
-    source_digest: "str | None",
+    ir_digest: str,
 ) -> BuiltKernel:
     """The :class:`~tilefish.aot.BuiltKernel` an entry holds, after checking it; raises :class:`_Invalid` for anything that is not as it was written."""
     try:
@@ -234,7 +320,7 @@ def decode(
     wanted = json.loads(json.dumps(dict(options), default=repr))  # as JSON reads it back
     if doc.get("options") != wanted:
         raise _Invalid(f"its compile options {doc.get('options')!r} are not {wanted!r}")
-    for name, value in (("arch", arch), ("triton_version", triton_version), ("ptxas_version", ptxas_version), ("stem", spec.stem)):
+    for name, value in (("arch", arch), ("triton_version", triton_version), ("ptxas_version", ptxas_version), ("ir_digest", ir_digest)):
         if doc.get(name) != value:
             raise _Invalid(f"its {name} is {doc.get(name)!r}, not {value!r}")
     num_warps = _field(doc, "num_warps", int)
@@ -262,7 +348,7 @@ def decode(
         ptx_target=_field(doc, "ptx_target", str),
         options=dict(options),
         launch=launch,
-        source_digest=source_digest,
+        ir_digest=ir_digest,
     )
 
 
@@ -284,7 +370,7 @@ class BuildCache:
         options: "Mapping[str, Any]",
         triton_version: str,
         ptxas_version: str,
-        source_digest: "str | None",
+        ir_digest: str,
     ) -> "BuiltKernel | None":
         """The cached build for ``key``, or ``None``: a miss, or an entry that failed its checks (a :class:`~tilefish.errors.TilefishCacheWarning` says which)."""
         path = self.path_of(key)
@@ -304,7 +390,7 @@ class BuildCache:
                 options=options,
                 triton_version=triton_version,
                 ptxas_version=ptxas_version,
-                source_digest=source_digest,
+                ir_digest=ir_digest,
             )
         except _Invalid as e:
             _warn(f"the tilefish build cache entry {str(path)!r} is corrupt or stale ({e}); it is not used, and the kernel is built again")

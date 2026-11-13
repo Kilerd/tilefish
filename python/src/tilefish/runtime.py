@@ -11,9 +11,9 @@ extern's ``Out`` tensors; ``None``, one tensor or a tuple.
 =============  ============================================================================================
 mode           what runs
 =============  ============================================================================================
-``jit``        the current source, built through its compile spec (``spec.ast_source_inputs()``, the path
-               of :func:`tilefish.aot.build`) in memory, cached by digest (in memory, and on disk by
-               tilefish's own build cache), and launched through the CUDA driver
+``jit``        the current kernel, built through its compile spec (``spec.ast_source_inputs()``, the path
+               of :func:`tilefish.aot.build`) in memory, cached by the digest of its Triton IR (in memory,
+               and on disk by tilefish's own build cache), and launched through the CUDA driver
 ``replay``     the prebuilt cubins of a manifest directory (``manifest=``, written by
                :func:`export` or ``write_manifest(..., cubins=True)``), loaded with ``cuModuleLoadData``
                and launched through the same driver path: exactly what a C++ or Rust host does
@@ -36,19 +36,21 @@ and refuses
   that uses shared memory with ``shared = 0``, and a launch that does not fit the device (shared memory, grid);
 * a manifest entry that is not what the compile spec of the operator asks for (ABI, grid, block, constants,
   preconditions, options, declaration digest): a binary never runs under assumptions it was not compiled for;
-* a stale binary. A generated kernel's spec carries ``source_sha256``, the sha256 of the generated Triton source, so a
-  kernel redeclared with another body but the same name and signature does not match its old manifest. A
-  hand-written ``extern`` has no source in its declaration: the entry records a *source digest*, a sha256 over the
-  text of the file of the kernel's module, of every user module file reachable from that module's globals (modules it
-  imports, modules of the functions and objects it holds, recursively; not ``triton``, ``torch``, ``tilefish`` or the
-  standard library) and the Triton version (:mod:`tilefish._source`), and ``replay`` recomputes it from the importable
-  kernel. Any edit to a reachable file, a comment included, makes it differ: export again and pin the new manifest.
-  Where it cannot be recomputed (the module does not import without Triton) ``replay`` refuses, unless ``pin=`` is given.
-  (Triton's ``cache_key`` is not used: it misses a ``tl.constexpr`` read as a module attribute, a dtype alias and
-  constants in helper modules. For the same reason a build never reads Triton's disk cache. It compiles from scratch
-  unless tilefish's own cache has the binary, keyed by the declaration digest, the source identity (this digest, or the
-  ``source_sha256`` of a generated kernel), the architecture, the toolchain and the options, and verified on every
-  read: :mod:`tilefish._cache`.)
+* a stale binary. **The identity of a binary is the Triton IR its kernel compiles to** (:mod:`tilefish._ir`): Triton's
+  frontend is run on the spec's source in this process (a few milliseconds, no compile) and the TTIR it builds, without locations
+  or names, is hashed. Every manifest entry records that digest (``source_digest``, kind ``"tilefish.triton-ir.v1"``), and when Triton
+  is importable ``replay`` recomputes it from the kernel *as this process holds it* and refuses a mismatch ("stale"), pinned or not.
+  Whatever the frontend reads is in the IR, so no route a kernel reads a constant by escapes it: a module attribute, ``getattr``
+  (with a literal or a computed name), a class attribute, a closure variable, a ``triton.constexpr_function`` that reads the
+  environment, a ``tl.constexpr`` of an object with hidden state, a helper two modules away, a user module that is named like a
+  standard library one. Comments, blank lines, the path of the file and local variable names are not in it. A generated kernel's
+  spec also carries ``source_sha256``, the sha256 of the generated Triton source, so a kernel redeclared with another body but the
+  same name and signature does not match its old manifest, and that needs no Triton. Where the IR of a hand-written ``extern`` cannot
+  be recomputed (the module does not import without Triton, or the Triton is not the version that built the entry) ``replay``
+  refuses, unless ``pin=`` is given. (Triton's ``cache_key`` is not used: it misses most of those routes. For the same reason a build
+  never reads Triton's disk cache. It compiles from scratch unless tilefish's own cache has the binary, keyed by the IR digest, the
+  architecture, the toolchain, the Triton knobs that change code generation and the options, and verified on every read:
+  :mod:`tilefish._cache`.)
 
 Trust. A replay needs a trust anchor and refuses to run without one: ``run(..., mode="replay", manifest=directory)`` raises
 unless it is given ``pin=`` or ``trust_directory=True``. (This is a deliberate break from 0.0.1 and 0.0.2, where the
@@ -57,15 +59,15 @@ write the directory can rewrite both and make ``replay`` run any binary. ``pin=`
 (``Manifest.digest``, returned by :func:`export`): hold it somewhere you trust (a build log, a lock file) and a changed
 directory is refused. ``trust_directory=True`` is the explicit statement that whatever the directory holds is fine, for a
 directory you wrote yourself a moment ago; it does not combine with ``pin=``. A pin vouches for the manifest, not for the
-machine code being correct, and not for a source digest that is known to differ.
+machine code being correct, and not for an IR digest that is known to differ.
 
-Kernel inputs come from source files. A hand-written kernel is identified by the files it reaches, so everything that shapes
-its binary must be in them: a constant a kernel reads (``cfg.SCALE``, a dtype alias, a constant of a helper) is a value in a
-source file, not module state that a program assigned at run time (``cfg.SCALE = 5.0``, ``monkeypatch.setattr``), which no
-source digest, cache entry or manifest could describe. A build refuses what it can see of that (an edited module that was
-not reloaded, a scalar or Triton constant that a kernel function reads and that was reassigned after its module was imported;
-:mod:`tilefish._source` says what it sees and what it does not): put the value in the file, or make it a ``const`` argument
-of the ``extern`` or the ``@tilefish.kernel``.
+What a process holds is what is compiled. ``export`` in a process whose module was edited and not reloaded compiles, and stamps,
+what the process holds; a fresh process that has the edited file computes another IR digest and refuses that manifest, with no
+check of files, imports or values. What is not in the IR is not part of a binary's identity: the options, the architecture and the
+toolchain (they are in the manifest entry and in the cache key), and the knobs of Triton that change code generation (the cache key;
+``TRITON_KERNEL_OVERRIDE`` is refused by a build). The checks of earlier versions that tried to *find* what Triton reads (a digest of
+the files a kernel reaches, the import watch with ``TILEFISH_IMPORT_WATCH``, the snapshot of module attributes, the walk over
+closures) are gone.
 
 Before ``jit`` and ``replay`` launch, every precondition of the binary is checked (dtypes, static sizes,
 ``divisible_by``, 16-byte aligned pointers, contiguity, aliasing, ``max_elements`` of a generated kernel); a
@@ -90,7 +92,7 @@ import weakref
 from dataclasses import dataclass
 from typing import Any, Iterator
 
-from . import _cuda, _source
+from . import _cache, _cuda, _ir
 from ._build import BuiltKernel, build, resolve_triton, write_manifest_doc
 from ._launch import (
     TORCH_DTYPE_NAMES,
@@ -421,24 +423,29 @@ def _capability(torch: Any, device_index: int) -> int:
     return major * 10 + minor
 
 
-def _source_key(spec: CompileSpec, fn: Any) -> Any:
-    """What tells two functions with one spec apart in the cache of builds: the spec's source, or the digest of the kernel's files."""
-    if spec.source_sha256 is not None:
-        return spec.source_sha256
-    digest = _source.source_digest(fn)
-    return digest if digest is not None else ("object", id(fn))
+def _ir_digest_of(spec: CompileSpec, fn: Any, cap: int, extra: "dict[str, Any]") -> str:
+    """The IR digest of the kernel ``fn`` as this process holds it, for ``spec`` on architecture ``cap`` (see :mod:`tilefish._ir`)."""
+    inputs = spec.ast_source_inputs()
+    options = {**inputs.options, **extra}
+    return _ir.ir_digest(_ir.ttir_text(fn, inputs, arch=cap, options=options, what=f"'{spec.stem}' ({spec.triton})"))
 
 
 def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKernel:
-    """The (cached, in memory) build of ``spec`` for the architecture of device ``device_index``."""
+    """The (cached, in memory) build of ``spec`` for the architecture of device ``device_index``.
+
+    The cache is keyed by the digest of the IR Triton's frontend builds for ``fn`` now (a few milliseconds per call), so a kernel
+    whose process state changed is not served the binary of the old one, and the same Triton knobs that key the disk cache.
+    """
     torch = _torch()
     cap = _capability(torch, device_index)
     extra = dict(getattr(_options, "value", {}))
-    key = (spec.stem, cap, spec.declaration_digest, spec._fingerprint(), _source_key(spec, fn), tuple(sorted(extra.items())))
+    digest = _ir_digest_of(spec, fn, cap, extra)
+    environment = repr(sorted(_cache.codegen_environment().items()))
+    key = (spec.stem, cap, spec._fingerprint(), digest, tuple(sorted(extra.items())), environment)
     with _lock:
         built = _builds.get(key)
     if built is None:
-        built = build(spec, arch=cap, fn=fn, options=extra)
+        built = build(spec, arch=cap, fn=fn, options=extra, ir_digest=digest)
         with _lock:
             _builds[key] = built
     return built
@@ -492,30 +499,32 @@ def _load_manifest(manifest: Any) -> Manifest:
     return loaded
 
 
-def _current_source_digest(spec: CompileSpec) -> "str | None":
-    """The source digest of the hand-written kernel a spec names, recomputed from the importable function's files.
+def _current_ir(prep: "_Prepared", cap: int) -> "tuple[str | None, str | None]":
+    """``(IR digest, Triton version)`` of the kernel this process holds for the spec, or ``(None, None)`` where it cannot be made.
 
-    ``None`` when it cannot be (the module does not import, which includes a module that imports Triton when Triton is
-    not installed, or a file it reaches cannot be read). A spec of a generated kernel has its source in the spec itself.
+    That is when Triton cannot be imported (a module that imports it does not import either), or the module that defines a
+    hand-written kernel cannot be imported. A frontend that cannot build the kernel is an error, not a missing digest.
     """
+    if not _ir.triton_importable():
+        return None, None
     try:
-        fn = resolve_triton(spec.triton)
-    except TilefishBuildError:
-        return None
-    try:
-        return _source.source_digest(fn)
-    except (_source.StaleSourceError, _source.UnstableValueError) as e:  # not what is on disk, or no digest can be made of it: not a digest to compare
-        raise TilefishRuntimeError(str(e)) from e
-    except Exception:  # noqa: BLE001 - whatever an object in a module namespace raises when it is looked at
-        return None
+        fn = prep.target.jit_function(prep.spec)
+    except TilefishRuntimeError:
+        return None, None
+    return _ir_digest_of(prep.spec, fn, cap, {}), _ir.triton_version()
 
 
 def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
     """Launch the prebuilt cubin of the manifest for this spec and this device's architecture."""
     torch = _torch()
     index = _device_index(torch, prep.device)
-    source = _current_source_digest(prep.spec) if prep.spec.source_sha256 is None else None
-    built = manifest.built_kernel(prep.spec, f"sm_{_capability(torch, index)}", source_digest=source, pinned=pinned)
+    cap = _capability(torch, index)
+    arch = f"sm_{cap}"
+    artifact = manifest.get(prep.spec.stem, arch)
+    digest = version = None
+    if artifact is not None and artifact.entry.get("source_digest_kind") == _ir.IR_DIGEST_KIND:  # an entry with no IR digest has nothing to compare
+        digest, version = _current_ir(prep, cap)
+    built = manifest.built_kernel(prep.spec, arch, ir_digest=digest, ir_triton=version, pinned=pinned)
     _launch_built(prep, built, index)
 
 
@@ -616,7 +625,7 @@ def run(
     other digest is refused, so the directory is trusted only as far as the digest you hold. ``trust_directory=True`` says
     that you trust whatever the directory holds, which is what whoever can write it makes it (the digests sit next to the
     files they describe); it is for a directory you wrote yourself a moment ago, and is not combined with ``pin``. For a
-    hand-written kernel whose source digest cannot be recomputed, only ``pin`` is the statement that you vouch for the
+    hand-written kernel whose IR digest cannot be recomputed, only ``pin`` is the statement that you vouch for the
     manifest. ``mode``, ``manifest``, ``pin`` and ``trust_directory`` are the only keywords that are not arguments of
     ``op`` (an operator with a parameter of one of those names takes it positionally). Raises
     :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks a precondition of the binary,

@@ -22,11 +22,12 @@ import tilefish
 from tilefish import Dim, Manifest, Out, Tensor, TilefishBuildError, TilefishManifestError, TilefishRuntimeError, bf16, const, f32
 from tilefish._elf import code_digest, parse_elf
 from tilefish._manifest import manifest_digest
-from tilefish._source import SOURCE_DIGEST_KIND
+from tilefish._ir import IR_DIGEST_KIND
 from tilefish.aot import compile_specs, write_manifest
 from tilefish.runtime import _load_manifest
 
 SRC = FAKE_SOURCE_DIGEST
+TRITON = "3.5.1"  # the Triton version fake_build says built it
 
 
 @pytest.fixture
@@ -165,7 +166,7 @@ def test_the_section_is_what_says_a_kernel_uses_shared_memory_not_its_size(tmp_p
         with pytest.raises(TilefishManifestError, match="has a shared memory section"):
             Manifest.load(tmp_path)
         write_manifest([fake_build(spec, cubin=cubin_like(shared=shared_section), shared=16)], tmp_path / "manifest.json", cubins=True)
-        assert Manifest.load(tmp_path).built_kernel(spec, "sm_90", source_digest=SRC).shared == 16
+        assert Manifest.load(tmp_path).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON).shared == 16
 
 
 def test_a_kernel_without_shared_memory_may_have_shared_zero(tmp_path):
@@ -173,12 +174,12 @@ def test_a_kernel_without_shared_memory_may_have_shared_zero(tmp_path):
     plain = cubin_like(shared=None)
     assert parse_elf(plain).section(".nv.shared.tf_k") is None
     write_manifest([fake_build(spec, cubin=plain, shared=0)], tmp_path / "manifest.json", cubins=True)
-    assert Manifest.load(tmp_path).built_kernel(spec, "sm_90", source_digest=SRC).shared == 0
+    assert Manifest.load(tmp_path).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON).shared == 0
 
 
 def test_shared_memory_of_the_manifest_is_what_the_binary_has(directory):
     spec, _ = specs()
-    assert Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC).shared == 16
+    assert Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON).shared == 16
 
 
 # -- the binary for a spec ---------------------------------------------------------------------------------------------------------
@@ -191,24 +192,24 @@ def specs():
 def test_built_kernel_is_the_binary_for_a_spec(directory):
     spec, (s32, s64) = specs()
     m = Manifest.load(directory)
-    b = m.built_kernel(spec, "sm_90", source_digest=SRC)
+    b = m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
     assert b.spec is spec and b.arch == "sm_90" and b.symbol == "tf_k" and b.cubin == cubin_like()
     assert b.ptx == "" and b.sha256 == hashlib.sha256(b.cubin).hexdigest() and b.sha256_code == code_digest(b.cubin)
-    assert b.num_warps == 4 and b.shared == 16 and b.options == {"num_warps": 4, "num_stages": 3} and b.source_digest == SRC
+    assert b.num_warps == 4 and b.shared == 16 and b.options == {"num_warps": 4, "num_stages": 3} and b.ir_digest == SRC
     assert b.launch.replay_blockers() == [] and b.triton_version == "3.5.1" and "V12.9.86" in b.ptxas_version
     assert b.abi() == fake_build(spec).abi()
-    assert m.built_kernel(s64, "sm_90", source_digest=SRC).stem == "rowop.S64"
+    assert m.built_kernel(s64, "sm_90", ir_digest=SRC, ir_triton=TRITON).stem == "rowop.S64"
 
 
 def test_built_kernel_needs_the_architecture(directory):
     spec, (s32, _) = specs()
     m = Manifest.load(directory)
     with pytest.raises(TilefishManifestError, match=r"no binary for 'scale' on sm_100 \(it has sm_90\)"):
-        m.built_kernel(spec, "sm_100", source_digest=SRC)
+        m.built_kernel(spec, "sm_100", ir_digest=SRC, ir_triton=TRITON)
     with pytest.raises(TilefishManifestError, match=r"no binary for 'other' on sm_90 \(it has \['rowop.S32', 'rowop.S64', 'scale'\]\)"):
         renamed = dataclasses.replace(spec, stem="other")
         renamed._mark_verified()
-        m.built_kernel(renamed, "sm_90", source_digest=SRC)
+        m.built_kernel(renamed, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
 
 ENTRY_CHANGES = [
@@ -232,7 +233,7 @@ def test_built_kernel_refuses_an_entry_that_is_not_what_the_spec_asks_for(direct
     spec, _ = specs()
     m = Manifest.load(directory)  # still a perfectly good manifest: the cubins are what was built
     with pytest.raises(TilefishManifestError, match=r"not what the compile spec asks for: first difference at " + difference.replace("[", r"\[").replace("]", r"\]")):
-        m.built_kernel(spec, "sm_90", source_digest=SRC)
+        m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
 
 @pytest.mark.parametrize("key", ["op", "abi", "grid", "block", "num_warps", "num_stages", "constexprs", "buckets", "preconditions", "declaration_digest"])
@@ -241,7 +242,7 @@ def test_an_entry_that_lacks_a_field_of_the_spec_is_not_taken_to_agree_with_it(d
     edit_manifest(directory, lambda d: d["kernels"][0].pop(key))
     spec, _ = specs()
     with pytest.raises(TilefishManifestError, match=r"not what the compile spec asks for: first difference at " + key):
-        Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC)
+        Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
 
 def test_built_kernel_refuses_a_binary_of_another_declaration(directory):
@@ -256,17 +257,17 @@ def test_built_kernel_refuses_a_binary_of_another_declaration(directory):
     (spec,) = compile_specs(scale_with_another_alpha)
     assert spec.stem == "scale"
     with pytest.raises(TilefishManifestError, match="not what the compile spec asks for"):
-        Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC)
+        Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
 
 def test_launch_attributes_that_replay_cannot_set_up_are_kept_for_the_driver_check(directory):
     edit_manifest(directory, lambda d: d["kernels"][0]["launch"].update(global_scratch_size=64, launch_pdl=True))
     spec, _ = specs()
-    b = Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC)
+    b = Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
     assert b.launch.replay_blockers() == ["global_scratch_size=64", "launch_pdl=True"]  # refused when it is loaded into the driver
     edit_manifest(directory, lambda d: d["kernels"][0].update(launch={"global_scratch_size": 0}))
     with pytest.raises(TilefishManifestError, match="launch attributes are malformed"):
-        Manifest.load(directory).built_kernel(spec, "sm_90", source_digest=SRC)
+        Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
 
 # -- the source: a stale binary is refused ----------------------------------------------------------------------------------------------
@@ -319,51 +320,76 @@ def test_an_entry_without_the_source_of_a_generated_kernel_is_refused(tmp_path):
 def test_a_hand_written_kernels_source_digest_must_match(directory):
     spec, _ = specs()
     m = Manifest.load(directory)
-    assert m.built_kernel(spec, "sm_90", source_digest=SRC).stem == "scale"
+    assert m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON).stem == "scale"
     other = hashlib.sha256(b"an edited kernel").hexdigest()
     with pytest.raises(TilefishManifestError) as e:
-        m.built_kernel(spec, "sm_90", source_digest=other)
+        m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton=TRITON)
     assert SRC in str(e.value) and other in str(e.value) and "my_kernels:scale" in str(e.value) and "stale" in str(e.value)
     with pytest.raises(TilefishManifestError, match="stale"):
-        m.built_kernel(spec, "sm_90", source_digest=other, pinned=True)  # a pin does not excuse a digest that is known to differ
+        m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton=TRITON, pinned=True)  # a pin does not excuse a digest that is known to differ
 
 
 def test_without_a_recomputed_source_digest_a_hand_written_kernel_needs_a_pin(directory):
     spec, _ = specs()
     m = Manifest.load(directory)
-    with pytest.raises(TilefishManifestError, match=r"cannot tell whether the binary for 'scale' \(sm_90\) was built from the current source .*cannot be recomputed here"):
+    with pytest.raises(TilefishManifestError, match=r"cannot tell whether the binary for 'scale' \(sm_90\) was built from the kernel 'my_kernels:scale' as the process holds it: the IR of 'my_kernels:scale' cannot be recomputed here"):
         m.built_kernel(spec, "sm_90")
     assert m.built_kernel(spec, "sm_90", pinned=True).stem == "scale"  # the caller vouches for the manifest
 
 
 def test_an_entry_without_a_source_digest_needs_a_pin(tmp_path):
     (spec,) = compile_specs(scale)
-    write_manifest([fake_build(spec, source_digest=None)], tmp_path / "manifest.json", cubins=True)
+    write_manifest([fake_build(spec, ir_digest=None)], tmp_path / "manifest.json", cubins=True)
     entry = json.loads((tmp_path / "manifest.json").read_text())["kernels"][0]
     assert "source_digest" not in entry and "source_digest_kind" not in entry
     m = Manifest.load(tmp_path)
-    with pytest.raises(TilefishManifestError, match="the manifest entry records no source digest"):
-        m.built_kernel(spec, "sm_90", source_digest=SRC)
-    assert m.built_kernel(spec, "sm_90", source_digest=SRC, pinned=True).source_digest is None
+    with pytest.raises(TilefishManifestError, match="the manifest entry records no IR digest"):
+        m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
+    assert m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON, pinned=True).ir_digest is None
+
+
+def test_an_ir_digest_made_by_another_triton_cannot_be_compared_and_needs_a_pin(directory):
+    """The same kernel may print differently in another Triton: not a mismatch, not a match, only a pin vouches."""
+    spec, _ = specs()
+    m = Manifest.load(directory)
+    other = hashlib.sha256(b"printed differently").hexdigest()
+    with pytest.raises(TilefishManifestError, match=r"the entry was built with Triton 3.5.1, this process has Triton 3.6.0, .*cannot be compared"):
+        m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton="3.6.0")
+    assert m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton="3.6.0", pinned=True).stem == "scale"
+
+
+def test_a_generated_kernels_entry_records_its_ir_and_is_told_by_its_source_without_triton(tmp_path):
+    low = rows_body(2.0).lower()
+    (spec,) = low.specs()
+    write_manifest([fake_build(spec)], tmp_path / "manifest.json", cubins=True)
+    entry = json.loads((tmp_path / "manifest.json").read_text())["kernels"][0]
+    assert entry["source_sha256"] == low.source_sha256 and entry["source_digest"] == SRC and entry["source_digest_kind"] == IR_DIGEST_KIND
+    m = Manifest.load(tmp_path)
+    assert m.built_kernel(spec, "sm_90").stem == spec.stem  # no Triton, no pin: its source is what is checked
+    other = hashlib.sha256(b"another kernel").hexdigest()
+    with pytest.raises(TilefishManifestError, match="stale"):  # with Triton, a different IR is stale too
+        m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton=TRITON)
+    assert m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON).ir_digest == SRC
+    assert m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton="3.6.0").stem == spec.stem  # another Triton: not comparable, not an error here
 
 
 def test_the_source_digest_of_an_entry_is_labelled(directory):
     entry = json.loads((directory / "manifest.json").read_text())["kernels"][0]
-    assert entry["source_digest"] == SRC and entry["source_digest_kind"] == SOURCE_DIGEST_KIND == "tilefish.module-sources.v2"
+    assert entry["source_digest"] == SRC and entry["source_digest_kind"] == IR_DIGEST_KIND == "tilefish.triton-ir.v1"
 
 
-def test_a_source_digest_of_another_kind_says_nothing_about_the_files(tmp_path):
-    """An older tilefish recorded Triton's ``cache_key`` there; it cannot be compared with a digest of files."""
+def test_a_source_digest_of_another_kind_says_nothing_about_the_ir(tmp_path):
+    """An older tilefish recorded Triton's ``cache_key`` (or a digest of files) there; it cannot be compared with a digest of IR."""
     (spec,) = compile_specs(scale)
     write_manifest([fake_build(spec)], tmp_path / "manifest.json", cubins=True)
     edit_manifest(tmp_path, lambda d: d["kernels"][0].update(source_digest_kind="triton.JITFunction.cache_key"))
     m = Manifest.load(tmp_path)
-    with pytest.raises(TilefishManifestError, match=r"source digest is of kind 'triton.JITFunction.cache_key', not 'tilefish.module-sources.v2'"):
-        m.built_kernel(spec, "sm_90", source_digest=SRC)  # the same hash, the other kind: not taken as a match
-    assert m.built_kernel(spec, "sm_90", source_digest=SRC, pinned=True).stem == "scale"  # only a pin vouches for it
+    with pytest.raises(TilefishManifestError, match=r"source digest is of kind 'triton.JITFunction.cache_key', not 'tilefish.triton-ir.v1'"):
+        m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)  # the same hash, the other kind: not taken as a match
+    assert m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON, pinned=True).stem == "scale"  # only a pin vouches for it
     edit_manifest(tmp_path, lambda d: d["kernels"][0].pop("source_digest_kind"))
     with pytest.raises(TilefishManifestError, match="is of kind None"):
-        Manifest.load(tmp_path).built_kernel(spec, "sm_90", source_digest=SRC)
+        Manifest.load(tmp_path).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
 
 # -- the digest of the manifest --------------------------------------------------------------------------------------------------------
@@ -479,7 +505,7 @@ def test_a_new_build_of_the_same_binary_replaces_its_entry(directory):
     [
         ({"cubin": cubin_like(code=b"\x05" * 64)}, "sha256_code"),
         ({"shared": 32}, "shared"),
-        ({"source_digest": hashlib.sha256(b"edited").hexdigest()}, "source_digest"),
+        ({"ir_digest": hashlib.sha256(b"edited").hexdigest()}, "source_digest"),
     ],
 )
 def test_a_conflicting_binary_replaces_an_entry_only_with_overwrite(directory, change, what):
@@ -746,7 +772,7 @@ def test_a_malformed_entry_is_a_manifest_error_whatever_raised_inside(directory)
     m = Manifest.load(directory)
     m.get("scale", "sm_90").entry["shared"] = "sixteen"  # a loaded manifest whose entry was edited in memory
     with pytest.raises(TilefishManifestError, match="the manifest entry is malformed: ValueError"):
-        m.built_kernel(spec, "sm_90", source_digest=SRC)
+        m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
 
 # -- writing: no link is followed, a file appears whole -----------------------------------------------------------------------------------

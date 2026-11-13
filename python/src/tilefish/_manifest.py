@@ -16,12 +16,15 @@ block, launch fields, toolchain); a caller that holds it from a trusted place (a
 without that anchor: it takes a pin, or ``trust_directory=True``, the explicit statement that whatever the directory holds is
 trusted.
 
-Source. The compile spec of a generated kernel carries ``source_sha256``, the sha256 of the Triton source it was built
-from, and a replay refuses an entry built from another source (a kernel redeclared with another body but the same name
-and signature). A hand-written ``extern`` has no source in its declaration, so the entry records a source digest (a sha256
-over the files the kernel is made of and the Triton version, see :mod:`tilefish._source`) and a replay recomputes it from
-the importable kernel and refuses a mismatch; where it cannot (Triton or the module is not importable), it refuses unless
-the caller pinned the manifest, which says that the caller vouches for it.
+Source. The identity of a binary is the Triton IR its kernel compiles to (:mod:`tilefish._ir`). Every entry records the digest
+of that IR in ``source_digest``, with ``source_digest_kind`` ``"tilefish.triton-ir.v1"`` (the same fields a schema 2 reader
+already reads: the field has the name of the earlier file digest and holds an IR digest). The compile spec of a generated kernel
+also carries ``source_sha256``, the sha256 of the Triton source it was built from, and a replay refuses an entry built from
+another source (a kernel redeclared with another body but the same name and signature) without needing Triton. A hand-written
+``extern`` has no source in its declaration, so its IR digest is all there is: a replay recomputes it from the importable kernel as
+the process holds it, with the same Triton version that built the entry, and refuses a mismatch; where it cannot (Triton or the module
+is not importable, or the Triton is another version, whose IR may print differently), it refuses unless the caller pinned the
+manifest, which says that the caller vouches for it.
 
 The file is read as strict JSON: no ``NaN`` or ``Infinity``, no number that does not fit a float, no object with the same
 key twice (which parsers disagree about), and every field a replay reads has the type it needs, so a malformed
@@ -40,7 +43,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ._build import MANIFEST_SCHEMA, BuiltKernel, LaunchAttributes, spec_entry
-from ._source import SOURCE_DIGEST_KIND
+from ._ir import IR_DIGEST_KIND
 from ._elf import code_digest, parse_elf, uses_shared
 from .errors import TilefishBuildError, TilefishManifestError
 
@@ -258,17 +261,25 @@ class Manifest:
         return self._artifacts.get((stem, arch))
 
     def built_kernel(
-        self, spec: "CompileSpec", arch: str, *, source_digest: "str | None" = None, pinned: bool = False
+        self,
+        spec: "CompileSpec",
+        arch: str,
+        *,
+        ir_digest: "str | None" = None,
+        ir_triton: "str | None" = None,
+        pinned: bool = False,
     ) -> BuiltKernel:
         """The binary for ``spec`` on ``arch``, as a :class:`~tilefish.aot.BuiltKernel` a replay can launch.
 
         The manifest entry must be what the spec asks for: every field the spec determines (ABI, grid, block,
         ``num_warps``, constants, buckets, preconditions, compile options, declaration digest and, for a generated
-        kernel, the ``source_sha256``) must equal the spec's. For a hand-written kernel (a spec without a
-        ``source_sha256``) the entry's ``source_digest`` must equal ``source_digest``, the digest the caller recomputed
-        from the importable kernel; when the caller could not (``None``) or the entry has none, the binary is only
-        accepted with ``pinned=True``: the caller vouches for the manifest. A recomputed digest that differs from the
-        entry's is a refusal either way. The result has no PTX (a manifest does not carry it).
+        kernel, the ``source_sha256``) must equal the spec's. The entry's ``source_digest`` (an IR digest, see
+        :mod:`tilefish._ir`) must equal ``ir_digest``, the digest the caller recomputed from the kernel in its process, made with
+        Triton version ``ir_triton`` (which must be the version the entry was built with, or the two are not comparable). A
+        recomputed digest that differs from the entry's is a refusal, pinned or not. For a hand-written kernel (a spec without a
+        ``source_sha256``), when the digests cannot be compared (the caller could not recompute one, the entry has none, or another
+        Triton made it) the binary is only accepted with ``pinned=True``: the caller vouches for the manifest. For a generated
+        kernel the ``source_sha256`` is what is checked then. The result has no PTX (a manifest does not carry it).
         """
         artifact = self._artifacts.get((spec.stem, arch))
         if artifact is None:
@@ -280,7 +291,7 @@ class Manifest:
         entry = artifact.entry
         from .aot import _first_difference, _show
 
-        self._check_source(spec, arch, entry, source_digest, pinned)
+        self._check_source(spec, arch, entry, ir_digest, ir_triton, pinned)
 
         expected = json.loads(json.dumps(spec_entry(spec)))  # as JSON read it back: lists, strings, plain numbers
         got = {k: entry.get(k) for k in expected}
@@ -312,13 +323,15 @@ class Manifest:
                 ptx_target=str(entry.get("ptx_target", "")),
                 options=dict(entry["options"]),
                 launch=launch,
-                source_digest=entry.get("source_digest"),
+                ir_digest=entry.get("source_digest") if entry.get("source_digest_kind") == IR_DIGEST_KIND else None,
             )
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             raise TilefishManifestError(f"'{spec.stem}' ({arch}): the manifest entry is malformed: {type(e).__name__}: {e}") from e
 
     @staticmethod
-    def _check_source(spec: "CompileSpec", arch: str, entry: "dict[str, Any]", source_digest: "str | None", pinned: bool) -> None:
+    def _check_source(
+        spec: "CompileSpec", arch: str, entry: "dict[str, Any]", ir_digest: "str | None", ir_triton: "str | None", pinned: bool
+    ) -> None:
         where = f"'{spec.stem}' ({arch})"
         if spec.source_sha256 is not None:  # a generated kernel: its source is part of its spec
             have = entry.get("source_sha256")
@@ -328,33 +341,39 @@ class Manifest:
                     f"generates source with sha256 {spec.source_sha256}: the kernel's body (or an option of its lowering) changed "
                     "since the manifest was written, so its binary is stale; export it again"
                 )
-            return
         recorded = entry.get("source_digest")
         kind = entry.get("source_digest_kind")
-        if recorded is not None and kind != SOURCE_DIGEST_KIND:
-            recorded = None  # a digest of another definition (an older tilefish) says nothing about the files now
-            unusable = f"the manifest entry's source digest is of kind {kind!r}, not {SOURCE_DIGEST_KIND!r}"
+        toolchain = entry.get("toolchain")
+        built_with = toolchain.get("triton") if isinstance(toolchain, dict) else None
+        if recorded is not None and kind != IR_DIGEST_KIND:
+            recorded = None  # a digest of another definition (an older tilefish) says nothing about the IR now
+            unusable = f"the manifest entry's source digest is of kind {kind!r}, not {IR_DIGEST_KIND!r}"
         else:
-            unusable = "the manifest entry records no source digest"
-        if source_digest is not None and recorded is not None and source_digest != recorded:
+            unusable = "the manifest entry records no IR digest"
+        comparable = ir_digest is not None and recorded is not None and ir_triton == built_with
+        if comparable and ir_digest != recorded:
             raise TilefishManifestError(
-                f"the manifest entry for {where} was built from kernel files with source digest {recorded}, but the files of "
-                f"'{spec.triton}' now have source digest {source_digest}: the kernel, a module it uses, or a value it reads that is "
-                "in no file (a module constant computed at import, a closure variable) is not what it was when the manifest was "
-                "written, so this binary is stale (a build here would give another one); export it again (and pin the new manifest)"
+                f"the manifest entry for {where} was built from Triton IR with digest {recorded}, but the kernel '{spec.triton}' in this "
+                f"process now compiles to IR with digest {ir_digest}: the kernel, or something it reads (a module constant by any "
+                "route, a closure variable, a class attribute, an environment variable that a constexpr_function reads) is not what "
+                "it was when the manifest was written, so this binary is stale (a build here would give another one); export it "
+                "again (and pin the new manifest)"
             )
-        if source_digest is None or recorded is None:
-            if pinned:
-                return  # the caller vouches for the manifest
+        if spec.source_sha256 is not None or comparable or pinned:
+            return  # a generated kernel is told by its source, a compared IR digest matched, or the caller vouches for the manifest
+        if recorded is None:
+            why = unusable
+        elif ir_digest is None:
+            why = f"the IR of '{spec.triton}' cannot be recomputed here (Triton or the module is not importable)"
+        else:
             why = (
-                unusable
-                if recorded is None
-                else f"the source digest of '{spec.triton}' cannot be recomputed here (Triton or the module is not importable)"
+                f"the entry was built with Triton {built_with}, this process has Triton {ir_triton}, whose IR for the same kernel "
+                "may print differently, so the two digests cannot be compared"
             )
-            raise TilefishManifestError(
-                f"cannot tell whether the binary for {where} was built from the current source of the hand-written kernel "
-                f"'{spec.triton}': {why}. Pass pin=<the manifest's digest> to vouch for the manifest, or rebuild it"
-            )
+        raise TilefishManifestError(
+            f"cannot tell whether the binary for {where} was built from the kernel '{spec.triton}' as the process holds it: "
+            f"{why}. Pass pin=<the manifest's digest> to vouch for the manifest, or rebuild it"
+        )
 
     def __repr__(self) -> str:
         return f"<Manifest {str(self.directory)!r}: {len(self._artifacts)} binaries>"
