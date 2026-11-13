@@ -159,6 +159,13 @@ def test_argmax_does_not_depend_on_the_warp_count():
         assert torch.equal(tilefish.run(low, x), want), warps
 
 
+def test_the_chunked_walk_and_one_block_agree():
+    assert "static_range" in ac.argmax_bf16.lower().source and "static_range" not in ac.argmax_and_sum.lower().source
+    for seed in range(3):
+        x = adversarial(5000, BF16, seed=seed)
+        assert torch.equal(tilefish.run(ac.argmax_and_sum, x)[0], tilefish.run(ac.argmax_bf16, x))
+
+
 def test_argmax_of_a_computed_row(exported):
     logits = randn((33, 5000), BF16, seed=4)
     bias = randn((5000,), BF16, seed=5)

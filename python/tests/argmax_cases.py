@@ -48,3 +48,9 @@ def arg_ints(a: Tensor[R, W, i32], b: Tensor[R, W, i64], c: Tensor[R, W, u8]) ->
 def greedy_token(logits: Tensor[R, C, bf16], bias: Tensor[C, bf16]) -> Tensor[R, i64]:
     """An argmax of a computed row: the logits plus a per-column bias, rounded to bf16 first."""
     return tilefish.argmax((logits.to(f32) + bias.to(f32)).to(bf16), dtype=i64)
+
+
+@tilefish.kernel
+def argmax_and_sum(x: Tensor[R, C, bf16]) -> tuple[Tensor[R, i64], Tensor[R, f32]]:
+    """A sum in the kernel keeps the row one block: its argmax must be the chunked one's."""
+    return tilefish.argmax(x, dtype=i64), tilefish.sum(x.to(f32), axis=-1)

@@ -42,15 +42,33 @@ def test_golden_source():
     check_golden("arg_ints", ac.arg_ints.lower().source)
 
 
-def test_argmax_of_a_half_type_widens_to_f32_and_tests_for_a_nan():
-    src = ac.argmax_bf16.lower().source
-    assert "v1_x = v0.to(tl.float32)  # exact" in src
-    assert "v1_nan = (v1_x != v1_x) & mask" in src
-    assert 'v1_best = tl.max(tl.where(mask, v1_x, float("-inf")), axis=0)' in src
-    assert "v1 = tl.min(tl.where(v1_hit, cols, BLOCK_D), axis=0).to(tl.int64)" in src
-    assert "tl.argmax" not in src and "tl.argmin" not in src  # Triton's own rule for a NaN is not torch's
-    arg = ac.argmin_bf16.lower().source
-    assert 'tl.min(tl.where(mask, v1_x, float("inf")), axis=0)' in arg and "tl.store(out + row, v1)" in arg
+def test_a_long_row_is_walked_in_chunks_with_the_combine_of_the_order():
+    low = ac.argmax_bf16.lower()
+    src = low.source
+    assert low.num_warps == 2 and low.bucket_num_warps == {}
+    assert "def _tf_argmax_float(v1, i1, v2, i2):" in src
+    assert "win = tl.where(n1 != n2, n1, gt | ((~gt) & (~lt) & (i1 < i2)))" in src
+    assert "v0_bv = tl.full([BLOCK_D], float(\"-inf\"), tl.float32)" in src and "v0_bi = tl.full([BLOCK_D], 2147483647, tl.int32)" in src
+    assert "for c0 in tl.static_range(0, D, BLOCK_D):" in src
+    assert "v0_x = v1.to(tl.float32)  # exact" in src
+    assert "v0_bv, v0_bi = _tf_argmax_float(v0_bv, v0_bi, tl.where(mask, v0_x, float(\"-inf\")), tl.where(mask, cols, 2147483647))" in src
+    assert "v0_v, v0_i = tl.reduce((v0_bv, v0_bi), 0, _tf_argmax_float)" in src and "v0 = v0_i.to(tl.int64)" in src
+    assert "tl.argmax" not in src and "tl.max(" not in src  # Triton's own argmax has another rule for a NaN
+    (spec,) = low.specs()
+    assert spec.constants[(3,)] == 1024 and spec.num_warps == 2  # BLOCK_D: one chunk
+
+
+def test_everything_per_element_is_computed_chunk_by_chunk():
+    src = ac.greedy_token.lower().source
+    body = src.split("for c0 in tl.static_range(0, D, BLOCK_D):", 1)[1].split("v0_v, v0_i = tl.reduce", 1)[0]
+    assert "tl.load(logits + offs" in body and "tl.load(bias + cols" in body and "v6 = v5.to(tl.bfloat16)  # rounding point" in body
+
+
+def test_a_short_or_bucketed_row_is_one_block():
+    src = ac.arg_f16.lower().source
+    assert "static_range" not in src and "def _tf_argmin_float(v1, i1, v2, i2):" in src
+    assert "v1_v, v1_i = tl.reduce((tl.where(mask, v1_x, float(\"-inf\")), tl.where(mask, cols, 2147483647)), 0, _tf_argmax_float)" in src
+    assert 'tl.where(mask, v2_x, float("inf"))' in src and "_tf_argmin_float)" in src
 
 
 def test_argmax_of_integers_masks_with_the_bounds_of_their_type():
@@ -58,7 +76,23 @@ def test_argmax_of_integers_masks_with_the_bounds_of_their_type():
     assert "tl.where(mask, v0, -2147483648)" in src and "tl.where(mask, v0, 2147483647)" in src
     assert "tl.cast(-9223372036854775808, tl.int64)" in src and "tl.cast(9223372036854775807, tl.int64)" in src
     assert "tl.cast(0, tl.uint8)" in src and "tl.cast(255, tl.uint8)" in src
-    assert "_nan" not in src
+    assert "win = (v1 > v2) | ((v1 == v2) & (i1 < i2))" in src and "win = (v1 < v2) | ((v1 == v2) & (i1 < i2))" in src
+    assert "n1 = v1 != v1" not in src
+
+
+def test_a_kernel_with_a_sum_is_not_chunked():
+    @tilefish.kernel
+    def with_sum(x: Tensor[M, ac.C, f32]) -> tuple[Tensor[M, i32], Tensor[M, f32]]:
+        return tilefish.argmax(x, dtype=i32), tilefish.sum(x, axis=-1)
+
+    @tilefish.kernel
+    def depends(x: Tensor[M, ac.C, f32]) -> Tensor[M, ac.C, f32]:
+        best = tilefish.argmax(x, dtype=i32, keepdims=True)
+        return tilefish.where(tilefish.iota(x, axis=-1) == best, x, 0.0)
+
+    for k in (with_sum, depends):
+        low = k.lower()
+        assert "static_range" not in low.source and low.num_warps == 16, k.name
 
 
 def test_argmax_lowers_to_the_row_template_only():
@@ -80,8 +114,3 @@ def test_a_bucketed_row_length_gives_a_spec_per_bucket():
     specs = compile_specs(ac.arg_f16.lower().extern)
     assert [s.stem for s in specs] == ["arg_f16.W7", "arg_f16.W96", "arg_f16.W1000"]
     assert [s.num_warps for s in specs] == [1, 1, 4]
-
-
-def test_argmax_of_a_computed_row():
-    src = ac.greedy_token.lower().source
-    assert "v5 = v4.to(tl.bfloat16)  # rounding point" in src and "v6_x = v5.to(tl.float32)" in src

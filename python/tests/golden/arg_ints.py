@@ -8,6 +8,24 @@ import triton.language as tl
 
 
 @triton.jit
+def _tf_argmax_int(v1, i1, v2, i2):
+    # whether (v1, i1) beats (v2, i2) in argmax (note 8 of tilefish.lower): the larger value wins;
+    # equal values go to the lower index. A strict total order,
+    # so the result depends on no reduction tree and no chunking
+    win = (v1 > v2) | ((v1 == v2) & (i1 < i2))
+    return tl.where(win, v1, v2), tl.where(win, i1, i2)
+
+
+@triton.jit
+def _tf_argmin_int(v1, i1, v2, i2):
+    # whether (v1, i1) beats (v2, i2) in argmin (note 8 of tilefish.lower): the smaller value wins;
+    # equal values go to the lower index. A strict total order,
+    # so the result depends on no reduction tree and no chunking
+    win = (v1 < v2) | ((v1 == v2) & (i1 < i2))
+    return tl.where(win, v1, v2), tl.where(win, i1, i2)
+
+
+@triton.jit
 def tf_arg_ints(
     a,
     b,
@@ -28,24 +46,18 @@ def tf_arg_ints(
     v0 = tl.load(a + offs, mask=mask, other=0)  # a
     v1 = tl.load(b + offs, mask=mask, other=0)  # b
     v2 = tl.load(c + offs, mask=mask, other=0)  # c
-    v3_best = tl.max(tl.where(mask, v0, -2147483648), axis=0)
-    v3_hit = (v0 == v3_best) & mask
-    v3 = tl.min(tl.where(v3_hit, cols, BLOCK_D), axis=0)
-    v4_best = tl.min(tl.where(mask, v0, 2147483647), axis=0)
-    v4_hit = (v0 == v4_best) & mask
-    v4 = tl.min(tl.where(v4_hit, cols, BLOCK_D), axis=0)
-    v5_best = tl.max(tl.where(mask, v1, tl.cast(-9223372036854775808, tl.int64)), axis=0)
-    v5_hit = (v1 == v5_best) & mask
-    v5 = tl.min(tl.where(v5_hit, cols, BLOCK_D), axis=0)
-    v6_best = tl.min(tl.where(mask, v1, tl.cast(9223372036854775807, tl.int64)), axis=0)
-    v6_hit = (v1 == v6_best) & mask
-    v6 = tl.min(tl.where(v6_hit, cols, BLOCK_D), axis=0)
-    v7_best = tl.max(tl.where(mask, v2, tl.cast(0, tl.uint8)), axis=0)
-    v7_hit = (v2 == v7_best) & mask
-    v7 = tl.min(tl.where(v7_hit, cols, BLOCK_D), axis=0)
-    v8_best = tl.min(tl.where(mask, v2, tl.cast(255, tl.uint8)), axis=0)
-    v8_hit = (v2 == v8_best) & mask
-    v8 = tl.min(tl.where(v8_hit, cols, BLOCK_D), axis=0)
+    v3_v, v3_i = tl.reduce((tl.where(mask, v0, -2147483648), tl.where(mask, cols, 2147483647)), 0, _tf_argmax_int)
+    v3 = v3_i
+    v4_v, v4_i = tl.reduce((tl.where(mask, v0, 2147483647), tl.where(mask, cols, 2147483647)), 0, _tf_argmin_int)
+    v4 = v4_i
+    v5_v, v5_i = tl.reduce((tl.where(mask, v1, tl.cast(-9223372036854775808, tl.int64)), tl.where(mask, cols, 2147483647)), 0, _tf_argmax_int)
+    v5 = v5_i
+    v6_v, v6_i = tl.reduce((tl.where(mask, v1, tl.cast(9223372036854775807, tl.int64)), tl.where(mask, cols, 2147483647)), 0, _tf_argmin_int)
+    v6 = v6_i
+    v7_v, v7_i = tl.reduce((tl.where(mask, v2, tl.cast(0, tl.uint8)), tl.where(mask, cols, 2147483647)), 0, _tf_argmax_int)
+    v7 = v7_i
+    v8_v, v8_i = tl.reduce((tl.where(mask, v2, tl.cast(255, tl.uint8)), tl.where(mask, cols, 2147483647)), 0, _tf_argmin_int)
+    v8 = v8_i
     tl.store(out0 + row, v3)  # return value 0
     tl.store(out1 + row, v4)  # return value 1
     tl.store(out2 + row, v5)  # return value 2

@@ -162,9 +162,9 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
 ``mask.to(dt)``             ``m.to(tl.<dt>)``                                               exactly 0 or 1 (zero extension,
                                                                                          ``uitofp``); a cast *to* a mask is
                                                                                          refused (write ``x != 0``).
-``argmax(x, -1, dtype=)``   row template only: ``tl.max`` of the row (``-inf`` in the       exact and order-free: the first NaN,
-``argmin(x, -1, dtype=)``   masked lanes), then ``tl.min`` of ``cols`` where the row        else the first extreme value
-                            holds it, or where it holds a NaN (note 8)                      (``-0.0 == +0.0``); torch's rule.
+``argmax(x, -1, dtype=)``   row template only: ``tl.reduce`` of (value, column) pairs       exact and order-free: the first NaN,
+``argmin(x, -1, dtype=)``   with a combine that implements the order; a row of 1025 to      else the first extreme value
+                            16384 columns is walked in chunks of 1024 (note 8)              (``-0.0 == +0.0``); torch's rule.
                                                                                          ``dtype`` is ``i32`` or ``i64``.
 ``gather_rows(x, idx,       ``ok = (i >= 0) & (i < x_rows)``, then                          a raw copy (the loaded bits are the
 oob="zero" | "clamp")``     ``tl.load(x + i * D + cols, mask=mask & ok, other=0)``;         stored bits). Out of range: a row of
@@ -268,14 +268,20 @@ Notes (the facts behind the table):
 8. **``argmax`` and ``argmin``.** The result is the index (``dtype=i32`` or ``i64``, which the call must say) of the winner of a strict
    total order on (value, index): a NaN beats every number (``+inf`` included, for ``argmax`` and ``argmin`` alike), two NaNs or two
    equal values (``-0.0`` and ``+0.0`` are equal) go to the lower index, otherwise the larger (``argmax``) or smaller (``argmin``) value
-   wins. So the first NaN wins, then the first extreme value; a row of ``-inf`` gives 0 for ``argmax``. This is torch's rule
-   (``torch.argmax`` / ``torch.argmin`` on CUDA); it is not ``tl.argmax``'s, whose combine lets a NaN win only from one side, so its
-   answer depends on the tree. A bf16 or f16 value is widened to f32 (exact), an integer is compared as it is (``u8`` unsigned). The
-   lowering is three or four reductions over the row, every one a ``tl.max`` or ``tl.min`` (whether there is a NaN; the extreme over the
-   valid lanes, the masked lanes being ``-inf`` / ``+inf`` or the integer type's bound; the smallest ``cols`` that holds the NaN or the
-   extreme), and a max or a min is exact and independent of the reduction tree: unlike ``sum``, the result does not depend on
-   ``num_warps`` (whatever ``tl.max`` does with a NaN or with the two zeros, the lanes are then picked by equality and the NaN test).
-   Only the row template has it, along the last axis.
+   wins. So the first NaN wins, then the first extreme value; a row of ``-inf`` gives 0 for ``argmax``. This is torch's documented rule
+   (the index of the first maximal value, a NaN propagating), and what ``torch.argmax`` / ``torch.argmin`` return on CUDA, checked on
+   adversarial rows by ``tests/test_gpu_argmax.py``. It is not ``tl.argmax``'s: its combine (``v1 > v2 or (v1 == v2 and i1 < i2)``) lets
+   a NaN win only from one side, so its answer depends on the tree. A bf16 or f16 value is widened to f32 (exact), an integer is
+   compared as it is (``u8`` unsigned). The lowering is a module-level combine of (value, index) pairs that implements the order
+   (``_tf_argmax_float`` and the like), applied by ``tl.reduce``; a masked lane offers (``-inf`` / ``+inf`` or the integer type's bound,
+   ``2**31 - 1``) and loses to every lane. Because the order is total, the combine is associative and commutative and the result does
+   not depend on the reduction tree, on ``num_warps`` or on how the row is cut. A row of more than ``1024`` columns (and at most
+   ``16 * 1024``) whose kernel has no ``sum``, ``mean`` or ``max`` and nothing per element that depends on the result is walked in
+   chunks of ``BLOCK_D = 1024`` columns, unrolled, in ascending order: each lane folds its column of every chunk into a carried pair,
+   then one ``tl.reduce`` of the carries, with 2 warps; everything per element in the kernel is computed chunk by chunk in the same
+   loop. Measured on a B300 MIG slice, GPU time of a captured plan, bf16 rows of 5000: 30.8 microseconds for 2048 rows chunked, 70.4
+   as one 8192-wide block (the same combine), 55.9 for ``torch.argmax``; 6.2 / 12.3 / 18.5 for 256 rows; 6.0 / 5.9 / 18.5 for 64 rows.
+   A longer row is one block (faster there: 32768 columns). Only the row template has them, along the last axis.
 9. **Gathers and scatters of rows.** ``gather_rows(x, idx, oob=...)`` is ``x[idx]`` along the first axis and ``scatter_rows(dst, idx, src,
    oob="skip")`` is ``dst[idx] = src`` in place (an index copy). Both are raw copies: a value is loaded and stored with no arithmetic, so a
    NaN keeps its payload and a zero its sign. The table ``x`` is a read-only ``Tensor[...]`` parameter and ``dst`` an ``InOut`` parameter
@@ -346,6 +352,9 @@ ELEMENTWISE_BLOCK = 1024
 ELEMENTWISE_NUM_WARPS = 4
 ROW_LANES_PER_WARP = 256
 ROW_MAX_WARPS = 16
+ARG_CHUNK = 1024  # an argmax / argmin row longer than this is walked in chunks of this many columns (note 8)
+ARG_MAX_CHUNKS = 16  # ... when it has at most this many (unrolled); a longer row is one block
+ARG_CHUNK_WARPS = 2
 MAX_BLOCK = 1 << 20  # Triton's limit on the number of elements of a tensor
 NUM_STAGES = 3
 NUM_WARPS = (1, 2, 4, 8, 16, 32)
@@ -383,6 +392,7 @@ _OTHER_OPS = ("not", "where", "iota", "gather_rows", "scatter_rows", "floordiv",
 # Triton's own type of a python literal: a scalar of any other dtype is written as a typed constant (tl.cast(0.1, tl.bfloat16)),
 # because Triton compares a bf16 or f16 tensor with a float literal in f32 (the literal is not rounded to the tensor's dtype first)
 _LITERAL_DTYPES = frozenset({"f32", "i32"})
+_INDEX_SENTINEL = 2147483647  # the column of a masked lane in an argmax / argmin: it loses every tie
 
 _FULL, _COL, _ROW = "full", "col", "row"  # row template: [R, D], [D], [R] / [R, 1]
 _SCALAR, _DEV = "scalar", "devscalar"  # rank 0: a value read from a DevScalar (broadcast), and the DevScalar parameter itself (a pointer to one element)
@@ -835,6 +845,61 @@ def _const_param(name: str, default: Any) -> Param:
     return Param(name, 0, "const", default=default, keyword_only=True)
 
 
+@dataclass
+class _Phases:
+    """Where each node of a chunked row goes: ``"pre"`` (before the loop over the chunks: per-row values that need no reduction), ``"loop"``
+    (per element, once per chunk; an argmax / argmin also folds each chunk into its carry there) or ``"post"`` (after the loop: what depends
+    on the result of an argmax / argmin)."""
+
+    values: "dict[Value, str]"
+    nodes: "dict[Node, str]"
+
+
+_PHASE_ORDER = {"pre": 0, "loop": 1, "post": 2}
+
+
+def _chunk_phases(graph: Graph, cls: "dict[Value, str]", tables: _Tables) -> "_Phases | None":
+    """The phases of a chunked row, or ``None`` when the body cannot be chunked (a per-element value depends on an argmax result)."""
+    values: dict[Value, str] = {}
+    nodes: dict[Node, str] = {}
+
+    def phase(v: Any) -> str:
+        return values.get(v, "pre") if isinstance(v, Value) else "pre"
+
+    for p in graph.inputs:
+        if not tables.skip(p) and not p.type.devscalar:
+            values[p] = "loop" if cls[p] in (_FULL, _COL) else "pre"
+    for n in graph.nodes:
+        ins = [i for i in n.inputs if isinstance(i, Value) and not tables.skip(i)]
+        if n.op == "store":
+            ins = [n.inputs[1]]  # type: ignore[list-item]
+        elif n.op == "scatter_rows":
+            ins = list(n.inputs[1:])  # type: ignore[arg-type]
+        latest = max((phase(i) for i in ins), key=_PHASE_ORDER.__getitem__, default="pre")
+        per_element = any(cls.get(o) in (_FULL, _COL) for o in n.outputs) or (n.op == "scatter_rows" and cls[n.inputs[2]] in (_FULL, _COL))  # type: ignore[index]
+        if n.op == "store":
+            per_element = cls[n.inputs[1]] in (_FULL, _COL)  # type: ignore[index]
+        if n.op in _ARG_REDUCTIONS:
+            nodes[n] = "loop"
+            values[n.outputs[0]] = "post"
+            continue
+        if per_element:
+            if latest == "post":
+                return None
+            here = "loop"
+        else:
+            if latest == "loop":  # a per-row value from per-element ones without a reduction: not a case the template has
+                return None
+            here = latest
+        nodes[n] = here
+        for o in n.outputs:
+            values[o] = here
+    for v in graph.outputs:
+        if cls[v] in (_FULL, _COL) and values.get(v, "pre") == "post":  # pragma: no cover - a per-element post value returned early
+            return None
+    return _Phases(values, nodes)
+
+
 class _RowLayout(_Layout):
     template = "row"
 
@@ -966,6 +1031,17 @@ class _RowLayout(_Layout):
                     "is [R] (one row each) or [R, D]",
                 )
         self.grid = (self.R.folded(),)
+        # an argmax or argmin of a long row walks it in chunks (note 8): each lane keeps its best (value, index) over the chunks, then one
+        # tree reduce. Only where the order cannot matter: no sum, mean or max in the kernel, and nothing per element depends on a result
+        self.chunk: "int | None" = None
+        self.phases: "_Phases | None" = None
+        if any(n.op in _ARG_REDUCTIONS for n in graph.nodes) and not any(n.op in _REDUCTIONS for n in graph.nodes):
+            lo, hi = dim_bounds(D)
+            if lo > ARG_CHUNK and hi is not None and hi <= ARG_CHUNK * ARG_MAX_CHUNKS:
+                self.phases = _chunk_phases(graph, self.cls, tables)
+                if self.phases is not None:
+                    self.chunk = ARG_CHUNK
+                    self.block_max = ARG_CHUNK
 
     def _shape_error(self, name: str, v: Value) -> TilefishLoweringError:
         return _fail(
@@ -982,12 +1058,16 @@ class _RowLayout(_Layout):
         self.D_name = names.fresh("D")
         self.BLOCK_name = names.fresh("BLOCK_D")
         self.row, self.cols, self.mask, self.offs = (names.fresh(x) for x in ("row", "cols", "mask", "offs"))
+        if self.chunk is not None:
+            self.lanes, self.c0 = names.fresh("lanes"), names.fresh("c0")
         if self.D.is_static:
             d_default: Any = self.D.value
             block_default: Any = next_pow2(self.D.value)
         else:
             d_default = self.D
             block_default = next_pow2(self.D)
+        if self.chunk is not None:
+            block_default = self.chunk
         return [
             _Extra(self.D_name, True, _const_param(self.D_name, d_default)),
             _Extra(self.BLOCK_name, True, _const_param(self.BLOCK_name, block_default)),
@@ -1010,12 +1090,27 @@ class _RowLayout(_Layout):
             f"{self.offs} = {self.row} * {self.D_name} + {self.cols}",
         ]
 
+    def chunk_prologue(self) -> "list[str]":
+        """A chunked row: what comes before the loop over the chunks."""
+        return [f"{self.row} = tl.program_id(0)", f"{self.lanes} = tl.arange(0, {self.BLOCK_name})"]
+
+    def chunk_loop(self) -> "list[str]":
+        """A chunked row: the loop over the chunks (unrolled; the columns in ascending order) and the first lines of its body."""
+        return [
+            f"for {self.c0} in tl.static_range(0, {self.D_name}, {self.BLOCK_name}):",
+            f"    {self.cols} = {self.c0} + {self.lanes}",
+            f"    {self.mask} = {self.cols} < {self.D_name}",
+            f"    {self.offs} = {self.row} * {self.D_name} + {self.cols}",
+        ]
+
     def default_num_warps(self) -> int:
+        if self.chunk is not None:
+            return ARG_CHUNK_WARPS
         return _row_warps(self.block_max)
 
     def bucket_num_warps(self) -> "dict[str, int]":
         """One warp count per bucket of ``D``, from the ``BLOCK_D`` of that bucket alone (none for a static ``D``)."""
-        if self.D.is_static:
+        if self.D.is_static or self.chunk is not None:  # a chunked row has the same block in every bucket
             return {}
         free = sorted(self.D.free_dims(), key=lambda x: x.name)  # the order compile_specs walks the buckets in
         out: dict[str, int] = {}
@@ -1026,6 +1121,11 @@ class _RowLayout(_Layout):
 
     def header(self) -> "list[str]":
         d = f"{self.D} (static)" if self.D.is_static else f"{self.D} (bucketed)"
+        if self.chunk is not None:
+            return [
+                f"template: row; one program per row, grid {_grid_text(self.grid)}",
+                f"D = {d}, walked in chunks of BLOCK_D = {self.chunk} columns (argmax / argmin; note 8)",
+            ]
         return [f"template: row; one program per row, grid {_grid_text(self.grid)}", f"D = {d}, BLOCK_D = next_pow2(D)"]
 
     def load(self, p: str, v: Value) -> str:
@@ -1251,6 +1351,8 @@ class _Body:
         self.params = {p.name: p for p in op.graph.inputs}
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
+        self.helpers: dict[tuple, tuple[str, list[str]]] = {}  # module-level @triton.jit functions the body calls (an argmax combine)
+        self.indent = 1
         self._count = 0
 
     def local(self) -> str:
@@ -1259,7 +1361,7 @@ class _Body:
         return name
 
     def emit(self, text: str, comment: str = "") -> None:
-        self.lines.append(f"    {text}" + (f"  # {comment}" if comment else ""))
+        self.lines.append("    " * self.indent + text + (f"  # {comment}" if comment else ""))
 
     def operand(self, x: "Value | Scalar") -> str:
         return self.var[x] if isinstance(x, Value) else _scalar_text(x, self.rename)
@@ -1274,10 +1376,9 @@ class _Body:
             x = Scalar(_round_float(float(x.value), x.dtype.name), x.dtype)
         return f"tl.cast({self.operand(x)}, tl.{_TL[x.dtype.name]})"
 
-    def run(self) -> "list[str]":
+    def _reads(self) -> "tuple[list[Value], dict[str, Node]]":
+        """The parameters the body loads, in declaration order, and the last store into each written parameter."""
         graph, layout = self.graph, self.layout
-        for line in layout.prologue():
-            self.emit(line)
         reads: set[Value] = set()
         last_store: dict[str, Node] = {}
         for n in graph.nodes:
@@ -1291,24 +1392,99 @@ class _Body:
             else:
                 reads.update(i for i in n.inputs if isinstance(i, Value))
         reads.update(graph.outputs)
-        for p in graph.inputs:  # inputs first, in declaration order; an Out parameter is never read, a DevScalar only by tilefish.load
-            if p.access != "out" and p in reads and not p.type.devscalar and p not in layout.tables.only:  # a table is read by its gathers
-                v = self.local()
-                self.var[p] = v
-                self.emit(f"{v} = {layout.load(self.rename.get(p.name, p.name), p)}", p.name)
+        # an Out parameter is never read, a DevScalar only by tilefish.load, a table by its gathers
+        loads = [p for p in graph.inputs if p.access != "out" and p in reads and not p.type.devscalar and p not in layout.tables.only]
+        return loads, last_store
+
+    def load(self, p: Value) -> None:
+        v = self.local()
+        self.var[p] = v
+        self.emit(f"{v} = {self.layout.load(self.rename.get(p.name, p.name), p)}", p.name)
+
+    def node(self, n: Node, last_store: "dict[str, Node]") -> None:
+        if n.op == "store":
+            self.store(n, last_store)
+        elif n.op == "scatter_rows":
+            self.scatter(n)
+        else:
+            (out,) = n.outputs
+            v = self.local()
+            self.var[out] = v
+            rounding = "rounding point" if n.is_rounding_point else ""
+            self.emit(f"{v} = {self.expression(n, v)}", rounding)  # an expression may emit the statements it needs first
+
+    def run(self) -> "list[str]":
+        graph, layout = self.graph, self.layout
+        if isinstance(layout, _RowLayout) and layout.chunk is not None:
+            return self.run_chunked()
+        for line in layout.prologue():
+            self.emit(line)
+        loads, last_store = self._reads()
+        for p in loads:  # inputs first, in declaration order
+            self.load(p)
         for n in graph.nodes:
-            if n.op == "store":
-                self.store(n, last_store)
-            elif n.op == "scatter_rows":
-                self.scatter(n)
-            else:
-                (out,) = n.outputs
-                v = self.local()
-                self.var[out] = v
-                rounding = "rounding point" if n.is_rounding_point else ""
-                self.emit(f"{v} = {self.expression(n, v)}", rounding)  # an expression may emit the statements it needs first
+            self.node(n, last_store)
         for k, v in enumerate(graph.outputs):
             self.emit(layout.store(self.out_names[k], v, self.var[v]), f"return value {k}")
+        return self.lines
+
+    def run_chunked(self) -> "list[str]":
+        """A row walked in chunks of ``BLOCK_D`` columns (note 8): the per-row values first, then a loop over the chunks in which every
+        per-element value is computed, stored and folded into the carry of each argmax / argmin, then the tree reduce of each carry and
+        what depends on the results."""
+        graph, layout = self.graph, self.layout
+        assert isinstance(layout, _RowLayout) and layout.phases is not None
+        phases = layout.phases
+        for line in layout.chunk_prologue():
+            self.emit(line)
+        loads, last_store = self._reads()
+        for p in loads:
+            if phases.values[p] == "pre":
+                self.load(p)
+        for n in graph.nodes:
+            if phases.nodes[n] == "pre":
+                self.node(n, last_store)
+        args = [n for n in graph.nodes if n.op in _ARG_REDUCTIONS]
+        carries: dict[Node, tuple[str, str, str]] = {}
+        for n in args:
+            v = self.local()
+            self.var[n.outputs[0]] = v
+            carries[n] = (v, self.names.fresh(f"{v}_bv"), self.names.fresh(f"{v}_bi"))
+            value_type, sentinel, _ = self.arg_kind(n)
+            self.emit(f"{carries[n][1]} = tl.full([{layout.BLOCK_name}], {sentinel}, tl.{value_type})", "the best value of each lane")
+            self.emit(f"{carries[n][2]} = tl.full([{layout.BLOCK_name}], {_INDEX_SENTINEL}, tl.int32)", "and its column")
+        loop = layout.chunk_loop()
+        self.emit(loop[0], "every chunk, in ascending order")
+        self.indent += 1
+        for line in loop[1:]:
+            self.emit(line.strip())
+        for p in loads:
+            if phases.values[p] == "loop":
+                self.load(p)
+        for n in graph.nodes:
+            if phases.nodes[n] != "loop":
+                continue
+            if n in carries:
+                v, bv, bi = carries[n]
+                value, index = self.arg_lanes(n, v)
+                self.emit(f"{bv}, {bi} = {self.combine(n)}({bv}, {bi}, {value}, {index})")
+            else:
+                self.node(n, last_store)
+        for k, v in enumerate(graph.outputs):
+            if layout.cls[v] in (_FULL, _COL):
+                self.emit(layout.store(self.out_names[k], v, self.var[v]), f"return value {k}")
+        self.indent -= 1
+        for n in args:
+            v, bv, bi = carries[n]
+            self.emit(f"{v}_v, {v}_i = tl.reduce(({bv}, {bi}), 0, {self.combine(n)})")
+            out = n.outputs[0].type.dtype.name
+            self.emit(f"{v} = {v}_i" if out == "i32" else f"{v} = {v}_i.to(tl.{_TL[out]})")
+        for n in graph.nodes:
+            if phases.nodes[n] == "post":
+                self.node(n, last_store)
+        for k, v in enumerate(graph.outputs):
+            if layout.cls[v] not in (_FULL, _COL):
+                self.emit(layout.store(self.out_names[k], v, self.var[v]), f"return value {k}")
         return self.lines
 
     def store(self, n: Node, last_store: "dict[str, Node]") -> None:
@@ -1384,37 +1560,69 @@ class _Body:
             return f"tl.where({r} < 0, {r} + {k}, {r})"
         return f"tl.where({r} < 0, {a} // {k} - 1, {a} // {k})"
 
-    def arg_reduce(self, n: Node, v: str) -> str:
-        """``argmax`` / ``argmin`` of an ``[R, D]`` value along the row (the row template; note 8): the index of the first lane that
-        holds the extreme value, or of the first NaN when the row has one. Every reduction here is a max or a min, which are exact
-        and do not depend on the order of the tree."""
-        layout = self.layout
-        assert isinstance(layout, _RowLayout)
-        mask, cols, block = layout.mask, layout.cols, layout.BLOCK_name
+    def arg_kind(self, n: Node) -> "tuple[str, str, bool]":
+        """The Triton type an argmax / argmin compares in (f32 for every float), the value a masked lane holds so that it loses to every
+        lane (``-inf`` / ``+inf``, or the integer type's bound: an equal value loses on its index), and whether the values are floats."""
         x = n.inputs[0]
         assert isinstance(x, Value)
         dt = x.type.dtype
-        a = self.var[x]
         largest = n.op == "argmax"
-        extreme = "tl.max" if largest else "tl.min"
-        if dt.name in ("bf16", "f16"):  # widened to f32, exactly
+        if dt.is_float:
+            return "float32", 'float("-inf")' if largest else 'float("inf")', True
+        lo, hi = dt.int_range()
+        return _TL[dt.name], self.typed(Scalar(lo if largest else hi, dt)), False
+
+    def combine(self, n: Node) -> str:
+        """The name of the module-level combine of an argmax / argmin (note 8), written into :attr:`helpers` the first time it is needed."""
+        _, _, floating = self.arg_kind(n)
+        key = (n.op, floating)
+        if key not in self.helpers:
+            name = self.names.fresh(f"_tf_{n.op}_{'float' if floating else 'int'}")
+            better = "gt" if n.op == "argmax" else "lt"
+            extreme = "the larger value" if n.op == "argmax" else "the smaller value"
+            lines = [
+                "@triton.jit",
+                f"def {name}(v1, i1, v2, i2):",
+                f"    # whether (v1, i1) beats (v2, i2) in {n.op} (note 8 of tilefish.lower): "
+                + (f"a NaN beats every number, else {extreme} wins;" if floating else f"{extreme} wins;"),
+                "    # equal values" + (" (two NaNs, -0.0 and +0.0)" if floating else "") + " go to the lower index. A strict total order,",
+                "    # so the result depends on no reduction tree and no chunking",
+            ]
+            if floating:
+                lines += [
+                    "    gt = v1 > v2",
+                    "    lt = v1 < v2",
+                    "    n1 = v1 != v1",
+                    "    n2 = v2 != v2",
+                    f"    win = tl.where(n1 != n2, n1, {better} | ((~gt) & (~lt) & (i1 < i2)))",
+                ]
+            else:
+                lines += [f"    win = (v1 {'>' if n.op == 'argmax' else '<'} v2) | ((v1 == v2) & (i1 < i2))"]
+            lines += ["    return tl.where(win, v1, v2), tl.where(win, i1, i2)"]
+            self.helpers[key] = (name, lines)
+        return self.helpers[key][0]
+
+    def arg_lanes(self, n: Node, v: str) -> "tuple[str, str]":
+        """The (value, index) pair each lane of the row (or of the chunk) offers an argmax / argmin; a masked lane loses to every lane."""
+        layout = self.layout
+        assert isinstance(layout, _RowLayout)
+        x = n.inputs[0]
+        assert isinstance(x, Value)
+        a = self.var[x]
+        if x.type.dtype.name in ("bf16", "f16"):  # widened to f32, exactly
             wide = self.names.fresh(f"{v}_x")
             self.emit(f"{wide} = {a}.to(tl.float32)", "exact")
             a = wide
-        best, hit = self.names.fresh(f"{v}_best"), self.names.fresh(f"{v}_hit")
-        if dt.is_float:
-            nan = self.names.fresh(f"{v}_nan")
-            sentinel = 'float("-inf")' if largest else 'float("inf")'
-            self.emit(f"{nan} = ({a} != {a}) & {mask}", "a NaN wins")
-            self.emit(f"{best} = {extreme}(tl.where({mask}, {a}, {sentinel}), axis=0)")
-            self.emit(f"{hit} = tl.where(tl.max({nan}.to(tl.int32), axis=0) > 0, {nan}, ({a} == {best}) & {mask})")
-        else:
-            lo, hi = dt.int_range()
-            self.emit(f"{best} = {extreme}(tl.where({mask}, {a}, {self.typed(Scalar(lo if largest else hi, dt))}), axis=0)")
-            self.emit(f"{hit} = ({a} == {best}) & {mask}")
-        index = f"tl.min(tl.where({hit}, {cols}, {block}), axis=0)"  # the first lane that holds it
+        _, sentinel, _ = self.arg_kind(n)
+        return f"tl.where({layout.mask}, {a}, {sentinel})", f"tl.where({layout.mask}, {layout.cols}, {_INDEX_SENTINEL})"
+
+    def arg_reduce(self, n: Node, v: str) -> str:
+        """``argmax`` / ``argmin`` of an ``[R, D]`` value along the row in one block (note 8): one ``tl.reduce`` of the (value, index) pairs
+        with the combine of the strict total order, so the result depends on no tree."""
+        value, index = self.arg_lanes(n, v)
+        self.emit(f"{v}_v, {v}_i = tl.reduce(({value}, {index}), 0, {self.combine(n)})")
         out = n.outputs[0].type.dtype.name
-        return index if out == "i32" else f"{index}.to(tl.{_TL[out]})"
+        return f"{v}_i" if out == "i32" else f"{v}_i.to(tl.{_TL[out]})"
 
     def expression(self, n: Node, v: str = "") -> str:
         op = n.op
@@ -1601,7 +1809,8 @@ def _assemble(
             p.name for p in params if p.kind == "tensor" and not p.type.devscalar and p.name not in tables  # type: ignore[union-attr]
         )
 
-    body = _Body(op, layout, names, out_names, rename).run()
+    body_emitter = _Body(op, layout, names, out_names, rename)
+    body = body_emitter.run()
     header = [
         f"Generated by tilefish.lower from the kernel '{op.name}'. Do not edit.",
         *layout.header(),
@@ -1611,7 +1820,10 @@ def _assemble(
         "Numerics contract: see the docstring of tilefish.lower.",
     ]
     lines = [f"# {h}" for h in header]
-    lines += ["import triton", "import triton.language as tl", "", "", "@triton.jit", f"def {fn_name}("]
+    lines += ["import triton", "import triton.language as tl"]
+    for _, helper in body_emitter.helpers.values():
+        lines += ["", "", *helper]
+    lines += ["", "", "@triton.jit", f"def {fn_name}("]
     lines += [f"    {d}," for d in decls]
     lines += ["):", *body]
     source = "\n".join(lines) + "\n"
