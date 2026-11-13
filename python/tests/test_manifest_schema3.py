@@ -122,26 +122,26 @@ def test_the_entry_must_match_the_compile_spec_in_the_new_fields_too(tmp_path):
             Manifest.load(tmp_path / "m2").built_kernel(spec, "sm_90", pinned=True)
 
 
-# -- what the Rust host does not launch yet ----------------------------------------------------------------------------------------------
+# -- what the Rust host launches (test_rust_host_schema3.py has the details) ----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "op, message",
+    "op, snippets",
     [
-        (head_copy, r"abi.params\[0\] \('x'\) takes a strided view \(strides, offset\), which is not yet supported by the Rust host"),
-        (masked, r"abi.params\[2\] \('n_tok'\) is a DevScalar \(a pointer with the shape \[\]\), which is not yet supported by the Rust host"),
+        (head_copy, ["x: TensorRef<'a, Bf16>", "a strided view (strides `[x_s0, x_s1, 1]`)", "`x_s0` is the stride of axis 0 of `x`, in elements"]),
+        (masked, ["n_tok: TensorRef<'a, I32>", "a device scalar (one element: the shape `[]` or `[1]`)", '&["S", "128"], &["S", "128"], &[]']),
+        (head_copy64, ["Runtime scalars of the binary, derived by `launch` from the tensors", "`x_s0` is the stride of axis 0 of `x`, in elements (i64)"]),
     ],
 )
-def test_the_rust_emitter_refuses_what_the_rust_host_cannot_launch(tmp_path, op, message):
+def test_the_rust_emitter_writes_launchers_for_strided_views_and_device_scalars(tmp_path, op, snippets):
     m = manifest_of(tmp_path, op)
-    with pytest.raises(TilefishManifestError, match=message):
-        rust.render(m.check_pin(m.digest))
+    source = rust.render(m.check_pin(m.digest), ops=[op])
+    for snippet in snippets:
+        assert snippet in source, snippet
+    assert "        x_s0:" not in source  # a stride is not an argument of a launch (a parameter of `launch` is indented by eight spaces)
 
 
-def test_the_rust_emitter_refuses_a_64_bit_stride_and_still_writes_what_schema_2_could_say(tmp_path):
-    m = manifest_of(tmp_path, head_copy64)
-    with pytest.raises(TilefishManifestError, match="which is not yet supported by the Rust host"):
-        rust.render(m.check_pin(m.digest))
+def test_the_rust_emitter_still_writes_what_schema_2_could_say(tmp_path):
     ok = manifest_of(tmp_path / "ok", scale, rowop)
     source = rust.render(ok.check_pin(ok.digest), ops=[scale, rowop])
     assert f'pub const MANIFEST_DIGEST: &str = "{ok.digest}";' in source and "pub struct Scale " in source

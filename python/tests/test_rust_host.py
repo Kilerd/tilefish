@@ -30,6 +30,12 @@ from tilefish.hosts import rust
 GOLDEN_DIR = pathlib.Path(__file__).resolve().parent / "golden"
 FIXTURES = REPO_ROOT / "crates" / "tilefish" / "tests" / "fixtures"
 needs_crate = pytest.mark.skipif(not FIXTURES.exists(), reason="the Rust crate is not available (not running from a source checkout)")
+CRATE_SRC = REPO_ROOT / "crates" / "tilefish" / "src"
+# a launcher of a GEMM needs `Gemm` of the crate, and the fixtures have GEMMs: the crate of an older checkout reads schema 2 only
+needs_new_crate = pytest.mark.skipif(
+    shutil.which("cargo") is None or not CRATE_SRC.is_dir() or not any("pub struct Gemm" in f.read_text() for f in CRATE_SRC.rglob("*.rs")),
+    reason="cargo is not installed, or the crate of this checkout does not read schema 3 yet (it has no `Gemm`)",
+)
 
 
 def check_golden(name: str, source: str) -> None:
@@ -459,6 +465,8 @@ def test_the_names_that_clash_with_the_module_or_the_language_are_renamed(fake_m
         entry["stem"] = "kernel"
         param(entry, "x").update(name="stream")
         param(entry, "y").update(name="type")
+        for pre in entry["preconditions"]:  # the preconditions name the pointers they are about
+            pre["arg"] = {"x": "stream", "y": "type"}.get(pre.get("arg"), pre.get("arg"))
 
     manifest = edited(fake_manifest, tmp_path, clash)
     source = rust.render(manifest, pin=manifest.digest)
