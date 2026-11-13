@@ -563,7 +563,7 @@ def export(
     hand-written kernel must be the ones the process imported (see :func:`tilefish.aot.build`). Files are written
     through temporary files and renamed, and a symbolic link where a file goes is refused.
 
-    Returns the loaded and verified :class:`~tilefish.aot.Manifest`: ``.directory``, ``.path`` and ``.digest``, the
+    Returns the loaded and verified :class:`~tilefish.aot.Manifest` (``.pinned``: it is what ``hosts.rust.emit`` takes): ``.directory``, ``.path`` and ``.digest``, the
     digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
     ``run(..., mode="replay", manifest=directory, pin=digest)`` to refuse a directory that was changed after the export.
     The digest is the one of the manifest that was written from the builds in memory; the directory is read back and

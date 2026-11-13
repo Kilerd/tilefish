@@ -72,6 +72,9 @@ def residual_add_rmsnorm(
 # An existing hand-written kernel, unchanged, given a type.
 n = Dim("n", divisible_by=16)
 
+# (index_bits=32 is the default: a kernel that offsets with i32 gets a max_elements
+# limit of 2**31 - 1 on every tensor, which both hosts check; a kernel that
+# indexes in i64 says index_bits=64.)
 @tilefish.extern(triton=my_kernels.gelu, num_warps=4,
                  grid=lambda n: (tilefish.cdiv(n, 1024),))
 def gelu(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]],
@@ -155,8 +158,16 @@ so its manifest entry records a *source digest*: a sha256 over the text of the
 file of the kernel's module, of every user module file reachable from that
 module's globals (the modules it imports, and the modules of the functions and
 objects it holds, recursively; not `triton`, `torch`, `tilefish` or the
-standard library) and the Triton version. `replay` recomputes it, which needs
-the kernel to be importable, or a pin. Triton's own `cache_key` is not used: it
+standard library), the Triton version, and the *values* the kernel reads that
+are in no file: the scalars and Triton constants of the module attributes it
+reads, as the process holds them, and the closure variables of its jit
+functions (a kernel made by a factory function, `def make(): S = ...;
+@triton.jit def k(...): ... S`, reads `S` from a cell). So the digest is what
+this process would compile: a replay in a process whose `S` is another number is
+refused, and a cache keyed by it cannot serve one value's binary for another's.
+A value with no stable `repr` (a list, an instance) is refused with "make it a
+module-level constant or a const parameter". `replay` recomputes the digest,
+which needs the kernel to be importable, or a pin. Triton's own `cache_key` is not used: it
 does not see a `tl.constexpr` read as a module attribute (`cfg.SCALE`), a dtype
 alias or a constant in a helper module, so none of them would make a stale
 binary look stale. For the same reason a build never reads Triton's disk cache.
@@ -164,15 +175,17 @@ binary look stale. For the same reason a build never reads Triton's disk cache.
 A build compiles from scratch (about 25 to 75 ms per binary on a B300) unless
 tilefish's own cache has it: `~/.cache/tilefish`, or `$TILEFISH_CACHE_DIR` (an
 empty value switches it off; `aot.build(..., cache=False)` skips it for one
-build). Its key is the declaration digest, the spec's source identity
-(`source_sha256`, or the source digest of a hand-written kernel, computed only
+build). Its key is the cache recipe (a number that is bumped whenever tilefish
+changes what goes into a binary) and the tilefish version, the declaration
+digest and the spec's fingerprint, the spec's source identity (`source_sha256`,
+or the source digest of a hand-written kernel, values included, computed only
 after the edited-module check above), the architecture, the Triton and `ptxas`
-versions, the compile options and the module constants the kernel reads (as the
-process holds them: a module may compute one at import from the environment, and
-no file says so), and every read is verified: the `sha256` and
+versions and the compile options, and every read is verified: the `sha256` and
 `sha256_code` of the cubin are recomputed (and the PTX, the entry point and its
 ABI, the options and the versions are checked), and an entry that is not as it
-was written is a warning and a rebuild, never used. Entries are written through a
+was written is a warning and a rebuild, never used, and a cache that cannot be
+read or written never fails a build, also under `python -W error` (the warning is
+then logged on `tilefish.cache` instead of raised). Entries are written through a
 temporary file and renamed, so builds that race do not tear one. A hit takes
 about 0.5 to 0.8 ms. The cache is as exact as the source digest (what that does not
 reach is not in the key either), nothing evicts it, and it is no defence
@@ -191,18 +204,20 @@ passes, and a module that was imported before `import tilefish` is compared by
 size and modification time only (`tilefish/_source.py` lists what the check does
 not see: an edit between a module's import and `import tilefish`, a module no
 source loader executed, a stale same-second `.pyc`). The recording wraps
-`SourceFileLoader.exec_module` for the whole process. `TILEFISH_IMPORT_WATCH=0`
+`SourceFileLoader.exec_module` for the whole process, and it never reads an
+attribute of a module (a `LazyLoader` module is not loaded by it).
+`TILEFISH_IMPORT_WATCH=0` (or `false`, `no`, `off`, in any case)
 leaves the import system alone, and every module is then compared by size and
 modification time only, from when tilefish was imported or when a build first
-read it. **Kernel inputs come from
+read it; a module reloaded after an edit is recorded again. **Kernel inputs come from
 source files, not from module state a program assigns at run time**
 (`cfg.SCALE = 5.0`, `monkeypatch.setattr`): a build refuses a constant that a
 kernel function reads and that was reassigned since its module was imported
 (scalars and Triton constants; not a container changed in place or an attribute
 of an instance), and a constant that is not in a file could not be described by
 any source digest, cache entry or manifest. `build` also refuses source that is
-not its spec's: a stale `LoweredKernel.write` output on `sys.path`, or another
-function passed as `fn`.
+not its spec's: a stale `LoweredKernel.write` output on `sys.path`, or a
+function passed as `fn` that is not the one `spec.triton` names.
 
 `replay` also refuses `shared` memory the cubin and the device cannot have (the
 driver's static shared memory of the function plus the manifest's dynamic size
@@ -245,8 +260,10 @@ strict JSON, recomputes the digests exactly as Python does (the `sha256` of each
 cubin, the `sha256_code` of its machine code, and the digest of the whole
 manifest) and refuses a directory whose digest is not the pin it is given
 (`Pin::Digest`; `Pin::TrustDirectory` is explicit). It then loads a cubin with
-`cuModuleLoadData` and launches on the caller's own `CUstream`, which also works
-inside a CUDA graph capture.
+`cuModuleLoadData` and launches on a cudarc `CudaStream` (`Kernel::launch`, safe:
+the stream is checked to be of the kernel's context) or, with the `unsafe`
+`Kernel::launch_raw`, on a raw `CUstream`, which also works inside a CUDA graph
+capture.
 
 A manifest (schema 2) carries what a host needs to check a launch on its own:
 every pointer parameter records its declared shape, with static axes as sizes
@@ -264,11 +281,18 @@ refused by both hosts: export it again.
 ```python
 from tilefish.hosts import rust
 rust.emit(m, "launchers.rs")   # m = tilefish.runtime.export(...); ops=[...] cross-checks the declarations
+rust.emit("build/", "launchers.rs", pin=m.digest)   # a directory is read only with its pin
 ```
 
-writes one Rust module with a struct per binary (per bucket), whose `launch`
-takes typed tensors (`TensorRef<'_, Bf16>`, `TensorMut<'_, F32>`: a device
-pointer, a shape and a device ordinal) and documents the binary: its tensors, its
+`emit` takes a pinned manifest (the one `export` returns, `Manifest.load(path, pin=...)`,
+or a directory with `pin=`: the file it writes is compiled and run, so a manifest
+nobody vouched for does not write it, and every field that reaches it is
+validated) and writes one Rust module with a struct per binary (per bucket), whose
+`launch` takes typed tensors (`TensorRef<'_, Bf16>`, `TensorMut<'_, F32>`: a
+region of device memory with its length, which a safe constructor takes from a
+cudarc slice or the host vouches for with `unsafe DevicePtr::from_raw`; a shape
+that needs more bytes than the region has is refused, and so is a launch on a
+stream of another context) and documents the binary: its tensors, its
 dimensions and their constraints, what is compiled in. It also embeds the digest
 of the manifest it was generated from and refuses any other, and with
 `embed=True` the manifest and the cubins as well. The output is deterministic.

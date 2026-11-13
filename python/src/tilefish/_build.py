@@ -513,9 +513,9 @@ def build(
 
     The compile itself never reads Triton's disk cache: its key does not cover everything that changes a binary, so a
     build would not be sure to be what the source says. tilefish has a cache of its own instead (:mod:`tilefish._cache`:
-    ``$TILEFISH_CACHE_DIR`` or ``~/.cache/tilefish``), keyed by the spec's declaration digest and fingerprint, the source
-    identity (``source_sha256`` or the source digest, so only after the checks above), the architecture, the Triton and
-    ``ptxas`` versions and the compile options, and verified on every read (the ``sha256`` and ``sha256_code`` of the cubin
+    ``$TILEFISH_CACHE_DIR`` or ``~/.cache/tilefish``), keyed by the cache recipe and the tilefish version, the spec's declaration
+    digest and fingerprint, the source identity (``source_sha256`` or the source digest, so only after the checks above), the
+    architecture, the Triton and ``ptxas`` versions and the compile options, and verified on every read (the ``sha256`` and ``sha256_code`` of the cubin
     are recomputed, among other things): an entry that is not as it was written is a miss with a
     :class:`~tilefish.errors.TilefishCacheWarning`, and the kernel is compiled. A hit has the cubin of the build that made
     it, so its ``sha256`` (whole file, with the debug path of that build) can differ from a fresh compile's while its
