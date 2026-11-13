@@ -227,6 +227,10 @@ the shapes of the views.
    enqueued. So executions of one plan on different streams, from one thread or several, are correct and run on the device one after the other, in the order the host issued them
    (a lock that orders only the enqueueing is not enough: the race it leaves corrupted the outputs of two runs on two streams in 5 of 5 tries). Executions on one stream are ordered by
    the stream. `clear_caches` waits for the event (`cuEventSynchronize`) before it frees an arena. Plans of different layouts have different arenas and are not ordered with each other.
+   The Rust host (`PlanRun`, one arena per instantiation) gives the same order: an execution, under the arena's lock, makes its stream wait for what the arena's
+   own stream (the one it was allocated on) holds, and makes that stream wait for an event recorded after its last launch (cudarc's events on the arena add the
+   rest), so executions of one instantiation on any streams, from any threads, run one after the other in the order they are issued; dropping the last handle of
+   an instantiation waits for that stream before the arena is freed.
 2. **Bind the externals.** The caller gives a tensor (address, shape, strides, dtype) for every buffer of role `input`, `weight` and `inout`, and for every `output` (or the host allocates it), and a
    value for every `devscalar`. Check each external against its buffer: dtype, rank, contiguous row-major (a parameter is a dense tensor), and bind the dimensions (section 5). Select the bucket.
    The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`), and none may overlap the arena.
@@ -255,6 +259,8 @@ graph replays byte-identically** (Python gate: `test_gpu_plan.py`, byte-identica
    capture's private pool, and Python does not refuse it; it is an allocation inside the capture all the same, so a test that proves there is none passes `outputs=`).
 3. **A device scalar must be written by a captured, device-side copy** from a CUDA tensor of one element: the graph re-reads that tensor at every replay, so changing the value between replays is
    writing that tensor. An `int` or a CPU tensor is a host write (an asynchronous copy from pinned memory is not capturable as a value that changes), and Python refuses it under capture.
+   (The Rust host keeps the write out of the graph: `CapturedPlan::replay` writes the slots with a stream-ordered copy from the host before it launches the graph,
+   whenever they do not hold that graph's values, `CapturedPlan::set_devscalar` changes them.)
 4. **A graph holds addresses, not values**: the externals are the same tensors at every replay (write into them in place), and **the arena of a captured graph is the plan's arena**, the one
    the uncaptured executions use, at the address the graph holds.
 5. **One stream**: the capture is of the stream the steps are launched on; all steps go there.
@@ -264,6 +270,8 @@ graph replays byte-identically** (Python gate: `test_gpu_plan.py`, byte-identica
    waits for the most recent execution or replay of the plan issued before it is launched, and records the event when its work is done: replays (of one graph or of the graphs of several
    buckets) and uncaptured executions of one plan, on any streams, are ordered with each other in the order the host issues them, exactly as executions are. The caller orders nothing but
    its own tensors (an input written on another stream, an output read on one), as for any launch.
+   (A graph of the Rust host has no event node: it is replayed only through `CapturedPlan::replay`, which orders a replay exactly as an execution, step 1 of
+   section 9, so replays and executions of one instantiation are ordered the same way.)
 8. Not a plan's doing, but a reason a capture can fail: a binary that is not capturable by itself (the manifest refuses cooperative launches, PDL, clusters and scratch memory for a plain
    replay, so none of those is in a plan), and the capture mode of the framework (torch's `global` mode refuses an unsafe call from another thread while it captures).
 

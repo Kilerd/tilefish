@@ -366,6 +366,73 @@ fn two_launches_of_one_run_on_two_streams_do_not_disturb_each_other() {
     println!("rust plan gate: two launches of one run on two streams, back to back, 5 rounds: both are Python's bytes");
 }
 
+/// The order of the runs of one instantiation (`docs/plan-schema-1.md`, section 9: two executions that use one arena must not overlap on the
+/// device): two threads at once, one launching a case of one bucket 12 times on its stream (each into an output of its own), the other replaying
+/// the graph of a case of another bucket 12 times on its stream (copying the output after each replay), with no synchronization between them.
+/// They share the arena; every one of the 24 results is Python's.
+#[test]
+fn launches_and_replays_from_two_threads_on_two_streams_run_one_after_the_other() {
+    fn shared<T: Send + Sync>(t: T) -> T {
+        t
+    }
+    let gpu = Gpu::new();
+    let plan = plan_named("block");
+    let run = shared(load(&plan).instantiate_all(&gpu.stream).unwrap());
+    let cases = plan["cases"].as_array().unwrap();
+    let (a, b) = (
+        cases.iter().find(|c| c["bucket"]["M"] == 128).unwrap(),
+        cases.iter().find(|c| c["bucket"]["M"] == 32).unwrap(),
+    );
+    let rounds = 12;
+    let expect = |case: &Value| {
+        let t = case["externals"].as_array().unwrap().iter().find(|t| t["name"] == "out0").unwrap();
+        read(t["expect"].as_str().unwrap())
+    };
+    for round in 0..3 {
+        let (got_a, got_b) = std::thread::scope(|scope| {
+            let launcher = scope.spawn(|| {
+                let s = gpu.ctx.new_stream().unwrap();
+                let mut exts = upload(&s, a);
+                let out = exts.iter().position(|e| e.name == "out0").unwrap();
+                let mut outs = Vec::new();
+                for _ in 0..rounds {
+                    exts[out].slice = s.alloc_zeros::<u8>(exts[out].slice.len()).unwrap();
+                    run.launch(&s, &mut args(&mut exts, false), &named(&devscalars(a))).unwrap();
+                    outs.push(std::mem::replace(&mut exts[out].slice, s.alloc_zeros::<u8>(1).unwrap()));
+                }
+                s.synchronize().unwrap();
+                outs.iter().map(|o| s.clone_dtoh(o).unwrap()).collect::<Vec<_>>()
+            });
+            let replayer = scope.spawn(|| {
+                let s = gpu.ctx.new_stream().unwrap();
+                let mut exts = upload(&s, b);
+                let mut copies: Vec<CudaSlice<u8>> = Vec::new();
+                {
+                    let mut graph = run.capture(&s, args(&mut exts, false), &named(&devscalars(b))).unwrap();
+                    for _ in 0..rounds {
+                        graph.replay(&s).unwrap();
+                        let view = graph.external("out0").unwrap();
+                        let mut copy = s.alloc_zeros::<u8>(view.len()).unwrap();
+                        s.memcpy_dtod(&view, &mut copy).unwrap();
+                        copies.push(copy);
+                    }
+                }
+                s.synchronize().unwrap();
+                copies.iter().map(|o| s.clone_dtoh(o).unwrap()).collect::<Vec<_>>()
+            });
+            (launcher.join().unwrap(), replayer.join().unwrap())
+        });
+        let (want_a, want_b) = (expect(a), expect(b));
+        let wrong_a = got_a.iter().filter(|g| **g != want_a).count();
+        let wrong_b = got_b.iter().filter(|g| **g != want_b).count();
+        assert_eq!((wrong_a, wrong_b), (0, 0), "round {round}: results that are not Python's (launches, replays)");
+    }
+    println!(
+        "rust plan gate: launches (M=128) and graph replays (M=32) of one run from two threads on two streams, {rounds} each, 3 rounds: every \
+         result is Python's"
+    );
+}
+
 /// A copy of an exported plan directory, under the gate directory.
 fn copy_dir(plan: &Value, name: &str) -> PathBuf {
     let from = gate_dir().join(plan["dir"].as_str().unwrap());

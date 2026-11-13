@@ -22,6 +22,17 @@
 //! [`CapturedPlan::set_devscalar`] (its slot is written on the stream right before the next replay, so a launch or another graph of the same
 //! instantiation in between does not change what this graph reads).
 //!
+//! **The order of the runs of one instantiation** (`docs/plan-schema-1.md`, section 9, step 1: two executions that use one arena must not
+//! overlap on the device). Every launch and every replay of an instantiation, whatever its stream and its thread, takes the arena's lock, makes
+//! its stream wait for what the arena's own stream holds (the stream the arena was allocated on, which has waited for the end of every earlier
+//! run made elsewhere; cudarc's read and write events on the arena are waited for too), and makes the arena's stream wait for an event recorded
+//! after its last launch (also when a launch fails after others were enqueued). So the runs of one instantiation (launches, and replays of its
+//! graphs of one bucket or several) run on the device one after the other, in the order they are issued: the contract of Python's *order
+//! event* of an arena. Python captures its event's wait and record as event nodes, because a torch graph is replayed by whoever holds it; the
+//! graph of a [`CapturedPlan`] is replayed only by [`CapturedPlan::replay`], which orders the replay as a launch, so it has no event node.
+//! Dropping the last handle of an instantiation waits for the arena's stream, so nothing of the plan runs when its arena is freed and its modules
+//! unloaded.
+//!
 //! What is not this module's: the ordering of a use of an external that is not a launch of this crate (cudarc's tracking, or the host's), as
 //! everywhere in the crate.
 
