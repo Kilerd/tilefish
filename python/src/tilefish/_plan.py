@@ -281,6 +281,13 @@ def _walk(gop: GraphOp) -> _Walk:
             role = "inout"
         else:
             role = "weight" if not v.type.free_dims() else "input"
+        offset = v.type.offset
+        if not (v.type.contiguous and v.type.strides is None and offset is not None and offset.is_static and offset.value == 0):
+            _fail(
+                name,
+                f"the parameter '{v.name}' has the type {v.type} ({v.type.layout_text()}), which is not a contiguous tensor: a plan binds a parameter as a "
+                "contiguous row-major tensor, and a run checks that it is one (a parameter that is a view is declared Strided[...], which a graph does not take)",
+            )
         b = new_buffer(role, v.type.dtype, v.type.shape, v.name)
         strides = row_major_strides(v.type.shape)
         if any(s is None for s in strides):

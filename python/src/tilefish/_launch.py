@@ -231,7 +231,7 @@ def check_tensor(p: "Param", info: TensorInfo) -> None:
                 arg=p.name,
             )
         return
-    if ptype.contiguous and not info.contiguous:
+    if not info.contiguous:  # every tensor that is not Strided[...] nor a DevScalar, whatever its type says (a declaration refuses any other type)
         raise TilefishPreconditionError(
             f"argument '{p.name}' is not contiguous (row-major, no gaps); this parameter takes a contiguous tensor: pass "
             ".contiguous(), or have the extern declare it Strided[...]",

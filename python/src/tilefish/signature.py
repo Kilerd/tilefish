@@ -206,6 +206,7 @@ def parse_signature(
         if isinstance(ann, TensorType):
             if ann.devscalar and not allow_devscalar:
                 raise TilefishDeclarationError(f"{where}: parameter '{pname}' is a DevScalar, which a {what} cannot take")
+            _require_contiguous(where, what, f"parameter '{pname}'", ann)
             param = Param(pname, index, "tensor", "in", type=ann, keyword_only=kw)
         elif isinstance(ann, StridedType):
             if not allow_strided:
@@ -222,6 +223,7 @@ def parse_signature(
                 pname, index, "dim", dim=Dim(pname, divisible_by=ann.divisible_by), keyword_only=kw, stride_of=(ann.arg, ann.axis)
             )
         elif isinstance(ann, Marked):
+            _require_contiguous(where, what, f"parameter '{pname}'", ann.type)
             param = Param(pname, index, "tensor", ann.mode, type=ann.type, keyword_only=kw)
         elif ann is const or isinstance(ann, ConstType):
             dtype = None if ann is const else ann.dtype
@@ -264,11 +266,31 @@ def parse_signature(
                 f"{where}: the return annotation must be a Tensor[...] or a tuple of them, got {ret_ann!r}"
             )
         returns = tuple(items)
+    for i, r in enumerate(returns):
+        _require_contiguous(where, what, f"return value {i}", r)
 
     result = Signature(params, returns)
     if check_derivable:
         _check_derivable(where, result)
     return result
+
+
+def _require_contiguous(where: str, what: str, label: str, t: TensorType) -> None:
+    """A tensor annotation that is not ``Strided[...]`` is a contiguous tensor: row-major strides, offset 0, 16-byte aligned.
+
+    That is the contract of a pointer a launch checks (``_launch.check_tensor`` refuses a tensor that is not contiguous), what a plan
+    assumes of a graph's parameters, and what the Rust host checks. A ``TensorType`` with other strides, an offset or no alignment would
+    say otherwise and be believed by nothing, so it is refused here: a parameter that takes a view is ``Strided[...]``.
+    """
+    offset = t.offset
+    dense = t.strides is None and offset is not None and offset.is_static and offset.value == 0
+    if dense and t.contiguous:
+        return
+    raise TilefishDeclarationError(
+        f"{where}: {label} is annotated with {t!r} ({t.layout_text()}), which is not a contiguous tensor: a tensor parameter or result "
+        f"of a {what} is contiguous (row-major strides, offset 0), and a launch checks that it is. A parameter that takes a strided view "
+        "(other strides, an offset) is declared Strided[Tensor[...]] with StrideOf parameters (an extern op)"
+    )
 
 
 def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":

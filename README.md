@@ -275,7 +275,9 @@ A real model needs four things that a dense, compiled-in, Triton-only operator c
 **Strided views.** A tensor type has element strides and an element offset, in the dimension algebra (`TensorType.strides`, `.offset`); dense
 and 16-byte aligned (`contiguous`) is the default. `x.reshape(M, 3, H, D)` (a dense input), `x.permute(1, 0, 2)`, `x[:, 1]` / `x.select(axis, i)` and
 `x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A view is a `View[...]` and can go into traced
-elementwise and reduction ops; a declared operator takes one only where its parameter says so. An `extern` parameter `x: Strided[Tensor[S, H, D, bf16]]`
+elementwise and reduction ops; a declared operator takes one only where its parameter says so. Every other tensor parameter (and result) of a kernel,
+extern, library op or graph is contiguous: an annotation that is a `TensorType` with other strides, an offset or no alignment is refused at the
+declaration, and a launch refuses a tensor that is not contiguous for such a parameter. An `extern` parameter `x: Strided[Tensor[S, H, D, bf16]]`
 takes a view, and the kernel's strides are scalar parameters the stub declares in the kernel's argument order:
 
 ```python
