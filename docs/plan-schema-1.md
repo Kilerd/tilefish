@@ -317,3 +317,6 @@ and 9 240 832 with it (720 896 for the intermediates).
 | the document of section 13 | `test_plan_docs.py` |
 | the runner: order, addresses, scalars, preconditions before the first launch, captures (fake backend) | `test_planrun.py` |
 | on a GPU: replay == jit == per-op eager, replay vs reference, CUDA graph capture, tampering, the arena | `test_gpu_plan.py` |
+| **golden fixtures for a second implementation**: two plan directories (`manifest.json`, cubins and `plan.json`) of the transformer block, without and with reuse, and `expected.json` with the plan digest, the manifest digest, the arena size and every arena offset that a reader must reproduce from the files alone | `golden/plans/` (written by `export_plan_fixtures.py`, no GPU needed), `test_plan_fixtures.py` |
+
+The cubins of the golden fixtures are fake (a tiny ELF file per kernel entry, a made-up algorithm per GEMM): the format, the digests and the plan are real, so a reader can be checked against them; they cannot be launched.
