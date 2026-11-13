@@ -1,25 +1,28 @@
 """Builds the fixtures of the Rust crate (``crates/tilefish/tests/fixtures``). Not collected: the name has no ``test_`` prefix.
 
-Run on a machine with a GPU and the ``gpu`` extra (the cubins are built by Triton), from ``python/tests``::
+Run on a machine with a GPU and the ``gpu`` extra (the cubins are built by Triton, the library entries pinned by cuBLASLt), from
+``python/tests``::
 
-    python export_rust_fixtures.py OUTPUT_DIR [--archs 103,120]
+    python export_rust_fixtures.py OUTPUT_DIR [--archs 103,120] [--gemm-shapes committed|all]
 
-For each architecture it exports every operator of ``host_ops.ops()`` (the five lowered goldens, a bucketed row kernel and
-the hand-written externs) to ``OUTPUT_DIR/sm_<arch>/`` with ``tilefish.runtime.export``: ``manifest.json`` and the cubins.
-An architecture other than the device's is cross-compiled, which needs nothing but Triton's ``ptxas``. Then it writes
+For each architecture it exports to ``OUTPUT_DIR/sm_<arch>/`` with ``tilefish.runtime.export`` (manifest schema 3: ``manifest.json``, the cubins) the operators
+of ``host_ops.ops()`` (the five lowered goldens, a bucketed row kernel, the hand-written Triton externs, the strided views and device scalars
+of ``gpu_kernels_p1.py`` and two prebuilt hand-written PTX externs), the prebuilt externs of ``host_ops.gpu_ops()`` (the PTX of two Triton
+builds, and a cubin: their source files are written to ``OUTPUT_DIR/sources/sm_<arch>/``, which ``rust_gate.py --manifest`` reuses) and, **for
+the architecture of the device only**, the pinned cuBLASLt GEMMs of ``host_ops.library_ops()``: a pin is made on a device of its architecture, so a
+fixture that is cross-compiled (any other architecture, which needs nothing but ptxas) has no ``library`` entries. The committed fixtures hold two
+``(N, K)`` shapes of ``gemm`` and ``gemm_bias`` (``--gemm-shapes committed``, 12 entries: buckets 32, 64 and 320 of ``M``); the gate exports every one
+(``rust_gate.py prepare``). Then it writes
 
-* ``expected.json``: for each fixture the digest of the manifest and, for every binary, its ``sha256`` and ``sha256_code``,
-  all computed by Python (``Manifest.digest``, ``code_digest``). The Rust tests (``tests/cross_language.rs``) reproduce them
-  from the files with no GPU and no Python; ``test_rust_fixtures.py`` checks them against Python on every ``pytest`` run.
-* ``generated.rs``: the launchers ``tilefish.hosts.rust.emit`` writes for the first architecture, from the declarations (the
-  launchers of another architecture differ only in ``MANIFEST_DIGEST``).
+* ``expected.json``: for each fixture the digest of the manifest, for every binary its ``kind``, ``sha256`` and ``sha256_code`` and for every library entry its
+  algorithm, the cuBLASLt version that chose it and its workspace, all computed by Python (``Manifest.digest``, ``code_digest``). The Rust tests
+  (``tests/cross_language.rs``) reproduce them from the files with no GPU and no Python; ``test_rust_host.py`` checks them against Python on every ``pytest`` run.
+* ``generated.rs``: the launchers ``tilefish.hosts.rust.emit`` writes for the fixture of the device's architecture (the first architecture when the
+  device is none of them), from the declarations that need no GPU (``host_ops.ops()`` and the GEMMs: ``test_rust_host.py`` writes the same file without one; the
+  docs of the prebuilt externs of ``gpu_ops`` have no tilefish signature). The launchers of another architecture differ only in ``MANIFEST_DIGEST``, and have no GEMM.
 
-The fixtures are committed; they only change when a binary does (another Triton, ptxas, or kernel), and then the files
+The fixtures are committed; they only change when a binary does (another Triton, ptxas, cuBLASLt, or kernel), and then the files
 of ``crates/tilefish/tests/fixtures`` are replaced together.
-
-**Manifest schema 3.** This script now writes schema 3 manifests (``docs/manifest-schema-3.md``), which the crate 0.0.1 (schema 2) cannot read: the
-committed fixtures stay schema 2 until the Rust lane moves the crate to schema 3, and then this script regenerates them. (``test_rust_host.py``
-migrates a copy of a committed fixture to schema 3 for the Python tests: ``schema2_fixtures.py``.)
 """
 
 import argparse
@@ -28,7 +31,7 @@ import pathlib
 import shutil
 import sys
 
-from host_ops import ops
+from host_ops import GEMM_SHAPES, GEMM_SHAPES_COMMITTED, gpu_ops, library_ops, ops
 
 from tilefish import runtime
 from tilefish._elf import code_digest
@@ -42,31 +45,73 @@ def expected(manifest):
             {
                 "stem": a.stem,
                 "arch": a.arch,
+                "kind": a.entry["kind"],
                 "cubin": a.entry["cubin"],
                 "sha256": a.entry["sha256"],
                 "sha256_code": code_digest(a.cubin),
             }
             for a in sorted(manifest.artifacts, key=lambda a: (a.stem, a.arch))
         ],
+        "library": [
+            {
+                "stem": e["stem"],
+                "arch": e["arch"],
+                "impl": e["impl"],
+                "algo": e["algo"],
+                "cublaslt_version": e["cublaslt_version"],
+                "workspace_bytes": e["workspace_bytes"],
+            }
+            for e in sorted(manifest.library_entries, key=lambda e: (e["stem"], e["arch"]))
+        ],
     }
+
+
+def native_capability():
+    """The compute capability of the device (``103``), or ``None`` when there is no torch or no device."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        major, minor = torch.cuda.get_device_capability()
+        return major * 10 + minor
+    except ImportError:
+        return None
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("output", type=pathlib.Path)
     parser.add_argument("--archs", default="103,120", help="compute capabilities to build for (default: 103,120)")
+    parser.add_argument("--gemm-shapes", choices=["committed", "all"], default="committed", help="the (N, K) shapes of the GEMMs of the device's fixture")
     args = parser.parse_args(argv)
-    declared = list(ops().values())
+    caps = [int(c) for c in args.archs.split(",")]
+    native = native_capability()
+    emit_cap = native if native in caps else caps[0]
+    shapes = GEMM_SHAPES_COMMITTED if args.gemm_shapes == "committed" else GEMM_SHAPES
     summary = {}
-    for position, cap in enumerate(int(c) for c in args.archs.split(",")):
+    for cap in caps:
         directory = args.output / f"sm_{cap}"
         if directory.exists():
             shutil.rmtree(directory)
+        sources = args.output / "sources" / f"sm_{cap}"
+        if sources.exists():
+            shutil.rmtree(sources)
+        plain = list(ops().values())  # declared without a GPU
+        declared = plain + list(gpu_ops(sources, cap).values())
+        gemms = list(library_ops(shapes).values())
+        if cap == native:
+            declared += gemms
         manifest = runtime.export(declared, directory, arch=cap)
-        if position == 0:
-            rust.emit(manifest, args.output / "generated.rs", ops=declared)  # the manifest export returned is pinned
+        if cap == emit_cap:
+            # the declarations that need no GPU (and those of the GEMMs, which the manifest may not have): what ``test_rust_host.py`` emits the committed file from,
+            # so the three prebuilt externs of ``gpu_ops`` have no tilefish signature in their docs. The manifest that export returned is pinned.
+            rust.emit(manifest, args.output / "generated.rs", ops=plain + gemms)
         summary[f"sm_{cap}"] = expected(manifest)
-        print(f"sm_{cap}: {len(manifest.artifacts)} binaries, manifest digest {manifest.digest}", file=sys.stderr)
+        print(
+            f"sm_{cap}: {len(manifest.artifacts)} binaries and {len(manifest.library_entries)} library entries, manifest digest {manifest.digest}",
+            file=sys.stderr,
+        )
     (args.output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
 
 
