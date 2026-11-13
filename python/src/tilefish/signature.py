@@ -10,6 +10,7 @@ trace so it propagates (see :class:`~tilefish.ir.Requirement`).
 from __future__ import annotations
 
 import inspect
+import math
 import typing
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Sequence
@@ -19,7 +20,7 @@ from .dtypes import DType
 from .errors import TilefishDeclarationError, TilefishError, TilefishTypeError
 from .ir import BucketRequirement, Requirement
 from .trace import Const, TraceContext, Value
-from .types import ConstType, Marked, TensorType, const
+from .types import ConstType, Marked, StrideOf, StridedType, TensorType, const
 
 if TYPE_CHECKING:
     from .decorators import Op
@@ -40,6 +41,11 @@ class Param:
     ``kind`` is ``"tensor"`` (``type`` and ``access`` set), ``"const"``
     (compile-time scalar; ``const_dtype`` and ``default``) or ``"dim"`` (a
     runtime scalar carrying the value of the dimension expression ``dim``).
+
+    A tensor parameter declared ``Strided[...]`` has ``strided=True``: its ``type`` carries the strides (each the dimension of
+    the ``StrideOf`` parameter of that axis, or ``1`` for the last axis when it has none) and an offset dimension, which a call
+    binds like it binds the shape; ``align`` is ``16`` when the declaration says the pointer is compiled as 16-byte aligned. A
+    ``"dim"`` parameter declared ``StrideOf(arg, axis)`` has ``stride_of=(arg, axis)``: its ``dim`` is the stride.
     """
 
     name: str
@@ -51,21 +57,31 @@ class Param:
     default: Any = MISSING
     dim: DimExpr | None = None
     keyword_only: bool = False
+    strided: bool = False
+    align: "int | None" = None
+    stride_of: "tuple[str, int] | None" = None
 
     @property
     def is_callable_arg(self) -> bool:
         """Whether a caller supplies this parameter (``Out`` and dim parameters are derived)."""
         return self.kind == "const" or (self.kind == "tensor" and self.access != "out")
 
+    @property
+    def is_devscalar(self) -> bool:
+        return self.kind == "tensor" and self.type is not None and self.type.devscalar
+
     def __str__(self) -> str:
         if self.kind == "tensor":
             ann = repr(self.type)
+            if self.strided:
+                assert self.type is not None
+                ann = f"Strided[Tensor[{', '.join([*(str(d) for d in self.type.shape), str(self.type.dtype)])}]" + (f", {self.align}" if self.align else "") + "]"
             if self.access == "inout":
                 ann = f"InOut[{ann}]"
             elif self.access == "out":
                 ann = f"Out[{ann}]"
         elif self.kind == "dim":
-            ann = f"{self.dim}"
+            ann = f"{self.dim}" if self.stride_of is None else repr(StrideOf(*self.stride_of))
         else:
             ann = "const" if self.const_dtype is None else f"const[{self.const_dtype}]"
         text = f"{self.name}: {ann}"
@@ -164,8 +180,14 @@ def parse_signature(
     name: str,
     allow_dim_const_defaults: bool = False,
     check_derivable: bool = True,
+    allow_strided: bool = False,
+    allow_devscalar: bool = True,
 ) -> Signature:
-    """Read ``fn``'s annotations into a :class:`Signature`."""
+    """Read ``fn``'s annotations into a :class:`Signature`.
+
+    ``allow_strided`` lets a tensor parameter be ``Strided[...]`` and a scalar parameter ``StrideOf(...)`` (an extern op does;
+    see :class:`~tilefish.types.Strided`).
+    """
     where = f"{what} '{name}'"
     sig = inspect.signature(fn)
     params: list[Param] = []
@@ -182,7 +204,23 @@ def parse_signature(
         kw = p.kind is inspect.Parameter.KEYWORD_ONLY
         has_default = p.default is not inspect.Parameter.empty
         if isinstance(ann, TensorType):
+            if ann.devscalar and not allow_devscalar:
+                raise TilefishDeclarationError(f"{where}: parameter '{pname}' is a DevScalar, which a {what} cannot take")
             param = Param(pname, index, "tensor", "in", type=ann, keyword_only=kw)
+        elif isinstance(ann, StridedType):
+            if not allow_strided:
+                raise TilefishDeclarationError(
+                    f"{where}: parameter '{pname}' is Strided[...], which only an extern op can take (a {what} takes contiguous tensors)"
+                )
+            param = Param(pname, index, "tensor", "in", type=ann.type, keyword_only=kw, strided=True, align=ann.align)
+        elif isinstance(ann, StrideOf):
+            if not allow_strided:
+                raise TilefishDeclarationError(f"{where}: parameter '{pname}' is {ann!r}, which only an extern op can take")
+            if has_default:
+                raise TilefishDeclarationError(f"{where}: stride parameter '{pname}' cannot have a default")
+            param = Param(
+                pname, index, "dim", dim=Dim(pname, divisible_by=ann.divisible_by), keyword_only=kw, stride_of=(ann.arg, ann.axis)
+            )
         elif isinstance(ann, Marked):
             param = Param(pname, index, "tensor", ann.mode, type=ann.type, keyword_only=kw)
         elif ann is const or isinstance(ann, ConstType):
@@ -206,11 +244,12 @@ def parse_signature(
         else:
             raise TilefishDeclarationError(
                 f"{where}: parameter '{pname}' has unsupported annotation {ann!r}; "
-                "use Tensor[...], InOut[...], Out[...], const, const[dtype] or a Dim"
+                "use Tensor[...], InOut[...], Out[...], DevScalar[...], const, const[dtype] or a Dim"
             )
         if param.kind == "tensor" and has_default:
             raise TilefishDeclarationError(f"{where}: tensor parameter '{pname}' cannot have a default")
         params.append(param)
+    params = _resolve_strides(where, params)
 
     ret_ann = _resolve(sig.return_annotation, fn, where)
     returns: tuple[TensorType, ...]
@@ -230,6 +269,67 @@ def parse_signature(
     if check_derivable:
         _check_derivable(where, result)
     return result
+
+
+def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":
+    """Give every ``Strided[...]`` tensor parameter the strides and the offset its ``StrideOf`` parameters declare.
+
+    Axis ``a`` of ``x`` has the stride dimension of the parameter declared ``StrideOf("x", a)``; the last axis, when it has none,
+    has stride 1 (the kernel loads along it contiguously). The offset is the dimension ``<x>_offset``: when the declaration says
+    ``Strided[..., 16]`` it is ``divisible_by`` the number of elements in 16 bytes, so that 16-byte alignment of the pointer is
+    *provable* from the type, and ``tt.divisibility`` follows from that proof alone.
+    """
+    by_name = {p.name: p for p in params}
+    stride_params: dict[tuple[str, int], Param] = {}
+    for p in params:
+        if p.stride_of is None:
+            continue
+        arg, axis = p.stride_of
+        target = by_name.get(arg)
+        if target is None or target.kind != "tensor" or not target.strided:
+            raise TilefishDeclarationError(
+                f"{where}: {p.name} is StrideOf({arg!r}, {axis}), but '{arg}' is not a Strided[...] tensor parameter of this op"
+            )
+        assert target.type is not None
+        if axis >= target.type.rank:
+            raise TilefishDeclarationError(f"{where}: {p.name} is the stride of axis {axis} of '{arg}', which has rank {target.type.rank}")
+        if (arg, axis) in stride_params:
+            raise TilefishDeclarationError(
+                f"{where}: the stride of axis {axis} of '{arg}' is declared twice ({stride_params[(arg, axis)].name} and {p.name})"
+            )
+        stride_params[(arg, axis)] = p
+    out: list[Param] = []
+    for p in params:
+        if not (p.kind == "tensor" and p.strided):
+            out.append(p)
+            continue
+        assert p.type is not None
+        t = p.type
+        if t.rank < 1:
+            raise TilefishDeclarationError(f"{where}: Strided parameter '{p.name}' needs at least one axis")
+        strides: list[Any] = []
+        for axis in range(t.rank):
+            sp = stride_params.get((p.name, axis))
+            if sp is not None:
+                strides.append(sp.dim)
+            elif axis == t.rank - 1:
+                strides.append(1)
+            else:
+                raise TilefishDeclarationError(
+                    f"{where}: Strided parameter '{p.name}' has no StrideOf({p.name!r}, {axis}) parameter: only the last axis may "
+                    "go without one (its stride is then 1); declare "
+                    f"`{p.name}_s{axis}: StrideOf({p.name!r}, {axis})` in the kernel's argument order"
+                )
+        offset_name = f"{p.name}_offset"
+        if offset_name in by_name:
+            raise TilefishDeclarationError(f"{where}: the parameter '{offset_name}' clashes with the offset dimension of Strided parameter '{p.name}'")
+        elems16 = 128 // math.gcd(t.dtype.bits, 128)  # type: ignore[union-attr]  # elements in 16 bytes
+        offset = Dim(offset_name, divisible_by=elems16 if p.align == 16 else None)
+        typed = TensorType(t.shape, t.dtype, strides=strides, offset=offset, aligned=False, normalize=False)
+        out.append(
+            Param(p.name, p.index, "tensor", p.access, type=typed, keyword_only=p.keyword_only, strided=True, align=p.align)
+        )
+    return out
 
 
 def _check_derivable(where: str, sig: Signature) -> None:
@@ -265,33 +365,40 @@ class _Unifier:
         self.ctx = ctx
         self.bindings: dict[Dim, DimExpr] = {}
         self.bound_by: dict[Dim, str] = {}
-        self.equations: list[tuple[str, int, DimExpr, DimExpr, TensorType]] = []
+        self.equations: list[tuple[str, int, DimExpr, DimExpr, TensorType, str]] = []
 
-    def add(self, pname: str, axis: int, pattern: DimExpr, actual: DimExpr, actual_type: TensorType) -> None:
-        self.equations.append((pname, axis, pattern, actual, actual_type))
+    def add(
+        self, pname: str, axis: int, pattern: DimExpr, actual: DimExpr, actual_type: TensorType, what: str = "dimension"
+    ) -> None:
+        """One equation between a pattern of the signature and what the argument has: a ``dimension`` of its shape, a ``stride`` or its ``offset``."""
+        self.equations.append((pname, axis, pattern, actual, actual_type, what))
 
     def solve(self) -> None:
         pending = self.equations
         while pending:
             rest = [eq for eq in pending if not self._try(eq)]
             if len(rest) == len(pending):
-                pname, axis, pattern, actual, _ = rest[0]
+                pname, axis, pattern, actual, _, what = rest[0]
                 raise TilefishTypeError(
                     f"{self.op.name}: argument '{pname}': cannot infer the dimensions in {pattern} "
-                    f"(dimension {axis}, argument size {actual}); the signature is ambiguous at this call"
+                    f"({self._where(what, axis)}, argument value {actual}); the signature is ambiguous at this call"
                 )
             pending = rest
 
     def _origin(self, pname: str) -> str:
         return f"{self.op.name}: argument '{pname}'"
 
-    def _try(self, eq: tuple[str, int, DimExpr, DimExpr, TensorType]) -> bool:
-        pname, axis, pattern, actual, atype = eq
+    @staticmethod
+    def _where(what: str, axis: int) -> str:
+        return {"dimension": f"dimension {axis}", "stride": f"the stride of axis {axis}", "offset": "the offset"}[what]
+
+    def _try(self, eq: tuple[str, int, DimExpr, DimExpr, TensorType, str]) -> bool:
+        pname, axis, pattern, actual, atype, what = eq
         unbound = [d for d in pattern.free_dims() if d not in self.bindings]
         if not unbound:
             expected = pattern.subst(self.bindings)
             if expected != actual:
-                self._mismatch(pname, axis, pattern, expected, actual, atype)
+                self._mismatch(pname, axis, pattern, expected, actual, atype, what)
             return True
         if len(unbound) != 1:
             return False
@@ -306,7 +413,7 @@ class _Unifier:
             target = actual  # keep the actual dimension as is (and its name)
         else:
             target = actual - rest.subst(self.bindings)
-        cannot = f"{self._origin(pname)}: dimension {axis} is {actual}, which cannot match {pattern}"
+        cannot = f"{self._origin(pname)}: {self._where(what, axis)} is {actual}, which cannot match {pattern}"
         if coef == 1:
             value = target  # keeps the caller's dimension (and its name) as is
         elif target.is_static:
@@ -318,19 +425,24 @@ class _Unifier:
             if q is None:
                 raise TilefishTypeError(f"{cannot} (cannot solve for {var})")
             value = q
-        if value.is_static and value.value < 1:
+        if value.is_static and value.value < (1 if what == "dimension" else 0):  # a stride or an offset can be 0
             raise TilefishTypeError(f"{cannot} (would need {var} = {value.value})")
-        self._bind(var, value, pname, axis)
+        self._bind(var, value, pname, axis, what)
         return True
 
-    def _bind(self, var: Dim, value: DimExpr, pname: str, axis: int) -> None:
+    def _bind(self, var: Dim, value: DimExpr, pname: str, axis: int, what: str = "dimension") -> None:
         origin = self._origin(pname)
         k = var.divisible_by
         if k:
             if value.is_static:
                 if value.value % k:
+                    if what == "offset":
+                        raise TilefishTypeError(
+                            f"{origin}: the offset of the view is {value.value} elements, which is not a multiple of {k} (16 bytes); "
+                            "this parameter is Strided[..., 16] and its kernel is compiled for a 16-byte aligned pointer"
+                        )
                     raise TilefishTypeError(
-                        f"{origin}: {var} requires divisible_by={k} but dimension {axis} is {value.value}"
+                        f"{origin}: {var} requires divisible_by={k} but {self._where(what, axis)} is {value.value}"
                     )
             else:
                 self.ctx.require_divisible(value, k, origin)
@@ -347,13 +459,15 @@ class _Unifier:
         self.bound_by[var] = f"argument '{pname}'"
 
     def _mismatch(
-        self, pname: str, axis: int, pattern: DimExpr, expected: DimExpr, actual: DimExpr, atype: TensorType
+        self, pname: str, axis: int, pattern: DimExpr, expected: DimExpr, actual: DimExpr, atype: TensorType, what: str = "dimension"
     ) -> None:
         actual_text, expected_text = describe_pair(actual.folded(), expected.folded())
         required = str(pattern)
         if required != expected_text:
             required += f" = {expected_text}"
-        text = f"{self._origin(pname)} ({atype}): dimension {axis} is {actual_text}, but the signature requires {required}"
+        text = f"{self._origin(pname)} ({atype}): {self._where(what, axis)} is {actual_text}, but the signature requires {required}"
+        if what == "stride":
+            text += " (the kernel loads along that axis contiguously: pass a view whose last axis has stride 1)"
         notes = [
             f"{v} was bound to {dim_text(self.bindings[v])} by {self.bound_by[v]}"
             for v in pattern.free_dims()
@@ -369,9 +483,13 @@ class _Unifier:
             raise TilefishTypeError(
                 f"{self.op.name}: cannot infer dimension(s) {', '.join(sorted(d.name for d in free))} of {what}"
             )
-        return TensorType(
-            [d.subst(self.bindings) for d in t.shape], t.dtype, known=self.ctx.known, contiguous=t.contiguous
-        )
+        shape = [d.subst(self.bindings) for d in t.shape]
+        if t.contiguous:
+            return TensorType(shape, t.dtype, known=self.ctx.known, devscalar=t.devscalar)
+        # a view: its layout, with the bindings of this call substituted
+        strides = None if t.strides is None else [None if s is None else s.subst(self.bindings) for s in t.strides]
+        offset = None if t.offset is None else t.offset.subst(self.bindings)
+        return TensorType(shape, t.dtype, known=self.ctx.known, strides=strides, offset=offset, aligned=False if strides is not None else None)
 
 
 def _check_buckets_overlap(origin: str, name: str, buckets: "tuple[int, ...]", value: DimExpr) -> None:
@@ -471,6 +589,37 @@ def call_op(op: "Op", args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         raise
 
 
+def _add_layout_equations(op: "Op", p: Param, pt: TensorType, at: TensorType, unifier: _Unifier) -> None:
+    """The strides and the offset of a view passed to a ``Strided[...]`` parameter, as equations on the stride and offset dimensions.
+
+    Each free stride binds to the stride the argument has (a dense argument has the row-major strides); an axis the kernel
+    loads contiguously (stride ``1``) must have stride 1, unless the argument's size along it is 1. The offset dimension binds to
+    the offset of the argument; for ``Strided[..., 16]`` it is ``divisible_by`` the elements in 16 bytes, so a view whose offset
+    is not provably a multiple of 16 bytes is refused here (or, when it depends on dimensions, recorded as a requirement).
+    """
+    assert pt.strides is not None
+    actual = at.layout_strides()
+    for axis, (pattern, got) in enumerate(zip(pt.strides, actual)):
+        assert pattern is not None
+        if got is None:
+            raise TilefishTypeError(
+                f"{op.name}: argument '{p.name}' is the view {at} whose stride along axis {axis} is not an affine expression "
+                "(a product of two symbolic dimensions), so it cannot be passed as a stride; make one of the factors static"
+            )
+        if pattern.is_static and at.shape[axis].is_static and at.shape[axis].value == 1:
+            continue  # the stride of a size-1 axis is never used
+        unifier.add(p.name, axis, pattern, got, at, "stride")
+    assert pt.offset is not None
+    if at.offset is None:
+        if p.align:
+            raise TilefishTypeError(
+                f"{op.name}: argument '{p.name}': the offset of the view {at} is not an affine expression, so it cannot be shown "
+                f"to be a multiple of {p.align} bytes, which this Strided[..., {p.align}] parameter needs"
+            )
+        return
+    unifier.add(p.name, -1, pt.offset, at.offset, at, "offset")
+
+
 def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
     sig = op.signature
     unifier = _Unifier(op, ctx)
@@ -504,10 +653,16 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
             )
         seen.setdefault(id(live), (p.name, p.access))
         at = live.type
-        if not at.contiguous:
+        if at.devscalar != pt.devscalar:
             raise TilefishTypeError(
-                f"{op.name}: argument '{p.name}' is a strided view ({at}); strided views arrive in M2, "
-                "pass the unsplit tensor (a chunk that does not start on a 16-byte boundary is a view too)"
+                f"{op.name}: argument '{p.name}': expected {pt}, got {at}: a DevScalar (one element in device memory) is only "
+                "passed to a DevScalar parameter, and a DevScalar parameter takes nothing else"
+            )
+        if not at.contiguous and not p.strided:
+            raise TilefishTypeError(
+                f"{op.name}: argument '{p.name}' is a strided view ({at}); this parameter takes a contiguous tensor: pass the "
+                "unsplit tensor, compute from the view (x + 0 is a contiguous copy), or have an extern declare the parameter "
+                "Strided[...] (a chunk that does not start on a 16-byte boundary is a view too)"
             )
         if at.rank != pt.rank:
             raise TilefishTypeError(
@@ -520,6 +675,8 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
             )
         for axis, (pd, ad) in enumerate(zip(pt.shape, at.shape)):
             unifier.add(p.name, axis, pd, ad, at)
+        if p.strided:
+            _add_layout_equations(op, p, pt, at, unifier)
         inputs.append(live)
         if p.access == "inout":
             inout_args.append((p, arg, live))

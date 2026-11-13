@@ -68,18 +68,21 @@ def test_load_is_the_same_through_tilefish_and_aot(directory):
 @pytest.mark.parametrize(
     "change, message",
     [
-        (lambda d: d.update(schema=3), "not a tilefish manifest of schema 2"),
+        (lambda d: d.update(schema=4), "not a tilefish manifest of schema 3"),
+        (lambda d: d.update(schema=2), "schema 2, which an older tilefish wrote.*Re-export it"),  # what the Rust host 0.0.1 reads
         (lambda d: d.update(schema=1), "schema 1, which an older tilefish wrote.*Re-export it"),
-        (lambda d: d.update(schema=True), "not a tilefish manifest of schema 2"),
-        (lambda d: d.update(schema=2.0), "not a tilefish manifest of schema 2"),  # 2.0 == 2 in Python; the Rust host refuses it
-        (lambda d: d.update(schema=2.5), "not a tilefish manifest of schema 2"),
-        (lambda d: d.update(schema=1.0), "not a tilefish manifest of schema 2"),
-        (lambda d: d.update(schema="2"), "not a tilefish manifest of schema 2"),
-        (lambda d: d.update(schema=[2]), "not a tilefish manifest of schema 2"),
-        (lambda d: d.update(schema=None), "not a tilefish manifest of schema 2"),
-        (lambda d: d.update(schema={"v": 2}), "not a tilefish manifest of schema 2"),
-        (lambda d: d.pop("schema"), "not a tilefish manifest of schema 2"),
+        (lambda d: d.update(schema=True), "not a tilefish manifest of schema 3"),
+        (lambda d: d.update(schema=3.0), "not a tilefish manifest of schema 3"),  # 3.0 == 3 in Python; a strict host refuses it
+        (lambda d: d.update(schema=2.5), "not a tilefish manifest of schema 3"),
+        (lambda d: d.update(schema=1.0), "not a tilefish manifest of schema 3"),
+        (lambda d: d.update(schema="3"), "not a tilefish manifest of schema 3"),
+        (lambda d: d.update(schema=[3]), "not a tilefish manifest of schema 3"),
+        (lambda d: d.update(schema=None), "not a tilefish manifest of schema 3"),
+        (lambda d: d.update(schema={"v": 3}), "not a tilefish manifest of schema 3"),
+        (lambda d: d.pop("schema"), "not a tilefish manifest of schema 3"),
         (lambda d: d.update(kernels="nope"), "not a tilefish manifest"),
+        (lambda d: d.pop("library"), "not a tilefish manifest"),
+        (lambda d: d.update(library={}), "not a tilefish manifest"),
         (lambda d: d["kernels"].append(d["kernels"][0]), "twice"),
         (lambda d: d["kernels"][0].pop("sha256_code"), "is missing \\['sha256_code'\\]"),
         (lambda d: d["kernels"].__setitem__(0, 7), "is not an object"),
@@ -456,7 +459,12 @@ def test_the_manifest_has_a_digest_of_everything_in_it(directory):
 def test_the_digest_does_not_depend_on_formatting_order_or_the_tilefish_version(directory):
     m = Manifest.load(directory)
     doc = json.loads((directory / "manifest.json").read_text())
-    reordered = {"kernels": list(reversed([dict(reversed(list(k.items()))) for k in doc["kernels"]])), "tilefish": "9.9.9", "schema": doc["schema"]}
+    reordered = {
+        "library": doc["library"],
+        "kernels": list(reversed([dict(reversed(list(k.items()))) for k in doc["kernels"]])),
+        "tilefish": "9.9.9",
+        "schema": doc["schema"],
+    }
     assert manifest_digest(reordered) == m.digest
     (directory / "manifest.json").write_text(json.dumps(doc, indent=4, sort_keys=True))
     assert Manifest.load(directory).digest == m.digest

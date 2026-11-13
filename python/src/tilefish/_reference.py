@@ -108,7 +108,9 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]") -> "list[Any]":
                 )
             a = [operand(i) for i in n.inputs]
             (out,) = n.outputs
-            if op == "add":
+            if op == "load":  # the one element of a DevScalar, as a 0-d tensor (it broadcasts like the kernel's scalar does)
+                r = a[0].reshape(())
+            elif op == "add":
                 r = a[0] + a[1]
             elif op == "sub":
                 r = a[0] - a[1]

@@ -11,6 +11,11 @@ cubin with a manifest (:func:`tilefish.aot.build`, :func:`tilefish.aot.write_man
 cubin through the CUDA driver, what a C++ or Rust host runs) and ``reference`` (the IR interpreted
 with torch). Importing tilefish imports neither torch nor Triton; the ``gpu`` extra installs them, and it changes nothing about
 how Python imports modules. The identity of a binary is the Triton IR its kernel compiles to (:mod:`tilefish._ir`).
+
+M3.2 (P1): strided views (``reshape``, ``permute``, ``select``, ``split`` give views; an ``extern`` parameter ``Strided[...]`` takes one, with its
+strides as ``StrideOf`` scalars), device scalars (``DevScalar[dtype]``, read with :func:`load`), prebuilt PTX and cubin externs
+(``extern(ptx=...)``, ``extern(cubin=...)``), a cuBLASLt GEMM as a ``library`` op with a pinned algorithm, and manifest schema 3
+(``docs/manifest-schema-3.md``).
 """
 
 from . import aot
@@ -48,11 +53,11 @@ from .errors import (
 from ._manifest import Manifest
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
-from .ops import exp, gelu, rsqrt, silu, sqrt
+from .ops import exp, gelu, load, rsqrt, silu, sqrt
 from .ops import reduce_mean as mean
 from .runtime import run
 from .trace import Const, Value
-from .types import InOut, Out, Tensor, TensorType, const
+from .types import DevScalar, InOut, Out, StrideOf, Strided, Tensor, TensorType, const
 
 __version__ = "0.0.3"
 
@@ -68,6 +73,7 @@ __all__ = [
     "BucketRequirement",
     "Const",
     "DType",
+    "DevScalar",
     "Dim",
     "DimExpr",
     "ExternOp",
@@ -83,6 +89,8 @@ __all__ = [
     "Out",
     "Requirement",
     "Scalar",
+    "StrideOf",
+    "Strided",
     "Tensor",
     "TensorType",
     "TilefishAttributeError",
@@ -115,6 +123,7 @@ __all__ = [
     "i64",
     "kernel",
     "library",
+    "load",
     "lower",
     "mean",
     "rsqrt",

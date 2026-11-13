@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import math
+import os
+import pathlib
 import re
 import sys
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from .dims import DimExpr, as_dim
@@ -164,31 +168,61 @@ def _with_traced_returns(signature: Signature, graph: Graph, kind: str, name: st
 
 
 class LibraryOp(Op):
-    """An operator with an opaque body (CUTLASS, cuBLASLt, ...): a typed signature only."""
+    """An operator with an opaque body (CUTLASS, cuBLASLt, ...): a typed signature only.
+
+    With ``impl="cublaslt.gemm"`` (or ``"cublaslt.gemm_bias"``) it is also a pinned cuBLASLt GEMM that ``tilefish.run`` runs and
+    ``tilefish.runtime.export`` writes to the ``library`` section of a manifest: ``out[M, N] = a[M, K] @ b[N, K]^T`` (``+ bias[N]``), bf16
+    with an f32 accumulator and one rounding, the algorithm the heuristic ranks first under a ``workspace_bytes`` limit, recorded
+    with the cuBLASLt version (see :mod:`tilefish._library`). Without ``impl`` it is a signature only.
+    """
 
     kind = "library"
 
-    def __init__(self, fn: Callable[..., Any], name: str, signature: Signature, acc: DType | None) -> None:
+    def __init__(
+        self,
+        fn: Callable[..., Any],
+        name: str,
+        signature: Signature,
+        acc: DType | None,
+        impl: "str | None" = None,
+        workspace_bytes: "int | None" = None,
+    ) -> None:
         super().__init__(fn, name, signature)
         self.acc = acc
+        self.impl = impl
+        self.workspace_bytes = workspace_bytes
 
     def node_attrs(self) -> dict[str, Any]:
         return {"acc": self.acc} if self.acc is not None else {}
 
 
-def library(name: Any = None, *, acc: DType | None = None) -> Any:
-    """``@tilefish.library("gemm", acc=f32)``: declare an operator by signature only."""
+def library(name: Any = None, *, acc: DType | None = None, impl: "str | None" = None, workspace_bytes: "int | None" = None) -> Any:
+    """``@tilefish.library("gemm", acc=f32)``: declare an operator by signature only.
+
+    ``impl="cublaslt.gemm"`` (or ``"cublaslt.gemm_bias"``) says a pinned cuBLASLt GEMM runs it: the signature must be
+    ``(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) -> Tensor[M, N, bf16]`` (with ``bias: Tensor[N, bf16]`` for the second), ``M``, ``N`` and
+    ``K`` static or bucketed, ``N`` and ``K`` multiples of 8. ``workspace_bytes`` is the workspace limit the heuristic is asked under
+    (default 8 519 680, torch's default); it is part of the declaration.
+    """
     if acc is not None and not isinstance(acc, DType):
         raise TilefishDeclarationError(f"library: acc must be a dtype such as f32, got {acc!r}")
+    if impl is None and workspace_bytes is not None:
+        raise TilefishDeclarationError("library: workspace_bytes needs an impl")
 
     def make(fn: Callable[..., Any], op_name: str | None) -> LibraryOp:
         nm = op_name or fn.__name__
-        sig = parse_signature(fn, what="library op", name=nm)
+        sig = parse_signature(fn, what="library op", name=nm, allow_devscalar=False)
         if not sig.returns and not sig.tensor_outputs and not any(p.access == "inout" for p in sig.params):
             raise TilefishDeclarationError(
                 f"library op '{nm}': declare a return type (-> Tensor[...]) or Out/InOut parameters"
             )
-        return LibraryOp(fn, nm, sig, acc)
+        ws = workspace_bytes
+        if impl is not None:
+            from . import _library
+
+            ws = _library.DEFAULT_WORKSPACE_BYTES if workspace_bytes is None else workspace_bytes
+            _library.check_declaration(nm, impl, sig, acc, ws)
+        return LibraryOp(fn, nm, sig, acc, impl, ws)
 
     if callable(name) and not isinstance(name, str):
         return make(name, None)
@@ -447,11 +481,13 @@ class ExternOp(Op):
         bucket_num_warps: "dict[str, int] | None" = None,
         source_sha256: "str | None" = None,
         index_bits: int = 32,
+        binary: "BinaryTarget | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         if type(index_bits) is not int or index_bits not in (32, 64):
             raise TilefishDeclarationError(f"extern '{name}': index_bits must be 32 or 64, got {index_bits!r}")
         self.index_bits: int = index_bits
+        self.binary: "BinaryTarget | None" = binary  # a prebuilt PTX or cubin instead of a Triton kernel (triton is "" then)
         self.triton = triton
         self.num_warps = num_warps
         self.num_stages = num_stages
@@ -495,6 +531,11 @@ class ExternOp(Op):
         return self.triton.split(":", 1)[1]
 
     @property
+    def is_binary(self) -> bool:
+        """Whether this is a prebuilt PTX or cubin (``extern(ptx=...)`` / ``extern(cubin=...)``) rather than a Triton kernel."""
+        return self.binary is not None
+
+    @property
     def grid_string(self) -> str | None:
         """The launch grid as a string expression over dimension names, e.g. ``(cdiv(n, 1024),)``."""
         if self.grid is None:
@@ -502,10 +543,17 @@ class ExternOp(Op):
         return grid_to_string(self.grid)
 
     def node_attrs(self) -> dict[str, Any]:
+        if self.binary is not None:
+            return {"binary": self.binary.symbol}
         return {"triton": self.triton}
 
     def check_const(self, param: Param, value: Any) -> Any:
         if value != param.default:
+            if self.binary is not None:
+                raise TilefishTypeError(
+                    f"{self.name}: argument '{param.name}' is fixed to {param.default} by the extern declaration "
+                    f"(its value is in the manifest) and cannot be changed to {value!r} at a call"
+                )
             raise TilefishTypeError(
                 f"{self.name}: constexpr '{param.name}' is fixed to {param.default} by the extern declaration "
                 f"(it is compiled into the binary) and cannot be changed to {value!r} at a call"
@@ -577,11 +625,93 @@ def grid_to_string(grid: "tuple[DimExpr, ...]") -> str:
     return f"({body},)" if len(grid) == 1 else f"({body})"
 
 
+_UNSET: Any = object()  # num_warps= / num_stages= not passed (None is a value, and an invalid one)
+
+
+@dataclass(frozen=True)
+class BinaryTarget:
+    """A prebuilt kernel that Triton does not compile: PTX that ``ptxas`` assembles for the target architecture, or a cubin per architecture.
+
+    ``sources`` holds the bytes of the file(s) as they were when the operator was declared (the identity of the binary is the sha256 of
+    those bytes, ``source_digest`` of kind ``"tilefish.binary.v1"``): ``{"ptx": ...}`` for PTX, ``{"sm_103": ...}`` per architecture
+    for cubins. ``symbol`` is the kernel's entry point, ``block`` its thread block and ``shared`` its dynamic shared memory in bytes
+    (a prebuilt kernel's ABI says no more than its C parameters, so the declaration says the rest).
+    """
+
+    kind: str  # "ptx" | "cubin"
+    symbol: str
+    block: "tuple[int, int, int]"
+    shared: int
+    sources: "dict[str, bytes]"
+
+    @property
+    def digests(self) -> "dict[str, str]":
+        return {k: hashlib.sha256(v).hexdigest() for k, v in sorted(self.sources.items())}
+
+
+_SYMBOL = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+_ARCH_NAME = re.compile(r"sm_[0-9]{2,3}")
+_MAX_BINARY = 1 << 26  # 64 MiB: a kernel file is not larger than this
+
+
+def _read_binary_file(label: str, where: str, path: Any, base: "pathlib.Path | None") -> bytes:
+    """The bytes of a PTX or cubin file named in a declaration (a relative path is relative to the file that declares the operator)."""
+    if not isinstance(path, (str, os.PathLike)):
+        raise TilefishDeclarationError(f"extern: {label} must be a file path, got {path!r}")
+    p = pathlib.Path(path)
+    if not p.is_absolute() and base is not None:
+        p = base / p
+    try:
+        size = p.stat().st_size
+        if size > _MAX_BINARY:
+            raise TilefishDeclarationError(f"extern '{where}': {label} {str(p)!r} is {size} bytes, more than the {_MAX_BINARY} a kernel file may have")
+        data = p.read_bytes()
+    except OSError as e:
+        raise TilefishDeclarationError(f"extern '{where}': cannot read {label} {str(p)!r}: {e}") from None
+    if not data:
+        raise TilefishDeclarationError(f"extern '{where}': {label} {str(p)!r} is empty")
+    return data
+
+
+def _block_of(block: Any) -> "tuple[int, int, int]":
+    if not isinstance(block, (tuple, list)) or not 1 <= len(block) <= 3 or any(isinstance(b, bool) or not isinstance(b, int) for b in block):
+        raise TilefishDeclarationError(f"extern: block must be a tuple of 1 to 3 ints (threads per block), got {block!r}")
+    padded = tuple(block) + (1,) * (3 - len(block))
+    if any(not 1 <= b <= 1024 for b in padded) or math.prod(padded) > 1024:
+        raise TilefishDeclarationError(f"extern: block {tuple(block)} must have sizes from 1 to 1024 and at most 1024 threads in all")
+    return padded  # type: ignore[return-value]
+
+
+def _binary_target(
+    kind: str, files: Any, symbol: Any, block: Any, shared: Any, base: "pathlib.Path | None", where: str
+) -> BinaryTarget:
+    if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
+        raise TilefishDeclarationError(f"extern: symbol= names the kernel's entry point (a PTX/ELF symbol), got {symbol!r}")
+    if isinstance(shared, bool) or not isinstance(shared, int) or not 0 <= shared <= 1 << 30:
+        raise TilefishDeclarationError(f"extern: shared must be a non-negative int (bytes of dynamic shared memory), got {shared!r}")
+    sources: dict[str, bytes] = {}
+    if kind == "ptx":
+        sources["ptx"] = _read_binary_file("ptx=", where, files, base)
+    else:
+        if not isinstance(files, dict) or not files:
+            raise TilefishDeclarationError(f"extern: cubin= maps architectures to files, {{'sm_103': 'k.cubin'}}, got {files!r}")
+        for arch, path in files.items():
+            if not isinstance(arch, str) or not _ARCH_NAME.fullmatch(arch):
+                raise TilefishDeclarationError(f"extern: cubin= keys are architectures such as 'sm_103', got {arch!r}")
+            sources[arch] = _read_binary_file(f"cubin[{arch!r}]", where, path, base)
+    return BinaryTarget(kind, symbol, _block_of(block), shared, sources)
+
+
 def extern(
     *args: Any,
     triton: Any = None,
-    num_warps: int = 4,
-    num_stages: int = 3,
+    ptx: Any = None,
+    cubin: Any = None,
+    symbol: "str | None" = None,
+    block: Any = None,
+    shared: int = 0,
+    num_warps: Any = _UNSET,
+    num_stages: Any = _UNSET,
     grid: Any = None,
     name: str | None = None,
     index_bits: int = 32,
@@ -591,6 +721,22 @@ def extern(
     It always takes arguments (``@tilefish.extern`` without parentheses is an
     error). ``triton`` is a ``"module:function"`` string or a kernel object;
     ``grid`` is a callable over dimension and constant names, or a tuple.
+
+    **A prebuilt binary that Triton does not compile** is declared with ``ptx="file.ptx"`` or ``cubin={"sm_103": "file.cubin", ...}``
+    instead of ``triton=``, together with ``symbol="entry_name"``, ``block=(x, y, z)`` and ``grid=...`` (and ``shared=0``, the bytes of
+    dynamic shared memory the kernel addresses)::
+
+        @tilefish.extern(ptx="scale.ptx", symbol="scale_bf16", block=(256,), grid=lambda n: (tilefish.cdiv(n, 256),))
+        def scale(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]], n_elem: n, alpha: const[f32] = 2.0): ...
+
+    The stub lists the kernel's **C parameters, in order**: a tensor is a pointer (``Strided[...]`` and ``DevScalar[...]`` too), a
+    parameter annotated with a runtime ``Dim`` is an ``i32``, a ``StrideOf`` an ``i32`` (``i64`` for ``index_bits=64``), and a typed
+    ``const[i32]``, ``const[i64]`` or ``const[f32]`` with a default is a **fixed argument**: a scalar whose value is written in the
+    manifest and passed at every launch (the way a prebuilt kernel takes its constants and its unused scratch slots; there are no
+    constexprs, since nothing is compiled). A prebuilt binary has **no Triton scratch slots**: it is launched with exactly these
+    parameters. A relative path is relative to the file that declares the operator, and the bytes are read once, there: the identity of
+    the binary is their sha256 (``source_digest`` of kind ``tilefish.binary.v1``). PTX is assembled by ``ptxas`` for the target
+    architecture with fixed, recorded flags; a cubin is used as it is for the architecture it names and refused for another.
 
     ``index_bits`` says how the kernel computes the offsets it loads and stores at. The default, ``32``, is the safe
     claim: every tensor parameter gets a ``max_elements`` precondition of ``2**31 - 1`` elements, which Python's ``replay`` and
@@ -613,16 +759,36 @@ def extern(
     sites. When ``triton`` is a kernel object that exposes ``arg_names`` (and
     ``params[i].is_constexpr``), the stub is checked against it.
     """
-    if args or triton is None:
+    given = [k for k, v in (("triton", triton), ("ptx", ptx), ("cubin", cubin)) if v is not None]
+    if args or not given:
         raise TilefishDeclarationError(
-            '@tilefish.extern takes arguments: write @tilefish.extern(triton="module:function", grid=...), '
-            "not a bare @tilefish.extern"
+            '@tilefish.extern takes arguments: write @tilefish.extern(triton="module:function", grid=...) (or ptx=/cubin= for a prebuilt '
+            "binary), not a bare @tilefish.extern"
         )
-    target = _triton_target(triton)
-    if isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS:
-        raise TilefishDeclarationError(f"extern: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
-    if isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1:
-        raise TilefishDeclarationError(f"extern: num_stages must be a positive int, got {num_stages!r}")
+    if len(given) > 1:
+        raise TilefishDeclarationError(f"extern: a kernel is one of triton=, ptx= and cubin=, got {' and '.join(given)}")
+    prebuilt = triton is None
+    if prebuilt:
+        for key, value in (("num_warps", num_warps), ("num_stages", num_stages)):
+            if value is not _UNSET:
+                raise TilefishDeclarationError(f"extern: {key}= is a Triton compile option; a prebuilt binary has its block= (and nothing is compiled)")
+        if symbol is None or block is None:
+            raise TilefishDeclarationError(f"extern: {given[0]}= needs symbol=<the kernel's entry point> and block=(x, y, z)")
+        target = None
+        num_warps, num_stages = 0, 0
+    else:
+        for key, value in (("symbol", symbol), ("block", block)):
+            if value is not None:
+                raise TilefishDeclarationError(f"extern: {key}= is for a prebuilt binary (ptx= or cubin=), not for a Triton kernel")
+        if shared != 0:
+            raise TilefishDeclarationError("extern: shared= is for a prebuilt binary; Triton records the shared memory of the kernel it compiles")
+        target = _triton_target(triton)
+        num_warps = 4 if num_warps is _UNSET else num_warps
+        num_stages = 3 if num_stages is _UNSET else num_stages
+        if isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS:
+            raise TilefishDeclarationError(f"extern: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
+        if isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1:
+            raise TilefishDeclarationError(f"extern: num_stages must be a positive int, got {num_stages!r}")
 
     if type(index_bits) is not int or index_bits not in (32, 64):
         raise TilefishDeclarationError(f"extern: index_bits must be 32 (the kernel indexes with i32) or 64 (with i64), got {index_bits!r}")
@@ -637,21 +803,44 @@ def extern(
         nm = name or fn.__name__
         if not _OP_NAME.fullmatch(nm):
             raise TilefishDeclarationError(f"extern: the function name {nm!r} is not a plain identifier; pass name=... to give the op one")
-        sig = parse_signature(fn, what="extern op", name=nm, allow_dim_const_defaults=True)
+        sig = parse_signature(fn, what="extern op", name=nm, allow_dim_const_defaults=not prebuilt, allow_strided=True)
         if sig.returns:
             raise TilefishDeclarationError(
-                f"extern op '{nm}': a Triton kernel returns nothing; declare results as Out[...] parameters"
+                f"extern op '{nm}': {'a kernel' if prebuilt else 'a Triton kernel'} returns nothing; declare results as Out[...] parameters"
             )
         for p in sig.consts:
             if p.default is MISSING:
                 raise TilefishDeclarationError(
-                    f"extern op '{nm}': const parameter '{p.name}' needs a default, the value compiled in as constexpr"
+                    f"extern op '{nm}': const parameter '{p.name}' needs a default, "
+                    + ("the value written in the manifest and passed at every launch" if prebuilt else "the value compiled in as constexpr")
                 )
-        _check_against_kernel(nm, sig, target)
+        binary = None
+        if prebuilt:
+            for p in sig.consts:  # a fixed argument: a scalar of a C type, with its value
+                dt = p.const_dtype
+                ok = dt is not None and dt.name in ("i32", "i64", "f32") and isinstance(p.default, (int, float)) and not isinstance(p.default, bool)
+                if ok and dt.is_int:  # type: ignore[union-attr]
+                    lo, hi = dt.int_range()  # type: ignore[union-attr]
+                    ok = isinstance(p.default, int) and lo <= p.default <= hi
+                if not ok:
+                    raise TilefishDeclarationError(
+                        f"extern op '{nm}': const parameter '{p.name}' of a prebuilt binary is an argument of its C ABI: write "
+                        f"`{p.name}: const[i32] = 0` (or const[i64], const[f32]) with a default that fits"
+                    )
+            base = pathlib.Path(fn.__code__.co_filename).resolve().parent if getattr(fn, "__code__", None) is not None else None
+            if base is not None and not base.is_dir():
+                base = None
+            binary = _binary_target("ptx" if ptx is not None else "cubin", ptx if ptx is not None else cubin, symbol, block, shared, base, nm)
+        else:
+            assert target is not None
+            _check_against_kernel(nm, sig, target)
         limits: dict[str, int] = {}
         if index_bits == 32:
             for p in sig.params:
-                if p.kind != "tensor":
+                if p.kind != "tensor" or p.is_devscalar:  # one element: nothing to overflow
+                    continue
+                if p.strided:  # the limit is on the largest offset the view reaches (a max_extent precondition), known at launch only
+                    limits[p.name] = MAX_ELEMENTS
                     continue
                 shape = p.type.shape  # type: ignore[union-attr]
                 count = math.prod(d.value for d in shape) if all(d.is_static for d in shape) else 0  # 0: not statically known
@@ -661,6 +850,17 @@ def extern(
                         "reach; declare index_bits=64 if the kernel computes its offsets in i64"
                     )
                 limits[p.name] = MAX_ELEMENTS
-        return ExternOp(fn, nm, sig, target.ref, num_warps, num_stages, grid, max_elements=limits, index_bits=index_bits)
+        return ExternOp(
+            fn,
+            nm,
+            sig,
+            target.ref if target is not None else "",
+            num_warps,
+            num_stages,
+            grid,
+            max_elements=limits,
+            index_bits=index_bits,
+            binary=binary,
+        )
 
     return deco

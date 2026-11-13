@@ -497,7 +497,7 @@ def test_each_schema_is_strict_about_its_own_fields():
     with pytest.raises(TilefishSpecError, match="must have exactly the fields"):  # nor constexpr dtypes
         CompileSpec.from_dict(with_dtype)
 
-    for schema in (0, 3, 99, -1, None, "2", 2.0, 1.0, True, False, [2]):
+    for schema in (0, 4, 99, -1, None, "2", 2.0, 1.0, True, False, [2]):
         doc = copy.deepcopy(SPEC.to_dict())
         doc["schema"] = schema
         with pytest.raises(TilefishSpecError, match="unsupported compile spec schema"):

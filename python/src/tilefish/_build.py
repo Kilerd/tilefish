@@ -29,13 +29,22 @@ from . import _ir, _source
 from ._ir import IR_DIGEST_KIND
 from .errors import TilefishBuildError, TilefishManifestError
 
+BINARY_DIGEST_KIND = "tilefish.binary.v1"  # the ``source_digest_kind`` of an entry whose ``source_digest`` is the sha256 of a prebuilt PTX or cubin
+
 if TYPE_CHECKING:
     from .aot import CompileSpec
 
 # 2: every pointer parameter of the ABI records its declared shape (``["Rows", 1024]``: a dimension expression, or the size of a static
 # axis) and every entry the constraints of its named dimensions (``dims``), so that a host binds the dimensions from the shapes of
 # its tensors and checks buckets, ``divisible_by``, ``max_elements`` and ``count_of`` from the manifest alone. Schema 1 had neither.
-MANIFEST_SCHEMA = 2
+# 3: strided views (a pointer records ``strides`` and ``offset``, a stride scalar ``stride_of``, the ``max_extent`` precondition), device
+# scalars (a pointer with the shape ``[]``), prebuilt binaries (an entry of ``kind`` ``"binary"``, ``fixed`` arguments, no scratch
+# slots: the ABI records ``scratch_slots``), the ``library`` section (a pinned cuBLASLt GEMM) and the digest tag ``v3``.
+# ``docs/manifest-schema-3.md`` specifies every field.
+MANIFEST_SCHEMA = 3
+LEGACY_MANIFEST_SCHEMA = 2  # what the Rust host reads; a manifest of this schema is refused here (export it again)
+ENTRY_KIND_TRITON = "triton"
+ENTRY_KIND_BINARY = "binary"
 MIN_TRITON = (3, 5)
 _ARCH = re.compile(r"(?:sm_?)?([0-9]{2,3})a?\Z")
 _ENTRY = re.compile(r"\.entry\s+(\w+)\s*\(")
@@ -44,8 +53,13 @@ _PTX_TARGET = re.compile(r"^\s*\.target\s+(\S+)", re.M)
 _MISSING = object()
 _compile_lock = _ir.LOCK  # a Triton knob is process-wide state, and Triton's frontend is not known to be thread-safe: one compile (or frontend) at a time
 
-# the PTX type of each kind of launch parameter (all the AOT specs produce): a pointer is 64 bits, an i32 is 32
-_PTX_TYPES = {"pointer": ("u64", 8), "scalar": ("u32", 4)}
+# the PTX type of each kind of launch parameter: a pointer is 64 bits, a scalar is as wide as its C type says
+_PTX_SCALARS = {"i32": ("u32", 4), "i64": ("u64", 8), "f32": ("f32", 4)}
+
+
+def ptx_type_of(kind: str, type_: str) -> "tuple[str, int]":
+    """The PTX type name and the size in bytes of one launch parameter, as Triton declares it."""
+    return ("u64", 8) if kind == "pointer" else _PTX_SCALARS[type_]
 
 
 def parse_arch(arch: "int | str") -> int:
@@ -270,12 +284,18 @@ class LaunchAttributes:
 
 def abi_of(spec: "CompileSpec") -> dict[str, Any]:
     """The launch ABI a spec promises: ``params`` (the non-constexpr arguments, in declaration order, one
-    ``kernelParams`` slot each) followed by the two ``scratch`` slots, which a launch passes as null 64-bit pointers."""
+    ``kernelParams`` slot each), followed by the ``scratch`` slots, which a launch passes as null 64-bit pointers, and
+    ``scratch_slots``, their number: 2 for a Triton kernel, 0 for a prebuilt binary (its C ABI has none).
+
+    A ``pointer`` is ``base + offset * itemsize`` of a tensor; with ``strides`` and ``offset`` (a ``Strided[...]`` parameter) the
+    tensor is a view, and the ``scalar`` that is a ``stride_of`` carries one of its strides. A ``fixed`` argument is a scalar whose
+    value is in the manifest (a prebuilt binary's constant argument, such as a scratch slot written out as a parameter).
+    """
     params: list[dict[str, Any]] = []
     for a in spec.args:
         if a.kind == "constexpr":
             continue
-        ptx_type, size = _PTX_TYPES[a.kind]
+        ptx_type, size = ptx_type_of(a.kind, a.type)
         entry: dict[str, Any] = {
             "slot": len(params),
             "index": a.index,
@@ -294,16 +314,25 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
             entry["dtype"] = a.dtype
             entry["access"] = a.access
             entry["shape"] = list(a.shape_dims)
+            if a.strides is not None:  # a pointer that takes a strided view: base + offset * itemsize, and these strides
+                entry["strides"] = list(a.strides)
+                entry["offset"] = a.offset
+        elif a.kind == "fixed":
+            from .aot import _encode
+
+            entry["value"] = _encode(a.value)
         else:
             entry["dim"] = a.dim
             if a.count_of is not None:  # the value is the element count of that pointer argument
                 entry["count_of"] = a.count_of
+            if a.stride_of is not None:  # the value is the stride of that pointer argument along that axis
+                entry["stride_of"] = {"arg": a.stride_of[0], "axis": a.stride_of[1]}
         params.append(entry)
     scratch = [
         {"slot": len(params) + k, "name": p.name, "type": p.type, "ptx_type": "u64", "size": 8, "value": p.value}
         for k, p in enumerate(spec.launch_params[len(params) :])
     ]
-    return {"params": params, "scratch": scratch}
+    return {"params": params, "scratch": scratch, "scratch_slots": len(scratch)}
 
 
 @dataclass(frozen=True, eq=False)
@@ -337,6 +366,10 @@ class BuiltKernel:
     options: "dict[str, Any]"
     launch: LaunchAttributes
     ir_digest: "str | None" = None
+    # a prebuilt binary (``spec.binary``): the sha256 of the PTX or cubin file it is made of (the ``source_digest`` of its entry, kind
+    # ``"tilefish.binary.v1"``), and how it was made: ``{"source": "ptx", "ptxas_flags": [...]}`` or ``{"source": "cubin"}``
+    binary_digest: "str | None" = None
+    binary_build: "dict[str, Any] | None" = None
 
     @property
     def stem(self) -> str:
@@ -410,7 +443,7 @@ def _check_abi(spec: "CompileSpec", ptx: str, symbol: str) -> None:
     if close < 0:
         raise TilefishBuildError(f"the PTX entry '{symbol}' of '{spec.stem}' has no parameter list end")
     found = _PTX_PARAM.findall(ptx[m.end() : close])
-    expected = [_PTX_TYPES[a.kind][0] for a in spec.args if a.kind != "constexpr"] + ["u64", "u64"]
+    expected = [ptx_type_of(a.kind, a.type)[0] for a in spec.args if a.kind != "constexpr"] + ["u64", "u64"]
     if found != expected:
         raise TilefishBuildError(
             f"the binary of '{spec.stem}' does not have the ABI its spec promises: the PTX entry '{symbol}' takes "
@@ -679,18 +712,24 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
     entry: dict[str, Any] = {
         "stem": spec.stem,
         "op": spec.op,
+        "kind": ENTRY_KIND_TRITON if spec.binary is None else ENTRY_KIND_BINARY,
         "abi": abi_of(spec),
         "grid": spec.grid,
         "block": list(spec.block),
-        "num_warps": spec.num_warps,
-        "num_stages": spec.num_stages,
-        "constexprs": constexprs,
-        "buckets": dict(spec.buckets),
-        "dims": {name: json.loads(json.dumps(c)) for name, c in spec.dims.items()},
-        "preconditions": [p.to_dict() for p in spec.preconditions],
-        "options": dict(spec.ast_source_inputs().options),
-        "declaration_digest": spec.declaration_digest,
     }
+    if spec.binary is None:
+        entry["num_warps"] = spec.num_warps
+        entry["num_stages"] = spec.num_stages
+    entry["constexprs"] = constexprs
+    entry["buckets"] = dict(spec.buckets)
+    entry["dims"] = {name: json.loads(json.dumps(c)) for name, c in spec.dims.items()}
+    entry["preconditions"] = [p.to_dict() for p in spec.preconditions]
+    if spec.binary is None:
+        entry["options"] = dict(spec.ast_source_inputs().options)
+    else:  # a prebuilt binary declares its dynamic shared memory, and the symbol of its kernel
+        entry["symbol"] = spec.binary["symbol"]
+        entry["shared"] = spec.binary["shared"]
+    entry["declaration_digest"] = spec.declaration_digest
     if spec.source_sha256 is not None:  # a generated kernel: the sha256 of the Triton source it was built from
         entry["source_sha256"] = spec.source_sha256
     return entry
@@ -698,9 +737,10 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
 
 def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     spec_part = spec_entry(b.spec)
-    entry = {
+    entry: dict[str, Any] = {
         "stem": spec_part["stem"],
         "op": spec_part["op"],
+        "kind": spec_part["kind"],
         "arch": b.arch,
         "ptx_target": b.ptx_target,
         "symbol": b.symbol,
@@ -709,41 +749,53 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         "grid": spec_part["grid"],
         "block": spec_part["block"],
         "shared": b.shared,
-        "num_warps": b.num_warps,
-        "num_stages": spec_part["num_stages"],
-        "launch": b.launch.to_dict(),
-        "constexprs": spec_part["constexprs"],
-        "buckets": spec_part["buckets"],
-        "dims": spec_part["dims"],
-        "preconditions": spec_part["preconditions"],
-        "options": dict(b.options),
-        "declaration_digest": spec_part["declaration_digest"],
-        "sha256": b.sha256,
-        "sha256_code": b.sha256_code,
-        "toolchain": {"triton": b.triton_version, "ptxas": b.ptxas_version},
     }
+    if b.spec.binary is None:
+        entry["num_warps"] = b.num_warps
+        entry["num_stages"] = spec_part["num_stages"]
+    entry["launch"] = b.launch.to_dict()
+    entry["constexprs"] = spec_part["constexprs"]
+    entry["buckets"] = spec_part["buckets"]
+    entry["dims"] = spec_part["dims"]
+    entry["preconditions"] = spec_part["preconditions"]
+    if b.spec.binary is None:
+        entry["options"] = dict(b.options)
+    entry["declaration_digest"] = spec_part["declaration_digest"]
+    entry["sha256"] = b.sha256
+    entry["sha256_code"] = b.sha256_code
+    if b.spec.binary is None:
+        entry["toolchain"] = {"triton": b.triton_version, "ptxas": b.ptxas_version}
+    else:  # a prebuilt PTX is assembled by ptxas (recorded, with its flags); a cubin is used as it is
+        entry["toolchain"] = {"ptxas": b.ptxas_version} if b.ptxas_version else {}
+        assert b.binary_build is not None
+        entry["binary"] = json.loads(json.dumps(b.binary_build))
     if "source_sha256" in spec_part:
         entry["source_sha256"] = spec_part["source_sha256"]
     if b.ir_digest is not None:  # the digest of the Triton IR the binary was compiled from (the field and its kind, so a reader of schema 2 reads it as before)
         entry["source_digest"] = b.ir_digest
         entry["source_digest_kind"] = IR_DIGEST_KIND
+    elif b.binary_digest is not None:  # the digest of the PTX or cubin bytes a prebuilt binary is made of
+        entry["source_digest"] = b.binary_digest
+        entry["source_digest_kind"] = BINARY_DIGEST_KIND
     return entry
 
 
-def manifest_dict(built: "Iterable[BuiltKernel]") -> dict[str, Any]:
-    """The manifest as a JSON-compatible dict: one entry per kernel, in the order given."""
+def manifest_dict(built: "Iterable[BuiltKernel]", library: "Iterable[Any]" = ()) -> dict[str, Any]:
+    """The manifest as a JSON-compatible dict: one entry per kernel, in the order given, and the ``library`` entries (pinned library
+    operations such as a cuBLASLt GEMM, each a :class:`~tilefish._library.BuiltLibrary`)."""
     from . import __version__
 
     return {
         "schema": MANIFEST_SCHEMA,
         "tilefish": __version__,
         "kernels": [_kernel_entry(b) for b in built],
+        "library": [lib.entry() for lib in library],
     }
 
 
 def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
     """What makes an existing manifest entry a different binary from a new one for the same stem and arch (``None``: the same)."""
-    for key in ("sha256_code", "declaration_digest", "source_sha256", "source_digest", "options", "shared"):
+    for key in ("sha256_code", "declaration_digest", "source_sha256", "source_digest", "options", "shared", "algo", "cublaslt_version", "workspace_bytes"):
         if old.get(key) != new.get(key):
             return key
     return None
@@ -756,8 +808,12 @@ def write_manifest(
     cubins: bool = False,
     merge: bool = False,
     overwrite: bool = False,
+    library: "Iterable[Any]" = (),
 ) -> pathlib.Path:
     """Write the manifest of built kernels as strict JSON to ``path`` and return it.
+
+    ``library`` is the built library operations (a :class:`~tilefish._library.BuiltLibrary` each: a pinned cuBLASLt GEMM): their entries
+    go in the manifest's ``library`` section, which has no files.
 
     For each kernel: ``stem``, ``symbol``, ``abi`` (``params`` in launch order, then the two ``scratch`` slots; a pointer
     records its declared ``shape``, a list of dimension expressions and sizes such as ``["Rows", 1024]``), ``dims`` (for each
@@ -782,7 +838,7 @@ def write_manifest(
     entry that is a *different* binary (other machine code, declaration, source, options or shared memory) is not
     replaced unless ``overwrite=True``; a merge into a manifest that does not verify is an error.
     """
-    return write_manifest_doc(built, path, cubins=cubins, merge=merge, overwrite=overwrite)[0]
+    return write_manifest_doc(built, path, cubins=cubins, merge=merge, overwrite=overwrite, library=library)[0]
 
 
 def write_manifest_doc(
@@ -792,13 +848,17 @@ def write_manifest_doc(
     cubins: bool = False,
     merge: bool = False,
     overwrite: bool = False,
+    library: "Iterable[Any]" = (),
 ) -> "tuple[pathlib.Path, dict[str, Any]]":
     """:func:`write_manifest`, returning the path and the manifest document that was written (what ``export`` checks the directory against)."""
     entries = list(built)
-    doc = manifest_dict(entries)
+    doc = manifest_dict(entries, library)
     keys = [(e["stem"], e["arch"]) for e in doc["kernels"]]
     if len(set(keys)) != len(keys):
         raise TilefishBuildError("a manifest needs one build per (stem, arch); some appear twice")
+    lib_keys = [(e["stem"], e["arch"]) for e in doc["library"]]
+    if len(set(lib_keys)) != len(lib_keys) or set(lib_keys) & set(keys):
+        raise TilefishBuildError("a manifest needs one build per (stem, arch), kernels and library entries together; some appear twice")
     path = pathlib.Path(path)
     refuse_symlink(path)
     targets = [b.cubin_path(path.parent) for b in entries] if cubins else []  # every name is checked before a byte is written
@@ -822,6 +882,22 @@ def write_manifest_doc(
                 )
             kept.append(new)
         doc["kernels"] = kept + list(new_by_key.values())
+        new_lib = dict(zip(lib_keys, doc["library"]))
+        kept_lib: list[dict[str, Any]] = []
+        for old in existing.doc["library"]:
+            key = (old["stem"], old["arch"])
+            new = new_lib.pop(key, None)
+            if new is None:
+                kept_lib.append(old)
+                continue
+            why = _conflicts(old, new)
+            if why is not None and not overwrite:
+                raise TilefishManifestError(
+                    f"the manifest {str(path)!r} already has a different library entry for '{key[0]}' on {key[1]} ({why} differs); "
+                    "pass overwrite=True to replace it"
+                )
+            kept_lib.append(new)
+        doc["library"] = kept_lib + list(new_lib.values())
     path.parent.mkdir(parents=True, exist_ok=True)
     for b, target in zip(entries, targets):
         write_file(target, b.cubin)

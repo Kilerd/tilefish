@@ -1,0 +1,44 @@
+//
+// out[i] = alpha * x[i] + y[i] for i < n: a kernel written by hand for the tests of prebuilt PTX (nothing generated it).
+// C ABI: (const float* x, const float* y, float* out, int n, float alpha). No Triton scratch slots.
+//
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry axpy_f32(
+	.param .u64 x,
+	.param .u64 y,
+	.param .u64 out,
+	.param .u32 n,
+	.param .f32 alpha
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .b32 	%r<6>;
+	.reg .f32 	%f<5>;
+	.reg .b64 	%rd<10>;
+
+	ld.param.u64 	%rd1, [x];
+	ld.param.u64 	%rd2, [y];
+	ld.param.u64 	%rd3, [out];
+	ld.param.u32 	%r1, [n];
+	ld.param.f32 	%f1, [alpha];
+	mov.u32 	%r2, %ctaid.x;
+	mov.u32 	%r3, %ntid.x;
+	mov.u32 	%r4, %tid.x;
+	mad.lo.s32 	%r5, %r2, %r3, %r4;
+	setp.ge.s32 	%p1, %r5, %r1;
+	@%p1 bra 	DONE;
+	cvt.s64.s32 	%rd4, %r5;
+	shl.b64 	%rd5, %rd4, 2;
+	add.s64 	%rd6, %rd1, %rd5;
+	add.s64 	%rd7, %rd2, %rd5;
+	add.s64 	%rd8, %rd3, %rd5;
+	ld.global.f32 	%f2, [%rd6];
+	ld.global.f32 	%f3, [%rd7];
+	fma.rn.f32 	%f4, %f1, %f2, %f3;
+	st.global.f32 	[%rd8], %f4;
+DONE:
+	ret;
+}

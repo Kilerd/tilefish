@@ -269,9 +269,9 @@ class Value:
         if name.startswith("_"):  # protocol probing (copy, pickle, ...) must see a plain AttributeError
             raise AttributeError(name)
         raise TilefishAttributeError(
-            f"traced tensor {self.ref} ({self.type}) has no attribute '{name}': in M1 a tensor has "
-            ".shape, .dtype, .rank, .to(dtype), .split(size, axis), .sum/.mean/.max(axis, keepdims) "
-            "and the operators + - * /"
+            f"traced tensor {self.ref} ({self.type}) has no attribute '{name}': a tensor has "
+            ".shape, .dtype, .rank, .to(dtype), .split(size, axis), the views .reshape(*dims), .permute(*axes), .select(axis, i) "
+            "and x[i], .sum/.mean/.max(axis, keepdims) and the operators + - * /"
         )
 
     # -- methods ------------------------------------------------------------
@@ -291,6 +291,24 @@ class Value:
         if size is _MISSING or axis is _MISSING:
             raise TilefishTypeError("split: needs a size and an axis, e.g. x.split(size, axis=-1)")
         return ops.split(self, size, axis)
+
+    def reshape(self, *dims: Any) -> "Value":
+        """A view of the same elements in another shape (a dense tensor only); see :func:`tilefish.ops.reshape`."""
+        from . import ops
+
+        return ops.reshape(self, *dims)
+
+    def permute(self, *axes: Any) -> "Value":
+        """A view with the axes in another order, nothing copied; see :func:`tilefish.ops.permute`."""
+        from . import ops
+
+        return ops.permute(self, *axes)
+
+    def select(self, axis: Any, index: Any) -> "Value":
+        """A view without ``axis``: the slice at an integer ``index``; ``x[i]`` is ``x.select(0, i)``."""
+        from . import ops
+
+        return ops.select(self, axis, index)
 
     def sum(self, axis: Any = None, keepdims: bool = False) -> "Value":
         from . import ops
@@ -354,8 +372,10 @@ class Value:
 
         ops.store(self, key, value)
 
-    def __getitem__(self, key: Any) -> Any:
-        raise TilefishTypeError(f"indexing {self.ref} is not supported (use .split(size, axis) to take pieces)")
+    def __getitem__(self, key: Any) -> "Value":
+        from . import ops
+
+        return ops.getitem(self, key)
 
     def __iter__(self) -> Any:
         raise TilefishTypeError(

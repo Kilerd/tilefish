@@ -13,7 +13,10 @@ folded with the dimension algebra, so a static entry below 1 is rejected, as
 This checks that a spec is well formed and consistent with itself, not that it
 is the spec of any declaration: for that, ``CompileSpec.verify_against(op)``
 regenerates it. Schema 1 documents are still read; schema 2 adds the
-``declaration_digest`` and the constexpr ``dtype``.
+``declaration_digest`` and the constexpr ``dtype``; schema 3 adds what a strided view, a device scalar and a prebuilt binary
+need (``strides``, ``offset`` and ``stride_of`` on arguments, 64-bit scalars, the ``max_extent`` precondition, a pointer
+alignment below 16 bytes for a pointer that is only element aligned, and the ``binary`` section of a spec that is not
+compiled by Triton). Every new field is accepted from schema 3 only.
 """
 
 from __future__ import annotations
@@ -26,9 +29,11 @@ from .dims import Dim, DimExpr, cdiv
 from .dtypes import ALL_DTYPES
 from .errors import TilefishError, TilefishSpecError
 
-SCHEMA_VERSION = 2  # what to_dict writes: schema 1 plus constexpr dtypes and the declaration digest
+SCHEMA_VERSION = 3  # what to_dict writes: schema 2 plus strides, offsets, 64-bit scalars and prebuilt binaries
 LEGACY_SCHEMA = 1  # still read, but such a spec has no declaration digest and cannot be verified
-SCHEMAS = (LEGACY_SCHEMA, SCHEMA_VERSION)
+DIGEST_SCHEMA = 2  # the first schema with the declaration digest, constexpr dtypes, ``max_elements`` and ``dims``
+STRIDED_SCHEMA = 3  # the first schema with strided views, device scalars and prebuilt binaries
+SCHEMAS = (LEGACY_SCHEMA, DIGEST_SCHEMA, SCHEMA_VERSION)
 ALIGNMENT = 16
 NUM_WARPS = (1, 2, 4, 8, 16, 32)
 MAX_STAGES = 16
@@ -54,6 +59,7 @@ PRE_FIELDS = {
     "static_size": {"arg", "index", "axis", "value"},
     "bucket": {"dim", "value", "buckets"},
     "max_elements": {"arg", "index", "shape", "value"},  # schema 2; a kernel that indexes with i32: every generated one, and every extern that does not say index_bits=64
+    "max_extent": {"arg", "index", "value"},  # schema 3; the same for a strided pointer: the largest element offset it reaches
 }
 MAX_ELEMENTS = 2**31 - 1  # the limit of i32 offsets, the only bound a max_elements precondition may carry
 
@@ -325,28 +331,64 @@ def validate_precondition(d: Any) -> None:
             bad(f"bucket precondition buckets must be a sorted list of distinct positive ints, got {b!r}")
 
 
+SCALAR_TYPES = ("i32", "i64", "f32")  # the C types of a scalar argument of a prebuilt binary (a runtime scalar is i32 or i64)
+
+
+def _layout_entry(entry: Any, where: str) -> None:
+    """One stride or the offset of a strided pointer: a size (an int from 0) or a dimension expression."""
+    if is_int(entry):
+        if entry < 0:
+            bad(f"{where} must not be negative, got {entry}")
+    elif isinstance(entry, str):
+        parse_expression(entry, where)
+    else:
+        bad(f"{where} must be an int or a dimension expression, got {entry!r}")
+
+
 def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
-    """Check one serialized argument. From schema 2 on a constexpr may carry its declared ``dtype``."""
-    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "shape_dims", "dim", "value", "count_of"])
+    """Check one serialized argument. From schema 2 on a constexpr may carry its declared ``dtype``; from schema 3 a pointer
+    may be strided (``strides`` and ``offset``), a scalar may carry a stride (``stride_of``) and be 64-bit, and a prebuilt
+    binary has ``fixed`` arguments (a value written in the manifest)."""
+    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "shape_dims", "dim", "value", "count_of", "strides", "offset", "stride_of"])
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
     kind, ty = d["kind"], d["type"]
-    if kind not in ("pointer", "scalar", "constexpr") or not isinstance(ty, str):
-        bad(f"arg {d['name']}: kind must be pointer, scalar or constexpr and type a string, got {kind!r}, {ty!r}")
+    kinds = ("pointer", "scalar", "constexpr") + (("fixed",) if schema >= STRIDED_SCHEMA else ())
+    if kind not in kinds or not isinstance(ty, str):
+        bad(f"arg {d['name']}: kind must be {', '.join(kinds)} and type a string, got {kind!r}, {ty!r}")
     present = set(d) - {"index", "name", "kind", "type"}
     expected = {
         "pointer": {"access", "dtype", "shape"},
         "scalar": {"dtype", "dim"},
         "constexpr": {"value"},
+        "fixed": {"dtype", "value"},
     }[kind]
-    optional = {"dtype"} if kind == "constexpr" and schema >= SCHEMA_VERSION else set()
-    if kind == "scalar" and schema >= SCHEMA_VERSION:
+    optional: "set[str]" = set()
+    if kind == "constexpr" and schema >= DIGEST_SCHEMA:
+        optional = {"dtype"}
+    if kind == "scalar" and schema >= DIGEST_SCHEMA:
         optional = {"count_of"}  # the pointer argument whose element count this scalar carries
-    if kind == "pointer" and schema >= SCHEMA_VERSION:
+        if schema >= STRIDED_SCHEMA:
+            optional = {"count_of", "stride_of"}  # or the pointer argument whose stride along an axis it carries
+    if kind == "pointer" and schema >= DIGEST_SCHEMA:
         optional = {"shape_dims"}  # the declared shape: what a host binds the dimensions from
+        if schema >= STRIDED_SCHEMA:
+            optional = {"shape_dims", "strides", "offset"}  # a pointer that accepts a strided view
     if not expected <= present <= expected | optional:
         bad(f"arg {d['name']} ({kind}) must have exactly the fields {sorted(expected)}, has {sorted(present)}")
-    if kind == "pointer":
+    if ("strides" in d) != ("offset" in d):
+        bad(f"arg {d['name']}: strides and offset come together")
+    if kind == "fixed":
+        if ty not in SCALAR_TYPES or d["dtype"] != ty:
+            bad(f"arg {d['name']}: a fixed argument is one of {SCALAR_TYPES}, got {ty!r}/{d['dtype']!r}")
+        value = decode_scalar(d["value"], f"arg {d['name']} value")
+        if isinstance(value, bool) or (ty == "f32") != isinstance(value, float):
+            bad(f"arg {d['name']}: the value of a fixed {ty} argument must be {'a float' if ty == 'f32' else 'an int'}, got {d['value']!r}")
+        if ty != "f32":
+            lo, hi = (-(1 << 31), (1 << 31) - 1) if ty == "i32" else (-(1 << 63), (1 << 63) - 1)
+            if not lo <= value <= hi:
+                bad(f"arg {d['name']}: the value {value} does not fit {ty}")
+    elif kind == "pointer":
         dtype = ALL_DTYPES.get(d["dtype"]) if isinstance(d["dtype"], str) else None
         if ty not in POINTER_TYPES or dtype is None or dtype.triton_ptr != ty:
             bad(f"arg {d['name']}: pointer type {ty!r} does not match dtype {d['dtype']!r}")
@@ -368,18 +410,90 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
                     parse_expression(entry, f"arg {d['name']} shape_dims[{i}]")
                 else:
                     bad(f"arg {d['name']}: shape_dims[{i}] must be an int size or a dimension expression, got {entry!r}")
+        if "strides" in d:
+            strides = d["strides"]
+            if not isinstance(strides, list) or len(strides) != len(d["shape"]) or not strides:
+                bad(f"arg {d['name']}: strides must be a list with one entry per axis of shape (at least one axis)")
+            for i, entry in enumerate(strides):
+                _layout_entry(entry, f"arg {d['name']} strides[{i}]")
+            _layout_entry(d["offset"], f"arg {d['name']} offset")
     elif kind == "scalar":
-        if ty != "i32" or d["dtype"] != "i32":
-            bad(f"arg {d['name']}: a runtime scalar must be i32, got {ty!r}/{d['dtype']!r}")
+        allowed = ("i32", "i64") if schema >= STRIDED_SCHEMA else ("i32",)
+        if ty not in allowed or d["dtype"] != ty:
+            bad(f"arg {d['name']}: a runtime scalar must be {' or '.join(allowed)}, got {ty!r}/{d['dtype']!r}")
         parse_expression(d["dim"], f"arg {d['name']} dim")
         if "count_of" in d:
             _ident(d["count_of"], f"arg {d['name']} count_of")
+        if "stride_of" in d:
+            so = d["stride_of"]
+            _keys(so, f"arg {d['name']} stride_of", ["arg", "axis"])
+            _ident(so["arg"], f"arg {d['name']} stride_of arg")
+            _int(so["axis"], f"arg {d['name']} stride_of axis")
+            if "count_of" in d:
+                bad(f"arg {d['name']}: a scalar is the element count of a pointer or the stride of one, not both")
     else:
         if ty != "constexpr":
             bad(f"arg {d['name']}: a constexpr's type must be 'constexpr', got {ty!r}")
         decode_scalar(d["value"], f"arg {d['name']} value")
         if "dtype" in d and (not isinstance(d["dtype"], str) or d["dtype"] not in ALL_DTYPES):
             bad(f"arg {d['name']}: a constexpr's dtype must be one of {sorted(ALL_DTYPES)}, got {d['dtype']!r}")
+
+
+_SYMBOL = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*\Z")  # a PTX / ELF symbol of a kernel
+_ARCH_KEY = re.compile(r"^sm_[0-9]{2,3}\Z")
+
+
+def validate_binary(b: Any) -> None:
+    """The ``binary`` section of a spec of a prebuilt (non-Triton) kernel: ``kind``, ``symbol``, dynamic ``shared`` memory and the sha256 of the source."""
+    _keys(b, "binary", ["kind", "symbol", "shared", "digests"])
+    if b["kind"] not in ("ptx", "cubin"):
+        bad(f"binary kind must be 'ptx' or 'cubin', got {b['kind']!r}")
+    if not isinstance(b["symbol"], str) or not _SYMBOL.match(b["symbol"]):
+        bad(f"binary symbol must be a kernel symbol, got {b['symbol']!r}")
+    _int(b["shared"], "binary shared")
+    digests = b["digests"]
+    if not isinstance(digests, dict) or not digests:
+        bad("binary digests must be a non-empty object")
+    for k, v in digests.items():
+        if not (isinstance(v, str) and _DIGEST.match(v)):
+            bad(f"binary digest of {k!r} must be 64 lowercase hex digits (a sha256), got {v!r}")
+        if b["kind"] == "cubin" and not _ARCH_KEY.match(str(k)):
+            bad(f"a cubin's digests are keyed by architecture ('sm_103'), got {k!r}")
+    if b["kind"] == "ptx" and set(digests) != {"ptx"}:
+        bad(f"a ptx binary has one digest, keyed 'ptx', got {sorted(digests)}")
+
+
+def _check_strides(args: "list[dict]", by_name: "dict[str, dict]") -> None:
+    """A scalar's ``stride_of`` and the ``strides`` of the pointer it names must say the same thing, axis by axis."""
+    carried: "dict[tuple[str, int], str]" = {}
+    for a in args:
+        if a["kind"] != "scalar" or "stride_of" not in a:
+            continue
+        so = a["stride_of"]
+        target = by_name.get(so["arg"])
+        if target is None or target["kind"] != "pointer" or "strides" not in target:
+            bad(f"arg {a['name']} is the stride of '{so['arg']}', which is not a strided pointer argument")
+        if so["axis"] >= len(target["strides"]):
+            bad(f"arg {a['name']} is the stride of axis {so['axis']} of '{so['arg']}', which has {len(target['strides'])} axes")
+        if target["strides"][so["axis"]] != a["dim"]:
+            bad(
+                f"arg {a['name']} carries {a['dim']!r} as the stride of axis {so['axis']} of '{so['arg']}', "
+                f"but the strides of that pointer say {target['strides'][so['axis']]!r}"
+            )
+        if (so["arg"], so["axis"]) in carried:
+            bad(f"axis {so['axis']} of '{so['arg']}' has two stride scalars ({carried[(so['arg'], so['axis'])]} and {a['name']})")
+        carried[(so["arg"], so["axis"])] = a["name"]
+    for a in args:
+        if a["kind"] == "pointer" and "strides" in a:
+            for axis, entry in enumerate(a["strides"]):
+                if isinstance(entry, str) and (a["name"], axis) not in carried:
+                    bad(f"the stride {entry!r} of axis {axis} of '{a['name']}' is carried by no scalar argument (stride_of)")
+                if is_int(entry) and entry != 1:  # the only fixed stride is the unit stride of the last axis, which a kernel loads along
+                    bad(f"the stride of axis {axis} of '{a['name']}' is the fixed size {entry}: a fixed stride is 1 (and only on the last axis)")
+                if is_int(entry) and axis != len(a["strides"]) - 1:
+                    bad(f"the stride of axis {axis} of '{a['name']}' is fixed, but only the last axis may be")
+            if not isinstance(a["offset"], str):
+                bad(f"the offset of '{a['name']}' must be the name of the offset dimension, got {a['offset']!r}")
 
 
 def validate_launch_param(d: Any) -> None:
@@ -398,14 +512,21 @@ def validate_spec(d: Any) -> None:
     schema = d.get("schema")
     if not is_int(schema) or schema not in SCHEMAS:
         raise TilefishSpecError(
-            f"unsupported compile spec schema {schema!r} (this version reads schemas {LEGACY_SCHEMA} and {SCHEMA_VERSION})"
+            f"unsupported compile spec schema {schema!r} (this version reads schemas {', '.join(map(str, SCHEMAS))})"
         )
-    # enable_fp_fusion and source_sha256 exist in schema 2 only, and only in the specs of kernels that tilefish generated
-    optional = ["enable_fp_fusion", "source_sha256", "dims"] if schema >= SCHEMA_VERSION else []
-    _keys(d, "spec", TOP_KEYS_V2 if schema >= SCHEMA_VERSION else TOP_KEYS, optional)
+    # a prebuilt binary (schema 3) has a ``binary`` section where a Triton kernel has the reference of its function, its warps and stages
+    binary = d.get("binary") if schema >= STRIDED_SCHEMA else None
+    is_binary = binary is not None
+    # enable_fp_fusion and source_sha256 exist from schema 2 on, and only in the specs of kernels that tilefish generated
+    optional = ["enable_fp_fusion", "source_sha256", "dims"] if schema >= DIGEST_SCHEMA else []
+    required = TOP_KEYS_V2 if schema >= DIGEST_SCHEMA else TOP_KEYS
+    if is_binary:
+        required = [k for k in required if k not in ("triton", "num_warps", "num_stages")] + ["binary"]
+        optional = ["dims"]
+    _keys(d, "spec", required, optional)
     if "source_sha256" in d and not (isinstance(d["source_sha256"], str) and _DIGEST.match(d["source_sha256"])):
         bad(f"source_sha256 must be 64 lowercase hex digits (a sha256), got {d['source_sha256']!r}")
-    if schema >= SCHEMA_VERSION and not (isinstance(d["declaration_digest"], str) and _DIGEST.match(d["declaration_digest"])):
+    if schema >= DIGEST_SCHEMA and not (isinstance(d["declaration_digest"], str) and _DIGEST.match(d["declaration_digest"])):
         bad(f"declaration_digest must be 64 lowercase hex digits (a sha256), got {d['declaration_digest']!r}")
     if "enable_fp_fusion" in d and not isinstance(d["enable_fp_fusion"], bool):
         bad(f"enable_fp_fusion must be true or false, got {d['enable_fp_fusion']!r}")
@@ -415,13 +536,16 @@ def validate_spec(d: Any) -> None:
     stem = d["stem"]
     if not isinstance(stem, str) or not _STEM.match(stem):
         bad(f"stem must look like 'op' or 'op.S32', got {stem!r}")
-    t = d["triton"]
-    _keys(t, "triton", ["module", "function", "ref"])
-    m = _REF.match(t["ref"]) if isinstance(t["ref"], str) else None
-    if not m:
-        bad(f"triton ref must look like 'module.path:function', got {t['ref']!r}")
-    if (t["module"], t["function"]) != (m.group(1), m.group(2)):
-        bad("triton module and function do not match the ref")
+    if is_binary:
+        validate_binary(binary)
+    else:
+        t = d["triton"]
+        _keys(t, "triton", ["module", "function", "ref"])
+        m = _REF.match(t["ref"]) if isinstance(t["ref"], str) else None
+        if not m:
+            bad(f"triton ref must look like 'module.path:function', got {t['ref']!r}")
+        if (t["module"], t["function"]) != (m.group(1), m.group(2)):
+            bad("triton module and function do not match the ref")
 
     # buckets and stem
     buckets = d["buckets"]
@@ -446,6 +570,12 @@ def validate_spec(d: Any) -> None:
         names.append(a["name"])
         for expr in (a["shape"] if a["kind"] == "pointer" else [a["dim"]] if a["kind"] == "scalar" else []):
             dims |= parse_expression(expr, f"arg {a['name']} dimension")
+        if a["kind"] == "pointer" and "strides" in a:
+            for entry in (*a["strides"], a["offset"]):
+                if isinstance(entry, str):
+                    dims |= parse_expression(entry, f"arg {a['name']} layout")
+        if is_binary and a["kind"] == "constexpr":
+            bad(f"arg {a['name']}: a prebuilt binary has no constexprs")
     if len(set(names)) != len(names):
         bad("argument names must be unique")
     by_name = {a["name"]: a for a in args}
@@ -457,6 +587,8 @@ def validate_spec(d: Any) -> None:
     for a in scalars:
         if "count_of" in a:
             _check_count_of(a, by_name)
+    # a scalar that carries a stride, and the strided pointer that says so: the two must agree on every axis
+    _check_strides(args, by_name)
 
     # signature <=> args
     sig = d["signature"]
@@ -483,14 +615,17 @@ def validate_spec(d: Any) -> None:
     if not isinstance(pres, list):
         bad("preconditions must be a list")
     aligned: set[int] = set()
+    attr_pointers: set[int] = set()  # the pointers promised 16-byte alignment: a Triton kernel gets tt.divisibility on exactly these
     divisible: set[int] = set()
     limited: set[int] = set()
     bucket_pres: dict[str, int] = {}
     for p in pres:
         validate_precondition(p)
         kind = p["kind"]
-        if kind == "max_elements" and schema < SCHEMA_VERSION:
-            bad(f"a max_elements precondition needs schema {SCHEMA_VERSION}, this spec is schema {schema}")
+        if kind == "max_elements" and schema < DIGEST_SCHEMA:
+            bad(f"a max_elements precondition needs schema {DIGEST_SCHEMA}, this spec is schema {schema}")
+        if kind == "max_extent" and schema < STRIDED_SCHEMA:
+            bad(f"a max_extent precondition needs schema {STRIDED_SCHEMA}, this spec is schema {schema}")
         if kind == "bucket":
             if p["dim"] in bucket_pres or buckets.get(p["dim"]) != p["value"] or p["value"] not in p["buckets"]:
                 bad(f"bucket precondition for {p['dim']} disagrees with the spec's buckets")
@@ -500,17 +635,29 @@ def validate_spec(d: Any) -> None:
         if a is None or a["index"] != p["index"]:
             bad(f"{kind} precondition refers to {p['arg']}@{p['index']}, which is not an argument")
         if kind == "pointer_alignment":
-            if a["kind"] != "pointer" or p["bytes"] != ALIGNMENT or p["index"] in aligned:
+            if a["kind"] != "pointer" or p["index"] in aligned:
+                bad(f"pointer_alignment must be {ALIGNMENT} bytes, once, on a pointer argument ({p['arg']})")
+            if "strides" in a:  # a strided pointer is 16-byte aligned only when its declaration says so, else aligned to its element
+                itemsize = max(1, ALL_DTYPES[a["dtype"]].bits // 8)
+                if p["bytes"] not in (ALIGNMENT, itemsize):
+                    bad(f"pointer_alignment of the strided pointer {p['arg']} must be {ALIGNMENT} bytes or its element size {itemsize}, got {p['bytes']}")
+            elif p["bytes"] != ALIGNMENT:
                 bad(f"pointer_alignment must be {ALIGNMENT} bytes, once, on a pointer argument ({p['arg']})")
             aligned.add(p["index"])
+            if p["bytes"] == ALIGNMENT:
+                attr_pointers.add(p["index"])
         elif kind == "divisible":
             if a["kind"] != "scalar" or p["by"] % ALIGNMENT or p["index"] in divisible or p["dim"] != a["dim"]:
                 bad(f"divisible must be by a multiple of {ALIGNMENT}, once, on a runtime scalar with its own dim ({p['arg']})")
             divisible.add(p["index"])
             dims |= parse_expression(p["dim"], "divisible dim")
         elif kind == "max_elements":
-            if a["kind"] != "pointer" or p["index"] in limited or p["shape"] != a["shape"]:
-                bad(f"max_elements must be once, on a pointer argument, with that argument's own shape ({p['arg']})")
+            if a["kind"] != "pointer" or p["index"] in limited or p["shape"] != a["shape"] or "strides" in a:
+                bad(f"max_elements must be once, on a dense pointer argument, with that argument's own shape ({p['arg']})")
+            limited.add(p["index"])
+        elif kind == "max_extent":
+            if a["kind"] != "pointer" or p["index"] in limited or "strides" not in a or p["value"] != MAX_ELEMENTS:
+                bad(f"max_extent must be once, on a strided pointer argument, with the value {MAX_ELEMENTS} ({p['arg']})")
             limited.add(p["index"])
         else:  # static_size
             if a["kind"] != "pointer" or p["axis"] >= len(a["shape"]) or a["shape"][p["axis"]] != str(p["value"]):
@@ -541,27 +688,37 @@ def validate_spec(d: Any) -> None:
         ):
             bad(f"attrs at {k} must be exactly [['tt.divisibility', {ALIGNMENT}]]")
         attr_index.add(int(k))
-    if attr_index != aligned | divisible:
-        bad("attrs must be at exactly the pointer arguments and the runtime scalars with a divisible precondition")
+    if is_binary:
+        if attrs:
+            bad("a prebuilt binary has no Triton attributes: attrs must be empty")
+    elif attr_index != attr_pointers | divisible:
+        bad("attrs must be at exactly the pointer arguments promised 16-byte alignment and the runtime scalars with a divisible precondition")
 
     # launch settings
-    nw, ns = d["num_warps"], d["num_stages"]
-    if not is_int(nw) or nw not in NUM_WARPS:
-        bad(f"num_warps must be one of {NUM_WARPS}, got {nw!r}")
-    if not is_int(ns) or not 1 <= ns <= MAX_STAGES:
-        bad(f"num_stages must be an int from 1 to {MAX_STAGES}, got {ns!r}")
     block = d["block"]
-    if not isinstance(block, list) or block != [32 * nw, 1, 1] or not all(is_int(x) for x in block):
-        bad(f"block must be [32 * num_warps, 1, 1] = {[32 * nw, 1, 1]}, got {block!r}")
+    if is_binary:
+        if not isinstance(block, list) or len(block) != 3 or not all(is_int(x) and 1 <= x <= 1024 for x in block) or math.prod(block) > 1024:
+            bad(f"block must be three sizes from 1 to 1024 whose product is at most 1024, got {block!r}")
+        expected_lp = [{"name": a["name"], "type": a["type"]} for a in args]  # every argument, and no Triton scratch slots
+        why = "launch_params must be every arg in order (a prebuilt binary has no scratch slots)"
+    else:
+        nw, ns = d["num_warps"], d["num_stages"]
+        if not is_int(nw) or nw not in NUM_WARPS:
+            bad(f"num_warps must be one of {NUM_WARPS}, got {nw!r}")
+        if not is_int(ns) or not 1 <= ns <= MAX_STAGES:
+            bad(f"num_stages must be an int from 1 to {MAX_STAGES}, got {ns!r}")
+        if not isinstance(block, list) or block != [32 * nw, 1, 1] or not all(is_int(x) for x in block):
+            bad(f"block must be [32 * num_warps, 1, 1] = {[32 * nw, 1, 1]}, got {block!r}")
+        expected_lp = [{"name": a["name"], "type": a["type"]} for a in args if a["kind"] != "constexpr"]
+        expected_lp += [{"name": n, "type": t, "value": v} for n, t, v in SCRATCH]
+        why = "launch_params must be the non-constexpr args in order followed by the two zero scratch slots"
     lp = d["launch_params"]
     if not isinstance(lp, list):
         bad("launch_params must be a list")
     for p in lp:
         validate_launch_param(p)
-    expected_lp = [{"name": a["name"], "type": a["type"]} for a in args if a["kind"] != "constexpr"]
-    expected_lp += [{"name": n, "type": t, "value": v} for n, t, v in SCRATCH]
     if lp != expected_lp:
-        bad("launch_params must be the non-constexpr args in order followed by the two zero scratch slots")
+        bad(why)
 
     # the grid: restricted grammar, only this spec's dimensions
     grid_ids = parse_grid(d["grid"])
@@ -593,6 +750,10 @@ def validate_spec(d: Any) -> None:
             for entry in a.get("shape_dims", ()):
                 if isinstance(entry, str):
                     used |= parse_expression(entry, "shape_dims")
+            if a["kind"] == "pointer" and "strides" in a:
+                for entry in (*a["strides"], a["offset"]):
+                    if isinstance(entry, str):
+                        used |= parse_expression(entry, "layout")
             if a["kind"] == "scalar":
                 used |= parse_expression(a["dim"], "scalar dim")
         missing = sorted(used - set(table))

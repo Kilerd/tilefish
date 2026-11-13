@@ -46,10 +46,37 @@ def pinned(manifest):
     return manifest.check_pin(manifest.digest)
 
 
+_migrated: "dict[str, pathlib.Path]" = {}
+
+
+def migrated_fixture(name="sm_103"):
+    """A copy of a fixture of the crate with its manifest migrated from schema 2 (what the crate reads) to schema 3 (what Python reads)."""
+    import atexit
+    import tempfile
+
+    from schema2_fixtures import migrated_copy
+
+    if name not in _migrated:
+        root = pathlib.Path(tempfile.mkdtemp(prefix="tilefish-fixture-"))
+        atexit.register(shutil.rmtree, root, True)
+        migrated_copy(FIXTURES / name, root / name)
+        _migrated[name] = root / name
+    return _migrated[name]
+
+
+def schema2_digest(name="sm_103"):
+    """The digest of the schema 2 manifest of a fixture, the one ``expected.json`` (which the Rust tests check) holds: computed by Python."""
+    from tilefish._manifest import manifest_digest
+
+    doc = json.loads((FIXTURES / name / "manifest.json").read_text())
+    assert manifest_digest(doc) == json.loads((FIXTURES / "expected.json").read_text())["fixtures"][name]["manifest_digest"]
+    return manifest_digest(doc)
+
+
 def fixture(name="sm_103"):
-    """A fixture of the crate, pinned to the digest ``expected.json`` (which the Rust tests check as well) holds for it."""
-    digest = json.loads((FIXTURES / "expected.json").read_text())["fixtures"][name]["manifest_digest"]
-    return Manifest.load(FIXTURES / name, pin=digest)
+    """A fixture of the crate, migrated to schema 3 and pinned to its own digest (the schema 2 digest is checked by its own test)."""
+    manifest = Manifest.load(migrated_fixture(name))
+    return manifest.check_pin(manifest.digest)
 
 
 @pytest.fixture
@@ -198,8 +225,11 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect():
     expected = json.loads((FIXTURES / "expected.json").read_text())["fixtures"]
     assert sorted(expected) == ["sm_103", "sm_120"]
     for name, want in expected.items():
-        manifest = Manifest.load(FIXTURES / name)  # verifies every cubin against the manifest
-        assert manifest.digest == want["manifest_digest"], name
+        assert schema2_digest(name) == want["manifest_digest"], name  # the digest of the schema 2 document, as Rust computes it
+        with pytest.raises(TilefishManifestError, match="schema 2, which an older tilefish wrote.*Re-export it"):
+            Manifest.load(FIXTURES / name)  # Python reads schema 3 only
+        manifest = Manifest.load(migrated_fixture(name))  # verifies every cubin against the manifest
+        assert manifest.digest != want["manifest_digest"]  # schema 3 has its own digest (tag v3, and the library section)
         assert len(manifest.artifacts) == len(want["kernels"]) == 12
         for k in want["kernels"]:
             artifact = manifest.get(k["stem"], k["arch"])
@@ -214,6 +244,9 @@ def test_the_committed_launchers_are_what_the_emitter_writes_for_the_fixture():
 
     manifest = fixture()
     emitted = rust.render(manifest, ops=host_ops.ops().values())
+    # the committed file embeds the schema 2 digest; the emitter now writes the schema 3 digest of the same manifest, and nothing else differs
+    assert emitted.count(manifest.digest) == 2 and (FIXTURES / "generated.rs").read_text().count(schema2_digest()) == 2
+    emitted = emitted.replace(manifest.digest, schema2_digest())
     assert emitted == (FIXTURES / "generated.rs").read_text(), (
         "crates/tilefish/tests/fixtures/generated.rs is not what tilefish.hosts.rust.emit writes for the sm_103 fixture: "
         "regenerate it with python/tests/export_rust_fixtures.py (or, if only the emitter changed, with emit)"
@@ -297,9 +330,10 @@ def _mutations():
         ("NaN", lambda d: text(d, lambda t: t.replace('"shared": 16', '"shared": NaN', 1))),
         ("Infinity", lambda d: text(d, lambda t: t.replace('"shared": 16', '"shared": Infinity', 1))),
         ("1e999", lambda d: text(d, lambda t: t.replace('"num_stages": 3', '"num_stages": 1e999', 1))),
-        ("a trailing comma", lambda d: text(d, lambda t: t.replace('"schema": 2,', '"schema": 2,,', 1))),
-        ("another schema", lambda d: text(d, lambda t: t.replace('"schema": 2,', '"schema": 3,', 1))),
-        ("the schema before the one with shapes", lambda d: text(d, lambda t: t.replace('"schema": 2,', '"schema": 1,', 1))),
+        ("a trailing comma", lambda d: text(d, lambda t: t.replace('"schema": 3,', '"schema": 3,,', 1))),
+        ("another schema", lambda d: text(d, lambda t: t.replace('"schema": 3,', '"schema": 4,', 1))),
+        ("the schema before the one with shapes", lambda d: text(d, lambda t: t.replace('"schema": 3,', '"schema": 1,', 1))),
+        ("the schema of the Rust host", lambda d: text(d, lambda t: t.replace('"schema": 3,', '"schema": 2,', 1))),
         ("not JSON", lambda d: text(d, lambda t: "not json")),
         ("a cubin that leaves the directory", lambda d: text(d, lambda t: t.replace('"cubin": "softmax.sm_103.cubin"', '"cubin": "../sm_120/softmax.sm_120.cubin"', 1))),
         ("an absolute cubin name", lambda d: text(d, lambda t: t.replace('"cubin": "softmax.sm_103.cubin"', '"cubin": "/etc/passwd"', 1))),
@@ -315,7 +349,7 @@ def _mutations():
 @needs_crate
 @pytest.mark.parametrize("name, mutate", _mutations(), ids=[n for n, _ in _mutations()])
 def test_python_refuses_what_the_rust_tests_refuse(name, mutate, tmp_path):
-    shutil.copytree(FIXTURES / "sm_103", tmp_path / "m")
+    shutil.copytree(migrated_fixture("sm_103"), tmp_path / "m")
     mutate(tmp_path / "m")
     with pytest.raises(TilefishManifestError):
         Manifest.load(tmp_path / "m")

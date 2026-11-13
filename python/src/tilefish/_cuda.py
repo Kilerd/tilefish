@@ -28,6 +28,7 @@ import json
 import threading
 from typing import TYPE_CHECKING, Any, Sequence
 
+from ._specvalid import decode_scalar
 from .errors import TilefishRuntimeError
 
 if TYPE_CHECKING:
@@ -35,7 +36,13 @@ if TYPE_CHECKING:
 
 DEFAULT_SHARED_LIMIT = 48 * 1024  # dynamic shared memory above this needs cuFuncSetAttribute
 INT32_MIN, INT32_MAX = -(1 << 31), (1 << 31) - 1
+INT64_MIN, INT64_MAX = -(1 << 63), (1 << 63) - 1
 UINT64_MAX = (1 << 64) - 1
+
+
+def _ctype(type_: str) -> Any:
+    """The ctypes type that lays out one scalar launch parameter of C type ``i32``, ``i64`` or ``f32``."""
+    return {"i32": ctypes.c_int32, "i64": ctypes.c_int64, "f32": ctypes.c_float}[type_]
 
 _lock = threading.Lock()
 _loaded: "dict[tuple, LoadedKernel]" = {}
@@ -156,6 +163,11 @@ class LoadedKernel:
         abi = built.abi()
         self._abi = abi["params"]
 
+    @property
+    def _call_params(self) -> "list[dict[str, Any]]":
+        """The arguments a caller passes: every parameter but the ``fixed`` ones, whose value the manifest holds and the launch writes itself."""
+        return [p for p in self._abi if p["kind"] != "fixed"]
+
     def _check_params(self) -> None:
         """The loaded function must take the parameters of the manifest's ABI (count and sizes), when the driver can say."""
         drv = _driver()
@@ -178,11 +190,11 @@ class LoadedKernel:
 
     def _check_launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]") -> "tuple[int, int, int]":
         name = f"'{self.built.stem}'"
-        if len(args) != len(self._abi):
+        if len(args) != len(self._call_params):
             raise TilefishRuntimeError(
-                f"{name} takes {len(self._abi)} arguments ({', '.join(p['name'] for p in self._abi)}), got {len(args)}"
+                f"{name} takes {len(self._call_params)} arguments ({', '.join(p['name'] for p in self._call_params)}), got {len(args)}"
             )
-        for position, (param, arg) in enumerate(zip(self._abi, args)):
+        for position, (param, arg) in enumerate(zip(self._call_params, args)):
             if not isinstance(arg, tuple) or len(arg) != 2:
                 raise TilefishRuntimeError(f"{name} argument {position} ('{param['name']}') must be a (kind, value) pair, got {arg!r}")
             kind, value = arg
@@ -192,11 +204,15 @@ class LoadedKernel:
                 )
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TilefishRuntimeError(f"{name} argument {position} ('{param['name']}') must be an int, got {value!r}")
-            lo, hi = (0, UINT64_MAX) if kind == "pointer" else (INT32_MIN, INT32_MAX)
+            if kind == "pointer":
+                lo, hi, what = 0, UINT64_MAX, "64-bit address"
+            elif param["type"] == "i64":
+                lo, hi, what = INT64_MIN, INT64_MAX, "64-bit signed integer"
+            else:
+                lo, hi, what = INT32_MIN, INT32_MAX, "32-bit signed integer"
             if not lo <= value <= hi:
                 raise TilefishRuntimeError(
-                    f"{name} argument {position} ('{param['name']}') is {value}, outside the {'64-bit address' if kind == 'pointer' else '32-bit signed integer'} "
-                    f"range {lo}..{hi} the binary takes"
+                    f"{name} argument {position} ('{param['name']}') is {value}, outside the {what} range {lo}..{hi} the binary takes"
                 )
         dims = tuple(grid)
         if not 1 <= len(dims) <= 3 or any(isinstance(g, bool) or not isinstance(g, int) for g in dims):
@@ -219,9 +235,14 @@ class LoadedKernel:
         g = self._check_launch(grid, args)
         drv = _driver()
         values: list[Any] = []
-        for kind, v in args:
-            values.append(ctypes.c_uint64(v) if kind == "pointer" else ctypes.c_int32(v))
-        values += [ctypes.c_uint64(0), ctypes.c_uint64(0)]  # global_scratch, profile_scratch
+        passed = iter(args)
+        for p in self._abi:  # the manifest's order: the caller's arguments, with each fixed argument at its own slot
+            if p["kind"] == "fixed":
+                values.append(_ctype(p["type"])(decode_scalar(p["value"], f"fixed argument {p['name']}")))
+                continue
+            kind, v = next(passed)
+            values.append(ctypes.c_uint64(v) if kind == "pointer" else _ctype(p["type"])(v))
+        values += [ctypes.c_uint64(0) for _ in self.built.abi()["scratch"]]  # global_scratch, profile_scratch: a Triton kernel's; a prebuilt binary has none
         slots = (ctypes.c_void_p * len(values))(*[ctypes.addressof(v) for v in values])
         b = self.block
         _check(

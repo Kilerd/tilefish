@@ -16,6 +16,10 @@ five goldens, a bucketed row kernel over each of its buckets, the hand-written r
 inputs, writes them as raw bytes, runs ``replay`` *with a pin* and writes what it left in every tensor, outputs and
 arguments, so that a tensor that is updated in place is compared too. ``compare`` then requires the files the Rust test
 wrote to be equal, byte for byte, to those.
+
+**Manifest schema 3.** Python now writes and reads schema 3 only (``docs/manifest-schema-3.md``), and the crate 0.0.1 reads schema 2: until a
+crate that reads schema 3 exists, ``prepare`` writes manifests the Rust test cannot load (and ``--manifest`` of the committed schema 2 fixtures is
+refused by Python). The Rust lane that implements schema 3 regenerates the fixtures and runs this gate again.
 """
 
 import argparse

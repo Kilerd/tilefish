@@ -1,9 +1,15 @@
-"""Traced built-in operations: elementwise arithmetic, unary math, casts, reductions, split, store.
+"""Traced built-in operations: elementwise arithmetic, unary math, casts, reductions, views (split, reshape, permute, select), loads of a DevScalar, store.
 
 Every function here takes traced :class:`~tilefish.trace.Value` operands,
 type-checks them, appends a node to the trace and returns new ``Value``s.
 There is no implicit promotion between tensor dtypes; python scalars and
 ``const`` parameters adopt the dtype of the tensor they are combined with.
+
+The view operations (:func:`split`, :func:`reshape`, :func:`permute`, :func:`select`) copy nothing: the result is a
+:class:`~tilefish.types.TensorType` with the strides and the element offset of the view, in the dimension algebra. A view
+that is dense and provably starts on a 16-byte boundary is a contiguous tensor (it can be passed anywhere a ``Tensor[...]``
+is wanted); any other view is a ``View[...]``, and only a ``Strided[...]`` parameter of an extern takes it. A stride or an
+offset that is not an affine expression (a product of two symbolic dimensions) is unknown, and such a view is opaque.
 """
 
 from __future__ import annotations
@@ -11,12 +17,12 @@ from __future__ import annotations
 import math
 from typing import Any, Sequence
 
-from .dims import DimExpr, as_dim, cdiv, describe_pair
+from .dims import DimExpr, as_dim, cdiv, describe_pair, dim_bounds
 from .dtypes import BlockScaled, DType
 from .errors import TilefishError, TilefishTypeError
 from .ir import Scalar
 from .trace import Const, TraceContext, Value
-from .types import TensorType
+from .types import TensorType, _mul, product as _product, starts_aligned as _starts_aligned
 
 _SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 
@@ -24,15 +30,21 @@ _SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 # -- operand checking ---------------------------------------------------------
 
 
-def _require_value(op: str, label: str, x: Any) -> Value:
+def _require_value(op: str, label: str, x: Any, *, devscalar: bool = False) -> Value:
     """Check that ``x`` is a readable traced tensor and return the version a read sees now.
 
-    A parameter reads its newest version; a value that an in-place call or a store consumed cannot be read.
+    A parameter reads its newest version; a value that an in-place call or a store consumed cannot be read. A ``DevScalar``
+    (one element in device memory) is not an operand of any operation until ``tilefish.load`` has read it (``devscalar=True`` is
+    for ``load`` itself).
     """
     if not isinstance(x, Value):
         raise TilefishTypeError(f"{op}: {label} must be a traced tensor value, got {type(x).__name__} ({x!r})")
     if x.access == "out":
         raise TilefishTypeError(f"{op}: {label} reads Out parameter '{x.name}', which is write-only")
+    if x.type.devscalar and not devscalar:
+        raise TilefishTypeError(
+            f"{op}: {label} is the DevScalar {x.ref} ({x.type}), one element in device memory; read it first with tilefish.load({x.name})"
+        )
     return x._current(f"{op}: {label}")
 
 
@@ -261,9 +273,11 @@ def reduce_max(x: Value, axis: Any = None, keepdims: bool = False) -> Value:
 def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
     """Split ``axis`` into equal chunks of ``size``, or into chunks of the sizes in a list.
 
-    Splitting along a non-leading axis gives *views* (slabs at an offset with
-    the parent's strides), typed non-contiguous: they can feed traced
-    elementwise and reduction ops but cannot be passed to a declared operator.
+    The chunks are views of the parent, with their strides and offset in the type. Splitting along the leading axis (or after
+    size-1 axes) gives dense slabs: a slab that provably starts on a 16-byte boundary is a contiguous tensor and can be passed to
+    any operator, one that does not is a view. Splitting along another axis gives strided slabs (the parent's strides at an
+    offset), typed ``View[...]``: they can feed traced elementwise and reduction ops, and be passed to an extern parameter written
+    ``Strided[...]``, but not to a parameter that takes a contiguous tensor.
 
     A chunk is a value, even where its type says "view": an in-place call on a chunk (a call that takes
     it as an ``InOut`` argument) consumes that chunk and produces a new version of the chunk. It does
@@ -299,45 +313,67 @@ def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
                 f"split: axis {axis} of {x.type} has size {dim}, which is not a whole number of chunks of size {chunk}"
             )
         sizes = [chunk] * count
-    # A slab along axis ax is contiguous only when everything before that axis has size 1, and it is a
-    # contiguous *aligned* tensor only when it starts on a 16-byte boundary (the contract of every pointer).
+    if isinstance(x.dtype, BlockScaled):
+        out_types = _blockscaled_chunks(x, ax, sizes)
+    else:
+        out_types = _chunks(x, ax, sizes)
+    return x.ctx.emit("split", [x], {"axis": ax, "sizes": tuple(sizes)}, out_types)
+
+
+def _chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> "list[TensorType]":
+    """The types of the chunks of a plain tensor: the strides of the parent, and an offset that is the parent's plus the chunk's start.
+
+    A chunk starts ``(sizes before it) * (stride of the axis)`` elements in. A slab along axis ``ax`` of a dense tensor is dense
+    again only when everything before that axis has size 1 (or the axis is the first one); then its strides are the default and
+    only the offset says where it is. Any other chunk is a strided view with the parent's strides. Whether a chunk is a contiguous
+    tensor (dense and provably starting on a 16-byte boundary: the contract of every pointer) follows from its type.
+    """
+    t = x.type
+    strides = t.layout_strides()
+    dense_chunks = t.is_dense and all(d.is_static and d.value == 1 for d in x.shape[:ax])
+    out_types: list[TensorType] = []
+    before = DimExpr.const(0)
+    for s in sizes:
+        shape = list(x.shape)
+        shape[ax] = s
+        step = _mul(before, strides[ax])
+        offset = None if (t.offset is None or step is None) else t.offset + step
+        try:
+            out_types.append(
+                TensorType(
+                    shape,
+                    x.dtype,
+                    known=x.ctx.known,
+                    strides=None if dense_chunks else strides,
+                    offset=offset,
+                )
+            )
+        except TilefishError as e:
+            raise TilefishTypeError(f"split: chunk type is invalid: {e}") from None
+        before = before + s
+    return out_types
+
+
+def _blockscaled_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> "list[TensorType]":
+    """A chunk of a block-scaled tensor is contiguous only when it is a dense slab whose data *and scales* start on 16-byte boundaries.
+
+    Anything else is a view of unknown layout (data and scales are two buffers: a strided view of both is not expressed yet).
+    """
     dense = x.type.contiguous and all(d.is_static and d.value == 1 for d in x.shape[:ax])
     out_types = []
     for s in sizes:
         shape = list(x.shape)
         shape[ax] = s
         try:
-            out_types.append(TensorType(shape, x.dtype, known=x.ctx.known, contiguous=dense))
+            out_types.append(TensorType(shape, x.dtype, known=x.ctx.known, aligned=dense))
         except TilefishError as e:
             raise TilefishTypeError(f"split: chunk type is invalid: {e}") from None
     if dense:
         aligned = _aligned_chunks(x, ax, sizes)
         out_types = [t if ok else t.as_view() for t, ok in zip(out_types, aligned)]
-    return x.ctx.emit("split", [x], {"axis": ax, "sizes": tuple(sizes)}, out_types)
-
-
-def _mul(a: "DimExpr | None", b: "DimExpr | None") -> "DimExpr | None":
-    """Product of two affine dimensions, or ``None`` when it is not affine (two symbolic factors)."""
-    if a is None or b is None:
-        return None
-    try:
-        return a * b
-    except TilefishTypeError:
-        return None
-
-
-def _product(dims: "Sequence[DimExpr]") -> "DimExpr | None":
-    out: DimExpr | None = DimExpr.const(1)
-    for d in dims:
-        out = _mul(out, d)
-    return out
-
-
-def _starts_aligned(offset: "DimExpr | None", bits: int, known: Any) -> bool:
-    """Whether ``offset`` elements of ``bits`` bits provably span a multiple of 16 bytes."""
-    if offset is None:
-        return False
-    return offset.is_divisible_by(128 // math.gcd(bits, 128), known)
+    else:
+        out_types = [t.as_view() for t in out_types]
+    return out_types
 
 
 def _aligned_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> list[bool]:
@@ -368,6 +404,198 @@ def _aligned_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> list[bool]
         flags.append(ok)
         before = before + size
     return flags
+
+
+# -- views: reshape, permute, select --------------------------------------------------------
+
+
+def _viewable(op: str, x: Any) -> Value:
+    """The readable tensor a view operation takes: not block-scaled (data and scales are two buffers), not a loaded DevScalar."""
+    x = _require_value(op, "the tensor", x)
+    if isinstance(x.dtype, BlockScaled):
+        raise TilefishTypeError(
+            f"{op}: {x.ref} is {x.type} with the block-scaled dtype {x.dtype!r}; a view of a block-scaled tensor (data plus "
+            "scales) is not supported yet, only split is"
+        )
+    return x
+
+
+def _view_type(op: str, x: Value, shape: "Sequence[DimExpr]", strides: "Sequence[DimExpr | None] | None", offset: "DimExpr | None") -> TensorType:
+    try:
+        return TensorType(shape, x.dtype, known=x.ctx.known, strides=strides, offset=offset)
+    except TilefishError as e:
+        raise TilefishTypeError(f"{op}: the type of the view is invalid: {e}") from None
+
+
+def _monomial(dims: "Sequence[DimExpr]") -> "tuple[int, tuple]":
+    """A product of dimensions as ``(integer factor, sorted irreducible factors)``: two products with the same monomial are equal."""
+    factor = 1
+    atoms: list = []
+    for d in dims:
+        d = d.folded()
+        if d.is_static:
+            factor *= d.value
+            continue
+        g = math.gcd(*(abs(c) for _, c in d.terms), abs(d.offset)) if d.terms else 1
+        if g > 1 and (d.offset == 0 or d.offset % g == 0):
+            factor *= g
+            d = DimExpr._make({a: c // g for a, c in d.terms}, d.offset // g)
+        atoms.append(d._key)
+    return factor, tuple(sorted(atoms, key=repr))
+
+
+def _same_count(a: "Sequence[DimExpr]", b: "Sequence[DimExpr]") -> bool:
+    """Whether two shapes provably have the same number of elements."""
+    pa, pb = _product(a), _product(b)
+    if pa is not None and pb is not None:
+        return pa == pb
+    return _monomial(a) == _monomial(b)
+
+
+def reshape(x: Any, *dims: Any) -> Value:
+    """A view of the same elements in another shape; the input must be dense (a reshape of a strided view would have to copy).
+
+    ``x.reshape(M, 3, H, D)`` or ``x.reshape((M, 3, H, D))``. The number of elements must provably stay the same (affine products of
+    dimensions are compared; a product of two symbolic dimensions is compared factor by factor). The result starts where the input
+    does; whether it is a contiguous tensor follows from that offset.
+    """
+    x = _viewable("reshape", x)
+    if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
+        dims = tuple(dims[0])
+    if not dims:
+        raise TilefishTypeError("reshape: needs the new shape, e.g. x.reshape(M, 3, H, D)")
+    new: list[DimExpr] = []
+    for d in dims:
+        try:
+            dim = as_dim(d)
+        except TilefishTypeError:
+            raise TilefishTypeError(f"reshape: the shape must be ints or dimensions, got {d!r}") from None
+        if dim.is_static and dim.value < 1:
+            raise TilefishTypeError(f"reshape: sizes must be positive (there is no -1 inference), got {dim.value}")
+        new.append(dim)
+    t = x.type
+    if not t.is_dense:
+        raise TilefishTypeError(
+            f"reshape: {x.ref} is the view {t} ({t.layout_text()}); only a dense tensor can be reshaped without a copy. "
+            "Compute from it first (x + 0 makes a contiguous copy), or reshape the tensor it is a view of"
+        )
+    if not _same_count(t.shape, new):
+        raise TilefishTypeError(
+            f"reshape: {x.ref} has shape {[str(d) for d in t.shape]}, which cannot be shown to have as many elements as "
+            f"{[str(d) for d in new]}"
+        )
+    out_type = _view_type("reshape", x, new, None, t.offset)
+    (out,) = x.ctx.emit("reshape", [x], {"shape": tuple(new)}, [out_type])
+    return out
+
+
+def permute(x: Any, *axes: Any) -> Value:
+    """A view with the axes in another order: the strides move with them and nothing is copied. ``x.permute(1, 0, 2)``."""
+    x = _viewable("permute", x)
+    if len(axes) == 1 and isinstance(axes[0], (list, tuple)):
+        axes = tuple(axes[0])
+    rank = x.rank
+    if len(axes) != rank or any(isinstance(a, bool) or not isinstance(a, int) for a in axes):
+        raise TilefishTypeError(f"permute: needs {rank} integer axes for {x.type}, got {list(axes)!r}")
+    order = []
+    for a in axes:
+        if not -rank <= a < rank:
+            raise TilefishTypeError(f"permute: axis {a} is out of range for {x.type} (rank {rank})")
+        order.append(a % rank)
+    if sorted(order) != list(range(rank)):
+        raise TilefishTypeError(f"permute: {list(axes)!r} is not a permutation of the axes of {x.type}")
+    t = x.type
+    if order == list(range(rank)):
+        out_type = t
+    else:
+        strides = t.layout_strides()
+        out_type = _view_type("permute", x, [t.shape[a] for a in order], [strides[a] for a in order], t.offset)
+    (out,) = x.ctx.emit("permute", [x], {"axes": tuple(order)}, [out_type])
+    return out
+
+
+def _lower_bound(d: DimExpr) -> int:
+    return dim_bounds(d)[0]
+
+
+def select(x: Any, axis: Any, index: Any) -> Value:
+    """A view without ``axis``: the slice at the integer ``index`` (``x[i]`` is ``x.select(0, i)``). The offset moves by ``index * stride``."""
+    x = _viewable("select", x)
+    t = x.type
+    if isinstance(axis, bool) or not isinstance(axis, int) or not -t.rank <= axis < t.rank:
+        raise TilefishTypeError(f"select: axis {axis!r} is invalid for {t} (rank {t.rank})")
+    if isinstance(index, bool) or not isinstance(index, int):
+        raise TilefishTypeError(f"select: the index must be a python int (a traced tensor has no value at trace time), got {index!r}")
+    ax = axis % t.rank
+    size = t.shape[ax]
+    i = index
+    if size.is_static:
+        if not -size.value <= i < size.value:
+            raise TilefishTypeError(f"select: index {index} is out of range for axis {axis} of {t} (size {size.value})")
+        i %= size.value
+    else:
+        if i < 0:
+            raise TilefishTypeError(f"select: a negative index needs a static size; axis {axis} of {t} has size {size}")
+        if i >= _lower_bound(size):
+            raise TilefishTypeError(
+                f"select: index {index} is not provably in range for axis {axis} of {t}: its size {size} can be as small as "
+                f"{_lower_bound(size)}"
+            )
+    strides = t.layout_strides()
+    step = _mul(DimExpr.const(i), strides[ax])
+    offset = None if (t.offset is None or step is None) else t.offset + step
+    keep = [k for k in range(t.rank) if k != ax]
+    out_type = _view_type("select", x, [t.shape[k] for k in keep], [strides[k] for k in keep], offset)
+    (out,) = x.ctx.emit("select", [x], {"axis": ax, "index": i}, [out_type])
+    return out
+
+
+def getitem(x: Any, key: Any) -> Value:
+    """``x[i]``, ``x[i, j]``, ``x[:, i]``, ``x[..., i]``: integer indices select (a view without that axis); ``:`` keeps an axis.
+
+    Only integers, ``:`` and ``...`` are indices; a range is taken with ``split``.
+    """
+    x = _viewable("indexing", x)
+    items = key if isinstance(key, tuple) else (key,)
+    if items.count(Ellipsis) > 1:
+        raise TilefishTypeError("indexing: at most one ... is allowed")
+    consumed = sum(1 for k in items if k is not Ellipsis)
+    if consumed > x.rank:
+        raise TilefishTypeError(f"indexing: {consumed} indices for {x.type} (rank {x.rank})")
+    expanded: list[Any] = []
+    for k in items:
+        if k is Ellipsis:
+            expanded.extend([slice(None)] * (x.rank - consumed))
+        else:
+            expanded.append(k)
+    out = x
+    axis = 0
+    for k in expanded:
+        if isinstance(k, slice):
+            if k != slice(None):
+                raise TilefishTypeError(
+                    f"indexing {x.ref}: only integers, ':' and '...' are indices; take a range with .split(size, axis=...)"
+                )
+            axis += 1
+        elif isinstance(k, int) and not isinstance(k, bool):
+            out = select(out, axis, k)
+        else:
+            raise TilefishTypeError(f"indexing {x.ref}: an index must be a python int, ':' or '...', got {k!r}")
+    if out is x:  # x[:] and x[...] name the tensor itself
+        return x._reference()
+    return out
+
+
+# -- DevScalar ---------------------------------------------------------------------------------
+
+
+def load(x: Any) -> Value:
+    """Read a ``DevScalar`` parameter: a rank-0 tensor of its dtype. A lowered kernel reads it with one ``tl.load(ptr)``, broadcast."""
+    x = _require_value("load", "argument 's'", x, devscalar=True)
+    if not x.type.devscalar:
+        raise TilefishTypeError(f"load: takes a DevScalar parameter (one element in device memory), got {x.ref} ({x.type})")
+    (out,) = x.ctx.emit("load", [x], {}, [TensorType((), x.dtype)])
+    return out
 
 
 # -- stores ----------------------------------------------------------------------------
@@ -408,7 +636,7 @@ def store(target: Any, key: Any, value: Any) -> None:
     if value.type != target.type:
         hint = ""
         if not value.type.contiguous:
-            hint = "; a strided view cannot be stored (strided views arrive in M2): combine it in an elementwise op first"
+            hint = "; a strided view cannot be stored (a store copies a contiguous tensor): combine it in an elementwise op first (x + 0 is a copy)"
         elif value.dtype != target.dtype:
             hint = "; stores do not cast implicitly, use .to(dtype)"
         raise TilefishTypeError(f"store into '{target.name}': expected {target.type}, got {value.type}{hint}")

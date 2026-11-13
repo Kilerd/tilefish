@@ -6,6 +6,14 @@ part that is specific to one manifest: one module with a struct per binary (per 
 takes the tensors by name, with the element type in the Rust type, so that a ``bf16`` tensor cannot be passed where an
 ``f32`` one is wanted, and whose doc comments carry what the manifest says of the binary.
 
+**Manifest schema 3 and the crate.** Python writes manifest schema 3 (``docs/manifest-schema-3.md``); the ``tilefish`` crate 0.0.1 reads
+schema 2 only, so a module generated here loads under a crate that reads schema 3, and fails at ``load`` with the crate's own error
+under 0.0.1. The emitter keeps working for what schema 2 could express (every Triton kernel whose parameters are dense tensors and ``i32``
+dimension scalars: nothing else of the manifest reaches the output, and ``MANIFEST_DIGEST`` is the schema 3 digest) and **refuses**
+everything the Rust host cannot launch yet with an error that says "not yet supported by the Rust host": a prebuilt PTX or cubin
+(``kind: "binary"``), a strided view (``strides``, ``offset``, a ``stride_of`` scalar), a device scalar (a pointer with the shape ``[]``), a
+64-bit scalar and a ``fixed`` argument, and a manifest with ``library`` entries (a pinned cuBLASLt GEMM). A Rust lane lifts these.
+
 It works from the manifest alone. A schema 2 manifest records, for every pointer parameter, its declared shape
 (``["Rows", 1024]``: a dimension expression, or the size of a static axis) and, for every entry, the constraints of its
 named dimensions (``divisible_by``, ``buckets`` and the bucket this binary is built for), so ``launch`` takes nothing but
@@ -58,6 +66,7 @@ RUST_ELEMENTS = {"bf16": "Bf16", "f16": "F16", "f32": "F32", "i32": "I32", "i64"
 # what the binaries of one stem must agree on, whatever their architecture
 _SHARED_FIELDS = (
     "op",
+    "kind",
     "abi",
     "grid",
     "block",
@@ -180,7 +189,11 @@ def _validate_entry(entry: Any) -> None:
     who = f"'{stem}' ({arch})"
     _name(who, "the operator", entry.get("op"))
     _name(who, "the cubin file name", entry.get("cubin"), _FILE)
+    if entry.get("kind") != "triton":
+        _bad(who, f"it is a {entry.get('kind')!r} kernel (a prebuilt PTX or cubin), which is not yet supported by the Rust host")
     abi = _field(who, "abi", entry, "abi", dict)
+    if abi.get("scratch_slots") != 2:
+        _bad(who, f"abi.scratch_slots is {abi.get('scratch_slots')!r}: the launchers pass the two scratch slots of a Triton kernel")
     params = _field(who, "abi.params", abi, "params", list)
     names = set()
     for i, p in enumerate(params):
@@ -195,12 +208,18 @@ def _validate_entry(entry: Any) -> None:
             if p.get("access") not in _ACCESS:
                 _bad(who, f"{where}.access must be one of {list(_ACCESS)}, got {p.get('access')!r}")
             shape = _field(who, f"{where}.shape", p, "shape", list)
+            if "strides" in p or "offset" in p:
+                _bad(who, f"{where} takes a strided view (strides, offset), which is not yet supported by the Rust host")
+            if not shape:
+                _bad(who, f"{where} is a DevScalar (a pointer with the shape []), which is not yet supported by the Rust host")
             for axis, d in enumerate(shape):
                 if isinstance(d, str):
                     _expression(who, f"{where}.shape[{axis}]", d)
                 else:
                     _count(who, f"{where}.shape[{axis}]", d)
         elif kind == "scalar":
+            if p.get("type") != "i32" or "stride_of" in p:
+                _bad(who, f"{where} is a {p.get('type')!r} scalar" + (" that carries a stride" if "stride_of" in p else "") + ", which is not yet supported by the Rust host (it takes i32 dimension scalars)")
             _expression(who, f"{where}.dim", p.get("dim"))
             target = p.get("count_of")
             if target is not None and target not in names:
@@ -208,7 +227,7 @@ def _validate_entry(entry: Any) -> None:
             if target is not None:
                 _name(who, f"{where}.count_of", target)
         else:
-            _bad(who, f"{where}.kind must be 'pointer' or 'scalar', got {kind!r}")
+            _bad(who, f"{where}.kind must be 'pointer' or 'scalar', got {kind!r}" + (" (a fixed argument belongs to a prebuilt binary, which is not yet supported by the Rust host)" if kind == "fixed" else ""))
     dims = _field(who, "dims", entry, "dims", dict)
     for name, c in dims.items():
         _name(who, "a dimension name", name)
@@ -499,6 +518,12 @@ def render(
     that reaches the output is validated first.
     """
     manifest = _trusted(manifest, pin)
+    if manifest.library_entries:
+        raise TilefishManifestError(
+            f"the manifest in {str(manifest.directory)!r} has library entries ({', '.join(sorted(e['stem'] for e in manifest.library_entries))}: "
+            "pinned cuBLASLt GEMMs), which are not yet supported by the Rust host (the tilefish crate reads manifest schema 2; the library "
+            "section needs the crate that reads schema 3)"
+        )
     binaries = _group(manifest)
     _check_declarations(binaries, ops)
     elements = sorted({RUST_ELEMENTS[p["dtype"]] for b in binaries for p in b.params})

@@ -332,8 +332,8 @@ def test_out_params_are_write_only(tr):
 
 def test_value_is_not_indexable_iterable_or_truthy(tr):
     x = tr.val(Tensor[M, f32])
-    with pytest.raises(TilefishTypeError, match="not supported"):
-        x[0]
+    with pytest.raises(TilefishTypeError, match="an index must be a python int"):
+        x[1.5]  # integers, ':' and '...' index a tensor (it is a view); nothing else does
     with pytest.raises(TilefishTypeError, match="cannot be unpacked"):
         a, b = x
     with pytest.raises(TilefishTypeError, match="truth value"):
@@ -374,7 +374,7 @@ def test_unsupported_operators_raise_tilefish_errors(tr, use):
 
 def test_unknown_attributes_are_tilefish_errors_and_still_attribute_errors(tr):
     x = tr.val(Tensor[M, f32])
-    for name in ("T", "reshape", "view", "transpose", "size", "item"):
+    for name in ("T", "view", "transpose", "size", "item"):  # reshape, permute and select are views now (tests/test_views.py)
         with pytest.raises(tilefish.TilefishAttributeError, match=f"no attribute '{name}'"):
             getattr(x, name)
     with pytest.raises(tilefish.TilefishError):

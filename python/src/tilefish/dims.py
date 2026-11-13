@@ -602,6 +602,37 @@ def next_pow2(x: Any) -> Any:
     return _NextPow2(d)
 
 
+def _atom_bounds(atom: DimExpr) -> "tuple[int, int | None]":
+    """Smallest and largest value of a symbolic dimension (``None``: no upper bound). Dimensions are positive."""
+    if isinstance(atom, Dim):
+        if atom.buckets:
+            return min(atom.buckets), max(atom.buckets)  # a binary exists for these sizes only
+        return (atom.divisible_by or 1), None
+    num, den = getattr(atom, "num", None), getattr(atom, "den", None)
+    if num is None or den is None:  # pragma: no cover - the other atoms never appear in a shape
+        return 1, None
+    n_lo, n_hi = dim_bounds(num)
+    d_lo, d_hi = dim_bounds(den)
+    lo = max(1, -(-n_lo // d_hi)) if d_hi else 1
+    return lo, (None if n_hi is None else -(-n_hi // max(d_lo, 1)))  # cdiv
+
+
+def dim_bounds(d: DimExpr) -> "tuple[int, int | None]":
+    """Interval of an affine dimension expression: ``(lowest, highest or None)``. Every dimension is at least 1."""
+    d = d.folded()
+    lo: "int | None" = d.offset
+    hi: "int | None" = d.offset
+    for atom, coef in d.terms:
+        a_lo, a_hi = _atom_bounds(atom)
+        if coef > 0:
+            lo_t, hi_t = coef * a_lo, None if a_hi is None else coef * a_hi
+        else:
+            lo_t, hi_t = (None if a_hi is None else coef * a_hi), coef * a_lo
+        lo = None if lo is None or lo_t is None else lo + lo_t
+        hi = None if hi is None or hi_t is None else hi + hi_t
+    return (1 if lo is None else max(1, lo)), hi
+
+
 def dim_text(d: DimExpr) -> str:
     """Readable text for a dimension; a constrained symbolic ``Dim`` shows its constraints."""
     if isinstance(d, Dim) and d.is_dynamic and (d.divisible_by is not None or d.buckets is not None):

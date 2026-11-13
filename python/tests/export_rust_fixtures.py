@@ -16,6 +16,10 @@ An architecture other than the device's is cross-compiled, which needs nothing b
 
 The fixtures are committed; they only change when a binary does (another Triton, ptxas, or kernel), and then the files
 of ``crates/tilefish/tests/fixtures`` are replaced together.
+
+**Manifest schema 3.** This script now writes schema 3 manifests (``docs/manifest-schema-3.md``), which the crate 0.0.1 (schema 2) cannot read: the
+committed fixtures stay schema 2 until the Rust lane moves the crate to schema 3, and then this script regenerates them. (``test_rust_host.py``
+migrates a copy of a committed fixture to schema 3 for the Python tests: ``schema2_fixtures.py``.)
 """
 
 import argparse

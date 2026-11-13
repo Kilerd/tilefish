@@ -40,6 +40,12 @@ carries the largest power of two (up to 1024) the factors prove between them.
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
 
+A ``DevScalar[dtype]`` parameter (one element in device memory) is a plain pointer parameter that the kernel reads with ``tilefish.load(s)``, which is
+``tl.load(s)``: no offsets, no mask, one load whose scalar broadcasts against the tensors it meets (the result has rank 0, and so does what
+is computed from it alone). It does not take part in the shape of the kernel (the elementwise template's ``n`` is the element count of a tensor
+parameter, never of a scalar); a scalar cannot be returned. A view (``reshape``, ``permute``, ``select`` and ``split`` are zero-copy views) is not
+lowered: rule ``view`` or ``split`` says so, and a strided view goes to an ``extern`` with a ``Strided[...]`` parameter.
+
 Both templates: offsets are ``i32``, so a tensor may have at most ``2**31 - 1`` elements. A tensor
 that provably has more is rejected (rule ``index-range``; the largest bucket of a bucketed
 dimension counts, and every dimension is at least 1). A tensor whose size has no static bound
@@ -226,7 +232,7 @@ from typing import Any, Iterable
 from ._specvalid import MAX_ELEMENTS
 from .aot import CompileSpec, compile_specs
 from .decorators import ExternOp, KernelOp
-from .dims import Dim, DimExpr, as_dim, cdiv, next_pow2
+from .dims import Dim, DimExpr, as_dim, cdiv, dim_bounds, next_pow2
 from .dtypes import BlockScaled
 from .errors import TilefishLoweringError, TilefishTypeError
 from .ir import Graph, Node, Scalar
@@ -268,6 +274,7 @@ _UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu")
 _REDUCTIONS = ("sum", "mean", "max")
 
 _FULL, _COL, _ROW = "full", "col", "row"  # row template: [R, D], [D], [R] / [R, 1]
+_SCALAR, _DEV = "scalar", "devscalar"  # rank 0: a value read from a DevScalar (broadcast), and the DevScalar parameter itself (a pointer to one element)
 
 
 # -- the result ---------------------------------------------------------------------------------
@@ -383,35 +390,7 @@ def _shape_text(shape: "Iterable[DimExpr]") -> str:
 # -- how many elements a tensor can have ---------------------------------------------------------------
 
 
-def _atom_bounds(atom: DimExpr) -> "tuple[int, int | None]":
-    """Smallest and largest value of a symbolic dimension (``None``: no upper bound). Dimensions are positive."""
-    if isinstance(atom, Dim):
-        if atom.buckets:
-            return min(atom.buckets), max(atom.buckets)  # a binary exists for these sizes only
-        return (atom.divisible_by or 1), None
-    num, den = getattr(atom, "num", None), getattr(atom, "den", None)
-    if num is None or den is None:  # pragma: no cover - the other atoms never appear in a shape
-        return 1, None
-    n_lo, n_hi = _bounds(num)
-    d_lo, d_hi = _bounds(den)
-    lo = max(1, -(-n_lo // d_hi)) if d_hi else 1
-    return lo, (None if n_hi is None else -(-n_hi // max(d_lo, 1)))  # cdiv
-
-
-def _bounds(d: DimExpr) -> "tuple[int, int | None]":
-    """Interval of an affine dimension expression: ``(lowest, highest or None)``."""
-    d = d.folded()
-    lo: "int | None" = d.offset
-    hi: "int | None" = d.offset
-    for atom, coef in d.terms:
-        a_lo, a_hi = _atom_bounds(atom)
-        if coef > 0:
-            lo_t, hi_t = coef * a_lo, None if a_hi is None else coef * a_hi
-        else:
-            lo_t, hi_t = (None if a_hi is None else coef * a_hi), coef * a_lo
-        lo = None if lo is None or lo_t is None else lo + lo_t
-        hi = None if hi is None or hi_t is None else hi + hi_t
-    return (1 if lo is None else max(1, lo)), hi
+_bounds = dim_bounds  # the interval of a dimension expression (tilefish.dims)
 
 
 def _numel_bounds(shape: "Iterable[DimExpr]") -> "tuple[int, int | None]":
@@ -484,7 +463,21 @@ def _check_common(op: KernelOp) -> None:
         if n.op == "split":
             views = [str(t) for t in n.output_types if not t.contiguous]
             note = f" (its chunks are views: {views[0]})" if views else ""
-            raise _fail(name, None, "split", f"split is not lowered{note}; strided views and slicing arrive later")
+            raise _fail(
+                name,
+                None,
+                "split",
+                f"split is not lowered{note}: a lowered kernel takes and gives contiguous tensors; a strided view goes to an "
+                "extern with a Strided[...] parameter",
+            )
+        if n.op in ("reshape", "permute", "select"):
+            raise _fail(
+                name,
+                None,
+                "view",
+                f"{n} is a view operation, and strided views are not lowered: a lowered kernel takes and gives contiguous tensors. "
+                "Write the kernel over the tensor the view is of, or declare an extern with a Strided[...] parameter",
+            )
         for v in n.outputs:
             if not v.type.contiguous:
                 raise _fail(name, None, "view-value", f"{_label(v)} is a View; strided views are not lowered")
@@ -547,6 +540,8 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
                 "the low byte, depending on the integer type; see note 1 of the numerics contract). Round or clamp "
                 "explicitly in a typed op once one exists, or declare the kernel with extern",
             )
+    elif n.op == "load":
+        _check_dtype(kernel, f"the DevScalar read by {n}", n.outputs[0].type.dtype)
     elif n.op != "store":
         raise _fail(kernel, None, "unsupported-op", f"the op '{n.op}' is not lowered")
 
@@ -667,18 +662,20 @@ class _RowLayout(_Layout):
                         "to reduce along",
                     )
         for v in values:
-            if v.type.rank == 0:
+            if v.type.rank == 0 and v.is_param and not v.type.devscalar:  # a loaded DevScalar is a rank-0 value, and so is what is computed from it
                 raise _fail(
                     name,
                     "row",
                     "row.rank",
-                    f"{_label(v)} has rank 0; the row template takes [R, D], [D], [R] and [R, 1] (rank 1 or 2)",
+                    f"{_label(v)} has rank 0; the row template takes [R, D], [D], [R] and [R, 1] (rank 1 or 2), and a DevScalar",
                 )
         self.block_max = _max_block(name, D)
         self.cls = {}
         for v in values:
             shape = v.type.shape
-            if len(shape) == 2:
+            if len(shape) == 0:
+                self.cls[v] = _DEV if v.type.devscalar else _SCALAR
+            elif len(shape) == 2:
                 if shape[0] == self.R and shape[1] == D:
                     self.cls[v] = _FULL
                 elif shape[0] == self.R and _is_one(shape[1]):
@@ -727,6 +724,13 @@ class _RowLayout(_Layout):
                     "row.col-output",
                     f"the returned {_label(v)} has shape [D]; every row program would write it (a race), so only "
                     "[R, D] and per-row tensors can be returned",
+                )
+            if self.cls[v] in (_SCALAR, _DEV):
+                raise _fail(
+                    name,
+                    "row",
+                    "row.scalar-output",
+                    f"the returned {_label(v)} is a scalar (read from a DevScalar); combine it with a tensor first",
                 )
         self.grid = (self.R.folded(),)
 
@@ -828,7 +832,11 @@ class _ElementwiseLayout(_Layout):
 
     def __init__(self, op: KernelOp) -> None:
         graph, name = op.graph, op.name
-        values = _all_values(graph)
+        all_values = _all_values(graph)
+        for v in all_values:
+            if v.type.rank == 0 and v.is_param and not v.type.devscalar:
+                raise _fail(name, "elementwise", "elementwise.same-shape", f"{_label(v)} has rank 0; give it a shape, or declare a DevScalar")
+        values = [v for v in all_values if v.type.rank > 0]  # a DevScalar, what is loaded from it and what is computed from that broadcast
         if not values:
             raise _fail(name, "elementwise", "elementwise.no-tensor", "the kernel has no tensors")
         for n in graph.nodes:
@@ -836,6 +844,9 @@ class _ElementwiseLayout(_Layout):
                 raise _fail(
                     name, "elementwise", "elementwise.reduction", f"{n.op} is a reduction; the elementwise template has none"
                 )
+        for v in graph.outputs:
+            if v.type.rank == 0:
+                raise _fail(name, "elementwise", "elementwise.scalar-output", f"the returned {_label(v)} is a scalar; combine it with a tensor first")
         self.shape = values[0].type.shape
         for v in values:
             if v.type.shape != self.shape:
@@ -983,8 +994,8 @@ class _Body:
             else:
                 reads.update(i for i in n.inputs if isinstance(i, Value))
         reads.update(graph.outputs)
-        for p in graph.inputs:  # inputs first, in declaration order; an Out parameter is never read
-            if p.access != "out" and p in reads:
+        for p in graph.inputs:  # inputs first, in declaration order; an Out parameter is never read, a DevScalar only by tilefish.load
+            if p.access != "out" and p in reads and not p.type.devscalar:
                 v = self.local()
                 self.var[p] = v
                 self.emit(f"{v} = {layout.load(self.rename.get(p.name, p.name), p)}", p.name)
@@ -1019,6 +1030,10 @@ class _Body:
 
     def expression(self, n: Node) -> str:
         op = n.op
+        if op == "load":  # one element from device memory, broadcast: no mask, no offsets
+            ptr = n.inputs[0]
+            assert isinstance(ptr, Value)
+            return f"tl.load({self.rename.get(ptr.name, ptr.name)})"
         a = [self.operand(i) for i in n.inputs]
         if op in _BINARY:
             return f"{a[0]} {_BINARY[op]} {a[1]}"
@@ -1167,7 +1182,7 @@ def _assemble(
         decls.append(f"{e.name}: tl.constexpr" if e.constexpr else e.name)
     element_counts: dict[str, str] = {}
     if layout.template == "elementwise":  # n is the element count of every tensor: say which one a host reads it from
-        element_counts[layout.n_name] = next(p.name for p in params if p.kind == "tensor")  # type: ignore[attr-defined]
+        element_counts[layout.n_name] = next(p.name for p in params if p.kind == "tensor" and not p.type.devscalar)  # type: ignore[attr-defined,union-attr]
 
     body = _Body(op, layout, names, out_names, rename).run()
     header = [

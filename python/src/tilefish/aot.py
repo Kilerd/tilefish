@@ -64,9 +64,18 @@ The fingerprint behind ``verified`` keeps the order of what carries order: ``sig
 order Triton sees) and ``buckets`` are hashed as lists, so reordering either in place withdraws the
 verification, like editing any other field.
 
-Schema 2 (this version) adds the digest and the constexpr dtypes to schema 1. Schema 1 specs are
+Schema 2 adds the digest and the constexpr dtypes to schema 1. Schema 1 specs are
 still read, but they have neither, so they are *unverifiable*: ``verify_against`` refuses them
 and the spec has to be regenerated with :func:`compile_specs`.
+
+Schema 3 (written only by a spec that needs it: :attr:`CompileSpec.uses_strided_schema`; every other spec is schema 2, as it was) adds what
+strided views, device scalars and prebuilt binaries need: on a pointer argument ``strides`` and ``offset`` (a ``Strided[...]`` parameter: the
+stride of each axis is the dimension that a ``StrideOf`` scalar carries, or ``1``; the offset is a dimension that is ``divisible_by`` the elements in
+16 bytes when the declaration says ``Strided[..., 16]``, and only then does the pointer get ``tt.divisibility=16``), on a scalar ``stride_of`` and
+the type ``i64`` (the width of the offsets of a kernel with ``index_bits=64``), the ``max_extent`` precondition (the largest offset a strided view
+reaches, where ``max_elements`` bounds an element count) and a pointer alignment of its element size where nothing more is promised, and for a
+prebuilt PTX or cubin (``extern(ptx=...)``) the ``binary`` section in place of ``triton``, ``num_warps`` and ``num_stages``, ``fixed`` arguments
+(typed constants of its C ABI) and no scratch slots. A pointer with the shape ``[]`` is a ``DevScalar``.
 """
 
 from __future__ import annotations
@@ -82,6 +91,7 @@ from typing import Any, Iterator
 
 from ._specvalid import (
     ALIGNMENT,
+    DIGEST_SCHEMA,
     LEGACY_SCHEMA,
     SCHEMA_VERSION,
     decode_scalar,
@@ -184,6 +194,13 @@ class ArgSpec:
     # (``"M"``, ``"3072*M"``) stays a name even when the binary is built for one bucket of it (``shape`` has the bucket value
     # there), and a static dimension is its size as an int (``["Rows", 1024]``)
     shape_dims: tuple["str | int", ...] | None = None
+    # pointers that accept a strided view (``Strided[...]``) only: the element stride of every axis (an int, or the name of the
+    # dimension that a ``StrideOf`` scalar carries) and the name of the offset dimension. The pointer passed is
+    # ``base + offset * itemsize``. A pointer without them is dense row-major at offset 0.
+    strides: tuple["str | int", ...] | None = None
+    offset: "str | int | None" = None
+    # scalars that carry a stride: ``(argument, axis)`` of the pointer argument whose stride along that axis this scalar is
+    stride_of: "tuple[str, int] | None" = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"index": self.index, "name": self.name, "kind": self.kind, "type": self.type}
@@ -197,6 +214,11 @@ class ArgSpec:
             out["shape"] = list(self.shape)
         if self.shape_dims is not None:
             out["shape_dims"] = list(self.shape_dims)
+        if self.strides is not None:
+            out["strides"] = list(self.strides)
+            out["offset"] = self.offset
+        if self.stride_of is not None:
+            out["stride_of"] = {"arg": self.stride_of[0], "axis": self.stride_of[1]}
         return out
 
     @classmethod
@@ -209,6 +231,10 @@ class ArgSpec:
                 kw["shape"] = tuple(kw["shape"])
             if kw.get("shape_dims") is not None:
                 kw["shape_dims"] = tuple(kw["shape_dims"])
+            if kw.get("strides") is not None:
+                kw["strides"] = tuple(kw["strides"])
+            if kw.get("stride_of") is not None:
+                kw["stride_of"] = (kw["stride_of"]["arg"], kw["stride_of"]["axis"])
             if "value" in kw:
                 kw["value"] = decode_scalar(kw["value"], "arg value")
             return cls(**kw)
@@ -294,6 +320,10 @@ class CompileSpec:
     # ``divisible_by`` and ``buckets`` when it has them, and ``bucket``, the value this binary is built for, when it is one of
     # the op's bucketed dimensions. The names are the ones in ``shape_dims``, in the scalars' ``dim`` and in the grid.
     dims: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # A prebuilt (non-Triton) binary: ``{"kind": "ptx" | "cubin", "symbol", "shared", "digests"}`` (see ``validate_binary``). Such a
+    # spec has no Triton reference (``triton`` is ``""``), no warps or stages (``0``), no constexprs and no scratch slots. ``None``
+    # for a Triton kernel.
+    binary: "dict[str, Any] | None" = None
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
@@ -361,6 +391,8 @@ class CompileSpec:
                 f"compile spec '{self.stem}' has not been verified against its declaration, so it must not be "
                 "compiled: call spec.verify_against(op) first (a spec from compile_specs(op) is already verified)"
             )
+        if self.binary is not None:
+            raise TilefishSpecError(f"compile spec '{self.stem}' is a prebuilt {self.binary['kind']} binary: Triton does not compile it")
         options: dict[str, Any] = {"num_warps": self.num_warps, "num_stages": self.num_stages}
         if self.enable_fp_fusion is not None:
             options["enable_fp_fusion"] = self.enable_fp_fusion
@@ -372,9 +404,25 @@ class CompileSpec:
         )
 
     @property
+    def uses_strided_schema(self) -> bool:
+        """Whether the spec has anything only schema 3 has: a strided pointer or a stride scalar, a 64-bit scalar, a ``fixed``
+        argument, a ``max_extent`` precondition or a prebuilt binary. A spec without any is schema 2, written as it always was."""
+        return (
+            self.binary is not None
+            or any(
+                a.strides is not None or a.stride_of is not None or a.kind == "fixed" or (a.kind == "scalar" and a.type == "i64")
+                for a in self.args
+            )
+            or any(p.kind == "max_extent" for p in self.preconditions)
+        )
+
+    @property
     def schema(self) -> int:
-        """The serialization schema of this spec: 2, or 1 for a spec read back from schema 1."""
-        return LEGACY_SCHEMA if self.declaration_digest is None else SCHEMA_VERSION
+        """The serialization schema of this spec: 3 when it uses what schema 3 added (see :attr:`uses_strided_schema`), 2 otherwise,
+        and 1 for a spec read back from schema 1."""
+        if self.declaration_digest is None:
+            return LEGACY_SCHEMA
+        return SCHEMA_VERSION if self.uses_strided_schema else DIGEST_SCHEMA
 
     @property
     def verifiable(self) -> bool:
@@ -389,23 +437,23 @@ class CompileSpec:
         ``declaration_digest`` hashes the *declaration*, not a binary. A spec read from schema 1
         is written back as schema 1 (it has no digest).
         """
-        doc: dict[str, Any] = {
-            "schema": self.schema,
-            "stem": self.stem,
-            "op": self.op,
-            "triton": {"module": self.triton_module, "function": self.triton_function, "ref": self.triton},
-            "buckets": dict(self.buckets),
-            "args": [a.to_dict() for a in self.args],
-            "signature": dict(self.signature),
-            "constants": {_key_to_str(k): _encode(v) for k, v in self.constants.items()},
-            "attrs": {_key_to_str(k): copy.deepcopy(v) for k, v in self.attrs.items()},
-            "num_warps": self.num_warps,
-            "num_stages": self.num_stages,
-            "grid": self.grid,
-            "block": list(self.block),
-            "launch_params": [p.to_dict() for p in self.launch_params],
-            "preconditions": [p.to_dict() for p in self.preconditions],
-        }
+        doc: dict[str, Any] = {"schema": self.schema, "stem": self.stem, "op": self.op}
+        if self.binary is None:
+            doc["triton"] = {"module": self.triton_module, "function": self.triton_function, "ref": self.triton}
+        else:
+            doc["binary"] = copy.deepcopy(self.binary)
+        doc["buckets"] = dict(self.buckets)
+        doc["args"] = [a.to_dict() for a in self.args]
+        doc["signature"] = dict(self.signature)
+        doc["constants"] = {_key_to_str(k): _encode(v) for k, v in self.constants.items()}
+        doc["attrs"] = {_key_to_str(k): copy.deepcopy(v) for k, v in self.attrs.items()}
+        if self.binary is None:
+            doc["num_warps"] = self.num_warps
+            doc["num_stages"] = self.num_stages
+        doc["grid"] = self.grid
+        doc["block"] = list(self.block)
+        doc["launch_params"] = [p.to_dict() for p in self.launch_params]
+        doc["preconditions"] = [p.to_dict() for p in self.preconditions]
         if self.declaration_digest is not None:  # schema 2: the table of dimensions, and the digest
             doc["dims"] = copy.deepcopy(self.dims)
             doc["declaration_digest"] = self.declaration_digest
@@ -442,12 +490,13 @@ class CompileSpec:
             return cls(
                 stem=d["stem"],
                 op=d["op"],
-                triton=d["triton"]["ref"],
+                triton=d["triton"]["ref"] if "triton" in d else "",
                 signature=dict(d["signature"]),
                 constants={_key_from_str(k): decode_scalar(v, "constant") for k, v in d["constants"].items()},
                 attrs={_key_from_str(k): copy.deepcopy(v) for k, v in d["attrs"].items()},
-                num_warps=d["num_warps"],
-                num_stages=d["num_stages"],
+                num_warps=d.get("num_warps", 0),
+                num_stages=d.get("num_stages", 0),
+                binary=copy.deepcopy(d.get("binary")),
                 grid=d["grid"],
                 block=tuple(d["block"]),  # type: ignore[arg-type]
                 launch_params=tuple(LaunchParam.from_dict(p) for p in d["launch_params"]),
@@ -660,9 +709,20 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
             entry["access"] = p.access
             entry["dtype"] = _canonical_dtype(p.type.dtype)
             entry["shape"] = [_canonical_dim(d) for d in p.type.shape]
+            if p.strided:  # only a Strided parameter has these: every other declaration digests as it always did
+                assert p.type.strides is not None and p.type.offset is not None
+                entry["strided"] = {
+                    "align": p.align,
+                    "strides": [_canonical_dim(s) for s in p.type.strides],  # type: ignore[arg-type]
+                    "offset": _canonical_dim(p.type.offset),
+                }
+            if p.type.devscalar:
+                entry["devscalar"] = True
         elif p.kind == "dim":
             assert p.dim is not None
             entry["dim"] = _canonical_dim(p.dim)
+            if p.stride_of is not None:
+                entry["stride_of"] = {"arg": p.stride_of[0], "axis": p.stride_of[1]}
         else:
             entry["dtype"] = None if p.const_dtype is None else _canonical_dtype(p.const_dtype)
             # a scalar default is hashed as the typed value a spec compiles in; a dimension expression is
@@ -670,15 +730,19 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
             typed = p.default if isinstance(p.default, DimExpr) or p.default is MISSING else _typed_const(op.name, p, p.default)
             entry["default"] = _canonical_value(typed)
         params.append(entry)
-    doc: dict[str, Any] = {
-        "format": DIGEST_FORMAT,
-        "op": op.name,
-        "triton": op.triton,
-        "num_warps": op.num_warps,
-        "num_stages": op.num_stages,
-        "grid": None if op.grid is None else [_canonical_dim(g) for g in op.grid],
-        "params": params,
-    }
+    doc: dict[str, Any] = {"format": DIGEST_FORMAT, "op": op.name}
+    if op.binary is None:
+        doc.update({"triton": op.triton, "num_warps": op.num_warps, "num_stages": op.num_stages})
+    else:  # a prebuilt binary: what it is made of (the sha256 of its PTX or cubin), its entry point, block and shared memory
+        doc["binary"] = {
+            "kind": op.binary.kind,
+            "symbol": op.binary.symbol,
+            "block": list(op.binary.block),
+            "shared": op.binary.shared,
+            "digests": op.binary.digests,
+        }
+    doc["grid"] = None if op.grid is None else [_canonical_dim(g) for g in op.grid]
+    doc["params"] = params
     # only kernels that tilefish generated have these; leaving them out otherwise keeps every other digest as it was
     if op.index_bits != 32:
         doc["index_bits"] = op.index_bits
@@ -774,32 +838,79 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                 )
             ptr = t.dtype.triton_ptr
             signature[p.name] = ptr
-            attrs[(i,)] = [["tt.divisibility", ALIGNMENT]]
-            preconditions.append(Precondition("pointer_alignment", arg=p.name, index=i, bytes=ALIGNMENT))
+            strides_entries: "tuple[str | int, ...] | None" = None
+            offset_entry: "str | None" = None
+            aligned_bytes = ALIGNMENT
+            if p.strided:
+                assert t.strides is not None and t.offset is not None
+                # 16-byte alignment is given to Triton only when the offset in bytes is provably a multiple of 16 (the offset
+                # dimension is divisible_by the elements in 16 bytes: Strided[..., 16]); otherwise the pointer is only element aligned
+                elems16 = 128 // math.gcd(t.dtype.bits, 128)  # type: ignore[union-attr]
+                if t.offset.is_divisible_by(elems16):
+                    attrs[(i,)] = [["tt.divisibility", ALIGNMENT]]
+                else:
+                    aligned_bytes = max(1, t.dtype.bits // 8)  # type: ignore[union-attr]
+                strides_entries = tuple(_shape_entry(s) for s in t.strides)  # type: ignore[arg-type]
+                offset_entry = _shape_entry(t.offset)  # type: ignore[assignment]
+                for s in t.strides:
+                    note(s)  # type: ignore[arg-type]
+                note(t.offset)
+            else:
+                attrs[(i,)] = [["tt.divisibility", ALIGNMENT]]
+            preconditions.append(Precondition("pointer_alignment", arg=p.name, index=i, bytes=aligned_bytes))
             for axis, d in enumerate(t.shape):
                 if d.is_static:
                     preconditions.append(Precondition("static_size", arg=p.name, index=i, axis=axis, value=d.value))
             shape = tuple(str(d.subst(mapping).folded()) for d in t.shape)  # bucket values and static dims, folded
             limit = op.max_elements.get(p.name)  # only for kernels tilefish generated (i32 indexing)
             if limit is not None:
-                preconditions.append(Precondition("max_elements", arg=p.name, index=i, value=limit, shape=shape))
+                if p.strided:  # the offsets are i32 sums of index * stride: bound the largest one, not the element count
+                    preconditions.append(Precondition("max_extent", arg=p.name, index=i, value=limit))
+                else:
+                    preconditions.append(Precondition("max_elements", arg=p.name, index=i, value=limit, shape=shape))
             for d in t.shape:
                 note(d)
             shape_dims = tuple(_shape_entry(d) for d in t.shape)
             args.append(
-                ArgSpec(i, p.name, "pointer", ptr, access=p.access, dtype=str(t.dtype), shape=shape, shape_dims=shape_dims)
+                ArgSpec(
+                    i,
+                    p.name,
+                    "pointer",
+                    ptr,
+                    access=p.access,
+                    dtype=str(t.dtype),
+                    shape=shape,
+                    shape_dims=shape_dims,
+                    strides=strides_entries,
+                    offset=offset_entry,
+                )
             )
         elif p.kind == "dim":
             assert p.dim is not None
-            signature[p.name] = "i32"
+            scalar_type = "i64" if (p.stride_of is not None and op.index_bits == 64) else "i32"  # a stride is as wide as the kernel's offsets
+            signature[p.name] = scalar_type
             note(p.dim)
             dim_text = str(p.dim.folded())  # a static dimension is its size: a host cannot look a name up that it was not told
             if p.dim.is_divisible_by(ALIGNMENT):
                 attrs[(i,)] = [["tt.divisibility", ALIGNMENT]]
                 preconditions.append(Precondition("divisible", arg=p.name, index=i, dim=dim_text, by=ALIGNMENT))
             args.append(
-                ArgSpec(i, p.name, "scalar", "i32", dtype="i32", dim=dim_text, count_of=op.element_counts.get(p.name))
+                ArgSpec(
+                    i,
+                    p.name,
+                    "scalar",
+                    scalar_type,
+                    dtype=scalar_type,
+                    dim=dim_text,
+                    count_of=op.element_counts.get(p.name),
+                    stride_of=p.stride_of,
+                )
             )
+        elif op.binary is not None:  # a prebuilt binary has no constexprs: a const is a fixed argument of its C ABI, with its value
+            assert p.default is not MISSING and p.const_dtype is not None
+            ty = p.const_dtype.name
+            signature[p.name] = ty
+            args.append(ArgSpec(i, p.name, "fixed", ty, dtype=ty, value=p.default))
         else:
             assert p.default is not MISSING
             value = p.default
@@ -829,10 +940,18 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
             raise TilefishSpecError(f"extern op '{op.name}': the grid has a non-positive size {g} for {mapping}")
 
     launch = [LaunchParam(a.name, a.type) for a in args if a.kind != "constexpr"]
-    launch += [LaunchParam("global_scratch", "u64", 0), LaunchParam("profile_scratch", "u64", 0)]
     suffix = "".join(f".{d.name}{v}" for d, v in mapping.items())
     stem = op.name + suffix
-    num_warps = op.bucket_num_warps.get(suffix, op.num_warps)  # only a kernel that tilefish generated has one per bucket
+    binary: "dict[str, Any] | None" = None
+    if op.binary is None:
+        launch += [LaunchParam("global_scratch", "u64", 0), LaunchParam("profile_scratch", "u64", 0)]
+        num_warps = op.bucket_num_warps.get(suffix, op.num_warps)  # only a kernel that tilefish generated has one per bucket
+        block = (32 * num_warps, 1, 1)
+    else:  # a prebuilt binary is launched with exactly its C parameters: no scratch slots, no warps; its block is declared
+        attrs = {}  # (no Triton compiles it: no divisibility attributes)
+        num_warps = 0
+        block = op.binary.block
+        binary = {"kind": op.binary.kind, "symbol": op.binary.symbol, "shared": op.binary.shared, "digests": op.binary.digests}
     spec = CompileSpec(
         stem=stem,
         op=op.name,
@@ -843,7 +962,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         num_warps=num_warps,
         num_stages=op.num_stages,
         grid=grid_to_string(grid),
-        block=(32 * num_warps, 1, 1),
+        block=block,
         launch_params=tuple(launch),
         preconditions=tuple(preconditions),
         args=tuple(args),
@@ -852,6 +971,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         enable_fp_fusion=op.fp_fusion,
         source_sha256=op.source_sha256,
         dims=dict(sorted(dims.items())),
+        binary=binary,
     )
     spec._mark_verified()  # generated from the declaration just now
     return spec

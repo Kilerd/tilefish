@@ -380,7 +380,7 @@ def test_the_externs_resolve_their_triton_function_by_reference():
 def test_the_manifest_describes_what_was_built(built, tmp_path):
     path = write_manifest(built, tmp_path / "out" / "manifest.json", cubins=True)
     doc = json.loads(path.read_text())
-    assert doc["schema"] == 2 and [k["stem"] for k in doc["kernels"]] == [b.stem for b in built]
+    assert doc["schema"] == 3 and doc["library"] == [] and [k["stem"] for k in doc["kernels"]] == [b.stem for b in built]
     for entry, b in zip(doc["kernels"], built):
         cubin = (tmp_path / "out" / entry["cubin"]).read_bytes()
         assert cubin == b.cubin

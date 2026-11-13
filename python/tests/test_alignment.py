@@ -86,7 +86,8 @@ def test_a_view_chunk_is_rejected_by_declared_operators_with_the_alignment_hint(
 
     with pytest.raises(
         TilefishTypeError,
-        match=r"ext: argument 'x' is a strided view \(View\[7, 3, bf16\]\); strided views arrive in M2, pass the unsplit tensor "
+        match=r"ext: argument 'x' is a strided view \(View\[7, 3, bf16\]\); this parameter takes a contiguous tensor: pass the unsplit tensor, "
+        r"compute from the view \(x \+ 0 is a contiguous copy\), or have an extern declare the parameter Strided\[\.\.\.\] "
         r"\(a chunk that does not start on a 16-byte boundary is a view too\)",
     ):
 

@@ -131,7 +131,7 @@ def test_manifest_content():
     specs = compile_specs(rowop)
     built = [fake_build(s) for s in specs]
     doc = manifest_dict(built)
-    assert doc["schema"] == 2 and doc["tilefish"] == tilefish.__version__
+    assert doc["schema"] == 3 and doc["library"] == [] and doc["tilefish"] == tilefish.__version__
     first, second = doc["kernels"]
     assert [first["stem"], second["stem"]] == ["rowop.S32", "rowop.S64"]
     assert first["symbol"] == "tf_k" and first["arch"] == "sm_90" and first["ptx_target"] == "sm_90a"

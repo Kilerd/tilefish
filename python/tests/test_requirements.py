@@ -227,7 +227,7 @@ def test_views_cannot_be_passed_to_library_extern_kernel_or_graph_arguments():
     for op in (scale, ext, kern, grph):
         with pytest.raises(
             TilefishTypeError,
-            match=rf"{op.name}: argument 'x' is a strided view \(View\[M, 4, bf16\]\); strided views arrive in M2, pass the unsplit tensor",
+            match=rf"{op.name}: argument 'x' is a strided view \(View\[M, 4, bf16\]\); this parameter takes a contiguous tensor: pass the unsplit tensor",
         ):
 
             @tilefish.graph

@@ -42,7 +42,15 @@ import pathlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from ._build import MANIFEST_SCHEMA, BuiltKernel, LaunchAttributes, spec_entry
+from ._build import (
+    BINARY_DIGEST_KIND,
+    ENTRY_KIND_BINARY,
+    ENTRY_KIND_TRITON,
+    MANIFEST_SCHEMA,
+    BuiltKernel,
+    LaunchAttributes,
+    spec_entry,
+)
 from ._ir import IR_DIGEST_KIND
 from ._elf import code_digest, parse_elf, uses_shared
 from .errors import TilefishBuildError, TilefishManifestError
@@ -51,24 +59,39 @@ if TYPE_CHECKING:
     from .aot import CompileSpec
 
 MANIFEST_NAME = "manifest.json"
-DIGEST_TAG = b"tilefish.manifest-digest.v2\0"  # part of what is hashed: another canonical form must change it
+DIGEST_TAG = b"tilefish.manifest-digest.v3\0"  # part of what is hashed: another canonical form must change it
+LEGACY_DIGEST_TAG = b"tilefish.manifest-digest.v2\0"  # schema 2, the one the Rust host (crate 0.0.1) computes
 
 
 def manifest_digest(doc: "dict[str, Any]") -> str:
-    """The sha256 (lowercase hex) of a manifest document: its schema and every kernel entry in full.
+    """The sha256 (lowercase hex) of a manifest document: its schema, every kernel entry and every library entry in full.
 
-    Entries are sorted by ``(stem, arch)`` and serialized as canonical JSON (sorted keys, no whitespace), so the
-    digest does not depend on the order of the entries or on how the file was formatted, and changes with any field
+    Entries are sorted by ``(stem, arch)`` (kernels and library entries each) and serialized as canonical JSON (sorted keys, no
+    whitespace), so the digest does not depend on the order of the entries or on how the file was formatted, and changes with any field
     of any entry: the spec-derived fields (ABI, grid, block, constants, preconditions, options, declaration digest,
-    source digests), the build facts (symbol, shared memory, launch attributes, toolchain, architecture) and the
-    digests of the cubin file and of its machine code. The top-level ``tilefish`` version is not part of it.
+    source digests), the build facts (symbol, shared memory, launch attributes, toolchain, architecture), the
+    digests of the cubin file and of its machine code, and of a library entry the pinned algorithm and the cuBLASLt version.
+    The top-level ``tilefish`` version is not part of it.
+
+    Schema 3 is ``sha256(DIGEST_TAG + json({"schema": 3, "kernels": [...], "library": [...]}))`` with the tag ``v3``. The function also
+    digests any other document in the form of schema 2 (``{"schema": <whatever it says>, "kernels": [...]}``, the tag ``v2``), which is
+    what the Rust host 0.0.1 computes for the manifests it reads (and for the edge cases of its test vectors); this Python reads and
+    writes schema 3 only.
     """
     try:
-        kernels = sorted(doc["kernels"], key=lambda e: (str(e.get("stem")), str(e.get("arch"))))
-        text = json.dumps({"schema": doc["schema"], "kernels": kernels}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        key = lambda e: (str(e.get("stem")), str(e.get("arch")))  # noqa: E731
+        kernels = sorted(doc["kernels"], key=key)
+        schema = doc["schema"]
+        if schema == MANIFEST_SCHEMA:
+            body = {"schema": schema, "kernels": kernels, "library": sorted(doc["library"], key=key)}
+            tag = DIGEST_TAG
+        else:  # the function of schema 2 and before, which digests whatever ``schema`` says (a reader refuses a schema it does not read; the digest of a document does not)
+            body = {"schema": schema, "kernels": kernels}
+            tag = LEGACY_DIGEST_TAG
+        text = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (ValueError, TypeError, AttributeError, KeyError) as e:  # a number that is not finite, a value JSON cannot hold, a malformed entry
         raise TilefishManifestError(f"the manifest cannot be digested, it is not plain JSON data: {type(e).__name__}: {e}") from e
-    return hashlib.sha256(DIGEST_TAG + text.encode("utf-8")).hexdigest()
+    return hashlib.sha256(tag + text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, eq=False)
@@ -137,11 +160,13 @@ class Manifest:
         artifacts: "dict[tuple[str, str], Artifact]",
         path: "pathlib.Path | None" = None,
         pinned: bool = False,
+        library: "dict[tuple[str, str], dict[str, Any]] | None" = None,
     ) -> None:
         self.directory = directory
         self.path = path if path is not None else directory / MANIFEST_NAME
         self.doc = doc
         self._artifacts = artifacts
+        self._library = library if library is not None else {}
         self.pinned = pinned  # whether its digest was compared with one from a trusted place (see :meth:`check_pin`)
 
     @property
@@ -176,14 +201,20 @@ class Manifest:
         if isinstance(older, int) and not isinstance(older, bool) and 0 < older < MANIFEST_SCHEMA:
             raise TilefishManifestError(
                 f"the manifest {str(manifest_path)!r} is schema {older}, which an older tilefish wrote; this tilefish reads schema "
-                f"{MANIFEST_SCHEMA}, where every pointer records its shape and every entry the constraints of its dimensions, which "
-                "a host needs. Re-export it (tilefish.runtime.export) and pin the new digest"
+                f"{MANIFEST_SCHEMA}, which adds strided views, device scalars, prebuilt binaries and library operations (and records the "
+                "number of scratch slots of every ABI) and has another digest. Re-export it (tilefish.runtime.export) and pin the new digest"
             )
-        # the schema is the integer 2: not 2.0 (which == 2 in Python, and which the Rust host refuses), not "2", not True
-        if not isinstance(doc, dict) or type(doc.get("schema")) is not int or doc["schema"] != MANIFEST_SCHEMA or not isinstance(doc.get("kernels"), list):
+        # the schema is the integer 3: not 3.0 (which == 3 in Python, and which a strict host refuses), not "3", not True
+        if (
+            not isinstance(doc, dict)
+            or type(doc.get("schema")) is not int
+            or doc["schema"] != MANIFEST_SCHEMA
+            or not isinstance(doc.get("kernels"), list)
+            or not isinstance(doc.get("library"), list)
+        ):
             raise TilefishManifestError(
-                f"the manifest {str(manifest_path)!r} is not a tilefish manifest of schema {MANIFEST_SCHEMA} "
-                f"(schema {doc.get('schema') if isinstance(doc, dict) else None!r})"
+                f"the manifest {str(manifest_path)!r} is not a tilefish manifest of schema {MANIFEST_SCHEMA} with a 'kernels' list and a "
+                f"'library' list (schema {doc.get('schema') if isinstance(doc, dict) else None!r})"
             )
         if pin is not None:
             _check_pin(manifest_path.parent, doc, pin)
@@ -194,7 +225,24 @@ class Manifest:
             if key in artifacts:
                 raise TilefishManifestError(f"the manifest lists '{key[0]}' for {key[1]} twice")
             artifacts[key] = artifact
-        return cls(manifest_path.parent, doc, artifacts, manifest_path, pinned=pin is not None)
+        from ._library import validate_entry
+
+        library: dict[tuple[str, str], dict[str, Any]] = {}
+        for i, lib in enumerate(doc["library"]):
+            validate_entry(lib, i)
+            key = (lib["stem"], lib["arch"])
+            if key in library or key in artifacts:
+                raise TilefishManifestError(f"the manifest lists '{key[0]}' for {key[1]} twice")
+            library[key] = lib
+        return cls(manifest_path.parent, doc, artifacts, manifest_path, pinned=pin is not None, library=library)
+
+    def library_entry(self, stem: str, arch: str) -> "dict[str, Any] | None":
+        """The library entry (a pinned library operation, such as a cuBLASLt GEMM) of ``stem`` for ``arch``, or ``None``."""
+        return self._library.get((stem, arch))
+
+    @property
+    def library_entries(self) -> "list[dict[str, Any]]":
+        return list(self._library.values())
 
     def check_pin(self, pin: str) -> "Manifest":
         """Refuse unless the digest of this manifest is ``pin``; then it is :attr:`pinned`. Returns the manifest."""
@@ -206,10 +254,22 @@ class Manifest:
     def _read(directory: pathlib.Path, i: int, entry: Any) -> Artifact:
         if not isinstance(entry, dict):
             raise TilefishManifestError(f"manifest kernel {i} is not an object")
-        needed = ("stem", "arch", "symbol", "cubin", "sha256", "sha256_code", "shared", "launch", "options", "toolchain")
+        entry_kind = entry.get("kind")
+        if entry_kind not in (ENTRY_KIND_TRITON, ENTRY_KIND_BINARY):
+            raise TilefishManifestError(
+                f"manifest kernel {i} ({entry.get('stem')!r}) has kind {entry_kind!r}, which is not '{ENTRY_KIND_TRITON}' or '{ENTRY_KIND_BINARY}'"
+            )
+        needed = ("stem", "arch", "symbol", "cubin", "sha256", "sha256_code", "shared", "launch", "toolchain")
+        needed += ("options",) if entry_kind == ENTRY_KIND_TRITON else ("binary",)  # what the spec determines (abi, grid, block, warps, ...) is checked against the spec
         missing = [k for k in needed if k not in entry]
         if missing:
             raise TilefishManifestError(f"manifest kernel {i} ({entry.get('stem')!r}) is missing {missing}")
+        if entry_kind == ENTRY_KIND_BINARY:
+            extra = [k for k in ("options", "num_warps", "num_stages") if k in entry]
+            if extra:
+                raise TilefishManifestError(
+                    f"manifest kernel {i} ({entry.get('stem')!r}) is a prebuilt binary, which has no {extra} (Triton compile settings)"
+                )
         stem, arch, name = entry["stem"], entry["arch"], entry["cubin"]
         if not isinstance(name, str) or not name or pathlib.PurePath(name).name != name or name in (".", ".."):
             raise TilefishManifestError(f"'{stem}': the cubin file name {name!r} must be a plain file name in the manifest directory")
@@ -235,9 +295,35 @@ class Manifest:
             )
         if elf.section(f".text.{entry['symbol']}") is None:
             raise TilefishManifestError(f"'{stem}' ({arch}): {name!r} has no code section '.text.{entry['symbol']}'")
-        for field in ("options", "toolchain", "launch"):
-            if not isinstance(entry[field], dict):
+        for field in ("options", "toolchain", "launch", "abi"):
+            if field in entry and not isinstance(entry[field], dict):
                 raise TilefishManifestError(f"'{stem}' ({arch}): '{field}' must be an object, got {entry[field]!r}")
+        if "abi" in entry and "scratch_slots" in entry["abi"]:
+            slots = entry["abi"]["scratch_slots"]
+            if type(slots) is not int or slots != (2 if entry_kind == ENTRY_KIND_TRITON else 0):
+                raise TilefishManifestError(
+                    f"'{stem}' ({arch}): a {entry_kind} kernel has {2 if entry_kind == ENTRY_KIND_TRITON else 0} scratch slots, "
+                    f"but abi.scratch_slots is {slots!r}"
+                )
+        if entry_kind == ENTRY_KIND_BINARY:
+            b = entry["binary"]
+            ok = isinstance(b, dict) and b.get("source") in ("ptx", "cubin")
+            if ok and b["source"] == "ptx":
+                flags = b.get("ptxas_flags")
+                ok = set(b) == {"source", "ptxas_flags"} and isinstance(flags, list) and all(isinstance(f, str) for f in flags)
+            elif ok:
+                ok = set(b) == {"source"}
+            if not ok:
+                raise TilefishManifestError(
+                    f"'{stem}' ({arch}): binary must be {{'source': 'cubin'}} or {{'source': 'ptx', 'ptxas_flags': [...]}}, got {b!r}"
+                )
+            if entry.get("source_digest_kind") != BINARY_DIGEST_KIND or entry.get("source_digest") is None:
+                raise TilefishManifestError(
+                    f"'{stem}' ({arch}): a prebuilt binary records the sha256 of its PTX or cubin as source_digest, "
+                    f"with source_digest_kind '{BINARY_DIGEST_KIND}'"
+                )
+            if entry.get("source_sha256") is not None:
+                raise TilefishManifestError(f"'{stem}' ({arch}): a prebuilt binary has no source_sha256 (that is the source of a generated Triton kernel)")
         # the digests of the source, as the Rust reader reads them (crates/tilefish/src/manifest.rs): a field that is there is a string
         # of 64 lowercase hex digits (a JSON null is as absent), and a source digest and its kind come together
         for field in ("source_sha256", "source_digest"):
@@ -252,7 +338,9 @@ class Manifest:
         shared = entry["shared"]
         if isinstance(shared, bool) or not isinstance(shared, int) or shared < 0:
             raise TilefishManifestError(f"'{stem}' ({arch}): shared must be a non-negative integer, got {shared!r}")
-        if shared == 0 and uses_shared(elf, entry["symbol"]):
+        # (Triton gives a kernel that needs shared memory dynamic shared memory, so the section means the manifest must say how much. A
+        # prebuilt binary may have static shared memory, which has the same section, so its declaration is what says how much it addresses.)
+        if entry_kind == ENTRY_KIND_TRITON and shared == 0 and uses_shared(elf, entry["symbol"]):
             raise TilefishManifestError(
                 f"'{stem}' ({arch}): the kernel has a shared memory section ('.nv.shared.{entry['symbol']}'), so it uses "
                 "shared memory, but the manifest says shared = 0; a launch without the dynamic shared memory it addresses "
@@ -302,7 +390,15 @@ class Manifest:
         entry = artifact.entry
         from .aot import _first_difference, _show
 
-        self._check_source(spec, arch, entry, ir_digest, ir_triton, pinned)
+        if (spec.binary is None) != (entry.get("kind") == ENTRY_KIND_TRITON):
+            raise TilefishManifestError(
+                f"the manifest entry for '{spec.stem}' ({arch}) is a {entry.get('kind')} kernel, but the compile spec is for a "
+                f"{'prebuilt binary' if spec.binary is not None else 'Triton kernel'}"
+            )
+        if spec.binary is not None:
+            self._check_binary_source(spec, arch, entry)
+        else:
+            self._check_source(spec, arch, entry, ir_digest, ir_triton, pinned)
 
         expected = json.loads(json.dumps(spec_entry(spec)))  # as JSON read it back: lists, strings, plain numbers
         got = {k: entry.get(k) for k in expected}
@@ -326,18 +422,47 @@ class Manifest:
                 ptx="",
                 symbol=entry["symbol"],
                 shared=int(entry["shared"]),
-                num_warps=int(entry["num_warps"]),
+                num_warps=int(entry.get("num_warps", spec.num_warps)),
                 sha256=entry["sha256"],
                 sha256_code=entry["sha256_code"],
                 triton_version=str(toolchain.get("triton", "")),
                 ptxas_version=str(toolchain.get("ptxas", "")),
                 ptx_target=str(entry.get("ptx_target", "")),
-                options=dict(entry["options"]),
+                options=dict(entry.get("options", {})),
                 launch=launch,
                 ir_digest=entry.get("source_digest") if entry.get("source_digest_kind") == IR_DIGEST_KIND else None,
+                binary_digest=entry.get("source_digest") if entry.get("source_digest_kind") == BINARY_DIGEST_KIND else None,
+                binary_build=dict(entry["binary"]) if spec.binary is not None else None,
             )
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             raise TilefishManifestError(f"'{spec.stem}' ({arch}): the manifest entry is malformed: {type(e).__name__}: {e}") from e
+
+    @staticmethod
+    def _check_binary_source(spec: "CompileSpec", arch: str, entry: "dict[str, Any]") -> None:
+        """A prebuilt binary is identified by the sha256 of its PTX or cubin (kind ``tilefish.binary.v1``): the one the declaration holds.
+
+        The declaration reads the file once, when the operator is declared, so what the process holds is what is compared: an entry
+        built from other bytes is stale, pinned or not (nothing needs Triton or a GPU to tell).
+        """
+        assert spec.binary is not None
+        where = f"'{spec.stem}' ({arch})"
+        key = "ptx" if spec.binary["kind"] == "ptx" else arch
+        have = spec.binary["digests"].get(key)
+        if have is None:
+            raise TilefishManifestError(
+                f"the declaration of {where} has no {spec.binary['kind']} for {arch} (it has {sorted(spec.binary['digests'])}), so "
+                "the manifest entry cannot be checked against it"
+            )
+        if entry.get("source_digest") != have or entry.get("source_digest_kind") != BINARY_DIGEST_KIND:
+            raise TilefishManifestError(
+                f"the manifest entry for {where} was built from a {spec.binary['kind']} with sha256 {entry.get('source_digest')}, but the "
+                f"declaration now holds one with sha256 {have}: the file changed since the manifest was written, so its binary is stale; "
+                "export it again"
+            )
+        if entry["binary"].get("source") != spec.binary["kind"]:
+            raise TilefishManifestError(
+                f"the manifest entry for {where} was made from a {entry['binary'].get('source')}, but the declaration says {spec.binary['kind']}"
+            )
 
     @staticmethod
     def _check_source(
@@ -392,4 +517,5 @@ class Manifest:
         )
 
     def __repr__(self) -> str:
-        return f"<Manifest {str(self.directory)!r}: {len(self._artifacts)} binaries>"
+        library = f", {len(self._library)} library entries" if self._library else ""
+        return f"<Manifest {str(self.directory)!r}: {len(self._artifacts)} binaries{library}>"
