@@ -394,9 +394,10 @@ fn launches_and_replays_from_two_threads_on_two_streams_run_one_after_the_other(
                 let s = gpu.ctx.new_stream().unwrap();
                 let mut exts = upload(&s, a);
                 let out = exts.iter().position(|e| e.name == "out0").unwrap();
+                let bytes = exts[out].slice.len();
                 let mut outs = Vec::new();
                 for _ in 0..rounds {
-                    exts[out].slice = s.alloc_zeros::<u8>(exts[out].slice.len()).unwrap();
+                    exts[out].slice = s.alloc_zeros::<u8>(bytes).unwrap();
                     run.launch(&s, &mut args(&mut exts, false), &named(&devscalars(a))).unwrap();
                     outs.push(std::mem::replace(&mut exts[out].slice, s.alloc_zeros::<u8>(1).unwrap()));
                 }
