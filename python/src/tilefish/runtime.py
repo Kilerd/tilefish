@@ -228,8 +228,8 @@ def _target(op: Any) -> _Target:
         return _Target(op.name, op.kernel.signature, op.kernel, op.extern, op)
     if isinstance(op, KernelOp):
         return _Target(op.name, op.signature, op, None, None)
-    if isinstance(op, ExternOp):
-        return _Target(op.name, op.signature, None, op, None)
+    if isinstance(op, ExternOp):  # a generated op (tilefish.contiguous, tilefish.im2col) carries the Triton source tilefish wrote for it
+        return _Target(op.name, op.signature, None, op, op.__dict__.get("_tf_generated"))
     if isinstance(op, Op):
         raise TilefishRuntimeError(
             f"cannot run the {op.kind} op '{op.name}': @tilefish.kernel, @tilefish.extern, a @tilefish.library with an impl and a @tilefish.graph run "
@@ -665,9 +665,29 @@ def replay_pin(spec: Any, manifest: Manifest, index: int) -> Any:
     return _library.built_from_manifest(manifest, spec, f"sm_{_capability(_torch(), index)}", _library.sm_count(index))
 
 
+def _run_extern_reference(op: ExternOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:
+    """``reference`` mode of an extern that has a ``reference=`` (a generated op has one): the torch function of its inputs, which returns
+    its ``Out`` tensors. An ``InOut`` tensor is not supported here (the reference returns, it does not update)."""
+    sig = op.signature
+    if any(p.access == "inout" for p in sig.tensor_inputs):
+        raise TilefishRuntimeError(f"reference mode of the extern op '{op.name}' does not run an op with InOut parameters on its own")
+    call = bind_call(op.name, sig, args, kwargs)
+    check_dim_constraints(call.dims, buckets=False)
+    assert op.reference is not None
+    res = op.reference(**{p.name: call.tensors[p.name] for p in sig.tensor_inputs})
+    produced = [] if res is None else (list(res) if isinstance(res, (tuple, list)) else [res])
+    if len(produced) != len(sig.tensor_outputs):
+        raise TilefishRuntimeError(
+            f"the reference of the extern op '{op.name}' returned {len(produced)} tensor(s), but the op has {len(sig.tensor_outputs)} Out parameter(s)"
+        )
+    return _result(produced)
+
+
 def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:
     from ._reference import interpret
 
+    if target.kernel is None and target.extern is not None and target.extern.reference is not None:
+        return _run_extern_reference(target.extern, args, kwargs)
     if target.kernel is None:
         raise TilefishRuntimeError(
             f"reference mode interprets the IR of a @tilefish.kernel; the extern op '{target.name}' wraps a hand-written "

@@ -60,6 +60,7 @@ from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import argmax, argmin, cos, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sin, sqrt, where
+from ._copyops import contiguous, im2col
 from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
@@ -124,6 +125,7 @@ __all__ = [
     "capture",
     "cdiv",
     "const",
+    "contiguous",
     "cos",
     "e2m1",
     "e4m3",
@@ -137,6 +139,7 @@ __all__ = [
     "graph",
     "i32",
     "i64",
+    "im2col",
     "iota",
     "kernel",
     "library",
