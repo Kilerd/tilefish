@@ -17,7 +17,9 @@
 //! device scalar is one element), that no dimension is empty, and that a tensor given for a parameter that is not strided is contiguous;
 //! the binding of the dimensions from the sizes of those tensors, and from the canonical strides of their views, which must agree across
 //! arguments and with the static sizes (a port of `solve_dims`: a call that leaves a dimension undetermined is ambiguous, an error that is not
-//! a precondition); `divisible_by` and the buckets of each dimension, in the order they were bound; the bucket of the binary (a bucketed
+//! a precondition), then of the dimensions they leave unbound from the shapes of the `Out` tensors that mention one (each checked on its own
+//! first: a dimension only an `Out` parameter mentions, Python's `bind_outputs`); `divisible_by` and the buckets of each dimension, in the
+//! order they were bound; the bucket of the binary (a bucketed
 //! dimension is the bucket exactly: there is no padding, and it is what the tensors say, never taken from the binary); the device and the
 //! context of every tensor; each tensor the kernel writes (`Out`, which Python allocates) against what Python would allocate; the runtime
 //! scalars, derived from their dimension expression, from the element count of the tensor they count (which binds the dimension a scalar is,
@@ -628,6 +630,21 @@ impl Plan {
             self.equations_of(t, a, &canonical[t], &mut equations)?;
         }
         self.solve(&mut dims, &mut bound, &equations)?;
+
+        // -- the dimensions those leave unbound, from the tensors the kernel writes (Python's `bind_outputs`): a dimension only an `Out`
+        // parameter's shape mentions (a `[B]` mask an extern writes from a device scalar) is what the `Out` tensor given for it says. Each `Out`
+        // tensor whose shape mentions one is checked on its own first, in the order of the ABI
+        let open: Vec<usize> = (0..self.tensors.len())
+            .filter(|&t| !read(t) && self.tensors[t].shape.iter().any(|p| p.vars.iter().any(|v| dims[*v].is_none())))
+            .collect();
+        if !open.is_empty() {
+            let mut more = Vec::new();
+            for &t in &open {
+                self.check_tensor(t, &tensors[t])?;
+                self.equations_of(t, &tensors[t], &canonical[t], &mut more)?;
+            }
+            self.solve(&mut dims, &mut bound, &more)?;
+        }
 
         // -- what the manifest says of each dimension bound (Python's `check_dim_constraints`): divisible_by, one of its buckets
         self.check_dims(&dims, &bound)?;

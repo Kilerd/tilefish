@@ -43,6 +43,7 @@ from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
     bind_infos,
+    bind_outputs,
     check_consts,
     check_dim_constraints,
     check_no_alias,
@@ -611,6 +612,9 @@ def resolve_step(
         extern = callee.extern
         public = {pp.name: infos[callee.names[pp.name]] for pp in callee.public.params if pp.kind == "tensor" and pp.access != "out"}
         dims = bind_infos(callee.name, callee.public, public)
+        # a dimension only the callee's Out parameters mention is bound from the Out buffer of the step, as any launch given its Out tensor binds it
+        outs = {pp.name: infos[callee.names[pp.name]] for pp in callee.public.tensor_outputs}
+        dims = bind_outputs(callee.name, callee.public, outs, dims)
         check_dim_constraints(dims)
         spec = select_spec(callee.name, callee.specs, dims)
         for q in extern.signature.params:  # a result is allocated by the callee's signature: the plan's buffer must be that

@@ -448,6 +448,9 @@ LAUNCH_CASES = [
     # M3.3: three views read with one stride pair, the q, k and v of a fused [R, 3, 4, 64] tensor (strides (768, 64, 1) each)
     ("qkv_sum", lambda r: [("bf16", (r, 4, 64), (768, 64, 1))] * 3, (1, 5)),
     ("qkv_sum16", lambda r: [("bf16", (r, 4, 64), (768, 64, 1))] * 3, (1, 5)),
+    # M3.3: a dimension only the Out tensor determines (a [B] mask from a device scalar): the inputs, then the Out tensors the call is given
+    ("key_mask", lambda b: [("i32", ()), ("bf16", (b,))], (8, 24)),
+    ("key_mask_any", lambda b: [("i32", (1,)), ("bf16", (b,))], (1, 1000)),
 ]
 _OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16", "i32": "i64"}
 I31 = (1 << 31) - 1
@@ -526,6 +529,21 @@ def _shared_strides(key, base):
     # the same strides on all three: separate dense tensors, a wider fused tensor, a broadcast first axis
     for strides in ((256, 64, 1), (1536, 64, 1), (0, 64, 1), (768, 64, 1)):
         yield [0, 1, 2], (base[0][0], base[0][1], None, strides)
+
+
+def _output_bound(key, base):
+    """Calls of an op whose ``Out`` tensor binds a dimension (``key_mask``): ``(input index, (dtype, shape, ptr, strides))`` for the ``Out`` tensor
+    (index 1) of other numbers of keys, buckets and not, and of other ranks, and for the device scalar (index 0) of every shape."""
+    if key not in ("key_mask", "key_mask_any"):
+        return
+    dtype, _, ptr, _ = base[1]
+    for b in (1, 7, 8, 9, 16, 24, 25, 128, 129, 1 << 20):
+        yield 1, (dtype, (b,), ptr, None)
+    yield 1, (dtype, (24, 1), ptr, None)
+    yield 1, (dtype, (), ptr, None)
+    yield 1, ("f32", (24,), ptr, None)
+    for shape in ((), (1,), (2,), (1, 1), (0,)):
+        yield 0, ("i32", shape, base[0][2], None)
 
 
 def _device_scalars(key, base):
@@ -608,13 +626,24 @@ def launches():
     stems = set()
     for key, build, sizes in LAUNCH_CASES:
         op = declared[key]
-        _, inputs, _ = abi_of(op)
+        _, inputs, outputs = abi_of(op)
+        # an op with a dimension only its Out tensors determine is called with them (`outputs=`), after its inputs: every change of a call is a
+        # change of one of them too
+        given_outs = bool(_target(op).public.output_dims)
+        names = inputs + outputs if given_outs else inputs
+        n_in = len(inputs)
+
+        def prepare_call(call, after):
+            if not given_outs:
+                return prepare(op, [fake(t) for t in call], next_slab=after)
+            return prepare(op, [fake(t) for t in call[:n_in]], next_slab=after, outputs=[fake(t) for t in call[n_in:]])
+
         specs = {sp.stem: sp for sp in _target(op).compile_specs()}
         stems |= set(specs)
         for size in sizes:
             base = [(item[0], tuple(item[1]), first_slab + i * slab, tuple(item[2]) if len(item) > 2 else None) for i, item in enumerate(build(size))]
             after = first_slab + len(base) * slab
-            prepared, error = prepare(op, [fake(t) for t in base], next_slab=after)
+            prepared, error = prepare_call(base, after)
             assert error is None, (key, size, error)
             intended = prepared.spec
             by_abi_base = dict(prepared.tensors)  # the allocated Out tensors of the valid call
@@ -636,24 +665,26 @@ def launches():
                 for j in which:
                     call[j] = (dtype, shape, base[j][2] if ptr is None else ptr, strides)
                 calls.append(call)
+            for j, new in _output_bound(key, base):
+                calls.append([*base[:j], new, *base[j + 1 :]])
             if key == "bucketed_rms":  # the bucketed dimension moved in every tensor that has it: another bucket, or none
                 rows = size[0]
                 for db in (95, 100, 512, 1000):
                     calls.append([(base[0][0], (rows, db), base[0][2], None), (base[1][0], (db,), base[1][2], None)])
             for call in calls:
-                prepared, error = prepare(op, [fake(t) for t in call], next_slab=after)
+                prepared, error = prepare_call(call, after)
                 got = verdict(prepared, error)
                 if prepared is not None:
                     # a binary Python selected: a valid call of that binary, and a bucket refusal of the one intended
                     selected = prepared.spec
                     add(selected.stem, abi_tensors(selected, dict(prepared.tensors)), {k: v for k, v in got.items() if k != "stem"})
                     if selected.stem != intended.stem:
-                        by_name = {inputs[i]: fake(t) for i, t in enumerate(call)}
+                        by_name = {names[i]: fake(t) for i, t in enumerate(call)}
                         outs = allocated_outs(op, call, after, {n: t for n, t in by_abi_base.items() if n not in by_name})
                         add(intended.stem, abi_tensors(intended, {**outs, **by_name}), {"ok": False, "kind": "bucket"})
                 else:
-                    by_name = {inputs[i]: fake(t) for i, t in enumerate(call)}
-                    outs = allocated_outs(op, call, after, {n: t for n, t in by_abi_base.items() if n not in by_name})
+                    by_name = {names[i]: fake(t) for i, t in enumerate(call)}
+                    outs = allocated_outs(op, call[:n_in], after, {n: t for n, t in by_abi_base.items() if n not in by_name})
                     add(intended.stem, abi_tensors(intended, {**outs, **by_name}), got)
     return records, len(stems)
 

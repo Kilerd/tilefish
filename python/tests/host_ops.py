@@ -12,7 +12,8 @@ kernels declared with ``tilefish.extern`` (an rmsnorm, an exact-erf gelu and an 
   ``strided_copy``: a 64-bit stride and a fixed ``i32``);
 
 and what M3.3 added (``gpu_kernels_p4.py``): ``fma_plain`` and ``fma_fused``, one hand-written kernel declared with ``enable_fp_fusion=False``
-and ``True``; ``qkv_sum`` and ``qkv_sum16``, a kernel that reads three views with one stride pair (``StrideOf(("q", "k", "v"), axis)``).
+and ``True``; ``qkv_sum`` and ``qkv_sum16``, a kernel that reads three views with one stride pair (``StrideOf(("q", "k", "v"), axis)``);
+``key_mask`` and ``key_mask_any``, a ``[B]`` mask made from a device scalar, whose ``B`` only the ``Out`` tensor determines.
 
 ``gpu_ops(directory, arch)`` is what needs the GPU toolchain to *declare*: the PTX of two lowered goldens taken from a Triton build
 (``gelu_ptx``, ``softmax_ptx``: the same machine code as the Triton path, declared as prebuilt externs with the Triton ABI's two scratch
@@ -154,6 +155,9 @@ def ops():
         # strides that several views share (M3.3)
         "qkv_sum": p4.qkv_sum,
         "qkv_sum16": p4.qkv_sum16,
+        # a dimension only the Out tensor determines (M3.3)
+        "key_mask": p4.key_mask,
+        "key_mask_any": p4.key_mask_any,
     }
 
 

@@ -112,6 +112,10 @@ magnitude, so that every language reads the same number); a file larger than
 * **Selecting a bucket at a call.** The host binds the dimensions from the sizes of the external tensors it is given (each external's `shape` expressions are equations;
   `3*M` against 192 gives `M = 64`, and a size that is not a whole multiple is a refusal), exactly as it binds the dimensions of one launch. Every name in `dims` must be
   bound, and its value must be in its list; else the call is refused with the kind `bucket` and nothing runs. Two externals that bind a name differently are refused.
+* **A dimension only an operator's `Out` parameters mention.** An extern may write a tensor whose dimension no argument of the call has (a `[B]` mask made from a
+  device scalar: manifest schema 3, section 7). In a graph such a call binds it to the graph's dimension that is the same `Dim` (its name, `divisible_by` and
+  `buckets`): the plan is made per bucket of the graph's dimensions, so the step's `Out` buffer has the bucket's size, and the step binds the entry's dimension from
+  that buffer as any launch given its `Out` tensor does (section 7.2). A graph that has no such dimension cannot make the call (`TilefishTypeError` at the call).
 
 ## 6. Buffers and the arena
 
@@ -175,7 +179,7 @@ An argument is `{"name": <string>, "binding": <buffer name>}` and optionally `"v
 
 The step is a launch of the manifest entry `entry` with the tensors of its arguments: pointer = as above, shape = `view.shape` (or the buffer's), element strides = `view.strides` (or
 the row-major ones). Everything else is as for a single launch in manifest schema 3: the host **binds the entry's dimensions from those shapes and strides** (section 5.1 there, with its
-canonical strides for axes of size 1), derives the runtime scalars (dimensions, element counts, strides, `fixed` values), evaluates the grid expression, and checks every precondition of the entry
+canonical strides for axes of size 1; a dimension the arguments the entry reads leave unbound is bound from the shape of its `out` arguments, section 7 there), derives the runtime scalars (dimensions, element counts, strides, `fixed` values), evaluates the grid expression, and checks every precondition of the entry
 (`pointer_alignment` of the passed pointer, `static_size`, `divisible`, `bucket`, `max_elements`, `max_extent`), that a pointer without `strides` in its ABI entry gets a **dense** tensor
 (the strides of its axes of size > 1 are the row-major ones), that the ranks and dtypes are the ABI's, that a written pointer (`access` `out` or `inout`) overlaps no other argument of the step, and
 the grid against the device's limits. A kernel is launched with `cuLaunchKernel` (a Triton kernel with its two zero scratch slots, a prebuilt one with exactly its parameters); a library entry
@@ -379,6 +383,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | what | tests (`python/tests/`) |
 |---|---|
 | the walk, the steps and views, the buffers, roles, buckets, the refusals of section 12 | `test_plan.py` |
+| a step that reads three views with one stride pair; a step whose dimension only its `Out` buffer has (section 5) | `test_shared_strides.py`, `test_output_dims.py`; on a GPU `test_gpu_shared_strides.py`, `test_gpu_output_dims.py` |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |
 | the document of section 13 | `test_plan_docs.py` |

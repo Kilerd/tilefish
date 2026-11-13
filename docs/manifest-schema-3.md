@@ -214,6 +214,17 @@ dimensions of a strided pointer: every stride dimension (`x_s0`) and the offset 
 constraints (`{"divisible_by": 8}` on the offset dimension of a `Strided[..., 16]` pointer; `{"divisible_by": k}` on a stride that the declaration
 says is a multiple of `k`). A name used in a shape, a `strides`/`offset` entry, a scalar's `dim` or the grid must be in `dims`.
 
+**Which tensors bind a dimension.** A launch binds the dimensions from the tensors the kernel reads (`in` and `inout`: their shapes, and the strides of
+their views) and then, for the dimensions those leave unbound, from the shapes of the `out` tensors it is given, in the order of the ABI: an `out` tensor
+whose declared shape mentions such a dimension is checked on its own first (its dtype, its rank, that it is not empty and that it is contiguous), and its
+shape equations are solved with what the inputs bound. Every dimension is then checked as any other: its `divisible_by`, its buckets and the `bucket` of
+the binary, the scalar that carries it. A dimension that only an `out` tensor determines is that of an extern that writes a `[B]` mask from a device
+scalar alone, `key_mask(mask: Out[Tensor[B, bf16]], n_valid: DevScalar[i32], b: B)`: nothing in its entry is new, and a host that binds only from the
+tensors the kernel reads refuses its launch as ambiguous (the crate 0.0.2 and tilefish 0.0.4 do). Python's single launch is given the tensors it writes
+with `tilefish.run(op, ..., outputs=...)` (without them it cannot allocate them, and says so); a plan step and a Rust launch always have them. The
+declaration of such a dimension is allowed for an extern (a kernel's shapes come from its inputs), never for the offset dimension of a strided
+pointer.
+
 ### 7.1 Dimension expressions: the limits both readers hold
 
 A shape axis, a stride dimension, a scalar's `dim`, the `dim` of a `divisible` precondition, an axis of the `shape` of a `max_elements` precondition and
@@ -441,7 +452,8 @@ and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter th
 * An entry may name at most 32 dimensions (a strided pointer has one per axis and one for its offset), and its expressions are folded in 128 bits
   (section 7.1); Python's reader holds both.
 
-**Launching a kernel** (`plan.rs`). The steps of section 5.1, in Python's order: shapes, strides and scalars bind the dimensions, `divisible_by`, the exact
+**Launching a kernel** (`plan.rs`). The steps of section 5.1, in Python's order: shapes, strides and scalars bind the dimensions (then the `out` tensors bind
+the dimensions those leave unbound, section 7), `divisible_by`, the exact
 bucket, the range of every scalar (`i32` or `i64`), aliasing (a view by its extent), the alignment each pointer promises, `max_elements`/`max_extent`,
 the grid. The kinds of the refusals are Python's (`stride`, `max_extent`, `contiguous` are new `PreconditionKind`s). A view is
 `TensorRef::from_cuda_strided(&slice, &shape, &strides, offset)` (also `TensorMut`, and `new_strided` over a region): element strides, which are
@@ -485,6 +497,7 @@ stride scalars and `fixed` arguments are not parameters) and for each library en
 | `kind`, `abi.scratch_slots`, prebuilt binary entries | `test_binary_externs.py`, `test_manifest_schema3.py` |
 | strided pointers, `strides`/`offset`/`stride_of`, `max_extent`, alignment | `test_strided_specs.py`, `test_views.py`; on a GPU `test_gpu_strided.py` |
 | a stride that several views share (`stride_of` a list) | `test_shared_strides.py`, `test_rust_host_schema3.py`; on a GPU `test_gpu_shared_strides.py` |
+| a dimension only an `out` tensor determines (section 7) | `test_output_dims.py`; on a GPU `test_gpu_output_dims.py` |
 | device scalars | `test_devscalar.py`; on a GPU `test_gpu_devscalar.py` |
 | prebuilt PTX and cubin, byte identity with the Triton path | `test_binary_externs.py`; on a GPU `test_gpu_binary.py`, `ptx/*.ptx` |
 | the `library` section | `test_library_ops.py`, `test_cublaslt.py`; on a GPU `test_gpu_gemm.py`, `test_gpu_cublaslt.py` |

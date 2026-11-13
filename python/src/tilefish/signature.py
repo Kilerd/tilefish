@@ -129,6 +129,32 @@ class Signature:
     def dim_params(self) -> tuple[Param, ...]:
         return tuple(p for p in self.params if p.kind == "dim")
 
+    @property
+    def input_dims(self) -> "frozenset[Dim]":
+        """The dimensions the tensors a call reads determine: those of their shapes and, for a ``Strided[...]`` parameter, of its strides."""
+        determined: set[Dim] = set()
+        for p in self.tensor_inputs:
+            t = p.type
+            assert t is not None
+            for d in t.shape:
+                determined |= d.free_dims()
+            for s in t.strides or ():
+                if s is not None:
+                    determined |= s.free_dims()
+        return frozenset(determined)
+
+    @property
+    def output_dims(self) -> "frozenset[Dim]":
+        """The dimensions only the shapes of the ``Out`` parameters mention (an extern that writes a ``[B]`` tensor and reads a device scalar): no
+        tensor a call reads determines them. A launch binds them from the ``Out`` tensors it is given, and a call in a trace binds each to the
+        dimension of the enclosing graph that is the same ``Dim`` (a plan is made per bucket of the graph's dimensions)."""
+        mentioned: set[Dim] = set()
+        for p in self.tensor_outputs:
+            assert p.type is not None
+            for d in p.type.shape:
+                mentioned |= d.free_dims()
+        return frozenset(mentioned - self.input_dims)
+
     def __str__(self) -> str:
         text = ", ".join(str(p) for p in self.params)
         if self.returns:
@@ -190,11 +216,13 @@ def parse_signature(
     check_derivable: bool = True,
     allow_strided: bool = False,
     allow_devscalar: bool = True,
+    allow_output_dims: bool = False,
 ) -> Signature:
     """Read ``fn``'s annotations into a :class:`Signature`.
 
     ``allow_strided`` lets a tensor parameter be ``Strided[...]`` and a scalar parameter ``StrideOf(...)`` (an extern op does;
-    see :class:`~tilefish.types.Strided`).
+    see :class:`~tilefish.types.Strided`). ``allow_output_dims`` lets the shape of an ``Out`` parameter mention a dimension that no input
+    determines (an extern op does: :attr:`Signature.output_dims`).
     """
     where = f"{what} '{name}'"
     sig = inspect.signature(fn)
@@ -277,7 +305,7 @@ def parse_signature(
 
     result = Signature(params, returns)
     if check_derivable:
-        _check_derivable(where, result)
+        _check_derivable(where, result, allow_output_dims)
     return result
 
 
@@ -361,20 +389,21 @@ def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":
     return out
 
 
-def _check_derivable(where: str, sig: Signature) -> None:
+def _check_derivable(where: str, sig: Signature, allow_output_dims: bool = False) -> None:
     """Outputs and dim parameters may only mention dims that the input tensors determine at a launch: those of their shapes and, for a
     ``Strided[...]`` parameter, of its strides. **Not the offset dimension** (``x_offset``) of a strided parameter: a launch does not bind it, in
     Python (``_launch.bind_infos``) or in Rust (manifest schema 3, section 5.1, step 7: the check of the address is the one made), so a result
-    shaped by it, or a runtime scalar that carries it, could be traced but never launched."""
-    determined: set[Dim] = set()
-    for p in sig.tensor_inputs:
-        t = p.type
-        assert t is not None
-        for d in t.shape:
-            determined |= d.free_dims()
-        for s in t.strides or ():
-            if s is not None:
-                determined |= s.free_dims()
+    shaped by it, or a runtime scalar that carries it, could be traced but never launched.
+
+    With ``allow_output_dims`` (an extern) the shapes of the ``Out`` parameters determine dimensions too, the ones no input does
+    (:attr:`Signature.output_dims`): a launch is given its ``Out`` tensors and binds them from their shapes."""
+    offsets = {p.type.offset for p in sig.tensor_inputs if p.strided and p.type is not None}
+    determined: set[Dim] = set(sig.input_dims)
+    if allow_output_dims:  # (but not the offset dimension of a strided parameter, which is the view's own: no Out tensor says what it is)
+        for p in sig.tensor_outputs:
+            assert p.type is not None
+            for d in p.type.shape:
+                determined |= d.free_dims() - offsets
     targets: list[tuple[str, Any]] = []
     for p in sig.tensor_outputs:
         targets.append((f"Out parameter '{p.name}'", p.type))
@@ -382,7 +411,6 @@ def _check_derivable(where: str, sig: Signature) -> None:
         targets.append((f"return value {i}", r))
     for p in sig.dim_params:
         targets.append((f"runtime parameter '{p.name}'", p.dim))
-    offsets = {p.type.offset for p in sig.tensor_inputs if p.strided and p.type is not None}
     for label, t in targets:
         free = t.free_dims() - determined
         missing = sorted(d.name for d in free)
@@ -668,6 +696,31 @@ def _add_layout_equations(op: "Op", p: Param, pt: TensorType, at: TensorType, un
     unifier.add(p.name, -1, pt.offset, at.offset, at, "offset")
 
 
+def _bind_output_dims(op: "Op", sig: Signature, unifier: _Unifier, ctx: TraceContext) -> None:
+    """A dimension that only the ``Out`` parameters of the callee mention (``mask: Out[Tensor[B, bf16]]`` of an extern that reads a device scalar)
+    is determined by no argument of the call: it is the dimension of the enclosing graph that is the same ``Dim`` (its name, ``divisible_by`` and
+    ``buckets``). A plan is made per bucket of the graph's dimensions, so the step that launches the callee knows its value, and binds it from the
+    ``Out`` buffer of that shape, as any launch given its ``Out`` tensor does. A graph that has no such dimension cannot make the call."""
+    for d in sorted(sig.output_dims, key=lambda d: d.name):
+        if d in unifier.bindings:  # (no argument mentions it: only a static Dim could be bound already)
+            continue
+        out = next(p for p in sig.tensor_outputs if any(d in s.free_dims() for s in p.type.shape))  # type: ignore[union-attr]
+        if d not in ctx.dims:
+            namesakes = sorted(repr(g) for g in ctx.dims if g.name == d.name)
+            note = (
+                f"; {ctx.kind} '{ctx.name}' has {', '.join(namesakes)}, which is not the same dimension (a Dim is its name, divisible_by and buckets)"
+                if namesakes
+                else ""
+            )
+            raise TilefishTypeError(
+                f"{op.name}: the dimension {d!r} of Out parameter '{out.name}' is determined by no argument of the call, so it is the dimension of "
+                f"the enclosing {ctx.kind} that is the same Dim, and {ctx.kind} '{ctx.name}' has none{note}: declare the {ctx.kind}'s parameters with "
+                f"that Dim, or give {op.name} an input that has it"
+            )
+        axis = next(i for i, s in enumerate(out.type.shape) if d in s.free_dims())  # type: ignore[union-attr]
+        unifier._bind(d, d, out.name, axis)
+
+
 def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
     sig = op.signature
     unifier = _Unifier(op, ctx)
@@ -729,6 +782,7 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
         if p.access == "inout":
             inout_args.append((p, arg, live))
     unifier.solve()
+    _bind_output_dims(op, sig, unifier, ctx)
 
     consts: dict[str, Any] = {}
     for p in sig.consts:

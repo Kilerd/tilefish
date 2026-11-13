@@ -35,6 +35,9 @@ class TraceContext:
         self.known: dict[DimExpr, int] = {}
         # Parameters (Out/InOut) that a store or an in-place call has written.
         self.written: set[Value] = set()
+        # The dimensions of the trace itself: those its tensor parameters mention (a graph's dimensions, which a plan has buckets of). A call
+        # binds a dimension of its callee that no argument determines (one only its Out parameters mention) to the one of these that is the same Dim.
+        self.dims: frozenset[Dim] = frozenset()
         self._next_id = 0
 
     def new_value(

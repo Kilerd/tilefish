@@ -1205,8 +1205,9 @@ fn the_gate_has_a_case_for_every_feature_of_schema_3() {
 }
 
 /// What M3.3 added is in the gate: one hand-written kernel compiled without and with FMA contraction (`enable_fp_fusion` of its
-/// declaration, in the options of its entry), and a kernel that reads three views with one stride pair (`StrideOf(("q", "k", "v"), axis)`),
-/// given the q, k and v of one fused tensor and three tensors of their own; `byte_identity` holds their bytes to Python's.
+/// declaration, in the options of its entry), a kernel that reads three views with one stride pair (`StrideOf(("q", "k", "v"), axis)`),
+/// given the q, k and v of one fused tensor and three tensors of their own, and a `[B]` mask made from a device scalar whose `B` only the
+/// `Out` tensor determines; `byte_identity` holds their bytes to Python's.
 #[test]
 fn the_gate_has_a_case_for_every_feature_of_m3_3() {
     let cases = cases();
@@ -1237,6 +1238,22 @@ fn the_gate_has_a_case_for_every_feature_of_m3_3() {
             })
             .collect::<Vec<_>>();
         assert_eq!(carried, [3, 3], "{stem}: two stride scalars, each the stride of three views");
+    }
+    for (stem, sizes) in [("key_mask", &[8u64, 24][..]), ("key_mask_any", &[1, 130, 1000][..])] {
+        let masks: std::collections::BTreeSet<u64> = cases_where(&cases, |c| c["stem"] == stem)
+            .iter()
+            .map(|c| tensors_json(c)[0]["shape"][0].as_u64().unwrap())
+            .collect();
+        assert!(
+            sizes.iter().all(|b| masks.contains(b)),
+            "{stem}: the gate has masks of {masks:?} keys, not every one of {sizes:?}"
+        );
+        // no tensor the kernel reads has B: the mask is the first tensor, the device scalar the second
+        let entry = manifest.entry(stem, &arch).expect("the gate's manifest has the entry");
+        let reads_b = entry.params.iter().any(
+            |p| matches!(&p.kind, tilefish::ParamKind::Pointer { access: Access::In, shape, .. } if !shape.is_empty()),
+        );
+        assert!(!reads_b, "{stem}: the kernel reads no tensor that has B");
     }
 }
 

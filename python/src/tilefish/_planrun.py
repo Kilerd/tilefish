@@ -70,10 +70,12 @@ from . import _plan, runtime
 from ._launch import (
     TORCH_DTYPE_NAMES,
     bind_call,
+    bind_infos,
     check_dim_constraints,
     check_tensor,
     dims_by_name,
     eval_dim,
+    solve_dims,
     tensor_info,
 )
 from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp
@@ -1330,6 +1332,23 @@ def _existing_graph(path: pathlib.Path) -> "str | None":
 # -- reference mode ---------------------------------------------------------------------------------------------------------------------
 
 
+def _reference_dims(op: ExternOp, ins: "dict[str, Any]", outs: "Sequence[Value]", size: Any) -> "dict[str, int]":
+    """What the reference of an extern is given besides its tensor inputs: nothing, unless a dimension only its ``Out`` parameters mention (an extern
+    that writes a ``[B]`` tensor and reads a device scalar), which no input tells the reference; then its runtime dimension parameters (and stride
+    scalars), by name, with the values a launch passes: bound from the inputs, and from the shapes the graph gives the ``Out`` tensors."""
+    sig = op.signature
+    if not sig.output_dims:
+        return {}
+    dims = bind_infos(op.name, sig, {name: tensor_info(name, t) for name, t in ins.items()})
+    equations = [
+        (p.name, axis, pattern, size(actual), str(p.type), "dimension")
+        for p, v in zip(sig.tensor_outputs, outs)
+        for axis, (pattern, actual) in enumerate(zip(p.type.shape, v.type.shape))  # type: ignore[union-attr]
+    ]
+    dims = solve_dims(op.name, equations, dims)
+    return {p.name: eval_dim(p.dim, dims) for p in sig.dim_params}  # type: ignore[arg-type,misc]
+
+
 def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:
     """``mode="reference"`` of a graph: the eager composition of the reference of each op, in torch, node by node.
 
@@ -1423,7 +1442,7 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
                         f"reference mode of graph '{graph.name}' needs a reference for the extern op '{op.name}': it wraps a hand-written kernel, which has no IR to "
                         "interpret. Give @tilefish.extern a reference=<a torch function of the op's tensor inputs> that returns its Out tensors"
                     )
-                res = op.reference(**ins)
+                res = op.reference(**ins, **_reference_dims(op, ins, n.outputs[: len(op_sig.tensor_outputs)], size))
                 produced = [] if res is None else (list(res) if isinstance(res, (tuple, list)) else [res])
                 if len(produced) != len(op_sig.tensor_outputs):
                     raise TilefishRuntimeError(

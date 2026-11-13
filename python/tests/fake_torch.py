@@ -98,12 +98,13 @@ class FakeTorch:
         return FakeTensor(shape, dtype, ptr)
 
 
-def prepare(op, args, *, next_slab):
-    """``runtime._prepare`` of ``op`` on ``args`` (fake tensors): ``(prepared, None)``, or ``(None, error)``."""
+def prepare(op, args, *, next_slab, outputs=None):
+    """``runtime._prepare`` of ``op`` on ``args`` (fake tensors): ``(prepared, None)``, or ``(None, error)``. ``outputs`` are the fake tensors its
+    results are written into (``tilefish.run(..., outputs=...)``) instead of allocated ones."""
     saved = runtime._torch
     runtime._torch = lambda: FakeTorch(next_slab)
     try:
-        return runtime._prepare(runtime._target(op), tuple(args), {}), None
+        return runtime._prepare(runtime._target(op), tuple(args), {}, outputs), None
     except TilefishError as e:
         return None, e
     finally:

@@ -314,6 +314,11 @@ view in a kernel body is refused with the rule that says so.
 element. A binary reads it with `tl.load`, so one binary serves every value and a value changes by writing memory, never by building; a lowered kernel
 reads it with `tilefish.load(s)` (one `tl.load(ptr)`, broadcast).
 
+**A dimension only an `Out` tensor has.** An extern may write a tensor whose size no input has: `key_mask(mask: Out[Tensor[B, bf16]], n_valid: DevScalar[i32],
+b: B)` makes a `[B]` mask from a device scalar alone. A launch binds `B` from the `Out` tensor it is given (`tilefish.run(key_mask, n, outputs=mask)`; a Rust
+launch and every plan step have their `Out` tensors) and checks it like any dimension, buckets included. In a graph the call binds `B` to the graph's own `B`
+(the same `Dim`), so the plan, which is per bucket, sizes the mask and the step binds it from that buffer.
+
 **Prebuilt binaries.** `@tilefish.extern(ptx="k.ptx", symbol="k", block=(256,), grid=...)` or `cubin={"sm_103": "k.cubin"}` declares a kernel that
 Triton does not compile, by its C ABI: pointers, `Dim` scalars and typed `const[i32|i64|f32]` fixed arguments, in order, and **no Triton scratch slots**.
 Its identity is the sha256 of the bytes of the file (`source_digest` of kind `tilefish.binary.v1`); PTX is assembled by `ptxas` with fixed, recorded flags
@@ -409,7 +414,8 @@ every pointer parameter records its declared shape, with static axes as sizes
 (`["Rows", 1024]`), and every entry the constraints of its named dimensions
 (`divisible_by`, `buckets`, and the bucket the binary is built for). A launch
 takes nothing but its tensors. The crate binds the dimensions from their sizes
-(and the stride dimensions of a strided view from its canonical strides),
+(and the stride dimensions of a strided view from its canonical strides; the
+tensors the kernel reads first, then an `Out` tensor for a dimension only it has),
 checks that they agree across arguments and with the static sizes, the exact
 bucket and `divisible_by`, the dtype and rank of each tensor (a device scalar is
 one element), `max_elements` and, for a view, `max_extent`, that the runtime

@@ -239,6 +239,27 @@ def bind_infos(op_name: str, sig: "Signature", infos: "Mapping[str, TensorInfo]"
     return solve_dims(op_name, equations)
 
 
+def bind_outputs(op_name: str, sig: "Signature", infos: "Mapping[str, TensorInfo]", dims: "Mapping[Dim, int]") -> "dict[Dim, int]":
+    """Bind the dimensions the tensors a call reads leave unbound from the ``Out`` tensors it is given (``infos``, by parameter name), in the order
+    of the signature: each ``Out`` parameter whose declared shape mentions one of them is checked on its own (dtype, rank, contiguity) and its
+    shape solved, with ``dims`` (what :func:`bind_infos` bound) as known. That is a dimension only the ``Out`` parameters of an extern mention
+    (:attr:`~tilefish.signature.Signature.output_dims`): a plan's step, a Rust launch and ``tilefish.run(..., outputs=...)`` are given the tensor.
+    An ``Out`` tensor whose shape mentions only bound dimensions is not looked at here (it is checked against them where it is used)."""
+    open_params = [
+        p for p in sig.tensor_outputs if any(d not in dims for s in p.type.shape for d in s.free_dims())  # type: ignore[union-attr]
+    ]
+    equations: list[tuple[str, int, DimExpr, int, str, str]] = []
+    for p in open_params:
+        info = infos.get(p.name)
+        if info is None:  # not given: what is left unbound is refused where it is needed
+            continue
+        check_tensor(p, info)
+        assert p.type is not None
+        for axis, (pattern, actual) in enumerate(zip(p.type.shape, info.shape)):
+            equations.append((p.name, axis, pattern, actual, str(p.type), "dimension"))
+    return solve_dims(op_name, equations, dims) if equations else dict(dims)
+
+
 def check_tensor(p: "Param", info: TensorInfo) -> None:
     """Dtype, rank and contiguity of one supplied tensor against its declared type.
 
@@ -298,15 +319,16 @@ def eval_dim(expr: DimExpr, dims: "Mapping[Dim, int]") -> "int | None":
     return value.value if value.is_static else None
 
 
-def solve_dims(op_name: str, equations: "Sequence[tuple[Any, ...]]") -> "dict[Dim, int]":
-    """Bind every dimension that the actual shapes determine, and check every shape equation.
+def solve_dims(op_name: str, equations: "Sequence[tuple[Any, ...]]", known: "Mapping[Dim, int] | None" = None) -> "dict[Dim, int]":
+    """Bind every dimension that the actual shapes determine, and check every shape equation (``known``: dimensions bound already, which are kept,
+    in their order, and checked).
 
     An equation is ``(argument, axis, pattern, actual size, type text)`` and, for the strides of a ``Strided[...]``
     argument, ``(argument, axis, pattern, actual stride, type text, "stride")``. A pattern with one unbound
     dimension is solved (``3072*M`` against 6144 gives ``M = 2``, and fails when it is not a whole
     number); a pattern that is fully bound is checked. Whatever is left over is ambiguous.
     """
-    dims: dict[Dim, int] = {}
+    dims: dict[Dim, int] = dict(known or {})
     pending = [(*eq, "dimension") if len(eq) == 5 else tuple(eq) for eq in equations]
     while pending:
         rest = [eq for eq in pending if not _solve_one(op_name, eq, dims)]

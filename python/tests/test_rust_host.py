@@ -256,7 +256,7 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect(tmp_path):
         manifest = Manifest.load(directory, pin=pin)  # verifies every cubin against the manifest; schema 3, which Rust reads too
         if directory == FIXTURES / name:  # (a copy that stands in for a fixture that predates sm_count has a digest of its own)
             assert manifest.digest == want["manifest_digest"], name
-        assert len(manifest.artifacts) == len(want["kernels"]) == 28 and len(manifest.library_entries) == len(want["library"])
+        assert len(manifest.artifacts) == len(want["kernels"]) == 30 and len(manifest.library_entries) == len(want["library"])
         # an extern declared with enable_fp_fusion= records the option it was compiled with
         for stem, fused in (("fma_plain", False), ("fma_fused", True)):
             assert manifest.get(stem, name).entry["options"] == {"num_warps": 4, "num_stages": 3, "enable_fp_fusion": fused}

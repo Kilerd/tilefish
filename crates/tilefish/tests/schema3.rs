@@ -398,6 +398,85 @@ fn a_shared_stride_that_is_not_what_it_says_is_refused() {
     assert!(message.contains("axis 0 of 'q' has two stride scalars (s_row and s_head)"), "{message}");
 }
 
+// -- a dimension only an Out tensor determines ----------------------------------------------------------------------------------------
+
+/// `key_mask(mask: Out[Tensor[shape, bf16]], n_valid: DevScalar[i32], b: B)` with `B` in `dims` as `b_dim` says: no tensor the kernel reads has
+/// `B`, which the `Out` tensor given for `mask` determines.
+fn key_mask(shape: Value, b_dim: Value) -> Kernel {
+    Kernel::new(
+        "triton",
+        "key_mask",
+        103,
+        vec![
+            pointer(0, "mask", "bf16", "out", shape, None),
+            pointer(1, "n_valid", "i32", "in", json!([]), None),
+            scalar(2, "b", "i32", "B", json!({})),
+        ],
+        vec![alignment(0, "mask", 16), alignment(1, "n_valid", 16)],
+        json!({"B": b_dim}),
+        "(cdiv(B, 128),)",
+    )
+}
+
+#[test]
+fn a_dimension_only_an_out_tensor_determines_is_bound_from_it() {
+    let manifest = read(&[key_mask(json!(["B"]), json!({"buckets": [8, 24]}))], &[]).unwrap();
+    let plan = plan_of(&manifest, "key_mask");
+    let n = [1usize];
+    for b in [8usize, 24] {
+        let shape = [b];
+        let p = plan
+            .prepare(&[dense(Y, &shape, DType::Bf16, Access::InOut), dense(X, &n, DType::I32, Access::In)], None)
+            .unwrap();
+        assert_eq!(p.params(), [Y, X, b as u64, 0, 0], "the pointers, B from the Out tensor, the scratch slots");
+        assert_eq!(p.grid, [1, 1, 1]);
+    }
+    // bound from the Out tensor, B is held to its buckets as any dimension is
+    let shape = [16usize];
+    let e = plan
+        .prepare(&[dense(Y, &shape, DType::Bf16, Access::InOut), dense(X, &n, DType::I32, Access::In)], None)
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Bucket, "{e}");
+    assert!(e.to_string().contains("dimension B is 16"), "{e}");
+    // the Out tensor is checked on its own before it binds anything: its dtype, its rank, that it is not empty
+    let (shape, two) = ([24usize], [24usize, 1]);
+    let e = plan
+        .prepare(&[dense(Y, &shape, DType::F32, Access::InOut), dense(X, &n, DType::I32, Access::In)], None)
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Dtype, "{e}");
+    let e = plan
+        .prepare(&[dense(Y, &two, DType::Bf16, Access::InOut), dense(X, &n, DType::I32, Access::In)], None)
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Rank, "{e}");
+    let empty = [0usize];
+    let e = plan
+        .prepare(&[dense(Y, &empty, DType::Bf16, Access::InOut), dense(X, &n, DType::I32, Access::In)], None)
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Shape, "{e}");
+    // and the device scalar is still one element: an input is checked before any Out tensor
+    let (shape, two_n) = ([24usize], [2usize]);
+    let e = plan
+        .prepare(&[dense(Y, &shape, DType::F32, Access::InOut), dense(X, &two_n, DType::I32, Access::In)], None)
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Shape, "{e}");
+}
+
+#[test]
+fn an_out_dimension_that_is_an_expression_is_solved_from_the_out_tensor() {
+    let manifest = read(&[key_mask(json!(["2*B"]), json!({}))], &[]).unwrap();
+    let plan = plan_of(&manifest, "key_mask");
+    let (n, six, seven) = ([1usize], [6usize], [7usize]);
+    let p = plan
+        .prepare(&[dense(Y, &six, DType::Bf16, Access::InOut), dense(X, &n, DType::I32, Access::In)], None)
+        .unwrap();
+    assert_eq!(p.params(), [Y, X, 3, 0, 0]);
+    let e = plan
+        .prepare(&[dense(Y, &seven, DType::Bf16, Access::InOut), dense(X, &n, DType::I32, Access::In)], None)
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Shape, "{e}");
+    assert!(e.to_string().contains("would need B = 7/2"), "{e}");
+}
+
 // -- a device scalar -------------------------------------------------------------------------------------------------------------
 
 /// `masked_rows(x: Tensor[R, 128, f32], y: Out[Tensor[R, 128, f32]], n_tok: DevScalar[i32])`: the last pointer has the shape `[]`.

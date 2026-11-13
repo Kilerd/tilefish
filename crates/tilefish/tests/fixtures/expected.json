@@ -1,7 +1,7 @@
 {
   "fixtures": {
     "sm_103": {
-      "manifest_digest": "2d474aee203e4b373d1a7ebf13b2ea880ab0cd974dc25aa217740afc08b5777d",
+      "manifest_digest": "695686c04490e494161f8357e97d357e2957b00892c67f7d66f9dd1e038eedce",
       "kernels": [
         {
           "stem": "axpy",
@@ -114,6 +114,22 @@
           "cubin": "head_copy64.sm_103.cubin",
           "sha256": "8897b35ac0cf66a27525cd5ff1f4fdc1b1806f8d744f45fbe98446b7ec94bb5d",
           "sha256_code": "096b1c6ccf02b161cd72c397e1009f58e128b871b6228ee2ca85e6a3fbb036bd"
+        },
+        {
+          "stem": "key_mask",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "key_mask.sm_103.cubin",
+          "sha256": "7288845d0248373ad0f686dd26315deceb3925e6a4a5a2ba0a358fbcb8a971a7",
+          "sha256_code": "f8e4c32d1eaaa0cf1791ef2be8c1d216caed3098690303c49c96357b692671b4"
+        },
+        {
+          "stem": "key_mask_any",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "key_mask_any.sm_103.cubin",
+          "sha256": "7288845d0248373ad0f686dd26315deceb3925e6a4a5a2ba0a358fbcb8a971a7",
+          "sha256_code": "f8e4c32d1eaaa0cf1791ef2be8c1d216caed3098690303c49c96357b692671b4"
         },
         {
           "stem": "layernorm",
@@ -340,7 +356,7 @@
       ]
     },
     "sm_120": {
-      "manifest_digest": "f85b935bbf5f1a674ebdd223b6a281b6c80dfe60617f8c854c2e1d1fa62826a3",
+      "manifest_digest": "aa5625fe1e65981734652af46607e823670f98656470ffb3da363d6fddcb8091",
       "kernels": [
         {
           "stem": "axpy",
@@ -453,6 +469,22 @@
           "cubin": "head_copy64.sm_120.cubin",
           "sha256": "42736f69942526109a8432124407599bbc49c7ff652818a6dc4eae4aac92cfd9",
           "sha256_code": "e3fd18819d92df880245546f574ce04b36a39e2c690e0b246b494df776a95690"
+        },
+        {
+          "stem": "key_mask",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "key_mask.sm_120.cubin",
+          "sha256": "be458cf67a89994ae42c1cc8df386a7d81cd37d151d407ccff8cf4faddf4eb2e",
+          "sha256_code": "a9f465b16c05d8fabeec63d8833e78032b9c49921f2a321b05d41bab6063ecf4"
+        },
+        {
+          "stem": "key_mask_any",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "key_mask_any.sm_120.cubin",
+          "sha256": "be458cf67a89994ae42c1cc8df386a7d81cd37d151d407ccff8cf4faddf4eb2e",
+          "sha256_code": "a9f465b16c05d8fabeec63d8833e78032b9c49921f2a321b05d41bab6063ecf4"
         },
         {
           "stem": "layernorm",

@@ -39,7 +39,9 @@ These checks happen before anything reaches the driver:
   `sha256` and machine-code digest and is for the architecture its entry says,
   and the loaded function takes the parameter sizes of the ABI.
 - **At launch:** the shapes bind the dimensions (and the strides of a view bind
-  its stride dimensions); dtypes, buckets, `divisible_by`, `max_elements` and
+  its stride dimensions), those of the tensors the kernel reads first, then the
+  shape of an `Out` tensor for a dimension only it has (a `[B]` mask made from a
+  device scalar); dtypes, buckets, `divisible_by`, `max_elements` and
   `max_extent`, aliasing, the alignment each pointer promises, contiguity,
   device and context, and the grid limits are all checked.
 

@@ -106,6 +106,8 @@ from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
     bind_call,
+    bind_outputs,
+    check_tensor,
     check_consts,
     check_dim_constraints,
     check_no_alias,
@@ -114,6 +116,7 @@ from ._launch import (
     eval_dim,
     eval_grid,
     select_spec,
+    solve_dims,
     tensor_info,
     tf_dtype_name,
 )
@@ -285,7 +288,10 @@ def _alloc(torch: Any, p: Param, dims: Any, device: Any, where: str) -> Any:
     for d in p.type.shape:
         v = eval_dim(d, dims)
         if v is None:
-            raise TilefishRuntimeError(f"cannot allocate {where}: dimension {d} is not determined by the arguments")
+            raise TilefishRuntimeError(
+                f"cannot allocate {where}: dimension {d} is not determined by the arguments (a dimension that only an Out parameter mentions "
+                "is bound from the Out tensor: give it with outputs=)"
+            )
         shape.append(v)
     dtype = getattr(torch, TORCH_DTYPE_NAMES[tf_dtype_name(p.type.dtype, where)].split(".")[1])
     return torch.empty(shape, dtype=dtype, device=device)
@@ -325,37 +331,76 @@ def _extern_names(target: _Target, extern: ExternOp) -> "dict[str, str]":
     return {p.name: q.name for p, q in zip(target.kernel.signature.params, extern.signature.params)}
 
 
-def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> _Prepared:
+def _result_names(target: _Target, extern: ExternOp) -> "list[str]":
+    """The launched kernel's parameters that hold the results of a call, in the order ``run`` returns them: a kernel's returned values (the stub
+    lists the kernel's own parameters, then one output per returned value), then its ``Out`` tensors; an extern's ``Out`` tensors."""
+    out_params = [p.name for p in extern.signature.params if p.kind == "tensor" and p.access == "out"]
+    if target.kernel is None:
+        return out_params
+    names = _extern_names(target, extern)
+    user = len(target.kernel.signature.params)
+    returned = [p.name for p in extern.signature.params[user:] if p.kind == "tensor" and p.access == "out"]
+    return returned + [names[p.name] for p in target.kernel.signature.tensor_outputs]
+
+
+def _given_outputs(target: _Target, outputs: Any, result_names: "list[str]") -> "dict[str, Any]":
+    """``outputs=`` of a call: the tensors to write the results into, by the launched kernel's parameter name (none given: ``{}``)."""
+    if outputs is None:
+        return {}
+    given = list(outputs) if isinstance(outputs, (list, tuple)) else [outputs]
+    if len(given) != len(result_names):
+        raise TilefishRuntimeError(
+            f"outputs= gives {len(given)} tensor(s), but '{target.name}' has {len(result_names)} result(s) ({', '.join(result_names) or 'none'}): give "
+            "one tensor per result, in the order the call returns them"
+        )
+    return dict(zip(result_names, given))
+
+
+def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None) -> _Prepared:
+    """Check a call and decide its binary, scalars and grid. ``outputs`` are the tensors the results are written into (a tensor, or one per result in
+    the order the call returns them) instead of allocated ones: their shapes bind the dimensions only the ``Out`` parameters mention, and each is held to
+    the dtype, the rank, the contiguity and the shape its parameter has."""
     torch = _torch()
     extern = target.launch_extern()
     call = bind_call(target.name, target.public, args, kwargs)
-    check_dim_constraints(call.dims)
-    specs = target.compile_specs()
-    spec = select_spec(target.name, specs, call.dims)
     names = _extern_names(target, extern)
+    result_names = _result_names(target, extern)
+    given = _given_outputs(target, outputs, result_names)
+    given_infos = {name: tensor_info(name, t) for name, t in given.items()}
+    public_of = {v: k for k, v in names.items()}
+    # the dimensions the inputs leave unbound, from the Out tensors given (a kernel's returned values are not parameters of its signature)
+    dims = bind_outputs(target.name, target.public, {public_of[n]: i for n, i in given_infos.items() if n in public_of}, call.dims)
+    check_dim_constraints(dims)
+    specs = target.compile_specs()
+    spec = select_spec(target.name, specs, dims)
     check_consts(spec, {names[k]: v for k, v in call.consts.items()})
-    device = _device_of(call.infos, call.tensors)
+    device = _device_of({**call.infos, **given_infos}, {**call.tensors, **given})
     if getattr(device, "type", None) != "cuda":
         raise TilefishRuntimeError(f"jit and replay run on a CUDA device; the tensors are on {device}")
 
-    # the tensors of the launched kernel, by its parameter names: the supplied ones, and every Out (allocated here)
+    # the tensors of the launched kernel, by its parameter names: the supplied ones, and every Out (given, or allocated here)
     tensors = {names[k]: v for k, v in call.tensors.items()}
-    out_params = [p for p in extern.signature.params if p.kind == "tensor" and p.access == "out"]
-    allocated = {p.name: _alloc(torch, p, call.dims, device, f"Out parameter '{p.name}'") for p in out_params}
-    tensors.update(allocated)
-    if target.kernel is not None:
-        # a kernel returns its returned values, then its Out tensors; the stub lists the kernel's own
-        # parameters (the Out ones among them), then one output per returned value
-        user = len(target.kernel.signature.params)
-        returned = [p for p in extern.signature.params[user:] if p.kind == "tensor" and p.access == "out"]
-        results = [allocated[p.name] for p in returned]
-        results += [allocated[names[p.name]] for p in target.kernel.signature.tensor_outputs]
-    else:
-        results = [allocated[p.name] for p in out_params]
+    for p in extern.signature.params:
+        if p.kind != "tensor" or p.access != "out":
+            continue
+        if p.name in given:
+            _check_given(target.name, p, given_infos[p.name], dims)
+            tensors[p.name] = given[p.name]
+        else:
+            tensors[p.name] = _alloc(torch, p, dims, device, f"Out parameter '{p.name}'")
+    results = [tensors[n] for n in result_names]
 
     infos = {name: tensor_info(name, t) for name, t in tensors.items()}
-    scalars, grid = _finish_launch(extern, spec, call.dims, infos)
+    scalars, grid = _finish_launch(extern, spec, dims, infos)
     return _Prepared(target, spec, str(device), tensors, scalars, grid, results)
+
+
+def _check_given(op_name: str, p: Param, info: TensorInfo, dims: "dict[Dim, int]") -> None:
+    """An ``Out`` tensor a call is given: its dtype, rank and contiguity, and the shape its parameter has under the bound dimensions (what a launch
+    would allocate)."""
+    check_tensor(p, info)
+    assert p.type is not None
+    solve_dims(op_name, [(p.name, axis, pattern, actual, str(p.type), "dimension") for axis, (pattern, actual) in enumerate(zip(p.type.shape, info.shape))], dims)
 
 
 def _finish_launch(extern: ExternOp, spec: CompileSpec, dims: "dict[Dim, int]", infos: "dict[str, TensorInfo]") -> "tuple[dict[str, int], tuple[int, ...]]":
@@ -861,8 +906,11 @@ def run(
     that you trust whatever the directory holds, which is what whoever can write it makes it (the digests sit next to the
     files they describe); it is for a directory you wrote yourself a moment ago, and is not combined with ``pin``. For a
     hand-written kernel whose IR digest cannot be recomputed, only ``pin`` is the statement that you vouch for the
-    manifest. ``mode``, ``manifest``, ``pin`` and ``trust_directory`` are the only keywords that are not arguments of
-    ``op`` (an operator with a parameter of one of those names takes it positionally). Raises
+    manifest. ``outputs=`` gives the tensors the results are written into (one tensor, or one per result in the order the call
+    returns them) instead of allocating them; each must have the dtype, the rank and the shape of its parameter and be contiguous,
+    and it is what binds a dimension that only an ``Out`` parameter mentions (an extern that writes a ``[B]`` tensor and reads
+    no tensor of ``B``), which a call cannot run without. ``mode``, ``manifest``, ``pin``, ``trust_directory`` and ``outputs`` are
+    the only keywords that are not arguments of ``op`` (an operator with a parameter of one of those names takes it positionally). Raises
     :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks a precondition of the binary,
     :class:`~tilefish.errors.TilefishManifestError` when the manifest is not what was built, not what the operator asks
     for, or not the pinned one, and :class:`~tilefish.errors.TilefishRuntimeError` when the call cannot run (a replay
@@ -872,6 +920,7 @@ def run(
         raise TilefishRuntimeError(f"unknown mode {mode!r}: use one of {', '.join(MODES)}")
     if isinstance(op, GraphOp) and not isinstance(op, KernelOp):
         return _run_graph(op, args, kwargs, mode, manifest, pin, trust_directory)
+    outputs = kwargs.pop("outputs", None)
     if mode == "replay" and manifest is None:
         raise TilefishRuntimeError(
             "replay runs prebuilt cubins from a manifest directory: pass manifest=<directory> (write one with "
@@ -901,6 +950,11 @@ def run(
             )
     is_library = isinstance(op, LibraryOp) and op.impl is not None
     target = None if is_library else _target(op)
+    if outputs is not None and (is_library or mode == "reference"):
+        raise TilefishRuntimeError(
+            "outputs= gives the tensors a kernel or an extern writes its results into, in jit and replay (and a graph's, in any mode); "
+            + ("a library op allocates its result" if is_library else "reference mode allocates the results it computes")
+        )
     if mode == "reference" and not is_library:
         return _run_reference(target, args, kwargs)
     loaded = None
@@ -914,7 +968,7 @@ def run(
     if is_library:
         return _run_library(op, args, kwargs, mode, loaded)
     assert target is not None
-    prep = _prepare(target, args, kwargs)
+    prep = _prepare(target, args, kwargs, outputs)
     if mode == "jit":
         _run_jit(prep)
     else:

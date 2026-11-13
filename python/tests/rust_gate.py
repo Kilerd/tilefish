@@ -27,6 +27,8 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **strides that several views share** (``gpu_kernels_p4.py``): ``o = q + k + v`` over the q, k and v of one fused tensor, read with one stride pair
   (``StrideOf(("q", "k", "v"), axis)``), and over three tensors of their own with the same strides; the plan ``fused_qkv`` binds the three views in one
   step;
+* **a dimension only an Out tensor determines** (``gpu_kernels_p4.py``): a ``[B]`` mask made from a device scalar, run with ``outputs=`` (which is what
+  binds ``B``), bucketed and not; the plan ``mask_rows`` makes it in a step whose ``B`` is the graph's;
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
@@ -191,6 +193,7 @@ class Case:
     may_be_zero: "tuple[str, ...]" = ()  # the ``out`` tensors that are legitimately all zeros
     kind: str = "kernel"
     same_as: "str | None" = None  # another operator (a key of ``host_ops``) whose replay on the same inputs gives these very bytes
+    outputs: "Callable[[tuple], tuple] | None" = None  # the tensors the call writes its results into (``outputs=``), made from its arguments
 
     @property
     def id(self) -> str:
@@ -255,6 +258,17 @@ def must_sum(args, got):
     assert same_bytes(got, ((q.float() + k.float()) + v.float()).to(BF16))
 
 
+def must_mask(args, got):
+    (n,) = args
+    keys = torch.arange(got.shape[0], device=got.device)
+    assert same_bytes(got, torch.where(keys < n.reshape(()), 0.0, float("-inf")).to(BF16))
+
+
+def mask_of(b):
+    """The ``Out`` tensor of a mask of ``b`` keys: what binds ``B``."""
+    return lambda args: (torch.zeros((b,), dtype=BF16, device="cuda"),)
+
+
 def build_cases():
     cases: "list[Case]" = [
         *plain("softmax", "softmax", args_softmax, ROW_SIZES),
@@ -302,6 +316,13 @@ def build_cases():
     for op in ("qkv_sum", "qkv_sum16"):
         cases += [Case(op, op, f"fused-{rows}-seed0", lambda rows=rows: args_qkv_fused(rows, 0), must_sum) for rows in (1, 7, 40)]
         cases += [Case(op, op, f"separate-{rows}-seed0", lambda rows=rows: args_qkv_separate(rows, 0), must_sum) for rows in (1, 7, 40)]
+    # -- a dimension only the Out tensor determines: B is the size of the mask the call is given
+    for op, sizes in (("key_mask", (8, 24)), ("key_mask_any", (1, 130, 1000))):
+        cases += [
+            Case(op, op, f"B{b}-n{n}", lambda n=n: (n_tok(n),), must_mask, may_be_zero=("mask",) if n >= b else (), outputs=mask_of(b))
+            for b in sizes
+            for n in (0, 5, b, b + 3)
+        ]
     return cases
 
 
@@ -402,7 +423,8 @@ def prepare(work, manifest_dir=None, pin=None):
         args = case.make()
         # an argument that is a view is given as it is (a strided pointer only reads); a plain tensor is cloned, so an in-place one keeps its input
         given = [a if is_view(a) else a.clone() for a in args]
-        result = tilefish.run(op, *given, mode="replay", manifest=directory, pin=digest)
+        extra = {} if case.outputs is None else {"outputs": case.outputs(args)}
+        result = tilefish.run(op, *given, mode="replay", manifest=directory, pin=digest, **extra)
         results = [] if result is None else (list(result) if isinstance(result, tuple) else [result])
         assert len(results) == len(outputs), (case.id, len(results), outputs)
         if library:  # the pin made in memory runs the algorithm the manifest records: the same bytes
@@ -495,6 +517,13 @@ def plan_graphs():
     def fused_qkv_cases():
         return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 768), BF16, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
 
+    def mask_rows_cases():
+        return [
+            (f"Rb{rb}-n{n}", {"x": randn((rb, 64), F32, seed=rb + n), "n": torch.tensor([n], dtype=I32, device="cuda")})
+            for rb in (8, 24)
+            for n in (0, 5, rb)
+        ]
+
     return [
         ("block", pm.block, False, block_cases),
         ("block-reuse", pm.block, True, block_cases),
@@ -503,6 +532,7 @@ def plan_graphs():
         ("prebuilt", pm.prebuilt, False, prebuilt_cases),
         ("accumulate", pm.accumulate, False, accumulate_cases),
         ("fused_qkv", p4.fused_qkv, False, fused_qkv_cases),  # one step that reads three views with one stride pair
+        ("mask_rows", p4.mask_rows, False, mask_rows_cases),  # a step whose B only its Out buffer determines
     ]
 
 
