@@ -1,182 +1,497 @@
 {
   "fixtures": {
     "sm_103": {
-      "manifest_digest": "5704fcd0ba63820d836451a1e48f678cc50d231a23834a2e7fe8dcb61e1106f9",
+      "manifest_digest": "59c69aa7373226a9b3d7d29aea1ac7f23b8dfb8c84aa13bb003a63d8efbce606",
       "kernels": [
         {
           "stem": "axpy",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "axpy.sm_103.cubin",
-          "sha256": "58d764db8a4312f354591d1a3b1410a8c72bc6d4dd4d7307f155b07129c6b41d",
+          "sha256": "e3620def04016fab73732655f876695432c370fe81a70e6bc160470c2ee80553",
           "sha256_code": "9a3b42e6cebae293c3a02399551a19170c591a4a3e994e951e6556a288a1fa8d"
+        },
+        {
+          "stem": "axpy_cubin",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "axpy_cubin.sm_103.cubin",
+          "sha256": "f2d1bac285b5f95e94a3fe9c2b16f998e7fe3aede2e1d82d6bdcf654ebf4cb2d",
+          "sha256_code": "6d71eab3fa53d2db1a69ebaac3783a0c37be01b140eca3ab116282e4e27237db"
+        },
+        {
+          "stem": "axpy_ptx",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "axpy_ptx.sm_103.cubin",
+          "sha256": "f2d1bac285b5f95e94a3fe9c2b16f998e7fe3aede2e1d82d6bdcf654ebf4cb2d",
+          "sha256_code": "6d71eab3fa53d2db1a69ebaac3783a0c37be01b140eca3ab116282e4e27237db"
         },
         {
           "stem": "bucketed_rms.Db1000",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "bucketed_rms.Db1000.sm_103.cubin",
-          "sha256": "1893f5b4fefe8bbcde797b4d3402ca8988c41aa1bfc4b3c9523a93d2e1693c8c",
+          "sha256": "371512607d01a5bc3de388086343bd5d53d22e8965165375e1dd790a11f464c9",
           "sha256_code": "137454276407cf80a568471d152407b0d8ae5e09db3408d6caabb990405f130e"
         },
         {
           "stem": "bucketed_rms.Db512",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "bucketed_rms.Db512.sm_103.cubin",
-          "sha256": "309985f3fc7e873eafa24a3d353e4b63806b76d5f83091360fe8a2c556b8225e",
+          "sha256": "56242b1e6d2fdce7cb78a63493658441da13caddf64a11b930e9c0ce5bffdddc",
           "sha256_code": "6c9023055998a8229ba22b58138b5a4ad74001c24e0d71be62ea2eeafdd32c4f"
         },
         {
           "stem": "bucketed_rms.Db96",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "bucketed_rms.Db96.sm_103.cubin",
-          "sha256": "fdb40b12ba1285550707e90958417ffe2073d502b75bc5402d18801faeeff07d",
+          "sha256": "3800b8b54d1fc3687eeb6e8a141953d7eda30b05cabd04971801ce28771406b2",
           "sha256_code": "2ca42566b7ba40fbdd523e90cfd15eeb245ed1c88491b75557fabef167cd516e"
         },
         {
           "stem": "gelu_erf",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "gelu_erf.sm_103.cubin",
-          "sha256": "aed0e836d35dca3540026ed6a7fc4e5a138e4c7cff9c557a5f1ff78755f8f5ef",
+          "sha256": "922f94892b48df58b909457b4b46e2794b2239c81507cf899c9eca9cf357f292",
           "sha256_code": "4560a7c377436f3c602a985cb2cf59fc81bd53df5a5e07c76759e8decfa98e85"
         },
         {
           "stem": "gelu_exact",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "gelu_exact.sm_103.cubin",
-          "sha256": "21add8de730944ed4b539ae8e695466288ad763e871c24872584452c8fad87e2",
+          "sha256": "937dcd02860a37737a2eed07489aae50758657e7baec4964e695118bd81fceac",
           "sha256_code": "d0982490af608ff7756275a922215bbdc7529b8f806155d5e3c976168901477f"
+        },
+        {
+          "stem": "gelu_ptx",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "gelu_ptx.sm_103.cubin",
+          "sha256": "937dcd02860a37737a2eed07489aae50758657e7baec4964e695118bd81fceac",
+          "sha256_code": "d0982490af608ff7756275a922215bbdc7529b8f806155d5e3c976168901477f"
+        },
+        {
+          "stem": "head_copy",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "head_copy.sm_103.cubin",
+          "sha256": "5e10e4b96f16ed4144d750ba86ecc2b32e4b0e5e4c1c4b85b2ada5cc02bde178",
+          "sha256_code": "925cbf4a8ac470c4b72c122b22e62535bfef21364e5a4f0aaf86b4ea0085ce42"
+        },
+        {
+          "stem": "head_copy16",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "head_copy16.sm_103.cubin",
+          "sha256": "5e10e4b96f16ed4144d750ba86ecc2b32e4b0e5e4c1c4b85b2ada5cc02bde178",
+          "sha256_code": "925cbf4a8ac470c4b72c122b22e62535bfef21364e5a4f0aaf86b4ea0085ce42"
+        },
+        {
+          "stem": "head_copy64",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "head_copy64.sm_103.cubin",
+          "sha256": "8897b35ac0cf66a27525cd5ff1f4fdc1b1806f8d744f45fbe98446b7ec94bb5d",
+          "sha256_code": "096b1c6ccf02b161cd72c397e1009f58e128b871b6228ee2ca85e6a3fbb036bd"
         },
         {
           "stem": "layernorm",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "layernorm.sm_103.cubin",
-          "sha256": "fe6f4aed989356c0296cba68b29e8ef240b40f546d613d26108c90b07b045055",
+          "sha256": "d7b870584a31e19c87c4280dc23a9387c12849289a4192778aa5e60c03c36f56",
           "sha256_code": "c2807c08ad9f9de0864d83f518b619af716d953e3f8dce72c5a9654cd59c613a"
+        },
+        {
+          "stem": "masked_rows",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "masked_rows.sm_103.cubin",
+          "sha256": "b10041c0382ae5f64b82bcc46c2801206a2b7294a080563d58fd9cf4ea24ea0d",
+          "sha256_code": "1753119a848562f54b5f1ef318ac47349b396f66155227e555c13528c86f631c"
         },
         {
           "stem": "mm",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "mm.sm_103.cubin",
-          "sha256": "6c35a43b3cba58317fcd9b2f27c212a726aac8cd3306368c07b9bab7209191d0",
+          "sha256": "75b9bc3644be2c751c11b2490ab0f35a4aeab5ce7ae58ff84e0d3c4b6bbb8ce3",
           "sha256_code": "9b4d28c3cdf0373db7941f4eb7a525199c45c6b25f0573642330e27a71ae56bc"
         },
         {
           "stem": "residual_add_rmsnorm",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "residual_add_rmsnorm.sm_103.cubin",
-          "sha256": "54a2e760b3a2a7883438462114aeddfa54216fdcd891061a23e9df8ead8c3266",
+          "sha256": "e3f76b15bbf2d4cae27958a64c299166a8b3b1a3f4ef774d5299cceb7aacde6d",
           "sha256_code": "f41b8d1abcd135eac77891583f4db3f6fe14c9113fdc598298a3d2cdbeef15ff"
         },
         {
           "stem": "rmsnorm",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "rmsnorm.sm_103.cubin",
-          "sha256": "39cb6ab728955446fc71c19aae82fa105bf5f31515b4a02cf0ecf24316ffc18c",
+          "sha256": "86ff48170ef36225fff68cbc1ee3a5155a79bc459c96aa96710197b005a6c662",
           "sha256_code": "6cba2cf266aa385b800de94870c3984777710d405d57df945af6af13dd387a9e"
+        },
+        {
+          "stem": "scale_by",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "scale_by.sm_103.cubin",
+          "sha256": "f735258913772a0cf48f8ab1cbf98b1b30ec836848318c1607d70169b7ed2c7a",
+          "sha256_code": "ec622a9fe8265ce7d62d532289e119023e56cd93154286378d88ea5618f95ce5"
+        },
+        {
+          "stem": "scale_flat",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "scale_flat.sm_103.cubin",
+          "sha256": "f40c7309725a4c905af85bcf74570b9c27b670e2d27d2c0d4ebd6919b7b1e156",
+          "sha256_code": "03e005e9e092da9a416257c464bde32c3c72d57f2eba2745fb057ea9d2449792"
         },
         {
           "stem": "softmax",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "softmax.sm_103.cubin",
-          "sha256": "56e2c2526becf4dee08908f89185b1c4e6ec72fb4a4704a495fa7bcd01576fe5",
+          "sha256": "54bc462cac3181ca9a2601cb15f3f988cf7e8414f476902f567ca26a1b609fad",
           "sha256_code": "c837592e099b50389bbc1e8c0721fb65d39d23fc9920a2499253922ebfdfb8e1"
+        },
+        {
+          "stem": "softmax3d",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "softmax3d.sm_103.cubin",
+          "sha256": "893970ca0937456de38c43d56ee40a32f9b543a1cc5046724a92a350530ada59",
+          "sha256_code": "420d04660c820610e14ba3fbbe2e1ea886962742626e04972ebba7f028d5385b"
+        },
+        {
+          "stem": "softmax_ptx",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "softmax_ptx.sm_103.cubin",
+          "sha256": "54bc462cac3181ca9a2601cb15f3f988cf7e8414f476902f567ca26a1b609fad",
+          "sha256_code": "c837592e099b50389bbc1e8c0721fb65d39d23fc9920a2499253922ebfdfb8e1"
+        },
+        {
+          "stem": "strided_copy",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "strided_copy.sm_103.cubin",
+          "sha256": "601aa69e7b975baed743a45b3dfac945b769f920a2a842a2ed2dedcfe609b521",
+          "sha256_code": "6ea64a39b46f76248b6dc892623f55a5721070450b1ea587ab3df0bbd85b6505"
         },
         {
           "stem": "swiglu",
           "arch": "sm_103",
+          "kind": "triton",
           "cubin": "swiglu.sm_103.cubin",
-          "sha256": "803bd76f1b53a126dcf2a206b8f430a6795b05c6d55a61a9f6a3932fc241a531",
+          "sha256": "74a541e70831eaa3fd98e06d58f2b40854dda6f5a2c4828fad2edbaf23442247",
           "sha256_code": "2749751cee10ebd30b279fbcbdbd862417c28ec320f28fd27796312235bf3aec"
+        }
+      ],
+      "library": [
+        {
+          "stem": "gemm_1024_1024.M32",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm",
+          "algo": "420000005000000023000000010000000000000000000000000000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_1024_1024.M320",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm",
+          "algo": "42000000d000000023000000010000000000000000000000010000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_1024_1024.M64",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm",
+          "algo": "420000005000000023000000010000000000000000000000000000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_1024_1024_bias.M32",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm_bias",
+          "algo": "420000005000000023000000010000000000000000000000000000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_1024_1024_bias.M320",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm_bias",
+          "algo": "42000000d000000023000000010000000000000000000000010000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_1024_1024_bias.M64",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm_bias",
+          "algo": "420000005000000023000000010000000000000000000000000000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_3072_1024.M32",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm",
+          "algo": "420000001000000023000000010000000000000000000000010000000000040001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_3072_1024.M320",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm",
+          "algo": "42000000f800000023000000010000000000000000000000050000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_3072_1024.M64",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm",
+          "algo": "42000000a400000023000000010000000000000000000000000000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_3072_1024_bias.M32",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm_bias",
+          "algo": "420000001000000023000000010000000000000000000000010000000000040001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_3072_1024_bias.M320",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm_bias",
+          "algo": "42000000f800000023000000010000000000000000000000050000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
+        },
+        {
+          "stem": "gemm_3072_1024_bias.M64",
+          "arch": "sm_103",
+          "impl": "cublaslt.gemm_bias",
+          "algo": "42000000a400000023000000010000000000000000000000000000000000030001000000e4d701000e0000000e0000000e000e00440000000000000000000000",
+          "cublaslt_version": 120804,
+          "workspace_bytes": 8519680
         }
       ]
     },
     "sm_120": {
-      "manifest_digest": "42e20c45197386961f119bfbd057c14f19a4249d09270197094c56424f1b9b83",
+      "manifest_digest": "ffe16d75adca5d68d0a68f070a9c6ce2b0b17e837d9ecea36f3713130cc73983",
       "kernels": [
         {
           "stem": "axpy",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "axpy.sm_120.cubin",
-          "sha256": "51a5f3f641e7c5180a03d0fe6849f4311de2e16433565b533ade44e451c9efed",
+          "sha256": "6826c2320d598fc6d58589fa965e91b39384aa94b3ce6b122d21b404e2d081de",
           "sha256_code": "744e62a5feb32c6ff1369e1affcafb0f83ddf63854d5e8fd58864417d3cdddbf"
+        },
+        {
+          "stem": "axpy_cubin",
+          "arch": "sm_120",
+          "kind": "binary",
+          "cubin": "axpy_cubin.sm_120.cubin",
+          "sha256": "cff194bf1312cfa31c9b1e302c1b996d1c746bac79b7f37a3cf802b80f33e601",
+          "sha256_code": "6f65e56702bbea019f5e41efe47e1363981af7508b10d45a288d9197eb78c75e"
+        },
+        {
+          "stem": "axpy_ptx",
+          "arch": "sm_120",
+          "kind": "binary",
+          "cubin": "axpy_ptx.sm_120.cubin",
+          "sha256": "cff194bf1312cfa31c9b1e302c1b996d1c746bac79b7f37a3cf802b80f33e601",
+          "sha256_code": "6f65e56702bbea019f5e41efe47e1363981af7508b10d45a288d9197eb78c75e"
         },
         {
           "stem": "bucketed_rms.Db1000",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "bucketed_rms.Db1000.sm_120.cubin",
-          "sha256": "9c31613426bda3002d16befad19e214a6a3efd06725837b591df217023642f28",
+          "sha256": "7d76c6a43081b667be24911066882b4af7103814945ede50bedfe8cc996e90fd",
           "sha256_code": "fda7233f8200581423eaf291bb5a789a5fe2eedc3e5a785b0eb8dfc0fb7ec286"
         },
         {
           "stem": "bucketed_rms.Db512",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "bucketed_rms.Db512.sm_120.cubin",
-          "sha256": "3b5c664a4f51750f37c33c989272d4bbdbb8a670d2d702c0ff4b38b05f95d920",
+          "sha256": "14f112cb5a42287717c89627ee41d61cef5feefe23dad63c6f520ce5d2bd8b56",
           "sha256_code": "4c77578d58e5cf1fb5d070b3b69e47e5fb56d2e976a381e61a44eb72f6ef0650"
         },
         {
           "stem": "bucketed_rms.Db96",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "bucketed_rms.Db96.sm_120.cubin",
-          "sha256": "2746a4cf1c6ae36dd97d8a2afe29593beaa916903ab8b89eeb8df2f49d8b5158",
+          "sha256": "dd57fe514f5acd6753fd7c5c6be4566099d0a0c8db8c044e82385c4660133869",
           "sha256_code": "4abc9b18ebf64ff9994731fc0061c8f406a6e416617e97b045aaf0d8b18c0d96"
         },
         {
           "stem": "gelu_erf",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "gelu_erf.sm_120.cubin",
-          "sha256": "d29552702e74b5e1be0266c8a4a3ea6ed1efccc516fe979c934cf184f7169471",
+          "sha256": "76030bf23c0c4133866309ced0660e82114d7f23aa23cac620a4d289c27b65a4",
           "sha256_code": "4a83af44086a65b02c235f243028e93b7f44bff8e6141dc4aa094860bfbef244"
         },
         {
           "stem": "gelu_exact",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "gelu_exact.sm_120.cubin",
-          "sha256": "90c606c6a5319b43afac50a2022398ed906fadff584d8adc8c3e3874bf5e88d5",
+          "sha256": "ba278e9cc9859f73474780a5d98606956892af9667e88f1960714c69297acdfc",
           "sha256_code": "57ce5b02b3d48f9239e85604be3c13f432223009fdc6873afe685c970f53e06f"
+        },
+        {
+          "stem": "gelu_ptx",
+          "arch": "sm_120",
+          "kind": "binary",
+          "cubin": "gelu_ptx.sm_120.cubin",
+          "sha256": "ba278e9cc9859f73474780a5d98606956892af9667e88f1960714c69297acdfc",
+          "sha256_code": "57ce5b02b3d48f9239e85604be3c13f432223009fdc6873afe685c970f53e06f"
+        },
+        {
+          "stem": "head_copy",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "head_copy.sm_120.cubin",
+          "sha256": "502acda08478d1fefdcc589972662fde05744ae078c98f949edfc90c28d16c15",
+          "sha256_code": "1e18c5c3cdadfe08fc3b8643a26ae04d82ea984e8f1acca857600cef9e4433db"
+        },
+        {
+          "stem": "head_copy16",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "head_copy16.sm_120.cubin",
+          "sha256": "502acda08478d1fefdcc589972662fde05744ae078c98f949edfc90c28d16c15",
+          "sha256_code": "1e18c5c3cdadfe08fc3b8643a26ae04d82ea984e8f1acca857600cef9e4433db"
+        },
+        {
+          "stem": "head_copy64",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "head_copy64.sm_120.cubin",
+          "sha256": "42736f69942526109a8432124407599bbc49c7ff652818a6dc4eae4aac92cfd9",
+          "sha256_code": "e3fd18819d92df880245546f574ce04b36a39e2c690e0b246b494df776a95690"
         },
         {
           "stem": "layernorm",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "layernorm.sm_120.cubin",
-          "sha256": "80f2d66a8b9cb4443ec86c2f46b7f614f11aebd2b25b47a00a138135ecf9153d",
+          "sha256": "6b2e97425f8491e3240865cf5a4c404a06a40162265340f7dba244c7b1628cc1",
           "sha256_code": "348c4e2ba9c643c263d1df9026f047b8a46f753b9221d3a5cf0de6338f987202"
+        },
+        {
+          "stem": "masked_rows",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "masked_rows.sm_120.cubin",
+          "sha256": "20fa1f9274a26444d17071584f4b66569511d2d45410b7329ca7c6710340eac4",
+          "sha256_code": "c38a30da7ef81216b2364068244fc9bdf70c924108d6ea5001de0b611f76b207"
         },
         {
           "stem": "mm",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "mm.sm_120.cubin",
-          "sha256": "4ac4690b321fdf0fc8efedd9488f398a281e6c64303f14c1de889c9bc7446415",
+          "sha256": "b98a0240b4c651fe0098804acf645eeee552be312de090462d0aac9d3ec7a103",
           "sha256_code": "041b5f2d507ba26c6f4540d457bae5d9e2a8d1756df43bc1c904b05709bd56ca"
         },
         {
           "stem": "residual_add_rmsnorm",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "residual_add_rmsnorm.sm_120.cubin",
-          "sha256": "43a8ba4af82d89cb34b99c8c1ebe365044fe85d5e153ecc85d596af89eeede70",
+          "sha256": "f700e72b6c404efb62ceff609adfc5536fa8586efc7578c81f84a63bef3629b2",
           "sha256_code": "c86b86efb1c996bcf7dc8580bc730d903e4de2ce3c490027ce9b91087b4f0ed6"
         },
         {
           "stem": "rmsnorm",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "rmsnorm.sm_120.cubin",
-          "sha256": "da5104ff4528f5ad1c2d7988f18df9908e39e5443474dbfe0c9818e58b47b2f0",
+          "sha256": "e4c4a9d6bec1e252a626716a0645ee5b0e1cb736ef48efc43062fd8a12542301",
           "sha256_code": "0010a75c02ab1219146fe6c3ec350578082fb10b20bfef46cbae2e2b7d8f8f0f"
+        },
+        {
+          "stem": "scale_by",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "scale_by.sm_120.cubin",
+          "sha256": "be7ce324c1d74ee3ee755c390fc0dc6b82f14d0e580deda18d3139f660bb7b8d",
+          "sha256_code": "1b41824c0fd33fffc17f4fe0d611191351201a4ab217b6a5250f1ed35d487997"
+        },
+        {
+          "stem": "scale_flat",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "scale_flat.sm_120.cubin",
+          "sha256": "b89fa236a1ffe997ac826d33e142be9dfa3284dc73f9ccc6bee5e1870224dd90",
+          "sha256_code": "10a8fa09fb7aa801cbe3e6e34d3f899940c8dd290c00720eccae068d85d4be95"
         },
         {
           "stem": "softmax",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "softmax.sm_120.cubin",
-          "sha256": "0136ae2e394c6dd2e4e9670e97fd7b8f4b238b90863e4e748a7fdffc966f9388",
+          "sha256": "f0176954bce5df84cce2937e5def4feeef766d8054686be9b6e8fd74db011cca",
           "sha256_code": "609b79a18a4290206c37c8f834aef25f5a878d211995aba9dd72aa348965d9e1"
+        },
+        {
+          "stem": "softmax3d",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "softmax3d.sm_120.cubin",
+          "sha256": "10d77a23f35fb27f2ef321541496f00673927b8284b436e3af4ae9444dee4faa",
+          "sha256_code": "38070009d1d46d0ef3209f52b905a708fcd81f1b514d61acdf5458a279b3440d"
+        },
+        {
+          "stem": "softmax_ptx",
+          "arch": "sm_120",
+          "kind": "binary",
+          "cubin": "softmax_ptx.sm_120.cubin",
+          "sha256": "f0176954bce5df84cce2937e5def4feeef766d8054686be9b6e8fd74db011cca",
+          "sha256_code": "609b79a18a4290206c37c8f834aef25f5a878d211995aba9dd72aa348965d9e1"
+        },
+        {
+          "stem": "strided_copy",
+          "arch": "sm_120",
+          "kind": "binary",
+          "cubin": "strided_copy.sm_120.cubin",
+          "sha256": "bf6f8d8bc7a58e055aac8d3914d1ea146b9c05198b340a58ea5cc17bfbe4ec97",
+          "sha256_code": "b4c72397e8f95b25f7881aa91bf1229f66966ab365f63955349936e7804bb7fa"
         },
         {
           "stem": "swiglu",
           "arch": "sm_120",
+          "kind": "triton",
           "cubin": "swiglu.sm_120.cubin",
-          "sha256": "685dfe91f45fd20c1020a0e3e0f70b30d3381c15b19c6d8dd2c42ced7c370f04",
+          "sha256": "c6f4f665073c64460f8da5c240edfad5fee0e69ed2f4fd3303203a7a1b4ed505",
           "sha256_code": "fea1c6640f8f7791c372d843c659d07fc94a71caba09b83b38900909001c9b35"
         }
-      ]
+      ],
+      "library": []
     }
   }
 }

@@ -2,13 +2,15 @@
 
 ``tilefish.hosts.rust.emit`` writes one Rust module per manifest. Here it is checked on small fake manifests (snapshots in
 ``tests/golden/``: regenerate with ``UPDATE_GOLDEN=1 pytest tests/test_rust_host.py`` and review the diff) and on the real
-fixture the crate is tested with (``crates/tilefish/tests/fixtures``, built on a B300 by ``export_rust_fixtures.py``); the
+fixtures the crate is tested with (``crates/tilefish/tests/fixtures``, manifests of schema 3 built on a B300 by ``export_rust_fixtures.py``); the
 output is deterministic and independent of the order of the entries; a declaration that is not what the manifest was
 built from is refused; and the emitted code is compiled by ``cargo check`` (with the ``tilefish`` crate, where cargo is
-installed), with ``embed=True`` too. Nothing here needs a GPU: the digests of the fixtures are recomputed by Python from the files
-and must be the ones ``expected.json`` (which the Rust tests check against) holds.
+installed and the crate reads schema 3), with ``embed=True`` too. Nothing here needs a GPU: the digests of the fixtures are recomputed by Python from the
+files and must be the ones ``expected.json`` (which the Rust tests check against) holds. What schema 3 added (strided views, device scalars, prebuilt binaries,
+GEMMs) is ``test_rust_host_schema3.py``.
 """
 
+import copy
 import hashlib
 import json
 import os
@@ -52,37 +54,22 @@ def pinned(manifest):
     return manifest.check_pin(manifest.digest)
 
 
-_migrated: "dict[str, pathlib.Path]" = {}
-
-
-def migrated_fixture(name="sm_103"):
-    """A copy of a fixture of the crate with its manifest migrated from schema 2 (what the crate reads) to schema 3 (what Python reads)."""
-    import atexit
-    import tempfile
-
-    from schema2_fixtures import migrated_copy
-
-    if name not in _migrated:
-        root = pathlib.Path(tempfile.mkdtemp(prefix="tilefish-fixture-"))
-        atexit.register(shutil.rmtree, root, True)
-        migrated_copy(FIXTURES / name, root / name)
-        _migrated[name] = root / name
-    return _migrated[name]
-
-
-def schema2_digest(name="sm_103"):
-    """The digest of the schema 2 manifest of a fixture, the one ``expected.json`` (which the Rust tests check) holds: computed by Python."""
-    from tilefish._manifest import manifest_digest
-
-    doc = json.loads((FIXTURES / name / "manifest.json").read_text())
-    assert manifest_digest(doc) == json.loads((FIXTURES / "expected.json").read_text())["fixtures"][name]["manifest_digest"]
-    return manifest_digest(doc)
+def expected_digest(name="sm_103"):
+    """The digest of a fixture that ``expected.json`` holds (which the Rust tests check too): computed by Python."""
+    return json.loads((FIXTURES / "expected.json").read_text())["fixtures"][name]["manifest_digest"]
 
 
 def fixture(name="sm_103"):
-    """A fixture of the crate, migrated to schema 3 and pinned to its own digest (the schema 2 digest is checked by its own test)."""
-    manifest = Manifest.load(migrated_fixture(name))
-    return manifest.check_pin(manifest.digest)
+    """A fixture of the crate (manifest schema 3, built by ``export_rust_fixtures.py``), loaded with the pin ``expected.json`` holds for it."""
+    return Manifest.load(FIXTURES / name, pin=expected_digest(name))
+
+
+def committed_ops():
+    """The declarations the committed fixture was emitted from: what can be declared without a GPU (``host_ops.gpu_ops`` cannot: it needs the Triton
+    builds the PTX of two prebuilt externs comes from), and the GEMMs of the committed shapes."""
+    import host_ops
+
+    return [*host_ops.ops().values(), *host_ops.library_ops(host_ops.GEMM_SHAPES_COMMITTED).values()]
 
 
 @pytest.fixture
@@ -131,9 +118,7 @@ def test_embedded_launchers(fake_manifest, tmp_path):
 
 @needs_crate
 def test_baked_in_sizes_are_constants_and_documented():
-    import host_ops
-
-    source = rust.render(fixture(), ops=host_ops.ops().values())
+    source = rust.render(fixture(), ops=committed_ops())
     assert "pub const X_PTR_AXIS1: usize = 2048;" in source  # the extern rmsnorm: Tensor[Rows, Hidden = 2048]
     assert "Baked into the binary: axis 1 of `x_ptr` is 2048;" in source
     assert "Constraints: `Db` is exactly 96 (a bucket of [96, 512, 1000]" in source
@@ -231,43 +216,79 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect():
     expected = json.loads((FIXTURES / "expected.json").read_text())["fixtures"]
     assert sorted(expected) == ["sm_103", "sm_120"]
     for name, want in expected.items():
-        assert schema2_digest(name) == want["manifest_digest"], name  # the digest of the schema 2 document, as Rust computes it
-        with pytest.raises(TilefishManifestError, match="schema 2, which an older tilefish wrote.*Re-export it"):
-            Manifest.load(FIXTURES / name)  # Python reads schema 3 only
-        manifest = Manifest.load(migrated_fixture(name))  # verifies every cubin against the manifest
-        assert manifest.digest != want["manifest_digest"]  # schema 3 has its own digest (tag v3, and the library section)
-        assert len(manifest.artifacts) == len(want["kernels"]) == 12
+        manifest = Manifest.load(FIXTURES / name, pin=want["manifest_digest"])  # verifies every cubin against the manifest; schema 3, which Rust reads too
+        assert manifest.digest == want["manifest_digest"], name
+        assert len(manifest.artifacts) == len(want["kernels"]) == 24 and len(manifest.library_entries) == len(want["library"])
         for k in want["kernels"]:
             artifact = manifest.get(k["stem"], k["arch"])
-            assert artifact.entry["cubin"] == k["cubin"]
+            assert artifact.entry["cubin"] == k["cubin"] and artifact.entry["kind"] == k["kind"]
             assert hashlib.sha256((FIXTURES / name / k["cubin"]).read_bytes()).hexdigest() == k["sha256"]
             assert code_digest(artifact.cubin) == k["sha256_code"]
+        for e in want["library"]:
+            entry = manifest.library_entry(e["stem"], e["arch"])
+            assert (entry["algo"], entry["cublaslt_version"], entry["workspace_bytes"], entry["impl"]) == (
+                e["algo"],
+                e["cublaslt_version"],
+                e["workspace_bytes"],
+                e["impl"],
+            )
+    # a pin is made on a device of its architecture: the native fixture has the GEMMs (two shapes, with and without a bias, over three buckets of M)
+    # and the one that was cross-compiled has none
+    assert len(expected["sm_103"]["library"]) == 12 and expected["sm_120"]["library"] == []
+    assert {e["stem"].split(".")[0] for e in expected["sm_103"]["library"]} == {"gemm_1024_1024", "gemm_1024_1024_bias", "gemm_3072_1024", "gemm_3072_1024_bias"}
+    # the prebuilt binaries are in both: hand-written PTX, the PTX of a Triton build and a cubin
+    for name in expected:
+        kinds = {k["stem"]: k["kind"] for k in expected[name]["kernels"]}
+        assert {s for s, kind in kinds.items() if kind == "binary"} == {"axpy_cubin", "axpy_ptx", "gelu_ptx", "softmax_ptx", "strided_copy"}, name
+    # the same binary through both doors has the same machine code (the PTX of the Triton build, assembled with Triton's flags)
+    by = {k["stem"]: k for k in expected["sm_103"]["kernels"]}
+    assert by["gelu_ptx"]["sha256_code"] == by["gelu_exact"]["sha256_code"] and by["softmax_ptx"]["sha256_code"] == by["softmax"]["sha256_code"]
+    assert by["axpy_cubin"]["sha256_code"] == by["axpy_ptx"]["sha256_code"]
 
 
 @needs_crate
 def test_the_committed_launchers_are_what_the_emitter_writes_for_the_fixture():
-    import host_ops
-
-    manifest = fixture()
-    emitted = rust.render(manifest, ops=host_ops.ops().values())
-    # the committed file embeds the schema 2 digest; the emitter now writes the schema 3 digest of the same manifest, and nothing else differs
-    assert emitted.count(manifest.digest) == 2 and (FIXTURES / "generated.rs").read_text().count(schema2_digest()) == 2
-    emitted = emitted.replace(manifest.digest, schema2_digest())
+    emitted = rust.render(fixture(), ops=committed_ops())
     assert emitted == (FIXTURES / "generated.rs").read_text(), (
         "crates/tilefish/tests/fixtures/generated.rs is not what tilefish.hosts.rust.emit writes for the sm_103 fixture: "
         "regenerate it with python/tests/export_rust_fixtures.py (or, if only the emitter changed, with emit)"
     )
+    assert f'pub const MANIFEST_DIGEST: &str = "{expected_digest()}";' in emitted
+
+
+def test_a_schema_2_manifest_is_refused_and_becomes_schema_3_by_three_additions(fake_manifest, tmp_path):
+    """A schema 2 manifest (no ``kind``, no ``scratch_slots``, no ``library``): Python refuses it, and ``migrate_doc`` of ``schema2_fixtures`` is what changes it."""
+    from schema2_fixtures import migrate_doc, migrated_copy
+
+    from tilefish._manifest import LEGACY_DIGEST_TAG, manifest_digest
+
+    doc = json.loads(fake_manifest.path.read_text())
+    old = copy.deepcopy(doc)
+    old["schema"] = 2
+    del old["library"]
+    for entry in old["kernels"]:
+        del entry["kind"]
+        del entry["abi"]["scratch_slots"]
+    directory = tmp_path / "old"
+    shutil.copytree(fake_manifest.directory, directory)
+    (directory / "manifest.json").write_text(json.dumps(old, indent=2) + "\n")
+    with pytest.raises(TilefishManifestError, match="schema 2, which an older tilefish wrote.*Re-export it"):
+        Manifest.load(directory)  # Python reads schema 3 only
+    assert migrate_doc(old) == doc
+    assert migrated_copy(directory, tmp_path / "new") == doc  # the directory too: the manifest rewritten, the cubins as they are
+    migrated = Manifest.load(tmp_path / "new")
+    assert migrated.doc == doc and migrated.digest == fake_manifest.digest
+    # the schema 2 document is still digested, in its own form (tag v2, no library), which is what the crate 0.0.1 computed
+    assert manifest_digest(old) != fake_manifest.digest and LEGACY_DIGEST_TAG == b"tilefish.manifest-digest.v2\0"
 
 
 # -- cargo check --------------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("cargo") is None, reason="cargo is not installed")
+@needs_new_crate
 @needs_crate
 def test_the_launchers_compile_against_the_crate(tmp_path_factory, fake_manifest):
     """``cargo check`` of three emitted modules (typed from declarations, from the manifest alone, and embedded) with no warnings."""
-    import host_ops
-
     crate = tmp_path_factory.mktemp("launchers-crate")
     (crate / "src").mkdir()
     (crate / "Cargo.toml").write_text(
@@ -275,7 +296,7 @@ def test_the_launchers_compile_against_the_crate(tmp_path_factory, fake_manifest
         f'[dependencies]\ntilefish = {{ path = {json.dumps(str(REPO_ROOT / "crates" / "tilefish"))} }}\n\n[workspace]\n'
     )
     sm_103 = fixture()
-    declared = list(host_ops.ops().values())
+    declared = committed_ops()
     rust.emit(sm_103, crate / "src" / "typed.rs", ops=declared)
     rust.emit(sm_103, crate / "src" / "manifest_only.rs")
     rust.emit(sm_103, crate / "src" / "embedded.rs", ops=declared, embed=True)
@@ -355,7 +376,7 @@ def _mutations():
 @needs_crate
 @pytest.mark.parametrize("name, mutate", _mutations(), ids=[n for n, _ in _mutations()])
 def test_python_refuses_what_the_rust_tests_refuse(name, mutate, tmp_path):
-    shutil.copytree(migrated_fixture("sm_103"), tmp_path / "m")
+    shutil.copytree(FIXTURES / "sm_103", tmp_path / "m")
     mutate(tmp_path / "m")
     with pytest.raises(TilefishManifestError):
         Manifest.load(tmp_path / "m")
