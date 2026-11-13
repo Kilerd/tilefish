@@ -476,3 +476,68 @@ fn a_scalar_has_a_dim_and_no_shape() {
     copy.edit_json(|doc| Copy::entry(doc, "swiglu")["abi"]["params"][3]["shape"] = serde_json::json!([1]));
     assert!(refused(&copy).contains("a scalar"));
 }
+
+#[test]
+fn the_launch_attributes_are_read_strictly_and_each_one_a_plain_launch_cannot_set_up_is_named() {
+    let read = |text: &str| serde_json::from_str::<tilefish::LaunchAttributes>(text);
+    let plain = r#"{"global_scratch_size": 0, "profile_scratch_size": 0, "launch_pdl": false,
+                    "cluster_dims": [1, 1, 1], "num_ctas": 1, "cooperative": false}"#;
+    let attrs = read(plain).unwrap();
+    assert!(attrs.blockers().is_empty());
+    // a field that is not one of the six is refused, and so is a missing one, wherever it is
+    let with = |extra: &str| plain.replacen('{', &format!("{{{extra},"), 1);
+    let e = read(&with(r#""launch_cluster": true"#)).unwrap_err().to_string();
+    assert!(e.contains("unknown field") && e.contains("launch_cluster"), "{e}");
+    assert!(read(&plain.replace("\"num_ctas\": 1,", "")).unwrap_err().to_string().contains("missing field"));
+    // the same inside a manifest entry
+    let copy = Copy::of("sm_103");
+    copy.edit("\"cooperative\": false", "\"cooperative\": false, \"preferred_cluster\": [2, 1, 1]");
+    assert!(refused(&copy).contains("unknown field"));
+    // each attribute is a blocker by itself, and says so
+    for (from, to, want) in [
+        ("\"global_scratch_size\": 0", "\"global_scratch_size\": 128", "global_scratch_size=128"),
+        ("\"profile_scratch_size\": 0", "\"profile_scratch_size\": 8", "profile_scratch_size=8"),
+        ("\"launch_pdl\": false", "\"launch_pdl\": true", "launch_pdl=True"),
+        ("\"cluster_dims\": [1, 1, 1]", "\"cluster_dims\": [2, 1, 1]", "cluster_dims=[2, 1, 1], num_ctas=1"),
+        ("\"cluster_dims\": [1, 1, 1]", "\"cluster_dims\": [1, 1, 2]", "cluster_dims=[1, 1, 2], num_ctas=1"),
+        ("\"num_ctas\": 1", "\"num_ctas\": 2", "cluster_dims=[1, 1, 1], num_ctas=2"),
+        ("\"cooperative\": false", "\"cooperative\": true", "launch_cooperative_grid=True"),
+    ] {
+        let attrs = read(&plain.replace(from, to)).unwrap();
+        assert_eq!(attrs.blockers(), [want], "{to}");
+    }
+    // several at once are all listed, in the order of the fields
+    let many = plain
+        .replace("\"launch_pdl\": false", "\"launch_pdl\": true")
+        .replace("\"cooperative\": false", "\"cooperative\": true")
+        .replace("\"global_scratch_size\": 0", "\"global_scratch_size\": 1");
+    assert_eq!(
+        read(&many).unwrap().blockers(),
+        ["global_scratch_size=1", "launch_pdl=True", "launch_cooperative_grid=True"]
+    );
+}
+
+#[test]
+fn a_loaded_manifest_can_be_checked_against_a_digest_afterwards() {
+    // what a generated launcher does with the digest it was generated from: the manifest it is given must be that one
+    let copy = Copy::of("sm_103");
+    let manifest = trust(&copy).unwrap();
+    let digest = expected_digest("sm_103");
+    assert_eq!(manifest.digest(), digest);
+    assert!(manifest.require_digest(&digest).is_ok());
+    // another manifest's digest, and one that only differs in its last character
+    match manifest.require_digest(&expected_digest("sm_120")) {
+        Err(Error::PinMismatch { found, pinned, directory }) => {
+            assert_eq!((found.as_str(), pinned.as_str()), (digest.as_str(), expected_digest("sm_120").as_str()));
+            assert_eq!(directory, manifest.label());
+        }
+        other => panic!("{other:?}"),
+    }
+    let last = if digest.ends_with('0') { '1' } else { '0' };
+    let near = format!("{}{last}", &digest[..63]);
+    assert!(matches!(manifest.require_digest(&near), Err(Error::PinMismatch { .. })));
+    // a pin that is not a digest is another error, and is refused even when it is what the manifest would say
+    for bad in ["", "abc", &digest.to_uppercase(), &format!("{digest}0"), &digest[..63]] {
+        assert!(matches!(manifest.require_digest(bad), Err(Error::BadPin(_))), "{bad:?}");
+    }
+}

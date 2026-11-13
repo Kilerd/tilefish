@@ -638,6 +638,65 @@ mod tests {
     }
 
     #[test]
+    fn a_value_that_does_not_fit_is_an_error_and_never_wraps() {
+        let m = &["M", "N"];
+        let (big, huge) = (i64::MAX, 1i64 << 60);
+        // 64 bits: the sum of two big dimensions, and a negative one, are exact in 128 bits and refused as values
+        let too_big = |r: Result<Option<i64>, String>| r.expect_err("it does not fit").contains("does not fit 64 bits");
+        assert!(too_big(eval("M + N", m, &[Some(big), Some(big)])));
+        assert!(too_big(eval("-M - N", m, &[Some(big), Some(big)])));
+        assert_eq!(eval("M + N", m, &[Some(big - 1), Some(1)]), Ok(Some(big)));
+        assert!(too_big(eval("M + N", m, &[Some(big), Some(1)])));
+        assert_eq!(eval("-M - 1", m, &[Some(big), None]), Ok(Some(i64::MIN)));
+        assert!(too_big(eval("-M - 2", m, &[Some(big), None])));
+        // 2^60 shapes: a product of two of them is a 120-bit number, which is bounded (2^100), and the message says so
+        let overflows = |r: Result<Option<i64>, String>| r.expect_err("it overflows").contains("overflows");
+        assert!(overflows(eval("M * N", m, &[Some(huge), Some(huge)])));
+        assert!(overflows(eval("M * N + 1", m, &[Some(huge), Some(huge)])));
+        assert!(overflows(eval("M * N - 1", m, &[Some(huge), Some(huge)])));
+        // the bound is 2^100 itself: 2^50 * 2^50 is within it (and then too big for 64 bits), one more is not
+        assert!(too_big(eval("M * N", m, &[Some(1 << 50), Some(1 << 50)])));
+        assert!(overflows(eval("M * N", m, &[Some(1 << 50), Some((1 << 50) + 1)])));
+        assert!(too_big(eval("M + N", m, &[Some(1 << 62), Some(1 << 62)])));
+        // a product of products that is beyond even 128 bits is the same refusal
+        assert!(overflows(eval("(M * N) * (M * N)", m, &[Some(1 << 40), Some(1 << 40)])));
+        // products that stay small are right, and a bound dimension of 2^60 alone is fine
+        assert_eq!(eval("M * 4 - M * 3", m, &[Some(huge), None]), Ok(Some(huge)));
+        assert_eq!(eval("M // 2 + cdiv(N, 2)", m, &[Some(huge), Some(huge)]), Ok(Some(huge)));
+    }
+
+    #[test]
+    fn an_equation_that_overflows_is_refused_and_one_at_the_edge_is_solved() {
+        // coefficients are folded in 128 bits: 10^12 * 10^12 is 10^24, and a bound dimension of 2^62 times it overflows
+        let q = pattern("999999999999*999999999999*M + N", &["M", "N"]);
+        let e = q.solve(5, &[Some(1 << 62), None]).unwrap_err();
+        assert_eq!(e, Unsolvable::Eval("a dimension expression overflows".to_owned()));
+        // a coefficient that big has no i64 form: the message shows the largest
+        let r = pattern("999999999999*999999999999*N", &["N"]);
+        assert_eq!(r.solve(5, &[None]), Err(Unsolvable::NotWhole { var: 0, target: 5, coefficient: i64::MAX }));
+        // a target that big shows as the largest i64, a negative one as the smallest
+        let up = pattern("2*N - 999999999999*999999999999", &["N"]);
+        assert_eq!(up.solve(0, &[None]), Err(Unsolvable::NotWhole { var: 0, target: i64::MAX, coefficient: 2 }));
+        let down = pattern("N + 999999999999*999999999999", &["N"]);
+        assert_eq!(down.solve(5, &[None]), Err(Unsolvable::NotPositive { var: 0, value: i64::MIN }));
+        // a solution that is not a 64-bit size
+        let wide = pattern("N - 999999999999*999999999999", &["N"]);
+        assert_eq!(wide.solve(5, &[None]), Err(Unsolvable::Eval("a dimension does not fit 64 bits".to_owned())));
+        // the edge: N = i64::MAX is a solution, 2^63 is not a 64-bit actual at all
+        let n = pattern("N", &["N"]);
+        assert_eq!(n.solve(i64::MAX, &[None]), Ok(Solved::Bound(0, i64::MAX)));
+        assert_eq!(n.solve(1, &[None]), Ok(Solved::Bound(0, 1)));
+        assert_eq!(n.solve(0, &[None]), Err(Unsolvable::NotPositive { var: 0, value: 0 }));
+        assert_eq!(n.solve(-1, &[None]), Err(Unsolvable::NotPositive { var: 0, value: -1 }));
+        // an evaluation that overflows while checking a fully bound pattern is an Eval error, not a mismatch
+        let both = pattern("M * N", &["M", "N"]);
+        assert!(
+            matches!(both.solve(7, &[Some(1 << 60), Some(1 << 60)]), Err(Unsolvable::Eval(m)) if m.contains("overflows"))
+        );
+        assert_eq!(both.solve(6, &[Some(2), Some(3)]), Ok(Solved::Checked));
+    }
+
+    #[test]
     fn folds_to_affine_forms() {
         let mut s = Symbols::default();
         let e = parse_expr("n - n + 3", "e", &mut s).unwrap();

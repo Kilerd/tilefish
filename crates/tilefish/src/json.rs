@@ -421,6 +421,60 @@ mod tests {
     }
 
     #[test]
+    fn nesting_is_bounded_exactly() {
+        // a leaf at depth 64 is read, one at depth 65 is not: for arrays and for objects, so a hostile file cannot overflow the stack
+        let arrays = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        let objects = |n: usize| format!("{}1{}", "{\"a\":".repeat(n), "}".repeat(n));
+        for make in [&arrays as &dyn Fn(usize) -> String, &objects] {
+            assert!(parse_strict(&make(64)).is_ok());
+            assert!(parse_strict(&make(65)).expect_err("65 levels").contains("nested too deeply"));
+            assert!(parse_strict(&make(5000)).expect_err("5000 levels").contains("nested too deeply"));
+        }
+        // empty containers count too
+        assert!(parse_strict(&format!("{}{}", "[".repeat(65), "]".repeat(65))).is_ok());
+        assert!(parse_strict(&format!("{}{}", "[".repeat(66), "]".repeat(66))).is_err());
+    }
+
+    #[test]
+    fn surrogate_escapes_are_read_at_the_edges_of_their_ranges() {
+        let text = |escapes: &str| match parse_strict(&format!("\"{escapes}\"")) {
+            Ok(Value::String(s)) => Ok(s),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        // the pairs at both ends, and the code points just outside the surrogate range on each side
+        assert_eq!(text("\\ud800\\udc00").unwrap(), "\u{10000}");
+        assert_eq!(text("\\udbff\\udfff").unwrap(), "\u{10ffff}");
+        assert_eq!(text("\\ud83d\\ude00").unwrap(), "\u{1f600}");
+        assert_eq!(text("\\ud7ff").unwrap(), "\u{d7ff}");
+        assert_eq!(text("\\ue000").unwrap(), "\u{e000}");
+        assert_eq!(text("\\uffff").unwrap(), "\u{ffff}");
+        // a high surrogate needs a low one right after it, and a low one cannot stand alone
+        for (escapes, what) in [
+            ("\\ud800", "the first high surrogate, alone"),
+            ("\\udbff", "the last high surrogate, alone"),
+            ("\\udc00", "the first low surrogate, alone"),
+            ("\\udfff", "the last low surrogate, alone"),
+            ("\\ud800x", "a high surrogate and a character"),
+            ("\\ud800\\n", "a high surrogate and another escape"),
+            ("\\ud800\\u0041", "a high surrogate and a letter"),
+            ("\\ud800\\ud800", "two high surrogates"),
+            ("\\ud800\\udbff", "a high surrogate and one just below the low range"),
+            ("\\ud800\\ue000", "a high surrogate and one just above the low range"),
+            ("\\udc00\\ud800", "a low surrogate first"),
+            ("\\udc00\\udc00", "two low surrogates"),
+        ] {
+            let e = text(escapes).expect_err(what);
+            assert!(e.contains("lone surrogate"), "{what}: {e}");
+        }
+        // four hex digits, of either case, and nothing else
+        assert_eq!(text("\\u00E9\\u00e9").unwrap(), "\u{e9}\u{e9}");
+        for bad in ["\\u12", "\\u12g4", "\\u+123", "\\u 123"] {
+            assert!(text(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn reads_what_python_reads() {
         let v = parse_strict(" {\"b\": [1, -0, 2.5, 1e2, true, null], \"a\": \"\\u00e9\\ud83d\\ude00\"} ").unwrap();
         assert_eq!(canonical(&v), "{\"a\":\"\\u00e9\\ud83d\\ude00\",\"b\":[1,0,2.5,100.0,true,null]}");
