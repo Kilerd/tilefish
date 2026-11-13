@@ -664,7 +664,6 @@ class Plan:
         self._doc = doc
         self._callees = callees  # entry stem -> the operator whose binary it is
         self._arena_variants = arena_variants
-        self._layout: "str | None" = None
         self.directory: "pathlib.Path | None" = None  # where it was exported to or loaded from (a plan that was only made has none)
         self.manifest: Any = None  # the verified manifest of that directory (:class:`~tilefish.Manifest`)
 
@@ -741,14 +740,6 @@ class Plan:
     @property
     def callees(self) -> "dict[str, Callee]":
         return dict(self._callees)
-
-    @property
-    def layout_key(self) -> str:
-        """A digest of everything about the memory layout and the steps but the architecture and the manifest: two plans with it are the same arena."""
-        if self._layout is None:
-            body = {k: v for k, v in self._doc.items() if k not in ("plan_digest", "tilefish", "arch", "manifest_digest")}
-            self._layout = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        return self._layout
 
     def with_manifest(self, arch: str, manifest_digest: str) -> "Plan":
         """The same plan built against the manifest ``manifest_digest`` for ``arch`` (its digest changes with them)."""

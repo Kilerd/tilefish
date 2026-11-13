@@ -54,7 +54,7 @@ from .trace import Value
 
 _lock = threading.Lock()
 _default_plans: "weakref.WeakKeyDictionary[GraphOp, Plan]" = weakref.WeakKeyDictionary()
-_loaded: "dict[tuple, tuple[Plan, PlanRunner]]" = {}  # a loaded plan directory, until a file in it changes
+_loaded: "dict[tuple, tuple[tuple, Plan, PlanRunner]]" = {}  # (directory, graph) -> (stamp of its files, loaded plan, its runner), until a file in it changes
 _jit_runners: "weakref.WeakKeyDictionary[Plan, PlanRunner]" = weakref.WeakKeyDictionary()
 
 
@@ -532,24 +532,23 @@ def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory
         p = pathlib.Path(path)
     except TypeError:
         raise TilefishRuntimeError(f"plan= takes a directory (or its plan.json) for replay, got {path!r}") from None
-    key = (*_directory_stamp(p), id(graph))
+    where, stamp = _directory_stamp(p)
+    key = (where, id(graph))  # one runner per directory and graph: a directory that changed replaces it, and its arena is freed with it
     with _lock:
         found = _loaded.get(key)
-    if found is not None:
-        loaded, runner = found
+    if found is not None and found[0] == stamp:
+        _, loaded, runner = found
         if pin is not None and loaded.digest != pin:
             raise TilefishManifestError(
                 f"the plan in {str(loaded.directory)!r} has digest {loaded.digest}, but the pin is {pin}: it is not the plan that was pinned "
                 "(it was changed, or it is another export)"
             )
-        if (pin is not None) != runner.provider.pinned:
-            found = None  # a load with the other trust anchor: the manifest's `pinned` differs, so load again
-        else:
+        if (pin is not None) == runner.provider.pinned:  # a load with the other trust anchor is made again: the manifest's `pinned` differs
             return runner
     loaded = _plan.load_plan(p, graph, pin=pin, trust_directory=trust_directory)
     runner = PlanRunner(loaded, ReplayProvider(loaded.manifest, pinned=pin is not None))
     with _lock:
-        _loaded[key] = (loaded, runner)
+        _loaded[key] = (stamp, loaded, runner)
     return runner
 
 
