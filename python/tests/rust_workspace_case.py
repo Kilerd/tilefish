@@ -7,7 +7,7 @@ torch's allocator), for ``gpu_gate.rs`` to run through ``Manifest::gemm`` with t
 
     python rust_workspace_case.py WORK
 
-Run on a machine with a GPU and the ``gpu`` extra, from ``python/tests`` (after or before ``rust_gate.py prepare WORK``, which does not touch it).
+Run on a machine with a GPU and the ``gpu`` extra, from ``python/tests``. ``rust_gate.py prepare WORK`` runs it at its end (prepare empties WORK first).
 """
 
 import ctypes

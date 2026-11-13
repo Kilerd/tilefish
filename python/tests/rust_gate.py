@@ -444,6 +444,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "prepare":
         prepare(args.work, args.manifest, args.pin)
+        # The GEMM whose pinned algorithm needs a workspace (gpu_gate.rs reads WORK/workspace_case); after prepare, which empties WORK.
+        import rust_workspace_case
+
+        rust_workspace_case.main(args.work)
         return 0
     return compare(args.work)
 

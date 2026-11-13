@@ -50,6 +50,10 @@ scalars (a tensor of one element), `i64` strides, and pinned cuBLASLt GEMMs
 (`Manifest::gemm`, `Gemm::launch`: the cuBLASLt of the process must be the version
 that chose the algorithm, and the workspace is the caller's last tensor, so
 nothing is allocated in a launch and it can be captured in a CUDA graph).
+cudarc opens `libcublasLt.so.12` by name: where cuBLASLt comes from a Python
+wheel (`nvidia-cublas`, torch's), put that wheel's `nvidia/cublas/lib` on
+`LD_LIBRARY_PATH`. A missing library is an error, and another build of it is
+refused by the version check.
 
 Safe code cannot free a slice under a running kernel or GEMM, and a launch of
 slices on a stream that is capturing a CUDA graph is refused, in every cudarc

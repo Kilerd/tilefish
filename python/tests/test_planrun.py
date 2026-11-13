@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import plan_model as pm
 import pytest
-from fake_torch import FakeDevice, FakeDtype, FakeTensor
+from fake_torch import FakeTensor
 
 import tilefish
 from tilefish import TilefishPreconditionError, TilefishRuntimeError, _plan

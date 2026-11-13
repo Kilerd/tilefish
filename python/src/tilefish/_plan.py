@@ -35,8 +35,8 @@ import json
 import math
 import pathlib
 import re
-from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Any, Mapping, Sequence
 
 from . import _specvalid as sv
 from ._launch import (
@@ -320,7 +320,6 @@ def _walk(gop: GraphOp) -> _Walk:
         if kind not in ("kernel", "extern", "library") or n.callee is None:
             _fail(name, f"{where} is a {kind!r} call that a plan cannot launch")
         callee = callee_of(n.callee)
-        op = callee.op
         sig_op = callee.public
         ins = {p.name: v for p, v in zip(sig_op.tensor_inputs, n.inputs)}
         for pname, v in ins.items():
@@ -1128,7 +1127,6 @@ def _validate(doc: Any) -> None:
     skeleton: "list[Any] | None" = None
     first: "dict[str, int]" = {}
     last: "dict[str, int]" = {}
-    written: "set[str]" = set()
     for bi, (bucket, shapes) in enumerate(zip(buckets, shapes_by_bucket)):
         steps = bucket["steps"]
         if not isinstance(steps, list) or len(steps) != n_steps:

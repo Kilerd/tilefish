@@ -857,7 +857,6 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
             for p, v in zip(op_sig.tensor_inputs, n.inputs):
                 if p.access == "inout" and v in views:
                     ins[p.name] = ins[p.name].clone()  # the IR: updating a chunk or a view does not change its parent
-            n_returned = len(op_sig.returns)
             if isinstance(op, LibraryOp):
                 from . import _library
 

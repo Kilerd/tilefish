@@ -14,7 +14,7 @@ import plan_model as pm
 import pytest
 
 import tilefish
-from tilefish import Dim, InOut, Out, Tensor, TilefishPlanError, bf16, f32, i32
+from tilefish import Dim, InOut, Out, Tensor, TilefishPlanError, bf16, f32
 from tilefish import _plan
 
 
@@ -170,7 +170,7 @@ def test_buckets_can_be_a_subset_of_the_declared_ones_and_not_anything_else():
 
 
 R = Dim("R")
-from plan_model import Q, W, accumulate, bump, plus, twice  # noqa: E402  (the small in-place graph of the model module)
+from plan_model import Q, W, accumulate, plus, twice  # noqa: E402  (the small in-place graph of the model module)
 
 
 def test_an_in_place_call_keeps_the_storage_of_the_version_it_consumes():
@@ -493,7 +493,7 @@ def test_nothing_a_plan_caches_keeps_a_plan_a_graph_or_an_operator_alive():
 
     @tilefish.graph
     def local_graph(a: Tensor[Q, W, f32]) -> Tensor[Q, W, f32]:
-        return local_op(a)
+        return local_op(a)  # noqa: F821 - traced when decorated, before the test deletes local_op
 
     p = tilefish.plan(local_graph)
     runner = _planrun._jit_runner(p)
