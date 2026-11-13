@@ -43,7 +43,7 @@ _ENTRY = re.compile(r"\.entry\s+(\w+)\s*\(")
 _PTX_PARAM = re.compile(r"\.param\s+\.(\w+)")
 _PTX_TARGET = re.compile(r"^\s*\.target\s+(\S+)", re.M)
 _MISSING = object()
-_compile_lock = threading.Lock()  # a Triton knob is process-wide state: one compile at a time while it is set
+_compile_lock = _ir.LOCK  # a Triton knob is process-wide state, and Triton's frontend is not known to be thread-safe: one compile (or frontend) at a time
 
 # the PTX type of each kind of launch parameter (all the AOT specs produce): a pointer is 64 bits, an i32 is 32
 _PTX_TYPES = {"pointer": ("u64", 8), "scalar": ("u32", 4)}
@@ -176,6 +176,21 @@ def _check_identity(jit: Any, spec: "CompileSpec") -> None:
         "a build compiles the function the spec names (the spec says nothing about the body of another one), so it is refused, "
         "and nothing is compiled or cached"
     )
+
+
+def _applied(key: str, want: Any, got: Any) -> bool:
+    """Whether the option ``key`` that was asked for as ``want`` is what the metadata of the compile says (``got``).
+
+    ``extern_libs`` is asked for as a mapping of names to paths; Triton keeps it as pairs (a list of lists once the metadata went through
+    its cache file) and adds ``libdevice`` when it is not among them, so it is applied when every library asked for is there with its path.
+    """
+    if key == "extern_libs":
+        try:
+            have = {str(k): v for k, v in dict(got).items()}
+            return all(have.get(str(k)) == v for k, v in dict(want).items())
+        except (TypeError, ValueError):
+            return False
+    return bool(got == want)
 
 
 def refuse_symlink(path: pathlib.Path) -> None:
@@ -462,14 +477,29 @@ def _check_generated(jit: Any, spec: "CompileSpec") -> None:
     _source.check_imported_lines(_source.jit_function(jit))
 
 
-def _refuse_overridden(triton: Any, spec: "CompileSpec") -> None:
-    """``TRITON_KERNEL_OVERRIDE`` makes Triton replace the IR of a stage with a file: the binary would not be of the kernel's IR."""
+def _refuse_unidentified(triton: Any, spec: "CompileSpec") -> None:
+    """Refuse a process state in which Triton does not compile the IR that identifies the binary.
+
+    ``TRITON_KERNEL_OVERRIDE`` makes Triton replace the IR of a stage with a file; so does the compile option ``ir_override``
+    (:func:`tilefish._cache.compile_files` refuses that); and an active Proton instrumentation (``CUDABackend.instrumentation``)
+    patches the passes that lower the IR. In each the binary would not be compiled from the IR whose digest identifies it.
+    """
     compilation = getattr(getattr(triton, "knobs", None), "compilation", None)
     if getattr(compilation, "override", False):
         raise TilefishBuildError(
             f"'{spec.stem}': Triton's kernel override is on (TRITON_KERNEL_OVERRIDE), so it may replace the IR of a stage with the "
             "contents of a file, and the binary would not be compiled from the IR whose digest identifies it. Switch it off to build "
             "(a build, an export and a cache entry are of the IR the kernel compiles to)"
+        )
+    try:
+        from triton.backends.nvidia.compiler import CUDABackend
+    except ImportError:  # not the NVIDIA backend (or not Triton at all)
+        return
+    if getattr(CUDABackend, "instrumentation", None) is not None:
+        raise TilefishBuildError(
+            f"'{spec.stem}': an instrumentation plugin of Triton is active (CUDABackend.instrumentation, as Proton's instrumentation "
+            "backend sets it), and it patches the passes that lower the IR, so the binary would not be compiled from the IR whose "
+            "digest identifies it. Stop the profiler to build"
         )
 
 
@@ -515,8 +545,11 @@ def build(
     are recomputed, among other things): an entry that is not as it was written is a miss with a
     :class:`~tilefish.errors.TilefishCacheWarning`, and the kernel is compiled. A hit has the cubin of the build that made
     it, so its ``sha256`` (whole file, with the debug path of that build) can differ from a fresh compile's while its
-    ``sha256_code`` is the same. ``cache=False`` neither reads nor writes it. Triton's kernel override
-    (``TRITON_KERNEL_OVERRIDE``) is refused: it replaces the IR of a stage with a file.
+    ``sha256_code`` is the same. ``cache=False`` neither reads nor writes it. Whatever would make Triton compile something other than the IR is refused:
+    its kernel override (``TRITON_KERNEL_OVERRIDE``) and the compile option ``ir_override`` replace the IR of a stage with a
+    file, and an active instrumentation plugin patches the passes. A compile option that names a file Triton reads
+    (``extern_libs``), and ``LLVM_PASS_PLUGIN_PATH``, are in the cache key by the sha256 of the content of the file, not
+    by its path.
     """
     cap = parse_arch(arch)
     inp = spec.ast_source_inputs()  # raises TilefishSpecError for a spec that is not verified
@@ -525,8 +558,11 @@ def build(
     _check_jit_function(jit, spec)
     _check_identity(jit, spec)  # before anything is built, so that no digest, key or binary is of a function the spec is not for
     _check_generated(jit, spec)
-    _refuse_overridden(triton, spec)
+    _refuse_unidentified(triton, spec)
     opts: dict[str, Any] = {**inp.options, **dict(options or {})}
+    from . import _cache
+
+    files = _cache.compile_files(opts)  # refuses ir_override; the sha256 of the files the options name (extern_libs)
     what = f"'{spec.stem}' ({spec.triton})"
     digest = _ir.ir_digest(_ir.ttir_text(jit, inp, arch=cap, options=opts, what=what))
     if ir_digest is not None and digest != ir_digest:
@@ -538,8 +574,6 @@ def build(
     cache_id = ""
     triton_version, ptxas = str(triton.__version__), ptxas_version()
     if cache:
-        from . import _cache
-
         store = _cache.default_cache()
     if store is not None:
         cache_id = _cache.cache_key(
@@ -549,6 +583,7 @@ def build(
             ptxas_version=ptxas,
             options=opts,
             environment=_cache.codegen_environment(),
+            files=files,
         )
         hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
@@ -575,7 +610,7 @@ def build(
         got = getattr(md, key, _MISSING)
         if got is _MISSING:
             raise TilefishBuildError(f"'{spec.stem}': Triton does not know the compile option '{key}' (it ignored it)")
-        if got != want:
+        if not _applied(key, want, got):
             raise TilefishBuildError(f"'{spec.stem}': the compile option {key}={want!r} was not applied (Triton used {got!r})")
     if getattr(md.target, "arch", None) != cap:
         raise TilefishBuildError(f"'{spec.stem}': asked for sm_{cap}, Triton built for {md.target!r}")

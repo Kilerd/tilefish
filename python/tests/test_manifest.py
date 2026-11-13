@@ -356,6 +356,12 @@ def test_an_ir_digest_made_by_another_triton_cannot_be_compared_and_needs_a_pin(
     with pytest.raises(TilefishManifestError, match=r"the entry was built with Triton 3.5.1, this process has Triton 3.6.0, .*cannot be compared"):
         m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton="3.6.0")
     assert m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton="3.6.0", pinned=True).stem == "scale"
+    # a replay that did not even run the frontend of the other Triton says the same: no digest, and the version it has
+    with pytest.raises(TilefishManifestError, match=r"the entry was built with Triton 3.5.1, this process has Triton 3.6.0, .*cannot be compared"):
+        m.built_kernel(spec, "sm_90", ir_digest=None, ir_triton="3.6.0")
+    assert m.built_kernel(spec, "sm_90", ir_digest=None, ir_triton="3.6.0", pinned=True).stem == "scale"
+    with pytest.raises(TilefishManifestError, match="cannot be recomputed here"):  # and with no Triton at all, the other message
+        m.built_kernel(spec, "sm_90", ir_digest=None, ir_triton=None)
 
 
 def test_a_generated_kernels_entry_records_its_ir_and_is_told_by_its_source_without_triton(tmp_path):
@@ -373,6 +379,37 @@ def test_a_generated_kernels_entry_records_its_ir_and_is_told_by_its_source_with
     assert m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton="3.6.0").stem == spec.stem  # another Triton: not comparable, not an error here
 
 
+# -- the digests of the source are read as the Rust reader reads them (crates/tilefish/src/manifest.rs) -------------------------------------
+
+
+@pytest.mark.parametrize("field", ["source_digest", "source_sha256"])
+@pytest.mark.parametrize("bad", ["A" * 64, "a" * 63, "a" * 65, "g" * 64, "", " " + "a" * 63, "a" * 63 + "é", 5, True, ["a" * 64], {"a": 1}])
+def test_a_source_digest_that_is_not_64_lowercase_hex_digits_is_refused_when_the_manifest_is_loaded(directory, field, bad):
+    edit_manifest(directory, lambda d: d["kernels"][0].update({field: bad}))
+    with pytest.raises(TilefishManifestError, match=rf"'scale' \(sm_90\): {field} must be 64 lowercase hex digits"):
+        Manifest.load(directory)
+
+
+def test_a_source_digest_and_its_kind_come_together_and_a_json_null_is_as_absent(directory):
+    for change in (lambda e: e.pop("source_digest_kind"), lambda e: e.pop("source_digest"), lambda e: e.update(source_digest_kind=None), lambda e: e.update(source_digest=None)):
+        edit_manifest(directory, lambda d: d["kernels"][0].update(source_digest=SRC, source_digest_kind=IR_DIGEST_KIND))
+        edit_manifest(directory, lambda d, change=change: change(d["kernels"][0]))
+        with pytest.raises(TilefishManifestError, match="source_digest and source_digest_kind come together"):
+            Manifest.load(directory)
+    edit_manifest(directory, lambda d: d["kernels"][0].update(source_digest=None, source_digest_kind=None))  # both null: both absent
+    assert Manifest.load(directory).get("scale", "sm_90").entry["source_digest"] is None
+    edit_manifest(directory, lambda d: (d["kernels"][0].pop("source_digest"), d["kernels"][0].pop("source_digest_kind")))
+    assert Manifest.load(directory).get("scale", "sm_90") is not None  # and both missing: an entry that records none
+
+
+def test_the_kind_of_a_source_digest_is_a_string_and_any_string_is_read(directory):
+    edit_manifest(directory, lambda d: d["kernels"][0].update(source_digest_kind=7))
+    with pytest.raises(TilefishManifestError, match="source_digest_kind must be a string"):
+        Manifest.load(directory)
+    edit_manifest(directory, lambda d: d["kernels"][0].update(source_digest_kind="another.definition.v9"))  # Rust does not judge the kind either
+    assert Manifest.load(directory).get("scale", "sm_90").entry["source_digest_kind"] == "another.definition.v9"
+
+
 def test_the_source_digest_of_an_entry_is_labelled(directory):
     entry = json.loads((directory / "manifest.json").read_text())["kernels"][0]
     assert entry["source_digest"] == SRC and entry["source_digest_kind"] == IR_DIGEST_KIND == "tilefish.triton-ir.v1"
@@ -388,8 +425,8 @@ def test_a_source_digest_of_another_kind_says_nothing_about_the_ir(tmp_path):
         m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)  # the same hash, the other kind: not taken as a match
     assert m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON, pinned=True).stem == "scale"  # only a pin vouches for it
     edit_manifest(tmp_path, lambda d: d["kernels"][0].pop("source_digest_kind"))
-    with pytest.raises(TilefishManifestError, match="is of kind None"):
-        Manifest.load(tmp_path).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
+    with pytest.raises(TilefishManifestError, match="source_digest and source_digest_kind come together"):  # the reader of Rust refuses it as well
+        Manifest.load(tmp_path)
 
 
 # -- the digest of the manifest --------------------------------------------------------------------------------------------------------

@@ -179,9 +179,11 @@ a lowered kernel has its `source_sha256` as well, which needs no Triton).
 `replay` recomputes the digest from the kernel the process holds, when Triton
 can be imported and is the version that built the entry, and refuses a mismatch
 as stale, with a pin or not (without Triton, or with another version, whose IR
-may print differently, only a pin vouches for a hand-written kernel). The frontend
-costs 2 to 8 ms per kernel on a B300 (no compile, no GPU), once for each build,
-`jit` call and `replay` call.
+may print differently, only a pin vouches for a hand-written kernel; the versions
+are compared first, so a Triton whose frontend differs is never asked to run it).
+The frontend costs 2 to 8 ms per kernel on a B300 (no compile, no GPU), once for
+each build, `jit` call and `replay` call. It runs under the same lock as a
+compile, so no two frontends, a compile's own included, run at once in any threads.
 
 So an edit that was not reloaded is not a special case. `export` in the process
 that imported the module compiles, and stamps, what that process holds; a fresh
@@ -196,9 +198,11 @@ What stays: the check, for a *lowered* kernel, that its module file has the
 `source_sha256` of its spec and that the function the process holds was
 imported from those lines (the IR digest says what the process holds, not that it
 is the source the spec claims); that `build(spec, fn=)` compiles the function
-the spec names and no other; and the refusal of Triton's kernel override
-(`TRITON_KERNEL_OVERRIDE` replaces the IR of a stage with a file, so the binary
-would not be of the IR).
+the spec names and no other; and the refusal of whatever makes Triton compile
+something other than the IR: its kernel override (`TRITON_KERNEL_OVERRIDE`) and
+the compile option `ir_override` replace the IR of a stage with a file (so the
+binary would not be of the IR), and an active instrumentation plugin
+(`CUDABackend.instrumentation`) patches the passes.
 
 A build compiles from scratch (25 to 120 ms per binary on a B300) unless
 tilefish's own cache has it: `~/.cache/tilefish`, or `$TILEFISH_CACHE_DIR` (an
@@ -213,7 +217,12 @@ tool paths, debugging switches), which is more than the 30 that Triton lists as
 cache-invalidating (it leaves out `TRITON_LIBDEVICE_PATH`,
 `TRITON_MOCK_PTX_VERSION` and `TRITON_KERNEL_OVERRIDE`, among others), the
 effective value of each codegen knob of `triton.knobs` and the sha256 of the
-libdevice file when a path is set. Every read is verified: the `sha256` and
+libdevice file when a path is set. A setting that names a file Triton reads is
+keyed by the sha256 of the file, not by its path, so a file rewritten under its name
+is another binary: the compile option `extern_libs`, `TRITON_LIBDEVICE_PATH` and
+`LLVM_PASS_PLUGIN_PATH` (a file that cannot be read refuses the build); the rest
+of what Triton 3.5.1 has that names a path is a tool (`ptxas`, whose version is in
+the key), an output, or the launcher's, and `_cache.py` lists it. Every read is verified: the `sha256` and
 `sha256_code` of the cubin are recomputed (and the PTX, the entry point and its
 ABI, the options, the IR digest and the versions are checked), and an entry that
 is not as it was written is a warning and a rebuild, never used, and a cache

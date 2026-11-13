@@ -167,11 +167,31 @@ def test_a_hand_written_kernel_that_cannot_be_recomputed_needs_a_pin(ext_dir, tm
     x = randn((64,), torch.float32, 0)
     write_ext_module(ext_dir, "2.0")
     manifest = runtime.export(ext_scale, tmp_path / "m")
-    monkeypatch.setattr(runtime, "_current_ir", lambda prep, cap: (None, None))
+    monkeypatch.setattr(runtime, "_current_ir", lambda prep, cap, built_with: (None, None))
     with pytest.raises(TilefishManifestError, match="cannot tell whether the binary for 'ext_scale' .* was built from the kernel .* as the process holds it.*cannot be recomputed"):
         tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, trust_directory=True)
     pinned = tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, pin=manifest.digest)
     assert torch.equal(pinned, x * 2)
+
+
+def test_a_pinned_replay_under_another_triton_falls_back_to_the_pin_and_never_runs_that_frontend(ext_dir, tmp_path, monkeypatch):
+    """The versions are compared before the frontend: a Triton whose frontend has other entry points would raise from it, where the answer is
+    that its IR digest cannot be compared, so only a pin can vouch."""
+    x = randn((64,), torch.float32, 0)
+    write_ext_module(ext_dir, "2.0")
+    manifest = runtime.export(ext_scale, tmp_path / "m")
+    ran = []
+
+    def frontend(*a, **k):
+        ran.append(1)
+        raise TilefishBuildError("a frontend whose entry points are not those of the Triton 3.5 tilefish calls")
+
+    monkeypatch.setattr(_ir, "triton_version", lambda: "9.9.9")  # the Triton of this process, as far as a replay can tell
+    monkeypatch.setattr(_ir, "ttir_text", frontend)
+    with pytest.raises(TilefishManifestError, match=r"the entry was built with Triton \S+, this process has Triton 9.9.9, .*cannot be compared"):
+        tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, trust_directory=True)
+    assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, pin=manifest.digest), x * 2)  # the pin vouches
+    assert ran == []
 
 
 def test_a_replay_without_triton_cannot_recompute_a_source_and_needs_a_pin(ext_dir, tmp_path):

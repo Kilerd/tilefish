@@ -16,8 +16,9 @@ The key is a sha256 over
   or names. It stands for the kernel: the body, every constant the kernel reads by any route, the jit functions it calls. It is the
   only thing that says which kernel it is; nothing is looked for in source files, namespaces or closures;
 * what the stages after the IR take besides it: the compile options in effect (the spec's and any a caller added), the target
-  architecture, the Triton version, the ``ptxas`` version, and the Triton settings that change code generation
-  (:func:`codegen_environment`, listed below).
+  architecture, the Triton version, the ``ptxas`` version, the Triton settings that change code generation
+  (:func:`codegen_environment`, listed below), and the *content* of every file that Triton reads while it compiles and that
+  a setting names (:func:`compile_files`, below).
 
 ``codegen_environment`` is, for Triton 3.5.1: every environment variable whose name starts with ``TRITON_``, ``MLIR_``, ``LLVM_``,
 ``NVPTX_``, ``AMDGCN_``, ``DISABLE_``, ``ENABLE_`` or ``ALLOW_``, or is ``USE_IR_LOC``, except those that are known not to change the
@@ -32,7 +33,19 @@ unless :data:`NOT_CODEGEN` names it: a missing entry in that list can only cost 
 of each codegen knob as ``triton.knobs`` reports it (a program may set a knob without the environment): ``compilation`` (``override``,
 ``use_ir_loc``, ``enable_asan``, ``disable_line_info``, ``front_end_debugging``, ``allow_non_constexpr_globals``,
 ``enable_experimental_consan``), ``language`` (``fp32_default``, ``default_fp_fusion``), ``nvidia`` (``disable_ptxas_opt``,
-``mock_ptx_version``, ``libdevice_path``), and the sha256 of the file that ``libdevice_path`` names.
+``mock_ptx_version``, ``libdevice_path``), ``runtime`` (``override_arch``), and the sha256 of the file that ``libdevice_path`` names.
+
+Files. A path in a key says which file, not what is in it, and a file can be rewritten under the same name. Every setting of Triton
+3.5.1 that names a file read while compiling was audited (the options of the NVIDIA backend, ``triton.knobs``, and the environment
+variables ``libtriton`` reads): ``ir_override`` (a compile option, a file that *replaces* the IR of a stage) is refused, like
+``TRITON_KERNEL_OVERRIDE`` and an active ``CUDABackend.instrumentation``, because the binary would not be of the IR that
+identifies it; ``extern_libs`` (a compile option, the bitcode libraries that are linked), ``TRITON_LIBDEVICE_PATH`` and
+``LLVM_PASS_PLUGIN_PATH`` (a plug-in that ``libtriton`` loads into the pass pipeline) are in the key by the sha256 of the file
+(a file that cannot be read refuses the build). What is left names a tool, an output or the launcher: ``TRITON_PTXAS_PATH`` (the
+``ptxas`` version is in the key), ``TRITON_CUOBJDUMP_PATH`` and ``TRITON_NVDISASM_PATH`` (only disassemble), ``MLIR_DUMP_PATH`` and
+``TRITON_REPRODUCER_PATH`` (written, not read), the caches and dump directories, ``TRITON_CUDACRT_PATH``, ``TRITON_CUDART_PATH`` and
+``TRITON_LIBCUDA_PATH`` (the launcher stub, which tilefish never builds), and ``TRITON_OVERRIDE_DIR`` (read only with the override
+on, which is refused).
 
 A kernel that Triton's frontend cannot build has no digest, so it has no key (``build`` raises). The IR is computed *before* the cache
 is looked up, so the lookup costs a run of the frontend (2 to 4 ms), and a binary is only ever stored under the digest of the IR it
@@ -171,7 +184,45 @@ _KNOBS = {
     ),
     "language": ("fp32_default", "default_fp_fusion"),
     "nvidia": ("disable_ptxas_opt", "mock_ptx_version", "libdevice_path"),
+    "runtime": ("override_arch",),
 }
+FILE_ENV = ("LLVM_PASS_PLUGIN_PATH",)  # environment variables that name a file libtriton reads while compiling: keyed by its content
+
+
+def _sha256_file(path: Any, what: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except (OSError, TypeError, ValueError) as e:
+        raise TilefishBuildError(
+            f"{what} ({path!r}) cannot be read, so the binary cannot be identified by what Triton would read from it: {e}"
+        ) from e
+
+
+def compile_files(options: "Mapping[str, Any]") -> "dict[str, str]":
+    """The sha256 of the content of every file that a compile with ``options`` reads, by option (see the module docstring).
+
+    ``ir_override`` is refused: it names a file that Triton substitutes for the IR of a stage, so the binary would not be compiled
+    from the IR that identifies it (the same hole as ``TRITON_KERNEL_OVERRIDE``). ``extern_libs`` (a mapping of names to paths, as
+    Triton takes it) gives one entry per library. Raises :class:`~tilefish.errors.TilefishBuildError` for the refused option, for
+    ``extern_libs`` that is not a mapping and for a file that cannot be read.
+    """
+    if options.get("ir_override"):
+        raise TilefishBuildError(
+            f"the compile option ir_override ({options['ir_override']!r}) names a file that Triton substitutes for the IR of a "
+            "stage, so the binary would not be compiled from the IR whose digest identifies it; it is refused, as Triton's kernel "
+            "override (TRITON_KERNEL_OVERRIDE) is. Write the kernel, not a replacement of its IR"
+        )
+    out: dict[str, str] = {}
+    libs = options.get("extern_libs")
+    if libs:
+        try:
+            pairs = dict(libs)
+        except (TypeError, ValueError) as e:
+            raise TilefishBuildError(f"the compile option extern_libs is a mapping of library names to file paths, got {libs!r}") from e
+        for name, path in sorted(pairs.items(), key=lambda kv: str(kv[0])):
+            out[f"extern_libs.{name}"] = _sha256_file(path, f"the extern library '{name}'")
+    return out
 
 
 def codegen_environment() -> "dict[str, Any]":
@@ -188,6 +239,9 @@ def codegen_environment() -> "dict[str, Any]":
             if (k.startswith(_ENV_PREFIXES) or k == "USE_IR_LOC") and k not in NOT_CODEGEN
         }
     }
+    for name in FILE_ENV:
+        if os.environ.get(name):
+            out.setdefault("env_files", {})[name] = _sha256_file(os.environ[name], name)
     try:
         import triton
     except ImportError:
@@ -222,8 +276,11 @@ def cache_key(
     ptxas_version: str,
     options: "Mapping[str, Any]",
     environment: "Mapping[str, Any]",
+    files: "Mapping[str, str]",
 ) -> str:
-    """The key of a build (see the module docstring): the IR digest and what the stages after the IR take besides it."""
+    """The key of a build (see the module docstring): the IR digest and what the stages after the IR take besides it.
+
+    ``files`` is :func:`compile_files` of the options: the content of the files they name."""
     from . import __version__
 
     doc = {
@@ -235,6 +292,7 @@ def cache_key(
         "ptxas": ptxas_version,
         "environment": dict(environment),
         "options": dict(options),
+        "files": dict(files),
     }
     text = json.dumps(doc, sort_keys=True, separators=(",", ":"), allow_nan=False, default=repr)
     return hashlib.sha256(_TAG + text.encode("utf-8")).hexdigest()

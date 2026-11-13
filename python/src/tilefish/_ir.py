@@ -44,7 +44,11 @@ if TYPE_CHECKING:
 
 IR_DIGEST_KIND = "tilefish.triton-ir.v1"  # the ``source_digest_kind`` of a manifest entry whose ``source_digest`` is an IR digest
 _TAG = b"tilefish.triton-ir-digest.v1\0"
-_frontend_lock = threading.Lock()  # Triton's frontend keeps state of its own (the code generator): one at a time
+# Triton's frontend (the code generator) and its compile are not known to be thread-safe, and the compile runs the frontend again inside
+# ``triton.compile`` (``ASTSource.make_ir``) with a knob set that is process-wide. So there is one lock, held by every run of the frontend
+# here and across the whole of every compile in :func:`tilefish._build.build`: no two frontends ever run at once. (Reentrant, so a
+# frontend inside a compile, which nothing here does, would not deadlock.)
+LOCK = threading.RLock()
 
 
 def triton_importable() -> bool:
@@ -89,7 +93,7 @@ def ttir_text(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "Mappi
         ) from e
     target = GPUTarget("cuda", arch, 32)
     try:
-        with _frontend_lock:
+        with LOCK:
             backend = make_backend(target)
             src = ASTSource(jit, signature=inputs.signature, constexprs=None, attrs=inputs.attrs)
             src.constants = inputs.constants
