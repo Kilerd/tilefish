@@ -394,6 +394,53 @@ def test_there_is_a_workspace_exactly_when_a_step_launches_a_gemm():
         _plan.validate_doc(doc)
 
 
+def leaves(node, path=()):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from leaves(v, path + (k,))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            yield from leaves(v, path + (i,))
+    else:
+        yield path
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_a_damaged_document_is_refused_with_a_manifest_error_or_still_valid_never_another_exception(good, good_reuse, exported, seed):
+    """Fuzz: change, delete, retype or duplicate one random part of a valid document, 25 times per seed; a reader either accepts it or raises TilefishManifestError."""
+    import random
+
+    rng = random.Random(seed)
+    _, p = exported
+    manifest = Manifest.load(exported[0])
+    base = (good, good_reuse)[seed % 2]
+    junk = [None, True, False, 0, -1, 1, 2**70, 1.5, "", "x", "M", "M*M", "3*M", "(((", [], {}, [1], {"a": 1}, "sm_103", "0" * 64]
+    refused = accepted = 0
+    for _ in range(25):
+        doc = copy.deepcopy(base)
+        path = rng.choice(list(leaves(doc)))
+        node = doc
+        for key in path[:-1]:
+            node = node[key]
+        how = rng.choice(["set", "set", "delete", "dup"])
+        if how == "set":
+            node[path[-1]] = rng.choice(junk)
+        elif how == "delete":
+            del node[path[-1]]
+        elif isinstance(node, list):
+            node.insert(rng.randrange(len(node) + 1), copy.deepcopy(node[path[-1]]))
+        else:
+            node[path[-1] + "_"] = node[path[-1]]
+        try:
+            _plan.validate_doc(doc)
+            doc["manifest_digest"] = manifest.digest  # the manifest check is next: it needs the digest to be the manifest's
+            _plan.check_against_manifest(doc, manifest)
+            accepted += 1
+        except TilefishManifestError:
+            refused += 1
+    assert refused + accepted == 25 and refused > 10
+
+
 def test_a_document_that_is_not_an_object_or_has_odd_types_is_a_refusal_not_a_crash(good):
     for bad in (None, [], "plan", 1, {"schema": "tilefish.plan.v1"}):
         with pytest.raises(TilefishManifestError):
