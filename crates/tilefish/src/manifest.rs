@@ -47,6 +47,9 @@ pub(crate) const MAX_ELEMENTS: u64 = (1 << 31) - 1;
 pub(crate) const ALIGNMENT: u64 = 16;
 const NUM_WARPS: [u32; 6] = [1, 2, 4, 8, 16, 32];
 const MAX_STAGES: u32 = 16;
+/// The `implementation` of an entry built from the fallback of an operator declared with an implementation per architecture (the
+/// implementation declared for an architecture is named by that architecture). Python's `IMPLEMENTATION_FALLBACK`.
+pub const IMPLEMENTATION_FALLBACK: &str = "fallback";
 /// The `source_digest_kind` of a prebuilt binary: its `source_digest` is the sha256 of the PTX or cubin file.
 const BINARY_DIGEST_KIND: &str = "tilefish.binary.v1";
 
@@ -515,6 +518,10 @@ pub struct Entry {
     pub enable_fp_fusion: Option<bool>,
     /// The sha256 of the declaration the binary was built from.
     pub declaration_digest: String,
+    /// Which implementation of an operator declared with an implementation per architecture (`@tilefish.extern(by_arch=...)`) the binary is:
+    /// the entry's own architecture (`"sm_103"`, the one declared for it) or `"fallback"`. `None` for every other operator. It is in the
+    /// declaration digest; a host launches the entry of its device's architecture, so it needs nothing else from it.
+    pub implementation: Option<String>,
     /// The sha256 of the cubin file.
     pub sha256: String,
     /// The sha256 of its machine code (see [`crate::elf`]).
@@ -696,6 +703,8 @@ struct RawEntry {
     #[serde(default)]
     options: Option<RawOptions>,
     declaration_digest: String,
+    #[serde(default)]
+    implementation: Option<String>,
     sha256: String,
     sha256_code: String,
     toolchain: RawToolchain,
@@ -1430,6 +1439,7 @@ impl Entry {
             preconditions,
             enable_fp_fusion: raw.options.as_ref().and_then(|o| o.enable_fp_fusion),
             declaration_digest: raw.declaration_digest,
+            implementation: raw.implementation,
             sha256: raw.sha256,
             sha256_code: raw.sha256_code,
             triton: raw.toolchain.triton,
@@ -1480,6 +1490,15 @@ impl Entry {
         }
         if raw.source_digest.is_some() != raw.source_digest_kind.is_some() {
             return Err("source_digest and source_digest_kind come together".to_owned());
+        }
+        if let Some(chosen) = &raw.implementation
+            && (kind != EntryKind::Triton || (chosen != &raw.arch && chosen != IMPLEMENTATION_FALLBACK))
+        {
+            return Err(format!(
+                "implementation must be the entry's architecture {:?} or {IMPLEMENTATION_FALLBACK:?} (the implementation of an operator declared \
+                 with by_arch= that it is), on a triton entry, got {chosen:?}",
+                raw.arch
+            ));
         }
         match kind {
             EntryKind::Triton => {

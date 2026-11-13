@@ -216,6 +216,51 @@ fn a_gluon_entry_with_i32_strides_and_no_offset_limit_is_read_and_its_strides_ar
     assert!(e.to_string().contains("x_s0") && e.to_string().contains("32-bit"), "{e}");
 }
 
+/// One implementation of an operator declared with an implementation per architecture (`@tilefish.extern(by_arch=...)`): a `triton` entry
+/// that says which (`"implementation"`: its own architecture, or `"fallback"`).
+fn row_sum(sm: u32, implementation: Value) -> Kernel {
+    let mut k = Kernel::new(
+        "triton",
+        "row_sum",
+        sm,
+        vec![
+            pointer(0, "x", "f32", "in", json!(["R", 256]), None),
+            pointer(1, "y", "f32", "out", json!(["R"]), None),
+            scalar(2, "n_rows", "i32", "R", json!({})),
+        ],
+        vec![alignment(0, "x", 16), alignment(1, "y", 16)],
+        json!({"R": {}}),
+        "(R,)",
+    );
+    k.entry["implementation"] = implementation;
+    k
+}
+
+#[test]
+fn the_implementation_an_entry_is_of_is_read_and_must_be_its_own_architecture_or_the_fallback() {
+    let manifest = read(&[row_sum(103, "sm_103".into()), row_sum(120, "fallback".into())], &[]).unwrap();
+    assert_eq!(manifest.entry("row_sum", "sm_103").unwrap().implementation.as_deref(), Some("sm_103"));
+    assert_eq!(manifest.entry("row_sum", "sm_120").unwrap().implementation.as_deref(), Some("fallback"));
+    // absent, or null: an operator with one implementation
+    assert_eq!(
+        read(&[row_sum(103, Value::Null)], &[]).unwrap().entry("row_sum", "sm_103").unwrap().implementation,
+        None
+    );
+    for bad in ["sm_120", "sm_90", "fallback2", "", "SM_103"] {
+        let e = refusal(&[row_sum(103, bad.into())], &[]);
+        assert!(e.contains("implementation must be the entry's architecture \"sm_103\" or \"fallback\""), "{bad}: {e}");
+    }
+    for bad in [json!(103), json!(true), json!(["sm_103"])] {
+        let e = refusal(&[row_sum(103, bad.clone())], &[]);
+        assert!(e.contains("expected a string"), "{bad}: {e}"); // (serde says the type, not the field)
+    }
+    // a prebuilt binary is no implementation of a Triton or Gluon declaration
+    let mut binary = axpy_ptx();
+    binary.entry["implementation"] = "sm_103".into();
+    let e = refusal(&[binary], &[]);
+    assert!(e.contains("on a triton entry"), "{e}");
+}
+
 #[test]
 fn a_view_that_reaches_further_than_its_memory_cannot_be_made() {
     // SAFETY: nothing is dereferenced.

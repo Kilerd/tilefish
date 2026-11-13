@@ -275,9 +275,9 @@ pub use launch_plan::{
 };
 pub use library::{AlgoSource, Heuristic, LibraryEntry, LibraryImpl};
 pub use manifest::{
-    Access, BinarySource, Constexpr, DimInfo, Entry, EntryKind, FixedValue, LaunchAttributes, MANIFEST_NAME,
-    MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin, Precondition, ScalarType, ShapeDim, StrideEntry, StrideOf, View,
-    manifest_digest,
+    Access, BinarySource, Constexpr, DimInfo, Entry, EntryKind, FixedValue, IMPLEMENTATION_FALLBACK, LaunchAttributes,
+    MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin, Precondition, ScalarType, ShapeDim, StrideEntry,
+    StrideOf, View, manifest_digest,
 };
 pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, Plan, Prepared};
