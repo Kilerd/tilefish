@@ -63,6 +63,7 @@ import os
 import pathlib
 import threading
 import weakref
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -557,6 +558,17 @@ class _CopyBound:
 
 
 @dataclass
+class _Tap:
+    """A debug tap of a run: the buffer ``buffer`` (``nbytes`` bytes, at the bucket) copied into the caller's tensor at ``dst`` after step ``after``."""
+
+    buffer: str
+    after: int
+    tensor: Any
+    dst: int
+    nbytes: int
+
+
+@dataclass
 class _StepRT:
     bound: "Bound | _CopyBound"
     loaded: Any  # the loaded kernel of a kernel step
@@ -592,6 +604,7 @@ class _Call:
     bases: "dict[str, int]"
     slots: "list[tuple[dict, Any, bool]]"  # (buffer, source, on_device) of every device scalar
     results: "list[Any]"  # the outputs, in the order the graph returns them
+    taps: "list[_Tap]" = dataclasses.field(default_factory=list)  # the copies of buffers the caller asked for, each after a step (taps=)
 
 
 def _ordered(be: Backend, arena: _Arena, stream: int, capturing: bool, work: Any) -> None:
@@ -764,13 +777,13 @@ class PlanRunner:
 
     # -- running ----------------------------------------------------------------------------------------------------------------
 
-    def run(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None) -> Any:
+    def run(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None, taps: Any = None) -> Any:
         be = self.backend
         bound = self._bind(args, kwargs)
         index = bound.index
         with _gate.shared():
             capturing = be.capturing(index)
-            call = self._call(bound, outputs, slots_in_graph=capturing)
+            call = self._call(bound, outputs, slots_in_graph=capturing, taps=taps)
             arena = call.arena
             with arena.lock, be.scope(index):
                 stream = be.stream(index)
@@ -828,7 +841,7 @@ class PlanRunner:
                 raise TilefishPreconditionError(f"the device scalar '{name}' is on {where}, but the other tensors of the call are on device {index}", kind="device", arg=name)
         return _BoundCall(call, sources, values, index)
 
-    def _call(self, bound: "_BoundCall", outputs: Any, slots_in_graph: bool) -> "_Call":
+    def _call(self, bound: "_BoundCall", outputs: Any, slots_in_graph: bool, taps: Any = None) -> "_Call":
         """The bucket's binaries and the arena (made the first time, outside a capture), the outputs (the caller's, or allocated), the address of every
         buffer, and **every precondition of every step**, all before anything is enqueued. ``slots_in_graph``: the writes of the device scalars are captured
         in a ``torch.cuda.graph``, so a host value is refused (a captured copy of it would freeze it). Called with the gate held shared."""
@@ -880,7 +893,7 @@ class PlanRunner:
                     )
                 slots.append((b, source, on_device))
         results = [t for _, t in sorted(made, key=lambda p: p[0])]
-        return _Call(rt, arena, checked, bases, slots, results)
+        return _Call(rt, arena, checked, bases, slots, results, self._taps(taps, rt, bases, arena, index))
 
     def _enqueue(self, call: "_Call", stream: int, index: int, slots: bool) -> None:
         """Enqueue the device-scalar writes (``slots``) and the launches of the steps on ``stream``, the current stream (the caller orders them: :func:`_ordered`)."""
@@ -888,18 +901,82 @@ class PlanRunner:
         if slots:
             for b, source, on_device in call.slots:
                 be.write_devscalar(call.arena.handle, b["offset"], b["dtype"], source, on_device)
-        for st, real in zip(call.rt.steps, call.checked):
-            if isinstance(st.bound, _CopyBound):
-                src, dst, nbytes = real
-                be.copy(dst, src, nbytes, stream)
-            elif st.algo is not None:
-                names = [a for a in st.bound.names]
-                a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
-                bias = real[names[2]].ptr if len(names) == 4 else None
-                be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, call.bases[st.workspace], stream, index)  # type: ignore[index]
+        taps = iter(call.taps)  # sorted by the step they follow
+        tap = next(taps, None)
+        for i, (st, real) in enumerate(zip(call.rt.steps, call.checked)):
+            self._enqueue_step(st, real, call.bases, stream, index)
+            while tap is not None and tap.after == i:  # a debug tap: the buffer as this step left it, copied out before the next step may reuse its bytes
+                be.copy(tap.dst, call.bases[tap.buffer], tap.nbytes, stream)
+                tap = next(taps, None)
+
+    def _enqueue_step(self, st: "_StepRT", real: Any, bases: "Mapping[str, int]", stream: int, index: int) -> None:
+        """Enqueue one checked step (``real``: what its ``check`` returned with the real addresses) on ``stream``."""
+        be = self.backend
+        if isinstance(st.bound, _CopyBound):
+            src, dst, nbytes = real
+            be.copy(dst, src, nbytes, stream)
+        elif st.algo is not None:
+            names = [a for a in st.bound.names]
+            a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
+            bias = real[names[2]].ptr if len(names) == 4 else None
+            be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
+        else:
+            launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
+            be.launch(st.loaded, st.bound.grid, launch_args, stream)
+
+    def _written(self, st: "_StepRT") -> "set[str]":
+        """The buffers a step writes: a copy's destination, a GEMM's ``out``, the ``out`` and ``inout`` pointers of a kernel."""
+        b = st.bound
+        if isinstance(b, _CopyBound):
+            return {b.dst}
+        written = {"out"} if st.algo is not None else b.written
+        return {binding for name, binding in zip(b.names, b.bindings) if name in written}
+
+    def _taps(self, taps: Any, rt: "_BucketRT", bases: "Mapping[str, int]", arena: _Arena, index: int) -> "list[_Tap]":
+        """``taps=`` of a run or a capture: ``{buffer: tensor}`` or ``{(buffer, step): tensor}``, a copy of the buffer (all of it, at the bucket) into the
+        tensor right after the step (by default after the last step of the bucket that writes the buffer). Outside the plan and its digest: a debug
+        view of the intermediates of the very plan a product runs. Checked before anything is enqueued."""
+        if taps is None:
+            return []
+        if not isinstance(taps, Mapping):
+            raise TilefishRuntimeError(f"taps= maps a buffer name (or a (name, step) pair) to the tensor it is copied into, got {taps!r}")
+        out: "list[_Tap]" = []
+        n_steps = len(rt.steps)
+        ranges = [(arena.ptr, arena.ptr + arena.nbytes)] if arena.nbytes else []
+        for b in self._doc["buffers"]:
+            if b["role"] in ("input", "weight", "inout", "output"):
+                dtype, shape = rt.shapes[b["name"]]
+                ranges.append((bases[b["name"]], bases[b["name"]] + math.prod(shape) * _plan.ITEMSIZE[dtype]))
+        for spec, tensor in taps.items():
+            if isinstance(spec, str):
+                name, after = spec, None
+            elif isinstance(spec, tuple) and len(spec) == 2:
+                name, after = spec
             else:
-                launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
-                be.launch(st.loaded, st.bound.grid, launch_args, stream)
+                name, after = None, None
+            buffer = name if isinstance(name, str) and name in self._buffers else _plan.output_buffer(self._doc, name)
+            if buffer is None or self._buffers[buffer]["role"] == "workspace":
+                raise TilefishRuntimeError(
+                    f"taps= names {spec!r}: a tap is a buffer of the plan of graph '{self.plan.name}' (not the workspace), or (buffer, step); its buffers are "
+                    f"{', '.join(b['name'] for b in self._doc['buffers'] if b['role'] != 'workspace')}"
+                )
+            if after is None:
+                writers = [i for i, st in enumerate(rt.steps) if buffer in self._written(st)]
+                if not writers:
+                    raise TilefishRuntimeError(f"taps= names '{buffer}', which no step writes: give the step to copy it after, ({buffer!r}, step)")
+                after = writers[-1]
+            if isinstance(after, bool) or not isinstance(after, int) or not 0 <= after < n_steps:
+                raise TilefishRuntimeError(f"taps= {spec!r}: the step is an index of the {n_steps} steps of the bucket, got {after!r}")
+            dtype, shape = rt.shapes[buffer]
+            self._check_output(f"taps[{spec!r}]", tensor, dtype, shape, index)
+            nbytes = math.prod(shape) * _plan.ITEMSIZE[dtype]
+            dst = int(tensor.data_ptr())
+            for lo, hi in ranges:
+                if dst < hi and lo < dst + nbytes:
+                    raise TilefishPreconditionError(f"the tensor of taps[{spec!r}] overlaps a tensor of the call or the plan's arena", kind="alias", arg=buffer)
+            ranges.append((dst, dst + nbytes))
+            out.append(_Tap(buffer, after, tensor, dst, nbytes))
+        return sorted(out, key=lambda t: t.after)
 
     def _check_one_stream_per_capture(self, arena: _Arena, stream: int) -> None:
         """Refuse a second run of this arena in one ``torch.cuda.graph`` capture on another stream than the first (under the arena's lock, before
@@ -920,7 +997,7 @@ class PlanRunner:
             )
         arena.captured = (capture, stream)
 
-    def capture(self, externals: "tuple[Any, ...]", devscalars: "Mapping[str, Any]", outputs: Any, stream: Any) -> "CapturedPlan":
+    def capture(self, externals: "tuple[Any, ...]", devscalars: "Mapping[str, Any]", outputs: Any, stream: Any, taps: Any = None) -> "CapturedPlan":
         """:func:`capture` of this runner's plan (see there)."""
         be = self.backend
         sig = self.plan.graph.signature
@@ -951,12 +1028,12 @@ class PlanRunner:
                     "tilefish.capture makes a CUDA graph of its own and is called outside a capture (the current stream is capturing one): to capture a plan in a "
                     "graph of yours, call tilefish.run inside torch.cuda.graph (see the docs for how its replays are ordered)"
                 )
-            call = self._call(bound, outputs, slots_in_graph=False)
+            call = self._call(bound, outputs, slots_in_graph=False, taps=taps)
             arena = call.arena
             epoch = _epoch[0]
             with arena.lock, be.scope(index):  # no other run of the plan is enqueued while the graph is captured
                 graph = be.capture_graph(index, stream, lambda s: self._enqueue(call, s, index, slots=False))
-        held = tuple(bound.call.tensors.values()) + tuple(call.results)
+        held = tuple(bound.call.tensors.values()) + tuple(call.results) + tuple(t.tensor for t in call.taps)
         return CapturedPlan(self, graph, call, index, epoch, held)
 
     def _given_outputs(self, outputs: Any, names: "Sequence[str]") -> "list[Any] | None":
@@ -1206,11 +1283,12 @@ def run_graph(
     pin: "str | None" = None,
     trust_directory: bool = False,
     outputs: Any = None,
+    taps: Any = None,
 ) -> Any:
     """``tilefish.run`` of a graph (see :func:`tilefish.run`)."""
     if mode == "reference":
-        if plan is not None or outputs is not None:
-            raise TilefishRuntimeError("plan= and outputs= are for jit and replay of a graph; reference mode evaluates the ops in torch and returns fresh tensors")
+        if plan is not None or outputs is not None or taps is not None:
+            raise TilefishRuntimeError("plan=, outputs= and taps= are for jit and replay of a graph; reference mode evaluates the ops in torch and returns fresh tensors")
         return reference_run(graph, args, kwargs)
     if mode == "jit":
         if isinstance(plan, Plan):
@@ -1221,8 +1299,8 @@ def run_graph(
             p = _default_plan(graph)
         else:
             raise TilefishRuntimeError("jit takes plan=<a Plan made by tilefish.plan(graph, ...)> or none; a directory is for mode='replay'")
-        return _jit_runner(p).run(args, kwargs, outputs)
-    return _replay_runner(graph, _plan_directory(plan), pin, trust_directory).run(args, kwargs, outputs)
+        return _jit_runner(p).run(args, kwargs, outputs, taps)
+    return _replay_runner(graph, _plan_directory(plan), pin, trust_directory).run(args, kwargs, outputs, taps)
 
 
 def capture(
@@ -1236,6 +1314,7 @@ def capture(
     devscalars: "Mapping[str, Any] | None" = None,
     outputs: Any = None,
     stream: Any = None,
+    taps: Any = None,
 ) -> CapturedPlan:
     """:func:`tilefish.capture`: the plan of ``graph`` (``jit`` or ``replay``, chosen as by :func:`tilefish.run`) captured in a CUDA graph of its own for the
     externals given, as a :class:`CapturedPlan` whose :meth:`~CapturedPlan.replay` is ordered with every other run of the plan.
@@ -1263,7 +1342,7 @@ def capture(
         if trust_directory is not True and trust_directory is not False:
             raise TilefishRuntimeError(f"trust_directory= is True or False, got {trust_directory!r}")
         runner = _replay_runner(graph, _plan_directory(plan), pin, trust_directory)
-    return runner.capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream)
+    return runner.capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream, taps)
 
 
 def _plan_directory(plan: Any) -> Any:

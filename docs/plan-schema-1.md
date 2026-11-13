@@ -288,6 +288,14 @@ what it always was.
 A host may cache everything of steps 1 to 3 that does not depend on an address (the dimension bindings, scalars, grids, the entries' loaded functions and pinned algorithms) per bucket, as Python's
 runner does; the address-dependent checks are repeated at every execution.
 
+**Debug taps (not part of the document).** A host may copy a buffer of the plan out during an execution, to observe the intermediates of the very plan a product runs: the
+plan and its digest are unchanged. A *tap* names a buffer (any but the workspace; a returned value by its name or `out<i>`) and a step of the bucket (by default the last step
+that writes the buffer: an `out` or `inout` pointer of a kernel, the `out` of a GEMM, the `dst` of a copy), and gives a dense tensor of the buffer's dtype and its shape at the
+bucket that overlaps no external, no other tap and not the arena. It is checked with everything else in step 3, and in step 5 the whole buffer is copied into it
+(`cuMemcpyDtoDAsync`, on the stream) right after its step, before the next step may write over the buffer's bytes (with `reuse`, an intermediate's bytes are reused). Python:
+`tilefish.run(graph, ..., taps={"t3": tensor, ("t5", 4): tensor})` and `tilefish.capture(..., taps=...)` (the copies are memcpy nodes of the graph); Rust:
+`PlanRun::launch_tapped(stream, externals, devscalars, &mut [Tap { buffer, after, into }])`.
+
 ## 10. CUDA graphs
 
 A plan does nothing during execution that a stream capture forbids: no allocation (the workspace of a GEMM, the intermediates and the device scalars are in the arena), no synchronization of
@@ -346,6 +354,8 @@ y = tilefish.run(graph, *inputs, mode="replay", plan="build/", pin=p.digest)  # 
 y = tilefish.run(graph, *inputs, mode="reference")                          # the ops' references composed in torch (an extern's reference= is its oracle)
 tilefish.run(graph, *inputs, outputs=out)                                   # write the returned values into these tensors instead of allocating
 tilefish.run(graph, *inputs, outputs={"y": y, "residual": r})              # the same by name (the graph's names, or out0, out1, ...)
+tilefish.run(graph, *inputs, taps={"t3": t, ("t5", 4): u})                 # copy buffers out after a step (section 9: debug taps; the plan is unchanged)
+plan.shape_of("t3", M=64)                                                   # the shape of a buffer at a bucket (what a tap is given)
 tilefish.runtime.prepare(graph, mode="replay", plan="build/", pin=p.digest) # arena, binaries, handle: before a CUDA graph capture
 cap = tilefish.capture(graph, *externals, devscalars={"n": 5}, outputs=out) # a CapturedPlan: the plan in a CUDA graph of its own (mode=, plan=, pin= as for run)
 cap.replay(stream=None)                                                     # ordered with every run and replay of the plan, from any thread
@@ -423,6 +433,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | a result written over its input (`MayAlias`, section 8) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
 | copy steps (`tilefish.copy`, a store into an `InOut` parameter; section 7.5) | `test_plan_copy.py`; on a GPU `test_gpu_plan_copy.py`; the Rust reader: `python_plans.json` (`copy ...` documents) |
 | returned views and parameters (section 12) | `test_plan_returns.py`; on a GPU `test_gpu_plan_returns.py` |
+| debug taps (section 9) | `test_plan_taps.py`; on a GPU `test_gpu_plan_taps.py` and `gpu_plan_gate.rs` (`taps_are_pythons_bytes`: Rust taps against Python's) |
 | the names of the returned values (section 6) | `test_plan_names.py`; the golden plan `steps` (`launch_plans.rs`); on a GPU `gpu_plan_gate.rs` (`a_named_output_is_given_by_its_name_or_by_out_i`) |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |

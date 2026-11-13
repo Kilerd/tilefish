@@ -937,6 +937,15 @@ class Plan:
         """The buffer of the returned value ``name``: its own name, or ``out<i>`` for the ``i``-th (:func:`output_buffer`)."""
         return output_buffer(self._doc, name)
 
+    def shape_of(self, name: str, **values: int) -> "tuple[int, ...]":
+        """The shape of the buffer ``name`` at the bucket ``values`` (``plan.shape_of("t3", M=64)``): what a tap of it (``taps=``) is given; its dtype
+        is in :attr:`buffers`."""
+        buffer = name if any(b["name"] == name for b in self._doc["buffers"]) else self.output_buffer(name)
+        if buffer is None:
+            raise TilefishPlanError(f"the plan of graph '{self.name}' has no buffer '{name}'")
+        self.steps(**values)  # the bucket must be one of the plan's
+        return buffer_shapes(self._doc, values)[buffer][1]
+
     def buckets(self) -> "list[dict[str, int]]":
         """The bucket combinations that have steps, in the order of the document."""
         return [dict(b["values"]) for b in self._doc["buckets"]]

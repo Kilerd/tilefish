@@ -388,6 +388,10 @@ the last call puts into the caller's output. A view that is not dense is refused
 `out1`, ...), `tilefish.run(..., outputs={"y": y, "residual": r})` takes them by name, and the Rust host binds them by name; both hosts also take `out<i>` for
 the `i`-th returned value, so a host written for the names of before keeps working.
 
+**Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
+last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest
+unchanged (`plan.shape_of("t3", M=64)` gives the shape; `tilefish.capture` takes `taps=` too; Rust: `PlanRun::launch_tapped`).
+
 A plan launches declared operators and views. Arithmetic traced in the graph body, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
 tensor was updated in place are refused with the rule that says so; there is no fusion in a plan yet. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation rules, the
 digest) for the host that will run it without Python.

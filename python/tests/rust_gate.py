@@ -85,6 +85,7 @@ SCALES = (0.5, -3.25, 1e-3)
 GEMM_M = (32, 64, 320)
 
 DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32", torch.int32: "i32"}
+TORCH_OF = {v: k for k, v in DTYPES.items()}
 
 
 # -- the inputs of the cases ----------------------------------------------------------------------------------------------------------------------
@@ -571,6 +572,31 @@ def plan_graphs():
     ]
 
 
+TAPPED = ("block-reuse",)  # the plans whose cases also record debug taps (intermediates whose bytes later steps reuse)
+
+
+def record_taps(work, exported, graph, args, params, bucket, case_id):
+    """Python's replay of a case with ``taps=``: every intermediate of the plan after the last step that writes it, and ``t2`` after step 3 (a step given);
+    ``[{"buffer", "after", "dtype", "shape", "expect"}]`` for ``gpu_plan_gate.rs``, which launches the same taps with ``PlanRun::launch_tapped``."""
+    doc = exported.doc
+    specs = [b["name"] for b in doc["buffers"] if b["role"] == "intermediate"] + [("t2", 3)]
+    taps = {}
+    for spec in specs:
+        name = spec if isinstance(spec, str) else spec[0]
+        dtype = next(b["dtype"] for b in doc["buffers"] if b["name"] == name)
+        taps[spec] = torch.full(exported.shape_of(name, **bucket), 7.0, dtype=TORCH_OF[dtype], device="cuda")
+    given = [args[b["name"]].clone() for b in params]
+    tilefish.run(graph, *given, mode="replay", plan=exported.directory, pin=exported.digest, taps=taps)
+    torch.cuda.synchronize()
+    out = []
+    for spec, t in taps.items():
+        name, after = (spec, None) if isinstance(spec, str) else spec
+        path = f"plans/cases/{case_id}/tap-{name}-{after}.expect.bin"
+        (work / path).write_bytes(raw(t))
+        out.append({"buffer": name, "after": after, "dtype": DTYPES[t.dtype], "shape": list(t.shape), "expect": path})
+    return out
+
+
 def prepare_plans(work):
     """Export the plans of :func:`plan_graphs` to ``WORK/plans/<name>`` and run every case through ``tilefish.run(..., mode="replay", plan=...)`` with
     the pin; write ``WORK/plans.json`` for ``gpu_gate.rs``::
@@ -635,7 +661,10 @@ def prepare_plans(work):
                     if isinstance(d, str) and d in doc["dims"]:
                         dims[d] = int(e)
             bucket = next(bk["values"] for bk in doc["buckets"] if all(bk["values"][k] == v for k, v in dims.items()))
-            cases.append({"id": case_id, "bucket": bucket, "devscalars": values, "externals": externals})
+            record = {"id": case_id, "bucket": bucket, "devscalars": values, "externals": externals}
+            if name in TAPPED:  # debug taps: every intermediate after the last step that writes it, and one after a step given
+                record["taps"] = record_taps(work, exported, graph, args, params, bucket, case_id)
+            cases.append(record)
             total += 1
         plans.append(
             {"name": name, "dir": f"plans/{name}", "digest": exported.digest, "graph": doc["graph"], "reuse": reuse, "arena_bytes": doc["arena_bytes"], "cases": cases}

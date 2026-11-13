@@ -25,7 +25,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, sys};
 use serde_json::Value;
 use tilefish::{
     Access, Bf16, DType, DevScalar, DevicePtr, Element, Error, F16, F32, I32, I64, LaunchPlan, Pin, PreconditionKind,
-    TensorArg, TensorMut, TensorRef, U8, plan_digest,
+    Tap, TensorArg, TensorMut, TensorRef, U8, plan_digest,
 };
 
 fn gate_dir() -> PathBuf {
@@ -250,6 +250,81 @@ fn every_case_launched_and_replayed_is_pythons_bytes() {
     println!(
         "rust plan gate: {cases} cases of plan replay: PlanRun::launch and two CapturedPlan::replay each byte-identical to Python ({tensors} tensors)"
     );
+}
+
+/// Debug taps (`PlanRun::launch_tapped`) of the block with reuse: every intermediate after the last step that writes it (later steps reuse its
+/// bytes) and `t2` after step 3, against what Python's `taps=` copied out of its replay of the same case; the outputs are still Python's.
+#[test]
+fn taps_are_pythons_bytes() {
+    let gpu = Gpu::new();
+    let plan = plan_named("block-reuse");
+    let run = load(&plan).instantiate_all(&gpu.stream).unwrap();
+    let mut tapped = 0;
+    for case in plan["cases"].as_array().unwrap() {
+        let id = case["id"].as_str().unwrap();
+        let specs = case["taps"].as_array().expect("the case records taps");
+        let values = devscalars(case);
+        let mut exts = upload(&gpu.stream, case);
+        let mut slices: Vec<(CudaSlice<u8>, Vec<usize>, DType)> = specs
+            .iter()
+            .map(|t| {
+                let dtype = dtype_of(t["dtype"].as_str().unwrap());
+                let shape: Vec<usize> =
+                    t["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect();
+                (gpu.stream.alloc_zeros::<u8>(shape.iter().product::<usize>() * dtype.size()).unwrap(), shape, dtype)
+            })
+            .collect();
+        {
+            let mut taps: Vec<Tap<'_>> = specs
+                .iter()
+                .zip(slices.iter_mut())
+                .map(|(t, (slice, shape, dtype))| Tap {
+                    buffer: t["buffer"].as_str().unwrap(),
+                    after: t["after"].as_u64().map(|a| a as usize),
+                    into: typed(slice, shape, *dtype, true),
+                })
+                .collect();
+            run.launch_tapped(&gpu.stream, &mut args(&mut exts, false), &named(&values), &mut taps)
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+        gpu.stream.synchronize().unwrap();
+        for (t, (slice, _, _)) in specs.iter().zip(&slices) {
+            let got = gpu.stream.clone_dtoh(slice).unwrap();
+            let expect = read(t["expect"].as_str().unwrap());
+            assert!(
+                got == expect,
+                "{id}: tap {} after {}: {} bytes differ",
+                t["buffer"],
+                t["after"],
+                differing(&got, &expect)
+            );
+            tapped += 1;
+        }
+        for e in exts.iter().filter(|e| e.expect.is_some()) {
+            assert!(
+                gpu.stream.clone_dtoh(&e.slice).unwrap() == *e.expect.as_ref().unwrap(),
+                "{id}: '{}' with taps",
+                e.name
+            );
+        }
+    }
+    // a tap is checked before anything runs: a buffer that is not one, the workspace, a step past the last, a tensor of another shape
+    let case = &plan["cases"].as_array().unwrap()[0];
+    let values = devscalars(case);
+    let mut exts = upload(&gpu.stream, case);
+    let mut wrong = gpu.stream.alloc_zeros::<u8>(4).unwrap();
+    let one = [1usize];
+    for (buffer, after, message) in [
+        ("nope", None, "not a buffer"),
+        ("workspace", None, "not a buffer"),
+        ("t1", Some(99), "but the bucket has"),
+        ("t1", None, "shape"),
+    ] {
+        let mut taps = [Tap { buffer, after, into: typed(&mut wrong, &one, DType::Bf16, true) }];
+        let e = run.launch_tapped(&gpu.stream, &mut args(&mut exts, false), &named(&values), &mut taps).unwrap_err();
+        assert!(e.to_string().contains(message), "{buffer}: {e}");
+    }
+    println!("rust plan gate: {tapped} taps byte-identical to Python's");
 }
 
 /// The outputs of a plan whose graph names them (`residual_chain`: `y` and `residual`) are given by those names or by `out0`, `out1` (the names
