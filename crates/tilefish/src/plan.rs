@@ -101,7 +101,8 @@ pub struct Plan {
     scalars: Vec<ScalarPlan>,
     slots: Vec<Slot>,
     scratch_slots: usize,
-    grid: Vec<Expr>,
+    /// The entries of the grid, evaluated in their folded form as Python evaluates its grid.
+    grid: Vec<Pattern>,
     grid_text: String,
     block: [u32; 3],
     shared: u32,
@@ -307,7 +308,11 @@ impl Plan {
                 Precondition::StaticSize { .. } | Precondition::Bucket { .. } => {}
             }
         }
-        let grid = parse_grid(source.grid, &mut syms).map_err(bad)?;
+        let grid = parse_grid(source.grid, &mut syms)
+            .map_err(bad)?
+            .into_iter()
+            .map(|e| Pattern::new(source.grid, e))
+            .collect();
         if syms.len() != dims.len() {
             return Err(Error::manifest(format!("{who}: the entry's dims do not name every dimension it uses")));
         }
@@ -653,7 +658,7 @@ impl Plan {
         for (s, scalar) in self.scalars.iter().enumerate() {
             let value = match scalar.count_of {
                 Some(t) => counts[t],
-                None => match scalar.dim.expr.eval(&dims).map_err(|e| Error::Launch(format!("'{stem}': {e}")))? {
+                None => match scalar.dim.eval(&dims).map_err(|e| Error::Launch(format!("'{stem}': {e}")))? {
                     Some(v) => v,
                     None => {
                         return Err(Error::Launch(format!(
@@ -753,10 +758,8 @@ impl Plan {
             let value =
                 entry.eval(&dims).map_err(|e| Error::Launch(format!("'{stem}': the grid {}: {e}", self.grid_text)))?;
             let Some(value) = value else {
-                let mut vars = Vec::new();
-                entry.vars(&mut vars);
                 let free: Vec<&str> =
-                    vars.into_iter().filter(|v| dims[*v].is_none()).map(|v| self.syms.name(v)).collect();
+                    entry.vars.iter().filter(|v| dims[**v].is_none()).map(|v| self.syms.name(*v)).collect();
                 return Err(Error::Launch(format!(
                     "the grid {} of '{stem}' mentions {free:?}, which no tensor determines",
                     self.grid_text

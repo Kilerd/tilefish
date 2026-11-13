@@ -61,12 +61,20 @@ pub enum Expr {
     CDiv(Box<Expr>, Box<Expr>),
 }
 
+const OVERFLOW: &str = "a dimension expression overflows";
+
 fn bounded(v: i128) -> Result<i128, String> {
-    if v.unsigned_abs() > (1u128 << 100) { Err("a dimension expression overflows".to_owned()) } else { Ok(v) }
+    if v.unsigned_abs() > (1u128 << 100) { Err(OVERFLOW.to_owned()) } else { Ok(v) }
 }
 
+/// `ceil(a / b)` for a positive `b` (the floor and one more when there is a remainder, which no `i128` overflows).
 fn ceil_div(a: i128, b: i128) -> i128 {
-    -(-a).div_euclid(b)
+    a.div_euclid(b) + i128::from(a.rem_euclid(b) != 0)
+}
+
+/// The value of `cdiv(n, d)`, an error for a divisor below 1 (as Python's `cdiv` raises for one).
+fn cdiv_value(n: i128, d: i128) -> Result<i128, String> {
+    if d < 1 { Err(format!("a division by {d}: the divisor must be positive")) } else { Ok(ceil_div(n, d)) }
 }
 
 impl Expr {
@@ -121,8 +129,20 @@ impl Expr {
         }
     }
 
-    /// The affine form of the expression (what Python's `DimExpr` folds to), or `None` when it is not affine
-    /// (two symbolic factors, a `//` that is not exact).
+    /// The affine form of the expression: what `_ExprParser._fold` in Python folds it to with the arithmetic of `DimExpr` and
+    /// `dims.cdiv`, or `None` where Python has no value for it (two symbolic factors, a `//` that is not exact, a `//` by a divisor that is
+    /// not a positive constant).
+    ///
+    /// The fold is Python's, case by case. A `//` folds a constant dividend (floor division: `-5 // 2` is `-3`) or a dividend whose every
+    /// coefficient is a multiple of the divisor. A `cdiv` by a positive constant is the dividend itself (by 1), a constant (`cdiv(-5, 2)` is
+    /// `-2`), an exact quotient (`cdiv(4*n, 2)` is `2*n`) or an atom of its own; a `cdiv` by a symbolic divisor is the constant `k` when the
+    /// dividend is exactly `k` times the divisor, whatever the signs (`cdiv(0, n)` and `cdiv(0, -n)` are `0`, `cdiv(2*n, -n)` is `-2`), and an
+    /// atom otherwise. A `cdiv` by a constant below 1 has no form (Python's `cdiv` raises, and its parser refuses the text before). The atom of a
+    /// `cdiv` that does not fold holds the *folded* dividend and divisor, as Python's `_CDiv` does: in `cdiv(M + N - N, 2)` the `N` cancels, so
+    /// the atom is `cdiv(M, 2)`, it equals the atom of `cdiv(M, 2)`, and evaluating it needs no value for `N`.
+    ///
+    /// One divergence remains: Python's integers are unbounded, the fold here is exact in 128 bits. A coefficient or a constant that does not
+    /// fit (a product of four 12-digit numbers, `10^48`) has no form here where Python has one; no manifest written by `tilefish` has one.
     pub fn affine(&self) -> Option<Affine> {
         match self {
             Expr::Num(n) => Some(Affine::constant(*n)),
@@ -133,8 +153,8 @@ impl Expr {
             Expr::Mul(a, b) => {
                 let (x, y) = (a.affine()?, b.affine()?);
                 match (x.as_constant(), y.as_constant()) {
-                    (Some(k), _) => y.scaled(k),
                     (_, Some(k)) => x.scaled(k),
+                    (Some(k), _) => y.scaled(k),
                     _ => None,
                 }
             }
@@ -143,25 +163,12 @@ impl Expr {
                 if d < 1 {
                     return None;
                 }
-                x.exact_div(d).or_else(|| x.as_constant().map(|c| Affine::constant(c.div_euclid(d))))
-            }
-            Expr::CDiv(a, b) => {
-                let (x, y) = (a.affine()?, b.affine()?);
-                match y.as_constant() {
-                    Some(1) => Some(x),
-                    Some(d) if d > 1 => {
-                        if let Some(c) = x.as_constant() {
-                            Some(Affine::constant(ceil_div(c, d)))
-                        } else if let Some(q) = x.exact_div(d) {
-                            Some(q)
-                        } else {
-                            Some(Affine::atom(Atom::Opaque(Box::new(self.clone()))))
-                        }
-                    }
-                    Some(_) => None,
-                    None => Some(Affine::atom(Atom::Opaque(Box::new(self.clone())))),
+                match x.as_constant() {
+                    Some(c) => Some(Affine::constant(c.div_euclid(d))),
+                    None => x.exact_div(d),
                 }
             }
+            Expr::CDiv(a, b) => cdiv(a.affine()?, b.affine()?).ok(),
         }
     }
 
@@ -171,23 +178,44 @@ impl Expr {
     }
 }
 
-/// An atom of an affine form: a dimension, or an expression that cannot be folded (a `cdiv` that is not exact).
+/// A ceiling division of two folded forms, folded as Python's `dims.cdiv` folds one (see [`Expr::affine`]): an error for a constant
+/// divisor below 1, as Python's raises.
+fn cdiv(x: Affine, y: Affine) -> Result<Affine, String> {
+    match y.as_constant() {
+        Some(d) if d < 1 => Err(format!("a division by {d}: the divisor must be positive")),
+        Some(1) => Ok(x),
+        Some(d) => Ok(match x.as_constant() {
+            Some(c) => Affine::constant(ceil_div(c, d)),
+            None => match x.exact_div(d) {
+                Some(q) => q,
+                None => Affine::atom(Atom::CDiv(Box::new(x), Box::new(y))),
+            },
+        }),
+        None => Ok(match x.ratio(&y) {
+            Some(k) => Affine::constant(k),
+            None => Affine::atom(Atom::CDiv(Box::new(x), Box::new(y))),
+        }),
+    }
+}
+
+/// An atom of an affine form: a dimension, or a ceiling division that does not fold (Python's `_CDiv`), of the folded dividend and divisor.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Atom {
     Var(usize),
-    Opaque(Box<Expr>),
+    CDiv(Box<Affine>, Box<Affine>),
 }
 
 impl Atom {
+    /// A text that two atoms share exactly when they are the same atom (an atom of a `cdiv` is known by its folded parts).
     fn key(&self) -> String {
         match self {
             Atom::Var(i) => format!("v{i:04}"),
-            Atom::Opaque(e) => format!("x{e:?}"),
+            Atom::CDiv(n, d) => format!("c({}/{})", n.key(), d.key()),
         }
     }
 }
 
-/// `c + sum(coefficient * atom)`.
+/// `c + sum(coefficient * atom)`, its terms in the order of their atoms' keys (so that one form has one spelling).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Affine {
     pub c: i128,
@@ -205,6 +233,14 @@ impl Affine {
 
     fn as_constant(&self) -> Option<i128> {
         self.terms.is_empty().then_some(self.c)
+    }
+
+    fn key(&self) -> String {
+        let mut key = self.c.to_string();
+        for (a, c) in &self.terms {
+            key.push_str(&format!(";{c}*{}", a.key()));
+        }
+        key
     }
 
     fn scaled(&self, k: i128) -> Option<Self> {
@@ -234,6 +270,8 @@ impl Affine {
         Some(Self { c: self.c.checked_add(other.c.checked_mul(sign)?)?, terms })
     }
 
+    /// The form divided by the constant `d` (at least 2), when every coefficient and the constant are multiples of it (Python's
+    /// `_div_exact_int`).
     fn exact_div(&self, d: i128) -> Option<Self> {
         if self.c % d != 0 || self.terms.iter().any(|(_, c)| c % d != 0) {
             return None;
@@ -241,27 +279,120 @@ impl Affine {
         Some(Self { c: self.c / d, terms: self.terms.iter().map(|(a, c)| (a.clone(), c / d)).collect() })
     }
 
-    /// The value of the affine form under `dims` (`None` while an atom it keeps mentions an unbound dimension): what Python's `subst` of the
-    /// folded expression gives, so a dimension that cancels (`M + N - N`) needs no value.
+    /// The integer `k` with `self == k * other`, for an `other` that is not a constant (Python's `DimExpr.exact_div`): the constants and the
+    /// coefficient of every atom of either form must all be `k` times the other's.
+    fn ratio(&self, other: &Self) -> Option<i128> {
+        let mut pairs = Vec::with_capacity(other.terms.len() + self.terms.len() + 1);
+        if self.c != 0 || other.c != 0 {
+            pairs.push((self.c, other.c));
+        }
+        for (a, c) in &other.terms {
+            pairs.push((self.coefficient_of(a), *c));
+        }
+        for (a, c) in &self.terms {
+            if other.coefficient_of(a) == 0 {
+                pairs.push((*c, 0));
+            }
+        }
+        let mut ratio = None;
+        for (mine, theirs) in pairs {
+            if theirs == 0 {
+                if mine != 0 {
+                    return None;
+                }
+                continue;
+            }
+            if mine.checked_rem(theirs)? != 0 {
+                return None;
+            }
+            let k = mine.checked_div(theirs)?;
+            match ratio {
+                None => ratio = Some(k),
+                Some(r) if r != k => return None,
+                Some(_) => {}
+            }
+        }
+        ratio
+    }
+
+    fn coefficient_of(&self, atom: &Atom) -> i128 {
+        self.terms.iter().find(|(a, _)| a == atom).map_or(0, |(_, c)| *c)
+    }
+
+    /// Every dimension the form mentions, once each, those inside the atom of a `cdiv` included (Python's `free_dims`): a dimension that
+    /// cancelled is not one of them.
+    pub fn vars(&self, out: &mut Vec<usize>) {
+        for (atom, _) in &self.terms {
+            match atom {
+                Atom::Var(i) => {
+                    if !out.contains(i) {
+                        out.push(*i);
+                    }
+                }
+                Atom::CDiv(n, d) => {
+                    n.vars(out);
+                    d.vars(out);
+                }
+            }
+        }
+    }
+
+    /// The value of the affine form under `dims`, as Python's `eval_dim` of the folded expression gives it: a dimension that cancelled
+    /// (`M + N - N`, `cdiv(M + N - N, 2)`) needs no value, and a form that folds to a constant once some of its dimensions are bound has that
+    /// value (`cdiv(M + 2*N, N)` is 2 when `M` is 0, whatever `N` is). `None` while it still mentions an unbound dimension; an error for a
+    /// `cdiv` by a value below 1, an overflow, or a value that does not fit 64 bits.
     pub fn eval(&self, dims: &[Option<i64>]) -> Result<Option<i64>, String> {
+        match self.value(&|i| dims.get(i).copied().flatten().map(i128::from))? {
+            None => Ok(None),
+            Some(v) => i64::try_from(v).map(Some).map_err(|_| format!("the value {v} does not fit 64 bits")),
+        }
+    }
+
+    /// The value under `lookup` (the value of each bound dimension): see [`Affine::eval`].
+    fn value(&self, lookup: &dyn Fn(usize) -> Option<i128>) -> Result<Option<i128>, String> {
+        match self.numeric(None, lookup)? {
+            Some(v) => Ok(Some(v)),
+            // a dimension is not bound: the form with the bound ones substituted may still fold to a constant, as Python's `subst` does
+            None => Ok(self.subst(lookup)?.as_constant()),
+        }
+    }
+
+    /// The value of the form without the term of the dimension `skip`, when every dimension the rest needs is bound (`None` as soon as one is
+    /// not). Nothing is allocated.
+    fn numeric(&self, skip: Option<usize>, lookup: &dyn Fn(usize) -> Option<i128>) -> Result<Option<i128>, String> {
         let mut acc = self.c;
         for (atom, c) in &self.terms {
             let value = match atom {
-                Atom::Var(i) => dims.get(*i).copied().flatten(),
-                Atom::Opaque(e) => e.eval(dims)?,
+                Atom::Var(i) if Some(*i) == skip => continue,
+                Atom::Var(i) => lookup(*i),
+                Atom::CDiv(n, d) => match (n.numeric(None, lookup)?, d.numeric(None, lookup)?) {
+                    (Some(n), Some(d)) => Some(cdiv_value(n, d)?),
+                    _ => None,
+                },
             };
             let Some(value) = value else { return Ok(None) };
-            acc = c
-                .checked_mul(i128::from(value))
-                .and_then(|p| acc.checked_add(p))
-                .ok_or("a dimension expression overflows")?;
+            acc = c.checked_mul(value).and_then(|p| acc.checked_add(p)).ok_or(OVERFLOW)?;
         }
-        i64::try_from(acc).map(Some).map_err(|_| format!("the value {acc} does not fit 64 bits"))
+        Ok(Some(acc))
+    }
+
+    /// The form with every bound dimension replaced by its value and folded again (Python's `subst`): an atom of a `cdiv` is folded anew
+    /// from its substituted parts.
+    fn subst(&self, lookup: &dyn Fn(usize) -> Option<i128>) -> Result<Self, String> {
+        let mut acc = Self::constant(self.c);
+        for (atom, c) in &self.terms {
+            let replaced = match atom {
+                Atom::Var(i) => lookup(*i).map_or_else(|| Self::atom(Atom::Var(*i)), Self::constant),
+                Atom::CDiv(n, d) => cdiv(n.subst(lookup)?, d.subst(lookup)?)?,
+            };
+            acc = replaced.scaled(*c).and_then(|r| acc.plus(&r, 1)).ok_or(OVERFLOW)?;
+        }
+        Ok(acc)
     }
 
     /// The coefficient of the dimension `var` (0 when it does not occur as an atom of its own).
     pub fn coefficient(&self, var: usize) -> i128 {
-        self.terms.iter().find(|(a, _)| *a == Atom::Var(var)).map_or(0, |(_, c)| *c)
+        self.coefficient_of(&Atom::Var(var))
     }
 }
 
@@ -469,7 +600,11 @@ pub fn parse_grid(text: &str, syms: &mut Symbols) -> Result<Vec<Expr>, String> {
 
 // -- patterns: an expression that is solved against a size -------------------------------------------------------------
 
-/// An expression that a launch binds or checks against a size: the shape of a tensor, the dimension a scalar carries.
+/// An expression that a launch binds, checks or evaluates: the shape of a tensor, the dimension a scalar carries, an entry of the grid.
+///
+/// It is used in its folded form, as Python uses the folded `DimExpr` of a declaration: its dimensions are the ones the folded form mentions
+/// (Python's `free_dims`: in `cdiv(M + N - N, 2)` only `M`), and its value is the one the folded form has. An expression that is not affine
+/// (`M*N`, which Python never writes, but a host may be given) is evaluated as it is written.
 #[derive(Debug, Clone)]
 pub struct Pattern {
     pub text: String,
@@ -506,14 +641,26 @@ pub enum Unsolvable {
 impl Pattern {
     pub fn new(text: &str, expr: Expr) -> Self {
         let mut vars = Vec::new();
-        expr.vars(&mut vars);
         let affine = expr.affine();
+        match &affine {
+            Some(a) => a.vars(&mut vars),
+            None => expr.vars(&mut vars),
+        }
         let is_static = affine.as_ref().is_some_and(|a| a.terms.is_empty());
         Self { text: text.to_owned(), expr, vars, affine, is_static }
     }
 
     pub fn parse(text: &str, what: &str, syms: &mut Symbols) -> Result<Self, String> {
         Ok(Self::new(text, parse_expr(text, what, syms)?))
+    }
+
+    /// The value under `dims` (`None` while it needs a dimension that is not bound): the folded form's (see [`Affine::eval`]), or for an
+    /// expression that is not affine, the value of the expression as it is written.
+    pub fn eval(&self, dims: &[Option<i64>]) -> Result<Option<i64>, String> {
+        match &self.affine {
+            Some(a) => a.eval(dims),
+            None => self.expr.eval(dims),
+        }
     }
 
     /// Bind or check one dimension against `actual`, as Python's `_solve_one` does: a dimension is at least 1.
@@ -527,7 +674,7 @@ impl Pattern {
     pub fn solve_from(&self, actual: i64, dims: &[Option<i64>], minimum: i64) -> Result<Solved, Unsolvable> {
         let mut unbound = self.vars.iter().copied().filter(|v| dims.get(*v).copied().flatten().is_none());
         let Some(var) = unbound.next() else {
-            return match self.expr.eval(dims).map_err(Unsolvable::Eval)? {
+            return match self.eval(dims).map_err(Unsolvable::Eval)? {
                 Some(expected) if expected == actual => Ok(Solved::Checked),
                 Some(expected) => Err(Unsolvable::Mismatch { expected }),
                 None => Ok(Solved::Stuck),
@@ -541,18 +688,20 @@ impl Pattern {
         if coefficient == 0 {
             return Ok(Solved::Stuck); // the dimension only occurs inside a cdiv
         }
-        let mut base = affine.c;
-        for (atom, c) in &affine.terms {
-            let value = match atom {
-                Atom::Var(i) if *i == var => continue,
-                Atom::Var(i) => dims.get(*i).copied().flatten().map(i128::from),
-                Atom::Opaque(e) => e.eval(dims).map_err(Unsolvable::Eval)?.map(i128::from),
-            };
-            let Some(value) = value else { return Ok(Solved::Stuck) };
-            let overflow = || Unsolvable::Eval("a dimension expression overflows".to_owned());
-            base = c.checked_mul(value).and_then(|p| base.checked_add(p)).ok_or_else(overflow)?;
-        }
-        let target = i128::from(actual) - base;
+        // the rest of the form (Python's `pattern - var * coef`), which must have a value with `var` unbound
+        let lookup = |i: usize| dims.get(i).copied().flatten().map(i128::from);
+        let base = match affine.numeric(Some(var), &lookup).map_err(Unsolvable::Eval)? {
+            Some(base) => base,
+            None => {
+                let mut rest = affine.clone();
+                rest.terms.retain(|(a, _)| *a != Atom::Var(var));
+                match rest.value(&lookup).map_err(Unsolvable::Eval)? {
+                    Some(base) => base,
+                    None => return Ok(Solved::Stuck),
+                }
+            }
+        };
+        let target = i128::from(actual).checked_sub(base).ok_or_else(|| Unsolvable::Eval(OVERFLOW.to_owned()))?;
         if target % coefficient != 0 {
             return Err(Unsolvable::NotWhole {
                 var,
@@ -719,6 +868,125 @@ mod tests {
             matches!(both.solve(7, &[Some(1 << 60), Some(1 << 60)]), Err(Unsolvable::Eval(m)) if m.contains("overflows"))
         );
         assert_eq!(both.solve(6, &[Some(2), Some(3)]), Ok(Solved::Checked));
+    }
+
+    /// What an expression folds to: a constant, a form over these dimensions (sorted), no form (not affine), or a text the parser refuses.
+    #[derive(Debug, PartialEq)]
+    enum Folded {
+        Constant(i128),
+        Over(Vec<String>),
+        NotAffine,
+        Refused,
+    }
+
+    fn folded(text: &str) -> Folded {
+        let mut syms = Symbols::default();
+        let Ok(e) = parse_expr(text, "e", &mut syms) else { return Folded::Refused };
+        match e.affine() {
+            None => Folded::NotAffine,
+            Some(a) => match a.as_constant() {
+                Some(c) => Folded::Constant(c),
+                None => {
+                    let mut vars = Vec::new();
+                    a.vars(&mut vars);
+                    let mut names: Vec<String> = vars.iter().map(|v| syms.name(*v).to_owned()).collect();
+                    names.sort();
+                    Folded::Over(names)
+                }
+            },
+        }
+    }
+
+    #[test]
+    fn cdiv_and_floor_division_fold_as_python_folds_them() {
+        use Folded::{Constant, NotAffine, Over, Refused};
+        let over = |names: &[&str]| Over(names.iter().map(|n| (*n).to_owned()).collect());
+        // what `_ExprParser(text).expr()` gives in Python (its value, or its `free_dims`), with `_fold`'s `DimExpr` arithmetic and `cdiv`
+        let python = [
+            // a dividend that is a multiple of a symbolic divisor is that multiple, of either sign: `cdiv(0, x)` is 0
+            ("cdiv(0, n)", Constant(0)),
+            ("cdiv(0, -n)", Constant(0)),
+            ("cdiv(0*n, m)", Constant(0)),
+            ("cdiv(m - m, n)", Constant(0)),
+            ("cdiv(0, n) + 1", Constant(1)),
+            ("cdiv(2*n, n)", Constant(2)),
+            ("cdiv(2*n, -n)", Constant(-2)),
+            ("cdiv(-2*n, n)", Constant(-2)),
+            ("cdiv(n, -n)", Constant(-1)),
+            ("cdiv(n+m, n+m)", Constant(1)),
+            ("cdiv(2*n+2, n+1)", Constant(2)),
+            ("cdiv(3*n, 2*n)", over(&["n"])),
+            ("cdiv(n+1, 2*n+2)", over(&["n"])),
+            ("cdiv(-4, n)", over(&["n"])),
+            ("cdiv(-5, n)", over(&["n"])),
+            // a constant divisor: the dividend (by 1), a constant (rounded up, negative dividends included), an exact quotient, or an atom
+            ("cdiv(n, 1)", over(&["n"])),
+            ("cdiv(n, n - n + 1)", over(&["n"])),
+            ("cdiv(0, 5)", Constant(0)),
+            ("cdiv(-5, 2)", Constant(-2)),
+            ("cdiv(-6, 3)", Constant(-2)),
+            ("cdiv(n - n - 4, 3)", Constant(-1)),
+            ("cdiv(4*n, 2)", over(&["n"])),
+            ("cdiv(-n, 2)", over(&["n"])),
+            // a divisor that folds to a constant below 1 is refused by the parser, a `//` by a symbolic divisor has no form
+            ("cdiv(n, 2 - 4)", Refused),
+            ("cdiv(n, cdiv(0, m))", Refused),
+            ("n // -n", NotAffine),
+            ("-5 // 2", Constant(-3)),
+            ("0 // 5", Constant(0)),
+            ("-0 // 5", Constant(0)),
+            ("(n - n) // 3", Constant(0)),
+            // the atom of a cdiv holds its folded parts: a name that cancels in it is not one of its dimensions, and two spellings are one atom
+            ("cdiv(M + N - N, 2)", over(&["M"])),
+            ("cdiv(M + N - N, 2) - cdiv(M, 2)", Constant(0)),
+            ("cdiv(M, 2) + cdiv(M+0, 2)", over(&["M"])),
+        ];
+        for (text, want) in python {
+            assert_eq!(folded(text), want, "{text}");
+        }
+        let mut s = Symbols::default();
+        let twice = parse_expr("cdiv(M, 2) + cdiv(M+0, 2)", "e", &mut s).unwrap().affine().unwrap();
+        assert_eq!(twice.terms.len(), 1);
+        assert_eq!(twice.terms[0].1, 2, "2*cdiv(M, 2)");
+        // and the grids Python's `parse_grid` refuses for a static entry below 1 once folded
+        for (grid, ok) in [
+            ("(cdiv(0, n),)", false),
+            ("(cdiv(0, -n) + 1,)", true),
+            ("(cdiv(n, -n) + 1,)", false),
+            ("(cdiv(n, -n) + 2,)", true),
+            ("(cdiv(M + N - N, 2) - cdiv(M, 2),)", false),
+            ("(cdiv(2*n, -n) + 3,)", true),
+        ] {
+            assert_eq!(parse_grid(grid, &mut Symbols::default()).is_ok(), ok, "{grid}");
+        }
+    }
+
+    #[test]
+    fn a_folded_form_is_evaluated_as_python_substitutes_into_it() {
+        let names = &["M", "N"];
+        let value = |text: &str, values: &[Option<i64>]| pattern(text, names).eval(values);
+        // a name that cancels inside a cdiv needs no value (Python's `eval_dim` of `cdiv(M, 2)`)
+        assert_eq!(value("cdiv(M + N - N, 2)", &[Some(5), None]), Ok(Some(3)));
+        assert_eq!(pattern("cdiv(M + N - N, 2)", names).vars, [0]);
+        // a form that folds to a constant once some dimensions are bound has that value: `cdiv(M + 2*N, N)` is 2 when M is 0
+        assert_eq!(value("cdiv(M + 2*N, N)", &[Some(0), None]), Ok(Some(2)));
+        assert_eq!(value("cdiv(M + 2*N, N)", &[Some(1), None]), Ok(None));
+        assert_eq!(value("cdiv(M, N)", &[Some(0), None]), Ok(Some(0)));
+        // a cdiv that folded to a constant has its value whatever the sign of the divisor would be; one that did not is refused for it
+        assert_eq!(value("cdiv(0, -N)", &[None, Some(3)]), Ok(Some(0)));
+        assert_eq!(value("cdiv(2*N, -N)", &[None, Some(3)]), Ok(Some(-2)));
+        assert!(value("cdiv(M, -N)", &[Some(4), Some(2)]).unwrap_err().contains("must be positive"));
+        assert!(value("cdiv(M, N)", &[Some(4), Some(0)]).unwrap_err().contains("must be positive"));
+        // solving: Python binds M from the first equation and checks `cdiv(M, 2)` against the second, N never needed
+        let p = pattern("cdiv(M + N - N, 2)", names);
+        assert_eq!(p.solve(3, &[Some(5), None]), Ok(Solved::Checked));
+        assert_eq!(p.solve(4, &[Some(5), None]), Err(Unsolvable::Mismatch { expected: 3 }));
+        assert_eq!(p.solve(3, &[None, None]), Ok(Solved::Stuck), "M only occurs inside the cdiv");
+        let q = pattern("M + cdiv(N + M - M, 2)", names);
+        assert_eq!(q.solve(10, &[None, Some(7)]), Ok(Solved::Bound(0, 6)));
+        // a cdiv of a negative constant by a dimension rounds up, as Python's does
+        assert_eq!(value("cdiv(-5, N)", &[None, Some(2)]), Ok(Some(-2)));
+        assert_eq!(value("cdiv(-5, N)", &[None, Some(5)]), Ok(Some(-1)));
     }
 
     #[test]
