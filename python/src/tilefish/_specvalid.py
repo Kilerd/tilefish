@@ -510,6 +510,12 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
 
 _SYMBOL = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*\Z")  # a PTX / ELF symbol of a kernel
 _ARCH_KEY = re.compile(r"^sm_[0-9]{2,3}\Z")
+IMPLEMENTATION_FALLBACK = "fallback"
+
+
+def is_implementation(x: Any) -> bool:
+    """Whether ``x`` names an implementation of an op declared with ``extern(by_arch=...)``: an architecture (``"sm_103"``) or ``"fallback"``."""
+    return isinstance(x, str) and (x == IMPLEMENTATION_FALLBACK or _ARCH_KEY.match(x) is not None)
 
 
 def validate_binary(b: Any) -> None:
@@ -622,7 +628,8 @@ def validate_spec(d: Any) -> None:
     is_binary = binary is not None
     # enable_fp_fusion and source_sha256 exist from schema 2 on: both in the specs of kernels that tilefish generated, enable_fp_fusion in
     # those of an extern declared with enable_fp_fusion= too; language only in the spec of a Gluon kernel (extern(gluon=...))
-    optional = ["enable_fp_fusion", "source_sha256", "dims", "language"] if schema >= DIGEST_SCHEMA else []
+    # (and implementation only in the spec of one implementation of an op declared with extern(by_arch=...))
+    optional = ["enable_fp_fusion", "source_sha256", "dims", "language", "implementation"] if schema >= DIGEST_SCHEMA else []
     required = TOP_KEYS_V2 if schema >= DIGEST_SCHEMA else TOP_KEYS
     if is_binary:
         required = [k for k in required if k not in ("triton", "num_warps", "num_stages")] + ["binary"]
@@ -636,6 +643,8 @@ def validate_spec(d: Any) -> None:
         bad(f"enable_fp_fusion must be true or false, got {d['enable_fp_fusion']!r}")
     if "language" in d and d["language"] != "gluon":  # written only for a Gluon kernel: a Triton kernel's spec has no key (one canonical form)
         bad(f"language is \"gluon\" (the spec of a Gluon kernel) or absent (a triton.jit kernel), got {d['language']!r}")
+    if "implementation" in d and not is_implementation(d["implementation"]):
+        bad(f"implementation is an architecture such as \"sm_103\" or \"fallback\" (the implementation of an op declared with by_arch=), got {d['implementation']!r}")
 
     # names
     op = _ident(d["op"], "op")

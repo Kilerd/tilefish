@@ -337,6 +337,9 @@ class CompileSpec:
     # The frontend that compiles the kernel: ``"triton"`` (``triton.jit``, Triton's ``ASTSource``) or ``"gluon"`` (``gluon.jit``, Gluon's
     # ``GluonASTSource``: TTGIR with explicit layouts). Written to the spec only for Gluon, so every other spec is as it was.
     language: str = "triton"
+    # The implementation of an op declared with ``extern(by_arch=...)`` this spec is of: the architecture it was declared for (``"sm_103"``) or
+    # ``"fallback"``. It is in the declaration digest. ``None`` (and not written) for every other op.
+    implementation: "str | None" = None
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
@@ -456,6 +459,8 @@ class CompileSpec:
             doc["triton"] = {"module": self.triton_module, "function": self.triton_function, "ref": self.triton}
             if self.language != "triton":  # a Gluon kernel: the reference is compiled by Gluon's frontend
                 doc["language"] = self.language
+            if self.implementation is not None:  # one implementation of an op with an implementation per architecture
+                doc["implementation"] = self.implementation
         else:
             doc["binary"] = copy.deepcopy(self.binary)
         doc["buckets"] = dict(self.buckets)
@@ -524,6 +529,7 @@ class CompileSpec:
                 source_sha256=d.get("source_sha256"),
                 dims=copy.deepcopy(d.get("dims", {})),
                 language=d.get("language", "triton"),
+                implementation=d.get("implementation"),
             )
 
     def verify_against(self, op: ExternOp) -> None:
@@ -544,6 +550,13 @@ class CompileSpec:
         call leaves it unverified.
         """
         object.__setattr__(self, "_verified", None)
+        if getattr(op, "implementations", None) is not None:  # the implementation the spec says it is of (which architecture selects it is the caller's to say)
+            if self.implementation not in op.implementations:
+                raise TilefishSpecError(
+                    f"compile spec '{self.stem}' does not match the declaration of extern op '{op.name}': first difference at implementation: "
+                    f"the spec has {self.implementation!r}, the declaration has the implementations {sorted(op.implementations)}"
+                )
+            op = op.implementations[self.implementation]
         if self.declaration_digest is None:
             raise TilefishSpecError(
                 f"compile spec '{self.stem}' is schema {LEGACY_SCHEMA}: it has no declaration digest and no "
@@ -760,6 +773,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc.update({"triton": op.triton, "num_warps": op.num_warps, "num_stages": op.num_stages})
         if op.language != "triton":  # a Gluon kernel (only then: every other declaration digests as it did)
             doc["language"] = op.language
+        if op.implementation is not None:  # one implementation of an op declared with by_arch= (only then)
+            doc["implementation"] = op.implementation
     else:  # a prebuilt binary: what it is made of (the sha256 of its PTX or cubin), its entry point, block and shared memory
         doc["binary"] = {
             "kind": op.binary.kind,
@@ -800,6 +815,7 @@ def declaration_digest(op: ExternOp) -> str:
     """
     if not isinstance(op, ExternOp):
         raise TilefishSpecError(f"declaration_digest takes an extern op, got {op!r}")
+    _one_implementation(op, "declaration_digest(op.for_arch(arch))")
     text = json.dumps(_canonical_declaration(op), sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -1019,15 +1035,34 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         dims=dict(sorted(dims.items())),
         binary=binary,
         language=op.language,
+        implementation=op.implementation,
     )
     spec._mark_verified()  # generated from the declaration just now
     return spec
 
 
-def compile_specs(op: ExternOp) -> list[CompileSpec]:
-    """One :class:`CompileSpec` per bucket combination of an ``extern`` op (one for an unbucketed op)."""
+def _one_implementation(op: ExternOp, use: str) -> None:
+    if op.implementations is not None:
+        raise TilefishSpecError(
+            f"extern op '{op.name}' has an implementation per architecture ({', '.join(op.implementations)}), each with its own declaration and "
+            f"binaries: use {use}"
+        )
+
+
+def compile_specs(op: ExternOp, arch: "int | str | None" = None) -> list[CompileSpec]:
+    """One :class:`CompileSpec` per bucket combination of an ``extern`` op (one for an unbucketed op).
+
+    An op declared with ``by_arch=`` has the specs of the implementation of an architecture: ``arch`` (``103``, ``"sm_103"``) says which, and
+    is required; for any other op it changes nothing (the specs of one declaration are the same on every architecture)."""
     if not isinstance(op, ExternOp):
         raise TilefishSpecError(f"compile_specs takes an extern op, got {op!r}")
+    if op.implementations is not None:
+        if arch is None:
+            _one_implementation(op, "compile_specs(op, arch=...)")
+        try:
+            op = op.for_arch(arch)  # type: ignore[arg-type]
+        except TilefishError as e:
+            raise TilefishSpecError(str(e)) from None
     if op.grid is None:
         raise TilefishSpecError(f"extern op '{op.name}' has no grid; pass grid=... to @tilefish.extern")
     dims = _bucket_dims(op)

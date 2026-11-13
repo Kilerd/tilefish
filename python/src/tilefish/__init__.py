@@ -32,7 +32,7 @@ its scalar (``dtype=i32`` or ``i64``) when it is not the width of the kernel's o
 from . import aot
 from . import ops as _ops
 from ._library import AlgoTable
-from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp, Op, extern, graph, kernel, library
+from .decorators import ExternOp, GraphOp, Implementation, KernelOp, LibraryOp, Op, extern, graph, impl, kernel, library
 from .dims import Dim, DimExpr, cdiv
 from .dtypes import (
     BlockScaled,
@@ -98,6 +98,7 @@ __all__ = [
     "DimExpr",
     "ExternOp",
     "Graph",
+    "Implementation",
     "GraphOp",
     "InOut",
     "KernelOp",
@@ -152,6 +153,7 @@ __all__ = [
     "i32",
     "i64",
     "im2col",
+    "impl",
     "iota",
     "kernel",
     "library",

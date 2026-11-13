@@ -80,7 +80,7 @@ from .._library import library_specs, validate_entry as validate_library_entry
 from .._manifest import Manifest
 from .._specvalid import parse_expression, parse_grid
 from ..decorators import LibraryOp
-from ..errors import TilefishManifestError, TilefishSpecError
+from ..errors import TilefishManifestError, TilefishRuntimeError, TilefishSpecError
 
 RUST_ELEMENTS = {"bf16": "Bf16", "f16": "F16", "f32": "F32", "i32": "I32", "i64": "I64", "u8": "U8", "e4m3": "E4m3", "e5m2": "E5m2"}
 
@@ -104,6 +104,9 @@ _SHARED_FIELDS = (
     "declaration_digest",
     "source_sha256",
 )
+# what the implementations of one op declared with by_arch= may differ in (each binary of the stem says which implementation it is): how the kernel
+# is compiled and launched, not its ABI
+_IMPLEMENTATION_FIELDS = ("grid", "block", "num_warps", "num_stages", "constexprs", "options", "declaration_digest")
 
 # what the library entries of one stem must agree on: everything but the device (its architecture and SM count, and the declaration digest, which
 # covers the SM count) and what the pin chose on it
@@ -143,6 +146,7 @@ class _Binary:
     entry: "dict[str, Any]"  # the entry of the first architecture: what the architectures agree on
     archs: "list[str]"
     struct: str = ""
+    entries: "list[dict[str, Any]]" = field(default_factory=list)  # one per architecture, sorted by it
     params: "list[dict[str, Any]]" = field(default_factory=list)  # the pointers of the ABI, in order
     scalars: "list[dict[str, Any]]" = field(default_factory=list)  # the runtime scalars (the ones `launch` derives)
     fixed: "list[dict[str, Any]]" = field(default_factory=list)  # the fixed arguments of a prebuilt binary
@@ -479,6 +483,8 @@ def _validate_entry(entry: Any) -> None:
         _bad(who, f"a {kind} kernel has {slots} scratch slots, but abi.scratch_slots is {abi.get('scratch_slots')!r} and abi.scratch has {scratch!r}")
     if kind == "binary":
         _validate_binary_section(who, entry)
+    if "implementation" in entry and (kind != "triton" or entry["implementation"] not in (arch, "fallback")):
+        _bad(who, f"implementation must be the entry's architecture '{arch}' or 'fallback', on a triton entry, got {entry['implementation']!r}")
     params = _field(who, "abi.params", abi, "params", list)
     names: "set[str]" = set()
     for i, p in enumerate(params):
@@ -568,14 +574,17 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
     for stem in sorted(by_stem):
         entries = sorted(by_stem[stem], key=lambda e: e["arch"])
         first = entries[0]
+        # the binaries of the implementations of an op declared with by_arch= share the ABI, and may be compiled and launched differently
+        per_arch = all("implementation" in e for e in entries)
+        shared = [k for k in _SHARED_FIELDS if not (per_arch and k in _IMPLEMENTATION_FIELDS)]
         for other in entries[1:]:
-            for key in _SHARED_FIELDS:
+            for key in shared + ["implementation"] * (not per_arch):
                 if other.get(key) != first.get(key):
                     raise TilefishManifestError(
                         f"the binaries of '{stem}' for {first['arch']} and {other['arch']} disagree about '{key}': a launcher is "
                         "typed from one signature, and the binaries of a stem must share it"
                     )
-        binary = _Binary(stem, first, [e["arch"] for e in entries], struct=_camel(stem))
+        binary = _Binary(stem, first, [e["arch"] for e in entries], struct=_camel(stem), entries=entries)
         binary.params = [p for p in first["abi"]["params"] if p["kind"] == "pointer"]
         binary.scalars = [p for p in first["abi"]["params"] if p["kind"] == "scalar"]
         binary.fixed = [p for p in first["abi"]["params"] if p["kind"] == "fixed"]
@@ -637,22 +646,28 @@ def _check_declarations(binaries: "list[_Binary]", gemms: "list[_Gemm]", ops: "I
         if found is None:
             continue
         target, extern = found
-        specs = {s.stem: s for s in target.compile_specs()}
-        spec = specs.get(binary.stem)
-        if spec is None:
-            raise TilefishManifestError(
-                f"the declaration of '{extern.name}' has no binary '{binary.stem}' (it has {sorted(specs)}): it is not what the "
-                "manifest was built from"
-            )
-        expected = json.loads(json.dumps(spec_entry(spec)))
-        got = {k: binary.entry.get(k) for k in expected}
-        difference = _first_difference(expected, got, "")
-        if difference is not None:
-            path, want, have = difference
-            raise TilefishManifestError(
-                f"the declaration of '{extern.name}' is not what the manifest's binary '{binary.stem}' was built from: first "
-                f"difference at {path}: the manifest has {_show(have)}, the declaration gives {_show(want)}"
-            )
+        for entry in binary.entries:  # each architecture's (an extern declared with by_arch=: the implementation of that architecture)
+            try:
+                specs = {s.stem: s for s in target.at(entry["arch"]).compile_specs()}
+            except TilefishRuntimeError as e:
+                raise TilefishManifestError(f"the declaration of '{extern.name}' is not what the manifest's binary '{binary.stem}' was built from: {e}") from None
+            spec = specs.get(binary.stem)
+            if spec is None:
+                raise TilefishManifestError(
+                    f"the declaration of '{extern.name}' has no binary '{binary.stem}' (it has {sorted(specs)}): it is not what the "
+                    "manifest was built from"
+                )
+            expected = json.loads(json.dumps(spec_entry(spec)))
+            got = {k: entry.get(k) for k in expected}
+            if "implementation" in entry and "implementation" not in expected:
+                got["implementation"], expected["implementation"] = entry["implementation"], None
+            difference = _first_difference(expected, got, "")
+            if difference is not None:
+                path, want, have = difference
+                raise TilefishManifestError(
+                    f"the declaration of '{extern.name}' is not what the manifest's binary '{binary.stem}' was built from (on {entry['arch']}): first "
+                    f"difference at {path}: the manifest has {_show(have)}, the declaration gives {_show(want)}"
+                )
         public = target.public
         binary.signature = f"{target.name}{public}" if target.kernel is not None else f"{extern.name}{extern.signature}"
     for gemm in gemms:
@@ -700,6 +715,10 @@ def _pointer_line(binary: _Binary, p: "dict[str, Any]") -> str:
     if "strides" in p:
         line += f", a strided view (strides `[{_shape_text(p['strides'])}]`)"
     return line
+
+
+def _constexprs_text(e: "dict[str, Any]") -> str:
+    return ", ".join(f"`{c['name']}` = {_scalar_text(c['value'])}" + (f" ({c['dtype']})" if "dtype" in c else "") for c in e["constexprs"])
 
 
 def _doc(binary: _Binary) -> "list[str]":
@@ -754,15 +773,10 @@ def _doc(binary: _Binary) -> "list[str]":
         lines.append("`launch` binds the dimensions from the sizes of the tensors and refuses a call where they disagree.")
         if constraints:
             lines.append("Constraints: " + "; ".join(constraints) + ".")
-    if e["constexprs"]:
+    per_arch = "implementation" in e  # an op declared with by_arch=: each architecture's binary is its own implementation
+    if e["constexprs"] and not per_arch:
         lines.append("")
-        lines.append(
-            "Compiled in: "
-            + ", ".join(
-                f"`{c['name']}` = {_scalar_text(c['value'])}" + (f" ({c['dtype']})" if "dtype" in c else "") for c in e["constexprs"]
-            )
-            + "."
-        )
+        lines.append("Compiled in: " + _constexprs_text(e) + ".")
     if binary.fixed:
         lines.append("")
         lines += _wrap(
@@ -778,7 +792,18 @@ def _doc(binary: _Binary) -> "list[str]":
             + "."
         )
     lines.append("")
-    lines.append(f"Grid `{e['grid']}`, block {_block_text(e['block'])}, {e['shared']} bytes of dynamic shared memory.")
+    if per_arch:
+        lines += _wrap(
+            "An implementation per architecture (an operator declared with `by_arch=`): one ABI, and on each architecture its own kernel, compile "
+            "options and grid; `load` takes the one of the device's architecture."
+        )
+        for x in binary.entries:
+            lines += _wrap(
+                f"- {x['arch']}: the implementation `{x['implementation']}`, grid `{x['grid']}`, block {_block_text(x['block'])}, {x['shared']} bytes of "
+                "dynamic shared memory" + (", compiled in: " + _constexprs_text(x) if x["constexprs"] else "") + "."
+            )
+    else:
+        lines.append(f"Grid `{e['grid']}`, block {_block_text(e['block'])}, {e['shared']} bytes of dynamic shared memory.")
     if binary.scalars:
         lines.append("")
         plain = all(s["type"] == "i32" and "stride_of" not in s for s in binary.scalars)

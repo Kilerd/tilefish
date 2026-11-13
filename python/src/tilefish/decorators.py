@@ -9,15 +9,15 @@ import os
 import pathlib
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence
 
 from .dims import DimExpr, as_dim
-from ._specvalid import MAX_ELEMENTS
+from ._specvalid import IMPLEMENTATION_FALLBACK as FALLBACK, MAX_ELEMENTS
 from .dtypes import DType
-from .errors import TilefishDeclarationError, TilefishError, TilefishPicklingError, TilefishTypeError
+from .errors import TilefishDeclarationError, TilefishError, TilefishPicklingError, TilefishRuntimeError, TilefishTypeError
 from .ir import Graph
-from .signature import MISSING, Param, Signature, call_op, parse_signature
+from .signature import MISSING, Param, Signature, _check_const_default, call_op, parse_signature
 from .trace import Const, TraceContext, Value
 
 
@@ -677,8 +677,14 @@ class ExternOp(Op):
         binary: "BinaryTarget | None" = None,
         reference: "Callable[..., Any] | None" = None,
         language: str = "triton",
+        implementation: "str | None" = None,
+        implementations: "dict[str, ExternOp] | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
+        # extern(by_arch=...): the op that a graph calls and a caller runs has ``implementations`` (its key -> an ExternOp of its own, the
+        # architecture's or "fallback"), and each of those has ``implementation``, its key, which is in its declaration digest and its specs
+        self.implementation: "str | None" = implementation
+        self.implementations: "dict[str, ExternOp] | None" = implementations
         if type(index_bits) is not int or index_bits not in (32, 64):
             raise TilefishDeclarationError(f"extern '{name}': index_bits must be 32 or 64, got {index_bits!r}")
         if language not in LANGUAGES:
@@ -749,10 +755,34 @@ class ExternOp(Op):
             return None
         return grid_to_string(self.grid)
 
+    def for_arch(self, arch: "int | str") -> "ExternOp":
+        """The implementation this op runs on ``arch`` (``103``, ``"sm_103"``): for an op declared with ``by_arch=``, the one declared for that
+        architecture, else its ``fallback``, else a :class:`~tilefish.errors.TilefishRuntimeError`; any other op is its own."""
+        if self.implementations is None:
+            return self
+        from ._build import parse_arch
+
+        name = f"sm_{parse_arch(arch)}"
+        found = self.implementations.get(name, self.implementations.get(FALLBACK))
+        if found is None:
+            archs = ", ".join(k for k in self.implementations)
+            raise TilefishRuntimeError(
+                f"extern op '{self.name}' has no implementation for {name}: it declares one for {archs} and no fallback. Declare one for "
+                f"{name} in by_arch= (or a fallback=) once it is known to be right there"
+            )
+        return found
+
     def node_attrs(self) -> dict[str, Any]:
+        if self.implementations is not None:
+            return {"by_arch": {k: v.triton for k, v in self.implementations.items()}}
         if self.binary is not None:
             return {"binary": self.binary.symbol}
         return {self.language: self.triton}
+
+    def __reduce__(self) -> Any:
+        if self.implementation is not None and self.__dict__.get("_tf_of") is not None:  # one implementation: by its op and its key
+            return (_implementation_of, (self.__dict__["_tf_of"], self.implementation))
+        return super().__reduce__()
 
     def check_const(self, param: Param, value: Any) -> Any:
         if value != param.default:
@@ -833,6 +863,200 @@ def grid_to_string(grid: "tuple[DimExpr, ...]") -> str:
 
 
 _UNSET: Any = object()  # num_warps= / num_stages= not passed (None is a value, and an invalid one)
+
+
+# -- per-architecture implementations: extern(by_arch=...) ------------------------------------------------------------------
+
+# FALLBACK ("fallback") is the key of the implementation an op declared with by_arch= runs on an architecture the map does not name.
+#
+# What every implementation of one op has in common, per binary (stem): the launch ABI, the buckets, the dimensions and the preconditions a
+# launch checks. What may differ is how the kernel is compiled and launched: the kernel, its constexpr values, warps, stages, options, grid.
+_SHARED_BY_IMPLEMENTATIONS = ("kind", "abi", "buckets", "dims", "preconditions")
+
+
+@dataclass(frozen=True, eq=False)
+class Implementation:
+    """One implementation of an op declared with ``@tilefish.extern(by_arch=...)``, made by :func:`impl`: a Triton or Gluon kernel and how it is
+    compiled and launched. The stub (the typed signature, so the ABI) is the op's; ``consts`` gives const parameters other compiled-in values,
+    ``grid`` another launch grid (``None``: the op's ``grid=``)."""
+
+    target: _TritonTarget
+    language: str
+    num_warps: int
+    num_stages: int
+    fp_fusion: "bool | None"
+    grid: Any
+    consts: "dict[str, Any]"
+
+    @property
+    def ref(self) -> str:
+        return self.target.ref
+
+    def __repr__(self) -> str:
+        return f"<impl {self.language}={self.ref} num_warps={self.num_warps}>"
+
+
+def _check_options(num_warps: Any, num_stages: Any, enable_fp_fusion: Any) -> None:
+    if isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS:
+        raise TilefishDeclarationError(f"extern: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
+    if isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1:
+        raise TilefishDeclarationError(f"extern: num_stages must be a positive int, got {num_stages!r}")
+    if enable_fp_fusion is not None and not isinstance(enable_fp_fusion, bool):
+        raise TilefishDeclarationError(f"extern: enable_fp_fusion must be True, False or None (Triton's default), got {enable_fp_fusion!r}")
+
+
+def impl(
+    *,
+    triton: Any = None,
+    gluon: Any = None,
+    num_warps: int = 4,
+    num_stages: int = 3,
+    enable_fp_fusion: "bool | None" = None,
+    grid: Any = None,
+    consts: "dict[str, Any] | None" = None,
+) -> Implementation:
+    """One implementation of an op with an implementation per architecture: ``@tilefish.extern(by_arch={"sm_103": tilefish.impl(triton=k_a,
+    num_warps=8), "sm_120": tilefish.impl(triton=k_b)}, grid=...)``.
+
+    ``triton=`` (a ``triton.jit`` kernel) or ``gluon=`` (a Gluon kernel), a kernel object or a ``"module:function"`` string, as for
+    :func:`extern`; ``num_warps``, ``num_stages`` and ``enable_fp_fusion`` are its compile options; ``grid`` its launch grid when it is not the
+    op's (a callable over the names of the stub, or a tuple); ``consts`` other values for const parameters of the stub (``{"BLOCK": 64}``), which
+    are compiled in. The kernel takes the stub's parameters, in order, as the kernel of any extern does.
+    """
+    given = [k for k, v in (("triton", triton), ("gluon", gluon)) if v is not None]
+    if len(given) != 1:
+        raise TilefishDeclarationError(
+            f"tilefish.impl takes one kernel, triton= (a triton.jit kernel) or gluon= (a Gluon kernel), got {' and '.join(given) or 'none'}"
+        )
+    language = given[0]
+    target = _triton_target(triton if triton is not None else gluon, language)
+    _check_options(num_warps, num_stages, enable_fp_fusion)
+    if consts is None:
+        consts = {}
+    if not isinstance(consts, dict) or not all(isinstance(k, str) for k in consts):
+        raise TilefishDeclarationError(f"tilefish.impl: consts= maps const parameter names to values ({{'BLOCK': 64}}), got {consts!r}")
+    return Implementation(target, language, num_warps, num_stages, enable_fp_fusion, grid, dict(consts))
+
+
+def _label(key: str) -> str:
+    return "the fallback" if key == FALLBACK else key
+
+
+def _implementation_of(op: "ExternOp", key: str) -> "ExternOp":
+    """The implementation ``key`` of an op declared with ``by_arch=`` (how one is unpickled: by its op, which pickles by reference)."""
+    assert op.implementations is not None
+    return op.implementations[key]
+
+
+def _with_consts(nm: str, key: str, sig: Signature, consts: "dict[str, Any]") -> Signature:
+    """The stub's signature with the const values of one implementation (the same parameters, kinds and types: only compiled-in values differ)."""
+    if not consts:
+        return sig
+    by_name = {p.name: p for p in sig.consts}
+    unknown = sorted(set(consts) - set(by_name))
+    if unknown:
+        raise TilefishDeclarationError(
+            f"extern op '{nm}': the implementation for {_label(key)} sets {unknown}, which are not const parameters of the stub ({sorted(by_name)})"
+        )
+    params = []
+    for p in sig.params:
+        if p.kind == "const" and p.name in consts:
+            value = _check_const_default(f"extern op '{nm}' ({_label(key)})", p.name, p.const_dtype, consts[p.name], allow_dim=True)
+            p = replace(p, default=value)
+        params.append(p)
+    return Signature(params, sig.returns)
+
+
+def _check_implementations(nm: str, impls: "dict[str, ExternOp]") -> None:
+    """Every implementation has the binaries (stems) of the others, and each binary the same ABI, buckets, dimensions and preconditions: a caller,
+    a plan and a host launch any of them the same way, whichever architecture it runs on."""
+    from ._build import spec_entry
+    from .aot import _first_difference, _show, compile_specs
+
+    found: "dict[str, dict[str, dict[str, Any]]]" = {}
+    for key, op in impls.items():
+        try:
+            specs = compile_specs(op)
+        except TilefishError as e:
+            raise TilefishDeclarationError(f"extern op '{nm}': the implementation for {_label(key)}: {e}") from None
+        found[key] = {s.stem: {k: v for k, v in spec_entry(s).items() if k in _SHARED_BY_IMPLEMENTATIONS} for s in specs}
+    (first_key, first), *rest = found.items()
+    for key, got in rest:
+        if list(got) != list(first):
+            raise TilefishDeclarationError(
+                f"extern op '{nm}': the implementation for {_label(key)} has the binaries {list(got)}, the one for {_label(first_key)} {list(first)}: "
+                "every implementation has the same buckets (a const of one that depends on a bucketed dimension is one of the others too)"
+            )
+        for stem, want in first.items():
+            diff = _first_difference(want, got[stem], "")
+            if diff is not None:
+                path, a, b = diff
+                raise TilefishDeclarationError(
+                    f"extern op '{nm}': the implementations for {_label(first_key)} and {_label(key)} are not launched the same way: '{stem}' "
+                    f"differs at {path.lstrip('.')} ({_show(a)} and {_show(b)}). Every implementation has the op's typed signature and ABI; only the "
+                    "kernel, its compile options, its constexpr values and its grid may differ"
+                )
+
+
+def _extern_by_arch(
+    by_arch: Any, fallback: Any, grid: Any, name: "str | None", index_bits: int, reference: Any, others: "dict[str, Any]"
+) -> Callable[[Callable[..., Any]], ExternOp]:
+    """``@tilefish.extern(by_arch={...}, fallback=..., grid=...)``: one op, one typed signature, an implementation per architecture."""
+    misplaced = [k for k, v in others.items() if v is not None and v is not _UNSET and not (k == "shared" and v == 0)]
+    if misplaced:
+        raise TilefishDeclarationError(
+            f"extern: with by_arch= each implementation names its kernel and its compile options (tilefish.impl(triton=..., num_warps=...)), "
+            f"so {', '.join(k + '=' for k in misplaced)} is not an argument of the op"
+        )
+    if not isinstance(by_arch, dict) or not by_arch:
+        raise TilefishDeclarationError(
+            f"extern: by_arch= maps architectures to implementations, {{'sm_103': tilefish.impl(triton=...), ...}}, got {by_arch!r}"
+        )
+    for arch, value in by_arch.items():
+        if not isinstance(arch, str) or not _ARCH_NAME.fullmatch(arch) or arch != f"sm_{int(arch[3:])}":
+            raise TilefishDeclarationError(f"extern: by_arch= keys are architectures such as 'sm_103' (no leading zero), got {arch!r}")
+        if not isinstance(value, Implementation):
+            raise TilefishDeclarationError(f"extern: by_arch[{arch!r}] must be a tilefish.impl(triton=... or gluon=...), got {value!r}")
+    if fallback is not None and not isinstance(fallback, Implementation):
+        raise TilefishDeclarationError(f"extern: fallback= is a tilefish.impl(...) (the implementation of every other architecture) or None, got {fallback!r}")
+    if type(index_bits) is not int or index_bits not in (32, 64):
+        raise TilefishDeclarationError(f"extern: index_bits must be 32 (the kernel indexes with i32) or 64 (with i64), got {index_bits!r}")
+    _check_op_name(name)
+    chosen: "dict[str, Implementation]" = dict(by_arch)
+    if fallback is not None:
+        chosen[FALLBACK] = fallback
+
+    def deco(fn: Callable[..., Any]) -> ExternOp:
+        nm, sig, limits = _parse_extern_stub(fn, name, index_bits, prebuilt=False)
+        impls: "dict[str, ExternOp]" = {}
+        for key, im in chosen.items():
+            own = _with_consts(nm, key, sig, im.consts)
+            _check_against_kernel(nm, own, im.target)
+            try:
+                impls[key] = ExternOp(
+                    fn,
+                    nm,
+                    own,
+                    im.ref,
+                    im.num_warps,
+                    im.num_stages,
+                    im.grid if im.grid is not None else grid,
+                    max_elements=limits,
+                    fp_fusion=im.fp_fusion,
+                    index_bits=index_bits,
+                    reference=reference,
+                    language=im.language,
+                    implementation=key,
+                )
+            except TilefishDeclarationError as e:  # its grid, under its constexpr values
+                raise TilefishDeclarationError(f"extern op '{nm}': the implementation for {_label(key)}: {e}") from None
+        _check_implementations(nm, impls)
+        op = ExternOp(fn, nm, sig, "", 0, 0, None, max_elements=limits, index_bits=index_bits, reference=reference, implementations=impls)
+        for one in impls.values():
+            one.__dict__["_tf_of"] = op
+        return op
+
+    return deco
 
 
 @dataclass(frozen=True)
@@ -925,6 +1149,8 @@ def extern(
     index_bits: int = 32,
     reference: "Callable[..., Any] | None" = None,
     enable_fp_fusion: "bool | None" = None,
+    by_arch: Any = None,
+    fallback: Any = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
 
@@ -962,6 +1188,19 @@ def extern(
     the binary is their sha256 (``source_digest`` of kind ``tilefish.binary.v1``). PTX is assembled by ``ptxas`` for the target
     architecture with fixed, recorded flags; a cubin is used as it is for the architecture it names and refused for another.
 
+    **An implementation per architecture.** ``by_arch=`` maps architectures to implementations (:func:`impl`: a Triton or Gluon kernel with its
+    own compile options, constexpr values and grid) of one stub, and ``fallback=`` names the one of every other architecture::
+
+        @tilefish.extern(by_arch={"sm_103": tilefish.impl(triton=k.sum_wide, num_warps=8), "sm_120": tilefish.impl(triton=k.sum_narrow)},
+                         grid=lambda R: (R,))
+        def row_sum(x: Tensor[R, 1024, f32], y: Out[Tensor[R, f32]], n_rows: R): ...
+
+    The op is one typed signature for a graph, a plan and a caller; ``export``, ``jit`` and ``replay`` run the implementation of the target's (or
+    the device's) architecture, and refuse an architecture with none. Every implementation has the stub's parameters and the same launch ABI,
+    buckets, dimensions and preconditions (checked here); each is an op of its own (``op.for_arch("sm_103")``), whose declaration digest, compile
+    specs and manifest entries carry its key (``"implementation": "sm_103"``, or ``"fallback"``), so a replay refuses a binary of another
+    implementation, or of one that changed. ``reference=``, ``index_bits=`` and ``name=`` are the op's.
+
     ``index_bits`` says how the kernel computes the offsets it loads and stores at. The default, ``32``, is the safe
     claim: every tensor parameter gets a ``max_elements`` precondition of ``2**31 - 1`` elements, which Python's ``replay`` and
     a Rust host check at launch, because a kernel that indexes with ``i32`` (``row * N_COLS + col`` on ``tl.int32`` values) goes
@@ -995,6 +1234,16 @@ def extern(
     sites. When ``triton`` is a kernel object that exposes ``arg_names`` (and
     ``params[i].is_constexpr``), the stub is checked against it.
     """
+    if by_arch is not None or fallback is not None:
+        if args:
+            raise TilefishDeclarationError("@tilefish.extern takes keyword arguments only, not a bare @tilefish.extern")
+        if by_arch is None:
+            raise TilefishDeclarationError("extern: fallback= is the implementation of an op declared with by_arch= for the architectures it does not name")
+        others = dict(
+            triton=triton, gluon=gluon, ptx=ptx, cubin=cubin, symbol=symbol, block=block, shared=shared, num_warps=num_warps,
+            num_stages=num_stages, enable_fp_fusion=enable_fp_fusion,
+        )  # fmt: skip
+        return _extern_by_arch(by_arch, fallback, grid, name, index_bits, reference, others)
     given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin)) if v is not None]
     if args or not given:
         raise TilefishDeclarationError(
@@ -1029,40 +1278,14 @@ def extern(
         target = _triton_target(gluon if gluon is not None else triton, language)
         num_warps = 4 if num_warps is _UNSET else num_warps
         num_stages = 3 if num_stages is _UNSET else num_stages
-        if isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS:
-            raise TilefishDeclarationError(f"extern: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
-        if isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1:
-            raise TilefishDeclarationError(f"extern: num_stages must be a positive int, got {num_stages!r}")
+        _check_options(num_warps, num_stages, None)
 
     if type(index_bits) is not int or index_bits not in (32, 64):
         raise TilefishDeclarationError(f"extern: index_bits must be 32 (the kernel indexes with i32) or 64 (with i64), got {index_bits!r}")
-
-    if name is not None and (not isinstance(name, str) or not _OP_NAME.fullmatch(name)):
-        raise TilefishDeclarationError(
-            f"extern: name must be a plain identifier (ASCII letters, digits and underscores, not starting with a digit): "
-            f"it becomes a file name in a manifest directory, so {name!r} is not allowed"
-        )
+    _check_op_name(name)
 
     def deco(fn: Callable[..., Any]) -> ExternOp:
-        nm = name or fn.__name__
-        if not _OP_NAME.fullmatch(nm):
-            raise TilefishDeclarationError(f"extern: the function name {nm!r} is not a plain identifier; pass name=... to give the op one")
-        sig = parse_signature(
-            fn, what="extern op", name=nm, allow_dim_const_defaults=not prebuilt, allow_strided=True, allow_output_dims=True, allow_alias=True
-        )
-        if sig.returns:
-            raise TilefishDeclarationError(
-                f"extern op '{nm}': {'a kernel' if prebuilt else 'a Triton kernel'} returns nothing; declare results as Out[...] parameters"
-            )
-        for p in sig.consts:
-            if p.default is MISSING and not prebuilt:
-                raise TilefishDeclarationError(f"extern op '{nm}': const parameter '{p.name}' needs a default, the value compiled in as constexpr")
-            if p.default is MISSING and (p.const_dtype is None or p.const_dtype.name not in ("i32", "i64")):
-                raise TilefishDeclarationError(
-                    f"extern op '{nm}': const parameter '{p.name}' of a prebuilt binary has no default, so every call gives its value (a fixed "
-                    f"argument per call): declare it `{p.name}: const[i32]` or const[i64] (a per-call value is an integer; an f32 is fixed by "
-                    "its default, written in the manifest)"
-                )
+        nm, sig, limits = _parse_extern_stub(fn, name, index_bits, prebuilt)
         binary = None
         if prebuilt:
             for p in sig.consts:  # a fixed argument: a scalar of a C type, with its value (none: each call gives it)
@@ -1085,22 +1308,6 @@ def extern(
         else:
             assert target is not None
             _check_against_kernel(nm, sig, target)
-        limits: dict[str, int] = {}
-        if index_bits == 32:
-            for p in sig.params:
-                if p.kind != "tensor" or p.is_devscalar:  # one element: nothing to overflow
-                    continue
-                if p.strided:  # the limit is on the largest offset the view reaches (a max_extent precondition), known at launch only
-                    limits[p.name] = MAX_ELEMENTS
-                    continue
-                shape = p.type.shape  # type: ignore[union-attr]
-                count = math.prod(d.value for d in shape) if all(d.is_static for d in shape) else 0  # 0: not statically known
-                if count > MAX_ELEMENTS:
-                    raise TilefishDeclarationError(
-                        f"extern op '{nm}': parameter '{p.name}' has {count} elements, more than the {MAX_ELEMENTS} that i32 offsets "
-                        "reach; declare index_bits=64 if the kernel computes its offsets in i64"
-                    )
-                limits[p.name] = MAX_ELEMENTS
         return ExternOp(
             fn,
             nm,
@@ -1118,3 +1325,51 @@ def extern(
         )
 
     return deco
+
+
+def _check_op_name(name: Any) -> None:
+    if name is not None and (not isinstance(name, str) or not _OP_NAME.fullmatch(name)):
+        raise TilefishDeclarationError(
+            f"extern: name must be a plain identifier (ASCII letters, digits and underscores, not starting with a digit): "
+            f"it becomes a file name in a manifest directory, so {name!r} is not allowed"
+        )
+
+
+def _parse_extern_stub(fn: Callable[..., Any], name: "str | None", index_bits: int, prebuilt: bool) -> "tuple[str, Signature, dict[str, int]]":
+    """The op name, the typed signature of an extern's stub and the ``max_elements`` limits its ``index_bits`` gives its tensors."""
+    nm = name or fn.__name__
+    if not _OP_NAME.fullmatch(nm):
+        raise TilefishDeclarationError(f"extern: the function name {nm!r} is not a plain identifier; pass name=... to give the op one")
+    sig = parse_signature(
+        fn, what="extern op", name=nm, allow_dim_const_defaults=not prebuilt, allow_strided=True, allow_output_dims=True, allow_alias=True
+    )
+    if sig.returns:
+        raise TilefishDeclarationError(
+            f"extern op '{nm}': {'a kernel' if prebuilt else 'a Triton kernel'} returns nothing; declare results as Out[...] parameters"
+        )
+    for p in sig.consts:
+        if p.default is MISSING and not prebuilt:
+            raise TilefishDeclarationError(f"extern op '{nm}': const parameter '{p.name}' needs a default, the value compiled in as constexpr")
+        if p.default is MISSING and (p.const_dtype is None or p.const_dtype.name not in ("i32", "i64")):
+            raise TilefishDeclarationError(
+                f"extern op '{nm}': const parameter '{p.name}' of a prebuilt binary has no default, so every call gives its value (a fixed "
+                f"argument per call): declare it `{p.name}: const[i32]` or const[i64] (a per-call value is an integer; an f32 is fixed by "
+                "its default, written in the manifest)"
+            )
+    limits: dict[str, int] = {}
+    if index_bits == 32:
+        for p in sig.params:
+            if p.kind != "tensor" or p.is_devscalar:  # one element: nothing to overflow
+                continue
+            if p.strided:  # the limit is on the largest offset the view reaches (a max_extent precondition), known at launch only
+                limits[p.name] = MAX_ELEMENTS
+                continue
+            shape = p.type.shape  # type: ignore[union-attr]
+            count = math.prod(d.value for d in shape) if all(d.is_static for d in shape) else 0  # 0: not statically known
+            if count > MAX_ELEMENTS:
+                raise TilefishDeclarationError(
+                    f"extern op '{nm}': parameter '{p.name}' has {count} elements, more than the {MAX_ELEMENTS} that i32 offsets "
+                    "reach; declare index_bits=64 if the kernel computes its offsets in i64"
+                )
+            limits[p.name] = MAX_ELEMENTS
+    return nm, sig, limits

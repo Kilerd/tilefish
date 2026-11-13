@@ -65,7 +65,7 @@ from ._build import (
 )
 from ._ir import LANGUAGE_OF_KIND, digest_kind
 from ._elf import code_digest, parse_elf, sm_of, uses_shared
-from ._specvalid import parse_expression, parse_grid
+from ._specvalid import IMPLEMENTATION_FALLBACK, parse_expression, parse_grid
 from .dtypes import ALL_DTYPES
 from .errors import TilefishBuildError, TilefishManifestError, TilefishSpecError
 
@@ -657,6 +657,14 @@ class Manifest:
             value = entry.get(field)
             if value is not None and not (isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)):
                 raise TilefishManifestError(f"'{stem}' ({arch}): {field} must be 64 lowercase hex digits (a sha256), got {value!r}")
+        # which implementation of an op declared with by_arch= the binary is, as the Rust reader reads it: the entry's own architecture or
+        # "fallback", on a Triton entry only (a JSON null is as absent)
+        chosen = entry.get("implementation")
+        if chosen is not None and (entry_kind != ENTRY_KIND_TRITON or chosen not in (arch, IMPLEMENTATION_FALLBACK)):
+            raise TilefishManifestError(
+                f"'{stem}' ({arch}): implementation must be the entry's architecture '{arch}' or '{IMPLEMENTATION_FALLBACK}' (the implementation of an "
+                f"op declared with by_arch= that it is), on a {ENTRY_KIND_TRITON} entry, got {chosen!r}"
+            )
         kind = entry.get("source_digest_kind")
         if kind is not None and not isinstance(kind, str):
             raise TilefishManifestError(f"'{stem}' ({arch}): source_digest_kind must be a string, got {kind!r}")
@@ -721,6 +729,15 @@ class Manifest:
             raise TilefishManifestError(
                 f"the manifest entry for '{spec.stem}' ({arch}) is a {entry.get('kind')} kernel, but the compile spec is for a "
                 f"{'prebuilt binary' if spec.binary is not None else 'Triton kernel'}"
+            )
+        if entry.get("implementation") != spec.implementation:  # the declaration selects another implementation on this architecture now
+            have, want = entry.get("implementation"), spec.implementation
+            raise TilefishManifestError(
+                f"the manifest entry for '{spec.stem}' ({arch}) was built from "
+                + (f"the implementation '{have}' of an op declared with by_arch=" if have is not None else "an op with one implementation")
+                + ", but the declaration now runs "
+                + (f"its implementation '{want}' on {arch}" if want is not None else "one implementation on every architecture")
+                + ": its binary is stale; export it again (and pin the new manifest)"
             )
         if spec.binary is not None:
             self._check_binary_source(spec, arch, entry)

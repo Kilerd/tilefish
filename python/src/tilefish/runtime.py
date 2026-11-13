@@ -192,6 +192,14 @@ class _Target:
             self.extern = self.lowered.extern
         return self.extern
 
+    def at(self, cap: "int | str") -> "_Target":
+        """This target on architecture ``cap``: for an extern declared with ``by_arch=``, the implementation it runs there (refused when it has none for
+        ``cap``); itself for any other op."""
+        extern = self.launch_extern()
+        if extern.implementations is None:
+            return self
+        return _Target(self.name, self.public, self.kernel, extern.for_arch(cap), self.lowered)
+
     def compile_specs(self) -> "list[CompileSpec]":
         if self.specs is None:
             extern = self.launch_extern()
@@ -373,6 +381,12 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]",
     # the dimensions the inputs leave unbound, from the Out tensors given (a kernel's returned values are not parameters of its signature)
     dims = bind_outputs(target.name, target.public, {public_of[n]: i for n, i in given_infos.items() if n in public_of}, call.dims)
     check_dim_constraints(dims)
+    if extern.implementations is not None:  # an implementation per architecture: the one of the device's (the same names, the same ABI)
+        device = _device_of({**call.infos, **given_infos}, {**call.tensors, **given})
+        if getattr(device, "type", None) != "cuda":
+            raise TilefishRuntimeError(f"jit and replay run on a CUDA device; the tensors are on {device}")
+        target = target.at(_capability(torch, _device_index(torch, str(device))))
+        extern = target.launch_extern()
     specs = target.compile_specs()
     spec = select_spec(target.name, specs, dims)
     check_consts(spec, {names[k]: v for k, v in call.consts.items()})
@@ -839,7 +853,7 @@ def export(
             for lspec in library_specs(op):
                 pinned_library.append(build_library(lspec, arch=cap))
             continue
-        target = _target(op)
+        target = _target(op).at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
         extern = target.launch_extern()
         for spec in target.compile_specs():
             if extern.binary is not None:

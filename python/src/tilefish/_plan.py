@@ -136,10 +136,24 @@ class Callee:
     extern: "ExternOp | None"  # what is launched for a kernel / extern
     names: "dict[str, str]"  # public parameter name -> the launched kernel's parameter name
     specs: "list[Any]"
+    # an extern declared with by_arch=: the callee of each implementation, by its key (``specs`` is empty: what is launched is one of them, which
+    # :meth:`at` picks for an architecture). They have the same stems and ABI, so the plan of a graph is the same document whichever runs.
+    implementations: "dict[str, Callee] | None" = None
 
     @property
     def by_stem(self) -> "dict[str, Any]":
         return {s.stem: s for s in self.specs}
+
+    def at(self, arch: "int | str") -> "Callee":
+        """The callee that is launched on ``arch``: the implementation of that architecture (refused when there is none), or this one."""
+        if self.implementations is None:
+            return self
+        assert self.extern is not None
+        return self.implementations[self.extern.for_arch(arch).implementation]  # type: ignore[index]
+
+    def variants(self) -> "list[Callee]":
+        """Every callee a step of this one may launch, whatever the architecture: its implementations, or itself."""
+        return [self] if self.implementations is None else list(self.implementations.values())
 
 
 def callee_of(op: Any) -> Callee:
@@ -164,6 +178,10 @@ def callee_of(op: Any) -> Callee:
                 with runtime._lock:
                     runtime._library_specs[op] = specs
             callee = Callee("library", op, op.name, op.signature, None, None, {}, list(specs))
+        elif isinstance(op, ExternOp) and op.implementations is not None:  # an implementation per architecture: a callee of each
+            target = runtime._target(op)
+            impls = {key: callee_of(one) for key, one in op.implementations.items()}
+            callee = Callee("kernel", op, op.name, target.public, target, op, runtime._extern_names(target, op), [], impls)
         elif isinstance(op, (KernelOp, ExternOp)):
             target = runtime._target(op)
             extern = target.launch_extern()
@@ -765,7 +783,10 @@ def resolve_step(
     and shape at this bucket), the dimensions, the binary, the scalars and the grid. This is the one place that decides all of them: a plan is
     built with it, and a plan is run with it, so what was planned is what runs. Raises the errors a launch of the binary would (a precondition
     that no address can change is checked here; the address-dependent ones in :meth:`Bound.check`). ``given`` are the values of the fixed
-    arguments per call of a prebuilt binary (the step's ``given``), by the launched kernel's parameter name."""
+    arguments per call of a prebuilt binary (the step's ``given``), by the launched kernel's parameter name. An extern declared with ``by_arch=`` is
+    resolved per implementation (``callee.at(arch)``, ``callee.variants()``)."""
+    if callee.implementations is not None:  # pragma: no cover - a bug of the caller: which implementation is launched depends on the architecture
+        raise TilefishPlanError(f"{where}: '{callee.name}' has an implementation per architecture: a step is resolved with callee.at(arch)")
     infos: "dict[str, TensorInfo]" = {}
     names, bindings, offsets = [], [], []
     order = {n: i for i, n in enumerate(buffers)}
@@ -1138,10 +1159,16 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
                 if isinstance(v, DimExpr) and not v.is_static:
                     v = _eval(v, mapping, name, f"{s.what}: the value of '{k}'")
                 values[s.callee.names.get(k, k)] = v
-            bound = resolve_step(s.callee, args_doc, shapes, f"graph '{name}' at {combo or 'its only size'}, {s.what}", values)
+            where = f"graph '{name}' at {combo or 'its only size'}, {s.what}"
+            # every implementation of an extern declared with by_arch= binds the step (the plan is for any architecture), to the same entry
+            bounds = [resolve_step(c, args_doc, shapes, where, values) for c in s.callee.variants()]
+            bound = bounds[0]
+            if any(b.stem != bound.stem or b.given != bound.given for b in bounds[1:]):  # pragma: no cover - the declaration holds them to one ABI
+                raise TilefishPlanError(f"{where}: the implementations of '{s.callee.name}' bind the step to {sorted({b.stem for b in bounds})}")
             if s.consts and s.callee.kind == "kernel":  # a constexpr is compiled into the binary: a call may restate its value, not change it (as for a single launch)
                 try:
-                    check_consts(bound.spec, {s.callee.names[k]: v for k, v in s.consts.items()})
+                    for b in bounds:
+                        check_consts(b.spec, {s.callee.names[k]: v for k, v in s.consts.items()})
                 except TilefishError as e:
                     raise TilefishPlanError(f"graph '{name}': {s.what}: {e}") from None
             callees.setdefault(bound.stem, s.callee)
@@ -1276,10 +1303,10 @@ def _check_resolves(p: Plan) -> None:
         for i, st in enumerate(b["steps"]):
             if st["kind"] == "copy":  # no binary: copy_problem held it to its rules when it was made
                 continue
-            callee = p._callees[st["entry"]]
-            bound = resolve_step(callee, st["args"], shapes, f"graph '{doc['graph']}' at {b['values'] or 'its only size'}, step #{i}", st.get("given"))
-            if bound.stem != st["entry"]:  # pragma: no cover - the entry was taken from this very resolution
-                raise TilefishPlanError(f"step #{i} of graph '{doc['graph']}' resolves to '{bound.stem}', not '{st['entry']}'")
+            for callee in p._callees[st["entry"]].variants():
+                bound = resolve_step(callee, st["args"], shapes, f"graph '{doc['graph']}' at {b['values'] or 'its only size'}, step #{i}", st.get("given"))
+                if bound.stem != st["entry"]:  # pragma: no cover - the entry was taken from this very resolution
+                    raise TilefishPlanError(f"step #{i} of graph '{doc['graph']}' resolves to '{bound.stem}', not '{st['entry']}'")
 
 
 def buffer_shapes(doc: "Mapping[str, Any]", values: "Mapping[str, int]") -> "dict[str, tuple[str, tuple[int, ...]]]":

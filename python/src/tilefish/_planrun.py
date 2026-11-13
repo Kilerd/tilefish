@@ -774,6 +774,8 @@ class PlanRunner:
             where = f"graph '{self.plan.name}' at {values or 'its only size'}, step #{i} ({st['entry']})"
             if callee is None:
                 raise TilefishManifestError(f"{where}: the graph calls no operator that has the binary '{st['entry']}'")
+            if callee.implementations is not None:  # an extern declared with by_arch=: the implementation of the device's architecture
+                callee = callee.at(be.capability(index))
             bound = _plan.resolve_step(callee, st["args"], shapes, where, st.get("given"))
             if bound.stem != st["entry"]:
                 raise TilefishManifestError(f"{where}: the arguments of the step select the binary '{bound.stem}', not '{st['entry']}'")
@@ -1838,6 +1840,7 @@ def export_graph(
     built: list = []
     pinned: list = []
     for stem, callee in sorted(p.callees.items(), key=lambda kv: kv[0]):
+        callee = callee.at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
         spec = callee.by_stem[stem]
         if callee.kind == "library":
             pinned.append(_library.build_library(spec, arch=cap))
@@ -1927,6 +1930,7 @@ def export_graphs(
     callees: "dict[str, Any]" = {}
     for p in plans:
         for stem, callee in p.callees.items():
+            callee = callee.at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
             other = callees.setdefault(stem, callee)
             if other is not callee and callee.by_stem[stem] != other.by_stem[stem]:
                 raise TilefishRuntimeError(f"two plans of the set launch different binaries under one name '{stem}': rename one of the operators")

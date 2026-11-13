@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 from ._elf import parse_elf, code_digest
 from . import _ir, _source
-from ._specvalid import stride_of_json
+from ._specvalid import IMPLEMENTATION_FALLBACK, stride_of_json
 from .errors import TilefishBuildError, TilefishManifestError
 
 BINARY_DIGEST_KIND = "tilefish.binary.v1"  # the ``source_digest_kind`` of an entry whose ``source_digest`` is the sha256 of a prebuilt PTX or cubin
@@ -79,6 +79,16 @@ def parse_arch(arch: "int | str") -> int:
     if not 70 <= cap <= 999:
         raise TilefishBuildError(f"arch {arch!r} is not a supported compute capability (70 to 999, e.g. 80, 90, 100, 103)")
     return cap
+
+
+def check_implementation_arch(spec: "CompileSpec", cap: int) -> None:
+    """The spec of the implementation an op declared with ``by_arch=`` declares for one architecture is built for that architecture only (a
+    fallback for any): a manifest entry's ``implementation`` is its ``arch`` or ``"fallback"``, which both readers hold it to."""
+    if spec.implementation is not None and spec.implementation not in (f"sm_{cap}", IMPLEMENTATION_FALLBACK):
+        raise TilefishBuildError(
+            f"'{spec.stem}' is the implementation declared for {spec.implementation}, not for sm_{cap}: build the implementation of sm_{cap} "
+            f"(compile_specs(op, arch={cap}))"
+        )
 
 
 def _import_triton() -> Any:
@@ -606,6 +616,7 @@ def build(
     """
     cap = parse_arch(arch)
     inp = spec.ast_source_inputs()  # raises TilefishSpecError for a spec that is not verified
+    check_implementation_arch(spec, cap)
     triton = _import_triton()
     jit = fn if fn is not None else resolve_triton(spec.triton)
     _check_jit_function(jit, spec)
@@ -744,6 +755,8 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
         entry["symbol"] = spec.binary["symbol"]
         entry["shared"] = spec.binary["shared"]
     entry["declaration_digest"] = spec.declaration_digest
+    if spec.implementation is not None:  # which implementation of an op declared with by_arch= this is (its key, in the declaration digest too)
+        entry["implementation"] = spec.implementation
     if spec.source_sha256 is not None:  # a generated kernel: the sha256 of the Triton source it was built from
         entry["source_sha256"] = spec.source_sha256
     return entry
@@ -775,6 +788,8 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     if b.spec.binary is None:
         entry["options"] = dict(b.options)
     entry["declaration_digest"] = spec_part["declaration_digest"]
+    if "implementation" in spec_part:
+        entry["implementation"] = spec_part["implementation"]
     entry["sha256"] = b.sha256
     entry["sha256_code"] = b.sha256_code
     if b.spec.binary is None:
@@ -812,6 +827,7 @@ def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
     for key in (
         "sha256_code",
         "declaration_digest",
+        "implementation",
         "source_sha256",
         "source_digest",
         "source_digest_kind",
