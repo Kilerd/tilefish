@@ -409,9 +409,15 @@ macro_rules! tensor_type {
                 self.arg.device
             }
 
-            /// The number of elements.
-            pub fn elements(&self) -> usize {
-                self.arg.shape.iter().product()
+            /// The number of elements, the product of the sizes, exactly: `None` when it does not fit a `usize`. Only a view has that
+            /// many (one broadcast along huge axes, `[usize::MAX, 2]` with strides `[0, 0]`, fits in an element of memory); a dense tensor
+            /// fits its memory, so its count always fits.
+            pub fn elements(&self) -> Option<usize> {
+                let shape = self.arg.shape;
+                if shape.contains(&0) {
+                    return Some(0); // whatever the other sizes are
+                }
+                shape.iter().try_fold(1usize, |count, size| count.checked_mul(*size))
             }
 
             /// The same tensor without its element type in the Rust type, for [`Kernel::launch`](crate::Kernel::launch). It keeps
