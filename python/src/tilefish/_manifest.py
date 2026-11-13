@@ -176,7 +176,8 @@ class Manifest:
                 f"{MANIFEST_SCHEMA}, where every pointer records its shape and every entry the constraints of its dimensions, which "
                 "a host needs. Re-export it (tilefish.runtime.export) and pin the new digest"
             )
-        if not isinstance(doc, dict) or doc.get("schema") != MANIFEST_SCHEMA or not isinstance(doc.get("kernels"), list):
+        # the schema is the integer 2: not 2.0 (which == 2 in Python, and which the Rust host refuses), not "2", not True
+        if not isinstance(doc, dict) or type(doc.get("schema")) is not int or doc["schema"] != MANIFEST_SCHEMA or not isinstance(doc.get("kernels"), list):
             raise TilefishManifestError(
                 f"the manifest {str(manifest_path)!r} is not a tilefish manifest of schema {MANIFEST_SCHEMA} "
                 f"(schema {doc.get('schema') if isinstance(doc, dict) else None!r})"

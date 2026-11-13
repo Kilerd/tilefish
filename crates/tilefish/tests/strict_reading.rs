@@ -158,7 +158,7 @@ fn what_is_not_strict_json_is_refused() {
 
 #[test]
 fn an_unknown_key_a_missing_key_and_a_wrong_type_are_refused() {
-    let cases: [(&str, &str, &str, &str); 11] = [
+    let cases: [(&str, &str, &str, &str); 16] = [
         (
             "an unknown key in an entry",
             "\"stem\": \"softmax\",",
@@ -173,6 +173,12 @@ fn an_unknown_key_a_missing_key_and_a_wrong_type_are_refused() {
         ("a bool where an int is", "\"num_stages\": 3", "\"num_stages\": true", "invalid type"),
         ("a negative size", "\"shared\": 16", "\"shared\": -16", "invalid value"),
         ("the schema as another number", "\"schema\": 2,", "\"schema\": 3,", "schema"),
+        // 2.0 is 2 to Python's `==`: both hosts refuse it, only the integer 2 is a schema
+        ("the schema as 2.0", "\"schema\": 2,", "\"schema\": 2.0,", "schema"),
+        ("the schema as 2e0", "\"schema\": 2,", "\"schema\": 2e0,", "schema"),
+        ("the schema as a string", "\"schema\": 2,", "\"schema\": \"2\",", "schema"),
+        ("the schema as true", "\"schema\": 2,", "\"schema\": true,", "schema"),
+        ("the schema as a list", "\"schema\": 2,", "\"schema\": [2],", "schema"),
         (
             "an unknown compile option",
             "\"num_stages\": 3\n      },\n      \"declaration_digest\"",
