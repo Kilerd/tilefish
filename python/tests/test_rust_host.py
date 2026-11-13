@@ -71,7 +71,7 @@ def test_launchers_typed_from_declarations(fake_manifest):
     for struct in ("pub struct Scale ", "pub struct RowopS32 ", "pub struct RowopS64 "):
         assert struct in source
     assert 'pub const SHAPES: &\'static [&\'static [&\'static str]] = &[&["M", "S"], &["M", "S"]];' in source
-    assert "x: TensorRef<'_, F32>" in source and "y: TensorMut<'_, F32>" in source
+    assert "x: TensorRef<'a, F32>" in source and "y: TensorMut<'a, F32>" in source
 
 
 def test_launchers_typed_from_the_manifest_alone(fake_manifest):
@@ -83,7 +83,7 @@ def test_launchers_typed_from_the_manifest_alone(fake_manifest):
     assert with_ops.replace("\n///\n", "\n").count("pub fn launch") == source.count("pub fn launch")
     assert "SHAPES" in source and 'pub const SHAPES: &\'static [&\'static [&\'static str]] = &[&["M", "S"], &["M", "S"]];' in source
     # nothing but the tensors: there is no way to tell a launch what a dimension is
-    assert "scalars: " not in source and "dims: " not in source and "self.kernel.launch(stream, &[x.arg(), y.arg()])" in source
+    assert "scalars: " not in source and "dims: " not in source and "self.kernel.launch(stream, &mut [x.into_arg(), y.into_arg()])" in source
     assert "Constraints: `S` is exactly 32" in source and "Constraints: `n` is a multiple of 16" in source
 
 
@@ -429,7 +429,7 @@ def test_the_names_that_clash_with_the_module_or_the_language_are_renamed(fake_m
     manifest = edited(fake_manifest, tmp_path, clash)
     source = rust.render(manifest, pin=manifest.digest)
     assert "pub struct KernelOp " in source and "pub struct Kernel " not in source  # `Kernel` is imported from the crate
-    assert "stream_: TensorRef<'_, Bf16>" in source and "type_: TensorMut<'_, Bf16>" in source
+    assert "stream_: TensorRef<'a, Bf16>" in source and "type_: TensorMut<'a, Bf16>" in source
     for stem, struct in [("self", "SelfOp"), ("error", "ErrorOp"), ("manifest", "ManifestOp"), ("kernel", "KernelOp"), ("bf16", "Bf16Op"), ("tensor_ref", "TensorRefOp"), ("none", "NoneOp")]:
         assert rust._camel(stem) == struct, stem
     # and the struct names that are not imports are as they were

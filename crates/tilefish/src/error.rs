@@ -23,8 +23,11 @@ pub enum PreconditionKind {
     MaxElements,
     /// A tensor that is written in place overlaps another argument.
     Alias,
-    /// The tensors are not all on the device the kernel was loaded on.
+    /// The tensors are not all on the device the kernel was loaded on, nor in the context it was loaded in.
     Device,
+    /// A tensor that may only be read is given for a parameter that the kernel writes. (Only the Rust host has this one: Python's
+    /// tensors have no access mode.)
+    Access,
 }
 
 impl PreconditionKind {
@@ -41,6 +44,7 @@ impl PreconditionKind {
             Self::MaxElements => "max_elements",
             Self::Alias => "alias",
             Self::Device => "device",
+            Self::Access => "access",
         }
     }
 }

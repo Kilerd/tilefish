@@ -11,7 +11,7 @@
 mod common;
 
 use common::{Copy, fixtures};
-use tilefish::{Arch, DType, DeviceInfo, DevicePtr, Error, Manifest, Pin, Plan, PreconditionKind, TensorArg};
+use tilefish::{Access, Arch, DType, DeviceInfo, DevicePtr, Error, Manifest, Pin, Plan, PreconditionKind, TensorArg};
 
 #[allow(dead_code)]
 #[rustfmt::skip] // generated: regenerate it, do not format it
@@ -36,7 +36,7 @@ macro_rules! typed {
 fn t<'a>(addr: u64, shape: &'a [usize], dtype: DType) -> TensorArg<'a> {
     // SAFETY: these addresses are never dereferenced: `prepare` only looks at the number. The region is as long as the tensor.
     let ptr = unsafe { DevicePtr::from_raw(addr, shape.iter().product::<usize>() as u64 * dtype.size() as u64, 0) };
-    TensorArg::new(ptr, shape, dtype).unwrap()
+    TensorArg::new(ptr, shape, dtype, Access::InOut).unwrap()
 }
 
 const A: u64 = 0x7000_0000_0000;
@@ -51,7 +51,7 @@ const LOW: u64 = 1 << 20;
 const HIGH: u64 = 1 << 63;
 
 /// A device like the B300's: 2^31 - 1 blocks along x, 65535 along y and z.
-const DEVICE: DeviceInfo = DeviceInfo { ordinal: 0, max_grid: [(1 << 31) - 1, 65535, 65535] };
+const DEVICE: DeviceInfo = DeviceInfo { ordinal: 0, context: None, max_grid: [(1 << 31) - 1, 65535, 65535] };
 
 fn kind(e: &Error) -> PreconditionKind {
     e.precondition_kind().unwrap_or_else(|| panic!("not a precondition error: {e:?}"))
@@ -347,7 +347,7 @@ fn a_grid_beyond_what_the_device_takes_is_refused_along_every_axis() {
             (_, other) => panic!("{grid}: {other:?}"),
         }
         // the device's limits are what is checked: the same grid is fine for a device that takes it
-        let roomy = DeviceInfo { ordinal: 0, max_grid: [i64::from(u32::MAX), 1 << 20, 1 << 20] };
+        let roomy = DeviceInfo { ordinal: 0, context: None, max_grid: [i64::from(u32::MAX), 1 << 20, 1 << 20] };
         assert!(plan.prepare(&args, Some(&roomy)).is_ok(), "{grid}");
     }
     // x, from the shapes: M is the number of rows
@@ -357,7 +357,7 @@ fn a_grid_beyond_what_the_device_takes_is_refused_along_every_axis() {
     let args = [t(BIG_A, &rows, DType::F32), t(BIG_B, &rows, DType::F32)];
     // 3_000_000 rows: fine along x, but not for a device that takes 1_000_000 there
     assert!(plan.prepare(&args, Some(&DEVICE)).is_err()); // (it is also more than the i32 offsets reach: max_elements)
-    let small = DeviceInfo { ordinal: 0, max_grid: [1_000_000, 65535, 65535] };
+    let small = DeviceInfo { ordinal: 0, context: None, max_grid: [1_000_000, 65535, 65535] };
     let rows = [1_500_000usize, 1000];
     let args = [t(BIG_A, &rows, DType::F32), t(BIG_B, &rows, DType::F32)];
     match plan.prepare(&args, Some(&small)) {
@@ -595,4 +595,59 @@ fn an_extern_that_says_it_indexes_with_i64_has_no_limit_in_its_manifest_and_the_
         .prepare(&[t(BIG_A, &x, DType::Bf16), t(A, &w, DType::Bf16), t(BIG_B, &x, DType::Bf16)], Some(&DEVICE))
         .unwrap();
     assert_eq!(prepared.grid, [1 << 20, 1, 1]);
+}
+
+// -- what a tensor may be used for -----------------------------------------------------------------------------------------------------------
+
+fn ta<'a>(addr: u64, shape: &'a [usize], dtype: DType, access: Access) -> TensorArg<'a> {
+    // SAFETY: these addresses are never dereferenced: `prepare` only looks at the number. The region is as long as the tensor.
+    let ptr = unsafe { DevicePtr::from_raw(addr, shape.iter().product::<usize>() as u64 * dtype.size() as u64, 0) };
+    TensorArg::new(ptr, shape, dtype, access).unwrap()
+}
+
+#[test]
+fn a_tensor_that_is_only_read_is_refused_for_a_parameter_the_kernel_writes() {
+    let shape = [4096usize];
+    let gelu = typed!(GeluErf); // x_ptr is In, y_ptr is Out
+    let call = |x, y| gelu.prepare(&[ta(A, &shape, DType::Bf16, x), ta(B, &shape, DType::Bf16, y)], Some(&DEVICE));
+    for (x, y) in [
+        (Access::In, Access::Out),
+        (Access::In, Access::InOut),
+        (Access::Out, Access::Out),
+        (Access::InOut, Access::InOut),
+    ] {
+        assert!(call(x, y).is_ok(), "{x:?}, {y:?}");
+    }
+    let e = call(Access::In, Access::In).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Access);
+    assert!(
+        e.to_string().contains("y_ptr") && e.to_string().contains("read-only") && e.to_string().contains("out"),
+        "{e}"
+    );
+    assert_eq!(PreconditionKind::Access.as_str(), "access");
+    // an InOut parameter (axpy's y, residual_add_rmsnorm's residual) needs a tensor that may be written too, and takes any that may
+    let axpy = typed!(Axpy);
+    let shape = [4096usize];
+    let call = |y| axpy.prepare(&[ta(A, &shape, DType::F32, Access::In), ta(B, &shape, DType::F32, y)], Some(&DEVICE));
+    assert!(call(Access::InOut).is_ok() && call(Access::Out).is_ok());
+    let e = call(Access::In).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Access);
+    assert!(e.to_string().contains("inout"), "{e}");
+    // an In parameter takes whatever it is given: a tensor that may be written is read
+    assert!(
+        axpy.prepare(
+            &[ta(A, &shape, DType::F32, Access::InOut), ta(B, &shape, DType::F32, Access::InOut)],
+            Some(&DEVICE)
+        )
+        .is_ok()
+    );
+    // the check is made without a device as well
+    assert_eq!(
+        kind(
+            &gelu
+                .prepare(&[ta(A, &[4096], DType::Bf16, Access::In), ta(B, &[4096], DType::Bf16, Access::In)], None)
+                .unwrap_err()
+        ),
+        PreconditionKind::Access
+    );
 }

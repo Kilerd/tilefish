@@ -264,7 +264,18 @@ layer and calls the driver directly nowhere: `Manifest::kernel(&ctx, ...)` loads
 cubin into a `CudaContext` that the kernel then keeps alive, and the kernel
 launches on a cudarc `CudaStream` (`Kernel::launch`, safe: the stream is checked
 to be of the kernel's context) or, with the `unsafe` `Kernel::launch_raw`, on a
-raw `CUstream`, which also works inside a CUDA graph capture.
+raw `CUstream`, which also works inside a CUDA graph capture (it makes the
+kernel's context current for the call and puts back what was). A tensor is made of
+a cudarc `CudaSlice` or view (`from_cuda`: no `unsafe`; it borrows the slice, so
+the slice cannot be freed under it, and the launch gives the slice to cudarc's own
+launch builder on the stream it launches on, so cudarc's event tracking orders the
+launch against every other use of the slice, whatever stream that was) or of a
+region the host vouches for (`unsafe DevicePtr::from_raw`, which has a lifetime and
+no tracking). The loaded function's parameter sizes are not compared with the ABI
+(`cuFuncGetParamInfo`, which Python's `replay` asks): cudarc has no wrapper for it,
+and it adds nothing, because the cubin is the one whose digests the manifest
+pinned and the ABI is in the digest of the manifest. `cudarc` panics when there is
+no NVIDIA driver, so `tilefish::driver_available()` says first.
 
 A manifest (schema 2) carries what a host needs to check a launch on its own:
 every pointer parameter records its declared shape, with static axes as sizes
@@ -289,11 +300,11 @@ rust.emit("build/", "launchers.rs", pin=m.digest)   # a directory is read only w
 or a directory with `pin=`: the file it writes is compiled and run, so a manifest
 nobody vouched for does not write it, and every field that reaches it is
 validated) and writes one Rust module with a struct per binary (per bucket), whose
-`launch` takes typed tensors (`TensorRef<'_, Bf16>`, `TensorMut<'_, F32>`: a
-region of device memory with its length, which a safe constructor takes from a
-cudarc slice or the host vouches for with `unsafe DevicePtr::from_raw`; a shape
-that needs more bytes than the region has is refused, and so is a launch on a
-stream of another context) and documents the binary: its tensors, its
+`launch` takes typed tensors (`TensorRef<'a, Bf16>`, `TensorMut<'a, F32>`: the
+borrow of a cudarc slice, or a region of device memory with its length that the
+host vouches for with `unsafe DevicePtr::from_raw`; a shape that needs more bytes
+than the memory has is refused, and so is a launch on a stream of another context
+or of a tensor of another context) and documents the binary: its tensors, its
 dimensions and their constraints, what is compiled in. It also embeds the digest
 of the manifest it was generated from and refuses any other, and with
 `embed=True` the manifest and the cubins as well. The output is deterministic.

@@ -45,7 +45,7 @@ fn every_launch_is_decided_as_python_decides_it() {
                         0,
                     )
                 };
-                TensorArg::new(region, shape, dtype).unwrap()
+                TensorArg::new(region, shape, dtype, tilefish::Access::InOut).unwrap()
             })
             .collect();
         let plan = manifest.plan(stem, &[], Arch::sm(103)).unwrap();

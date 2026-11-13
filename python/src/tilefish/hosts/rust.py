@@ -389,8 +389,8 @@ def _render_binary(b: _Binary) -> str:
     tensor_params = []
     for p in b.params:
         wrapper = "TensorRef" if p["access"] == "in" else "TensorMut"
-        tensor_params.append(f"{b.arg_names[p['name']]}: {wrapper}<'_, {elements[p['name']]}>")
-    args = ", ".join(f"{b.arg_names[p['name']]}.arg()" for p in b.params)
+        tensor_params.append(f"{b.arg_names[p['name']]}: {wrapper}<'a, {elements[p['name']]}>")
+    args = ", ".join(f"{b.arg_names[p['name']]}.into_arg()" for p in b.params)
     out = [_doc_comment(_doc(b)), "#[derive(Debug, Clone)]\n", f"pub struct {b.struct} {{\n    kernel: Kernel,\n}}\n\n", f"impl {b.struct} {{\n"]
     out.append("    /// The stem of the binary in the manifest.\n")
     out.append(f"    pub const STEM: &'static str = {_rs_str(b.stem)};\n")
@@ -424,7 +424,8 @@ def _render_binary(b: _Binary) -> str:
     out.append("    pub fn kernel(&self) -> &Kernel {\n        &self.kernel\n    }\n\n")
     doc = [
         "Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be",
-        "capturing a CUDA graph).",
+        "capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every",
+        "other use of the slice.",
         "",
         "Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the",
         "bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched",
@@ -432,23 +433,24 @@ def _render_binary(b: _Binary) -> str:
     ]
     out.append(_doc_comment(doc, "    "))
     out.append("    #[allow(clippy::too_many_arguments, non_snake_case)]\n")
-    out.append("    pub fn launch(\n        &self,\n        stream: &CudaStream,\n")
+    out.append("    pub fn launch<'a>(\n        &self,\n        stream: &CudaStream,\n")
     for p in tensor_params:
         out.append(f"        {p},\n")
     out.append("    ) -> Result<(), Error> {\n")
-    out.append(f"        self.kernel.launch(stream, &[{args}])\n")
+    out.append(f"        self.kernel.launch(stream, &mut [{args}])\n")
     out.append("    }\n\n")
     raw_doc = [
         "Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.",
         "",
         "# Safety",
         "",
-        "`stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and",
-        "the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).",
+        "The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of",
+        "the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the",
+        "other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).",
     ]
     out.append(_doc_comment(raw_doc, "    "))
     out.append("    #[allow(clippy::too_many_arguments, non_snake_case)]\n")
-    out.append("    pub unsafe fn launch_raw(\n        &self,\n        stream: CUstream,\n")
+    out.append("    pub unsafe fn launch_raw<'a>(\n        &self,\n        stream: CUstream,\n")
     for p in tensor_params:
         out.append(f"        {p},\n")
     out.append("    ) -> Result<(), Error> {\n")

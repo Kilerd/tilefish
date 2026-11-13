@@ -1,16 +1,19 @@
 //! Element types and the tensors a launch is given.
 //!
-//! A tensor of a launch is a region of device memory (a [`DevicePtr`]: an address, the bytes the host vouches for, the device it
-//! is on) and a shape that must fit it; the host owns the memory. [`TensorRef`] (read only) and [`TensorMut`] (written by the kernel: `Out` and `InOut`) carry the element type
-//! in their type, so a generated launcher cannot be given a `bf16` tensor where it wants `f32`. Both are contiguous
-//! row-major tensors: the binaries take no strides.
+//! A tensor of a launch is memory and a shape that must fit it. The memory is either a cudarc `CudaSlice` or view, borrowed
+//! (`from_cuda`: no `unsafe`, and the launch hands the slice back to cudarc on its own stream, which orders it against every other use
+//! of it, see `memory`), or a region of device memory that the host vouches for (a [`DevicePtr`]: an address, the bytes, the device,
+//! and a lifetime; `new`, which needs `unsafe` to make the region). [`TensorRef`] (read only) and [`TensorMut`] (written by the
+//! kernel: `Out` and `InOut`) carry the element type in their type, so a generated launcher cannot be given a `bf16` tensor where
+//! it wants `f32`. They are contiguous row-major tensors: the binaries take no strides. A tensor borrows what it is made of, for
+//! as long as it lives, and what it turns into for a launch ([`TensorArg`]) does too.
 
 use std::marker::PhantomData;
 
-use cudarc::driver::{CudaStream, SyncOnDrop};
-
 use crate::error::{Error, Result};
-use crate::region::{self, DevicePtr};
+use crate::manifest::Access;
+use crate::memory::{CudaRead, CudaWrite, sealed};
+use crate::region::DevicePtr;
 
 /// An element type a binary can be given (the dtypes of Python's `TORCH_DTYPE_NAMES`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,12 +83,12 @@ impl DType {
     }
 }
 
-mod sealed {
+mod element_sealed {
     pub trait Sealed {}
 }
 
 /// The element type of a [`TensorRef`] or [`TensorMut`], as a type.
-pub trait Element: sealed::Sealed + Copy + 'static {
+pub trait Element: element_sealed::Sealed + Copy + 'static {
     /// The runtime tag of the type.
     const DTYPE: DType;
 }
@@ -95,7 +98,7 @@ macro_rules! elements {
         $(#[$doc])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct $name;
-        impl sealed::Sealed for $name {}
+        impl element_sealed::Sealed for $name {}
         impl Element for $name {
             const DTYPE: DType = DType::$tag;
         }
@@ -127,37 +130,79 @@ fn bytes_of(shape: &[usize], dtype: DType) -> Option<u64> {
     u64::try_from(numel.checked_mul(dtype.size() as u128)?).ok()
 }
 
-/// The error of a tensor that needs more bytes than its region has.
-fn too_big(shape: &[usize], dtype: DType, region: DevicePtr) -> Error {
+/// The error of a tensor that needs more bytes than its memory has.
+fn too_big(shape: &[usize], dtype: DType, len_bytes: u64) -> Error {
     Error::Launch(format!(
-        "a tensor of shape {shape:?} and dtype {} needs {} bytes, but its region has {} bytes",
+        "a tensor of shape {shape:?} and dtype {} needs {} bytes, but its region has {len_bytes} bytes",
         dtype.name(),
         bytes_of(shape, dtype).map_or_else(|| "more than 2^64".to_owned(), |b| b.to_string()),
-        region.len_bytes()
     ))
 }
 
+fn check_fits(shape: &[usize], dtype: DType, len_bytes: u64) -> Result<()> {
+    match bytes_of(shape, dtype) {
+        Some(needed) if needed <= len_bytes => Ok(()),
+        _ => Err(too_big(shape, dtype, len_bytes)),
+    }
+}
+
+/// What a tensor is made of, for a launch.
+pub(crate) enum Backing<'a> {
+    /// A region the host vouched for: the launch passes its address.
+    Raw,
+    /// A cudarc slice or view that is read: the launch gives it to cudarc's launch builder.
+    Read(&'a dyn sealed::Read),
+    /// A cudarc slice or view that is written.
+    Write(&'a mut dyn sealed::Write),
+}
+
 /// The facts about one tensor that a launch checks, without the element type in the Rust type (what [`TensorRef`] and
-/// [`TensorMut`] turn into). Build one with [`TensorArg::new`] to launch a kernel without a generated launcher.
-#[derive(Debug, Clone, Copy)]
+/// [`TensorMut`] turn into with `into_arg`). Build one with [`TensorArg::new`] to launch a kernel without a generated launcher.
+///
+/// It borrows the memory it is made of for `'a` (so it cannot outlive a `CudaSlice`, nor the region of an `unsafe` constructor whose
+/// lifetime was bound), it is used once (it is not `Copy` or `Clone`: it may hold the exclusive borrow of a slice that is written),
+/// and it says what the kernel may do to it ([`Access`]), which a launch checks against the parameter it is given for.
 pub struct TensorArg<'a> {
     pub(crate) ptr: u64,
     pub(crate) shape: &'a [usize],
     pub(crate) dtype: DType,
     pub(crate) device: i32,
+    /// The `CUcontext` the memory was allocated in, when it is known (it is for cudarc memory): a tensor of another context on the
+    /// same device is refused.
+    pub(crate) context: Option<usize>,
+    pub(crate) access: Access,
+    pub(crate) backing: Backing<'a>,
+}
+
+impl std::fmt::Debug for TensorArg<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TensorArg")
+            .field("addr", &format_args!("{:#x}", self.ptr))
+            .field("shape", &self.shape)
+            .field("dtype", &self.dtype)
+            .field("device", &self.device)
+            .field("access", &self.access)
+            .field(
+                "backing",
+                &match self.backing {
+                    Backing::Raw => "a region the host vouched for",
+                    Backing::Read(_) => "a cudarc slice, read",
+                    Backing::Write(_) => "a cudarc slice, written",
+                },
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> TensorArg<'a> {
-    /// A contiguous row-major tensor of `dtype` and `shape` in the region `ptr`, on the device the region is on.
+    /// A contiguous row-major tensor of `dtype` and `shape` in the region `ptr`, on the device the region is on, which the kernel
+    /// may use as `access` says: [`Access::In`] it reads, [`Access::Out`] it writes, [`Access::InOut`] it does both. A launch refuses a
+    /// tensor that is `In` for a parameter that is `Out` or `InOut`.
     ///
     /// Refused when the shape needs more bytes than the region has: a launch can then never touch memory the host did not vouch for.
-    pub fn new(ptr: DevicePtr, shape: &'a [usize], dtype: DType) -> Result<Self> {
-        match bytes_of(shape, dtype) {
-            Some(needed) if needed <= ptr.len_bytes() => {
-                Ok(Self { ptr: ptr.addr(), shape, dtype, device: ptr.device() })
-            }
-            _ => Err(too_big(shape, dtype, ptr)),
-        }
+    pub fn new(ptr: DevicePtr<'a>, shape: &'a [usize], dtype: DType, access: Access) -> Result<Self> {
+        check_fits(shape, dtype, ptr.len_bytes())?;
+        Ok(Self { ptr: ptr.addr(), shape, dtype, device: ptr.device(), context: None, access, backing: Backing::Raw })
     }
 
     /// The device address.
@@ -179,56 +224,63 @@ impl<'a> TensorArg<'a> {
     pub fn device(&self) -> i32 {
         self.device
     }
+
+    /// What the kernel may do to the tensor.
+    pub fn access(&self) -> Access {
+        self.access
+    }
 }
 
 macro_rules! tensor_type {
-    ($(#[$doc:meta])* $name:ident, $marker:ty) => {
+    ($(#[$doc:meta])* $name:ident, $access:expr) => {
         $(#[$doc])*
         ///
-        /// It is made from a region the host vouches for (`new`, from a [`DevicePtr`]) or from a cudarc slice or view whose length is
-        /// known (`from_cuda`, no `unsafe`); either way it is refused when the shape needs more bytes than the region has. One from a
-        /// cudarc slice keeps cudarc's event tracking until it is dropped, which is after the launch it is given to has been enqueued:
-        /// so it is not `Copy`, and a launcher takes it by value.
-        #[derive(Debug)]
+        /// It is made from a cudarc slice or view (`from_cuda`, no `unsafe`: the length is known, the borrow keeps the memory alive,
+        /// and the launch gives the slice to cudarc, which orders it) or from a region the host vouches for (`new`, from a
+        /// [`DevicePtr`]); either way it is refused when the shape needs more bytes than the memory has. It is not `Copy`, and a
+        /// launcher takes it by value. It has no address to give back as a region: only [`addr`](Self::addr), a number.
         pub struct $name<'a, T: Element> {
-            ptr: DevicePtr,
-            shape: &'a [usize],
-            _guard: Option<SyncOnDrop<'a>>,
-            _marker: PhantomData<$marker>,
+            arg: TensorArg<'a>,
+            _marker: PhantomData<T>,
+        }
+
+        impl<T: Element> std::fmt::Debug for $name<'_, T> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_tuple(stringify!($name)).field(&self.arg).finish()
+            }
         }
 
         impl<'a, T: Element> $name<'a, T> {
             /// A contiguous row-major tensor of `shape` in the region `ptr`.
-            pub fn new(ptr: DevicePtr, shape: &'a [usize]) -> Result<Self> {
-                match bytes_of(shape, T::DTYPE) {
-                    Some(needed) if needed <= ptr.len_bytes() => Ok(Self { ptr, shape, _guard: None, _marker: PhantomData }),
-                    _ => Err(too_big(shape, T::DTYPE, ptr)),
-                }
+            pub fn new(ptr: DevicePtr<'a>, shape: &'a [usize]) -> Result<Self> {
+                Ok(Self { arg: TensorArg::new(ptr, shape, T::DTYPE, $access)?, _marker: PhantomData })
             }
 
-            /// The device pointer (the region).
-            pub fn ptr(&self) -> DevicePtr {
-                self.ptr
+            /// The device address, a plain number: it cannot be turned back into a tensor without `unsafe`
+            /// ([`DevicePtr::from_raw`]).
+            pub fn addr(&self) -> u64 {
+                self.arg.ptr
             }
 
             /// The shape.
             pub fn shape(&self) -> &'a [usize] {
-                self.shape
+                self.arg.shape
             }
 
             /// The device ordinal.
             pub fn device(&self) -> i32 {
-                self.ptr.device()
+                self.arg.device
             }
 
             /// The number of elements.
             pub fn elements(&self) -> usize {
-                self.shape.iter().product()
+                self.arg.shape.iter().product()
             }
 
-            /// The same tensor without its element type in the Rust type, for [`Kernel::launch`](crate::Kernel::launch).
-            pub fn arg(&self) -> TensorArg<'a> {
-                TensorArg { ptr: self.ptr.addr(), shape: self.shape, dtype: T::DTYPE, device: self.ptr.device() }
+            /// The same tensor without its element type in the Rust type, for [`Kernel::launch`](crate::Kernel::launch). It keeps
+            /// the borrow of what it is made of.
+            pub fn into_arg(self) -> TensorArg<'a> {
+                self.arg
             }
         }
     };
@@ -237,42 +289,50 @@ macro_rules! tensor_type {
 tensor_type!(
     /// A tensor a kernel only reads (an `In` parameter).
     TensorRef,
-    &'a T
+    Access::In
 );
 tensor_type!(
     /// A tensor a kernel writes (an `Out` or `InOut` parameter).
     TensorMut,
-    &'a mut T
+    Access::InOut
 );
 
 impl<'a, T: Element> TensorRef<'a, T> {
-    /// A tensor over a cudarc `CudaSlice` or `CudaView`, whose length is known, as seen from `stream` (the stream the launch is
-    /// made on: cudarc orders the slice's earlier writes before it, and records the use on it). The slice may hold any type: its
-    /// bytes are the tensor's elements, as `T` says.
-    pub fn from_cuda<E, S: cudarc::driver::DevicePtr<E>>(
-        slice: &'a S,
-        stream: &'a CudaStream,
-        shape: &'a [usize],
-    ) -> Result<Self> {
-        let (ptr, guard) = region::region_of(slice, stream);
-        let mut tensor = Self::new(ptr, shape)?;
-        tensor._guard = Some(guard);
-        Ok(tensor)
+    /// A tensor over a cudarc `CudaSlice` or `CudaView`, whose length is known. The slice may hold any type: its bytes are the
+    /// tensor's elements, as `T` says. The tensor borrows the slice (so it is gone before the slice is) and a launch gives the slice
+    /// to cudarc as a read, on the stream it launches on.
+    pub fn from_cuda<S: CudaRead + 'a>(slice: &'a S, shape: &'a [usize]) -> Result<Self> {
+        let region = sealed::Memory::region(slice);
+        check_fits(shape, T::DTYPE, region.len_bytes)?;
+        let arg = TensorArg {
+            ptr: region.addr,
+            shape,
+            dtype: T::DTYPE,
+            device: region.ordinal,
+            context: Some(region.context),
+            access: Access::In,
+            backing: Backing::Read(slice),
+        };
+        Ok(Self { arg, _marker: PhantomData })
     }
 }
 
 impl<'a, T: Element> TensorMut<'a, T> {
-    /// A tensor over a cudarc `CudaSlice` or `CudaViewMut` that the kernel writes, as seen from `stream`; see
-    /// [`TensorRef::from_cuda`].
-    pub fn from_cuda<E, S: cudarc::driver::DevicePtrMut<E>>(
-        slice: &'a mut S,
-        stream: &'a CudaStream,
-        shape: &'a [usize],
-    ) -> Result<Self> {
-        let (ptr, guard) = region::region_of_mut(slice, stream);
-        let mut tensor = Self::new(ptr, shape)?;
-        tensor._guard = Some(guard);
-        Ok(tensor)
+    /// A tensor over a cudarc `CudaSlice` or `CudaViewMut` that the kernel writes; see [`TensorRef::from_cuda`]. It holds the
+    /// exclusive borrow of the slice, and a launch gives the slice to cudarc as a write.
+    pub fn from_cuda<S: CudaWrite + 'a>(slice: &'a mut S, shape: &'a [usize]) -> Result<Self> {
+        let region = sealed::Memory::region(&*slice);
+        check_fits(shape, T::DTYPE, region.len_bytes)?;
+        let arg = TensorArg {
+            ptr: region.addr,
+            shape,
+            dtype: T::DTYPE,
+            device: region.ordinal,
+            context: Some(region.context),
+            access: Access::InOut,
+            backing: Backing::Write(slice),
+        };
+        Ok(Self { arg, _marker: PhantomData })
     }
 }
 

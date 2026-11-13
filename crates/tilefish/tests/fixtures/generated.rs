@@ -53,36 +53,38 @@ impl Axpy {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x_ptr: TensorRef<'_, F32>,
-        y_ptr: TensorMut<'_, F32>,
+        x_ptr: TensorRef<'a, F32>,
+        y_ptr: TensorMut<'a, F32>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x_ptr.arg(), y_ptr.arg()])
+        self.kernel.launch(stream, &mut [x_ptr.into_arg(), y_ptr.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x_ptr: TensorRef<'_, F32>,
-        y_ptr: TensorMut<'_, F32>,
+        x_ptr: TensorRef<'a, F32>,
+        y_ptr: TensorMut<'a, F32>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x_ptr.arg(), y_ptr.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x_ptr.into_arg(), y_ptr.into_arg()]) }
     }
 }
 
@@ -129,38 +131,40 @@ impl BucketedRmsDb1000 {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x: TensorRef<'_, Bf16>,
-        w: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        w: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x.arg(), w.arg(), out.arg()])
+        self.kernel.launch(stream, &mut [x.into_arg(), w.into_arg(), out.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x: TensorRef<'_, Bf16>,
-        w: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        w: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x.arg(), w.arg(), out.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x.into_arg(), w.into_arg(), out.into_arg()]) }
     }
 }
 
@@ -207,38 +211,40 @@ impl BucketedRmsDb512 {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x: TensorRef<'_, Bf16>,
-        w: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        w: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x.arg(), w.arg(), out.arg()])
+        self.kernel.launch(stream, &mut [x.into_arg(), w.into_arg(), out.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x: TensorRef<'_, Bf16>,
-        w: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        w: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x.arg(), w.arg(), out.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x.into_arg(), w.into_arg(), out.into_arg()]) }
     }
 }
 
@@ -285,38 +291,40 @@ impl BucketedRmsDb96 {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x: TensorRef<'_, Bf16>,
-        w: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        w: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x.arg(), w.arg(), out.arg()])
+        self.kernel.launch(stream, &mut [x.into_arg(), w.into_arg(), out.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x: TensorRef<'_, Bf16>,
-        w: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        w: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x.arg(), w.arg(), out.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x.into_arg(), w.into_arg(), out.into_arg()]) }
     }
 }
 
@@ -365,36 +373,38 @@ impl GeluErf {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x_ptr: TensorRef<'_, Bf16>,
-        y_ptr: TensorMut<'_, Bf16>,
+        x_ptr: TensorRef<'a, Bf16>,
+        y_ptr: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x_ptr.arg(), y_ptr.arg()])
+        self.kernel.launch(stream, &mut [x_ptr.into_arg(), y_ptr.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x_ptr: TensorRef<'_, Bf16>,
-        y_ptr: TensorMut<'_, Bf16>,
+        x_ptr: TensorRef<'a, Bf16>,
+        y_ptr: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x_ptr.arg(), y_ptr.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x_ptr.into_arg(), y_ptr.into_arg()]) }
     }
 }
 
@@ -443,36 +453,38 @@ impl GeluExact {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x.arg(), out.arg()])
+        self.kernel.launch(stream, &mut [x.into_arg(), out.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x.arg(), out.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x.into_arg(), out.into_arg()]) }
     }
 }
 
@@ -529,40 +541,42 @@ impl Layernorm {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x: TensorRef<'_, Bf16>,
-        w: TensorRef<'_, Bf16>,
-        b: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        w: TensorRef<'a, Bf16>,
+        b: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x.arg(), w.arg(), b.arg(), out.arg()])
+        self.kernel.launch(stream, &mut [x.into_arg(), w.into_arg(), b.into_arg(), out.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x: TensorRef<'_, Bf16>,
-        w: TensorRef<'_, Bf16>,
-        b: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        w: TensorRef<'a, Bf16>,
+        b: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x.arg(), w.arg(), b.arg(), out.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x.into_arg(), w.into_arg(), b.into_arg(), out.into_arg()]) }
     }
 }
 
@@ -614,38 +628,40 @@ impl Mm {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        a_ptr: TensorRef<'_, F16>,
-        b_ptr: TensorRef<'_, F16>,
-        c_ptr: TensorMut<'_, F32>,
+        a_ptr: TensorRef<'a, F16>,
+        b_ptr: TensorRef<'a, F16>,
+        c_ptr: TensorMut<'a, F32>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[a_ptr.arg(), b_ptr.arg(), c_ptr.arg()])
+        self.kernel.launch(stream, &mut [a_ptr.into_arg(), b_ptr.into_arg(), c_ptr.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        a_ptr: TensorRef<'_, F16>,
-        b_ptr: TensorRef<'_, F16>,
-        c_ptr: TensorMut<'_, F32>,
+        a_ptr: TensorRef<'a, F16>,
+        b_ptr: TensorRef<'a, F16>,
+        c_ptr: TensorMut<'a, F32>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[a_ptr.arg(), b_ptr.arg(), c_ptr.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[a_ptr.into_arg(), b_ptr.into_arg(), c_ptr.into_arg()]) }
     }
 }
 
@@ -702,40 +718,42 @@ impl ResidualAddRmsnorm {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x: TensorRef<'_, Bf16>,
-        residual: TensorMut<'_, F32>,
-        w: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        residual: TensorMut<'a, F32>,
+        w: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x.arg(), residual.arg(), w.arg(), out.arg()])
+        self.kernel.launch(stream, &mut [x.into_arg(), residual.into_arg(), w.into_arg(), out.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x: TensorRef<'_, Bf16>,
-        residual: TensorMut<'_, F32>,
-        w: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        x: TensorRef<'a, Bf16>,
+        residual: TensorMut<'a, F32>,
+        w: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x.arg(), residual.arg(), w.arg(), out.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x.into_arg(), residual.into_arg(), w.into_arg(), out.into_arg()]) }
     }
 }
 
@@ -789,38 +807,40 @@ impl Rmsnorm {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x_ptr: TensorRef<'_, Bf16>,
-        w_ptr: TensorRef<'_, Bf16>,
-        y_ptr: TensorMut<'_, Bf16>,
+        x_ptr: TensorRef<'a, Bf16>,
+        w_ptr: TensorRef<'a, Bf16>,
+        y_ptr: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x_ptr.arg(), w_ptr.arg(), y_ptr.arg()])
+        self.kernel.launch(stream, &mut [x_ptr.into_arg(), w_ptr.into_arg(), y_ptr.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x_ptr: TensorRef<'_, Bf16>,
-        w_ptr: TensorRef<'_, Bf16>,
-        y_ptr: TensorMut<'_, Bf16>,
+        x_ptr: TensorRef<'a, Bf16>,
+        w_ptr: TensorRef<'a, Bf16>,
+        y_ptr: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x_ptr.arg(), w_ptr.arg(), y_ptr.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x_ptr.into_arg(), w_ptr.into_arg(), y_ptr.into_arg()]) }
     }
 }
 
@@ -871,36 +891,38 @@ impl Softmax {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        x: TensorRef<'_, F32>,
-        out: TensorMut<'_, F32>,
+        x: TensorRef<'a, F32>,
+        out: TensorMut<'a, F32>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[x.arg(), out.arg()])
+        self.kernel.launch(stream, &mut [x.into_arg(), out.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        x: TensorRef<'_, F32>,
-        out: TensorMut<'_, F32>,
+        x: TensorRef<'a, F32>,
+        out: TensorMut<'a, F32>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[x.arg(), out.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[x.into_arg(), out.into_arg()]) }
     }
 }
 
@@ -957,37 +979,39 @@ impl Swiglu {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph).
+    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
+    /// other use of the slice.
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
     /// when one fails. The dimensions, the runtime scalars and the grid come from the shapes of the tensors.
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub fn launch(
+    pub fn launch<'a>(
         &self,
         stream: &CudaStream,
-        gate: TensorRef<'_, Bf16>,
-        up: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        gate: TensorRef<'a, Bf16>,
+        up: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
-        self.kernel.launch(stream, &[gate.arg(), up.arg(), out.arg()])
+        self.kernel.launch(stream, &mut [gate.into_arg(), up.into_arg(), out.into_arg()])
     }
 
     /// Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.
     ///
     /// # Safety
     ///
-    /// `stream` must be a valid `CUstream` of the CUDA context the kernel was loaded in, which must be current on this thread, and
-    /// the memory of the tensors must stay allocated until the launch has completed on it (see `tilefish::Kernel::launch_raw`).
+    /// The kernel's context is made current for the call and what was current is put back. `stream` must be a valid `CUstream` of
+    /// the CUDA context the kernel was loaded in, and the memory of the tensors must stay allocated, and be ordered against the
+    /// other streams that use it, until the launch has completed on `stream` (see `tilefish::Kernel::launch_raw`).
     #[allow(clippy::too_many_arguments, non_snake_case)]
-    pub unsafe fn launch_raw(
+    pub unsafe fn launch_raw<'a>(
         &self,
         stream: CUstream,
-        gate: TensorRef<'_, Bf16>,
-        up: TensorRef<'_, Bf16>,
-        out: TensorMut<'_, Bf16>,
+        gate: TensorRef<'a, Bf16>,
+        up: TensorRef<'a, Bf16>,
+        out: TensorMut<'a, Bf16>,
     ) -> Result<(), Error> {
         // SAFETY: the caller vouches for the stream, as this function's contract says.
-        unsafe { self.kernel.launch_raw(stream, &[gate.arg(), up.arg(), out.arg()]) }
+        unsafe { self.kernel.launch_raw(stream, &[gate.into_arg(), up.into_arg(), out.into_arg()]) }
     }
 }

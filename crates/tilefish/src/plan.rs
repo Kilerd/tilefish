@@ -24,12 +24,15 @@ use crate::tensor::{DType, TensorArg};
 /// The widest `kernelParams` array: the arguments of a kernel plus its two scratch slots.
 pub(crate) const MAX_PARAMS: usize = 64;
 
-/// The device a launch is checked against: its ordinal, and the largest grid it takes along each axis
-/// (`CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X/Y/Z`).
+/// The device a launch is checked against: its ordinal, the CUDA context the kernel is loaded in, and the largest grid it takes
+/// along each axis (`CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X/Y/Z`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeviceInfo {
     /// The ordinal of the device the kernel is loaded on: every tensor must be on it.
     pub ordinal: i32,
+    /// The address of the `CUcontext` the kernel is loaded in, when there is one (a made-up device for a test has none): a tensor whose
+    /// memory is cudarc's and was allocated in another context, even of the same device, is refused.
+    pub context: Option<usize>,
     /// The largest grid size along x, y and z.
     pub max_grid: [i64; 3],
 }
@@ -86,7 +89,12 @@ pub struct Prepared {
     pub grid: [u32; 3],
     pub(crate) values: [u64; MAX_PARAMS],
     pub(crate) count: usize,
+    /// For each slot, the index of the tensor it holds (`NOT_A_TENSOR` for a scalar or a scratch slot).
+    pub(crate) tensor_of: [u8; MAX_PARAMS],
 }
+
+/// What `Prepared::tensor_of` holds for a slot that is not a tensor.
+pub(crate) const NOT_A_TENSOR: u8 = u8::MAX;
 
 impl Prepared {
     /// The `kernelParams` values, one 64-bit slot each: an address, or an `i32` in the low four bytes, then the two
@@ -341,6 +349,30 @@ impl Plan {
                     ),
                 ));
             }
+            if let (Some(kernel), Some(tensor)) = (device.and_then(|d| d.context), a.context)
+                && kernel != tensor
+            {
+                return Err(Error::precondition(
+                    PreconditionKind::Device,
+                    Some(&t.name),
+                    format!(
+                        "argument '{}' is memory of another CUDA context than the one '{stem}' is loaded in (the same device, {}, but \
+                         another context): memory can only be used in the context it was allocated in",
+                        t.name, a.device
+                    ),
+                ));
+            }
+            if t.access != Access::In && a.access == Access::In {
+                return Err(Error::precondition(
+                    PreconditionKind::Access,
+                    Some(&t.name),
+                    format!(
+                        "argument '{}' is a read-only tensor, but '{stem}' writes it ({}): give it a tensor that may be written",
+                        t.name,
+                        t.access.as_str()
+                    ),
+                ));
+            }
             if a.dtype != t.dtype {
                 return Err(Error::precondition(
                     PreconditionKind::Dtype,
@@ -566,13 +598,17 @@ impl Plan {
 
         // -- the kernelParams values
         let mut values = [0u64; MAX_PARAMS];
+        let mut tensor_of = [NOT_A_TENSOR; MAX_PARAMS];
         for (k, slot) in self.slots.iter().enumerate() {
             values[k] = match slot {
-                Slot::Tensor(t) => tensors[*t].ptr,
+                Slot::Tensor(t) => {
+                    tensor_of[k] = *t as u8; // at most MAX_PARAMS - 2 tensors: `Plan::new` refuses more parameters
+                    tensors[*t].ptr
+                }
                 Slot::Scalar(s) => u64::from(scalar_values[*s] as u32),
             };
         }
-        Ok(Prepared { grid, values, count: self.slots.len() + 2 }) // the two scratch slots stay 0: null pointers
+        Ok(Prepared { grid, values, count: self.slots.len() + 2, tensor_of }) // the two scratch slots stay 0: null pointers
     }
 
     fn solve(&self, dims: &mut [Option<i64>], equations: &[Equation<'_>]) -> Result<()> {
@@ -662,4 +698,51 @@ fn extent(a: &TensorArg<'_>) -> (u128, u128) {
     let bytes =
         a.shape.iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128)).saturating_mul(a.dtype.size() as u128);
     (u128::from(a.ptr), u128::from(a.ptr).saturating_add(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::{Manifest, Pin};
+    use crate::region::DevicePtr;
+
+    fn gelu() -> Plan {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sm_103");
+        let manifest = Manifest::load(dir, Pin::TrustDirectory).unwrap();
+        manifest.plan("gelu_erf", &[], crate::kernel::Arch::sm(103)).unwrap()
+    }
+
+    fn arg(shape: &[usize], addr: u64, context: Option<usize>) -> TensorArg<'_> {
+        // SAFETY: the address is never dereferenced: `prepare` only looks at the number.
+        #[allow(unsafe_code)]
+        let region = unsafe { DevicePtr::from_raw(addr, 8192, 0) };
+        let mut arg = TensorArg::new(region, shape, DType::Bf16, Access::InOut).unwrap();
+        arg.context = context;
+        arg
+    }
+
+    const SHAPE: [usize; 1] = [4096];
+
+    #[test]
+    fn memory_of_another_context_on_the_same_device_is_refused_and_the_kernels_own_is_not() {
+        let plan = gelu();
+        let device = |context| DeviceInfo { ordinal: 0, context, max_grid: [1 << 20, 65535, 65535] };
+        let call = |kernel: Option<usize>, x: Option<usize>, y: Option<usize>| {
+            plan.prepare(&[arg(&SHAPE, 0x7000_0000_0000, x), arg(&SHAPE, 0x7000_1000_0000, y)], Some(&device(kernel)))
+        };
+        assert!(call(Some(0xA), Some(0xA), Some(0xA)).is_ok());
+        // a tensor of another context (the same device): refused, and the message says which argument
+        let e = call(Some(0xA), Some(0xB), Some(0xA)).unwrap_err();
+        assert_eq!(e.precondition_kind(), Some(PreconditionKind::Device), "{e}");
+        assert!(e.to_string().contains("x_ptr") && e.to_string().contains("another CUDA context"), "{e}");
+        let e = call(Some(0xA), Some(0xA), Some(0xB)).unwrap_err();
+        assert!(e.to_string().contains("y_ptr"), "{e}");
+        // memory with no context of its own (a region the host vouched for), and a kernel with none (a made-up device), are not checked
+        assert!(call(Some(0xA), None, None).is_ok());
+        assert!(call(None, Some(0xB), Some(0xC)).is_ok());
+        assert!(
+            plan.prepare(&[arg(&SHAPE, 0x7000_0000_0000, Some(1)), arg(&SHAPE, 0x7000_1000_0000, Some(2))], None)
+                .is_ok()
+        );
+    }
 }

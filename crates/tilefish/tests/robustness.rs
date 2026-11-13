@@ -142,8 +142,10 @@ fn a_damaged_expression_is_an_error_never_a_panic() {
                     let shape = [4096usize];
                     // SAFETY: the address is never dereferenced.
                     let ptr = unsafe { tilefish::DevicePtr::from_raw(0x1000, 8192, 0) };
-                    let a = tilefish::TensorArg::new(ptr, &shape, tilefish::DType::Bf16).unwrap();
-                    let _ = plan.prepare(&[a, a], None);
+                    let arg = || {
+                        tilefish::TensorArg::new(ptr, &shape, tilefish::DType::Bf16, tilefish::Access::InOut).unwrap()
+                    };
+                    let _ = plan.prepare(&[arg(), arg()], None);
                 }
             }
         });

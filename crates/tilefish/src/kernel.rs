@@ -149,9 +149,14 @@ impl Kernel {
     ///
     /// The stream must be a stream of the context the kernel was loaded in (checked, with cudarc's own comparison of contexts); that
     /// context is made current on this thread, as cudarc does for its own calls. The launch is asynchronous, as any launch is: `stream`
-    /// orders it with the host's other work. `stream` may be capturing a CUDA graph: the call is captured like any kernel node. For a
-    /// raw handle that cudarc does not own, see [`Kernel::launch_raw`].
-    pub fn launch(&self, stream: &CudaStream, tensors: &[TensorArg<'_>]) -> Result<()> {
+    /// orders it with the host's other work. A tensor made of a cudarc slice is handed to cudarc's launch builder on `stream`, so
+    /// cudarc orders the launch against every other use of the slice, whatever stream that was on, and a free of the slice
+    /// waits for it. A tensor made of a region the host vouched for is not tracked by anything: that is the host's. `tensors` are
+    /// used by the call (a written slice is borrowed exclusively), and `stream` may be capturing a CUDA graph: the call is captured
+    /// like any kernel node (cudarc's event tracking of its own slices is not meant for capture; see its
+    /// `CudaContext::disable_event_tracking`, or capture with tensors made of regions). For a raw handle that cudarc does not own,
+    /// see [`Kernel::launch_raw`].
+    pub fn launch(&self, stream: &CudaStream, tensors: &mut [TensorArg<'_>]) -> Result<()> {
         if **stream.context() != *self.loaded.context {
             return Err(Error::Launch(format!(
                 "the stream is in another CUDA context than the one '{}' was loaded in: launch it on a stream of that context",
@@ -159,14 +164,7 @@ impl Kernel {
             )));
         }
         let prepared = self.check(tensors)?;
-        ffi::enqueue(
-            &self.loaded.function,
-            stream,
-            prepared.grid,
-            self.plan.block(),
-            self.plan.shared(),
-            prepared.params(),
-        )
+        ffi::enqueue(&self.loaded.function, stream, &prepared, self.plan.block(), self.plan.shared(), tensors)
     }
 }
 
@@ -232,7 +230,7 @@ impl Manifest {
             loaded: Arc::new(Loaded {
                 function,
                 context: Arc::clone(ctx),
-                device: DeviceInfo { ordinal: ctx.ordinal() as i32, max_grid },
+                device: DeviceInfo { ordinal: ctx.ordinal() as i32, context: Some(ctx.cu_ctx() as usize), max_grid },
                 stem: entry.stem.clone(),
                 arch: entry.arch.clone(),
             }),
