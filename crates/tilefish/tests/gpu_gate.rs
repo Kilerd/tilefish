@@ -53,13 +53,15 @@ fn manifest() -> Manifest {
 }
 
 struct Gpu {
+    ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
 }
 
 impl Gpu {
     fn new() -> Self {
         let ctx = CudaContext::new(0).expect("a CUDA context on device 0");
-        Self { stream: ctx.new_stream().expect("a stream") }
+        let stream = ctx.new_stream().expect("a stream");
+        Self { ctx, stream }
     }
 
     fn upload(&self, bytes: &[u8]) -> Buf {
@@ -124,36 +126,40 @@ fn launch(gpu: &Gpu, manifest: &Manifest, launcher: &str, bufs: &mut [Buf]) -> R
     use generated::*;
     let s: &CudaStream = &gpu.stream;
     match (launcher, bufs) {
-        ("Softmax", [x, o]) => Softmax::load(manifest)?.launch(s, r::<F32>(x, s)?, m::<F32>(o, s)?),
-        ("Layernorm", [x, w, b, o]) => {
-            Layernorm::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, r::<Bf16>(b, s)?, m::<Bf16>(o, s)?)
-        }
-        ("ResidualAddRmsnorm", [x, res, w, o]) => ResidualAddRmsnorm::load(manifest)?.launch(
+        ("Softmax", [x, o]) => Softmax::load(manifest, &gpu.ctx)?.launch(s, r::<F32>(x, s)?, m::<F32>(o, s)?),
+        ("Layernorm", [x, w, b, o]) => Layernorm::load(manifest, &gpu.ctx)?.launch(
+            s,
+            r::<Bf16>(x, s)?,
+            r::<Bf16>(w, s)?,
+            r::<Bf16>(b, s)?,
+            m::<Bf16>(o, s)?,
+        ),
+        ("ResidualAddRmsnorm", [x, res, w, o]) => ResidualAddRmsnorm::load(manifest, &gpu.ctx)?.launch(
             s,
             r::<Bf16>(x, s)?,
             m::<F32>(res, s)?,
             r::<Bf16>(w, s)?,
             m::<Bf16>(o, s)?,
         ),
-        ("GeluExact", [x, o]) => GeluExact::load(manifest)?.launch(s, r::<Bf16>(x, s)?, m::<Bf16>(o, s)?),
+        ("GeluExact", [x, o]) => GeluExact::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(x, s)?, m::<Bf16>(o, s)?),
         ("Swiglu", [g, u, o]) => {
-            Swiglu::load(manifest)?.launch(s, r::<Bf16>(g, s)?, r::<Bf16>(u, s)?, m::<Bf16>(o, s)?)
+            Swiglu::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(g, s)?, r::<Bf16>(u, s)?, m::<Bf16>(o, s)?)
         }
         ("BucketedRmsDb96", [x, w, o]) => {
-            BucketedRmsDb96::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
+            BucketedRmsDb96::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
         }
         ("BucketedRmsDb512", [x, w, o]) => {
-            BucketedRmsDb512::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
+            BucketedRmsDb512::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
         }
         ("BucketedRmsDb1000", [x, w, o]) => {
-            BucketedRmsDb1000::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
+            BucketedRmsDb1000::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(o, s)?)
         }
         ("Rmsnorm", [x, w, y]) => {
-            Rmsnorm::load(manifest)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(y, s)?)
+            Rmsnorm::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(x, s)?, r::<Bf16>(w, s)?, m::<Bf16>(y, s)?)
         }
-        ("GeluErf", [x, y]) => GeluErf::load(manifest)?.launch(s, r::<Bf16>(x, s)?, m::<Bf16>(y, s)?),
-        ("Axpy", [x, y]) => Axpy::load(manifest)?.launch(s, r::<F32>(x, s)?, m::<F32>(y, s)?),
-        ("Mm", [a, b, c]) => Mm::load(manifest)?.launch(s, r::<F16>(a, s)?, r::<F16>(b, s)?, m::<F32>(c, s)?),
+        ("GeluErf", [x, y]) => GeluErf::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(x, s)?, m::<Bf16>(y, s)?),
+        ("Axpy", [x, y]) => Axpy::load(manifest, &gpu.ctx)?.launch(s, r::<F32>(x, s)?, m::<F32>(y, s)?),
+        ("Mm", [a, b, c]) => Mm::load(manifest, &gpu.ctx)?.launch(s, r::<F16>(a, s)?, r::<F16>(b, s)?, m::<F32>(c, s)?),
         (other, bufs) => panic!("the gate does not know the launcher {other} with {} tensors", bufs.len()),
     }
 }
@@ -205,6 +211,19 @@ fn byte_identity() {
     let (gpu, manifest) = (Gpu::new(), manifest());
     let ran = run_cases(&gpu, &manifest, "rust");
     println!("rust gate: launched {ran} cases through the generated launchers");
+    assert_no_nvrtc();
+}
+
+/// Loading a cubin goes through cudarc's `load_module`, which is behind its `nvrtc` feature: with `dynamic-loading` the NVRTC library
+/// must still not be opened, since nothing here compiles anything. (On Linux, where the libraries a process has mapped are listed.)
+fn assert_no_nvrtc() {
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        let nvrtc: Vec<&str> = maps.lines().filter(|l| l.contains("nvrtc")).collect();
+        assert!(nvrtc.is_empty(), "libnvrtc is mapped in this process: {nvrtc:?}");
+        let cuda = maps.lines().filter(|l| l.contains("libcuda")).count();
+        assert!(cuda > 0, "the driver (libcuda) is expected to be mapped after a launch");
+        println!("rust gate: libcuda is mapped, libnvrtc is not (after the launches)");
+    }
 }
 
 /// The same cases, with the manifest and the cubins that the generated module embeds with `include_bytes!`.
@@ -223,14 +242,14 @@ fn byte_identity_of_the_embedded_manifest() {
 #[test]
 fn a_kernel_with_more_than_48_kib_of_dynamic_shared_memory_is_in_the_gate() {
     let (gpu, manifest) = (Gpu::new(), manifest());
-    let arch = Arch::current().unwrap();
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
     let entry = manifest.entry("mm", &arch.to_string()).expect("the gate's manifest has mm");
     assert!(
         entry.shared > 48 * 1024,
         "mm needs more than 48 KiB of dynamic shared memory for this to test the opt-in: {}",
         entry.shared
     );
-    let _ = generated::Mm::load(&manifest).expect("it loads: the opt-in is within the device's maximum");
+    let _ = generated::Mm::load(&manifest, &gpu.ctx).expect("it loads: the opt-in is within the device's maximum");
     assert!(cases()["cases"].as_array().unwrap().iter().any(|c| c["launcher"] == "Mm"));
     drop(gpu);
     println!("rust gate: mm needs {} bytes of dynamic shared memory", entry.shared);
@@ -277,7 +296,7 @@ fn refusals() {
     let shifted = unsafe { gpu.region(&x, x.nbytes()) }.offset(8).unwrap();
     let xs = [4096usize];
     let misaligned = TensorRef::<Bf16>::new(shifted, &xs).unwrap();
-    let launcher = generated::GeluErf::load(&manifest).unwrap();
+    let launcher = generated::GeluErf::load(&manifest, &gpu.ctx).unwrap();
     let e = launcher.launch(s, misaligned, m::<Bf16>(&mut y, s).unwrap()).unwrap_err();
     check(
         "a misaligned pointer",
@@ -289,7 +308,7 @@ fn refusals() {
     let mut rows = gpu.zeros(3 * 2000 * 2).shaped(&[3, 2000]);
     let w = gpu.zeros(2000 * 2).shaped(&[2000]);
     let x2 = gpu.zeros(3 * 2000 * 2).shaped(&[3, 2000]);
-    let e = generated::Rmsnorm::load(&manifest)
+    let e = generated::Rmsnorm::load(&manifest, &gpu.ctx)
         .unwrap()
         .launch(s, r::<Bf16>(&x2, s).unwrap(), r::<Bf16>(&w, s).unwrap(), m::<Bf16>(&mut rows, s).unwrap())
         .unwrap_err();
@@ -301,7 +320,7 @@ fn refusals() {
         gpu.zeros(100 * 2).shaped(&[100]),
         gpu.zeros(3 * 100 * 2).shaped(&[3, 100]),
     );
-    let e = generated::BucketedRmsDb96::load(&manifest)
+    let e = generated::BucketedRmsDb96::load(&manifest, &gpu.ctx)
         .unwrap()
         .launch(s, r::<Bf16>(&x, s).unwrap(), r::<Bf16>(&w, s).unwrap(), m::<Bf16>(&mut o, s).unwrap())
         .unwrap_err();
@@ -319,7 +338,7 @@ fn refusals() {
             DevicePtr::from_raw((1 << 36) + a.slice.device_ptr(s).0, 8_800_000_000, 0),
         )
     };
-    let e = generated::Softmax::load(&manifest)
+    let e = generated::Softmax::load(&manifest, &gpu.ctx)
         .unwrap()
         .launch(s, TensorRef::<F32>::new(ra, &big).unwrap(), TensorMut::<F32>::new(rb, &big).unwrap())
         .unwrap_err();
@@ -329,7 +348,7 @@ fn refusals() {
     // a runtime dimension that is not a multiple of 16, and a written tensor that aliases another
     let a = gpu.zeros(64 * 2).shaped(&[60]);
     let mut b = gpu.zeros(64 * 2).shaped(&[60]);
-    let e = generated::GeluErf::load(&manifest)
+    let e = generated::GeluErf::load(&manifest, &gpu.ctx)
         .unwrap()
         .launch(s, r::<Bf16>(&a, s).unwrap(), m::<Bf16>(&mut b, s).unwrap())
         .unwrap_err();
@@ -338,7 +357,7 @@ fn refusals() {
     // SAFETY: two tensors over one buffer is the point of the test (it is refused as an alias before any launch); the buffer outlives it.
     let same = unsafe { gpu.region(&a, a.nbytes()) };
     let sh = [4096usize];
-    let e = generated::Axpy::load(&manifest)
+    let e = generated::Axpy::load(&manifest, &gpu.ctx)
         .unwrap()
         .launch(s, TensorRef::<F32>::new(same, &sh).unwrap(), m::<F32>(&mut a, s).unwrap())
         .unwrap_err();
@@ -350,7 +369,7 @@ fn refusals() {
         gpu.zeros(64 * 128 * 2).shaped(&[64, 128]),
         gpu.zeros(100 * 128 * 4).shaped(&[100, 128]),
     );
-    let e = generated::Mm::load(&manifest)
+    let e = generated::Mm::load(&manifest, &gpu.ctx)
         .unwrap()
         .launch(s, r::<F16>(&a, s).unwrap(), r::<F16>(&b, s).unwrap(), m::<F32>(&mut c, s).unwrap())
         .unwrap_err();
@@ -364,7 +383,7 @@ fn refusals() {
         gpu.zeros(128 * 128 * 2).shaped(&[128, 128]),
         gpu.zeros(128 * 128 * 4).shaped(&[128, 128]),
     );
-    let e = generated::Mm::load(&manifest)
+    let e = generated::Mm::load(&manifest, &gpu.ctx)
         .unwrap()
         .launch(s, r::<F16>(&a, s).unwrap(), r::<F16>(&b, s).unwrap(), m::<F32>(&mut c, s).unwrap())
         .unwrap_err();
@@ -402,24 +421,24 @@ fn refusals() {
     // a manifest of another architecture only: sm_120 on this device
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sm_120");
     let other = Manifest::load(&fixtures, Pin::TrustDirectory).unwrap();
-    let here = Arch::current().unwrap();
+    let here = Arch::of_context(&gpu.ctx).unwrap();
     assert_ne!(here, Arch::sm(120), "the refusal test needs a device that is not an sm_120");
-    let e = other.kernel("softmax", &[], here).unwrap_err();
+    let e = other.kernel(&gpu.ctx, "softmax", &[], here).unwrap_err();
     check(
         "an sm_120-only manifest on this device",
         matches!(&e, Error::NoBinary(m) if m.contains(&format!("no binary for 'softmax' on {here}")) && m.contains("sm_120")),
     );
     // ... and a launcher typed from one manifest refuses another, whatever it holds
-    let e = generated::Softmax::load(&other).unwrap_err();
+    let e = generated::Softmax::load(&other, &gpu.ctx).unwrap_err();
     check("a launcher refuses a manifest it was not generated from", matches!(e, Error::PinMismatch { .. }));
     // a manifest that has the kernel, but not for this architecture, asked for explicitly
-    let e = manifest.kernel("softmax", &[], Arch::sm(120)).unwrap_err();
+    let e = manifest.kernel(&gpu.ctx, "softmax", &[], Arch::sm(120)).unwrap_err();
     check("an explicit architecture the manifest does not have", matches!(e, Error::NoBinary(_)));
     // an architecture that is not the device's
-    let e = other.kernel("softmax", &[], Arch::sm(120)).unwrap_err();
+    let e = other.kernel(&gpu.ctx, "softmax", &[], Arch::sm(120)).unwrap_err();
     check(
         "an architecture that is not the current device's",
-        matches!(&e, Error::Unsupported(m) if m.contains("current CUDA device")),
+        matches!(&e, Error::Unsupported(m) if m.contains("of the context")),
     );
     println!("rust gate: {refused} refusals checked");
 }
@@ -435,7 +454,7 @@ fn graph_capture() {
     let ((x_name, x), (y_name, mut y)) = (tensors.next().unwrap(), tensors.next().unwrap());
     assert_eq!((x_name.as_str(), y_name.as_str()), ("x_ptr", "y_ptr"));
     let expect = read(&gate_dir().join(case["tensors"][1]["expect"].as_str().unwrap()));
-    let launcher = generated::GeluErf::load(&manifest).unwrap(); // loads the module: not allowed during capture
+    let launcher = generated::GeluErf::load(&manifest, &gpu.ctx).unwrap(); // loads the module: not allowed during capture
     gpu.stream.synchronize().unwrap();
     let stream = gpu.stream.cu_stream();
 

@@ -9,9 +9,11 @@ keywords = ["gpu", "cuda", "dsl", "tensor", "quantization"]
 categories = ["compilers", "science"]
 
 [dependencies]
-# The CUDA driver API only, loaded at run time (`dynamic-loading`): the crate builds and its tests run on a machine
-# without CUDA, and a launch on one reports `Error::NoDriver`. The `cuda-*` feature of cudarc picks the bindings.
-cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading"] }
+# cudarc's safe layer over the CUDA driver API (contexts, modules, functions, streams, the launch builder), loaded at run
+# time (`dynamic-loading`): the crate builds and its tests run on a machine without CUDA. `nvrtc` is there for
+# `CudaContext::load_module` (a cubin is loaded with `Ptx::from_binary`); with `dynamic-loading` the NVRTC library is opened
+# only when a function of it is called, which this crate never does. The `cuda-*` feature of cudarc picks the bindings.
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "nvrtc"] }
 ryu = "1.0.23"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }

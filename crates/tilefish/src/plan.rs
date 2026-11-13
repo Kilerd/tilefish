@@ -18,9 +18,11 @@
 
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Expr, MAX_DIMS, Pattern, Solved, Symbols, Unsolvable, parse_grid};
-use crate::ffi::MAX_PARAMS;
 use crate::manifest::{Access, Entry, ParamKind, Precondition, ShapeDim};
 use crate::tensor::{DType, TensorArg};
+
+/// The widest `kernelParams` array: the arguments of a kernel plus its two scratch slots.
+pub(crate) const MAX_PARAMS: usize = 64;
 
 /// The device a launch is checked against: its ordinal, and the largest grid it takes along each axis
 /// (`CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X/Y/Z`).

@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 use cudarc::driver::{CudaStream, SyncOnDrop};
 
 use crate::error::{Error, Result};
-use crate::ffi::{self, DevicePtr};
+use crate::region::{self, DevicePtr};
 
 /// An element type a binary can be given (the dtypes of Python's `TORCH_DTYPE_NAMES`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -254,7 +254,7 @@ impl<'a, T: Element> TensorRef<'a, T> {
         stream: &'a CudaStream,
         shape: &'a [usize],
     ) -> Result<Self> {
-        let (ptr, guard) = ffi::region_of(slice, stream);
+        let (ptr, guard) = region::region_of(slice, stream);
         let mut tensor = Self::new(ptr, shape)?;
         tensor._guard = Some(guard);
         Ok(tensor)
@@ -269,7 +269,7 @@ impl<'a, T: Element> TensorMut<'a, T> {
         stream: &'a CudaStream,
         shape: &'a [usize],
     ) -> Result<Self> {
-        let (ptr, guard) = ffi::region_of_mut(slice, stream);
+        let (ptr, guard) = region::region_of_mut(slice, stream);
         let mut tensor = Self::new(ptr, shape)?;
         tensor._guard = Some(guard);
         Ok(tensor)

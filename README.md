@@ -259,11 +259,12 @@ host of a manifest directory, without Python or Triton: it reads the manifest as
 strict JSON, recomputes the digests exactly as Python does (the `sha256` of each
 cubin, the `sha256_code` of its machine code, and the digest of the whole
 manifest) and refuses a directory whose digest is not the pin it is given
-(`Pin::Digest`; `Pin::TrustDirectory` is explicit). It then loads a cubin with
-`cuModuleLoadData` and launches on a cudarc `CudaStream` (`Kernel::launch`, safe:
-the stream is checked to be of the kernel's context) or, with the `unsafe`
-`Kernel::launch_raw`, on a raw `CUstream`, which also works inside a CUDA graph
-capture.
+(`Pin::Digest`; `Pin::TrustDirectory` is explicit). It builds on cudarc's safe
+layer and calls the driver directly nowhere: `Manifest::kernel(&ctx, ...)` loads a
+cubin into a `CudaContext` that the kernel then keeps alive, and the kernel
+launches on a cudarc `CudaStream` (`Kernel::launch`, safe: the stream is checked
+to be of the kernel's context) or, with the `unsafe` `Kernel::launch_raw`, on a
+raw `CUstream`, which also works inside a CUDA graph capture.
 
 A manifest (schema 2) carries what a host needs to check a launch on its own:
 every pointer parameter records its declared shape, with static axes as sizes

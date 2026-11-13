@@ -1,13 +1,15 @@
-//! Loading a binary into the CUDA driver and launching it.
+//! Loading a binary into a CUDA context and launching it, through cudarc's safe layer.
 //!
-//! What Python's `_cuda.py` does through `cuda-python`, through `cudarc`'s driver bindings: `cuModuleLoadData` on the
-//! verified bytes in memory, `cuModuleGetFunction` on the manifest's symbol, `cuFuncSetAttribute` for dynamic shared
-//! memory above the default 48 KiB, and `cuLaunchKernel` with `kernelParams` laid out as the ABI says (the arguments in
-//! declaration order, a pointer as 64 bits and an `i32` as 32, then two null 64-bit scratch pointers).
+//! What Python's `_cuda.py` does through `cuda-python`: load the verified cubin bytes into a context
+//! (`CudaContext::load_module(Ptx::from_binary(..))`), get the manifest's symbol (`CudaModule::load_function`), opt in to dynamic
+//! shared memory above the default 48 KiB (`CudaFunction::set_attribute`), and launch with `kernelParams` laid out as the ABI says (the
+//! arguments in declaration order, a pointer as 64 bits and an `i32` as 32, then two null 64-bit scratch pointers).
 //!
-//! A load is checked against the device like Python's: the function's static shared memory (as the driver reports it)
-//! plus the manifest's dynamic shared memory must fit the device's opt-in maximum per block, and the loaded function must
-//! take the parameters the ABI says. A launch is checked by [`Plan::prepare`], and then against the device's maximum grid.
+//! A kernel belongs to the context it was loaded in, which is passed explicitly ([`Manifest::kernel`] takes an
+//! `&Arc<CudaContext>`) and kept alive by the kernel, with the module and the function: nothing relies on which context is current on
+//! a thread. A load is checked against the device like Python's: the function's static shared memory (as the driver reports it) plus
+//! the manifest's dynamic shared memory must fit the device's opt-in maximum per block. A launch is checked by [`Plan::prepare`],
+//! and then against the device's maximum grid.
 //!
 //! A launch goes on the stream the caller gives (cudarc's `CudaStream`, checked to be of the kernel's context; or, for a handle that
 //! nothing owns, `unsafe` [`Kernel::launch_raw`]), so it also works inside a CUDA graph capture: the driver copies `kernelParams`
@@ -16,12 +18,16 @@
 use std::fmt;
 use std::sync::{Arc, Weak};
 
-pub use cudarc::driver::CudaStream;
+use cudarc::driver::CudaFunction;
+use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute};
+use cudarc::nvrtc::Ptx;
+
 pub use cudarc::driver::sys::CUstream;
+pub use cudarc::driver::{CudaContext, CudaStream};
 
 use crate::error::{Error, Result};
 use crate::ffi;
-use crate::manifest::{Manifest, ParamKind};
+use crate::manifest::Manifest;
 use crate::plan::{DeviceInfo, Plan, Prepared};
 use crate::tensor::TensorArg;
 
@@ -47,15 +53,11 @@ impl Arch {
         }
     }
 
-    /// The compute capability of the device with this ordinal.
-    pub fn of_device(ordinal: i32) -> Result<Self> {
-        let (major, minor) = ffi::compute_capability(ordinal)?;
+    /// The compute capability of the device of `ctx` (the one a binary is loaded for).
+    pub fn of_context(ctx: &CudaContext) -> Result<Self> {
+        let (major, minor) =
+            ctx.compute_capability().map_err(Error::driver("cuDeviceGetAttribute(COMPUTE_CAPABILITY)"))?;
         Ok(Self((major * 10 + minor) as u32))
-    }
-
-    /// The compute capability of the device that is current on this thread (the one a binary is loaded for).
-    pub fn current() -> Result<Self> {
-        Self::of_device(ffi::current()?.ordinal)
     }
 
     /// `major * 10 + minor`.
@@ -71,11 +73,10 @@ impl fmt::Display for Arch {
 }
 
 struct Loaded {
-    // the function first: it is gone before the module is unloaded
-    function: ffi::Function,
-    _module: ffi::Module, // held for its Drop, which unloads the module
+    // the function first: it holds its module, which holds the context, and is gone before this struct's own handle on it
+    function: CudaFunction,
+    context: Arc<CudaContext>,
     device: DeviceInfo,
-    context: usize,
     stem: String,
     arch: String,
 }
@@ -98,8 +99,8 @@ pub(crate) struct Cached {
     plan: Arc<Plan>,
 }
 
-/// A binary of a manifest, loaded on a device and ready to launch. Cheap to clone; it can be shared between threads
-/// (each thread that launches needs the kernel's CUDA context to be current).
+/// A binary of a manifest, loaded in a context and ready to launch. Cheap to clone; it can be shared between threads. It keeps
+/// its context, its module and its function alive.
 #[derive(Debug, Clone)]
 pub struct Kernel {
     loaded: Arc<Loaded>,
@@ -122,9 +123,18 @@ impl Kernel {
         self.loaded.device.ordinal
     }
 
+    /// The context the kernel was loaded in: a launch is on a stream of this context.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.loaded.context
+    }
+
     /// What a call is checked against.
     pub fn plan(&self) -> &Plan {
         &self.plan
+    }
+
+    pub(crate) fn function(&self) -> &CudaFunction {
+        &self.loaded.function
     }
 
     /// Check a call without launching it: every precondition of the manifest, and the grid against the device's limits.
@@ -137,100 +147,92 @@ impl Kernel {
 
     /// Check the call and launch the kernel on `stream`.
     ///
-    /// The stream must be a stream of the context the kernel was loaded in (checked); that context is made current on this thread,
-    /// as cudarc does for its own calls. The launch is asynchronous, as any launch is: `stream` orders it with the host's other work.
-    /// `stream` may be capturing a CUDA graph: the call is captured like any kernel node. For a raw handle that cudarc does not
-    /// own, see [`Kernel::launch_raw`].
+    /// The stream must be a stream of the context the kernel was loaded in (checked, with cudarc's own comparison of contexts); that
+    /// context is made current on this thread, as cudarc does for its own calls. The launch is asynchronous, as any launch is: `stream`
+    /// orders it with the host's other work. `stream` may be capturing a CUDA graph: the call is captured like any kernel node. For a
+    /// raw handle that cudarc does not own, see [`Kernel::launch_raw`].
     pub fn launch(&self, stream: &CudaStream, tensors: &[TensorArg<'_>]) -> Result<()> {
-        if stream.context().cu_ctx() as usize != self.loaded.context {
+        if **stream.context() != *self.loaded.context {
             return Err(Error::Launch(format!(
                 "the stream is in another CUDA context than the one '{}' was loaded in: launch it on a stream of that context",
                 self.loaded.stem
             )));
         }
-        stream
-            .context()
-            .bind_to_thread()
-            .map_err(|e| Error::Launch(format!("cannot make the context of the stream current: {e}")))?;
-        self.launch_on(stream.cu_stream(), tensors)
-    }
-
-    /// The context the kernel was loaded in, as an address.
-    pub(crate) fn context(&self) -> usize {
-        self.loaded.context
-    }
-
-    /// Check the call and launch on `stream`, which the caller has vouched for.
-    pub(crate) fn launch_on(&self, stream: CUstream, tensors: &[TensorArg<'_>]) -> Result<()> {
-        let mut prepared = self.check(tensors)?;
-        let (block, shared) = (self.plan.block(), self.plan.shared());
-        self.loaded.function.launch(prepared.grid, block, shared, stream, &mut prepared.values, prepared.count)
+        let prepared = self.check(tensors)?;
+        ffi::enqueue(
+            &self.loaded.function,
+            stream,
+            prepared.grid,
+            self.plan.block(),
+            self.plan.shared(),
+            prepared.params(),
+        )
     }
 }
 
 impl Manifest {
     /// The binary for `name` (a stem such as `rowop.S32`, or an operator) with exactly these bucket values, for `arch`,
-    /// loaded in the CUDA context that is current on this thread.
+    /// loaded in `ctx`.
     ///
     /// Bucket semantics are exact: the bucket values name the binary, there is no padding and no rounding up. `arch` is
-    /// the compute capability of the device (`Arch::current()?`); a manifest that has no binary for it is refused, as is
-    /// an `arch` that is not the current device's. The module is loaded once per context and shared by later calls.
-    pub fn kernel(&self, name: &str, buckets: &[(&str, u64)], arch: Arch) -> Result<Kernel> {
+    /// the compute capability of the device of `ctx` (`Arch::of_context(&ctx)?`); a manifest that has no binary for it is refused,
+    /// as is an `arch` that is not the device's. The module is loaded once per context and shared by later calls, and the kernel
+    /// keeps `ctx` alive.
+    pub fn kernel(&self, ctx: &Arc<CudaContext>, name: &str, buckets: &[(&str, u64)], arch: Arch) -> Result<Kernel> {
         let index = self.select(name, buckets, &arch.to_string())?;
         let entry = &self.entries[index];
         let plan = Plan::new(entry)?;
-        let current = ffi::current()?;
-        let device_arch = Arch::of_device(current.ordinal)?;
+        let device_arch = Arch::of_context(ctx)?;
         if device_arch != arch {
             return Err(Error::Unsupported(format!(
-                "'{}' is asked for {arch}, but the current CUDA device {} is {device_arch}",
-                entry.stem, current.ordinal
+                "'{}' is asked for {arch}, but the CUDA device {} of the context is {device_arch}",
+                entry.stem,
+                ctx.ordinal()
             )));
         }
-        let key = (index, current.context);
+        let key = (index, ctx.cu_ctx() as usize);
         let mut cache = self.kernels.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cached) = cache.get(&key)
             && let Some(loaded) = cached.loaded.upgrade()
         {
             return Ok(Kernel { loaded, plan: Arc::clone(&cached.plan) });
         }
-        let limits = ffi::limits(current.ordinal)?;
-        let module = ffi::Module::load(&entry.cubin, current.context)?;
-        let function = module.function(&entry.symbol)?;
-        let static_shared = function.static_shared()?;
+        let attribute =
+            |a: CUdevice_attribute, call: &'static str| ctx.attribute(a).map(i64::from).map_err(Error::driver(call));
+        let max_grid = [
+            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, "cuDeviceGetAttribute(MAX_GRID_DIM_X)")?,
+            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y, "cuDeviceGetAttribute(MAX_GRID_DIM_Y)")?,
+            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z, "cuDeviceGetAttribute(MAX_GRID_DIM_Z)")?,
+        ];
+        let shared_optin = attribute(
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+            "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
+        )?;
+        if entry.symbol.contains('\0') {
+            return Err(Error::Unsupported(format!("the symbol {:?} has a NUL byte", entry.symbol)));
+        }
+        let module =
+            ctx.load_module(Ptx::from_binary(entry.cubin.to_vec())).map_err(Error::driver("cuModuleLoadData"))?;
+        let function = module.load_function(&entry.symbol).map_err(Error::driver("cuModuleGetFunction"))?;
+        let static_shared =
+            i64::from(function.shared_size_bytes().map_err(Error::driver("cuFuncGetAttribute(SHARED_SIZE_BYTES)"))?);
         let who = format!("'{}' ({})", entry.stem, entry.arch);
-        if static_shared + i64::from(entry.shared) > limits.shared_optin {
+        if static_shared + i64::from(entry.shared) > shared_optin {
             return Err(Error::Unsupported(format!(
-                "{who} needs {static_shared} bytes of static and {} bytes of dynamic shared memory, more than the {} bytes a block may use on this device",
-                entry.shared, limits.shared_optin
+                "{who} needs {static_shared} bytes of static and {} bytes of dynamic shared memory, more than the {shared_optin} bytes a block may use on this device",
+                entry.shared
             )));
         }
         if entry.shared > DEFAULT_SHARED_LIMIT {
-            function.set_max_dynamic_shared(
-                i32::try_from(entry.shared)
-                    .map_err(|_| Error::Unsupported(format!("{who}: too much shared memory")))?,
-            )?;
-        }
-        if let Some(sizes) = function.param_sizes()? {
-            let want: Vec<usize> = entry
-                .params
-                .iter()
-                .map(|p| if matches!(p.kind, ParamKind::Pointer { .. }) { 8 } else { 4 })
-                .chain([8, 8])
-                .collect();
-            if sizes != want {
-                return Err(Error::Unsupported(format!(
-                    "the loaded function '{}' takes parameters of {sizes:?} bytes, but the ABI in the manifest says {want:?}",
-                    entry.symbol
-                )));
-            }
+            let bytes = i32::try_from(entry.shared)
+                .map_err(|_| Error::Unsupported(format!("{who}: too much shared memory")))?;
+            set_max_dynamic_shared(ctx, &function, bytes)?;
         }
         let kernel = Kernel {
             loaded: Arc::new(Loaded {
                 function,
-                _module: module,
-                device: DeviceInfo { ordinal: current.ordinal, max_grid: limits.grid },
-                context: current.context,
+                context: Arc::clone(ctx),
+                device: DeviceInfo { ordinal: ctx.ordinal() as i32, max_grid },
                 stem: entry.stem.clone(),
                 arch: entry.arch.clone(),
             }),
@@ -246,4 +248,14 @@ impl Manifest {
         let index = self.select(name, buckets, &arch.to_string())?;
         Plan::new(&self.entries[index])
     }
+}
+
+/// Allow `bytes` of dynamic shared memory (needed above the default 48 KiB) for `function`, which is in `ctx`.
+fn set_max_dynamic_shared(ctx: &CudaContext, function: &CudaFunction, bytes: i32) -> Result<()> {
+    let call = "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)";
+    // cudarc's `set_attribute` does not bind the context, as its `get_attribute` does
+    ctx.bind_to_thread().map_err(Error::driver(call))?;
+    function
+        .set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes)
+        .map_err(Error::driver(call))
 }

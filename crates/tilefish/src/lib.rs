@@ -15,10 +15,10 @@
 //! //    directory's own digests, which whoever can write the directory can rewrite.
 //! let manifest = Manifest::load("build/", Pin::Digest("<the digest `tilefish.runtime.export` returned>"))?;
 //!
-//! // 2. Load the binary for the current device. (A CUDA context must be current: cudarc's `CudaContext::new` binds one.)
+//! // 2. Load the binary for the device of a context, which the kernel then keeps alive.
 //! let ctx = CudaContext::new(0)?;
 //! let stream = ctx.new_stream()?;
-//! let kernel = manifest.kernel("gelu_erf", &[], Arch::current()?)?;
+//! let kernel = manifest.kernel(&ctx, "gelu_erf", &[], Arch::of_context(&ctx)?)?;
 //!
 //! // 3. Launch on a stream of that context. Every precondition of the binary is checked first. The tensors are made of cudarc
 //! //    slices, whose length is known: no `unsafe`, and a shape that does not fit its slice is an error, not a launch.
@@ -49,7 +49,10 @@
 //!
 //! # `unsafe`
 //!
-//! The driver calls are in one module that is not part of the public API, and the host takes on obligations in exactly two places:
+//! The CUDA driver is cudarc's safe layer (contexts, modules, functions, attributes, streams, the launch builder), with no call to
+//! `cudarc::driver::sys` in this crate. A kernel holds the context it was loaded in ([`Manifest::kernel`] takes an
+//! `&Arc<CudaContext>`), and so keeps it, its module and its function alive. The host takes on obligations in exactly two places
+//! (and the five items of `src/region.rs` and `src/ffi.rs`, the only ones with `unsafe`, each say why they are sound):
 //!
 //! * [`DevicePtr::from_raw`] (`unsafe`): the host vouches for a region of device memory, by address, byte length and device: that it
 //!   is allocated there, and stays allocated (and is not raced on) until every launch that was given a tensor made of it has completed.
@@ -62,6 +65,7 @@
 //! Everything else is safe: a launch is checked against the manifest (shapes, dtypes, alignment, aliasing, buckets, grid) before it
 //! reaches the driver, and nothing is launched when a check fails.
 
+// `unsafe` is denied everywhere; the few items that need it (in `ffi`) allow it one by one, with the reason beside them.
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -69,21 +73,21 @@
 pub mod elf;
 mod error;
 mod expr;
-#[allow(unsafe_code)]
 mod ffi;
 pub mod json;
 mod kernel;
 mod manifest;
 mod plan;
+mod region;
 mod tensor;
 
 pub use cudarc;
 pub use error::{Error, PreconditionKind, Result};
-pub use ffi::DevicePtr;
-pub use kernel::{Arch, CUstream, CudaStream, Kernel};
+pub use kernel::{Arch, CUstream, CudaContext, CudaStream, Kernel};
 pub use manifest::{
     Access, Constexpr, Entry, LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin,
     Precondition, manifest_digest,
 };
 pub use plan::{DeviceInfo, Plan, Prepared};
+pub use region::DevicePtr;
 pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, TensorArg, TensorMut, TensorRef, U8};

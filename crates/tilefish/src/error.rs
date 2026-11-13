@@ -104,27 +104,26 @@ pub enum Error {
     /// the signature determines and the call also gives).
     #[error("{0}")]
     Launch(String),
-    /// A CUDA driver call failed.
-    #[error("CUDA driver call {call} failed: {name} ({code}){detail}")]
+    /// A CUDA driver call failed: cudarc's `DriverError`, which is the `CUresult` with the name and the text the driver gives it.
+    #[error("CUDA driver call {call} failed: {source}")]
     Driver {
-        /// The driver function.
+        /// What the host was doing when it failed (the driver function, or what it was for).
         call: &'static str,
-        /// `CUresult` as a number.
-        code: u32,
-        /// `CUDA_ERROR_...`, when the driver can name it.
-        name: String,
-        /// `": <text>"`, or empty.
-        detail: String,
+        /// The driver's error.
+        #[source]
+        source: cudarc::driver::DriverError,
     },
-    /// The CUDA driver library cannot be loaded (no NVIDIA driver on this machine).
-    #[error("the CUDA driver library (libcuda) cannot be loaded: this machine has no NVIDIA driver")]
-    NoDriver,
 }
 
 /// The result of an operation of this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
+    /// The error of a driver call, for `map_err`: `ctx.attribute(..).map_err(Error::driver("cuDeviceGetAttribute"))`.
+    pub(crate) fn driver(call: &'static str) -> impl FnOnce(cudarc::driver::DriverError) -> Self {
+        move |source| Self::Driver { call, source }
+    }
+
     pub(crate) fn manifest(message: impl Into<String>) -> Self {
         Self::Manifest(message.into())
     }
