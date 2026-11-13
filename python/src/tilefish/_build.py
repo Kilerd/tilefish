@@ -318,6 +318,8 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
             if a.strides is not None:  # a pointer that takes a strided view: base + offset * itemsize, and these strides
                 entry["strides"] = list(a.strides)
                 entry["offset"] = a.offset
+            if a.alias is not None:  # an out pointer that may be written over that in pointer: a launch takes the two as exactly one tensor
+                entry["alias"] = a.alias
         elif a.kind == "fixed":
             from .aot import _encode
 

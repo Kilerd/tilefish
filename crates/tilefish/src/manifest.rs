@@ -227,6 +227,9 @@ pub enum ParamKind {
         shape: Vec<ShapeDim>,
         /// The strides and the offset a view of the tensor may have (a pointer without it is a dense, row-major tensor).
         view: Option<View>,
+        /// An `out` pointer only: the `in` pointer it may be written over (`Out[..., MayAlias("r")]` in Python), the two given as exactly one
+        /// tensor (one address, shape and strides). Any other overlap of a written tensor is refused, as always.
+        alias: Option<String>,
     },
     /// A runtime integer: the value of a dimension expression, the element count of a pointer, or one stride of a strided pointer.
     Scalar {
@@ -762,6 +765,8 @@ struct RawParam {
     stride_of: Option<RawStrideOfs>,
     #[serde(default)]
     value: Option<Value>,
+    #[serde(default)]
+    alias: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1123,6 +1128,18 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                 {
                     return Err(format!("parameter {name} is not a well-formed 64-bit pointer"));
                 }
+                // an out pointer that may be written over an in pointer (checked against that pointer by `check_consistent`)
+                let alias = match &p.alias {
+                    None => None,
+                    Some(Value::String(a)) if access == Access::Out => Some(a.clone()),
+                    Some(Value::String(_)) => {
+                        return Err(format!(
+                            "arg {name}: only an out pointer may alias an input (it is {:?})",
+                            access.as_str()
+                        ));
+                    }
+                    Some(other) => return Err(format!("parameter {name}: alias must be a str, got {other}")),
+                };
                 let Some(shape) = &p.shape else {
                     return Err(format!("parameter {name} has no shape: a pointer records its declared shape"));
                 };
@@ -1173,7 +1190,14 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                     }
                     _ => return Err(format!("parameter {name}: strides and offset come together")),
                 };
-                ParamKind::Pointer { dtype: DType::from_name(dtype), dtype_name: dtype.to_owned(), access, shape, view }
+                ParamKind::Pointer {
+                    dtype: DType::from_name(dtype),
+                    dtype_name: dtype.to_owned(),
+                    access,
+                    shape,
+                    view,
+                    alias,
+                }
             }
             "scalar" => {
                 let (ty, ptx, size) = match p.ty.as_str() {
@@ -1195,6 +1219,7 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                     || p.strides.is_some()
                     || p.offset.is_some()
                     || p.value.is_some()
+                    || p.alias.is_some()
                 {
                     return Err(format!(
                         "parameter {name} is a scalar: it has a dim and no dtype, access, shape, strides or value"
@@ -1261,6 +1286,7 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                     || p.strides.is_some()
                     || p.offset.is_some()
                     || p.dtype.is_some()
+                    || p.alias.is_some()
                 {
                     return Err(format!("parameter {name} is a fixed argument: it has a value and no dim or shape"));
                 }
@@ -1563,8 +1589,45 @@ impl Entry {
         Ok(())
     }
 
+    /// An `out` pointer that may be written over an input (`alias`): the input is an `in` pointer, not strided and not a device scalar, of
+    /// the same dtype and declared shape, and no other `out` pointer names it (Python's `check_alias_target`).
+    fn check_aliases(&self) -> std::result::Result<(), String> {
+        let mut taken: HashMap<&str, &str> = HashMap::new();
+        for p in &self.params {
+            let ParamKind::Pointer { alias: Some(alias), dtype_name, shape, .. } = &p.kind else { continue };
+            if !is_ident(alias) {
+                return Err(format!("arg {}: alias must be the name of a pointer argument, got {alias:?}", p.name));
+            }
+            let Some(ParamKind::Pointer { access, dtype_name: target_dtype, shape: target_shape, view, .. }) =
+                self.param(alias).map(|t| &t.kind)
+            else {
+                return Err(format!("arg {} may alias '{alias}', which is not an `in` pointer argument", p.name));
+            };
+            if *access != Access::In {
+                return Err(format!("arg {} may alias '{alias}', which is not an `in` pointer argument", p.name));
+            }
+            if view.is_some() || target_shape.is_empty() {
+                return Err(format!(
+                    "arg {} may alias '{alias}', which is a strided view or a device scalar: an Out written over an input is that whole tensor",
+                    p.name
+                ));
+            }
+            if target_dtype != dtype_name || target_shape != shape {
+                return Err(format!("arg {} may alias '{alias}', which has another dtype or declared shape", p.name));
+            }
+            if let Some(other) = taken.insert(alias.as_str(), p.name.as_str()) {
+                return Err(format!(
+                    "the out pointers {other} and {} both may alias '{alias}': at most one is written over an input",
+                    p.name
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The checks of `validate_spec` that the manifest's own fields allow: what a launch relies on is all there.
     fn check_consistent(&self, syms: &mut Symbols) -> std::result::Result<(), String> {
+        self.check_aliases()?;
         let mut carried: HashMap<(&str, usize), &str> = HashMap::new();
         for p in &self.params {
             match &p.kind {

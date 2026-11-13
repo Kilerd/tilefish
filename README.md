@@ -370,6 +370,11 @@ the plan's arena and its replays are ordered with the runs whose record they see
 of the same plan overlaps that run** (wrong bytes, no error), so order the two yourself or use `tilefish.capture`. `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
 eager composition of the same ops give the same bytes for every bucket and two values of `n`.
 
+**An `Out` written over its input.** A hand-written kernel `k(x, r, y, r_out)` that reads every element of `r` before it writes the same element of `r_out`
+declares `r_out: Out[Tensor[M, D, f32], MayAlias("r")]`: a launch (Python or Rust) then accepts `r_out` and `r` that are exactly one tensor and refuses any
+other overlap, and a plan writes `r_out` over `r` when nothing reads that `r` after the call (a whole intermediate, no later reader, not returned), with no
+buffer of its own; otherwise the result gets one, so the values are the same either way (manifest schema 3, section 5.4; `docs/plan-schema-1.md`, section 8).
+
 A plan launches declared operators and views. Arithmetic traced in the graph body, a `store`, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
 tensor was updated in place are refused with the rule that says so; there is no fusion in a plan yet. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation rules, the
 digest) for the host that will run it without Python.

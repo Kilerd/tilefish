@@ -35,7 +35,7 @@ import json
 import math
 import pathlib
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 from . import _specvalid as sv
@@ -249,6 +249,66 @@ def _layout(graph: str, what: str, t: Any) -> "tuple[tuple[DimExpr, ...], DimExp
     return tuple(strides), t.offset  # type: ignore[arg-type]
 
 
+_RETURNED = 1 << 62  # the "last use" of a value the graph returns: after every node
+
+
+def _storage_uses(g: Any) -> "tuple[dict[Value, Value], dict[Value, int]]":
+    """``(root, last)``: the *storage root* of every value of the graph (a view and a new version of an in-place update or a store share the storage of
+    the value they come from; anything else is its own root), and for every root the index of the last node that reads a value of that storage
+    (:data:`_RETURNED` for one the graph returns). What an in-place write needs to know: a value whose storage nothing reads after a call may be written
+    over by that call (``Out[..., MayAlias(...)]``)."""
+    root: "dict[Value, Value]" = {}
+    last: "dict[Value, int]" = {}
+
+    def of(v: Value) -> Value:
+        return root.get(v, v)
+
+    for i, n in enumerate(g.nodes):
+        for x in n.inputs:
+            if isinstance(x, Value):
+                last[of(x)] = i
+        kind = n.attrs.get("kind")
+        if kind is None and n.op in _VIEW_OPS:
+            for o in n.outputs:
+                root[o] = of(n.inputs[0])  # type: ignore[arg-type]
+        elif kind is None and n.op == "store":
+            for o in n.outputs:  # the new version of the parameter stored into
+                root[o] = of(n.inputs[0])  # type: ignore[arg-type]
+        elif kind in ("kernel", "extern", "library") and n.callee is not None:
+            try:
+                public = callee_of(n.callee).public
+            except TilefishError:  # the walk refuses the call, with its own message
+                continue
+            n_new = len(public.returns) + len(public.tensor_outputs)
+            inout_inputs = [v for p, v in zip(public.tensor_inputs, n.inputs) if p.access == "inout"]
+            for version, consumed in zip(n.outputs[n_new:], inout_inputs):
+                root[version] = of(consumed)  # type: ignore[arg-type]
+    for v in g.outputs:
+        last[of(v)] = _RETURNED
+    return root, last
+
+
+def _in_place(
+    p: Any, ins: "Mapping[str, Value]", loc: "Mapping[Value, _Loc]", roots: "Mapping[Value, Value]", last_use: "Mapping[Value, int]", n: Any, index: int
+) -> "_Loc | None":
+    """Where the ``Out`` parameter ``p`` of the call ``n`` (node ``index``) is written when it may be written over an input (``MayAlias``): that input's
+    location, if writing there changes no value the graph reads, else ``None`` (a buffer of its own). In place when the input is a whole intermediate
+    at its current version (made by a call of this graph: not a parameter, which is the caller's, and not a view), no later node reads its storage
+    (a view of it, a version of it, or the graph's return), and no other argument of this call is in that storage."""
+    if p.alias is None:
+        return None
+    value = ins[p.alias]
+    src = loc[value]
+    if not src.whole or src.buffer.role != "intermediate" or src.version != src.buffer.version:
+        return None
+    root = roots.get(value, value)
+    if last_use.get(root, -1) != index:
+        return None
+    if sum(1 for x in n.inputs if isinstance(x, Value) and roots.get(x, x) is root) != 1:
+        return None
+    return src
+
+
 def _walk(gop: GraphOp) -> _Walk:
     g = gop.graph
     name = g.name
@@ -256,6 +316,7 @@ def _walk(gop: GraphOp) -> _Walk:
     buffers: "list[_Buffer]" = []
     loc: "dict[Value, _Loc]" = {}
     steps: "list[_SymStep]" = []
+    roots, last_use = _storage_uses(g)
 
     def new_buffer(role: str, dtype: Any, shape: "tuple[DimExpr, ...]", name_: str) -> _Buffer:
         try:
@@ -342,8 +403,15 @@ def _walk(gop: GraphOp) -> _Walk:
         n_ret, n_out = len(sig_op.returns), len(sig_op.tensor_outputs)
         returned, outs, inouts = n.outputs[:n_ret], n.outputs[n_ret : n_ret + n_out], n.outputs[n_ret + n_out :]
         out_locs: "dict[Value, _Loc]" = {}
-        for o in (*returned, *outs):
+        for o in returned:
             out_locs[o] = loc[o] = fresh(o)
+        for p, o in zip(sig_op.tensor_outputs, outs):
+            over = _in_place(p, ins, loc, roots, last_use, n, index)
+            if over is not None:  # Out[..., MayAlias(r)]: the result is written over r, whose storage nothing reads after this call
+                over.buffer.version += 1
+                out_locs[o] = loc[o] = replace(over, version=over.buffer.version)
+            else:
+                out_locs[o] = loc[o] = fresh(o)
         for p, version in zip((p for p in sig_op.tensor_inputs if p.access == "inout"), inouts):
             src = loc[ins[p.name]]
             if not src.whole:
@@ -527,6 +595,7 @@ class Bound:
     offsets: "tuple[int, ...]"  # the byte offset of each in its buffer
     infos: "dict[str, TensorInfo]"
     written: "frozenset[str]"
+    aliases: "Mapping[str, str]" = field(default_factory=dict)  # an Out that may be written over an input (MayAlias) -> that input
 
     @property
     def stem(self) -> str:
@@ -540,7 +609,7 @@ class Bound:
             check_no_alias(real, {"out"})
             check_spec_preconditions(self.spec, real, {}, self.dims)
         else:
-            check_no_alias(real, self.written)
+            check_no_alias(real, self.written, self.aliases)
             check_spec_preconditions(self.spec, real, self.scalars, self.dims)
         return real
 
@@ -626,7 +695,8 @@ def resolve_step(
 
         scalars, grid = _finish_launch(extern, spec, dims, infos)
         written = frozenset(p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in")
-        return Bound(callee, spec, dims, scalars, grid, tuple(names), tuple(bindings), tuple(offsets), infos, written)
+        aliases = {p.name: p.alias for p in extern.signature.params if p.alias is not None}
+        return Bound(callee, spec, dims, scalars, grid, tuple(names), tuple(bindings), tuple(offsets), infos, written, aliases)
     except TilefishPreconditionError as e:
         raise TilefishPreconditionError(f"{where}: {e}", kind=e.kind, arg=e.arg) from None
 

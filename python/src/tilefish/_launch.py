@@ -522,9 +522,23 @@ def check_i32(scalars: "Mapping[str, int]") -> None:
             )
 
 
-def check_no_alias(infos: "Mapping[str, TensorInfo]", written: "set[str]") -> None:
-    """A tensor that is written in place must not overlap any other argument."""
+def same_tensor(a: TensorInfo, b: TensorInfo) -> bool:
+    """Whether two arguments are exactly one tensor: one address, one dtype, one shape, and the same stride on every axis of a size other than 1."""
+    if a.ptr != b.ptr or a.dtype != b.dtype or tuple(a.shape) != tuple(b.shape):
+        return False
+    if a.contiguous and b.contiguous:
+        return True
+    sa, sb = a.strides, b.strides
+    if sa is None or sb is None:
+        return False
+    return all(n == 1 or x == y for n, x, y in zip(a.shape, sa, sb))
+
+
+def check_no_alias(infos: "Mapping[str, TensorInfo]", written: "set[str]", aliases: "Mapping[str, str] | None" = None) -> None:
+    """A tensor that is written in place must not overlap any other argument; ``aliases`` maps an ``Out`` that may be written over an input
+    (``Out[..., MayAlias("r")]``) to that input, and the two may be **exactly** one tensor (:func:`same_tensor`), not overlap otherwise."""
     names = list(infos)
+    aliases = aliases or {}
     for w in names:
         if w not in written:
             continue
@@ -534,6 +548,15 @@ def check_no_alias(infos: "Mapping[str, TensorInfo]", written: "set[str]") -> No
                 continue
             b = infos[o]
             if a.ptr < b.ptr + b.nbytes and b.ptr < a.ptr + a.nbytes:
+                if aliases.get(w) == o:
+                    if same_tensor(a, b):
+                        continue
+                    raise TilefishPreconditionError(
+                        f"argument '{w}' may be written over '{o}' (MayAlias), but only as exactly that tensor (one address, shape and strides): "
+                        "it overlaps it otherwise",
+                        kind="alias",
+                        arg=w,
+                    )
                 raise TilefishPreconditionError(
                     f"argument '{w}' is written in place but overlaps argument '{o}': an InOut or Out tensor cannot "
                     "alias another argument",

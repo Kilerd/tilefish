@@ -293,6 +293,10 @@ def _validate_pointer(who: str, where: str, p: "dict[str, Any]") -> None:
         _name(who, f"{where}.offset", p["offset"])
     elif not shape and access != "in":
         _bad(who, f"{where} is a device scalar (the shape []) with access {access!r}: a device scalar is an 'in' pointer")
+    if "alias" in p:  # an out pointer that may be written over an in pointer: the launch takes the two as exactly one tensor (a region, DevicePtr)
+        _name(who, f"{where}.alias", p["alias"])
+        if access != "out":
+            _bad(who, f"{where} may alias {p['alias']!r} with access {access!r}: only an 'out' pointer may be written over an input")
 
 
 def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> None:

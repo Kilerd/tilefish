@@ -205,10 +205,13 @@ class ArgSpec:
     # scalars that carry a stride: ``(argument, axis)`` of the pointer argument whose stride along that axis this scalar is, one pair, or one per
     # view that shares the stride (``StrideOf(("q", "k", "v"), 0)``; serialized as a list then, see ``stride_of_json``)
     stride_of: "tuple[tuple[str, int], ...] | None" = None
+    # an ``out`` pointer only: the ``in`` pointer argument it may be written over (``Out[..., MayAlias("r")]``); a launch accepts the two as
+    # exactly one tensor. Absent for every other pointer, so a spec without it (and its digest) is what it always was
+    alias: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"index": self.index, "name": self.name, "kind": self.kind, "type": self.type}
-        for k in ("access", "dtype", "dim", "count_of"):
+        for k in ("access", "dtype", "dim", "count_of", "alias"):
             v = getattr(self, k)
             if v is not None:
                 out[k] = v
@@ -410,12 +413,12 @@ class CompileSpec:
 
     @property
     def uses_strided_schema(self) -> bool:
-        """Whether the spec has anything only schema 3 has: a strided pointer or a stride scalar, a 64-bit scalar, a ``fixed``
+        """Whether the spec has anything only schema 3 has: a strided pointer or a stride scalar, an ``out`` pointer that may alias an input, a 64-bit scalar, a ``fixed``
         argument, a ``max_extent`` precondition or a prebuilt binary. A spec without any is schema 2, written as it always was."""
         return (
             self.binary is not None
             or any(
-                a.strides is not None or a.stride_of is not None or a.kind == "fixed" or (a.kind == "scalar" and a.type == "i64")
+                a.strides is not None or a.stride_of is not None or a.alias is not None or a.kind == "fixed" or (a.kind == "scalar" and a.type == "i64")
                 for a in self.args
             )
             or any(p.kind == "max_extent" for p in self.preconditions)
@@ -723,6 +726,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
                 }
             if p.type.devscalar:
                 entry["devscalar"] = True
+            if p.alias is not None:  # only an Out that may be written over an input has it: every other declaration digests as it did
+                entry["alias"] = p.alias
         elif p.kind == "dim":
             assert p.dim is not None
             entry["dim"] = _canonical_dim(p.dim)
@@ -889,6 +894,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                     shape_dims=shape_dims,
                     strides=strides_entries,
                     offset=offset_entry,
+                    alias=p.alias,
                 )
             )
         elif p.kind == "dim":

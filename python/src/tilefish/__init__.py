@@ -63,7 +63,7 @@ from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
 from .trace import Const, Value
-from .types import DevScalar, InOut, Out, StrideOf, Strided, Tensor, TensorType, const
+from .types import DevScalar, InOut, MayAlias, Out, StrideOf, Strided, Tensor, TensorType, const
 
 __version__ = "0.0.4"
 
@@ -91,6 +91,7 @@ __all__ = [
     "LibraryOp",
     "LoweredKernel",
     "Manifest",
+    "MayAlias",
     "Node",
     "Op",
     "Out",

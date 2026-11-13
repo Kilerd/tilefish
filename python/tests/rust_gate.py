@@ -27,6 +27,8 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **strides that several views share** (``gpu_kernels_p4.py``): ``o = q + k + v`` over the q, k and v of one fused tensor, read with one stride pair
   (``StrideOf(("q", "k", "v"), axis)``), and over three tensors of their own with the same strides; the plan ``fused_qkv`` binds the three views in one
   step;
+* **an Out that may be written over an input** (``gpu_kernels_p5.py``): ``add_into`` launched with its outputs apart; the plan ``residual_chain``
+  (without and with reuse) writes both of its calls in place, over the residual it made in the arena;
 * **a dimension only an Out tensor determines** (``gpu_kernels_p4.py``): a ``[B]`` mask made from a device scalar, run with ``outputs=`` (which is what
   binds ``B``), bucketed and not; the plan ``mask_rows`` makes it in a step whose ``B`` is the graph's;
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
@@ -269,6 +271,16 @@ def mask_of(b):
     return lambda args: (torch.zeros((b,), dtype=BF16, device="cuda"),)
 
 
+def args_add_into(rows, seed):
+    return randn((rows, 64), F32, seed), randn((rows, 64), F32, seed + 50)
+
+
+def must_add_into(args, got):
+    x, r = args
+    y = got  # the first result (the check of a case sees that one): y = 0.5 * (r + x), which needs r_out = r + x
+    assert same_bytes(y, (r + x) * 0.5)
+
+
 def build_cases():
     cases: "list[Case]" = [
         *plain("softmax", "softmax", args_softmax, ROW_SIZES),
@@ -323,6 +335,8 @@ def build_cases():
             for b in sizes
             for n in (0, 5, b, b + 3)
         ]
+    # -- an Out that may be written over an input (MayAlias): launched apart here; in place in the plan residual_chain
+    cases += plain("add_into", "add_into", args_add_into, (8, 24), seeds=(0, 1), check=must_add_into)
     return cases
 
 
@@ -524,6 +538,11 @@ def plan_graphs():
             for n in (0, 5, rb)
         ]
 
+    import gpu_kernels_p5 as p5
+
+    def residual_cases():
+        return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 64), F32, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
+
     return [
         ("block", pm.block, False, block_cases),
         ("block-reuse", pm.block, True, block_cases),
@@ -533,6 +552,8 @@ def plan_graphs():
         ("accumulate", pm.accumulate, False, accumulate_cases),
         ("fused_qkv", p4.fused_qkv, False, fused_qkv_cases),  # one step that reads three views with one stride pair
         ("mask_rows", p4.mask_rows, False, mask_rows_cases),  # a step whose B only its Out buffer determines
+        ("residual_chain", p5.residual_chain, False, residual_cases),  # two steps whose Out is written over their input (MayAlias)
+        ("residual_chain-reuse", p5.residual_chain, True, residual_cases),
     ]
 
 

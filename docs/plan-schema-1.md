@@ -181,7 +181,8 @@ The step is a launch of the manifest entry `entry` with the tensors of its argum
 the row-major ones). Everything else is as for a single launch in manifest schema 3: the host **binds the entry's dimensions from those shapes and strides** (section 5.1 there, with its
 canonical strides for axes of size 1; a dimension the arguments the entry reads leave unbound is bound from the shape of its `out` arguments, section 7 there), derives the runtime scalars (dimensions, element counts, strides, `fixed` values), evaluates the grid expression, and checks every precondition of the entry
 (`pointer_alignment` of the passed pointer, `static_size`, `divisible`, `bucket`, `max_elements`, `max_extent`), that a pointer without `strides` in its ABI entry gets a **dense** tensor
-(the strides of its axes of size > 1 are the row-major ones), that the ranks and dtypes are the ABI's, that a written pointer (`access` `out` or `inout`) overlaps no other argument of the step, and
+(the strides of its axes of size > 1 are the row-major ones), that the ranks and dtypes are the ABI's, that a written pointer (`access` `out` or `inout`) overlaps no other argument of the step
+(but an `out` pointer with `alias` and the `in` pointer it names, which may be exactly one tensor: manifest schema 3, section 5.4), and
 the grid against the device's limits. A kernel is launched with `cuLaunchKernel` (a Triton kernel with its two zero scratch slots, a prebuilt one with exactly its parameters); a library entry
 with `cublasLtMatmul` and its pinned algorithm (manifest schema 3, section 9), whose **workspace is the buffer named by `workspace`**, at its address in the arena (`workspace_bytes` of the entry
 are always there; the matmul is given the size the algorithm needs, at most that), so the call allocates nothing.
@@ -220,6 +221,13 @@ the shapes of the views.
   (`last` of one < `first` of the other). A device scalar's slot and the workspace never share bytes. `validate_doc` checks this from the steps of the first bucket (the bindings are the same
   in every bucket). Python lays out a reusing plan first-fit by first step; the layout is part of the document, and a host uses it as it is.
 * A buffer with no step (a parameter that no operator reads) is allowed; it has no live range.
+* **A result written over its input.** A call to an operator whose `Out` may be written over an input (`Out[..., MayAlias("r")]`, an `alias` in the
+  manifest) has its result bound to the buffer of `r`, the same view, when that changes no value the graph computes: `r` is a whole `intermediate`
+  at its current version (made by a call of the graph: not a parameter, which is the caller's, and not a view), no later node of the graph reads its
+  storage (a view of it, a version of it, or the graph's return), and no other argument of the call is in that storage. The step then binds `r` and
+  `r_out` to one buffer (`python/src/tilefish/_plan.py`, `_in_place`); the buffer is written by the step that made `r` and again by this one, and its
+  live range covers both. Otherwise the result has a buffer of its own. The document needs nothing new: two arguments of a step bound to one buffer
+  are checked by the launch (section 7.2) as any two arguments are.
 
 ## 9. What a host does
 
@@ -384,6 +392,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 |---|---|
 | the walk, the steps and views, the buffers, roles, buckets, the refusals of section 12 | `test_plan.py` |
 | a step that reads three views with one stride pair; a step whose dimension only its `Out` buffer has (section 5) | `test_shared_strides.py`, `test_output_dims.py`; on a GPU `test_gpu_shared_strides.py`, `test_gpu_output_dims.py` |
+| a result written over its input (`MayAlias`, section 8) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |
 | the document of section 13 | `test_plan_docs.py` |

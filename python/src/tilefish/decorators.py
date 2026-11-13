@@ -833,7 +833,9 @@ def extern(
         nm = name or fn.__name__
         if not _OP_NAME.fullmatch(nm):
             raise TilefishDeclarationError(f"extern: the function name {nm!r} is not a plain identifier; pass name=... to give the op one")
-        sig = parse_signature(fn, what="extern op", name=nm, allow_dim_const_defaults=not prebuilt, allow_strided=True, allow_output_dims=True)
+        sig = parse_signature(
+            fn, what="extern op", name=nm, allow_dim_const_defaults=not prebuilt, allow_strided=True, allow_output_dims=True, allow_alias=True
+        )
         if sig.returns:
             raise TilefishDeclarationError(
                 f"extern op '{nm}': {'a kernel' if prebuilt else 'a Triton kernel'} returns nothing; declare results as Out[...] parameters"

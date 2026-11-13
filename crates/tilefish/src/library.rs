@@ -326,6 +326,7 @@ impl LibraryEntry {
                     access: if last { Access::Out } else { Access::In },
                     shape,
                     view: None,
+                    alias: None,
                 },
             });
         }

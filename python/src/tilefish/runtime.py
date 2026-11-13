@@ -435,7 +435,7 @@ def _finish_launch(extern: ExternOp, spec: CompileSpec, dims: "dict[Dim, int]", 
     check_dim_constraints(dims)
     check_scalar_ranges(spec, scalars)
     written = {p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in"}
-    check_no_alias(infos, written)
+    check_no_alias(infos, written, {p.name: p.alias for p in extern.signature.params if p.alias is not None})
     check_spec_preconditions(spec, infos, scalars, dims)
     assert extern.grid is not None
     return scalars, eval_grid(spec, extern.grid, dims)

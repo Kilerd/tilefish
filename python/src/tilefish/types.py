@@ -394,15 +394,48 @@ class Marked:
 
     mode: str  # "inout" | "out"
     type: TensorType
+    alias: "str | None" = None  # an Out only: the tensor input it may be written over (MayAlias)
 
     def __repr__(self) -> str:
-        return f"{'InOut' if self.mode == 'inout' else 'Out'}[{self.type!r}]"
+        inner = repr(self.type) + (f", {MayAlias(self.alias)!r}" if self.alias is not None else "")
+        return f"{'InOut' if self.mode == 'inout' else 'Out'}[{inner}]"
+
+
+@dataclass(frozen=True)
+class MayAlias:
+    """``Out[Tensor[...], MayAlias("r")]``: the ``Out`` tensor may be the memory of the tensor input ``r`` (an in-place kernel with two pointers).
+
+    A hand-written kernel ``k(x, r, y, r_out)`` that reads every element of ``r`` before it writes the same element of ``r_out`` can write its
+    result over ``r``: a caller may pass one tensor for both. The declaration says the kernel allows it; it does not make a call in place.
+    ``r`` is a tensor input of the op (not ``Strided``, not a ``DevScalar``) with the dtype and the declared shape of the ``Out``, and at most
+    one ``Out`` names it. A launch accepts ``r_out`` and ``r`` that are **exactly** one tensor (one address, one shape, the same strides) and
+    refuses every other overlap, as for any written tensor. A launch plan writes the result over ``r`` when nothing reads that version of ``r``
+    after the call (``r`` is a whole intermediate of the graph, and no later step and no returned value reads it, or a view of it); otherwise
+    the result gets a buffer of its own, so what the graph computes is the same either way. Only an extern op can declare it: it is the
+    hand-written kernel's promise.
+    """
+
+    arg: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.arg, str) or not self.arg.isidentifier():
+            raise TilefishDeclarationError(f"MayAlias names the tensor parameter an Out may be written over, got {self.arg!r}")
+
+    def __repr__(self) -> str:
+        return f"MayAlias({self.arg!r})"
 
 
 class _AccessMarker:
     mode = ""
 
     def __class_getitem__(cls, item: Any) -> Marked:
+        alias = None
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[1], MayAlias):
+            if cls.mode != "out":
+                raise TilefishDeclarationError(
+                    f"{cls.__name__}[..., {item[1]!r}]: only an Out tensor names an input it may be written over (an InOut tensor is that input)"
+                )
+            item, alias = item[0], item[1].arg
         if isinstance(item, StridedType):
             raise TilefishDeclarationError(
                 f"{cls.__name__}[Strided[...]]: only input tensors can be strided in this version; an {cls.__name__} tensor is contiguous"
@@ -413,7 +446,7 @@ class _AccessMarker:
             )
         if item.devscalar:
             raise TilefishDeclarationError(f"{cls.__name__}[{item!r}]: a DevScalar is read-only")
-        return Marked(cls.mode, item)
+        return Marked(cls.mode, item, alias)
 
 
 class InOut(_AccessMarker):

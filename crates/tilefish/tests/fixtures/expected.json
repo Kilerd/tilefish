@@ -1,8 +1,16 @@
 {
   "fixtures": {
     "sm_103": {
-      "manifest_digest": "695686c04490e494161f8357e97d357e2957b00892c67f7d66f9dd1e038eedce",
+      "manifest_digest": "72da0ae5063721cde8036ba8fc4dd669dda7ddfcc564d42d95c6168b44afba82",
       "kernels": [
+        {
+          "stem": "add_into",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "add_into.sm_103.cubin",
+          "sha256": "d9137defd9d6a217f4e6a883b0b56636678f9de5fb8a0cb87dbe594e8cab62a1",
+          "sha256_code": "11234a1811d80aff551337083dba56ef53b22d803ac31c1c00f029482c89e390"
+        },
         {
           "stem": "axpy",
           "arch": "sm_103",
@@ -356,8 +364,16 @@
       ]
     },
     "sm_120": {
-      "manifest_digest": "aa5625fe1e65981734652af46607e823670f98656470ffb3da363d6fddcb8091",
+      "manifest_digest": "fdbffba5a5e91376b0ab8ac0a7391b73b9bdadba4d0bd5fb22a42c712078d7ad",
       "kernels": [
+        {
+          "stem": "add_into",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "add_into.sm_120.cubin",
+          "sha256": "95bfa9323e20fe69a949f28194dac6800c5f4d7841bb441717586862e2c854fb",
+          "sha256_code": "47a370d5602bfa19bfd46bd61f361f22d9a769c74894e542fb415180bf3a4720"
+        },
         {
           "stem": "axpy",
           "arch": "sm_120",
