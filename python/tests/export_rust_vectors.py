@@ -12,12 +12,17 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
   escapes, control characters, ``0x7f``, characters above the basic plane, keys whose code point order is not their UTF-16
   order, the edges of the integers, floats, nesting, random strings;
 * ``python_elf.in``: small ELF files (``elf_builder.py``) and their ``code_digest``;
+* ``python_launches.json``: calls on the binaries of ``host_ops.ops()`` (a valid call per size and every single change of one input:
+  dtype, rank, an axis made larger, twice as large or empty, a misaligned address, a tensor too large for 32-bit offsets, an alias) and
+  what ``runtime._prepare`` of Python decides for each (the grid and the ``kernelParams`` values, or the kind of the refusal), run on
+  fake tensors; the Rust ``Plan::prepare`` must decide the same (``tests/python_launches.rs``);
 * ``python_manifests.in``: small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
   alphabets) and their ``manifest_digest``, which has its own tag.
 
 The generators are seeded, so the files only change when a format does.
 """
 
+import json
 import math
 import pathlib
 import random
@@ -156,6 +161,137 @@ def manifest_digests():
     return "\n".join([*out, "];"]) + "\n"
 
 
+# (the operator of host_ops.ops(), the inputs of a valid call for one size, the sizes): what a call is built from
+LAUNCH_CASES = [
+    ("softmax", lambda r: [("f32", (r, 1000))], (1, 5)),
+    ("layernorm", lambda r: [("bf16", (r, 768)), ("bf16", (768,)), ("bf16", (768,))], (1, 5)),
+    ("residual_add_rmsnorm", lambda r: [("bf16", (r, 2560)), ("f32", (r, 2560)), ("bf16", (2560,))], (1, 5)),
+    ("gelu_exact", lambda n: [("bf16", (n,))], (16, 1040)),
+    ("swiglu", lambda r: [("bf16", (r, 3072)), ("bf16", (r, 3072))], (1, 5)),
+    ("bucketed_rms", lambda rd: [("bf16", rd), ("bf16", rd[1:])], ((5, 96), (3, 512), (5, 1000))),
+    ("rmsnorm", lambda r: [("bf16", (r, 2048)), ("bf16", (2048,))], (1, 5)),
+    ("gelu_erf", lambda n: [("bf16", (n,))], (16, 1040)),
+    ("axpy", lambda n: [("f32", (n,)), ("f32", (n,))], (16, 1040)),
+    ("mm", lambda mnk: [("f16", (mnk[0], mnk[2])), ("f16", (mnk[2], mnk[1]))], ((128, 128, 64), (256, 384, 192))),
+]
+_OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16"}
+
+
+def _mutations(dtype, shape, ptr):
+    """Single changes to one input tensor: ``(what, (dtype, shape, ptr))``."""
+    yield "dtype", (_OTHER_DTYPE[dtype], shape, ptr)
+    if len(shape) >= 2:
+        yield "drop an axis", (dtype, shape[:-1], ptr)
+    yield "add an axis", (dtype, (*shape, 2), ptr)
+    for axis, size in enumerate(shape):
+        yield f"axis {axis} + 1", (dtype, (*shape[:axis], size + 1, *shape[axis + 1 :]), ptr)
+        yield f"axis {axis} * 2", (dtype, (*shape[:axis], size * 2, *shape[axis + 1 :]), ptr)
+        yield f"axis {axis} = 0", (dtype, (*shape[:axis], 0, *shape[axis + 1 :]), ptr)
+    yield "address + 8", (dtype, shape, ptr + 8)
+    yield "address + 16", (dtype, shape, ptr + 16)
+    yield "more elements than 32-bit offsets reach", (dtype, (2_200_000, *shape[1:]), ptr)
+
+
+def launches():
+    """Calls and what ``runtime._prepare`` of Python decides for each (the oracle for the Rust ``Plan::prepare``): ``(records, how_many_binaries)``.
+
+    For each binary of ``host_ops.ops()`` a valid call per size, and every single change of one input (dtype, rank, an axis made
+    larger, twice as large or empty, a misaligned address, a tensor too large for 32-bit offsets, an in-place tensor aliased).
+    A record is the stem of a binary, the tensors of the call in the order of its ABI (an ``Out`` tensor is what Python would
+    allocate) and what Python decided: the grid and the ``kernelParams`` values, or the kind of the refusal. A call that Python sends
+    to another bucket is a valid call of that binary, and a ``bucket`` refusal of this one.
+    """
+    from fake_torch import FakeTensor, prepare, verdict
+    from host_ops import abi_of, ops
+
+    from tilefish.runtime import _target
+
+    from tilefish._launch import bind_call, eval_dim
+    from tilefish.errors import TilefishError
+
+    first_slab, slab = 1 << 44, 1 << 36
+    declared = ops()
+
+    def allocated_outs(op, call, after, fallback):
+        """What Python would allocate for the ``Out`` tensors of ``call``: shaped by the dimensions its inputs bind (as ``_prepare`` does
+        once they are bound), or ``fallback`` when they cannot be bound (the refusal is then about an input)."""
+        target = _target(op)
+        try:
+            dims = bind_call(target.name, target.public, [FakeTensor(sh, d, p) for d, sh, p in call], {}).dims
+        except TilefishError:
+            return fallback
+        outs = {}
+        for i, p in enumerate(q for q in target.launch_extern().signature.params if q.kind == "tensor" and q.access == "out"):
+            shape = [eval_dim(d, dims) for d in p.type.shape]
+            if any(v is None for v in shape):
+                return fallback
+            outs[p.name] = FakeTensor(shape, p.type.dtype.name, after + i * slab)
+        return outs
+    records, seen = [], set()
+
+    def add(stem, tensors, expect):
+        record = {"stem": stem, "tensors": tensors, "expect": expect}
+        key = json.dumps(record, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            records.append(record)
+
+    def abi_tensors(spec, by_name):
+        return [
+            {"ptr": by_name[a.name].data_ptr(), "shape": list(by_name[a.name].shape), "dtype": by_name[a.name].dtype.short}
+            for a in spec.args
+            if a.kind == "pointer"
+        ]
+
+    stems = set()
+    for key, build, sizes in LAUNCH_CASES:
+        op = declared[key]
+        _, inputs, _ = abi_of(op)
+        specs = {sp.stem: sp for sp in _target(op).compile_specs()}
+        stems |= set(specs)
+        for size in sizes:
+            base = [(d, tuple(sh), first_slab + i * slab) for i, (d, sh) in enumerate(build(size))]
+            after = first_slab + len(base) * slab
+            prepared, error = prepare(op, [FakeTensor(sh, d, ptr) for d, sh, ptr in base], next_slab=after)
+            assert error is None, (key, size, error)
+            intended = prepared.spec
+            by_abi_base = dict(prepared.tensors)  # the allocated Out tensors of the valid call
+            inout = [i for i, name in enumerate(inputs) if any(a.name == name and a.access == "inout" for a in intended.args)]
+            add(intended.stem, abi_tensors(intended, by_abi_base), {k: v for k, v in verdict(prepared, None).items() if k != "stem"})
+            calls = []  # every call: the valid one with a single change
+            for j, (d, sh, ptr) in enumerate(base):
+                for _, new in _mutations(d, sh, ptr):
+                    calls.append([*base[:j], new, *base[j + 1 :]])
+                for i in inout:
+                    if i != j:
+                        calls.append([*base[:j], (d, sh, base[i][2]), *base[j + 1 :]])
+            if key == "bucketed_rms":  # the bucketed dimension moved in every tensor that has it: another bucket, or none
+                rows = size[0]
+                for db in (95, 100, 512, 1000):
+                    calls.append([(base[0][0], (rows, db), base[0][2]), (base[1][0], (db,), base[1][2])])
+            for call in calls:
+                prepared, error = prepare(op, [FakeTensor(sh_, d_, p_) for d_, sh_, p_ in call], next_slab=after)
+                got = verdict(prepared, error)
+                if prepared is not None:
+                    # a binary Python selected: a valid call of that binary, and a bucket refusal of the one intended
+                    selected = prepared.spec
+                    add(selected.stem, abi_tensors(selected, dict(prepared.tensors)), {k: v for k, v in got.items() if k != "stem"})
+                    if selected.stem != intended.stem:
+                        by_name = {inputs[i]: FakeTensor(sh_, d_, p_) for i, (d_, sh_, p_) in enumerate(call)}
+                        outs = allocated_outs(op, call, after, {n: t for n, t in by_abi_base.items() if n not in by_name})
+                        add(intended.stem, abi_tensors(intended, {**outs, **by_name}), {"ok": False, "kind": "bucket"})
+                else:
+                    by_name = {inputs[i]: FakeTensor(sh_, d_, p_) for i, (d_, sh_, p_) in enumerate(call)}
+                    outs = allocated_outs(op, call, after, {n: t for n, t in by_abi_base.items() if n not in by_name})
+                    add(intended.stem, abi_tensors(intended, {**outs, **by_name}), got)
+    return records, len(stems)
+
+
+def launches_json():
+    records, _ = launches()
+    return json.dumps(records, indent=None, separators=(",", ":")) + "\n"
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
@@ -167,6 +303,7 @@ def main(argv=None):
         ("python_canonical.in", canonical()),
         ("python_elf.in", elfs()),
         ("python_manifests.in", manifest_digests()),
+        ("python_launches.json", launches_json()),
     ):
         (directory / name).write_text(text, encoding="utf-8")
 

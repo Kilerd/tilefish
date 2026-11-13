@@ -10,6 +10,11 @@ pub fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures")
 }
 
+/// The vectors Python made (`export_rust_vectors.py`).
+pub fn data() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("data")
+}
+
 /// `expected.json`: what Python computed for each fixture.
 pub fn expected() -> Value {
     let text = std::fs::read_to_string(fixtures().join("expected.json")).expect("expected.json");

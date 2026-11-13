@@ -21,7 +21,7 @@ from conftest import make_my_kernels, readme_snippet
 from lower_cases import M, gelu_exact, layernorm, softmax, swiglu
 
 import tilefish
-from tilefish import Dim, Tensor, bf16, const, f32
+from tilefish import Dim, Tensor, bf16, const, f32, runtime
 
 Db = Dim("Db", buckets=[96, 512, 1000])
 
@@ -88,3 +88,21 @@ def ops():
         "axpy": kernels.axpy,
         "mm": mm_kernels().mm,  # a tl.dot kernel: more than 48 KiB of dynamic shared memory and a 2-D grid
     }
+
+
+def abi_of(op):
+    """``(tensors, inputs, outputs)``: the tensor parameters of the launched kernel in ABI order with their access, the
+    names of the arguments of a call (``In`` and ``InOut``) and of the results of a call, in order."""
+    target = runtime._target(op)
+    extern = target.launch_extern()
+    names = runtime._extern_names(target, extern)
+    tensors = [(p.name, p.access) for p in extern.signature.params if p.kind == "tensor"]
+    if target.kernel is None:
+        inputs = [n for n, a in tensors if a != "out"]
+        outputs = [n for n, a in tensors if a == "out"]
+    else:
+        user = len(target.kernel.signature.params)
+        returned = [p.name for p in extern.signature.params[user:] if p.kind == "tensor" and p.access == "out"]
+        outputs = returned + [names[p.name] for p in target.kernel.signature.tensor_outputs]
+        inputs = [names[p.name] for p in target.kernel.signature.tensor_inputs]
+    return tensors, inputs, outputs

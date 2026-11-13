@@ -380,7 +380,7 @@ def test_the_externs_resolve_their_triton_function_by_reference():
 def test_the_manifest_describes_what_was_built(built, tmp_path):
     path = write_manifest(built, tmp_path / "out" / "manifest.json", cubins=True)
     doc = json.loads(path.read_text())
-    assert doc["schema"] == 1 and [k["stem"] for k in doc["kernels"]] == [b.stem for b in built]
+    assert doc["schema"] == 2 and [k["stem"] for k in doc["kernels"]] == [b.stem for b in built]
     for entry, b in zip(doc["kernels"], built):
         cubin = (tmp_path / "out" / entry["cubin"]).read_bytes()
         assert cubin == b.cubin
@@ -395,6 +395,9 @@ def test_the_manifest_describes_what_was_built(built, tmp_path):
     n = next(p for p in swiglu_entry["abi"]["params"] if p["kind"] == "scalar")
     assert n["count_of"] == "gate" and n["dim"] == "3072*M"  # how a host computes the element count
     assert any(p["kind"] == "max_elements" for p in swiglu_entry["preconditions"])
+    # schema 2: what a host binds the dimensions by: the declared shape of every pointer, and the constraints of the dimensions
+    pointers = [p for p in swiglu_entry["abi"]["params"] if p["kind"] == "pointer"]
+    assert [p["shape"] for p in pointers] == [["M", 3072]] * 3 and swiglu_entry["dims"] == {"M": {}}
 
 
 def test_build_for_device_caches_by_spec_arch_and_options(lowered):
