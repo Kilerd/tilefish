@@ -2,8 +2,33 @@
 name = "tilefish"
 version = "0.0.0"
 edition = "2024"
-description = "Typed tensor DSL for GPU kernels: shapes, dtypes and quantization formats in the type, one compiled artifact for Python, C++ and Rust hosts. Name reservation, nothing usable yet."
+description = "Typed tensor DSL for GPU kernels: shapes, dtypes and quantization formats in the type, one compiled artifact for Python, C++ and Rust hosts. This crate is the Rust host of a tilefish manifest: it verifies a manifest directory and launches its cubins."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Kilerd/tilefish"
 keywords = ["gpu", "cuda", "dsl", "tensor", "quantization"]
 categories = ["compilers", "science"]
+
+[dependencies]
+# The CUDA driver API only, loaded at run time (`dynamic-loading`): the crate builds and its tests run on a machine
+# without CUDA, and a launch on one reports `Error::NoDriver`. The `cuda-*` feature of cudarc picks the bindings.
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+
+[features]
+# Pick exactly one: the CUDA driver API version the bindings are generated for. The driver found at run time must be
+# at least as new as the bindings' version. 13.2 is the driver of the B300 the crate is tested on.
+default = ["cuda-13020"]
+cuda-12040 = ["cudarc/cuda-12040"]
+cuda-12080 = ["cudarc/cuda-12080"]
+cuda-13000 = ["cudarc/cuda-13000"]
+cuda-13020 = ["cudarc/cuda-13020"]
+# Builds `tests/gpu_gate.rs`, the Rust half of the byte-identity gate against Python's `replay` (it needs a GPU and the
+# files that `python/tests/rust_gate.py` writes).
+gpu-gate = []
+
+[[test]]
+name = "gpu_gate"
+required-features = ["gpu-gate"]

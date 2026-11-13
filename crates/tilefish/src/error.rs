@@ -1,0 +1,143 @@
+//! The errors of the host. Every refusal is an [`Error`]; nothing here panics on a bad manifest or a bad call.
+
+use std::fmt;
+
+/// Which precondition of a binary a launch broke (the `kind` of Python's `TilefishPreconditionError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PreconditionKind {
+    /// The tensor is not of the element type the binary was compiled for.
+    Dtype,
+    /// The tensor has another number of dimensions than the signature says.
+    Rank,
+    /// The shapes of the call cannot be one binding of the signature's dimensions (or a dimension is empty).
+    Shape,
+    /// A dimension that the binary has baked in (`Dim("D", 2048)`) is not the size of the tensor.
+    StaticSize,
+    /// A pointer is not aligned to the 16 bytes every pointer of a binary is compiled for.
+    PointerAlignment,
+    /// A runtime dimension is not a multiple of what the binary assumes.
+    Divisible,
+    /// A bucketed dimension is not the bucket the binary was built for (there is no padding).
+    Bucket,
+    /// A tensor has more elements than the 32-bit offsets of a generated kernel reach.
+    MaxElements,
+    /// A tensor that is written in place overlaps another argument.
+    Alias,
+    /// The tensors are not all on the device the kernel was loaded on.
+    Device,
+}
+
+impl PreconditionKind {
+    /// The name Python gives the same kind (`"static_size"`, `"pointer_alignment"`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dtype => "dtype",
+            Self::Rank => "rank",
+            Self::Shape => "shape",
+            Self::StaticSize => "static_size",
+            Self::PointerAlignment => "pointer_alignment",
+            Self::Divisible => "divisible",
+            Self::Bucket => "bucket",
+            Self::MaxElements => "max_elements",
+            Self::Alias => "alias",
+            Self::Device => "device",
+        }
+    }
+}
+
+impl fmt::Display for PreconditionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Everything that can go wrong in loading a manifest or launching one of its kernels.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// A file of the manifest directory cannot be read.
+    #[error("cannot read {path:?}: {source}")]
+    Io {
+        /// The file.
+        path: String,
+        /// Why.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The manifest is not what `tilefish` writes: not strict JSON, a field of the wrong type, an unknown or missing
+    /// key, a cubin whose digests differ from the manifest's, a file name that leaves the directory, ...
+    #[error("{0}")]
+    Manifest(String),
+    /// The pin is not a sha256 in lowercase hex.
+    #[error("the pin must be the 64 lowercase hex digits of a manifest digest, got {0:?}")]
+    BadPin(String),
+    /// The manifest has another digest than the pinned one.
+    #[error(
+        "the manifest in {directory:?} has digest {found}, but the pin says {pinned}: it is not the manifest that was \
+         pinned (it was changed, or it is another export)"
+    )]
+    PinMismatch {
+        /// Where the manifest was read from.
+        directory: String,
+        /// The digest of what was read.
+        found: String,
+        /// The digest that was pinned.
+        pinned: String,
+    },
+    /// The manifest has no binary for the kernel, the buckets or the architecture asked for.
+    #[error("{0}")]
+    NoBinary(String),
+    /// An argument breaks a precondition of the binary; nothing was launched.
+    #[error("{message}")]
+    Precondition {
+        /// Which precondition.
+        kind: PreconditionKind,
+        /// The argument or dimension it is about.
+        arg: Option<String>,
+        /// What is wrong.
+        message: String,
+    },
+    /// The binary or the device cannot run this: launch attributes a plain `cuLaunchKernel` does not set up, a packed
+    /// element type, more shared memory than the device has, a grid beyond its limits.
+    #[error("{0}")]
+    Unsupported(String),
+    /// The call does not fit the kernel's signature (a missing tensor, an unknown scalar or dimension, a value that
+    /// the signature determines and the call also gives).
+    #[error("{0}")]
+    Launch(String),
+    /// A CUDA driver call failed.
+    #[error("CUDA driver call {call} failed: {name} ({code}){detail}")]
+    Driver {
+        /// The driver function.
+        call: &'static str,
+        /// `CUresult` as a number.
+        code: u32,
+        /// `CUDA_ERROR_...`, when the driver can name it.
+        name: String,
+        /// `": <text>"`, or empty.
+        detail: String,
+    },
+    /// The CUDA driver library cannot be loaded (no NVIDIA driver on this machine).
+    #[error("the CUDA driver library (libcuda) cannot be loaded: this machine has no NVIDIA driver")]
+    NoDriver,
+}
+
+/// The result of an operation of this crate.
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    pub(crate) fn manifest(message: impl Into<String>) -> Self {
+        Self::Manifest(message.into())
+    }
+
+    pub(crate) fn precondition(kind: PreconditionKind, arg: Option<&str>, message: impl Into<String>) -> Self {
+        Self::Precondition { kind, arg: arg.map(str::to_owned), message: message.into() }
+    }
+
+    /// The kind of precondition this is, if it is one.
+    pub fn precondition_kind(&self) -> Option<PreconditionKind> {
+        match self {
+            Self::Precondition { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+}
