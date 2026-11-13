@@ -270,14 +270,20 @@ layer and calls the driver directly nowhere: `Manifest::kernel(&ctx, ...)` loads
 cubin into a `CudaContext` that the kernel then keeps alive, and the kernel
 launches on a cudarc `CudaStream` (`Kernel::launch`, safe: the stream is checked
 to be of the kernel's context) or, with the `unsafe` `Kernel::launch_raw`, on a
-raw `CUstream`, which also works inside a CUDA graph capture (it makes the
-kernel's context current for the call and puts back what was). A tensor is made of
-a cudarc `CudaSlice` or view (`from_cuda`: no `unsafe`; it borrows the slice, so
-the slice cannot be freed under it, and the launch gives the slice to cudarc's own
-launch builder on the stream it launches on, so cudarc's event tracking orders the
-launch against every other use of the slice, whatever stream that was) or of a
-region the host vouches for (`unsafe DevicePtr::from_raw`, which has a lifetime and
-no tracking). The loaded function's parameter sizes are not compared with the ABI
+raw `CUstream` (it makes the kernel's context current for the call and puts back
+what was). A tensor is made of a cudarc `CudaSlice` or view (`from_cuda`: no
+`unsafe`; it borrows the slice, so the slice cannot be freed under it, and making
+it records nothing on the slice) or of a region the host vouches for (`unsafe
+DevicePtr::from_raw`, which has a lifetime and no tracking). The launch gives a
+slice to cudarc's launch builder on the stream it launches on, which orders it
+after the slice's earlier writes, and makes the slice's own stream wait for the
+kernel, so freeing the slice (or any later work on its stream) runs after the
+kernel however many other streams read it; between launches on different streams
+that write one slice, only cudarc's one event per slice orders them, so keep such
+work on one stream. A CUDA graph is captured with `launch_raw` and regions: the
+graph holds the addresses and nothing that keeps the memory alive, so it must not
+be replayed after the memory is gone, and a safe `launch` of slices on a capturing
+stream is an error, not a graph. The loaded function's parameter sizes are not compared with the ABI
 (`cuFuncGetParamInfo`, which Python's `replay` asks): cudarc has no wrapper for it,
 and it adds nothing, because the cubin is the one whose digests the manifest
 pinned and the ABI is in the digest of the manifest. `cudarc` panics when there is

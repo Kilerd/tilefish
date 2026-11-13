@@ -149,13 +149,26 @@ impl Kernel {
     ///
     /// The stream must be a stream of the context the kernel was loaded in (checked, with cudarc's own comparison of contexts); that
     /// context is made current on this thread, as cudarc does for its own calls. The launch is asynchronous, as any launch is: `stream`
-    /// orders it with the host's other work. A tensor made of a cudarc slice is handed to cudarc's launch builder on `stream`, so
-    /// cudarc orders the launch against every other use of the slice, whatever stream that was on, and a free of the slice
-    /// waits for it. A tensor made of a region the host vouched for is not tracked by anything: that is the host's. `tensors` are
-    /// used by the call (a written slice is borrowed exclusively), and `stream` may be capturing a CUDA graph: the call is captured
-    /// like any kernel node (cudarc's event tracking of its own slices is not meant for capture; see its
-    /// `CudaContext::disable_event_tracking`, or capture with tensors made of regions). For a raw handle that cudarc does not own,
-    /// see [`Kernel::launch_raw`].
+    /// orders it with the host's other work. `tensors` are used by the call (a written slice is borrowed exclusively).
+    ///
+    /// What is guaranteed for a tensor made of a cudarc slice or view (`from_cuda`):
+    ///
+    /// * cudarc's own tracking, on `stream`: the launch is ordered after the slice's earlier writes (and, when it writes, its reads),
+    ///   on whatever stream they were, as far as cudarc's one `read` and one `write` event per slice reach;
+    /// * and the slice's own stream (the one it will be freed on) waits for the end of this kernel, when that is not `stream`:
+    ///   freeing the slice, or any later work on its stream, runs after the kernel, however many other launches read the slice on
+    ///   other streams. Making the tensor, and throwing it away or having the call refused, change nothing about that.
+    ///
+    /// A tensor made of a region the host vouched for ([`DevicePtr::from_raw`](crate::DevicePtr::from_raw)) is tracked by nothing:
+    /// ordering it against other streams, and keeping it allocated, is the host's. Ordering between launches on different streams that
+    /// write the same slice is cudarc's, which keeps one event for the last reader (see the `memory` module docs): use one stream for
+    /// work that must be ordered.
+    ///
+    /// `stream` must not be capturing a CUDA graph when a tensor is made of a slice: cudarc's tracking waits on events recorded
+    /// outside the capture, so the launch is refused by the driver (`CUDA_ERROR_STREAM_CAPTURE_ISOLATION`), which is an error and not a
+    /// graph that holds the slice's address with nothing to keep the slice alive. To capture, use [`Kernel::launch_raw`] with regions
+    /// from `unsafe` [`DevicePtr::from_raw`](crate::DevicePtr::from_raw), whose contract includes that the graph is not replayed
+    /// after the memory it captured is gone. For a raw handle that cudarc does not own, see [`Kernel::launch_raw`].
     pub fn launch(&self, stream: &CudaStream, tensors: &mut [TensorArg<'_>]) -> Result<()> {
         if **stream.context() != *self.loaded.context {
             return Err(Error::Launch(format!(

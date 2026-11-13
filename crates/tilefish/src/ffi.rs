@@ -23,10 +23,14 @@ compile_error!("tilefish packs a 32-bit kernel argument into the low bytes of a 
 /// cudarc loads the driver when it is first called, and **`CudaContext::new` panics inside cudarc when there is no driver**: this
 /// crate builds, and its tests that need no GPU run, on a machine without one, so a program that may run on such a machine asks
 /// first.
+///
+/// The probe opens the library (`dlopen`) and keeps it open when it is there. Opening a library runs its initializers, so on a
+/// machine that has one this has the effect of loading the driver into the process, as the first call of cudarc would; it calls no
+/// function of the driver.
 #[allow(unsafe_code)]
 pub fn driver_available() -> bool {
-    // SAFETY: `is_culib_present` only tries to open the library by its usual names (and keeps it open when it is there); it calls
-    // nothing in it.
+    // SAFETY: `is_culib_present` only tries to open the library by its usual names (and keeps it open when it is there): loading
+    // the driver, which runs its initializers as any use of it does, and calling no function in it.
     unsafe { sys::is_culib_present() }
 }
 
@@ -35,10 +39,16 @@ pub fn driver_available() -> bool {
 ///
 /// This is cudarc's launch builder (`CudaStream::launch_builder`, `.arg`, `.launch`): it binds the stream's context to the thread
 /// and calls `cuLaunchKernel`, which copies the arguments before it returns. A tensor that is cudarc's own memory is given to the
-/// builder as the slice or view itself, which makes cudarc order the launch on `stream` against every other use of it (the writes
-/// before it, the reads before a write) and record the launch on it, so that freeing it waits for the launch; a tensor that is a
-/// region the host vouched for is given as its address. A scalar is read through the first four bytes of its slot
-/// (little-endian, which the crate insists on).
+/// builder as the slice or view itself, which makes cudarc order the launch on `stream` after the slice's earlier writes (and reads,
+/// for a write) and record the launch on the slice's `read` or `write` event. A tensor that is a region the host vouched for is given
+/// as its address, and nothing tracks it. A scalar is read through the first four bytes of its slot (little-endian, which the crate
+/// insists on).
+///
+/// cudarc keeps one `read` event per slice, so with two launches that read a slice on two streams the free of the slice (on the stream
+/// it was allocated on) waits only for the last one. So, when a slice's owning stream is not `stream`, the builder is asked for the
+/// events around the kernel (`record_kernel_launch`, timing disabled) and, once the kernel is enqueued, the owning stream waits for
+/// the one recorded after it: whatever is enqueued on the owning stream afterwards (the free, a use) runs after this kernel, however
+/// many other launches read the slice. Nothing is waited for when every slice is on `stream` (stream order already says it).
 #[allow(unsafe_code)]
 pub(crate) fn enqueue(
     function: &CudaFunction,
@@ -48,15 +58,20 @@ pub(crate) fn enqueue(
     shared: u32,
     tensors: &mut [TensorArg<'_>],
 ) -> Result<()> {
+    let across = |t: &TensorArg<'_>| t.owner.as_ref().is_some_and(|owner| owner.cu_stream() != stream.cu_stream());
+    let any_across = tensors.iter().any(across);
     let mut launch = stream.launch_builder(function);
-    let mut tensors = tensors.iter_mut();
+    if any_across {
+        launch.record_kernel_launch(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING);
+    }
+    let mut pushed = tensors.iter_mut();
     for (slot, value) in prepared.params().iter().enumerate() {
         if prepared.tensor_of[slot] == NOT_A_TENSOR {
             launch.arg(value);
             continue;
         }
         // the tensors are in the order of the slots: `Plan::new` numbers them as it meets them
-        let Some(tensor) = tensors.next() else {
+        let Some(tensor) = pushed.next() else {
             return Err(Error::Launch("fewer tensors than the ABI has".to_owned()));
         };
         match &mut tensor.backing {
@@ -83,11 +98,18 @@ pub(crate) fn enqueue(
     // a `Prepared`, made by `Plan::prepare` from the manifest's ABI (a pointer, an `i32`, two null pointers for the binary's scratch,
     // in the order of its parameters), and the cubin is the one whose digests the manifest pinned. The memory the pointers name is
     // what the tensors borrow: a cudarc slice that the tensor holds the borrow of, for the whole call, and that this launch hands to
-    // cudarc on `stream` (so it is ordered and recorded there), or a region whose lifetime and contents the host vouched for
-    // (`DevicePtr::from_raw`); the tensors were checked to fit their memory, not to overlap where one is written, to be in this
-    // kernel's context and device, to be writable where the kernel writes, and to be aligned as the binary was compiled; the grid
-    // was checked against the device's limits and the shared memory against its opt-in maximum when the kernel was loaded.
-    unsafe { launch.launch(config) }.map(drop).map_err(Error::driver("cuLaunchKernel"))
+    // cudarc on `stream` (so it is ordered and recorded there, and the slice's own stream is made to wait for the kernel below), or
+    // a region whose lifetime and contents the host vouched for (`DevicePtr::from_raw`); the tensors were checked to fit their memory,
+    // not to overlap where one is written, to be in this kernel's context and device, to be writable where the kernel writes, and to
+    // be aligned as the binary was compiled; the grid was checked against the device's limits and the shared memory against its
+    // opt-in maximum when the kernel was loaded.
+    let events = unsafe { launch.launch(config) }.map_err(Error::driver("cuLaunchKernel"))?;
+    if let Some((_, end)) = events {
+        for owner in tensors.iter().filter(|t| across(t)).filter_map(|t| t.owner.as_ref()) {
+            owner.wait(&end).map_err(Error::driver("cuStreamWaitEvent"))?;
+        }
+    }
+    Ok(())
 }
 
 /// A context made current on this thread for as long as the guard lives, with what was current before put back when it is

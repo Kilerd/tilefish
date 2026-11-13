@@ -552,57 +552,244 @@ unsafe extern "C" fn hold_until_released(_: *mut c_void) {
     }
 }
 
-/// cudarc frees a `CudaSlice` on the stream it was allocated on (`cuMemFreeAsync`), and orders the free after the launches that used
-/// it only through the events it records when the slice is given to ITS launch builder on the stream that launches. A tensor over a
-/// slice, launched on another stream, used to be made for one stream and launched on another, so the free was not ordered after the
-/// kernel: the memory was reused by the next allocation while the kernel (held back here by a host function on its stream, as a busy
-/// stream would be) had yet to write it. Now the launch gives the slices to cudarc on the launch stream: nothing is written into the
-/// memory that was allocated after the free.
-#[test]
-fn a_launch_on_another_stream_is_ordered_against_the_free_of_its_slices() {
-    let (gpu, manifest) = (Gpu::new(), manifest());
-    let (s1, s2) = (gpu.stream.clone(), gpu.ctx.new_stream().expect("a second stream"));
-    let launcher = generated::GeluErf::load(&manifest, &gpu.ctx).unwrap();
-    let n = 4096usize;
-    let ones: Vec<u8> = (0..n).flat_map(|_| 0x3FC0u16.to_le_bytes()).collect(); // bf16 1.5: gelu_erf(1.5) is not zero
-    let shape = [n];
+/// What the tests of launches on other streams share. Everything is allocated on `s1` and freed there (as cudarc frees a slice on the
+/// stream it was allocated on, with `cuMemFreeAsync`); the launch under test is on `s2`, which is held back by a host function as a busy
+/// stream would be; `s3` is a stream with other work. The launch is `y = gelu(x)` over bf16 1.5s (`ones`), and one of the two is freed
+/// while it is queued and allocated again: the new memory for `x` is filled with 3.0s (`threes`), so a kernel that reads it by mistake
+/// writes `gelu(3.0)` into `y`, which is compared with what it must be; the new memory for `y` is filled with `ones`, so a kernel that
+/// writes it by mistake changes it. A kernel that read zeros, or wrote zeros over zeros, would hide the hazard.
+struct Race {
+    gpu: Gpu,
+    s1: Arc<CudaStream>,
+    s2: Arc<CudaStream>,
+    s3: Arc<CudaStream>,
+    launcher: generated::GeluErf,
+    ones: Vec<u8>,
+    threes: Vec<u8>,
+    /// `gelu(ones)`, computed on one stream with nothing else going on.
+    expect: Vec<u8>,
+    shape: [usize; 1],
+}
 
-    let mut stale_writes = 0;
-    for round in 0..20 {
+/// Which of the two slices of a launch is freed (and allocated again) while the launch is queued.
+#[derive(Clone, Copy, Debug)]
+enum Free {
+    /// The input: the kernel must still read 1.5s.
+    Input,
+    /// The output: the kernel must not write into what is allocated in its place.
+    Output,
+}
+
+impl Race {
+    const N: usize = 4096;
+
+    fn new() -> Self {
+        let (gpu, manifest) = (Gpu::new(), manifest());
+        let launcher = generated::GeluErf::load(&manifest, &gpu.ctx).unwrap();
+        let (s1, s2, s3) = (gpu.stream.clone(), gpu.ctx.new_stream().unwrap(), gpu.ctx.new_stream().unwrap());
+        let fill = |bits: u16| (0..Self::N).flat_map(move |_| bits.to_le_bytes()).collect::<Vec<u8>>();
+        let (ones, threes) = (fill(0x3FC0), fill(0x4040)); // bf16 1.5 and 3.0
+        let mut race = Self { gpu, s1, s2, s3, launcher, ones, threes, expect: Vec::new(), shape: [Self::N] };
+        let (x, mut y) = race.pair();
+        race.gelu(&race.s1, &x, &mut y).unwrap();
+        race.s1.synchronize().unwrap();
+        race.expect = race.s1.clone_dtoh(&y).unwrap();
+        assert!(race.expect != race.ones && race.expect != race.threes);
+        race
+    }
+
+    /// A slice of `ones`, and a slice of zeros, on `s1`.
+    fn pair(&self) -> (CudaSlice<u8>, CudaSlice<u8>) {
+        let (x, y) = (self.s1.clone_htod(&self.ones).unwrap(), self.s1.alloc_zeros::<u8>(Self::N * 2).unwrap());
+        self.s1.synchronize().unwrap();
+        (x, y)
+    }
+
+    /// Hold `s2` back: nothing queued on it from now runs until the returned thread has released it (after 150 ms).
+    fn hold(&self) -> std::thread::JoinHandle<()> {
         RELEASE.store(false, Ordering::Release);
-        let x = s1.clone_htod(&ones).unwrap();
-        let mut y = s1.alloc_zeros::<u8>(n * 2).unwrap();
-        s1.synchronize().unwrap();
-        // the launch stream is busy: nothing behind this runs until it is released
-        unsafe { result::stream::launch_host_function(s2.cu_stream(), hold_until_released, std::ptr::null_mut()) }
+        // SAFETY: the function only waits for an atomic and takes no argument.
+        unsafe { result::stream::launch_host_function(self.s2.cu_stream(), hold_until_released, std::ptr::null_mut()) }
             .expect("a host function on the second stream");
-        let releaser = std::thread::spawn(|| {
+        std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(150));
             RELEASE.store(true, Ordering::Release);
-        });
-        // slices allocated on s1, launched on s2
-        launcher
-            .launch(
-                &s2,
-                TensorRef::<Bf16>::from_cuda(&x, &shape).unwrap(),
-                TensorMut::<Bf16>::from_cuda(&mut y, &shape).unwrap(),
-            )
-            .unwrap();
-        // freed on s1 (where they were allocated) while the kernel has not run; then the memory is allocated again, and filled with the 1.5s of `ones` (what the kernel would change)
-        drop(x);
-        drop(y);
-        let z1 = s1.clone_htod(&ones).unwrap();
-        let z2 = s1.clone_htod(&ones).unwrap();
-        releaser.join().unwrap();
-        gpu.ctx.synchronize().unwrap();
-        let (got1, got2) = (s1.clone_dtoh(&z1).unwrap(), s1.clone_dtoh(&z2).unwrap());
-        if got1 != ones || got2 != ones {
-            stale_writes += 1;
-            println!("round {round}: the kernel wrote into memory that was allocated after its slices were freed");
+        })
+    }
+
+    /// `y = gelu(x)` on `stream`, through the safe launcher, with tensors made of the slices.
+    fn gelu(&self, stream: &CudaStream, x: &CudaSlice<u8>, y: &mut CudaSlice<u8>) -> Result<(), Error> {
+        self.gelu_of(stream, x, y, &self.shape)
+    }
+
+    fn gelu_of(
+        &self,
+        stream: &CudaStream,
+        x: &CudaSlice<u8>,
+        y: &mut CudaSlice<u8>,
+        shape: &[usize],
+    ) -> Result<(), Error> {
+        self.launcher.launch(stream, TensorRef::<Bf16>::from_cuda(x, shape)?, TensorMut::<Bf16>::from_cuda(y, shape)?)
+    }
+
+    /// Free one of `x` and `y`, and `others`, on `s1` while the held-back launch has not run, allocate memory again in their place,
+    /// release the stream, and say whether what the kernel did was not what it must have done.
+    fn freed_and_reused(
+        &self,
+        free: Free,
+        x: CudaSlice<u8>,
+        y: CudaSlice<u8>,
+        others: Vec<CudaSlice<u8>>,
+        releaser: std::thread::JoinHandle<()>,
+    ) -> bool {
+        match free {
+            Free::Input => {
+                drop((x, others));
+                let again = (0..3).map(|_| self.s1.clone_htod(&self.threes).unwrap()).collect::<Vec<_>>();
+                releaser.join().unwrap();
+                self.gpu.ctx.synchronize().unwrap();
+                drop(again);
+                self.s1.clone_dtoh(&y).unwrap() != self.expect // the kernel read what x held, not what was put there
+            }
+            Free::Output => {
+                drop((y, others));
+                let again = (0..3).map(|_| self.s1.clone_htod(&self.ones).unwrap()).collect::<Vec<_>>();
+                releaser.join().unwrap();
+                self.gpu.ctx.synchronize().unwrap();
+                again.iter().any(|z| self.s1.clone_dtoh(z).unwrap() != self.ones) // the kernel wrote into what was put there
+            }
         }
     }
-    assert_eq!(stale_writes, 0, "a launch on another stream was not ordered against the free of its slices");
-    println!("rust gate: 20 launches on a held-back second stream, their slices freed on the first: memory intact");
+
+    /// Run `round` 20 times with the input freed and 20 times with the output freed; none may have gone wrong.
+    fn rounds(&self, what: &str, round: impl Fn(&Race, Free) -> bool) {
+        let counts = [Free::Input, Free::Output].map(|free| (0..20).filter(|_| round(self, free)).count());
+        println!(
+            "rust gate: {what}: {} of 20 rounds wrong with the input freed, {} of 20 with the output freed",
+            counts[0], counts[1]
+        );
+        assert_eq!(counts, [0, 0], "{what}: a kernel read or wrote memory that had been freed and allocated again");
+    }
+}
+
+/// cudarc frees a `CudaSlice` on the stream it was allocated on, and orders the free after the launches that used it by the events it
+/// records. A launch of slices allocated on `s1` and launched on `s2` (held back): the slices are freed on `s1` while the kernel has not
+/// run, and allocated again. The launch makes `s1` wait for the kernel, so the new memory is not touched.
+#[test]
+fn a_launch_on_another_stream_is_ordered_against_the_free_of_its_slices() {
+    let race = Race::new();
+    race.rounds("a launch on a held-back second stream, its slices freed on the first", |r, free| {
+        let (x, mut y) = r.pair();
+        let releaser = r.hold();
+        r.gelu(&r.s2, &x, &mut y).unwrap();
+        r.freed_and_reused(free, x, y, vec![], releaser)
+    });
+}
+
+/// (1) Making a tensor over the slice, and throwing it away, while the launch is queued. Making a tensor used to record on the slice's
+/// single `read` event, replacing the record of the queued launch: the free then waited for the wrong point.
+#[test]
+fn a_tensor_made_and_thrown_away_while_a_launch_is_queued_changes_nothing() {
+    let race = Race::new();
+    race.rounds("a tensor over the slices, made and discarded while the launch is queued", |r, free| {
+        let (x, mut y) = r.pair();
+        let releaser = r.hold();
+        r.gelu(&r.s2, &x, &mut y).unwrap();
+        // (a tensor over `y`, which the queued launch writes, would make `s1` wait for that launch, as cudarc's own `device_ptr` does
+        // when it gives the address of a slice that has a write pending: harmless, but it would hide what this is about)
+        for _ in 0..3 {
+            let _ = TensorRef::<Bf16>::from_cuda(&x, &r.shape).unwrap();
+        }
+        r.freed_and_reused(free, x, y, vec![], releaser)
+    });
+}
+
+/// (2) A second launch on the same slices that a precondition refuses (a size that is not a multiple of 16), while the first is queued.
+#[test]
+fn a_second_launch_that_is_refused_while_a_launch_is_queued_changes_nothing() {
+    let race = Race::new();
+    race.rounds("a refused second launch while the first is queued", |r, free| {
+        let (x, mut y) = r.pair();
+        let mut y2 = r.s1.alloc_zeros::<u8>(Race::N * 2).unwrap();
+        let releaser = r.hold();
+        r.gelu(&r.s2, &x, &mut y).unwrap();
+        // the refused launch reads the same x, and writes another slice (not `y`, which the first launch writes: see above)
+        let e = r.gelu_of(&r.s2, &x, &mut y2, &[60]).unwrap_err();
+        assert_eq!(e.precondition_kind(), Some(PreconditionKind::Divisible), "{e}");
+        r.freed_and_reused(free, x, y, vec![y2], releaser)
+    });
+}
+
+/// (3) A second reader of the same slice on a third stream, which runs at once: cudarc keeps one `read` event per slice, so its record
+/// replaces the queued launch's, and a free that waited only for that one would not wait for the first.
+#[test]
+fn a_second_reader_on_a_third_stream_does_not_hide_the_first() {
+    let race = Race::new();
+    race.rounds("a second reader of the slice on a third stream", |r, free| {
+        let (x, mut y) = r.pair();
+        let mut y3 = r.s1.alloc_zeros::<u8>(Race::N * 2).unwrap();
+        let releaser = r.hold();
+        r.gelu(&r.s2, &x, &mut y).unwrap(); // queued behind the held-back stream
+        r.gelu(&r.s3, &x, &mut y3).unwrap(); // runs at once, and is recorded on x after the first
+        r.s3.synchronize().unwrap();
+        r.freed_and_reused(free, x, y, vec![y3], releaser)
+    });
+}
+
+/// (4) A writer of the slice on another stream while a reader is queued: building a `TensorMut` over the slice used to replace the
+/// record of the queued reader, so the writer did not wait for it and the reader read what the writer wrote.
+#[test]
+fn a_writer_on_another_stream_waits_for_the_reader_that_is_queued() {
+    let race = Race::new();
+    let expect = race.expect.clone();
+    let wrong = (0..20)
+        .filter(|_| {
+            let (mut x, mut y) = race.pair();
+            let w = race.s1.clone_htod(&race.threes).unwrap();
+            let releaser = race.hold();
+            race.gelu(&race.s2, &x, &mut y).unwrap(); // the reader of x, queued
+            race.gelu(&race.s3, &w, &mut x).unwrap(); // the writer of x, on another stream: it must wait for the reader
+            releaser.join().unwrap();
+            race.gpu.ctx.synchronize().unwrap();
+            race.s1.clone_dtoh(&y).unwrap() != expect // the reader read what the writer wrote
+        })
+        .count();
+    println!(
+        "rust gate: a writer on a third stream while the reader on the second is queued: {wrong} of 20 rounds wrong"
+    );
+    assert_eq!(wrong, 0, "a writer on another stream did not wait for the reader that was queued");
+}
+
+/// A safe `launch` on a stream that is capturing, of tensors made of cudarc slices, is an error: cudarc's tracking waits on events that
+/// were recorded outside the capture, which the driver refuses (`CUDA_ERROR_STREAM_CAPTURE_ISOLATION`). The alternative would be a graph
+/// that holds the slices' addresses and nothing that keeps them alive. The stream is usable afterwards.
+#[test]
+fn a_safe_launch_of_slices_on_a_capturing_stream_is_an_error_and_not_a_graph() {
+    let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
+    let case = cases["cases"].as_array().unwrap().iter().find(|c| c["launcher"] == "GeluErf").expect("a GeluErf case");
+    let expect = read(&gate_dir().join(case["tensors"][1]["expect"].as_str().unwrap()));
+    let mut tensors = tensors_of(&gpu, case).into_iter();
+    let ((_, x), (_, mut y)) = (tensors.next().unwrap(), tensors.next().unwrap());
+    let launcher = generated::GeluErf::load(&manifest, &gpu.ctx).unwrap();
+    gpu.stream.synchronize().unwrap();
+
+    // the tensors are made before the capture begins: making one is not what is under test
+    let (xt, yt) = (r::<Bf16>(&x).unwrap(), m::<Bf16>(&mut y).unwrap());
+    gpu.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).unwrap();
+    let refused = launcher.launch(&gpu.stream, xt, yt);
+    let ended = gpu.stream.end_capture(sys::CUgraphInstantiate_flags(0));
+    let e = refused.expect_err("the launch of slices was captured");
+    assert!(
+        matches!(&e, Error::Driver { source, .. } if source.0 == sys::CUresult::CUDA_ERROR_STREAM_CAPTURE_ISOLATION),
+        "{e:?}"
+    );
+    assert!(!matches!(ended, Ok(Some(_))), "a graph was made of a launch that was refused");
+
+    // nothing was captured, nothing was launched, and the stream works
+    assert!(gpu.download(&y).iter().all(|b| *b == 0));
+    launcher.launch(&gpu.stream, r::<Bf16>(&x).unwrap(), m::<Bf16>(&mut y).unwrap()).unwrap();
+    assert_eq!(gpu.download(&y), expect, "and the next launch on the stream is Python's replay, byte for byte");
+    println!("rust gate: a safe launch of slices on a capturing stream: {e}");
 }
 
 /// `launch_raw` makes the kernel's context current for the call, and puts back what was current: nothing, on a thread that had no

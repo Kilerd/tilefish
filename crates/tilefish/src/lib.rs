@@ -29,8 +29,8 @@
 //!
 //! // 3. Launch on a stream of that context. Every precondition of the binary is checked first. The tensors are made of cudarc
 //! //    slices, whose length is known: no `unsafe`, and a shape that does not fit its slice is an error, not a launch. A tensor
-//! //    borrows its slice (the slice cannot be freed under it), and the launch gives the slice to cudarc on the stream it launches
-//! //    on, which orders it against every other use of it.
+//! //    borrows its slice (the slice cannot be freed under it), making it records nothing on the slice, and the launch gives the
+//! //    slice to cudarc on the stream it launches on and makes the slice's own stream wait for the kernel (see `Kernel::launch`).
 //! let (x, mut y) = (stream.alloc_zeros::<u8>(4096 * 2)?, stream.alloc_zeros::<u8>(4096 * 2)?);
 //! let shape = [4096usize];
 //! let x_tensor = TensorRef::<Bf16>::from_cuda(&x, &shape)?;
@@ -68,15 +68,24 @@
 //! ([`CudaRead`], [`CudaWrite`]), because a user type that implements cudarc's `DevicePtr` can name any address and length), or of a
 //! region the host vouches for ([`DevicePtr`], `unsafe` to make).
 //!
-//! * A tensor over a slice holds the borrow of the slice, and has no stream: [`Kernel::launch`] hands the slice to cudarc's launch
-//!   builder on the stream it launches on, so cudarc's event tracking, which orders the launch against every other use of the slice
-//!   and makes freeing it (on the stream that allocated it) wait for the launch, is for the right stream. The tensor, and the
-//!   [`TensorArg`] it turns into, cannot outlive the slice, and an address is only a number
-//!   ([`TensorRef::addr`]): there is nothing to rebuild a tensor from without `unsafe`.
-//! * A region has a lifetime ([`DevicePtr<'a>`]); the host that makes one says what it borrows from, and nothing orders a launch
-//!   on it against other streams: that is the host's.
-//! * cudarc's event tracking is not meant for CUDA graph capture (see its `CudaContext::disable_event_tracking`): capture a launch
-//!   with tensors made of regions, or with tracking off, as the gate does.
+//! * A tensor over a slice holds the borrow of the slice, and has no stream. The tensor, and the [`TensorArg`] it turns into, cannot
+//!   outlive the slice, and an address is only a number ([`TensorRef::addr`]): there is nothing to rebuild a tensor from without
+//!   `unsafe`. **Making a tensor records nothing on the slice** (and neither does throwing it away, or a launch that is refused):
+//!   cudarc keeps one `read` event per slice, and recording on it replaces the record of a launch that is still queued on another stream.
+//! * [`Kernel::launch`] hands the slice to cudarc's launch builder on the stream it launches on, which orders the launch after the
+//!   slice's earlier writes (and reads, for a write) and records it on the slice, **and** makes the slice's own stream (the one it is
+//!   freed on) wait for an event recorded right after the kernel, when that is not the launch stream. So freeing the slice, or any
+//!   later work on its stream, runs after the kernel, however many other launches read the slice on other streams. What is not
+//!   guaranteed is more than cudarc's one-event-per-slice tracking gives between launches on different streams that write: a
+//!   writer waits for the last reader recorded, not for all of them. Order such work on one stream.
+//! * A region has a lifetime ([`DevicePtr<'a>`]); the host that makes one says what it borrows from, and nothing tracks it: not its
+//!   ordering against other streams, and not its being freed.
+//! * **A CUDA graph is captured with [`Kernel::launch_raw`] and regions** (`unsafe` [`DevicePtr::from_raw`]). A graph holds the
+//!   addresses it captured and nothing that keeps the memory alive, so the contract of `from_raw` includes that the graph is not
+//!   replayed after the memory is gone. The safe [`Kernel::launch`] on a capturing stream with a tensor made of a slice is an
+//!   error (the driver refuses cudarc's waits on events recorded outside the capture, `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`), not a
+//!   graph. There is nothing to switch off: do not turn cudarc's event tracking off to capture slices, it leaves exactly the graph
+//!   that outlives its memory.
 //!
 //! # `unsafe`
 //!
@@ -88,9 +97,10 @@
 //!
 //! * [`DevicePtr::from_raw`] (`unsafe`): the host vouches for a region of device memory, by address, byte length, device and lifetime:
 //!   that it is allocated there, and stays allocated (and is not raced on) until every launch that was given a tensor made of it has
-//!   completed. A tensor is *refused* when its shape needs more bytes than its region has, and the sub-regions (`offset`, `slice`) are
+//!   completed (a captured launch is launched again at every replay of its graph). A tensor is *refused* when its shape needs more bytes than its region has, and the sub-regions (`offset`, `slice`) are
 //!   checked, so a launch cannot reach past what was vouched for. A tensor over a cudarc `CudaSlice` or `CudaView` needs no
-//!   `unsafe` ([`TensorRef::from_cuda`]): its length is known, the borrow keeps it alive, and cudarc orders it.
+//!   `unsafe` ([`TensorRef::from_cuda`]): its length is known, the borrow keeps it alive, and the launch orders its free after the
+//!   kernel (see above).
 //! * [`Kernel::launch_raw`] (`unsafe`): the host vouches for a raw `CUstream` (a valid handle of the kernel's context). The kernel's
 //!   context is made current for the call and what was current is put back. The safe [`Kernel::launch`] takes cudarc's
 //!   [`CudaStream`] and checks that it is of the kernel's context.

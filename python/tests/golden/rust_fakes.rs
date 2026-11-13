@@ -49,9 +49,10 @@ impl RowopS32 {
         &self.kernel
     }
 
-    /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
-    /// other use of the slice.
+    /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
+    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
+    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
+    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -126,9 +127,10 @@ impl RowopS64 {
         &self.kernel
     }
 
-    /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
-    /// other use of the slice.
+    /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
+    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
+    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
+    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -206,9 +208,10 @@ impl Scale {
         &self.kernel
     }
 
-    /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked; it may be
-    /// capturing a CUDA graph). A tensor made of a cudarc slice is given to cudarc on `stream`, which orders the launch against every
-    /// other use of the slice.
+    /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
+    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
+    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
+    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched

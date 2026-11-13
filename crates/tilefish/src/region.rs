@@ -42,7 +42,9 @@ impl DevicePtr<'_> {
     /// * it stays allocated, and is not reused, for the whole lifetime `'a` of the region and until every launch that was given a
     ///   tensor made of it has completed on the device (a launch is asynchronous: its stream orders it, it is not finished when
     ///   `launch` returns). The lifetime is the caller's to bind: make it the lifetime of a borrow of whatever owns the memory, and
-    ///   the compiler refuses a tensor that outlives it;
+    ///   the compiler refuses a tensor that outlives it. A launch that is *captured in a CUDA graph* is launched again at every replay
+    ///   of the graph, which holds the address and nothing else: the memory must stay allocated for as long as the graph can be
+    ///   replayed, and the lifetime cannot say so;
     /// * nothing else writes it while a launch that reads it is in flight, or reads it while one that writes it is. Nothing orders a
     ///   launch on a raw region against other streams' use of the memory (cudarc's event tracking is for its own slices, which
     ///   `TensorRef::from_cuda` hands back to it): that is the caller's too.
