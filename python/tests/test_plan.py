@@ -491,6 +491,13 @@ def test_the_parameter_names_that_the_plan_makes_up_do_not_collide_with_the_grap
     assert p.outputs == ["out0_"] and "t0_" in listed
 
 
+def test_a_plan_describes_itself():
+    text = tilefish.plan(pm.block, reuse=True).describe()
+    assert "plan of graph 'block'" in text and "arena: 9240832 bytes (with reuse); without reuse 9634048, with reuse 9240832" in text
+    assert "workspace    workspace    u8" in text and "#2 attention (kernel): t1[view], t1[view], t1[view], t2, n" in text
+    assert text.splitlines()[-1].startswith("  #8 add (kernel)")
+
+
 def test_the_plan_of_a_graph_is_made_without_torch_and_names_every_binary_by_its_stem():
     p = tilefish.plan(pm.block)
     assert sorted(p.callees) == sorted(

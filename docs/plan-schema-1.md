@@ -248,7 +248,7 @@ graph replays byte-identically** (Python gate: `test_gpu_plan.py`, byte-identica
 
 ```python
 plan = tilefish.plan(graph, buckets={"M": [32, 64, 128]}, reuse=False)      # a Plan: no GPU, no torch, nothing built
-plan.doc, plan.digest, plan.arena_bytes, plan.arena_bytes_without_reuse, plan.arena_bytes_with_reuse, plan.steps(M=64), plan.buffers
+plan.doc, plan.digest, plan.arena_bytes, plan.arena_bytes_without_reuse, plan.arena_bytes_with_reuse, plan.steps(M=64), plan.buffers, plan.describe()
 p = tilefish.runtime.export(graph, "build/", buckets=..., reuse=...)        # builds the binaries, writes manifest.json and plan.json; returns the Plan loaded back (p.digest to pin)
 y = tilefish.run(graph, *inputs)                                            # jit: the plan in memory (tilefish.plan(graph), or plan=<a Plan>), binaries built in memory
 y = tilefish.run(graph, *inputs, mode="replay", plan="build/", pin=p.digest)  # replay: the exported plan, verified; or trust_directory=True

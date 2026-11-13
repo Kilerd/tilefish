@@ -735,6 +735,24 @@ class Plan:
     def to_json(self) -> str:
         return json.dumps(self._doc, indent=2, allow_nan=False) + "\n"
 
+    def describe(self) -> str:
+        """A readable report: the dimensions and buckets, the arena with and without reuse, every buffer (role, shape, offset, bytes) and the steps of the largest bucket."""
+        d = self._doc
+        lines = [
+            f"plan of graph '{self.name}' ({self.digest[:12]}): dims {self.dims}, {len(d['buckets'])} bucket(s), {len(d['buckets'][0]['steps'])} step(s)",
+            f"arena: {self.arena_bytes} bytes ({'with' if self.reuse else 'without'} reuse); without reuse {self.arena_bytes_without_reuse}, with reuse {self.arena_bytes_with_reuse}",
+            "buffers:",
+        ]
+        for b in d["buffers"]:
+            place = "external" if b["offset"] is None else f"arena +{b['offset']}"
+            lines.append(f"  {b['name']:<12} {b['role']:<12} {b['dtype']:<5} {b['shape']} {b['bytes']} bytes, {place}")
+        last = d["buckets"][-1]
+        lines.append(f"steps at {last['values'] or 'the only size'}:")
+        for i, st in enumerate(last["steps"]):
+            args = ", ".join(a["binding"] + ("[view]" if "view" in a else "") for a in st["args"])
+            lines.append(f"  #{i} {st['entry']} ({st['kind']}): {args}")
+        return "\n".join(lines)
+
     # -- what a runner needs ----------------------------------------------------------------------------------------------------
 
     @property
