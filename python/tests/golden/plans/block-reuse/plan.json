@@ -3,7 +3,7 @@
   "tilefish": "0.0.3",
   "graph": "block",
   "arch": "sm_103",
-  "manifest_digest": "9aef1335f474c69586b52f9ff4f47f492d29ece41896ff1330f89a5e9f162afa",
+  "manifest_digest": "b34a2377d61f44fc1c44e79420df1ebe2236135b3143bd0ba943fa0f237518ce",
   "dims": {
     "M": [
       32,
@@ -952,5 +952,5 @@
       ]
     }
   ],
-  "plan_digest": "57c2c4e2037bbfef861b197be15038713f5adfe2d2d0672385bb828e50554225"
+  "plan_digest": "9b4afd68419b20c2afc521272647db0a9860eb3da2d56b06e0fdc0dbeb188cbb"
 }

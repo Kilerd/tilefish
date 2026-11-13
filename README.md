@@ -309,8 +309,9 @@ as it is for its own architecture and refused for another. `replay` refuses a fi
 Tensor[M, N, bf16]` computes `a @ b.T` with an f32 accumulator and one rounding (`impl="cublaslt.gemm_bias"` adds `bias: Tensor[N, bf16]`, added in f32 before it).
 For each `(M, N, K, bias)` (`M` from its buckets) the algorithm that cuBLASLt's heuristic ranks first under a fixed workspace limit (8 519 680 bytes,
 torch's default; `workspace_bytes=` changes it) is pinned: its 64 bytes go to the manifest's `library` section with the cuBLASLt version that chose
-it, and `replay` runs that algorithm and refuses another cuBLASLt version. `jit` pins in memory the same way, so `jit` and `replay` run the same
-algorithm. The binding is ctypes on the `libcublasLt` the process already has loaded (torch's); operands are contiguous and 16-byte aligned (strided
+it and the SM count of the device it chose it on (`sm_count`: a MIG slice has fewer SMs than the whole GPU), and `replay` runs that algorithm and refuses
+another cuBLASLt version and a device of another SM count ("re-export the manifest on this device"). `jit` pins in memory the same way, per device, so
+`jit` and `replay` run the same algorithm. The binding is ctypes on the `libcublasLt` the process already has loaded (torch's); operands are contiguous and 16-byte aligned (strided
 operands are not supported yet).
 
 ## Launch plans: a graph as a static list of launches over one arena

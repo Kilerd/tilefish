@@ -44,7 +44,7 @@ IMPLS = {IMPL_GEMM: False, IMPL_GEMM_BIAS: True}  # impl -> whether it has a bia
 DEFAULT_WORKSPACE_BYTES = 8_519_680  # torch's default CUBLAS_WORKSPACE_CONFIG (":4096:2:16:8": 4096 KiB * 2 + 16 KiB * 8)
 MAX_WORKSPACE_BYTES = 1 << 40
 ALIGNMENT = 16
-DIGEST_FORMAT = 1  # of the canonical declaration below
+DIGEST_FORMAT = 2  # of the canonical declaration below (2: the digest of an entry covers the SM count of its device)
 
 # what every entry of this implementation says about the problem, as cuBLASLt is called (see the module docstring and describe())
 COMPUTE_TYPE = "CUBLAS_COMPUTE_32F"
@@ -55,7 +55,7 @@ _ALGO = re.compile(r"^[0-9a-f]{128}\Z")
 _ARCH = re.compile(r"^sm_[0-9]{2,3}\Z")
 ENTRY_KEYS = (
     "stem op arch impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd "
-    "epilogue workspace_bytes algo cublaslt_version declaration_digest"
+    "epilogue workspace_bytes algo cublaslt_version sm_count declaration_digest"
 ).split()
 
 
@@ -141,11 +141,17 @@ def _canonical(op: "LibraryOp") -> "dict[str, Any]":
     }
 
 
-def declaration_digest(op: "LibraryOp") -> str:
-    """A sha256 over the canonical declaration of a library op: its name, implementation, workspace limit and signature (dimensions with
-    their ``divisible_by`` and buckets); the same for every bucket and every architecture."""
-    text = json.dumps(_canonical(op), sort_keys=True, separators=(",", ":"), allow_nan=False)
+def _digest(canonical: "dict[str, Any]") -> str:
+    text = json.dumps(canonical, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def declaration_digest(op: "LibraryOp", sm_count: "int | None" = None) -> str:
+    """A sha256 over the canonical declaration of a library op: its name, implementation, workspace limit and signature (dimensions with
+    their ``divisible_by`` and buckets), the same for every bucket and every device. With ``sm_count``: over that and the number of
+    multiprocessors of the device an algorithm is pinned on, which is the ``declaration_digest`` of a library entry (:meth:`LibrarySpec.entry`)."""
+    canonical = _canonical(op)
+    return _digest(canonical if sm_count is None else {**canonical, "sm_count": sm_count})
 
 
 # -- the specs: one per bucket combination ---------------------------------------------------------------------------------------
@@ -153,8 +159,11 @@ def declaration_digest(op: "LibraryOp") -> str:
 
 @dataclass(frozen=True, eq=False)
 class LibrarySpec:
-    """Everything about one pinned library operation that does not depend on the architecture or on the algorithm: what an entry of the
-    manifest's ``library`` section says (see :meth:`entry`) before the build adds ``arch``, ``algo`` and ``cublaslt_version``."""
+    """Everything about one pinned library operation that does not depend on the device or on the algorithm: what an entry of the
+    manifest's ``library`` section says (see :meth:`entry`) before the build adds ``arch``, ``algo``, ``cublaslt_version`` and ``sm_count``.
+
+    ``declaration_digest`` is the digest of the declaration alone (the same on every device); the ``declaration_digest`` of an entry also covers
+    the SM count of the device it is pinned on (:meth:`pinned_digest`, over ``canonical``)."""
 
     stem: str
     op: str
@@ -168,13 +177,19 @@ class LibrarySpec:
     dims: "dict[str, dict[str, Any]]"
     preconditions: "tuple[Any, ...]"  # tilefish.aot.Precondition: pointer_alignment, static_size, bucket
     declaration_digest: str
+    canonical: "dict[str, Any]"  # the canonical declaration (_canonical) the digests are taken over
 
     @property
     def bias(self) -> bool:
         return IMPLS[self.impl]
 
-    def entry(self) -> "dict[str, Any]":
-        """The architecture-independent fields of the library entry (a replay checks the manifest's entry against them)."""
+    def pinned_digest(self, sm_count: int) -> str:
+        """The ``declaration_digest`` of an entry of this spec pinned on a device of ``sm_count`` multiprocessors."""
+        return _digest({**self.canonical, "sm_count": sm_count})
+
+    def entry(self, sm_count: int) -> "dict[str, Any]":
+        """The fields of the library entry that the declaration and the SM count of the device determine (a replay checks the manifest's entry
+        against them); the build adds ``arch``, ``algo`` and ``cublaslt_version``."""
         dtypes = {"a": "bf16", "b": "bf16", **({"bias": "bf16"} if self.bias else {}), "out": "bf16"}
         return {
             "stem": self.stem,
@@ -198,7 +213,8 @@ class LibrarySpec:
             "ldd": self.n,
             "epilogue": "bias" if self.bias else "none",
             "workspace_bytes": self.workspace_bytes,
-            "declaration_digest": self.declaration_digest,
+            "sm_count": sm_count,
+            "declaration_digest": self.pinned_digest(sm_count),
         }
 
 
@@ -222,7 +238,8 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
         for f in d.free_dims():
             free.setdefault(f.name, f)
     dims = [free[name] for name in sorted(free)]
-    digest = declaration_digest(op)
+    canonical = _canonical(op)
+    digest = _digest(canonical)
     specs = []
     for combo in itertools.product(*(d.buckets for d in dims)) if dims else [()]:  # type: ignore[arg-type]
         mapping = dict(zip(dims, combo))
@@ -276,6 +293,7 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
                 dims=dict(sorted(table.items())),
                 preconditions=tuple(pres),
                 declaration_digest=digest,
+                canonical=canonical,
             )
         )
     return specs
@@ -286,12 +304,15 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
 
 @dataclass(frozen=True, eq=False)
 class BuiltLibrary:
-    """One pinned library operation for one architecture: the spec, the algorithm cuBLASLt chose and the version that chose it."""
+    """One pinned library operation for one device: the spec, the algorithm cuBLASLt chose, the version that chose it, and the architecture and
+    the number of multiprocessors (SMs) of the device it chose it on (a MIG slice has fewer than the whole GPU, and an algorithm that partitions its
+    work by the SM count, a stream-K one, is chosen for that count)."""
 
     spec: LibrarySpec
     arch: str
     algo: str  # 128 lowercase hex digits: the 64 bytes of the cublasLtMatmulAlgo_t
     cublaslt_version: int
+    sm_count: int
 
     @property
     def stem(self) -> str:
@@ -303,7 +324,7 @@ class BuiltLibrary:
 
     def entry(self) -> "dict[str, Any]":
         """The ``library`` entry of the manifest."""
-        out = self.spec.entry()
+        out = self.spec.entry(self.sm_count)
         out["arch"] = self.arch
         out["algo"] = self.algo
         out["cublaslt_version"] = self.cublaslt_version
@@ -327,7 +348,7 @@ def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | 
             f"cannot pin '{spec.stem}' for sm_{cap}: cuBLASLt chooses an algorithm for the device it runs on, and device {index} is sm_{have}"
         )
     pinned = _cublaslt.pin_algo(spec.m, spec.n, spec.k, spec.bias, workspace_bytes=spec.workspace_bytes, device_index=index)
-    return BuiltLibrary(spec, f"sm_{cap}", pinned.algo_hex, _cublaslt.version())
+    return BuiltLibrary(spec, f"sm_{cap}", pinned.algo_hex, _cublaslt.version(), sm_count(index))
 
 
 def _device_index(index: "int | None") -> int:
@@ -343,12 +364,19 @@ def _capability(index: int) -> int:
     return major * 10 + minor
 
 
-def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str) -> BuiltLibrary:
-    """The pinned library operation of ``spec`` for ``arch`` from a manifest: the entry must be what the declaration asks for, and
-    cuBLASLt must be the version that chose its algorithm.
+def sm_count(index: int) -> int:
+    """The number of multiprocessors of device ``index`` (``CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT``; a MIG slice has its own count)."""
+    import torch
 
-    Raises :class:`~tilefish.errors.TilefishManifestError` for a missing entry, an entry that differs from the spec in any field (the first
-    one is named), and a cuBLASLt of another version than the entry's.
+    return int(torch.cuda.get_device_properties(index).multi_processor_count)
+
+
+def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str, sm_count: int) -> BuiltLibrary:
+    """The pinned library operation of ``spec`` for a device of ``arch`` with ``sm_count`` multiprocessors, from a manifest: the entry must have
+    been pinned on a device of that SM count, be what the declaration asks for, and cuBLASLt must be the version that chose its algorithm.
+
+    Raises :class:`~tilefish.errors.TilefishManifestError` for a missing entry, an entry pinned on a device of another SM count, an entry that
+    differs from the spec in any field (the first one is named), and a cuBLASLt of another version than the entry's.
     """
     from . import _cublaslt
     from .aot import _first_difference, _show
@@ -360,7 +388,14 @@ def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str) -> BuiltLib
             f"the manifest in {str(manifest.directory)!r} has no library entry for '{spec.stem}' on {arch}"
             + (f" (it has {', '.join(have)})" if have else f" (it has {sorted({e['stem'] for e in manifest.library_entries})})")
         )
-    expected = json.loads(json.dumps(spec.entry()))
+    pinned_on = entry["sm_count"]
+    if pinned_on != sm_count:
+        raise TilefishManifestError(
+            f"the manifest pinned the cuBLASLt algorithm of '{spec.stem}' ({arch}) on a device with {pinned_on} SMs, but this device has {sm_count}: "
+            "an algorithm is chosen for the number of multiprocessors it runs on (a MIG slice has fewer than the whole GPU), so the pin is refused; "
+            "re-export the manifest on this device (or on one with the same SM count)"
+        )
+    expected = json.loads(json.dumps(spec.entry(sm_count)))
     got = {k: entry.get(k) for k in expected}
     found = _first_difference(expected, got, "")
     if found is not None:
@@ -377,7 +412,7 @@ def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str) -> BuiltLib
             f"{here}: an algorithm id names other kernels in another version, so the pin is refused (export the manifest again with this "
             "cuBLASLt, or run with the version that made it)"
         )
-    return BuiltLibrary(spec, arch, entry["algo"], pinned_by)
+    return BuiltLibrary(spec, arch, entry["algo"], pinned_by, pinned_on)
 
 
 # -- reading an entry back ---------------------------------------------------------------------------------------------------------
@@ -448,6 +483,8 @@ def validate_entry(entry: Any, index: int = 0) -> None:
             _bad(where, f"algo must be 128 lowercase hex digits (the 64 bytes of a cublasLtMatmulAlgo_t), got {entry['algo']!r}")
         if not sv.is_int(entry["cublaslt_version"]) or entry["cublaslt_version"] < 1:
             _bad(where, f"cublaslt_version must be a positive int, got {entry['cublaslt_version']!r}")
+        if not sv.is_int(entry["sm_count"]) or entry["sm_count"] < 1:
+            _bad(where, f"sm_count must be a positive int (the multiprocessors of the device the algorithm was pinned on), got {entry['sm_count']!r}")
         if not (isinstance(entry["declaration_digest"], str) and sv._DIGEST.match(entry["declaration_digest"])):
             _bad(where, f"declaration_digest must be 64 lowercase hex digits (a sha256), got {entry['declaration_digest']!r}")
         buckets = entry["buckets"]

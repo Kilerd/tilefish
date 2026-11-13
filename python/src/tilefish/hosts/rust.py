@@ -43,7 +43,7 @@ What the module holds, in order:
   ``load(&Manifest, &Arc<CudaContext>)`` loads the binary for the device of a context and ``launch(&CudaStream, tensors...)`` checks the call and
   launches, and ``unsafe launch_raw(CUstream, tensors...)`` does the same on a raw handle. A CUDA graph is captured with regions
   and ``launch_raw`` (a launch of cudarc slices on a capturing stream is an error). A library struct adds ``M``, ``N``, ``K``, ``BIAS``,
-  ``WORKSPACE_BYTES`` and ``PINNED_WITH`` (the cuBLASLt version of each architecture's pin) and ``gemm()``.
+  ``WORKSPACE_BYTES`` and ``PINNED_WITH`` (the cuBLASLt version of each architecture's pin; its doc names the SM count each was pinned on) and ``gemm()``.
 
 The output is deterministic: the same manifest gives the same bytes. Nothing in it depends on where the manifest was
 written, except the ``include_bytes!`` paths with ``embed=True``.
@@ -100,9 +100,10 @@ _SHARED_FIELDS = (
     "source_sha256",
 )
 
-# what the library entries of one stem must agree on: everything but the architecture and what the pin chose on it
+# what the library entries of one stem must agree on: everything but the device (its architecture and SM count, and the declaration digest, which
+# covers the SM count) and what the pin chose on it
 _LIBRARY_SHARED_FIELDS = (
-    "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes declaration_digest"
+    "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes"
 ).split()
 
 _RUST_KEYWORDS = frozenset(
@@ -514,7 +515,7 @@ def _validate_library_entry(entry: Any) -> None:
     impl = entry.get("impl")
     if impl not in LIBRARY_IMPLS:
         _bad(who, f"impl must be one of {sorted(LIBRARY_IMPLS)}, got {impl!r}")
-    for key in ("m", "n", "k", "workspace_bytes", "cublaslt_version"):
+    for key in ("m", "n", "k", "workspace_bytes", "cublaslt_version", "sm_count"):
         _count(who, key, entry.get(key), 1)
     params = _field(who, "abi.params", _field(who, "abi", entry, "abi", dict), "params", list)
     if len(params) != (4 if LIBRARY_IMPLS[impl] else 3):
@@ -643,8 +644,8 @@ def _check_declarations(binaries: "list[_Binary]", gemms: "list[_Gemm]", ops: "I
                 f"the declaration of '{op.name}' has no library entry '{gemm.stem}' (it has {sorted(specs)}): it is not what the "
                 "manifest was built from"
             )
-        expected = json.loads(json.dumps(spec.entry()))
         for entry in gemm.entries:
+            expected = json.loads(json.dumps(spec.entry(entry["sm_count"])))  # the declaration on the device the entry was pinned on
             got = {k: entry.get(k) for k in expected}
             difference = _first_difference(expected, got, "")
             if difference is not None:
@@ -897,8 +898,8 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
     lines.append("")
     lines += _wrap(
         "The algorithm is the one cuBLASLt's heuristic ranked first when the manifest was made, pinned in the manifest and run as it is; "
-        "a cuBLASLt of another version than the one that chose it is refused. Pinned with: "
-        + ", ".join(f"{x['arch']}: cuBLASLt {_cublaslt_text(x['cublaslt_version'])}" for x in g.entries)
+        "a cuBLASLt of another version than the one that chose it, and a device of another number of SMs, are refused. Pinned with: "
+        + ", ".join(f"{x['arch']}: cuBLASLt {_cublaslt_text(x['cublaslt_version'])} on {x['sm_count']} SMs" for x in g.entries)
         + "."
     )
     return lines
@@ -936,8 +937,8 @@ def _render_gemm(g: _Gemm) -> str:
     out.append("\n")
     out.append("    /// Load the GEMM for the device of `ctx` from `manifest`, in that context (which the launcher then keeps alive).\n")
     out.append("    ///\n")
-    out.append("    /// Refuses a manifest whose digest is not [`MANIFEST_DIGEST`], one without an entry for the device, and a cuBLASLt of another\n")
-    out.append("    /// version than the one that chose the algorithm (see `PINNED_WITH`).\n")
+    out.append("    /// Refuses a manifest whose digest is not [`MANIFEST_DIGEST`], one without an entry for the device, a cuBLASLt of another\n")
+    out.append("    /// version than the one that chose the algorithm (see `PINNED_WITH`), and a device of another number of SMs than it was pinned on.\n")
     out.append("    pub fn load(manifest: &Manifest, ctx: &Arc<CudaContext>) -> Result<Self, Error> {\n")
     out.append("        manifest.require_digest(MANIFEST_DIGEST)?;\n")
     out.append("        let gemm = manifest.gemm(ctx, Self::STEM, Self::BUCKETS, Arch::of_context(ctx)?)?;\n")

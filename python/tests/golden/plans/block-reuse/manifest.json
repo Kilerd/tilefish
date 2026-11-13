@@ -1316,7 +1316,8 @@
       "ldd": 256,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "e907fb7b5409d919a9c64b3ccaaebec3f618cac18f4c700f4917c59fac55a55a",
+      "sm_count": 148,
+      "declaration_digest": "e23a203ddcf0b903914004c7849f1130c130938ff20e64184510bbc6782c693e",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -1451,7 +1452,8 @@
       "ldd": 256,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "e907fb7b5409d919a9c64b3ccaaebec3f618cac18f4c700f4917c59fac55a55a",
+      "sm_count": 148,
+      "declaration_digest": "e23a203ddcf0b903914004c7849f1130c130938ff20e64184510bbc6782c693e",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -1586,7 +1588,8 @@
       "ldd": 256,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "e907fb7b5409d919a9c64b3ccaaebec3f618cac18f4c700f4917c59fac55a55a",
+      "sm_count": 148,
+      "declaration_digest": "e23a203ddcf0b903914004c7849f1130c130938ff20e64184510bbc6782c693e",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -1721,7 +1724,8 @@
       "ldd": 256,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "d42481f7583fcab4fd079d4bba7ffc2645d1420a0e028696608effcbba12947d",
+      "sm_count": 148,
+      "declaration_digest": "3da59cb84812c983c0327ad0995bb62c077635334308a921aa04d89e87323d50",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -1856,7 +1860,8 @@
       "ldd": 256,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "d42481f7583fcab4fd079d4bba7ffc2645d1420a0e028696608effcbba12947d",
+      "sm_count": 148,
+      "declaration_digest": "3da59cb84812c983c0327ad0995bb62c077635334308a921aa04d89e87323d50",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -1991,7 +1996,8 @@
       "ldd": 256,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "d42481f7583fcab4fd079d4bba7ffc2645d1420a0e028696608effcbba12947d",
+      "sm_count": 148,
+      "declaration_digest": "3da59cb84812c983c0327ad0995bb62c077635334308a921aa04d89e87323d50",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -2150,7 +2156,8 @@
       "ldd": 768,
       "epilogue": "bias",
       "workspace_bytes": 8519680,
-      "declaration_digest": "7d5e406f91f18042abd53ed10266eb06aef53421b913205279b78c1353b2f381",
+      "sm_count": 148,
+      "declaration_digest": "00e798ad608ff1b42447a0007c0f49b80bb7099d2a134b73ccad980a265e5e11",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -2309,7 +2316,8 @@
       "ldd": 768,
       "epilogue": "bias",
       "workspace_bytes": 8519680,
-      "declaration_digest": "7d5e406f91f18042abd53ed10266eb06aef53421b913205279b78c1353b2f381",
+      "sm_count": 148,
+      "declaration_digest": "00e798ad608ff1b42447a0007c0f49b80bb7099d2a134b73ccad980a265e5e11",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -2468,7 +2476,8 @@
       "ldd": 768,
       "epilogue": "bias",
       "workspace_bytes": 8519680,
-      "declaration_digest": "7d5e406f91f18042abd53ed10266eb06aef53421b913205279b78c1353b2f381",
+      "sm_count": 148,
+      "declaration_digest": "00e798ad608ff1b42447a0007c0f49b80bb7099d2a134b73ccad980a265e5e11",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -2603,7 +2612,8 @@
       "ldd": 1024,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "9b28c09c5b38cc5c173073ae4b73685d82ead687ff668ae8d4865a6fbfc49775",
+      "sm_count": 148,
+      "declaration_digest": "724e3c6700a691baedf8350c538dff3ff61a5b2c46dc4d2e64b189324c9d9a0f",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -2738,7 +2748,8 @@
       "ldd": 1024,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "9b28c09c5b38cc5c173073ae4b73685d82ead687ff668ae8d4865a6fbfc49775",
+      "sm_count": 148,
+      "declaration_digest": "724e3c6700a691baedf8350c538dff3ff61a5b2c46dc4d2e64b189324c9d9a0f",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804
@@ -2873,7 +2884,8 @@
       "ldd": 1024,
       "epilogue": "none",
       "workspace_bytes": 8519680,
-      "declaration_digest": "9b28c09c5b38cc5c173073ae4b73685d82ead687ff668ae8d4865a6fbfc49775",
+      "sm_count": 148,
+      "declaration_digest": "724e3c6700a691baedf8350c538dff3ff61a5b2c46dc4d2e64b189324c9d9a0f",
       "arch": "sm_103",
       "algo": "abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab",
       "cublaslt_version": 120804

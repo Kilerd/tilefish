@@ -27,7 +27,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | ABI argument kinds | `pointer`, `scalar` | adds `fixed`: a scalar whose value is in the manifest |
 | preconditions | `pointer_alignment` always 16 bytes | a strided pointer may promise only its element alignment; adds `max_extent` |
 | `dims` | names from shapes, scalars and the grid | also the stride dimensions and the offset dimension of a strided pointer |
-| library | none | a pinned cuBLASLt GEMM: `library` entries (no file) |
+| library | none | a pinned cuBLASLt GEMM, for one device (its architecture and SM count): `library` entries (no file) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -57,7 +57,7 @@ sha256( b"tilefish.manifest-digest.v3\0" + canonical_json({"schema": 3, "kernels
   `NaN`/`Infinity`, floats in Python's shortest round-trip `repr` (`2.0`, `1e-06`).
 * **Every new field is digested, with no exception and no special treatment:** an entry is digested whole, so `kind`, `abi.scratch_slots`,
   `strides`, `offset`, `stride_of`, a `fixed` argument and its `value`, `binary`, the `max_extent` precondition, the `dims` additions, every field
-  of a `library` entry (the algorithm, the cuBLASLt version, the workspace) are all in it. The top-level `tilefish` is the only field outside it.
+  of a `library` entry (the algorithm, the cuBLASLt version, the SM count of the device, the workspace) are all in it. The top-level `tilefish` is the only field outside it.
 * The digest of the empty schema 3 manifest, `{"schema":3,"kernels":[],"library":[]}`, is
   `f66955caeb4e878dbe95483da2607d19ea4f734977e86282fff6f92f1a87fe6e` (a test vector; `test_manifest_schema3.py` recomputes it from the definition
   above). The empty schema 2 manifest `{"schema":2,"kernels":[]}` has `a3593eed6b463f7408711b92645197eda2e7bc5f2830b138b40e33ceedc1cfc8`.
@@ -264,7 +264,8 @@ bucket combination (the stem names the buckets, like a kernel's).
 | `workspace_bytes` | int from 1 to 2^40: the workspace limit the heuristic was asked under **and the size of the workspace a launch provides** (default `8519680`, torch's default `CUBLAS_WORKSPACE_CONFIG`) |
 | `algo` | 128 lowercase hex digits: the 64 bytes of the `cublasLtMatmulAlgo_t`, in memory order (eight `uint64_t`, as the host stores them) |
 | `cublaslt_version` | int ≥ 1: the value of `cublasLtGetVersion()` of the library that chose `algo` (e.g. `120804` for 12.8.4) |
-| `declaration_digest` | 64 lowercase hex digits: sha256 over the canonical declaration (name, impl, workspace limit, signature with the dimensions' constraints) |
+| `sm_count` | int ≥ 1 (a JSON integer: not `30.0`, not `true`, not `"30"`; no upper bound): the multiprocessor count (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`, torch's `multi_processor_count`) of the device `algo` was pinned on. A MIG slice has fewer SMs than the whole GPU (a B300 slice of 1g has 30, the GPU 148), and an algorithm that partitions its work by the SM count (stream-K) is chosen for that count |
+| `declaration_digest` | 64 lowercase hex digits: sha256 over the canonical declaration (name, impl, workspace limit, signature with the dimensions' constraints) **and the `sm_count`** (the canonical declaration object with the key `"sm_count"` added, format 2): a pin is the declaration on one device |
 
 `abi.params[i]` has exactly `index` (= i), `name`, `kind` (`"pointer"`), `dtype` (`"bf16"`), `access` (`"in"`, and `"out"` for the last), `shape` (a list
 of ints and dimension expressions: `a` is rank 2, `b` rank 2, `bias` rank 1, `out` rank 2). The shapes must agree with `m`, `n`, `k`: an integer entry
@@ -282,10 +283,18 @@ table and `describe` agree.
 **Replay.**
 
 1. Bind the dimensions from the shapes and check the preconditions as for a kernel (alignment, static sizes, the exact bucket, contiguity).
-2. Refuse if the process's `cublasLtGetVersion()` is not `cublaslt_version`: an algorithm id names other kernels in another version. (Python:
+2. Refuse if the device's multiprocessor count is not `sm_count`, with an error that says to re-export the manifest on this device (Python, before any
+   other field of the entry is compared: `TilefishManifestError`, "the manifest pinned the cuBLASLt algorithm of '<stem>' (<arch>) on a device with X SMs,
+   but this device has Y: ... re-export the manifest on this device"). An entry is found by `(stem, arch)`, and two devices of one architecture may
+   differ in their SM count (a MIG slice and the whole GPU), so the architecture alone does not say the pin is for this device.
+3. Refuse if the process's `cublasLtGetVersion()` is not `cublaslt_version`: an algorithm id names other kernels in another version. (Python:
    `TilefishManifestError`, "the manifest pinned the cuBLASLt algorithm of '<stem>' (<arch>) with cuBLASLt X, but this process has cuBLASLt Y".)
-3. Rebuild the `cublasLtMatmulAlgo_t` from `algo`; ask `cublasLtMatmulAlgoCheck` for the problem (the algo must be valid, and its
-   `workspaceSize` must be ≤ `workspace_bytes`), then `cublasLtMatmul` with a workspace of at least that size on the launch stream.
+   **The build number is not compared, because cuBLASLt does not expose one**: `cublasLtGetVersion()` is `major * 10000 + minor * 100 + patch`, and
+   `cublasLtGetProperty` answers the same three (`MAJOR_VERSION`, `MINOR_VERSION`, `PATCH_LEVEL`); the 12.8.4 library has no other version or build
+   entry point (checked). Two builds of one version are therefore not told apart by this check.
+4. Rebuild the `cublasLtMatmulAlgo_t` from `algo`; ask `cublasLtMatmulAlgoCheck` for the problem (the algo must be valid, and its
+   `workspaceSize` must be ≤ `workspace_bytes`), then `cublasLtMatmul` with a workspace of at least that size on the launch stream. A workspace the
+   caller gives (a launch plan's arena buffer, the last tensor of a Rust launch) is **256-byte aligned**, which both hosts require.
    **`cublasLtMatmulAlgoCheck` is a weak judge of the bytes**: measured on 12.8.4 it accepts a changed version field, changed padding, a reserved CTA
    swizzling and a garbage custom option, and it crashes the process on a tile id ≥ 2^31. The Python binding therefore first rebuilds the algorithm
    with `cublasLtMatmulAlgoInit` + `cublasLtMatmulAlgoConfigSetAttribute` from the configuration the bytes read back as and requires identical bytes,
@@ -293,15 +302,18 @@ table and `describe` agree.
    accumulator, alignment capabilities ≤ 16 bytes, and split-K to go with the reduction scheme `NONE` or `COMPUTE_TYPE` (f32 partial sums; a bf16
    partial sum would round more than once). A host that runs a `library` entry should do the same. What no byte check can see is a flip to *another
    valid* algorithm: only the digest of the manifest vouches for the file.
-4. The pin belongs to one `arch`: an entry is found by `(stem, arch)` for the architecture of the device, and a missing pair is an error naming the
-   architectures the manifest has.
+5. The pin belongs to one `arch` and one SM count: an entry is found by `(stem, arch)` for the architecture of the device, and a missing pair is an error
+   naming the architectures the manifest has; the entry found must have the device's `sm_count` (step 2).
 
 **Pinning (how an entry is made)**, for the writers: the heuristic is asked on a device of `arch` with the preferences `MAX_WORKSPACE_BYTES =
-workspace_bytes`, `MIN_ALIGNMENT_{A,B,C,D}_BYTES = 16` and a reduction-scheme mask of `NONE | COMPUTE_TYPE`, for a few results; result 0 is the pin.
-`jit` pins in memory the same way, so `jit` and `replay` run the same algorithm by construction. A pin does not bind itself to its problem
-(the same bytes are accepted for other problems), which is why `m`, `n`, `k` and the epilogue are in the entry.
+workspace_bytes`, `MIN_ALIGNMENT_{A,B,C,D}_BYTES = 16` and a reduction-scheme mask of `NONE | COMPUTE_TYPE`, for a few results; result 0 is the pin, and
+the device's multiprocessor count is `sm_count`. `jit` pins in memory the same way, for the device it runs on (its in-memory pins are kept per device), so
+`jit` and `replay` run the same algorithm by construction. A pin does not bind itself to its problem (the same bytes are accepted for other problems), which
+is why `m`, `n`, `k` and the epilogue are in the entry. Re-exporting on a device of another SM count makes another entry for the same `(stem, arch)`, which
+replaces the old one only with `overwrite=True` (its `sm_count` and `declaration_digest` differ).
 
-**Digest.** The entry is digested whole, in `library` (section 3); `algo` and `cublaslt_version` are in it.
+**Digest.** The entry is digested whole, in `library` (section 3); `algo`, `cublaslt_version` and `sm_count` are in it (and `sm_count` is in its
+`declaration_digest` too).
 
 ## 10. Strict reading: every refusal
 

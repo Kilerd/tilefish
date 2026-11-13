@@ -203,6 +203,34 @@ def test_a_cublaslt_of_another_version_is_refused(ops, exported, monkeypatch, tm
         tilefish.run(op, *args, mode="replay", manifest=other, trust_directory=True)
 
 
+def test_an_entry_records_the_sm_count_of_its_device_and_a_device_of_another_count_is_refused(ops, exported, tmp_path):
+    """A pin is chosen for the multiprocessors it runs on (this MIG slice has fewer than the whole GPU): the entry records them, and a replay on a device of
+    another count is told to re-export (an entry that says another count stands in for that device)."""
+    from tilefish import _library
+
+    directory, manifest = exported
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    doc = json.loads((directory / "manifest.json").read_text())
+    assert {e["sm_count"] for e in doc["library"]} == {sms} and _library.sm_count(0) == sms
+    op = ops[(1024, 1024, False)]
+    args = operands(32, 1024, 1024, False)
+    spec = next(s for s in _library.library_specs(op) if s.stem == "gemm_1024_1024.M32")
+    assert manifest.library_entry(spec.stem, f"sm_{_arch()}")["declaration_digest"] == spec.pinned_digest(sms)
+    for e in doc["library"]:
+        e["sm_count"] = sms + 2  # pinned on another slice
+        e["declaration_digest"] = next(s for s in _library.library_specs(ops[(e["n"], e["k"], e["impl"].endswith("bias"))]) if s.stem == e["stem"]).pinned_digest(sms + 2)
+    (tmp_path / "manifest.json").write_text(json.dumps(doc))
+    with pytest.raises(
+        TilefishManifestError, match=rf"on a device with {sms + 2} SMs, but this device has {sms}: .*re-export the manifest on this device"
+    ):
+        tilefish.run(op, *args, mode="replay", manifest=tmp_path, trust_directory=True)
+    # jit pins for the device it runs on: the key of its in-memory pin has the device and its SM count
+    runtime._pins.clear()
+    tilefish.run(op, *args)
+    (key,) = [k for k in runtime._pins if k[0] == "gemm_1024_1024.M32"]
+    assert key[1:4] == (f"sm_{_arch()}", 0, sms)
+
+
 def test_an_entry_that_is_not_what_the_declaration_asks_for_is_refused(ops, exported, tmp_path):
     directory, _ = exported
     op = ops[(1024, 1024, False)]

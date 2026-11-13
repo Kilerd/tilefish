@@ -13,6 +13,7 @@ from tilefish._library import BuiltLibrary
 ARCH = 103
 FAKE_ALGO = "ab" * 64
 FAKE_CUBLASLT = 120804
+FAKE_SM_COUNT = 148  # the multiprocessors of a whole B300 (a fake pin says which device it is for like a real one)
 
 
 def builds(plan, arch=ARCH):
@@ -20,7 +21,7 @@ def builds(plan, arch=ARCH):
     for stem, callee in sorted(plan.callees.items()):
         spec = callee.by_stem[stem]
         if callee.kind == "library":
-            library.append(BuiltLibrary(spec, f"sm_{arch}", FAKE_ALGO, FAKE_CUBLASLT))
+            library.append(BuiltLibrary(spec, f"sm_{arch}", FAKE_ALGO, FAKE_CUBLASLT, FAKE_SM_COUNT))
         else:
             kernels.append(fake_build(spec, arch=f"sm_{arch}"))
     return kernels, library
