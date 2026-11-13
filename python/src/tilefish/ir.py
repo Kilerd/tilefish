@@ -96,7 +96,7 @@ class Node:
     versions, it has no output.
     """
 
-    __slots__ = ("op", "inputs", "attrs", "outputs")
+    __slots__ = ("op", "inputs", "attrs", "outputs", "callee")
 
     def __init__(
         self,
@@ -109,6 +109,9 @@ class Node:
         self.inputs = tuple(inputs)
         self.attrs = dict(attrs)
         self.outputs = tuple(outputs)
+        # The declared operator a call node calls (a kernel, extern, library or graph op), so that a plan can find what to launch;
+        # ``None`` for a built-in op (arithmetic, a cast, a view, a store). It is not in ``attrs``: it is not printed and not compared.
+        self.callee: Any = None
 
     @property
     def output_types(self) -> "tuple[TensorType, ...]":

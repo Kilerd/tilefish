@@ -311,6 +311,38 @@ it, and `replay` runs that algorithm and refuses another cuBLASLt version. `jit`
 algorithm. The binding is ctypes on the `libcublasLt` the process already has loaded (torch's); operands are contiguous and 16-byte aligned (strided
 operands are not supported yet).
 
+## Launch plans: a graph as a static list of launches over one arena
+
+A model forward is not one kernel. `tilefish.plan(graph, buckets=...)` compiles a `@tilefish.graph` into a **launch plan**: for every combination of the bucket values of its
+dimensions, the ordered launches of manifest entries (a lowered kernel, a hand-written Triton extern, a prebuilt binary or a pinned cuBLASLt GEMM), with every pointer argument bound to a
+buffer or to a *view* of one (a `reshape`, `permute`, `select` or `split` copies nothing), and **one arena of device memory** for everything the caller does not provide: the intermediates, one
+slot per `DevScalar` input and the cuBLASLt workspace. Every arena buffer has a fixed byte offset, a multiple of 256, **the same in every bucket** (the arena is sized for the largest), so a plan
+can be captured in a CUDA graph once per bucket at fixed addresses. The steps run on one stream in the order of the IR, with no synchronization between them and none implied (an in-place call
+keeps the storage of the version it consumes). `reuse=True` lets intermediates share bytes where no step uses both: the transformer block of the gate (rmsnorm, a bias GEMM whose output is split
+into q, k and v views, an attention that masks the keys at a device scalar `n`, a GEMM, a residual add and rmsnorm, two GEMMs around a gelu, a residual add; rows bucketed over 32, 64 and 128)
+needs 9 634 048 bytes without reuse (8 519 680 of them the workspace) and 9 240 832 with it; unrolled 24 times (216 launches per bucket, the weights of the layers views of stacked
+parameters) the arena is 36 765 952 bytes without reuse and 9 306 368 with it, one layer's intermediates plus the workspace whatever the depth.
+
+```python
+plan = tilefish.plan(block, buckets={"M": [32, 64, 128]}, reuse=False)       # no GPU, no torch: steps, buffers, offsets
+p = tilefish.runtime.export(block, "build/")                                  # binaries, manifest.json and plan.json (schema "tilefish.plan.v1"); p.digest is the pin
+y = tilefish.run(block, x, n, *weights)                                       # jit: the same plan, binaries built in memory
+y = tilefish.run(block, x, n, *weights, mode="replay", plan="build/", pin=p.digest)   # a verified plan directory, or trust_directory=True
+y = tilefish.run(block, x, n, *weights, mode="reference")                     # each op's reference composed in torch
+```
+
+`plan.json` carries the plan and the digest of the manifest it was built against, so **pinning the plan digest pins every binary and every pinned GEMM algorithm it launches**. A replay loads and
+verifies the file and its manifest (a tampered plan, a wrong pin, a plan built against another manifest, and a plan of a graph that changed are all refused), allocates the arena once per device
+and keeps it, and checks **every step's preconditions before the first launch**: a failure launches nothing, not even the write of a device scalar. A run allocates nothing but its outputs
+(`outputs=` gives them) and waits for nothing: the GEMM workspace is in the arena, a device scalar is written by a stream-ordered copy. So **a replay under `torch.cuda.graph` captures and the
+graph replays byte-identically** (`runtime.prepare` does the allocating and the loading that cannot happen inside a capture; `docs/plan-schema-1.md` lists every reason a plan could fail to
+capture). `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
+eager composition of the same ops give the same bytes for every bucket and two values of `n`.
+
+A plan launches declared operators and views. Arithmetic traced in the graph body, a `store`, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
+tensor was updated in place are refused with the rule that says so; there is no fusion in a plan yet. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation rules, the
+digest) for the host that will run it without Python.
+
 ## The Rust host
 
 The `tilefish` crate (`crates/tilefish`, version 0.0.1) is the

@@ -1,0 +1,956 @@
+{
+  "schema": "tilefish.plan.v1",
+  "tilefish": "0.0.3",
+  "graph": "block",
+  "arch": "sm_103",
+  "manifest_digest": "9aef1335f474c69586b52f9ff4f47f492d29ece41896ff1330f89a5e9f162afa",
+  "dims": {
+    "M": [
+      32,
+      64,
+      128
+    ]
+  },
+  "reuse": true,
+  "arena_alignment": 256,
+  "arena_bytes": 9240832,
+  "buffers": [
+    {
+      "name": "x",
+      "role": "input",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        256
+      ],
+      "offset": null,
+      "bytes": 65536
+    },
+    {
+      "name": "n",
+      "role": "devscalar",
+      "dtype": "i32",
+      "shape": [],
+      "offset": 0,
+      "bytes": 4
+    },
+    {
+      "name": "w_ln1",
+      "role": "weight",
+      "dtype": "bf16",
+      "shape": [
+        256
+      ],
+      "offset": null,
+      "bytes": 512
+    },
+    {
+      "name": "w_qkv",
+      "role": "weight",
+      "dtype": "bf16",
+      "shape": [
+        768,
+        256
+      ],
+      "offset": null,
+      "bytes": 393216
+    },
+    {
+      "name": "b_qkv",
+      "role": "weight",
+      "dtype": "bf16",
+      "shape": [
+        768
+      ],
+      "offset": null,
+      "bytes": 1536
+    },
+    {
+      "name": "w_o",
+      "role": "weight",
+      "dtype": "bf16",
+      "shape": [
+        256,
+        256
+      ],
+      "offset": null,
+      "bytes": 131072
+    },
+    {
+      "name": "w_ln2",
+      "role": "weight",
+      "dtype": "bf16",
+      "shape": [
+        256
+      ],
+      "offset": null,
+      "bytes": 512
+    },
+    {
+      "name": "w_up",
+      "role": "weight",
+      "dtype": "bf16",
+      "shape": [
+        1024,
+        256
+      ],
+      "offset": null,
+      "bytes": 524288
+    },
+    {
+      "name": "w_down",
+      "role": "weight",
+      "dtype": "bf16",
+      "shape": [
+        256,
+        1024
+      ],
+      "offset": null,
+      "bytes": 524288
+    },
+    {
+      "name": "t0",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        256
+      ],
+      "offset": 8519936,
+      "bytes": 65536
+    },
+    {
+      "name": "t1",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        768
+      ],
+      "offset": 8585472,
+      "bytes": 196608
+    },
+    {
+      "name": "t2",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        4,
+        64
+      ],
+      "offset": 8519936,
+      "bytes": 65536
+    },
+    {
+      "name": "t3",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        256
+      ],
+      "offset": 8585472,
+      "bytes": 65536
+    },
+    {
+      "name": "t4",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        256
+      ],
+      "offset": 8519936,
+      "bytes": 65536
+    },
+    {
+      "name": "t5",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        256
+      ],
+      "offset": 8651008,
+      "bytes": 65536
+    },
+    {
+      "name": "t6",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        1024
+      ],
+      "offset": 8716544,
+      "bytes": 262144
+    },
+    {
+      "name": "t7",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        1024
+      ],
+      "offset": 8978688,
+      "bytes": 262144
+    },
+    {
+      "name": "t8",
+      "role": "intermediate",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        256
+      ],
+      "offset": 8585472,
+      "bytes": 65536
+    },
+    {
+      "name": "out0",
+      "role": "output",
+      "dtype": "bf16",
+      "shape": [
+        "M",
+        256
+      ],
+      "offset": null,
+      "bytes": 65536
+    },
+    {
+      "name": "workspace",
+      "role": "workspace",
+      "dtype": "u8",
+      "shape": [
+        8519680
+      ],
+      "offset": 256,
+      "bytes": 8519680
+    }
+  ],
+  "outputs": [
+    "out0"
+  ],
+  "buckets": [
+    {
+      "values": {
+        "M": 32
+      },
+      "steps": [
+        {
+          "entry": "rmsnorm",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "w",
+              "binding": "w_ln1"
+            },
+            {
+              "name": "out",
+              "binding": "t0"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_qkv.M32",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t0"
+            },
+            {
+              "name": "b",
+              "binding": "w_qkv"
+            },
+            {
+              "name": "bias",
+              "binding": "b_qkv"
+            },
+            {
+              "name": "out",
+              "binding": "t1"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "attention",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "q",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  32,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "k",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  32,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 256
+              }
+            },
+            {
+              "name": "v",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  32,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 512
+              }
+            },
+            {
+              "name": "o",
+              "binding": "t2"
+            },
+            {
+              "name": "n_valid",
+              "binding": "n"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_o.M32",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t2",
+              "view": {
+                "shape": [
+                  32,
+                  256
+                ],
+                "strides": [
+                  256,
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "b",
+              "binding": "w_o"
+            },
+            {
+              "name": "out",
+              "binding": "t3"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "add_rmsnorm",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "o",
+              "binding": "t3"
+            },
+            {
+              "name": "w",
+              "binding": "w_ln2"
+            },
+            {
+              "name": "out0",
+              "binding": "t4"
+            },
+            {
+              "name": "out1",
+              "binding": "t5"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_up.M32",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t5"
+            },
+            {
+              "name": "b",
+              "binding": "w_up"
+            },
+            {
+              "name": "out",
+              "binding": "t6"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "gelu",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t6"
+            },
+            {
+              "name": "out",
+              "binding": "t7"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_down.M32",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t7"
+            },
+            {
+              "name": "b",
+              "binding": "w_down"
+            },
+            {
+              "name": "out",
+              "binding": "t8"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t4"
+            },
+            {
+              "name": "y",
+              "binding": "t8"
+            },
+            {
+              "name": "out",
+              "binding": "out0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "values": {
+        "M": 64
+      },
+      "steps": [
+        {
+          "entry": "rmsnorm",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "w",
+              "binding": "w_ln1"
+            },
+            {
+              "name": "out",
+              "binding": "t0"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_qkv.M64",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t0"
+            },
+            {
+              "name": "b",
+              "binding": "w_qkv"
+            },
+            {
+              "name": "bias",
+              "binding": "b_qkv"
+            },
+            {
+              "name": "out",
+              "binding": "t1"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "attention",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "q",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  64,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "k",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  64,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 256
+              }
+            },
+            {
+              "name": "v",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  64,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 512
+              }
+            },
+            {
+              "name": "o",
+              "binding": "t2"
+            },
+            {
+              "name": "n_valid",
+              "binding": "n"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_o.M64",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t2",
+              "view": {
+                "shape": [
+                  64,
+                  256
+                ],
+                "strides": [
+                  256,
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "b",
+              "binding": "w_o"
+            },
+            {
+              "name": "out",
+              "binding": "t3"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "add_rmsnorm",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "o",
+              "binding": "t3"
+            },
+            {
+              "name": "w",
+              "binding": "w_ln2"
+            },
+            {
+              "name": "out0",
+              "binding": "t4"
+            },
+            {
+              "name": "out1",
+              "binding": "t5"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_up.M64",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t5"
+            },
+            {
+              "name": "b",
+              "binding": "w_up"
+            },
+            {
+              "name": "out",
+              "binding": "t6"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "gelu",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t6"
+            },
+            {
+              "name": "out",
+              "binding": "t7"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_down.M64",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t7"
+            },
+            {
+              "name": "b",
+              "binding": "w_down"
+            },
+            {
+              "name": "out",
+              "binding": "t8"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t4"
+            },
+            {
+              "name": "y",
+              "binding": "t8"
+            },
+            {
+              "name": "out",
+              "binding": "out0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "values": {
+        "M": 128
+      },
+      "steps": [
+        {
+          "entry": "rmsnorm",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "w",
+              "binding": "w_ln1"
+            },
+            {
+              "name": "out",
+              "binding": "t0"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_qkv.M128",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t0"
+            },
+            {
+              "name": "b",
+              "binding": "w_qkv"
+            },
+            {
+              "name": "bias",
+              "binding": "b_qkv"
+            },
+            {
+              "name": "out",
+              "binding": "t1"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "attention",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "q",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  128,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "k",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  128,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 256
+              }
+            },
+            {
+              "name": "v",
+              "binding": "t1",
+              "view": {
+                "shape": [
+                  128,
+                  4,
+                  64
+                ],
+                "strides": [
+                  768,
+                  64,
+                  1
+                ],
+                "offset": 512
+              }
+            },
+            {
+              "name": "o",
+              "binding": "t2"
+            },
+            {
+              "name": "n_valid",
+              "binding": "n"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_o.M128",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t2",
+              "view": {
+                "shape": [
+                  128,
+                  256
+                ],
+                "strides": [
+                  256,
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "b",
+              "binding": "w_o"
+            },
+            {
+              "name": "out",
+              "binding": "t3"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "add_rmsnorm",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "o",
+              "binding": "t3"
+            },
+            {
+              "name": "w",
+              "binding": "w_ln2"
+            },
+            {
+              "name": "out0",
+              "binding": "t4"
+            },
+            {
+              "name": "out1",
+              "binding": "t5"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_up.M128",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t5"
+            },
+            {
+              "name": "b",
+              "binding": "w_up"
+            },
+            {
+              "name": "out",
+              "binding": "t6"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "gelu",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t6"
+            },
+            {
+              "name": "out",
+              "binding": "t7"
+            }
+          ]
+        },
+        {
+          "entry": "gemm_down.M128",
+          "kind": "library",
+          "args": [
+            {
+              "name": "a",
+              "binding": "t7"
+            },
+            {
+              "name": "b",
+              "binding": "w_down"
+            },
+            {
+              "name": "out",
+              "binding": "t8"
+            }
+          ],
+          "workspace": "workspace"
+        },
+        {
+          "entry": "add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t4"
+            },
+            {
+              "name": "y",
+              "binding": "t8"
+            },
+            {
+              "name": "out",
+              "binding": "out0"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "plan_digest": "57c2c4e2037bbfef861b197be15038713f5adfe2d2d0672385bb828e50554225"
+}

@@ -1,0 +1,68 @@
+{
+  "block": {
+    "arch": "sm_103",
+    "arena_bytes": 9634048,
+    "buckets": [
+      {
+        "M": 32
+      },
+      {
+        "M": 64
+      },
+      {
+        "M": 128
+      }
+    ],
+    "graph": "block",
+    "manifest_digest": "9aef1335f474c69586b52f9ff4f47f492d29ece41896ff1330f89a5e9f162afa",
+    "offsets": {
+      "n": 0,
+      "t0": 256,
+      "t1": 65792,
+      "t2": 262400,
+      "t3": 327936,
+      "t4": 393472,
+      "t5": 459008,
+      "t6": 524544,
+      "t7": 786688,
+      "t8": 1048832,
+      "workspace": 1114368
+    },
+    "plan_digest": "bbed07f295c54c7ebd95c1e0dfd22de9bec930aaec3f745dd394d693044e534f",
+    "reuse": false,
+    "steps_per_bucket": 9
+  },
+  "block-reuse": {
+    "arch": "sm_103",
+    "arena_bytes": 9240832,
+    "buckets": [
+      {
+        "M": 32
+      },
+      {
+        "M": 64
+      },
+      {
+        "M": 128
+      }
+    ],
+    "graph": "block",
+    "manifest_digest": "9aef1335f474c69586b52f9ff4f47f492d29ece41896ff1330f89a5e9f162afa",
+    "offsets": {
+      "n": 0,
+      "t0": 8519936,
+      "t1": 8585472,
+      "t2": 8519936,
+      "t3": 8585472,
+      "t4": 8519936,
+      "t5": 8651008,
+      "t6": 8716544,
+      "t7": 8978688,
+      "t8": 8585472,
+      "workspace": 256
+    },
+    "plan_digest": "57c2c4e2037bbfef861b197be15038713f5adfe2d2d0672385bb828e50554225",
+    "reuse": true,
+    "steps_per_bucket": 9
+  }
+}

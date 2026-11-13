@@ -803,6 +803,13 @@ def check_algo(
         return _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}")
 
 
+def warm(device_index: "int | None" = None) -> None:
+    """Load cuBLASLt and create the handle of a device, which the first matmul on it does: a launch plan does it before the first launch, because
+    creating a handle may allocate device memory, which is not allowed while a CUDA graph is being captured."""
+    index = _device(_check_device_arg(device_index))
+    _handle(_lib(), index)
+
+
 def matmul(
     a_ptr: int,
     b_ptr: int,
@@ -816,6 +823,7 @@ def matmul(
     workspace_bytes: int,
     stream: int,
     device_index: "int | None" = None,
+    workspace_ptr: "int | None" = None,
 ) -> None:
     """``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` with the pinned algorithm, enqueued on ``stream`` (a ``CUstream`` as an int).
 
@@ -824,6 +832,10 @@ def matmul(
     the pin, an upper bound of what the algorithm may need. The workspace is taken from torch's caching allocator, on
     ``stream``'s device and ordered on ``stream``, and lives only as long as this call (the allocator keeps it from being reused
     before the work already queued on ``stream`` is done).
+
+    With ``workspace_ptr`` (the address of at least ``workspace_bytes`` bytes of device memory, aligned to 256 bytes) the workspace is
+    that memory and nothing is allocated: this is how a launch plan runs it (the workspace is a buffer of the plan's arena, so the call
+    allocates nothing and can be captured in a CUDA graph). Besides the matmul itself the call touches the device not at all.
     """
     bias = bias_ptr is not None
     m, n, k, bias = _check_problem(m, n, k, bias)
@@ -837,22 +849,23 @@ def matmul(
     algo = _algo_struct(algo_hex)
     lib = _lib()
     index = _device(device_index)
+    given = None if workspace_ptr is None else _check_pointer("workspace", workspace_ptr)
     handle = _handle(lib, index)
     with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None) as p:
         required = _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}")
         workspace = None
-        workspace_ptr = None
-        if required:
+        address = given
+        if required and given is None:
             torch = _torch()
             with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=index)):
                 workspace = torch.empty(required, dtype=torch.uint8, device=f"cuda:{index}")
-            workspace_ptr = workspace.data_ptr()
+            address = workspace.data_ptr()
         alpha = ctypes.c_float(1.0)
         beta = ctypes.c_float(0.0)
         # cuBLAS A operand = tilefish B, cuBLAS B operand = tilefish A; C is D (beta = 0, so it is never read)
         lib.call(
             "cublasLtMatmul",
             handle, p.desc, ctypes.byref(alpha), b, p.a, a, p.b, ctypes.byref(beta), d, p.d, d, p.d,
-            ctypes.byref(algo), workspace_ptr, required, stream,
+            ctypes.byref(algo), address if required else None, required, stream,
         )
         del workspace
