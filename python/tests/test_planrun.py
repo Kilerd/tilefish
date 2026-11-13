@@ -194,7 +194,7 @@ def test_the_device_scalar_is_written_before_the_first_launch_from_what_the_call
 def test_a_device_scalar_that_is_not_an_integer_of_its_dtype_is_refused_before_anything_runs():
     r, be = runner()
     w = Weights(32)
-    for bad in (5.5, 2**31, -(2**31) - 1):
+    for bad in (5.5, 2**31, -(2**31) - 1, float("nan"), float("inf")):
         with pytest.raises(TilefishPreconditionError, match="not an integer that fits i32"):
             r.run((w.t["x"], bad, *[w.t[k] for k in pm.WEIGHT_NAMES]), {})
     assert not be.launches() and not any(e[0] == "devscalar" for e in be.log)
@@ -317,6 +317,19 @@ def test_a_precondition_that_fails_launches_nothing_not_even_the_device_scalar()
     with pytest.raises(TilefishPreconditionError, match="outputs= must give the 1 returned value"):
         r.run(w.args(), {}, outputs=(FakeTensor((64, 256), "bf16", 1 << 50), FakeTensor((64, 256), "bf16", 1 << 51)))
     nothing_ran(be)
+
+
+def test_a_tensor_of_the_caller_inside_the_arena_is_refused():
+    r, be = runner()
+    w = Weights(64)
+    w.t["w_o"] = FakeTensor((256, 256), "bf16", ARENA + 4096)  # a weight that lives in the plan's own memory
+    with pytest.raises(TilefishPreconditionError, match="'w_o' overlaps the arena of the plan") as e:
+        r.run(w.args(), {})
+    assert e.value.kind == "alias"
+    assert not be.launches()
+    w.t["w_o"] = FakeTensor((256, 256), "bf16", ARENA + r.plan.arena_bytes)  # just past it: fine
+    r.run(w.args(), {})
+    assert len(be.launches()) == 9
 
 
 def test_an_unaligned_output_given_by_the_caller_is_refused_by_the_step_that_writes_it():

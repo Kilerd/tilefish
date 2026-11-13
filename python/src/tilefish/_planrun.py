@@ -372,7 +372,11 @@ class PlanRunner:
                 dtype = p.type.dtype  # type: ignore[union-attr]
                 if dtype.is_int:
                     lo, hi = dtype.int_range()
-                    if v != int(v) or not lo <= v <= hi:
+                    try:
+                        fits = v == int(v) and lo <= v <= hi
+                    except (ValueError, OverflowError):  # nan, inf
+                        fits = False
+                    if not fits:
                         raise TilefishPreconditionError(
                             f"the device scalar '{p.name}' is {v!r}, which is not an integer that fits {dtype} ({lo} to {hi})", kind="shape", arg=p.name
                         )
@@ -438,7 +442,7 @@ class PlanRunner:
                 written.append(name)
             else:  # in the arena
                 bases[name] = arena.ptr + b["offset"]
-        self._check_externals(bases, written, rt)
+        self._check_externals(bases, written, rt, arena)
         # every precondition of every step, before anything is launched
         checked = [st.bound.check(bases) for st in rt.steps]
         slots = []
@@ -490,14 +494,21 @@ class PlanRunner:
         if self.backend.device_index(info.device) != index:
             raise TilefishPreconditionError(f"the output for '{name}' is on {info.device}, not on device {index}", kind="device", arg=name)
 
-    def _check_externals(self, bases: "Mapping[str, int]", written: "Sequence[str]", rt: _BucketRT) -> None:
+    def _check_externals(self, bases: "Mapping[str, int]", written: "Sequence[str]", rt: _BucketRT, arena: _Arena) -> None:
         """A tensor the plan writes (an output or an in-place tensor) must not overlap any other external: the steps are ordered, but the plan is not
-        written for two names for one memory."""
+        written for two names for one memory. No external may overlap the arena: it is the plan's own."""
         ranges = {}
         for b in self._doc["buffers"]:
             if b["role"] in ("input", "weight", "inout", "output"):
                 dtype, shape = rt.shapes[b["name"]]
                 ranges[b["name"]] = (bases[b["name"]], bases[b["name"]] + math.prod(shape) * _plan.ITEMSIZE[dtype])
+                if arena.nbytes and ranges[b["name"]][0] < arena.ptr + arena.nbytes and arena.ptr < ranges[b["name"]][1]:
+                    raise TilefishPreconditionError(
+                        f"'{b['name']}' overlaps the arena of the plan (the memory the plan keeps its intermediates, device scalars and workspace in): a tensor of the "
+                        "caller must not be in it",
+                        kind="alias",
+                        arg=b["name"],
+                    )
         for w in written:
             lo, hi = ranges[w]
             for other, (olo, ohi) in ranges.items():
