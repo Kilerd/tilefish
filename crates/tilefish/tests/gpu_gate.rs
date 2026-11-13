@@ -523,24 +523,24 @@ fn refusals() {
     let e = Manifest::load(&dir, Pin::Digest(&"0".repeat(64))).unwrap_err();
     check("a wrong pin", matches!(e, Error::PinMismatch { .. }));
 
-    // a manifest of another architecture only: sm_120 on this device
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sm_120");
-    let other = Manifest::load(&fixtures, Pin::TrustDirectory).unwrap();
+    // a manifest of another architecture only: the committed fixture of the architecture that is not this device's
     let here = Arch::of_context(&gpu.ctx).unwrap();
-    assert_ne!(here, Arch::sm(120), "the refusal test needs a device that is not an sm_120");
+    let elsewhere = other_arch(here);
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(elsewhere.to_string());
+    let other = Manifest::load(&fixtures, Pin::TrustDirectory).unwrap();
     let e = other.kernel(&gpu.ctx, "softmax", &[], here).unwrap_err();
     check(
-        "an sm_120-only manifest on this device",
-        matches!(&e, Error::NoBinary(m) if m.contains(&format!("no binary for 'softmax' on {here}")) && m.contains("sm_120")),
+        "a manifest of another architecture only, on this device",
+        matches!(&e, Error::NoBinary(m) if m.contains(&format!("no binary for 'softmax' on {here}")) && m.contains(&elsewhere.to_string())),
     );
     // ... and a launcher typed from one manifest refuses another, whatever it holds
     let e = generated::Softmax::load(&other, &gpu.ctx).unwrap_err();
     check("a launcher refuses a manifest it was not generated from", matches!(e, Error::PinMismatch { .. }));
     // a manifest that has the kernel, but not for this architecture, asked for explicitly
-    let e = manifest.kernel(&gpu.ctx, "softmax", &[], Arch::sm(120)).unwrap_err();
+    let e = manifest.kernel(&gpu.ctx, "softmax", &[], elsewhere).unwrap_err();
     check("an explicit architecture the manifest does not have", matches!(e, Error::NoBinary(_)));
     // an architecture that is not the device's
-    let e = other.kernel(&gpu.ctx, "softmax", &[], Arch::sm(120)).unwrap_err();
+    let e = other.kernel(&gpu.ctx, "softmax", &[], elsewhere).unwrap_err();
     check(
         "an architecture that is not the current device's",
         matches!(&e, Error::Unsupported(m) if m.contains("of the context")),
@@ -1407,6 +1407,12 @@ fn an_out_is_written_over_the_input_it_may_alias() {
 }
 
 /// A copy of the gate's manifest directory in a fresh temporary directory.
+/// The architecture of a committed fixture (`tests/fixtures/sm_103`, `sm_120`) that is not `here`: what a refusal of "another architecture"
+/// uses, so that the gate runs on either device.
+fn other_arch(here: Arch) -> Arch {
+    if here == Arch::sm(120) { Arch::sm(103) } else { Arch::sm(120) }
+}
+
 fn copy_of_the_manifest(name: &str) -> PathBuf {
     let dir = gate_dir().join(cases()["manifest"].as_str().unwrap());
     let tmp = std::env::temp_dir().join(format!("tilefish-gate-{name}-{}", std::process::id()));
@@ -1621,7 +1627,7 @@ fn refusals_of_schema_3() {
     wrong[0] = TensorRef::<Bf16>::from_cuda(&a_more.slice, &a_more_shape).unwrap().into_arg();
     let e = gemm.launch(s, &mut wrong).unwrap_err();
     check("a GEMM at a size that is not its bucket", e.precondition_kind() == Some(PreconditionKind::Bucket));
-    let e = manifest.gemm(&gpu.ctx, &entry.stem, &[], Arch::sm(120)).unwrap_err();
+    let e = manifest.gemm(&gpu.ctx, &entry.stem, &[], other_arch(Arch::of_context(&gpu.ctx).unwrap())).unwrap_err();
     check(
         "a GEMM asked for another architecture than the device's",
         matches!(&e, Error::NoBinary(_) | Error::Unsupported(_)),
@@ -1696,14 +1702,15 @@ fn refusals_of_schema_3() {
 
     // a cubin of another architecture, under the name of this one: its ELF header says so
     let tmp = copy_of_the_manifest("arch");
-    let sm120 = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sm_120");
-    let theirs_doc = read_json(&sm120.join("manifest.json"));
+    let elsewhere = other_arch(arch);
+    let theirs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(elsewhere.to_string());
+    let theirs_doc = read_json(&theirs_dir.join("manifest.json"));
     let theirs = theirs_doc["kernels"]
         .as_array()
         .unwrap()
         .iter()
         .find(|k| k["stem"] == "gelu_erf")
-        .expect("gelu_erf in sm_120")
+        .expect("gelu_erf in the other architecture's fixture")
         .clone();
     let mut doc = read_json(&tmp.join("manifest.json"));
     let mine = doc["kernels"]
@@ -1712,14 +1719,15 @@ fn refusals_of_schema_3() {
         .iter_mut()
         .find(|k| k["stem"] == "gelu_erf" && k["arch"] == arch.to_string())
         .unwrap();
-    std::fs::copy(sm120.join(theirs["cubin"].as_str().unwrap()), tmp.join(mine["cubin"].as_str().unwrap())).unwrap();
+    std::fs::copy(theirs_dir.join(theirs["cubin"].as_str().unwrap()), tmp.join(mine["cubin"].as_str().unwrap()))
+        .unwrap();
     mine["sha256"] = theirs["sha256"].clone();
     mine["sha256_code"] = theirs["sha256_code"].clone();
     write_json(&tmp.join("manifest.json"), &doc);
     let e = Manifest::load(&tmp, Pin::TrustDirectory).unwrap_err();
     check(
-        "a cubin of sm_120 under the name of this architecture",
-        matches!(&e, Error::Manifest(m) if m.contains("is for sm_120") && m.contains(&arch.to_string())),
+        "a cubin of another architecture under the name of this one",
+        matches!(&e, Error::Manifest(m) if m.contains(&format!("is for {elsewhere}")) && m.contains(&arch.to_string())),
     );
     let _ = std::fs::remove_dir_all(&tmp);
 
