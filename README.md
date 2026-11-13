@@ -166,12 +166,14 @@ empty value switches it off; `aot.build(..., cache=False)` skips it for one
 build). Its key is the declaration digest, the spec's source identity
 (`source_sha256`, or the source digest of a hand-written kernel, computed only
 after the edited-module check above), the architecture, the Triton and `ptxas`
-versions and the compile options, and every read is verified: the `sha256` and
+versions, the compile options and the module constants the kernel reads (as the
+process holds them: a module may compute one at import from the environment, and
+no file says so), and every read is verified: the `sha256` and
 `sha256_code` of the cubin are recomputed (and the PTX, the entry point and its
 ABI, the options and the versions are checked), and an entry that is not as it
 was written is a warning and a rebuild, never used. Entries are written through a
 temporary file and renamed, so builds that race do not tear one. A hit takes
-about 0.5 ms. The cache is as exact as the source digest (what that does not
+about 0.5 to 0.8 ms. The cache is as exact as the source digest (what that does not
 reach is not in the key either), nothing evicts it, and it is no defence
 against someone who can write the directory: a manifest is what to pin.
 
