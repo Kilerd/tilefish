@@ -152,13 +152,15 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "4b7ace3a671a3256d15837ee2a7e96ffefe1be5b097d129e4ae2579faa998603",
-      "sha256": "32df23fac9090e6aba91700279d5c524bb83e91e93eeec72ff48a49576b646a3",
+      "sha256": "0136ae2e394c6dd2e4e9670e97fd7b8f4b238b90863e4e748a7fdffc966f9388",
       "sha256_code": "609b79a18a4290206c37c8f834aef25f5a878d211995aba9dd72aa348965d9e1",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_sha256": "b8183129eb5d9a4b8f14562be008a85a3069fc6321b76e5418f30cd20fcfaae0"
+      "source_sha256": "b8183129eb5d9a4b8f14562be008a85a3069fc6321b76e5418f30cd20fcfaae0",
+      "source_digest": "673f5fbbc4c30f98b9b16aba365773e85e8f2c6c75c93e97149c5de1fe7a0258",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "layernorm",
@@ -370,13 +372,15 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "529934a610d6a4319c98d347ce400947709e061a0914219e0398c0aa75ffe25c",
-      "sha256": "320925671189c50b17f1521a4ba7c879c9cf7f9f5ba5d477a467913cc4e2ccb4",
+      "sha256": "80f2d66a8b9cb4443ec86c2f46b7f614f11aebd2b25b47a00a138135ecf9153d",
       "sha256_code": "348c4e2ba9c643c263d1df9026f047b8a46f753b9221d3a5cf0de6338f987202",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_sha256": "3665322861c773ee6544da9b9a319c1b3c49cbb5bd444070bb4e461f0d5d56c3"
+      "source_sha256": "3665322861c773ee6544da9b9a319c1b3c49cbb5bd444070bb4e461f0d5d56c3",
+      "source_digest": "4fd87bfeadd990c7b1debddb11dff9a630547959d51e51fdc8df779f1bed0942",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "residual_add_rmsnorm",
@@ -599,13 +603,15 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "ae60e4bdadab8c3d2e6f23bae3c53c7b0cb0fe0ea100b365e100782972ac5273",
-      "sha256": "ecbaca6d982f44ecd862af6077bec68464873e774acf11c73b5f8bf32badfa88",
+      "sha256": "43a8ba4af82d89cb34b99c8c1ebe365044fe85d5e153ecc85d596af89eeede70",
       "sha256_code": "c86b86efb1c996bcf7dc8580bc730d903e4de2ce3c490027ce9b91087b4f0ed6",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_sha256": "d26b9eee2c5fbd2e6bcdd81a354fb60fdf3924dedd133d037cad5d1472d89d88"
+      "source_sha256": "d26b9eee2c5fbd2e6bcdd81a354fb60fdf3924dedd133d037cad5d1472d89d88",
+      "source_digest": "0c5a429b82b7462091ca6e054c2f773f66bb2ae81e0f8d88a68c24edef88da4f",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "gelu_exact",
@@ -754,13 +760,15 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "1d945a997ff5a0c99a21bfc0d33989591380c3efca3dc332d7c49fe6963a3090",
-      "sha256": "8b78dcba4db1d9b0adc54e7e09d24d4254d53cd4bbc2c28270560fb4ca8ef8b9",
+      "sha256": "90c606c6a5319b43afac50a2022398ed906fadff584d8adc8c3e3874bf5e88d5",
       "sha256_code": "57ce5b02b3d48f9239e85604be3c13f432223009fdc6873afe685c970f53e06f",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_sha256": "e31cfe3292742382614c8a3b19e6d85a90613db14a4d25add41e1e099a76adcf"
+      "source_sha256": "e31cfe3292742382614c8a3b19e6d85a90613db14a4d25add41e1e099a76adcf",
+      "source_digest": "ee43fbc7fce688a1ca4924b5c1fd4c7feaa7163b1f6326db59bd2b960f5d69a1",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "swiglu",
@@ -963,13 +971,15 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "d2da50eac0728e64f382b0075740539c88afb100f33e06f50356eed3177fc18f",
-      "sha256": "a27390285eb6fea50e230ce1afaff05eab9929b5442fb94b625693e70d6903b6",
+      "sha256": "685dfe91f45fd20c1020a0e3e0f70b30d3381c15b19c6d8dd2c42ced7c370f04",
       "sha256_code": "fea1c6640f8f7791c372d843c659d07fc94a71caba09b83b38900909001c9b35",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_sha256": "08d8ca8dd8a7b2a6b438179f42feaf6d3a8652b28382fedef4e04696214ba190"
+      "source_sha256": "08d8ca8dd8a7b2a6b438179f42feaf6d3a8652b28382fedef4e04696214ba190",
+      "source_digest": "0a3b3400deb99a030eedb9b88f7c2f768ffa2321f7e47aa91ffdb03915696595",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "bucketed_rms.Db96",
@@ -1153,13 +1163,15 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "cbee9bacaa4e2f4fb26706ce58bdb55c90aa19ae958522bd926a8d5953574c5e",
-      "sha256": "dd67a55eeda4289ede28a98e750d766d0b7799b9c52986987584709778f4bc75",
+      "sha256": "2746a4cf1c6ae36dd97d8a2afe29593beaa916903ab8b89eeb8df2f49d8b5158",
       "sha256_code": "4abc9b18ebf64ff9994731fc0061c8f406a6e416617e97b045aaf0d8b18c0d96",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_sha256": "902a44866c59a8bb7d4f4978ace7cb607f5fd8b4c5012a16f5c7a07ecc3d7f8f"
+      "source_sha256": "902a44866c59a8bb7d4f4978ace7cb607f5fd8b4c5012a16f5c7a07ecc3d7f8f",
+      "source_digest": "77e743bffa9f598a3de6c864621d273e2ad91ea68b16ea3e834535816b150dee",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "bucketed_rms.Db512",
@@ -1343,13 +1355,15 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "cbee9bacaa4e2f4fb26706ce58bdb55c90aa19ae958522bd926a8d5953574c5e",
-      "sha256": "5766658cce15f6411e6d3735e2902da13c92adc94cebdeddc733ec38d409248a",
+      "sha256": "3b5c664a4f51750f37c33c989272d4bbdbb8a670d2d702c0ff4b38b05f95d920",
       "sha256_code": "4c77578d58e5cf1fb5d070b3b69e47e5fb56d2e976a381e61a44eb72f6ef0650",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_sha256": "902a44866c59a8bb7d4f4978ace7cb607f5fd8b4c5012a16f5c7a07ecc3d7f8f"
+      "source_sha256": "902a44866c59a8bb7d4f4978ace7cb607f5fd8b4c5012a16f5c7a07ecc3d7f8f",
+      "source_digest": "63bc41b0866ff4a9659c3e76e7f56153e41d34dba317b63caea62ea39cb2accf",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "bucketed_rms.Db1000",
@@ -1533,13 +1547,15 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "cbee9bacaa4e2f4fb26706ce58bdb55c90aa19ae958522bd926a8d5953574c5e",
-      "sha256": "2da26bd781c113ddb77ebbb2a255a8311fb0d4f6dd49d79e65b02a52fb4540e0",
+      "sha256": "9c31613426bda3002d16befad19e214a6a3efd06725837b591df217023642f28",
       "sha256_code": "fda7233f8200581423eaf291bb5a789a5fe2eedc3e5a785b0eb8dfc0fb7ec286",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_sha256": "902a44866c59a8bb7d4f4978ace7cb607f5fd8b4c5012a16f5c7a07ecc3d7f8f"
+      "source_sha256": "902a44866c59a8bb7d4f4978ace7cb607f5fd8b4c5012a16f5c7a07ecc3d7f8f",
+      "source_digest": "294ac706c13c3beaaa5e7c7cd903dd8362a0211d6d1b0e20914691922418b745",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "rmsnorm",
@@ -1732,14 +1748,14 @@
         "num_stages": 3
       },
       "declaration_digest": "6dcb0386b0936058c4db33fad37e5b3458345927fd2a185033cdbd6f397c0a75",
-      "sha256": "6ca3e65b4653692252b30ee38963fafba826c42e2a069989655bf60229a20f51",
+      "sha256": "da5104ff4528f5ad1c2d7988f18df9908e39e5443474dbfe0c9818e58b47b2f0",
       "sha256_code": "0010a75c02ab1219146fe6c3ec350578082fb10b20bfef46cbae2e2b7d8f8f0f",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_digest": "51fb3da2330d0bcb85c9490dbb4dd7a72c395d3516f62c1e79b7f6ebe50a1333",
-      "source_digest_kind": "tilefish.module-sources.v2"
+      "source_digest": "cce343bc1124129c2b87bcda447d683dc92d850e0b79a1ed9f590e892a251a5f",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "gelu_erf",
@@ -1886,14 +1902,14 @@
         "num_stages": 3
       },
       "declaration_digest": "e4339056943a6d27f4b11ba52a3c33a34fbc3eaa1ece4c65f2ca45502267fc7f",
-      "sha256": "0dac9d8408703df310689a2d3b24a90b632cf059bea41306875b05c1cb1708c8",
+      "sha256": "d29552702e74b5e1be0266c8a4a3ea6ed1efccc516fe979c934cf184f7169471",
       "sha256_code": "4a83af44086a65b02c235f243028e93b7f44bff8e6141dc4aa094860bfbef244",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_digest": "51fb3da2330d0bcb85c9490dbb4dd7a72c395d3516f62c1e79b7f6ebe50a1333",
-      "source_digest_kind": "tilefish.module-sources.v2"
+      "source_digest": "113920150838de0140f631ff58d483ab47496a5afaebf44b49de8a4a8f85f362",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "axpy",
@@ -2046,14 +2062,14 @@
         "num_stages": 3
       },
       "declaration_digest": "393aa918adcf04eef5d6837f45ddbb53cae073dd8184a6551ca763e0afd09bc3",
-      "sha256": "5e0fa3b0e92bbc4ae8f89bcc52de3617700d78e47c9910ef796dcbe42b7f7388",
+      "sha256": "51a5f3f641e7c5180a03d0fe6849f4311de2e16433565b533ade44e451c9efed",
       "sha256_code": "744e62a5feb32c6ff1369e1affcafb0f83ddf63854d5e8fd58864417d3cdddbf",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_digest": "51fb3da2330d0bcb85c9490dbb4dd7a72c395d3516f62c1e79b7f6ebe50a1333",
-      "source_digest_kind": "tilefish.module-sources.v2"
+      "source_digest": "9fc0c0a2383e0c0efe859225663da75290b7c382349d62e78e47830996332229",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
       "stem": "mm",
@@ -2285,14 +2301,14 @@
         "num_stages": 4
       },
       "declaration_digest": "246bc63040f28a33678442bd5e69c8ed4b7e3fc1256953e2bc9a7ba9f48d1efb",
-      "sha256": "d6c5baf1406ed787fe675ab4d5013a21bf4f299c409277824f4c91206c4ae97a",
+      "sha256": "4ac4690b321fdf0fc8efedd9488f398a281e6c64303f14c1de889c9bc7446415",
       "sha256_code": "041b5f2d507ba26c6f4540d457bae5d9e2a8d1756df43bc1c904b05709bd56ca",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_digest": "02153abc9897fc095d3999dfa188b4b712c08eae8db2f64122c8b92073acb1a6",
-      "source_digest_kind": "tilefish.module-sources.v2"
+      "source_digest": "c8f47daf70d8496e8c70c4c0772962067ddf5d3c4123d098fe47b488234f3c0e",
+      "source_digest_kind": "tilefish.triton-ir.v1"
     }
   ]
 }
