@@ -504,7 +504,7 @@ def _current_source_digest(spec: CompileSpec) -> "str | None":
         return None
     try:
         return _source.source_digest(fn)
-    except _source.StaleSourceError as e:  # the process holds another version of a file than the one on disk: not a digest to compare
+    except (_source.StaleSourceError, _source.UnstableValueError) as e:  # not what is on disk, or no digest can be made of it: not a digest to compare
         raise TilefishRuntimeError(str(e)) from e
     except Exception:  # noqa: BLE001 - whatever an object in a module namespace raises when it is looked at
         return None

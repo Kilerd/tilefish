@@ -1,7 +1,7 @@
 {
   "fixtures": {
     "sm_103": {
-      "manifest_digest": "ed658674b504d7699b987ccef0792995c2c8838b5c598bd03b0a474f97e9ee11",
+      "manifest_digest": "39b9f3a519cc9001d3ea3a4e9edbc94a287c046709437bb238dd9c9b17df12ae",
       "kernels": [
         {
           "stem": "axpy",
@@ -90,7 +90,7 @@
       ]
     },
     "sm_120": {
-      "manifest_digest": "68594cae5148783b33c9761d39e3df48b4e1cf70cb0ee2ea5321cedd39e24799",
+      "manifest_digest": "19a885119f8fb0f7a2e1d62688f5563975874223d1b9b65b714aae909db495d9",
       "kernels": [
         {
           "stem": "axpy",

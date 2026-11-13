@@ -1672,6 +1672,16 @@
           "value": 2048
         },
         {
+          "kind": "max_elements",
+          "arg": "x_ptr",
+          "index": 0,
+          "value": 2147483647,
+          "shape": [
+            "Rows",
+            "2048"
+          ]
+        },
+        {
           "kind": "pointer_alignment",
           "arg": "w_ptr",
           "index": 1,
@@ -1685,6 +1695,15 @@
           "value": 2048
         },
         {
+          "kind": "max_elements",
+          "arg": "w_ptr",
+          "index": 1,
+          "value": 2147483647,
+          "shape": [
+            "2048"
+          ]
+        },
+        {
           "kind": "pointer_alignment",
           "arg": "y_ptr",
           "index": 2,
@@ -1696,21 +1715,31 @@
           "index": 2,
           "axis": 1,
           "value": 2048
+        },
+        {
+          "kind": "max_elements",
+          "arg": "y_ptr",
+          "index": 2,
+          "value": 2147483647,
+          "shape": [
+            "Rows",
+            "2048"
+          ]
         }
       ],
       "options": {
         "num_warps": 8,
         "num_stages": 3
       },
-      "declaration_digest": "0c60d07a7a8a36a51957f2d47674b4ab35c45823217d297aef02989743013ea4",
+      "declaration_digest": "6dcb0386b0936058c4db33fad37e5b3458345927fd2a185033cdbd6f397c0a75",
       "sha256": "6ca3e65b4653692252b30ee38963fafba826c42e2a069989655bf60229a20f51",
       "sha256_code": "0010a75c02ab1219146fe6c3ec350578082fb10b20bfef46cbae2e2b7d8f8f0f",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_digest": "5c2f6c6d01d45f33b78c6f7e671ec489f73857387c39a4d80fcc4f44f4a8cdec",
-      "source_digest_kind": "tilefish.module-sources.v1"
+      "source_digest": "51fb3da2330d0bcb85c9490dbb4dd7a72c395d3516f62c1e79b7f6ebe50a1333",
+      "source_digest_kind": "tilefish.module-sources.v2"
     },
     {
       "stem": "gelu_erf",
@@ -1821,10 +1850,28 @@
           "bytes": 16
         },
         {
+          "kind": "max_elements",
+          "arg": "x_ptr",
+          "index": 0,
+          "value": 2147483647,
+          "shape": [
+            "Count"
+          ]
+        },
+        {
           "kind": "pointer_alignment",
           "arg": "y_ptr",
           "index": 1,
           "bytes": 16
+        },
+        {
+          "kind": "max_elements",
+          "arg": "y_ptr",
+          "index": 1,
+          "value": 2147483647,
+          "shape": [
+            "Count"
+          ]
         },
         {
           "kind": "divisible",
@@ -1838,15 +1885,15 @@
         "num_warps": 4,
         "num_stages": 3
       },
-      "declaration_digest": "cc3a47b269d7ef0e292318e9b20b2821dc1d55a2e251e909eb4febf3b946af4b",
+      "declaration_digest": "e4339056943a6d27f4b11ba52a3c33a34fbc3eaa1ece4c65f2ca45502267fc7f",
       "sha256": "0dac9d8408703df310689a2d3b24a90b632cf059bea41306875b05c1cb1708c8",
       "sha256_code": "4a83af44086a65b02c235f243028e93b7f44bff8e6141dc4aa094860bfbef244",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_digest": "5c2f6c6d01d45f33b78c6f7e671ec489f73857387c39a4d80fcc4f44f4a8cdec",
-      "source_digest_kind": "tilefish.module-sources.v1"
+      "source_digest": "51fb3da2330d0bcb85c9490dbb4dd7a72c395d3516f62c1e79b7f6ebe50a1333",
+      "source_digest_kind": "tilefish.module-sources.v2"
     },
     {
       "stem": "axpy",
@@ -1963,10 +2010,28 @@
           "bytes": 16
         },
         {
+          "kind": "max_elements",
+          "arg": "x_ptr",
+          "index": 0,
+          "value": 2147483647,
+          "shape": [
+            "Count"
+          ]
+        },
+        {
           "kind": "pointer_alignment",
           "arg": "y_ptr",
           "index": 1,
           "bytes": 16
+        },
+        {
+          "kind": "max_elements",
+          "arg": "y_ptr",
+          "index": 1,
+          "value": 2147483647,
+          "shape": [
+            "Count"
+          ]
         },
         {
           "kind": "divisible",
@@ -1980,15 +2045,15 @@
         "num_warps": 4,
         "num_stages": 3
       },
-      "declaration_digest": "3e97f30422749cdda066acadc91b0fa23aa09e942e7058b79c3daaa08710a3ae",
+      "declaration_digest": "393aa918adcf04eef5d6837f45ddbb53cae073dd8184a6551ca763e0afd09bc3",
       "sha256": "5e0fa3b0e92bbc4ae8f89bcc52de3617700d78e47c9910ef796dcbe42b7f7388",
       "sha256_code": "744e62a5feb32c6ff1369e1affcafb0f83ddf63854d5e8fd58864417d3cdddbf",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_digest": "5c2f6c6d01d45f33b78c6f7e671ec489f73857387c39a4d80fcc4f44f4a8cdec",
-      "source_digest_kind": "tilefish.module-sources.v1"
+      "source_digest": "51fb3da2330d0bcb85c9490dbb4dd7a72c395d3516f62c1e79b7f6ebe50a1333",
+      "source_digest_kind": "tilefish.module-sources.v2"
     },
     {
       "stem": "mm",
@@ -2152,16 +2217,46 @@
           "bytes": 16
         },
         {
+          "kind": "max_elements",
+          "arg": "a_ptr",
+          "index": 0,
+          "value": 2147483647,
+          "shape": [
+            "MmM",
+            "MmK"
+          ]
+        },
+        {
           "kind": "pointer_alignment",
           "arg": "b_ptr",
           "index": 1,
           "bytes": 16
         },
         {
+          "kind": "max_elements",
+          "arg": "b_ptr",
+          "index": 1,
+          "value": 2147483647,
+          "shape": [
+            "MmK",
+            "MmN"
+          ]
+        },
+        {
           "kind": "pointer_alignment",
           "arg": "c_ptr",
           "index": 2,
           "bytes": 16
+        },
+        {
+          "kind": "max_elements",
+          "arg": "c_ptr",
+          "index": 2,
+          "value": 2147483647,
+          "shape": [
+            "MmM",
+            "MmN"
+          ]
         },
         {
           "kind": "divisible",
@@ -2189,15 +2284,15 @@
         "num_warps": 8,
         "num_stages": 4
       },
-      "declaration_digest": "de3378fa5da3d4951028e434fb9573ae609e0b4d97ace540765ec211446d2717",
+      "declaration_digest": "246bc63040f28a33678442bd5e69c8ed4b7e3fc1256953e2bc9a7ba9f48d1efb",
       "sha256": "d6c5baf1406ed787fe675ab4d5013a21bf4f299c409277824f4c91206c4ae97a",
       "sha256_code": "041b5f2d507ba26c6f4540d457bae5d9e2a8d1756df43bc1c904b05709bd56ca",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
-      "source_digest": "bf900073abbb64481e73ea730ced719b69114f3efef062a6648bf24fbb0ca600",
-      "source_digest_kind": "tilefish.module-sources.v1"
+      "source_digest": "02153abc9897fc095d3999dfa188b4b712c08eae8db2f64122c8b92073acb1a6",
+      "source_digest_kind": "tilefish.module-sources.v2"
     }
   ]
 }

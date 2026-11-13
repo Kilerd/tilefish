@@ -24,7 +24,7 @@ from built_fakes import fake_build, scale
 from elf_builder import cubin_like
 
 import tilefish
-from tilefish import TilefishCacheWarning, _cache, _source, runtime
+from tilefish import TilefishCacheWarning, TilefishManifestError, _cache, _source, runtime
 from tilefish.aot import build, compile_specs
 from tilefish.dims import cdiv
 
@@ -259,14 +259,14 @@ def test_the_environment_variables_triton_invalidates_its_cache_with_are_part_of
 
 
 def test_a_value_a_module_computes_when_it_is_imported_is_part_of_the_key(world, monkeypatch):
-    """The files are the same, the process holds another constant: the digest cannot tell, the binary differs, so the key must."""
+    """The files are the same, the process holds another constant: the binary differs, so the digest, and with it the key, must."""
     project, compiler = world
     project.write("ic_cfg", 'import os\n\nSCALE = float(os.environ.get("IC_SCALE", "2.0"))\n')
     monkeypatch.setenv("IC_SCALE", "2.0")
     first = build(SPEC, arch="sm_90", fn=project.load())
     monkeypatch.setenv("IC_SCALE", "3.0")
     other = build(SPEC, arch="sm_90", fn=project.load())  # the same files, another value in the process
-    assert compiler.count == 2 and other.source_digest == first.source_digest and other.sha256_code != first.sha256_code
+    assert compiler.count == 2 and other.source_digest != first.source_digest and other.sha256_code != first.sha256_code
     monkeypatch.setenv("IC_SCALE", "2.0")
     again = build(SPEC, arch="sm_90", fn=project.load())
     assert compiler.count == 2 and again.sha256 == first.sha256  # and each is a hit for its own value
@@ -625,3 +625,108 @@ def test_export_builds_through_the_cache_and_writes_the_same_manifest_entry(worl
     write_manifest([second], tmp_path / "b" / "manifest.json", cubins=True)
     assert compiler.count == 1
     assert tilefish.Manifest.load(tmp_path / "a").digest == tilefish.Manifest.load(tmp_path / "b").digest
+
+
+# -- a kernel made by a factory function reads its constants from closure cells ------------------------------------------------------
+
+
+CLO_FILE = (
+    "import os\n"
+    "\n"
+    "from fake_jit import jit\n"
+    "\n"
+    "\n"
+    "def make():\n"
+    '    S = float(os.environ["CLO_S"])\n'
+    "\n"
+    "    @jit\n"
+    "    def k(x_ptr, y_ptr, n_elem, BLOCK):\n"
+    "        return (BLOCK * S, n_elem)\n"
+    "\n"
+    "    return k\n"
+    "\n"
+    "\n"
+    "k = make()\n"
+)
+
+
+@tilefish.extern(triton="clo_kernel:k", num_warps=4, grid=lambda n: (cdiv(n, 256),))
+def clo_op(x_ptr: tilefish.Tensor[n, tilefish.bf16], y_ptr: tilefish.Out[tilefish.Tensor[n, tilefish.bf16]], n_elem: n, *, BLOCK: tilefish.const = 256): ...
+
+
+(CLO_SPEC,) = compile_specs(clo_op)
+
+
+@pytest.fixture
+def closure(world, monkeypatch):
+    """``load()`` imports ``clo_kernel`` from its file as a new process does (``CLO_S`` is what it reads), and returns its kernel."""
+    project, compiler = world
+    project.write("clo_kernel", CLO_FILE)
+    monkeypatch.setenv("CLO_S", "2.0")
+
+    def load():
+        sys.modules.pop("clo_kernel", None)
+        importlib.invalidate_caches()
+        linecache.clearcache()
+        return importlib.import_module("clo_kernel").k
+
+    yield load, compiler, project
+    sys.modules.pop("clo_kernel", None)
+
+
+def test_a_closure_variable_is_part_of_the_key_so_another_value_is_another_binary_and_not_a_stale_hit(closure, monkeypatch):
+    """The reviewer's repro: two processes share one cache directory, ``CLO_S=2.0`` and then ``CLO_S=3.0``. The files are the same."""
+    load, compiler, project = closure
+    first = build(CLO_SPEC, arch="sm_90", fn=load())
+    assert compiler.count == 1 and len(entries()) == 1
+    monkeypatch.setenv("CLO_S", "3.0")
+    runtime.clear_caches()
+    other = build(CLO_SPEC, arch="sm_90", fn=load())  # a new process: the same files, another value in the cell
+    assert compiler.count == 2 and len(entries()) == 2  # a miss; it used to be a hit on the first one's binary
+    assert other.sha256_code != first.sha256_code and other.source_digest != first.source_digest
+    assert compiler.values_held(fake_compile.ASTSource(load(), {}))[1] == (3.0, 1)  # and the binary is what the process holds
+    monkeypatch.setenv("CLO_S", "2.0")
+    runtime.clear_caches()
+    again = build(CLO_SPEC, arch="sm_90", fn=load())
+    assert compiler.count == 2 and again.sha256 == first.sha256 and again.source_digest == first.source_digest  # each value has its own entry
+
+
+def test_export_stamps_the_binary_of_the_value_the_process_holds_and_replay_refuses_another(closure, monkeypatch, tmp_path):
+    load, compiler, project = closure
+    load()
+    manifest = runtime.export(clo_op, tmp_path / "two", arch=90)
+    (entry,) = manifest.doc["kernels"]
+    assert entry["source_digest_kind"] == _source.SOURCE_DIGEST_KIND and len(entry["source_digest"]) == 64
+    # a replay in a process that holds the same value: the digest is the entry's, and the binary is accepted
+    digest_two = runtime._current_source_digest(CLO_SPEC)
+    assert digest_two == entry["source_digest"]
+    assert manifest.built_kernel(CLO_SPEC, "sm_90", source_digest=digest_two).sha256_code == entry["sha256_code"]
+    # a new process whose cell has another value would compile another binary: replay refuses, pinned or not
+    monkeypatch.setenv("CLO_S", "3.0")
+    load()
+    digest_three = runtime._current_source_digest(CLO_SPEC)
+    assert digest_three is not None and digest_three != digest_two
+    for pinned in (False, True):
+        with pytest.raises(TilefishManifestError, match=rf"now have source digest {digest_three}.*a closure variable"):
+            manifest.built_kernel(CLO_SPEC, "sm_90", source_digest=digest_three, pinned=pinned)
+    # ... and exporting there stamps the binary of 3.0, not the stale one of 2.0 that the cache holds
+    count = compiler.count
+    again = runtime.export(clo_op, tmp_path / "three", arch=90)
+    (entry_three,) = again.doc["kernels"]
+    assert compiler.count == count + 1
+    assert entry_three["sha256_code"] != entry["sha256_code"] and entry_three["source_digest"] == digest_three
+    assert again.built_kernel(CLO_SPEC, "sm_90", source_digest=digest_three).sha256_code == entry_three["sha256_code"]
+
+
+def test_a_closure_variable_that_has_no_stable_repr_refuses_the_build_and_the_export_and_the_replay(closure, tmp_path):
+    load, compiler, project = closure
+    project.write("clo_kernel", CLO_FILE.replace('S = float(os.environ["CLO_S"])', 'S = [float(os.environ["CLO_S"])]').replace("BLOCK * S", "BLOCK * S[0]"))
+    kernel = load()
+    for cache in (True, False):
+        with pytest.raises(_source.UnstableValueError, match=r"closure variable 'S' of the Triton function 'k' holds a list.*module-level constant.*const parameter"):
+            build(CLO_SPEC, arch="sm_90", fn=kernel, cache=cache)
+    with pytest.raises(_source.UnstableValueError, match="closure variable 'S'"):
+        runtime.export(clo_op, tmp_path / "m", arch=90)
+    assert compiler.count == 0 and entries() == [] and not (tmp_path / "m" / "manifest.json").exists()  # nothing was compiled, cached or written
+    with pytest.raises(tilefish.TilefishRuntimeError, match="closure variable 'S'"):
+        runtime._current_source_digest(CLO_SPEC)

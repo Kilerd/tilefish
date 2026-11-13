@@ -49,11 +49,11 @@ is never serialized. Every spec also carries
 ``declaration_digest``, a sha256 over the canonical declaration (see :func:`declaration_digest`),
 which a tool without the declaration at hand can compare.
 
-Kernels that tilefish generated (``tilefish.lower``) add two optional facts to their specs, both
-schema 2 only and never present in the specs of a hand-written ``extern``: a ``max_elements``
-precondition per tensor whose element count is not statically bounded (the generated code indexes
-with ``i32``; see :class:`Precondition`), and ``count_of`` on a runtime scalar that carries the element
-count of a tensor argument (see :class:`ArgSpec`). Two more facts of a generated kernel sit at the top level of its
+Two facts about indexing are in the specs of both kinds of kernel (schema 2 only): a ``max_elements``
+precondition on every tensor whose offsets are ``i32`` (see :class:`Precondition`: a generated kernel
+has one per tensor whose element count is not statically bounded, and a hand-written ``extern`` has one per
+tensor unless it declares ``index_bits=64``), and, for a generated kernel only, ``count_of`` on a runtime scalar that
+carries the element count of a tensor argument (see :class:`ArgSpec`). Two more facts of a generated kernel sit at the top level of its
 spec (schema 2 only too): ``enable_fp_fusion`` (Triton's FMA contraction option, always written out for a generated
 kernel) and ``source_sha256`` (the sha256 of the generated Triton source, so that a kernel redeclared with another
 body but the same name and signature is not the kernel a stored binary was built from). Both are in the declaration
@@ -127,10 +127,10 @@ class Precondition:
     * ``"bucket"``: dimension ``dim`` equals ``value`` exactly. ``value`` is the bucket this
       binary was compiled for and ``buckets`` lists every bucket, so a host can pick the
       smallest one that is at least the real size and pad up to it;
-    * ``"max_elements"`` (kernels that tilefish generated, which index with ``i32``): the number of
-      elements of tensor argument ``arg``, the product of its ``shape`` entries evaluated at launch,
-      is at most ``value`` (``2**31 - 1``). A tensor whose size is statically small has no such
-      precondition.
+    * ``"max_elements"`` (a kernel that indexes with ``i32``: every generated one, and every ``extern`` that does
+      not declare ``index_bits=64``): the number of elements of tensor argument ``arg``, the product of its ``shape``
+      entries evaluated at launch, is at most ``value`` (``2**31 - 1``). A generated kernel's tensor whose size is
+      statically small has no such precondition.
     """
 
     kind: str
@@ -680,6 +680,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         "params": params,
     }
     # only kernels that tilefish generated have these; leaving them out otherwise keeps every other digest as it was
+    if op.index_bits != 32:
+        doc["index_bits"] = op.index_bits
     if op.max_elements:
         doc["max_elements"] = dict(sorted(op.max_elements.items()))
     if op.element_counts:

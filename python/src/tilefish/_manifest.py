@@ -307,8 +307,9 @@ class Manifest:
         if source_digest is not None and recorded is not None and source_digest != recorded:
             raise TilefishManifestError(
                 f"the manifest entry for {where} was built from kernel files with source digest {recorded}, but the files of "
-                f"'{spec.triton}' now have source digest {source_digest}: the kernel, or a module it uses, changed since the "
-                "manifest was written, so its binary is stale; export it again (and pin the new manifest)"
+                f"'{spec.triton}' now have source digest {source_digest}: the kernel, a module it uses, or a value it reads that is "
+                "in no file (a module constant computed at import, a closure variable) is not what it was when the manifest was "
+                "written, so this binary is stale (a build here would give another one); export it again (and pin the new manifest)"
             )
         if source_digest is None or recorded is None:
             if pinned:

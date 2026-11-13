@@ -294,7 +294,7 @@ def check_spec_preconditions(
                     kind="static_size",
                     arg=pre.arg,
                 )
-        elif pre.kind == "max_elements":  # a generated kernel indexes with i32
+        elif pre.kind == "max_elements":  # the kernel indexes with i32 (a generated one, or an extern that did not say index_bits=64)
             count = math.prod(infos[pre.arg].shape)  # type: ignore[index]
             if count > pre.value:  # type: ignore[operator]
                 raise TilefishPreconditionError(

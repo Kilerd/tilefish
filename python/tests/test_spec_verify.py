@@ -46,7 +46,7 @@ INDEX = {a.name: a.index for a in SPEC.args}
 
 # The digest of `kernel`, pinned: it must not change between runs, platforms or Python versions. If this
 # fails on purpose (the canonical form changed), bump aot.DIGEST_FORMAT and update the literal.
-KERNEL_DIGEST = "11261830ca987123240fea073bc9241f02d8e69674806da2a3e95da719b825c4"
+KERNEL_DIGEST = "31f1efc428e79da02111c830cbfca7486095148b7677c2e185acf097355fe198"
 
 
 def forged(mutate, spec=SPEC):
@@ -174,6 +174,8 @@ def test_a_static_size_edited_together_with_its_shape_is_caught():
         for p in doc["preconditions"]:
             if p["kind"] == "static_size" and p["arg"] == "w":
                 p["value"] = 4
+            if p["kind"] == "max_elements" and p["arg"] == "w":
+                p["shape"] = ["4"]
 
     assert_caught(forged(mutate), f"args[{INDEX['w']}].shape[0]")
 
@@ -436,6 +438,7 @@ def as_schema_1(spec):
     doc["schema"] = 1
     del doc["declaration_digest"]
     doc.pop("dims", None)  # schema 1 has no table of dimensions, and no declared shapes
+    doc["preconditions"] = [p for p in doc["preconditions"] if p["kind"] != "max_elements"]  # nor max_elements
     for a in doc["args"]:
         a.pop("shape_dims", None)
         if a["kind"] == "constexpr":
@@ -519,7 +522,10 @@ def test_schema_2_only_adds_the_digest_the_constexpr_dtypes_and_what_a_host_bind
         new, old = spec.to_dict(), as_schema_1(spec)
         assert set(new) - set(old) == {"declaration_digest", "dims"}
         for key in old:
-            if key not in ("schema", "args"):
+            if key == "preconditions":  # and a max_elements precondition per tensor that indexes with i32
+                assert [p for p in new[key] if p["kind"] != "max_elements"] == old[key], key
+                assert {p["arg"] for p in new[key] if p["kind"] == "max_elements"} == {a["name"] for a in new["args"] if a["kind"] == "pointer"}
+            elif key not in ("schema", "args"):
                 assert new[key] == old[key], key
         for a_new, a_old in zip(new["args"], old["args"]):
             added = {k: v for k, v in a_new.items() if not (a_new["kind"] == "constexpr" and k == "dtype") and k != "shape_dims"}

@@ -542,3 +542,57 @@ fn shapes_of_two_to_the_sixtieth_and_element_counts_of_two_to_the_sixty_third_ar
     assert!(rows(1 << 54).to_string().contains("more elements than fit 64 bits"));
     assert_eq!(kind(&rows(1 << 53)), PreconditionKind::MaxElements);
 }
+
+// -- externs index with i32 unless they declare index_bits=64 -----------------------------------------------------------------------------
+
+#[test]
+fn every_pointer_of_a_hand_written_extern_has_max_elements_and_the_host_checks_it() {
+    // rmsnorm (`row * N_COLS`) and mm used to pass every check at sizes where their i32 offsets overflow
+    let manifest = manifest();
+    for stem in ["rmsnorm", "mm", "gelu_erf", "axpy"] {
+        let entry = manifest.entry(stem, "sm_103").unwrap();
+        for p in entry.params.iter().filter(|p| matches!(p.kind, tilefish::ParamKind::Pointer { .. })) {
+            let limited = entry.preconditions.iter().any(
+                |c| matches!(c, tilefish::Precondition::MaxElements { arg, value, .. } if arg == &p.name && *value == 2147483647),
+            );
+            assert!(limited, "{stem}: {} has no max_elements", p.name);
+        }
+    }
+    // rmsnorm: x is (Rows, 2048), so (2^20 - 1) rows are 2147481600 elements, and 2^20 rows are 2^31
+    let plan = typed!(Rmsnorm);
+    let call = |rows: usize| {
+        let (x, w) = ([rows, 2048], [2048usize]);
+        plan.prepare(&[t(BIG_A, &x, DType::Bf16), t(A, &w, DType::Bf16), t(BIG_B, &x, DType::Bf16)], Some(&DEVICE))
+    };
+    assert_eq!(call((1 << 20) - 1).unwrap().grid, [(1 << 20) - 1, 1, 1]);
+    let e = call(1 << 20).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::MaxElements);
+    assert!(e.to_string().contains("'x_ptr'") || e.to_string().contains("x_ptr"), "{e}");
+    assert!(e.to_string().contains("2147483648 elements") && e.to_string().contains("2147483647"), "{e}");
+
+    // mm: c is (MmM, MmN) f32, and MmN is at least 128: 2^24 - 128 rows of 128 columns are 2147467264 elements, 2^24 rows are 2^31
+    let plan = typed!(Mm);
+    let call = |m: usize| {
+        let (a, b, c) = ([m, 64usize], [64usize, 128], [m, 128usize]);
+        plan.prepare(&[t(BIG_A, &a, DType::F16), t(A, &b, DType::F16), t(BIG_B, &c, DType::F32)], Some(&DEVICE))
+    };
+    let ok = call((1 << 24) - 128).unwrap();
+    assert_eq!(ok.grid, [(1 << 17) - 1, 1, 1]);
+    let e = call(1 << 24).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::MaxElements);
+    assert!(e.to_string().contains("c_ptr") && e.to_string().contains("2147483648 elements"), "{e}");
+}
+
+#[test]
+fn an_extern_that_says_it_indexes_with_i64_has_no_limit_in_its_manifest_and_the_host_launches_it() {
+    // a manifest whose rmsnorm lost its max_elements (what `index_bits=64` writes): the same call is not refused for its size
+    let (_copy, plan) = edited("rmsnorm", |e| {
+        e["preconditions"].as_array_mut().unwrap().retain(|p| p["kind"] != "max_elements");
+    });
+    let rows = 1usize << 20;
+    let (x, w) = ([rows, 2048], [2048usize]);
+    let prepared = plan
+        .prepare(&[t(BIG_A, &x, DType::Bf16), t(A, &w, DType::Bf16), t(BIG_B, &x, DType::Bf16)], Some(&DEVICE))
+        .unwrap();
+    assert_eq!(prepared.grid, [1 << 20, 1, 1]);
+}

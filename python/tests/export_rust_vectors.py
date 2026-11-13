@@ -248,6 +248,10 @@ def _mutations(dtype, shape, ptr):
     yield "address + 8", (dtype, shape, ptr + 8)
     yield "address + 16", (dtype, shape, ptr + 16)
     yield "more elements than 32-bit offsets reach", (dtype, (2_200_000, *shape[1:]), ptr)
+    yield "2^31 rows", (dtype, (1 << 31, *shape[1:]), ptr)
+    if len(shape) == 2:  # the row count at which the tensor has 2^31 - 1 elements or fewer, and the first that has more
+        for rows in (((1 << 31) - 1) // shape[1], ((1 << 31) - 1) // shape[1] + 1):
+            yield f"{rows} rows", (dtype, (rows, shape[1]), ptr)
 
 
 def launches():

@@ -209,13 +209,47 @@ def test_bucketed_row_specs_state_the_bucket_value_in_the_shape():
     assert [[p.shape for p in limits(s)] for s in specs] == [[("M", "256")] * 2, [("M", "1024")] * 2]
 
 
-def test_hand_written_externs_get_no_such_precondition():
+def test_hand_written_externs_declare_max_elements_for_every_tensor_unless_they_index_with_i64():
     @tilefish.extern(triton="my_kernels:gelu", grid=lambda M: (M,))
     def ext(x: Tensor[M, 7, bf16], y: Out[Tensor[M, 7, bf16]], BLOCK: const = 1024): ...
 
-    assert ext.max_elements == {} and ext.element_counts == {}
+    # index_bits=32 is the default: a hand-written kernel is taken to index with i32, so every pointer has the limit
+    assert ext.index_bits == 32 and ext.max_elements == {"x": LIMIT, "y": LIMIT} and ext.element_counts == {}
     (spec,) = compile_specs(ext)
-    assert limits(spec) == [] and all("count_of" not in a.to_dict() for a in spec.args)
+    assert [(p.arg, p.shape, p.value) for p in limits(spec)] == [("x", ("M", "7"), LIMIT), ("y", ("M", "7"), LIMIT)]
+    assert all("count_of" not in a.to_dict() for a in spec.args)
+
+    @tilefish.extern(triton="my_kernels:gelu", grid=lambda M: (M,), index_bits=64)
+    def wide(x: Tensor[M, 7, bf16], y: Out[Tensor[M, 7, bf16]], BLOCK: const = 1024): ...
+
+    assert wide.index_bits == 64 and wide.max_elements == {}
+    (spec64,) = compile_specs(wide)
+    assert limits(spec64) == []
+    assert declaration_digest(wide) != declaration_digest(ext)  # the claim about indexing is part of the declaration
+
+
+def test_index_bits_is_32_or_64_and_a_static_tensor_that_i32_cannot_index_is_refused():
+    for bad in (16, 0, 128, True, "32", None, 32.0):
+        with pytest.raises(tilefish.TilefishDeclarationError, match="index_bits must be 32"):
+            tilefish.extern(triton="my_kernels:gelu", grid=lambda M: (M,), index_bits=bad)
+
+        with pytest.raises(tilefish.TilefishDeclarationError, match="index_bits must be 32"):
+            tilefish.ExternOp(lambda: None, "x", None, "m:k", 4, 3, None, index_bits=bad)
+
+    with pytest.raises(tilefish.TilefishDeclarationError, match=r"'x' has 4294967296 elements, more than the 2147483647 .*index_bits=64"):
+
+        @tilefish.extern(triton="my_kernels:gelu", grid=lambda: (1,))
+        def huge(x: Tensor[65536, 65536, bf16]): ...
+
+    @tilefish.extern(triton="my_kernels:gelu", grid=lambda: (1,), index_bits=64)
+    def huge64(x: Tensor[65536, 65536, bf16]): ...
+
+    assert huge64.max_elements == {}
+    # a bucketed or runtime dimension is not statically known, so there is no refusal at the declaration, and the limit is at launch
+    @tilefish.extern(triton="my_kernels:gelu", grid=lambda M: (M,))
+    def ok(x: Tensor[M, 65536, bf16]): ...
+
+    assert ok.max_elements == {"x": LIMIT}
 
 
 def test_the_facts_are_part_of_the_declaration_digest():

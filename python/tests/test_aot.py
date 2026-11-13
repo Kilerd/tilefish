@@ -72,10 +72,13 @@ def test_norm_kernel_preconditions():
     assert [p.to_dict() for p in spec.preconditions] == [
         {"kind": "pointer_alignment", "arg": "X", "index": 0, "bytes": 16},
         {"kind": "static_size", "arg": "X", "index": 0, "axis": 1, "value": 2560},
+        {"kind": "max_elements", "arg": "X", "index": 0, "value": 2**31 - 1, "shape": ["M", "2560"]},
         {"kind": "pointer_alignment", "arg": "W", "index": 1, "bytes": 16},
         {"kind": "static_size", "arg": "W", "index": 1, "axis": 0, "value": 2560},
+        {"kind": "max_elements", "arg": "W", "index": 1, "value": 2**31 - 1, "shape": ["2560"]},
         {"kind": "pointer_alignment", "arg": "Y", "index": 2, "bytes": 16},
         {"kind": "static_size", "arg": "Y", "index": 2, "axis": 1, "value": 2560},
+        {"kind": "max_elements", "arg": "Y", "index": 2, "value": 2**31 - 1, "shape": ["M", "2560"]},
     ]
 
 

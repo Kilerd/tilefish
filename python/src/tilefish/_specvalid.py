@@ -53,7 +53,7 @@ PRE_FIELDS = {
     "divisible": {"arg", "index", "dim", "by"},
     "static_size": {"arg", "index", "axis", "value"},
     "bucket": {"dim", "value", "buckets"},
-    "max_elements": {"arg", "index", "shape", "value"},  # schema 2; only kernels that tilefish generated
+    "max_elements": {"arg", "index", "shape", "value"},  # schema 2; a kernel that indexes with i32: every generated one, and every extern that does not say index_bits=64
 }
 MAX_ELEMENTS = 2**31 - 1  # the limit of i32 offsets, the only bound a max_elements precondition may carry
 

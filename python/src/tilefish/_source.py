@@ -13,9 +13,19 @@ globals it reads *directly*, so a constexpr read as a module attribute (``cfg.SC
 * recursively, the full text of the file of every *user module* reachable from the namespace of that module: the
   modules it holds (``import cfg``), the modules of the functions, classes and objects it holds (``from helpers
   import apply``, a constant that is an instance of a class from ``cfg``), then the same for each of those modules.
-  Only the top level of a namespace is followed: a name that is a container of functions is not opened, and an import
-  inside a function body is not seen;
-* the Triton version.
+  Only the top level of a namespace is followed (and the closure variables of the jit functions found): a name that is a
+  container of functions is not opened, and an import inside a function body is not seen;
+* the Triton version;
+* the *values* the kernel's jit functions read that are in no file (:func:`values_read`): the scalars and Triton constants of
+  the module attributes they read, as the process holds them (a module may compute one when it is imported, from the
+  environment or a device query), and the **closure variables** of every jit function reached (a kernel made by a factory
+  function, ``def make(): S = tl.constexpr(...); @triton.jit def k(...): ... S``, reads ``S`` from a cell, which no file has).
+  Each is written as its ``repr``, so the digest means *what this process would compile*: a replay in a process whose cell
+  or constant has another value is refused, and a cache of builds keyed by the digest cannot serve one value's binary for
+  another's. A closure variable that holds a module, a function or a class stands for which one it is; one that holds anything
+  else (a list, an instance, an object whose ``repr`` is its address), and a module attribute that a kernel reads and that
+  is such an object, has no text that is the same in every process: **it is refused** (:class:`UnstableValueError`: make it a
+  module-level constant or a const parameter of the extern).
 
 Each file counts by its module name and the sha256 of its bytes, so the digest does not depend on where the files are.
 
@@ -62,6 +72,7 @@ import ast
 import functools
 import hashlib
 import importlib.machinery
+import json
 import os
 import sys
 import textwrap
@@ -72,8 +83,8 @@ from typing import Any, Iterator
 
 from .errors import TilefishBuildError
 
-SOURCE_DIGEST_KIND = "tilefish.module-sources.v1"
-_TAG = b"tilefish.source-digest.v1\0"
+SOURCE_DIGEST_KIND = "tilefish.module-sources.v2"
+_TAG = b"tilefish.source-digest.v2\0"
 _EXCLUDED = frozenset({"triton", "torch", "tilefish", "builtins", "__future__"}) | frozenset(getattr(sys, "stdlib_module_names", ()))
 _MAX_UNWRAP = 8
 
@@ -145,8 +156,28 @@ class Sources:
         self.functions = functions
 
 
+def _closure_of(jit: Any) -> "dict[str, Any]":
+    """The closure variables of the function behind a jit function, by name (``_EMPTY`` for a cell that has no value yet)."""
+    inner = _attr(jit, "fn")
+    names = _attr(_attr(inner, "__code__"), "co_freevars")
+    cells = _attr(inner, "__closure__")
+    if not names or not cells:
+        return {}
+    out: dict[str, Any] = {}
+    for name, cell in zip(names, cells):
+        try:
+            out[name] = cell.cell_contents
+        except ValueError:
+            out[name] = _EMPTY
+    return out
+
+
 def reachable(fn: Any) -> "Sources | None":
-    """The files that make up the kernel ``fn`` (a ``JITFunction``), or ``None`` when its own module is not a Python file."""
+    """The files that make up the kernel ``fn`` (a ``JITFunction``), or ``None`` when its own module is not a Python file.
+
+    The walk goes through the top level of the module namespaces and through the closure variables of every jit function it
+    finds (a kernel made by a factory function holds what it reads in cells, not in its module).
+    """
     kernel = jit_function(fn)
     if kernel is None:
         return None
@@ -156,23 +187,34 @@ def reachable(fn: Any) -> "Sources | None":
     files: dict[str, str] = {}
     functions: list[Any] = [kernel]
     pending = [start]
-    while pending:
-        name, namespace = pending.pop()
-        if name in files or not is_user_module(name):
-            continue
-        path = _source_file(namespace)
-        if path is None:
-            continue
-        files[name] = path
-        for value in list(namespace.values()):
-            for held in _held(value):
-                target = _namespace_of(held)
-                if target is None or not is_user_module(target[0]):
-                    continue
-                if _is_jit(held) and not any(held is known for known in functions):
-                    functions.append(held)
-                if target[0] not in files:
-                    pending.append(target)
+
+    def consider(value: Any) -> None:
+        for held in _held(value):
+            target = _namespace_of(held)
+            if target is None or not is_user_module(target[0]):
+                continue
+            if _is_jit(held) and not any(held is known for known in functions):
+                functions.append(held)
+            if target[0] not in files:
+                pending.append(target)
+
+    closed = 0  # the jit functions whose closure variables were looked at
+    while True:
+        while pending:
+            name, namespace = pending.pop()
+            if name in files or not is_user_module(name):
+                continue
+            path = _source_file(namespace)
+            if path is None:
+                continue
+            files[name] = path
+            for value in list(namespace.values()):
+                consider(value)
+        if closed == len(functions):
+            break
+        for value in _closure_of(functions[closed]).values():
+            consider(value)
+        closed += 1
     return Sources(files, functions)
 
 
@@ -214,10 +256,12 @@ def digest_of(found: "Sources | None") -> "str | None":
     except OSError:
         return None
     check_values(found)
+    values = values_read(found, strict=True)  # a value with no stable repr is refused: no digest could tell two of them apart
     h = hashlib.sha256(_TAG)
     h.update(version.encode("utf-8") + b"\0")
     for name in sorted(found.files):
         h.update(name.encode("utf-8") + b"\0" + hashes[name].encode("ascii") + b"\n")
+    h.update(b"values\0" + json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii") + b"\n")
     return h.hexdigest()
 
 
@@ -262,9 +306,15 @@ class StaleSourceError(TilefishBuildError):
     """What the process holds of a module a kernel reaches is not what is on disk, or not what the module's source says."""
 
 
+class UnstableValueError(TilefishBuildError):
+    """A value a kernel reads (a closure variable, a module constant) that has no stable ``repr``, so no digest can say which value it is."""
+
+
 _NoneType = type(None)
 _SCALARS = (int, float, bool, str, bytes, complex, _NoneType)
 _MISSING = object()
+_EMPTY = object()  # a closure cell that has no value (yet)
+_STRUCTURAL = (types.ModuleType, types.FunctionType, types.BuiltinFunctionType, types.MethodType, type)
 
 
 def _is_scalar(value: Any) -> bool:
@@ -490,17 +540,22 @@ def _check_value(owner: str, namespace: "dict[str, Any]", name: str, reader: Any
 
 
 def _reads(found: Sources) -> "Iterator[tuple[str, dict[str, Any], str, Any]]":
-    """``(module name, its namespace, name, jit function)`` for every module-level name a jit function of ``found`` reads, by name or as ``module.name``."""
+    """``(module name, its namespace, name, jit function)`` for every module-level name a jit function of ``found`` reads, by name or as ``module.name``.
+
+    A name that is a closure variable of the function is not a module attribute: see :func:`values_read`.
+    """
     for fn in found.functions:
         free, chains = _names_read(fn)
         namespace = _attr(fn, "__globals__")
         if not isinstance(namespace, dict):
             continue
+        cells = _closure_of(fn)
         owner = str(namespace.get("__name__", "?"))
         for name in sorted(free):
-            yield owner, namespace, name, fn
+            if name not in cells:
+                yield owner, namespace, name, fn
         for chain in sorted(chains):
-            module: Any = namespace.get(chain[0])
+            module: Any = cells[chain[0]] if chain[0] in cells else namespace.get(chain[0])
             for attr in chain[1:]:
                 if not issubclass(type(module), types.ModuleType):
                     break
@@ -515,27 +570,103 @@ def check_values(found: Sources) -> None:
         _check_value(owner, namespace, name, fn)
 
 
-def _stable_repr(value: Any) -> str:
-    text = repr(value)
-    return type(value).__qualname__ if " at 0x" in text else text  # a default repr holds an address: not the same in another process
+def _canonical(value: Any) -> str:
+    """The ``repr`` of a scalar, the same in every process (a ``frozenset`` is written in sorted order)."""
+    if type(value) is frozenset:
+        return "frozenset({" + ", ".join(sorted(_canonical(v) for v in value)) + "})"
+    if type(value) is tuple:
+        return "(" + ", ".join(_canonical(v) for v in value) + ("," if len(value) == 1 else "") + ")"
+    return repr(value)
 
 
-def values_read(found: "Sources | None") -> "dict[str, str]":
-    """The scalars and Triton constants (``module.name`` to their ``repr``) that the jit functions of ``found`` read and the process holds now.
+def _function_id(fn: Any) -> str:
+    """Which jit function: its module, its qualified name and its line, the same in every process that has the same files."""
+    inner = _attr(fn, "fn")
+    namespace = _attr(fn, "__globals__")
+    module = str(namespace.get("__name__", "?")) if isinstance(namespace, dict) else "?"
+    return f"{module}:{_attr(inner, '__qualname__') or _attr(fn, '__name__')}@{_attr(fn, 'starting_line_number')}"
 
-    A source digest is of files, and what a module computes when it is imported (from the environment, from a device query) is
-    not in them; these are the values a compile takes from the process, so a cache of builds keys by them too.
+
+def _identity(value: Any) -> str:
+    """Which module, function or class a closure variable holds: its ``module:qualname`` (what the files say it is, not an address)."""
+    if issubclass(type(value), types.ModuleType):
+        return f"module:{value.__name__}"
+    kernel = jit_function(value)
+    if kernel is not None:
+        return f"jit:{_function_id(kernel)}"
+    return f"{_attr(value, '__module__')}:{_attr(value, '__qualname__') or _attr(value, '__name__')}"
+
+
+def _render(value: Any, *, closure: bool, strict: bool, what: "Any") -> "str | None":
+    """The text that stands for a value a kernel reads in a digest or a cache key, or ``None`` for one that is covered by the files.
+
+    A scalar, and a Triton object with a stable ``repr`` (``tl.constexpr``, a dtype), stand for themselves; what a closure
+    variable holds that is a module, a function or a class stands for which one it is. Any other value (a container, an
+    instance, an object whose ``repr`` is its address) has no text that is the same in every process: with ``strict`` that is
+    an :class:`UnstableValueError`, otherwise it is left out.
+    """
+    if value is _EMPTY:
+        return "<empty cell>"
+    try:
+        if _is_scalar(value):
+            return _canonical(value)
+        if issubclass(type(value), _STRUCTURAL) or jit_function(value) is not None:
+            return _identity(value) if closure else None
+        if _is_triton_object(value):
+            text = repr(value)
+            if " at 0x" not in text:
+                return text
+            if not strict:
+                return type(value).__qualname__
+        elif not strict:
+            return None
+    except Exception:  # noqa: BLE001 - an object that cannot be looked at
+        if not strict:
+            return None
+    kind = "closure variable" if closure else "module attribute"
+    raise UnstableValueError(
+        f"{what()} holds a {type(value).__qualname__} that has no stable repr, so its value cannot be part of the source digest "
+        f"(a build, a cache entry and a manifest could not tell one value of it from another): make it a module-level constant "
+        f"(a scalar or a tl.constexpr, in a file) or a const parameter of the extern, not a {kind} that holds an object"
+    )
+
+
+def values_read(found: "Sources | None", *, strict: bool = False) -> "dict[str, str]":
+    """What the jit functions of ``found`` read that is not in a file, as the process holds it now: ``name`` to text.
+
+    * the scalars and Triton constants of module attributes they read, by name or as ``module.name`` (``"cfg.SCALE"``);
+    * the closure variables of every jit function (``"module:make.<locals>.kernel@12/S"``): a kernel made by a factory function
+      reads its constants from cells, which are in no file.
+
+    A source digest is of files, and what a module computes when it is imported (from the environment, from a device query), or a
+    factory closes over, is not in them; these are the values a compile takes from the process, so the source digest (and a cache of builds) is of
+    them too. With ``strict`` a value that has no stable ``repr`` raises :class:`UnstableValueError`; without it such a value is left out.
     """
     if found is None:
         return {}
     out: dict[str, str] = {}
-    for owner, namespace, name, _ in _reads(found):
+    for owner, namespace, name, fn in _reads(found):
         value = namespace.get(name, _MISSING)
-        try:
-            if value is not _MISSING and (_is_scalar(value) or _is_triton_object(value)):
-                out[f"{owner}.{name}"] = _stable_repr(value)
-        except Exception:  # noqa: BLE001 - an object that cannot be looked at
+        if value is _MISSING:
             continue
+        text = _render(
+            value,
+            closure=False,
+            strict=strict,
+            what=lambda: f"the module attribute '{owner}.{name}', which the Triton function '{_attr(fn, '__name__')}' reads,",
+        )
+        if text is not None:
+            out[f"{owner}.{name}"] = text
+    for fn in found.functions:
+        for name, value in _closure_of(fn).items():
+            text = _render(
+                value,
+                closure=True,
+                strict=strict,
+                what=lambda: f"the closure variable '{name}' of the Triton function '{_attr(fn, '__name__')}'",
+            )
+            if text is not None:
+                out[f"{_function_id(fn)}/{name}"] = text
     return dict(sorted(out.items()))
 
 

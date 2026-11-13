@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import inspect
+import math
 import re
 import sys
 from typing import Any, Callable
 
 from .dims import DimExpr, as_dim
+from ._specvalid import MAX_ELEMENTS
 from .dtypes import DType
 from .errors import TilefishDeclarationError, TilefishError, TilefishPicklingError, TilefishTypeError
 from .ir import Graph
@@ -401,13 +403,20 @@ class ExternOp(Op):
     parameters: tensors are pointers, a parameter annotated with a runtime
     ``Dim`` is an ``i32`` scalar, a ``const`` parameter is a ``constexpr``.
 
-    Five optional facts exist for kernels that tilefish generated (``@tilefish.extern`` never sets them,
-    so the specs of a hand-written kernel say nothing about its indexing, its contraction, a warp count
+    ``index_bits`` is how the kernel indexes its tensors: ``32`` (the default, and what every generated kernel does) or
+    ``64``. A kernel whose offsets are ``i32`` reads and writes the wrong memory past ``2**31 - 1`` elements, silently, so
+    ``@tilefish.extern`` declares ``max_elements`` for every tensor parameter when ``index_bits`` is 32 and a host checks it at
+    launch; ``index_bits=64`` is the kernel's word that it indexes with ``i64``, and declares none. It is in the declaration
+    digest (as ``max_elements`` is), so a binary built under the other declaration is not the binary of this one.
+
+    Four more optional facts exist for kernels that tilefish generated (``@tilefish.extern`` never sets them,
+    so the specs of a hand-written kernel say nothing about its contraction, a warp count
     per bucket or its source):
 
     * ``max_elements`` maps tensor parameters to the largest element count the kernel can index (its
       offsets are ``i32``); every spec of the op then carries a ``max_elements`` precondition on those
-      arguments, which a host checks at launch.
+      arguments, which a host checks at launch. ``@tilefish.extern`` sets it for every tensor parameter unless
+      ``index_bits=64``; a generated kernel names the tensors whose size no static bound keeps within ``i32``.
     * ``element_counts`` maps runtime scalar parameters to the tensor parameter whose element count (the
       product of its shape) the scalar carries; the spec records how a host computes the value.
     * ``fp_fusion`` (``True`` or ``False``) puts ``enable_fp_fusion`` into the compile options of every
@@ -437,8 +446,12 @@ class ExternOp(Op):
         fp_fusion: "bool | None" = None,
         bucket_num_warps: "dict[str, int] | None" = None,
         source_sha256: "str | None" = None,
+        index_bits: int = 32,
     ) -> None:
         super().__init__(fn, name, signature)
+        if type(index_bits) is not int or index_bits not in (32, 64):
+            raise TilefishDeclarationError(f"extern '{name}': index_bits must be 32 or 64, got {index_bits!r}")
+        self.index_bits: int = index_bits
         self.triton = triton
         self.num_warps = num_warps
         self.num_stages = num_stages
@@ -571,12 +584,19 @@ def extern(
     num_stages: int = 3,
     grid: Any = None,
     name: str | None = None,
+    index_bits: int = 32,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
 
     It always takes arguments (``@tilefish.extern`` without parentheses is an
     error). ``triton`` is a ``"module:function"`` string or a kernel object;
     ``grid`` is a callable over dimension and constant names, or a tuple.
+
+    ``index_bits`` says how the kernel computes the offsets it loads and stores at. The default, ``32``, is the safe
+    claim: every tensor parameter gets a ``max_elements`` precondition of ``2**31 - 1`` elements, which Python's ``replay`` and
+    a Rust host check at launch, because a kernel that indexes with ``i32`` (``row * N_COLS + col`` on ``tl.int32`` values) goes
+    through memory it was not given, silently, on a tensor that is any larger. A kernel that computes its offsets in ``i64``
+    (``row.to(tl.int64) * N_COLS``) declares ``index_bits=64`` and has no such limit. The choice is in the declaration digest.
 
     The decorated stub lists **the Triton kernel's parameters, in order**:
     a ``Tensor``/``InOut``/``Out`` is a pointer, a parameter annotated with a
@@ -604,6 +624,9 @@ def extern(
     if isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1:
         raise TilefishDeclarationError(f"extern: num_stages must be a positive int, got {num_stages!r}")
 
+    if type(index_bits) is not int or index_bits not in (32, 64):
+        raise TilefishDeclarationError(f"extern: index_bits must be 32 (the kernel indexes with i32) or 64 (with i64), got {index_bits!r}")
+
     if name is not None and (not isinstance(name, str) or not _OP_NAME.fullmatch(name)):
         raise TilefishDeclarationError(
             f"extern: name must be a plain identifier (ASCII letters, digits and underscores, not starting with a digit): "
@@ -625,6 +648,19 @@ def extern(
                     f"extern op '{nm}': const parameter '{p.name}' needs a default, the value compiled in as constexpr"
                 )
         _check_against_kernel(nm, sig, target)
-        return ExternOp(fn, nm, sig, target.ref, num_warps, num_stages, grid)
+        limits: dict[str, int] = {}
+        if index_bits == 32:
+            for p in sig.params:
+                if p.kind != "tensor":
+                    continue
+                shape = p.type.shape  # type: ignore[union-attr]
+                count = math.prod(d.value for d in shape) if all(d.is_static for d in shape) else 0  # 0: not statically known
+                if count > MAX_ELEMENTS:
+                    raise TilefishDeclarationError(
+                        f"extern op '{nm}': parameter '{p.name}' has {count} elements, more than the {MAX_ELEMENTS} that i32 offsets "
+                        "reach; declare index_bits=64 if the kernel computes its offsets in i64"
+                    )
+                limits[p.name] = MAX_ELEMENTS
+        return ExternOp(fn, nm, sig, target.ref, num_warps, num_stages, grid, max_elements=limits, index_bits=index_bits)
 
     return deco

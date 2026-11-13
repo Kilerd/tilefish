@@ -341,7 +341,7 @@ def test_an_entry_without_a_source_digest_needs_a_pin(tmp_path):
 
 def test_the_source_digest_of_an_entry_is_labelled(directory):
     entry = json.loads((directory / "manifest.json").read_text())["kernels"][0]
-    assert entry["source_digest"] == SRC and entry["source_digest_kind"] == SOURCE_DIGEST_KIND == "tilefish.module-sources.v1"
+    assert entry["source_digest"] == SRC and entry["source_digest_kind"] == SOURCE_DIGEST_KIND == "tilefish.module-sources.v2"
 
 
 def test_a_source_digest_of_another_kind_says_nothing_about_the_files(tmp_path):
@@ -350,7 +350,7 @@ def test_a_source_digest_of_another_kind_says_nothing_about_the_files(tmp_path):
     write_manifest([fake_build(spec)], tmp_path / "manifest.json", cubins=True)
     edit_manifest(tmp_path, lambda d: d["kernels"][0].update(source_digest_kind="triton.JITFunction.cache_key"))
     m = Manifest.load(tmp_path)
-    with pytest.raises(TilefishManifestError, match=r"source digest is of kind 'triton.JITFunction.cache_key', not 'tilefish.module-sources.v1'"):
+    with pytest.raises(TilefishManifestError, match=r"source digest is of kind 'triton.JITFunction.cache_key', not 'tilefish.module-sources.v2'"):
         m.built_kernel(spec, "sm_90", source_digest=SRC)  # the same hash, the other kind: not taken as a match
     assert m.built_kernel(spec, "sm_90", source_digest=SRC, pinned=True).stem == "scale"  # only a pin vouches for it
     edit_manifest(tmp_path, lambda d: d["kernels"][0].pop("source_digest_kind"))
