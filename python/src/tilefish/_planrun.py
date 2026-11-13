@@ -1063,6 +1063,87 @@ class PlanRunner:
             )
         return items
 
+    def run_step(self, step: Any, buffers: Any, bucket: "Mapping[str, int] | None" = None) -> None:
+        """:func:`run_step` of this runner's plan (see there)."""
+        be = self.backend
+        doc = self._doc
+        if not isinstance(buffers, Mapping):
+            raise TilefishRuntimeError(f"run_step: buffers= maps the name of every buffer the step binds to its tensor, got {buffers!r}")
+        n_steps = len(doc["buckets"][0]["steps"])
+        if isinstance(step, bool) or not isinstance(step, int) or not 0 <= step < n_steps:
+            raise TilefishRuntimeError(f"run_step: the step is an index of the {n_steps} steps of the plan of graph '{self.plan.name}', got {step!r}")
+        given: "dict[str, Any]" = {}
+        for key, t in buffers.items():
+            name = key if isinstance(key, str) and key in self._buffers else _plan.output_buffer(doc, key)
+            if name is None or self._buffers[name]["role"] == "workspace":
+                raise TilefishRuntimeError(f"run_step: {key!r} is not a buffer of the plan of graph '{self.plan.name}' (the workspace is the plan's own)")
+            if name in given:
+                raise TilefishRuntimeError(f"run_step: the buffer '{name}' is given twice")
+            given[name] = t
+        infos = {n: tensor_info(n, t) for n, t in given.items()}
+        if bucket is None:  # the one bucket whose shapes are the tensors' (a devscalar of one element fits any)
+            fits = []
+            for b in doc["buckets"]:
+                shapes = _plan.buffer_shapes(doc, b["values"])
+                if all(shapes[n][1] == infos[n].shape or (not shapes[n][1] and math.prod(infos[n].shape) == 1) for n in given):
+                    fits.append(b["values"])
+            if len(fits) != 1:
+                raise TilefishPreconditionError(
+                    f"run_step: the shapes of the tensors given fit {len(fits)} buckets of the plan of graph '{self.plan.name}' "
+                    f"({', '.join(map(str, fits[:8])) or 'none'}): give bucket=",
+                    kind="bucket",
+                )
+            values = dict(fits[0])
+        else:
+            values = dict(bucket)
+            if not any(b["values"] == values for b in doc["buckets"]):
+                raise TilefishPreconditionError(f"run_step: {values} is not a bucket of the plan of graph '{self.plan.name}'", kind="bucket")
+        st_doc = next(b["steps"] for b in doc["buckets"] if b["values"] == values)[step]
+        needed = [a["binding"] for a in st_doc["args"]]
+        missing, extra = [n for n in needed if n not in given], sorted(set(given) - set(needed))
+        if missing or extra:
+            raise TilefishRuntimeError(
+                f"run_step: step #{step} of graph '{self.plan.name}' binds the buffers {sorted(set(needed))}"
+                + (f"; {', '.join(dict.fromkeys(missing))} missing" if missing else "")
+                + (f"; {', '.join(extra)} not bound by it" if extra else "")
+            )
+        device = runtime._device_of(infos, given)
+        if getattr(device, "type", None) != "cuda":
+            raise TilefishRuntimeError(f"run_step runs on a CUDA device; the tensors are on {device}")
+        index = be.device_index(device)
+        arch = self.plan.arch
+        if arch is not None and arch != f"sm_{be.capability(index)}":
+            raise TilefishRuntimeError(f"the plan of graph '{self.plan.name}' was built for {arch}, but device {index} is sm_{be.capability(index)}")
+        with _gate.shared():
+            if be.capturing(index):
+                raise TilefishRuntimeError("run_step is not captured: run the step outside a CUDA graph capture")
+            rt = self._bucket(values, index)
+            arena = self._arena(index)
+            st = rt.steps[step]
+            bases: "dict[str, int]" = {}
+            ranges = []
+            for name, t in given.items():
+                dtype, shape = rt.shapes[name]
+                info = infos[name]
+                if self._buffers[name]["role"] == "devscalar" and math.prod(info.shape) == 1 and info.dtype == TORCH_DTYPE_NAMES[dtype]:
+                    shape = tuple(info.shape)  # a device scalar is a tensor of one element
+                self._check_output(f"buffers[{name!r}]", t, dtype, shape, index)
+                bases[name] = int(info.ptr)
+                ranges.append((name, bases[name], bases[name] + math.prod(shape) * _plan.ITEMSIZE[dtype]))
+            if st.workspace is not None:
+                bases[st.workspace] = arena.ptr + self._buffers[st.workspace]["offset"]
+            written = self._written(st)
+            for name, lo, hi in ranges:
+                if arena.nbytes and lo < arena.ptr + arena.nbytes and arena.ptr < hi:
+                    raise TilefishPreconditionError(f"run_step: the tensor of '{name}' overlaps the arena of the plan", kind="alias", arg=name)
+                for other, olo, ohi in ranges:
+                    if other != name and (name in written or other in written) and lo < ohi and olo < hi:
+                        raise TilefishPreconditionError(f"run_step: the tensors of '{name}' and '{other}' overlap, and the step writes one", kind="alias", arg=name)
+            real = st.bound.check(bases)  # every precondition of the step with the caller's addresses
+            with arena.lock, be.scope(index):
+                stream = be.stream(index)
+                _ordered(be, arena, stream, False, lambda: self._enqueue_step(st, real, bases, stream, index))
+
     def _check_output(self, name: str, t: Any, dtype: str, shape: "tuple[int, ...]", index: int) -> None:
         info = tensor_info(f"outputs[{name}]", t)
         if info.dtype != TORCH_DTYPE_NAMES[dtype] or info.shape != tuple(shape) or not info.contiguous:
@@ -1381,6 +1462,36 @@ def prepare(
     torch = runtime._torch()
     index = torch.cuda.current_device() if device is None else runner.backend.device_index(device)
     runner.prepare(index, buckets)
+
+
+def run_step(
+    graph: GraphOp,
+    step: int,
+    buffers: "Mapping[str, Any]",
+    *,
+    mode: str = "jit",
+    plan: Any = None,
+    pin: "str | None" = None,
+    trust_directory: bool = False,
+    bucket: "Mapping[str, int] | None" = None,
+) -> None:
+    """Launch one step of the plan of ``graph`` on the caller's tensors: the binary the plan's manifest has for the step's entry (``replay``: the plan
+    verified against ``pin``, which pins that manifest, or ``trust_directory=True``; ``jit``: built in memory) and the binding the plan says (each
+    argument the buffer and the view the step names), with every check of the step made with the caller's addresses before the launch.
+
+    ``buffers`` maps the name of every buffer the step binds (a returned value also as ``out<i>``; not the workspace: a GEMM's is the plan's arena) to a
+    tensor of the buffer's dtype and its shape at the bucket, contiguous (a device scalar: a tensor of one element). ``bucket`` is the bucket
+    combination, found from the shapes when exactly one fits them. The launch is on torch's current stream, ordered with the runs of the plan
+    (the arena's order event). What it is for: one op of an exported plan replayed on the inputs of a reference, under the pin the product uses."""
+    if mode not in ("jit", "replay"):
+        raise TilefishRuntimeError(f"run_step: mode is 'jit' or 'replay', got {mode!r}")
+    if mode == "jit":
+        if pin is not None or trust_directory:
+            raise TilefishRuntimeError("pin= and trust_directory= are for mode='replay' (they vouch for a plan directory); mode 'jit' runs no plan directory")
+        runner = _jit_runner(plan if isinstance(plan, Plan) else _default_plan(graph))
+    else:
+        runner = _replay_runner(graph, _plan_directory(plan), pin, trust_directory)
+    runner.run_step(step, buffers, bucket)
 
 
 # -- export --------------------------------------------------------------------------------------------------------------------------------

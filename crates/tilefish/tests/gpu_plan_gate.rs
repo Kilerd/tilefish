@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, sys};
 use serde_json::Value;
 use tilefish::{
-    Access, Bf16, DType, DevScalar, DevicePtr, Element, Error, F16, F32, I32, I64, LaunchPlan, Pin, PreconditionKind,
-    Tap, TensorArg, TensorMut, TensorRef, U8, plan_digest,
+    Access, Bf16, BufferRole, DType, DevScalar, DevicePtr, Element, Error, F16, F32, I32, I64, LaunchPlan, Pin,
+    PreconditionKind, Tap, TensorArg, TensorMut, TensorRef, U8, plan_digest,
 };
 
 fn gate_dir() -> PathBuf {
@@ -325,6 +325,64 @@ fn taps_are_pythons_bytes() {
         assert!(e.to_string().contains(message), "{buffer}: {e}");
     }
     println!("rust plan gate: {tapped} taps byte-identical to Python's");
+}
+
+/// `PlanRun::launch_step`: the steps of `residual_chain` launched one by one on the caller's tensors (the intermediate too), each with the binary
+/// and the binding of the pinned plan, give Python's outputs of the whole plan byte for byte; a step given a buffer it does not bind, or not given
+/// one it binds, is refused.
+#[test]
+fn the_steps_launched_one_by_one_give_the_bytes_of_the_plan() {
+    let gpu = Gpu::new();
+    let plan = plan_named("residual_chain");
+    let lp = load(&plan);
+    let run = lp.instantiate_all(&gpu.stream).unwrap();
+    for case in plan["cases"].as_array().unwrap() {
+        let id = case["id"].as_str().unwrap();
+        let bucket: Vec<(String, u64)> =
+            case["bucket"].as_object().unwrap().iter().map(|(n, v)| (n.clone(), v.as_u64().unwrap())).collect();
+        let values: Vec<(&str, u64)> = bucket.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let at = lp.bucket(&values).unwrap();
+        let mut exts = upload(&gpu.stream, case);
+        // the intermediates: buffers of the arena, given here as tensors of their own
+        for (i, b) in lp.buffers().iter().enumerate().filter(|(_, b)| b.role == BufferRole::Intermediate) {
+            let shape = at.shape_of(i).unwrap().to_vec();
+            let slice = gpu.stream.alloc_zeros::<u8>(shape.iter().product::<usize>() * b.dtype.size()).unwrap();
+            exts.push(Ext {
+                name: b.name.clone(),
+                role: "intermediate".to_owned(),
+                dtype: b.dtype,
+                shape,
+                slice,
+                input: None,
+                expect: None,
+            });
+        }
+        for (si, step) in at.steps.iter().enumerate() {
+            let bound: Vec<&str> = step.args.iter().map(|a| a.binding.as_str()).collect();
+            let mut given: Vec<(&str, TensorArg<'_>)> = exts
+                .iter_mut()
+                .filter(|e| bound.contains(&e.name.as_str()))
+                .map(|e| (e.name.as_str(), typed(&mut e.slice, &e.shape, e.dtype, true)))
+                .collect();
+            run.launch_step(&gpu.stream, &values, si, &mut given).unwrap_or_else(|e| panic!("{id} step {si}: {e}"));
+        }
+        gpu.stream.synchronize().unwrap();
+        for e in exts.iter().filter(|e| e.expect.is_some()) {
+            let got = gpu.stream.clone_dtoh(&e.slice).unwrap();
+            assert!(got == *e.expect.as_ref().unwrap(), "{id}: '{}' launched step by step is not the plan's", e.name);
+        }
+    }
+    let case = &plan["cases"].as_array().unwrap()[0];
+    let values: Vec<(String, u64)> =
+        case["bucket"].as_object().unwrap().iter().map(|(n, v)| (n.clone(), v.as_u64().unwrap())).collect();
+    let values: Vec<(&str, u64)> = values.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    let mut exts = upload(&gpu.stream, case);
+    let mut given = args(&mut exts, true); // x, y and residual: step 0 binds x and residual only
+    let e = run.launch_step(&gpu.stream, &values, 0, &mut given).unwrap_err();
+    assert!(e.to_string().contains("does not bind the buffer 'y'"), "{e}");
+    given.retain(|(n, _)| *n == "x");
+    let e = run.launch_step(&gpu.stream, &values, 0, &mut given).unwrap_err();
+    assert!(e.to_string().contains("which is not given"), "{e}");
 }
 
 /// The outputs of a plan whose graph names them (`residual_chain`: `y` and `residual`) are given by those names or by `out0`, `out1` (the names

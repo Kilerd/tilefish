@@ -78,7 +78,8 @@ run.launch(&stream, &mut [("x", x.into_arg()), /* the weights, */ ("out0", y.int
 The externals are given by the names of the plan's buffers: a parameter by its name, a returned value by the name the graph gives it
 (`@tilefish.graph(outputs=("y", ...))` in Python, `LaunchPlan::outputs`) or by `out0`, `out1`, ... in the order the graph returns them
 (`LaunchPlan::output_buffer`), so a host written before graphs named their outputs keeps working. `PlanRun::launch_tapped` is a launch with debug
-taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a step, with the plan and its digest unchanged.
+taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a step, with the plan and its digest unchanged. `PlanRun::launch_step`
+launches one step of a bucket on the caller's tensors, with the binary and the binding of the pinned plan.
 
 Safe code cannot free a slice under a running kernel or GEMM, and a launch of
 slices on a stream that is capturing a CUDA graph is refused, in every cudarc

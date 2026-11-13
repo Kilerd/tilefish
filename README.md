@@ -392,6 +392,10 @@ the `i`-th returned value, so a host written for the names of before keeps worki
 last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest
 unchanged (`plan.shape_of("t3", M=64)` gives the shape; `tilefish.capture` takes `taps=` too; Rust: `PlanRun::launch_tapped`).
 
+**One step alone.** `tilefish.runtime.run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest)` launches one step of the
+plan on your tensors, with the binary and the binding of its arguments that the pinned plan says (Rust: `PlanRun::launch_step`): one op of an exported plan
+replayed on a reference's inputs, under the pin a product uses.
+
 A plan launches declared operators and views. Arithmetic traced in the graph body, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
 tensor was updated in place are refused with the rule that says so; there is no fusion in a plan yet. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation rules, the
 digest) for the host that will run it without Python.

@@ -880,6 +880,17 @@ def prepare(op: GraphOp, **options: Any) -> None:
     _prepare_plan(op, **options)
 
 
+def run_step(op: GraphOp, step: int, buffers: Any, **options: Any) -> None:
+    """Launch one step of a graph's plan, with the binary and the binding of its arguments the (verified) plan says, on the caller's tensors:
+    ``run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest, bucket=None)``. ``buffers`` gives a tensor for every
+    buffer the step binds (by name; a returned value also as ``out<i>``; not the workspace, which is the plan's arena), each of the buffer's dtype and its
+    shape at the bucket, contiguous; the step reads and writes them through the views the plan gives it. ``bucket`` is found from the shapes when one
+    bucket fits them. A single-op replay under the plan's pin: see :func:`tilefish._planrun.run_step` and ``docs/plan-schema-1.md``, section 9."""
+    from ._planrun import run_step as _run_step
+
+    _run_step(op, step, buffers, **options)
+
+
 def run(
     op: Any,
     /,
