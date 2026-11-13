@@ -3,7 +3,7 @@
 Five lowered kernels (the goldens of the lowering: softmax, layernorm, the README's residual add + rmsnorm with its
 ``InOut`` tensor, the exact gelu, swiglu), a row kernel with a bucketed row length (one binary per bucket), and three
 hand-written Triton kernels declared with ``tilefish.extern``: an rmsnorm, an exact-erf gelu and an in-place
-``y += alpha * x`` (``gpu_kernels.py``). They are what ``export_rust_fixtures.py`` builds into the fixtures of the crate and what
+``y += alpha * x`` (``gpu_kernels.py``, and ``mm_kernels.py`` for the matrix product). They are what ``export_rust_fixtures.py`` builds into the fixtures of the crate and what
 ``rust_gate.py`` runs in Python (``replay``) and in Rust.
 
 ``ops()`` works without Triton: ``gpu_kernels`` only needs ``triton.jit`` and ``tl.constexpr`` to be *declared*, and a
@@ -40,16 +40,16 @@ def readme_kernel():
     return ns["residual_add_rmsnorm"]
 
 
-def gpu_kernels():
-    """The ``gpu_kernels`` module of the gpu tests, imported with a stand-in for Triton where Triton is missing."""
+def _with_triton(module_name):
+    """Import ``module_name`` (a module of the gpu tests), with a stand-in for Triton where Triton is missing."""
+    import importlib
+
     try:
         import triton  # noqa: F401
     except ImportError:
         pass
     else:
-        import gpu_kernels as module
-
-        return module
+        return importlib.import_module(module_name)
     standin = types.ModuleType("triton")
     standin.jit = lambda fn: fn
     language = types.ModuleType("triton.language")
@@ -57,11 +57,20 @@ def gpu_kernels():
     standin.language = language
     sys.modules["triton"], sys.modules["triton.language"] = standin, language
     try:
-        import gpu_kernels as module
+        return importlib.import_module(module_name)
     finally:
         del sys.modules["triton"], sys.modules["triton.language"]
-        sys.modules.pop("gpu_kernels", None)  # a later import, with Triton, must not find the stand-in's functions
-    return module
+        sys.modules.pop(module_name, None)  # a later import, with Triton, must not find the stand-in's functions
+
+
+def gpu_kernels():
+    """The ``gpu_kernels`` module of the gpu tests."""
+    return _with_triton("gpu_kernels")
+
+
+def mm_kernels():
+    """The ``tl.dot`` matrix product (``mm_kernels.py``)."""
+    return _with_triton("mm_kernels")
 
 
 def ops():
@@ -77,4 +86,5 @@ def ops():
         "rmsnorm": kernels.rmsnorm,
         "gelu_erf": kernels.gelu_erf,
         "axpy": kernels.axpy,
+        "mm": mm_kernels().mm,  # a tl.dot kernel: more than 48 KiB of dynamic shared memory and a 2-D grid
     }

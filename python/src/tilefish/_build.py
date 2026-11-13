@@ -32,7 +32,10 @@ from .errors import TilefishBuildError, TilefishManifestError
 if TYPE_CHECKING:
     from .aot import CompileSpec
 
-MANIFEST_SCHEMA = 1
+# 2: every pointer parameter of the ABI records its declared shape (``["Rows", 1024]``: a dimension expression, or the size of a static
+# axis) and every entry the constraints of its named dimensions (``dims``), so that a host binds the dimensions from the shapes of
+# its tensors and checks buckets, ``divisible_by``, ``max_elements`` and ``count_of`` from the manifest alone. Schema 1 had neither.
+MANIFEST_SCHEMA = 2
 MIN_TRITON = (3, 5)
 _ARCH = re.compile(r"(?:sm_?)?([0-9]{2,3})a?\Z")
 _ENTRY = re.compile(r"\.entry\s+(\w+)\s*\(")
@@ -238,8 +241,14 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
             "size": size,
         }
         if a.kind == "pointer":
+            if a.shape_dims is None:
+                raise TilefishBuildError(
+                    f"the compile spec of '{spec.stem}' has no declared shape for '{a.name}' (it was written by a tilefish before "
+                    "manifest schema 2): regenerate it with compile_specs(op)"
+                )
             entry["dtype"] = a.dtype
             entry["access"] = a.access
+            entry["shape"] = list(a.shape_dims)
         else:
             entry["dim"] = a.dim
             if a.count_of is not None:  # the value is the element count of that pointer argument
@@ -589,6 +598,7 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
         "num_stages": spec.num_stages,
         "constexprs": constexprs,
         "buckets": dict(spec.buckets),
+        "dims": {name: json.loads(json.dumps(c)) for name, c in spec.dims.items()},
         "preconditions": [p.to_dict() for p in spec.preconditions],
         "options": dict(spec.ast_source_inputs().options),
         "declaration_digest": spec.declaration_digest,
@@ -616,6 +626,7 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         "launch": b.launch.to_dict(),
         "constexprs": spec_part["constexprs"],
         "buckets": spec_part["buckets"],
+        "dims": spec_part["dims"],
         "preconditions": spec_part["preconditions"],
         "options": dict(b.options),
         "declaration_digest": spec_part["declaration_digest"],
@@ -660,8 +671,11 @@ def write_manifest(
 ) -> pathlib.Path:
     """Write the manifest of built kernels as strict JSON to ``path`` and return it.
 
-    For each kernel: ``stem``, ``symbol``, ``abi`` (``params`` in launch order, then the two ``scratch`` slots),
-    ``grid`` (an expression over the dimension names, with ``cdiv(a, b)``), ``block``, ``shared``, ``launch``
+    For each kernel: ``stem``, ``symbol``, ``abi`` (``params`` in launch order, then the two ``scratch`` slots; a pointer
+    records its declared ``shape``, a list of dimension expressions and sizes such as ``["Rows", 1024]``), ``dims`` (for each
+    named dimension its ``divisible_by`` and ``buckets`` and, for a bucketed one, the ``bucket`` this binary is built for: a
+    host binds the dimensions from the shapes of its tensors and checks them with these alone), ``grid`` (an expression over the
+    dimension names, with ``cdiv(a, b)``), ``block``, ``shared``, ``launch``
     (scratch sizes, PDL, cluster and cooperative flags: all zero or false for a binary a plain
     ``cuLaunchKernel`` can run), ``constexprs``, ``preconditions`` (what a host checks before it launches),
     ``declaration_digest`` and, for a generated kernel, ``source_sha256`` (the Triton source it was built from), for a

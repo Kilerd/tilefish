@@ -327,7 +327,7 @@ def validate_precondition(d: Any) -> None:
 
 def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     """Check one serialized argument. From schema 2 on a constexpr may carry its declared ``dtype``."""
-    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "dim", "value", "count_of"])
+    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "shape_dims", "dim", "value", "count_of"])
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
     kind, ty = d["kind"], d["type"]
@@ -342,6 +342,8 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     optional = {"dtype"} if kind == "constexpr" and schema >= SCHEMA_VERSION else set()
     if kind == "scalar" and schema >= SCHEMA_VERSION:
         optional = {"count_of"}  # the pointer argument whose element count this scalar carries
+    if kind == "pointer" and schema >= SCHEMA_VERSION:
+        optional = {"shape_dims"}  # the declared shape: what a host binds the dimensions from
     if not expected <= present <= expected | optional:
         bad(f"arg {d['name']} ({kind}) must have exactly the fields {sorted(expected)}, has {sorted(present)}")
     if kind == "pointer":
@@ -354,6 +356,18 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
             bad(f"arg {d['name']}: shape must be a list of dimension strings")
         for i, dim in enumerate(d["shape"]):
             parse_expression(dim, f"arg {d['name']} shape[{i}]")
+        if "shape_dims" in d:
+            declared = d["shape_dims"]
+            if not isinstance(declared, list) or len(declared) != len(d["shape"]):
+                bad(f"arg {d['name']}: shape_dims must be a list with one entry per axis of shape")
+            for i, entry in enumerate(declared):
+                if is_int(entry):
+                    if entry < 1 or str(entry) != d["shape"][i]:
+                        bad(f"arg {d['name']}: shape_dims[{i}] is the size {entry}, but shape[{i}] is {d['shape'][i]!r}")
+                elif isinstance(entry, str):
+                    parse_expression(entry, f"arg {d['name']} shape_dims[{i}]")
+                else:
+                    bad(f"arg {d['name']}: shape_dims[{i}] must be an int size or a dimension expression, got {entry!r}")
     elif kind == "scalar":
         if ty != "i32" or d["dtype"] != "i32":
             bad(f"arg {d['name']}: a runtime scalar must be i32, got {ty!r}/{d['dtype']!r}")
@@ -387,7 +401,7 @@ def validate_spec(d: Any) -> None:
             f"unsupported compile spec schema {schema!r} (this version reads schemas {LEGACY_SCHEMA} and {SCHEMA_VERSION})"
         )
     # enable_fp_fusion and source_sha256 exist in schema 2 only, and only in the specs of kernels that tilefish generated
-    optional = ["enable_fp_fusion", "source_sha256"] if schema >= SCHEMA_VERSION else []
+    optional = ["enable_fp_fusion", "source_sha256", "dims"] if schema >= SCHEMA_VERSION else []
     _keys(d, "spec", TOP_KEYS_V2 if schema >= SCHEMA_VERSION else TOP_KEYS, optional)
     if "source_sha256" in d and not (isinstance(d["source_sha256"], str) and _DIGEST.match(d["source_sha256"])):
         bad(f"source_sha256 must be 64 lowercase hex digits (a sha256), got {d['source_sha256']!r}")
@@ -550,6 +564,37 @@ def validate_spec(d: Any) -> None:
         bad("launch_params must be the non-constexpr args in order followed by the two zero scratch slots")
 
     # the grid: restricted grammar, only this spec's dimensions
-    unknown = parse_grid(d["grid"]) - dims
+    grid_ids = parse_grid(d["grid"])
+    unknown = grid_ids - dims
     if unknown:
         bad(f"grid {d['grid']!r} mentions {sorted(unknown)}, which are not dimensions of this spec")
+
+    # the constraints of the named dimensions: the names are the ones the declared shapes, the scalars and the grid use
+    if "dims" in d:
+        table = d["dims"]
+        if not isinstance(table, dict):
+            bad("dims must be an object")
+        for name, c in table.items():
+            _ident(name, "dims name")
+            _keys(c, f"dims.{name}", [], ["divisible_by", "buckets", "bucket"])
+            if "divisible_by" in c:
+                _int(c["divisible_by"], f"dims.{name}.divisible_by", 1)
+            if "buckets" in c:
+                b = c["buckets"]
+                if not isinstance(b, list) or not b or any(not is_int(x) or x < 1 for x in b) or b != sorted(set(b)):
+                    bad(f"dims.{name}.buckets must be a sorted list of distinct positive ints, got {b!r}")
+            if "bucket" in c and ("buckets" not in c or c["bucket"] not in c["buckets"] or buckets.get(name) != c["bucket"]):
+                bad(f"dims.{name}.bucket must be one of its buckets and the bucket of this spec")
+        for name in buckets:
+            if table.get(name, {}).get("bucket") != buckets[name]:
+                bad(f"every bucketed dimension needs its bucket in dims: {name} has none")
+        used: set[str] = set(grid_ids)
+        for a in args:
+            for entry in a.get("shape_dims", ()):
+                if isinstance(entry, str):
+                    used |= parse_expression(entry, "shape_dims")
+            if a["kind"] == "scalar":
+                used |= parse_expression(a["dim"], "scalar dim")
+        missing = sorted(used - set(table))
+        if missing:
+            bad(f"dims does not name {missing}, which the declared shapes, the scalars or the grid mention")

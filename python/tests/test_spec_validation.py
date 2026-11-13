@@ -391,7 +391,7 @@ def test_non_object_and_incomplete_input_is_a_spec_error(junk):
         CompileSpec.from_dict(junk)
 
 
-@pytest.mark.parametrize("key", list(GOOD))
+@pytest.mark.parametrize("key", [k for k in GOOD if k != "dims"])  # the table of dimensions is optional: an older spec has none
 def test_every_missing_top_level_key_is_a_spec_error(key):
     if key == "schema":
         rejects(lambda d: d.pop("schema"), "unsupported compile spec schema")

@@ -34,7 +34,7 @@ from native_jit import native_jit  # noqa: E402
 from lower_cases import T, gelu_exact, layernorm, softmax, swiglu  # noqa: E402
 
 import tilefish  # noqa: E402
-from tilefish import Out, Tensor, TilefishPreconditionError, TilefishTypeError, bf16, const, f32  # noqa: E402
+from tilefish import Out, Tensor, TilefishPreconditionError, TilefishTypeError, const, f32  # noqa: E402
 from tilefish import runtime  # noqa: E402
 
 BF16, F32 = torch.bfloat16, torch.float32

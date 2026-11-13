@@ -64,12 +64,16 @@ def test_launchers_typed_from_declarations(fake_manifest):
 
 
 def test_launchers_typed_from_the_manifest_alone(fake_manifest):
+    """Schema 2 records the declared shapes and the dimensions: the declarations only add the signature to the docs."""
     source = rust.render(fake_manifest)
     check_golden("rust_fakes_manifest_only.rs", source)
-    assert "SHAPES" not in source
-    assert "scalars: &[(&str, i64)]" in source and "dims: &[(&str, i64)]" in source
-    assert "`dims`: the dimensions of the grid that no scalar carries: `M`" in source  # rowop's grid is (M,)
-    assert "`scalars`: `n_elem`" in source
+    with_ops = rust.render(fake_manifest, ops=[scale, rowop])
+    assert "`scale(x: Tensor[n, bf16]" in with_ops and "`scale(" not in source  # the declarations add the signature, nothing else
+    assert with_ops.replace("\n///\n", "\n").count("pub fn launch") == source.count("pub fn launch")
+    assert "SHAPES" in source and 'pub const SHAPES: &\'static [&\'static [&\'static str]] = &[&["M", "S"], &["M", "S"]];' in source
+    # nothing but the tensors: there is no way to tell a launch what a dimension is
+    assert "scalars: " not in source and "dims: " not in source and "self.kernel.launch(stream, &[x.arg(), y.arg()])" in source
+    assert "Constraints: `S` is exactly 32" in source and "Constraints: `n` is a multiple of 16" in source
 
 
 def test_embedded_launchers(fake_manifest, tmp_path):
@@ -87,8 +91,8 @@ def test_baked_in_sizes_are_constants_and_documented():
 
     source = rust.render(Manifest.load(FIXTURES / "sm_103"), ops=host_ops.ops().values())
     assert "pub const X_PTR_AXIS1: usize = 2048;" in source  # the extern rmsnorm: Tensor[Rows, Hidden = 2048]
-    assert "Baked into the binary (checked before every launch): axis 1 of `x_ptr` is 2048;" in source
-    assert "Bucketed: `Db` is exactly 96" in source
+    assert "Baked into the binary: axis 1 of `x_ptr` is 2048;" in source
+    assert "Constraints: `Db` is exactly 96 (a bucket of [96, 512, 1000]" in source
 
 
 # -- determinism ------------------------------------------------------------------------------------------------------------
@@ -185,7 +189,7 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect():
     for name, want in expected.items():
         manifest = Manifest.load(FIXTURES / name)  # verifies every cubin against the manifest
         assert manifest.digest == want["manifest_digest"], name
-        assert len(manifest.artifacts) == len(want["kernels"]) == 11
+        assert len(manifest.artifacts) == len(want["kernels"]) == 12
         for k in want["kernels"]:
             artifact = manifest.get(k["stem"], k["arch"])
             assert artifact.entry["cubin"] == k["cubin"]
@@ -282,8 +286,9 @@ def _mutations():
         ("NaN", lambda d: text(d, lambda t: t.replace('"shared": 16', '"shared": NaN', 1))),
         ("Infinity", lambda d: text(d, lambda t: t.replace('"shared": 16', '"shared": Infinity', 1))),
         ("1e999", lambda d: text(d, lambda t: t.replace('"num_stages": 3', '"num_stages": 1e999', 1))),
-        ("a trailing comma", lambda d: text(d, lambda t: t.replace('"schema": 1,', '"schema": 1,,', 1))),
-        ("another schema", lambda d: text(d, lambda t: t.replace('"schema": 1,', '"schema": 2,', 1))),
+        ("a trailing comma", lambda d: text(d, lambda t: t.replace('"schema": 2,', '"schema": 2,,', 1))),
+        ("another schema", lambda d: text(d, lambda t: t.replace('"schema": 2,', '"schema": 3,', 1))),
+        ("the schema before the one with shapes", lambda d: text(d, lambda t: t.replace('"schema": 2,', '"schema": 1,', 1))),
         ("not JSON", lambda d: text(d, lambda t: "not json")),
         ("a cubin that leaves the directory", lambda d: text(d, lambda t: t.replace('"cubin": "softmax.sm_103.cubin"', '"cubin": "../sm_120/softmax.sm_120.cubin"', 1))),
         ("an absolute cubin name", lambda d: text(d, lambda t: t.replace('"cubin": "softmax.sm_103.cubin"', '"cubin": "/etc/passwd"', 1))),

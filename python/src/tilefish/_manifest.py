@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from .aot import CompileSpec
 
 MANIFEST_NAME = "manifest.json"
-DIGEST_TAG = b"tilefish.manifest-digest.v1\0"  # part of what is hashed: another canonical form must change it
+DIGEST_TAG = b"tilefish.manifest-digest.v2\0"  # part of what is hashed: another canonical form must change it
 
 
 def manifest_digest(doc: "dict[str, Any]") -> str:
@@ -146,6 +146,13 @@ class Manifest:
             raise
         except ValueError as e:
             raise TilefishManifestError(f"the manifest {str(manifest_path)!r} is not valid JSON: {e}") from e
+        older = doc.get("schema") if isinstance(doc, dict) else None
+        if isinstance(older, int) and not isinstance(older, bool) and 0 < older < MANIFEST_SCHEMA:
+            raise TilefishManifestError(
+                f"the manifest {str(manifest_path)!r} is schema {older}, which an older tilefish wrote; this tilefish reads schema "
+                f"{MANIFEST_SCHEMA}, where every pointer records its shape and every entry the constraints of its dimensions, which "
+                "a host needs. Re-export it (tilefish.runtime.export) and pin the new digest"
+            )
         if not isinstance(doc, dict) or doc.get("schema") != MANIFEST_SCHEMA or not isinstance(doc.get("kernels"), list):
             raise TilefishManifestError(
                 f"the manifest {str(manifest_path)!r} is not a tilefish manifest of schema {MANIFEST_SCHEMA} "

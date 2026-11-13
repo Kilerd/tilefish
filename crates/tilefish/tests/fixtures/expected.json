@@ -1,165 +1,179 @@
 {
   "fixtures": {
     "sm_103": {
-      "manifest_digest": "40348f59af04cc252d8b25fcf8593083a6090297525aa35edace568501fb002c",
+      "manifest_digest": "ed658674b504d7699b987ccef0792995c2c8838b5c598bd03b0a474f97e9ee11",
       "kernels": [
         {
           "stem": "axpy",
           "arch": "sm_103",
           "cubin": "axpy.sm_103.cubin",
-          "sha256": "b79a25c0ea70bb1c9dd2964fa496f4c25a1ed8f06dfb86dfb9db7f1dc9c45e7f",
+          "sha256": "6feeb04fd0b3f0c3025a58441e57dbcbd34a980b567076c413a505089c4ab02c",
           "sha256_code": "9a3b42e6cebae293c3a02399551a19170c591a4a3e994e951e6556a288a1fa8d"
         },
         {
           "stem": "bucketed_rms.Db1000",
           "arch": "sm_103",
           "cubin": "bucketed_rms.Db1000.sm_103.cubin",
-          "sha256": "c4044144db56ab44260f8ef0e45cdcb61d3ad31030ee238f526fccf1933d1b4b",
+          "sha256": "a1149626a9195690024c91ab8f43476bc0492bcfd73e86da85ef2ed37c411084",
           "sha256_code": "137454276407cf80a568471d152407b0d8ae5e09db3408d6caabb990405f130e"
         },
         {
           "stem": "bucketed_rms.Db512",
           "arch": "sm_103",
           "cubin": "bucketed_rms.Db512.sm_103.cubin",
-          "sha256": "b62f85c92dae739fea6de773bb49b6c268b439bf00959c012c542a80cb383b86",
+          "sha256": "13293e965293fc9406c41eaf7beab6951809a8345181124f5584e3acd5f6bc96",
           "sha256_code": "6c9023055998a8229ba22b58138b5a4ad74001c24e0d71be62ea2eeafdd32c4f"
         },
         {
           "stem": "bucketed_rms.Db96",
           "arch": "sm_103",
           "cubin": "bucketed_rms.Db96.sm_103.cubin",
-          "sha256": "49f6a1f19dec3bb001351c65ba2447724edae7ce7e06c99cb7746c9544068e9e",
+          "sha256": "c09f182cba59de7e23b90afa9d97f434e9d793cee72a4e2fece8b253d2cc081d",
           "sha256_code": "2ca42566b7ba40fbdd523e90cfd15eeb245ed1c88491b75557fabef167cd516e"
         },
         {
           "stem": "gelu_erf",
           "arch": "sm_103",
           "cubin": "gelu_erf.sm_103.cubin",
-          "sha256": "b0bbfba862f770bca742fbd33e66c00823ab51d4bb36747d035c2c0de75ccf0d",
+          "sha256": "f0605731693e6c7cbedfa7b7e74c7f47050befe7dad7c9bfefbc061c26478679",
           "sha256_code": "4560a7c377436f3c602a985cb2cf59fc81bd53df5a5e07c76759e8decfa98e85"
         },
         {
           "stem": "gelu_exact",
           "arch": "sm_103",
           "cubin": "gelu_exact.sm_103.cubin",
-          "sha256": "3a37717f84ea78774371b663f6a5f858f49343baef74821814e1ab1a0ac52b10",
+          "sha256": "6f8714a471f48d7cb40fad0254338d4e89b4532974a8299adb41b543dd307bbf",
           "sha256_code": "d0982490af608ff7756275a922215bbdc7529b8f806155d5e3c976168901477f"
         },
         {
           "stem": "layernorm",
           "arch": "sm_103",
           "cubin": "layernorm.sm_103.cubin",
-          "sha256": "e4c97aa1c287c4ad16529df012fda9dbec5cde0b5f17cfa9d527553818c506ef",
+          "sha256": "c178e78eb6328d06f14c2e719f92119ced5c0c71124590412bfdb443655d0554",
           "sha256_code": "c2807c08ad9f9de0864d83f518b619af716d953e3f8dce72c5a9654cd59c613a"
+        },
+        {
+          "stem": "mm",
+          "arch": "sm_103",
+          "cubin": "mm.sm_103.cubin",
+          "sha256": "7581497b94f48ddc980d4ea947421d1740e7ce5a5d90f6dbb49306ba947b5606",
+          "sha256_code": "9b4d28c3cdf0373db7941f4eb7a525199c45c6b25f0573642330e27a71ae56bc"
         },
         {
           "stem": "residual_add_rmsnorm",
           "arch": "sm_103",
           "cubin": "residual_add_rmsnorm.sm_103.cubin",
-          "sha256": "6e609cdfc398d17bf3dfbb2c9a5d87de6e3b12691608983e80069c0d505df3e2",
+          "sha256": "a4685f1f78f697d9d40ba039505753b23880e5cb2cdb3354825f38fbda9751b9",
           "sha256_code": "f41b8d1abcd135eac77891583f4db3f6fe14c9113fdc598298a3d2cdbeef15ff"
         },
         {
           "stem": "rmsnorm",
           "arch": "sm_103",
           "cubin": "rmsnorm.sm_103.cubin",
-          "sha256": "25c52e9055f5f6a76066a6533125ec6398db3d42f7208bcf54e109d914769ec3",
+          "sha256": "7f75ebff04df5e1f34e3ffb4ba1fd4b7bd42498f759065aa43e78a8eeb60e00d",
           "sha256_code": "6cba2cf266aa385b800de94870c3984777710d405d57df945af6af13dd387a9e"
         },
         {
           "stem": "softmax",
           "arch": "sm_103",
           "cubin": "softmax.sm_103.cubin",
-          "sha256": "d06d1a48613d5fd01d4920eb7d355575dbd24905f478f110982cfd4dd1e5b821",
+          "sha256": "dd2f427e1d56bad7db83b18ed6e0c39bfd1701337e5721cc2bc55d4a0ee4c7ca",
           "sha256_code": "c837592e099b50389bbc1e8c0721fb65d39d23fc9920a2499253922ebfdfb8e1"
         },
         {
           "stem": "swiglu",
           "arch": "sm_103",
           "cubin": "swiglu.sm_103.cubin",
-          "sha256": "66bf1bc6b90d87e10ebfaac3cdec8d6c515603e1e5e1a1f62d6ae4d61dde28b7",
+          "sha256": "1ad66cca168eb92a13a28f4068efcfed3a11dbac73e5708fbc2fcb09c31807eb",
           "sha256_code": "2749751cee10ebd30b279fbcbdbd862417c28ec320f28fd27796312235bf3aec"
         }
       ]
     },
     "sm_120": {
-      "manifest_digest": "084a0f09fa4e2289f66c59e9cf07b6c55404d6c2fa2c807d3f32d99e6e790803",
+      "manifest_digest": "68594cae5148783b33c9761d39e3df48b4e1cf70cb0ee2ea5321cedd39e24799",
       "kernels": [
         {
           "stem": "axpy",
           "arch": "sm_120",
           "cubin": "axpy.sm_120.cubin",
-          "sha256": "3fe40baf025edf52de0a4302b4f58d7419ca0489d5eb1302f02dda9f4d27a958",
+          "sha256": "5e0fa3b0e92bbc4ae8f89bcc52de3617700d78e47c9910ef796dcbe42b7f7388",
           "sha256_code": "744e62a5feb32c6ff1369e1affcafb0f83ddf63854d5e8fd58864417d3cdddbf"
         },
         {
           "stem": "bucketed_rms.Db1000",
           "arch": "sm_120",
           "cubin": "bucketed_rms.Db1000.sm_120.cubin",
-          "sha256": "56776ad48f8af201c5322fc53eb89569805325f57e06d25077d62c711a4ba27d",
+          "sha256": "2da26bd781c113ddb77ebbb2a255a8311fb0d4f6dd49d79e65b02a52fb4540e0",
           "sha256_code": "fda7233f8200581423eaf291bb5a789a5fe2eedc3e5a785b0eb8dfc0fb7ec286"
         },
         {
           "stem": "bucketed_rms.Db512",
           "arch": "sm_120",
           "cubin": "bucketed_rms.Db512.sm_120.cubin",
-          "sha256": "f856b5dfe857909704a110945a769aef508a08fc63730d85dc2d0b26df1cc731",
+          "sha256": "5766658cce15f6411e6d3735e2902da13c92adc94cebdeddc733ec38d409248a",
           "sha256_code": "4c77578d58e5cf1fb5d070b3b69e47e5fb56d2e976a381e61a44eb72f6ef0650"
         },
         {
           "stem": "bucketed_rms.Db96",
           "arch": "sm_120",
           "cubin": "bucketed_rms.Db96.sm_120.cubin",
-          "sha256": "f594a8ed2573bf6bf1793727fe4ba9c7f3cb2f82b4dd7737de7b9843b93603d5",
+          "sha256": "dd67a55eeda4289ede28a98e750d766d0b7799b9c52986987584709778f4bc75",
           "sha256_code": "4abc9b18ebf64ff9994731fc0061c8f406a6e416617e97b045aaf0d8b18c0d96"
         },
         {
           "stem": "gelu_erf",
           "arch": "sm_120",
           "cubin": "gelu_erf.sm_120.cubin",
-          "sha256": "05f175f161fc71c3c23f6d2bb8ae3bc51ed9ed2fd65ba8d38428ebc595d9c8e8",
+          "sha256": "0dac9d8408703df310689a2d3b24a90b632cf059bea41306875b05c1cb1708c8",
           "sha256_code": "4a83af44086a65b02c235f243028e93b7f44bff8e6141dc4aa094860bfbef244"
         },
         {
           "stem": "gelu_exact",
           "arch": "sm_120",
           "cubin": "gelu_exact.sm_120.cubin",
-          "sha256": "88bc1f6f3547fe9edd1a802553204106d3810588e61f02a90ac905f68d4bb643",
+          "sha256": "8b78dcba4db1d9b0adc54e7e09d24d4254d53cd4bbc2c28270560fb4ca8ef8b9",
           "sha256_code": "57ce5b02b3d48f9239e85604be3c13f432223009fdc6873afe685c970f53e06f"
         },
         {
           "stem": "layernorm",
           "arch": "sm_120",
           "cubin": "layernorm.sm_120.cubin",
-          "sha256": "90c40881dc3baaeb80ba3a1ff6700f4ec0c9f84846450e746bc975c358e10c0e",
+          "sha256": "320925671189c50b17f1521a4ba7c879c9cf7f9f5ba5d477a467913cc4e2ccb4",
           "sha256_code": "348c4e2ba9c643c263d1df9026f047b8a46f753b9221d3a5cf0de6338f987202"
+        },
+        {
+          "stem": "mm",
+          "arch": "sm_120",
+          "cubin": "mm.sm_120.cubin",
+          "sha256": "d6c5baf1406ed787fe675ab4d5013a21bf4f299c409277824f4c91206c4ae97a",
+          "sha256_code": "041b5f2d507ba26c6f4540d457bae5d9e2a8d1756df43bc1c904b05709bd56ca"
         },
         {
           "stem": "residual_add_rmsnorm",
           "arch": "sm_120",
           "cubin": "residual_add_rmsnorm.sm_120.cubin",
-          "sha256": "c4a8ad2bf3a51e5100877b93e4e0f72bc30553dd4255c037070fb58b4d7793b4",
+          "sha256": "ecbaca6d982f44ecd862af6077bec68464873e774acf11c73b5f8bf32badfa88",
           "sha256_code": "c86b86efb1c996bcf7dc8580bc730d903e4de2ce3c490027ce9b91087b4f0ed6"
         },
         {
           "stem": "rmsnorm",
           "arch": "sm_120",
           "cubin": "rmsnorm.sm_120.cubin",
-          "sha256": "ab95a8eb482cd466e78ed8c1461013e8ed8bfdb637da1ee076352dc037571c81",
+          "sha256": "6ca3e65b4653692252b30ee38963fafba826c42e2a069989655bf60229a20f51",
           "sha256_code": "0010a75c02ab1219146fe6c3ec350578082fb10b20bfef46cbae2e2b7d8f8f0f"
         },
         {
           "stem": "softmax",
           "arch": "sm_120",
           "cubin": "softmax.sm_120.cubin",
-          "sha256": "5edc07fbdd437798c6097588dadeadc6b3a639af4acbcf32ace007c673acec9a",
+          "sha256": "32df23fac9090e6aba91700279d5c524bb83e91e93eeec72ff48a49576b646a3",
           "sha256_code": "609b79a18a4290206c37c8f834aef25f5a878d211995aba9dd72aa348965d9e1"
         },
         {
           "stem": "swiglu",
           "arch": "sm_120",
           "cubin": "swiglu.sm_120.cubin",
-          "sha256": "258847db331925d29157b48bc57058eed2bf78d2d0e065ee0f4eeac2e1411fb1",
+          "sha256": "a27390285eb6fea50e230ce1afaff05eab9929b5442fb94b625693e70d6903b6",
           "sha256_code": "fea1c6640f8f7791c372d843c659d07fc94a71caba09b83b38900909001c9b35"
         }
       ]

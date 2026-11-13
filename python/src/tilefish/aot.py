@@ -180,6 +180,10 @@ class ArgSpec:
     # scalars of a generated kernel only: the pointer argument whose element count (the product of its shape
     # entries) this scalar carries, so a host computes the value without knowing the kernel
     count_of: str | None = None
+    # pointers: the shape as the declaration has it, which is what a host binds the dimensions from: a dimension expression
+    # (``"M"``, ``"3072*M"``) stays a name even when the binary is built for one bucket of it (``shape`` has the bucket value
+    # there), and a static dimension is its size as an int (``["Rows", 1024]``)
+    shape_dims: tuple["str | int", ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"index": self.index, "name": self.name, "kind": self.kind, "type": self.type}
@@ -191,6 +195,8 @@ class ArgSpec:
             out["value"] = _encode(self.value)
         if self.shape is not None:
             out["shape"] = list(self.shape)
+        if self.shape_dims is not None:
+            out["shape_dims"] = list(self.shape_dims)
         return out
 
     @classmethod
@@ -201,6 +207,8 @@ class ArgSpec:
             kw = dict(d)
             if kw.get("shape") is not None:
                 kw["shape"] = tuple(kw["shape"])
+            if kw.get("shape_dims") is not None:
+                kw["shape_dims"] = tuple(kw["shape_dims"])
             if "value" in kw:
                 kw["value"] = decode_scalar(kw["value"], "arg value")
             return cls(**kw)
@@ -282,6 +290,10 @@ class CompileSpec:
     # source is a Python function the declaration does not contain). It is in the declaration digest, so a binary built
     # from another body of a kernel with the same name and signature is not the binary of this spec.
     source_sha256: str | None = None
+    # What a host needs to know about each named dimension of the signature (see :func:`_dim_constraints`): its
+    # ``divisible_by`` and ``buckets`` when it has them, and ``bucket``, the value this binary is built for, when it is one of
+    # the op's bucketed dimensions. The names are the ones in ``shape_dims``, in the scalars' ``dim`` and in the grid.
+    dims: dict[str, dict[str, Any]] = field(default_factory=dict)
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
@@ -394,7 +406,8 @@ class CompileSpec:
             "launch_params": [p.to_dict() for p in self.launch_params],
             "preconditions": [p.to_dict() for p in self.preconditions],
         }
-        if self.declaration_digest is not None:
+        if self.declaration_digest is not None:  # schema 2: the table of dimensions, and the digest
+            doc["dims"] = copy.deepcopy(self.dims)
             doc["declaration_digest"] = self.declaration_digest
         if self.enable_fp_fusion is not None:
             doc["enable_fp_fusion"] = self.enable_fp_fusion
@@ -444,6 +457,7 @@ class CompileSpec:
                 declaration_digest=d.get("declaration_digest"),
                 enable_fp_fusion=d.get("enable_fp_fusion"),
                 source_sha256=d.get("source_sha256"),
+                dims=copy.deepcopy(d.get("dims", {})),
             )
 
     def verify_against(self, op: ExternOp) -> None:
@@ -712,12 +726,39 @@ def _bucket_dims(op: ExternOp) -> list[Dim]:
     return dims
 
 
+def _dim_constraints(d: Dim) -> dict[str, Any]:
+    """What a host must know about the named dimension ``d`` besides its value: ``divisible_by`` and ``buckets``, when it has them."""
+    out: dict[str, Any] = {}
+    if d.divisible_by is not None:
+        out["divisible_by"] = d.divisible_by
+    if d.buckets is not None:
+        out["buckets"] = list(d.buckets)
+    return out
+
+
+def _shape_entry(d: DimExpr) -> "str | int":
+    """One axis of a declared shape: its size when it is static, else the dimension expression."""
+    folded = d.folded()
+    return folded.value if folded.is_static else str(folded)
+
+
 def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
     signature: dict[str, str] = {}
     constants: dict[tuple[int, ...], Any] = {}
     attrs: dict[tuple[int, ...], list[list[Any]]] = {}
     preconditions: list[Precondition] = []
     args: list[ArgSpec] = []
+    dims: dict[str, dict[str, Any]] = {}
+
+    def note(expr: DimExpr) -> None:
+        """Record the constraints of every named dimension ``expr`` mentions (two dimensions of one name must agree)."""
+        for d in expr.free_dims():
+            found = _dim_constraints(d)
+            if dims.setdefault(d.name, found) != found:
+                raise TilefishSpecError(
+                    f"extern op '{op.name}': the dimension {d.name!r} is declared twice with different constraints "
+                    f"({dims[d.name]} and {found}); a host binds a dimension by its name"
+                )
 
     for p in op.signature.params:
         i = p.index
@@ -740,15 +781,22 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
             limit = op.max_elements.get(p.name)  # only for kernels tilefish generated (i32 indexing)
             if limit is not None:
                 preconditions.append(Precondition("max_elements", arg=p.name, index=i, value=limit, shape=shape))
-            args.append(ArgSpec(i, p.name, "pointer", ptr, access=p.access, dtype=str(t.dtype), shape=shape))
+            for d in t.shape:
+                note(d)
+            shape_dims = tuple(_shape_entry(d) for d in t.shape)
+            args.append(
+                ArgSpec(i, p.name, "pointer", ptr, access=p.access, dtype=str(t.dtype), shape=shape, shape_dims=shape_dims)
+            )
         elif p.kind == "dim":
             assert p.dim is not None
             signature[p.name] = "i32"
+            note(p.dim)
+            dim_text = str(p.dim.folded())  # a static dimension is its size: a host cannot look a name up that it was not told
             if p.dim.is_divisible_by(ALIGNMENT):
                 attrs[(i,)] = [["tt.divisibility", ALIGNMENT]]
-                preconditions.append(Precondition("divisible", arg=p.name, index=i, dim=str(p.dim), by=ALIGNMENT))
+                preconditions.append(Precondition("divisible", arg=p.name, index=i, dim=dim_text, by=ALIGNMENT))
             args.append(
-                ArgSpec(i, p.name, "scalar", "i32", dtype="i32", dim=str(p.dim), count_of=op.element_counts.get(p.name))
+                ArgSpec(i, p.name, "scalar", "i32", dtype="i32", dim=dim_text, count_of=op.element_counts.get(p.name))
             )
         else:
             assert p.default is not MISSING
@@ -766,8 +814,13 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
 
     for d, v in mapping.items():
         preconditions.append(Precondition("bucket", dim=d.name, value=v, buckets=d.buckets))
+        note(d)
 
     assert op.grid is not None
+    for g in op.grid:
+        note(g)
+    for d, v in mapping.items():
+        dims[d.name]["bucket"] = v  # after every mention was noted: two mentions are compared by their constraints
     grid = tuple(g.subst(mapping).folded() for g in op.grid)  # exact buckets: the bucket value, folded
     for g in grid:
         if g.is_static and g.value < 1:
@@ -796,6 +849,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         declaration_digest=digest,
         enable_fp_fusion=op.fp_fusion,
         source_sha256=op.source_sha256,
+        dims=dict(sorted(dims.items())),
     )
     spec._mark_verified()  # generated from the declaration just now
     return spec

@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "tilefish": "0.0.2",
   "kernels": [
     {
@@ -20,7 +20,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "f32",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "M",
+              1000
+            ]
           },
           {
             "slot": 1,
@@ -31,7 +35,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "f32",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "M",
+              1000
+            ]
           }
         ],
         "scratch": [
@@ -87,6 +95,9 @@
         }
       ],
       "buckets": {},
+      "dims": {
+        "M": {}
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -141,7 +152,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "4b7ace3a671a3256d15837ee2a7e96ffefe1be5b097d129e4ae2579faa998603",
-      "sha256": "d06d1a48613d5fd01d4920eb7d355575dbd24905f478f110982cfd4dd1e5b821",
+      "sha256": "dd2f427e1d56bad7db83b18ed6e0c39bfd1701337e5721cc2bc55d4a0ee4c7ca",
       "sha256_code": "c837592e099b50389bbc1e8c0721fb65d39d23fc9920a2499253922ebfdfb8e1",
       "toolchain": {
         "triton": "3.5.1",
@@ -167,7 +178,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "M",
+              768
+            ]
           },
           {
             "slot": 1,
@@ -178,7 +193,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              768
+            ]
           },
           {
             "slot": 2,
@@ -189,7 +207,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              768
+            ]
           },
           {
             "slot": 3,
@@ -200,7 +221,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "M",
+              768
+            ]
           }
         ],
         "scratch": [
@@ -262,6 +287,9 @@
         }
       ],
       "buckets": {},
+      "dims": {
+        "M": {}
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -342,7 +370,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "529934a610d6a4319c98d347ce400947709e061a0914219e0398c0aa75ffe25c",
-      "sha256": "e4c97aa1c287c4ad16529df012fda9dbec5cde0b5f17cfa9d527553818c506ef",
+      "sha256": "c178e78eb6328d06f14c2e719f92119ced5c0c71124590412bfdb443655d0554",
       "sha256_code": "c2807c08ad9f9de0864d83f518b619af716d953e3f8dce72c5a9654cd59c613a",
       "toolchain": {
         "triton": "3.5.1",
@@ -368,7 +396,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "M",
+              2560
+            ]
           },
           {
             "slot": 1,
@@ -379,7 +411,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "f32",
-            "access": "inout"
+            "access": "inout",
+            "shape": [
+              "M",
+              2560
+            ]
           },
           {
             "slot": 2,
@@ -390,7 +426,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              2560
+            ]
           },
           {
             "slot": 3,
@@ -401,7 +440,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "M",
+              2560
+            ]
           }
         ],
         "scratch": [
@@ -463,6 +506,9 @@
         }
       ],
       "buckets": {},
+      "dims": {
+        "M": {}
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -553,7 +599,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "ae60e4bdadab8c3d2e6f23bae3c53c7b0cb0fe0ea100b365e100782972ac5273",
-      "sha256": "6e609cdfc398d17bf3dfbb2c9a5d87de6e3b12691608983e80069c0d505df3e2",
+      "sha256": "a4685f1f78f697d9d40ba039505753b23880e5cb2cdb3354825f38fbda9751b9",
       "sha256_code": "f41b8d1abcd135eac77891583f4db3f6fe14c9113fdc598298a3d2cdbeef15ff",
       "toolchain": {
         "triton": "3.5.1",
@@ -579,7 +625,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "T"
+            ]
           },
           {
             "slot": 1,
@@ -590,7 +639,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "T"
+            ]
           },
           {
             "slot": 2,
@@ -652,6 +704,11 @@
         }
       ],
       "buckets": {},
+      "dims": {
+        "T": {
+          "divisible_by": 16
+        }
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -697,7 +754,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "1d945a997ff5a0c99a21bfc0d33989591380c3efca3dc332d7c49fe6963a3090",
-      "sha256": "3a37717f84ea78774371b663f6a5f858f49343baef74821814e1ab1a0ac52b10",
+      "sha256": "6f8714a471f48d7cb40fad0254338d4e89b4532974a8299adb41b543dd307bbf",
       "sha256_code": "d0982490af608ff7756275a922215bbdc7529b8f806155d5e3c976168901477f",
       "toolchain": {
         "triton": "3.5.1",
@@ -723,7 +780,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "M",
+              3072
+            ]
           },
           {
             "slot": 1,
@@ -734,7 +795,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "M",
+              3072
+            ]
           },
           {
             "slot": 2,
@@ -745,7 +810,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "M",
+              3072
+            ]
           },
           {
             "slot": 3,
@@ -807,6 +876,9 @@
         }
       ],
       "buckets": {},
+      "dims": {
+        "M": {}
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -891,7 +963,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "d2da50eac0728e64f382b0075740539c88afb100f33e06f50356eed3177fc18f",
-      "sha256": "66bf1bc6b90d87e10ebfaac3cdec8d6c515603e1e5e1a1f62d6ae4d61dde28b7",
+      "sha256": "1ad66cca168eb92a13a28f4068efcfed3a11dbac73e5708fbc2fcb09c31807eb",
       "sha256_code": "2749751cee10ebd30b279fbcbdbd862417c28ec320f28fd27796312235bf3aec",
       "toolchain": {
         "triton": "3.5.1",
@@ -917,7 +989,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "M",
+              "Db"
+            ]
           },
           {
             "slot": 1,
@@ -928,7 +1004,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "Db"
+            ]
           },
           {
             "slot": 2,
@@ -939,7 +1018,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "M",
+              "Db"
+            ]
           }
         ],
         "scratch": [
@@ -1003,6 +1086,17 @@
       "buckets": {
         "Db": 96
       },
+      "dims": {
+        "Db": {
+          "buckets": [
+            96,
+            512,
+            1000
+          ],
+          "bucket": 96
+        },
+        "M": {}
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -1059,7 +1153,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "cbee9bacaa4e2f4fb26706ce58bdb55c90aa19ae958522bd926a8d5953574c5e",
-      "sha256": "49f6a1f19dec3bb001351c65ba2447724edae7ce7e06c99cb7746c9544068e9e",
+      "sha256": "c09f182cba59de7e23b90afa9d97f434e9d793cee72a4e2fece8b253d2cc081d",
       "sha256_code": "2ca42566b7ba40fbdd523e90cfd15eeb245ed1c88491b75557fabef167cd516e",
       "toolchain": {
         "triton": "3.5.1",
@@ -1085,7 +1179,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "M",
+              "Db"
+            ]
           },
           {
             "slot": 1,
@@ -1096,7 +1194,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "Db"
+            ]
           },
           {
             "slot": 2,
@@ -1107,7 +1208,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "M",
+              "Db"
+            ]
           }
         ],
         "scratch": [
@@ -1171,6 +1276,17 @@
       "buckets": {
         "Db": 512
       },
+      "dims": {
+        "Db": {
+          "buckets": [
+            96,
+            512,
+            1000
+          ],
+          "bucket": 512
+        },
+        "M": {}
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -1227,7 +1343,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "cbee9bacaa4e2f4fb26706ce58bdb55c90aa19ae958522bd926a8d5953574c5e",
-      "sha256": "b62f85c92dae739fea6de773bb49b6c268b439bf00959c012c542a80cb383b86",
+      "sha256": "13293e965293fc9406c41eaf7beab6951809a8345181124f5584e3acd5f6bc96",
       "sha256_code": "6c9023055998a8229ba22b58138b5a4ad74001c24e0d71be62ea2eeafdd32c4f",
       "toolchain": {
         "triton": "3.5.1",
@@ -1253,7 +1369,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "M",
+              "Db"
+            ]
           },
           {
             "slot": 1,
@@ -1264,7 +1384,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "Db"
+            ]
           },
           {
             "slot": 2,
@@ -1275,7 +1398,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "M",
+              "Db"
+            ]
           }
         ],
         "scratch": [
@@ -1339,6 +1466,17 @@
       "buckets": {
         "Db": 1000
       },
+      "dims": {
+        "Db": {
+          "buckets": [
+            96,
+            512,
+            1000
+          ],
+          "bucket": 1000
+        },
+        "M": {}
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -1395,7 +1533,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "cbee9bacaa4e2f4fb26706ce58bdb55c90aa19ae958522bd926a8d5953574c5e",
-      "sha256": "c4044144db56ab44260f8ef0e45cdcb61d3ad31030ee238f526fccf1933d1b4b",
+      "sha256": "a1149626a9195690024c91ab8f43476bc0492bcfd73e86da85ef2ed37c411084",
       "sha256_code": "137454276407cf80a568471d152407b0d8ae5e09db3408d6caabb990405f130e",
       "toolchain": {
         "triton": "3.5.1",
@@ -1421,7 +1559,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "Rows",
+              2048
+            ]
           },
           {
             "slot": 1,
@@ -1432,7 +1574,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              2048
+            ]
           },
           {
             "slot": 2,
@@ -1443,7 +1588,11 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "Rows",
+              2048
+            ]
           }
         ],
         "scratch": [
@@ -1505,6 +1654,9 @@
         }
       ],
       "buckets": {},
+      "dims": {
+        "Rows": {}
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -1551,7 +1703,7 @@
         "num_stages": 3
       },
       "declaration_digest": "0c60d07a7a8a36a51957f2d47674b4ab35c45823217d297aef02989743013ea4",
-      "sha256": "25c52e9055f5f6a76066a6533125ec6398db3d42f7208bcf54e109d914769ec3",
+      "sha256": "7f75ebff04df5e1f34e3ffb4ba1fd4b7bd42498f759065aa43e78a8eeb60e00d",
       "sha256_code": "6cba2cf266aa385b800de94870c3984777710d405d57df945af6af13dd387a9e",
       "toolchain": {
         "triton": "3.5.1",
@@ -1578,7 +1730,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "Count"
+            ]
           },
           {
             "slot": 1,
@@ -1589,7 +1744,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "bf16",
-            "access": "out"
+            "access": "out",
+            "shape": [
+              "Count"
+            ]
           },
           {
             "slot": 2,
@@ -1650,6 +1808,11 @@
         }
       ],
       "buckets": {},
+      "dims": {
+        "Count": {
+          "divisible_by": 16
+        }
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -1676,7 +1839,7 @@
         "num_stages": 3
       },
       "declaration_digest": "cc3a47b269d7ef0e292318e9b20b2821dc1d55a2e251e909eb4febf3b946af4b",
-      "sha256": "b0bbfba862f770bca742fbd33e66c00823ab51d4bb36747d035c2c0de75ccf0d",
+      "sha256": "f0605731693e6c7cbedfa7b7e74c7f47050befe7dad7c9bfefbc061c26478679",
       "sha256_code": "4560a7c377436f3c602a985cb2cf59fc81bd53df5a5e07c76759e8decfa98e85",
       "toolchain": {
         "triton": "3.5.1",
@@ -1703,7 +1866,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "f32",
-            "access": "in"
+            "access": "in",
+            "shape": [
+              "Count"
+            ]
           },
           {
             "slot": 1,
@@ -1714,7 +1880,10 @@
             "ptx_type": "u64",
             "size": 8,
             "dtype": "f32",
-            "access": "inout"
+            "access": "inout",
+            "shape": [
+              "Count"
+            ]
           },
           {
             "slot": 2,
@@ -1781,6 +1950,11 @@
         }
       ],
       "buckets": {},
+      "dims": {
+        "Count": {
+          "divisible_by": 16
+        }
+      },
       "preconditions": [
         {
           "kind": "pointer_alignment",
@@ -1807,13 +1981,222 @@
         "num_stages": 3
       },
       "declaration_digest": "3e97f30422749cdda066acadc91b0fa23aa09e942e7058b79c3daaa08710a3ae",
-      "sha256": "b79a25c0ea70bb1c9dd2964fa496f4c25a1ed8f06dfb86dfb9db7f1dc9c45e7f",
+      "sha256": "6feeb04fd0b3f0c3025a58441e57dbcbd34a980b567076c413a505089c4ab02c",
       "sha256_code": "9a3b42e6cebae293c3a02399551a19170c591a4a3e994e951e6556a288a1fa8d",
       "toolchain": {
         "triton": "3.5.1",
         "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
       },
       "source_digest": "5c2f6c6d01d45f33b78c6f7e671ec489f73857387c39a4d80fcc4f44f4a8cdec",
+      "source_digest_kind": "tilefish.module-sources.v1"
+    },
+    {
+      "stem": "mm",
+      "op": "mm",
+      "arch": "sm_103",
+      "ptx_target": "sm_103a",
+      "symbol": "mm_kernel",
+      "cubin": "mm.sm_103.cubin",
+      "abi": {
+        "params": [
+          {
+            "slot": 0,
+            "index": 0,
+            "name": "a_ptr",
+            "kind": "pointer",
+            "type": "*fp16",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f16",
+            "access": "in",
+            "shape": [
+              "MmM",
+              "MmK"
+            ]
+          },
+          {
+            "slot": 1,
+            "index": 1,
+            "name": "b_ptr",
+            "kind": "pointer",
+            "type": "*fp16",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f16",
+            "access": "in",
+            "shape": [
+              "MmK",
+              "MmN"
+            ]
+          },
+          {
+            "slot": 2,
+            "index": 2,
+            "name": "c_ptr",
+            "kind": "pointer",
+            "type": "*fp32",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f32",
+            "access": "out",
+            "shape": [
+              "MmM",
+              "MmN"
+            ]
+          },
+          {
+            "slot": 3,
+            "index": 3,
+            "name": "m",
+            "kind": "scalar",
+            "type": "i32",
+            "ptx_type": "u32",
+            "size": 4,
+            "dim": "MmM"
+          },
+          {
+            "slot": 4,
+            "index": 4,
+            "name": "n",
+            "kind": "scalar",
+            "type": "i32",
+            "ptx_type": "u32",
+            "size": 4,
+            "dim": "MmN"
+          },
+          {
+            "slot": 5,
+            "index": 5,
+            "name": "k",
+            "kind": "scalar",
+            "type": "i32",
+            "ptx_type": "u32",
+            "size": 4,
+            "dim": "MmK"
+          }
+        ],
+        "scratch": [
+          {
+            "slot": 6,
+            "name": "global_scratch",
+            "type": "u64",
+            "ptx_type": "u64",
+            "size": 8,
+            "value": 0
+          },
+          {
+            "slot": 7,
+            "name": "profile_scratch",
+            "type": "u64",
+            "ptx_type": "u64",
+            "size": 8,
+            "value": 0
+          }
+        ]
+      },
+      "grid": "(cdiv(MmM, 128), cdiv(MmN, 128))",
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "shared": 131088,
+      "num_warps": 8,
+      "num_stages": 4,
+      "launch": {
+        "global_scratch_size": 0,
+        "profile_scratch_size": 0,
+        "launch_pdl": false,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "num_ctas": 1,
+        "cooperative": false
+      },
+      "constexprs": [
+        {
+          "index": 6,
+          "name": "BM",
+          "value": 128
+        },
+        {
+          "index": 7,
+          "name": "BN",
+          "value": 128
+        },
+        {
+          "index": 8,
+          "name": "BK",
+          "value": 64
+        }
+      ],
+      "buckets": {},
+      "dims": {
+        "MmK": {
+          "divisible_by": 64
+        },
+        "MmM": {
+          "divisible_by": 128
+        },
+        "MmN": {
+          "divisible_by": 128
+        }
+      },
+      "preconditions": [
+        {
+          "kind": "pointer_alignment",
+          "arg": "a_ptr",
+          "index": 0,
+          "bytes": 16
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "b_ptr",
+          "index": 1,
+          "bytes": 16
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "c_ptr",
+          "index": 2,
+          "bytes": 16
+        },
+        {
+          "kind": "divisible",
+          "arg": "m",
+          "index": 3,
+          "dim": "MmM",
+          "by": 16
+        },
+        {
+          "kind": "divisible",
+          "arg": "n",
+          "index": 4,
+          "dim": "MmN",
+          "by": 16
+        },
+        {
+          "kind": "divisible",
+          "arg": "k",
+          "index": 5,
+          "dim": "MmK",
+          "by": 16
+        }
+      ],
+      "options": {
+        "num_warps": 8,
+        "num_stages": 4
+      },
+      "declaration_digest": "de3378fa5da3d4951028e434fb9573ae609e0b4d97ace540765ec211446d2717",
+      "sha256": "7581497b94f48ddc980d4ea947421d1740e7ce5a5d90f6dbb49306ba947b5606",
+      "sha256_code": "9b4d28c3cdf0373db7941f4eb7a525199c45c6b25f0573642330e27a71ae56bc",
+      "toolchain": {
+        "triton": "3.5.1",
+        "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
+      },
+      "source_digest": "bf900073abbb64481e73ea730ced719b69114f3efef062a6648bf24fbb0ca600",
       "source_digest_kind": "tilefish.module-sources.v1"
     }
   ]

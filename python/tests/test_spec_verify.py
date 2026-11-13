@@ -170,6 +170,7 @@ def test_other_self_consistent_edits_are_caught_and_name_the_field(mutate, field
 def test_a_static_size_edited_together_with_its_shape_is_caught():
     def mutate(doc):
         doc["args"][INDEX["w"]]["shape"] = ["4"]
+        doc["args"][INDEX["w"]]["shape_dims"] = [4]
         for p in doc["preconditions"]:
             if p["kind"] == "static_size" and p["arg"] == "w":
                 p["value"] = 4
@@ -189,6 +190,7 @@ def test_a_bucket_spec_relabelled_as_another_bucket_is_caught():
     def mutate(doc):
         doc["buckets"] = {"S": 32}
         doc["stem"] = "kernel.S32"
+        doc["dims"]["S"]["bucket"] = 32
         for p in doc["preconditions"]:
             if p["kind"] == "bucket":
                 p["value"] = 32
@@ -200,6 +202,7 @@ def test_a_spec_of_a_binary_or_operator_the_declaration_does_not_generate_is_cau
     def to_other_bucket(doc):
         doc["buckets"] = {"S": 64}
         doc["stem"] = "kernel.S64"
+        doc["dims"]["S"].update(bucket=64, buckets=[16, 32, 64])
         for p in doc["preconditions"]:
             if p["kind"] == "bucket":
                 p.update(value=64, buckets=[16, 32, 64])
@@ -432,7 +435,9 @@ def as_schema_1(spec):
     doc = copy.deepcopy(spec.to_dict())
     doc["schema"] = 1
     del doc["declaration_digest"]
+    doc.pop("dims", None)  # schema 1 has no table of dimensions, and no declared shapes
     for a in doc["args"]:
+        a.pop("shape_dims", None)
         if a["kind"] == "constexpr":
             a.pop("dtype", None)
     return doc
@@ -509,13 +514,13 @@ def test_the_digest_must_be_64_lowercase_hex_digits(digest):
 # -- what compile_specs emits for a valid extern is unchanged except for the additive fields ------------------------------------------
 
 
-def test_schema_2_only_adds_the_digest_and_the_constexpr_dtypes_to_schema_1():
+def test_schema_2_only_adds_the_digest_the_constexpr_dtypes_and_what_a_host_binds_dimensions_by_to_schema_1():
     for spec in SPECS:
         new, old = spec.to_dict(), as_schema_1(spec)
-        assert set(new) - set(old) == {"declaration_digest"}
+        assert set(new) - set(old) == {"declaration_digest", "dims"}
         for key in old:
             if key not in ("schema", "args"):
                 assert new[key] == old[key], key
         for a_new, a_old in zip(new["args"], old["args"]):
-            without_dtype = {k: v for k, v in a_new.items() if not (a_new["kind"] == "constexpr" and k == "dtype")}
-            assert without_dtype == a_old
+            added = {k: v for k, v in a_new.items() if not (a_new["kind"] == "constexpr" and k == "dtype") and k != "shape_dims"}
+            assert added == a_old

@@ -131,13 +131,17 @@ def test_manifest_content():
     specs = compile_specs(rowop)
     built = [fake_build(s) for s in specs]
     doc = manifest_dict(built)
-    assert doc["schema"] == 1 and doc["tilefish"] == tilefish.__version__
+    assert doc["schema"] == 2 and doc["tilefish"] == tilefish.__version__
     first, second = doc["kernels"]
     assert [first["stem"], second["stem"]] == ["rowop.S32", "rowop.S64"]
     assert first["symbol"] == "tf_k" and first["arch"] == "sm_90" and first["ptx_target"] == "sm_90a"
     assert first["cubin"] == "rowop.S32.sm_90.cubin"
     assert first["grid"] == "(M,)" and first["block"] == [64, 1, 1] and first["shared"] == 16
     assert first["buckets"] == {"S": 32} and second["buckets"] == {"S": 64}
+    # schema 2: the declared shape of every pointer (a name stays a name in a bucketed binary), and the constraints of the dimensions
+    assert [p["shape"] for p in first["abi"]["params"]] == [["M", "S"], ["M", "S"]]
+    assert first["dims"] == {"M": {}, "S": {"buckets": [32, 64], "bucket": 32}}
+    assert second["dims"] == {"M": {}, "S": {"buckets": [32, 64], "bucket": 64}}
     assert first["constexprs"] == [
         {"index": 2, "name": "EPS", "value": 1e-05, "dtype": "f32"},
         {"index": 3, "name": "BLOCK", "value": 32},

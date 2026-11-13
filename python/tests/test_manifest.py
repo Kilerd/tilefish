@@ -67,7 +67,9 @@ def test_load_is_the_same_through_tilefish_and_aot(directory):
 @pytest.mark.parametrize(
     "change, message",
     [
-        (lambda d: d.update(schema=2), "not a tilefish manifest of schema 1"),
+        (lambda d: d.update(schema=3), "not a tilefish manifest of schema 2"),
+        (lambda d: d.update(schema=1), "schema 1, which an older tilefish wrote.*Re-export it"),
+        (lambda d: d.update(schema=True), "not a tilefish manifest of schema 2"),
         (lambda d: d.update(kernels="nope"), "not a tilefish manifest"),
         (lambda d: d["kernels"].append(d["kernels"][0]), "twice"),
         (lambda d: d["kernels"][0].pop("sha256_code"), "is missing \\['sha256_code'\\]"),
