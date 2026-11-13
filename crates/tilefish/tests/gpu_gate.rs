@@ -49,8 +49,8 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, result};
 use serde_json::Value;
 use tilefish::{
-    Access, Arch, Bf16, DType, DevicePtr, Element, Error, F16, F32, I32, I64, Manifest, Pin, PreconditionKind,
-    TensorArg, TensorMut, TensorRef, U8, elf::sha256_hex,
+    Access, AlgoSource, Arch, Bf16, DType, DevicePtr, Element, Error, F16, F32, I32, I64, Manifest, Pin,
+    PreconditionKind, TensorArg, TensorMut, TensorRef, U8, elf::sha256_hex,
 };
 
 fn gate_dir() -> PathBuf {
@@ -1375,11 +1375,12 @@ fn refusals_of_schema_3() {
         "a GEMM workspace that is not 256-byte aligned",
         e.precondition_kind() == Some(PreconditionKind::PointerAlignment),
     );
-    // it must not overlap the result: two regions over the result's own memory, one of them the workspace
-    // SAFETY: both regions are the result's own memory, which outlives the call; nothing is launched (it is refused).
+    // it must not overlap the result: two regions over one buffer, the result and a workspace of the bytes the algorithm needs (at least)
+    let shared = gpu.zeros((m * n * 2).max(gemm.workspace_required() as usize));
+    // SAFETY: both regions are the shared buffer's own memory, which outlives the call; nothing is launched (it is refused).
     let (out_region, ws_region) =
-        unsafe { (gpu.unbound_region(&out, out.nbytes()), gpu.unbound_region(&out, out.nbytes())) };
-    let overlap_shape = [out.nbytes() as usize];
+        unsafe { (gpu.unbound_region(&shared, shared.nbytes()), gpu.unbound_region(&shared, shared.nbytes())) };
+    let overlap_shape = [shared.nbytes() as usize];
     let e = gemm
         .launch(
             s,
@@ -1456,6 +1457,39 @@ fn refusals_of_schema_3() {
         matches!(&e, Error::Manifest(m) if m.contains("is not one cuBLASLt produces")),
     );
     let _ = std::fs::remove_dir_all(&tmp);
+
+    // an algorithm whose split-K adds its partial sums in bf16 runs only for an entry that opts in (`allow_bf16_reduction`): the imported entries
+    // of the gate (on a fresh export) load as they are, and the same entries without the opt-in are refused
+    let opted: Vec<_> = manifest
+        .library()
+        .iter()
+        .filter(|e| e.allow_bf16_reduction && e.algo_source == AlgoSource::Imported && e.arch == arch.to_string())
+        .collect();
+    if opted.is_empty() {
+        println!(
+            "rust gate: no entry opts in to bf16 split-K partial sums (a committed fixture, or no such split-K on this device)"
+        );
+    } else {
+        for e in &opted {
+            assert!(manifest.gemm(&gpu.ctx, &e.stem, &[], arch).is_ok(), "{} loads", e.stem);
+        }
+        let tmp = copy_of_the_manifest("bf16-reduction");
+        let mut doc = read_json(&tmp.join("manifest.json"));
+        for e in doc["library"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("allow_bf16_reduction");
+        }
+        write_json(&tmp.join("manifest.json"), &doc);
+        let strict = Manifest::load(&tmp, Pin::TrustDirectory).unwrap();
+        let refused: Vec<String> = opted
+            .iter()
+            .filter_map(|e| strict.gemm(&gpu.ctx, &e.stem, &[], arch).err().map(|err| err.to_string()))
+            .collect();
+        check(
+            "a split-K with bf16 partial sums in an entry that does not opt in",
+            refused.len() >= 2 && refused.iter().all(|m| m.contains("bf16")),
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     // a cubin of another architecture, under the name of this one: its ELF header says so
     let tmp = copy_of_the_manifest("arch");

@@ -466,7 +466,10 @@ class TorchBackend(Backend):
     def check_gemm(self, spec: Any, algo: str, index: int) -> None:
         from . import _cublaslt
 
-        _cublaslt.check_algo(spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index)
+        _cublaslt.check_algo(
+            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index,
+            allow_bf16_reduction=spec.allow_bf16_reduction,
+        )  # fmt: skip
 
 
 # -- where a step's binary comes from ----------------------------------------------------------------------------------------------------

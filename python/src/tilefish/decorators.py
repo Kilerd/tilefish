@@ -172,8 +172,9 @@ class LibraryOp(Op):
 
     With ``impl="cublaslt.gemm"`` (or ``"cublaslt.gemm_bias"``) it is also a pinned cuBLASLt GEMM that ``tilefish.run`` runs and
     ``tilefish.runtime.export`` writes to the ``library`` section of a manifest: ``out[M, N] = a[M, K] @ b[N, K]^T`` (``+ bias[N]``), bf16
-    with an f32 accumulator and one rounding, the algorithm the heuristic ranks first under a ``workspace_bytes`` limit, recorded
-    with the cuBLASLt version (see :mod:`tilefish._library`). Without ``impl`` it is a signature only.
+    with an f32 accumulator and one rounding, the algorithm the heuristic ranks first under a ``workspace_bytes`` limit and a ``heuristic``
+    posture (or the one an imported table, ``algos``, gives), recorded with the cuBLASLt version (see :mod:`tilefish._library`). Without
+    ``impl`` it is a signature only.
     """
 
     kind = "library"
@@ -186,28 +187,54 @@ class LibraryOp(Op):
         acc: DType | None,
         impl: "str | None" = None,
         workspace_bytes: "int | None" = None,
+        heuristic: str = "tilefish",
+        allow_bf16_reduction: bool = False,
+        algos: "tuple[Any, ...] | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         self.acc = acc
         self.impl = impl
         self.workspace_bytes = workspace_bytes
+        self.heuristic = heuristic
+        self.allow_bf16_reduction = allow_bf16_reduction
+        self.algos = algos
 
     def node_attrs(self) -> dict[str, Any]:
         return {"acc": self.acc} if self.acc is not None else {}
 
 
-def library(name: Any = None, *, acc: DType | None = None, impl: "str | None" = None, workspace_bytes: "int | None" = None) -> Any:
+def library(
+    name: Any = None,
+    *,
+    acc: DType | None = None,
+    impl: "str | None" = None,
+    workspace_bytes: "int | None" = None,
+    heuristic: "str | None" = None,
+    allow_bf16_reduction: "bool | None" = None,
+    algos: Any = None,
+) -> Any:
     """``@tilefish.library("gemm", acc=f32)``: declare an operator by signature only.
 
     ``impl="cublaslt.gemm"`` (or ``"cublaslt.gemm_bias"``) says a pinned cuBLASLt GEMM runs it: the signature must be
     ``(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) -> Tensor[M, N, bf16]`` (with ``bias: Tensor[N, bf16]`` for the second), ``M``, ``N`` and
-    ``K`` static or bucketed, ``N`` and ``K`` multiples of 8. ``workspace_bytes`` is the workspace limit the heuristic is asked under
-    (default 8 519 680, torch's default); it is part of the declaration.
+    ``K`` static or bucketed (of any size: the library judges the leading dimensions an algorithm can take). How its algorithm is chosen is
+    part of the declaration:
+
+    * ``heuristic``: the posture cuBLASLt's heuristic is asked under, ``"tilefish"`` (the default: 16-byte alignment minimums) or ``"torch"``
+      (what torch's ``addmm`` asks: the workspace limit alone, so the heuristic answers what ``torch.addmm`` / ``torch.mm`` run);
+    * ``workspace_bytes``: the workspace limit (default 8 519 680, torch's ``CUBLAS_WORKSPACE_CONFIG``; under ``"torch"`` 1 048 576 for
+      ``gemm_bias``, torch's ``CUBLASLT_WORKSPACE_SIZE``);
+    * ``allow_bf16_reduction=True``: split-K may add its partial sums in bf16 (torch's ``allow_bf16_reduced_precision_reduction``, its
+      default), which rounds more than once; without it they are added in f32 and the result is rounded once;
+    * ``algos``: a :class:`~tilefish.AlgoTable` (or a list of them, one per device) whose algorithms are pinned instead of asking the
+      heuristic, on the devices they are for.
     """
     if acc is not None and not isinstance(acc, DType):
         raise TilefishDeclarationError(f"library: acc must be a dtype such as f32, got {acc!r}")
     if impl is None and workspace_bytes is not None:
         raise TilefishDeclarationError("library: workspace_bytes needs an impl")
+    if impl is None and (heuristic is not None or allow_bf16_reduction is not None or algos is not None):
+        raise TilefishDeclarationError("library: heuristic, allow_bf16_reduction and algos need an impl")
 
     def make(fn: Callable[..., Any], op_name: str | None) -> LibraryOp:
         nm = op_name or fn.__name__
@@ -217,12 +244,20 @@ def library(name: Any = None, *, acc: DType | None = None, impl: "str | None" = 
                 f"library op '{nm}': declare a return type (-> Tensor[...]) or Out/InOut parameters"
             )
         ws = workspace_bytes
-        if impl is not None:
-            from . import _library
+        if impl is None:
+            return LibraryOp(fn, nm, sig, acc)
+        from . import _library
 
-            ws = _library.DEFAULT_WORKSPACE_BYTES if workspace_bytes is None else workspace_bytes
-            _library.check_declaration(nm, impl, sig, acc, ws)
-        return LibraryOp(fn, nm, sig, acc, impl, ws)
+        posture = "tilefish" if heuristic is None else heuristic
+        bf16_reduction = False if allow_bf16_reduction is None else allow_bf16_reduction
+        tables = _library.check_options(nm, posture, bf16_reduction, algos)
+        if impl not in _library.IMPLS:
+            raise TilefishDeclarationError(f"library op '{nm}': impl must be one of {sorted(_library.IMPLS)}, got {impl!r}")
+        ws = _library.default_workspace_bytes(impl, posture) if workspace_bytes is None else workspace_bytes
+        _library.check_declaration(nm, impl, sig, acc, ws)
+        op = LibraryOp(fn, nm, sig, acc, impl, ws, posture, bf16_reduction, tables)
+        _library.check_coverage(op)
+        return op
 
     if callable(name) and not isinstance(name, str):
         return make(name, None)

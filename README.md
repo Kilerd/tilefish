@@ -325,6 +325,42 @@ another cuBLASLt version and a device of another SM count ("re-export the manife
 `jit` and `replay` run the same algorithm. The binding is ctypes on the `libcublasLt` the process already has loaded (torch's); operands are contiguous and 16-byte aligned (strided
 operands are not supported yet).
 
+How the algorithm is chosen is part of the declaration (and of its digest):
+
+```python
+# torch's choice: the result is torch.addmm(bias, a, b.t()) byte for byte (torch.mm(a, b.t()) without a bias)
+@tilefish.library("qkv", acc=f32, impl="cublaslt.gemm_bias", heuristic="torch", allow_bf16_reduction=True)
+def qkv(a: Tensor[M, 1024, bf16], b: Tensor[3072, 1024, bf16], bias: Tensor[3072, bf16]) -> Tensor[M, 3072, bf16]: ...
+
+# algorithms chosen elsewhere (a tuner, another engine's pin file), one table per device: the heuristic is not asked there
+config = {"id": 21, "tile_id": 11, "splitk_num": 1, "reduction_scheme": 0, "cta_swizzling": 0, "custom_option": 0,
+          "stages_id": 20, "inner_shape_id": 0, "cluster_shape_id": 0}
+rtx5090 = tilefish.AlgoTable("sm_120", 170, 120804, {(32, 3072, 1024, True): config})
+
+@tilefish.library("qkv32", acc=f32, impl="cublaslt.gemm_bias", algos=[rtx5090])
+def qkv32(a: Tensor[32, 1024, bf16], b: Tensor[3072, 1024, bf16], bias: Tensor[3072, bf16]) -> Tensor[32, 3072, bf16]: ...
+```
+
+* `heuristic="torch"` asks the heuristic as torch 2.9's `addmm` does (`at::cuda::blas::gemm_and_bias`): one result, under the workspace limit alone (no
+  alignment minimums: torch's pointers are 256-byte aligned, the library's default), with torch's limits by default, 1 048 576 bytes for `gemm_bias`
+  (`CUBLASLT_WORKSPACE_SIZE`) and 8 519 680 for `gemm` (`torch.mm` runs `cublasGemmEx` with `CUBLAS_WORKSPACE_CONFIG`'s workspace, and the heuristic under that
+  limit answers what it runs; on an sm_90 exactly torch's default is 32 MiB, `workspace_bytes=33_554_432`). With torch's default reduction
+  (`allow_bf16_reduction=True`) the result is torch's byte for byte: `test_gpu_cublaslt.py` asserts it over 48 shapes, with and without a bias, on three
+  operand sets each, and it was measured on a B300 MIG slice (sm_103) and an RTX 5090 (sm_120) with cuBLASLt 12.8.4. The default posture, `"tilefish"`, adds
+  16-byte alignment minimums.
+* `allow_bf16_reduction=True` lets split-K add its partial sums in bf16 (`INPLACE`, `OUTPUT_TYPE`: torch's default,
+  `allow_bf16_reduced_precision_reduction`), which rounds more than once. Without it the heuristic is asked for f32 partial sums only, and a GEMM with a
+  bias for no split-K at all (with the bias epilogue, a split-K with f32 partial sums was measured to round twice: cuBLASLt 12.8.4 on an RTX 5090); an
+  algorithm that breaks either is refused by both hosts.
+* `algos=` imports the algorithms (`tilefish.AlgoTable(arch, sm_count, cublaslt_version, {(m, n, k, bias): config})`, a config being the nine
+  `cublasLtMatmulAlgoConfig` attributes or the 128 hex digits of a pin): on the device a table is for, each entry pins the table's algorithm, encoded as
+  cuBLASLt encodes it and held to the same checks (`cublasLtMatmulAlgoCheck` for the problem, the workspace limit, bf16 partial sums only with the
+  opt-in); a device no table is for is refused, never handed to the heuristic.
+
+A manifest entry records them as `heuristic`, `algo_source` and `allow_bf16_reduction`, which are there only when they are not the default
+(`docs/manifest-schema-3.md`, section 9). A pin is the configuration the heuristic chose, encoded by the library: the 64 bytes the heuristic returns can carry
+bytes that are no part of it, which change from process to process.
+
 ## Launch plans: a graph as a static list of launches over one arena
 
 A model forward is not one kernel. `tilefish.plan(graph, buckets=...)` compiles a `@tilefish.graph` into a **launch plan**: for every combination of the bucket values of its

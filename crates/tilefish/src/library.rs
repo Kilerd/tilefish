@@ -3,8 +3,8 @@
 //!
 //! A port of `validate_entry` of `python/src/tilefish/_library.py`. An entry has exactly the fields of [`ENTRY_KEYS`], each of the type it
 //! needs, and the redundant ones must agree: the dtypes, the cuBLAS-level problem (the `T`/`N` transposes, the leading dimensions)
-//! and the shapes of the operands follow from `impl`, `m`, `n` and `k`. `n` and `k` are multiples of 8, as the declaration of the operation
-//! asks (`check_declaration`: every bf16 row starts on 16 bytes). The pinned algorithm is 64 bytes (128 lowercase hex digits) that
+//! and the shapes of the operands follow from `impl`, `m`, `n` and `k`, which may be any size (an algorithm that cannot take the leading
+//! dimensions they make is refused by `cublasLtMatmulAlgoCheck` when it is loaded). The pinned algorithm is 64 bytes (128 lowercase hex digits) that
 //! only the library that made them can judge: running one is [`crate::gemm`].
 
 use serde::Deserialize;
@@ -31,6 +31,25 @@ pub enum LibraryImpl {
     Gemm,
     /// `cublaslt.gemm_bias`: the same with `bias[N]` added in f32 before the rounding (`CUBLASLT_EPILOGUE_BIAS`).
     GemmBias,
+}
+
+/// How the heuristic was asked for an entry's algorithm (`heuristic`; absent means [`Heuristic::Tilefish`]). Provenance: a host runs the
+/// pinned algorithm either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heuristic {
+    /// The default: a few results under the workspace limit, 16-byte alignment minimums.
+    Tilefish,
+    /// `"torch"`: one result under the workspace limit alone, as torch's `addmm` asks.
+    Torch,
+}
+
+/// Where an entry's algorithm comes from (`algo_source`; absent means [`AlgoSource::Heuristic`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlgoSource {
+    /// The heuristic's first answer.
+    Heuristic,
+    /// `"imported"`: a table of the declaration gave it, and the heuristic was not asked.
+    Imported,
 }
 
 impl LibraryImpl {
@@ -87,6 +106,13 @@ pub struct LibraryEntry {
     pub sm_count: u64,
     /// The sha256 of the canonical declaration the entry was made from.
     pub declaration_digest: String,
+    /// How the heuristic was asked (`heuristic`, absent: [`Heuristic::Tilefish`]).
+    pub heuristic: Heuristic,
+    /// Where the algorithm comes from (`algo_source`, absent: [`AlgoSource::Heuristic`]).
+    pub algo_source: AlgoSource,
+    /// Whether the declaration opted in to split-K partial sums in bf16 (`allow_bf16_reduction: true`; absent: no). Without it an algorithm
+    /// whose split-K reduction scheme is `INPLACE` or `OUTPUT_TYPE` (bf16 partial sums, more than one rounding) is refused.
+    pub allow_bf16_reduction: bool,
 }
 
 impl LibraryEntry {
@@ -126,6 +152,18 @@ pub(crate) struct RawLibrary {
     cublaslt_version: Value,
     sm_count: Value,
     declaration_digest: String,
+    // present only when not the default, each with its one value (`docs/manifest-schema-3.md`, section 9); a JSON null is present (and refused)
+    #[serde(default, deserialize_with = "present")]
+    heuristic: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    algo_source: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    allow_bf16_reduction: Option<Value>,
+}
+
+/// A field that is there, whatever its value: `null` included (serde's `Option` would read a `null` as an absent field, which Python does not).
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -157,6 +195,15 @@ fn size_field(v: &Value, name: &str) -> std::result::Result<u64, String> {
     match v.as_u64() {
         Some(n) if (1..=MAX_ELEMENTS).contains(&n) => Ok(n),
         _ => Err(format!("{name} must be an int from 1 to {MAX_ELEMENTS}, got {v}")),
+    }
+}
+
+/// An optional field: absent (`None`) is the default, and present it must be exactly `only` (`true` is not `1`, `"torch"` not `"Torch"`).
+fn optional_field(value: &Option<Value>, name: &str, only: &Value) -> std::result::Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(v) if v == only => Ok(true),
+        Some(v) => Err(format!("{name} is absent (the default) or {only}, got {v}")),
     }
 }
 
@@ -212,15 +259,6 @@ impl LibraryEntry {
         if ld != [k, k, n, n] {
             return Err("the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)".to_owned());
         }
-        // what Python's declaration asks of N and K (`check_declaration`; M may be any size): every row of a, b and the result starts on 16 bytes
-        for (name, size) in [("n", n), ("k", k)] {
-            if size % 8 != 0 {
-                return Err(format!(
-                    "{name} = {size} must be a multiple of 8: a, b and the result are bf16 rows of k and n elements, and every row starts \
-                     on 16 bytes (a declaration of the GEMM gives N and K divisible_by=8, buckets that are multiples of 8, or such a static size)"
-                ));
-            }
-        }
         if (raw.transa.as_str(), raw.transb.as_str()) != ("T", "N") {
             return Err(format!(
                 "transa and transb must be \"T\" and \"N\", got {:?} and {:?}",
@@ -269,6 +307,18 @@ impl LibraryEntry {
                 raw.declaration_digest
             ));
         }
+        let heuristic = if optional_field(&raw.heuristic, "heuristic", &Value::from("torch"))? {
+            Heuristic::Torch
+        } else {
+            Heuristic::Tilefish
+        };
+        let algo_source = if optional_field(&raw.algo_source, "algo_source", &Value::from("imported"))? {
+            AlgoSource::Imported
+        } else {
+            AlgoSource::Heuristic
+        };
+        let allow_bf16_reduction =
+            optional_field(&raw.allow_bf16_reduction, "allow_bf16_reduction", &Value::Bool(true))?;
         let mut buckets = Vec::with_capacity(raw.buckets.len());
         let mut stem = raw.op.clone();
         for (name, value) in &raw.buckets {
@@ -402,6 +452,9 @@ impl LibraryEntry {
             cublaslt_version,
             sm_count,
             declaration_digest: raw.declaration_digest,
+            heuristic,
+            algo_source,
+            allow_bf16_reduction,
         })
     }
 }
@@ -434,6 +487,22 @@ mod tests {
         assert_eq!(decode_algo(&good).unwrap()[..4], [0x01, 0x23, 0x45, 0x67]);
         for bad in [good.to_uppercase(), good[1..].to_owned(), format!("{good}0"), "g".repeat(128), String::new()] {
             assert!(decode_algo(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_optional_field_is_absent_or_its_one_value() {
+        let torch = Value::from("torch");
+        assert_eq!(optional_field(&None, "heuristic", &torch), Ok(false));
+        assert_eq!(optional_field(&Some(Value::from("torch")), "heuristic", &torch), Ok(true));
+        for bad in [Value::from("tilefish"), Value::from("Torch"), Value::Null, Value::from(1)] {
+            let e = optional_field(&Some(bad.clone()), "heuristic", &torch).unwrap_err();
+            assert_eq!(e, format!("heuristic is absent (the default) or \"torch\", got {bad}"));
+        }
+        let yes = Value::Bool(true);
+        assert_eq!(optional_field(&Some(Value::Bool(true)), "allow_bf16_reduction", &yes), Ok(true));
+        for bad in [Value::Bool(false), Value::from(1), Value::from("true")] {
+            assert!(optional_field(&Some(bad), "allow_bf16_reduction", &yes).is_err());
         }
     }
 

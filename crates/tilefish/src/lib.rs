@@ -272,7 +272,7 @@ pub use launch_plan::{
     ARENA_ALIGNMENT, BufferRole, LaunchPlan, PLAN_NAME, PLAN_SCHEMA, PlanArg, PlanBucket, PlanBuffer, PlanStep,
     PlanView, StepKind, plan_digest,
 };
-pub use library::{LibraryEntry, LibraryImpl};
+pub use library::{AlgoSource, Heuristic, LibraryEntry, LibraryImpl};
 pub use manifest::{
     Access, BinarySource, Constexpr, DimInfo, Entry, EntryKind, FixedValue, LaunchAttributes, MANIFEST_NAME,
     MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin, Precondition, ScalarType, ShapeDim, StrideEntry, StrideOf, View,

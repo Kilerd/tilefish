@@ -35,7 +35,9 @@ const WORKSPACE_ALIGNMENT: u64 = 256;
 const ACCUMULATOR_TYPE_MASK: u64 = 0xFF << 8;
 const ACCUMULATOR_32F: u64 = 0x02 << 8;
 const REDUCTION_NONE: u32 = 0;
+const REDUCTION_INPLACE: u32 = 1;
 const REDUCTION_COMPUTE_TYPE: u32 = 2;
+const REDUCTION_OUTPUT_TYPE: u32 = 4;
 /// The alignment of every operand tilefish guarantees (and the library is told: `MIN_ALIGNMENT_{A,B,C,D}_BYTES = 16`).
 const OPERAND_ALIGNMENT: u32 = 16;
 
@@ -97,9 +99,10 @@ fn refuse(who: &str, why: impl std::fmt::Display) -> Error {
 /// `cublasLtMatmulAlgoInit` (which also writes the data types, the compute type and the version) and the configuration attributes, and must
 /// be byte for byte the same; the configuration must be one that the capabilities of its id list (tile, stages, swizzling, custom option);
 /// it must accumulate in f32 and need no more than 16-byte alignment, and its split-K must go with a reduction scheme that does not round in
-/// bf16 (none, or f32 partial sums). What this cannot see is a flip to another valid configuration (another tile, say): that is a
-/// different, legitimate algorithm, and only the digest of the manifest vouches for the file.
-fn vet(handle: &Handle, algo: &Algo, who: &str) -> Result<AlgoConfig> {
+/// bf16 (none, or f32 partial sums), and a GEMM with a bias has no split-K, or, for an entry that opts in (`allow_bf16_reduction`), any
+/// scheme cuBLASLt defines ([`reduction_problem`]). What this cannot see is a flip to another valid configuration (another tile, say): that
+/// is a different, legitimate algorithm, and only the digest of the manifest vouches for the file.
+fn vet(handle: &Handle, algo: &Algo, who: &str, allow_bf16_reduction: bool, bias: bool) -> Result<AlgoConfig> {
     let bytes = algo.to_bytes();
     let hex: String = bytes[..8].iter().map(|b| format!("{b:02x}")).collect();
     let head = format!(
@@ -141,20 +144,8 @@ fn vet(handle: &Handle, algo: &Algo, who: &str) -> Result<AlgoConfig> {
             config.custom_option, caps.custom_option_max, config.id
         ));
     }
-    if config.splitk_num < 1 {
-        problems.push(format!("split-K count {} is below 1", config.splitk_num));
-    }
-    if (config.splitk_num > 1) != (config.reduction_scheme != REDUCTION_NONE) {
-        problems.push(format!(
-            "split-K count {} does not go with reduction scheme {} (split-K needs one, no split-K has none)",
-            config.splitk_num, config.reduction_scheme
-        ));
-    }
-    if ![REDUCTION_NONE, REDUCTION_COMPUTE_TYPE].contains(&config.reduction_scheme) {
-        problems.push(format!(
-            "reduction scheme {} does not keep the one rounding (only no split-K, 0, and f32 partial sums, 2, do; bf16 partial sums round more than once)",
-            config.reduction_scheme
-        ));
+    if let Some(problem) = reduction_problem(config.splitk_num, config.reduction_scheme, allow_bf16_reduction, bias) {
+        problems.push(problem);
     }
     if caps.numerical_impl_flags & ACCUMULATOR_TYPE_MASK != ACCUMULATOR_32F {
         problems.push("it does not accumulate in f32".to_owned());
@@ -176,6 +167,44 @@ fn vet(handle: &Handle, algo: &Algo, who: &str) -> Result<AlgoConfig> {
         }
     }
     if problems.is_empty() { Ok(config) } else { Err(Error::Manifest(format!("{head}: {}", problems.join("; ")))) }
+}
+
+/// What is wrong with a split-K count and a reduction scheme for a pinned algorithm of a GEMM with or without a bias (`None`: nothing): the
+/// rule of Python's `tilefish._cublaslt.reduction_problem`, word for word. No split-K has no reduction scheme and split-K has one; without the
+/// entry's opt-in (`allow_bf16_reduction`) the scheme keeps the one rounding (f32 partial sums, `COMPUTE_TYPE`) and a GEMM with a bias has no
+/// split-K at all (with the bias epilogue a split-K was measured to round twice, f32 partial sums included: cuBLASLt 12.8.4 on sm_120); with
+/// it the two that add the partial sums in bf16 (`INPLACE`, `OUTPUT_TYPE`) are allowed too.
+pub(crate) fn reduction_problem(
+    splitk_num: i32,
+    reduction_scheme: u32,
+    allow_bf16_reduction: bool,
+    bias: bool,
+) -> Option<String> {
+    if splitk_num < 1 {
+        return Some(format!("split-K count {splitk_num} is below 1"));
+    }
+    if (splitk_num > 1) != (reduction_scheme != REDUCTION_NONE) {
+        return Some(format!(
+            "split-K count {splitk_num} does not go with reduction scheme {reduction_scheme} (split-K needs one, no split-K has none)"
+        ));
+    }
+    let bf16 = [REDUCTION_INPLACE, REDUCTION_OUTPUT_TYPE].contains(&reduction_scheme);
+    if bf16 && !allow_bf16_reduction {
+        return Some(format!(
+            "reduction scheme {reduction_scheme} adds the split-K partial sums in bf16, which rounds more than once (only no split-K, 0, and \
+             f32 partial sums, 2, keep the one rounding); a declaration may opt in with allow_bf16_reduction=True"
+        ));
+    }
+    if !bf16 && ![REDUCTION_NONE, REDUCTION_COMPUTE_TYPE].contains(&reduction_scheme) {
+        return Some(format!("reduction scheme {reduction_scheme} is not one cuBLASLt defines (0, 1, 2 or 4)"));
+    }
+    if bias && splitk_num > 1 && !allow_bf16_reduction {
+        return Some(format!(
+            "split-K count {splitk_num} with the bias epilogue may add the bias to a sum already rounded to bf16 (measured with f32 partial \
+             sums too), which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with allow_bf16_reduction=True"
+        ));
+    }
+    None
 }
 
 impl Manifest {
@@ -262,7 +291,7 @@ fn load(entry: &LibraryEntry, ctx: &Arc<CudaContext>) -> Result<LoadedGemm> {
     }
     let handle = Handle::new(ctx)?;
     let algo = Algo::from_bytes(&entry.algo);
-    vet(&handle, &algo, &who)?;
+    vet(&handle, &algo, &who, entry.allow_bf16_reduction, entry.implementation.has_bias())?;
     let problem = cublaslt::Problem::new(entry.m, entry.n, entry.k, entry.implementation.has_bias().then_some(16))?;
     let checked = cublaslt::check(&handle, &problem, &algo).map_err(|e| {
         Error::Manifest(format!(
@@ -934,6 +963,52 @@ mod tests {
         ] {
             let e = checks.check_call(&call(ws)).unwrap_err();
             assert!(e.to_string().contains(want), "{want}: {e}");
+        }
+    }
+
+    /// The rule a pinned algorithm's split-K count and reduction scheme are held to: Python's `reduction_problem`, word for word.
+    #[test]
+    fn split_k_reduces_in_f32_unless_the_entry_opts_in_to_bf16_partial_sums() {
+        for allow in [false, true] {
+            // no split-K and f32 partial sums: always (without a bias)
+            assert_eq!(reduction_problem(1, REDUCTION_NONE, allow, false), None);
+            assert_eq!(reduction_problem(1, REDUCTION_NONE, allow, true), None);
+            assert_eq!(reduction_problem(4, REDUCTION_COMPUTE_TYPE, allow, false), None);
+            // split-K without a scheme, a scheme without split-K, a count below 1, a scheme cuBLASLt does not define: never
+            assert_eq!(
+                reduction_problem(4, REDUCTION_NONE, allow, false).unwrap(),
+                "split-K count 4 does not go with reduction scheme 0 (split-K needs one, no split-K has none)"
+            );
+            assert!(reduction_problem(1, REDUCTION_COMPUTE_TYPE, allow, false).unwrap().contains("does not go with"));
+            assert_eq!(reduction_problem(0, REDUCTION_NONE, allow, false).unwrap(), "split-K count 0 is below 1");
+            assert_eq!(
+                reduction_problem(2, 8, allow, false).unwrap(),
+                "reduction scheme 8 is not one cuBLASLt defines (0, 1, 2 or 4)"
+            );
+        }
+        // a GEMM with a bias: no split-K without the opt-in, f32 partial sums included
+        assert_eq!(reduction_problem(4, REDUCTION_COMPUTE_TYPE, true, true), None);
+        assert_eq!(
+            reduction_problem(4, REDUCTION_COMPUTE_TYPE, false, true).unwrap(),
+            "split-K count 4 with the bias epilogue may add the bias to a sum already rounded to bf16 (measured with f32 partial sums too), \
+             which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with allow_bf16_reduction=True"
+        );
+        assert!(
+            reduction_problem(4, REDUCTION_OUTPUT_TYPE, false, true)
+                .unwrap()
+                .contains("adds the split-K partial sums in bf16")
+        );
+        // bf16 partial sums (in the output, or in a workspace of the output type): only with the opt-in
+        for scheme in [REDUCTION_INPLACE, REDUCTION_OUTPUT_TYPE] {
+            assert_eq!(reduction_problem(43, scheme, true, false), None);
+            assert_eq!(reduction_problem(43, scheme, true, true), None);
+            assert_eq!(
+                reduction_problem(43, scheme, false, false).unwrap(),
+                format!(
+                    "reduction scheme {scheme} adds the split-K partial sums in bf16, which rounds more than once (only no split-K, 0, and \
+                     f32 partial sums, 2, keep the one rounding); a declaration may opt in with allow_bf16_reduction=True"
+                )
+            );
         }
     }
 

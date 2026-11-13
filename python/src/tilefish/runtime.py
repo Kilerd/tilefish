@@ -662,7 +662,7 @@ def replay_pin(spec: Any, manifest: Manifest, index: int) -> Any:
     that its entry is what the declaration asks for and that cuBLASLt is the version that chose it."""
     from . import _library
 
-    return _library.built_from_manifest(manifest, spec, f"sm_{_capability(_torch(), index)}", _library.sm_count(index))
+    return _library.built_from_manifest(manifest, spec, f"sm_{_capability(_torch(), index)}", _library.sm_count(index), index)
 
 
 def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:

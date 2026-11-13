@@ -28,6 +28,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | preconditions | `pointer_alignment` always 16 bytes | a strided pointer may promise only its element alignment; adds `max_extent` |
 | `dims` | names from shapes, scalars and the grid | also the stride dimensions and the offset dimension of a strided pointer |
 | library | none | a pinned cuBLASLt GEMM, for one device (its architecture and SM count): `library` entries (no file) |
+| library entry (0.0.5) | — | three optional fields, present only when not the default: `heuristic`, `algo_source`, `allow_bf16_reduction` (section 9.1) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -273,8 +274,10 @@ compiled by Triton, so there are no `tt.divisibility` attributes; the preconditi
 
 **The operation.** In tilefish's row-major terms, `out[M, N] = a[M, K] @ b[N, K]^T` (`+ bias[N]` for `impl: "cublaslt.gemm_bias"`): `a`, `b`, `bias`
 and `out` are bf16, contiguous, 16-byte aligned; the accumulator is f32; the result is rounded to bf16 **once**; the bias is added in f32 to the
-accumulator before that rounding (`CUBLASLT_EPILOGUE_BIAS`). `K` and `N` are multiples of 8. `M`, `N`, `K` are static or bucketed: one entry per
-bucket combination (the stem names the buckets, like a kernel's).
+accumulator before that rounding (`CUBLASLT_EPILOGUE_BIAS`). `M`, `N`, `K` are static or bucketed: one entry per bucket combination (the stem names
+the buckets, like a kernel's). `N` and `K` may be any size (tilefish 0.0.5; 0.0.4 and crate 0.0.2 required multiples of 8): where a row of `k` or `n`
+bf16 elements does not start on 16 bytes, the leading dimensions are what decides which algorithms are valid, and `cublasLtMatmulAlgoCheck` (which
+sees them) judges the pinned one when it is pinned, when a host loads it and, in Python, before every run; the pointers stay 16-byte aligned.
 
 **The fields** (exactly these; a reader refuses missing and unknown ones; `python/src/tilefish/_library.py`, `ENTRY_KEYS`, `validate_entry`):
 
@@ -299,7 +302,10 @@ bucket combination (the stem names the buckets, like a kernel's).
 | `algo` | 128 lowercase hex digits: the 64 bytes of the `cublasLtMatmulAlgo_t`, in memory order (eight `uint64_t`, as the host stores them) |
 | `cublaslt_version` | int ≥ 1: the value of `cublasLtGetVersion()` of the library that chose `algo` (e.g. `120804` for 12.8.4) |
 | `sm_count` | int ≥ 1 (a JSON integer: not `30.0`, not `true`, not `"30"`; no upper bound): the multiprocessor count (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`, torch's `multi_processor_count`) of the device `algo` was pinned on. A MIG slice has fewer SMs than the whole GPU (a B300 slice of 1g has 30, the GPU 148), and an algorithm that partitions its work by the SM count (stream-K) is chosen for that count |
-| `declaration_digest` | 64 lowercase hex digits: sha256 over the canonical declaration (name, impl, workspace limit, signature with the dimensions' constraints) **and the `sm_count`** (the canonical declaration object with the key `"sm_count"` added, format 2): a pin is the declaration on one device |
+| `declaration_digest` | 64 lowercase hex digits: sha256 over the canonical declaration (name, impl, workspace limit, signature with the dimensions' constraints, and the options of section 9.1 that are not the default) **and the `sm_count`** (the canonical declaration object with the key `"sm_count"` added, format 2): a pin is the declaration on one device |
+| `heuristic` | *optional* (section 9.1): absent, or exactly `"torch"` |
+| `algo_source` | *optional* (section 9.1): absent, or exactly `"imported"` |
+| `allow_bf16_reduction` | *optional* (section 9.1): absent, or exactly `true` |
 
 `abi.params[i]` has exactly `index` (= i), `name`, `kind` (`"pointer"`), `dtype` (`"bf16"`), `access` (`"in"`, and `"out"` for the last), `shape` (a list
 of ints and dimension expressions: `a` is rank 2, `b` rank 2, `bias` rank 1, `out` rank 2). The shapes must agree with `m`, `n`, `k`: an integer entry
@@ -334,20 +340,50 @@ table and `describe` agree.
    with `cublasLtMatmulAlgoInit` + `cublasLtMatmulAlgoConfigSetAttribute` from the configuration the bytes read back as and requires identical bytes,
    requires the tile and stages ids to be in the capability lists of the algorithm id, the swizzling and the custom option to be in range, an f32
    accumulator, alignment capabilities ≤ 16 bytes, and split-K to go with the reduction scheme `NONE` or `COMPUTE_TYPE` (f32 partial sums; a bf16
-   partial sum would round more than once). A host that runs a `library` entry should do the same. What no byte check can see is a flip to *another
+   partial sum would round more than once), and no split-K at all for `gemm_bias` (with the bias epilogue, a split-K with f32 partial sums was measured
+   to add the bias to a sum already rounded to bf16: cuBLASLt 12.8.4 on an RTX 5090, sm_120, algorithm id 21, where 32x1024x3072 has 8409 of 32768
+   elements that are not the correctly rounded result, past the bound one rounding and an f32 accumulation allow, while the same algorithm without the
+   bias, or without split-K, keeps it); or, for an entry with `allow_bf16_reduction: true`, also `INPLACE` (1) or `OUTPUT_TYPE` (4), and split-K with a
+   bias. The rule, with its words, is `tilefish._cublaslt.reduction_problem` (and the crate's `reduction_problem`, `gemm.rs`): no split-K has no scheme
+   and split-K has one; a scheme other than 0, 1, 2 and 4 is refused. A host that runs a `library` entry should do the same. What no byte check can see is a flip to *another
    valid* algorithm: only the digest of the manifest vouches for the file.
 5. The pin belongs to one `arch` and one SM count: an entry is found by `(stem, arch)` for the architecture of the device, and a missing pair is an error
    naming the architectures the manifest has; the entry found must have the device's `sm_count` (step 2).
 
 **Pinning (how an entry is made)**, for the writers: the heuristic is asked on a device of `arch` with the preferences `MAX_WORKSPACE_BYTES =
-workspace_bytes`, `MIN_ALIGNMENT_{A,B,C,D}_BYTES = 16` and a reduction-scheme mask of `NONE | COMPUTE_TYPE`, for a few results; result 0 is the pin, and
-the device's multiprocessor count is `sm_count`. `jit` pins in memory the same way, for the device it runs on (its in-memory pins are kept per device), so
+workspace_bytes`, `MIN_ALIGNMENT_{A,B,C,D}_BYTES = 16` and a reduction-scheme mask of `NONE | COMPUTE_TYPE` (`NONE` alone, the mask `0`, for
+`gemm_bias`: step 4), for a few results (another posture, or an
+imported algorithm: section 9.1); result 0 is the pin, and the device's multiprocessor count is `sm_count`. The pin is the configuration of result 0 (its
+nine `CUBLASLT_ALGO_CONFIG_*` attributes) **encoded again** with `cublasLtMatmulAlgoInit` and `cublasLtMatmulAlgoConfigSetAttribute`, not the 64 bytes the
+heuristic returned: those can hold bytes that are no part of the configuration (measured with cuBLASLt 12.8.4 on an RTX 5090, sm_120: bytes 34 and 35 of
+split-K algorithms of id 21, which change from process to process), so the bytes it returned are neither reproducible nor what the check of step 4
+accepts. The configuration is all a host rebuilds and checks, and the re-encoded algorithm runs to the bytes torch gets from the returned one (section 9.1,
+`test_the_torch_posture_pins_what_torch_runs`). Before an entry is written its algorithm passes the checks of a run (step 4). `jit` pins in memory the same way, for the device it runs on (its in-memory pins are kept per device), so
 `jit` and `replay` run the same algorithm by construction. A pin does not bind itself to its problem (the same bytes are accepted for other problems), which
 is why `m`, `n`, `k` and the epilogue are in the entry. Re-exporting on a device of another SM count makes another entry for the same `(stem, arch)`, which
 replaces the old one only with `overwrite=True` (its `sm_count` and `declaration_digest` differ).
 
 **Digest.** The entry is digested whole, in `library` (section 3); `algo`, `cublaslt_version` and `sm_count` are in it (and `sm_count` is in its
 `declaration_digest` too).
+
+### 9.1 How the algorithm was chosen: three optional fields (tilefish 0.0.5, crate 0.0.3)
+
+A declaration says how its algorithms are chosen (`@tilefish.library(..., heuristic=, allow_bf16_reduction=, algos=)`, `python/src/tilefish/_library.py`).
+Its entries say it in three fields that are **absent when the declaration has the default, and present only with their one other value**; a reader
+refuses any other value, `null` and the default written out included (Python `validate_entry`, `OPTIONAL_ENTRY_FIELDS`; Rust `LibraryEntry::from_raw`).
+So an entry of a declaration that uses none of them is exactly what tilefish 0.0.4 wrote (its digest and `declaration_digest` are unchanged), and a
+reader of 0.0.4 or of crate 0.0.2 refuses an entry that has one (an unknown field), which it would otherwise run against its meaning.
+
+| field | absent (the default) | present |
+|---|---|---|
+| `heuristic` | the posture above: a few results, `MIN_ALIGNMENT_{A,B,C,D}_BYTES = 16`, the bias pointer the heuristic sees is a 16-byte aligned dummy | `"torch"`: what torch 2.9 asks for `torch.addmm(bias, a, b.t())` (`at::cuda::blas::gemm_and_bias`): **one** result, under `MAX_WORKSPACE_BYTES` alone (torch sets the alignment minimums to the alignment of its pointers, 256 bytes from its allocator, which is the library's default, so none is set), a 256-byte aligned dummy bias pointer. The declaration's default `workspace_bytes` is then torch's: `1048576` for `cublaslt.gemm_bias` (`CUBLASLT_WORKSPACE_SIZE`), `8519680` for `cublaslt.gemm` (`torch.mm` runs `cublasGemmEx` on a handle with `CUBLAS_WORKSPACE_CONFIG`'s workspace, and the heuristic asked this way under that limit answers what it runs; torch's default is 32 MiB on sm_90 exactly) |
+| `allow_bf16_reduction` | the heuristic is asked with the reduction-scheme mask `NONE \| COMPUTE_TYPE` (`gemm_bias`: `0`, no split-K), and an algorithm whose split-K adds its partial sums in bf16, or a split-K of `gemm_bias`, is refused (step 4) | `true`: no mask (torch's default, `allow_bf16_reduced_precision_reduction = True`; the mask `NONE \| COMPUTE_TYPE` is what torch sets when it is `False`), and `INPLACE` (1), `OUTPUT_TYPE` (4) and a split-K of `gemm_bias` are accepted: the result may be rounded more than once |
+| `algo_source` | `algo` is the heuristic's result 0, re-encoded | `"imported"`: the declaration's `algos=` gave it (`tilefish.AlgoTable(arch, sm_count, cublaslt_version, {(m, n, k, bias): config})`, one table per device; a config is the nine attributes, encoded with `cublasLtMatmulAlgoInit` and the setters, or 128 hex digits taken as they are). The heuristic is not asked; the algorithm passes step 4 before the entry is written; a device no table of the declaration is for is refused at the build (never handed to the heuristic). The rows of the tables the declaration uses (and the tables' devices) are in its canonical declaration, so a change of one changes `declaration_digest`; `replay` also compares `algo` with what the table gives for the device |
+
+These fields are provenance for a host that runs the pin (it runs `algo` either way), except `allow_bf16_reduction`, which step 4 needs. With the
+`"torch"` posture and `allow_bf16_reduction`, the pinned result is torch's byte for byte (`python/tests/test_gpu_cublaslt.py`,
+`test_the_torch_posture_pins_what_torch_runs`, on 48 shapes with and without a bias and three operand sets each; measured on a B300 MIG slice, sm_103, and
+an RTX 5090, sm_120, with cuBLASLt 12.8.4).
 
 ## 10. Strict reading: every refusal
 
@@ -385,7 +421,8 @@ document tilefish writes next to a build and the host does not read):
 * preconditions: `max_extent` more than once on a pointer (a kernel with `index_bits=64` has none, so it is not required), with a value other than `2147483647`, or on a pointer without `strides`;
   `max_elements` on a pointer with `strides`; `pointer_alignment` of a strided pointer other than 16 or its element size (of any other pointer other
   than 16); every pointer must have exactly one `pointer_alignment`.
-* every `library` entry: the field list, the types and the cross-field equalities of section 9, each by the rule given there.
+* every `library` entry: the field list, the types and the cross-field equalities of section 9, each by the rule given there; an optional field of section 9.1
+  with any value but its one (`"torch"`, `"imported"`, `true`), `null` included.
 * *spec* only, for prebuilt binaries: a `binary` section that is not `{kind, symbol, shared, digests}`; `attrs` not empty; `launch_params` not every arg
   in order; a `block` that is not three ints from 1 to 1024 with product ≤ 1024; a `constexpr` argument.
 
@@ -442,7 +479,9 @@ The offset dimension of a strided pointer is not bound (section 5.1 step 7): the
   first), a cuBLASLt whose `cublasLtGetVersion()` is not `cublaslt_version` (an error naming both versions), an algorithm that fails the vetting of section 9
   (the checks of Python's `_validate_algo`: rebuilt with `cublasLtMatmulAlgoInit` and the configuration attributes and byte-for-byte equal, tile and stages ids
   and swizzling and custom option within the capabilities of its id, an f32 accumulator, alignment at most 16 bytes, split-K with a reduction scheme of `NONE` or
-  `COMPUTE_TYPE`), an algorithm `cublasLtMatmulAlgoCheck` does not approve for the problem, and one that needs more than `workspace_bytes`. The check runs once at
+  `COMPUTE_TYPE`, or also `INPLACE` or `OUTPUT_TYPE` for an entry with `allow_bf16_reduction`), an algorithm `cublasLtMatmulAlgoCheck` does not approve for the
+  problem, and one that needs more than `workspace_bytes`. The optional fields of section 9.1 are read into `LibraryEntry::heuristic` (`Heuristic`),
+  `algo_source` (`AlgoSource`) and `allow_bf16_reduction`. The check runs once at
   load, not at every launch (the problem of an entry is fixed); the descriptors of a call are made and destroyed in the call.
 * The process must map the same cuBLASLt build that chose the pin (cudarc tries `libcublasLt.so` and then `.so.<major>`, `.so.12`, ...; on a machine whose torch
   ships its own cuBLASLt, put that directory on `LD_LIBRARY_PATH`): a different build is refused by the version check, and by nothing else.
@@ -470,13 +509,14 @@ stride scalars and `fixed` arguments are not parameters) and for each library en
 | device scalars | `test_devscalar.py`; on a GPU `test_gpu_devscalar.py` |
 | prebuilt PTX and cubin, byte identity with the Triton path | `test_binary_externs.py`; on a GPU `test_gpu_binary.py`, `ptx/*.ptx` |
 | the `library` section | `test_library_ops.py`, `test_cublaslt.py`; on a GPU `test_gpu_gemm.py`, `test_gpu_cublaslt.py` |
+| its optional fields (section 9.1): the posture, imported algorithms, bf16 split-K partial sums | `test_library_options.py`, `test_cublaslt.py`; on a GPU `test_gpu_cublaslt.py` (torch's bytes, the opt-in), `test_gpu_gemm.py` (jit and replay) |
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
 
 The Rust crate (`crates/tilefish/tests/`):
 
 | what | tests |
 |---|---|
-| strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs`, `schema3.rs` (synthetic manifests, `common/synthetic.rs`) |
+| strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs` (the optional fields of section 9.1 too), `schema3.rs` (synthetic manifests, `common/synthetic.rs`) |
 | views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
 | on a GPU, byte identity with Python's `replay` of every feature, the refusals, graph capture of a GEMM and of a strided kernel, the hazards of other streams | `gpu_gate.rs` with `python/tests/rust_gate.py` |

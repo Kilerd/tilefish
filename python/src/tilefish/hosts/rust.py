@@ -108,7 +108,8 @@ _SHARED_FIELDS = (
 # what the library entries of one stem must agree on: everything but the device (its architecture and SM count, and the declaration digest, which
 # covers the SM count) and what the pin chose on it
 _LIBRARY_SHARED_FIELDS = (
-    "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes"
+    "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes "
+    "heuristic algo_source allow_bf16_reduction"  # (the last three are absent by default: they are compared as present or not too)
 ).split()
 
 _RUST_KEYWORDS = frozenset(
@@ -901,12 +902,23 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
         lines.append("`launch` binds the dimensions from the sizes of the tensors and refuses a call where they disagree.")
         lines += _wrap("Constraints: " + "; ".join(constraints) + ".")
     lines.append("")
+    if e.get("algo_source") == "imported":
+        chosen = "The algorithm is the one the declaration imported for the device (`algos=`), not the heuristic's"
+    elif e.get("heuristic") == "torch":
+        chosen = "The algorithm is the one cuBLASLt's heuristic ranked first, asked as torch's `addmm` asks it, when the manifest was made"
+    else:
+        chosen = "The algorithm is the one cuBLASLt's heuristic ranked first when the manifest was made"
     lines += _wrap(
-        "The algorithm is the one cuBLASLt's heuristic ranked first when the manifest was made, pinned in the manifest and run as it is; "
+        chosen + ", pinned in the manifest and run as it is; "
         "a cuBLASLt of another version than the one that chose it, and a device of another number of SMs, are refused. Pinned with: "
         + ", ".join(f"{x['arch']}: cuBLASLt {_cublaslt_text(x['cublaslt_version'])} on {x['sm_count']} SMs" for x in g.entries)
         + "."
     )
+    if e.get("allow_bf16_reduction") is True:
+        lines.append("")
+        lines += _wrap(
+            "The declaration allows split-K to add its partial sums in bf16 (`allow_bf16_reduction`): the result may be rounded more than once."
+        )
     return lines
 
 

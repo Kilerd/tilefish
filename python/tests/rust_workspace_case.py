@@ -32,7 +32,7 @@ def candidates(m, n, k, bias, limit, count=16):
     lib = _cublaslt._lib()
     index = torch.cuda.current_device()
     handle = _cublaslt._handle(lib, index)
-    with _cublaslt._on_device(index), _cublaslt._Problem(lib, m, n, k, bias, _cublaslt.HEURISTIC_BIAS_POINTER, limit) as p:
+    with _cublaslt._on_device(index), _cublaslt._Problem(lib, m, n, k, bias, _cublaslt.HEURISTIC_BIAS_POINTER, _cublaslt.preferences("tilefish", limit, False)) as p:
         results = (_cublaslt._HeuristicResult * count)()
         returned = ctypes.c_int(0)
         lib.call("cublasLtMatmulAlgoGetHeuristic", handle, p.desc, p.a, p.b, p.d, p.d, p.preference, count, results, ctypes.byref(returned))
@@ -55,9 +55,11 @@ def main(work):
     if pick is None:
         sys.exit(f"no algorithm of the heuristic needs a workspace for the shapes {SHAPES}: choose other sizes")
     algo, needs = pick
+    algo = _cublaslt.encode_algo(_cublaslt.algo_info(algo))  # the pin of the configuration (what the heuristic returns may hold stray bytes)
     Mb = Dim("M", buckets=[M])
 
-    @tilefish.library("gemm_ws", acc=f32, impl="cublaslt.gemm_bias", workspace_bytes=LIMIT)
+    # (an algorithm with a workspace is a split-K, which a GEMM with a bias runs only with the opt-in: its bias epilogue may round twice)
+    @tilefish.library("gemm_ws", acc=f32, impl="cublaslt.gemm_bias", workspace_bytes=LIMIT, allow_bf16_reduction=True)
     def gemm_ws(a: Tensor[Mb, K, bf16], b: Tensor[N, K, bf16], bias: Tensor[N, bf16]) -> Tensor[Mb, N, bf16]: ...
 
     (spec,) = _library.library_specs(gemm_ws)

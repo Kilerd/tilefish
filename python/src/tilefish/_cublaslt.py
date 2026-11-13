@@ -25,17 +25,31 @@ and to vet a pinned algorithm, ``cublasLtMatmulAlgoInit``, ``cublasLtMatmulAlgoC
 ``cublasLtMatmulAlgoCapGetAttribute``. Every call checks its ``cublasStatus_t`` and raises
 :class:`~tilefish.errors.TilefishRuntimeError` naming the call. Arguments are validated before the library is touched.
 
-**Pinning.** :func:`pin_algo` asks the heuristic for a few algorithms under a fixed workspace limit and takes the first.
-The preferences ``MIN_ALIGNMENT_{A,B,C,D}_BYTES = 16`` are set, so that what the heuristic returns does not depend on
-the values of the pointers (the bias pointer, which the heuristic reads for its alignment, is a fixed 16-byte aligned
-dummy, :data:`HEURISTIC_BIAS_POINTER`), and the reduction-scheme mask lets split-K only add its partial sums in f32 (a bf16
-partial sum would round more than once). The pin is the 64-byte ``cublasLtMatmulAlgo_t`` as a 128-character hex string, and
-the workspace it needs. :func:`check_algo` and :func:`matmul` rebuild the algorithm from that string and have
-``cublasLtMatmulAlgoCheck`` approve it for the problem before it runs; an algorithm that is not valid for the problem, or that
-needs more workspace than recorded, is refused. ``cublasLtMatmulAlgoCheck`` is a weak judge of bytes (it accepts several
-corruptions and crashes the process on some, see :func:`_validate_algo`), so the string is first held to what cuBLASLt itself
-would have encoded. The pin belongs to one cuBLASLt build (:func:`version`) and one device (compute capability, and the SM
-count of a MIG slice).
+**Pinning.** :func:`pin_algo` asks the heuristic under a workspace limit and takes its first answer. How it asks is a
+*heuristic posture* (:data:`HEURISTICS`):
+
+* ``"tilefish"`` (the default): a few results are asked for, with the preferences ``MIN_ALIGNMENT_{A,B,C,D}_BYTES = 16``, so
+  that what the heuristic returns does not depend on the values of the pointers (the bias pointer, which the heuristic reads
+  for its alignment, is a fixed 16-byte aligned dummy, :data:`HEURISTIC_BIAS_POINTER`);
+* ``"torch"``: what torch 2.9 asks for ``torch.addmm(bias, a, b.t())`` (``at::cuda::blas::gemm_and_bias``): one result, under the
+  workspace limit alone (the alignment minimums it sets are those of its own pointers, 256 bytes from its allocator, which is
+  the library's default, so none is set here, and the bias pointer is a 256-byte aligned dummy). With the limit torch uses
+  (:data:`TORCH_LT_WORKSPACE_BYTES` for ``addmm``, :data:`DEFAULT_WORKSPACE_BYTES` for ``mm``, which runs ``cublasGemmEx`` and
+  is matched by this posture with its workspace) the heuristic answers what torch runs.
+
+In both, the reduction-scheme mask lets split-K add its partial sums only in f32 (a bf16 partial sum rounds more than once),
+which is what torch does with ``allow_bf16_reduced_precision_reduction = False``, and a GEMM with a bias gets no split-K at all (with
+the bias epilogue a split-K was measured to round twice even with f32 partial sums, see :data:`NO_SPLIT_K_MASK`); with
+``allow_bf16_reduction=True`` (torch's default) no mask is set, and an algorithm whose split-K reduces in bf16 (``INPLACE``,
+``OUTPUT_TYPE``) is accepted.
+
+An algorithm can also be imported: :func:`encode_algo` turns its nine configuration attributes into the 64 bytes cuBLASLt
+writes for them. The pin is the 64-byte ``cublasLtMatmulAlgo_t`` as a 128-character hex string, and the workspace it needs.
+:func:`check_algo` and :func:`matmul` rebuild the algorithm from that string and have ``cublasLtMatmulAlgoCheck`` approve it for
+the problem before it runs; an algorithm that is not valid for the problem, or that needs more workspace than recorded, is
+refused. ``cublasLtMatmulAlgoCheck`` is a weak judge of bytes (it accepts several corruptions and crashes the process on some,
+see :func:`_validate_algo`), so the string is first held to what cuBLASLt itself would have encoded. The pin belongs to one
+cuBLASLt build (:func:`version`) and one device (compute capability, and the SM count of a MIG slice).
 
 Descriptors are built per call and destroyed at its end, so nothing mutable is shared between threads; the one thing that is
 shared is the cuBLASLt handle (one per device, created once under a lock, never destroyed before the process ends), which holds
@@ -56,13 +70,16 @@ from typing import Any, Iterator
 from .errors import TilefishRuntimeError
 
 DEFAULT_WORKSPACE_BYTES = 8_519_680  # torch's default cuBLAS workspace config ":4096:2:16:8": 4096 KiB * 2 + 16 KiB * 8
+TORCH_LT_WORKSPACE_BYTES = 1_048_576  # torch's default cuBLASLt workspace (CUBLASLT_WORKSPACE_SIZE unset: 1024 KiB), what addmm offers its heuristic
 ALGO_BYTES = 64  # sizeof(cublasLtMatmulAlgo_t): uint64_t data[8]
 INT32_MAX = (1 << 31) - 1
 UINT64_MAX = (1 << 64) - 1
 ALIGNMENT_BYTES = 16
 WORKSPACE_ALIGNMENT = 256  # of a workspace the caller gives (cuBLASLt asks for 16 bytes at least and recommends 256; the Rust host requires 256, a plan's arena buffer is)
-REQUESTED_ALGO_COUNT = 8  # how many results the heuristic is asked for; the first is the pin
+HEURISTICS = ("tilefish", "torch")  # the heuristic postures (see the module docstring)
+REQUESTED_ALGO_COUNT = 8  # how many results the "tilefish" posture asks the heuristic for; the first is the pin ("torch" asks for one, as torch does)
 HEURISTIC_BIAS_POINTER = 16  # a 16-byte (and no more) aligned dummy, so that the heuristic never sees an address of the caller's
+TORCH_HEURISTIC_BIAS_POINTER = 256  # the "torch" posture's dummy: aligned as torch's allocations are (to 256 bytes at least)
 
 # -- the values of the header ------------------------------------------------------------------------------------------------
 # All of them are read from the cuBLAS 12.8 headers of the nvidia-cublas wheel (nvidia/cublas/include/cublasLt.h and
@@ -70,6 +87,7 @@ HEURISTIC_BIAS_POINTER = 16  # a 16-byte (and no more) aligned dummy, so that th
 
 # cublas_api.h, cublasStatus_t
 CUBLAS_STATUS_SUCCESS = 0
+CUBLAS_STATUS_NOT_SUPPORTED = 15
 _STATUS_NAMES = {
     0: "CUBLAS_STATUS_SUCCESS",
     1: "CUBLAS_STATUS_NOT_INITIALIZED",
@@ -112,11 +130,48 @@ CUBLASLT_REDUCTION_SCHEME_INPLACE = 1
 CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE = 2
 CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE = 4
 # Split-K may combine its partial sums in the output type (bf16: INPLACE and OUTPUT_TYPE), which would round more than once; the
-# pin allows only no split-K (NONE) and f32 partial sums in the workspace (COMPUTE_TYPE). The mask is the bits of the schemes
-# that may be used (the header: "mask value of 0x03 will allow only INPLACE and COMPUTE_TYPE"); NONE has no bit, and algorithms
-# without split-K are returned under the mask 0x2 (measured).
+# pin allows only no split-K (NONE) and f32 partial sums in the workspace (COMPUTE_TYPE), unless the declaration opts in to bf16
+# partial sums (allow_bf16_reduction). The mask is the bits of the schemes that may be used (the header: "mask value of 0x03 will
+# allow only INPLACE and COMPUTE_TYPE"); NONE has no bit, and algorithms without split-K are returned under the mask 0x2 (measured).
+#
+# A GEMM with a bias gets no split-K at all without the opt-in (the mask 0: only NONE, measured to return algorithms without split-K):
+# with the bias epilogue, a split-K with f32 partial sums was measured to add the bias to a sum already rounded to bf16 (cuBLASLt 12.8.4,
+# RTX 5090, sm_120, algorithm 21: 32x1024x3072, 8409 of 32768 elements not the correctly rounded result and errors past what one rounding
+# and an f32 accumulation allow; the same configuration without the bias, and without split-K, keep the bound).
 REDUCTION_SCHEME_MASK = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE
+NO_SPLIT_K_MASK = 0
 ALLOWED_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_NONE, CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)
+BF16_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_INPLACE, CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE)  # allowed too with allow_bf16_reduction
+
+
+def allowed_reduction_schemes(allow_bf16_reduction: bool, bias: bool = False) -> "tuple[int, ...]":
+    """The ``cublasLtReductionScheme_t`` values a pinned algorithm may have: no split-K and f32 partial sums (only no split-K with a bias), and with
+    the opt-in also the two that add the partial sums in bf16 (in the output buffer, or in a workspace of the output type)."""
+    if allow_bf16_reduction:
+        return ALLOWED_REDUCTION_SCHEMES + BF16_REDUCTION_SCHEMES
+    return (CUBLASLT_REDUCTION_SCHEME_NONE,) if bias else ALLOWED_REDUCTION_SCHEMES
+
+
+def reduction_problem(splitk_num: int, reduction_scheme: int, allow_bf16_reduction: bool, bias: bool = False) -> "str | None":
+    """What is wrong with this split-K count and reduction scheme for a pin of a GEMM with or without a bias (``None``: nothing). Pure: the rule
+    both hosts hold an algorithm to (the Rust crate's ``reduction_problem`` has the same words)."""
+    if splitk_num < 1:
+        return f"split-K count {splitk_num} is below 1"
+    if (splitk_num > 1) != (reduction_scheme != CUBLASLT_REDUCTION_SCHEME_NONE):
+        return f"split-K count {splitk_num} does not go with reduction scheme {reduction_scheme} (split-K needs one, no split-K has none)"
+    if reduction_scheme in BF16_REDUCTION_SCHEMES and not allow_bf16_reduction:
+        return (
+            f"reduction scheme {reduction_scheme} adds the split-K partial sums in bf16, which rounds more than once (only no split-K, 0, and f32 "
+            "partial sums, 2, keep the one rounding); a declaration may opt in with allow_bf16_reduction=True"
+        )
+    if reduction_scheme not in ALLOWED_REDUCTION_SCHEMES + BF16_REDUCTION_SCHEMES:
+        return f"reduction scheme {reduction_scheme} is not one cuBLASLt defines (0, 1, 2 or 4)"
+    if bias and splitk_num > 1 and not allow_bf16_reduction:
+        return (
+            f"split-K count {splitk_num} with the bias epilogue may add the bias to a sum already rounded to bf16 (measured with f32 partial "
+            "sums too), which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with allow_bf16_reduction=True"
+        )
+    return None
 # cublasLt.h, cublasLtMatmulAlgoConfigAttributes_t
 _ALGO_CONFIG = {  # name -> (attribute, ctypes type)
     "id": (0, ctypes.c_int32),  # CUBLASLT_ALGO_CONFIG_ID
@@ -334,11 +389,13 @@ class _Library:
                 name = None
         return f"{name} ({status})" if name else f"status {status}"
 
-    def call(self, name: str, *args: Any) -> None:
-        """Call a function that returns a ``cublasStatus_t``; anything but success is a :class:`TilefishRuntimeError` naming it."""
+    def call(self, name: str, *args: Any, allow: "tuple[int, ...]" = ()) -> int:
+        """Call a function that returns a ``cublasStatus_t``; anything but success (or a status of ``allow``, which is returned) is a
+        :class:`TilefishRuntimeError` naming it."""
         status = getattr(self, name)(*args)
-        if status != CUBLAS_STATUS_SUCCESS:
+        if status != CUBLAS_STATUS_SUCCESS and status not in allow:
             raise TilefishRuntimeError(f"cuBLASLt call {name} failed: {self.status_name(status)}")
+        return int(status)
 
 
 def _lib() -> _Library:
@@ -402,13 +459,26 @@ def _check_workspace(workspace_bytes: object) -> int:
     return _int_arg("workspace_bytes", workspace_bytes, low=0, high=UINT64_MAX)
 
 
-def describe(m: int, n: int, k: int, bias: bool) -> "dict[str, Any]":
+def _check_heuristic(heuristic: object) -> str:
+    if heuristic not in HEURISTICS:
+        raise TilefishRuntimeError(f"cuBLASLt matmul: heuristic must be one of {list(HEURISTICS)}, got {heuristic!r}")
+    return str(heuristic)
+
+
+def _check_flag(name: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise TilefishRuntimeError(f"cuBLASLt matmul: {name} must be a bool, got {value!r}")
+    return value
+
+
+def describe(m: int, n: int, k: int, bias: bool, *, allow_bf16_reduction: bool = False) -> "dict[str, Any]":
     """The exact cuBLAS-level problem that tilefish's ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` is posed as (pure: no GPU, no library).
 
     The keys are what is passed to cuBLASLt: the transposes, the compute and scale types, the sizes ``cublas_m = n``,
     ``cublas_n = m``, ``cublas_k = k`` and the leading dimensions of the column-major operands.
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
+    allow_bf16_reduction = _check_flag("allow_bf16_reduction", allow_bf16_reduction)
     return {
         "library": "cublasLt",
         "operation": "matmul",
@@ -438,16 +508,45 @@ def describe(m: int, n: int, k: int, bias: bool) -> "dict[str, Any]":
         "bias_type": "CUDA_R_16BF" if bias else None,
         "bias_length": n if bias else None,  # one value per row of the column-major D, which is one per column of tilefish's D
         "min_alignment_bytes": ALIGNMENT_BYTES,
-        "reduction_schemes": list(ALLOWED_REDUCTION_SCHEMES),  # cublasLtReductionScheme_t values a split-K may use: NONE, COMPUTE_TYPE
+        # cublasLtReductionScheme_t values a split-K may use: NONE, COMPUTE_TYPE, and with the opt-in INPLACE and OUTPUT_TYPE (bf16 partial sums)
+        "reduction_schemes": list(allowed_reduction_schemes(allow_bf16_reduction, bias)),
     }
+
+
+def preferences(heuristic: str, workspace_bytes: int, allow_bf16_reduction: bool, bias: bool = False) -> "list[tuple[int, int]]":
+    """The matmul preference attributes a posture asks the heuristic with, in the order they are set, as ``(attribute, value)``: the workspace
+    limit (``uint64_t``) and then ``uint32_t`` ones (the reduction-scheme mask: none with the opt-in, else f32 partial sums only, and no split-K
+    for a GEMM with a bias). Pure."""
+    prefs = [(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_bytes)]
+    if not allow_bf16_reduction:
+        prefs.append((CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, NO_SPLIT_K_MASK if bias else REDUCTION_SCHEME_MASK))
+    if heuristic == "tilefish":
+        prefs += [
+            (CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, ALIGNMENT_BYTES),
+            (CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, ALIGNMENT_BYTES),
+            (CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, ALIGNMENT_BYTES),
+            (CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, ALIGNMENT_BYTES),
+        ]
+    return prefs
 
 
 class _Problem:
     """The descriptors of one call: matmul descriptor, the layouts of the two operands and of ``D`` (``C`` is the same), and
-    optionally a preference. Everything is destroyed by :meth:`close`; nothing of it is shared with another call."""
+    optionally a preference (the attributes of :func:`preferences`). Everything is destroyed by :meth:`close`; nothing of it is shared
+    with another call."""
 
-    def __init__(self, lib: _Library, m: int, n: int, k: int, bias: bool, bias_ptr: int, preference_workspace: "int | None") -> None:
+    def __init__(
+        self,
+        lib: _Library,
+        m: int,
+        n: int,
+        k: int,
+        bias: bool,
+        bias_ptr: int,
+        preference: "list[tuple[int, int]] | None",
+    ) -> None:
         self.lib = lib
+        self.bias = bias
         self._owned: "list[tuple[str, ctypes.c_void_p]]" = []
         try:
             self.desc = self._create("cublasLtMatmulDescDestroy", "cublasLtMatmulDescCreate", CUBLAS_COMPUTE_32F, CUDA_R_32F)
@@ -466,24 +565,11 @@ class _Problem:
             # D[m, n] row-major is n x m column-major, ldd = n; C has the layout of D
             self.d = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", CUDA_R_16BF, n, m, n)
             self.preference = None
-            if preference_workspace is not None:
+            if preference is not None:
                 self.preference = self._create("cublasLtMatmulPreferenceDestroy", "cublasLtMatmulPreferenceCreate")
-                workspace = ctypes.c_uint64(preference_workspace)
-                lib.call(
-                    "cublasLtMatmulPreferenceSetAttribute",
-                    self.preference,
-                    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                    ctypes.byref(workspace),
-                    ctypes.sizeof(workspace),
-                )
-                for attr, value in (
-                    (CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, REDUCTION_SCHEME_MASK),
-                    (CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, ALIGNMENT_BYTES),
-                    (CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES, ALIGNMENT_BYTES),
-                    (CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, ALIGNMENT_BYTES),
-                    (CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES, ALIGNMENT_BYTES),
-                ):
-                    number = ctypes.c_uint32(value)
+                for attr, value in preference:
+                    # MAX_WORKSPACE_BYTES is a uint64_t, every other preference tilefish sets a uint32_t
+                    number = ctypes.c_uint64(value) if attr == CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES else ctypes.c_uint32(value)
                     lib.call("cublasLtMatmulPreferenceSetAttribute", self.preference, attr, ctypes.byref(number), ctypes.sizeof(number))
         except BaseException:
             self.close(raising=False)
@@ -617,7 +703,7 @@ def _algo_config(lib: _Library, algo: _Algo) -> "dict[str, int]":
     return info
 
 
-_validated: "dict[tuple[int, str], dict[str, int]]" = {}  # (device, hex) -> the configuration of an algorithm that passed _validate_algo
+_validated: "dict[tuple[int, str, bool, bool], dict[str, int]]" = {}  # (device, hex, allow_bf16_reduction, bias) -> the configuration that passed _validate_algo
 
 
 def _cap(lib: _Library, algo: _Algo, attr: int, ctype: Any, *, array: bool = False) -> Any:
@@ -632,7 +718,9 @@ def _cap(lib: _Library, algo: _Algo, attr: int, ctype: Any, *, array: bool = Fal
     return value.value
 
 
-def _validate_algo(lib: _Library, handle: ctypes.c_void_p, index: int, algo_hex: str) -> "dict[str, int]":
+def _validate_algo(
+    lib: _Library, handle: ctypes.c_void_p, index: int, algo_hex: str, allow_bf16_reduction: bool = False, bias: bool = False
+) -> "dict[str, int]":
     """Refuse an algorithm that cuBLASLt itself would not have produced, before ``cublasLtMatmulAlgoCheck`` sees it.
 
     Measured (cuBLASLt 12.8.4 on a B300): ``cublasLtMatmulAlgoCheck`` accepts an algorithm with a changed version field, changed
@@ -641,16 +729,17 @@ def _validate_algo(lib: _Library, handle: ctypes.c_void_p, index: int, algo_hex:
     is rebuilt with ``cublasLtMatmulAlgoInit`` (which also writes the data types, the compute type and the version) and
     ``cublasLtMatmulAlgoConfigSetAttribute``, and must be byte for byte the same; the configuration must be one that the
     capabilities of its id list (tile, stages, swizzling, custom option); it must accumulate in f32 and need no more than
-    16-byte alignment, and its split-K must go with a reduction scheme that does not round in bf16. What this cannot see is a flip to another valid configuration
-    (another tile, say): that is a different, legitimate algorithm.
+    16-byte alignment, and its split-K must go with a reduction scheme that does not round in bf16, and a GEMM with a bias has no split-K
+    (or, with ``allow_bf16_reduction``, any reduction scheme cuBLASLt defines: :func:`reduction_problem`). What this cannot see is a flip to
+    another valid configuration (another tile, say): that is a different, legitimate algorithm.
     """
-    key = (index, algo_hex)
+    key = (index, algo_hex, allow_bf16_reduction, bias)
     cached = _validated.get(key)
     if cached is not None:
         return cached
     head = f"the pinned cuBLASLt algorithm {algo_hex[:16]}... is not one cuBLASLt produces for bf16 with f32 accumulation"
     try:
-        cfg = _validate_algo_bytes(lib, handle, algo_hex, head)
+        cfg = _validate_algo_bytes(lib, handle, algo_hex, head, allow_bf16_reduction, bias)
     except TilefishRuntimeError as e:
         if str(e).startswith(head):
             raise
@@ -659,7 +748,9 @@ def _validate_algo(lib: _Library, handle: ctypes.c_void_p, index: int, algo_hex:
     return cfg
 
 
-def _validate_algo_bytes(lib: _Library, handle: ctypes.c_void_p, algo_hex: str, head: str) -> "dict[str, int]":
+def _validate_algo_bytes(
+    lib: _Library, handle: ctypes.c_void_p, algo_hex: str, head: str, allow_bf16_reduction: bool = False, bias: bool = False
+) -> "dict[str, int]":
     algo = _algo_struct(algo_hex)
     cfg = _algo_config(lib, algo)
     fresh = _Algo()
@@ -684,15 +775,9 @@ def _validate_algo_bytes(lib: _Library, handle: ctypes.c_void_p, algo_hex: str, 
     custom_max = _cap(lib, fresh, _CAP_CUSTOM_OPTION_MAX, ctypes.c_int32)
     if cfg["custom_option"] > custom_max:
         problems.append(f"custom option {cfg['custom_option']} is above the maximum {custom_max} of algorithm {cfg['id']}")
-    if cfg["splitk_num"] < 1:
-        problems.append(f"split-K count {cfg['splitk_num']} is below 1")
-    if (cfg["splitk_num"] > 1) != (cfg["reduction_scheme"] != CUBLASLT_REDUCTION_SCHEME_NONE):
-        problems.append(f"split-K count {cfg['splitk_num']} does not go with reduction scheme {cfg['reduction_scheme']} (split-K needs one, no split-K has none)")
-    if cfg["reduction_scheme"] not in ALLOWED_REDUCTION_SCHEMES:
-        problems.append(
-            f"reduction scheme {cfg['reduction_scheme']} does not keep the one rounding (only no split-K, 0, and f32 partial "
-            "sums, 2, do; bf16 partial sums round more than once)"
-        )
+    reduction = reduction_problem(cfg["splitk_num"], cfg["reduction_scheme"], allow_bf16_reduction, bias)
+    if reduction is not None:
+        problems.append(reduction)
     if _cap(lib, fresh, _CAP_NUMERICAL_IMPL_FLAGS, ctypes.c_uint64) & _IMPL_ACCUMULATOR_TYPE_MASK != _IMPL_ACCUMULATOR_32F:
         problems.append("it does not accumulate in f32")
     for name, attr in zip("ABCD", _CAP_MIN_ALIGNMENT_BYTES):
@@ -735,28 +820,41 @@ def pin_algo(
     *,
     workspace_bytes: int = DEFAULT_WORKSPACE_BYTES,
     device_index: "int | None" = None,
+    heuristic: str = "tilefish",
+    allow_bf16_reduction: bool = False,
 ) -> Pinned:
     """Ask the heuristic for the algorithm of ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` under a workspace limit, and pin the first.
 
     ``workspace_bytes`` is the limit the heuristic works under (:data:`DEFAULT_WORKSPACE_BYTES` is torch's default workspace
-    config). The pointers are not known here, so the preferences say they are 16-byte aligned, which is all that is relied on.
+    config). ``heuristic`` is the posture (:data:`HEURISTICS`, see the module docstring): ``"tilefish"`` asks for a few results with
+    16-byte alignment minimums (the pointers are not known here, and 16-byte alignment is all that is relied on), ``"torch"`` for one
+    result under the workspace limit alone, as torch's ``addmm`` does. ``allow_bf16_reduction`` lets split-K add its partial sums in bf16
+    (no reduction-scheme mask); without it they are added in f32.
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     limit = _check_workspace(workspace_bytes)
     device_index = _check_device_arg(device_index)
+    heuristic = _check_heuristic(heuristic)
+    allow_bf16_reduction = _check_flag("allow_bf16_reduction", allow_bf16_reduction)
+    count = REQUESTED_ALGO_COUNT if heuristic == "tilefish" else 1
+    dummy = HEURISTIC_BIAS_POINTER if heuristic == "tilefish" else TORCH_HEURISTIC_BIAS_POINTER
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    with _on_device(index), _Problem(lib, m, n, k, bias, HEURISTIC_BIAS_POINTER, limit) as p:
-        results = (_HeuristicResult * REQUESTED_ALGO_COUNT)()
+    no_split_k = "; a GEMM with a bias is asked for one without split-K, unless it opts in with allow_bf16_reduction=True" if bias and not allow_bf16_reduction else ""
+    with _on_device(index), _Problem(lib, m, n, k, bias, dummy, preferences(heuristic, limit, allow_bf16_reduction, bias)) as p:
+        results = (_HeuristicResult * count)()
         returned = ctypes.c_int(0)
-        lib.call(
+        status = lib.call(
             "cublasLtMatmulAlgoGetHeuristic",
-            handle, p.desc, p.a, p.b, p.d, p.d, p.preference, REQUESTED_ALGO_COUNT, results, ctypes.byref(returned),
-        )
+            handle, p.desc, p.a, p.b, p.d, p.d, p.preference, count, results, ctypes.byref(returned),
+            allow=(CUBLAS_STATUS_NOT_SUPPORTED,),  # what the library says when no algorithm fits the preferences (measured)
+        )  # fmt: skip
+        if status == CUBLAS_STATUS_NOT_SUPPORTED:
+            returned.value = 0
         if returned.value < 1:
             raise TilefishRuntimeError(
-                f"cuBLASLt returned no algorithm for the matmul m={m} n={n} k={k} bias={bias} under a workspace limit of {limit} bytes"
+                f"cuBLASLt returned no algorithm for the matmul m={m} n={n} k={k} bias={bias} under a workspace limit of {limit} bytes{no_split_k}"
             )
         first = results[0]
         if first.state != CUBLAS_STATUS_SUCCESS:
@@ -768,11 +866,94 @@ def pin_algo(
             raise TilefishRuntimeError(
                 f"cuBLASLt's first algorithm for the matmul m={m} n={n} k={k} bias={bias} needs {required} bytes of workspace, over the limit of {limit}"
             )
-        return Pinned(algo_hex=algo_to_hex(bytes(first.algo)), workspace_required=required, workspace_limit=limit)
+        # The pin is the algorithm cuBLASLt encodes for the configuration the heuristic chose, not the 64 bytes it returned: those may hold
+        # bytes that are no part of the configuration (measured, cuBLASLt 12.8.4 on an RTX 5090: two bytes that change from process to
+        # process, in split-K algorithms of id 21), which would make the pin differ from run to run and fail the check of its bytes. The
+        # configuration is all a pin is held to and all a replay rebuilds (_validate_algo), as the heuristic's own algorithm would be.
+        canonical = _encode(lib, handle, _algo_config(lib, first.algo))
+        return Pinned(algo_hex=algo_to_hex(bytes(canonical)), workspace_required=required, workspace_limit=limit)
 
 
-def _check(lib: _Library, handle: ctypes.c_void_p, index: int, p: _Problem, algo_hex: str, workspace_bytes: int, what: str) -> int:
-    _validate_algo(lib, handle, index, algo_hex)
+ALGO_CONFIG_FIELDS = tuple(_ALGO_CONFIG)  # the nine configuration attributes of an algorithm, by the names algo_info and encode_algo use
+_CONFIG_RANGES = {  # the C type of each attribute, as a range
+    "id": (-(1 << 31), INT32_MAX),
+    "tile_id": (0, (1 << 32) - 1),
+    "splitk_num": (-(1 << 31), INT32_MAX),
+    "reduction_scheme": (0, (1 << 32) - 1),
+    "cta_swizzling": (0, (1 << 32) - 1),
+    "custom_option": (0, (1 << 32) - 1),
+    "stages_id": (0, (1 << 32) - 1),
+    "inner_shape_id": (0, (1 << 16) - 1),
+    "cluster_shape_id": (0, (1 << 16) - 1),
+}
+
+
+def check_config(config: object, what: str = "an algorithm configuration") -> "dict[str, int]":
+    """``config`` as a dict of exactly the nine attributes of :data:`ALGO_CONFIG_FIELDS`, each an int (not a bool) in the range of its C type (pure).
+
+    Raises :class:`~tilefish.errors.TilefishRuntimeError` naming what is wrong."""
+    if not isinstance(config, dict):
+        raise TilefishRuntimeError(f"{what} is a dict of {list(ALGO_CONFIG_FIELDS)}, got {config!r}")
+    missing = [f for f in ALGO_CONFIG_FIELDS if f not in config]
+    unknown = sorted(str(f) for f in config if f not in ALGO_CONFIG_FIELDS)
+    if missing or unknown:
+        raise TilefishRuntimeError(
+            f"{what} has exactly the fields {list(ALGO_CONFIG_FIELDS)}" + (f"; missing {missing}" if missing else "") + (f"; unknown {unknown}" if unknown else "")
+        )
+    out = {}
+    for f in ALGO_CONFIG_FIELDS:
+        v = config[f]
+        low, high = _CONFIG_RANGES[f]
+        if isinstance(v, bool) or not isinstance(v, int) or not low <= v <= high:
+            raise TilefishRuntimeError(f"{what}: {f} must be an int from {low} to {high}, got {v!r}")
+        out[f] = v
+    return out
+
+
+def encode_algo(config: "dict[str, int]", *, device_index: "int | None" = None) -> str:
+    """The pin (:func:`algo_to_hex`) of an algorithm given by its nine configuration attributes (:data:`ALGO_CONFIG_FIELDS`, the names
+    :func:`algo_info` reads them back as): ``cublasLtMatmulAlgoInit`` for its id with bf16 operands and results and an f32 accumulator and
+    scale, then ``cublasLtMatmulAlgoConfigSetAttribute`` for the other eight, which is how cuBLASLt itself encodes them (the heuristic's own
+    algorithms come out byte for byte the same this way). Nothing is checked here beyond the types: :func:`check_algo` holds the result
+    to the capabilities of its id and has ``cublasLtMatmulAlgoCheck`` approve it for a problem."""
+    cfg = check_config(config)
+    device_index = _check_device_arg(device_index)
+    lib = _lib()
+    index = _device(device_index)
+    handle = _handle(lib, index)
+    with _on_device(index):
+        try:
+            algo = _encode(lib, handle, cfg)
+        except TilefishRuntimeError as e:
+            raise TilefishRuntimeError(f"the algorithm configuration {cfg} cannot be encoded for bf16 with f32 accumulation: {e}") from e
+    return algo_to_hex(bytes(algo))
+
+
+def _encode(lib: _Library, handle: ctypes.c_void_p, cfg: "dict[str, int]") -> _Algo:
+    """``cublasLtMatmulAlgoInit`` for ``cfg["id"]`` (bf16 operands and results, f32 accumulator and scale), then the other eight attributes."""
+    algo = _Algo()
+    lib.call(
+        "cublasLtMatmulAlgoInit",
+        handle, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, cfg["id"], ctypes.byref(algo),
+    )  # fmt: skip
+    for name, (attr, ctype) in _ALGO_CONFIG.items():
+        if name != "id":
+            value = ctype(cfg[name])
+            lib.call("cublasLtMatmulAlgoConfigSetAttribute", ctypes.byref(algo), attr, ctypes.byref(value), ctypes.sizeof(value))
+    return algo
+
+
+def _check(
+    lib: _Library,
+    handle: ctypes.c_void_p,
+    index: int,
+    p: _Problem,
+    algo_hex: str,
+    workspace_bytes: int,
+    what: str,
+    allow_bf16_reduction: bool = False,
+) -> int:
+    _validate_algo(lib, handle, index, algo_hex, allow_bf16_reduction, p.bias)
     algo = _algo_struct(algo_hex)
     result = _HeuristicResult()
     try:
@@ -800,21 +981,24 @@ def check_algo(
     *,
     workspace_bytes: int,
     device_index: "int | None" = None,
+    allow_bf16_reduction: bool = False,
 ) -> int:
     """The workspace the pinned algorithm needs for this problem, after ``cublasLtMatmulAlgoCheck`` approved it.
 
     Raises :class:`~tilefish.errors.TilefishRuntimeError` when the algorithm is not valid for the problem on this device, or needs
-    more than ``workspace_bytes`` (the workspace recorded with the pin).
+    more than ``workspace_bytes`` (the workspace recorded with the pin), or adds split-K partial sums in bf16 without
+    ``allow_bf16_reduction``.
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     budget = _check_workspace(workspace_bytes)
     device_index = _check_device_arg(device_index)
+    allow_bf16_reduction = _check_flag("allow_bf16_reduction", allow_bf16_reduction)
     algo_from_hex(algo_hex)  # the format, before anything reaches the library
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
     with _on_device(index), _Problem(lib, m, n, k, bias, HEURISTIC_BIAS_POINTER, None) as p:
-        return _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}")
+        return _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}", allow_bf16_reduction)
 
 
 def warm(device_index: "int | None" = None) -> None:
@@ -838,6 +1022,7 @@ def matmul(
     stream: int,
     device_index: "int | None" = None,
     workspace_ptr: "int | None" = None,
+    allow_bf16_reduction: bool = False,
 ) -> None:
     """``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` with the pinned algorithm, enqueued on ``stream`` (a ``CUstream`` as an int).
 
@@ -850,6 +1035,8 @@ def matmul(
     With ``workspace_ptr`` (the address of at least ``workspace_bytes`` bytes of device memory, aligned to 256 bytes) the workspace is
     that memory and nothing is allocated: this is how a launch plan runs it (the workspace is a buffer of the plan's arena, so the call
     allocates nothing and can be captured in a CUDA graph). Besides the matmul itself the call touches the device not at all.
+
+    An algorithm whose split-K adds its partial sums in bf16 runs only with ``allow_bf16_reduction=True`` (the declaration's opt-in).
     """
     bias = bias_ptr is not None
     m, n, k, bias = _check_problem(m, n, k, bias)
@@ -862,11 +1049,12 @@ def matmul(
     device_index = _check_device_arg(device_index)
     algo = _algo_struct(algo_hex)
     given = None if workspace_ptr is None else _check_workspace_pointer(workspace_ptr)
+    allow_bf16_reduction = _check_flag("allow_bf16_reduction", allow_bf16_reduction)
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
     with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None) as p:
-        required = _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}")
+        required = _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}", allow_bf16_reduction)
         workspace = None
         address = given
         if required and given is None:
