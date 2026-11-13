@@ -3,7 +3,8 @@
 //!
 //! A port of `validate_entry` of `python/src/tilefish/_library.py`. An entry has exactly the fields of [`ENTRY_KEYS`], each of the type it
 //! needs, and the redundant ones must agree: the dtypes, the cuBLAS-level problem (the `T`/`N` transposes, the leading dimensions)
-//! and the shapes of the operands follow from `impl`, `m`, `n` and `k`. The pinned algorithm is 64 bytes (128 lowercase hex digits) that
+//! and the shapes of the operands follow from `impl`, `m`, `n` and `k`. `n` and `k` are multiples of 8, as the declaration of the operation
+//! asks (`check_declaration`: every bf16 row starts on 16 bytes). The pinned algorithm is 64 bytes (128 lowercase hex digits) that
 //! only the library that made them can judge: running one is [`crate::gemm`].
 
 use serde::Deserialize;
@@ -205,6 +206,15 @@ impl LibraryEntry {
         ];
         if ld != [k, k, n, n] {
             return Err("the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)".to_owned());
+        }
+        // what Python's declaration asks of N and K (`check_declaration`; M may be any size): every row of a, b and the result starts on 16 bytes
+        for (name, size) in [("n", n), ("k", k)] {
+            if size % 8 != 0 {
+                return Err(format!(
+                    "{name} = {size} must be a multiple of 8: a, b and the result are bf16 rows of k and n elements, and every row starts \
+                     on 16 bytes (a declaration of the GEMM gives N and K divisible_by=8, buckets that are multiples of 8, or such a static size)"
+                ));
+            }
         }
         if (raw.transa.as_str(), raw.transb.as_str()) != ("T", "N") {
             return Err(format!(
