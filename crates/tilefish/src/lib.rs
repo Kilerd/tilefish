@@ -280,7 +280,7 @@ pub use manifest::{
 };
 pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, Plan, Prepared};
-pub use plan_run::{CapturedPlan, DevScalar, PlanRun};
+pub use plan_run::{CapturedPlan, DevScalar, PlanRun, Tap};
 pub use region::DevicePtr;
 pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, Readable, TensorArg, TensorMut, TensorRef, U8};
 

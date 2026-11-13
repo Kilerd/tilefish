@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, sys};
 use serde_json::Value;
 use tilefish::{
-    Access, Bf16, DType, DevScalar, DevicePtr, Element, Error, F16, F32, I32, I64, LaunchPlan, Pin, PreconditionKind,
-    TensorArg, TensorMut, TensorRef, U8, plan_digest,
+    Access, Bf16, BufferRole, DType, DevScalar, DevicePtr, Element, Error, F16, F32, I32, I64, LaunchPlan, Pin,
+    PreconditionKind, Tap, TensorArg, TensorMut, TensorRef, U8, plan_digest,
 };
 
 fn gate_dir() -> PathBuf {
@@ -250,6 +250,186 @@ fn every_case_launched_and_replayed_is_pythons_bytes() {
     println!(
         "rust plan gate: {cases} cases of plan replay: PlanRun::launch and two CapturedPlan::replay each byte-identical to Python ({tensors} tensors)"
     );
+}
+
+/// Debug taps (`PlanRun::launch_tapped`) of the block with reuse: every intermediate after the last step that writes it (later steps reuse its
+/// bytes) and `t2` after step 3, against what Python's `taps=` copied out of its replay of the same case; the outputs are still Python's.
+#[test]
+fn taps_are_pythons_bytes() {
+    let gpu = Gpu::new();
+    let plan = plan_named("block-reuse");
+    let run = load(&plan).instantiate_all(&gpu.stream).unwrap();
+    let mut tapped = 0;
+    for case in plan["cases"].as_array().unwrap() {
+        let id = case["id"].as_str().unwrap();
+        let specs = case["taps"].as_array().expect("the case records taps");
+        let values = devscalars(case);
+        let mut exts = upload(&gpu.stream, case);
+        let mut slices: Vec<(CudaSlice<u8>, Vec<usize>, DType)> = specs
+            .iter()
+            .map(|t| {
+                let dtype = dtype_of(t["dtype"].as_str().unwrap());
+                let shape: Vec<usize> =
+                    t["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect();
+                (gpu.stream.alloc_zeros::<u8>(shape.iter().product::<usize>() * dtype.size()).unwrap(), shape, dtype)
+            })
+            .collect();
+        {
+            let mut taps: Vec<Tap<'_>> = specs
+                .iter()
+                .zip(slices.iter_mut())
+                .map(|(t, (slice, shape, dtype))| Tap {
+                    buffer: t["buffer"].as_str().unwrap(),
+                    after: t["after"].as_u64().map(|a| a as usize),
+                    into: typed(slice, shape, *dtype, true),
+                })
+                .collect();
+            run.launch_tapped(&gpu.stream, &mut args(&mut exts, false), &named(&values), &mut taps)
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+        gpu.stream.synchronize().unwrap();
+        for (t, (slice, _, _)) in specs.iter().zip(&slices) {
+            let got = gpu.stream.clone_dtoh(slice).unwrap();
+            let expect = read(t["expect"].as_str().unwrap());
+            assert!(
+                got == expect,
+                "{id}: tap {} after {}: {} bytes differ",
+                t["buffer"],
+                t["after"],
+                differing(&got, &expect)
+            );
+            tapped += 1;
+        }
+        for e in exts.iter().filter(|e| e.expect.is_some()) {
+            assert!(
+                gpu.stream.clone_dtoh(&e.slice).unwrap() == *e.expect.as_ref().unwrap(),
+                "{id}: '{}' with taps",
+                e.name
+            );
+        }
+    }
+    // a tap is checked before anything runs: a buffer that is not one, the workspace, a step past the last, a tensor of another shape
+    let case = &plan["cases"].as_array().unwrap()[0];
+    let values = devscalars(case);
+    let mut exts = upload(&gpu.stream, case);
+    let mut wrong = gpu.stream.alloc_zeros::<u8>(4).unwrap();
+    let one = [1usize];
+    for (buffer, after, message) in [
+        ("nope", None, "not a buffer"),
+        ("workspace", None, "not a buffer"),
+        ("t1", Some(99), "but the bucket has"),
+        ("t1", None, "shape"),
+    ] {
+        let mut taps = [Tap { buffer, after, into: typed(&mut wrong, &one, DType::Bf16, true) }];
+        let e = run.launch_tapped(&gpu.stream, &mut args(&mut exts, false), &named(&values), &mut taps).unwrap_err();
+        assert!(e.to_string().contains(message), "{buffer}: {e}");
+    }
+    println!("rust plan gate: {tapped} taps byte-identical to Python's");
+}
+
+/// `PlanRun::launch_step`: the steps of `residual_chain` launched one by one on the caller's tensors (the intermediate too), each with the binary
+/// and the binding of the pinned plan, give Python's outputs of the whole plan byte for byte; a step given a buffer it does not bind, or not given
+/// one it binds, is refused.
+#[test]
+fn the_steps_launched_one_by_one_give_the_bytes_of_the_plan() {
+    let gpu = Gpu::new();
+    let plan = plan_named("residual_chain");
+    let lp = load(&plan);
+    let run = lp.instantiate_all(&gpu.stream).unwrap();
+    for case in plan["cases"].as_array().unwrap() {
+        let id = case["id"].as_str().unwrap();
+        let bucket: Vec<(String, u64)> =
+            case["bucket"].as_object().unwrap().iter().map(|(n, v)| (n.clone(), v.as_u64().unwrap())).collect();
+        let values: Vec<(&str, u64)> = bucket.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let at = lp.bucket(&values).unwrap();
+        let mut exts = upload(&gpu.stream, case);
+        // the intermediates: buffers of the arena, given here as tensors of their own
+        for (i, b) in lp.buffers().iter().enumerate().filter(|(_, b)| b.role == BufferRole::Intermediate) {
+            let shape = at.shape_of(i).unwrap().to_vec();
+            let slice = gpu.stream.alloc_zeros::<u8>(shape.iter().product::<usize>() * b.dtype.size()).unwrap();
+            exts.push(Ext {
+                name: b.name.clone(),
+                role: "intermediate".to_owned(),
+                dtype: b.dtype,
+                shape,
+                slice,
+                input: None,
+                expect: None,
+            });
+        }
+        for (si, step) in at.steps.iter().enumerate() {
+            let bound: Vec<&str> = step.args.iter().map(|a| a.binding.as_str()).collect();
+            let mut given: Vec<(&str, TensorArg<'_>)> = exts
+                .iter_mut()
+                .filter(|e| bound.contains(&e.name.as_str()))
+                .map(|e| (e.name.as_str(), typed(&mut e.slice, &e.shape, e.dtype, true)))
+                .collect();
+            run.launch_step(&gpu.stream, &values, si, &mut given).unwrap_or_else(|e| panic!("{id} step {si}: {e}"));
+        }
+        gpu.stream.synchronize().unwrap();
+        for e in exts.iter().filter(|e| e.expect.is_some()) {
+            let got = gpu.stream.clone_dtoh(&e.slice).unwrap();
+            assert!(got == *e.expect.as_ref().unwrap(), "{id}: '{}' launched step by step is not the plan's", e.name);
+        }
+    }
+    let case = &plan["cases"].as_array().unwrap()[0];
+    let values: Vec<(String, u64)> =
+        case["bucket"].as_object().unwrap().iter().map(|(n, v)| (n.clone(), v.as_u64().unwrap())).collect();
+    let values: Vec<(&str, u64)> = values.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    let mut exts = upload(&gpu.stream, case);
+    let mut given = args(&mut exts, true); // x, y and residual: step 0 binds x and residual only
+    let e = run.launch_step(&gpu.stream, &values, 0, &mut given).unwrap_err();
+    assert!(e.to_string().contains("does not bind the buffer 'y'"), "{e}");
+    given.retain(|(n, _)| *n == "x");
+    let e = run.launch_step(&gpu.stream, &values, 0, &mut given).unwrap_err();
+    assert!(e.to_string().contains("which is not given"), "{e}");
+}
+
+/// The outputs of a plan whose graph names them (`residual_chain`: `y` and `residual`) are given by those names or by `out0`, `out1` (the names
+/// of before), with the same bytes; both names of one output are refused as one external given twice.
+#[test]
+fn a_named_output_is_given_by_its_name_or_by_out_i() {
+    let gpu = Gpu::new();
+    let plan = plan_named("residual_chain");
+    let lp = load(&plan);
+    assert_eq!(lp.outputs(), ["y", "residual"]);
+    let run = lp.instantiate_all(&gpu.stream).unwrap();
+    let case = &plan["cases"].as_array().unwrap()[0];
+    for legacy in [false, true] {
+        let mut exts = upload(&gpu.stream, case);
+        let mut given = args(&mut exts, false);
+        if legacy {
+            for (name, _) in given.iter_mut() {
+                *name = match *name {
+                    "y" => "out0",
+                    "residual" => "out1",
+                    other => other,
+                };
+            }
+        }
+        run.launch(&gpu.stream, &mut given, &[]).unwrap_or_else(|e| panic!("legacy {legacy}: {e}"));
+        drop(given);
+        gpu.stream.synchronize().unwrap();
+        for e in exts.iter().filter(|e| e.expect.is_some()) {
+            let got = gpu.stream.clone_dtoh(&e.slice).unwrap();
+            assert!(got == *e.expect.as_ref().unwrap(), "legacy {legacy}: '{}' is not Python's", e.name);
+        }
+    }
+    let mut exts = upload(&gpu.stream, case);
+    let extra = gpu.stream.alloc_zeros::<u8>(exts[1].slice.len()).unwrap();
+    let mut extra = Ext {
+        name: "out0".to_owned(),
+        role: "output".to_owned(),
+        dtype: exts[1].dtype,
+        shape: exts[1].shape.clone(),
+        slice: extra,
+        input: None,
+        expect: None,
+    };
+    let mut given = args(&mut exts, false);
+    given.push(("out0", typed(&mut extra.slice, &extra.shape, extra.dtype, true)));
+    let e = run.launch(&gpu.stream, &mut given, &[]).unwrap_err();
+    assert!(e.to_string().contains("given twice"), "{e}");
 }
 
 /// One graph per bucket, replayed with the inputs and the device scalar of every case of its bucket written between replays (the graph holds

@@ -123,7 +123,7 @@ magnitude, so that every language reads the same number); a file larger than
 
 | field | type and rule |
 |---|---|
-| `name` | string, an identifier, unique in the plan. The graph's parameters keep their own names; the returned values are `out0`, `out1`, ... (in the order the graph returns them), an intermediate `t0`, `t1`, ... in the order the steps make them, the workspace `workspace`. A name that would collide with a parameter's gets underscores. |
+| `name` | string, an identifier, unique in the plan. The graph's parameters keep their own names; the returned values have the names the graph gives them (`@tilefish.graph(outputs=("y", "residual"))`, in the order it returns them) or, when it gives none, `out0`, `out1`, ...; an intermediate is `t0`, `t1`, ... in the order the steps make them, the workspace `workspace`. A name that would collide with a parameter's or a returned value's gets underscores. **A host takes a returned value by its name, or by `out<i>` for the `i`-th returned value whatever its name** (the name every returned value had before a graph could name them), when no buffer of the plan is called `out<i>` (Python `_plan.output_buffer`, Rust `LaunchPlan::output_buffer`). |
 | `role` | one of the seven below. |
 | `dtype` | one of `bf16 f16 f32 i32 i64 u8 e4m3 e5m2` (the dtypes that have a storage type). |
 | `shape` | list of integers >= 1 and dimension expressions (section 5); `[]` for a device scalar. |
@@ -153,12 +153,12 @@ magnitude, so that every language reads the same number); a file larger than
 
 ### 7.1 The fields
 
-`buckets[i].steps` is a list (the same length in every bucket) of objects with the fields `entry kind args` and, for kind `library` only, `workspace`:
+`buckets[i].steps` is a list (the same length in every bucket) of objects with the fields `entry kind args` and, for kind `library` only, `workspace`; a step of kind `copy` has exactly the fields `kind args` (section 7.5):
 
 | field | type and rule |
 |---|---|
 | `entry` | string: the stem of a manifest entry (`rmsnorm`, `attention`, `gemm_qkv.M64`: an identifier, then `.<Dim><value>` per bucketed dimension of the operator). It is the entry's own bucket, which differs between buckets of the plan for an operator whose binaries are bucketed. |
-| `kind` | `"kernel"`: an entry of the manifest's `kernels` (Triton or prebuilt binary). `"library"`: an entry of its `library` (a pinned GEMM). The manifest must have the entry **for `arch`** in that section. |
+| `kind` | `"kernel"`: an entry of the manifest's `kernels` (Triton or prebuilt binary). `"library"`: an entry of its `library` (a pinned GEMM). The manifest must have the entry **for `arch`** in that section. `"copy"`: a device-to-device copy (section 7.5), which names no entry. |
 | `args` | non-empty list, one object per **pointer parameter of the entry's `abi.params`, in order** (a kernel's scalar and `fixed` parameters are not arguments: the host derives them). Names in one step are distinct. |
 | `workspace` | present exactly when `kind` is `"library"`: the name of the buffer of role `workspace`. |
 
@@ -181,7 +181,8 @@ The step is a launch of the manifest entry `entry` with the tensors of its argum
 the row-major ones). Everything else is as for a single launch in manifest schema 3: the host **binds the entry's dimensions from those shapes and strides** (section 5.1 there, with its
 canonical strides for axes of size 1; a dimension the arguments the entry reads leave unbound is bound from the shape of its `out` arguments, section 7 there), derives the runtime scalars (dimensions, element counts, strides, `fixed` values), evaluates the grid expression, and checks every precondition of the entry
 (`pointer_alignment` of the passed pointer, `static_size`, `divisible`, `bucket`, `max_elements`, `max_extent`), that a pointer without `strides` in its ABI entry gets a **dense** tensor
-(the strides of its axes of size > 1 are the row-major ones), that the ranks and dtypes are the ABI's, that a written pointer (`access` `out` or `inout`) overlaps no other argument of the step, and
+(the strides of its axes of size > 1 are the row-major ones), that the ranks and dtypes are the ABI's, that a written pointer (`access` `out` or `inout`) overlaps no other argument of the step
+(but an `out` pointer with `alias` and the `in` pointer it names, which may be exactly one tensor: manifest schema 3, section 5.4), and
 the grid against the device's limits. A kernel is launched with `cuLaunchKernel` (a Triton kernel with its two zero scratch slots, a prebuilt one with exactly its parameters); a library entry
 with `cublasLtMatmul` and its pinned algorithm (manifest schema 3, section 9), whose **workspace is the buffer named by `workspace`**, at its address in the arena (`workspace_bytes` of the entry
 are always there; the matmul is given the size the algorithm needs, at most that), so the call allocates nothing.
@@ -202,11 +203,34 @@ the shapes of the views.
   (a pointer with access `out`; an `inout` pointer on a buffer not yet written is refused);
 * **every `output` is written** by some step of every bucket (a returned value no step writes would come back as whatever its tensor held).
 
+A copy step (section 7.5) has no entry: of the rules above it has the last two, its `src` read (written before) and its `dst` written.
+
 ### 7.4 What the rules of `validate_doc` say about steps and buckets (no manifest needed)
 
 * every bucket has the same number of steps, and **in step `k` the `kind`, the `workspace` and, for every argument, the `name` and the `binding` are the same in every bucket**; only
   `entry` and the views' numbers may differ between buckets;
-* every `binding` is a buffer; a `workspace` is the buffer of role `workspace`; a `view` is well formed and inside its buffer at that bucket.
+* every `binding` is a buffer; a `workspace` is the buffer of role `workspace`; a `view` is well formed and inside its buffer at that bucket;
+* a copy step is what section 7.5 says, at every bucket.
+
+### 7.5 Copy steps
+
+A step of kind `"copy"` is `{"kind": "copy", "args": [{"name": "src", ...}, {"name": "dst", ...}]}`: exactly those two fields (no `entry`: it launches no binary; no
+`workspace`), and exactly two arguments, named `src` and then `dst`, each a buffer and optionally a view of it, as any argument. At every bucket:
+
+* each of `src` and `dst` is **dense**: the whole buffer, or a view whose axes of a size other than 1 have the row-major strides (one run of elements, from the view's
+  `offset`);
+* the two have **the same dtype** (their buffers') and **the same number of elements** (their shapes may differ: a copy is of bytes);
+* `dst` is a buffer a step may write (`intermediate`, `output`, `inout`), and in one buffer the two runs of elements do not overlap.
+
+**What a host does.** The copy is `cuMemcpyDtoDAsync(address(dst) + dst.offset * itemsize, address(src) + src.offset * itemsize, count * itemsize)` on the plan's stream, in
+its place among the steps; with the real addresses the two runs of bytes must not overlap (two externals that overlap are refused before, section 9). A stream that is being
+captured records it as a memcpy node, so a plan with copy steps captures in a CUDA graph as before.
+
+**Where they come from.** `tilefish.copy(x)` in a graph body (a new tensor of its own: a copy step from `x`, a tensor or a dense view of one, into a fresh intermediate, which
+an in-place call may then update, where `x`, a parameter, is the caller's and never written), and `param[...] = value` into an `InOut` parameter of the graph (a copy step
+into the caller's tensor; `param[...] = param` is no step). A copy of a view that is not dense (a permutation, a column block) is refused when the plan is made.
+A reader that predates copy steps (the published crate 0.0.2, tilefish 0.0.4) refuses a plan that has one (`kind` must be `kernel` or `library`); a plan without one is
+what it always was.
 
 ## 8. Order, liveness and reuse
 
@@ -220,6 +244,13 @@ the shapes of the views.
   (`last` of one < `first` of the other). A device scalar's slot and the workspace never share bytes. `validate_doc` checks this from the steps of the first bucket (the bindings are the same
   in every bucket). Python lays out a reusing plan first-fit by first step; the layout is part of the document, and a host uses it as it is.
 * A buffer with no step (a parameter that no operator reads) is allowed; it has no live range.
+* **A result written over its input.** A call to an operator whose `Out` may be written over an input (`Out[..., MayAlias("r")]`, an `alias` in the
+  manifest) has its result bound to the buffer of `r`, the same view, when that changes no value the graph computes: `r` is a whole `intermediate`
+  at its current version (made by a call of the graph: not a parameter, which is the caller's, and not a view), no later node of the graph reads its
+  storage (a view of it, a version of it, or the graph's return), and no other argument of the call is in that storage. The step then binds `r` and
+  `r_out` to one buffer (`python/src/tilefish/_plan.py`, `_in_place`); the buffer is written by the step that made `r` and again by this one, and its
+  live range covers both. Otherwise the result has a buffer of its own. The document needs nothing new: two arguments of a step bound to one buffer
+  are checked by the launch (section 7.2) as any two arguments are.
 
 ## 9. What a host does
 
@@ -256,6 +287,22 @@ the shapes of the views.
 
 A host may cache everything of steps 1 to 3 that does not depend on an address (the dimension bindings, scalars, grids, the entries' loaded functions and pinned algorithms) per bucket, as Python's
 runner does; the address-dependent checks are repeated at every execution.
+
+**Debug taps (not part of the document).** A host may copy a buffer of the plan out during an execution, to observe the intermediates of the very plan a product runs: the
+plan and its digest are unchanged. A *tap* names a buffer (any but the workspace; a returned value by its name or `out<i>`) and a step of the bucket (by default the last step
+that writes the buffer: an `out` or `inout` pointer of a kernel, the `out` of a GEMM, the `dst` of a copy), and gives a dense tensor of the buffer's dtype and its shape at the
+bucket that overlaps no external, no other tap and not the arena. It is checked with everything else in step 3, and in step 5 the whole buffer is copied into it
+(`cuMemcpyDtoDAsync`, on the stream) right after its step, before the next step may write over the buffer's bytes (with `reuse`, an intermediate's bytes are reused). Python:
+`tilefish.run(graph, ..., taps={"t3": tensor, ("t5", 4): tensor})` and `tilefish.capture(..., taps=...)` (the copies are memcpy nodes of the graph); Rust:
+`PlanRun::launch_tapped(stream, externals, devscalars, &mut [Tap { buffer, after, into }])`.
+
+**One step alone (not part of the document).** A host may launch one step of a bucket on the caller's tensors: the binary of the step's entry in the verified
+manifest (the one the plan's pin pins) and the binding of the step (each argument the buffer and the view the step names, made of the tensor given for that buffer),
+with every check of a launch of the step (section 7.2) made with those addresses first. The caller gives a tensor for every buffer the step binds and for nothing else (a
+returned value by its name or `out<i>`; not the workspace, which is the arena's), of the buffer's dtype and its shape at the bucket (a device scalar: one element), dense,
+and overlapping neither the arena nor, where the step writes one, each other. The launch is ordered with the executions of the plan (section 9, step 1). It is how one op
+of an exported plan is replayed on a reference's inputs under the pin a product uses. Python: `tilefish.runtime.run_step(graph, step, buffers, mode=, plan=, pin=,
+bucket=None)` (the bucket is found from the shapes when one fits them); Rust: `PlanRun::launch_step(stream, bucket, step, buffers)`.
 
 ## 10. CUDA graphs
 
@@ -314,7 +361,11 @@ y = tilefish.run(graph, *inputs)                                            # ji
 y = tilefish.run(graph, *inputs, mode="replay", plan="build/", pin=p.digest)  # replay: the exported plan, verified; or trust_directory=True
 y = tilefish.run(graph, *inputs, mode="reference")                          # the ops' references composed in torch (an extern's reference= is its oracle)
 tilefish.run(graph, *inputs, outputs=out)                                   # write the returned values into these tensors instead of allocating
+tilefish.run(graph, *inputs, outputs={"y": y, "residual": r})              # the same by name (the graph's names, or out0, out1, ...)
+tilefish.run(graph, *inputs, taps={"t3": t, ("t5", 4): u})                 # copy buffers out after a step (section 9: debug taps; the plan is unchanged)
+plan.shape_of("t3", M=64)                                                   # the shape of a buffer at a bucket (what a tap is given)
 tilefish.runtime.prepare(graph, mode="replay", plan="build/", pin=p.digest) # arena, binaries, handle: before a CUDA graph capture
+tilefish.runtime.run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest)  # one step alone (section 9)
 cap = tilefish.capture(graph, *externals, devscalars={"n": 5}, outputs=out) # a CapturedPlan: the plan in a CUDA graph of its own (mode=, plan=, pin= as for run)
 cap.replay(stream=None)                                                     # ordered with every run and replay of the plan, from any thread
 cap.set_devscalar("n", 7)                                                   # the value the next replays write (nothing is enqueued now)
@@ -342,11 +393,15 @@ A graph body that a plan cannot make is refused by `tilefish.plan` with the rule
 
 * **arithmetic traced in the graph body** (`x + y`, a cast, a reduction, a load): a plan launches declared operators; put it in a `@tilefish.kernel`. Views (`reshape`, `permute`, `select`, `split`,
   `x[i]`) are fine. There is no fusion in this version: the steps are the calls the graph makes.
-* a **`store`** into a parameter (a copy), an **`Out`** parameter of the graph and a runtime **`Dim`** parameter: a graph's results are its returned values.
+* an **`Out`** parameter of the graph (and so a `store` into one) and a runtime **`Dim`** parameter: a graph's results are its returned values (a `store` into an `InOut`
+  parameter is a copy step, section 7.5), and a `tilefish.copy` of a view that is not dense;
 * a call to **another graph** (it is not inlined yet).
 * an **in-place call on a view** of another tensor (the IR says updating a view does not change its parent; a plan has no copy to make that true), and a view **read after its tensor was updated
   in place**.
-* a returned value that is **an input, a view of anything, or returned twice**.
+* a returned value that is **a view that is not dense**, a **`DevScalar`**, or a view of a tensor updated in place after the view was made. (Any other returned value is
+  planned: a tensor a call made is the caller's output buffer itself; **all of it in another shape** (a reshape: offset 0, the row-major strides, as many elements) too,
+  the output buffer then having the returned shape and the steps that write and read it a view of their own shape; **any other dense view, a parameter and a value
+  returned twice** are copied into the caller's buffer by a copy step after the last call, section 7.5.)
 * a **dimension without buckets**, an operator **without an implementation** (a `library` op with no `impl`), two different operators with one name, a block-scaled tensor.
 
 ## 13. An example
@@ -384,12 +439,18 @@ and 9 240 832 with it (720 896 for the intermediates).
 |---|---|
 | the walk, the steps and views, the buffers, roles, buckets, the refusals of section 12 | `test_plan.py` |
 | a step that reads three views with one stride pair; a step whose dimension only its `Out` buffer has (section 5) | `test_shared_strides.py`, `test_output_dims.py`; on a GPU `test_gpu_shared_strides.py`, `test_gpu_output_dims.py` |
+| a result written over its input (`MayAlias`, section 8) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
+| copy steps (`tilefish.copy`, a store into an `InOut` parameter; section 7.5) | `test_plan_copy.py`; on a GPU `test_gpu_plan_copy.py`; the Rust reader: `python_plans.json` (`copy ...` documents) |
+| returned views and parameters (section 12) | `test_plan_returns.py`; on a GPU `test_gpu_plan_returns.py` |
+| one step alone (section 9) | `test_plan_step.py`; on a GPU `test_gpu_plan_step.py` and `gpu_plan_gate.rs` (`the_steps_launched_one_by_one_give_the_bytes_of_the_plan`) |
+| debug taps (section 9) | `test_plan_taps.py`; on a GPU `test_gpu_plan_taps.py` and `gpu_plan_gate.rs` (`taps_are_pythons_bytes`: Rust taps against Python's) |
+| the names of the returned values (section 6) | `test_plan_names.py`; the golden plan `steps` (`launch_plans.rs`); on a GPU `gpu_plan_gate.rs` (`a_named_output_is_given_by_its_name_or_by_out_i`) |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |
 | the document of section 13 | `test_plan_docs.py` |
 | the runner: order, addresses, scalars, preconditions before the first launch, captures, the order event of the arena (fake backend) | `test_planrun.py` |
 | on a GPU: replay == jit == per-op eager, replay vs reference, CUDA graph capture, tampering, the arena | `test_gpu_plan.py` |
 | on a GPU: runs of one plan on two streams (the race of the review, 0 of 20 rounds corrupted), from two threads, and replays of a captured graph between runs on other streams | `test_gpu_plan_streams.py` |
-| **golden fixtures for a second implementation**: two plan directories (`manifest.json`, cubins and `plan.json`) of the transformer block, without and with reuse, and `expected.json` with the plan digest, the manifest digest, the arena size and every arena offset that a reader must reproduce from the files alone | `golden/plans/` (written by `export_plan_fixtures.py`, no GPU needed), `test_plan_fixtures.py` |
+| **golden fixtures for a second implementation**: three plan directories (`manifest.json`, cubins and `plan.json`): the transformer block, without and with reuse, and `steps` (a result written over its input, two copy steps, a returned reshape, named outputs); `expected.json` with the plan digest, the manifest digest, the arena size, every arena offset and the outputs that a reader must reproduce from the files alone | `golden/plans/` (written by `export_plan_fixtures.py`, no GPU needed), `test_plan_fixtures.py` |
 
 The cubins of the golden fixtures are fake (a tiny ELF file per kernel entry, a made-up algorithm per GEMM): the format, the digests and the plan are real, so a reader can be checked against them; they cannot be launched.

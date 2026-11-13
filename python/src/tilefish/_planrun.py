@@ -63,6 +63,7 @@ import os
 import pathlib
 import threading
 import weakref
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -303,6 +304,10 @@ class Backend:
     def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]", stream: int) -> None:
         raise NotImplementedError
 
+    def copy(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        """Copy ``nbytes`` bytes of device memory from ``src`` to ``dst`` on ``stream`` (a copy step of the plan; captured as a memcpy node)."""
+        raise NotImplementedError
+
     def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
         raise NotImplementedError
 
@@ -445,6 +450,11 @@ class TorchBackend(Backend):
     def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]", stream: int) -> None:
         loaded.launch(grid, args, stream)
 
+    def copy(self, dst: int, src: int, nbytes: int, stream: int) -> None:
+        from . import _cuda
+
+        _cuda.copy_async(dst, src, nbytes, stream)
+
     def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
         from . import _library
 
@@ -527,8 +537,43 @@ class _Arena:
 
 
 @dataclass
+class _CopyBound:
+    """A copy step at one bucket: ``nbytes`` bytes from ``src`` (byte ``src_offset`` of that buffer) to ``dst`` (byte ``dst_offset``)."""
+
+    src: str
+    src_offset: int
+    dst: str
+    dst_offset: int
+    nbytes: int
+
+    @classmethod
+    def of(cls, args: "Sequence[Mapping[str, Any]]", shapes: "Mapping[str, tuple[str, tuple[int, ...]]]") -> "_CopyBound":
+        (src_shape, _, src_off), (dst_shape, _, dst_off) = (_plan.copy_view(a, shapes) for a in args)
+        itemsize = _plan.ITEMSIZE[shapes[args[0]["binding"]][0]]
+        return cls(args[0]["binding"], src_off * itemsize, args[1]["binding"], dst_off * itemsize, math.prod(src_shape) * itemsize)
+
+    def check(self, bases: "Mapping[str, int]") -> "tuple[int, int, int]":
+        """``(src, dst, nbytes)`` with the real addresses: the two runs of bytes must not overlap (externals that overlap are refused before this)."""
+        src, dst, n = bases[self.src] + self.src_offset, bases[self.dst] + self.dst_offset, self.nbytes
+        if src < dst + n and dst < src + n:
+            raise TilefishPreconditionError(f"the copy from '{self.src}' to '{self.dst}' overlaps itself", kind="alias", arg=self.dst)
+        return src, dst, n
+
+
+@dataclass
+class _Tap:
+    """A debug tap of a run: the buffer ``buffer`` (``nbytes`` bytes, at the bucket) copied into the caller's tensor at ``dst`` after step ``after``."""
+
+    buffer: str
+    after: int
+    tensor: Any
+    dst: int
+    nbytes: int
+
+
+@dataclass
 class _StepRT:
-    bound: Bound
+    bound: "Bound | _CopyBound"
     loaded: Any  # the loaded kernel of a kernel step
     order: "tuple[tuple[str, str], ...]"  # (kind, name) of the arguments of a launch, in the ABI's order
     algo: "str | None"  # the pinned algorithm of a library step
@@ -562,6 +607,7 @@ class _Call:
     bases: "dict[str, int]"
     slots: "list[tuple[dict, Any, bool]]"  # (buffer, source, on_device) of every device scalar
     results: "list[Any]"  # the outputs, in the order the graph returns them
+    taps: "list[_Tap]" = dataclasses.field(default_factory=list)  # the copies of buffers the caller asked for, each after a step (taps=)
 
 
 def _ordered(be: Backend, arena: _Arena, stream: int, capturing: bool, work: Any) -> None:
@@ -704,6 +750,9 @@ class PlanRunner:
         callees = self.plan._callees
         steps: "list[_StepRT]" = []
         for i, st in enumerate(steps_doc):
+            if st["kind"] == "copy":  # a device-to-device copy: no binary to build or load
+                steps.append(_StepRT(_CopyBound.of(st["args"], shapes), None, (), None, None))
+                continue
             callee = callees.get(st["entry"])
             where = f"graph '{self.plan.name}' at {values or 'its only size'}, step #{i} ({st['entry']})"
             if callee is None:
@@ -731,13 +780,13 @@ class PlanRunner:
 
     # -- running ----------------------------------------------------------------------------------------------------------------
 
-    def run(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None) -> Any:
+    def run(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None, taps: Any = None) -> Any:
         be = self.backend
         bound = self._bind(args, kwargs)
         index = bound.index
         with _gate.shared():
             capturing = be.capturing(index)
-            call = self._call(bound, outputs, slots_in_graph=capturing)
+            call = self._call(bound, outputs, slots_in_graph=capturing, taps=taps)
             arena = call.arena
             with arena.lock, be.scope(index):
                 stream = be.stream(index)
@@ -795,7 +844,7 @@ class PlanRunner:
                 raise TilefishPreconditionError(f"the device scalar '{name}' is on {where}, but the other tensors of the call are on device {index}", kind="device", arg=name)
         return _BoundCall(call, sources, values, index)
 
-    def _call(self, bound: "_BoundCall", outputs: Any, slots_in_graph: bool) -> "_Call":
+    def _call(self, bound: "_BoundCall", outputs: Any, slots_in_graph: bool, taps: Any = None) -> "_Call":
         """The bucket's binaries and the arena (made the first time, outside a capture), the outputs (the caller's, or allocated), the address of every
         buffer, and **every precondition of every step**, all before anything is enqueued. ``slots_in_graph``: the writes of the device scalars are captured
         in a ``torch.cuda.graph``, so a host value is refused (a captured copy of it would freeze it). Called with the gate held shared."""
@@ -847,7 +896,7 @@ class PlanRunner:
                     )
                 slots.append((b, source, on_device))
         results = [t for _, t in sorted(made, key=lambda p: p[0])]
-        return _Call(rt, arena, checked, bases, slots, results)
+        return _Call(rt, arena, checked, bases, slots, results, self._taps(taps, rt, bases, arena, index))
 
     def _enqueue(self, call: "_Call", stream: int, index: int, slots: bool) -> None:
         """Enqueue the device-scalar writes (``slots``) and the launches of the steps on ``stream``, the current stream (the caller orders them: :func:`_ordered`)."""
@@ -855,15 +904,82 @@ class PlanRunner:
         if slots:
             for b, source, on_device in call.slots:
                 be.write_devscalar(call.arena.handle, b["offset"], b["dtype"], source, on_device)
-        for st, real in zip(call.rt.steps, call.checked):
-            if st.algo is not None:
-                names = [a for a in st.bound.names]
-                a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
-                bias = real[names[2]].ptr if len(names) == 4 else None
-                be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, call.bases[st.workspace], stream, index)  # type: ignore[index]
+        taps = iter(call.taps)  # sorted by the step they follow
+        tap = next(taps, None)
+        for i, (st, real) in enumerate(zip(call.rt.steps, call.checked)):
+            self._enqueue_step(st, real, call.bases, stream, index)
+            while tap is not None and tap.after == i:  # a debug tap: the buffer as this step left it, copied out before the next step may reuse its bytes
+                be.copy(tap.dst, call.bases[tap.buffer], tap.nbytes, stream)
+                tap = next(taps, None)
+
+    def _enqueue_step(self, st: "_StepRT", real: Any, bases: "Mapping[str, int]", stream: int, index: int) -> None:
+        """Enqueue one checked step (``real``: what its ``check`` returned with the real addresses) on ``stream``."""
+        be = self.backend
+        if isinstance(st.bound, _CopyBound):
+            src, dst, nbytes = real
+            be.copy(dst, src, nbytes, stream)
+        elif st.algo is not None:
+            names = [a for a in st.bound.names]
+            a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
+            bias = real[names[2]].ptr if len(names) == 4 else None
+            be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
+        else:
+            launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
+            be.launch(st.loaded, st.bound.grid, launch_args, stream)
+
+    def _written(self, st: "_StepRT") -> "set[str]":
+        """The buffers a step writes: a copy's destination, a GEMM's ``out``, the ``out`` and ``inout`` pointers of a kernel."""
+        b = st.bound
+        if isinstance(b, _CopyBound):
+            return {b.dst}
+        written = {"out"} if st.algo is not None else b.written
+        return {binding for name, binding in zip(b.names, b.bindings) if name in written}
+
+    def _taps(self, taps: Any, rt: "_BucketRT", bases: "Mapping[str, int]", arena: _Arena, index: int) -> "list[_Tap]":
+        """``taps=`` of a run or a capture: ``{buffer: tensor}`` or ``{(buffer, step): tensor}``, a copy of the buffer (all of it, at the bucket) into the
+        tensor right after the step (by default after the last step of the bucket that writes the buffer). Outside the plan and its digest: a debug
+        view of the intermediates of the very plan a product runs. Checked before anything is enqueued."""
+        if taps is None:
+            return []
+        if not isinstance(taps, Mapping):
+            raise TilefishRuntimeError(f"taps= maps a buffer name (or a (name, step) pair) to the tensor it is copied into, got {taps!r}")
+        out: "list[_Tap]" = []
+        n_steps = len(rt.steps)
+        ranges = [(arena.ptr, arena.ptr + arena.nbytes)] if arena.nbytes else []
+        for b in self._doc["buffers"]:
+            if b["role"] in ("input", "weight", "inout", "output"):
+                dtype, shape = rt.shapes[b["name"]]
+                ranges.append((bases[b["name"]], bases[b["name"]] + math.prod(shape) * _plan.ITEMSIZE[dtype]))
+        for spec, tensor in taps.items():
+            if isinstance(spec, str):
+                name, after = spec, None
+            elif isinstance(spec, tuple) and len(spec) == 2:
+                name, after = spec
             else:
-                launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
-                be.launch(st.loaded, st.bound.grid, launch_args, stream)
+                name, after = None, None
+            buffer = name if isinstance(name, str) and name in self._buffers else _plan.output_buffer(self._doc, name)
+            if buffer is None or self._buffers[buffer]["role"] == "workspace":
+                raise TilefishRuntimeError(
+                    f"taps= names {spec!r}: a tap is a buffer of the plan of graph '{self.plan.name}' (not the workspace), or (buffer, step); its buffers are "
+                    f"{', '.join(b['name'] for b in self._doc['buffers'] if b['role'] != 'workspace')}"
+                )
+            if after is None:
+                writers = [i for i, st in enumerate(rt.steps) if buffer in self._written(st)]
+                if not writers:
+                    raise TilefishRuntimeError(f"taps= names '{buffer}', which no step writes: give the step to copy it after, ({buffer!r}, step)")
+                after = writers[-1]
+            if isinstance(after, bool) or not isinstance(after, int) or not 0 <= after < n_steps:
+                raise TilefishRuntimeError(f"taps= {spec!r}: the step is an index of the {n_steps} steps of the bucket, got {after!r}")
+            dtype, shape = rt.shapes[buffer]
+            self._check_output(f"taps[{spec!r}]", tensor, dtype, shape, index)
+            nbytes = math.prod(shape) * _plan.ITEMSIZE[dtype]
+            dst = int(tensor.data_ptr())
+            for lo, hi in ranges:
+                if dst < hi and lo < dst + nbytes:
+                    raise TilefishPreconditionError(f"the tensor of taps[{spec!r}] overlaps a tensor of the call or the plan's arena", kind="alias", arg=buffer)
+            ranges.append((dst, dst + nbytes))
+            out.append(_Tap(buffer, after, tensor, dst, nbytes))
+        return sorted(out, key=lambda t: t.after)
 
     def _check_one_stream_per_capture(self, arena: _Arena, stream: int) -> None:
         """Refuse a second run of this arena in one ``torch.cuda.graph`` capture on another stream than the first (under the arena's lock, before
@@ -884,7 +1000,7 @@ class PlanRunner:
             )
         arena.captured = (capture, stream)
 
-    def capture(self, externals: "tuple[Any, ...]", devscalars: "Mapping[str, Any]", outputs: Any, stream: Any) -> "CapturedPlan":
+    def capture(self, externals: "tuple[Any, ...]", devscalars: "Mapping[str, Any]", outputs: Any, stream: Any, taps: Any = None) -> "CapturedPlan":
         """:func:`capture` of this runner's plan (see there)."""
         be = self.backend
         sig = self.plan.graph.signature
@@ -915,23 +1031,121 @@ class PlanRunner:
                     "tilefish.capture makes a CUDA graph of its own and is called outside a capture (the current stream is capturing one): to capture a plan in a "
                     "graph of yours, call tilefish.run inside torch.cuda.graph (see the docs for how its replays are ordered)"
                 )
-            call = self._call(bound, outputs, slots_in_graph=False)
+            call = self._call(bound, outputs, slots_in_graph=False, taps=taps)
             arena = call.arena
             epoch = _epoch[0]
             with arena.lock, be.scope(index):  # no other run of the plan is enqueued while the graph is captured
                 graph = be.capture_graph(index, stream, lambda s: self._enqueue(call, s, index, slots=False))
-        held = tuple(bound.call.tensors.values()) + tuple(call.results)
+        held = tuple(bound.call.tensors.values()) + tuple(call.results) + tuple(t.tensor for t in call.taps)
         return CapturedPlan(self, graph, call, index, epoch, held)
 
     def _given_outputs(self, outputs: Any, names: "Sequence[str]") -> "list[Any] | None":
         if outputs is None:
             return None
+        if isinstance(outputs, Mapping):  # by name: the graph's names of its returned values, or out0, out1, ... (_plan.output_buffer)
+            by_buffer: "dict[str, Any]" = {}
+            for key, t in outputs.items():
+                buffer = _plan.output_buffer(self._doc, key)
+                if buffer is None:
+                    raise TilefishPreconditionError(
+                        f"outputs= names {key!r}, which is not a returned value of graph '{self.plan.name}' (they are {', '.join(names)}, or out0, out1, ... "
+                        "in the order they are returned)",
+                        kind="shape",
+                    )
+                if buffer in by_buffer:
+                    raise TilefishPreconditionError(f"outputs= gives the returned value '{buffer}' twice", kind="shape", arg=buffer)
+                by_buffer[buffer] = t
+            missing = [n for n in names if n not in by_buffer]
+            if missing:
+                raise TilefishPreconditionError(f"outputs= must give every returned value of graph '{self.plan.name}'; {', '.join(missing)} is missing", kind="shape")
+            return [by_buffer[n] for n in names]
         items = [outputs] if not isinstance(outputs, (tuple, list)) else list(outputs)
         if len(items) != len(names):
             raise TilefishPreconditionError(
                 f"outputs= must give the {len(names)} returned value(s) of graph '{self.plan.name}' ({', '.join(names)}), got {len(items)}", kind="shape"
             )
         return items
+
+    def run_step(self, step: Any, buffers: Any, bucket: "Mapping[str, int] | None" = None) -> None:
+        """:func:`run_step` of this runner's plan (see there)."""
+        be = self.backend
+        doc = self._doc
+        if not isinstance(buffers, Mapping):
+            raise TilefishRuntimeError(f"run_step: buffers= maps the name of every buffer the step binds to its tensor, got {buffers!r}")
+        n_steps = len(doc["buckets"][0]["steps"])
+        if isinstance(step, bool) or not isinstance(step, int) or not 0 <= step < n_steps:
+            raise TilefishRuntimeError(f"run_step: the step is an index of the {n_steps} steps of the plan of graph '{self.plan.name}', got {step!r}")
+        given: "dict[str, Any]" = {}
+        for key, t in buffers.items():
+            name = key if isinstance(key, str) and key in self._buffers else _plan.output_buffer(doc, key)
+            if name is None or self._buffers[name]["role"] == "workspace":
+                raise TilefishRuntimeError(f"run_step: {key!r} is not a buffer of the plan of graph '{self.plan.name}' (the workspace is the plan's own)")
+            if name in given:
+                raise TilefishRuntimeError(f"run_step: the buffer '{name}' is given twice")
+            given[name] = t
+        infos = {n: tensor_info(n, t) for n, t in given.items()}
+        if bucket is None:  # the one bucket whose shapes are the tensors' (a devscalar of one element fits any)
+            fits = []
+            for b in doc["buckets"]:
+                shapes = _plan.buffer_shapes(doc, b["values"])
+                if all(shapes[n][1] == infos[n].shape or (not shapes[n][1] and math.prod(infos[n].shape) == 1) for n in given):
+                    fits.append(b["values"])
+            if len(fits) != 1:
+                raise TilefishPreconditionError(
+                    f"run_step: the shapes of the tensors given fit {len(fits)} buckets of the plan of graph '{self.plan.name}' "
+                    f"({', '.join(map(str, fits[:8])) or 'none'}): give bucket=",
+                    kind="bucket",
+                )
+            values = dict(fits[0])
+        else:
+            values = dict(bucket)
+            if not any(b["values"] == values for b in doc["buckets"]):
+                raise TilefishPreconditionError(f"run_step: {values} is not a bucket of the plan of graph '{self.plan.name}'", kind="bucket")
+        st_doc = next(b["steps"] for b in doc["buckets"] if b["values"] == values)[step]
+        needed = [a["binding"] for a in st_doc["args"]]
+        missing, extra = [n for n in needed if n not in given], sorted(set(given) - set(needed))
+        if missing or extra:
+            raise TilefishRuntimeError(
+                f"run_step: step #{step} of graph '{self.plan.name}' binds the buffers {sorted(set(needed))}"
+                + (f"; {', '.join(dict.fromkeys(missing))} missing" if missing else "")
+                + (f"; {', '.join(extra)} not bound by it" if extra else "")
+            )
+        device = runtime._device_of(infos, given)
+        if getattr(device, "type", None) != "cuda":
+            raise TilefishRuntimeError(f"run_step runs on a CUDA device; the tensors are on {device}")
+        index = be.device_index(device)
+        arch = self.plan.arch
+        if arch is not None and arch != f"sm_{be.capability(index)}":
+            raise TilefishRuntimeError(f"the plan of graph '{self.plan.name}' was built for {arch}, but device {index} is sm_{be.capability(index)}")
+        with _gate.shared():
+            if be.capturing(index):
+                raise TilefishRuntimeError("run_step is not captured: run the step outside a CUDA graph capture")
+            rt = self._bucket(values, index)
+            arena = self._arena(index)
+            st = rt.steps[step]
+            bases: "dict[str, int]" = {}
+            ranges = []
+            for name, t in given.items():
+                dtype, shape = rt.shapes[name]
+                info = infos[name]
+                if self._buffers[name]["role"] == "devscalar" and math.prod(info.shape) == 1 and info.dtype == TORCH_DTYPE_NAMES[dtype]:
+                    shape = tuple(info.shape)  # a device scalar is a tensor of one element
+                self._check_output(f"buffers[{name!r}]", t, dtype, shape, index)
+                bases[name] = int(info.ptr)
+                ranges.append((name, bases[name], bases[name] + math.prod(shape) * _plan.ITEMSIZE[dtype]))
+            if st.workspace is not None:
+                bases[st.workspace] = arena.ptr + self._buffers[st.workspace]["offset"]
+            written = self._written(st)
+            for name, lo, hi in ranges:
+                if arena.nbytes and lo < arena.ptr + arena.nbytes and arena.ptr < hi:
+                    raise TilefishPreconditionError(f"run_step: the tensor of '{name}' overlaps the arena of the plan", kind="alias", arg=name)
+                for other, olo, ohi in ranges:
+                    if other != name and (name in written or other in written) and lo < ohi and olo < hi:
+                        raise TilefishPreconditionError(f"run_step: the tensors of '{name}' and '{other}' overlap, and the step writes one", kind="alias", arg=name)
+            real = st.bound.check(bases)  # every precondition of the step with the caller's addresses
+            with arena.lock, be.scope(index):
+                stream = be.stream(index)
+                _ordered(be, arena, stream, False, lambda: self._enqueue_step(st, real, bases, stream, index))
 
     def _check_output(self, name: str, t: Any, dtype: str, shape: "tuple[int, ...]", index: int) -> None:
         info = tensor_info(f"outputs[{name}]", t)
@@ -1153,11 +1367,12 @@ def run_graph(
     pin: "str | None" = None,
     trust_directory: bool = False,
     outputs: Any = None,
+    taps: Any = None,
 ) -> Any:
     """``tilefish.run`` of a graph (see :func:`tilefish.run`)."""
     if mode == "reference":
-        if plan is not None or outputs is not None:
-            raise TilefishRuntimeError("plan= and outputs= are for jit and replay of a graph; reference mode evaluates the ops in torch and returns fresh tensors")
+        if plan is not None or outputs is not None or taps is not None:
+            raise TilefishRuntimeError("plan=, outputs= and taps= are for jit and replay of a graph; reference mode evaluates the ops in torch and returns fresh tensors")
         return reference_run(graph, args, kwargs)
     if mode == "jit":
         if isinstance(plan, Plan):
@@ -1168,8 +1383,8 @@ def run_graph(
             p = _default_plan(graph)
         else:
             raise TilefishRuntimeError("jit takes plan=<a Plan made by tilefish.plan(graph, ...)> or none; a directory is for mode='replay'")
-        return _jit_runner(p).run(args, kwargs, outputs)
-    return _replay_runner(graph, _plan_directory(plan), pin, trust_directory).run(args, kwargs, outputs)
+        return _jit_runner(p).run(args, kwargs, outputs, taps)
+    return _replay_runner(graph, _plan_directory(plan), pin, trust_directory).run(args, kwargs, outputs, taps)
 
 
 def capture(
@@ -1183,6 +1398,7 @@ def capture(
     devscalars: "Mapping[str, Any] | None" = None,
     outputs: Any = None,
     stream: Any = None,
+    taps: Any = None,
 ) -> CapturedPlan:
     """:func:`tilefish.capture`: the plan of ``graph`` (``jit`` or ``replay``, chosen as by :func:`tilefish.run`) captured in a CUDA graph of its own for the
     externals given, as a :class:`CapturedPlan` whose :meth:`~CapturedPlan.replay` is ordered with every other run of the plan.
@@ -1210,7 +1426,7 @@ def capture(
         if trust_directory is not True and trust_directory is not False:
             raise TilefishRuntimeError(f"trust_directory= is True or False, got {trust_directory!r}")
         runner = _replay_runner(graph, _plan_directory(plan), pin, trust_directory)
-    return runner.capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream)
+    return runner.capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream, taps)
 
 
 def _plan_directory(plan: Any) -> Any:
@@ -1249,6 +1465,36 @@ def prepare(
     torch = runtime._torch()
     index = torch.cuda.current_device() if device is None else runner.backend.device_index(device)
     runner.prepare(index, buckets)
+
+
+def run_step(
+    graph: GraphOp,
+    step: int,
+    buffers: "Mapping[str, Any]",
+    *,
+    mode: str = "jit",
+    plan: Any = None,
+    pin: "str | None" = None,
+    trust_directory: bool = False,
+    bucket: "Mapping[str, int] | None" = None,
+) -> None:
+    """Launch one step of the plan of ``graph`` on the caller's tensors: the binary the plan's manifest has for the step's entry (``replay``: the plan
+    verified against ``pin``, which pins that manifest, or ``trust_directory=True``; ``jit``: built in memory) and the binding the plan says (each
+    argument the buffer and the view the step names), with every check of the step made with the caller's addresses before the launch.
+
+    ``buffers`` maps the name of every buffer the step binds (a returned value also as ``out<i>``; not the workspace: a GEMM's is the plan's arena) to a
+    tensor of the buffer's dtype and its shape at the bucket, contiguous (a device scalar: a tensor of one element). ``bucket`` is the bucket
+    combination, found from the shapes when exactly one fits them. The launch is on torch's current stream, ordered with the runs of the plan
+    (the arena's order event). What it is for: one op of an exported plan replayed on the inputs of a reference, under the pin the product uses."""
+    if mode not in ("jit", "replay"):
+        raise TilefishRuntimeError(f"run_step: mode is 'jit' or 'replay', got {mode!r}")
+    if mode == "jit":
+        if pin is not None or trust_directory:
+            raise TilefishRuntimeError("pin= and trust_directory= are for mode='replay' (they vouch for a plan directory); mode 'jit' runs no plan directory")
+        runner = _jit_runner(plan if isinstance(plan, Plan) else _default_plan(graph))
+    else:
+        runner = _replay_runner(graph, _plan_directory(plan), pin, trust_directory)
+    runner.run_step(step, buffers, bucket)
 
 
 # -- export --------------------------------------------------------------------------------------------------------------------------------
@@ -1398,6 +1644,16 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
     with torch.no_grad():
         for index, n in enumerate(g.nodes):
             kind = n.attrs.get("kind")
+            if kind is None and n.op == "copy":  # a new tensor of its own
+                env[n.outputs[0]] = env[n.inputs[0]].contiguous().clone()  # type: ignore[index]
+                continue
+            if kind is None and n.op == "store":  # `param[...] = value` into an InOut parameter: the caller's tensor gets the value
+                target = env[n.inputs[0]]  # type: ignore[index]
+                if n.inputs[1] is not n.inputs[0]:
+                    target.copy_(env[n.inputs[1]])  # type: ignore[index]
+                for o in n.outputs:
+                    env[o] = target
+                continue
             if kind is None:
                 x = env[n.inputs[0]] if n.inputs else None  # type: ignore[index]  (iota reads no input)
                 if n.op == "reshape":

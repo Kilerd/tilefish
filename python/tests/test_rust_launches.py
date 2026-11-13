@@ -46,7 +46,7 @@ def test_every_kind_of_refusal_a_host_makes_is_in_the_vectors(made):
         "static_size",
         "stride",
     }
-    assert binaries == 27 and len(records) > 900 and kinds["accepted"] > 200
+    assert binaries == 28 and len(records) > 900 and kinds["accepted"] > 200
     # what is accepted has the grid and the parameters of a launch: the pointers, scalars and fixed arguments of the ABI, then (for a Triton
     # kernel only) the two null scratch slots
     for r in records:

@@ -451,6 +451,8 @@ LAUNCH_CASES = [
     # M3.3: a dimension only the Out tensor determines (a [B] mask from a device scalar): the inputs, then the Out tensors the call is given
     ("key_mask", lambda b: [("i32", ()), ("bf16", (b,))], (8, 24)),
     ("key_mask_any", lambda b: [("i32", (1,)), ("bf16", (b,))], (1, 1000)),
+    # M3.3: an Out that may be written over an input (MayAlias): the inputs, then the Out tensors the call is given (r_out apart from r)
+    ("add_into", lambda r: [("f32", (r, 64))] * 4, (8, 24)),
 ]
 _OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16", "i32": "i64"}
 I31 = (1 << 31) - 1
@@ -529,6 +531,29 @@ def _shared_strides(key, base):
     # the same strides on all three: separate dense tensors, a wider fused tensor, a broadcast first axis
     for strides in ((256, 64, 1), (1536, 64, 1), (0, 64, 1), (768, 64, 1)):
         yield [0, 1, 2], (base[0][0], base[0][1], None, strides)
+
+
+GIVEN_OUTS = ("add_into",)  # the ops whose calls are given their Out tensors (outputs=), besides those whose Out tensors bind a dimension
+
+
+def _aliased(key, base):
+    """Calls of ``add_into(x, r, y, r_out)``, whose ``r_out`` may be written over ``r`` (``MayAlias``): ``(indices, the call's tensors)`` with
+    ``r_out`` exactly ``r`` (accepted), ``r`` shifted by a row, by a byte or as a view of another shape (refused), ``y`` over ``r``, ``r_out`` over
+    ``x`` (refused: no declaration says they may)."""
+    if key != "add_into":
+        return
+    x, r, y, _ = base
+    dtype, shape, ptr, _ = r
+    for label, new in (
+        ("exactly r", r),
+        ("r shifted by a row", (dtype, shape, ptr + 64 * 4, None)),
+        ("r shifted by 16 bytes", (dtype, shape, ptr + 16, None)),
+        ("r with one row less", (dtype, (shape[0] - 1, 64), ptr, None)),
+        ("x", x),
+    ):
+        yield [3], [x, r, y, new]
+    yield [2], [x, r, r, base[3]]
+    yield [2, 3], [x, r, r, r]
 
 
 def _output_bound(key, base):
@@ -629,7 +654,7 @@ def launches():
         _, inputs, outputs = abi_of(op)
         # an op with a dimension only its Out tensors determine is called with them (`outputs=`), after its inputs: every change of a call is a
         # change of one of them too
-        given_outs = bool(_target(op).public.output_dims)
+        given_outs = bool(_target(op).public.output_dims) or key in GIVEN_OUTS
         names = inputs + outputs if given_outs else inputs
         n_in = len(inputs)
 
@@ -664,6 +689,11 @@ def launches():
                 call = list(base)
                 for j in which:
                     call[j] = (dtype, shape, base[j][2] if ptr is None else ptr, strides)
+                calls.append(call)
+            for which, new in _aliased(key, base):
+                call = list(base)
+                for j in which:
+                    call[j] = new[j]
                 calls.append(call)
             for j, new in _output_bound(key, base):
                 calls.append([*base[:j], new, *base[j + 1 :]])

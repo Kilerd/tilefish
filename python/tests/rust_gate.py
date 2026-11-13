@@ -27,6 +27,10 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **strides that several views share** (``gpu_kernels_p4.py``): ``o = q + k + v`` over the q, k and v of one fused tensor, read with one stride pair
   (``StrideOf(("q", "k", "v"), axis)``), and over three tensors of their own with the same strides; the plan ``fused_qkv`` binds the three views in one
   step;
+* **an Out that may be written over an input** (``gpu_kernels_p5.py``): ``add_into`` launched with its outputs apart; the plan ``residual_chain``
+  (without and with reuse) writes both of its calls in place, over the residual it made in the arena; the plan ``copy_steps`` has two copy steps
+  (``tilefish.copy`` of a dense view into the arena, a store into an ``InOut`` parameter), launched and captured; the plan ``view_returns`` returns a
+  reshape of a result (the caller's output is its buffer), a dense view of a parameter and the result again (copy steps);
 * **a dimension only an Out tensor determines** (``gpu_kernels_p4.py``): a ``[B]`` mask made from a device scalar, run with ``outputs=`` (which is what
   binds ``B``), bucketed and not; the plan ``mask_rows`` makes it in a step whose ``B`` is the graph's;
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
@@ -84,6 +88,7 @@ SCALES = (0.5, -3.25, 1e-3)
 GEMM_M = (32, 64, 320)
 
 DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32", torch.int32: "i32"}
+TORCH_OF = {v: k for k, v in DTYPES.items()}
 
 
 # -- the inputs of the cases ----------------------------------------------------------------------------------------------------------------------
@@ -272,6 +277,16 @@ def mask_of(b):
     return lambda args: (torch.zeros((b,), dtype=BF16, device="cuda"),)
 
 
+def args_add_into(rows, seed):
+    return randn((rows, 64), F32, seed), randn((rows, 64), F32, seed + 50)
+
+
+def must_add_into(args, got):
+    x, r = args
+    y = got  # the first result (the check of a case sees that one): y = 0.5 * (r + x), which needs r_out = r + x
+    assert same_bytes(y, (r + x) * 0.5)
+
+
 def build_cases():
     cases: "list[Case]" = [
         *plain("softmax", "softmax", args_softmax, ROW_SIZES),
@@ -326,6 +341,8 @@ def build_cases():
             for b in sizes
             for n in (0, 5, b, b + 3)
         ]
+    # -- an Out that may be written over an input (MayAlias): launched apart here; in place in the plan residual_chain
+    cases += plain("add_into", "add_into", args_add_into, (8, 24), seeds=(0, 1), check=must_add_into)
     return cases
 
 
@@ -585,6 +602,21 @@ def plan_graphs():
             for n in (0, 5, rb)
         ]
 
+    import gpu_kernels_p5 as p5
+
+    def copy_cases():
+        return [
+            (f"Rb{rb}-seed{seed}", {"x": randn((2, rb, 64), F32, seed=rb + seed), "state": randn((rb, 64), F32, seed=rb + seed + 9)})
+            for rb in (8, 24)
+            for seed in (0, 1)
+        ]
+
+    def view_cases():
+        return [(f"Rb{rb}-seed{seed}", {"x": randn((2, rb, 64), F32, seed=rb + seed + 30)}) for rb in (8, 24) for seed in (0, 1)]
+
+    def residual_cases():
+        return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 64), F32, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
+
     return [
         ("block", pm.block, False, block_cases),
         ("block-reuse", pm.block, True, block_cases),
@@ -594,7 +626,36 @@ def plan_graphs():
         ("accumulate", pm.accumulate, False, accumulate_cases),
         ("fused_qkv", p4.fused_qkv, False, fused_qkv_cases),  # one step that reads three views with one stride pair
         ("mask_rows", p4.mask_rows, False, mask_rows_cases),  # a step whose B only its Out buffer determines
+        ("residual_chain", p5.residual_chain, False, residual_cases),  # two steps whose Out is written over their input (MayAlias)
+        ("residual_chain-reuse", p5.residual_chain, True, residual_cases),
+        ("copy_steps", p5.copy_steps, False, copy_cases),  # a copy of a dense view into the arena and a store into an InOut parameter
+        ("view_returns", p5.view_returns, False, view_cases),  # a reshape of a result returned (no copy), a dense view of a parameter and a value twice (copies)
     ]
+
+
+TAPPED = ("block-reuse",)  # the plans whose cases also record debug taps (intermediates whose bytes later steps reuse)
+
+
+def record_taps(work, exported, graph, args, params, bucket, case_id):
+    """Python's replay of a case with ``taps=``: every intermediate of the plan after the last step that writes it, and ``t2`` after step 3 (a step given);
+    ``[{"buffer", "after", "dtype", "shape", "expect"}]`` for ``gpu_plan_gate.rs``, which launches the same taps with ``PlanRun::launch_tapped``."""
+    doc = exported.doc
+    specs = [b["name"] for b in doc["buffers"] if b["role"] == "intermediate"] + [("t2", 3)]
+    taps = {}
+    for spec in specs:
+        name = spec if isinstance(spec, str) else spec[0]
+        dtype = next(b["dtype"] for b in doc["buffers"] if b["name"] == name)
+        taps[spec] = torch.full(exported.shape_of(name, **bucket), 7.0, dtype=TORCH_OF[dtype], device="cuda")
+    given = [args[b["name"]].clone() for b in params]
+    tilefish.run(graph, *given, mode="replay", plan=exported.directory, pin=exported.digest, taps=taps)
+    torch.cuda.synchronize()
+    out = []
+    for spec, t in taps.items():
+        name, after = (spec, None) if isinstance(spec, str) else spec
+        path = f"plans/cases/{case_id}/tap-{name}-{after}.expect.bin"
+        (work / path).write_bytes(raw(t))
+        out.append({"buffer": name, "after": after, "dtype": DTYPES[t.dtype], "shape": list(t.shape), "expect": path})
+    return out
 
 
 def prepare_plans(work):
@@ -661,7 +722,10 @@ def prepare_plans(work):
                     if isinstance(d, str) and d in doc["dims"]:
                         dims[d] = int(e)
             bucket = next(bk["values"] for bk in doc["buckets"] if all(bk["values"][k] == v for k, v in dims.items()))
-            cases.append({"id": case_id, "bucket": bucket, "devscalars": values, "externals": externals})
+            record = {"id": case_id, "bucket": bucket, "devscalars": values, "externals": externals}
+            if name in TAPPED:  # debug taps: every intermediate after the last step that writes it, and one after a step given
+                record["taps"] = record_taps(work, exported, graph, args, params, bucket, case_id)
+            cases.append(record)
             total += 1
         plans.append(
             {"name": name, "dir": f"plans/{name}", "digest": exported.digest, "graph": doc["graph"], "reuse": reuse, "arena_bytes": doc["arena_bytes"], "cases": cases}

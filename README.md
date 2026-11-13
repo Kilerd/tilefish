@@ -444,7 +444,33 @@ the plan's arena and its replays are ordered with the runs whose record they see
 of the same plan overlaps that run** (wrong bytes, no error), so order the two yourself or use `tilefish.capture`. `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
 eager composition of the same ops give the same bytes for every bucket and two values of `n`.
 
-A plan launches declared operators and views. Arithmetic traced in the graph body, a `store`, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
+**An `Out` written over its input.** A hand-written kernel `k(x, r, y, r_out)` that reads every element of `r` before it writes the same element of `r_out`
+declares `r_out: Out[Tensor[M, D, f32], MayAlias("r")]`: a launch (Python or Rust) then accepts `r_out` and `r` that are exactly one tensor and refuses any
+other overlap, and a plan writes `r_out` over `r` when nothing reads that `r` after the call (a whole intermediate, no later reader, not returned), with no
+buffer of its own; otherwise the result gets one, so the values are the same either way (manifest schema 3, section 5.4; `docs/plan-schema-1.md`, section 8).
+
+**Copy steps.** `r = tilefish.copy(x)` in a graph is a step of kind `copy`: the dense bytes of `x` (a tensor, or a dense view such as `x[1]`) copied into a
+buffer of its own with `cuMemcpyDtoDAsync`, a memcpy node in a CUDA graph. The copy is an intermediate an in-place call may update, where `x`, the caller's,
+is never written. `state[...] = r` into an `InOut` parameter is a copy step into the caller's tensor. A copy of a view that is not dense is refused when the
+plan is made (`docs/plan-schema-1.md`, section 7.5).
+
+**Returned views.** A graph may return a reshape of a result at no cost (`return y.reshape(M, N)` of a flat `y`: the caller's output is `y`'s buffer, in the
+returned shape, and the step that writes it binds it through a flat view), and any other dense view, a parameter or a value twice, which a copy step after
+the last call puts into the caller's output. A view that is not dense is refused.
+
+**Named outputs.** `@tilefish.graph(outputs=("y", "residual"))` names the returned values: the plan's output buffers have those names (else `out0`,
+`out1`, ...), `tilefish.run(..., outputs={"y": y, "residual": r})` takes them by name, and the Rust host binds them by name; both hosts also take `out<i>` for
+the `i`-th returned value, so a host written for the names of before keeps working.
+
+**Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
+last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest
+unchanged (`plan.shape_of("t3", M=64)` gives the shape; `tilefish.capture` takes `taps=` too; Rust: `PlanRun::launch_tapped`).
+
+**One step alone.** `tilefish.runtime.run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest)` launches one step of the
+plan on your tensors, with the binary and the binding of its arguments that the pinned plan says (Rust: `PlanRun::launch_step`): one op of an exported plan
+replayed on a reference's inputs, under the pin a product uses.
+
+A plan launches declared operators and views. Arithmetic traced in the graph body, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
 tensor was updated in place are refused with the rule that says so; there is no fusion in a plan yet. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation rules, the
 digest) for the host that will run it without Python.
 

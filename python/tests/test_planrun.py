@@ -141,6 +141,9 @@ class FakeBackend(Backend):
     def launch(self, loaded, grid, args, stream):
         self.log.append(("launch", loaded.stem, tuple(grid), tuple(args), stream))
 
+    def copy(self, dst, src, nbytes, stream):
+        self.log.append(("copy", dst, src, nbytes, stream))
+
     def gemm(self, spec, algo, a, b, bias, out, workspace, stream, index):
         self.log.append(("gemm", spec.stem, a, b, bias, out, workspace, stream))
 
@@ -148,7 +151,7 @@ class FakeBackend(Backend):
         self.log.append(("warm", library))
 
     def launches(self):
-        return [e for e in self.log if e[0] in ("launch", "gemm")]
+        return [e for e in self.log if e[0] in ("launch", "gemm", "copy")]
 
 
 class FakeProvider:

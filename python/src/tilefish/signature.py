@@ -62,6 +62,7 @@ class Param:
     strided: bool = False
     align: "int | None" = None
     stride_of: "tuple[tuple[str, int], ...] | None" = None
+    alias: "str | None" = None  # an Out tensor only: the tensor input it may be written over (``Out[..., MayAlias("r")]``)
 
     @property
     def is_callable_arg(self) -> bool:
@@ -81,7 +82,7 @@ class Param:
             if self.access == "inout":
                 ann = f"InOut[{ann}]"
             elif self.access == "out":
-                ann = f"Out[{ann}]"
+                ann = f"Out[{ann}" + (f", MayAlias({self.alias!r})" if self.alias is not None else "") + "]"
         elif self.kind == "dim":
             ann = f"{self.dim}" if self.stride_of is None else repr(stride_annotation(self.stride_of))
         else:
@@ -217,12 +218,14 @@ def parse_signature(
     allow_strided: bool = False,
     allow_devscalar: bool = True,
     allow_output_dims: bool = False,
+    allow_alias: bool = False,
 ) -> Signature:
     """Read ``fn``'s annotations into a :class:`Signature`.
 
     ``allow_strided`` lets a tensor parameter be ``Strided[...]`` and a scalar parameter ``StrideOf(...)`` (an extern op does;
     see :class:`~tilefish.types.Strided`). ``allow_output_dims`` lets the shape of an ``Out`` parameter mention a dimension that no input
-    determines (an extern op does: :attr:`Signature.output_dims`).
+    determines (an extern op does: :attr:`Signature.output_dims`). ``allow_alias`` lets an ``Out`` name the input it may be written over
+    (``Out[..., MayAlias("r")]``, an extern op: :class:`~tilefish.types.MayAlias`).
     """
     where = f"{what} '{name}'"
     sig = inspect.signature(fn)
@@ -259,7 +262,12 @@ def parse_signature(
             param = Param(pname, index, "dim", dim=Dim(pname, divisible_by=ann.divisible_by), keyword_only=kw, stride_of=ann.targets)
         elif isinstance(ann, Marked):
             _require_contiguous(where, what, f"parameter '{pname}'", ann.type)
-            param = Param(pname, index, "tensor", ann.mode, type=ann.type, keyword_only=kw)
+            if ann.alias is not None and not allow_alias:
+                raise TilefishDeclarationError(
+                    f"{where}: parameter '{pname}' is {ann!r}, which only an extern op can declare (the promise of a hand-written kernel that it reads "
+                    "an element before it writes it)"
+                )
+            param = Param(pname, index, "tensor", ann.mode, type=ann.type, keyword_only=kw, alias=ann.alias)
         elif ann is const or isinstance(ann, ConstType):
             dtype = None if ann is const else ann.dtype
             default = (
@@ -287,6 +295,7 @@ def parse_signature(
             raise TilefishDeclarationError(f"{where}: tensor parameter '{pname}' cannot have a default")
         params.append(param)
     params = _resolve_strides(where, params)
+    _check_aliases(where, params)
 
     ret_ann = _resolve(sig.return_annotation, fn, where)
     returns: tuple[TensorType, ...]
@@ -317,6 +326,33 @@ def require_storable(where: str, label: str, t: TensorType) -> None:
             f"{where}: {label} is {t!r}, a mask: a mask is a value inside a kernel body and has no storage type here. Store it as a "
             "number with .to(u8) (0 or 1) and read it back with a comparison (m != 0)"
         )
+
+
+def _check_aliases(where: str, params: "Sequence[Param]") -> None:
+    """``Out[..., MayAlias("r")]``: ``r`` is a tensor input of the op (not ``Strided``, not a ``DevScalar``) with the dtype and the declared shape of the
+    ``Out``, and no other ``Out`` names it (two results written over one input would be two writes of one element)."""
+    by_name = {p.name: p for p in params}
+    taken: "dict[str, str]" = {}
+    for p in params:
+        if p.alias is None:
+            continue
+        target = by_name.get(p.alias)
+        if target is None or target.kind != "tensor" or target.access != "in":
+            raise TilefishDeclarationError(f"{where}: the Out '{p.name}' may alias '{p.alias}', which is not a tensor input of this op")
+        if target.strided or target.is_devscalar:
+            raise TilefishDeclarationError(
+                f"{where}: the Out '{p.name}' may alias '{p.alias}', which is {'a strided view' if target.strided else 'a DevScalar'}: an Out written over "
+                "an input is that whole, contiguous tensor"
+            )
+        assert p.type is not None and target.type is not None
+        if p.type.dtype != target.type.dtype or tuple(p.type.shape) != tuple(target.type.shape):
+            raise TilefishDeclarationError(
+                f"{where}: the Out '{p.name}' ({p.type}) may alias '{p.alias}' ({target.type}), which has another dtype or shape: an Out written over an "
+                "input has its dtype and its declared shape"
+            )
+        if p.alias in taken:
+            raise TilefishDeclarationError(f"{where}: the Outs '{taken[p.alias]}' and '{p.name}' both may alias '{p.alias}': at most one Out is written over an input")
+        taken[p.alias] = p.name
 
 
 def _require_contiguous(where: str, what: str, label: str, t: TensorType) -> None:

@@ -77,6 +77,8 @@ struct TensorPlan {
     strides: Option<Vec<StridePlan>>,
     /// The alignment the pointer passed must have (16 bytes, or for a strided pointer promised only its element's alignment, that).
     alignment: u64,
+    /// An `out` pointer that may be written over an input (`alias`): the index of that input, which it may be exactly (not overlap otherwise).
+    alias: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,7 +247,7 @@ impl Plan {
         let mut slots = Vec::new();
         for p in source.params {
             match &p.kind {
-                ParamKind::Pointer { dtype_name, dtype, access, shape, view } => {
+                ParamKind::Pointer { dtype_name, dtype, access, shape, view, .. } => {
                     let Some(dtype) = *dtype else {
                         return Err(Error::Unsupported(format!(
                             "{who}: parameter '{}' has dtype {dtype_name}, which has no storage type here (packed formats cannot be run yet)",
@@ -292,6 +294,7 @@ impl Plan {
                         shape: patterns,
                         strides,
                         alignment: 16,
+                        alias: None,
                     });
                 }
                 ParamKind::Scalar { ty, dim, .. } => {
@@ -300,6 +303,14 @@ impl Plan {
                     scalars.push(ScalarPlan { name: p.name.clone(), ty: *ty, dim, count_of: None });
                 }
                 ParamKind::Fixed { value } => slots.push(Slot::Fixed(value.bits())),
+            }
+        }
+        for p in source.params {
+            if let ParamKind::Pointer { alias: Some(target), .. } = &p.kind
+                && let (Some(w), Some(t)) =
+                    (tensors.iter().position(|t| t.name == p.name), tensors.iter().position(|t| t.name == *target))
+            {
+                tensors[w].alias = Some(t);
             }
         }
         for p in source.params {
@@ -809,6 +820,21 @@ impl Plan {
             for (o, to) in self.tensors.iter().enumerate().filter(|(o, _)| *o != w) {
                 let (b_start, b_end) = extent(&tensors[o]);
                 if a_start < b_end && b_start < a_end {
+                    if tw.alias == Some(o) {
+                        // an Out that may be written over this input (`alias`): exactly that tensor, or refused
+                        if same_tensor(&tensors[w], &tensors[o]) {
+                            continue;
+                        }
+                        return Err(Error::precondition(
+                            PreconditionKind::Alias,
+                            Some(&tw.name),
+                            format!(
+                                "argument '{}' may be written over '{}' (MayAlias), but only as exactly that tensor (one address, shape and \
+                                 strides): it overlaps it otherwise",
+                                tw.name, to.name
+                            ),
+                        ));
+                    }
                     return Err(Error::precondition(
                         PreconditionKind::Alias,
                         Some(&tw.name),
@@ -1057,6 +1083,14 @@ fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
         expected = expected.saturating_mul(*n as u128);
     }
     true
+}
+
+/// Whether two arguments are exactly one tensor: one address, one dtype, one shape and the same canonical strides (Python's `same_tensor`).
+fn same_tensor(a: &TensorArg<'_>, b: &TensorArg<'_>) -> bool {
+    a.ptr == b.ptr
+        && a.dtype == b.dtype
+        && a.shape == b.shape
+        && canonical_strides(a.shape, a.strides) == canonical_strides(b.shape, b.strides)
 }
 
 /// The bytes a tensor covers, `[start, end)`: the elements it reaches (a dense tensor's, a view's extent) from its first one.

@@ -57,7 +57,7 @@ sha256( b"tilefish.manifest-digest.v3\0" + canonical_json({"schema": 3, "kernels
 * `canonical_json` is exactly schema 2's: object keys sorted, separators `","` and `":"`, no whitespace, non-ASCII escaped (`ensure_ascii`), no
   `NaN`/`Infinity`, floats in Python's shortest round-trip `repr` (`2.0`, `1e-06`).
 * **Every new field is digested, with no exception and no special treatment:** an entry is digested whole, so `kind`, `abi.scratch_slots`,
-  `strides`, `offset`, `stride_of`, a `fixed` argument and its `value`, `binary`, the `max_extent` precondition, the `dims` additions, every field
+  `strides`, `offset`, `stride_of`, `alias`, a `fixed` argument and its `value`, `binary`, the `max_extent` precondition, the `dims` additions, every field
   of a `library` entry (the algorithm, the cuBLASLt version, the SM count of the device, the workspace) are all in it. The top-level `tilefish` is the only field outside it.
 * The digest of the empty schema 3 manifest, `{"schema":3,"kernels":[],"library":[]}`, is
   `f66955caeb4e878dbe95483da2607d19ea4f734977e86282fff6f92f1a87fe6e` (a test vector; `test_manifest_schema3.py` recomputes it from the definition
@@ -115,7 +115,7 @@ Every `params` entry has `slot`, `index` (the position in the declaration), `nam
 
 | `kind` | `type` | `ptx_type`, `size` | other fields |
 |---|---|---|---|
-| `pointer` | `*bf16`, `*fp32`, `*i32`, ... (Triton's pointer type of the dtype) | `u64`, 8 | `dtype`, `access` (`in`/`out`/`inout`), `shape`; optional `strides` and `offset` (together) |
+| `pointer` | `*bf16`, `*fp32`, `*i32`, ... (Triton's pointer type of the dtype) | `u64`, 8 | `dtype`, `access` (`in`/`out`/`inout`), `shape`; optional `strides` and `offset` (together); on an `out` pointer, optionally `alias` (section 5.4) |
 | `scalar` | `i32` or `i64` | `u32`/4 or `u64`/8 | `dim` (an expression); optionally one of `count_of` or `stride_of` |
 | `fixed` (prebuilt binaries only) | `i32`, `i64` or `f32` | `u32`/4, `u64`/8, `f32`/4 | `value` |
 
@@ -186,6 +186,25 @@ A `fixed` argument is a scalar whose value is in the manifest: a prebuilt binary
 a Triton scratch slot written out as an explicit parameter). It has `value` and no `dim`. `value` is a JSON integer for `i32`/`i64` (not a bool, in
 range of the type) and a JSON number **with a fraction or exponent** (`2.0`) for `f32`; a non-finite `f32` is the tagged object
 `{"float": "inf" | "-inf" | "nan"}` (as a constexpr value is in schema 2). A caller of the operator may restate the value but not change it.
+
+### 5.4 An `out` pointer that may be written over an input: `alias`
+
+`"alias": "<name>"` on a pointer says that the kernel may be launched with this pointer and the pointer `<name>` as **exactly one tensor**: an
+in-place kernel with two pointers, such as `k(x, r, y, r_out)` that reads every element of `r` before it writes the same element of `r_out` (Python:
+`r_out: Out[Tensor[R, 64, f32], MayAlias("r")]`, which only `@tilefish.extern` declares: it is the hand-written kernel's promise). The rules, which
+both readers check:
+
+* `alias` is a string, on a `pointer` whose `access` is `out` (a `scalar`, a `fixed` argument and any other pointer have none);
+* it names a `pointer` of the same ABI whose `access` is `in`, that has no `strides` (a whole tensor) and a non-empty `shape` (not a device scalar),
+  with the same `dtype` and the same declared `shape` (the same list, entry for entry);
+* at most one pointer names a given input.
+
+**What a host does.** The no-alias rule of a launch (section 5.1: a tensor that is written must not overlap any other argument) has one exception:
+the `out` pointer and the `in` pointer it names may be the same tensor, **one address, one shape and the same canonical strides** (Python:
+`_launch.same_tensor`; Rust: `plan.rs`). Any other overlap of the two (a shifted view, another shape) is refused with the kind `alias`, as is any
+overlap of either with a third argument. A pointer without `alias` is what it always was, so a manifest without it, and its digest, are unchanged;
+a reader that predates it (the published crate 0.0.2, tilefish 0.0.4) refuses a manifest that has one (an unknown field). The declaration digest of
+the operator has it (`"alias"` on the parameter), only when present.
 
 ## 6. Preconditions
 
@@ -433,11 +452,11 @@ document tilefish writes next to a build and the host does not read):
   that is not `op` and `.<dim><value>` for each of `buckets`, in order (`rowop.S32`); a `declaration_digest` that is not 64 lowercase hex digits (`null`
   included); a parameter with a field no parameter has, without `slot`, `index`, `name`, `kind`, `type`, `ptx_type`, `size`, or at another `slot` than
   its position, and the fields of each kind (`read_params`): a `pointer` whose `type` is not the pointer type of its `dtype`, whose `access` is not
-  `in`/`inout`/`out`, that has `dim`, `count_of`, `stride_of` or `value`, is not a `u64` of 8 bytes, or has no `shape` (axes: an int ≥ 1 or an
+  `in`/`inout`/`out`, that has `dim`, `count_of`, `stride_of` or `value`, or an `alias` that is not a string or is on an access other than `out`, is not a `u64` of 8 bytes, or has no `shape` (axes: an int ≥ 1 or an
   expression), or has `strides` and `offset` not together, on an access other than `in`, not one per axis of its shape (a name, or the fixed `1` on
-  the last axis only), or an `offset` that is not a name; a `scalar` that has `dtype`, `access`, `shape`, `strides`, `offset` or `value`, no `dim`, both
+  the last axis only), or an `offset` that is not a name; a `scalar` that has `dtype`, `access`, `shape`, `strides`, `offset`, `value` or `alias`, no `dim`, both
   `count_of` and `stride_of`, or another width than `u32`/4 or `u64`/8; a `fixed` argument on a Triton kernel, or with a `dim`, `count_of`,
-  `stride_of`, `access`, `shape`, `strides`, `offset` or `dtype`, or without a `value` of its type (a JSON `null` is as absent, in each); an
+  `stride_of`, `access`, `shape`, `strides`, `offset`, `dtype` or `alias`, or without a `value` of its type (a JSON `null` is as absent, in each); an
   expression outside the grammar, a name that `dims` does not have, more than 32 names, a static grid entry or divisor below 1 (section 7.1).
 * the ABI as a whole (a host that reads without a spec checks these itself; Python checks them by comparing the entry with the compile spec, and
   `_specvalid` checks them in the spec): `params` kinds in `pointer`/`scalar`/`fixed`; a `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
@@ -445,7 +464,8 @@ document tilefish writes next to a build and the host does not read):
   `stride_of` scalar carries, or two scalars for one axis; an `offset` that is not a string; a `stride_of` list of fewer than two objects or with an
   `(arg, axis)` pair twice; a `stride_of` object with a missing/extra key, a negative axis, an
   axis out of range, a target that is not a strided pointer, a `dim` different from the target's `strides` entry, or together with `count_of`; a `fixed`
-  argument with a type not in `i32`/`i64`/`f32`, an `f32` value that is not a float, an integer type with a non-integer, a bool, or an out-of-range value.
+  argument with a type not in `i32`/`i64`/`f32`, an `f32` value that is not a float, an integer type with a non-integer, a bool, or an out-of-range value;
+  an `alias` (section 5.4) that names no `in` pointer, a strided one or a device scalar, one of another `dtype` or declared `shape`, or an input another `out` pointer names.
 * preconditions: `max_extent` more than once on a pointer (a kernel with `index_bits=64` has none, so it is not required), with a value other than `2147483647`, or on a pointer without `strides`;
   `max_elements` on a pointer with `strides`; `pointer_alignment` of a strided pointer other than 16 or its element size (of any other pointer other
   than 16); every pointer must have exactly one `pointer_alignment`.
@@ -537,6 +557,7 @@ stride scalars and `fixed` arguments are not parameters) and for each library en
 | strided pointers, `strides`/`offset`/`stride_of`, `max_extent`, alignment | `test_strided_specs.py`, `test_views.py`; on a GPU `test_gpu_strided.py` |
 | a stride that several views share (`stride_of` a list) | `test_shared_strides.py`, `test_rust_host_schema3.py`; on a GPU `test_gpu_shared_strides.py` |
 | a dimension only an `out` tensor determines (section 7) | `test_output_dims.py`; on a GPU `test_gpu_output_dims.py` |
+| an `out` pointer that may be written over an input (`alias`, section 5.4) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
 | device scalars | `test_devscalar.py`; on a GPU `test_gpu_devscalar.py` |
 | prebuilt PTX and cubin, byte identity with the Triton path | `test_binary_externs.py`; on a GPU `test_gpu_binary.py`, `ptx/*.ptx` |
 | the `library` section | `test_library_ops.py`, `test_cublaslt.py`; on a GPU `test_gpu_gemm.py`, `test_gpu_cublaslt.py` |

@@ -66,13 +66,14 @@ from ._manifest import Manifest
 from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
+from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in __all__, `from tilefish import *` must not shadow the module copy
 from .ops import argmax, argmin, cos, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sin, sqrt, where
 from ._copyops import contiguous, im2col
 from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
 from .trace import Const, Value
-from .types import DevScalar, InOut, Out, StrideOf, Strided, Tensor, TensorType, const
+from .types import DevScalar, InOut, MayAlias, Out, StrideOf, Strided, Tensor, TensorType, const
 
 __version__ = "0.0.4"
 
@@ -101,6 +102,7 @@ __all__ = [
     "LibraryOp",
     "LoweredKernel",
     "Manifest",
+    "MayAlias",
     "Node",
     "Op",
     "Out",

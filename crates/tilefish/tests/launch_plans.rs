@@ -102,6 +102,42 @@ fn the_golden_plans_load_with_their_pins_and_give_every_number_python_has() {
     }
 }
 
+/// The golden plan `steps` (`plan_model.steps`): a copy of a dense view into the arena, a step whose `r_out` is written over its `r` (one buffer for
+/// both), a copy into the caller's `InOut` tensor, a result returned as all of its buffer in another shape, and outputs named by the graph.
+#[test]
+fn the_golden_plan_of_steps_has_copies_a_result_over_its_input_a_returned_reshape_and_named_outputs() {
+    let e = &expected()["steps"];
+    let pin = e["plan_digest"].as_str().unwrap();
+    let plan = LaunchPlan::load(golden().join("steps"), Pin::Digest(pin)).unwrap();
+    assert_eq!(plan.manifest_digest(), e["manifest_digest"].as_str().unwrap());
+    assert_eq!(plan.arena_bytes(), e["arena_bytes"].as_u64().unwrap());
+    let at = plan.bucket(&[("Rf", 24)]).unwrap();
+    let kinds: Vec<StepKind> = at.steps.iter().map(|s| s.kind).collect();
+    assert_eq!(kinds, [StepKind::Copy, StepKind::Kernel, StepKind::Copy, StepKind::Kernel]);
+    assert_eq!(at.steps[0].entry, "", "a copy step launches no entry");
+    let copy = &at.steps[0].args;
+    assert_eq!((copy[0].name.as_str(), copy[0].binding.as_str(), copy[1].binding.as_str()), ("src", "x", "t0"));
+    assert_eq!(copy[0].view.as_ref().unwrap().offset, 24 * 64, "x[1]: a dense view at an offset");
+    let over = &at.steps[1].args;
+    assert_eq!((over[1].binding.as_str(), over[3].binding.as_str()), ("t0", "t0"), "r and r_out: one buffer");
+    assert_eq!((at.steps[2].args[0].binding.as_str(), at.steps[2].args[1].binding.as_str()), ("t0", "state"));
+    let half = plan.buffer("half").unwrap();
+    assert_eq!(half.shape.iter().map(ToString::to_string).collect::<Vec<_>>(), ["Rf", "64"]);
+    assert_eq!(at.steps[3].args[1].view.as_ref().unwrap().shape, [24 * 64], "written flat into the [Rf, 64] output");
+    // the outputs by the graph's names, and by out0, out1 (the names of before)
+    assert_eq!(plan.outputs(), ["y", "half"]);
+    for (name, found) in [("y", Some("y")), ("half", Some("half")), ("out0", Some("y")), ("out1", Some("half"))] {
+        assert_eq!(plan.output_buffer(name), found, "{name}");
+    }
+    for name in ["out2", "out01", "out", "outx", "t0", "x", "state"] {
+        assert_eq!(plan.output_buffer(name), None, "{name}");
+    }
+    // a plan whose output is called out0 has nothing else under that name
+    let block = LaunchPlan::load(golden().join("block"), Pin::TrustDirectory).unwrap();
+    assert_eq!(block.output_buffer("out0"), Some("out0"));
+    assert_eq!(block.output_buffer("out1"), None);
+}
+
 #[test]
 fn the_digests_are_recomputed_from_the_files() {
     let expected = expected();

@@ -53,7 +53,7 @@ use crate::ffi;
 use crate::gemm::{Call, Gemm};
 use crate::kernel::{Arch, Kernel};
 use crate::launch_plan::{BufferRole, LaunchPlan, StepKind, describe_values};
-use crate::manifest::{Access, ShapeDim};
+use crate::manifest::{Access, ParamKind, ShapeDim};
 use crate::memory::sealed;
 use crate::plan::Prepared;
 use crate::tensor::{Backing, DType, TensorArg, TensorMut, U8};
@@ -139,10 +139,33 @@ impl DevScalar {
     }
 }
 
+/// A debug tap of a launch ([`PlanRun::launch_tapped`]): the buffer `buffer` of the plan (by name, or `out<i>` for a returned value), copied into
+/// `into` right after the step `after` (by default the last step of the bucket that writes the buffer).
+pub struct Tap<'a> {
+    /// The buffer of the plan.
+    pub buffer: &'a str,
+    /// The index of the step of the bucket the copy follows, or `None` for the last step that writes the buffer.
+    pub after: Option<usize>,
+    /// Where the copy goes: a dense `TensorMut` of the buffer's dtype and shape at the bucket.
+    pub into: TensorArg<'a>,
+}
+
+impl std::fmt::Debug for Tap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tap").field("buffer", &self.buffer).field("after", &self.after).finish_non_exhaustive()
+    }
+}
+
 /// The launch of one step, checked: what [`ffi::plan::enqueue_steps`] launches.
 pub(crate) enum Ready<'r> {
     Kernel(&'r Kernel, Box<Prepared>),
     Gemm(&'r Gemm, Call),
+    /// A copy step: `bytes` bytes from `src` to `dst`, checked to be inside their buffers and not to overlap.
+    Copy {
+        src: u64,
+        dst: u64,
+        bytes: usize,
+    },
 }
 
 /// The value of one device scalar, at its slot of the arena.
@@ -158,6 +181,8 @@ struct Slot {
 enum Op {
     Kernel(Kernel),
     Gemm(Gemm),
+    /// A copy step: no binary.
+    Copy,
 }
 
 /// One pointer argument of a step at one bucket: the buffer, the shape, and the view (none: the whole buffer, dense).
@@ -177,6 +202,8 @@ struct StepRun {
     args: Vec<ArgRun>,
     /// A library step's workspace: its buffer and its shape (`[bytes]`).
     workspace: Option<(usize, [usize; 1])>,
+    /// The buffers the step writes.
+    written: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -402,6 +429,7 @@ impl PlanRun {
             for st in &bucket.steps {
                 let key = (st.kind == StepKind::Library, st.entry.clone());
                 let op = match ops.get(&key) {
+                    _ if st.kind == StepKind::Copy => Op::Copy, // a device-to-device copy: nothing to load
                     Some(op) => op.clone(),
                     None => {
                         let op = match st.kind {
@@ -412,6 +440,7 @@ impl PlanRun {
                                 Op::Kernel(kernel)
                             }
                             StepKind::Library => Op::Gemm(plan.manifest().gemm(&ctx, &st.entry, &[], arch)?),
+                            StepKind::Copy => unreachable!("a copy step loads nothing"),
                         };
                         ops.insert(key, op.clone());
                         op
@@ -431,7 +460,27 @@ impl PlanRun {
                     })
                     .collect();
                 let workspace = st.workspace_buffer.map(|w| (w, [bucket.shapes[w][0]]));
-                steps.push(StepRun { stem: st.entry.clone(), op, args, workspace });
+                // the buffers the step writes (what a tap without a step is copied after): a copy's dst, a GEMM's out, a kernel's out and
+                // inout pointers (the reader checked the arguments are the entry's pointers, in order)
+                let written: Vec<usize> = match st.kind {
+                    StepKind::Copy => vec![st.args[1].buffer],
+                    StepKind::Library => st.args.last().map(|a| a.buffer).into_iter().collect(),
+                    StepKind::Kernel => {
+                        let entry =
+                            plan.manifest().entry(&st.entry, plan.arch()).expect("the reader checked the entry");
+                        let pointers = entry.params.iter().filter_map(|p| match &p.kind {
+                            ParamKind::Pointer { access, .. } => Some(*access),
+                            _ => None,
+                        });
+                        st.args
+                            .iter()
+                            .zip(pointers)
+                            .filter(|(_, access)| *access != Access::In)
+                            .map(|(a, _)| a.buffer)
+                            .collect()
+                    }
+                };
+                steps.push(StepRun { stem: st.entry.clone(), op, args, workspace, written });
             }
             runs.push(BucketRun { index, steps });
         }
@@ -541,7 +590,13 @@ impl PlanRun {
         // -- the names
         let mut given: Vec<Option<usize>> = vec![None; buffers.len()];
         for (k, (name, _)) in externals.iter().enumerate() {
-            match inner.by_name.get(*name).copied() {
+            // a returned value by its name, or by out<i> (`LaunchPlan::output_buffer`)
+            let index = inner
+                .by_name
+                .get(*name)
+                .copied()
+                .or_else(|| plan.output_buffer(name).and_then(|b| inner.by_name.get(b).copied()));
+            match index {
                 None => {
                     return Err(Error::Launch(format!(
                         "'{name}' is not a buffer of the plan of graph '{graph}'; its externals are {}",
@@ -835,18 +890,25 @@ impl PlanRun {
     /// Every step of the bound bucket checked with the addresses of the call, as a single launch is checked: the grid and the parameters of
     /// each kernel, the addresses of each GEMM. A refusal is the step's, and nothing is launched.
     fn ready(&self, bound: &Bound) -> Result<Vec<Ready<'_>>> {
+        let steps = self.inner.buckets[bound.bucket].steps.len();
+        (0..steps).map(|si| self.ready_step(bound.bucket, si, &bound.bases)).collect()
+    }
+
+    /// Step `si` of the instantiated bucket `bucket` checked with the addresses `bases` (one per buffer), as a single launch is checked.
+    fn ready_step(&self, bucket: usize, si: usize, bases: &[u64]) -> Result<Ready<'_>> {
         let inner = &*self.inner;
         let plan = &inner.plan;
-        let bucket = &inner.buckets[bound.bucket];
+        let bucket = &inner.buckets[bucket];
         let combo = &plan.buckets()[bucket.index];
         let region_bytes =
             |i: usize| combo.shapes[i].iter().product::<usize>() as u64 * plan.buffers()[i].dtype.size() as u64;
-        let mut ready = Vec::with_capacity(bucket.steps.len());
-        for (si, step) in bucket.steps.iter().enumerate() {
-            let what = format!("step #{si} ({}) at {}", step.stem, describe_values(&combo.values));
+        {
+            let step = &bucket.steps[si];
+            let stem = if matches!(step.op, Op::Copy) { "copy" } else { step.stem.as_str() };
+            let what = format!("step #{si} ({stem}) at {}", describe_values(&combo.values));
             let mut args: Vec<TensorArg<'_>> = Vec::with_capacity(step.args.len() + 1);
             for a in &step.args {
-                let region = ffi::plan::check_region(bound.bases[a.buffer], region_bytes(a.buffer), inner.device);
+                let region = ffi::plan::check_region(bases[a.buffer], region_bytes(a.buffer), inner.device);
                 let arg = match &a.view {
                     Some((strides, offset)) => {
                         TensorArg::new_strided(region, &a.shape, strides, *offset, a.dtype, a.access)
@@ -855,19 +917,168 @@ impl PlanRun {
                 };
                 args.push(arg.map_err(|e| in_step(e, &what))?);
             }
-            ready.push(match &step.op {
+            Ok(match &step.op {
                 Op::Kernel(kernel) => {
                     Ready::Kernel(kernel, Box::new(kernel.check(&args).map_err(|e| in_step(e, &what))?))
                 }
                 Op::Gemm(gemm) => {
                     let (w, shape) = step.workspace.as_ref().expect("a library step has a workspace");
-                    let region = ffi::plan::check_region(bound.bases[*w], region_bytes(*w), inner.device);
+                    let region = ffi::plan::check_region(bases[*w], region_bytes(*w), inner.device);
                     args.push(TensorArg::new(region, shape, DType::U8, Access::InOut).map_err(|e| in_step(e, &what))?);
                     Ready::Gemm(gemm, gemm.check_call(&args).map_err(|e| in_step(e, &what))?)
                 }
-            });
+                Op::Copy => {
+                    // the dense bytes of src into dst: each was made a tensor of its region above (so it lies inside its buffer), and the
+                    // reader checked that both are dense, of one dtype and one count; with the real addresses they must not overlap
+                    let bytes = args[0].shape.iter().product::<usize>() * args[0].dtype.size();
+                    let (src, dst) = (args[0].ptr, args[1].ptr);
+                    if src < dst + bytes as u64 && dst < src + bytes as u64 {
+                        return Err(Error::precondition(
+                            PreconditionKind::Alias,
+                            Some("dst"),
+                            format!("{what}: the source and the destination of the copy overlap"),
+                        ));
+                    }
+                    Ready::Copy { src, dst, bytes }
+                }
+            })
         }
-        Ok(ready)
+    }
+
+    /// Launch step `step` of the bucket `bucket` (one value per dimension) on the caller's tensors: the binary of the step's entry in the plan's
+    /// verified manifest (what the pin of the plan pins) and the binding the plan says, each argument the buffer and the view the step names,
+    /// made of the tensor given for that buffer. A single-op replay under the plan's pin (Python: `tilefish.runtime.run_step`).
+    ///
+    /// `buffers` gives a tensor for every buffer the step binds, by name (a returned value also as `out<i>`), and nothing else: of the buffer's
+    /// dtype and its shape at the bucket (a device scalar: one element), dense, on the plan's device and context, a `TensorMut` for a buffer the
+    /// step writes. A GEMM's workspace is the plan's arena. Every check of the step is made with these addresses before the launch, and the
+    /// tensors must not overlap the arena, nor each other where the step writes one. The launch is ordered as [`PlanRun::launch`] is.
+    pub fn launch_step(
+        &self,
+        stream: &Arc<CudaStream>,
+        bucket: &[(&str, u64)],
+        step: usize,
+        buffers: &mut [(&str, TensorArg<'_>)],
+    ) -> Result<()> {
+        self.check_stream(stream)?;
+        let inner = &*self.inner;
+        let plan = &inner.plan;
+        let all = plan.buffers();
+        let graph = plan.graph();
+        let Some(index) = plan.bucket_index(bucket) else {
+            return Err(Error::precondition(
+                PreconditionKind::Bucket,
+                None,
+                format!("the plan of graph '{graph}' has no bucket {bucket:?}"),
+            ));
+        };
+        let Some(b) = inner.buckets.iter().position(|r| r.index == index) else {
+            return Err(Error::precondition(
+                PreconditionKind::Bucket,
+                None,
+                format!("this run of the plan of graph '{graph}' was not instantiated for the bucket {bucket:?}"),
+            ));
+        };
+        let run = &inner.buckets[b];
+        let Some(st) = run.steps.get(step) else {
+            return Err(Error::Launch(format!("the bucket has {} steps, not a step #{step}", run.steps.len())));
+        };
+        let shapes = &plan.buckets()[index].shapes;
+        let mut given: Vec<Option<usize>> = vec![None; all.len()];
+        for (k, (name, _)) in buffers.iter().enumerate() {
+            let i = inner
+                .by_name
+                .get(*name)
+                .copied()
+                .or_else(|| plan.output_buffer(name).and_then(|o| inner.by_name.get(o).copied()))
+                .filter(|i| all[*i].role != BufferRole::Workspace)
+                .ok_or_else(|| {
+                    Error::Launch(format!(
+                        "'{name}' is not a buffer of the plan of graph '{graph}' (the workspace is the plan's own)"
+                    ))
+                })?;
+            if given[i].replace(k).is_some() {
+                return Err(Error::Launch(format!("the buffer '{}' is given twice", all[i].name)));
+            }
+        }
+        let needed: Vec<usize> = st.args.iter().map(|a| a.buffer).collect();
+        if let Some(missing) = needed.iter().find(|i| given[**i].is_none()) {
+            return Err(Error::Launch(format!(
+                "step #{step} binds the buffer '{}', which is not given",
+                all[*missing].name
+            )));
+        }
+        if let Some(extra) = (0..all.len()).find(|i| given[*i].is_some() && !needed.contains(i)) {
+            return Err(Error::Launch(format!("step #{step} does not bind the buffer '{}'", all[extra].name)));
+        }
+        let mut bases = vec![0u64; all.len()];
+        let mut ranges: Vec<(usize, u128, u128)> = Vec::new();
+        for (i, k) in given.iter().enumerate().filter_map(|(i, k)| k.map(|k| (i, k))) {
+            let (t, buf) = (&buffers[k].1, &all[i]);
+            let name = buf.name.as_str();
+            let refuse =
+                |kind, why: String| Err(Error::precondition(kind, Some(name), format!("the buffer '{name}': {why}")));
+            if t.device != inner.device || t.context.is_some_and(|c| c != inner.context.cu_ctx() as usize) {
+                return refuse(
+                    PreconditionKind::Device,
+                    "its tensor is not memory of the plan's device and context".to_owned(),
+                );
+            }
+            if t.dtype != buf.dtype {
+                return refuse(
+                    PreconditionKind::Dtype,
+                    format!("its tensor is {}, the buffer {}", t.dtype.name(), buf.dtype.name()),
+                );
+            }
+            let scalar = buf.role == BufferRole::Devscalar && t.shape.iter().product::<usize>() == 1;
+            if t.shape != shapes[i].as_slice() && !scalar {
+                return refuse(
+                    PreconditionKind::Shape,
+                    format!("its tensor has shape {:?}, the buffer at this bucket {:?}", t.shape, shapes[i]),
+                );
+            }
+            if t.strides.is_some_and(|s| !dense(t.shape, s)) {
+                return refuse(PreconditionKind::Contiguous, "its tensor is not contiguous".to_owned());
+            }
+            if st.written.contains(&i) && t.access == Access::In {
+                return refuse(
+                    PreconditionKind::Access,
+                    "the step writes it, but its tensor is read-only: give a TensorMut".to_owned(),
+                );
+            }
+            let bytes =
+                shapes[i].iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128)) * buf.dtype.size() as u128;
+            let (lo, hi) = (u128::from(t.ptr), u128::from(t.ptr) + bytes);
+            let arena = (u128::from(inner.arena_addr), u128::from(inner.arena_addr) + u128::from(plan.arena_bytes()));
+            if plan.arena_bytes() > 0 && lo < arena.1 && arena.0 < hi {
+                return refuse(PreconditionKind::Alias, "its tensor overlaps the arena of the plan".to_owned());
+            }
+            if let Some(&(o, _, _)) = ranges
+                .iter()
+                .find(|(o, olo, ohi)| lo < *ohi && *olo < hi && (st.written.contains(&i) || st.written.contains(o)))
+            {
+                return refuse(
+                    PreconditionKind::Alias,
+                    format!("its tensor overlaps the one of '{}', and the step writes one", all[o].name),
+                );
+            }
+            ranges.push((i, lo, hi));
+            bases[i] = t.ptr;
+        }
+        if let Some((w, _)) = st.workspace {
+            bases[w] = inner.arena_addr + all[w].offset.expect("the workspace is in the arena");
+        }
+        let ready = [self.ready_step(b, step, &bases)?];
+        let shape = [plan.arena_bytes() as usize];
+        let mut arena = inner.lock_arena();
+        let Arena { slice, staging, .. } = &mut *arena;
+        let mut tensors: Vec<TensorArg<'_>> = buffers.iter_mut().map(|(_, t)| t.reborrow()).collect();
+        if let Some(slice) = slice.as_mut() {
+            tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
+        }
+        ffi::ordered(stream, &mut tensors, |tensors, want_end| {
+            tracked(stream, tensors, &[], staging.as_mut(), want_end, |stream| ffi::plan::enqueue_steps(stream, &ready))
+        })
     }
 
     /// Check a call as [`PlanRun::launch`] does, and launch nothing.
@@ -899,14 +1110,37 @@ impl PlanRun {
         externals: &mut [(&str, TensorArg<'_>)],
         devscalars: &[(&str, DevScalar)],
     ) -> Result<()> {
+        self.launch_tapped(stream, externals, devscalars, &mut [])
+    }
+
+    /// [`PlanRun::launch`] with debug taps: each [`Tap`] copies a buffer of the plan (all of it, at the bucket) into the caller's tensor right after
+    /// a step (`after`, or by default the last step of the bucket that writes the buffer), on the launch stream, before the next step may reuse the
+    /// buffer's bytes. The intermediates of the very plan a product runs, with the plan and its digest unchanged (Python: `tilefish.run(...,
+    /// taps=...)`). A tap is checked with everything else before anything is enqueued: a buffer of the plan (by name, or `out<i>`), not the
+    /// workspace; a step of the bucket; a dense, writable tensor (a `TensorMut`) of the buffer's dtype and shape at the bucket, on the plan's device
+    /// and context, that overlaps no external, no other tap and not the arena. Its memory is ordered as an external's that the plan writes.
+    pub fn launch_tapped(
+        &self,
+        stream: &Arc<CudaStream>,
+        externals: &mut [(&str, TensorArg<'_>)],
+        devscalars: &[(&str, DevScalar)],
+        taps: &mut [Tap<'_>],
+    ) -> Result<()> {
         self.check_stream(stream)?;
         let bound = self.bind(externals, devscalars)?;
-        let ready = self.ready(&bound)?;
+        let mut ready = self.ready(&bound)?;
+        if !taps.is_empty() {
+            let copies = self.resolve_taps(&bound, externals, taps)?;
+            for (after, copy) in copies.into_iter().rev() {
+                ready.insert(after + 1, copy); // from the last: an index is not moved by an insertion after it
+            }
+        }
         let shape = [self.inner.plan.arena_bytes() as usize];
         let mut arena = self.inner.lock_arena();
         let launched = {
             let Arena { slice, staging, .. } = &mut *arena;
             let mut tensors: Vec<TensorArg<'_>> = externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
+            tensors.extend(taps.iter_mut().map(|t| t.into.reborrow()));
             if let Some(slice) = slice.as_mut() {
                 tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
             }
@@ -919,6 +1153,99 @@ impl PlanRun {
         };
         arena.slots_of = 0;
         launched
+    }
+
+    /// The copies of the taps of a launch, each with the index of the step it follows, in the order of the steps (see [`PlanRun::launch_tapped`]).
+    fn resolve_taps(
+        &self,
+        bound: &Bound,
+        externals: &[(&str, TensorArg<'_>)],
+        taps: &[Tap<'_>],
+    ) -> Result<Vec<(usize, Ready<'static>)>> {
+        let inner = &*self.inner;
+        let plan = &inner.plan;
+        let buffers = plan.buffers();
+        let bucket = &inner.buckets[bound.bucket];
+        let combo = &plan.buckets()[bucket.index];
+        let steps = bucket.steps.len();
+        let elements = |shape: &[usize]| shape.iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128));
+        let mut taken: Vec<(u128, u128, String)> = Vec::new();
+        if plan.arena_bytes() > 0 {
+            let start = u128::from(inner.arena_addr);
+            taken.push((start, start + u128::from(plan.arena_bytes()), "the arena of the plan".to_owned()));
+        }
+        for (name, t) in externals {
+            let bytes = elements(t.shape) * t.dtype.size() as u128;
+            taken.push((u128::from(t.ptr), u128::from(t.ptr) + bytes, format!("the external '{name}'")));
+        }
+        let mut copies = Vec::with_capacity(taps.len());
+        for tap in taps {
+            let name = tap.buffer;
+            let index = inner
+                .by_name
+                .get(name)
+                .copied()
+                .or_else(|| plan.output_buffer(name).and_then(|b| inner.by_name.get(b).copied()))
+                .filter(|i| buffers[*i].role != BufferRole::Workspace);
+            let Some(index) = index else {
+                return Err(Error::Launch(format!(
+                    "the tap '{name}' is not a buffer of the plan of graph '{}' (a tap is any buffer but the workspace, by name or out<i>)",
+                    plan.graph()
+                )));
+            };
+            let after = match tap.after {
+                Some(step) => step,
+                None => bucket.steps.iter().rposition(|s| s.written.contains(&index)).ok_or_else(|| {
+                    Error::Launch(format!(
+                        "the tap '{name}' names a buffer no step writes: give the step to copy it after"
+                    ))
+                })?,
+            };
+            if after >= steps {
+                return Err(Error::Launch(format!(
+                    "the tap '{name}' is to follow step {after}, but the bucket has {steps} steps"
+                )));
+            }
+            let (t, b) = (&tap.into, &buffers[index]);
+            let want = combo.shapes[index].as_slice();
+            let refuse =
+                |kind, why: String| Err(Error::precondition(kind, Some(name), format!("the tap '{name}': {why}")));
+            if t.device != inner.device || t.context.is_some_and(|c| c != inner.context.cu_ctx() as usize) {
+                return refuse(
+                    PreconditionKind::Device,
+                    "its tensor is not memory of the plan's device and context".to_owned(),
+                );
+            }
+            if t.dtype != b.dtype {
+                return refuse(
+                    PreconditionKind::Dtype,
+                    format!("its tensor is {}, the buffer {}", t.dtype.name(), b.dtype.name()),
+                );
+            }
+            if t.shape != want {
+                return refuse(
+                    PreconditionKind::Shape,
+                    format!("its tensor has shape {:?}, the buffer at this bucket {want:?}", t.shape),
+                );
+            }
+            if t.strides.is_some_and(|s| !dense(t.shape, s)) {
+                return refuse(PreconditionKind::Contiguous, "its tensor is not contiguous".to_owned());
+            }
+            if t.access == Access::In {
+                return refuse(PreconditionKind::Access, "its tensor is read-only: give a TensorMut".to_owned());
+            }
+            let bytes = elements(want) * b.dtype.size() as u128;
+            let (lo, hi) = (u128::from(t.ptr), u128::from(t.ptr) + bytes);
+            if let Some((_, _, what)) = taken.iter().find(|(olo, ohi, _)| lo < *ohi && *olo < hi) {
+                return refuse(PreconditionKind::Alias, format!("its tensor overlaps {what}"));
+            }
+            taken.push((lo, hi, format!("the tap '{name}'")));
+            let bytes = usize::try_from(bytes)
+                .map_err(|_| Error::Launch(format!("the tap '{name}' does not fit the address space")))?;
+            copies.push((after, Ready::Copy { src: bound.bases[index], dst: t.ptr, bytes }));
+        }
+        copies.sort_by_key(|(after, _)| *after); // stable: taps after one step in the order given
+        Ok(copies)
     }
 
     /// Capture the plan in a CUDA graph on `stream`, for the bucket the externals select: the returned [`CapturedPlan`] holds the graph and this

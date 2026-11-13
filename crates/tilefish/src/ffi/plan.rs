@@ -156,6 +156,15 @@ pub(crate) fn enqueue_steps(stream: &CudaStream, steps: &[Ready<'_>]) -> Result<
                 // algorithm needs) and are used as the doc comment of this function says.
                 unsafe { gemm.run(stream.cu_stream(), call) }?;
             }
+            Ready::Copy { src, dst, bytes } => {
+                stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+                // SAFETY: `src` and `dst` are the first bytes of two arguments of a copy step, each checked by the run to lie inside its
+                // buffer (an external the call borrows, or a region of the arena) with `bytes` bytes, and not to overlap each other; the
+                // stream is a live cudarc stream of the plan's context, current on this thread. A capturing stream records the copy as a memcpy
+                // node, with these addresses, held as the doc comment of this function says.
+                unsafe { result::memcpy_dtod_async(*dst, *src, *bytes, stream.cu_stream()) }
+                    .map_err(Error::driver("cuMemcpyDtoDAsync"))?;
+            }
         }
     }
     Ok(())

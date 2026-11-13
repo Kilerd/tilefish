@@ -422,21 +422,21 @@ def test_a_view_of_a_graph_parameter_that_is_updated_in_place_is_stale_for_the_s
         tilefish.plan(on_param)
 
 
-def test_a_returned_value_must_be_a_fresh_result_not_an_input_a_view_or_a_repeat():
+def test_an_input_and_a_repeat_are_copied_and_a_view_that_is_not_dense_is_refused():
+    # (test_plan_returns.py has the rest: a reshape costs nothing, any dense view is copied)
     @tilefish.graph
     def returns_input(a: Tensor[Q, W, f32]) -> Tensor[Q, W, f32]:
         twice(a)
         return a
 
-    with pytest.raises(TilefishPlanError, match="returned value %a .* is the input 'a'"):
-        tilefish.plan(returns_input)
+    assert [s["kind"] for s in tilefish.plan(returns_input).steps(Q=16)] == ["kernel", "copy"]
 
     @tilefish.graph
     def returns_view(a: Tensor[Q, W, f32]):
         left, right = twice(a).split(64, axis=-1)
         return left
 
-    with pytest.raises(TilefishPlanError, match="is a view"):
+    with pytest.raises(TilefishPlanError, match="which is not dense"):
         tilefish.plan(returns_view)
 
     @tilefish.graph
@@ -444,8 +444,8 @@ def test_a_returned_value_must_be_a_fresh_result_not_an_input_a_view_or_a_repeat
         t = twice(a)
         return t, t
 
-    with pytest.raises(TilefishPlanError, match="returned twice"):
-        tilefish.plan(twice_returned)
+    p = tilefish.plan(twice_returned)
+    assert [s["kind"] for s in p.steps(Q=16)] == ["kernel", "copy"] and p.outputs == ["out0", "out1"]
 
 
 def test_two_returned_values_are_named_in_the_order_the_graph_returns_them():
