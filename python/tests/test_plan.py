@@ -502,6 +502,35 @@ def test_the_parameter_names_that_the_plan_makes_up_do_not_collide_with_the_grap
     assert p.outputs == ["out0_"] and "t0_" in listed
 
 
+def test_reuse_keeps_the_arena_flat_as_the_model_gets_deeper_and_no_reuse_grows_with_it():
+    """The block unrolled L times (weights stacked and taken by views): without reuse every layer's intermediates have a region of their own; with it the arena is one layer's."""
+    arena = {}
+    for layers in (1, 2, 4, 12):
+        graph = pm.deep_block(layers)
+        plain, reused = tilefish.plan(graph), tilefish.plan(graph, reuse=True)
+        assert len(plain.steps(M=64)) == 9 * layers and plain.arena_bytes_without_reuse == plain.arena_bytes
+        _plan.validate_doc(reused.with_manifest("sm_103", "a" * 64).doc)  # every overlap of regions is between buffers no step uses together
+        arena[layers] = (plain.arena_bytes, reused.arena_bytes)
+    plain_sizes = [arena[n][0] for n in (1, 2, 4, 12)]
+    assert plain_sizes == sorted(plain_sizes) and plain_sizes[-1] > 2 * plain_sizes[0]
+    reused_sizes = [arena[n][1] for n in (2, 4, 12)]
+    assert max(reused_sizes) - min(reused_sizes) < 256 * 1024 and max(reused_sizes) < 1.1 * arena[1][1]  # flat: the depth does not show
+    workspace = 8_519_680 + 256  # the cuBLASLt workspace and the device scalar's slot are in every arena, and are not what reuse is about
+    assert (arena[12][1] - workspace) * 10 < arena[12][0] - workspace  # the intermediates of twelve layers in a twelfth of the bytes or less
+
+
+def test_the_weights_of_a_layer_are_views_of_a_stacked_parameter_and_cost_nothing():
+    p = tilefish.plan(pm.deep_block(3))
+    steps = p.steps(M=32)
+    qkv = [s for s in steps if s["entry"] == "gemm_qkv.M32"]
+    assert len(qkv) == 3
+    views = [{a["name"]: a for a in s["args"]}["b"] for s in qkv]
+    assert [v["binding"] for v in views] == ["w_qkv"] * 3
+    assert [v["view"]["offset"] for v in views] == [0, 768 * 256, 2 * 768 * 256]  # a chunk of the first axis: its offset in elements, dense
+    assert all(v["view"]["shape"] == [768, 256] and v["view"]["strides"] == [256, 1] for v in views)
+    assert {b["name"]: b["bytes"] for b in p.buffers}["w_qkv"] == 3 * 768 * 256 * 2
+
+
 def test_a_plan_describes_itself():
     text = tilefish.plan(pm.block, reuse=True).describe()
     assert "plan of graph 'block'" in text and "arena: 9240832 bytes (with reuse); without reuse 9634048, with reuse 9240832" in text

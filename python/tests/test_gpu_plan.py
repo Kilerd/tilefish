@@ -258,6 +258,47 @@ def test_results_of_every_kind_land_in_the_right_buffers_and_come_back_in_the_or
         assert out[0] is given[0] and out[1] is given[1] and same_bytes(given[0], expected[0]) and same_bytes(given[1], expected[1])
 
 
+def test_a_deep_forward_is_one_plan_whose_reuse_changes_no_byte_and_that_a_cuda_graph_replays(tmp_path):
+    """Four unrolled layers, 36 steps, the weights of every layer a view of a stacked parameter: replay == jit == the layers composed per op, with and without reuse, and captured."""
+    layers = 4
+    deep = pm.deep_block(layers)
+    per_layer, stacked = pm.stacked_weights(layers)
+    exported = runtime.export(deep, tmp_path / "plain")
+    exported_reuse = runtime.export(deep, tmp_path / "reuse", reuse=True)
+    assert exported_reuse.arena_bytes < exported.arena_bytes and len(exported.steps(M=64)) == 9 * layers
+    print(f"\n[arena] {layers} layers: without reuse {exported.arena_bytes} bytes, with reuse {exported_reuse.arena_bytes} bytes")
+    names = ["w_ln1", "w_qkv", "b_qkv", "w_o", "w_ln2", "w_up", "w_down"]
+    for m in pm.BUCKETS:
+        x = pm.activations(m, seed=60 + m)
+        n_t = torch.tensor([m - 3], dtype=torch.int32, device="cuda")
+        expected = x
+        for layer in per_layer:  # the same block, one layer at a time, each op on tensors of its own
+            expected = eager(expected, n_t, *[layer[k] for k in names])
+        args = (x, n_t, *[stacked[k] for k in names])
+        jit = tilefish.run(deep, *args)
+        plain = tilefish.run(deep, *args, mode="replay", plan=tmp_path / "plain", pin=exported.digest)
+        shared = tilefish.run(deep, *args, mode="replay", plan=tmp_path / "reuse", pin=exported_reuse.digest)
+        assert same_bytes(jit, expected) and same_bytes(plain, expected) and same_bytes(shared, expected), m
+    m = 64
+    x = pm.activations(m, seed=7)
+    n_t = torch.tensor([20], dtype=torch.int32, device="cuda")
+    args = (x, n_t, *[stacked[k] for k in names])
+    out = torch.empty((m, pm.D_MODEL), dtype=BF16, device="cuda")
+    runtime.prepare(deep, mode="replay", plan=tmp_path / "reuse", pin=exported_reuse.digest)
+    graph = capture(lambda: tilefish.run(deep, *args, mode="replay", plan=tmp_path / "reuse", pin=exported_reuse.digest, outputs=out))
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert same_bytes(out, tilefish.run(deep, *args))
+    start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(20):
+        graph.replay()
+    stop.record()
+    torch.cuda.synchronize()
+    print(f"[graph] 4 layers, 36 launches: {start.elapsed_time(stop) / 20 * 1000:.0f} us per replay of the CUDA graph")
+
+
 def test_n_is_a_device_scalar_the_one_binary_reads_so_the_same_arena_serves_every_value(exported, weights):
     directory, p = exported
     m = 64

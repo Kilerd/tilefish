@@ -123,6 +123,48 @@ def block(
     return add(r, d)
 
 
+def deep_block(layers):
+    """The block repeated ``layers`` times in one graph (the layers are unrolled: a plan has no nested graphs), with the weights of the layers stacked along the first axis of one
+    parameter each (``w_qkv`` is ``[layers * 768, 256]``), so a layer takes its weights as chunks of those: views of a parameter, which cost nothing."""
+    L = layers
+
+    @tilefish.graph(name=f"deep{L}")
+    def deep(
+        x: Tensor[M, D, bf16],
+        n: DevScalar[i32],
+        w_ln1: Tensor[L * D_MODEL, bf16],
+        w_qkv: Tensor[L * 3 * D_MODEL, D_MODEL, bf16],
+        b_qkv: Tensor[L * 3 * D_MODEL, bf16],
+        w_o: Tensor[L * D_MODEL, D_MODEL, bf16],
+        w_ln2: Tensor[L * D_MODEL, bf16],
+        w_up: Tensor[L * D_FF, D_MODEL, bf16],
+        w_down: Tensor[L * D_MODEL, D_FF, bf16],
+    ) -> Tensor[M, D, bf16]:
+        ln1, ln2 = w_ln1.split(D_MODEL, axis=0), w_ln2.split(D_MODEL, axis=0)
+        qkv_w, qkv_b = w_qkv.split(3 * D_MODEL, axis=0), b_qkv.split(3 * D_MODEL, axis=0)
+        o_w, up_w, down_w = w_o.split(D_MODEL, axis=0), w_up.split(D_FF, axis=0), w_down.split(D_MODEL, axis=0)
+        for i in range(L):
+            h = rmsnorm(x, ln1[i])
+            qkv = gemm_qkv(h, qkv_w[i], qkv_b[i])
+            qkv4 = qkv.reshape(M, 3, HEADS, D_HEAD)
+            a = attention(qkv4[:, 0], qkv4[:, 1], qkv4[:, 2], n)
+            o = gemm_o(a.reshape(M, D_MODEL), o_w[i])
+            r, h2 = add_rmsnorm(x, o, ln2[i])
+            x = add(r, gemm_down(gelu(gemm_up(h2, up_w[i])), down_w[i]))
+        return x
+
+    return deep
+
+
+def stacked_weights(layers, seed=0, device="cuda"):
+    """Per-layer weights (as :func:`weights` makes them, one seed per layer) and their stacked versions for :func:`deep_block`."""
+    import torch
+
+    per_layer = [weights(seed + 100 * i, device) for i in range(layers)]
+    stacked = {k: torch.cat([w[k] for w in per_layer]) for k in WEIGHT_NAMES}
+    return per_layer, stacked
+
+
 # -- a small graph with an in-place tensor: f32, so its results are exact ------------------------------------------------------------------------------------
 
 Q = Dim("Q", buckets=[16, 32])
