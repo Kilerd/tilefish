@@ -11,7 +11,7 @@ field that is not mentioned is as in schema 2.
 
 Contents: 1 what changed; 2 the top level; 3 the digest; 4 kernel entries; 5 the ABI (strided views, device scalars, fixed arguments, scratch
 slots); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM); 10 strict reading, every
-refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does today, and the order to implement it in; 13 where it is tested.
+refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where it is tested.
 
 ## 1. What changed
 
@@ -180,7 +180,7 @@ The list is as in schema 2, with these differences.
   pointer has `tt.divisibility=16` (see below); the element size means no alignment is assumed beyond the element's own, and Triton was given no hint.
   A device scalar's is 16.
 * new kind **`max_extent`**: `{"kind": "max_extent", "arg": <pointer>, "index": <its position>, "value": 2147483647}`, once per pointer that has
-  `strides` (and only on such a pointer; `max_elements` is not allowed on it). It says: for a kernel that indexes with `i32` (`index_bits=32`, the
+  `strides` of a kernel that indexes with `i32`, and no more than once on any pointer (and only on a pointer that has `strides`; `max_elements` is not allowed on it). It says: for a kernel that indexes with `i32` (`index_bits=32`, the
   default), the view's **extent** must not exceed `value` elements, where
   `extent = 1 + Σ over axes of (size[a] − 1) * canonical_stride[a]` (computed with unbounded integers: the product can exceed 64 bits). The test is
   `extent ≤ value`. (`max_elements` bounds an element count, which for a view says nothing about the offsets the kernel computes.) A kernel with
@@ -323,7 +323,7 @@ document tilefish writes next to a build and the host does not read):
   `stride_of` scalar carries, or two scalars for one axis; an `offset` that is not a string; `stride_of` with a missing/extra key, a negative axis, an
   axis out of range, a target that is not a strided pointer, a `dim` different from the target's `strides` entry, or together with `count_of`; a `fixed`
   argument with a type not in `i32`/`i64`/`f32`, an `f32` value that is not a float, an integer type with a non-integer, a bool, or an out-of-range value.
-* preconditions: `max_extent` not exactly once on a strided pointer, with a value other than `2147483647`, or on a pointer without `strides`;
+* preconditions: `max_extent` more than once on a pointer (a kernel with `index_bits=64` has none, so it is not required), with a value other than `2147483647`, or on a pointer without `strides`;
   `max_elements` on a pointer with `strides`; `pointer_alignment` of a strided pointer other than 16 or its element size (of any other pointer other
   than 16); every pointer must have exactly one `pointer_alignment`.
 * every `library` entry: the field list, the types and the cross-field equalities of section 9, each by the rule given there.
@@ -339,28 +339,64 @@ A schema 2 manifest of Triton kernels is the same manifest in schema 3 after exa
 2. every kernel entry gains `"kind": "triton"` and its `abi` gains `"scratch_slots": 2`;
 3. the manifest gains `"library": []`.
 
-Its digest changes (tag `v3`, and the `library` key), so a pin must be taken again. Python refuses schema 2 (`Re-export it`), so it cannot read the
-crate's committed fixtures directly; its tests migrate a copy (`test_rust_host.py: migrated_fixture`) and compute the schema 2 digest of the original
-with `manifest_digest`, which equals `expected.json`. The `export_rust_fixtures.py` script now writes schema 3: the Rust lane regenerates the
-fixtures (and `generated.rs`, whose `MANIFEST_DIGEST` is the digest of the manifest) when it moves the crate to schema 3.
+Its digest changes (tag `v3`, and the `library` key), so a pin must be taken again. Both hosts refuse schema 2 (`Re-export it` / `Export it again`),
+checked before anything else of the file is looked at, so a manifest of schema 2 is told to be exported again and not that a field is missing. The
+committed fixtures of the Rust crate (`crates/tilefish/tests/fixtures`, built on a B300 by `python/tests/export_rust_fixtures.py`) are schema 3
+manifests, and `expected.json` holds the digests Python computed for them.
 
-## 12. What the Rust host does today, and an order to implement it
+## 12. What the Rust host does
 
-`tilefish.hosts.rust.emit` still writes typed launchers for a schema 3 manifest of Triton kernels that use nothing of schema 2's features beyond
-what schema 2 had (every pointer dense, every scalar an `i32` dimension), and refuses, with a message that ends "not yet supported by the Rust
-host", everything else: a `binary` kernel, a pointer with `strides`/`offset`, a pointer with shape `[]`, a non-`i32` scalar or one with
-`stride_of`, a `fixed` argument, and a manifest that has `library` entries. The launchers it writes embed the schema 3 digest, so they load under a
-crate that reads schema 3 and fail at `load` with the crate's "unsupported schema" error under 0.0.1.
+The Rust crate `tilefish` of this repository reads schema 3 in full and launches everything this document describes, with the safety model of its
+schema 2 launches (`DevicePtr<'a>` lifetimes, `from_cuda` sealed to cudarc's slices and views, the safe `launch` on a `CudaStream` with owner waits and
+writer-waits-for-readers, the refusal of a capture of slices; `unsafe` only in `region.rs` and `ffi.rs` with its `ffi/cublaslt.rs`; cudarc's safe layer
+and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter than Python, or differs from it, it is listed here.
 
-A reasonable order for the Rust lane, each step testable against Python on a GPU (`python/tests/rust_gate.py` and `crates/tilefish/tests/gpu_gate.rs`):
+**Reading** (`crates/tilefish/src/manifest.rs`, `library.rs`).
 
-1. read schema 3 and the new digest (tag, `library`); migrate the fixtures; keep every kernel entry working (`kind: "triton"`, `scratch_slots`).
-2. `fixed` arguments and `binary` entries (launch with exactly `params`, no scratch; `block`, `shared` from the entry; the `.text.<symbol>` and
-   param-size checks). Gate: the PTX of a lowered golden as a prebuilt extern is byte-identical to its Triton path
-   (`test_gpu_binary.py::test_the_ptx_of_the_elementwise_gelu...`).
-3. device scalars (a pointer with shape `[]`), then strided pointers (`strides`, `offset`, `stride_of`, `max_extent`, canonical strides, the
-   ranges). Gates: `test_gpu_devscalar.py`, `test_gpu_strided.py` (an aligned and an unaligned offset, an expanded view, a transposed one).
-4. `library` entries: version check, algorithm validation, workspace, the launch (`test_gpu_gemm.py`: byte-identical across two processes and to `jit`).
+* Everything of section 10 is refused, and the digest of section 3 is computed exactly (`manifest_digest`, with the schema 2 form for any other `schema`).
+  `abi.scratch_slots` is required (a host without a spec must require it). `max_extent` is optional: *at most once, and only on a strided pointer* (section 6
+  says "once per strided pointer", and a kernel with `index_bits=64` has none, so Python's reader does not require it). `max_elements` or `max_extent`
+  on a device scalar is refused, `fixed` on a Triton kernel is refused (section 5's table), `strides` on a pointer that is not `in` is refused
+  (section 5.1 allows a reader to), and a stride entry is a dimension expression that must be exactly the `dim` of the scalar that carries it.
+* A cubin is checked against the architecture of its entry when it is read: `Elf::sm()` (Python's `cubin_sm`: the SM in the low byte of `e_flags` for OS
+  ABI `0x33`, in the second byte for `0x41`). A prebuilt binary whose header names no readable architecture, or another one than its entry, is refused
+  (section 8); a Triton cubin is refused when it names another one, and left to the driver when the header cannot be read.
+* The function the driver loads must take the parameter sizes of the ABI (`cuFuncGetParamInfo`, as Python checks at load, for every kernel).
+* An entry may name at most 32 dimensions (a strided pointer has one per axis and one for its offset).
+
+**Launching a kernel** (`plan.rs`). The steps of section 5.1, in Python's order: shapes, strides and scalars bind the dimensions, `divisible_by`, the exact
+bucket, the range of every scalar (`i32` or `i64`), aliasing (a view by its extent), the alignment each pointer promises, `max_elements`/`max_extent`,
+the grid. The kinds of the refusals are Python's (`stride`, `max_extent`, `contiguous` are new `PreconditionKind`s). A view is
+`TensorRef::from_cuda_strided(&slice, &shape, &strides, offset)` (also `TensorMut`, and `new_strided` over a region): element strides, which are
+unsigned here, so a negative stride cannot be made (section 5.1 step 2 refuses it); the view's extent from its first element must fit its memory
+(refused at construction); the offset is in elements, may start at any byte of a slice of any element type, and the kernel is given the address of the
+first element (for a slice, cudarc is handed a view of the bytes from there, so its tracking of the slice is unchanged). A tensor that is not a view is a
+view with the dense strides. A view given to a parameter that is not strided must be contiguous (torch's rule: the strides of size-1 axes are not looked at).
+The offset dimension of a strided pointer is not bound (section 5.1 step 7): the check of the address is the one made. A device scalar is a tensor of shape
+`[]` or `[1]`. `fixed` values are written at their slots as their type says (an `f32` is the JSON double rounded to the nearest `f32`).
+
+**Launching a library entry** (`gemm.rs`, `ffi/cublaslt.rs`). `Manifest::gemm(&ctx, name, buckets, arch)` loads a `Gemm` for the device of `ctx` once and
+`Gemm::launch(&stream, &mut [a, b, [bias], out, workspace])` runs it:
+
+* Load refuses, in Python's order: a cuBLASLt that cannot be opened (cudarc opens it when first used, and *panics* if it is missing, so `ffi/cublaslt.rs` asks
+  first), a cuBLASLt whose `cublasLtGetVersion()` is not `cublaslt_version` (an error naming both versions), an algorithm that fails the vetting of section 9
+  (the checks of Python's `_validate_algo`: rebuilt with `cublasLtMatmulAlgoInit` and the configuration attributes and byte-for-byte equal, tile and stages ids
+  and swizzling and custom option within the capabilities of its id, an f32 accumulator, alignment at most 16 bytes, split-K with a reduction scheme of `NONE` or
+  `COMPUTE_TYPE`), an algorithm `cublasLtMatmulAlgoCheck` does not approve for the problem, and one that needs more than `workspace_bytes`. The check runs once at
+  load, not at every launch (the problem of an entry is fixed); the descriptors of a call are made and destroyed in the call.
+* The process must map the same cuBLASLt build that chose the pin (cudarc tries `libcublasLt.so` and then `.so.<major>`, `.so.12`, ...; on a machine whose torch
+  ships its own cuBLASLt, put that directory on `LD_LIBRARY_PATH`): a different build is refused by the version check, and by nothing else.
+* **The workspace is the caller's**, the last tensor of a launch: a `TensorMut<U8>` (cudarc slice or region) of at least `Gemm::workspace_required()` bytes (the
+  algorithm's need, at most `workspace_bytes`; `workspace_bytes` is what Python provides and what `Gemm::alloc_workspace` allocates), 256-byte aligned,
+  overlapping no operand. Nothing is allocated in a launch, so a launch can be captured. Two launches that share a workspace are ordered by cudarc's write tracking
+  and the crate's writer-waits-for-readers rule (on one stream, by stream order); a graph that shares one between replays is the host's to order.
+* The operands go through the plan of the entry (shapes bound to the entry's dimensions, the exact bucket, dtype, contiguity, 16-byte alignment, device,
+  context, aliasing), the stream and context are checked, and the slices are ordered as a kernel's (cudarc's wait and record through the guards of
+  `device_ptr`, the owners' wait for the end of the work, a refusal while a stream is capturing). `unsafe Gemm::launch_raw` with regions captures a GEMM.
+
+**The emitter** (`tilefish.hosts.rust`). It writes a struct for each kernel (Triton or prebuilt: `launch` takes every pointer as a `TensorRef` or `TensorMut`;
+stride scalars and `fixed` arguments are not parameters) and for each library entry (`launch` takes `a`, `b`, `bias`, `out`, `workspace`; `gemm()`, `M`, `N`, `K`,
+`BIAS`, `WORKSPACE_BYTES`, `PINNED_WITH`), with the digest of the manifest embedded. It refuses what the reader refuses.
 
 ## 13. Where it is tested
 
@@ -372,3 +408,13 @@ A reasonable order for the Rust lane, each step testable against Python on a GPU
 | device scalars | `test_devscalar.py`; on a GPU `test_gpu_devscalar.py` |
 | prebuilt PTX and cubin, byte identity with the Triton path | `test_binary_externs.py`; on a GPU `test_gpu_binary.py`, `ptx/*.ptx` |
 | the `library` section | `test_library_ops.py`, `test_cublaslt.py`; on a GPU `test_gpu_gemm.py`, `test_gpu_cublaslt.py` |
+| the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
+
+The Rust crate (`crates/tilefish/tests/`):
+
+| what | tests |
+|---|---|
+| strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs`, `schema3.rs` (synthetic manifests, `common/synthetic.rs`) |
+| views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
+| Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
+| on a GPU, byte identity with Python's `replay` of every feature, the refusals, graph capture of a GEMM and of a strided kernel, the hazards of other streams | `gpu_gate.rs` with `python/tests/rust_gate.py` |

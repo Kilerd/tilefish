@@ -404,12 +404,19 @@ entry says, and gives the docs the tilefish signature.
 
 The byte-identity gate (`python/tests/rust_gate.py` with
 `crates/tilefish/tests/gpu_gate.rs`) checks on a GPU that the Rust host and
-`replay` agree byte for byte on the five goldens, a bucketed row kernel over each
-bucket, the hand-written kernels (outputs and in-place tensors) and a `tl.dot`
-kernel that needs more than 48 KiB of dynamic shared memory, with the manifest
-directory and with the embedded manifest. On any machine, `cargo test` and
-`pytest` check that the digests Rust computes from a committed manifest directory
-(`sm_103`, and a cross-compiled `sm_120` one) are the ones Python computes, and
+`replay` agree byte for byte, on a fresh export and with the manifest directory
+and with the embedded manifest, for the five goldens, a bucketed row kernel over
+each bucket, the hand-written kernels (outputs and in-place tensors), a `tl.dot`
+kernel that needs more than 48 KiB of dynamic shared memory, strided views
+(a fused qkv, any element offset, aligned and not, transposed and expanded
+views, 64-bit strides), device scalars, prebuilt PTX and cubin binaries (the PTX
+of a Triton build and hand-written PTX with `fixed` arguments) and the pinned
+cuBLASLt GEMMs with and without a bias at every bucket; it also checks the
+refusals of schema 3, a strided kernel and a GEMM captured in a CUDA graph, and
+the order of the frees of their slices against other streams. On any machine,
+`cargo test` and `pytest` check that the digests Rust computes from a committed
+manifest directory (`sm_103`, and a cross-compiled `sm_120` one) are the ones
+Python computes, that Rust decides the same as Python on a thousand calls, and
 that Rust refuses what Python refuses.
 
 ## Rewrites that know about rounding
