@@ -327,6 +327,75 @@ fn taps_are_pythons_bytes() {
     println!("rust plan gate: {tapped} taps byte-identical to Python's");
 }
 
+/// Taps of a captured plan (`PlanRun::capture_tapped`): the block with reuse captured with every tap of its first case, replayed twice (the tap
+/// tensors cleared between), each replay copying Python's bytes into the taps again; `CapturedPlan::tap` is the memory of one; a tap that is
+/// not a buffer is refused before the capture.
+#[test]
+fn a_captured_plan_copies_its_taps_at_every_replay() {
+    let gpu = Gpu::new();
+    let plan = plan_named("block-reuse");
+    let run = load(&plan).instantiate_all(&gpu.stream).unwrap();
+    let mut replayed = 0;
+    for case in plan["cases"].as_array().unwrap().iter().take(2) {
+        let id = case["id"].as_str().unwrap();
+        let specs = case["taps"].as_array().expect("the case records taps");
+        let values = devscalars(case);
+        let mut exts = upload(&gpu.stream, case);
+        let mut slices: Vec<(CudaSlice<u8>, Vec<usize>, DType)> = specs
+            .iter()
+            .map(|t| {
+                let dtype = dtype_of(t["dtype"].as_str().unwrap());
+                let shape: Vec<usize> =
+                    t["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect();
+                (gpu.stream.alloc_zeros::<u8>(shape.iter().product::<usize>() * dtype.size()).unwrap(), shape, dtype)
+            })
+            .collect();
+        let taps: Vec<Tap<'_>> = specs
+            .iter()
+            .zip(slices.iter_mut())
+            .map(|(t, (slice, shape, dtype))| Tap {
+                buffer: t["buffer"].as_str().unwrap(),
+                after: t["after"].as_u64().map(|a| a as usize),
+                into: typed(slice, shape, *dtype, true),
+            })
+            .collect();
+        let mut graph = run
+            .capture_tapped(&gpu.stream, args(&mut exts, false), &named(&values), taps)
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+        for round in 0..2 {
+            graph.replay(&gpu.stream).unwrap();
+            gpu.stream.synchronize().unwrap();
+            for t in specs.iter().filter(|t| t["after"].is_null()) {
+                let name = t["buffer"].as_str().unwrap();
+                let got = gpu.stream.clone_dtoh(&graph.tap(name).unwrap()).unwrap();
+                let expect = read(t["expect"].as_str().unwrap());
+                assert!(got == expect, "{id}: replay {round}: tap {name}: {} bytes differ", differing(&got, &expect));
+                replayed += 1;
+            }
+        }
+        assert!(graph.tap("nope").is_err());
+        drop(graph);
+        // the taps' own slices hold the last replay's copies (those after a given step too)
+        for (t, (slice, _, _)) in specs.iter().zip(&slices) {
+            assert!(
+                gpu.stream.clone_dtoh(slice).unwrap() == read(t["expect"].as_str().unwrap()),
+                "{id}: tap {}",
+                t["buffer"]
+            );
+        }
+    }
+    let case = &plan["cases"].as_array().unwrap()[0];
+    let mut exts = upload(&gpu.stream, case);
+    let mut wrong = gpu.stream.alloc_zeros::<u8>(4).unwrap();
+    let one = [1usize];
+    let taps = vec![Tap { buffer: "nope", after: None, into: typed(&mut wrong, &one, DType::Bf16, true) }];
+    let e = run.capture_tapped(&gpu.stream, args(&mut exts, false), &named(&devscalars(case)), taps).unwrap_err();
+    assert!(e.to_string().contains("not a buffer"), "{e}");
+    println!(
+        "rust plan gate: {replayed} taps of captured plans, copied again at every replay, byte-identical to Python's"
+    );
+}
+
 /// `PlanRun::launch_step`: the steps of `residual_chain` launched one by one on the caller's tensors (the intermediate too), each with the binary
 /// and the binding of the pinned plan, give Python's outputs of the whole plan byte for byte; a step given a buffer it does not bind, or not given
 /// one it binds, is refused.

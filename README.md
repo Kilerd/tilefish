@@ -503,7 +503,8 @@ plan, their manifest and every binary. A replay takes `plan="build/"` and the se
 
 **Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
 last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest
-unchanged (`plan.shape_of("t3", M=64)` gives the shape; `tilefish.capture` takes `taps=` too; Rust: `PlanRun::launch_tapped`).
+unchanged (`plan.shape_of("t3", M=64)` gives the shape; `tilefish.capture` takes `taps=` too; Rust: `PlanRun::launch_tapped`, and
+`PlanRun::capture_tapped`, whose replays copy the taps again).
 
 **One step alone.** `tilefish.runtime.run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest)` launches one step of the
 plan on your tensors, with the binary and the binding of its arguments that the pinned plan says (Rust: `PlanRun::launch_step`): one op of an exported plan

@@ -311,7 +311,9 @@ that writes the buffer: an `out` or `inout` pointer of a kernel, the `out` of a 
 bucket that overlaps no external, no other tap and not the arena. It is checked with everything else in step 3, and in step 5 the whole buffer is copied into it
 (`cuMemcpyDtoDAsync`, on the stream) right after its step, before the next step may write over the buffer's bytes (with `reuse`, an intermediate's bytes are reused). Python:
 `tilefish.run(graph, ..., taps={"t3": tensor, ("t5", 4): tensor})` and `tilefish.capture(..., taps=...)` (the copies are memcpy nodes of the graph); Rust:
-`PlanRun::launch_tapped(stream, externals, devscalars, &mut [Tap { buffer, after, into }])`.
+`PlanRun::launch_tapped(stream, externals, devscalars, &mut [Tap { buffer, after, into }])`, and `PlanRun::capture_tapped(stream, externals, devscalars,
+taps)`, whose graph holds the copies as memcpy nodes (every replay copies again; the `CapturedPlan` borrows the tap tensors, `CapturedPlan::tap(buffer)` is the
+memory of one).
 
 **One step alone (not part of the document).** A host may launch one step of a bucket on the caller's tensors: the binary of the step's entry in the verified
 manifest (the one the plan's pin pins) and the binding of the step (each argument the buffer and the view the step names, made of the tensor given for that buffer),
@@ -319,7 +321,10 @@ with every check of a launch of the step (section 7.2) made with those addresses
 returned value by its name or `out<i>`; not the workspace, which is the arena's), of the buffer's dtype and its shape at the bucket (a device scalar: one element), dense,
 and overlapping neither the arena nor, where the step writes one, each other. The launch is ordered with the executions of the plan (section 9, step 1). It is how one op
 of an exported plan is replayed on a reference's inputs under the pin a product uses. Python: `tilefish.runtime.run_step(graph, step, buffers, mode=, plan=, pin=,
-bucket=None)` (the bucket is found from the shapes when one fits them); Rust: `PlanRun::launch_step(stream, bucket, step, buffers)`.
+bucket=None)` (the bucket is found from the shapes when one fits them); Rust: `PlanRun::launch_step(stream, bucket, step, buffers)`. **It is not
+captured** (both hosts refuse a capturing stream): it is a check of one op under the product's pin on a reference's inputs, done once, where a graph
+buys nothing, and a step reads the plan's arena (a GEMM's workspace) under the arena's order; a host that wants one binary of the plan in a graph of
+its own launches it from the manifest the plan pins (`LaunchPlan::manifest().kernel(...)`, `Kernel::launch_raw`), or captures the plan.
 
 ## 10. CUDA graphs
 

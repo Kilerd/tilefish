@@ -1338,8 +1338,22 @@ impl PlanRun {
         externals: Vec<(&str, TensorArg<'ext>)>,
         devscalars: &[(&str, DevScalar)],
     ) -> Result<CapturedPlan<'ext>> {
+        self.capture_tapped(stream, externals, devscalars, Vec::new())
+    }
+
+    /// [`PlanRun::capture`] with debug taps (see [`PlanRun::launch_tapped`]): each tap's copy is a memcpy node of the graph, right after its step, so
+    /// every replay copies the buffer into the tap's tensor again (Python: `tilefish.capture(..., taps=...)`). The taps are checked with everything
+    /// else before the capture, and the [`CapturedPlan`] borrows their tensors for `'ext`, as it borrows the externals; [`CapturedPlan::tap`] is
+    /// the memory of one, to read after a replay.
+    pub fn capture_tapped<'ext>(
+        &self,
+        stream: &Arc<CudaStream>,
+        externals: Vec<(&str, TensorArg<'ext>)>,
+        devscalars: &[(&str, DevScalar)],
+        taps: Vec<Tap<'ext>>,
+    ) -> Result<CapturedPlan<'ext>> {
         self.check_stream(stream)?;
-        ffi::refuse_per_thread(stream, externals.iter().map(|(_, t)| t))?;
+        ffi::refuse_per_thread(stream, externals.iter().map(|(_, t)| t).chain(taps.iter().map(|t| &t.into)))?;
         let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
         if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
             return Err(Error::Launch(
@@ -1347,7 +1361,12 @@ impl PlanRun {
             ));
         }
         let bound = self.bind(&externals, devscalars)?;
-        let ready = self.ready(&bound)?;
+        let mut ready = self.ready(&bound)?;
+        if !taps.is_empty() {
+            for (after, copy) in self.resolve_taps(&bound, &externals, &taps)?.into_iter().rev() {
+                ready.insert(after + 1, copy); // from the last: an index is not moved by an insertion after it
+            }
+        }
         // The arena's lock is held from the beginning of the capture to its end: a launch or a replay of this instantiation on another thread
         // makes the arena's own stream wait for its end, which would be a wait on an event from outside the capture if that stream is the one
         // captured (`CUDA_ERROR_STREAM_CAPTURE_ISOLATION`, then the capture invalidated); they wait for the capture to end instead.
@@ -1369,6 +1388,7 @@ impl PlanRun {
             run: self.clone(),
             bucket: bound.bucket,
             externals: externals.into_iter().map(|(n, t)| (n.to_owned(), t)).collect(),
+            taps: taps.into_iter().map(|t| (t.buffer.to_owned(), t.after, t.into)).collect(),
             slots: bound.slots,
             id,
             current: false,
@@ -1461,10 +1481,21 @@ impl<'w> WeightedRun<'w> {
         externals: Vec<(&str, TensorArg<'ext>)>,
         devscalars: &[(&str, DevScalar)],
     ) -> Result<CapturedPlan<'ext>> {
+        self.capture_tapped(stream, externals, devscalars, Vec::new())
+    }
+
+    /// [`PlanRun::capture_tapped`] with the weights bound.
+    pub fn capture_tapped<'ext>(
+        &'ext self,
+        stream: &Arc<CudaStream>,
+        externals: Vec<(&str, TensorArg<'ext>)>,
+        devscalars: &[(&str, DevScalar)],
+        taps: Vec<Tap<'ext>>,
+    ) -> Result<CapturedPlan<'ext>> {
         self.refuse_weights(externals.iter().map(|(n, _)| *n))?;
         let mut all: Vec<(&str, TensorArg<'ext>)> = self.shared().collect();
         all.extend(externals);
-        self.run.capture(stream, all, devscalars)
+        self.run.capture_tapped(stream, all, devscalars, taps)
     }
 }
 
@@ -1496,6 +1527,8 @@ pub struct CapturedPlan<'ext> {
     run: PlanRun,
     bucket: usize,
     externals: Vec<(String, TensorArg<'ext>)>,
+    /// The tensors of the debug taps (buffer, the step it follows, the tensor), copied into at every replay.
+    taps: Vec<(String, Option<usize>, TensorArg<'ext>)>,
     slots: Vec<Slot>,
     /// Distinct among the captures of one instantiation: whose device scalar values the arena's slots hold.
     id: u64,
@@ -1540,6 +1573,7 @@ impl<'ext> CapturedPlan<'ext> {
         let replayed = {
             let Arena { slice, staging, .. } = &mut *arena;
             let mut tensors: Vec<TensorArg<'_>> = self.externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
+            tensors.extend(self.taps.iter_mut().map(|(_, _, t)| t.reborrow()));
             if let Some(slice) = slice.as_mut() {
                 tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
             }
@@ -1578,6 +1612,23 @@ impl<'ext> CapturedPlan<'ext> {
         slot.bytes = value.into().encode(slot.dtype, name)?;
         self.current = false;
         Ok(())
+    }
+
+    /// The memory of the tap of buffer `buffer` (the whole cudarc slice or view its tensor was made of, as bytes): what the last replay copied
+    /// into it, to read (ordered after the replays by cudarc's tracking). A buffer tapped after several steps: the first such tap.
+    pub fn tap(&self, buffer: &str) -> Result<CudaView<'_, u8>> {
+        let Some((_, _, t)) = self.taps.iter().find(|(n, _, _)| n == buffer) else {
+            let names: Vec<&str> = self.taps.iter().map(|(n, _, _)| n.as_str()).collect();
+            return Err(Error::Launch(format!("'{buffer}' is not a tap of the captured plan; its taps are {names:?}")));
+        };
+        let missing = || Error::Launch(format!("the memory of the tap '{buffer}' has no bytes to view"));
+        match &t.backing {
+            Backing::Write(memory) => memory.bytes().ok_or_else(missing),
+            Backing::Read(memory) => memory.bytes_from(0).ok_or_else(missing),
+            Backing::Raw => Err(Error::Launch(format!(
+                "the tap '{buffer}' is a region the host vouched for (DevicePtr::from_raw): its memory is the host's"
+            ))),
+        }
     }
 
     fn external_arg(&self, name: &str) -> Result<&TensorArg<'ext>> {

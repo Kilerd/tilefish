@@ -89,8 +89,9 @@ returns a `WeightedRun`, whose `launch`, `launch_tapped`, `check` and `capture` 
 weights are borrowed for the life of the `WeightedRun`). A plan set (several plans exported together with one manifest, `plans.json` its index)
 loads with one pin: `PlanSet::load(dir, Pin::Digest(set_digest))`, then `set.plan(name)` for each `LaunchPlan`, which share the set's manifest
 (`Manifest` is cheap to clone, and its clones share the modules they load). `PlanRun::launch_tapped` is a launch with debug
-taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a step, with the plan and its digest unchanged. `PlanRun::launch_step`
-launches one step of a bucket on the caller's tensors, with the binary and the binding of the pinned plan.
+taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a step, with the plan and its digest unchanged (`PlanRun::capture_tapped`
+captures them as memcpy nodes, copied again at every replay). `PlanRun::launch_step` launches one step of a bucket on the caller's tensors, with the
+binary and the binding of the pinned plan (not on a capturing stream).
 
 Safe code cannot free a slice under a running kernel or GEMM, and a launch of
 slices on a stream that is capturing a CUDA graph is refused, in every cudarc
