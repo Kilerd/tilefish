@@ -63,7 +63,17 @@ fn the_two_architectures_are_other_binaries_of_the_same_kernels() {
         assert_eq!(entry.params, other.params);
         assert_eq!(entry.grid, other.grid);
         assert_eq!(entry.preconditions, other.preconditions);
-        assert_eq!(entry.declaration_digest, other.declaration_digest);
+        // (the declaration of a prebuilt binary holds the digest of the PTX or cubin it was made from, which is another file for each
+        // architecture when it is a Triton build's PTX or a cubin)
+        if entry.kind == tilefish::EntryKind::Binary && entry.source_digest != other.source_digest {
+            assert_ne!(
+                entry.declaration_digest, other.declaration_digest,
+                "{}: another source is another declaration",
+                entry.stem
+            );
+        } else {
+            assert_eq!(entry.declaration_digest, other.declaration_digest, "{}", entry.stem);
+        }
         assert_ne!(entry.sha256_code, other.sha256_code, "{}: another architecture is other machine code", entry.stem);
     }
 }

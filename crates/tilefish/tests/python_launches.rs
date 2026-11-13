@@ -18,7 +18,7 @@ fn every_launch_is_decided_as_python_decides_it() {
     let text = std::fs::read_to_string(common::data().join("python_launches.json")).unwrap();
     let records: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
     let manifest = Manifest::load(fixtures().join("sm_103"), Pin::TrustDirectory).unwrap();
-    let (mut accepted, mut refused) = (0, 0);
+    let (mut accepted, mut refused, mut unrepresentable) = (0, 0, 0);
     let mut differences = Vec::new();
     let mut stems = std::collections::BTreeSet::new();
     for (n, record) in records.iter().enumerate() {
@@ -39,7 +39,7 @@ fn every_launch_is_decided_as_python_decides_it() {
                 t.get("strides").map(|s| s.as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect())
             })
             .collect();
-        let tensors: Vec<TensorArg<'_>> = record["tensors"]
+        let tensors: Vec<Option<TensorArg<'_>>> = record["tensors"]
             .as_array()
             .unwrap()
             .iter()
@@ -59,20 +59,33 @@ fn every_launch_is_decided_as_python_decides_it() {
                         1 + shape.iter().zip(strides).map(|(n, s)| (*n as u128 - 1) * *s as u128).sum::<u128>()
                     }
                 };
-                let bytes = u64::try_from(reach * dtype.size() as u128)
-                    .unwrap_or_else(|_| panic!("record {n}: a view that reaches more than 2^64 bytes cannot be made"));
+                // a view that reaches more than 2^64 bytes cannot be made at all
+                let bytes = u64::try_from(reach * dtype.size() as u128).ok()?;
                 // SAFETY: the address is never dereferenced: `prepare` only looks at the number. The region is as long as the tensor.
                 let region = unsafe { DevicePtr::from_raw(ptr, bytes, 0) };
-                match strides {
+                Some(match strides {
                     None => TensorArg::new(region, shape, dtype, tilefish::Access::InOut).unwrap(),
                     Some(strides) => {
                         TensorArg::new_strided(region, shape, strides, 0, dtype, tilefish::Access::InOut).unwrap()
                     }
-                }
+                })
             })
             .collect();
-        let plan = manifest.plan(stem, &[], Arch::sm(103)).unwrap();
         let expect = &record["expect"];
+        if tensors.iter().any(Option::is_none) {
+            // a view that reaches more than 2^64 bytes (a stride of 2^63 - 1 elements of 2 bytes: Python checks the stride against the 64-bit
+            // integer the binary takes, and has no memory to fit it in) is a tensor this crate cannot even make: no memory is that large. A
+            // call that Python refuses is refused by that, and one it accepts is a view no host could launch (counted, and the range of an
+            // `i64` stride is the unit test's: `a_stride_that_does_not_fit_the_integer_the_binary_takes_is_refused_and_a_wide_one_is_not`)
+            if expect["ok"].as_bool().unwrap() {
+                unrepresentable += 1;
+            } else {
+                refused += 1;
+            }
+            continue;
+        }
+        let tensors: Vec<TensorArg<'_>> = tensors.into_iter().flatten().collect();
+        let plan = manifest.plan(stem, &[], Arch::sm(103)).unwrap();
         let mismatch = match (expect["ok"].as_bool().unwrap(), plan.prepare(&tensors, None)) {
             (true, Ok(prepared)) => {
                 accepted += 1;
@@ -102,7 +115,7 @@ fn every_launch_is_decided_as_python_decides_it() {
         }
     }
     println!(
-        "compared {} launches of {} binaries with Python: {accepted} accepted, {refused} refused, {} differences",
+        "compared {} launches of {} binaries with Python: {accepted} accepted, {refused} refused, {unrepresentable} views no memory could hold, {} differences",
         records.len(),
         stems.len(),
         differences.len()
