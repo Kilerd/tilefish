@@ -199,7 +199,8 @@ impl Manifest {
     /// The binary for `name` (a stem such as `rowop.S32`, or an operator) with exactly these bucket values, for `arch`,
     /// loaded in `ctx`.
     ///
-    /// Bucket semantics are exact: the bucket values name the binary, there is no padding and no rounding up. `arch` is
+    /// Bucket semantics are exact: the bucket values name the binary (each bucketed dimension once: a dimension named twice is refused
+    /// with [`Error::Launch`]), there is no padding and no rounding up. `arch` is
     /// the compute capability of the device of `ctx` (`Arch::of_context(&ctx)?`); a manifest that has no binary for it is refused,
     /// as is an `arch` that is not the device's. The module is loaded once per context and shared by later calls, and the kernel
     /// keeps `ctx` alive.

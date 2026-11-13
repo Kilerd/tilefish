@@ -2076,6 +2076,17 @@ fn select_among(
     buckets: &[(&str, u64)],
     arch: &str,
 ) -> Result<usize> {
+    // the bucket values are Python's mapping of dimension names to sizes, which cannot name a dimension twice: here a list could, and one
+    // that does would match an entry with as many buckets of which it names only some
+    if let Some((d, _)) =
+        buckets.iter().enumerate().find_map(|(i, b)| buckets[..i].iter().any(|(e, _)| *e == b.0).then_some(*b))
+    {
+        let values: Vec<u64> = buckets.iter().filter(|(e, _)| *e == d).map(|(_, v)| *v).collect();
+        return Err(Error::Launch(format!(
+            "the bucket values for '{name}' name the dimension {d} more than once ({values:?}): give each bucketed dimension once, \
+             with its value"
+        )));
+    }
     let same = |item: &Named<'_>| {
         item.buckets.len() == buckets.len()
             && buckets.iter().all(|(d, v)| item.buckets.iter().any(|(ed, ev)| ed == d && ev == v))

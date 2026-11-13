@@ -440,6 +440,63 @@ fn buckets_are_exact() {
 }
 
 #[test]
+fn bucket_values_that_name_a_dimension_twice_are_refused() {
+    // Python's bucket values are a mapping (`select_spec` reads `dims` by name), which cannot name a dimension twice; a list can, and it
+    // is refused before it is matched, whatever the entries are
+    let manifest = Manifest::load(common::fixtures().join("sm_103"), Pin::TrustDirectory).unwrap();
+    let arch = Arch::sm(103);
+    for (name, twice) in [
+        ("bucketed_rms", &[("Db", 96), ("Db", 96)][..]),
+        ("bucketed_rms", &[("Db", 96), ("Db", 512)][..]),
+        ("bucketed_rms.Db96", &[("Db", 96), ("Db", 96)][..]),
+        ("bucketed_rms", &[("M", 1), ("Db", 96), ("M", 1)][..]),
+        ("softmax", &[("M", 4), ("M", 4)][..]),
+        ("no_such_kernel", &[("M", 4), ("M", 4)][..]),
+    ] {
+        match manifest.plan(name, twice, arch) {
+            Err(Error::Launch(m)) => assert!(m.contains("more than once") && m.contains(name), "{twice:?}: {m}"),
+            other => panic!("{twice:?}: {other:?}"),
+        }
+    }
+    // the library operations are chosen the same way
+    let gemm = &manifest.library()[0];
+    let (op, (dim, value)) = (gemm.op.as_str(), (gemm.buckets[0].0.as_str(), gemm.buckets[0].1));
+    match manifest.library_plan(op, &[(dim, value), (dim, value)], arch) {
+        Err(Error::Launch(m)) => assert!(m.contains(&format!("the dimension {dim} more than once")), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(manifest.library_plan(op, &[(dim, value)], arch).is_ok());
+    // and the sizes named once still choose their entry
+    assert_eq!(manifest.plan("bucketed_rms", &[("Db", 512)], arch).unwrap().stem(), "bucketed_rms.Db512");
+
+    // an entry with two buckets, which as many values that name one of them twice would match: M is bucketed too, at 4 (and so the sizes of
+    // x and out are bounded, and a generated kernel has no max_elements for them)
+    let copy = Copy::of("sm_103");
+    copy.edit_json(|doc| {
+        let e = Copy::entry(doc, "bucketed_rms.Db96");
+        e["stem"] = "bucketed_rms.Db96.M4".into();
+        e["buckets"]["M"] = 4.into();
+        e["dims"]["M"] = serde_json::json!({"buckets": [4, 8], "bucket": 4});
+        let pres = e["preconditions"].as_array_mut().unwrap();
+        pres.retain(|p| p["kind"] != "max_elements");
+        pres.push(serde_json::json!({"kind": "bucket", "dim": "M", "value": 4, "buckets": [4, 8]}));
+    });
+    let manifest = trust(&copy).unwrap();
+    let both = [("Db", 96), ("M", 4)];
+    assert_eq!(manifest.plan("bucketed_rms", &both, arch).unwrap().stem(), "bucketed_rms.Db96.M4");
+    for (name, twice) in [
+        ("bucketed_rms", [("Db", 96), ("Db", 96)]),
+        ("bucketed_rms", [("M", 4), ("M", 4)]),
+        ("bucketed_rms.Db96.M4", [("Db", 96), ("Db", 96)]),
+    ] {
+        match manifest.plan(name, &twice, arch) {
+            Err(Error::Launch(m)) => assert!(m.contains("more than once"), "{twice:?}: {m}"),
+            other => panic!("{name} {twice:?}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn a_manifest_of_an_older_schema_is_refused_with_a_request_to_export_it_again() {
     for older in [1, 2] {
         let copy = Copy::of("sm_103");
