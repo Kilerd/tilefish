@@ -220,7 +220,10 @@ def test_reference_mode_takes_a_device_scalar_as_an_int_and_a_missing_reference_
     w = [weights[k] for k in pm.WEIGHT_NAMES]
     from_int = tilefish.run(pm.block, x, 7, *w, mode="reference")
     from_tensor = tilefish.run(pm.block, x, torch.tensor([7], dtype=torch.int32, device="cuda"), *w, mode="reference")
-    assert same_bytes(from_int, from_tensor)
+    assert same_bytes(from_int, from_tensor) and same_bytes(tilefish.run(pm.block, x, 7.0, *w, mode="reference"), from_int)
+    for how in ("reference", "jit"):  # a number that is not an i32 is refused in every mode (reference mode truncated 3.7 to 3)
+        with pytest.raises(TilefishPreconditionError, match=r"the device scalar 'n' is 3.7, which is not an integer that fits i32"):
+            tilefish.run(pm.block, x, 3.7, *w, mode=how)
 
     @tilefish.extern(triton="gpu_kernels_p2:attention_kernel", num_warps=4, grid=lambda S: (S, pm.HEADS), name="attention_without_a_reference")
     def no_reference(

@@ -659,16 +659,23 @@ def plan_arena(items: "Sequence[ArenaItem]", reuse: bool) -> "tuple[dict[str, in
     order = {i.name: n for n, i in enumerate(items)}
     for it in sorted((i for i in items if reuse and i.reusable), key=lambda i: (i.first, order[i.name])):
         size = align_up(it.bytes)
-        conflicts = sorted((o, o + s) for o, s, other in placed if other.first <= it.last and it.first <= other.last)
-        off = base
-        for a, b in conflicts:
-            if off + size <= a:
-                break
-            off = max(off, b)
+        conflicts = [(o, o + s) for o, s, other in placed if other.first <= it.last and it.first <= other.last]
+        off = first_fit(base, size, conflicts)
         offsets[it.name] = off
         placed.append((off, size, it))
     end = max((offsets[i.name] + align_up(i.bytes) for i in items), default=0)
     return offsets, align_up(end)
+
+
+def first_fit(base: int, size: int, taken: "Sequence[tuple[int, int]]") -> int:
+    """The lowest offset ``>= base`` at which ``[offset, offset + size)`` meets none of the half-open regions ``taken``, which may overlap or nest
+    (:func:`plan_arena` happens to give it disjoint ones: every buffer it conflicts with is live at its first step, so they are live together)."""
+    off = base
+    for a, b in sorted(taken):
+        if off + size <= a:
+            break
+        off = max(off, b)  # a region nested in one already passed ends before it: it must not move the offset back
+    return off
 
 
 # -- the plan --------------------------------------------------------------------------------------------------------------------------
@@ -943,6 +950,10 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
         "buckets": buckets_doc,
     }
     doc["plan_digest"] = plan_digest(doc)
+    try:  # every rule a reader holds a file to, the overlap sweep of the arena among them: what jit runs is checked as a replay's plan is
+        validate_doc(doc, made=True)
+    except TilefishManifestError as e:
+        raise TilefishPlanError(f"graph '{name}': the plan made is not a valid plan (a bug of the planner): {str(e).removeprefix('plan.json: ')}") from e
     made = Plan(graph, doc, callees, variants)
     _check_resolves(made)
     return made
@@ -1019,24 +1030,25 @@ def _keys(obj: Any, where: str, keys: "Sequence[str]", optional: "Sequence[str]"
         _bad(f"{where} must have exactly the fields {list(keys)}" + (f" (and optionally {list(optional)})" if optional else "") + (f"; missing {missing}" if missing else "") + (f"; unknown {unknown}" if unknown else ""))
 
 
-def validate_doc(doc: Any) -> None:
+def validate_doc(doc: Any, *, made: bool = False) -> None:
     """Strict reading of a plan document, with the rules of ``docs/plan-schema-1.md`` (raises :class:`~tilefish.errors.TilefishManifestError`).
 
     Structure and types of every field; the buffers (names, roles, dtypes, shapes over the dimensions, the arena offsets: aligned, inside the arena,
     and overlapping only where ``reuse`` allows it and the buffers' live ranges are disjoint); the buckets (exactly the combinations of ``dims``, in
     order) and the steps (the same kinds and bindings in every bucket, every view inside its buffer, a result bound to a buffer a step may write, a
     buffer written before it is read). What needs the manifest (that an entry exists and its pointers are what the arguments say) is
-    :func:`check_against_manifest`.
+    :func:`check_against_manifest`. ``made``: the document of a plan that was only made (what ``jit`` runs), whose ``arch`` and
+    ``manifest_digest`` are ``null``; every other rule is the same (:func:`plan` checks every plan it makes with it).
     """
     try:
-        _validate(doc)
+        _validate(doc, made)
     except TilefishManifestError:
         raise
     except (KeyError, TypeError, ValueError, AttributeError, IndexError, OverflowError, RecursionError, TilefishError) as e:
         raise TilefishManifestError(f"plan.json is malformed: {type(e).__name__}: {e}") from None
 
 
-def _validate(doc: Any) -> None:
+def _validate(doc: Any, made: bool = False) -> None:
     _keys(doc, "the document", TOP_KEYS)
     if doc["schema"] != PLAN_SCHEMA or type(doc["schema"]) is not str:
         _bad(f"schema must be the string {PLAN_SCHEMA!r}, got {doc['schema']!r}")
@@ -1044,9 +1056,12 @@ def _validate(doc: Any) -> None:
         _bad("tilefish must be a string")
     if not isinstance(doc["graph"], str) or not _NAME.match(doc["graph"]):
         _bad(f"graph must be an identifier, got {doc['graph']!r}")
-    if not isinstance(doc["arch"], str) or not _ARCH.match(doc["arch"]):
+    if made:  # a plan that was only made names no architecture and no manifest (a file always does)
+        if doc["arch"] is not None or doc["manifest_digest"] is not None:
+            _bad(f"a plan that was only made has null arch and manifest_digest, got {doc['arch']!r} and {doc['manifest_digest']!r}")
+    elif not isinstance(doc["arch"], str) or not _ARCH.match(doc["arch"]):
         _bad(f"arch must look like 'sm_103', got {doc['arch']!r}")
-    for key in ("manifest_digest", "plan_digest"):
+    for key in ("plan_digest",) if made else ("manifest_digest", "plan_digest"):
         if not (isinstance(doc[key], str) and _HEX64.match(doc[key])):
             _bad(f"{key} must be 64 lowercase hex digits (a sha256), got {doc[key]!r}")
     if type(doc["reuse"]) is not bool:
@@ -1239,7 +1254,8 @@ def _validate(doc: Any) -> None:
 def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
     """Check a plan document against the manifest it names: the digest, and for every step that the entry exists on the plan's architecture with the
     kind the step says, and that the pointers of its ABI are the arguments the step binds (count, names, dtype, rank, access, and which buffers
-    may be written); a buffer is written before it is read. Raises :class:`~tilefish.errors.TilefishManifestError`."""
+    may be written); a buffer is written before it is read; every output is written by some step of every bucket. Raises
+    :class:`~tilefish.errors.TilefishManifestError`."""
     if manifest.digest != doc["manifest_digest"]:
         _bad(
             f"the plan was built against the manifest with digest {doc['manifest_digest']}, but the manifest in {str(manifest.directory)!r} has digest "
@@ -1285,6 +1301,9 @@ def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
                     _bad(f"{where}: argument '{a['name']}' reads '{buf['name']}' before any step has written it")
                 if writes:
                     written.add(buf["name"])
+        unwritten = [o for o in doc["outputs"] if o not in written]
+        if unwritten:  # a result no step writes would be returned as whatever the caller's (or a fresh) tensor held
+            _bad(f"bucket {bucket['values']}: no step writes the output '{unwritten[0]}' (every returned value is written by a step of every bucket)")
 
 
 def check_anchor(pin: "str | None", trust_directory: bool) -> None:

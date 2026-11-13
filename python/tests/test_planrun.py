@@ -358,6 +358,25 @@ def test_the_arena_belongs_to_the_plan_layout_not_to_a_runner_so_replacing_a_run
     assert be.arenas == 2 and other.arena_of(0) is not arena
 
 
+def test_reference_mode_refuses_a_device_scalar_that_is_not_an_integer_of_its_dtype(monkeypatch):
+    """``3.7`` for a ``DevScalar[i32]`` was truncated to 3 by reference mode (``torch.tensor(3.7, dtype=int32)``) where jit and replay refuse it: refused the same way."""
+    from tilefish import runtime
+
+    def reached(*args, **kwargs):
+        pytest.fail("a tensor was made of a value that is refused")
+
+    monkeypatch.setattr(runtime, "_torch", lambda: SimpleNamespace(int32="torch.int32", bfloat16="torch.bfloat16", tensor=reached))
+    w = Weights(32)
+    for bad in (3.7, -0.5, 2**31, float("nan"), float("inf")):
+        with pytest.raises(TilefishPreconditionError, match="not an integer that fits i32") as e:
+            tilefish.run(pm.block, w.t["x"], bad, *[w.t[k] for k in pm.WEIGHT_NAMES], mode="reference")
+        assert e.value.arg == "n"
+    from tilefish._planrun import devscalar_number
+
+    n = next(p for p in pm.block.signature.params if p.name == "n")
+    assert devscalar_number(n, 7.0) == 7 and type(devscalar_number(n, 7.0)) is int and devscalar_number(n, -(2**31)) == -(2**31)
+
+
 def _run_ops(be):
     """The log of the runs, without what prepares them: the waits, the writes, the launches and the records."""
     return [e for e in be.log if e[0] in ("wait", "record", "devscalar", "launch", "gemm")]

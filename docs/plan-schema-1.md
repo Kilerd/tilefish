@@ -193,7 +193,8 @@ the shapes of the views.
 * a pointer with shape `[]` (a device scalar) is bound to a buffer of role `devscalar`, and only such a pointer is;
 * a pointer with access `out` or `inout` is bound to a buffer whose role is `intermediate`, `output` or `inout` (a step never writes an `input`, a `weight`, a `devscalar`);
 * **a buffer is written before it is read**: a pointer with access `in` or `inout` is bound to a buffer that is `input`, `weight`, `inout` or `devscalar`, or that an earlier step of the same bucket wrote
-  (a pointer with access `out`; an `inout` pointer on a buffer not yet written is refused).
+  (a pointer with access `out`; an `inout` pointer on a buffer not yet written is refused);
+* **every `output` is written** by some step of every bucket (a returned value no step writes would come back as whatever its tensor held).
 
 ### 7.4 What the rules of `validate_doc` say about steps and buckets (no manifest needed)
 
@@ -280,12 +281,14 @@ tilefish.runtime.prepare(graph, mode="replay", plan="build/", pin=p.digest) # ar
 ```
 
 * `buckets` maps a dimension name to the sizes to plan; it defaults to the dimension's own `buckets=` and is required for a dimension that has none. `reuse` defaults to `False`.
-* A `DevScalar` parameter takes an `int` (a number that is not an integer of its dtype is refused), a CPU tensor or a CUDA tensor of one element at a call.
+* A `DevScalar` parameter takes an `int` (a number that is not an integer of its dtype, such as `3.7` for an `i32`, is refused in `jit`, `replay` and `reference` alike: it is never truncated), a CPU tensor or a CUDA tensor of one element at a call.
 * A compile-time argument (`const`) that a call in the graph gives another value than the declared default is refused when the plan is made, as it is at a single launch (the binary has the
   declared value compiled in); the same in `reference` mode.
 * `tilefish.runtime.clear_caches()` resets every runner and frees every arena (after the last execution on it is done), so call it only when no captured graph will be replayed again.
 * `jit` builds the binaries of the plan in memory from the same compile specs and pins the same GEMM algorithms in memory, and runs the *same* runner as `replay`, which differs in where a binary
-  comes from (a manifest verified against the specs); so the two are identical by construction (a test holds them to byte equality).
+  comes from (a manifest verified against the specs); so the two are identical by construction (a test holds them to byte equality). The plan `jit` runs is
+  held to every rule a reader holds a file to (sections 2 and 5 to 8, `validate_doc(doc, made=True)`, the overlap sweep of the arena among them; only its `arch` and
+  `manifest_digest` are `null`): `tilefish.plan` checks every plan it makes.
 
 ## 12. What a plan does not do (version 1)
 

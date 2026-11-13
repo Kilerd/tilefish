@@ -504,19 +504,7 @@ class PlanRunner:
         for p in scalar_params:
             v = bound.arguments[p.name]
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                dtype = p.type.dtype  # type: ignore[union-attr]
-                if dtype.is_int:
-                    lo, hi = dtype.int_range()
-                    try:
-                        fits = v == int(v) and lo <= v <= hi
-                    except (ValueError, OverflowError):  # nan, inf
-                        fits = False
-                    if not fits:
-                        raise TilefishPreconditionError(
-                            f"the device scalar '{p.name}' is {v!r}, which is not an integer that fits {dtype} ({lo} to {hi})", kind="shape", arg=p.name
-                        )
-                    v = int(v)
-                bound.arguments[p.name] = v = be.devscalar_tensor(v, dtype.name)
+                bound.arguments[p.name] = v = be.devscalar_tensor(devscalar_number(p, v), p.type.dtype.name)  # type: ignore[union-attr]
             sources[p.name] = v
         call = bind_call(graph.name, sig, bound.args, bound.kwargs)
         check_dim_constraints(call.dims, buckets=False)
@@ -663,6 +651,22 @@ class PlanRunner:
                         kind="alias",
                         arg=w,
                     )
+
+
+def devscalar_number(p: Any, v: "int | float") -> "int | float":
+    """The value a number passed for the ``DevScalar`` parameter ``p`` is written as: for an integer dtype it must be an integer that fits the dtype
+    (``3.7``, ``nan`` or ``2**31`` for an ``i32`` is refused, not truncated or wrapped), in ``jit``, ``replay`` and ``reference`` alike."""
+    dtype = p.type.dtype
+    if not dtype.is_int:
+        return v
+    lo, hi = dtype.int_range()
+    try:
+        fits = v == int(v) and lo <= v <= hi
+    except (ValueError, OverflowError):  # nan, inf
+        fits = False
+    if not fits:
+        raise TilefishPreconditionError(f"the device scalar '{p.name}' is {v!r}, which is not an integer that fits {dtype} ({lo} to {hi})", kind="shape", arg=p.name)
+    return int(v)
 
 
 # -- tilefish.run of a graph ---------------------------------------------------------------------------------------------------------------
@@ -900,7 +904,7 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
             v = bound.arguments[p.name]
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 dtype = getattr(torch, TORCH_DTYPE_NAMES[p.type.dtype.name].split(".")[1])  # type: ignore[union-attr]
-                bound.arguments[p.name] = torch.tensor(v, dtype=dtype, device=getattr(anchor, "device", None))
+                bound.arguments[p.name] = torch.tensor(devscalar_number(p, v), dtype=dtype, device=getattr(anchor, "device", None))  # 3.7 for an i32 is refused, not truncated
     call = bind_call(graph.name, sig, bound.args, bound.kwargs)
     check_dim_constraints(call.dims, buckets=False)
     dims = call.dims
