@@ -20,7 +20,7 @@ stream-ordered copy (from a CUDA tensor) or an asynchronous copy from pinned mem
 
 **CUDA graphs.** A run under ``torch.cuda.graph(...)`` captures. The things that would make a plan fail to capture are, each refused with a message that
 says so: (1) the arena, the binary of a step (``cuModuleLoadData``, ``cuFuncLoad``) and the cuBLASLt handle must exist, so the plan has to have run once
-(or :func:`prepare` called) outside the capture; (2) the outputs must not be allocated inside the capture unless the graph owns them (pass ``outputs=``);
+(or :func:`prepare` called) outside the capture; (2) outputs allocated inside the capture belong to the graph (torch's private pool): that works, but pass ``outputs=`` to have tensors of your own (and no allocation at all);
 (3) a device scalar passed as an ``int`` or a CPU tensor would be written by a host copy, which cannot be captured: pass a CUDA tensor, which the captured
 copy reads at every replay (write it between replays to change the value); (4) the externals must be the same tensors at every replay (a graph holds
 addresses); (5) the stream must be the one the capture uses (torch's current stream; the capture is of that stream's work only); (6) a plan is not
@@ -53,17 +53,34 @@ from ._plan import PLAN_NAME, Bound, Plan, plan as make_plan
 from .trace import Value
 
 _lock = threading.Lock()
-_default_plans: "weakref.WeakKeyDictionary[GraphOp, Plan]" = weakref.WeakKeyDictionary()
+_arena_lock = threading.Lock()
 _loaded: "dict[tuple, tuple[tuple, Plan, PlanRunner]]" = {}  # (directory, graph) -> (stamp of its files, loaded plan, its runner), until a file in it changes
-_jit_runners: "weakref.WeakKeyDictionary[Plan, PlanRunner]" = weakref.WeakKeyDictionary()
+_runners: "weakref.WeakSet[PlanRunner]" = weakref.WeakSet()  # every runner alive, so that clear_caches can reset them (a runner is kept by its plan or by _loaded, never by a global)
+_torch_backend: "list[TorchBackend]" = []
+
+
+def torch_backend() -> "TorchBackend":
+    """The one :class:`TorchBackend` of the process: the arenas live in it, so every runner of one plan layout on one device shares one."""
+    with _lock:
+        if not _torch_backend:
+            _torch_backend.append(TorchBackend())
+        return _torch_backend[0]
 
 
 def clear_caches() -> None:
-    """Forget every loaded plan and every runner, and free their arenas (for tests, and to give the memory back)."""
+    """Forget every loaded plan, reset every runner (its loaded binaries) and free every arena (for tests, and to give the memory back).
+
+    **A CUDA graph that was captured from a plan holds the address of its arena**, and nothing but this registry keeps the arena alive: the arenas are freed here and nowhere
+    else (not when a runner is replaced, a plan directory re-exported or a plan garbage collected), so call it only when no captured graph of a plan will be replayed again.
+    """
     with _lock:
         _loaded.clear()
-        _jit_runners.clear()
-        _default_plans.clear()
+        runners = list(_runners)
+        backends = list(_torch_backend)
+    for r in runners:
+        r._reset()
+    for b in backends:
+        b.arena_registry().clear()
 
 
 # -- what a runner asks of torch and the driver ---------------------------------------------------------------------------------------------
@@ -72,6 +89,10 @@ def clear_caches() -> None:
 class Backend:
     """What a runner needs from torch and the CUDA driver. :class:`TorchBackend` is the real one; a test passes another that records what it is
     asked to do, which is how the order, the pointers and "nothing is launched when a precondition fails" are tested without a GPU."""
+
+    def arena_registry(self) -> "dict[tuple[str, int], Any]":
+        """The arenas this backend has made, by (layout of the plan, device): one per plan layout and device, kept until :func:`clear_caches`, whichever runners come and go."""
+        return self.__dict__.setdefault("_arena_registry", {})
 
     def device_index(self, device: Any) -> int:
         raise NotImplementedError
@@ -118,12 +139,20 @@ class Backend:
     def warm(self, index: int, library: bool) -> None:
         raise NotImplementedError
 
+    def check_grid(self, loaded: Any, grid: "Sequence[int]") -> None:
+        """Refuse a grid the device cannot launch (it depends on the bucket only, so a runner checks it when it prepares the bucket, not at a launch)."""
+
+    def check_gemm(self, spec: Any, algo: str, index: int) -> None:
+        """Refuse a pinned algorithm that is not valid for the problem on this device, or needs more workspace than recorded (the same: once per bucket)."""
+
 
 class TorchBackend(Backend):
     def __init__(self) -> None:
         self.torch = runtime._torch()
 
     def device_index(self, device: Any) -> int:
+        if isinstance(device, int) and not isinstance(device, bool):
+            return device
         return runtime._device_index(self.torch, str(device))
 
     def capability(self, index: int) -> int:
@@ -191,6 +220,20 @@ class TorchBackend(Backend):
 
             _cublaslt.warm(index)
 
+    def check_grid(self, loaded: Any, grid: "Sequence[int]") -> None:
+        dims = tuple(grid)
+        padded = dims + (1,) * (3 - len(dims))
+        for axis, (g, limit) in enumerate(zip(padded, loaded.grid_limits)):
+            if not 1 <= g <= limit:
+                raise TilefishRuntimeError(
+                    f"'{loaded.built.stem}': the grid {dims} has {g} blocks along {'XYZ'[axis]}, but this device takes 1 to {limit} there"
+                )
+
+    def check_gemm(self, spec: Any, algo: str, index: int) -> None:
+        from . import _cublaslt
+
+        _cublaslt.check_algo(spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index)
+
 
 # -- where a step's binary comes from ----------------------------------------------------------------------------------------------------
 
@@ -256,15 +299,15 @@ class PlanRunner:
         self._doc = plan._doc
         self._buffers = {b["name"]: b for b in self._doc["buffers"]}
         self._rts: "dict[tuple, _BucketRT]" = {}
-        self._arenas: "dict[int, _Arena]" = {}
         self._lock = threading.RLock()
         self.has_library = any(s["kind"] == "library" for s in self._doc["buckets"][0]["steps"])
+        _runners.add(self)
 
     @property
     def backend(self) -> Backend:
         """The backend (torch and the driver, made when first needed: a runner can be made, and a plan loaded, on a machine without torch)."""
         if self._backend is None:
-            self._backend = TorchBackend()
+            self._backend = torch_backend()
         return self._backend
 
     # -- preparing: everything that may allocate or wait ------------------------------------------------------------------------
@@ -282,8 +325,17 @@ class PlanRunner:
                 self._bucket(dict(values), index)
             be.warm(index, self.has_library)
 
+    def _reset(self) -> None:
+        """Forget the binaries this runner loaded (``clear_caches`` unloads every module)."""
+        with self._lock:
+            self._rts.clear()
+
+    def arena_of(self, index: int) -> "_Arena | None":
+        """The arena of this plan's layout on device ``index``, if it exists (it is shared by every runner of that layout, and kept until ``clear_caches``)."""
+        return self.backend.arena_registry().get((self.plan.layout_key, index))
+
     def _arena(self, index: int) -> _Arena:
-        arena = self._arenas.get(index)
+        arena = self.arena_of(index)
         if arena is not None:
             return arena
         be = self.backend
@@ -292,14 +344,14 @@ class PlanRunner:
                 f"the arena of the plan of graph '{self.plan.name}' has not been allocated on device {index} yet, and memory is not allocated while a CUDA "
                 "graph is being captured (the graph would own it): run the plan once outside the capture, or call tilefish.runtime.prepare"
             )
-        with self._lock:
-            arena = self._arenas.get(index)
+        with _arena_lock:
+            arena = self.arena_of(index)
             if arena is None:
                 nbytes = self._doc["arena_bytes"]
                 handle, ptr = be.alloc_arena(nbytes, index) if nbytes else (None, 0)
                 if nbytes and ptr % _plan.ARENA_ALIGNMENT:
                     raise TilefishRuntimeError(f"the arena was allocated at {ptr:#x}, which is not aligned to {_plan.ARENA_ALIGNMENT} bytes")
-                arena = self._arenas[index] = _Arena(handle, ptr, nbytes, threading.Lock())
+                arena = be.arena_registry()[(self.plan.layout_key, index)] = _Arena(handle, ptr, nbytes, threading.Lock())
         return arena
 
     def _bucket(self, values: "Mapping[str, int]", index: int) -> _BucketRT:
@@ -341,13 +393,16 @@ class PlanRunner:
                 if shapes[ws][1][0] < bound.spec.workspace_bytes:
                     raise TilefishManifestError(f"{where}: the workspace '{ws}' has {shapes[ws][1][0]} bytes, but the entry needs {bound.spec.workspace_bytes}")
                 built = self.provider.pin(bound.spec, index)
+                be.check_gemm(bound.spec, built.algo, index)  # once, here: a launch repeats it, but a refusal must not come after another step has run (or inside a capture)
                 steps.append(_StepRT(bound, None, (), built.algo, ws))
             else:
                 built = self.provider.kernel(callee, bound.spec, index)
                 if built.spec.block != bound.spec.block or built.num_warps != bound.spec.num_warps:
                     raise TilefishRuntimeError(f"the binary of '{bound.spec.stem}' disagrees with its spec about num_warps")
                 order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "scalar"))
-                steps.append(_StepRT(bound, be.load(built, index), order, None, None))
+                loaded = be.load(built, index)
+                be.check_grid(loaded, bound.grid)
+                steps.append(_StepRT(bound, loaded, order, None, None))
         be.warm(index, self.has_library)
         return _BucketRT(dict(values), shapes, steps)
 
@@ -389,7 +444,7 @@ class PlanRunner:
         values: "dict[str, int]" = {}
         for n, allowed in doc["dims"].items():
             if n not in by_name:
-                raise TilefishPreconditionError(f"the dimension {n} of graph '{graph.name}' is not determined by the arguments", kind="shape", arg=n)
+                raise TilefishPreconditionError(f"the dimension {n} of graph '{graph.name}' is not determined by the arguments", kind="bucket", arg=n)
             if by_name[n] not in allowed:
                 raise TilefishPreconditionError(
                     f"dimension {n} is {by_name[n]}, which is not one of the buckets {allowed} of the plan of graph '{graph.name}'; a bucketed dimension "
@@ -524,20 +579,21 @@ class PlanRunner:
 
 
 def _default_plan(graph: GraphOp) -> Plan:
-    with _lock:
-        p = _default_plans.get(graph)
+    """``tilefish.plan(graph)``, made once and kept on the graph (an attribute, so that no global table holds the graph or the plan alive)."""
+    p = graph.__dict__.get("_tf_default_plan")
     if p is None:
         p = make_plan(graph)
-        with _lock:
-            _default_plans[graph] = p
+        graph.__dict__.setdefault("_tf_default_plan", p)
+        p = graph.__dict__["_tf_default_plan"]
     return p
 
 
 def _jit_runner(p: Plan) -> PlanRunner:
+    """The runner of a plan that ``jit`` runs, kept on the plan (a plan and its runner are freed together; the arena is in the backend's registry)."""
     with _lock:
-        r = _jit_runners.get(p)
+        r = p._jit_runner
         if r is None:
-            r = _jit_runners[p] = PlanRunner(p, JitProvider())
+            r = p._jit_runner = PlanRunner(p, JitProvider())
     return r
 
 
@@ -557,10 +613,10 @@ def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory
     except TypeError:
         raise TilefishRuntimeError(f"plan= takes a directory (or its plan.json) for replay, got {path!r}") from None
     where, stamp = _directory_stamp(p)
-    key = (where, id(graph))  # one runner per directory and graph: a directory that changed replaces it, and its arena is freed with it
+    key = (where, id(graph))  # one runner per directory and graph: a directory that changed replaces it (its arena stays: a CUDA graph may hold it)
     with _lock:
         found = _loaded.get(key)
-    if found is not None and found[0] == stamp:
+    if found is not None and found[0] == stamp and found[1].graph is graph:
         _, loaded, runner = found
         if pin is not None and loaded.digest != pin:
             raise TilefishManifestError(
@@ -733,7 +789,8 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
     A view operation is torch's (``reshape``, ``permute``, ``select``, ``split``); a call to a lowered ``@tilefish.kernel`` is its IR interpreted
     (:mod:`tilefish._reference`); a pinned cuBLASLt GEMM is an f32 matmul rounded once to bf16; a hand-written extern is its ``reference=`` (a torch
     function given to ``@tilefish.extern``), and an extern that has none is refused. An in-place call on a view updates a copy of it: the IR says
-    a chunk that is updated does not change its parent. Needs no CUDA: it runs where the tensors are.
+    a chunk that is updated does not change its parent. Needs no CUDA: it runs where the tensors are. (A torch view of a tensor that an op then updates in place
+    sees the update here, where the IR says a view keeps the contents it had: a plan refuses such a graph, so the two never disagree on a graph that can be planned.)
     """
     torch = runtime._torch()
     sig = graph.signature
@@ -809,7 +866,9 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
                 device = next(iter(ins.values())).device
                 produced = [_library.reference_gemm(ins).to(device)]
             elif isinstance(op, KernelOp):
-                res = runtime._run_reference(runtime._target(op), (), dict(ins))
+                given = n.attrs.get("consts") or {}
+                changed = {p.name: given[p.name] for p in op_sig.consts if p.name in given and given[p.name] is not p.default}  # refused when it differs from what is compiled in
+                res = runtime._run_reference(runtime._target(op), (), {**ins, **changed})
                 produced = [] if res is None else (list(res) if isinstance(res, tuple) else [res])
                 produced += [ins[p.name] for p in inout]
             elif isinstance(op, ExternOp):

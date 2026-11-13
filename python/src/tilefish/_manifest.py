@@ -89,7 +89,7 @@ def manifest_digest(doc: "dict[str, Any]") -> str:
             body = {"schema": schema, "kernels": kernels}
             tag = LEGACY_DIGEST_TAG
         text = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    except (ValueError, TypeError, AttributeError, KeyError) as e:  # a number that is not finite, a value JSON cannot hold, a malformed entry
+    except (ValueError, TypeError, AttributeError, KeyError, RecursionError) as e:  # a number that is not finite, a value JSON cannot hold, a malformed entry, a document nested too deeply
         raise TilefishManifestError(f"the manifest cannot be digested, it is not plain JSON data: {type(e).__name__}: {e}") from e
     return hashlib.sha256(tag + text.encode("utf-8")).hexdigest()
 

@@ -319,6 +319,56 @@ def test_a_precondition_that_fails_launches_nothing_not_even_the_device_scalar()
     nothing_ran(be)
 
 
+def test_the_arena_belongs_to_the_plan_layout_not_to_a_runner_so_replacing_a_runner_never_frees_what_a_cuda_graph_holds(tmp_path):
+    """A captured graph holds the address of the arena. Runners come and go (a directory is re-exported, jit and replay are both used); the arena stays."""
+    import plan_fakes
+
+    made = tilefish.plan(pm.block)
+    exported = plan_fakes.export(made, tmp_path)
+    be = FakeBackend()
+    first = PlanRunner(made, FakeProvider(), be)
+    first.run(Weights(64).args(), {})
+    arena = first.arena_of(0)
+    assert be.arenas == 1 and arena is not None
+    second = PlanRunner(exported, FakeProvider(), be)  # a replay runner of the same layout: the same arena, though a different plan object and manifest
+    second.run(Weights(64).args(), {})
+    assert be.arenas == 1 and second.arena_of(0) is arena and made.layout_key == exported.layout_key
+    del first
+    third = PlanRunner(made, FakeProvider(), be)
+    third.run(Weights(32).args(), {})
+    assert be.arenas == 1 and third.arena_of(0) is arena  # the arena outlived the runner that made it
+    other = PlanRunner(tilefish.plan(pm.block, reuse=True), FakeProvider(), be)  # another layout is another arena
+    other.run(Weights(64).args(), {})
+    assert be.arenas == 2 and other.arena_of(0) is not arena
+
+
+def test_what_depends_on_the_bucket_only_is_checked_when_the_bucket_is_prepared_not_in_the_middle_of_a_run():
+    """The device's grid limits and the validity of a pinned GEMM algorithm do not depend on an address: a refusal must come before the first launch, and never inside a capture."""
+
+    class Refusing(FakeBackend):
+        def __init__(self, what):
+            super().__init__()
+            self.what = what
+
+        def check_grid(self, loaded, grid):
+            if self.what == "grid" and loaded.stem == "attention":
+                raise TilefishRuntimeError("the grid has too many blocks")
+
+        def check_gemm(self, spec, algo, index):
+            if self.what == "gemm" and spec.stem == "gemm_o.M64":
+                raise TilefishRuntimeError("the pinned algorithm is not valid here")
+
+    for what in ("grid", "gemm"):
+        be = Refusing(what)
+        r, _ = runner(backend=be)
+        with pytest.raises(TilefishRuntimeError, match="too many blocks|not valid here"):
+            r.run(Weights(64).args(), {})
+        assert not be.launches() and not any(e[0] == "devscalar" for e in be.log)  # not one step ran before the refusal
+    be = FakeBackend()
+    r, _ = runner(backend=be)
+    r.prepare(0)  # the checks ran at prepare: a capture that follows has nothing left to refuse
+
+
 def test_a_tensor_of_the_caller_inside_the_arena_is_refused():
     r, be = runner()
     w = Weights(64)

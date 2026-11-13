@@ -481,6 +481,34 @@ def test_a_document_cannot_make_a_reader_do_work_out_of_proportion_to_its_size(g
     assert len(str(e.value)) < 600 and "in all" in str(e.value)
 
 
+def test_a_deeply_nested_or_huge_document_is_a_manifest_error(tmp_path):
+    (tmp_path / "plan.json").write_text('{"schema": "tilefish.plan.v1", "x": ' + "[" * 990 + "]" * 990 + "}")
+    with pytest.raises(TilefishManifestError):
+        _plan.read_plan(tmp_path)  # json parses it, the encoder cannot walk it: a manifest error, not a RecursionError
+    from tilefish._manifest import manifest_digest
+
+    with pytest.raises(TilefishManifestError):
+        manifest_digest({"schema": 3, "kernels": [{"stem": "a", "arch": "b", "x": __import__("functools").reduce(lambda a, _: [a], range(1500), [])}], "library": []})
+    # an integer a double cannot hold (every language reads a plan number as one) is not strict JSON, wherever it is
+    text = json.dumps(tilefish.plan(pm.block).with_manifest("sm_103", "a" * 64).doc)
+    (tmp_path / "plan.json").write_text(text.replace('"arena_bytes": 9634048', '"arena_bytes": ' + str(256 * 10**400)))
+    with pytest.raises(TilefishManifestError, match="does not fit a double|not valid JSON"):
+        _plan.read_plan(tmp_path)
+    (tmp_path / "plan.json").write_text(text.replace('"arena_bytes": 9634048', '"arena_bytes": ' + str(2**53 + 2)))
+    with pytest.raises(TilefishManifestError, match="does not fit a double"):
+        _plan.read_plan(tmp_path)
+
+
+def test_validating_a_plan_with_thousands_of_buffers_that_share_regions_is_fast():
+    import time
+
+    doc = tilefish.plan(pm.deep_block(150), reuse=True).with_manifest("sm_103", "a" * 64).doc
+    assert len(doc["buffers"]) > 1500
+    start = time.perf_counter()
+    _plan.validate_doc(doc)
+    assert time.perf_counter() - start < 2  # a sweep: it was quadratic in the buffers that share one region
+
+
 def test_the_overlap_check_is_a_sweep_that_finds_every_overlapping_pair(good_reuse):
     """Many buffers sharing one region is what reuse makes; a pair in the middle of them that does not have disjoint live ranges is still found."""
     doc = copy.deepcopy(good_reuse)

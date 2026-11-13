@@ -27,13 +27,14 @@ has no copy to make that true). A returned value must be a fresh buffer made by 
 
 from __future__ import annotations
 
+import bisect
 import hashlib
+import heapq
 import itertools
 import json
 import math
 import pathlib
 import re
-import weakref
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -42,6 +43,7 @@ from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
     bind_infos,
+    check_consts,
     check_dim_constraints,
     check_no_alias,
     check_spec_preconditions,
@@ -103,8 +105,8 @@ def plan_digest(doc: "Mapping[str, Any]") -> str:
     try:
         body = {k: v for k, v in doc.items() if k not in ("plan_digest", "tilefish")}
         text = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    except (ValueError, TypeError, AttributeError) as e:
-        raise TilefishManifestError(f"the plan cannot be digested, it is not plain JSON data: {type(e).__name__}: {e}") from e
+    except (ValueError, TypeError, AttributeError, RecursionError) as e:  # RecursionError: a document nested deeper than the encoder can walk
+        raise TilefishManifestError(f"the plan cannot be digested, it is not plain JSON data: {type(e).__name__}: {str(e)[:200]}") from e
     return hashlib.sha256(DIGEST_TAG + text.encode("utf-8")).hexdigest()
 
 
@@ -133,12 +135,10 @@ class Callee:
         return {s.stem: s for s in self.specs}
 
 
-_callees: "weakref.WeakKeyDictionary[Any, Callee]" = weakref.WeakKeyDictionary()  # an op is immutable
-
-
 def callee_of(op: Any) -> Callee:
-    """The :class:`Callee` of a declared operator (cached): raises :class:`~tilefish.errors.TilefishPlanError` for one a plan cannot launch."""
-    found = _callees.get(op)
+    """The :class:`Callee` of a declared operator (cached on the operator: an op is immutable, and no global table keeps it alive through its callee): raises
+    :class:`~tilefish.errors.TilefishPlanError` for one a plan cannot launch."""
+    found = getattr(op, "__dict__", {}).get("_tf_callee")
     if found is not None:
         return found
     from . import _library, runtime
@@ -167,7 +167,7 @@ def callee_of(op: Any) -> Callee:
         raise
     except TilefishError as e:
         raise TilefishPlanError(f"cannot plan the call to '{op.name}': {e}") from e
-    _callees[op] = callee
+    op.__dict__["_tf_callee"] = callee
     return callee
 
 
@@ -218,6 +218,7 @@ class _SymStep:
     args: "list[_Arg]"
     what: str  # for messages: "the call to 'rmsnorm' (node #3)"
     library: bool = False
+    consts: "dict[str, Any] | None" = None  # the compile-time arguments the call gave a value other than the declared default: a binary cannot take them
 
 
 @dataclass
@@ -367,7 +368,9 @@ def _walk(gop: GraphOp) -> _Walk:
                         args.append(_Arg(q.name, loc[ins[pp.name]], pp.access))
                 else:
                     args.append(_Arg(q.name, loc[next(appended)], "out"))
-        steps.append(_SymStep(callee, args, where, library=callee.kind == "library"))
+        given = n.attrs.get("consts") or {}
+        changed = {p.name: given[p.name] for p in sig_op.consts if p.name in given and given[p.name] is not p.default}
+        steps.append(_SymStep(callee, args, where, library=callee.kind == "library", consts=changed))
 
     outputs: "list[_Buffer]" = []
     for i, v in enumerate(g.outputs):
@@ -647,7 +650,8 @@ def plan_arena(items: "Sequence[ArenaItem]", reuse: bool) -> "tuple[dict[str, in
         cursor += align_up(it.bytes)
     base = cursor
     placed: "list[tuple[int, int, ArenaItem]]" = []
-    for it in sorted((i for i in items if reuse and i.reusable), key=lambda i: (i.first, items.index(i))):
+    order = {i.name: n for n, i in enumerate(items)}
+    for it in sorted((i for i in items if reuse and i.reusable), key=lambda i: (i.first, order[i.name])):
         size = align_up(it.bytes)
         conflicts = sorted((o, o + s) for o, s, other in placed if other.first <= it.last and it.first <= other.last)
         off = base
@@ -676,6 +680,8 @@ class Plan:
         self._doc = doc
         self._callees = callees  # entry stem -> the operator whose binary it is
         self._arena_variants = arena_variants
+        self._jit_runner: Any = None  # the runner that ``jit`` made for this plan (kept here, so that a plan and its runner are freed together)
+        self._layout: "str | None" = None
         self.directory: "pathlib.Path | None" = None  # where it was exported to or loaded from (a plan that was only made has none)
         self.manifest: Any = None  # the verified manifest of that directory (:class:`~tilefish.Manifest`)
 
@@ -771,6 +777,15 @@ class Plan:
     def callees(self) -> "dict[str, Callee]":
         return dict(self._callees)
 
+    @property
+    def layout_key(self) -> str:
+        """A digest of everything about the memory layout and the steps but the architecture and the manifest: plans that have it are one arena (a runner of any of them
+        on one device uses the same memory, so an arena outlives the runner and the plan object that made it)."""
+        if self._layout is None:
+            body = {k: v for k, v in self._doc.items() if k not in ("plan_digest", "tilefish", "arch", "manifest_digest")}
+            self._layout = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return self._layout
+
     def with_manifest(self, arch: str, manifest_digest: str) -> "Plan":
         """The same plan built against the manifest ``manifest_digest`` for ``arch`` (its digest changes with them)."""
         doc = {k: v for k, v in self._doc.items() if k != "plan_digest"}
@@ -801,9 +816,6 @@ class Plan:
             f"<Plan {self.name!r}: {len(self._doc['buckets'])} buckets, {len(self._doc['buckets'][0]['steps'])} steps, "
             f"arena {self.arena_bytes} bytes, digest {self.digest[:12]}>"
         )
-
-
-_plans: "weakref.WeakKeyDictionary[GraphOp, dict[Any, Plan]]" = weakref.WeakKeyDictionary()
 
 
 def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
@@ -869,6 +881,11 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
                     entry["view"] = {"shape": list(shape), "strides": list(strides), "offset": offset}
                 args_doc.append(entry)
             bound = resolve_step(s.callee, args_doc, shapes, f"graph '{name}' at {combo or 'its only size'}, {s.what}")
+            if s.consts and s.callee.kind == "kernel":  # a constexpr is compiled into the binary: a call may restate its value, not change it (as for a single launch)
+                try:
+                    check_consts(bound.spec, {s.callee.names[k]: v for k, v in s.consts.items()})
+                except TilefishError as e:
+                    raise TilefishPlanError(f"graph '{name}': {s.what}: {e}") from None
             callees.setdefault(bound.stem, s.callee)
             if callees[bound.stem] is not s.callee:
                 raise TilefishPlanError(
@@ -1180,20 +1197,37 @@ def _validate(doc: Any) -> None:
     end = max((b["offset"] + align_up(b["bytes"]) for b in arena), default=0)
     if not _is_int(doc["arena_bytes"]) or doc["arena_bytes"] != align_up(end):
         _bad(f"arena_bytes must be the end of the last region rounded up to {ARENA_ALIGNMENT} ({align_up(end)}), got {doc['arena_bytes']!r}")
-    active: "list[tuple[int, dict[str, Any]]]" = []  # a sweep over the regions by offset: every pair that overlaps is looked at once, when the later one starts
-    for b in sorted(arena, key=lambda r: (r["offset"], r["bytes"])):
-        active = [(e, o) for e, o in active if e > b["offset"]]
-        for _, a in active:
-            ok = (
-                doc["reuse"]
-                and a["role"] == b["role"] == "intermediate"
-                and a["name"] in first
-                and b["name"] in first
-                and (last[a["name"]] < first[b["name"]] or last[b["name"]] < first[a["name"]])
-            )
-            if not ok:
-                _bad(f"the regions of '{a['name']}' and '{b['name']}' overlap, which only reuse=true allows, and only for two intermediates that no step uses together")
-        active.append((b["offset"] + align_up(b["bytes"]), b))
+    # A sweep over the regions by offset, in O(n log n): the regions that cover the current offset are the *active* ones. A region that may not share (reuse is false, or it is not an
+    # intermediate that some step uses) must start with no active region and have none start under it; the ones that may share must have pairwise disjoint live ranges, which
+    # is kept as a sorted list of ranges (disjoint, so a new range only has to be compared with its two neighbours).
+    heap: "list[tuple[int, int, str, tuple[int, int, str] | None]]" = []  # (end of region, sequence, name, its live range if it shares)
+    lives: "list[tuple[int, int, str]]" = []
+    exclusive = ""  # the name of an active region that may not share, if there is one
+    for seq, b in enumerate(sorted(arena, key=lambda r: (r["offset"], r["bytes"]))):
+        while heap and heap[0][0] <= b["offset"]:
+            _, _, gone, span = heapq.heappop(heap)
+            if span is not None:
+                del lives[bisect.bisect_left(lives, span)]
+            elif gone == exclusive:
+                exclusive = ""
+        name = b["name"]
+        shares = bool(doc["reuse"]) and b["role"] == "intermediate" and name in first
+        overlap = "overlap, which only reuse=true allows, and only for two intermediates that no step uses together"
+        if not shares:
+            if heap:
+                _bad(f"the regions of '{name}' and '{heap[0][2]}' {overlap}")
+            span = None
+            exclusive = name
+        else:
+            if exclusive:
+                _bad(f"the regions of '{name}' and '{exclusive}' {overlap}")
+            span = (first[name], last[name], name)
+            at = bisect.bisect_left(lives, span)
+            for neighbour in (lives[at - 1] if at else None, lives[at] if at < len(lives) else None):
+                if neighbour is not None and neighbour[0] <= span[1] and span[0] <= neighbour[1]:
+                    _bad(f"the regions of '{name}' and '{neighbour[2]}' {overlap}")
+            lives.insert(at, span)
+        heapq.heappush(heap, (b["offset"] + align_up(b["bytes"]), seq, name, span))
     # (that an intermediate or an output is written before it is read needs the access of each pointer, which the manifest has: check_against_manifest)
 
 
@@ -1285,7 +1319,13 @@ def load_plan(path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" =
         raise TilefishManifestError(f"the plan in {str(directory)!r} is the plan of graph '{doc['graph']}', not of '{graph.graph.name}'")
     manifest = Manifest.load(directory)
     check_against_manifest(doc, manifest)
-    derived = plan(graph, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"])
+    try:
+        derived = plan(graph, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"])
+    except (TilefishPlanError, TilefishPreconditionError) as e:  # the graph (or an operator it calls) is not what it was: the plan on disk is stale
+        raise TilefishManifestError(
+            f"the plan in {str(directory)!r} is not the plan of graph '{graph.graph.name}' as this process holds it: the graph can no longer be planned for the "
+            f"same buckets ({str(e)[:400]}); export it again (and pin the new plan)"
+        ) from e
     why = derived.stale_reason(doc)
     if why is not None:
         raise TilefishManifestError(
@@ -1297,6 +1337,16 @@ def load_plan(path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" =
     loaded.manifest = manifest
     manifest.pinned = pin is not None
     return loaded
+
+
+MAX_INT = 1 << 53  # the integers a double holds exactly: a plan number is read as one in every language
+
+
+def _parse_int(text: str) -> int:
+    value = int(text)
+    if abs(value) > MAX_INT:
+        raise TilefishManifestError(f"the plan is not strict JSON: the integer {text[:40]}{'...' if len(text) > 40 else ''} does not fit a double (at most 2**53 in magnitude)")
+    return value
 
 
 def read_plan(path: "str | pathlib.Path", *, pin: "str | None" = None) -> "dict[str, Any]":
@@ -1314,7 +1364,7 @@ def read_plan(path: "str | pathlib.Path", *, pin: "str | None" = None) -> "dict[
     except (OSError, UnicodeDecodeError) as e:
         raise TilefishManifestError(f"cannot read the plan {str(file)!r}: {e}") from e
     try:
-        doc = json.loads(text, parse_constant=_reject_constant, parse_float=_parse_float, object_pairs_hook=_no_duplicate_keys)
+        doc = json.loads(text, parse_constant=_reject_constant, parse_float=_parse_float, parse_int=_parse_int, object_pairs_hook=_no_duplicate_keys)
     except RecursionError as e:
         raise TilefishManifestError(f"the plan {str(file)!r} is nested too deeply to be read") from e
     except TilefishManifestError:

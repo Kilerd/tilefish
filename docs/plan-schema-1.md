@@ -92,7 +92,8 @@ fine (`trust_directory=True` in Python); a replay with neither, or with both, is
 
 ## 4. Strict reading
 
-The file is read as strict JSON, as the manifest is: **no duplicate keys in an object, no `NaN`/`Infinity`, no number that does not fit a double**; a file larger than
+The file is read as strict JSON, as the manifest is: **no duplicate keys in an object, no `NaN`/`Infinity`, no number that does not fit a double** (an integer must be at most 2**53 in
+magnitude, so that every language reads the same number); a file larger than
 256 MiB, nested too deeply, or that is not UTF-8 is refused. An object has exactly the fields listed for it: a missing or an unknown field is a refusal.
 
 **Limits**, so that a document cannot make a reader do work out of proportion to its size (a reader counts before it lists): at most **4096** bucket combinations (the product of the lengths of the
@@ -134,7 +135,7 @@ The file is read as strict JSON, as the manifest is: **no duplicate keys in an o
 | `workspace` | the cuBLASLt workspace: dtype `u8`, shape `[N]` with a static `N` | the arena | (only as the `workspace` of a library step) |
 
 * The buffers listed first are the graph's parameters, in the order of its signature; they have the roles `input`, `weight`, `inout` and `devscalar`. The rest are made by the
-  steps, then the workspace.
+  steps, then the workspace. (Whether a parameter is an `input` or a `weight` is how the writer labels it, from its shape; a reader does not check it, and neither role is written.)
 * A `devscalar` has shape `[]` (one element). There is at most one `workspace`, and it exists exactly when some step has kind `library`; its `bytes` is the
   largest `workspace_bytes` of the library entries the plan uses (a reader requires it to be at least each one's: section 7.3).
 * **The arena** is `arena_bytes` bytes of device memory, allocated once by the host and **aligned to 256 bytes**. The region of an arena buffer is
@@ -216,7 +217,9 @@ the shapes of the views.
 ## 9. What a host does
 
 1. **Load** (section 3): the file, the pin or the trust statement, the manifest, the rules, the entries. Allocate the arena once per device: `arena_bytes` bytes, 256-aligned (nothing if it is 0).
-   Keep it for as long as the plan is in use; **the plan is not reentrant**: two executions of one plan are ordered by the caller (one stream, or an event), because they share the arena.
+   Keep it for as long as the plan is in use, **and for as long as any CUDA graph captured from the plan can be replayed** (the graph holds its address and nothing keeps the memory
+   alive: Python keeps an arena per plan layout and device until `tilefish.runtime.clear_caches()`, however many runners and plan objects come and go; a host that frees an arena must
+   drop the graphs). **The plan is not reentrant**: two executions of one plan are ordered by the caller (one stream, or an event), because they share the arena.
 2. **Bind the externals.** The caller gives a tensor (address, shape, strides, dtype) for every buffer of role `input`, `weight` and `inout`, and for every `output` (or the host allocates it), and a
    value for every `devscalar`. Check each external against its buffer: dtype, rank, contiguous row-major (a parameter is a dense tensor), and bind the dimensions (section 5). Select the bucket.
    The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`), and none may overlap the arena.
@@ -236,9 +239,11 @@ write to device memory but the copy of a device scalar, no module loading, no ha
 graph replays byte-identically** (Python gate: `test_gpu_plan.py`, byte-identical to the uncaptured replay and to per-op eager execution, with 0 allocations inside the capture). What has to be so:
 
 1. **Everything that allocates or waits is done before the capture**: the arena, the loading of every function of the bucket (`cuModuleLoadData`, and `cuFuncLoad` where the driver has it, so
-   that lazy loading does not happen inside the capture), the cuBLASLt handle (`cublasLtCreate`), the validation of the pinned algorithms. Python: run the plan once, or `tilefish.runtime.prepare(graph, ...)`.
-   Python refuses a capture that would do one of these ("has not been prepared").
-2. **The outputs** are tensors the caller gives (`outputs=` in Python) and that stay alive as long as the graph: memory allocated inside a capture belongs to the graph.
+   that lazy loading does not happen inside the capture), the cuBLASLt handle (`cublasLtCreate`), and the checks that depend on the bucket only (the grids against the device's limits,
+   `cublasLtMatmulAlgoCheck` of every pinned algorithm: Python does them when it prepares a bucket, so a refusal comes before the first launch of any run). Python: run the plan once, or
+   `tilefish.runtime.prepare(graph, ...)`. Python refuses a capture that would do one of these ("has not been prepared").
+2. **The outputs** are best tensors the caller gives (`outputs=` in Python) and that stay alive as long as the graph: memory allocated inside a capture belongs to the graph (torch allows it, from the
+   capture's private pool, and Python does not refuse it; it is an allocation inside the capture all the same, so a test that proves there is none passes `outputs=`).
 3. **A device scalar must be written by a captured, device-side copy** from a CUDA tensor of one element: the graph re-reads that tensor at every replay, so changing the value between replays is
    writing that tensor. An `int` or a CPU tensor is a host write (an asynchronous copy from pinned memory is not capturable as a value that changes), and Python refuses it under capture.
 4. **A graph holds addresses, not values**: the externals are the same tensors at every replay (write into them in place), and the arena is the same arena.
@@ -262,7 +267,10 @@ tilefish.runtime.prepare(graph, mode="replay", plan="build/", pin=p.digest) # ar
 ```
 
 * `buckets` maps a dimension name to the sizes to plan; it defaults to the dimension's own `buckets=` and is required for a dimension that has none. `reuse` defaults to `False`.
-* A `DevScalar` parameter takes an `int`, a CPU tensor or a CUDA tensor of one element at a call.
+* A `DevScalar` parameter takes an `int` (a number that is not an integer of its dtype is refused), a CPU tensor or a CUDA tensor of one element at a call.
+* A compile-time argument (`const`) that a call in the graph gives another value than the declared default is refused when the plan is made, as it is at a single launch (the binary has the
+  declared value compiled in); the same in `reference` mode.
+* `tilefish.runtime.clear_caches()` resets every runner and frees every arena, so call it only when no captured graph will be replayed again.
 * `jit` builds the binaries of the plan in memory from the same compile specs and pins the same GEMM algorithms in memory, and runs the *same* runner as `replay`, which differs in where a binary
   comes from (a manifest verified against the specs); so the two are identical by construction (a test holds them to byte equality).
 

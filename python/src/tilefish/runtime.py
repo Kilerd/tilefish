@@ -136,7 +136,6 @@ MODES = ("jit", "replay", "reference")
 
 _lock = threading.Lock()
 _builds: "dict[tuple, BuiltKernel]" = {}
-_lowered: "weakref.WeakKeyDictionary[KernelOp, LoweredKernel]" = weakref.WeakKeyDictionary()
 _specs: "weakref.WeakKeyDictionary[ExternOp, list[CompileSpec]]" = weakref.WeakKeyDictionary()  # an op is immutable
 _manifests: "dict[tuple, Manifest]" = {}  # a loaded manifest directory, until a file in it changes
 _modules: "dict[str, Any]" = {}  # sha256 of a lowered source -> the imported JITFunction
@@ -210,12 +209,12 @@ class _Target:
 
 
 def _lower_cached(kernel: KernelOp) -> LoweredKernel:
-    with _lock:
-        low = _lowered.get(kernel)
+    """The lowering of a kernel, made once and kept on the kernel (a table keyed weakly by the kernel would never let it go: the lowering points back at it)."""
+    low = kernel.__dict__.get("_tf_lowered")
     if low is None:
         low = lower(kernel)
         with _lock:
-            _lowered[kernel] = low
+            low = kernel.__dict__.setdefault("_tf_lowered", low)
     return low
 
 

@@ -462,6 +462,48 @@ def test_two_returned_values_are_named_in_the_order_the_graph_returns_them():
     assert [(a["name"], a["binding"]) for a in last["args"]] == [("x", "out1"), ("y", "a"), ("out", "out0")]
 
 
+def test_a_constexpr_the_call_changes_cannot_be_planned_because_the_binary_has_the_declared_value_compiled_in():
+    """A single launch refuses it (``check_consts``); a step is checked exactly as a single launch is, so a plan must not quietly run the declared value instead."""
+
+    @tilefish.graph
+    def changed(x: Tensor[pm.M, pm.D, bf16], w: Tensor[pm.D, bf16]) -> Tensor[pm.M, pm.D, bf16]:
+        return pm.rmsnorm(x, w, eps=1e-3)  # rmsnorm is declared with eps=1e-6
+
+    with pytest.raises(TilefishPlanError, match=r"the call to 'rmsnorm' \(node #0\): constexpr 'eps' is compiled into 'rmsnorm' as 1e-06; it cannot be changed to 0.001"):
+        tilefish.plan(changed)
+
+    @tilefish.graph
+    def restated(x: Tensor[pm.M, pm.D, bf16], w: Tensor[pm.D, bf16]) -> Tensor[pm.M, pm.D, bf16]:
+        return pm.rmsnorm(x, w, eps=1e-6)  # the declared value, restated: fine
+
+    assert [s["entry"] for s in tilefish.plan(restated).steps(M=32)] == ["rmsnorm"]
+
+
+def test_nothing_a_plan_caches_keeps_a_plan_a_graph_or_an_operator_alive():
+    """A table keyed weakly by an object whose value points back at the key never lets go: the runner of a plan, the default plan of a graph and the callee of an op are
+    kept on the object they belong to, so a cycle is all they are and the collector frees it (and the arena is in the backend's registry, by layout)."""
+    import gc
+    import weakref
+
+    from tilefish import _planrun
+
+    @tilefish.kernel
+    def local_op(x: Tensor[Q, W, f32]) -> Tensor[Q, W, f32]:
+        return x * 5.0
+
+    @tilefish.graph
+    def local_graph(a: Tensor[Q, W, f32]) -> Tensor[Q, W, f32]:
+        return local_op(a)
+
+    p = tilefish.plan(local_graph)
+    runner = _planrun._jit_runner(p)
+    default = _planrun._default_plan(local_graph)
+    refs = [weakref.ref(x) for x in (p, runner, default, local_graph, local_op)]
+    del p, runner, default, local_graph, local_op
+    gc.collect()
+    assert [r() for r in refs] == [None] * 5
+
+
 def test_two_operators_with_one_name_would_share_a_manifest_entry_and_are_refused():
     @tilefish.kernel(name="same")
     def one(x: Tensor[Q, W, f32]) -> Tensor[Q, W, f32]:
