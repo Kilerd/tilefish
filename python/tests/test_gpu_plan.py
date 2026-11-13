@@ -574,7 +574,7 @@ def test_the_offsets_are_the_same_in_every_bucket_so_one_arena_serves_all(export
     from tilefish import _planrun
 
     runner = next(iter(_planrun._loaded.values()))[2]
-    arena = runner._arenas[torch.cuda.current_device()]
+    arena = runner.arena_of(torch.cuda.current_device())
     assert arena.nbytes == p.arena_bytes and arena.ptr % 256 == 0
     # run every bucket and read an intermediate back from the arena at its one offset: the qkv of every bucket is where the plan says
     off = {b["name"]: b["offset"] for b in p.buffers}
