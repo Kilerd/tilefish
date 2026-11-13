@@ -86,7 +86,8 @@ fn a_damaged_manifest_is_an_error_never_a_panic() {
         .filter(|p| p.extension().is_some_and(|x| x == "cubin"))
         .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
         .collect();
-    assert_eq!(cubins.len(), 12);
+    let entries = Manifest::load(&dir, Pin::TrustDirectory).unwrap().entries().len();
+    assert_eq!(cubins.len(), entries, "a cubin for every entry of the fixture");
     let files: Vec<(&str, &[u8])> = cubins.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
     let mut rng = Lcg(3);
     let mut accepted = 0;

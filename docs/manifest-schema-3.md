@@ -1,8 +1,9 @@
 # Manifest schema 3
 
 This is the specification of what manifest schema 3 adds to schema 2. The Python package writes and reads schema 3 (`tilefish.runtime.export`,
-`tilefish.Manifest.load`); the Rust crate `tilefish` 0.0.1 reads schema 2 only. A Rust lane implements this document. Everything here is checked
-by tests in `python/tests/` (named in the last section), and the Python code that writes each field is named where the field is described.
+`tilefish.Manifest.load`), and so does the Rust crate `tilefish` of this repository (the published 0.0.1 reads schema 2 only; section 12 says what the
+crate does with each part of this document). Everything here is checked by tests in `python/tests/` and in `crates/tilefish/tests/` (named in the last
+section), and the Python code that writes each field is named where the field is described.
 
 A reader of this document is assumed to know schema 2: the entry fields of a Triton kernel, `abi`, `dims`, `preconditions`, the dimension
 expression grammar, the canonical JSON of the digest, and the launch checks the crate already makes. Only what is new or changed is specified; a
@@ -60,11 +61,14 @@ sha256( b"tilefish.manifest-digest.v3\0" + canonical_json({"schema": 3, "kernels
 * The digest of the empty schema 3 manifest, `{"schema":3,"kernels":[],"library":[]}`, is
   `f66955caeb4e878dbe95483da2607d19ea4f734977e86282fff6f92f1a87fe6e` (a test vector; `test_manifest_schema3.py` recomputes it from the definition
   above). The empty schema 2 manifest `{"schema":2,"kernels":[]}` has `a3593eed6b463f7408711b92645197eda2e7bc5f2830b138b40e33ceedc1cfc8`.
-* The digest of a schema 2 document (`{"schema":2,"kernels":[...]}`, tag `v2`) is still computable by the same function: it is what the crate 0.0.1
-  computes for the manifests it reads, and `crates/tilefish/tests/fixtures/expected.json` holds. A document whose `schema` is any other value than 3 is
-  digested in that same schema 2 form with whatever `schema` says (a reader refuses it, a digest function does not: the cross-language test vectors of
-  `crates/tilefish/tests/data/python_manifests.in` include such documents, and `export_rust_vectors.py` still reproduces them byte for byte). A
-  schema 3 digest is never equal to a schema 2 one.
+* The digest of a schema 2 document (`{"schema":2,"kernels":[...]}`, tag `v2`) is still computable by the same function: it is what the published
+  crate 0.0.1 computed for the manifests it read. A document whose `schema` is any other value than 3 is digested in that same schema 2 form with
+  whatever `schema` says (a reader refuses it, a digest function does not: the cross-language test vectors of
+  `crates/tilefish/tests/data/python_manifests.in` include such documents, and `export_rust_vectors.py` reproduces them byte for byte). "Is 3" is Python's
+  `schema == 3`: the integer `3` and the float `3.0` are (a document with `"schema": 3.0` is digested in the schema 3 form, with `3.0` in the text), `true`
+  and `"3"` are not. A schema 3 document without a `library` list, a `kernels` or `library` that is not a list, and an entry that is not an object cannot be
+  digested (the same file `python_manifests.in` lists them in `MANIFEST_ERRORS`; the Rust `manifest_digest` returns an error for each). A schema 3 digest is
+  never equal to a schema 2 one.
 
 ## 4. Kernel entries
 

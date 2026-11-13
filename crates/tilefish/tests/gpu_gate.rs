@@ -40,8 +40,8 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, result};
 use serde_json::Value;
 use tilefish::{
-    Access, Arch, Bf16, DevicePtr, Element, Error, F16, F32, Manifest, Pin, PreconditionKind, TensorMut, TensorRef,
-    elf::sha256_hex,
+    Access, Arch, Bf16, DType, DevicePtr, Element, Error, F16, F32, I32, I64, Manifest, Pin, PreconditionKind,
+    TensorArg, TensorMut, TensorRef, U8, elf::sha256_hex,
 };
 
 fn gate_dir() -> PathBuf {
@@ -72,11 +72,11 @@ impl Gpu {
     }
 
     fn upload(&self, bytes: &[u8]) -> Buf {
-        Buf { slice: self.stream.clone_htod(bytes).expect("upload"), shape: Vec::new() }
+        Buf { slice: self.stream.clone_htod(bytes).expect("upload"), shape: Vec::new(), view: None }
     }
 
     fn zeros(&self, nbytes: usize) -> Buf {
-        Buf { slice: self.stream.alloc_zeros::<u8>(nbytes).expect("alloc"), shape: Vec::new() }
+        Buf { slice: self.stream.alloc_zeros::<u8>(nbytes).expect("alloc"), shape: Vec::new(), view: None }
     }
 
     fn download(&self, buf: &Buf) -> Vec<u8> {
@@ -108,10 +108,12 @@ impl Gpu {
     }
 }
 
-/// A device buffer of bytes and the shape of the tensor it holds.
+/// A device buffer of bytes and the tensor it holds: a shape, and for a view of the buffer its element strides and the element offset of
+/// its first element (the buffer is then the storage of a larger tensor, and the tensor a view of it).
 struct Buf {
     slice: CudaSlice<u8>,
     shape: Vec<usize>,
+    view: Option<(Vec<usize>, usize)>,
 }
 
 impl Buf {
@@ -120,19 +122,51 @@ impl Buf {
         self
     }
 
+    /// The tensor is the view with these element strides, starting at this element of the buffer.
+    fn viewed(mut self, strides: &[usize], offset: usize) -> Self {
+        self.view = Some((strides.to_vec(), offset));
+        self
+    }
+
     fn nbytes(&self) -> u64 {
         self.slice.len() as u64
     }
 }
 
-/// A read-only tensor over a buffer, as cudarc sees it: no `unsafe`, and refused when the shape does not fit.
+/// A read-only tensor over a buffer, as cudarc sees it: no `unsafe`, and refused when the shape does not fit. A buffer that holds a view
+/// is a view of it (`TensorRef::from_cuda_strided`).
 fn r<T: Element>(b: &Buf) -> Result<TensorRef<'_, T>, Error> {
-    TensorRef::from_cuda(&b.slice, &b.shape)
+    match &b.view {
+        Some((strides, offset)) => TensorRef::from_cuda_strided(&b.slice, &b.shape, strides, *offset),
+        None => TensorRef::from_cuda(&b.slice, &b.shape),
+    }
 }
 
 /// A tensor the kernel writes, over a buffer.
 fn m<T: Element>(b: &mut Buf) -> Result<TensorMut<'_, T>, Error> {
-    TensorMut::from_cuda(&mut b.slice, &b.shape)
+    match &b.view {
+        Some((strides, offset)) => TensorMut::from_cuda_strided(&mut b.slice, &b.shape, strides, *offset),
+        None => TensorMut::from_cuda(&mut b.slice, &b.shape),
+    }
+}
+
+/// The tensor of a case as a launch argument without a Rust element type: `dtype` is the name the manifest uses, `role` says whether the
+/// kernel writes it.
+fn arg_of<'a>(buf: &'a mut Buf, dtype: &str, role: &str) -> Result<TensorArg<'a>, Error> {
+    macro_rules! typed {
+        ($t:ty) => {
+            if role == "in" { r::<$t>(buf)?.into_arg() } else { m::<$t>(buf)?.into_arg() }
+        };
+    }
+    Ok(match dtype {
+        "bf16" => typed!(Bf16),
+        "f16" => typed!(F16),
+        "f32" => typed!(F32),
+        "i32" => typed!(I32),
+        "i64" => typed!(I64),
+        "u8" => typed!(U8),
+        other => panic!("the gate does not know the dtype {other}"),
+    })
 }
 
 fn read(path: &Path) -> Vec<u8> {
@@ -140,11 +174,17 @@ fn read(path: &Path) -> Vec<u8> {
 }
 
 /// Launch the launcher a case names, on typed tensors made of cudarc slices: a launcher whose signature changed does not compile.
-/// `bufs` are the tensors of the case in the order of the launcher's parameters.
-fn launch(gpu: &Gpu, manifest: &Manifest, launcher: &str, bufs: &mut [Buf]) -> Result<(), Error> {
+/// `bufs` are the tensors of the case in the order of the launcher's parameters. A case that no typed arm below knows (the library
+/// operations among them, which have a workspace the typed arms would also need) goes through `Manifest::kernel` or `Manifest::gemm` and
+/// untyped `TensorArg`s of the same slices (`launch_generic`).
+fn launch(gpu: &Gpu, manifest: &Manifest, case: &Value, bufs: &mut [Buf]) -> Result<(), Error> {
     use generated::*;
     let s: &CudaStream = &gpu.stream;
-    match (launcher, bufs) {
+    let launcher = case["launcher"].as_str().expect("the case names its launcher");
+    if case["kind"] == "gemm" {
+        return launch_generic(gpu, manifest, case, bufs);
+    }
+    match (launcher, &mut *bufs) {
         ("Softmax", [x, o]) => Softmax::load(manifest, &gpu.ctx)?.launch(s, r::<F32>(x)?, m::<F32>(o)?),
         ("Layernorm", [x, w, b, o]) => {
             Layernorm::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(x)?, r::<Bf16>(w)?, r::<Bf16>(b)?, m::<Bf16>(o)?)
@@ -175,8 +215,29 @@ fn launch(gpu: &Gpu, manifest: &Manifest, launcher: &str, bufs: &mut [Buf]) -> R
         ("GeluErf", [x, y]) => GeluErf::load(manifest, &gpu.ctx)?.launch(s, r::<Bf16>(x)?, m::<Bf16>(y)?),
         ("Axpy", [x, y]) => Axpy::load(manifest, &gpu.ctx)?.launch(s, r::<F32>(x)?, m::<F32>(y)?),
         ("Mm", [a, b, c]) => Mm::load(manifest, &gpu.ctx)?.launch(s, r::<F16>(a)?, r::<F16>(b)?, m::<F32>(c)?),
-        (other, bufs) => panic!("the gate does not know the launcher {other} with {} tensors", bufs.len()),
+        _ => launch_generic(gpu, manifest, case, bufs),
     }
+}
+
+/// The same launch through `Manifest::kernel` (or `Manifest::gemm`, with a workspace of the entry's size) and `TensorArg`s.
+fn launch_generic(gpu: &Gpu, manifest: &Manifest, case: &Value, bufs: &mut [Buf]) -> Result<(), Error> {
+    let s: &CudaStream = &gpu.stream;
+    let stem = case["stem"].as_str().expect("the case names its stem");
+    let arch = Arch::of_context(&gpu.ctx)?;
+    let mut args: Vec<TensorArg<'_>> = Vec::new();
+    for (t, buf) in case["tensors"].as_array().unwrap().iter().zip(bufs.iter_mut()) {
+        args.push(arg_of(buf, t["dtype"].as_str().unwrap(), t["role"].as_str().unwrap())?);
+    }
+    if case["kind"] == "gemm" {
+        let gemm = manifest.gemm(&gpu.ctx, stem, &[], arch)?;
+        let mut workspace = gemm.alloc_workspace(&gpu.stream)?;
+        let shape = [workspace.len()];
+        args.push(TensorMut::<U8>::from_cuda(&mut workspace, &shape)?.into_arg());
+        gemm.launch(s, &mut args)?;
+        // the workspace is freed after the launch: cudarc orders its free behind the GEMM that used it
+        return Ok(());
+    }
+    manifest.kernel(&gpu.ctx, stem, &[], arch)?.launch(s, &mut args)
 }
 
 /// Upload the tensors of a case: the inputs from their files, the outputs as zeros. In the order of the launcher's ABI.
@@ -189,12 +250,18 @@ fn tensors_of(gpu: &Gpu, case: &Value) -> Vec<(String, Buf)> {
             let shape: Vec<usize> =
                 t["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect();
             let nbytes = t["nbytes"].as_u64().unwrap() as usize;
-            let buf = if t["role"] == "out" {
+            let mut buf = if t["role"] == "out" {
                 gpu.zeros(nbytes)
             } else {
                 gpu.upload(&read(&gate_dir().join(t["input"].as_str().unwrap())))
             };
             assert_eq!(buf.slice.len(), nbytes);
+            if let Some(strides) = t.get("strides") {
+                // a view: the buffer is the storage of a larger tensor, and the tensor starts `offset` elements into it
+                let strides: Vec<usize> =
+                    strides.as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect();
+                buf = buf.viewed(&strides, t["offset"].as_u64().unwrap() as usize);
+            }
             (t["name"].as_str().unwrap().to_owned(), buf.shaped(&shape))
         })
         .collect()
@@ -209,7 +276,7 @@ fn run_cases(gpu: &Gpu, manifest: &Manifest, subdir: &str) -> usize {
     for case in cases["cases"].as_array().unwrap() {
         let id = case["id"].as_str().unwrap();
         let (names, mut bufs): (Vec<String>, Vec<Buf>) = tensors_of(gpu, case).into_iter().unzip();
-        launch(gpu, manifest, case["launcher"].as_str().unwrap(), &mut bufs).unwrap_or_else(|e| panic!("{id}: {e}"));
+        launch(gpu, manifest, case, &mut bufs).unwrap_or_else(|e| panic!("{id}: {e}"));
         let case_dir = out_dir.join(id);
         std::fs::create_dir_all(&case_dir).unwrap();
         for (name, buf) in names.iter().zip(&bufs) {
@@ -965,4 +1032,658 @@ fn launch_raw_puts_back_the_current_context() {
     });
     assert_eq!(gpu.download(&y), expect, "and the launches computed what Python's replay did");
     println!("rust gate: launch_raw restores the current context ({devices} device(s))");
+}
+
+// -- manifest schema 3: views, device scalars, prebuilt binaries and the library section ---------------------------------------------------
+
+fn cases_where(cases: &Value, keep: impl Fn(&Value) -> bool) -> Vec<Value> {
+    cases["cases"].as_array().unwrap().iter().filter(|c| keep(c)).cloned().collect()
+}
+
+fn tensors_json(case: &Value) -> &Vec<Value> {
+    case["tensors"].as_array().unwrap()
+}
+
+fn has_view(case: &Value) -> bool {
+    tensors_json(case).iter().any(|t| t.get("strides").is_some())
+}
+
+fn has_device_scalar(case: &Value) -> bool {
+    tensors_json(case).iter().any(|t| t["shape"].as_array().is_some_and(|s| s.is_empty()))
+}
+
+fn is_gemm(case: &Value) -> bool {
+    case["kind"] == "gemm"
+}
+
+fn element_size(dtype: &str) -> u64 {
+    match dtype {
+        "bf16" | "f16" => 2,
+        "f32" | "i32" => 4,
+        "i64" => 8,
+        _ => 1,
+    }
+}
+
+/// What the gate holds, by the feature of schema 3 each case is about: the claim is that every one of them is launched by Rust and the bytes it
+/// leaves are the bytes Python's replay left (that is `byte_identity`), so a gate that does not hold them says so here.
+#[test]
+fn the_gate_has_a_case_for_every_feature_of_schema_3() {
+    let cases = cases();
+    let all = cases_where(&cases, |_| true);
+    let views = cases_where(&cases, has_view);
+    let device_scalars = cases_where(&cases, has_device_scalar);
+    let gemms = cases_where(&cases, is_gemm);
+    let biased = cases_where(&cases, |c| is_gemm(c) && tensors_json(c).len() == 4);
+    // an unaligned view: one whose first element is not on a 16-byte boundary
+    let unaligned = cases_where(&cases, |c| {
+        tensors_json(c).iter().any(|t| {
+            t.get("offset")
+                .is_some_and(|o| !(o.as_u64().unwrap() * element_size(t["dtype"].as_str().unwrap())).is_multiple_of(16))
+        })
+    });
+    let ms: std::collections::BTreeSet<u64> =
+        gemms.iter().map(|c| tensors_json(c)[0]["shape"][0].as_u64().unwrap()).collect();
+    println!(
+        "rust gate: {} cases: {} of views ({} of them starting off a 16-byte boundary), {} of device scalars, {} of GEMMs ({} with a bias; M in {:?})",
+        all.len(),
+        views.len(),
+        unaligned.len(),
+        device_scalars.len(),
+        gemms.len(),
+        biased.len(),
+        ms
+    );
+    assert!(views.len() >= 30 && !unaligned.is_empty(), "the strided cases of the gate");
+    assert!(device_scalars.len() >= 7, "the device scalar cases of the gate");
+    assert!(
+        !gemms.is_empty() && !biased.is_empty() && [32, 64, 320].iter().all(|m| ms.contains(m)),
+        "the GEMM cases of the gate"
+    );
+    // the prebuilt binaries: PTX with fixed arguments of each type, and a cubin
+    let stems: std::collections::BTreeSet<String> =
+        all.iter().map(|c| c["stem"].as_str().unwrap().to_owned()).collect();
+    for stem in ["gelu_ptx", "softmax_ptx", "axpy_ptx", "strided_copy", "axpy_cubin"] {
+        assert!(stems.contains(stem), "the gate has no case of the prebuilt binary {stem}: {stems:?}");
+    }
+}
+
+/// A copy of the gate's manifest directory in a fresh temporary directory.
+fn copy_of_the_manifest(name: &str) -> PathBuf {
+    let dir = gate_dir().join(cases()["manifest"].as_str().unwrap());
+    let tmp = std::env::temp_dir().join(format!("tilefish-gate-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    for f in std::fs::read_dir(&dir).unwrap() {
+        let f = f.unwrap();
+        std::fs::copy(f.path(), tmp.join(f.file_name())).unwrap();
+    }
+    tmp
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn write_json(path: &Path, doc: &Value) {
+    std::fs::write(path, serde_json::to_string_pretty(doc).unwrap()).unwrap();
+}
+
+/// What only the new entries can refuse: a view that reaches past its slice or starts where its binary was not compiled for, a device scalar
+/// that is not one element, a workspace that is too small or missing, a bucket that is not exact, a cuBLASLt of another version, an
+/// algorithm that cuBLASLt would not have written, a cubin of another architecture, an old schema.
+#[test]
+fn refusals_of_schema_3() {
+    let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
+    let s: &CudaStream = &gpu.stream;
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let mut refused = 0;
+    let mut check = |what: &str, ok: bool| {
+        assert!(ok, "{what}");
+        refused += 1;
+        println!("rust gate: refused: {what}");
+    };
+
+    // a view that reaches further than its slice
+    let dense_bytes = 40 * 8 * 64 * 2;
+    let x = gpu.zeros(dense_bytes);
+    let (shape, strides, dense_strides) = ([40usize, 8, 64], [1536usize, 64, 1], [512usize, 64, 1]);
+    let e = TensorRef::<Bf16>::from_cuda_strided(&x.slice, &shape, &strides, 0).unwrap_err();
+    check(
+        "a view whose extent passes its slice (a [40, 8, 64] bf16 view of row stride 1536 of a slice for the dense tensor)",
+        matches!(&e, Error::Launch(m) if m.contains("reaches") && m.contains("but the region has")),
+    );
+    let e = TensorRef::<Bf16>::from_cuda_strided(&x.slice, &shape, &dense_strides, 1).unwrap_err();
+    check("... and a dense view that starts one element in", matches!(&e, Error::Launch(_)));
+    // SAFETY: the region is the buffer's own and outlives the (refused) construction.
+    let region = unsafe { gpu.region(&x, x.nbytes()) };
+    check("... and the same over a region", TensorRef::<Bf16>::new_strided(region, &shape, &strides, 0).is_err());
+
+    // Strided[..., 16]: a view that starts where 16 does not divide the address is refused, and one that does is run
+    assert!(cases_where(&cases, |c| c["stem"] == "head_copy16").len() >= 3, "the gate has head_copy16");
+    let kernel = manifest.kernel(&gpu.ctx, "head_copy16", &[], arch).unwrap();
+    let flat = gpu.zeros((40 * 8 * 64 + 32) * 2);
+    let mut y = gpu.zeros(dense_bytes);
+    let y_shape = [40usize, 8, 64];
+    for offset in [1usize, 2, 3, 5, 7, 9] {
+        let view = TensorRef::<Bf16>::from_cuda_strided(&flat.slice, &shape, &dense_strides, offset).unwrap();
+        let out = TensorMut::<Bf16>::from_cuda(&mut y.slice, &y_shape).unwrap();
+        let e = kernel.launch(s, &mut [view.into_arg(), out.into_arg()]).unwrap_err();
+        assert!(
+            e.precondition_kind() == Some(PreconditionKind::PointerAlignment)
+                && e.to_string().contains("not aligned to 16 bytes"),
+            "offset {offset}: {e}"
+        );
+    }
+    check(
+        "a Strided[..., 16] view that starts off a 16-byte boundary (offsets 1, 2, 3, 5, 7, 9), and nothing was written",
+        gpu.download(&y).iter().all(|b| *b == 0),
+    );
+    for offset in [0usize, 8, 16] {
+        let view = TensorRef::<Bf16>::from_cuda_strided(&flat.slice, &shape, &dense_strides, offset).unwrap();
+        let out = TensorMut::<Bf16>::from_cuda(&mut y.slice, &y_shape).unwrap();
+        kernel.launch(s, &mut [view.into_arg(), out.into_arg()]).unwrap();
+    }
+    check("... and the views that start on 16 bytes (offsets 0, 8, 16) are launched", true);
+    // a stride the binary fixes: the last axis is unit stride
+    let wide = [1024usize, 128, 2];
+    let flat2 = gpu.zeros(40 * 1024 * 2);
+    let view = TensorRef::<Bf16>::from_cuda_strided(&flat2.slice, &shape, &wide, 0).unwrap();
+    let out = TensorMut::<Bf16>::from_cuda(&mut y.slice, &y_shape).unwrap();
+    let e = kernel.launch(s, &mut [view.into_arg(), out.into_arg()]).unwrap_err();
+    check("a view whose last axis is not unit stride", e.precondition_kind() == Some(PreconditionKind::Stride));
+
+    // a device scalar is one element
+    assert!(!cases_where(&cases, |c| c["stem"] == "masked_rows").is_empty(), "the gate has masked_rows");
+    let masked_rows = manifest.kernel(&gpu.ctx, "masked_rows", &[], arch).unwrap();
+    let (xs, mut ys, two) = (gpu.zeros(64 * 128 * 4), gpu.zeros(64 * 128 * 4), gpu.zeros(8));
+    let (rows, tok) = ([64usize, 128], [2usize]);
+    let args = [
+        TensorRef::<F32>::from_cuda(&xs.slice, &rows).unwrap().into_arg(),
+        TensorMut::<F32>::from_cuda(&mut ys.slice, &rows).unwrap().into_arg(),
+        TensorRef::<I32>::from_cuda(&two.slice, &tok).unwrap().into_arg(),
+    ];
+    let e = masked_rows.launch(s, &mut { args }).unwrap_err();
+    check("a device scalar of two elements", e.precondition_kind() == Some(PreconditionKind::Shape));
+
+    // the library: a GEMM with a bias for this architecture
+    assert!(!manifest.library().is_empty(), "the gate's manifest has library entries");
+    let entry = manifest
+        .library()
+        .iter()
+        .find(|e| e.implementation.has_bias() && e.arch == arch.to_string())
+        .expect("a gemm_bias for this architecture");
+    let gemm = manifest.gemm(&gpu.ctx, &entry.stem, &[], arch).unwrap();
+    let (m, n, k) = (entry.m as usize, entry.n as usize, entry.k as usize);
+    let (a, b, bias) = (gpu.zeros(m * k * 2), gpu.zeros(n * k * 2), gpu.zeros(n * 2));
+    let (mut out, mut tiny, mut workspace) =
+        (gpu.zeros(m * n * 2), gpu.zeros(16), gemm.alloc_workspace(&gpu.stream).unwrap());
+    let (a_shape, b_shape, bias_shape, out_shape, tiny_shape, ws_shape) =
+        ([m, k], [n, k], [n], [m, n], [16usize], [workspace.len()]);
+    macro_rules! operands {
+        ($out:expr, $workspace:expr $(,)?) => {
+            [
+                TensorRef::<Bf16>::from_cuda(&a.slice, &a_shape).unwrap().into_arg(),
+                TensorRef::<Bf16>::from_cuda(&b.slice, &b_shape).unwrap().into_arg(),
+                TensorRef::<Bf16>::from_cuda(&bias.slice, &bias_shape).unwrap().into_arg(),
+                $out,
+                $workspace,
+            ]
+        };
+    }
+    let e = gemm
+        .launch(
+            s,
+            &mut operands!(
+                TensorMut::<Bf16>::from_cuda(&mut out.slice, &out_shape).unwrap().into_arg(),
+                TensorMut::<U8>::from_cuda(&mut tiny.slice, &tiny_shape).unwrap().into_arg(),
+            ),
+        )
+        .unwrap_err();
+    check(
+        "a GEMM workspace that is too small",
+        e.precondition_kind() == Some(PreconditionKind::Shape) && e.to_string().contains("workspace"),
+    );
+    let e = gemm
+        .launch(
+            s,
+            &mut operands!(
+                TensorRef::<Bf16>::from_cuda(&out.slice, &out_shape).unwrap().into_arg(),
+                TensorMut::<U8>::from_cuda(&mut workspace, &ws_shape).unwrap().into_arg(),
+            ),
+        )
+        .unwrap_err();
+    check("a GEMM result that is read only", e.precondition_kind() == Some(PreconditionKind::Access));
+    let mut without = Vec::from(operands!(
+        TensorMut::<Bf16>::from_cuda(&mut out.slice, &out_shape).unwrap().into_arg(),
+        TensorMut::<U8>::from_cuda(&mut workspace, &ws_shape).unwrap().into_arg(),
+    ));
+    without.pop();
+    let e = gemm.launch(s, &mut without).unwrap_err();
+    check("a GEMM with no workspace", matches!(&e, Error::Launch(m) if m.contains("workspace")));
+    let a_more = gpu.zeros((m + 1) * k * 2);
+    let mut out_more = gpu.zeros((m + 1) * n * 2);
+    let (a_more_shape, out_more_shape) = ([m + 1, k], [m + 1, n]);
+    let mut wrong = operands!(
+        TensorMut::<Bf16>::from_cuda(&mut out_more.slice, &out_more_shape).unwrap().into_arg(),
+        TensorMut::<U8>::from_cuda(&mut workspace, &ws_shape).unwrap().into_arg(),
+    );
+    wrong[0] = TensorRef::<Bf16>::from_cuda(&a_more.slice, &a_more_shape).unwrap().into_arg();
+    let e = gemm.launch(s, &mut wrong).unwrap_err();
+    check("a GEMM at a size that is not its bucket", e.precondition_kind() == Some(PreconditionKind::Bucket));
+    let e = manifest.gemm(&gpu.ctx, &entry.stem, &[], Arch::sm(120)).unwrap_err();
+    check(
+        "a GEMM asked for another architecture than the device's",
+        matches!(&e, Error::NoBinary(_) | Error::Unsupported(_)),
+    );
+
+    // a cuBLASLt of another version than the one that pinned the algorithm (the edited manifest is trusted, as a pin would be made again)
+    let here = tilefish::cublaslt_version().expect("cuBLASLt is on this machine");
+    let tmp = copy_of_the_manifest("version");
+    let mut doc = read_json(&tmp.join("manifest.json"));
+    for e in doc["library"].as_array_mut().unwrap() {
+        e["cublaslt_version"] = (here + 100).into();
+    }
+    write_json(&tmp.join("manifest.json"), &doc);
+    let other = Manifest::load(&tmp, Pin::TrustDirectory).unwrap();
+    let e = other.gemm(&gpu.ctx, &entry.stem, &[], arch).unwrap_err();
+    check(
+        "a cuBLASLt of another version than the one that pinned the algorithm",
+        matches!(&e, Error::Manifest(m) if m.contains(&format!("pinned the cuBLASLt algorithm of '{}'", entry.stem))
+            && m.contains(&format!("with cuBLASLt {}", here + 100))
+            && m.contains(&format!("this process has cuBLASLt {here}"))),
+    );
+    // ... and an algorithm that cuBLASLt would not have written (a tile id past what its id has) is refused before cublasLtMatmulAlgoCheck, which
+    // crashes the process on some of those, can see it
+    let mut doc = read_json(&tmp.join("manifest.json"));
+    for e in doc["library"].as_array_mut().unwrap() {
+        e["cublaslt_version"] = here.into();
+        let mut algo = e["algo"].as_str().unwrap().to_owned().into_bytes();
+        algo[8..16].fill(b'f'); // the second 32-bit word of the first eight bytes: the tile id
+        e["algo"] = String::from_utf8(algo).unwrap().into();
+    }
+    write_json(&tmp.join("manifest.json"), &doc);
+    let corrupt = Manifest::load(&tmp, Pin::TrustDirectory).unwrap();
+    let e = corrupt.gemm(&gpu.ctx, &entry.stem, &[], arch).unwrap_err();
+    check(
+        "a pinned algorithm with a tile id that its algorithm id does not have",
+        matches!(&e, Error::Manifest(m) if m.contains("is not one cuBLASLt produces")),
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // a cubin of another architecture, under the name of this one: its ELF header says so
+    let tmp = copy_of_the_manifest("arch");
+    let sm120 = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sm_120");
+    let theirs_doc = read_json(&sm120.join("manifest.json"));
+    let theirs = theirs_doc["kernels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["stem"] == "gelu_erf")
+        .expect("gelu_erf in sm_120")
+        .clone();
+    let mut doc = read_json(&tmp.join("manifest.json"));
+    let mine = doc["kernels"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|k| k["stem"] == "gelu_erf" && k["arch"] == arch.to_string())
+        .unwrap();
+    std::fs::copy(sm120.join(theirs["cubin"].as_str().unwrap()), tmp.join(mine["cubin"].as_str().unwrap())).unwrap();
+    mine["sha256"] = theirs["sha256"].clone();
+    mine["sha256_code"] = theirs["sha256_code"].clone();
+    write_json(&tmp.join("manifest.json"), &doc);
+    let e = Manifest::load(&tmp, Pin::TrustDirectory).unwrap_err();
+    check(
+        "a cubin of sm_120 under the name of this architecture",
+        matches!(&e, Error::Manifest(m) if m.contains("is for sm_120") && m.contains(&arch.to_string())),
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // a manifest of schema 2 is told to be exported again
+    let tmp = copy_of_the_manifest("schema2");
+    let mut doc = read_json(&tmp.join("manifest.json"));
+    doc["schema"] = 2.into();
+    doc.as_object_mut().unwrap().remove("library");
+    write_json(&tmp.join("manifest.json"), &doc);
+    let e = Manifest::load(&tmp, Pin::TrustDirectory).unwrap_err();
+    check(
+        "a manifest of schema 2",
+        matches!(&e, Error::Manifest(m) if m.contains("schema 2") && m.contains("Export it again")),
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+    println!("rust gate: {refused} refusals of schema 3 checked");
+}
+
+/// Capture `launch` (which enqueues on the stream of `gpu`) in a CUDA graph, run the graph three times (`out` cleared before each) and compare
+/// `out` with what Python's replay computed.
+fn capture_and_run(gpu: &Gpu, launch: &dyn Fn() -> Result<(), Error>, out: &mut CudaSlice<u8>, expect: &[u8]) {
+    let stream = gpu.stream.cu_stream();
+    let mut graph: sys::CUgraph = std::ptr::null_mut();
+    // SAFETY (the driver calls below): `stream` is a live stream of the current context; the graph handles come from the driver.
+    unsafe {
+        let begin = sys::cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+        assert_eq!(begin, sys::CUresult::CUDA_SUCCESS, "cuStreamBeginCapture");
+    }
+    let launched = launch();
+    unsafe {
+        let end = sys::cuStreamEndCapture(stream, &mut graph);
+        assert_eq!(end, sys::CUresult::CUDA_SUCCESS, "cuStreamEndCapture");
+    }
+    launched.expect("the launch is captured");
+    gpu.stream.synchronize().unwrap();
+    assert!(
+        gpu.stream.clone_dtoh(out).unwrap().iter().all(|b| *b == 0),
+        "a captured launch runs nothing: the output is untouched"
+    );
+    let mut exec: sys::CUgraphExec = std::ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0),
+            sys::CUresult::CUDA_SUCCESS,
+            "cuGraphInstantiate"
+        );
+    }
+    for run in 0..3 {
+        gpu.stream.memset_zeros(out).unwrap();
+        unsafe {
+            assert_eq!(sys::cuGraphLaunch(exec, stream), sys::CUresult::CUDA_SUCCESS, "cuGraphLaunch");
+        }
+        gpu.stream.synchronize().unwrap();
+        assert_eq!(
+            gpu.stream.clone_dtoh(out).unwrap(),
+            expect,
+            "run {run}: the graph's output is Python's replay, byte for byte"
+        );
+    }
+    unsafe {
+        let _ = sys::cuGraphExecDestroy(exec);
+        let _ = sys::cuGraphDestroy(graph);
+    }
+    gpu.stream.memset_zeros(out).unwrap();
+}
+
+fn usizes(v: &Value) -> Vec<usize> {
+    v.as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect()
+}
+
+/// A strided kernel and a GEMM captured in a CUDA graph with regions and `unsafe launch_raw` (and the kernel with the safe `launch`, which
+/// captures regions too): the graph computes what Python's replay did, byte for byte, every time it runs. The loads (the module, the cuBLASLt
+/// handle and the check of the algorithm) and the allocation of the workspace are before the capture.
+#[test]
+fn graph_capture_of_a_strided_kernel_and_of_a_gemm() {
+    let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let stream = gpu.stream.cu_stream();
+
+    // -- a strided kernel: a view of a fused qkv
+    let case = cases_where(&cases, |c| c["stem"] == "head_copy" && has_view(c))
+        .into_iter()
+        .next()
+        .expect("a strided head_copy case");
+    let kernel = manifest.kernel(&gpu.ctx, "head_copy", &[], arch).unwrap();
+    let mut tensors = tensors_of(&gpu, &case);
+    let expect = read(&gate_dir().join(case["tensors"][1]["expect"].as_str().unwrap()));
+    let (x_shape, x_strides, x_offset) = (
+        usizes(&case["tensors"][0]["shape"]),
+        usizes(&case["tensors"][0]["strides"]),
+        case["tensors"][0]["offset"].as_u64().unwrap() as usize,
+    );
+    let y_shape = usizes(&case["tensors"][1]["shape"]);
+    gpu.stream.synchronize().unwrap();
+    // SAFETY: the buffers are used until the end of this function, outlive the graph, and nothing else uses them while it is captured or run.
+    let (xr, yr) = unsafe {
+        (
+            gpu.unbound_region(&tensors[0].1, tensors[0].1.nbytes()),
+            gpu.unbound_region(&tensors[1].1, tensors[1].1.nbytes()),
+        )
+    };
+    for raw in [true, false] {
+        let launch = || {
+            let x = TensorRef::<Bf16>::new_strided(xr, &x_shape, &x_strides, x_offset)?;
+            let y = TensorMut::<Bf16>::new(yr, &y_shape)?;
+            if raw {
+                // SAFETY: `stream` is the handle of a stream of the kernel's context; the buffers outlive the graph.
+                unsafe { kernel.launch_raw(stream, &[x.into_arg(), y.into_arg()]) }
+            } else {
+                kernel.launch(&gpu.stream, &mut [x.into_arg(), y.into_arg()])
+            }
+        };
+        capture_and_run(&gpu, &launch, &mut tensors[1].1.slice, &expect);
+    }
+    println!(
+        "rust gate: a strided kernel captured in a CUDA graph (launch and launch_raw, with regions) ran 3 times each and matched Python's replay"
+    );
+
+    // -- a GEMM with a bias, the smallest of the gate
+    let case = cases_where(&cases, |c| is_gemm(c) && tensors_json(c).len() == 4)
+        .into_iter()
+        .min_by_key(|c| tensors_json(c)[1]["nbytes"].as_u64().unwrap())
+        .expect("a GEMM case with a bias");
+    let stem = case["stem"].as_str().unwrap().to_owned();
+    let gemm = manifest.gemm(&gpu.ctx, &stem, &[], arch).unwrap();
+    let mut workspace = gemm.alloc_workspace(&gpu.stream).unwrap();
+    let mut tensors = tensors_of(&gpu, &case);
+    let last = tensors.len() - 1;
+    let expect = read(&gate_dir().join(case["tensors"][last]["expect"].as_str().unwrap()));
+    let shapes: Vec<Vec<usize>> = tensors_json(&case).iter().map(|t| usizes(&t["shape"])).collect();
+    let ws_shape = [workspace.len()];
+    gpu.stream.synchronize().unwrap();
+    // SAFETY: as above.
+    let regions: Vec<DevicePtr<'static>> =
+        unsafe { tensors.iter().map(|(_, b)| gpu.unbound_region(b, b.nbytes())).collect() };
+    let ws = unsafe { DevicePtr::from_raw(workspace.device_ptr(&gpu.stream).0, workspace.len() as u64, 0) };
+    let launch = || {
+        let mut args: Vec<TensorArg<'_>> = Vec::new();
+        for (i, shape) in shapes.iter().enumerate() {
+            let access = if i == last { Access::InOut } else { Access::In };
+            args.push(TensorArg::new(regions[i], shape, DType::Bf16, access)?);
+        }
+        args.push(TensorArg::new(ws, &ws_shape, DType::U8, Access::InOut)?);
+        // SAFETY: the stream is the GEMM's; the regions are the buffers' own, which outlive the graph.
+        unsafe { gemm.launch_raw(stream, &args) }
+    };
+    capture_and_run(&gpu, &launch, &mut tensors[last].1.slice, &expect);
+    let _ = &mut workspace;
+    println!(
+        "rust gate: the GEMM '{stem}' captured in a CUDA graph with launch_raw and regions ran 3 times and matched Python's replay"
+    );
+}
+
+/// A GEMM launch of slices is refused while the stream captures, as a kernel's is: a graph would hold their addresses.
+#[test]
+fn a_gemm_of_slices_on_a_capturing_stream_is_an_error_and_not_a_graph() {
+    let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let case = cases_where(&cases, |c| is_gemm(c) && tensors_json(c).len() == 3)
+        .into_iter()
+        .min_by_key(|c| tensors_json(c)[1]["nbytes"].as_u64().unwrap())
+        .expect("a GEMM case without a bias");
+    let gemm = manifest.gemm(&gpu.ctx, case["stem"].as_str().unwrap(), &[], arch).unwrap();
+    let mut workspace = gemm.alloc_workspace(&gpu.stream).unwrap();
+    let ws_shape = [workspace.len()];
+    let mut bufs: Vec<Buf> = tensors_of(&gpu, &case).into_iter().map(|(_, b)| b).collect();
+    gpu.stream.synchronize().unwrap();
+    assert!(gpu.ctx.is_in_multi_stream_mode());
+    let (a, rest) = bufs.split_first_mut().unwrap();
+    let (b, rest) = rest.split_first_mut().unwrap();
+    let out = &mut rest[0];
+    let mut args =
+        vec![r::<Bf16>(a).unwrap().into_arg(), r::<Bf16>(b).unwrap().into_arg(), m::<Bf16>(out).unwrap().into_arg()];
+    args.push(TensorMut::<U8>::from_cuda(&mut workspace, &ws_shape).unwrap().into_arg());
+    gpu.stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).unwrap();
+    let refused = gemm.launch(&gpu.stream, &mut args);
+    let ended = gpu.stream.end_capture(sys::CUgraphInstantiate_flags(0));
+    let e = refused.expect_err("the launch of slices was captured");
+    assert!(matches!(&e, Error::Launch(why) if why.contains("capturing") && why.contains("launch_raw")), "{e:?}");
+    if let Ok(Some(graph)) = ended {
+        graph.launch().unwrap(); // whatever was captured (nothing) runs
+    }
+    gpu.stream.synchronize().unwrap();
+    assert!(gpu.download(&bufs[2]).iter().all(|b| *b == 0), "nothing was captured and nothing was launched");
+    println!("rust gate: a GEMM of slices on a capturing stream: {e}");
+}
+
+/// What the tests of launches on other streams of a GEMM and of a strided kernel share, as `Race` does for the gelu: the slices are allocated and
+/// freed on `s1`, the launch under test is on `s2`, which a host function holds back, so that the slices are freed and allocated again while it is
+/// queued. The expected output is what the launch gave on one stream with nothing else going on.
+struct Held {
+    gpu: Gpu,
+    s1: Arc<CudaStream>,
+    s2: Arc<CudaStream>,
+}
+
+impl Held {
+    fn new() -> Self {
+        let gpu = Gpu::new();
+        let (s1, s2) = (gpu.stream.clone(), gpu.ctx.new_stream().unwrap());
+        Self { gpu, s1, s2 }
+    }
+
+    /// Hold `s2` back: nothing queued on it from now runs until the returned thread has released it (after 150 ms).
+    fn hold(&self) -> std::thread::JoinHandle<()> {
+        RELEASE.store(false, Ordering::Release);
+        // SAFETY: the function only waits for an atomic and takes no argument.
+        unsafe { result::stream::launch_host_function(self.s2.cu_stream(), hold_until_released, std::ptr::null_mut()) }
+            .expect("a host function on the second stream");
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(150));
+            RELEASE.store(true, Ordering::Release);
+        })
+    }
+
+    /// Upload the inputs of a case on `s1`, and make the outputs zeros there.
+    fn bufs(&self, case: &Value) -> Vec<Buf> {
+        tensors_of(&self.gpu, case).into_iter().map(|(_, b)| b).collect()
+    }
+}
+
+/// Run `case` of the gate on `stream` with the typed arguments of `launch_generic`, on slices that live on `s1`.
+fn launch_case_on(
+    held: &Held,
+    manifest: &Manifest,
+    case: &Value,
+    stream: &CudaStream,
+    bufs: &mut [Buf],
+) -> Result<(), Error> {
+    let arch = Arch::of_context(&held.gpu.ctx)?;
+    let stem = case["stem"].as_str().unwrap();
+    let mut args: Vec<TensorArg<'_>> = Vec::new();
+    for (t, buf) in tensors_json(case).iter().zip(bufs.iter_mut()) {
+        args.push(arg_of(buf, t["dtype"].as_str().unwrap(), t["role"].as_str().unwrap())?);
+    }
+    if is_gemm(case) {
+        let gemm = manifest.gemm(&held.gpu.ctx, stem, &[], arch)?;
+        // the workspace on `s1` as well, and kept until the end of the test through `args`' borrow
+        let mut workspace = gemm.alloc_workspace(&held.s1)?;
+        let shape = [workspace.len()];
+        args.push(TensorMut::<U8>::from_cuda(&mut workspace, &shape)?.into_arg());
+        let launched = gemm.launch(stream, &mut args);
+        drop(args);
+        drop(workspace);
+        return launched;
+    }
+    manifest.kernel(&held.gpu.ctx, stem, &[], arch)?.launch(stream, &mut args)
+}
+
+/// The rounds of the hazard tests of a case: freed and allocated again, on `s1`, while the launch is queued on `s2`: its first tensor (an input) with
+/// the memory of another input put in its place, and its last (the output) with a known pattern; the kernel must read what the input held
+/// and must not write into what is allocated in place of the output. 20 rounds of each; none may go wrong.
+fn rounds_of_a_launch_on_another_stream(what: &str, case_filter: impl Fn(&Value) -> bool) {
+    let (held, manifest, cases) = (Held::new(), manifest(), cases());
+    let case = cases_where(&cases, case_filter)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{what}: no such case in the gate"));
+    let expect = read(&gate_dir().join(tensors_json(&case).last().unwrap()["expect"].as_str().unwrap()));
+    let last = tensors_json(&case).len() - 1;
+    let mut wrong = [0usize; 2];
+    for (which, free_input) in [(0usize, true), (1, false)] {
+        for _ in 0..20 {
+            let mut bufs = held.bufs(&case);
+            held.s1.synchronize().unwrap();
+            let releaser = held.hold();
+            launch_case_on(&held, &manifest, &case, &held.s2, &mut bufs).unwrap();
+            // the slices are freed while the launch is queued behind the held-back stream, and the memory is allocated again
+            let again = if free_input {
+                let victim = bufs.remove(0);
+                let size = victim.slice.len();
+                drop(victim);
+                // the same size as the input, with bytes that are not the input's, so that a read of it is told apart
+                let filler: Vec<u8> = (0..size).map(|i| (i % 251) as u8 | 0x11).collect();
+                (0..3).map(|_| held.s1.clone_htod(&filler).unwrap()).collect::<Vec<_>>()
+            } else {
+                let victim = bufs.pop().unwrap();
+                let size = victim.slice.len();
+                drop(victim);
+                (0..3).map(|_| held.s1.clone_htod(&vec![0xA5u8; size]).unwrap()).collect::<Vec<_>>()
+            };
+            releaser.join().unwrap();
+            held.gpu.ctx.synchronize().unwrap();
+            let bad = if free_input {
+                // the output is the last buffer that is left
+                held.s1.clone_dtoh(&bufs[last - 1].slice).unwrap() != expect
+            } else {
+                again.iter().any(|z| held.s1.clone_dtoh(z).unwrap().iter().any(|b| *b != 0xA5))
+            };
+            wrong[which] += usize::from(bad);
+            drop(again);
+        }
+    }
+    println!(
+        "rust gate: {what}: {} of 20 rounds wrong with the input freed, {} of 20 with the output freed",
+        wrong[0], wrong[1]
+    );
+    assert_eq!(wrong, [0, 0], "{what}: a launch read or wrote memory that had been freed and allocated again");
+}
+
+/// The free of a GEMM's slices is ordered after the GEMM, which is enqueued on a stream that is held back: it reads its inputs as they were and does
+/// not write into the memory that took the place of its output.
+#[test]
+fn a_gemm_on_another_stream_is_ordered_against_the_free_of_its_slices() {
+    rounds_of_a_launch_on_another_stream("a GEMM on a held-back second stream, its slices freed on the first", |c| {
+        is_gemm(c) && tensors_json(c).len() == 3 && tensors_json(c)[0]["shape"][0] == 32
+    });
+}
+
+/// The same for a strided kernel: the launch is given a view of the bytes of its slice from the first element on, and cudarc still orders and
+/// records the use of the slice.
+#[test]
+fn a_strided_launch_on_another_stream_is_ordered_against_the_free_of_its_slice() {
+    rounds_of_a_launch_on_another_stream(
+        "a strided kernel on a held-back second stream, its slices freed on the first",
+        |c| c["stem"] == "head_copy" && has_view(c) && tensors_json(c)[0]["offset"].as_u64().unwrap() > 0,
+    );
+}
+
+/// A tensor the kernel writes may be a view of a larger slice that starts at an element of it: the kernel writes there and nowhere else (the
+/// launch hands cudarc the bytes of the slice from the first element on, and the kernel is given that address).
+#[test]
+fn a_written_view_lands_at_its_offset_and_nowhere_else() {
+    let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
+    let case = cases["cases"].as_array().unwrap().iter().find(|c| c["launcher"] == "GeluErf").expect("a GeluErf case");
+    let mut tensors = tensors_of(&gpu, case).into_iter();
+    let ((_, x), (_, y)) = (tensors.next().unwrap(), tensors.next().unwrap());
+    let expect = read(&gate_dir().join(case["tensors"][1]["expect"].as_str().unwrap()));
+    let launcher = generated::GeluErf::load(&manifest, &gpu.ctx).unwrap();
+    let n = y.shape[0];
+    for offset in [8usize, 16, 24] {
+        // a slice for the result with `offset` elements before it and 8 after, all 0xAB
+        let mut storage = gpu.upload(&vec![0xABu8; (offset + n + 8) * 2]);
+        let strides = [1usize];
+        {
+            let out = TensorMut::<Bf16>::from_cuda_strided(&mut storage.slice, &y.shape, &strides, offset).unwrap();
+            launcher.launch(&gpu.stream, r::<Bf16>(&x).unwrap(), out).unwrap();
+        }
+        let got = gpu.download(&storage);
+        assert!(got[..offset * 2].iter().all(|b| *b == 0xAB), "offset {offset}: bytes before the view were written");
+        assert_eq!(&got[offset * 2..(offset + n) * 2], &expect[..], "offset {offset}: the view holds Python's replay");
+        assert!(
+            got[(offset + n) * 2..].iter().all(|b| *b == 0xAB),
+            "offset {offset}: bytes after the view were written"
+        );
+    }
+    println!(
+        "rust gate: a written view of a slice (offsets 8, 16 and 24 elements) holds Python's replay and nothing around it changed"
+    );
 }

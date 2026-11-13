@@ -30,22 +30,45 @@ fn every_launch_is_decided_as_python_decides_it() {
             .iter()
             .map(|t| t["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect())
             .collect();
+        // a view has its element strides (and `ptr` is the address of its first element); a tensor without them is dense
+        let strides: Vec<Option<Vec<usize>>> = record["tensors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                t.get("strides").map(|s| s.as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect())
+            })
+            .collect();
         let tensors: Vec<TensorArg<'_>> = record["tensors"]
             .as_array()
             .unwrap()
             .iter()
             .zip(&shapes)
-            .map(|(t, shape)| {
+            .zip(&strides)
+            .map(|((t, shape), strides)| {
                 let dtype = DType::from_name(t["dtype"].as_str().unwrap()).unwrap();
-                // SAFETY: the address is never dereferenced: `prepare` only looks at the number. The region is as long as the tensor.
-                let region = unsafe {
-                    DevicePtr::from_raw(
-                        t["ptr"].as_u64().unwrap(),
-                        shape.iter().product::<usize>() as u64 * dtype.size() as u64,
-                        0,
-                    )
+                let ptr = t["ptr"].as_u64().unwrap();
+                // the elements the tensor reaches: its number, or the extent of a view
+                let reach: u128 = match strides {
+                    None => shape.iter().map(|d| *d as u128).product(),
+                    Some(strides) if shape.contains(&0) => {
+                        let _ = strides;
+                        0
+                    }
+                    Some(strides) => {
+                        1 + shape.iter().zip(strides).map(|(n, s)| (*n as u128 - 1) * *s as u128).sum::<u128>()
+                    }
                 };
-                TensorArg::new(region, shape, dtype, tilefish::Access::InOut).unwrap()
+                let bytes = u64::try_from(reach * dtype.size() as u128)
+                    .unwrap_or_else(|_| panic!("record {n}: a view that reaches more than 2^64 bytes cannot be made"));
+                // SAFETY: the address is never dereferenced: `prepare` only looks at the number. The region is as long as the tensor.
+                let region = unsafe { DevicePtr::from_raw(ptr, bytes, 0) };
+                match strides {
+                    None => TensorArg::new(region, shape, dtype, tilefish::Access::InOut).unwrap(),
+                    Some(strides) => {
+                        TensorArg::new_strided(region, shape, strides, 0, dtype, tilefish::Access::InOut).unwrap()
+                    }
+                }
             })
             .collect();
         let plan = manifest.plan(stem, &[], Arch::sm(103)).unwrap();
@@ -90,5 +113,5 @@ fn every_launch_is_decided_as_python_decides_it() {
         differences.len(),
         differences[..differences.len().min(10)].join("\n")
     );
-    assert!(records.len() > 400 && accepted > 80 && stems.len() == 12);
+    assert!(records.len() > 400 && accepted > 80 && stems.len() >= 12);
 }
