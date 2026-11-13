@@ -152,72 +152,78 @@ cubin that `jit` builds has the `sha256_code` of the one in the manifest.
 `replay` refuses a cubin whose digests are not the manifest's, a manifest
 entry that is not what the operator's compile spec asks for, and a stale
 binary: a kernel redeclared with another body but the same name and signature
-does not replay its old binary. A generated kernel's spec carries the sha256 of
-its Triton source. A hand-written `extern` has no source in its declaration,
-so its manifest entry records a *source digest*: a sha256 over the text of the
-file of the kernel's module, of every user module file reachable from that
-module's globals (the modules it imports, and the modules of the functions and
-objects it holds, recursively; not `triton`, `torch`, `tilefish` or the
-standard library), the Triton version, and the *values* the kernel reads that
-are in no file: the scalars and Triton constants of the module attributes it
-reads, as the process holds them, and the closure variables of its jit
-functions (a kernel made by a factory function, `def make(): S = ...;
-@triton.jit def k(...): ... S`, reads `S` from a cell). So the digest is what
-this process would compile: a replay in a process whose `S` is another number is
-refused, and a cache keyed by it cannot serve one value's binary for another's.
-A value with no stable `repr` (a list, an instance) is refused with "make it a
-module-level constant or a const parameter". `replay` recomputes the digest,
-which needs the kernel to be importable, or a pin. Triton's own `cache_key` is not used: it
-does not see a `tl.constexpr` read as a module attribute (`cfg.SCALE`), a dtype
-alias or a constant in a helper module, so none of them would make a stale
-binary look stale. For the same reason a build never reads Triton's disk cache.
+does not replay its old binary.
 
-A build compiles from scratch (about 25 to 75 ms per binary on a B300) unless
+**What a binary is, is the Triton IR its kernel compiles to.** Which kernel
+Triton compiles depends on everything the Python process holds when its
+frontend runs: the text of the function and of the jit functions it calls, the
+module constants it reads (`cfg.SCALE`, `getattr(cfg, "SCALE")`, `getattr(cfg,
+"SC" + "ALE")`, a class attribute `cfg.Inner.SCALE`), closure variables, a
+`triton.constexpr_function` that reads the environment, a `tl.constexpr` of an
+object whose `repr` hides its state, a helper two modules away, a user module
+named like a standard library module. Five rounds of review found a route that
+each way of *looking for* these (a digest of the files a kernel reaches, the
+module attributes, the closures, a watch on the imports) did not follow, and each
+was a stale binary served by the build cache or by an export replayed with a
+pin. So nothing is looked for. Triton's frontend folds every one of them into
+the IR it builds, and that IR is hashed (`tilefish._ir`): the TTIR that
+`ASTSource.make_ir` builds, printed with `Module.str_nodebug()` (no locations,
+no names of values). Where the kernel is (its path, its line numbers), comments,
+blank lines and the names of local variables are not in it, so none of them is an
+edit; the operations, the types, the constants and the functions that are called
+are. Whatever the process holds is what is hashed, because that is what is
+compiled. The digest of every build is in `BuiltKernel.ir_digest`, and in the
+manifest entry as `source_digest` with `source_digest_kind` `"tilefish.triton-ir.v1"`
+(the fields schema 2 already has, so a reader of the manifest reads it as before;
+a lowered kernel has its `source_sha256` as well, which needs no Triton).
+`replay` recomputes the digest from the kernel the process holds, when Triton
+can be imported and is the version that built the entry, and refuses a mismatch
+as stale, with a pin or not (without Triton, or with another version, whose IR
+may print differently, only a pin vouches for a hand-written kernel). The frontend
+costs 2 to 8 ms per kernel on a B300 (no compile, no GPU), once for each build,
+`jit` call and `replay` call.
+
+So an edit that was not reloaded is not a special case. `export` in the process
+that imported the module compiles, and stamps, what that process holds; a fresh
+process with the edited file computes another digest and refuses the manifest.
+Triton's own `cache_key` is not used, and a build never reads Triton's disk
+cache. What was removed: the digest of the files a kernel reaches, the import
+watch (`SourceFileLoader.exec_module` is not wrapped and `TILEFISH_IMPORT_WATCH`
+is gone), the snapshot of module attributes and the refusal of a reassigned one
+(a value that a program assigned is in the IR), and the walk over the values
+and closures of a kernel with its refusal of a value that has no stable `repr`.
+What stays: the check, for a *lowered* kernel, that its module file has the
+`source_sha256` of its spec and that the function the process holds was
+imported from those lines (the IR digest says what the process holds, not that it
+is the source the spec claims); that `build(spec, fn=)` compiles the function
+the spec names and no other; and the refusal of Triton's kernel override
+(`TRITON_KERNEL_OVERRIDE` replaces the IR of a stage with a file, so the binary
+would not be of the IR).
+
+A build compiles from scratch (25 to 120 ms per binary on a B300) unless
 tilefish's own cache has it: `~/.cache/tilefish`, or `$TILEFISH_CACHE_DIR` (an
 empty value switches it off; `aot.build(..., cache=False)` skips it for one
 build). Its key is the cache recipe (a number that is bumped whenever tilefish
-changes what goes into a binary) and the tilefish version, the declaration
-digest and the spec's fingerprint, the spec's source identity (`source_sha256`,
-or the source digest of a hand-written kernel, values included, computed only
-after the edited-module check above), the architecture, the Triton and `ptxas`
-versions and the compile options, and every read is verified: the `sha256` and
+changes what goes into a binary) and the tilefish version, the IR digest, the
+compile options, the architecture, the Triton and `ptxas` versions, and the
+Triton settings that change code generation: every environment variable of the
+families `TRITON_`, `MLIR_`, `LLVM_`, `NVPTX_`, `AMDGCN_`, `DISABLE_`, `ENABLE_`,
+`ALLOW_` and `USE_IR_LOC` except those known not to (cache and dump directories,
+tool paths, debugging switches), which is more than the 30 that Triton lists as
+cache-invalidating (it leaves out `TRITON_LIBDEVICE_PATH`,
+`TRITON_MOCK_PTX_VERSION` and `TRITON_KERNEL_OVERRIDE`, among others), the
+effective value of each codegen knob of `triton.knobs` and the sha256 of the
+libdevice file when a path is set. Every read is verified: the `sha256` and
 `sha256_code` of the cubin are recomputed (and the PTX, the entry point and its
-ABI, the options and the versions are checked), and an entry that is not as it
-was written is a warning and a rebuild, never used, and a cache that cannot be
-read or written never fails a build, also under `python -W error` (the warning is
-then logged on `tilefish.cache` instead of raised). Entries are written through a
-temporary file and renamed, so builds that race do not tear one. A hit takes
-about 0.5 to 0.8 ms. The cache is as exact as the source digest (what that does not
-reach is not in the key either), nothing evicts it, and it is no defence
-against someone who can write the directory: a manifest is what to pin.
-
-**Any edit to a file a hand-written kernel reaches, a comment included, means
-exporting again and pinning the new manifest.** The digest is of the files on
-disk, and Triton compiles what the process holds, so no digest is made of a file
-the process holds in another version. `import tilefish` starts recording the
-files of the modules imported after it, and `jit`, `export` and `replay` of a
-hand-written kernel raise "module X changed on disk since it was imported;
-reload it or restart" when a module the kernel reaches was edited and not
-reloaded (in a notebook, say), whichever module it is, a helper two levels
-away included. It compares the content of the file, so a save without a change
-passes, and a module that was imported before `import tilefish` is compared by
-size and modification time only (`tilefish/_source.py` lists what the check does
-not see: an edit between a module's import and `import tilefish`, a module no
-source loader executed, a stale same-second `.pyc`). The recording wraps
-`SourceFileLoader.exec_module` for the whole process, and it never reads an
-attribute of a module (a `LazyLoader` module is not loaded by it).
-`TILEFISH_IMPORT_WATCH=0` (or `false`, `no`, `off`, in any case)
-leaves the import system alone, and every module is then compared by size and
-modification time only, from when tilefish was imported or when a build first
-read it; a module reloaded after an edit is recorded again. **Kernel inputs come from
-source files, not from module state a program assigns at run time**
-(`cfg.SCALE = 5.0`, `monkeypatch.setattr`): a build refuses a constant that a
-kernel function reads and that was reassigned since its module was imported
-(scalars and Triton constants; not a container changed in place or an attribute
-of an instance), and a constant that is not in a file could not be described by
-any source digest, cache entry or manifest. `build` also refuses source that is
-not its spec's: a stale `LoweredKernel.write` output on `sys.path`, or a
-function passed as `fn` that is not the one `spec.triton` names.
+ABI, the options, the IR digest and the versions are checked), and an entry that
+is not as it was written is a warning and a rebuild, never used, and a cache
+that cannot be read or written never fails a build, also under `python -W error`
+(the warning is then logged on `tilefish.cache` instead of raised). Entries are
+written through a temporary file and renamed, so builds that race do not tear
+one. A lookup is a run of the frontend and a read: 3 to 6 ms. Nothing evicts the
+cache, it is no defence against someone who can write the directory (a manifest
+is what to pin), and it tells a patched Triton that keeps its version string from
+the original no better than the version does.
 
 `replay` also refuses `shared` memory the cubin and the device cannot have (the
 driver's static shared memory of the function plus the manifest's dynamic size
@@ -235,7 +241,7 @@ checks that the directory it wrote has that digest; keep it somewhere you trust
 and pass it as `pin=` to refuse a directory that changed.
 `trust_directory=True` is the explicit statement that whatever the directory
 holds is fine (a directory you wrote a moment ago); it does not combine with
-`pin=`. A pin vouches for the manifest, not for a source digest that is known to
+`pin=`. A pin vouches for the manifest, not for an IR digest that is known to
 differ, and not for a `shared` that is nonzero but too small for the kernel
 (nothing but the manifest says how much it needs). Triton's own JIT launcher,
 which specializes on argument values, is not a mode. Neither `jit` nor `replay`
