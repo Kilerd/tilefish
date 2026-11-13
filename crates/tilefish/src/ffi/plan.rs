@@ -1,15 +1,106 @@
 //! The `unsafe` of a launch plan, each item with the reason it is sound: the regions its steps are checked with, the launches of the
-//! checked steps, the launch of a captured graph on a stream it was not captured on, and the eager loading of a function.
+//! checked steps, the launch of a captured graph on a stream it was not captured on, the eager loading of a function, and the copies of the
+//! device scalars from pinned host memory.
 //!
 //! What decides that a step may be launched (the binding of the externals, the checks of every step before the first launch, the ordering of
 //! the externals and of the arena against other streams, the lifetimes a captured graph is held to) is `crate::plan_run`, which has no
 //! `unsafe`; it calls these.
 
-use cudarc::driver::{CudaFunction, CudaGraph, CudaStream, LaunchConfig, PushKernelArg, result, sys};
+use std::sync::Arc;
+
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, CudaViewMut, DevicePtrMut, LaunchConfig,
+    PinnedHostSlice, PushKernelArg, result, sys,
+};
 
 use crate::error::{Error, Result};
 use crate::plan_run::Ready;
 use crate::region::DevicePtr;
+
+/// The pinned host memory the values of the device scalars are copied from into their slots of the arena.
+///
+/// A copy from a host slice (`CudaStream::memcpy_htod` of a `&[u8]`, pageable memory) is `cuMemcpyHtoDAsync` from pageable memory, which CUDA
+/// keeps asynchronous only as far as the driver can stage the bytes at once: it allows the driver to synchronize with the stream when it
+/// cannot (on the B300 of the gate it did not, for these copies of at most 8 bytes: a launch behind 3 ms of queued replays took 96 us of the
+/// host before this, 86 us with it). From pinned memory the copy is asynchronous by definition, so a launch, and a replay that rewrites the
+/// slots, never waits for the device. The bytes are put in an entry of a pinned buffer allocated once per instantiation, copied
+/// asynchronously from it (`cuMemcpyHtoDAsync`), and an event is recorded after the copy; an entry is written again only once its event is
+/// complete. The entries are used in turn, so the host waits only when [`Staging::ENTRIES`] copies are still pending on the device (it is that
+/// many writes of device scalars ahead of it), and then for the oldest of them alone.
+#[derive(Debug)]
+pub(crate) struct Staging {
+    memory: PinnedHostSlice<u8>,
+    /// Per entry, the event recorded after the last copy from it.
+    copied: Vec<Option<CudaEvent>>,
+    next: usize,
+}
+
+impl Staging {
+    /// The number of entries.
+    pub(crate) const ENTRIES: usize = 256;
+    /// The bytes of an entry: the largest dtype of a device scalar.
+    const ENTRY: usize = 8;
+
+    /// Allocate the pinned memory (`cuMemHostAlloc`) in the context of `ctx`.
+    #[allow(unsafe_code)]
+    pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        // SAFETY: `alloc_pinned` is unsafe because the memory it returns is not initialized; every entry is written (`copy`) before a copy
+        // reads it, and `u8` has no invalid values.
+        let memory =
+            unsafe { ctx.alloc_pinned::<u8>(Self::ENTRIES * Self::ENTRY) }.map_err(Error::driver("cuMemHostAlloc"))?;
+        Ok(Self { memory, copied: (0..Self::ENTRIES).map(|_| None).collect(), next: 0 })
+    }
+
+    /// Copy `bytes` (one element of a device scalar, at most 8 bytes) into `slot` (the slot's bytes of the arena) on `stream`, asynchronously.
+    ///
+    /// The slot is used through cudarc's tracking (`device_ptr_mut` on `stream`: the copy waits for the earlier uses of the arena on other
+    /// streams, and is recorded as a write of it when the guard is dropped, after the copy), as `memcpy_htod` does.
+    #[allow(unsafe_code)]
+    pub(crate) fn copy(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        bytes: &[u8],
+        slot: &mut CudaViewMut<'_, u8>,
+    ) -> Result<()> {
+        if bytes.len() > Self::ENTRY || bytes.len() != slot.len() {
+            return Err(Error::Launch(format!(
+                "a device scalar of {} bytes does not fit its slot of {} bytes",
+                bytes.len(),
+                slot.len()
+            )));
+        }
+        let entry = self.next;
+        self.next = (entry + 1) % Self::ENTRIES;
+        if let Some(event) = self.copied[entry].take()
+            && !event.is_complete()
+        {
+            event.synchronize().map_err(Error::driver("cuEventSynchronize"))?; // ENTRIES copies are pending: wait for the oldest
+        }
+        // `as_mut_slice` waits for the event cudarc keeps for this buffer, which only its own copies record: none are made from it, so it
+        // returns at once.
+        let all = self.memory.as_mut_slice().map_err(Error::driver("cuEventSynchronize"))?;
+        let host = &mut all[entry * Self::ENTRY..entry * Self::ENTRY + bytes.len()];
+        host.copy_from_slice(bytes);
+        stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+        let (dst, guard) = slot.device_ptr_mut(stream);
+        // SAFETY: `dst` is the address of the slot, `bytes.len()` bytes of the arena (a view of the arena's slice, which the instantiation
+        // owns), on the stream's device; `host` is pinned memory owned by this `Staging`, which the arena owns, and which is dropped only
+        // after the instantiation has waited for the arena's stream (that stream waits for every launch made elsewhere), so it outlives the
+        // copy; and the entry is not written again before the event recorded below is complete. The stream is a live cudarc stream of the
+        // context made current above.
+        unsafe { result::memcpy_htod_async(dst, host, stream.cu_stream()) }
+            .map_err(Error::driver("cuMemcpyHtoDAsync"))?;
+        drop(guard);
+        match stream.record_event(None) {
+            Ok(event) => self.copied[entry] = Some(event),
+            Err(e) => {
+                let _ = stream.synchronize(); // the copy is done before the entry can be written again
+                return Err(Error::driver("cuEventRecord")(e));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The region `addr .. addr + len` of device `device`, for the checks of a step ([`crate::Plan::prepare`], `Gemm::check_call`) and nothing
 /// else.

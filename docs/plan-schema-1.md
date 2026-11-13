@@ -234,7 +234,9 @@ the shapes of the views.
    The Rust host (`PlanRun`, one arena per instantiation) gives the same order: an execution, under the arena's lock, makes its stream wait for what the arena's
    own stream (the one it was allocated on) holds, and makes that stream wait for an event recorded after its last launch (cudarc's events on the arena add the
    rest), so executions of one instantiation on any streams, from any threads, run one after the other in the order they are issued; dropping the last handle of
-   an instantiation waits for that stream before the arena is freed.
+   an instantiation waits for that stream before the arena is freed. A capture (`PlanRun::capture`) holds the arena's lock from the beginning of the capture to its end,
+   so no execution on another thread makes the arena's stream wait for an event while that stream is being captured (before, 3 to 18 of 200 captures on the arena's
+   stream failed with `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` or `..._INVALIDATED` against a loop of launches on another thread, and some runs crashed; now none).
 2. **Bind the externals.** The caller gives a tensor (address, shape, strides, dtype) for every buffer of role `input`, `weight` and `inout`, and for every `output` (or the host allocates it), and a
    value for every `devscalar`. Check each external against its buffer: dtype, rank, contiguous row-major (a parameter is a dense tensor), and bind the dimensions (section 5). Select the bucket.
    The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`), and none may overlap the arena.
@@ -242,7 +244,8 @@ the shapes of the views.
    nothing is launched and nothing is written**, not even a device scalar: the checks are all done first, then the writes and the launches.
 4. **Write the device scalars**, after the stream waits for the previous execution on the arena (step 1). Each `devscalar` slot (at `arena + offset`) gets the value the caller gave, as the
    little-endian bytes of its dtype, ordered on the stream before the first launch: a copy from device memory (stream-ordered), or an asynchronous copy from pinned host memory. (Python:
-   `_planrun.TorchBackend.write_devscalar`.)
+   `_planrun.TorchBackend.write_devscalar`; Rust: a pinned staging buffer per instantiation, `ffi::plan::Staging`. A copy from pageable memory may synchronize with the stream, as
+   CUDA documents `cuMemcpyHtoDAsync` from pageable memory.)
 5. **Launch** the steps in order on the stream (section 7.2), then record the arena's order event on it (step 1). Nothing else: no allocation, no synchronization of the host.
 
 A host may cache everything of steps 1 to 3 that does not depend on an address (the dimension bindings, scalars, grids, the entries' loaded functions and pinned algorithms) per bucket, as Python's
@@ -271,8 +274,8 @@ whoever holds it, with no lock of the host: item 7 says what its event nodes ord
    writing that tensor. An `int` or a CPU tensor is a host write (an asynchronous copy from pinned memory is not capturable as a value that changes), and Python refuses it under capture.
    (A host-owned graph keeps the write out of the graph. Python's `CapturedPlan.replay` writes every slot before it launches the graph, after the wait for the order, by an asynchronous
    copy from pinned host memory of the value `CapturedPlan.set_devscalar` set (or a stream-ordered copy of a CUDA tensor given there): the host is not synchronized, and an execution in
-   between, which writes the slots too, does not change what the graph reads. The Rust host's `CapturedPlan::replay` writes the slots with a stream-ordered copy from the host before it
-   launches the graph, whenever they do not hold that graph's values; `CapturedPlan::set_devscalar` changes them.)
+   between, which writes the slots too, does not change what the graph reads. The Rust host's `CapturedPlan::replay` writes the slots with an asynchronous copy from pinned host memory
+   before it launches the graph, whenever they do not hold that graph's values; `CapturedPlan::set_devscalar` changes them.)
 4. **A graph holds addresses, not values**: the externals are the same tensors at every replay (write into them in place), and **the arena of a captured graph is the plan's arena**, the one
    the uncaptured executions use, at the address the graph holds.
 5. **One stream**: the capture is of the stream the steps are launched on; all steps go there. Every execution of one plan in one capture is on one stream: Python refuses a second

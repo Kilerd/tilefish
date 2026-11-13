@@ -434,6 +434,92 @@ fn launches_and_replays_from_two_threads_on_two_streams_run_one_after_the_other(
     );
 }
 
+/// `PlanRun::capture` holds the arena's lock from the beginning of the capture to its end: one thread captures the plan on the arena's own
+/// stream (and replays the graph) in a loop while another launches it on another stream in a loop. A launch makes the arena's stream wait for
+/// its end; inside a capture of that stream that wait was `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`, then the capture invalidated (and, in some
+/// runs, a crash of the driver). Now the launch waits for the capture to end: no capture and no launch fails, and the results are Python's.
+#[test]
+fn captures_on_the_arena_stream_and_launches_from_another_thread_do_not_disturb_each_other() {
+    fn shared<T: Send + Sync>(t: T) -> T {
+        t
+    }
+    let gpu = Gpu::new();
+    let plan = plan_named("block");
+    let run = shared(load(&plan).instantiate_all(&gpu.stream).unwrap());
+    let cases = plan["cases"].as_array().unwrap();
+    let (a, b) = (
+        cases.iter().find(|c| c["bucket"]["M"] == 128).unwrap(),
+        cases.iter().find(|c| c["bucket"]["M"] == 32).unwrap(),
+    );
+    let expect = |case: &Value| {
+        let t = case["externals"].as_array().unwrap().iter().find(|t| t["name"] == "out0").unwrap();
+        read(t["expect"].as_str().unwrap())
+    };
+    let rounds = 200;
+    // everything but the captures, the replays and the launches is done before the two threads start and after they end: an allocation or a
+    // copy of the test's own while the arena's stream captures is not what is held here
+    let s = gpu.ctx.new_stream().unwrap();
+    let mut launched = upload(&s, a);
+    let mut captured = upload(&gpu.stream, b);
+    s.synchronize().unwrap();
+    gpu.stream.synchronize().unwrap();
+    let start = std::sync::Barrier::new(2);
+    let (capture_errors, launch_errors) = std::thread::scope(|scope| {
+        let capturer = scope.spawn(|| {
+            let mut errors = Vec::new();
+            start.wait();
+            for _ in 0..rounds {
+                let replayed = run
+                    .capture(&gpu.stream, args(&mut captured, false), &named(&devscalars(b)))
+                    .and_then(|mut graph| graph.replay(&gpu.stream));
+                if let Err(e) = replayed {
+                    errors.push(e.to_string());
+                }
+            }
+            errors
+        });
+        let launcher = scope.spawn(|| {
+            let mut errors = Vec::new();
+            start.wait();
+            for _ in 0..rounds {
+                if let Err(e) = run.launch(&s, &mut args(&mut launched, false), &named(&devscalars(a))) {
+                    errors.push(e.to_string());
+                }
+            }
+            errors
+        });
+        (capturer.join().unwrap(), launcher.join().unwrap())
+    });
+    s.synchronize().unwrap();
+    gpu.stream.synchronize().unwrap();
+    let out = |exts: &[Ext], stream: &Arc<CudaStream>| {
+        let e = exts.iter().find(|e| e.name == "out0").unwrap();
+        stream.clone_dtoh(&e.slice).unwrap()
+    };
+    let launched_wrong = usize::from(out(&launched, &s) != expect(a));
+    let captured_wrong = usize::from(out(&captured, &gpu.stream) != expect(b));
+    println!(
+        "rust plan gate: {rounds} captures (each replayed) on the arena's stream and {rounds} launches on another stream, from two threads: \
+         {} captures failed, {} launches failed; the last replay wrong: {captured_wrong}, the last launch wrong: {launched_wrong}",
+        capture_errors.len(),
+        launch_errors.len()
+    );
+    for (what, errors) in [("capture", &capture_errors), ("launch", &launch_errors)] {
+        for e in errors.iter().take(4) {
+            println!("  {what} error: {e}");
+        }
+    }
+    let first = |errors: &[String]| errors.first().cloned().unwrap_or_default();
+    assert!(
+        capture_errors.is_empty(),
+        "{} captures failed, the first: {}",
+        capture_errors.len(),
+        first(&capture_errors)
+    );
+    assert!(launch_errors.is_empty(), "{} launches failed, the first: {}", launch_errors.len(), first(&launch_errors));
+    assert_eq!((captured_wrong, launched_wrong), (0, 0));
+}
+
 /// A copy of an exported plan directory, under the gate directory.
 fn copy_dir(plan: &Value, name: &str) -> PathBuf {
     let from = gate_dir().join(plan["dir"].as_str().unwrap());
@@ -715,6 +801,22 @@ fn launches_and_replays_allocate_nothing_and_their_time_is_reported() {
         }
         gpu.stream.synchronize().unwrap();
         let replay_wall = t.elapsed();
+        // a launch behind queued work: it writes its device scalar from pinned memory, so the host does not wait for the queue (reported: its
+        // host time is that of a launch, not that of the queue)
+        for _ in 0..n {
+            graph.replay(&gpu.stream).unwrap();
+        }
+        let t = Instant::now();
+        run.launch(&gpu.stream, &mut args(&mut exts, false), &named(&values)).unwrap();
+        let behind = t.elapsed();
+        let t = Instant::now();
+        gpu.stream.synchronize().unwrap();
+        let queued = t.elapsed();
+        println!(
+            "rust plan gate [{name}, M=64]: a launch behind {n} queued replays takes {:.1} us of the host; the queue then takes {:.1} us more",
+            behind.as_secs_f64() * 1e6,
+            queued.as_secs_f64() * 1e6
+        );
         for e in exts.iter().filter(|e| e.expect.is_some()) {
             assert!(gpu.stream.clone_dtoh(&e.slice).unwrap() == *e.expect.as_ref().unwrap(), "{name}: '{}'", e.name);
         }

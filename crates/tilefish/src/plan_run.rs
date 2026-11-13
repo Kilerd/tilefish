@@ -9,7 +9,9 @@
 //! [`PlanRun::launch`] takes the externals by name (tensors of cudarc slices, `TensorRef` for what the plan reads and `TensorMut` for what it
 //! writes) and a value for every device scalar, binds the dimensions from the externals' shapes and selects the bucket (exactly one of the
 //! plan's), checks every step of it with the real addresses (**before the first launch: a refusal launches nothing and writes nothing**),
-//! writes the device scalars into their slots on the stream, and launches the steps in order. The externals are ordered against other
+//! writes the device scalars into their slots on the stream (asynchronous copies from pinned host memory the instantiation allocated, which
+//! never wait for the device: a copy from pageable memory may, as CUDA documents it), and launches the steps in order.
+//! The externals are ordered against other
 //! streams as a single launch's tensors are ([`Kernel::launch`]): cudarc's tracking on the launch stream, each slice's own stream waiting for
 //! the end of the plan, a written slice's own stream waited for first; and the arena is ordered the same way, as a slice that every launch
 //! writes, owned by the stream it was allocated on: two launches of one instantiation on two streams run one after the other.
@@ -30,6 +32,8 @@
 //! graphs of one bucket or several) run on the device one after the other, in the order they are issued: the contract of Python's *order
 //! event* of an arena. Python captures its event's wait and record as event nodes, because a torch graph is replayed by whoever holds it; the
 //! graph of a [`CapturedPlan`] is replayed only by [`CapturedPlan::replay`], which orders the replay as a launch, so it has no event node.
+//! A capture ([`PlanRun::capture`]) holds the arena's lock from the beginning of the capture to its end, so no launch or replay of the
+//! instantiation, on any thread, makes the arena's stream wait for an event while that stream is being captured.
 //! Dropping the last handle of an instantiation waits for the arena's stream, so nothing of the plan runs when its arena is freed and its modules
 //! unloaded.
 //!
@@ -187,6 +191,9 @@ struct Arena {
     slice: Option<CudaSlice<u8>>,
     /// Whose device scalar values the slots hold: the id of a `CapturedPlan`, or 0 (a launch, or nothing yet).
     slots_of: u64,
+    /// The pinned host memory the device scalars are copied from (a plan with device scalars only): after the slice, so that it is freed
+    /// after the arena, when the instantiation has waited for its stream.
+    staging: Option<ffi::plan::Staging>,
 }
 
 #[derive(Debug)]
@@ -276,14 +283,21 @@ fn in_step(e: Error, what: &str) -> Error {
     }
 }
 
-/// Write `bytes` at byte `at` of written cudarc memory, on `stream` (cudarc's copy from the host, which orders it after the memory's
-/// earlier uses on any stream and records it as a write).
-fn write_bytes(memory: &mut dyn sealed::Write, stream: &Arc<CudaStream>, at: u64, bytes: &[u8]) -> Result<()> {
+/// Write `bytes` at byte `at` of written cudarc memory, on `stream`: an asynchronous copy from the pinned memory of `staging` (no
+/// synchronization of the host, see [`ffi::plan::Staging`]), ordered after the memory's earlier uses on any stream and recorded as a write
+/// by cudarc's tracking.
+fn write_bytes(
+    memory: &mut dyn sealed::Write,
+    staging: &mut ffi::plan::Staging,
+    stream: &Arc<CudaStream>,
+    at: u64,
+    bytes: &[u8],
+) -> Result<()> {
     let missing = || Error::Launch("a slot of a device scalar is outside the arena".to_owned());
     let mut all = memory.bytes_mut().ok_or_else(missing)?;
     let at = usize::try_from(at).map_err(|_| missing())?;
     let mut part = all.try_slice_mut(at..at + bytes.len()).ok_or_else(missing)?;
-    stream.memcpy_htod(bytes, &mut part).map_err(Error::driver("cuMemcpyHtoDAsync"))
+    staging.copy(stream, bytes, &mut part)
 }
 
 /// The work of a launch or a replay, inside `ffi::ordered` (which refused a capturing stream and made `stream` wait for what a written slice's
@@ -294,15 +308,17 @@ fn tracked(
     stream: &Arc<CudaStream>,
     tensors: &mut [TensorArg<'_>],
     slots: &[Slot],
+    staging: Option<&mut ffi::plan::Staging>,
     want_end: bool,
     work: impl FnOnce(&CudaStream) -> Result<()>,
 ) -> Result<Option<CudaEvent>> {
     if !slots.is_empty() {
-        let Some(TensorArg { backing: Backing::Write(arena), .. }) = tensors.last_mut() else {
+        let (Some(TensorArg { backing: Backing::Write(arena), .. }), Some(staging)) = (tensors.last_mut(), staging)
+        else {
             return Err(Error::Launch("a plan with device scalars has no arena".to_owned()));
         };
         for slot in slots {
-            write_bytes(&mut **arena, stream, slot.offset, &slot.bytes)?;
+            write_bytes(&mut **arena, staging, stream, slot.offset, &slot.bytes)?;
         }
     }
     let mut guards = Vec::with_capacity(tensors.len());
@@ -435,13 +451,18 @@ impl PlanRun {
                 crate::launch_plan::ARENA_ALIGNMENT
             )));
         }
+        let staging = if buffers.iter().any(|b| b.role == BufferRole::Devscalar) {
+            Some(ffi::plan::Staging::new(&ctx)?)
+        } else {
+            None
+        };
         let run = Self {
             inner: Arc::new(Instance {
                 plan: plan.clone(),
                 context: ctx.clone(),
                 home: Arc::clone(stream),
                 device: ctx.ordinal() as i32,
-                arena: Mutex::new(Arena { slice, slots_of: 0 }),
+                arena: Mutex::new(Arena { slice, slots_of: 0, staging }),
                 arena_addr,
                 buckets: runs,
                 by_name,
@@ -884,13 +905,16 @@ impl PlanRun {
         let shape = [self.inner.plan.arena_bytes() as usize];
         let mut arena = self.inner.lock_arena();
         let launched = {
+            let Arena { slice, staging, .. } = &mut *arena;
             let mut tensors: Vec<TensorArg<'_>> = externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
-            if let Some(slice) = arena.slice.as_mut() {
+            if let Some(slice) = slice.as_mut() {
                 tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
             }
             let slots = bound.slots.as_slice();
             ffi::ordered(stream, &mut tensors, |tensors, want_end| {
-                tracked(stream, tensors, slots, want_end, |stream| ffi::plan::enqueue_steps(stream, &ready))
+                tracked(stream, tensors, slots, staging.as_mut(), want_end, |stream| {
+                    ffi::plan::enqueue_steps(stream, &ready)
+                })
             })
         };
         arena.slots_of = 0;
@@ -904,7 +928,9 @@ impl PlanRun {
     /// Everything [`PlanRun::launch`] checks is checked first (a refusal captures nothing); then the steps are captured on `stream`
     /// (`CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`), which must not be capturing already. Nothing runs, and nothing is allocated: the workspace and
     /// the device scalars are in the arena, every function and handle was loaded when the plan was instantiated. `devscalars` are the values the
-    /// first replay reads (see [`CapturedPlan::set_devscalar`]).
+    /// first replay reads (see [`CapturedPlan::set_devscalar`]). The arena's lock is held from the beginning of the capture to its end, so a
+    /// launch or a replay of this instantiation on another thread waits for the capture to end (it would otherwise make the arena's stream, which
+    /// may be the one captured, wait for an event from outside the capture: `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`, and the capture invalidated).
     pub fn capture<'ext>(
         &self,
         stream: &Arc<CudaStream>,
@@ -921,12 +947,17 @@ impl PlanRun {
         }
         let bound = self.bind(&externals, devscalars)?;
         let ready = self.ready(&bound)?;
+        // The arena's lock is held from the beginning of the capture to its end: a launch or a replay of this instantiation on another thread
+        // makes the arena's own stream wait for its end, which would be a wait on an event from outside the capture if that stream is the one
+        // captured (`CUDA_ERROR_STREAM_CAPTURE_ISOLATION`, then the capture invalidated); they wait for the capture to end instead.
+        let arena = self.inner.lock_arena();
         stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(Error::driver("cuStreamBeginCapture"))?;
         let enqueued = ffi::plan::enqueue_steps(stream, &ready);
         // the capture is ended whatever happened, so that the stream is usable again (a graph of a failed capture is dropped)
         let ended = stream.end_capture(CUgraphInstantiate_flags(0)).map_err(Error::driver("cuStreamEndCapture"));
+        drop(arena);
         enqueued?;
         let graph = ended?.ok_or_else(|| Error::Launch("the capture made no graph".to_owned()))?;
         drop(ready);
@@ -1014,14 +1045,17 @@ impl<'ext> CapturedPlan<'ext> {
         let mut arena = inner.lock_arena();
         let write = !(self.current && arena.slots_of == self.id);
         let replayed = {
+            let Arena { slice, staging, .. } = &mut *arena;
             let mut tensors: Vec<TensorArg<'_>> = self.externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
-            if let Some(slice) = arena.slice.as_mut() {
+            if let Some(slice) = slice.as_mut() {
                 tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
             }
             let slots: &[Slot] = if write { &self.slots } else { &[] };
             let (graph, captured_on) = (&self.graph, &self.captured_on);
             ffi::ordered(stream, &mut tensors, |tensors, want_end| {
-                tracked(stream, tensors, slots, want_end, |stream| ffi::plan::launch_graph(graph, captured_on, stream))
+                tracked(stream, tensors, slots, staging.as_mut(), want_end, |stream| {
+                    ffi::plan::launch_graph(graph, captured_on, stream)
+                })
             })
         };
         match replayed {
