@@ -208,7 +208,8 @@ def verdict(text, manifest):
             doc = _plan.read_plan(path)
             _plan.check_against_manifest(doc, manifest)
         except TilefishManifestError as e:
-            return False, str(e).replace(str(path), "plan.json").replace(tmp, ".")[:300]  # the temporary directory is not part of the reason
+            # where the files are (the temporary directory, the checkout) is not part of the reason: the same file in every checkout
+            return False, str(e).replace(str(path), "plan.json").replace(tmp, ".").replace(str(GOLDEN), "golden/plans")[:300]
     return True, ""
 
 
