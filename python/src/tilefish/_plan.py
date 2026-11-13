@@ -181,17 +181,24 @@ class _Buffer:
     last: int = -1
     offset: "int | None" = None
     bytes: int = 0
+    version: int = 0  # how many steps have written it so far, while the graph is walked (a parameter starts at 0: the caller wrote it)
 
 
 @dataclass(frozen=True)
 class _Loc:
-    """Where a traced value lives: a buffer, and the shape, element strides and element offset of the view of it (all dimension expressions)."""
+    """Where a traced value lives: a buffer, and the shape, element strides and element offset of the view of it (all dimension expressions).
+
+    ``version`` is the version of the buffer's contents the value is: the IR gives a value the contents it had when it was made (an in-place call makes a
+    new version and consumes the old), but a view shares its buffer's storage, so a view that is read after its buffer was updated in place would read
+    the new bytes. A step that reads a value whose ``version`` is not the buffer's current one is refused (:func:`_walk`).
+    """
 
     buffer: _Buffer
     shape: "tuple[DimExpr, ...]"
     strides: "tuple[DimExpr, ...]"
     offset: DimExpr
     whole: bool  # the value is the buffer itself (not a view of it)
+    version: int = 0
 
 
 @dataclass
@@ -275,7 +282,8 @@ def _walk(gop: GraphOp) -> _Walk:
         strides = row_major_strides(t.shape)
         if any(s is None for s in strides):
             _fail(name, f"{value.ref} has the type {t}, whose strides are not affine expressions, so it cannot be planned")
-        return _Loc(b, tuple(t.shape), tuple(strides), DimExpr.const(0), True)  # type: ignore[arg-type]
+        b.version = 1  # the step that makes it writes it once
+        return _Loc(b, tuple(t.shape), tuple(strides), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
 
     for index, n in enumerate(g.nodes):
         kind = n.attrs.get("kind")
@@ -285,7 +293,7 @@ def _walk(gop: GraphOp) -> _Walk:
                 parent = loc[n.inputs[0]]  # type: ignore[index]
                 for out in n.outputs:
                     strides, offset = _layout(name, f"the view {out.ref} made by {n.op} (node #{index})", out.type)
-                    loc[out] = _Loc(parent.buffer, tuple(out.type.shape), strides, offset, False)
+                    loc[out] = _Loc(parent.buffer, tuple(out.type.shape), strides, offset, False, parent.version)
                 continue
             if n.op == "store":
                 _fail(name, f"{where} stores into the parameter '{n.attrs.get('target')}': a store is a copy, which a plan has no launch for; the last op should produce the value (return it)")
@@ -302,6 +310,15 @@ def _walk(gop: GraphOp) -> _Walk:
         op = callee.op
         sig_op = callee.public
         ins = {p.name: v for p, v in zip(sig_op.tensor_inputs, n.inputs)}
+        for pname, v in ins.items():
+            l = loc[v]
+            if l.version != l.buffer.version:
+                _fail(
+                    name,
+                    f"{where} reads '{pname}' = {v.ref} ({v.type}), a view of a tensor that was updated in place after the view was made: the IR gives a view the "
+                    "contents its tensor had then, but a view shares the storage, so a plan would read the updated bytes. Take the view from the updated "
+                    "version (its .live), or read the view before the update",
+                )
         n_ret, n_out = len(sig_op.returns), len(sig_op.tensor_outputs)
         returned, outs, inouts = n.outputs[:n_ret], n.outputs[n_ret : n_ret + n_out], n.outputs[n_ret + n_out :]
         out_locs: "dict[Value, _Loc]" = {}
@@ -315,7 +332,8 @@ def _walk(gop: GraphOp) -> _Walk:
                     f"{where} updates '{p.name}' in place, but the argument is a view of another tensor ({ins[p.name].ref}: {ins[p.name].type}); the IR says "
                     "updating a view does not change its parent, and a plan has no copy to make that true: pass a whole tensor",
                 )
-            loc[version] = src
+            src.buffer.version += 1
+            loc[version] = replace(src, version=src.buffer.version)
         args: "list[_Arg]" = []
         if callee.kind == "library":
             for p in sig_op.params:
@@ -342,6 +360,8 @@ def _walk(gop: GraphOp) -> _Walk:
     outputs: "list[_Buffer]" = []
     for i, v in enumerate(g.outputs):
         l = loc[v]
+        if any(l.buffer is o for o in outputs):
+            _fail(name, f"the returned value {v.ref} is returned twice (a plan writes each result into one buffer of the caller's)")
         if not l.whole or l.buffer.role != "intermediate":
             why = "a view" if not l.whole else f"the {l.buffer.role} '{l.buffer.name}'"
             _fail(
@@ -349,8 +369,6 @@ def _walk(gop: GraphOp) -> _Walk:
                 f"the returned value {v.ref} ({v.type}) is {why}, not a tensor that a call made: a plan writes a result into a buffer the caller provides, "
                 "and has no copy to put an input or a view there; have an op produce it",
             )
-        if any(l.buffer is o for o in outputs):
-            _fail(name, f"the returned value {v.ref} is returned twice")
         l.buffer.role = "output"
         outputs.append(l.buffer)
     if any(s.library for s in steps):
@@ -1109,6 +1127,8 @@ def _validate(doc: Any) -> None:
                         _bad(f"step #{si} args[{ai}]: the view reaches past the end of buffer '{a['binding']}' at {bucket['values']}")
                     if b["role"] == "devscalar":
                         _bad(f"step #{si} args[{ai}]: a devscalar is bound whole, without a view")
+            if len({a for a, _ in names_here}) != len(names_here):
+                _bad(f"step #{si}: the argument names must be distinct, got {[a for a, _ in names_here]}")
             this.append((st["kind"], st.get("workspace"), tuple(names_here)))
             if bi == 0:
                 for a in st["args"]:

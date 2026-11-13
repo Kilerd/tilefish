@@ -251,13 +251,20 @@ class PlanRunner:
     def __init__(self, plan: Plan, provider: Any, backend: "Backend | None" = None) -> None:
         self.plan = plan
         self.provider = provider
-        self.backend = backend if backend is not None else TorchBackend()
+        self._backend = backend
         self._doc = plan._doc
         self._buffers = {b["name"]: b for b in self._doc["buffers"]}
         self._rts: "dict[tuple, _BucketRT]" = {}
         self._arenas: "dict[int, _Arena]" = {}
         self._lock = threading.RLock()
         self.has_library = any(s["kind"] == "library" for s in self._doc["buckets"][0]["steps"])
+
+    @property
+    def backend(self) -> Backend:
+        """The backend (torch and the driver, made when first needed: a runner can be made, and a plan loaded, on a machine without torch)."""
+        if self._backend is None:
+            self._backend = TorchBackend()
+        return self._backend
 
     # -- preparing: everything that may allocate or wait ------------------------------------------------------------------------
 
@@ -532,7 +539,7 @@ def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory
         loaded, runner = found
         if pin is not None and loaded.digest != pin:
             raise TilefishManifestError(
-                f"the plan in {str(loaded.directory)!r} has digest {loaded.digest}, but pin= says {pin}: it is not the plan that was pinned "
+                f"the plan in {str(loaded.directory)!r} has digest {loaded.digest}, but the pin is {pin}: it is not the plan that was pinned "
                 "(it was changed, or it is another export)"
             )
         if (pin is not None) != runner.provider.pinned:
@@ -572,12 +579,21 @@ def run_graph(
         else:
             raise TilefishRuntimeError("jit takes plan=<a Plan made by tilefish.plan(graph, ...)> or none; a directory is for mode='replay'")
         return _jit_runner(p).run(args, kwargs, outputs)
-    if plan is None or isinstance(plan, Plan):
+    return _replay_runner(graph, _plan_directory(plan), pin, trust_directory).run(args, kwargs, outputs)
+
+
+def _plan_directory(plan: Any) -> Any:
+    """``plan=`` of a replay: a directory (or its ``plan.json``), or the :class:`~tilefish._plan.Plan` that ``export`` returned (it knows its directory)."""
+    if isinstance(plan, Plan):
+        if plan.directory is None:
+            raise TilefishRuntimeError(f"the plan of graph '{plan.name}' was only made, not exported: replay runs an exported directory (tilefish.runtime.export)")
+        return plan.directory
+    if plan is None:
         raise TilefishRuntimeError(
             "replay runs the plan of an exported directory: pass plan=<directory> (written by tilefish.runtime.export(graph, directory)) and pin=<the plan's digest> "
             "or trust_directory=True"
         )
-    return _replay_runner(graph, plan, pin, trust_directory).run(args, kwargs, outputs)
+    return plan
 
 
 def prepare(
@@ -598,7 +614,7 @@ def prepare(
     if mode == "jit":
         runner = _jit_runner(plan if isinstance(plan, Plan) else _default_plan(graph))
     else:
-        runner = _replay_runner(graph, plan, pin, trust_directory)
+        runner = _replay_runner(graph, _plan_directory(plan), pin, trust_directory)
     torch = runtime._torch()
     index = torch.cuda.current_device() if device is None else runner.backend.device_index(device)
     runner.prepare(index, buckets)
@@ -619,9 +635,8 @@ def export_graph(
     """:func:`tilefish.runtime.export` of a graph: build the binary of every step (and pin every GEMM), write the manifest (merged into one that is
     already there) and ``plan.json`` next to it, read both back, and return the plan loaded from the directory, which has the digest to pin."""
     from . import _library
-    from ._build import build, parse_arch, write_file, write_manifest_doc
+    from ._build import build, parse_arch
     from ._binary import build_binary
-    from ._manifest import MANIFEST_NAME, Manifest, manifest_digest
 
     p = make_plan(graph, buckets, reuse=reuse)
     if arch is None:
@@ -639,6 +654,16 @@ def export_graph(
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         else:
             built.append(build(spec, arch=cap, fn=callee.target.jit_function(spec)))
+    return write_export(p, built, pinned, directory, cap, overwrite)
+
+
+def write_export(p: Plan, built: "Sequence[Any]", pinned: "Sequence[Any]", directory: "str | os.PathLike[str]", cap: int, overwrite: bool) -> Plan:
+    """The half of :func:`export_graph` that writes: the builds (``BuiltKernel`` and ``BuiltLibrary``, one per entry of the plan) go to the manifest in
+    ``directory`` (merged into one that is there), ``plan.json`` is written next to it against the digest of the manifest as read back, and the plan is
+    loaded back from the directory (verified) and returned."""
+    from ._build import write_file, write_manifest_doc
+    from ._manifest import MANIFEST_NAME, Manifest, manifest_digest
+
     directory = pathlib.Path(directory)
     plan_path = directory / PLAN_NAME
     if plan_path.exists() and not overwrite:
@@ -662,7 +687,7 @@ def export_graph(
     _plan.validate_doc(final._doc)
     _plan.check_against_manifest(final._doc, loaded)
     write_file(plan_path, final.to_json().encode("utf-8"))
-    return _plan.load_plan(plan_path, graph, pin=final.digest)
+    return _plan.load_plan(plan_path, p.graph, pin=final.digest)
 
 
 def _existing_graph(path: pathlib.Path) -> "str | None":
