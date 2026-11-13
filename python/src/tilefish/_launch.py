@@ -66,7 +66,12 @@ def extent_elements(shape: "Sequence[int]", strides: "Sequence[int]") -> int:
 
 
 def tensor_info(name: str, t: Any) -> TensorInfo:
-    """Read the facts off a tensor (anything with torch's ``shape``, ``dtype``, ``data_ptr()``, ...)."""
+    """Read the facts off a tensor (anything with torch's ``shape``, ``dtype``, ``data_ptr()``, ...).
+
+    A kernel reads and writes the bytes of the tensor's memory, so a tensor whose memory does not hold what it is is refused here
+    (:func:`check_memory`): a negated or conjugated view, whose bytes are not its values, and a tensor whose storage cannot hold the
+    elements it reaches (a storage resized or freed under it). What a stand-in tensor (a test's fake) does not have is not checked.
+    """
     try:
         shape = tuple(int(d) for d in t.shape)
         itemsize = int(t.element_size())
@@ -75,7 +80,7 @@ def tensor_info(name: str, t: Any) -> TensorInfo:
         except (AttributeError, TypeError):
             strides = None
         nbytes = int(t.numel()) * itemsize if strides is None else extent_elements(shape, strides) * itemsize
-        return TensorInfo(
+        info = TensorInfo(
             shape=shape,
             dtype=str(t.dtype),
             ptr=int(t.data_ptr()),
@@ -89,6 +94,53 @@ def tensor_info(name: str, t: Any) -> TensorInfo:
         raise TilefishTypeError(
             f"argument '{name}' must be a torch tensor, got {type(t).__name__} ({t!r})"
         ) from None
+    check_memory(name, t, info)
+    return info
+
+
+def check_memory(name: str, t: Any, info: TensorInfo) -> None:
+    """Refuse a tensor whose memory is not what a kernel may read and write as its elements.
+
+    * A **negated** or **conjugated** view (``t.is_neg()``, ``t.is_conj()``: ``torch._neg_view(x)``, ``x.conj()`` of a complex tensor, the
+      ``.imag`` of one) shares the memory of its base and has torch apply the sign or the conjugation when it is read: its bytes are not its
+      values, and a kernel, which reads the bytes, would compute with the wrong ones (and write a result torch then negates again).
+      ``resolve_neg()`` / ``resolve_conj()`` give a tensor that holds its values.
+    * A tensor with elements whose data pointer is 0: its storage was resized to nothing or freed (``untyped_storage().resize_(0)``), and 0
+      passes every alignment check.
+    * A tensor whose storage is too small for it: the storage offset and the furthest element it reaches (its extent, by its strides), in
+      bytes, beyond ``untyped_storage().nbytes()``. Torch does not check that a tensor fits its storage once the storage is resized under it,
+      and a kernel would read and write past its end.
+
+    Each check needs the methods torch has (``is_neg``, ``is_conj``; ``untyped_storage`` and ``storage_offset`` for the last two, which every
+    tensor of the torch tilefish runs with has): a stand-in without them (a test's fake, whose address is any number) is not held to that check.
+    An empty tensor has no memory to check.
+    """
+    for flag, what, fix in (("is_neg", "a negated view", "resolve_neg"), ("is_conj", "a conjugated view", "resolve_conj")):
+        test = getattr(t, flag, None)
+        if callable(test) and bool(test()):
+            raise TilefishTypeError(
+                f"argument '{name}' is {what} ({flag}() is True): torch applies the {'sign' if flag == 'is_neg' else 'conjugation'} when the "
+                f"tensor is read, so its memory does not hold its values, and a kernel reads the memory; pass {name}.{fix}()"
+            )
+    storage, offset = getattr(t, "untyped_storage", None), getattr(t, "storage_offset", None)
+    if 0 in info.shape or not (callable(storage) and callable(offset)):
+        return
+    if info.ptr == 0:
+        raise TilefishTypeError(
+            f"argument '{name}' has {math.prod(info.shape)} elements (shape {list(info.shape)}) but its data pointer is 0: its storage was "
+            "resized to nothing or freed, and a kernel would read and write at address 0"
+        )
+    try:
+        held, start = int(storage().nbytes()), int(offset())
+    except (RuntimeError, NotImplementedError):  # (a tensor subclass with no storage of its own: the pointer is what there is)
+        return
+    reached = start * info.itemsize + info.nbytes
+    if reached > held:
+        raise TilefishTypeError(
+            f"argument '{name}' reaches {reached} bytes into its storage (from storage offset {start}, {info.nbytes} bytes of elements of "
+            f"{info.itemsize} bytes, shape {list(info.shape)}), but its storage holds {held} bytes: the storage was resized under it, and a "
+            "kernel would read and write past its end"
+        )
 
 
 def canonical_strides(shape: "Sequence[int]", strides: "Sequence[int] | None") -> "tuple[int, ...]":

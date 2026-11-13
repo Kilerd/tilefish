@@ -166,6 +166,89 @@ def test_tensor_info_reads_the_facts():
     assert (info.shape, info.dtype, info.ptr, info.contiguous, info.device, info.nbytes) == ((2, 3), F32, 64, True, "cuda:0", 24)
 
 
+# -- a tensor whose memory is not its values, or does not hold it --------------------------------------------------------------------------
+
+
+class TorchLikeTensor(FakeTensor):
+    """A fake with the methods of torch that say what its memory holds: the neg and conj bits, its storage and its offset into it."""
+
+    def __init__(self, shape, dtype=F32, ptr=0x7F0000000000, *, neg=False, conj=False, storage_nbytes=None, storage_offset=0, strides=None):
+        super().__init__(shape, dtype, ptr)
+        self._neg, self._conj, self._offset, self._strides = neg, conj, storage_offset, strides
+        self._held = (storage_offset + math.prod(shape)) * ITEMSIZE[dtype] if storage_nbytes is None else storage_nbytes
+
+    def is_neg(self):
+        return self._neg
+
+    def is_conj(self):
+        return self._conj
+
+    def stride(self):
+        if self._strides is None:
+            raise AttributeError("dense")  # (as a fake without strides: tensor_info takes the dense ones)
+        return self._strides
+
+    def storage_offset(self):
+        return self._offset
+
+    def untyped_storage(self):
+        held = self._held
+        return type("Storage", (), {"nbytes": lambda s: held})()
+
+
+def test_a_negated_or_conjugated_view_is_refused():
+    """``torch._neg_view(x)`` and ``x.conj()`` of a complex tensor share ``x``'s memory: torch negates or conjugates when it reads, a kernel does not."""
+    with pytest.raises(TilefishTypeError, match=r"argument 'x' is a negated view \(is_neg\(\) is True\): .* pass x.resolve_neg\(\)"):
+        tensor_info("x", TorchLikeTensor((4,), neg=True))
+    with pytest.raises(TilefishTypeError, match=r"argument 'x' is a conjugated view \(is_conj\(\) is True\): .* pass x.resolve_conj\(\)"):
+        tensor_info("x", TorchLikeTensor((4,), conj=True))
+    assert tensor_info("x", TorchLikeTensor((4,))).nbytes == 16
+
+
+def test_a_tensor_whose_storage_cannot_hold_it_is_refused():
+    # a storage resized to nothing under a tensor: its data pointer is 0, which every alignment check passes
+    with pytest.raises(TilefishTypeError, match=r"argument 'x' has 4 elements \(shape \[4\]\) but its data pointer is 0"):
+        tensor_info("x", TorchLikeTensor((4,), ptr=0, storage_nbytes=0))
+    assert tensor_info("x", FakeTensor((4,), F32, ptr=0)).ptr == 0  # (a stand-in that does not say where its memory is is not held to it)
+    assert tensor_info("x", TorchLikeTensor((0, 4), ptr=0, storage_nbytes=0)).nbytes == 0  # an empty tensor has no memory to hold
+    # a storage shrunk under a view: the offset and the furthest element it reaches, in bytes, beyond what the storage holds
+    with pytest.raises(TilefishTypeError, match=r"argument 'x' reaches 48 bytes into its storage \(from storage offset 8, 16 bytes .*\), but its storage holds 40 bytes"):
+        tensor_info("x", TorchLikeTensor((4,), storage_offset=8, storage_nbytes=40))
+    assert tensor_info("x", TorchLikeTensor((4,), storage_offset=8, storage_nbytes=48)).ptr == 0x7F0000000000  # exactly enough
+    # a strided view reaches its extent, not its element count: 1 + 3*5 elements of 4 bytes
+    with pytest.raises(TilefishTypeError, match=r"reaches 64 bytes into its storage"):
+        tensor_info("x", TorchLikeTensor((4,), strides=(5,), storage_nbytes=60))
+    assert tensor_info("x", TorchLikeTensor((4,), strides=(5,), storage_nbytes=64)).nbytes == 64
+    assert tensor_info("x", TorchLikeTensor((4, 8), strides=(0, 1), storage_nbytes=32)).nbytes == 32  # an expanded view reaches one row
+
+
+def test_a_real_negated_conjugated_or_resized_tensor_is_refused():
+    """The same on torch's own tensors, on the CPU (``test_gpu_*`` launch CUDA tensors through the same ``tensor_info``)."""
+    torch = pytest.importorskip("torch")
+    x = torch.arange(8, dtype=torch.float32)
+    assert tensor_info("x", x).nbytes == 32 and tensor_info("x", x[2:6]).nbytes == 16 and tensor_info("x", x[::2]).nbytes == 28
+    assert tensor_info("x", x[:1].expand(8)).nbytes == 4
+    with pytest.raises(TilefishTypeError, match=r"is a negated view"):
+        tensor_info("x", torch._neg_view(x))
+    tensor_info("x", torch._neg_view(x).resolve_neg())
+    z = torch.zeros(4, dtype=torch.complex64)
+    with pytest.raises(TilefishTypeError, match=r"is a conjugated view"):
+        tensor_info("z", z.conj())
+    with pytest.raises(TilefishTypeError, match=r"is a negated view"):
+        tensor_info("z", z.conj().imag)  # the imaginary part of a conjugated view is a negated view
+    tensor_info("z", z.conj().resolve_conj())
+    y = torch.arange(8, dtype=torch.float32)
+    view = y[4:]
+    y.untyped_storage().resize_(16)  # 4 elements left: the view starts at element 4 and reaches element 7
+    with pytest.raises(TilefishTypeError, match=r"argument 'v' reaches 32 bytes into its storage \(from storage offset 4, 16 bytes .*\), but its storage holds 16 bytes"):
+        tensor_info("v", view)
+    w = torch.arange(8, dtype=torch.float32)
+    w.untyped_storage().resize_(0)
+    with pytest.raises(TilefishTypeError, match=r"argument 'w' has 8 elements \(shape \[8\]\) but its data pointer is 0"):
+        tensor_info("w", w)
+    assert tensor_info("e", torch.empty(0)).nbytes == 0
+
+
 # -- solving dimensions ---------------------------------------------------------------------------------------------------------
 
 K = Dim("K")
