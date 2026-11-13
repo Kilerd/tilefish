@@ -34,17 +34,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 These checks happen before anything reaches the driver:
 
-- **At load:** the manifest is strict JSON, its digest is the pinned one, and
-  every cubin matches its `sha256` and machine-code digest.
-- **At launch:** the shapes bind the dimensions; dtypes, buckets,
-  `divisible_by`, `max_elements`, aliasing, alignment, device and context, and
-  the grid limits are all checked.
+- **At load:** the manifest is strict JSON of schema 3 (an older one is refused:
+  export it again), its digest is the pinned one, every cubin matches its
+  `sha256` and machine-code digest and is for the architecture its entry says,
+  and the loaded function takes the parameter sizes of the ABI.
+- **At launch:** the shapes bind the dimensions (and the strides of a view bind
+  its stride dimensions); dtypes, buckets, `divisible_by`, `max_elements` and
+  `max_extent`, aliasing, the alignment each pointer promises, contiguity,
+  device and context, and the grid limits are all checked.
 
-Safe code cannot free a slice under a running kernel, and a launch of slices
-on a stream that is capturing a CUDA graph is refused, in every cudarc context.
-`unsafe` is needed in exactly two places: vouching for a raw device region,
-which is also how CUDA graphs are captured (with `launch_raw`), and launching on
-a raw `CUstream`. See the crate docs for the exact contracts.
+Everything schema 3 describes is launched: Triton kernels and prebuilt PTX and
+cubin binaries (launched with exactly their parameters, `fixed` arguments
+written at their slots), strided views (`TensorRef::from_cuda_strided`), device
+scalars (a tensor of one element), `i64` strides, and pinned cuBLASLt GEMMs
+(`Manifest::gemm`, `Gemm::launch`: the cuBLASLt of the process must be the version
+that chose the algorithm, and the workspace is the caller's last tensor, so
+nothing is allocated in a launch and it can be captured in a CUDA graph).
+
+Safe code cannot free a slice under a running kernel or GEMM, and a launch of
+slices on a stream that is capturing a CUDA graph is refused, in every cudarc
+context. `unsafe` is needed in exactly two places: vouching for a raw device
+region, which is also how CUDA graphs are captured (with `launch_raw`), and
+launching on a raw `CUstream`. See the crate docs for the exact contracts.
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your
 option.

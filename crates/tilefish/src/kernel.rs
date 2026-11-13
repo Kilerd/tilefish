@@ -3,7 +3,9 @@
 //! What Python's `_cuda.py` does through `cuda-python`: load the verified cubin bytes into a context
 //! (`CudaContext::load_module(Ptx::from_binary(..))`), get the manifest's symbol (`CudaModule::load_function`), opt in to dynamic
 //! shared memory above the default 48 KiB (`CudaFunction::set_attribute`), and launch with `kernelParams` laid out as the ABI says (the
-//! arguments in declaration order, a pointer as 64 bits and an `i32` as 32, then two null 64-bit scratch pointers).
+//! arguments in declaration order: a pointer as 64 bits, a scalar as its `i32` or `i64`, a `fixed` argument as its value in its type;
+//! then, for a Triton kernel, two null 64-bit scratch pointers, and for a prebuilt binary nothing). The loaded function must take the
+//! parameter sizes of that ABI (`cuFuncGetParamInfo`).
 //!
 //! A kernel belongs to the context it was loaded in, which is passed explicitly ([`Manifest::kernel`] takes an
 //! `&Arc<CudaContext>`) and kept alive by the kernel, with the module and the function: nothing relies on which context is current on

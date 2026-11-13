@@ -340,29 +340,46 @@ orders the free behind a kernel that may have run.) A CUDA graph is captured
 with `launch_raw` (or `launch`) and regions: the graph holds the addresses and
 nothing that keeps the memory alive, so it must not be replayed after the memory
 is gone, and a launch of slices on a capturing stream is an error, not a graph,
-whatever the cudarc context. The loaded function's parameter sizes are not compared with the ABI
-(`cuFuncGetParamInfo`, which Python's `replay` asks): cudarc has no wrapper for it,
-and it adds nothing, because the cubin is the one whose digests the manifest
-pinned and the ABI is in the digest of the manifest. `cudarc` panics when there is
-no NVIDIA driver, so `tilefish::driver_available()` says first.
+whatever the cudarc context. The loaded function's parameter sizes are compared
+with the ABI of the manifest (`cuFuncGetParamInfo`, as Python's `replay` does), and
+a cubin whose ELF header names another architecture than its entry is refused.
+`cudarc` panics when there is no NVIDIA driver, so `tilefish::driver_available()`
+says first.
 
-A manifest (schema 2) carries what a host needs to check a launch on its own:
+A manifest (schema 3) carries what a host needs to check a launch on its own:
 every pointer parameter records its declared shape, with static axes as sizes
 (`["Rows", 1024]`), and every entry the constraints of its named dimensions
 (`divisible_by`, `buckets`, and the bucket the binary is built for). A launch
-takes nothing but its tensors. The crate binds the dimensions from their sizes,
+takes nothing but its tensors. The crate binds the dimensions from their sizes
+(and the stride dimensions of a strided view from its canonical strides),
 checks that they agree across arguments and with the static sizes, the exact
-bucket and `divisible_by`, the dtype and rank of each tensor, `max_elements`,
-that the runtime scalars (derived from the dimensions, or from the element count
-of the tensor they count) fit 32 bits, aliasing, 16-byte alignment and the grid
+bucket and `divisible_by`, the dtype and rank of each tensor (a device scalar is
+one element), `max_elements` and, for a view, `max_extent`, that the runtime
+scalars (derived from the dimensions, from the element count of the tensor they
+count, or from a stride) fit the 32 or 64 bits they are passed as, aliasing, the
+alignment each pointer promises (16 bytes, or a strided pointer's element size),
+contiguity of a tensor given for a parameter that is not strided, and the grid
 against the device's limits, and evaluates the grid from its expression. There is
 no way to tell a launch what a dimension is. A manifest of an older schema is
 refused by both hosts: export it again.
 
-**Schema 3 and the crate.** Python writes manifest schema 3 (`docs/manifest-schema-3.md`); the crate 0.0.1 reads schema 2 only, and a later
-version reads schema 3 (strided views, device scalars, prebuilt binaries, the `library` section). Until then `emit` writes launchers for a schema 3 manifest
-of dense Triton kernels (they load under a crate that reads schema 3) and refuses the rest with "not yet supported by the Rust host"; the committed
-fixtures of the crate stay schema 2, and the Python tests migrate a copy.
+**Schema 3 and the crate.** The crate reads manifest schema 3
+(`docs/manifest-schema-3.md`) in full and launches everything it describes:
+Triton kernels and prebuilt PTX and cubin binaries (exactly their parameters, no
+scratch slots, `fixed` arguments at their slots), strided views
+(`TensorRef::from_cuda_strided`, or over a region with `new_strided`; any element
+strides and any offset), device scalars (a tensor of shape `[]` or `[1]`), `i64`
+strides, and the pinned cuBLASLt GEMMs of the `library` section
+(`Manifest::gemm`, `Gemm::launch`, and `unsafe Gemm::launch_raw` for a CUDA
+graph). A GEMM runs the 64-byte algorithm the manifest pinned through cudarc's
+`cublaslt::result`: it is refused when the process has another cuBLASLt than the
+one that chose it, when the algorithm is not one cuBLASLt would have produced,
+and when the library does not approve it for the problem. Its workspace is the
+caller's last tensor (`Gemm::alloc_workspace` allocates the size the entry says),
+so a launch allocates nothing and can be captured; the slices of a GEMM are
+ordered like a kernel's. The published crate 0.0.1 reads schema 2 only. `emit`
+writes typed launchers for all of it; the committed fixtures of the crate are
+schema 3 manifests.
 
 ```python
 from tilefish.hosts import rust

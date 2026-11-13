@@ -1208,11 +1208,16 @@ fn refusals_of_schema_3() {
 
     // the library: a GEMM with a bias for this architecture
     assert!(!manifest.library().is_empty(), "the gate's manifest has library entries");
-    let entry = manifest
-        .library()
+    // (one whose pinned algorithm needs a workspace, so that a workspace that is too small is refused; some algorithms need none)
+    let candidates: Vec<_> =
+        manifest.library().iter().filter(|e| e.implementation.has_bias() && e.arch == arch.to_string()).collect();
+    assert!(!candidates.is_empty(), "a gemm_bias for this architecture");
+    let needs: Vec<(u64, &str)> = candidates
         .iter()
-        .find(|e| e.implementation.has_bias() && e.arch == arch.to_string())
-        .expect("a gemm_bias for this architecture");
+        .map(|e| (manifest.gemm(&gpu.ctx, &e.stem, &[], arch).unwrap().workspace_required(), e.stem.as_str()))
+        .collect();
+    println!("rust gate: the workspace each pinned gemm_bias needs: {needs:?}");
+    let entry = candidates.iter().zip(&needs).find(|(_, (bytes, _))| *bytes > 16).map_or(candidates[0], |(e, _)| *e);
     let gemm = manifest.gemm(&gpu.ctx, &entry.stem, &[], arch).unwrap();
     let (m, n, k) = (entry.m as usize, entry.n as usize, entry.k as usize);
     let (a, b, bias) = (gpu.zeros(m * k * 2), gpu.zeros(n * k * 2), gpu.zeros(n * 2));
@@ -1231,19 +1236,65 @@ fn refusals_of_schema_3() {
             ]
         };
     }
+    if gemm.workspace_required() > 16 {
+        let e = gemm
+            .launch(
+                s,
+                &mut operands!(
+                    TensorMut::<Bf16>::from_cuda(&mut out.slice, &out_shape).unwrap().into_arg(),
+                    TensorMut::<U8>::from_cuda(&mut tiny.slice, &tiny_shape).unwrap().into_arg(),
+                ),
+            )
+            .unwrap_err();
+        check(
+            "a GEMM workspace that is too small",
+            e.precondition_kind() == Some(PreconditionKind::Shape) && e.to_string().contains("workspace"),
+        );
+    } else {
+        // (every algorithm pinned on this device needs no workspace: any workspace is enough, the other checks of it still hold)
+        println!("rust gate: the pinned algorithm of '{}' needs no workspace: no workspace is too small", entry.stem);
+    }
+    // the workspace is bytes
     let e = gemm
         .launch(
             s,
             &mut operands!(
                 TensorMut::<Bf16>::from_cuda(&mut out.slice, &out_shape).unwrap().into_arg(),
-                TensorMut::<U8>::from_cuda(&mut tiny.slice, &tiny_shape).unwrap().into_arg(),
+                TensorMut::<Bf16>::from_cuda(&mut tiny.slice, &[8usize]).unwrap().into_arg(),
+            ),
+        )
+        .unwrap_err();
+    check("a GEMM workspace that is not bytes", e.precondition_kind() == Some(PreconditionKind::Dtype));
+    // 256-byte aligned: a workspace that starts 8 bytes into its slice is not
+    let strides = [1usize];
+    let e = gemm
+        .launch(
+            s,
+            &mut operands!(
+                TensorMut::<Bf16>::from_cuda(&mut out.slice, &out_shape).unwrap().into_arg(),
+                TensorMut::<U8>::from_cuda_strided(&mut workspace, &[ws_shape[0] - 8], &strides, 8).unwrap().into_arg(),
             ),
         )
         .unwrap_err();
     check(
-        "a GEMM workspace that is too small",
-        e.precondition_kind() == Some(PreconditionKind::Shape) && e.to_string().contains("workspace"),
+        "a GEMM workspace that is not 256-byte aligned",
+        e.precondition_kind() == Some(PreconditionKind::PointerAlignment),
     );
+    // it must not overlap the result: two regions over the result's own memory, one of them the workspace
+    // SAFETY: both regions are the result's own memory, which outlives the call; nothing is launched (it is refused).
+    let (out_region, ws_region) =
+        unsafe { (gpu.unbound_region(&out, out.nbytes()), gpu.unbound_region(&out, out.nbytes())) };
+    let overlap_shape = [out.nbytes() as usize];
+    let e = gemm
+        .launch(
+            s,
+            &mut operands!(
+                TensorMut::<Bf16>::new(out_region, &out_shape).unwrap().into_arg(),
+                TensorMut::<U8>::new(ws_region, &overlap_shape).unwrap().into_arg(),
+            ),
+        )
+        .unwrap_err();
+    check("a GEMM workspace that overlaps the result", e.precondition_kind() == Some(PreconditionKind::Alias));
     let e = gemm
         .launch(
             s,
