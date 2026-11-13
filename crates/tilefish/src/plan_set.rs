@@ -5,9 +5,14 @@
 //! port of `read_plan_set`, `validate_set` and `set_digest` of `python/src/tilefish/_plan.py`. [`PlanSet::load`] reads the index with its pin, loads
 //! and verifies the manifest once (pinned to the index's `manifest_digest`), and [`PlanSet::plan`] loads one plan with the digest the index lists as
 //! its pin and the set's manifest: one pin covers every plan, their manifest and every binary, and the plans share the manifest's loaded modules.
+//!
+//! [`PlanSet::instantiate`] puts plans of the set on **one arena they share** ([`SharedArena`], section 15.1 of the document): a host that runs
+//! them one at a time pays for the largest of their arenas, not for each, and every launch and replay of any of them is ordered with the others.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use cudarc::driver::CudaStream;
 use serde_json::Value;
 
 use crate::elf::sha256_hex;
@@ -15,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::json::{canonical, parse_strict, type_name};
 use crate::launch_plan::LaunchPlan;
 use crate::manifest::{MANIFEST_NAME, Manifest, Pin, is_arch, is_digest, is_ident};
+use crate::plan_run::{PlanRun, SharedArena};
 
 /// The `schema` of a plan set's index.
 pub const PLAN_SET_SCHEMA: &str = "tilefish.plan-set.v1";
@@ -207,5 +213,78 @@ impl PlanSet {
     /// The manifest of every plan of the set, loaded and verified once.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// The plans of graphs `names`, each loaded once ([`PlanSet::plan`]); refused for no name, a name given twice or one the set does not
+    /// list.
+    fn plans_named(&self, names: &[&str]) -> Result<Vec<LaunchPlan>> {
+        if names.is_empty() {
+            return Err(Error::Launch(
+                "name the plans of the set that share the arena (all of them: set.names().collect::<Vec<_>>())"
+                    .to_owned(),
+            ));
+        }
+        let mut plans: Vec<LaunchPlan> = Vec::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            if names[..i].contains(name) {
+                return Err(Error::Launch(format!(
+                    "a shared arena has each plan once: the plan of graph '{name}' is given twice"
+                )));
+            }
+            plans.push(self.plan(name)?);
+        }
+        Ok(plans)
+    }
+
+    /// The bytes of the arena the plans of graphs `names` share ([`SharedArena::bytes_for`]: the largest of their `arena_bytes`; each plan keeps
+    /// its own offsets from the arena's first byte). Needs no GPU.
+    pub fn shared_arena_bytes(&self, names: &[&str]) -> Result<u64> {
+        let plans = self.plans_named(names)?;
+        SharedArena::bytes_for(&plans.iter().collect::<Vec<_>>())
+    }
+
+    /// Instantiate the plans of graphs `names` on **one arena they share** (`docs/plan-schema-1.md`, section 15.1): a [`SharedArena`] of the
+    /// largest of their arenas, allocated on `stream`, and every plan instantiated on it for every bucket combination
+    /// ([`LaunchPlan::instantiate_all_in`]). A host that runs them one at a time (a request's stage A, then B, then C) pays for one arena, not
+    /// one per plan: every launch and replay of any of them is ordered with those of the others, so none run concurrently, and nothing in the
+    /// arena outlives a launch (a value a later plan reads is a returned value of the earlier one, in a tensor of the caller's).
+    pub fn instantiate(&self, stream: &Arc<CudaStream>, names: &[&str]) -> Result<SetRun> {
+        let plans = self.plans_named(names)?;
+        let arena = SharedArena::new(stream, &plans.iter().collect::<Vec<_>>())?;
+        let mut runs = Vec::with_capacity(plans.len());
+        for plan in &plans {
+            runs.push((plan.graph().to_owned(), plan.instantiate_all_in(&arena)?));
+        }
+        Ok(SetRun { arena, runs })
+    }
+}
+
+/// Plans of a set instantiated on one [`SharedArena`] ([`PlanSet::instantiate`]): a [`PlanRun`] per plan, every one on the same arena. Cheap
+/// to clone (the clones share the instantiations and the arena).
+#[derive(Debug, Clone)]
+pub struct SetRun {
+    arena: SharedArena,
+    runs: Vec<(String, PlanRun)>,
+}
+
+impl SetRun {
+    /// The instantiation of the plan of graph `graph`, on the shared arena: launch it, capture it, bind its weights as any [`PlanRun`].
+    pub fn run(&self, graph: &str) -> Result<&PlanRun> {
+        self.runs.iter().find(|(g, _)| g == graph).map(|(_, r)| r).ok_or_else(|| {
+            let names: Vec<&str> = self.names().collect();
+            Error::Launch(format!(
+                "the plan of graph '{graph}' is not one of this shared arena; its plans are {names:?}"
+            ))
+        })
+    }
+
+    /// The graphs of the plans, in the order they were given.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.runs.iter().map(|(g, _)| g.as_str())
+    }
+
+    /// The arena the plans share.
+    pub fn arena(&self) -> &SharedArena {
+        &self.arena
     }
 }

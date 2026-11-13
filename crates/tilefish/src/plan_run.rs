@@ -37,6 +37,12 @@
 //! Dropping the last handle of an instantiation waits for the arena's stream, so nothing of the plan runs when its arena is freed and its modules
 //! unloaded.
 //!
+//! **An arena shared by several plans** ([`SharedArena`], `docs/plan-schema-1.md` section 15.1). Plans that a host runs one at a time (the plans
+//! of a set: [`PlanSet::instantiate`](crate::PlanSet::instantiate)) can be instantiated on one arena of the largest one's bytes
+//! ([`LaunchPlan::instantiate_in`]), each with its buffers at its own offsets from the first byte. Their instantiations hold the one arena, with
+//! its one lock and its one stream, so everything above is said of all of them together: a launch, a capture, a replay or a `launch_step` of any
+//! plan of the arena is ordered with those of every other, and they never overlap on the device. Nothing in the arena outlives a launch.
+//!
 //! What is not this module's: the ordering of a use of an external that is not a launch of this crate (cudarc's tracking, or the host's), as
 //! everywhere in the crate.
 
@@ -225,36 +231,224 @@ struct Arena {
     staging: Option<ffi::plan::Staging>,
 }
 
+/// An arena and what orders the executions on it: the memory of the intermediates, the device-scalar slots and the cuBLASLt workspace of the
+/// one plan of an instantiation, or of the plans of a [`SharedArena`], which run on it one at a time, each with its own layout from the first
+/// byte. Every launch, replay and `launch_step` of every instantiation on it takes the one lock (`state`) and is ordered through the one stream
+/// it was allocated on (`home`), so no two of them overlap on the device.
+#[derive(Debug)]
+struct ArenaCore {
+    context: Arc<CudaContext>,
+    /// The stream the arena was allocated on, and is freed on: an execution elsewhere is ordered against it, as a slice's own stream is.
+    home: Arc<CudaStream>,
+    device: i32,
+    state: Mutex<Arena>,
+    addr: u64,
+    bytes: u64,
+    /// Numbers the captures of every instantiation on the arena (whose device scalar values the slots hold).
+    captures: AtomicU64,
+    /// The plans that may be instantiated on the arena, `(graph, plan digest)`, when it is a [`SharedArena`]'s; empty for the arena of one
+    /// instantiation.
+    members: Vec<(String, String)>,
+}
+
+impl Drop for ArenaCore {
+    fn drop(&mut self) {
+        // The home stream has waited for the end of every execution on the arena made on another stream, and has the ones made on it: when it
+        // is idle nothing uses the arena, so freeing it and the pinned staging memory (which the fields do next) cannot happen under a step.
+        let _ = self.home.synchronize();
+    }
+}
+
+impl ArenaCore {
+    /// Allocate `bytes` bytes on `stream` (aligned to 256), and the pinned staging memory of the device scalars when `devscalars`.
+    fn allocate(
+        stream: &Arc<CudaStream>,
+        bytes: u64,
+        devscalars: bool,
+        members: Vec<(String, String)>,
+    ) -> Result<Arc<Self>> {
+        let ctx = Arc::clone(stream.context());
+        let arena_bytes = usize::try_from(bytes)
+            .map_err(|_| Error::Unsupported("the arena does not fit the address space".to_owned()))?;
+        let slice = if arena_bytes > 0 {
+            Some(stream.alloc_zeros::<u8>(arena_bytes).map_err(Error::driver("cuMemAllocAsync"))?)
+        } else {
+            None
+        };
+        let addr = slice.as_ref().map_or(0, |s| sealed::Memory::region(s).addr);
+        if !addr.is_multiple_of(crate::launch_plan::ARENA_ALIGNMENT) {
+            return Err(Error::Unsupported(format!(
+                "the arena was allocated at {addr:#x}, which is not aligned to {} bytes",
+                crate::launch_plan::ARENA_ALIGNMENT
+            )));
+        }
+        let staging = if devscalars { Some(ffi::plan::Staging::new(&ctx)?) } else { None };
+        Ok(Arc::new(Self {
+            context: Arc::clone(&ctx),
+            home: Arc::clone(stream),
+            device: ctx.ordinal() as i32,
+            state: Mutex::new(Arena { slice, slots_of: 0, staging }),
+            addr,
+            bytes,
+            captures: AtomicU64::new(0),
+            members,
+        }))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Arena> {
+        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn shared(&self) -> bool {
+        !self.members.is_empty()
+    }
+
+    /// The arena's range of addresses, for the checks that nothing of the caller is in it.
+    fn range(&self) -> (u128, u128) {
+        (u128::from(self.addr), u128::from(self.addr) + u128::from(self.bytes))
+    }
+
+    /// What a refusal of a tensor in the arena adds when the arena is shared.
+    fn shared_note(&self) -> &'static str {
+        if self.shared() {
+            " (the arena is shared with other plans, which write all of its bytes: a value that outlives a launch is a returned value, in a \
+             tensor of the caller)"
+        } else {
+            ""
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Instance {
     plan: LaunchPlan,
-    context: Arc<CudaContext>,
-    /// The stream the arena was allocated on, and is freed on: a launch elsewhere is ordered against it, as a slice's own stream is.
-    home: Arc<CudaStream>,
-    device: i32,
-    arena: Mutex<Arena>,
-    arena_addr: u64,
+    arena: Arc<ArenaCore>,
     buckets: Vec<BucketRun>,
     by_name: HashMap<String, usize>,
     /// The dimensions, numbered in the order of the plan's `dims` (what the externals' shapes bind).
     syms: Symbols,
     /// The shape of every external, as patterns over the dimensions (empty for an arena buffer).
     patterns: Vec<Vec<Pattern>>,
-    captures: AtomicU64,
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        // The arena's own stream has waited for the end of every launch and replay of this instantiation made on another stream, and has the
-        // ones made on it: when it is idle nothing of the plan runs, so unloading the modules, destroying the cuBLASLt handles and freeing the
-        // arena (which the fields do next) cannot happen under a step. A failure cannot be reported from a destructor.
-        let _ = self.home.synchronize();
+        // The arena's own stream has waited for the end of every launch and replay on the arena made on another stream, and has the ones made
+        // on it: when it is idle nothing of the plan runs, so unloading the modules and destroying the cuBLASLt handles (which the fields do
+        // next; the arena is freed with its last holder) cannot happen under a step. A failure cannot be reported from a destructor.
+        let _ = self.arena.home.synchronize();
     }
 }
 
 impl Instance {
     fn lock_arena(&self) -> MutexGuard<'_, Arena> {
-        self.arena.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.arena.lock()
+    }
+}
+
+/// An arena shared by several plans that a host runs **one at a time** (`docs/plan-schema-1.md`, section 15.1): the plans of a set (stage A,
+/// then B, then C of a request; a variable number of tile plans), each of which would otherwise have an arena of its own.
+///
+/// **The layout.** The arena has the bytes of the largest arena of the plans ([`SharedArena::bytes_for`]: the largest `arena_bytes` of their
+/// documents), and each plan keeps its own layout in it, from the same first byte: every buffer at the `offset` its plan says, so a CUDA graph
+/// captured from any of them holds fixed addresses. Nothing of a plan changes, nor its digest, nor the set's: the layout is the plans' own,
+/// which the pin of the set covers. The plans' intermediates, device-scalar slots and cuBLASLt workspaces share bytes, which is sound because no
+/// two executions on the arena overlap on the device and every execution writes each arena buffer it reads before it reads it (a device
+/// scalar's slot before the first launch).
+///
+/// **The order.** A plan is instantiated on it with [`LaunchPlan::instantiate_in`] (or `instantiate_all_in`, or every plan of a set at once with
+/// [`PlanSet::instantiate`](crate::PlanSet::instantiate)); the [`PlanRun`]s share the arena's one lock and its one stream, so every launch,
+/// [`CapturedPlan::replay`], capture and `launch_step` of any of them is ordered with all the others, from any thread and on any stream, exactly
+/// as those of one instantiation are: they cannot run concurrently. A replay of plan A's graph is ordered with every launch and replay of plan B.
+///
+/// **What outlives a launch.** Nothing in the arena: the next execution, of any plan of the arena, writes over it. A value one plan makes and a
+/// later plan reads is a **returned value** of the first (a tensor of the caller's) given as an external of the second. A tensor of the caller
+/// that overlaps the arena anywhere (not only the part of the plan that runs), an external, a tap or a tensor of `launch_step`, is refused.
+///
+/// Cheap to clone (the clones are one arena); the arena is freed with the last of its clones and of the instantiations on it, after its stream
+/// has finished what it has.
+#[derive(Debug, Clone)]
+pub struct SharedArena {
+    core: Arc<ArenaCore>,
+}
+
+impl SharedArena {
+    /// Allocate the arena of `plans` on `stream` (which it is freed on; an execution on that stream needs no extra ordering): the bytes of the
+    /// largest of their arenas ([`SharedArena::bytes_for`]), with the pinned staging memory of the device scalars when some plan has one. Every
+    /// plan must be for the architecture of the stream's device; the plans are given each once (by graph name). Refused on the per-thread
+    /// default stream and on a stream that is capturing a CUDA graph.
+    pub fn new(stream: &Arc<CudaStream>, plans: &[&LaunchPlan]) -> Result<Self> {
+        let bytes = Self::bytes_for(plans)?;
+        ffi::refuse_per_thread(stream, std::iter::empty())?;
+        let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
+        if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+            return Err(Error::Launch(
+                "a shared arena is not allocated while its stream captures a CUDA graph: the graph would own it"
+                    .to_owned(),
+            ));
+        }
+        let arch = Arch::of_context(stream.context())?;
+        if let Some(other) = plans.iter().find(|p| p.arch() != arch.to_string()) {
+            return Err(Error::Unsupported(format!(
+                "the plan of graph '{}' was built for {}, but the CUDA device {} of the stream is {arch}",
+                other.graph(),
+                other.arch(),
+                stream.context().ordinal()
+            )));
+        }
+        let devscalars = plans.iter().any(|p| p.buffers().iter().any(|b| b.role == BufferRole::Devscalar));
+        let members = plans.iter().map(|p| (p.graph().to_owned(), p.digest().to_owned())).collect();
+        Ok(Self { core: ArenaCore::allocate(stream, bytes, devscalars, members)? })
+    }
+
+    /// The bytes of the arena `plans` share: the largest `arena_bytes` of their documents (each plan's buffers keep their offsets, from the
+    /// arena's first byte). Refused for no plan, and for a graph given twice. Needs no GPU.
+    pub fn bytes_for(plans: &[&LaunchPlan]) -> Result<u64> {
+        if plans.is_empty() {
+            return Err(Error::Launch(
+                "a shared arena is the arena of one plan or more: give the plans that share it".to_owned(),
+            ));
+        }
+        for (i, p) in plans.iter().enumerate() {
+            if plans[..i].iter().any(|q| q.graph() == p.graph()) {
+                return Err(Error::Launch(format!(
+                    "a shared arena has each plan once: the plan of graph '{}' is given twice",
+                    p.graph()
+                )));
+            }
+        }
+        Ok(plans.iter().map(|p| p.arena_bytes()).max().unwrap_or(0))
+    }
+
+    /// The bytes of the arena.
+    pub fn bytes(&self) -> u64 {
+        self.core.bytes
+    }
+
+    /// The device address of the arena's first byte (0 when it has no bytes): a host's own memory must not overlap
+    /// `[address, address + bytes)` where a plan of the arena is given it.
+    pub fn address(&self) -> u64 {
+        self.core.addr
+    }
+
+    /// The stream the arena was allocated on (and is freed on).
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.core.home
+    }
+
+    /// The context of the arena: its plans are instantiated, and launched, in it.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.core.context
+    }
+
+    /// The graphs of the plans the arena was made for, in the order they were given.
+    pub fn graphs(&self) -> impl Iterator<Item = &str> {
+        self.core.members.iter().map(|(g, _)| g.as_str())
+    }
+
+    /// The digest of the plan of graph `graph` that the arena was made for.
+    pub fn plan_digest(&self, graph: &str) -> Option<&str> {
+        self.core.members.iter().find(|(g, _)| g == graph).map(|(_, d)| d.as_str())
     }
 }
 
@@ -273,12 +467,16 @@ struct Bound {
     slots: Vec<Slot>,
 }
 
+/// Where an instantiation's arena comes from.
+enum Place<'a> {
+    /// An arena of its own, allocated on this stream.
+    Own(&'a Arc<CudaStream>),
+    /// A shared arena.
+    Shared(&'a SharedArena),
+}
+
 impl LaunchPlan {
-    /// Instantiate the plan for the bucket combination `values` (one value per dimension, `&[]` for a plan without dimensions): load every
-    /// kernel and GEMM of its steps in the context of `stream`, check every step's preconditions that do not depend on an address, and
-    /// allocate the arena on `stream` (which it is freed on; a launch on that stream needs no extra ordering). The device must be of the
-    /// plan's architecture.
-    pub fn instantiate(&self, stream: &Arc<CudaStream>, values: &[(&str, u64)]) -> Result<PlanRun> {
+    fn bucket_indices(&self, values: &[(&str, u64)]) -> Result<Vec<usize>> {
         let Some(index) = self.bucket_index(values) else {
             let all: Vec<String> = self.buckets().iter().map(|b| describe_values(&b.values)).collect();
             return Err(Error::precondition(
@@ -291,13 +489,34 @@ impl LaunchPlan {
                 ),
             ));
         };
-        PlanRun::new(self, stream, &[index])
+        Ok(vec![index])
+    }
+
+    /// Instantiate the plan for the bucket combination `values` (one value per dimension, `&[]` for a plan without dimensions): load every
+    /// kernel and GEMM of its steps in the context of `stream`, check every step's preconditions that do not depend on an address, and
+    /// allocate the arena on `stream` (which it is freed on; a launch on that stream needs no extra ordering). The device must be of the
+    /// plan's architecture.
+    pub fn instantiate(&self, stream: &Arc<CudaStream>, values: &[(&str, u64)]) -> Result<PlanRun> {
+        PlanRun::new(self, Place::Own(stream), &self.bucket_indices(values)?)
     }
 
     /// Instantiate the plan for every bucket combination: one arena serves all of them (a buffer is at the same offset in every bucket).
     pub fn instantiate_all(&self, stream: &Arc<CudaStream>) -> Result<PlanRun> {
         let all: Vec<usize> = (0..self.buckets().len()).collect();
-        PlanRun::new(self, stream, &all)
+        PlanRun::new(self, Place::Own(stream), &all)
+    }
+
+    /// [`LaunchPlan::instantiate`] on a [`SharedArena`] instead of an arena of its own: the kernels and GEMMs are loaded in the arena's context,
+    /// and every launch and replay of the returned [`PlanRun`] is ordered with those of every other plan on the arena. The plan must be one the
+    /// arena was made for (the same digest): another is refused, whatever its size.
+    pub fn instantiate_in(&self, arena: &SharedArena, values: &[(&str, u64)]) -> Result<PlanRun> {
+        PlanRun::new(self, Place::Shared(arena), &self.bucket_indices(values)?)
+    }
+
+    /// [`LaunchPlan::instantiate_all`] on a [`SharedArena`] (see [`LaunchPlan::instantiate_in`]).
+    pub fn instantiate_all_in(&self, arena: &SharedArena) -> Result<PlanRun> {
+        let all: Vec<usize> = (0..self.buckets().len()).collect();
+        PlanRun::new(self, Place::Shared(arena), &all)
     }
 }
 
@@ -373,10 +592,46 @@ fn tracked(
 }
 
 impl PlanRun {
-    fn new(plan: &LaunchPlan, stream: &Arc<CudaStream>, buckets: &[usize]) -> Result<Self> {
-        // the arena's stream orders every launch of the run against the others: it cannot be the per-thread default stream (`ffi::refuse_per_thread`)
-        ffi::refuse_per_thread(stream, std::iter::empty())?;
-        let ctx = Arc::clone(stream.context());
+    fn new(plan: &LaunchPlan, place: Place<'_>, buckets: &[usize]) -> Result<Self> {
+        let ctx = match place {
+            Place::Own(stream) => {
+                // the arena's stream orders every launch of the run against the others: it cannot be the per-thread default stream
+                // (`ffi::refuse_per_thread`)
+                ffi::refuse_per_thread(stream, std::iter::empty())?;
+                let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
+                if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+                    return Err(Error::Launch(
+                        "a plan is not instantiated while its stream captures a CUDA graph: its arena would be allocated inside the capture"
+                            .to_owned(),
+                    ));
+                }
+                Arc::clone(stream.context())
+            }
+            Place::Shared(arena) => {
+                // only a plan the arena was sized for: the same graph and the same digest (so the same layout and arena_bytes)
+                if arena.plan_digest(plan.graph()) != Some(plan.digest()) {
+                    let graphs: Vec<&str> = arena.graphs().collect();
+                    return Err(Error::Launch(format!(
+                        "the plan of graph '{}' (digest {}) is not a plan this shared arena was made for: its plans are {graphs:?}{}",
+                        plan.graph(),
+                        plan.digest(),
+                        match arena.plan_digest(plan.graph()) {
+                            Some(d) => format!(", and its plan of graph '{}' has digest {d}", plan.graph()),
+                            None => String::new(),
+                        }
+                    )));
+                }
+                if plan.arena_bytes() > arena.bytes() {
+                    return Err(Error::Launch(format!(
+                        "the plan of graph '{}' needs an arena of {} bytes, but the shared arena has {}",
+                        plan.graph(),
+                        plan.arena_bytes(),
+                        arena.bytes()
+                    )));
+                }
+                Arc::clone(arena.context())
+            }
+        };
         let arch = Arch::of_context(&ctx)?;
         if arch.to_string() != plan.arch() {
             return Err(Error::Unsupported(format!(
@@ -385,12 +640,6 @@ impl PlanRun {
                 plan.arch(),
                 ctx.ordinal()
             )));
-        }
-        let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
-        if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
-            return Err(Error::Launch(
-                "a plan is not instantiated while its stream captures a CUDA graph: its arena would be allocated inside the capture".to_owned(),
-            ));
         }
         if plan.dims().len() > MAX_DIMS {
             return Err(Error::Unsupported(format!(
@@ -487,41 +736,19 @@ impl PlanRun {
             runs.push(BucketRun { index, steps });
         }
 
-        // -- the arena, once
-        let arena_bytes = usize::try_from(plan.arena_bytes())
-            .map_err(|_| Error::Unsupported("the arena does not fit the address space".to_owned()))?;
-        let slice = if arena_bytes > 0 {
-            Some(stream.alloc_zeros::<u8>(arena_bytes).map_err(Error::driver("cuMemAllocAsync"))?)
-        } else {
-            None
+        // -- the arena, once (or the shared one)
+        let arena = match place {
+            Place::Own(stream) => ArenaCore::allocate(
+                stream,
+                plan.arena_bytes(),
+                buffers.iter().any(|b| b.role == BufferRole::Devscalar),
+                Vec::new(),
+            )?,
+            Place::Shared(shared) => Arc::clone(&shared.core),
         };
-        let arena_addr = slice.as_ref().map_or(0, |s| sealed::Memory::region(s).addr);
-        if !arena_addr.is_multiple_of(crate::launch_plan::ARENA_ALIGNMENT) {
-            return Err(Error::Unsupported(format!(
-                "the arena was allocated at {arena_addr:#x}, which is not aligned to {} bytes",
-                crate::launch_plan::ARENA_ALIGNMENT
-            )));
-        }
-        let staging = if buffers.iter().any(|b| b.role == BufferRole::Devscalar) {
-            Some(ffi::plan::Staging::new(&ctx)?)
-        } else {
-            None
-        };
-        let run = Self {
-            inner: Arc::new(Instance {
-                plan: plan.clone(),
-                context: ctx.clone(),
-                home: Arc::clone(stream),
-                device: ctx.ordinal() as i32,
-                arena: Mutex::new(Arena { slice, slots_of: 0, staging }),
-                arena_addr,
-                buckets: runs,
-                by_name,
-                syms,
-                patterns,
-                captures: AtomicU64::new(0),
-            }),
-        };
+        let arena_addr = arena.addr;
+        let run =
+            Self { inner: Arc::new(Instance { plan: plan.clone(), arena, buckets: runs, by_name, syms, patterns }) };
         // -- every step's preconditions that no address can change, with made-up addresses for the externals (Python's virtual ones, distinct
         // per buffer): a refusal comes now, not at the first launch
         for (k, bucket) in run.inner.buckets.iter().enumerate() {
@@ -546,17 +773,22 @@ impl PlanRun {
 
     /// The context the plan is instantiated in: a launch is on a stream of it.
     pub fn context(&self) -> &Arc<CudaContext> {
-        &self.inner.context
+        &self.inner.arena.context
     }
 
     /// The stream the arena was allocated on (and is freed on).
     pub fn stream(&self) -> &Arc<CudaStream> {
-        &self.inner.home
+        &self.inner.arena.home
     }
 
-    /// The bytes of the arena.
+    /// The bytes of the arena the run uses: the plan's `arena_bytes`, or the bytes of the [`SharedArena`] it was instantiated on.
     pub fn arena_bytes(&self) -> u64 {
-        self.inner.plan.arena_bytes()
+        self.inner.arena.bytes
+    }
+
+    /// The [`SharedArena`] the run was instantiated on ([`LaunchPlan::instantiate_in`]), or `None` when it has an arena of its own.
+    pub fn shared_arena(&self) -> Option<SharedArena> {
+        self.inner.arena.shared().then(|| SharedArena { core: Arc::clone(&self.inner.arena) })
     }
 
     /// The bucket combinations the run was instantiated for.
@@ -565,7 +797,7 @@ impl PlanRun {
     }
 
     fn check_stream(&self, stream: &CudaStream) -> Result<()> {
-        if **stream.context() != *self.inner.context {
+        if **stream.context() != *self.inner.arena.context {
             return Err(Error::Launch(format!(
                 "the stream is in another CUDA context than the one the plan of graph '{}' is instantiated in: use a stream of that context",
                 self.inner.plan.graph()
@@ -743,7 +975,7 @@ impl PlanRun {
         let shapes = &plan.buckets()[index].shapes;
 
         // -- every external has its shape at the bucket; none overlaps the arena, and none that is written overlaps another
-        let arena = (u128::from(inner.arena_addr), u128::from(inner.arena_addr) + u128::from(plan.arena_bytes()));
+        let arena = inner.arena.range();
         let mut ranges: Vec<(usize, u128, u128)> = Vec::new();
         for (i, b) in buffers.iter().enumerate().filter(|(_, b)| b.role.is_external()) {
             let t = tensor(i);
@@ -762,14 +994,15 @@ impl PlanRun {
             }
             let bytes = shapes[i].iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128)) * b.dtype.size() as u128;
             let (lo, hi) = (u128::from(t.ptr), u128::from(t.ptr) + bytes);
-            if plan.arena_bytes() > 0 && lo < arena.1 && arena.0 < hi {
+            if inner.arena.bytes > 0 && lo < arena.1 && arena.0 < hi {
                 return Err(Error::precondition(
                     PreconditionKind::Alias,
                     Some(&b.name),
                     format!(
                         "'{}' overlaps the arena of the plan (the memory the plan keeps its intermediates, device scalars and workspace in): a \
-                         tensor of the caller must not be in it",
-                        b.name
+                         tensor of the caller must not be in it{}",
+                        b.name,
+                        inner.arena.shared_note()
                     ),
                 ));
             }
@@ -791,7 +1024,7 @@ impl PlanRun {
             .iter()
             .enumerate()
             .map(|(i, b)| match b.offset {
-                Some(offset) => inner.arena_addr + offset,
+                Some(offset) => inner.arena.addr + offset,
                 None => tensor(i).ptr,
             })
             .collect();
@@ -803,13 +1036,13 @@ impl PlanRun {
     fn check_external(&self, b: &PlanBuffer, t: &TensorArg<'_>) -> Result<()> {
         let inner = &*self.inner;
         let name = b.name.as_str();
-        if t.device != inner.device || t.context.is_some_and(|c| c != inner.context.cu_ctx() as usize) {
+        if t.device != inner.arena.device || t.context.is_some_and(|c| c != inner.arena.context.cu_ctx() as usize) {
             return Err(Error::precondition(
                 PreconditionKind::Device,
                 Some(name),
                 format!(
                     "the external '{name}' is memory of device {} or of another CUDA context than the plan's (device {})",
-                    t.device, inner.device
+                    t.device, inner.arena.device
                 ),
             ));
         }
@@ -981,7 +1214,7 @@ impl PlanRun {
             let what = format!("step #{si} ({stem}) at {}", describe_values(&combo.values));
             let mut args: Vec<TensorArg<'_>> = Vec::with_capacity(step.args.len() + 1);
             for a in &step.args {
-                let region = ffi::plan::check_region(bases[a.buffer], region_bytes(a.buffer), inner.device);
+                let region = ffi::plan::check_region(bases[a.buffer], region_bytes(a.buffer), inner.arena.device);
                 let arg = match &a.view {
                     Some((strides, offset)) => {
                         TensorArg::new_strided(region, &a.shape, strides, *offset, a.dtype, a.access)
@@ -997,7 +1230,7 @@ impl PlanRun {
                 }
                 Op::Gemm(gemm) => {
                     let (w, shape) = step.workspace.as_ref().expect("a library step has a workspace");
-                    let region = ffi::plan::check_region(bases[*w], region_bytes(*w), inner.device);
+                    let region = ffi::plan::check_region(bases[*w], region_bytes(*w), inner.arena.device);
                     args.push(TensorArg::new(region, shape, DType::U8, Access::InOut).map_err(|e| in_step(e, &what))?);
                     Ready::Gemm(gemm, gemm.check_call(&args).map_err(|e| in_step(e, &what))?)
                 }
@@ -1092,7 +1325,7 @@ impl PlanRun {
             let name = buf.name.as_str();
             let refuse =
                 |kind, why: String| Err(Error::precondition(kind, Some(name), format!("the buffer '{name}': {why}")));
-            if t.device != inner.device || t.context.is_some_and(|c| c != inner.context.cu_ctx() as usize) {
+            if t.device != inner.arena.device || t.context.is_some_and(|c| c != inner.arena.context.cu_ctx() as usize) {
                 return refuse(
                     PreconditionKind::Device,
                     "its tensor is not memory of the plan's device and context".to_owned(),
@@ -1123,9 +1356,12 @@ impl PlanRun {
             let bytes =
                 shapes[i].iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128)) * buf.dtype.size() as u128;
             let (lo, hi) = (u128::from(t.ptr), u128::from(t.ptr) + bytes);
-            let arena = (u128::from(inner.arena_addr), u128::from(inner.arena_addr) + u128::from(plan.arena_bytes()));
-            if plan.arena_bytes() > 0 && lo < arena.1 && arena.0 < hi {
-                return refuse(PreconditionKind::Alias, "its tensor overlaps the arena of the plan".to_owned());
+            let arena = inner.arena.range();
+            if inner.arena.bytes > 0 && lo < arena.1 && arena.0 < hi {
+                return refuse(
+                    PreconditionKind::Alias,
+                    format!("its tensor overlaps the arena of the plan{}", inner.arena.shared_note()),
+                );
             }
             if let Some(&(o, _, _)) = ranges
                 .iter()
@@ -1140,19 +1376,27 @@ impl PlanRun {
             bases[i] = t.ptr;
         }
         if let Some((w, _)) = st.workspace {
-            bases[w] = inner.arena_addr + all[w].offset.expect("the workspace is in the arena");
+            bases[w] = inner.arena.addr + all[w].offset.expect("the workspace is in the arena");
         }
         let ready = [self.ready_step(b, step, &bases)?];
-        let shape = [plan.arena_bytes() as usize];
+        let shape = [inner.arena.bytes as usize];
         let mut arena = inner.lock_arena();
-        let Arena { slice, staging, .. } = &mut *arena;
-        let mut tensors: Vec<TensorArg<'_>> = buffers.iter_mut().map(|(_, t)| t.reborrow()).collect();
-        if let Some(slice) = slice.as_mut() {
-            tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
-        }
-        ffi::ordered(stream, &mut tensors, |tensors, want_end| {
-            tracked(stream, tensors, &[], staging.as_mut(), want_end, |stream| ffi::plan::enqueue_steps(stream, &ready))
-        })
+        let launched = {
+            let Arena { slice, staging, .. } = &mut *arena;
+            let mut tensors: Vec<TensorArg<'_>> = buffers.iter_mut().map(|(_, t)| t.reborrow()).collect();
+            if let Some(slice) = slice.as_mut() {
+                tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
+            }
+            ffi::ordered(stream, &mut tensors, |tensors, want_end| {
+                tracked(stream, tensors, &[], staging.as_mut(), want_end, |stream| {
+                    ffi::plan::enqueue_steps(stream, &ready)
+                })
+            })
+        };
+        // a step's workspace may lie over the device-scalar slots of another plan of a shared arena: the next replay of a graph writes its
+        // slots again
+        arena.slots_of = 0;
+        launched
     }
 
     /// Check a call as [`PlanRun::launch`] does, and launch nothing.
@@ -1209,7 +1453,7 @@ impl PlanRun {
                 ready.insert(after + 1, copy); // from the last: an index is not moved by an insertion after it
             }
         }
-        let shape = [self.inner.plan.arena_bytes() as usize];
+        let shape = [self.inner.arena.bytes as usize];
         let mut arena = self.inner.lock_arena();
         let launched = {
             let Arena { slice, staging, .. } = &mut *arena;
@@ -1244,9 +1488,9 @@ impl PlanRun {
         let steps = bucket.steps.len();
         let elements = |shape: &[usize]| shape.iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128));
         let mut taken: Vec<(u128, u128, String)> = Vec::new();
-        if plan.arena_bytes() > 0 {
-            let start = u128::from(inner.arena_addr);
-            taken.push((start, start + u128::from(plan.arena_bytes()), "the arena of the plan".to_owned()));
+        if inner.arena.bytes > 0 {
+            let (start, end) = inner.arena.range();
+            taken.push((start, end, format!("the arena of the plan{}", inner.arena.shared_note())));
         }
         for (name, t) in externals {
             let bytes = elements(t.shape) * t.dtype.size() as u128;
@@ -1284,7 +1528,7 @@ impl PlanRun {
             let want = combo.shapes[index].as_slice();
             let refuse =
                 |kind, why: String| Err(Error::precondition(kind, Some(name), format!("the tap '{name}': {why}")));
-            if t.device != inner.device || t.context.is_some_and(|c| c != inner.context.cu_ctx() as usize) {
+            if t.device != inner.arena.device || t.context.is_some_and(|c| c != inner.arena.context.cu_ctx() as usize) {
                 return refuse(
                     PreconditionKind::Device,
                     "its tensor is not memory of the plan's device and context".to_owned(),
@@ -1381,7 +1625,7 @@ impl PlanRun {
         enqueued?;
         let graph = ended?.ok_or_else(|| Error::Launch("the capture made no graph".to_owned()))?;
         drop(ready);
-        let id = self.inner.captures.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = self.inner.arena.captures.fetch_add(1, Ordering::Relaxed) + 1;
         Ok(CapturedPlan {
             graph,
             captured_on: Arc::clone(stream),
@@ -1530,7 +1774,7 @@ pub struct CapturedPlan<'ext> {
     /// The tensors of the debug taps (buffer, the step it follows, the tensor), copied into at every replay.
     taps: Vec<(String, Option<usize>, TensorArg<'ext>)>,
     slots: Vec<Slot>,
-    /// Distinct among the captures of one instantiation: whose device scalar values the arena's slots hold.
+    /// Distinct among the captures on one arena (of every plan of a shared one): whose device scalar values the arena's slots hold.
     id: u64,
     /// Whether the slots hold this graph's values (set by a replay, cleared by `set_devscalar`).
     current: bool,
@@ -1561,13 +1805,13 @@ impl<'ext> CapturedPlan<'ext> {
     /// Replay the graph on `stream` (a stream of the plan's context; the one it was captured on, or another).
     ///
     /// The device scalars are written into their slots first, on `stream`, when the slots do not hold this graph's values (it was never
-    /// replayed, a value was set, or a launch or another graph of the instantiation wrote them since). The externals and the arena are ordered
-    /// exactly as for [`PlanRun::launch`]: a replay is refused while a stream captures, waits for the earlier uses of what it writes, and the
-    /// streams the externals and the arena are freed on wait for its end.
+    /// replayed, a value was set, or a launch or another graph on the arena, of any of its plans, wrote them since). The externals and the
+    /// arena are ordered exactly as for [`PlanRun::launch`]: a replay is refused while a stream captures, waits for the earlier uses of what it
+    /// writes, and the streams the externals and the arena are freed on wait for its end.
     pub fn replay(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
         self.run.check_stream(stream)?;
         let inner = &*self.run.inner;
-        let shape = [inner.plan.arena_bytes() as usize];
+        let shape = [inner.arena.bytes as usize];
         let mut arena = inner.lock_arena();
         let write = !(self.current && arena.slots_of == self.id);
         let replayed = {

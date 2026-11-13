@@ -97,3 +97,16 @@ def test_the_two_plans_share_a_manifest_and_differ_in_where_buffers_are(committe
     assert plain["manifest_digest"] == reused["manifest_digest"] and plain["plan_digest"] != reused["plan_digest"]
     assert reused["arena_bytes"] < plain["arena_bytes"] and plain["arena_bytes"] == 9634048 and reused["arena_bytes"] == 9240832
     assert plain["offsets"]["n"] == reused["offsets"]["n"] == 0 and plain["offsets"] != reused["offsets"]
+
+
+def test_the_arena_the_plans_of_the_golden_set_share_is_the_largest_of_theirs(committed):
+    """``shared_arena_bytes`` of the set (what Rust's ``PlanSet::shared_arena_bytes`` reproduces): the plans' own ``arena_bytes``, read from the pinned
+    files, and their largest; ``share_arena`` of the three, loaded through the set's pin, has it."""
+    import gpu_kernels_p6 as p6
+
+    from tilefish import runtime
+
+    e = committed[fx.SET]
+    s = runtime.share_arena([p6.TILES[t] for t in (1, 2, 3)], mode="replay", plan=fx.DEFAULT / fx.SET, pin=e["set_digest"])
+    assert s.sizes == e["arena_bytes"] == {"tiles1": 256, "tiles2": 1024, "tiles3": 2304}
+    assert s.arena_bytes == e["shared_arena_bytes"] == 2304

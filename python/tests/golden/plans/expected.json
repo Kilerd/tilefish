@@ -118,6 +118,11 @@
   },
   "set": {
     "arch": "sm_103",
+    "arena_bytes": {
+      "tiles1": 256,
+      "tiles2": 1024,
+      "tiles3": 2304
+    },
     "manifest_digest": "b0d66517f57337eff0366ab845d8f5ea84f710091df30f1b195418537547e42f",
     "plans": {
       "tiles1": "f70e3f606d469d54959f48e935754e0644271412830801fbe90e9b21b481abd0",
@@ -125,6 +130,7 @@
       "tiles3": "ac406b816bda8f7e74322017431f0e4418384d14cf4c9a1505135c31a1d47e36"
     },
     "set_digest": "8219868f518c4e5295e83597ce233d56861d27ffb13873e35bdaff1c8e229492",
+    "shared_arena_bytes": 2304,
     "steps": {
       "tiles1": 2,
       "tiles2": 3,

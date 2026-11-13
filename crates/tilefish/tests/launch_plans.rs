@@ -173,6 +173,36 @@ fn the_golden_plan_set_shares_one_manifest_and_one_pin_covers_every_plan() {
     }
 }
 
+/// The arena the plans of the golden set share (`docs/plan-schema-1.md`, section 15.1): the largest `arena_bytes` of the plans, read from their
+/// pinned files, as Python's `share_arena` has it (`expected.json`), for every subset; the documents are unchanged, so the set's pin still covers
+/// them; no plan, a plan given twice and a plan the set does not list are refused.
+#[test]
+fn the_plans_of_the_golden_set_share_an_arena_of_the_largest_of_theirs() {
+    let e = &expected()["set"];
+    let set = PlanSet::load(golden().join("set"), Pin::Digest(e["set_digest"].as_str().unwrap())).unwrap();
+    let all = ["tiles1", "tiles2", "tiles3"];
+    for name in all {
+        assert_eq!(set.plan(name).unwrap().arena_bytes(), e["arena_bytes"][name].as_u64().unwrap());
+    }
+    assert_eq!(set.shared_arena_bytes(&all).unwrap(), e["shared_arena_bytes"].as_u64().unwrap());
+    assert_eq!(set.shared_arena_bytes(&all).unwrap(), 2304);
+    assert_eq!(set.shared_arena_bytes(&["tiles2", "tiles1"]).unwrap(), 1024);
+    assert_eq!(set.shared_arena_bytes(&["tiles1"]).unwrap(), 256);
+    let plans: Vec<LaunchPlan> = all.iter().map(|n| set.plan(n).unwrap()).collect();
+    let refs: Vec<&LaunchPlan> = plans.iter().collect();
+    assert_eq!(tilefish::SharedArena::bytes_for(&refs).unwrap(), 2304);
+    let e1 = set.shared_arena_bytes(&[]).unwrap_err();
+    assert!(e1.to_string().contains("name the plans of the set"), "{e1}");
+    let e2 = set.shared_arena_bytes(&["tiles1", "tiles1"]).unwrap_err();
+    assert!(e2.to_string().contains("given twice"), "{e2}");
+    let e3 = set.shared_arena_bytes(&["tiles1", "tiles4"]).unwrap_err();
+    assert!(e3.to_string().contains("lists no plan of graph 'tiles4'"), "{e3}");
+    let e4 = tilefish::SharedArena::bytes_for(&[]).unwrap_err();
+    assert!(e4.to_string().contains("one plan or more"), "{e4}");
+    let e5 = tilefish::SharedArena::bytes_for(&[refs[0], refs[1], refs[0]]).unwrap_err();
+    assert!(e5.to_string().contains("'tiles1' is given twice"), "{e5}");
+}
+
 /// The golden plan `given` (`plan_model.two_scales`): one prebuilt binary (one manifest entry) launched by two steps, each with the values its call
 /// gives to the fixed arguments per call `k` (`i32`) and `c` (`i64`), the second `c` the bucket's `Rg`; the entry has them as `given` parameters.
 #[test]

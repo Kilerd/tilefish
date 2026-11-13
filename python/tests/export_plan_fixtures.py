@@ -64,6 +64,9 @@ def export_all(output: pathlib.Path) -> dict:
         "manifest_digest": exported_set.manifest_digest,
         "plans": {name: p.digest for name, p in exported_set.plans.items()},
         "steps": {name: len(p.steps()) for name, p in exported_set.plans.items()},
+        # the arena the three plans share (docs/plan-schema-1.md, section 15.1): the largest of their arenas, each plan at its own offsets
+        "arena_bytes": {name: p.arena_bytes for name, p in exported_set.plans.items()},
+        "shared_arena_bytes": max(p.arena_bytes for p in exported_set.plans.values()),
     }
     (output / "expected.json").write_text(json.dumps(expected, indent=2, sort_keys=True) + "\n")
     return expected

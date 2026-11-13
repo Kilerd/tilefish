@@ -43,7 +43,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
   exported and run through Python's plan replay; ``crates/tilefish/tests/gpu_plan_gate.rs`` launches and captures each case, and ``compare`` holds the
-  Rust plan's launch and its CUDA graph replay to Python's bytes.
+  Rust plan's launch and its CUDA graph replay to Python's bytes. The three stages of the block (``plan_model.STAGES``) are a plan set whose plans
+  ``gpu_plan_gate.rs`` also runs one after the other on one shared arena (``SharedArena``), launched and replayed, each stage's outputs the next one's
+  inputs on the device; ``compare`` holds those to Python's bytes too.
 
 ``WORK/cases.json`` is what ``crates/tilefish/tests/gpu_gate.rs`` reads::
 
@@ -596,6 +598,45 @@ def verify(case, declared, args, results, directory, digest):
 # -- launch plans ------------------------------------------------------------------------------------------------------------------------------
 
 
+def pm_stages():
+    import plan_model as pm
+
+    return pm.STAGES
+
+
+def stage_cases(directory, pin):
+    """The cases of the three stages of ``plan_model`` (``M`` in every bucket, two values of ``n``): ``[(stage, make_cases)]``, the inputs of a stage the
+    outputs of Python's replay of the stage before (each on its own arena). The same three stages on one shared arena (``share_arena``) must give the
+    same bytes, or the gate is not prepared."""
+    import plan_model as pm
+
+    weights = pm.weights(seed=5)
+    opts = dict(mode="replay", plan=directory, pin=pin)
+    shared = runtime.share_arena(pm.STAGES, **opts)
+    cases = {g.name: [] for g in pm.STAGES}
+    for m in pm.BUCKETS:
+        for n in (m, m // 3 + 1):
+            label = f"M{m}-n{n}"
+            x = pm.activations(m, seed=200 + m + n)
+            nt = torch.tensor([n], dtype=I32, device="cuda")
+            w = {k: weights[k] for k in pm.STAGE_WEIGHTS["stage_attn"]}
+            a = tilefish.run(pm.stage_attn, x, nt, *w.values(), **opts)
+            cases["stage_attn"].append((label, {"x": x, "n": nt, **w}))
+            w = {k: weights[k] for k in pm.STAGE_WEIGHTS["stage_mix"]}
+            r, h2 = tilefish.run(pm.stage_mix, a, x, *w.values(), **opts)
+            cases["stage_mix"].append((label, {"a": a, "x": x, **w}))
+            w = {k: weights[k] for k in pm.STAGE_WEIGHTS["stage_ffn"]}
+            y = tilefish.run(pm.stage_ffn, r, h2, *w.values(), **opts)
+            cases["stage_ffn"].append((label, {"r": r, "h2": h2, **w}))
+            sa = shared.run(pm.stage_attn, x, nt, *[weights[k] for k in pm.STAGE_WEIGHTS["stage_attn"]])
+            sr, sh2 = shared.run(pm.stage_mix, sa, x, *[weights[k] for k in pm.STAGE_WEIGHTS["stage_mix"]])
+            sy = shared.run(pm.stage_ffn, sr, sh2, *[weights[k] for k in pm.STAGE_WEIGHTS["stage_ffn"]])
+            for what, got, want in (("a", sa, a), ("r", sr, r), ("h2", sh2, h2), ("y", sy, y)):
+                if not same_bytes(got, want):
+                    raise RuntimeError(f"{label}: the stages on one shared arena give other bytes for '{what}' than on separate arenas")
+    return [(g, lambda name=g.name: cases[name]) for g in pm.STAGES]
+
+
 def plan_graphs():
     """``(name, graph, reuse, the arguments of each case)``: the plans the gate exports. A case is ``(label, {parameter: tensor})``, the
     parameters in the order of the graph's signature (a ``DevScalar`` as a CUDA tensor of one element)."""
@@ -758,6 +799,13 @@ def prepare_plans(work):
 
         extra = {"dir": f"plans/set/{g.name}.plan.json", "set": "plans/set", "set_digest": planset.digest}
         exports.append((f"set-{g.name}", g, False, tiles_cases, set_dir, planset[g.name], planset.digest, extra))
+    # an arena shared by the plans of a set: the block of plan_model cut into three stages, each stage's inputs the outputs Python's replay of
+    # the stage before gave; gpu_plan_gate.rs runs them one after the other on one SharedArena (and each on its own arena, as every plan)
+    stages_dir = root / "shared"
+    stages = runtime.export(pm_stages(), stages_dir)
+    for g, make_cases in stage_cases(stages_dir, stages.digest):
+        extra = {"dir": f"plans/shared/{g.name}.plan.json", "set": "plans/shared", "set_digest": stages.digest, "shared": True}
+        exports.append((f"shared-{g.name}", g, False, make_cases, stages_dir, stages[g.name], stages.digest, extra))
     for name, graph, reuse, make_cases, directory, exported, pin, extra in exports:
         doc = exported.doc
         params = [b for b in doc["buffers"] if b["role"] in ("input", "weight", "inout", "devscalar")]
@@ -817,15 +865,18 @@ def prepare_plans(work):
 
 
 def compare_plans(work):
-    """The outputs (and in-place tensors) the Rust plan wrote, for its launch (``rust_plans``) and its CUDA graph replay (``rust_plans_graph``), against
+    """The outputs (and in-place tensors) the Rust plan wrote, for its launch (``rust_plans``) and its CUDA graph replay (``rust_plans_graph``), and for
+    the plans of a shared arena their launches and replays one after the other on one ``SharedArena`` (``rust_shared``, ``rust_shared_graph``), against
     what Python's plan replay left. Returns ``(passed, cases, failures)``."""
     path = work / "plans.json"
     if not path.exists():
         return 0, 0, []
     doc = json.loads(path.read_text(encoding="utf-8"))
     failed, passed, count = [], 0, 0
-    for subdir in ("rust_plans", "rust_plans_graph"):
+    for subdir in ("rust_plans", "rust_plans_graph", "rust_shared", "rust_shared_graph"):
         for plan in doc["plans"]:
+            if subdir.startswith("rust_shared") and not plan.get("shared"):
+                continue  # the plans of the shared arena run again, one after the other on one SharedArena (launched, and replayed)
             for case in plan["cases"]:
                 count += 1
                 bad = []
@@ -881,7 +932,10 @@ def compare(work):
     for case_id, bad in plan_failed:
         print(f"FAIL {case_id}: {'; '.join(bad)}")
     if plan_cases:
-        print(f"rust plan vs python plan replay: {plan_passed} of {plan_cases} cases byte-identical (the launch and the CUDA graph replay of each case)")
+        print(
+            f"rust plan vs python plan replay: {plan_passed} of {plan_cases} cases byte-identical (the launch and the CUDA graph replay of each case; the "
+            "cases of the plans of a shared arena again, one plan after the other on one SharedArena)"
+        )
     return 0 if not failed and not plan_failed else 1
 
 

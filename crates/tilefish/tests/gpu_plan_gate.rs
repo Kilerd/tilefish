@@ -675,7 +675,7 @@ fn weights_bound_once_give_pythons_bytes() {
 #[test]
 fn a_plan_set_is_loaded_with_one_pin_and_its_plans_give_pythons_bytes() {
     let gpu = Gpu::new();
-    let members: Vec<Value> = plans().into_iter().filter(|p| p.get("set").is_some()).collect();
+    let members: Vec<Value> = plans().into_iter().filter(|p| p.get("set").is_some_and(|s| s == "plans/set")).collect();
     assert_eq!(members.len(), 3, "the gate's plan set has three plans");
     let set_dir = gate_dir().join(members[0]["set"].as_str().unwrap());
     let set = PlanSet::load(&set_dir, Pin::Digest(members[0]["set_digest"].as_str().unwrap()))
@@ -712,6 +712,339 @@ fn a_plan_set_is_loaded_with_one_pin_and_its_plans_give_pythons_bytes() {
         "rust plan gate: a plan set of {} plans over one manifest of {} entries: {cases} cases launched, Python's bytes",
         members.len(),
         stems.len()
+    );
+}
+
+// -- an arena shared by the plans of a set: the three stages of the block, one after the other ---------------------------------------------------
+
+const STAGES: [&str; 3] = ["stage_attn", "stage_mix", "stage_ffn"];
+
+/// The plans of the shared arena's set (`plans/shared`: the block of `plan_model` cut into `stage_attn`, `stage_mix` and `stage_ffn`), in that order.
+fn shared_members() -> Vec<Value> {
+    let members: Vec<Value> = plans().into_iter().filter(|p| p.get("shared").is_some()).collect();
+    let graphs: Vec<&str> = members.iter().map(|p| p["graph"].as_str().unwrap()).collect();
+    assert_eq!(graphs, STAGES, "the gate's shared arena has the three stages");
+    members
+}
+
+/// One request through the three stages: every tensor on the device (the inputs and weights from Python's files, the stages' outputs zeros), the
+/// case of each stage, and the bytes Python's replay left in each output.
+struct Pipeline {
+    label: String,
+    n: i64,
+    bufs: Vec<Ext>,
+    /// The case of each stage (its id is what `compare` reads the files of).
+    cases: [Value; 3],
+}
+
+impl Pipeline {
+    fn all(stream: &Arc<CudaStream>, members: &[Value]) -> Vec<Self> {
+        let labels: Vec<String> = members[0]["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().trim_start_matches("shared-stage_attn-").to_owned())
+            .collect();
+        labels.into_iter().map(|label| Self::new(stream, members, label)).collect()
+    }
+
+    fn new(stream: &Arc<CudaStream>, members: &[Value], label: String) -> Self {
+        let cases: [Value; 3] = std::array::from_fn(|k| {
+            let id = format!("shared-{}-{label}", STAGES[k]);
+            members[k]["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap_or_else(|| panic!("{id}"))
+                .clone()
+        });
+        let mut bufs: Vec<Ext> = Vec::new();
+        for case in &cases {
+            for e in upload(stream, case) {
+                match bufs.iter().find(|b| b.name == e.name) {
+                    // an input of two stages (x): one tensor
+                    Some(earlier) if earlier.expect.is_none() => assert_eq!(earlier.input, e.input, "'{}'", e.name),
+                    // a stage's input that the stage before returned: one tensor, the earlier stage's output (zeros until it runs)
+                    Some(_) => {}
+                    None => bufs.push(e),
+                }
+            }
+        }
+        let n = cases[0]["devscalars"]["n"].as_i64().unwrap();
+        Self { label, n, bufs, cases }
+    }
+
+    /// The externals of stage `k`, by name: a `TensorMut` for what it writes, a `TensorRef` for what it reads.
+    fn args(&mut self, k: usize) -> Vec<(&str, TensorArg<'_>)> {
+        let names: Vec<String> = self.cases[k]["externals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect();
+        let outputs: Vec<String> = self.cases[k]["externals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["role"] == "output")
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect();
+        self.bufs
+            .iter_mut()
+            .filter(|b| names.contains(&b.name))
+            .map(|b| {
+                let write = outputs.contains(&b.name);
+                (b.name.as_str(), typed(&mut b.slice, &b.shape, b.dtype, write))
+            })
+            .collect()
+    }
+
+    /// The externals of stage `k` as regions the host vouches for, so that one stage's graph can write a tensor the next stage's graph reads.
+    fn raw_args(&self, k: usize, stream: &Arc<CudaStream>) -> Vec<(&str, TensorArg<'_>)> {
+        let externals = self.cases[k]["externals"].as_array().unwrap();
+        externals
+            .iter()
+            .map(|t| {
+                let b = self.bufs.iter().find(|b| b.name == t["name"].as_str().unwrap()).unwrap();
+                let access = if t["role"] == "output" { Access::InOut } else { Access::In };
+                let addr = b.slice.device_ptr(stream).0;
+                // SAFETY: the slice is owned by this pipeline, which outlives every graph captured with these regions (they are dropped first in
+                // the tests), and nothing frees or writes it but the graphs' replays and the test on the same stream, after a synchronization.
+                let region = unsafe { DevicePtr::from_raw(addr, b.slice.len() as u64, 0) };
+                (b.name.as_str(), TensorArg::new(region, &b.shape, b.dtype, access).unwrap())
+            })
+            .collect()
+    }
+
+    /// The bytes of the outputs of stage `k` (on `stream`, after it is synchronized), each against Python's; written to `subdir` for `compare`.
+    fn check(&self, k: usize, stream: &Arc<CudaStream>, subdir: Option<&str>, what: &str) {
+        let id = self.cases[k]["id"].as_str().unwrap();
+        for t in self.cases[k]["externals"].as_array().unwrap().iter().filter(|t| t["role"] == "output") {
+            let name = t["name"].as_str().unwrap();
+            let b = self.bufs.iter().find(|b| b.name == name).unwrap();
+            let got = stream.clone_dtoh(&b.slice).unwrap();
+            if let Some(subdir) = subdir {
+                write_out(subdir, id, name, &got);
+            }
+            let expect = b.expect.as_ref().unwrap();
+            assert!(
+                got == *expect,
+                "{id}: {what}: '{name}' differs from Python's in {} bytes",
+                differing(&got, expect)
+            );
+        }
+    }
+
+    fn clear_outputs(&mut self, stream: &Arc<CudaStream>) {
+        for b in self.bufs.iter_mut().filter(|b| b.role == "output") {
+            stream.memset_zeros(&mut b.slice).unwrap();
+        }
+    }
+}
+
+/// The stages of the block (`plans/shared`, a plan set) instantiated on **one shared arena** (`PlanSet::instantiate`): the arena has the bytes of
+/// the largest stage's arena, not their sum; every case (each bucket, two values of the device scalar) launched one stage after the other on one
+/// stream, each stage's outputs the next one's inputs on the device, gives Python's bytes (those of each stage on its own arena); and the three
+/// stages captured on the arena (each its own `CapturedPlan`) and replayed one after the other, twice, give them too.
+#[test]
+fn the_plans_of_a_set_on_one_shared_arena_launched_and_replayed_one_after_the_other_give_pythons_bytes() {
+    let gpu = Gpu::new();
+    let members = shared_members();
+    let set_dir = gate_dir().join(members[0]["set"].as_str().unwrap());
+    let set = PlanSet::load(&set_dir, Pin::Digest(members[0]["set_digest"].as_str().unwrap())).unwrap();
+    let runs = set.instantiate(&gpu.stream, &STAGES).expect("the stages instantiate on one arena");
+    let sizes: Vec<u64> = members.iter().map(|p| p["arena_bytes"].as_u64().unwrap()).collect();
+    let largest = *sizes.iter().max().unwrap();
+    assert_eq!(runs.arena().bytes(), largest);
+    assert_eq!(set.shared_arena_bytes(&STAGES).unwrap(), largest);
+    assert!(largest < sizes.iter().sum::<u64>());
+    assert_eq!(runs.names().collect::<Vec<_>>(), STAGES);
+    for stage in STAGES {
+        let run = runs.run(stage).unwrap();
+        assert_eq!(run.arena_bytes(), largest);
+        assert_eq!(run.shared_arena().unwrap().address(), runs.arena().address());
+    }
+    let mut pipelines = Pipeline::all(&gpu.stream, &members);
+    gpu.stream.synchronize().unwrap();
+    for p in pipelines.iter_mut() {
+        let n = [("n", DevScalar::Int(p.n))];
+        for (k, stage) in STAGES.iter().enumerate() {
+            let devscalars: &[(&str, DevScalar)] = if k == 0 { &n } else { &[] };
+            runs.run(stage)
+                .unwrap()
+                .launch(&gpu.stream, &mut p.args(k), devscalars)
+                .unwrap_or_else(|e| panic!("{}: {e}", p.label));
+        }
+        gpu.stream.synchronize().unwrap();
+        for k in 0..3 {
+            p.check(k, &gpu.stream, Some("rust_shared"), "launched on the shared arena");
+        }
+    }
+    // the stages captured on the shared arena, one graph each, replayed one after the other
+    for p in pipelines.iter_mut() {
+        p.clear_outputs(&gpu.stream);
+        gpu.stream.synchronize().unwrap();
+        {
+            let n = [("n", DevScalar::Int(p.n))];
+            let mut graphs: Vec<_> = STAGES
+                .iter()
+                .enumerate()
+                .map(|(k, stage)| {
+                    let devscalars: &[(&str, DevScalar)] = if k == 0 { &n } else { &[] };
+                    runs.run(stage).unwrap().capture(&gpu.stream, p.raw_args(k, &gpu.stream), devscalars).unwrap()
+                })
+                .collect();
+            for _round in 0..2 {
+                for graph in graphs.iter_mut() {
+                    graph.replay(&gpu.stream).unwrap_or_else(|e| panic!("{}: {e}", p.label));
+                }
+            }
+            gpu.stream.synchronize().unwrap();
+        }
+        for k in 0..3 {
+            p.check(k, &gpu.stream, Some("rust_shared_graph"), "replayed on the shared arena");
+        }
+    }
+    println!(
+        "rust plan gate: a shared arena of {largest} bytes for 3 plans of a set ({} bytes as 3 arenas): {} cases launched and replayed one stage \
+         after the other, each stage's outputs the next one's inputs: Python's bytes",
+        sizes.iter().sum::<u64>(),
+        pipelines.len()
+    );
+}
+
+/// The order of the executions on a shared arena: two threads at once, one replaying the graphs of the three stages of one case on its stream (and
+/// copying the result after each round), the other launching the three stages of another case on its stream, 12 rounds each, with no
+/// synchronization between them. The stages share every byte of the arena (the ffn's intermediates lie over the attention's device-scalar slot), so
+/// a replay of a stage's graph that overlapped a launch of another stage would give wrong bytes; every one of the 24 results is Python's.
+#[test]
+fn launches_and_replays_of_different_plans_of_a_shared_arena_from_two_threads_run_one_after_the_other() {
+    fn shared<T: Send + Sync>(t: T) -> T {
+        t
+    }
+    let gpu = Gpu::new();
+    let members = shared_members();
+    let set_dir = gate_dir().join(members[0]["set"].as_str().unwrap());
+    let set = PlanSet::load(&set_dir, Pin::Digest(members[0]["set_digest"].as_str().unwrap())).unwrap();
+    let runs = shared(set.instantiate(&gpu.stream, &STAGES).unwrap());
+    let rounds = 12;
+    let label_of = |m: u64| {
+        let case = members[0]["cases"].as_array().unwrap().iter().find(|c| c["bucket"]["M"] == m).unwrap();
+        case["id"].as_str().unwrap().trim_start_matches("shared-stage_attn-").to_owned()
+    };
+    let (label_a, label_b) = (label_of(128), label_of(32));
+    let (got_a, got_b, want_a, want_b) = std::thread::scope(|scope| {
+        let replayer = scope.spawn(|| {
+            let s = gpu.ctx.new_stream().unwrap();
+            let p = Pipeline::new(&s, &members, label_a.clone());
+            let want = p.bufs.iter().find(|b| b.name == "y").unwrap().expect.clone().unwrap();
+            let n = [("n", DevScalar::Int(p.n))];
+            let mut copies: Vec<CudaSlice<u8>> = Vec::new();
+            {
+                let mut graphs: Vec<_> = STAGES
+                    .iter()
+                    .enumerate()
+                    .map(|(k, stage)| {
+                        let devscalars: &[(&str, DevScalar)] = if k == 0 { &n } else { &[] };
+                        runs.run(stage).unwrap().capture(&s, p.raw_args(k, &s), devscalars).unwrap()
+                    })
+                    .collect();
+                let y = &p.bufs.iter().find(|b| b.name == "y").unwrap().slice;
+                for _ in 0..rounds {
+                    for graph in graphs.iter_mut() {
+                        graph.replay(&s).unwrap();
+                    }
+                    let mut copy = s.alloc_zeros::<u8>(y.len()).unwrap();
+                    s.memcpy_dtod(y, &mut copy).unwrap();
+                    copies.push(copy);
+                }
+            }
+            s.synchronize().unwrap();
+            (copies.iter().map(|c| s.clone_dtoh(c).unwrap()).collect::<Vec<_>>(), want)
+        });
+        let launcher = scope.spawn(|| {
+            let s = gpu.ctx.new_stream().unwrap();
+            let mut p = Pipeline::new(&s, &members, label_b.clone());
+            let want = p.bufs.iter().find(|b| b.name == "y").unwrap().expect.clone().unwrap();
+            let y = p.bufs.iter().position(|b| b.name == "y").unwrap();
+            let bytes = p.bufs[y].slice.len();
+            let mut outs = Vec::new();
+            for _ in 0..rounds {
+                p.bufs[y].slice = s.alloc_zeros::<u8>(bytes).unwrap();
+                let n = [("n", DevScalar::Int(p.n))];
+                for (k, stage) in STAGES.iter().enumerate() {
+                    let devscalars: &[(&str, DevScalar)] = if k == 0 { &n } else { &[] };
+                    runs.run(stage).unwrap().launch(&s, &mut p.args(k), devscalars).unwrap();
+                }
+                outs.push(std::mem::replace(&mut p.bufs[y].slice, s.alloc_zeros::<u8>(1).unwrap()));
+            }
+            s.synchronize().unwrap();
+            (outs.iter().map(|o| s.clone_dtoh(o).unwrap()).collect::<Vec<_>>(), want)
+        });
+        let (got_a, want_a) = replayer.join().unwrap();
+        let (got_b, want_b) = launcher.join().unwrap();
+        (got_a, got_b, want_a, want_b)
+    });
+    let wrong_a = got_a.iter().filter(|g| **g != want_a).count();
+    let wrong_b = got_b.iter().filter(|g| **g != want_b).count();
+    println!(
+        "rust plan gate: a shared arena, {rounds} replays of the three stages' graphs (M=128) and {rounds} launches of the three stages (M=32) from \
+         two threads on two streams: {wrong_a} and {wrong_b} results are not Python's"
+    );
+    assert_eq!((wrong_a, wrong_b), (0, 0));
+}
+
+/// What a shared arena refuses, each before anything is launched: a tensor of the caller in the arena past the end of the running plan's own
+/// part (the bytes of another plan's intermediates, which its next launch writes over), a plan the arena was not made for, and plans the set does
+/// not list or names given twice.
+#[test]
+fn a_shared_arena_refuses_what_another_plan_would_overwrite() {
+    let gpu = Gpu::new();
+    let members = shared_members();
+    let set_dir = gate_dir().join(members[0]["set"].as_str().unwrap());
+    let set = PlanSet::load(&set_dir, Pin::Digest(members[0]["set_digest"].as_str().unwrap())).unwrap();
+    let runs = set.instantiate(&gpu.stream, &STAGES).unwrap();
+    let arena = runs.arena();
+    let mix = runs.run("stage_mix").unwrap();
+    let own = mix.plan().arena_bytes();
+    assert!(own + 256 + 64 * 256 * 2 <= arena.bytes(), "the mix's part of the arena is smaller than the arena");
+    let mut p = Pipeline::all(&gpu.stream, &members).into_iter().find(|p| p.cases[0]["bucket"]["M"] == 64).unwrap();
+    let n = [("n", DevScalar::Int(p.n))];
+    runs.run("stage_attn").unwrap().launch(&gpu.stream, &mut p.args(0), &n).unwrap();
+    gpu.stream.synchronize().unwrap();
+    let sentinel = vec![0x5au8; 64 * 256 * 2];
+    let h2 = p.bufs.iter().position(|b| b.name == "h2").unwrap();
+    gpu.stream.memcpy_htod(&sentinel, &mut p.bufs[h2].slice).unwrap();
+    gpu.stream.synchronize().unwrap();
+    {
+        let mut a: Vec<(&str, TensorArg<'_>)> = p.args(1).into_iter().filter(|(n, _)| *n != "r").collect();
+        // SAFETY: the region is inside the arena, which the runs keep alive; the call is refused before anything is launched
+        let inside = unsafe { DevicePtr::from_raw(arena.address() + own + 256, 64 * 256 * 2, 0) };
+        a.push(("r", TensorArg::new(inside, &[64, 256], DType::Bf16, Access::InOut).unwrap()));
+        let e = mix.launch(&gpu.stream, &mut a, &[]).unwrap_err();
+        assert_eq!(e.precondition_kind(), Some(PreconditionKind::Alias), "{e}");
+        assert!(e.to_string().contains("shared with other plans"), "{e}");
+    }
+    gpu.stream.synchronize().unwrap();
+    assert_eq!(gpu.stream.clone_dtoh(&p.bufs[h2].slice).unwrap(), sentinel, "a refused launch wrote 'h2'");
+    // a plan the arena was not made for: refused, whatever its size
+    let other = PlanSet::load(gate_dir().join("plans/set"), Pin::TrustDirectory).unwrap();
+    let tiles = other.plan("tiles1").unwrap();
+    assert!(tiles.arena_bytes() <= arena.bytes());
+    let e = tiles.instantiate_all_in(arena).unwrap_err();
+    assert!(e.to_string().contains("is not a plan this shared arena was made for"), "{e}");
+    let e = set.instantiate(&gpu.stream, &["stage_attn", "stage_attn"]).unwrap_err();
+    assert!(e.to_string().contains("given twice"), "{e}");
+    let e = set.instantiate(&gpu.stream, &["stage_attn", "block"]).unwrap_err();
+    assert!(e.to_string().contains("lists no plan of graph 'block'"), "{e}");
+    assert!(runs.run("block").is_err());
+    // and the same launch, with the caller's own r, runs
+    runs.run("stage_mix").unwrap().launch(&gpu.stream, &mut p.args(1), &[]).unwrap();
+    gpu.stream.synchronize().unwrap();
+    p.check(1, &gpu.stream, None, "after the refusals");
+    println!(
+        "rust plan gate: a shared arena refused a tensor in another plan's part of it, a plan it was not made for and bad names"
     );
 }
 
