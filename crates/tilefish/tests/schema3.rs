@@ -7,7 +7,9 @@
 
 mod common;
 
-use common::synthetic::{Kernel, alignment, fixed, json, max_extent, pointer, read, refusal, scalar, stride_scalar};
+use common::synthetic::{
+    Kernel, alignment, fixed, given, json, max_extent, pointer, read, refusal, scalar, stride_scalar,
+};
 use serde_json::Value;
 use tilefish::{
     Access, Arch, DType, DevicePtr, Error, Manifest, ParamKind, Plan, PreconditionKind, StrideEntry, TensorArg,
@@ -809,5 +811,65 @@ fn a_fixed_argument_that_is_not_what_it_says_is_refused() {
     // and belongs to a prebuilt binary, not to a Triton kernel
     let mut k = masked_rows();
     k.entry["abi"]["params"][2] = fixed(2, "alpha", "f32", json!(1.0));
+    assert!(refusal(&[k], &[]).contains("belongs to a prebuilt binary"));
+}
+
+/// `axpy` with `alpha` an `i32` and `zero` an `i64` given per call (no value in the manifest): one entry serves every value.
+fn axpy_given() -> Kernel {
+    let mut k = axpy_ptx();
+    k.entry["abi"]["params"][4] = given(4, "alpha", "i32");
+    k.entry["abi"]["params"][5] = given(5, "zero", "i64");
+    k
+}
+
+#[test]
+fn the_values_given_per_call_are_passed_at_their_slots_and_held_to_their_types() {
+    let manifest = read(&[axpy_given()], &[]).unwrap();
+    let entry = manifest.entry("axpy_ptx", "sm_103").unwrap();
+    assert!(matches!(entry.params[4].kind, ParamKind::Given { ty: tilefish::ScalarType::I32 }));
+    assert_eq!(entry.params[5].size(), 8);
+    let plan = plan_of(&manifest, "axpy_ptx");
+    assert_eq!(plan.given_names().collect::<Vec<_>>(), ["alpha", "zero"]);
+    let shape = [16usize];
+    let tensors = [
+        dense(X, &shape, DType::F32, Access::In),
+        dense(X + 0x1000, &shape, DType::F32, Access::In),
+        dense(Y, &shape, DType::F32, Access::InOut),
+    ];
+    for (alpha, zero) in [(3i64, -2i64), (-1, 1 << 40), (i64::from(i32::MIN), i64::MIN)] {
+        let p = plan.prepare_with(&tensors, &[("zero", zero), ("alpha", alpha)], None).unwrap();
+        assert_eq!(p.params()[4], u64::from(alpha as i32 as u32), "{alpha}");
+        assert_eq!(p.params()[5], zero as u64, "{zero}");
+    }
+    let refused = |given: &[(&str, i64)]| plan.prepare_with(&tensors, given, None).unwrap_err().to_string();
+    assert!(refused(&[("alpha", 1)]).contains("argument 'zero' of 'axpy_ptx' is a fixed argument per call"));
+    assert!(plan.prepare(&tensors, None).unwrap_err().to_string().contains("give its value"));
+    assert!(refused(&[("alpha", 1), ("zero", 0), ("beta", 2)]).contains("has no fixed argument per call 'beta'"));
+    assert!(refused(&[("alpha", 1), ("alpha", 2), ("zero", 0)]).contains("given twice"));
+    let e = plan.prepare_with(&tensors, &[("alpha", 1 << 31), ("zero", 0)], None).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Shape, "{e}");
+    assert!(e.to_string().contains("does not fit the i32"), "{e}");
+}
+
+#[test]
+fn a_given_argument_that_is_not_what_it_says_is_refused() {
+    let cases: [(&str, Value, &str); 5] = [
+        ("with a value", json!({"value": 1}), "it has no value, dim or shape"),
+        ("with a dim", json!({"dim": "n"}), "it has no value, dim or shape"),
+        ("an f32", json!({"type": "f32", "ptx_type": "f32"}), "is i32 or i64"),
+        ("passed in 8 bytes", json!({"ptx_type": "u64", "size": 8}), "is passed as a u32 of 4 bytes"),
+        ("of an unknown kind", json!({"kind": "giving"}), "kind must be pointer, scalar, fixed or given"),
+    ];
+    for (what, change, why) in cases {
+        let mut k = axpy_given();
+        for (key, v) in change.as_object().unwrap() {
+            k.entry["abi"]["params"][4][key] = v.clone();
+        }
+        let message = refusal(&[k], &[]);
+        assert!(message.contains(why), "{what}: {message}");
+    }
+    // a value given per call belongs to a prebuilt binary
+    let mut k = masked_rows();
+    k.entry["abi"]["params"][2] = given(2, "alpha", "i32");
     assert!(refusal(&[k], &[]).contains("belongs to a prebuilt binary"));
 }

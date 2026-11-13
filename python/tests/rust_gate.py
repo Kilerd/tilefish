@@ -205,6 +205,7 @@ class Case:
     kind: str = "kernel"
     same_as: "str | None" = None  # another operator (a key of ``host_ops``) whose replay on the same inputs gives these very bytes
     outputs: "Callable[[tuple], tuple] | None" = None  # the tensors the call writes its results into (``outputs=``), made from its arguments
+    given: "dict[str, int] | None" = None  # the values of a prebuilt binary's fixed arguments per call (``k: const[i32]`` with no default)
 
     @property
     def id(self) -> str:
@@ -304,6 +305,22 @@ def must_add_into(args, got):
     assert same_bytes(y, (r + x) * 0.5)
 
 
+def args_scale_add(n, seed):
+    return (randn((n,), F32, seed),)
+
+
+def must_scale_add(k, c):
+    return lambda args, got: same_bytes(got, args[0] * float(k) + float(c))
+
+
+def given_ops():
+    """``{name: extern}``: a prebuilt PTX whose ``k: const[i32]`` and ``c: const[i64]`` every call gives (``gpu_kernels_p6.scale_add``). Not in the committed
+    fixtures, so only a fresh export has it."""
+    import gpu_kernels_p6 as p6
+
+    return {"scale_add": p6.scale_add}
+
+
 def build_cases():
     cases: "list[Case]" = [
         *plain("softmax", "softmax", args_softmax, ROW_SIZES),
@@ -351,6 +368,12 @@ def build_cases():
     for op in ("qkv_sum", "qkv_sum16"):
         cases += [Case(op, op, f"fused-{rows}-seed0", lambda rows=rows: args_qkv_fused(rows, 0), must_sum) for rows in (1, 7, 40)]
         cases += [Case(op, op, f"separate-{rows}-seed0", lambda rows=rows: args_qkv_separate(rows, 0), must_sum) for rows in (1, 7, 40)]
+    # -- fixed arguments given per call: one binary (one entry) launched with the values of each call (i32 and i64, either sign, at the edges)
+    for k, c in ((3, -2), (-1, 7), (0, 5), (2**31 - 1, -(2**40)), (-(2**31), 2**24)):
+        cases += [
+            Case("scale_add", "scale_add", f"k{k}-c{c}-{n}", lambda n=n: args_scale_add(n, 0), must_scale_add(k, c), given={"k": k, "c": c})
+            for n in (1, 1000)
+        ]
     # -- a dimension only the Out tensor determines: B is the size of the mask the call is given
     for op, sizes in (("key_mask", (8, 24)), ("key_mask_any", (1, 130, 1000))):
         cases += [
@@ -500,6 +523,7 @@ def prepare(work, manifest_dir=None, pin=None):
     if manifest_dir is None:  # (a committed fixture has none of them: the GEMMs of other options, the Gluon kernels)
         declared.update(option_ops())
         declared.update(gluon_ops())
+        declared.update(given_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -524,7 +548,7 @@ def prepare(work, manifest_dir=None, pin=None):
         # an argument that is a view is given as it is (a strided pointer only reads); a plain tensor is cloned, so an in-place one keeps its input
         given = [a if is_view(a) else a.clone() for a in args]
         extra = {} if case.outputs is None else {"outputs": case.outputs(args)}
-        result = tilefish.run(op, *given, mode="replay", manifest=directory, pin=digest, **extra)
+        result = tilefish.run(op, *given, mode="replay", manifest=directory, pin=digest, **(case.given or {}), **extra)
         results = [] if result is None else (list(result) if isinstance(result, tuple) else [result])
         assert len(results) == len(outputs), (case.id, len(results), outputs)
         if library:  # the pin made in memory runs the algorithm the manifest records: the same bytes
@@ -544,7 +568,10 @@ def prepare(work, manifest_dir=None, pin=None):
                 entry["may_be_zero"] = True
             entries.append(entry)
         tensors_total += len(entries)
-        cases.append({"id": case.id, "launcher": rust._camel(case.stem), "stem": case.stem, "kind": case.kind, "tensors": entries})
+        record = {"id": case.id, "launcher": rust._camel(case.stem), "stem": case.stem, "kind": case.kind, "tensors": entries}
+        if case.given:
+            record["given"] = case.given
+        cases.append(record)
     if not cases:
         sys.exit(f"no case has a binary in the manifest for {arch}")
     doc = {"arch": arch, "digest": digest, "manifest": manifest_ref}
@@ -649,6 +676,9 @@ def plan_graphs():
         w, b = randn((16, 64), F32, seed=70), randn((16, 64), F32, seed=71)
         return [(f"seed{seed}", {"x": randn((16, 64), F32, seed=72 + seed), "w": w, "b": b}) for seed in range(3)]
 
+    def given_cases():
+        return [(f"Rg{rg}-seed{seed}", {"x": randn((rg, 64), F32, seed=80 + rg + seed)}) for rg in (8, 24) for seed in (0, 1)]
+
     return [
         ("block", pm.block, False, block_cases),
         ("block-reuse", pm.block, True, block_cases),
@@ -664,6 +694,7 @@ def plan_graphs():
         ("copy_steps", p5.copy_steps, False, copy_cases),  # a copy of a dense view into the arena and a store into an InOut parameter
         ("view_returns", p5.view_returns, False, view_cases),  # a reshape of a result returned (no copy), a dense view of a parameter and a value twice (copies)
         ("weighted", p6.static_affine, False, weighted_cases),  # a static graph that declares its roles: weights bound once (PlanRun::bind_weights)
+        ("given_steps", p6.two_scales, False, given_cases),  # one prebuilt binary, two steps with the values each call gives (one of them the bucket's)
     ]
 
 

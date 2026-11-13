@@ -712,6 +712,13 @@ class Bound:
     def stem(self) -> str:
         return self.spec.stem
 
+    @property
+    def given(self) -> "dict[str, int]":
+        """The values of the fixed arguments per call of a prebuilt binary (``given`` in its ABI), by name: what the step records."""
+        if self.callee.kind == "library":
+            return {}
+        return {a.name: self.scalars[a.name] for a in self.spec.args if a.kind == "given"}
+
     def check(self, bases: "Mapping[str, int]") -> "dict[str, TensorInfo]":
         """The facts with the real addresses (``bases``: buffer name -> address of its first byte), after the checks that depend on them: every
         pointer's alignment (and what else the spec's preconditions say) and that a tensor that is written overlaps no other argument."""
@@ -747,12 +754,17 @@ def _itemsize(dtype: str) -> int:
 
 
 def resolve_step(
-    callee: Callee, args: "Sequence[Mapping[str, Any]]", buffers: "Mapping[str, tuple[str, tuple[int, ...]]]", where: str
+    callee: Callee,
+    args: "Sequence[Mapping[str, Any]]",
+    buffers: "Mapping[str, tuple[str, tuple[int, ...]]]",
+    where: str,
+    given: "Mapping[str, Any] | None" = None,
 ) -> Bound:
     """Bind one step at one bucket: the facts about its arguments (from the document: each ``{name, binding, view?}`` against the buffers' dtype
     and shape at this bucket), the dimensions, the binary, the scalars and the grid. This is the one place that decides all of them: a plan is
     built with it, and a plan is run with it, so what was planned is what runs. Raises the errors a launch of the binary would (a precondition
-    that no address can change is checked here; the address-dependent ones in :meth:`Bound.check`)."""
+    that no address can change is checked here; the address-dependent ones in :meth:`Bound.check`). ``given`` are the values of the fixed
+    arguments per call of a prebuilt binary (the step's ``given``), by the launched kernel's parameter name."""
     infos: "dict[str, TensorInfo]" = {}
     names, bindings, offsets = [], [], []
     order = {n: i for i, n in enumerate(buffers)}
@@ -804,7 +816,7 @@ def resolve_step(
                     raise TilefishPlanError(f"{where}: the result '{q.name}' of '{callee.name}' has shape {list(want)}, but the buffer it is bound to has {list(infos[q.name].shape)}")
         from .runtime import _finish_launch
 
-        scalars, grid = _finish_launch(extern, spec, dims, infos)
+        scalars, grid = _finish_launch(extern, spec, dims, infos, given)
         written = frozenset(p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in")
         aliases = {p.name: p.alias for p in extern.signature.params if p.alias is not None}
         return Bound(callee, spec, dims, scalars, grid, tuple(names), tuple(bindings), tuple(offsets), infos, written, aliases)
@@ -1114,7 +1126,12 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
                 steps_doc.append({"kind": "copy", "args": args_doc})
                 continue
             assert s.callee is not None
-            bound = resolve_step(s.callee, args_doc, shapes, f"graph '{name}' at {combo or 'its only size'}, {s.what}")
+            values: "dict[str, Any]" = {}  # the call's constants by the launched kernel's names: a fixed argument per call is evaluated at the bucket
+            for k, v in (s.consts or {}).items():
+                if isinstance(v, DimExpr) and not v.is_static:
+                    v = _eval(v, mapping, name, f"{s.what}: the value of '{k}'")
+                values[s.callee.names.get(k, k)] = v
+            bound = resolve_step(s.callee, args_doc, shapes, f"graph '{name}' at {combo or 'its only size'}, {s.what}", values)
             if s.consts and s.callee.kind == "kernel":  # a constexpr is compiled into the binary: a call may restate its value, not change it (as for a single launch)
                 try:
                     check_consts(bound.spec, {s.callee.names[k]: v for k, v in s.consts.items()})
@@ -1128,6 +1145,12 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
             step: "dict[str, Any]" = {"entry": bound.stem, "kind": s.callee.kind, "args": args_doc}
             if s.library:
                 step["workspace"] = next(b.name for b in w.buffers if b.role == "workspace")
+            given = bound.given
+            if given:  # the fixed arguments per call of a prebuilt binary: the values this call gives, at this bucket (part of the digest)
+                big = [k for k, v in given.items() if abs(v) > MAX_INT]
+                if big:
+                    raise TilefishPlanError(f"graph '{name}' at {combo or 'its only size'}, {s.what}: the value of '{big[0]}' is beyond 2**53, which a plan number cannot be")
+                step["given"] = given
             steps_doc.append(step)
         kinds = [(st["kind"], st.get("workspace", "")) for st in steps_doc]
         first_kinds = first_kinds or kinds
@@ -1211,7 +1234,7 @@ def _check_resolves(p: Plan) -> None:
             if st["kind"] == "copy":  # no binary: copy_problem held it to its rules when it was made
                 continue
             callee = p._callees[st["entry"]]
-            bound = resolve_step(callee, st["args"], shapes, f"graph '{doc['graph']}' at {b['values'] or 'its only size'}, step #{i}")
+            bound = resolve_step(callee, st["args"], shapes, f"graph '{doc['graph']}' at {b['values'] or 'its only size'}, step #{i}", st.get("given"))
             if bound.stem != st["entry"]:  # pragma: no cover - the entry was taken from this very resolution
                 raise TilefishPlanError(f"step #{i} of graph '{doc['graph']}' resolves to '{bound.stem}', not '{st['entry']}'")
 
@@ -1387,7 +1410,7 @@ def _validate(doc: Any, made: bool = False) -> None:
             if is_copy:  # a copy step: no entry, no workspace
                 _keys(st, f"step #{si}", COPY_KEYS)
             else:
-                _keys(st, f"step #{si}", STEP_KEYS, ["workspace"])
+                _keys(st, f"step #{si}", STEP_KEYS, ["workspace", "given"])
                 if not isinstance(st["entry"], str) or not sv._STEM.match(st["entry"]):
                     _bad(f"step #{si}: entry must be a manifest stem such as 'gemm.M64', got {st['entry']!r}")
             if st["kind"] not in KINDS or type(st["kind"]) is not str:
@@ -1398,6 +1421,15 @@ def _validate(doc: Any, made: bool = False) -> None:
                 ws = by_name.get(st["workspace"])
                 if ws is None or ws["role"] != "workspace":
                     _bad(f"step #{si}: workspace must name the buffer of role workspace, got {st['workspace']!r}")
+            given_names: "tuple[str, ...]" = ()
+            if "given" in st:  # the values of a prebuilt binary's fixed arguments per call (check_against_manifest: exactly the entry's)
+                g = st["given"]
+                if st["kind"] != "kernel" or not isinstance(g, dict) or not g or len(g) > MAX_ARGS:
+                    _bad(f"step #{si}: given is a non-empty object of at most {MAX_ARGS} values, on a step of kind 'kernel' only")
+                for k, v in g.items():
+                    if not _NAME.match(k) or not _is_int(v):
+                        _bad(f"step #{si}: given maps argument names to ints, got {k!r}: {v!r}")
+                given_names = tuple(sorted(g))
             if not isinstance(st["args"], list) or not st["args"] or len(st["args"]) > MAX_ARGS:
                 _bad(f"step #{si}: args must be a non-empty list of at most {MAX_ARGS} arguments")
             names_here = []
@@ -1437,7 +1469,7 @@ def _validate(doc: Any, made: bool = False) -> None:
                 dst = by_name[st["args"][1]["binding"]]
                 if dst["role"] not in WRITABLE_ROLES:
                     _bad(f"step #{si}: a copy step writes '{dst['name']}', whose role is {dst['role']}")
-            this.append((st["kind"], st.get("workspace"), tuple(names_here)))
+            this.append((st["kind"], st.get("workspace"), tuple(names_here), given_names))
             if bi == 0:
                 for a in st["args"]:
                     n = a["binding"]
@@ -1446,7 +1478,7 @@ def _validate(doc: Any, made: bool = False) -> None:
         if skeleton is None:
             skeleton = this
         elif this != skeleton:
-            _bad(f"bucket {bucket['values']} has other kinds, workspaces, argument names or bindings than the first bucket: only the entries and the views may differ")
+            _bad(f"bucket {bucket['values']} has other kinds, workspaces, argument names or bindings (or names of given values) than the first bucket: only the entries, the views and the given values may differ")
     uses_library = any(st["kind"] == "library" for st in buckets[0]["steps"])
     if uses_library != any(b["role"] == "workspace" for b in buffers):
         _bad("there is a buffer of role workspace exactly when some step has kind library")
@@ -1517,6 +1549,15 @@ def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
                 if artifact is None:
                     _bad(f"{where}: the manifest has no kernel '{stem}' for {arch}")
                 pointers = [p for p in artifact.entry["abi"]["params"] if p["kind"] == "pointer"]
+                # the fixed arguments per call of a prebuilt binary: the step gives a value for every one of them, of its type, and for nothing else
+                wanted = {p["name"]: p["type"] for p in artifact.entry["abi"]["params"] if p["kind"] == "given"}
+                values = st.get("given", {})
+                if set(values) != set(wanted):
+                    _bad(f"{where}: the binary takes the fixed arguments per call {sorted(wanted)}, the step gives {sorted(values)}")
+                for k, v in values.items():
+                    lo, hi = (-(1 << 31), (1 << 31) - 1) if wanted[k] == "i32" else (-(1 << 63), (1 << 63) - 1)
+                    if not lo <= v <= hi:
+                        _bad(f"{where}: the value {v} of '{k}' does not fit the {wanted[k]} the binary takes")
             else:
                 entry = manifest.library_entry(stem, arch)
                 if entry is None:

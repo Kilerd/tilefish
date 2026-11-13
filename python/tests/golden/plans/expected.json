@@ -91,6 +91,31 @@
       "w_down"
     ]
   },
+  "given": {
+    "arch": "sm_103",
+    "arena_bytes": 6144,
+    "buckets": [
+      {
+        "Rg": 8
+      },
+      {
+        "Rg": 24
+      }
+    ],
+    "graph": "two_scales",
+    "manifest_digest": "027202edecd821b606991c54b401888a334042beba49c43534d033bf58030abd",
+    "offsets": {
+      "t0": 0
+    },
+    "outputs": [
+      "out0"
+    ],
+    "plan_digest": "6d3edd3978ecab9c652c81b4e128b84f7d994dfff866bc99a7439c2050d4d92a",
+    "reuse": false,
+    "roles_declared": false,
+    "steps_per_bucket": 2,
+    "weights": []
+  },
   "steps": {
     "arch": "sm_103",
     "arena_bytes": 6144,

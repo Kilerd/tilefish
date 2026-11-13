@@ -204,6 +204,8 @@ struct StepRun {
     workspace: Option<(usize, [usize; 1])>,
     /// The buffers the step writes.
     written: Vec<usize>,
+    /// The values of the binary's fixed arguments per call, at this bucket.
+    given: Vec<(String, i64)>,
 }
 
 #[derive(Debug)]
@@ -480,7 +482,7 @@ impl PlanRun {
                             .collect()
                     }
                 };
-                steps.push(StepRun { stem: st.entry.clone(), op, args, workspace, written });
+                steps.push(StepRun { stem: st.entry.clone(), op, args, workspace, written, given: st.given.clone() });
             }
             runs.push(BucketRun { index, steps });
         }
@@ -990,7 +992,8 @@ impl PlanRun {
             }
             Ok(match &step.op {
                 Op::Kernel(kernel) => {
-                    Ready::Kernel(kernel, Box::new(kernel.check(&args).map_err(|e| in_step(e, &what))?))
+                    let given: Vec<(&str, i64)> = step.given.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+                    Ready::Kernel(kernel, Box::new(kernel.check_with(&args, &given).map_err(|e| in_step(e, &what))?))
                 }
                 Op::Gemm(gemm) => {
                     let (w, shape) = step.workspace.as_ref().expect("a library step has a workspace");

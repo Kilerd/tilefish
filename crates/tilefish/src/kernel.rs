@@ -145,7 +145,13 @@ impl Kernel {
     /// `tensors` are in the order of the manifest's ABI (see [`Plan::tensor_names`]); the dimensions and the runtime
     /// scalars all come from their shapes.
     pub fn check(&self, tensors: &[TensorArg<'_>]) -> Result<Prepared> {
-        self.plan.prepare(tensors, Some(&self.loaded.device))
+        self.check_with(tensors, &[])
+    }
+
+    /// [`Kernel::check`] of a call that gives the values of the binary's fixed arguments per call (`given`, by name: a prebuilt binary's
+    /// `const[i32]` or `const[i64]` with no default; [`Plan::given_names`]).
+    pub fn check_with(&self, tensors: &[TensorArg<'_>], given: &[(&str, i64)]) -> Result<Prepared> {
+        self.plan.prepare_with(tensors, given, Some(&self.loaded.device))
     }
 
     /// Check the call and launch the kernel on `stream`.
@@ -184,13 +190,20 @@ impl Kernel {
     /// check is made when the call is made: a capture begun on `stream` by another thread while the call runs is not excluded by this
     /// crate. For a raw handle that cudarc does not own, see [`Kernel::launch_raw`].
     pub fn launch(&self, stream: &CudaStream, tensors: &mut [TensorArg<'_>]) -> Result<()> {
+        self.launch_with(stream, tensors, &[])
+    }
+
+    /// [`Kernel::launch`] of a call that gives the values of the binary's fixed arguments per call (`given`, by name: every one of
+    /// [`Plan::given_names`], each fitting the `i32` or `i64` it is passed as). One binary serves every value: they are written at their
+    /// slots of `kernelParams`, as a runtime scalar is.
+    pub fn launch_with(&self, stream: &CudaStream, tensors: &mut [TensorArg<'_>], given: &[(&str, i64)]) -> Result<()> {
         if **stream.context() != *self.loaded.context {
             return Err(Error::Launch(format!(
                 "the stream is in another CUDA context than the one '{}' was loaded in: launch it on a stream of that context",
                 self.loaded.stem
             )));
         }
-        let prepared = self.check(tensors)?;
+        let prepared = self.check_with(tensors, given)?;
         ffi::enqueue(&self.loaded.function, stream, &prepared, self.plan.block(), self.plan.shared(), tensors)
     }
 }

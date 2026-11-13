@@ -247,7 +247,51 @@ fn launch_generic(gpu: &Gpu, manifest: &Manifest, case: &Value, bufs: &mut [Buf]
         // the workspace is freed after the launch: cudarc orders its free behind the GEMM that used it
         return Ok(());
     }
-    manifest.kernel(&gpu.ctx, stem, &[], arch)?.launch(s, &mut args)
+    // a prebuilt binary's fixed arguments per call: the values the case gave
+    let given: Vec<(String, i64)> = case
+        .get("given")
+        .and_then(Value::as_object)
+        .map(|m| m.iter().map(|(n, v)| (n.clone(), v.as_i64().expect("a given value is an integer"))).collect())
+        .unwrap_or_default();
+    let given: Vec<(&str, i64)> = given.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    manifest.kernel(&gpu.ctx, stem, &[], arch)?.launch_with(s, &mut args, &given)
+}
+
+/// Fixed arguments given per call: the gate's `scale_add` cases (five pairs of values, `i32` and `i64`, either sign, at the edges) are launched by
+/// `byte_identity` through one entry of the manifest, which has `k` and `c` as `given` parameters and no value; here a launch that gives no value,
+/// one that names an argument the binary does not have, and an `i32` value that does not fit are refused, and write nothing.
+#[test]
+fn one_binary_serves_the_values_each_call_gives() {
+    let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let given = cases_where(&cases, |c| c["stem"] == "scale_add");
+    let values: std::collections::BTreeSet<String> = given.iter().map(|c| c["given"].to_string()).collect();
+    assert!(given.len() >= 10 && values.len() >= 5, "the gate's cases of values given per call: {values:?}");
+    let entry = manifest.entry("scale_add", &arch.to_string()).expect("one entry serves every value");
+    let kinds: Vec<bool> = entry.params.iter().map(|p| matches!(p.kind, tilefish::ParamKind::Given { .. })).collect();
+    assert_eq!(kinds, [false, false, false, true, true]);
+    let kernel = manifest.kernel(&gpu.ctx, "scale_add", &[], arch).unwrap();
+    let x = gpu.upload(&vec![0u8; 64 * 4]);
+    let mut y = gpu.zeros(64 * 4);
+    let shape = [64usize];
+    for (given, why) in [
+        (&[][..], "is a fixed argument per call"),
+        (&[("k", 1), ("c", 0), ("z", 2)][..], "has no fixed argument per call 'z'"),
+        (&[("k", 1i64 << 31), ("c", 0)][..], "does not fit the i32"),
+    ] {
+        let mut args = [
+            TensorRef::<F32>::from_cuda(&x.slice, &shape).unwrap().into_arg(),
+            TensorMut::<F32>::from_cuda(&mut y.slice, &shape).unwrap().into_arg(),
+        ];
+        let e = kernel.launch_with(&gpu.stream, &mut args, given).unwrap_err();
+        assert!(e.to_string().contains(why), "{why}: {e}");
+    }
+    assert!(gpu.download(&y).iter().all(|b| *b == 0), "a refused launch wrote");
+    println!(
+        "rust gate: {} cases of one binary with values given per call ({} pairs of values)",
+        given.len(),
+        values.len()
+    );
 }
 
 /// Upload the tensors of a case: the inputs from their files, the outputs as zeros. In the order of the launcher's ABI.

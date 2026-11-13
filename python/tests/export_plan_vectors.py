@@ -25,7 +25,7 @@ from tilefish.errors import TilefishManifestError
 HERE = pathlib.Path(__file__).resolve().parent
 GOLDEN = HERE / "golden" / "plans"
 BASES = ("block", "block-reuse")  # the bases of the mutations of the rules (their paths are the block's)
-RANDOM_BASES = {"block": 7, "block-reuse": 8, "steps": 9}  # the bases of the random changes of one leaf, and the seed of each
+RANDOM_BASES = {"block": 7, "block-reuse": 8, "steps": 9, "given": 10}  # the bases of the random changes of one leaf, and the seed of each
 JUNK = [None, True, False, 0, -1, 1, 2**70, 1.5, "", "x", "M", "M*M", "3*M", "(((", [], {}, [1], {"a": 1}, "sm_103", "0" * 64]
 
 
@@ -170,6 +170,34 @@ def mutations():
     for text in ("256", "2*128", "0+256", "M - M + 256", "cdiv(512, 2)", "513//2", "cdiv(511, 2)", "256*1*1", "-(-256)", "128 + 128 "):
         out.append((f"static shape {text!r}", setter(["buffers", 2, "shape"], [text])))
     return out
+
+
+def given_mutations():
+    """The values given per call of the golden plan ``given`` (``plan_model.two_scales``: one prebuilt binary launched twice, ``k`` an ``i32`` and
+    ``c`` an ``i64`` given by each call): what both readers hold a step's ``given`` to, in every bucket (``each``) or in one."""
+
+    def each(change):
+        return lambda d: [change(b["steps"][0]) for b in d["buckets"]]
+
+    return [
+        ("given removed", each(lambda st: st.pop("given"))),
+        ("given value missing", each(lambda st: st["given"].pop("c"))),
+        ("given value extra", each(lambda st: st["given"].update(z=1))),
+        ("given i32 at its largest", each(lambda st: st["given"].update(k=2**31 - 1))),
+        ("given i32 past its largest", each(lambda st: st["given"].update(k=2**31))),
+        ("given i32 at its smallest", each(lambda st: st["given"].update(k=-(2**31)))),
+        ("given i64 at 2**53", each(lambda st: st["given"].update(c=2**53))),
+        ("given float", each(lambda st: st["given"].update(k=1.5))),
+        ("given float of an int", each(lambda st: st["given"].update(k=3.0))),
+        ("given bool", each(lambda st: st["given"].update(k=True))),
+        ("given string", each(lambda st: st["given"].update(k="3"))),
+        ("given null", each(lambda st: st["given"].update(k=None))),
+        ("given empty", each(lambda st: st.update(given={}))),
+        ("given list", each(lambda st: st.update(given=[3, -2]))),
+        ("given name not an identifier", each(lambda st: st["given"].update({"1k": 1}))),
+        ("given names differ across buckets", lambda d: d["buckets"][0]["steps"][0]["given"].update(z=1)),
+        ("given values differ across buckets", lambda d: d["buckets"][0]["steps"][0]["given"].update(k=5)),
+    ]
 
 
 def arg(name, binding, view=None):
@@ -324,7 +352,7 @@ def documents():
         base_text = (directory / "plan.json").read_text()
         base = json.loads(base_text)
         made = []
-        for name, mutate in mutations() if base_name in BASES else ():
+        for name, mutate in mutations() if base_name in BASES else given_mutations() if base_name == "given" else ():
             doc = copy.deepcopy(base)
             mutate(doc)
             made.append((name, doc, False))

@@ -152,10 +152,15 @@ def test_the_const_of_a_prebuilt_binary_is_a_typed_argument_with_a_value(ptx):
         @tilefish.extern(ptx=ptx, symbol="tf_k", block=(1,), grid=(1,))
         def g(x: Tensor[16, f32], a: const[i32] = 2**31): ...  # does not fit
 
-    with pytest.raises(TilefishDeclarationError, match="needs a default, the value written in the manifest"):
+    # without a default an integer is given by every call (a fixed argument per call: test_given_args.py); a float is fixed by its default
+    @tilefish.extern(ptx=ptx, symbol="tf_k", block=(1,), grid=(1,))
+    def h(x: Tensor[16, f32], *, a: const[i32]): ...
+
+    assert [a.kind for a in compile_specs(h)[0].args if a.name == "a"] == ["given"]
+    with pytest.raises(TilefishDeclarationError, match="a per-call value is an integer"):
 
         @tilefish.extern(ptx=ptx, symbol="tf_k", block=(1,), grid=(1,))
-        def h(x: Tensor[16, f32], *, a: const[i32]): ...
+        def h2(x: Tensor[16, f32], *, a: const[f32]): ...
 
 
 def test_a_triton_extern_is_not_a_prebuilt_one_and_still_has_its_warps():

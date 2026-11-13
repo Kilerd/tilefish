@@ -17,6 +17,7 @@ No ``from __future__ import annotations``: tilefish evaluates annotations at dec
 import pathlib
 
 import tilefish
+from gpu_kernels_p6 import two_scales  # noqa: F401  (the golden plan `given`: one prebuilt binary launched with values given per call)
 from tilefish import DevScalar, Dim, InOut, MayAlias, Out, StrideOf, Strided, Tensor, bf16, const, f32, i32
 
 D_MODEL, HEADS, D_HEAD, D_FF = 256, 4, 64, 1024

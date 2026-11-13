@@ -350,8 +350,18 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
                 bad(f"parameter {name}: the value of a fixed {ty} argument must be an int, got {value!r}")
             elif not -(2**63) <= value < 2**63 or (ty == "i32" and not -(2**31) <= value < 2**31):
                 bad(f"parameter {name}: the value {value} does not fit {ty}")
+        elif pkind == "given":  # a fixed argument per call: every launch (every step of a plan) gives its value
+            if kind != ENTRY_KIND_BINARY:
+                bad(f"parameter {name}: a fixed argument per call belongs to a prebuilt binary, and this is a {kind} kernel")
+            if ty not in _PASSED_AS["scalar"]:
+                bad(f"parameter {name}: a fixed argument per call is i32 or i64, got {ty!r}")
+            ptx, size = _PASSED_AS["scalar"][ty]
+            if p["ptx_type"] != ptx or p["size"] != size:
+                bad(f"parameter {name}: a {ty} given per call is passed as a {ptx} of {size} bytes, got {p['ptx_type']} of {p['size']}")
+            if any(_has(p, k) for k in ("dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "dtype", "alias", "value")):
+                bad(f"parameter {name} is a fixed argument per call: it has no value, dim or shape (each call gives its value)")
         else:
-            bad(f"parameter {name}: kind must be pointer, scalar or fixed, got {pkind!r}")
+            bad(f"parameter {name}: kind must be pointer, scalar, fixed or given, got {pkind!r}")
     # an out pointer that may be written over an in pointer (`alias`, the Rust reader's `check_consistent`): that pointer is an `in` one, not strided and
     # not a device scalar, of the same dtype and declared shape, and no other out pointer names it
     from ._specvalid import check_alias_target

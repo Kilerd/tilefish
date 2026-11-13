@@ -80,6 +80,8 @@ from ._launch import (
     tensor_info,
 )
 from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp
+from .dims import DimExpr
+from .signature import MISSING
 from .errors import TilefishManifestError, TilefishPreconditionError, TilefishRuntimeError
 from ._plan import PLAN_NAME, Bound, Plan, plan as make_plan
 from .trace import Value
@@ -757,7 +759,7 @@ class PlanRunner:
             where = f"graph '{self.plan.name}' at {values or 'its only size'}, step #{i} ({st['entry']})"
             if callee is None:
                 raise TilefishManifestError(f"{where}: the graph calls no operator that has the binary '{st['entry']}'")
-            bound = _plan.resolve_step(callee, st["args"], shapes, where)
+            bound = _plan.resolve_step(callee, st["args"], shapes, where, st.get("given"))
             if bound.stem != st["entry"]:
                 raise TilefishManifestError(f"{where}: the arguments of the step select the binary '{bound.stem}', not '{st['entry']}'")
             if callee.kind == "library":
@@ -771,7 +773,7 @@ class PlanRunner:
                 built = self.provider.kernel(callee, bound.spec, index)
                 if built.spec.block != bound.spec.block or built.num_warps != bound.spec.num_warps:
                     raise TilefishRuntimeError(f"the binary of '{bound.spec.stem}' disagrees with its spec about num_warps")
-                order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "scalar"))
+                order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "scalar", "given"))
                 loaded = be.load(built, index)
                 be.check_grid(loaded, bound.grid)
                 steps.append(_StepRT(bound, loaded, order, None, None))
@@ -924,7 +926,7 @@ class PlanRunner:
             bias = real[names[2]].ptr if len(names) == 4 else None
             be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
         else:
-            launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
+            launch_args = [("pointer", real[n].ptr) if kind == "pointer" else (kind, st.bound.scalars[n]) for kind, n in st.order]
             be.launch(st.loaded, st.bound.grid, launch_args, stream)
 
     def _written(self, st: "_StepRT") -> "set[str]":
@@ -1848,7 +1850,13 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
                         f"reference mode of graph '{graph.name}' needs a reference for the extern op '{op.name}': it wraps a hand-written kernel, which has no IR to "
                         "interpret. Give @tilefish.extern a reference=<a torch function of the op's tensor inputs> that returns its Out tensors"
                     )
-                res = op.reference(**ins, **_reference_dims(op, ins, n.outputs[: len(op_sig.tensor_outputs)], size))
+                consts = n.attrs.get("consts") or {}
+                given = {  # a prebuilt binary's fixed arguments per call: the values this call gives (an expression of the graph's dimensions evaluated)
+                    p.name: size(consts[p.name]) if isinstance(consts[p.name], DimExpr) else consts[p.name]
+                    for p in op_sig.consts
+                    if p.default is MISSING and p.name in consts
+                }
+                res = op.reference(**ins, **_reference_dims(op, ins, n.outputs[: len(op_sig.tensor_outputs)], size), **given)
                 produced = [] if res is None else (list(res) if isinstance(res, (tuple, list)) else [res])
                 if len(produced) != len(op_sig.tensor_outputs):
                     raise TilefishRuntimeError(

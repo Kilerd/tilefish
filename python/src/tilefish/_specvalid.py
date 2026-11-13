@@ -421,7 +421,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
     kind, ty = d["kind"], d["type"]
-    kinds = ("pointer", "scalar", "constexpr") + (("fixed",) if schema >= STRIDED_SCHEMA else ())
+    kinds = ("pointer", "scalar", "constexpr") + (("fixed", "given") if schema >= STRIDED_SCHEMA else ())
     if kind not in kinds or not isinstance(ty, str):
         bad(f"arg {d['name']}: kind must be {', '.join(kinds)} and type a string, got {kind!r}, {ty!r}")
     present = set(d) - {"index", "name", "kind", "type"}
@@ -430,6 +430,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         "scalar": {"dtype", "dim"},
         "constexpr": {"value"},
         "fixed": {"dtype", "value"},
+        "given": {"dtype"},  # a fixed argument per call: its value is the call's (a plan step's), not the spec's
     }[kind]
     optional: "set[str]" = set()
     if kind == "constexpr" and schema >= DIGEST_SCHEMA:
@@ -446,7 +447,10 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         bad(f"arg {d['name']} ({kind}) must have exactly the fields {sorted(expected)}, has {sorted(present)}")
     if ("strides" in d) != ("offset" in d):
         bad(f"arg {d['name']}: strides and offset come together")
-    if kind == "fixed":
+    if kind == "given":
+        if ty not in ("i32", "i64") or d["dtype"] != ty:
+            bad(f"arg {d['name']}: a fixed argument per call is i32 or i64, got {ty!r}/{d['dtype']!r}")
+    elif kind == "fixed":
         if ty not in SCALAR_TYPES or d["dtype"] != ty:
             bad(f"arg {d['name']}: a fixed argument is one of {SCALAR_TYPES}, got {ty!r}/{d['dtype']!r}")
         value = decode_scalar(d["value"], f"arg {d['name']} value")
@@ -678,6 +682,8 @@ def validate_spec(d: Any) -> None:
                     dims |= parse_expression(entry, f"arg {a['name']} layout")
         if is_binary and a["kind"] == "constexpr":
             bad(f"arg {a['name']}: a prebuilt binary has no constexprs")
+        if not is_binary and a["kind"] == "given":
+            bad(f"arg {a['name']}: a fixed argument per call belongs to a prebuilt binary")
     if len(set(names)) != len(names):
         bad("argument names must be unique")
     by_name = {a["name"]: a for a in args}

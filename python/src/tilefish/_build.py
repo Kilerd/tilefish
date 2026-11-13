@@ -296,7 +296,8 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
 
     A ``pointer`` is ``base + offset * itemsize`` of a tensor; with ``strides`` and ``offset`` (a ``Strided[...]`` parameter) the
     tensor is a view, and the ``scalar`` that is a ``stride_of`` carries one of its strides. A ``fixed`` argument is a scalar whose
-    value is in the manifest (a prebuilt binary's constant argument, such as a scratch slot written out as a parameter).
+    value is in the manifest (a prebuilt binary's constant argument, such as a scratch slot written out as a parameter); a ``given`` one is
+    a fixed argument per call, whose value each call gives (a plan records it in the step).
     """
     params: list[dict[str, Any]] = []
     for a in spec.args:
@@ -330,6 +331,8 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
             from .aot import _encode
 
             entry["value"] = _encode(a.value)
+        elif a.kind == "given":  # a fixed argument per call: the call (a step of a plan) gives the value
+            pass
         else:
             entry["dim"] = a.dim
             if a.count_of is not None:  # the value is the element count of that pointer argument

@@ -661,6 +661,35 @@ def _check_const_arg(op: "Op", p: Param, value: Any) -> Any:
     return value
 
 
+GIVEN_RANGES = {"i32": (-(1 << 31), (1 << 31) - 1), "i64": (-(1 << 63), (1 << 63) - 1)}
+
+
+def given_value(op_name: str, p: Param, value: Any, dims: "Any" = None) -> Any:
+    """The value a call gives a prebuilt binary's fixed argument per call (``h_out: const[i32]`` with no default): an int of its type, or, in a
+    graph body (``dims``: the graph's dimensions), a dimension expression over the graph's dimensions (``H // 2``), which a plan evaluates at
+    every bucket. A bool, a float and an int out of range are refused."""
+    if isinstance(value, Const):
+        value = value.value
+    if isinstance(value, DimExpr):
+        folded = value.folded()
+        if folded.is_static:
+            value = folded.value
+        elif dims is not None and folded.free_dims() <= set(dims):
+            return folded
+        else:
+            raise TilefishTypeError(
+                f"{op_name}: argument '{p.name}' is {value}, which is not an int"
+                + (" nor an expression of the dimensions of the graph" if dims is not None else "")
+                + f": a fixed argument per call (const[{p.const_dtype}] with no default) takes an int"
+            )
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TilefishTypeError(f"{op_name}: argument '{p.name}' is const[{p.const_dtype}], given at every call: it takes an int, got {value!r}")
+    lo, hi = GIVEN_RANGES[p.const_dtype.name]  # type: ignore[union-attr]
+    if not lo <= value <= hi:
+        raise TilefishTypeError(f"{op_name}: argument '{p.name}' is {value}, which does not fit {p.const_dtype} ({lo} to {hi})")
+    return value
+
+
 def _apply_callee_requirement(
     op: "Op", r: "Requirement | BucketRequirement", bindings: dict[Dim, DimExpr], ctx: TraceContext
 ) -> None:
@@ -837,7 +866,9 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
     consts: dict[str, Any] = {}
     for p in sig.consts:
         value = arguments[p.name]
-        if value is p.default:
+        if p.default is MISSING and getattr(op, "is_binary", False):  # a prebuilt binary's fixed argument per call: this call gives its value
+            consts[p.name] = given_value(op.name, p, value, ctx.dims)
+        elif value is p.default:
             consts[p.name] = value  # the declared default, validated at declaration
         else:
             consts[p.name] = op.check_const(p, _check_const_arg(op, p, value))

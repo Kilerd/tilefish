@@ -1,0 +1,46 @@
+//
+// y[i] = x[i] * k + c for i < n, the product and the sum each rounded to f32: a kernel written by hand for the tests of fixed arguments
+// given per call (nothing generated it). k and c are geometry-like integers a call gives, not dimensions of a tensor.
+// C ABI: (const float* x, float* y, int n, int k, long long c). No Triton scratch slots.
+//
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry scale_add_f32(
+	.param .u64 x,
+	.param .u64 y,
+	.param .u32 n,
+	.param .u32 k,
+	.param .u64 c
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .b32 	%r<7>;
+	.reg .f32 	%f<6>;
+	.reg .b64 	%rd<8>;
+
+	ld.param.u64 	%rd1, [x];
+	ld.param.u64 	%rd2, [y];
+	ld.param.u32 	%r1, [n];
+	ld.param.u32 	%r6, [k];
+	ld.param.u64 	%rd7, [c];
+	mov.u32 	%r2, %ctaid.x;
+	mov.u32 	%r3, %ntid.x;
+	mov.u32 	%r4, %tid.x;
+	mad.lo.s32 	%r5, %r2, %r3, %r4;
+	setp.ge.s32 	%p1, %r5, %r1;
+	@%p1 bra 	DONE;
+	cvt.s64.s32 	%rd3, %r5;
+	shl.b64 	%rd4, %rd3, 2;
+	add.s64 	%rd5, %rd1, %rd4;
+	add.s64 	%rd6, %rd2, %rd4;
+	ld.global.f32 	%f1, [%rd5];
+	cvt.rn.f32.s32 	%f2, %r6;
+	cvt.rn.f32.s64 	%f3, %rd7;
+	mul.rn.f32 	%f4, %f1, %f2;
+	add.rn.f32 	%f5, %f4, %f3;
+	st.global.f32 	[%rd6], %f5;
+DONE:
+	ret;
+}

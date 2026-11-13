@@ -565,6 +565,34 @@ def check_no_alias(infos: "Mapping[str, TensorInfo]", written: "set[str]", alias
                 )
 
 
+GIVEN_RANGE = {"i32": (-(1 << 31), (1 << 31) - 1), "i64": (-(1 << 63), (1 << 63) - 1)}
+
+
+def given_values(spec: "CompileSpec", values: "Mapping[str, Any]", where: str = "") -> "dict[str, int]":
+    """The values of the fixed arguments per call of ``spec`` (a prebuilt binary's ``given`` arguments, ``const[i32]`` with no default): one for
+    every one of them, by the launched kernel's parameter name, each an int that fits its type. ``values`` may hold other names (the call's other
+    constants), which are not looked at."""
+    out: "dict[str, int]" = {}
+    prefix = f"{where}: " if where else ""
+    for a in spec.args:
+        if a.kind != "given":
+            continue
+        if a.name not in values:
+            raise TilefishTypeError(f"{prefix}argument '{a.name}' of '{spec.stem}' is a fixed argument per call (const[{a.type}] with no default): give its value")
+        v = values[a.name]
+        if isinstance(v, DimExpr) and v.is_static:
+            v = v.value
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise TilefishTypeError(f"{prefix}argument '{a.name}' of '{spec.stem}' takes an int (a fixed argument per call), got {v!r}")
+        lo, hi = GIVEN_RANGE[a.type]
+        if not lo <= v <= hi:
+            raise TilefishPreconditionError(
+                f"{prefix}argument '{a.name}' of '{spec.stem}' is {v}, which does not fit the {a.type} the binary takes ({lo} to {hi})", kind="shape", arg=a.name
+            )
+        out[a.name] = v
+    return out
+
+
 def check_consts(spec: "CompileSpec", explicit: "Mapping[str, Any]") -> None:
     """A constexpr is compiled into the binary: a call may restate its value, not change it."""
     compiled = {a.name: a.value for a in spec.args if a.kind in ("constexpr", "fixed")}  # a fixed argument of a prebuilt binary likewise

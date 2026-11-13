@@ -49,8 +49,18 @@ def test_each_directory_loads_as_a_replay_loads_it(committed, name):
     assert loaded.digest == e["plan_digest"] and loaded.manifest_digest == e["manifest_digest"] and loaded.manifest.digest == e["manifest_digest"]
     assert loaded.arch == e["arch"] == "sm_103" and loaded.reuse is e["reuse"] and loaded.arena_bytes == e["arena_bytes"]
     assert {b["name"]: b["offset"] for b in loaded.buffers if b["offset"] is not None} == e["offsets"]
-    assert loaded.buckets() == e["buckets"] and len(loaded.steps(**loaded.buckets()[-1])) == e["steps_per_bucket"] == (4 if name == "steps" else 9)
+    assert loaded.buckets() == e["buckets"] and len(loaded.steps(**loaded.buckets()[-1])) == e["steps_per_bucket"] == {"steps": 4, "given": 2}.get(name, 9)
     assert loaded.outputs == e["outputs"] == (["y", "half"] if name == "steps" else ["out0"])
+
+
+def test_the_given_plan_launches_one_binary_with_the_values_of_each_call(committed):
+    loaded = _plan.load_plan(fx.DEFAULT / "given", pm.two_scales, pin=committed["given"]["plan_digest"])
+    for rg in (8, 24):
+        first, second = loaded.steps(Rg=rg)
+        assert first["entry"] == second["entry"] == "scale_add"
+        assert (first["given"], second["given"]) == ({"k": 3, "c": -2}, {"k": -1, "c": rg})
+    entry = loaded.manifest.get("scale_add", "sm_103").entry
+    assert [p["kind"] for p in entry["abi"]["params"]][-2:] == ["given", "given"]
 
 
 def test_the_steps_plan_has_what_m3_3_added(committed):

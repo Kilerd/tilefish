@@ -113,6 +113,13 @@ pub fn fixed(slot: usize, name: &str, ty: &str, value: Value) -> Value {
     json!({"slot": slot, "index": slot, "name": name, "kind": "fixed", "type": ty, "ptx_type": ptx, "size": size, "value": value})
 }
 
+/// A fixed argument per call of a prebuilt binary: no value, every launch gives it.
+#[allow(dead_code)]
+pub fn given(slot: usize, name: &str, ty: &str) -> Value {
+    let (ptx, size) = if ty == "i64" { ("u64", 8) } else { ("u32", 4) };
+    json!({"slot": slot, "index": slot, "name": name, "kind": "given", "type": ty, "ptx_type": ptx, "size": size})
+}
+
 pub fn alignment(index: usize, arg: &str, bytes: u64) -> Value {
     json!({"kind": "pointer_alignment", "arg": arg, "index": index, "bytes": bytes})
 }

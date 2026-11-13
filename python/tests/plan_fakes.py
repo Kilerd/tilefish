@@ -5,6 +5,7 @@
 The checks of the document and of the manifest are the real ones; what is not real is the machine code.
 """
 
+from binary_fakes import fake_binary_build
 from built_fakes import fake_build
 
 from tilefish import _planrun
@@ -22,6 +23,8 @@ def builds(plan, arch=ARCH):
         spec = callee.by_stem[stem]
         if callee.kind == "library":
             library.append(BuiltLibrary(spec, f"sm_{arch}", FAKE_ALGO, FAKE_CUBLASLT, FAKE_SM_COUNT))
+        elif callee.extern is not None and callee.extern.binary is not None:  # a prebuilt PTX or cubin: a fake ELF with its entry point
+            kernels.append(fake_binary_build(spec, callee.extern.binary, arch=f"sm_{arch}"))
         else:
             kernels.append(fake_build(spec, arch=f"sm_{arch}"))
     return kernels, library

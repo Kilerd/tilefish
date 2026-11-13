@@ -1055,14 +1055,19 @@ def extern(
                 f"extern op '{nm}': {'a kernel' if prebuilt else 'a Triton kernel'} returns nothing; declare results as Out[...] parameters"
             )
         for p in sig.consts:
-            if p.default is MISSING:
+            if p.default is MISSING and not prebuilt:
+                raise TilefishDeclarationError(f"extern op '{nm}': const parameter '{p.name}' needs a default, the value compiled in as constexpr")
+            if p.default is MISSING and (p.const_dtype is None or p.const_dtype.name not in ("i32", "i64")):
                 raise TilefishDeclarationError(
-                    f"extern op '{nm}': const parameter '{p.name}' needs a default, "
-                    + ("the value written in the manifest and passed at every launch" if prebuilt else "the value compiled in as constexpr")
+                    f"extern op '{nm}': const parameter '{p.name}' of a prebuilt binary has no default, so every call gives its value (a fixed "
+                    f"argument per call): declare it `{p.name}: const[i32]` or const[i64] (a per-call value is an integer; an f32 is fixed by "
+                    "its default, written in the manifest)"
                 )
         binary = None
         if prebuilt:
-            for p in sig.consts:  # a fixed argument: a scalar of a C type, with its value
+            for p in sig.consts:  # a fixed argument: a scalar of a C type, with its value (none: each call gives it)
+                if p.default is MISSING:
+                    continue
                 dt = p.const_dtype
                 ok = dt is not None and dt.name in ("i32", "i64", "f32") and isinstance(p.default, (int, float)) and not isinstance(p.default, bool)
                 if ok and dt.is_int:  # type: ignore[union-attr]

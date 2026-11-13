@@ -1,0 +1,178 @@
+{
+  "schema": "tilefish.plan.v1",
+  "tilefish": "0.0.4",
+  "graph": "two_scales",
+  "arch": "sm_103",
+  "manifest_digest": "027202edecd821b606991c54b401888a334042beba49c43534d033bf58030abd",
+  "dims": {
+    "Rg": [
+      8,
+      24
+    ]
+  },
+  "reuse": false,
+  "arena_alignment": 256,
+  "arena_bytes": 6144,
+  "buffers": [
+    {
+      "name": "x",
+      "role": "input",
+      "dtype": "f32",
+      "shape": [
+        "Rg",
+        64
+      ],
+      "offset": null,
+      "bytes": 6144
+    },
+    {
+      "name": "t0",
+      "role": "intermediate",
+      "dtype": "f32",
+      "shape": [
+        "64*Rg"
+      ],
+      "offset": 0,
+      "bytes": 6144
+    },
+    {
+      "name": "out0",
+      "role": "output",
+      "dtype": "f32",
+      "shape": [
+        "Rg",
+        64
+      ],
+      "offset": null,
+      "bytes": 6144
+    }
+  ],
+  "outputs": [
+    "out0"
+  ],
+  "buckets": [
+    {
+      "values": {
+        "Rg": 8
+      },
+      "steps": [
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x",
+              "view": {
+                "shape": [
+                  512
+                ],
+                "strides": [
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "y",
+              "binding": "t0"
+            }
+          ],
+          "given": {
+            "k": 3,
+            "c": -2
+          }
+        },
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t0"
+            },
+            {
+              "name": "y",
+              "binding": "out0",
+              "view": {
+                "shape": [
+                  512
+                ],
+                "strides": [
+                  1
+                ],
+                "offset": 0
+              }
+            }
+          ],
+          "given": {
+            "k": -1,
+            "c": 8
+          }
+        }
+      ]
+    },
+    {
+      "values": {
+        "Rg": 24
+      },
+      "steps": [
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x",
+              "view": {
+                "shape": [
+                  1536
+                ],
+                "strides": [
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "y",
+              "binding": "t0"
+            }
+          ],
+          "given": {
+            "k": 3,
+            "c": -2
+          }
+        },
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t0"
+            },
+            {
+              "name": "y",
+              "binding": "out0",
+              "view": {
+                "shape": [
+                  1536
+                ],
+                "strides": [
+                  1
+                ],
+                "offset": 0
+              }
+            }
+          ],
+          "given": {
+            "k": -1,
+            "c": 24
+          }
+        }
+      ]
+    }
+  ],
+  "plan_digest": "6d3edd3978ecab9c652c81b4e128b84f7d994dfff866bc99a7439c2050d4d92a"
+}

@@ -28,7 +28,7 @@ use crate::error::{Error, Result};
 use crate::expr::{Symbols, parse_expr};
 use crate::json::{canonical, parse_strict, type_name};
 use crate::manifest::{
-    Access, MANIFEST_NAME, Manifest, ParamKind, Pin, ShapeDim, is_arch, is_digest, is_ident, is_stem,
+    Access, MANIFEST_NAME, Manifest, ParamKind, Pin, ScalarType, ShapeDim, is_arch, is_digest, is_ident, is_stem,
 };
 use crate::tensor::DType;
 
@@ -201,6 +201,9 @@ pub struct PlanStep {
     /// The workspace buffer of a library step.
     pub workspace: Option<String>,
     pub(crate) workspace_buffer: Option<usize>,
+    /// The values of a prebuilt binary's fixed arguments per call (the step's `given`), by name in code point order: what the launch passes at
+    /// their slots. Empty for an entry that has none.
+    pub given: Vec<(String, i64)>,
 }
 
 /// The steps of one bucket combination.
@@ -664,7 +667,7 @@ fn validate(doc: &Value) -> Check<Validated> {
     if n_steps > MAX_STEPS {
         return refuse(format!("a bucket has at most {MAX_STEPS} steps, this one has {n_steps}"));
     }
-    type Skeleton = Vec<(StepKind, Option<String>, Vec<(String, String)>)>;
+    type Skeleton = Vec<(StepKind, Option<String>, Vec<(String, String)>, Vec<String>)>;
     let mut skeleton: Option<Skeleton> = None;
     let mut first: HashMap<usize, usize> = HashMap::new();
     let mut last: HashMap<usize, usize> = HashMap::new();
@@ -682,7 +685,7 @@ fn validate(doc: &Value) -> Check<Validated> {
             let (st, entry) = if is_copy {
                 (keys(st, &format!("step #{si}"), &COPY_KEYS, &[])?, String::new())
             } else {
-                let st = keys(st, &format!("step #{si}"), &STEP_KEYS, &["workspace"])?;
+                let st = keys(st, &format!("step #{si}"), &STEP_KEYS, &["workspace", "given"])?;
                 match st["entry"].as_str() {
                     Some(e) if is_stem(e) => (st, e.to_owned()),
                     _ => {
@@ -718,6 +721,35 @@ fn validate(doc: &Value) -> Check<Validated> {
                     }
                 },
                 None => (None, None),
+            };
+            // the values of a prebuilt binary's fixed arguments per call (`check_against_manifest`: exactly the entry's, each of its type)
+            let given: Vec<(String, i64)> = match st.get("given") {
+                None => Vec::new(),
+                Some(g) => {
+                    let malformed = || {
+                        refuse(format!(
+                            "step #{si}: given is a non-empty object of at most {MAX_ARGS} values, on a step of kind 'kernel' only"
+                        ))
+                    };
+                    let Value::Object(map) = g else { return malformed() };
+                    if kind != StepKind::Kernel || map.is_empty() || map.len() > MAX_ARGS {
+                        return malformed();
+                    }
+                    let mut out = Vec::with_capacity(map.len());
+                    for (name, v) in map {
+                        match int_of(v) {
+                            Some(value) if is_ident(name) => out.push((name.clone(), value)),
+                            _ => {
+                                return refuse(format!(
+                                    "step #{si}: given maps argument names to ints, got {name:?}: {}",
+                                    brief(v)
+                                ));
+                            }
+                        }
+                    }
+                    out.sort();
+                    out
+                }
             };
             let args_doc = match st["args"].as_array() {
                 Some(list) if !list.is_empty() && list.len() <= MAX_ARGS => list,
@@ -809,20 +841,21 @@ fn validate(doc: &Value) -> Check<Validated> {
                     ));
                 }
             }
-            this.push((kind, workspace.clone(), names_here));
+            this.push((kind, workspace.clone(), names_here, given.iter().map(|(n, _)| n.clone()).collect()));
             if bi == 0 {
                 for a in &args {
                     first.entry(a.buffer).or_insert(si);
                     last.insert(a.buffer, si);
                 }
             }
-            steps.push(PlanStep { entry, kind, args, workspace, workspace_buffer });
+            steps.push(PlanStep { entry, kind, args, workspace, workspace_buffer, given });
         }
         match &skeleton {
             None => skeleton = Some(this),
             Some(s) if *s != this => {
                 return refuse(format!(
-                    "bucket {} has other kinds, workspaces, argument names or bindings than the first bucket: only the entries and the views may differ",
+                    "bucket {} has other kinds, workspaces, argument names or bindings (or names of given values) than the first bucket: only the entries, \
+                     the views and the given values may differ",
                     describe_values(combo)
                 ));
             }
@@ -1030,6 +1063,31 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
                     let Some(entry) = manifest.entry(stem, arch) else {
                         return refuse(format!("{at}: the manifest has no kernel '{stem}' for {arch}"));
                     };
+                    // the fixed arguments per call of a prebuilt binary: a value for every one of them, of its type, and for nothing else
+                    let wanted: Vec<(&str, ScalarType)> = entry
+                        .params
+                        .iter()
+                        .filter_map(|p| match &p.kind {
+                            ParamKind::Given { ty } => Some((p.name.as_str(), *ty)),
+                            _ => None,
+                        })
+                        .collect();
+                    let mut want_names: Vec<&str> = wanted.iter().map(|(n, _)| *n).collect();
+                    want_names.sort_unstable();
+                    let have: Vec<&str> = st.given.iter().map(|(n, _)| n.as_str()).collect();
+                    if want_names != have {
+                        return refuse(format!(
+                            "{at}: the binary takes the fixed arguments per call {want_names:?}, the step gives {have:?}"
+                        ));
+                    }
+                    for (name, value) in &st.given {
+                        let ty = wanted.iter().find(|(n, _)| n == name).map(|(_, t)| *t).expect("checked above");
+                        if ty == ScalarType::I32 && i32::try_from(*value).is_err() {
+                            return refuse(format!(
+                                "{at}: the value {value} of '{name}' does not fit the i32 the binary takes"
+                            ));
+                        }
+                    }
                     pointers_of(&entry.params)
                 }
                 StepKind::Library => {

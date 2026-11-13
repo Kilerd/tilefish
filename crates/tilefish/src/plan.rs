@@ -120,6 +120,8 @@ enum Slot {
     Scalar(usize),
     /// A `fixed` argument: its bits in the low bytes of the slot.
     Fixed(u64),
+    /// A fixed argument per call: the index of its value in what the call gives.
+    Given(usize),
 }
 
 /// One manifest entry, ready to check a call against.
@@ -130,6 +132,8 @@ pub struct Plan {
     dims: Vec<DimPlan>,
     tensors: Vec<TensorPlan>,
     scalars: Vec<ScalarPlan>,
+    /// The fixed arguments per call (`given`), in the order of the ABI: their names and how each is passed.
+    given: Vec<(String, ScalarType)>,
     checks: Vec<Check>,
     slots: Vec<Slot>,
     scratch_slots: usize,
@@ -244,6 +248,7 @@ impl Plan {
         }
         let mut tensors: Vec<TensorPlan> = Vec::new();
         let mut scalars: Vec<ScalarPlan> = Vec::new();
+        let mut given: Vec<(String, ScalarType)> = Vec::new();
         let mut slots = Vec::new();
         for p in source.params {
             match &p.kind {
@@ -303,6 +308,10 @@ impl Plan {
                     scalars.push(ScalarPlan { name: p.name.clone(), ty: *ty, dim, count_of: None });
                 }
                 ParamKind::Fixed { value } => slots.push(Slot::Fixed(value.bits())),
+                ParamKind::Given { ty } => {
+                    slots.push(Slot::Given(given.len()));
+                    given.push((p.name.clone(), *ty));
+                }
             }
         }
         for p in source.params {
@@ -371,6 +380,7 @@ impl Plan {
             dims,
             tensors,
             scalars,
+            given,
             checks,
             slots,
             scratch_slots: source.scratch_slots,
@@ -389,6 +399,12 @@ impl Plan {
     /// The names of the tensor parameters, in the order a launch gives its tensors.
     pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.tensors.iter().map(|t| t.name.as_str())
+    }
+
+    /// The names of the fixed arguments per call (a prebuilt binary's `const[i32]` or `const[i64]` with no default), in the order of the ABI:
+    /// what [`Plan::prepare_with`] takes a value for.
+    pub fn given_names(&self) -> impl Iterator<Item = &str> {
+        self.given.iter().map(|(n, _)| n.as_str())
     }
 
     pub(crate) fn block(&self) -> [u32; 3] {
@@ -611,7 +627,39 @@ impl Plan {
     /// The checks are made in the order Python's `runtime._prepare` makes them (see the module's documentation), so that a call that breaks
     /// several preconditions is refused for the one Python finds first.
     pub fn prepare(&self, tensors: &[TensorArg<'_>], device: Option<&DeviceInfo>) -> Result<Prepared> {
+        self.prepare_with(tensors, &[], device)
+    }
+
+    /// [`Plan::prepare`] of a call that gives the values of the binary's fixed arguments per call (`given`, by name: every one of
+    /// [`Plan::given_names`] once, and nothing else; each must fit the `i32` or `i64` it is passed as). A value is checked where Python's
+    /// `_finish_launch` checks it, after the runtime scalars; a name that is missing, unknown or given twice is refused first.
+    pub fn prepare_with(
+        &self,
+        tensors: &[TensorArg<'_>],
+        given: &[(&str, i64)],
+        device: Option<&DeviceInfo>,
+    ) -> Result<Prepared> {
         let stem = self.stem.as_str();
+        let mut given_values = [0i64; MAX_PARAMS];
+        let mut seen = [false; MAX_PARAMS];
+        for (name, value) in given {
+            let Some(i) = self.given.iter().position(|(n, _)| n == name) else {
+                return Err(Error::Launch(format!(
+                    "'{stem}' has no fixed argument per call '{name}' (it has {:?})",
+                    self.given_names().collect::<Vec<_>>()
+                )));
+            };
+            if std::mem::replace(&mut seen[i], true) {
+                return Err(Error::Launch(format!("the fixed argument per call '{name}' of '{stem}' is given twice")));
+            }
+            given_values[i] = *value;
+        }
+        if let Some((missing, _)) = self.given.iter().enumerate().find(|(i, _)| !seen[*i]).map(|(_, g)| g) {
+            return Err(Error::Launch(format!(
+                "argument '{missing}' of '{stem}' is a fixed argument per call (a value every launch gives): give its value \
+                 (Kernel::launch_with)"
+            )));
+        }
         if tensors.len() != self.tensors.len() {
             return Err(Error::Launch(format!(
                 "'{stem}' takes {} tensors ({}), got {}",
@@ -814,6 +862,22 @@ impl Plan {
             }
         }
 
+        // each value given per call fits the integer the binary takes it as (Python's `given_values`): any sign
+        for (i, (name, ty)) in self.given.iter().enumerate() {
+            let value = given_values[i];
+            if *ty == ScalarType::I32 && i32::try_from(value).is_err() {
+                return Err(Error::precondition(
+                    PreconditionKind::Shape,
+                    Some(name),
+                    format!(
+                        "argument '{name}' of '{stem}' is {value}, which does not fit the i32 the binary takes ({} to {})",
+                        i32::MIN,
+                        i32::MAX
+                    ),
+                ));
+            }
+        }
+
         // -- a tensor that is written must not overlap another argument (Python's `check_no_alias`)
         for (w, tw) in self.tensors.iter().enumerate().filter(|(_, t)| t.access != Access::In) {
             let (a_start, a_end) = extent(&tensors[w]);
@@ -963,6 +1027,10 @@ impl Plan {
                     }
                 }
                 Slot::Fixed(bits) => *bits,
+                Slot::Given(i) => match self.given[*i].1 {
+                    ScalarType::I32 => u64::from(given_values[*i] as u32),
+                    ScalarType::I64 => given_values[*i] as u64,
+                },
             };
         }
         // (the scratch slots of a Triton kernel stay 0: null pointers)

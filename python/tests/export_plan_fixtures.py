@@ -24,7 +24,7 @@ from tilefish import Manifest
 
 HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT = HERE / "golden" / "plans"
-PLANS = {"block": ("block", False), "block-reuse": ("block", True), "steps": ("steps", False)}  # directory: (the graph of plan_model, reuse)
+PLANS = {"block": ("block", False), "block-reuse": ("block", True), "steps": ("steps", False), "given": ("two_scales", False)}  # directory: (the graph of plan_model, reuse)
 
 
 def export_all(output: pathlib.Path) -> dict:

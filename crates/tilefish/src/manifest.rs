@@ -249,6 +249,12 @@ pub enum ParamKind {
         /// Its value, in its type.
         value: FixedValue,
     },
+    /// A fixed argument per call (a prebuilt binary's `const[i32]` or `const[i64]` with no default): every launch gives its value
+    /// ([`crate::Kernel::launch_with`]; a step of a plan records it), which is passed at its own slot.
+    Given {
+        /// How it is passed.
+        ty: ScalarType,
+    },
 }
 
 /// One non-constexpr parameter of the launch ABI.
@@ -282,6 +288,10 @@ impl Param {
             ParamKind::Fixed { value } => match value {
                 FixedValue::I32(_) | FixedValue::F32(_) => 4,
                 FixedValue::I64(_) => 8,
+            },
+            ParamKind::Given { ty } => match ty {
+                ScalarType::I32 => 4,
+                ScalarType::I64 => 8,
             },
         }
     }
@@ -1296,8 +1306,48 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                 };
                 ParamKind::Fixed { value: fixed_value(&p.ty, value, &format!("parameter {name}"))? }
             }
+            "given" => {
+                // a fixed argument per call: every launch (every step of a plan) gives its value
+                if kind != EntryKind::Binary {
+                    return Err(format!(
+                        "parameter {name}: a fixed argument per call belongs to a prebuilt binary, and this is a {} kernel",
+                        kind.as_str()
+                    ));
+                }
+                let (ty, ptx, size) = match p.ty.as_str() {
+                    "i32" => (ScalarType::I32, "u32", 4),
+                    "i64" => (ScalarType::I64, "u64", 8),
+                    other => {
+                        return Err(format!(
+                            "parameter {name}: a fixed argument per call is i32 or i64, got {other:?}"
+                        ));
+                    }
+                };
+                if p.ptx_type != ptx || p.size != size {
+                    return Err(format!(
+                        "parameter {name}: a {} given per call is passed as a {ptx} of {size} bytes, got {} of {}",
+                        p.ty, p.ptx_type, p.size
+                    ));
+                }
+                if p.dim.is_some()
+                    || p.count_of.is_some()
+                    || p.stride_of.is_some()
+                    || p.access.is_some()
+                    || p.shape.is_some()
+                    || p.strides.is_some()
+                    || p.offset.is_some()
+                    || p.dtype.is_some()
+                    || p.alias.is_some()
+                    || p.value.is_some()
+                {
+                    return Err(format!(
+                        "parameter {name} is a fixed argument per call: it has no value, dim or shape (each call gives its value)"
+                    ));
+                }
+                ParamKind::Given { ty }
+            }
             other => {
-                return Err(format!("parameter {name}: kind must be pointer, scalar or fixed, got {other:?}"));
+                return Err(format!("parameter {name}: kind must be pointer, scalar, fixed or given, got {other:?}"));
             }
         };
         out.push(Param { slot: p.slot, index: p.index, name: p.name.clone(), kind: kind_of });
@@ -1680,7 +1730,7 @@ impl Entry {
                         }
                     }
                 }
-                ParamKind::Fixed { .. } => {}
+                ParamKind::Fixed { .. } | ParamKind::Given { .. } => {}
             }
         }
         for p in &self.params {

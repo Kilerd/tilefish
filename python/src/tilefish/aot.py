@@ -424,7 +424,7 @@ class CompileSpec:
         return (
             self.binary is not None
             or any(
-                a.strides is not None or a.stride_of is not None or a.alias is not None or a.kind == "fixed" or (a.kind == "scalar" and a.type == "i64")
+                a.strides is not None or a.stride_of is not None or a.alias is not None or a.kind in ("fixed", "given") or (a.kind == "scalar" and a.type == "i64")
                 for a in self.args
             )
             or any(p.kind == "max_extent" for p in self.preconditions)
@@ -746,6 +746,10 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
                     entry["stride_type"] = p.stride_dtype.name  # only a type other than the default: a declaration that says the default digests as before
         else:
             entry["dtype"] = None if p.const_dtype is None else _canonical_dtype(p.const_dtype)
+            if p.default is MISSING and op.binary is not None:  # a fixed argument per call: no value in the declaration
+                entry["given"] = True
+                params.append(entry)
+                continue
             # a scalar default is hashed as the typed value a spec compiles in; a dimension expression is
             # resolved per bucket (and typed then), so it is hashed with its dtype above
             typed = p.default if isinstance(p.default, DimExpr) or p.default is MISSING else _typed_const(op.name, p, p.default)
@@ -946,10 +950,13 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                 )
             )
         elif op.binary is not None:  # a prebuilt binary has no constexprs: a const is a fixed argument of its C ABI, with its value
-            assert p.default is not MISSING and p.const_dtype is not None
+            assert p.const_dtype is not None
             ty = p.const_dtype.name
             signature[p.name] = ty
-            args.append(ArgSpec(i, p.name, "fixed", ty, dtype=ty, value=p.default))
+            if p.default is MISSING:  # a fixed argument per call: every call (every step of a plan) gives its value
+                args.append(ArgSpec(i, p.name, "given", ty, dtype=ty))
+            else:
+                args.append(ArgSpec(i, p.name, "fixed", ty, dtype=ty, value=p.default))
         else:
             assert p.default is not MISSING
             value = p.default

@@ -146,6 +146,7 @@ class _Binary:
     params: "list[dict[str, Any]]" = field(default_factory=list)  # the pointers of the ABI, in order
     scalars: "list[dict[str, Any]]" = field(default_factory=list)  # the runtime scalars (the ones `launch` derives)
     fixed: "list[dict[str, Any]]" = field(default_factory=list)  # the fixed arguments of a prebuilt binary
+    given: "list[dict[str, Any]]" = field(default_factory=list)  # its fixed arguments per call: parameters of `launch`
     arg_names: "dict[str, str]" = field(default_factory=dict)  # ABI name -> Rust name
     signature: "str | None" = None  # the tilefish signature of the declaration, when it was given
 
@@ -343,8 +344,15 @@ def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> No
             if kind != "binary":
                 _bad(who, f"{where} is a fixed argument, which only a prebuilt binary has (this is a {kind} kernel)")
             _validate_fixed(who, where, p)
+        elif pkind == "given":
+            if kind != "binary":
+                _bad(who, f"{where} is a fixed argument per call, which only a prebuilt binary has (this is a {kind} kernel)")
+            if p.get("type") not in ("i32", "i64"):
+                _bad(who, f"{where}.type of a fixed argument per call must be i32 or i64, got {p.get('type')!r}")
+            if any(k in p for k in ("value", "dim", "count_of", "stride_of")):
+                _bad(who, f"{where} is a fixed argument per call: every launch gives its value, it has no value, dim, count_of or stride_of")
         else:
-            _bad(who, f"{where}.kind must be 'pointer', 'scalar' or 'fixed', got {pkind!r}")
+            _bad(who, f"{where}.kind must be 'pointer', 'scalar', 'fixed' or 'given', got {pkind!r}")
     for p in params:
         for axis, s in enumerate(p.get("strides", ()) if p.get("kind") == "pointer" else ()):
             if isinstance(s, str) and (p["name"], axis) not in carried:
@@ -571,16 +579,17 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
         binary.params = [p for p in first["abi"]["params"] if p["kind"] == "pointer"]
         binary.scalars = [p for p in first["abi"]["params"] if p["kind"] == "scalar"]
         binary.fixed = [p for p in first["abi"]["params"] if p["kind"] == "fixed"]
+        binary.given = [p for p in first["abi"]["params"] if p["kind"] == "given"]
         for p in binary.params:
             if p["dtype"] not in RUST_ELEMENTS:
                 raise TilefishManifestError(
                     f"'{stem}': the tensor '{p['name']}' has dtype {p['dtype']}, which has no element type in Rust "
                     "(packed formats cannot be run yet)"
                 )
-        names = [_snake_ident(p["name"]) for p in binary.params]
-        if len(set(names)) != len(names):
-            raise TilefishManifestError(f"'{stem}': two tensor names collide as Rust identifiers: {names}")
-        binary.arg_names = {p["name"]: n for p, n in zip(binary.params, names)}
+        names = [_snake_ident(p["name"]) for p in binary.params + binary.given]
+        if len(set(names)) != len(names) or "stream" in names:
+            raise TilefishManifestError(f"'{stem}': two parameter names collide as Rust identifiers (or one is `stream`): {names}")
+        binary.arg_names = {p["name"]: n for p, n in zip(binary.params + binary.given, names)}
         out.append(binary)
     gemms = []
     for stem in sorted(library_by_stem):
@@ -761,6 +770,13 @@ def _doc(binary: _Binary) -> "list[str]":
             + ", ".join(f"`{f['name']}` = {_scalar_text(f['value'])} ({f['type']})" for f in binary.fixed)
             + "."
         )
+    if binary.given:
+        lines.append("")
+        lines += _wrap(
+            "Fixed arguments given per call (parameters of `launch`, after the tensors: one binary serves every value): "
+            + ", ".join(f"`{binary.arg_names[g['name']]}` ({g['type']})" for g in binary.given)
+            + "."
+        )
     lines.append("")
     lines.append(f"Grid `{e['grid']}`, block {_block_text(e['block'])}, {e['shared']} bytes of dynamic shared memory.")
     if binary.scalars:
@@ -812,6 +828,11 @@ def _render_binary(b: _Binary) -> str:
         wrapper = "TensorRef" if p["access"] == "in" else "TensorMut"
         tensor_params.append(f"{b.arg_names[p['name']]}: {wrapper}<'a, {elements[p['name']]}>")
     args = ", ".join(f"{b.arg_names[p['name']]}.into_arg()" for p in b.params)
+    for g in b.given:  # a fixed argument per call: a parameter of `launch` after the tensors, passed by name
+        tensor_params.append(f"{b.arg_names[g['name']]}: {g['type']}")
+    given = ", ".join(
+        f"({_rs_str(g['name'])}, " + (f"i64::from({b.arg_names[g['name']]})" if g["type"] == "i32" else b.arg_names[g["name"]]) + ")" for g in b.given
+    )
     out = [_doc_comment(_doc(b)), "#[derive(Debug, Clone)]\n", f"pub struct {b.struct} {{\n    kernel: Kernel,\n}}\n\n", f"impl {b.struct} {{\n"]
     out.append("    /// The stem of the binary in the manifest.\n")
     out.append(f"    pub const STEM: &'static str = {_rs_str(b.stem)};\n")
@@ -860,7 +881,10 @@ def _render_binary(b: _Binary) -> str:
     for p in tensor_params:
         out.append(f"        {p},\n")
     out.append("    ) -> Result<(), Error> {\n")
-    out.append(f"        self.kernel.launch(stream, &mut [{args}])\n")
+    if b.given:
+        out.append(f"        self.kernel.launch_with(stream, &mut [{args}], &[{given}])\n")
+    else:
+        out.append(f"        self.kernel.launch(stream, &mut [{args}])\n")
     out.append("    }\n\n")
     raw_doc = [
         "Check the call and launch the kernel on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.",
@@ -878,7 +902,10 @@ def _render_binary(b: _Binary) -> str:
         out.append(f"        {p},\n")
     out.append("    ) -> Result<(), Error> {\n")
     out.append("        // SAFETY: the caller vouches for the stream, as this function's contract says.\n")
-    out.append(f"        unsafe {{ self.kernel.launch_raw(stream, &[{args}]) }}\n")
+    if b.given:
+        out.append(f"        unsafe {{ self.kernel.launch_raw_with(stream, &[{args}], &[{given}]) }}\n")
+    else:
+        out.append(f"        unsafe {{ self.kernel.launch_raw(stream, &[{args}]) }}\n")
     out.append("    }\n}\n")
     return "".join(out)
 

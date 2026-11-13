@@ -24,7 +24,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | ABI pointer | dense, row-major, offset 0 | may take a strided view: adds `strides` and `offset` |
 | ABI pointer, shape `[]` | not used | a *device scalar*: one element in device memory |
 | ABI scalar | `i32`, carries a dimension (`dim`) or an element count (`count_of`) | may be `i64`; may carry a stride (`stride_of`), of one view or of several views that share it |
-| ABI argument kinds | `pointer`, `scalar` | adds `fixed`: a scalar whose value is in the manifest |
+| ABI argument kinds | `pointer`, `scalar` | adds `fixed`: a scalar whose value is in the manifest; and `given` (0.0.5, crate 0.0.3): a fixed argument whose value each call gives |
 | preconditions | `pointer_alignment` always 16 bytes | a strided pointer may promise only its element alignment; adds `max_extent` |
 | `dims` | names from shapes, scalars and the grid | also the stride dimensions and the offset dimension of a strided pointer |
 | library | none | a pinned cuBLASLt GEMM, for one device (its architecture and SM count): `library` entries (no file) |
@@ -122,6 +122,7 @@ Every `params` entry has `slot`, `index` (the position in the declaration), `nam
 | `pointer` | `*bf16`, `*fp32`, `*i32`, ... (Triton's pointer type of the dtype) | `u64`, 8 | `dtype`, `access` (`in`/`out`/`inout`), `shape`; optional `strides` and `offset` (together); on an `out` pointer, optionally `alias` (section 5.4) |
 | `scalar` | `i32` or `i64` | `u32`/4 or `u64`/8 | `dim` (an expression); optionally one of `count_of` or `stride_of` |
 | `fixed` (prebuilt binaries only) | `i32`, `i64` or `f32` | `u32`/4, `u64`/8, `f32`/4 | `value` |
+| `given` (prebuilt binaries only) | `i32` or `i64` | `u32`/4 or `u64`/8 | none: every call gives the value (section 5.3) |
 
 A launch passes: a `pointer` as its 64-bit address (see 5.1), a `scalar` as a signed integer of its `type`, a `fixed` as its `value` in its `type`
 (`ctypes.c_int32`/`c_int64`/`c_float`: an `f32` value is the JSON number rounded to the nearest `f32`).
@@ -190,6 +191,16 @@ A `fixed` argument is a scalar whose value is in the manifest: a prebuilt binary
 a Triton scratch slot written out as an explicit parameter). It has `value` and no `dim`. `value` is a JSON integer for `i32`/`i64` (not a bool, in
 range of the type) and a JSON number **with a fraction or exponent** (`2.0`) for `f32`; a non-finite `f32` is the tagged object
 `{"float": "inf" | "-inf" | "nan"}` (as a constexpr value is in schema 2). A caller of the operator may restate the value but not change it.
+
+**A fixed argument given per call** (`"kind": "given"`) is a scalar of a prebuilt binary whose value is not in the manifest: each call gives it
+(Python: `h_out: const[i32]` or `const[i64]` **with no default**, `k(x, h_out=5)`; the geometry of a call, such as an output size or an offset, that
+no tensor of the call determines). It has `type` `i32` or `i64` (`u32`/4 or `u64`/8) and no `value`, `dim` or anything else, and only a `binary`
+entry has one. **One entry serves every value**: a launch passes the value the call gives at the parameter's slot, as a signed integer of its type (any
+sign; a value that does not fit is refused, and so is a launch that gives no value for one of them, or one for a name the entry does not have:
+Python `tilefish.run(op, x, h_out=5)`, Rust `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`); a step of a launch plan records the values
+of its call (`"given"`, `docs/plan-schema-1.md` section 7). A float stays a `fixed` argument (fixed per declaration). The declaration digest has the
+parameter as given (`"given": true`, no default), so a declaration with a default is another operator. A reader that predates the kind (tilefish
+0.0.4, the published crate 0.0.2) refuses a manifest that has one.
 
 ### 5.4 An `out` pointer that may be written over an input: `alias`
 
@@ -305,7 +316,8 @@ A prebuilt binary is a kernel Triton does not compile: PTX assembled by `ptxas`,
 * `toolchain`: `{"ptxas": <version text>}` for PTX, `{}` for a cubin. `declaration_digest`, `sha256`, `sha256_code`: as for any entry.
 
 **Launch.** `cuModuleLoadData(cubin)`, `cuModuleGetFunction(symbol)`, then `cuLaunchKernel(grid, block, shared)` with `kernelParams` = the `abi.params`
-in order: a `pointer` is its address (`u64`), a `scalar` its value (`i32`/`i64`), a `fixed` its `value` (`i32`/`i64`/`f32`); **nothing is appended**
+in order: a `pointer` is its address (`u64`), a `scalar` its value (`i32`/`i64`), a `fixed` its `value` (`i32`/`i64`/`f32`), a `given` the value
+the call gives (`i32`/`i64`); **nothing is appended**
 (`scratch_slots` is 0). `cuFuncGetParamInfo`, when the driver can answer, must report exactly the `size` of each parameter and no more (Python
 checks this at load). A cubin is refused for an architecture other than its own: the declaration has one cubin per architecture, and a replay on
 `sm_90` finds no entry (and does not use the `sm_103` one).
@@ -460,10 +472,12 @@ document tilefish writes next to a build and the host does not read):
   expression), or has `strides` and `offset` not together, on an access other than `in`, not one per axis of its shape (a name, or the fixed `1` on
   the last axis only), or an `offset` that is not a name; a `scalar` that has `dtype`, `access`, `shape`, `strides`, `offset`, `value` or `alias`, no `dim`, both
   `count_of` and `stride_of`, or another width than `u32`/4 or `u64`/8; a `fixed` argument on a Triton kernel, or with a `dim`, `count_of`,
-  `stride_of`, `access`, `shape`, `strides`, `offset`, `dtype` or `alias`, or without a `value` of its type (a JSON `null` is as absent, in each); an
+  `stride_of`, `access`, `shape`, `strides`, `offset`, `dtype` or `alias`, or without a `value` of its type (a JSON `null` is as absent, in each); a
+  `given` argument on a Triton kernel, of a type other than `i32`/`i64` or another width than `u32`/4 or `u64`/8, or with a `value`, `dim`,
+  `count_of`, `stride_of`, `access`, `shape`, `strides`, `offset`, `dtype` or `alias`; an
   expression outside the grammar, a name that `dims` does not have, more than 32 names, a static grid entry or divisor below 1 (section 7.1).
 * the ABI as a whole (a host that reads without a spec checks these itself; Python checks them by comparing the entry with the compile spec, and
-  `_specvalid` checks them in the spec): `params` kinds in `pointer`/`scalar`/`fixed`; a `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
+  `_specvalid` checks them in the spec): `params` kinds in `pointer`/`scalar`/`fixed`/`given`; a `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
   `offset` or the reverse; `strides` of the wrong length or empty, with an integer other than `1`, an integer on a non-last axis, a string that no
   `stride_of` scalar carries, or two scalars for one axis; an `offset` that is not a string; a `stride_of` list of fewer than two objects or with an
   `(arg, axis)` pair twice; a `stride_of` object with a missing/extra key, a negative axis, an
@@ -523,7 +537,10 @@ unsigned here, so a negative stride cannot be made (section 5.1 step 2 refuses i
 first element (for a slice, cudarc is handed a view of the bytes from there, so its tracking of the slice is unchanged). A tensor that is not a view is a
 view with the dense strides. A view given to a parameter that is not strided must be contiguous (torch's rule: the strides of size-1 axes are not looked at).
 The offset dimension of a strided pointer is not bound (section 5.1 step 7): the check of the address is the one made. A device scalar is a tensor of shape
-`[]` or `[1]`. `fixed` values are written at their slots as their type says (an `f32` is the JSON double rounded to the nearest `f32`).
+`[]` or `[1]`. `fixed` values are written at their slots as their type says (an `f32` is the JSON double rounded to the nearest `f32`). A `given`
+argument's value is the call's: `Kernel::launch_with(stream, tensors, &[(name, value)])` (`check_with`, `launch_raw_with`; `Plan::prepare_with`): a name
+the entry does not have, a name twice and a missing one are refused first (`Error::Launch`), and a value that does not fit an `i32` where the scalars'
+ranges are checked (kind `shape`); `launch` gives no value, so it is refused for an entry that has one. A plan step's values are its `given`.
 
 **Launching a library entry** (`gemm.rs`, `ffi/cublaslt.rs`). `Manifest::gemm(&ctx, name, buckets, arch)` loads a `Gemm` for the device of `ctx` once and
 `Gemm::launch(&stream, &mut [a, b, [bias], out, workspace])` runs it:

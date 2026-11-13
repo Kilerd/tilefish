@@ -107,6 +107,25 @@ fn the_golden_plans_load_with_their_pins_and_give_every_number_python_has() {
     }
 }
 
+/// The golden plan `given` (`plan_model.two_scales`): one prebuilt binary (one manifest entry) launched by two steps, each with the values its call
+/// gives to the fixed arguments per call `k` (`i32`) and `c` (`i64`), the second `c` the bucket's `Rg`; the entry has them as `given` parameters.
+#[test]
+fn the_golden_plan_of_given_values_has_one_entry_and_the_values_of_each_step() {
+    let e = &expected()["given"];
+    let plan = LaunchPlan::load(golden().join("given"), Pin::Digest(e["plan_digest"].as_str().unwrap())).unwrap();
+    let entry = plan.manifest().entry("scale_add", "sm_103").unwrap();
+    let kinds: Vec<bool> = entry.params.iter().map(|p| matches!(p.kind, tilefish::ParamKind::Given { .. })).collect();
+    assert_eq!(kinds, [false, false, false, true, true]);
+    for rg in [8u64, 24] {
+        let at = plan.bucket(&[("Rg", rg)]).unwrap();
+        assert_eq!((at.steps[0].entry.as_str(), at.steps[1].entry.as_str()), ("scale_add", "scale_add"));
+        assert_eq!(at.steps[0].given, [("c".to_owned(), -2), ("k".to_owned(), 3)]);
+        assert_eq!(at.steps[1].given, [("c".to_owned(), rg as i64), ("k".to_owned(), -1)]);
+    }
+    let plan_of = tilefish::Plan::new(entry).unwrap();
+    assert_eq!(plan_of.given_names().collect::<Vec<_>>(), ["k", "c"]);
+}
+
 /// The golden plan `steps` (`plan_model.steps`): a copy of a dense view into the arena, a step whose `r_out` is written over its `r` (one buffer for
 /// both), a copy into the caller's `InOut` tensor, a result returned as all of its buffer in another shape, and outputs named by the graph.
 #[test]

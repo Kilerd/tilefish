@@ -47,7 +47,9 @@ These checks happen before anything reaches the driver:
 
 Everything schema 3 describes is launched: Triton kernels and prebuilt PTX and
 cubin binaries (launched with exactly their parameters, `fixed` arguments
-written at their slots), strided views (`TensorRef::from_cuda_strided`), device
+written at their slots, and the values of the `given` ones, fixed per call,
+passed by `Kernel::launch_with(stream, tensors, &[("h_out", 5)])` or a plan
+step), strided views (`TensorRef::from_cuda_strided`), device
 scalars (a tensor of one element), `i64` strides, and pinned cuBLASLt GEMMs
 (`Manifest::gemm`, `Gemm::launch`: the cuBLASLt of the process must be the version
 that chose the algorithm, and the workspace is the caller's last tensor, so

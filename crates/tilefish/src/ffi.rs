@@ -509,7 +509,23 @@ impl Kernel {
     ///   it must be ordered against the other streams that use it (nothing here is).
     #[allow(unsafe_code)]
     pub unsafe fn launch_raw(&self, stream: sys::CUstream, tensors: &[TensorArg<'_>]) -> Result<()> {
-        let mut prepared = self.check(tensors)?;
+        // SAFETY: the caller's contract is this function's.
+        unsafe { self.launch_raw_with(stream, tensors, &[]) }
+    }
+
+    /// [`Kernel::launch_raw`] of a call that gives the values of the binary's fixed arguments per call (see [`Kernel::launch_with`]).
+    ///
+    /// # Safety
+    ///
+    /// As for [`Kernel::launch_raw`].
+    #[allow(unsafe_code)]
+    pub unsafe fn launch_raw_with(
+        &self,
+        stream: sys::CUstream,
+        tensors: &[TensorArg<'_>],
+        given: &[(&str, i64)],
+    ) -> Result<()> {
+        let mut prepared = self.check_with(tensors, given)?;
         let _current = Current::make(self.context())?;
         refuse_capture_raw(stream, tensors)?;
         let mut params: [*mut c_void; MAX_PARAMS] = [std::ptr::null_mut(); MAX_PARAMS];

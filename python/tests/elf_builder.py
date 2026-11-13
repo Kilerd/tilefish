@@ -118,7 +118,7 @@ def arch_header(arch):
     return dict(osabi=0x41, abiversion=8, flags=0x09000000 | (sm << 8) | 0x0A)
 
 
-def cubin_like(*, debug="path/a.py", code=b"\x01\x02\x03\x04" * 16, gap=0, debug_first=False, shared=1024, **kw):
+def cubin_like(*, debug="path/a.py", code=b"\x01\x02\x03\x04" * 16, gap=0, debug_first=False, shared=1024, symbol="tf_k", **kw):
     """A small file shaped like a Mercury cubin: code and constants, symbol tables, and debug sections that hold ``debug``.
 
     ``shared`` is the size of the shared memory section ``.nv.shared.tf_k`` of the kernel: 1024 as on sm_90 and later, ``0``
@@ -131,13 +131,14 @@ def cubin_like(*, debug="path/a.py", code=b"\x01\x02\x03\x04" * 16, gap=0, debug
         S(".nv.merc.debug_line", data=b"merc:" + dbg),
         S(".nv.merc.rela.debug_line", type=4, data=dbg[:4].ljust(24, b"\0"), link=".symtab", flags=SHF_INFO_LINK),
     ]
+    sym = symbol
     code_sections = [
-        S(".strtab", SHT_STRTAB, data=b"\0tf_k\0"),
+        S(".strtab", SHT_STRTAB, data=b"\0" + sym.encode() + b"\0"),
         S(".symtab", SHT_SYMTAB, data=b"\0" * 48, link=".strtab", info=2, align=8, entsize=24),
-        S(".nv.info.tf_k", 0x70000000, flags=SHF_INFO_LINK, data=b"\x04\x2f\x08\x00" * 4, link=".symtab", info=".text.tf_k", align=4),
-        S(".text.tf_k", SHT_PROGBITS, flags=SHF_ALLOC | SHF_EXECINSTR, data=code, link=".symtab", info=1, align=128),
-        *([S(".nv.shared.tf_k", SHT_NOBITS, flags=SHF_ALLOC | 0x1, size=shared, align=16)] if shared is not None else []),
-        S(".nv.constant0.tf_k", SHT_PROGBITS, flags=SHF_ALLOC, data=b"\0" * 32, align=4),
+        S(f".nv.info.{sym}", 0x70000000, flags=SHF_INFO_LINK, data=b"\x04\x2f\x08\x00" * 4, link=".symtab", info=f".text.{sym}", align=4),
+        S(f".text.{sym}", SHT_PROGBITS, flags=SHF_ALLOC | SHF_EXECINSTR, data=code, link=".symtab", info=1, align=128),
+        *([S(f".nv.shared.{sym}", SHT_NOBITS, flags=SHF_ALLOC | 0x1, size=shared, align=16)] if shared is not None else []),
+        S(f".nv.constant0.{sym}", SHT_PROGBITS, flags=SHF_ALLOC, data=b"\0" * 32, align=4),
     ]
     sections = [*debug_sections, *code_sections] if debug_first else [*code_sections, *debug_sections]
     return build_elf(sections, gap=gap, **kw)

@@ -116,6 +116,7 @@ from ._launch import (
     check_spec_preconditions,
     eval_dim,
     eval_grid,
+    given_values,
     select_spec,
     solve_dims,
     tensor_info,
@@ -392,7 +393,7 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]",
     results = [tensors[n] for n in result_names]
 
     infos = {name: tensor_info(name, t) for name, t in tensors.items()}
-    scalars, grid = _finish_launch(extern, spec, dims, infos)
+    scalars, grid = _finish_launch(extern, spec, dims, infos, {names[k]: v for k, v in call.consts.items()})
     return _Prepared(target, spec, str(device), tensors, scalars, grid, results)
 
 
@@ -404,9 +405,12 @@ def _check_given(op_name: str, p: Param, info: TensorInfo, dims: "dict[Dim, int]
     solve_dims(op_name, [(p.name, axis, pattern, actual, str(p.type), "dimension") for axis, (pattern, actual) in enumerate(zip(p.type.shape, info.shape))], dims)
 
 
-def _finish_launch(extern: ExternOp, spec: CompileSpec, dims: "dict[Dim, int]", infos: "dict[str, TensorInfo]") -> "tuple[dict[str, int], tuple[int, ...]]":
+def _finish_launch(
+    extern: ExternOp, spec: CompileSpec, dims: "dict[Dim, int]", infos: "dict[str, TensorInfo]", given: "dict[str, Any] | None" = None
+) -> "tuple[dict[str, int], tuple[int, ...]]":
     """The runtime scalars and the grid of one launch of ``spec``, after every check a launch makes (``dims`` are the bound dimensions,
-    ``infos`` the facts about every pointer argument of the launched kernel by its parameter name).
+    ``infos`` the facts about every pointer argument of the launched kernel by its parameter name). ``given`` are the values of the fixed
+    arguments per call (a prebuilt binary's ``given`` arguments, by name), which join the scalars once checked.
 
     This is the half of :func:`_prepare` that does not depend on where the facts come from: a call on torch tensors has them from the
     tensors, a plan from the views it launches with (:mod:`tilefish._plan`).
@@ -435,6 +439,7 @@ def _finish_launch(extern: ExternOp, spec: CompileSpec, dims: "dict[Dim, int]", 
         scalars[a.name] = v
     check_dim_constraints(dims)
     check_scalar_ranges(spec, scalars)
+    scalars.update(given_values(spec, given or {}))  # a fixed argument per call: an int of its type, any sign
     written = {p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in"}
     check_no_alias(infos, written, {p.name: p.alias for p in extern.signature.params if p.alias is not None})
     check_spec_preconditions(spec, infos, scalars, dims)
@@ -448,8 +453,8 @@ def _launch_values(prep: _Prepared) -> "list[tuple[str, str, Any]]":
     for a in prep.spec.args:
         if a.kind == "pointer":
             out.append(("pointer", a.name, prep.tensors[a.name]))
-        elif a.kind == "scalar":
-            out.append(("scalar", a.name, prep.scalars[a.name]))
+        elif a.kind in ("scalar", "given"):  # a runtime scalar, or a fixed argument per call (the value the call gave)
+            out.append((a.kind, a.name, prep.scalars[a.name]))
         elif a.kind == "fixed":
             continue  # a prebuilt binary's constant argument: its value is in the manifest, and the launch writes it
         else:
@@ -539,8 +544,8 @@ def _launch_built(prep: _Prepared, built: BuiltKernel, index: int) -> None:
     for kind, _, v in _launch_values(prep):
         if kind == "pointer":
             args.append(("pointer", int(v.data_ptr())))
-        elif kind == "scalar":
-            args.append(("scalar", int(v)))
+        elif kind in ("scalar", "given"):
+            args.append((kind, int(v)))
     with torch.cuda.device(index):
         loaded = _cuda.load(built, index)
         stream = torch.cuda.current_stream(index).cuda_stream
@@ -723,7 +728,8 @@ def _run_extern_reference(op: ExternOp, args: "tuple[Any, ...]", kwargs: "dict[s
     call = bind_call(op.name, sig, args, kwargs)
     check_dim_constraints(call.dims, buckets=False)
     assert op.reference is not None
-    res = op.reference(**{p.name: call.tensors[p.name] for p in sig.tensor_inputs})
+    given = {p.name: call.consts[p.name] for p in sig.consts if p.default is MISSING and p.name in call.consts}  # fixed arguments per call
+    res = op.reference(**{p.name: call.tensors[p.name] for p in sig.tensor_inputs}, **given)
     produced = [] if res is None else (list(res) if isinstance(res, (tuple, list)) else [res])
     if len(produced) != len(sig.tensor_outputs):
         raise TilefishRuntimeError(

@@ -329,6 +329,12 @@ Its identity is the sha256 of the bytes of the file (`source_digest` of kind `ti
 (the ones Triton passes, so the PTX of a Triton build declared this way gives the machine code, and the output bytes, of the Triton path); a cubin is used
 as it is for its own architecture and refused for another. `replay` refuses a file that is not the one the manifest was built from.
 
+A `const[i32]` or `const[i64]` of a prebuilt binary **without a default** is a fixed argument *given per call*: the geometry of a call (an output
+size, an offset) that no tensor determines. One declaration and one binary serve every value: `k(x, h_out=5)`, `tilefish.run(k, x, h_out=5)`,
+Rust `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`; in a graph the value may be an expression of the graph's dimensions (`h_out=H // 2`),
+and each step of the plan records the values of its call at its bucket (`"given": {"h_out": 5}`), so they are in the plan's digest and both hosts
+check them against the entry (`docs/manifest-schema-3.md`, section 5.3).
+
 **Gluon kernels.** A kernel written in Triton's Gluon dialect (`triton.experimental.gluon`: `@gluon.jit`, layouts written out, so the kernel pins
 which thread holds which element and so the order of its reductions) is declared with `gluon=` in place of `triton=`, and everything else is the same:
 strided views and shared strides, `const` arguments, buckets, `index_bits`, `enable_fp_fusion`, plans, `jit`, `replay` and the Rust host.
