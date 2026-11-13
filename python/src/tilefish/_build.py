@@ -21,7 +21,6 @@ import pathlib
 import re
 import subprocess
 import tempfile
-import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
