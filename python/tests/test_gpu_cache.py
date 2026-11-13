@@ -362,3 +362,91 @@ def test_processes_that_build_the_same_kernel_at_once_leave_one_good_entry(tmp_p
     assert last.returncode == 0, last.stderr[-3000:]
     after = json.loads(last.stdout.strip().splitlines()[-1])
     assert after["compiled"] == 0 and after["code"] == results[0]["code"] and after["sha"] in {r["sha"] for r in results}  # a new process: a hit, on a whole entry
+
+
+# -- a kernel made by a factory function: its constant is in a closure cell ------------------------------------------------------------------
+
+CLO_FILE = (
+    "import os\n"
+    "\n"
+    "import triton\n"
+    "import triton.language as tl\n"
+    "\n"
+    "\n"
+    "def make():\n"
+    '    S = tl.constexpr(float(os.environ["CLO_S"]))\n'
+    "\n"
+    "    @triton.jit\n"
+    "    def clo_k(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):\n"
+    "        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n"
+    "        mask = offsets < n_elements\n"
+    "        x = tl.load(x_ptr + offsets, mask=mask)\n"
+    "        tl.store(y_ptr + offsets, x * S, mask=mask)\n"
+    "\n"
+    "    return clo_k\n"
+    "\n"
+    "\n"
+    "clo_k = make()\n"
+)
+CloN = Dim("CloN", divisible_by=16)
+
+
+@tilefish.extern(triton="clo_kernel:clo_k", num_warps=4, grid=lambda CloN: (cdiv(CloN, 256),))
+def clo(x_ptr: Tensor[CloN, f32], y_ptr: Out[Tensor[CloN, f32]], n_elements: CloN, *, BLOCK: tilefish.const = 256): ...
+
+
+@pytest.fixture
+def closure(tmp_path, monkeypatch):
+    directory = tmp_path / "clo"
+    directory.mkdir()
+    (directory / "clo_kernel.py").write_text(CLO_FILE)
+    monkeypatch.syspath_prepend(str(directory))
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.setenv("CLO_S", "2.0")
+
+    def load():
+        sys.modules.pop("clo_kernel", None)
+        importlib.invalidate_caches()
+        linecache.clearcache()
+        runtime.clear_caches()
+        return importlib.import_module("clo_kernel")
+
+    yield load, directory
+    sys.modules.pop("clo_kernel", None)
+
+
+def test_a_closure_variable_is_part_of_what_the_cache_and_the_export_say_a_kernel_is(compiles, closure, monkeypatch, tmp_path):
+    """The reviewer's repro, on a real GPU: ``CLO_S=2.0`` and then ``CLO_S=3.0`` shared one cache directory and gave y = 2.0 twice."""
+    load, _ = closure
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    load()
+    assert torch.equal(tilefish.run(clo, x, mode="jit"), x * 2.0) and len(compiles) == 1
+    first = runtime.export(clo, tmp_path / "two")
+    assert len(compiles) == 1  # the cache: the same files and the same value
+    monkeypatch.setenv("CLO_S", "3.0")
+    load()  # a new process: the same files, another value in the cell
+    assert torch.equal(tilefish.run(clo, x, mode="jit"), x * 3.0)  # not the cached binary of 2.0
+    assert len(compiles) == 2 and len(entries()) == 2
+    # a replay of the manifest made under 2.0, here, would compile another binary than the one in it: refused, with the pin or not
+    for kwargs in ({"pin": first.digest}, {"trust_directory": True}):
+        with pytest.raises(tilefish.TilefishManifestError, match="source digest.*a closure variable"):
+            tilefish.run(clo, x, mode="replay", manifest=first.directory, **kwargs)
+    # and the export here stamps the binary of 3.0, which replays here
+    second = runtime.export(clo, tmp_path / "three")
+    assert second.doc["kernels"][0]["source_digest"] != first.doc["kernels"][0]["source_digest"]
+    assert torch.equal(tilefish.run(clo, x, mode="replay", manifest=second.directory, pin=second.digest), x * 3.0)
+    monkeypatch.setenv("CLO_S", "2.0")
+    load()
+    assert torch.equal(tilefish.run(clo, x, mode="replay", manifest=first.directory, pin=first.digest), x * 2.0)  # the same value: accepted
+
+
+def test_a_closure_variable_that_has_no_stable_repr_is_refused_by_a_real_build(compiles, closure, tmp_path):
+    load, directory = closure
+    (directory / "clo_kernel.py").write_text(CLO_FILE.replace('S = tl.constexpr(float(os.environ["CLO_S"]))', 'S = [float(os.environ["CLO_S"])]').replace("x * S", "x * S[0]"))
+    load()
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    with pytest.raises(TilefishBuildError, match=r"closure variable 'S' of the Triton function 'clo_k' holds a list.*module-level constant.*const parameter"):
+        tilefish.run(clo, x, mode="jit")
+    with pytest.raises(TilefishBuildError, match="closure variable 'S'"):
+        runtime.export(clo, tmp_path / "m")
+    assert len(compiles) == 0 and entries() == []
