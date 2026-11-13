@@ -568,6 +568,59 @@ def test_replay_needs_a_manifest_and_only_replay_takes_one(directory):
         scale.run(manifest=directory)  # jit is the default mode
 
 
+def test_a_replay_needs_a_trust_anchor_and_does_not_read_the_directory_without_one(directory, monkeypatch):
+    """``manifest=`` alone is not enough: the digests sit next to the files they describe, so the caller says which to trust."""
+    from tilefish import runtime
+
+    def read(manifest):
+        raise AssertionError("the manifest was read before the caller said whether to trust it")
+
+    monkeypatch.setattr(runtime, "_load_manifest", read)
+    anchor = "replay needs a trust anchor.*pin=<the manifest's digest>.*or trust_directory=True"
+    with pytest.raises(TilefishRuntimeError, match=anchor):
+        tilefish.run(scale, mode="replay", manifest=directory)
+    with pytest.raises(TilefishRuntimeError, match=anchor):
+        scale.run(mode="replay", manifest=directory)  # the method passes it through
+    with pytest.raises(TilefishRuntimeError, match=anchor):
+        tilefish.run(scale, mode="replay", manifest=directory, trust_directory=False)
+    with pytest.raises(TilefishRuntimeError, match=anchor):
+        tilefish.run(scale, mode="replay", manifest=Manifest.load(directory))  # a loaded manifest is no anchor either
+
+
+def test_the_trust_anchor_is_one_of_a_pin_and_trust_directory(directory, monkeypatch):
+    from tilefish import runtime
+
+    seen = []
+
+    def load(manifest):
+        seen.append(manifest)
+        raise TilefishManifestError("stop here: the anchor was accepted")
+
+    monkeypatch.setattr(runtime, "_load_manifest", load)
+    with pytest.raises(TilefishManifestError, match="the anchor was accepted"):
+        tilefish.run(scale, mode="replay", manifest=directory, trust_directory=True)
+    with pytest.raises(TilefishManifestError, match="the anchor was accepted"):
+        tilefish.run(scale, mode="replay", manifest=directory, pin="a" * 64)
+    assert len(seen) == 2
+    with pytest.raises(TilefishRuntimeError, match=r"pass either pin= .* or trust_directory=True .*, not both"):
+        tilefish.run(scale, mode="replay", manifest=directory, pin="a" * 64, trust_directory=True)
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("bad", [1, "yes", None, 0, "True"])
+def test_trust_directory_is_a_bool(directory, bad):
+    with pytest.raises(TilefishRuntimeError, match="trust_directory= is True or False"):
+        tilefish.run(scale, mode="replay", manifest=directory, trust_directory=bad)
+
+
+def test_trust_directory_belongs_to_replay(directory):
+    for mode in ("jit", "reference"):
+        with pytest.raises(TilefishRuntimeError, match="trust_directory= is for mode='replay'"):
+            tilefish.run(scale, mode=mode, trust_directory=True)
+    with pytest.raises(TilefishRuntimeError, match="trust_directory= is for mode='replay'"):
+        scale.run(trust_directory=True)  # jit is the default mode
+
+
 def test_a_manifest_directory_is_loaded_once_and_again_when_a_file_changes(directory):
     first = _load_manifest(directory)
     assert _load_manifest(directory) is first and _load_manifest(str(directory)) is first and _load_manifest(first) is first

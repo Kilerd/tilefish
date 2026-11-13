@@ -169,7 +169,7 @@ def test_jit_and_replay_agree_byte_for_byte(name, op, make, size, seed, request,
     op = request.getfixturevalue("readme_kernel") if op == "readme" else op()
     args = make(size, seed)
     jit, jit_args = run_in("jit", op, args)
-    replay, replay_args = run_in("replay", op, args, manifest=exported(op))
+    replay, replay_args = run_in("replay", op, args, manifest=exported(op), trust_directory=True)
 
     outs_jit, outs_replay = tensors_of(jit), tensors_of(replay)
     assert len(outs_jit) == len(outs_replay)
@@ -202,7 +202,7 @@ def test_jit_builds_in_memory_and_replay_loads_the_manifests_cubin(tmp_path):
 
     directory = runtime.export(softmax, tmp_path).directory
     runtime.clear_caches()
-    tilefish.run(softmax, *args, mode="replay", manifest=directory)
+    tilefish.run(softmax, *args, mode="replay", manifest=directory, trust_directory=True)
     assert not runtime._builds  # replay builds nothing
     (loaded,) = _cuda._loaded.values()
     assert loaded.built.cubin == (directory / built.cubin_name).read_bytes()
@@ -218,7 +218,7 @@ def test_triton_native_jit_computes_the_same_bytes_too(exported):
         fn = op()
         args = make(sizes[1], 0)
         native, native_args = run_in("jit", fn, args, runner=lambda *a, fn=fn: native_jit(fn, *a))
-        replay, replay_args = run_in("replay", fn, args, manifest=exported(fn))
+        replay, replay_args = run_in("replay", fn, args, manifest=exported(fn), trust_directory=True)
         for a, b in zip(tensors_of(native) + native_args, tensors_of(replay) + replay_args):
             assert same_bytes(a, b), name
 
@@ -229,7 +229,7 @@ def go(exported):
 
     def call(mode, op, *args, **kw):
         if mode == "replay":
-            kw["manifest"] = exported(op)
+            kw["manifest"], kw["trust_directory"] = exported(op), True
         return tilefish.run(op, *args, mode=mode, **kw)
 
     return call
@@ -238,9 +238,9 @@ def go(exported):
 def test_op_run_and_lowered_run_are_the_same_as_tilefish_run(exported):
     args = args_layernorm(5, 3)
     manifest = exported(layernorm)
-    a = tilefish.run(layernorm, *args, mode="replay", manifest=manifest)
-    assert same_bytes(a, layernorm.run(*args, mode="replay", manifest=manifest))
-    assert same_bytes(a, layernorm.lower().run(*args, mode="replay", manifest=manifest))
+    a = tilefish.run(layernorm, *args, mode="replay", manifest=manifest, trust_directory=True)
+    assert same_bytes(a, layernorm.run(*args, mode="replay", manifest=manifest, trust_directory=True))
+    assert same_bytes(a, layernorm.lower().run(*args, mode="replay", manifest=manifest, trust_directory=True))
     assert same_bytes(a, tilefish.run(layernorm.lower(), *args, mode="jit"))
     assert same_bytes(a, layernorm.run(*args))  # jit is the default mode
 

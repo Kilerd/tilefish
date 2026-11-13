@@ -112,7 +112,7 @@ def both(manifest, op, *args):
     out = {}
     for mode in ("replay", "reference"):
         clones = [a.clone() if torch.is_tensor(a) else a for a in args]
-        out[mode] = (tilefish.run(op, *clones, mode=mode, **({"manifest": manifest} if mode == "replay" else {})), clones)
+        out[mode] = (tilefish.run(op, *clones, mode=mode, **({"manifest": manifest, "trust_directory": True} if mode == "replay" else {})), clones)
     return out
 
 
@@ -212,4 +212,4 @@ def test_the_reference_is_deterministic_and_does_not_depend_on_the_binary(manife
     a = tilefish.run(softmax, *args, mode="reference")
     b = tilefish.run(softmax, *args, mode="reference")
     assert same_bytes(a, b)
-    assert differing(a, tilefish.run(softmax, *args, mode="replay", manifest=manifest)) > 0
+    assert differing(a, tilefish.run(softmax, *args, mode="replay", manifest=manifest, trust_directory=True)) > 0

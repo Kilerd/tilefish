@@ -203,7 +203,7 @@ def test_a_manifest_written_elsewhere_has_the_machine_code_of_a_jit_build_and_re
         jit_args = [a.clone() for a in args]
         replay_args = [a.clone() for a in args]
         jit = tilefish.run(kernel, *jit_args, mode="jit")
-        replay = tilefish.run(kernel, *replay_args, mode="replay", manifest=tmp_path / "manifest")
+        replay = tilefish.run(kernel, *replay_args, mode="replay", manifest=tmp_path / "manifest", trust_directory=True)
         assert same_bytes(jit, replay), name  # (b) the same outputs ...
         assert all(same_bytes(a, b) for a, b in zip(jit_args, replay_args)), name  # ... and the same in-place tensors
 
@@ -214,7 +214,7 @@ def test_replay_refuses_a_cubin_that_was_changed_after_it_was_built(tmp_path, lo
     low = lowered["softmax"]
     directory = runtime.export(low, tmp_path).directory
     x = torch.randn(7, 1000, device="cuda")
-    expected = tilefish.run(low, x, mode="replay", manifest=directory)  # fine as built
+    expected = tilefish.run(low, x, mode="replay", manifest=directory, trust_directory=True)  # fine as built
     cubin_path = next(directory.glob("*.cubin"))
     original = cubin_path.read_bytes()
     text = parse_elf(original).section(f".text.{low.fn_name}")
@@ -223,17 +223,17 @@ def test_replay_refuses_a_cubin_that_was_changed_after_it_was_built(tmp_path, lo
     cubin_path.write_bytes(bytes(flipped))
     runtime.clear_caches()
     with pytest.raises(TilefishManifestError, match="sha256"):  # the file digest
-        tilefish.run(low, x, mode="replay", manifest=directory)
+        tilefish.run(low, x, mode="replay", manifest=directory, trust_directory=True)
     # an attacker (or a careless tool) that also fixes the file digest in the manifest is still caught by the code digest
     doc = json.loads((directory / "manifest.json").read_text())
     doc["kernels"][0]["sha256"] = hashlib.sha256(bytes(flipped)).hexdigest()
     (directory / "manifest.json").write_text(json.dumps(doc))
     with pytest.raises(TilefishManifestError, match="machine code .* sha256_code"):
-        tilefish.run(low, x, mode="replay", manifest=directory)
+        tilefish.run(low, x, mode="replay", manifest=directory, trust_directory=True)
     cubin_path.write_bytes(original)  # restored: the original manifest digests hold again
     doc["kernels"][0]["sha256"] = hashlib.sha256(original).hexdigest()
     (directory / "manifest.json").write_text(json.dumps(doc))
-    assert same_bytes(tilefish.run(low, x, mode="replay", manifest=directory), expected)
+    assert same_bytes(tilefish.run(low, x, mode="replay", manifest=directory, trust_directory=True), expected)
 
 
 def test_replay_needs_the_architecture_and_the_spec_the_manifest_was_built_for(tmp_path, lowered):
@@ -244,14 +244,14 @@ def test_replay_needs_the_architecture_and_the_spec_the_manifest_was_built_for(t
     other = "sm_80" if ARCH != "sm_80" else "sm_90"
     elsewhere = runtime.export(low, tmp_path / "elsewhere", arch=other).directory
     with pytest.raises(TilefishManifestError, match=f"no binary for 'softmax' on {ARCH} \\(it has {other}\\)"):
-        tilefish.run(low, x, mode="replay", manifest=elsewhere)
+        tilefish.run(low, x, mode="replay", manifest=elsewhere, trust_directory=True)
     here = runtime.export(low, tmp_path / "here").directory
     with pytest.raises(TilefishManifestError, match="no binary for 'layernorm'"):
-        tilefish.run(layernorm, *(torch.zeros(s, device="cuda", dtype=torch.bfloat16) for s in ((5, 768), (768,), (768,))), mode="replay", manifest=here)
+        tilefish.run(layernorm, *(torch.zeros(s, device="cuda", dtype=torch.bfloat16) for s in ((5, 768), (768,), (768,))), mode="replay", manifest=here, trust_directory=True)
     # a binary built from a different declaration of the same name is not accepted either
     strict = runtime.export(softmax.lower(fp_fusion=False), tmp_path / "strict").directory
     with pytest.raises(TilefishManifestError, match="was built from kernel source with sha256"):
-        tilefish.run(low, x, mode="replay", manifest=strict)
+        tilefish.run(low, x, mode="replay", manifest=strict, trust_directory=True)
 
 
 def test_replay_needs_neither_triton_nor_ptxas_nor_a_c_compiler(tmp_path, lowered):
@@ -263,7 +263,7 @@ def test_replay_needs_neither_triton_nor_ptxas_nor_a_c_compiler(tmp_path, lowere
         "import torch, tilefish\n"
         "from lower_cases import softmax\n"
         "x = torch.randn(7, 1000, device='cuda')\n"
-        "y = tilefish.run(softmax, x, mode='replay', manifest=sys.argv[1])\n"
+        "y = tilefish.run(softmax, x, mode='replay', manifest=sys.argv[1], trust_directory=True)\n"
         "assert sys.modules['triton'] is None\n"
         "assert float((y.sum(-1) - 1).abs().max()) < 1e-5\n"
         "print('replayed without triton')\n"

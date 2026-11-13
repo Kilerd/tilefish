@@ -127,9 +127,14 @@ The Python side has three modes:
 ```python
 y = tilefish.run(residual_add_rmsnorm, x, residual, w)                        # jit
 m = tilefish.runtime.export(residual_add_rmsnorm, "build/")                    # cubins and manifest.json
-y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/")
-y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/", pin=m.digest)
+y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/", pin=m.digest)           # a manifest whose digest you hold
+y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/", trust_directory=True)  # whatever the directory holds
 ```
+
+`replay` refuses to run without one of the two (`pin=` or `trust_directory=True`). This
+is a deliberate breaking change in 0.0.x: until 0.0.2 a replay trusted the directory by
+default, and the digests in it sit next to the files they describe, so whoever can write
+the directory could make it run any binary.
 
 Arguments are torch tensors, matched to the signature the way a call is
 matched in a trace: inputs and `InOut` tensors are passed (an `InOut` tensor
@@ -173,16 +178,20 @@ ABI, and a grid beyond the device's limits. The manifest is read as strict JSON
 written through a temporary file and renamed, and a symbolic link where a file
 is to go is refused.
 
-**Trust.** Without `pin=` a replay trusts the directory: the digests sit next
-to the files they describe, so whoever can write the directory can rewrite
-both. `export` returns the manifest with its `digest`, a sha256 over every
-entry, and checks that the directory it wrote has that digest; keep it somewhere
-you trust and pass it as `pin=` to refuse a directory that changed. A pin
-vouches for the manifest, not for a source digest that is known to differ, and
-not for a `shared` that is nonzero but too small for the kernel (nothing but the
-manifest says how much it needs). Triton's own JIT launcher, which specializes
-on argument values, is not a mode. Neither `jit` nor `replay` needs a C
-compiler, and a `replay` of a generated kernel needs neither Triton nor `ptxas`.
+**Trust.** A replay needs a trust anchor, `pin=` or `trust_directory=True`, and
+raises without one. The digests in a manifest directory sit next to the files
+they describe, so whoever can write the directory can rewrite both.
+`export` returns the manifest with its `digest`, a sha256 over every entry, and
+checks that the directory it wrote has that digest; keep it somewhere you trust
+and pass it as `pin=` to refuse a directory that changed.
+`trust_directory=True` is the explicit statement that whatever the directory
+holds is fine (a directory you wrote a moment ago); it does not combine with
+`pin=`. A pin vouches for the manifest, not for a source digest that is known to
+differ, and not for a `shared` that is nonzero but too small for the kernel
+(nothing but the manifest says how much it needs). Triton's own JIT launcher,
+which specializes on argument values, is not a mode. Neither `jit` nor `replay`
+needs a C compiler, and a `replay` of a generated kernel needs neither Triton nor
+`ptxas`.
 
 CI asserts, on a GPU (the tests marked `gpu`), that a `jit`-built cubin has the
 digest of the manifest's, that `jit` and `replay` agree byte for byte, and that
