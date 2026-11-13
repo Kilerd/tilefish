@@ -10,6 +10,8 @@ entries are ``<dir>/builds/<key[:2]>/<key>.json``. Nothing evicts them; delete t
 
 The key is a sha256 over
 
+* the cache recipe (:data:`CACHE_RECIPE`, a number that is bumped whenever tilefish changes what goes into a binary) and the version
+  of tilefish;
 * the declaration digest and the fingerprint of the compile spec (everything that goes into ``triton.compile``: the
   signature, the constants, the attributes, the grid and block, the launch parameters);
 * the identity of the source: ``source_sha256`` of a generated kernel (the sha256 of the Triton source its spec was made
@@ -32,6 +34,12 @@ fresh build), the options and the versions against what is being built. Anything
 with a :class:`~tilefish.errors.TilefishCacheWarning` and the kernel is built again (and the entry rewritten); the cache
 never hands back a binary it could not check, and it never fails a build.
 
+Never fails a build, also when warnings are errors. The warning is a :class:`~tilefish.errors.TilefishCacheWarning`, and under
+``python -W error`` (or ``pytest -W error``, ``warnings.simplefilter("error")``) ``warnings.warn`` raises it, from inside ``build``,
+after the kernel compiled fine. The cache therefore issues its warnings through a helper that catches what the filters and the hooks
+raise and logs the message instead (``logging.getLogger("tilefish.cache")``, WARNING): with ``-W error`` the text is in the log and
+the build succeeds. The same holds for anything unexpected that reading or writing an entry raises: a miss, with a warning.
+
 A write is a temporary file in the directory and an atomic rename, like every file tilefish writes, so a reader sees the old
 entry or the new one and processes that build the same kernel at the same time do not tear it. A symbolic link where an
 entry goes is refused.
@@ -51,6 +59,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import warnings
@@ -61,9 +70,35 @@ from ._elf import code_digest, parse_elf
 from .errors import TilefishBuildError, TilefishCacheWarning
 
 CACHE_FORMAT = "tilefish.build-cache.v1"
+# The recipe: what tilefish does to turn a compile spec into a binary (how a spec becomes the inputs of ``triton.compile``, the
+# options it adds, the ABI it checks, how a generated kernel's source is written, what a source digest covers). It is part of every
+# key, so a change of any of that must bump it: an entry made by an older recipe is then not found, instead of served as the binary
+# of the new one. The tilefish version is part of the key as well (a release can change what goes into a binary without anyone
+# remembering to bump this).
+CACHE_RECIPE = 2
 ENV_DIR = "TILEFISH_CACHE_DIR"
 _TAG = b"tilefish.build-cache-key.v1\0"
 _warned_writes: "set[str]" = set()
+_log = logging.getLogger("tilefish.cache")
+
+
+def _warn(message: str) -> None:
+    """Tell the user something about the cache, in a way that cannot fail the build that is running.
+
+    The cache is an optimisation: a build that compiled fine must not fail because the cache did not work. A
+    :class:`~tilefish.errors.TilefishCacheWarning` is a warning, but ``python -W error`` (or ``warnings.simplefilter("error")``, or
+    ``pytest -W error``) makes ``warnings.warn`` *raise* it, from inside ``build``, and so would a ``showwarning`` hook that fails.
+    So the warning is issued where the filters can only turn it into an exception that is caught here, and the message is then logged
+    (``logging.getLogger("tilefish.cache")``, at WARNING) so that it is not lost: the user who asked for warnings to be errors
+    sees the same text in the log, and the build goes on.
+    """
+    try:
+        warnings.warn(message, TilefishCacheWarning, stacklevel=4)
+    except Exception:  # noqa: BLE001 - an "error" filter raises the warning itself, a hook may raise anything: neither fails a build
+        try:
+            _log.warning("%s", message)
+        except Exception:  # noqa: BLE001 - nor does a logging handler that fails
+            pass
 
 
 def cache_directory() -> "pathlib.Path | None":
@@ -100,7 +135,11 @@ def cache_key(
 ) -> str:
     """The key of a build (see the module docstring): ``source`` is ``("source_sha256" | "source_digest", value)``;
     ``values`` are the module constants the kernel reads, as the process holds them (:func:`tilefish._source.values_read`)."""
+    from . import __version__
+
     doc = {
+        "recipe": CACHE_RECIPE,
+        "tilefish": __version__,
         "declaration_digest": spec.declaration_digest,
         "spec": spec._fingerprint(),
         "source": list(source),
@@ -254,7 +293,7 @@ class BuildCache:
         except (FileNotFoundError, NotADirectoryError):
             return None
         except OSError as e:
-            warnings.warn(f"cannot read the tilefish build cache entry {str(path)!r} ({e}); building instead", TilefishCacheWarning, stacklevel=3)
+            _warn(f"cannot read the tilefish build cache entry {str(path)!r} ({e}); building instead")
             return None
         try:
             return decode(
@@ -268,10 +307,12 @@ class BuildCache:
                 source_digest=source_digest,
             )
         except _Invalid as e:
-            warnings.warn(
-                f"the tilefish build cache entry {str(path)!r} is corrupt or stale ({e}); it is not used, and the kernel is built again",
-                TilefishCacheWarning,
-                stacklevel=3,
+            _warn(f"the tilefish build cache entry {str(path)!r} is corrupt or stale ({e}); it is not used, and the kernel is built again")
+            return None
+        except Exception as e:  # noqa: BLE001 - whatever a damaged entry makes the checks raise: it is a miss, never a failed build
+            _warn(
+                f"the tilefish build cache entry {str(path)!r} could not be checked ({type(e).__name__}: {e}); it is not used, "
+                "and the kernel is built again"
             )
             return None
 
@@ -282,14 +323,12 @@ class BuildCache:
             path.parent.mkdir(parents=True, exist_ok=True)
             write_file(path, encode(key, built))
             return True
-        except (OSError, TilefishBuildError) as e:
+        except Exception as e:  # noqa: BLE001 - a directory that cannot be written, or an entry that cannot be made: the build is done
             if str(self.directory) not in _warned_writes:
                 _warned_writes.add(str(self.directory))
-                warnings.warn(
-                    f"cannot write the tilefish build cache in {str(self.directory)!r} ({e}); builds are not cached there "
-                    f"(set {ENV_DIR} to a writable directory, or to an empty value to switch the cache off)",
-                    TilefishCacheWarning,
-                    stacklevel=3,
+                _warn(
+                    f"cannot write the tilefish build cache in {str(self.directory)!r} ({type(e).__name__}: {e}); builds are not "
+                    f"cached there (set {ENV_DIR} to a writable directory, or to an empty value to switch the cache off)"
                 )
             return False
 

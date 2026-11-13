@@ -10,12 +10,15 @@ import hashlib
 import importlib
 import json
 import linecache
+import logging
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import threading
+import types
 import warnings
 
 import fake_compile
@@ -851,3 +854,270 @@ def test_a_generated_kernel_is_told_by_its_name_and_the_sha256_of_its_source(wor
         build(spec1, arch="sm_90", fn=runtime.load_lowered(other_body))
     assert compiler.count == 0 and entries() == []
     assert build(spec1, arch="sm_90", fn=runtime.load_lowered(low1)).spec is spec1 and compiler.count == 1
+
+
+# -- warnings that are errors must not fail a build that compiled fine ------------------------------------------------------------------------
+
+
+@pytest.fixture
+def warnings_are_errors():
+    """``python -W error``: every warning raised from where it is issued (a TilefishCacheWarning included)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        yield
+
+
+def cache_messages(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == "tilefish.cache" and r.levelno == logging.WARNING]
+
+
+@pytest.mark.parametrize("label, corrupt, why", CORRUPTIONS[:6], ids=[c[0] for c in CORRUPTIONS[:6]])
+def test_a_corrupt_entry_under_w_error_is_a_miss_and_the_build_succeeds_and_the_message_is_logged(world, label, corrupt, why, caplog):
+    project, compiler = world
+    kernel = project.load()
+    good = build(SPEC, arch="sm_90", fn=kernel)
+    (path,) = entries()
+    corrupt(path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with caplog.at_level(logging.WARNING, logger="tilefish.cache"):
+            rebuilt = build(SPEC, arch="sm_90", fn=kernel)  # raised TilefishCacheWarning here, after the compile
+    assert compiler.count == 2 and rebuilt.sha256_code == good.sha256_code
+    messages = cache_messages(caplog)
+    assert len(messages) == 1 and str(path) in messages[0] and "corrupt or stale" in messages[0] and why in messages[0]
+
+
+def test_an_unreadable_entry_and_an_unwritable_directory_under_w_error_never_fail_a_build(world, tmp_path, monkeypatch, caplog, warnings_are_errors):
+    project, compiler = world
+    kernel = project.load()
+    with caplog.at_level(logging.WARNING, logger="tilefish.cache"):
+        build(SPEC, arch="sm_90", fn=kernel)
+        (path,) = entries()
+        path.unlink()
+        path.mkdir()  # a directory where the entry should be
+        build(SPEC, arch="sm_90", fn=kernel)  # cannot read it, cannot write it
+        blocked = tmp_path / "blocked"
+        blocked.write_text("a file where the cache directory should be")
+        monkeypatch.setenv("TILEFISH_CACHE_DIR", str(blocked))
+        build(SPEC, arch="sm_90", fn=kernel)  # cannot write the directory
+    assert compiler.count == 3
+    text = "\n".join(cache_messages(caplog))
+    assert "cannot read the tilefish build cache entry" in text and "cannot write the tilefish build cache" in text
+
+
+def test_something_unexpected_that_checking_an_entry_raises_is_a_miss_not_a_failed_build(world, monkeypatch, caplog):
+    project, compiler = world
+    kernel = project.load()
+    build(SPEC, arch="sm_90", fn=kernel)
+
+    def boom(*args, **kwargs):
+        raise ValueError("a bug in how an entry is read")
+
+    monkeypatch.setattr(_cache, "decode", boom)
+    with pytest.warns(TilefishCacheWarning, match=r"could not be checked \(ValueError: a bug in how an entry is read\)"):
+        build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 2
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with caplog.at_level(logging.WARNING, logger="tilefish.cache"):
+            build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 3 and "could not be checked" in "".join(cache_messages(caplog))
+
+
+def test_something_unexpected_that_writing_an_entry_raises_is_a_warning_not_a_failed_build(world, monkeypatch, tmp_path):
+    project, compiler = world
+    kernel = project.load()
+
+    def boom(key, built):
+        raise TypeError("a bug in how an entry is made")
+
+    monkeypatch.setattr(_cache, "encode", boom)
+    monkeypatch.setenv("TILEFISH_CACHE_DIR", str(tmp_path / "other-cache"))
+    with pytest.warns(TilefishCacheWarning, match=r"cannot write the tilefish build cache .*TypeError: a bug in how an entry is made"):
+        built = build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 1 and built.cubin
+
+
+def test_a_warnings_hook_that_fails_does_not_fail_a_build_either(world, monkeypatch, caplog):
+    project, compiler = world
+    kernel = project.load()
+    build(SPEC, arch="sm_90", fn=kernel)
+    (path,) = entries()
+    path.write_bytes(b"")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the hook is broken")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        monkeypatch.setattr(warnings, "showwarning", broken)
+        with caplog.at_level(logging.WARNING, logger="tilefish.cache"):
+            build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 2 and "corrupt or stale" in "".join(cache_messages(caplog))
+
+
+def test_the_warning_is_still_a_warning_with_the_default_filters_and_points_at_the_caller_of_build(world):
+    project, compiler = world
+    kernel = project.load()
+    build(SPEC, arch="sm_90", fn=kernel)
+    (path,) = entries()
+    path.write_bytes(b"")
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        build(SPEC, arch="sm_90", fn=kernel)
+    cache = [w for w in seen if issubclass(w.category, TilefishCacheWarning)]
+    assert len(cache) == 1 and pathlib.Path(cache[0].filename).name == "test_build_cache.py"  # where build was called from, not the cache
+
+
+def test_a_logger_that_fails_is_not_a_failed_build_either(world, monkeypatch):
+    project, compiler = world
+    kernel = project.load()
+    build(SPEC, arch="sm_90", fn=kernel)
+    (path,) = entries()
+    path.write_bytes(b"")
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the log is broken")
+
+    monkeypatch.setattr(_cache._log, "warning", broken)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 2
+
+
+# -- the key: every input of it is one, the recipe and the version too ---------------------------------------------------------------------------
+
+
+def key_of(**changes):
+    """``cache_key`` with every input given, and the ones in ``changes`` different. The spec is anything with a digest and a fingerprint."""
+    inputs = dict(
+        spec=types.SimpleNamespace(declaration_digest="d" * 64, _fingerprint=lambda: {"signature": ["a"]}),
+        arch=90,
+        source=("source_digest", "s" * 64),
+        triton_version="3.5.1",
+        ptxas_version="12.9",
+        options={"num_warps": 4},
+        environment={"TRITON_X": "1"},
+        values={"cfg.SCALE": "2.0"},
+    )
+    inputs.update(changes)
+    return _cache.cache_key(**inputs)
+
+
+def spec_of(digest="d" * 64, fingerprint=None):
+    return types.SimpleNamespace(declaration_digest=digest, _fingerprint=lambda: fingerprint or {"signature": ["a"]})
+
+
+KEY_INPUTS = [
+    ("the declaration digest", dict(spec=spec_of(digest="e" * 64))),
+    ("the fingerprint of the spec", dict(spec=spec_of(fingerprint={"signature": ["b"]}))),
+    ("the identity of the source", dict(source=("source_digest", "t" * 64))),
+    ("the kind of the identity of the source", dict(source=("source_sha256", "s" * 64))),
+    ("the architecture", dict(arch=100)),
+    ("the Triton version", dict(triton_version="3.6.0")),
+    ("the ptxas version", dict(ptxas_version="13.0")),
+    ("the compile options", dict(options={"num_warps": 8})),
+    ("an option that is not set and one that is", dict(options={"num_warps": 4, "enable_fp_fusion": False})),
+    ("the environment Triton reads", dict(environment={"TRITON_X": "2"})),
+    ("an environment variable that is not there", dict(environment={})),
+    ("a value the kernel reads", dict(values={"cfg.SCALE": "3.0"})),
+    ("a value the kernel reads that is not there", dict(values={})),
+]
+
+
+@pytest.mark.parametrize("label, changed", KEY_INPUTS, ids=[k[0] for k in KEY_INPUTS])
+def test_every_input_of_the_key_is_part_of_it(label, changed):
+    assert key_of() == key_of()  # and the same inputs are the same key
+    assert key_of(**changed) != key_of()
+    assert re.fullmatch(r"[0-9a-f]{64}", key_of(**changed))
+
+
+def test_the_declaration_digest_and_the_fingerprint_are_each_enough_to_make_another_key():
+    """Neither stands in for the other: the digest is of the declaration, the fingerprint of what feeds ``triton.compile``."""
+    base = key_of()
+    assert key_of(spec=spec_of(digest="e" * 64)) != base  # another declaration, the same fingerprint
+    assert key_of(spec=spec_of(fingerprint={"signature": ["a"], "grid": "(1,)"})) != base  # another fingerprint, the same declaration
+    assert key_of(spec=spec_of(digest="e" * 64)) != key_of(spec=spec_of(fingerprint={"signature": ["a"], "grid": "(1,)"}))
+
+
+def test_the_key_names_its_inputs_so_that_two_of_them_cannot_be_swapped():
+    assert key_of(arch=90, triton_version="3.5.1", ptxas_version="12.9") != key_of(arch=90, triton_version="12.9", ptxas_version="3.5.1")
+    assert key_of(options={"a": 1}, environment={"b": "2"}) != key_of(options={"b": "2"}, environment={"a": 1})
+
+
+def test_the_cache_recipe_and_the_version_of_tilefish_are_part_of_the_key(monkeypatch):
+    base = key_of()
+    monkeypatch.setattr(_cache, "CACHE_RECIPE", _cache.CACHE_RECIPE + 1)
+    bumped = key_of()
+    assert bumped != base  # a change of what goes into a binary: nothing made by the old recipe is served
+    monkeypatch.setattr(tilefish, "__version__", "99.0.0")
+    released = key_of()
+    assert released != bumped and released != base  # a release, whether or not anyone remembered to bump the recipe
+    monkeypatch.setattr(_cache, "CACHE_RECIPE", _cache.CACHE_RECIPE - 1)
+    assert key_of() != base and key_of() != released  # each alone makes another key
+
+
+def test_an_entry_of_another_recipe_or_version_is_not_found_and_is_not_a_warning(world, monkeypatch):
+    project, compiler = world
+    kernel = project.load()
+    first = build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 1 and len(entries()) == 1
+    context = quiet()  # not a corrupt entry: nobody looks for it under the new key
+    try:
+        monkeypatch.setattr(_cache, "CACHE_RECIPE", _cache.CACHE_RECIPE + 1)
+        second = build(SPEC, arch="sm_90", fn=kernel)
+        monkeypatch.setattr(tilefish, "__version__", "99.0.0")
+        third = build(SPEC, arch="sm_90", fn=kernel)
+    finally:
+        context.__exit__(None, None, None)
+    assert compiler.count == 3 and len(entries()) == 3  # each recipe and each version has its own entry
+    assert first.sha256_code == second.sha256_code == third.sha256_code  # (the same source and values: the same code)
+
+
+# -- the lines a function was imported from are checked by build ----------------------------------------------------------------------------
+
+
+def exec_module(path, name):
+    """Import ``path`` the way no loader does (``exec`` of its text): the import watch has no record of it, so only the lines can tell."""
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    linecache.clearcache()
+    exec(compile(path.read_text(), str(path), "exec"), module.__dict__)
+    sys.modules[name] = module
+    return module
+
+
+def test_build_refuses_a_hand_written_kernel_whose_file_changed_under_the_function_it_holds(world):
+    project, compiler = world
+    project.write("cil_kernel", "from fake_jit import jit\n\n\n@jit\ndef kernel(x_ptr, y_ptr, n_elem, BLOCK):\n    return (BLOCK * 2.0, n_elem)\n")
+    try:
+        kernel = exec_module(project.path("cil_kernel"), "cil_kernel").kernel
+        spec = extern_of("cil_kernel:kernel")
+        project.edit("cil_kernel", "BLOCK * 2.0", "BLOCK * 3.0")  # the process holds the 2.0, the file says 3.0, and no record of the module exists
+        linecache.clearcache()
+        with pytest.raises(TilefishBuildError, match=r"the Triton function 'kernel' was imported from an older version of '.*cil_kernel.py': its lines 4-6 are not what the file has now"):
+            build(spec, arch="sm_90", fn=kernel)
+        assert compiler.count == 0 and entries() == []  # nothing was compiled, and no entry holds a digest of the edited file
+        build(spec, arch="sm_90", fn=exec_module(project.path("cil_kernel"), "cil_kernel").kernel)  # imported again: the process holds the file
+        assert compiler.count == 1
+    finally:
+        sys.modules.pop("cil_kernel", None)
+
+
+def test_build_refuses_a_generated_kernel_whose_file_changed_under_the_function_it_holds(world, tmp_path):
+    _, compiler = world
+    old, new = scale_kernel(2.0).lower(), scale_kernel(3.0).lower()
+    (spec_new,) = new.specs()
+    src = tmp_path / "gen"
+    path = old.write(src)
+    try:
+        held = getattr(exec_module(path, "gen_held"), new.fn_name)  # the function of the old source
+        new.write(src)  # the file is the source the spec is for now: its sha256 is the spec's, so only the lines tell
+        linecache.clearcache()
+        assert _source.file_sha256(str(path)) == spec_new.source_sha256
+        with pytest.raises(TilefishBuildError, match=r"was imported from an older version of"):
+            build(spec_new, arch="sm_90", fn=held)
+        assert compiler.count == 0 and entries() == []
+    finally:
+        sys.modules.pop("gen_held", None)
