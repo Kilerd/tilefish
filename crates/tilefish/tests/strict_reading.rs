@@ -126,10 +126,10 @@ fn what_is_not_strict_json_is_refused() {
         ("NaN", "\"shared\": 16", "\"shared\": NaN"),
         ("Infinity", "\"shared\": 16", "\"shared\": Infinity"),
         ("a number that does not fit a float", "\"num_stages\": 3", "\"num_stages\": 1e999"),
-        ("a trailing comma", "\"schema\": 2,", "\"schema\": 2,,"),
+        ("a trailing comma", "\"schema\": 3,", "\"schema\": 3,,"),
         ("a leading zero", "\"num_stages\": 3", "\"num_stages\": 03"),
         ("a lone surrogate", "\"op\": \"softmax\"", "\"op\": \"soft\\ud800max\""),
-        ("a single quote", "\"schema\": 2", "'schema': 2"),
+        ("a single quote", "\"schema\": 3", "'schema': 3"),
     ];
     for (what, from, to) in cases {
         let copy = Copy::of("sm_103");
@@ -139,7 +139,7 @@ fn what_is_not_strict_json_is_refused() {
     }
     // every kind of repeated key, not only in an entry
     let copy = Copy::of("sm_103");
-    copy.edit("\"schema\": 2,", "\"schema\": 2, \"schema\": 2,");
+    copy.edit("\"schema\": 3,", "\"schema\": 3, \"schema\": 3,");
     assert!(refused(&copy).contains("twice"));
     let copy = Copy::of("sm_103");
     copy.edit("\"slot\": 0,", "\"slot\": 0, \"slot\": 0,");
@@ -165,20 +165,20 @@ fn an_unknown_key_a_missing_key_and_a_wrong_type_are_refused() {
             "\"stem\": \"softmax\", \"extra\": 1,",
             "unknown field",
         ),
-        ("an unknown top-level key", "\"schema\": 2,", "\"schema\": 2, \"surprise\": true,", "unknown field"),
+        ("an unknown top-level key", "\"schema\": 3,", "\"schema\": 3, \"surprise\": true,", "unknown field"),
         ("an unknown key in the ABI", "\"slot\": 0,", "\"slot\": 0, \"align\": 8,", "unknown field"),
         ("a missing key", "\"symbol\": \"tf_softmax\",", "", "missing field"),
         ("shared as a string", "\"shared\": 16", "\"shared\": \"16\"", "invalid type"),
         ("num_warps as a float", "\"num_warps\": 4,", "\"num_warps\": 4.0,", "invalid type"),
         ("a bool where an int is", "\"num_stages\": 3", "\"num_stages\": true", "invalid type"),
         ("a negative size", "\"shared\": 16", "\"shared\": -16", "invalid value"),
-        ("the schema as another number", "\"schema\": 2,", "\"schema\": 3,", "schema"),
-        // 2.0 is 2 to Python's `==`: both hosts refuse it, only the integer 2 is a schema
-        ("the schema as 2.0", "\"schema\": 2,", "\"schema\": 2.0,", "schema"),
-        ("the schema as 2e0", "\"schema\": 2,", "\"schema\": 2e0,", "schema"),
-        ("the schema as a string", "\"schema\": 2,", "\"schema\": \"2\",", "schema"),
-        ("the schema as true", "\"schema\": 2,", "\"schema\": true,", "schema"),
-        ("the schema as a list", "\"schema\": 2,", "\"schema\": [2],", "schema"),
+        ("the schema as another number", "\"schema\": 3,", "\"schema\": 4,", "schema"),
+        // 3.0 is 3 to Python's `==`: both hosts refuse it, only the integer 3 is a schema
+        ("the schema as 3.0", "\"schema\": 3,", "\"schema\": 3.0,", "schema"),
+        ("the schema as 3e0", "\"schema\": 3,", "\"schema\": 3e0,", "schema"),
+        ("the schema as a string", "\"schema\": 3,", "\"schema\": \"3\",", "schema"),
+        ("the schema as true", "\"schema\": 3,", "\"schema\": true,", "schema"),
+        ("the schema as a list", "\"schema\": 3,", "\"schema\": [3],", "schema"),
         (
             "an unknown compile option",
             "\"num_stages\": 3\n      },\n      \"declaration_digest\"",
@@ -376,15 +376,41 @@ fn buckets_are_exact() {
 }
 
 #[test]
-fn a_manifest_of_the_schema_before_the_shapes_is_refused_with_a_request_to_export_it_again() {
+fn a_manifest_of_an_older_schema_is_refused_with_a_request_to_export_it_again() {
+    for older in [1, 2] {
+        let copy = Copy::of("sm_103");
+        copy.edit("\"schema\": 3,", &format!("\"schema\": {older},"));
+        let message = refused(&copy);
+        assert!(
+            message.contains(&format!("schema {older}"))
+                && message.contains("older tilefish")
+                && message.contains("Export it again"),
+            "{message}"
+        );
+    }
+    // a real schema 2 manifest has no `library` and no `kind`: it is told to export again, not that a field is missing
     let copy = Copy::of("sm_103");
-    copy.edit("\"schema\": 2,", "\"schema\": 1,");
+    copy.edit_json(|doc| {
+        doc["schema"] = 2.into();
+        doc.as_object_mut().unwrap().remove("library");
+        for k in doc["kernels"].as_array_mut().unwrap() {
+            k.as_object_mut().unwrap().remove("kind");
+            k["abi"].as_object_mut().unwrap().remove("scratch_slots");
+        }
+    });
     let message = refused(&copy);
-    assert!(
-        message.contains("schema 1") && message.contains("older tilefish") && message.contains("export it again"),
-        "{message}"
-    );
-    // and an entry of schema 1 has neither shapes nor dims: a schema 2 manifest without them is not read either
+    assert!(message.contains("schema 2") && message.contains("Export it again"), "{message}");
+    // an integer that is not an older schema (0, negative, 2.0, true) is not a manifest of schema 3, and is not told to export again
+    for not_older in ["0", "-1", "2.0", "true", "\"2\"", "null"] {
+        let copy = Copy::of("sm_103");
+        copy.edit("\"schema\": 3,", &format!("\"schema\": {not_older},"));
+        let message = refused(&copy);
+        assert!(
+            !message.contains("older tilefish") && message.contains("not a tilefish manifest of schema 3"),
+            "{not_older}: {message}"
+        );
+    }
+    // and an entry without its shapes or dims is not read either
     for what in ["dims", "shape"] {
         let copy = Copy::of("sm_103");
         copy.edit_json(|doc| {

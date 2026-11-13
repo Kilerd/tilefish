@@ -21,6 +21,14 @@ pub enum PreconditionKind {
     Bucket,
     /// A tensor has more elements than the 32-bit offsets of a generated kernel reach.
     MaxElements,
+    /// A strided view reaches further than the 32-bit offsets of a kernel that indexes with `i32` (its *extent*, one more than the largest
+    /// element offset, is more than `2**31 - 1`).
+    MaxExtent,
+    /// A view has a stride a binary cannot take: the axis the kernel loads along is not unit stride, or a stride does not fit the
+    /// integer the binary takes it as. (Python's `stride`; a negative stride is not representable here: strides are unsigned.)
+    Stride,
+    /// A tensor that is not contiguous (row-major with no gaps) is given for a parameter that is not declared strided.
+    Contiguous,
     /// A tensor that is written in place overlaps another argument.
     Alias,
     /// The tensors are not all on the device the kernel was loaded on, nor in the context it was loaded in.
@@ -42,6 +50,9 @@ impl PreconditionKind {
             Self::Divisible => "divisible",
             Self::Bucket => "bucket",
             Self::MaxElements => "max_elements",
+            Self::MaxExtent => "max_extent",
+            Self::Stride => "stride",
+            Self::Contiguous => "contiguous",
             Self::Alias => "alias",
             Self::Device => "device",
             Self::Access => "access",
@@ -108,6 +119,14 @@ pub enum Error {
     /// the signature determines and the call also gives).
     #[error("{0}")]
     Launch(String),
+    /// A cuBLASLt call failed: the call and the `cublasStatus_t` it returned.
+    #[error("cuBLASLt call {call} failed: {status}")]
+    Cublas {
+        /// The function of cuBLASLt.
+        call: &'static str,
+        /// The status it returned (cudarc's `CublasError`, as text).
+        status: String,
+    },
     /// A CUDA driver call failed: cudarc's `DriverError`, which is the `CUresult` with the name and the text the driver gives it.
     #[error("CUDA driver call {call} failed: {source}")]
     Driver {
@@ -126,6 +145,11 @@ impl Error {
     /// The error of a driver call, for `map_err`: `ctx.attribute(..).map_err(Error::driver("cuDeviceGetAttribute"))`.
     pub(crate) fn driver(call: &'static str) -> impl FnOnce(cudarc::driver::DriverError) -> Self {
         move |source| Self::Driver { call, source }
+    }
+
+    /// The error of a cuBLASLt call, for `map_err`.
+    pub(crate) fn cublas(call: &'static str) -> impl FnOnce(cudarc::cublaslt::result::CublasError) -> Self {
+        move |source| Self::Cublas { call, status: format!("{:?}", source.0) }
     }
 
     pub(crate) fn manifest(message: impl Into<String>) -> Self {

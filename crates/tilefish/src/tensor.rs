@@ -6,8 +6,10 @@
 //! region of device memory that the host vouches for (a [`DevicePtr`]: an address, the bytes, the device, and a lifetime; `new`,
 //! which needs `unsafe` to make the region, and nothing tracks it). [`TensorRef`] (read only) and [`TensorMut`] (written by the
 //! kernel: `Out` and `InOut`) carry the element type in their type, so a generated launcher cannot be given a `bf16` tensor where
-//! it wants `f32`. They are contiguous row-major tensors: the binaries take no strides. A tensor borrows what it is made of, for
-//! as long as it lives, and what it turns into for a launch ([`TensorArg`]) does too.
+//! it wants `f32`. A tensor is a contiguous row-major tensor, or (`from_cuda_strided`, `new_strided`) a *view*: a shape, element strides and
+//! the element offset of its first element from the start of its memory, for a parameter the manifest declares strided (`Strided[...]`
+//! in Python); the view must fit its memory (its *extent*, one more than the largest element offset it reaches, from its first element on).
+//! A tensor borrows what it is made of, for as long as it lives, and what it turns into for a launch ([`TensorArg`]) does too.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -128,25 +130,57 @@ elements! {
     E5m2 => E5m2,
 }
 
-/// The bytes a tensor of `dtype` and `shape` covers (`None` when they do not fit 64 bits).
-fn bytes_of(shape: &[usize], dtype: DType) -> Option<u64> {
-    let numel = shape.iter().try_fold(1u128, |acc, d| acc.checked_mul(*d as u128))?;
-    u64::try_from(numel.checked_mul(dtype.size() as u128)?).ok()
+/// How many elements a tensor reaches from its first one: the number of elements of a dense tensor, and for a view its *extent*, one more
+/// than the largest element offset (`1 + sum((size - 1) * stride)`; 0 when a size is 0). Saturating: a number that does not fit is far
+/// more than any memory has.
+pub(crate) fn reach(shape: &[usize], strides: Option<&[usize]>) -> u128 {
+    if shape.contains(&0) {
+        return 0;
+    }
+    match strides {
+        None => shape.iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128)),
+        Some(strides) => shape
+            .iter()
+            .zip(strides)
+            .fold(1u128, |acc, (n, s)| acc.saturating_add((*n as u128 - 1).saturating_mul(*s as u128))),
+    }
+}
+
+/// The bytes from the start of the memory to the end of the last element a tensor reaches (`None` when they do not fit 64 bits).
+fn bytes_of(shape: &[usize], strides: Option<&[usize]>, offset: usize, dtype: DType) -> Option<u64> {
+    let elements = (offset as u128).checked_add(reach(shape, strides))?;
+    u64::try_from(elements.checked_mul(dtype.size() as u128)?).ok()
 }
 
 /// The error of a tensor that needs more bytes than its memory has.
-fn too_big(shape: &[usize], dtype: DType, len_bytes: u64) -> Error {
-    Error::Launch(format!(
-        "a tensor of shape {shape:?} and dtype {} needs {} bytes, but its region has {len_bytes} bytes",
-        dtype.name(),
-        bytes_of(shape, dtype).map_or_else(|| "more than 2^64".to_owned(), |b| b.to_string()),
-    ))
+fn too_big(shape: &[usize], strides: Option<&[usize]>, offset: usize, dtype: DType, len_bytes: u64) -> Error {
+    let needed = bytes_of(shape, strides, offset, dtype).map_or_else(|| "more than 2^64".to_owned(), |b| b.to_string());
+    match strides {
+        None => Error::Launch(format!(
+            "a tensor of shape {shape:?} and dtype {} needs {needed} bytes, but its region has {len_bytes} bytes",
+            dtype.name()
+        )),
+        Some(strides) => Error::Launch(format!(
+            "a view of shape {shape:?} and strides {strides:?}, whose first element is element {offset} of its region (dtype {}), reaches {needed} bytes \
+             from the start of its region, but the region has {len_bytes} bytes",
+            dtype.name()
+        )),
+    }
 }
 
-fn check_fits(shape: &[usize], dtype: DType, len_bytes: u64) -> Result<()> {
-    match bytes_of(shape, dtype) {
+fn check_fits(shape: &[usize], strides: Option<&[usize]>, offset: usize, dtype: DType, len_bytes: u64) -> Result<()> {
+    if let Some(strides) = strides
+        && strides.len() != shape.len()
+    {
+        return Err(Error::Launch(format!(
+            "a view needs one stride per axis: the shape {shape:?} has {} axes, the strides {strides:?} have {}",
+            shape.len(),
+            strides.len()
+        )));
+    }
+    match bytes_of(shape, strides, offset, dtype) {
         Some(needed) if needed <= len_bytes => Ok(()),
-        _ => Err(too_big(shape, dtype, len_bytes)),
+        _ => Err(too_big(shape, strides, offset, dtype, len_bytes)),
     }
 }
 
@@ -167,8 +201,14 @@ pub(crate) enum Backing<'a> {
 /// lifetime was bound), it is used once (it is not `Copy` or `Clone`: it may hold the exclusive borrow of a slice that is written),
 /// and it says what the kernel may do to it ([`Access`]), which a launch checks against the parameter it is given for.
 pub struct TensorArg<'a> {
+    /// The address of the first element (for a view, `base + offset * itemsize`).
     pub(crate) ptr: u64,
     pub(crate) shape: &'a [usize],
+    /// The element strides of a view; `None` is a dense, row-major tensor.
+    pub(crate) strides: Option<&'a [usize]>,
+    /// Bytes from the start of the cudarc slice to the first element (0 unless it is a view): the launch hands cudarc a view of the bytes
+    /// from there, so that the kernel is given this tensor's address and cudarc still tracks the slice.
+    pub(crate) byte_offset: u64,
     pub(crate) dtype: DType,
     pub(crate) device: i32,
     /// The `CUcontext` the memory was allocated in, when it is known (it is for cudarc memory): a tensor of another context on the
@@ -186,6 +226,7 @@ impl std::fmt::Debug for TensorArg<'_> {
         f.debug_struct("TensorArg")
             .field("addr", &format_args!("{:#x}", self.ptr))
             .field("shape", &self.shape)
+            .field("strides", &self.strides)
             .field("dtype", &self.dtype)
             .field("device", &self.device)
             .field("access", &self.access)
@@ -208,10 +249,48 @@ impl<'a> TensorArg<'a> {
     ///
     /// Refused when the shape needs more bytes than the region has: a launch can then never touch memory the host did not vouch for.
     pub fn new(ptr: DevicePtr<'a>, shape: &'a [usize], dtype: DType, access: Access) -> Result<Self> {
-        check_fits(shape, dtype, ptr.len_bytes())?;
+        check_fits(shape, None, 0, dtype, ptr.len_bytes())?;
         Ok(Self {
             ptr: ptr.addr(),
             shape,
+            strides: None,
+            byte_offset: 0,
+            dtype,
+            device: ptr.device(),
+            context: None,
+            owner: None,
+            access,
+            backing: Backing::Raw,
+        })
+    }
+
+    /// A view of `dtype` and `shape` with element `strides` in the region `ptr`, whose first element is element `offset` of the region
+    /// (the address of the view is `ptr + offset * itemsize`): for a parameter the manifest declares strided. A tensor made with
+    /// [`TensorArg::new`] is the view with the dense row-major strides.
+    ///
+    /// Refused when the view reaches further than the region: the view's extent (one more than the largest element offset it reaches, which
+    /// a stride of 0, as of an expanded view, does not add to) counted from its first element must fit the bytes the region has, so a
+    /// launch can never touch memory the host did not vouch for. The strides are unsigned: a view that walks backwards is not
+    /// representable.
+    pub fn new_strided(
+        ptr: DevicePtr<'a>,
+        shape: &'a [usize],
+        strides: &'a [usize],
+        offset: usize,
+        dtype: DType,
+        access: Access,
+    ) -> Result<Self> {
+        check_fits(shape, Some(strides), offset, dtype, ptr.len_bytes())?;
+        let byte_offset = byte_offset_of(offset, dtype, ptr.len_bytes())?;
+        let addr = ptr
+            .addr()
+            .checked_add(byte_offset)
+            .ok_or_else(|| Error::Launch("an offset past the end of the address space".to_owned()))?;
+        Ok(Self {
+            ptr: addr,
+            shape,
+            strides: Some(strides),
+            byte_offset: 0, // a region has nothing cudarc tracks: the address is all
             dtype,
             device: ptr.device(),
             context: None,
@@ -229,6 +308,11 @@ impl<'a> TensorArg<'a> {
     /// The shape.
     pub fn shape(&self) -> &'a [usize] {
         self.shape
+    }
+
+    /// The element strides of a view (`None`: a dense, row-major tensor).
+    pub fn strides(&self) -> Option<&'a [usize]> {
+        self.strides
     }
 
     /// The element type.
@@ -273,6 +357,17 @@ macro_rules! tensor_type {
                 Ok(Self { arg: TensorArg::new(ptr, shape, T::DTYPE, $access)?, _marker: PhantomData })
             }
 
+            /// A view of `shape` with element `strides` in the region `ptr`, whose first element is element `offset` of the region (see
+            /// [`TensorArg::new_strided`]): refused when it reaches further than the region.
+            pub fn new_strided(
+                ptr: DevicePtr<'a>,
+                shape: &'a [usize],
+                strides: &'a [usize],
+                offset: usize,
+            ) -> Result<Self> {
+                Ok(Self { arg: TensorArg::new_strided(ptr, shape, strides, offset, T::DTYPE, $access)?, _marker: PhantomData })
+            }
+
             /// The device address, a plain number: it cannot be turned back into a tensor without `unsafe`
             /// ([`DevicePtr::from_raw`]).
             pub fn addr(&self) -> u64 {
@@ -282,6 +377,11 @@ macro_rules! tensor_type {
             /// The shape.
             pub fn shape(&self) -> &'a [usize] {
                 self.arg.shape
+            }
+
+            /// The element strides of a view (`None`: a dense, row-major tensor).
+            pub fn strides(&self) -> Option<&'a [usize]> {
+                self.arg.strides
             }
 
             /// The device ordinal.
@@ -320,11 +420,45 @@ impl<'a, T: Element> TensorRef<'a, T> {
     /// the slice (it only waits, on the slice's own stream, for the slice's last write), and a launch gives the slice to cudarc as a
     /// read, on the stream it launches on, and makes the slice's own stream wait for the kernel.
     pub fn from_cuda<S: CudaRead + 'a>(slice: &'a S, shape: &'a [usize]) -> Result<Self> {
+        Self::over(slice, shape, None, 0)
+    }
+
+    /// A view over a cudarc `CudaSlice` or `CudaView`: `shape`, element `strides`, and the element `offset` of its first element from the
+    /// start of the slice (the kernel is given the address `slice + offset * itemsize`). For a parameter the manifest declares strided
+    /// (`Strided[...]` in Python); any element strides and any offset are accepted by the tensor, a launch checks them against the
+    /// parameter (a stride that the binary fixes, the alignment it was compiled for, the extent it indexes with `i32`).
+    ///
+    /// Refused when the view reaches further than the slice (its extent, counted from its first element, must fit) and when the strides do
+    /// not have one entry per axis. The view may start at any byte (a `bf16` view of a `CudaSlice<f32>` may start at an odd element).
+    /// Everything else is as for [`TensorRef::from_cuda`]: the tensor borrows the slice, records nothing on it, and a launch hands cudarc the
+    /// slice's bytes from the first element on, on the stream it launches on, so cudarc's ordering of the slice is what it is for a dense
+    /// tensor.
+    pub fn from_cuda_strided<S: CudaRead + 'a>(
+        slice: &'a S,
+        shape: &'a [usize],
+        strides: &'a [usize],
+        offset: usize,
+    ) -> Result<Self> {
+        Self::over(slice, shape, Some(strides), offset)
+    }
+
+    fn over<S: CudaRead + 'a>(
+        slice: &'a S,
+        shape: &'a [usize],
+        strides: Option<&'a [usize]>,
+        offset: usize,
+    ) -> Result<Self> {
         let region = sealed::Memory::region(slice);
-        check_fits(shape, T::DTYPE, region.len_bytes)?;
+        check_fits(shape, strides, offset, T::DTYPE, region.len_bytes)?;
+        let byte_offset = byte_offset_of(offset, T::DTYPE, region.len_bytes)?;
+        if byte_offset != 0 && slice.bytes_from(byte_offset).is_none() {
+            return Err(unaligned_view(offset, byte_offset));
+        }
         let arg = TensorArg {
-            ptr: region.addr,
+            ptr: region.addr + byte_offset,
             shape,
+            strides,
+            byte_offset,
             dtype: T::DTYPE,
             device: region.ordinal,
             context: Some(region.context),
@@ -340,11 +474,37 @@ impl<'a, T: Element> TensorMut<'a, T> {
     /// A tensor over a cudarc `CudaSlice` or `CudaViewMut` that the kernel writes; see [`TensorRef::from_cuda`]. It holds the
     /// exclusive borrow of the slice, and a launch gives the slice to cudarc as a write.
     pub fn from_cuda<S: CudaWrite + 'a>(slice: &'a mut S, shape: &'a [usize]) -> Result<Self> {
+        Self::over(slice, shape, None, 0)
+    }
+
+    /// A view over a cudarc `CudaSlice` or `CudaViewMut` that the kernel writes: see [`TensorRef::from_cuda_strided`]. (The binaries of a
+    /// manifest only take a strided pointer that is read, so a launch refuses it for a parameter that is written and not contiguous.)
+    pub fn from_cuda_strided<S: CudaWrite + 'a>(
+        slice: &'a mut S,
+        shape: &'a [usize],
+        strides: &'a [usize],
+        offset: usize,
+    ) -> Result<Self> {
+        Self::over(slice, shape, Some(strides), offset)
+    }
+
+    fn over<S: CudaWrite + 'a>(
+        slice: &'a mut S,
+        shape: &'a [usize],
+        strides: Option<&'a [usize]>,
+        offset: usize,
+    ) -> Result<Self> {
         let region = sealed::Memory::region(&*slice);
-        check_fits(shape, T::DTYPE, region.len_bytes)?;
+        check_fits(shape, strides, offset, T::DTYPE, region.len_bytes)?;
+        let byte_offset = byte_offset_of(offset, T::DTYPE, region.len_bytes)?;
+        if byte_offset != 0 && slice.bytes_from_mut(byte_offset).is_none() {
+            return Err(unaligned_view(offset, byte_offset));
+        }
         let arg = TensorArg {
-            ptr: region.addr,
+            ptr: region.addr + byte_offset,
             shape,
+            strides,
+            byte_offset,
             dtype: T::DTYPE,
             device: region.ordinal,
             context: Some(region.context),
@@ -354,6 +514,17 @@ impl<'a, T: Element> TensorMut<'a, T> {
         };
         Ok(Self { arg, _marker: PhantomData })
     }
+}
+
+/// The bytes from the start of the slice to a view's first element: `offset` elements of `dtype` (already known to fit `len_bytes`).
+fn byte_offset_of(offset: usize, dtype: DType, len_bytes: u64) -> Result<u64> {
+    (offset as u64).checked_mul(dtype.size() as u64).filter(|b| *b <= len_bytes).ok_or_else(|| {
+        Error::Launch(format!("the element offset {offset} is past the end of a region of {len_bytes} bytes"))
+    })
+}
+
+fn unaligned_view(offset: usize, byte_offset: u64) -> Error {
+    Error::Launch(format!("a view that starts at element {offset} ({byte_offset} bytes) has no bytes in this slice"))
 }
 
 #[cfg(test)]

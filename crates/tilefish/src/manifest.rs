@@ -1,11 +1,14 @@
 //! Reading a manifest directory: the cubins, checked against what the manifest says.
 //!
-//! A port of `python/src/tilefish/_manifest.py` (`Manifest.load`) and of the schema checks of `_specvalid.py`. A
-//! manifest is read as strict JSON (see [`crate::json`]), every field has the type it needs and no key is unknown, and
-//! the entries are checked for being consistent with themselves: the ABI, the preconditions, the buckets, the grid. Then
-//! each cubin is read, and refused unless its `sha256` (the file) and `sha256_code` (the machine code, see
-//! [`crate::elf`]) are the manifest's, it has the code section of the manifest's symbol, and it does not use shared
-//! memory the manifest does not account for.
+//! A port of `python/src/tilefish/_manifest.py` (`Manifest.load`) and of the schema checks of `_specvalid.py`, for manifest schema 3
+//! (`docs/manifest-schema-3.md`). A manifest is read as strict JSON (see [`crate::json`]), every field has the type it needs and no key
+//! is unknown, and the entries are checked for being consistent with themselves: the ABI (pointers, strided views, device scalars,
+//! scalars, `fixed` arguments, scratch slots), the preconditions, the buckets, the grid. Then each cubin is read, and refused unless
+//! its `sha256` (the file) and `sha256_code` (the machine code, see [`crate::elf`]) are the manifest's, it has the code section of
+//! the manifest's symbol, and it is for the architecture the entry says. A Triton kernel that does not use shared memory in the
+//! manifest's account must not have a shared memory section.
+//!
+//! The `library` section (pinned cuBLASLt GEMMs, no files) is read by [`crate::library`].
 //!
 //! **Trust.** The digests sit next to the files they describe, so whoever can write the directory can rewrite both. The
 //! digest of the whole manifest ([`Manifest::digest`], what Python's `Manifest.digest` and `export` return) is what a
@@ -22,23 +25,30 @@ use serde_json::{Map, Value};
 use crate::elf::{Elf, sha256_hex};
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Symbols, parse_expr, parse_grid};
+use crate::gemm::CachedGemm;
 use crate::json::{canonical, parse_strict};
 use crate::kernel::Cached;
+use crate::library::{LibraryEntry, RawLibrary};
 use crate::tensor::DType;
 
-/// The only manifest schema this host reads. Python's `MANIFEST_SCHEMA`. Schema 2 records, for every pointer parameter, its declared
-/// shape, and for every entry the constraints of its named dimensions: all that a host needs to check a launch on its own.
-pub const MANIFEST_SCHEMA: u64 = 2;
+/// The only manifest schema this host reads. Python's `MANIFEST_SCHEMA`. Schema 3 adds to schema 2 (where every pointer records its declared
+/// shape and every entry the constraints of its named dimensions) strided views, device scalars, 64-bit scalars, `fixed` arguments,
+/// prebuilt binaries (`kind: "binary"`) and the `library` section.
+pub const MANIFEST_SCHEMA: u64 = 3;
 /// The file a manifest directory has.
 pub const MANIFEST_NAME: &str = "manifest.json";
 /// Part of what is hashed: another canonical form must change it. Python's `DIGEST_TAG`.
-const DIGEST_TAG: &[u8] = b"tilefish.manifest-digest.v2\0";
-/// The limit of 32-bit offsets, the only bound a `max_elements` precondition carries.
-const MAX_ELEMENTS: u64 = (1 << 31) - 1;
-/// Every pointer of a binary is compiled as this many bytes aligned.
-const ALIGNMENT: u64 = 16;
+const DIGEST_TAG: &[u8] = b"tilefish.manifest-digest.v3\0";
+/// The tag of the digest of any other document than schema 3 (the form of schema 2). Python's `LEGACY_DIGEST_TAG`.
+const LEGACY_DIGEST_TAG: &[u8] = b"tilefish.manifest-digest.v2\0";
+/// The limit of 32-bit offsets, the only bound a `max_elements` or `max_extent` precondition carries.
+pub(crate) const MAX_ELEMENTS: u64 = (1 << 31) - 1;
+/// Every pointer of a binary is compiled as this many bytes aligned (a strided pointer may promise only its element's size).
+pub(crate) const ALIGNMENT: u64 = 16;
 const NUM_WARPS: [u32; 6] = [1, 2, 4, 8, 16, 32];
 const MAX_STAGES: u32 = 16;
+/// The `source_digest_kind` of a prebuilt binary: its `source_digest` is the sha256 of the PTX or cubin file.
+const BINARY_DIGEST_KIND: &str = "tilefish.binary.v1";
 
 /// What vouches for a manifest directory.
 #[derive(Debug, Clone, Copy)]
@@ -103,10 +113,108 @@ pub struct DimInfo {
     pub bucket: Option<u64>,
 }
 
+/// The stride a strided pointer accepts along one axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrideEntry {
+    /// Fixed: 1, the unit stride of the axis the kernel loads along (only ever the last axis).
+    Unit,
+    /// A *stride dimension*, bound from the view's stride (the `dim` of the one scalar that carries it).
+    Dim(String),
+}
+
+/// What a pointer that takes a strided view says (`strides` and `offset` of the ABI, which come together).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct View {
+    /// One entry per axis of the declared shape.
+    pub strides: Vec<StrideEntry>,
+    /// The name of the pointer's *offset dimension* (`<pointer>_offset`): not carried by a scalar, because the pointer passed to the
+    /// kernel is already the address of the view's first element (`base + offset * itemsize`).
+    pub offset: String,
+}
+
+/// The pointer and the axis whose stride a scalar carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrideOf {
+    /// The strided pointer parameter.
+    pub arg: String,
+    /// Its axis.
+    pub axis: usize,
+}
+
+/// The integer a runtime scalar is passed as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarType {
+    /// `i32`, 4 bytes (`0 ..= 2**31 - 1` here: a dimension, an element count or a stride is not negative).
+    I32,
+    /// `i64`, 8 bytes (a stride of a kernel declared with `index_bits=64`).
+    I64,
+}
+
+impl ScalarType {
+    /// The word a manifest uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+        }
+    }
+
+    /// The largest value a runtime scalar of this type may carry.
+    pub fn max(self) -> i64 {
+        match self {
+            Self::I32 => i64::from(i32::MAX),
+            Self::I64 => i64::MAX,
+        }
+    }
+}
+
+/// The value of a `fixed` argument, in its type.
+#[derive(Debug, Clone, Copy)]
+pub enum FixedValue {
+    /// An `i32`.
+    I32(i32),
+    /// An `i64`.
+    I64(i64),
+    /// An `f32` (the JSON number rounded to the nearest `f32`; compared by its bits).
+    F32(f32),
+}
+
+impl PartialEq for FixedValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::I32(a), Self::I32(b)) => a == b,
+            (Self::I64(a), Self::I64(b)) => a == b,
+            (Self::F32(a), Self::F32(b)) => a.to_bits() == b.to_bits(),
+            _ => false,
+        }
+    }
+}
+
+impl FixedValue {
+    /// The word a manifest uses for the type.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Self::I32(_) => "i32",
+            Self::I64(_) => "i64",
+            Self::F32(_) => "f32",
+        }
+    }
+
+    /// The bytes of the value in a 64-bit `kernelParams` slot: little-endian, so a 32-bit value is in the low four bytes.
+    pub(crate) fn bits(self) -> u64 {
+        match self {
+            Self::I32(v) => u64::from(v as u32),
+            Self::I64(v) => v as u64,
+            Self::F32(v) => u64::from(v.to_bits()),
+        }
+    }
+}
+
 /// What a launch parameter is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamKind {
-    /// A device pointer.
+    /// A device pointer. With a `view` it takes a strided view of a tensor; with an empty `shape` it is a *device scalar* (one element in
+    /// device memory, read by the kernel with `tl.load(ptr)`).
     Pointer {
         /// The element dtype as the manifest names it (`"bf16"`, `"e2m1"`, ...).
         dtype_name: String,
@@ -116,13 +224,24 @@ pub enum ParamKind {
         access: Access,
         /// The declared shape: one entry per axis. A launch binds the named dimensions from the sizes of the tensors it is given.
         shape: Vec<ShapeDim>,
+        /// The strides and the offset a view of the tensor may have (a pointer without it is a dense, row-major tensor).
+        view: Option<View>,
     },
-    /// A runtime `i32` that carries the value of a dimension expression.
+    /// A runtime integer: the value of a dimension expression, the element count of a pointer, or one stride of a strided pointer.
     Scalar {
-        /// The expression (`n`, `3072*M`).
+        /// How it is passed.
+        ty: ScalarType,
+        /// The expression (`n`, `3072*M`); for a stride, the name of the stride dimension.
         dim: String,
         /// The pointer parameter whose element count this scalar is, for a generated kernel.
         count_of: Option<String>,
+        /// The strided pointer parameter and the axis whose stride this scalar is.
+        stride_of: Option<StrideOf>,
+    },
+    /// A scalar whose value is in the manifest (a prebuilt binary's constant argument): the launch writes it at its own slot.
+    Fixed {
+        /// Its value, in its type.
+        value: FixedValue,
     },
 }
 
@@ -135,8 +254,31 @@ pub struct Param {
     pub index: usize,
     /// The parameter's name.
     pub name: String,
-    /// Pointer or scalar.
+    /// Pointer, scalar or fixed argument.
     pub kind: ParamKind,
+}
+
+impl Param {
+    /// Whether this is a device scalar: a pointer with the empty shape.
+    pub fn is_device_scalar(&self) -> bool {
+        matches!(&self.kind, ParamKind::Pointer { shape, .. } if shape.is_empty())
+    }
+
+    /// The bytes the parameter takes in `kernelParams`: 8 for a pointer, as many as its type for a scalar or a fixed argument (the `size` of
+    /// the manifest, which the loaded function is asked to report).
+    pub fn size(&self) -> usize {
+        match &self.kind {
+            ParamKind::Pointer { .. } => 8,
+            ParamKind::Scalar { ty, .. } => match ty {
+                ScalarType::I32 => 4,
+                ScalarType::I64 => 8,
+            },
+            ParamKind::Fixed { value } => match value {
+                FixedValue::I32(_) | FixedValue::F32(_) => 4,
+                FixedValue::I64(_) => 8,
+            },
+        }
+    }
 }
 
 /// A value compiled into the binary as `tl.constexpr`.
@@ -155,13 +297,13 @@ pub struct Constexpr {
 /// A condition a host checks before it may launch the binary.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Precondition {
-    /// The pointer is aligned to `bytes`.
+    /// The pointer passed (the address of the first element of the view) is aligned to `bytes`.
     PointerAlignment {
         /// The pointer parameter.
         arg: String,
         /// Its position among the kernel's parameters.
         index: usize,
-        /// The alignment in bytes (always 16).
+        /// The alignment in bytes: 16, or (for a strided pointer only) the size of its element.
         bytes: u64,
     },
     /// The runtime scalar is a multiple of `by`.
@@ -203,6 +345,16 @@ pub enum Precondition {
         index: usize,
         /// Its shape, with the bucket values in.
         shape: Vec<String>,
+        /// The limit (`2**31 - 1`).
+        value: u64,
+    },
+    /// The view's extent (one more than the largest element offset it reaches, `1 + sum((size - 1) * stride)` with the canonical strides) is at
+    /// most `value`: what `max_elements` says of a dense tensor, for a kernel that indexes a strided pointer with `i32`.
+    MaxExtent {
+        /// The strided pointer parameter.
+        arg: String,
+        /// Its position among the kernel's parameters.
+        index: usize,
         /// The limit (`2**31 - 1`).
         value: u64,
     },
@@ -249,16 +401,57 @@ impl LaunchAttributes {
     }
 }
 
+/// What a kernel entry is made of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A kernel Triton compiled (`num_warps`, `num_stages` and `options` are its compile settings; two scratch slots follow its parameters).
+    Triton,
+    /// A prebuilt PTX (assembled by `ptxas`) or cubin: launched with exactly its parameters, no scratch slots.
+    Binary,
+}
+
+impl EntryKind {
+    /// The word a manifest uses (`"triton"`, `"binary"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Triton => "triton",
+            Self::Binary => "binary",
+        }
+    }
+
+    /// How many scratch slots a kernel of this kind is launched with after its parameters: 2 for Triton, 0 for a prebuilt binary.
+    pub fn scratch_slots(self) -> usize {
+        match self {
+            Self::Triton => 2,
+            Self::Binary => 0,
+        }
+    }
+}
+
+/// How a prebuilt binary was made (`binary` of its entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BinarySource {
+    /// A cubin used as it is, for its own architecture.
+    Cubin,
+    /// PTX assembled by `ptxas` with these flags (the argument vector before the file names).
+    Ptx {
+        /// The flags, in their spelling (`ptxas` records them in the cubin, so the machine code depends on them).
+        ptxas_flags: Vec<String>,
+    },
+}
+
 /// One binary of a manifest: its entry, and its cubin whose digests have been checked.
 #[derive(Debug, Clone)]
 pub struct Entry {
-    /// The operator and its bucket values (`rowop.S32`); unique with `arch`.
+    /// The operator and its bucket values (`rowop.S32`); unique with `arch` (and across the `library` section too).
     pub stem: String,
     /// The operator.
     pub op: String,
+    /// A kernel Triton compiled, or a prebuilt binary.
+    pub kind: EntryKind,
     /// The architecture the cubin is for (`sm_103`).
     pub arch: String,
-    /// The `.target` of the PTX it was assembled from.
+    /// The `.target` of the PTX it was assembled from (`""` for a cubin that was used as it is).
     pub ptx_target: String,
     /// The kernel's symbol in the cubin.
     pub symbol: String,
@@ -266,16 +459,18 @@ pub struct Entry {
     pub cubin_name: String,
     /// The non-constexpr parameters, in `kernelParams` order.
     pub params: Vec<Param>,
+    /// How many scratch slots (null 64-bit pointers) a launch passes after the parameters: 2 for a Triton kernel, 0 for a prebuilt binary.
+    pub scratch_slots: usize,
     /// The grid, an expression over dimension names (`(cdiv(n, 1024),)`).
     pub grid: String,
     /// The thread block.
     pub block: [u32; 3],
     /// The dynamic shared memory a launch passes, in bytes.
     pub shared: u32,
-    /// Warps per block.
-    pub num_warps: u32,
-    /// Pipeline stages the kernel was compiled with.
-    pub num_stages: u32,
+    /// Warps per block (a Triton kernel).
+    pub num_warps: Option<u32>,
+    /// Pipeline stages the kernel was compiled with (a Triton kernel).
+    pub num_stages: Option<u32>,
     /// What the binary asks of the launch.
     pub launch: LaunchAttributes,
     /// The compiled-in constants.
@@ -294,24 +489,26 @@ pub struct Entry {
     pub sha256: String,
     /// The sha256 of its machine code (see [`crate::elf`]).
     pub sha256_code: String,
-    /// The Triton version that built it.
-    pub triton: String,
-    /// The `ptxas` that assembled it.
-    pub ptxas: String,
+    /// The Triton version that built it (a Triton kernel).
+    pub triton: Option<String>,
+    /// The `ptxas` that assembled it (always for a Triton kernel; for a prebuilt binary only when it was made from PTX).
+    pub ptxas: Option<String>,
+    /// How a prebuilt binary was made.
+    pub binary: Option<BinarySource>,
     /// The sha256 of the Triton source of a generated kernel.
     pub source_sha256: Option<String>,
-    /// The identity of what Triton compiled: the digest of the Triton IR (TTIR without locations) the binary was built
-    /// from, for generated and hand-written kernels alike. Python recomputes it to tell a stale binary; a Rust host has
-    /// no Triton and trusts it through the pinned manifest digest.
+    /// The identity of what was built: the digest of the Triton IR (TTIR without locations) the binary was built from, for generated and
+    /// hand-written kernels alike (Python recomputes it to tell a stale binary; a Rust host has no Triton and trusts it through the pinned
+    /// manifest digest), or, for a prebuilt binary, the sha256 of its PTX or cubin file.
     pub source_digest: Option<String>,
-    /// How `source_digest` was computed (`tilefish.triton-ir.v1`).
+    /// How `source_digest` was computed (`tilefish.triton-ir.v1`, or `tilefish.binary.v1` for a prebuilt binary).
     pub source_digest_kind: Option<String>,
     /// The verified cubin.
     pub cubin: Arc<[u8]>,
 }
 
 impl Entry {
-    /// The ABI entry of a pointer or scalar parameter by name.
+    /// The ABI entry of a parameter by name.
     pub fn param(&self, name: &str) -> Option<&Param> {
         self.params.iter().find(|p| p.name == name)
     }
@@ -323,27 +520,60 @@ pub struct Manifest {
     pub(crate) label: String,
     pub(crate) digest: String,
     pub(crate) entries: Vec<Entry>,
+    pub(crate) library: Vec<LibraryEntry>,
     pub(crate) kernels: Mutex<HashMap<(usize, usize), Cached>>,
+    pub(crate) gemms: Mutex<HashMap<(usize, usize), CachedGemm>>,
 }
 
 // -- the digest -------------------------------------------------------------------------------------------------------
 
-/// The sha256 (lowercase hex) of a manifest document: its schema and every kernel entry in full.
+/// `Python's str(value)` as far as a sort key needs it: the text of a string, `"None"` for anything else (a reader refuses an entry whose
+/// stem or architecture is not a string, so no digest of a manifest that loads depends on the rest).
+fn sort_key(e: &Value, field: &str) -> String {
+    e.get(field).and_then(Value::as_str).unwrap_or("None").to_owned()
+}
+
+fn sorted_entries(list: &[Value], what: &str) -> std::result::Result<Vec<Value>, String> {
+    if let Some(i) = list.iter().position(|e| !e.is_object()) {
+        return Err(format!("{what} {i} is not an object"));
+    }
+    let mut sorted: Vec<&Value> = list.iter().collect();
+    sorted.sort_by_key(|e| (sort_key(e, "stem"), sort_key(e, "arch")));
+    Ok(sorted.into_iter().cloned().collect())
+}
+
+/// Whether `schema` is the number 3 the way Python's `schema == 3` says: the integer 3 and the float 3.0 are, `true` and `"3"` are not.
+fn is_schema_3(schema: &Value) -> bool {
+    match schema {
+        Value::Number(n) => n.as_i64() == Some(3) || n.as_u64() == Some(3) || (n.is_f64() && n.as_f64() == Some(3.0)),
+        _ => false,
+    }
+}
+
+/// The sha256 (lowercase hex) of a manifest document: its schema, every kernel entry and every library entry in full.
 ///
-/// Entries are sorted by `(stem, arch)` and serialized as canonical JSON (see [`crate::json::canonical`]), so the
-/// digest does not depend on the order of the entries or on how the file was formatted, and changes with any field of
-/// any entry. The top-level `tilefish` version is not part of it. This is Python's `manifest_digest`.
+/// Entries are sorted by `(stem, arch)` (kernels and library entries each) and serialized as canonical JSON (see
+/// [`crate::json::canonical`]), so the digest does not depend on the order of the entries or on how the file was formatted, and
+/// changes with any field of any entry. The top-level `tilefish` version is not part of it. This is Python's `manifest_digest`:
+/// for schema 3 it is `sha256(b"tilefish.manifest-digest.v3\0" + canonical({"schema": 3, "kernels": K, "library": L}))`; any other
+/// document is digested in the form of schema 2 (`{"schema": <whatever it says>, "kernels": [...]}`, the tag `v2`), which is what a
+/// reader of schema 2 computed, and which a reader of schema 3 refuses to load.
 pub fn manifest_digest(doc: &Value) -> std::result::Result<String, String> {
     let schema = doc.get("schema").ok_or("the manifest has no schema")?;
     let kernels = doc.get("kernels").and_then(Value::as_array).ok_or("the manifest has no list of kernels")?;
-    let key = |e: &Value, field: &str| -> String { e.get(field).and_then(Value::as_str).unwrap_or("None").to_owned() };
-    let mut sorted: Vec<&Value> = kernels.iter().collect();
-    sorted.sort_by_key(|e| (key(e, "stem"), key(e, "arch")));
     let mut body = Map::new();
     body.insert("schema".to_owned(), schema.clone());
-    body.insert("kernels".to_owned(), Value::Array(sorted.into_iter().cloned().collect()));
+    body.insert("kernels".to_owned(), Value::Array(sorted_entries(kernels, "kernel entry")?));
+    let tag = if is_schema_3(schema) {
+        let library =
+            doc.get("library").and_then(Value::as_array).ok_or("the manifest has no list of library entries")?;
+        body.insert("library".to_owned(), Value::Array(sorted_entries(library, "library entry")?));
+        DIGEST_TAG
+    } else {
+        LEGACY_DIGEST_TAG
+    };
     let text = canonical(&Value::Object(body));
-    let mut bytes = DIGEST_TAG.to_vec();
+    let mut bytes = tag.to_vec();
     bytes.extend_from_slice(text.as_bytes());
     Ok(sha256_hex(&bytes))
 }
@@ -358,6 +588,7 @@ struct RawDoc {
     #[allow(dead_code)]
     tilefish: Option<String>,
     kernels: Vec<Value>,
+    library: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -365,6 +596,7 @@ struct RawDoc {
 struct RawEntry {
     stem: String,
     op: String,
+    kind: String,
     arch: String,
     ptx_target: String,
     symbol: String,
@@ -373,18 +605,23 @@ struct RawEntry {
     grid: String,
     block: [u32; 3],
     shared: u32,
-    num_warps: u32,
-    num_stages: u32,
+    #[serde(default)]
+    num_warps: Option<u32>,
+    #[serde(default)]
+    num_stages: Option<u32>,
     launch: LaunchAttributes,
     constexprs: Vec<RawConstexpr>,
     buckets: Map<String, Value>,
     dims: Map<String, Value>,
     preconditions: Vec<Value>,
-    options: RawOptions,
+    #[serde(default)]
+    options: Option<RawOptions>,
     declaration_digest: String,
     sha256: String,
     sha256_code: String,
     toolchain: RawToolchain,
+    #[serde(default)]
+    binary: Option<Value>,
     #[serde(default)]
     source_sha256: Option<String>,
     #[serde(default)]
@@ -398,6 +635,14 @@ struct RawEntry {
 struct RawAbi {
     params: Vec<RawParam>,
     scratch: Vec<RawScratch>,
+    scratch_slots: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawStrideOf {
+    arg: String,
+    axis: u64,
 }
 
 #[derive(Deserialize)]
@@ -421,6 +666,14 @@ struct RawParam {
     dim: Option<String>,
     #[serde(default)]
     count_of: Option<String>,
+    #[serde(default)]
+    strides: Option<Vec<Value>>,
+    #[serde(default)]
+    offset: Option<Value>,
+    #[serde(default)]
+    stride_of: Option<RawStrideOf>,
+    #[serde(default)]
+    value: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -468,55 +721,74 @@ struct RawOptions {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawToolchain {
-    triton: String,
-    ptxas: String,
+    #[serde(default)]
+    triton: Option<String>,
+    #[serde(default)]
+    ptxas: Option<String>,
 }
 
-fn is_ident(s: &str) -> bool {
+pub(crate) fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn is_stem(s: &str) -> bool {
+pub(crate) fn is_stem(s: &str) -> bool {
     !s.is_empty() && s.split('.').all(is_ident)
 }
 
-fn is_digest(s: &str) -> bool {
+pub(crate) fn is_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn is_arch(s: &str) -> bool {
+pub(crate) fn is_arch(s: &str) -> bool {
     s.strip_prefix("sm_").is_some_and(|n| (2..=3).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// A kernel symbol of a prebuilt binary (a PTX or ELF symbol: `$` is allowed).
+fn is_symbol(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// The `sm_103` of an architecture name as its number.
+fn arch_number(arch: &str) -> Option<u32> {
+    arch.strip_prefix("sm_")?.parse().ok()
+}
+
 /// The Triton spelling of a pointer to each dtype a manifest may name (Python's `ALL_DTYPES`).
-fn pointer_type_of(dtype: &str) -> Option<&'static str> {
+pub(crate) fn pointer_type_of(dtype: &str) -> Option<&'static str> {
     Some(match dtype {
         "e2m1" | "ue8m0" => "*u8",
         other => DType::from_name(other)?.pointer_type(),
     })
 }
 
-fn strictly<T>(r: std::result::Result<T, String>, who: &str) -> Result<T> {
+pub(crate) fn strictly<T>(r: std::result::Result<T, String>, who: &str) -> Result<T> {
     r.map_err(|e| Error::manifest(format!("{who}: {e}")))
 }
 
-fn want_int(v: &Value, what: &str, minimum: u64) -> std::result::Result<u64, String> {
+pub(crate) fn want_int(v: &Value, what: &str, minimum: u64) -> std::result::Result<u64, String> {
     match v.as_u64() {
         Some(n) if n >= minimum => Ok(n),
         _ => Err(format!("{what} must be an int >= {minimum}, got {v}")),
     }
 }
 
-fn want_ident(v: &Value, what: &str) -> std::result::Result<String, String> {
+pub(crate) fn want_ident(v: &Value, what: &str) -> std::result::Result<String, String> {
     match v.as_str() {
         Some(s) if is_ident(s) => Ok(s.to_owned()),
         _ => Err(format!("{what} must be an identifier, got {v}")),
     }
 }
 
-fn want_keys(obj: &Map<String, Value>, what: &str, kind: &str, allowed: &[&str]) -> std::result::Result<(), String> {
+pub(crate) fn want_keys(
+    obj: &Map<String, Value>,
+    what: &str,
+    kind: &str,
+    allowed: &[&str],
+) -> std::result::Result<(), String> {
     for k in obj.keys() {
         if k != "kind" && !allowed.contains(&k.as_str()) {
             return Err(format!("{what} has unknown fields [{k:?}]"));
@@ -526,7 +798,7 @@ fn want_keys(obj: &Map<String, Value>, what: &str, kind: &str, allowed: &[&str])
     if missing.is_empty() { Ok(()) } else { Err(format!("{what} ({kind}) is missing {missing:?}")) }
 }
 
-fn precondition_of(v: &Value, syms: &mut Symbols) -> std::result::Result<Precondition, String> {
+pub(crate) fn precondition_of(v: &Value, syms: &mut Symbols) -> std::result::Result<Precondition, String> {
     let obj = v.as_object().ok_or_else(|| format!("a precondition must be an object, got {v}"))?;
     let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("");
     let what = format!("{kind} precondition");
@@ -608,16 +880,30 @@ fn precondition_of(v: &Value, syms: &mut Symbols) -> std::result::Result<Precond
                 value,
             }
         }
+        "max_extent" => {
+            want_keys(obj, &what, kind, &["arg", "index", "value"])?;
+            let value = want_int(get("value"), &format!("{what} value"), 1)?;
+            if value != MAX_ELEMENTS {
+                return Err(format!(
+                    "max_extent precondition value must be {MAX_ELEMENTS} (the limit of i32 offsets), got {value}"
+                ));
+            }
+            Precondition::MaxExtent {
+                arg: want_ident(get("arg"), &format!("{what} arg"))?,
+                index: usize_of("index", 0)?,
+                value,
+            }
+        }
         other => {
             return Err(format!(
-                "precondition kind must be one of [\"bucket\", \"divisible\", \"max_elements\", \"pointer_alignment\", \"static_size\"], got {other:?}"
+                "precondition kind must be one of [\"bucket\", \"divisible\", \"max_elements\", \"max_extent\", \"pointer_alignment\", \"static_size\"], got {other:?}"
             ));
         }
     })
 }
 
-/// The declared shape of a pointer: each axis a size (an int of at least 1) or a dimension expression.
-fn parse_shape(name: &str, shape: &[Value]) -> std::result::Result<Vec<ShapeDim>, String> {
+/// The declared shape of a pointer: each axis a size (an int of at least 1) or a dimension expression. Empty for a device scalar.
+pub(crate) fn parse_shape(name: &str, shape: &[Value]) -> std::result::Result<Vec<ShapeDim>, String> {
     shape
         .iter()
         .enumerate()
@@ -632,7 +918,10 @@ fn parse_shape(name: &str, shape: &[Value]) -> std::result::Result<Vec<ShapeDim>
 }
 
 /// The table of named dimensions, checked against the buckets of the entry.
-fn parse_dims(dims: &Map<String, Value>, buckets: &Map<String, Value>) -> std::result::Result<Vec<DimInfo>, String> {
+pub(crate) fn parse_dims(
+    dims: &Map<String, Value>,
+    buckets: &Map<String, Value>,
+) -> std::result::Result<Vec<DimInfo>, String> {
     let mut out = Vec::with_capacity(dims.len());
     for (name, value) in dims {
         want_ident(&Value::String(name.clone()), "dims name")?;
@@ -676,43 +965,274 @@ fn decode_scalar(v: &Value, what: &str) -> std::result::Result<(), String> {
     }
 }
 
+/// The value of a `fixed` argument of C type `ty` (`i32`, `i64`, `f32`): an integer in range for an integer type (not a bool, not a float),
+/// a JSON number with a fraction or exponent (or the tagged form of a non-finite one) for `f32`.
+fn fixed_value(ty: &str, v: &Value, who: &str) -> std::result::Result<FixedValue, String> {
+    match ty {
+        "i32" | "i64" => {
+            let wide = match v {
+                Value::Number(n) if !n.is_f64() => {
+                    n.as_i64().ok_or_else(|| format!("{who}: the value {v} does not fit {ty}"))
+                }
+                _ => Err(format!("{who}: the value of a fixed {ty} argument must be an int, got {v}")),
+            }?;
+            if ty == "i32" {
+                i32::try_from(wide)
+                    .map(FixedValue::I32)
+                    .map_err(|_| format!("{who}: the value {wide} does not fit i32"))
+            } else {
+                Ok(FixedValue::I64(wide))
+            }
+        }
+        "f32" => match v {
+            Value::Number(n) if n.is_f64() => {
+                let x = n.as_f64().ok_or_else(|| format!("{who}: the value {v} is not a number"))?;
+                Ok(FixedValue::F32(x as f32))
+            }
+            Value::Object(o) if o.len() == 1 => match o.get("float").and_then(Value::as_str) {
+                Some("inf") => Ok(FixedValue::F32(f32::INFINITY)),
+                Some("-inf") => Ok(FixedValue::F32(f32::NEG_INFINITY)),
+                Some("nan") => Ok(FixedValue::F32(f32::NAN)),
+                _ => Err(format!("{who}: {v} is not a valid tagged float")),
+            },
+            _ => Err(format!("{who}: the value of a fixed f32 argument must be a float, got {v}")),
+        },
+        other => Err(format!("{who}: a fixed argument is one of i32, i64, f32, got {other:?}")),
+    }
+}
+
+fn str_field<'a>(v: &'a Option<String>, what: &str, name: &str) -> std::result::Result<&'a str, String> {
+    v.as_deref().ok_or_else(|| format!("parameter {name}: {what} is missing"))
+}
+
+/// The ABI parameters of an entry, each checked on its own (the kinds, the types and their widths, which fields each has).
+fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param>, String> {
+    let mut out = Vec::with_capacity(raw.abi.params.len());
+    for (position, p) in raw.abi.params.iter().enumerate() {
+        want_ident(&Value::String(p.name.clone()), "parameter name")?;
+        if p.slot != position {
+            return Err(format!("parameter {} has slot {} but is at position {position}", p.name, p.slot));
+        }
+        let name = p.name.as_str();
+        let kind_of = match p.kind.as_str() {
+            "pointer" => {
+                let dtype = p.dtype.as_deref().unwrap_or("");
+                if pointer_type_of(dtype) != Some(p.ty.as_str()) {
+                    return Err(format!("parameter {name}: pointer type {:?} does not match dtype {dtype:?}", p.ty));
+                }
+                let access = match p.access.as_deref() {
+                    Some("in") => Access::In,
+                    Some("inout") => Access::InOut,
+                    Some("out") => Access::Out,
+                    other => return Err(format!("parameter {name}: access must be in, inout or out, got {other:?}")),
+                };
+                if p.dim.is_some()
+                    || p.count_of.is_some()
+                    || p.stride_of.is_some()
+                    || p.value.is_some()
+                    || p.ptx_type != "u64"
+                    || p.size != 8
+                {
+                    return Err(format!("parameter {name} is not a well-formed 64-bit pointer"));
+                }
+                let Some(shape) = &p.shape else {
+                    return Err(format!("parameter {name} has no shape: a pointer records its declared shape"));
+                };
+                let shape = parse_shape(name, shape)?;
+                let view = match (&p.strides, &p.offset) {
+                    (None, None) => None,
+                    (Some(strides), Some(offset)) => {
+                        if shape.is_empty() || strides.len() != shape.len() {
+                            return Err(format!(
+                                "parameter {name}: strides must be a list with one entry per axis of shape (at least one axis), got {} for {} axes",
+                                strides.len(),
+                                shape.len()
+                            ));
+                        }
+                        if access != Access::In {
+                            return Err(format!(
+                                "parameter {name} is {} and takes strides, but only an `in` pointer may be strided",
+                                access.as_str()
+                            ));
+                        }
+                        let mut entries = Vec::with_capacity(strides.len());
+                        for (axis, s) in strides.iter().enumerate() {
+                            entries.push(match s {
+                                Value::Number(n) if !n.is_f64() => {
+                                    if n.as_u64() != Some(1) {
+                                        return Err(format!(
+                                            "the stride of axis {axis} of '{name}' is the fixed size {s}: a fixed stride is 1 (and only on the last axis)"
+                                        ));
+                                    }
+                                    if axis + 1 != strides.len() {
+                                        return Err(format!(
+                                            "the stride of axis {axis} of '{name}' is fixed, but only the last axis may be"
+                                        ));
+                                    }
+                                    StrideEntry::Unit
+                                }
+                                Value::String(text) => StrideEntry::Dim(text.clone()),
+                                other => {
+                                    return Err(format!(
+                                        "parameter {name}: strides[{axis}] must be an int or a dimension expression, got {other}"
+                                    ));
+                                }
+                            });
+                        }
+                        let offset =
+                            want_ident(offset, &format!("the offset of '{name}' (the name of the offset dimension)"))?;
+                        Some(View { strides: entries, offset })
+                    }
+                    _ => return Err(format!("parameter {name}: strides and offset come together")),
+                };
+                ParamKind::Pointer { dtype: DType::from_name(dtype), dtype_name: dtype.to_owned(), access, shape, view }
+            }
+            "scalar" => {
+                let (ty, ptx, size) = match p.ty.as_str() {
+                    "i32" => (ScalarType::I32, "u32", 4),
+                    "i64" => (ScalarType::I64, "u64", 8),
+                    other => {
+                        return Err(format!("parameter {name}: a runtime scalar must be i32 or i64, got {other:?}"));
+                    }
+                };
+                if p.ptx_type != ptx || p.size != size {
+                    return Err(format!(
+                        "parameter {name}: an {} scalar is passed as a {ptx} of {size} bytes, got {} of {}",
+                        p.ty, p.ptx_type, p.size
+                    ));
+                }
+                if p.dtype.is_some()
+                    || p.access.is_some()
+                    || p.shape.is_some()
+                    || p.strides.is_some()
+                    || p.offset.is_some()
+                    || p.value.is_some()
+                {
+                    return Err(format!(
+                        "parameter {name} is a scalar: it has a dim and no dtype, access, shape, strides or value"
+                    ));
+                }
+                if p.count_of.is_some() && p.stride_of.is_some() {
+                    return Err(format!(
+                        "parameter {name}: a scalar is the element count of a pointer or the stride of one, not both"
+                    ));
+                }
+                let dim = str_field(&p.dim, "dim", name)?.to_owned();
+                let stride_of = match &p.stride_of {
+                    Some(s) => {
+                        want_ident(&Value::String(s.arg.clone()), "stride_of arg")?;
+                        let axis = usize::try_from(s.axis)
+                            .map_err(|_| format!("parameter {name}: stride_of axis is too large"))?;
+                        Some(StrideOf { arg: s.arg.clone(), axis })
+                    }
+                    None => None,
+                };
+                ParamKind::Scalar { ty, dim, count_of: p.count_of.clone(), stride_of }
+            }
+            "fixed" => {
+                if kind != EntryKind::Binary {
+                    return Err(format!(
+                        "parameter {name}: a fixed argument belongs to a prebuilt binary, and this is a {} kernel",
+                        kind.as_str()
+                    ));
+                }
+                let (ptx, size) = match p.ty.as_str() {
+                    "i32" => ("u32", 4),
+                    "i64" => ("u64", 8),
+                    "f32" => ("f32", 4),
+                    other => {
+                        return Err(format!(
+                            "parameter {name}: a fixed argument is one of i32, i64, f32, got {other:?}"
+                        ));
+                    }
+                };
+                if p.ptx_type != ptx || p.size != size {
+                    return Err(format!(
+                        "parameter {name}: a fixed {} is passed as a {ptx} of {size} bytes, got {} of {}",
+                        p.ty, p.ptx_type, p.size
+                    ));
+                }
+                if p.dim.is_some()
+                    || p.count_of.is_some()
+                    || p.stride_of.is_some()
+                    || p.access.is_some()
+                    || p.shape.is_some()
+                    || p.strides.is_some()
+                    || p.offset.is_some()
+                    || p.dtype.is_some()
+                {
+                    return Err(format!("parameter {name} is a fixed argument: it has a value and no dim or shape"));
+                }
+                let Some(value) = &p.value else {
+                    return Err(format!("parameter {name} is a fixed argument and has no value"));
+                };
+                ParamKind::Fixed { value: fixed_value(&p.ty, value, &format!("parameter {name}"))? }
+            }
+            other => {
+                return Err(format!("parameter {name}: kind must be pointer, scalar or fixed, got {other:?}"));
+            }
+        };
+        out.push(Param { slot: p.slot, index: p.index, name: p.name.clone(), kind: kind_of });
+    }
+    Ok(out)
+}
+
+fn read_binary(v: &Value) -> std::result::Result<BinarySource, String> {
+    let bad = || {
+        format!("binary must be {{\"source\": \"cubin\"}} or {{\"source\": \"ptx\", \"ptxas_flags\": [...]}}, got {v}")
+    };
+    let obj = v.as_object().ok_or_else(bad)?;
+    match obj.get("source").and_then(Value::as_str) {
+        Some("cubin") if obj.len() == 1 => Ok(BinarySource::Cubin),
+        Some("ptx") if obj.len() == 2 => {
+            let flags = obj
+                .get("ptxas_flags")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().map(|f| f.as_str().map(str::to_owned)).collect::<Option<Vec<String>>>())
+                .ok_or_else(bad)?;
+            Ok(BinarySource::Ptx { ptxas_flags: flags })
+        }
+        _ => Err(bad()),
+    }
+}
+
+fn entry_kind(raw: &RawEntry) -> std::result::Result<EntryKind, String> {
+    match raw.kind.as_str() {
+        "triton" => Ok(EntryKind::Triton),
+        "binary" => Ok(EntryKind::Binary),
+        other => Err(format!("kind must be 'triton' or 'binary', got {other:?}")),
+    }
+}
+
 impl Entry {
     fn from_raw(raw: RawEntry, cubin: Arc<[u8]>) -> Result<Self> {
         let who = format!("'{}' ({})", raw.stem, raw.arch);
+        let kind = strictly(entry_kind(&raw), &who)?;
         let dims = strictly(parse_dims(&raw.dims, &raw.buckets), &who)?;
         let mut syms = Symbols::default();
         for d in &dims {
             strictly(syms.intern(&d.name), &who)?;
         }
-        let mut params = Vec::with_capacity(raw.abi.params.len());
-        for p in raw.abi.params {
-            let kind = if p.kind == "pointer" {
-                let dtype_name = p.dtype.unwrap_or_default();
-                let access = match p.access.as_deref() {
-                    Some("in") => Access::In,
-                    Some("inout") => Access::InOut,
-                    _ => Access::Out,
-                };
-                let shape = strictly(parse_shape(&p.name, p.shape.as_deref().unwrap_or_default()), &who)?;
-                ParamKind::Pointer { dtype: DType::from_name(&dtype_name), dtype_name, access, shape }
-            } else {
-                ParamKind::Scalar { dim: p.dim.unwrap_or_default(), count_of: p.count_of }
-            };
-            params.push(Param { slot: p.slot, index: p.index, name: p.name, kind });
-        }
+        let params = strictly(read_params(&raw, kind), &who)?;
         let mut preconditions = Vec::with_capacity(raw.preconditions.len());
         for p in &raw.preconditions {
             preconditions.push(strictly(precondition_of(p, &mut syms), &who)?);
         }
+        let binary = match &raw.binary {
+            Some(b) => Some(strictly(read_binary(b), &who)?),
+            None => None,
+        };
         let buckets = raw.buckets.iter().map(|(k, v)| (k.clone(), v.as_u64().unwrap_or(0))).collect::<Vec<_>>();
         let entry = Self {
             stem: raw.stem,
             op: raw.op,
+            kind,
             arch: raw.arch,
             ptx_target: raw.ptx_target,
             symbol: raw.symbol,
             cubin_name: raw.cubin,
             params,
+            scratch_slots: raw.abi.scratch.len(),
             grid: raw.grid,
             block: raw.block,
             shared: raw.shared,
@@ -727,12 +1247,13 @@ impl Entry {
             buckets,
             dims,
             preconditions,
-            enable_fp_fusion: raw.options.enable_fp_fusion,
+            enable_fp_fusion: raw.options.as_ref().and_then(|o| o.enable_fp_fusion),
             declaration_digest: raw.declaration_digest,
             sha256: raw.sha256,
             sha256_code: raw.sha256_code,
             triton: raw.toolchain.triton,
             ptxas: raw.toolchain.ptxas,
+            binary,
             source_sha256: raw.source_sha256,
             source_digest: raw.source_digest,
             source_digest_kind: raw.source_digest_kind,
@@ -744,6 +1265,7 @@ impl Entry {
 
     /// The checks that need no more than the raw fields.
     fn check_raw(raw: &RawEntry) -> std::result::Result<(), String> {
+        let kind = entry_kind(raw)?;
         if !is_stem(&raw.stem) {
             return Err(format!("stem must look like 'op' or 'op.S32', got {:?}", raw.stem));
         }
@@ -753,7 +1275,8 @@ impl Entry {
         if !is_arch(&raw.arch) {
             return Err(format!("arch must look like 'sm_103', got {:?}", raw.arch));
         }
-        if !is_ident(&raw.symbol) {
+        let symbol_ok = if kind == EntryKind::Binary { is_symbol(&raw.symbol) } else { is_ident(&raw.symbol) };
+        if !symbol_ok {
             return Err(format!("symbol must be an identifier, got {:?}", raw.symbol));
         }
         let name = raw.cubin.as_str();
@@ -777,21 +1300,96 @@ impl Entry {
         if raw.source_digest.is_some() != raw.source_digest_kind.is_some() {
             return Err("source_digest and source_digest_kind come together".to_owned());
         }
-        if !NUM_WARPS.contains(&raw.num_warps) {
-            return Err(format!("num_warps must be one of {NUM_WARPS:?}, got {}", raw.num_warps));
-        }
-        if !(1..=MAX_STAGES).contains(&raw.num_stages) {
-            return Err(format!("num_stages must be an int from 1 to {MAX_STAGES}, got {}", raw.num_stages));
-        }
-        if raw.block != [32 * raw.num_warps, 1, 1] {
-            return Err(format!(
-                "block must be [32 * num_warps, 1, 1] = {:?}, got {:?}",
-                [32 * raw.num_warps, 1, 1],
-                raw.block
-            ));
-        }
-        if raw.options.num_warps != raw.num_warps || raw.options.num_stages != raw.num_stages {
-            return Err("the compile options disagree with num_warps and num_stages".to_owned());
+        match kind {
+            EntryKind::Triton => {
+                let (Some(num_warps), Some(num_stages)) = (raw.num_warps, raw.num_stages) else {
+                    return Err("a triton kernel has num_warps and num_stages".to_owned());
+                };
+                if !NUM_WARPS.contains(&num_warps) {
+                    return Err(format!("num_warps must be one of {NUM_WARPS:?}, got {num_warps}"));
+                }
+                if !(1..=MAX_STAGES).contains(&num_stages) {
+                    return Err(format!("num_stages must be an int from 1 to {MAX_STAGES}, got {num_stages}"));
+                }
+                if raw.block != [32 * num_warps, 1, 1] {
+                    return Err(format!(
+                        "block must be [32 * num_warps, 1, 1] = {:?}, got {:?}",
+                        [32 * num_warps, 1, 1],
+                        raw.block
+                    ));
+                }
+                let Some(options) = &raw.options else {
+                    return Err("a triton kernel has the compile options it was built with".to_owned());
+                };
+                if options.num_warps != num_warps || options.num_stages != num_stages {
+                    return Err("the compile options disagree with num_warps and num_stages".to_owned());
+                }
+                if raw.binary.is_some() {
+                    return Err("a triton kernel is not a prebuilt binary: it has no `binary` section".to_owned());
+                }
+                if raw.toolchain.triton.is_none() || raw.toolchain.ptxas.is_none() {
+                    return Err("the toolchain of a triton kernel is {\"triton\": ..., \"ptxas\": ...}".to_owned());
+                }
+            }
+            EntryKind::Binary => {
+                let extra: Vec<&str> = [
+                    ("num_warps", raw.num_warps.is_some()),
+                    ("num_stages", raw.num_stages.is_some()),
+                    ("options", raw.options.is_some()),
+                ]
+                .into_iter()
+                .filter_map(|(k, present)| present.then_some(k))
+                .collect();
+                if !extra.is_empty() {
+                    return Err(format!("a prebuilt binary has no {extra:?} (Triton compile settings)"));
+                }
+                let Some(binary) = &raw.binary else {
+                    return Err("a prebuilt binary has a `binary` section: {\"source\": \"cubin\"} or {\"source\": \"ptx\", \"ptxas_flags\": [...]}".to_owned());
+                };
+                let source = read_binary(binary)?;
+                if raw.source_digest_kind.as_deref() != Some(BINARY_DIGEST_KIND) || raw.source_digest.is_none() {
+                    return Err(format!(
+                        "a prebuilt binary records the sha256 of its PTX or cubin as source_digest, with source_digest_kind '{BINARY_DIGEST_KIND}'"
+                    ));
+                }
+                if raw.source_sha256.is_some() {
+                    return Err(
+                        "a prebuilt binary has no source_sha256 (that is the source of a generated Triton kernel)"
+                            .to_owned(),
+                    );
+                }
+                if source == BinarySource::Cubin && raw.source_digest.as_deref() != Some(raw.sha256.as_str()) {
+                    return Err("the source_digest of a cubin used as it is is the sha256 of the cubin file".to_owned());
+                }
+                if raw.toolchain.triton.is_some() {
+                    return Err(
+                        "the toolchain of a prebuilt binary has no triton: it is {} or {\"ptxas\": ...}".to_owned()
+                    );
+                }
+                if (source == BinarySource::Cubin) != raw.toolchain.ptxas.is_none() {
+                    return Err(
+                        "the toolchain of a prebuilt binary is {} for a cubin and {\"ptxas\": ...} for PTX".to_owned()
+                    );
+                }
+                if !raw.constexprs.is_empty() {
+                    return Err("a prebuilt binary has no constexprs".to_owned());
+                }
+                if !raw.block.iter().all(|b| (1..=1024).contains(b))
+                    || raw.block.iter().map(|b| u64::from(*b)).product::<u64>() > 1024
+                {
+                    return Err(format!(
+                        "block must be three sizes from 1 to 1024 whose product is at most 1024, got {:?}",
+                        raw.block
+                    ));
+                }
+                let blockers = raw.launch.blockers();
+                if !blockers.is_empty() {
+                    return Err(format!(
+                        "a prebuilt binary is launched with a plain cuLaunchKernel: its launch attributes are the zero ones, got {}",
+                        blockers.join(", ")
+                    ));
+                }
+            }
         }
         if raw.launch.cluster_dims.contains(&0) || raw.launch.num_ctas == 0 {
             return Err("the launch attributes have a zero cluster dimension or CTA count".to_owned());
@@ -816,44 +1414,22 @@ impl Entry {
         }
         parse_dims(&raw.dims, &raw.buckets)?;
         let n = raw.abi.params.len();
-        for (position, p) in raw.abi.params.iter().enumerate() {
-            want_ident(&Value::String(p.name.clone()), "parameter name")?;
-            if p.slot != position {
-                return Err(format!("parameter {} has slot {} but is at position {position}", p.name, p.slot));
-            }
-            match p.kind.as_str() {
-                "pointer" => {
-                    let dtype = p.dtype.as_deref().unwrap_or("");
-                    if pointer_type_of(dtype) != Some(p.ty.as_str()) {
-                        return Err(format!(
-                            "parameter {}: pointer type {:?} does not match dtype {dtype:?}",
-                            p.name, p.ty
-                        ));
-                    }
-                    if !matches!(p.access.as_deref(), Some("in" | "inout" | "out")) {
-                        return Err(format!(
-                            "parameter {}: access must be in, inout or out, got {:?}",
-                            p.name, p.access
-                        ));
-                    }
-                    if p.dim.is_some() || p.count_of.is_some() || p.ptx_type != "u64" || p.size != 8 {
-                        return Err(format!("parameter {} is not a well-formed 64-bit pointer", p.name));
-                    }
-                    let Some(shape) = &p.shape else {
-                        return Err(format!("parameter {} has no shape: a pointer records its declared shape", p.name));
-                    };
-                    parse_shape(&p.name, shape)?;
+        read_params(raw, kind)?;
+        if raw.abi.scratch_slots != kind.scratch_slots() as u64 {
+            return Err(format!(
+                "a {} kernel has {} scratch slots, but abi.scratch_slots is {}",
+                kind.as_str(),
+                kind.scratch_slots(),
+                raw.abi.scratch_slots
+            ));
+        }
+        if raw.abi.scratch.len() != kind.scratch_slots() {
+            return Err(match kind {
+                EntryKind::Triton => "the ABI must end with the two scratch slots".to_owned(),
+                EntryKind::Binary => {
+                    "a prebuilt binary is launched with exactly its parameters: its abi.scratch is empty".to_owned()
                 }
-                "scalar" => {
-                    if p.ty != "i32" || p.ptx_type != "u32" || p.size != 4 || p.dtype.is_some() || p.access.is_some() {
-                        return Err(format!("parameter {}: a runtime scalar must be an i32 passed as a u32", p.name));
-                    }
-                    if p.dim.is_none() || p.shape.is_some() {
-                        return Err(format!("parameter {} is a scalar: it has a dim and no shape", p.name));
-                    }
-                }
-                other => return Err(format!("parameter {}: kind must be pointer or scalar, got {other:?}", p.name)),
-            }
+            });
         }
         for (k, s) in raw.abi.scratch.iter().enumerate() {
             let name = ["global_scratch", "profile_scratch"].get(k).copied().unwrap_or("");
@@ -861,9 +1437,6 @@ impl Entry {
             {
                 return Err("the scratch slots must be global_scratch and profile_scratch, null 64-bit pointers after the arguments".to_owned());
             }
-        }
-        if raw.abi.scratch.len() != 2 {
-            return Err("the ABI must end with the two scratch slots".to_owned());
         }
         // every parameter index once, parameters and constexprs together
         let mut indices: Vec<usize> =
@@ -891,25 +1464,76 @@ impl Entry {
 
     /// The checks of `validate_spec` that the manifest's own fields allow: what a launch relies on is all there.
     fn check_consistent(&self, syms: &mut Symbols) -> std::result::Result<(), String> {
+        let mut carried: HashMap<(&str, usize), &str> = HashMap::new();
         for p in &self.params {
-            if let ParamKind::Pointer { shape, .. } = &p.kind {
-                for (axis, d) in shape.iter().enumerate() {
-                    if let ShapeDim::Expr(e) = d {
-                        parse_expr(e, &format!("parameter {} shape[{axis}]", p.name), syms)?;
+            match &p.kind {
+                ParamKind::Pointer { shape, view, .. } => {
+                    for (axis, d) in shape.iter().enumerate() {
+                        if let ShapeDim::Expr(e) = d {
+                            parse_expr(e, &format!("parameter {} shape[{axis}]", p.name), syms)?;
+                        }
+                    }
+                    if let Some(view) = view {
+                        for (axis, s) in view.strides.iter().enumerate() {
+                            if let StrideEntry::Dim(e) = s {
+                                parse_expr(e, &format!("parameter {} strides[{axis}]", p.name), syms)?;
+                            }
+                        }
+                        syms.intern(&view.offset)?;
                     }
                 }
-            }
-            if let ParamKind::Scalar { dim, count_of } = &p.kind {
-                parse_expr(dim, &format!("parameter {} dim", p.name), syms)?;
-                if let Some(target) = count_of {
-                    match self.param(target).map(|t| &t.kind) {
-                        Some(ParamKind::Pointer { .. }) => {}
-                        _ => {
+                ParamKind::Scalar { dim, count_of, stride_of, .. } => {
+                    parse_expr(dim, &format!("parameter {} dim", p.name), syms)?;
+                    if let Some(target) = count_of {
+                        match self.param(target).map(|t| &t.kind) {
+                            Some(ParamKind::Pointer { .. }) => {}
+                            _ => {
+                                return Err(format!(
+                                    "parameter {} count_of {target:?} must name a pointer parameter",
+                                    p.name
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(StrideOf { arg, axis }) = stride_of {
+                        let Some(ParamKind::Pointer { view: Some(view), .. }) = self.param(arg).map(|t| &t.kind) else {
                             return Err(format!(
-                                "parameter {} count_of {target:?} must name a pointer parameter",
+                                "parameter {} is the stride of '{arg}', which is not a strided pointer parameter",
+                                p.name
+                            ));
+                        };
+                        let Some(entry) = view.strides.get(*axis) else {
+                            return Err(format!(
+                                "parameter {} is the stride of axis {axis} of '{arg}', which has {} axes",
+                                p.name,
+                                view.strides.len()
+                            ));
+                        };
+                        if *entry != StrideEntry::Dim(dim.clone()) {
+                            return Err(format!(
+                                "parameter {} carries {dim:?} as the stride of axis {axis} of '{arg}', but the strides of that pointer say {entry:?}",
                                 p.name
                             ));
                         }
+                        if let Some(other) = carried.insert((arg.as_str(), *axis), p.name.as_str()) {
+                            return Err(format!(
+                                "axis {axis} of '{arg}' has two stride scalars ({other} and {})",
+                                p.name
+                            ));
+                        }
+                    }
+                }
+                ParamKind::Fixed { .. } => {}
+            }
+        }
+        for p in &self.params {
+            if let ParamKind::Pointer { view: Some(view), .. } = &p.kind {
+                for (axis, s) in view.strides.iter().enumerate() {
+                    if matches!(s, StrideEntry::Dim(_)) && !carried.contains_key(&(p.name.as_str(), axis)) {
+                        return Err(format!(
+                            "the stride of axis {axis} of '{}' is carried by no scalar parameter (stride_of)",
+                            p.name
+                        ));
                     }
                 }
             }
@@ -936,7 +1560,8 @@ impl Entry {
                 Precondition::PointerAlignment { arg, index, .. }
                 | Precondition::Divisible { arg, index, .. }
                 | Precondition::StaticSize { arg, index, .. }
-                | Precondition::MaxElements { arg, index, .. } => match self.param(arg) {
+                | Precondition::MaxElements { arg, index, .. }
+                | Precondition::MaxExtent { arg, index, .. } => match self.param(arg) {
                     Some(p) if p.index == *index => {}
                     _ => return Err(format!("a precondition refers to {arg}@{index}, which is not an argument")),
                 },
@@ -944,12 +1569,17 @@ impl Entry {
             let kind_of = |name: &str| self.param(name).map(|p| &p.kind);
             match pre {
                 Precondition::PointerAlignment { arg, bytes, .. } => {
-                    if !matches!(kind_of(arg), Some(ParamKind::Pointer { .. }))
-                        || *bytes != ALIGNMENT
-                        || !aligned.insert(arg.clone())
-                    {
+                    let allowed = match kind_of(arg) {
+                        Some(ParamKind::Pointer { view: Some(_), dtype_name, .. }) => {
+                            let element = DType::from_name(dtype_name).map_or(1, |d| d.size() as u64);
+                            Some(vec![ALIGNMENT, element])
+                        }
+                        Some(ParamKind::Pointer { .. }) => Some(vec![ALIGNMENT]),
+                        _ => None,
+                    };
+                    if !allowed.is_some_and(|a| a.contains(bytes)) || !aligned.insert(arg.clone()) {
                         return Err(format!(
-                            "pointer_alignment must be {ALIGNMENT} bytes, once, on a pointer argument ({arg})"
+                            "pointer_alignment must be {ALIGNMENT} bytes (or, for a strided pointer, its element size), once, on a pointer argument ({arg})"
                         ));
                     }
                 }
@@ -965,8 +1595,19 @@ impl Entry {
                     }
                 }
                 Precondition::MaxElements { arg, .. } => {
-                    if !matches!(kind_of(arg), Some(ParamKind::Pointer { .. })) || !limited.insert(arg.clone()) {
-                        return Err(format!("max_elements must be once, on a pointer argument ({arg})"));
+                    let dense =
+                        matches!(kind_of(arg), Some(ParamKind::Pointer { view: None, shape, .. }) if !shape.is_empty());
+                    if !dense || !limited.insert(arg.clone()) {
+                        return Err(format!(
+                            "max_elements must be once, on a dense pointer argument that is not a device scalar ({arg})"
+                        ));
+                    }
+                }
+                Precondition::MaxExtent { arg, .. } => {
+                    if !matches!(kind_of(arg), Some(ParamKind::Pointer { view: Some(_), .. }))
+                        || !limited.insert(arg.clone())
+                    {
+                        return Err(format!("max_extent must be once, on a strided pointer argument ({arg})"));
                     }
                 }
                 Precondition::StaticSize { arg, axis, value, .. } => {
@@ -987,9 +1628,21 @@ impl Entry {
         for p in &self.params {
             if matches!(p.kind, ParamKind::Pointer { .. }) && !aligned.contains(&p.name) {
                 return Err(format!(
-                    "pointer argument {} has no pointer_alignment precondition: every pointer of a binary is compiled as {ALIGNMENT}-byte aligned",
+                    "pointer argument {} has no pointer_alignment precondition: every pointer of a binary is compiled for the alignment it promises",
                     p.name
                 ));
+            }
+            if p.is_device_scalar() && !matches!(&p.kind, ParamKind::Pointer { access: Access::In, .. }) {
+                return Err(format!("the device scalar {} must be read only (access in)", p.name));
+            }
+        }
+        // a device scalar's alignment is 16 bytes: "A device scalar's is 16"
+        for pre in &self.preconditions {
+            if let Precondition::PointerAlignment { arg, bytes, .. } = pre
+                && self.param(arg).is_some_and(Param::is_device_scalar)
+                && *bytes != ALIGNMENT
+            {
+                return Err(format!("the pointer_alignment of the device scalar {arg} is {ALIGNMENT} bytes"));
             }
         }
         parse_grid(&self.grid, syms)?;
@@ -1008,7 +1661,7 @@ impl Entry {
         if syms.len() > self.dims.len() {
             let unnamed: Vec<&str> = (self.dims.len()..syms.len()).map(|i| syms.name(i)).collect();
             return Err(format!(
-                "dims does not name {unnamed:?}, which the declared shapes, the scalars or the grid mention"
+                "dims does not name {unnamed:?}, which the declared shapes, the strides, the scalars or the grid mention"
             ));
         }
         Ok(())
@@ -1032,13 +1685,18 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(io)
 }
 
+/// The integer `n` a schema field holds, for `0 < n < 3`: an older schema (Python: `isinstance(older, int)`, a float or a bool is not one).
+fn older_schema(schema: &Value) -> Option<u64> {
+    schema.as_u64().filter(|n| (1..MANIFEST_SCHEMA).contains(n))
+}
+
 impl Manifest {
     /// Load `<directory>/manifest.json` (or the manifest file itself) and every cubin it names.
     ///
-    /// Refuses a manifest that is not strict JSON of the schema `tilefish` writes, one whose digest is not the pinned one
-    /// (before any cubin is read), a cubin that is a symbolic link or whose name is not a plain file name in the
-    /// directory, and a cubin whose `sha256` or `sha256_code` is not the manifest's or that is not an ELF file with the
-    /// code section of the manifest's symbol.
+    /// Refuses a manifest that is not strict JSON of the schema `tilefish` writes (schema 3: an older one is refused with the advice to
+    /// export it again), one whose digest is not the pinned one (before any cubin is read), a cubin that is a symbolic link or whose name
+    /// is not a plain file name in the directory, and a cubin whose `sha256` or `sha256_code` is not the manifest's, that is not an ELF
+    /// file with the code section of the manifest's symbol, or that is for another architecture than the entry says.
     pub fn load(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
         let path = path.as_ref();
         let (directory, manifest_path): (PathBuf, PathBuf) = if path.is_dir() {
@@ -1077,21 +1735,24 @@ impl Manifest {
             .map_err(|e| Error::manifest(format!("the manifest {label:?} is not UTF-8 text: {e}")))?;
         let doc = parse_strict(text)
             .map_err(|e| Error::manifest(format!("the manifest {label:?} is not strict JSON: {e}")))?;
+        // the schema is looked at first, so that a manifest of an older schema is told to be exported again, whatever else it lacks
+        if let Some(older) = doc.get("schema").and_then(older_schema) {
+            return Err(Error::manifest(format!(
+                "the manifest {label:?} is schema {older}, which an older tilefish wrote; this host reads schema {MANIFEST_SCHEMA}, which adds \
+                 strided views, device scalars, prebuilt binaries and library operations (and records the number of scratch slots of every ABI) \
+                 and has another digest. Export it again with a current tilefish (tilefish.runtime.export) and pin the new digest"
+            )));
+        }
         let raw: RawDoc = serde_json::from_value(doc.clone()).map_err(|e| {
             if doc.is_object() {
                 Error::manifest(format!(
-                    "the manifest {label:?} is not a tilefish manifest of schema {MANIFEST_SCHEMA}: {e}"
+                    "the manifest {label:?} is not a tilefish manifest of schema {MANIFEST_SCHEMA} with a 'kernels' list and a 'library' list: {e}"
                 ))
             } else {
                 Error::manifest(format!("the manifest {label:?} is not a tilefish manifest: it is not a JSON object"))
             }
         })?;
-        if let Some(older) = raw.schema.as_u64().filter(|n| (1..MANIFEST_SCHEMA).contains(n)) {
-            return Err(Error::manifest(format!(
-                "the manifest {label:?} is schema {older}, which an older tilefish wrote; this host reads schema {MANIFEST_SCHEMA}, where every \
-                 pointer records its shape and every entry the constraints of its dimensions: export it again with a current tilefish"
-            )));
-        }
+        // the schema is the integer 3: not 3.0 (which a strict host refuses), not "3", not true
         if raw.schema.as_u64() != Some(MANIFEST_SCHEMA) {
             return Err(Error::manifest(format!(
                 "the manifest {label:?} is not a tilefish manifest of schema {MANIFEST_SCHEMA} (schema {})",
@@ -1108,6 +1769,13 @@ impl Manifest {
         for raw in &raws {
             // everything that needs no file: the names (a cubin name that leaves the directory is refused here, before any read)
             Entry::check_raw(raw).map_err(|e| Error::manifest(format!("'{}' ({}): {e}", raw.stem, raw.arch)))?;
+        }
+        let mut library = Vec::with_capacity(raw.library.len());
+        for (i, value) in raw.library.iter().enumerate() {
+            let entry: RawLibrary = serde_json::from_value(value.clone()).map_err(|e| {
+                Error::manifest(format!("library entry #{i} ({:?}): {e}", value.get("stem").and_then(Value::as_str)))
+            })?;
+            library.push(LibraryEntry::from_raw(entry, i)?);
         }
         let digest =
             manifest_digest(&doc).map_err(|e| Error::manifest(format!("the manifest cannot be digested: {e}")))?;
@@ -1126,7 +1794,19 @@ impl Manifest {
             let cubin = verify_cubin(&raw, &stem, &arch, &mut read_cubin)?;
             entries.push(Entry::from_raw(raw, cubin.into())?);
         }
-        Ok(Self { label: label.to_owned(), digest, entries, kernels: Mutex::new(HashMap::new()) })
+        for entry in &library {
+            if !seen.insert((entry.stem.clone(), entry.arch.clone())) {
+                return Err(Error::manifest(format!("the manifest lists '{}' for {} twice", entry.stem, entry.arch)));
+            }
+        }
+        Ok(Self {
+            label: label.to_owned(),
+            digest,
+            entries,
+            library,
+            kernels: Mutex::new(HashMap::new()),
+            gemms: Mutex::new(HashMap::new()),
+        })
     }
 
     /// The digest of the whole manifest (see [`manifest_digest`]): what a pin is compared with.
@@ -1149,6 +1829,16 @@ impl Manifest {
         self.entries.iter().find(|e| e.stem == stem && e.arch == arch)
     }
 
+    /// Every library operation of the manifest (a pinned cuBLASLt GEMM), in file order.
+    pub fn library(&self) -> &[LibraryEntry] {
+        &self.library
+    }
+
+    /// The library operation of `stem` for `arch` (`"sm_103"`).
+    pub fn library_entry(&self, stem: &str, arch: &str) -> Option<&LibraryEntry> {
+        self.library.iter().find(|e| e.stem == stem && e.arch == arch)
+    }
+
     /// Refuse unless the digest is `pinned`: what a generated launcher does with the digest of the manifest it was
     /// generated from.
     pub fn require_digest(&self, pinned: &str) -> Result<()> {
@@ -1167,62 +1857,103 @@ impl Manifest {
 
     /// The index of the entry for `name` (a stem, or an operator) with exactly these bucket values on `arch`.
     pub(crate) fn select(&self, name: &str, buckets: &[(&str, u64)], arch: &str) -> Result<usize> {
-        let same = |entry: &Entry| {
-            entry.buckets.len() == buckets.len()
-                && buckets.iter().all(|(d, v)| entry.buckets.iter().any(|(ed, ev)| ed == d && ev == v))
-        };
-        let named: Vec<usize> =
-            (0..self.entries.len()).filter(|i| self.entries[*i].stem == name || self.entries[*i].op == name).collect();
-        if named.is_empty() {
-            let mut have: Vec<&str> = self.entries.iter().map(|e| e.stem.as_str()).collect();
-            have.sort_unstable();
-            have.dedup();
-            return Err(Error::NoBinary(format!(
-                "the manifest in {:?} has no kernel '{name}' (it has {have:?})",
-                self.label
-            )));
-        }
-        let here: Vec<usize> = named.iter().copied().filter(|i| self.entries[*i].arch == arch).collect();
-        if here.is_empty() {
-            let mut archs: Vec<&str> = named.iter().map(|i| self.entries[*i].arch.as_str()).collect();
-            archs.sort_unstable();
-            archs.dedup();
-            return Err(Error::NoBinary(format!(
-                "the manifest in {:?} has no binary for '{name}' on {arch} (it has {})",
-                self.label,
-                archs.join(", ")
-            )));
-        }
-        // a stem names its own buckets; an operator needs them given
-        let found = here.iter().copied().find(|i| {
-            let e = &self.entries[*i];
-            if e.stem == name { buckets.is_empty() || same(e) } else { same(e) }
-        });
-        found.ok_or_else(|| {
-            let mut wanted: Vec<&str> = here.iter().flat_map(|i| self.entries[*i].buckets.iter().map(|(d, _)| d.as_str())).collect();
-            wanted.sort_unstable();
-            wanted.dedup();
-            let listing: Vec<String> = wanted
-                .iter()
-                .map(|d| {
-                    let mut vs: Vec<u64> =
-                        here.iter().filter_map(|i| self.entries[*i].buckets.iter().find(|(ed, _)| ed == d).map(|(_, v)| *v)).collect();
-                    vs.sort_unstable();
-                    vs.dedup();
-                    format!("{d}: {vs:?}")
-                })
-                .collect();
-            Error::Precondition {
-                kind: PreconditionKind::Bucket,
-                arg: wanted.first().map(|d| (*d).to_owned()),
-                message: format!(
-                    "no binary was built for {buckets:?}: a bucketed dimension must equal a bucket exactly, and the buckets are \
-                     {{{}}}. There is no padding: pad or slice in the host to a bucket size",
-                    listing.join(", ")
-                ),
-            }
+        let items: Vec<Named<'_>> = self
+            .entries
+            .iter()
+            .map(|e| Named { stem: &e.stem, op: &e.op, arch: &e.arch, buckets: &e.buckets })
+            .collect();
+        select_among(&self.label, "kernel", &items, name, buckets, arch).map_err(|e| match e {
+            Error::NoBinary(m) if self.library.iter().any(|l| l.stem == name || l.op == name) => Error::NoBinary(
+                format!("{m}; '{name}' is a library operation (a pinned cuBLASLt GEMM): load it with Manifest::gemm"),
+            ),
+            other => other,
         })
     }
+
+    /// The index of the library entry for `name` (a stem, or an operator) with exactly these bucket values on `arch`.
+    pub(crate) fn select_library(&self, name: &str, buckets: &[(&str, u64)], arch: &str) -> Result<usize> {
+        let items: Vec<Named<'_>> = self
+            .library
+            .iter()
+            .map(|e| Named { stem: &e.stem, op: &e.op, arch: &e.arch, buckets: &e.buckets })
+            .collect();
+        select_among(&self.label, "library operation", &items, name, buckets, arch).map_err(|e| match e {
+            Error::NoBinary(m) if self.entries.iter().any(|k| k.stem == name || k.op == name) => {
+                Error::NoBinary(format!("{m}; '{name}' is a kernel: load it with Manifest::kernel"))
+            }
+            other => other,
+        })
+    }
+}
+
+/// What the selection of an entry by name needs to know about one: a kernel or a library entry.
+pub(crate) struct Named<'a> {
+    stem: &'a str,
+    op: &'a str,
+    arch: &'a str,
+    buckets: &'a [(String, u64)],
+}
+
+/// The index of the item for `name` (a stem, or an operator) with exactly these bucket values on `arch`: the choice of a kernel and of
+/// a library operation, with `what` (`"kernel"`, `"library operation"`) in the messages.
+fn select_among(
+    label: &str,
+    what: &str,
+    items: &[Named<'_>],
+    name: &str,
+    buckets: &[(&str, u64)],
+    arch: &str,
+) -> Result<usize> {
+    let same = |item: &Named<'_>| {
+        item.buckets.len() == buckets.len()
+            && buckets.iter().all(|(d, v)| item.buckets.iter().any(|(ed, ev)| ed == d && ev == v))
+    };
+    let named: Vec<usize> = (0..items.len()).filter(|i| items[*i].stem == name || items[*i].op == name).collect();
+    if named.is_empty() {
+        let mut have: Vec<&str> = items.iter().map(|e| e.stem).collect();
+        have.sort_unstable();
+        have.dedup();
+        return Err(Error::NoBinary(format!("the manifest in {label:?} has no {what} '{name}' (it has {have:?})")));
+    }
+    let here: Vec<usize> = named.iter().copied().filter(|i| items[*i].arch == arch).collect();
+    if here.is_empty() {
+        let mut archs: Vec<&str> = named.iter().map(|i| items[*i].arch).collect();
+        archs.sort_unstable();
+        archs.dedup();
+        return Err(Error::NoBinary(format!(
+            "the manifest in {label:?} has no binary for '{name}' on {arch} (it has {})",
+            archs.join(", ")
+        )));
+    }
+    // a stem names its own buckets; an operator needs them given
+    let found = here.iter().copied().find(|i| {
+        let e = &items[*i];
+        if e.stem == name { buckets.is_empty() || same(e) } else { same(e) }
+    });
+    found.ok_or_else(|| {
+        let mut wanted: Vec<&str> = here.iter().flat_map(|i| items[*i].buckets.iter().map(|(d, _)| d.as_str())).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let listing: Vec<String> = wanted
+            .iter()
+            .map(|d| {
+                let mut vs: Vec<u64> =
+                    here.iter().filter_map(|i| items[*i].buckets.iter().find(|(ed, _)| ed == d).map(|(_, v)| *v)).collect();
+                vs.sort_unstable();
+                vs.dedup();
+                format!("{d}: {vs:?}")
+            })
+            .collect();
+        Error::Precondition {
+            kind: PreconditionKind::Bucket,
+            arg: wanted.first().map(|d| (*d).to_owned()),
+            message: format!(
+                "no binary was built for {buckets:?}: a bucketed dimension must equal a bucket exactly, and the buckets are \
+                 {{{}}}. There is no padding: pad or slice in the host to a bucket size",
+                listing.join(", ")
+            ),
+        }
+    })
 }
 
 fn verify_cubin(
@@ -1232,6 +1963,7 @@ fn verify_cubin(
     read_cubin: &mut impl FnMut(&str) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
     let name = raw.cubin.as_str();
+    let kind = entry_kind(raw).map_err(Error::manifest)?;
     let cubin = read_cubin(name).map_err(|e| match e {
         Error::Io { source, .. } => {
             Error::manifest(format!("'{stem}' ({arch}): cannot read the cubin {name:?}: {source}"))
@@ -1257,7 +1989,25 @@ fn verify_cubin(
     if elf.section(&format!(".text.{}", raw.symbol)).is_none() {
         return Err(Error::manifest(format!("'{stem}' ({arch}): {name:?} has no code section '.text.{}'", raw.symbol)));
     }
-    if raw.shared == 0 && elf.uses_shared(&raw.symbol) {
+    // the architecture the cubin is for is in its ELF header, where it can be read (a prebuilt cubin is used as it is, for its own
+    // architecture: Python refuses one whose header says another; a Triton cubin the driver refuses on the wrong device)
+    match (elf.sm(), arch_number(arch)) {
+        (Some(sm), Some(want)) if sm != want => {
+            return Err(Error::manifest(format!(
+                "'{stem}' ({arch}): {name:?} is for sm_{sm} (its ELF header says so), but the manifest says {arch}: a cubin is used as it is, for the architecture it was built for"
+            )));
+        }
+        (None, _) if kind == EntryKind::Binary => {
+            return Err(Error::manifest(format!(
+                "'{stem}' ({arch}): the ELF header of {name:?} is not that of a CUDA cubin of a known architecture: its architecture cannot be read"
+            )));
+        }
+        _ => {}
+    }
+    // (Triton gives a kernel that needs shared memory dynamic shared memory, so the section means the manifest must say how much. A prebuilt
+    // binary may have static shared memory, which has the same section, so its declaration says how much dynamic memory it addresses; the
+    // loader's check, static + dynamic within the device's opt-in maximum, is the guard.)
+    if kind == EntryKind::Triton && raw.shared == 0 && elf.uses_shared(&raw.symbol) {
         return Err(Error::manifest(format!(
             "'{stem}' ({arch}): the kernel has a shared memory section ('.nv.shared.{}'), so it uses shared memory, but the manifest \
              says shared = 0; a launch without the dynamic shared memory it addresses would fault and poison the CUDA context",

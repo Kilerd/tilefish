@@ -7,21 +7,28 @@
 //! is tested without a GPU.
 //!
 //! Everything comes from the manifest: each pointer parameter has its declared shape (`["Rows", 1024]`: a dimension
-//! expression, or the size of a static axis) and the entry has the constraints of its named dimensions. The checks, in order:
-//! the number of tensors; for each tensor its device, dtype and rank, and that no dimension is empty; the binding of the
-//! dimensions from the sizes of the tensors, which must agree across arguments and with the static sizes (a port of
-//! `solve_dims`); the bucket (a bucketed dimension is the bucket exactly: there is no padding) and `divisible_by` of every
-//! dimension; the runtime scalars, derived from their dimension expression or from the element count of the tensor they count,
-//! and their 32-bit range; aliasing of the tensors that are written; 16-byte alignment; `max_elements`. Last, the grid is
-//! evaluated from its expression and checked against the device's limits. A call has nothing but its tensors: there is no way to
-//! tell a launch what a dimension is.
+//! expression, or the size of a static axis) and the entry has the constraints of its named dimensions. A pointer may also take a
+//! *strided view* (its `strides` are fixed to 1 or are dimensions to bind, its `offset` is the address of the view's first element),
+//! or be a *device scalar* (the empty shape: one element); a runtime scalar is an `i32` or an `i64`, and a `fixed` argument is a
+//! value the manifest holds. The checks, in order: the number of tensors; for each tensor its device, dtype and rank (a device scalar
+//! is one element), that no dimension is empty, and that a tensor given for a parameter that is not strided is contiguous; the
+//! binding of the dimensions from the sizes of the tensors, and from the canonical strides of the views, which must agree across
+//! arguments and with the static sizes (a port of `solve_dims`); the bucket (a bucketed dimension is the bucket exactly: there is no
+//! padding) and `divisible_by` of every dimension; the runtime scalars, derived from their dimension expression, from the element count
+//! of the tensor they count or from the stride they carry, and their range (`i32` or `i64`); aliasing of the tensors that are written;
+//! the alignment of every pointer the parameter promises; `max_elements` and `max_extent`. Last, the grid is evaluated from its
+//! expression and checked against the device's limits. A call has nothing but its tensors: there is no way to tell a launch what a
+//! dimension is.
 
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Expr, MAX_DIMS, Pattern, Solved, Symbols, Unsolvable, parse_grid};
-use crate::manifest::{Access, Entry, ParamKind, Precondition, ShapeDim};
-use crate::tensor::{DType, TensorArg};
+use crate::library::LibraryEntry;
+use crate::manifest::{
+    Access, DimInfo, Entry, LaunchAttributes, Param, ParamKind, Precondition, ScalarType, ShapeDim, StrideEntry,
+};
+use crate::tensor::{DType, TensorArg, reach};
 
-/// The widest `kernelParams` array: the arguments of a kernel plus its two scratch slots.
+/// The widest `kernelParams` array: the arguments of a kernel plus its scratch slots.
 pub(crate) const MAX_PARAMS: usize = 64;
 
 /// The device a launch is checked against: its ordinal, the CUDA context the kernel is loaded in, and the largest grid it takes
@@ -37,18 +44,33 @@ pub struct DeviceInfo {
     pub max_grid: [i64; 3],
 }
 
+/// One axis of the strides a pointer takes: a stride dimension to bind (or an expression over them), or the fixed unit stride (the
+/// constant 1, whose mismatch is a refusal of its own kind, `stride`).
+#[derive(Debug, Clone)]
+struct StridePlan {
+    pattern: Pattern,
+}
+
 #[derive(Debug, Clone)]
 struct TensorPlan {
     name: String,
     dtype: DType,
     access: Access,
+    /// A device scalar: a pointer with the empty shape, one element in device memory.
+    device_scalar: bool,
     shape: Vec<Pattern>,
+    /// The strides of a pointer that takes a view, one per axis; `None` is a dense, row-major tensor.
+    strides: Option<Vec<StridePlan>>,
+    /// The alignment the pointer passed must have (16 bytes, or for a strided pointer promised only its element's alignment, that).
+    alignment: u64,
     max_elements: Option<i64>,
+    max_extent: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
 struct ScalarPlan {
     name: String,
+    ty: ScalarType,
     dim: Pattern,
     count_of: Option<usize>,
     divisible: Option<i64>,
@@ -65,6 +87,8 @@ struct DimPlan {
 enum Slot {
     Tensor(usize),
     Scalar(usize),
+    /// A `fixed` argument: its bits in the low bytes of the slot.
+    Fixed(u64),
 }
 
 /// One manifest entry, ready to check a call against.
@@ -76,6 +100,7 @@ pub struct Plan {
     tensors: Vec<TensorPlan>,
     scalars: Vec<ScalarPlan>,
     slots: Vec<Slot>,
+    scratch_slots: usize,
     grid: Vec<Expr>,
     grid_text: String,
     block: [u32; 3],
@@ -89,7 +114,7 @@ pub struct Prepared {
     pub grid: [u32; 3],
     pub(crate) values: [u64; MAX_PARAMS],
     pub(crate) count: usize,
-    /// For each slot, the index of the tensor it holds (`NOT_A_TENSOR` for a scalar or a scratch slot).
+    /// For each slot, the index of the tensor it holds (`NOT_A_TENSOR` for a scalar, a fixed argument or a scratch slot).
     pub(crate) tensor_of: [u8; MAX_PARAMS],
 }
 
@@ -97,8 +122,8 @@ pub struct Prepared {
 pub(crate) const NOT_A_TENSOR: u8 = u8::MAX;
 
 impl Prepared {
-    /// The `kernelParams` values, one 64-bit slot each: an address, or an `i32` in the low four bytes, then the two
-    /// scratch slots (null pointers).
+    /// The `kernelParams` values, one 64-bit slot each: an address, an `i32` or an `f32` in the low four bytes, an `i64`, then the scratch
+    /// slots of a Triton kernel (null pointers; a prebuilt binary has none).
     pub fn params(&self) -> &[u64] {
         &self.values[..self.count]
     }
@@ -108,29 +133,75 @@ fn to_i64(v: u64, what: &str) -> Result<i64> {
     i64::try_from(v).map_err(|_| Error::manifest(format!("{what} {v} does not fit 64 bits")))
 }
 
+/// Everything `Plan` is made of, from a kernel entry or a library entry.
+struct Source<'a> {
+    stem: &'a str,
+    arch: &'a str,
+    params: &'a [Param],
+    dims: &'a [DimInfo],
+    preconditions: &'a [Precondition],
+    grid: &'a str,
+    block: [u32; 3],
+    shared: u32,
+    scratch_slots: usize,
+    launch: Option<&'a LaunchAttributes>,
+}
+
 impl Plan {
     /// The plan of a manifest entry. Refuses a binary that a plain `cuLaunchKernel` cannot run (it needs scratch memory,
     /// programmatic dependent launch, clusters or a cooperative launch) and a pointer of a packed element type.
     pub fn new(entry: &Entry) -> Result<Self> {
-        let who = format!("'{}' ({})", entry.stem, entry.arch);
-        let blockers = entry.launch.blockers();
+        Self::build(&Source {
+            stem: &entry.stem,
+            arch: &entry.arch,
+            params: &entry.params,
+            dims: &entry.dims,
+            preconditions: &entry.preconditions,
+            grid: &entry.grid,
+            block: entry.block,
+            shared: entry.shared,
+            scratch_slots: entry.scratch_slots,
+            launch: Some(&entry.launch),
+        })
+    }
+
+    /// The plan of a library entry (a pinned GEMM): what its operands are checked against. It launches nothing by itself (its grid is
+    /// `(1,)` and it has no scalars): the checks are those of a kernel, on the pointers `a`, `b`, `bias` and `out`.
+    pub(crate) fn for_library(entry: &LibraryEntry) -> Result<Self> {
+        Self::build(&Source {
+            stem: &entry.stem,
+            arch: &entry.arch,
+            params: &entry.params,
+            dims: &entry.dims,
+            preconditions: &entry.preconditions,
+            grid: "(1,)",
+            block: [1, 1, 1],
+            shared: 0,
+            scratch_slots: 0,
+            launch: None,
+        })
+    }
+
+    fn build(source: &Source<'_>) -> Result<Self> {
+        let who = format!("'{}' ({})", source.stem, source.arch);
+        let blockers = source.launch.map(LaunchAttributes::blockers).unwrap_or_default();
         if !blockers.is_empty() {
             return Err(Error::Unsupported(format!(
                 "{who}: the binary needs launch attributes that this host does not set up: {}",
                 blockers.join(", ")
             )));
         }
-        if entry.params.len() + 2 > MAX_PARAMS {
+        if source.params.len() + source.scratch_slots > MAX_PARAMS {
             return Err(Error::Unsupported(format!(
                 "{who}: a kernel with {} parameters is not supported",
-                entry.params.len()
+                source.params.len()
             )));
         }
         let bad = |e: String| Error::manifest(format!("{who}: {e}"));
         // the named dimensions come first, so that a symbol's number is its place in the table of the manifest
         let mut syms = Symbols::default();
-        let mut dims = Vec::with_capacity(entry.dims.len());
-        for d in &entry.dims {
+        let mut dims = Vec::with_capacity(source.dims.len());
+        for d in source.dims {
             syms.intern(&d.name).map_err(bad)?;
             let bucket = match (d.bucket, &d.buckets) {
                 (Some(b), Some(all)) => Some((to_i64(b, "a bucket")?, all.clone())),
@@ -141,9 +212,9 @@ impl Plan {
         let mut tensors: Vec<TensorPlan> = Vec::new();
         let mut scalars: Vec<ScalarPlan> = Vec::new();
         let mut slots = Vec::new();
-        for p in &entry.params {
+        for p in source.params {
             match &p.kind {
-                ParamKind::Pointer { dtype_name, dtype, access, shape } => {
+                ParamKind::Pointer { dtype_name, dtype, access, shape, view } => {
                     let Some(dtype) = *dtype else {
                         return Err(Error::Unsupported(format!(
                             "{who}: parameter '{}' has dtype {dtype_name}, which has no storage type here (packed formats cannot be run yet)",
@@ -160,23 +231,49 @@ impl Plan {
                             }
                         });
                     }
+                    let strides = match view {
+                        Some(view) => {
+                            let mut out = Vec::with_capacity(view.strides.len());
+                            for (axis, s) in view.strides.iter().enumerate() {
+                                out.push(match s {
+                                    StrideEntry::Unit => StridePlan { pattern: Pattern::new("1", Expr::Num(1)) },
+                                    StrideEntry::Dim(e) => StridePlan {
+                                        pattern: Pattern::parse(
+                                            e,
+                                            &format!("the stride of '{}' axis {axis}", p.name),
+                                            &mut syms,
+                                        )
+                                        .map_err(bad)?,
+                                    },
+                                });
+                            }
+                            syms.intern(&view.offset).map_err(bad)?;
+                            Some(out)
+                        }
+                        None => None,
+                    };
                     slots.push(Slot::Tensor(tensors.len()));
                     tensors.push(TensorPlan {
                         name: p.name.clone(),
                         dtype,
                         access: *access,
+                        device_scalar: shape.is_empty(),
                         shape: patterns,
+                        strides,
+                        alignment: 16,
                         max_elements: None,
+                        max_extent: None,
                     });
                 }
-                ParamKind::Scalar { dim, .. } => {
+                ParamKind::Scalar { ty, dim, .. } => {
                     slots.push(Slot::Scalar(scalars.len()));
                     let dim = Pattern::parse(dim, &format!("parameter {} dim", p.name), &mut syms).map_err(bad)?;
-                    scalars.push(ScalarPlan { name: p.name.clone(), dim, count_of: None, divisible: None });
+                    scalars.push(ScalarPlan { name: p.name.clone(), ty: *ty, dim, count_of: None, divisible: None });
                 }
+                ParamKind::Fixed { value } => slots.push(Slot::Fixed(value.bits())),
             }
         }
-        for p in &entry.params {
+        for p in source.params {
             if let ParamKind::Scalar { count_of: Some(target), .. } = &p.kind
                 && let (Some(s), Some(t)) =
                     (scalars.iter().position(|s| s.name == p.name), tensors.iter().position(|t| t.name == *target))
@@ -184,11 +281,21 @@ impl Plan {
                 scalars[s].count_of = Some(t);
             }
         }
-        for pre in &entry.preconditions {
+        for pre in source.preconditions {
             match pre {
                 Precondition::MaxElements { arg, value, .. } => {
                     if let Some(t) = tensors.iter_mut().find(|t| t.name == *arg) {
                         t.max_elements = Some(to_i64(*value, "max_elements")?);
+                    }
+                }
+                Precondition::MaxExtent { arg, value, .. } => {
+                    if let Some(t) = tensors.iter_mut().find(|t| t.name == *arg) {
+                        t.max_extent = Some(to_i64(*value, "max_extent")?);
+                    }
+                }
+                Precondition::PointerAlignment { arg, bytes, .. } => {
+                    if let Some(t) = tensors.iter_mut().find(|t| t.name == *arg) {
+                        t.alignment = *bytes;
                     }
                 }
                 Precondition::Divisible { arg, by, .. } => {
@@ -196,28 +303,26 @@ impl Plan {
                         s.divisible = Some(to_i64(*by, "a divisor")?);
                     }
                 }
-                // checked when the manifest is read: the alignment is 16 for every pointer, a static size is what the
-                // shape says, and a bucket is what `dims` says
-                Precondition::PointerAlignment { .. }
-                | Precondition::StaticSize { .. }
-                | Precondition::Bucket { .. } => {}
+                // checked when the manifest is read: a static size is what the shape says, and a bucket is what `dims` says
+                Precondition::StaticSize { .. } | Precondition::Bucket { .. } => {}
             }
         }
-        let grid = parse_grid(&entry.grid, &mut syms).map_err(bad)?;
+        let grid = parse_grid(source.grid, &mut syms).map_err(bad)?;
         if syms.len() != dims.len() {
             return Err(Error::manifest(format!("{who}: the entry's dims do not name every dimension it uses")));
         }
         Ok(Self {
-            stem: entry.stem.clone(),
+            stem: source.stem.to_owned(),
             syms,
             dims,
             tensors,
             scalars,
             slots,
+            scratch_slots: source.scratch_slots,
             grid,
-            grid_text: entry.grid.clone(),
-            block: entry.block,
-            shared: entry.shared,
+            grid_text: source.grid.to_owned(),
+            block: source.block,
+            shared: source.shared,
         })
     }
 
@@ -241,11 +346,14 @@ impl Plan {
 
     fn describe_tensor(&self, t: usize) -> String {
         let p = &self.tensors[t];
-        format!(
-            "Tensor[{}, {}]",
-            p.shape.iter().map(|d| d.text.as_str()).collect::<Vec<_>>().join(", "),
-            p.dtype.name()
-        )
+        let shape = p.shape.iter().map(|d| d.text.as_str()).collect::<Vec<_>>().join(", ");
+        if p.device_scalar {
+            format!("DevScalar[{}]", p.dtype.name())
+        } else if p.strides.is_some() {
+            format!("Strided[Tensor[{shape}, {}]]", p.dtype.name())
+        } else {
+            format!("Tensor[{shape}, {}]", p.dtype.name())
+        }
     }
 
     fn unsolvable(
@@ -259,47 +367,51 @@ impl Plan {
         let name_of = |i: usize| self.syms.name(i).to_owned();
         match (origin, e) {
             (_, Unsolvable::Eval(message)) => Error::Launch(format!("'{}': {message}", self.stem)),
-            (Origin::Tensor { t, axis }, Unsolvable::Mismatch { expected }) => {
+            (Origin::Tensor { t, axis } | Origin::Stride { t, axis }, e) => {
+                let stride = matches!(origin, Origin::Stride { .. });
                 let name = &self.tensors[t].name;
-                let what =
-                    if pattern.is_static { expected.to_string() } else { format!("{} = {expected}", pattern.text) };
-                Error::precondition(
-                    if pattern.is_static { PreconditionKind::StaticSize } else { PreconditionKind::Shape },
-                    Some(name),
-                    format!(
-                        "'{}': argument '{name}' ({}): dimension {axis} is {actual}, but the signature requires {what}",
-                        self.stem,
-                        self.describe_tensor(t)
+                let which = if stride { format!("the stride of axis {axis}") } else { format!("dimension {axis}") };
+                let head =
+                    format!("'{}': argument '{name}' ({}): {which} is {actual}", self.stem, self.describe_tensor(t));
+                match e {
+                    Unsolvable::Mismatch { expected } => {
+                        let what = if pattern.is_static {
+                            expected.to_string()
+                        } else {
+                            format!("{} = {expected}", pattern.text)
+                        };
+                        let note = if stride && pattern.is_static {
+                            " (the kernel loads along that axis contiguously: pass a view whose last axis has stride 1)"
+                        } else {
+                            ""
+                        };
+                        let kind = match (pattern.is_static, stride) {
+                            (true, true) => PreconditionKind::Stride,
+                            (true, false) => PreconditionKind::StaticSize,
+                            (false, _) => PreconditionKind::Shape,
+                        };
+                        Error::precondition(
+                            kind,
+                            Some(name),
+                            format!("{head}, but the signature requires {what}{note}"),
+                        )
+                    }
+                    Unsolvable::NotWhole { var, target, coefficient } => Error::precondition(
+                        PreconditionKind::Shape,
+                        Some(name),
+                        format!(
+                            "{head}, which cannot match {} (would need {} = {target}/{coefficient})",
+                            pattern.text,
+                            name_of(var)
+                        ),
                     ),
-                )
-            }
-            (Origin::Tensor { t, axis }, Unsolvable::NotWhole { var, target, coefficient }) => {
-                let name = &self.tensors[t].name;
-                Error::precondition(
-                    PreconditionKind::Shape,
-                    Some(name),
-                    format!(
-                        "'{}': argument '{name}' ({}): dimension {axis} is {actual}, which cannot match {} (would need {} = {target}/{coefficient})",
-                        self.stem,
-                        self.describe_tensor(t),
-                        pattern.text,
-                        name_of(var)
+                    Unsolvable::NotPositive { var, value } => Error::precondition(
+                        PreconditionKind::Shape,
+                        Some(name),
+                        format!("{head}, which cannot match {} (would need {} = {value})", pattern.text, name_of(var)),
                     ),
-                )
-            }
-            (Origin::Tensor { t, axis }, Unsolvable::NotPositive { var, value }) => {
-                let name = &self.tensors[t].name;
-                Error::precondition(
-                    PreconditionKind::Shape,
-                    Some(name),
-                    format!(
-                        "'{}': argument '{name}' ({}): dimension {axis} is {actual}, which cannot match {} (would need {} = {value})",
-                        self.stem,
-                        self.describe_tensor(t),
-                        pattern.text,
-                        name_of(var)
-                    ),
-                )
+                    Unsolvable::Eval(_) => unreachable!("handled above"),
+                }
             }
             (Origin::Scalar { s }, other) => {
                 let name = &self.scalars[s].name;
@@ -338,6 +450,7 @@ impl Plan {
         }
         // -- each tensor on its own
         let mut counts = [0i64; MAX_PARAMS];
+        let mut canonical: Vec<Vec<u128>> = Vec::with_capacity(tensors.len());
         for (i, (t, a)) in self.tensors.iter().zip(tensors).enumerate() {
             if let Some(d) = device.filter(|d| d.ordinal != a.device) {
                 return Err(Error::precondition(
@@ -385,6 +498,24 @@ impl Plan {
                     ),
                 ));
             }
+            if t.device_scalar {
+                // one element of device memory: a tensor of shape [] or [1]
+                if !(a.shape.is_empty() || a.shape == [1]) {
+                    return Err(Error::precondition(
+                        PreconditionKind::Shape,
+                        Some(&t.name),
+                        format!(
+                            "argument '{}' has shape {:?}, but the signature requires {}: one element in device memory (a tensor of shape [] or [1])",
+                            t.name,
+                            a.shape,
+                            self.describe_tensor(i)
+                        ),
+                    ));
+                }
+                counts[i] = 1;
+                canonical.push(Vec::new());
+                continue;
+            }
             if a.shape.len() != t.shape.len() {
                 return Err(Error::precondition(
                     PreconditionKind::Rank,
@@ -409,6 +540,20 @@ impl Plan {
                     ),
                 ));
             }
+            if t.strides.is_none()
+                && let Some(strides) = a.strides
+                && !is_contiguous(a.shape, strides)
+            {
+                return Err(Error::precondition(
+                    PreconditionKind::Contiguous,
+                    Some(&t.name),
+                    format!(
+                        "argument '{}' is not contiguous (row-major, no gaps; shape {:?}, strides {:?}); this parameter takes a contiguous \
+                         tensor: pass it contiguous, or have the binary declare it Strided[...]",
+                        t.name, a.shape, strides
+                    ),
+                ));
+            }
             let count =
                 a.shape.iter().try_fold(1u128, |acc, d| acc.checked_mul(*d as u128)).filter(|c| *c <= i64::MAX as u128);
             let Some(count) = count else {
@@ -419,21 +564,46 @@ impl Plan {
                 ));
             };
             counts[i] = count as i64;
+            canonical.push(if t.strides.is_some() { canonical_strides(a.shape, a.strides) } else { Vec::new() });
         }
 
-        // -- the dimensions, bound from the sizes of the tensors (and the element counts the scalars carry)
+        // -- the dimensions, bound from the sizes of the tensors, the strides of the views (and the element counts the scalars carry)
         let mut dims: [Option<i64>; MAX_DIMS] = [None; MAX_DIMS];
         let mut equations: Vec<Equation<'_>> = Vec::new();
         for (t, a) in tensors.iter().enumerate() {
-            for (axis, (pattern, size)) in self.tensors[t].shape.iter().zip(a.shape).enumerate() {
+            let plan = &self.tensors[t];
+            for (axis, (pattern, size)) in plan.shape.iter().zip(a.shape).enumerate() {
                 let actual = i64::try_from(*size).map_err(|_| {
-                    Error::precondition(
-                        PreconditionKind::Shape,
-                        Some(&self.tensors[t].name),
-                        "a dimension does not fit 64 bits",
-                    )
+                    Error::precondition(PreconditionKind::Shape, Some(&plan.name), "a dimension does not fit 64 bits")
                 })?;
-                equations.push(Equation { pattern, actual, origin: Origin::Tensor { t, axis }, counted: None });
+                equations.push(Equation {
+                    pattern,
+                    actual,
+                    origin: Origin::Tensor { t, axis },
+                    counted: None,
+                    minimum: 1,
+                });
+            }
+            if let Some(strides) = &plan.strides {
+                for (axis, (stride, value)) in strides.iter().zip(&canonical[t]).enumerate() {
+                    let Ok(actual) = i64::try_from(*value) else {
+                        return Err(Error::precondition(
+                            PreconditionKind::Shape,
+                            Some(&plan.name),
+                            format!(
+                                "argument '{}': the stride of axis {axis} is {value}, which does not fit the 64-bit signed integer a stride is carried in",
+                                plan.name
+                            ),
+                        ));
+                    };
+                    equations.push(Equation {
+                        pattern: &stride.pattern,
+                        actual,
+                        origin: Origin::Stride { t, axis },
+                        counted: None,
+                        minimum: 0, // a stride can be 0 (an expanded view)
+                    });
+                }
             }
         }
         for (s, scalar) in self.scalars.iter().enumerate() {
@@ -443,6 +613,7 @@ impl Plan {
                     actual: counts[t],
                     origin: Origin::Scalar { s },
                     counted: Some((t, counts[t])),
+                    minimum: 1,
                 });
             }
         }
@@ -492,13 +663,14 @@ impl Plan {
                     }
                 },
             };
-            if !(0..=i64::from(i32::MAX)).contains(&value) {
+            if !(0..=scalar.ty.max()).contains(&value) {
                 return Err(Error::precondition(
                     PreconditionKind::Shape,
                     Some(&scalar.name),
                     format!(
-                        "runtime argument '{}' is {value}, which does not fit the 32-bit signed integer the binary takes",
-                        scalar.name
+                        "runtime argument '{}' is {value}, which does not fit the {}-bit signed integer the binary takes",
+                        scalar.name,
+                        if scalar.ty == ScalarType::I64 { 64 } else { 32 }
                     ),
                 ));
             }
@@ -533,21 +705,35 @@ impl Plan {
             }
         }
 
-        // -- every pointer of a binary is compiled as 16-byte aligned, and a generated kernel indexes with i32
+        // -- the alignment each pointer promises (16 bytes; a strided pointer may promise only its element's), and a generated kernel
+        // indexes with i32: the number of elements of a dense tensor, and the extent of a view, must not pass 2**31 - 1
         for (t, a) in self.tensors.iter().zip(tensors) {
-            if a.ptr % 16 != 0 {
+            if a.ptr % t.alignment != 0 {
                 return Err(Error::precondition(
                     PreconditionKind::PointerAlignment,
                     Some(&t.name),
                     format!(
-                        "argument '{}' is at address {:#x}, which is not aligned to 16 bytes; every pointer of '{stem}' is compiled as 16-byte aligned \
+                        "argument '{}' is at address {:#x}, which is not aligned to {} bytes; every pointer of '{stem}' is compiled as {}-byte aligned \
                          (allocate it aligned, or copy it)",
-                        t.name, a.ptr
+                        t.name, a.ptr, t.alignment, t.alignment
                     ),
                 ));
             }
         }
         for (i, (t, a)) in self.tensors.iter().zip(tensors).enumerate() {
+            if let Some(limit) = t.max_extent {
+                let spans = reach_canonical(a.shape, &canonical[i]);
+                if spans > limit as u128 {
+                    return Err(Error::precondition(
+                        PreconditionKind::MaxExtent,
+                        Some(&t.name),
+                        format!(
+                            "argument '{}' (shape {:?}, strides {:?}) spans {spans} elements, more than the {limit} that the i32 offsets of '{stem}' reach",
+                            t.name, a.shape, canonical[i]
+                        ),
+                    ));
+                }
+            }
             if let Some(limit) = t.max_elements.filter(|limit| counts[i] > *limit) {
                 return Err(Error::precondition(
                     PreconditionKind::MaxElements,
@@ -602,13 +788,21 @@ impl Plan {
         for (k, slot) in self.slots.iter().enumerate() {
             values[k] = match slot {
                 Slot::Tensor(t) => {
-                    tensor_of[k] = *t as u8; // at most MAX_PARAMS - 2 tensors: `Plan::new` refuses more parameters
+                    tensor_of[k] = *t as u8; // at most MAX_PARAMS tensors: `Plan::new` refuses more parameters
                     tensors[*t].ptr
                 }
-                Slot::Scalar(s) => u64::from(scalar_values[*s] as u32),
+                Slot::Scalar(s) => {
+                    let v = scalar_values[*s];
+                    match self.scalars[*s].ty {
+                        ScalarType::I32 => u64::from(v as u32),
+                        ScalarType::I64 => v as u64,
+                    }
+                }
+                Slot::Fixed(bits) => *bits,
             };
         }
-        Ok(Prepared { grid, values, count: self.slots.len() + 2, tensor_of }) // the two scratch slots stay 0: null pointers
+        // (the scratch slots of a Triton kernel stay 0: null pointers)
+        Ok(Prepared { grid, values, count: self.slots.len() + self.scratch_slots, tensor_of })
     }
 
     fn solve(&self, dims: &mut [Option<i64>], equations: &[Equation<'_>]) -> Result<()> {
@@ -619,7 +813,7 @@ impl Plan {
                 if done[k] {
                     continue;
                 }
-                match eq.pattern.solve(eq.actual, dims) {
+                match eq.pattern.solve_from(eq.actual, dims, eq.minimum) {
                     Ok(Solved::Checked) => {
                         done[k] = true;
                         progress = true;
@@ -663,6 +857,12 @@ impl Plan {
                         self.describe_tensor(t),
                         stuck.actual
                     ),
+                    Origin::Stride { t, axis } => format!(
+                        "argument '{}' ({}): the stride of axis {axis} (value {})",
+                        self.tensors[t].name,
+                        self.describe_tensor(t),
+                        stuck.actual
+                    ),
                     Origin::Scalar { s } => {
                         format!("runtime argument '{}' (value {})", self.scalars[s].name, stuck.actual)
                     }
@@ -683,6 +883,7 @@ impl Plan {
 #[derive(Clone, Copy)]
 enum Origin {
     Tensor { t: usize, axis: usize },
+    Stride { t: usize, axis: usize },
     Scalar { s: usize },
 }
 
@@ -691,12 +892,63 @@ struct Equation<'p> {
     actual: i64,
     origin: Origin,
     counted: Option<(usize, i64)>,
+    /// The least value the dimension it binds may have: 1 for a size, 0 for a stride.
+    minimum: i64,
 }
 
-/// The bytes a tensor covers, `[start, end)`.
+/// The strides of a view with those of its size-1 axes made canonical (Python's `canonical_strides`): the stride of a size-1 axis is never
+/// read by a kernel, so it is replaced by the stride a dense tensor would have there (`1` for the last axis, else the size of the next axis
+/// times its stride), so that two views that differ only there bind the same values, and an `unsqueeze` or an `expand` does not pass a stride
+/// that no kernel reads. `None` strides are the dense row-major ones.
+fn canonical_strides(shape: &[usize], strides: Option<&[usize]>) -> Vec<u128> {
+    let n = shape.len();
+    let mut out: Vec<u128> = match strides {
+        Some(s) => s.iter().map(|v| *v as u128).collect(),
+        None => {
+            let mut dense = vec![0u128; n];
+            let mut acc = 1u128;
+            for i in (0..n).rev() {
+                dense[i] = acc;
+                acc = acc.saturating_mul(shape[i] as u128);
+            }
+            dense
+        }
+    };
+    for i in (0..n).rev() {
+        if shape[i] == 1 {
+            out[i] = if i + 1 == n { 1 } else { (shape[i + 1] as u128).saturating_mul(out[i + 1]) };
+        }
+    }
+    out
+}
+
+/// One more than the largest element offset a tensor of this shape and these (canonical) strides reaches.
+fn reach_canonical(shape: &[usize], strides: &[u128]) -> u128 {
+    if strides.is_empty() {
+        // a dense tensor: its number of elements
+        return shape.iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128));
+    }
+    shape.iter().zip(strides).fold(1u128, |acc, (n, s)| acc.saturating_add((*n as u128 - 1).saturating_mul(*s)))
+}
+
+/// Whether a tensor is contiguous the way torch's `is_contiguous` says: row-major with no gaps, the strides of size-1 axes not looked at.
+fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
+    let mut expected = 1u128;
+    for (n, s) in shape.iter().zip(strides).rev() {
+        if *n == 1 {
+            continue;
+        }
+        if *s as u128 != expected {
+            return false;
+        }
+        expected = expected.saturating_mul(*n as u128);
+    }
+    true
+}
+
+/// The bytes a tensor covers, `[start, end)`: the elements it reaches (a dense tensor's, a view's extent) from its first one.
 fn extent(a: &TensorArg<'_>) -> (u128, u128) {
-    let bytes =
-        a.shape.iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128)).saturating_mul(a.dtype.size() as u128);
+    let bytes = reach(a.shape, a.strides).saturating_mul(a.dtype.size() as u128);
     (u128::from(a.ptr), u128::from(a.ptr).saturating_add(bytes))
 }
 
@@ -744,5 +996,39 @@ mod tests {
             plan.prepare(&[arg(&SHAPE, 0x7000_0000_0000, Some(1)), arg(&SHAPE, 0x7000_1000_0000, Some(2))], None)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn strides_are_made_canonical_where_the_size_is_one() {
+        // a dense tensor
+        assert_eq!(canonical_strides(&[4, 8, 64], None), [512, 64, 1]);
+        // a view as torch reports it
+        assert_eq!(canonical_strides(&[40, 8, 64], Some(&[1536, 64, 1])), [1536, 64, 1]);
+        // a size-1 axis gets the stride of a dense tensor there, whatever the view says (an unsqueeze, an expand)
+        assert_eq!(canonical_strides(&[1, 8, 8], Some(&[999, 8, 1])), [64, 8, 1]);
+        assert_eq!(canonical_strides(&[4, 8, 1], Some(&[8, 1, 12345])), [8, 1, 1]);
+        assert_eq!(canonical_strides(&[1], Some(&[7])), [1]);
+        // a stride of 0 (an expanded view) of an axis that is not size 1 stays 0
+        assert_eq!(canonical_strides(&[40, 8, 64], Some(&[0, 64, 1])), [0, 64, 1]);
+    }
+
+    #[test]
+    fn contiguity_is_torchs() {
+        assert!(is_contiguous(&[4, 8], &[8, 1]));
+        assert!(!is_contiguous(&[4, 8], &[16, 1]));
+        assert!(!is_contiguous(&[4, 8], &[1, 4]));
+        assert!(is_contiguous(&[1, 8], &[777, 1]), "the stride of a size-1 axis is not looked at");
+        assert!(is_contiguous(&[4, 1, 8], &[8, 5, 1]));
+        assert!(!is_contiguous(&[40, 8, 64], &[1536, 64, 1]));
+        assert!(is_contiguous(&[], &[]));
+    }
+
+    #[test]
+    fn the_extent_of_a_view_is_one_more_than_the_largest_offset() {
+        assert_eq!(reach_canonical(&[40, 8, 64], &[1536, 64, 1]), 39 * 1536 + 7 * 64 + 63 + 1);
+        assert_eq!(reach_canonical(&[40, 8, 64], &[0, 64, 1]), 7 * 64 + 63 + 1, "an expanded axis adds nothing");
+        assert_eq!(reach_canonical(&[4, 8], &[]), 32, "a dense tensor: its elements");
+        // unbounded: the product exceeds 64 bits and is still compared as it is
+        assert!(reach_canonical(&[1 << 40, 1 << 40], &[1 << 40, 1]) > u128::from(u64::MAX));
     }
 }

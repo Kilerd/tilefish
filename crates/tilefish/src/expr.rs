@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 const MAX_LEN: usize = 512;
 const MAX_TOKENS: usize = 256;
 const MAX_DEPTH: usize = 24;
-/// The most dimension names one kernel may use.
-pub const MAX_DIMS: usize = 16;
+/// The most dimension names one kernel may use (a strided pointer has one name per axis for its strides, and one for its offset).
+pub const MAX_DIMS: usize = 32;
 
 /// The dimension names of one kernel, numbered in order of first appearance.
 #[derive(Debug, Clone, Default)]
@@ -498,8 +498,15 @@ impl Pattern {
         Ok(Self::new(text, parse_expr(text, what, syms)?))
     }
 
-    /// Bind or check one dimension against `actual`, as Python's `_solve_one` does.
+    /// Bind or check one dimension against `actual`, as Python's `_solve_one` does: a dimension is at least 1.
+    #[cfg(test)]
     pub fn solve(&self, actual: i64, dims: &[Option<i64>]) -> Result<Solved, Unsolvable> {
+        self.solve_from(actual, dims, 1)
+    }
+
+    /// As [`Pattern::solve`], with the dimension it binds at least `minimum`: 1 for a size, 0 for a stride (the stride of an expanded view
+    /// is 0, as Python's `_solve_one` allows for the equations of a stride).
+    pub fn solve_from(&self, actual: i64, dims: &[Option<i64>], minimum: i64) -> Result<Solved, Unsolvable> {
         let mut unbound = self.vars.iter().copied().filter(|v| dims.get(*v).copied().flatten().is_none());
         let Some(var) = unbound.next() else {
             return match self.expr.eval(dims).map_err(Unsolvable::Eval)? {
@@ -536,7 +543,7 @@ impl Pattern {
             });
         }
         let value = target / coefficient;
-        if value < 1 {
+        if value < i128::from(minimum) {
             return Err(Unsolvable::NotPositive { var, value: i64::try_from(value).unwrap_or(i64::MIN) });
         }
         match i64::try_from(value) {

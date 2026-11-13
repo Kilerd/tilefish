@@ -1,6 +1,8 @@
 //! Helpers of the tests that read the fixtures (`tests/fixtures`, built by `python/tests/export_rust_fixtures.py`).
 #![allow(dead_code)]
 
+pub mod synthetic;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 

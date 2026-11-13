@@ -28,7 +28,7 @@ pub use cudarc::driver::{CudaContext, CudaStream};
 
 use crate::error::{Error, Result};
 use crate::ffi;
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, Param};
 use crate::plan::{DeviceInfo, Plan, Prepared};
 use crate::tensor::TensorArg;
 
@@ -237,9 +237,20 @@ impl Manifest {
         let module =
             ctx.load_module(Ptx::from_binary(entry.cubin.to_vec())).map_err(Error::driver("cuModuleLoadData"))?;
         let function = module.load_function(&entry.symbol).map_err(Error::driver("cuModuleGetFunction"))?;
+        let who = format!("'{}' ({})", entry.stem, entry.arch);
+        // the loaded function must take the parameters of the manifest's ABI, with the sizes it says (Python's `_check_params`): a prebuilt
+        // binary's ABI is declared by its author, and a function that read more than it was given would read what follows the array
+        let reported = ffi::param_sizes(&function);
+        let expected: Vec<usize> =
+            entry.params.iter().map(Param::size).chain(std::iter::repeat_n(8, entry.scratch_slots)).collect();
+        if reported != expected {
+            return Err(Error::Manifest(format!(
+                "{who}: the loaded function '{}' takes parameters of {reported:?} bytes, but the ABI in the manifest says {expected:?}",
+                entry.symbol
+            )));
+        }
         let static_shared =
             i64::from(function.shared_size_bytes().map_err(Error::driver("cuFuncGetAttribute(SHARED_SIZE_BYTES)"))?);
-        let who = format!("'{}' ({})", entry.stem, entry.arch);
         if static_shared + i64::from(entry.shared) > shared_optin {
             return Err(Error::Unsupported(format!(
                 "{who} needs {static_shared} bytes of static and {} bytes of dynamic shared memory, more than the {shared_optin} bytes a block may use on this device",

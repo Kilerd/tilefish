@@ -53,13 +53,16 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _, DeviceSlice as _, LaunchArgs, PushKernelArg,
+    CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtr as _, DevicePtrMut as _, DeviceSlice as _, LaunchArgs,
+    PushKernelArg, SyncOnDrop,
 };
 
 pub(crate) mod sealed {
     use std::sync::Arc;
 
-    use super::{CudaStream, LaunchArgs};
+    use cudarc::driver::SyncOnDrop;
+
+    use super::{CudaStream, CudaView, CudaViewMut, LaunchArgs};
 
     /// Where a piece of cudarc memory is: what a launch checks a tensor of it against.
     #[derive(Debug, Clone)]
@@ -82,12 +85,28 @@ pub(crate) mod sealed {
     pub trait Read: Memory {
         /// Hand the memory to `launch` as a read, on the stream `launch` is for.
         fn push<'b>(&'b self, launch: &mut LaunchArgs<'b>);
+
+        /// A view of the bytes of the memory from byte `from` on (`None` when there are none): for a view of a tensor whose first element
+        /// is not the first byte of the slice, which `launch` hands to cudarc in place of the slice, so that the kernel is given the
+        /// address of the first element and cudarc still orders and records the use of the slice.
+        fn bytes_from(&self, from: u64) -> Option<CudaView<'_, u8>>;
+
+        /// What cudarc's `device_ptr(stream)` does besides giving the address: `stream` waits for the memory's last write, and the guard,
+        /// dropped, records the read on the memory's `read` event on `stream`. (For the calls that are not a kernel launch.)
+        fn sync_read<'b>(&'b self, stream: &'b CudaStream) -> SyncOnDrop<'b>;
     }
 
     /// Memory a launch writes.
     pub trait Write: Memory {
         /// Hand the memory to `launch` as a write, on the stream `launch` is for.
         fn push<'b>(&'b mut self, launch: &mut LaunchArgs<'b>);
+
+        /// As [`Read::bytes_from`], for memory that is written.
+        fn bytes_from_mut(&mut self, from: u64) -> Option<CudaViewMut<'_, u8>>;
+
+        /// What cudarc's `device_ptr_mut(stream)` does besides giving the address: `stream` waits for the memory's last read and write, and
+        /// the guard, dropped, records the write on the memory's `write` event on `stream`.
+        fn sync_write<'b>(&'b mut self, stream: &'b CudaStream) -> SyncOnDrop<'b>;
     }
 }
 
@@ -135,11 +154,27 @@ impl<E> sealed::Read for CudaSlice<E> {
     fn push<'b>(&'b self, launch: &mut LaunchArgs<'b>) {
         launch.arg(self);
     }
+
+    fn bytes_from(&self, from: u64) -> Option<CudaView<'_, u8>> {
+        crate::ffi::bytes_of_slice(self, from)
+    }
+
+    fn sync_read<'b>(&'b self, stream: &'b CudaStream) -> SyncOnDrop<'b> {
+        self.device_ptr(stream).1
+    }
 }
 
 impl<E> sealed::Read for CudaView<'_, E> {
     fn push<'b>(&'b self, launch: &mut LaunchArgs<'b>) {
         launch.arg(self);
+    }
+
+    fn bytes_from(&self, from: u64) -> Option<CudaView<'_, u8>> {
+        crate::ffi::bytes_of_view(self, from)
+    }
+
+    fn sync_read<'b>(&'b self, stream: &'b CudaStream) -> SyncOnDrop<'b> {
+        self.device_ptr(stream).1
     }
 }
 
@@ -147,10 +182,26 @@ impl<E> sealed::Write for CudaSlice<E> {
     fn push<'b>(&'b mut self, launch: &mut LaunchArgs<'b>) {
         launch.arg(self);
     }
+
+    fn bytes_from_mut(&mut self, from: u64) -> Option<CudaViewMut<'_, u8>> {
+        crate::ffi::bytes_of_slice_mut(self, from)
+    }
+
+    fn sync_write<'b>(&'b mut self, stream: &'b CudaStream) -> SyncOnDrop<'b> {
+        self.device_ptr_mut(stream).1
+    }
 }
 
 impl<E> sealed::Write for CudaViewMut<'_, E> {
     fn push<'b>(&'b mut self, launch: &mut LaunchArgs<'b>) {
         launch.arg(self);
+    }
+
+    fn bytes_from_mut(&mut self, from: u64) -> Option<CudaViewMut<'_, u8>> {
+        crate::ffi::bytes_of_view_mut(self, from)
+    }
+
+    fn sync_write<'b>(&'b mut self, stream: &'b CudaStream) -> SyncOnDrop<'b> {
+        self.device_ptr_mut(stream).1
     }
 }

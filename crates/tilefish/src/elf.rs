@@ -254,6 +254,20 @@ impl<'a> Elf<'a> {
         self.sections.iter().find(|s| s.name == name)
     }
 
+    /// The SM version a cubin is for (`103` for sm_103), from its ELF header: Python's `cubin_sm`.
+    ///
+    /// Checked by Python on cubins that ptxas 12.9 made for sm_80 to sm_120: a cubin whose `EI_OSABI` is `0x33` (up to sm_90) has the
+    /// version in the low byte of `e_flags` (80, 86, 89, 90; bit 11 is the `a` suffix), one whose `EI_OSABI` is `0x41` (sm_100 and
+    /// later, the `a`/`f` suffix in the low byte) has it in the second byte (100, 103, 120). `None` for another OS ABI: the version
+    /// cannot be read.
+    pub fn sm(&self) -> Option<u32> {
+        match self.ident[7] {
+            0x33 => Some(self.flags & 0xFF),
+            0x41 => Some((self.flags >> 8) & 0xFF),
+            _ => None,
+        }
+    }
+
     /// Whether the kernel `symbol` uses shared memory: it has a `.nv.shared.<symbol>` section.
     ///
     /// The ELF does not say how much dynamic shared memory the code addresses: that is the `shared` the build recorded.

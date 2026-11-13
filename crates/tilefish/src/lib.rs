@@ -123,8 +123,10 @@ pub mod elf;
 mod error;
 mod expr;
 mod ffi;
+mod gemm;
 pub mod json;
 mod kernel;
+mod library;
 mod manifest;
 mod memory;
 mod plan;
@@ -134,10 +136,13 @@ mod tensor;
 pub use cudarc;
 pub use error::{Error, PreconditionKind, Result};
 pub use ffi::driver_available;
+pub use gemm::{Gemm, cublaslt_version};
 pub use kernel::{Arch, CUstream, CudaContext, CudaStream, Kernel};
+pub use library::{LibraryEntry, LibraryImpl};
 pub use manifest::{
-    Access, Constexpr, Entry, LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin,
-    Precondition, manifest_digest,
+    Access, BinarySource, Constexpr, DimInfo, Entry, EntryKind, FixedValue, LaunchAttributes, MANIFEST_NAME,
+    MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin, Precondition, ScalarType, ShapeDim, StrideEntry, StrideOf, View,
+    manifest_digest,
 };
 pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, Plan, Prepared};
