@@ -584,8 +584,8 @@ def validate_spec(d: Any) -> None:
     binary = d.get("binary") if schema >= STRIDED_SCHEMA else None
     is_binary = binary is not None
     # enable_fp_fusion and source_sha256 exist from schema 2 on: both in the specs of kernels that tilefish generated, enable_fp_fusion in
-    # those of an extern declared with enable_fp_fusion= too
-    optional = ["enable_fp_fusion", "source_sha256", "dims"] if schema >= DIGEST_SCHEMA else []
+    # those of an extern declared with enable_fp_fusion= too; language only in the spec of a Gluon kernel (extern(gluon=...))
+    optional = ["enable_fp_fusion", "source_sha256", "dims", "language"] if schema >= DIGEST_SCHEMA else []
     required = TOP_KEYS_V2 if schema >= DIGEST_SCHEMA else TOP_KEYS
     if is_binary:
         required = [k for k in required if k not in ("triton", "num_warps", "num_stages")] + ["binary"]
@@ -597,6 +597,8 @@ def validate_spec(d: Any) -> None:
         bad(f"declaration_digest must be 64 lowercase hex digits (a sha256), got {d['declaration_digest']!r}")
     if "enable_fp_fusion" in d and not isinstance(d["enable_fp_fusion"], bool):
         bad(f"enable_fp_fusion must be true or false, got {d['enable_fp_fusion']!r}")
+    if "language" in d and d["language"] != "gluon":  # written only for a Gluon kernel: a Triton kernel's spec has no key (one canonical form)
+        bad(f"language is \"gluon\" (the spec of a Gluon kernel) or absent (a triton.jit kernel), got {d['language']!r}")
 
     # names
     op = _ident(d["op"], "op")

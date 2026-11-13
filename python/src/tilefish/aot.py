@@ -278,6 +278,8 @@ class AstSourceInputs:
     attrs: dict[tuple[int, ...], list[list[Any]]]
     constants: dict[tuple[int, ...], Any]
     options: dict[str, Any]
+    # the frontend: "triton" hands these to ``ASTSource``, "gluon" to Gluon's ``GluonASTSource`` (the same four arguments)
+    language: str = "triton"
 
     @property
     def signature_by_index(self) -> dict[int, str]:
@@ -329,6 +331,9 @@ class CompileSpec:
     # spec has no Triton reference (``triton`` is ``""``), no warps or stages (``0``), no constexprs and no scratch slots. ``None``
     # for a Triton kernel.
     binary: "dict[str, Any] | None" = None
+    # The frontend that compiles the kernel: ``"triton"`` (``triton.jit``, Triton's ``ASTSource``) or ``"gluon"`` (``gluon.jit``, Gluon's
+    # ``GluonASTSource``: TTGIR with explicit layouts). Written to the spec only for Gluon, so every other spec is as it was.
+    language: str = "triton"
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
@@ -406,6 +411,7 @@ class CompileSpec:
             attrs=copy.deepcopy(self.attrs),
             constants=dict(self.constants),
             options=options,
+            language=self.language,
         )
 
     @property
@@ -445,6 +451,8 @@ class CompileSpec:
         doc: dict[str, Any] = {"schema": self.schema, "stem": self.stem, "op": self.op}
         if self.binary is None:
             doc["triton"] = {"module": self.triton_module, "function": self.triton_function, "ref": self.triton}
+            if self.language != "triton":  # a Gluon kernel: the reference is compiled by Gluon's frontend
+                doc["language"] = self.language
         else:
             doc["binary"] = copy.deepcopy(self.binary)
         doc["buckets"] = dict(self.buckets)
@@ -512,6 +520,7 @@ class CompileSpec:
                 enable_fp_fusion=d.get("enable_fp_fusion"),
                 source_sha256=d.get("source_sha256"),
                 dims=copy.deepcopy(d.get("dims", {})),
+                language=d.get("language", "triton"),
             )
 
     def verify_against(self, op: ExternOp) -> None:
@@ -740,6 +749,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
     doc: dict[str, Any] = {"format": DIGEST_FORMAT, "op": op.name}
     if op.binary is None:
         doc.update({"triton": op.triton, "num_warps": op.num_warps, "num_stages": op.num_stages})
+        if op.language != "triton":  # a Gluon kernel (only then: every other declaration digests as it did)
+            doc["language"] = op.language
     else:  # a prebuilt binary: what it is made of (the sha256 of its PTX or cubin), its entry point, block and shared memory
         doc["binary"] = {
             "kind": op.binary.kind,
@@ -994,6 +1005,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         source_sha256=op.source_sha256,
         dims=dict(sorted(dims.items())),
         binary=binary,
+        language=op.language,
     )
     spec._mark_verified()  # generated from the declaration just now
     return spec

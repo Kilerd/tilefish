@@ -10,6 +10,9 @@ returns the :class:`FakeCompiler` behind it. What it models is what the identity
   represented by the dump of its syntax tree, which has the same two properties.)
 * the **compiler** (``triton.compile``) calls the frontend, then makes a small ELF file whose code is a function of the IR text, the
   options and the architecture, and counts the calls.
+* **Gluon's frontend** (``triton.experimental.gluon._runtime.GluonASTSource``): the IR of a Gluon kernel is its TTGIR, whose module carries
+  ``ttg.num-warps`` and ``ttg.target`` (and the layouts, which here are whatever the function's body returns); Triton's own frontend cannot
+  build a Gluon kernel (its layouts need ``ttg.num-warps``), and neither can it here. ``gluon.jit`` makes a ``FakeGluonJit``.
 
 It is not Triton: it checks nothing a real compile checks. The real thing is checked on a GPU (``test_gpu_identity.py``).
 """
@@ -80,6 +83,8 @@ class FakeModule:
 
 
 class ASTSource:
+    language = "triton"
+
     def __init__(self, fn, signature, constexprs=None, attrs=None):
         self.fn, self.signature, self.attrs, self.constants = fn, signature, attrs, {}
 
@@ -87,6 +92,8 @@ class ASTSource:
         return {}
 
     def make_ir(self, target, options, codegen_fns, module_map, context):
+        if self.fn.is_gluon() and self.language != "gluon":  # Triton's frontend on a Gluon kernel, as Triton 3.5.1 fails it
+            raise RuntimeError("error encountered during parsing: Could not determine the number of warps per CTA (no ttg.num-warps)")
         names = list(self.fn.arg_names)
         constants = {index[0]: value for index, value in self.constants.items()}
         args = [constants[i] if i in constants else Sym(names[i]) for i in range(len(names))]
@@ -96,6 +103,16 @@ class ASTSource:
             body = ast.dump(ast.parse(textwrap.dedent("".join(self.fn.raw_src))))
         types_ = ",".join(f"{self.signature.get(n, '?')}" for n in names)
         return FakeModule(f"module {{ func @{self.fn.__name__}({types_}) attrs={sorted(map(str, (self.attrs or {}).items()))} {{ {body} }} }}")
+
+
+class GluonSourceMixin:
+    """Gluon's frontend: the module of a Gluon kernel is TTGIR, with ``ttg.num-warps`` and ``ttg.target`` set before the body is built."""
+
+    language = "gluon"
+
+    def make_ir(self, target, options, codegen_fns, module_map, context):
+        module = super().make_ir(target, options, codegen_fns, module_map, context)
+        return FakeModule(f'module attributes {{"ttg.num-warps" = {options.num_warps}, ttg.target = "cuda:{target.arch}"}} ttgir ' + module.text)
 
 
 class FakeBackend:
@@ -137,6 +154,7 @@ class FakeCompiler:
     def __init__(self, version="3.5.1"):
         self.version = version
         self.calls = []  # (the function's name, the options)
+        self.languages = []  # the frontend of each compile: "triton" (ASTSource) or "gluon" (GluonASTSource)
         self.frontends = 0  # how many times the frontend ran (a compile runs it once, a digest once)
         self.shared = 16
         self.fail = None  # an exception to raise from ``compile``
@@ -159,6 +177,7 @@ class FakeCompiler:
             raise self.fail
         options = dict(options or {})
         self.calls.append((src.fn.__name__, options))
+        self.languages.append(src.language)
         module = src.make_ir(target, types.SimpleNamespace(**options), {}, {}, FakeContext())
         text = module.str_nodebug() + repr(sorted(options.items())) + repr(target.arch)
         code = hashlib.sha256(text.encode()).digest() * 2
@@ -229,6 +248,17 @@ def install(monkeypatch, version="3.5.1"):
     monkeypatch.setitem(sys.modules, "triton.backends", _module("triton.backends"))
     monkeypatch.setitem(sys.modules, "triton.backends.compiler", _module("triton.backends.compiler", GPUTarget=GPUTarget))
     monkeypatch.setitem(sys.modules, "triton.compiler", _module("triton.compiler", ASTSource=CountingSource))
+
+    class GluonASTSource(GluonSourceMixin, CountingSource):
+        pass
+
+    gluon_language = _module("triton.experimental.gluon.language", constexpr=fake_triton.constexpr)
+    gluon = _module("triton.experimental.gluon", jit=fake_jit.gluon_jit, language=gluon_language)
+    runtime = _module("triton.experimental.gluon._runtime", GluonASTSource=GluonASTSource, GluonJITFunction=fake_jit.FakeGluonJit)
+    monkeypatch.setitem(sys.modules, "triton.experimental", _module("triton.experimental", gluon=gluon))
+    monkeypatch.setitem(sys.modules, "triton.experimental.gluon", gluon)
+    monkeypatch.setitem(sys.modules, "triton.experimental.gluon.language", gluon_language)
+    monkeypatch.setitem(sys.modules, "triton.experimental.gluon._runtime", runtime)
     monkeypatch.setitem(sys.modules, "triton.compiler.compiler", _module("triton.compiler.compiler", make_backend=FakeBackend))
     ir = _module("triton._C.libtriton.ir", context=FakeContext, load_dialects=lambda context: None)
     monkeypatch.setitem(sys.modules, "triton._C", _module("triton._C"))

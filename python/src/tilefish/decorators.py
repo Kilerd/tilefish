@@ -367,32 +367,51 @@ def kernel(
 # -- extern -----------------------------------------------------------------------------------
 
 _TRITON_REF = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*\Z")
+LANGUAGES = ("triton", "gluon")  # the frontends of Triton a hand-written kernel is compiled by: triton.jit, and Gluon's gluon.jit
 _OP_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")  # ASCII only: an op name is part of a stem, which is part of a file name
 _NUM_WARPS = (1, 2, 4, 8, 16, 32)
 
 
 class _TritonTarget:
-    """What ``extern(triton=...)`` says about the kernel: a reference and, when known, its parameters."""
+    """What ``extern(triton=...)`` or ``extern(gluon=...)`` says about the kernel: a reference and, when known, its parameters and whether it is
+    a Gluon kernel (``None``: the object does not say, or the reference is a string)."""
 
-    def __init__(self, ref: str, arg_names: "list[str] | None" = None, constexpr: "list[bool] | None" = None) -> None:
+    def __init__(
+        self, ref: str, arg_names: "list[str] | None" = None, constexpr: "list[bool] | None" = None, is_gluon: "bool | None" = None
+    ) -> None:
         self.ref = ref
         self.arg_names = arg_names
         self.constexpr = constexpr
+        self.is_gluon = is_gluon
 
 
-def _triton_target(obj: Any) -> _TritonTarget:
-    """Resolve ``triton=``: a ``"module:function"`` string or a kernel object.
+def _is_gluon(chain: "list[Any]") -> "bool | None":
+    """Whether the kernel in ``chain`` (an object and the ``.fn`` it wraps, outermost first) is a Gluon kernel: what the first object that has
+    Triton's ``is_gluon()`` says (a ``triton.JITFunction`` has it, ``False``; a Gluon ``GluonJITFunction``, ``True``), or ``None``."""
+    for cand in chain:
+        method = getattr(cand, "is_gluon", None)
+        if callable(method):
+            try:
+                answer = method()
+            except Exception:  # noqa: BLE001 - an object that only looks like a kernel: it says nothing
+                return None
+            return answer if isinstance(answer, bool) else None
+    return None
+
+
+def _triton_target(obj: Any, language: str = "triton") -> _TritonTarget:
+    """Resolve ``triton=`` (or ``gluon=``, ``language="gluon"``): a ``"module:function"`` string or a kernel object.
 
     For an object, the innermost ``.fn`` that has a ``__module__`` and a
     ``__name__`` names the kernel (a ``triton.JITFunction`` wraps the Python
     function, an autotuner wraps the JIT function). If the object
     exposes the kernel's parameter list (duck-typed, nothing is imported:
     ``arg_names``, and ``params[i].is_constexpr`` when present) it is returned
-    so the stub can be checked against it.
+    so the stub can be checked against it, and so is what its ``is_gluon()`` says (``triton.JITFunction.is_gluon``).
     """
     if isinstance(obj, str):
         if not _TRITON_REF.match(obj):
-            raise TilefishDeclarationError(f"extern: triton={obj!r} must look like 'module:function'")
+            raise TilefishDeclarationError(f"extern: {language}={obj!r} must look like 'module:function'")
         return _TritonTarget(obj)
     chain = [obj]  # an autotuner wraps the JIT function, which wraps the python function
     while len(chain) < 4 and getattr(chain[-1], "fn", None) is not None:
@@ -406,7 +425,7 @@ def _triton_target(obj: Any) -> _TritonTarget:
             break
     if ref is None:
         raise TilefishDeclarationError(
-            f"extern: triton= takes a 'module:function' string or a kernel object, got {obj!r}"
+            f"extern: {language}= takes a 'module:function' string or a kernel object, got {obj!r}"
         )
     # Take the parameter list from wherever it exists in the chain; wrappers that disagree are an error.
     names_at: list[tuple[str, list[str]]] = []
@@ -433,7 +452,18 @@ def _triton_target(obj: Any) -> _TritonTarget:
             f"extern: the kernel object for '{ref}' lists {len(names)} parameter names but {len(flags)} "
             "constexpr flags"
         )
-    return _TritonTarget(ref, names, flags)
+    gluon = _is_gluon(chain)
+    if language == "triton" and gluon is True:
+        raise TilefishDeclarationError(
+            f"extern: '{ref}' is a Gluon kernel (@gluon.jit, triton.experimental.gluon): declare it with gluon=..., not triton=. Its "
+            "identity and its compile go through Gluon's frontend (the layouts are in its IR), which triton= does not use"
+        )
+    if language == "gluon" and gluon is False:
+        raise TilefishDeclarationError(
+            f"extern: gluon= takes a Gluon kernel (@gluon.jit, triton.experimental.gluon), but '{ref}' is a triton.jit kernel: declare it "
+            "with triton=..."
+        )
+    return _TritonTarget(ref, names, flags, gluon)
 
 
 def _consensus(ref: str, what: str, found: "list[tuple[str, list]]") -> "list | None":
@@ -477,6 +507,10 @@ class ExternOp(Op):
     The stub's parameters, in declaration order, are the Triton kernel's
     parameters: tensors are pointers, a parameter annotated with a runtime
     ``Dim`` is an ``i32`` scalar, a ``const`` parameter is a ``constexpr``.
+
+    ``language`` is the frontend that compiles the kernel: ``"triton"`` (a ``triton.jit`` function, ``@tilefish.extern(triton=...)``) or
+    ``"gluon"`` (a Gluon ``gluon.jit`` function, ``@tilefish.extern(gluon=...)``, whose layouts are explicit). It is in the declaration
+    digest and in every compile spec, and it decides which IR identifies the binary (:mod:`tilefish._ir`).
 
     ``index_bits`` is how the kernel indexes its tensors: ``32`` (the default, and what every generated kernel does) or
     ``64``. A kernel whose offsets are ``i32`` reads and writes the wrong memory past ``2**31 - 1`` elements, silently, so
@@ -525,10 +559,17 @@ class ExternOp(Op):
         index_bits: int = 32,
         binary: "BinaryTarget | None" = None,
         reference: "Callable[..., Any] | None" = None,
+        language: str = "triton",
     ) -> None:
         super().__init__(fn, name, signature)
         if type(index_bits) is not int or index_bits not in (32, 64):
             raise TilefishDeclarationError(f"extern '{name}': index_bits must be 32 or 64, got {index_bits!r}")
+        if language not in LANGUAGES:
+            raise TilefishDeclarationError(f"extern '{name}': language must be one of {', '.join(LANGUAGES)}, got {language!r}")
+        if binary is not None and language != "triton":
+            raise TilefishDeclarationError(f"extern '{name}': a prebuilt binary is not compiled by a frontend, so it has no language {language!r}")
+        # the frontend that compiles the kernel: "triton" (triton.jit) or "gluon" (gluon.jit: explicit layouts). Not a fact of a prebuilt binary
+        self.language: str = language
         if reference is not None and not callable(reference):
             raise TilefishDeclarationError(f"extern '{name}': reference must be a callable, got {reference!r}")
         # An oracle in torch for ``mode="reference"`` of a graph that calls this op (see ``tilefish.run``): called with the op's tensor inputs
@@ -594,7 +635,7 @@ class ExternOp(Op):
     def node_attrs(self) -> dict[str, Any]:
         if self.binary is not None:
             return {"binary": self.binary.symbol}
-        return {"triton": self.triton}
+        return {self.language: self.triton}
 
     def check_const(self, param: Param, value: Any) -> Any:
         if value != param.default:
@@ -754,6 +795,7 @@ def _binary_target(
 def extern(
     *args: Any,
     triton: Any = None,
+    gluon: Any = None,
     ptx: Any = None,
     cubin: Any = None,
     symbol: "str | None" = None,
@@ -772,6 +814,20 @@ def extern(
     It always takes arguments (``@tilefish.extern`` without parentheses is an
     error). ``triton`` is a ``"module:function"`` string or a kernel object;
     ``grid`` is a callable over dimension and constant names, or a tuple.
+
+    **A Gluon kernel** (``triton.experimental.gluon``: ``@gluon.jit``, explicit layouts) is declared with ``gluon=`` in place of ``triton=``,
+    with everything else the same (``num_warps``, ``num_stages``, ``grid``, ``index_bits``, ``enable_fp_fusion``, the stub)::
+
+        @tilefish.extern(gluon=my_gluon_kernels.row_sum, num_warps=4, grid=lambda R: (tilefish.cdiv(R, 4),))
+        def row_sum(x: Strided[Tensor[R, 256, f32]], y: Out[Tensor[R, f32]], s_row: StrideOf("x", 0), n_rows: R, C: const = 256): ...
+
+    The declaration says which frontend compiles the kernel because a compile spec is the whole recipe of its binary, made from the
+    declaration alone (a ``"module:function"`` string is not imported to make it): Gluon's frontend builds TTGIR, with the layouts and
+    ``num_warps`` in it, where Triton's builds TTIR, and that IR is what identifies the binary (``source_digest_kind``
+    ``"tilefish.gluon-ir.v1"``, see :mod:`tilefish._ir`). The language is in the declaration digest and in every spec. A kernel object
+    that says what it is (``is_gluon()``) is checked here: a Gluon kernel given as ``triton=``, or a ``triton.jit`` one as ``gluon=``, is
+    refused with the argument to use; a string reference is checked when the kernel is built. The layouts of a Gluon kernel are written for
+    a number of warps, so ``num_warps`` must be that number: Gluon's frontend refuses another one when the kernel is built.
 
     **A prebuilt binary that Triton does not compile** is declared with ``ptx="file.ptx"`` or ``cubin={"sm_103": "file.cubin", ...}``
     instead of ``triton=``, together with ``symbol="entry_name"``, ``block=(x, y, z)`` and ``grid=...`` (and ``shared=0``, the bytes of
@@ -795,7 +851,7 @@ def extern(
     through memory it was not given, silently, on a tensor that is any larger. A kernel that computes its offsets in ``i64``
     (``row.to(tl.int64) * N_COLS``) declares ``index_bits=64`` and has no such limit. The choice is in the declaration digest.
 
-    ``enable_fp_fusion=`` is Triton's compile option of the same name, for a Triton kernel only: ``False`` compiles ``a * b + c`` as a multiply
+    ``enable_fp_fusion=`` is Triton's compile option of the same name, for a Triton or Gluon kernel only: ``False`` compiles ``a * b + c`` as a multiply
     and an add, each rounded (no FMA contraction), ``True`` asks for the contraction explicitly (Triton's default, the same machine code as
     leaving it out). ``None``, the default, leaves the option out of the compile options, as before. When it is given it is in every compile
     spec (``enable_fp_fusion``), in the compile options a manifest entry records (``options``) and in the declaration digest, so a binary
@@ -822,15 +878,16 @@ def extern(
     sites. When ``triton`` is a kernel object that exposes ``arg_names`` (and
     ``params[i].is_constexpr``), the stub is checked against it.
     """
-    given = [k for k, v in (("triton", triton), ("ptx", ptx), ("cubin", cubin)) if v is not None]
+    given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin)) if v is not None]
     if args or not given:
         raise TilefishDeclarationError(
-            '@tilefish.extern takes arguments: write @tilefish.extern(triton="module:function", grid=...) (or ptx=/cubin= for a prebuilt '
-            "binary), not a bare @tilefish.extern"
+            '@tilefish.extern takes arguments: write @tilefish.extern(triton="module:function", grid=...) (gluon= for a Gluon kernel, '
+            "ptx=/cubin= for a prebuilt binary), not a bare @tilefish.extern"
         )
     if len(given) > 1:
-        raise TilefishDeclarationError(f"extern: a kernel is one of triton=, ptx= and cubin=, got {' and '.join(given)}")
-    prebuilt = triton is None
+        raise TilefishDeclarationError(f"extern: a kernel is one of triton=, gluon=, ptx= and cubin=, got {' and '.join(given)}")
+    prebuilt = triton is None and gluon is None
+    language = "gluon" if gluon is not None else "triton"
     if enable_fp_fusion is not None and not isinstance(enable_fp_fusion, bool):
         raise TilefishDeclarationError(f"extern: enable_fp_fusion must be True, False or None (Triton's default), got {enable_fp_fusion!r}")
     if prebuilt:
@@ -849,10 +906,10 @@ def extern(
     else:
         for key, value in (("symbol", symbol), ("block", block)):
             if value is not None:
-                raise TilefishDeclarationError(f"extern: {key}= is for a prebuilt binary (ptx= or cubin=), not for a Triton kernel")
+                raise TilefishDeclarationError(f"extern: {key}= is for a prebuilt binary (ptx= or cubin=), not for a {language.title()} kernel")
         if shared != 0:
             raise TilefishDeclarationError("extern: shared= is for a prebuilt binary; Triton records the shared memory of the kernel it compiles")
-        target = _triton_target(triton)
+        target = _triton_target(gluon if gluon is not None else triton, language)
         num_warps = 4 if num_warps is _UNSET else num_warps
         num_stages = 3 if num_stages is _UNSET else num_stages
         if isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS:
@@ -933,6 +990,7 @@ def extern(
             index_bits=index_bits,
             binary=binary,
             reference=reference,
+            language=language,
         )
 
     return deco

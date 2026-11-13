@@ -170,6 +170,50 @@ fn a_stride_that_does_not_fit_the_integer_the_binary_takes_is_refused_and_a_wide
     assert_eq!(p.params(), [X, Y, 1 << 31, 64, 0, 0]);
 }
 
+/// A Gluon kernel that takes `i32` strides and computes 64-bit offsets with them (`@tilefish.extern(gluon=..., index_bits=64)` with
+/// `StrideOf("x", 0, dtype=i32)`): its entry is a `triton` one whose `source_digest_kind` is `tilefish.gluon-ir.v1`, its strides are `i32`
+/// and there is no `max_extent`. The stride is held to the `i32` the binary takes, and the extent of the view to nothing.
+fn head_copy_gluon() -> Kernel {
+    let mut k = Kernel::new(
+        "triton",
+        "head_copy_gluon",
+        103,
+        vec![
+            pointer(0, "x", "bf16", "in", json!(["S", 8, 64]), Some((json!(["x_s0", "x_s1", 1]), "x_offset"))),
+            pointer(1, "y", "bf16", "out", json!(["S", 8, 64]), None),
+            stride_scalar(2, "x_s0", "i32", "x", 0),
+            stride_scalar(3, "x_s1", "i32", "x", 1),
+        ],
+        vec![alignment(0, "x", 2), alignment(1, "y", 16)],
+        json!({"S": {}, "x_s0": {}, "x_s1": {}, "x_offset": {}}),
+        "(S, 8)",
+    );
+    k.entry["source_digest_kind"] = "tilefish.gluon-ir.v1".into();
+    k
+}
+
+#[test]
+fn a_gluon_entry_with_i32_strides_and_no_offset_limit_is_read_and_its_strides_are_held_to_i32() {
+    let manifest = read(&[head_copy_gluon()], &[]).unwrap();
+    let entry = manifest.entry("head_copy_gluon", "sm_103").unwrap();
+    assert_eq!(entry.source_digest_kind.as_deref(), Some("tilefish.gluon-ir.v1"));
+    let plan = plan_of(&manifest, "head_copy_gluon");
+    let out = [2usize, 8, 64];
+    // the widest stride an i32 carries: a view that reaches past 2**31 elements, which no max_extent refuses
+    let (shape, strides) = ([2usize, 8, 64], [(1usize << 31) - 1, 64, 1]);
+    let p = plan
+        .prepare(&[view(X, &shape, &strides, DType::Bf16), dense(Y, &out, DType::Bf16, Access::InOut)], None)
+        .unwrap();
+    assert_eq!(p.params(), [X, Y, (1 << 31) - 1, 64, 0, 0]);
+    // one more does not fit the i32
+    let strides = [1usize << 31, 64, 1];
+    let e = plan
+        .prepare(&[view(X, &shape, &strides, DType::Bf16), dense(Y, &out, DType::Bf16, Access::InOut)], None)
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Shape, "{e}");
+    assert!(e.to_string().contains("x_s0") && e.to_string().contains("32-bit"), "{e}");
+}
+
 #[test]
 fn a_view_that_reaches_further_than_its_memory_cannot_be_made() {
     // SAFETY: nothing is dereferenced.

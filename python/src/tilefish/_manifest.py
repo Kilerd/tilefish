@@ -18,7 +18,8 @@ trusted.
 
 Source. The identity of a binary is the Triton IR its kernel compiles to (:mod:`tilefish._ir`). Every entry records the digest
 of that IR in ``source_digest``, with ``source_digest_kind`` ``"tilefish.triton-ir.v1"`` (the same fields a schema 2 reader
-already reads: the field has the name of the earlier file digest and holds an IR digest). The compile spec of a generated kernel
+already reads: the field has the name of the earlier file digest and holds an IR digest), or ``"tilefish.gluon-ir.v1"`` for a Gluon
+kernel, whose IR is the TTGIR Gluon's frontend builds. The compile spec of a generated kernel
 also carries ``source_sha256``, the sha256 of the Triton source it was built from, and a replay refuses an entry built from
 another source (a kernel redeclared with another body but the same name and signature) without needing Triton. A hand-written
 ``extern`` has no source in its declaration, so its IR digest is all there is: a replay recomputes it from the importable kernel as
@@ -62,7 +63,7 @@ from ._build import (
     LaunchAttributes,
     spec_entry,
 )
-from ._ir import IR_DIGEST_KIND
+from ._ir import LANGUAGE_OF_KIND, digest_kind
 from ._elf import code_digest, parse_elf, sm_of, uses_shared
 from ._specvalid import parse_expression, parse_grid
 from .dtypes import ALL_DTYPES
@@ -730,7 +731,7 @@ class Manifest:
                 ptx_target=str(entry.get("ptx_target", "")),
                 options=dict(entry.get("options", {})),
                 launch=launch,
-                ir_digest=entry.get("source_digest") if entry.get("source_digest_kind") == IR_DIGEST_KIND else None,
+                ir_digest=entry.get("source_digest") if entry.get("source_digest_kind") in LANGUAGE_OF_KIND else None,
                 binary_digest=entry.get("source_digest") if entry.get("source_digest_kind") == BINARY_DIGEST_KIND else None,
                 binary_build=dict(entry["binary"]) if spec.binary is not None else None,
             )
@@ -781,16 +782,24 @@ class Manifest:
         kind = entry.get("source_digest_kind")
         toolchain = entry.get("toolchain")
         built_with = toolchain.get("triton") if isinstance(toolchain, dict) else None
-        if recorded is not None and kind != IR_DIGEST_KIND:
+        expected_kind = digest_kind(spec.language)
+        if recorded is not None and kind in LANGUAGE_OF_KIND and kind != expected_kind:  # the IR of the other frontend: another kernel
+            raise TilefishManifestError(
+                f"the manifest entry for {where} was built from a {_frontend(LANGUAGE_OF_KIND[kind])} (its source_digest_kind is {kind!r}), but "
+                f"the operator now declares a {_frontend(spec.language)} '{spec.triton}' ({expected_kind!r}): its binary is stale; export it "
+                "again (and pin the new manifest)"
+            )
+        if recorded is not None and kind != expected_kind:
             recorded = None  # a digest of another definition (an older tilefish) says nothing about the IR now
-            unusable = f"the manifest entry's source digest is of kind {kind!r}, not {IR_DIGEST_KIND!r}"
+            unusable = f"the manifest entry's source digest is of kind {kind!r}, not {expected_kind!r}"
         else:
             unusable = "the manifest entry records no IR digest"
         comparable = ir_digest is not None and recorded is not None and ir_triton == built_with
         if comparable and ir_digest != recorded:
             raise TilefishManifestError(
-                f"the manifest entry for {where} was built from Triton IR with digest {recorded}, but the kernel '{spec.triton}' in this "
-                f"process now compiles to IR with digest {ir_digest}: the kernel, or something it reads (a module constant by any "
+                f"the manifest entry for {where} was built from {'Gluon' if spec.language == 'gluon' else 'Triton'} IR with digest {recorded}, "
+                f"but the kernel '{spec.triton}' in this process now compiles to IR with digest {ir_digest}: the kernel (its layouts, for a Gluon "
+                "kernel), or something it reads (a module constant by any "
                 "route, a closure variable, a class attribute, an environment variable that a constexpr_function reads) is not what "
                 "it was when the manifest was written, so this binary is stale (a build here would give another one); export it "
                 "again (and pin the new manifest)"
@@ -819,3 +828,8 @@ class Manifest:
     def __repr__(self) -> str:
         library = f", {len(self._library)} library entries" if self._library else ""
         return f"<Manifest {str(self.directory)!r}: {len(self._artifacts)} binaries{library}>"
+
+
+def _frontend(language: str) -> str:
+    """How a message names a kernel of ``language``."""
+    return "Gluon kernel (gluon.jit)" if language == "gluon" else "Triton kernel (triton.jit)"

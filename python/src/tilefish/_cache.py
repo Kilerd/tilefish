@@ -13,8 +13,9 @@ The key is a sha256 over
 * the cache recipe (:data:`CACHE_RECIPE`, a number that is bumped whenever tilefish changes what goes into a binary) and the version
   of tilefish;
 * the **IR digest** (:mod:`tilefish._ir`): the TTIR that Triton's frontend builds for the kernel in this process, without locations
-  or names. It stands for the kernel: the body, every constant the kernel reads by any route, the jit functions it calls. It is the
-  only thing that says which kernel it is; nothing is looked for in source files, namespaces or closures;
+  or names (for a Gluon kernel the TTGIR of Gluon's frontend, and its kind ``"tilefish.gluon-ir.v1"`` as well). It stands for the
+  kernel: the body, every constant the kernel reads by any route, the jit functions it calls. It is the only thing that says which
+  kernel it is; nothing is looked for in source files, namespaces or closures;
 * what the stages after the IR take besides it: the compile options in effect (the spec's and any a caller added), the target
   architecture, the Triton version, the ``ptxas`` version, the Triton settings that change code generation
   (:func:`codegen_environment`, listed below), and the *content* of every file that Triton reads while it compiles and that
@@ -94,6 +95,7 @@ from typing import Any, Mapping
 
 from ._build import BuiltKernel, LaunchAttributes, _check_abi, write_file
 from ._elf import code_digest, parse_elf
+from ._ir import IR_DIGEST_KIND, digest_kind
 from .errors import TilefishBuildError, TilefishCacheWarning
 
 CACHE_FORMAT = "tilefish.build-cache.v2"
@@ -307,10 +309,12 @@ def cache_key(
     options: "Mapping[str, Any]",
     environment: "Mapping[str, Any]",
     files: "Mapping[str, str]",
+    language: str = "triton",
 ) -> str:
     """The key of a build (see the module docstring): the IR digest and what the stages after the IR take besides it.
 
-    ``files`` is :func:`compile_files` of the options: the content of the files they name."""
+    ``files`` is :func:`compile_files` of the options: the content of the files they name. ``language`` is the frontend of the kernel: a
+    Gluon kernel's key has the kind of its IR digest too (``"tilefish.gluon-ir.v1"``), a Triton kernel's is as it was."""
     from . import __version__
 
     doc = {
@@ -324,6 +328,8 @@ def cache_key(
         "options": dict(options),
         "files": dict(files),
     }
+    if language != "triton":
+        doc["ir_kind"] = digest_kind(language)
     text = json.dumps(doc, sort_keys=True, separators=(",", ":"), allow_nan=False, default=repr)
     return hashlib.sha256(_TAG + text.encode("utf-8")).hexdigest()
 
@@ -349,6 +355,8 @@ def encode(key: str, built: BuiltKernel) -> bytes:
         "ptx": built.ptx,
         "cubin": base64.b64encode(built.cubin).decode("ascii"),
     }
+    if built.spec.language != "triton":  # the kind of the IR digest of a Gluon kernel (a Triton kernel's entry is as it was: no key)
+        doc["ir_kind"] = digest_kind(built.spec.language)
     return (json.dumps(doc, sort_keys=True, allow_nan=False, default=repr) + "\n").encode("utf-8")
 
 
@@ -411,6 +419,9 @@ def decode(
     for name, value in (("arch", arch), ("triton_version", triton_version), ("ptxas_version", ptxas_version), ("ir_digest", ir_digest)):
         if doc.get(name) != value:
             raise _Invalid(f"its {name} is {doc.get(name)!r}, not {value!r}")
+    kind = doc.get("ir_kind", IR_DIGEST_KIND)  # the frontend whose IR the digest is of: TTIR (no key), or the TTGIR of a Gluon kernel
+    if kind != digest_kind(spec.language):
+        raise _Invalid(f"its IR digest is of kind {kind!r}, not {digest_kind(spec.language)!r}")
     num_warps = _field(doc, "num_warps", int)
     if num_warps != wanted.get("num_warps", spec.num_warps):
         raise _Invalid(f"its num_warps is {num_warps}, not what the options ask for")

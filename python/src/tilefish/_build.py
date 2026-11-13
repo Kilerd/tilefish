@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 from ._elf import parse_elf, code_digest
 from . import _ir, _source
 from ._specvalid import stride_of_json
-from ._ir import IR_DIGEST_KIND
 from .errors import TilefishBuildError, TilefishManifestError
 
 BINARY_DIGEST_KIND = "tilefish.binary.v1"  # the ``source_digest_kind`` of an entry whose ``source_digest`` is the sha256 of a prebuilt PTX or cubin
@@ -151,15 +150,22 @@ def _check_jit_function(fn: Any, spec: "CompileSpec") -> None:
     if not isinstance(fn, JITFunction):
         what = "an autotuned or heuristics-wrapped kernel" if hasattr(fn, "fn") else type(fn).__name__
         raise TilefishBuildError(
-            f"'{spec.triton}' is {what}, not a triton.jit function; a compile spec fixes every launch choice, so it "
-            "needs the plain JITFunction (pass it as build(spec, fn=...))"
+            f"'{spec.triton}' is {what}, not a {'gluon.jit' if spec.language == 'gluon' else 'triton.jit'} function; a compile spec fixes "
+            "every launch choice, so it needs the plain JITFunction (pass it as build(spec, fn=...))"
         )
+    _check_language(fn, spec)
     names = list(spec.signature)
     if list(fn.arg_names) != names:
         raise TilefishBuildError(
             f"the parameters of '{spec.triton}' {list(fn.arg_names)} are not the ones its compile spec "
             f"'{spec.stem}' was made for {names}"
         )
+
+
+def _check_language(jit: Any, spec: "CompileSpec") -> None:
+    """The function must be a kernel of the frontend the spec says (``spec.language``): a Gluon kernel for ``gluon``, a ``triton.jit`` one for
+    ``triton`` (:func:`tilefish._ir.check_language`), checked before anything is run."""
+    _ir.check_language(jit, spec.language, f"'{spec.stem}' ({spec.triton})")
 
 
 def _check_identity(jit: Any, spec: "CompileSpec") -> None:
@@ -553,8 +559,9 @@ def build(
     even when its parameters are the same. The spec must be verified
     (:attr:`~tilefish.aot.CompileSpec.verified`; ``compile_specs`` output is).
 
-    Triton is called as ``ASTSource(fn, signature=..., constexprs=None, attrs=...)``, then ``src.constants = ...``,
-    then ``triton.compile(src, target=GPUTarget("cuda", arch, 32), options=...)``, with the three values and the
+    Triton is called as ``ASTSource(fn, signature=..., constexprs=None, attrs=...)`` (Gluon's ``GluonASTSource`` for the spec of a Gluon
+    kernel, ``spec.language == "gluon"``; ``fn`` must then be a ``gluon.jit`` function, and for any other spec it must not be one), then
+    ``src.constants = ...``, then ``triton.compile(src, target=GPUTarget("cuda", arch, 32), options=...)``, with the three values and the
     options exactly as ``spec.ast_source_inputs()`` gives them. ``options`` adds Triton compile options on top
     of the spec's (an experiment, such as ``{"enable_fp_fusion": False}``); they are recorded in the result, and
     each one is checked against the metadata Triton returns, because Triton silently ignores an option it does
@@ -562,8 +569,9 @@ def build(
     the PTX entry (the ABI). Raises :class:`~tilefish.errors.TilefishBuildError`.
 
     **The identity of the binary is the IR that Triton compiles** (:mod:`tilefish._ir`). Before anything is looked up or compiled,
-    Triton's frontend is run on the spec's source (the first step of ``triton.compile``) and the TTIR it builds, without locations
-    or names, is hashed: that is :attr:`BuiltKernel.ir_digest`, which must equal ``ir_digest`` when that is given. Whatever the
+    Triton's frontend is run on the spec's source (the first step of ``triton.compile``) and the TTIR it builds (the TTGIR of a Gluon
+    kernel), without locations or names, is hashed: that is :attr:`BuiltKernel.ir_digest`, which must equal ``ir_digest`` when that is
+    given. Whatever the
     process holds that the frontend reads is in it, whichever route the kernel reads it by, so nothing is guessed from source
     files. The compile then uses a source that records the IR it was given, and a build whose IR has another digest than the one it
     was looked up under is refused, so a binary is only ever recorded under the digest of the IR it was compiled from. A spec with a
@@ -604,7 +612,7 @@ def build(
 
     files = _cache.compile_files(opts)  # refuses ir_override; the sha256 of the files the options name (extern_libs)
     what = f"'{spec.stem}' ({spec.triton})"
-    digest = _ir.ir_digest(_ir.ttir_text(jit, inp, arch=cap, options=opts, what=what))
+    digest = _ir.ir_digest(_ir.ttir_text(jit, inp, arch=cap, options=opts, what=what), spec.language)
     if ir_digest is not None and digest != ir_digest:
         raise TilefishBuildError(
             f"the IR of {what} has digest {digest}, but {ir_digest} was expected: it is not the kernel the caller meant to build"
@@ -626,15 +634,15 @@ def build(
             options=opts,
             environment=environment,
             files=files,
+            language=spec.language,
         )
         hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
             return hit
 
     from triton.backends.compiler import GPUTarget
-    from triton.compiler import ASTSource
 
-    src = _ir.recording_source(ASTSource)(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
+    src = _ir.recording_source(_ir.source_class(spec.language))(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
     src.constants = inp.constants
     try:
         with _always_compile(triton):
@@ -648,7 +656,7 @@ def build(
             "build was identified by or of the new one, and the cache key (which holds the content of these files) cannot say which: "
             "the binary was neither returned nor stored. Build again when nothing is rewriting the file"
         )
-    if src.ir_text is None or _ir.ir_digest(src.ir_text) != digest:
+    if src.ir_text is None or _ir.ir_digest(src.ir_text, spec.language) != digest:
         raise TilefishBuildError(
             f"'{spec.stem}': the IR Triton compiled is not the IR whose digest {digest} the build was identified by (Triton's frontend "
             "gave another module the second time it was run on the same kernel); refusing to record or cache the binary"
@@ -774,7 +782,7 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         entry["source_sha256"] = spec_part["source_sha256"]
     if b.ir_digest is not None:  # the digest of the Triton IR the binary was compiled from (the field and its kind, so a reader of schema 2 reads it as before)
         entry["source_digest"] = b.ir_digest
-        entry["source_digest_kind"] = IR_DIGEST_KIND
+        entry["source_digest_kind"] = _ir.digest_kind(b.spec.language)  # the TTIR of a triton.jit kernel, the TTGIR of a Gluon one
     elif b.binary_digest is not None:  # the digest of the PTX or cubin bytes a prebuilt binary is made of
         entry["source_digest"] = b.binary_digest
         entry["source_digest_kind"] = BINARY_DIGEST_KIND
@@ -796,7 +804,19 @@ def manifest_dict(built: "Iterable[BuiltKernel]", library: "Iterable[Any]" = ())
 
 def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
     """What makes an existing manifest entry a different binary from a new one for the same stem and arch (``None``: the same)."""
-    for key in ("sha256_code", "declaration_digest", "source_sha256", "source_digest", "options", "shared", "algo", "cublaslt_version", "sm_count", "workspace_bytes"):
+    for key in (
+        "sha256_code",
+        "declaration_digest",
+        "source_sha256",
+        "source_digest",
+        "source_digest_kind",
+        "options",
+        "shared",
+        "algo",
+        "cublaslt_version",
+        "sm_count",
+        "workspace_bytes",
+    ):
         if old.get(key) != new.get(key):
             return key
     return None
