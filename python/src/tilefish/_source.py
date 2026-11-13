@@ -26,20 +26,48 @@ elsewhere (numpy, say) are user modules like any other and are read like any oth
 one makes the digest depend on all that it reaches.
 
 What follows from this: any edit to a reachable file, including one that cannot change the binary (a comment), makes
-the digest differ, and the binary has to be exported again and its pin (``Manifest.digest``) replaced. The digest is of the files as they
-are on disk when it is computed, so a process that edited a file after importing it must reload before it builds (a build
-checks the kernel's own functions and refuses when the lines the process imported are not the ones in the file); it does
-not see a value a program assigned to a module attribute at run time, nor a file that is not read from disk.
+the digest differ, and the binary has to be exported again and its pin (``Manifest.digest``) replaced.
+
+Memory against disk. The digest is of the files as they are on disk, and Triton compiles what the process holds in memory.
+They are the same only if no reachable file was edited after the process imported it, and nothing assigned to a module
+attribute that a kernel reads. So no digest is computed from files the process may hold in another version: *every*
+:func:`digest_of` (and with it every build, ``jit``, ``export`` and ``replay`` of a hand-written kernel) first checks
+
+* **the files.** Every user module the kernel reaches must be the file the process imported. ``import tilefish`` installs a
+  small import watch (:func:`install_import_watch`): for each user module that a ``SourceFileLoader`` then executes (an
+  ``import``, an ``importlib.reload``, ``spec_from_file_location``) it records the sha256 of the file just before it runs. The
+  check hashes the file again and refuses when it differs: "module X changed on disk since it was imported; reload it or
+  restart". This is exact for any edit, also one that keeps the size, the modification time, or lands in the same second as the
+  import, and a file that is edited and then restored passes. A module that was already imported when tilefish was imported has no
+  record; for it the size and modification time that the file had at that moment are compared (a ``touch`` counts as a change
+  there). The ``.pyc`` header is not used: it holds whole seconds and a size, it is rewritten by any process that imports the
+  module, and a stale one is simply ignored when bytecode is not written, so it would give false alarms and false assurance;
+* **the values.** A scalar (``int``, ``float``, ``bool``, ``str``, ``bytes``, ``None``, a tuple of them) or a Triton object
+  (``tl.constexpr``, a dtype) that a module held when it finished importing, and that a jit function of the kernel reads
+  by name or as ``module.name``, must still be the same: a kernel's inputs come from source files, not from a module attribute
+  that a program assigned later. Only a module recorded by the watch has a snapshot; a container mutated in place, an attribute of an
+  instance, and a value copied out of its module before it was changed (``from cfg import SCALE``) are not seen.
+
+What it does not see, besides the above: a module that was already imported, and edited, before tilefish was imported; a module that no
+``SourceFileLoader`` executed (a zip import, a custom loader, pytest's assertion rewriting, a notebook cell, ``exec``), which
+has no file or no record; a source that Python took from an ``unchecked-hash`` or stale same-second ``.pyc`` rather than from the
+file (the record is of the file); and a file that is not read from disk.
 
 Nothing in this module imports Triton except to read its version.
 """
 
 from __future__ import annotations
 
+import ast
+import functools
 import hashlib
+import importlib.machinery
+import os
 import sys
+import textwrap
 import tokenize
 import types
+from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from .errors import TilefishBuildError
@@ -172,17 +200,24 @@ def source_digest(fn: Any) -> "str | None":
 
 
 def digest_of(found: "Sources | None") -> "str | None":
-    """The source digest of what :func:`reachable` found (``None`` for ``None``, or when Triton or a file is not available)."""
+    """The source digest of what :func:`reachable` found (``None`` for ``None``, or when Triton or a file is not available).
+
+    The files are checked against the process first (:func:`check_current`), and the digest is made of the very bytes that
+    were checked: no digest exists of a file the process holds in another version. Raises
+    :class:`StaleSourceError` (a :class:`~tilefish.errors.TilefishBuildError`) when one is.
+    """
     version = triton_version()
     if version is None or found is None:
         return None
-    h = hashlib.sha256(_TAG)
-    h.update(version.encode("utf-8") + b"\0")
     try:
-        for name in sorted(found.files):
-            h.update(name.encode("utf-8") + b"\0" + file_sha256(found.files[name]).encode("ascii") + b"\n")
+        hashes = _check_files(found)
     except OSError:
         return None
+    check_values(found)
+    h = hashlib.sha256(_TAG)
+    h.update(version.encode("utf-8") + b"\0")
+    for name in sorted(found.files):
+        h.update(name.encode("utf-8") + b"\0" + hashes[name].encode("ascii") + b"\n")
     return h.hexdigest()
 
 
@@ -218,3 +253,250 @@ def check_imported_lines(functions: "list[Any]") -> None:
                 f"{first + 1}-{first + len(fn.raw_src)} are not what the file has now. Restart the process, or reload the "
                 "module (and every module it imports that changed), before building"
             )
+
+
+# -- memory against disk: what the process imported, and what a kernel reads from it -----------------------------------------------
+
+
+class StaleSourceError(TilefishBuildError):
+    """What the process holds of a module a kernel reaches is not what is on disk, or not what the module's source says."""
+
+
+_NoneType = type(None)
+_SCALARS = (int, float, bool, str, bytes, complex, _NoneType)
+_MISSING = object()
+
+
+def _is_scalar(value: Any) -> bool:
+    if type(value) in _SCALARS:
+        return True
+    if type(value) in (tuple, frozenset):
+        return all(_is_scalar(v) for v in value)
+    return False
+
+
+def _is_triton_object(value: Any) -> bool:
+    """``tl.constexpr``, a ``tl.dtype``: what a kernel's module holds as its compile-time constants and dtype aliases."""
+    return str(getattr(type(value), "__module__", "")).partition(".")[0] == "triton"
+
+
+def _same(old: Any, new: Any) -> bool:
+    if old is new:
+        return True
+    if type(old) is not type(new) or not _is_scalar(old):
+        return False
+    try:
+        return bool(old == new) or bool(old != old and new != new)  # nan is the same nan
+    except Exception:  # noqa: BLE001 - a scalar whose comparison fails
+        return False
+
+
+def _snapshot(namespace: "dict[str, Any]") -> "dict[str, Any]":
+    """The names of a module namespace that hold a scalar or a Triton object, as they are (dunder names are skipped)."""
+    out: dict[str, Any] = {}
+    for name, value in list(namespace.items()):
+        if name.startswith("__") and name.endswith("__"):
+            continue
+        try:
+            if _is_scalar(value) or _is_triton_object(value):
+                out[name] = value
+        except Exception:  # noqa: BLE001 - an object whose type cannot be looked at
+            continue
+    return out
+
+
+def _key(path: str) -> str:
+    return os.path.abspath(path)
+
+
+@dataclass
+class _Imported:
+    sha256: str  # of the file, just before a loader executed it
+    values: "dict[str, Any]"  # _snapshot of the namespace when the module had finished importing
+
+
+@dataclass
+class _Watch:
+    """What the process imported: the files, by path, and the modules that were there before the watch."""
+
+    imported: "dict[str, _Imported]" = field(default_factory=dict)
+    before: "dict[str, tuple[int, int]]" = field(default_factory=dict)  # path -> (mtime_ns, size) when the watch was installed
+    original: Any = None
+    loader: Any = None
+
+    @property
+    def installed(self) -> bool:
+        return self.original is not None
+
+    def _before(self, loader: Any, module: Any) -> "tuple[str, str] | None":
+        try:
+            path = loader.path
+            if not isinstance(path, str) or not path.endswith(".py") or not is_user_module(str(module.__name__)):
+                return None
+            with open(path, "rb") as f:
+                return _key(path), hashlib.sha256(f.read()).hexdigest()
+        except Exception:  # noqa: BLE001 - the watch must never make an import fail
+            return None
+
+    def _after(self, token: "tuple[str, str] | None", module: Any) -> None:
+        if token is None:
+            return
+        try:
+            self.imported[token[0]] = _Imported(token[1], _snapshot(module.__dict__))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def install(self) -> None:
+        """Wrap ``SourceFileLoader.exec_module`` (idempotent); modules already imported get their size and modification time recorded."""
+        if self.installed:
+            return
+        loader = importlib.machinery.SourceFileLoader
+        original = loader.exec_module
+        watch = self
+
+        @functools.wraps(original)
+        def exec_module(self_: Any, module: Any) -> None:
+            token = watch._before(self_, module)
+            original(self_, module)
+            watch._after(token, module)
+
+        exec_module._tilefish_watch = watch  # type: ignore[attr-defined]
+        self.before = {}
+        for name, module in list(sys.modules.items()):
+            try:
+                path = getattr(module, "__file__", None)
+                if isinstance(path, str) and path.endswith(".py") and is_user_module(name):
+                    st = os.stat(path)
+                    self.before.setdefault(_key(path), (st.st_mtime_ns, st.st_size))
+            except Exception:  # noqa: BLE001 - a module whose attributes or file cannot be looked at
+                continue
+        self.original, self.loader = original, loader
+        loader.exec_module = exec_module  # type: ignore[method-assign]
+
+    def uninstall(self) -> None:
+        if not self.installed:
+            return
+        if self.loader.exec_module is not self.original:
+            self.loader.exec_module = self.original  # type: ignore[method-assign]
+        self.original = self.loader = None
+
+    def check_file(self, name: str, path: str, sha256: str, st: "os.stat_result") -> None:
+        """Raise :class:`StaleSourceError` when the file ``path`` of module ``name``, which has ``sha256`` and ``st`` now, is not what was imported."""
+        key = _key(path)
+        record = self.imported.get(key)
+        if record is not None:
+            if record.sha256 != sha256:
+                raise StaleSourceError(
+                    f"module '{name}' changed on disk since it was imported ({path!r}); reload it or restart the process, then "
+                    "build again. The process holds the version it imported, so a digest of the file would describe a binary "
+                    "that was not compiled from it (reload with importlib.reload, the modules that import names from it too)"
+                )
+            return
+        before = self.before.get(key)
+        if before is not None and before != (st.st_mtime_ns, st.st_size):
+            raise StaleSourceError(
+                f"module '{name}' changed on disk since it was imported ({path!r}); reload it or restart the process, then build "
+                "again. It was imported before tilefish, and its size or modification time is not what it was when tilefish was "
+                "imported, so the process may hold an older version than the file (reload with importlib.reload, the modules "
+                "that import names from it too)"
+            )
+
+
+def _adopt() -> _Watch:
+    """The watch that is installed already (``tilefish._source`` was reloaded), or a new one."""
+    existing = getattr(importlib.machinery.SourceFileLoader.exec_module, "_tilefish_watch", None)
+    return existing if existing is not None else _Watch()
+
+
+_watch = _adopt()
+
+
+def install_import_watch() -> None:
+    """Start recording the modules that are imported from now on (called when ``tilefish`` is imported; harmless to call again)."""
+    _watch.install()
+
+
+def _check_files(found: Sources) -> "dict[str, str]":
+    """Check every file of ``found`` against what the process imported, and return the sha256 of each (``OSError``: a file cannot be read)."""
+    hashes: dict[str, str] = {}
+    for name in sorted(found.files):
+        path = found.files[name]
+        with open(path, "rb") as f:
+            data = f.read()
+            st = os.fstat(f.fileno())
+        hashes[name] = hashlib.sha256(data).hexdigest()
+        _watch.check_file(name, path, hashes[name], st)
+    return hashes
+
+
+def _names_read(fn: Any) -> "tuple[set[str], set[tuple[str, ...]]]":
+    """The names a jit function reads that it does not bind itself, and the dotted chains (``cfg.SCALE``) it reads."""
+    try:
+        tree = ast.parse(textwrap.dedent("".join(fn.raw_src)))
+    except (SyntaxError, ValueError, TypeError, AttributeError):
+        return set(), set()
+    bound: set[str] = set()
+    loaded: set[str] = set()
+    chains: set[tuple[str, ...]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.Name):
+            (loaded if isinstance(node.ctx, ast.Load) else bound).add(node.id)
+        elif isinstance(node, ast.Attribute):
+            parts: list[str] = []
+            inner: Any = node
+            while isinstance(inner, ast.Attribute):
+                parts.append(inner.attr)
+                inner = inner.value
+            if isinstance(inner, ast.Name):
+                chains.add((inner.id, *reversed(parts)))
+    return loaded - bound, {c for c in chains if c[0] not in bound}
+
+
+def _check_value(owner: str, namespace: "dict[str, Any]", name: str, reader: Any) -> None:
+    path = namespace.get("__file__")
+    record = _watch.imported.get(_key(path)) if isinstance(path, str) else None
+    if record is None or name not in record.values:
+        return
+    old, new = record.values[name], namespace.get(name, _MISSING)
+    if not _same(old, new):
+        now = "deleted" if new is _MISSING else repr(new)
+        raise StaleSourceError(
+            f"the module attribute '{owner}.{name}', which the Triton function '{reader.__name__}' reads, was assigned after "
+            f"'{owner}' was imported (it was {old!r}, it is {now}). A kernel's inputs must come from its source files, not "
+            "from module state changed at run time: the binary would be compiled from the new value while the source digest, "
+            "and the cache and manifest entries made from it, describe the file. Put the value in the file (and reload the "
+            "module), or make it a constexpr argument of the extern"
+        )
+
+
+def check_values(found: Sources) -> None:
+    """Raise :class:`StaleSourceError` when a scalar or Triton constant a jit function of ``found`` reads has been reassigned since its module was imported."""
+    for fn in found.functions:
+        free, chains = _names_read(fn)
+        namespace = _attr(fn, "__globals__")
+        if not isinstance(namespace, dict):
+            continue
+        owner = str(namespace.get("__name__", "?"))
+        for name in sorted(free):
+            _check_value(owner, namespace, name, fn)
+        for chain in sorted(chains):
+            module: Any = namespace.get(chain[0])
+            for attr in chain[1:]:
+                if not issubclass(type(module), types.ModuleType):
+                    break
+                if is_user_module(module.__name__):
+                    _check_value(module.__name__, module.__dict__, attr, fn)
+                module = module.__dict__.get(attr)
+
+
+def check_current(found: "Sources | None") -> None:
+    """Raise :class:`StaleSourceError` when what the process holds of the modules of ``found`` is not what is on disk (see the module docstring)."""
+    if found is None:
+        return
+    try:
+        _check_files(found)
+    except OSError as e:
+        raise StaleSourceError(f"cannot read a file of the kernel's modules to compare it with what the process imported: {e}") from e
+    check_values(found)

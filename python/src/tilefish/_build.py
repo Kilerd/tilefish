@@ -397,8 +397,10 @@ def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "str
     A generated kernel's spec carries ``source_sha256``: the file of the function's module must have exactly that
     sha256 (for a lowered kernel that file is the generated source), whatever got imported from ``sys.path`` or was
     passed as ``fn``. A hand-written kernel's source digest is computed (:func:`tilefish._source.source_digest`) and, when
-    the caller knows what it must be (``expected``), compared. For both the lines the process imported must be the ones
-    in the file now.
+    the caller knows what it must be (``expected``), compared. For both, what the process holds must be what is on disk:
+    every module the kernel reaches must be the file the process imported, and no constant a kernel function reads may
+    have been assigned since (:class:`~tilefish._source.StaleSourceError`, see :mod:`tilefish._source`), and the lines of
+    the kernel's functions that the process imported must be the ones in their files now.
     """
     reached = _source.reachable(jit)
     if spec.source_sha256 is not None:
@@ -419,12 +421,13 @@ def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "str
                 "LoweredKernel.write(directory) output on sys.path, or another function passed as fn). Refusing to build "
                 "it, as the manifest would say it is the new source"
             )
+        _source.check_current(reached)
         if reached is not None:
             _source.check_imported_lines(reached.functions)
         return None
+    digest = _source.digest_of(reached)  # checks the files and the values against what the process imported, then digests those bytes
     if reached is not None:
         _source.check_imported_lines(reached.functions)
-    digest = _source.digest_of(reached)
     if digest is not None and expected is not None and digest != expected:
         raise TilefishBuildError(
             f"the source of '{spec.triton}' has digest {digest}, but {expected} was expected: it is not the source the "
@@ -458,9 +461,11 @@ def build(
     The source is checked before anything is compiled. A spec with a ``source_sha256`` (a generated kernel) is built only
     from a function whose module file has exactly that sha256, so a stale file on ``sys.path`` (or another ``fn``) cannot
     be stamped with the digest of source it is not. For a hand-written kernel the result records the source digest of its
-    files (:attr:`BuiltKernel.source_digest`), which must equal ``source_digest`` when that is given. In both cases the
-    lines of the kernel's functions that the process imported must be the ones in their files now, or the build is
-    refused (restart or reload). The compile itself never reads Triton's disk cache: the cache key does not cover everything
+    files (:attr:`BuiltKernel.source_digest`), which must equal ``source_digest`` when that is given. In both cases every
+    module the kernel reaches must be the file the process imported (an edited module that was not reloaded is refused:
+    "module X changed on disk since it was imported; reload it or restart"), no constant that a kernel function reads may
+    have been assigned to its module since, and the lines of the kernel's functions that the process imported must be the
+    ones in their files now. The compile itself never reads Triton's disk cache: the cache key does not cover everything
     that changes a binary, so a build would not be sure to be what the source says.
     """
     cap = parse_arch(arch)

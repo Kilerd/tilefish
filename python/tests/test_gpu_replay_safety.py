@@ -695,7 +695,7 @@ def test_the_old_exports_binary_is_not_what_a_new_export_of_the_edited_kernel_wr
 
 
 def test_a_file_edited_after_the_process_imported_it_is_not_built(hkp, tmp_path):
-    """The digest is of the files on disk, so a build refuses a function the process holds in an older version."""
+    """The digest is of the files on disk and Triton compiles what the process holds: a module edited and not reloaded is refused."""
     x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
     hkp.write()
     hkp.load()
@@ -703,20 +703,55 @@ def test_a_file_edited_after_the_process_imported_it_is_not_built(hkp, tmp_path)
     source = hkp.directory / "hk_kernel.py"
     source.write_text(source.read_text().replace("* hk_cfg.SCALE", "* hk_cfg.SCALE * 1.0"))  # edited, not reloaded
     runtime.clear_caches()
-    with pytest.raises(TilefishBuildError, match=r"'hk_kernel' was imported from an older version of '.*hk_kernel.py'.*Restart the process, or reload"):
+    with pytest.raises(TilefishBuildError, match=r"module 'hk_kernel' changed on disk since it was imported .*hk_kernel.py.*reload it or restart"):
         runtime.export(hk, tmp_path / "again", overwrite=True)
-    with pytest.raises(TilefishBuildError, match="older version"):
+    with pytest.raises(TilefishBuildError, match="module 'hk_kernel' changed on disk"):
         tilefish.run(hk, x, mode="jit")
     hkp.load()  # reloaded: fine
     assert torch.equal(tilefish.run(hk, x, mode="jit"), hk_expected(x, {}))
     helper = hkp.directory / "hk_helper_a.py"
-    helper.write_text(helper.read_text() + "\n")  # a helper's function is checked too: appending changes no line of it ...
+    helper.write_text(helper.read_text() + "\n")  # a helper that is edited is checked too, also by an edit that changes no line of a function
     runtime.clear_caches()
-    assert torch.equal(tilefish.run(hk, x, mode="jit"), hk_expected(x, {}))
-    helper.write_text("# moved\n" + helper.read_text())  # ... but a line above it moves it
-    runtime.clear_caches()
-    with pytest.raises(TilefishBuildError, match=r"'apply' was imported from an older version"):
+    with pytest.raises(TilefishBuildError, match="module 'hk_helper_a' changed on disk since it was imported"):
         tilefish.run(hk, x, mode="jit")
+    helper.write_text("# moved\n" + helper.read_text())  # ... and one that moves it
+    with pytest.raises(TilefishBuildError, match="module 'hk_helper_a' changed on disk since it was imported"):
+        tilefish.run(hk, x, mode="jit")
+
+
+def test_a_constant_two_levels_away_that_was_edited_and_not_reloaded_is_refused_not_stamped(hkp, tmp_path):
+    """The scenario of the issue: ``export`` would compile the old OFFSET and stamp the digest of the file that has the new one,
+    and a fresh process would replay the old binary without an error."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    hkp.write()
+    hkp.load()
+    old = hk_expected(x, {})
+    (hkp.directory / "hk_helper_b.py").write_text((hkp.directory / "hk_helper_b.py").read_text().replace("tl.constexpr(0.0)", "tl.constexpr(1.0)"))
+    runtime.clear_caches()
+    for attempt in (lambda: runtime.export(hk, tmp_path / "m"), lambda: tilefish.run(hk, x, mode="jit")):
+        with pytest.raises(TilefishBuildError, match=r"module 'hk_helper_b' changed on disk since it was imported .*reload it or restart"):
+            attempt()
+    assert not (tmp_path / "m" / "manifest.json").exists()  # nothing was written
+    hkp.load()  # reloaded: the process holds the file, so the export is of what is on disk, and says so
+    exported = runtime.export(hk, tmp_path / "m")
+    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=exported.directory, pin=exported.digest), hk_expected(x, {"OFFSET": "1.0"}))
+    assert not torch.equal(old, hk_expected(x, {"OFFSET": "1.0"}))
+
+
+def test_a_constexpr_assigned_to_a_module_at_run_time_is_refused(hkp, tmp_path):
+    """A kernel's inputs come from source files: a value assigned to ``hk_cfg.SCALE`` after the import would be compiled in
+    while the digest, the cache and the manifest describe the file."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    hkp.write()
+    hkp.load()
+    sys.modules["hk_cfg"].SCALE = triton.language.constexpr(5.0)
+    runtime.clear_caches()
+    with pytest.raises(TilefishBuildError, match=r"module attribute 'hk_cfg.SCALE', which the Triton function 'hk_kernel' reads, was assigned"):
+        tilefish.run(hk, x, mode="jit")
+    with pytest.raises(TilefishBuildError, match="was assigned after 'hk_cfg' was imported"):
+        runtime.export(hk, tmp_path / "m")
+    hkp.load()
+    assert torch.equal(tilefish.run(hk, x, mode="jit"), hk_expected(x, {}))
 
 
 # -- H2: build() stamps a source digest on what it compiled ---------------------------------------------------------------------------------------
@@ -769,7 +804,7 @@ def test_a_generated_file_edited_after_it_was_imported_is_not_built(tmp_path, mo
     low_new.write(src)  # the file is overwritten with the new one, the process keeps the old function
     linecache.clearcache()
     (spec,) = low_new.specs()
-    with pytest.raises(TilefishBuildError, match=r"was imported from an older version of .*Restart the process, or reload"):
+    with pytest.raises(TilefishBuildError, match=r"module '.*' changed on disk since it was imported .*reload it or restart"):
         build(spec, arch=ARCH, fn=getattr(imported, low_new.fn_name))
 
 

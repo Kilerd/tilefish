@@ -9,8 +9,14 @@ M2: a ``kernel`` lowers to Triton source (:func:`lower`); a compile spec builds 
 cubin with a manifest (:func:`tilefish.aot.build`, :func:`tilefish.aot.write_manifest`); and
 :func:`run` runs a kernel or an extern on torch tensors in the modes ``jit``, ``replay`` (the built
 cubin through the CUDA driver, what a C++ or Rust host runs) and ``reference`` (the IR interpreted
-with torch). Importing tilefish imports neither torch nor Triton; the ``gpu`` extra installs them.
+with torch). Importing tilefish imports neither torch nor Triton; the ``gpu`` extra installs them. It does install an import
+watch (:mod:`tilefish._source`) that records the files of the modules imported from then on, so that a build can refuse a module
+that was edited after the process imported it.
 """
+
+from . import _source
+
+_source.install_import_watch()  # records the modules imported from here on, so a build can tell a file that was edited after its import
 
 from . import aot
 from . import ops as _ops
