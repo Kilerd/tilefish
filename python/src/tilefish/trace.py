@@ -265,13 +265,14 @@ class Value:
 
     # -- methods ------------------------------------------------------------
 
-    def to(self, dtype: Any = _MISSING) -> "Value":
-        """Cast to ``dtype``. A narrowing cast is flagged as a rounding point in the IR."""
+    def to(self, dtype: Any = _MISSING, *, nan: "str | None" = None) -> "Value":
+        """Cast to ``dtype``. A narrowing cast is flagged as a rounding point in the IR. ``nan="preserve"`` keeps a NaN's sign and payload
+        in the f32 to bf16 cast (``"canonical"``, the default, gives ``0x7FFF``)."""
         from . import ops
 
         if dtype is _MISSING:
             raise TilefishTypeError("to: needs a dtype, e.g. x.to(bf16)")
-        return ops.cast(self, dtype)
+        return ops.cast(self, dtype, nan)
 
     def split(self, size: Any = _MISSING, axis: Any = _MISSING) -> "tuple[Value, ...]":
         """Split ``axis`` into equal chunks of ``size`` (or into chunks of the given sizes)."""

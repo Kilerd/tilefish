@@ -99,6 +99,10 @@ load of a tensor            ``tl.load(p + offs, mask=mask, other=0)``           
                                                                                          (rule ``cast.float-to-int``).
                                                                                          A narrowing cast gets ``# rounding
                                                                                          point``. Nothing else is ever cast.
+``x.to(bf16,                f32 to bf16 on the bits: ``b = x.to(tl.uint32,                  the same rounding; a NaN keeps its
+nan="preserve")``           bitcast=True)``, ``(b + 0x7FFF + ((b >> 16) & 1)) >> 16``,      sign and top payload bits, quiet
+                            a NaN ``(b >> 16) | 0x40``                                      (note 1). ``nan="canonical"`` is the
+                                                                                         default: ``0x7FFF``.
 store                       ``tl.store(p + offs, v, mask=mask)``                        the IR value as is (its dtype equals
                                                                                          the target's). ``[R]``: no mask.
                                                                                          An ``Out`` or ``InOut`` parameter
@@ -192,6 +196,16 @@ Notes (the facts behind the table):
    give 0), then reduced modulo 256, so ``-1.5`` is 0, ``255.5`` is 255, ``256`` is 0, ``300`` is 44, ``1000`` is
    232 and anything from 65535 up is 255; it neither saturates at 255 nor wraps like C. torch differs again
    (``-1.5`` to ``u8`` is 255).
+   **A NaN in the f32 to bf16 cast** has two declared modes. ``x.to(bf16)`` is ``x.to(bf16, nan="canonical")``:
+   ``cvt.rn.bf16.f32``, which gives the canonical NaN ``0x7FFF`` for every NaN. ``x.to(bf16, nan="preserve")`` is the integer
+   round to nearest even on the bit pattern (``r = (b + 0x7FFF + ((b >> 16) & 1)) >> 16`` on the u32 bits), and a NaN keeps its
+   sign and its top payload bits with the quiet bit set (``(b >> 16) | 0x40``: ``0xFFC00000`` becomes ``0xFFC0``, ``0x7F800001``
+   becomes ``0x7FC0``). The two modes give the same bits on every other f32 (subnormals and infinities included); over all 2**32
+   inputs they differ on 16 646 142, every one a NaN whose upper half is not ``0x7FFF`` (``tests/test_gpu_casts.py``). An f32 that
+   comes out of GPU arithmetic is never such a NaN (``add`` and ``mul`` produce only ``0x7FFFFFFF``), so the mode matters for a cast
+   of an input. torch's own cast of a NaN is a third answer that depends on where it runs (``0x7FFF`` on CUDA, ``0x7FC0`` or ``0xFFFF``
+   on the CPU); the ``reference`` mode computes the declared mode on the bits, so it is byte-identical to the binary in both.
+   Only the f32 to bf16 cast has ``nan=``.
 2. **FMA contraction.** A generated kernel asks Triton for ``enable_fp_fusion=True`` (Triton's default, written
    into the spec), so ``a * b + c`` **may round once**: it is one FMA, ``fma.rn.f32`` for f32 and ``fma.rn.bf16x2``,
    a native packed bf16 FMA, for bf16. With ``@tilefish.kernel(fp_fusion=False)`` it is ``mul.rn`` then ``add.rn``
@@ -1441,6 +1455,12 @@ class _Body:
         if op == "gelu":
             return f"0.5 * {a[0]} * (1.0 + tl.math.erf({a[0]} * 0.7071067811865476))"
         if op == "cast":
+            if n.attrs.get("nan") == "preserve":  # f32 -> bf16 by the integer round to nearest even on the bits (note 1)
+                b, r, q = (self.names.fresh(f"{v}_{s}") for s in ("b", "r", "q"))
+                self.emit(f"{b} = {a[0]}.to(tl.uint32, bitcast=True)")
+                self.emit(f"{r} = ({b} + 0x7FFF + (({b} >> 16) & 1)) >> 16", "round to nearest even on the upper half")
+                self.emit(f"{q} = ({b} >> 16) | 0x40", "a NaN: its sign and payload, quiet")
+                return f"tl.where({a[0]} != {a[0]}, {q}, {r}).to(tl.uint16).to(tl.bfloat16, bitcast=True)"
             return f"{a[0]}.to(tl.{_TL[n.attrs['to'].name]})"
         if op in _REDUCTIONS:
             return self.layout.reduce(op, a[0])

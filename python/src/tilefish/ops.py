@@ -364,8 +364,16 @@ def cos(x: Value) -> Value:
 # -- casts ------------------------------------------------------------------------
 
 
-def cast(x: Value, dtype: DType) -> Value:
+NAN_MODES = ("canonical", "preserve")
+
+
+def cast(x: Value, dtype: DType, nan: "str | None" = None) -> Value:
     """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point.
+
+    ``nan`` says what the f32 to bf16 cast does with a NaN (note 1 of :mod:`tilefish.lower`): ``"canonical"`` (the default, PTX
+    ``cvt.rn.bf16.f32``) gives the canonical NaN ``0x7FFF``; ``"preserve"`` is the integer round to nearest even on the bit pattern, which
+    keeps a NaN's sign and the top of its payload (quiet bit set): ``0xFFC00000`` becomes ``0xFFC0``. The two agree on every other input.
+    Only that cast has the option.
 
     A cast to the dtype the tensor already has emits no node and behaves exactly like reading the
     tensor at that point: it returns the version that is current at the time of the cast, and that
@@ -385,10 +393,20 @@ def cast(x: Value, dtype: DType) -> Value:
             f"to: {x.ref} ({x.type}) cannot be cast to a mask: a mask comes from a comparison, so write the test it stands for "
             "(x != 0 is what a cast to bool would mean, and is true for a NaN)"
         )
+    if nan is not None:
+        if nan not in NAN_MODES:
+            raise TilefishTypeError(f"to: nan must be 'canonical' or 'preserve', got {nan!r}")
+        if not (x.dtype.name == "f32" and dtype.name == "bf16"):
+            raise TilefishTypeError(
+                f"to: nan= is a mode of the f32 to bf16 cast; casting {x.type} to {dtype} has one NaN rule (see note 1 of the numerics contract)"
+            )
     if dtype == x.dtype:
         return x._reference()
     rounding = x.dtype.is_narrowing_to(dtype)
-    (out,) = x.ctx.emit("cast", [x], {"to": dtype, "rounding": rounding}, [x.type.with_dtype(dtype)])
+    attrs: dict[str, Any] = {"to": dtype, "rounding": rounding}
+    if nan == "preserve":  # the default, "canonical", is the plain cast and leaves the node as it always was
+        attrs["nan"] = nan
+    (out,) = x.ctx.emit("cast", [x], attrs, [x.type.with_dtype(dtype)])
     return out
 
 

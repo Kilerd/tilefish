@@ -5,7 +5,10 @@ node by node:
 
 * a cast happens exactly where the IR has one (``.to(dtype)``, nowhere else); a cast to ``e4m3`` or ``e5m2``
   is ``satfinite`` like the binaries (saturating at 448 and 57344, where torch gives NaN or infinity), and the
-  half types round to nearest even like torch. A float to integer cast is torch's, which is a plain truncation
+  half types round to nearest even like torch. f32 to bf16 is computed on the bits, in the NaN mode the cast declares: a NaN is
+  ``0x7FFF`` for ``nan="canonical"`` (the default, what the binary's ``cvt.rn.bf16.f32`` gives) and keeps its sign and payload for
+  ``nan="preserve"``; torch's own cast is neither everywhere (``0x7FFF`` on CUDA, ``0x7FC0`` or ``0xFFFF`` on the CPU), so it is not
+  used for that one. A float to integer cast is torch's, which is a plain truncation
   in range; the lowering rejects it (rule ``cast.float-to-int``), so no binary has a behavior to compare with;
 * every other operation runs in the dtype the IR gave its result, and a python scalar or ``const`` is a 0-d
   tensor of that dtype (a bf16 tensor combined with a float scalar rounds the scalar to bf16 first, as
@@ -62,15 +65,33 @@ def reciprocal(torch: Any, value: float, dtype: Any, device: Any) -> Any:
     return (one / torch.tensor(value, dtype=dtype)).to(device)
 
 
-def cast(torch: Any, x: Any, src: Any, dst: Any) -> Any:
-    """``x.to(dst)``, with ``satfinite`` for the fp8 types.
+def f32_to_bf16(torch: Any, x: Any, nan: str) -> Any:
+    """The f32 to bf16 cast of the binary, bit for bit: round to nearest even on the bit pattern, and a NaN either canonical (``0x7FFF``,
+    what ``cvt.rn.bf16.f32`` gives) or with its sign and top payload bits kept, quiet (``nan="preserve"``).
+
+    Written on the bits rather than as ``x.to(torch.bfloat16)`` because torch's own cast of a NaN depends on where it runs: ``0x7FFF`` on
+    CUDA, ``0x7FC0`` or ``0xFFFF`` on the CPU (scalar or vectorized path). On every other input they are all the same rounding.
+    """
+    b = x.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    rounded = (b + 0x7FFF + ((b >> 16) & 1)) >> 16
+    kept = (b >> 16) | 0x40
+    canonical = torch.full_like(b, 0x7FFF)
+    word = torch.where(torch.isnan(x), kept if nan == "preserve" else canonical, rounded) & 0xFFFF
+    return torch.where(word >= 0x8000, word - 0x10000, word).to(torch.int16).view(torch.bfloat16)
+
+
+def cast(torch: Any, x: Any, src: Any, dst: Any, nan: "str | None" = None) -> Any:
+    """``x.to(dst)``, with ``satfinite`` for the fp8 types and the binary's own f32 to bf16 rounding.
 
     ``src`` and ``dst`` are tilefish dtypes. Float to ``e4m3`` / ``e5m2``: round to nearest even, saturating at
     the largest finite value (448, 57344), infinities included, instead of overflowing to NaN or infinity as
-    torch does; NaN stays NaN. Every other cast is torch's (a float to integer cast is not lowered, see
+    torch does; NaN stays NaN. f32 to bf16 is :func:`f32_to_bf16` in the NaN mode ``nan`` of the cast (``canonical`` by
+    default). Every other cast is torch's (a float to integer cast is not lowered, see
     ``cast.float-to-int``, so only its in-range truncation toward zero is meaningful here).
     """
     target = torch_dtype(torch, dst)
+    if src.name == "f32" and dst.name == "bf16":
+        return f32_to_bf16(torch, x, nan or "canonical")
     if src.is_float and dst.name == "e4m3":
         return x.to(torch.float32).clamp(-_E4M3_MAX, _E4M3_MAX).to(target)
     if src.is_float and dst.name == "e5m2":
@@ -203,7 +224,7 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 r = 0.5 * a[0] * (1.0 + torch.erf(a[0] * 0.7071067811865476))
             elif op == "cast":
                 src = n.inputs[0].type.dtype  # type: ignore[union-attr]
-                r = cast(torch, a[0], src, n.attrs["to"])
+                r = cast(torch, a[0], src, n.attrs["to"], n.attrs.get("nan"))
             elif op in ("sum", "mean", "max"):
                 axes = tuple(n.attrs["axes"])
                 keep = bool(n.attrs["keepdims"])
