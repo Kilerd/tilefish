@@ -8,8 +8,8 @@ import triton.language as tl
 
 
 @triton.jit
-def fill_kernel(x_ptr, n_elements, VALUE: tl.constexpr, BLOCK: tl.constexpr):
+def fill_kernel(x, n_elements, VALUE: tl.constexpr, BLOCK: tl.constexpr):
     """``x[:n] = VALUE``: writes ``n_elements`` elements from the pointer it is given, whatever the tensor behind it holds."""
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n_elements
-    tl.store(x_ptr + offsets, tl.full((BLOCK,), VALUE, tl.float32), mask=mask)
+    tl.store(x + offsets, tl.full((BLOCK,), VALUE, tl.float32), mask=mask)
