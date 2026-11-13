@@ -158,9 +158,22 @@ standard library) and the Triton version. `replay` recomputes it, which needs
 the kernel to be importable, or a pin. Triton's own `cache_key` is not used: it
 does not see a `tl.constexpr` read as a module attribute (`cfg.SCALE`), a dtype
 alias or a constant in a helper module, so none of them would make a stale
-binary look stale. For the same reason every `jit` and `export` build compiles
-from scratch and never reads Triton's disk cache (about 35 to 130 ms per binary
-on a B300, once per process for `jit`).
+binary look stale. For the same reason a build never reads Triton's disk cache.
+
+A build compiles from scratch (about 25 to 75 ms per binary on a B300) unless
+tilefish's own cache has it: `~/.cache/tilefish`, or `$TILEFISH_CACHE_DIR` (an
+empty value switches it off; `aot.build(..., cache=False)` skips it for one
+build). Its key is the declaration digest, the spec's source identity
+(`source_sha256`, or the source digest of a hand-written kernel, computed only
+after the edited-module check above), the architecture, the Triton and `ptxas`
+versions and the compile options, and every read is verified: the `sha256` and
+`sha256_code` of the cubin are recomputed (and the PTX, the entry point and its
+ABI, the options and the versions are checked), and an entry that is not as it
+was written is a warning and a rebuild, never used. Entries are written through a
+temporary file and renamed, so builds that race do not tear one. A hit takes
+about 0.5 ms. The cache is as exact as the source digest (what that does not
+reach is not in the key either), nothing evicts it, and it is no defence
+against someone who can write the directory: a manifest is what to pin.
 
 **Any edit to a file a hand-written kernel reaches, a comment included, means
 exporting again and pinning the new manifest.** The digest is of the files on

@@ -13,7 +13,8 @@ also lowers to Triton source (`tilefish.lower`), and with the `gpu` extra
 a cubin (`tilefish.aot.build`), a manifest directory holds the cubins
 (`tilefish.runtime.export`), and a kernel runs in `jit` (built through its
 spec, in memory), `replay` (the manifest's cubins, checked against its
-digests; a stale binary is refused, and the directory is trusted unless its
-digest is pinned) and `reference` mode (`tilefish.run`). The API will change.
+digests; a stale binary is refused, and it needs a trust anchor: the manifest's
+pinned digest, or an explicit `trust_directory=True`) and `reference` mode
+(`tilefish.run`). The API will change.
 
 The design and the roadmap are at https://github.com/Kilerd/tilefish.

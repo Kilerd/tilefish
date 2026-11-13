@@ -12,8 +12,8 @@ extern's ``Out`` tensors; ``None``, one tensor or a tuple.
 mode           what runs
 =============  ============================================================================================
 ``jit``        the current source, built through its compile spec (``spec.ast_source_inputs()``, the path
-               of :func:`tilefish.aot.build`) in memory, cached by digest, and launched through the CUDA
-               driver
+               of :func:`tilefish.aot.build`) in memory, cached by digest (in memory, and on disk by
+               tilefish's own build cache), and launched through the CUDA driver
 ``replay``     the prebuilt cubins of a manifest directory (``manifest=``, written by
                :func:`export` or ``write_manifest(..., cubins=True)``), loaded with ``cuModuleLoadData``
                and launched through the same driver path: exactly what a C++ or Rust host does
@@ -45,8 +45,10 @@ and refuses
   kernel. Any edit to a reachable file, a comment included, makes it differ: export again and pin the new manifest.
   Where it cannot be recomputed (the module does not import without Triton) ``replay`` refuses, unless ``pin=`` is given.
   (Triton's ``cache_key`` is not used: it misses a ``tl.constexpr`` read as a module attribute, a dtype alias and
-  constants in helper modules. For the same reason every ``jit`` and ``export`` build compiles from scratch and never
-  reads Triton's disk cache.)
+  constants in helper modules. For the same reason a build never reads Triton's disk cache. It compiles from scratch
+  unless tilefish's own cache has the binary, keyed by the declaration digest, the source identity (this digest, or the
+  ``source_sha256`` of a generated kernel), the architecture, the toolchain and the options, and verified on every
+  read: :mod:`tilefish._cache`.)
 
 Trust. A replay needs a trust anchor and refuses to run without one: ``run(..., mode="replay", manifest=directory)`` raises
 unless it is given ``pin=`` or ``trust_directory=True``. (This is a deliberate break from 0.0.1 and 0.0.2, where the
@@ -556,9 +558,10 @@ def export(
     kernels stay, and a new binary replaces the entry of the same stem and architecture. An existing entry that is a
     different binary (other machine code, declaration, source or options) is replaced only with ``overwrite=True``.
 
-    Every build compiles from scratch (Triton's disk cache is not read) and the files of a hand-written kernel must be
-    the ones the process imported (see :func:`tilefish.aot.build`). Files are written through temporary files and
-    renamed, and a symbolic link where a file goes is refused.
+    No build reads Triton's disk cache; a binary comes from tilefish's own build cache when it has one for exactly this
+    source, architecture, toolchain and options (verified on every read), and is compiled otherwise. The files of a
+    hand-written kernel must be the ones the process imported (see :func:`tilefish.aot.build`). Files are written
+    through temporary files and renamed, and a symbolic link where a file goes is refused.
 
     Returns the loaded and verified :class:`~tilefish.aot.Manifest`: ``.directory``, ``.path`` and ``.digest``, the
     digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
