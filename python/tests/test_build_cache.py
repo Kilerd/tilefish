@@ -210,6 +210,19 @@ def test_a_constant_assigned_at_run_time_is_refused_not_cached(world):
     assert compiler.count == 0 and entries() == []  # an entry made now would be served to a clean process under the digest of the file
 
 
+def test_a_replay_recomputes_a_source_digest_only_for_a_process_that_holds_the_files(world):
+    """``replay`` compares the manifest's digest with the files, so it asks for the same check as a build."""
+    project, _ = world
+    project.load()
+    digest = runtime._current_source_digest(SPEC)
+    assert digest is not None and len(digest) == 64
+    project.edit("ic_helper_b", "OFFSET = 0.0", "OFFSET = 1.0")  # edited, not reloaded
+    with pytest.raises(tilefish.TilefishRuntimeError, match=r"module 'ic_helper_b' changed on disk since it was imported .*reload it or restart"):
+        runtime._current_source_digest(SPEC)
+    project.load()
+    assert runtime._current_source_digest(SPEC) not in (None, digest)
+
+
 # -- the key --------------------------------------------------------------------------------------------------------------------------
 
 

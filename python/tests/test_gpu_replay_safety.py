@@ -550,9 +550,11 @@ def test_an_attacker_who_rewrites_the_cubin_and_every_digest_is_caught_only_by_a
     (tmp_path / "manifest.json").write_text(json.dumps(doc))
     with pytest.raises(TilefishManifestError, match="it is not the manifest that was pinned"):
         tilefish.run(softmax, x, mode="replay", manifest=tmp_path, pin=manifest.digest)
-    # without the pin the directory is trusted, as the documentation says: it replays the altered binary
+    # trust_directory=True is the explicit statement that whatever the directory holds is fine: it replays the altered binary
     runtime.clear_caches()
     tilefish.run(softmax, x, mode="replay", manifest=tmp_path, trust_directory=True)
+    with pytest.raises(TilefishRuntimeError, match="replay needs a trust anchor"):  # and neither is a default
+        tilefish.run(softmax, x, mode="replay", manifest=tmp_path)
 
 
 def test_a_declared_constraint_is_checked_before_a_binary_is_chosen():
@@ -736,6 +738,22 @@ def test_a_constant_two_levels_away_that_was_edited_and_not_reloaded_is_refused_
     exported = runtime.export(hk, tmp_path / "m")
     assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=exported.directory, pin=exported.digest), hk_expected(x, {"OFFSET": "1.0"}))
     assert not torch.equal(old, hk_expected(x, {"OFFSET": "1.0"}))
+
+
+def test_a_replay_is_refused_for_a_module_edited_and_not_reloaded(hkp, tmp_path):
+    """The binary may be the one of the file on disk, and the process holds another version: whichever, it is not told apart silently."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    hkp.write()
+    hkp.load()
+    manifest = runtime.export(hk, tmp_path / "m")
+    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=manifest.digest), hk_expected(x, {}))
+    (hkp.directory / "hk_cfg.py").write_text((hkp.directory / "hk_cfg.py").read_text().replace("tl.constexpr(2.0)", "tl.constexpr(3.0)"))
+    for anchor in ({"pin": manifest.digest}, {"trust_directory": True}):
+        with pytest.raises(TilefishRuntimeError, match=r"module 'hk_cfg' changed on disk since it was imported .*reload it or restart"):
+            tilefish.run(hk, x, mode="replay", manifest=manifest.directory, **anchor)
+    hkp.load()  # reloaded: now it is the ordinary refusal of a stale binary
+    with pytest.raises(TilefishManifestError, match="stale"):
+        tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=manifest.digest)
 
 
 def test_a_constexpr_assigned_to_a_module_at_run_time_is_refused(hkp, tmp_path):
