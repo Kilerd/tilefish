@@ -1,0 +1,370 @@
+//! A manifest directory is read as strictly as Python reads it: what it refuses, Rust refuses, with no GPU.
+//!
+//! Each test starts from a copy of the `sm_103` fixture and breaks one thing: tampered JSON, a wrong pin, a path that
+//! leaves the directory, a symbolic link, a key twice, `NaN`, an unknown key, a field of the wrong type, a tampered
+//! cubin (also one whose digest in the manifest was rewritten to match), an entry that two kernels share, a kernel that
+//! uses shared memory the manifest does not account for.
+
+mod common;
+
+use common::{Copy, expected_digest};
+use tilefish::elf::{Elf, sha256_hex};
+use tilefish::{Arch, Error, Manifest, Pin, PreconditionKind};
+
+fn trust(copy: &Copy) -> Result<Manifest, Error> {
+    Manifest::load(&copy.dir, Pin::TrustDirectory)
+}
+
+fn refused(copy: &Copy) -> String {
+    match trust(copy) {
+        Err(Error::Manifest(message)) => message,
+        Err(other) => panic!("expected a manifest error, got {other:?}"),
+        Ok(_) => panic!("the manifest was accepted"),
+    }
+}
+
+#[test]
+fn an_untouched_copy_is_accepted_under_both_pins() {
+    let copy = Copy::of("sm_103");
+    let digest = expected_digest("sm_103");
+    assert!(Manifest::load(&copy.dir, Pin::Digest(&digest)).is_ok());
+    assert!(trust(&copy).is_ok());
+    // the manifest file itself works as well as its directory
+    assert!(Manifest::load(copy.manifest_path(), Pin::Digest(&digest)).is_ok());
+}
+
+#[test]
+fn a_wrong_pin_is_refused_and_so_is_one_that_is_not_a_digest() {
+    let copy = Copy::of("sm_103");
+    let wrong = "0".repeat(64);
+    match Manifest::load(&copy.dir, Pin::Digest(&wrong)) {
+        Err(Error::PinMismatch { found, pinned, .. }) => {
+            assert_eq!(found, expected_digest("sm_103"));
+            assert_eq!(pinned, wrong);
+        }
+        other => panic!("{other:?}"),
+    }
+    // the digest of the other architecture's manifest is a wrong pin too
+    assert!(matches!(
+        Manifest::load(&copy.dir, Pin::Digest(&expected_digest("sm_120"))),
+        Err(Error::PinMismatch { .. })
+    ));
+    for bad in ["", "abc", &"A".repeat(64), &"g".repeat(64), &"0".repeat(65)] {
+        assert!(matches!(Manifest::load(&copy.dir, Pin::Digest(bad)), Err(Error::BadPin(_))), "{bad:?}");
+    }
+}
+
+#[test]
+fn tampered_json_changes_the_digest_so_a_pin_refuses_it() {
+    let copy = Copy::of("sm_103");
+    copy.edit("\"shared\": 16", "\"shared\": 17");
+    let result = Manifest::load(&copy.dir, Pin::Digest(&expected_digest("sm_103")));
+    assert!(matches!(result, Err(Error::PinMismatch { .. })), "{result:?}");
+    // trusting the directory takes whatever it holds: that is what the pin is for
+    let trusted = trust(&copy).expect("a consistent edit is accepted without a pin");
+    assert_ne!(trusted.digest(), expected_digest("sm_103"));
+    // and the pin of the edited manifest accepts it
+    assert!(Manifest::load(&copy.dir, Pin::Digest(trusted.digest())).is_ok());
+}
+
+#[test]
+fn a_pin_is_checked_before_a_cubin_is_read() {
+    let copy = Copy::of("sm_103");
+    std::fs::remove_file(copy.dir.join("softmax.sm_103.cubin")).unwrap();
+    let result = Manifest::load(&copy.dir, Pin::Digest(&"1".repeat(64)));
+    assert!(matches!(result, Err(Error::PinMismatch { .. })), "{result:?}");
+}
+
+#[test]
+fn a_cubin_name_that_leaves_the_directory_is_refused() {
+    for name in [
+        "../sm_120/softmax.sm_120.cubin",
+        "/etc/passwd",
+        "sub/softmax.sm_103.cubin",
+        "..",
+        ".",
+        ".softmax.cubin",
+        "a\\\\b.cubin",
+        "",
+    ] {
+        let copy = Copy::of("sm_103");
+        copy.edit("\"cubin\": \"softmax.sm_103.cubin\"", &format!("\"cubin\": \"{name}\""));
+        let message = refused(&copy);
+        assert!(message.contains("plain file name"), "{name:?}: {message}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symbolic_link_is_refused_for_the_cubin_and_for_the_manifest() {
+    let copy = Copy::of("sm_103");
+    let cubin = copy.dir.join("softmax.sm_103.cubin");
+    let real = copy.dir.join("elsewhere.bin");
+    std::fs::rename(&cubin, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &cubin).unwrap();
+    assert!(refused(&copy).contains("symbolic link"));
+
+    let copy = Copy::of("sm_103");
+    let real = copy.dir.join("real-manifest.json");
+    std::fs::rename(copy.manifest_path(), &real).unwrap();
+    std::os::unix::fs::symlink(&real, copy.manifest_path()).unwrap();
+    assert!(refused(&copy).contains("symbolic link"));
+}
+
+#[test]
+fn a_missing_cubin_is_refused() {
+    let copy = Copy::of("sm_103");
+    std::fs::remove_file(copy.dir.join("swiglu.sm_103.cubin")).unwrap();
+    let message = refused(&copy);
+    assert!(message.contains("swiglu") && message.contains("cannot read the cubin"), "{message}");
+}
+
+#[test]
+fn what_is_not_strict_json_is_refused() {
+    let cases: [(&str, &str, &str); 8] = [
+        ("a key twice", "\"stem\": \"softmax\",", "\"stem\": \"softmax\", \"stem\": \"softmax\","),
+        ("NaN", "\"shared\": 16", "\"shared\": NaN"),
+        ("Infinity", "\"shared\": 16", "\"shared\": Infinity"),
+        ("a number that does not fit a float", "\"num_stages\": 3", "\"num_stages\": 1e999"),
+        ("a trailing comma", "\"schema\": 1,", "\"schema\": 1,,"),
+        ("a leading zero", "\"num_stages\": 3", "\"num_stages\": 03"),
+        ("a lone surrogate", "\"op\": \"softmax\"", "\"op\": \"soft\\ud800max\""),
+        ("a single quote", "\"schema\": 1", "'schema': 1"),
+    ];
+    for (what, from, to) in cases {
+        let copy = Copy::of("sm_103");
+        copy.edit(from, to);
+        let message = refused(&copy);
+        assert!(message.contains("not strict JSON"), "{what}: {message}");
+    }
+    // every kind of repeated key, not only in an entry
+    let copy = Copy::of("sm_103");
+    copy.edit("\"schema\": 1,", "\"schema\": 1, \"schema\": 1,");
+    assert!(refused(&copy).contains("twice"));
+    let copy = Copy::of("sm_103");
+    copy.edit("\"slot\": 0,", "\"slot\": 0, \"slot\": 0,");
+    assert!(refused(&copy).contains("twice"));
+    // not JSON at all, a byte order mark, text that is not UTF-8
+    let copy = Copy::of("sm_103");
+    copy.write_manifest("not json");
+    assert!(refused(&copy).contains("not strict JSON"));
+    let copy = Copy::of("sm_103");
+    copy.write_manifest(&format!("\u{feff}{}", copy.manifest_text()));
+    assert!(refused(&copy).contains("byte order mark"));
+    let copy = Copy::of("sm_103");
+    std::fs::write(copy.manifest_path(), [0xff, 0xfe, b'{', b'}']).unwrap();
+    assert!(refused(&copy).contains("UTF-8"));
+}
+
+#[test]
+fn an_unknown_key_a_missing_key_and_a_wrong_type_are_refused() {
+    let cases: [(&str, &str, &str, &str); 11] = [
+        (
+            "an unknown key in an entry",
+            "\"stem\": \"softmax\",",
+            "\"stem\": \"softmax\", \"extra\": 1,",
+            "unknown field",
+        ),
+        ("an unknown top-level key", "\"schema\": 1,", "\"schema\": 1, \"surprise\": true,", "unknown field"),
+        ("an unknown key in the ABI", "\"slot\": 0,", "\"slot\": 0, \"align\": 8,", "unknown field"),
+        ("a missing key", "\"symbol\": \"tf_softmax\",", "", "missing field"),
+        ("shared as a string", "\"shared\": 16", "\"shared\": \"16\"", "invalid type"),
+        ("num_warps as a float", "\"num_warps\": 4,", "\"num_warps\": 4.0,", "invalid type"),
+        ("a bool where an int is", "\"num_stages\": 3", "\"num_stages\": true", "invalid type"),
+        ("a negative size", "\"shared\": 16", "\"shared\": -16", "invalid value"),
+        ("the schema as another number", "\"schema\": 1,", "\"schema\": 2,", "schema"),
+        (
+            "an unknown compile option",
+            "\"num_stages\": 3\n      },\n      \"declaration_digest\"",
+            "\"num_stages\": 3, \"maxnreg\": 64\n      },\n      \"declaration_digest\"",
+            "unknown field",
+        ),
+        ("a digest that is not hex", "\"sha256\": \"", "\"sha256\": \"G", "sha256"),
+    ];
+    for (what, from, to, why) in cases {
+        let copy = Copy::of("sm_103");
+        copy.edit(from, to);
+        let message = refused(&copy);
+        assert!(message.contains(why), "{what}: {message}");
+    }
+    let copy = Copy::of("sm_103");
+    copy.write_manifest("[1, 2]");
+    assert!(refused(&copy).contains("not a JSON object") || refused(&copy).contains("not a tilefish manifest"));
+}
+
+#[test]
+fn a_tampered_cubin_is_refused_by_its_file_digest() {
+    let copy = Copy::of("sm_103");
+    let path = copy.dir.join("gelu_exact.sm_103.cubin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&path, bytes).unwrap();
+    let message = refused(&copy);
+    assert!(
+        message.contains("gelu_exact") && message.contains("sha256") && message.contains("not the one that was built"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_tampered_cubin_whose_file_digest_was_rewritten_is_refused_by_its_code_digest() {
+    let copy = Copy::of("sm_103");
+    let path = copy.dir.join("gelu_exact.sm_103.cubin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let old_file = sha256_hex(&bytes);
+    // flip one bit of the machine code itself
+    let section = {
+        let elf = Elf::parse(&bytes).unwrap();
+        let s = elf.section(".text.tf_gelu_exact").expect("the kernel's code section").clone();
+        assert!(s.size > 16);
+        s
+    };
+    bytes[section.offset as usize + 8] ^= 0x10;
+    std::fs::write(&path, &bytes).unwrap();
+    copy.edit(&old_file, &sha256_hex(&bytes)); // the attacker who can write the directory rewrites this one too
+    let message = refused(&copy);
+    assert!(message.contains("sha256_code") && message.contains("changed after it was built"), "{message}");
+    // and a pin refuses the rewritten manifest before any of that
+    assert!(matches!(
+        Manifest::load(&copy.dir, Pin::Digest(&expected_digest("sm_103"))),
+        Err(Error::PinMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_cubin_that_is_not_an_elf_file_is_refused() {
+    let copy = Copy::of("sm_103");
+    let junk = vec![7u8; 4096];
+    std::fs::write(copy.dir.join("gelu_exact.sm_103.cubin"), &junk).unwrap();
+    let old = common::expected()["fixtures"]["sm_103"]["kernels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["stem"] == "gelu_exact")
+        .unwrap()["sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    copy.edit(&old, &sha256_hex(&junk));
+    let message = refused(&copy);
+    assert!(message.contains("is not a valid cubin") && message.contains("bad magic"), "{message}");
+}
+
+#[test]
+fn an_entry_that_two_kernels_share_is_refused() {
+    let copy = Copy::of("sm_103");
+    let mut doc: serde_json::Value = serde_json::from_str(&copy.manifest_text()).unwrap();
+    let first = doc["kernels"][0].clone();
+    doc["kernels"].as_array_mut().unwrap().push(first);
+    copy.write_manifest(&serde_json::to_string_pretty(&doc).unwrap());
+    assert!(refused(&copy).contains("twice"));
+}
+
+#[test]
+fn shared_memory_the_manifest_does_not_account_for_is_refused() {
+    let copy = Copy::of("sm_103");
+    // softmax reduces through shared memory: a launch with `shared = 0` would fault and poison the context
+    let mut doc: serde_json::Value = serde_json::from_str(&copy.manifest_text()).unwrap();
+    let softmax = doc["kernels"].as_array_mut().unwrap().iter_mut().find(|k| k["stem"] == "softmax").unwrap();
+    softmax["shared"] = serde_json::Value::from(0);
+    copy.write_manifest(&serde_json::to_string_pretty(&doc).unwrap());
+    let message = refused(&copy);
+    assert!(message.contains("shared = 0") && message.contains("poison"), "{message}");
+}
+
+#[test]
+fn entries_that_contradict_themselves_are_refused() {
+    type Change = fn(&mut serde_json::Value);
+    let cases: [(&str, Change, &str); 8] = [
+        ("a block that is not 32 threads a warp", |e| e["block"][0] = 64.into(), "block must be"),
+        ("an op that does not match the stem", |e| e["op"] = "softmaxx".into(), "does not match op"),
+        ("an alignment other than 16", |e| e["preconditions"][0]["bytes"] = 8.into(), "pointer_alignment must be 16"),
+        (
+            "a pointer type that is not its dtype",
+            |e| e["abi"]["params"][0]["type"] = "*bf16".into(),
+            "does not match dtype",
+        ),
+        (
+            "a max_elements that is not 2^31-1",
+            |e| e["preconditions"][2]["value"] = 2147483646u64.into(),
+            "max_elements",
+        ),
+        ("a slot out of place", |e| e["abi"]["params"][1]["slot"] = 5.into(), "slot"),
+        (
+            "scratch slots that are not the two null pointers",
+            |e| e["abi"]["scratch"][0]["value"] = 1.into(),
+            "scratch slots",
+        ),
+        ("a grid with no trailing comma", |e| e["grid"] = "(M)".into(), "trailing comma"),
+    ];
+    for (what, change, why) in cases {
+        let copy = Copy::of("sm_103");
+        copy.edit_json(|doc| change(Copy::entry(doc, "softmax")));
+        let message = refused(&copy);
+        assert!(message.contains(why), "{what}: {message}");
+    }
+}
+
+#[test]
+fn a_manifest_that_drops_a_pointers_alignment_check_is_refused() {
+    let copy = Copy::of("sm_103");
+    let mut doc: serde_json::Value = serde_json::from_str(&copy.manifest_text()).unwrap();
+    let gelu = doc["kernels"].as_array_mut().unwrap().iter_mut().find(|k| k["stem"] == "gelu_exact").unwrap();
+    let pre = gelu["preconditions"].as_array_mut().unwrap();
+    let at = pre.iter().position(|p| p["kind"] == "pointer_alignment").unwrap();
+    pre.remove(at);
+    copy.write_manifest(&serde_json::to_string_pretty(&doc).unwrap());
+    let message = refused(&copy);
+    assert!(message.contains("no pointer_alignment precondition"), "{message}");
+}
+
+#[test]
+fn a_binary_that_needs_launch_attributes_a_plain_launch_does_not_set_up_is_refused_when_it_is_planned() {
+    let copy = Copy::of("sm_103");
+    let mut doc: serde_json::Value = serde_json::from_str(&copy.manifest_text()).unwrap();
+    doc["kernels"][0]["launch"]["launch_pdl"] = serde_json::Value::Bool(true);
+    let stem = doc["kernels"][0]["stem"].as_str().unwrap().to_owned();
+    copy.write_manifest(&serde_json::to_string_pretty(&doc).unwrap());
+    let manifest = trust(&copy).expect("it reads: it is the launch that cannot be made");
+    match manifest.plan(&stem, &[], Arch::sm(103)) {
+        Err(Error::Unsupported(message)) => assert!(message.contains("launch_pdl=True"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_kernel_or_an_architecture_the_manifest_does_not_have_is_named() {
+    let manifest = Manifest::load(common::fixtures().join("sm_120"), Pin::TrustDirectory).unwrap();
+    match manifest.plan("softmax", &[], Arch::sm(103)) {
+        Err(Error::NoBinary(message)) => {
+            assert!(message.contains("no binary for 'softmax' on sm_103") && message.contains("sm_120"), "{message}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(manifest.plan("softmax", &[], Arch::sm(120)).is_ok());
+    match manifest.plan("no_such_kernel", &[], Arch::sm(120)) {
+        Err(Error::NoBinary(message)) => assert!(message.contains("no kernel 'no_such_kernel'"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn buckets_are_exact() {
+    let manifest = Manifest::load(common::fixtures().join("sm_103"), Pin::TrustDirectory).unwrap();
+    let arch = Arch::sm(103);
+    // an operator and its bucket values, or the stem that says them
+    assert_eq!(manifest.plan("bucketed_rms", &[("Db", 96)], arch).unwrap().stem(), "bucketed_rms.Db96");
+    assert_eq!(manifest.plan("bucketed_rms.Db512", &[], arch).unwrap().stem(), "bucketed_rms.Db512");
+    assert_eq!(manifest.plan("bucketed_rms.Db512", &[("Db", 512)], arch).unwrap().stem(), "bucketed_rms.Db512");
+    for wrong in [&[("Db", 100)][..], &[][..], &[("Db", 96), ("X", 1)][..], &[("Dc", 96)][..]] {
+        match manifest.plan("bucketed_rms", wrong, arch) {
+            Err(e) => assert_eq!(e.precondition_kind(), Some(PreconditionKind::Bucket), "{wrong:?}: {e}"),
+            Ok(_) => panic!("{wrong:?} was accepted"),
+        }
+    }
+    let message = manifest.plan("bucketed_rms", &[("Db", 100)], arch).unwrap_err().to_string();
+    assert!(message.contains("no padding") && message.contains("[96, 512, 1000]"), "{message}");
+    // a stem that is not bucketed does not take a bucket
+    assert!(manifest.plan("softmax", &[("M", 4)], arch).is_err());
+}
