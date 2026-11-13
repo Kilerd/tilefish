@@ -191,6 +191,17 @@ def test_the_device_scalar_is_written_before_the_first_launch_from_what_the_call
     assert [e for e in be.log if e[0] == "devscalar"][-1][3] is True
 
 
+def test_a_device_scalar_that_is_not_an_integer_of_its_dtype_is_refused_before_anything_runs():
+    r, be = runner()
+    w = Weights(32)
+    for bad in (5.5, 2**31, -(2**31) - 1):
+        with pytest.raises(TilefishPreconditionError, match="not an integer that fits i32"):
+            r.run((w.t["x"], bad, *[w.t[k] for k in pm.WEIGHT_NAMES]), {})
+    assert not be.launches() and not any(e[0] == "devscalar" for e in be.log)
+    r.run((w.t["x"], 5.0, *[w.t[k] for k in pm.WEIGHT_NAMES]), {})  # a float that is a whole number is the integer
+    assert [e for e in be.log if e[0] == "devscalar"][-1][2] == 5
+
+
 def test_the_arena_is_allocated_once_and_the_binaries_are_loaded_once_per_bucket():
     r, be = runner()
     w = Weights(64)

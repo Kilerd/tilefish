@@ -369,7 +369,15 @@ class PlanRunner:
         for p in scalar_params:
             v = bound.arguments[p.name]
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                bound.arguments[p.name] = v = be.devscalar_tensor(v, p.type.dtype.name)  # type: ignore[union-attr]
+                dtype = p.type.dtype  # type: ignore[union-attr]
+                if dtype.is_int:
+                    lo, hi = dtype.int_range()
+                    if v != int(v) or not lo <= v <= hi:
+                        raise TilefishPreconditionError(
+                            f"the device scalar '{p.name}' is {v!r}, which is not an integer that fits {dtype} ({lo} to {hi})", kind="shape", arg=p.name
+                        )
+                    v = int(v)
+                bound.arguments[p.name] = v = be.devscalar_tensor(v, dtype.name)
             sources[p.name] = v
         call = bind_call(graph.name, sig, bound.args, bound.kwargs)
         check_dim_constraints(call.dims, buckets=False)
