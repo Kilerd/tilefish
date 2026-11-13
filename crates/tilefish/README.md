@@ -84,5 +84,20 @@ a launch on it cannot be ordered against other threads' uses of a slice; use
 region, which is also how CUDA graphs are captured (with `launch_raw`), and
 launching on a raw `CUstream`. See the crate docs for the exact contracts.
 
+**In a workspace that uses cudarc itself.** The crate needs cudarc 0.19.10 or a
+later 0.19 release: it hands the driver the function a `CudaFunction` holds
+(`CudaFunction::cu_function`, to check its parameter sizes, to load it eagerly
+and to launch it on a raw stream) and instantiates captured graphs with no flags
+(`CUgraphInstantiate_flags(0)`), both of which cudarc 0.19.10 added; 0.19.9 does
+not compile it. cudarc builds its bindings for exactly one `cuda-*` feature,
+and this crate enables `cuda-13020` by default: a workspace that picks its own
+must depend on the crate with the same one, or cudarc is built with two and does
+not compile:
+
+```toml
+cudarc = { version = "0.19.10", default-features = false, features = ["driver", "cuda-13000"] }
+tilefish = { version = "0.0.2", default-features = false, features = ["cuda-13000"] }
+```
+
 Licensed under either of Apache License, Version 2.0 or MIT license at your
 option.

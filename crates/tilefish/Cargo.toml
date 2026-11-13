@@ -18,7 +18,9 @@ categories = ["compilers", "science"]
 # only when a function of it is called, which this crate never does. The `cuda-*` feature of cudarc picks the bindings. `cublaslt` is
 # cudarc's cuBLASLt bindings (`cublaslt::result` and `cublaslt::sys`, which this crate calls to run a pinned algorithm: the safe
 # `CudaBlasLT::matmul` always runs the heuristic and cannot take one); with `dynamic-loading` libcublasLt is opened only when the first
-# call of a GEMM is made, and a manifest without `library` entries never opens it.
+# call of a GEMM is made, and a manifest without `library` entries never opens it. 0.19.10 is the oldest cudarc this crate builds
+# with: it calls `CudaFunction::cu_function` and `CUgraphInstantiate_flags(0)`, which 0.19.10 added (README: "In a workspace that uses
+# cudarc itself").
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "nvrtc", "cublaslt"] }
 ryu = "1.0.23"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -28,7 +30,9 @@ thiserror = "2.0.21"
 
 [features]
 # Pick exactly one: the CUDA driver API version the bindings are generated for. The driver found at run time must be
-# at least as new as the bindings' version. 13.2 is the driver of the B300 the crate is tested on.
+# at least as new as the bindings' version. 13.2 is the driver of the B300 the crate is tested on. A workspace that enables a
+# `cuda-*` feature of cudarc itself depends on this crate with `default-features = false` and the same feature: cudarc does
+# not compile with two.
 default = ["cuda-13020"]
 cuda-12040 = ["cudarc/cuda-12040"]
 cuda-12080 = ["cudarc/cuda-12080"]
