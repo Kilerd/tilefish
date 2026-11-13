@@ -355,10 +355,19 @@ def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":
 
 
 def _check_derivable(where: str, sig: Signature) -> None:
-    """Outputs and dim parameters may only mention dims that the input tensors determine."""
+    """Outputs and dim parameters may only mention dims that the input tensors determine at a launch: those of their shapes and, for a
+    ``Strided[...]`` parameter, of its strides. **Not the offset dimension** (``x_offset``) of a strided parameter: a launch does not bind it, in
+    Python (``_launch.bind_infos``) or in Rust (manifest schema 3, section 5.1, step 7: the check of the address is the one made), so a result
+    shaped by it, or a runtime scalar that carries it, could be traced but never launched."""
     determined: set[Dim] = set()
     for p in sig.tensor_inputs:
-        determined |= p.type.free_dims()  # type: ignore[union-attr]
+        t = p.type
+        assert t is not None
+        for d in t.shape:
+            determined |= d.free_dims()
+        for s in t.strides or ():
+            if s is not None:
+                determined |= s.free_dims()
     targets: list[tuple[str, Any]] = []
     for p in sig.tensor_outputs:
         targets.append((f"Out parameter '{p.name}'", p.type))
@@ -366,11 +375,19 @@ def _check_derivable(where: str, sig: Signature) -> None:
         targets.append((f"return value {i}", r))
     for p in sig.dim_params:
         targets.append((f"runtime parameter '{p.name}'", p.dim))
+    offsets = {p.type.offset for p in sig.tensor_inputs if p.strided and p.type is not None}
     for label, t in targets:
-        missing = sorted(d.name for d in t.free_dims() - determined)
+        free = t.free_dims() - determined
+        missing = sorted(d.name for d in free)
         if missing:
+            note = (
+                " (the offset dimension of a Strided[...] parameter is not bound at a launch, which checks the address of the view instead: it cannot "
+                "size a result or be passed as a scalar)"
+                if free & offsets
+                else ""
+            )
             raise TilefishDeclarationError(
-                f"{where}: {label} mentions dimension(s) {', '.join(missing)} that no input tensor determines"
+                f"{where}: {label} mentions dimension(s) {', '.join(missing)} that no input tensor determines{note}"
             )
 
 

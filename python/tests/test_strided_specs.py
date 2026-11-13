@@ -552,3 +552,24 @@ def test_a_device_scalar_is_a_pointer_with_no_axes_in_the_spec():
 
     # the same ABI, but another declaration: a rank-0 tensor is not a device scalar (it is not read with tilefish.load)
     assert abi_of(spec_of(as_tensor))["params"][2] == abi_of(spec)["params"][2] and declaration_digest(as_tensor) != declaration_digest(masked)
+
+
+def test_the_offset_dimension_of_a_strided_parameter_cannot_size_a_result_or_be_a_scalar():
+    """A launch binds the shape and the strides of a view, not its offset (Python's bind_infos, and Rust: manifest schema 3, section 5.1, step 7, the
+    address is what is checked), so a result shaped by ``x_offset`` or a scalar that carries it could be traced but never launched: refused at the declaration.
+    A stride dimension is bound, and may size a result."""
+    XO = Dim("x_offset")  # the offset dimension of the parameter x (the same dimension: a name and no constraint)
+    with pytest.raises(TilefishDeclarationError, match=r"Out parameter 'y' mentions dimension\(s\) x_offset that no input tensor determines \(the offset dimension of a Strided"):
+
+        @tilefish.extern(triton="kernels:k", grid=lambda S: (S,), name="by_offset")
+        def by_offset(x: Strided[Tensor[S, H, f32]], y: Out[Tensor[XO, f32]], x_s0: StrideOf("x", 0)): ...
+
+    with pytest.raises(TilefishDeclarationError, match=r"runtime parameter 'n' mentions dimension\(s\) x_offset that no input tensor determines"):
+
+        @tilefish.extern(triton="kernels:k", grid=lambda S: (S,), name="offset_scalar")
+        def offset_scalar(x: Strided[Tensor[S, H, f32]], y: Out[Tensor[S, H, f32]], x_s0: StrideOf("x", 0), n: XO): ...
+
+    @tilefish.extern(triton="kernels:k", grid=lambda S: (S,), name="by_stride")
+    def by_stride(x: Strided[Tensor[S, H, f32]], y: Out[Tensor[S, H, f32]], x_s0: StrideOf("x", 0), n: Dim("x_s0")): ...
+
+    assert [p.name for p in by_stride.signature.dim_params] == ["x_s0", "n"]
