@@ -502,19 +502,26 @@ def _load_manifest(manifest: Any) -> Manifest:
     return loaded
 
 
-def _current_ir(prep: "_Prepared", cap: int) -> "tuple[str | None, str | None]":
-    """``(IR digest, Triton version)`` of the kernel this process holds for the spec, or ``(None, None)`` where it cannot be made.
+def _current_ir(prep: "_Prepared", cap: int, built_with: "str | None") -> "tuple[str | None, str | None]":
+    """``(IR digest, Triton version)`` of the kernel this process holds for the spec, or no digest where it cannot be made or compared.
 
-    That is when Triton cannot be imported (a module that imports it does not import either), or the module that defines a
-    hand-written kernel cannot be imported. A frontend that cannot build the kernel is an error, not a missing digest.
+    ``built_with`` is the Triton version the manifest entry was built with. The versions are compared *before* the frontend runs: a
+    Triton that is not that version prints the IR differently, so its digest could not be compared, and its frontend may not even
+    have the entry points tilefish calls (a ``TilefishBuildError`` instead of the pin-only fallback). The result is then ``(None,
+    version)`` and nothing of Triton's is run. ``(None, None)`` is when Triton cannot be imported (a module that imports it does
+    not import either), or the module that defines a hand-written kernel cannot be imported. A frontend of the right version that
+    cannot build the kernel is an error, not a missing digest.
     """
     if not _ir.triton_importable():
         return None, None
+    version = _ir.triton_version()
+    if version != built_with:
+        return None, version
     try:
         fn = prep.target.jit_function(prep.spec)
     except TilefishRuntimeError:
         return None, None
-    return _ir_digest_of(prep.spec, fn, cap, {}), _ir.triton_version()
+    return _ir_digest_of(prep.spec, fn, cap, {}), version
 
 
 def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
@@ -526,7 +533,8 @@ def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
     artifact = manifest.get(prep.spec.stem, arch)
     digest = version = None
     if artifact is not None and artifact.entry.get("source_digest_kind") == _ir.IR_DIGEST_KIND:  # an entry with no IR digest has nothing to compare
-        digest, version = _current_ir(prep, cap)
+        toolchain = artifact.entry.get("toolchain")
+        digest, version = _current_ir(prep, cap, toolchain.get("triton") if isinstance(toolchain, dict) else None)
     built = manifest.built_kernel(prep.spec, arch, ir_digest=digest, ir_triton=version, pinned=pinned)
     _launch_built(prep, built, index)
 

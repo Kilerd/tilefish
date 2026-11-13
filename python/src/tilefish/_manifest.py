@@ -238,6 +238,17 @@ class Manifest:
         for field in ("options", "toolchain", "launch"):
             if not isinstance(entry[field], dict):
                 raise TilefishManifestError(f"'{stem}' ({arch}): '{field}' must be an object, got {entry[field]!r}")
+        # the digests of the source, as the Rust reader reads them (crates/tilefish/src/manifest.rs): a field that is there is a string
+        # of 64 lowercase hex digits (a JSON null is as absent), and a source digest and its kind come together
+        for field in ("source_sha256", "source_digest"):
+            value = entry.get(field)
+            if value is not None and not (isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)):
+                raise TilefishManifestError(f"'{stem}' ({arch}): {field} must be 64 lowercase hex digits (a sha256), got {value!r}")
+        kind = entry.get("source_digest_kind")
+        if kind is not None and not isinstance(kind, str):
+            raise TilefishManifestError(f"'{stem}' ({arch}): source_digest_kind must be a string, got {kind!r}")
+        if (entry.get("source_digest") is None) != (kind is None):
+            raise TilefishManifestError(f"'{stem}' ({arch}): source_digest and source_digest_kind come together")
         shared = entry["shared"]
         if isinstance(shared, bool) or not isinstance(shared, int) or shared < 0:
             raise TilefishManifestError(f"'{stem}' ({arch}): shared must be a non-negative integer, got {shared!r}")
@@ -363,13 +374,13 @@ class Manifest:
             return  # a generated kernel is told by its source, a compared IR digest matched, or the caller vouches for the manifest
         if recorded is None:
             why = unusable
-        elif ir_digest is None:
-            why = f"the IR of '{spec.triton}' cannot be recomputed here (Triton or the module is not importable)"
-        else:
+        elif ir_triton is not None and ir_triton != built_with:
             why = (
                 f"the entry was built with Triton {built_with}, this process has Triton {ir_triton}, whose IR for the same kernel "
                 "may print differently, so the two digests cannot be compared"
             )
+        else:
+            why = f"the IR of '{spec.triton}' cannot be recomputed here (Triton or the module is not importable)"
         raise TilefishManifestError(
             f"cannot tell whether the binary for {where} was built from the kernel '{spec.triton}' as the process holds it: "
             f"{why}. Pass pin=<the manifest's digest> to vouch for the manifest, or rebuild it"

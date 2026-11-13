@@ -1344,3 +1344,27 @@ def test_no_two_frontends_run_at_once_in_any_threads_not_even_one_inside_a_compi
     assert not errors, errors[:1]
     assert compiler.max_active == 1 and compiler.frontends > 20  # one at a time, however many threads asked
     assert tilefish._build._compile_lock is _ir.LOCK
+
+
+# -- a Triton that is not the version that built the entry is not asked to run its frontend -------------------------------------------------------
+
+
+def test_replay_compares_the_triton_versions_before_it_runs_the_frontend(world, monkeypatch):
+    """A Triton whose frontend differs would raise from the frontend; the version says first that the digests cannot be compared."""
+    project, compiler = world
+    kernel = project.load()
+    prep = types.SimpleNamespace(spec=SPEC, target=types.SimpleNamespace(jit_function=lambda spec: kernel))
+    digest, version = runtime._current_ir(prep, 90, "3.5.1")
+    assert version == "3.5.1" and digest == ir_of(kernel)
+    monkeypatch.setattr(sys.modules["triton"], "__version__", "9.9.9")  # another Triton: its frontend is not run
+    ran = []
+
+    def frontend(*a, **k):
+        ran.append(1)
+        raise TilefishBuildError("the entry points of another Triton")
+
+    monkeypatch.setattr(_ir, "ttir_text", frontend)
+    assert runtime._current_ir(prep, 90, "3.5.1") == (None, "9.9.9") and ran == []
+    assert runtime._current_ir(prep, 90, None) == (None, "9.9.9") and ran == []  # an entry that does not say which Triton made it
+    monkeypatch.setitem(sys.modules, "triton", None)  # no Triton: nothing to recompute, nothing said of a version
+    assert runtime._current_ir(prep, 90, "3.5.1") == (None, None)
