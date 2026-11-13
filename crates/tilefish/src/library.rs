@@ -80,6 +80,10 @@ pub struct LibraryEntry {
     /// `cublasLtGetVersion()` of the library that chose the algorithm (`120804` for 12.8.4): an algorithm id names other kernels in another
     /// version, so a host with another version refuses the entry.
     pub cublaslt_version: u64,
+    /// The multiprocessor count (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`) of the device the algorithm was pinned on: an algorithm is chosen for
+    /// the multiprocessors it runs on (a MIG slice has fewer than the whole GPU, and a stream-K algorithm partitions its work by the count), so a
+    /// device of another count refuses the entry.
+    pub sm_count: u64,
     /// The sha256 of the canonical declaration the entry was made from.
     pub declaration_digest: String,
 }
@@ -119,6 +123,7 @@ pub(crate) struct RawLibrary {
     workspace_bytes: Value,
     algo: String,
     cublaslt_version: Value,
+    sm_count: Value,
     declaration_digest: String,
 }
 
@@ -230,6 +235,16 @@ impl LibraryEntry {
         let cublaslt_version = match raw.cublaslt_version.as_u64() {
             Some(v) if v >= 1 => v,
             _ => return Err(format!("cublaslt_version must be a positive int, got {}", raw.cublaslt_version)),
+        };
+        // a JSON integer >= 1: not 30.0, not true, not "30" (`as_u64` is `None` for all three); no upper bound but the 64 bits of the reader
+        let sm_count = match raw.sm_count.as_u64() {
+            Some(v) if v >= 1 => v,
+            _ => {
+                return Err(format!(
+                    "sm_count must be a positive int (the multiprocessors of the device the algorithm was pinned on), got {}",
+                    raw.sm_count
+                ));
+            }
         };
         if !is_digest(&raw.declaration_digest) {
             return Err(format!(
@@ -368,6 +383,7 @@ impl LibraryEntry {
             workspace_bytes,
             algo,
             cublaslt_version,
+            sm_count,
             declaration_digest: raw.declaration_digest,
         })
     }

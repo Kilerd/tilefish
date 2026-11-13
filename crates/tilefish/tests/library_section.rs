@@ -49,7 +49,7 @@ fn gemm(bias: bool, m: u64, n: u64, k: u64) -> Value {
         "compute_type": "CUBLAS_COMPUTE_32F", "scale_type": "CUDA_R_32F", "transa": "T", "transb": "N",
         "m": m, "n": n, "k": k, "lda": k, "ldb": k, "ldc": n, "ldd": n,
         "epilogue": if bias { "bias" } else { "none" }, "workspace_bytes": 8519680,
-        "algo": ALGO, "cublaslt_version": 120804, "declaration_digest": "a".repeat(64),
+        "algo": ALGO, "cublaslt_version": 120804, "sm_count": 30, "declaration_digest": "a".repeat(64),
     })
 }
 
@@ -222,7 +222,7 @@ fn a_stem_and_an_architecture_are_unique_across_kernels_and_library_together() {
 #[test]
 fn a_library_entry_that_is_not_what_python_writes_is_refused() {
     type Change = fn(&mut Value);
-    let cases: [(&str, Change, &str); 30] = [
+    let cases: [(&str, Change, &str); 35] = [
         ("an unknown field", |e| e["note"] = 1.into(), "unknown field"),
         (
             "a missing field",
@@ -268,6 +268,17 @@ fn a_library_entry_that_is_not_what_python_writes_is_refused() {
         ),
         ("an alignment of 8", |e| e["preconditions"][0]["bytes"] = 8.into(), "pointer_alignment must be 16"),
         ("a bucket that is not the entry's", |e| e["dims"]["M"]["bucket"] = 64.into(), "bucket"),
+        (
+            "no sm_count",
+            |e| {
+                e.as_object_mut().unwrap().remove("sm_count");
+            },
+            "missing field `sm_count`",
+        ),
+        ("sm_count 0", |e| e["sm_count"] = 0.into(), "sm_count must be a positive int"),
+        ("sm_count as a float", |e| e["sm_count"] = 30.0.into(), "sm_count must be a positive int"),
+        ("sm_count as a bool", |e| e["sm_count"] = true.into(), "sm_count must be a positive int"),
+        ("sm_count as a string", |e| e["sm_count"] = "30".into(), "sm_count must be a positive int"),
     ];
     for (what, change, why) in cases {
         let mut entry = gemm(false, 32, 1024, 1024);

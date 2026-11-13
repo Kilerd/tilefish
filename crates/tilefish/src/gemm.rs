@@ -2,8 +2,9 @@
 //!
 //! `out[M, N] = a[M, K] @ b[N, K]^T (+ bias[N])` in tilefish's row-major terms: bf16 operands, an f32 accumulator, one rounding to bf16 at
 //! the end, the bias added in f32 before it (`docs/manifest-schema-3.md`, section 9). The entry pins the 64 bytes of the algorithm that
-//! cuBLASLt's heuristic ranked first under a workspace limit, with the cuBLASLt version that chose it; [`Manifest::gemm`] refuses another
-//! version (an algorithm id names other kernels in another version), vets the 64 bytes the way Python's binding does (a weak check by the
+//! cuBLASLt's heuristic ranked first under a workspace limit, with the cuBLASLt version that chose it and the SM count of the device it
+//! was chosen on; [`Manifest::gemm`] refuses a device of another SM count (an algorithm is chosen for the multiprocessors it runs on: a MIG
+//! slice has fewer than the whole GPU), another version (an algorithm id names other kernels in another version), vets the 64 bytes the way Python's binding does (a weak check by the
 //! library itself would accept several corruptions and crash the process on some), and has the library approve the algorithm for the
 //! problem. A launch is then [`Gemm::launch`] on a cudarc stream, which checks everything [`Kernel::launch`](crate::Kernel::launch)
 //! does of its tensors (shapes bound to the entry's dimensions, the exact bucket, dtypes, contiguity, 16-byte alignment, the device and
@@ -62,6 +63,7 @@ struct LoadedGemm {
     k: u64,
     bias: bool,
     workspace_bytes: u64,
+    sm_count: u64,
 }
 
 /// A pinned GEMM of a manifest, loaded in a context and ready to launch. Cheap to clone; it can be shared between threads. It keeps its
@@ -219,8 +221,30 @@ impl Manifest {
     }
 }
 
+/// Refuse an entry pinned on a device of another multiprocessor count than this one (`device`), before any other field of the entry is
+/// compared (as Python does): an entry is found by its stem and its architecture, and two devices of one architecture may differ in their
+/// SM count (a MIG slice and the whole GPU), for which another algorithm is chosen.
+fn require_sm_count(entry: &LibraryEntry, device: u64) -> Result<()> {
+    sm_count_matches(&entry.stem, &entry.arch, entry.sm_count, device)
+}
+
+fn sm_count_matches(stem: &str, arch: &str, pinned: u64, device: u64) -> Result<()> {
+    if pinned != device {
+        return Err(Error::Manifest(format!(
+            "the manifest pinned the cuBLASLt algorithm of '{}' ({}) on a device with {} SMs, but this device has {device}: an algorithm is \
+             chosen for the multiprocessors it runs on, so the pin is refused (re-export the manifest on this device)",
+            stem, arch, pinned
+        )));
+    }
+    Ok(())
+}
+
 fn load(entry: &LibraryEntry, ctx: &Arc<CudaContext>) -> Result<LoadedGemm> {
     let who = format!("'{}' ({})", entry.stem, entry.arch);
+    let sm_count = ctx
+        .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+        .map_err(Error::driver("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)"))?;
+    require_sm_count(entry, u64::try_from(sm_count).unwrap_or(0))?;
     if !cublaslt::available() {
         return Err(Error::Unsupported(format!(
             "{who} is a cuBLASLt GEMM, and libcublasLt cannot be loaded on this machine (with LD_LIBRARY_PATH or the like, give the process the \
@@ -269,6 +293,7 @@ fn load(entry: &LibraryEntry, ctx: &Arc<CudaContext>) -> Result<LoadedGemm> {
         k: entry.k,
         bias: entry.implementation.has_bias(),
         workspace_bytes: entry.workspace_bytes,
+        sm_count: entry.sm_count,
     })
 }
 
@@ -307,6 +332,11 @@ impl Gemm {
     /// Whether the operation has a `bias` operand (`cublaslt.gemm_bias`).
     pub fn has_bias(&self) -> bool {
         self.loaded.bias
+    }
+
+    /// The multiprocessor count of the device the algorithm was pinned on (the device it is loaded on has it: [`Manifest::gemm`] refuses another).
+    pub fn sm_count(&self) -> u64 {
+        self.loaded.sm_count
     }
 
     /// The workspace limit of the entry: the limit the heuristic was asked under, and the size of the workspace Python provides. The size
@@ -492,4 +522,21 @@ impl Gemm {
 /// The version of cuBLASLt this process has (`120804` for 12.8.4), or `None` when it cannot be loaded: what a pinned algorithm is compared with.
 pub fn cublaslt_version() -> Option<u64> {
     cublaslt::available().then(cublaslt::version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pin_of_a_device_with_another_sm_count_is_refused_and_says_to_export_again() {
+        assert!(sm_count_matches("gemm.M64", "sm_103", 30, 30).is_ok());
+        // a whole B300 (148 SMs) and a 1g MIG slice of it (30 SMs) are one architecture, and another algorithm is chosen for each
+        let e = sm_count_matches("gemm.M64", "sm_103", 30, 148).unwrap_err();
+        assert!(
+            matches!(&e, Error::Manifest(m) if m.contains("on a device with 30 SMs, but this device has 148")),
+            "{e}"
+        );
+        assert!(e.to_string().contains("re-export the manifest on this device"), "{e}");
+    }
 }
