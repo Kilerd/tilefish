@@ -59,7 +59,7 @@ from ._manifest import Manifest
 from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
-from .ops import argmax, argmin, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sqrt, where
+from .ops import argmax, argmin, cos, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sin, sqrt, where
 from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
@@ -124,6 +124,7 @@ __all__ = [
     "capture",
     "cdiv",
     "const",
+    "cos",
     "e2m1",
     "e4m3",
     "e5m2",
@@ -147,6 +148,7 @@ __all__ = [
     "run",
     "scatter_rows",
     "silu",
+    "sin",
     "sqrt",
     "u8",
     "ue8m0",

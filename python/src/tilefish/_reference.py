@@ -189,6 +189,10 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 r = torch.exp(a[0])
             elif op == "sqrt":
                 r = torch.sqrt(a[0])
+            elif op == "cos":
+                r = torch.cos(a[0])
+            elif op == "sin":  # libdevice built with FTZ: a subnormal argument is a zero of its sign, and sin(±0) = ±0
+                r = torch.where(a[0].abs() < 2.0**-126, a[0] * 0.0, torch.sin(a[0]))
             elif op == "silu":  # x * sigmoid(x), sigmoid(x) = 1 / (1 + exp(-x))
                 r = a[0] * (1.0 / (1.0 + torch.exp(-a[0])))
             elif op == "gelu":  # exact erf form, evaluated left to right

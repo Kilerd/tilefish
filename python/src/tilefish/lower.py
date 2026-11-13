@@ -124,6 +124,10 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
                                                                                          ``1 / (1 + tl.exp(-x))``.
 ``gelu(x)``                 ``0.5 * x * (1.0 + tl.math.erf(x * 0.7071067811865476))``       f32 only; exact erf form, evaluated
                                                                                          left to right (note 5).
+``sin(x)``, ``cos(x)``      ``tl.sin(x)``, ``tl.cos(x)``                                    f32 only; libdevice ``__nv_sinf`` /
+                                                                                         ``__nv_cosf``, built with FTZ: torch's
+                                                                                         CUDA bits except ``sin`` of a
+                                                                                         subnormal, which is ±0 (note 10).
 ``sum(x, axis=-1)``         ``tl.sum(tl.where(mask, x, 0.0), axis=0)``                      f32 only. The reduction is over all
                                                                                          ``BLOCK_D`` lanes; masked lanes are
                                                                                          set to 0 explicitly (intermediates
@@ -271,6 +275,11 @@ Notes (the facts behind the table):
    ``max_elements`` precondition when it is dynamic), so ``i * D + cols`` fits. The indices in range of one scatter must be distinct:
    two programs that write one row race, and which bytes land is not defined (torch's ``index_copy_`` does not define it either).
    Rows of ``dst`` that no index names keep their bytes.
+10. **``sin`` and ``cos``.** ``tl.sin`` and ``tl.cos`` are libdevice's ``__nv_sinf`` and ``__nv_cosf``, inlined (no ``call`` is left: a
+    polynomial of ``fma.rn.ftz.f32`` after a range reduction), the same PTX as ``libdevice.sin`` / ``libdevice.cos``. Triton links
+    libdevice with ``__CUDA_FTZ = 1``, so the only inputs on which they differ from the non-FTZ library (torch's CUDA ``sinf`` /
+    ``cosf``) are the subnormals, where ``sin(x)`` is ``±0`` (the sign of ``x``) instead of ``x``; ``cos`` is the same on every input. The
+    reference is torch's with that flush, so it is byte-identical to the binary (``tests/test_gpu_trig.py``). f32 only.
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -344,7 +353,7 @@ _MATH = frozenset({"f32"})
 _BINARY = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 _COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 _LOGICAL = {"and": "&", "or": "|", "xor": "^"}
-_UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu")
+_UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos")
 _REDUCTIONS = ("sum", "mean", "max")
 _ARG_REDUCTIONS = ("argmax", "argmin")
 # Triton's own type of a python literal: a scalar of any other dtype is written as a typed constant (tl.cast(0.1, tl.bfloat16)),
@@ -536,7 +545,8 @@ def _check_common(op: KernelOp) -> None:
                 None,
                 "declared-op-call",
                 f"the body calls the {n.attrs['kind']} op '{n.op}'; only the built-in ops (+ - * /, comparisons, & | ^ ~ of masks, "
-                "where, iota, silu, gelu, rsqrt, exp, sqrt, .to, sum, mean, max, argmax, argmin, gather_rows, scatter_rows, load and stores) are lowered",
+                "where, iota, silu, gelu, rsqrt, exp, sqrt, sin, cos, .to, sum, mean, max, argmax, argmin, gather_rows, scatter_rows, load and "
+                "stores) are lowered",
             )
         if n.op == "split":
             views = [str(t) for t in n.output_types if not t.contiguous]
@@ -1397,6 +1407,8 @@ class _Body:
             return f"tl.exp({a[0]})"
         if op == "sqrt":
             return f"tl.sqrt_rn({a[0]})"
+        if op in ("sin", "cos"):
+            return f"tl.{op}({a[0]})"
         if op == "silu":
             return f"{a[0]} * tl.sigmoid({a[0]})"
         if op == "gelu":

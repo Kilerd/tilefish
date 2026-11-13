@@ -319,6 +319,16 @@ def sqrt(x: Value) -> Value:
     return _unary("sqrt", x)
 
 
+def sin(x: Value) -> Value:
+    """The sine (libdevice's ``sinf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`)."""
+    return _unary("sin", x)
+
+
+def cos(x: Value) -> Value:
+    """The cosine (libdevice's ``cosf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`)."""
+    return _unary("cos", x)
+
+
 # -- casts ------------------------------------------------------------------------
 
 
