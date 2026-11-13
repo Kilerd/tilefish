@@ -166,6 +166,7 @@ def test_reloading_the_module_that_changed_is_what_clears_it(project):
 def test_a_module_the_kernel_does_not_reach_is_not_looked_at(project):
     kernel = project.load().kernel
     project.write("im_unrelated", "X = 1\n")
+    importlib.invalidate_caches()
     sys.path.insert(0, str(project.directory))
     try:
         import im_unrelated  # noqa: F401
@@ -201,6 +202,7 @@ def test_the_standard_library_and_tilefish_are_not_recorded(project):
 
 def test_the_watch_does_not_break_an_import_that_fails(project):
     project.write("im_broken", "def f(:\n")
+    importlib.invalidate_caches()
     sys.path.insert(0, str(project.directory))
     try:
         with pytest.raises(SyntaxError):

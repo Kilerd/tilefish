@@ -87,6 +87,7 @@ class Project:
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     compiler = fake_compile.install(monkeypatch)
+    monkeypatch.setattr(runtime, "_modules", {})  # the generated modules imported under the fake Triton are not for a test that has the real one
     monkeypatch.setattr(sys, "dont_write_bytecode", True)
     project = Project(tmp_path / "project")
     monkeypatch.syspath_prepend(str(project.directory))
