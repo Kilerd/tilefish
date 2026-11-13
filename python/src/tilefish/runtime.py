@@ -152,17 +152,20 @@ def _torch() -> Any:
 def clear_caches() -> None:
     """Forget every built kernel and unload every loaded module (for tests and for rebuilding after a toolchain change).
 
-    Nothing is freed under work that may still run: the arenas of launch plans are freed after the last run on each is done (its order event), and the modules
-    after every context that has one is synchronized (a launch of a kernel may still be running on any stream). Call it outside a CUDA graph capture, and only
-    when no graph captured from a plan will be replayed again (it holds the address of the arena)."""
-    with _lock:
-        _builds.clear()
-        _manifests.clear()
-        _pins.clear()
+    Nothing is freed under work that may still run: no run, capture or replay of a launch plan is in progress on any thread while this frees and unloads (it
+    waits for the ones in progress, and the ones that start meanwhile wait for it, then build and load again), the arenas of launch plans are freed after the
+    last run on each is done (its order event), and the modules after every context that has one is synchronized (a launch of a kernel may still be running on
+    any stream). Call it outside a CUDA graph capture, and only when no graph captured from a plan with ``torch.cuda.graph`` will be replayed again (it holds
+    the address of the arena); a :class:`~tilefish._planrun.CapturedPlan` refuses to replay after it."""
     from . import _planrun
 
-    _planrun.clear_caches()  # the runners of launch plans, and the arenas they hold
-    _cuda.unload_all()  # nothing to do (and no driver imported) when no module was loaded
+    with _planrun.exclusive():
+        with _lock:
+            _builds.clear()
+            _manifests.clear()
+            _pins.clear()
+        _planrun.clear_caches()  # the runners of launch plans, and the arenas they hold
+        _cuda.unload_all()  # nothing to do (and no driver imported) when no module was loaded
 
 
 # -- what is being run ----------------------------------------------------------------------------------------------------
@@ -786,6 +789,37 @@ def _run_graph(op: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", m
     from ._planrun import run_graph
 
     return run_graph(op, args, kwargs, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, outputs=outputs)
+
+
+def capture(
+    op: GraphOp,
+    /,
+    *externals: Any,
+    mode: str = "jit",
+    plan: Any = None,
+    pin: "str | None" = None,
+    trust_directory: bool = False,
+    devscalars: Any = None,
+    outputs: Any = None,
+    stream: Any = None,
+) -> Any:
+    """Capture the launch plan of a ``@tilefish.graph`` in a CUDA graph of its own: a :class:`~tilefish._planrun.CapturedPlan`, whose ``replay(stream=None)``
+    is ordered with every other run and replay of the plan, from any thread and on any stream (it takes the arena's lock and waits for and records the arena's
+    order event around the launch of the graph), and whose ``set_devscalar(name, value)`` changes a device scalar for the next replays.
+
+    ``externals`` are the graph's arguments in the order of its signature without its ``DevScalar`` parameters, whose values ``devscalars={name: value}``
+    gives; ``outputs=`` the tensors the returned values are written into (allocated before the capture by default: ``CapturedPlan.outputs``). ``mode``,
+    ``plan``, ``pin`` and ``trust_directory`` choose the plan as for :func:`run`. The ``CapturedPlan`` keeps the externals and the arena alive. See
+    :func:`tilefish._planrun.capture` and ``docs/plan-schema-1.md``, section 10."""
+    if not isinstance(op, GraphOp) or isinstance(op, KernelOp):
+        raise TilefishRuntimeError(f"tilefish.capture takes a @tilefish.graph, got {op!r}")
+    if pin is not None and not (isinstance(pin, str) and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin)):
+        raise TilefishRuntimeError(f"pin= is the 64 lowercase hex digits of a plan digest, got {pin!r}")
+    from ._planrun import capture as _capture
+
+    return _capture(
+        op, externals, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, devscalars=devscalars, outputs=outputs, stream=stream
+    )
 
 
 def prepare(op: GraphOp, **options: Any) -> None:

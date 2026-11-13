@@ -60,7 +60,8 @@ from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import exp, gelu, load, rsqrt, silu, sqrt
 from .ops import reduce_mean as mean
-from .runtime import run
+from .runtime import capture, run
+from ._planrun import CapturedPlan
 from .trace import Const, Value
 from .types import DevScalar, InOut, Out, StrideOf, Strided, Tensor, TensorType, const
 
@@ -76,6 +77,7 @@ max = _ops.reduce_max  # noqa: A001
 __all__ = [
     "BlockScaled",
     "BucketRequirement",
+    "CapturedPlan",
     "Const",
     "DType",
     "DevScalar",
@@ -115,6 +117,7 @@ __all__ = [
     "Value",
     "aot",
     "bf16",
+    "capture",
     "cdiv",
     "const",
     "e2m1",

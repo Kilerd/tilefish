@@ -20,22 +20,39 @@ stream-ordered copy (from a CUDA tensor) or an asynchronous copy from pinned mem
 
 **Runs on several streams.** Every run of a plan layout on a device uses the same arena (its intermediates, device scalars and workspace), so two runs must
 not overlap on the device. The arena has an *order event* (:class:`_Arena`): a run makes its stream (torch's current stream) wait for the event's most recent
-record, enqueues its device-scalar writes and its launches, and records the event on its stream, all under the arena's lock. So **runs of one plan on
-different streams, from one thread or many, are correct, and execute on the device one after the other**, in the order their host calls took the lock (the
-lock alone would order the enqueueing, not the device); runs on one stream are ordered by the stream as before. Nothing waits on the host. (Runs of one plan do
-not overlap on the device, so a run on another stream is not concurrent with one in flight; two plans with different layouts have different arenas and do run
-concurrently.) The externals are the caller's: an input written on another stream, or an output read on one, is ordered by the caller, as for any torch op.
+record, enqueues its device-scalar writes and its launches, and records the event on its stream, all under the arena's lock (:func:`_ordered`; the record is
+made whenever anything was enqueued after the wait, also when a launch fails or an interrupt lands). So **runs of one plan on different streams, from one
+thread or many, are correct, and execute on the device one after the other**, in the order their host calls took the lock (the lock alone would order the
+enqueueing, not the device); runs on one stream are ordered by the stream as before. Nothing waits on the host. (Runs of one plan do not overlap on the device,
+so a run on another stream is not concurrent with one in flight; two plans with different layouts have different arenas and do run concurrently.) The externals
+are the caller's: an input written on another stream, or an output read on one, is ordered by the caller, as for any torch op. :func:`clear_caches` frees
+nothing under a run: it waits for the runs in progress on every thread (:class:`_Gate`) and for the last record of every arena's event.
 
-**CUDA graphs.** A run under ``torch.cuda.graph(...)`` captures. The things that would make a plan fail to capture are, each refused with a message that
-says so: (1) the arena, the binary of a step (``cuModuleLoadData``, ``cuFuncLoad``) and the cuBLASLt handle must exist, so the plan has to have run once
-(or :func:`prepare` called) outside the capture; (2) outputs allocated inside the capture belong to the graph (torch's private pool): that works, but pass ``outputs=`` to have tensors of your own (and no allocation at all);
-(3) a device scalar passed as an ``int`` or a CPU tensor would be written by a host copy, which cannot be captured: pass a CUDA tensor, which the captured
-copy reads at every replay (write it between replays to change the value); (4) the externals must be the same tensors at every replay (a graph holds
-addresses); (5) the stream must be the one the capture uses (torch's current stream; the capture is of that stream's work only). Everything else a run
-does is enqueued launches, which capture. **A captured graph's arena is the plan's arena** (the same memory, at the address the graph holds), and the wait and
-the record of the order event are captured as *external* event nodes (``CU_EVENT_WAIT_EXTERNAL``, ``CU_EVENT_RECORD_EXTERNAL``): every replay of the graph
-waits for the most recent run or replay issued before it is launched, and the runs and replays issued after it wait for it. So replays of the graphs of a
-plan, on any stream, and plain runs of it are ordered with each other in the order the host issues them, as runs are.
+**CUDA graphs: tilefish.capture.** :func:`capture` (``tilefish.capture(graph, *externals, devscalars=..., outputs=...)``) captures the plan in a CUDA graph
+of its own and returns a :class:`CapturedPlan`. The graph holds the launches of the steps only; :meth:`CapturedPlan.replay` takes the arena's lock, makes its
+stream wait for the order event, writes the device scalars (from pinned host memory: :meth:`CapturedPlan.set_devscalar` changes them, with no synchronization),
+launches the graph and records the event, exactly as a run does. So **its replays are ordered with every run and every other replay of the plan, from any
+thread, on any stream**. The ``CapturedPlan`` keeps the externals and the arena alive. This is the way to capture a plan that another thread may run.
+
+**CUDA graphs: torch.cuda.graph.** A run under ``torch.cuda.graph(...)`` captures too. The things that would make a plan fail to capture are, each refused with a
+message that says so: (1) the arena, the binary of a step (``cuModuleLoadData``, ``cuFuncLoad``) and the cuBLASLt handle must exist, so the plan has to have
+run once (or :func:`prepare` called) outside the capture; (2) outputs allocated inside the capture belong to the graph (torch's private pool): that works, but
+pass ``outputs=`` to have tensors of your own (and no allocation at all); (3) a device scalar passed as an ``int`` or a CPU tensor would be written by a host
+copy, which cannot be captured: pass a CUDA tensor, which the captured copy reads at every replay (write it between replays to change the value); (4) the
+externals must be the same tensors at every replay (a graph holds addresses); (5) the stream must be the one the capture uses (torch's current stream; the
+capture is of that stream's work only), and every run of one plan in one capture must be on one stream (a second run on another, forked, stream of the same
+capture is refused: its wait node would not depend on the first run's record node inside the graph, so a replay could run the two at once). Everything else a
+run does is enqueued launches, which capture. **A captured graph's arena is the plan's arena** (the same memory, at the address the graph holds), and the wait
+and the record of the order event are captured as *external* event nodes (``CU_EVENT_WAIT_EXTERNAL``, ``CU_EVENT_RECORD_EXTERNAL``): every replay of the graph
+waits for the most recent record of the event made before it is launched, and records the event when its work is done.
+
+**What that orders, and what it does not.** ``CUDAGraph.replay()`` is torch's: it takes no lock of tilefish. So a raw graph's replay is ordered only against
+the runs whose record it sees: the runs and replays whose record was made before the replay is launched come before it, and the ones that wait after it is
+launched come after it. A run on another thread that is between its wait and its record when the replay is launched has waited for the record before it and
+has not recorded yet: **the replay and that run overlap on the arena** (the same intermediates, device scalar slots and workspace) and give wrong bytes with
+no error (3 of 4000 runs of a plan on one thread, against a loop of replays on another, on a B300). A caller who replays a raw graph while another thread
+may use the same plan (``tilefish.run``, the replay of a :class:`CapturedPlan`, whose wait and record are two calls too, or the replay of another raw graph)
+must order them itself (one thread, or a lock of its own around all of them), or use :func:`capture`, whose replay takes the arena's lock.
 """
 
 from __future__ import annotations
@@ -54,6 +71,7 @@ from ._launch import (
     TORCH_DTYPE_NAMES,
     bind_call,
     check_dim_constraints,
+    check_tensor,
     dims_by_name,
     eval_dim,
     tensor_info,
@@ -68,6 +86,81 @@ _arena_lock = threading.Lock()
 _loaded: "dict[tuple, tuple[tuple, Plan, PlanRunner]]" = {}  # (directory, graph) -> (stamp of its files, loaded plan, its runner), until a file in it changes
 _runners: "weakref.WeakSet[PlanRunner]" = weakref.WeakSet()  # every runner alive, so that clear_caches can reset them (a runner is kept by its plan or by _loaded, never by a global)
 _torch_backend: "list[TorchBackend]" = []
+_epoch = [0]  # how many times clear_caches has run: a CapturedPlan is replayed only in the epoch it was captured in (its binaries are unloaded after)
+
+
+class _Gate:
+    """What keeps :func:`clear_caches` from freeing what a run is using: every run, capture, replay and ``prepare`` of a plan holds the gate *shared*
+    while it uses an arena, a loaded binary or an order event (from the moment it looks them up to the record of the order event after its last launch);
+    ``clear_caches`` holds it *exclusive* while it frees them and unloads the modules. Shared holders do not wait for each other; ``clear_caches`` waits for
+    every run in progress to finish enqueueing, and a run that starts meanwhile waits for it (then finds no arena and no binary, and makes them again).
+
+    Both sides are reentrant on one thread (``runtime.clear_caches`` holds the gate across ``_planrun.clear_caches`` and the unloading of the modules); a
+    thread that holds it shared cannot take it exclusive (that would wait for itself), and is refused."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._shared = 0  # threads that hold it shared
+        self._waiting = 0  # clear_caches calls waiting: a new run waits behind them, so that a stream of runs cannot starve a clear
+        self._owner: "int | None" = None  # the thread that holds it exclusive
+        self._local = threading.local()
+
+    @contextlib.contextmanager
+    def shared(self) -> Any:
+        me = threading.get_ident()
+        depth = getattr(self._local, "depth", 0)
+        if depth or self._owner == me:  # this thread holds it already (shared, or exclusive)
+            self._local.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._local.depth = depth
+            return
+        with self._cond:
+            while self._owner is not None or self._waiting:
+                self._cond.wait()
+            self._shared += 1
+        self._local.depth = 1
+        try:
+            yield
+        finally:
+            self._local.depth = 0
+            with self._cond:
+                self._shared -= 1
+                if not self._shared:
+                    self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def exclusive(self) -> Any:
+        me = threading.get_ident()
+        if self._owner == me:
+            yield
+            return
+        if getattr(self._local, "depth", 0):
+            raise TilefishRuntimeError("clear_caches was called while this thread runs a plan (it would wait for that run to end, which waits for it)")
+        with self._cond:
+            self._waiting += 1
+            try:
+                while self._owner is not None or self._shared:
+                    self._cond.wait()
+            finally:
+                self._waiting -= 1
+                self._cond.notify_all()  # the runs that waited behind this call, if it was interrupted
+            self._owner = me
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._owner = None
+                self._cond.notify_all()
+
+
+_gate = _Gate()
+
+
+def exclusive() -> Any:
+    """The gate held exclusive (see :class:`_Gate`): no run, capture, replay or ``prepare`` of a plan is in progress until the block ends."""
+    return _gate.exclusive()
 
 
 def torch_backend() -> "TorchBackend":
@@ -81,29 +174,40 @@ def torch_backend() -> "TorchBackend":
 def clear_caches() -> None:
     """Forget every loaded plan, reset every runner (its loaded binaries) and free every arena (for tests, and to give the memory back).
 
-    An arena is freed only once the work of every run on it is done: every run waits for the one before it (the arena's order event), so waiting on the host for
-    the last record of that event (``cuEventSynchronize``) waits for all of them, whatever streams they ran on, and for the replays of a captured graph issued
-    before this call. **A CUDA graph that was captured from a plan holds the address of its arena**, and nothing but this registry keeps the arena alive: the
-    arenas are freed here and nowhere else (not when a runner is replaced, a plan directory re-exported or a plan garbage collected), so call it only when no
-    captured graph of a plan will be replayed again.
+    **Nothing is freed under a run.** First the gate (:class:`_Gate`) is taken exclusive: it waits for every run, capture, replay and ``prepare`` that is in
+    progress on any thread to have enqueued its last launch and recorded the order event, and the ones that start meanwhile wait until this returns (they then
+    find no arena and no binary, and make them again, cleanly). Then, under each arena's lock, the arena is freed only once the work of every run on it is done:
+    every run waits for the one before it (the arena's order event), so waiting on the host for the last record of that event (``cuEventSynchronize``) waits for
+    all of them, whatever streams they ran on, and for the replays of a captured graph issued before this call. ``tilefish.runtime.clear_caches`` holds the gate
+    across this and the unloading of the modules (after ``cuCtxSynchronize`` of every context that has one).
+
+    A :class:`CapturedPlan` keeps its arena alive (the memory is not given back while it lives), but it cannot be replayed after this (its binaries are
+    unloaded): its ``replay`` refuses, and it has to be captured again. **A CUDA graph captured with ``torch.cuda.graph`` from a plan holds the address of its
+    arena** and nothing keeps that arena alive but this registry: the arenas are freed here and nowhere else (not when a runner is replaced, a plan directory
+    re-exported or a plan garbage collected), so call it only when no such graph will be replayed again.
     """
-    with _lock:
-        _loaded.clear()
-        runners = list(_runners)
-        backends = list(_torch_backend)
-    for r in runners:
-        r._reset()
-    for b in backends:
-        registry = b.arena_registry()
-        arenas = list(registry.items())
-        for (_, index), arena in arenas:
-            if arena.event is not None:
-                b.synchronize_event(arena.event, index)  # raises (and frees nothing) if it cannot wait: memory a kernel may still use is not given back
-        for key, arena in arenas:
-            if registry.get(key) is arena:
-                del registry[key]
-            if arena.event is not None:
-                b.destroy_event(arena.event, key[1])
+    with _gate.exclusive():
+        with _lock:
+            _loaded.clear()
+            runners = list(_runners)
+            backends = list(_torch_backend)
+            _epoch[0] += 1
+        for r in runners:
+            r._reset()
+        for b in backends:
+            registry = b.arena_registry()
+            arenas = list(registry.items())
+            for (_, index), arena in arenas:
+                with arena.lock:
+                    if arena.event is not None:
+                        b.synchronize_event(arena.event, index)  # raises (and frees nothing) if it cannot wait: memory a kernel may still use is not given back
+            for key, arena in arenas:
+                with arena.lock:
+                    if registry.get(key) is arena:
+                        del registry[key]
+                    if arena.event is not None:
+                        b.destroy_event(arena.event, key[1])
+                        arena.event = None
 
 
 # -- what a runner asks of torch and the driver ---------------------------------------------------------------------------------------------
@@ -153,6 +257,28 @@ class Backend:
         raise NotImplementedError
 
     def destroy_event(self, event: Any, index: int) -> None:
+        raise NotImplementedError
+
+    def synchronize_stream(self, stream: int) -> None:
+        """Wait on the host for everything enqueued on ``stream`` (what a run does when it cannot record the order event after its launches)."""
+        raise NotImplementedError
+
+    def capture_id(self, stream: int) -> "int | None":
+        """The id of the capture ``stream`` takes part in (``cuStreamGetCaptureInfo``), or ``None`` when it is not capturing."""
+        raise NotImplementedError
+
+    def use_stream(self, stream: Any, index: int) -> Any:
+        """A context in which ``stream`` (a ``torch.cuda.Stream``, or ``None`` for the current one) is the current stream of device ``index``."""
+        raise NotImplementedError
+
+    def capture_graph(self, index: int, stream: Any, enqueue: Any) -> Any:
+        """Capture what ``enqueue(stream_handle)`` enqueues in a new CUDA graph on ``stream`` (a ``torch.cuda.Stream``, or ``None`` for a stream of
+        its own), in the thread-local capture mode, and return the graph (what :meth:`replay_graph` replays). The capture is ended, and the graph
+        dropped, when ``enqueue`` raises."""
+        raise NotImplementedError
+
+    def replay_graph(self, graph: Any, stream: int) -> None:
+        """Launch the graph on ``stream``, the current stream (``cuGraphLaunch``)."""
         raise NotImplementedError
 
     def empty(self, shape: "Sequence[int]", dtype: str, index: int) -> Any:
@@ -241,6 +367,44 @@ class TorchBackend(Backend):
 
         with self.torch.cuda.device(index):
             _cuda.destroy_event(event)
+
+    def synchronize_stream(self, stream: int) -> None:
+        from . import _cuda
+
+        _cuda.synchronize_stream(stream)
+
+    def capture_id(self, stream: int) -> "int | None":
+        from . import _cuda
+
+        return _cuda.capture_id(stream)
+
+    def use_stream(self, stream: Any, index: int) -> Any:
+        if stream is None:
+            return contextlib.nullcontext()
+        if int(getattr(stream, "device_index", index)) != index:
+            raise TilefishRuntimeError(f"stream= is a stream of device {stream.device_index}, but the plan runs on device {index}")
+        return self.torch.cuda.stream(stream)
+
+    def capture_graph(self, index: int, stream: Any, enqueue: Any) -> Any:
+        torch = self.torch
+        graph = torch.cuda.CUDAGraph()
+        on = torch.cuda.Stream(device=index) if stream is None else stream  # a capture is not made on the default stream
+        with torch.cuda.device(index), torch.cuda.stream(on):
+            if torch.cuda.is_current_stream_capturing():
+                raise TilefishRuntimeError("the stream given to tilefish.capture is capturing a CUDA graph already: a plan is captured on a stream that is not")
+            # thread-local: another thread's calls are not refused while this one captures (torch.cuda.graph's default, "global", refuses them)
+            graph.capture_begin(capture_error_mode="thread_local")
+            try:
+                enqueue(int(on.cuda_stream))
+            except BaseException:
+                with contextlib.suppress(Exception):
+                    graph.capture_end()  # the stream is usable again; the graph is dropped
+                raise
+            graph.capture_end()
+        return graph
+
+    def replay_graph(self, graph: Any, stream: int) -> None:
+        graph.replay()  # on torch's current stream, which is `stream` (the caller made it current)
 
     def empty(self, shape: "Sequence[int]", dtype: str, index: int) -> Any:
         return self.torch.empty(tuple(shape), dtype=getattr(self.torch, TORCH_DTYPE_NAMES[dtype].split(".")[1]), device=f"cuda:{index}")
@@ -340,9 +504,13 @@ class _Arena:
     """The memory of one plan layout on one device, and what orders the runs on it.
 
     ``event`` is the arena's *order event*: every run, under ``lock``, makes its stream wait for the event's most recent record, enqueues its writes and launches,
-    and records the event on its stream. So the runs on one arena execute one after the other on the device, in the order their host calls took the lock, whatever
-    streams and threads they come from (``lock`` alone orders the enqueueing, not the device). Under a capture the wait and the record are external event
-    nodes, so a replay of the graph takes its place in that order when it is launched.
+    and records the event on its stream (:func:`_ordered`). So the runs on one arena execute one after the other on the device, in the order their host calls took
+    the lock, whatever streams and threads they come from (``lock`` alone orders the enqueueing, not the device); :meth:`CapturedPlan.replay` does the same around
+    the launch of its graph. Under a ``torch.cuda.graph`` capture the wait and the record are external event nodes, so a replay of that graph takes its place in
+    that order when it is launched, but takes no lock: see the module docstring for what that orders and what it does not.
+
+    ``captured`` is ``(capture id, stream)`` of the last run captured in a ``torch.cuda.graph`` on this arena: a second run of the arena in the same capture on
+    another stream is refused (its external wait node would not depend on the first run's record node, so one replay would race with itself).
     """
 
     handle: Any
@@ -350,6 +518,7 @@ class _Arena:
     nbytes: int
     lock: threading.Lock
     event: Any = None
+    captured: "tuple[int, int] | None" = None
 
 
 @dataclass
@@ -366,6 +535,75 @@ class _BucketRT:
     values: "dict[str, int]"
     shapes: "dict[str, tuple[str, tuple[int, ...]]]"
     steps: "list[_StepRT]"
+
+
+@dataclass
+class _BoundCall:
+    """The arguments of a call matched to the graph: the binding, the device scalars' tensors by name, the bucket, the device."""
+
+    call: Any
+    sources: "dict[str, Any]"
+    values: "dict[str, int]"
+    index: int
+
+
+@dataclass
+class _Call:
+    """A call ready to be enqueued: every precondition checked."""
+
+    rt: _BucketRT
+    arena: _Arena
+    checked: "list[Any]"  # per step, the checked tensors by name (their addresses)
+    bases: "dict[str, int]"
+    slots: "list[tuple[dict, Any, bool]]"  # (buffer, source, on_device) of every device scalar
+    results: "list[Any]"  # the outputs, in the order the graph returns them
+
+
+def _ordered(be: Backend, arena: _Arena, stream: int, capturing: bool, work: Any) -> None:
+    """``work()`` (what enqueues the writes and launches of a run, or a replay) between the wait for the arena's order event and its record, on ``stream``,
+    under the arena's lock (held by the caller).
+
+    **Once anything was enqueued after the wait, the record is made**, whatever happens: a failure of a launch, a ``KeyboardInterrupt`` anywhere after the
+    wait has returned, or a failure of the record itself. A record that fails is tried once more (an interrupt that landed inside the first is not there
+    twice), and if it fails again the host waits for the stream (``cuStreamSynchronize``, outside a capture) before the error is raised and the lock
+    released: then the work is done before the next run on the arena is enqueued, so it cannot overlap it (a capture whose record failed is broken, and its
+    graph cannot be made). A wait that failed has enqueued nothing, and is not followed by a record: a record then would stand for this stream's work
+    alone, and the next run would no longer wait for the one before."""
+    event = arena.event
+    if event is None:  # a plan with no arena shares no memory between its runs: nothing to order
+        work()
+        return
+    waited = failed = False
+    try:
+        be.wait_event(event, stream, capturing)
+        waited = True  # from here on, the record must follow (an interrupt before this line comes before anything but the wait is enqueued)
+        failed = True
+        work()
+        failed = False
+    finally:
+        if waited:
+            if failed:  # the error of the work is the one raised; the record is made all the same
+                with contextlib.suppress(BaseException):
+                    _record(be, event, stream, capturing)
+            else:
+                _record(be, event, stream, capturing)
+
+
+def _record(be: Backend, event: Any, stream: int, capturing: bool) -> None:
+    """The record of :func:`_ordered`: tried twice, then the stream is drained on the host (see there). A failure of the first try is raised once the
+    record is made (or the stream drained): a ``KeyboardInterrupt`` is not lost."""
+    try:
+        be.record_event(event, stream, capturing)
+        return
+    except BaseException as first:  # noqa: BLE001 - a KeyboardInterrupt too: the record is what must not be lost
+        error = first
+    try:
+        be.record_event(event, stream, capturing)
+    except BaseException:  # noqa: BLE001
+        if not capturing:
+            with contextlib.suppress(Exception):
+                be.synchronize_stream(stream)
+    raise error
 
 
 class PlanRunner:
@@ -398,7 +636,7 @@ class PlanRunner:
         be = self.backend
         if be.capturing(index):
             raise TilefishRuntimeError("a plan cannot be prepared while a CUDA graph is being captured: its arena, binaries and handles are made outside the capture")
-        with self._lock:
+        with _gate.shared(), self._lock:
             self._arena(index)
             for values in buckets if buckets is not None else self.plan.buckets():
                 self._bucket(dict(values), index)
@@ -490,10 +728,26 @@ class PlanRunner:
 
     def run(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None) -> Any:
         be = self.backend
+        bound = self._bind(args, kwargs)
+        index = bound.index
+        with _gate.shared():
+            capturing = be.capturing(index)
+            call = self._call(bound, outputs, slots_in_graph=capturing)
+            arena = call.arena
+            with arena.lock, be.scope(index):
+                stream = be.stream(index)
+                if capturing:
+                    self._check_one_stream_per_capture(arena, stream)
+                _ordered(be, arena, stream, capturing, lambda: self._enqueue(call, stream, index, slots=True))
+        return runtime._result(call.results)
+
+    def _bind(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> "_BoundCall":
+        """Match the arguments to the graph's signature (a ``DevScalar`` passed as a number becomes a tensor of one element on the host), bind the
+        dimensions and select the bucket, find the device. Touches no arena and no binary."""
+        be = self.backend
         graph = self.plan.graph
         sig = graph.signature
         doc = self._doc
-        # the arguments: a DevScalar may be passed as an int (or a CPU tensor), which becomes a tensor of one element
         try:
             bound = sig.call_signature.bind(*args, **kwargs)
         except TypeError as e:
@@ -534,8 +788,16 @@ class PlanRunner:
             where = call.infos[name].device
             if where != "cpu" and be.device_index(where) != index:
                 raise TilefishPreconditionError(f"the device scalar '{name}' is on {where}, but the other tensors of the call are on device {index}", kind="device", arg=name)
-        capturing = be.capturing(index)
-        rt = self._bucket(values, index)
+        return _BoundCall(call, sources, values, index)
+
+    def _call(self, bound: "_BoundCall", outputs: Any, slots_in_graph: bool) -> "_Call":
+        """The bucket's binaries and the arena (made the first time, outside a capture), the outputs (the caller's, or allocated), the address of every
+        buffer, and **every precondition of every step**, all before anything is enqueued. ``slots_in_graph``: the writes of the device scalars are captured
+        in a ``torch.cuda.graph``, so a host value is refused (a captured copy of it would freeze it). Called with the gate held shared."""
+        be = self.backend
+        doc = self._doc
+        call, index = bound.call, bound.index
+        rt = self._bucket(bound.values, index)
         arena = self._arena(index)
         # the outputs and the address of every buffer
         out_names = doc["outputs"]
@@ -571,39 +833,90 @@ class PlanRunner:
         slots = []
         for b in doc["buffers"]:
             if b["role"] == "devscalar":
-                source, on_device = be.devscalar_source(sources[b["name"]], b["dtype"], index)
-                if capturing and not on_device:
+                source, on_device = be.devscalar_source(bound.sources[b["name"]], b["dtype"], index)
+                if slots_in_graph and not on_device:
                     raise TilefishRuntimeError(
                         f"the device scalar '{b['name']}' was passed as a host value (an int, a number or a CPU tensor), which is written by a host copy that "
                         "cannot be captured in a CUDA graph (and a captured copy of it would freeze the value): pass a CUDA tensor of one element, which the "
-                        "captured copy reads at every replay, and write it between replays"
+                        "captured copy reads at every replay, and write it between replays (or capture with tilefish.capture, whose set_devscalar changes it)"
                     )
                 slots.append((b, source, on_device))
-        with arena.lock, be.scope(index):
-            stream = be.stream(index)
-            if arena.event is not None:  # after the run before it on this arena, whatever its stream (see _Arena)
-                be.wait_event(arena.event, stream, capturing)
-            try:
-                for b, source, on_device in slots:
-                    be.write_devscalar(arena.handle, b["offset"], b["dtype"], source, on_device)
-                for st, real in zip(rt.steps, checked):
-                    if st.algo is not None:
-                        names = [a for a in st.bound.names]
-                        a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
-                        bias = real[names[2]].ptr if len(names) == 4 else None
-                        be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
-                    else:
-                        launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
-                        be.launch(st.loaded, st.bound.grid, launch_args, stream)
-            except BaseException:
-                if arena.event is not None:  # what was enqueued before the failure still comes before the next run
-                    with contextlib.suppress(Exception):
-                        be.record_event(arena.event, stream, capturing)
-                raise
-            if arena.event is not None:
-                be.record_event(arena.event, stream, capturing)
         results = [t for _, t in sorted(made, key=lambda p: p[0])]
-        return runtime._result(results)
+        return _Call(rt, arena, checked, bases, slots, results)
+
+    def _enqueue(self, call: "_Call", stream: int, index: int, slots: bool) -> None:
+        """Enqueue the device-scalar writes (``slots``) and the launches of the steps on ``stream``, the current stream (the caller orders them: :func:`_ordered`)."""
+        be = self.backend
+        if slots:
+            for b, source, on_device in call.slots:
+                be.write_devscalar(call.arena.handle, b["offset"], b["dtype"], source, on_device)
+        for st, real in zip(call.rt.steps, call.checked):
+            if st.algo is not None:
+                names = [a for a in st.bound.names]
+                a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
+                bias = real[names[2]].ptr if len(names) == 4 else None
+                be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, call.bases[st.workspace], stream, index)  # type: ignore[index]
+            else:
+                launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
+                be.launch(st.loaded, st.bound.grid, launch_args, stream)
+
+    def _check_one_stream_per_capture(self, arena: _Arena, stream: int) -> None:
+        """Refuse a second run of this arena in one ``torch.cuda.graph`` capture on another stream than the first (under the arena's lock, before
+        anything is enqueued). Each run captures an external wait node on the order event and an external record node; the second run's wait node would
+        not depend on the first run's record node inside the graph (a forked stream joins the capture without it), so every replay would run the two at
+        once on the same intermediates. On one stream the graph orders them."""
+        if arena.event is None:
+            return
+        capture = self.backend.capture_id(stream)
+        if capture is None:  # pragma: no cover - the caller saw the stream capturing
+            return
+        if arena.captured is not None and arena.captured[0] == capture and arena.captured[1] != stream:
+            raise TilefishRuntimeError(
+                f"the plan of graph '{self.plan.name}' was already run in this CUDA graph capture on another stream: two runs of one plan in one capture must be on "
+                "one stream (each run waits for the run before it through the arena's order event, and inside one graph a run on a forked stream would not wait "
+                "for the other, so a replay would run both at once on the same arena). Run them on the same stream, or capture them in two graphs, or use "
+                "tilefish.capture"
+            )
+        arena.captured = (capture, stream)
+
+    def capture(self, externals: "tuple[Any, ...]", devscalars: "Mapping[str, Any]", outputs: Any, stream: Any) -> "CapturedPlan":
+        """:func:`capture` of this runner's plan (see there)."""
+        be = self.backend
+        sig = self.plan.graph.signature
+        scalar_names = [p.name for p in sig.params if p.kind == "tensor" and p.is_devscalar]
+        others = [n for n in sig.call_signature.parameters if n not in scalar_names]
+        if len(externals) > len(others):
+            raise TilefishPreconditionError(
+                f"tilefish.capture of graph '{self.plan.name}' takes at most {len(others)} externals ({', '.join(others)}): the device scalars "
+                f"({', '.join(scalar_names) or 'none'}) are given by devscalars=, got {len(externals)}",
+                kind="shape",
+            )
+        if not isinstance(devscalars, Mapping):
+            raise TilefishRuntimeError(f"devscalars= is a mapping of the name of every device scalar of the graph to its value, got {devscalars!r}")
+        unknown = sorted(set(devscalars) - set(scalar_names))
+        missing = [n for n in scalar_names if n not in devscalars]
+        if unknown or missing:
+            raise TilefishPreconditionError(
+                f"devscalars= gives the value of every device scalar of graph '{self.plan.name}' ({', '.join(scalar_names) or 'it has none'})"
+                + (f"; {', '.join(unknown)} is not one" if unknown else "")
+                + (f"; {', '.join(missing)} is missing" if missing else ""),
+                kind="shape",
+            )
+        bound = self._bind((), {**dict(zip(others, externals)), **devscalars})
+        index = bound.index
+        with _gate.shared():
+            if be.capturing(index):
+                raise TilefishRuntimeError(
+                    "tilefish.capture makes a CUDA graph of its own and is called outside a capture (the current stream is capturing one): to capture a plan in a "
+                    "graph of yours, call tilefish.run inside torch.cuda.graph (see the docs for how its replays are ordered)"
+                )
+            call = self._call(bound, outputs, slots_in_graph=False)
+            arena = call.arena
+            epoch = _epoch[0]
+            with arena.lock, be.scope(index):  # no other run of the plan is enqueued while the graph is captured
+                graph = be.capture_graph(index, stream, lambda s: self._enqueue(call, s, index, slots=False))
+        held = tuple(bound.call.tensors.values()) + tuple(call.results)
+        return CapturedPlan(self, graph, call, index, epoch, held)
 
     def _given_outputs(self, outputs: Any, names: "Sequence[str]") -> "list[Any] | None":
         if outputs is None:
@@ -651,6 +964,105 @@ class PlanRunner:
                         kind="alias",
                         arg=w,
                     )
+
+
+class CapturedPlan:
+    """A plan captured in a CUDA graph by :func:`tilefish.capture`, for one bucket and one set of externals: replay it with :meth:`replay`.
+
+    **Its replays are ordered with every other run of the plan, from any thread and on any stream**: :meth:`replay` takes the arena's lock, makes the stream
+    wait for the arena's order event, writes the device scalars, launches the graph and records the event, as a run does (so the graph itself has no event
+    node: the ordering is the replay's, which is why a ``CapturedPlan`` is replayed only through :meth:`replay`). It keeps alive what the graph holds the
+    address of: the externals (the tensors given, and the outputs) and the arena. Write new contents into the externals between replays (in place), and set
+    a device scalar with :meth:`set_devscalar`. An external written or read on another stream than the replay's is ordered by the caller, as for any torch op.
+
+    After ``tilefish.runtime.clear_caches()`` (which unloads the binaries the graph launches) it cannot be replayed: capture again.
+    """
+
+    def __init__(self, runner: PlanRunner, graph: Any, call: _Call, index: int, epoch: int, externals: "tuple[Any, ...]") -> None:
+        self._runner = runner
+        self._graph = graph
+        self._call = call
+        self._arena = call.arena  # the memory the graph holds the address of: kept alive with the graph
+        self._index = index
+        self._epoch = epoch
+        self._externals = externals  # the tensors the graph holds the addresses of: kept alive with the graph
+        self._slots = [(b, _host_copy(s, on_device), on_device) for b, s, on_device in call.slots]  # (buffer, source, on_device) of every device scalar: written before every replay
+        self.outputs = runtime._result(list(call.results))  # what the graph writes its returned values into (the caller's outputs=, or allocated by capture)
+        self.bucket = dict(call.rt.values)
+
+    def __repr__(self) -> str:
+        return f"CapturedPlan(graph={self._runner.plan.name!r}, bucket={self.bucket}, devscalars={[b['name'] for b, _, _ in self._slots]})"
+
+    @property
+    def plan(self) -> Plan:
+        """The plan the graph was captured from."""
+        return self._runner.plan
+
+    def replay(self, stream: Any = None) -> None:
+        """Replay the graph on ``stream`` (a ``torch.cuda.Stream`` of the plan's device; default: the current stream).
+
+        Under the arena's lock: the stream waits for the arena's order event (the run or replay of the plan issued before this one, whatever its stream and
+        thread), the device scalars are written into their slots (from the values :meth:`set_devscalar` set, through pinned host memory, or from the CUDA
+        tensor given), the graph is launched, and the event is recorded (also when a step of this fails after something was enqueued). Nothing waits on the
+        host. Refused inside a capture, and after ``clear_caches``."""
+        runner = self._runner
+        be = runner.backend
+        index = self._index
+        with _gate.shared():
+            if self._epoch != _epoch[0]:
+                raise TilefishRuntimeError(
+                    f"the captured plan of graph '{runner.plan.name}' cannot be replayed: tilefish.runtime.clear_caches() unloaded the binaries its graph launches "
+                    "since it was captured; capture it again"
+                )
+            arena = self._arena
+            with be.scope(index), be.use_stream(stream, index):
+                if be.capturing(index):
+                    raise TilefishRuntimeError(
+                        "a CapturedPlan is not replayed while the stream captures a CUDA graph: its replay waits for and records the arena's order event, which "
+                        "are not what a capture records (capture tilefish.run in torch.cuda.graph instead)"
+                    )
+                with arena.lock:
+                    s = be.stream(index)
+                    _ordered(be, arena, s, False, lambda: self._enqueue(s))
+
+    def _enqueue(self, stream: int) -> None:
+        be = self._runner.backend
+        for b, source, on_device in self._slots:
+            be.write_devscalar(self._arena.handle, b["offset"], b["dtype"], source, on_device)
+        be.replay_graph(self._graph, stream)
+
+    def set_devscalar(self, name: str, value: Any) -> None:
+        """Set the value the device scalar ``name`` has in the next replays: a number (an integer that fits an integer dtype, as at a call), or a tensor of one
+        element on the host or on the plan's device. Nothing is enqueued here: the next :meth:`replay` writes the slot, on its stream, after it has waited
+        for the run before it (so a run or another graph of the plan in between does not change what this graph reads). A number or a CPU tensor is
+        copied now, and written from pinned host memory (no synchronization of the host); a CUDA tensor is read by a stream-ordered copy at every replay."""
+        runner = self._runner
+        be = runner.backend
+        position = next((i for i, (b, _, _) in enumerate(self._slots) if b["name"] == name), None)
+        if position is None:
+            names = [b["name"] for b, _, _ in self._slots]
+            raise TilefishRuntimeError(f"'{name}' is not a device scalar of graph '{runner.plan.name}'; its device scalars are {names}")
+        buffer = self._slots[position][0]
+        param = next(p for p in runner.plan.graph.signature.params if p.name == name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            source = be.devscalar_tensor(devscalar_number(param, value), buffer["dtype"])
+        else:
+            source = value
+            info = tensor_info(name, source)
+            check_tensor(param, info)
+            if info.device != "cpu" and be.device_index(info.device) != self._index:
+                raise TilefishPreconditionError(f"the device scalar '{name}' is on {info.device}, but the plan runs on device {self._index}", kind="device", arg=name)
+        source, on_device = be.devscalar_source(source, buffer["dtype"], self._index)
+        with self._arena.lock:  # not while a replay of this plan enqueues its writes
+            self._slots[position] = (buffer, _host_copy(source, on_device), on_device)
+
+
+def _host_copy(source: Any, on_device: bool) -> Any:
+    """A device scalar's value on the host, copied (a later write to the caller's CPU tensor does not change what a :class:`CapturedPlan` writes); a CUDA
+    tensor is kept as it is (the replay's stream-ordered copy reads it, as a captured copy does)."""
+    if on_device or not hasattr(source, "clone"):
+        return source
+    return source.clone()
 
 
 def devscalar_number(p: Any, v: "int | float") -> "int | float":
@@ -753,6 +1165,47 @@ def run_graph(
             raise TilefishRuntimeError("jit takes plan=<a Plan made by tilefish.plan(graph, ...)> or none; a directory is for mode='replay'")
         return _jit_runner(p).run(args, kwargs, outputs)
     return _replay_runner(graph, _plan_directory(plan), pin, trust_directory).run(args, kwargs, outputs)
+
+
+def capture(
+    graph: GraphOp,
+    externals: "tuple[Any, ...]",
+    *,
+    mode: str = "jit",
+    plan: Any = None,
+    pin: "str | None" = None,
+    trust_directory: bool = False,
+    devscalars: "Mapping[str, Any] | None" = None,
+    outputs: Any = None,
+    stream: Any = None,
+) -> CapturedPlan:
+    """:func:`tilefish.capture`: the plan of ``graph`` (``jit`` or ``replay``, chosen as by :func:`tilefish.run`) captured in a CUDA graph of its own for the
+    externals given, as a :class:`CapturedPlan` whose :meth:`~CapturedPlan.replay` is ordered with every other run of the plan.
+
+    ``externals`` are the graph's arguments in the order of its signature, **without its device scalars**, which ``devscalars={name: value}`` gives (the values
+    the first replay writes; :meth:`~CapturedPlan.set_devscalar` changes them). ``outputs=`` gives the tensors the graph writes its returned values into (by
+    default they are allocated here, before the capture, and are ``CapturedPlan.outputs``). ``stream=`` is the stream the graph is captured on (default: a
+    new one; the default stream cannot capture). The plan is prepared (arena, binaries, cuBLASLt handle) first, outside the capture; nothing is allocated
+    inside it and nothing runs: the graph holds the launches of the steps only (no write of a device scalar and no event node: :meth:`~CapturedPlan.replay`
+    does those)."""
+    if mode not in ("jit", "replay"):
+        raise TilefishRuntimeError(f"tilefish.capture: mode is 'jit' or 'replay', got {mode!r}")
+    if mode == "jit":
+        if pin is not None or trust_directory:
+            raise TilefishRuntimeError("pin= and trust_directory= are for mode='replay' (they vouch for a plan directory); mode 'jit' runs no plan directory")
+        if isinstance(plan, Plan):
+            if plan.graph is not graph:
+                raise TilefishRuntimeError(f"plan= is the plan of graph '{plan.name}', not of '{graph.name}'")
+            runner = _jit_runner(plan)
+        elif plan is None:
+            runner = _jit_runner(_default_plan(graph))
+        else:
+            raise TilefishRuntimeError("jit takes plan=<a Plan made by tilefish.plan(graph, ...)> or none; a directory is for mode='replay'")
+    else:
+        if trust_directory is not True and trust_directory is not False:
+            raise TilefishRuntimeError(f"trust_directory= is True or False, got {trust_directory!r}")
+        runner = _replay_runner(graph, _plan_directory(plan), pin, trust_directory)
+    return runner.capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream)
 
 
 def _plan_directory(plan: Any) -> Any:

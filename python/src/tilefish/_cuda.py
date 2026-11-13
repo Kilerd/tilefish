@@ -332,3 +332,19 @@ def synchronize_event(event: Any) -> None:
 
 def destroy_event(event: Any) -> None:
     _check(_driver().cuEventDestroy(event), "cuEventDestroy")
+
+
+def synchronize_stream(stream: int) -> None:
+    """Wait on the host until the work enqueued on ``stream`` is done (``cuStreamSynchronize``)."""
+    drv = _driver()
+    _check(drv.cuStreamSynchronize(drv.CUstream(stream)), "cuStreamSynchronize")
+
+
+def capture_id(stream: int) -> "int | None":
+    """The id of the capture ``stream`` takes part in (``cuStreamGetCaptureInfo``: unique among the captures of the process), or ``None`` when the stream
+    is not capturing. (cuda-python returns the status and the id first, then the graph and the dependencies, whose number differs between versions.)"""
+    drv = _driver()
+    status, ident = _check(drv.cuStreamGetCaptureInfo(drv.CUstream(stream)), "cuStreamGetCaptureInfo")[:2]
+    if status != drv.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+        return None
+    return int(ident)

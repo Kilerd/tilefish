@@ -338,6 +338,8 @@ p = tilefish.runtime.export(block, "build/")                                  # 
 y = tilefish.run(block, x, n, *weights)                                       # jit: the same plan, binaries built in memory
 y = tilefish.run(block, x, n, *weights, mode="replay", plan="build/", pin=p.digest)   # a verified plan directory, or trust_directory=True
 y = tilefish.run(block, x, n, *weights, mode="reference")                     # each op's reference composed in torch
+cap = tilefish.capture(block, x, *weights, devscalars={"n": n}, outputs=y)    # the plan in a CUDA graph of its own
+cap.set_devscalar("n", 17); cap.replay()                                      # a replay ordered with every run of the plan, from any thread
 ```
 
 `plan.json` carries the plan and the digest of the manifest it was built against, so **pinning the plan digest pins every binary and every pinned GEMM algorithm it launches**. A replay loads and
@@ -346,9 +348,12 @@ and keeps it, and checks **every step's preconditions before the first launch**:
 (`outputs=` gives them) and waits for nothing: the GEMM workspace is in the arena, a device scalar is written by a stream-ordered copy. So **a replay under `torch.cuda.graph` captures and the
 graph replays byte-identically** (`runtime.prepare` does the allocating and the loading that cannot happen inside a capture; `docs/plan-schema-1.md` lists every reason a plan could fail to
 capture). Every run of a plan on a device uses the one arena, so **runs of one plan on several streams (or threads) are ordered on the device** by an event of the arena: a run waits on its
-stream for the run before it and records the event after its last launch, so they never overlap and their results are correct, at the cost of running one after the other. Under a capture the
-wait and the record are external event nodes of the graph, so a captured graph's arena is the plan's arena and its replays take their place in that order, with the plain runs, in the order
-the host issues them. `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
+stream for the run before it and records the event after its last launch, so they never overlap and their results are correct, at the cost of running one after the other.
+`tilefish.capture(graph, *inputs, devscalars=..., outputs=...)` captures the plan in a CUDA graph of its own: its `replay()` takes the arena's lock and waits for and records that event
+around the graph, as a run does, so **its replays are ordered with every run and replay of the plan, from any thread and on any stream**, and `set_devscalar` changes a device scalar for
+the next replays with no synchronization. A plan run inside your own `torch.cuda.graph(...)` captures too: the wait and the record are external event nodes of the graph, so its arena is
+the plan's arena and its replays are ordered with the runs whose record they see. But torch's `replay()` takes no lock: **a raw graph replayed while another thread is in the middle of a run
+of the same plan overlaps that run** (wrong bytes, no error), so order the two yourself or use `tilefish.capture`. `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
 eager composition of the same ops give the same bytes for every bucket and two values of `n`.
 
 A plan launches declared operators and views. Arithmetic traced in the graph body, a `store`, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its

@@ -397,6 +397,53 @@ def test_a_replay_under_cuda_graph_capture_allocates_nothing_and_the_graph_repla
     assert same_bytes(out, expected)
 
 
+@pytest.mark.parametrize("m", [32, 128])
+def test_tilefish_capture_replays_byte_identically_and_set_devscalar_changes_n_for_the_next_replay(exported, weights, m, monkeypatch):
+    """``tilefish.capture``: the graph holds the launches only (nothing is allocated while it captures), ``replay`` writes ``n`` from pinned memory before the
+    graph, and ``set_devscalar`` changes it for the next replay; the inputs are written in place."""
+    from tilefish import _planrun
+
+    directory, p = exported
+    x = pm.activations(m, seed=21)
+    ws = [weights[k] for k in pm.WEIGHT_NAMES]
+    out = torch.empty((m, pm.D_MODEL), dtype=BF16, device="cuda")
+    runtime.prepare(pm.block, mode="replay", plan=directory, pin=p.digest)
+    allocated = []
+    enqueue = _planrun.PlanRunner._enqueue
+
+    def counted(self, *args, **kw):  # what is enqueued while the stream captures (torch's capture_begin makes two tensors of its own RNG state before)
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        enqueue(self, *args, **kw)
+        allocated.append(torch.cuda.memory_stats()["allocation.all.allocated"] - before)
+
+    monkeypatch.setattr(_planrun.PlanRunner, "_enqueue", counted)
+    cap = tilefish.capture(pm.block, x, *ws, mode="replay", plan=directory, pin=p.digest, devscalars={"n": m // 2}, outputs=out)
+    monkeypatch.undo()
+    assert allocated == [0] and cap.outputs is out and cap.bucket == {"M": m}
+    cap.replay()
+    torch.cuda.synchronize()
+    assert same_bytes(out, eager(x, torch.tensor([m // 2], dtype=torch.int32, device="cuda"), *ws))
+    x.copy_(pm.activations(m, seed=22))
+    cap.set_devscalar("n", 3)
+    out.zero_()
+    cap.replay()
+    torch.cuda.synchronize()
+    expected3 = eager(x, torch.tensor([3], dtype=torch.int32, device="cuda"), *ws)
+    assert same_bytes(out, expected3)
+    tilefish.run(pm.block, x, 7, *ws, mode="replay", plan=directory, pin=p.digest)  # a run in between writes 7 into the slot: the next replay writes 3 again
+    out.zero_()
+    cap.replay()
+    torch.cuda.synchronize()
+    assert same_bytes(out, expected3)
+    n_dev = torch.tensor([9], dtype=torch.int32, device="cuda")
+    cap.set_devscalar("n", n_dev)  # a CUDA tensor: read by a stream-ordered copy at every replay
+    n_dev.fill_(11)
+    out.zero_()
+    cap.replay()
+    torch.cuda.synchronize()
+    assert same_bytes(out, eager(x, torch.tensor([11], dtype=torch.int32, device="cuda"), *ws))
+
+
 def test_a_jit_plan_captures_the_same_way(weights):
     m = 32
     args = args_of(m, 20, seed=8, weights=weights)

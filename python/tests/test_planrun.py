@@ -52,8 +52,11 @@ class FakeBackend(Backend):
     def __init__(self):
         self.log = []
         self.capture = False
+        self.capture_ident = 1  # the id of the capture the current stream takes part in, while `capture` is set
+        self.current = 7  # the current stream
         self.next = 1 << 40
         self.arenas = 0
+        self.graphs = 0
 
     def device_index(self, device):
         return 0
@@ -68,7 +71,33 @@ class FakeBackend(Backend):
         return contextlib.nullcontext()
 
     def stream(self, index):
-        return 7
+        return self.current
+
+    def synchronize_stream(self, stream):
+        self.log.append(("drain", stream))
+
+    def capture_id(self, stream):
+        return self.capture_ident if self.capture else None
+
+    @contextlib.contextmanager
+    def use_stream(self, stream, index):
+        saved = self.current
+        self.current = saved if stream is None else stream
+        try:
+            yield
+        finally:
+            self.current = saved
+
+    def capture_graph(self, index, stream, enqueue):
+        self.graphs += 1
+        on = 99 if stream is None else stream
+        self.log.append(("begin", on))
+        enqueue(on)
+        self.log.append(("end", on))
+        return SimpleNamespace(name=f"graph{self.graphs}")
+
+    def replay_graph(self, graph, stream):
+        self.log.append(("graph", graph.name, stream))
 
     def alloc_arena(self, nbytes, index):
         self.arenas += 1
@@ -470,6 +499,237 @@ def test_clear_caches_waits_for_the_last_run_on_every_arena_before_it_frees_it(m
     with pytest.raises(TilefishRuntimeError, match="cannot wait"):
         _planrun.clear_caches()
     assert r.arena_of(0) is not None  # nothing that a kernel may still use was freed
+
+
+def test_clear_caches_waits_for_a_run_in_progress_on_another_thread_and_a_run_after_it_rebuilds(monkeypatch):
+    """A run on another thread that is between its first launch and its record holds the gate: clear_caches waits for it before it waits for the order event
+    and frees the arena (before, it freed the arena and destroyed the event under the run). A run that starts after clear_caches makes a new arena, a new
+    event and loads its binaries again."""
+    import threading
+
+    from tilefish import _planrun
+
+    inside, release = threading.Event(), threading.Event()
+
+    class Slow(FakeBackend):
+        def launch(self, loaded, grid, args, stream):
+            if loaded.stem == "attention" and not release.is_set():
+                inside.set()
+                assert release.wait(10)
+            super().launch(loaded, grid, args, stream)
+
+    be = Slow()
+    monkeypatch.setattr(_planrun, "_torch_backend", [be])
+    r, _ = runner(backend=be)
+    errors = []
+
+    def run():
+        try:
+            r.run(Weights(64).args(), {})
+        except BaseException as e:  # noqa: BLE001 - reported below
+            errors.append(e)
+
+    t = threading.Thread(target=run)
+    t.start()
+    assert inside.wait(10)
+    cleared = threading.Thread(target=_planrun.clear_caches)
+    cleared.start()
+    cleared.join(0.3)
+    assert cleared.is_alive() and not any(e[0] in ("synchronize", "destroy") for e in be.log)  # it waits for the run
+    release.set()
+    t.join(10)
+    cleared.join(10)
+    assert not cleared.is_alive() and errors == []
+    kinds = [e[0] for e in be.log]
+    assert kinds.index("synchronize") > max(i for i, k in enumerate(kinds) if k == "record")  # after the run's record
+    assert kinds[-2:] == ["synchronize", "destroy"] and r.arena_of(0) is None
+    loads = kinds.count("load")
+    r.run(Weights(64).args(), {})  # rebuilt cleanly: a new arena, a new event, the binaries loaded again
+    assert be.arenas == 2 and kinds.count("event") + 1 == [e[0] for e in be.log].count("event") and [e[0] for e in be.log].count("load") > loads
+    assert [e for e in _run_ops(be)][-1] == ("record", "event2", 7, False)
+
+
+def test_clear_caches_inside_a_run_is_refused_instead_of_waiting_for_itself(monkeypatch):
+    from tilefish import _planrun
+
+    class Clearing(FakeBackend):
+        def launch(self, loaded, grid, args, stream):
+            _planrun.clear_caches()
+
+    be = Clearing()
+    monkeypatch.setattr(_planrun, "_torch_backend", [be])
+    r, _ = runner(backend=be)
+    with pytest.raises(TilefishRuntimeError, match="clear_caches was called while this thread runs a plan"):
+        r.run(Weights(64).args(), {})
+    assert _run_ops(be)[-1][0] == "record"  # the run that failed still recorded the order event
+    _planrun.clear_caches()  # and the gate was released
+
+
+def test_the_record_is_made_even_when_it_fails_once_and_the_stream_is_drained_when_it_fails_twice():
+    """Once anything is enqueued after the wait for the order event, the record follows: a record interrupted once (a KeyboardInterrupt landing in it) is made
+    again and the interrupt raised after; a record that fails twice drains the stream on the host before the error is raised, so the work cannot overlap the next
+    run. A wait that failed enqueued nothing and is followed by no record."""
+
+    class Flaky(FakeBackend):
+        def __init__(self, failures, error):
+            super().__init__()
+            self.failures, self.error = failures, error
+
+        def record_event(self, event, stream, capturing):
+            if self.failures:
+                self.failures -= 1
+                raise self.error
+            super().record_event(event, stream, capturing)
+
+    be = Flaky(1, KeyboardInterrupt())
+    r, _ = runner(backend=be)
+    with pytest.raises(KeyboardInterrupt):
+        r.run(Weights(64).args(), {})
+    ops = _run_ops(be)
+    assert ops[0][0] == "wait" and ops[-1] == ("record", "event1", 7, False) and len(be.launches()) == 9
+
+    be = Flaky(2, TilefishRuntimeError("cuEventRecord failed"))
+    r, _ = runner(backend=be)
+    with pytest.raises(TilefishRuntimeError, match="cuEventRecord failed"):
+        r.run(Weights(64).args(), {})
+    assert be.log[-1] == ("drain", 7) and not any(e[0] == "record" for e in be.log)
+
+    class NoWait(FakeBackend):
+        def wait_event(self, event, stream, capturing):
+            raise TilefishRuntimeError("cuStreamWaitEvent failed")
+
+    be = NoWait()
+    r, _ = runner(backend=be)
+    with pytest.raises(TilefishRuntimeError, match="cuStreamWaitEvent failed"):
+        r.run(Weights(64).args(), {})
+    assert not any(e[0] in ("record", "launch", "gemm", "devscalar", "drain") for e in be.log)
+
+
+def test_a_second_run_of_a_plan_in_one_capture_on_another_stream_is_refused():
+    """Two runs of one plan on two forked streams of one torch capture: each has an external wait node and an external record node, and the second's wait does
+    not depend on the first's record inside the graph, so a replay would run both at once on the arena. Refused before anything of the second is enqueued; on
+    the same stream (ordered by the graph), or in another capture, it is allowed."""
+    r, be = runner()
+    r.prepare(0)
+    be.capture, be.capture_ident = True, 41
+    w = Weights(64)
+    out = FakeTensor((64, 256), "bf16", 1 << 50)
+    be.current = 11
+    r.run(w.args(), {}, outputs=out)
+    r.run(w.args(), {}, outputs=out)  # the same stream of the capture: ordered by the graph
+    before = list(be.log)
+    be.current = 22
+    with pytest.raises(TilefishRuntimeError, match="already run in this CUDA graph capture on another stream"):
+        r.run(w.args(), {}, outputs=out)
+    assert be.log == before  # nothing enqueued
+    be.capture_ident = 42  # another capture
+    r.run(w.args(), {}, outputs=out)
+    assert _run_ops(be)[-1] == ("record", "event1", 22, True)
+
+
+def _captured(r, m=64, n=5, outputs=None, stream=None):
+    w = Weights(m)
+    return r.capture((w.t["x"], *[w.t[k] for k in pm.WEIGHT_NAMES]), {"n": n}, outputs, stream), w
+
+
+def test_tilefish_capture_captures_only_the_launches_and_a_replay_orders_them_with_the_runs():
+    """``tilefish.capture``: the graph holds the launches of the steps and nothing else (no event node, no write of a device scalar); ``replay`` takes the arena's
+    lock, waits for the order event, writes the device scalars, launches the graph and records the event, as a run does."""
+    r, be = runner()
+    r.run(Weights(64).args(), {})  # prepares the bucket and the arena
+    start = len(be.log)
+    cap, _ = _captured(r)
+    captured = be.log[start:]
+    kinds = [e[0] for e in captured]
+    assert kinds[0] == "empty" and kinds[1] == "begin" and kinds[-1] == "end"  # the output is allocated before the capture
+    assert set(kinds[2:-1]) == {"launch", "gemm"} and len(kinds[2:-1]) == 9
+    assert {e[-1] for e in captured[2:-1]} == {99}  # on the stream of the capture
+    assert cap.bucket == {"M": 64} and cap.outputs.shape == (64, 256)
+    start = len(be.log)
+    cap.replay()
+    assert be.log[start:] == [
+        ("wait", "event1", 7, False),
+        ("devscalar", offsets_of(r.plan)["n"], 5, False),
+        ("graph", "graph1", 7),
+        ("record", "event1", 7, False),
+    ]
+    start = len(be.log)
+    cap.replay(stream=33)
+    assert [e[-1] for e in be.log[start:]] == [False, False, 33, False] and be.log[start][2] == 33 and be.log[-1] == ("record", "event1", 33, False)
+
+
+def test_set_devscalar_changes_the_value_the_next_replay_writes_and_enqueues_nothing():
+    r, be = runner()
+    r.prepare(0)
+    cap, w = _captured(r)
+    offset = offsets_of(r.plan)["n"]
+    start = len(be.log)
+    cap.set_devscalar("n", 9)
+    assert be.log[start:] == []  # nothing on the device until the next replay
+    cap.replay()
+    assert ("devscalar", offset, 9, False) in be.log[start:]
+    with pytest.raises(TilefishPreconditionError, match="not an integer that fits i32"):
+        cap.set_devscalar("n", 3.7)
+    with pytest.raises(TilefishPreconditionError, match="has dtype torch.int64"):
+        cap.set_devscalar("n", HostTensor(4, "i64"))
+    with pytest.raises(TilefishRuntimeError, match="'m' is not a device scalar of graph 'block'; its device scalars are \\['n'\\]"):
+        cap.set_devscalar("m", 1)
+    start = len(be.log)
+    cap.replay()
+    assert ("devscalar", offset, 9, False) in be.log[start:]  # a refused value changed nothing
+    cap.set_devscalar("n", HostTensor(11, "i32"))
+    cap.set_devscalar("n", w.n)  # a tensor on the device: read by a stream-ordered copy at every replay
+    start = len(be.log)
+    cap.replay()
+    assert ("devscalar", offset, "tensor", True) in be.log[start:]
+
+
+def test_a_captured_plan_keeps_its_externals_and_its_arena_alive_and_is_not_replayed_after_clear_caches(monkeypatch):
+    import gc
+    import weakref
+
+    from tilefish import _planrun
+
+    be = FakeBackend()
+    monkeypatch.setattr(_planrun, "_torch_backend", [be])
+    r, _ = runner(backend=be)
+    r.prepare(0)
+    cap, w = _captured(r)
+    x, out, arena = weakref.ref(w.t["x"]), weakref.ref(cap.outputs), weakref.ref(r.arena_of(0))
+    del w
+    gc.collect()
+    assert x() is not None and out() is not None  # the graph holds their addresses
+    _planrun.clear_caches()
+    gc.collect()
+    assert r.arena_of(0) is None and arena() is not None  # out of the registry, but not freed: the captured plan holds it
+    with pytest.raises(TilefishRuntimeError, match="clear_caches\\(\\) unloaded the binaries its graph launches"):
+        cap.replay()
+    del cap
+    gc.collect()
+    assert x() is None and out() is None and arena() is None
+
+
+def test_tilefish_capture_says_what_it_takes():
+    r, be = runner()
+    r.prepare(0)
+    w = Weights(64)
+    weights = [w.t[k] for k in pm.WEIGHT_NAMES]
+    with pytest.raises(TilefishPreconditionError, match="devscalars= gives the value of every device scalar of graph 'block' \\(n\\); n is missing"):
+        r.capture((w.t["x"], *weights), {}, None, None)
+    with pytest.raises(TilefishPreconditionError, match="m is not one"):
+        r.capture((w.t["x"], *weights), {"n": 1, "m": 2}, None, None)
+    with pytest.raises(TilefishPreconditionError, match="takes at most 8 externals"):
+        r.capture((w.t["x"], w.n, *weights), {"n": 1}, None, None)
+    be.capture = True
+    with pytest.raises(TilefishRuntimeError, match="tilefish.capture makes a CUDA graph of its own"):
+        r.capture((w.t["x"], *weights), {"n": 1}, None, None)
+    be.capture = False
+    cap = r.capture((w.t["x"], *weights), {"n": 1}, None, None)
+    be.capture = True
+    with pytest.raises(TilefishRuntimeError, match="not replayed while the stream captures"):
+        cap.replay()
+    with pytest.raises(TilefishRuntimeError, match="takes a @tilefish.graph"):
+        tilefish.capture(pm.twice, w.t["x"])
 
 
 def test_what_depends_on_the_bucket_only_is_checked_when_the_bucket_is_prepared_not_in_the_middle_of_a_run():
