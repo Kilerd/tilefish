@@ -218,8 +218,9 @@
 //!
 //! # `unsafe`
 //!
-//! The CUDA driver is cudarc's safe layer (contexts, modules, functions, attributes, streams, the launch builder, graphs), with three calls to
-//! `cudarc::driver::sys` in this crate, the probe of [`driver_available`], the query of the parameter sizes of a loaded function
+//! The CUDA driver is cudarc's safe layer (contexts, modules, functions, attributes, streams, the launch builder, graphs), with four calls to
+//! `cudarc::driver::sys` in this crate, the probe of [`driver_available`], the version of the driver (`cuDriverGetVersion`: a driver older than
+//! 12.4 is refused before a function it lacks is called, which would panic in cudarc), the query of the parameter sizes of a loaded function
 //! (`cuFuncGetParamInfo`) and the eager load of a function of a plan (`cuFuncLoad`), and one to `cudarc::driver::result`, the launch of a
 //! captured graph on another stream than its own; cuBLASLt is cudarc's `cublaslt::result` and `sys` (its safe `CudaBlasLT::matmul` always runs
 //! the heuristic and cannot take a pinned algorithm). There is no hand-written driver FFI. A kernel or a GEMM holds the context it was loaded in

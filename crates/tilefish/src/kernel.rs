@@ -242,7 +242,7 @@ impl Manifest {
         let who = format!("'{}' ({})", entry.stem, entry.arch);
         // the loaded function must take the parameters of the manifest's ABI, with the sizes it says (Python's `_check_params`): a prebuilt
         // binary's ABI is declared by its author, and a function that read more than it was given would read what follows the array
-        let reported = ffi::param_sizes(&function);
+        let reported = ffi::param_sizes(&function)?;
         let expected: Vec<usize> =
             entry.params.iter().map(Param::size).chain(std::iter::repeat_n(8, entry.scratch_slots)).collect();
         if reported != expected {

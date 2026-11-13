@@ -3,8 +3,9 @@
 //! The CUDA driver is cudarc's safe layer: contexts, modules, functions, attributes and streams are cudarc's, and so is the launch
 //! builder that [`Kernel::launch`] goes through; [`Kernel::launch_raw`] uses cudarc's `result::launch_kernel` for a stream that
 //! cudarc does not own. cuBLASLt is cudarc's `cublaslt::result` and `cublaslt::sys`, called from the `cublaslt` submodule. The calls to
-//! `cudarc::driver::sys` in this crate are the probe of [`driver_available`] and the query of the parameter sizes of a loaded function
-//! (`cuFuncGetParamInfo`, which cudarc has no wrapper for). The `unsafe` code of the crate is in the items of this module and its
+//! `cudarc::driver::sys` in this crate are the probe of [`driver_available`], the version of the driver (`cuDriverGetVersion`), the query of the
+//! parameter sizes of a loaded function (`cuFuncGetParamInfo`) and the eager load of a function of a plan (`cuFuncLoad`, in the `plan`
+//! submodule), which cudarc has no wrappers for; `result::graph::launch` launches a captured plan on another stream than its own. The `unsafe` code of the crate is in the items of this module and its
 //! `cublaslt` submodule (the launch of a kernel, [`Kernel::launch_raw`], [`Gemm::launch_raw`], the restore of the current context, the
 //! probes, the views of the bytes of a slice, and every call of cuBLASLt) and one in `region` ([`crate::DevicePtr::from_raw`]), each with
 //! the reason it is sound beside it.
@@ -46,10 +47,44 @@ pub fn driver_available() -> bool {
     unsafe { sys::is_culib_present() }
 }
 
-/// The sizes in bytes of the parameters of a loaded function, as the driver reports them (`cuFuncGetParamInfo`, one query per parameter
-/// until it has no more): what the ABI of the manifest is checked against, as Python's `_check_params` does at load.
+/// The oldest CUDA driver this crate launches with, as `cuDriverGetVersion` writes it (major * 1000 + minor * 10): 12.4, which has
+/// `cuFuncGetParamInfo` (the check of a loaded function's parameters against the ABI of the manifest) and `cuFuncLoad`.
+const OLDEST_DRIVER: i32 = 12040;
+
+/// The version of the CUDA driver (`cuDriverGetVersion`: `13020` for 13.2), which cudarc has no wrapper of.
 #[allow(unsafe_code)]
-pub(crate) fn param_sizes(function: &CudaFunction) -> Vec<usize> {
+pub(crate) fn driver_version() -> Result<i32> {
+    let mut version = 0;
+    // SAFETY: the out-pointer is a live local; the function only writes the version (it is in every driver).
+    let status = unsafe { sys::cuDriverGetVersion(&mut version) };
+    status.result().map_err(Error::driver("cuDriverGetVersion"))?;
+    Ok(version)
+}
+
+/// Refuse a driver older than [`OLDEST_DRIVER`]: cudarc loads a function of the driver when it is first called, and **panics** when the driver
+/// does not have it, so the functions that came with 12.4 are not called on an older one.
+fn require_driver(version: i32) -> Result<()> {
+    if version < OLDEST_DRIVER {
+        return Err(Error::Unsupported(format!(
+            "the CUDA driver of this machine is {}.{}, but this host needs 12.4 or newer (cuFuncGetParamInfo, with which a loaded binary's \
+             parameters are checked against its ABI): update the driver",
+            version / 1000,
+            (version % 1000) / 10
+        )));
+    }
+    Ok(())
+}
+
+/// The sizes in bytes of the parameters of a loaded function, as the driver reports them (`cuFuncGetParamInfo`, one query per parameter
+/// until it has no more): what the ABI of the manifest is checked against, as Python's `_check_params` does at load. Refused (and nothing
+/// asked) when the driver is older than 12.4, which does not have the function.
+pub(crate) fn param_sizes(function: &CudaFunction) -> Result<Vec<usize>> {
+    require_driver(driver_version()?)?;
+    Ok(sizes_of(function))
+}
+
+#[allow(unsafe_code)]
+fn sizes_of(function: &CudaFunction) -> Vec<usize> {
     let mut sizes = Vec::new();
     loop {
         let (mut offset, mut size) = (0usize, 0usize);
@@ -648,6 +683,18 @@ mod tests {
         let (_, synchronized, result) = run(Err(boom("launch")), &[], &[]);
         assert_eq!(synchronized, 0, "stream order orders the free after the kernel, enqueued or not");
         assert_eq!(result.unwrap_err().to_string(), boom("launch").to_string());
+    }
+
+    #[test]
+    fn a_driver_older_than_12_4_is_refused_before_a_function_of_12_4_is_called() {
+        for old in [11080, 12000, 12030] {
+            let e = require_driver(old).unwrap_err();
+            assert!(matches!(&e, Error::Unsupported(m) if m.contains("needs 12.4 or newer")), "{e}");
+        }
+        assert!(require_driver(12030).unwrap_err().to_string().contains("is 12.3"));
+        for new in [12040, 12080, 13000, 13020] {
+            assert!(require_driver(new).is_ok());
+        }
     }
 
     #[test]
