@@ -241,6 +241,11 @@ Notes (the facts behind the table):
    they do not depend on ``enable_fp_fusion``. The exact gelu cancels for large negative inputs (``1 + erf`` is
    a difference of two numbers near 1), so its relative error there is large (128 bf16 ULP on values near
    zero), though its absolute error stays below 1.6e-5.
+   **libdevice and flush to zero.** Triton always links libdevice built with ``__CUDA_FTZ = 1``; there is no option to
+   change it, and tilefish adds none. The libdevice functions a lowered kernel calls are ``__nv_erff`` (``gelu``),
+   ``__nv_sinf`` and ``__nv_cosf`` (note 10). Against the same functions built without FTZ (what a CUDA C++ or Rust
+   kernel and torch's CUDA kernels get), over all 2**32 f32 inputs: ``erff`` and ``sinf`` differ only on subnormal
+   inputs, ``cosf`` on none, and ``expf`` on none (``tilefish.exp`` is not ``expf``: it is ``ex2.approx``, above).
 6. **Reduction order and ``num_warps``.** The tree a reduction adds in depends on how many warps the block has,
    so the same kernel on the same data is not byte-identical across ``num_warps`` (129 rows with D = 96: 17 to 59
    rows differ from the 1-warp result in f32, depending on the kernel; with D = 1000: 28 to 125), though
