@@ -781,7 +781,7 @@ def extern(
         def scale(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]], n_elem: n, alpha: const[f32] = 2.0): ...
 
     The stub lists the kernel's **C parameters, in order**: a tensor is a pointer (``Strided[...]`` and ``DevScalar[...]`` too), a
-    parameter annotated with a runtime ``Dim`` is an ``i32``, a ``StrideOf`` an ``i32`` (``i64`` for ``index_bits=64``), and a typed
+    parameter annotated with a runtime ``Dim`` is an ``i32``, a ``StrideOf`` an ``i32`` (``i64`` for ``index_bits=64``, or its ``dtype=``), and a typed
     ``const[i32]``, ``const[i64]`` or ``const[f32]`` with a default is a **fixed argument**: a scalar whose value is written in the
     manifest and passed at every launch (the way a prebuilt kernel takes its constants and its unused scratch slots; there are no
     constexprs, since nothing is compiled). A prebuilt binary has **no Triton scratch slots**: it is launched with exactly these

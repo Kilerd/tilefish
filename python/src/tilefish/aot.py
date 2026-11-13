@@ -73,7 +73,7 @@ Schema 3 (written only by a spec that needs it: :attr:`CompileSpec.uses_strided_
 strided views, device scalars and prebuilt binaries need: on a pointer argument ``strides`` and ``offset`` (a ``Strided[...]`` parameter: the
 stride of each axis is the dimension that a ``StrideOf`` scalar carries, or ``1``; the offset is a dimension that is ``divisible_by`` the elements in
 16 bytes when the declaration says ``Strided[..., 16]``, and only then does the pointer get ``tt.divisibility=16``), on a scalar ``stride_of`` and
-the type ``i64`` (the width of the offsets of a kernel with ``index_bits=64``), the ``max_extent`` precondition (the largest offset a strided view
+the type ``i64`` (the width of the offsets of a kernel with ``index_bits=64``, or the ``dtype`` its ``StrideOf`` declares), the ``max_extent`` precondition (the largest offset a strided view
 reaches, where ``max_elements`` bounds an element count) and a pointer alignment of its element size where nothing more is promised, and for a
 prebuilt PTX or cubin (``extern(ptx=...)``) the ``binary`` section in place of ``triton``, ``num_warps`` and ``num_stages``, ``fixed`` arguments
 (typed constants of its C ABI) and no scratch slots. A pointer with the shape ``[]`` is a ``DevScalar``.
@@ -728,6 +728,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
             entry["dim"] = _canonical_dim(p.dim)
             if p.stride_of is not None:
                 entry["stride_of"] = stride_of_json(p.stride_of)  # one view as it always was; the views that share a stride as a list
+                if p.stride_dtype is not None and p.stride_dtype.name != _default_stride_type(op):
+                    entry["stride_type"] = p.stride_dtype.name  # only a type other than the default: a declaration that says the default digests as before
         else:
             entry["dtype"] = None if p.const_dtype is None else _canonical_dtype(p.const_dtype)
             # a scalar default is hashed as the typed value a spec compiles in; a dimension expression is
@@ -780,6 +782,20 @@ def declaration_digest(op: ExternOp) -> str:
         raise TilefishSpecError(f"declaration_digest takes an extern op, got {op!r}")
     text = json.dumps(_canonical_declaration(op), sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _default_stride_type(op: ExternOp) -> str:
+    """The type of a stride scalar whose ``StrideOf`` has no ``dtype``: as wide as the offsets the kernel computes (``index_bits``)."""
+    return "i64" if op.index_bits == 64 else "i32"
+
+
+def stride_scalar_type(op: ExternOp, p: Any) -> str:
+    """The type a stride parameter ``p`` of ``op`` is passed as: the ``dtype`` of its ``StrideOf``, else :func:`_default_stride_type`.
+
+    The width of a stride parameter and the width of the offsets the kernel computes with it are two facts. A kernel that takes ``i32``
+    strides and widens them before it multiplies (``row.to(tl.int64) * s_row``) is ``index_bits=64`` with ``StrideOf(..., dtype=i32)``.
+    """
+    return p.stride_dtype.name if p.stride_dtype is not None else _default_stride_type(op)
 
 
 def _bucket_dims(op: ExternOp) -> list[Dim]:
@@ -893,7 +909,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
             )
         elif p.kind == "dim":
             assert p.dim is not None
-            scalar_type = "i64" if (p.stride_of is not None and op.index_bits == 64) else "i32"  # a stride is as wide as the kernel's offsets
+            scalar_type = stride_scalar_type(op, p) if p.stride_of is not None else "i32"
             signature[p.name] = scalar_type
             note(p.dim)
             dim_text = str(p.dim.folded())  # a static dimension is its size: a host cannot look a name up that it was not told
