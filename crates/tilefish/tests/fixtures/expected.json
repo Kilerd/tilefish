@@ -1,7 +1,7 @@
 {
   "fixtures": {
     "sm_103": {
-      "manifest_digest": "5f020a25c3c3f3799064c0a0d8cd57f3fe2e026e88e03acca0152e96027405cc",
+      "manifest_digest": "94826258e7baaa6c68eb706f54164ed8b9ad59a9c89cc2f95ef8edce6752b365",
       "kernels": [
         {
           "stem": "axpy",
@@ -50,6 +50,22 @@
           "cubin": "bucketed_rms.Db96.sm_103.cubin",
           "sha256": "3800b8b54d1fc3687eeb6e8a141953d7eda30b05cabd04971801ce28771406b2",
           "sha256_code": "2ca42566b7ba40fbdd523e90cfd15eeb245ed1c88491b75557fabef167cd516e"
+        },
+        {
+          "stem": "fma_fused",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "fma_fused.sm_103.cubin",
+          "sha256": "82b7fd68c54123443e7a954e97c0f0ba795ff5689375119b0ee4c72040793c77",
+          "sha256_code": "c4664496dfaa66e8cd87b94c59e142b53388cc13fe4eac7d5f2fa0b1f759ca47"
+        },
+        {
+          "stem": "fma_plain",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "fma_plain.sm_103.cubin",
+          "sha256": "98cd1c9cc49bc9c7e2f306fc12d200d35199838c9809ff18cba5139b1d464a67",
+          "sha256_code": "74c4caa160c924b548205a6b04b0ce353c7a466e80236843479536a914daa094"
         },
         {
           "stem": "gelu_erf",
@@ -308,7 +324,7 @@
       ]
     },
     "sm_120": {
-      "manifest_digest": "ffe16d75adca5d68d0a68f070a9c6ce2b0b17e837d9ecea36f3713130cc73983",
+      "manifest_digest": "b5e7fc439accf739722b04893ad29f907f18c153c940d5d5a6046b94fc8fd87a",
       "kernels": [
         {
           "stem": "axpy",
@@ -357,6 +373,22 @@
           "cubin": "bucketed_rms.Db96.sm_120.cubin",
           "sha256": "dd57fe514f5acd6753fd7c5c6be4566099d0a0c8db8c044e82385c4660133869",
           "sha256_code": "4abc9b18ebf64ff9994731fc0061c8f406a6e416617e97b045aaf0d8b18c0d96"
+        },
+        {
+          "stem": "fma_fused",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "fma_fused.sm_120.cubin",
+          "sha256": "575a0797d3ccf45d382f830df7ec11cf8405ff21aea85ee407ad9a37b29a758f",
+          "sha256_code": "997a173001db2806ea684ee1cac8b5ec2fee1b2f211be82443c707d3e1e769a9"
+        },
+        {
+          "stem": "fma_plain",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "fma_plain.sm_120.cubin",
+          "sha256": "826d706a0fc9a51130750d693af19d9ce9cf6d36083f31938e6cc921e608512b",
+          "sha256_code": "43b4d9e7b41c95a7be5c2d539e38a1a066a80de970ad11a19fc619feb9633cb6"
         },
         {
           "stem": "gelu_erf",

@@ -32,7 +32,8 @@
 //! context that tracks events and in one that does not; `launch_raw_puts_back_the_current_context` is what it says. Schema 3 adds
 //! `the_gate_has_a_case_for_every_feature_of_schema_3`, `refusals_of_schema_3`, `graph_capture_of_a_strided_kernel_and_of_a_gemm`,
 //! `a_gemm_of_slices_on_a_capturing_stream_...`, the free of the slices of a GEMM and of a strided kernel on another stream,
-//! `a_written_view_lands_at_its_offset_and_nowhere_else` and `a_gemm_whose_algorithm_needs_a_workspace_...`.
+//! `a_written_view_lands_at_its_offset_and_nowhere_else` and `a_gemm_whose_algorithm_needs_a_workspace_...`. M3.3 adds
+//! `the_gate_has_a_case_for_every_feature_of_m3_3`.
 
 #[allow(dead_code)]
 mod generated {
@@ -1200,6 +1201,22 @@ fn the_gate_has_a_case_for_every_feature_of_schema_3() {
         all.iter().map(|c| c["stem"].as_str().unwrap().to_owned()).collect();
     for stem in ["gelu_ptx", "softmax_ptx", "axpy_ptx", "strided_copy", "axpy_cubin"] {
         assert!(stems.contains(stem), "the gate has no case of the prebuilt binary {stem}: {stems:?}");
+    }
+}
+
+/// What M3.3 added is in the gate: one hand-written kernel compiled without and with FMA contraction (`enable_fp_fusion` of its
+/// declaration, in the options of its entry), whose bytes `byte_identity` holds to Python's.
+#[test]
+fn the_gate_has_a_case_for_every_feature_of_m3_3() {
+    let cases = cases();
+    let arch = cases["arch"].as_str().unwrap().to_owned();
+    let stems: std::collections::BTreeSet<String> =
+        cases_where(&cases, |_| true).iter().map(|c| c["stem"].as_str().unwrap().to_owned()).collect();
+    let manifest = manifest();
+    for (stem, fused) in [("fma_plain", false), ("fma_fused", true)] {
+        assert!(stems.contains(stem), "the gate has no case of {stem}: {stems:?}");
+        let entry = manifest.entry(stem, &arch).expect("the gate's manifest has the entry");
+        assert_eq!(entry.enable_fp_fusion, Some(fused), "{stem}: the contraction its binary was compiled with");
     }
 }
 

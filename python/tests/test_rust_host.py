@@ -256,7 +256,10 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect(tmp_path):
         manifest = Manifest.load(directory, pin=pin)  # verifies every cubin against the manifest; schema 3, which Rust reads too
         if directory == FIXTURES / name:  # (a copy that stands in for a fixture that predates sm_count has a digest of its own)
             assert manifest.digest == want["manifest_digest"], name
-        assert len(manifest.artifacts) == len(want["kernels"]) == 24 and len(manifest.library_entries) == len(want["library"])
+        assert len(manifest.artifacts) == len(want["kernels"]) == 26 and len(manifest.library_entries) == len(want["library"])
+        # an extern declared with enable_fp_fusion= records the option it was compiled with
+        for stem, fused in (("fma_plain", False), ("fma_fused", True)):
+            assert manifest.get(stem, name).entry["options"] == {"num_warps": 4, "num_stages": 3, "enable_fp_fusion": fused}
         for k in want["kernels"]:
             artifact = manifest.get(k["stem"], k["arch"])
             assert artifact.entry["cubin"] == k["cubin"] and artifact.entry["kind"] == k["kind"]
@@ -283,6 +286,8 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect(tmp_path):
     by = {k["stem"]: k for k in expected["sm_103"]["kernels"]}
     assert by["gelu_ptx"]["sha256_code"] == by["gelu_exact"]["sha256_code"] and by["softmax_ptx"]["sha256_code"] == by["softmax"]["sha256_code"]
     assert by["axpy_cubin"]["sha256_code"] == by["axpy_ptx"]["sha256_code"]
+    # one kernel compiled with and without FMA contraction is two binaries
+    assert by["fma_plain"]["sha256_code"] != by["fma_fused"]["sha256_code"]
 
 
 @needs_crate

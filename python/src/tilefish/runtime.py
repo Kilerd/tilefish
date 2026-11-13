@@ -434,7 +434,9 @@ def build_options(**options: Any) -> "Iterator[None]":
 
     An experiment, not a mode: ``with build_options(enable_fp_fusion=False): run(op, ..., mode="jit")`` runs a
     binary compiled without FMA contraction. (A lowered kernel asks for that itself with
-    ``@tilefish.kernel(fp_fusion=False)``; this is for an ``extern``, whose spec says nothing about it.) The options
+    ``@tilefish.kernel(fp_fusion=False)``, and an ``extern`` with ``@tilefish.extern(enable_fp_fusion=False)``, which puts it in
+    its specs, its manifest entries and its declaration digest; this is for an experiment on an ``extern`` whose spec says
+    nothing about it.) The options
     are part of the cache key and are recorded in the :class:`~tilefish.aot.BuiltKernel`, and they make the build
     differ from the compile spec, so a manifest written from it is refused by ``replay``. An option that names a file is
     keyed by the content of the file (``extern_libs``: a rewritten library is another binary), and ``ir_override``, a file

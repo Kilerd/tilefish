@@ -443,9 +443,9 @@ class ExternOp(Op):
     launch; ``index_bits=64`` is the kernel's word that it indexes with ``i64``, and declares none. It is in the declaration
     digest (as ``max_elements`` is), so a binary built under the other declaration is not the binary of this one.
 
-    Four more optional facts exist for kernels that tilefish generated (``@tilefish.extern`` never sets them,
-    so the specs of a hand-written kernel say nothing about its contraction, a warp count
-    per bucket or its source):
+    Four more optional facts exist for kernels that tilefish generated (``@tilefish.extern`` sets only the contraction, and only
+    when it is asked to with ``enable_fp_fusion=``, so the specs of a hand-written kernel say nothing about a warp count per bucket
+    or its source):
 
     * ``max_elements`` maps tensor parameters to the largest element count the kernel can index (its
       offsets are ``i32``); every spec of the op then carries a ``max_elements`` precondition on those
@@ -454,7 +454,8 @@ class ExternOp(Op):
     * ``element_counts`` maps runtime scalar parameters to the tensor parameter whose element count (the
       product of its shape) the scalar carries; the spec records how a host computes the value.
     * ``fp_fusion`` (``True`` or ``False``) puts ``enable_fp_fusion`` into the compile options of every
-      spec; ``None`` leaves the option out, which is Triton's default (contraction on).
+      spec; ``None`` leaves the option out, which is Triton's default (contraction on). A generated kernel always
+      has it; a hand-written one has it when ``@tilefish.extern(enable_fp_fusion=...)`` says so.
     * ``bucket_num_warps`` maps a bucket's stem suffix (``".D96"``) to its warp count, so that each
       binary of a bucketed op has the warps for its own size; a bucket without an entry has ``num_warps``.
     * ``source_sha256`` is the sha256 of the generated Triton source (deterministic for one IR). It is in the
@@ -723,6 +724,7 @@ def extern(
     name: str | None = None,
     index_bits: int = 32,
     reference: "Callable[..., Any] | None" = None,
+    enable_fp_fusion: "bool | None" = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
 
@@ -751,6 +753,13 @@ def extern(
     a Rust host check at launch, because a kernel that indexes with ``i32`` (``row * N_COLS + col`` on ``tl.int32`` values) goes
     through memory it was not given, silently, on a tensor that is any larger. A kernel that computes its offsets in ``i64``
     (``row.to(tl.int64) * N_COLS``) declares ``index_bits=64`` and has no such limit. The choice is in the declaration digest.
+
+    ``enable_fp_fusion=`` is Triton's compile option of the same name, for a Triton kernel only: ``False`` compiles ``a * b + c`` as a multiply
+    and an add, each rounded (no FMA contraction), ``True`` asks for the contraction explicitly (Triton's default, the same machine code as
+    leaving it out). ``None``, the default, leaves the option out of the compile options, as before. When it is given it is in every compile
+    spec (``enable_fp_fusion``), in the compile options a manifest entry records (``options``) and in the declaration digest, so a binary
+    built with the other setting is not the binary of this declaration and ``replay`` refuses it. A prebuilt binary is not compiled by
+    Triton and takes no ``enable_fp_fusion=``: its PTX says how each instruction rounds.
 
     ``reference=`` is an oracle in torch for ``tilefish.run(graph, ..., mode="reference")``, where a graph that calls this op has nothing to
     interpret (a hand-written kernel has no IR): a callable that takes the op's tensor inputs as keyword arguments, by parameter name (a
@@ -781,10 +790,17 @@ def extern(
     if len(given) > 1:
         raise TilefishDeclarationError(f"extern: a kernel is one of triton=, ptx= and cubin=, got {' and '.join(given)}")
     prebuilt = triton is None
+    if enable_fp_fusion is not None and not isinstance(enable_fp_fusion, bool):
+        raise TilefishDeclarationError(f"extern: enable_fp_fusion must be True, False or None (Triton's default), got {enable_fp_fusion!r}")
     if prebuilt:
         for key, value in (("num_warps", num_warps), ("num_stages", num_stages)):
             if value is not _UNSET:
                 raise TilefishDeclarationError(f"extern: {key}= is a Triton compile option; a prebuilt binary has its block= (and nothing is compiled)")
+        if enable_fp_fusion is not None:
+            raise TilefishDeclarationError(
+                "extern: enable_fp_fusion= is a Triton compile option; a prebuilt binary is not compiled by Triton (its PTX says how each "
+                "instruction rounds)"
+            )
         if symbol is None or block is None:
             raise TilefishDeclarationError(f"extern: {given[0]}= needs symbol=<the kernel's entry point> and block=(x, y, z)")
         target = None
@@ -872,6 +888,7 @@ def extern(
             num_stages,
             grid,
             max_elements=limits,
+            fp_fusion=enable_fp_fusion,
             index_bits=index_bits,
             binary=binary,
             reference=reference,

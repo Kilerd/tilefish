@@ -3,7 +3,8 @@
 * Each bucket of a bucketed ``D`` gets the warp count of its own ``BLOCK_D`` (one warp per 256 lanes, 1 to 16), so the
   bits of the ``D = 96`` binary do not depend on which other buckets a kernel declares. ``num_warps=N`` pins every bucket.
 * A generated kernel writes ``enable_fp_fusion`` into its specs (``True``, Triton's default, or ``False`` for
-  ``@tilefish.kernel(fp_fusion=False)``); an ``extern`` has no such key.
+  ``@tilefish.kernel(fp_fusion=False)``); an ``extern`` has the key only when it declares ``enable_fp_fusion=``, and then it is in its
+  specs, its manifest entries and its declaration digest like a generated kernel's.
 * A float to integer cast is rejected (rule ``cast.float-to-int``); float to ``e4m3``/``e5m2`` and the rest stay.
 
 No ``from __future__ import annotations`` here: tilefish evaluates annotations at declaration.
@@ -13,15 +14,36 @@ import copy
 import dataclasses
 import importlib
 import json
+import pathlib
 
 import pytest
-from built_fakes import scale
+from built_fakes import FAKE_SOURCE_DIGEST, fake_build, scale
 from lower_cases import T, layernorm, softmax
 
 import tilefish
-from tilefish import Dim, Tensor, TilefishDeclarationError, TilefishLoweringError, TilefishSpecError, bf16, e4m3, e5m2, f16, f32, i32, i64, u8
-from tilefish.aot import CompileSpec, compile_specs, declaration_digest
+from tilefish import (
+    Dim,
+    Manifest,
+    Out,
+    Tensor,
+    TilefishDeclarationError,
+    TilefishLoweringError,
+    TilefishManifestError,
+    TilefishSpecError,
+    bf16,
+    const,
+    e4m3,
+    e5m2,
+    f16,
+    f32,
+    i32,
+    i64,
+    u8,
+)
+from tilefish.aot import CompileSpec, compile_specs, declaration_digest, write_manifest
 from tilefish.decorators import ExternOp
+
+PTX = pathlib.Path(__file__).resolve().parent / "ptx"
 
 
 def rows_kernel(d_dim, **options):
@@ -232,6 +254,81 @@ def test_an_extern_op_validates_its_contraction():
     with pytest.raises(TilefishDeclarationError, match="fp_fusion must be True, False or None"):
         make(1)
     assert "enable_fp_fusion" not in compile_specs(make(None))[0].to_dict()
+
+
+# -- the contraction of a hand-written kernel: @tilefish.extern(enable_fp_fusion=...) -------------------------------------------------------
+
+_n = Dim("n")
+
+
+def fma_extern(enable_fp_fusion="unset", name="fma"):
+    """``y = a * b + c`` declared as an extern of the Triton kernel ``my_kernels:fma``, with ``enable_fp_fusion=`` as given (left out when ``"unset"``)."""
+    options = {} if enable_fp_fusion == "unset" else {"enable_fp_fusion": enable_fp_fusion}
+
+    @tilefish.extern(triton="my_kernels:fma", num_warps=4, grid=lambda n: (tilefish.cdiv(n, 256),), name=name, **options)
+    def fma(a: Tensor[_n, f32], b: Tensor[_n, f32], c: Tensor[_n, f32], y: Out[Tensor[_n, f32]], n_elem: _n, *, BLOCK: const = 256): ...
+
+    return fma
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_an_extern_asks_for_the_contraction_in_every_spec(value):
+    op = fma_extern(value)
+    (spec,) = compile_specs(op)
+    assert op.fp_fusion is value and spec.enable_fp_fusion is value
+    assert spec.to_dict()["enable_fp_fusion"] is value
+    assert spec.ast_source_inputs().options == {"num_warps": 4, "num_stages": 3, "enable_fp_fusion": value}
+
+
+def test_an_extern_that_says_nothing_is_what_it_was():
+    unset, none = fma_extern(), fma_extern(None)
+    assert unset.fp_fusion is None and none.fp_fusion is None
+    (spec,) = compile_specs(none)
+    assert "enable_fp_fusion" not in spec.to_dict() and spec.ast_source_inputs().options == {"num_warps": 4, "num_stages": 3}
+    assert declaration_digest(unset) == declaration_digest(none)  # None is the default: the digest of every extern declared before is unchanged
+
+
+def test_the_contraction_of_an_extern_is_in_its_declaration_digest_and_its_verification():
+    digests = {value: declaration_digest(fma_extern(value)) for value in (None, False, True)}
+    assert len(set(digests.values())) == 3  # True is Triton's default, but a declaration that says so is another declaration
+    (off,) = compile_specs(fma_extern(False))
+    back = CompileSpec.from_json(off.to_json())
+    back.verify_against(fma_extern(False))
+    assert back.verified
+    for other in (None, True):  # the digest differs, and so does the key: the first difference is the one met first
+        with pytest.raises(TilefishSpecError, match="first difference at (declaration_digest|enable_fp_fusion)"):
+            CompileSpec.from_json(off.to_json()).verify_against(fma_extern(other))
+    edited = json.loads(off.to_json())
+    edited["enable_fp_fusion"] = True  # the digest of the declaration, but another contraction: not this declaration's spec
+    with pytest.raises(TilefishSpecError, match="first difference at enable_fp_fusion: the spec has True, the declaration gives False"):
+        CompileSpec.from_dict(edited).verify_against(fma_extern(False))
+
+
+def test_a_manifest_entry_of_another_contraction_is_not_the_binary_of_the_declaration(tmp_path):
+    (off,) = compile_specs(fma_extern(False))
+    write_manifest([fake_build(off)], tmp_path / "manifest.json", cubins=True)
+    entry = json.loads((tmp_path / "manifest.json").read_text())["kernels"][0]
+    assert entry["options"] == {"num_warps": 4, "num_stages": 3, "enable_fp_fusion": False}  # the options the binary was compiled with
+    m = Manifest.load(tmp_path)
+    assert m.built_kernel(off, "sm_90", ir_digest=FAKE_SOURCE_DIGEST, ir_triton="3.5.1").options["enable_fp_fusion"] is False
+    for other in (None, True):
+        (spec,) = compile_specs(fma_extern(other))
+        with pytest.raises(TilefishManifestError, match="is not what the compile spec asks for"):
+            m.built_kernel(spec, "sm_90", ir_digest=FAKE_SOURCE_DIGEST, ir_triton="3.5.1", pinned=True)
+
+
+@pytest.mark.parametrize("bad", [0, 1, "no", "False", [False]])
+def test_enable_fp_fusion_of_an_extern_is_true_false_or_none(bad):
+    with pytest.raises(TilefishDeclarationError, match="enable_fp_fusion must be True, False or None"):
+        fma_extern(bad)
+
+
+@pytest.mark.parametrize("value", [False, True])
+def test_a_prebuilt_binary_takes_no_enable_fp_fusion(value):
+    with pytest.raises(TilefishDeclarationError, match="enable_fp_fusion= is a Triton compile option; a prebuilt binary is not compiled by Triton"):
+
+        @tilefish.extern(ptx=PTX / "axpy_f32.ptx", symbol="axpy_f32", block=(128,), grid=lambda n: (tilefish.cdiv(n, 128),), enable_fp_fusion=value)
+        def axpy(x: Tensor[_n, f32], y: Tensor[_n, f32], out: Out[Tensor[_n, f32]], n_elem: _n, alpha: const[f32] = 2.0): ...
 
 
 # -- casts ----------------------------------------------------------------------------------------------------------------------------------

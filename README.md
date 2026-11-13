@@ -493,7 +493,13 @@ point in the IR, and rules come in two kinds:
 `num_warps` is part of a kernel's numerics identity in the same way: it fixes
 the tree a `tl.sum` adds in, so the same kernel with another warp count differs
 in the last bits. It is recorded in the declaration digest, the compile spec
-and the manifest, and a replay refuses an entry that has another.
+and the manifest, and a replay refuses an entry that has another. So is FMA
+contraction: a generated kernel always says whether `a * b + c` may be one
+rounding (`@tilefish.kernel(fp_fusion=False)` says no), and a hand-written one
+says it with `@tilefish.extern(triton=..., enable_fp_fusion=False)` (Triton's
+compile option of that name; `None`, the default, leaves it to Triton). The
+setting is in the declaration digest, every compile spec and the `options` of
+the manifest entry, so a binary built with the other one is refused by a replay.
 
 Whether a legal fusion is worth doing is still measured, not assumed. The
 measurements live in the repository next to the rules.

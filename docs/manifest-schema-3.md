@@ -79,7 +79,10 @@ A `kernels` entry has a `kind`, which is required and is exactly one of `"triton
 `stem op kind arch ptx_target symbol cubin abi grid block shared num_warps num_stages launch constexprs buckets dims preconditions options
 declaration_digest sha256 sha256_code toolchain` and optionally `source_sha256`, `source_digest` + `source_digest_kind` (as in schema 2:
 `source_digest_kind` is `"tilefish.triton-ir.v1"` for the digest of the Triton IR).
-`toolchain` is `{"triton": ..., "ptxas": ...}`.
+`toolchain` is `{"triton": ..., "ptxas": ...}`. `options` are the compile options Triton was given: `num_warps` and `num_stages` (equal to the entry's) and,
+for a kernel whose declaration says it, `enable_fp_fusion` (a boolean: always for a kernel tilefish generated, and for a hand-written one declared with
+`@tilefish.extern(enable_fp_fusion=...)`; without the key Triton's default applies, which is `true`). Like every field it is digested, and a replay compares it
+with the compile spec of the operator.
 
 **`kind: "binary"`** (section 8) has no `num_warps`, `num_stages` or `options` (a reader refuses an entry that has one) and has instead `binary`.
 Its fields are
@@ -471,6 +474,7 @@ stride scalars and `fixed` arguments are not parameters) and for each library en
 | prebuilt PTX and cubin, byte identity with the Triton path | `test_binary_externs.py`; on a GPU `test_gpu_binary.py`, `ptx/*.ptx` |
 | the `library` section | `test_library_ops.py`, `test_cublaslt.py`; on a GPU `test_gpu_gemm.py`, `test_gpu_cublaslt.py` |
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
+| `options.enable_fp_fusion` of a hand-written kernel (`@tilefish.extern(enable_fp_fusion=...)`) | `test_lower_options.py`; on a GPU `test_gpu_extern_fusion.py` |
 
 The Rust crate (`crates/tilefish/tests/`):
 

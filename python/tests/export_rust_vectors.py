@@ -435,6 +435,9 @@ LAUNCH_CASES = [
     ("scale_flat", lambda n: [("f32", (n,)), ("f32", ()), ("f32", ())], (16, 1040)),
     ("axpy_ptx", lambda n: [("f32", (n,)), ("f32", (n,))], (16, 1040)),
     ("strided_copy", lambda r: [("bf16", (r, 64), (200, 1))], (1, 5)),
+    # M3.3: an extern declared with enable_fp_fusion= (the option is in the manifest entry; a launch is as any other)
+    ("fma_plain", lambda n: [("f32", (n,)), ("f32", (n,)), ("f32", (n,))], (16, 1040)),
+    ("fma_fused", lambda n: [("f32", (n,)), ("f32", (n,)), ("f32", (n,))], (16, 1040)),
 ]
 _OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16", "i32": "i64"}
 I31 = (1 << 31) - 1

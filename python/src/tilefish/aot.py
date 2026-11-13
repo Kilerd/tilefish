@@ -55,7 +55,8 @@ has one per tensor whose element count is not statically bounded, and a hand-wri
 tensor unless it declares ``index_bits=64``), and, for a generated kernel only, ``count_of`` on a runtime scalar that
 carries the element count of a tensor argument (see :class:`ArgSpec`). Two more facts of a generated kernel sit at the top level of its
 spec (schema 2 only too): ``enable_fp_fusion`` (Triton's FMA contraction option, always written out for a generated
-kernel) and ``source_sha256`` (the sha256 of the generated Triton source, so that a kernel redeclared with another
+kernel, and for a hand-written one that declares ``@tilefish.extern(enable_fp_fusion=...)``) and ``source_sha256`` (the sha256 of the
+generated Triton source, so that a kernel redeclared with another
 body but the same name and signature is not the kernel a stored binary was built from). Both are in the declaration
 digest and in what ``verify_against`` compares. The warp count of a bucketed generated kernel is per bucket (each
 spec has its own ``num_warps`` and ``block``).
@@ -309,8 +310,9 @@ class CompileSpec:
     # sha256 of the canonical declaration this spec was generated from (see declaration_digest). ``None`` for
     # a spec read from schema 1, which has none: such a spec cannot be verified, only regenerated.
     declaration_digest: str | None = None
-    # Triton's ``enable_fp_fusion`` for a kernel that tilefish generated: ``True`` is Triton's default, written out;
-    # ``False`` asks for no FMA contraction. ``None`` (every ``extern``) leaves the option out of the compile options.
+    # Triton's ``enable_fp_fusion`` for a kernel that tilefish generated, or an ``extern`` declared with ``enable_fp_fusion=``: ``True`` is
+    # Triton's default, written out; ``False`` asks for no FMA contraction. ``None`` (an ``extern`` that says nothing) leaves the option
+    # out of the compile options.
     enable_fp_fusion: bool | None = None
     # sha256 of the generated Triton source, for a kernel that tilefish generated (``None`` for every ``extern``, whose
     # source is a Python function the declaration does not contain). It is in the declaration digest, so a binary built
@@ -743,7 +745,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         }
     doc["grid"] = None if op.grid is None else [_canonical_dim(g) for g in op.grid]
     doc["params"] = params
-    # only kernels that tilefish generated have these; leaving them out otherwise keeps every other digest as it was
+    # only kernels that tilefish generated have these (and fp_fusion an extern declared with enable_fp_fusion=); leaving them out
+    # otherwise keeps every other digest as it was
     if op.index_bits != 32:
         doc["index_bits"] = op.index_bits
     if op.max_elements:

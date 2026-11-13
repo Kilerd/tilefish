@@ -27,6 +27,14 @@ of ``crates/tilefish/tests/fixtures`` are replaced together.
 Fixtures built before a library entry recorded the SM count of its device (``sm_count``) are migrated without a GPU, keeping every binary and algorithm::
 
     python export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --migrate-sm-count 30
+
+An operator added to ``host_ops.ops()`` is added to the committed fixtures without building the others again (their cubins, and so their digests, stay
+as they are; a fresh export would give the same machine code in other files, since a cubin names the directory it was built in)::
+
+    python export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --add-missing [--archs 103,120]
+
+which exports, for each architecture, the operators of ``ops()`` that the fixture has no binary of into its directory (``tilefish.runtime.export`` merges
+into a manifest that is there), then writes ``expected.json`` and ``generated.rs`` again.
 """
 
 import argparse
@@ -121,6 +129,31 @@ def migrate_sm_count(output, sm_count):
     (output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
 
 
+def add_missing(output, caps):
+    """Export the operators of ``ops()`` that a committed fixture has no binary of into its directory, for each of ``caps`` (merged into the manifest
+    that is there: every other binary and library entry stays), then write ``expected.json`` and ``generated.rs`` again. Needs Triton and ptxas, not a GPU
+    of the architecture (a library entry is not added: those are pinned on a device)."""
+    from tilefish import Manifest
+
+    summary = json.loads((output / "expected.json").read_text())["fixtures"]
+    native = native_capability()
+    emit_cap = native if native in caps else caps[0]
+    plain = list(ops().values())
+    gemms = list(library_ops(GEMM_SHAPES_COMMITTED).values())
+    for cap in caps:
+        name = f"sm_{cap}"
+        directory = output / name
+        have = Manifest.load(directory, pin=summary[name]["manifest_digest"])
+        stems = {a.stem for a in have.artifacts}
+        missing = [op for op in plain if any(s.stem not in stems for s in runtime._target(op).compile_specs())]
+        manifest = runtime.export(missing, directory, arch=cap) if missing else have
+        if cap == emit_cap:
+            rust.emit(manifest, output / "generated.rs", ops=plain + gemms)
+        summary[name] = expected(manifest)
+        print(f"{name}: added {[op.name for op in missing]}, manifest digest {manifest.digest}", file=sys.stderr)
+    (output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("output", type=pathlib.Path)
@@ -132,11 +165,19 @@ def main(argv=None):
         metavar="N",
         help="no build: give the library entries of the fixtures in OUTPUT the sm_count N of the device they were pinned on, and write expected.json and generated.rs again",
     )
+    parser.add_argument(
+        "--add-missing",
+        action="store_true",
+        help="build only the operators of ops() that the fixtures in OUTPUT have no binary of, merge them in, and write expected.json and generated.rs again",
+    )
     args = parser.parse_args(argv)
     if args.migrate_sm_count is not None:
         migrate_sm_count(args.output, args.migrate_sm_count)
         return
     caps = [int(c) for c in args.archs.split(",")]
+    if args.add_missing:
+        add_missing(args.output, caps)
+        return
     native = native_capability()
     emit_cap = native if native in caps else caps[0]
     shapes = GEMM_SHAPES_COMMITTED if args.gemm_shapes == "committed" else GEMM_SHAPES

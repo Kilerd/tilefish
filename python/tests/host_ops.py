@@ -9,7 +9,10 @@ kernels declared with ``tilefish.extern`` (an rmsnorm, an exact-erf gelu and an 
   ``head_copy64`` (64-bit strides) and ``softmax3d`` (a row softmax over a permuted view);
 * device scalars: ``masked_rows`` (a hand-written kernel), ``scale_by`` and ``scale_flat`` (lowered kernels that ``tilefish.load`` them);
 * prebuilt binaries that need no toolchain to be declared: the hand-written PTX of ``ptx/`` (``axpy_ptx``: a float fixed argument;
-  ``strided_copy``: a 64-bit stride and a fixed ``i32``).
+  ``strided_copy``: a 64-bit stride and a fixed ``i32``);
+
+and what M3.3 added (``gpu_kernels_p4.py``): ``fma_plain`` and ``fma_fused``, one hand-written kernel declared with ``enable_fp_fusion=False``
+and ``True``.
 
 ``gpu_ops(directory, arch)`` is what needs the GPU toolchain to *declare*: the PTX of two lowered goldens taken from a Triton build
 (``gelu_ptx``, ``softmax_ptx``: the same machine code as the Triton path, declared as prebuilt externs with the Triton ABI's two scratch
@@ -98,6 +101,11 @@ def mm_kernels():
     return _with_triton("mm_kernels")
 
 
+def gpu_kernels_p4():
+    """The hand-written kernels of the features of M3.3 (``gpu_kernels_p4.py``)."""
+    return _with_triton("gpu_kernels_p4")
+
+
 # -- prebuilt PTX that is checked in: hand-written (ptx/), so nothing here needs a toolchain -------------------------------------------------
 
 _N = Dim("n")
@@ -116,6 +124,7 @@ def ops():
     """``{name: operator}`` in a fixed order: the lowered kernels, the bucketed one, the hand-written externs, then schema 3's."""
     kernels = gpu_kernels()
     p1 = gpu_kernels_p1()
+    p4 = gpu_kernels_p4()
     return {
         "softmax": softmax,
         "layernorm": layernorm,
@@ -139,6 +148,9 @@ def ops():
         # prebuilt PTX (the stem of the first is not `axpy`: that is the Triton kernel of gpu_kernels)
         "axpy_ptx": axpy_ptx,
         "strided_copy": strided_copy,
+        # an extern's contraction (M3.3)
+        "fma_plain": p4.fma_plain,
+        "fma_fused": p4.fma_fused,
     }
 
 

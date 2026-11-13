@@ -22,6 +22,8 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **device scalars**: a mask whose row count is a tensor of shape ``()`` or ``(1,)``, a lowered kernel that reads one and one that reads two;
 * **prebuilt binaries**: the PTX of a Triton build declared as a prebuilt extern (checked here to give the bytes of the Triton path), hand-written
   PTX with a float fixed argument and with a 64-bit stride, and a cubin;
+* **an extern's contraction** (``gpu_kernels_p4.py``): ``y = a * b + c`` declared with ``enable_fp_fusion=False`` (checked here to be torch's two
+  roundings) and ``True`` (one rounding);
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
@@ -220,6 +222,20 @@ def must_scale(args, got):
     assert same_bytes(got, x * s)
 
 
+def must_round_twice(args, got):
+    a, b, c = args
+    assert same_bytes(got, torch.mul(a, b).add(c))
+
+
+def must_round_once(args, got):
+    a, b, c = args
+    assert same_bytes(got, (a.double() * b.double() + c.double()).to(F32))
+
+
+def args_fma(n, seed):
+    return (randn((n,), F32, seed), randn((n,), F32, seed + 100), randn((n,), F32, seed + 200))
+
+
 def build_cases():
     cases: "list[Case]" = [
         *plain("softmax", "softmax", args_softmax, ROW_SIZES),
@@ -260,6 +276,9 @@ def build_cases():
     cases += plain("axpy_ptx", "axpy_ptx", args_axpy, PTX_SIZES, seeds=(0, 1), check=lambda args, got: same_bytes(got, 2.0 * args[0] + args[1]))
     cases += plain("axpy_cubin", "axpy_cubin", args_axpy, PTX_SIZES, seeds=(0, 1), same_as="axpy_ptx")
     cases += plain("strided_copy", "strided_copy", args_strided_copy, [(rows, first) for rows in (1, 7, 33) for first in (0, 3, 8)], seeds=(0,), check=must_be_the_copy)
+    # -- an extern's contraction
+    cases += plain("fma_plain", "fma_plain", args_fma, (16, 1040, 65539), seeds=(0, 1), check=must_round_twice)
+    cases += plain("fma_fused", "fma_fused", args_fma, (16, 1040, 65539), seeds=(0, 1), check=must_round_once)
     return cases
 
 

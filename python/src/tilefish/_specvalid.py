@@ -551,7 +551,8 @@ def validate_spec(d: Any) -> None:
     # a prebuilt binary (schema 3) has a ``binary`` section where a Triton kernel has the reference of its function, its warps and stages
     binary = d.get("binary") if schema >= STRIDED_SCHEMA else None
     is_binary = binary is not None
-    # enable_fp_fusion and source_sha256 exist from schema 2 on, and only in the specs of kernels that tilefish generated
+    # enable_fp_fusion and source_sha256 exist from schema 2 on: both in the specs of kernels that tilefish generated, enable_fp_fusion in
+    # those of an extern declared with enable_fp_fusion= too
     optional = ["enable_fp_fusion", "source_sha256", "dims"] if schema >= DIGEST_SCHEMA else []
     required = TOP_KEYS_V2 if schema >= DIGEST_SCHEMA else TOP_KEYS
     if is_binary:
