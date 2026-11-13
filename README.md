@@ -118,7 +118,7 @@ tilefish build --arch sm_90,sm_100,sm_120 --host python,rust,cpp
 Library operators put a different code object behind the same kind of
 manifest entry: a CUTLASS instantiation with a C entry point, a CuTe DSL
 ahead-of-time export, or a pinned cuBLASLt algorithm recorded with its
-workspace size and replayed as is.
+workspace size and replayed as is (the last exists: a bf16 GEMM, below).
 
 The Python side has three modes:
 
@@ -174,7 +174,7 @@ edit; the operations, the types, the constants and the functions that are called
 are. Whatever the process holds is what is hashed, because that is what is
 compiled. The digest of every build is in `BuiltKernel.ir_digest`, and in the
 manifest entry as `source_digest` with `source_digest_kind` `"tilefish.triton-ir.v1"`
-(the fields schema 2 already has, so a reader of the manifest reads it as before;
+(the fields schema 2 already had, so a reader of the manifest reads it as before;
 a lowered kernel has its `source_sha256` as well, which needs no Triton).
 `replay` recomputes the digest from the kernel the process holds, when Triton
 can be imported and is the version that built the entry, and refuses a mismatch
@@ -267,6 +267,50 @@ bf16 step of the largest reference value and a fraction of elements that may
 differ, the f32 softmax by an absolute error of 5e-7, the gelu by 3e-5. An
 experiment that passes in `replay` is, kernel for kernel, what production runs.
 
+## Views, device scalars, prebuilt binaries and a pinned GEMM
+
+A real model needs four things that a dense, compiled-in, Triton-only operator cannot say. Each is part of the manifest, which is schema 3
+(`docs/manifest-schema-3.md` specifies every field; the Python package reads and writes only schema 3, and says "re-export" for schema 2).
+
+**Strided views.** A tensor type has element strides and an element offset, in the dimension algebra (`TensorType.strides`, `.offset`); dense
+and 16-byte aligned (`contiguous`) is the default. `x.reshape(M, 3, H, D)` (a dense input), `x.permute(1, 0, 2)`, `x[:, 1]` / `x.select(axis, i)` and
+`x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A view is a `View[...]` and can go into traced
+elementwise and reduction ops; a declared operator takes one only where its parameter says so. An `extern` parameter `x: Strided[Tensor[S, H, D, bf16]]`
+takes a view, and the kernel's strides are scalar parameters the stub declares in the kernel's argument order:
+
+```python
+@tilefish.extern(triton=head_copy, grid=lambda S: (S, 8))
+def head_copy(x: Strided[Tensor[S, 8, 64, bf16]], y: Out[Tensor[S, 8, 64, bf16]],
+              x_s0: StrideOf("x", 0), x_s1: StrideOf("x", 1), D: const = 64): ...      # the last axis has stride 1
+
+y = tilefish.run(head_copy, qkv[:, 1])        # a view of a fused qkv tensor: its pointer and its two strides go to the kernel
+```
+
+An axis without a `StrideOf` must be the last one (its stride is then 1, and a view that does not have it is refused); the strides are bound at a
+call like shapes are, range-checked as `i32` (`i64` for `index_bits=64`), and a strided pointer is bounded by its extent (`max_extent`), not its element
+count. The pointer passed is `base + offset * itemsize`. `Strided[Tensor[...], 16]` compiles the kernel for a 16-byte aligned pointer
+(`tt.divisibility=16`), which the offset must then provably allow (a trace call refuses an offset that is not a multiple of 16 bytes, a launch
+checks the address); without the `16` Triton gets no hint and any element-aligned view runs. Lowered `@kernel`s still take contiguous tensors only: a
+view in a kernel body is refused with the rule that says so.
+
+**Device scalars.** `n_tok: DevScalar[i32]` is one element in device memory: in the ABI a pointer with the shape `[]`, at the API a tensor of one
+element. A binary reads it with `tl.load`, so one binary serves every value and a value changes by writing memory, never by building; a lowered kernel
+reads it with `tilefish.load(s)` (one `tl.load(ptr)`, broadcast).
+
+**Prebuilt binaries.** `@tilefish.extern(ptx="k.ptx", symbol="k", block=(256,), grid=...)` or `cubin={"sm_103": "k.cubin"}` declares a kernel that
+Triton does not compile, by its C ABI: pointers, `Dim` scalars and typed `const[i32|i64|f32]` fixed arguments, in order, and **no Triton scratch slots**.
+Its identity is the sha256 of the bytes of the file (`source_digest` of kind `tilefish.binary.v1`); PTX is assembled by `ptxas` with fixed, recorded flags
+(the ones Triton passes, so the PTX of a Triton build declared this way gives the machine code, and the output bytes, of the Triton path); a cubin is used
+as it is for its own architecture and refused for another. `replay` refuses a file that is not the one the manifest was built from.
+
+**A pinned cuBLASLt GEMM.** `@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")` over `(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) ->
+Tensor[M, N, bf16]` computes `a @ b.T` with an f32 accumulator and one rounding (`impl="cublaslt.gemm_bias"` adds `bias: Tensor[N, bf16]`, added in f32 before it).
+For each `(M, N, K, bias)` (`M` from its buckets) the algorithm that cuBLASLt's heuristic ranks first under a fixed workspace limit (8 519 680 bytes,
+torch's default; `workspace_bytes=` changes it) is pinned: its 64 bytes go to the manifest's `library` section with the cuBLASLt version that chose
+it, and `replay` runs that algorithm and refuses another cuBLASLt version. `jit` pins in memory the same way, so `jit` and `replay` run the same
+algorithm. The binding is ctypes on the `libcublasLt` the process already has loaded (torch's); operands are contiguous and 16-byte aligned (strided
+operands are not supported yet).
+
 ## The Rust host
 
 The `tilefish` crate (`crates/tilefish`, version 0.0.1) is the
@@ -314,6 +358,11 @@ of the tensor they count) fit 32 bits, aliasing, 16-byte alignment and the grid
 against the device's limits, and evaluates the grid from its expression. There is
 no way to tell a launch what a dimension is. A manifest of an older schema is
 refused by both hosts: export it again.
+
+**Schema 3 and the crate.** Python writes manifest schema 3 (`docs/manifest-schema-3.md`); the crate 0.0.1 reads schema 2 only, and a later
+version reads schema 3 (strided views, device scalars, prebuilt binaries, the `library` section). Until then `emit` writes launchers for a schema 3 manifest
+of dense Triton kernels (they load under a crate that reads schema 3) and refuses the rest with "not yet supported by the Rust host"; the committed
+fixtures of the crate stay schema 2, and the Python tests migrate a copy.
 
 ```python
 from tilefish.hosts import rust
