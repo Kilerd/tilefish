@@ -67,6 +67,8 @@ const TOP_KEYS: [&str; 13] = [
 ];
 const BUFFER_KEYS: [&str; 6] = ["name", "role", "dtype", "shape", "offset", "bytes"];
 const STEP_KEYS: [&str; 3] = ["entry", "kind", "args"];
+/// A copy step has no entry (it launches no binary) and no workspace.
+const COPY_KEYS: [&str; 2] = ["kind", "args"];
 
 /// What a buffer of a plan is, and who provides it (`docs/plan-schema-1.md`, section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,13 +149,15 @@ pub struct PlanBuffer {
     pub bytes: u64,
 }
 
-/// Which section of the manifest a step launches an entry of.
+/// What a step is: a launch of an entry of one section of the manifest, or a copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepKind {
     /// An entry of `kernels`: a Triton kernel or a prebuilt binary.
     Kernel,
     /// An entry of `library`: a pinned cuBLASLt GEMM.
     Library,
+    /// A copy of the dense bytes of one argument (`src`) into another (`dst`): `cuMemcpyDtoDAsync`, no manifest entry.
+    Copy,
 }
 
 /// A view of a buffer that a step passes: element shape, element strides and the element offset of its first element.
@@ -182,7 +186,7 @@ pub struct PlanArg {
 /// One launch of a manifest entry (section 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanStep {
-    /// The stem of the entry (`rmsnorm`, `gemm_qkv.M64`).
+    /// The stem of the entry (`rmsnorm`, `gemm_qkv.M64`); empty for a copy step, which launches no entry.
     pub entry: String,
     /// The section of the manifest the entry is in.
     pub kind: StepKind,
@@ -655,22 +659,29 @@ fn validate(doc: &Value) -> Check<Validated> {
         let mut this: Skeleton = Vec::with_capacity(n_steps);
         let mut steps = Vec::with_capacity(n_steps);
         for (si, st) in steps_doc.iter().enumerate() {
-            let st = keys(st, &format!("step #{si}"), &STEP_KEYS, &["workspace"])?;
-            let entry = match st["entry"].as_str() {
-                Some(e) if is_stem(e) => e.to_owned(),
-                _ => {
-                    return refuse(format!(
-                        "step #{si}: entry must be a manifest stem such as 'gemm.M64', got {}",
-                        brief(&st["entry"])
-                    ));
+            // a copy step has no entry (it launches no binary) and no workspace
+            let is_copy = st.get("kind").and_then(Value::as_str) == Some("copy");
+            let (st, entry) = if is_copy {
+                (keys(st, &format!("step #{si}"), &COPY_KEYS, &[])?, String::new())
+            } else {
+                let st = keys(st, &format!("step #{si}"), &STEP_KEYS, &["workspace"])?;
+                match st["entry"].as_str() {
+                    Some(e) if is_stem(e) => (st, e.to_owned()),
+                    _ => {
+                        return refuse(format!(
+                            "step #{si}: entry must be a manifest stem such as 'gemm.M64', got {}",
+                            brief(&st["entry"])
+                        ));
+                    }
                 }
             };
             let kind = match st["kind"].as_str() {
                 Some("kernel") => StepKind::Kernel,
                 Some("library") => StepKind::Library,
+                Some("copy") => StepKind::Copy,
                 _ => {
                     return refuse(format!(
-                        "step #{si}: kind must be one of [\"kernel\", \"library\"], got {}",
+                        "step #{si}: kind must be one of [\"kernel\", \"library\", \"copy\"], got {}",
                         brief(&st["kind"])
                     ));
                 }
@@ -767,6 +778,18 @@ fn validate(doc: &Value) -> Check<Validated> {
             if distinct.len() != names_here.len() {
                 let all: Vec<&str> = names_here.iter().map(|(n, _)| n.as_str()).collect();
                 return refuse(format!("step #{si}: the argument names must be distinct, got {all:?}"));
+            }
+            if kind == StepKind::Copy {
+                if let Some(problem) = copy_problem(&args, &shapes, &buffers) {
+                    return refuse(format!("step #{si} at {}: {problem}", describe_values(combo)));
+                }
+                let dst = &buffers[args[1].buffer];
+                if !dst.role.is_writable() {
+                    return refuse(format!(
+                        "step #{si}: a copy step writes '{}', whose role is {}",
+                        dst.name, dst.role
+                    ));
+                }
             }
             this.push((kind, workspace.clone(), names_here));
             if bi == 0 {
@@ -878,6 +901,72 @@ fn validate(doc: &Value) -> Check<Validated> {
     })
 }
 
+/// `(shape, strides, offset)` in elements of an argument of a step at a bucket: its view, or the whole buffer (Python's `copy_view`).
+pub(crate) fn arg_layout(a: &PlanArg, shapes: &[Vec<usize>]) -> (Vec<usize>, Vec<usize>, usize) {
+    match &a.view {
+        Some(v) => (v.shape.clone(), v.strides.clone(), v.offset),
+        None => {
+            let shape = shapes[a.buffer].clone();
+            let mut strides = vec![0usize; shape.len()];
+            let mut acc = 1usize;
+            for i in (0..shape.len()).rev() {
+                strides[i] = acc;
+                acc = acc.saturating_mul(shape[i]);
+            }
+            (shape, strides, 0)
+        }
+    }
+}
+
+/// Whether a tensor of this shape and these strides is one run of elements (the strides of its axes of a size other than 1 the row-major ones).
+fn is_dense(shape: &[usize], strides: &[usize]) -> bool {
+    let mut expected = 1u128;
+    for (n, s) in shape.iter().zip(strides).rev() {
+        if *n == 1 {
+            continue;
+        }
+        if *s as u128 != expected {
+            return false;
+        }
+        expected = expected.saturating_mul(*n as u128);
+    }
+    true
+}
+
+/// What is wrong with the arguments of a copy step at a bucket (Python's `copy_problem`): exactly `src` then `dst`, each dense, of one dtype and
+/// one number of elements, and in one buffer not overlapping.
+fn copy_problem(args: &[PlanArg], shapes: &[Vec<usize>], buffers: &[PlanBuffer]) -> Option<String> {
+    let names: Vec<&str> = args.iter().map(|a| a.name.as_str()).collect();
+    if names != ["src", "dst"] {
+        return Some(format!("a copy step has the arguments [\"src\", \"dst\"], in that order, got {names:?}"));
+    }
+    let mut runs = Vec::with_capacity(2);
+    for a in args {
+        let (shape, strides, offset) = arg_layout(a, shapes);
+        if !is_dense(&shape, &strides) {
+            return Some(format!(
+                "the {} of a copy is a view of '{}' with the shape {shape:?} and the strides {strides:?}, which is not dense: a copy step copies \
+                 one run of bytes",
+                a.name, a.binding
+            ));
+        }
+        let count = shape.iter().fold(1u128, |acc, d| acc.saturating_mul(*d as u128));
+        runs.push((buffers[a.buffer].dtype, count, offset as u128));
+    }
+    let ((sd, sn, so), (dd, dn, d_off)) = (runs[0], runs[1]);
+    if sd != dd || sn != dn {
+        return Some(format!(
+            "a copy step copies {sn} {} elements into {dn} {} elements: the dtype and the number of elements must be the same",
+            sd.name(),
+            dd.name()
+        ));
+    }
+    if args[0].buffer == args[1].buffer && so < d_off + dn && d_off < so + sn {
+        return Some(format!("the source and the destination of a copy step overlap in '{}'", args[0].binding));
+    }
+    None
+}
+
 /// Every step of every bucket against the manifest (Python's `check_against_manifest`): the digest, the entry for the plan's architecture in
 /// the section the step says, the pointers of its ABI against the arguments (count, names, dtype, rank, which buffers may be written, the
 /// device scalars), the workspace of a library step, that a buffer is written before it is read, and that every output is written by a step of every bucket.
@@ -902,6 +991,19 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
             })
             .collect();
         for (si, st) in bucket.steps.iter().enumerate() {
+            if st.kind == StepKind::Copy {
+                // no entry: it reads src and writes dst (`validate` held it to its rules)
+                let (src, dst) = (st.args[0].buffer, st.args[1].buffer);
+                if !written.contains(&src) {
+                    return refuse(format!(
+                        "step #{si} (copy) of bucket {}: argument 'src' reads '{}' before any step has written it",
+                        describe_values(&bucket.values),
+                        v.buffers[src].name
+                    ));
+                }
+                written.insert(dst);
+                continue;
+            }
             let stem = st.entry.as_str();
             let at = format!("step #{si} ({stem}) of bucket {}", describe_values(&bucket.values));
             let pointers: Vec<(&str, &str, Access, usize)> = match st.kind {
@@ -924,6 +1026,7 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
                     }
                     pointers_of(&entry.params)
                 }
+                StepKind::Copy => unreachable!("handled above"),
             };
             if pointers.len() != st.args.len() {
                 let names: Vec<&str> = pointers.iter().map(|p| p.0).collect();
@@ -1186,9 +1289,26 @@ impl LaunchPlan {
         self.inner.buffers.iter().find(|b| b.name == name)
     }
 
-    /// The returned values (buffers of role `output`), in the order the graph returns them.
+    /// The returned values (buffers of role `output`), in the order the graph returns them: the graph's names of them
+    /// (`@tilefish.graph(outputs=...)` in Python), or `out0`, `out1`, ...
     pub fn outputs(&self) -> &[String] {
         &self.inner.outputs
+    }
+
+    /// The buffer of the returned value a host calls `name`: its own name, or `out<i>` for the `i`-th returned value whatever its name (the name
+    /// every returned value had before a graph could name them), when no buffer of the plan is called `out<i>` (Python's `output_buffer`). A
+    /// launch takes an output by either name.
+    pub fn output_buffer(&self, name: &str) -> Option<&str> {
+        let outputs = &self.inner.outputs;
+        if let Some(found) = outputs.iter().find(|o| *o == name) {
+            return Some(found);
+        }
+        let digits = name.strip_prefix("out")?;
+        let canonical = !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && (digits == "0" || !digits.starts_with('0'));
+        let index: usize = digits.parse().ok().filter(|_| canonical)?;
+        if index < outputs.len() && self.buffer(name).is_none() { Some(outputs[index].as_str()) } else { None }
     }
 
     /// Every bucket combination and its steps, in the order of the file.

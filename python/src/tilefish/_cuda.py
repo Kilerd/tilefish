@@ -334,6 +334,13 @@ def destroy_event(event: Any) -> None:
     _check(_driver().cuEventDestroy(event), "cuEventDestroy")
 
 
+def copy_async(dst: int, src: int, nbytes: int, stream: int) -> None:
+    """Copy ``nbytes`` bytes of device memory from ``src`` to ``dst`` on ``stream`` (``cuMemcpyDtoDAsync``: stream-ordered, and a memcpy node of the
+    graph when the stream is being captured). The copy step of a launch plan."""
+    drv = _driver()
+    _check(drv.cuMemcpyDtoDAsync(drv.CUdeviceptr(dst), drv.CUdeviceptr(src), nbytes, drv.CUstream(stream)), "cuMemcpyDtoDAsync")
+
+
 def synchronize_stream(stream: int) -> None:
     """Wait on the host until the work enqueued on ``stream`` is done (``cuStreamSynchronize``)."""
     drv = _driver()

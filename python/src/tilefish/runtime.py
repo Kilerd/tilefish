@@ -436,7 +436,7 @@ def _finish_launch(extern: ExternOp, spec: CompileSpec, dims: "dict[Dim, int]", 
     check_dim_constraints(dims)
     check_scalar_ranges(spec, scalars)
     written = {p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in"}
-    check_no_alias(infos, written)
+    check_no_alias(infos, written, {p.name: p.alias for p in extern.signature.params if p.alias is not None})
     check_spec_preconditions(spec, infos, scalars, dims)
     assert extern.grid is not None
     return scalars, eval_grid(spec, extern.grid, dims)
@@ -843,10 +843,11 @@ def export(
 
 
 def _run_graph(op: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", mode: str, manifest: Any, pin: "str | None", trust_directory: bool) -> Any:
-    """``run`` of a ``@tilefish.graph``: its launch plan (:mod:`tilefish._plan`), run by :mod:`tilefish._planrun`. ``plan=`` and ``outputs=`` are the two
-    keywords that are not arguments of the graph (a graph with a parameter of those names takes it positionally)."""
+    """``run`` of a ``@tilefish.graph``: its launch plan (:mod:`tilefish._plan`), run by :mod:`tilefish._planrun`. ``plan=``, ``outputs=`` and ``taps=`` are the
+    three keywords that are not arguments of the graph (a graph with a parameter of those names takes it positionally)."""
     plan = kwargs.pop("plan", None)
     outputs = kwargs.pop("outputs", None)
+    taps = kwargs.pop("taps", None)
     if manifest is not None:
         raise TilefishRuntimeError("manifest= is for a kernel or an extern; a graph replays plan=<directory> (written by tilefish.runtime.export(graph, directory))")
     if mode != "replay" and (pin is not None or trust_directory):
@@ -857,7 +858,7 @@ def _run_graph(op: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", m
         raise TilefishRuntimeError(f"pin= is the 64 lowercase hex digits of a plan digest, got {pin!r}")
     from ._planrun import run_graph
 
-    return run_graph(op, args, kwargs, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, outputs=outputs)
+    return run_graph(op, args, kwargs, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, outputs=outputs, taps=taps)
 
 
 def capture(
@@ -871,6 +872,7 @@ def capture(
     devscalars: Any = None,
     outputs: Any = None,
     stream: Any = None,
+    taps: Any = None,
 ) -> Any:
     """Capture the launch plan of a ``@tilefish.graph`` in a CUDA graph of its own: a :class:`~tilefish._planrun.CapturedPlan`, whose ``replay(stream=None)``
     is ordered with every other run and replay of the plan, from any thread and on any stream (it takes the arena's lock and waits for and records the arena's
@@ -887,7 +889,7 @@ def capture(
     from ._planrun import capture as _capture
 
     return _capture(
-        op, externals, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, devscalars=devscalars, outputs=outputs, stream=stream
+        op, externals, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, devscalars=devscalars, outputs=outputs, stream=stream, taps=taps
     )
 
 
@@ -898,6 +900,17 @@ def prepare(op: GraphOp, **options: Any) -> None:
     from ._planrun import prepare as _prepare_plan
 
     _prepare_plan(op, **options)
+
+
+def run_step(op: GraphOp, step: int, buffers: Any, **options: Any) -> None:
+    """Launch one step of a graph's plan, with the binary and the binding of its arguments the (verified) plan says, on the caller's tensors:
+    ``run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest, bucket=None)``. ``buffers`` gives a tensor for every
+    buffer the step binds (by name; a returned value also as ``out<i>``; not the workspace, which is the plan's arena), each of the buffer's dtype and its
+    shape at the bucket, contiguous; the step reads and writes them through the views the plan gives it. ``bucket`` is found from the shapes when one
+    bucket fits them. A single-op replay under the plan's pin: see :func:`tilefish._planrun.run_step` and ``docs/plan-schema-1.md``, section 9."""
+    from ._planrun import run_step as _run_step
+
+    _run_step(op, step, buffers, **options)
 
 
 def run(
@@ -915,7 +928,10 @@ def run(
     ``op`` can be a ``@tilefish.graph``: ``jit`` runs its plan (``plan=tilefish.plan(graph, ...)`` or, by default, ``tilefish.plan(graph)``) with binaries built in
     memory, ``replay`` runs the plan of an exported directory (``plan=<directory>``, with ``pin=<the plan's digest>`` or ``trust_directory=True``: the plan
     pins its manifest, so it pins every binary), ``reference`` composes the references of its ops in torch. ``outputs=`` gives the tensors a plan writes its
-    returned values into instead of allocating them. See :mod:`tilefish._plan` and ``docs/plan-schema-1.md``.
+    returned values into instead of allocating them (a list in order, or a mapping by name). ``taps={"t3": tensor, ("t5", 4): tensor}`` copies buffers of the
+    plan into the caller's tensors right after a step (by default the last one that writes the buffer), to observe the intermediates of the very plan a
+    product runs: the plan and its digest are unchanged (``Plan.shape_of`` gives a buffer's shape at a bucket). See :mod:`tilefish._plan` and
+    ``docs/plan-schema-1.md``.
 
     ``op`` is a ``@tilefish.kernel`` (or its :class:`~tilefish.lower.LoweredKernel`) or an ``@tilefish.extern`` whose
     Triton function can be imported. ``mode`` is ``"jit"``, ``"replay"`` or ``"reference"``. ``manifest`` is the

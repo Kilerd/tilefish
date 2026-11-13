@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .dims import Dim, DimExpr, _CDiv, cdiv
 from .dtypes import ALL_DTYPES
@@ -417,7 +417,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     """Check one serialized argument. From schema 2 on a constexpr may carry its declared ``dtype``; from schema 3 a pointer
     may be strided (``strides`` and ``offset``), a scalar may carry a stride (``stride_of``) and be 64-bit, and a prebuilt
     binary has ``fixed`` arguments (a value written in the manifest)."""
-    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "shape_dims", "dim", "value", "count_of", "strides", "offset", "stride_of"])
+    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "shape_dims", "dim", "value", "count_of", "strides", "offset", "stride_of", "alias"])
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
     kind, ty = d["kind"], d["type"]
@@ -441,7 +441,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     if kind == "pointer" and schema >= DIGEST_SCHEMA:
         optional = {"shape_dims"}  # the declared shape: what a host binds the dimensions from
         if schema >= STRIDED_SCHEMA:
-            optional = {"shape_dims", "strides", "offset"}  # a pointer that accepts a strided view
+            optional = {"shape_dims", "strides", "offset", "alias"}  # a pointer that accepts a strided view; an Out that may be written over an input
     if not expected <= present <= expected | optional:
         bad(f"arg {d['name']} ({kind}) must have exactly the fields {sorted(expected)}, has {sorted(present)}")
     if ("strides" in d) != ("offset" in d):
@@ -562,6 +562,39 @@ def _check_strides(args: "list[dict]", by_name: "dict[str, dict]") -> None:
                 bad(f"the offset of '{a['name']}' must be the name of the offset dimension, got {a['offset']!r}")
 
 
+def check_alias_target(name: str, alias: Any, access: Any, by_name: "Mapping[str, Mapping[str, Any]]", shape_key: str = "shape") -> None:
+    """``alias`` on the pointer ``name``: it is on an ``out`` pointer, and names an ``in`` pointer that is not strided and not a device scalar, with the
+    pointer's dtype and declared shape (``shape_key``: ``shape_dims`` in a spec, ``shape`` in a manifest's ABI). Shared by the spec and the
+    manifest reader."""
+    if not isinstance(alias, str) or not _IDENT.match(alias):
+        bad(f"arg {name}: alias must be the name of a pointer argument, got {alias!r}")
+    if access != "out":
+        bad(f"arg {name}: only an out pointer may alias an input (it is {access!r})")
+    target = by_name.get(alias)
+    me = by_name[name]
+    if target is None or target.get("kind") != "pointer" or target.get("access") != "in":
+        bad(f"arg {name} may alias '{alias}', which is not an `in` pointer argument")
+    if "strides" in target or target.get(shape_key) == []:
+        bad(f"arg {name} may alias '{alias}', which is a strided view or a device scalar: an Out written over an input is that whole tensor")
+    if target.get("dtype") != me.get("dtype") or target.get(shape_key) != me.get(shape_key):
+        bad(
+            f"arg {name} may alias '{alias}', which has another dtype or declared shape ({target.get('dtype')!r} {target.get(shape_key)!r}, "
+            f"not {me.get('dtype')!r} {me.get(shape_key)!r})"
+        )
+
+
+def _check_aliases(args: "list[dict]", by_name: "dict[str, dict]") -> None:
+    """An ``out`` pointer that may be written over an ``in`` pointer (``alias``): see :func:`check_alias_target`; at most one names an input."""
+    taken: "dict[str, str]" = {}
+    for a in args:
+        if a["kind"] != "pointer" or "alias" not in a:
+            continue
+        check_alias_target(a["name"], a["alias"], a["access"], by_name, "shape_dims" if "shape_dims" in a else "shape")
+        if a["alias"] in taken:
+            bad(f"args {taken[a['alias']]} and {a['name']} both may alias '{a['alias']}': at most one out pointer is written over an input")
+        taken[a["alias"]] = a["name"]
+
+
 def validate_launch_param(d: Any) -> None:
     _keys(d, "launch parameter", ["name", "type"], ["value"])
     _ident(d["name"], "launch parameter name")
@@ -658,6 +691,8 @@ def validate_spec(d: Any) -> None:
             _check_count_of(a, by_name)
     # a scalar that carries a stride, and the strided pointer that says so: the two must agree on every axis
     _check_strides(args, by_name)
+    # an Out that may be written over an input, and that input
+    _check_aliases(args, by_name)
 
     # signature <=> args
     sig = d["signature"]

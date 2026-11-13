@@ -607,6 +607,13 @@ def _check_common(op: KernelOp) -> None:
                 f"{n} is a view operation, and strided views are not lowered: a lowered kernel takes and gives contiguous tensors. "
                 "Write the kernel over the tensor the view is of, or declare an extern with a Strided[...] parameter",
             )
+        if n.op == "copy":
+            raise _fail(
+                name,
+                None,
+                "copy",
+                f"{n} is tilefish.copy, a copy step of a graph's plan: in a kernel body a value is already its own (use it as it is)",
+            )
         for v in n.outputs:
             if not v.type.contiguous:
                 raise _fail(name, None, "view-value", f"{_label(v)} is a View; strided views are not lowered")

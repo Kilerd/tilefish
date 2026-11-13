@@ -2,9 +2,9 @@
 
     python export_plan_vectors.py ../../crates/tilefish/tests/data      # (export_rust_vectors.py writes it too)
 
-Each document is a ``plan.json`` text made from one of the golden plans (``golden/plans/block`` and ``block-reuse``) by one change: every mutation of
+Each document is a ``plan.json`` text made from one of the golden plans (``golden/plans/block``, ``block-reuse`` and ``steps``) by one change: every mutation of
 ``test_plan_schema.py`` (a field of the wrong type or value, a key missing or unknown, a view outside its buffer, overlapping regions, a step that is not
-what the manifest's entry says, a buffer read before it is written, ...), shape expressions that do and do not fold (``2*M//2`` is ``M``, ``M*M//M`` is
+what the manifest's entry says, a buffer read before it is written, copy steps of every kind, ...: on ``block`` and ``block-reuse``), shape expressions that do and do not fold (``2*M//2`` is ``M``, ``M*M//M`` is
 not an affine expression), texts that are not strict JSON, and a few hundred random changes of one leaf (seeded). Unless the change is to the digest
 itself, the ``plan_digest`` is computed again, so that what is held to is the format and not the digest. Each has ``accepted``: what Python's
 ``read_plan`` (with no pin) and ``check_against_manifest`` with the manifest of its directory decide. ``crates/tilefish/tests/launch_plans.rs``
@@ -24,7 +24,8 @@ from tilefish.errors import TilefishManifestError
 
 HERE = pathlib.Path(__file__).resolve().parent
 GOLDEN = HERE / "golden" / "plans"
-BASES = ("block", "block-reuse")
+BASES = ("block", "block-reuse")  # the bases of the mutations of the rules (their paths are the block's)
+RANDOM_BASES = {"block": 7, "block-reuse": 8, "steps": 9}  # the bases of the random changes of one leaf, and the seed of each
 JUNK = [None, True, False, 0, -1, 1, 2**70, 1.5, "", "x", "M", "M*M", "3*M", "(((", [], {}, [1], {"a": 1}, "sm_103", "0" * 64]
 
 
@@ -157,6 +158,7 @@ def mutations():
         ("a later bucket", setter(["buckets", 2, "steps", 0, "entry"], "nothing")),
         ("an output no step writes", lambda d: [b["steps"][8]["args"][2].update(binding="t0") for b in d["buckets"]]),
     ]
+    out += copy_mutations()
     # shape expressions: the same sizes, written so that Python's dimension algebra folds them (accepted) or cannot (refused)
     for text in ("2*M//2", "M + 0", "M*1", "(M+M)//2", "M//1", "cdiv(M, 1)", "cdiv(2*M, 2)", "M - M + M", "-(-M)", "cdiv(M, 2) * 2", "M*M//M",
                  "cdiv(M*M, M)", "M // 2 * 2", "M // 0", "cdiv(M, 0)", "M - 2*M + 2*M", "N", "M+N-N", "((M))", "M//2+M//2", "2*(M//2)", "M  "):
@@ -164,6 +166,71 @@ def mutations():
     for text in ("256", "2*128", "0+256", "M - M + 256", "cdiv(512, 2)", "513//2", "cdiv(511, 2)", "256*1*1", "-(-256)", "128 + 128 "):
         out.append((f"static shape {text!r}", setter(["buffers", 2, "shape"], [text])))
     return out
+
+
+def arg(name, binding, view=None):
+    out = {"name": name, "binding": binding}
+    if view is not None:
+        out["view"] = view
+    return out
+
+
+def copy_step(src, dst, *extra):
+    """A copy step made per bucket: ``src`` and ``dst`` are ``(binding, view(rows) or None)``; ``extra`` are more keys (refused)."""
+
+    def make(rows):
+        step = {"kind": "copy", "args": [arg("src", src[0], src[1] and src[1](rows)), arg("dst", dst[0], dst[1] and dst[1](rows))]}
+        for k, v in extra:
+            step[k] = v
+        return step
+
+    return make
+
+
+def with_step(make, at=None, buckets=None):
+    """Every bucket (or the ones of index in ``buckets``) gets the step ``make(M)``, appended or inserted at ``at``."""
+
+    def apply(doc):
+        for i, b in enumerate(doc["buckets"]):
+            if buckets is not None and i not in buckets:
+                continue
+            step = make(b["values"]["M"])
+            b["steps"].insert(len(b["steps"]) if at is None else at, step)
+
+    return apply
+
+
+def copy_mutations():
+    """Copy steps (``kind: "copy"``) added to the block's plan: valid ones (a whole buffer, a dense view, into an output, two runs of one
+    buffer apart), and every rule both readers hold one to: the fields, the two arguments in order, dense, one dtype and one count, no overlap
+    in one buffer, a destination a step may write, a source written before, the same step in every bucket."""
+    dense = lambda offset: lambda m: {"shape": [m, 256], "strides": [256, 1], "offset": offset(m)}  # noqa: E731
+    strided = lambda m: {"shape": [m, 256], "strides": [768, 1], "offset": 0}  # noqa: E731
+    whole = None
+    return [
+        ("copy of an input", with_step(copy_step(("x", whole), ("t0", whole)))),
+        ("copy into an output", with_step(copy_step(("t0", whole), ("out0", whole)))),
+        ("copy of a dense view", with_step(copy_step(("t1", dense(lambda m: 0)), ("t0", whole)))),
+        ("copy of a dense view at an offset", with_step(copy_step(("t1", dense(lambda m: 2 * m * 256)), ("t0", whole)))),
+        ("copy within a buffer, apart", with_step(copy_step(("t1", dense(lambda m: 0)), ("t1", dense(lambda m: m * 256))))),
+        ("copy within a buffer, overlapping", with_step(copy_step(("t1", dense(lambda m: 0)), ("t1", dense(lambda m: 128))))),
+        ("copy of a view that is not dense", with_step(copy_step(("t1", strided), ("t0", whole)))),
+        ("copy of another count", with_step(copy_step(("t1", whole), ("t0", whole)))),
+        ("copy of a device scalar", with_step(copy_step(("n", whole), ("t0", whole)))),
+        ("copy into an input", with_step(copy_step(("t0", whole), ("x", whole)))),
+        ("copy into a weight", with_step(copy_step(("t0", dense(lambda m: 0)), ("w_ln1", whole)))),
+        ("copy into a device scalar", with_step(copy_step(("x", whole), ("n", whole)))),
+        ("copy of the workspace", with_step(copy_step(("workspace", whole), ("t0", whole)))),
+        ("copy with an entry", with_step(copy_step(("x", whole), ("t0", whole), ("entry", "copy")))),
+        ("copy with a workspace", with_step(copy_step(("x", whole), ("t0", whole), ("workspace", "workspace")))),
+        ("copy with its arguments swapped", with_step(lambda m: {"kind": "copy", "args": [arg("dst", "t0"), arg("src", "x")]})),
+        ("copy with one argument", with_step(lambda m: {"kind": "copy", "args": [arg("src", "x")]})),
+        ("copy with three arguments", with_step(lambda m: {"kind": "copy", "args": [arg("src", "x"), arg("dst", "t0"), arg("dst2", "t1")]})),
+        ("copy reads before it is written", with_step(copy_step(("t8", whole), ("t0", whole)), at=0)),
+        ("copy writes before it is read", with_step(copy_step(("x", whole), ("t0", whole)), at=0)),
+        ("copy in one bucket only", with_step(copy_step(("x", whole), ("t0", whole)), buckets=[1])),
+        ("copy kind is not a string", with_step(lambda m: {"kind": ["copy"], "args": [arg("src", "x"), arg("dst", "t0")]})),
+    ]
 
 
 def leaves(node, path=()):
@@ -247,17 +314,17 @@ def documents():
     ``plan_digest`` computed again when ``rehash``) or ``"text"`` (``{"replace": [old, new] or null, "prefix", "suffix"}``, applied once to the base
     file's text)."""
     records = []
-    for base_name in BASES:
+    for base_name in RANDOM_BASES:
         directory = GOLDEN / base_name
         manifest = Manifest.load(directory)
         base_text = (directory / "plan.json").read_text()
         base = json.loads(base_text)
         made = []
-        for name, mutate in mutations():
+        for name, mutate in mutations() if base_name in BASES else ():
             doc = copy.deepcopy(base)
             mutate(doc)
             made.append((name, doc, False))
-        made += random_mutations(base, seed=7 if base_name == "block" else 8, count=300)
+        made += random_mutations(base, seed=RANDOM_BASES[base_name], count=300)
         for name, doc, keep_digest in made:
             ops = diff(base, doc)
             rehash = isinstance(doc, dict) and "plan_digest" in doc and not keep_digest

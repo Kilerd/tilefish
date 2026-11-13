@@ -17,7 +17,7 @@ No ``from __future__ import annotations``: tilefish evaluates annotations at dec
 import pathlib
 
 import tilefish
-from tilefish import DevScalar, Dim, InOut, Out, StrideOf, Strided, Tensor, bf16, const, f32, i32
+from tilefish import DevScalar, Dim, InOut, MayAlias, Out, StrideOf, Strided, Tensor, bf16, const, f32, i32
 
 D_MODEL, HEADS, D_HEAD, D_FF = 256, 4, 64, 1024
 BUCKETS = [32, 64, 128]
@@ -237,6 +237,31 @@ def prebuilt(x: Tensor[B, 64, f32], y: Tensor[B, 64, f32], w: Tensor[B, 128, bf1
     z = axpy(x.reshape(B * 64), y.reshape(B * 64))  # a prebuilt PTX with a fixed float argument, on views
     left, _ = w.split(64, axis=-1)  # a column block of w: a view with a row stride of 128
     return z, strided_copy(left)  # a prebuilt PTX with a 64-bit stride scalar
+
+
+# -- what M3.3 added to plans: a result written over its input, copy steps, a returned reshape, named outputs (the golden plan `steps`) -------------
+
+Rf = Dim("Rf", buckets=[8, 24])
+
+
+@tilefish.extern(triton="gpu_kernels_p5:add_into_kernel", num_warps=1, grid=lambda Rf: (Rf,), name="add_over")
+def add_over(
+    x: Tensor[Rf, 64, f32], r: Tensor[Rf, 64, f32], y: Out[Tensor[Rf, 64, f32]], r_out: Out[Tensor[Rf, 64, f32], MayAlias("r")], D: const = 64
+): ...
+
+
+@tilefish.kernel
+def flat_half(x: Tensor[Rf * 64, f32]) -> Tensor[Rf * 64, f32]:
+    return x * 0.5
+
+
+@tilefish.graph(outputs=("y", "half"))
+def steps(x: Tensor[2, Rf, 64, f32], state: InOut[Tensor[Rf, 64, f32]]):
+    r = tilefish.copy(x[1])  # a copy step: a dense view of x into the arena
+    y, r = add_over(x[0], r)  # r_out written over the copy: one buffer for r and r_out
+    state[...] = r  # a copy step into the caller's InOut tensor
+    half = flat_half(y.reshape(Rf * 64))
+    return y, half.reshape(Rf, 64)  # named outputs; the second all of a flat result in another shape (no copy)
 
 
 # the operators of the graph, in the order they are called (what a per-op eager run of the block calls)

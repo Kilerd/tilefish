@@ -167,7 +167,7 @@ _ARCH = re.compile(r"sm_[0-9]{2,3}", re.ASCII)  # `is_arch`
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)  # `is_digest`
 _U64_MAX = 2**64 - 1
 # every field a parameter of the ABI may have (`RawParam`), the ones it must have, and the width each scalar type is passed with
-_PARAM_FIELDS = frozenset("slot index name kind type ptx_type size dtype access shape dim count_of strides offset stride_of value".split())
+_PARAM_FIELDS = frozenset("slot index name kind type ptx_type size dtype access shape dim count_of strides offset stride_of value alias".split())
 _PARAM_REQUIRED = ("slot", "index", "name", "kind", "type", "ptx_type", "size")
 _PASSED_AS = {"scalar": {"i32": ("u32", 4), "i64": ("u64", 8)}, "fixed": {"i32": ("u32", 4), "i64": ("u64", 8), "f32": ("f32", 4)}}
 
@@ -256,7 +256,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
             if not _is_count(p[key], 0):
                 bad(f"parameter {name}: {key} must be an int >= 0, got {p[key]!r}")
         typed = (("kind", str), ("type", str), ("ptx_type", str), ("dtype", str), ("access", str), ("shape", list), ("dim", str))
-        for key, kind_of_value in (*typed, ("count_of", str), ("strides", list)):
+        for key, kind_of_value in (*typed, ("count_of", str), ("strides", list), ("alias", str)):
             if _has(p, key) and not isinstance(p[key], kind_of_value):
                 bad(f"parameter {name}: {key} must be a {kind_of_value.__name__}, got {p[key]!r}")
         if _has(p, "stride_of") and not isinstance(p["stride_of"], (dict, list)):
@@ -309,7 +309,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
             ptx, size = _PASSED_AS["scalar"][ty]
             if p["ptx_type"] != ptx or p["size"] != size:
                 bad(f"parameter {name}: an {ty} scalar is passed as a {ptx} of {size} bytes, got {p['ptx_type']} of {p['size']}")
-            extra = [k for k in ("dtype", "access", "shape", "strides", "offset", "value") if _has(p, k)]
+            extra = [k for k in ("dtype", "access", "shape", "strides", "offset", "value", "alias") if _has(p, k)]
             if extra:
                 bad(f"parameter {name} is a scalar: it has a dim and no dtype, access, shape, strides or value (it has {extra})")
             if _has(p, "count_of") and _has(p, "stride_of"):
@@ -335,7 +335,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
             ptx, size = _PASSED_AS["fixed"][ty]
             if p["ptx_type"] != ptx or p["size"] != size:
                 bad(f"parameter {name}: a fixed {ty} is passed as a {ptx} of {size} bytes, got {p['ptx_type']} of {p['size']}")
-            if any(_has(p, k) for k in ("dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "dtype")):
+            if any(_has(p, k) for k in ("dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "dtype", "alias")):
                 bad(f"parameter {name} is a fixed argument: it has a value and no dim or shape")
             value = p.get("value")
             if value is None:
@@ -352,6 +352,22 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
                 bad(f"parameter {name}: the value {value} does not fit {ty}")
         else:
             bad(f"parameter {name}: kind must be pointer, scalar or fixed, got {pkind!r}")
+    # an out pointer that may be written over an in pointer (`alias`, the Rust reader's `check_consistent`): that pointer is an `in` one, not strided and
+    # not a device scalar, of the same dtype and declared shape, and no other out pointer names it
+    from ._specvalid import check_alias_target
+
+    by_name = {p["name"]: {k: v for k, v in p.items() if v is not None} for p in params}
+    taken: "dict[str, str]" = {}
+    for p in params:
+        if not _has(p, "alias"):
+            continue
+        try:
+            check_alias_target(p["name"], p["alias"], p.get("access"), by_name)
+        except TilefishSpecError as e:
+            bad(str(e).removeprefix("malformed compile spec: "))
+        if p["alias"] in taken:
+            bad(f"the out pointers {taken[p['alias']]} and {p['name']} both may alias '{p['alias']}': at most one is written over an input")
+        taken[p["alias"]] = p["name"]
 
 
 def _check_dimension_names(who: str, entry: "dict[str, Any]") -> None:

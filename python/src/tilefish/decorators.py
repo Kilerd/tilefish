@@ -10,7 +10,7 @@ import pathlib
 import re
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .dims import DimExpr, as_dim
 from ._specvalid import MAX_ELEMENTS
@@ -276,13 +276,17 @@ def library(
 
 
 class GraphOp(Op):
-    """A model: ordinary Python over typed values, traced once at declaration."""
+    """A model: ordinary Python over typed values, traced once at declaration.
+
+    ``output_names`` are the names of its returned values, in order (``@tilefish.graph(outputs=("y", "residual"))``), or ``None``: a launch plan
+    names their buffers so (``out0``, ``out1``, ... otherwise), and a host binds the outputs by them."""
 
     kind = "graph"
 
-    def __init__(self, fn: Callable[..., Any], name: str, signature: Signature, graph: Graph) -> None:
+    def __init__(self, fn: Callable[..., Any], name: str, signature: Signature, graph: Graph, output_names: "tuple[str, ...] | None" = None) -> None:
         super().__init__(fn, name, signature)
         self.graph = graph
+        self.output_names = output_names
 
 
 class KernelOp(GraphOp):
@@ -331,12 +335,45 @@ def _check_decorator_arg(deco: str, fn: Any) -> None:
         )
 
 
-def graph(fn: Callable[..., Any] | None = None, *, name: str | None = None) -> Any:
-    """``@tilefish.graph``: trace and type-check a model body."""
+_OUTPUT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")  # ASCII: the name of a buffer of a plan
+
+
+def _declare_graph(fn: Callable[..., Any], name: str | None, outputs: Any) -> GraphOp:
+    names = None
+    nm = name or getattr(fn, "__name__", "?")
+    if outputs is not None:
+        if isinstance(outputs, (str, bytes)) or not isinstance(outputs, (list, tuple)):
+            raise TilefishDeclarationError(f"graph '{nm}': outputs= is a list of the names of the returned values, in order, got {outputs!r}")
+        names = tuple(outputs)
+        bad = [n for n in names if not isinstance(n, str) or not _OUTPUT_NAME.match(n)]
+        if bad:
+            raise TilefishDeclarationError(f"graph '{nm}': the output names must be ASCII identifiers (the names of a plan's buffers), got {bad!r}")
+        if len(set(names)) != len(names):
+            raise TilefishDeclarationError(f"graph '{nm}': an output name is given twice in {list(names)}")
+    op = _declare_traced(fn, name, GraphOp, "graph")
+    if names is not None:
+        returned = len(op.graph.outputs)
+        if len(names) != returned:
+            raise TilefishDeclarationError(f"graph '{op.name}': outputs= names {len(names)} value(s) ({', '.join(names)}), but the body returns {returned}")
+        taken = sorted(set(names) & {p.name for p in op.signature.params})
+        if taken:
+            raise TilefishDeclarationError(
+                f"graph '{op.name}': the output name(s) {taken} are names of parameters: a host binds the tensors of a call by name, so a returned value is "
+                "named apart from them"
+            )
+        op.output_names = names
+    return op
+
+
+def graph(fn: Callable[..., Any] | None = None, *, name: str | None = None, outputs: "Sequence[str] | None" = None) -> Any:
+    """``@tilefish.graph``: trace and type-check a model body.
+
+    ``outputs=("y", "residual")`` names the returned values, in order: a launch plan gives their buffers those names (instead of ``out0``,
+    ``out1``, ...), so that a host without Python binds them by name (``docs/plan-schema-1.md``, section 6)."""
     _check_decorator_arg("graph", fn)
     if fn is None:
-        return lambda f: _declare_traced(f, name, GraphOp, "graph")
-    return _declare_traced(fn, name, GraphOp, "graph")
+        return lambda f: _declare_graph(f, name, outputs)
+    return _declare_graph(fn, name, outputs)
 
 
 def kernel(
@@ -930,7 +967,9 @@ def extern(
         nm = name or fn.__name__
         if not _OP_NAME.fullmatch(nm):
             raise TilefishDeclarationError(f"extern: the function name {nm!r} is not a plain identifier; pass name=... to give the op one")
-        sig = parse_signature(fn, what="extern op", name=nm, allow_dim_const_defaults=not prebuilt, allow_strided=True, allow_output_dims=True)
+        sig = parse_signature(
+            fn, what="extern op", name=nm, allow_dim_const_defaults=not prebuilt, allow_strided=True, allow_output_dims=True, allow_alias=True
+        )
         if sig.returns:
             raise TilefishDeclarationError(
                 f"extern op '{nm}': {'a kernel' if prebuilt else 'a Triton kernel'} returns nothing; declare results as Out[...] parameters"

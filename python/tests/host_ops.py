@@ -13,7 +13,8 @@ kernels declared with ``tilefish.extern`` (an rmsnorm, an exact-erf gelu and an 
 
 and what M3.3 added (``gpu_kernels_p4.py``): ``fma_plain`` and ``fma_fused``, one hand-written kernel declared with ``enable_fp_fusion=False``
 and ``True``; ``qkv_sum`` and ``qkv_sum16``, a kernel that reads three views with one stride pair (``StrideOf(("q", "k", "v"), axis)``);
-``key_mask`` and ``key_mask_any``, a ``[B]`` mask made from a device scalar, whose ``B`` only the ``Out`` tensor determines.
+``key_mask`` and ``key_mask_any``, a ``[B]`` mask made from a device scalar, whose ``B`` only the ``Out`` tensor determines; and
+(``gpu_kernels_p5.py``) ``add_into``, an in-place kernel with two pointers whose ``Out`` may be written over an input (``MayAlias``).
 
 ``gpu_ops(directory, arch)`` is what needs the GPU toolchain to *declare*: the PTX of two lowered goldens taken from a Triton build
 (``gelu_ptx``, ``softmax_ptx``: the same machine code as the Triton path, declared as prebuilt externs with the Triton ABI's two scratch
@@ -106,6 +107,11 @@ def mm_kernels():
     return _with_triton("mm_kernels")
 
 
+def gpu_kernels_p5():
+    """The hand-written kernels of the plan features of M3.3 (``gpu_kernels_p5.py``)."""
+    return _with_triton("gpu_kernels_p5")
+
+
 def gpu_kernels_p4():
     """The hand-written kernels of the features of M3.3 (``gpu_kernels_p4.py``)."""
     return _with_triton("gpu_kernels_p4")
@@ -130,6 +136,7 @@ def ops():
     kernels = gpu_kernels()
     p1 = gpu_kernels_p1()
     p4 = gpu_kernels_p4()
+    p5 = gpu_kernels_p5()
     return {
         "softmax": softmax,
         "layernorm": layernorm,
@@ -162,6 +169,8 @@ def ops():
         # a dimension only the Out tensor determines (M3.3)
         "key_mask": p4.key_mask,
         "key_mask_any": p4.key_mask_any,
+        # an Out that may be written over an input (M3.3)
+        "add_into": p5.add_into,
     }
 
 

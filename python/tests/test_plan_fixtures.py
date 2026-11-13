@@ -44,11 +44,23 @@ def test_the_committed_fixtures_are_what_the_code_makes(committed, tmp_path):
 @pytest.mark.parametrize("name", list(fx.PLANS))
 def test_each_directory_loads_as_a_replay_loads_it(committed, name):
     e = committed[name]
-    loaded = _plan.load_plan(fx.DEFAULT / name, pm.block, pin=e["plan_digest"])
+    graph = getattr(pm, fx.PLANS[name][0])
+    loaded = _plan.load_plan(fx.DEFAULT / name, graph, pin=e["plan_digest"])
     assert loaded.digest == e["plan_digest"] and loaded.manifest_digest == e["manifest_digest"] and loaded.manifest.digest == e["manifest_digest"]
     assert loaded.arch == e["arch"] == "sm_103" and loaded.reuse is e["reuse"] and loaded.arena_bytes == e["arena_bytes"]
     assert {b["name"]: b["offset"] for b in loaded.buffers if b["offset"] is not None} == e["offsets"]
-    assert loaded.buckets() == e["buckets"] and len(loaded.steps(M=64)) == e["steps_per_bucket"] == 9
+    assert loaded.buckets() == e["buckets"] and len(loaded.steps(**loaded.buckets()[-1])) == e["steps_per_bucket"] == (4 if name == "steps" else 9)
+    assert loaded.outputs == e["outputs"] == (["y", "half"] if name == "steps" else ["out0"])
+
+
+def test_the_steps_plan_has_what_m3_3_added(committed):
+    loaded = _plan.load_plan(fx.DEFAULT / "steps", pm.steps, pin=committed["steps"]["plan_digest"])
+    steps = loaded.steps(Rf=24)
+    assert [s["kind"] for s in steps] == ["copy", "kernel", "copy", "kernel"]
+    over = {a["name"]: a["binding"] for a in steps[1]["args"]}
+    assert over["r"] == over["r_out"] == "t0"  # the result written over its input
+    assert [b["shape"] for b in loaded.buffers if b["name"] == "half"] == [["Rf", 64]] and "view" in steps[3]["args"][1]  # the returned reshape
+    assert loaded.output_buffer("out0") == "y" and loaded.output_buffer("out1") == "half" and loaded.output_buffer("out2") is None
 
 
 @pytest.mark.parametrize("name", list(fx.PLANS))

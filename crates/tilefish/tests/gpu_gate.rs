@@ -1361,6 +1361,51 @@ fn views_that_share_a_stride_must_all_have_it() {
     assert!(got.chunks(2).all(|b| b == want), "every element is 1 + 2 + 4 = 7 (bf16 {want:02x?})");
 }
 
+/// `add_into(x, r, y, r_out)` with `r_out: Out[..., MayAlias("r")]`: launched with one region for `r` and `r_out` (two tensors over one buffer, which
+/// only regions can be), it writes `r + x` over `r`; `r_out` over `r` shifted by a row is refused, and writes nothing.
+#[test]
+fn an_out_is_written_over_the_input_it_may_alias() {
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let s: &CudaStream = &gpu.stream;
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let kernel = manifest.kernel(&gpu.ctx, "add_into", &[], arch).unwrap();
+    let (rows, shape) = (8usize, [8usize, 64]);
+    let floats = |f: &dyn Fn(usize) -> f32| -> Vec<u8> { (0..rows * 64).flat_map(|i| f(i).to_le_bytes()).collect() };
+    let (x_host, r_host) = (floats(&|i| i as f32 * 0.25), floats(&|i| 1.0 + i as f32 * 0.5));
+    let x = gpu.upload(&x_host);
+    let r = gpu.upload(&[r_host.clone(), vec![0u8; 64 * 4]].concat()); // a row more than r, for a view of r shifted by a row
+    let y = gpu.zeros(rows * 64 * 4);
+    let bytes = (rows * 64 * 4) as u64;
+    // SAFETY: the buffers live to the end of the test and are used on the one stream; `r` is given twice on purpose (that is the feature).
+    let (xr, rr, rr_out, yr) = unsafe {
+        (
+            gpu.unbound_region(&x, bytes),
+            gpu.unbound_region(&r, bytes),
+            gpu.unbound_region(&r, bytes),
+            gpu.unbound_region(&y, bytes),
+        )
+    };
+    let arg = |region: DevicePtr<'static>, access| TensorArg::new(region, &shape, DType::F32, access).unwrap();
+    // r_out over r shifted by a row: an overlap that is not exactly r, refused before anything runs
+    // SAFETY: as above, rows 1 to 8 of `r`'s buffer, which has 9
+    let shifted = unsafe { DevicePtr::from_raw(r.slice.device_ptr(s).0 + 256, bytes, 0) };
+    let e = kernel
+        .launch(s, &mut [arg(xr, Access::In), arg(rr, Access::In), arg(yr, Access::InOut), arg(shifted, Access::InOut)])
+        .unwrap_err();
+    assert_eq!(e.precondition_kind(), Some(PreconditionKind::Alias), "{e}");
+    assert!(e.to_string().contains("only as exactly that tensor"), "{e}");
+    assert!(gpu.download(&y).iter().all(|b| *b == 0), "a refused launch writes nothing");
+    // r_out exactly r: launched, the sum written over r
+    kernel
+        .launch(s, &mut [arg(xr, Access::In), arg(rr, Access::In), arg(yr, Access::InOut), arg(rr_out, Access::InOut)])
+        .unwrap();
+    let f32s = |b: &[u8]| b.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<f32>>();
+    let (xs, rs) = (f32s(&x_host), f32s(&r_host));
+    let want_r: Vec<f32> = rs.iter().zip(&xs).map(|(a, b)| a + b).collect();
+    assert_eq!(f32s(&gpu.download(&r))[..rows * 64], want_r[..], "r_out = r + x, over r");
+    assert_eq!(f32s(&gpu.download(&y)), want_r.iter().map(|v| v * 0.5).collect::<Vec<_>>(), "y = 0.5 * r_out");
+}
+
 /// A copy of the gate's manifest directory in a fresh temporary directory.
 fn copy_of_the_manifest(name: &str) -> PathBuf {
     let dir = gate_dir().join(cases()["manifest"].as_str().unwrap());

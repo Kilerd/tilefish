@@ -19,10 +19,12 @@ of the manifest it was built against, so a pin of the plan digest pins every bin
 Triton and no GPU. :mod:`tilefish._planrun` runs a plan.
 
 What a plan accepts. A graph body is calls to declared operators (``kernel``, ``extern``, ``library`` with an ``impl``) and views. A traced
-arithmetic op in the graph body (``x + y``, a cast, a reduction), a ``store``, a call to another ``graph``, a ``Dim`` parameter and an ``Out``
-parameter are refused with the rule that says so (wrap arithmetic in a ``@tilefish.kernel``; a graph's results are its returned values). An in-place
+arithmetic op in the graph body (``x + y``, a cast, a reduction), a call to another ``graph``, a ``Dim`` parameter and an ``Out``
+parameter are refused with the rule that says so (wrap arithmetic in a ``@tilefish.kernel``; a graph's results are its returned values); ``tilefish.copy``
+and a ``store`` into an ``InOut`` parameter are copy steps (a device-to-device copy of dense bytes). An in-place
 call (``InOut``) must take a whole buffer, not a view of another tensor (the IR says a chunk that is updated does not change its parent; a plan
-has no copy to make that true). A returned value must be a fresh buffer made by a call: not an input, and not a view.
+has no copy to make that true). A returned value is the buffer a call made (all of it, in any shape: a reshape costs nothing), or a copy step at the end
+copies it (a dense view, a parameter, a value returned twice); a view that is not dense is refused.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ import json
 import math
 import pathlib
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 from . import _specvalid as sv
@@ -78,7 +80,8 @@ WRITABLE_ROLES = ("intermediate", "output", "inout")  # what a step may write
 TOP_KEYS = "schema tilefish graph arch manifest_digest dims reuse arena_alignment arena_bytes buffers outputs buckets plan_digest".split()
 BUFFER_KEYS = "name role dtype shape offset bytes".split()
 STEP_KEYS = "entry kind args".split()
-KINDS = ("kernel", "library")
+KINDS = ("kernel", "library", "copy")
+COPY_KEYS = "kind args".split()  # a copy step has no entry (it launches no binary) and no workspace
 _VIEW_OPS = ("reshape", "permute", "select", "split")
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _ARCH = re.compile(r"sm_[0-9]{2,3}\Z")
@@ -215,11 +218,12 @@ class _Arg:
 
 @dataclass
 class _SymStep:
-    callee: Callee
+    callee: "Callee | None"  # None for a copy step
     args: "list[_Arg]"
     what: str  # for messages: "the call to 'rmsnorm' (node #3)"
     library: bool = False
     consts: "dict[str, Any] | None" = None  # the compile-time arguments the call gave a value other than the declared default: a binary cannot take them
+    copy: bool = False  # a copy step (tilefish.copy, or a store into an InOut parameter): args src and dst, no binary
 
 
 @dataclass
@@ -249,6 +253,79 @@ def _layout(graph: str, what: str, t: Any) -> "tuple[tuple[DimExpr, ...], DimExp
     return tuple(strides), t.offset  # type: ignore[arg-type]
 
 
+_RETURNED = 1 << 62  # the "last use" of a value the graph returns: after every node
+
+
+def _storage_uses(g: Any) -> "tuple[dict[Value, Value], dict[Value, int]]":
+    """``(root, last)``: the *storage root* of every value of the graph (a view and a new version of an in-place update or a store share the storage of
+    the value they come from; anything else is its own root), and for every root the index of the last node that reads a value of that storage
+    (:data:`_RETURNED` for one the graph returns). What an in-place write needs to know: a value whose storage nothing reads after a call may be written
+    over by that call (``Out[..., MayAlias(...)]``)."""
+    root: "dict[Value, Value]" = {}
+    last: "dict[Value, int]" = {}
+
+    def of(v: Value) -> Value:
+        return root.get(v, v)
+
+    for i, n in enumerate(g.nodes):
+        for x in n.inputs:
+            if isinstance(x, Value):
+                last[of(x)] = i
+        kind = n.attrs.get("kind")
+        if kind is None and n.op in _VIEW_OPS:
+            for o in n.outputs:
+                root[o] = of(n.inputs[0])  # type: ignore[arg-type]
+        elif kind is None and n.op == "store":
+            for o in n.outputs:  # the new version of the parameter stored into
+                root[o] = of(n.inputs[0])  # type: ignore[arg-type]
+        elif kind in ("kernel", "extern", "library") and n.callee is not None:
+            try:
+                public = callee_of(n.callee).public
+            except TilefishError:  # the walk refuses the call, with its own message
+                continue
+            n_new = len(public.returns) + len(public.tensor_outputs)
+            inout_inputs = [v for p, v in zip(public.tensor_inputs, n.inputs) if p.access == "inout"]
+            for version, consumed in zip(n.outputs[n_new:], inout_inputs):
+                root[version] = of(consumed)  # type: ignore[arg-type]
+    for v in g.outputs:
+        last[of(v)] = _RETURNED
+    return root, last
+
+
+def _whole_reshape(l: _Loc) -> bool:
+    """Whether a view is all of its buffer in another shape: offset 0, the row-major strides of its shape, and provably as many elements as the buffer
+    (a reshape of a whole tensor). Returning one costs nothing: the buffer is the caller's output, in the returned shape."""
+    from .ops import _same_count
+
+    if not (l.offset.folded().is_static and l.offset.folded().value == 0):
+        return False
+    dense = row_major_strides(l.shape)
+    if any(d is None for d in dense) or any(s.folded() != d.folded() for s, d in zip(l.strides, dense) if d is not None):  # type: ignore[union-attr]
+        return False
+    return _same_count(tuple(l.shape), tuple(l.buffer.shape))
+
+
+def _in_place(
+    p: Any, ins: "Mapping[str, Value]", loc: "Mapping[Value, _Loc]", roots: "Mapping[Value, Value]", last_use: "Mapping[Value, int]", n: Any, index: int
+) -> "_Loc | None":
+    """Where the ``Out`` parameter ``p`` of the call ``n`` (node ``index``) is written when it may be written over an input (``MayAlias``): that input's
+    location, if writing there changes no value the graph reads, else ``None`` (a buffer of its own). In place when the input is a whole intermediate
+    at its current version (made by a call of this graph: not a parameter, which is the caller's, and not a view), no later node reads its storage
+    (a view of it, a version of it, or the graph's return), and no other argument of this call is in that storage."""
+    if p.alias is None:
+        return None
+    value = ins[p.alias]
+    src = loc[value]
+    if not src.whole or src.buffer.role != "intermediate" or src.version != src.buffer.version:
+        return None
+    root = roots.get(value, value)
+    if last_use.get(root, -1) != index:
+        return None
+    if sum(1 for x in n.inputs if isinstance(x, Value) and roots.get(x, x) is root) != 1:
+        return None
+    return src
+
+
 def _walk(gop: GraphOp) -> _Walk:
     g = gop.graph
     name = g.name
@@ -256,6 +333,7 @@ def _walk(gop: GraphOp) -> _Walk:
     buffers: "list[_Buffer]" = []
     loc: "dict[Value, _Loc]" = {}
     steps: "list[_SymStep]" = []
+    roots, last_use = _storage_uses(g)
 
     def new_buffer(role: str, dtype: Any, shape: "tuple[DimExpr, ...]", name_: str) -> _Buffer:
         try:
@@ -316,8 +394,30 @@ def _walk(gop: GraphOp) -> _Walk:
                     strides, offset = _layout(name, f"the view {out.ref} made by {n.op} (node #{index})", out.type)
                     loc[out] = _Loc(parent.buffer, tuple(out.type.shape), strides, offset, False, parent.version)
                 continue
-            if n.op == "store":
-                _fail(name, f"{where} stores into the parameter '{n.attrs.get('target')}': a store is a copy, which a plan has no launch for; the last op should produce the value (return it)")
+            if n.op in ("copy", "store"):
+                value = n.inputs[0] if n.op == "copy" else n.inputs[1]
+                src = loc[value]  # type: ignore[index]
+                if src.version != src.buffer.version:
+                    _fail(
+                        name,
+                        f"{where} copies {value.ref} ({value.type}), a view of a tensor that was updated in place after the view was made: the IR gives a "  # type: ignore[union-attr]
+                        "view the contents its tensor had then, but a view shares the storage. Take the view from the updated version (its .live)",
+                    )
+                if n.op == "copy":
+                    dst = loc[n.outputs[0]] = fresh(n.outputs[0])
+                else:
+                    current = loc[n.inputs[0]]  # type: ignore[index]
+                    if value is n.inputs[0]:  # `x[...] = x`: a copy onto itself, no step
+                        loc[n.outputs[0]] = current
+                        continue
+                    if src.buffer is current.buffer:
+                        _fail(name, f"{where} stores a view of '{n.attrs.get('target')}' into it: the source and the destination of a copy overlap")
+                    dst = current
+                steps.append(_SymStep(None, [_Arg("src", src, "in"), _Arg("dst", dst, "out")], where, copy=True))  # type: ignore[arg-type]
+                if n.op == "store":
+                    dst.buffer.version += 1
+                    loc[n.outputs[0]] = replace(dst, version=dst.buffer.version)
+                continue
             _fail(
                 name,
                 f"{where} is arithmetic traced in the graph body, which a plan cannot launch (there is no kernel for it): put it in a "
@@ -342,8 +442,15 @@ def _walk(gop: GraphOp) -> _Walk:
         n_ret, n_out = len(sig_op.returns), len(sig_op.tensor_outputs)
         returned, outs, inouts = n.outputs[:n_ret], n.outputs[n_ret : n_ret + n_out], n.outputs[n_ret + n_out :]
         out_locs: "dict[Value, _Loc]" = {}
-        for o in (*returned, *outs):
+        for o in returned:
             out_locs[o] = loc[o] = fresh(o)
+        for p, o in zip(sig_op.tensor_outputs, outs):
+            over = _in_place(p, ins, loc, roots, last_use, n, index)
+            if over is not None:  # Out[..., MayAlias(r)]: the result is written over r, whose storage nothing reads after this call
+                over.buffer.version += 1
+                out_locs[o] = loc[o] = replace(over, version=over.buffer.version)
+            else:
+                out_locs[o] = loc[o] = fresh(o)
         for p, version in zip((p for p in sig_op.tensor_inputs if p.access == "inout"), inouts):
             src = loc[ins[p.name]]
             if not src.whole:
@@ -382,17 +489,30 @@ def _walk(gop: GraphOp) -> _Walk:
     outputs: "list[_Buffer]" = []
     for i, v in enumerate(g.outputs):
         l = loc[v]
-        if any(l.buffer is o for o in outputs):
-            _fail(name, f"the returned value {v.ref} is returned twice (a plan writes each result into one buffer of the caller's)")
-        if not l.whole or l.buffer.role != "intermediate":
-            why = "a view" if not l.whole else f"the {l.buffer.role} '{l.buffer.name}'"
+        if l.version != l.buffer.version:
             _fail(
                 name,
-                f"the returned value {v.ref} ({v.type}) is {why}, not a tensor that a call made: a plan writes a result into a buffer the caller provides, "
-                "and has no copy to put an input or a view there; have an op produce it",
+                f"the returned value {v.ref} ({v.type}) is a view of a tensor that was updated in place after the view was made: the IR gives a view the "
+                "contents its tensor had then, but a view shares the storage. Return the view of the updated version (its .live)",
             )
-        l.buffer.role = "output"
-        outputs.append(l.buffer)
+        if l.buffer.role == "devscalar":
+            _fail(name, f"the returned value {v.ref} is the DevScalar '{l.buffer.name}', one element the host writes: return a tensor an op made from it")
+        made = l.buffer.role == "intermediate" and not any(l.buffer is o for o in outputs)
+        if made and l.whole:  # a tensor a call made: the caller's output buffer is where the call writes it
+            l.buffer.role = "output"
+            outputs.append(l.buffer)
+        elif made and _whole_reshape(l):  # a dense view of all of it from its first element (a reshape): the same bytes in the returned shape
+            l.buffer.shape = tuple(v.type.shape)
+            l.buffer.role = "output"
+            outputs.append(l.buffer)
+        else:  # a parameter, a part of a tensor, a value returned twice: a copy step at the end into a buffer of the caller's
+            out = new_buffer("output", v.type.dtype, tuple(v.type.shape), "")
+            strides = row_major_strides(v.type.shape)
+            if any(s is None for s in strides):
+                _fail(name, f"the returned value {v.ref} has the type {v.type}, whose strides are not affine expressions, so it cannot be planned")
+            dst = _Loc(out, tuple(v.type.shape), tuple(strides), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
+            steps.append(_SymStep(None, [_Arg("src", l, "in"), _Arg("dst", dst, "out")], f"the return of {v.ref} ({v.type})", copy=True))
+            outputs.append(out)
     if any(s.library for s in steps):
         words = max(s.callee.op.workspace_bytes for s in steps if s.library)
         ws = _Buffer("", "workspace", "u8", (DimExpr.const(words),), len(buffers))
@@ -401,9 +521,10 @@ def _walk(gop: GraphOp) -> _Walk:
     return _Walk(buffers, steps, outputs, dims)
 
 
-def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]") -> None:
-    """Names: a parameter keeps its own, the returned values are ``out0``, ``out1``, ... in the order the graph returns them, the rest ``t0``,
-    ``t1``, ... in the order they are made, and the workspace ``workspace`` (a name that a parameter already has gets underscores)."""
+def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]", names: "Sequence[str] | None" = None) -> None:
+    """Names: a parameter keeps its own, the returned values the names the graph gives them (``@tilefish.graph(outputs=...)``) or ``out0``, ``out1``,
+    ... in the order the graph returns them, the rest ``t0``, ``t1``, ... in the order they are made, and the workspace ``workspace`` (a name that a
+    parameter or a returned value already has gets underscores)."""
     used = {b.name for b in buffers if b.name}
 
     def unique(base: str) -> str:
@@ -413,7 +534,7 @@ def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]") -> Non
         return base
 
     for i, b in enumerate(outputs):
-        b.name = unique(f"out{i}")
+        b.name = unique(names[i] if names is not None else f"out{i}")
     count = 0
     for b in buffers:
         if b.name:
@@ -423,6 +544,23 @@ def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]") -> Non
         else:
             b.name = unique(f"t{count}")
             count += 1
+
+
+_LEGACY_OUTPUT = re.compile(r"out(0|[1-9][0-9]*)\Z")
+
+
+def output_buffer(doc: "Mapping[str, Any]", name: Any) -> "str | None":
+    """The buffer of the returned value a host calls ``name``: its own name, or ``out<i>`` for the ``i``-th returned value whatever its name (the name
+    every returned value had before a graph could name them), when no buffer of the plan is called ``out<i>``. ``None`` when it is neither."""
+    outs = doc["outputs"]
+    if not isinstance(name, str):
+        return None
+    if name in outs:
+        return name
+    m = _LEGACY_OUTPUT.match(name)
+    if m is not None and int(m.group(1)) < len(outs) and all(b["name"] != name for b in doc["buffers"]):
+        return outs[int(m.group(1))]
+    return None
 
 
 # -- the dimensions and their buckets -------------------------------------------------------------------------------------------------
@@ -508,6 +646,43 @@ def _contiguous(shape: "Sequence[int]", strides: "Sequence[int]") -> bool:
     return True
 
 
+# -- a copy step -------------------------------------------------------------------------------------------------------------------------
+
+COPY_ARGS = ("src", "dst")
+
+
+def copy_view(a: "Mapping[str, Any]", shapes: "Mapping[str, tuple[str, tuple[int, ...]]]") -> "tuple[tuple[int, ...], tuple[int, ...], int]":
+    """``(shape, strides, offset)`` in elements of the argument ``a`` of a step at a bucket: its view, or the whole buffer."""
+    _, bshape = shapes[a["binding"]]
+    v = a.get("view")
+    if v is None:
+        return tuple(bshape), _row_major(bshape), 0
+    return tuple(v["shape"]), tuple(v["strides"]), v["offset"]
+
+
+def copy_problem(args: "Sequence[Mapping[str, Any]]", shapes: "Mapping[str, tuple[str, tuple[int, ...]]]") -> "str | None":
+    """What is wrong with the arguments of a copy step at a bucket (``None``: nothing): exactly ``src`` then ``dst``, each a dense tensor (the whole
+    buffer or a view whose axes of a size other than 1 have the row-major strides: one run of bytes), of one dtype and one number of elements, and,
+    in one buffer, not overlapping. ``shapes`` are the buffers' ``(dtype, shape)`` at the bucket."""
+    if [a.get("name") for a in args] != list(COPY_ARGS):
+        return f"a copy step has the arguments {list(COPY_ARGS)}, in that order, got {[a.get('name') for a in args]}"
+    runs = []
+    for a in args:
+        shape, strides, offset = copy_view(a, shapes)
+        if not _contiguous(shape, strides):
+            return (
+                f"the {a['name']} of a copy is a view of '{a['binding']}' with the shape {list(shape)} and the strides {list(strides)}, which is not dense: "
+                "a copy step copies one run of bytes (compute a view that is not dense with an operator)"
+            )
+        runs.append((shapes[a["binding"]][0], math.prod(shape), offset))
+    (sd, sn, so), (dd, dn, do) = runs
+    if sd != dd or sn != dn:
+        return f"a copy step copies {sn} {sd} elements into {dn} {dd} elements: the dtype and the number of elements must be the same"
+    if args[0]["binding"] == args[1]["binding"] and so < do + dn and do < so + sn:
+        return f"the source and the destination of a copy step overlap in '{args[0]['binding']}'"
+    return None
+
+
 # -- binding one step at one bucket ----------------------------------------------------------------------------------------------------
 
 
@@ -527,6 +702,7 @@ class Bound:
     offsets: "tuple[int, ...]"  # the byte offset of each in its buffer
     infos: "dict[str, TensorInfo]"
     written: "frozenset[str]"
+    aliases: "Mapping[str, str]" = field(default_factory=dict)  # an Out that may be written over an input (MayAlias) -> that input
 
     @property
     def stem(self) -> str:
@@ -540,7 +716,7 @@ class Bound:
             check_no_alias(real, {"out"})
             check_spec_preconditions(self.spec, real, {}, self.dims)
         else:
-            check_no_alias(real, self.written)
+            check_no_alias(real, self.written, self.aliases)
             check_spec_preconditions(self.spec, real, self.scalars, self.dims)
         return real
 
@@ -626,7 +802,8 @@ def resolve_step(
 
         scalars, grid = _finish_launch(extern, spec, dims, infos)
         written = frozenset(p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in")
-        return Bound(callee, spec, dims, scalars, grid, tuple(names), tuple(bindings), tuple(offsets), infos, written)
+        aliases = {p.name: p.alias for p in extern.signature.params if p.alias is not None}
+        return Bound(callee, spec, dims, scalars, grid, tuple(names), tuple(bindings), tuple(offsets), infos, written, aliases)
     except TilefishPreconditionError as e:
         raise TilefishPreconditionError(f"{where}: {e}", kind=e.kind, arg=e.arg) from None
 
@@ -753,8 +930,21 @@ class Plan:
 
     @property
     def outputs(self) -> "list[str]":
-        """The names of the buffers the graph returns, in the order it returns them."""
+        """The names of the buffers the graph returns, in the order it returns them (the graph's names, ``@tilefish.graph(outputs=...)``, or ``out0``, ...)."""
         return list(self._doc["outputs"])
+
+    def output_buffer(self, name: str) -> "str | None":
+        """The buffer of the returned value ``name``: its own name, or ``out<i>`` for the ``i``-th (:func:`output_buffer`)."""
+        return output_buffer(self._doc, name)
+
+    def shape_of(self, name: str, **values: int) -> "tuple[int, ...]":
+        """The shape of the buffer ``name`` at the bucket ``values`` (``plan.shape_of("t3", M=64)``): what a tap of it (``taps=``) is given; its dtype
+        is in :attr:`buffers`."""
+        buffer = name if any(b["name"] == name for b in self._doc["buffers"]) else self.output_buffer(name)
+        if buffer is None:
+            raise TilefishPlanError(f"the plan of graph '{self.name}' has no buffer '{name}'")
+        self.steps(**values)  # the bucket must be one of the plan's
+        return buffer_shapes(self._doc, values)[buffer][1]
 
     def buckets(self) -> "list[dict[str, int]]":
         """The bucket combinations that have steps, in the order of the document."""
@@ -785,7 +975,7 @@ class Plan:
         lines.append(f"steps at {last['values'] or 'the only size'}:")
         for i, st in enumerate(last["steps"]):
             args = ", ".join(a["binding"] + ("[view]" if "view" in a else "") for a in st["args"])
-            lines.append(f"  #{i} {st['entry']} ({st['kind']}): {args}")
+            lines.append(f"  #{i} {st.get('entry', 'copy')} ({st['kind']}): {args}")
         return "\n".join(lines)
 
     # -- what a runner needs ----------------------------------------------------------------------------------------------------
@@ -852,7 +1042,7 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
         raise TilefishPlanError(f"reuse= is True or False, got {reuse!r}")
     name = graph.graph.name
     w = _walk(graph)
-    _name_buffers(w.buffers, w.outputs)
+    _name_buffers(w.buffers, w.outputs, graph.output_names)
     dims = _bucket_values(name, w.dims, buckets)
     count = math.prod(len(v) for v in dims.values())
     if count > MAX_BUCKETS:
@@ -897,6 +1087,13 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
                 if not (offset == 0 and shape == bshape and strides == _row_major(bshape)):
                     entry["view"] = {"shape": list(shape), "strides": list(strides), "offset": offset}
                 args_doc.append(entry)
+            if s.copy:  # a copy step: the dense bytes of src into dst (no binary, no manifest entry)
+                problem = copy_problem(args_doc, shapes)
+                if problem is not None:
+                    raise TilefishPlanError(f"graph '{name}' at {combo or 'its only size'}, {s.what}: {problem}")
+                steps_doc.append({"kind": "copy", "args": args_doc})
+                continue
+            assert s.callee is not None
             bound = resolve_step(s.callee, args_doc, shapes, f"graph '{name}' at {combo or 'its only size'}, {s.what}")
             if s.consts and s.callee.kind == "kernel":  # a constexpr is compiled into the binary: a call may restate its value, not change it (as for a single launch)
                 try:
@@ -989,6 +1186,8 @@ def _check_resolves(p: Plan) -> None:
     for b in doc["buckets"]:
         shapes = buffer_shapes(doc, b["values"])
         for i, st in enumerate(b["steps"]):
+            if st["kind"] == "copy":  # no binary: copy_problem held it to its rules when it was made
+                continue
             callee = p._callees[st["entry"]]
             bound = resolve_step(callee, st["args"], shapes, f"graph '{doc['graph']}' at {b['values'] or 'its only size'}, step #{i}")
             if bound.stem != st["entry"]:  # pragma: no cover - the entry was taken from this very resolution
@@ -1160,9 +1359,13 @@ def _validate(doc: Any, made: bool = False) -> None:
         shape_of = {n: s for n, (_, s) in shapes.items()}
         this: "list[Any]" = []
         for si, st in enumerate(steps):
-            _keys(st, f"step #{si}", STEP_KEYS, ["workspace"])
-            if not isinstance(st["entry"], str) or not sv._STEM.match(st["entry"]):
-                _bad(f"step #{si}: entry must be a manifest stem such as 'gemm.M64', got {st['entry']!r}")
+            is_copy = isinstance(st, dict) and type(st.get("kind")) is str and st.get("kind") == "copy"
+            if is_copy:  # a copy step: no entry, no workspace
+                _keys(st, f"step #{si}", COPY_KEYS)
+            else:
+                _keys(st, f"step #{si}", STEP_KEYS, ["workspace"])
+                if not isinstance(st["entry"], str) or not sv._STEM.match(st["entry"]):
+                    _bad(f"step #{si}: entry must be a manifest stem such as 'gemm.M64', got {st['entry']!r}")
             if st["kind"] not in KINDS or type(st["kind"]) is not str:
                 _bad(f"step #{si}: kind must be one of {list(KINDS)}, got {st['kind']!r}")
             if (st["kind"] == "library") != ("workspace" in st):
@@ -1203,6 +1406,13 @@ def _validate(doc: Any, made: bool = False) -> None:
                         _bad(f"step #{si} args[{ai}]: a devscalar is bound whole, without a view")
             if len({a for a, _ in names_here}) != len(names_here):
                 _bad(f"step #{si}: the argument names must be distinct, got {[a for a, _ in names_here]}")
+            if is_copy:  # src then dst, dense, one dtype and one count, not overlapping; dst a buffer a step may write
+                problem = copy_problem(st["args"], shapes)
+                if problem is not None:
+                    _bad(f"step #{si} at {bucket['values']}: {problem}")
+                dst = by_name[st["args"][1]["binding"]]
+                if dst["role"] not in WRITABLE_ROLES:
+                    _bad(f"step #{si}: a copy step writes '{dst['name']}', whose role is {dst['role']}")
             this.append((st["kind"], st.get("workspace"), tuple(names_here)))
             if bi == 0:
                 for a in st["args"]:
@@ -1270,6 +1480,12 @@ def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
     for bucket in doc["buckets"]:
         written: "set[str]" = {b["name"] for b in doc["buffers"] if b["role"] in ("input", "weight", "inout", "devscalar")}  # provided by the caller / the host
         for si, st in enumerate(bucket["steps"]):
+            if st["kind"] == "copy":  # no entry: it reads src and writes dst (validate_doc held it to its rules)
+                src, dst = (a["binding"] for a in st["args"])
+                if src not in written:
+                    _bad(f"step #{si} (copy) of bucket {bucket['values']}: argument 'src' reads '{src}' before any step has written it")
+                written.add(dst)
+                continue
             stem = st["entry"]
             where = f"step #{si} ({stem}) of bucket {bucket['values']}"
             if st["kind"] == "kernel":

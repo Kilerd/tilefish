@@ -521,6 +521,103 @@ fn an_out_dimension_that_is_an_expression_is_solved_from_the_out_tensor() {
     assert!(e.to_string().contains("would need B = 7/2"), "{e}");
 }
 
+// -- an Out that may be written over an input --------------------------------------------------------------------------------------
+
+/// `add_into(x: Tensor[R, 64, f32], r: Tensor[R, 64, f32], y: Out[...], r_out: Out[Tensor[R, 64, f32], MayAlias("r")])`, with `change` applied
+/// to its parameters.
+fn add_into(change: impl FnOnce(&mut Vec<Value>)) -> Kernel {
+    let mut params = vec![
+        pointer(0, "x", "f32", "in", json!(["R", 64]), None),
+        pointer(1, "r", "f32", "in", json!(["R", 64]), None),
+        pointer(2, "y", "f32", "out", json!(["R", 64]), None),
+        pointer(3, "r_out", "f32", "out", json!(["R", 64]), None),
+    ];
+    params[3]["alias"] = json!("r");
+    change(&mut params);
+    Kernel::new(
+        "triton",
+        "add_into",
+        103,
+        params,
+        (0..4).map(|i| alignment(i, ["x", "r", "y", "r_out"][i], 16)).collect(),
+        json!({"R": {}}),
+        "(R,)",
+    )
+}
+
+const R: u64 = 0x7200_0000_0000;
+const W: u64 = 0x7300_0000_0000;
+
+#[test]
+fn an_out_that_may_alias_an_input_is_given_exactly_that_tensor_and_overlaps_nothing_else() {
+    let manifest = read(&[add_into(|_| {})], &[]).unwrap();
+    let entry = manifest.entry("add_into", "sm_103").unwrap();
+    assert!(matches!(&entry.params[3].kind, ParamKind::Pointer { alias: Some(a), .. } if a == "r"));
+    assert!(matches!(&entry.params[2].kind, ParamKind::Pointer { alias: None, .. }));
+    let plan = plan_of(&manifest, "add_into");
+    let shape = [8usize, 64];
+    let call = |x: u64, r: u64, y: u64, r_out: u64| {
+        plan.prepare(
+            &[
+                dense(x, &shape, DType::F32, Access::In),
+                dense(r, &shape, DType::F32, Access::In),
+                dense(y, &shape, DType::F32, Access::InOut),
+                dense(r_out, &shape, DType::F32, Access::InOut),
+            ],
+            None,
+        )
+    };
+    // r_out in r's memory: exactly that tensor, accepted (the pointers are passed as they are)
+    let p = call(X, R, Y, R).unwrap();
+    assert_eq!(&p.params()[..4], [X, R, Y, R]);
+    assert!(call(X, R, Y, W).is_ok());
+    // r_out over r but shifted by one row: an overlap, refused
+    let e = call(X, R, Y, R + 256).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::Alias, "{e}");
+    assert!(e.to_string().contains("only as exactly that tensor"), "{e}");
+    // y over r (no declaration says it may), r_out over x (not the input it names): refused
+    for (y, r_out, written, other) in [(R, W, "y", "r"), (Y, X, "r_out", "x")] {
+        let e = call(X, R, y, r_out).unwrap_err();
+        assert_eq!(kind(&e), PreconditionKind::Alias, "{e}");
+        assert!(
+            e.to_string().contains(&format!("'{written}' is written in place but overlaps argument '{other}'")),
+            "{e}"
+        );
+    }
+    // a view of r with another shape is not exactly r
+    let flat = [512usize];
+    let other_shape = plan.prepare(
+        &[
+            dense(X, &shape, DType::F32, Access::In),
+            dense(R, &shape, DType::F32, Access::In),
+            dense(Y, &shape, DType::F32, Access::InOut),
+            dense(R, &flat, DType::F32, Access::InOut),
+        ],
+        None,
+    );
+    assert!(other_shape.is_err());
+}
+
+#[test]
+fn an_alias_that_does_not_fit_its_input_is_refused_at_the_reading_of_the_manifest() {
+    type Change = Box<dyn FnOnce(&mut Vec<Value>)>;
+    let cases: Vec<(Change, &str)> = vec![
+        (Box::new(|p| p[3]["alias"] = json!("nope")), "is not an `in` pointer"),
+        (Box::new(|p| p[3]["alias"] = json!("y")), "is not an `in` pointer"),
+        (Box::new(|p| p[3]["alias"] = json!(3)), "alias must be a str"),
+        (Box::new(|p| p[2]["alias"] = json!("r")), "both may alias 'r'"),
+        (Box::new(|p| p[0]["alias"] = json!("r")), "only an out pointer may alias"),
+        (Box::new(|p| p[1]["shape"] = json!(["R", 32])), "another dtype or declared shape"),
+        (Box::new(|p| p[1]["dtype"] = json!("bf16")), "pointer type"),
+    ];
+    for (change, message) in cases {
+        let text = refusal(&[add_into(change)], &[]);
+        assert!(text.contains(message), "{message}: {text}");
+    }
+    // a JSON null is no alias, as Python reads it
+    assert!(read(&[add_into(|p| p[3]["alias"] = Value::Null)], &[]).is_ok());
+}
+
 // -- a device scalar -------------------------------------------------------------------------------------------------------------
 
 /// `masked_rows(x: Tensor[R, 128, f32], y: Out[Tensor[R, 128, f32]], n_tok: DevScalar[i32])`: the last pointer has the shape `[]`.

@@ -2,7 +2,8 @@
 
     python export_plan_fixtures.py [OUTPUT_DIR]        # default: golden/plans next to this file
 
-Two directories, ``block`` and ``block-reuse``: the transformer block of ``plan_model`` planned without and with liveness reuse, exported to ``sm_103`` the way
+Three directories, ``block`` and ``block-reuse`` (the transformer block of ``plan_model`` planned without and with liveness reuse) and ``steps`` (the graph
+``plan_model.steps``: a result written over its input, two copy steps, a returned reshape and named outputs), each exported to ``sm_103`` the way
 ``tilefish.runtime.export`` does, but with the *fake* builds of ``plan_fakes`` (a tiny ELF file per kernel entry, a made-up 64-byte algorithm per GEMM): what is real is
 the format, the digests and the plan; the machine code is not, so the fixtures validate a reader and cannot be launched. Each directory has ``manifest.json`` (schema 3),
 the cubins and ``plan.json``; ``expected.json`` has, for each, the plan digest and the manifest digest that Python computes, the arena size and every buffer's offset, which a
@@ -23,17 +24,17 @@ from tilefish import Manifest
 
 HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT = HERE / "golden" / "plans"
-PLANS = {"block": False, "block-reuse": True}
+PLANS = {"block": ("block", False), "block-reuse": ("block", True), "steps": ("steps", False)}  # directory: (the graph of plan_model, reuse)
 
 
 def export_all(output: pathlib.Path) -> dict:
     expected = {}
-    for name, reuse in PLANS.items():
+    for name, (graph, reuse) in PLANS.items():
         directory = output / name
         if directory.exists():
             shutil.rmtree(directory)
         directory.mkdir(parents=True)
-        exported = plan_fakes.export(tilefish.plan(pm.block, reuse=reuse), directory)
+        exported = plan_fakes.export(tilefish.plan(getattr(pm, graph), reuse=reuse), directory)
         manifest = Manifest.load(directory)
         expected[name] = {
             "graph": exported.name,
@@ -44,7 +45,8 @@ def export_all(output: pathlib.Path) -> dict:
             "arena_bytes": exported.arena_bytes,
             "offsets": {b["name"]: b["offset"] for b in exported.buffers if b["offset"] is not None},
             "buckets": exported.buckets(),
-            "steps_per_bucket": len(exported.steps(M=64)),
+            "steps_per_bucket": len(exported.steps(**exported.buckets()[-1])),
+            "outputs": exported.outputs,
         }
     (output / "expected.json").write_text(json.dumps(expected, indent=2, sort_keys=True) + "\n")
     return expected
