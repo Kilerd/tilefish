@@ -2,8 +2,8 @@
 
 * A rebuild of an unchanged kernel (generated or hand-written, ``build``, ``jit`` or ``export``) is read from the cache and calls
   ``triton.compile`` not at all; the binary is the one that was built, with the ``sha256_code`` of a fresh compile.
-* An edit to any file the kernel reaches, a helper two levels away included, is a miss: the key is of the files the process holds
-  (and a process that holds another version than the disk is refused before a key is made), so an old binary is never served.
+* A change to anything the kernel reads, by any route (an edit to a file it reaches, a helper two levels away included, a value the
+  process computed), is another IR, so a miss: the key is of the IR the process holds, so an old binary is never served.
 * A corrupt or tampered entry is a warning and a rebuild; builds that race write whole entries.
 """
 

@@ -437,14 +437,14 @@ def test_an_environment_variable_of_the_codegen_families_is_part_of_the_key_and_
     monkeypatch.setenv("TRITON_PTXAS_PATH", "/other/ptxas")  # a tool whose version is in the key
     build(SPEC, arch="sm_90", fn=kernel)
     assert compiler.count == 1
-    for name in ("TRITON_DEFAULT_FP_FUSION", "TRITON_LIBDEVICE_PATH", "TRITON_MOCK_PTX_VERSION", "TRITON_KERNEL_OVERRIDE", "DISABLE_PTXAS_OPT", "MLIR_ENABLE_DUMP", "USE_IR_LOC", "LLVM_PASS_PLUGIN_PATH", "TRITON_A_KNOB_OF_A_LATER_TRITON"):
+    for name in ("TRITON_DEFAULT_FP_FUSION", "TRITON_LIBDEVICE_PATH", "TRITON_MOCK_PTX_VERSION", "TRITON_KERNEL_OVERRIDE", "DISABLE_PTXAS_OPT", "MLIR_ENABLE_DUMP", "USE_IR_LOC", "TRITON_A_KNOB_OF_A_LATER_TRITON"):
         before = compiler.count
         monkeypatch.setenv(name, "1")
         build(SPEC, arch="sm_90", fn=kernel)
         assert compiler.count == before + 1, name  # another binary may come of it: another key
         monkeypatch.delenv(name)
     build(SPEC, arch="sm_90", fn=kernel)
-    assert compiler.count == 1 + 9  # and with none of them set it is the first entry again
+    assert compiler.count == 1 + 8  # and with none of them set it is the first entry again
 
 
 def test_a_knob_that_a_program_set_without_the_environment_is_part_of_the_key(world, monkeypatch):
@@ -719,7 +719,7 @@ def test_an_entry_reads_back_as_the_build_it_was_made_from(tmp_path):
 
 
 def test_the_key_depends_on_every_part_of_it(tmp_path):
-    base = dict(arch=90, ir_digest="a" * 64, triton_version="3.5.1", ptxas_version="12.9", options={"num_warps": 4}, environment={})
+    base = dict(arch=90, ir_digest="a" * 64, triton_version="3.5.1", ptxas_version="12.9", options={"num_warps": 4}, environment={}, files={})
     key = _cache.cache_key(**base)
     assert key == _cache.cache_key(**base) and len(key) == 64
     for change in (
@@ -730,6 +730,7 @@ def test_the_key_depends_on_every_part_of_it(tmp_path):
         {"options": {"num_warps": 8}},
         {"options": {"num_warps": 4, "enable_fp_fusion": False}},
         {"environment": {"env": {"TRITON_X": "1"}}},
+        {"files": {"extern_libs.libdevice": "c" * 64}},
     ):
         assert _cache.cache_key(**{**base, **change}) != key, change
 
@@ -1090,6 +1091,7 @@ def key_of(**changes):
         ptxas_version="12.9",
         options={"num_warps": 4},
         environment={"env": {"TRITON_X": "1"}, "knobs": {"language.default_fp_fusion": "True"}},
+        files={"extern_libs.libdevice": "d" * 64},
     )
     inputs.update(changes)
     return _cache.cache_key(**inputs)
@@ -1106,6 +1108,8 @@ KEY_INPUTS = [
     ("an environment variable that is not there", dict(environment={"env": {}, "knobs": {"language.default_fp_fusion": "True"}})),
     ("a knob Triton reads", dict(environment={"env": {"TRITON_X": "1"}, "knobs": {"language.default_fp_fusion": "False"}})),
     ("the libdevice file", dict(environment={"env": {"TRITON_X": "1"}, "knobs": {"language.default_fp_fusion": "True"}, "libdevice": "f" * 64})),
+    ("the content of a file an option names", dict(files={"extern_libs.libdevice": "e" * 64})),
+    ("a file an option names that is not there", dict(files={})),
 ]
 
 
@@ -1207,3 +1211,136 @@ def test_a_hand_written_kernel_whose_file_changed_under_the_function_it_holds_is
         assert ir_of(exec_module(project.path("cil_kernel"), "cil_kernel").kernel, spec) != held  # a new process holds 3.0
     finally:
         sys.modules.pop("cil_kernel", None)
+
+
+# -- files that Triton reads while it compiles: ir_override is refused, the others are keyed by their content ----------------------------------
+
+
+def test_the_compile_option_ir_override_is_refused_like_the_kernel_override(world, tmp_path):
+    """``ir_override`` is a file that Triton substitutes for the IR of a stage: the binary would not be of the IR that identifies it."""
+    project, compiler = world
+    kernel = project.load()
+    replacement = tmp_path / "replacement.ptx"
+    replacement.write_text(".version 8.8\n")
+    for cache in (True, False):
+        with pytest.raises(TilefishBuildError, match=r"the compile option ir_override .*names a file that Triton substitutes for the IR of a stage.*TRITON_KERNEL_OVERRIDE"):
+            build(SPEC, arch="sm_90", fn=kernel, options={"ir_override": str(replacement)}, cache=cache)
+    assert compiler.count == 0 and compiler.frontends == 0 and entries() == []  # refused before anything was built or cached
+    build(SPEC, arch="sm_90", fn=kernel, options={"ir_override": None})  # an unset option is none
+
+
+def test_compile_files_is_what_the_in_memory_key_asks_too(world, tmp_path):
+    replacement = tmp_path / "replacement.ptx"
+    replacement.write_text("one")
+    with pytest.raises(TilefishBuildError, match="ir_override"):
+        _cache.compile_files({"ir_override": str(replacement)})
+    assert _cache.compile_files({"num_warps": 4}) == {}
+
+
+def test_extern_libs_are_keyed_by_the_content_of_the_files_not_by_their_paths(world, tmp_path):
+    """A library rewritten under the same name is another binary: its sha256 is in the key, and a miss recompiles."""
+    project, compiler = world
+    kernel = project.load()
+    library = tmp_path / "libdevice.10.bc"
+    library.write_bytes(b"one")
+    options = {"extern_libs": {"libdevice": str(library)}}
+    first = build(SPEC, arch="sm_90", fn=kernel, options=options)
+    build(SPEC, arch="sm_90", fn=kernel, options=options)
+    assert compiler.count == 1 and len(entries()) == 1  # a hit
+    library.write_bytes(b"two")  # the same path, another file
+    second = build(SPEC, arch="sm_90", fn=kernel, options=options)
+    assert compiler.count == 2 and len(entries()) == 2 and second.cubin is not first.cubin
+    library.write_bytes(b"one")  # put back: the first entry again
+    build(SPEC, arch="sm_90", fn=kernel, options=options)
+    assert compiler.count == 2
+    assert _cache.compile_files(options) == {"extern_libs.libdevice": hashlib.sha256(b"one").hexdigest()}
+
+
+def test_extern_libs_that_cannot_be_hashed_refuse_the_build(world, tmp_path):
+    project, compiler = world
+    kernel = project.load()
+    with pytest.raises(TilefishBuildError, match=r"the extern library 'libdevice' .*cannot be read"):
+        build(SPEC, arch="sm_90", fn=kernel, options={"extern_libs": {"libdevice": str(tmp_path / "missing.bc")}})
+    with pytest.raises(TilefishBuildError, match="extern_libs is a mapping of library names to file paths"):
+        build(SPEC, arch="sm_90", fn=kernel, options={"extern_libs": 42})
+    assert compiler.count == 0 and entries() == []
+
+
+def test_llvm_pass_plugin_path_is_keyed_by_the_content_of_the_plugin(world, tmp_path, monkeypatch):
+    project, compiler = world
+    kernel = project.load()
+    plugin = tmp_path / "plugin.so"
+    plugin.write_bytes(b"plugin one")
+    monkeypatch.setenv("LLVM_PASS_PLUGIN_PATH", str(plugin))
+    build(SPEC, arch="sm_90", fn=kernel)
+    build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 1
+    plugin.write_bytes(b"plugin two")  # rewritten under the same path
+    build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 2 and len(entries()) == 2
+    assert _cache.codegen_environment()["env_files"] == {"LLVM_PASS_PLUGIN_PATH": hashlib.sha256(b"plugin two").hexdigest()}
+    plugin.unlink()
+    with pytest.raises(TilefishBuildError, match=r"LLVM_PASS_PLUGIN_PATH .*cannot be read"):
+        build(SPEC, arch="sm_90", fn=kernel)
+    monkeypatch.delenv("LLVM_PASS_PLUGIN_PATH")
+    assert "env_files" not in _cache.codegen_environment()
+    build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 3  # without the plug-in: its own entry
+
+
+def test_an_active_instrumentation_plugin_refuses_the_build(world, monkeypatch):
+    """Proton's instrumentation backend patches the passes that lower the IR (``CUDABackend.instrumentation``)."""
+    project, compiler = world
+    kernel = project.load()
+    backend = type("CUDABackend", (), {"instrumentation": None})
+    monkeypatch.setitem(sys.modules, "triton.backends.nvidia", types.ModuleType("triton.backends.nvidia"))
+    monkeypatch.setitem(sys.modules, "triton.backends.nvidia.compiler", types.SimpleNamespace(CUDABackend=backend))
+    build(SPEC, arch="sm_90", fn=kernel)  # the backend is there and no instrumentation is on
+    backend.instrumentation = object()
+    with pytest.raises(TilefishBuildError, match=r"instrumentation plugin of Triton is active \(CUDABackend.instrumentation"):
+        build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 1
+
+
+def test_the_arch_override_knob_is_part_of_the_key(world, monkeypatch):
+    project, compiler = world
+    kernel = project.load()
+    build(SPEC, arch="sm_90", fn=kernel)
+    monkeypatch.setattr(sys.modules["triton"].knobs.runtime, "override_arch", "sm100")
+    build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 2
+
+
+# -- the frontend and the compile share one lock --------------------------------------------------------------------------------------------
+
+
+def test_no_two_frontends_run_at_once_in_any_threads_not_even_one_inside_a_compile(world):
+    """``triton.compile`` runs the frontend again, so the lock that serialises a compile is the lock of the frontend of a digest: with
+    two locks a compile's own ``make_ir`` and another thread's digest ran together (and failed closed, by the digest check)."""
+    project, compiler = world
+    kernel = project.load()
+    compiler.delay = 0.004
+    errors = []
+
+    def digest():
+        try:
+            for _ in range(6):
+                ir_of(kernel)
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    def compile_():
+        try:
+            for i in range(4):
+                build(SPEC, arch="sm_90", fn=kernel, options={"num_stages": 2 + i}, cache=False)
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=digest) for _ in range(4)] + [threading.Thread(target=compile_) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors[:1]
+    assert compiler.max_active == 1 and compiler.frontends > 20  # one at a time, however many threads asked
+    assert tilefish._build._compile_lock is _ir.LOCK

@@ -408,7 +408,9 @@ def build_options(**options: Any) -> "Iterator[None]":
     binary compiled without FMA contraction. (A lowered kernel asks for that itself with
     ``@tilefish.kernel(fp_fusion=False)``; this is for an ``extern``, whose spec says nothing about it.) The options
     are part of the cache key and are recorded in the :class:`~tilefish.aot.BuiltKernel`, and they make the build
-    differ from the compile spec, so a manifest written from it is refused by ``replay``.
+    differ from the compile spec, so a manifest written from it is refused by ``replay``. An option that names a file is
+    keyed by the content of the file (``extern_libs``: a rewritten library is another binary), and ``ir_override``, a file
+    that replaces the IR of a stage, is refused (a ``TilefishBuildError``).
     """
     previous = getattr(_options, "value", {})
     _options.value = {**previous, **options}
@@ -439,9 +441,10 @@ def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKern
     torch = _torch()
     cap = _capability(torch, device_index)
     extra = dict(getattr(_options, "value", {}))
+    files = _cache.compile_files({**spec.ast_source_inputs().options, **extra})  # refuses ir_override; the content of extern_libs
     digest = _ir_digest_of(spec, fn, cap, extra)
     environment = repr(sorted(_cache.codegen_environment().items()))
-    key = (spec.stem, cap, spec._fingerprint(), digest, tuple(sorted(extra.items())), environment)
+    key = (spec.stem, cap, spec._fingerprint(), digest, repr(sorted(extra.items())), tuple(sorted(files.items())), environment)
     with _lock:
         built = _builds.get(key)
     if built is None:

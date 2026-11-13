@@ -18,6 +18,8 @@ import ast
 import hashlib
 import sys
 import textwrap
+import threading
+import time
 import types
 from collections import namedtuple
 
@@ -140,6 +142,10 @@ class FakeCompiler:
         self.fail = None  # an exception to raise from ``compile``
         self.second_ir = None  # a text for the frontend to give the second time it runs (a frontend that is not deterministic)
         self.fail_frontend = None  # an exception for the frontend to raise
+        self.delay = 0.0  # seconds a frontend takes (so that two that overlap are seen to)
+        self.active = 0  # frontends running now, and the most there ever were at once
+        self.max_active = 0
+        self.lock = threading.Lock()
 
     @property
     def count(self):
@@ -177,10 +183,19 @@ def install(monkeypatch, version="3.5.1"):
 
     class CountingSource(ASTSource):
         def make_ir(self, *a, **k):
-            compiler.frontends += 1
-            if compiler.fail_frontend is not None:
-                raise compiler.fail_frontend
-            module = super().make_ir(*a, **k)
+            with compiler.lock:
+                compiler.frontends += 1
+                compiler.active += 1
+                compiler.max_active = max(compiler.max_active, compiler.active)
+            try:
+                if compiler.delay:
+                    time.sleep(compiler.delay)
+                if compiler.fail_frontend is not None:
+                    raise compiler.fail_frontend
+                module = super().make_ir(*a, **k)
+            finally:
+                with compiler.lock:
+                    compiler.active -= 1
             if compiler.second_ir is not None and compiler.frontends > 1:
                 return FakeModule(compiler.second_ir)
             return module
@@ -203,6 +218,7 @@ def install(monkeypatch, version="3.5.1"):
         nvidia=types.SimpleNamespace(
             ptxas=types.SimpleNamespace(path="/fake/ptxas"), disable_ptxas_opt=False, mock_ptx_version=None, libdevice_path=None
         ),
+        runtime=types.SimpleNamespace(override_arch=None),
     )
     monkeypatch.setattr(triton, "knobs", knobs, raising=False)
     monkeypatch.setitem(sys.modules, "triton.runtime", _module("triton.runtime"))
