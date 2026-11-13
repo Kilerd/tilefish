@@ -536,6 +536,40 @@ impl<'a, T: Element> TensorMut<'a, T> {
     }
 }
 
+/// A tensor that a launch only reads, given either read-only ([`TensorRef`]: a shared borrow, which other launches may share) or
+/// writable ([`TensorMut`]: an exclusive borrow, which a captured plan can hand back for writing new contents between replays, see
+/// [`CapturedPlan::external_mut`](crate::CapturedPlan::external_mut)). What the typed plan runners of `tilefish.hosts.rust.emit_plan` take for
+/// an input or a weight: `x.into()` from either.
+#[derive(Debug)]
+pub enum Readable<'a, T: Element> {
+    /// Given read-only.
+    Ref(TensorRef<'a, T>),
+    /// Given writable (the launch still only reads it).
+    Mut(TensorMut<'a, T>),
+}
+
+impl<'a, T: Element> From<TensorRef<'a, T>> for Readable<'a, T> {
+    fn from(t: TensorRef<'a, T>) -> Self {
+        Self::Ref(t)
+    }
+}
+
+impl<'a, T: Element> From<TensorMut<'a, T>> for Readable<'a, T> {
+    fn from(t: TensorMut<'a, T>) -> Self {
+        Self::Mut(t)
+    }
+}
+
+impl<'a, T: Element> Readable<'a, T> {
+    /// The tensor without its element type in the Rust type; it keeps the borrow of what it is made of.
+    pub fn into_arg(self) -> TensorArg<'a> {
+        match self {
+            Self::Ref(t) => t.into_arg(),
+            Self::Mut(t) => t.into_arg(),
+        }
+    }
+}
+
 /// The bytes from the start of the slice to a view's first element: `offset` elements of `dtype` (already known to fit `len_bytes`).
 fn byte_offset_of(offset: usize, dtype: DType, len_bytes: u64) -> Result<u64> {
     (offset as u64).checked_mul(dtype.size() as u64).filter(|b| *b <= len_bytes).ok_or_else(|| {

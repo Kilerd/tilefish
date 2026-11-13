@@ -282,7 +282,7 @@ pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, Plan, Prepared};
 pub use plan_run::{CapturedPlan, DevScalar, PlanRun};
 pub use region::DevicePtr;
-pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, TensorArg, TensorMut, TensorRef, U8};
+pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, Readable, TensorArg, TensorMut, TensorRef, U8};
 
 /// What the compiler refuses, as tests (`cargo test --doc`): each `compile_fail` block is paired with a `no_run` block that is the
 /// same program without the one line that must not compile, so a failure of the first is about that line.

@@ -1,4 +1,4 @@
-"""Typed Rust launchers for a manifest: ``emit(manifest, "launchers.rs")``.
+"""Typed Rust launchers for a manifest: ``emit(manifest, "launchers.rs")``; and a typed runner of a launch plan: ``emit_plan(directory, "runner.rs", pin=...)``.
 
 The ``tilefish`` crate (``crates/tilefish``) loads a manifest directory and launches what it describes from Rust: it verifies
 the digests, checks every precondition of the binary and launches through the CUDA driver. :func:`emit` writes the
@@ -56,6 +56,11 @@ output is validated (``stem``, ``op``, architecture, file names, tensor and dime
 values, the grid, sizes, the fields of a library entry: each must be what it is for), so a manifest cannot write a doc line that breaks out
 of its comment, an item, or a string literal into the generated file; and the doc comments are written a line at a time, with line breaks
 that a field might carry split into lines that are all comments.
+
+**Launch plans.** :func:`emit_plan` writes a typed runner of a ``plan.json`` (``docs/plan-schema-1.md``) for the crate's ``LaunchPlan`` and
+``PlanRun``: a struct named after the graph whose ``load`` pins the plan (and so its manifest), and whose ``launch`` and ``capture`` take one field
+per external tensor, with its element type, and one per device scalar. It takes a pinned plan only, and validates every name that reaches the
+output, as :func:`emit` does.
 """
 
 from __future__ import annotations
@@ -1089,6 +1094,196 @@ def emit(
     """
     path = pathlib.Path(path)
     source = render(manifest, ops=list(ops), embed=embed, relative_to=path.resolve().parent, pin=pin)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_file(path, source.encode("utf-8"))
+    return path
+
+
+# -- launch plans ----------------------------------------------------------------------------------------------------------------------
+
+# what a generated plan runner imports from the crate and std, and `Self`: a struct of these names would clash with them
+_RESERVED_PLAN_STRUCTS = frozenset(
+    {"Self", "Arc", "Path", "CapturedPlan", "CudaStream", "DevScalar", "Error", "LaunchPlan", "Pin", "PlanRun", "Readable", "TensorArg", "TensorMut"}
+    | {"Result", "Option", "Some", "None", "Ok", "Err", "Vec"}
+    | set(RUST_ELEMENTS.values())
+)
+
+# the host type a device scalar's value is given as, by dtype (a dtype that is none of these is given as `DevScalar`, its bits)
+_DEVSCALAR_TYPES = {"i32": "i32", "i64": "i64", "u8": "u8", "f32": "f32"}
+
+
+def _trusted_plan(plan: Any, pin: "str | None") -> "dict[str, Any]":
+    """The document of the plan to generate from: a plan directory (or its ``plan.json``) with ``pin``, or a :class:`~tilefish._plan.Plan` that is
+    pinned (loaded with a pin, or returned by ``tilefish.runtime.export``). Verified as a replay verifies it: strict JSON, the digest against the pin
+    and against the one it carries, every rule of the format, and the manifest next to it (pinned to the plan's ``manifest_digest``) against every
+    step."""
+    from .. import _plan
+
+    if isinstance(plan, (str, os.PathLike)):
+        if pin is None:
+            raise TilefishManifestError(
+                f"the plan {str(plan)!r} would be read without a trust anchor, and the Rust source generated from it is compiled and run: pass "
+                "pin=<the plan's digest> (Plan.digest, which runtime.export returns), or a Plan that is pinned"
+            )
+        doc = _plan.read_plan(plan, pin=pin)
+        path = pathlib.Path(plan)
+        directory = path if path.is_dir() else path.parent
+        _plan.check_against_manifest(doc, Manifest.load(directory, pin=doc["manifest_digest"]))
+        return doc
+    if not isinstance(plan, _plan.Plan):
+        raise TilefishManifestError(f"emit_plan takes a plan directory (with pin=) or a pinned Plan, got {type(plan).__name__}")
+    if pin is not None and plan.digest != pin:
+        raise TilefishManifestError(f"the plan of graph '{plan.name}' has digest {plan.digest}, but the pin is {pin}")
+    if pin is None and not getattr(getattr(plan, "manifest", None), "pinned", False):
+        raise TilefishManifestError(
+            f"the plan of graph '{plan.name}' is not pinned, and the Rust source generated from it is compiled and run: load it with a pin, pass "
+            "pin= here, or use the Plan that runtime.export returned"
+        )
+    _plan.validate_doc(plan.doc)  # what reaches the output: validated again (a plan made only in memory has no architecture and is refused here)
+    return plan.doc
+
+
+def render_plan(plan: Any, *, pin: "str | None" = None) -> str:
+    """The Rust source :func:`emit_plan` writes, as a string. ``plan`` is a plan directory with ``pin``, or a pinned
+    :class:`~tilefish._plan.Plan`; every field of it that reaches the output is validated first."""
+    doc = _trusted_plan(plan, pin)
+    who = f"the plan of graph {doc.get('graph')!r}"
+    graph = _name(who, "graph", doc["graph"])
+    digest = _name(who, "plan_digest", doc["plan_digest"], _DIGEST)
+    manifest_digest = _name(who, "manifest_digest", doc["manifest_digest"], _DIGEST)
+    arch = _name(who, "arch", doc["arch"], _ARCH)
+    struct = _camel(graph)
+    struct = struct + "Plan" if struct in _RESERVED_PLAN_STRUCTS or struct + "Externals" in _RESERVED_PLAN_STRUCTS else struct
+    externals = [b for b in doc["buffers"] if b["role"] in ("input", "weight", "inout", "output")]
+    scalars = [b for b in doc["buffers"] if b["role"] == "devscalar"]
+    fields: "dict[str, str]" = {}
+    for b in externals + scalars:
+        name = _snake_ident(_name(who, "a buffer name", b["name"]))
+        if name in fields.values():
+            _bad(who, f"two buffers have the field name {name!r} in Rust")
+        if b["dtype"] not in RUST_ELEMENTS:
+            _bad(who, f"buffer {b['name']!r} has dtype {b['dtype']!r}, which has no Rust element type")
+        _shape(who, f"the shape of buffer {b['name']!r}", b["shape"])
+        fields[b["name"]] = name
+    dims = []
+    for d, values in doc["dims"].items():
+        _name(who, "a dimension", d)
+        dims.append(f"({_rs_str(d)}, &[{', '.join(str(_count(who, f'a bucket of {d}', v, 1)) for v in values)}])")
+    roles = {"input": "an input (read)", "weight": "a weight (read)", "inout": "updated in place", "output": "a returned value (written)"}
+    outputs = list(doc["outputs"])
+    uses = {"CapturedPlan", "CudaStream", "DevScalar", "Error", "LaunchPlan", "Pin", "PlanRun", "TensorArg"}
+    uses |= {RUST_ELEMENTS[b["dtype"]] for b in externals}
+    if any(b["role"] in ("input", "weight") for b in externals):
+        uses.add("Readable")
+    if any(b["role"] in ("inout", "output") for b in externals):
+        uses.add("TensorMut")
+    out = [
+        "// @generated by tilefish.hosts.rust.emit_plan. Do not edit: generate it again from the plan.\n",
+        f"// The plan of graph `{graph}` it was generated from has digest {digest}; its manifest has digest {manifest_digest}.\n",
+        "\n",
+        "use std::path::Path;\n",
+        "use std::sync::Arc;\n",
+        "\n",
+        f"use tilefish::{{{', '.join(sorted(uses))}}};\n",
+        "\n",
+        "/// The digest of the plan this module was generated from: `load` refuses any other plan (and so any other manifest).\n",
+        f"pub const PLAN_DIGEST: &str = {_rs_str(digest)};\n",
+        "\n",
+    ]
+    lines = [f"The tensors of a call of the plan of graph `{graph}`, by name, with their element types (the caller's: the plan allocates none)."]
+    lines.append("An input or a weight is a `Readable` (`x.into()` from a `TensorRef`, or from a `TensorMut` to write new contents through a")
+    lines.append("`CapturedPlan` between replays); what the plan writes is a `TensorMut`. Every one is checked against the plan at a call.")
+    out.append(_doc_comment(lines))
+    out.append("#[allow(non_snake_case)]\n")
+    out.append(f"pub struct {struct}Externals<'a> {{\n")
+    for b in externals:
+        what = roles[b["role"]] + (f", returned value {outputs.index(b['name'])}" if b["role"] == "output" else "")
+        out.append(_doc_comment([f"`{b['name']}`: {what}, {b['dtype']} `[{_shape_text(b['shape'])}]`."], "    "))
+        element = RUST_ELEMENTS[b["dtype"]]
+        kind = "TensorMut" if b["role"] in ("inout", "output") else "Readable"
+        out.append(f"    pub {fields[b['name']]}: {kind}<'a, {element}>,\n")
+    out.append("}\n\n")
+    out.append(_doc_comment([f"The device scalars of a call of the plan of graph `{graph}`: written into their slots of the arena before the first launch."]))
+    out.append("#[derive(Debug, Clone, Copy)]\n")
+    if scalars:
+        out.append("#[allow(non_snake_case)]\n")
+        out.append(f"pub struct {struct}Scalars {{\n")
+        for b in scalars:
+            ty = _DEVSCALAR_TYPES.get(b["dtype"], "DevScalar")
+            note = "" if ty != "DevScalar" else " (its bits: `DevScalar::Bits`)"
+            out.append(_doc_comment([f"`{b['name']}`: DevScalar[{b['dtype']}]{note}."], "    "))
+            out.append(f"    pub {fields[b['name']]}: {ty},\n")
+        out.append("}\n\n")
+    else:
+        out.append(f"pub struct {struct}Scalars;\n\n")
+    doc_lines = [
+        f"The launch plan of graph `{graph}` for {arch}, instantiated: every bucket's binaries loaded and its arena allocated, once.",
+        "",
+        f"The dimensions and their buckets: {', '.join(f'{d} {list(v)}' for d, v in doc['dims'].items()) or 'none (one bucket)'}. A call selects the bucket",
+        "from the shapes of its tensors, which must be one exactly (there is no padding).",
+    ]
+    out.append(_doc_comment(doc_lines))
+    out.append("#[derive(Debug, Clone)]\n")
+    out.append(f"pub struct {struct} {{\n    run: PlanRun,\n}}\n\n")
+    out.append(f"impl {struct} {{\n")
+    out.append("    /// The name of the graph.\n")
+    out.append(f"    pub const GRAPH: &'static str = {_rs_str(graph)};\n")
+    out.append("    /// The architecture the plan is for.\n")
+    out.append(f"    pub const ARCH: &'static str = {_rs_str(arch)};\n")
+    out.append("    /// The dimensions of the plan and the sizes planned for each.\n")
+    out.append(f"    pub const DIMS: &'static [(&'static str, &'static [u64])] = &[{', '.join(dims)}];\n")
+    out.append("    /// The bytes of the arena.\n")
+    out.append(f"    pub const ARENA_BYTES: u64 = {_count(who, 'arena_bytes', doc['arena_bytes'])};\n\n")
+    out.append("    /// Load the plan directory (its `plan.json`, pinned to [`PLAN_DIGEST`], and the manifest next to it) and instantiate it for every\n")
+    out.append("    /// bucket on `stream`, which the arena is allocated on.\n")
+    out.append("    pub fn load(directory: impl AsRef<Path>, stream: &Arc<CudaStream>) -> Result<Self, Error> {\n")
+    out.append("        let plan = LaunchPlan::load(directory, Pin::Digest(PLAN_DIGEST))?;\n")
+    out.append("        Ok(Self { run: plan.instantiate_all(stream)? })\n")
+    out.append("    }\n\n")
+    out.append("    /// The instantiated plan (untyped).\n")
+    out.append("    pub fn run(&self) -> &PlanRun {\n        &self.run\n    }\n\n")
+    out.append(f"    fn tensors(externals: {struct}Externals<'_>) -> Vec<(&'static str, TensorArg<'_>)> {{\n")
+    out.append("        vec![\n")
+    for b in externals:
+        out.append(f"            ({_rs_str(b['name'])}, externals.{fields[b['name']]}.into_arg()),\n")
+    out.append("        ]\n    }\n\n")
+    out.append(f"    fn values(scalars: &{struct}Scalars) -> Vec<(&'static str, DevScalar)> {{\n")
+    if scalars:
+        out.append("        vec![\n")
+        for b in scalars:
+            value = f"scalars.{fields[b['name']]}"
+            out.append(f"            ({_rs_str(b['name'])}, {value if _DEVSCALAR_TYPES.get(b['dtype']) is None else value + '.into()'}),\n")
+        out.append("        ]\n    }\n\n")
+    else:
+        out.append("        let _ = scalars;\n        Vec::new()\n    }\n\n")
+    out.append("    /// Run the plan on `stream` (see `tilefish::PlanRun::launch`): every step is checked before the first launch, and nothing is\n")
+    out.append("    /// allocated.\n")
+    out.append(f"    pub fn launch(&self, stream: &Arc<CudaStream>, externals: {struct}Externals<'_>, scalars: &{struct}Scalars) -> Result<(), Error> {{\n")
+    out.append("        self.run.launch(stream, &mut Self::tensors(externals), &Self::values(scalars))\n")
+    out.append("    }\n\n")
+    out.append("    /// Capture the plan in a CUDA graph on `stream` for the bucket the tensors select (see `tilefish::PlanRun::capture`): the graph\n")
+    out.append("    /// borrows the tensors for as long as it lives, and `scalars` are what its first replay reads.\n")
+    out.append(
+        f"    pub fn capture<'a>(&self, stream: &Arc<CudaStream>, externals: {struct}Externals<'a>, scalars: &{struct}Scalars) -> Result<CapturedPlan<'a>, Error> {{\n"
+    )
+    out.append("        self.run.capture(stream, Self::tensors(externals), &Self::values(scalars))\n")
+    out.append("    }\n}\n")
+    return "".join(out)
+
+
+def emit_plan(plan: Any, path: "str | os.PathLike[str]", *, pin: "str | None" = None) -> pathlib.Path:
+    """Write a typed Rust runner of a launch plan (``plan.json``) to ``path`` (one ``.rs`` module) and return the path.
+
+    The module has ``PLAN_DIGEST``; a struct named after the graph (``block`` gives ``Block``) whose ``load(directory, &stream)`` loads the plan
+    pinned to that digest (and with it the manifest) and instantiates every bucket, and whose ``launch`` and ``capture`` take a
+    ``<Graph>Externals`` (one field per external, named after it, with its element type: a ``Readable`` for an input or a weight, a ``TensorMut``
+    for what the plan writes) and a ``<Graph>Scalars`` (one field per device scalar, in its host type). Everything else is the crate's
+    ``PlanRun``. ``plan`` is a plan directory with ``pin=`` (the plan's digest), or a pinned :class:`~tilefish._plan.Plan` (loaded with a pin, or
+    returned by ``tilefish.runtime.export``): the source is compiled and run by whoever uses it, so a plan nobody vouched for does not get to write
+    it, and every field that reaches it is validated. The file is written through a temporary file and renamed.
+    """
+    path = pathlib.Path(path)
+    source = render_plan(plan, pin=pin)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_file(path, source.encode("utf-8"))
     return path
