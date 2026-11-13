@@ -279,14 +279,27 @@ class GraphOp(Op):
     """A model: ordinary Python over typed values, traced once at declaration.
 
     ``output_names`` are the names of its returned values, in order (``@tilefish.graph(outputs=("y", "residual"))``), or ``None``: a launch plan
-    names their buffers so (``out0``, ``out1``, ... otherwise), and a host binds the outputs by them."""
+    names their buffers so (``out0``, ``out1``, ... otherwise), and a host binds the outputs by them.
+
+    ``param_roles`` maps every read-only tensor parameter (not ``InOut``, not ``DevScalar``) to ``"input"`` (given at every call) or ``"weight"``
+    (bound once by a host, at load), as ``@tilefish.graph(inputs=..., weights=...)`` declares them, or is ``None``: a launch plan then labels a
+    parameter by its shape (``weight`` when it mentions no dimension), which a host cannot rely on."""
 
     kind = "graph"
 
-    def __init__(self, fn: Callable[..., Any], name: str, signature: Signature, graph: Graph, output_names: "tuple[str, ...] | None" = None) -> None:
+    def __init__(
+        self,
+        fn: Callable[..., Any],
+        name: str,
+        signature: Signature,
+        graph: Graph,
+        output_names: "tuple[str, ...] | None" = None,
+        param_roles: "dict[str, str] | None" = None,
+    ) -> None:
         super().__init__(fn, name, signature)
         self.graph = graph
         self.output_names = output_names
+        self.param_roles = param_roles
 
 
 class KernelOp(GraphOp):
@@ -338,9 +351,62 @@ def _check_decorator_arg(deco: str, fn: Any) -> None:
 _OUTPUT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")  # ASCII: the name of a buffer of a plan
 
 
-def _declare_graph(fn: Callable[..., Any], name: str | None, outputs: Any) -> GraphOp:
+def _role_names(nm: str, key: str, value: Any) -> "tuple[str, ...] | None":
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise TilefishDeclarationError(f"graph '{nm}': {key}= is a list of parameter names, got {value!r}")
+    names = tuple(value)
+    if any(not isinstance(n, str) for n in names):
+        raise TilefishDeclarationError(f"graph '{nm}': {key}= is a list of parameter names, got {value!r}")
+    if len(set(names)) != len(names):
+        raise TilefishDeclarationError(f"graph '{nm}': a name is given twice in {key}={list(names)}")
+    return names
+
+
+def _param_roles(op: GraphOp, inputs: "tuple[str, ...] | None", weights: "tuple[str, ...] | None") -> "dict[str, str] | None":
+    """The roles ``@tilefish.graph(inputs=..., weights=...)`` declares: every read-only tensor parameter is an ``input`` (given at every call) or a
+    ``weight`` (bound once, at load). The names given must be such parameters; one list alone makes the rest of them the other role, two lists must
+    name every one of them once."""
+    if inputs is None and weights is None:
+        return None
+    params = {p.name: p for p in op.signature.params}
+    eligible = [p.name for p in op.signature.params if p.kind == "tensor" and p.access == "in" and not p.is_devscalar]
+    for key, names in (("inputs", inputs), ("weights", weights)):
+        for n in names or ():
+            p = params.get(n)
+            if p is None:
+                raise TilefishDeclarationError(f"graph '{op.name}': {key}= names '{n}', which is not a parameter (the parameters are {', '.join(params)})")
+            if n not in eligible:
+                what = (
+                    "a DevScalar (a value the host writes at every call)"
+                    if p.kind == "tensor" and p.is_devscalar
+                    else f"an {p.access.capitalize()} parameter (the caller's tensor at every call)"
+                    if p.kind == "tensor"
+                    else "not a tensor"
+                )
+                raise TilefishDeclarationError(
+                    f"graph '{op.name}': {key}= names '{n}', which is {what}: inputs= and weights= sort the read-only tensor parameters only"
+                )
+    if inputs is not None and weights is not None:
+        both = sorted(set(inputs) & set(weights))
+        if both:
+            raise TilefishDeclarationError(f"graph '{op.name}': {both} are named both in inputs= and in weights=")
+        missing = [n for n in eligible if n not in inputs and n not in weights]
+        if missing:
+            raise TilefishDeclarationError(
+                f"graph '{op.name}': inputs= and weights= together name every read-only tensor parameter; {', '.join(missing)} is in neither "
+                "(or give one of the two lists, and the other is the rest)"
+            )
+    if weights is None:
+        return {n: ("input" if n in inputs else "weight") for n in eligible}  # type: ignore[operator]
+    return {n: ("weight" if n in weights else "input") for n in eligible}
+
+
+def _declare_graph(fn: Callable[..., Any], name: str | None, outputs: Any, inputs: Any = None, weights: Any = None) -> GraphOp:
     names = None
     nm = name or getattr(fn, "__name__", "?")
+    input_names, weight_names = _role_names(nm, "inputs", inputs), _role_names(nm, "weights", weights)
     if outputs is not None:
         if isinstance(outputs, (str, bytes)) or not isinstance(outputs, (list, tuple)):
             raise TilefishDeclarationError(f"graph '{nm}': outputs= is a list of the names of the returned values, in order, got {outputs!r}")
@@ -362,18 +428,32 @@ def _declare_graph(fn: Callable[..., Any], name: str | None, outputs: Any) -> Gr
                 "named apart from them"
             )
         op.output_names = names
+    op.param_roles = _param_roles(op, input_names, weight_names)
     return op
 
 
-def graph(fn: Callable[..., Any] | None = None, *, name: str | None = None, outputs: "Sequence[str] | None" = None) -> Any:
+def graph(
+    fn: Callable[..., Any] | None = None,
+    *,
+    name: str | None = None,
+    outputs: "Sequence[str] | None" = None,
+    inputs: "Sequence[str] | None" = None,
+    weights: "Sequence[str] | None" = None,
+) -> Any:
     """``@tilefish.graph``: trace and type-check a model body.
 
     ``outputs=("y", "residual")`` names the returned values, in order: a launch plan gives their buffers those names (instead of ``out0``,
-    ``out1``, ...), so that a host without Python binds them by name (``docs/plan-schema-1.md``, section 6)."""
+    ``out1``, ...), so that a host without Python binds them by name (``docs/plan-schema-1.md``, section 6).
+
+    ``inputs=("x",)`` and/or ``weights=("w1", "w2")`` declare which read-only tensor parameters a call gives every time (the inputs) and which a
+    host binds once, when it loads the model (the weights). One list makes the rest of those parameters the other role; two must name every one
+    of them once. A launch plan records the roles (``"roles": "declared"``), so a host can bind the weights once per instantiation and only the
+    inputs per launch or capture (``tilefish.runtime.bind_weights``; Rust ``PlanRun::bind_weights``). Without either list a plan labels a
+    parameter by its shape (``weight`` when it mentions no dimension), as before, and those labels are not a contract."""
     _check_decorator_arg("graph", fn)
     if fn is None:
-        return lambda f: _declare_graph(f, name, outputs)
-    return _declare_graph(fn, name, outputs)
+        return lambda f: _declare_graph(f, name, outputs, inputs, weights)
+    return _declare_graph(fn, name, outputs, inputs, weights)
 
 
 def kernel(

@@ -33,7 +33,17 @@
     ],
     "plan_digest": "3c61f37fc6fe0f2ed824b4aa82e14d0bb511aaf4d0559f8e286794b8a8dc8138",
     "reuse": false,
-    "steps_per_bucket": 9
+    "roles_declared": false,
+    "steps_per_bucket": 9,
+    "weights": [
+      "w_ln1",
+      "w_qkv",
+      "b_qkv",
+      "w_o",
+      "w_ln2",
+      "w_up",
+      "w_down"
+    ]
   },
   "block-reuse": {
     "arch": "sm_103",
@@ -69,7 +79,17 @@
     ],
     "plan_digest": "9b4afd68419b20c2afc521272647db0a9860eb3da2d56b06e0fdc0dbeb188cbb",
     "reuse": true,
-    "steps_per_bucket": 9
+    "roles_declared": false,
+    "steps_per_bucket": 9,
+    "weights": [
+      "w_ln1",
+      "w_qkv",
+      "b_qkv",
+      "w_o",
+      "w_ln2",
+      "w_up",
+      "w_down"
+    ]
   },
   "steps": {
     "arch": "sm_103",
@@ -91,8 +111,10 @@
       "y",
       "half"
     ],
-    "plan_digest": "9e4055bc94c48cce56d754224ba1cb4dae3088728fa163510e1ae16d88fcdf98",
+    "plan_digest": "41a7b1f9c532dced4add4f9d9a945f7aa0403f01d4420409c20ebb29f0888101",
     "reuse": false,
-    "steps_per_bucket": 4
+    "roles_declared": true,
+    "steps_per_bucket": 4,
+    "weights": []
   }
 }

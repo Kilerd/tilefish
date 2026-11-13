@@ -96,6 +96,11 @@ fn the_golden_plans_load_with_their_pins_and_give_every_number_python_has() {
         assert_eq!(attention.args[4].binding, "n");
         assert_eq!(plan.buffer("n").unwrap().role, BufferRole::Devscalar);
         assert_eq!(plan.outputs(), ["out0"]);
+        // the block declares no roles: the weights are labelled by their shapes, which a host does not bind once
+        assert_eq!(plan.roles_declared(), e["roles_declared"].as_bool().unwrap());
+        assert!(!plan.roles_declared());
+        let weights: Vec<Value> = plan.weights().map(Value::from).collect();
+        assert_eq!(Value::Array(weights), e["weights"]);
         // trusting the directory loads the same plan
         let trusted = LaunchPlan::load(golden().join(name).join("plan.json"), Pin::TrustDirectory).unwrap();
         assert_eq!(trusted.digest(), pin);
@@ -126,6 +131,10 @@ fn the_golden_plan_of_steps_has_copies_a_result_over_its_input_a_returned_reshap
     assert_eq!(at.steps[3].args[1].view.as_ref().unwrap().shape, [24 * 64], "written flat into the [Rf, 64] output");
     // the outputs by the graph's names, and by out0, out1 (the names of before)
     assert_eq!(plan.outputs(), ["y", "half"]);
+    // the graph declares its roles (`inputs=("x",)`): x an input, no weight
+    assert!(plan.roles_declared() && e["roles_declared"].as_bool().unwrap());
+    assert_eq!(plan.buffer("x").unwrap().role, BufferRole::Input);
+    assert_eq!(plan.weights().count(), 0);
     for (name, found) in [("y", Some("y")), ("half", Some("half")), ("out0", Some("y")), ("out1", Some("half"))] {
         assert_eq!(plan.output_buffer(name), found, "{name}");
     }

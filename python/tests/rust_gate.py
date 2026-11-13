@@ -617,6 +617,12 @@ def plan_graphs():
     def residual_cases():
         return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 64), F32, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
 
+    import gpu_kernels_p6 as p6
+
+    def weighted_cases():  # the same weights in every case (what a host binds once), another input each time
+        w, b = randn((16, 64), F32, seed=70), randn((16, 64), F32, seed=71)
+        return [(f"seed{seed}", {"x": randn((16, 64), F32, seed=72 + seed), "w": w, "b": b}) for seed in range(3)]
+
     return [
         ("block", pm.block, False, block_cases),
         ("block-reuse", pm.block, True, block_cases),
@@ -630,6 +636,7 @@ def plan_graphs():
         ("residual_chain-reuse", p5.residual_chain, True, residual_cases),
         ("copy_steps", p5.copy_steps, False, copy_cases),  # a copy of a dense view into the arena and a store into an InOut parameter
         ("view_returns", p5.view_returns, False, view_cases),  # a reshape of a result returned (no copy), a dense view of a parameter and a value twice (copies)
+        ("weighted", p6.static_affine, False, weighted_cases),  # a static graph that declares its roles: weights bound once (PlanRun::bind_weights)
     ]
 
 

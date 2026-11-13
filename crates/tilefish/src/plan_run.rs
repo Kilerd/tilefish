@@ -52,7 +52,7 @@ use crate::expr::{Expr, MAX_DIMS, Pattern, Solved, Symbols, Unsolvable};
 use crate::ffi;
 use crate::gemm::{Call, Gemm};
 use crate::kernel::{Arch, Kernel};
-use crate::launch_plan::{BufferRole, LaunchPlan, StepKind, describe_values};
+use crate::launch_plan::{BufferRole, LaunchPlan, PlanBuffer, StepKind, describe_values};
 use crate::manifest::{Access, ParamKind, ShapeDim};
 use crate::memory::sealed;
 use crate::plan::Prepared;
@@ -662,60 +662,7 @@ impl PlanRun {
         // -- each external on its own: device, context, dtype, rank, density, and that the plan may write it
         let tensor = |i: usize| &externals[given[i].expect("checked above")].1;
         for (i, b) in buffers.iter().enumerate().filter(|(_, b)| b.role.is_external()) {
-            let t = tensor(i);
-            let name = b.name.as_str();
-            if t.device != inner.device || t.context.is_some_and(|c| c != inner.context.cu_ctx() as usize) {
-                return Err(Error::precondition(
-                    PreconditionKind::Device,
-                    Some(name),
-                    format!(
-                        "the external '{name}' is memory of device {} or of another CUDA context than the plan's (device {})",
-                        t.device, inner.device
-                    ),
-                ));
-            }
-            if t.dtype != b.dtype {
-                return Err(Error::precondition(
-                    PreconditionKind::Dtype,
-                    Some(name),
-                    format!("the external '{name}' has dtype {}, but the plan has {}", t.dtype.name(), b.dtype.name()),
-                ));
-            }
-            if t.shape.len() != b.shape.len() {
-                return Err(Error::precondition(
-                    PreconditionKind::Rank,
-                    Some(name),
-                    format!(
-                        "the external '{name}' has rank {} (shape {:?}), but the plan has rank {} ({})",
-                        t.shape.len(),
-                        t.shape,
-                        b.shape.len(),
-                        b.shape.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-                    ),
-                ));
-            }
-            if let Some(strides) = t.strides
-                && !dense(t.shape, strides)
-            {
-                return Err(Error::precondition(
-                    PreconditionKind::Contiguous,
-                    Some(name),
-                    format!(
-                        "the external '{name}' is not contiguous (shape {:?}, strides {strides:?}): a tensor of a plan is dense and row-major",
-                        t.shape
-                    ),
-                ));
-            }
-            if b.role.is_writable() && t.access == Access::In {
-                return Err(Error::precondition(
-                    PreconditionKind::Access,
-                    Some(name),
-                    format!(
-                        "the external '{name}' is a read-only tensor, but the plan writes it ({}): give a TensorMut",
-                        b.role
-                    ),
-                ));
-            }
+            self.check_external(b, tensor(i))?;
         }
 
         // -- the dimensions, bound from the shapes of the parameters (as a single launch binds them), and the bucket
@@ -847,6 +794,130 @@ impl PlanRun {
             })
             .collect();
         Ok(Bound { bucket, bases, slots })
+    }
+
+    /// One external on its own: on the plan's device and in its context, of its buffer's dtype and rank, dense, and writable where the plan
+    /// writes it.
+    fn check_external(&self, b: &PlanBuffer, t: &TensorArg<'_>) -> Result<()> {
+        let inner = &*self.inner;
+        let name = b.name.as_str();
+        if t.device != inner.device || t.context.is_some_and(|c| c != inner.context.cu_ctx() as usize) {
+            return Err(Error::precondition(
+                PreconditionKind::Device,
+                Some(name),
+                format!(
+                    "the external '{name}' is memory of device {} or of another CUDA context than the plan's (device {})",
+                    t.device, inner.device
+                ),
+            ));
+        }
+        if t.dtype != b.dtype {
+            return Err(Error::precondition(
+                PreconditionKind::Dtype,
+                Some(name),
+                format!("the external '{name}' has dtype {}, but the plan has {}", t.dtype.name(), b.dtype.name()),
+            ));
+        }
+        if t.shape.len() != b.shape.len() {
+            return Err(Error::precondition(
+                PreconditionKind::Rank,
+                Some(name),
+                format!(
+                    "the external '{name}' has rank {} (shape {:?}), but the plan has rank {} ({})",
+                    t.shape.len(),
+                    t.shape,
+                    b.shape.len(),
+                    b.shape.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+        if let Some(strides) = t.strides
+            && !dense(t.shape, strides)
+        {
+            return Err(Error::precondition(
+                PreconditionKind::Contiguous,
+                Some(name),
+                format!(
+                    "the external '{name}' is not contiguous (shape {:?}, strides {strides:?}): a tensor of a plan is dense and row-major",
+                    t.shape
+                ),
+            ));
+        }
+        if b.role.is_writable() && t.access == Access::In {
+            return Err(Error::precondition(
+                PreconditionKind::Access,
+                Some(name),
+                format!(
+                    "the external '{name}' is a read-only tensor, but the plan writes it ({}): give a TensorMut",
+                    b.role
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bind the weights of the plan once: the returned [`WeightedRun`] launches and captures the plan with them, and takes the other externals
+    /// (the inputs, the `inout` tensors and the outputs) and the device scalars at every call. Python: `tilefish.runtime.bind_weights`.
+    ///
+    /// The plan must declare its roles ([`LaunchPlan::roles_declared`]: the graph says which parameters are inputs and which weights; a plan whose
+    /// roles were chosen from the shapes is refused, since a fully static graph labels its inputs weights). `weights` gives a tensor for every
+    /// buffer of role `weight` and for nothing else, each read-only (a `TensorRef`: a weight is never written), and is checked now as an
+    /// external is (device and context, dtype, rank, density, and the static sizes of its shape); what depends on the bucket (a dimension a
+    /// weight's shape mentions, the overlaps) is checked at every launch, with everything else. The weights are borrowed for `'w`, so their
+    /// memory outlives every launch and capture made through the [`WeightedRun`].
+    pub fn bind_weights<'w>(&self, weights: Vec<(&str, TensorArg<'w>)>) -> Result<WeightedRun<'w>> {
+        let inner = &*self.inner;
+        let plan = &inner.plan;
+        let graph = plan.graph();
+        if !plan.roles_declared() {
+            return Err(Error::Launch(format!(
+                "the plan of graph '{graph}' does not declare which parameters are weights (its roles were chosen from the shapes, and a fully \
+                 static graph labels its inputs weights): declare them with @tilefish.graph(inputs=..., weights=...) and export it again"
+            )));
+        }
+        let buffers = plan.buffers();
+        let all: Vec<&str> = plan.weights().collect();
+        let mut given: Vec<Option<TensorArg<'w>>> = (0..buffers.len()).map(|_| None).collect();
+        for (name, t) in weights {
+            let Some(i) = inner.by_name.get(name).copied().filter(|i| buffers[*i].role == BufferRole::Weight) else {
+                return Err(Error::Launch(format!(
+                    "'{name}' is not a weight of the plan of graph '{graph}'; its weights are {all:?}"
+                )));
+            };
+            let b = &buffers[i];
+            if given[i].is_some() {
+                return Err(Error::Launch(format!("the weight '{name}' is given twice")));
+            }
+            if t.access != Access::In {
+                return Err(Error::precondition(
+                    PreconditionKind::Access,
+                    Some(name),
+                    format!(
+                        "the weight '{name}' is given as a tensor the plan may write: a weight is only read, give a TensorRef"
+                    ),
+                ));
+            }
+            self.check_external(b, &t)?;
+            for (axis, (want, size)) in b.shape.iter().zip(t.shape).enumerate() {
+                if let ShapeDim::Static(n) = want
+                    && *n != *size as u64
+                {
+                    return Err(Error::precondition(
+                        PreconditionKind::StaticSize,
+                        Some(name),
+                        format!("the weight '{name}' has size {size} on axis {axis}, but the plan has {n} there"),
+                    ));
+                }
+            }
+            given[i] = Some(t);
+        }
+        if let Some(missing) = all.iter().find(|n| inner.by_name.get(**n).is_none_or(|i| given[*i].is_none())) {
+            return Err(Error::Launch(format!(
+                "the weight '{missing}' of graph '{graph}' is missing: bind_weights takes every one of {all:?}"
+            )));
+        }
+        let weights = buffers.iter().zip(given).filter_map(|(b, t)| t.map(|t| (b.name.clone(), t))).collect();
+        Ok(WeightedRun { run: self.clone(), weights })
     }
 
     fn unsolvable(&self, buffer: usize, axis: usize, actual: i64, e: Unsolvable) -> Error {
@@ -1299,6 +1370,98 @@ impl PlanRun {
             id,
             current: false,
         })
+    }
+}
+
+/// A launch plan instantiated on a device with its **weights bound once** ([`PlanRun::bind_weights`]): every launch and capture takes the other
+/// externals (inputs, `inout` tensors, outputs) and the device scalars only, and is otherwise exactly [`PlanRun::launch`] (and
+/// [`PlanRun::capture`]) given the weights too: the same checks, the same order with every other run of the instantiation.
+///
+/// It borrows the weights for `'w` (a capture made through it borrows them for its own lifetime), and holds the instantiation.
+pub struct WeightedRun<'w> {
+    run: PlanRun,
+    weights: Vec<(String, TensorArg<'w>)>,
+}
+
+impl std::fmt::Debug for WeightedRun<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeightedRun")
+            .field("graph", &self.run.inner.plan.graph())
+            .field("weights", &self.weights.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'w> WeightedRun<'w> {
+    /// The instantiation.
+    pub fn run(&self) -> &PlanRun {
+        &self.run
+    }
+
+    /// The names of the weights bound, in the order of the plan.
+    pub fn weights(&self) -> impl Iterator<Item = &str> {
+        self.weights.iter().map(|(n, _)| n.as_str())
+    }
+
+    fn refuse_weights<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        for name in names {
+            if self.weights.iter().any(|(n, _)| n == name) {
+                return Err(Error::Launch(format!(
+                    "'{name}' is a weight of the plan, bound once by bind_weights: a launch gives the other externals only"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn shared(&self) -> impl Iterator<Item = (&str, TensorArg<'_>)> {
+        self.weights.iter().map(|(n, t)| (n.as_str(), t.share().expect("a weight is a read-only tensor")))
+    }
+
+    /// Check a call as [`WeightedRun::launch`] does, and launch nothing.
+    pub fn check(&self, externals: &[(&str, TensorArg<'_>)], devscalars: &[(&str, DevScalar)]) -> Result<()> {
+        self.refuse_weights(externals.iter().map(|(n, _)| *n))?;
+        let mut all: Vec<(&str, TensorArg<'_>)> = self.weights.iter().map(|(n, t)| (n.as_str(), t.facts())).collect();
+        all.extend(externals.iter().map(|(n, t)| (*n, t.facts())));
+        self.run.check(&all, devscalars)
+    }
+
+    /// [`PlanRun::launch`] with the weights bound: `externals` are the inputs, the `inout` tensors and the outputs, by name.
+    pub fn launch(
+        &self,
+        stream: &Arc<CudaStream>,
+        externals: &mut [(&str, TensorArg<'_>)],
+        devscalars: &[(&str, DevScalar)],
+    ) -> Result<()> {
+        self.launch_tapped(stream, externals, devscalars, &mut [])
+    }
+
+    /// [`PlanRun::launch_tapped`] with the weights bound.
+    pub fn launch_tapped(
+        &self,
+        stream: &Arc<CudaStream>,
+        externals: &mut [(&str, TensorArg<'_>)],
+        devscalars: &[(&str, DevScalar)],
+        taps: &mut [Tap<'_>],
+    ) -> Result<()> {
+        self.refuse_weights(externals.iter().map(|(n, _)| *n))?;
+        let mut all: Vec<(&str, TensorArg<'_>)> = self.shared().collect();
+        all.extend(externals.iter_mut().map(|(n, t)| (*n, t.reborrow())));
+        self.run.launch_tapped(stream, &mut all, devscalars, taps)
+    }
+
+    /// [`PlanRun::capture`] with the weights bound: the [`CapturedPlan`] borrows the weights (through this `WeightedRun`) and the externals given
+    /// for `'ext`.
+    pub fn capture<'ext>(
+        &'ext self,
+        stream: &Arc<CudaStream>,
+        externals: Vec<(&str, TensorArg<'ext>)>,
+        devscalars: &[(&str, DevScalar)],
+    ) -> Result<CapturedPlan<'ext>> {
+        self.refuse_weights(externals.iter().map(|(n, _)| *n))?;
+        let mut all: Vec<(&str, TensorArg<'ext>)> = self.shared().collect();
+        all.extend(externals);
+        self.run.capture(stream, all, devscalars)
     }
 }
 

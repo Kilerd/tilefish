@@ -295,5 +295,6 @@
       ]
     }
   ],
-  "plan_digest": "9e4055bc94c48cce56d754224ba1cb4dae3088728fa163510e1ae16d88fcdf98"
+  "roles": "declared",
+  "plan_digest": "41a7b1f9c532dced4add4f9d9a945f7aa0403f01d4420409c20ebb29f0888101"
 }

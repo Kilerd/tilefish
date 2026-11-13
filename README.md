@@ -462,6 +462,12 @@ the last call puts into the caller's output. A view that is not dense is refused
 `out1`, ...), `tilefish.run(..., outputs={"y": y, "residual": r})` takes them by name, and the Rust host binds them by name; both hosts also take `out<i>` for
 the `i`-th returned value, so a host written for the names of before keeps working.
 
+**Inputs and weights.** `@tilefish.graph(inputs=("x",))` (or `weights=(...)`, or both) says which parameters a call gives every time and which a
+host binds once, when it loads the model. The plan records the roles (`"roles": "declared"`), and both hosts bind the weights once:
+`w = tilefish.runtime.bind_weights(graph, {"w1": t1, ...}, mode="replay", plan="build/", pin=p.digest)`, then `w.run(x)` and `w.capture(x, ...)`
+(Rust: `PlanRun::bind_weights`, a `WeightedRun` whose `launch` and `capture` take the inputs only). Without the declaration a plan labels a
+parameter by its shape, as before (`weight` when it mentions no dimension: every parameter of a fully static graph), and `bind_weights` refuses it.
+
 **Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
 last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest
 unchanged (`plan.shape_of("t3", M=64)` gives the shape; `tilefish.capture` takes `taps=` too; Rust: `PlanRun::launch_tapped`).

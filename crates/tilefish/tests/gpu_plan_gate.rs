@@ -507,6 +507,99 @@ fn a_captured_plan_replays_new_inputs_and_new_device_scalars() {
     );
 }
 
+/// The plan of a static graph that declares its roles (`weighted`: `x` an input, `w` and `b` weights): the weights bound once
+/// (`PlanRun::bind_weights`), then every case launched with its input and output only, and captured through the bound run and replayed with each
+/// case's input written into the captured tensor, each Python's bytes; a weight given again, a plan without declared roles, a weight missing and a
+/// weight given as a written tensor are refused, and launch nothing.
+#[test]
+fn weights_bound_once_give_pythons_bytes() {
+    let gpu = Gpu::new();
+    let plan = plan_named("weighted");
+    let lp = load(&plan);
+    assert!(lp.roles_declared());
+    assert_eq!(lp.weights().collect::<Vec<_>>(), ["w", "b"]);
+    assert_eq!(lp.buffer("x").unwrap().role, BufferRole::Input);
+    let run = lp.instantiate_all(&gpu.stream).unwrap();
+    let cases = plan["cases"].as_array().unwrap();
+    // the weights, uploaded once (every case has the same files)
+    let mut weights: Vec<Ext> = upload(&gpu.stream, &cases[0]).into_iter().filter(|e| e.role == "weight").collect();
+    assert_eq!(weights.len(), 2);
+    let bound = {
+        let given: Vec<(&str, TensorArg<'_>)> =
+            weights.iter_mut().map(|e| (e.name.as_str(), typed(&mut e.slice, &e.shape, e.dtype, false))).collect();
+        run.bind_weights(given).expect("the weights bind")
+    };
+    assert_eq!(bound.weights().collect::<Vec<_>>(), ["w", "b"]);
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        let mut exts: Vec<Ext> = upload(&gpu.stream, case).into_iter().filter(|e| e.role != "weight").collect();
+        bound.launch(&gpu.stream, &mut args(&mut exts, false), &[]).unwrap_or_else(|e| panic!("{id}: {e}"));
+        gpu.stream.synchronize().unwrap();
+        for e in exts.iter().filter(|e| e.expect.is_some()) {
+            let got = gpu.stream.clone_dtoh(&e.slice).unwrap();
+            assert!(
+                got == *e.expect.as_ref().unwrap(),
+                "{id}: '{}' differs in {} bytes",
+                e.name,
+                differing(&got, e.expect.as_ref().unwrap())
+            );
+        }
+    }
+    // one capture through the bound run, replayed with every case's input written into it
+    let mut exts: Vec<Ext> = upload(&gpu.stream, &cases[0]).into_iter().filter(|e| e.role != "weight").collect();
+    let mut graph = bound.capture(&gpu.stream, args(&mut exts, true), &[]).unwrap();
+    for case in cases.iter().rev() {
+        let id = case["id"].as_str().unwrap();
+        let inputs = upload_inputs(case);
+        gpu.stream.memcpy_htod(&inputs["x"], &mut graph.external_mut("x").unwrap()).unwrap();
+        graph.replay(&gpu.stream).unwrap();
+        gpu.stream.synchronize().unwrap();
+        for t in case["externals"].as_array().unwrap().iter().filter(|t| t.get("expect").is_some()) {
+            let name = t["name"].as_str().unwrap();
+            let got = gpu.stream.clone_dtoh(&graph.external(name).unwrap()).unwrap();
+            assert!(got == read(t["expect"].as_str().unwrap()), "{id}: the replay's '{name}'");
+        }
+    }
+    drop(graph);
+    // refusals: nothing is launched
+    let mut exts: Vec<Ext> = upload(&gpu.stream, &cases[0]).into_iter().filter(|e| e.role != "weight").collect();
+    let mut again = upload(&gpu.stream, &cases[0]);
+    let mut given = args(&mut again, false);
+    let e = bound.launch(&gpu.stream, &mut given, &[]).unwrap_err();
+    assert!(e.to_string().contains("is a weight of the plan, bound once"), "{e}");
+    drop(given);
+    let e = bound.capture(&gpu.stream, args(&mut again, false), &[]).unwrap_err();
+    assert!(e.to_string().contains("is a weight of the plan, bound once"), "{e}");
+    let one: Vec<(&str, TensorArg<'_>)> =
+        weights.iter_mut().take(1).map(|e| (e.name.as_str(), typed(&mut e.slice, &e.shape, e.dtype, false))).collect();
+    let e = run.bind_weights(one).unwrap_err();
+    assert!(e.to_string().contains("the weight 'b' of graph 'static_affine' is missing"), "{e}");
+    let written: Vec<(&str, TensorArg<'_>)> =
+        weights.iter_mut().map(|e| (e.name.as_str(), typed(&mut e.slice, &e.shape, e.dtype, true))).collect();
+    let e = run.bind_weights(written).unwrap_err();
+    assert!(matches!(e, Error::Precondition { kind: PreconditionKind::Access, .. }), "{e}");
+    let x: Vec<(&str, TensorArg<'_>)> = exts
+        .iter_mut()
+        .filter(|e| e.name == "x")
+        .map(|e| (e.name.as_str(), typed(&mut e.slice, &e.shape, e.dtype, false)))
+        .collect();
+    let e = run.bind_weights(x).unwrap_err();
+    assert!(e.to_string().contains("'x' is not a weight"), "{e}");
+    let block = load(&plan_named("block")).instantiate_all(&gpu.stream).unwrap();
+    assert!(!block.plan().roles_declared());
+    let e = block.bind_weights(Vec::new()).unwrap_err();
+    assert!(e.to_string().contains("does not declare which parameters are weights"), "{e}");
+    gpu.stream.synchronize().unwrap();
+    for e in exts.iter().filter(|e| e.role == "output") {
+        assert!(
+            gpu.stream.clone_dtoh(&e.slice).unwrap().iter().all(|b| *b == 0),
+            "a refused launch wrote '{}'",
+            e.name
+        );
+    }
+    println!("rust plan gate: {} cases launched and replayed with the weights bound once", cases.len());
+}
+
 fn upload_inputs(case: &Value) -> std::collections::HashMap<String, Vec<u8>> {
     case["externals"]
         .as_array()

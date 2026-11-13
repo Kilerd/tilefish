@@ -78,6 +78,8 @@ EXTERNAL_ROLES = ("input", "output", "inout", "weight")
 ARENA_ROLES = ("intermediate", "devscalar", "workspace")
 WRITABLE_ROLES = ("intermediate", "output", "inout")  # what a step may write
 TOP_KEYS = "schema tilefish graph arch manifest_digest dims reuse arena_alignment arena_bytes buffers outputs buckets plan_digest".split()
+OPTIONAL_TOP_KEYS = ("roles",)  # "roles": "declared" when the graph declares its inputs and weights (absent: the roles were chosen from the shapes)
+ROLES_DECLARED = "declared"
 BUFFER_KEYS = "name role dtype shape offset bytes".split()
 STEP_KEYS = "entry kind args".split()
 KINDS = ("kernel", "library", "copy")
@@ -358,7 +360,9 @@ def _walk(gop: GraphOp) -> _Walk:
             role = "devscalar"
         elif v.access == "inout":
             role = "inout"
-        else:
+        elif gop.param_roles is not None:  # declared: @tilefish.graph(inputs=..., weights=...)
+            role = gop.param_roles[v.name]
+        else:  # by its shape (not a contract a host can rely on: a fully static graph labels its inputs weights)
             role = "weight" if not v.type.free_dims() else "input"
         offset = v.type.offset
         if not (v.type.contiguous and v.type.strides is None and offset is not None and offset.is_static and offset.value == 0):
@@ -937,6 +941,22 @@ class Plan:
         """The buffer of the returned value ``name``: its own name, or ``out<i>`` for the ``i``-th (:func:`output_buffer`)."""
         return output_buffer(self._doc, name)
 
+    @property
+    def roles_declared(self) -> bool:
+        """Whether the graph declares which parameters are inputs and which weights (``@tilefish.graph(inputs=..., weights=...)``; the document has
+        ``"roles": "declared"``). Otherwise the roles ``input`` and ``weight`` were chosen from the parameters' shapes and are not a contract."""
+        return self._doc.get("roles") == ROLES_DECLARED
+
+    @property
+    def weights(self) -> "list[str]":
+        """The parameters of role ``weight``, in the order of the signature (what a host binds once when the roles are declared)."""
+        return [b["name"] for b in self._doc["buffers"] if b["role"] == "weight"]
+
+    @property
+    def inputs(self) -> "list[str]":
+        """The parameters of role ``input``, in the order of the signature (what a call gives every time, with the ``inout`` and ``devscalar`` ones)."""
+        return [b["name"] for b in self._doc["buffers"] if b["role"] == "input"]
+
     def shape_of(self, name: str, **values: int) -> "tuple[int, ...]":
         """The shape of the buffer ``name`` at the bucket ``values`` (``plan.shape_of("t3", M=64)``): what a tap of it (``taps=``) is given; its dtype
         is in :attr:`buffers`."""
@@ -1150,6 +1170,8 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
         "outputs": [b.name for b in w.outputs],
         "buckets": buckets_doc,
     }
+    if graph.param_roles is not None:  # only then: a plan of a graph that declares no roles (and its digest) is what it always was
+        doc["roles"] = ROLES_DECLARED
     doc["plan_digest"] = plan_digest(doc)
     try:  # every rule a reader holds a file to, the overlap sweep of the arena among them: what jit runs is checked as a replay's plan is
         validate_doc(doc, made=True)
@@ -1252,7 +1274,9 @@ def validate_doc(doc: Any, *, made: bool = False) -> None:
 
 
 def _validate(doc: Any, made: bool = False) -> None:
-    _keys(doc, "the document", TOP_KEYS)
+    _keys(doc, "the document", TOP_KEYS, OPTIONAL_TOP_KEYS)
+    if "roles" in doc and (type(doc["roles"]) is not str or doc["roles"] != ROLES_DECLARED):
+        _bad(f"roles is the string {ROLES_DECLARED!r} when present (the graph declares which parameters are inputs and which weights), got {doc['roles']!r}")
     if doc["schema"] != PLAN_SCHEMA or type(doc["schema"]) is not str:
         _bad(f"schema must be the string {PLAN_SCHEMA!r}, got {doc['schema']!r}")
     if not isinstance(doc["tilefish"], str):

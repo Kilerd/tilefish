@@ -47,6 +47,8 @@ def export_all(output: pathlib.Path) -> dict:
             "buckets": exported.buckets(),
             "steps_per_bucket": len(exported.steps(**exported.buckets()[-1])),
             "outputs": exported.outputs,
+            "roles_declared": exported.roles_declared,
+            "weights": exported.weights,
         }
     (output / "expected.json").write_text(json.dumps(expected, indent=2, sort_keys=True) + "\n")
     return expected

@@ -891,6 +891,15 @@ def capture(
     )
 
 
+def bind_weights(op: GraphOp, weights: Any, **options: Any) -> Any:
+    """Bind the weights of a graph whose plan declares its roles (``@tilefish.graph(inputs=..., weights=...)``) once:
+    ``w = bind_weights(graph, {"w1": t1, ...}, mode="replay", plan="build/", pin=p.digest)``, then ``w.run(x, n)`` and ``w.capture(x, devscalars=...)``
+    take only the other arguments. See :func:`tilefish._planrun.bind_weights`."""
+    from ._planrun import bind_weights as _bind_weights
+
+    return _bind_weights(op, weights, **options)
+
+
 def prepare(op: GraphOp, **options: Any) -> None:
     """Do ahead of time what a run of a graph's plan does for itself the first time (allocate its arena, build or load every binary, create the cuBLASLt
     handle), none of which can happen while a CUDA graph is being captured. ``prepare(graph, mode="jit" | "replay", plan=..., pin=..., device=..., buckets=...)``;

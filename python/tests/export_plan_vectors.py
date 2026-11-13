@@ -59,6 +59,10 @@ def mutations():
     out = [
         ("schema", setter(["schema"], "tilefish.plan.v2")),
         ("unknown key", setter(["extra"], 1)),
+        ("roles declared", setter(["roles"], "declared")),
+        ("roles of another word", setter(["roles"], "shape")),
+        ("roles true", setter(["roles"], True)),
+        ("roles null", setter(["roles"], None)),
         ("missing key", deleter(["arena_bytes"])),
         ("version type", setter(["tilefish"], 1)),
         ("version", setter(["tilefish"], "9.9.9")),

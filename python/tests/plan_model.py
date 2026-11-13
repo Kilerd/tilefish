@@ -255,7 +255,7 @@ def flat_half(x: Tensor[Rf * 64, f32]) -> Tensor[Rf * 64, f32]:
     return x * 0.5
 
 
-@tilefish.graph(outputs=("y", "half"))
+@tilefish.graph(outputs=("y", "half"), inputs=("x",))
 def steps(x: Tensor[2, Rf, 64, f32], state: InOut[Tensor[Rf, 64, f32]]):
     r = tilefish.copy(x[1])  # a copy step: a dense view of x into the arena
     y, r = add_over(x[0], r)  # r_out written over the copy: one buffer for r and r_out

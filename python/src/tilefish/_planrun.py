@@ -1429,6 +1429,153 @@ def capture(
     return runner.capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream, taps)
 
 
+def _runner_for(graph: GraphOp, what: str, mode: str, plan: Any, pin: "str | None", trust_directory: bool) -> PlanRunner:
+    """The runner ``mode`` (``jit`` or ``replay``) chooses for ``graph``, as :func:`capture` chooses it."""
+    if mode not in ("jit", "replay"):
+        raise TilefishRuntimeError(f"{what}: mode is 'jit' or 'replay', got {mode!r}")
+    if mode == "jit":
+        if pin is not None or trust_directory:
+            raise TilefishRuntimeError("pin= and trust_directory= are for mode='replay' (they vouch for a plan directory); mode 'jit' runs no plan directory")
+        if isinstance(plan, Plan):
+            if plan.graph is not graph:
+                raise TilefishRuntimeError(f"plan= is the plan of graph '{plan.name}', not of '{graph.name}'")
+            return _jit_runner(plan)
+        if plan is None:
+            return _jit_runner(_default_plan(graph))
+        raise TilefishRuntimeError("jit takes plan=<a Plan made by tilefish.plan(graph, ...)> or none; a directory is for mode='replay'")
+    if trust_directory is not True and trust_directory is not False:
+        raise TilefishRuntimeError(f"trust_directory= is True or False, got {trust_directory!r}")
+    return _replay_runner(graph, _plan_directory(plan), pin, trust_directory)
+
+
+class WeightedRun:
+    """The plan of a graph with its **weights bound once**: :func:`bind_weights` checked them against the plan, and every :meth:`run` and
+    :meth:`capture` takes the other arguments only (the inputs, the ``InOut`` tensors and the device scalars, in the order of the signature, or by
+    name). The roles are the graph's declaration (``@tilefish.graph(inputs=..., weights=...)``), which the plan records.
+
+    It holds the weight tensors (a run reads them where they are: write new values into them in place, as into any input). Runs and captures go
+    through the plan's runner, so they are ordered with every other run of the plan as :func:`tilefish.run` is."""
+
+    def __init__(self, runner: PlanRunner, weights: "dict[str, Any]") -> None:
+        self._runner = runner
+        self._weights = weights
+        sig = runner.plan.graph.signature
+        self._names = [n for n in sig.call_signature.parameters if n not in weights]  # what a run takes, in the order of the signature
+        scalars = {p.name for p in sig.params if p.kind == "tensor" and p.is_devscalar}
+        self._others = [n for n in sig.call_signature.parameters if n not in scalars]  # the externals of a capture, weights included
+
+    def __repr__(self) -> str:
+        return f"WeightedRun(graph={self.plan.name!r}, weights={list(self._weights)}, takes={self._names})"
+
+    @property
+    def plan(self) -> Plan:
+        return self._runner.plan
+
+    @property
+    def weights(self) -> "dict[str, Any]":
+        """The weights, by name (the tensors bound: write into them in place to change them)."""
+        return dict(self._weights)
+
+    def _arguments(self, args: "tuple[Any, ...]", kwargs: "Mapping[str, Any]", names: "Sequence[str]", what: str) -> "dict[str, Any]":
+        given = [n for n in kwargs if n in self._weights]
+        if given:
+            raise TilefishPreconditionError(
+                f"{what} of graph '{self.plan.name}': {', '.join(given)} is a weight, bound once by bind_weights (write new values into the tensor bound)",
+                kind="shape",
+                arg=given[0],
+            )
+        if len(args) > len(names):
+            raise TilefishPreconditionError(
+                f"{what} of graph '{self.plan.name}' takes at most {len(names)} argument(s) besides its weights ({', '.join(names)}), got {len(args)}",
+                kind="shape",
+            )
+        return {**self._weights, **dict(zip(names, args)), **kwargs}
+
+    def run(self, *args: Any, outputs: Any = None, taps: Any = None, **kwargs: Any) -> Any:
+        """``tilefish.run`` of the graph with the weights bound: ``args`` are the parameters that are not weights, in the order of the signature (or by
+        name); ``outputs=`` and ``taps=`` as there."""
+        return self._runner.run((), self._arguments(args, kwargs, self._names, "a run"), outputs, taps)
+
+    def capture(self, *externals: Any, devscalars: "Mapping[str, Any] | None" = None, outputs: Any = None, stream: Any = None, taps: Any = None) -> CapturedPlan:
+        """``tilefish.capture`` of the graph with the weights bound: ``externals`` are the parameters that are neither weights nor device scalars, in
+        the order of the signature; ``devscalars=``, ``outputs=``, ``stream=`` and ``taps=`` as there."""
+        names = [n for n in self._others if n not in self._weights]
+        merged = self._arguments(externals, {}, names, "a capture")
+        missing = [n for n in self._others if n not in merged]
+        if missing:
+            raise TilefishPreconditionError(f"a capture of graph '{self.plan.name}' needs {', '.join(missing)}", kind="shape", arg=missing[0])
+        return self._runner.capture(tuple(merged[n] for n in self._others), {} if devscalars is None else devscalars, outputs, stream, taps)
+
+    def prepare(self, device: Any = None, buckets: "Sequence[Mapping[str, int]] | None" = None) -> None:
+        """:func:`prepare` of the plan (its arena, binaries and handles), on ``device`` (default: the weights')."""
+        if device is None and self._weights:
+            device = next(iter(self._weights.values())).device
+        index = runtime._torch().cuda.current_device() if device is None else self._runner.backend.device_index(device)
+        self._runner.prepare(index, buckets)
+
+
+def bind_weights(
+    graph: GraphOp,
+    weights: "Mapping[str, Any]",
+    *,
+    mode: str = "jit",
+    plan: Any = None,
+    pin: "str | None" = None,
+    trust_directory: bool = False,
+) -> WeightedRun:
+    """Bind the weights of ``graph`` once: a :class:`WeightedRun` whose runs and captures take only the other arguments.
+
+    The plan must declare its roles (``@tilefish.graph(inputs=..., weights=...)``: ``"roles": "declared"`` in the document; a plan whose roles were
+    chosen from the shapes is refused, since a fully static graph labels its inputs weights), and ``weights`` must give a tensor for every parameter of
+    role ``weight`` and for nothing else, each on a CUDA device, of its dtype and rank, contiguous (and of its static sizes); the rest is checked at
+    every run, as for any argument. ``mode``, ``plan``, ``pin`` and ``trust_directory`` choose the plan as for :func:`tilefish.run`."""
+    if not isinstance(graph, GraphOp) or isinstance(graph, KernelOp):
+        raise TilefishRuntimeError(f"bind_weights takes a @tilefish.graph, got {graph!r}")
+    return weighted(_runner_for(graph, "bind_weights", mode, plan, pin, trust_directory), weights)
+
+
+def weighted(runner: PlanRunner, weights: "Mapping[str, Any]") -> WeightedRun:
+    """:func:`bind_weights` on a runner: the checks of the weights against its plan, then the :class:`WeightedRun`."""
+    graph = runner.plan.graph
+    p = runner.plan
+    if not p.roles_declared:
+        raise TilefishRuntimeError(
+            f"the plan of graph '{p.name}' does not declare which parameters are weights (its roles were chosen from the shapes, and a fully static graph "
+            "labels its inputs weights): declare them with @tilefish.graph(inputs=..., weights=...) and plan or export it again"
+        )
+    if not isinstance(weights, Mapping):
+        raise TilefishRuntimeError(f"bind_weights: weights= maps the name of every weight of graph '{p.name}' to its tensor, got {weights!r}")
+    want = p.weights
+    unknown = [n for n in weights if n not in want]
+    missing = [n for n in want if n not in weights]
+    if unknown or missing:
+        raise TilefishPreconditionError(
+            f"bind_weights: graph '{p.name}' has the weights {want}"
+            + (f"; {', '.join(map(str, unknown))} is not one" if unknown else "")
+            + (f"; {', '.join(missing)} is missing" if missing else ""),
+            kind="shape",
+            arg=(unknown or missing)[0],
+        )
+    params = {q.name: q for q in graph.signature.params}
+    device = None
+    shapes = {b["name"]: b["shape"] for b in p.doc["buffers"]}
+    for name, t in weights.items():
+        info = tensor_info(name, t)
+        check_tensor(params[name], info)
+        if not str(info.device).startswith("cuda"):
+            raise TilefishPreconditionError(f"bind_weights: the weight '{name}' is on {info.device}; a plan runs on a CUDA device", kind="device", arg=name)
+        if device is None:
+            device = info.device
+        elif runner.backend.device_index(info.device) != runner.backend.device_index(device):
+            raise TilefishPreconditionError(f"bind_weights: the weight '{name}' is on {info.device}, the others on {device}", kind="device", arg=name)
+        for axis, (want_size, size) in enumerate(zip(shapes[name], info.shape)):
+            if isinstance(want_size, int) and want_size != size:
+                raise TilefishPreconditionError(
+                    f"bind_weights: the weight '{name}' has size {size} on axis {axis}, but the plan has {want_size} there", kind="static_size", arg=name
+                )
+    return WeightedRun(runner, {n: weights[n] for n in want})
+
+
 def _plan_directory(plan: Any) -> Any:
     """``plan=`` of a replay: a directory (or its ``plan.json``), or the :class:`~tilefish._plan.Plan` that ``export`` returned (it knows its directory)."""
     if isinstance(plan, Plan):

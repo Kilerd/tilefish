@@ -325,6 +325,44 @@ impl<'a> TensorArg<'a> {
         }
     }
 
+    /// The same tensor, sharing this one, when it is only read (a `TensorRef` of cudarc memory, or a region): what a launch is given each time
+    /// for a tensor that is bound once and never written (a weight, `PlanRun::bind_weights`). `None` for a tensor that is written.
+    pub(crate) fn share(&self) -> Option<TensorArg<'_>> {
+        let backing = match &self.backing {
+            Backing::Raw => Backing::Raw,
+            Backing::Read(memory) => Backing::Read(*memory),
+            Backing::Write(_) => return None,
+        };
+        Some(TensorArg {
+            ptr: self.ptr,
+            shape: self.shape,
+            strides: self.strides,
+            byte_offset: self.byte_offset,
+            dtype: self.dtype,
+            device: self.device,
+            context: self.context,
+            owner: self.owner.clone(),
+            access: self.access,
+            backing,
+        })
+    }
+
+    /// The facts of this tensor (address, shape, strides, dtype, device, access) with no hold on its memory: for a check that launches nothing.
+    pub(crate) fn facts(&self) -> TensorArg<'_> {
+        TensorArg {
+            ptr: self.ptr,
+            shape: self.shape,
+            strides: self.strides,
+            byte_offset: self.byte_offset,
+            dtype: self.dtype,
+            device: self.device,
+            context: self.context,
+            owner: None,
+            access: self.access,
+            backing: Backing::Raw,
+        }
+    }
+
     /// The shape.
     pub fn shape(&self) -> &'a [usize] {
         self.shape

@@ -65,6 +65,10 @@ const TOP_KEYS: [&str; 13] = [
     "buckets",
     "plan_digest",
 ];
+/// `"roles": "declared"` when the graph declares which parameters are inputs and which weights; absent, the roles were chosen from the shapes.
+const OPTIONAL_TOP_KEYS: [&str; 1] = ["roles"];
+/// The one value of `roles`.
+const ROLES_DECLARED: &str = "declared";
 const BUFFER_KEYS: [&str; 6] = ["name", "role", "dtype", "shape", "offset", "bytes"];
 const STEP_KEYS: [&str; 3] = ["entry", "kind", "args"];
 /// A copy step has no entry (it launches no binary) and no workspace.
@@ -73,13 +77,15 @@ const COPY_KEYS: [&str; 2] = ["kind", "args"];
 /// What a buffer of a plan is, and who provides it (`docs/plan-schema-1.md`, section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BufferRole {
-    /// A graph parameter whose shape mentions a dimension (an activation): the caller's, read.
+    /// A graph parameter that a call gives every time (an activation): the caller's, read. Declared by the graph when the plan says
+    /// [`LaunchPlan::roles_declared`]; otherwise a parameter whose shape mentions a dimension.
     Input,
     /// A returned value: the caller's, written (first), then read and written.
     Output,
     /// An `InOut` parameter: the caller's, updated in place.
     Inout,
-    /// A graph parameter whose shape mentions no dimension: the caller's, read.
+    /// A graph parameter that a host binds once ([`crate::PlanRun::bind_weights`]): the caller's, read. Declared by the graph when the plan says
+    /// [`LaunchPlan::roles_declared`]; otherwise a parameter whose shape mentions no dimension (which a fully static graph's inputs are too).
     Weight,
     /// A result that is not returned: in the arena.
     Intermediate,
@@ -230,6 +236,7 @@ pub(crate) struct Inner {
     pub(crate) manifest_digest: String,
     pub(crate) digest: String,
     pub(crate) reuse: bool,
+    pub(crate) roles_declared: bool,
     pub(crate) arena_bytes: u64,
     pub(crate) dims: Vec<(String, Vec<u64>)>,
     pub(crate) buffers: Vec<PlanBuffer>,
@@ -417,6 +424,7 @@ struct Validated {
     arch: String,
     manifest_digest: String,
     reuse: bool,
+    roles_declared: bool,
     arena_bytes: u64,
     dims: Vec<(String, Vec<u64>)>,
     buffers: Vec<PlanBuffer>,
@@ -426,7 +434,17 @@ struct Validated {
 
 /// Every rule of sections 2 and 5 to 8, in the order of Python's `_validate` (`validate_doc`).
 fn validate(doc: &Value) -> Check<Validated> {
-    let top = keys(doc, "the document", &TOP_KEYS, &[])?;
+    let top = keys(doc, "the document", &TOP_KEYS, &OPTIONAL_TOP_KEYS)?;
+    let roles_declared = match top.get("roles") {
+        None => false,
+        Some(Value::String(s)) if s == ROLES_DECLARED => true,
+        Some(other) => {
+            return refuse(format!(
+                "roles is the string {ROLES_DECLARED:?} when present (the graph declares which parameters are inputs and which weights), got {}",
+                brief(other)
+            ));
+        }
+    };
     if top["schema"].as_str() != Some(PLAN_SCHEMA) {
         return refuse(format!("schema must be the string {PLAN_SCHEMA:?}, got {}", brief(&top["schema"])));
     }
@@ -893,6 +911,7 @@ fn validate(doc: &Value) -> Check<Validated> {
         arch,
         manifest_digest,
         reuse,
+        roles_declared,
         arena_bytes,
         dims,
         buffers,
@@ -1213,8 +1232,19 @@ impl LaunchPlan {
 
     fn finish(label: String, validated: Validated, digest: String, manifest: Manifest) -> Result<Self> {
         check_against_manifest(&validated, &manifest)?;
-        let Validated { version, graph, arch, manifest_digest, reuse, arena_bytes, dims, buffers, outputs, buckets } =
-            validated;
+        let Validated {
+            version,
+            graph,
+            arch,
+            manifest_digest,
+            reuse,
+            roles_declared,
+            arena_bytes,
+            dims,
+            buffers,
+            outputs,
+            buckets,
+        } = validated;
         Ok(Self {
             inner: Arc::new(Inner {
                 label,
@@ -1224,6 +1254,7 @@ impl LaunchPlan {
                 manifest_digest,
                 digest,
                 reuse,
+                roles_declared,
                 arena_bytes,
                 dims,
                 buffers,
@@ -1272,6 +1303,18 @@ impl LaunchPlan {
     /// The bytes of the arena.
     pub fn arena_bytes(&self) -> u64 {
         self.inner.arena_bytes
+    }
+
+    /// Whether the graph declares which parameters are inputs (given at every call) and which weights (bound once): the plan has
+    /// `"roles": "declared"` (Python's `@tilefish.graph(inputs=..., weights=...)`). Otherwise the roles `input` and `weight` were chosen from
+    /// the shapes (a fully static graph labels its inputs weights), and [`crate::PlanRun::bind_weights`] refuses the plan.
+    pub fn roles_declared(&self) -> bool {
+        self.inner.roles_declared
+    }
+
+    /// The parameters of role `weight`, in the order of the graph's signature.
+    pub fn weights(&self) -> impl Iterator<Item = &str> {
+        self.inner.buffers.iter().filter(|b| b.role == BufferRole::Weight).map(|b| b.name.as_str())
     }
 
     /// The dimensions and the sizes planned for each (its buckets), in the order of the file.

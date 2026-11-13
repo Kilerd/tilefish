@@ -41,7 +41,7 @@ it from the first view and holds the others to it, as a single launch does.
  "reuse": false, "arena_alignment": 256, "arena_bytes": 9634048, "buffers": [ ... ], "outputs": ["out0"], "buckets": [ ... ], "plan_digest": "<64 hex>"}
 ```
 
-Exactly these keys, no others and none missing (a reader refuses the file otherwise):
+Exactly these keys, no others and none missing (a reader refuses the file otherwise), and optionally `roles`:
 
 | key | type and rule |
 |---|---|
@@ -58,6 +58,7 @@ Exactly these keys, no others and none missing (a reader refuses the file otherw
 | `outputs` | list of buffer names: the buffers of role `output`, each once, **in the order the graph returns them**. |
 | `buckets` | list with one entry per bucket combination (section 5), each `{"values": {...}, "steps": [...]}` (section 7). |
 | `plan_digest` | 64 lowercase hex digits (section 3). |
+| `roles` (optional) | the string `"declared"`, present exactly when the graph declares which parameters are inputs and which weights (`@tilefish.graph(inputs=..., weights=...)`, section 6). Any other value is refused. A plan of a graph that declares nothing has no `roles` and is, with its digest, what it always was; a reader that predates the key (the published crate 0.0.2, tilefish 0.0.4) refuses a plan that has it. |
 
 **Integers are JSON integers**: a reader refuses `2.0`, `1e3` and `true` where an integer is wanted (Python: `type(v) is int`).
 
@@ -132,8 +133,8 @@ magnitude, so that every language reads the same number); a file larger than
 
 | `role` | what it is | who provides it | a step may |
 |---|---|---|---|
-| `input` | a graph parameter whose shape mentions a dimension (an activation) | the caller | read |
-| `weight` | a graph parameter whose shape mentions no dimension | the caller | read |
+| `input` | a graph parameter that a call gives every time (an activation) | the caller, at every call | read |
+| `weight` | a graph parameter that a host binds once (a model weight) | the caller, once (or at every call) | read |
 | `inout` | an `InOut` parameter: updated in place | the caller | read and write |
 | `output` | a returned value (a result of a call) | the caller (allocated by the Python `run` unless `outputs=` gives it) | write (first), then read and write |
 | `intermediate` | a result that is not returned | the arena | write (first), then read and write |
@@ -141,7 +142,11 @@ magnitude, so that every language reads the same number); a file larger than
 | `workspace` | the cuBLASLt workspace: dtype `u8`, shape `[N]` with a static `N` | the arena | (only as the `workspace` of a library step) |
 
 * The buffers listed first are the graph's parameters, in the order of its signature; they have the roles `input`, `weight`, `inout` and `devscalar`. The rest are made by the
-  steps, then the workspace. (Whether a parameter is an `input` or a `weight` is how the writer labels it, from its shape; a reader does not check it, and neither role is written.)
+  steps, then the workspace. Neither `input` nor `weight` is written, and a reader checks nothing else about the two. **Who chose them:** with `"roles": "declared"`
+  the graph did (`@tilefish.graph(inputs=("x",))`, `weights=(...)` or both: every read-only tensor parameter is one or the other, an `InOut` is `inout` and a
+  `DevScalar` is `devscalar`), and a host may bind the weights once per instantiation and only the inputs at every call (section 9). Without `roles` the writer
+  labelled a parameter by its shape (`weight` when it mentions no dimension), which is not a contract: every parameter of a fully static graph is a `weight`,
+  its per-call inputs included, so a host does not bind the weights of such a plan once (both hosts refuse to).
 * A `devscalar` has shape `[]` (one element). There is at most one `workspace`, and it exists exactly when some step has kind `library`; its `bytes` is the
   largest `workspace_bytes` of the library entries the plan uses (a reader requires it to be at least each one's: section 7.3).
 * **The arena** is `arena_bytes` bytes of device memory, allocated once by the host and **aligned to 256 bytes**. The region of an arena buffer is
@@ -288,6 +293,13 @@ what it always was.
 A host may cache everything of steps 1 to 3 that does not depend on an address (the dimension bindings, scalars, grids, the entries' loaded functions and pinned algorithms) per bucket, as Python's
 runner does; the address-dependent checks are repeated at every execution.
 
+**Weights bound once (not part of the document).** For a plan with `"roles": "declared"` a host may take the tensors of the buffers of role `weight` once
+and every other external at each call: what it checks and launches is exactly steps 2 to 5 with all of them. The weights are checked when they are bound as an
+external is (dtype, rank, density, the static sizes; a weight is only read), and again with the rest at every call (a dimension a weight's shape mentions, the
+overlaps). A weight given again at a call is refused. Python: `tilefish.runtime.bind_weights(graph, {"w": t, ...}, mode=, plan=, pin=)`, a `WeightedRun` whose
+`run(*inputs)` and `capture(*inputs, devscalars=...)` take the parameters that are not weights; Rust: `PlanRun::bind_weights(vec![("w", t), ...])`, a
+`WeightedRun<'w>` (it borrows the weights) whose `launch`, `launch_tapped`, `check` and `capture` take the other externals. Both refuse a plan without `roles`.
+
 **Debug taps (not part of the document).** A host may copy a buffer of the plan out during an execution, to observe the intermediates of the very plan a product runs: the
 plan and its digest are unchanged. A *tap* names a buffer (any but the workspace; a returned value by its name or `out<i>`) and a step of the bucket (by default the last step
 that writes the buffer: an `out` or `inout` pointer of a kernel, the `out` of a GEMM, the `dst` of a copy), and gives a dense tensor of the buffer's dtype and its shape at the
@@ -364,6 +376,8 @@ tilefish.run(graph, *inputs, outputs=out)                                   # wr
 tilefish.run(graph, *inputs, outputs={"y": y, "residual": r})              # the same by name (the graph's names, or out0, out1, ...)
 tilefish.run(graph, *inputs, taps={"t3": t, ("t5", 4): u})                 # copy buffers out after a step (section 9: debug taps; the plan is unchanged)
 plan.shape_of("t3", M=64)                                                   # the shape of a buffer at a bucket (what a tap is given)
+w = tilefish.runtime.bind_weights(graph, {"w_o": w_o, ...}, mode="replay", plan="build/", pin=p.digest)  # a plan with declared roles (section 6)
+w.run(x, n); w.capture(x, devscalars={"n": 5})                              # the inputs only: the weights are bound (section 9)
 tilefish.runtime.prepare(graph, mode="replay", plan="build/", pin=p.digest) # arena, binaries, handle: before a CUDA graph capture
 tilefish.runtime.run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest)  # one step alone (section 9)
 cap = tilefish.capture(graph, *externals, devscalars={"n": 5}, outputs=out) # a CapturedPlan: the plan in a CUDA graph of its own (mode=, plan=, pin= as for run)
@@ -444,6 +458,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | returned views and parameters (section 12) | `test_plan_returns.py`; on a GPU `test_gpu_plan_returns.py` |
 | one step alone (section 9) | `test_plan_step.py`; on a GPU `test_gpu_plan_step.py` and `gpu_plan_gate.rs` (`the_steps_launched_one_by_one_give_the_bytes_of_the_plan`) |
 | debug taps (section 9) | `test_plan_taps.py`; on a GPU `test_gpu_plan_taps.py` and `gpu_plan_gate.rs` (`taps_are_pythons_bytes`: Rust taps against Python's) |
+| the roles of the parameters, declared or chosen from the shapes (sections 2, 6), and weights bound once (section 9) | `test_plan_roles.py`; the golden plan `steps` (`launch_plans.rs`); on a GPU `test_gpu_plan_roles.py` and `gpu_plan_gate.rs` (`weights_bound_once_give_pythons_bytes`) |
 | the names of the returned values (section 6) | `test_plan_names.py`; the golden plan `steps` (`launch_plans.rs`); on a GPU `gpu_plan_gate.rs` (`a_named_output_is_given_by_its_name_or_by_out_i`) |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |
