@@ -218,7 +218,7 @@ the shapes of the views.
    Keep it for as long as the plan is in use; **the plan is not reentrant**: two executions of one plan are ordered by the caller (one stream, or an event), because they share the arena.
 2. **Bind the externals.** The caller gives a tensor (address, shape, strides, dtype) for every buffer of role `input`, `weight` and `inout`, and for every `output` (or the host allocates it), and a
    value for every `devscalar`. Check each external against its buffer: dtype, rank, contiguous row-major (a parameter is a dense tensor), and bind the dimensions (section 5). Select the bucket.
-   The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`).
+   The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`), and none may overlap the arena.
 3. **Check, before anything is launched**: for every step of the selected bucket, resolve it (section 7.2) with the real addresses and run every check of a single launch. **If any check fails,
    nothing is launched and nothing is written**, not even a device scalar: the checks are all done first, then the writes and the launches.
 4. **Write the device scalars.** Each `devscalar` slot (at `arena + offset`) gets the value the caller gave, as the little-endian bytes of its dtype, ordered on the stream before the first
