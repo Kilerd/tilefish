@@ -130,7 +130,8 @@ class TorchBackend(Backend):
         return runtime._capability(self.torch, index)
 
     def capturing(self, index: int) -> bool:
-        return bool(self.torch.cuda.is_current_stream_capturing())
+        with self.torch.cuda.device(index):  # the current stream of that device
+            return bool(self.torch.cuda.is_current_stream_capturing())
 
     def scope(self, index: int) -> Any:
         return self.torch.cuda.device(index)
@@ -394,6 +395,10 @@ class PlanRunner:
         arch = self.plan.arch
         if arch is not None and arch != f"sm_{be.capability(index)}":
             raise TilefishRuntimeError(f"the plan of graph '{graph.name}' was built for {arch}, but device {index} is sm_{be.capability(index)}")
+        for name in sources:  # a device scalar may be on the host, or on this device: a copy from another device is not what a plan orders
+            where = call.infos[name].device
+            if where != "cpu" and be.device_index(where) != index:
+                raise TilefishPreconditionError(f"the device scalar '{name}' is on {where}, but the other tensors of the call are on device {index}", kind="device", arg=name)
         capturing = be.capturing(index)
         rt = self._bucket(values, index)
         arena = self._arena(index)

@@ -239,6 +239,21 @@ def test_a_requirement_of_the_graph_is_checked_at_every_bucket():
 # -- what a plan refuses -----------------------------------------------------------------------------------------------------------------
 
 
+def test_a_bucket_an_operator_has_no_binary_for_is_refused_by_the_graphs_own_requirement():
+    G = Dim("G", buckets=[32, 64, 128])
+
+    @tilefish.library("gemm_g", acc=f32, impl="cublaslt.gemm")
+    def gemm_g(a: Tensor[Dim("G", buckets=[32, 64]), 256, bf16], b: Tensor[256, 256, bf16]) -> Tensor[Dim("G", buckets=[32, 64]), 256, bf16]: ...
+
+    @tilefish.graph
+    def wide(a: Tensor[G, 256, bf16], b: Tensor[256, 256, bf16]) -> Tensor[G, 256, bf16]:
+        return gemm_g(a, b)
+
+    with pytest.raises(TilefishPlanError, match=r"G in \[32, 64\].*it is 128"):
+        tilefish.plan(wide)
+    assert tilefish.plan(wide, buckets={"G": [32, 64]}).dims == {"G": (32, 64)}  # the subset the operator has binaries for
+
+
 def test_a_kernel_or_anything_that_is_not_a_graph_is_not_planned():
     with pytest.raises(TilefishPlanError, match="takes a @tilefish.graph"):
         tilefish.plan(twice)
