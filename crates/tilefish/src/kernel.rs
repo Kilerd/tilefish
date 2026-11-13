@@ -224,11 +224,7 @@ impl Manifest {
         }
         let attribute =
             |a: CUdevice_attribute, call: &'static str| ctx.attribute(a).map(i64::from).map_err(Error::driver(call));
-        let max_grid = [
-            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, "cuDeviceGetAttribute(MAX_GRID_DIM_X)")?,
-            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y, "cuDeviceGetAttribute(MAX_GRID_DIM_Y)")?,
-            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z, "cuDeviceGetAttribute(MAX_GRID_DIM_Z)")?,
-        ];
+        let max_grid = max_grid(attribute)?;
         let shared_optin = attribute(
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
             "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
@@ -286,6 +282,16 @@ impl Manifest {
     }
 }
 
+/// The largest grid the device takes along x, y and z (what a launch's grid is checked against: `DeviceInfo::max_grid`), from the
+/// device's attributes; `attribute` asks the driver for one.
+fn max_grid(attribute: impl Fn(CUdevice_attribute, &'static str) -> Result<i64>) -> Result<[i64; 3]> {
+    Ok([
+        attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, "cuDeviceGetAttribute(MAX_GRID_DIM_X)")?,
+        attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y, "cuDeviceGetAttribute(MAX_GRID_DIM_Y)")?,
+        attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z, "cuDeviceGetAttribute(MAX_GRID_DIM_Z)")?,
+    ])
+}
+
 /// Allow `bytes` of dynamic shared memory (needed above the default 48 KiB) for `function`, which is in `ctx`.
 fn set_max_dynamic_shared(ctx: &CudaContext, function: &CudaFunction, bytes: i32) -> Result<()> {
     let call = "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)";
@@ -294,4 +300,88 @@ fn set_max_dynamic_shared(ctx: &CudaContext, function: &CudaFunction, bytes: i32
     function
         .set_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes)
         .map_err(Error::driver(call))
+}
+
+#[cfg(test)]
+mod tests {
+    //! What a launch of a loaded kernel is checked against, without a GPU: the device's grid limits as `Manifest::kernel` reads them
+    //! (`max_grid`, over made-up attributes), and the checks of `Kernel::check` (the plan's, with that device) refusing a grid beyond them.
+
+    use super::*;
+    use crate::manifest::{Access, Pin};
+    use crate::region::DevicePtr;
+    use crate::tensor::DType;
+
+    /// The device a kernel would be loaded on, whose attributes say it takes `limits` blocks along x, y and z.
+    fn device(limits: [i64; 3]) -> DeviceInfo {
+        let attribute = |a: CUdevice_attribute, _call: &'static str| match a {
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X => Ok(limits[0]),
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y => Ok(limits[1]),
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z => Ok(limits[2]),
+            other => panic!("the grid limits do not need {other:?}"),
+        };
+        DeviceInfo { ordinal: 0, context: Some(0xC0_0000), max_grid: max_grid(attribute).unwrap() }
+    }
+
+    /// The plan of `stem` in the `sm_103` fixture, with its grid replaced by `grid` when one is given.
+    fn plan(stem: &str, grid: Option<&str>) -> Plan {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sm_103");
+        let manifest = Manifest::load(dir, Pin::TrustDirectory).unwrap();
+        let mut entry = manifest.entry(stem, "sm_103").unwrap().clone();
+        if let Some(grid) = grid {
+            entry.grid = grid.to_owned();
+        }
+        Plan::new(&entry).unwrap()
+    }
+
+    fn tensor(addr: u64, shape: &[usize], dtype: DType, access: Access) -> TensorArg<'_> {
+        let bytes = shape.iter().product::<usize>() as u64 * dtype.size() as u64;
+        // SAFETY: the address is never dereferenced: the checks only look at the number.
+        #[allow(unsafe_code)]
+        let region = unsafe { DevicePtr::from_raw(addr, bytes, 0) };
+        TensorArg::new(region, shape, dtype, access).unwrap()
+    }
+
+    /// The limits are the x, y and z attributes, in that order, and an attribute the driver does not give is the error of its call.
+    #[test]
+    fn the_grid_limits_of_a_device_are_its_x_y_and_z_attributes_in_that_order() {
+        assert_eq!(device([11, 22, 33]).max_grid, [11, 22, 33]);
+        let failing = |a: CUdevice_attribute, call: &'static str| match a {
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y => Err(Error::Unsupported(call.to_owned())),
+            _ => Ok(1),
+        };
+        let e = max_grid(failing).unwrap_err();
+        assert_eq!(e.to_string(), "cuDeviceGetAttribute(MAX_GRID_DIM_Y)");
+    }
+
+    /// `Kernel::check` refuses a grid that is more blocks than the device takes along an axis, and takes one that is exactly as many.
+    #[test]
+    fn a_grid_beyond_the_limits_the_device_reports_is_refused_along_each_axis() {
+        let x = |rows: usize| [rows, 1000];
+        let softmax = |plan: &Plan, rows: usize, limits: [i64; 3]| {
+            let shape = x(rows);
+            let tensors = [
+                tensor(0x7000_0000_0000, &shape, DType::F32, Access::In),
+                tensor(0x7100_0000_0000, &shape, DType::F32, Access::Out),
+            ];
+            plan.prepare(&tensors, Some(&device(limits))).map(|p| p.grid)
+        };
+        // softmax's grid is (M,): M rows are M blocks along x
+        let plan_x = plan("softmax", None);
+        assert_eq!(softmax(&plan_x, 1000, [1000, 1, 1]).unwrap(), [1000, 1, 1]);
+        let e = softmax(&plan_x, 1001, [1000, 1, 1]).unwrap_err();
+        assert!(
+            matches!(&e, Error::Unsupported(m) if m == "'softmax': the grid (M,) is 1001 blocks along x here, but this device takes 1 to 1000 there"),
+            "{e}"
+        );
+        // and with a grid along y and z: (M, 7, 5)
+        let plan_xyz = plan("softmax", Some("(M, 7, 5)"));
+        assert_eq!(softmax(&plan_xyz, 3, [3, 7, 5]).unwrap(), [3, 7, 5]);
+        for (limits, along) in
+            [([2, 7, 5], "3 blocks along x"), ([3, 6, 5], "7 blocks along y"), ([3, 7, 4], "5 blocks along z")]
+        {
+            let e = softmax(&plan_xyz, 3, limits).unwrap_err();
+            assert!(matches!(&e, Error::Unsupported(m) if m.contains(along)), "{limits:?}: {e}");
+        }
+    }
 }
