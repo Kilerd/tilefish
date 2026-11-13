@@ -507,6 +507,20 @@ def test_a_missing_operand_pointer_is_refused(untouchable_library):
             L.matmul(*pointers, None, 8, 16, 32, HEX, workspace_bytes=0, stream=0)
 
 
+@pytest.mark.parametrize("bad", [0, 16, 128, 0x1000 + 16, 0x1000 + 255, -256, 2**64, 256.0, "256", True])
+def test_a_workspace_the_caller_gives_is_256_byte_aligned(untouchable_library, bad):
+    """What the Rust host requires of a caller's workspace (cuBLASLt asks for 16 bytes at least and recommends 256), checked before the library is touched."""
+    with pytest.raises(TilefishRuntimeError, match=r"workspace pointer"):
+        L.matmul(0x1000, 0x2000, 0x3000, None, 8, 16, 32, HEX, workspace_bytes=1024, stream=0, workspace_ptr=bad)
+
+
+def test_a_workspace_aligned_to_256_bytes_reaches_the_library(reachable_library):
+    with pytest.raises(Reached):
+        L.matmul(0x1000, 0x2000, 0x3000, None, 8, 16, 32, HEX, workspace_bytes=1024, stream=0, workspace_ptr=0x10100)
+    with pytest.raises(TilefishRuntimeError, match=r"the workspace pointer 0x10010 is not 256-byte aligned"):
+        L.matmul(0x1000, 0x2000, 0x3000, None, 8, 16, 32, HEX, workspace_bytes=1024, stream=0, workspace_ptr=0x10010)  # 16 bytes was enough before
+
+
 def test_the_message_of_a_misaligned_pointer_says_which_and_why(untouchable_library):
     with pytest.raises(TilefishRuntimeError, match=r"the D pointer 0x3008 is not 16-byte aligned"):
         L.matmul(0x1000, 0x2000, 0x3008, None, 8, 16, 32, HEX, workspace_bytes=0, stream=0)

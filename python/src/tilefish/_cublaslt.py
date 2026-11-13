@@ -60,6 +60,7 @@ ALGO_BYTES = 64  # sizeof(cublasLtMatmulAlgo_t): uint64_t data[8]
 INT32_MAX = (1 << 31) - 1
 UINT64_MAX = (1 << 64) - 1
 ALIGNMENT_BYTES = 16
+WORKSPACE_ALIGNMENT = 256  # of a workspace the caller gives (cuBLASLt asks for 16 bytes at least and recommends 256; the Rust host requires 256, a plan's arena buffer is)
 REQUESTED_ALGO_COUNT = 8  # how many results the heuristic is asked for; the first is the pin
 HEURISTIC_BIAS_POINTER = 16  # a 16-byte (and no more) aligned dummy, so that the heuristic never sees an address of the caller's
 
@@ -352,7 +353,12 @@ def _lib() -> _Library:
 
 
 def version() -> int:
-    """``cublasLtGetVersion()``: the version of the cuBLASLt this process uses (for 12.8.4 it is ``120804``)."""
+    """``cublasLtGetVersion()``: the version of the cuBLASLt this process uses (for 12.8.4 it is ``120804``).
+
+    This is all a pin is compared on: cuBLASLt exposes no build number. ``cublasLtGetVersion`` is ``major * 10000 + minor * 100 + patch``, and
+    ``cublasLtGetProperty`` answers the same three (``MAJOR_VERSION``, ``MINOR_VERSION``, ``PATCH_LEVEL``; checked on 12.8.4, whose library has no
+    other version or build entry point), so two builds of one version are not told apart. The library that ran the pin is the one torch maps, and a
+    different build of the same version is not refused by this check (``docs/manifest-schema-3.md``, section 9)."""
     return int(_lib().cublasLtGetVersion())  # type: ignore[attr-defined]
 
 
@@ -381,6 +387,14 @@ def _check_pointer(name: str, value: object) -> int:
     value = _int_arg(f"{name} pointer", value, low=1, high=UINT64_MAX)
     if value % ALIGNMENT_BYTES:
         raise TilefishRuntimeError(f"cuBLASLt matmul: the {name} pointer {value:#x} is not {ALIGNMENT_BYTES}-byte aligned")
+    return value
+
+
+def _check_workspace_pointer(value: object) -> int:
+    """A workspace the caller gives: a non-null address aligned to ``WORKSPACE_ALIGNMENT`` bytes (what the Rust host requires too)."""
+    value = _int_arg("workspace pointer", value, low=1, high=UINT64_MAX)
+    if value % WORKSPACE_ALIGNMENT:
+        raise TilefishRuntimeError(f"cuBLASLt matmul: the workspace pointer {value:#x} is not {WORKSPACE_ALIGNMENT}-byte aligned")
     return value
 
 
@@ -847,9 +861,9 @@ def matmul(
     stream = _int_arg("stream", stream, low=0, high=UINT64_MAX)
     device_index = _check_device_arg(device_index)
     algo = _algo_struct(algo_hex)
+    given = None if workspace_ptr is None else _check_workspace_pointer(workspace_ptr)
     lib = _lib()
     index = _device(device_index)
-    given = None if workspace_ptr is None else _check_pointer("workspace", workspace_ptr)
     handle = _handle(lib, index)
     with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None) as p:
         required = _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}")

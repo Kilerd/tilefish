@@ -505,7 +505,7 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         for i, (p, shape) in enumerate(zip(params, expected_shapes)):
             sv._keys(p, f"abi.params[{i}]", ["index", "name", "kind", "dtype", "access", "shape"])
             sv._ident(p["name"], f"abi.params[{i}].name")
-            if p["index"] != i or p["kind"] != "pointer" or p["dtype"] != "bf16" or p["access"] != ("out" if i == len(params) - 1 else "in"):
+            if not sv.is_int(p["index"]) or p["index"] != i or p["kind"] != "pointer" or p["dtype"] != "bf16" or p["access"] != ("out" if i == len(params) - 1 else "in"):  # 0.0 and true are not 0 and 1
                 _bad(where, f"abi.params[{i}] must be the bf16 pointer #{i} with access {'out' if i == len(params) - 1 else 'in'}")
             if p["name"] in seen:
                 _bad(where, f"the name {p['name']!r} is used twice")
@@ -560,7 +560,7 @@ def validate_entry(entry: Any, index: int = 0) -> None:
                 b = c["buckets"]
                 if not isinstance(b, list) or not b or any(not sv.is_int(x) or x < 1 for x in b) or b != sorted(set(b)):
                     _bad(where, f"dims.{name}.buckets must be a sorted list of distinct positive ints")
-            if "bucket" in c and ("buckets" not in c or c["bucket"] not in c["buckets"] or buckets.get(name) != c["bucket"]):
+            if "bucket" in c and ("buckets" not in c or not sv.is_int(c["bucket"]) or c["bucket"] not in c["buckets"] or buckets.get(name) != c["bucket"]):
                 _bad(where, f"dims.{name}.bucket must be one of its buckets and the bucket of this entry")
         for name in buckets:
             if table.get(name, {}).get("bucket") != buckets[name]:

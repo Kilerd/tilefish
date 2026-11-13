@@ -425,6 +425,14 @@ def test_the_sm_count_is_a_positive_int(bad):
     validate_entry(entry)
 
 
+@pytest.mark.parametrize("bad", [0.0, False])
+def test_the_index_of_an_operand_is_an_int_not_a_float_or_a_bool(bad):
+    """``0.0 == 0`` and ``True == 1`` in Python: the comparison with the position alone let them through (Rust refuses them)."""
+    refuses(lambda e: e["abi"]["params"][0].update(index=bad), r"must be the bf16 pointer #0")
+    refuses(lambda e: e["abi"]["params"][1].update(index=True if bad is False else 1.0), r"must be the bf16 pointer #1")
+    refuses(lambda e: e["dims"]["M"].update(bucket=32.0), r"dims.M.bucket must be one of its buckets")
+
+
 def test_the_operands_are_a_b_bias_out_in_this_order():
     refuses(lambda e: e["abi"]["params"].pop(), "abi.params must list 3 pointers")
     refuses(lambda e: e["abi"].update(extra=1), "unknown fields")
