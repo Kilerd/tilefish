@@ -45,7 +45,8 @@ and refuses
   preconditions, options, declaration digest): a binary never runs under assumptions it was not compiled for;
 * a stale binary. **The identity of a binary is the Triton IR its kernel compiles to** (:mod:`tilefish._ir`): Triton's
   frontend is run on the spec's source in this process (a few milliseconds, no compile) and the TTIR it builds, without locations
-  or names, is hashed. Every manifest entry records that digest (``source_digest``, kind ``"tilefish.triton-ir.v1"``), and when Triton
+  or names, is hashed (Gluon's frontend and its TTGIR for a Gluon kernel). Every manifest entry records that digest (``source_digest``,
+  kind ``"tilefish.triton-ir.v1"``, or ``"tilefish.gluon-ir.v1"`` for a Gluon kernel), and when Triton
   is importable ``replay`` recomputes it from the kernel *as this process holds it* and refuses a mismatch ("stale"), pinned or not.
   Whatever the frontend reads is in the IR, so no route a kernel reads a constant by escapes it: a module attribute, ``getattr``
   (with a literal or a computed name), a class attribute, a closure variable, a ``triton.constexpr_function`` that reads the
@@ -504,7 +505,7 @@ def _ir_digest_of(spec: CompileSpec, fn: Any, cap: int, extra: "dict[str, Any]")
     """The IR digest of the kernel ``fn`` as this process holds it, for ``spec`` on architecture ``cap`` (see :mod:`tilefish._ir`)."""
     inputs = spec.ast_source_inputs()
     options = {**inputs.options, **extra}
-    return _ir.ir_digest(_ir.ttir_text(fn, inputs, arch=cap, options=options, what=f"'{spec.stem}' ({spec.triton})"))
+    return _ir.ir_digest(_ir.ttir_text(fn, inputs, arch=cap, options=options, what=f"'{spec.stem}' ({spec.triton})"), spec.language)
 
 
 def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKernel:
@@ -634,7 +635,8 @@ def replay_built(target: _Target, spec: CompileSpec, manifest: Manifest, pinned:
         return manifest.built_kernel(spec, arch, pinned=pinned)
     artifact = manifest.get(spec.stem, arch)
     digest = version = None
-    if artifact is not None and artifact.entry.get("source_digest_kind") == _ir.IR_DIGEST_KIND:  # an entry with no IR digest has nothing to compare
+    # an entry with no IR digest has nothing to compare, and one of the other frontend's IR is refused by the manifest without a frontend run
+    if artifact is not None and artifact.entry.get("source_digest_kind") == _ir.digest_kind(spec.language):
         toolchain = artifact.entry.get("toolchain")
         digest, version = _current_ir(SimpleNamespace(target=target, spec=spec), cap, toolchain.get("triton") if isinstance(toolchain, dict) else None)  # type: ignore[arg-type]
     return manifest.built_kernel(spec, arch, ir_digest=digest, ir_triton=version, pinned=pinned)

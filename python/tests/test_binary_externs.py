@@ -103,7 +103,7 @@ def test_a_relative_path_is_relative_to_the_file_that_declares_the_op(tmp_path):
 @pytest.mark.parametrize(
     "kwargs, message",
     [
-        (dict(triton="m:f", ptx="x.ptx", symbol="s", block=(1,)), "a kernel is one of triton=, ptx= and cubin="),
+        (dict(triton="m:f", ptx="x.ptx", symbol="s", block=(1,)), "a kernel is one of triton=, gluon=, ptx= and cubin="),
         (dict(ptx="x.ptx", block=(1,)), "needs symbol=<the kernel's entry point> and block"),
         (dict(ptx="x.ptx", symbol="s"), "needs symbol=<the kernel's entry point> and block"),
         (dict(ptx="x.ptx", symbol="s", block=(1,), num_warps=4), "num_warps= is a Triton compile option"),

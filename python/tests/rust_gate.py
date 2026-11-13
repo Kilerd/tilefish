@@ -33,6 +33,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   reshape of a result (the caller's output is its buffer), a dense view of a parameter and the result again (copy steps);
 * **a dimension only an Out tensor determines** (``gpu_kernels_p4.py``): a ``[B]`` mask made from a device scalar, run with ``outputs=`` (which is what
   binds ``B``), bucketed and not; the plan ``mask_rows`` makes it in a step whose ``B`` is the graph's;
+* **Gluon kernels** (``gluon_kernels.py``, exported only: the committed fixtures have none): ``row_dot`` and ``row_dot_fma``, a layout-pinned row
+  reduction declared with ``@tilefish.extern(gluon=...)`` over two views read with one ``i32`` row stride, for each bucket of its columns, over the
+  two halves of one tensor and over two tensors of their own; the plan ``halves_dot`` runs it in a step over two views of an intermediate;
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
   and (on a fresh export) how an algorithm is chosen (:func:`option_ops`): a ``gemm_bias`` under ``heuristic="torch"``, and one with ``algos=`` imported
   for this device, whose split-K adds its partial sums in bf16 at one bucket in the output and at another in a workspace (``allow_bf16_reduction=True``),
@@ -66,7 +69,7 @@ from typing import Any, Callable
 
 import torch
 from gpu_util import randn, same_bytes
-from host_ops import GEMM_SHAPES, abi_of, gemm_name, gpu_ops, library_ops, ops
+from host_ops import GEMM_SHAPES, abi_of, gemm_name, gluon_ops, gpu_ops, library_ops, ops
 
 import tilefish
 from tilefish import runtime
@@ -272,6 +275,20 @@ def must_mask(args, got):
     assert same_bytes(got, torch.where(keys < n.reshape(()), 0.0, float("-inf")).to(BF16))
 
 
+def args_halves(spec, seed):
+    """``a`` and ``b``: the two halves of one ``[rows, 2, c]`` f32 tensor (row stride ``2 * c``, offsets 0 and ``c``), or two tensors of their own."""
+    rows, c, fused = spec
+    if fused:
+        pair = randn((rows, 2, c), F32, seed)
+        return pair[:, 0], pair[:, 1]
+    return randn((rows, c), F32, seed), randn((rows, c), F32, seed + 1)
+
+
+def must_be_a_row_dot(args, got):
+    a, b = args
+    assert torch.allclose(got, ((a.double() * b.double()).sum(-1) * 0.5).float(), rtol=1e-5, atol=1e-5)
+
+
 def mask_of(b):
     """The ``Out`` tensor of a mask of ``b`` keys: what binds ``B``."""
     return lambda args: (torch.zeros((b,), dtype=BF16, device="cuda"),)
@@ -341,6 +358,10 @@ def build_cases():
             for b in sizes
             for n in (0, 5, b, b + 3)
         ]
+    # -- Gluon kernels: one binary per bucket of the columns, over two views of one tensor and over two tensors with the same stride
+    for op in ("row_dot", "row_dot_fma"):
+        for c in (128, 256):
+            cases += plain(op, f"{op}.Cb{c}", args_halves, [(rows, c, fused) for rows in (1, 7, 40) for fused in (True, False)], seeds=(0,), check=must_be_a_row_dot)
     # -- an Out that may be written over an input (MayAlias): launched apart here; in place in the plan residual_chain
     cases += plain("add_into", "add_into", args_add_into, (8, 24), seeds=(0, 1), check=must_add_into)
     return cases
@@ -476,8 +497,9 @@ def prepare(work, manifest_dir=None, pin=None):
         if committed.is_dir():
             shutil.copytree(committed, sources)
     declared = {**ops(), **gpu_ops(sources, cap, reuse=manifest_dir is not None), **library_ops()}
-    if manifest_dir is None:  # (a committed fixture has none of them)
+    if manifest_dir is None:  # (a committed fixture has none of them: the GEMMs of other options, the Gluon kernels)
         declared.update(option_ops())
+        declared.update(gluon_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -590,10 +612,14 @@ def plan_graphs():
                 out.append((f"Q{q}-seed{seed}", {"a": randn((q, 128), F32, seed=q + seed), "state": randn((q, 128), F32, seed=q + seed + 7)}))
         return out
 
+    import gluon_kernels as gk
     import gpu_kernels_p4 as p4
 
     def fused_qkv_cases():
         return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 768), BF16, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
+
+    def halves_dot_cases():
+        return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 256), F32, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
 
     def mask_rows_cases():
         return [
@@ -632,6 +658,7 @@ def plan_graphs():
         ("accumulate", pm.accumulate, False, accumulate_cases),
         ("fused_qkv", p4.fused_qkv, False, fused_qkv_cases),  # one step that reads three views with one stride pair
         ("mask_rows", p4.mask_rows, False, mask_rows_cases),  # a step whose B only its Out buffer determines
+        ("halves_dot", gk.halves_dot, False, halves_dot_cases),  # a Gluon step over two views of an intermediate
         ("residual_chain", p5.residual_chain, False, residual_cases),  # two steps whose Out is written over their input (MayAlias)
         ("residual_chain-reuse", p5.residual_chain, True, residual_cases),
         ("copy_steps", p5.copy_steps, False, copy_cases),  # a copy of a dense view into the arena and a store into an InOut parameter

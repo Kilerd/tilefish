@@ -518,10 +518,11 @@ pub struct Entry {
     /// The sha256 of the Triton source of a generated kernel.
     pub source_sha256: Option<String>,
     /// The identity of what was built: the digest of the Triton IR (TTIR without locations) the binary was built from, for generated and
-    /// hand-written kernels alike (Python recomputes it to tell a stale binary; a Rust host has no Triton and trusts it through the pinned
-    /// manifest digest), or, for a prebuilt binary, the sha256 of its PTX or cubin file.
+    /// hand-written kernels alike (the TTGIR of Gluon's frontend for a Gluon kernel; Python recomputes it to tell a stale binary; a Rust
+    /// host has no Triton and trusts it through the pinned manifest digest), or, for a prebuilt binary, the sha256 of its PTX or cubin file.
     pub source_digest: Option<String>,
-    /// How `source_digest` was computed (`tilefish.triton-ir.v1`, or `tilefish.binary.v1` for a prebuilt binary).
+    /// How `source_digest` was computed (`tilefish.triton-ir.v1`, `tilefish.gluon-ir.v1` for a Gluon kernel, or `tilefish.binary.v1` for a
+    /// prebuilt binary). A Gluon kernel is a `triton` entry like any other: Triton compiled it, and it is launched the same way.
     pub source_digest_kind: Option<String>,
     /// The verified cubin.
     pub cubin: Arc<[u8]>,

@@ -186,7 +186,9 @@ are. Whatever the process holds is what is hashed, because that is what is
 compiled. The digest of every build is in `BuiltKernel.ir_digest`, and in the
 manifest entry as `source_digest` with `source_digest_kind` `"tilefish.triton-ir.v1"`
 (the fields schema 2 already had, so a reader of the manifest reads it as before;
-a lowered kernel has its `source_sha256` as well, which needs no Triton).
+a lowered kernel has its `source_sha256` as well, which needs no Triton). A Gluon
+kernel's IR is the TTGIR that Gluon's frontend (`GluonASTSource`) builds, with its
+layouts and `num_warps` in it, and its kind is `"tilefish.gluon-ir.v1"`.
 `replay` recomputes the digest from the kernel the process holds, when Triton
 can be imported and is the version that built the entry, and refuses a mismatch
 as stale, with a pin or not (without Triton, or with another version, whose IR
@@ -305,7 +307,9 @@ does not have it (a trace call, a launch in Python and in Rust, and every step o
 
 An axis without a `StrideOf` must be the last one (its stride is then 1, and a view that does not have it is refused); the strides are bound at a
 call like shapes are, range-checked as `i32` (`i64` for `index_bits=64`), and a strided pointer is bounded by its extent (`max_extent`), not its element
-count. The pointer passed is `base + offset * itemsize`. `Strided[Tensor[...], 16]` compiles the kernel for a 16-byte aligned pointer
+count. The type of a stride scalar is the width of the offsets unless the `StrideOf` says otherwise: a kernel that takes `i32` strides and computes
+64-bit offsets with them (`row.to(tl.int64) * s_row`) declares `index_bits=64` and `s_row: StrideOf("x", 0, dtype=tilefish.i32)`, and a launch then holds
+the stride to an `i32` and the extent of the view to nothing. The pointer passed is `base + offset * itemsize`. `Strided[Tensor[...], 16]` compiles the kernel for a 16-byte aligned pointer
 (`tt.divisibility=16`), which the offset must then provably allow (a trace call refuses an offset that is not a multiple of 16 bytes, a launch
 checks the address); without the `16` Triton gets no hint and any element-aligned view runs. Lowered `@kernel`s still take contiguous tensors only: a
 view in a kernel body is refused with the rule that says so.
@@ -324,6 +328,22 @@ Triton does not compile, by its C ABI: pointers, `Dim` scalars and typed `const[
 Its identity is the sha256 of the bytes of the file (`source_digest` of kind `tilefish.binary.v1`); PTX is assembled by `ptxas` with fixed, recorded flags
 (the ones Triton passes, so the PTX of a Triton build declared this way gives the machine code, and the output bytes, of the Triton path); a cubin is used
 as it is for its own architecture and refused for another. `replay` refuses a file that is not the one the manifest was built from.
+
+**Gluon kernels.** A kernel written in Triton's Gluon dialect (`triton.experimental.gluon`: `@gluon.jit`, layouts written out, so the kernel pins
+which thread holds which element and so the order of its reductions) is declared with `gluon=` in place of `triton=`, and everything else is the same:
+strided views and shared strides, `const` arguments, buckets, `index_bits`, `enable_fp_fusion`, plans, `jit`, `replay` and the Rust host.
+
+```python
+@tilefish.extern(gluon=my_gluon_kernels.row_sum, num_warps=4, grid=lambda R: (tilefish.cdiv(R, 4),), index_bits=64)
+def row_sum(x: Strided[Tensor[R, 256, f32]], y: Out[Tensor[R, f32]], s_row: StrideOf("x", 0, dtype=tilefish.i32), n_rows: R, C: const = 256): ...
+```
+
+The declaration says which frontend compiles the kernel because a compile spec is the whole recipe of a binary, made from the declaration without
+importing the kernel: `"language": "gluon"` is in the spec and in the declaration digest, and the build hands Gluon's `GluonASTSource` to
+`triton.compile`. Its identity is the TTGIR that frontend builds (`source_digest_kind` `"tilefish.gluon-ir.v1"`, under its own tag), so a changed
+layout, `num_warps`, body or constant is another binary, and `replay` refuses a stale one, pinned or not, as for a Triton kernel. A Gluon kernel given as
+`triton=` (or a `triton.jit` one as `gluon=`) is refused with the argument to use: at the declaration for a kernel object, at the build for a
+`"module:function"` string. The manifest entry is a `triton` entry (Triton compiled it; it has the two scratch slots), so a host launches it like any other.
 
 **A pinned cuBLASLt GEMM.** `@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")` over `(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) ->
 Tensor[M, N, bf16]` computes `a @ b.T` with an f32 accumulator and one rounding (`impl="cublaslt.gemm_bias"` adds `bias: Tensor[N, bf16]`, added in f32 before it).

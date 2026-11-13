@@ -62,6 +62,7 @@ class Param:
     strided: bool = False
     align: "int | None" = None
     stride_of: "tuple[tuple[str, int], ...] | None" = None
+    stride_dtype: "DType | None" = None  # a stride scalar declared StrideOf(..., dtype=i32 | i64); None: as wide as the op's offsets
     alias: "str | None" = None  # an Out tensor only: the tensor input it may be written over (``Out[..., MayAlias("r")]``)
 
     @property
@@ -84,7 +85,7 @@ class Param:
             elif self.access == "out":
                 ann = f"Out[{ann}" + (f", MayAlias({self.alias!r})" if self.alias is not None else "") + "]"
         elif self.kind == "dim":
-            ann = f"{self.dim}" if self.stride_of is None else repr(stride_annotation(self.stride_of))
+            ann = f"{self.dim}" if self.stride_of is None else repr(stride_annotation(self.stride_of, self.stride_dtype))
         else:
             ann = "const" if self.const_dtype is None else f"const[{self.const_dtype}]"
         text = f"{self.name}: {ann}"
@@ -93,10 +94,10 @@ class Param:
         return text
 
 
-def stride_annotation(targets: "tuple[tuple[str, int], ...]") -> StrideOf:
-    """The ``StrideOf`` annotation of a stride scalar's targets (the views of one axis that share it)."""
+def stride_annotation(targets: "tuple[tuple[str, int], ...]", dtype: "DType | None" = None) -> StrideOf:
+    """The ``StrideOf`` annotation of a stride scalar's targets (the views of one axis that share it), with its declared ``dtype``."""
     names = tuple(arg for arg, _ in targets)
-    return StrideOf(names[0] if len(names) == 1 else names, targets[0][1])
+    return StrideOf(names[0] if len(names) == 1 else names, targets[0][1], dtype=dtype)
 
 
 class Signature:
@@ -259,7 +260,9 @@ def parse_signature(
                 raise TilefishDeclarationError(f"{where}: parameter '{pname}' is {ann!r}, which only an extern op can take")
             if has_default:
                 raise TilefishDeclarationError(f"{where}: stride parameter '{pname}' cannot have a default")
-            param = Param(pname, index, "dim", dim=Dim(pname, divisible_by=ann.divisible_by), keyword_only=kw, stride_of=ann.targets)
+            param = Param(
+                pname, index, "dim", dim=Dim(pname, divisible_by=ann.divisible_by), keyword_only=kw, stride_of=ann.targets, stride_dtype=ann.dtype
+            )
         elif isinstance(ann, Marked):
             _require_contiguous(where, what, f"parameter '{pname}'", ann.type)
             if ann.alias is not None and not allow_alias:

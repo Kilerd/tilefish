@@ -311,7 +311,8 @@ class Strided:
 
     An axis that has no ``StrideOf`` parameter must be the last one, and then its stride is 1 (the kernel loads along it
     contiguously); a view that does not have unit stride there is refused. Every other axis is free: the strides are bound at the
-    call like dimensions are, and passed as ``i32`` (``i64`` for a kernel that declares ``index_bits=64``), range-checked.
+    call like dimensions are, and passed as ``i32`` (``i64`` for a kernel that declares ``index_bits=64``, or the ``dtype=`` of the
+    ``StrideOf``), range-checked.
 
     ``Strided[Tensor[...], 16]`` says the kernel is compiled for a 16-byte aligned pointer (``tt.divisibility=16``): a view whose
     offset in bytes is not provably a multiple of 16 is then refused at a trace call, and at a launch the address is checked. Without
@@ -339,9 +340,12 @@ class Strided:
 class StrideOf:
     """``StrideOf("x", 0)``: a runtime scalar parameter that carries the element stride of axis 0 of the tensor parameter ``x``.
 
-    The scalar is ``i32`` (``i64`` for an op that declares ``index_bits=64``); the stride is range-checked at a launch. ``x`` must be
-    declared ``Strided[...]``. ``divisible_by=k`` says the stride is a multiple of ``k`` elements (it is checked, and a multiple of 16 is
-    given to Triton as ``tt.divisibility``).
+    The scalar is ``i32`` (``i64`` for an op that declares ``index_bits=64``) unless ``dtype=`` says which: ``dtype=tilefish.i32`` or
+    ``dtype=tilefish.i64``. The width of the stride parameter and the width of the offsets the kernel computes are two facts: a kernel
+    that takes ``i32`` strides and widens them (``row.to(tl.int64) * s_row``) declares ``index_bits=64`` and ``StrideOf("x", 0,
+    dtype=tilefish.i32)``. The stride is range-checked at a launch against the type it is passed as. ``x`` must be declared
+    ``Strided[...]``. ``divisible_by=k`` says the stride is a multiple of ``k`` elements (it is checked, and a multiple of 16 is given to
+    Triton as ``tt.divisibility``).
 
     ``StrideOf(("q", "k", "v"), 0)`` is **one** scalar that carries the stride of axis 0 of each of the ``Strided[...]`` parameters ``q``, ``k``
     and ``v``: a kernel that takes one stride pair for several views of one buffer (the q, k and v column blocks of a fused ``[B, 3 * D]``
@@ -353,6 +357,7 @@ class StrideOf:
     arg: "str | tuple[str, ...]"
     axis: int
     divisible_by: "int | None" = None
+    dtype: "DType | None" = None  # the type of the scalar (i32 or i64); None: as wide as the op's offsets (index_bits)
 
     def __post_init__(self) -> None:
         names = self.arg
@@ -372,6 +377,11 @@ class StrideOf:
             raise TilefishDeclarationError(f"StrideOf({self.arg!r}, ...): the axis must be a non-negative int, got {self.axis!r}")
         if self.divisible_by is not None and (isinstance(self.divisible_by, bool) or not isinstance(self.divisible_by, int) or self.divisible_by < 1):
             raise TilefishDeclarationError(f"StrideOf: divisible_by must be a positive int, got {self.divisible_by!r}")
+        if self.dtype is not None and not (isinstance(self.dtype, DType) and self.dtype.name in ("i32", "i64")):
+            raise TilefishDeclarationError(
+                f"StrideOf: dtype is the type of the stride scalar, tilefish.i32 or tilefish.i64 (or None: i64 under index_bits=64, else i32), "
+                f"got {self.dtype!r}"
+            )
 
     @property
     def args(self) -> "tuple[str, ...]":
@@ -385,6 +395,8 @@ class StrideOf:
 
     def __repr__(self) -> str:
         extra = f", divisible_by={self.divisible_by}" if self.divisible_by else ""
+        if self.dtype is not None:
+            extra += f", dtype={self.dtype}"
         return f"StrideOf({self.arg!r}, {self.axis}{extra})"
 
 
