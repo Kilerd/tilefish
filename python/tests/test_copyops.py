@@ -35,7 +35,7 @@ def test_contiguous_is_a_call_of_a_generated_op_on_the_view():
     op = out.callee
     params = [(p.name, p.kind, p.strided, p.stride_of) for p in op.signature.params]
     assert params[0] == ("x", "tensor", True, None) and params[1][:2] == ("y", "tensor")
-    assert [p[3] for p in params[6:10]] == [("x", 0), ("x", 1), ("x", 2), ("x", 3)]
+    assert [p[3] for p in params[6:10]] == [(("x", 0),), (("x", 1),), (("x", 2),), (("x", 3),)]  # one view per stride
     assert [(p.name, p.kind, p.default) for p in op.signature.params if p.kind == "const"] == [("a3", "const", 16), ("TR", "const", 128), ("TC", "const", 16)]
     assert op.index_bits == 64 and op.grid_string == "(cdiv(A2, 128), A1, A0)"  # tiles of 128 x 16
 
