@@ -14,6 +14,8 @@ No ``from __future__ import annotations``: tilefish evaluates annotations at dec
 ``"gpu_kernels_p2:attention_kernel"``), so a plan of it can be made on any machine; the gpu tests run it.
 """
 
+import pathlib
+
 import tilefish
 from tilefish import DevScalar, Dim, InOut, Out, StrideOf, Strided, Tensor, bf16, const, f32, i32
 
@@ -213,6 +215,28 @@ def two_outputs(a: Tensor[Q, W, f32]) -> tuple[Tensor[Q, W, f32], Tensor[Q, W, f
     t = with_out(a)
     r, o = both(a)
     return plus(t, o), r
+
+
+# -- a graph of prebuilt binaries: hand-written PTX, a fixed float argument, a 64-bit stride scalar ------------------------------------------------------
+
+PTX = pathlib.Path(__file__).resolve().parent / "ptx"
+B = Dim("B", buckets=[8, 24])
+Nn = Dim("Nn")
+
+
+@tilefish.extern(ptx=PTX / "axpy_f32.ptx", symbol="axpy_f32", block=(128,), grid=lambda Nn: (tilefish.cdiv(Nn, 128),))
+def axpy(x: Tensor[Nn, f32], y: Tensor[Nn, f32], out: Out[Tensor[Nn, f32]], n_elem: Nn, alpha: const[f32] = 2.0): ...
+
+
+@tilefish.extern(ptx=PTX / "strided_copy_bf16.ptx", symbol="strided_copy_bf16", block=(64,), grid=lambda B: (B,), index_bits=64)
+def strided_copy(x: Strided[Tensor[B, 64, bf16]], y: Out[Tensor[B, 64, bf16]], *, cols: const[i32] = 64, x_s0: StrideOf("x", 0)): ...
+
+
+@tilefish.graph
+def prebuilt(x: Tensor[B, 64, f32], y: Tensor[B, 64, f32], w: Tensor[B, 128, bf16]) -> tuple[Tensor[B * 64, f32], Tensor[B, 64, bf16]]:
+    z = axpy(x.reshape(B * 64), y.reshape(B * 64))  # a prebuilt PTX with a fixed float argument, on views
+    left, _ = w.split(64, axis=-1)  # a column block of w: a view with a row stride of 128
+    return z, strided_copy(left)  # a prebuilt PTX with a 64-bit stride scalar
 
 
 # the operators of the graph, in the order they are called (what a per-op eager run of the block calls)

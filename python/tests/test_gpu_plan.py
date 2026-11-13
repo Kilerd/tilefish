@@ -12,7 +12,6 @@ lowered residual add and rmsnorm in one kernel, a GEMM, a lowered gelu, a GEMM a
 """
 
 import json
-import pathlib
 import warnings
 
 import pytest
@@ -172,28 +171,7 @@ def test_an_in_place_graph_updates_the_callers_tensor_in_the_order_of_the_ir_in_
             tilefish.run(pm.accumulate, a, a)  # the in-place tensor must not also be an input
 
 
-PTX = pathlib.Path(__file__).resolve().parent / "ptx"
-B = tilefish.Dim("B", buckets=[8, 24])
-Nn = tilefish.Dim("Nn")
-
-
-@tilefish.extern(ptx=PTX / "axpy_f32.ptx", symbol="axpy_f32", block=(128,), grid=lambda Nn: (tilefish.cdiv(Nn, 128),))
-def axpy(x: tilefish.Tensor[Nn, tilefish.f32], y: tilefish.Tensor[Nn, tilefish.f32], out: tilefish.Out[tilefish.Tensor[Nn, tilefish.f32]], n_elem: Nn, alpha: tilefish.const[tilefish.f32] = 2.0): ...
-
-
-@tilefish.extern(ptx=PTX / "strided_copy_bf16.ptx", symbol="strided_copy_bf16", block=(64,), grid=lambda B: (B,), index_bits=64)
-def strided_copy(
-    x: tilefish.Strided[tilefish.Tensor[B, 64, tilefish.bf16]], y: tilefish.Out[tilefish.Tensor[B, 64, tilefish.bf16]], *, cols: tilefish.const[tilefish.i32] = 64, x_s0: tilefish.StrideOf("x", 0)
-): ...
-
-
-@tilefish.graph
-def prebuilt(
-    x: tilefish.Tensor[B, 64, tilefish.f32], y: tilefish.Tensor[B, 64, tilefish.f32], w: tilefish.Tensor[B, 128, tilefish.bf16]
-) -> tuple[tilefish.Tensor[B * 64, tilefish.f32], tilefish.Tensor[B, 64, tilefish.bf16]]:
-    z = axpy(x.reshape(B * 64), y.reshape(B * 64))  # a prebuilt PTX with a fixed float argument, on views
-    left, _ = w.split(64, axis=-1)  # a column block of w: a view with a row stride of 128
-    return z, strided_copy(left)  # a prebuilt PTX with a 64-bit stride scalar
+axpy, strided_copy, prebuilt = pm.axpy, pm.strided_copy, pm.prebuilt  # a graph of prebuilt PTX (plan_model: the Rust gate runs it too)
 
 
 def test_a_graph_of_prebuilt_binaries_plans_exports_and_replays_like_one_of_triton_kernels(tmp_path):

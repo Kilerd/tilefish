@@ -22,7 +22,11 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **device scalars**: a mask whose row count is a tensor of shape ``()`` or ``(1,)``, a lowered kernel that reads one and one that reads two;
 * **prebuilt binaries**: the PTX of a Triton build declared as a prebuilt extern (checked here to give the bytes of the Triton path), hand-written
   PTX with a float fixed argument and with a 64-bit stride, and a cubin;
-* **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op.
+* **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
+* **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
+  scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
+  exported and run through Python's plan replay; ``crates/tilefish/tests/gpu_plan_gate.rs`` launches and captures each case, and ``compare`` holds the
+  Rust plan's launch and its CUDA graph replay to Python's bytes.
 
 ``WORK/cases.json`` is what ``crates/tilefish/tests/gpu_gate.rs`` reads::
 
@@ -398,6 +402,165 @@ def verify(case, declared, args, results, directory, digest):
         assert same_bytes(results[0], other), f"{case.id}: not the bytes of {case.same_as}"
 
 
+# -- launch plans ------------------------------------------------------------------------------------------------------------------------------
+
+
+def plan_graphs():
+    """``(name, graph, reuse, the arguments of each case)``: the plans the gate exports. A case is ``(label, {parameter: tensor})``, the
+    parameters in the order of the graph's signature (a ``DevScalar`` as a CUDA tensor of one element)."""
+    import plan_model as pm
+
+    weights = pm.weights()
+    n_values = {32: (32, 5), 64: (64, 17), 128: (128, 77)}  # all the keys, and some of them
+
+    def block_cases():
+        out = []
+        for m in pm.BUCKETS:
+            for n in n_values[m]:
+                x = pm.activations(m, seed=m + n)
+                out.append((f"M{m}-n{n}", {"x": x, "n": torch.tensor([n], dtype=I32, device="cuda"), **weights}))
+        return out
+
+    layers = 4
+    deep = pm.deep_block(layers)
+    _, stacked = pm.stacked_weights(layers)
+
+    def deep_cases():
+        out = []
+        for m in pm.BUCKETS:
+            for n in (m - 3, m // 2):
+                x = pm.activations(m, seed=60 + m + n)
+                out.append((f"M{m}-n{n}", {"x": x, "n": torch.tensor([n], dtype=I32, device="cuda"), **stacked}))
+        return out
+
+    def prebuilt_cases():
+        out = []
+        for b in (8, 24):
+            for seed in (0, 1):
+                args = {"x": randn((b, 64), F32, seed=b + seed), "y": randn((b, 64), F32, seed=b + seed + 1), "w": randn((b, 128), BF16, seed=b + seed + 2)}
+                out.append((f"B{b}-seed{seed}", args))
+        return out
+
+    def accumulate_cases():
+        out = []
+        for q in (16, 32):
+            for seed in (0, 1):
+                out.append((f"Q{q}-seed{seed}", {"a": randn((q, 128), F32, seed=q + seed), "state": randn((q, 128), F32, seed=q + seed + 7)}))
+        return out
+
+    return [
+        ("block", pm.block, False, block_cases),
+        ("block-reuse", pm.block, True, block_cases),
+        (f"deep{layers}", deep, False, deep_cases),
+        (f"deep{layers}-reuse", deep, True, deep_cases),
+        ("prebuilt", pm.prebuilt, False, prebuilt_cases),
+        ("accumulate", pm.accumulate, False, accumulate_cases),
+    ]
+
+
+def prepare_plans(work):
+    """Export the plans of :func:`plan_graphs` to ``WORK/plans/<name>`` and run every case through ``tilefish.run(..., mode="replay", plan=...)`` with
+    the pin; write ``WORK/plans.json`` for ``gpu_gate.rs``::
+
+        {"plans": [{"name", "dir", "digest", "graph", "reuse", "arena_bytes", "cases": [{"id", "bucket": {dim: value}, "devscalars": {name: int},
+          "externals": [{"name", "role", "dtype", "shape", "input"?, "expect"?}]}]}]}
+
+    An external of role ``input``, ``weight`` or ``inout`` has ``input`` (its bytes before the call; a weight's file is shared by the cases of a
+    plan); an ``output`` and an ``inout`` have ``expect``, the bytes Python's replay left in it (an ``inout`` is updated in place)."""
+    work = pathlib.Path(work).resolve()
+    root = work / "plans"
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    plans = []
+    total = 0
+    for name, graph, reuse, make_cases in plan_graphs():
+        directory = root / name
+        exported = runtime.export(graph, directory, reuse=reuse)
+        doc = exported.doc
+        params = [b for b in doc["buffers"] if b["role"] in ("input", "weight", "inout", "devscalar")]
+        shared = {}  # a weight's file, written once per plan
+        cases = []
+        for label, args in make_cases():
+            case_id = f"{name}-{label}"
+            case_dir = root / "cases" / case_id
+            case_dir.mkdir(parents=True)
+            given = [args[b["name"]].clone() for b in params]  # a fresh tensor per call: an inout one is updated in place
+            before = {b["name"]: raw(args[b["name"]]) for b in params}
+            result = tilefish.run(graph, *given, mode="replay", plan=directory, pin=exported.digest)
+            results = list(result) if isinstance(result, tuple) else [result]
+            after = {b["name"]: t for b, t in zip(params, given)}
+            after.update(zip(doc["outputs"], results))
+            values = {}
+            dims = {}
+            externals = []
+            for b in doc["buffers"]:
+                role = b["role"]
+                if role == "devscalar":
+                    values[b["name"]] = int(args[b["name"]].reshape(()).item())
+                    continue
+                if role not in ("input", "weight", "inout", "output"):
+                    continue
+                t = after[b["name"]]
+                entry = {"name": b["name"], "role": role, "dtype": DTYPES[t.dtype], "shape": list(t.shape)}
+                if role in ("input", "weight", "inout"):
+                    if role == "weight":
+                        if b["name"] not in shared:
+                            shared[b["name"]] = f"plans/weights/{name}/{b['name']}.bin"
+                            (work / shared[b["name"]]).parent.mkdir(parents=True, exist_ok=True)
+                            (work / shared[b["name"]]).write_bytes(before[b["name"]])
+                        entry["input"] = shared[b["name"]]
+                    else:
+                        entry["input"] = f"plans/cases/{case_id}/{b['name']}.in.bin"
+                        (work / entry["input"]).write_bytes(before[b["name"]])
+                if role in ("inout", "output"):
+                    entry["expect"] = f"plans/cases/{case_id}/{b['name']}.expect.bin"
+                    (work / entry["expect"]).write_bytes(raw(t))
+                externals.append(entry)
+            for b in doc["buffers"]:
+                for d, e in zip(b["shape"], after[b["name"]].shape if b["name"] in after else ()):
+                    if isinstance(d, str) and d in doc["dims"]:
+                        dims[d] = int(e)
+            bucket = next(bk["values"] for bk in doc["buckets"] if all(bk["values"][k] == v for k, v in dims.items()))
+            cases.append({"id": case_id, "bucket": bucket, "devscalars": values, "externals": externals})
+            total += 1
+        plans.append(
+            {"name": name, "dir": f"plans/{name}", "digest": exported.digest, "graph": doc["graph"], "reuse": reuse, "arena_bytes": doc["arena_bytes"], "cases": cases}
+        )
+    (work / "plans.json").write_text(json.dumps({"plans": plans}, indent=1) + "\n", encoding="utf-8")
+    print(f"prepared {len(plans)} plans and {total} cases of plan replay", file=sys.stderr)
+
+
+def compare_plans(work):
+    """The outputs (and in-place tensors) the Rust plan wrote, for its launch (``rust_plans``) and its CUDA graph replay (``rust_plans_graph``), against
+    what Python's plan replay left. Returns ``(passed, cases, failures)``."""
+    path = work / "plans.json"
+    if not path.exists():
+        return 0, 0, []
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    failed, passed, count = [], 0, 0
+    for subdir in ("rust_plans", "rust_plans_graph"):
+        for plan in doc["plans"]:
+            for case in plan["cases"]:
+                count += 1
+                bad = []
+                for t in case["externals"]:
+                    if "expect" not in t:
+                        continue
+                    expect = (work / t["expect"]).read_bytes()
+                    got_path = work / subdir / case["id"] / f"{t['name']}.bin"
+                    got = got_path.read_bytes() if got_path.exists() else None
+                    if got != expect:
+                        bad.append(f"{t['name']} ({'missing' if got is None else sum(a != b for a, b in zip(got, expect))} bytes differ)")
+                    elif not any(expect):
+                        bad.append(f"{t['name']} is all zeros")
+                if bad:
+                    failed.append((f"{subdir}/{case['id']}", bad))
+                else:
+                    passed += 1
+    return passed, count, failed
+
+
 def compare(work):
     """Every file the Rust test wrote, from the manifest directory and from the embedded manifest, against what replay left."""
     work = pathlib.Path(work).resolve()
@@ -429,7 +592,12 @@ def compare(work):
         f"rust vs replay: {passed['rust']} of {n} cases byte-identical with the manifest directory, "
         f"{passed['rust_embedded']} of {n} with the embedded manifest ({tensors} tensors, {total} bytes compared)"
     )
-    return 0 if not failed else 1
+    plan_passed, plan_cases, plan_failed = compare_plans(work)
+    for case_id, bad in plan_failed:
+        print(f"FAIL {case_id}: {'; '.join(bad)}")
+    if plan_cases:
+        print(f"rust plan vs python plan replay: {plan_passed} of {plan_cases} cases byte-identical (the launch and the CUDA graph replay of each case)")
+    return 0 if not failed and not plan_failed else 1
 
 
 def main(argv=None):
@@ -448,6 +616,7 @@ def main(argv=None):
         import rust_workspace_case
 
         rust_workspace_case.main(args.work)
+        prepare_plans(args.work)  # the launch plans (gpu_gate.rs reads WORK/plans.json)
         return 0
     return compare(args.work)
 
