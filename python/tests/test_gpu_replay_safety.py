@@ -672,9 +672,9 @@ def test_an_edit_in_a_module_the_kernel_reaches_is_not_replayed_stale_with_or_wi
     hkp.load()
     new_digest = _source.source_digest(sys.modules["hk_kernel"].hk_kernel)
     assert new_digest != entry["source_digest"]
-    for pin in (None, manifest.digest):  # refused with and without the pin of the old manifest
+    for anchor in ({"trust_directory": True}, {"pin": manifest.digest}):  # refused under either trust anchor
         with pytest.raises(TilefishManifestError) as e:
-            tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=pin)
+            tilefish.run(hk, x, mode="replay", manifest=manifest.directory, **anchor)
         assert entry["source_digest"] in str(e.value) and new_digest in str(e.value) and "stale" in str(e.value) and "export it again" in str(e.value)
     assert torch.equal(tilefish.run(hk, x, mode="jit"), new)  # not the old binary, from the build cache or from Triton's disk cache
     again = runtime.export(hk, tmp_path / "m", overwrite=True)
@@ -866,11 +866,11 @@ def test_every_build_compiles_from_scratch_and_puts_the_knob_back(monkeypatch):
 
     monkeypatch.setattr(triton, "compile", spy)
     assert knob.always_compile is False
-    build(spec, arch=ARCH, fn=fn)
+    build(spec, arch=ARCH, fn=fn, cache=False)
     assert seen == [True] and knob.always_compile is False
     knob.always_compile = True  # a caller that set it itself finds it as it was
     try:
-        build(spec, arch=ARCH, fn=fn)
+        build(spec, arch=ARCH, fn=fn, cache=False)
         assert seen == [True, True] and knob.always_compile is True
     finally:
         knob.always_compile = False
@@ -881,7 +881,7 @@ def test_every_build_compiles_from_scratch_and_puts_the_knob_back(monkeypatch):
 
     monkeypatch.setattr(triton, "compile", boom)
     with pytest.raises(TilefishBuildError, match="compiler exploded"):
-        build(spec, arch=ARCH, fn=fn)
+        build(spec, arch=ARCH, fn=fn, cache=False)
     assert seen[-1] is True and knob.always_compile is False  # restored when the compile fails too
 
 
@@ -891,12 +891,12 @@ def test_a_build_does_not_reuse_the_binary_in_triton_s_disk_cache(monkeypatch, t
     low = softmax.lower()
     (spec,) = low.specs()
     fn = runtime.load_lowered(low)
-    first = build(spec, arch=ARCH, fn=fn)
+    first = build(spec, arch=ARCH, fn=fn, cache=False)
     cached = list((tmp_path / "cache").rglob("*.cubin"))
     assert cached  # Triton wrote it
     for p in cached:
         p.write_bytes(b"not a cubin: poisoned")  # what a stale or damaged entry looks like
-    second = build(spec, arch=ARCH, fn=fn)  # a cache hit would hand back the poisoned file
+    second = build(spec, arch=ARCH, fn=fn, cache=False)  # a cache hit would hand back the poisoned file
     assert second.sha256_code == first.sha256_code and second.cubin[:4] == b"\x7fELF"
 
 

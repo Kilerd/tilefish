@@ -104,7 +104,7 @@ def test_building_twice_gives_the_same_bytes(lowered):
     low = lowered["layernorm"]
     fn = runtime.load_lowered(low)
     (spec,) = low.specs()
-    a, b = build(spec, arch=ARCH, fn=fn), build(spec, arch=ARCH, fn=fn)
+    a, b = build(spec, arch=ARCH, fn=fn, cache=False), build(spec, arch=ARCH, fn=fn, cache=False)  # two compiles, not one and its cache entry
     assert a.cubin == b.cubin and a.sha256 == b.sha256 and a.sha256_code == b.sha256_code
 
 
@@ -145,6 +145,7 @@ def build_in_a_fresh_place(root: pathlib.Path):
     (root / "cwd").mkdir(parents=True)
     env = dict(os.environ)
     env["TRITON_CACHE_DIR"] = str(root / "cache")
+    env["TILEFISH_CACHE_DIR"] = str(root / "tilefish-cache")  # an independent build: not the entries of the parent's cache
     tests = pathlib.Path(__file__).resolve().parent
     src = pathlib.Path(tilefish.__file__).resolve().parent.parent
     env["PYTHONPATH"] = os.pathsep.join([str(src), str(tests), env.get("PYTHONPATH", "")])

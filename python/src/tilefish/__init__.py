@@ -39,6 +39,7 @@ from .dtypes import (
 from .errors import (
     TilefishAttributeError,
     TilefishBuildError,
+    TilefishCacheWarning,
     TilefishDeclarationError,
     TilefishError,
     TilefishLoweringError,
@@ -91,6 +92,7 @@ __all__ = [
     "TensorType",
     "TilefishAttributeError",
     "TilefishBuildError",
+    "TilefishCacheWarning",
     "TilefishDeclarationError",
     "TilefishError",
     "TilefishLoweringError",

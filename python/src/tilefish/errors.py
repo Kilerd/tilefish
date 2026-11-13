@@ -79,3 +79,9 @@ class TilefishPreconditionError(TilefishRuntimeError):
         super().__init__(message)
         self.kind = kind
         self.arg = arg
+
+
+class TilefishCacheWarning(UserWarning):
+    """tilefish's build cache could not be used as it is: an entry is corrupt or stale (it is ignored and the kernel is built
+    again), or the cache directory cannot be written (builds are not cached there). It is a warning, never an error: a build
+    does not depend on the cache."""
