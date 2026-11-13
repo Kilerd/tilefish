@@ -147,6 +147,37 @@ def _check_jit_function(fn: Any, spec: "CompileSpec") -> None:
         )
 
 
+def _check_identity(jit: Any, spec: "CompileSpec") -> None:
+    """``fn`` must be the function ``spec.triton`` names (``module:function``), not another one with the same parameters.
+
+    Without this a build of one kernel's spec from another kernel's function is a binary of the wrong kernel stamped with the first
+    one's declaration, and the build cache would then serve it to a later, correct build. A function is the one the spec names when
+    it is the very object ``spec.triton`` imports to, or is defined under that module and name. A generated kernel's module is a
+    scratch import of the written source (its name has the digest of the source in it), so it is told by the function's name here
+    and by the sha256 of its file (:func:`_check_source`).
+    """
+    module, _, name = spec.triton.partition(":")
+    namespace = _source._namespace_of(jit)
+    defined = (namespace[0] if namespace is not None else str(getattr(jit, "__module__", "?")), str(getattr(jit, "__name__", "?")))
+    if spec.source_sha256 is not None:
+        if defined[1] == name:
+            return
+    else:
+        try:
+            resolved = resolve_triton(spec.triton)
+        except TilefishBuildError:
+            resolved = None  # not importable here: only where it is defined can say
+        if resolved is not None and (resolved is jit or _source.jit_function(resolved) is jit):
+            return
+        if defined == (module, name):
+            return
+    raise TilefishBuildError(
+        f"the function passed as fn is '{defined[0]}:{defined[1]}', but the compile spec '{spec.stem}' is for '{spec.triton}': "
+        "a build compiles the function the spec names (the spec says nothing about the body of another one), so it is refused, "
+        "and nothing is compiled or cached"
+    )
+
+
 def refuse_symlink(path: pathlib.Path) -> None:
     """Raise :class:`~tilefish.errors.TilefishBuildError` when ``path`` is a symbolic link (dangling or not)."""
     if path.is_symlink():
@@ -458,7 +489,9 @@ def build(
     """Compile one spec to a cubin for ``arch`` (``"sm_103"`` or ``103``) with Triton.
 
     ``fn`` is the ``triton.jit`` function; by default it is imported from ``spec.triton`` (``module:function``).
-    For a lowered kernel pass the JITFunction imported from the written source. The spec must be verified
+    For a lowered kernel pass the JITFunction imported from the written source. A ``fn`` that is not the function ``spec.triton``
+    names (the same object, or one defined under that module and name) is refused before anything is digested, compiled or cached,
+    even when its parameters are the same. The spec must be verified
     (:attr:`~tilefish.aot.CompileSpec.verified`; ``compile_specs`` output is).
 
     Triton is called as ``ASTSource(fn, signature=..., constexprs=None, attrs=...)``, then ``src.constants = ...``,
@@ -493,6 +526,7 @@ def build(
     triton = _import_triton()
     jit = fn if fn is not None else resolve_triton(spec.triton)
     _check_jit_function(jit, spec)
+    _check_identity(jit, spec)  # before the source is digested, so that no digest, key or binary is of a function the spec is not for
     recorded_digest, reached = _check_source(jit, spec, source_digest)
     opts: dict[str, Any] = {**inp.options, **dict(options or {})}
 

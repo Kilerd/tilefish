@@ -24,7 +24,7 @@ from built_fakes import fake_build, scale
 from elf_builder import cubin_like
 
 import tilefish
-from tilefish import TilefishCacheWarning, TilefishManifestError, _cache, _source, runtime
+from tilefish import TilefishBuildError, TilefishCacheWarning, TilefishManifestError, _cache, _source, runtime
 from tilefish.aot import build, compile_specs
 from tilefish.dims import cdiv
 
@@ -731,3 +731,123 @@ def test_a_closure_variable_that_has_no_stable_repr_refuses_the_build_and_the_ex
     assert compiler.count == 0 and entries() == [] and not (tmp_path / "m" / "manifest.json").exists()  # nothing was compiled, cached or written
     with pytest.raises(tilefish.TilefishRuntimeError, match="closure variable 'S'"):
         runtime._current_source_digest(CLO_SPEC)
+
+
+# -- build(spec, fn=...) compiles the function the spec names, and no other ----------------------------------------------------------------
+
+TWO = (
+    "from fake_jit import jit\n"
+    "\n"
+    "\n"
+    "@jit\n"
+    "def ka(x_ptr, y_ptr, n_elem, BLOCK):\n"
+    "    return (BLOCK * 2.0, n_elem)\n"
+    "\n"
+    "\n"
+    "@jit\n"
+    "def kb(x_ptr, y_ptr, n_elem, BLOCK):\n"
+    "    return (BLOCK * 3.0, n_elem)\n"
+    "\n"
+    "\n"
+    "alias = ka\n"
+)
+
+
+def extern_of(triton):
+    @tilefish.extern(triton=triton, num_warps=4, grid=lambda n: (cdiv(n, 256),))
+    def op(x_ptr: tilefish.Tensor[n, tilefish.bf16], y_ptr: tilefish.Out[tilefish.Tensor[n, tilefish.bf16]], n_elem: n, *, BLOCK: tilefish.const = 256): ...
+
+    return compile_specs(op)[0]
+
+
+@pytest.fixture
+def two(world):
+    project, compiler = world
+    project.write("m5_kernels", TWO)
+
+    def load():
+        sys.modules.pop("m5_kernels", None)
+        importlib.invalidate_caches()
+        linecache.clearcache()
+        return importlib.import_module("m5_kernels")
+
+    yield load, compiler
+    sys.modules.pop("m5_kernels", None)
+
+
+def test_another_kernel_with_the_same_parameters_is_refused_and_does_not_poison_the_cache(two):
+    """The reviewer's repro: ``build(spec_ka, fn=kb)`` was accepted, and the cache served kb's cubin to a later ``build(spec_ka, fn=ka)``."""
+    load, compiler = two
+    module = load()
+    spec_ka = extern_of("m5_kernels:ka")
+    with pytest.raises(TilefishBuildError, match=r"the function passed as fn is 'm5_kernels:kb', but the compile spec '.*' is for 'm5_kernels:ka'.*nothing is compiled or cached"):
+        build(spec_ka, arch="sm_90", fn=module.kb)
+    assert compiler.count == 0 and entries() == []  # nothing was compiled, and nothing was cached under the key of ka
+    right = build(spec_ka, arch="sm_90", fn=module.ka)
+    assert compiler.count == 1  # a miss: there was nothing of kb's to serve
+    assert compiler.values_held(fake_compile.ASTSource(module.ka, {}))[1] == (2.0, 1)
+    # kb's own spec builds kb, and the two are different binaries with different digests
+    spec_kb = extern_of("m5_kernels:kb")
+    other = build(spec_kb, arch="sm_90", fn=module.kb)
+    assert other.sha256_code != right.sha256_code and compiler.count == 2  # (one file: the digest of the files is the same, the declaration is not)
+
+
+def test_the_function_the_spec_names_is_accepted_however_it_was_reached(two):
+    load, compiler = two
+    module = load()
+    spec = extern_of("m5_kernels:ka")
+    build(spec, arch="sm_90", fn=module.ka)
+    build(spec, arch="sm_90", fn=module.alias)  # the same object under another name
+    build(spec, arch="sm_90")  # imported from spec.triton
+    assert compiler.count == 1
+    reloaded = load().ka  # a new import of the same file: another object, defined under the same module and name
+    assert reloaded is not module.ka
+    build(spec, arch="sm_90", fn=reloaded)
+    assert compiler.count == 1  # and a hit: the same source
+
+
+def test_a_function_of_the_same_name_in_another_module_is_refused(two, world):
+    load, compiler = two
+    project, _ = world
+    project.write("m5_other", TWO)
+    try:
+        other = importlib.import_module("m5_other")
+        with pytest.raises(TilefishBuildError, match="'m5_other:ka', but the compile spec '.*' is for 'm5_kernels:ka'"):
+            build(extern_of("m5_kernels:ka"), arch="sm_90", fn=other.ka)
+        assert compiler.count == 0 and entries() == []
+    finally:
+        sys.modules.pop("m5_other", None)
+
+
+def test_a_spec_that_names_a_module_that_cannot_be_imported_is_built_from_the_function_defined_there(two):
+    load, compiler = two
+    module = load()
+    spec = extern_of("not_installed_anywhere:ka")
+    with pytest.raises(TilefishBuildError, match="'m5_kernels:ka', but the compile spec '.*' is for 'not_installed_anywhere:ka'"):
+        build(spec, arch="sm_90", fn=module.ka)
+    assert compiler.count == 0
+
+
+def named_kernel(name, factor):
+    M, D = tilefish.Dim("M"), tilefish.Dim("D", 64)
+
+    @tilefish.kernel(name=name)
+    def k(x: tilefish.Tensor[M, D, tilefish.f32]) -> tilefish.Tensor[M, D, tilefish.f32]:
+        return x * factor
+
+    return k
+
+
+def test_a_generated_kernel_is_told_by_its_name_and_the_sha256_of_its_source(world):
+    _, compiler = world
+    low1, low2, other_body = named_kernel("one_k", 2.0).lower(), named_kernel("two_k", 2.0).lower(), named_kernel("one_k", 3.0).lower()
+    (spec1,) = low1.specs()
+    compiler.evaluate = False
+    with pytest.raises(TilefishBuildError, match=r"the function passed as fn is '.*:tf_two_k', but the compile spec 'one_k' is for '.*:tf_one_k'"):
+        build(spec1, arch="sm_90", fn=runtime.load_lowered(low2))
+    assert compiler.count == 0 and entries() == []
+    # the same name with another body is told by the sha256 of the file it was imported from
+    with pytest.raises(TilefishBuildError, match=r"whose sha256 is .*, but the compile spec '.*' is for Triton source with sha256"):
+        build(spec1, arch="sm_90", fn=runtime.load_lowered(other_body))
+    assert compiler.count == 0 and entries() == []
+    assert build(spec1, arch="sm_90", fn=runtime.load_lowered(low1)).spec is spec1 and compiler.count == 1
