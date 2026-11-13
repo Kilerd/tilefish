@@ -197,6 +197,13 @@ def gluon_ops():
     return {"row_dot": gluon_kernels.row_dot, "row_dot_fma": gluon_kernels.row_dot_fma}
 
 
+def per_arch_ops():
+    """``{name: extern}``: the op of ``per_arch_kernels.py`` with an implementation per architecture (a Triton kernel each)."""
+    import per_arch_kernels
+
+    return {"row_sum": per_arch_kernels.row_sum}
+
+
 def gemm_name(n, k, bias):
     return f"gemm_{n}_{k}{'_bias' if bias else ''}"
 

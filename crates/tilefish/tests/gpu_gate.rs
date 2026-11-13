@@ -1342,6 +1342,30 @@ fn the_gate_has_a_gluon_kernel() {
     }
 }
 
+/// An operator with an implementation per architecture (`@tilefish.extern(by_arch=...)`, `python/tests/per_arch_kernels.py`): its entry in the gate's
+/// manifest is the implementation the device's architecture selects (`"sm_103"` on sm_103, `"sm_120"` on sm_120, `"fallback"` elsewhere), read
+/// into `Entry::implementation`; it is launched like any entry (`byte_identity` holds its bytes to Python's, which `rust_gate.py` holds to those of
+/// that tiling declared alone). A committed fixture has none.
+#[test]
+fn the_gate_has_an_implementation_per_architecture() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no operator with an implementation per architecture");
+        return;
+    }
+    let arch = cases["arch"].as_str().unwrap().to_owned();
+    let entry = manifest().entry("row_sum", &arch).cloned().expect("the gate's manifest has row_sum");
+    let want = if arch == "sm_103" || arch == "sm_120" { arch.as_str() } else { tilefish::IMPLEMENTATION_FALLBACK };
+    assert_eq!(entry.implementation.as_deref(), Some(want));
+    let ran = cases_where(&cases, |c| c["stem"] == "row_sum").len();
+    assert!(ran >= 5, "the gate has {ran} cases of row_sum");
+    println!(
+        "rust gate: row_sum on {arch} is the implementation {want:?} ({} warps, grid {}): {ran} cases",
+        entry.num_warps.unwrap_or(0),
+        entry.grid
+    );
+}
+
 /// The bf16 nearest to an f32 (round to nearest, ties to even), as Triton's `.to(tl.bfloat16)` rounds a finite value.
 fn bf16_bits(x: f32) -> u16 {
     let bits = x.to_bits();

@@ -36,6 +36,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **Gluon kernels** (``gluon_kernels.py``, exported only: the committed fixtures have none): ``row_dot`` and ``row_dot_fma``, a layout-pinned row
   reduction declared with ``@tilefish.extern(gluon=...)`` over two views read with one ``i32`` row stride, for each bucket of its columns, over the
   two halves of one tensor and over two tensors of their own; the plan ``halves_dot`` runs it in a step over two views of an intermediate;
+* **an implementation per architecture** (``per_arch_kernels.py``, exported only): ``row_sum``, declared with ``by_arch=`` (one tiling of a row
+  reduction on sm_103, another on sm_120 and as the fallback), whose entry is the implementation of the device's architecture; checked here to give
+  the bytes of that tiling declared alone; the plan ``scaled_row_sum`` runs it in a step;
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
   and (on a fresh export) how an algorithm is chosen (:func:`option_ops`): a ``gemm_bias`` under ``heuristic="torch"``, and one with ``algos=`` imported
   for this device, whose split-K adds its partial sums in bf16 at one bucket in the output and at another in a workspace (``allow_bf16_reduction=True``),
@@ -71,7 +74,7 @@ from typing import Any, Callable
 
 import torch
 from gpu_util import randn, same_bytes
-from host_ops import GEMM_SHAPES, abi_of, gemm_name, gluon_ops, gpu_ops, library_ops, ops
+from host_ops import GEMM_SHAPES, abi_of, gemm_name, gluon_ops, gpu_ops, library_ops, ops, per_arch_ops
 
 import tilefish
 from tilefish import runtime
@@ -292,6 +295,20 @@ def must_be_a_row_dot(args, got):
     assert torch.allclose(got, ((a.double() * b.double()).sum(-1) * 0.5).float(), rtol=1e-5, atol=1e-5)
 
 
+def args_rows(rows, seed):
+    return (randn((rows, 1024), F32, seed),)
+
+
+def must_be_this_tiling(args, got):
+    """``row_sum`` runs the implementation of the device's architecture: the bytes of that tiling declared as an op of its own (jit)."""
+    import per_arch_kernels as pk
+
+    major, minor = torch.cuda.get_device_capability()
+    alone = {"sm_103": pk.tiled_only}.get(pk.row_sum.for_arch(major * 10 + minor).implementation, pk.whole_only)
+    (x,) = args
+    assert same_bytes(got, tilefish.run(alone, x)) and torch.allclose(got, x.double().sum(-1).float(), rtol=1e-5, atol=1e-3)
+
+
 def mask_of(b):
     """The ``Out`` tensor of a mask of ``b`` keys: what binds ``B``."""
     return lambda args: (torch.zeros((b,), dtype=BF16, device="cuda"),)
@@ -387,6 +404,8 @@ def build_cases():
     for op in ("row_dot", "row_dot_fma"):
         for c in (128, 256):
             cases += plain(op, f"{op}.Cb{c}", args_halves, [(rows, c, fused) for rows in (1, 7, 40) for fused in (True, False)], seeds=(0,), check=must_be_a_row_dot)
+    # -- an implementation per architecture: the device's, which gives the bytes of its tiling declared alone
+    cases += plain("row_sum", "row_sum", args_rows, (1, 2, 7, 40, 1000), seeds=(0, 1), check=must_be_this_tiling)
     # -- an Out that may be written over an input (MayAlias): launched apart here; in place in the plan residual_chain
     cases += plain("add_into", "add_into", args_add_into, (8, 24), seeds=(0, 1), check=must_add_into)
     return cases
@@ -525,6 +544,7 @@ def prepare(work, manifest_dir=None, pin=None):
     if manifest_dir is None:  # (a committed fixture has none of them: the GEMMs of other options, the Gluon kernels)
         declared.update(option_ops())
         declared.update(gluon_ops())
+        declared.update(per_arch_ops())
         declared.update(given_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
@@ -682,6 +702,10 @@ def plan_graphs():
 
     import gluon_kernels as gk
     import gpu_kernels_p4 as p4
+    import per_arch_kernels as pk
+
+    def scaled_cases():
+        return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 1024), F32, seed=40 + rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
 
     def fused_qkv_cases():
         return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 768), BF16, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
@@ -730,6 +754,7 @@ def plan_graphs():
         ("fused_qkv", p4.fused_qkv, False, fused_qkv_cases),  # one step that reads three views with one stride pair
         ("mask_rows", p4.mask_rows, False, mask_rows_cases),  # a step whose B only its Out buffer determines
         ("halves_dot", gk.halves_dot, False, halves_dot_cases),  # a Gluon step over two views of an intermediate
+        ("scaled_row_sum", pk.scaled_row_sum, False, scaled_cases),  # a step of the implementation of the device's architecture
         ("residual_chain", p5.residual_chain, False, residual_cases),  # two steps whose Out is written over their input (MayAlias)
         ("residual_chain-reuse", p5.residual_chain, True, residual_cases),
         ("copy_steps", p5.copy_steps, False, copy_cases),  # a copy of a dense view into the arena and a store into an InOut parameter
