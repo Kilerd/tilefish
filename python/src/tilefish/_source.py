@@ -87,6 +87,7 @@ SOURCE_DIGEST_KIND = "tilefish.module-sources.v2"
 _TAG = b"tilefish.source-digest.v2\0"
 _EXCLUDED = frozenset({"triton", "torch", "tilefish", "builtins", "__future__"}) | frozenset(getattr(sys, "stdlib_module_names", ()))
 _MAX_UNWRAP = 8
+_OFF = ("0", "false", "no", "off")  # the values of TILEFISH_IMPORT_WATCH that leave the import system alone
 
 
 def _attr(obj: Any, name: str) -> Any:
@@ -97,7 +98,31 @@ def _attr(obj: Any, name: str) -> Any:
         return None
 
 
+_MODULE_DICT = types.ModuleType.__dict__["__dict__"]
+
+
+def _is_module(value: Any) -> bool:
+    return issubclass(type(value), types.ModuleType)  # not isinstance: that asks the object for its __class__
+
+
+def _module_dict(module: Any) -> "dict[str, Any] | None":
+    """The namespace of a module, read without asking the module for anything.
+
+    An attribute of a ``importlib.util.LazyLoader`` module (``__file__``, ``__dict__``, any) *executes its body*, and some other
+    modules compute attributes on access. Nothing here touches the attributes of a module that has not been looked at already:
+    the dict comes from ``ModuleType``'s own descriptor, which no ``__getattribute__`` of a subclass is asked about. A lazy
+    module that has not been loaded has only its dunder names there (its file among them), which is all that is read of it.
+    """
+    try:
+        found = _MODULE_DICT.__get__(module)
+    except Exception:  # noqa: BLE001 - not a module at all
+        return None
+    return found if isinstance(found, dict) else None
+
+
 def _is_jit(value: Any) -> bool:
+    if _is_module(value):  # a module is never a jit function, and asking it for one would load a lazy module
+        return False
     return _attr(value, "raw_src") is not None and isinstance(_attr(value, "__globals__"), dict)
 
 
@@ -119,8 +144,10 @@ def jit_function(fn: Any) -> Any:
 
 def _namespace_of(value: Any) -> "tuple[str, dict[str, Any]] | None":
     """The module (name and namespace) a value belongs to: itself for a module, where it was defined for the rest."""
-    if issubclass(type(value), types.ModuleType):  # not isinstance: that asks the object for its __class__
-        return value.__name__, value.__dict__
+    if _is_module(value):
+        raw = _module_dict(value)
+        name = None if raw is None else raw.get("__name__")
+        return (name, raw) if isinstance(name, str) and raw is not None else None
     namespace = _attr(value, "__globals__")  # a function, a jit function
     if isinstance(namespace, dict) and isinstance(namespace.get("__name__"), str):
         return namespace["__name__"], namespace
@@ -136,7 +163,7 @@ def _namespace_of(value: Any) -> "tuple[str, dict[str, Any]] | None":
 def _held(value: Any) -> "Iterator[Any]":
     """``value`` and the function it wraps, if it wraps one (the ``.fn`` of a jit function or an autotuner)."""
     yield value
-    if issubclass(type(value), types.ModuleType):  # not isinstance: that asks the object for its __class__
+    if _is_module(value):
         return
     inner = _attr(value, "fn")
     if inner is not None and inner is not value:
@@ -371,6 +398,7 @@ class _Watch:
 
     imported: "dict[str, _Imported]" = field(default_factory=dict)
     before: "dict[str, tuple[int, int]]" = field(default_factory=dict)  # path -> (mtime_ns, size) when the watch was installed
+    specs: "dict[str, Any]" = field(default_factory=dict)  # path -> the module spec it had then: a reload makes another one
     original: Any = None
     loader: Any = None
     lazy: bool = False  # TILEFISH_IMPORT_WATCH=0: no loader is wrapped; a file is recorded when a build first reads it
@@ -418,13 +446,21 @@ class _Watch:
         loader.exec_module = exec_module  # type: ignore[method-assign]
 
     def record_baseline(self) -> None:
-        """Record the size and modification time of the file of every user module imported so far."""
+        """Record the size and modification time of the file of every user module imported so far.
+
+        A module is not asked for its ``__file__``: that would execute the body of a ``LazyLoader`` module that has not been used
+        yet (see :func:`_module_dict`).
+        """
         for name, module in list(sys.modules.items()):
             try:
-                path = getattr(module, "__file__", None)
+                raw = _module_dict(module)
+                path = None if raw is None else raw.get("__file__")
                 if isinstance(path, str) and path.endswith(".py") and is_user_module(name):
                     st = os.stat(path)
-                    self.before.setdefault(_key(path), (st.st_mtime_ns, st.st_size))
+                    key = _key(path)
+                    if key not in self.before:
+                        self.before[key] = (st.st_mtime_ns, st.st_size)
+                        self.specs[key] = raw.get("__spec__")
             except Exception:  # noqa: BLE001 - a module whose attributes or file cannot be looked at
                 continue
 
@@ -434,6 +470,11 @@ class _Watch:
         if self.loader.exec_module is not self.original:
             self.loader.exec_module = self.original  # type: ignore[method-assign]
         self.original = self.loader = None
+
+    @staticmethod
+    def _spec_of(name: str) -> Any:
+        raw = _module_dict(sys.modules.get(name))
+        return None if raw is None else raw.get("__spec__")
 
     def check_file(self, name: str, path: str, sha256: str, st: "os.stat_result") -> None:
         """Raise :class:`StaleSourceError` when the file ``path`` of module ``name``, which has ``sha256`` and ``st`` now, is not what was imported."""
@@ -448,9 +489,17 @@ class _Watch:
                 )
             return
         before = self.before.get(key)
+        spec = self._spec_of(name)
         if before is None:
             if self.lazy:
                 self.before[key] = (st.st_mtime_ns, st.st_size)
+                self.specs[key] = spec
+            return
+        if self.lazy and spec is not None and self.specs.get(key) is not spec:
+            # the module was imported again since the file was recorded (importlib.reload makes a new spec): it holds what the
+            # file has now, which is what is recorded again, instead of a refusal that nothing could ever clear
+            self.before[key] = (st.st_mtime_ns, st.st_size)
+            self.specs[key] = spec
             return
         if before != (st.st_mtime_ns, st.st_size):
             raise StaleSourceError(
@@ -473,11 +522,11 @@ _watch = _adopt()
 def install_import_watch() -> None:
     """Start recording the modules that are imported from now on (called when ``tilefish`` is imported; harmless to call again).
 
-    ``TILEFISH_IMPORT_WATCH=0`` leaves the import system alone: no loader is wrapped. A module is then checked only by the size
+    ``TILEFISH_IMPORT_WATCH`` set to ``0``, ``false``, ``no`` or ``off`` (any case) leaves the import system alone: no loader is wrapped. A module is then checked only by the size
     and modification time its file had when tilefish was imported or, for a module imported later, when a build first read it.
     That misses an edit made between such a module's import and the first build that reads it, and an edit that keeps both.
     """
-    if os.environ.get("TILEFISH_IMPORT_WATCH", "").strip() == "0":
+    if os.environ.get("TILEFISH_IMPORT_WATCH", "").strip().lower() in _OFF:
         _watch.lazy = True
         _watch.record_baseline()
         return
@@ -557,11 +606,13 @@ def _reads(found: Sources) -> "Iterator[tuple[str, dict[str, Any], str, Any]]":
         for chain in sorted(chains):
             module: Any = cells[chain[0]] if chain[0] in cells else namespace.get(chain[0])
             for attr in chain[1:]:
-                if not issubclass(type(module), types.ModuleType):
+                raw = _module_dict(module) if _is_module(module) else None
+                name = None if raw is None else raw.get("__name__")
+                if raw is None or not isinstance(name, str):
                     break
-                if is_user_module(module.__name__):
-                    yield module.__name__, module.__dict__, attr, fn
-                module = module.__dict__.get(attr)
+                if is_user_module(name):
+                    yield name, raw, attr, fn
+                module = raw.get(attr)
 
 
 def check_values(found: Sources) -> None:
@@ -589,8 +640,9 @@ def _function_id(fn: Any) -> str:
 
 def _identity(value: Any) -> str:
     """Which module, function or class a closure variable holds: its ``module:qualname`` (what the files say it is, not an address)."""
-    if issubclass(type(value), types.ModuleType):
-        return f"module:{value.__name__}"
+    if _is_module(value):
+        raw = _module_dict(value)
+        return f"module:{raw.get('__name__') if raw is not None else '?'}"
     kernel = jit_function(value)
     if kernel is not None:
         return f"jit:{_function_id(kernel)}"
