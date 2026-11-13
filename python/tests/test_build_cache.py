@@ -696,6 +696,7 @@ def test_export_stamps_the_binary_of_the_value_the_process_holds_and_replay_refu
     load()
     manifest = runtime.export(clo_op, tmp_path / "two", arch=90)
     (entry,) = manifest.doc["kernels"]
+    assert manifest.pinned  # export has written it from its own builds: what generates source from a manifest takes it
     assert entry["source_digest_kind"] == _source.SOURCE_DIGEST_KIND and len(entry["source_digest"]) == 64
     # a replay in a process that holds the same value: the digest is the entry's, and the binary is accepted
     digest_two = runtime._current_source_digest(CLO_SPEC)

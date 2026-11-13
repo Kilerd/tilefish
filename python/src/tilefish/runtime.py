@@ -590,6 +590,7 @@ def export(
             f"the manifest in {str(path.parent)!r} has digest {loaded.digest} when it is read back, but the manifest that was "
             f"written has digest {expected}: the directory changed while it was being exported"
         )
+    loaded.pinned = True  # its digest is the one of the manifest this process wrote from its own builds
     return loaded
 
 

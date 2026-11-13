@@ -108,16 +108,38 @@ def _no_duplicate_keys(pairs: "list[tuple[str, Any]]") -> "dict[str, Any]":
     return out
 
 
+def _check_pin(directory: pathlib.Path, doc: "dict[str, Any]", pin: Any) -> None:
+    if not (isinstance(pin, str) and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin)):
+        raise TilefishManifestError(f"pin= is the 64 lowercase hex digits of a manifest digest, got {pin!r}")
+    found = manifest_digest(doc)
+    if found != pin:
+        raise TilefishManifestError(
+            f"the manifest in {str(directory)!r} has digest {found}, but the pin is {pin}: it is not the manifest that was "
+            "pinned (it was changed, or it is another export)"
+        )
+
+
 class Manifest:
-    """The binaries of a manifest directory, verified when it is loaded."""
+    """The binaries of a manifest directory, verified when it is loaded.
+
+    ``pinned`` says whether its digest was compared with one from a trusted place: ``Manifest.load(path, pin=...)`` and
+    :meth:`check_pin` do, and so does :func:`tilefish.runtime.export` for the manifest it has just written from its own builds.
+    What generates source code from a manifest (:mod:`tilefish.hosts.rust`) takes only a pinned one.
+    """
 
     def __init__(
-        self, directory: pathlib.Path, doc: "dict[str, Any]", artifacts: "dict[tuple[str, str], Artifact]", path: "pathlib.Path | None" = None
+        self,
+        directory: pathlib.Path,
+        doc: "dict[str, Any]",
+        artifacts: "dict[tuple[str, str], Artifact]",
+        path: "pathlib.Path | None" = None,
+        pinned: bool = False,
     ) -> None:
         self.directory = directory
         self.path = path if path is not None else directory / MANIFEST_NAME
         self.doc = doc
         self._artifacts = artifacts
+        self.pinned = pinned  # whether its digest was compared with one from a trusted place (see :meth:`check_pin`)
 
     @property
     def digest(self) -> str:
@@ -125,12 +147,13 @@ class Manifest:
         return manifest_digest(self.doc)
 
     @classmethod
-    def load(cls, path: "str | pathlib.Path") -> "Manifest":
+    def load(cls, path: "str | pathlib.Path", *, pin: "str | None" = None) -> "Manifest":
         """Load ``<directory>/manifest.json`` (or the manifest file itself) and every cubin it names.
 
         Raises :class:`~tilefish.errors.TilefishManifestError` when a file is missing or malformed, a cubin is not
         an ELF file with the code section the manifest's symbol names, or its ``sha256`` or ``sha256_code`` is not
-        the one the manifest records.
+        the one the manifest records. With ``pin=`` (the digest of the manifest, from a trusted place) a manifest with any
+        other digest is refused, before a cubin is read, and the result is :attr:`pinned`.
         """
         path = pathlib.Path(path)
         manifest_path = path / MANIFEST_NAME if path.is_dir() else path
@@ -158,6 +181,8 @@ class Manifest:
                 f"the manifest {str(manifest_path)!r} is not a tilefish manifest of schema {MANIFEST_SCHEMA} "
                 f"(schema {doc.get('schema') if isinstance(doc, dict) else None!r})"
             )
+        if pin is not None:
+            _check_pin(manifest_path.parent, doc, pin)
         artifacts: dict[tuple[str, str], Artifact] = {}
         for i, entry in enumerate(doc["kernels"]):
             artifact = cls._read(manifest_path.parent, i, entry)
@@ -165,7 +190,13 @@ class Manifest:
             if key in artifacts:
                 raise TilefishManifestError(f"the manifest lists '{key[0]}' for {key[1]} twice")
             artifacts[key] = artifact
-        return cls(manifest_path.parent, doc, artifacts, manifest_path)
+        return cls(manifest_path.parent, doc, artifacts, manifest_path, pinned=pin is not None)
+
+    def check_pin(self, pin: str) -> "Manifest":
+        """Refuse unless the digest of this manifest is ``pin``; then it is :attr:`pinned`. Returns the manifest."""
+        _check_pin(self.directory, self.doc, pin)
+        self.pinned = True
+        return self
 
     @staticmethod
     def _read(directory: pathlib.Path, i: int, entry: Any) -> Artifact:

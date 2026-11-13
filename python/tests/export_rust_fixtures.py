@@ -28,7 +28,6 @@ from host_ops import ops
 
 from tilefish import runtime
 from tilefish._elf import code_digest
-from tilefish.aot import Manifest
 from tilefish.hosts import rust
 
 
@@ -61,7 +60,7 @@ def main(argv=None):
             shutil.rmtree(directory)
         manifest = runtime.export(declared, directory, arch=cap)
         if position == 0:
-            rust.emit(Manifest.load(directory), args.output / "generated.rs", ops=declared)
+            rust.emit(manifest, args.output / "generated.rs", ops=declared)  # the manifest export returned is pinned
         summary[f"sm_{cap}"] = expected(manifest)
         print(f"sm_{cap}: {len(manifest.artifacts)} binaries, manifest digest {manifest.digest}", file=sys.stderr)
     (args.output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")

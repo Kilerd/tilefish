@@ -98,7 +98,16 @@ def raw(t):
     return t.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
 
 
-def prepare(work, manifest_dir=None):
+def expected_pin(manifest_dir):
+    """The digest ``expected.json`` (next to the fixture directories, which the Rust tests check as well) has for a fixture directory."""
+    expected = pathlib.Path(manifest_dir).resolve().parent / "expected.json"
+    try:
+        return json.loads(expected.read_text())["fixtures"][pathlib.Path(manifest_dir).resolve().name]["manifest_digest"]
+    except (OSError, KeyError, ValueError):
+        sys.exit(f"--manifest needs --pin <the manifest's digest> ({expected} has none for {manifest_dir})")
+
+
+def prepare(work, manifest_dir=None, pin=None):
     work = pathlib.Path(work).resolve()
     if work.exists():
         shutil.rmtree(work)
@@ -108,7 +117,7 @@ def prepare(work, manifest_dir=None):
         manifest = runtime.export(list(declared.values()), work / "manifest")
         manifest_ref = "manifest"
     else:
-        manifest = Manifest.load(manifest_dir)
+        manifest = Manifest.load(manifest_dir, pin=pin or expected_pin(manifest_dir))  # the emitter and the replay both take a pinned manifest
         manifest_ref = str(pathlib.Path(manifest_dir).resolve())
     digest = manifest.digest
     # embedded: the generated module also carries the manifest and the cubins (include_bytes!), which the Rust test runs too
@@ -191,11 +200,12 @@ def main(argv=None):
     p = sub.add_parser("prepare")
     p.add_argument("work", type=pathlib.Path)
     p.add_argument("--manifest", type=pathlib.Path, help="use this manifest directory instead of exporting one")
+    p.add_argument("--pin", help="the digest of --manifest (default: the one expected.json next to a fixture directory has)")
     c = sub.add_parser("compare")
     c.add_argument("work", type=pathlib.Path)
     args = parser.parse_args(argv)
     if args.command == "prepare":
-        prepare(args.work, args.manifest)
+        prepare(args.work, args.manifest, args.pin)
         return 0
     return compare(args.work)
 

@@ -27,6 +27,15 @@ What the module holds, in order:
 
 The output is deterministic: the same manifest gives the same bytes. Nothing in it depends on where the manifest was
 written, except the ``include_bytes!`` paths with ``embed=True``.
+
+What it trusts. The output is Rust source that a developer compiles and runs, and a manifest directory vouches for nothing by
+itself: whoever can write it can put any text in any field. So :func:`emit` (and :func:`render`) take a *pinned* manifest only: a
+directory with ``pin=<the manifest's digest>``, or a :class:`~tilefish.Manifest` that was loaded with a pin (or that
+``tilefish.runtime.export`` returned, which has just been written from this process's builds). Then every field that reaches the
+output is validated (``stem``, ``op``, architecture, file names, tensor and dimension names, dtypes, shapes, constexprs, the
+grid, sizes: each must be what it is for), so a manifest cannot write a doc line that breaks out of its comment, an item, or a
+string literal into the generated file; and the doc comments are written a line at a time, with line breaks that a field might carry
+split into lines that are all comments.
 """
 
 from __future__ import annotations
@@ -40,7 +49,8 @@ from typing import Any, Iterable
 
 from .._build import spec_entry, write_file
 from .._manifest import Manifest
-from ..errors import TilefishManifestError
+from .._specvalid import parse_expression, parse_grid
+from ..errors import TilefishManifestError, TilefishSpecError
 
 RUST_ELEMENTS = {"bf16": "Bf16", "f16": "F16", "f32": "F32", "i32": "I32", "i64": "I64", "u8": "U8", "e4m3": "E4m3", "e5m2": "E5m2"}
 
@@ -64,8 +74,17 @@ _SHARED_FIELDS = (
 _RUST_KEYWORDS = frozenset(
     "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref "
     "return self Self static struct super trait true type unsafe use where while abstract become box do final macro override priv "
-    "typeof unsized virtual yield try gen stream".split()
-)
+    "typeof unsized virtual yield try gen stream _".split()
+)  # `stream` is the name of the stream parameter of every launcher, `_` is not a name that can be used
+
+# what a name in a manifest may be, to reach the generated source: plain ASCII, never what a lexer could read as something else
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
+_STEM = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", re.ASCII)
+_ARCH = re.compile(r"sm_[0-9]{2,3}[a-z]?", re.ASCII)
+_FILE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]*", re.ASCII)
+_DTYPE = re.compile(r"[a-z][a-z0-9_]*", re.ASCII)
+_U64_MAX = 2**64 - 1
+_ACCESS = ("in", "out", "inout")
 
 
 @dataclass
@@ -83,16 +102,28 @@ class _Binary:
 
 
 def _rs_str(text: str) -> str:
-    """A Rust string literal for plain ASCII text (identifiers, digits and the characters of dimension expressions)."""
-    if not text.isascii() or not text.isprintable():
+    """A Rust string literal for plain ASCII text (identifiers, digits and the characters of dimension expressions).
+
+    Anything else is refused, and ``\\`` and ``"`` are escaped: no text can end the literal.
+    """
+    if not isinstance(text, str) or not text.isascii() or not text.isprintable():
         raise TilefishManifestError(f"cannot write {text!r} in generated Rust source: it is not printable ASCII")
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+# what the generated module imports from the crate, and `Self`: a struct of these names would clash with them
+_RESERVED_STRUCTS = frozenset(
+    {"Self", "Arch", "CUstream", "CudaStream", "Error", "Kernel", "Manifest", "Pin", "TensorRef", "TensorMut", "Result", "Option", "Some", "None", "Ok", "Err"}
+    | set(RUST_ELEMENTS.values())
+)
+
+
 def _camel(stem: str) -> str:
+    """The name of the struct of a stem: ``rowop.S32`` is ``RowopS32``. One that would clash with an import gets ``Op`` after it."""
     pieces = [p for p in re.split(r"[._]+", stem) if p]
     name = "".join(p[0].upper() + p[1:] for p in pieces)
-    return name if name and not name[0].isdigit() else "K" + name
+    name = name if name and not name[0].isdigit() else "K" + name
+    return name + "Op" if name in _RESERVED_STRUCTS else name
 
 
 def _snake_ident(name: str) -> str:
@@ -107,7 +138,122 @@ def _scalar_text(value: Any) -> str:
     return repr(value)
 
 
+def _bad(who: str, what: str) -> Any:
+    raise TilefishManifestError(f"cannot write Rust launchers for {who}: {what}")
+
+
+def _name(who: str, where: str, value: Any, pattern: "re.Pattern[str]" = _IDENT) -> str:
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        _bad(who, f"{where} must be a plain ASCII name, got {value!r}")
+    return value
+
+
+def _count(who: str, where: str, value: Any, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= _U64_MAX:
+        _bad(who, f"{where} must be an integer from {minimum} to 2**64 - 1, got {value!r}")
+    return value
+
+
+def _expression(who: str, where: str, value: Any) -> str:
+    try:
+        parse_expression(value, where)
+    except TilefishSpecError as e:
+        _bad(who, f"{where} is not a dimension expression ({e})")
+    return value
+
+
+def _field(who: str, where: str, owner: Any, key: str, kind: type) -> Any:
+    value = owner.get(key) if isinstance(owner, dict) else None
+    if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
+        _bad(who, f"{where} is missing or is not a {kind.__name__}")
+    return value
+
+
+def _validate_entry(entry: Any) -> None:
+    """Refuse an entry with any field that must not reach generated Rust source as it is (see the module docstring)."""
+    if not isinstance(entry, dict):
+        _bad("an entry", f"it is not an object: {entry!r}")
+    who = f"the entry {entry.get('stem')!r}"
+    stem = _name(who, "the stem", entry.get("stem"), _STEM)
+    arch = _name(who, "the architecture", entry.get("arch"), _ARCH)
+    who = f"'{stem}' ({arch})"
+    _name(who, "the operator", entry.get("op"))
+    _name(who, "the cubin file name", entry.get("cubin"), _FILE)
+    abi = _field(who, "abi", entry, "abi", dict)
+    params = _field(who, "abi.params", abi, "params", list)
+    names = set()
+    for i, p in enumerate(params):
+        where = f"abi.params[{i}]"
+        name = _name(who, f"{where}.name", p.get("name") if isinstance(p, dict) else None)
+        names.add(name)
+    for i, p in enumerate(params):
+        where = f"abi.params[{i}] ('{p['name']}')"
+        kind = p.get("kind")
+        if kind == "pointer":
+            _name(who, f"{where}.dtype", p.get("dtype"), _DTYPE)
+            if p.get("access") not in _ACCESS:
+                _bad(who, f"{where}.access must be one of {list(_ACCESS)}, got {p.get('access')!r}")
+            shape = _field(who, f"{where}.shape", p, "shape", list)
+            for axis, d in enumerate(shape):
+                if isinstance(d, str):
+                    _expression(who, f"{where}.shape[{axis}]", d)
+                else:
+                    _count(who, f"{where}.shape[{axis}]", d)
+        elif kind == "scalar":
+            _expression(who, f"{where}.dim", p.get("dim"))
+            target = p.get("count_of")
+            if target is not None and target not in names:
+                _bad(who, f"{where}.count_of must name a parameter, got {target!r}")
+            if target is not None:
+                _name(who, f"{where}.count_of", target)
+        else:
+            _bad(who, f"{where}.kind must be 'pointer' or 'scalar', got {kind!r}")
+    dims = _field(who, "dims", entry, "dims", dict)
+    for name, c in dims.items():
+        _name(who, "a dimension name", name)
+        if not isinstance(c, dict):
+            _bad(who, f"the constraints of dimension '{name}' are not an object")
+        for key in ("divisible_by", "bucket"):
+            if key in c:
+                _count(who, f"dims['{name}'].{key}", c[key], 1)
+        if "buckets" in c:
+            listed = c["buckets"]
+            if not isinstance(listed, list):
+                _bad(who, f"dims['{name}'].buckets is not a list")
+            for v in listed:
+                _count(who, f"dims['{name}'].buckets", v, 1)
+    buckets = _field(who, "buckets", entry, "buckets", dict)
+    for name, v in buckets.items():
+        _name(who, "a bucket's dimension name", name)
+        _count(who, f"buckets['{name}']", v, 1)
+    for i, c in enumerate(_field(who, "constexprs", entry, "constexprs", list)):
+        where = f"constexprs[{i}]"
+        _name(who, f"{where}.name", c.get("name") if isinstance(c, dict) else None)
+        value = c.get("value")
+        if isinstance(value, dict):
+            if set(value) != {"float"} or value["float"] not in ("inf", "-inf", "nan"):
+                _bad(who, f"{where}.value is not a number, a bool or a tagged float: {value!r}")
+        elif not isinstance(value, (bool, int, float)):
+            _bad(who, f"{where}.value must be a number or a bool, got {value!r}")
+        elif isinstance(value, float) and value != value:
+            _bad(who, f"{where}.value is not a finite number")
+        if "dtype" in c:
+            _name(who, f"{where}.dtype", c["dtype"], _DTYPE)
+    try:
+        parse_grid(entry.get("grid"))
+    except TilefishSpecError as e:
+        _bad(who, f"the grid is not a grid expression ({e})")
+    block = _field(who, "block", entry, "block", list)
+    if len(block) != 3:
+        _bad(who, f"block must have three sizes, got {block!r}")
+    for k, b in enumerate(block):
+        _count(who, f"block[{k}]", b, 1)
+    _count(who, "shared", entry.get("shared"))
+
+
 def _group(manifest: Manifest) -> "list[_Binary]":
+    for artifact in manifest.artifacts:
+        _validate_entry(artifact.entry)
     by_stem: "dict[str, list[dict[str, Any]]]" = {}
     for artifact in manifest.artifacts:
         by_stem.setdefault(artifact.stem, []).append(artifact.entry)
@@ -229,7 +375,12 @@ def _doc(binary: _Binary) -> "list[str]":
 
 
 def _doc_comment(lines: "list[str]", indent: str = "") -> str:
-    return "".join(f"{indent}///{' ' + ln if ln else ''}\n" for ln in lines)
+    """Doc comment lines. A line break inside a line (which no validated field has) starts another comment line, never code."""
+    out = []
+    for line in lines:
+        for ln in "".join(c if c.isprintable() or c in "\n\r" else f"\\x{ord(c):02x}" for c in line).splitlines() or [""]:
+            out.append(f"{indent}///{' ' + ln if ln else ''}\n")
+    return "".join(out)
 
 
 def _render_binary(b: _Binary) -> str:
@@ -307,8 +458,42 @@ def _render_binary(b: _Binary) -> str:
     return "".join(out)
 
 
-def render(manifest: Manifest, *, ops: "Iterable[Any]" = (), embed: bool = False, relative_to: "str | os.PathLike[str] | None" = None) -> str:
-    """The Rust source :func:`emit` writes, as a string. ``relative_to`` is the directory of the generated file (for ``embed``)."""
+def _trusted(manifest: Any, pin: "str | None") -> Manifest:
+    """The manifest to generate from: a directory with ``pin``, or a :class:`Manifest` that is pinned (see the module docstring)."""
+    if isinstance(manifest, (str, os.PathLike)):
+        if pin is None:
+            raise TilefishManifestError(
+                f"the manifest directory {str(manifest)!r} would be read without a trust anchor, and the Rust source generated from it is "
+                "compiled and run: pass pin=<the manifest's digest> (Manifest.digest, which runtime.export returns), or a Manifest "
+                "that is pinned"
+            )
+        return Manifest.load(manifest, pin=pin)
+    if not isinstance(manifest, Manifest):
+        raise TilefishManifestError(f"emit takes a manifest directory (with pin=) or a pinned Manifest, got {type(manifest).__name__}")
+    if pin is not None:
+        return manifest.check_pin(pin)
+    if not manifest.pinned:
+        raise TilefishManifestError(
+            f"the manifest in {str(manifest.directory)!r} is not pinned, and the Rust source generated from it is compiled and run: "
+            "load it with Manifest.load(path, pin=<its digest>), pass pin= here, or use the Manifest that runtime.export returned"
+        )
+    return manifest
+
+
+def render(
+    manifest: Any,
+    *,
+    ops: "Iterable[Any]" = (),
+    embed: bool = False,
+    relative_to: "str | os.PathLike[str] | None" = None,
+    pin: "str | None" = None,
+) -> str:
+    """The Rust source :func:`emit` writes, as a string. ``relative_to`` is the directory of the generated file (for ``embed``).
+
+    ``manifest`` is a directory with ``pin``, or a pinned :class:`~tilefish.Manifest` (see the module docstring); every field of it
+    that reaches the output is validated first.
+    """
+    manifest = _trusted(manifest, pin)
     binaries = _group(manifest)
     _check_declarations(binaries, ops)
     elements = sorted({RUST_ELEMENTS[p["dtype"]] for b in binaries for p in b.params})
@@ -350,13 +535,20 @@ def render(manifest: Manifest, *, ops: "Iterable[Any]" = (), embed: bool = False
 
 
 def emit(
-    manifest: Manifest,
+    manifest: Any,
     path: "str | os.PathLike[str]",
     *,
     ops: "Iterable[Any]" = (),
     embed: bool = False,
+    pin: "str | None" = None,
 ) -> pathlib.Path:
     """Write the typed Rust launchers of ``manifest`` to ``path`` (one ``.rs`` module) and return the path.
+
+    ``manifest`` is a manifest directory, which is loaded only with ``pin=`` (its digest: a directory with any other digest is
+    refused), or a :class:`~tilefish.Manifest` that is pinned (loaded with a pin, or returned by ``tilefish.runtime.export``). The
+    source is compiled and run by whoever uses it, so a manifest nobody vouched for does not get to write it, and every field that
+    reaches it is validated: a name, a dtype, a shape, the grid, a file name that is not what it should be is a
+    :class:`~tilefish.errors.TilefishManifestError`, never text in the generated file.
 
     The launchers are typed from the manifest alone (a schema 2 manifest has the declared shape of every pointer and the
     constraints of every dimension). ``ops`` are optional: the declarations the manifest was built from (kernels, externs or
@@ -366,7 +558,7 @@ def emit(
     file is written through a temporary file and renamed, and a symbolic link at ``path`` is refused.
     """
     path = pathlib.Path(path)
-    source = render(manifest, ops=list(ops), embed=embed, relative_to=path.resolve().parent)
+    source = render(manifest, ops=list(ops), embed=embed, relative_to=path.resolve().parent, pin=pin)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_file(path, source.encode("utf-8"))
     return path

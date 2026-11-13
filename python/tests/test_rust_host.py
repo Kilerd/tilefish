@@ -41,12 +41,23 @@ def check_golden(name: str, source: str) -> None:
     assert source == path.read_bytes().decode("utf-8"), f"{name} no longer matches {path}; if the change is intended, rerun with UPDATE_GOLDEN=1"
 
 
+def pinned(manifest):
+    """The manifest, pinned to its own digest: the emitter takes a pinned manifest only, and these tests are about what it writes."""
+    return manifest.check_pin(manifest.digest)
+
+
+def fixture(name="sm_103"):
+    """A fixture of the crate, pinned to the digest ``expected.json`` (which the Rust tests check as well) holds for it."""
+    digest = json.loads((FIXTURES / "expected.json").read_text())["fixtures"][name]["manifest_digest"]
+    return Manifest.load(FIXTURES / name, pin=digest)
+
+
 @pytest.fixture
 def fake_manifest(tmp_path):
-    """A manifest directory of four fake binaries: ``scale``, and ``rowop`` for its two buckets, for sm_90."""
+    """A pinned manifest directory of four fake binaries: ``scale``, and ``rowop`` for its two buckets, for sm_90."""
     built = [fake_build(s) for s in compile_specs(scale) + compile_specs(rowop)]
     write_manifest(built, tmp_path / "manifest" / "manifest.json", cubins=True)
-    return Manifest.load(tmp_path / "manifest")
+    return pinned(Manifest.load(tmp_path / "manifest"))
 
 
 # -- snapshots ------------------------------------------------------------------------------------------------------------
@@ -89,7 +100,7 @@ def test_embedded_launchers(fake_manifest, tmp_path):
 def test_baked_in_sizes_are_constants_and_documented():
     import host_ops
 
-    source = rust.render(Manifest.load(FIXTURES / "sm_103"), ops=host_ops.ops().values())
+    source = rust.render(fixture(), ops=host_ops.ops().values())
     assert "pub const X_PTR_AXIS1: usize = 2048;" in source  # the extern rmsnorm: Tensor[Rows, Hidden = 2048]
     assert "Baked into the binary: axis 1 of `x_ptr` is 2048;" in source
     assert "Constraints: `Db` is exactly 96 (a bucket of [96, 512, 1000]" in source
@@ -106,7 +117,7 @@ def test_the_output_is_deterministic_and_does_not_depend_on_the_order_of_the_ent
     other = tmp_path / "reordered"
     shutil.copytree(fake_manifest.directory, other)
     (other / "manifest.json").write_text(json.dumps(doc, indent=2) + "\n")
-    reordered = Manifest.load(other)
+    reordered = pinned(Manifest.load(other))
     assert reordered.digest == fake_manifest.digest  # the digest does not depend on the order either
     assert rust.render(reordered, ops=[scale, rowop]) == first
     # and writing it twice gives the same bytes
@@ -147,7 +158,7 @@ def test_the_binaries_of_a_stem_must_agree_across_architectures(tmp_path):
     a = fake_build(spec, arch="sm_90")
     b = fake_build(spec, arch="sm_100", cubin=cubin_like(code=b"\x09\x08\x07\x06" * 16))
     write_manifest([a, b], tmp_path / "manifest.json", cubins=True)
-    manifest = Manifest.load(tmp_path)
+    manifest = pinned(Manifest.load(tmp_path))
     source = rust.render(manifest, ops=[scale])
     assert source.count("pub struct Scale ") == 1  # one stem for two architectures is one launcher
     assert "built for sm_100, sm_90" in source
@@ -155,7 +166,7 @@ def test_the_binaries_of_a_stem_must_agree_across_architectures(tmp_path):
     doc["kernels"][1]["grid"] = "(cdiv(n, 128),)"
     (tmp_path / "manifest.json").write_text(json.dumps(doc, indent=2))
     with pytest.raises(TilefishManifestError, match="disagree about 'grid'"):
-        rust.render(Manifest.load(tmp_path))
+        rust.render(pinned(Manifest.load(tmp_path)))
 
 
 def test_a_pointer_of_a_packed_dtype_has_no_launcher(tmp_path):
@@ -167,7 +178,7 @@ def test_a_pointer_of_a_packed_dtype_has_no_launcher(tmp_path):
     (spec,) = compile_specs(packed)
     write_manifest([fake_build(spec)], tmp_path / "manifest.json", cubins=True)
     with pytest.raises(TilefishManifestError, match="no element type in Rust"):
-        rust.render(Manifest.load(tmp_path))
+        rust.render(pinned(Manifest.load(tmp_path)))
 
 
 def test_identifiers_are_made_safe(fake_manifest):
@@ -201,7 +212,7 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect():
 def test_the_committed_launchers_are_what_the_emitter_writes_for_the_fixture():
     import host_ops
 
-    manifest = Manifest.load(FIXTURES / "sm_103")
+    manifest = fixture()
     emitted = rust.render(manifest, ops=host_ops.ops().values())
     assert emitted == (FIXTURES / "generated.rs").read_text(), (
         "crates/tilefish/tests/fixtures/generated.rs is not what tilefish.hosts.rust.emit writes for the sm_103 fixture: "
@@ -224,11 +235,11 @@ def test_the_launchers_compile_against_the_crate(tmp_path_factory, fake_manifest
         '[package]\nname = "launchers-check"\nversion = "0.0.0"\nedition = "2024"\n\n'
         f'[dependencies]\ntilefish = {{ path = {json.dumps(str(REPO_ROOT / "crates" / "tilefish"))} }}\n\n[workspace]\n'
     )
-    fixture = Manifest.load(FIXTURES / "sm_103")
+    sm_103 = fixture()
     declared = list(host_ops.ops().values())
-    rust.emit(fixture, crate / "src" / "typed.rs", ops=declared)
-    rust.emit(fixture, crate / "src" / "manifest_only.rs")
-    rust.emit(fixture, crate / "src" / "embedded.rs", ops=declared, embed=True)
+    rust.emit(sm_103, crate / "src" / "typed.rs", ops=declared)
+    rust.emit(sm_103, crate / "src" / "manifest_only.rs")
+    rust.emit(sm_103, crate / "src" / "embedded.rs", ops=declared, embed=True)
     rust.emit(fake_manifest, crate / "src" / "fakes.rs", ops=[scale, rowop])
     (crate / "src" / "lib.rs").write_text("pub mod embedded;\npub mod fakes;\npub mod manifest_only;\npub mod typed;\n")
     env = {**os.environ, "RUSTFLAGS": "-D warnings", "CARGO_TARGET_DIR": str(REPO_ROOT / "target" / "launchers-check")}
@@ -308,3 +319,172 @@ def test_python_refuses_what_the_rust_tests_refuse(name, mutate, tmp_path):
     mutate(tmp_path / "m")
     with pytest.raises(TilefishManifestError):
         Manifest.load(tmp_path / "m")
+
+
+# -- what the emitter trusts, and what no field of a manifest can do to the file it writes -------------------------------------------------
+
+# a payload that would end a doc comment, an item and a string literal, and write code
+EVIL = 'x\n}\n}\npub fn pwned() { std::process::exit(0) }\nstatic S: &str = "'
+
+
+def edited(fake_manifest, tmp_path, change):
+    """A copy of the directory of ``fake_manifest`` whose entry ``scale`` was changed by ``change(entry, directory)``; loaded, not pinned."""
+    other = tmp_path / "edited"
+    shutil.copytree(fake_manifest.directory, other)
+    doc = json.loads((other / "manifest.json").read_text())
+    entry = next(k for k in doc["kernels"] if k["stem"] == "scale")
+    change(entry, other)
+    (other / "manifest.json").write_text(json.dumps(doc, indent=2) + "\n")
+    return Manifest.load(other)
+
+
+def param(entry, name):
+    return next(p for p in entry["abi"]["params"] if p["name"] == name)
+
+
+def rename_cubin(entry, directory, name):
+    (directory / name).write_bytes((directory / entry["cubin"]).read_bytes())  # the file is there under the name it is given
+    entry["cubin"] = name
+
+
+FIELDS = {
+    "the stem": lambda e, d: e.update(stem=EVIL),
+    "a stem with a dot at the end": lambda e, d: e.update(stem="scale."),
+    "the operator": lambda e, d: e.update(op=EVIL),
+    "the architecture": lambda e, d: e.update(arch="sm_90\n"),
+    "an architecture that is not one": lambda e, d: e.update(arch="sm_90; drop"),
+    "a cubin name with a quote": lambda e, d: rename_cubin(e, d, 'a".sm_90.cubin'),
+    "a cubin name with a newline": lambda e, d: rename_cubin(e, d, "a\n.sm_90.cubin"),
+    "a tensor name": lambda e, d: param(e, "x").update(name=EVIL),
+    "a tensor name with a unicode letter": lambda e, d: param(e, "x").update(name="xé"),
+    "a tensor name that starts with a digit": lambda e, d: param(e, "x").update(name="1x"),
+    "the dtype of a tensor": lambda e, d: param(e, "x").update(dtype=EVIL),
+    "the access of a tensor": lambda e, d: param(e, "x").update(access="in\n"),
+    "a tensor's dimension expression": lambda e, d: param(e, "x").update(shape=[EVIL]),
+    "a tensor's dimension expression with a quote": lambda e, d: param(e, "x").update(shape=['n"; drop']),
+    "a static size that is not an integer": lambda e, d: param(e, "x").update(shape=[1.5]),
+    "a static size that is negative": lambda e, d: param(e, "x").update(shape=[-1]),
+    "a static size beyond 64 bits": lambda e, d: param(e, "x").update(shape=[2**64]),
+    "the shape of a tensor": lambda e, d: param(e, "x").update(shape=EVIL),
+    "a scalar's dimension expression": lambda e, d: param(e, "n_elem").update(dim=EVIL),
+    "a scalar's kind": lambda e, d: param(e, "n_elem").update(kind="pointer\n"),
+    "a name in dims": lambda e, d: e["dims"].update({EVIL: {}}),
+    "the divisor of a dimension": lambda e, d: e["dims"]["n"].update(divisible_by="16\npub fn pwned() {}"),
+    "a dimension's constraints": lambda e, d: e["dims"].update(n="16"),
+    "a bucket value": lambda e, d: e["dims"].update(n={"buckets": [16], "bucket": "16\n"}),
+    "the name in buckets": lambda e, d: e["buckets"].update({EVIL: 1}),
+    "a constexpr's name": lambda e, d: e["constexprs"][1].update(name=EVIL),
+    "a constexpr's value": lambda e, d: e["constexprs"][1].update(value=EVIL),
+    "a constexpr's tagged float": lambda e, d: e["constexprs"][0].update(value={"float": "inf\n"}),
+    "a constexpr's dtype": lambda e, d: e["constexprs"][0].update(dtype=EVIL),
+    "the grid": lambda e, d: e.update(grid=EVIL),
+    "a grid that is a name": lambda e, d: e.update(grid="(cdiv(n, 256),)\n"),
+    "the block": lambda e, d: e.update(block=[128, "1", 1]),
+    "a block of three words": lambda e, d: e.update(block="1 1 1"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(FIELDS))
+def test_a_field_that_is_not_what_it_must_be_is_refused_and_writes_nothing(name, fake_manifest, tmp_path):
+    manifest = edited(fake_manifest, tmp_path, FIELDS[name])
+    out = tmp_path / "launchers.rs"
+    for embed in (False, True):
+        with pytest.raises(TilefishManifestError, match="cannot write Rust launchers for"):
+            rust.emit(manifest, out, pin=manifest.digest, embed=embed)
+    assert not out.exists()  # and the file is not written half way
+
+
+def test_the_reviewers_grid_with_a_newline_cannot_inject_items(fake_manifest, tmp_path):
+    """A newline in the grid ended the doc comment and wrote ``pub fn`` items into the generated file."""
+    manifest = edited(fake_manifest, tmp_path, lambda e, d: e.update(grid="(n,)\npub fn pwned() {}\n// "))
+    with pytest.raises(TilefishManifestError, match=r"the grid is not a grid expression"):
+        rust.render(manifest, pin=manifest.digest)
+
+
+def test_every_piece_of_text_that_reaches_a_doc_comment_stays_in_the_comment():
+    # the guard below the validation: whatever a field carries, a line break starts another comment line, never code
+    for text in ["a\npub fn pwned() {}", "b\r\npub fn pwned() {}", "c\rpub fn pwned() {}", "d pub fn pwned() {}", "e\x0bpub fn pwned() {}", "\x00\x1b[31m", "", "\n"]:
+        out = rust._doc_comment(["first", text, "last"], "    ")
+        lines = out.split("\n")
+        assert lines[-1] == "" and all(line.startswith("    ///") for line in lines[:-1]), repr(out)
+        assert "\r" not in out and "\x0b" not in out and " " not in out and "\x00" not in out and "\x1b" not in out, repr(out)
+    assert rust._doc_comment(["a", "", "b"]) == "/// a\n///\n/// b\n"
+
+
+def test_a_string_literal_cannot_be_ended_from_inside():
+    assert rust._rs_str('a"b') == '"a\\"b"' and rust._rs_str("a\\b") == '"a\\\\b"'
+    for bad in ["a\nb", "a\rb", "a\tb", "a\x00b", "café", " ", 5, None]:
+        with pytest.raises(TilefishManifestError, match="not printable ASCII"):
+            rust._rs_str(bad)
+
+
+def test_the_names_that_clash_with_the_module_or_the_language_are_renamed(fake_manifest, tmp_path):
+    """A tensor called ``stream`` is a second parameter of that name, and a stem that gives ``Self`` or ``Error`` a struct of that name."""
+
+    def clash(entry, directory):
+        entry["stem"] = "kernel"
+        param(entry, "x").update(name="stream")
+        param(entry, "y").update(name="type")
+
+    manifest = edited(fake_manifest, tmp_path, clash)
+    source = rust.render(manifest, pin=manifest.digest)
+    assert "pub struct KernelOp " in source and "pub struct Kernel " not in source  # `Kernel` is imported from the crate
+    assert "stream_: TensorRef<'_, Bf16>" in source and "type_: TensorMut<'_, Bf16>" in source
+    for stem, struct in [("self", "SelfOp"), ("error", "ErrorOp"), ("manifest", "ManifestOp"), ("kernel", "KernelOp"), ("bf16", "Bf16Op"), ("tensor_ref", "TensorRefOp"), ("none", "NoneOp")]:
+        assert rust._camel(stem) == struct, stem
+    # and the struct names that are not imports are as they were
+    assert rust._camel("scale") == "Scale" and rust._camel("rowop.S32") == "RowopS32"
+
+
+# -- what the emitter loads, and from whom ------------------------------------------------------------------------------------------------
+
+
+def test_a_directory_is_loaded_only_with_a_pin_and_only_the_pinned_manifest_is_taken(fake_manifest, tmp_path):
+    out = tmp_path / "out.rs"
+    directory, digest = fake_manifest.directory, fake_manifest.digest
+    with pytest.raises(TilefishManifestError, match="without a trust anchor.*pin="):
+        rust.emit(directory, out)
+    with pytest.raises(TilefishManifestError, match=r"has digest .* but the pin is " + "0" * 64):
+        rust.emit(directory, out, pin="0" * 64)
+    with pytest.raises(TilefishManifestError, match="64 lowercase hex digits"):
+        rust.emit(directory, out, pin="abc")
+    assert not out.exists()
+    rust.emit(directory, out, pin=digest, ops=[scale, rowop])
+    assert out.read_text() == rust.render(fake_manifest, ops=[scale, rowop])  # a directory with its pin is the pinned manifest
+    # a Manifest that was loaded without a pin is not trusted, and one that was is
+    loose = Manifest.load(directory)
+    assert not loose.pinned and fake_manifest.pinned and Manifest.load(directory, pin=digest).pinned
+    with pytest.raises(TilefishManifestError, match="is not pinned"):
+        rust.render(loose)
+    with pytest.raises(TilefishManifestError, match="is not pinned"):
+        rust.emit(loose, out)
+    assert rust.render(loose, pin=digest) == rust.render(fake_manifest)  # a pin given here pins it
+    assert loose.pinned  # and it is pinned from then on
+    with pytest.raises(TilefishManifestError, match="but the pin is"):
+        rust.render(Manifest.load(directory), pin="1" * 64)
+    with pytest.raises(TilefishManifestError, match="takes a manifest directory"):
+        rust.render(object())
+
+
+def test_a_manifest_that_was_changed_after_it_was_pinned_is_not_the_one_that_was_pinned(fake_manifest, tmp_path):
+    other = tmp_path / "changed"
+    shutil.copytree(fake_manifest.directory, other)
+    doc = json.loads((other / "manifest.json").read_text())
+    doc["kernels"][0]["grid"] = "(n,)"
+    (other / "manifest.json").write_text(json.dumps(doc, indent=2) + "\n")
+    with pytest.raises(TilefishManifestError, match="but the pin is " + fake_manifest.digest):
+        rust.emit(other, tmp_path / "out.rs", pin=fake_manifest.digest)
+    with pytest.raises(TilefishManifestError, match="but the pin is"):
+        Manifest.load(other, pin=fake_manifest.digest)
+    assert not (tmp_path / "out.rs").exists()
+
+
+def test_a_pin_is_checked_before_a_cubin_is_read(fake_manifest, tmp_path):
+    other = tmp_path / "no-cubins"
+    shutil.copytree(fake_manifest.directory, other)
+    for cubin in other.glob("*.cubin"):
+        cubin.unlink()
+    with pytest.raises(TilefishManifestError, match="but the pin is"):  # not "cannot read the cubin"
+        Manifest.load(other, pin="2" * 64)
+    with pytest.raises(TilefishManifestError, match="cannot read the cubin"):
+        Manifest.load(other, pin=fake_manifest.digest)
