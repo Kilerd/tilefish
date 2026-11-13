@@ -1,8 +1,9 @@
-"""tilefish's own build cache (``tilefish._cache``): a hit after a rebuild, a miss after any edit, a corrupt entry never used.
+"""tilefish's own build cache (``tilefish._cache``) and the identity of a binary (``tilefish._ir``): the IR Triton compiles.
 
-No Triton and no GPU: ``fake_compile`` stands in for the compiler (it "compiles" what the process holds and counts the
-calls), and the sources are real files in a temporary package, edited and reloaded for real. ``test_gpu_cache.py`` runs the
-same through Triton on a GPU.
+No Triton and no GPU: ``fake_compile`` stands in for the frontend and the compiler (its IR is what the kernel function, run on
+symbolic arguments, builds, so everything the process holds that the function reads is in it, and comments, blank lines, file paths
+and local names are not), and the sources are real files in a temporary package, edited and reloaded for real. ``test_gpu_identity.py``
+runs the same routes through Triton on a GPU.
 """
 
 import base64
@@ -27,8 +28,8 @@ from built_fakes import fake_build, scale
 from elf_builder import cubin_like
 
 import tilefish
-from tilefish import TilefishBuildError, TilefishCacheWarning, TilefishManifestError, _cache, _source, runtime
-from tilefish.aot import build, compile_specs
+from tilefish import TilefishBuildError, TilefishCacheWarning, TilefishManifestError, _cache, _ir, _source, runtime
+from tilefish.aot import build, compile_specs, write_manifest
 from tilefish.dims import cdiv
 
 # -- a hand-written kernel in a package of four modules (the helper reads a constant of the helper below it) ----------------------
@@ -43,7 +44,7 @@ FILES = {
         "\n"
         "@jit\n"
         "def kernel(x_ptr, y_ptr, n_elem, BLOCK):\n"
-        "    return (ic_helper_a.apply(BLOCK) * ic_cfg.SCALE, n_elem)\n"
+        "    return (ic_helper_a.apply(n_elem) * ic_cfg.SCALE, BLOCK)\n"
     ),
     "ic_cfg": "SCALE = 2.0\n",
     "ic_helper_a": "import ic_helper_b\nfrom fake_jit import jit\n\n\n@jit\ndef apply(x):\n    return x + ic_helper_b.OFFSET\n",
@@ -53,18 +54,23 @@ FILES = {
 n = tilefish.Dim("n", divisible_by=16)
 
 
-@tilefish.extern(triton="ic_kernel:kernel", num_warps=4, grid=lambda n: (cdiv(n, 256),))
-def op(x_ptr: tilefish.Tensor[n, tilefish.bf16], y_ptr: tilefish.Out[tilefish.Tensor[n, tilefish.bf16]], n_elem: n, *, BLOCK: tilefish.const = 256): ...
+def extern_of(triton):
+    @tilefish.extern(triton=triton, num_warps=4, grid=lambda n: (cdiv(n, 256),))
+    def op(x_ptr: tilefish.Tensor[n, tilefish.bf16], y_ptr: tilefish.Out[tilefish.Tensor[n, tilefish.bf16]], n_elem: n, *, BLOCK: tilefish.const = 256): ...
+
+    return op, compile_specs(op)[0]
 
 
-(SPEC,) = compile_specs(op)
+op, SPEC = extern_of("ic_kernel:kernel")
+SM90 = 90
 
 
 class Project:
-    def __init__(self, directory):
+    def __init__(self, directory, files=None, modules=None):
         self.directory = directory
+        self.modules = MODULES if modules is None else modules
         directory.mkdir(parents=True, exist_ok=True)
-        for name, text in FILES.items():
+        for name, text in (FILES if files is None else files).items():
             self.write(name, text)
 
     def path(self, name):
@@ -78,13 +84,13 @@ class Project:
         assert old in text, (name, old)
         self.write(name, text.replace(old, new, 1))
 
-    def load(self):
+    def load(self, entry="ic_kernel", attr="kernel"):
         """Import the modules from their files as they are now (what a new process does), and return the kernel."""
-        for name in MODULES:
+        for name in (*self.modules, entry):
             sys.modules.pop(name, None)
         importlib.invalidate_caches()
         linecache.clearcache()
-        return importlib.import_module("ic_kernel").kernel
+        return getattr(importlib.import_module(entry), attr)
 
 
 @pytest.fixture
@@ -111,19 +117,25 @@ def quiet():
     return context
 
 
+def ir_of(kernel, spec=None, arch=SM90, options=None):
+    """The IR digest of ``kernel`` as the process holds it (what ``build`` identifies the binary by)."""
+    return runtime._ir_digest_of(spec or SPEC, kernel, arch, dict(options or {}))
+
+
 # -- a hit after a rebuild -------------------------------------------------------------------------------------------------
 
 
-def test_the_second_build_of_unchanged_sources_is_read_from_the_cache_and_compiles_nothing(world):
+def test_the_second_build_of_the_same_kernel_is_read_from_the_cache_and_compiles_nothing(world):
     project, compiler = world
     kernel = project.load()
     first = build(SPEC, arch="sm_90", fn=kernel)
     assert compiler.count == 1 and len(entries()) == 1
+    assert compiler.frontends == 2  # one for the digest, one inside the compile, which checks that it is the same IR
     second = build(SPEC, arch="sm_90", fn=kernel)
-    assert compiler.count == 1  # nothing was compiled: the binary is the cached one
-    for field in ("cubin", "ptx", "symbol", "shared", "num_warps", "sha256", "sha256_code", "triton_version", "ptxas_version", "ptx_target", "options", "launch", "source_digest", "arch"):
+    assert compiler.count == 1 and compiler.frontends == 3  # nothing was compiled: the binary is the cached one; the lookup is one frontend run
+    for field in ("cubin", "ptx", "symbol", "shared", "num_warps", "sha256", "sha256_code", "triton_version", "ptxas_version", "ptx_target", "options", "launch", "ir_digest", "arch"):
         assert getattr(second, field) == getattr(first, field), field
-    assert second.spec is SPEC and second.source_digest == _source.source_digest(kernel) and len(second.source_digest) == 64
+    assert second.spec is SPEC and second.ir_digest == ir_of(kernel) and len(second.ir_digest) == 64
 
 
 def test_a_new_process_hits_too_and_so_does_the_same_project_somewhere_else(world, tmp_path, monkeypatch):
@@ -135,7 +147,7 @@ def test_a_new_process_hits_too_and_so_does_the_same_project_somewhere_else(worl
     assert compiler.count == 1 and again.sha256 == first.sha256
     elsewhere = tmp_path / "elsewhere"
     shutil.copytree(project.directory, elsewhere)
-    monkeypatch.syspath_prepend(str(elsewhere))  # the digest is of the files, not of where they are
+    monkeypatch.syspath_prepend(str(elsewhere))  # the identity is of the IR, not of where the files are
     moved = build(SPEC, arch="sm_90", fn=project.load())
     assert sys.modules["ic_kernel"].__file__ == str(elsewhere / "ic_kernel.py")
     assert compiler.count == 1 and moved.sha256 == first.sha256
@@ -150,7 +162,7 @@ def test_a_hit_returns_what_the_build_that_made_it_returned_and_launches_the_sam
     assert hit.launch.replay_blockers() == [] and hit.shared == compiler.shared
 
 
-# -- a miss after any edit, including one two levels away ------------------------------------------------------------------------
+# -- what changes the identity: the IR, and nothing else --------------------------------------------------------------------------------
 
 
 EDITS = [
@@ -162,72 +174,237 @@ EDITS = [
 
 
 @pytest.mark.parametrize("name, old, new", EDITS, ids=[e[0] for e in EDITS])
-def test_a_source_edit_is_a_miss_and_the_edit_undone_is_a_hit_again(world, name, old, new):
+def test_an_edit_that_changes_the_ir_is_a_miss_and_the_edit_undone_is_a_hit_again(world, name, old, new):
     project, compiler = world
     before = build(SPEC, arch="sm_90", fn=project.load())
     project.edit(name, old, new)
     after = build(SPEC, arch="sm_90", fn=project.load())  # reloaded: the process holds the new file
     assert compiler.count == 2 and len(entries()) == 2
-    assert after.sha256_code != before.sha256_code and after.source_digest != before.source_digest
+    assert after.sha256_code != before.sha256_code and after.ir_digest != before.ir_digest
     project.edit(name, new, old)
     undone = build(SPEC, arch="sm_90", fn=project.load())
     assert compiler.count == 2 and undone.sha256 == before.sha256  # served from the first entry
     assert len(entries()) == 2
 
 
-def test_a_comment_is_an_edit_too_it_changes_the_source_digest_and_so_the_key(world):
+FORMATTING = [
+    ("a comment", "ic_helper_b", "OFFSET = 0.0", "OFFSET = 0.0  # nothing changes"),
+    ("blank lines and a comment above the kernel", "ic_kernel", "@jit\ndef kernel", "# a comment\n\n\n\n@jit\ndef kernel"),
+    ("the lines of the kernel moved down", "ic_kernel", "import ic_cfg\n", "# one\n# two\n# three\nimport ic_cfg\n"),
+    ("a local variable renamed", "ic_helper_a", "def apply(x):\n    return x + ic_helper_b.OFFSET", "def apply(x):\n    y = x\n    return y + ic_helper_b.OFFSET"),
+]
+
+
+@pytest.mark.parametrize("label, name, old, new", FORMATTING, ids=[f[0] for f in FORMATTING])
+def test_an_edit_that_does_not_change_the_ir_is_the_same_binary_and_a_hit(world, label, name, old, new):
+    """A comment, blank lines, line offsets and the names of locals are not in the IR, so none of them is an edit of the kernel."""
     project, compiler = world
-    build(SPEC, arch="sm_90", fn=project.load())
-    project.edit("ic_helper_b", "OFFSET = 0.0", "OFFSET = 0.0  # nothing changes")
-    build(SPEC, arch="sm_90", fn=project.load())
-    assert compiler.count == 2
+    before = build(SPEC, arch="sm_90", fn=project.load())
+    project.edit(name, old, new)
+    after = build(SPEC, arch="sm_90", fn=project.load())
+    assert after.ir_digest == before.ir_digest and compiler.count == 1 and after.sha256 == before.sha256
 
 
-# -- an edit that was not reloaded never meets the cache ---------------------------------------------------------------------------
-
-
-def test_a_module_edited_and_not_reloaded_is_refused_before_the_cache_is_read_or_written(world, monkeypatch):
-    project, compiler = world
-    kernel = project.load()
-    stale = build(SPEC, arch="sm_90", fn=kernel)
-    listed = [p.read_bytes() for p in entries()]
-    touched = []
-    with monkeypatch.context() as spy:
-        spy.setattr(_cache.BuildCache, "load", lambda self, *a, **k: touched.append("load"))
-        spy.setattr(_cache.BuildCache, "store", lambda self, *a, **k: touched.append("store"))
-        spy.setattr(_cache, "cache_key", lambda *a, **k: touched.append("key"))
-        project.edit("ic_helper_b", "OFFSET = 0.0", "OFFSET = 1.0")  # two levels away, edited, not reloaded
-        with pytest.raises(tilefish.TilefishBuildError, match=r"module 'ic_helper_b' changed on disk since it was imported .*reload it or restart"):
-            build(SPEC, arch="sm_90", fn=kernel)
-    assert touched == [] and compiler.count == 1  # no key was computed, nothing was read, written or compiled
-    assert [p.read_bytes() for p in entries()] == listed
-    fresh = build(SPEC, arch="sm_90", fn=project.load())  # reloaded: the key is of the file the process holds, a miss
-    assert compiler.count == 2 and fresh.sha256_code != stale.sha256_code and len(entries()) == 2
-
-
-def test_a_constant_assigned_at_run_time_is_refused_not_cached(world):
-    project, compiler = world
-    kernel = project.load()
-    sys.modules["ic_cfg"].SCALE = 5.0
-    with pytest.raises(_source.StaleSourceError, match=r"'ic_cfg.SCALE'.*was assigned after 'ic_cfg' was imported"):
-        build(SPEC, arch="sm_90", fn=kernel)
-    assert compiler.count == 0 and entries() == []  # an entry made now would be served to a clean process under the digest of the file
-
-
-def test_a_replay_recomputes_a_source_digest_only_for_a_process_that_holds_the_files(world):
-    """``replay`` compares the manifest's digest with the files, so it asks for the same check as a build."""
+def test_the_ir_digest_is_the_same_from_another_directory_with_other_line_numbers(world, tmp_path, monkeypatch):
     project, _ = world
-    project.load()
-    digest = runtime._current_source_digest(SPEC)
-    assert digest is not None and len(digest) == 64
-    project.edit("ic_helper_b", "OFFSET = 0.0", "OFFSET = 1.0")  # edited, not reloaded
-    with pytest.raises(tilefish.TilefishRuntimeError, match=r"module 'ic_helper_b' changed on disk since it was imported .*reload it or restart"):
-        runtime._current_source_digest(SPEC)
-    project.load()
-    assert runtime._current_source_digest(SPEC) not in (None, digest)
+    digest = ir_of(project.load())
+    elsewhere = Project(tmp_path / "a" / "much" / "deeper" / "directory")
+    elsewhere.edit("ic_kernel", "import ic_cfg\n", "# padding\n" * 7 + "import ic_cfg\n")
+    monkeypatch.syspath_prepend(str(elsewhere.directory))
+    kernel = elsewhere.load()
+    assert sys.modules["ic_kernel"].__file__.startswith(str(elsewhere.directory)) and kernel.starting_line_number != 6
+    assert ir_of(kernel) == digest
 
 
-# -- the key --------------------------------------------------------------------------------------------------------------------------
+# -- an edit that was not reloaded: the process holds what it holds, and what it holds is what is compiled and stamped -------------------
+
+
+def test_a_module_edited_and_not_reloaded_is_built_as_the_process_holds_it_and_a_fresh_process_refuses_that_manifest(world, tmp_path):
+    """Process A imports, the file is edited, A exports: it compiles (and stamps) the old values it holds. A fresh process B, which
+    imports the edited file, computes another IR digest and refuses A's manifest."""
+    project, compiler = world
+    a = project.load()
+    held = ir_of(a)
+    project.edit("ic_helper_b", "OFFSET = 0.0", "OFFSET = 1.0")  # two levels away, edited, not reloaded
+    exported = runtime.export(op, tmp_path / "m", arch=90)  # process A
+    (entry,) = exported.doc["kernels"]
+    assert entry["source_digest"] == held and entry["source_digest_kind"] == _ir.IR_DIGEST_KIND  # what A held, not what the file says
+    a_again = ir_of(a)
+    assert a_again == held  # A still holds it
+    b = project.load()  # process B: a fresh import of the edited file
+    in_b = ir_of(b)
+    assert in_b != held
+    with pytest.raises(TilefishManifestError, match=rf"built from Triton IR with digest {held}.*now compiles to IR with digest {in_b}.*stale"):
+        exported.built_kernel(SPEC, "sm_90", ir_digest=in_b, ir_triton="3.5.1")
+    with pytest.raises(TilefishManifestError, match="stale"):  # a pin vouches for the manifest, not for an IR that is known to differ
+        exported.built_kernel(SPEC, "sm_90", ir_digest=in_b, ir_triton="3.5.1", pinned=True)
+    assert exported.built_kernel(SPEC, "sm_90", ir_digest=held, ir_triton="3.5.1").sha256_code == entry["sha256_code"]  # A itself: fine
+    count = compiler.count
+    again = runtime.export(op, tmp_path / "m2", arch=90)  # exporting from B stamps B's binary
+    assert compiler.count == count + 1 and again.doc["kernels"][0]["source_digest"] == in_b
+    assert again.built_kernel(SPEC, "sm_90", ir_digest=in_b, ir_triton="3.5.1").sha256_code != entry["sha256_code"]
+
+
+def test_a_constant_assigned_to_a_module_at_run_time_is_in_the_ir_and_so_in_the_identity(world):
+    """No rule is needed for module state a program assigned: the frontend reads it, so it is part of the digest and of the key."""
+    project, compiler = world
+    kernel = project.load()
+    first = build(SPEC, arch="sm_90", fn=kernel)
+    sys.modules["ic_cfg"].SCALE = 5.0
+    second = build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 2 and second.ir_digest != first.ir_digest and second.sha256_code != first.sha256_code
+    sys.modules["ic_cfg"].SCALE = 2.0
+    third = build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 2 and third.sha256 == first.sha256
+
+
+# -- every route a kernel can read a constant by ---------------------------------------------------------------------------------------
+
+
+def route_files(route):
+    """A kernel package whose constant comes by ``route`` and takes the value of ``R_VALUE`` from the environment where it can."""
+    kernel_head = "from fake_jit import jit\n\n\n"
+    cfg = "import os\n\nSCALE = float(os.environ['R_VALUE'])\n"
+    body = {
+        "an attribute": ("import r_cfg\n", "r_cfg.SCALE", cfg),
+        "getattr with a literal name": ("import r_cfg\n", 'getattr(r_cfg, "SCALE")', cfg),
+        "getattr with a name made at run time": ("import r_cfg\n", 'getattr(r_cfg, "SC" + "ALE")', cfg),
+        "a class attribute": ("import r_cfg\n", "r_cfg.Inner.SCALE", "import os\n\n\nclass Inner:\n    SCALE = float(os.environ['R_VALUE'])\n"),
+        "an object whose repr hides its state": (
+            "import r_cfg\n",
+            "r_cfg.HIDDEN.value",
+            "import os\n\n\nclass Hidden:\n    def __init__(self, value):\n        self.value = value\n\n    def __repr__(self):\n        return 'Hidden()'\n\n\nHIDDEN = Hidden(float(os.environ['R_VALUE']))\n",
+        ),
+        "a function that reads the environment when it is compiled": (
+            "import r_cfg\n",
+            "r_cfg.scale()",
+            "import os\n\n\ndef scale():\n    return float(os.environ['R_VALUE'])\n",
+        ),
+        "a user module named like a standard library module": ("import profile\n", "profile.SCALE", "import os\n\nSCALE = float(os.environ['R_VALUE'])\n"),
+        "a helper two levels away": ("import r_cfg\n", "r_cfg.helper(BLOCK)", "import os\n\n\ndef helper(x):\n    return x * float(os.environ['R_VALUE'])\n"),
+    }
+    imports, expr, cfg_text = body[route]
+    files = {"r_kernel": f"{imports}{kernel_head}@jit\ndef kernel(x_ptr, y_ptr, n_elem, BLOCK):\n    return (BLOCK * {expr}, n_elem)\n"}
+    if route == "a user module named like a standard library module":
+        files["profile"] = cfg_text
+        return files, ("r_kernel", "profile")
+    files["r_cfg"] = cfg_text
+    return files, ("r_kernel", "r_cfg")
+
+
+ROUTES = [
+    "an attribute",
+    "getattr with a literal name",
+    "getattr with a name made at run time",
+    "a class attribute",
+    "an object whose repr hides its state",
+    "a function that reads the environment when it is compiled",
+    "a user module named like a standard library module",
+    "a helper two levels away",
+]
+
+
+@pytest.fixture
+def routed(world, monkeypatch, tmp_path):
+    project, compiler = world
+    other = Project(tmp_path / "routes", files={}, modules=())
+    monkeypatch.syspath_prepend(str(other.directory))
+    created = []
+
+    def prepare(route):
+        files, modules = route_files(route)
+        for name, text in files.items():
+            other.write(name, text)
+        other.modules = modules
+        created.extend(modules)
+        stdlib = {name: sys.modules.pop(name, None) for name in modules}  # a user module that is named like a standard library one
+        created.append(("restore", stdlib))
+        return other
+
+    yield prepare, compiler
+    for item in created:
+        if isinstance(item, tuple):
+            for name, module in item[1].items():
+                sys.modules.pop(name, None)
+                if module is not None:
+                    sys.modules[name] = module
+        else:
+            sys.modules.pop(item, None)
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_whichever_route_a_kernel_reads_a_constant_by_another_value_is_another_binary_and_never_a_stale_hit(routed, monkeypatch, route):
+    """The reviewer's routes, through the cache with two 'processes' (fresh imports) that share one directory and hold other values."""
+    prepare, compiler = routed
+    project = prepare(route)
+    _, spec = extern_of("r_kernel:kernel")
+    monkeypatch.setenv("R_VALUE", "2.0")
+    first = build(spec, arch="sm_90", fn=project.load("r_kernel"))
+    assert compiler.count == 1
+    monkeypatch.setenv("R_VALUE", "3.0")
+    runtime.clear_caches()
+    other = build(spec, arch="sm_90", fn=project.load("r_kernel"))  # the same files, another value in the process
+    assert compiler.count == 2 and len(entries()) == 2, route  # a miss, not the first one's binary
+    assert other.ir_digest != first.ir_digest and other.sha256_code != first.sha256_code
+    monkeypatch.setenv("R_VALUE", "2.0")
+    runtime.clear_caches()
+    again = build(spec, arch="sm_90", fn=project.load("r_kernel"))
+    assert compiler.count == 2 and again.sha256 == first.sha256  # each value has its own entry
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_whichever_route_export_stamps_the_value_the_process_holds_and_a_process_with_another_refuses_it(routed, monkeypatch, tmp_path, route):
+    """Export in one process, replay-check in another with a pin: the pin is no excuse for another IR."""
+    prepare, compiler = routed
+    project = prepare(route)
+    op_, spec = extern_of("r_kernel:kernel")
+    monkeypatch.setenv("R_VALUE", "2.0")
+    held = project.load("r_kernel")
+    manifest = runtime.export(op_, tmp_path / "m", arch=90)
+    digest_two = ir_of(held, spec)
+    (entry,) = manifest.doc["kernels"]
+    assert entry["source_digest"] == digest_two
+    assert manifest.built_kernel(spec, "sm_90", ir_digest=digest_two, ir_triton="3.5.1").sha256_code == entry["sha256_code"]
+    monkeypatch.setenv("R_VALUE", "3.0")
+    digest_three = ir_of(project.load("r_kernel"), spec)
+    assert digest_three != digest_two
+    for pinned in (False, True):
+        with pytest.raises(TilefishManifestError, match="stale"):
+            manifest.built_kernel(spec, "sm_90", ir_digest=digest_three, ir_triton="3.5.1", pinned=pinned)
+
+
+def test_a_name_that_is_a_user_module_of_the_standard_library_s_name_is_not_left_out(routed, monkeypatch):
+    """The old digest left out any module whose top-level package had a standard library name: a user ``profile.py`` was not read."""
+    prepare, compiler = routed
+    project = prepare("a user module named like a standard library module")
+    monkeypatch.setenv("R_VALUE", "2.0")
+    _, spec = extern_of("r_kernel:kernel")
+    kernel = project.load("r_kernel")
+    assert sys.modules["profile"].__file__ == str(project.path("profile"))  # the user's file, not the standard library's
+    before = ir_of(kernel, spec)
+    project.edit("profile", "SCALE = float(os.environ['R_VALUE'])", "SCALE = float(os.environ['R_VALUE']) + 1")
+    assert ir_of(project.load("r_kernel"), spec) != before
+
+
+def test_a_kernel_made_by_a_factory_reads_its_constants_from_closure_cells_and_they_are_in_the_ir(world, monkeypatch):
+    project, compiler = world
+    project.write(
+        "clo_kernel",
+        "import os\n\nfrom fake_jit import jit\n\n\ndef make():\n    S = float(os.environ['CLO_S'])\n\n    @jit\n"
+        "    def k(x_ptr, y_ptr, n_elem, BLOCK):\n        return (BLOCK * S, n_elem)\n\n    return k\n\n\nk = make()\n",
+    )
+    _, spec = extern_of("clo_kernel:k")
+    try:
+        monkeypatch.setenv("CLO_S", "2.0")
+        first = build(spec, arch="sm_90", fn=project.load("clo_kernel", "k"))
+        monkeypatch.setenv("CLO_S", "3.0")
+        other = build(spec, arch="sm_90", fn=project.load("clo_kernel", "k"))
+        assert compiler.count == 2 and other.ir_digest != first.ir_digest
+    finally:
+        sys.modules.pop("clo_kernel", None)
+
+
+# -- the key ---------------------------------------------------------------------------------------------------------------------------
 
 
 def test_the_arch_the_options_and_the_toolchain_are_part_of_the_key(world, monkeypatch):
@@ -252,49 +429,99 @@ def test_the_arch_the_options_and_the_toolchain_are_part_of_the_key(world, monke
     assert compiler.count == len(steps) + 1  # the first three are hits; the fourth entry was made for 3.6.0 and the 3.5.1 ones remain
 
 
-def test_the_environment_variables_triton_invalidates_its_cache_with_are_part_of_the_key(world, monkeypatch):
+def test_an_environment_variable_of_the_codegen_families_is_part_of_the_key_and_one_that_is_not_codegen_is_not(world, monkeypatch):
     project, compiler = world
     kernel = project.load()
     build(SPEC, arch="sm_90", fn=kernel)
-    monkeypatch.setattr(_cache, "triton_environment", lambda: {"TRITON_DEFAULT_FP_FUSION": "0"})
+    monkeypatch.setenv("TRITON_CACHE_DIR", "/somewhere/else")  # where Triton keeps its cache: not code
+    monkeypatch.setenv("TRITON_PTXAS_PATH", "/other/ptxas")  # a tool whose version is in the key
+    build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 1
+    for name in ("TRITON_DEFAULT_FP_FUSION", "TRITON_LIBDEVICE_PATH", "TRITON_MOCK_PTX_VERSION", "TRITON_KERNEL_OVERRIDE", "DISABLE_PTXAS_OPT", "MLIR_ENABLE_DUMP", "USE_IR_LOC", "LLVM_PASS_PLUGIN_PATH", "TRITON_A_KNOB_OF_A_LATER_TRITON"):
+        before = compiler.count
+        monkeypatch.setenv(name, "1")
+        build(SPEC, arch="sm_90", fn=kernel)
+        assert compiler.count == before + 1, name  # another binary may come of it: another key
+        monkeypatch.delenv(name)
+    build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 1 + 9  # and with none of them set it is the first entry again
+
+
+def test_a_knob_that_a_program_set_without_the_environment_is_part_of_the_key(world, monkeypatch):
+    project, compiler = world
+    kernel = project.load()
+    build(SPEC, arch="sm_90", fn=kernel)
+    knobs = sys.modules["triton"].knobs
+    monkeypatch.setattr(knobs.language, "default_fp_fusion", False)
+    build(SPEC, arch="sm_90", fn=kernel)
+    monkeypatch.setattr(knobs.nvidia, "mock_ptx_version", "99")
+    build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 3
+
+
+def test_the_libdevice_file_is_part_of_the_key_by_its_content(world, monkeypatch, tmp_path):
+    project, compiler = world
+    kernel = project.load()
+    libdevice = tmp_path / "libdevice.10.bc"
+    libdevice.write_bytes(b"one")
+    monkeypatch.setattr(sys.modules["triton"].knobs.nvidia, "libdevice_path", str(libdevice))
+    build(SPEC, arch="sm_90", fn=kernel)
+    build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 1
+    libdevice.write_bytes(b"two")  # the same path, another file
     build(SPEC, arch="sm_90", fn=kernel)
     assert compiler.count == 2
+    libdevice.unlink()
+    build(SPEC, arch="sm_90", fn=kernel)  # an unreadable one is a key of its own, not a crash
+    assert compiler.count == 3
 
 
-def test_a_value_a_module_computes_when_it_is_imported_is_part_of_the_key(world, monkeypatch):
-    """The files are the same, the process holds another constant: the binary differs, so the digest, and with it the key, must."""
+def test_triton_s_kernel_override_is_refused_because_the_binary_would_not_be_of_the_ir(world, monkeypatch):
     project, compiler = world
-    project.write("ic_cfg", 'import os\n\nSCALE = float(os.environ.get("IC_SCALE", "2.0"))\n')
-    monkeypatch.setenv("IC_SCALE", "2.0")
-    first = build(SPEC, arch="sm_90", fn=project.load())
-    monkeypatch.setenv("IC_SCALE", "3.0")
-    other = build(SPEC, arch="sm_90", fn=project.load())  # the same files, another value in the process
-    assert compiler.count == 2 and other.source_digest != first.source_digest and other.sha256_code != first.sha256_code
-    monkeypatch.setenv("IC_SCALE", "2.0")
-    again = build(SPEC, arch="sm_90", fn=project.load())
-    assert compiler.count == 2 and again.sha256 == first.sha256  # and each is a hit for its own value
+    kernel = project.load()
+    monkeypatch.setattr(sys.modules["triton"].knobs.compilation, "override", True)
+    with pytest.raises(TilefishBuildError, match=r"kernel override is on \(TRITON_KERNEL_OVERRIDE\).*not be compiled from the IR"):
+        build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 0 and entries() == []
 
 
-def test_the_values_a_kernel_reads_are_the_scalars_and_constants_of_its_modules(world):
-    project, _ = world
-    project.write("ic_cfg", "SCALE = 2.0\nOTHER = 5\nTABLE = [1]\n")
-    found = _source.reachable(project.load())
-    assert _source.values_read(found) == {"ic_cfg.SCALE": "2.0", "ic_helper_b.OFFSET": "0.0"}  # read by a jit function, scalar; not OTHER, not a list
-    assert _source.values_read(None) == {}
+def test_a_binary_is_only_recorded_under_the_digest_of_the_ir_it_was_compiled_from(world):
+    """If the frontend gave another module the second time (it is not deterministic), the compile is not of the IR the build is identified by."""
+    project, compiler = world
+    kernel = project.load()
+    compiler.second_ir = "module { another }"
+    with pytest.raises(TilefishBuildError, match=r"the IR Triton compiled is not the IR whose digest [0-9a-f]{64} the build was identified by"):
+        build(SPEC, arch="sm_90", fn=kernel)
+    assert entries() == []  # nothing was cached
 
 
-def test_another_declaration_or_spec_is_another_key(world):
+def test_the_ir_digest_a_caller_expects_is_checked(world):
+    project, compiler = world
+    kernel = project.load()
+    digest = ir_of(kernel)
+    assert build(SPEC, arch="sm_90", fn=kernel, ir_digest=digest).ir_digest == digest
+    with pytest.raises(TilefishBuildError, match=rf"has digest {digest}, but {'0' * 64} was expected"):
+        build(SPEC, arch="sm_90", fn=kernel, ir_digest="0" * 64)
+
+
+def test_a_frontend_that_cannot_build_the_kernel_is_a_build_error_with_nothing_cached(world):
+    project, compiler = world
+    kernel = project.load()
+    compiler.fail_frontend = ValueError("an unsupported construct")
+    with pytest.raises(TilefishBuildError, match=r"Triton could not compile 'op' \(ic_kernel:kernel\) for sm_90: ValueError: an unsupported construct"):
+        build(SPEC, arch="sm_90", fn=kernel)
+    assert compiler.count == 0 and entries() == []
+
+
+def test_another_declaration_of_the_same_kernel_with_the_same_ir_shares_the_binary(world):
+    """The spec is not in the key: the IR, the options and the toolchain are what make a binary. (The entry is checked against the spec on read.)"""
     project, compiler = world
     kernel = project.load()
     build(SPEC, arch="sm_90", fn=kernel)
-
-    @tilefish.extern(triton="ic_kernel:kernel", num_warps=2, grid=lambda n: (cdiv(n, 256),))
-    def op(x_ptr: tilefish.Tensor[n, tilefish.bf16], y_ptr: tilefish.Out[tilefish.Tensor[n, tilefish.bf16]], n_elem: n, *, BLOCK: tilefish.const = 256): ...
-
-    (other,) = compile_specs(op)
-    assert other.declaration_digest != SPEC.declaration_digest
+    other_op, other = extern_of("ic_kernel:kernel")
+    assert other.stem == SPEC.stem  # the same declaration shape: the same binary
     build(other, arch="sm_90", fn=kernel)
-    assert compiler.count == 2
+    assert compiler.count == 1
 
 
 def test_the_cache_can_be_switched_off_per_build_and_by_the_environment(world, monkeypatch):
@@ -321,7 +548,7 @@ def test_where_the_cache_is(monkeypatch, tmp_path):
     assert _cache.cache_directory() == tmp_path / "home" / "elsewhere"
 
 
-# -- a generated kernel's key is its spec's source --------------------------------------------------------------------------------------
+# -- a generated kernel: its spec carries the sha256 of its source, and its IR is recorded as well ----------------------------------------
 
 
 def scale_kernel(factor):
@@ -335,36 +562,19 @@ def scale_kernel(factor):
     return scale_k
 
 
-def test_a_generated_kernel_hits_and_another_body_is_a_miss(world):
+def test_a_generated_kernel_hits_and_another_body_is_a_miss_and_its_ir_is_recorded_too(world):
     _, compiler = world
     old, new = scale_kernel(2.0).lower(), scale_kernel(3.0).lower()
     (spec_old,), (spec_new,) = old.specs(), new.specs()
     assert spec_old.source_sha256 != spec_new.source_sha256
-    compiler.evaluate = False  # the source text is what is compiled
     a = build(spec_old, arch="sm_90", fn=runtime.load_lowered(old))
-    assert a.source_digest is None and compiler.count == 1
+    assert len(a.ir_digest) == 64 and compiler.count == 1  # (a lowered kernel has its source_sha256 in the spec, and its IR digest as well)
     again = build(spec_old, arch="sm_90", fn=runtime.load_lowered(old))
-    assert compiler.count == 1 and again.sha256 == a.sha256 and again.source_digest is None
+    assert compiler.count == 1 and again.sha256 == a.sha256 and again.ir_digest == a.ir_digest
     b = build(spec_new, arch="sm_90", fn=runtime.load_lowered(new))
-    assert compiler.count == 2 and b.sha256_code != a.sha256_code
-
-
-def test_a_stale_generated_file_is_refused_before_the_cache(world, tmp_path, monkeypatch):
-    _, compiler = world
-    old, new = scale_kernel(2.0).lower(), scale_kernel(3.0).lower()
-    (spec_new,) = new.specs()
-    src = tmp_path / "src"
-    old.write(src)
-    monkeypatch.syspath_prepend(str(src))
-    sys.modules.pop(new.module, None)
-    importlib.invalidate_caches()
-    imported = importlib.import_module(new.module)  # the old source
-    new.write(src)  # the file now has the spec's source; the process holds the old function
-    linecache.clearcache()
-    with pytest.raises(tilefish.TilefishBuildError, match=r"module '.*' changed on disk since it was imported"):
-        build(spec_new, arch="sm_90", fn=getattr(imported, new.fn_name))
-    assert compiler.count == 0 and entries() == []
-    sys.modules.pop(new.module, None)
+    assert compiler.count == 2 and b.sha256_code != a.sha256_code and b.ir_digest != a.ir_digest
+    entry = tilefish._build._kernel_entry(a)
+    assert entry["source_sha256"] == spec_old.source_sha256 and entry["source_digest"] == a.ir_digest and entry["source_digest_kind"] == _ir.IR_DIGEST_KIND
 
 
 # -- a corrupt entry is detected, not used, and rebuilt ----------------------------------------------------------------------------------
@@ -409,6 +619,7 @@ CORRUPTIONS = [
     ("a missing field", lambda p: rewrite(p, lambda d: d.pop("shared")), "'shared'"),
     ("other options", lambda p: rewrite(p, lambda d: d["options"].update(num_warps=8)), "compile options"),
     ("the toolchain it was built with", lambda p: rewrite(p, lambda d: d.update(ptxas_version="ptxas 1.0")), "ptxas_version"),
+    ("the IR digest it was made for", lambda p: rewrite(p, lambda d: d.update(ir_digest="0" * 64)), "ir_digest"),
     ("malformed launch attributes", lambda p: rewrite(p, lambda d: d.update(launch={"num_ctas": 1})), "launch attributes"),
 ]
 
@@ -491,7 +702,7 @@ def key_args(built):
         options=built.options,
         triton_version=built.triton_version,
         ptxas_version=built.ptxas_version,
-        source_digest=built.source_digest,
+        ir_digest=built.ir_digest,
     )
 
 
@@ -508,22 +719,19 @@ def test_an_entry_reads_back_as_the_build_it_was_made_from(tmp_path):
 
 
 def test_the_key_depends_on_every_part_of_it(tmp_path):
-    (spec,) = compile_specs(scale)
-    base = dict(arch=90, source=("source_digest", "a" * 64), triton_version="3.5.1", ptxas_version="12.9", options={"num_warps": 4}, environment={}, values={})
-    key = _cache.cache_key(spec, **base)
-    assert key == _cache.cache_key(spec, **base) and len(key) == 64
+    base = dict(arch=90, ir_digest="a" * 64, triton_version="3.5.1", ptxas_version="12.9", options={"num_warps": 4}, environment={})
+    key = _cache.cache_key(**base)
+    assert key == _cache.cache_key(**base) and len(key) == 64
     for change in (
         {"arch": 100},
-        {"source": ("source_digest", "b" * 64)},
-        {"source": ("source_sha256", "a" * 64)},
+        {"ir_digest": "b" * 64},
         {"triton_version": "3.5.2"},
         {"ptxas_version": "12.10"},
         {"options": {"num_warps": 8}},
         {"options": {"num_warps": 4, "enable_fp_fusion": False}},
-        {"environment": {"TRITON_X": "1"}},
-        {"values": {"ic_cfg.SCALE": "2.0"}},
+        {"environment": {"env": {"TRITON_X": "1"}}},
     ):
-        assert _cache.cache_key(spec, **{**base, **change}) != key, change
+        assert _cache.cache_key(**{**base, **change}) != key, change
 
 
 # -- atomic writes: several writers and readers of one entry ------------------------------------------------------------------------------
@@ -572,7 +780,7 @@ valid = {v.sha256 for v in variants}
 cache = _cache.BuildCache(sys.argv[1])
 key = "ef" * 32
 me = variants[int(sys.argv[2]) % 3]
-args = dict(arch=me.arch, options=me.options, triton_version=me.triton_version, ptxas_version=me.ptxas_version, source_digest=me.source_digest)
+args = dict(arch=me.arch, options=me.options, triton_version=me.triton_version, ptxas_version=me.ptxas_version, ir_digest=me.ir_digest)
 for _ in range(100):
     assert cache.store(key, me)
     got = cache.load(key, spec, **args)
@@ -630,112 +838,6 @@ def test_export_builds_through_the_cache_and_writes_the_same_manifest_entry(worl
     assert tilefish.Manifest.load(tmp_path / "a").digest == tilefish.Manifest.load(tmp_path / "b").digest
 
 
-# -- a kernel made by a factory function reads its constants from closure cells ------------------------------------------------------
-
-
-CLO_FILE = (
-    "import os\n"
-    "\n"
-    "from fake_jit import jit\n"
-    "\n"
-    "\n"
-    "def make():\n"
-    '    S = float(os.environ["CLO_S"])\n'
-    "\n"
-    "    @jit\n"
-    "    def k(x_ptr, y_ptr, n_elem, BLOCK):\n"
-    "        return (BLOCK * S, n_elem)\n"
-    "\n"
-    "    return k\n"
-    "\n"
-    "\n"
-    "k = make()\n"
-)
-
-
-@tilefish.extern(triton="clo_kernel:k", num_warps=4, grid=lambda n: (cdiv(n, 256),))
-def clo_op(x_ptr: tilefish.Tensor[n, tilefish.bf16], y_ptr: tilefish.Out[tilefish.Tensor[n, tilefish.bf16]], n_elem: n, *, BLOCK: tilefish.const = 256): ...
-
-
-(CLO_SPEC,) = compile_specs(clo_op)
-
-
-@pytest.fixture
-def closure(world, monkeypatch):
-    """``load()`` imports ``clo_kernel`` from its file as a new process does (``CLO_S`` is what it reads), and returns its kernel."""
-    project, compiler = world
-    project.write("clo_kernel", CLO_FILE)
-    monkeypatch.setenv("CLO_S", "2.0")
-
-    def load():
-        sys.modules.pop("clo_kernel", None)
-        importlib.invalidate_caches()
-        linecache.clearcache()
-        return importlib.import_module("clo_kernel").k
-
-    yield load, compiler, project
-    sys.modules.pop("clo_kernel", None)
-
-
-def test_a_closure_variable_is_part_of_the_key_so_another_value_is_another_binary_and_not_a_stale_hit(closure, monkeypatch):
-    """The reviewer's repro: two processes share one cache directory, ``CLO_S=2.0`` and then ``CLO_S=3.0``. The files are the same."""
-    load, compiler, project = closure
-    first = build(CLO_SPEC, arch="sm_90", fn=load())
-    assert compiler.count == 1 and len(entries()) == 1
-    monkeypatch.setenv("CLO_S", "3.0")
-    runtime.clear_caches()
-    other = build(CLO_SPEC, arch="sm_90", fn=load())  # a new process: the same files, another value in the cell
-    assert compiler.count == 2 and len(entries()) == 2  # a miss; it used to be a hit on the first one's binary
-    assert other.sha256_code != first.sha256_code and other.source_digest != first.source_digest
-    assert compiler.values_held(fake_compile.ASTSource(load(), {}))[1] == (3.0, 1)  # and the binary is what the process holds
-    monkeypatch.setenv("CLO_S", "2.0")
-    runtime.clear_caches()
-    again = build(CLO_SPEC, arch="sm_90", fn=load())
-    assert compiler.count == 2 and again.sha256 == first.sha256 and again.source_digest == first.source_digest  # each value has its own entry
-
-
-def test_export_stamps_the_binary_of_the_value_the_process_holds_and_replay_refuses_another(closure, monkeypatch, tmp_path):
-    load, compiler, project = closure
-    load()
-    manifest = runtime.export(clo_op, tmp_path / "two", arch=90)
-    (entry,) = manifest.doc["kernels"]
-    assert manifest.pinned  # export has written it from its own builds: what generates source from a manifest takes it
-    assert entry["source_digest_kind"] == _source.SOURCE_DIGEST_KIND and len(entry["source_digest"]) == 64
-    # a replay in a process that holds the same value: the digest is the entry's, and the binary is accepted
-    digest_two = runtime._current_source_digest(CLO_SPEC)
-    assert digest_two == entry["source_digest"]
-    assert manifest.built_kernel(CLO_SPEC, "sm_90", source_digest=digest_two).sha256_code == entry["sha256_code"]
-    # a new process whose cell has another value would compile another binary: replay refuses, pinned or not
-    monkeypatch.setenv("CLO_S", "3.0")
-    load()
-    digest_three = runtime._current_source_digest(CLO_SPEC)
-    assert digest_three is not None and digest_three != digest_two
-    for pinned in (False, True):
-        with pytest.raises(TilefishManifestError, match=rf"now have source digest {digest_three}.*a closure variable"):
-            manifest.built_kernel(CLO_SPEC, "sm_90", source_digest=digest_three, pinned=pinned)
-    # ... and exporting there stamps the binary of 3.0, not the stale one of 2.0 that the cache holds
-    count = compiler.count
-    again = runtime.export(clo_op, tmp_path / "three", arch=90)
-    (entry_three,) = again.doc["kernels"]
-    assert compiler.count == count + 1
-    assert entry_three["sha256_code"] != entry["sha256_code"] and entry_three["source_digest"] == digest_three
-    assert again.built_kernel(CLO_SPEC, "sm_90", source_digest=digest_three).sha256_code == entry_three["sha256_code"]
-
-
-def test_a_closure_variable_that_has_no_stable_repr_refuses_the_build_and_the_export_and_the_replay(closure, tmp_path):
-    load, compiler, project = closure
-    project.write("clo_kernel", CLO_FILE.replace('S = float(os.environ["CLO_S"])', 'S = [float(os.environ["CLO_S"])]').replace("BLOCK * S", "BLOCK * S[0]"))
-    kernel = load()
-    for cache in (True, False):
-        with pytest.raises(_source.UnstableValueError, match=r"closure variable 'S' of the Triton function 'k' holds a list.*module-level constant.*const parameter"):
-            build(CLO_SPEC, arch="sm_90", fn=kernel, cache=cache)
-    with pytest.raises(_source.UnstableValueError, match="closure variable 'S'"):
-        runtime.export(clo_op, tmp_path / "m", arch=90)
-    assert compiler.count == 0 and entries() == [] and not (tmp_path / "m" / "manifest.json").exists()  # nothing was compiled, cached or written
-    with pytest.raises(tilefish.TilefishRuntimeError, match="closure variable 'S'"):
-        runtime._current_source_digest(CLO_SPEC)
-
-
 # -- build(spec, fn=...) compiles the function the spec names, and no other ----------------------------------------------------------------
 
 TWO = (
@@ -754,13 +856,6 @@ TWO = (
     "\n"
     "alias = ka\n"
 )
-
-
-def extern_of(triton):
-    @tilefish.extern(triton=triton, num_warps=4, grid=lambda n: (cdiv(n, 256),))
-    def op(x_ptr: tilefish.Tensor[n, tilefish.bf16], y_ptr: tilefish.Out[tilefish.Tensor[n, tilefish.bf16]], n_elem: n, *, BLOCK: tilefish.const = 256): ...
-
-    return compile_specs(op)[0]
 
 
 @pytest.fixture
@@ -782,23 +877,22 @@ def test_another_kernel_with_the_same_parameters_is_refused_and_does_not_poison_
     """The reviewer's repro: ``build(spec_ka, fn=kb)`` was accepted, and the cache served kb's cubin to a later ``build(spec_ka, fn=ka)``."""
     load, compiler = two
     module = load()
-    spec_ka = extern_of("m5_kernels:ka")
+    spec_ka = extern_of("m5_kernels:ka")[1]
     with pytest.raises(TilefishBuildError, match=r"the function passed as fn is 'm5_kernels:kb', but the compile spec '.*' is for 'm5_kernels:ka'.*nothing is compiled or cached"):
         build(spec_ka, arch="sm_90", fn=module.kb)
     assert compiler.count == 0 and entries() == []  # nothing was compiled, and nothing was cached under the key of ka
     right = build(spec_ka, arch="sm_90", fn=module.ka)
     assert compiler.count == 1  # a miss: there was nothing of kb's to serve
-    assert compiler.values_held(fake_compile.ASTSource(module.ka, {}))[1] == (2.0, 1)
     # kb's own spec builds kb, and the two are different binaries with different digests
-    spec_kb = extern_of("m5_kernels:kb")
+    spec_kb = extern_of("m5_kernels:kb")[1]
     other = build(spec_kb, arch="sm_90", fn=module.kb)
-    assert other.sha256_code != right.sha256_code and compiler.count == 2  # (one file: the digest of the files is the same, the declaration is not)
+    assert other.sha256_code != right.sha256_code and compiler.count == 2  # (one file; two kernels: two IRs)
 
 
 def test_the_function_the_spec_names_is_accepted_however_it_was_reached(two):
     load, compiler = two
     module = load()
-    spec = extern_of("m5_kernels:ka")
+    spec = extern_of("m5_kernels:ka")[1]
     build(spec, arch="sm_90", fn=module.ka)
     build(spec, arch="sm_90", fn=module.alias)  # the same object under another name
     build(spec, arch="sm_90")  # imported from spec.triton
@@ -816,7 +910,7 @@ def test_a_function_of_the_same_name_in_another_module_is_refused(two, world):
     try:
         other = importlib.import_module("m5_other")
         with pytest.raises(TilefishBuildError, match="'m5_other:ka', but the compile spec '.*' is for 'm5_kernels:ka'"):
-            build(extern_of("m5_kernels:ka"), arch="sm_90", fn=other.ka)
+            build(extern_of("m5_kernels:ka")[1], arch="sm_90", fn=other.ka)
         assert compiler.count == 0 and entries() == []
     finally:
         sys.modules.pop("m5_other", None)
@@ -825,7 +919,7 @@ def test_a_function_of_the_same_name_in_another_module_is_refused(two, world):
 def test_a_spec_that_names_a_module_that_cannot_be_imported_is_built_from_the_function_defined_there(two):
     load, compiler = two
     module = load()
-    spec = extern_of("not_installed_anywhere:ka")
+    spec = extern_of("not_installed_anywhere:ka")[1]
     with pytest.raises(TilefishBuildError, match="'m5_kernels:ka', but the compile spec '.*' is for 'not_installed_anywhere:ka'"):
         build(spec, arch="sm_90", fn=module.ka)
     assert compiler.count == 0
@@ -845,7 +939,6 @@ def test_a_generated_kernel_is_told_by_its_name_and_the_sha256_of_its_source(wor
     _, compiler = world
     low1, low2, other_body = named_kernel("one_k", 2.0).lower(), named_kernel("two_k", 2.0).lower(), named_kernel("one_k", 3.0).lower()
     (spec1,) = low1.specs()
-    compiler.evaluate = False
     with pytest.raises(TilefishBuildError, match=r"the function passed as fn is '.*:tf_two_k', but the compile spec 'one_k' is for '.*:tf_one_k'"):
         build(spec1, arch="sm_90", fn=runtime.load_lowered(low2))
     assert compiler.count == 0 and entries() == []
@@ -990,39 +1083,30 @@ def test_a_logger_that_fails_is_not_a_failed_build_either(world, monkeypatch):
 
 
 def key_of(**changes):
-    """``cache_key`` with every input given, and the ones in ``changes`` different. The spec is anything with a digest and a fingerprint."""
+    """``cache_key`` with every input given, and the ones in ``changes`` different."""
     inputs = dict(
-        spec=types.SimpleNamespace(declaration_digest="d" * 64, _fingerprint=lambda: {"signature": ["a"]}),
         arch=90,
-        source=("source_digest", "s" * 64),
+        ir_digest="s" * 64,
         triton_version="3.5.1",
         ptxas_version="12.9",
         options={"num_warps": 4},
-        environment={"TRITON_X": "1"},
-        values={"cfg.SCALE": "2.0"},
+        environment={"env": {"TRITON_X": "1"}, "knobs": {"language.default_fp_fusion": "True"}},
     )
     inputs.update(changes)
     return _cache.cache_key(**inputs)
 
 
-def spec_of(digest="d" * 64, fingerprint=None):
-    return types.SimpleNamespace(declaration_digest=digest, _fingerprint=lambda: fingerprint or {"signature": ["a"]})
-
-
 KEY_INPUTS = [
-    ("the declaration digest", dict(spec=spec_of(digest="e" * 64))),
-    ("the fingerprint of the spec", dict(spec=spec_of(fingerprint={"signature": ["b"]}))),
-    ("the identity of the source", dict(source=("source_digest", "t" * 64))),
-    ("the kind of the identity of the source", dict(source=("source_sha256", "s" * 64))),
+    ("the IR digest", dict(ir_digest="t" * 64)),
     ("the architecture", dict(arch=100)),
     ("the Triton version", dict(triton_version="3.6.0")),
     ("the ptxas version", dict(ptxas_version="13.0")),
     ("the compile options", dict(options={"num_warps": 8})),
     ("an option that is not set and one that is", dict(options={"num_warps": 4, "enable_fp_fusion": False})),
-    ("the environment Triton reads", dict(environment={"TRITON_X": "2"})),
-    ("an environment variable that is not there", dict(environment={})),
-    ("a value the kernel reads", dict(values={"cfg.SCALE": "3.0"})),
-    ("a value the kernel reads that is not there", dict(values={})),
+    ("an environment variable Triton reads", dict(environment={"env": {"TRITON_X": "2"}, "knobs": {"language.default_fp_fusion": "True"}})),
+    ("an environment variable that is not there", dict(environment={"env": {}, "knobs": {"language.default_fp_fusion": "True"}})),
+    ("a knob Triton reads", dict(environment={"env": {"TRITON_X": "1"}, "knobs": {"language.default_fp_fusion": "False"}})),
+    ("the libdevice file", dict(environment={"env": {"TRITON_X": "1"}, "knobs": {"language.default_fp_fusion": "True"}, "libdevice": "f" * 64})),
 ]
 
 
@@ -1033,12 +1117,11 @@ def test_every_input_of_the_key_is_part_of_it(label, changed):
     assert re.fullmatch(r"[0-9a-f]{64}", key_of(**changed))
 
 
-def test_the_declaration_digest_and_the_fingerprint_are_each_enough_to_make_another_key():
-    """Neither stands in for the other: the digest is of the declaration, the fingerprint of what feeds ``triton.compile``."""
-    base = key_of()
-    assert key_of(spec=spec_of(digest="e" * 64)) != base  # another declaration, the same fingerprint
-    assert key_of(spec=spec_of(fingerprint={"signature": ["a"], "grid": "(1,)"})) != base  # another fingerprint, the same declaration
-    assert key_of(spec=spec_of(digest="e" * 64)) != key_of(spec=spec_of(fingerprint={"signature": ["a"], "grid": "(1,)"}))
+def test_the_key_has_no_spec_in_it():
+    """The IR digest stands for the kernel; what the spec adds (grid, preconditions, the stem) does not make another binary."""
+    import inspect
+
+    assert "spec" not in inspect.signature(_cache.cache_key).parameters
 
 
 def test_the_key_names_its_inputs_so_that_two_of_them_cannot_be_swapped():
@@ -1072,14 +1155,16 @@ def test_an_entry_of_another_recipe_or_version_is_not_found_and_is_not_a_warning
     finally:
         context.__exit__(None, None, None)
     assert compiler.count == 3 and len(entries()) == 3  # each recipe and each version has its own entry
-    assert first.sha256_code == second.sha256_code == third.sha256_code  # (the same source and values: the same code)
+    assert first.sha256_code == second.sha256_code == third.sha256_code  # (the same IR: the same code)
 
 
-# -- the lines a function was imported from are checked by build ----------------------------------------------------------------------------
+
+
+# -- a lowered kernel: the lines a function was imported from are checked by build ------------------------------------------------------------
 
 
 def exec_module(path, name):
-    """Import ``path`` the way no loader does (``exec`` of its text): the import watch has no record of it, so only the lines can tell."""
+    """Import ``path`` the way no loader does (``exec`` of its text)."""
     module = types.ModuleType(name)
     module.__file__ = str(path)
     linecache.clearcache()
@@ -1088,24 +1173,9 @@ def exec_module(path, name):
     return module
 
 
-def test_build_refuses_a_hand_written_kernel_whose_file_changed_under_the_function_it_holds(world):
-    project, compiler = world
-    project.write("cil_kernel", "from fake_jit import jit\n\n\n@jit\ndef kernel(x_ptr, y_ptr, n_elem, BLOCK):\n    return (BLOCK * 2.0, n_elem)\n")
-    try:
-        kernel = exec_module(project.path("cil_kernel"), "cil_kernel").kernel
-        spec = extern_of("cil_kernel:kernel")
-        project.edit("cil_kernel", "BLOCK * 2.0", "BLOCK * 3.0")  # the process holds the 2.0, the file says 3.0, and no record of the module exists
-        linecache.clearcache()
-        with pytest.raises(TilefishBuildError, match=r"the Triton function 'kernel' was imported from an older version of '.*cil_kernel.py': its lines 4-6 are not what the file has now"):
-            build(spec, arch="sm_90", fn=kernel)
-        assert compiler.count == 0 and entries() == []  # nothing was compiled, and no entry holds a digest of the edited file
-        build(spec, arch="sm_90", fn=exec_module(project.path("cil_kernel"), "cil_kernel").kernel)  # imported again: the process holds the file
-        assert compiler.count == 1
-    finally:
-        sys.modules.pop("cil_kernel", None)
-
-
 def test_build_refuses_a_generated_kernel_whose_file_changed_under_the_function_it_holds(world, tmp_path):
+    """The IR digest is of what the process holds and says nothing about whether that is the source the spec claims: the spec's
+    ``source_sha256`` is the new source's, the file has it, and the function the process holds is the old one."""
     _, compiler = world
     old, new = scale_kernel(2.0).lower(), scale_kernel(3.0).lower()
     (spec_new,) = new.specs()
@@ -1121,3 +1191,20 @@ def test_build_refuses_a_generated_kernel_whose_file_changed_under_the_function_
         assert compiler.count == 0 and entries() == []
     finally:
         sys.modules.pop("gen_held", None)
+
+
+def test_a_hand_written_kernel_whose_file_changed_under_the_function_it_holds_is_built_as_held(world):
+    """No file is looked at for an extern: the function the process holds is what is compiled, and its IR is what is recorded."""
+    project, compiler = world
+    project.write("cil_kernel", "from fake_jit import jit\n\n\n@jit\ndef kernel(x_ptr, y_ptr, n_elem, BLOCK):\n    return (BLOCK * 2.0, n_elem)\n")
+    try:
+        kernel = exec_module(project.path("cil_kernel"), "cil_kernel").kernel
+        _, spec = extern_of("cil_kernel:kernel")
+        held = ir_of(kernel, spec)
+        project.edit("cil_kernel", "BLOCK * 2.0", "BLOCK * 3.0")  # the process holds the 2.0, the file says 3.0
+        linecache.clearcache()
+        built = build(spec, arch="sm_90", fn=kernel)
+        assert built.ir_digest == held and compiler.count == 1
+        assert ir_of(exec_module(project.path("cil_kernel"), "cil_kernel").kernel, spec) != held  # a new process holds 3.0
+    finally:
+        sys.modules.pop("cil_kernel", None)

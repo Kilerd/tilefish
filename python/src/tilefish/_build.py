@@ -2,9 +2,10 @@
 
 ``build(spec, arch=...)`` feeds a verified :class:`~tilefish.aot.CompileSpec` to ``triton.compile`` exactly
 as ``spec.ast_source_inputs()`` says (this is the recipe in the docstring of :mod:`tilefish.aot`) and
-returns a :class:`BuiltKernel`: the cubin and the PTX, the symbol, the shared memory size, both digests and
-the toolchain versions. ``write_manifest`` writes what a host needs to load and launch the cubins without
-Python: for each kernel the ABI, the grid rule, the block, the compiled-in constants and the digests.
+returns a :class:`BuiltKernel`: the cubin and the PTX, the symbol, the shared memory size, the digests (of the binary, and
+the ``ir_digest`` of the Triton IR it was compiled from, :mod:`tilefish._ir`) and the toolchain versions. ``write_manifest``
+writes what a host needs to load and launch the cubins without Python: for each kernel the ABI, the grid rule, the block, the
+compiled-in constants and the digests.
 
 Triton is imported inside the functions that need it, so ``import tilefish`` never imports it.
 """
@@ -25,8 +26,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 from ._elf import parse_elf, code_digest
-from . import _source
-from ._source import SOURCE_DIGEST_KIND
+from . import _ir, _source
+from ._ir import IR_DIGEST_KIND
 from .errors import TilefishBuildError, TilefishManifestError
 
 if TYPE_CHECKING:
@@ -157,8 +158,7 @@ def _check_identity(jit: Any, spec: "CompileSpec") -> None:
     and by the sha256 of its file (:func:`_check_source`).
     """
     module, _, name = spec.triton.partition(":")
-    namespace = _source._namespace_of(jit)
-    defined = (namespace[0] if namespace is not None else str(getattr(jit, "__module__", "?")), str(getattr(jit, "__name__", "?")))
+    defined = _source.defined_in(jit)
     if spec.source_sha256 is not None:
         if defined[1] == name:
             return
@@ -301,11 +301,11 @@ class BuiltKernel:
     different directories have the same ``sha256_code`` and may differ in ``sha256``, because the debug
     information holds the build path. ``options`` are the options handed to ``triton.compile``.
 
-    ``source_digest`` is the source digest of a hand-written kernel at build time (:func:`tilefish._source.source_digest`:
-    a sha256 over the text of the kernel's module file, of every user module file reachable from its globals, and the
-    Triton version), or ``None`` for a binary of a generated kernel (its spec carries ``source_sha256``), for one that
-    was not built here, and for a kernel whose files cannot be read. It is what tells a manifest of a hand-written
-    kernel that its source was edited, which no declaration can; any edit to a reachable file changes it.
+    ``ir_digest`` is the digest of the Triton IR the binary was compiled from (:func:`tilefish._ir.ir_digest`: the TTIR that
+    Triton's frontend builds for the kernel, without locations or names), or ``None`` for one that was not built here. It is
+    what tells a manifest that the kernel it was built from is not the kernel a process holds now, for a hand-written ``extern``
+    (whose declaration says nothing about its body) and a lowered kernel alike: whatever the process holds that the frontend reads
+    (the body, a constant read by any route, a closure) is in the IR, so a change of any of them changes it.
     """
 
     spec: "CompileSpec"
@@ -322,7 +322,7 @@ class BuiltKernel:
     ptx_target: str  # the ``.target`` of the PTX: "sm_103a"
     options: "dict[str, Any]"
     launch: LaunchAttributes
-    source_digest: "str | None" = None
+    ir_digest: "str | None" = None
 
     @property
     def stem(self) -> str:
@@ -431,50 +431,46 @@ def _always_compile(triton: Any) -> "Iterator[None]":
             compilation.always_compile = previous
 
 
-def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "tuple[str | None, _source.Sources | None]":
-    """Check that the source behind ``jit`` is the one the spec is for and return its source digest (``None``: not recorded)
-    and the files and functions it reaches.
+def _check_generated(jit: Any, spec: "CompileSpec") -> None:
+    """For a lowered kernel, check that the function behind ``jit`` is the generated source the spec is for.
 
-    A generated kernel's spec carries ``source_sha256``: the file of the function's module must have exactly that
-    sha256 (for a lowered kernel that file is the generated source), whatever got imported from ``sys.path`` or was
-    passed as ``fn``. A hand-written kernel's source digest is computed (:func:`tilefish._source.source_digest`) and, when
-    the caller knows what it must be (``expected``), compared. For both, what the process holds must be what is on disk:
-    every module the kernel reaches must be the file the process imported, and no constant a kernel function reads may
-    have been assigned since (:class:`~tilefish._source.StaleSourceError`, see :mod:`tilefish._source`), and the lines of
-    the kernel's functions that the process imported must be the ones in their files now.
+    A generated kernel's spec carries ``source_sha256``: the file of the function's module must have exactly that sha256 (that
+    file is the generated source), whatever got imported from ``sys.path`` or was passed as ``fn``, and the lines the process
+    imported of the function must be the ones in the file now (:func:`tilefish._source.check_imported_lines`). The IR digest says
+    what the process holds, not whether that is the source the spec claims, and a manifest entry records both. A hand-written
+    kernel's spec has no source: its identity is its IR alone (:mod:`tilefish._ir`).
     """
-    reached = _source.reachable(jit)
-    if spec.source_sha256 is not None:
-        path = _source.function_file(jit)
-        if path is None:
-            raise TilefishBuildError(
-                f"cannot check the source of '{spec.triton}' against the compile spec '{spec.stem}': the function is not "
-                "defined in a Python source file"
-            )
-        try:
-            found = _source.file_sha256(path)
-        except OSError as e:
-            raise TilefishBuildError(f"cannot read {path!r}, the source of '{spec.triton}': {e}") from e
-        if found != spec.source_sha256:
-            raise TilefishBuildError(
-                f"'{spec.triton}' comes from {path!r}, whose sha256 is {found}, but the compile spec '{spec.stem}' is for "
-                f"Triton source with sha256 {spec.source_sha256}: the file is not the source this kernel generates now (a stale "
-                "LoweredKernel.write(directory) output on sys.path, or another function passed as fn). Refusing to build "
-                "it, as the manifest would say it is the new source"
-            )
-        _source.check_current(reached)
-        if reached is not None:
-            _source.check_imported_lines(reached.functions)
-        return None, reached
-    digest = _source.digest_of(reached)  # checks the files and the values against what the process imported, then digests those bytes
-    if reached is not None:
-        _source.check_imported_lines(reached.functions)
-    if digest is not None and expected is not None and digest != expected:
+    if spec.source_sha256 is None:
+        return
+    path = _source.function_file(jit)
+    if path is None:
         raise TilefishBuildError(
-            f"the source of '{spec.triton}' has digest {digest}, but {expected} was expected: it is not the source the "
-            "caller meant to build"
+            f"cannot check the source of '{spec.triton}' against the compile spec '{spec.stem}': the function is not "
+            "defined in a Python source file"
         )
-    return digest, reached
+    try:
+        found = _source.file_sha256(path)
+    except OSError as e:
+        raise TilefishBuildError(f"cannot read {path!r}, the source of '{spec.triton}': {e}") from e
+    if found != spec.source_sha256:
+        raise TilefishBuildError(
+            f"'{spec.triton}' comes from {path!r}, whose sha256 is {found}, but the compile spec '{spec.stem}' is for "
+            f"Triton source with sha256 {spec.source_sha256}: the file is not the source this kernel generates now (a stale "
+            "LoweredKernel.write(directory) output on sys.path, or another function passed as fn). Refusing to build "
+            "it, as the manifest would say it is the new source"
+        )
+    _source.check_imported_lines(_source.jit_function(jit))
+
+
+def _refuse_overridden(triton: Any, spec: "CompileSpec") -> None:
+    """``TRITON_KERNEL_OVERRIDE`` makes Triton replace the IR of a stage with a file: the binary would not be of the kernel's IR."""
+    compilation = getattr(getattr(triton, "knobs", None), "compilation", None)
+    if getattr(compilation, "override", False):
+        raise TilefishBuildError(
+            f"'{spec.stem}': Triton's kernel override is on (TRITON_KERNEL_OVERRIDE), so it may replace the IR of a stage with the "
+            "contents of a file, and the binary would not be compiled from the IR whose digest identifies it. Switch it off to build "
+            "(a build, an export and a cache entry are of the IR the kernel compiles to)"
+        )
 
 
 def build(
@@ -483,14 +479,14 @@ def build(
     arch: "int | str",
     fn: Any = None,
     options: "Mapping[str, Any] | None" = None,
-    source_digest: "str | None" = None,
+    ir_digest: "str | None" = None,
     cache: bool = True,
 ) -> BuiltKernel:
     """Compile one spec to a cubin for ``arch`` (``"sm_103"`` or ``103``) with Triton.
 
     ``fn`` is the ``triton.jit`` function; by default it is imported from ``spec.triton`` (``module:function``).
     For a lowered kernel pass the JITFunction imported from the written source. A ``fn`` that is not the function ``spec.triton``
-    names (the same object, or one defined under that module and name) is refused before anything is digested, compiled or cached,
+    names (the same object, or one defined under that module and name) is refused before anything is built or cached,
     even when its parameters are the same. The spec must be verified
     (:attr:`~tilefish.aot.CompileSpec.verified`; ``compile_specs`` output is).
 
@@ -502,69 +498,77 @@ def build(
     not know. The result is checked against the spec: the options in effect, the symbol, and the parameters of
     the PTX entry (the ABI). Raises :class:`~tilefish.errors.TilefishBuildError`.
 
-    The source is checked before anything is compiled. A spec with a ``source_sha256`` (a generated kernel) is built only
-    from a function whose module file has exactly that sha256, so a stale file on ``sys.path`` (or another ``fn``) cannot
-    be stamped with the digest of source it is not. For a hand-written kernel the result records the source digest of its
-    files (:attr:`BuiltKernel.source_digest`), which must equal ``source_digest`` when that is given. In both cases every
-    module the kernel reaches must be the file the process imported (an edited module that was not reloaded is refused:
-    "module X changed on disk since it was imported; reload it or restart"), no constant that a kernel function reads may
-    have been assigned to its module since, and the lines of the kernel's functions that the process imported must be the
-    ones in their files now.
+    **The identity of the binary is the IR that Triton compiles** (:mod:`tilefish._ir`). Before anything is looked up or compiled,
+    Triton's frontend is run on the spec's source (the first step of ``triton.compile``) and the TTIR it builds, without locations
+    or names, is hashed: that is :attr:`BuiltKernel.ir_digest`, which must equal ``ir_digest`` when that is given. Whatever the
+    process holds that the frontend reads is in it, whichever route the kernel reads it by, so nothing is guessed from source
+    files. The compile then uses a source that records the IR it was given, and a build whose IR has another digest than the one it
+    was looked up under is refused, so a binary is only ever recorded under the digest of the IR it was compiled from. A spec with a
+    ``source_sha256`` (a generated kernel) is also built only from a function whose module file has exactly that sha256, and whose
+    imported lines are the file's.
 
     The compile itself never reads Triton's disk cache: its key does not cover everything that changes a binary, so a
-    build would not be sure to be what the source says. tilefish has a cache of its own instead (:mod:`tilefish._cache`:
-    ``$TILEFISH_CACHE_DIR`` or ``~/.cache/tilefish``), keyed by the cache recipe and the tilefish version, the spec's declaration
-    digest and fingerprint, the source identity (``source_sha256`` or the source digest, so only after the checks above), the
-    architecture, the Triton and ``ptxas`` versions and the compile options, and verified on every read (the ``sha256`` and ``sha256_code`` of the cubin
+    build would not be sure to be what the kernel says. tilefish has a cache of its own instead (:mod:`tilefish._cache`:
+    ``$TILEFISH_CACHE_DIR`` or ``~/.cache/tilefish``), keyed by the cache recipe and the tilefish version, the IR digest, the
+    architecture, the Triton and ``ptxas`` versions, the Triton knobs that change code generation and the compile options, and
+    verified on every read (the ``sha256`` and ``sha256_code`` of the cubin
     are recomputed, among other things): an entry that is not as it was written is a miss with a
     :class:`~tilefish.errors.TilefishCacheWarning`, and the kernel is compiled. A hit has the cubin of the build that made
     it, so its ``sha256`` (whole file, with the debug path of that build) can differ from a fresh compile's while its
-    ``sha256_code`` is the same. ``cache=False`` neither reads nor writes it.
+    ``sha256_code`` is the same. ``cache=False`` neither reads nor writes it. Triton's kernel override
+    (``TRITON_KERNEL_OVERRIDE``) is refused: it replaces the IR of a stage with a file.
     """
     cap = parse_arch(arch)
     inp = spec.ast_source_inputs()  # raises TilefishSpecError for a spec that is not verified
     triton = _import_triton()
     jit = fn if fn is not None else resolve_triton(spec.triton)
     _check_jit_function(jit, spec)
-    _check_identity(jit, spec)  # before the source is digested, so that no digest, key or binary is of a function the spec is not for
-    recorded_digest, reached = _check_source(jit, spec, source_digest)
+    _check_identity(jit, spec)  # before anything is built, so that no digest, key or binary is of a function the spec is not for
+    _check_generated(jit, spec)
+    _refuse_overridden(triton, spec)
     opts: dict[str, Any] = {**inp.options, **dict(options or {})}
+    what = f"'{spec.stem}' ({spec.triton})"
+    digest = _ir.ir_digest(_ir.ttir_text(jit, inp, arch=cap, options=opts, what=what))
+    if ir_digest is not None and digest != ir_digest:
+        raise TilefishBuildError(
+            f"the IR of {what} has digest {digest}, but {ir_digest} was expected: it is not the kernel the caller meant to build"
+        )
 
     store = None
     cache_id = ""
-    identity = ("source_sha256", spec.source_sha256) if spec.source_sha256 is not None else ("source_digest", recorded_digest)
-    if cache and identity[1] is not None:  # after the checks of the source above: the key is of a source this process holds
+    triton_version, ptxas = str(triton.__version__), ptxas_version()
+    if cache:
         from . import _cache
 
         store = _cache.default_cache()
     if store is not None:
-        triton_version, ptxas = str(triton.__version__), ptxas_version()
         cache_id = _cache.cache_key(
-            spec,
             arch=cap,
-            source=(identity[0], str(identity[1])),
+            ir_digest=digest,
             triton_version=triton_version,
             ptxas_version=ptxas,
             options=opts,
-            environment=_cache.triton_environment(),
-            values=_source.values_read(reached),
+            environment=_cache.codegen_environment(),
         )
-        hit = store.load(
-            cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, source_digest=recorded_digest
-        )
+        hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
             return hit
 
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
 
-    src = ASTSource(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
+    src = _ir.recording_source(ASTSource)(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
     src.constants = inp.constants
     try:
         with _always_compile(triton):
             compiled = triton.compile(src, target=GPUTarget("cuda", cap, 32), options=opts)
     except Exception as e:  # noqa: BLE001 - a compile failure of any kind is a build error, with Triton's message
         raise TilefishBuildError(f"Triton could not compile '{spec.stem}' ({spec.triton}) for sm_{cap}: {type(e).__name__}: {e}") from e
+    if src.ir_text is None or _ir.ir_digest(src.ir_text) != digest:
+        raise TilefishBuildError(
+            f"'{spec.stem}': the IR Triton compiled is not the IR whose digest {digest} the build was identified by (Triton's frontend "
+            "gave another module the second time it was run on the same kernel); refusing to record or cache the binary"
+        )
 
     md = compiled.metadata
     for key, want in opts.items():
@@ -595,12 +599,12 @@ def build(
         num_warps=int(md.num_warps),
         sha256=sha256(cubin).hexdigest(),
         sha256_code=code_digest(cubin),
-        triton_version=str(triton.__version__),
-        ptxas_version=ptxas_version(),
+        triton_version=triton_version,
+        ptxas_version=ptxas,
         ptx_target=target.group(1) if target else "",
         options=opts,
         launch=_launch_attributes(md),
-        source_digest=recorded_digest,
+        ir_digest=digest,
     )
     if store is not None:
         store.store(cache_id, built)
@@ -670,9 +674,9 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     }
     if "source_sha256" in spec_part:
         entry["source_sha256"] = spec_part["source_sha256"]
-    if b.source_digest is not None:  # the digest of the files of a hand-written kernel: what its source is checked by
-        entry["source_digest"] = b.source_digest
-        entry["source_digest_kind"] = SOURCE_DIGEST_KIND
+    if b.ir_digest is not None:  # the digest of the Triton IR the binary was compiled from (the field and its kind, so a reader of schema 2 reads it as before)
+        entry["source_digest"] = b.ir_digest
+        entry["source_digest_kind"] = IR_DIGEST_KIND
     return entry
 
 
@@ -712,8 +716,9 @@ def write_manifest(
     dimension names, with ``cdiv(a, b)``), ``block``, ``shared``, ``launch``
     (scratch sizes, PDL, cluster and cooperative flags: all zero or false for a binary a plain
     ``cuLaunchKernel`` can run), ``constexprs``, ``preconditions`` (what a host checks before it launches),
-    ``declaration_digest`` and, for a generated kernel, ``source_sha256`` (the Triton source it was built from), for a
-    hand-written one ``source_digest`` (the digest of its files, see :mod:`tilefish._source`), ``sha256`` (the file) and
+    ``declaration_digest`` and, for a generated kernel, ``source_sha256`` (the Triton source it was built from), for every kernel
+    ``source_digest`` with ``source_digest_kind`` ``"tilefish.triton-ir.v1"`` (the digest of the Triton IR it was compiled from, see
+    :mod:`tilefish._ir`; the field has this name for schema 2 readers, and holds an IR digest), ``sha256`` (the file) and
     ``sha256_code`` (the machine code, independent of the build directory), and the ``toolchain`` (Triton and ptxas
     versions). With ``cubins=True`` the cubins are written next to the manifest under the file names the manifest gives.
 

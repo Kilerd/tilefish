@@ -47,7 +47,7 @@ def fake_build(spec, *, arch="sm_90", cubin=None, launch=None, **kw):
         ptx_target="sm_90a",
         options=spec.ast_source_inputs().options,
         launch=launch or LaunchAttributes(0, 0, False, (1, 1, 1), 1, False),
-        source_digest=FAKE_SOURCE_DIGEST,
+        ir_digest=FAKE_SOURCE_DIGEST,
     )
     values.update(kw)
     return BuiltKernel(**values)
