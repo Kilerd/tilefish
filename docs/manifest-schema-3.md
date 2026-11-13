@@ -79,7 +79,11 @@ A `kernels` entry has a `kind`, which is required and is exactly one of `"triton
 
 `stem op kind arch ptx_target symbol cubin abi grid block shared num_warps num_stages launch constexprs buckets dims preconditions options
 declaration_digest sha256 sha256_code toolchain` and optionally `source_sha256`, `source_digest` + `source_digest_kind` (as in schema 2:
-`source_digest_kind` is `"tilefish.triton-ir.v1"` for the digest of the Triton IR).
+`source_digest_kind` is `"tilefish.triton-ir.v1"` for the digest of the Triton IR, the TTIR of a `triton.jit` kernel, and `"tilefish.gluon-ir.v1"` for that of
+a Gluon kernel, `@tilefish.extern(gluon=...)`: the TTGIR Gluon's frontend builds, layouts and `num_warps` included, hashed under its own tag. A Gluon kernel is
+compiled by Triton and launched like any other, so its entry is a `triton` entry with nothing else that differs; a reader that does not recompute IR
+digests, such as the Rust host, needs nothing for it. Python's `replay` recomputes the digest with the frontend the operator's declaration names and refuses
+an entry whose kind is the other frontend's).
 `toolchain` is `{"triton": ..., "ptxas": ...}`. `options` are the compile options Triton was given: `num_warps` and `num_stages` (equal to the entry's) and,
 for a kernel whose declaration says it, `enable_fp_fusion` (a boolean: always for a kernel tilefish generated, and for a hand-written one declared with
 `@tilefish.extern(enable_fp_fusion=...)`; without the key Triton's default applies, which is `true`). Like every field it is digested, and a replay compares it

@@ -24,7 +24,9 @@ M3.3: a lowered kernel compares (a mask, :data:`bool_`), selects (:func:`where`)
 reduces to an index (:func:`argmax`, :func:`argmin`), gathers and scatters rows (:func:`gather_rows`, :func:`scatter_rows`), takes
 :func:`sin` and :func:`cos`, keeps a NaN's payload in a cast (``x.to(bf16, nan="preserve")``) and broadcasts an operand over the leading
 axes; a graph materialises a view (:func:`contiguous`) and the patches of a convolution (:func:`im2col`). The numerics contract of each is in
-:mod:`tilefish.lower` (notes 7 to 11) and :mod:`tilefish._copyops`.
+:mod:`tilefish.lower` (notes 7 to 11) and :mod:`tilefish._copyops`. An ``extern`` takes a Gluon kernel (``extern(gluon=...)``: Triton's
+``triton.experimental.gluon``, layouts written out), identified by the TTGIR Gluon's frontend builds, and a ``StrideOf`` says the type of
+its scalar (``dtype=i32`` or ``i64``) when it is not the width of the kernel's offsets.
 """
 
 from . import aot
