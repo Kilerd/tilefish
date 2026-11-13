@@ -12,7 +12,9 @@ Trust. A manifest directory vouches for nothing by itself: its digests only say 
 manifest describes, and an attacker who can write the directory can rewrite both. :attr:`Manifest.digest` is a sha256
 over the whole manifest (every entry: spec digests, source digests, file and code digests, symbol, shared memory,
 block, launch fields, toolchain); a caller that holds it from a trusted place (a build log, a lock file) passes it as
-``pin=`` and a manifest with any other content is refused. Without a pin the directory is trusted.
+``pin=`` and a manifest with any other content is refused. ``tilefish.run(..., mode="replay")`` does not run a directory
+without that anchor: it takes a pin, or ``trust_directory=True``, the explicit statement that whatever the directory holds is
+trusted.
 
 Source. The compile spec of a generated kernel carries ``source_sha256``, the sha256 of the Triton source it was built
 from, and a replay refuses an entry built from another source (a kernel redeclared with another body but the same name

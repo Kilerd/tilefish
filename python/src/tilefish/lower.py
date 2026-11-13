@@ -195,6 +195,21 @@ Notes (the facts behind the table):
    made a ``D = 96`` bucket next to a ``D = 2048`` one run with 8 warps and differ from the 1-warp result in 25
    of 129 rows). A spec fixes ``num_warps``, so ``jit``, ``replay`` and a generated host all agree, and
    ``num_warps=N`` pins one value for every bucket.
+
+``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
+kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
+accumulator dtype (a numerics-changing rewrite in the README's terms), and two binaries that differ in ``num_warps`` are not
+byte-comparable. It is therefore recorded everywhere an identity is: the declaration digest, the compile spec, the manifest
+entry (a replay refuses an entry whose ``num_warps`` is not the spec's) and the manifest digest. Pin it
+(``@tilefish.kernel(num_warps=N)``) where bytes must not move when a size is added to a bucketed dimension, and treat a
+change of it, or of the rule that picks it (``clamp(BLOCK_D // 256, 1, 16)``), as a change of the numerics contract.
+
+The ``reference`` mode is held to the binary within tolerances that are measured per input distribution, not stated once:
+a ULP count only means something where the result is far from zero, so for a bf16 output the bound is half a bf16 step of the
+largest value of the reference (``2**-7 * max|ref|``) together with a fraction of elements allowed to differ, for the f32 softmax an
+absolute error of 5e-7 (and ULP where meaningful), for the gelu an absolute error of 3e-5. They differ by dtype, kernel and
+distribution (the mean of a layernorm's data, the scale of a softmax's), and the measured bounds are tabulated, and asserted, in
+``tests/test_gpu_reference.py``.
 """
 
 from __future__ import annotations

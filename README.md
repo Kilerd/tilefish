@@ -123,14 +123,19 @@ The Python side has three modes:
 |---|---|---|
 | `jit` | the current source, built through its compile spec (the path of the build) in memory and launched through the CUDA driver | iterating on a kernel |
 | `reference` | the same bodies interpreted with torch | an oracle, compared within a tolerance |
-| `replay` | the prebuilt cubins of a manifest directory, checked against its digests, through the CUDA driver; the directory is trusted unless you pin its digest | the exact machine code the C++ and Rust hosts run |
+| `replay` | the prebuilt cubins of a manifest directory, checked against its digests, through the CUDA driver; it needs a trust anchor, the manifest's pinned digest or an explicit `trust_directory=True` | the exact machine code the C++ and Rust hosts run |
 
 ```python
 y = tilefish.run(residual_add_rmsnorm, x, residual, w)                        # jit
 m = tilefish.runtime.export(residual_add_rmsnorm, "build/")                    # cubins and manifest.json
-y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/")
-y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/", pin=m.digest)
+y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/", pin=m.digest)           # a manifest whose digest you hold
+y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="replay", manifest="build/", trust_directory=True)  # whatever the directory holds
 ```
+
+`replay` refuses to run without one of the two (`pin=` or `trust_directory=True`). This
+is a deliberate breaking change in 0.0.x: until 0.0.2 a replay trusted the directory by
+default, and the digests in it sit next to the files they describe, so whoever can write
+the directory could make it run any binary.
 
 Arguments are torch tensors, matched to the signature the way a call is
 matched in a trace: inputs and `InOut` tensors are passed (an `InOut` tensor
@@ -154,17 +159,50 @@ standard library) and the Triton version. `replay` recomputes it, which needs
 the kernel to be importable, or a pin. Triton's own `cache_key` is not used: it
 does not see a `tl.constexpr` read as a module attribute (`cfg.SCALE`), a dtype
 alias or a constant in a helper module, so none of them would make a stale
-binary look stale. For the same reason every `jit` and `export` build compiles
-from scratch and never reads Triton's disk cache (about 35 to 130 ms per binary
-on a B300, once per process for `jit`).
+binary look stale. For the same reason a build never reads Triton's disk cache.
+
+A build compiles from scratch (about 25 to 75 ms per binary on a B300) unless
+tilefish's own cache has it: `~/.cache/tilefish`, or `$TILEFISH_CACHE_DIR` (an
+empty value switches it off; `aot.build(..., cache=False)` skips it for one
+build). Its key is the declaration digest, the spec's source identity
+(`source_sha256`, or the source digest of a hand-written kernel, computed only
+after the edited-module check above), the architecture, the Triton and `ptxas`
+versions, the compile options and the module constants the kernel reads (as the
+process holds them: a module may compute one at import from the environment, and
+no file says so), and every read is verified: the `sha256` and
+`sha256_code` of the cubin are recomputed (and the PTX, the entry point and its
+ABI, the options and the versions are checked), and an entry that is not as it
+was written is a warning and a rebuild, never used. Entries are written through a
+temporary file and renamed, so builds that race do not tear one. A hit takes
+about 0.5 to 0.8 ms. The cache is as exact as the source digest (what that does not
+reach is not in the key either), nothing evicts it, and it is no defence
+against someone who can write the directory: a manifest is what to pin.
 
 **Any edit to a file a hand-written kernel reaches, a comment included, means
 exporting again and pinning the new manifest.** The digest is of the files on
-disk, so a process that edited a file after importing it must reload before it
-builds (a build refuses a function whose imported lines are not the file's), and
-it does not see a value that a program assigned to a module attribute at run
-time. `build` also refuses source that is not its spec's: a stale
-`LoweredKernel.write` output on `sys.path`, or another function passed as `fn`.
+disk, and Triton compiles what the process holds, so no digest is made of a file
+the process holds in another version. `import tilefish` starts recording the
+files of the modules imported after it, and `jit`, `export` and `replay` of a
+hand-written kernel raise "module X changed on disk since it was imported;
+reload it or restart" when a module the kernel reaches was edited and not
+reloaded (in a notebook, say), whichever module it is, a helper two levels
+away included. It compares the content of the file, so a save without a change
+passes, and a module that was imported before `import tilefish` is compared by
+size and modification time only (`tilefish/_source.py` lists what the check does
+not see: an edit between a module's import and `import tilefish`, a module no
+source loader executed, a stale same-second `.pyc`). The recording wraps
+`SourceFileLoader.exec_module` for the whole process. `TILEFISH_IMPORT_WATCH=0`
+leaves the import system alone, and every module is then compared by size and
+modification time only, from when tilefish was imported or when a build first
+read it. **Kernel inputs come from
+source files, not from module state a program assigns at run time**
+(`cfg.SCALE = 5.0`, `monkeypatch.setattr`): a build refuses a constant that a
+kernel function reads and that was reassigned since its module was imported
+(scalars and Triton constants; not a container changed in place or an attribute
+of an instance), and a constant that is not in a file could not be described by
+any source digest, cache entry or manifest. `build` also refuses source that is
+not its spec's: a stale `LoweredKernel.write` output on `sys.path`, or another
+function passed as `fn`.
 
 `replay` also refuses `shared` memory the cubin and the device cannot have (the
 driver's static shared memory of the function plus the manifest's dynamic size
@@ -174,22 +212,30 @@ ABI, and a grid beyond the device's limits. The manifest is read as strict JSON
 written through a temporary file and renamed, and a symbolic link where a file
 is to go is refused.
 
-**Trust.** Without `pin=` a replay trusts the directory: the digests sit next
-to the files they describe, so whoever can write the directory can rewrite
-both. `export` returns the manifest with its `digest`, a sha256 over every
-entry, and checks that the directory it wrote has that digest; keep it somewhere
-you trust and pass it as `pin=` to refuse a directory that changed. A pin
-vouches for the manifest, not for a source digest that is known to differ, and
-not for a `shared` that is nonzero but too small for the kernel (nothing but the
-manifest says how much it needs). Triton's own JIT launcher, which specializes
-on argument values, is not a mode. Neither `jit` nor `replay` needs a C
-compiler, and a `replay` of a generated kernel needs neither Triton nor `ptxas`.
+**Trust.** A replay needs a trust anchor, `pin=` or `trust_directory=True`, and
+raises without one. The digests in a manifest directory sit next to the files
+they describe, so whoever can write the directory can rewrite both.
+`export` returns the manifest with its `digest`, a sha256 over every entry, and
+checks that the directory it wrote has that digest; keep it somewhere you trust
+and pass it as `pin=` to refuse a directory that changed.
+`trust_directory=True` is the explicit statement that whatever the directory
+holds is fine (a directory you wrote a moment ago); it does not combine with
+`pin=`. A pin vouches for the manifest, not for a source digest that is known to
+differ, and not for a `shared` that is nonzero but too small for the kernel
+(nothing but the manifest says how much it needs). Triton's own JIT launcher,
+which specializes on argument values, is not a mode. Neither `jit` nor `replay`
+needs a C compiler, and a `replay` of a generated kernel needs neither Triton nor
+`ptxas`.
 
 CI asserts, on a GPU (the tests marked `gpu`), that a `jit`-built cubin has the
 digest of the manifest's, that `jit` and `replay` agree byte for byte, and that
-`replay` stays within tolerance of `reference` (tolerances per input
-distribution, in the test). An experiment that passes in `replay` is, kernel
-for kernel, what production runs.
+`replay` stays within tolerance of `reference`. The tolerances are measured per
+input distribution and tabulated in `python/tests/test_gpu_reference.py`: a ULP
+count only means something where the result is far from zero (a layernorm of
+data with a large mean has tiny outputs), so a bf16 output is bounded by half a
+bf16 step of the largest reference value and a fraction of elements that may
+differ, the f32 softmax by an absolute error of 5e-7, the gelu by 3e-5. An
+experiment that passes in `replay` is, kernel for kernel, what production runs.
 
 ## The Rust host
 
@@ -242,6 +288,11 @@ point in the IR, and rules come in two kinds:
   Applied automatically.
 - **numerics-changing**: a reduction order, an accumulator dtype or a rounding
   point changes. Applied only on request, and gated against the reference.
+
+`num_warps` is part of a kernel's numerics identity in the same way: it fixes
+the tree a `tl.sum` adds in, so the same kernel with another warp count differs
+in the last bits. It is recorded in the declaration digest, the compile spec
+and the manifest, and a replay refuses an entry that has another.
 
 Whether a legal fusion is worth doing is still measured, not assumed. The
 measurements live in the repository next to the rules.

@@ -391,14 +391,17 @@ def _always_compile(triton: Any) -> "Iterator[None]":
             compilation.always_compile = previous
 
 
-def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "str | None":
-    """Check that the source behind ``jit`` is the one the spec is for and return its source digest (``None``: not recorded).
+def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "tuple[str | None, _source.Sources | None]":
+    """Check that the source behind ``jit`` is the one the spec is for and return its source digest (``None``: not recorded)
+    and the files and functions it reaches.
 
     A generated kernel's spec carries ``source_sha256``: the file of the function's module must have exactly that
     sha256 (for a lowered kernel that file is the generated source), whatever got imported from ``sys.path`` or was
     passed as ``fn``. A hand-written kernel's source digest is computed (:func:`tilefish._source.source_digest`) and, when
-    the caller knows what it must be (``expected``), compared. For both the lines the process imported must be the ones
-    in the file now.
+    the caller knows what it must be (``expected``), compared. For both, what the process holds must be what is on disk:
+    every module the kernel reaches must be the file the process imported, and no constant a kernel function reads may
+    have been assigned since (:class:`~tilefish._source.StaleSourceError`, see :mod:`tilefish._source`), and the lines of
+    the kernel's functions that the process imported must be the ones in their files now.
     """
     reached = _source.reachable(jit)
     if spec.source_sha256 is not None:
@@ -419,18 +422,19 @@ def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "str
                 "LoweredKernel.write(directory) output on sys.path, or another function passed as fn). Refusing to build "
                 "it, as the manifest would say it is the new source"
             )
+        _source.check_current(reached)
         if reached is not None:
             _source.check_imported_lines(reached.functions)
-        return None
+        return None, reached
+    digest = _source.digest_of(reached)  # checks the files and the values against what the process imported, then digests those bytes
     if reached is not None:
         _source.check_imported_lines(reached.functions)
-    digest = _source.digest_of(reached)
     if digest is not None and expected is not None and digest != expected:
         raise TilefishBuildError(
             f"the source of '{spec.triton}' has digest {digest}, but {expected} was expected: it is not the source the "
             "caller meant to build"
         )
-    return digest
+    return digest, reached
 
 
 def build(
@@ -440,6 +444,7 @@ def build(
     fn: Any = None,
     options: "Mapping[str, Any] | None" = None,
     source_digest: "str | None" = None,
+    cache: bool = True,
 ) -> BuiltKernel:
     """Compile one spec to a cubin for ``arch`` (``"sm_103"`` or ``103``) with Triton.
 
@@ -458,18 +463,54 @@ def build(
     The source is checked before anything is compiled. A spec with a ``source_sha256`` (a generated kernel) is built only
     from a function whose module file has exactly that sha256, so a stale file on ``sys.path`` (or another ``fn``) cannot
     be stamped with the digest of source it is not. For a hand-written kernel the result records the source digest of its
-    files (:attr:`BuiltKernel.source_digest`), which must equal ``source_digest`` when that is given. In both cases the
-    lines of the kernel's functions that the process imported must be the ones in their files now, or the build is
-    refused (restart or reload). The compile itself never reads Triton's disk cache: the cache key does not cover everything
-    that changes a binary, so a build would not be sure to be what the source says.
+    files (:attr:`BuiltKernel.source_digest`), which must equal ``source_digest`` when that is given. In both cases every
+    module the kernel reaches must be the file the process imported (an edited module that was not reloaded is refused:
+    "module X changed on disk since it was imported; reload it or restart"), no constant that a kernel function reads may
+    have been assigned to its module since, and the lines of the kernel's functions that the process imported must be the
+    ones in their files now.
+
+    The compile itself never reads Triton's disk cache: its key does not cover everything that changes a binary, so a
+    build would not be sure to be what the source says. tilefish has a cache of its own instead (:mod:`tilefish._cache`:
+    ``$TILEFISH_CACHE_DIR`` or ``~/.cache/tilefish``), keyed by the spec's declaration digest and fingerprint, the source
+    identity (``source_sha256`` or the source digest, so only after the checks above), the architecture, the Triton and
+    ``ptxas`` versions and the compile options, and verified on every read (the ``sha256`` and ``sha256_code`` of the cubin
+    are recomputed, among other things): an entry that is not as it was written is a miss with a
+    :class:`~tilefish.errors.TilefishCacheWarning`, and the kernel is compiled. A hit has the cubin of the build that made
+    it, so its ``sha256`` (whole file, with the debug path of that build) can differ from a fresh compile's while its
+    ``sha256_code`` is the same. ``cache=False`` neither reads nor writes it.
     """
     cap = parse_arch(arch)
     inp = spec.ast_source_inputs()  # raises TilefishSpecError for a spec that is not verified
     triton = _import_triton()
     jit = fn if fn is not None else resolve_triton(spec.triton)
     _check_jit_function(jit, spec)
-    recorded_digest = _check_source(jit, spec, source_digest)
+    recorded_digest, reached = _check_source(jit, spec, source_digest)
     opts: dict[str, Any] = {**inp.options, **dict(options or {})}
+
+    store = None
+    cache_id = ""
+    identity = ("source_sha256", spec.source_sha256) if spec.source_sha256 is not None else ("source_digest", recorded_digest)
+    if cache and identity[1] is not None:  # after the checks of the source above: the key is of a source this process holds
+        from . import _cache
+
+        store = _cache.default_cache()
+    if store is not None:
+        triton_version, ptxas = str(triton.__version__), ptxas_version()
+        cache_id = _cache.cache_key(
+            spec,
+            arch=cap,
+            source=(identity[0], str(identity[1])),
+            triton_version=triton_version,
+            ptxas_version=ptxas,
+            options=opts,
+            environment=_cache.triton_environment(),
+            values=_source.values_read(reached),
+        )
+        hit = store.load(
+            cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, source_digest=recorded_digest
+        )
+        if hit is not None:
+            return hit
 
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
@@ -501,7 +542,7 @@ def build(
     from hashlib import sha256
 
     target = _PTX_TARGET.search(ptx)
-    return BuiltKernel(
+    built = BuiltKernel(
         spec=spec,
         arch=f"sm_{cap}",
         cubin=cubin,
@@ -518,6 +559,9 @@ def build(
         launch=_launch_attributes(md),
         source_digest=recorded_digest,
     )
+    if store is not None:
+        store.store(cache_id, built)
+    return built
 
 
 # -- the manifest ---------------------------------------------------------------------------------------------------------

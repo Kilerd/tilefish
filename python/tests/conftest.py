@@ -31,6 +31,12 @@ def gpu_problem():
     return None
 
 
+@pytest.fixture(autouse=True)
+def _isolated_build_cache(tmp_path_factory, monkeypatch):
+    """Every test has its own, empty tilefish build cache: none reads or writes ``~/.cache/tilefish``, and none sees another's entries."""
+    monkeypatch.setenv("TILEFISH_CACHE_DIR", str(tmp_path_factory.mktemp("tilefish-cache")))
+
+
 def pytest_configure(config):
     # also registered in pyproject.toml; repeated here for a run from the repository root, which has no ini file
     config.addinivalue_line("markers", "gpu: needs a CUDA device with torch, triton and cuda-python; skipped automatically when any is missing")

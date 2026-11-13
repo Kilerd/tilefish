@@ -12,8 +12,8 @@ extern's ``Out`` tensors; ``None``, one tensor or a tuple.
 mode           what runs
 =============  ============================================================================================
 ``jit``        the current source, built through its compile spec (``spec.ast_source_inputs()``, the path
-               of :func:`tilefish.aot.build`) in memory, cached by digest, and launched through the CUDA
-               driver
+               of :func:`tilefish.aot.build`) in memory, cached by digest (in memory, and on disk by
+               tilefish's own build cache), and launched through the CUDA driver
 ``replay``     the prebuilt cubins of a manifest directory (``manifest=``, written by
                :func:`export` or ``write_manifest(..., cubins=True)``), loaded with ``cuModuleLoadData``
                and launched through the same driver path: exactly what a C++ or Rust host does
@@ -45,14 +45,27 @@ and refuses
   kernel. Any edit to a reachable file, a comment included, makes it differ: export again and pin the new manifest.
   Where it cannot be recomputed (the module does not import without Triton) ``replay`` refuses, unless ``pin=`` is given.
   (Triton's ``cache_key`` is not used: it misses a ``tl.constexpr`` read as a module attribute, a dtype alias and
-  constants in helper modules. For the same reason every ``jit`` and ``export`` build compiles from scratch and never
-  reads Triton's disk cache.)
+  constants in helper modules. For the same reason a build never reads Triton's disk cache. It compiles from scratch
+  unless tilefish's own cache has the binary, keyed by the declaration digest, the source identity (this digest, or the
+  ``source_sha256`` of a generated kernel), the architecture, the toolchain and the options, and verified on every
+  read: :mod:`tilefish._cache`.)
 
-Trust. Without ``pin=`` the directory is trusted: the digests in a manifest are written next to the files they
-describe, so whoever can write the directory can rewrite both and make ``replay`` run any binary. ``pin=`` is the
-digest of the whole manifest (``Manifest.digest``, returned by :func:`export`): hold it somewhere you trust (a build
-log, a lock file) and a changed directory is refused. A pin vouches for the manifest, not for the machine code
-being correct.
+Trust. A replay needs a trust anchor and refuses to run without one: ``run(..., mode="replay", manifest=directory)`` raises
+unless it is given ``pin=`` or ``trust_directory=True``. (This is a deliberate break from 0.0.1 and 0.0.2, where the
+directory was trusted by default.) The digests in a manifest are written next to the files they describe, so whoever can
+write the directory can rewrite both and make ``replay`` run any binary. ``pin=`` is the digest of the whole manifest
+(``Manifest.digest``, returned by :func:`export`): hold it somewhere you trust (a build log, a lock file) and a changed
+directory is refused. ``trust_directory=True`` is the explicit statement that whatever the directory holds is fine, for a
+directory you wrote yourself a moment ago; it does not combine with ``pin=``. A pin vouches for the manifest, not for the
+machine code being correct, and not for a source digest that is known to differ.
+
+Kernel inputs come from source files. A hand-written kernel is identified by the files it reaches, so everything that shapes
+its binary must be in them: a constant a kernel reads (``cfg.SCALE``, a dtype alias, a constant of a helper) is a value in a
+source file, not module state that a program assigned at run time (``cfg.SCALE = 5.0``, ``monkeypatch.setattr``), which no
+source digest, cache entry or manifest could describe. A build refuses what it can see of that (an edited module that was
+not reloaded, a scalar or Triton constant that a kernel function reads and that was reassigned after its module was imported;
+:mod:`tilefish._source` says what it sees and what it does not): put the value in the file, or make it a ``const`` argument
+of the ``extern`` or the ``@tilefish.kernel``.
 
 Before ``jit`` and ``replay`` launch, every precondition of the binary is checked (dtypes, static sizes,
 ``divisible_by``, 16-byte aligned pointers, contiguity, aliasing, ``max_elements`` of a generated kernel); a
@@ -491,6 +504,8 @@ def _current_source_digest(spec: CompileSpec) -> "str | None":
         return None
     try:
         return _source.source_digest(fn)
+    except _source.StaleSourceError as e:  # the process holds another version of a file than the one on disk: not a digest to compare
+        raise TilefishRuntimeError(str(e)) from e
     except Exception:  # noqa: BLE001 - whatever an object in a module namespace raises when it is looked at
         return None
 
@@ -543,9 +558,10 @@ def export(
     kernels stay, and a new binary replaces the entry of the same stem and architecture. An existing entry that is a
     different binary (other machine code, declaration, source or options) is replaced only with ``overwrite=True``.
 
-    Every build compiles from scratch (Triton's disk cache is not read) and the files of a hand-written kernel must be
-    the ones the process imported (see :func:`tilefish.aot.build`). Files are written through temporary files and
-    renamed, and a symbolic link where a file goes is refused.
+    No build reads Triton's disk cache; a binary comes from tilefish's own build cache when it has one for exactly this
+    source, architecture, toolchain and options (verified on every read), and is compiled otherwise. The files of a
+    hand-written kernel must be the ones the process imported (see :func:`tilefish.aot.build`). Files are written
+    through temporary files and renamed, and a symbolic link where a file goes is refused.
 
     Returns the loaded and verified :class:`~tilefish.aot.Manifest`: ``.directory``, ``.path`` and ``.digest``, the
     digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
@@ -577,21 +593,35 @@ def export(
     return loaded
 
 
-def run(op: Any, /, *args: Any, mode: str = "jit", manifest: Any = None, pin: "str | None" = None, **kwargs: Any) -> Any:
+def run(
+    op: Any,
+    /,
+    *args: Any,
+    mode: str = "jit",
+    manifest: Any = None,
+    pin: "str | None" = None,
+    trust_directory: bool = False,
+    **kwargs: Any,
+) -> Any:
     """Run a kernel or an extern op on tensors. See the module docstring for the three modes.
 
     ``op`` is a ``@tilefish.kernel`` (or its :class:`~tilefish.lower.LoweredKernel`) or an ``@tilefish.extern`` whose
     Triton function can be imported. ``mode`` is ``"jit"``, ``"replay"`` or ``"reference"``. ``manifest`` is the
     directory (or the :class:`~tilefish.aot.Manifest`) that ``"replay"`` loads its cubins from, and is required
-    there and nowhere else. ``pin`` (replay only) is the digest of the manifest (``Manifest.digest``, what ``export``
-    returns): a manifest with any other digest is refused, so the directory is trusted only as far as the digest
-    you hold; without it the directory itself is trusted. For a hand-written kernel whose source digest cannot be
-    recomputed, ``pin`` is also the explicit statement that you vouch for the manifest. ``mode``, ``manifest`` and
-    ``pin`` are the only keywords that are not arguments of ``op`` (an operator with a parameter of one of those
-    names takes it positionally). Raises :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks
-    a precondition of the binary, :class:`~tilefish.errors.TilefishManifestError` when the manifest is not what was
-    built, not what the operator asks for, or not the pinned one, and :class:`~tilefish.errors.TilefishRuntimeError`
-    when the call cannot run.
+    there and nowhere else.
+
+    A replay needs a trust anchor, one of ``pin`` and ``trust_directory``, and refuses to run without. ``pin`` is the
+    digest of the manifest (``Manifest.digest``, what ``export`` returns, kept somewhere you trust): a manifest with any
+    other digest is refused, so the directory is trusted only as far as the digest you hold. ``trust_directory=True`` says
+    that you trust whatever the directory holds, which is what whoever can write it makes it (the digests sit next to the
+    files they describe); it is for a directory you wrote yourself a moment ago, and is not combined with ``pin``. For a
+    hand-written kernel whose source digest cannot be recomputed, only ``pin`` is the statement that you vouch for the
+    manifest. ``mode``, ``manifest``, ``pin`` and ``trust_directory`` are the only keywords that are not arguments of
+    ``op`` (an operator with a parameter of one of those names takes it positionally). Raises
+    :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks a precondition of the binary,
+    :class:`~tilefish.errors.TilefishManifestError` when the manifest is not what was built, not what the operator asks
+    for, or not the pinned one, and :class:`~tilefish.errors.TilefishRuntimeError` when the call cannot run (a replay
+    without a trust anchor, for one).
     """
     if mode not in MODES:
         raise TilefishRuntimeError(f"unknown mode {mode!r}: use one of {', '.join(MODES)}")
@@ -604,8 +634,24 @@ def run(op: Any, /, *args: Any, mode: str = "jit", manifest: Any = None, pin: "s
         raise TilefishRuntimeError(f"manifest= is for mode='replay'; mode {mode!r} builds or interprets the kernel itself")
     if mode != "replay" and pin is not None:
         raise TilefishRuntimeError(f"pin= is for mode='replay' (it pins a manifest); mode {mode!r} has none")
+    if trust_directory is not True and trust_directory is not False:
+        raise TilefishRuntimeError(f"trust_directory= is True or False, got {trust_directory!r}")
+    if mode != "replay" and trust_directory:
+        raise TilefishRuntimeError(f"trust_directory= is for mode='replay'; mode {mode!r} runs no manifest to trust")
     if pin is not None and not (isinstance(pin, str) and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin)):
         raise TilefishRuntimeError(f"pin= is the 64 lowercase hex digits of a manifest digest, got {pin!r}")
+    if mode == "replay":
+        if pin is not None and trust_directory:
+            raise TilefishRuntimeError(
+                "pass either pin= (a manifest with another digest is refused) or trust_directory=True (whatever the directory "
+                "holds is accepted), not both: one of them says which manifest to trust and the other that any will do"
+            )
+        if pin is None and not trust_directory:
+            raise TilefishRuntimeError(
+                "replay needs a trust anchor: the digests in a manifest directory sit next to the files they describe, so whoever "
+                "can write the directory can make a replay run any binary. Pass pin=<the manifest's digest> (Manifest.digest, which "
+                "export returns; keep it somewhere you trust), or trust_directory=True to run whatever the directory holds"
+            )
     target = _target(op)
     if mode == "reference":
         return _run_reference(target, args, kwargs)

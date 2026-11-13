@@ -82,15 +82,15 @@ def test_a_generated_kernel_with_another_body_does_not_replay_the_old_binary(tmp
     old, new = scale_kernel(2.0), scale_kernel(3.0)
     x = arange_rows()
     directory = runtime.export(old, tmp_path).directory
-    assert torch.equal(tilefish.run(old, x, mode="replay", manifest=directory), x * 2)  # the manifest is right for its kernel
+    assert torch.equal(tilefish.run(old, x, mode="replay", manifest=directory, trust_directory=True), x * 2)  # the manifest is right for its kernel
     low_old, low_new = old.lower(), new.lower()
     assert low_old.source_sha256 != low_new.source_sha256
     with pytest.raises(TilefishManifestError) as e:  # ... and refused for the redeclared one, instead of returning x * 2
-        tilefish.run(new, x, mode="replay", manifest=directory)
+        tilefish.run(new, x, mode="replay", manifest=directory, trust_directory=True)
     assert low_old.source_sha256 in str(e.value) and low_new.source_sha256 in str(e.value)
     assert "changed since the manifest was written" in str(e.value) and "export it again" in str(e.value)
     assert torch.equal(tilefish.run(new, x, mode="jit"), x * 3)  # jit builds the new source
-    assert torch.equal(tilefish.run(new, x, mode="replay", manifest=runtime.export(new, tmp_path / "new").directory), x * 3)
+    assert torch.equal(tilefish.run(new, x, mode="replay", manifest=runtime.export(new, tmp_path / "new").directory, trust_directory=True), x * 3)
 
 
 EXT_SOURCE = """
@@ -137,17 +137,17 @@ def test_a_hand_written_kernel_with_another_body_does_not_replay_the_old_binary(
     entry = json.loads((manifest.directory / "manifest.json").read_text())["kernels"][0]
     assert entry["source_digest_kind"] == _source.SOURCE_DIGEST_KIND and len(entry["source_digest"]) == 64
     assert "source_sha256" not in entry  # an extern's declaration contains no source
-    assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory), x * 2)
+    assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, trust_directory=True), x * 2)
     assert torch.equal(tilefish.run(ext_scale, x, mode="jit"), x * 2)
 
     # the same file again: the same key, still fine (a reload is not a change)
     write_ext_module(ext_dir, "2.0")
-    assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory), x * 2)
+    assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, trust_directory=True), x * 2)
 
     # the body changes, the name and the signature do not
     write_ext_module(ext_dir, "3.0")
     with pytest.raises(TilefishManifestError) as e:
-        tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory)
+        tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, trust_directory=True)
     new_digest = _source.source_digest(sys.modules["ext_scale_mod"].ext_scale_kernel)
     assert new_digest != entry["source_digest"]
     assert entry["source_digest"] in str(e.value) and new_digest in str(e.value) and "stale" in str(e.value)
@@ -155,7 +155,7 @@ def test_a_hand_written_kernel_with_another_body_does_not_replay_the_old_binary(
         tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, pin=manifest.digest)
     assert torch.equal(tilefish.run(ext_scale, x, mode="jit"), x * 3)
     again = runtime.export(ext_scale, tmp_path / "m", overwrite=True)  # exported again: the new binary
-    assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=again.directory), x * 3)
+    assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=again.directory, trust_directory=True), x * 3)
 
 
 def test_a_hand_written_kernel_that_cannot_be_recomputed_needs_a_pin(ext_dir, tmp_path, monkeypatch):
@@ -164,7 +164,7 @@ def test_a_hand_written_kernel_that_cannot_be_recomputed_needs_a_pin(ext_dir, tm
     manifest = runtime.export(ext_scale, tmp_path / "m")
     monkeypatch.setattr(runtime, "_current_source_digest", lambda spec: None)
     with pytest.raises(TilefishManifestError, match="cannot tell whether the binary for 'ext_scale' .* was built from the current source.*cannot be recomputed"):
-        tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory)
+        tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, trust_directory=True)
     pinned = tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, pin=manifest.digest)
     assert torch.equal(pinned, x * 2)
 
@@ -184,7 +184,7 @@ def test_a_replay_without_triton_cannot_recompute_a_source_and_needs_a_pin(ext_d
         "x = torch.arange(64, dtype=torch.float32, device='cuda')\n"
         "directory, pin = sys.argv[1], sys.argv[2]\n"
         "try:\n"
-        "    tilefish.run(ext_scale, x, mode='replay', manifest=directory)\n"
+        "    tilefish.run(ext_scale, x, mode='replay', manifest=directory, trust_directory=True)\n"
         "    print('RAN WITHOUT A PIN')\n"
         "except tilefish.TilefishManifestError as e:\n"
         "    print('refused:', 'cannot be recomputed' in str(e))\n"
@@ -228,7 +228,7 @@ def test_shared_zero_for_a_kernel_that_uses_shared_memory_is_refused_before_it_c
     doc["kernels"][0]["shared"] = 0
     (tmp_path / "manifest.json").write_text(json.dumps(doc))
     with pytest.raises(TilefishManifestError, match=r"has a shared memory section .* shared = 0"):
-        tilefish.run(softmax, x, mode="replay", manifest=tmp_path)
+        tilefish.run(softmax, x, mode="replay", manifest=tmp_path, trust_directory=True)
     torch.cuda.synchronize()  # the context is fine
     assert torch.isfinite(tilefish.run(softmax, x, mode="jit")).all()
 
@@ -240,7 +240,7 @@ def test_shared_memory_beyond_the_device_is_refused(tmp_path):
     doc["kernels"][0]["shared"] = 1 << 22
     (tmp_path / "manifest.json").write_text(json.dumps(doc))
     with pytest.raises(TilefishRuntimeError, match=r"needs 0 bytes of static and 4194304 bytes of dynamic shared memory, more than the \d+ bytes a block may use"):
-        tilefish.run(softmax, x, mode="replay", manifest=tmp_path)
+        tilefish.run(softmax, x, mode="replay", manifest=tmp_path, trust_directory=True)
     assert torch.isfinite(tilefish.run(softmax, x, mode="jit")).all()
 
 
@@ -283,11 +283,11 @@ def test_replay_looks_up_the_binary_of_the_devices_architecture(tmp_path, monkey
     for capability, arch in ((90, "sm_90"), (CAP[0] * 10 + CAP[1], ARCH)):
         seen.clear()
         monkeypatch.setattr(runtime, "_capability", lambda torch_, index, c=capability: c)
-        tilefish.run(softmax, x, mode="replay", manifest=tmp_path)
+        tilefish.run(softmax, x, mode="replay", manifest=tmp_path, trust_directory=True)
         assert seen[0] == arch  # the architecture of the (mocked) device, not a hardcoded one
     monkeypatch.setattr(runtime, "_capability", lambda torch_, index: 100)
     with pytest.raises(TilefishManifestError, match=rf"no binary for 'softmax' on sm_100 \(it has {', '.join(sorted({ARCH, 'sm_90'}))}\)"):
-        tilefish.run(softmax, x, mode="replay", manifest=tmp_path)
+        tilefish.run(softmax, x, mode="replay", manifest=tmp_path, trust_directory=True)
 
 
 def test_the_build_cache_is_per_architecture(monkeypatch):
@@ -315,8 +315,8 @@ def test_export_into_an_existing_directory_keeps_what_is_there(tmp_path):
     assert sorted((a.stem, a.arch) for a in m.artifacts) == sorted({("softmax", ARCH), ("gelu_exact", ARCH), ("softmax", "sm_90")})
     assert len({first.digest, second.digest, third.digest}) == 3 and third.digest == m.digest
     x = randn((7, 1000), torch.float32, 0)
-    assert same_bytes(tilefish.run(softmax, x, mode="replay", manifest=tmp_path), tilefish.run(softmax, x, mode="jit"))
-    assert tilefish.run(gelu_exact, randn((64,), BF16, 0), mode="replay", manifest=tmp_path).shape == (64,)
+    assert same_bytes(tilefish.run(softmax, x, mode="replay", manifest=tmp_path, trust_directory=True), tilefish.run(softmax, x, mode="jit"))
+    assert tilefish.run(gelu_exact, randn((64,), BF16, 0), mode="replay", manifest=tmp_path, trust_directory=True).shape == (64,)
 
 
 def test_export_does_not_replace_a_different_binary_unless_told_to(tmp_path):
@@ -385,7 +385,7 @@ def test_the_devices_limits_are_what_the_driver_says():
 def test_the_launch_is_ordered_on_torchs_current_stream(mode, tmp_path):
     """The input is written on a side stream after a long wait; a launch on stream 0 would read it before that."""
     manifest = runtime.export(gelu_exact, tmp_path).directory if mode == "replay" else None
-    kw = {"manifest": manifest} if manifest is not None else {}
+    kw = {"manifest": manifest, "trust_directory": True} if manifest is not None else {}
     n = 1 << 16
     side = torch.cuda.Stream()
     x = torch.zeros(n, dtype=BF16, device="cuda")
@@ -550,9 +550,11 @@ def test_an_attacker_who_rewrites_the_cubin_and_every_digest_is_caught_only_by_a
     (tmp_path / "manifest.json").write_text(json.dumps(doc))
     with pytest.raises(TilefishManifestError, match="it is not the manifest that was pinned"):
         tilefish.run(softmax, x, mode="replay", manifest=tmp_path, pin=manifest.digest)
-    # without the pin the directory is trusted, as the documentation says: it replays the altered binary
+    # trust_directory=True is the explicit statement that whatever the directory holds is fine: it replays the altered binary
     runtime.clear_caches()
-    tilefish.run(softmax, x, mode="replay", manifest=tmp_path)
+    tilefish.run(softmax, x, mode="replay", manifest=tmp_path, trust_directory=True)
+    with pytest.raises(TilefishRuntimeError, match="replay needs a trust anchor"):  # and neither is a default
+        tilefish.run(softmax, x, mode="replay", manifest=tmp_path)
 
 
 def test_a_declared_constraint_is_checked_before_a_binary_is_chosen():
@@ -660,7 +662,7 @@ def test_an_edit_in_a_module_the_kernel_reaches_is_not_replayed_stale_with_or_wi
     hkp.load()
     old = hk_expected(x, {})
     manifest = runtime.export(hk, tmp_path / "m")
-    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=manifest.directory), old)
+    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=manifest.directory, trust_directory=True), old)
     assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=manifest.digest), old)
     assert torch.equal(tilefish.run(hk, x, mode="jit"), old)
     entry = manifest.get("hk", ARCH).entry
@@ -672,15 +674,15 @@ def test_an_edit_in_a_module_the_kernel_reaches_is_not_replayed_stale_with_or_wi
     hkp.load()
     new_digest = _source.source_digest(sys.modules["hk_kernel"].hk_kernel)
     assert new_digest != entry["source_digest"]
-    for pin in (None, manifest.digest):  # refused with and without the pin of the old manifest
+    for anchor in ({"trust_directory": True}, {"pin": manifest.digest}):  # refused under either trust anchor
         with pytest.raises(TilefishManifestError) as e:
-            tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=pin)
+            tilefish.run(hk, x, mode="replay", manifest=manifest.directory, **anchor)
         assert entry["source_digest"] in str(e.value) and new_digest in str(e.value) and "stale" in str(e.value) and "export it again" in str(e.value)
     assert torch.equal(tilefish.run(hk, x, mode="jit"), new)  # not the old binary, from the build cache or from Triton's disk cache
     again = runtime.export(hk, tmp_path / "m", overwrite=True)
     assert again.digest != manifest.digest and again.get("hk", ARCH).entry["source_digest"] == new_digest
     assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=again.directory, pin=again.digest), new)
-    assert same_bytes(tilefish.run(hk, x, mode="replay", manifest=again.directory), tilefish.run(hk, x, mode="jit"))
+    assert same_bytes(tilefish.run(hk, x, mode="replay", manifest=again.directory, trust_directory=True), tilefish.run(hk, x, mode="jit"))
 
 
 def test_the_old_exports_binary_is_not_what_a_new_export_of_the_edited_kernel_writes(hkp, tmp_path):
@@ -695,7 +697,7 @@ def test_the_old_exports_binary_is_not_what_a_new_export_of_the_edited_kernel_wr
 
 
 def test_a_file_edited_after_the_process_imported_it_is_not_built(hkp, tmp_path):
-    """The digest is of the files on disk, so a build refuses a function the process holds in an older version."""
+    """The digest is of the files on disk and Triton compiles what the process holds: a module edited and not reloaded is refused."""
     x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
     hkp.write()
     hkp.load()
@@ -703,20 +705,71 @@ def test_a_file_edited_after_the_process_imported_it_is_not_built(hkp, tmp_path)
     source = hkp.directory / "hk_kernel.py"
     source.write_text(source.read_text().replace("* hk_cfg.SCALE", "* hk_cfg.SCALE * 1.0"))  # edited, not reloaded
     runtime.clear_caches()
-    with pytest.raises(TilefishBuildError, match=r"'hk_kernel' was imported from an older version of '.*hk_kernel.py'.*Restart the process, or reload"):
+    with pytest.raises(TilefishBuildError, match=r"module 'hk_kernel' changed on disk since it was imported .*hk_kernel.py.*reload it or restart"):
         runtime.export(hk, tmp_path / "again", overwrite=True)
-    with pytest.raises(TilefishBuildError, match="older version"):
+    with pytest.raises(TilefishBuildError, match="module 'hk_kernel' changed on disk"):
         tilefish.run(hk, x, mode="jit")
     hkp.load()  # reloaded: fine
     assert torch.equal(tilefish.run(hk, x, mode="jit"), hk_expected(x, {}))
     helper = hkp.directory / "hk_helper_a.py"
-    helper.write_text(helper.read_text() + "\n")  # a helper's function is checked too: appending changes no line of it ...
+    helper.write_text(helper.read_text() + "\n")  # a helper that is edited is checked too, also by an edit that changes no line of a function
     runtime.clear_caches()
-    assert torch.equal(tilefish.run(hk, x, mode="jit"), hk_expected(x, {}))
-    helper.write_text("# moved\n" + helper.read_text())  # ... but a line above it moves it
-    runtime.clear_caches()
-    with pytest.raises(TilefishBuildError, match=r"'apply' was imported from an older version"):
+    with pytest.raises(TilefishBuildError, match="module 'hk_helper_a' changed on disk since it was imported"):
         tilefish.run(hk, x, mode="jit")
+    helper.write_text("# moved\n" + helper.read_text())  # ... and one that moves it
+    with pytest.raises(TilefishBuildError, match="module 'hk_helper_a' changed on disk since it was imported"):
+        tilefish.run(hk, x, mode="jit")
+
+
+def test_a_constant_two_levels_away_that_was_edited_and_not_reloaded_is_refused_not_stamped(hkp, tmp_path):
+    """The scenario of the issue: ``export`` would compile the old OFFSET and stamp the digest of the file that has the new one,
+    and a fresh process would replay the old binary without an error."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    hkp.write()
+    hkp.load()
+    old = hk_expected(x, {})
+    (hkp.directory / "hk_helper_b.py").write_text((hkp.directory / "hk_helper_b.py").read_text().replace("tl.constexpr(0.0)", "tl.constexpr(1.0)"))
+    runtime.clear_caches()
+    for attempt in (lambda: runtime.export(hk, tmp_path / "m"), lambda: tilefish.run(hk, x, mode="jit")):
+        with pytest.raises(TilefishBuildError, match=r"module 'hk_helper_b' changed on disk since it was imported .*reload it or restart"):
+            attempt()
+    assert not (tmp_path / "m" / "manifest.json").exists()  # nothing was written
+    hkp.load()  # reloaded: the process holds the file, so the export is of what is on disk, and says so
+    exported = runtime.export(hk, tmp_path / "m")
+    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=exported.directory, pin=exported.digest), hk_expected(x, {"OFFSET": "1.0"}))
+    assert not torch.equal(old, hk_expected(x, {"OFFSET": "1.0"}))
+
+
+def test_a_replay_is_refused_for_a_module_edited_and_not_reloaded(hkp, tmp_path):
+    """The binary may be the one of the file on disk, and the process holds another version: whichever, it is not told apart silently."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    hkp.write()
+    hkp.load()
+    manifest = runtime.export(hk, tmp_path / "m")
+    assert torch.equal(tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=manifest.digest), hk_expected(x, {}))
+    (hkp.directory / "hk_cfg.py").write_text((hkp.directory / "hk_cfg.py").read_text().replace("tl.constexpr(2.0)", "tl.constexpr(3.0)"))
+    for anchor in ({"pin": manifest.digest}, {"trust_directory": True}):
+        with pytest.raises(TilefishRuntimeError, match=r"module 'hk_cfg' changed on disk since it was imported .*reload it or restart"):
+            tilefish.run(hk, x, mode="replay", manifest=manifest.directory, **anchor)
+    hkp.load()  # reloaded: now it is the ordinary refusal of a stale binary
+    with pytest.raises(TilefishManifestError, match="stale"):
+        tilefish.run(hk, x, mode="replay", manifest=manifest.directory, pin=manifest.digest)
+
+
+def test_a_constexpr_assigned_to_a_module_at_run_time_is_refused(hkp, tmp_path):
+    """A kernel's inputs come from source files: a value assigned to ``hk_cfg.SCALE`` after the import would be compiled in
+    while the digest, the cache and the manifest describe the file."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    hkp.write()
+    hkp.load()
+    sys.modules["hk_cfg"].SCALE = triton.language.constexpr(5.0)
+    runtime.clear_caches()
+    with pytest.raises(TilefishBuildError, match=r"module attribute 'hk_cfg.SCALE', which the Triton function 'hk_kernel' reads, was assigned"):
+        tilefish.run(hk, x, mode="jit")
+    with pytest.raises(TilefishBuildError, match="was assigned after 'hk_cfg' was imported"):
+        runtime.export(hk, tmp_path / "m")
+    hkp.load()
+    assert torch.equal(tilefish.run(hk, x, mode="jit"), hk_expected(x, {}))
 
 
 # -- H2: build() stamps a source digest on what it compiled ---------------------------------------------------------------------------------------
@@ -769,7 +822,7 @@ def test_a_generated_file_edited_after_it_was_imported_is_not_built(tmp_path, mo
     low_new.write(src)  # the file is overwritten with the new one, the process keeps the old function
     linecache.clearcache()
     (spec,) = low_new.specs()
-    with pytest.raises(TilefishBuildError, match=r"was imported from an older version of .*Restart the process, or reload"):
+    with pytest.raises(TilefishBuildError, match=r"module '.*' changed on disk since it was imported .*reload it or restart"):
         build(spec, arch=ARCH, fn=getattr(imported, low_new.fn_name))
 
 
@@ -831,11 +884,11 @@ def test_every_build_compiles_from_scratch_and_puts_the_knob_back(monkeypatch):
 
     monkeypatch.setattr(triton, "compile", spy)
     assert knob.always_compile is False
-    build(spec, arch=ARCH, fn=fn)
+    build(spec, arch=ARCH, fn=fn, cache=False)
     assert seen == [True] and knob.always_compile is False
     knob.always_compile = True  # a caller that set it itself finds it as it was
     try:
-        build(spec, arch=ARCH, fn=fn)
+        build(spec, arch=ARCH, fn=fn, cache=False)
         assert seen == [True, True] and knob.always_compile is True
     finally:
         knob.always_compile = False
@@ -846,7 +899,7 @@ def test_every_build_compiles_from_scratch_and_puts_the_knob_back(monkeypatch):
 
     monkeypatch.setattr(triton, "compile", boom)
     with pytest.raises(TilefishBuildError, match="compiler exploded"):
-        build(spec, arch=ARCH, fn=fn)
+        build(spec, arch=ARCH, fn=fn, cache=False)
     assert seen[-1] is True and knob.always_compile is False  # restored when the compile fails too
 
 
@@ -856,12 +909,12 @@ def test_a_build_does_not_reuse_the_binary_in_triton_s_disk_cache(monkeypatch, t
     low = softmax.lower()
     (spec,) = low.specs()
     fn = runtime.load_lowered(low)
-    first = build(spec, arch=ARCH, fn=fn)
+    first = build(spec, arch=ARCH, fn=fn, cache=False)
     cached = list((tmp_path / "cache").rglob("*.cubin"))
     assert cached  # Triton wrote it
     for p in cached:
         p.write_bytes(b"not a cubin: poisoned")  # what a stale or damaged entry looks like
-    second = build(spec, arch=ARCH, fn=fn)  # a cache hit would hand back the poisoned file
+    second = build(spec, arch=ARCH, fn=fn, cache=False)  # a cache hit would hand back the poisoned file
     assert second.sha256_code == first.sha256_code and second.cubin[:4] == b"\x7fELF"
 
 

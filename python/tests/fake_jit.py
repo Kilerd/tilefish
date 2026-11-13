@@ -14,6 +14,11 @@ class FakeJit:
         self.__globals__ = fn.__globals__
         self.__module__ = fn.__module__
         self.__name__ = fn.__name__
+        self.arg_names = list(inspect.signature(fn).parameters)
+
+    def __call__(self, *args):
+        """Running the function is what a fake "compile" does to see the values the process holds (a real one is not called)."""
+        return self.fn(*args)
 
 
 def jit(fn):
