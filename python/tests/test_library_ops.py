@@ -115,17 +115,24 @@ def _k_1020(a: Tensor[M, 1020, bf16], b: Tensor[2048, 1020, bf16]) -> Tensor[M, 
 def _n_2044(a: Tensor[M, 1024, bf16], b: Tensor[2044, 1024, bf16]) -> Tensor[M, 2044, bf16]: ...
 
 
-def test_every_dimension_is_static_or_bucketed_and_the_rows_start_on_16_bytes():
+def _k_9(a: Tensor[M, 9, bf16], b: Tensor[480, 9, bf16], bias: Tensor[480, bf16]) -> Tensor[M, 480, bf16]: ...
+
+
+def test_every_dimension_is_static_or_bucketed_and_n_and_k_may_be_any_size():
     free = Dim("free")
 
     def f(a: Tensor[free, 1024, bf16], b: Tensor[2048, 1024, bf16]) -> Tensor[free, 2048, bf16]: ...
 
     with pytest.raises(TilefishDeclarationError, match="depends on the dynamic dimension free without buckets"):
         declare(f)
-    with pytest.raises(TilefishDeclarationError, match=r"K = 1020 must be a multiple of 8"):
-        declare(_k_1020)
-    with pytest.raises(TilefishDeclarationError, match=r"N = 2044 must be a multiple of 8"):
-        declare(_n_2044)
+    # rows that do not start on 16 bytes: the library says which algorithms can take those leading dimensions (cublasLtMatmulAlgoCheck)
+    k = library_specs(declare(_k_1020))[0]
+    assert (k.k, k.entry(SMS)["lda"], k.entry(SMS)["ldb"]) == (1020, 1020, 1020)
+    n = library_specs(declare(_n_2044))[0]
+    assert (n.n, n.entry(SMS)["ldc"], n.entry(SMS)["ldd"]) == (2044, 2044, 2044)
+    nine = library_specs(declare(_k_9, "cublaslt.gemm_bias"))[1]
+    assert (nine.m, nine.n, nine.k) == (64, 480, 9)
+    validate_entry(built(nine).entry())
     with pytest.raises(TilefishDeclarationError, match="workspace_bytes must be an int from 1"):
         declare(_two_args, workspace_bytes=0)
     with pytest.raises(TilefishDeclarationError, match="accumulates in f32"):
@@ -339,11 +346,16 @@ def test_pinning_asks_the_device_of_the_architecture(monkeypatch):
     monkeypatch.setattr(_library, "_device_index", lambda i: 0)
     monkeypatch.setattr(_library, "_capability", lambda i: 90)
     monkeypatch.setattr(_cublaslt, "pin_algo", lambda *a, **kw: (calls.append((a, kw)) or FakePinned()))
+    monkeypatch.setattr(_cublaslt, "check_algo", lambda *a, **kw: calls.append(("check", a, kw)) or 0)
     monkeypatch.setattr(_cublaslt, "version", lambda: VERSION)
     monkeypatch.setattr(_library, "sm_count", lambda i: 132)
     got = build_library(spec, arch="sm_90")
     assert got.algo == ALGO and got.arch == "sm_90" and got.cublaslt_version == VERSION and got.sm_count == 132 and got.entry()["sm_count"] == 132
-    assert calls == [((32, 2048, 1024, False), {"workspace_bytes": 8_519_680, "device_index": 0})]
+    assert calls == [
+        ((32, 2048, 1024, False), {"workspace_bytes": 8_519_680, "device_index": 0, "heuristic": "tilefish", "allow_bf16_reduction": False}),
+        # the pin passes the checks of a run before it is recorded
+        ("check", (32, 2048, 1024, False, ALGO), {"workspace_bytes": 8_519_680, "device_index": 0, "allow_bf16_reduction": False}),
+    ]
     with pytest.raises(tilefish.TilefishBuildError, match="cannot pin 'gemm.M32' for sm_103: cuBLASLt chooses an algorithm for the device it runs on, and device 0 is sm_90"):
         build_library(spec, arch="sm_103")
 

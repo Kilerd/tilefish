@@ -8,15 +8,23 @@ and for ``"cublaslt.gemm_bias"`` it has a third parameter ``bias: Tensor[N, bf16
 
 with an f32 accumulator and **one** rounding, to bf16, at the end; the bias goes through ``CUBLASLT_EPILOGUE_BIAS``, so it is added in
 f32 to the accumulator before that rounding. Every operand is contiguous with a 16-byte aligned pointer (a strided operand is not
-supported in this version: pass ``.contiguous()``); ``K`` and ``N`` are multiples of 8, so every row starts on 16 bytes.
+supported in this version: pass ``.contiguous()``). ``K`` and ``N`` may be any size: when a row of ``k`` or ``n`` bf16 elements does not start on
+16 bytes (``K`` or ``N`` not a multiple of 8), an algorithm that needs aligned rows is not valid for the problem, which
+``cublasLtMatmulAlgoCheck`` says (it sees the leading dimensions) when the algorithm is pinned and before every run.
 
 **A binary is a pinned algorithm.** For every ``(M, N, K, bias)`` (``M``, ``N`` and ``K`` are static or bucketed: one entry per bucket
-combination, like a kernel) the heuristic of cuBLASLt is asked, with a fixed workspace limit (``workspace_bytes``, by default
-8 519 680, torch's default ``CUBLAS_WORKSPACE_CONFIG``), for its best algorithm; result 0 is the pin, the 64 bytes of its
-``cublasLtMatmulAlgo_t`` written as 128 lowercase hex digits. A manifest records it in its ``library`` section (see
-``docs/manifest-schema-3.md``) with the cuBLASLt version that chose it, and ``jit`` pins in memory the same way, so ``jit`` and
-``replay`` run the same algorithm by construction. ``replay`` refuses a cuBLASLt of another version (an algorithm id means other
-kernels there) and an entry that is not what the declaration asks for.
+combination, like a kernel) the heuristic of cuBLASLt is asked, with a fixed workspace limit (``workspace_bytes``), for its best
+algorithm; result 0 is the pin, the 64 bytes of its ``cublasLtMatmulAlgo_t`` written as 128 lowercase hex digits. A manifest records it
+in its ``library`` section (see ``docs/manifest-schema-3.md``) with the cuBLASLt version that chose it, and ``jit`` pins in memory the same
+way, so ``jit`` and ``replay`` run the same algorithm by construction. ``replay`` refuses a cuBLASLt of another version (an algorithm id
+means other kernels there) and an entry that is not what the declaration asks for.
+
+How the heuristic is asked is the declaration's ``heuristic=`` (:mod:`tilefish._cublaslt`): ``"tilefish"`` (the default; workspace limit
+8 519 680, torch's default ``CUBLAS_WORKSPACE_CONFIG``, and 16-byte alignment minimums) or ``"torch"`` (what torch's ``addmm`` asks: one
+result under the workspace limit alone; the limit is 1 048 576 for ``gemm_bias``, torch's default ``CUBLASLT_WORKSPACE_SIZE``, and
+8 519 680 for ``gemm``, the workspace of the ``cublasGemmEx`` that ``torch.mm`` runs). Split-K adds its partial sums in f32 unless the
+declaration says ``allow_bf16_reduction=True``. And ``algos=`` (:class:`AlgoTable`, one per device) imports the algorithms instead: on a
+device a table is for, the heuristic is not asked, and each entry runs the algorithm the table gives for its ``(M, N, K, bias)``.
 
 Nothing here imports torch or loads cuBLASLt until a build or a run needs them (:mod:`tilefish._cublaslt`).
 """
@@ -32,7 +40,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import _specvalid as sv
 from .dims import Dim, DimExpr
-from .errors import TilefishDeclarationError, TilefishManifestError, TilefishSpecError
+from .errors import TilefishDeclarationError, TilefishManifestError, TilefishRuntimeError, TilefishSpecError
 
 if TYPE_CHECKING:
     from .decorators import LibraryOp
@@ -42,6 +50,8 @@ IMPL_GEMM = "cublaslt.gemm"
 IMPL_GEMM_BIAS = "cublaslt.gemm_bias"
 IMPLS = {IMPL_GEMM: False, IMPL_GEMM_BIAS: True}  # impl -> whether it has a bias
 DEFAULT_WORKSPACE_BYTES = 8_519_680  # torch's default CUBLAS_WORKSPACE_CONFIG (":4096:2:16:8": 4096 KiB * 2 + 16 KiB * 8)
+TORCH_LT_WORKSPACE_BYTES = 1_048_576  # torch's default CUBLASLT_WORKSPACE_SIZE (1024 KiB): the limit its addmm asks the heuristic under
+HEURISTICS = ("tilefish", "torch")
 MAX_WORKSPACE_BYTES = 1 << 40
 ALIGNMENT = 16
 DIGEST_FORMAT = 2  # of the canonical declaration below (2: the digest of an entry covers the SM count of its device)
@@ -57,13 +67,126 @@ ENTRY_KEYS = (
     "stem op arch impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd "
     "epilogue workspace_bytes algo cublaslt_version sm_count declaration_digest"
 ).split()
+# Fields an entry has only when its declaration is not the default, each with the one value it may then have (absent: the default, so an entry
+# of a default declaration is what tilefish 0.0.4 wrote): the heuristic posture, an imported algorithm, the opt-in to bf16 split-K partial sums.
+OPTIONAL_ENTRY_FIELDS = {"heuristic": "torch", "algo_source": "imported", "allow_bf16_reduction": True}
 
 
 def has_bias(impl: str) -> bool:
     return IMPLS[impl]
 
 
+def default_workspace_bytes(impl: str, heuristic: str) -> int:
+    """The workspace limit of a declaration that gives none: torch's ``addmm`` limit for a biased GEMM under the ``"torch"`` posture, torch's
+    cuBLAS workspace otherwise."""
+    return TORCH_LT_WORKSPACE_BYTES if heuristic == "torch" and IMPLS[impl] else DEFAULT_WORKSPACE_BYTES
+
+
+# -- imported algorithms ----------------------------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class AlgoTable:
+    """cuBLASLt algorithms to pin instead of asking the heuristic, for one device: an architecture (``"sm_120"``), the SM count of the device
+    (``CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT``: a MIG slice has its own) and the ``cublasLtGetVersion()`` they belong to.
+
+    ``algos`` maps ``(m, n, k, bias)`` (tilefish's sizes, ``a [m, k]``, ``b [n, k]``, and whether the GEMM has a bias) to an algorithm: a dict
+    of its nine configuration attributes (``id``, ``tile_id``, ``splitk_num``, ``reduction_scheme``, ``cta_swizzling``, ``custom_option``,
+    ``stages_id``, ``inner_shape_id``, ``cluster_shape_id``: what ``cublasLtMatmulAlgoConfigGetAttribute`` reads back, and what
+    ``tilefish._cublaslt.algo_info`` returns), which is encoded as cuBLASLt itself encodes it, or the 128 hex digits of a pin. A declaration
+    with ``algos=`` runs, on a device a table is for, the table's algorithm for each of its entries, after the same checks as a pin of the
+    heuristic (the bytes are what cuBLASLt encodes, the capabilities of the id, ``cublasLtMatmulAlgoCheck`` for the problem, the workspace limit,
+    and a bf16 split-K reduction only with ``allow_bf16_reduction=True``); it is recorded in the entry as ``"algo_source": "imported"``.
+    Rows for other shapes are allowed (one table can serve several declarations) and do not reach a declaration's digest."""
+
+    arch: str
+    sm_count: int
+    cublaslt_version: int
+    algos: "dict[tuple[int, int, int, bool], Any]"
+
+    def __post_init__(self) -> None:
+        from . import _cublaslt
+
+        where = "AlgoTable"
+        if not isinstance(self.arch, str) or not _ARCH.match(self.arch):
+            raise TilefishDeclarationError(f"{where}: arch must look like 'sm_120', got {self.arch!r}")
+        for name in ("sm_count", "cublaslt_version"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise TilefishDeclarationError(f"{where}: {name} must be a positive int, got {v!r}")
+        if not isinstance(self.algos, dict) or not self.algos:
+            raise TilefishDeclarationError(f"{where}: algos must be a non-empty dict of (m, n, k, bias) -> algorithm, got {self.algos!r}")
+        rows: "dict[tuple[int, int, int, bool], Any]" = {}
+        for key, algo in self.algos.items():
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 4
+                or any(isinstance(x, bool) or not isinstance(x, int) or not 1 <= x <= _cublaslt.INT32_MAX for x in key[:3])
+                or not isinstance(key[3], bool)
+            ):
+                raise TilefishDeclarationError(f"{where}: a key is (m, n, k, bias), three ints from 1 to 2**31 - 1 and a bool, got {key!r}")
+            what = f"{where} ({self.arch}, {self.sm_count} SMs) algorithm for {key}"
+            try:
+                if isinstance(algo, str):
+                    _cublaslt.algo_from_hex(algo)  # 128 lowercase hex digits
+                    rows[key] = algo
+                else:
+                    rows[key] = _cublaslt.check_config(algo, what)
+            except TilefishRuntimeError as e:  # the binding's pure checks; about a declaration here
+                raise TilefishDeclarationError(str(e)) from None
+        object.__setattr__(self, "algos", rows)
+
+    @property
+    def device(self) -> "tuple[str, int, int]":
+        return (self.arch, self.sm_count, self.cublaslt_version)
+
+    def canonical(self, keys: "list[tuple[int, int, int, bool]]") -> "dict[str, Any]":
+        """The table restricted to ``keys``, as canonical JSON-able data (what a declaration's digest covers)."""
+        return {
+            "arch": self.arch,
+            "sm_count": self.sm_count,
+            "cublaslt_version": self.cublaslt_version,
+            "algos": [[m, n, k, bias, self.algos[(m, n, k, bias)]] for (m, n, k, bias) in sorted(keys)],
+        }
+
+    def __repr__(self) -> str:
+        return f"AlgoTable({self.arch!r}, sm_count={self.sm_count}, cublaslt_version={self.cublaslt_version}, {len(self.algos)} algorithms)"
+
+
+def _check_tables(where: str, algos: Any) -> "tuple[AlgoTable, ...]":
+    tables = (algos,) if isinstance(algos, AlgoTable) else algos
+    if not isinstance(tables, (list, tuple)) or not tables or any(not isinstance(t, AlgoTable) for t in tables):
+        raise TilefishDeclarationError(f"{where}: algos must be an AlgoTable or a non-empty list of them, got {algos!r}")
+    seen: "set[tuple[str, int, int]]" = set()
+    for t in tables:
+        if t.device in seen:
+            raise TilefishDeclarationError(
+                f"{where}: two algorithm tables are for {t.arch} with {t.sm_count} SMs and cuBLASLt {t.cublaslt_version}; give one per device"
+            )
+        seen.add(t.device)
+    return tuple(tables)
+
+
+def table_for(tables: "tuple[AlgoTable, ...]", arch: str, sm_count: int, version: int) -> "AlgoTable | None":
+    """The table of ``tables`` for a device of ``arch`` with ``sm_count`` SMs and cuBLASLt ``version``, or ``None``."""
+    for t in tables:
+        if t.device == (arch, sm_count, version):
+            return t
+    return None
+
+
 # -- the declaration -------------------------------------------------------------------------------------------------------
+
+
+def check_options(name: str, heuristic: Any, allow_bf16_reduction: Any, algos: Any) -> "tuple[AlgoTable, ...] | None":
+    """Check the options of a ``@library(impl=...)`` declaration that say how its algorithms are chosen (the posture, the opt-in to bf16 split-K
+    partial sums, the imported tables); return the tables (``None`` without). Raises a ``TilefishDeclarationError``."""
+    where = f"library op '{name}'"
+    if heuristic not in HEURISTICS:
+        raise TilefishDeclarationError(f"{where}: heuristic must be one of {list(HEURISTICS)}, got {heuristic!r}")
+    if not isinstance(allow_bf16_reduction, bool):
+        raise TilefishDeclarationError(f"{where}: allow_bf16_reduction must be a bool, got {allow_bf16_reduction!r}")
+    return None if algos is None else _check_tables(where, algos)
 
 
 def check_declaration(name: str, impl: Any, sig: "Signature", acc: Any, workspace_bytes: Any) -> None:
@@ -105,23 +228,49 @@ def check_declaration(name: str, impl: Any, sig: "Signature", acc: Any, workspac
                 f"{where}: {label} = {d} depends on the dynamic dimension {', '.join(loose)} without buckets; a pinned algorithm is for "
                 "one size, so give it Dim(name, buckets=[...]) or a static value"
             )
-    for label, d in (("N", n), ("K", k)):  # every row of a, b and the result starts on 16 bytes
-        if not _multiple_of_8(d):
+    # N and K may be any size: the leading dimensions (k and n) are the library's to judge for an algorithm (cublasLtMatmulAlgoCheck, at the pin
+    # and before every run), and every pointer is still 16-byte aligned, which is more than any algorithm tilefish pins needs (the check of
+    # its bytes refuses one that needs more)
+
+
+def check_coverage(op: "LibraryOp") -> None:
+    """Every table of a declaration with ``algos=`` has an algorithm for every ``(m, n, k, bias)`` the declaration has an entry for (one per
+    bucket combination): a table is for a device, and on that device every entry runs one of its algorithms."""
+    tables = getattr(op, "algos", None)
+    if not tables:
+        return
+    keys = _problem_keys(op)
+    for t in tables:
+        missing = [key for key in keys if key not in t.algos]
+        if missing:
             raise TilefishDeclarationError(
-                f"{where}: {label} = {d} must be a multiple of 8 (bf16 rows start on 16 bytes); give it divisible_by=8, buckets that are "
-                "multiples of 8, or a static size that is"
+                f"library op '{op.name}': the algorithm table for {t.arch} with {t.sm_count} SMs (cuBLASLt {t.cublaslt_version}) has no algorithm for "
+                f"(m, n, k, bias) = {', '.join(map(str, missing[:4]))}{' ...' if len(missing) > 4 else ''}: a table gives one for every entry of the declaration"
             )
 
 
-def _multiple_of_8(d: DimExpr) -> bool:
-    """Whether a dimension is a multiple of 8 for every bucket of the dimensions it mentions (all of them have buckets, or it is static)."""
-    if d.is_divisible_by(8):
-        return True
-    free = sorted(d.free_dims(), key=lambda f: f.name)
-    return all(d.subst(dict(zip(free, combo))).value % 8 == 0 for combo in itertools.product(*(f.buckets for f in free)))  # type: ignore[arg-type]
+def _problem_keys(op: "LibraryOp") -> "list[tuple[int, int, int, bool]]":
+    """The ``(m, n, k, bias)`` of every entry of a library op (one per bucket combination), sorted, without repeats."""
+    sig = op.signature
+    m_expr, k_expr = sig.params[0].type.shape  # type: ignore[union-attr]
+    n_expr = sig.params[1].type.shape[0]  # type: ignore[union-attr]
+    free: "dict[str, Dim]" = {}
+    for d in (m_expr, n_expr, k_expr):
+        for f in d.free_dims():
+            free.setdefault(f.name, f)
+    dims = [free[name] for name in sorted(free)]
+    keys = set()
+    for combo in itertools.product(*(d.buckets for d in dims)) if dims else [()]:  # type: ignore[arg-type]
+        mapping = dict(zip(dims, combo))
+        m, n, k = (int(e.subst(mapping).folded().value) for e in (m_expr, n_expr, k_expr))
+        keys.add((m, n, k, IMPLS[op.impl]))  # type: ignore[index]
+    return sorted(keys)
 
 
 def _canonical(op: "LibraryOp") -> "dict[str, Any]":
+    """The canonical declaration the digests are taken over. The options a declaration has only when it is not the default (the posture
+    ``"torch"``, the opt-in to bf16 split-K partial sums, imported algorithms: the rows of each table that the declaration uses) are keys only
+    then, so the digest of a declaration without them is the one tilefish 0.0.4 computed."""
     from .aot import _canonical_dim
 
     sig = op.signature
@@ -130,7 +279,7 @@ def _canonical(op: "LibraryOp") -> "dict[str, Any]":
         t = p.type
         assert t is not None
         params.append({"name": p.name, "dtype": t.dtype.name, "shape": [_canonical_dim(d) for d in t.shape]})  # type: ignore[union-attr]
-    return {
+    out = {
         "format": DIGEST_FORMAT,
         "op": op.name,
         "impl": op.impl,
@@ -139,6 +288,15 @@ def _canonical(op: "LibraryOp") -> "dict[str, Any]":
         "params": params,
         "returns": [{"dtype": r.dtype.name, "shape": [_canonical_dim(d) for d in r.shape]} for r in sig.returns],  # type: ignore[union-attr]
     }
+    if getattr(op, "heuristic", "tilefish") != "tilefish":
+        out["heuristic"] = op.heuristic
+    if getattr(op, "allow_bf16_reduction", False):
+        out["allow_bf16_reduction"] = True
+    tables = getattr(op, "algos", None)
+    if tables:
+        keys = _problem_keys(op)
+        out["algos"] = sorted((t.canonical(keys) for t in tables), key=lambda c: (c["arch"], c["sm_count"], c["cublaslt_version"]))
+    return out
 
 
 def _digest(canonical: "dict[str, Any]") -> str:
@@ -178,10 +336,18 @@ class LibrarySpec:
     preconditions: "tuple[Any, ...]"  # tilefish.aot.Precondition: pointer_alignment, static_size, bucket
     declaration_digest: str
     canonical: "dict[str, Any]"  # the canonical declaration (_canonical) the digests are taken over
+    heuristic: str = "tilefish"  # the posture the heuristic is asked under (tilefish._cublaslt.HEURISTICS)
+    allow_bf16_reduction: bool = False  # whether split-K may add its partial sums in bf16
+    algos: "tuple[AlgoTable, ...] | None" = None  # imported algorithms, one table per device
 
     @property
     def bias(self) -> bool:
         return IMPLS[self.impl]
+
+    @property
+    def key(self) -> "tuple[int, int, int, bool]":
+        """The ``(m, n, k, bias)`` of the problem: what an :class:`AlgoTable` is indexed by."""
+        return (self.m, self.n, self.k, self.bias)
 
     def pinned_digest(self, sm_count: int) -> str:
         """The ``declaration_digest`` of an entry of this spec pinned on a device of ``sm_count`` multiprocessors."""
@@ -215,7 +381,19 @@ class LibrarySpec:
             "workspace_bytes": self.workspace_bytes,
             "sm_count": sm_count,
             "declaration_digest": self.pinned_digest(sm_count),
+            **self.options(),
         }
+
+    def options(self) -> "dict[str, Any]":
+        """The optional fields of an entry (:data:`OPTIONAL_ENTRY_FIELDS`) this declaration has: only those that are not the default."""
+        out: "dict[str, Any]" = {}
+        if self.heuristic != "tilefish":
+            out["heuristic"] = self.heuristic
+        if self.algos:
+            out["algo_source"] = "imported"
+        if self.allow_bf16_reduction:
+            out["allow_bf16_reduction"] = True
+        return out
 
 
 def _shape_entry(d: DimExpr) -> "str | int":
@@ -294,6 +472,9 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
                 preconditions=tuple(pres),
                 declaration_digest=digest,
                 canonical=canonical,
+                heuristic=getattr(op, "heuristic", "tilefish"),
+                allow_bf16_reduction=getattr(op, "allow_bf16_reduction", False),
+                algos=getattr(op, "algos", None),
             )
         )
     return specs
@@ -332,7 +513,9 @@ class BuiltLibrary:
 
 
 def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | None" = None) -> BuiltLibrary:
-    """Pin the algorithm of ``spec`` for ``arch``: ask cuBLASLt's heuristic, with the spec's workspace limit, for its best algorithm.
+    """Pin the algorithm of ``spec`` for ``arch``: ask cuBLASLt's heuristic, under the spec's posture and workspace limit, for its best algorithm,
+    or, for a declaration with ``algos=``, take the algorithm its table for this device gives (refused when it has none for this device). Either
+    way the algorithm must pass the checks a run makes (``tilefish._cublaslt.check_algo``) before it is pinned.
 
     The heuristic is asked on a device of that architecture (a pin is per architecture), so the device must be one.
     """
@@ -347,8 +530,42 @@ def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | 
         raise TilefishBuildError(
             f"cannot pin '{spec.stem}' for sm_{cap}: cuBLASLt chooses an algorithm for the device it runs on, and device {index} is sm_{have}"
         )
-    pinned = _cublaslt.pin_algo(spec.m, spec.n, spec.k, spec.bias, workspace_bytes=spec.workspace_bytes, device_index=index)
-    return BuiltLibrary(spec, f"sm_{cap}", pinned.algo_hex, _cublaslt.version(), sm_count(index))
+    version, sms = _cublaslt.version(), sm_count(index)
+    if spec.algos:
+        algo = imported_algo(spec, f"sm_{cap}", sms, version, index)
+        if algo is None:
+            have_tables = ", ".join(f"{t.arch} with {t.sm_count} SMs and cuBLASLt {t.cublaslt_version}" for t in spec.algos)
+            raise TilefishBuildError(
+                f"cannot pin '{spec.stem}' on sm_{cap} with {sms} SMs and cuBLASLt {version}: its declaration imports its algorithms (algos=), "
+                f"and has a table only for {have_tables}; give one for this device, or declare it without algos= to ask the heuristic"
+            )
+    else:
+        algo = _cublaslt.pin_algo(
+            spec.m, spec.n, spec.k, spec.bias, workspace_bytes=spec.workspace_bytes, device_index=index, heuristic=spec.heuristic,
+            allow_bf16_reduction=spec.allow_bf16_reduction,
+        ).algo_hex  # fmt: skip
+    try:
+        _cublaslt.check_algo(
+            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index,
+            allow_bf16_reduction=spec.allow_bf16_reduction,
+        )  # fmt: skip
+    except TilefishRuntimeError as e:
+        source = "the imported" if spec.algos else "the heuristic's"
+        raise TilefishBuildError(f"cannot pin '{spec.stem}' on sm_{cap}: {source} algorithm is refused: {e}") from e
+    return BuiltLibrary(spec, f"sm_{cap}", algo, version, sms)
+
+
+def imported_algo(spec: LibrarySpec, arch: str, sms: int, version: int, device_index: "int | None") -> "str | None":
+    """The pin (128 hex digits) the tables of ``spec`` give its problem on a device of ``arch`` with ``sms`` SMs and cuBLASLt ``version`` (a
+    configuration is encoded by the library: ``tilefish._cublaslt.encode_algo``), or ``None`` when no table is for that device."""
+    from . import _cublaslt
+
+    assert spec.algos
+    table = table_for(spec.algos, arch, sms, version)
+    if table is None:
+        return None
+    algo = table.algos[spec.key]  # every key of the declaration is in every table (check_coverage)
+    return algo if isinstance(algo, str) else _cublaslt.encode_algo(algo, device_index=device_index)
 
 
 def _device_index(index: "int | None") -> int:
@@ -371,7 +588,7 @@ def sm_count(index: int) -> int:
     return int(torch.cuda.get_device_properties(index).multi_processor_count)
 
 
-def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str, sm_count: int) -> BuiltLibrary:
+def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str, sm_count: int, device_index: "int | None" = None) -> BuiltLibrary:
     """The pinned library operation of ``spec`` for a device of ``arch`` with ``sm_count`` multiprocessors, from a manifest: the entry must have
     been pinned on a device of that SM count, be what the declaration asks for, and cuBLASLt must be the version that chose its algorithm.
 
@@ -412,6 +629,14 @@ def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str, sm_count: i
             f"{here}: an algorithm id names other kernels in another version, so the pin is refused (export the manifest again with this "
             "cuBLASLt, or run with the version that made it)"
         )
+    if spec.algos:  # the digest covers the tables; this is the algorithm itself, against the table of this device
+        want = imported_algo(spec, arch, sm_count, pinned_by, device_index)
+        if want != entry["algo"]:
+            raise TilefishManifestError(
+                f"the library entry for '{spec.stem}' ({arch}) has the algorithm {entry['algo'][:16]}..., but the declaration imports "
+                + (f"{want[:16]}... for this device" if want else f"none for {arch} with {sm_count} SMs and cuBLASLt {pinned_by}")
+                + ": it is not what the declaration asks for"
+            )
     return BuiltLibrary(spec, arch, entry["algo"], pinned_by, pinned_on)
 
 
@@ -446,9 +671,17 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         _bad(where, f"is not an object: {entry!r}")
     where = f"#{index} ({entry.get('stem')!r})"
     missing = [k for k in ENTRY_KEYS if k not in entry]
-    unknown = sorted(str(k) for k in set(entry) - set(ENTRY_KEYS))
+    unknown = sorted(str(k) for k in set(entry) - set(ENTRY_KEYS) - set(OPTIONAL_ENTRY_FIELDS))
     if missing or unknown:
-        _bad(where, f"must have exactly the fields {ENTRY_KEYS}" + (f"; missing {missing}" if missing else "") + (f"; unknown {unknown}" if unknown else ""))
+        _bad(
+            where,
+            f"must have exactly the fields {ENTRY_KEYS} and may have {list(OPTIONAL_ENTRY_FIELDS)}"
+            + (f"; missing {missing}" if missing else "")
+            + (f"; unknown {unknown}" if unknown else ""),
+        )
+    for key, only in OPTIONAL_ENTRY_FIELDS.items():  # present only when not the default, and then with its one value (true is not 1)
+        if key in entry and (type(entry[key]) is not type(only) or entry[key] != only):
+            _bad(where, f"{key} is absent (the default) or {json.dumps(only)}, got {entry[key]!r}")
     try:
         stem = entry["stem"]
         if not isinstance(stem, str) or not sv._STEM.match(stem):
@@ -613,6 +846,7 @@ def run_gemm_ptrs(
         stream=stream,
         device_index=device_index,
         workspace_ptr=workspace_ptr,
+        allow_bf16_reduction=spec.allow_bf16_reduction,
     )
 
 
@@ -628,6 +862,7 @@ def reference_gemm(tensors: "dict[str, Any]") -> Any:
 
 
 __all__ = [
+    "AlgoTable",
     "BuiltLibrary",
     "IMPLS",
     "LibrarySpec",

@@ -30,6 +30,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **a dimension only an Out tensor determines** (``gpu_kernels_p4.py``): a ``[B]`` mask made from a device scalar, run with ``outputs=`` (which is what
   binds ``B``), bucketed and not; the plan ``mask_rows`` makes it in a step whose ``B`` is the graph's;
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
+  and (on a fresh export) how an algorithm is chosen (:func:`option_ops`): a ``gemm_bias`` under ``heuristic="torch"``, and one with ``algos=`` imported
+  for this device, whose split-K adds its partial sums in bf16 at one bucket in the output and at another in a workspace (``allow_bf16_reduction=True``),
+  and a ``gemm_bias`` whose ``K`` is 9 (rows that do not start on 16 bytes);
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
   exported and run through Python's plan replay; ``crates/tilefish/tests/gpu_plan_gate.rs`` launches and captures each case, and ``compare`` holds the
@@ -326,6 +329,62 @@ def build_cases():
     return cases
 
 
+OPTION_N, OPTION_K = 1024, 4096
+ODD_N, ODD_K = 480, 9  # a K whose rows do not start on 16 bytes
+OPTION_SHAPES = {"gemm_torch": (OPTION_N, OPTION_K), "gemm_imported": (OPTION_N, OPTION_K), "gemm_k9": (ODD_N, ODD_K)}
+
+
+def option_ops():
+    """``{name: library op}`` of the options of a GEMM declaration, for the device this runs on: ``gemm_torch`` (``heuristic="torch"``, torch's
+    reduction) and ``gemm_imported`` (``algos=``: the torch posture's algorithm with a split-K whose partial sums are bf16, OUTPUT_TYPE at M = 32
+    and INPLACE at M = 64, and the posture's own at M = 320; ``allow_bf16_reduction=True``). Empty when the library takes no such split-K here."""
+    from tilefish import Dim, Tensor, _cublaslt, bf16, f32
+
+    M = Dim("M", buckets=list(GEMM_M))
+    configs = {}
+    for m, scheme in zip(GEMM_M, (4, 1, None)):
+        base = _cublaslt.algo_info(
+            _cublaslt.pin_algo(m, OPTION_N, OPTION_K, True, heuristic="torch", allow_bf16_reduction=True, workspace_bytes=1 << 20).algo_hex
+        )
+        if scheme is None:
+            configs[(m, OPTION_N, OPTION_K, True)] = base
+            continue
+        for splitk in (2, 3, 4):
+            cfg = {**base, "splitk_num": splitk, "reduction_scheme": scheme}
+            try:
+                _cublaslt.check_algo(m, OPTION_N, OPTION_K, True, _cublaslt.encode_algo(cfg), workspace_bytes=1 << 20, allow_bf16_reduction=True)
+            except tilefish.TilefishRuntimeError:
+                continue
+            configs[(m, OPTION_N, OPTION_K, True)] = cfg
+            break
+        else:
+            return {}
+    major, minor = torch.cuda.get_device_capability()
+    table = tilefish.AlgoTable(f"sm_{major * 10 + minor}", torch.cuda.get_device_properties(0).multi_processor_count, _cublaslt.version(), configs)
+
+    def declare(name, n=OPTION_N, k=OPTION_K, **kw):
+        @tilefish.library(name, acc=f32, impl="cublaslt.gemm_bias", **kw)
+        def gemm_bias(a: Tensor[M, k, bf16], b: Tensor[n, k, bf16], bias: Tensor[n, bf16]) -> Tensor[M, n, bf16]: ...
+
+        return gemm_bias
+
+    return {
+        "gemm_torch": declare("gemm_torch", heuristic="torch", allow_bf16_reduction=True),
+        "gemm_imported": declare("gemm_imported", algos=table, allow_bf16_reduction=True, workspace_bytes=1 << 20),
+        "gemm_k9": declare("gemm_k9", ODD_N, ODD_K, heuristic="torch", allow_bf16_reduction=True),
+    }
+
+
+def option_cases(declared):
+    return [
+        Case(name, f"{name}.M{m}", f"seed{seed}", lambda spec=(m, *OPTION_SHAPES[name], True), seed=seed: operands(spec, seed), kind="gemm")
+        for name in OPTION_SHAPES
+        if name in declared
+        for m in GEMM_M
+        for seed in (0,)
+    ]
+
+
 def gemm_cases():
     return [
         Case(
@@ -400,6 +459,8 @@ def prepare(work, manifest_dir=None, pin=None):
         if committed.is_dir():
             shutil.copytree(committed, sources)
     declared = {**ops(), **gpu_ops(sources, cap, reuse=manifest_dir is not None), **library_ops()}
+    if manifest_dir is None:  # (a committed fixture has none of them)
+        declared.update(option_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -412,7 +473,7 @@ def prepare(work, manifest_dir=None, pin=None):
     # embedded: the generated module also carries the manifest and the cubins (include_bytes!), which the Rust test runs too
     rust.emit(manifest, work / "generated.rs", ops=all_ops, embed=True)
     cases, skipped, tensors_total = [], [], 0
-    for case in [*build_cases(), *gemm_cases()]:
+    for case in [*build_cases(), *gemm_cases(), *option_cases(declared)]:
         if manifest.get(case.stem, arch) is None and manifest.library_entry(case.stem, arch) is None:
             skipped.append(case.stem)
             continue

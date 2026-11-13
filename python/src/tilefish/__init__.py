@@ -29,6 +29,7 @@ axes; a graph materialises a view (:func:`contiguous`) and the patches of a conv
 
 from . import aot
 from . import ops as _ops
+from ._library import AlgoTable
 from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp, Op, extern, graph, kernel, library
 from .dims import Dim, DimExpr, cdiv
 from .dtypes import (
@@ -83,6 +84,7 @@ max = _ops.reduce_max  # noqa: A001
 # `sum` and `max` are deliberately not in __all__: `from tilefish import *` must not shadow
 # the builtins. They stay reachable as tilefish.sum and tilefish.max.
 __all__ = [
+    "AlgoTable",
     "BlockScaled",
     "BucketRequirement",
     "CapturedPlan",

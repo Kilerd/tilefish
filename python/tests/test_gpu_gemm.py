@@ -8,8 +8,9 @@ manifest with the cuBLASLt version. ``jit`` pins in memory the same way, so ``ji
 
 Checked here: ``jit`` and ``replay`` agree byte for byte; the pinned replay is byte-identical across two processes (and the pin itself is); the
 result is the f64 reference within what one f32 accumulation and one rounding can do; a cuBLASLt of another version is refused; the
-preconditions (contiguous, aligned, an exact bucket) are. How often the result is torch's byte for byte is *reported* (informational: it is not
-asserted).
+preconditions (contiguous, aligned, an exact bucket) are. How often the result of the default posture is torch's byte for byte is *reported*
+(informational: it is not asserted); a declaration with ``heuristic="torch"`` is torch's (asserted), and one with ``algos=`` runs its table's
+algorithms, a split-K with bf16 partial sums only with ``allow_bf16_reduction=True``, the same in ``jit`` and ``replay``.
 """
 
 import hashlib
@@ -284,3 +285,110 @@ def test_how_often_the_pinned_result_is_the_result_of_torch_byte_for_byte(ops, e
         for name, (same, total, ulp) in rows.items():
             print(f"\n[gemm torch match] {name}: {same} of {total} shapes byte-identical to torch" + (f" (largest bf16 distance {ulp} steps)" if same != total else ""))
     assert sum(r[1] for r in rows.values()) == len(ops) * len(BUCKETS)
+
+
+# -- the "torch" posture, imported algorithms and bf16 partial sums, through declarations ----------------------------------------------------
+
+OPT_N, OPT_K, OPT_BUCKETS = 1024, 4096, [32, 64]
+
+
+def make_option_gemm(name, **kw):
+    Mo = Dim("Mo", buckets=OPT_BUCKETS)
+
+    @tilefish.library(name, acc=f32, impl="cublaslt.gemm_bias", **kw)
+    def gemm_bias(a: Tensor[Mo, OPT_K, bf16], b: Tensor[OPT_N, OPT_K, bf16], bias: Tensor[OPT_N, bf16]) -> Tensor[Mo, OPT_N, bf16]: ...
+
+    return gemm_bias
+
+
+def _device_table(configs):
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return tilefish.AlgoTable(_arch_name(), props.multi_processor_count, _cublaslt.version(), configs)
+
+
+def _arch_name():
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm_{major * 10 + minor}"
+
+
+def _bf16_split_config(m):
+    """The torch posture's algorithm for ``(m, OPT_N, OPT_K)`` with a split-K whose partial sums are added in the output type (OUTPUT_TYPE), when the
+    library takes one on this device (else ``None``)."""
+    pin = _cublaslt.pin_algo(m, OPT_N, OPT_K, True, heuristic="torch", allow_bf16_reduction=True, workspace_bytes=1 << 20)
+    base = _cublaslt.algo_info(pin.algo_hex)
+    for splitk in (2, 3, 4):
+        cfg = {**base, "splitk_num": splitk, "reduction_scheme": 4}
+        try:
+            _cublaslt.check_algo(m, OPT_N, OPT_K, True, _cublaslt.encode_algo(cfg), workspace_bytes=1 << 20, allow_bf16_reduction=True)
+        except tilefish.TilefishRuntimeError:
+            continue
+        return cfg
+    return None
+
+
+def test_the_torch_posture_and_imported_algorithms_run_the_same_in_jit_and_replay(tmp_path):
+    """A declaration with ``heuristic="torch"`` and one with ``algos=`` (here: the torch posture's algorithm at one bucket, a split-K with bf16 partial
+    sums at the other, with the opt-in) are exported and replayed; replay is jit byte for byte, the entries say how their algorithms were chosen, and
+    the posture's result is torch's ``addmm``."""
+    split = _bf16_split_config(OPT_BUCKETS[1])
+    if split is None:
+        pytest.skip("cuBLASLt takes no split-K with bf16 partial sums for this problem on this device")
+    torch_op = make_option_gemm("gemm_torch", heuristic="torch", allow_bf16_reduction=True)
+    first = _cublaslt.algo_info(_cublaslt.pin_algo(OPT_BUCKETS[0], OPT_N, OPT_K, True, heuristic="torch", allow_bf16_reduction=True, workspace_bytes=1 << 20).algo_hex)
+    table = _device_table({(OPT_BUCKETS[0], OPT_N, OPT_K, True): first, (OPT_BUCKETS[1], OPT_N, OPT_K, True): split})
+    imported = make_option_gemm("gemm_imported", algos=table, allow_bf16_reduction=True, workspace_bytes=1 << 20)
+    manifest = runtime.export([torch_op, imported], tmp_path)
+    entries = {e["stem"]: e for e in manifest.library_entries}
+    assert entries["gemm_torch.Mo32"]["heuristic"] == "torch" and entries["gemm_torch.Mo32"]["workspace_bytes"] == 1 << 20
+    assert entries["gemm_imported.Mo64"]["algo_source"] == "imported" and entries["gemm_imported.Mo64"]["allow_bf16_reduction"] is True
+    assert entries["gemm_imported.Mo64"]["algo"] == _cublaslt.encode_algo(split)
+    assert entries["gemm_imported.Mo32"]["algo"] == entries["gemm_torch.Mo32"]["algo"]  # the posture's own algorithm, imported
+    for op in (torch_op, imported):
+        for m in OPT_BUCKETS:
+            args = operands(m, OPT_N, OPT_K, True, seed=m)
+            jit = tilefish.run(op, *args)
+            replay = tilefish.run(op, *args, mode="replay", manifest=tmp_path, pin=manifest.digest)
+            assert same_bytes(jit, replay), (op.name, m)
+            if op is torch_op:
+                assert same_bytes(jit, torch_result(args)), m
+    # the same split-K without the opt-in is refused when it is pinned, and a replay of the manifest by such a declaration is refused
+    strict = make_option_gemm("gemm_imported", algos=table, workspace_bytes=1 << 20)
+    with pytest.raises(tilefish.TilefishBuildError, match="the imported algorithm is refused: .*bf16"):
+        runtime.export([strict], tmp_path / "strict")
+    with pytest.raises(TilefishManifestError, match="first difference at"):
+        tilefish.run(strict, *operands(OPT_BUCKETS[1], OPT_N, OPT_K, True), mode="replay", manifest=tmp_path, pin=manifest.digest)
+
+
+# -- N and K of any size ---------------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n, k, bias", [(480, 9, True), (70, 18, False), (1000, 1001, True)])
+def test_n_and_k_of_any_size_pin_run_and_replay(n, k, bias, tmp_path):
+    """Rows that do not start on 16 bytes (``K`` or ``N`` not a multiple of 8): the library judges which algorithms take those leading dimensions,
+    the result is the f64 reference within one rounding (the default posture), and torch's under the torch posture; replay is jit."""
+    Mk = Dim("Mk", buckets=[32, 640])
+
+    def declare(name, **kw):
+        if bias:
+
+            @tilefish.library(name, acc=f32, impl="cublaslt.gemm_bias", **kw)
+            def g(a: Tensor[Mk, k, bf16], b: Tensor[n, k, bf16], bias: Tensor[n, bf16]) -> Tensor[Mk, n, bf16]: ...
+
+            return g
+
+        @tilefish.library(name, acc=f32, impl="cublaslt.gemm", **kw)
+        def h(a: Tensor[Mk, k, bf16], b: Tensor[n, k, bf16]) -> Tensor[Mk, n, bf16]: ...
+
+        return h
+
+    plain, like_torch = declare("odd"), declare("odd_torch", heuristic="torch", allow_bf16_reduction=True)
+    manifest = runtime.export([plain, like_torch], tmp_path)
+    for m in (32, 640):
+        args = operands(m, n, k, bias, seed=k)
+        jit = tilefish.run(plain, *args)
+        assert same_bytes(jit, tilefish.run(plain, *args, mode="replay", manifest=tmp_path, pin=manifest.digest))
+        a, b_, *rest = args
+        exact = a.double() @ b_.double().t() + (rest[0].double() if rest else 0)
+        assert (jit.double() - exact).abs().max() <= 2**-8 * exact.abs().max() * 1.01, (m, n, k, bias)
+        theirs = tilefish.run(like_torch, *args, mode="replay", manifest=tmp_path, pin=manifest.digest)
+        assert same_bytes(theirs, torch_result(args)), (m, n, k, bias)

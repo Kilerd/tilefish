@@ -224,7 +224,7 @@ class RecordingLib:
         self.seen = {}
         self.next_handle = 100
 
-    def call(self, name, *args):
+    def call(self, name, *args, allow=()):
         self.seen[name] = self.seen.get(name, 0) + 1
         if self.fail_on == (name, self.seen[name]):
             raise TilefishRuntimeError(f"cuBLASLt call {name} failed: pretend")
@@ -242,7 +242,7 @@ class RecordingLib:
 
 def test_the_problem_is_a_tn_gemm_with_the_layouts_of_the_translation():
     lib = RecordingLib()
-    with L._Problem(lib, 64, 3072, 1024, True, 0x1000, 8_519_680):
+    with L._Problem(lib, 64, 3072, 1024, True, 0x1000, L.preferences("tilefish", 8_519_680, False)):
         pass
     desc_create = lib.named("cublasLtMatmulDescCreate")
     assert [a[1:] for a in desc_create] == [[68, 0]]  # CUBLAS_COMPUTE_32F, CUDA_R_32F
@@ -284,7 +284,7 @@ def test_the_problem_without_a_bias_sets_no_bias_and_the_default_epilogue():
 
 def test_the_problem_destroys_what_it_created_in_reverse_order():
     lib = RecordingLib()
-    with L._Problem(lib, 8, 16, 32, True, 16, 100):
+    with L._Problem(lib, 8, 16, 32, True, 16, L.preferences("tilefish", 100, False)):
         assert not any(n.endswith("Destroy") for n, _ in lib.calls)
     created = [(n, _value(a[0])) for n, a in lib.calls if n.endswith("Create")]
     destroyed = [(n, _value(a[0])) for n, a in lib.calls if n.endswith("Destroy")]
@@ -325,7 +325,7 @@ def fake_runtime(monkeypatch):
     monkeypatch.setattr(L, "_device", lambda index: 0)
     monkeypatch.setattr(L, "_handle", lambda lib_, index: ctypes.c_void_p(7))
     monkeypatch.setattr(L, "_on_device", lambda index: contextlib.nullcontext())
-    monkeypatch.setattr(L, "_validate_algo", lambda lib_, handle, index, algo_hex: {})
+    monkeypatch.setattr(L, "_validate_algo", lambda lib_, handle, index, algo_hex, allow_bf16_reduction=False, bias=False: {})
     return lib
 
 
@@ -886,3 +886,160 @@ def test_importing_the_module_does_not_import_torch():
     env["PYTHONPATH"] = os.pathsep.join([src, env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
     assert result.returncode == 0, result.stderr
+
+
+# -- the heuristic postures, imported configurations and the opt-in to bf16 partial sums -----------------------------------------------------
+
+
+def test_the_postures_ask_the_heuristic_with_these_preferences():
+    ws = 1_048_576
+    alignment = [(5, 16), (6, 16), (7, 16), (8, 16)]  # MIN_ALIGNMENT_{A,B,C,D}_BYTES
+    assert L.preferences("tilefish", ws, False) == [(1, ws), (3, 2)] + alignment  # the workspace, the f32-only mask, the alignment
+    assert L.preferences("tilefish", ws, True) == [(1, ws)] + alignment  # bf16 partial sums allowed: no mask
+    # torch's addmm: the workspace limit alone (its alignment minimums are those of its own pointers, 256 bytes, the library's default);
+    # the mask is torch's with allow_bf16_reduced_precision_reduction = False, none with its default
+    assert L.preferences("torch", ws, False) == [(1, ws), (3, 2)]
+    assert L.preferences("torch", ws, True) == [(1, ws)]
+    # a GEMM with a bias: no split-K at all without the opt-in (the mask 0), whatever the posture
+    assert L.preferences("tilefish", ws, False, True) == [(1, ws), (3, 0)] + alignment
+    assert L.preferences("torch", ws, False, True) == [(1, ws), (3, 0)]
+    assert L.preferences("torch", ws, True, True) == [(1, ws)]
+    assert L.TORCH_LT_WORKSPACE_BYTES == 1 << 20 and L.HEURISTICS == ("tilefish", "torch")
+
+
+class HeuristicLib(RecordingLib):
+    """A recording library whose heuristic answers one algorithm with stray bytes in it (what an RTX 5090 was measured to do) and whose
+    configuration reads back as all zeros."""
+
+    STRAY = bytes(34) + b"\xd1\xd6" + bytes(28)
+
+    def call(self, name, *args, allow=()):
+        super().call(name, *args)
+        if name == "cublasLtMatmulAlgoGetHeuristic":
+            results, returned = args[8], args[9]
+            results[0].algo = L._Algo.from_buffer_copy(self.STRAY)
+            results[0].state = 0
+            results[0].workspaceSize = 48
+            returned._obj.value = 1
+
+
+@pytest.fixture
+def heuristic_runtime(monkeypatch):
+    lib = HeuristicLib()
+    monkeypatch.setattr(L, "_lib", lambda: lib)
+    monkeypatch.setattr(L, "_device", lambda index: 0)
+    monkeypatch.setattr(L, "_handle", lambda lib_, index: ctypes.c_void_p(7))
+    monkeypatch.setattr(L, "_on_device", lambda index: contextlib.nullcontext())
+    return lib
+
+
+@pytest.mark.parametrize("heuristic, count, dummy", [("tilefish", 8, 16), ("torch", 1, 256)])
+@pytest.mark.parametrize("allow", [False, True])
+def test_pin_algo_asks_as_its_posture_says(heuristic_runtime, heuristic, count, dummy, allow):
+    lib = heuristic_runtime
+    pin = L.pin_algo(32, 1024, 4096, True, workspace_bytes=1 << 20, heuristic=heuristic, allow_bf16_reduction=allow)
+    (ask,) = lib.named("cublasLtMatmulAlgoGetHeuristic")
+    assert ask[7] == count  # requested results: torch asks for one
+    attrs = {a[1]: a[2] for a in lib.named("cublasLtMatmulDescSetAttribute")}
+    assert attrs[8] == dummy  # the bias pointer the heuristic sees: 16-byte aligned, or aligned as torch's allocations are
+    prefs = [(a[1], a[2]) for a in lib.named("cublasLtMatmulPreferenceSetAttribute")]
+    assert prefs == L.preferences(heuristic, 1 << 20, allow, True)
+    assert (pin.workspace_required, pin.workspace_limit) == (48, 1 << 20)
+
+
+def test_a_pin_is_what_the_library_encodes_for_the_configuration_the_heuristic_chose(heuristic_runtime):
+    """The 64 bytes the heuristic returns may hold bytes that are no part of the configuration (two that change from process to process were
+    measured on an RTX 5090): the pin is the configuration encoded by ``AlgoInit`` and the setters, which is what a replay rebuilds."""
+    lib = heuristic_runtime
+    pin = L.pin_algo(1, 1024, 7680, False, heuristic="torch")
+    assert pin.algo_hex == "00" * 64 != HeuristicLib.STRAY.hex()
+    assert len(lib.named("cublasLtMatmulAlgoConfigGetAttribute")) == 9  # the configuration read back
+    assert [a[7] for a in lib.named("cublasLtMatmulAlgoInit")] == [0]  # and encoded: the id read back (0 here) ...
+    assert [a[1] for a in lib.named("cublasLtMatmulAlgoConfigSetAttribute")] == [1, 2, 3, 4, 5, 6, 7, 8]  # ... and the other eight
+
+
+def test_a_posture_and_the_opt_in_are_checked_before_the_library(untouchable_library):
+    with pytest.raises(TilefishRuntimeError, match="heuristic must be one of \\['tilefish', 'torch'\\]"):
+        L.pin_algo(8, 16, 32, heuristic="cublas")
+    for call in (
+        lambda: L.pin_algo(8, 16, 32, allow_bf16_reduction=1),
+        lambda: L.check_algo(8, 16, 32, False, HEX, workspace_bytes=0, allow_bf16_reduction="yes"),
+        lambda: L.matmul(16, 32, 48, None, 8, 16, 32, HEX, workspace_bytes=0, stream=0, allow_bf16_reduction=None),
+        lambda: L.describe(8, 16, 32, False, allow_bf16_reduction=0),
+    ):
+        with pytest.raises(TilefishRuntimeError, match="allow_bf16_reduction must be a bool"):
+            call()
+
+
+def test_split_k_reduces_in_f32_unless_the_declaration_opts_in_to_bf16_partial_sums():
+    """The rule both hosts hold a pinned algorithm to (the Rust crate's ``reduction_problem`` has the same words, ``gemm.rs``)."""
+    for allow in (False, True):
+        assert L.reduction_problem(1, 0, allow) is None and L.reduction_problem(4, 2, allow) is None
+        assert L.reduction_problem(4, 0, allow) == "split-K count 4 does not go with reduction scheme 0 (split-K needs one, no split-K has none)"
+        assert "does not go with" in L.reduction_problem(1, 2, allow)
+        assert L.reduction_problem(0, 0, allow) == "split-K count 0 is below 1"
+        assert L.reduction_problem(2, 8, allow) == "reduction scheme 8 is not one cuBLASLt defines (0, 1, 2 or 4)"
+    for scheme in (1, 4):  # INPLACE, OUTPUT_TYPE
+        assert L.reduction_problem(43, scheme, True) is None
+        assert L.reduction_problem(43, scheme, False) == (
+            f"reduction scheme {scheme} adds the split-K partial sums in bf16, which rounds more than once (only no split-K, 0, and f32 partial "
+            "sums, 2, keep the one rounding); a declaration may opt in with allow_bf16_reduction=True"
+        )
+    assert L.allowed_reduction_schemes(False) == (0, 2) and L.allowed_reduction_schemes(True) == (0, 2, 1, 4)
+    assert L.allowed_reduction_schemes(False, True) == (0,) and L.allowed_reduction_schemes(True, True) == (0, 2, 1, 4)
+    assert L.describe(8, 16, 32, False)["reduction_schemes"] == [0, 2]
+    assert L.describe(8, 16, 32, True)["reduction_schemes"] == [0]
+    assert L.describe(8, 16, 32, False, allow_bf16_reduction=True)["reduction_schemes"] == [0, 2, 1, 4]
+    # a GEMM with a bias: no split-K without the opt-in, f32 partial sums included (they were measured to round twice with the bias epilogue)
+    assert L.reduction_problem(1, 0, False, True) is None and L.reduction_problem(4, 2, True, True) is None
+    assert L.reduction_problem(4, 2, False, True) == (
+        "split-K count 4 with the bias epilogue may add the bias to a sum already rounded to bf16 (measured with f32 partial sums too), which "
+        "rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with allow_bf16_reduction=True"
+    )
+    assert "adds the split-K partial sums in bf16" in L.reduction_problem(4, 4, False, True)  # the scheme is named first
+
+
+def test_the_opt_in_reaches_the_check_of_the_algorithm(fake_runtime, monkeypatch):
+    seen = []
+    monkeypatch.setattr(L, "_validate_algo", lambda lib_, handle, index, algo_hex, allow=False, bias=False: seen.append((allow, bias)) or {})
+    L.check_algo(4, 8, 16, False, "00" * 64, workspace_bytes=0)
+    L.check_algo(4, 8, 16, True, "00" * 64, workspace_bytes=0, allow_bf16_reduction=True)
+    L.matmul(0x1000, 0x2000, 0x3000, 0x4000, 4, 8, 16, "00" * 64, workspace_bytes=0, stream=0, allow_bf16_reduction=True)
+    L.matmul(0x1000, 0x2000, 0x3000, None, 4, 8, 16, "00" * 64, workspace_bytes=0, stream=0)
+    assert seen == [(False, False), (True, True), (True, True), (False, False)]  # the opt-in, and whether the problem has a bias
+
+
+CONFIG = {
+    "id": 21, "tile_id": 11, "splitk_num": 43, "reduction_scheme": 4, "cta_swizzling": 0, "custom_option": 0, "stages_id": 19,
+    "inner_shape_id": 0, "cluster_shape_id": 0,
+}  # fmt: skip
+
+
+def test_an_imported_configuration_is_encoded_as_the_library_encodes_it(fake_runtime):
+    assert L.encode_algo(CONFIG) == "00" * 64  # (the recording library writes nothing into the algorithm)
+    (init,) = fake_runtime.named("cublasLtMatmulAlgoInit")
+    assert init[1:8] == [68, 0, 14, 14, 14, 14, 21]  # COMPUTE_32F, R_32F scale, bf16 A, B, C, D, the id
+    sets = [(a[1], a[2], a[3]) for a in fake_runtime.named("cublasLtMatmulAlgoConfigSetAttribute")]
+    assert sets == [(1, 11, 4), (2, 43, 4), (3, 4, 4), (4, 0, 4), (5, 0, 4), (6, 19, 4), (7, 0, 2), (8, 0, 2)]  # attribute, value, size
+    assert L.ALGO_CONFIG_FIELDS == tuple(CONFIG)
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (lambda c: c.pop("tile_id"), r"missing \['tile_id'\]"),
+        (lambda c: c.update(tile=1), r"unknown \['tile'\]"),
+        (lambda c: c.update(splitk_num=1.0), "splitk_num must be an int"),
+        (lambda c: c.update(reduction_scheme=True), "reduction_scheme must be an int"),
+        (lambda c: c.update(tile_id=2**32), "tile_id must be an int from 0 to 4294967295"),
+        (lambda c: c.update(inner_shape_id=-1), "inner_shape_id must be an int from 0 to 65535"),
+        (lambda c: c.update(id=2**31), "id must be an int from -2147483648 to 2147483647"),
+    ],
+)
+def test_a_configuration_is_checked_before_the_library(untouchable_library, change, message):
+    config = dict(CONFIG)
+    change(config)
+    with pytest.raises(TilefishRuntimeError, match=message):
+        L.encode_algo(config)
+    with pytest.raises(TilefishRuntimeError, match="is a dict of"):
+        L.encode_algo([1, 2])

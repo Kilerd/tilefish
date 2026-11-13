@@ -8,8 +8,8 @@ use common::synthetic::{Kernel, alignment, cubin, elf, fixed, json, pointer, rea
 use serde_json::Value;
 use tilefish::json::{canonical, parse_strict};
 use tilefish::{
-    Access, Arch, DType, DevicePtr, Error, LibraryImpl, Manifest, ParamKind, Pin, PreconditionKind, TensorArg,
-    manifest_digest,
+    Access, AlgoSource, Arch, DType, DevicePtr, Error, Heuristic, LibraryImpl, Manifest, ParamKind, Pin,
+    PreconditionKind, TensorArg, manifest_digest,
 };
 
 const ALGO: &str = "0100000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f";
@@ -299,17 +299,78 @@ fn a_library_entry_that_is_not_what_python_writes_is_refused() {
     }
 }
 
+/// The fields an entry has only when its declaration is not the default (`docs/manifest-schema-3.md`, section 9): absent they are the
+/// default (an entry tilefish 0.0.4 wrote reads as before), present they have their one value, and anything else is refused.
 #[test]
-fn n_and_k_are_multiples_of_eight_as_the_declaration_asks() {
-    // Python's `check_declaration`: every row of a, b and the result starts on 16 bytes (M may be any size)
-    assert!(read(&[], &[gemm(false, 32, 8, 8), gemm(true, 64, 3072, 1024), gemm(false, 320, 1024, 3072)]).is_ok());
-    for (n, k, why) in
-        [(1020, 1024, "n = 1020"), (1024, 1028, "k = 1028"), (4, 1024, "n = 4"), (1024, 1, "k = 1"), (12, 12, "n = 12")]
+fn how_an_algorithm_was_chosen_is_read_from_fields_that_are_absent_by_default() {
+    let manifest = read(&[], &[gemm(true, 64, 1024, 1024)]).unwrap();
+    let e = manifest.library_entry("gemm_bias.M64", "sm_103").unwrap();
+    assert_eq!(
+        (e.heuristic, e.algo_source, e.allow_bf16_reduction),
+        (Heuristic::Tilefish, AlgoSource::Heuristic, false)
+    );
+    let mut entry = gemm(true, 64, 1024, 1024);
+    entry["heuristic"] = "torch".into();
+    entry["algo_source"] = "imported".into();
+    entry["allow_bf16_reduction"] = true.into();
+    let manifest = read(&[], &[entry.clone()]).unwrap();
+    let e = manifest.library_entry("gemm_bias.M64", "sm_103").unwrap();
+    assert_eq!((e.heuristic, e.algo_source, e.allow_bf16_reduction), (Heuristic::Torch, AlgoSource::Imported, true));
+    // each of them on its own
+    for (key, value) in
+        [("heuristic", json!("torch")), ("algo_source", json!("imported")), ("allow_bf16_reduction", json!(true))]
     {
+        let mut one = gemm(false, 32, 1024, 1024);
+        one[key] = value;
+        assert!(read(&[], &[one]).is_ok(), "{key}");
+    }
+    type Change = fn(&mut Value);
+    let cases: [(&str, Change, &str); 9] = [
+        (
+            "the default heuristic written out",
+            |e| e["heuristic"] = "tilefish".into(),
+            "heuristic is absent (the default) or \"torch\", got \"tilefish\"",
+        ),
+        ("a heuristic that is not one", |e| e["heuristic"] = "Torch".into(), "heuristic is absent"),
+        ("a heuristic that is null", |e| e["heuristic"] = Value::Null, "heuristic is absent"),
+        (
+            "the default source written out",
+            |e| e["algo_source"] = "heuristic".into(),
+            "algo_source is absent (the default) or \"imported\"",
+        ),
+        ("a source that is not one", |e| e["algo_source"] = 1.into(), "algo_source is absent"),
+        (
+            "the opt-in written as false",
+            |e| e["allow_bf16_reduction"] = false.into(),
+            "allow_bf16_reduction is absent (the default) or true, got false",
+        ),
+        ("the opt-in as 1", |e| e["allow_bf16_reduction"] = 1.into(), "allow_bf16_reduction is absent"),
+        ("the opt-in as a string", |e| e["allow_bf16_reduction"] = "true".into(), "allow_bf16_reduction is absent"),
+        ("a field of the same family that does not exist", |e| e["reduction"] = "bf16".into(), "unknown field"),
+    ];
+    for (what, change, why) in cases {
+        let mut entry = gemm(false, 32, 1024, 1024);
+        change(&mut entry);
+        let message = refusal(&[], &[entry]);
+        assert!(message.contains(why), "{what}: {message}");
+        assert!(message.contains("library entry #0"), "{what}: {message}");
+    }
+    // the digest covers them: an entry that opts in is another document than one that does not
+    let doc = |e: Value| -> Value { serde_json::from_str(&common::synthetic::manifest_text(&[], &[e])).unwrap() };
+    let plain = manifest_digest(&doc(gemm(true, 64, 1024, 1024))).unwrap();
+    assert_ne!(plain, manifest_digest(&doc(entry)).unwrap());
+}
+
+#[test]
+fn n_and_k_may_be_any_size() {
+    // Python's `check_declaration` takes any N and K: an algorithm that cannot take the leading dimensions is refused by the library when it
+    // is loaded (`cublasLtMatmulAlgoCheck`)
+    assert!(read(&[], &[gemm(false, 32, 8, 8), gemm(true, 64, 3072, 1024), gemm(false, 320, 1024, 3072)]).is_ok());
+    for (n, k) in [(1020, 1024), (1024, 1028), (4, 1024), (1024, 1), (12, 12), (480, 9)] {
         for bias in [false, true] {
-            let message = refusal(&[], &[gemm(bias, 32, n, k)]);
-            assert!(message.contains(why) && message.contains("must be a multiple of 8"), "{n}, {k}: {message}");
-            assert!(message.contains("library entry #0"), "{message}");
+            let manifest = read(&[], &[gemm(bias, 32, n, k)]).unwrap();
+            let e = &manifest.library()[0];
+            assert_eq!((e.n, e.k), (n, k));
         }
     }
 }
