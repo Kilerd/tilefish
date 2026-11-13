@@ -13,7 +13,6 @@ identified by now.
 """
 
 import json
-import os
 import sys
 
 # the kernel; ``{imports}`` and ``{expr}`` are the route

@@ -300,9 +300,11 @@ pub struct Entry {
     pub ptxas: String,
     /// The sha256 of the Triton source of a generated kernel.
     pub source_sha256: Option<String>,
-    /// The digest of the files of a hand-written kernel.
+    /// The identity of what Triton compiled: the digest of the Triton IR (TTIR without locations) the binary was built
+    /// from, for generated and hand-written kernels alike. Python recomputes it to tell a stale binary; a Rust host has
+    /// no Triton and trusts it through the pinned manifest digest.
     pub source_digest: Option<String>,
-    /// How `source_digest` was computed.
+    /// How `source_digest` was computed (`tilefish.triton-ir.v1`).
     pub source_digest_kind: Option<String>,
     /// The verified cubin.
     pub cubin: Arc<[u8]>,

@@ -829,7 +829,6 @@ def test_export_builds_through_the_cache_and_writes_the_same_manifest_entry(worl
     project, compiler = world
     kernel = project.load()
     first = build(SPEC, arch="sm_90", fn=kernel)
-    from tilefish.aot import write_manifest
 
     write_manifest([first], tmp_path / "a" / "manifest.json", cubins=True)
     second = build(SPEC, arch="sm_90", fn=kernel)

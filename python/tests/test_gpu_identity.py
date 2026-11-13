@@ -39,7 +39,6 @@ import identity_routes  # noqa: E402
 
 import tilefish  # noqa: E402
 from tilefish import runtime  # noqa: E402
-from tilefish._build import resolve_triton  # noqa: E402
 from tilefish.aot import compile_specs  # noqa: E402
 
 CAP = torch.cuda.get_device_capability()

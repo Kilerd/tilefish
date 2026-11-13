@@ -49,7 +49,7 @@ from tilefish import (  # noqa: E402
     f32,
     runtime,
 )
-from tilefish import _ir, _source  # noqa: E402
+from tilefish import _ir  # noqa: E402
 from tilefish._elf import parse_elf  # noqa: E402
 from tilefish.aot import build  # noqa: E402
 from tilefish.dims import as_dim, cdiv  # noqa: E402

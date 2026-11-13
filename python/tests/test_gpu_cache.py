@@ -29,7 +29,7 @@ from gpu_util import randn, same_bytes  # noqa: E402
 from lower_cases import softmax  # noqa: E402
 
 import tilefish  # noqa: E402
-from tilefish import Dim, Out, Tensor, TilefishBuildError, TilefishCacheWarning, f32, runtime  # noqa: E402
+from tilefish import Dim, Out, Tensor, TilefishCacheWarning, f32, runtime  # noqa: E402
 from tilefish.aot import build  # noqa: E402
 from tilefish.dims import cdiv  # noqa: E402
 
