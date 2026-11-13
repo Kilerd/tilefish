@@ -123,7 +123,6 @@ from .dims import Dim, DimExpr
 from ._manifest import MANIFEST_NAME, Manifest, manifest_digest
 from .errors import (
     TilefishBuildError,
-    TilefishError,
     TilefishManifestError,
     TilefishPreconditionError,
     TilefishRuntimeError,

@@ -589,7 +589,7 @@ def test_a_region_is_active_up_to_its_last_byte(good):
     """Two regions of a plan without reuse that overlap by the last 256 bytes of the first: refused (a sweep that retired a region 256 bytes early would not see it)."""
     doc = copy.deepcopy(good)
     regions = sorted(_regions(doc).items(), key=lambda kv: kv[1])
-    (a, (lo_a, hi_a)), (b, (lo_b, hi_b)) = regions[2], regions[3]
+    (a, (lo_a, hi_a)), (b, (lo_b, _hi_b)) = regions[2], regions[3]
     assert hi_a == lo_b and hi_a - lo_a >= 512  # consecutive, the first larger than 256 bytes
     buffer(doc, b)["offset"] = hi_a - 256
     _plan.validate_doc(copy.deepcopy(good))

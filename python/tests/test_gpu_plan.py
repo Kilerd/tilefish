@@ -91,10 +91,24 @@ def test_export_writes_a_schema_3_manifest_and_a_plan_that_pins_it(exported):
     assert [b["values"] for b in plan_doc["buckets"]] == [{"M": 32}, {"M": 64}, {"M": 128}]
 
 
-def test_the_plan_digest_is_the_same_for_two_exports_of_the_same_graph(exported, tmp_path):
-    _, p = exported
-    again = runtime.export(pm.block, tmp_path)
-    assert again.manifest_digest == p.manifest_digest and again.digest == p.digest  # the binaries, the pins and the plan are all deterministic
+def test_two_exports_of_the_same_graph_have_the_same_machine_code_and_the_same_plan(exported, tmp_path):
+    """The manifest pins the cubin *files*, and a cubin's debug sections name the directory it was built in (a build-cache hit returns a
+    binary built elsewhere), so two exports need not have the same manifest or plan digest: a pin is of one exported artifact, not of a
+    recipe. What two exports always share is the machine code of every binary (``sha256_code``), every pinned GEMM, and the plan itself."""
+    directory, _ = exported
+    runtime.export(pm.block, tmp_path)
+    first, second = (json.loads((d / "manifest.json").read_text()) for d in (directory, tmp_path))
+
+    def code(manifest):
+        return {(e["stem"], e["arch"]): (e["sha256_code"], e["symbol"], e["shared"]) for e in manifest["kernels"]}
+
+    assert code(first) == code(second)
+    assert first["library"] == second["library"]
+    plans = [json.loads((d / "plan.json").read_text()) for d in (directory, tmp_path)]
+    for doc in plans:
+        for key in ("manifest_digest", "plan_digest", "tilefish"):
+            doc.pop(key, None)
+    assert plans[0] == plans[1]
 
 
 # -- (a) replay == jit == per-op eager ---------------------------------------------------------------------------------------------------------------------

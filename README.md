@@ -140,6 +140,12 @@ is a deliberate breaking change in 0.0.x: until 0.0.2 a replay trusted the direc
 default, and the digests in it sit next to the files they describe, so whoever can write
 the directory could make it run any binary.
 
+A pin is of one exported artifact, not of a recipe. The manifest digest covers the cubin
+files, and a cubin's debug sections name the directory it was built in. Exporting the
+same graph again, elsewhere or after a build-cache hit, can therefore give another digest
+for the same machine code: every binary's `sha256_code`, the pinned GEMMs and the plan
+are unchanged. Pin what you exported, and ship that directory.
+
 Arguments are torch tensors, matched to the signature the way a call is
 matched in a trace: inputs and `InOut` tensors are passed (an `InOut` tensor
 is updated in place), `Out` tensors are allocated and returned. Before a
