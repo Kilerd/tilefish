@@ -409,6 +409,9 @@ fn a_bucketed_dimension_is_what_the_tensors_say_and_never_taken_from_the_binary(
             [("x", r#"["M", "cdiv(Db, 2)"]"#), ("w", r#"["cdiv(Db, 2)"]"#), ("out", r#"["M", "cdiv(Db, 2)"]"#)]
         {
             param(e, name)["shape"] = serde_json::from_str(shape).unwrap();
+            // (its max_elements precondition is on that shape with the bucket in: Db = 96, so cdiv(Db, 2) = 48)
+            let limited: Vec<&str> = if name == "w" { vec!["48"] } else { vec!["M", "48"] };
+            on_own_shape(e, name, &limited);
         }
     });
     for db in [48usize, 47, 256] {
@@ -428,6 +431,16 @@ fn a_bucketed_dimension_is_what_the_tensors_say_and_never_taken_from_the_binary(
     let e = refused(&plan, &[t(A, &[3, 96], DType::Bf16), t(B, &[96], DType::Bf16), t(C, &[3, 96], DType::Bf16)]);
     assert_eq!(kind(&e), PreconditionKind::Bucket);
     assert!(e.to_string().contains("dimension Db is not determined by the tensors"), "{e}");
+}
+
+/// Give the `max_elements` precondition of the pointer `name` the shape `limited` (the reader requires it to be the pointer's declared shape
+/// with the bucket values in).
+fn on_own_shape(entry: &mut serde_json::Value, name: &str, limited: &[&str]) {
+    for p in entry["preconditions"].as_array_mut().unwrap() {
+        if p["kind"] == "max_elements" && p["arg"] == name {
+            p["shape"] = serde_json::Value::from(limited.to_vec());
+        }
+    }
 }
 
 fn param<'a>(entry: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {

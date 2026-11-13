@@ -203,10 +203,7 @@ impl Expr {
         for (atom, c) in &affine.terms {
             let key = match atom {
                 Atom::Var(i) => format!("d{i}"),
-                Atom::Opaque(e) => match e.as_ref() {
-                    Expr::CDiv(a, b) => format!("cdiv({}, {})", a.folded_key()?, b.folded_key()?),
-                    other => format!("{other:?}"), // (the affine form keeps no other expression whole)
-                },
+                cdiv @ Atom::CDiv(..) => cdiv.key(), // a `cdiv` that does not fold, known by its folded parts
             };
             let sum = terms.entry(key).or_insert(0);
             *sum = sum.checked_add(*c)?;
