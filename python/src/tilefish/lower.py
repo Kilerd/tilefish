@@ -30,8 +30,10 @@ warps of its own ``BLOCK_D`` (the spec of the ``D = 96`` binary says 1 warp whet
 ``@tilefish.kernel(num_warps=N)`` or ``lower(num_warps=N)`` pins ``N`` for every bucket.
 
 **elementwise** (grid ``(cdiv(n, 1024),)``). Every tensor has the same shape, flattened to
-``n = prod(shape)`` (but an ``[N]`` table of ``gather_rows`` / ``scatter_rows``, addressed by an index);
-no broadcasting except python and ``const`` scalars; no reductions. ``n`` is a
+``n = prod(shape)`` (but an ``[N]`` table of ``gather_rows`` / ``scatter_rows``, addressed by an index),
+or the trailing axes of it: such an operand (``pe: [T, D]`` of a ``[K, T, D]`` kernel) broadcasts over the
+leading axes, lane ``o`` reading its element ``o % pe_n`` (``pe_n`` a runtime ``i32``, its element count), and
+is never written. Python and ``const`` scalars broadcast too; there are no reductions. ``n`` is a
 runtime ``i32`` parameter whose dimension is that product (``3072*M``), so a spec says how to
 compute it and ``compile_specs`` emits ``tt.divisibility`` when the product is provably a multiple
 of 16. When the product is not affine (two symbolic dimensions), ``n`` gets a fresh dimension that
@@ -1180,7 +1182,7 @@ def _max_block(kernel: str, d: DimExpr) -> int:
 class _ElementwiseLayout(_Layout):
     template = "elementwise"
 
-    def __init__(self, op: KernelOp, tables: _Tables) -> None:
+    def __init__(self, op: KernelOp, tables: _Tables, broadcast: bool = True) -> None:
         graph, name = op.graph, op.name
         self.tables = tables
         for t in tables.params:
@@ -1207,15 +1209,49 @@ class _ElementwiseLayout(_Layout):
         for v in graph.outputs:
             if v.type.rank == 0:
                 raise _fail(name, "elementwise", "elementwise.scalar-output", f"the returned {_label(v)} is a scalar; combine it with a tensor first")
-        self.shape = values[0].type.shape
+        widest = max(values, key=lambda v: v.type.rank)  # the first of the largest rank
+        self.shape = widest.type.shape
+        # an operand whose shape is the trailing axes of the kernel's shape broadcasts over the leading ones: lane o reads its element o % n
+        self.broadcast: dict[Value, str] = {}
         for v in values:
-            if v.type.shape != self.shape:
+            shape = v.type.shape
+            if shape == self.shape:
+                continue
+            if broadcast and len(shape) < len(self.shape) and tuple(self.shape[len(self.shape) - len(shape) :]) == tuple(shape):
+                self.broadcast[v] = ""
+                continue
+            if not broadcast:
                 raise _fail(
                     name,
                     "elementwise",
                     "elementwise.same-shape",
-                    f"{_label(v)} does not have the shape {_shape_text(self.shape)} of {_label(values[0])}: the "
+                    f"{_label(v)} does not have the shape {_shape_text(self.shape)} of {_label(widest)}: the "
                     "elementwise template does not broadcast (only python and const scalars combine with a tensor)",
+                )
+            raise _fail(
+                name,
+                "elementwise",
+                "elementwise.same-shape",
+                f"{_label(v)} does not have the shape {_shape_text(self.shape)} of {_label(widest)}, nor its trailing axes: the "
+                "elementwise template does not broadcast other shapes (an operand over the leading axes, a [T, D] operand of a "
+                "[K, T, D] kernel, and python and const scalars do)",
+            )
+        for v in [*(p for p in graph.inputs if p.access != "in"), *graph.outputs]:
+            if v in self.broadcast:
+                raise _fail(
+                    name,
+                    "elementwise",
+                    "elementwise.broadcast-write",
+                    f"{_label(v)} is written or returned with the shape {_shape_text(v.type.shape)}, which broadcasts over the kernel's "
+                    f"{_shape_text(self.shape)}: every lane that maps onto one of its elements would write it. What is written has the kernel's shape",
+                )
+        for n in graph.nodes:
+            if n.op in ("gather_rows", "scatter_rows", "iota") and any(o in self.broadcast for o in (*n.outputs, *n.inputs) if isinstance(o, Value)):
+                raise _fail(
+                    name,
+                    "elementwise",
+                    "elementwise.broadcast-index",
+                    f"{n}: a gather, a scatter or an iota of a broadcast shape is not lowered here; give it the kernel's shape {_shape_text(self.shape)}",
                 )
         self.total = _product(self.shape)
 
@@ -1235,9 +1271,21 @@ class _ElementwiseLayout(_Layout):
             k = min(ELEMENTWISE_BLOCK, math.prod(_pow2_divisor(d) for d in self.shape))
             self.n_dim = Dim(dim_name, divisible_by=k if k > 1 else None)
         self.grid = (as_dim(cdiv(self.n_dim, ELEMENTWISE_BLOCK)),)
+        # a broadcast parameter's element count: a runtime i32 that a host reads off the tensor (count_of)
+        self.counts: dict[str, str] = {}
+        bcast: list[_Extra] = []
+        for v in self.broadcast:
+            if not v.is_param:
+                continue
+            nm = self.broadcast[v] = names.fresh(f"{v.name}_n")
+            total = _product(v.type.shape)
+            dim = total if total is not None else Dim(nm)
+            bcast.append(_Extra(nm, False, Param(nm, 0, "dim", dim=dim)))
+            self.counts[nm] = v.name
         return [
             _Extra(self.n_name, False, Param(self.n_name, 0, "dim", dim=self.n_dim)),
             _Extra(self.BLOCK_name, True, _const_param(self.BLOCK_name, ELEMENTWISE_BLOCK)),
+            *bcast,
             *self.table_extras(names),
         ]
 
@@ -1256,12 +1304,18 @@ class _ElementwiseLayout(_Layout):
 
     def header(self) -> "list[str]":
         n = str(self.total) if self.total is not None else " * ".join(str(d) for d in self.shape)
-        return [
+        lines = [
             f"template: elementwise; every tensor is {_shape_text(self.shape)}, flattened to n = {n} elements",
             f"grid {_grid_text(self.grid)}, BLOCK = {ELEMENTWISE_BLOCK}",
         ]
+        for v, count in self.broadcast.items():
+            if v.is_param:
+                lines.append(f"'{v.name}' {_shape_text(v.type.shape)} broadcasts over the leading axes: lane o reads its element o % {count}")
+        return lines
 
     def load(self, p: str, v: Value) -> str:
+        if v in self.broadcast:
+            return f"tl.load({p} + {self.offs} % {self.broadcast[v]}, mask={self.mask}, other=0)"
         return f"tl.load({p} + {self.offs}, mask={self.mask}, other=0)"
 
     def store(self, p: str, v: Value, value: str) -> str:
@@ -1742,14 +1796,21 @@ def lower(
         )
     _check_common(op)
     tables = _tables(op)
-    errors: list[TilefishLoweringError] = []
-    for t in (template,) if template else TEMPLATES:
+    # without a template: the elementwise template with operands of one shape, then the row template, then the elementwise template
+    # broadcasting an operand over the leading axes (a last resort, so that no kernel the row template takes changes template)
+    attempts = {"row": [("row", False)], "elementwise": [("elementwise", True)]}.get(
+        template or "", [("elementwise", False), ("row", False), ("elementwise", True)]
+    )
+    failed: list[tuple[str, TilefishLoweringError]] = []
+    for t, bcast in attempts:
         try:
-            layout = _ElementwiseLayout(op, tables) if t == "elementwise" else _RowLayout(op, tables)
+            layout = _ElementwiseLayout(op, tables, broadcast=bcast) if t == "elementwise" else _RowLayout(op, tables)
         except TilefishLoweringError as e:
-            errors.append(e)
+            if not (t == "elementwise" and not bcast):  # the broadcasting attempt says more
+                failed.append((t, e))
             continue
         return _assemble(op, layout, module, fn_name, num_warps, fp_fusion)
+    errors = [e for _, e in sorted(failed, key=lambda f: TEMPLATES.index(f[0]))]
     if len(errors) == 1:
         raise errors[0]
     detail = "; ".join(f"{e.rule}: {str(e).split('failed: ', 1)[-1]}" for e in errors)
@@ -1808,11 +1869,15 @@ def _assemble(
         params.append(_reindexed(e.param, len(params), e.param.name))
         decls.append(f"{e.name}: tl.constexpr" if e.constexpr else e.name)
     element_counts: dict[str, str] = {}
-    if layout.template == "elementwise":  # n is the element count of every tensor (but a table): say which one a host reads it from
+    if layout.template == "elementwise":  # n is the element count of every tensor of the kernel's shape: say which one a host reads it from
+        assert isinstance(layout, _ElementwiseLayout)
         tables = {rename.get(t.name, t.name) for t in layout.tables.only}
         element_counts[layout.n_name] = next(
-            p.name for p in params if p.kind == "tensor" and not p.type.devscalar and p.name not in tables  # type: ignore[union-attr]
+            p.name
+            for p in params
+            if p.kind == "tensor" and not p.type.devscalar and p.name not in tables and p.type.shape == layout.shape  # type: ignore[union-attr]
         )
+        element_counts.update({k: rename.get(v, v) for k, v in layout.counts.items()})  # a broadcast operand's own count
 
     body_emitter = _Body(op, layout, names, out_names, rename)
     body = body_emitter.run()
