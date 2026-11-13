@@ -222,9 +222,13 @@ needs a C compiler, and a `replay` of a generated kernel needs neither Triton no
 
 CI asserts, on a GPU (the tests marked `gpu`), that a `jit`-built cubin has the
 digest of the manifest's, that `jit` and `replay` agree byte for byte, and that
-`replay` stays within tolerance of `reference` (tolerances per input
-distribution, in the test). An experiment that passes in `replay` is, kernel
-for kernel, what production runs.
+`replay` stays within tolerance of `reference`. The tolerances are measured per
+input distribution and tabulated in `python/tests/test_gpu_reference.py`: a ULP
+count only means something where the result is far from zero (a layernorm of
+data with a large mean has tiny outputs), so a bf16 output is bounded by half a
+bf16 step of the largest reference value and a fraction of elements that may
+differ, the f32 softmax by an absolute error of 5e-7, the gelu by 3e-5. An
+experiment that passes in `replay` is, kernel for kernel, what production runs.
 
 ## Rewrites that know about rounding
 
@@ -242,6 +246,11 @@ point in the IR, and rules come in two kinds:
   Applied automatically.
 - **numerics-changing**: a reduction order, an accumulator dtype or a rounding
   point changes. Applied only on request, and gated against the reference.
+
+`num_warps` is part of a kernel's numerics identity in the same way: it fixes
+the tree a `tl.sum` adds in, so the same kernel with another warp count differs
+in the last bits. It is recorded in the declaration digest, the compile spec
+and the manifest, and a replay refuses an entry that has another.
 
 Whether a legal fusion is worth doing is still measured, not assumed. The
 measurements live in the repository next to the rules.
