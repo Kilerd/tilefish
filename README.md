@@ -364,16 +364,16 @@ How the algorithm is chosen is part of the declaration (and of its digest):
 
 ```python
 # torch's choice: the result is torch.addmm(bias, a, b.t()) byte for byte (torch.mm(a, b.t()) without a bias)
-@tilefish.library("qkv", acc=f32, impl="cublaslt.gemm_bias", heuristic="torch", allow_bf16_reduction=True)
-def qkv(a: Tensor[M, 1024, bf16], b: Tensor[3072, 1024, bf16], bias: Tensor[3072, bf16]) -> Tensor[M, 3072, bf16]: ...
+@tilefish.library("proj", acc=f32, impl="cublaslt.gemm_bias", heuristic="torch", allow_bf16_reduction=True)
+def proj(a: Tensor[M, 512, bf16], b: Tensor[1536, 512, bf16], bias: Tensor[1536, bf16]) -> Tensor[M, 1536, bf16]: ...
 
 # algorithms chosen elsewhere (a tuner, another engine's pin file), one table per device: the heuristic is not asked there
 config = {"id": 21, "tile_id": 11, "splitk_num": 1, "reduction_scheme": 0, "cta_swizzling": 0, "custom_option": 0,
           "stages_id": 20, "inner_shape_id": 0, "cluster_shape_id": 0}
-rtx5090 = tilefish.AlgoTable("sm_120", 170, 120804, {(32, 3072, 1024, True): config})
+tuned = tilefish.AlgoTable("sm_120", 84, 120804, {(32, 1536, 512, True): config})  # arch, SM count, cuBLASLt version
 
-@tilefish.library("qkv32", acc=f32, impl="cublaslt.gemm_bias", algos=[rtx5090])
-def qkv32(a: Tensor[32, 1024, bf16], b: Tensor[3072, 1024, bf16], bias: Tensor[3072, bf16]) -> Tensor[32, 3072, bf16]: ...
+@tilefish.library("proj32", acc=f32, impl="cublaslt.gemm_bias", algos=[tuned])
+def proj32(a: Tensor[32, 512, bf16], b: Tensor[1536, 512, bf16], bias: Tensor[1536, bf16]) -> Tensor[32, 1536, bf16]: ...
 ```
 
 * `heuristic="torch"` asks the heuristic as torch 2.9's `addmm` does (`at::cuda::blas::gemm_and_bias`): one result, under the workspace limit alone (no
@@ -406,7 +406,7 @@ runs in `jit`, `replay` and `reference`, alone and in a plan.
 import tilefish
 from tilefish import Dim, DevScalar, Tensor, bf16, f32, i32, i64
 
-V, R, C = Dim("V"), Dim("R"), Dim("C", 5000)
+V, R, C = Dim("V"), Dim("R"), Dim("C", 3000)
 D = Dim("D", 1024)
 
 @tilefish.kernel

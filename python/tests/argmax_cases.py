@@ -7,7 +7,7 @@ import tilefish
 from tilefish import Dim, Tensor, bf16, f16, f32, i32, i64, u8
 
 R = Dim("R")
-C = Dim("C", 5000)  # not a power of two: masked lanes in every row
+C = Dim("C", 3000)  # not a power of two: masked lanes in every row
 P = Dim("P", 256)  # a power of two: none
 W = Dim("W", buckets=[7, 96, 1000])
 

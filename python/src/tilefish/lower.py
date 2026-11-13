@@ -286,8 +286,9 @@ Notes (the facts behind the table):
    ``16 * 1024``) whose kernel has no ``sum``, ``mean`` or ``max`` and nothing per element that depends on the result is walked in
    chunks of ``BLOCK_D = 1024`` columns, unrolled, in ascending order: each lane folds its column of every chunk into a carried pair,
    then one ``tl.reduce`` of the carries, with 2 warps; everything per element in the kernel is computed chunk by chunk in the same
-   loop. Measured on a B300 MIG slice, GPU time of a captured plan, bf16 rows of 5000: 30.8 microseconds for 2048 rows chunked, 70.4
-   as one 8192-wide block (the same combine), 55.9 for ``torch.argmax``; 6.2 / 12.3 / 18.5 for 256 rows; 6.0 / 5.9 / 18.5 for 64 rows.
+   loop. Measured on a B300 MIG slice, GPU time of a captured plan, bf16 rows of a length between 4096 and 8192: 30.8 microseconds
+   for 2048 rows chunked, 70.4 as one 8192-wide block (the same combine), 55.9 for ``torch.argmax``; 6.2 / 12.3 / 18.5 for 256 rows;
+   6.0 / 5.9 / 18.5 for 64 rows.
    A longer row is one block (faster there: 32768 columns). Only the row template has them, along the last axis.
 9. **Gathers and scatters of rows.** ``gather_rows(x, idx, oob=...)`` is ``x[idx]`` along the first axis and ``scatter_rows(dst, idx, src,
    oob="skip")`` is ``dst[idx] = src`` in place (an index copy). Both are raw copies: a value is loaded and stored with no arithmetic, so a

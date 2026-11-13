@@ -101,13 +101,13 @@ def check(k, args, expected, exported):
 
 
 def test_argmax_and_argmin_of_bf16_rows_are_torchs(exported):
-    x = adversarial(5000, BF16)
+    x = adversarial(3000, BF16)
     check(ac.argmax_bf16, (x,), [torch_arg(x, True)], exported)
     check(ac.argmin_bf16, (x,), [torch_arg(x, False, keepdim=True)], exported)
 
 
 def test_the_rule_on_the_trap_rows():
-    n = 5000
+    n = 3000
     x = adversarial(n, BF16)
     high = tilefish.run(ac.argmax_bf16, x).tolist()
     low = tilefish.run(ac.argmin_bf16, x).flatten().tolist()
@@ -152,7 +152,7 @@ def test_argmax_of_integer_rows(exported, width):
 
 
 def test_argmax_does_not_depend_on_the_warp_count():
-    x = adversarial(5000, BF16, seed=3)
+    x = adversarial(3000, BF16, seed=3)
     want = tilefish.run(ac.argmax_bf16, x)
     for warps in (1, 4, 8, 32):
         low = tilefish.lower(ac.argmax_bf16, num_warps=warps)
@@ -162,13 +162,13 @@ def test_argmax_does_not_depend_on_the_warp_count():
 def test_the_chunked_walk_and_one_block_agree():
     assert "static_range" in ac.argmax_bf16.lower().source and "static_range" not in ac.argmax_and_sum.lower().source
     for seed in range(3):
-        x = adversarial(5000, BF16, seed=seed)
+        x = adversarial(3000, BF16, seed=seed)
         assert torch.equal(tilefish.run(ac.argmax_and_sum, x)[0], tilefish.run(ac.argmax_bf16, x))
 
 
 def test_argmax_of_a_computed_row(exported):
-    logits = randn((33, 5000), BF16, seed=4)
-    bias = randn((5000,), BF16, seed=5)
+    logits = randn((33, 3000), BF16, seed=4)
+    bias = randn((3000,), BF16, seed=5)
     want = (logits.float() + bias.float()).to(BF16).argmax(-1)
     check(ac.greedy_token, (logits, bias), [want], exported)
 
@@ -186,8 +186,8 @@ def pick(logits: Tensor[Sb, ac.C, bf16], bias: Tensor[ac.C, bf16]):
 def test_a_graph_of_argmax_kernels_plans_exports_and_replays(tmp_path):
     p = runtime.export(pick, tmp_path)
     for rows in (16, 48):
-        logits = adversarial(5000, BF16, seed=rows)[:rows].contiguous()
-        bias = randn((5000,), BF16, seed=6)
+        logits = adversarial(3000, BF16, seed=rows)[:rows].contiguous()
+        bias = randn((3000,), BF16, seed=6)
         jit = tilefish.run(pick, logits, bias)
         replay = tilefish.run(pick, logits, bias, mode="replay", plan=tmp_path, pin=p.digest)
         ref = tilefish.run(pick, logits, bias, mode="reference")

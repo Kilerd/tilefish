@@ -104,7 +104,7 @@ def inputs_of(k):
     if k is mc.positions:
         return [(randn((37, 96), F32, seed=3),)]
     if k is mc.flat_positions:
-        return [(randn((5000,), F32, seed=4),)]
+        return [(randn((6000,), F32, seed=4),)]
     if k is mc.int_divmod:
         return [divmod_inputs()]
     if k is mc.tile_coords:
@@ -202,13 +202,13 @@ def test_iota_is_the_row_and_the_column():
     rows = torch.arange(37, device=CUDA).reshape(37, 1)
     assert torch.equal(rc, (rows * 1000 + torch.arange(96, device=CUDA)).to(torch.int32))
     assert torch.equal(r, rows.to(torch.int64))
-    assert torch.equal(tilefish.run(mc.flat_positions, randn((5000,), F32)), torch.arange(5000, device=CUDA))
+    assert torch.equal(tilefish.run(mc.flat_positions, randn((6000,), F32)), torch.arange(6000, device=CUDA))
 
 
 def divmod_inputs():
     gen = torch.Generator().manual_seed(9)
-    x = torch.cat([torch.arange(-50, 50), torch.tensor([-(2**31), 2**31 - 1, -(2**31) + 1, -7, 7, -14, 14]), torch.randint(-(2**31), 2**31, (5000,), generator=gen)])
-    y = torch.cat([torch.arange(-50, 50), torch.tensor([-(2**63), 2**63 - 1, -(2**63) + 1, -1000000007, 1000000007, -2000000014, 3]), torch.randint(-(2**62), 2**62, (5000,), generator=gen) * 2])
+    x = torch.cat([torch.arange(-50, 50), torch.tensor([-(2**31), 2**31 - 1, -(2**31) + 1, -7, 7, -14, 14]), torch.randint(-(2**31), 2**31, (6000,), generator=gen)])
+    y = torch.cat([torch.arange(-50, 50), torch.tensor([-(2**63), 2**63 - 1, -(2**63) + 1, -1000000007, 1000000007, -2000000014, 3]), torch.randint(-(2**62), 2**62, (6000,), generator=gen) * 2])
     z = torch.arange(x.numel()) % 256
     return x.to(torch.int32).to(CUDA), y.to(torch.int64).to(CUDA), z.to(torch.uint8).to(CUDA)
 

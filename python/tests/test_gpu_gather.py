@@ -137,7 +137,7 @@ def test_element_gathers(exported):
     (clamped, zeroed), _ = three_modes(exported, gc.take_elems, (x, idx))
     assert same_bytes(clamped, x[idx.long().clamp(0, 99)]) and same_bytes(zeroed, gather_zero(x, idx))
     xb = bf16_table(64, seed=8).flatten()
-    idx64 = ids_of(xb.numel(), 5000, torch.int64, seed=9)
+    idx64 = ids_of(xb.numel(), 6000, torch.int64, seed=9)
     (got,), _ = three_modes(exported, gc.take_elems_i64, (xb, idx64))
     assert same_bytes(got, gather_zero(xb, idx64))
 
@@ -169,15 +169,15 @@ def test_an_index_copy_writes_the_named_rows_and_keeps_the_others(exported):
 
 
 def test_an_element_scatter(exported):
-    dst = f32_table(5000, seed=16)
+    dst = f32_table(6000, seed=16)
     gen = torch.Generator().manual_seed(17)
-    idx = torch.randperm(5000, generator=gen)[:3000].to(torch.int32)
-    idx[:3] = torch.tensor([-5, 5000, 2**31 - 1], dtype=torch.int32)
+    idx = torch.randperm(6000, generator=gen)[:3000].to(torch.int32)
+    idx[:3] = torch.tensor([-5, 6000, 2**31 - 1], dtype=torch.int32)
     idx = idx.to(CUDA)
     src = f32_table(3000, seed=18)
     _, (after,) = three_modes(exported, gc.scatter_elems, (dst, idx, src), inout=(0,))
     want = dst.clone()
-    ok = in_range(idx, 5000)
+    ok = in_range(idx, 6000)
     want[idx[ok].long()] = src[ok]
     assert same_bytes(after, want)
 

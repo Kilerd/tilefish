@@ -366,7 +366,7 @@ fn n_and_k_may_be_any_size() {
     // Python's `check_declaration` takes any N and K: an algorithm that cannot take the leading dimensions is refused by the library when it
     // is loaded (`cublasLtMatmulAlgoCheck`)
     assert!(read(&[], &[gemm(false, 32, 8, 8), gemm(true, 64, 3072, 1024), gemm(false, 320, 1024, 3072)]).is_ok());
-    for (n, k) in [(1020, 1024), (1024, 1028), (4, 1024), (1024, 1), (12, 12), (480, 9)] {
+    for (n, k) in [(1020, 1024), (1024, 1028), (4, 1024), (1024, 1), (12, 12), (96, 9)] {
         for bias in [false, true] {
             let manifest = read(&[], &[gemm(bias, 32, n, k)]).unwrap();
             let e = &manifest.library()[0];

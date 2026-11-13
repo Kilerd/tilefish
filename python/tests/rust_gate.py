@@ -391,7 +391,7 @@ def build_cases():
 
 
 OPTION_N, OPTION_K = 1024, 4096
-ODD_N, ODD_K = 480, 9  # a K whose rows do not start on 16 bytes
+ODD_N, ODD_K = 96, 9  # a K whose rows do not start on 16 bytes
 OPTION_SHAPES = {"gemm_torch": (OPTION_N, OPTION_K), "gemm_imported": (OPTION_N, OPTION_K), "gemm_k9": (ODD_N, ODD_K)}
 
 

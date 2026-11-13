@@ -670,7 +670,7 @@ def test_report_how_often_the_pinned_result_is_torchs():
 # -- the "torch" posture, imported configurations and bf16 partial sums ----------------------------------------------------------------------
 
 # (M, N, K): transformer projections at several M, and the shapes where a split-K is chosen (a small M * N and a large K)
-TORCH_SHAPES = [(m, n, k) for m in (1, 32, 64, 320, 1000, 2048) for n, k in TORCH_MN_K + [(1024, 4096), (1024, 7680), (5000, 1024)]]
+TORCH_SHAPES = [(m, n, k) for m in (1, 32, 64, 320, 1000, 2048) for n, k in TORCH_MN_K + [(1024, 4096), (1024, 7680), (3000, 1024)]]
 
 
 def torch_pin(m, n, k, with_bias):

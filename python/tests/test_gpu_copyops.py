@@ -1,8 +1,8 @@
 """``tilefish.contiguous`` and ``tilefish.im2col`` on a real GPU: raw copies of strided views, byte for byte against torch.
 
 The sources hold every bf16 bit pattern (NaN payloads, signed zeros, subnormals), so a copy that interprets a value would show. Views are
-permutations (a pack of convolution outputs, heads to tokens, a transpose), expanded axes (stride 0) and offsets. ``im2col`` reads a
-spectrogram through a transposing view (one channel) and an NHWC activation through a permutation to NCHW, and agrees with
+permutations (NCHW to NHWC, heads to tokens, a transpose), expanded axes (stride 0) and offsets. ``im2col`` reads a one-channel image
+through a transposing view and an NHWC activation through a permutation to NCHW, and agrees with
 ``torch.nn.functional.unfold``. ``jit``, ``replay`` and ``reference`` agree byte for byte, alone and in a plan.
 """
 
@@ -44,20 +44,20 @@ def three(op, *args, directory, digest):
 
 
 def views():
-    pack = words(5, 16, 33, 480, seed=1).permute(0, 2, 3, 1)  # [K, F, T, C] read as [K, T, C, F]
+    nhwc = words(5, 16, 35, 200, seed=1).permute(0, 2, 3, 1)  # [N, C, H, W] read as [N, H, W, C]
     heads = words(16, 77, 128, seed=2).permute(1, 0, 2)  # [H, S, D] read as [S, H, D]
     transposed = words(300, 70, seed=3).t()
     expanded = words(1, 50, 64, seed=4).expand(3, 50, 64)  # stride 0 on the first axis
     offset = words(40, 130, seed=5)[3:, 1:129].t()  # an offset, both strides odd
     flat = words(9000, seed=6)[1::3]
-    return [pack, heads, transposed, expanded, offset, flat]
+    return [nhwc, heads, transposed, expanded, offset, flat]
 
 
 @pytest.fixture(scope="module")
 def exported(tmp_path_factory):
     directory = tmp_path_factory.mktemp("copyops")
     ops = [contiguous_op(v.dim(), bf16, last) for v in views() for last in (None, v.shape[-1])]
-    ops += [im2col_op(bf16, 3, 2, 1, channels=1), im2col_op(bf16, 3, 2, 1, channels=480), im2col_op(bf16, (2, 3), 1, 0)]
+    ops += [im2col_op(bf16, 3, 2, 1, channels=1), im2col_op(bf16, 3, 2, 1, channels=192), im2col_op(bf16, (2, 3), 1, 0)]
     unique = list({id(o): o for o in ops}.values())
     return directory, runtime.export(unique, directory)
 
@@ -88,12 +88,12 @@ def unfold(x, k, s, p):
     return cols.transpose(1, 2).reshape(n, ho, wo, -1)
 
 
-def test_im2col_of_a_spectrogram_through_a_transposing_view(exported):
+def test_im2col_of_one_channel_through_a_transposing_view(exported):
     directory, m = exported
-    mel = words(2, 101, 128, seed=7)  # [N, W, 128]: read as [N, 1, 128, W]
-    x = mel.reshape(2, 1, 101, 128).permute(0, 1, 3, 2)
+    img = words(2, 101, 40, seed=7)  # [N, W, 40]: read as [N, 1, 40, W]
+    x = img.reshape(2, 1, 101, 40).permute(0, 1, 3, 2)
     got = three(im2col_op(bf16, 3, 2, 1, channels=1), x, directory=directory, digest=m.digest)
-    assert got.shape == (2, 64, 51, 9)
+    assert got.shape == (2, 20, 51, 9)
     assert torch.equal(got.view(torch.int16), unfold(x, (3, 3), (2, 2), (1, 1)).view(torch.int16))
     border = got[:, 0, :, :3]  # the first output row reads the row above the input: padding
     assert (border.view(torch.int16) == 0).all()  # +0.0, all bits clear
@@ -101,10 +101,10 @@ def test_im2col_of_a_spectrogram_through_a_transposing_view(exported):
 
 def test_im2col_of_an_nhwc_activation(exported):
     directory, m = exported
-    act = words(2, 32, 25, 480, seed=8)  # NHWC
+    act = words(2, 30, 27, 192, seed=8)  # NHWC
     x = act.permute(0, 3, 1, 2)
-    got = three(im2col_op(bf16, 3, 2, 1, channels=480), x, directory=directory, digest=m.digest)
-    assert got.shape == (2, 16, 13, 4320)
+    got = three(im2col_op(bf16, 3, 2, 1, channels=192), x, directory=directory, digest=m.digest)
+    assert got.shape == (2, 15, 14, 1728)  # 1728 columns: two chunks of 1024, the last one masked
     assert torch.equal(got.view(torch.int16), unfold(x, (3, 3), (2, 2), (1, 1)).view(torch.int16))
 
 
@@ -117,27 +117,27 @@ def test_im2col_with_a_runtime_channel_count_and_another_window(exported):
 
 # -- in a launch plan ----------------------------------------------------------------------------------------------------------
 
-K = Dim("K", buckets=[3, 5])
-T = Dim("T", buckets=[33])
-NB = Dim("NB", buckets=[2])
-WB = Dim("WB", buckets=[101])
+N = Dim("N", buckets=[3, 5])
+H = Dim("H", buckets=[35])
+B = Dim("B", buckets=[2])
+L = Dim("L", buckets=[101])
 
 
 @tilefish.graph
-def pack_then_conv(x: Tensor[K, 16, T, 480, bf16], mel: Tensor[NB, WB, 128, bf16]):
-    packed = tilefish.contiguous(x.permute(0, 2, 3, 1))
-    patches = tilefish.im2col(mel.reshape(NB, 1, WB, 128).permute(0, 1, 3, 2), kernel=3, stride=2, padding=1)
-    return packed, patches
+def permute_then_im2col(x: Tensor[N, 16, H, 200, bf16], img: Tensor[B, L, 40, bf16]):
+    nhwc = tilefish.contiguous(x.permute(0, 2, 3, 1))
+    patches = tilefish.im2col(img.reshape(B, 1, L, 40).permute(0, 1, 3, 2), kernel=3, stride=2, padding=1)
+    return nhwc, patches
 
 
 def test_a_plan_of_generated_ops(tmp_path):
-    p = runtime.export(pack_then_conv, tmp_path)
-    mel = words(2, 101, 128, seed=10)
-    for k in (3, 5):
-        x = words(k, 16, 33, 480, seed=k)
-        jit = tilefish.run(pack_then_conv, x, mel)
-        replay = tilefish.run(pack_then_conv, x, mel, mode="replay", plan=tmp_path, pin=p.digest)
-        ref = tilefish.run(pack_then_conv, x, mel, mode="reference")
+    p = runtime.export(permute_then_im2col, tmp_path)
+    img = words(2, 101, 40, seed=10)
+    for n in (3, 5):
+        x = words(n, 16, 35, 200, seed=n)
+        jit = tilefish.run(permute_then_im2col, x, img)
+        replay = tilefish.run(permute_then_im2col, x, img, mode="replay", plan=tmp_path, pin=p.digest)
+        ref = tilefish.run(permute_then_im2col, x, img, mode="reference")
         for a, b, c in zip(jit, replay, ref):
             assert same_bytes(a, b) and same_bytes(a, c)
         assert same_bytes(jit[0], x.permute(0, 2, 3, 1).contiguous())

@@ -115,7 +115,7 @@ def _k_1020(a: Tensor[M, 1020, bf16], b: Tensor[2048, 1020, bf16]) -> Tensor[M, 
 def _n_2044(a: Tensor[M, 1024, bf16], b: Tensor[2044, 1024, bf16]) -> Tensor[M, 2044, bf16]: ...
 
 
-def _k_9(a: Tensor[M, 9, bf16], b: Tensor[480, 9, bf16], bias: Tensor[480, bf16]) -> Tensor[M, 480, bf16]: ...
+def _k_9(a: Tensor[M, 9, bf16], b: Tensor[96, 9, bf16], bias: Tensor[96, bf16]) -> Tensor[M, 96, bf16]: ...
 
 
 def test_every_dimension_is_static_or_bucketed_and_n_and_k_may_be_any_size():
@@ -131,7 +131,7 @@ def test_every_dimension_is_static_or_bucketed_and_n_and_k_may_be_any_size():
     n = library_specs(declare(_n_2044))[0]
     assert (n.n, n.entry(SMS)["ldc"], n.entry(SMS)["ldd"]) == (2044, 2044, 2044)
     nine = library_specs(declare(_k_9, "cublaslt.gemm_bias"))[1]
-    assert (nine.m, nine.n, nine.k) == (64, 480, 9)
+    assert (nine.m, nine.n, nine.k) == (64, 96, 9)
     validate_entry(built(nine).entry())
     with pytest.raises(TilefishDeclarationError, match="workspace_bytes must be an int from 1"):
         declare(_two_args, workspace_bytes=0)

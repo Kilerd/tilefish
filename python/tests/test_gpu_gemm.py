@@ -362,7 +362,7 @@ def test_the_torch_posture_and_imported_algorithms_run_the_same_in_jit_and_repla
 # -- N and K of any size ---------------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("n, k, bias", [(480, 9, True), (70, 18, False), (1000, 1001, True)])
+@pytest.mark.parametrize("n, k, bias", [(96, 9, True), (70, 18, False), (1000, 1001, True)])
 def test_n_and_k_of_any_size_pin_run_and_replay(n, k, bias, tmp_path):
     """Rows that do not start on 16 bytes (``K`` or ``N`` not a multiple of 8): the library judges which algorithms take those leading dimensions,
     the result is the f64 reference within one rounding (the default posture), and torch's under the torch posture; replay is jit."""
