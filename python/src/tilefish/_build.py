@@ -391,8 +391,9 @@ def _always_compile(triton: Any) -> "Iterator[None]":
             compilation.always_compile = previous
 
 
-def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "str | None":
-    """Check that the source behind ``jit`` is the one the spec is for and return its source digest (``None``: not recorded).
+def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "tuple[str | None, _source.Sources | None]":
+    """Check that the source behind ``jit`` is the one the spec is for and return its source digest (``None``: not recorded)
+    and the files and functions it reaches.
 
     A generated kernel's spec carries ``source_sha256``: the file of the function's module must have exactly that
     sha256 (for a lowered kernel that file is the generated source), whatever got imported from ``sys.path`` or was
@@ -424,7 +425,7 @@ def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "str
         _source.check_current(reached)
         if reached is not None:
             _source.check_imported_lines(reached.functions)
-        return None
+        return None, reached
     digest = _source.digest_of(reached)  # checks the files and the values against what the process imported, then digests those bytes
     if reached is not None:
         _source.check_imported_lines(reached.functions)
@@ -433,7 +434,7 @@ def _check_source(jit: Any, spec: "CompileSpec", expected: "str | None") -> "str
             f"the source of '{spec.triton}' has digest {digest}, but {expected} was expected: it is not the source the "
             "caller meant to build"
         )
-    return digest
+    return digest, reached
 
 
 def build(
@@ -483,7 +484,7 @@ def build(
     triton = _import_triton()
     jit = fn if fn is not None else resolve_triton(spec.triton)
     _check_jit_function(jit, spec)
-    recorded_digest = _check_source(jit, spec, source_digest)
+    recorded_digest, reached = _check_source(jit, spec, source_digest)
     opts: dict[str, Any] = {**inp.options, **dict(options or {})}
 
     store = None
@@ -503,6 +504,7 @@ def build(
             ptxas_version=ptxas,
             options=opts,
             environment=_cache.triton_environment(),
+            values=_source.values_read(reached),
         )
         hit = store.load(
             cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, source_digest=recorded_digest

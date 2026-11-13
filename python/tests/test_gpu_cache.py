@@ -231,6 +231,19 @@ def test_an_edit_in_any_file_the_kernel_reaches_is_a_miss_and_runs_the_new_code(
     assert torch.equal(tilefish.run(gc, x, mode="jit"), expected(x)) and len(compiles) == 2  # undone: the first entry again
 
 
+def test_a_constant_a_module_computes_when_it_is_imported_is_part_of_the_key(compiles, project, monkeypatch):
+    """The files do not change, so the source digest does not; the process holds another constant, so the binary differs."""
+    x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024
+    project.write(gc_cfg=[("tl.constexpr(2.0)", 'tl.constexpr(float(__import__("os").environ["GC_SCALE"]))')])
+    for scale, count in (("2.0", 1), ("3.0", 2), ("2.0", 2), ("3.0", 2)):
+        monkeypatch.setenv("GC_SCALE", scale)
+        project.load()
+        runtime.clear_caches()
+        assert torch.equal(tilefish.run(gc, x, mode="jit"), expected(x, scale=scale))  # never the binary of the other value
+        assert len(compiles) == count
+    assert len(entries()) == 2
+
+
 def test_an_edit_that_was_not_reloaded_never_reaches_the_cache(compiles, project):
     """The process holds the old values and the disk the new: no key is made, so no entry can hold the one under the other's digest."""
     x = 1 + torch.arange(64, dtype=torch.float32, device="cuda") / 1024

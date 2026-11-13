@@ -471,8 +471,8 @@ def _check_value(owner: str, namespace: "dict[str, Any]", name: str, reader: Any
         )
 
 
-def check_values(found: Sources) -> None:
-    """Raise :class:`StaleSourceError` when a scalar or Triton constant a jit function of ``found`` reads has been reassigned since its module was imported."""
+def _reads(found: Sources) -> "Iterator[tuple[str, dict[str, Any], str, Any]]":
+    """``(module name, its namespace, name, jit function)`` for every module-level name a jit function of ``found`` reads, by name or as ``module.name``."""
     for fn in found.functions:
         free, chains = _names_read(fn)
         namespace = _attr(fn, "__globals__")
@@ -480,15 +480,45 @@ def check_values(found: Sources) -> None:
             continue
         owner = str(namespace.get("__name__", "?"))
         for name in sorted(free):
-            _check_value(owner, namespace, name, fn)
+            yield owner, namespace, name, fn
         for chain in sorted(chains):
             module: Any = namespace.get(chain[0])
             for attr in chain[1:]:
                 if not issubclass(type(module), types.ModuleType):
                     break
                 if is_user_module(module.__name__):
-                    _check_value(module.__name__, module.__dict__, attr, fn)
+                    yield module.__name__, module.__dict__, attr, fn
                 module = module.__dict__.get(attr)
+
+
+def check_values(found: Sources) -> None:
+    """Raise :class:`StaleSourceError` when a scalar or Triton constant a jit function of ``found`` reads has been reassigned since its module was imported."""
+    for owner, namespace, name, fn in _reads(found):
+        _check_value(owner, namespace, name, fn)
+
+
+def _stable_repr(value: Any) -> str:
+    text = repr(value)
+    return type(value).__qualname__ if " at 0x" in text else text  # a default repr holds an address: not the same in another process
+
+
+def values_read(found: "Sources | None") -> "dict[str, str]":
+    """The scalars and Triton constants (``module.name`` to their ``repr``) that the jit functions of ``found`` read and the process holds now.
+
+    A source digest is of files, and what a module computes when it is imported (from the environment, from a device query) is
+    not in them; these are the values a compile takes from the process, so a cache of builds keys by them too.
+    """
+    if found is None:
+        return {}
+    out: dict[str, str] = {}
+    for owner, namespace, name, _ in _reads(found):
+        value = namespace.get(name, _MISSING)
+        try:
+            if value is not _MISSING and (_is_scalar(value) or _is_triton_object(value)):
+                out[f"{owner}.{name}"] = _stable_repr(value)
+        except Exception:  # noqa: BLE001 - an object that cannot be looked at
+            continue
+    return dict(sorted(out.items()))
 
 
 def check_current(found: "Sources | None") -> None:

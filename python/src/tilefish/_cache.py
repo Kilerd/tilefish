@@ -16,7 +16,10 @@ The key is a sha256 over
   from) or the *source digest* of a hand-written one (:func:`tilefish._source.source_digest`: the files it reaches and the
   Triton version);
 * the architecture, the Triton version, the ``ptxas`` version, the environment variables that Triton itself says
-  invalidate its cache, and the compile options in effect (the spec's and any a caller added).
+  invalidate its cache, and the compile options in effect (the spec's and any a caller added);
+* the scalars and Triton constants (``tl.constexpr``, dtypes) that the kernel's jit functions read from module attributes, as
+  the process holds them: a source digest is of files, and a module may compute a value when it is imported (from the
+  environment, from a device query) that is not in any file. The same file with another value is another binary and another key.
 
 ``build`` checks that the process holds the files it digests (an edited module that was not reloaded, a reassigned
 constant) *before* it computes the key, so a stale process cannot be served an entry for a source it does not run, nor
@@ -93,8 +96,10 @@ def cache_key(
     ptxas_version: str,
     options: "Mapping[str, Any]",
     environment: "Mapping[str, str]",
+    values: "Mapping[str, str]",
 ) -> str:
-    """The key of a build (see the module docstring): ``source`` is ``("source_sha256" | "source_digest", value)``."""
+    """The key of a build (see the module docstring): ``source`` is ``("source_sha256" | "source_digest", value)``;
+    ``values`` are the module constants the kernel reads, as the process holds them (:func:`tilefish._source.values_read`)."""
     doc = {
         "declaration_digest": spec.declaration_digest,
         "spec": spec._fingerprint(),
@@ -104,6 +109,7 @@ def cache_key(
         "ptxas": ptxas_version,
         "environment": dict(environment),
         "options": dict(options),
+        "values": dict(values),
     }
     text = json.dumps(doc, sort_keys=True, separators=(",", ":"), allow_nan=False, default=repr)
     return hashlib.sha256(_TAG + text.encode("utf-8")).hexdigest()

@@ -257,6 +257,28 @@ def test_the_environment_variables_triton_invalidates_its_cache_with_are_part_of
     assert compiler.count == 2
 
 
+def test_a_value_a_module_computes_when_it_is_imported_is_part_of_the_key(world, monkeypatch):
+    """The files are the same, the process holds another constant: the digest cannot tell, the binary differs, so the key must."""
+    project, compiler = world
+    project.write("ic_cfg", 'import os\n\nSCALE = float(os.environ.get("IC_SCALE", "2.0"))\n')
+    monkeypatch.setenv("IC_SCALE", "2.0")
+    first = build(SPEC, arch="sm_90", fn=project.load())
+    monkeypatch.setenv("IC_SCALE", "3.0")
+    other = build(SPEC, arch="sm_90", fn=project.load())  # the same files, another value in the process
+    assert compiler.count == 2 and other.source_digest == first.source_digest and other.sha256_code != first.sha256_code
+    monkeypatch.setenv("IC_SCALE", "2.0")
+    again = build(SPEC, arch="sm_90", fn=project.load())
+    assert compiler.count == 2 and again.sha256 == first.sha256  # and each is a hit for its own value
+
+
+def test_the_values_a_kernel_reads_are_the_scalars_and_constants_of_its_modules(world):
+    project, _ = world
+    project.write("ic_cfg", "SCALE = 2.0\nOTHER = 5\nTABLE = [1]\n")
+    found = _source.reachable(project.load())
+    assert _source.values_read(found) == {"ic_cfg.SCALE": "2.0", "ic_helper_b.OFFSET": "0.0"}  # read by a jit function, scalar; not OTHER, not a list
+    assert _source.values_read(None) == {}
+
+
 def test_another_declaration_or_spec_is_another_key(world):
     project, compiler = world
     kernel = project.load()
@@ -483,7 +505,7 @@ def test_an_entry_reads_back_as_the_build_it_was_made_from(tmp_path):
 
 def test_the_key_depends_on_every_part_of_it(tmp_path):
     (spec,) = compile_specs(scale)
-    base = dict(arch=90, source=("source_digest", "a" * 64), triton_version="3.5.1", ptxas_version="12.9", options={"num_warps": 4}, environment={})
+    base = dict(arch=90, source=("source_digest", "a" * 64), triton_version="3.5.1", ptxas_version="12.9", options={"num_warps": 4}, environment={}, values={})
     key = _cache.cache_key(spec, **base)
     assert key == _cache.cache_key(spec, **base) and len(key) == 64
     for change in (
@@ -495,6 +517,7 @@ def test_the_key_depends_on_every_part_of_it(tmp_path):
         {"options": {"num_warps": 8}},
         {"options": {"num_warps": 4, "enable_fp_fusion": False}},
         {"environment": {"TRITON_X": "1"}},
+        {"values": {"ic_cfg.SCALE": "2.0"}},
     ):
         assert _cache.cache_key(spec, **{**base, **change}) != key, change
 
