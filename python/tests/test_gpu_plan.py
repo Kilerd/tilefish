@@ -242,6 +242,22 @@ def test_reference_mode_takes_a_device_scalar_as_an_int_and_a_missing_reference_
         tilefish.run(with_it, x, 7, w[1], w[2], mode="reference")
 
 
+def test_results_of_every_kind_land_in_the_right_buffers_and_come_back_in_the_order_the_graph_returns_them(tmp_path):
+    from gpu_util import randn
+
+    p = runtime.export(pm.two_outputs, tmp_path)
+    for q in (16, 32):
+        a = randn((q, pm.W.value), torch.float32, seed=q)
+        expected = (a * 2.0 + a * 3.0, a + 1.0)
+        for how in ("jit", "replay", "reference"):
+            kw = dict(mode="replay", plan=tmp_path, pin=p.digest) if how == "replay" else dict(mode=how)
+            first, second = tilefish.run(pm.two_outputs, a, **kw)
+            assert same_bytes(first, expected[0]) and same_bytes(second, expected[1]), (q, how)
+        given = (torch.empty_like(a), torch.empty_like(a))
+        out = tilefish.run(pm.two_outputs, a, outputs=given)
+        assert out[0] is given[0] and out[1] is given[1] and same_bytes(given[0], expected[0]) and same_bytes(given[1], expected[1])
+
+
 def test_n_is_a_device_scalar_the_one_binary_reads_so_the_same_arena_serves_every_value(exported, weights):
     directory, p = exported
     m = 64

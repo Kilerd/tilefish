@@ -187,6 +187,17 @@ def test_an_in_place_call_keeps_the_storage_of_the_version_it_consumes():
     ]
 
 
+def test_a_kernel_with_an_out_parameter_and_a_returned_value_binds_each_result_to_its_own_buffer():
+    p = tilefish.plan(pm.two_outputs)
+    steps = [(s["entry"], [(a["name"], a["binding"]) for a in s["args"]]) for s in p.steps(Q=16)]
+    assert steps == [
+        ("with_out", [("x", "a"), ("y", "t0")]),
+        ("both", [("x", "a"), ("y", "t1"), ("out", "out1")]),  # the stub lists the Out parameter, then the returned value
+        ("plus", [("x", "t0"), ("y", "t1"), ("out", "out0")]),
+    ]
+    assert p.outputs == ["out0", "out1"]  # in the order the graph returns them: plus's result first, then both's returned value
+
+
 def test_a_graph_without_a_dimension_has_one_bucket():
     @tilefish.graph
     def fixed(a: Tensor[4, W, f32], b: Tensor[4, W, f32]) -> Tensor[4, W, f32]:

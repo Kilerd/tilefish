@@ -154,6 +154,25 @@ def accumulate(a: Tensor[Q, W, f32], state: InOut[Tensor[Q, W, f32]]) -> Tensor[
     return plus(t.live, state)
 
 
+@tilefish.kernel
+def with_out(x: Tensor[Q, W, f32], y: Out[Tensor[Q, W, f32]]):
+    y[...] = x * 2.0
+
+
+@tilefish.kernel
+def both(x: Tensor[Q, W, f32], y: Out[Tensor[Q, W, f32]]) -> Tensor[Q, W, f32]:
+    y[...] = x * 3.0
+    return x + 1.0
+
+
+@tilefish.graph
+def two_outputs(a: Tensor[Q, W, f32]) -> tuple[Tensor[Q, W, f32], Tensor[Q, W, f32]]:
+    """A kernel with an ``Out`` parameter, one with an ``Out`` parameter and a returned value, and two returned values in an order of their own."""
+    t = with_out(a)
+    r, o = both(a)
+    return plus(t, o), r
+
+
 # the operators of the graph, in the order they are called (what a per-op eager run of the block calls)
 OPS = [rmsnorm, gemm_qkv, attention, gemm_o, add_rmsnorm, gemm_up, gelu, gemm_down, add]
 WEIGHT_NAMES = ["w_ln1", "w_qkv", "b_qkv", "w_o", "w_ln2", "w_up", "w_down"]
