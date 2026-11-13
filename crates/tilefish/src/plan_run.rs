@@ -551,7 +551,13 @@ impl PlanRun {
         // -- the names
         let mut given: Vec<Option<usize>> = vec![None; buffers.len()];
         for (k, (name, _)) in externals.iter().enumerate() {
-            match inner.by_name.get(*name).copied() {
+            // a returned value by its name, or by out<i> (`LaunchPlan::output_buffer`)
+            let index = inner
+                .by_name
+                .get(*name)
+                .copied()
+                .or_else(|| plan.output_buffer(name).and_then(|b| inner.by_name.get(b).copied()));
+            match index {
                 None => {
                     return Err(Error::Launch(format!(
                         "'{name}' is not a buffer of the plan of graph '{graph}'; its externals are {}",

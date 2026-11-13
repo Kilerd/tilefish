@@ -384,6 +384,10 @@ plan is made (`docs/plan-schema-1.md`, section 7.5).
 returned shape, and the step that writes it binds it through a flat view), and any other dense view, a parameter or a value twice, which a copy step after
 the last call puts into the caller's output. A view that is not dense is refused.
 
+**Named outputs.** `@tilefish.graph(outputs=("y", "residual"))` names the returned values: the plan's output buffers have those names (else `out0`,
+`out1`, ...), `tilefish.run(..., outputs={"y": y, "residual": r})` takes them by name, and the Rust host binds them by name; both hosts also take `out<i>` for
+the `i`-th returned value, so a host written for the names of before keeps working.
+
 A plan launches declared operators and views. Arithmetic traced in the graph body, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
 tensor was updated in place are refused with the rule that says so; there is no fusion in a plan yet. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation rules, the
 digest) for the host that will run it without Python.

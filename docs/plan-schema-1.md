@@ -123,7 +123,7 @@ magnitude, so that every language reads the same number); a file larger than
 
 | field | type and rule |
 |---|---|
-| `name` | string, an identifier, unique in the plan. The graph's parameters keep their own names; the returned values are `out0`, `out1`, ... (in the order the graph returns them), an intermediate `t0`, `t1`, ... in the order the steps make them, the workspace `workspace`. A name that would collide with a parameter's gets underscores. |
+| `name` | string, an identifier, unique in the plan. The graph's parameters keep their own names; the returned values have the names the graph gives them (`@tilefish.graph(outputs=("y", "residual"))`, in the order it returns them) or, when it gives none, `out0`, `out1`, ...; an intermediate is `t0`, `t1`, ... in the order the steps make them, the workspace `workspace`. A name that would collide with a parameter's or a returned value's gets underscores. **A host takes a returned value by its name, or by `out<i>` for the `i`-th returned value whatever its name** (the name every returned value had before a graph could name them), when no buffer of the plan is called `out<i>` (Python `_plan.output_buffer`, Rust `LaunchPlan::output_buffer`). |
 | `role` | one of the seven below. |
 | `dtype` | one of `bf16 f16 f32 i32 i64 u8 e4m3 e5m2` (the dtypes that have a storage type). |
 | `shape` | list of integers >= 1 and dimension expressions (section 5); `[]` for a device scalar. |
@@ -345,6 +345,7 @@ y = tilefish.run(graph, *inputs)                                            # ji
 y = tilefish.run(graph, *inputs, mode="replay", plan="build/", pin=p.digest)  # replay: the exported plan, verified; or trust_directory=True
 y = tilefish.run(graph, *inputs, mode="reference")                          # the ops' references composed in torch (an extern's reference= is its oracle)
 tilefish.run(graph, *inputs, outputs=out)                                   # write the returned values into these tensors instead of allocating
+tilefish.run(graph, *inputs, outputs={"y": y, "residual": r})              # the same by name (the graph's names, or out0, out1, ...)
 tilefish.runtime.prepare(graph, mode="replay", plan="build/", pin=p.digest) # arena, binaries, handle: before a CUDA graph capture
 cap = tilefish.capture(graph, *externals, devscalars={"n": 5}, outputs=out) # a CapturedPlan: the plan in a CUDA graph of its own (mode=, plan=, pin= as for run)
 cap.replay(stream=None)                                                     # ordered with every run and replay of the plan, from any thread
@@ -422,12 +423,13 @@ and 9 240 832 with it (720 896 for the intermediates).
 | a result written over its input (`MayAlias`, section 8) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
 | copy steps (`tilefish.copy`, a store into an `InOut` parameter; section 7.5) | `test_plan_copy.py`; on a GPU `test_gpu_plan_copy.py`; the Rust reader: `python_plans.json` (`copy ...` documents) |
 | returned views and parameters (section 12) | `test_plan_returns.py`; on a GPU `test_gpu_plan_returns.py` |
+| the names of the returned values (section 6) | `test_plan_names.py`; the golden plan `steps` (`launch_plans.rs`); on a GPU `gpu_plan_gate.rs` (`a_named_output_is_given_by_its_name_or_by_out_i`) |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |
 | the document of section 13 | `test_plan_docs.py` |
 | the runner: order, addresses, scalars, preconditions before the first launch, captures, the order event of the arena (fake backend) | `test_planrun.py` |
 | on a GPU: replay == jit == per-op eager, replay vs reference, CUDA graph capture, tampering, the arena | `test_gpu_plan.py` |
 | on a GPU: runs of one plan on two streams (the race of the review, 0 of 20 rounds corrupted), from two threads, and replays of a captured graph between runs on other streams | `test_gpu_plan_streams.py` |
-| **golden fixtures for a second implementation**: two plan directories (`manifest.json`, cubins and `plan.json`) of the transformer block, without and with reuse, and `expected.json` with the plan digest, the manifest digest, the arena size and every arena offset that a reader must reproduce from the files alone | `golden/plans/` (written by `export_plan_fixtures.py`, no GPU needed), `test_plan_fixtures.py` |
+| **golden fixtures for a second implementation**: three plan directories (`manifest.json`, cubins and `plan.json`): the transformer block, without and with reuse, and `steps` (a result written over its input, two copy steps, a returned reshape, named outputs); `expected.json` with the plan digest, the manifest digest, the arena size, every arena offset and the outputs that a reader must reproduce from the files alone | `golden/plans/` (written by `export_plan_fixtures.py`, no GPU needed), `test_plan_fixtures.py` |
 
 The cubins of the golden fixtures are fake (a tiny ELF file per kernel entry, a made-up algorithm per GEMM): the format, the digests and the plan are real, so a reader can be checked against them; they cannot be launched.

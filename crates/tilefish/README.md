@@ -75,6 +75,10 @@ let run = plan.instantiate_all(&stream)?;
 run.launch(&stream, &mut [("x", x.into_arg()), /* the weights, */ ("out0", y.into_arg())], &[("n", DevScalar::Int(64))])?;
 ```
 
+The externals are given by the names of the plan's buffers: a parameter by its name, a returned value by the name the graph gives it
+(`@tilefish.graph(outputs=("y", ...))` in Python, `LaunchPlan::outputs`) or by `out0`, `out1`, ... in the order the graph returns them
+(`LaunchPlan::output_buffer`), so a host written before graphs named their outputs keeps working.
+
 Safe code cannot free a slice under a running kernel or GEMM, and a launch of
 slices on a stream that is capturing a CUDA graph is refused, in every cudarc
 context. The per-thread default stream (`ctx.per_thread_stream()`) is refused

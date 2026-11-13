@@ -521,9 +521,10 @@ def _walk(gop: GraphOp) -> _Walk:
     return _Walk(buffers, steps, outputs, dims)
 
 
-def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]") -> None:
-    """Names: a parameter keeps its own, the returned values are ``out0``, ``out1``, ... in the order the graph returns them, the rest ``t0``,
-    ``t1``, ... in the order they are made, and the workspace ``workspace`` (a name that a parameter already has gets underscores)."""
+def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]", names: "Sequence[str] | None" = None) -> None:
+    """Names: a parameter keeps its own, the returned values the names the graph gives them (``@tilefish.graph(outputs=...)``) or ``out0``, ``out1``,
+    ... in the order the graph returns them, the rest ``t0``, ``t1``, ... in the order they are made, and the workspace ``workspace`` (a name that a
+    parameter or a returned value already has gets underscores)."""
     used = {b.name for b in buffers if b.name}
 
     def unique(base: str) -> str:
@@ -533,7 +534,7 @@ def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]") -> Non
         return base
 
     for i, b in enumerate(outputs):
-        b.name = unique(f"out{i}")
+        b.name = unique(names[i] if names is not None else f"out{i}")
     count = 0
     for b in buffers:
         if b.name:
@@ -543,6 +544,23 @@ def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]") -> Non
         else:
             b.name = unique(f"t{count}")
             count += 1
+
+
+_LEGACY_OUTPUT = re.compile(r"out(0|[1-9][0-9]*)\Z")
+
+
+def output_buffer(doc: "Mapping[str, Any]", name: Any) -> "str | None":
+    """The buffer of the returned value a host calls ``name``: its own name, or ``out<i>`` for the ``i``-th returned value whatever its name (the name
+    every returned value had before a graph could name them), when no buffer of the plan is called ``out<i>``. ``None`` when it is neither."""
+    outs = doc["outputs"]
+    if not isinstance(name, str):
+        return None
+    if name in outs:
+        return name
+    m = _LEGACY_OUTPUT.match(name)
+    if m is not None and int(m.group(1)) < len(outs) and all(b["name"] != name for b in doc["buffers"]):
+        return outs[int(m.group(1))]
+    return None
 
 
 # -- the dimensions and their buckets -------------------------------------------------------------------------------------------------
@@ -912,8 +930,12 @@ class Plan:
 
     @property
     def outputs(self) -> "list[str]":
-        """The names of the buffers the graph returns, in the order it returns them."""
+        """The names of the buffers the graph returns, in the order it returns them (the graph's names, ``@tilefish.graph(outputs=...)``, or ``out0``, ...)."""
         return list(self._doc["outputs"])
+
+    def output_buffer(self, name: str) -> "str | None":
+        """The buffer of the returned value ``name``: its own name, or ``out<i>`` for the ``i``-th (:func:`output_buffer`)."""
+        return output_buffer(self._doc, name)
 
     def buckets(self) -> "list[dict[str, int]]":
         """The bucket combinations that have steps, in the order of the document."""
@@ -1011,7 +1033,7 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
         raise TilefishPlanError(f"reuse= is True or False, got {reuse!r}")
     name = graph.graph.name
     w = _walk(graph)
-    _name_buffers(w.buffers, w.outputs)
+    _name_buffers(w.buffers, w.outputs, graph.output_names)
     dims = _bucket_values(name, w.dims, buckets)
     count = math.prod(len(v) for v in dims.values())
     if count > MAX_BUCKETS:

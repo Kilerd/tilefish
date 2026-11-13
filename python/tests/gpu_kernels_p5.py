@@ -47,7 +47,7 @@ def scaled(x: Tensor[Rb, 64, f32]) -> Tensor[Rb, 64, f32]:
     return x * 2.0
 
 
-@tilefish.graph
+@tilefish.graph(outputs=("y", "residual"))
 def residual_chain(x: Tensor[Rb, 64, f32]):
     """``r = 2x`` in the arena, then two in-place updates of it: a plan writes both ``r_out`` over the ``r`` before them, so the three versions of
     the residual are one buffer (the one the graph returns)."""

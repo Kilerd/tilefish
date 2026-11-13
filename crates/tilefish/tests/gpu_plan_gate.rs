@@ -252,6 +252,53 @@ fn every_case_launched_and_replayed_is_pythons_bytes() {
     );
 }
 
+/// The outputs of a plan whose graph names them (`residual_chain`: `y` and `residual`) are given by those names or by `out0`, `out1` (the names
+/// of before), with the same bytes; both names of one output are refused as one external given twice.
+#[test]
+fn a_named_output_is_given_by_its_name_or_by_out_i() {
+    let gpu = Gpu::new();
+    let plan = plan_named("residual_chain");
+    let lp = load(&plan);
+    assert_eq!(lp.outputs(), ["y", "residual"]);
+    let run = lp.instantiate_all(&gpu.stream).unwrap();
+    let case = &plan["cases"].as_array().unwrap()[0];
+    for legacy in [false, true] {
+        let mut exts = upload(&gpu.stream, case);
+        let mut given = args(&mut exts, false);
+        if legacy {
+            for (name, _) in given.iter_mut() {
+                *name = match *name {
+                    "y" => "out0",
+                    "residual" => "out1",
+                    other => other,
+                };
+            }
+        }
+        run.launch(&gpu.stream, &mut given, &[]).unwrap_or_else(|e| panic!("legacy {legacy}: {e}"));
+        drop(given);
+        gpu.stream.synchronize().unwrap();
+        for e in exts.iter().filter(|e| e.expect.is_some()) {
+            let got = gpu.stream.clone_dtoh(&e.slice).unwrap();
+            assert!(got == *e.expect.as_ref().unwrap(), "legacy {legacy}: '{}' is not Python's", e.name);
+        }
+    }
+    let mut exts = upload(&gpu.stream, case);
+    let extra = gpu.stream.alloc_zeros::<u8>(exts[1].slice.len()).unwrap();
+    let mut extra = Ext {
+        name: "out0".to_owned(),
+        role: "output".to_owned(),
+        dtype: exts[1].dtype,
+        shape: exts[1].shape.clone(),
+        slice: extra,
+        input: None,
+        expect: None,
+    };
+    let mut given = args(&mut exts, false);
+    given.push(("out0", typed(&mut extra.slice, &extra.shape, extra.dtype, true)));
+    let e = run.launch(&gpu.stream, &mut given, &[]).unwrap_err();
+    assert!(e.to_string().contains("given twice"), "{e}");
+}
+
 /// One graph per bucket, replayed with the inputs and the device scalar of every case of its bucket written between replays (the graph holds
 /// addresses; the contents and the slots change); a launch of the same run with other values in between changes nothing the graph reads.
 #[test]

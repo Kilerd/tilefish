@@ -2,9 +2,9 @@
 
     python export_plan_vectors.py ../../crates/tilefish/tests/data      # (export_rust_vectors.py writes it too)
 
-Each document is a ``plan.json`` text made from one of the golden plans (``golden/plans/block`` and ``block-reuse``) by one change: every mutation of
+Each document is a ``plan.json`` text made from one of the golden plans (``golden/plans/block``, ``block-reuse`` and ``steps``) by one change: every mutation of
 ``test_plan_schema.py`` (a field of the wrong type or value, a key missing or unknown, a view outside its buffer, overlapping regions, a step that is not
-what the manifest's entry says, a buffer read before it is written, ...), shape expressions that do and do not fold (``2*M//2`` is ``M``, ``M*M//M`` is
+what the manifest's entry says, a buffer read before it is written, copy steps of every kind, ...: on ``block`` and ``block-reuse``), shape expressions that do and do not fold (``2*M//2`` is ``M``, ``M*M//M`` is
 not an affine expression), texts that are not strict JSON, and a few hundred random changes of one leaf (seeded). Unless the change is to the digest
 itself, the ``plan_digest`` is computed again, so that what is held to is the format and not the digest. Each has ``accepted``: what Python's
 ``read_plan`` (with no pin) and ``check_against_manifest`` with the manifest of its directory decide. ``crates/tilefish/tests/launch_plans.rs``
@@ -24,7 +24,8 @@ from tilefish.errors import TilefishManifestError
 
 HERE = pathlib.Path(__file__).resolve().parent
 GOLDEN = HERE / "golden" / "plans"
-BASES = ("block", "block-reuse")
+BASES = ("block", "block-reuse")  # the bases of the mutations of the rules (their paths are the block's)
+RANDOM_BASES = {"block": 7, "block-reuse": 8, "steps": 9}  # the bases of the random changes of one leaf, and the seed of each
 JUNK = [None, True, False, 0, -1, 1, 2**70, 1.5, "", "x", "M", "M*M", "3*M", "(((", [], {}, [1], {"a": 1}, "sm_103", "0" * 64]
 
 
@@ -313,17 +314,17 @@ def documents():
     ``plan_digest`` computed again when ``rehash``) or ``"text"`` (``{"replace": [old, new] or null, "prefix", "suffix"}``, applied once to the base
     file's text)."""
     records = []
-    for base_name in BASES:
+    for base_name in RANDOM_BASES:
         directory = GOLDEN / base_name
         manifest = Manifest.load(directory)
         base_text = (directory / "plan.json").read_text()
         base = json.loads(base_text)
         made = []
-        for name, mutate in mutations():
+        for name, mutate in mutations() if base_name in BASES else ():
             doc = copy.deepcopy(base)
             mutate(doc)
             made.append((name, doc, False))
-        made += random_mutations(base, seed=7 if base_name == "block" else 8, count=300)
+        made += random_mutations(base, seed=RANDOM_BASES[base_name], count=300)
         for name, doc, keep_digest in made:
             ops = diff(base, doc)
             rehash = isinstance(doc, dict) and "plan_digest" in doc and not keep_digest

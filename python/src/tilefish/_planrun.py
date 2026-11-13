@@ -962,6 +962,23 @@ class PlanRunner:
     def _given_outputs(self, outputs: Any, names: "Sequence[str]") -> "list[Any] | None":
         if outputs is None:
             return None
+        if isinstance(outputs, Mapping):  # by name: the graph's names of its returned values, or out0, out1, ... (_plan.output_buffer)
+            by_buffer: "dict[str, Any]" = {}
+            for key, t in outputs.items():
+                buffer = _plan.output_buffer(self._doc, key)
+                if buffer is None:
+                    raise TilefishPreconditionError(
+                        f"outputs= names {key!r}, which is not a returned value of graph '{self.plan.name}' (they are {', '.join(names)}, or out0, out1, ... "
+                        "in the order they are returned)",
+                        kind="shape",
+                    )
+                if buffer in by_buffer:
+                    raise TilefishPreconditionError(f"outputs= gives the returned value '{buffer}' twice", kind="shape", arg=buffer)
+                by_buffer[buffer] = t
+            missing = [n for n in names if n not in by_buffer]
+            if missing:
+                raise TilefishPreconditionError(f"outputs= must give every returned value of graph '{self.plan.name}'; {', '.join(missing)} is missing", kind="shape")
+            return [by_buffer[n] for n in names]
         items = [outputs] if not isinstance(outputs, (tuple, list)) else list(outputs)
         if len(items) != len(names):
             raise TilefishPreconditionError(

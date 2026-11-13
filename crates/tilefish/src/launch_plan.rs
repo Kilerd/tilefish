@@ -1289,9 +1289,26 @@ impl LaunchPlan {
         self.inner.buffers.iter().find(|b| b.name == name)
     }
 
-    /// The returned values (buffers of role `output`), in the order the graph returns them.
+    /// The returned values (buffers of role `output`), in the order the graph returns them: the graph's names of them
+    /// (`@tilefish.graph(outputs=...)` in Python), or `out0`, `out1`, ...
     pub fn outputs(&self) -> &[String] {
         &self.inner.outputs
+    }
+
+    /// The buffer of the returned value a host calls `name`: its own name, or `out<i>` for the `i`-th returned value whatever its name (the name
+    /// every returned value had before a graph could name them), when no buffer of the plan is called `out<i>` (Python's `output_buffer`). A
+    /// launch takes an output by either name.
+    pub fn output_buffer(&self, name: &str) -> Option<&str> {
+        let outputs = &self.inner.outputs;
+        if let Some(found) = outputs.iter().find(|o| *o == name) {
+            return Some(found);
+        }
+        let digits = name.strip_prefix("out")?;
+        let canonical = !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+            && (digits == "0" || !digits.starts_with('0'));
+        let index: usize = digits.parse().ok().filter(|_| canonical)?;
+        if index < outputs.len() && self.buffer(name).is_none() { Some(outputs[index].as_str()) } else { None }
     }
 
     /// Every bucket combination and its steps, in the order of the file.

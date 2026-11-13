@@ -1,0 +1,299 @@
+{
+  "schema": "tilefish.plan.v1",
+  "tilefish": "0.0.4",
+  "graph": "steps",
+  "arch": "sm_103",
+  "manifest_digest": "de3f0c145ab58933824fd65db5fbda8d5b4213c75cbf7c79956fd0178d0aae24",
+  "dims": {
+    "Rf": [
+      8,
+      24
+    ]
+  },
+  "reuse": false,
+  "arena_alignment": 256,
+  "arena_bytes": 6144,
+  "buffers": [
+    {
+      "name": "x",
+      "role": "input",
+      "dtype": "f32",
+      "shape": [
+        2,
+        "Rf",
+        64
+      ],
+      "offset": null,
+      "bytes": 12288
+    },
+    {
+      "name": "state",
+      "role": "inout",
+      "dtype": "f32",
+      "shape": [
+        "Rf",
+        64
+      ],
+      "offset": null,
+      "bytes": 6144
+    },
+    {
+      "name": "t0",
+      "role": "intermediate",
+      "dtype": "f32",
+      "shape": [
+        "Rf",
+        64
+      ],
+      "offset": 0,
+      "bytes": 6144
+    },
+    {
+      "name": "y",
+      "role": "output",
+      "dtype": "f32",
+      "shape": [
+        "Rf",
+        64
+      ],
+      "offset": null,
+      "bytes": 6144
+    },
+    {
+      "name": "half",
+      "role": "output",
+      "dtype": "f32",
+      "shape": [
+        "Rf",
+        64
+      ],
+      "offset": null,
+      "bytes": 6144
+    }
+  ],
+  "outputs": [
+    "y",
+    "half"
+  ],
+  "buckets": [
+    {
+      "values": {
+        "Rf": 8
+      },
+      "steps": [
+        {
+          "kind": "copy",
+          "args": [
+            {
+              "name": "src",
+              "binding": "x",
+              "view": {
+                "shape": [
+                  8,
+                  64
+                ],
+                "strides": [
+                  64,
+                  1
+                ],
+                "offset": 512
+              }
+            },
+            {
+              "name": "dst",
+              "binding": "t0"
+            }
+          ]
+        },
+        {
+          "entry": "add_over",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x",
+              "view": {
+                "shape": [
+                  8,
+                  64
+                ],
+                "strides": [
+                  64,
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "r",
+              "binding": "t0"
+            },
+            {
+              "name": "y",
+              "binding": "y"
+            },
+            {
+              "name": "r_out",
+              "binding": "t0"
+            }
+          ]
+        },
+        {
+          "kind": "copy",
+          "args": [
+            {
+              "name": "src",
+              "binding": "t0"
+            },
+            {
+              "name": "dst",
+              "binding": "state"
+            }
+          ]
+        },
+        {
+          "entry": "flat_half",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "y",
+              "view": {
+                "shape": [
+                  512
+                ],
+                "strides": [
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "out",
+              "binding": "half",
+              "view": {
+                "shape": [
+                  512
+                ],
+                "strides": [
+                  1
+                ],
+                "offset": 0
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "values": {
+        "Rf": 24
+      },
+      "steps": [
+        {
+          "kind": "copy",
+          "args": [
+            {
+              "name": "src",
+              "binding": "x",
+              "view": {
+                "shape": [
+                  24,
+                  64
+                ],
+                "strides": [
+                  64,
+                  1
+                ],
+                "offset": 1536
+              }
+            },
+            {
+              "name": "dst",
+              "binding": "t0"
+            }
+          ]
+        },
+        {
+          "entry": "add_over",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x",
+              "view": {
+                "shape": [
+                  24,
+                  64
+                ],
+                "strides": [
+                  64,
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "r",
+              "binding": "t0"
+            },
+            {
+              "name": "y",
+              "binding": "y"
+            },
+            {
+              "name": "r_out",
+              "binding": "t0"
+            }
+          ]
+        },
+        {
+          "kind": "copy",
+          "args": [
+            {
+              "name": "src",
+              "binding": "t0"
+            },
+            {
+              "name": "dst",
+              "binding": "state"
+            }
+          ]
+        },
+        {
+          "entry": "flat_half",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "y",
+              "view": {
+                "shape": [
+                  1536
+                ],
+                "strides": [
+                  1
+                ],
+                "offset": 0
+              }
+            },
+            {
+              "name": "out",
+              "binding": "half",
+              "view": {
+                "shape": [
+                  1536
+                ],
+                "strides": [
+                  1
+                ],
+                "offset": 0
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "plan_digest": "9e4055bc94c48cce56d754224ba1cb4dae3088728fa163510e1ae16d88fcdf98"
+}
