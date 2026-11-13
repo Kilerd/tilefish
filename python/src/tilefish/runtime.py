@@ -151,7 +151,11 @@ def _torch() -> Any:
 
 
 def clear_caches() -> None:
-    """Forget every built kernel and unload every loaded module (for tests and for rebuilding after a toolchain change)."""
+    """Forget every built kernel and unload every loaded module (for tests and for rebuilding after a toolchain change).
+
+    Nothing is freed under work that may still run: the arenas of launch plans are freed after the last run on each is done (its order event), and the modules
+    after every context that has one is synchronized (a launch of a kernel may still be running on any stream). Call it outside a CUDA graph capture, and only
+    when no graph captured from a plan will be replayed again (it holds the address of the arena)."""
     with _lock:
         _builds.clear()
         _manifests.clear()
@@ -159,10 +163,7 @@ def clear_caches() -> None:
     from . import _planrun
 
     _planrun.clear_caches()  # the runners of launch plans, and the arenas they hold
-    try:
-        _cuda.unload_all()
-    except TilefishError:
-        pass
+    _cuda.unload_all()  # nothing to do (and no driver imported) when no module was loaded
 
 
 # -- what is being run ----------------------------------------------------------------------------------------------------

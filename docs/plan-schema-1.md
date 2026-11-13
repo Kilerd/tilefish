@@ -206,7 +206,7 @@ the shapes of the views.
 * **Order.** The steps of a bucket run in list order, **all on one stream, with no synchronization between them and none implied**: a step that writes a buffer comes before every step that reads
   that version of it, in the order of the graph's IR (an in-place call keeps the storage of the version it consumes, so its readers come after it, and a view that is read after its buffer
   was updated in place is refused by the writer of a plan, because the IR gives a view the contents it had when it was made and a view shares the storage). A host does not reorder, overlap or
-  parallelize steps, and does not insert events.
+  parallelize steps, and does not insert events between them (the order event of section 9 is between executions).
 * **Liveness.** The *live range* of a buffer is `[first, last]`: the index of the first step, and of the last, that has the buffer as an argument (a library step's workspace is live for the whole
   plan; a `devscalar` slot is written before step 0 and lives for the whole plan). Both ends are inclusive: a step that reads one buffer and writes another has both live.
 * **Reuse.** `"reuse": false` means no two arena regions overlap. `"reuse": true` allows two regions to overlap **only if** both buffers are `intermediate` and their live ranges are disjoint
@@ -219,23 +219,31 @@ the shapes of the views.
 1. **Load** (section 3): the file, the pin or the trust statement, the manifest, the rules, the entries. Allocate the arena once per device: `arena_bytes` bytes, 256-aligned (nothing if it is 0).
    Keep it for as long as the plan is in use, **and for as long as any CUDA graph captured from the plan can be replayed** (the graph holds its address and nothing keeps the memory
    alive: Python keeps an arena per plan layout and device until `tilefish.runtime.clear_caches()`, however many runners and plan objects come and go; a host that frees an arena must
-   drop the graphs). **The plan is not reentrant**: two executions of one plan are ordered by the caller (one stream, or an event), because they share the arena.
+   drop the graphs, and must first wait for the work of the last execution on it, whatever its stream).
+   **Two executions that use one arena must not overlap on the device**, whatever streams they are enqueued on: they share the intermediates, the device scalars and the workspace. A host
+   orders them. Python does it with one *order event* per arena (`_planrun._Arena`): an execution, under the arena's lock, makes its stream wait for the event's most recent record
+   (`cuStreamWaitEvent`) before its first write (step 4), and records the event on its stream (`cuEventRecord`) after its last launch (step 5), also when a launch fails after others were
+   enqueued. So executions of one plan on different streams, from one thread or several, are correct and run on the device one after the other, in the order the host issued them
+   (a lock that orders only the enqueueing is not enough: the race it leaves corrupted the outputs of two runs on two streams in 5 of 5 tries). Executions on one stream are ordered by
+   the stream. `clear_caches` waits for the event (`cuEventSynchronize`) before it frees an arena. Plans of different layouts have different arenas and are not ordered with each other.
 2. **Bind the externals.** The caller gives a tensor (address, shape, strides, dtype) for every buffer of role `input`, `weight` and `inout`, and for every `output` (or the host allocates it), and a
    value for every `devscalar`. Check each external against its buffer: dtype, rank, contiguous row-major (a parameter is a dense tensor), and bind the dimensions (section 5). Select the bucket.
    The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`), and none may overlap the arena.
 3. **Check, before anything is launched**: for every step of the selected bucket, resolve it (section 7.2) with the real addresses and run every check of a single launch. **If any check fails,
    nothing is launched and nothing is written**, not even a device scalar: the checks are all done first, then the writes and the launches.
-4. **Write the device scalars.** Each `devscalar` slot (at `arena + offset`) gets the value the caller gave, as the little-endian bytes of its dtype, ordered on the stream before the first
-   launch: a copy from device memory (stream-ordered), or an asynchronous copy from pinned host memory. (Python: `_planrun.TorchBackend.write_devscalar`.)
-5. **Launch** the steps in order on the stream (section 7.2). Nothing else: no allocation, no synchronization.
+4. **Write the device scalars**, after the stream waits for the previous execution on the arena (step 1). Each `devscalar` slot (at `arena + offset`) gets the value the caller gave, as the
+   little-endian bytes of its dtype, ordered on the stream before the first launch: a copy from device memory (stream-ordered), or an asynchronous copy from pinned host memory. (Python:
+   `_planrun.TorchBackend.write_devscalar`.)
+5. **Launch** the steps in order on the stream (section 7.2), then record the arena's order event on it (step 1). Nothing else: no allocation, no synchronization of the host.
 
 A host may cache everything of steps 1 to 3 that does not depend on an address (the dimension bindings, scalars, grids, the entries' loaded functions and pinned algorithms) per bucket, as Python's
 runner does; the address-dependent checks are repeated at every execution.
 
 ## 10. CUDA graphs
 
-A plan does nothing during execution that a stream capture forbids: no allocation (the workspace of a GEMM, the intermediates and the device scalars are in the arena), no synchronization, no host
-write to device memory but the copy of a device scalar, no module loading, no handle creation, every launch on one stream. So **a plan can be captured once per bucket, at fixed addresses, and the
+A plan does nothing during execution that a stream capture forbids: no allocation (the workspace of a GEMM, the intermediates and the device scalars are in the arena), no synchronization of
+the host (the order event of the arena is waited for and recorded on the stream, as event nodes: item 7), no host write to device memory but the copy of a device scalar, no module loading, no
+handle creation, every launch on one stream. So **a plan can be captured once per bucket, at fixed addresses, and the
 graph replays byte-identically** (Python gate: `test_gpu_plan.py`, byte-identical to the uncaptured replay and to per-op eager execution, with 0 allocations inside the capture). What has to be so:
 
 1. **Everything that allocates or waits is done before the capture**: the arena, the loading of every function of the bucket (`cuModuleLoadData`, and `cuFuncLoad` where the driver has it, so
@@ -246,10 +254,15 @@ graph replays byte-identically** (Python gate: `test_gpu_plan.py`, byte-identica
    capture's private pool, and Python does not refuse it; it is an allocation inside the capture all the same, so a test that proves there is none passes `outputs=`).
 3. **A device scalar must be written by a captured, device-side copy** from a CUDA tensor of one element: the graph re-reads that tensor at every replay, so changing the value between replays is
    writing that tensor. An `int` or a CPU tensor is a host write (an asynchronous copy from pinned memory is not capturable as a value that changes), and Python refuses it under capture.
-4. **A graph holds addresses, not values**: the externals are the same tensors at every replay (write into them in place), and the arena is the same arena.
+4. **A graph holds addresses, not values**: the externals are the same tensors at every replay (write into them in place), and **the arena of a captured graph is the plan's arena**, the one
+   the uncaptured executions use, at the address the graph holds.
 5. **One stream**: the capture is of the stream the steps are launched on; all steps go there.
 6. **One bucket per graph**: a graph is made for one bucket combination's steps, from the first launch to the last, and replayed for that combination's tensors.
-7. A plan is **not reentrant** (section 9): two replays of graphs of one plan on two streams at the same time share the arena.
+7. **The order of the replays.** The wait for the arena's order event and its record (section 9, step 1) are captured as *external* event nodes (`CU_EVENT_WAIT_EXTERNAL`,
+   `CU_EVENT_RECORD_EXTERNAL`; a plain wait on an event recorded outside the capture is not allowed in it, and a plain record would only join the capture). So every replay of the graph
+   waits for the most recent execution or replay of the plan issued before it is launched, and records the event when its work is done: replays (of one graph or of the graphs of several
+   buckets) and uncaptured executions of one plan, on any streams, are ordered with each other in the order the host issues them, exactly as executions are. The caller orders nothing but
+   its own tensors (an input written on another stream, an output read on one), as for any launch.
 8. Not a plan's doing, but a reason a capture can fail: a binary that is not capturable by itself (the manifest refuses cooperative launches, PDL, clusters and scratch memory for a plain
    replay, so none of those is in a plan), and the capture mode of the framework (torch's `global` mode refuses an unsafe call from another thread while it captures).
 
@@ -270,7 +283,7 @@ tilefish.runtime.prepare(graph, mode="replay", plan="build/", pin=p.digest) # ar
 * A `DevScalar` parameter takes an `int` (a number that is not an integer of its dtype is refused), a CPU tensor or a CUDA tensor of one element at a call.
 * A compile-time argument (`const`) that a call in the graph gives another value than the declared default is refused when the plan is made, as it is at a single launch (the binary has the
   declared value compiled in); the same in `reference` mode.
-* `tilefish.runtime.clear_caches()` resets every runner and frees every arena, so call it only when no captured graph will be replayed again.
+* `tilefish.runtime.clear_caches()` resets every runner and frees every arena (after the last execution on it is done), so call it only when no captured graph will be replayed again.
 * `jit` builds the binaries of the plan in memory from the same compile specs and pins the same GEMM algorithms in memory, and runs the *same* runner as `replay`, which differs in where a binary
   comes from (a manifest verified against the specs); so the two are identical by construction (a test holds them to byte equality).
 
@@ -324,8 +337,8 @@ and 9 240 832 with it (720 896 for the intermediates).
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |
 | the document of section 13 | `test_plan_docs.py` |
-| the runner: order, addresses, scalars, preconditions before the first launch, captures (fake backend) | `test_planrun.py` |
-| on a GPU: replay == jit == per-op eager, replay vs reference, CUDA graph capture, tampering, the arena | `test_gpu_plan.py` |
+| the runner: order, addresses, scalars, preconditions before the first launch, captures, the order event of the arena (fake backend) | `test_planrun.py` |
+| on a GPU: replay == jit == per-op eager, replay vs reference, CUDA graph capture, tampering, the arena, runs on two streams and from two threads, replays and runs at once | `test_gpu_plan.py` |
 | **golden fixtures for a second implementation**: two plan directories (`manifest.json`, cubins and `plan.json`) of the transformer block, without and with reuse, and `expected.json` with the plan digest, the manifest digest, the arena size and every arena offset that a reader must reproduce from the files alone | `golden/plans/` (written by `export_plan_fixtures.py`, no GPU needed), `test_plan_fixtures.py` |
 
 The cubins of the golden fixtures are fake (a tiny ELF file per kernel entry, a made-up algorithm per GEMM): the format, the digests and the plan are real, so a reader can be checked against them; they cannot be launched.

@@ -338,7 +338,10 @@ verifies the file and its manifest (a tampered plan, a wrong pin, a plan built a
 and keeps it, and checks **every step's preconditions before the first launch**: a failure launches nothing, not even the write of a device scalar. A run allocates nothing but its outputs
 (`outputs=` gives them) and waits for nothing: the GEMM workspace is in the arena, a device scalar is written by a stream-ordered copy. So **a replay under `torch.cuda.graph` captures and the
 graph replays byte-identically** (`runtime.prepare` does the allocating and the loading that cannot happen inside a capture; `docs/plan-schema-1.md` lists every reason a plan could fail to
-capture). `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
+capture). Every run of a plan on a device uses the one arena, so **runs of one plan on several streams (or threads) are ordered on the device** by an event of the arena: a run waits on its
+stream for the run before it and records the event after its last launch, so they never overlap and their results are correct, at the cost of running one after the other. Under a capture the
+wait and the record are external event nodes of the graph, so a captured graph's arena is the plan's arena and its replays take their place in that order, with the plain runs, in the order
+the host issues them. `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
 eager composition of the same ops give the same bytes for every bucket and two values of `n`.
 
 A plan launches declared operators and views. Arithmetic traced in the graph body, a `store`, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its

@@ -585,3 +585,60 @@ def test_two_loads_of_one_cubin_with_another_launch_are_not_the_same_kernel():
     assert all(b.cubin == base.cubin for b in same_cubin)
     assert len(keys) == 8  # the cubin alone does not identify a launch: shared memory, symbol, launch fields, block, ABI, device
     assert load_key(base, 0) == load_key(fake_build(spec), 0)
+
+
+class _FakeDriver:
+    """The driver calls of unload_all, recorded: which context is current at each."""
+
+    class CUresult:
+        CUDA_SUCCESS = 0
+
+    def __init__(self, fail_sync=False):
+        self.log = []
+        self.stack = []
+        self.fail_sync = fail_sync
+
+    def cuCtxPushCurrent(self, ctx):
+        self.stack.append(ctx)
+        return (0,)
+
+    def cuCtxPopCurrent(self):
+        return (0, self.stack.pop())
+
+    def cuCtxSynchronize(self):
+        self.log.append(("synchronize", self.stack[-1]))
+        return (1 if self.fail_sync else 0,)
+
+    def cuModuleUnload(self, module):
+        self.log.append(("unload", module, self.stack[-1]))
+        return (0,)
+
+    def cuGetErrorString(self, err):
+        return (0, b"a stream is being captured")
+
+
+def test_unload_all_synchronizes_every_context_before_a_module_is_unloaded(monkeypatch):
+    """A kernel launched from a module may still run on any stream: the module is unloaded only after its context is synchronized, from that context."""
+    from types import SimpleNamespace
+
+    from tilefish import _cuda
+
+    drv = _FakeDriver()
+    monkeypatch.setattr(_cuda, "_driver", lambda: drv)
+    loaded = {("a", 0): SimpleNamespace(module="mod_a", context=100), ("b", 1): SimpleNamespace(module="mod_b", context=200), ("c", 0): SimpleNamespace(module="mod_c", context=100)}
+    monkeypatch.setattr(_cuda, "_loaded", dict(loaded))
+    _cuda.unload_all()
+    assert drv.log[:2] == [("synchronize", 100), ("synchronize", 200)]
+    assert sorted(drv.log[2:]) == [("unload", "mod_a", 100), ("unload", "mod_b", 200), ("unload", "mod_c", 100)]
+    assert _cuda._loaded == {} and drv.stack == []
+
+    drv = _FakeDriver(fail_sync=True)  # a context that cannot be synchronized: nothing is unloaded, nothing forgotten
+    monkeypatch.setattr(_cuda, "_driver", lambda: drv)
+    monkeypatch.setattr(_cuda, "_loaded", dict(loaded))
+    with pytest.raises(TilefishRuntimeError, match="cuCtxSynchronize failed"):
+        _cuda.unload_all()
+    assert not [e for e in drv.log if e[0] == "unload"] and _cuda._loaded == loaded and drv.stack == []
+
+    monkeypatch.setattr(_cuda, "_driver", lambda: pytest.fail("the driver is not needed when nothing is loaded"))
+    monkeypatch.setattr(_cuda, "_loaded", {})
+    _cuda.unload_all()

@@ -17,7 +17,7 @@ import pytest
 from fake_torch import FakeTensor
 
 import tilefish
-from tilefish import TilefishPreconditionError, TilefishRuntimeError, _plan
+from tilefish import Tensor, TilefishPreconditionError, TilefishRuntimeError, _plan, f32
 from tilefish._planrun import Backend, JitProvider, PlanRunner
 
 ARENA = 1 << 46  # the fake arena's address (256-byte aligned, like torch's)
@@ -74,6 +74,22 @@ class FakeBackend(Backend):
         self.arenas += 1
         self.log.append(("arena", nbytes))
         return object(), ARENA
+
+    def new_event(self, index):
+        self.log.append(("event", index))
+        return SimpleNamespace(name=f"event{self.arenas}")
+
+    def wait_event(self, event, stream, capturing):
+        self.log.append(("wait", event.name, stream, capturing))
+
+    def record_event(self, event, stream, capturing):
+        self.log.append(("record", event.name, stream, capturing))
+
+    def synchronize_event(self, event, index):
+        self.log.append(("synchronize", event.name, index))
+
+    def destroy_event(self, event, index):
+        self.log.append(("destroy", event.name, index))
 
     def empty(self, shape, dtype, index):
         self.next += 1 << 30
@@ -263,7 +279,7 @@ def test_a_capture_that_needs_what_a_capture_cannot_make_says_so():
 
 def test_a_precondition_that_fails_launches_nothing_not_even_the_device_scalar():
     def nothing_ran(be):
-        assert not [e for e in be.log if e[0] in ("launch", "gemm", "devscalar")], be.log
+        assert not [e for e in be.log if e[0] in ("launch", "gemm", "devscalar", "wait", "record")], be.log
 
     # a weight that is not 16-byte aligned
     r, be = runner()
@@ -340,6 +356,101 @@ def test_the_arena_belongs_to_the_plan_layout_not_to_a_runner_so_replacing_a_run
     other = PlanRunner(tilefish.plan(pm.block, reuse=True), FakeProvider(), be)  # another layout is another arena
     other.run(Weights(64).args(), {})
     assert be.arenas == 2 and other.arena_of(0) is not arena
+
+
+def _run_ops(be):
+    """The log of the runs, without what prepares them: the waits, the writes, the launches and the records."""
+    return [e for e in be.log if e[0] in ("wait", "record", "devscalar", "launch", "gemm")]
+
+
+def test_runs_on_two_streams_are_ordered_on_the_device_by_the_order_event_of_the_arena():
+    """Every run of a layout on a device shares the arena, and the arena's lock orders only the enqueueing: each run makes its stream wait for the most recent
+    record of the arena's event before its first write, and records the event on its stream after its last launch, so two runs on two streams never overlap
+    on the device (the reviewer's race, 5 of 5 corrupted before: ``test_gpu_plan.py`` holds it at 0 of 20)."""
+    be = FakeBackend()
+    streams = iter([11, 22, 11, 33])
+    be.stream = lambda index: next(streams)
+    r, _ = runner(backend=be)
+    r2 = PlanRunner(r.plan, FakeProvider(), be)  # another runner of the same layout: the same arena, and the same event
+    for runner_, m in ((r, 64), (r2, 32), (r, 64), (r2, 128)):
+        runner_.run(Weights(m).args(), {})
+    assert be.log.count(("event", 0)) == 1 and be.arenas == 1  # one event, made with the arena
+    ops = _run_ops(be)
+    assert len(ops) == 4 * 12
+    for i, stream in enumerate((11, 22, 11, 33)):
+        run = ops[12 * i : 12 * (i + 1)]
+        assert run[0] == ("wait", "event1", stream, False), run[0]  # before the device scalar is written: it is in the arena
+        assert run[1][0] == "devscalar"
+        assert [e[0] for e in run[2:-1]] == ["launch", "gemm", "launch", "gemm", "launch", "gemm", "launch", "gemm", "launch"]
+        assert {e[-1] for e in run[2:-1]} == {stream}  # every launch on the run's stream
+        assert run[-1] == ("record", "event1", stream, False)
+
+
+def test_a_captured_run_waits_for_and_records_the_order_event_as_nodes_of_the_graph():
+    """Inside a capture the wait and the record are external event nodes, so every replay of the graph is ordered with the runs (and other replays) issued
+    before and after it: a captured graph's arena is the plan's arena."""
+    r, be = runner()
+    r.prepare(0)
+    be.capture = True
+    w = Weights(64)
+    r.run(w.args(), {}, outputs=FakeTensor((64, 256), "bf16", 1 << 50))
+    ops = _run_ops(be)
+    assert ops[0] == ("wait", "event1", 7, True) and ops[-1] == ("record", "event1", 7, True) and len(ops) == 12
+
+
+def test_a_run_that_fails_while_it_launches_still_records_the_order_event():
+    """What a run enqueued before a launch failed still uses the arena: the next run must come after it."""
+
+    class Failing(FakeBackend):
+        def launch(self, loaded, grid, args, stream):
+            if loaded.stem == "attention":
+                raise TilefishRuntimeError("the launch failed")
+            super().launch(loaded, grid, args, stream)
+
+    be = Failing()
+    r, _ = runner(backend=be)
+    with pytest.raises(TilefishRuntimeError, match="the launch failed"):
+        r.run(Weights(64).args(), {})
+    ops = _run_ops(be)
+    assert ops[0][0] == "wait" and [e[1] for e in ops[2:-1]] == ["rmsnorm", "gemm_qkv.M64"] and ops[-1] == ("record", "event1", 7, False)
+
+
+def test_a_plan_with_no_arena_has_nothing_to_order():
+    @tilefish.graph
+    def single(a: Tensor[pm.Q, pm.W, f32]) -> Tensor[pm.Q, pm.W, f32]:
+        return pm.twice(a)
+
+    p = tilefish.plan(single)
+    assert p.arena_bytes == 0
+    r, be = runner(p)
+    r.run((FakeTensor((16, 128), "f32", 1 << 36),), {})
+    assert not any(e[0] in ("event", "wait", "record") for e in be.log) and len(be.launches()) == 1
+
+
+def test_clear_caches_waits_for_the_last_run_on_every_arena_before_it_frees_it(monkeypatch):
+    from tilefish import _planrun
+
+    be = FakeBackend()
+    monkeypatch.setattr(_planrun, "_torch_backend", [be])
+    r, _ = runner(backend=be)
+    r.run(Weights(64).args(), {})
+    arena = r.arena_of(0)
+    assert arena is not None
+    _planrun.clear_caches()
+    tail = be.log[-2:]
+    assert tail == [("synchronize", "event1", 0), ("destroy", "event1", 0)] and r.arena_of(0) is None
+
+    class Stuck(FakeBackend):
+        def synchronize_event(self, event, index):
+            raise TilefishRuntimeError("cannot wait while a stream is being captured")
+
+    be = Stuck()
+    monkeypatch.setattr(_planrun, "_torch_backend", [be])
+    r, _ = runner(backend=be)
+    r.run(Weights(64).args(), {})
+    with pytest.raises(TilefishRuntimeError, match="cannot wait"):
+        _planrun.clear_caches()
+    assert r.arena_of(0) is not None  # nothing that a kernel may still use was freed
 
 
 def test_what_depends_on_the_bucket_only_is_checked_when_the_bucket_is_prepared_not_in_the_middle_of_a_run():
