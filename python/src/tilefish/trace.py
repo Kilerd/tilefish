@@ -133,18 +133,6 @@ _UNSUPPORTED = {
     "__rpow__": ("exponentiation (**)", "multiply explicitly, or use exp, sqrt or rsqrt"),
     "__matmul__": ("matrix multiplication (@)", "declare a library op such as gemm and call it"),
     "__rmatmul__": ("matrix multiplication (@)", "declare a library op such as gemm and call it"),
-    "__floordiv__": ("floor division (//)", "use / on floating-point tensors"),
-    "__rfloordiv__": ("floor division (//)", "use / on floating-point tensors"),
-    "__mod__": ("modulo (%)", "there is no modulo op yet"),
-    "__rmod__": ("modulo (%)", "there is no modulo op yet"),
-    "__lt__": ("comparison (<)", "comparisons and masks are not part of the traced ops yet"),
-    "__le__": ("comparison (<=)", "comparisons and masks are not part of the traced ops yet"),
-    "__gt__": ("comparison (>)", "comparisons and masks are not part of the traced ops yet"),
-    "__ge__": ("comparison (>=)", "comparisons and masks are not part of the traced ops yet"),
-    "__and__": ("bitwise and (&)", "there are no bitwise ops yet"),
-    "__or__": ("bitwise or (|)", "there are no bitwise ops yet"),
-    "__xor__": ("bitwise xor (^)", "there are no bitwise ops yet"),
-    "__invert__": ("bitwise not (~)", "there are no bitwise ops yet"),
     "__lshift__": ("shift (<<)", "there are no bitwise ops yet"),
     "__rshift__": ("shift (>>)", "there are no bitwise ops yet"),
     "__len__": ("len()", "use .shape"),
@@ -274,18 +262,20 @@ class Value:
         raise TilefishAttributeError(
             f"traced tensor {self.ref} ({self.type}) has no attribute '{name}': a tensor has "
             ".shape, .dtype, .rank, .to(dtype), .split(size, axis), the views .reshape(*dims), .permute(*axes), .select(axis, i) "
-            "and x[i], .sum/.mean/.max(axis, keepdims) and the operators + - * /"
+            "and x[i], .sum/.mean/.max(axis, keepdims), .argmax/.argmin(axis, dtype=...), the operators + - * /, // and % of an integer by a positive constant, the comparisons "
+            "== != < <= > >= (a mask) and, on masks, & | ^ ~"
         )
 
     # -- methods ------------------------------------------------------------
 
-    def to(self, dtype: Any = _MISSING) -> "Value":
-        """Cast to ``dtype``. A narrowing cast is flagged as a rounding point in the IR."""
+    def to(self, dtype: Any = _MISSING, *, nan: "str | None" = None) -> "Value":
+        """Cast to ``dtype``. A narrowing cast is flagged as a rounding point in the IR. ``nan="preserve"`` keeps a NaN's sign and payload
+        in the f32 to bf16 cast (``"canonical"``, the default, gives ``0x7FFF``)."""
         from . import ops
 
         if dtype is _MISSING:
             raise TilefishTypeError("to: needs a dtype, e.g. x.to(bf16)")
-        return ops.cast(self, dtype)
+        return ops.cast(self, dtype, nan)
 
     def split(self, size: Any = _MISSING, axis: Any = _MISSING) -> "tuple[Value, ...]":
         """Split ``axis`` into equal chunks of ``size`` (or into chunks of the given sizes)."""
@@ -328,6 +318,18 @@ class Value:
 
         return ops.reduce_max(self, axis, keepdims)
 
+    def argmax(self, axis: Any = -1, *, dtype: Any = None, keepdims: bool = False) -> "Value":
+        """``tilefish.argmax(self, axis, dtype=..., keepdims=...)``: the index of the first maximum (a NaN wins)."""
+        from . import ops
+
+        return ops.argmax(self, axis, dtype=ops._REQUIRED if dtype is None else dtype, keepdims=keepdims)
+
+    def argmin(self, axis: Any = -1, *, dtype: Any = None, keepdims: bool = False) -> "Value":
+        """``tilefish.argmin(self, axis, dtype=..., keepdims=...)``: the index of the first minimum (a NaN wins)."""
+        from . import ops
+
+        return ops.argmin(self, axis, dtype=ops._REQUIRED if dtype is None else dtype, keepdims=keepdims)
+
     # -- operators ----------------------------------------------------------
 
     def __add__(self, other: Any) -> "Value":
@@ -369,6 +371,97 @@ class Value:
         from . import ops
 
         return ops.binary("div", other, self)
+
+    # integer index arithmetic: // and % by a positive constant, with Python's (floor) semantics
+
+    def __floordiv__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.int_division("floordiv", self, other)
+
+    def __rfloordiv__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.int_division("floordiv", other, self)
+
+    def __mod__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.int_division("mod", self, other)
+
+    def __rmod__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.int_division("mod", other, self)
+
+    # comparisons give a mask (bool_); a reflected comparison (0.5 < x) arrives here as its mirror (x > 0.5)
+
+    def __eq__(self, other: Any) -> "Value":  # type: ignore[override]
+        from . import ops
+
+        return ops.compare("eq", self, other)
+
+    def __ne__(self, other: Any) -> "Value":  # type: ignore[override]
+        from . import ops
+
+        return ops.compare("ne", self, other)
+
+    def __lt__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.compare("lt", self, other)
+
+    def __le__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.compare("le", self, other)
+
+    def __gt__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.compare("gt", self, other)
+
+    def __ge__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.compare("ge", self, other)
+
+    # masks combine with & | ^ ~ (logical, on masks only: integers have no bitwise ops yet)
+
+    def __and__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("and", self, other)
+
+    def __rand__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("and", other, self)
+
+    def __or__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("or", self, other)
+
+    def __ror__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("or", other, self)
+
+    def __xor__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("xor", self, other)
+
+    def __rxor__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.logical("xor", other, self)
+
+    def __invert__(self) -> "Value":
+        from . import ops
+
+        return ops.logical_not(self)
 
     def __setitem__(self, key: Any, value: Any) -> None:
         from . import ops

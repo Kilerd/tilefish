@@ -19,6 +19,12 @@ strides as ``StrideOf`` scalars), device scalars (``DevScalar[dtype]``, read wit
 
 M3.2 (P2): :func:`plan` compiles a graph into a static launch plan with an arena memory plan per shape bucket (:mod:`tilefish._plan`), :func:`tilefish.runtime.export` writes it as
 ``plan.json`` next to the manifest (``docs/plan-schema-1.md``), and :func:`run` of a graph executes it in ``jit``, ``replay`` and ``reference`` modes, capturable in a CUDA graph.
+
+M3.3: a lowered kernel compares (a mask, :data:`bool_`), selects (:func:`where`), counts positions (:func:`iota`, integer ``//`` and ``%``),
+reduces to an index (:func:`argmax`, :func:`argmin`), gathers and scatters rows (:func:`gather_rows`, :func:`scatter_rows`), takes
+:func:`sin` and :func:`cos`, keeps a NaN's payload in a cast (``x.to(bf16, nan="preserve")``) and broadcasts an operand over the leading
+axes; a graph materialises a view (:func:`contiguous`) and the patches of a convolution (:func:`im2col`). The numerics contract of each is in
+:mod:`tilefish.lower` (notes 7 to 11) and :mod:`tilefish._copyops`.
 """
 
 from . import aot
@@ -29,6 +35,7 @@ from .dtypes import (
     BlockScaled,
     DType,
     bf16,
+    bool_,
     e2m1,
     e4m3,
     e5m2,
@@ -58,7 +65,8 @@ from ._manifest import Manifest
 from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
-from .ops import exp, gelu, load, rsqrt, silu, sqrt
+from .ops import argmax, argmin, cos, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sin, sqrt, where
+from ._copyops import contiguous, im2col
 from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
@@ -116,10 +124,15 @@ __all__ = [
     "TilefishTypeError",
     "Value",
     "aot",
+    "argmax",
+    "argmin",
     "bf16",
+    "bool_",
     "capture",
     "cdiv",
     "const",
+    "contiguous",
+    "cos",
     "e2m1",
     "e4m3",
     "e5m2",
@@ -127,10 +140,13 @@ __all__ = [
     "extern",
     "f16",
     "f32",
+    "gather_rows",
     "gelu",
     "graph",
     "i32",
     "i64",
+    "im2col",
+    "iota",
     "kernel",
     "library",
     "load",
@@ -139,8 +155,11 @@ __all__ = [
     "plan",
     "rsqrt",
     "run",
+    "scatter_rows",
     "silu",
+    "sin",
     "sqrt",
     "u8",
     "ue8m0",
+    "where",
 ]

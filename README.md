@@ -334,6 +334,44 @@ another cuBLASLt version and a device of another SM count ("re-export the manife
 `jit` and `replay` run the same algorithm. The binding is ctypes on the `libcublasLt` the process already has loaded (torch's); operands are contiguous and 16-byte aligned (strided
 operands are not supported yet).
 
+## Masks, indices, gathers and copies
+
+A lowered `@kernel` also compares, selects, counts positions, reduces to an index, and gathers and scatters rows at indices that are device
+data; a graph materialises a view or the patches of a convolution. Each has an exact numerics contract (notes 7 to 11 of `tilefish.lower`) and
+runs in `jit`, `replay` and `reference`, alone and in a plan.
+
+```python
+import tilefish
+from tilefish import Dim, DevScalar, Tensor, bf16, f32, i32, i64
+
+V, R, C = Dim("V"), Dim("R"), Dim("C", 5000)
+D = Dim("D", 1024)
+
+@tilefish.kernel
+def embed(table: Tensor[V, D, bf16], ids: Tensor[R, i64], n: DevScalar[i32]) -> Tensor[R, D, bf16]:
+    rows = tilefish.gather_rows(table, ids, oob="zero")               # an index outside [0, V) loads a row of +0.0
+    keep = tilefish.iota(rows, axis=0) < tilefish.load(n)            # a mask: the rows below a device-scalar count
+    return tilefish.where(keep, rows, (rows.to(f32) * 0.0).to(bf16))  # a select: the kept rows' bits as they are
+
+@tilefish.kernel
+def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
+    return tilefish.argmax(logits, dtype=i64)                        # torch's rule: the first NaN, else the first maximum
+```
+
+- `== != < <= > >=` give a mask (`tilefish.bool_`, a value inside the body: store it with `.to(u8)`); masks combine with `& | ^ ~`; a scalar is
+  rounded to the operand's dtype before it is compared. `tilefish.where(m, a, b)` selects bits, NaN payloads and signed zeros included.
+- `tilefish.iota(x, axis)` is the index along an axis (`[R, 1]` for the rows of `[R, D]`, `[D]` for its columns); `//` and `%` of integers by a
+  positive constant have Python's semantics.
+- `tilefish.argmax` / `argmin(x, dtype=i32 | i64)` along the last axis are exact and independent of the reduction tree (a combine of
+  (value, index) pairs); a row of up to 16384 columns is walked in chunks of 1024.
+- `tilefish.gather_rows(x, idx, oob="zero" | "clamp")` and `tilefish.scatter_rows(dst, idx, src, oob="skip")` copy rows (or elements) as raw
+  bits, with the out-of-range policy declared at the call.
+- `x.to(bf16, nan="preserve")` keeps a NaN's sign and payload (the default, `"canonical"`, gives `0x7FFF`); `tilefish.sin` and `tilefish.cos`
+  are libdevice's, built with flush-to-zero like every libdevice function Triton links.
+- The elementwise template broadcasts an operand over the leading axes (a `[T, D]` table added to a `[K, T, D]` batch).
+- In a graph, `tilefish.contiguous(view)` and `tilefish.im2col(x, kernel, stride, padding)` are ops whose Triton tilefish generates, reading
+  a strided view: a materialised permutation, and convolution patches with channel-major columns and `+0.0` padding.
+
 ## Launch plans: a graph as a static list of launches over one arena
 
 A model forward is not one kernel. `tilefish.plan(graph, buckets=...)` compiles a `@tilefish.graph` into a **launch plan**: for every combination of the bucket values of its

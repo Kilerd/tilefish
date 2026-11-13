@@ -1,4 +1,5 @@
-"""Traced built-in operations: elementwise arithmetic, unary math, casts, reductions, views (split, reshape, permute, select), loads of a DevScalar, store.
+"""Traced built-in operations: elementwise arithmetic, comparisons and masks (``where``, ``iota``), unary math, casts, reductions (and
+``argmax`` / ``argmin``), gathers and scatters of rows, views (split, reshape, permute, select), loads of a DevScalar, store.
 
 Every function here takes traced :class:`~tilefish.trace.Value` operands,
 type-checks them, appends a node to the trace and returns new ``Value``s.
@@ -18,13 +19,15 @@ import math
 from typing import Any, Sequence
 
 from .dims import DimExpr, as_dim, cdiv, describe_pair, dim_bounds
-from .dtypes import BlockScaled, DType
+from .dtypes import BlockScaled, DType, bool_, i32, i64
 from .errors import TilefishError, TilefishTypeError
 from .ir import Scalar
 from .trace import Const, TraceContext, Value
 from .types import TensorType, _mul, product as _product, starts_aligned as _starts_aligned
 
 _SYMBOLS = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
+_INDEX_DEFAULT = i32
+_INDEX_DTYPES = (i32, i64)
 
 
 # -- operand checking ---------------------------------------------------------
@@ -54,6 +57,11 @@ def _require_computable(op: str, label: str, x: Value, *, floating: bool = False
         raise TilefishTypeError(
             f"{op}: {label} has block-scaled dtype {dt!r}; it can only be passed to operators that "
             "declare it (library/extern), not combined directly"
+        )
+    if dt.is_bool:
+        raise TilefishTypeError(
+            f"{op}: {label} is the mask {x.ref} ({x.type}), which has no arithmetic and no order: combine masks with & | ^ ~, select "
+            "with tilefish.where(mask, a, b), or make it a number with .to(u8) (0 or 1)"
         )
     if not dt.computable:
         raise TilefishTypeError(
@@ -125,11 +133,22 @@ def broadcast_shapes(op: str, a: TensorType, b: TensorType) -> tuple[DimExpr, ..
 # -- elementwise arithmetic ---------------------------------------------------
 
 
-def binary(op: str, left: Any, right: Any) -> Value:
-    """``left <op> right`` for ``op`` in ``add``, ``sub``, ``mul``, ``div``."""
-    named = f"{op} ({_SYMBOLS[op]})"
-    sides = [("left operand", left), ("right operand", right)]
-    ctx: TraceContext | None = None
+def _operands(
+    named: str,
+    sides: "list[tuple[str, Any]]",
+    *,
+    floating: bool = False,
+    dtype: "DType | None" = None,
+    masks: bool = False,
+    ctx: "TraceContext | None" = None,
+) -> "tuple[TraceContext, list[Value | Scalar], DType, tuple[DimExpr, ...]]":
+    """Resolve the operands of an elementwise op: the trace, the operands (scalars typed), their common dtype and the broadcast shape.
+
+    Tensors must have one dtype (no implicit promotion); a python number or a ``const`` takes that dtype and is rounded to it. ``dtype``
+    is the dtype the caller requires (``tilefish.where(..., dtype=...)``), and the only source of it when every operand is a scalar.
+    ``masks`` lets the operands be masks (``where`` selects between masks too); ``ctx`` is the trace when it is known otherwise (the mask
+    of a ``where`` whose operands are scalars).
+    """
     resolved: list[Any] = []
     for lab, x in sides:
         if isinstance(x, Value):
@@ -142,20 +161,160 @@ def binary(op: str, left: Any, right: Any) -> Value:
     if ctx is None:
         raise TilefishTypeError(f"{named}: at least one operand must be a traced tensor value")
     tensors = [(lab, x) for (lab, _), x in zip(sides, resolved) if isinstance(x, Value)]
-    dtypes = [_require_computable(named, lab, x, floating=(op == "div")) for lab, x in tensors]
-    if len(tensors) == 2 and tensors[0][1].dtype != tensors[1][1].dtype:
-        raise TilefishTypeError(
-            f"{named}: no implicit promotion between tensor dtypes: left operand is {tensors[0][1].type}, "
-            f"right operand is {tensors[1][1].type}; cast one side explicitly with .to(dtype)"
-        )
-    dtype = dtypes[0]
-    operands = [
-        x if isinstance(x, Value) else _scalar_operand(named, lab, x, dtype)
-        for (lab, _), x in zip(sides, resolved)
+    dtypes = [
+        x.dtype if (masks and isinstance(x.dtype, DType) and x.dtype.is_bool) else _require_computable(named, lab, x, floating=floating)
+        for lab, x in tensors
     ]
-    shapes = [o.type for o in operands if isinstance(o, Value)]
-    shape = shapes[0].shape if len(shapes) == 1 else broadcast_shapes(named, shapes[0], shapes[1])
+    for (lab, x), dt in zip(tensors, dtypes):
+        if dt != dtypes[0]:
+            raise TilefishTypeError(
+                f"{named}: no implicit promotion between tensor dtypes: {tensors[0][0]} is {tensors[0][1].type}, "
+                f"{lab} is {x.type}; cast one side explicitly with .to(dtype)"
+            )
+        if dtype is not None and dt != dtype:
+            raise TilefishTypeError(f"{named}: {lab} is {x.type}, but dtype={dtype} was asked for; cast it with .to({dtype})")
+    if not dtypes and dtype is None:
+        raise TilefishTypeError(f"{named}: every operand is a scalar, so the result has no dtype; pass dtype=... (f32, bf16, i32, ...)")
+    common = dtypes[0] if dtypes else dtype
+    assert common is not None
+    if common.is_bool and len(tensors) < len(sides):
+        raise TilefishTypeError(f"{named}: masks combine with masks, not with python numbers or consts; compare first (x > 0)")
+    operands = [x if isinstance(x, Value) else _scalar_operand(named, lab, x, common) for (lab, _), x in zip(sides, resolved)]
+    acc: "TensorType | None" = None  # the broadcast of the tensor operands so far (the first operand's own type until there is a second)
+    for o in operands:
+        if isinstance(o, Value):
+            acc = o.type if acc is None else TensorType(broadcast_shapes(named, acc, o.type), common)
+    return ctx, operands, common, acc.shape if acc is not None else ()
+
+
+def binary(op: str, left: Any, right: Any) -> Value:
+    """``left <op> right`` for ``op`` in ``add``, ``sub``, ``mul``, ``div``."""
+    named = f"{op} ({_SYMBOLS[op]})"
+    ctx, operands, dtype, shape = _operands(named, [("left operand", left), ("right operand", right)], floating=(op == "div"))
     (out,) = ctx.emit(op, operands, {}, [TensorType(shape, dtype)])
+    return out
+
+
+_INT_DIVISION = {"floordiv": "//", "mod": "%"}
+
+
+def int_division(op: str, x: Any, divisor: Any) -> Value:
+    """``x // c`` (``floordiv``) or ``x % c`` (``mod``) of an integer tensor by a positive constant, with Python's semantics: the quotient
+    rounds toward minus infinity and the remainder is in ``[0, c)`` (not C's, which truncate: ``-7 // 2`` is ``-4`` and ``-7 % 2`` is ``1``).
+
+    The divisor is a python int, an integer ``const`` or a static dimension, and positive: a tensor divisor could be zero or negative, so it
+    is refused. Exact (no overflow is possible). For index arithmetic: ``iota(x, -1) % H``, ``(p // W, p % W)``.
+    """
+    named = f"{op} ({_INT_DIVISION[op]})"
+    if not isinstance(x, Value):
+        raise TilefishTypeError(
+            f"{named}: the divisor {divisor!r} is a traced tensor; a divisor is a positive constant (a python int, an integer const or a static "
+            "dimension), because a tensor could be zero or negative"
+        )
+    x = _require_value(named, "the dividend", x)
+    dt = _require_computable(named, "the dividend", x)
+    if not dt.is_int:
+        raise TilefishTypeError(f"{named}: {x.ref} is {x.type}; // and % are integer index arithmetic here (use / on floating-point tensors)")
+    if isinstance(divisor, Value):
+        raise TilefishTypeError(
+            f"{named}: the divisor {divisor.ref} is a traced tensor; a divisor is a positive constant (a python int, an integer const or a "
+            "static dimension), because a tensor could be zero or negative"
+        )
+    c = _scalar_operand(named, "the divisor", divisor, dt)
+    if c.value < 1:
+        raise TilefishTypeError(f"{named}: the divisor must be positive, got {c.value}")
+    (out,) = x.ctx.emit(op, [x, c], {}, [x.type.materialized()])
+    return out
+
+
+# -- comparisons, masks, where, iota -------------------------------------------------------------------------------------------
+
+COMPARISONS = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+LOGICAL = {"and": "&", "or": "|", "xor": "^"}
+
+
+def compare(op: str, left: Any, right: Any) -> Value:
+    """``left <op> right`` for ``op`` in ``eq ne lt le gt ge``: a mask (:data:`~tilefish.dtypes.bool_`) of the broadcast shape.
+
+    The operands have one dtype (no implicit promotion; a python number or a ``const`` takes the tensor's dtype and is rounded to it,
+    as in arithmetic). Floats compare as IEEE 754 does: ``-0.0 == +0.0``; a NaN is unordered, so every comparison with a NaN is
+    false except ``!=``, which is true (``x != x`` is the NaN test). Integers compare by value (``u8`` unsigned).
+    """
+    named = f"comparison ({COMPARISONS[op]})"
+    ctx, operands, _, shape = _operands(named, [("left operand", left), ("right operand", right)])
+    (out,) = ctx.emit(op, operands, {}, [TensorType(shape, bool_)])
+    return out
+
+
+def _require_mask(named: str, label: str, x: Any) -> Value:
+    if not isinstance(x, Value):
+        raise TilefishTypeError(
+            f"{named}: {label} must be a mask (a comparison of traced tensors, such as x > 0), got {type(x).__name__} ({x!r})"
+        )
+    x = _require_value(named, label, x)
+    if not (isinstance(x.dtype, DType) and x.dtype.is_bool):
+        raise TilefishTypeError(
+            f"{named}: {label} is {x.type}, not a mask: a mask comes from a comparison (x != 0 reads a stored u8 mask back)"
+        )
+    return x
+
+
+def logical(op: str, left: Any, right: Any) -> Value:
+    """``left & right``, ``left | right``, ``left ^ right`` of two masks (logical and, or, exclusive or), broadcast."""
+    named = f"{op} ({LOGICAL[op]})"
+    a = _require_mask(named, "left operand", left)
+    b = _require_mask(named, "right operand", right)
+    if a.ctx is not b.ctx:
+        raise TilefishTypeError(f"{named}: the operands belong to different traces")
+    (out,) = a.ctx.emit(op, [a, b], {}, [TensorType(broadcast_shapes(named, a.type, b.type), bool_)])
+    return out
+
+
+def logical_not(x: Any) -> Value:
+    """``~mask``: the logical negation of a mask."""
+    x = _require_mask("not (~)", "the operand", x)
+    (out,) = x.ctx.emit("not", [x], {}, [x.type.materialized()])
+    return out
+
+
+def where(mask: Any, a: Any, b: Any, *, dtype: "DType | None" = None) -> Value:
+    """``tilefish.where(mask, a, b)``: ``a`` where ``mask`` is true, else ``b``, element by element, broadcast over the three.
+
+    A select, not arithmetic: the bits of the chosen operand pass through unchanged (a NaN keeps its payload, ``-0.0`` its sign).
+    ``a`` and ``b`` have one dtype (no implicit promotion); a python number or a ``const`` takes the dtype of the tensor operand and is
+    rounded to it. When both are scalars, ``dtype=`` gives the result's dtype (``tilefish.where(j < n, 0.0, -1e4, dtype=bf16)``).
+    """
+    named = "where"
+    if dtype is not None and not isinstance(dtype, DType):
+        raise TilefishTypeError(f"where: dtype must be a dtype such as f32 or bf16, got {dtype!r}")
+    m = _require_mask(named, "the mask", mask)
+    _, operands, dt, shape = _operands(named, [("argument 'a'", a), ("argument 'b'", b)], dtype=dtype, masks=True, ctx=m.ctx)
+    out_shape = broadcast_shapes(named, m.type, TensorType(shape, dt))
+    (out,) = m.ctx.emit("where", [m, *operands], {}, [TensorType(out_shape, dt)])
+    return out
+
+
+def iota(x: Any, axis: int = -1, *, dtype: "DType | None" = None) -> Value:
+    """The index of every position of ``x`` along ``axis``, as an ``i32`` tensor (``dtype=i64`` for ``i64``).
+
+    Only the shape of ``x`` is used (nothing is read; ``x`` may be an ``Out`` parameter). The result varies along ``axis`` only, so it
+    has the broadcastable shape ``x.shape[axis:]`` with size 1 after ``axis``: for ``x: [R, D]``, ``iota(x, axis=0)`` is ``[R, 1]`` (the row
+    index) and ``iota(x, axis=-1)`` is ``[D]`` (the column index); for ``x: [n]`` it is ``[n]``. ``tilefish.iota(x, 0) < tilefish.load(n)`` is
+    the mask of the rows below a device-scalar count.
+    """
+    if not isinstance(x, Value):
+        raise TilefishTypeError(f"iota: takes a traced tensor (for its shape), got {type(x).__name__} ({x!r})")
+    if x.type.rank == 0:
+        raise TilefishTypeError(f"iota: {x.ref} ({x.type}) has rank 0, so it has no axis to count along")
+    if isinstance(axis, bool) or not isinstance(axis, int) or not -x.rank <= axis < x.rank:
+        raise TilefishTypeError(f"iota: axis {axis!r} is invalid for {x.type} (rank {x.rank})")
+    if dtype is None:
+        dtype = _INDEX_DEFAULT
+    if dtype not in _INDEX_DTYPES:
+        raise TilefishTypeError(f"iota: dtype must be i32 or i64, got {dtype!r}")
+    ax = axis % x.rank
+    shape = (x.shape[ax], *(as_dim(1) for _ in x.shape[ax + 1 :]))
+    (out,) = x.ctx.emit("iota", [], {"dim": x.shape[ax]}, [TensorType(shape, dtype)])
     return out
 
 
@@ -192,11 +351,29 @@ def sqrt(x: Value) -> Value:
     return _unary("sqrt", x)
 
 
+def sin(x: Value) -> Value:
+    """The sine (libdevice's ``sinf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`)."""
+    return _unary("sin", x)
+
+
+def cos(x: Value) -> Value:
+    """The cosine (libdevice's ``cosf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`)."""
+    return _unary("cos", x)
+
+
 # -- casts ------------------------------------------------------------------------
 
 
-def cast(x: Value, dtype: DType) -> Value:
+NAN_MODES = ("canonical", "preserve")
+
+
+def cast(x: Value, dtype: DType, nan: "str | None" = None) -> Value:
     """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point.
+
+    ``nan`` says what the f32 to bf16 cast does with a NaN (note 1 of :mod:`tilefish.lower`): ``"canonical"`` (the default, PTX
+    ``cvt.rn.bf16.f32``) gives the canonical NaN ``0x7FFF``; ``"preserve"`` is the integer round to nearest even on the bit pattern, which
+    keeps a NaN's sign and the top of its payload (quiet bit set): ``0xFFC00000`` becomes ``0xFFC0``. The two agree on every other input.
+    Only that cast has the option.
 
     A cast to the dtype the tensor already has emits no node and behaves exactly like reading the
     tensor at that point: it returns the version that is current at the time of the cast, and that
@@ -211,10 +388,25 @@ def cast(x: Value, dtype: DType) -> Value:
         )
     if not isinstance(dtype, DType):
         raise TilefishTypeError(f"to: expected a dtype such as f32 or bf16, got {dtype!r}")
+    if dtype.is_bool and dtype != x.dtype:
+        raise TilefishTypeError(
+            f"to: {x.ref} ({x.type}) cannot be cast to a mask: a mask comes from a comparison, so write the test it stands for "
+            "(x != 0 is what a cast to bool would mean, and is true for a NaN)"
+        )
+    if nan is not None:
+        if nan not in NAN_MODES:
+            raise TilefishTypeError(f"to: nan must be 'canonical' or 'preserve', got {nan!r}")
+        if not (x.dtype.name == "f32" and dtype.name == "bf16"):
+            raise TilefishTypeError(
+                f"to: nan= is a mode of the f32 to bf16 cast; casting {x.type} to {dtype} has one NaN rule (see note 1 of the numerics contract)"
+            )
     if dtype == x.dtype:
         return x._reference()
     rounding = x.dtype.is_narrowing_to(dtype)
-    (out,) = x.ctx.emit("cast", [x], {"to": dtype, "rounding": rounding}, [x.type.with_dtype(dtype)])
+    attrs: dict[str, Any] = {"to": dtype, "rounding": rounding}
+    if nan == "preserve":  # the default, "canonical", is the plain cast and leaves the node as it always was
+        attrs["nan"] = nan
+    (out,) = x.ctx.emit("cast", [x], attrs, [x.type.with_dtype(dtype)])
     return out
 
 
@@ -265,6 +457,51 @@ def reduce_mean(x: Value, axis: Any = None, keepdims: bool = False) -> Value:
 def reduce_max(x: Value, axis: Any = None, keepdims: bool = False) -> Value:
     """Maximum over ``axis`` with numpy semantics."""
     return _reduce("max", x, axis, keepdims)
+
+
+class _Required:
+    def __repr__(self) -> str:
+        return "<required>"
+
+
+_REQUIRED: Any = _Required()
+
+
+def _arg_reduce(op: str, x: Any, axis: Any, dtype: Any, keepdims: Any) -> Value:
+    x = _require_value(op, "argument 'x'", x)
+    _require_computable(op, "argument 'x'", x)
+    if x.rank == 0:
+        raise TilefishTypeError(f"{op}: {x.ref} ({x.type}) has rank 0, so it has no axis to reduce")
+    if isinstance(axis, bool) or not isinstance(axis, int):
+        raise TilefishTypeError(f"{op}: axis must be one int (the index of one axis is returned), got {axis!r}")
+    (ax,) = _normalize_axes(op, x, axis)
+    if dtype is _REQUIRED:
+        raise TilefishTypeError(f"{op}: say the index type: dtype=i32 or dtype=i64 (it is part of the result's type)")
+    if dtype not in _INDEX_DTYPES:
+        raise TilefishTypeError(f"{op}: dtype must be i32 or i64, got {dtype!r}")
+    if not isinstance(keepdims, bool):
+        raise TilefishTypeError(f"{op}: keepdims must be True or False, got {keepdims!r}")
+    shape = [as_dim(1) if i == ax else d for i, d in enumerate(x.shape)] if keepdims else [d for i, d in enumerate(x.shape) if i != ax]
+    (out,) = x.ctx.emit(op, [x], {"axes": (ax,), "keepdims": keepdims, "dtype": dtype}, [TensorType(shape, dtype)])
+    return out
+
+
+def argmax(x: Any, axis: Any = -1, *, dtype: Any = _REQUIRED, keepdims: Any = False) -> Value:
+    """The index of the maximum along ``axis``, as ``dtype`` (``i32`` or ``i64``, required).
+
+    Exact, and the same as torch's ``argmax``: the first maximum wins (``-0.0`` and ``+0.0`` are equal, so the first of them); a NaN is
+    larger than every number, so the first NaN wins; a row of ``-inf`` gives 0. A bf16 or f16 value is compared as its (exact) f32 value.
+    """
+    return _arg_reduce("argmax", x, axis, dtype, keepdims)
+
+
+def argmin(x: Any, axis: Any = -1, *, dtype: Any = _REQUIRED, keepdims: Any = False) -> Value:
+    """The index of the minimum along ``axis``, as ``dtype`` (``i32`` or ``i64``, required).
+
+    Exact, and the same as torch's ``argmin``: the first minimum wins (``-0.0`` and ``+0.0`` are equal); a NaN wins here too (torch's
+    rule: a NaN propagates through min and max alike), so the first NaN; a row of ``+inf`` gives 0.
+    """
+    return _arg_reduce("argmin", x, axis, dtype, keepdims)
 
 
 # -- split ---------------------------------------------------------------------------
@@ -584,6 +821,88 @@ def getitem(x: Any, key: Any) -> Value:
     if out is x:  # x[:] and x[...] name the tensor itself
         return x._reference()
     return out
+
+
+# -- gather and scatter of rows -----------------------------------------------------------------------
+
+GATHER_OOB = ("zero", "clamp")
+SCATTER_OOB = ("skip",)
+
+
+def _index_operand(op: str, idx: Any) -> Value:
+    idx = _require_value(op, "the index", idx)
+    dt = idx.dtype
+    if not (isinstance(dt, DType) and dt.is_int):
+        raise TilefishTypeError(f"{op}: the index {idx.ref} is {idx.type}; an index is an integer tensor (i32, i64 or u8)")
+    if idx.rank == 0:
+        raise TilefishTypeError(f"{op}: the index {idx.ref} has rank 0; give it a shape ([R] for R rows)")
+    return idx
+
+
+def _oob(op: str, oob: Any, allowed: "tuple[str, ...]") -> str:
+    if oob is _REQUIRED:
+        raise TilefishTypeError(
+            f"{op}: say what an index out of range does: oob={' or '.join(repr(a) for a in allowed)} (an index is device data, which "
+            "nothing checks before the kernel reads it)"
+        )
+    if oob not in allowed:
+        raise TilefishTypeError(f"{op}: oob must be {' or '.join(repr(a) for a in allowed)}, got {oob!r}")
+    return str(oob)
+
+
+def gather_rows(x: Any, idx: Any, *, oob: Any = _REQUIRED) -> Value:
+    """``x[idx]`` along the first axis: ``out[i..., :] = x[idx[i...], :]``, a raw copy of the rows (NaN payloads, signed zeros as they are).
+
+    ``x`` is ``[N, ...]`` (in a lowered kernel a read-only parameter, ``[N, D]`` or ``[N]``) and ``idx`` an integer tensor; the result has
+    the shape ``idx.shape + x.shape[1:]`` and the dtype of ``x``. An index is device data, so what an index outside ``[0, N)`` does is part of
+    the call: ``oob="zero"`` gives a row of zeros (``+0.0``, all bits clear), ``oob="clamp"`` the nearest row (0 or ``N - 1``). An embedding
+    lookup is ``gather_rows(table, ids, oob="zero")``.
+    """
+    named = "gather_rows"
+    x = _require_value(named, "the table", x)
+    if isinstance(x.dtype, BlockScaled):
+        raise TilefishTypeError(f"{named}: {x.ref} is block-scaled ({x.type}); a gather of data and scales is not supported yet")
+    if x.rank == 0:
+        raise TilefishTypeError(f"{named}: the table {x.ref} has rank 0; it has no rows")
+    if isinstance(x.dtype, DType) and x.dtype.is_bool:
+        raise TilefishTypeError(f"{named}: the table {x.ref} is a mask, which is not in memory")
+    idx = _index_operand(named, idx)
+    if idx.ctx is not x.ctx:
+        raise TilefishTypeError(f"{named}: the table and the index belong to different traces")
+    policy = _oob(named, oob, GATHER_OOB)
+    (out,) = x.ctx.emit(named, [x, idx], {"oob": policy}, [TensorType((*idx.shape, *x.shape[1:]), x.dtype)])
+    return out
+
+
+def scatter_rows(dst: Any, idx: Any, src: Any, *, oob: Any = _REQUIRED) -> None:
+    """``dst[idx] = src`` along the first axis, in place: ``dst[idx[i...], :] = src[i..., :]``, a raw copy; the rows of ``dst`` that no index
+    names keep their bytes (an index copy).
+
+    ``dst`` is an ``InOut`` parameter ``[N, ...]``, ``idx`` an integer tensor and ``src`` has the shape ``idx.shape + dst.shape[1:]`` and the dtype
+    of ``dst``. ``oob="skip"`` (required) says that a source row whose index is outside ``[0, N)`` is not written. The indices in range must
+    be distinct: two sources for one row race, and which bytes land is not defined (as in torch's ``index_copy_``). Like a store, the call
+    replaces the version of ``dst`` it writes; the parameter's name then reads the new one.
+    """
+    named = "scatter_rows"
+    if not isinstance(dst, Value):
+        raise TilefishTypeError(f"{named}: the target must be a traced tensor, got {type(dst).__name__}")
+    if not dst.is_param or dst.access != "inout":
+        what = "an Out parameter, whose rows that no index names would be left unwritten" if dst.access == "out" else "not an InOut parameter"
+        raise TilefishTypeError(f"{named}: the target {dst.ref} ({dst.type}) is {what}; declare it InOut[...] (the rows not named keep their bytes)")
+    idx = _index_operand(named, idx)
+    src = _require_value(named, "the source", src)
+    if src.ctx is not dst.ctx or idx.ctx is not dst.ctx:
+        raise TilefishTypeError(f"{named}: the target, the index and the source belong to different traces")
+    want = TensorType((*idx.shape, *dst.shape[1:]), dst.dtype)
+    if src.type != want:
+        raise TilefishTypeError(f"{named}: the source is {src.type}, but rows of {dst.type} indexed by {idx.type} are {want}")
+    policy = _oob(named, oob, SCATTER_OOB)
+    current = dst.live  # the version this scatter replaces
+    (new,) = dst.ctx.emit(named, [current, idx, src], {"target": dst.name, "oob": policy}, [dst.type])
+    dst.ctx.written.add(dst)
+    current._consumed_by = (dst.ctx.nodes[-1], dst.name)
+    current._latest = new
+    dst._latest = new
 
 
 # -- DevScalar ---------------------------------------------------------------------------------

@@ -353,22 +353,30 @@ def test_value_is_not_indexable_iterable_or_truthy(tr):
         lambda x: x**2,
         lambda x: 2**x,
         lambda x: x @ x,
-        lambda x: x > 0,
-        lambda x: x <= 1,
-        lambda x: x // 2,
-        lambda x: x % 2,
         lambda x: len(x),
         lambda x: int(x),
         lambda x: float(x),
         lambda x: range(x),
-        lambda x: ~x,
-        lambda x: x & x,
         lambda x: x << 1,
     ],
 )
 def test_unsupported_operators_raise_tilefish_errors(tr, use):
     x = tr.val(Tensor[M, f32])
     with pytest.raises(TilefishTypeError, match="not supported in M1"):
+        use(x)
+
+
+@pytest.mark.parametrize("use", [lambda x: x // 2, lambda x: x % 2])
+def test_integer_division_of_floats_is_refused(tr, use):
+    x = tr.val(Tensor[M, f32])
+    with pytest.raises(TilefishTypeError, match="use / on floating-point tensors"):
+        use(x)
+
+
+@pytest.mark.parametrize("use", [lambda x: ~x, lambda x: x & x, lambda x: x | x, lambda x: x ^ x])
+def test_bitwise_operators_on_numbers_are_refused(tr, use):
+    x = tr.val(Tensor[M, f32])
+    with pytest.raises(TilefishTypeError, match="not a mask"):
         use(x)
 
 

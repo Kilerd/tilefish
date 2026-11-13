@@ -60,3 +60,15 @@ def test_readme_dims_and_formats(ns):
     assert ns["mxfp8"].block == 32 and ns["nvfp4"].global_scale is f32
     assert ns["mxfp4"] != ns["mxfp8"]
     assert isinstance(ns["M"], Dim) and ns["M"].is_dynamic
+
+
+def test_the_masks_section_runs_and_lowers():
+    import re
+
+    if not (REPO_ROOT / "README.md").exists():
+        pytest.skip("README.md is not available (not running from a source checkout)")
+    m = re.search(r"## Masks, indices, gathers and copies\n.*?```python\n(.*?)```", (REPO_ROOT / "README.md").read_text(), re.S)
+    assert m, "README.md has no python block under '## Masks, indices, gathers and copies'"
+    namespace: dict = {}
+    exec(compile(m.group(1), "README.md", "exec"), namespace)
+    assert namespace["embed"].lower().template == "row" and "static_range" in namespace["greedy"].lower().source

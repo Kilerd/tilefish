@@ -1396,7 +1396,7 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
         for index, n in enumerate(g.nodes):
             kind = n.attrs.get("kind")
             if kind is None:
-                x = env[n.inputs[0]]  # type: ignore[index]
+                x = env[n.inputs[0]] if n.inputs else None  # type: ignore[index]  (iota reads no input)
                 if n.op == "reshape":
                     results = [x.reshape([size(d) for d in n.attrs["shape"]])]
                 elif n.op == "permute":

@@ -397,14 +397,21 @@ def test_row_dim_may_be_static_or_an_expression():
 # -- rejected patterns ---------------------------------------------------------------------------------------
 
 
-def test_broadcast_is_rejected_by_the_elementwise_template():
+def test_the_elementwise_template_broadcasts_trailing_axes_only_when_the_row_template_cannot_or_is_not_asked():
     @tilefish.kernel
     def bcast(x: Tensor[M, D, f32], w: Tensor[D, f32]) -> Tensor[M, D, f32]:
         return x * w
 
-    err = fails(bcast, "elementwise.same-shape", template="elementwise", contains=["does not broadcast", "parameter 'w'"])
-    assert "kernel 'bcast' with the elementwise template" in str(err)
     assert bcast.lower().template == "row"  # without a forced template, the row template takes it
+    forced = bcast.lower(template="elementwise")  # forced, the elementwise template broadcasts w over the leading axis
+    assert "tl.load(w + offs % w_n, mask=mask, other=0)" in forced.source
+
+    @tilefish.kernel
+    def per_row(x: Tensor[M, D, f32], s: Tensor[M, 1, f32]) -> Tensor[M, D, f32]:
+        return x * s
+
+    err = fails(per_row, "elementwise.same-shape", template="elementwise", contains=["does not broadcast", "parameter 's'"])
+    assert "kernel 'per_row' with the elementwise template" in str(err)
     # a scalar is not a broadcast
     @tilefish.kernel
     def scalar(x: Tensor[M, D, f32]) -> Tensor[M, D, f32]:
