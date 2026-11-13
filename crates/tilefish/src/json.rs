@@ -275,17 +275,35 @@ impl Parser<'_> {
     }
 }
 
+/// The shortest digits that read back as `x` (positive and finite) and where the decimal point goes: `x = 0.<digits> * 10^decpt`.
+///
+/// This must be CPython's digits, and not only some shortest digits: when two strings of the same length both round-trip, Python's
+/// `repr` (David Gay's `dtoa` in shortest mode) takes the one closest to the exact value and, when the exact value is a tie between
+/// them (it ends in a 5 one digit past the shortest), the even one. Rust's `{:e}` rounds such a tie up (`2^-25` is
+/// `2.9802322387695312e-08` in Python and `...313e-08` there), so the digits come from Ryu, which rounds the tie to even.
+fn shortest_digits(x: f64) -> (String, i32) {
+    let mut buffer = ryu::Buffer::new();
+    let text = buffer.format_finite(x);
+    let (mantissa, exponent) = match text.split_once('e') {
+        Some((m, e)) => (m, e.parse::<i32>().expect("Ryu writes an integer exponent")),
+        None => (text, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all = format!("{int_part}{frac_part}");
+    let mut decpt = int_part.len() as i32 + exponent;
+    let leading = all.len() - all.trim_start_matches('0').len();
+    decpt -= leading as i32;
+    let digits = all.trim_matches('0').to_owned();
+    (digits, decpt)
+}
+
 /// `repr(x)` of a Python float, for a finite `x`.
 pub fn python_float_repr(x: f64) -> String {
     assert!(x.is_finite(), "a canonical document has only finite floats");
     if x == 0.0 {
         return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_owned();
     }
-    let sci = format!("{:e}", x.abs()); // the shortest digits that read back as x: "1.5e-5"
-    let (mantissa, exponent) = sci.split_once('e').expect("{:e} always has an exponent");
-    let exponent: i32 = exponent.parse().expect("{:e} has an integer exponent");
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let decpt = exponent + 1; // the value is 0.<digits> * 10^decpt
+    let (digits, decpt) = shortest_digits(x.abs()); // the value is 0.<digits> * 10^decpt
     let n = digits.len() as i32;
     let body = if decpt <= -4 || decpt > 16 {
         let e = decpt - 1;
@@ -444,6 +462,13 @@ mod tests {
             (5e-324, "5e-324"),
             (f64::MAX, "1.7976931348623157e+308"),
             (9007199254740993.0, "9007199254740992.0"),
+            // exact decimal ties between two shortest strings: Python takes the even one (Rust's `{:e}` rounds them up)
+            (2.0f64.powi(-25), "2.9802322387695312e-08"),
+            (5.0 * 2.0f64.powi(-23), "5.960464477539062e-07"),
+            (9.0 * 2.0f64.powi(-23), "1.0728836059570312e-06"),
+            (13.0 * 2.0f64.powi(-23), "1.5497207641601562e-06"),
+            (2.0f64.powi(49) + 0.25, "562949953421312.2"),
+            (2.0f64.powi(49) + 0.75, "562949953421312.8"),
         ] {
             assert_eq!(python_float_repr(x), want, "{x:e}");
         }
