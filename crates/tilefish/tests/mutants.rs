@@ -227,8 +227,15 @@ fn an_expanded_view_is_refused_for_a_dense_parameter_read_or_written() {
 /// A dimension is at least 1: a size that would bind one to 0 is refused (`NotPositive`), not bound.
 #[test]
 fn a_dimension_that_solves_to_zero_is_refused() {
-    // softmax with x declared [M + 1, 1000]: one row of x would be M = 0
-    let (_copy, plan) = edited("softmax", |e| param(e, "x")["shape"] = serde_json::json!(["M + 1", 1000]));
+    // softmax with x declared [M + 1, 1000] (and its max_elements precondition, which is on its own shape): one row of x would be M = 0
+    let (_copy, plan) = edited("softmax", |e| {
+        param(e, "x")["shape"] = serde_json::json!(["M + 1", 1000]);
+        for p in e["preconditions"].as_array_mut().unwrap() {
+            if p["kind"] == "max_elements" && p["arg"] == "x" {
+                p["shape"] = serde_json::json!(["M + 1", "1000"]);
+            }
+        }
+    });
     let call = |x_rows: usize, out_rows: usize| {
         let (x, out) = ([x_rows, 1000], [out_rows, 1000]);
         plan.prepare(&[dense(A, &x, DType::F32, Access::In), dense(B, &out, DType::F32, Access::Out)], Some(&DEVICE))
