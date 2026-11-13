@@ -1,8 +1,8 @@
 //! Reading a manifest directory: the cubins, checked against what the manifest says.
 //!
 //! A port of `python/src/tilefish/_manifest.py` (`Manifest.load`) and of the schema checks of `_specvalid.py`, for manifest schema 3
-//! (`docs/manifest-schema-3.md`). A manifest is read as strict JSON (see [`crate::json`]), every field has the type it needs and no key
-//! is unknown, and the entries are checked for being consistent with themselves: the ABI (pointers, strided views, device scalars,
+//! (`docs/manifest-schema-3.md`). A manifest is read as strict JSON (see [`crate::json`]), every field has the type it needs (an object is
+//! an object, never the list of its values) and no key is unknown, and the entries are checked for being consistent with themselves: the ABI (pointers, strided views, device scalars,
 //! scalars, `fixed` arguments, scratch slots), the preconditions, the buckets, the grid. Then each cubin is read, and refused unless
 //! its `sha256` (the file) and `sha256_code` (the machine code, see [`crate::elf`]) are the manifest's, it has the code section of
 //! the manifest's symbol, and it is for the architecture the entry says. A Triton kernel that does not use shared memory in the
@@ -26,7 +26,7 @@ use crate::elf::{Elf, sha256_hex};
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Symbols, parse_expr, parse_grid};
 use crate::gemm::CachedGemm;
-use crate::json::{canonical, parse_strict};
+use crate::json::{canonical, parse_strict, type_name};
 use crate::kernel::Cached;
 use crate::library::{LibraryEntry, RawLibrary};
 use crate::tensor::DType;
@@ -361,8 +361,10 @@ pub enum Precondition {
 }
 
 /// What the binary asks of the launch besides grid, block and shared memory.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// Read (with serde) from a JSON object with exactly these six fields, by name: a list of the values in their order is refused, as Python
+/// refuses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchAttributes {
     /// Bytes of global scratch the kernel needs (a plain launch passes a null pointer).
     pub global_scratch_size: u64,
@@ -376,6 +378,18 @@ pub struct LaunchAttributes {
     pub num_ctas: u32,
     /// A cooperative launch.
     pub cooperative: bool,
+}
+
+/// The derived reader of [`LaunchAttributes`] (every field by name, none unknown), which `by_name!` hands an object only.
+#[derive(Deserialize)]
+#[serde(remote = "LaunchAttributes", deny_unknown_fields)]
+struct LaunchFields {
+    global_scratch_size: u64,
+    profile_scratch_size: u64,
+    launch_pdl: bool,
+    cluster_dims: [u32; 3],
+    num_ctas: u32,
+    cooperative: bool,
 }
 
 impl LaunchAttributes {
@@ -580,8 +594,53 @@ pub fn manifest_digest(doc: &Value) -> std::result::Result<String, String> {
 
 // -- the typed, strict reading of one entry --------------------------------------------------------------------------------
 
+/// The value a struct of the manifest is read from, refused unless it is a JSON object.
+///
+/// serde's derived `Deserialize` of a struct also takes a JSON array, the fields by position (`[0, 0, false, [1, 1, 1], 1, false]` for the
+/// launch attributes), and Python's reader refuses one (`isinstance(entry, dict)`, `_keys`): a manifest names every field. So every struct a
+/// manifest is read into derives its reader as an inherent function (`#[serde(remote = "Self")]`, or a `remote` mirror for a public type)
+/// and has its `Deserialize` from `by_name!`, which hands that reader an object only, at every depth. `what` names it in the message.
+pub(crate) fn object_value<'de, D: serde::Deserializer<'de>>(d: D, what: &str) -> std::result::Result<Value, D::Error> {
+    let value = Value::deserialize(d)?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "{what} must be an object (its fields by name), got {}",
+            type_name(&value)
+        )))
+    }
+}
+
+/// `Deserialize` for structs that are read from a JSON object only (see `object_value`): `Type => reader, "what it is";`, where the
+/// reader is the derived one (`Type::deserialize` of a struct derived with `#[serde(remote = "Self")]`).
+macro_rules! by_name {
+    ($($ty:ty => $read:path, $what:expr;)*) => {$(
+        impl<'de> serde::Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+                $read($crate::manifest::object_value(d, $what)?).map_err(serde::de::Error::custom)
+            }
+        }
+    )*};
+}
+pub(crate) use by_name;
+
+by_name! {
+    LaunchAttributes => LaunchFields::deserialize, "launch";
+    RawDoc => RawDoc::deserialize, "the manifest";
+    RawEntry => RawEntry::deserialize, "a kernel entry";
+    RawAbi => RawAbi::deserialize, "abi";
+    RawStrideOf => RawStrideOf::deserialize, "stride_of";
+    RawParam => RawParam::deserialize, "a parameter of abi.params";
+    RawDim => RawDim::deserialize, "an entry of dims";
+    RawScratch => RawScratch::deserialize, "a slot of abi.scratch";
+    RawConstexpr => RawConstexpr::deserialize, "an entry of constexprs";
+    RawOptions => RawOptions::deserialize, "options";
+    RawToolchain => RawToolchain::deserialize, "toolchain";
+}
+
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawDoc {
     schema: Value,
     #[serde(default)]
@@ -592,7 +651,7 @@ struct RawDoc {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawEntry {
     stem: String,
     op: String,
@@ -631,7 +690,7 @@ struct RawEntry {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawAbi {
     params: Vec<RawParam>,
     scratch: Vec<RawScratch>,
@@ -639,14 +698,14 @@ struct RawAbi {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawStrideOf {
     arg: String,
     axis: u64,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawParam {
     slot: usize,
     index: usize,
@@ -677,7 +736,7 @@ struct RawParam {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawDim {
     #[serde(default)]
     divisible_by: Option<u64>,
@@ -688,7 +747,7 @@ struct RawDim {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawScratch {
     slot: usize,
     name: String,
@@ -700,7 +759,7 @@ struct RawScratch {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawConstexpr {
     index: usize,
     name: String,
@@ -710,7 +769,7 @@ struct RawConstexpr {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawOptions {
     num_warps: u32,
     num_stages: u32,
@@ -719,7 +778,7 @@ struct RawOptions {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawToolchain {
     #[serde(default)]
     triton: Option<String>,

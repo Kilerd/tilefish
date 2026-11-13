@@ -198,6 +198,70 @@ fn an_unknown_key_a_missing_key_and_a_wrong_type_are_refused() {
     assert!(refused(&copy).contains("not a JSON object") || refused(&copy).contains("not a tilefish manifest"));
 }
 
+/// Replace an object by the list of its values, in its order: what serde's derived reader of a struct also takes (its fields by position).
+fn by_position(v: &mut serde_json::Value) {
+    let values: Vec<serde_json::Value> = v.as_object().expect("an object").values().cloned().collect();
+    *v = serde_json::Value::Array(values);
+}
+
+#[test]
+fn an_object_given_as_the_list_of_its_values_is_refused() {
+    // Python reads every one of these with `isinstance(x, dict)`; serde's derive would take the values by position
+    type Pick = fn(&mut serde_json::Value) -> &mut serde_json::Value;
+    let stride_of: Pick = |d| {
+        let params = Copy::entry(d, "strided_copy")["abi"]["params"].as_array_mut().unwrap();
+        params.iter_mut().find_map(|p| p.get_mut("stride_of")).expect("a scalar that carries a stride")
+    };
+    let cases: [(&str, Pick, &str); 14] = [
+        ("a kernel entry", |d| Copy::entry(d, "softmax"), "a kernel entry must be an object"),
+        ("abi", |d| &mut Copy::entry(d, "softmax")["abi"], "abi must be an object"),
+        (
+            "a parameter",
+            |d| &mut Copy::entry(d, "softmax")["abi"]["params"][0],
+            "a parameter of abi.params must be an object",
+        ),
+        ("stride_of", stride_of, "stride_of must be an object"),
+        (
+            "a scratch slot",
+            |d| &mut Copy::entry(d, "softmax")["abi"]["scratch"][1],
+            "a slot of abi.scratch must be an object",
+        ),
+        ("an empty dims entry", |d| &mut Copy::entry(d, "softmax")["dims"]["M"], "an entry of dims must be an object"),
+        ("a dims entry", |d| &mut Copy::entry(d, "gelu_exact")["dims"]["T"], "an entry of dims must be an object"),
+        (
+            "a constexpr",
+            |d| &mut Copy::entry(d, "softmax")["constexprs"][0],
+            "an entry of constexprs must be an object",
+        ),
+        ("the compile options", |d| &mut Copy::entry(d, "softmax")["options"], "options must be an object"),
+        ("the toolchain", |d| &mut Copy::entry(d, "softmax")["toolchain"], "toolchain must be an object"),
+        ("an empty toolchain", |d| &mut Copy::entry(d, "axpy_cubin")["toolchain"], "toolchain must be an object"),
+        ("the launch attributes", |d| &mut Copy::entry(d, "softmax")["launch"], "launch must be an object"),
+        ("a library entry", |d| &mut d["library"][0], "a library entry must be an object"),
+        ("the abi of a library entry", |d| &mut d["library"][0]["abi"], "abi must be an object"),
+    ];
+    for (what, pick, why) in cases {
+        let copy = Copy::of("sm_103");
+        copy.edit_json(|doc| by_position(pick(doc)));
+        let message = refused(&copy);
+        assert!(message.contains(why) && message.contains("got list"), "{what}: {message}");
+    }
+    let copy = Copy::of("sm_103");
+    copy.edit_json(|doc| by_position(&mut doc["library"][0]["abi"]["params"][0]));
+    let message = refused(&copy);
+    assert!(
+        message.contains("library entry #0") && message.contains("a parameter of abi.params must be an object"),
+        "{message}"
+    );
+    // the whole document
+    let copy = Copy::of("sm_103");
+    copy.edit_json(by_position);
+    assert!(refused(&copy).contains("it is not a JSON object"));
+    // and the launch attributes read by themselves
+    let e = serde_json::from_str::<tilefish::LaunchAttributes>("[0, 0, false, [1, 1, 1], 1, false]").unwrap_err();
+    assert!(e.to_string().contains("launch must be an object (its fields by name), got list"), "{e}");
+}
+
 #[test]
 fn a_tampered_cubin_is_refused_by_its_file_digest() {
     let copy = Copy::of("sm_103");

@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 use crate::elf::sha256_hex;
 use crate::error::{Error, Result};
 use crate::expr::{Symbols, parse_expr};
-use crate::json::{canonical, parse_strict};
+use crate::json::{canonical, parse_strict, type_name};
 use crate::manifest::{
     Access, MANIFEST_NAME, Manifest, ParamKind, Pin, ShapeDim, is_arch, is_digest, is_ident, is_stem,
 };
@@ -306,18 +306,6 @@ fn keys<'v>(obj: &'v Value, what: &str, keys: &[&str], optional: &[&str]) -> Che
         message.push_str(&format!("; unknown {unknown:?}"));
     }
     refuse(message)
-}
-
-fn type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "NoneType",
-        Value::Bool(_) => "bool",
-        Value::Number(n) if n.is_f64() => "float",
-        Value::Number(_) => "int",
-        Value::String(_) => "str",
-        Value::Array(_) => "list",
-        Value::Object(_) => "dict",
-    }
 }
 
 fn align_up(n: u128) -> u128 {

@@ -391,6 +391,19 @@ pub fn canonical(v: &Value) -> String {
     out
 }
 
+/// The name Python gives the type of what `json.loads` makes of `v` (`type(v).__name__`): `"list"` for an array, `"dict"` for an object.
+pub(crate) fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

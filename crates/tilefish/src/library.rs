@@ -12,8 +12,8 @@ use serde_json::{Map, Value};
 use crate::error::{Error, Result};
 use crate::expr::{Symbols, parse_expr};
 use crate::manifest::{
-    ALIGNMENT, Access, DimInfo, MAX_ELEMENTS, Param, ParamKind, Precondition, ShapeDim, is_arch, is_digest, is_ident,
-    is_stem, parse_dims, parse_shape, precondition_of, want_ident, want_int,
+    ALIGNMENT, Access, DimInfo, MAX_ELEMENTS, Param, ParamKind, Precondition, ShapeDim, by_name, is_arch, is_digest,
+    is_ident, is_stem, parse_dims, parse_shape, precondition_of, want_ident, want_int,
 };
 use crate::tensor::DType;
 
@@ -92,7 +92,7 @@ impl LibraryEntry {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 pub(crate) struct RawLibrary {
     stem: String,
     op: String,
@@ -123,13 +123,13 @@ pub(crate) struct RawLibrary {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawLibraryAbi {
     params: Vec<RawLibraryParam>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(remote = "Self", deny_unknown_fields)]
 struct RawLibraryParam {
     index: u64,
     name: String,
@@ -137,6 +137,13 @@ struct RawLibraryParam {
     dtype: String,
     access: String,
     shape: Vec<Value>,
+}
+
+// each from a JSON object only, as Python reads them (`validate_entry`, `_keys`): not a list of the values by position
+by_name! {
+    RawLibrary => RawLibrary::deserialize, "a library entry";
+    RawLibraryAbi => RawLibraryAbi::deserialize, "abi";
+    RawLibraryParam => RawLibraryParam::deserialize, "a parameter of abi.params";
 }
 
 /// An integer field from 1 to `2**31 - 1` (a size, or a leading dimension, of cuBLASLt's `int32` world).
