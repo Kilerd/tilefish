@@ -380,6 +380,10 @@ buffer of its own with `cuMemcpyDtoDAsync`, a memcpy node in a CUDA graph. The c
 is never written. `state[...] = r` into an `InOut` parameter is a copy step into the caller's tensor. A copy of a view that is not dense is refused when the
 plan is made (`docs/plan-schema-1.md`, section 7.5).
 
+**Returned views.** A graph may return a reshape of a result at no cost (`return y.reshape(M, N)` of a flat `y`: the caller's output is `y`'s buffer, in the
+returned shape, and the step that writes it binds it through a flat view), and any other dense view, a parameter or a value twice, which a copy step after
+the last call puts into the caller's output. A view that is not dense is refused.
+
 A plan launches declared operators and views. Arithmetic traced in the graph body, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its
 tensor was updated in place are refused with the rule that says so; there is no fusion in a plan yet. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation rules, the
 digest) for the host that will run it without Python.

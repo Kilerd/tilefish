@@ -378,7 +378,10 @@ A graph body that a plan cannot make is refused by `tilefish.plan` with the rule
 * a call to **another graph** (it is not inlined yet).
 * an **in-place call on a view** of another tensor (the IR says updating a view does not change its parent; a plan has no copy to make that true), and a view **read after its tensor was updated
   in place**.
-* a returned value that is **an input, a view of anything, or returned twice**.
+* a returned value that is **a view that is not dense**, a **`DevScalar`**, or a view of a tensor updated in place after the view was made. (Any other returned value is
+  planned: a tensor a call made is the caller's output buffer itself; **all of it in another shape** (a reshape: offset 0, the row-major strides, as many elements) too,
+  the output buffer then having the returned shape and the steps that write and read it a view of their own shape; **any other dense view, a parameter and a value
+  returned twice** are copied into the caller's buffer by a copy step after the last call, section 7.5.)
 * a **dimension without buckets**, an operator **without an implementation** (a `library` op with no `impl`), two different operators with one name, a block-scaled tensor.
 
 ## 13. An example
@@ -418,6 +421,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | a step that reads three views with one stride pair; a step whose dimension only its `Out` buffer has (section 5) | `test_shared_strides.py`, `test_output_dims.py`; on a GPU `test_gpu_shared_strides.py`, `test_gpu_output_dims.py` |
 | a result written over its input (`MayAlias`, section 8) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
 | copy steps (`tilefish.copy`, a store into an `InOut` parameter; section 7.5) | `test_plan_copy.py`; on a GPU `test_gpu_plan_copy.py`; the Rust reader: `python_plans.json` (`copy ...` documents) |
+| returned views and parameters (section 12) | `test_plan_returns.py`; on a GPU `test_gpu_plan_returns.py` |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |
 | the document of section 13 | `test_plan_docs.py` |

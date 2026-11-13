@@ -7,6 +7,7 @@ do (``host_ops`` imports it with a stand-in for Triton where there is none). No 
   (``Out[..., MayAlias("r")]``: every program loads its row of ``r`` before it stores the same row of ``r_out``). ``residual_chain`` is a graph
   that makes the residual in the arena and updates it with two calls, which a plan makes in place (one buffer for the three versions).
 * ``copy_steps``: a graph with two copy steps, ``tilefish.copy`` of a dense view into the arena and a store into an ``InOut`` parameter.
+* ``view_returns``: a graph that returns a reshape of a result (no copy), a dense view of a parameter and the result again (copy steps).
 """
 
 import triton
@@ -67,3 +68,19 @@ def copy_steps(x: Tensor[2, Rb, 64, f32], state: InOut[Tensor[Rb, 64, f32]]):
     y, r = add_into(x[0], r)
     state[...] = r
     return y
+
+
+# -- returned views ---------------------------------------------------------------------------------------------------------------------------
+
+
+@tilefish.kernel
+def flat_scaled(x: Tensor[Rb * 64, f32]) -> Tensor[Rb * 64, f32]:
+    return x * 3.0
+
+
+@tilefish.graph
+def view_returns(x: Tensor[2, Rb, 64, f32]):
+    """A flat result returned as ``[Rb, 64]`` (all of its buffer in another shape: the caller's output, no copy), a dense view of a parameter (a copy
+    step) and the result again (a copy step)."""
+    y = flat_scaled(x[1].reshape(Rb * 64))
+    return y.reshape(Rb, 64), x[0], y.reshape(Rb, 64)

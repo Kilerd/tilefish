@@ -29,7 +29,8 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   step;
 * **an Out that may be written over an input** (``gpu_kernels_p5.py``): ``add_into`` launched with its outputs apart; the plan ``residual_chain``
   (without and with reuse) writes both of its calls in place, over the residual it made in the arena; the plan ``copy_steps`` has two copy steps
-  (``tilefish.copy`` of a dense view into the arena, a store into an ``InOut`` parameter), launched and captured;
+  (``tilefish.copy`` of a dense view into the arena, a store into an ``InOut`` parameter), launched and captured; the plan ``view_returns`` returns a
+  reshape of a result (the caller's output is its buffer), a dense view of a parameter and the result again (copy steps);
 * **a dimension only an Out tensor determines** (``gpu_kernels_p4.py``): a ``[B]`` mask made from a device scalar, run with ``outputs=`` (which is what
   binds ``B``), bucketed and not; the plan ``mask_rows`` makes it in a step whose ``B`` is the graph's;
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
@@ -548,6 +549,9 @@ def plan_graphs():
             for seed in (0, 1)
         ]
 
+    def view_cases():
+        return [(f"Rb{rb}-seed{seed}", {"x": randn((2, rb, 64), F32, seed=rb + seed + 30)}) for rb in (8, 24) for seed in (0, 1)]
+
     def residual_cases():
         return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 64), F32, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
 
@@ -563,6 +567,7 @@ def plan_graphs():
         ("residual_chain", p5.residual_chain, False, residual_cases),  # two steps whose Out is written over their input (MayAlias)
         ("residual_chain-reuse", p5.residual_chain, True, residual_cases),
         ("copy_steps", p5.copy_steps, False, copy_cases),  # a copy of a dense view into the arena and a store into an InOut parameter
+        ("view_returns", p5.view_returns, False, view_cases),  # a reshape of a result returned (no copy), a dense view of a parameter and a value twice (copies)
     ]
 
 

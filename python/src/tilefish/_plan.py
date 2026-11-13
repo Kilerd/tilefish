@@ -19,10 +19,12 @@ of the manifest it was built against, so a pin of the plan digest pins every bin
 Triton and no GPU. :mod:`tilefish._planrun` runs a plan.
 
 What a plan accepts. A graph body is calls to declared operators (``kernel``, ``extern``, ``library`` with an ``impl``) and views. A traced
-arithmetic op in the graph body (``x + y``, a cast, a reduction), a ``store``, a call to another ``graph``, a ``Dim`` parameter and an ``Out``
-parameter are refused with the rule that says so (wrap arithmetic in a ``@tilefish.kernel``; a graph's results are its returned values). An in-place
+arithmetic op in the graph body (``x + y``, a cast, a reduction), a call to another ``graph``, a ``Dim`` parameter and an ``Out``
+parameter are refused with the rule that says so (wrap arithmetic in a ``@tilefish.kernel``; a graph's results are its returned values); ``tilefish.copy``
+and a ``store`` into an ``InOut`` parameter are copy steps (a device-to-device copy of dense bytes). An in-place
 call (``InOut``) must take a whole buffer, not a view of another tensor (the IR says a chunk that is updated does not change its parent; a plan
-has no copy to make that true). A returned value must be a fresh buffer made by a call: not an input, and not a view.
+has no copy to make that true). A returned value is the buffer a call made (all of it, in any shape: a reshape costs nothing), or a copy step at the end
+copies it (a dense view, a parameter, a value returned twice); a view that is not dense is refused.
 """
 
 from __future__ import annotations
@@ -290,6 +292,19 @@ def _storage_uses(g: Any) -> "tuple[dict[Value, Value], dict[Value, int]]":
     return root, last
 
 
+def _whole_reshape(l: _Loc) -> bool:
+    """Whether a view is all of its buffer in another shape: offset 0, the row-major strides of its shape, and provably as many elements as the buffer
+    (a reshape of a whole tensor). Returning one costs nothing: the buffer is the caller's output, in the returned shape."""
+    from .ops import _same_count
+
+    if not (l.offset.folded().is_static and l.offset.folded().value == 0):
+        return False
+    dense = row_major_strides(l.shape)
+    if any(d is None for d in dense) or any(s.folded() != d.folded() for s, d in zip(l.strides, dense) if d is not None):  # type: ignore[union-attr]
+        return False
+    return _same_count(tuple(l.shape), tuple(l.buffer.shape))
+
+
 def _in_place(
     p: Any, ins: "Mapping[str, Value]", loc: "Mapping[Value, _Loc]", roots: "Mapping[Value, Value]", last_use: "Mapping[Value, int]", n: Any, index: int
 ) -> "_Loc | None":
@@ -474,17 +489,30 @@ def _walk(gop: GraphOp) -> _Walk:
     outputs: "list[_Buffer]" = []
     for i, v in enumerate(g.outputs):
         l = loc[v]
-        if any(l.buffer is o for o in outputs):
-            _fail(name, f"the returned value {v.ref} is returned twice (a plan writes each result into one buffer of the caller's)")
-        if not l.whole or l.buffer.role != "intermediate":
-            why = "a view" if not l.whole else f"the {l.buffer.role} '{l.buffer.name}'"
+        if l.version != l.buffer.version:
             _fail(
                 name,
-                f"the returned value {v.ref} ({v.type}) is {why}, not a tensor that a call made: a plan writes a result into a buffer the caller provides, "
-                "and has no copy to put an input or a view there; have an op produce it",
+                f"the returned value {v.ref} ({v.type}) is a view of a tensor that was updated in place after the view was made: the IR gives a view the "
+                "contents its tensor had then, but a view shares the storage. Return the view of the updated version (its .live)",
             )
-        l.buffer.role = "output"
-        outputs.append(l.buffer)
+        if l.buffer.role == "devscalar":
+            _fail(name, f"the returned value {v.ref} is the DevScalar '{l.buffer.name}', one element the host writes: return a tensor an op made from it")
+        made = l.buffer.role == "intermediate" and not any(l.buffer is o for o in outputs)
+        if made and l.whole:  # a tensor a call made: the caller's output buffer is where the call writes it
+            l.buffer.role = "output"
+            outputs.append(l.buffer)
+        elif made and _whole_reshape(l):  # a dense view of all of it from its first element (a reshape): the same bytes in the returned shape
+            l.buffer.shape = tuple(v.type.shape)
+            l.buffer.role = "output"
+            outputs.append(l.buffer)
+        else:  # a parameter, a part of a tensor, a value returned twice: a copy step at the end into a buffer of the caller's
+            out = new_buffer("output", v.type.dtype, tuple(v.type.shape), "")
+            strides = row_major_strides(v.type.shape)
+            if any(s is None for s in strides):
+                _fail(name, f"the returned value {v.ref} has the type {v.type}, whose strides are not affine expressions, so it cannot be planned")
+            dst = _Loc(out, tuple(v.type.shape), tuple(strides), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
+            steps.append(_SymStep(None, [_Arg("src", l, "in"), _Arg("dst", dst, "out")], f"the return of {v.ref} ({v.type})", copy=True))
+            outputs.append(out)
     if any(s.library for s in steps):
         words = max(s.callee.op.workspace_bytes for s in steps if s.library)
         ws = _Buffer("", "workspace", "u8", (DimExpr.const(words),), len(buffers))
