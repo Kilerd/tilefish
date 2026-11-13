@@ -53,11 +53,17 @@ has not recorded yet: **the replay and that run overlap on the arena** (the same
 no error (3 of 4000 runs of a plan on one thread, against a loop of replays on another, on a B300). A caller who replays a raw graph while another thread
 may use the same plan (``tilefish.run``, the replay of a :class:`CapturedPlan`, whose wait and record are two calls too, or the replay of another raw graph)
 must order them itself (one thread, or a lock of its own around all of them), or use :func:`capture`, whose replay takes the arena's lock.
+
+**An arena shared by several plans.** :func:`share_arena` (``tilefish.runtime.share_arena([g1, g2, g3], ...)``) runs the plans of a set on one arena of
+the largest plan's size, each plan's buffers at their own offsets in it (:class:`SharedArena`). Its runners hold one :class:`_Arena` between them, so
+everything above holds for the executions of all of them as for the runs of one plan: one lock and one order event, so a run, a capture, the replay of a
+:class:`CapturedPlan` and a ``run_step`` of plan A are ordered with those of plan B, whatever their threads and streams. Nothing in the arena outlives a run.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 import json
 import os
@@ -661,9 +667,12 @@ def _record(be: Backend, event: Any, stream: int, capturing: bool) -> None:
 
 
 class PlanRunner:
-    """Runs one plan (:class:`~tilefish._plan.Plan`) with binaries from a provider, on a backend. See the module docstring."""
+    """Runs one plan (:class:`~tilefish._plan.Plan`) with binaries from a provider, on a backend. See the module docstring.
 
-    def __init__(self, plan: Plan, provider: Any, backend: "Backend | None" = None) -> None:
+    ``arena`` is ``(key, bytes)`` of the arena the runner uses when it is not the plan's own (one per plan layout and device): the arena of a
+    :class:`SharedArena`, which several plans use one at a time."""
+
+    def __init__(self, plan: Plan, provider: Any, backend: "Backend | None" = None, *, arena: "tuple[str, int] | None" = None) -> None:
         self.plan = plan
         self.provider = provider
         self._backend = backend
@@ -672,6 +681,10 @@ class PlanRunner:
         self._rts: "dict[tuple, _BucketRT]" = {}
         self._lock = threading.RLock()
         self.has_library = any(s["kind"] == "library" for s in self._doc["buckets"][0]["steps"])
+        self.shared = arena is not None  # the arena is a SharedArena's (other plans run on it too)
+        self._arena_key, self._arena_bytes = arena if arena is not None else (plan.layout_key, self._doc["arena_bytes"])
+        if self._arena_bytes < self._doc["arena_bytes"]:  # pragma: no cover - a SharedArena is sized for every plan it has
+            raise TilefishRuntimeError(f"the arena of {self._arena_bytes} bytes cannot hold the {self._doc['arena_bytes']} of the plan of graph '{plan.name}'")
         _runners.add(self)
 
     @property
@@ -702,8 +715,9 @@ class PlanRunner:
             self._rts.clear()
 
     def arena_of(self, index: int) -> "_Arena | None":
-        """The arena of this plan's layout on device ``index``, if it exists (it is shared by every runner of that layout, and kept until ``clear_caches``)."""
-        return self.backend.arena_registry().get((self.plan.layout_key, index))
+        """The arena of this runner on device ``index``, if it exists: the one of this plan's layout (shared by every runner of that layout), or the
+        one of the :class:`SharedArena` the runner belongs to (shared by the runners of its plans); kept until ``clear_caches``."""
+        return self.backend.arena_registry().get((self._arena_key, index))
 
     def _arena(self, index: int) -> _Arena:
         arena = self.arena_of(index)
@@ -718,12 +732,12 @@ class PlanRunner:
         with _arena_lock:
             arena = self.arena_of(index)
             if arena is None:
-                nbytes = self._doc["arena_bytes"]
+                nbytes = self._arena_bytes
                 handle, ptr = be.alloc_arena(nbytes, index) if nbytes else (None, 0)
                 if nbytes and ptr % _plan.ARENA_ALIGNMENT:
                     raise TilefishRuntimeError(f"the arena was allocated at {ptr:#x}, which is not aligned to {_plan.ARENA_ALIGNMENT} bytes")
                 event = be.new_event(index) if nbytes else None  # a plan with no arena shares no memory between its runs: nothing to order
-                arena = be.arena_registry()[(self.plan.layout_key, index)] = _Arena(handle, ptr, nbytes, threading.Lock(), event)
+                arena = be.arena_registry()[(self._arena_key, index)] = _Arena(handle, ptr, nbytes, threading.Lock(), event)
         return arena
 
     def _bucket(self, values: "Mapping[str, int]", index: int) -> _BucketRT:
@@ -995,11 +1009,11 @@ class PlanRunner:
         if capture is None:  # pragma: no cover - the caller saw the stream capturing
             return
         if arena.captured is not None and arena.captured[0] == capture and arena.captured[1] != stream:
+            who = f"a plan of the shared arena of graph '{self.plan.name}'" if self.shared else f"the plan of graph '{self.plan.name}'"
             raise TilefishRuntimeError(
-                f"the plan of graph '{self.plan.name}' was already run in this CUDA graph capture on another stream: two runs of one plan in one capture must be on "
-                "one stream (each run waits for the run before it through the arena's order event, and inside one graph a run on a forked stream would not wait "
-                "for the other, so a replay would run both at once on the same arena). Run them on the same stream, or capture them in two graphs, or use "
-                "tilefish.capture"
+                f"{who} was already run in this CUDA graph capture on another stream: two runs on one arena in one capture must be on one stream (each run "
+                "waits for the run before it through the arena's order event, and inside one graph a run on a forked stream would not wait for the other, so a "
+                "replay would run both at once on the same arena). Run them on the same stream, or capture them in two graphs, or use tilefish.capture"
             )
         arena.captured = (capture, stream)
 
@@ -1173,7 +1187,13 @@ class PlanRunner:
                 if arena.nbytes and ranges[b["name"]][0] < arena.ptr + arena.nbytes and arena.ptr < ranges[b["name"]][1]:
                     raise TilefishPreconditionError(
                         f"'{b['name']}' overlaps the arena of the plan (the memory the plan keeps its intermediates, device scalars and workspace in): a tensor of the "
-                        "caller must not be in it",
+                        "caller must not be in it"
+                        + (
+                            " (the arena is shared with other plans, which write all of its bytes: a value that outlives a run is a returned value, in a "
+                            "tensor of the caller)"
+                            if self.shared
+                            else ""
+                        ),
                         kind="alias",
                         arg=b["name"],
                     )
@@ -1584,6 +1604,143 @@ def weighted(runner: PlanRunner, weights: "Mapping[str, Any]") -> WeightedRun:
                     f"bind_weights: the weight '{name}' has size {size} on axis {axis}, but the plan has {want_size} there", kind="static_size", arg=name
                 )
     return WeightedRun(runner, {n: weights[n] for n in want})
+
+
+# -- an arena shared by several plans ------------------------------------------------------------------------------------------------------
+
+SHARED_ARENA_TAG = b"tilefish.shared-arena.v1\0"
+
+
+class SharedArena:
+    """Several plans that a host runs **one at a time** on **one arena** (``docs/plan-schema-1.md``, section 15.1): the plans of a set (stage A, then
+    B, then C of a request; a variable number of tile plans), which would otherwise each have an arena of their own.
+
+    **The layout.** The arena has the bytes of the largest arena of the plans (``arena_bytes``: the largest ``arena_bytes`` of their documents), and
+    each plan keeps its own layout in it, from the same first byte: every buffer at the ``offset`` its plan says, so a CUDA graph captured from any of
+    them holds fixed addresses. Nothing of a plan's document changes (its digest neither, nor the set's): the layout is the plans' own, which their
+    pin covers. The plans' intermediates, device-scalar slots and cuBLASLt workspaces overlap; that is sound because no two executions on the arena
+    overlap on the device (next item) and an execution writes every arena buffer it reads before it reads it (a device scalar's slot before the first
+    launch).
+
+    **The order.** The arena has one lock and one order event (:class:`_Arena`): every run, capture, replay of a :class:`CapturedPlan` and
+    :meth:`run_step` of **any** of the plans takes the lock, makes its stream wait for the event and records it after its last launch, exactly as the
+    runs of one plan do. So two executions on the arena, of one plan or of two, from any threads and on any streams, run one after the other on the
+    device, in the order they were issued: they cannot run concurrently. A ``torch.cuda.graph`` capture of runs on the arena on two streams of one
+    capture is refused, as for one plan.
+
+    **What outlives a run.** Nothing in the arena: the next execution, of any plan of the arena, writes over it. A value one plan makes and a later
+    plan reads is a **returned value** of the first (a tensor of the caller's: ``outputs=``, or allocated by the run) passed as an argument of the
+    second. A tensor of the caller that overlaps the arena, anywhere in it (not only in the part of the plan that runs), is refused, as is a tap or a
+    tensor of :meth:`run_step` that does: what would be overwritten is refused, never corrupted.
+
+    Arenas are kept per layout as for one plan: every ``SharedArena`` of the same plans (the same layouts, in ``jit`` or ``replay``) on one device uses
+    one arena, kept until ``tilefish.runtime.clear_caches()``; a plan run alone (``tilefish.run``) has its own arena, not this one."""
+
+    def __init__(self, runners: "Sequence[PlanRunner]") -> None:
+        runners = list(runners)
+        if not runners:
+            raise TilefishRuntimeError("a shared arena is the arena of one plan or more: give the plans that share it")
+        names = [r.plan.name for r in runners]
+        twice = sorted({n for n in names if names.count(n) > 1})
+        if twice:
+            raise TilefishRuntimeError(f"a shared arena has each plan once: {', '.join(twice)} is given twice")
+        backends = {id(r._backend) for r in runners}
+        if len(backends) != 1:
+            raise TilefishRuntimeError("the plans of a shared arena run on one backend")
+        layouts = sorted(r.plan.layout_key for r in runners)
+        self.key = "shared:" + hashlib.sha256(SHARED_ARENA_TAG + "\0".join(layouts).encode("ascii")).hexdigest()
+        self.arena_bytes = max(r.plan.arena_bytes for r in runners)
+        self._runners = {r.plan.name: PlanRunner(r.plan, r.provider, r._backend, arena=(self.key, self.arena_bytes)) for r in runners}
+
+    def __repr__(self) -> str:
+        return f"SharedArena(plans={list(self._runners)}, arena_bytes={self.arena_bytes})"
+
+    @property
+    def names(self) -> "list[str]":
+        """The graphs of the plans, in the order they were given."""
+        return list(self._runners)
+
+    @property
+    def plans(self) -> "dict[str, Plan]":
+        """The plans, by graph name."""
+        return {n: r.plan for n, r in self._runners.items()}
+
+    @property
+    def sizes(self) -> "dict[str, int]":
+        """The ``arena_bytes`` of each plan (its own part of the arena, from the first byte), by graph name."""
+        return {n: r.plan.arena_bytes for n, r in self._runners.items()}
+
+    def runner(self, graph: Any) -> PlanRunner:
+        """The runner of ``graph`` (the graph, or its name) on the shared arena; a graph whose plan is not one of the arena's is refused."""
+        name = graph if isinstance(graph, str) else getattr(graph, "name", None)
+        r = self._runners.get(name) if isinstance(name, str) else None
+        if r is None or (not isinstance(graph, str) and r.plan.graph is not graph):
+            raise TilefishRuntimeError(f"{graph!r} is not a graph of this shared arena: its plans are {list(self._runners)}")
+        return r
+
+    def run(self, graph: Any, *args: Any, outputs: Any = None, taps: Any = None, **kwargs: Any) -> Any:
+        """``tilefish.run(graph, *args, outputs=, taps=)`` of one plan of the arena, on the arena (ordered with every other execution on it)."""
+        return self.runner(graph).run(args, kwargs, outputs, taps)
+
+    def capture(
+        self, graph: Any, *externals: Any, devscalars: "Mapping[str, Any] | None" = None, outputs: Any = None, stream: Any = None, taps: Any = None
+    ) -> CapturedPlan:
+        """``tilefish.capture`` of one plan of the arena, on the arena: the :class:`CapturedPlan`'s replays are ordered with every run and replay of
+        every plan of the arena."""
+        return self.runner(graph).capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream, taps)
+
+    def bind_weights(self, graph: Any, weights: "Mapping[str, Any]") -> WeightedRun:
+        """``bind_weights`` of one plan of the arena: its runs and captures are on the arena."""
+        return weighted(self.runner(graph), weights)
+
+    def run_step(self, graph: Any, step: int, buffers: "Mapping[str, Any]", bucket: "Mapping[str, int] | None" = None) -> None:
+        """``run_step`` of one plan of the arena (its GEMM workspace is in the arena: ordered with the other executions on it)."""
+        self.runner(graph).run_step(step, buffers, bucket)
+
+    def prepare(self, device: Any = None, buckets: "Mapping[str, Sequence[Mapping[str, int]]] | None" = None) -> None:
+        """``prepare`` of every plan of the arena (the arena once, the binaries of every bucket, or of ``buckets[graph name]``), on ``device``
+        (default: torch's current device)."""
+        first = next(iter(self._runners.values()))
+        index = runtime._torch().cuda.current_device() if device is None else first.backend.device_index(device)
+        if buckets is not None:
+            unknown = sorted(set(buckets) - set(self._runners))
+            if unknown:
+                raise TilefishRuntimeError(f"prepare: buckets= names {unknown}, which are not graphs of this shared arena ({list(self._runners)})")
+        for name, r in self._runners.items():
+            r.prepare(index, None if buckets is None or name not in buckets else buckets[name])
+
+    def arena_of(self, index: int) -> "_Arena | None":
+        """The arena on device ``index``, if it was allocated."""
+        return next(iter(self._runners.values())).arena_of(index)
+
+
+def share_arena(
+    graphs: "Sequence[Any]",
+    *,
+    mode: str = "jit",
+    plan: Any = None,
+    pin: "str | None" = None,
+    trust_directory: bool = False,
+) -> SharedArena:
+    """The plans of ``graphs`` on **one arena** they share, run one at a time (:class:`SharedArena`; ``docs/plan-schema-1.md``, section 15.1).
+
+    ``replay``: the plans of the graphs in the plan set ``plan=<directory>``, verified with ``pin=`` (the set's digest) or ``trust_directory=True``, as
+    :func:`tilefish.run` loads them. ``jit``: an item is a graph (its default plan) or a :class:`~tilefish._plan.Plan` that ``tilefish.plan`` made."""
+    if isinstance(graphs, (str, GraphOp, Plan)) or not isinstance(graphs, (list, tuple)):
+        raise TilefishRuntimeError(f"share_arena takes a list of graphs (or of plans, in jit), got {graphs!r}")
+    if mode not in ("jit", "replay"):
+        raise TilefishRuntimeError(f"share_arena: mode is 'jit' or 'replay', got {mode!r}")
+    if mode == "jit" and plan is not None:
+        raise TilefishRuntimeError("share_arena in jit takes the plans in the list (tilefish.plan(graph, ...)); plan= is the directory of a replay")
+    runners = []
+    for item in graphs:
+        if mode == "jit" and isinstance(item, Plan):
+            runners.append(_runner_for(item.graph, "share_arena", mode, item, pin, trust_directory))
+        elif isinstance(item, GraphOp) and not isinstance(item, KernelOp):
+            runners.append(_runner_for(item, "share_arena", mode, plan, pin, trust_directory))
+        else:
+            raise TilefishRuntimeError(f"share_arena takes @tilefish.graph objects{' (or plans)' if mode == 'jit' else ''}, got {item!r}")
+    return SharedArena(runners)
 
 
 def _plan_directory(plan: Any) -> Any:

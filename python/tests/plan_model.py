@@ -168,6 +168,37 @@ def stacked_weights(layers, seed=0, device="cuda"):
     return per_layer, stacked
 
 
+# -- the block cut into three stages: a plan set whose plans a host runs one after the other on one shared arena ---------------------------------------------
+#
+# stage_attn(x, n) -> a; stage_mix(a, x) -> (r, h2); stage_ffn(r, h2) -> y: the launches of `block`, in its order, so the three in a row give its bytes. Each stage's
+# result is a returned value (a tensor of the caller's) that the next stage reads: nothing in a shared arena outlives a run. Their arenas differ (8 782 080,
+# 8 585 216 and 9 109 504 bytes, each with a cuBLASLt workspace of 8 519 680), so a shared arena has the largest one's bytes, not their sum; and the ffn's
+# intermediates lie over the attention's device-scalar slot, which every run of the attention writes again.
+
+
+@tilefish.graph(inputs=("x",), outputs=("a",))
+def stage_attn(
+    x: Tensor[M, D, bf16], n: DevScalar[i32], w_ln1: Tensor[D, bf16], w_qkv: Tensor[3 * D_MODEL, D_MODEL, bf16], b_qkv: Tensor[3 * D_MODEL, bf16]
+):
+    qkv = gemm_qkv(rmsnorm(x, w_ln1), w_qkv, b_qkv)
+    qkv4 = qkv.reshape(M, 3, HEADS, D_HEAD)
+    return attention(qkv4[:, 0], qkv4[:, 1], qkv4[:, 2], n).reshape(M, D_MODEL)
+
+
+@tilefish.graph(inputs=("a", "x"), outputs=("r", "h2"))
+def stage_mix(a: Tensor[M, D, bf16], x: Tensor[M, D, bf16], w_o: Tensor[D_MODEL, D_MODEL, bf16], w_ln2: Tensor[D, bf16]):
+    return add_rmsnorm(x, gemm_o(a, w_o), w_ln2)
+
+
+@tilefish.graph(inputs=("r", "h2"), outputs=("y",))
+def stage_ffn(r: Tensor[M, D, bf16], h2: Tensor[M, D, bf16], w_up: Tensor[D_FF, D_MODEL, bf16], w_down: Tensor[D_MODEL, D_FF, bf16]):
+    return add(r, gemm_down(gelu(gemm_up(h2, w_up)), w_down))
+
+
+STAGES = [stage_attn, stage_mix, stage_ffn]
+STAGE_WEIGHTS = {"stage_attn": ["w_ln1", "w_qkv", "b_qkv"], "stage_mix": ["w_o", "w_ln2"], "stage_ffn": ["w_up", "w_down"]}
+
+
 # -- a small graph with an in-place tensor: f32, so its results are exact ------------------------------------------------------------------------------------
 
 Q = Dim("Q", buckets=[16, 32])

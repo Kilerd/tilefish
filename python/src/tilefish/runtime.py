@@ -942,6 +942,18 @@ def run_step(op: GraphOp, step: int, buffers: Any, **options: Any) -> None:
     _run_step(op, step, buffers, **options)
 
 
+def share_arena(graphs: Any, **options: Any) -> Any:
+    """The plans of several graphs (the plans of a set) on **one arena** they share and run **one at a time**: a
+    :class:`~tilefish._planrun.SharedArena`, ``s = share_arena([g1, g2, g3], mode="replay", plan="build/", pin=planset.digest)``, then ``s.run(g1, x)``,
+    ``s.capture(g2, ...)``, ``s.bind_weights(g3, {...})``, ``s.run_step(...)``, ``s.prepare()``. The arena has the bytes of the largest arena of the plans,
+    each plan's buffers at their own offsets in it; every execution on it, of any of the plans, is ordered with every other (one lock, one order event),
+    and nothing in it outlives a run: a value a later plan reads is a returned value of the earlier one. See :func:`tilefish._planrun.share_arena` and
+    ``docs/plan-schema-1.md``, section 15.1."""
+    from ._planrun import share_arena as _share_arena
+
+    return _share_arena(graphs, **options)
+
+
 def run(
     op: Any,
     /,
