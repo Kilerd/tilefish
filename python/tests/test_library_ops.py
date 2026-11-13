@@ -23,6 +23,7 @@ M = Dim("M", buckets=[32, 64])
 Kb = Dim("Kb", buckets=[1024, 2048])
 ALGO = "0123456789abcdef" * 8  # 64 bytes of hex: not an algorithm anyone chose, but a well-formed one
 VERSION = 120804
+SMS = 30  # the multiprocessors of the device a pin is made on (a B300 MIG slice of 1g has 30)
 
 
 @tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")
@@ -33,8 +34,8 @@ def gemm(a: Tensor[M, 1024, bf16], b: Tensor[2048, 1024, bf16]) -> Tensor[M, 204
 def gemm_bias(a: Tensor[M, Kb, bf16], b: Tensor[2048, Kb, bf16], bias: Tensor[2048, bf16]) -> Tensor[M, 2048, bf16]: ...
 
 
-def built(spec, arch="sm_103", algo=ALGO, version=VERSION):
-    return BuiltLibrary(spec, arch, algo, version)
+def built(spec, arch="sm_103", algo=ALGO, version=VERSION, sm_count=SMS):
+    return BuiltLibrary(spec, arch, algo, version, sm_count)
 
 
 # -- the declaration ------------------------------------------------------------------------------------------------------------------------
@@ -171,24 +172,24 @@ def test_one_spec_per_bucket_combination_with_the_stem_of_a_kernel():
 
 def test_the_entry_of_a_spec_says_the_problem_as_cublaslt_is_called():
     s = library_specs(gemm)[0]
-    entry = s.entry()
+    entry = s.entry(SMS)
     assert set(entry) == set(_library.ENTRY_KEYS) - {"arch", "algo", "cublaslt_version"}
     assert (entry["stem"], entry["op"], entry["impl"], entry["epilogue"]) == ("gemm.M32", "gemm", "cublaslt.gemm", "none")
     assert (entry["m"], entry["n"], entry["k"]) == (32, 2048, 1024) and (entry["lda"], entry["ldb"], entry["ldc"], entry["ldd"]) == (1024, 1024, 2048, 2048)
     assert (entry["transa"], entry["transb"], entry["compute_type"], entry["scale_type"]) == ("T", "N", "CUBLAS_COMPUTE_32F", "CUDA_R_32F")
     assert entry["dtypes"] == {"a": "bf16", "b": "bf16", "out": "bf16"} and entry["workspace_bytes"] == 8_519_680
     assert [(p["name"], p["access"], p["shape"]) for p in entry["abi"]["params"]] == [("a", "in", ["M", 1024]), ("b", "in", [2048, 1024]), ("out", "out", ["M", 2048])]
-    assert entry["buckets"] == {"M": 32} and entry["declaration_digest"] == declaration_digest(gemm)
+    assert entry["buckets"] == {"M": 32} and entry["declaration_digest"] == declaration_digest(gemm, SMS) != declaration_digest(gemm) and entry["sm_count"] == SMS
     pres = entry["preconditions"]
     assert [p for p in pres if p["kind"] == "pointer_alignment"] == [{"kind": "pointer_alignment", "arg": n, "index": i, "bytes": 16} for i, n in enumerate(["a", "b", "out"])]
     assert {"kind": "static_size", "arg": "b", "index": 1, "axis": 0, "value": 2048} in pres and {"kind": "bucket", "dim": "M", "value": 32, "buckets": [32, 64]} in pres
-    bias = library_specs(gemm_bias)[0].entry()
+    bias = library_specs(gemm_bias)[0].entry(SMS)
     assert bias["epilogue"] == "bias" and bias["dtypes"]["bias"] == "bf16" and [p["name"] for p in bias["abi"]["params"]] == ["a", "b", "bias", "out"]
 
 
 def test_the_entry_says_what_the_binding_calls_cublaslt_with():
     for spec in library_specs(gemm) + library_specs(gemm_bias):
-        entry, d = spec.entry(), _cublaslt.describe(spec.m, spec.n, spec.k, spec.bias)
+        entry, d = spec.entry(SMS), _cublaslt.describe(spec.m, spec.n, spec.k, spec.bias)
         for key in ("transa", "transb", "compute_type", "scale_type", "lda", "ldb", "ldc", "ldd", "epilogue"):
             assert entry[key] == d[key], key
         assert (d["cublas_m"], d["cublas_n"], d["cublas_k"]) == (spec.n, spec.m, spec.k)  # tilefish's b is cuBLAS's A: m and n swap
@@ -255,9 +256,36 @@ def test_a_replay_takes_an_entry_that_is_what_the_declaration_asks_for(tmp_path,
     m = write(tmp_path, *(built(s) for s in library_specs(gemm)))
     monkeypatch.setattr(_cublaslt, "version", lambda: VERSION)
     spec = library_specs(gemm)[1]
-    got = built_from_manifest(m, spec, "sm_103")
+    got = built_from_manifest(m, spec, "sm_103", SMS)
     assert got.algo == ALGO and got.cublaslt_version == VERSION and got.spec is spec and got.stem == "gemm.M64" and got.workspace_bytes == 8_519_680
     assert got.entry() == m.library_entry("gemm.M64", "sm_103")
+
+
+def test_a_replay_refuses_a_device_with_another_number_of_sms(tmp_path, monkeypatch):
+    """A pin is chosen for the SM count of its device (a MIG slice has fewer than the whole GPU, a stream-K algorithm partitions by it): another
+    count is refused, before anything else of the entry, with what to do about it."""
+    m = write(tmp_path, built(library_specs(gemm)[0]))
+    monkeypatch.setattr(_cublaslt, "version", lambda: VERSION + 100)  # the SM count is the first thing a replay compares
+    for other in (SMS - 1, SMS + 1, 148):
+        with pytest.raises(
+            TilefishManifestError,
+            match=rf"pinned the cuBLASLt algorithm of 'gemm.M32' \(sm_103\) on a device with {SMS} SMs, but this device has {other}: .*re-export the manifest on this device",
+        ):
+            built_from_manifest(m, library_specs(gemm)[0], "sm_103", other)
+
+
+def test_the_sm_count_is_in_the_entry_its_declaration_digest_and_the_manifest_digest(tmp_path):
+    spec = library_specs(gemm)[0]
+    a, b = built(spec).entry(), built(spec, sm_count=148).entry()
+    assert a["sm_count"] == SMS and b["sm_count"] == 148 and list(a).index("sm_count") == list(a).index("workspace_bytes") + 1
+    assert a["declaration_digest"] == spec.pinned_digest(SMS) == declaration_digest(gemm, SMS)
+    assert len({a["declaration_digest"], b["declaration_digest"], spec.declaration_digest}) == 3  # the pin of each device is its own declaration
+    assert _library.ENTRY_KEYS.index("sm_count") == _library.ENTRY_KEYS.index("cublaslt_version") + 1
+    m30 = write(tmp_path / "a", built(spec))
+    m148 = write(tmp_path / "b", built(spec, sm_count=148))
+    assert m30.digest != m148.digest
+    with pytest.raises(TilefishManifestError, match=r"already has a different library entry for 'gemm.M32' on sm_103 \((declaration_digest|sm_count) differs\)"):
+        write(tmp_path / "a", built(spec, sm_count=148), merge=True)  # a re-export on another device does not silently replace the pin
 
 
 def test_a_replay_refuses_a_cublaslt_of_another_version(tmp_path, monkeypatch):
@@ -268,7 +296,7 @@ def test_a_replay_refuses_a_cublaslt_of_another_version(tmp_path, monkeypatch):
         match=rf"the manifest pinned the cuBLASLt algorithm of 'gemm.M32' \(sm_103\) with cuBLASLt {VERSION}, but this process has cuBLASLt {VERSION + 100}: "
         r"an algorithm id names other kernels in another version, so the pin is refused",
     ):
-        built_from_manifest(m, library_specs(gemm)[0], "sm_103")
+        built_from_manifest(m, library_specs(gemm)[0], "sm_103", SMS)
 
 
 def test_a_replay_refuses_a_missing_entry_and_an_entry_that_differs_from_the_declaration(tmp_path, monkeypatch):
@@ -276,19 +304,19 @@ def test_a_replay_refuses_a_missing_entry_and_an_entry_that_differs_from_the_dec
     first, second = library_specs(gemm)
     m = write(tmp_path, built(first))
     with pytest.raises(TilefishManifestError, match=r"has no library entry for 'gemm.M64' on sm_103 \(it has \['gemm.M32'\]\)"):
-        built_from_manifest(m, second, "sm_103")
+        built_from_manifest(m, second, "sm_103", SMS)
     with pytest.raises(TilefishManifestError, match=r"has no library entry for 'gemm.M32' on sm_90 \(it has sm_103\)"):
-        built_from_manifest(m, first, "sm_90")
+        built_from_manifest(m, first, "sm_90", SMS)
     # the same stem, another declaration: a different workspace limit, another weight shape
     other_ws = tilefish.library("gemm", acc=f32, impl="cublaslt.gemm", workspace_bytes=4096)(gemm.fn)
     with pytest.raises(TilefishManifestError, match="first difference at workspace_bytes: the manifest has 8519680, the declaration gives 4096"):
-        built_from_manifest(m, library_specs(other_ws)[0], "sm_103")
+        built_from_manifest(m, library_specs(other_ws)[0], "sm_103", SMS)
 
     @tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")
     def wider(a: Tensor[M, 1024, bf16], b: Tensor[4096, 1024, bf16]) -> Tensor[M, 4096, bf16]: ...
 
     with pytest.raises(TilefishManifestError, match="first difference at abi.params\\[1\\].shape\\[0\\]|first difference at n"):
-        built_from_manifest(m, library_specs(wider)[0], "sm_103")
+        built_from_manifest(m, library_specs(wider)[0], "sm_103", SMS)
 
 
 def test_the_rust_emitter_writes_a_launcher_for_a_library_entry(tmp_path):
@@ -301,7 +329,7 @@ def test_the_rust_emitter_writes_a_launcher_for_a_library_entry(tmp_path):
 
 
 def test_pinning_asks_the_device_of_the_architecture(monkeypatch):
-    """A pin is per architecture: the heuristic runs on the device, which must be of the architecture the entry is for."""
+    """A pin is per device: the heuristic runs on the device, which must be of the architecture the entry is for, and the entry records its SM count."""
     spec = library_specs(gemm)[0]
     calls = []
 
@@ -312,8 +340,9 @@ def test_pinning_asks_the_device_of_the_architecture(monkeypatch):
     monkeypatch.setattr(_library, "_capability", lambda i: 90)
     monkeypatch.setattr(_cublaslt, "pin_algo", lambda *a, **kw: (calls.append((a, kw)) or FakePinned()))
     monkeypatch.setattr(_cublaslt, "version", lambda: VERSION)
+    monkeypatch.setattr(_library, "sm_count", lambda i: 132)
     got = build_library(spec, arch="sm_90")
-    assert got.algo == ALGO and got.arch == "sm_90" and got.cublaslt_version == VERSION
+    assert got.algo == ALGO and got.arch == "sm_90" and got.cublaslt_version == VERSION and got.sm_count == 132 and got.entry()["sm_count"] == 132
     assert calls == [((32, 2048, 1024, False), {"workspace_bytes": 8_519_680, "device_index": 0})]
     with pytest.raises(tilefish.TilefishBuildError, match="cannot pin 'gemm.M32' for sm_103: cuBLASLt chooses an algorithm for the device it runs on, and device 0 is sm_90"):
         build_library(spec, arch="sm_103")
@@ -385,6 +414,23 @@ def test_the_pin_and_the_provenance_are_exactly_typed():
     refuses(lambda e: e.update(workspace_bytes=2**40 + 1), "workspace_bytes must be an int from 1 to 2\\*\\*40")
     refuses(lambda e: e.update(workspace_bytes=1.5), "workspace_bytes must be an int")
     refuses(lambda e: e.update(declaration_digest="0" * 63), "declaration_digest must be 64 lowercase hex digits")
+
+
+@pytest.mark.parametrize("bad", [0, -1, 30.0, True, "30", None])
+def test_the_sm_count_is_a_positive_int(bad):
+    refuses(lambda e: e.update(sm_count=bad), "sm_count must be a positive int")
+    refuses(lambda e: e.pop("sm_count"), r"missing \['sm_count'\]")
+    entry = entry_of()
+    entry["sm_count"] = 2**40  # any int >= 1: the reader has no other bound
+    validate_entry(entry)
+
+
+@pytest.mark.parametrize("bad", [0.0, False])
+def test_the_index_of_an_operand_is_an_int_not_a_float_or_a_bool(bad):
+    """``0.0 == 0`` and ``True == 1`` in Python: the comparison with the position alone let them through (Rust refuses them)."""
+    refuses(lambda e: e["abi"]["params"][0].update(index=bad), r"must be the bf16 pointer #0")
+    refuses(lambda e: e["abi"]["params"][1].update(index=True if bad is False else 1.0), r"must be the bf16 pointer #1")
+    refuses(lambda e: e["dims"]["M"].update(bucket=32.0), r"dims.M.bucket must be one of its buckets")
 
 
 def test_the_operands_are_a_b_bias_out_in_this_order():

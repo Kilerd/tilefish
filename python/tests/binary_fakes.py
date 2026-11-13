@@ -56,9 +56,12 @@ def make_ptx_op(path, *, name="axpy", **kw):
 
 
 def fake_binary_build(spec, target, *, arch="sm_90", cubin=None, flags=("-lineinfo", "-v", "--gpu-name=sm_90"), **kw):
-    """A ``BuiltKernel`` of a prebuilt-binary ``spec``, around a small ELF file whose entry point is ``tf_k``; ``kw`` overrides any field."""
-    cubin = cubin_like(shared=None, **SM90) if cubin is None else cubin  # (a prebuilt binary may have static shared memory: the section is no sign of dynamic use)
+    """A ``BuiltKernel`` of a prebuilt-binary ``spec``, around a small ELF file whose entry point is ``tf_k`` (a declared cubin is used as it is, as
+    ``build_binary`` does: its bytes are the build); ``kw`` overrides any field."""
     key = "ptx" if spec.binary["kind"] == "ptx" else arch
+    if cubin is None and spec.binary["kind"] == "cubin" and key in target.sources:
+        cubin = target.sources[key]
+    cubin = cubin_like(shared=None, **SM90) if cubin is None else cubin  # (a prebuilt binary may have static shared memory: the section is no sign of dynamic use)
     build = {"source": "ptx", "ptxas_flags": list(flags)} if spec.binary["kind"] == "ptx" else {"source": "cubin"}
     values = dict(
         spec=spec,

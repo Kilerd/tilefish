@@ -151,7 +151,11 @@ def _torch() -> Any:
 
 
 def clear_caches() -> None:
-    """Forget every built kernel and unload every loaded module (for tests and for rebuilding after a toolchain change)."""
+    """Forget every built kernel and unload every loaded module (for tests and for rebuilding after a toolchain change).
+
+    Nothing is freed under work that may still run: the arenas of launch plans are freed after the last run on each is done (its order event), and the modules
+    after every context that has one is synchronized (a launch of a kernel may still be running on any stream). Call it outside a CUDA graph capture, and only
+    when no graph captured from a plan will be replayed again (it holds the address of the arena)."""
     with _lock:
         _builds.clear()
         _manifests.clear()
@@ -159,10 +163,7 @@ def clear_caches() -> None:
     from . import _planrun
 
     _planrun.clear_caches()  # the runners of launch plans, and the arenas they hold
-    try:
-        _cuda.unload_all()
-    except TilefishError:
-        pass
+    _cuda.unload_all()  # nothing to do (and no driver imported) when no module was loaded
 
 
 # -- what is being run ----------------------------------------------------------------------------------------------------
@@ -598,7 +599,7 @@ def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
 
 
 _library_specs: "weakref.WeakKeyDictionary[LibraryOp, list[Any]]" = weakref.WeakKeyDictionary()  # an op is immutable
-_pins: "dict[tuple, Any]" = {}  # (stem, arch, workspace, cuBLASLt version) -> the BuiltLibrary that jit pinned in memory
+_pins: "dict[tuple, Any]" = {}  # (stem, arch, device, its SM count, workspace, cuBLASLt version, declaration) -> the BuiltLibrary that jit pinned in memory
 
 
 def _run_library(op: LibraryOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", mode: str, manifest: "Manifest | None") -> Any:
@@ -643,7 +644,8 @@ def jit_pin(spec: Any, index: int) -> Any:
     from . import _cublaslt, _library
 
     cap = _capability(_torch(), index)
-    key = (spec.stem, f"sm_{cap}", spec.workspace_bytes, _cublaslt.version(), spec.declaration_digest)
+    # a pin is for one device: its index (two devices of one architecture may have other SM counts, a MIG slice fewer than the whole GPU) and its SM count
+    key = (spec.stem, f"sm_{cap}", index, _library.sm_count(index), spec.workspace_bytes, _cublaslt.version(), spec.declaration_digest)
     with _lock:
         built = _pins.get(key)
     if built is None:
@@ -654,11 +656,11 @@ def jit_pin(spec: Any, index: int) -> Any:
 
 
 def replay_pin(spec: Any, manifest: Manifest, index: int) -> Any:
-    """The algorithm a manifest recorded for a library spec on device ``index``, after checking that its entry is what the declaration asks for and
-    that cuBLASLt is the version that chose it."""
+    """The algorithm a manifest recorded for a library spec on device ``index``, after checking that it was pinned on a device of this one's SM count,
+    that its entry is what the declaration asks for and that cuBLASLt is the version that chose it."""
     from . import _library
 
-    return _library.built_from_manifest(manifest, spec, f"sm_{_capability(_torch(), index)}")
+    return _library.built_from_manifest(manifest, spec, f"sm_{_capability(_torch(), index)}", _library.sm_count(index))
 
 
 def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:

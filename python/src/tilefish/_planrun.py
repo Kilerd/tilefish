@@ -15,16 +15,27 @@ A :class:`PlanRunner` executes a plan document (:mod:`tilefish._plan`) on one st
 Everything else is one code path, so they are identical by construction.
 
 **Allocation and synchronization.** A run allocates nothing on the device but what the caller asks for (the outputs, unless ``outputs=`` gives them): the
-arena is allocated once per runner and device and kept, the cuBLASLt workspace is a buffer of the arena, and a device scalar is written by a
-stream-ordered copy (from a CUDA tensor) or an asynchronous copy from pinned memory (from an ``int`` or a CPU tensor). Nothing waits for the device.
+arena is allocated once per plan layout and device and kept, the cuBLASLt workspace is a buffer of the arena, and a device scalar is written by a
+stream-ordered copy (from a CUDA tensor) or an asynchronous copy from pinned memory (from an ``int`` or a CPU tensor). Nothing waits on the host for the device.
+
+**Runs on several streams.** Every run of a plan layout on a device uses the same arena (its intermediates, device scalars and workspace), so two runs must
+not overlap on the device. The arena has an *order event* (:class:`_Arena`): a run makes its stream (torch's current stream) wait for the event's most recent
+record, enqueues its device-scalar writes and its launches, and records the event on its stream, all under the arena's lock. So **runs of one plan on
+different streams, from one thread or many, are correct, and execute on the device one after the other**, in the order their host calls took the lock (the
+lock alone would order the enqueueing, not the device); runs on one stream are ordered by the stream as before. Nothing waits on the host. (Runs of one plan do
+not overlap on the device, so a run on another stream is not concurrent with one in flight; two plans with different layouts have different arenas and do run
+concurrently.) The externals are the caller's: an input written on another stream, or an output read on one, is ordered by the caller, as for any torch op.
 
 **CUDA graphs.** A run under ``torch.cuda.graph(...)`` captures. The things that would make a plan fail to capture are, each refused with a message that
 says so: (1) the arena, the binary of a step (``cuModuleLoadData``, ``cuFuncLoad``) and the cuBLASLt handle must exist, so the plan has to have run once
 (or :func:`prepare` called) outside the capture; (2) outputs allocated inside the capture belong to the graph (torch's private pool): that works, but pass ``outputs=`` to have tensors of your own (and no allocation at all);
 (3) a device scalar passed as an ``int`` or a CPU tensor would be written by a host copy, which cannot be captured: pass a CUDA tensor, which the captured
 copy reads at every replay (write it between replays to change the value); (4) the externals must be the same tensors at every replay (a graph holds
-addresses); (5) the stream must be the one the capture uses (torch's current stream; the capture is of that stream's work only); (6) a plan is not
-reentrant: two runs of one plan on two streams at once share the arena. Everything else a run does is enqueued launches, which capture.
+addresses); (5) the stream must be the one the capture uses (torch's current stream; the capture is of that stream's work only). Everything else a run
+does is enqueued launches, which capture. **A captured graph's arena is the plan's arena** (the same memory, at the address the graph holds), and the wait and
+the record of the order event are captured as *external* event nodes (``CU_EVENT_WAIT_EXTERNAL``, ``CU_EVENT_RECORD_EXTERNAL``): every replay of the graph
+waits for the most recent run or replay issued before it is launched, and the runs and replays issued after it wait for it. So replays of the graphs of a
+plan, on any stream, and plain runs of it are ordered with each other in the order the host issues them, as runs are.
 """
 
 from __future__ import annotations
@@ -70,8 +81,11 @@ def torch_backend() -> "TorchBackend":
 def clear_caches() -> None:
     """Forget every loaded plan, reset every runner (its loaded binaries) and free every arena (for tests, and to give the memory back).
 
-    **A CUDA graph that was captured from a plan holds the address of its arena**, and nothing but this registry keeps the arena alive: the arenas are freed here and nowhere
-    else (not when a runner is replaced, a plan directory re-exported or a plan garbage collected), so call it only when no captured graph of a plan will be replayed again.
+    An arena is freed only once the work of every run on it is done: every run waits for the one before it (the arena's order event), so waiting on the host for
+    the last record of that event (``cuEventSynchronize``) waits for all of them, whatever streams they ran on, and for the replays of a captured graph issued
+    before this call. **A CUDA graph that was captured from a plan holds the address of its arena**, and nothing but this registry keeps the arena alive: the
+    arenas are freed here and nowhere else (not when a runner is replaced, a plan directory re-exported or a plan garbage collected), so call it only when no
+    captured graph of a plan will be replayed again.
     """
     with _lock:
         _loaded.clear()
@@ -80,7 +94,16 @@ def clear_caches() -> None:
     for r in runners:
         r._reset()
     for b in backends:
-        b.arena_registry().clear()
+        registry = b.arena_registry()
+        arenas = list(registry.items())
+        for (_, index), arena in arenas:
+            if arena.event is not None:
+                b.synchronize_event(arena.event, index)  # raises (and frees nothing) if it cannot wait: memory a kernel may still use is not given back
+        for key, arena in arenas:
+            if registry.get(key) is arena:
+                del registry[key]
+            if arena.event is not None:
+                b.destroy_event(arena.event, key[1])
 
 
 # -- what a runner asks of torch and the driver ---------------------------------------------------------------------------------------------
@@ -111,6 +134,25 @@ class Backend:
 
     def alloc_arena(self, nbytes: int, index: int) -> "tuple[Any, int]":
         """``(handle, address)`` of ``nbytes`` bytes of device memory, 256-byte aligned."""
+        raise NotImplementedError
+
+    def new_event(self, index: int) -> Any:
+        """The order event of a new arena on device ``index`` (made with the arena, outside any capture)."""
+        raise NotImplementedError
+
+    def wait_event(self, event: Any, stream: int, capturing: bool) -> None:
+        """Make what is enqueued on ``stream`` next wait for the most recent record of ``event``; ``capturing``: as an event wait node of the graph."""
+        raise NotImplementedError
+
+    def record_event(self, event: Any, stream: int, capturing: bool) -> None:
+        """Record ``event`` on ``stream`` after what was enqueued; ``capturing``: as an event record node of the graph."""
+        raise NotImplementedError
+
+    def synchronize_event(self, event: Any, index: int) -> None:
+        """Wait on the host for the most recent record of ``event``."""
+        raise NotImplementedError
+
+    def destroy_event(self, event: Any, index: int) -> None:
         raise NotImplementedError
 
     def empty(self, shape: "Sequence[int]", dtype: str, index: int) -> Any:
@@ -171,6 +213,34 @@ class TorchBackend(Backend):
     def alloc_arena(self, nbytes: int, index: int) -> "tuple[Any, int]":
         t = self.torch.empty(nbytes, dtype=self.torch.uint8, device=f"cuda:{index}")
         return t, int(t.data_ptr())
+
+    def new_event(self, index: int) -> Any:
+        from . import _cuda
+
+        with self.torch.cuda.device(index):
+            return _cuda.new_event()
+
+    def wait_event(self, event: Any, stream: int, capturing: bool) -> None:
+        from . import _cuda
+
+        _cuda.wait_event(stream, event, external=capturing)
+
+    def record_event(self, event: Any, stream: int, capturing: bool) -> None:
+        from . import _cuda
+
+        _cuda.record_event(stream, event, external=capturing)
+
+    def synchronize_event(self, event: Any, index: int) -> None:
+        from . import _cuda
+
+        with self.torch.cuda.device(index):
+            _cuda.synchronize_event(event)
+
+    def destroy_event(self, event: Any, index: int) -> None:
+        from . import _cuda
+
+        with self.torch.cuda.device(index):
+            _cuda.destroy_event(event)
 
     def empty(self, shape: "Sequence[int]", dtype: str, index: int) -> Any:
         return self.torch.empty(tuple(shape), dtype=getattr(self.torch, TORCH_DTYPE_NAMES[dtype].split(".")[1]), device=f"cuda:{index}")
@@ -267,10 +337,19 @@ class ReplayProvider:
 
 @dataclass
 class _Arena:
+    """The memory of one plan layout on one device, and what orders the runs on it.
+
+    ``event`` is the arena's *order event*: every run, under ``lock``, makes its stream wait for the event's most recent record, enqueues its writes and launches,
+    and records the event on its stream. So the runs on one arena execute one after the other on the device, in the order their host calls took the lock, whatever
+    streams and threads they come from (``lock`` alone orders the enqueueing, not the device). Under a capture the wait and the record are external event
+    nodes, so a replay of the graph takes its place in that order when it is launched.
+    """
+
     handle: Any
     ptr: int
     nbytes: int
     lock: threading.Lock
+    event: Any = None
 
 
 @dataclass
@@ -351,7 +430,8 @@ class PlanRunner:
                 handle, ptr = be.alloc_arena(nbytes, index) if nbytes else (None, 0)
                 if nbytes and ptr % _plan.ARENA_ALIGNMENT:
                     raise TilefishRuntimeError(f"the arena was allocated at {ptr:#x}, which is not aligned to {_plan.ARENA_ALIGNMENT} bytes")
-                arena = be.arena_registry()[(self.plan.layout_key, index)] = _Arena(handle, ptr, nbytes, threading.Lock())
+                event = be.new_event(index) if nbytes else None  # a plan with no arena shares no memory between its runs: nothing to order
+                arena = be.arena_registry()[(self.plan.layout_key, index)] = _Arena(handle, ptr, nbytes, threading.Lock(), event)
         return arena
 
     def _bucket(self, values: "Mapping[str, int]", index: int) -> _BucketRT:
@@ -424,19 +504,7 @@ class PlanRunner:
         for p in scalar_params:
             v = bound.arguments[p.name]
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                dtype = p.type.dtype  # type: ignore[union-attr]
-                if dtype.is_int:
-                    lo, hi = dtype.int_range()
-                    try:
-                        fits = v == int(v) and lo <= v <= hi
-                    except (ValueError, OverflowError):  # nan, inf
-                        fits = False
-                    if not fits:
-                        raise TilefishPreconditionError(
-                            f"the device scalar '{p.name}' is {v!r}, which is not an integer that fits {dtype} ({lo} to {hi})", kind="shape", arg=p.name
-                        )
-                    v = int(v)
-                bound.arguments[p.name] = v = be.devscalar_tensor(v, dtype.name)
+                bound.arguments[p.name] = v = be.devscalar_tensor(devscalar_number(p, v), p.type.dtype.name)  # type: ignore[union-attr]
             sources[p.name] = v
         call = bind_call(graph.name, sig, bound.args, bound.kwargs)
         check_dim_constraints(call.dims, buckets=False)
@@ -513,17 +581,27 @@ class PlanRunner:
                 slots.append((b, source, on_device))
         with arena.lock, be.scope(index):
             stream = be.stream(index)
-            for b, source, on_device in slots:
-                be.write_devscalar(arena.handle, b["offset"], b["dtype"], source, on_device)
-            for st, real in zip(rt.steps, checked):
-                if st.algo is not None:
-                    names = [a for a in st.bound.names]
-                    a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
-                    bias = real[names[2]].ptr if len(names) == 4 else None
-                    be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
-                else:
-                    launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
-                    be.launch(st.loaded, st.bound.grid, launch_args, stream)
+            if arena.event is not None:  # after the run before it on this arena, whatever its stream (see _Arena)
+                be.wait_event(arena.event, stream, capturing)
+            try:
+                for b, source, on_device in slots:
+                    be.write_devscalar(arena.handle, b["offset"], b["dtype"], source, on_device)
+                for st, real in zip(rt.steps, checked):
+                    if st.algo is not None:
+                        names = [a for a in st.bound.names]
+                        a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
+                        bias = real[names[2]].ptr if len(names) == 4 else None
+                        be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
+                    else:
+                        launch_args = [("pointer", real[n].ptr) if kind == "pointer" else ("scalar", st.bound.scalars[n]) for kind, n in st.order]
+                        be.launch(st.loaded, st.bound.grid, launch_args, stream)
+            except BaseException:
+                if arena.event is not None:  # what was enqueued before the failure still comes before the next run
+                    with contextlib.suppress(Exception):
+                        be.record_event(arena.event, stream, capturing)
+                raise
+            if arena.event is not None:
+                be.record_event(arena.event, stream, capturing)
         results = [t for _, t in sorted(made, key=lambda p: p[0])]
         return runtime._result(results)
 
@@ -573,6 +651,22 @@ class PlanRunner:
                         kind="alias",
                         arg=w,
                     )
+
+
+def devscalar_number(p: Any, v: "int | float") -> "int | float":
+    """The value a number passed for the ``DevScalar`` parameter ``p`` is written as: for an integer dtype it must be an integer that fits the dtype
+    (``3.7``, ``nan`` or ``2**31`` for an ``i32`` is refused, not truncated or wrapped), in ``jit``, ``replay`` and ``reference`` alike."""
+    dtype = p.type.dtype
+    if not dtype.is_int:
+        return v
+    lo, hi = dtype.int_range()
+    try:
+        fits = v == int(v) and lo <= v <= hi
+    except (ValueError, OverflowError):  # nan, inf
+        fits = False
+    if not fits:
+        raise TilefishPreconditionError(f"the device scalar '{p.name}' is {v!r}, which is not an integer that fits {dtype} ({lo} to {hi})", kind="shape", arg=p.name)
+    return int(v)
 
 
 # -- tilefish.run of a graph ---------------------------------------------------------------------------------------------------------------
@@ -810,7 +904,7 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
             v = bound.arguments[p.name]
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 dtype = getattr(torch, TORCH_DTYPE_NAMES[p.type.dtype.name].split(".")[1])  # type: ignore[union-attr]
-                bound.arguments[p.name] = torch.tensor(v, dtype=dtype, device=getattr(anchor, "device", None))
+                bound.arguments[p.name] = torch.tensor(devscalar_number(p, v), dtype=dtype, device=getattr(anchor, "device", None))  # 3.7 for an i32 is refused, not truncated
     call = bind_call(graph.name, sig, bound.args, bound.kwargs)
     check_dim_constraints(call.dims, buckets=False)
     dims = call.dims

@@ -22,7 +22,7 @@ from built_fakes import fake_build
 from conftest import REPO_ROOT
 from elf_builder import cubin_like
 from host_ops import gpu_kernels_p1
-from test_library_ops import ALGO, VERSION, gemm, gemm_bias
+from test_library_ops import ALGO, SMS, VERSION, gemm, gemm_bias
 from test_rust_host import check_golden, needs_new_crate, pinned
 
 import tilefish
@@ -53,9 +53,9 @@ def build_manifest(directory, ops=(), library=(), arch="sm_90"):
     return pinned(Manifest.load(directory))
 
 
-def pins(op, arch="sm_103", algo=ALGO, version=VERSION):
-    """The library entries of every bucket of ``op``, as pinned on ``arch`` with ``algo`` by cuBLASLt ``version``."""
-    return [BuiltLibrary(spec, arch, algo, version) for spec in library_specs(op)]
+def pins(op, arch="sm_103", algo=ALGO, version=VERSION, sm_count=SMS):
+    """The library entries of every bucket of ``op``, as pinned on ``arch`` (a device of ``sm_count`` SMs) with ``algo`` by cuBLASLt ``version``."""
+    return [BuiltLibrary(spec, arch, algo, version, sm_count) for spec in library_specs(op)]
 
 
 def docs(source):
@@ -136,7 +136,7 @@ def test_launchers_for_prebuilt_binaries(prebuilt, tmp_path):
 
 
 def test_launchers_for_pinned_gemms(tmp_path):
-    library = [*pins(gemm), *pins(gemm_bias), BuiltLibrary(library_specs(gemm)[0], "sm_90", ALGO2, VERSION - 100)]
+    library = [*pins(gemm), *pins(gemm_bias), BuiltLibrary(library_specs(gemm)[0], "sm_90", ALGO2, VERSION - 100, 132)]
     manifest = build_manifest(tmp_path / "m", (), library)
     source = rust.render(manifest, ops=[gemm, gemm_bias])
     check_golden("rust_library.rs", source)
@@ -153,7 +153,7 @@ def test_launchers_for_pinned_gemms(tmp_path):
     assert "pub const M: usize = 32;" in source and "pub const N: usize = 2048;" in source and "pub const K: usize = 1024;" in source and "pub const BIAS: bool = false;" in source
     assert "pub const WORKSPACE_BYTES: usize = 8519680;" in source and "pub const WORKSPACE_BYTES: usize = 1048576;" in source
     assert 'pub const PINNED_WITH: &\'static [(&\'static str, u64)] = &[("sm_103", 120804), ("sm_90", 120704)];' in source  # one struct for the two architectures
-    assert "Pinned with: sm_103: cuBLASLt 12.8.4 (120804), sm_90: cuBLASLt 12.7.4 (120704)." in docs(source)
+    assert "Pinned with: sm_103: cuBLASLt 12.8.4 (120804) on 30 SMs, sm_90: cuBLASLt 12.7.4 (120704) on 132 SMs." in docs(source)
     assert 'pub const SHAPES: &\'static [&\'static [&\'static str]] = &[&["M", "Kb"], &["2048", "Kb"], &["2048"], &["M", "2048"]];' in source
 
 
@@ -228,12 +228,12 @@ def test_a_stem_is_a_kernel_or_a_library_entry_not_both(tmp_path):
     (kspec,) = runtime._target(kernel).compile_specs()
     (lspec,) = library_specs(g)
     assert kspec.stem == lspec.stem == "g"
-    write_manifest([fake_build(kspec, arch="sm_90")], tmp_path / "m" / "manifest.json", cubins=True, library=[BuiltLibrary(lspec, "sm_103", ALGO, VERSION)])
+    write_manifest([fake_build(kspec, arch="sm_90")], tmp_path / "m" / "manifest.json", cubins=True, library=[BuiltLibrary(lspec, "sm_103", ALGO, VERSION, SMS)])
     manifest = pinned(Manifest.load(tmp_path / "m"))
     with pytest.raises(TilefishManifestError, match=r"\['g'\] are both kernels and library entries"):
         rust.render(manifest)
     with pytest.raises(TilefishBuildError, match="one build per .stem, arch., kernels and library entries together"):  # nor can a manifest be written so
-        write_manifest([fake_build(kspec, arch="sm_103")], tmp_path / "same" / "manifest.json", cubins=True, library=[BuiltLibrary(lspec, "sm_103", ALGO, VERSION)])
+        write_manifest([fake_build(kspec, arch="sm_103")], tmp_path / "same" / "manifest.json", cubins=True, library=[BuiltLibrary(lspec, "sm_103", ALGO, VERSION, SMS)])
     shutil.copytree(manifest.directory, tmp_path / "edited")
     doc = json.loads((tmp_path / "edited" / "manifest.json").read_text())
     doc["kernels"][0]["arch"] = "sm_103"  # the kernel and the library entry are now for the same architecture
@@ -262,7 +262,7 @@ def test_a_tensor_called_workspace_would_clash_with_the_launchers_workspace(tmp_
 
 def test_the_library_entries_of_a_stem_must_agree_across_architectures(tmp_path):
     spec = library_specs(gemm)[0]
-    library = [BuiltLibrary(spec, "sm_103", ALGO, VERSION), BuiltLibrary(spec, "sm_90", ALGO2, VERSION - 100)]
+    library = [BuiltLibrary(spec, "sm_103", ALGO, VERSION, SMS), BuiltLibrary(spec, "sm_90", ALGO2, VERSION - 100, 132)]
     manifest = build_manifest(tmp_path / "m", (), library)
     assert rust.render(manifest).count("pub struct GemmM32 ") == 1
     doc = json.loads(manifest.path.read_text())
@@ -431,6 +431,10 @@ LIBRARY_FIELDS = {
     "a workspace of zero": lambda e: e.update(workspace_bytes=0),
     "the version of cuBLASLt": lambda e: e.update(cublaslt_version="12.8\n"),
     "a version of zero": lambda e: e.update(cublaslt_version=0),
+    "the SM count": lambda e: e.update(sm_count="30\npub fn pwned() {}"),
+    "an SM count of zero": lambda e: e.update(sm_count=0),
+    "an SM count that is a bool": lambda e: e.update(sm_count=True),
+    "no SM count": lambda e: e.pop("sm_count"),
     "the algorithm": lambda e: e.update(algo="z" * 128),
     "an algorithm that is short": lambda e: e.update(algo="0" * 127),
     "the epilogue": lambda e: e.update(epilogue="bias"),

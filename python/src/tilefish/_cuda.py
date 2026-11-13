@@ -116,6 +116,7 @@ class LoadedKernel:
                 "no CUDA context is current on this thread; touch the device with torch first (for example "
                 "torch.zeros(1, device='cuda'))"
             )
+        self.context = ctx  # what unload_all synchronizes before it unloads the module
         (device,) = _check(drv.cuCtxGetDevice(), "cuCtxGetDevice")
         if int(device) != device_index:
             raise TilefishRuntimeError(
@@ -264,9 +265,70 @@ def load(built: "BuiltKernel", device_index: int) -> LoadedKernel:
 
 
 def unload_all() -> None:
-    """Unload every module this process loaded (for tests); the contexts must still be current."""
-    drv = _driver()
+    """Unload every module this process loaded (for tests, and to give the memory back).
+
+    A launch of a kernel may still be running on any stream when this is called (nothing in a launch waits for the device), and a module must not be
+    unloaded under a kernel that runs from it: so every context that has a loaded module is synchronized first (``cuCtxSynchronize``, with the context
+    made current for the call), and a failure to synchronize (a stream of it is being captured, the context is broken) raises before anything is
+    unloaded or forgotten. Nothing is imported or synchronized when no module is loaded.
+    """
     with _lock:
-        for k in _loaded.values():
-            drv.cuModuleUnload(k.module)
-        _loaded.clear()
+        loaded = list(_loaded.items())
+    if not loaded:
+        return
+    drv = _driver()
+    contexts: "dict[int, Any]" = {}
+    for _, k in loaded:
+        contexts.setdefault(int(k.context), k.context)
+    for ctx in contexts.values():
+        _check(drv.cuCtxPushCurrent(ctx), "cuCtxPushCurrent")
+        try:
+            _check(drv.cuCtxSynchronize(), "cuCtxSynchronize")  # every launch from these modules, on every stream of the context, has finished
+        finally:
+            drv.cuCtxPopCurrent()
+    with _lock:
+        for key, k in loaded:
+            if _loaded.get(key) is k:
+                del _loaded[key]
+            _check(drv.cuCtxPushCurrent(k.context), "cuCtxPushCurrent")  # a module is unloaded from its own context
+            try:
+                drv.cuModuleUnload(k.module)
+            finally:
+                drv.cuCtxPopCurrent()
+
+
+# -- the events that order the runs of a launch plan on one arena (tilefish._planrun) ---------------------------------------------------
+
+
+def new_event() -> Any:
+    """An event of the current context, without timing (``cuEventCreate(CU_EVENT_DISABLE_TIMING)``)."""
+    drv = _driver()
+    (event,) = _check(drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DISABLE_TIMING), "cuEventCreate")
+    return event
+
+
+def wait_event(stream: int, event: Any, external: bool) -> None:
+    """Make the work submitted to ``stream`` after this wait for the most recent record of ``event``. ``external`` (while ``stream`` is being
+    captured): the wait is captured as an event wait node, so every replay of the graph waits for the most recent record made before it is launched."""
+    drv = _driver()
+    flags = drv.CUevent_wait_flags.CU_EVENT_WAIT_EXTERNAL if external else drv.CUevent_wait_flags.CU_EVENT_WAIT_DEFAULT
+    _check(drv.cuStreamWaitEvent(drv.CUstream(stream), event, flags), "cuStreamWaitEvent")
+
+
+def record_event(stream: int, event: Any, external: bool) -> None:
+    """Record ``event`` on ``stream``. ``external`` (while ``stream`` is being captured): captured as an event record node, so every replay of the
+    graph records the event when its work is done (a record without the flag would only join the capture)."""
+    drv = _driver()
+    if external:
+        _check(drv.cuEventRecordWithFlags(event, drv.CUstream(stream), drv.CUevent_record_flags.CU_EVENT_RECORD_EXTERNAL), "cuEventRecordWithFlags")
+    else:
+        _check(drv.cuEventRecord(event, drv.CUstream(stream)), "cuEventRecord")
+
+
+def synchronize_event(event: Any) -> None:
+    """Wait on the host until the work of the most recent record of ``event`` is done."""
+    _check(_driver().cuEventSynchronize(event), "cuEventSynchronize")
+
+
+def destroy_event(event: Any) -> None:
+    _check(_driver().cuEventDestroy(event), "cuEventDestroy")

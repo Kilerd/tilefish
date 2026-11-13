@@ -795,7 +795,7 @@ def manifest_dict(built: "Iterable[BuiltKernel]", library: "Iterable[Any]" = ())
 
 def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
     """What makes an existing manifest entry a different binary from a new one for the same stem and arch (``None``: the same)."""
-    for key in ("sha256_code", "declaration_digest", "source_sha256", "source_digest", "options", "shared", "algo", "cublaslt_version", "workspace_bytes"):
+    for key in ("sha256_code", "declaration_digest", "source_sha256", "source_digest", "options", "shared", "algo", "cublaslt_version", "sm_count", "workspace_bytes"):
         if old.get(key) != new.get(key):
             return key
     return None

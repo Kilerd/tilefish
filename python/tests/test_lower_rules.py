@@ -537,7 +537,17 @@ def test_writing_a_column_vector_from_every_row_is_rejected():
     fails(col_result, "row.col-output", template="row", contains=["returned"])
 
 
-def test_a_view_input_is_rejected():
+def test_a_view_input_is_rejected(monkeypatch):
+    with pytest.raises(TilefishDeclarationError, match=r"parameter 'x' is annotated with View\[M, D, f32\].*not a contiguous tensor.*Strided"):
+
+        @tilefish.kernel
+        def refused(x: Tensor[M, D, f32].as_view()) -> Tensor[M, D, f32]:
+            return x + 1.0
+
+    from tilefish import signature
+
+    monkeypatch.setattr(signature, "_require_contiguous", lambda *a: None)  # past the declaration: the lowering refuses it too
+
     @tilefish.kernel
     def on_view(x: Tensor[M, D, f32].as_view()) -> Tensor[M, D, f32]:
         return x + 1.0

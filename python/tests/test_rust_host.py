@@ -59,9 +59,45 @@ def expected_digest(name="sm_103"):
     return json.loads((FIXTURES / "expected.json").read_text())["fixtures"][name]["manifest_digest"]
 
 
-def fixture(name="sm_103"):
-    """A fixture of the crate (manifest schema 3, built by ``export_rust_fixtures.py``), loaded with the pin ``expected.json`` holds for it."""
-    return Manifest.load(FIXTURES / name, pin=expected_digest(name))
+# The SM count of the device the GEMMs of the committed sm_103 fixture were pinned on: the B300 MIG slice (1g) the fixtures are built on has 30 SMs, and
+# re-pinning the fixture's twelve problems there gives the twelve algorithms it holds (checked on that device when the field was added).
+FIXTURE_SM_COUNT = 30
+
+
+def fixture_predates_sm_count(name="sm_103"):
+    """Whether the committed fixture's library entries lack ``sm_count`` (the field a library entry gained after the fixtures were built): the Rust lane
+    regenerates the fixtures with it; until then Python, which requires the field, reads a copy that has it (:func:`fixture_dir`)."""
+    doc = json.loads((FIXTURES / name / "manifest.json").read_text())
+    return any("sm_count" not in e for e in doc["library"])
+
+
+predates_sm_count = pytest.mark.skipif(
+    FIXTURES.exists() and fixture_predates_sm_count(),
+    reason="the committed Rust fixtures predate the sm_count of a library entry: generated.rs and expected.json are regenerated with them (crates/tilefish/tests/fixtures)",
+)
+
+
+def fixture_dir(tmp_path, name="sm_103"):
+    """The directory of a fixture of the crate as a reader of today's schema takes it, and the digest to pin it with: the committed one, or, while that predates
+    ``sm_count``, a copy of it migrated as ``export_rust_fixtures.py --migrate-sm-count`` migrates the committed one (``with_sm_count``)."""
+    if not fixture_predates_sm_count(name):
+        return FIXTURES / name, expected_digest(name)
+    from export_rust_fixtures import with_sm_count
+
+    from tilefish._manifest import manifest_digest
+
+    directory = tmp_path / f"fixture-{name}"
+    shutil.copytree(FIXTURES / name, directory)
+    doc = with_sm_count(json.loads((directory / "manifest.json").read_text()), FIXTURE_SM_COUNT)
+    (directory / "manifest.json").write_text(json.dumps(doc, indent=2) + "\n")
+    return directory, manifest_digest(doc)
+
+
+def fixture(tmp_path, name="sm_103"):
+    """A fixture of the crate (manifest schema 3, built by ``export_rust_fixtures.py``), loaded with the pin ``expected.json`` holds for it (or, while the committed
+    one predates ``sm_count``, the copy of :func:`fixture_dir` with its own digest)."""
+    directory, pin = fixture_dir(tmp_path, name)
+    return Manifest.load(directory, pin=pin)
 
 
 def committed_ops():
@@ -117,8 +153,8 @@ def test_embedded_launchers(fake_manifest, tmp_path):
 
 
 @needs_crate
-def test_baked_in_sizes_are_constants_and_documented():
-    source = rust.render(fixture(), ops=committed_ops())
+def test_baked_in_sizes_are_constants_and_documented(tmp_path):
+    source = rust.render(fixture(tmp_path), ops=committed_ops())
     assert "pub const X_PTR_AXIS1: usize = 2048;" in source  # the extern rmsnorm: Tensor[Rows, Hidden = 2048]
     assert "Baked into the binary: axis 1 of `x_ptr` is 2048;" in source
     assert "Constraints: `Db` is exactly 96 (a bucket of [96, 512, 1000]" in source
@@ -212,12 +248,14 @@ def test_identifiers_are_made_safe(fake_manifest):
 
 
 @needs_crate
-def test_the_fixture_digests_are_the_ones_the_rust_tests_expect():
+def test_the_fixture_digests_are_the_ones_the_rust_tests_expect(tmp_path):
     expected = json.loads((FIXTURES / "expected.json").read_text())["fixtures"]
     assert sorted(expected) == ["sm_103", "sm_120"]
     for name, want in expected.items():
-        manifest = Manifest.load(FIXTURES / name, pin=want["manifest_digest"])  # verifies every cubin against the manifest; schema 3, which Rust reads too
-        assert manifest.digest == want["manifest_digest"], name
+        directory, pin = fixture_dir(tmp_path, name)
+        manifest = Manifest.load(directory, pin=pin)  # verifies every cubin against the manifest; schema 3, which Rust reads too
+        if directory == FIXTURES / name:  # (a copy that stands in for a fixture that predates sm_count has a digest of its own)
+            assert manifest.digest == want["manifest_digest"], name
         assert len(manifest.artifacts) == len(want["kernels"]) == 24 and len(manifest.library_entries) == len(want["library"])
         for k in want["kernels"]:
             artifact = manifest.get(k["stem"], k["arch"])
@@ -226,11 +264,12 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect():
             assert code_digest(artifact.cubin) == k["sha256_code"]
         for e in want["library"]:
             entry = manifest.library_entry(e["stem"], e["arch"])
-            assert (entry["algo"], entry["cublaslt_version"], entry["workspace_bytes"], entry["impl"]) == (
+            assert (entry["algo"], entry["cublaslt_version"], entry["workspace_bytes"], entry["impl"], entry["sm_count"]) == (
                 e["algo"],
                 e["cublaslt_version"],
                 e["workspace_bytes"],
                 e["impl"],
+                e.get("sm_count", FIXTURE_SM_COUNT),
             )
     # a pin is made on a device of its architecture: the native fixture has the GEMMs (two shapes, with and without a bias, over three buckets of M)
     # and the one that was cross-compiled has none
@@ -247,8 +286,24 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect():
 
 
 @needs_crate
-def test_the_committed_launchers_are_what_the_emitter_writes_for_the_fixture():
-    emitted = rust.render(fixture(), ops=committed_ops())
+def test_a_library_entry_without_its_sm_count_is_refused(tmp_path):
+    """The committed fixture while it predates the field, and a copy of it with the field removed once it has it: Python requires sm_count (so does Rust)."""
+    if fixture_predates_sm_count():
+        with pytest.raises(TilefishManifestError, match=r"library entry #0 \('gemm_1024_1024.M32'\): must have exactly the fields .*missing \['sm_count'\]"):
+            Manifest.load(FIXTURES / "sm_103")
+    directory, _ = fixture_dir(tmp_path)
+    shutil.copytree(directory, tmp_path / "m")
+    doc = json.loads((tmp_path / "m" / "manifest.json").read_text())
+    del doc["library"][3]["sm_count"]
+    (tmp_path / "m" / "manifest.json").write_text(json.dumps(doc))
+    with pytest.raises(TilefishManifestError, match=r"library entry #3 .*missing \['sm_count'\]"):
+        Manifest.load(tmp_path / "m")
+
+
+@needs_crate
+@predates_sm_count
+def test_the_committed_launchers_are_what_the_emitter_writes_for_the_fixture(tmp_path):
+    emitted = rust.render(fixture(tmp_path), ops=committed_ops())
     assert emitted == (FIXTURES / "generated.rs").read_text(), (
         "crates/tilefish/tests/fixtures/generated.rs is not what tilefish.hosts.rust.emit writes for the sm_103 fixture: "
         "regenerate it with python/tests/export_rust_fixtures.py (or, if only the emitter changed, with emit)"
@@ -295,7 +350,7 @@ def test_the_launchers_compile_against_the_crate(tmp_path_factory, fake_manifest
         '[package]\nname = "launchers-check"\nversion = "0.0.0"\nedition = "2024"\n\n'
         f'[dependencies]\ntilefish = {{ path = {json.dumps(str(REPO_ROOT / "crates" / "tilefish"))} }}\n\n[workspace]\n'
     )
-    sm_103 = fixture()
+    sm_103 = fixture(tmp_path_factory.mktemp("fixture"))
     declared = committed_ops()
     rust.emit(sm_103, crate / "src" / "typed.rs", ops=declared)
     rust.emit(sm_103, crate / "src" / "manifest_only.rs")
@@ -396,7 +451,9 @@ def _mutations():
 @needs_crate
 @pytest.mark.parametrize("name, mutate", _mutations(), ids=[n for n, _ in _mutations()])
 def test_python_refuses_what_the_rust_tests_refuse(name, mutate, tmp_path):
-    shutil.copytree(FIXTURES / "sm_103", tmp_path / "m")
+    directory, _ = fixture_dir(tmp_path)  # the committed fixture (as a reader of sm_count takes it), which Python accepts as it is
+    Manifest.load(directory)
+    shutil.copytree(directory, tmp_path / "m")
     mutate(tmp_path / "m")
     with pytest.raises(TilefishManifestError):
         Manifest.load(tmp_path / "m")

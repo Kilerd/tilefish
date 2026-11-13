@@ -62,7 +62,7 @@ def main(work):
 
     (spec,) = _library.library_specs(gemm_ws)
     cap = torch.cuda.get_device_capability()
-    built = _library.BuiltLibrary(spec, f"sm_{cap[0] * 10 + cap[1]}", algo, _cublaslt.version())
+    built = _library.BuiltLibrary(spec, f"sm_{cap[0] * 10 + cap[1]}", algo, _cublaslt.version(), _library.sm_count(torch.cuda.current_device()))
     write_manifest([], out / "manifest" / "manifest.json", library=[built])
     a = randn((M, K), torch.bfloat16, seed=1)
     b = randn((N, K), torch.bfloat16, seed=2, scale=1 / K**0.5)

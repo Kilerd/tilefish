@@ -526,6 +526,116 @@ def test_the_overlap_check_is_a_sweep_that_finds_every_overlapping_pair(good_reu
         _plan.validate_doc(doc)
 
 
+def _live(doc):
+    """The live range of every buffer that a step of the first bucket binds: (first step, last step)."""
+    first, last = {}, {}
+    for si, st in enumerate(doc["buckets"][0]["steps"]):
+        for a in st["args"]:
+            first.setdefault(a["binding"], si)
+            last[a["binding"]] = si
+    return {n: (first[n], last[n]) for n in first}
+
+
+def _regions(doc):
+    return {b["name"]: (b["offset"], b["offset"] + _plan.align_up(b["bytes"])) for b in doc["buffers"] if b["role"] in _plan.ARENA_ROLES}
+
+
+def _resize(doc):
+    """``arena_bytes`` as the moved regions make it (the overlap rules are what is tested, not the size)."""
+    doc["arena_bytes"] = _plan.align_up(max(end for _, end in _regions(doc).values()))
+
+
+def test_a_region_that_may_not_share_is_refused_inside_any_active_region_not_only_one_that_may_not_share(good_reuse):
+    """The sweep refuses a non-sharing region (here the device scalar ``n``) that starts while *any* region is active, a sharing one included (a sweep that
+    compared it with the active non-sharing region alone would let it into an intermediate)."""
+    doc = copy.deepcopy(good_reuse)
+    regions = _regions(doc)
+    host = next(
+        n
+        for n, (lo, hi) in regions.items()
+        if buffer(doc, n)["role"] == "intermediate" and hi - lo >= 1024 and not any(lo + 256 <= o < lo + 512 for m, (o, _) in regions.items() if m != n)
+    )
+    buffer(doc, "n")["offset"] = regions[host][0] + 256  # inside the intermediate, past its start: the intermediate is active and may share
+    _resize(doc)
+    with pytest.raises(TilefishManifestError, match=rf"the regions of 'n' and '{host}' overlap"):
+        _plan.validate_doc(doc)
+
+
+def test_only_an_intermediate_may_share_a_device_scalar_never_even_with_disjoint_live_ranges(good_reuse):
+    """``n`` (read by step 2 only) put on an intermediate that no step uses with it: disjoint live ranges, which would let two intermediates share, but a
+    device scalar never shares (a sweep that let any role share would accept it)."""
+    doc = copy.deepcopy(good_reuse)
+    live, regions = _live(doc), _regions(doc)
+    n_first, n_last = live["n"]
+
+    def apart(m):
+        lo, hi = live.get(m, (-1, -1))
+        return hi < n_first or n_last < lo
+
+    host = next(
+        x
+        for x, (lo, hi) in regions.items()
+        if buffer(doc, x)["role"] == "intermediate"
+        and all(apart(m) for m, (o, e) in regions.items() if m not in ("n", x) and o < lo + 256 and lo < e)  # everything under n's new region is apart from n
+        and apart(x)
+    )
+    buffer(doc, "n")["offset"] = regions[host][0]
+    _resize(doc)
+    with pytest.raises(TilefishManifestError, match=r"the regions of '(n|%s)' and '(n|%s)' overlap" % (host, host)):
+        _plan.validate_doc(doc)
+
+
+def test_a_region_is_active_up_to_its_last_byte(good):
+    """Two regions of a plan without reuse that overlap by the last 256 bytes of the first: refused (a sweep that retired a region 256 bytes early would not see it)."""
+    doc = copy.deepcopy(good)
+    regions = sorted(_regions(doc).items(), key=lambda kv: kv[1])
+    (a, (lo_a, hi_a)), (b, (lo_b, hi_b)) = regions[2], regions[3]
+    assert hi_a == lo_b and hi_a - lo_a >= 512  # consecutive, the first larger than 256 bytes
+    buffer(doc, b)["offset"] = hi_a - 256
+    _plan.validate_doc(copy.deepcopy(good))
+    with pytest.raises(TilefishManifestError, match=rf"the regions of '{b}' and '{a}' overlap"):
+        _plan.validate_doc(doc)
+    buffer(doc, b)["offset"] = hi_a  # back where it ends: fine
+    _plan.validate_doc(doc)
+
+
+def _view_args(doc, bucket=1):
+    """The attention step of a bucket (M = 64) and its view of v in the fused qkv ``t1``: offset 512, the last element of t1 is its last."""
+    st = next(s for s in doc["buckets"][bucket]["steps"] if s["entry"] == "attention")
+    v = next(a for a in st["args"] if a["name"] == "v")
+    assert v["binding"] == "t1" and v["view"] == {"shape": [64, 4, 64], "strides": [768, 64, 1], "offset": 512}
+    return st, v
+
+
+def test_a_view_that_ends_at_the_last_element_of_its_buffer_is_inside_and_one_more_is_outside(good):
+    """``offset + 1 + sum((shape - 1) * stride) <= elements``: v ends exactly at the end of t1 (64 * 768 elements); one element further is refused, by the
+    reader (validate_doc) and by what binds a step (resolve_step)."""
+    import plan_model as pm
+
+    doc = copy.deepcopy(good)
+    st, v = _view_args(doc)
+    assert v["view"]["offset"] + 1 + 63 * 768 + 3 * 64 + 63 == 64 * 768
+    _plan.validate_doc(doc)
+    v["view"]["offset"] = 513
+    with pytest.raises(TilefishManifestError, match=r"the view reaches past the end of buffer 't1' at \{'M': 64\}"):
+        _plan.validate_doc(doc)
+    v["view"]["offset"] = 512
+    v["view"]["shape"] = [64, 4, 65]  # the same end, by the shape: one element past
+    with pytest.raises(TilefishManifestError, match=r"the view reaches past the end of buffer 't1'"):
+        _plan.validate_doc(doc)
+    # resolve_step, which a runner binds every step with
+    made = tilefish.plan(pm.block)
+    shapes = _plan.buffer_shapes(made._doc, {"M": 64})
+    callee = made.callees["attention"]
+    st = copy.deepcopy(_view_args(made._doc)[0])
+    _plan.resolve_step(callee, st["args"], shapes, "the attention")  # as planned: the last element of v is the last of t1
+    for change in ({"offset": 513}, {"shape": [64, 4, 65]}):
+        bad = copy.deepcopy(st)
+        next(a for a in bad["args"] if a["name"] == "v")["view"].update(change)
+        with pytest.raises(TilefishPlanError, match=r"the view of 't1' for argument 'v' .* reaches past the 49152 elements of the buffer"):
+            _plan.resolve_step(callee, bad["args"], shapes, "the attention")
+
+
 def test_a_document_that_is_not_an_object_or_has_odd_types_is_a_refusal_not_a_crash(good):
     for bad in (None, [], "plan", 1, {"schema": "tilefish.plan.v1"}):
         with pytest.raises(TilefishManifestError):
@@ -588,6 +698,34 @@ def test_a_buffer_is_written_before_it_is_read(against):
     d = copy.deepcopy(doc)
     d["buckets"][0]["steps"][1]["args"][0]["binding"] = "t4"  # reads t4, which only step 4 writes
     refused(d, manifest, "reads 't4' before any step has written it")
+
+
+def test_an_in_place_pointer_reads_its_buffer_so_the_buffer_is_written_before(tmp_path):
+    """An ``inout`` pointer reads what it updates: bound to an intermediate no step has written yet, it is refused like an ``in`` pointer (a check of the
+    ``in`` pointers alone would let it read garbage). ``accumulate``: step 2 (``twice``) writes t0 and step 3 (``bump``) updates it in place."""
+    exported = plan_fakes.export(tilefish.plan(pm.accumulate), tmp_path)
+    doc, manifest = exported.doc, exported.manifest
+    steps = doc["buckets"][0]["steps"]
+    assert [s["entry"] for s in steps] == ["bump", "bump", "twice", "bump", "plus"] and steps[3]["args"][0] == {"name": "state", "binding": "t0"}
+    _plan.check_against_manifest(doc, manifest)
+    pointers = {p["name"]: p["access"] for p in manifest.get("bump", "sm_103").entry["abi"]["params"] if p["kind"] == "pointer"}
+    assert pointers["state"] == "inout"
+    d = copy.deepcopy(doc)
+    d["buckets"][0]["steps"][2]["args"][1]["binding"] = "out0"  # twice writes the output instead: t0 is first touched by the in-place bump
+    refused(d, manifest, r"step #3 \(bump\) of bucket \{'Q': 16\}: argument 'state' reads 't0' before any step has written it")
+
+
+def test_every_output_is_written_by_a_step(against):
+    """A returned value that no step writes would come back as whatever its tensor held: refused (the last step's result rebound to an intermediate)."""
+    doc, manifest = against
+    d = copy.deepcopy(doc)
+    last = d["buckets"][0]["steps"][-1]
+    assert last["args"][-1] == {"name": "out", "binding": "out0"}
+    last["args"][-1]["binding"] = "t0"  # an intermediate of the same dtype and shape, which an earlier step wrote: every other rule holds
+    refused(d, manifest, r"bucket \{'M': 32\}: no step writes the output 'out0'")
+    d = copy.deepcopy(doc)
+    d["buckets"][2]["steps"][-1]["args"][-1]["binding"] = "t0"  # in one bucket only
+    refused(d, manifest, r"bucket \{'M': 128\}: no step writes the output 'out0'")
 
 
 def test_a_library_step_needs_the_workspace_the_entry_says(against):

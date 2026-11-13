@@ -132,3 +132,52 @@ def test_an_empty_plan_has_an_empty_arena():
 
 def test_align_up():
     assert [align_up(n) for n in (0, 1, 255, 256, 257, 512)] == [0, 256, 256, 256, 512, 512] and _plan.ARENA_ALIGNMENT == 256
+
+
+def test_first_fit_skips_a_region_nested_in_one_it_already_passed():
+    """``off = max(off, b)``, not ``off = b``: a region inside one already passed ends before it, and must not send the offset back into it."""
+    assert _plan.first_fit(0, 256, [(0, 1024), (256, 512)]) == 1024  # with off = b it would be 512, inside the first region
+    assert _plan.first_fit(0, 256, [(256, 512), (0, 1024)]) == 1024  # the order given does not matter
+    assert _plan.first_fit(0, 256, [(0, 1024), (256, 512), (2048, 4096)]) == 1024
+    assert _plan.first_fit(0, 1024, [(0, 256), (256, 512), (1536, 2048)]) == 512 and _plan.first_fit(512, 256, []) == 512
+
+
+@pytest.mark.parametrize("seed", range(200))
+def test_first_fit_is_the_lowest_free_offset_for_any_regions(seed):
+    """Against a brute force over every multiple of 256: the lowest offset from ``base`` where the region meets none of the taken ones (which may overlap or nest)."""
+    rng = random.Random(seed)
+    taken = []
+    for _ in range(rng.randint(0, 8)):
+        a = 256 * rng.randint(0, 24)
+        taken.append((a, a + 256 * rng.randint(1, 8)))
+    base, size = 256 * rng.randint(0, 4), 256 * rng.randint(1, 6)
+    want = next(o for o in range(base, 1 << 20, 256) if all(o + size <= a or b <= o for a, b in taken))
+    assert _plan.first_fit(base, size, taken) == want
+
+
+def test_a_plan_that_is_made_is_held_to_every_rule_of_a_file_the_overlap_sweep_among_them(monkeypatch):
+    """jit runs a plan that was only made: it is validated as export and replay validate a file. A layout that overlaps two buffers a step uses together
+    (a bug of the planner, here made by hand) is refused before anything runs."""
+    import plan_model as pm
+
+    import tilefish
+    from tilefish import TilefishPlanError
+
+    made = tilefish.plan(pm.block, reuse=True)
+    _plan.validate_doc(made.doc, made=True)
+    real = plan_arena
+
+    def everything_at_one_offset(items, reuse):
+        offsets, _ = real(items, reuse)
+        reusable = {i.name for i in items if i.reusable}
+        shared = min(o for n, o in offsets.items() if n in reusable)
+        offsets = {n: (shared if n in reusable else o) for n, o in offsets.items()}
+        return offsets, align_up(max(offsets[i.name] + align_up(i.bytes) for i in items))  # a consistent size: only the overlaps are wrong
+
+    monkeypatch.setattr(_plan, "plan_arena", everything_at_one_offset)
+    with pytest.raises(TilefishPlanError, match=r"graph 'block': the plan made is not a valid plan .*no step uses together"):
+        tilefish.plan(pm.block, reuse=True)
+    with pytest.raises(TilefishPlanError, match=r"the plan made is not a valid plan"):
+        tilefish.run(pm.deep_block(2), *[None] * 9)  # the default plan of jit: refused before an argument is looked at
+    with pytest.raises(Exception, match="null arch and manifest_digest"):
+        _plan.validate_doc(made.with_manifest("sm_103", "a" * 64).doc, made=True)

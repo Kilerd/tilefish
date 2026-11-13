@@ -275,7 +275,9 @@ A real model needs four things that a dense, compiled-in, Triton-only operator c
 **Strided views.** A tensor type has element strides and an element offset, in the dimension algebra (`TensorType.strides`, `.offset`); dense
 and 16-byte aligned (`contiguous`) is the default. `x.reshape(M, 3, H, D)` (a dense input), `x.permute(1, 0, 2)`, `x[:, 1]` / `x.select(axis, i)` and
 `x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A view is a `View[...]` and can go into traced
-elementwise and reduction ops; a declared operator takes one only where its parameter says so. An `extern` parameter `x: Strided[Tensor[S, H, D, bf16]]`
+elementwise and reduction ops; a declared operator takes one only where its parameter says so. Every other tensor parameter (and result) of a kernel,
+extern, library op or graph is contiguous: an annotation that is a `TensorType` with other strides, an offset or no alignment is refused at the
+declaration, and a launch refuses a tensor that is not contiguous for such a parameter. An `extern` parameter `x: Strided[Tensor[S, H, D, bf16]]`
 takes a view, and the kernel's strides are scalar parameters the stub declares in the kernel's argument order:
 
 ```python
@@ -307,8 +309,9 @@ as it is for its own architecture and refused for another. `replay` refuses a fi
 Tensor[M, N, bf16]` computes `a @ b.T` with an f32 accumulator and one rounding (`impl="cublaslt.gemm_bias"` adds `bias: Tensor[N, bf16]`, added in f32 before it).
 For each `(M, N, K, bias)` (`M` from its buckets) the algorithm that cuBLASLt's heuristic ranks first under a fixed workspace limit (8 519 680 bytes,
 torch's default; `workspace_bytes=` changes it) is pinned: its 64 bytes go to the manifest's `library` section with the cuBLASLt version that chose
-it, and `replay` runs that algorithm and refuses another cuBLASLt version. `jit` pins in memory the same way, so `jit` and `replay` run the same
-algorithm. The binding is ctypes on the `libcublasLt` the process already has loaded (torch's); operands are contiguous and 16-byte aligned (strided
+it and the SM count of the device it chose it on (`sm_count`: a MIG slice has fewer SMs than the whole GPU), and `replay` runs that algorithm and refuses
+another cuBLASLt version and a device of another SM count ("re-export the manifest on this device"). `jit` pins in memory the same way, per device, so
+`jit` and `replay` run the same algorithm. The binding is ctypes on the `libcublasLt` the process already has loaded (torch's); operands are contiguous and 16-byte aligned (strided
 operands are not supported yet).
 
 ## Launch plans: a graph as a static list of launches over one arena
@@ -336,7 +339,10 @@ verifies the file and its manifest (a tampered plan, a wrong pin, a plan built a
 and keeps it, and checks **every step's preconditions before the first launch**: a failure launches nothing, not even the write of a device scalar. A run allocates nothing but its outputs
 (`outputs=` gives them) and waits for nothing: the GEMM workspace is in the arena, a device scalar is written by a stream-ordered copy. So **a replay under `torch.cuda.graph` captures and the
 graph replays byte-identically** (`runtime.prepare` does the allocating and the loading that cannot happen inside a capture; `docs/plan-schema-1.md` lists every reason a plan could fail to
-capture). `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
+capture). Every run of a plan on a device uses the one arena, so **runs of one plan on several streams (or threads) are ordered on the device** by an event of the arena: a run waits on its
+stream for the run before it and records the event after its last launch, so they never overlap and their results are correct, at the cost of running one after the other. Under a capture the
+wait and the record are external event nodes of the graph, so a captured graph's arena is the plan's arena and its replays take their place in that order, with the plain runs, in the order
+the host issues them. `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
 eager composition of the same ops give the same bytes for every bucket and two values of `n`.
 
 A plan launches declared operators and views. Arithmetic traced in the graph body, a `store`, an `Out` parameter, a call to another graph, an in-place call on a view and a view read after its

@@ -15,7 +15,7 @@ fixture that is cross-compiled (any other architecture, which needs nothing but 
 (``rust_gate.py prepare``). Then it writes
 
 * ``expected.json``: for each fixture the digest of the manifest, for every binary its ``kind``, ``sha256`` and ``sha256_code`` and for every library entry its
-  algorithm, the cuBLASLt version that chose it and its workspace, all computed by Python (``Manifest.digest``, ``code_digest``). The Rust tests
+  algorithm, the cuBLASLt version that chose it, the SM count of the device it chose it on and its workspace, all computed by Python (``Manifest.digest``, ``code_digest``). The Rust tests
   (``tests/cross_language.rs``) reproduce them from the files with no GPU and no Python; ``test_rust_host.py`` checks them against Python on every ``pytest`` run.
 * ``generated.rs``: the launchers ``tilefish.hosts.rust.emit`` writes for the fixture of the device's architecture (the first architecture when the
   device is none of them), from the declarations that need no GPU (``host_ops.ops()`` and the GEMMs: ``test_rust_host.py`` writes the same file without one; the
@@ -23,6 +23,10 @@ fixture that is cross-compiled (any other architecture, which needs nothing but 
 
 The fixtures are committed; they only change when a binary does (another Triton, ptxas, cuBLASLt, or kernel), and then the files
 of ``crates/tilefish/tests/fixtures`` are replaced together.
+
+Fixtures built before a library entry recorded the SM count of its device (``sm_count``) are migrated without a GPU, keeping every binary and algorithm::
+
+    python export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --migrate-sm-count 30
 """
 
 import argparse
@@ -59,6 +63,7 @@ def expected(manifest):
                 "impl": e["impl"],
                 "algo": e["algo"],
                 "cublaslt_version": e["cublaslt_version"],
+                "sm_count": e["sm_count"],
                 "workspace_bytes": e["workspace_bytes"],
             }
             for e in sorted(manifest.library_entries, key=lambda e: (e["stem"], e["arch"]))
@@ -79,12 +84,58 @@ def native_capability():
         return None
 
 
+def with_sm_count(doc, sm_count):
+    """A manifest document whose library entries predate ``sm_count`` (the multiprocessor count of the device a pin was made on), as it is with the field:
+    ``sm_count`` placed after ``cublaslt_version``, and the declaration digest of the committed declaration on a device of that SM count (an entry's
+    declaration digest covers it). The cubins and the kernels are untouched."""
+    import copy
+
+    from tilefish._library import library_specs
+
+    specs = {s.stem: s for op in library_ops(GEMM_SHAPES).values() for s in library_specs(op)}
+    out = copy.deepcopy(doc)
+    for i, e in enumerate(out["library"]):
+        items = [(k, v) for k, v in e.items() if k != "sm_count"]
+        at = [k for k, _ in items].index("cublaslt_version") + 1
+        out["library"][i] = dict(items[:at] + [("sm_count", sm_count)] + items[at:])
+        out["library"][i]["declaration_digest"] = specs[e["stem"]].pinned_digest(sm_count)
+    return out
+
+
+def migrate_sm_count(output, sm_count):
+    """Give the library entries of the committed fixtures in ``output`` the ``sm_count`` of the device they were pinned on (no GPU: the algorithms stay), then write
+    ``expected.json`` and ``generated.rs`` again from them. For the fixtures built before library entries had the field."""
+    from tilefish import Manifest
+
+    summary = json.loads((output / "expected.json").read_text())["fixtures"]
+    for name in summary:
+        path = output / name / "manifest.json"
+        doc = with_sm_count(json.loads(path.read_text()), sm_count)
+        path.write_text(json.dumps(doc, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        manifest = Manifest.load(output / name)
+        manifest = manifest.check_pin(manifest.digest)
+        summary[name] = expected(manifest)
+        if manifest.library_entries:
+            rust.emit(manifest, output / "generated.rs", ops=list(ops().values()) + list(library_ops(GEMM_SHAPES_COMMITTED).values()))
+        print(f"{name}: manifest digest {manifest.digest}", file=sys.stderr)
+    (output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("output", type=pathlib.Path)
     parser.add_argument("--archs", default="103,120", help="compute capabilities to build for (default: 103,120)")
     parser.add_argument("--gemm-shapes", choices=["committed", "all"], default="committed", help="the (N, K) shapes of the GEMMs of the device's fixture")
+    parser.add_argument(
+        "--migrate-sm-count",
+        type=int,
+        metavar="N",
+        help="no build: give the library entries of the fixtures in OUTPUT the sm_count N of the device they were pinned on, and write expected.json and generated.rs again",
+    )
     args = parser.parse_args(argv)
+    if args.migrate_sm_count is not None:
+        migrate_sm_count(args.output, args.migrate_sm_count)
+        return
     caps = [int(c) for c in args.archs.split(",")]
     native = native_capability()
     emit_cap = native if native in caps else caps[0]
