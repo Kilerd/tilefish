@@ -24,7 +24,8 @@ parameter are refused with the rule that says so (wrap arithmetic in a ``@tilefi
 and a ``store`` into an ``InOut`` parameter are copy steps (a device-to-device copy of dense bytes). An in-place
 call (``InOut``) must take a whole buffer, not a view of another tensor (the IR says a chunk that is updated does not change its parent; a plan
 has no copy to make that true). A returned value is the buffer a call made (all of it, in any shape: a reshape costs nothing), or a copy step at the end
-copies it (a dense view, a parameter, a value returned twice); a view that is not dense is refused.
+copies it (a dense view, a parameter, a value returned twice); a view that is not dense (and a ``tilefish.copy`` of one) is materialised by a launch
+of the generated op ``tilefish.contiguous``.
 """
 
 from __future__ import annotations
@@ -1082,6 +1083,11 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
         raise TilefishPlanError(f"graph '{name}': {count} bucket combinations are planned, more than the {MAX_BUCKETS} a plan may have (plan fewer sizes)")
     combos = bucket_combinations(dims)
     by_name = {d.name: d for d in w.dims}
+    # a copy of a view that is not dense at some bucket (a permutation, a column block: what a returned value, tilefish.copy or a store may be) is
+    # not one run of bytes: it is materialised by a launch of tilefish.contiguous instead, at every bucket (a dense one stays a copy step)
+    for index, s in enumerate(w.steps):
+        if s.copy and not _dense_at_every_bucket(s.args[0].loc, combos, by_name, name):
+            w.steps[index] = _materialised(s, name)
 
     for index, s in enumerate(w.steps):  # the live range of every buffer: from the first step that has it as an argument to the last
         for a in s.args:
@@ -1204,6 +1210,42 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
     made = Plan(graph, doc, callees, variants)
     _check_resolves(made)
     return made
+
+
+def _dense_at_every_bucket(l: _Loc, combos: "Sequence[Mapping[str, int]]", by_name: "Mapping[str, Dim]", graph: str) -> bool:
+    """Whether the view ``l`` is one run of elements (dense: the strides of its axes of a size other than 1 are the row-major ones) at every bucket."""
+    for combo in combos:
+        mapping = {by_name[n]: v for n, v in combo.items()}
+        shape = tuple(_eval(d, mapping, graph, "the shape of a view") for d in l.shape)
+        strides = tuple(_eval(d, mapping, graph, "a stride of a view") for d in l.strides)
+        if not _contiguous(shape, strides):
+            return False
+    return True
+
+
+def _materialised(s: _SymStep, graph: str) -> _SymStep:
+    """A copy step whose source is a view that is not dense, as a launch of the generated op ``tilefish.contiguous`` (a strided view of rank 1 to 4 into
+    a contiguous tensor of its shape, raw bits): the destination, the whole buffer (in the view's shape when it has another one)."""
+    from ._copyops import contiguous_op
+    from .dtypes import ALL_DTYPES
+
+    src, dst = s.args[0].loc, s.args[1].loc
+    rank = len(src.shape)
+    if not 1 <= rank <= 4:
+        _fail(graph, f"{s.what} copies a view that is not dense and has rank {rank}: tilefish.contiguous materialises views of rank 1 to 4 (compute it with an operator)")
+    last = src.shape[-1].folded()
+    try:
+        op = contiguous_op(rank, ALL_DTYPES[src.buffer.dtype], last.value if last.is_static else None)
+    except TilefishError as e:
+        raise TilefishPlanError(f"graph '{graph}': {s.what} copies a view that is not dense, which tilefish.contiguous cannot materialise: {e}") from None
+    callee = callee_of(op)
+    if tuple(d.folded() for d in dst.shape) == tuple(d.folded() for d in src.shape):
+        out = dst
+    else:  # the destination in the shape of the view (as many elements: a copy is of bytes)
+        strides = row_major_strides(src.shape)
+        out = _Loc(dst.buffer, tuple(src.shape), tuple(strides), dst.offset, False, dst.version)  # type: ignore[arg-type]
+    args = [_Arg(callee.names["x"], src, "in"), _Arg(callee.names["y"], out, "out")]
+    return _SymStep(callee, args, f"{s.what}, materialised by tilefish.contiguous (the view is not dense)")
 
 
 def _shape_entry(d: DimExpr) -> "int | str":

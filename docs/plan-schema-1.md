@@ -236,7 +236,9 @@ captured records it as a memcpy node, so a plan with copy steps captures in a CU
 
 **Where they come from.** `tilefish.copy(x)` in a graph body (a new tensor of its own: a copy step from `x`, a tensor or a dense view of one, into a fresh intermediate, which
 an in-place call may then update, where `x`, a parameter, is the caller's and never written), and `param[...] = value` into an `InOut` parameter of the graph (a copy step
-into the caller's tensor; `param[...] = param` is no step). A copy of a view that is not dense (a permutation, a column block) is refused when the plan is made.
+into the caller's tensor; `param[...] = param` is no step). A copy of a view that is not dense at some bucket (a permutation, a column block) is not a copy
+step: the writer makes it a step of kind `kernel` that launches the generated op `tilefish.contiguous` (a strided view of rank 1 to 4, read through its strides,
+into the dense destination; `python/src/tilefish/_copyops.py`) at every bucket, so the document has nothing new (a view of rank 5 or more is refused).
 A reader that predates copy steps (the published crate 0.0.2, tilefish 0.0.4) refuses a plan that has one (`kind` must be `kernel` or `library`); a plan without one is
 what it always was.
 
@@ -411,11 +413,12 @@ A graph body that a plan cannot make is refused by `tilefish.plan` with the rule
 * **arithmetic traced in the graph body** (`x + y`, a cast, a reduction, a load): a plan launches declared operators; put it in a `@tilefish.kernel`. Views (`reshape`, `permute`, `select`, `split`,
   `x[i]`) are fine. There is no fusion in this version: the steps are the calls the graph makes.
 * an **`Out`** parameter of the graph (and so a `store` into one) and a runtime **`Dim`** parameter: a graph's results are its returned values (a `store` into an `InOut`
-  parameter is a copy step, section 7.5), and a `tilefish.copy` of a view that is not dense;
+  parameter is a copy step, section 7.5);
 * a call to **another graph** (it is not inlined yet).
 * an **in-place call on a view** of another tensor (the IR says updating a view does not change its parent; a plan has no copy to make that true), and a view **read after its tensor was updated
   in place**.
-* a returned value that is **a view that is not dense**, a **`DevScalar`**, or a view of a tensor updated in place after the view was made. (Any other returned value is
+* a returned value that is a **`DevScalar`**, or a view of a tensor updated in place after the view was made (a view that is **not dense** is a launch of
+  `tilefish.contiguous` into the caller's output, section 7.5). (Any other returned value is
   planned: a tensor a call made is the caller's output buffer itself; **all of it in another shape** (a reshape: offset 0, the row-major strides, as many elements) too,
   the output buffer then having the returned shape and the steps that write and read it a view of their own shape; **any other dense view, a parameter and a value
   returned twice** are copied into the caller's buffer by a copy step after the last call, section 7.5.)
@@ -463,6 +466,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | debug taps (section 9) | `test_plan_taps.py`; on a GPU `test_gpu_plan_taps.py` and `gpu_plan_gate.rs` (`taps_are_pythons_bytes`: Rust taps against Python's) |
 | the roles of the parameters, declared or chosen from the shapes (sections 2, 6), and weights bound once (section 9) | `test_plan_roles.py`; the golden plan `steps` (`launch_plans.rs`); on a GPU `test_gpu_plan_roles.py` and `gpu_plan_gate.rs` (`weights_bound_once_give_pythons_bytes`) |
 | the fixed arguments given per call of a prebuilt binary: a step's `given` (section 7) | `test_given_args.py`; the golden plan `given` (`launch_plans.rs`, and the `given ...` documents of `python_plans.json`); on a GPU `test_gpu_given_args.py`, `gpu_gate.rs` (`one_binary_serves_the_values_each_call_gives`) and the gate plan `given_steps` |
+| views that are not dense, returned or copied: launches of `tilefish.contiguous` (section 7.5) | `test_plan_materialise.py`; on a GPU `test_gpu_plan_materialise.py` and the gate plan `strided_returns` |
 | the names of the returned values (section 6) | `test_plan_names.py`; the golden plan `steps` (`launch_plans.rs`); on a GPU `gpu_plan_gate.rs` (`a_named_output_is_given_by_its_name_or_by_out_i`) |
 | the memory plan: alignment, no overlap, liveness reuse against a simulated arena | `test_plan_arena.py` |
 | the digest, the pin, every rule of the format, the manifest checks, tampering | `test_plan_schema.py` |

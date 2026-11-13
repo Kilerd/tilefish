@@ -695,6 +695,7 @@ def plan_graphs():
         ("view_returns", p5.view_returns, False, view_cases),  # a reshape of a result returned (no copy), a dense view of a parameter and a value twice (copies)
         ("weighted", p6.static_affine, False, weighted_cases),  # a static graph that declares its roles: weights bound once (PlanRun::bind_weights)
         ("given_steps", p6.two_scales, False, given_cases),  # one prebuilt binary, two steps with the values each call gives (one of them the bucket's)
+        ("strided_returns", p6.strided_returns, False, given_cases),  # a transpose and a column block materialised by tilefish.contiguous, a row copied
     ]
 
 

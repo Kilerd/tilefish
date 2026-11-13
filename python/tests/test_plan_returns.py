@@ -92,14 +92,8 @@ def test_an_updated_inout_parameter_returned_is_its_final_version_copied():
     assert kinds(p) == ["kernel", "copy"] and p.steps(Rb=8)[1]["args"][0] == {"name": "src", "binding": "state"}
 
 
-def test_a_view_that_is_not_dense_a_device_scalar_and_a_stale_view_are_refused():
-    @tilefish.graph
-    def columns(x: Tensor[Rb, 128, f32]):
-        a, b = x.split(64, axis=1)
-        return a
-
-    with pytest.raises(TilefishPlanError, match="the return of %.*which is not dense"):
-        tilefish.plan(columns)
+def test_a_device_scalar_and_a_stale_view_are_refused():
+    # (a view that is not dense is materialised by tilefish.contiguous: test_plan_materialise.py)
 
     @tilefish.graph
     def scalar(x: Tensor[Rb, 64, f32], n: DevScalar[i32]):

@@ -477,12 +477,14 @@ buffer of its own; otherwise the result gets one, so the values are the same eit
 
 **Copy steps.** `r = tilefish.copy(x)` in a graph is a step of kind `copy`: the dense bytes of `x` (a tensor, or a dense view such as `x[1]`) copied into a
 buffer of its own with `cuMemcpyDtoDAsync`, a memcpy node in a CUDA graph. The copy is an intermediate an in-place call may update, where `x`, the caller's,
-is never written. `state[...] = r` into an `InOut` parameter is a copy step into the caller's tensor. A copy of a view that is not dense is refused when the
+is never written. `state[...] = r` into an `InOut` parameter is a copy step into the caller's tensor. A copy of a view that is not dense is a launch of
+`tilefish.contiguous` instead (a strided view of rank 1 to 4 into a dense tensor), as the
 plan is made (`docs/plan-schema-1.md`, section 7.5).
 
 **Returned views.** A graph may return a reshape of a result at no cost (`return y.reshape(M, N)` of a flat `y`: the caller's output is `y`'s buffer, in the
 returned shape, and the step that writes it binds it through a flat view), and any other dense view, a parameter or a value twice, which a copy step after
-the last call puts into the caller's output. A view that is not dense is refused.
+the last call puts into the caller's output. A view that is not dense (a transpose, a column block) is materialised there by a launch of
+`tilefish.contiguous`.
 
 **Named outputs.** `@tilefish.graph(outputs=("y", "residual"))` names the returned values: the plan's output buffers have those names (else `out0`,
 `out1`, ...), `tilefish.run(..., outputs={"y": y, "residual": r})` takes them by name, and the Rust host binds them by name; both hosts also take `out<i>` for

@@ -422,7 +422,7 @@ def test_a_view_of_a_graph_parameter_that_is_updated_in_place_is_stale_for_the_s
         tilefish.plan(on_param)
 
 
-def test_an_input_and_a_repeat_are_copied_and_a_view_that_is_not_dense_is_refused():
+def test_an_input_and_a_repeat_are_copied_and_a_view_that_is_not_dense_is_materialised():
     # (test_plan_returns.py has the rest: a reshape costs nothing, any dense view is copied)
     @tilefish.graph
     def returns_input(a: Tensor[Q, W, f32]) -> Tensor[Q, W, f32]:
@@ -436,8 +436,9 @@ def test_an_input_and_a_repeat_are_copied_and_a_view_that_is_not_dense_is_refuse
         left, right = twice(a).split(64, axis=-1)
         return left
 
-    with pytest.raises(TilefishPlanError, match="which is not dense"):
-        tilefish.plan(returns_view)
+    # a column block is not one run of bytes: a launch of tilefish.contiguous puts it into the caller's output (test_plan_materialise.py)
+    steps = tilefish.plan(returns_view).steps(Q=16)
+    assert [s["kind"] for s in steps] == ["kernel", "kernel"] and steps[1]["entry"].startswith("contiguous_r2_f32")
 
     @tilefish.graph
     def twice_returned(a: Tensor[Q, W, f32]) -> tuple[Tensor[Q, W, f32], Tensor[Q, W, f32]]:

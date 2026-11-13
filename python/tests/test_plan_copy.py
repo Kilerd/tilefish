@@ -14,7 +14,7 @@ from fake_torch import FakeTensor
 from test_planrun import ARENA, FakeBackend, FakeProvider
 
 import tilefish
-from tilefish import Dim, InOut, Tensor, TilefishLoweringError, TilefishManifestError, TilefishPlanError, _plan, f32
+from tilefish import Dim, InOut, Tensor, TilefishLoweringError, TilefishManifestError, _plan, f32
 from tilefish._planrun import PlanRunner
 
 Rb = Dim("Rb", buckets=[8, 24])
@@ -76,14 +76,16 @@ def test_a_copy_of_a_dense_view_has_its_offset_and_the_store_of_a_value_onto_its
     assert [s["kind"] for s in steps(tilefish.plan(onto_itself))] == ["kernel"]
 
 
-def test_a_copy_of_a_view_that_is_not_dense_is_refused():
+def test_a_copy_of_a_view_that_is_not_dense_is_a_launch_of_contiguous():
     @tilefish.graph
     def columns(x: Tensor[Rb, 128, f32]):
         a, b = x.split(64, axis=1)  # a column block: rows of 64 with a stride of 128
         return twice(tilefish.copy(a))
 
-    with pytest.raises(TilefishPlanError, match="which is not dense: a copy step copies one run of bytes"):
-        tilefish.plan(columns)
+    first, second = tilefish.plan(columns).steps(Rb=8)
+    assert first["kind"] == "kernel" and first["entry"] == "contiguous_r2_f32_last64_t32x64"
+    assert first["args"][0] == {"name": "x", "binding": "x", "view": {"shape": [8, 64], "strides": [128, 1], "offset": 0}}
+    assert second["args"][0]["binding"] == first["args"][1]["binding"]
 
 
 def test_a_copy_in_a_kernel_body_is_not_lowered():

@@ -57,6 +57,23 @@ def two_scales(x: Tensor[Rg, 64, f32]):
     return scale_add(a, k=-1, c=Rg).reshape(Rg, 64)
 
 
+# -- views that are not dense, returned, copied and stored: launches of tilefish.contiguous ---------------------------------------------------
+
+
+@tilefish.kernel
+def triple(x: Tensor[Rg, 64, f32]) -> Tensor[Rg, 64, f32]:
+    return x * 3.0
+
+
+@tilefish.graph
+def strided_returns(x: Tensor[Rg, 64, f32]):
+    """A transpose of a result returned, and a column block of a parameter copied (``tilefish.copy``) then returned: views that are not dense,
+    which a plan materialises with ``tilefish.contiguous``; and a dense view of a result returned, which stays a copy step."""
+    t = triple(x)
+    block = tilefish.copy(x.split(32, axis=1)[1])  # the columns 32 to 64: a view whose rows are 64 apart
+    return t.permute(1, 0), block, t[2]  # a transpose; the copy; a row of t (dense: a copy step)
+
+
 # -- a plan set: one graph per key, the launch count depending on the key, one manifest ----------------------------------------------------
 
 Nh = Dim("Nh")
