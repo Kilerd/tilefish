@@ -7,7 +7,7 @@
 //! exact bytes Python's `replay` runs.
 //!
 //! ```no_run
-//! use tilefish::{Arch, Args, Manifest, Pin, TensorArg, DType, DevicePtr};
+//! use tilefish::{Arch, Manifest, Pin, TensorArg, DType, DevicePtr};
 //!
 //! # fn main() -> tilefish::Result<()> {
 //! // 1. Read and verify the directory. Production pins the digest of the manifest; `Pin::TrustDirectory` trusts the
@@ -21,20 +21,25 @@
 //! # let (x, y, stream): (DevicePtr, DevicePtr, tilefish::CUstream) = unimplemented!();
 //! let shape = [4096usize];
 //! let tensors = [TensorArg::new(x, &shape, DType::Bf16, 0), TensorArg::new(y, &shape, DType::Bf16, 0)];
-//! kernel.launch(stream, &Args::new(&tensors).scalars(&[("n_elements", 4096)]))?;
+//! kernel.launch(stream, &tensors)?; // the dimensions and the runtime scalar come from the shapes
 //! # Ok(())
 //! # }
 //! ```
 //!
 //! # What is checked
 //!
-//! * **At load** ([`Manifest::load`]): the manifest is strict JSON of schema 1 (no duplicate keys, no `NaN`, no unknown
+//! * **At load** ([`Manifest::load`]): the manifest is strict JSON of schema 2 (no duplicate keys, no `NaN`, no unknown
 //!   field, every field of its type); its digest is the pinned one; every cubin is a regular file in the directory,
 //!   whose `sha256` and `sha256_code` (the digest of the machine code, [`elf`]) are the manifest's; the entries are
-//!   consistent (the ABI, the preconditions, the buckets, the grid). Digests are computed exactly as Python computes them.
-//! * **At launch** ([`Kernel::launch`]): the dtype of every tensor, static sizes, `divisible_by`, 16-byte alignment, the
-//!   exact bucket, `max_elements`, that the 32-bit scalars fit, that nothing written aliases anything else, and the grid
-//!   against the device's limits. Nothing is launched when a check fails.
+//!   consistent (the ABI, the declared shapes, the dimensions, the preconditions, the grid). Digests are computed exactly as
+//!   Python computes them. A manifest of an older schema is refused: export it again.
+//! * **At launch** ([`Kernel::launch`]): the manifest declares the shape of every pointer (`["Rows", 1024]`) and the constraints
+//!   of every named dimension, so a launch needs nothing but the tensors. It binds the dimensions from their sizes, checks
+//!   that they agree across arguments and with the static sizes, the exact bucket and `divisible_by` of each dimension,
+//!   the dtype and rank of every tensor, `max_elements`, that the runtime scalars (derived from the dimensions, or from the
+//!   element count of the tensor they count) fit 32 bits, that nothing written aliases anything else, 16-byte alignment, and
+//!   the grid against the device's limits. Nothing is launched when a check fails. There is no way to tell a launch what a
+//!   dimension is: that would be a way to run a binary under assumptions the tensors do not satisfy.
 //!
 //! # `unsafe`
 //!
@@ -63,5 +68,5 @@ pub use manifest::{
     Access, Constexpr, Entry, LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin,
     Precondition, manifest_digest,
 };
-pub use plan::{Args, Plan, Prepared};
+pub use plan::{DeviceInfo, Plan, Prepared};
 pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, TensorArg, TensorMut, TensorRef, U8};

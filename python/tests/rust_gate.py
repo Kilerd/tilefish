@@ -10,8 +10,9 @@ bytes. The gate has three steps, on a machine with a GPU, the ``gpu`` extra and 
     python rust_gate.py compare WORK                  # 3. Python: compare the bytes, tensor by tensor
 
 ``prepare`` exports every operator of ``host_ops.ops()`` (or reads ``--manifest``, for example the committed fixture),
-writes the generated launchers to ``WORK/generated.rs``, and for each case (the five goldens, a bucketed row kernel over each
-of its buckets, the hand-written rmsnorm and exact gelu and an in-place axpy, over several sizes and seeds) generates
+writes the generated launchers to ``WORK/generated.rs`` (with the manifest and the cubins embedded), and for each case (the
+five goldens, a bucketed row kernel over each of its buckets, the hand-written rmsnorm and exact gelu, an in-place axpy and a
+``tl.dot`` matrix product with more than 48 KiB of dynamic shared memory, over several sizes and seeds) generates
 inputs, writes them as raw bytes, runs ``replay`` *with a pin* and writes what it left in every tensor, outputs and
 arguments, so that a tensor that is updated in place is compared too. ``compare`` then requires the files the Rust test
 wrote to be equal, byte for byte, to those.
@@ -32,10 +33,11 @@ from tilefish import runtime
 from tilefish.aot import Manifest
 from tilefish.hosts import rust
 
-BF16, F32 = torch.bfloat16, torch.float32
+BF16, F16, F32 = torch.bfloat16, torch.float16, torch.float32
 SEEDS = (0, 1, 2)
 ROW_SIZES = (1, 7, 64, 129)
 FLAT_SIZES = (16, 1040, 65552, 1 << 20)
+MM_SIZES = ((128, 128, 64), (256, 256, 256), (384, 128, 192), (128, 512, 128))  # (M, N, K): M and N multiples of 128, K of 64
 
 
 def args_softmax(rows, seed):
@@ -70,6 +72,11 @@ def args_axpy(n, seed):
     return (randn((n,), F32, seed), randn((n,), F32, seed + 100))
 
 
+def args_mm(size, seed):
+    m, n, k = size
+    return (randn((m, k), F16, seed, scale=0.5), randn((k, n), F16, seed + 100, scale=0.5))
+
+
 # (the operator in host_ops.ops(), the stem of its binary, the inputs, the sizes)
 CASES = [
     ("softmax", "softmax", args_softmax, ROW_SIZES),
@@ -81,9 +88,10 @@ CASES = [
     ("rmsnorm", "rmsnorm", args_rmsnorm, (1, 5, 64)),
     ("gelu_erf", "gelu_erf", args_gelu, FLAT_SIZES),
     ("axpy", "axpy", args_axpy, FLAT_SIZES),
+    ("mm", "mm", args_mm, MM_SIZES),  # a tl.dot kernel with more than 48 KiB of dynamic shared memory and a 2-D grid
 ]
 
-DTYPES = {torch.bfloat16: "bf16", torch.float32: "f32"}
+DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}
 
 
 def raw(t):
@@ -121,7 +129,8 @@ def prepare(work, manifest_dir=None):
         manifest = Manifest.load(manifest_dir)
         manifest_ref = str(pathlib.Path(manifest_dir).resolve())
     digest = manifest.digest
-    rust.emit(manifest, work / "generated.rs", ops=list(declared.values()))
+    # embedded: the generated module also carries the manifest and the cubins (include_bytes!), which the Rust test runs too
+    rust.emit(manifest, work / "generated.rs", ops=list(declared.values()), embed=True)
     cap = torch.cuda.get_device_capability()
     arch = f"sm_{cap[0] * 10 + cap[1]}"
     cases = []
@@ -130,7 +139,7 @@ def prepare(work, manifest_dir=None):
         tensors, inputs, outputs = abi_of(op)
         for size in sizes:
             for seed in SEEDS:
-                case_id = f"{stem}-{size}-seed{seed}"
+                case_id = f"{stem}-{'x'.join(map(str, size)) if isinstance(size, tuple) else size}-seed{seed}"
                 (work / "cases" / case_id).mkdir(parents=True)
                 args = make(size, seed)
                 clones = [a.clone() for a in args]
@@ -161,28 +170,36 @@ def prepare(work, manifest_dir=None):
 
 
 def compare(work):
+    """Every file the Rust test wrote, from the manifest directory and from the embedded manifest, against what replay left."""
     work = pathlib.Path(work).resolve()
     doc = json.loads((work / "cases.json").read_text(encoding="utf-8"))
-    passed, failed, tensors, total = 0, [], 0, 0
-    for case in doc["cases"]:
-        bad = []
-        for t in case["tensors"]:
-            expect = (work / t["expect"]).read_bytes()
-            path = work / "rust" / case["id"] / f"{t['name']}.bin"
-            got = path.read_bytes() if path.exists() else None
-            tensors += 1
-            total += len(expect)
-            if got != expect:
-                bad.append(f"{t['name']} ({'missing' if got is None else sum(a != b for a, b in zip(got, expect))} bytes differ)")
-            elif t["role"] == "out" and not any(expect):
-                bad.append(f"{t['name']} is all zeros: the kernel wrote nothing")
-        if bad:
-            failed.append((case["id"], bad))
-        else:
-            passed += 1
+    failed, tensors, total = [], 0, 0
+    passed = {}
+    for subdir in ("rust", "rust_embedded"):
+        passed[subdir] = 0
+        for case in doc["cases"]:
+            bad = []
+            for t in case["tensors"]:
+                expect = (work / t["expect"]).read_bytes()
+                path = work / subdir / case["id"] / f"{t['name']}.bin"
+                got = path.read_bytes() if path.exists() else None
+                tensors += 1
+                total += len(expect)
+                if got != expect:
+                    bad.append(f"{t['name']} ({'missing' if got is None else sum(a != b for a, b in zip(got, expect))} bytes differ)")
+                elif t["role"] == "out" and not any(expect):
+                    bad.append(f"{t['name']} is all zeros: the kernel wrote nothing")
+            if bad:
+                failed.append((f"{subdir}/{case['id']}", bad))
+            else:
+                passed[subdir] += 1
     for case_id, bad in failed:
         print(f"FAIL {case_id}: {'; '.join(bad)}")
-    print(f"rust vs replay: {passed} of {len(doc['cases'])} cases byte-identical ({tensors} tensors, {total} bytes compared)")
+    n = len(doc["cases"])
+    print(
+        f"rust vs replay: {passed['rust']} of {n} cases byte-identical with the manifest directory, "
+        f"{passed['rust_embedded']} of {n} with the embedded manifest ({tensors} tensors, {total} bytes compared)"
+    )
     return 0 if not failed else 1
 
 

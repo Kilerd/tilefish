@@ -245,32 +245,45 @@ strict JSON, recomputes the digests exactly as Python does (the `sha256` of each
 cubin, the `sha256_code` of its machine code, and the digest of the whole
 manifest) and refuses a directory whose digest is not the pin it is given
 (`Pin::Digest`; `Pin::TrustDirectory` is explicit). It then loads a cubin with
-`cuModuleLoadData`, checks every precondition of the binary before a launch
-(dtype, static sizes, `divisible_by`, 16-byte alignment, the exact bucket,
-`max_elements`, aliasing, the grid against the device) and launches on the
-caller's own `CUstream`, which also works inside a CUDA graph capture.
+`cuModuleLoadData` and launches on the caller's own `CUstream`, which also works
+inside a CUDA graph capture.
+
+A manifest (schema 2) carries what a host needs to check a launch on its own:
+every pointer parameter records its declared shape, with static axes as sizes
+(`["Rows", 1024]`), and every entry the constraints of its named dimensions
+(`divisible_by`, `buckets`, and the bucket the binary is built for). A launch
+takes nothing but its tensors. The crate binds the dimensions from their sizes,
+checks that they agree across arguments and with the static sizes, the exact
+bucket and `divisible_by`, the dtype and rank of each tensor, `max_elements`,
+that the runtime scalars (derived from the dimensions, or from the element count
+of the tensor they count) fit 32 bits, aliasing, 16-byte alignment and the grid
+against the device's limits, and evaluates the grid from its expression. There is
+no way to tell a launch what a dimension is. A manifest of an older schema is
+refused by both hosts: export it again.
 
 ```python
 from tilefish.hosts import rust
-rust.emit(m, "launchers.rs", ops=[residual_add_rmsnorm])   # m = tilefish.runtime.export(...)
+rust.emit(m, "launchers.rs")   # m = tilefish.runtime.export(...); ops=[...] cross-checks the declarations
 ```
 
 writes one Rust module with a struct per binary (per bucket), whose `launch`
 takes typed tensors (`TensorRef<'_, Bf16>`, `TensorMut<'_, F32>`: a device
-pointer, a shape and a device ordinal) and carries the tilefish signature in its
-docs. It also embeds the digest of the manifest it was generated from and refuses
-any other. The output is deterministic. The declarations (`ops=`) are an input
-because a manifest does not say which dimension each axis of a tensor is; without
-them the launchers are typed from the manifest alone, and the caller gives the
-dimensions the tensors would have determined.
+pointer, a shape and a device ordinal) and documents the binary: its tensors, its
+dimensions and their constraints, what is compiled in. It also embeds the digest
+of the manifest it was generated from and refuses any other, and with
+`embed=True` the manifest and the cubins as well. The output is deterministic.
+`ops=` is optional: each declaration it lists must be exactly what the manifest's
+entry says, and gives the docs the tilefish signature.
 
 The byte-identity gate (`python/tests/rust_gate.py` with
 `crates/tilefish/tests/gpu_gate.rs`) checks on a GPU that the Rust host and
 `replay` agree byte for byte on the five goldens, a bucketed row kernel over each
-bucket and the hand-written kernels (outputs and in-place tensors). On any
-machine, `cargo test` and `pytest` check that the digests Rust computes from a
-committed manifest directory (`sm_103`, and a cross-compiled `sm_120` one) are the
-ones Python computes, and that Rust refuses what Python refuses.
+bucket, the hand-written kernels (outputs and in-place tensors) and a `tl.dot`
+kernel that needs more than 48 KiB of dynamic shared memory, with the manifest
+directory and with the embedded manifest. On any machine, `cargo test` and
+`pytest` check that the digests Rust computes from a committed manifest directory
+(`sm_103`, and a cross-compiled `sm_120` one) are the ones Python computes, and
+that Rust refuses what Python refuses.
 
 ## Rewrites that know about rounding
 

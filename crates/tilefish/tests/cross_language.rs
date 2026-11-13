@@ -27,7 +27,7 @@ fn the_manifest_digest_is_pythons() {
         // loading it with the pin Python computed accepts it, and says the same digest
         let manifest = Manifest::load(fixtures().join(name), Pin::Digest(&want)).unwrap();
         assert_eq!(manifest.digest(), want, "{name}");
-        assert_eq!(manifest.entries().len(), 11, "{name}");
+        assert_eq!(manifest.entries().len(), 12, "{name}");
     }
 }
 

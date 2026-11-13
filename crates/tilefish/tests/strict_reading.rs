@@ -126,10 +126,10 @@ fn what_is_not_strict_json_is_refused() {
         ("NaN", "\"shared\": 16", "\"shared\": NaN"),
         ("Infinity", "\"shared\": 16", "\"shared\": Infinity"),
         ("a number that does not fit a float", "\"num_stages\": 3", "\"num_stages\": 1e999"),
-        ("a trailing comma", "\"schema\": 1,", "\"schema\": 1,,"),
+        ("a trailing comma", "\"schema\": 2,", "\"schema\": 2,,"),
         ("a leading zero", "\"num_stages\": 3", "\"num_stages\": 03"),
         ("a lone surrogate", "\"op\": \"softmax\"", "\"op\": \"soft\\ud800max\""),
-        ("a single quote", "\"schema\": 1", "'schema': 1"),
+        ("a single quote", "\"schema\": 2", "'schema': 2"),
     ];
     for (what, from, to) in cases {
         let copy = Copy::of("sm_103");
@@ -139,7 +139,7 @@ fn what_is_not_strict_json_is_refused() {
     }
     // every kind of repeated key, not only in an entry
     let copy = Copy::of("sm_103");
-    copy.edit("\"schema\": 1,", "\"schema\": 1, \"schema\": 1,");
+    copy.edit("\"schema\": 2,", "\"schema\": 2, \"schema\": 2,");
     assert!(refused(&copy).contains("twice"));
     let copy = Copy::of("sm_103");
     copy.edit("\"slot\": 0,", "\"slot\": 0, \"slot\": 0,");
@@ -165,14 +165,14 @@ fn an_unknown_key_a_missing_key_and_a_wrong_type_are_refused() {
             "\"stem\": \"softmax\", \"extra\": 1,",
             "unknown field",
         ),
-        ("an unknown top-level key", "\"schema\": 1,", "\"schema\": 1, \"surprise\": true,", "unknown field"),
+        ("an unknown top-level key", "\"schema\": 2,", "\"schema\": 2, \"surprise\": true,", "unknown field"),
         ("an unknown key in the ABI", "\"slot\": 0,", "\"slot\": 0, \"align\": 8,", "unknown field"),
         ("a missing key", "\"symbol\": \"tf_softmax\",", "", "missing field"),
         ("shared as a string", "\"shared\": 16", "\"shared\": \"16\"", "invalid type"),
         ("num_warps as a float", "\"num_warps\": 4,", "\"num_warps\": 4.0,", "invalid type"),
         ("a bool where an int is", "\"num_stages\": 3", "\"num_stages\": true", "invalid type"),
         ("a negative size", "\"shared\": 16", "\"shared\": -16", "invalid value"),
-        ("the schema as another number", "\"schema\": 1,", "\"schema\": 2,", "schema"),
+        ("the schema as another number", "\"schema\": 2,", "\"schema\": 3,", "schema"),
         (
             "an unknown compile option",
             "\"num_stages\": 3\n      },\n      \"declaration_digest\"",
@@ -367,4 +367,112 @@ fn buckets_are_exact() {
     assert!(message.contains("no padding") && message.contains("[96, 512, 1000]"), "{message}");
     // a stem that is not bucketed does not take a bucket
     assert!(manifest.plan("softmax", &[("M", 4)], arch).is_err());
+}
+
+#[test]
+fn a_manifest_of_the_schema_before_the_shapes_is_refused_with_a_request_to_export_it_again() {
+    let copy = Copy::of("sm_103");
+    copy.edit("\"schema\": 2,", "\"schema\": 1,");
+    let message = refused(&copy);
+    assert!(
+        message.contains("schema 1") && message.contains("older tilefish") && message.contains("export it again"),
+        "{message}"
+    );
+    // and an entry of schema 1 has neither shapes nor dims: a schema 2 manifest without them is not read either
+    for what in ["dims", "shape"] {
+        let copy = Copy::of("sm_103");
+        copy.edit_json(|doc| {
+            let entry = Copy::entry(doc, "softmax");
+            match what {
+                "dims" => {
+                    entry.as_object_mut().unwrap().remove("dims");
+                }
+                _ => {
+                    entry["abi"]["params"][0].as_object_mut().unwrap().remove("shape");
+                }
+            }
+        });
+        let message = refused(&copy);
+        assert!(message.contains("missing field `dims`") || message.contains("has no shape"), "{what}: {message}");
+    }
+}
+
+#[test]
+fn shapes_and_dimensions_that_contradict_themselves_are_refused() {
+    type Change = fn(&mut serde_json::Value);
+    let cases: [(&str, Change, &str); 13] = [
+        (
+            "a shape entry that is neither a size nor an expression",
+            |e| e["abi"]["params"][0]["shape"][1] = 1.5.into(),
+            "shape[1]",
+        ),
+        ("a size of 0", |e| e["abi"]["params"][0]["shape"][1] = 0.into(), "shape[1]"),
+        (
+            "an expression that is not in the grammar",
+            |e| e["abi"]["params"][0]["shape"][0] = "M ** 2".into(),
+            "shape[0]",
+        ),
+        (
+            "a dimension no entry of dims names",
+            |e| e["abi"]["params"][0]["shape"][0] = "Rows".into(),
+            "dims does not name",
+        ),
+        (
+            "a dims entry removed",
+            |e| {
+                e["dims"].as_object_mut().unwrap().remove("M");
+            },
+            "dims does not name",
+        ),
+        (
+            "a static size that is not the static_size precondition",
+            |e| e["abi"]["params"][0]["shape"][1] = 999.into(),
+            "static_size",
+        ),
+        ("a dims entry with an unknown key", |e| e["dims"]["M"]["extra"] = 1.into(), "unknown field"),
+        ("a divisor of 0", |e| e["dims"]["M"]["divisible_by"] = 0.into(), "divisible_by"),
+        ("a bucket that the entry does not have", |e| e["dims"]["M"]["bucket"] = 4.into(), "bucket"),
+        ("buckets out of order", |e| e["dims"]["M"]["buckets"] = serde_json::json!([4, 2]), "sorted"),
+        ("a dims name that is not an identifier", |e| e["dims"]["a b"] = serde_json::json!({}), "identifier"),
+        ("a dims value that is not an object", |e| e["dims"]["M"] = 3.into(), "dims.M"),
+        ("a shape that is not a list", |e| e["abi"]["params"][0]["shape"] = "M".into(), "expected a sequence"),
+    ];
+    for (what, change, why) in cases {
+        let copy = Copy::of("sm_103");
+        copy.edit_json(|doc| change(Copy::entry(doc, "softmax")));
+        let message = refused(&copy);
+        assert!(message.contains(why), "{what}: {message}");
+    }
+}
+
+#[test]
+fn the_bucket_of_a_bucketed_entry_is_in_dims_and_agrees_with_the_precondition() {
+    let ok = Manifest::load(common::fixtures().join("sm_103"), Pin::TrustDirectory).unwrap();
+    let entry = ok.entry("bucketed_rms.Db96", "sm_103").unwrap();
+    let db = entry.dims.iter().find(|d| d.name == "Db").unwrap();
+    assert_eq!((db.bucket, db.buckets.clone()), (Some(96), Some(vec![96, 512, 1000])));
+    assert!(entry.dims.iter().any(|d| d.name == "M" && d.bucket.is_none() && d.divisible_by.is_none()));
+    // the entry's bucket, its dims and its precondition say one thing; any two that differ are refused
+    for (what, change) in [
+        (
+            "dims says another bucket",
+            (|e: &mut serde_json::Value| e["dims"]["Db"]["bucket"] = 512.into()) as fn(&mut serde_json::Value),
+        ),
+        ("dims has no bucket", |e| {
+            e["dims"]["Db"].as_object_mut().unwrap().remove("bucket");
+        }),
+        ("the bucket is not among the buckets", |e| e["dims"]["Db"]["buckets"] = serde_json::json!([512, 1000])),
+    ] {
+        let copy = Copy::of("sm_103");
+        copy.edit_json(|doc| change(Copy::entry(doc, "bucketed_rms.Db96")));
+        let message = refused(&copy);
+        assert!(message.contains("bucket"), "{what}: {message}");
+    }
+}
+
+#[test]
+fn a_scalar_has_a_dim_and_no_shape() {
+    let copy = Copy::of("sm_103");
+    copy.edit_json(|doc| Copy::entry(doc, "swiglu")["abi"]["params"][3]["shape"] = serde_json::json!([1]));
+    assert!(refused(&copy).contains("a scalar"));
 }

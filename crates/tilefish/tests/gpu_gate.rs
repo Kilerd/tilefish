@@ -33,7 +33,7 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _};
 use serde_json::Value;
 use tilefish::{
-    Arch, Bf16, DevicePtr, Error, F32, Manifest, Pin, PreconditionKind, TensorMut, TensorRef, elf::sha256_hex,
+    Arch, Bf16, DevicePtr, Error, F16, F32, Manifest, Pin, PreconditionKind, TensorMut, TensorRef, elf::sha256_hex,
 };
 
 fn gate_dir() -> PathBuf {
@@ -136,6 +136,12 @@ fn launch(gpu: &Gpu, manifest: &Manifest, launcher: &str, t: &HashMap<String, Bu
         "Rmsnorm" => Rmsnorm::load(manifest)?.launch(s, ib(&t["x_ptr"]), ib(&t["w_ptr"]), ob(&t["y_ptr"])),
         "GeluErf" => GeluErf::load(manifest)?.launch(s, ib(&t["x_ptr"]), ob(&t["y_ptr"])),
         "Axpy" => Axpy::load(manifest)?.launch(s, i(&t["x_ptr"]), o(&t["y_ptr"])),
+        "Mm" => Mm::load(manifest)?.launch(
+            s,
+            Buf::input::<F16>(&t["a_ptr"]),
+            Buf::input::<F16>(&t["b_ptr"]),
+            o(&t["c_ptr"]),
+        ),
         other => panic!("the gate does not know the launcher {other}"),
     }
 }
@@ -161,18 +167,18 @@ fn tensors_of(gpu: &Gpu, case: &Value) -> Vec<(String, Buf)> {
         .collect()
 }
 
-#[test]
-fn byte_identity() {
-    let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
-    let out_dir = gate_dir().join("rust");
+/// Run every case of the gate through the launchers, with the kernels of `manifest`, and write what they computed to `<gate>/<subdir>`.
+fn run_cases(gpu: &Gpu, manifest: &Manifest, subdir: &str) -> usize {
+    let cases = cases();
+    let out_dir = gate_dir().join(subdir);
     let _ = std::fs::remove_dir_all(&out_dir);
     let mut ran = 0;
     for case in cases["cases"].as_array().unwrap() {
         let id = case["id"].as_str().unwrap();
         let names: Vec<String> =
             case["tensors"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect();
-        let map: HashMap<String, Buf> = tensors_of(&gpu, case).into_iter().collect();
-        launch(&gpu, &manifest, case["launcher"].as_str().unwrap(), &map).unwrap_or_else(|e| panic!("{id}: {e}"));
+        let map: HashMap<String, Buf> = tensors_of(gpu, case).into_iter().collect();
+        launch(gpu, manifest, case["launcher"].as_str().unwrap(), &map).unwrap_or_else(|e| panic!("{id}: {e}"));
         let case_dir = out_dir.join(id);
         std::fs::create_dir_all(&case_dir).unwrap();
         for name in &names {
@@ -180,8 +186,44 @@ fn byte_identity() {
         }
         ran += 1;
     }
-    println!("rust gate: launched {ran} cases through the generated launchers");
     assert_eq!(ran, cases["cases"].as_array().unwrap().len());
+    ran
+}
+
+#[test]
+fn byte_identity() {
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let ran = run_cases(&gpu, &manifest, "rust");
+    println!("rust gate: launched {ran} cases through the generated launchers");
+}
+
+/// The same cases, with the manifest and the cubins that the generated module embeds with `include_bytes!`.
+#[test]
+fn byte_identity_of_the_embedded_manifest() {
+    let gpu = Gpu::new();
+    let manifest = generated::load_embedded().expect("the embedded manifest verifies and is pinned");
+    assert_eq!(manifest.digest(), generated::MANIFEST_DIGEST);
+    assert_eq!(manifest.label(), "<embedded>");
+    let ran = run_cases(&gpu, &manifest, "rust_embedded");
+    println!("rust gate: launched {ran} cases with the embedded manifest");
+}
+
+/// A kernel that needs more than the default 48 KiB of dynamic shared memory is loaded with `cuFuncSetAttribute`: the gate has one
+/// (`mm`, a `tl.dot` kernel), and its cases are compared with `replay` like the others.
+#[test]
+fn a_kernel_with_more_than_48_kib_of_dynamic_shared_memory_is_in_the_gate() {
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::current().unwrap();
+    let entry = manifest.entry("mm", &arch.to_string()).expect("the gate's manifest has mm");
+    assert!(
+        entry.shared > 48 * 1024,
+        "mm needs more than 48 KiB of dynamic shared memory for this to test the opt-in: {}",
+        entry.shared
+    );
+    let _ = generated::Mm::load(&manifest).expect("it loads: the opt-in is within the device's maximum");
+    assert!(cases()["cases"].as_array().unwrap().iter().any(|c| c["launcher"] == "Mm"));
+    drop(gpu);
+    println!("rust gate: mm needs {} bytes of dynamic shared memory", entry.shared);
 }
 
 fn kind(e: &Error) -> PreconditionKind {
@@ -258,6 +300,35 @@ fn refusals() {
     let e =
         generated::Axpy::load(&manifest).unwrap().launch(gpu.raw(), a.input::<F32>(), a.output::<F32>()).unwrap_err();
     check("an in-place tensor that aliases another", kind(&e) == PreconditionKind::Alias);
+
+    // a dimension that is not a multiple of what the binary assumes (mm: MmM is a multiple of 128, and so is the 2-D grid's x)
+    let (a, b, c) = (
+        gpu.zeros(100 * 64 * 2).shaped(&[100, 64]),
+        gpu.zeros(64 * 128 * 2).shaped(&[64, 128]),
+        gpu.zeros(100 * 128 * 4).shaped(&[100, 128]),
+    );
+    let e = generated::Mm::load(&manifest)
+        .unwrap()
+        .launch(gpu.raw(), a.input::<F16>(), b.input::<F16>(), c.output::<F32>())
+        .unwrap_err();
+    check(
+        "divisible_by of a dimension (MmM = 100)",
+        kind(&e) == PreconditionKind::Divisible && e.to_string().contains("MmM"),
+    );
+    // tensors that disagree about a dimension (mm: the K of a is 64, the K of b is 128)
+    let (a, b, c) = (
+        gpu.zeros(128 * 64 * 2).shaped(&[128, 64]),
+        gpu.zeros(128 * 128 * 2).shaped(&[128, 128]),
+        gpu.zeros(128 * 128 * 4).shaped(&[128, 128]),
+    );
+    let e = generated::Mm::load(&manifest)
+        .unwrap()
+        .launch(gpu.raw(), a.input::<F16>(), b.input::<F16>(), c.output::<F32>())
+        .unwrap_err();
+    check(
+        "tensors that disagree about a dimension",
+        kind(&e) == PreconditionKind::Shape && e.to_string().contains("MmK"),
+    );
 
     // a tampered cubin: the manifest is intact, so a pin accepts it; the digest of the file does not
     let dir = gate_dir().join(cases()["manifest"].as_str().unwrap());

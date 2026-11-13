@@ -86,7 +86,7 @@ fn a_damaged_manifest_is_an_error_never_a_panic() {
         .filter(|p| p.extension().is_some_and(|x| x == "cubin"))
         .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
         .collect();
-    assert_eq!(cubins.len(), 11);
+    assert_eq!(cubins.len(), 12);
     let files: Vec<(&str, &[u8])> = cubins.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
     let mut rng = Lcg(3);
     let mut accepted = 0;
@@ -108,18 +108,45 @@ fn a_damaged_manifest_is_an_error_never_a_panic() {
 }
 
 #[test]
-fn a_damaged_shape_is_an_error_never_a_panic() {
-    let manifest = Manifest::load(fixtures().join("sm_103"), Pin::TrustDirectory).unwrap();
-    let plan = manifest.plan("gelu_erf", &[], Arch::sm(103)).unwrap();
+fn a_damaged_expression_is_an_error_never_a_panic() {
+    // the same fixture, with a random expression where the manifest has a shape, a grid or the dimension a scalar carries
+    let dir = fixtures().join("sm_103");
+    let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+    let cubins: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "cubin"))
+        .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
+        .collect();
+    let files: Vec<(&str, &[u8])> = cubins.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
     let alphabet: Vec<&str> =
         vec!["(", ")", ",", "+", "-", "*", "//", "cdiv", "n", "Count", "2", "1000000000000", "0", " ", "x_y", "#", "é"];
     let mut rng = Lcg(4);
-    for _ in 0..4000 {
+    let mut accepted = 0;
+    for round in 0..400 {
         let len = 1 + rng.below(12);
-        let text: String = (0..len).map(|_| alphabet[rng.below(alphabet.len())]).collect();
+        let expression: String = (0..len).map(|_| alphabet[rng.below(alphabet.len())]).collect();
+        let mut doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let entry = doc["kernels"].as_array_mut().unwrap().iter_mut().find(|k| k["stem"] == "gelu_erf").unwrap();
+        match round % 3 {
+            0 => entry["abi"]["params"][0]["shape"][0] = expression.clone().into(),
+            1 => entry["grid"] = expression.clone().into(),
+            _ => entry["abi"]["params"][2]["dim"] = expression.clone().into(),
+        }
+        let damaged = serde_json::to_vec(&doc).unwrap();
         no_panic("the expression parser", || {
-            let _ = plan.clone().with_shapes(&[&[text.as_str()], &["Count"]]);
+            if let Ok(manifest) = Manifest::from_embedded(&damaged, &files, Pin::TrustDirectory) {
+                accepted += 1;
+                // an expression that reads must also plan and prepare without a panic
+                if let Ok(plan) = manifest.plan("gelu_erf", &[], Arch::sm(103)) {
+                    let shape = [4096usize];
+                    // SAFETY: the address is never dereferenced.
+                    let ptr = unsafe { tilefish::DevicePtr::from_raw(0x1000) };
+                    let a = tilefish::TensorArg::new(ptr, &shape, tilefish::DType::Bf16, 0);
+                    let _ = plan.prepare(&[a, a], None);
+                }
+            }
         });
     }
-    assert!(plan.clone().with_shapes(&[&["Count"], &["Count"]]).is_ok());
+    println!("{accepted} of 400 random expressions were valid ones");
 }

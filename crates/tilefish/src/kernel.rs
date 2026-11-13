@@ -18,9 +18,10 @@ use std::sync::{Arc, Weak};
 pub use cudarc::driver::sys::CUstream;
 
 use crate::error::{Error, Result};
-use crate::ffi::{self, Limits};
+use crate::ffi;
 use crate::manifest::{Manifest, ParamKind};
-use crate::plan::{Args, Plan, Prepared};
+use crate::plan::{DeviceInfo, Plan, Prepared};
+use crate::tensor::TensorArg;
 
 /// Dynamic shared memory above this needs `cuFuncSetAttribute`.
 const DEFAULT_SHARED_LIMIT: u32 = 48 * 1024;
@@ -71,9 +72,8 @@ struct Loaded {
     // the function first: it is gone before the module is unloaded
     function: ffi::Function,
     _module: ffi::Module, // held for its Drop, which unloads the module
-    device: i32,
+    device: DeviceInfo,
     context: usize,
-    limits: Limits,
     stem: String,
     arch: String,
 }
@@ -83,7 +83,7 @@ impl fmt::Debug for Loaded {
         f.debug_struct("Loaded")
             .field("stem", &self.stem)
             .field("arch", &self.arch)
-            .field("device", &self.device)
+            .field("device", &self.device.ordinal)
             .finish_non_exhaustive()
     }
 }
@@ -105,12 +105,6 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    /// The same kernel with the shapes of its tensors given as dimension expressions, in the order of the ABI (see
-    /// [`Plan::with_shapes`]). What a generated launcher does with the signature it was generated from.
-    pub fn with_shapes(&self, shapes: &[&[&str]]) -> Result<Self> {
-        Ok(Self { loaded: Arc::clone(&self.loaded), plan: Arc::new((*self.plan).clone().with_shapes(shapes)?) })
-    }
-
     /// The stem of the binary (`rowop.S32`).
     pub fn stem(&self) -> &str {
         &self.loaded.stem
@@ -123,7 +117,7 @@ impl Kernel {
 
     /// The ordinal of the device it is loaded on.
     pub fn device(&self) -> i32 {
-        self.loaded.device
+        self.loaded.device.ordinal
     }
 
     /// What a call is checked against.
@@ -131,20 +125,12 @@ impl Kernel {
         &self.plan
     }
 
-    /// Check a call without launching it: every precondition, the grid against the device's limits.
-    pub fn check(&self, args: &Args<'_>) -> Result<Prepared> {
-        let prepared = self.plan.prepare(args, Some(self.loaded.device))?;
-        for (axis, (g, limit)) in prepared.grid.iter().zip(self.loaded.limits.grid).enumerate() {
-            if i64::from(*g) > limit {
-                return Err(Error::Unsupported(format!(
-                    "'{}': the grid {:?} has {g} blocks along {}, but this device takes 1 to {limit} there",
-                    self.loaded.stem,
-                    prepared.grid,
-                    "XYZ".as_bytes()[axis] as char
-                )));
-            }
-        }
-        Ok(prepared)
+    /// Check a call without launching it: every precondition of the manifest, and the grid against the device's limits.
+    ///
+    /// `tensors` are in the order of the manifest's ABI (see [`Plan::tensor_names`]); the dimensions and the runtime
+    /// scalars all come from their shapes.
+    pub fn check(&self, tensors: &[TensorArg<'_>]) -> Result<Prepared> {
+        self.plan.prepare(tensors, Some(&self.loaded.device))
     }
 
     /// Check the call and launch the kernel on `stream`.
@@ -152,8 +138,8 @@ impl Kernel {
     /// The launch is asynchronous, as any launch is: `stream` orders it with the host's other work, and the tensors must
     /// stay allocated until it has run. `stream` may be capturing a CUDA graph: the call is captured like any kernel node.
     /// The CUDA context the kernel was loaded in must be current on this thread.
-    pub fn launch(&self, stream: CUstream, args: &Args<'_>) -> Result<()> {
-        let mut prepared = self.check(args)?;
+    pub fn launch(&self, stream: CUstream, tensors: &[TensorArg<'_>]) -> Result<()> {
+        let mut prepared = self.check(tensors)?;
         if !ffi::is_current(self.loaded.context) {
             return Err(Error::Launch(format!(
                 "'{}' was loaded in another CUDA context than the one that is current on this thread: make its context current first",
@@ -226,9 +212,8 @@ impl Manifest {
             loaded: Arc::new(Loaded {
                 function,
                 _module: module,
-                device: current.ordinal,
+                device: DeviceInfo { ordinal: current.ordinal, max_grid: limits.grid },
                 context: current.context,
-                limits,
                 stem: entry.stem.clone(),
                 arch: entry.arch.clone(),
             }),

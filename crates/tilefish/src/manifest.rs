@@ -26,12 +26,13 @@ use crate::json::{canonical, parse_strict};
 use crate::kernel::Cached;
 use crate::tensor::DType;
 
-/// The only manifest schema there is. Python's `MANIFEST_SCHEMA`.
-pub const MANIFEST_SCHEMA: u64 = 1;
+/// The only manifest schema this host reads. Python's `MANIFEST_SCHEMA`. Schema 2 records, for every pointer parameter, its declared
+/// shape, and for every entry the constraints of its named dimensions: all that a host needs to check a launch on its own.
+pub const MANIFEST_SCHEMA: u64 = 2;
 /// The file a manifest directory has.
 pub const MANIFEST_NAME: &str = "manifest.json";
 /// Part of what is hashed: another canonical form must change it. Python's `DIGEST_TAG`.
-const DIGEST_TAG: &[u8] = b"tilefish.manifest-digest.v1\0";
+const DIGEST_TAG: &[u8] = b"tilefish.manifest-digest.v2\0";
 /// The limit of 32-bit offsets, the only bound a `max_elements` precondition carries.
 const MAX_ELEMENTS: u64 = (1 << 31) - 1;
 /// Every pointer of a binary is compiled as this many bytes aligned.
@@ -71,6 +72,37 @@ impl Access {
     }
 }
 
+/// One axis of a declared shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShapeDim {
+    /// A size baked into the binary.
+    Static(u64),
+    /// A dimension expression over the named dimensions of the entry (`M`, `3072*M`, `cdiv(n, 16)`).
+    Expr(String),
+}
+
+impl std::fmt::Display for ShapeDim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(n) => write!(f, "{n}"),
+            Self::Expr(e) => f.write_str(e),
+        }
+    }
+}
+
+/// What the manifest says about one named dimension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DimInfo {
+    /// The name the shapes, the scalars and the grid use.
+    pub name: String,
+    /// The dimension is a multiple of this.
+    pub divisible_by: Option<u64>,
+    /// The buckets of a bucketed dimension.
+    pub buckets: Option<Vec<u64>>,
+    /// The bucket this binary is built for: the dimension must equal it exactly (there is no padding).
+    pub bucket: Option<u64>,
+}
+
 /// What a launch parameter is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamKind {
@@ -82,6 +114,8 @@ pub enum ParamKind {
         dtype: Option<DType>,
         /// How the kernel uses it.
         access: Access,
+        /// The declared shape: one entry per axis. A launch binds the named dimensions from the sizes of the tensors it is given.
+        shape: Vec<ShapeDim>,
     },
     /// A runtime `i32` that carries the value of a dimension expression.
     Scalar {
@@ -248,6 +282,8 @@ pub struct Entry {
     pub constexprs: Vec<Constexpr>,
     /// The bucket value of each bucketed dimension, in the order of the stem.
     pub buckets: Vec<(String, u64)>,
+    /// The named dimensions of the signature and what is known of each.
+    pub dims: Vec<DimInfo>,
     /// What a launch must check.
     pub preconditions: Vec<Precondition>,
     /// Whether FMA contraction was disabled at compile time, when the build said.
@@ -340,6 +376,7 @@ struct RawEntry {
     launch: LaunchAttributes,
     constexprs: Vec<RawConstexpr>,
     buckets: Map<String, Value>,
+    dims: Map<String, Value>,
     preconditions: Vec<Value>,
     options: RawOptions,
     declaration_digest: String,
@@ -377,9 +414,22 @@ struct RawParam {
     #[serde(default)]
     access: Option<String>,
     #[serde(default)]
+    shape: Option<Vec<Value>>,
+    #[serde(default)]
     dim: Option<String>,
     #[serde(default)]
     count_of: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDim {
+    #[serde(default)]
+    divisible_by: Option<u64>,
+    #[serde(default)]
+    buckets: Option<Vec<u64>>,
+    #[serde(default)]
+    bucket: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -564,6 +614,54 @@ fn precondition_of(v: &Value, syms: &mut Symbols) -> std::result::Result<Precond
     })
 }
 
+/// The declared shape of a pointer: each axis a size (an int of at least 1) or a dimension expression.
+fn parse_shape(name: &str, shape: &[Value]) -> std::result::Result<Vec<ShapeDim>, String> {
+    shape
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match (d.as_u64(), d.as_str()) {
+            (Some(n), _) if n >= 1 => Ok(ShapeDim::Static(n)),
+            (_, Some(e)) => Ok(ShapeDim::Expr(e.to_owned())),
+            _ => Err(format!(
+                "parameter {name}: shape[{i}] must be an int size of at least 1 or a dimension expression, got {d}"
+            )),
+        })
+        .collect()
+}
+
+/// The table of named dimensions, checked against the buckets of the entry.
+fn parse_dims(dims: &Map<String, Value>, buckets: &Map<String, Value>) -> std::result::Result<Vec<DimInfo>, String> {
+    let mut out = Vec::with_capacity(dims.len());
+    for (name, value) in dims {
+        want_ident(&Value::String(name.clone()), "dims name")?;
+        let raw: RawDim = serde_json::from_value(value.clone()).map_err(|e| format!("dims.{name}: {e}"))?;
+        if raw.divisible_by == Some(0) {
+            return Err(format!("dims.{name}.divisible_by must be at least 1"));
+        }
+        if let Some(b) = &raw.buckets
+            && (b.is_empty() || b.iter().any(|x| *x < 1) || !b.windows(2).all(|w| w[0] < w[1]))
+        {
+            return Err(format!("dims.{name}.buckets must be a sorted list of distinct positive ints, got {b:?}"));
+        }
+        let mine = buckets.get(name).and_then(Value::as_u64);
+        match (raw.bucket, &raw.buckets) {
+            (Some(b), Some(all)) if all.contains(&b) && mine == Some(b) => {}
+            (None, _) if mine.is_none() => {}
+            _ => return Err(format!("dims.{name}.bucket must be one of its buckets and the bucket of this entry")),
+        }
+        out.push(DimInfo {
+            name: name.clone(),
+            divisible_by: raw.divisible_by,
+            buckets: raw.buckets,
+            bucket: raw.bucket,
+        });
+    }
+    if let Some(missing) = buckets.keys().find(|b| !dims.contains_key(*b)) {
+        return Err(format!("every bucketed dimension needs its entry in dims: {missing} has none"));
+    }
+    Ok(out)
+}
+
 fn decode_scalar(v: &Value, what: &str) -> std::result::Result<(), String> {
     match v {
         Value::Bool(_) | Value::Number(_) => Ok(()),
@@ -579,7 +677,11 @@ fn decode_scalar(v: &Value, what: &str) -> std::result::Result<(), String> {
 impl Entry {
     fn from_raw(raw: RawEntry, cubin: Arc<[u8]>) -> Result<Self> {
         let who = format!("'{}' ({})", raw.stem, raw.arch);
+        let dims = strictly(parse_dims(&raw.dims, &raw.buckets), &who)?;
         let mut syms = Symbols::default();
+        for d in &dims {
+            strictly(syms.intern(&d.name), &who)?;
+        }
         let mut params = Vec::with_capacity(raw.abi.params.len());
         for p in raw.abi.params {
             let kind = if p.kind == "pointer" {
@@ -589,7 +691,8 @@ impl Entry {
                     Some("inout") => Access::InOut,
                     _ => Access::Out,
                 };
-                ParamKind::Pointer { dtype: DType::from_name(&dtype_name), dtype_name, access }
+                let shape = strictly(parse_shape(&p.name, p.shape.as_deref().unwrap_or_default()), &who)?;
+                ParamKind::Pointer { dtype: DType::from_name(&dtype_name), dtype_name, access, shape }
             } else {
                 ParamKind::Scalar { dim: p.dim.unwrap_or_default(), count_of: p.count_of }
             };
@@ -620,6 +723,7 @@ impl Entry {
                 .map(|c| Constexpr { index: c.index, name: c.name, value: c.value, dtype: c.dtype })
                 .collect(),
             buckets,
+            dims,
             preconditions,
             enable_fp_fusion: raw.options.enable_fp_fusion,
             declaration_digest: raw.declaration_digest,
@@ -708,6 +812,7 @@ impl Entry {
                 return Err(format!("constexpr {}: dtype {d:?} is not a tilefish dtype", c.name));
             }
         }
+        parse_dims(&raw.dims, &raw.buckets)?;
         let n = raw.abi.params.len();
         for (position, p) in raw.abi.params.iter().enumerate() {
             want_ident(&Value::String(p.name.clone()), "parameter name")?;
@@ -732,13 +837,17 @@ impl Entry {
                     if p.dim.is_some() || p.count_of.is_some() || p.ptx_type != "u64" || p.size != 8 {
                         return Err(format!("parameter {} is not a well-formed 64-bit pointer", p.name));
                     }
+                    let Some(shape) = &p.shape else {
+                        return Err(format!("parameter {} has no shape: a pointer records its declared shape", p.name));
+                    };
+                    parse_shape(&p.name, shape)?;
                 }
                 "scalar" => {
                     if p.ty != "i32" || p.ptx_type != "u32" || p.size != 4 || p.dtype.is_some() || p.access.is_some() {
                         return Err(format!("parameter {}: a runtime scalar must be an i32 passed as a u32", p.name));
                     }
-                    if p.dim.is_none() {
-                        return Err(format!("parameter {} is a scalar and needs a dim", p.name));
+                    if p.dim.is_none() || p.shape.is_some() {
+                        return Err(format!("parameter {} is a scalar: it has a dim and no shape", p.name));
                     }
                 }
                 other => return Err(format!("parameter {}: kind must be pointer or scalar, got {other:?}", p.name)),
@@ -781,6 +890,13 @@ impl Entry {
     /// The checks of `validate_spec` that the manifest's own fields allow: what a launch relies on is all there.
     fn check_consistent(&self, syms: &mut Symbols) -> std::result::Result<(), String> {
         for p in &self.params {
+            if let ParamKind::Pointer { shape, .. } = &p.kind {
+                for (axis, d) in shape.iter().enumerate() {
+                    if let ShapeDim::Expr(e) = d {
+                        parse_expr(e, &format!("parameter {} shape[{axis}]", p.name), syms)?;
+                    }
+                }
+            }
             if let ParamKind::Scalar { dim, count_of } = &p.kind {
                 parse_expr(dim, &format!("parameter {} dim", p.name), syms)?;
                 if let Some(target) = count_of {
@@ -805,7 +921,12 @@ impl Entry {
             match pre {
                 Precondition::Bucket { dim, value, buckets } => {
                     let mine = self.buckets.iter().find(|(d, _)| d == dim).map(|(_, v)| *v);
-                    if mine != Some(*value) || !buckets.contains(value) || !bucketed.insert(dim.clone()) {
+                    let in_dims = self.dims.iter().find(|d| d.name == *dim).and_then(|d| d.bucket);
+                    if mine != Some(*value)
+                        || in_dims != Some(*value)
+                        || !buckets.contains(value)
+                        || !bucketed.insert(dim.clone())
+                    {
                         return Err(format!("the bucket precondition for {dim} disagrees with the entry's buckets"));
                     }
                     continue;
@@ -870,6 +991,24 @@ impl Entry {
             }
         }
         parse_grid(&self.grid, syms)?;
+        // a static_size is the size the shape has on that axis; the table of dimensions names every dimension in use
+        for (arg, axis) in sized.keys() {
+            let agrees = match self.param(arg).map(|p| &p.kind) {
+                Some(ParamKind::Pointer { shape, .. }) => {
+                    matches!(shape.get(*axis), Some(ShapeDim::Static(n)) if Some(n) == sized.get(&(arg.clone(), *axis)))
+                }
+                _ => false,
+            };
+            if !agrees {
+                return Err(format!("static_size of {arg} axis {axis} is not the size the declared shape has there"));
+            }
+        }
+        if syms.len() > self.dims.len() {
+            let unnamed: Vec<&str> = (self.dims.len()..syms.len()).map(|i| syms.name(i)).collect();
+            return Err(format!(
+                "dims does not name {unnamed:?}, which the declared shapes, the scalars or the grid mention"
+            ));
+        }
         Ok(())
     }
 }
@@ -945,6 +1084,12 @@ impl Manifest {
                 Error::manifest(format!("the manifest {label:?} is not a tilefish manifest: it is not a JSON object"))
             }
         })?;
+        if let Some(older) = raw.schema.as_u64().filter(|n| (1..MANIFEST_SCHEMA).contains(n)) {
+            return Err(Error::manifest(format!(
+                "the manifest {label:?} is schema {older}, which an older tilefish wrote; this host reads schema {MANIFEST_SCHEMA}, where every \
+                 pointer records its shape and every entry the constraints of its dimensions: export it again with a current tilefish"
+            )));
+        }
         if raw.schema.as_u64() != Some(MANIFEST_SCHEMA) {
             return Err(Error::manifest(format!(
                 "the manifest {label:?} is not a tilefish manifest of schema {MANIFEST_SCHEMA} (schema {})",
