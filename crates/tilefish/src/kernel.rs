@@ -224,11 +224,7 @@ impl Manifest {
         }
         let attribute =
             |a: CUdevice_attribute, call: &'static str| ctx.attribute(a).map(i64::from).map_err(Error::driver(call));
-        let max_grid = [
-            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, "cuDeviceGetAttribute(MAX_GRID_DIM_X)")?,
-            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y, "cuDeviceGetAttribute(MAX_GRID_DIM_Y)")?,
-            attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z, "cuDeviceGetAttribute(MAX_GRID_DIM_Z)")?,
-        ];
+        let max_grid = max_grid(attribute)?;
         let shared_optin = attribute(
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
             "cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)",
@@ -284,6 +280,16 @@ impl Manifest {
         let index = self.select(name, buckets, &arch.to_string())?;
         Plan::new(&self.entries[index])
     }
+}
+
+/// The largest grid the device takes along x, y and z (what a launch's grid is checked against: `DeviceInfo::max_grid`), from the
+/// device's attributes; `attribute` asks the driver for one.
+fn max_grid(attribute: impl Fn(CUdevice_attribute, &'static str) -> Result<i64>) -> Result<[i64; 3]> {
+    Ok([
+        attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, "cuDeviceGetAttribute(MAX_GRID_DIM_X)")?,
+        attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y, "cuDeviceGetAttribute(MAX_GRID_DIM_Y)")?,
+        attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z, "cuDeviceGetAttribute(MAX_GRID_DIM_Z)")?,
+    ])
 }
 
 /// Allow `bytes` of dynamic shared memory (needed above the default 48 KiB) for `function`, which is in `ctx`.

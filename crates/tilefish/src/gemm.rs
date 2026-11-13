@@ -341,7 +341,67 @@ impl Gemm {
 
     /// Check a call (see [`Gemm::launch`]) and return the addresses to run it with.
     pub(crate) fn check_call(&self, tensors: &[TensorArg<'_>]) -> Result<Call> {
-        let stem = self.loaded.stem.as_str();
+        self.checks().check_call(tensors)
+    }
+
+    /// What the checks of a call are made of.
+    fn checks(&self) -> Checks<'_> {
+        let loaded = &*self.loaded;
+        Checks {
+            stem: &loaded.stem,
+            plan: &self.plan,
+            device: &loaded.device,
+            m: loaded.m,
+            n: loaded.n,
+            k: loaded.k,
+            bias: loaded.bias,
+            required: loaded.required,
+            workspace_bytes: loaded.workspace_bytes,
+        }
+    }
+
+    /// Check the call and run the GEMM on `stream`.
+    ///
+    /// `tensors` are `a` `[m, k]`, `b` `[n, k]`, `bias` `[n]` (for `gemm_bias`), `out` `[m, n]` (written) and the workspace (written), in this
+    /// order: bf16 tensors but the workspace, which is bytes, contiguous, 16-byte aligned (the workspace 256), with the entry's static sizes
+    /// and bucket exactly. The stream must be a stream of the context the GEMM was loaded in (checked); that context is made current on
+    /// this thread, as cudarc does for its own calls. The launch is asynchronous: `stream` orders it with the host's other work.
+    ///
+    /// The slices are ordered exactly as for [`Kernel::launch`](crate::Kernel::launch): cudarc's launch tracking on `stream`, the slices'
+    /// own streams waiting for the end of the GEMM (and a written slice waiting for everything before it), a refusal while a stream is
+    /// capturing (`launch_raw` and regions capture a GEMM), and an `Err` that is not a promise that nothing was enqueued.
+    pub fn launch(&self, stream: &CudaStream, tensors: &mut [TensorArg<'_>]) -> Result<()> {
+        if **stream.context() != *self.loaded.context {
+            return Err(Error::Launch(format!(
+                "the stream is in another CUDA context than the one '{}' was loaded in: launch it on a stream of that context",
+                self.loaded.stem
+            )));
+        }
+        let call = self.check_call(tensors)?;
+        crate::ffi::enqueue_gemm(self, stream, &call, tensors)
+    }
+}
+
+/// What the checks of a call need of a loaded GEMM: the facts of its entry, the device it is loaded on and what the library said the
+/// algorithm needs, without the library itself (no handle, no algorithm), so that the checks run without a GPU.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Checks<'a> {
+    stem: &'a str,
+    plan: &'a Plan,
+    device: &'a DeviceInfo,
+    m: u64,
+    n: u64,
+    k: u64,
+    bias: bool,
+    /// What the library says the algorithm needs for the problem.
+    required: usize,
+    workspace_bytes: u64,
+}
+
+impl Checks<'_> {
+    /// Check a call (see [`Gemm::launch`]) and return the addresses to run it with.
+    pub(crate) fn check_call(&self, tensors: &[TensorArg<'_>]) -> Result<Call> {
+        let stem = self.stem;
         let operands = self.plan.tensor_names().count();
         if tensors.len() != operands + 1 {
             return Err(Error::Launch(format!(
@@ -354,11 +414,11 @@ impl Gemm {
         let (operand_args, workspace) = tensors.split_at(operands);
         let workspace = &workspace[0];
         // the operands: shapes bound to the entry's dimensions, the exact bucket, dtype, contiguity, alignment, device and context, aliasing
-        self.plan.prepare(operand_args, Some(&self.loaded.device))?;
+        self.plan.prepare(operand_args, Some(self.device))?;
         // (the entry's shapes agree with m, n, k, and its dimensions are bucketed to them: a defense for the memory the library reads)
-        let (m, n, k) = (self.loaded.m as usize, self.loaded.n as usize, self.loaded.k as usize);
+        let (m, n, k) = (self.m as usize, self.n as usize, self.k as usize);
         let mut wanted: Vec<Vec<usize>> = vec![vec![m, k], vec![n, k]];
-        if self.loaded.bias {
+        if self.bias {
             wanted.push(vec![n]);
         }
         wanted.push(vec![m, n]);
@@ -377,15 +437,15 @@ impl Gemm {
         self.check_workspace(workspace, operand_args)?;
         let address = |i: usize| operand_args[i].ptr;
         let (a, b) = (address(0), address(1));
-        let (bias, out) = if self.loaded.bias { (Some(address(2)), address(3)) } else { (None, address(2)) };
-        Ok(Call { a, b, bias, out, workspace: if self.loaded.required == 0 { 0 } else { workspace.ptr } })
+        let (bias, out) = if self.bias { (Some(address(2)), address(3)) } else { (None, address(2)) };
+        Ok(Call { a, b, bias, out, workspace: if self.required == 0 { 0 } else { workspace.ptr } })
     }
 
     /// The workspace is a tensor that is written: bytes, enough of them, aligned, in this context, overlapping no operand.
     fn check_workspace(&self, workspace: &TensorArg<'_>, operands: &[TensorArg<'_>]) -> Result<()> {
-        let stem = self.loaded.stem.as_str();
+        let stem = self.stem;
         let name = Some("workspace");
-        let device = &self.loaded.device;
+        let device = self.device;
         if workspace.device != device.ordinal {
             return Err(Error::precondition(
                 PreconditionKind::Device,
@@ -430,13 +490,13 @@ impl Gemm {
                 ),
             ));
         }
-        if (workspace.shape[0] as u64) < self.loaded.required as u64 {
+        if (workspace.shape[0] as u64) < self.required as u64 {
             return Err(Error::precondition(
                 PreconditionKind::Shape,
                 name,
                 format!(
                     "the workspace has {} bytes, but the pinned algorithm of '{stem}' needs {} (the entry's limit is {})",
-                    workspace.shape[0], self.loaded.required, self.loaded.workspace_bytes
+                    workspace.shape[0], self.required, self.workspace_bytes
                 ),
             ));
         }
@@ -465,27 +525,6 @@ impl Gemm {
             }
         }
         Ok(())
-    }
-
-    /// Check the call and run the GEMM on `stream`.
-    ///
-    /// `tensors` are `a` `[m, k]`, `b` `[n, k]`, `bias` `[n]` (for `gemm_bias`), `out` `[m, n]` (written) and the workspace (written), in this
-    /// order: bf16 tensors but the workspace, which is bytes, contiguous, 16-byte aligned (the workspace 256), with the entry's static sizes
-    /// and bucket exactly. The stream must be a stream of the context the GEMM was loaded in (checked); that context is made current on
-    /// this thread, as cudarc does for its own calls. The launch is asynchronous: `stream` orders it with the host's other work.
-    ///
-    /// The slices are ordered exactly as for [`Kernel::launch`](crate::Kernel::launch): cudarc's launch tracking on `stream`, the slices'
-    /// own streams waiting for the end of the GEMM (and a written slice waiting for everything before it), a refusal while a stream is
-    /// capturing (`launch_raw` and regions capture a GEMM), and an `Err` that is not a promise that nothing was enqueued.
-    pub fn launch(&self, stream: &CudaStream, tensors: &mut [TensorArg<'_>]) -> Result<()> {
-        if **stream.context() != *self.loaded.context {
-            return Err(Error::Launch(format!(
-                "the stream is in another CUDA context than the one '{}' was loaded in: launch it on a stream of that context",
-                self.loaded.stem
-            )));
-        }
-        let call = self.check_call(tensors)?;
-        crate::ffi::enqueue_gemm(self, stream, &call, tensors)
     }
 }
 
