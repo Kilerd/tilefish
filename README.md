@@ -189,7 +189,11 @@ away included. It compares the content of the file, so a save without a change
 passes, and a module that was imported before `import tilefish` is compared by
 size and modification time only (`tilefish/_source.py` lists what the check does
 not see: an edit between a module's import and `import tilefish`, a module no
-source loader executed, a stale same-second `.pyc`). **Kernel inputs come from
+source loader executed, a stale same-second `.pyc`). The recording wraps
+`SourceFileLoader.exec_module` for the whole process. `TILEFISH_IMPORT_WATCH=0`
+leaves the import system alone, and every module is then compared by size and
+modification time only, from when tilefish was imported or when a build first
+read it. **Kernel inputs come from
 source files, not from module state a program assigns at run time**
 (`cfg.SCALE = 5.0`, `monkeypatch.setattr`): a build refuses a constant that a
 kernel function reads and that was reassigned since its module was imported

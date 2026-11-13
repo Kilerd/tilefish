@@ -323,6 +323,7 @@ class _Watch:
     before: "dict[str, tuple[int, int]]" = field(default_factory=dict)  # path -> (mtime_ns, size) when the watch was installed
     original: Any = None
     loader: Any = None
+    lazy: bool = False  # TILEFISH_IMPORT_WATCH=0: no loader is wrapped; a file is recorded when a build first reads it
 
     @property
     def installed(self) -> bool:
@@ -362,6 +363,12 @@ class _Watch:
 
         exec_module._tilefish_watch = watch  # type: ignore[attr-defined]
         self.before = {}
+        self.record_baseline()
+        self.original, self.loader = original, loader
+        loader.exec_module = exec_module  # type: ignore[method-assign]
+
+    def record_baseline(self) -> None:
+        """Record the size and modification time of the file of every user module imported so far."""
         for name, module in list(sys.modules.items()):
             try:
                 path = getattr(module, "__file__", None)
@@ -370,8 +377,6 @@ class _Watch:
                     self.before.setdefault(_key(path), (st.st_mtime_ns, st.st_size))
             except Exception:  # noqa: BLE001 - a module whose attributes or file cannot be looked at
                 continue
-        self.original, self.loader = original, loader
-        loader.exec_module = exec_module  # type: ignore[method-assign]
 
     def uninstall(self) -> None:
         if not self.installed:
@@ -393,7 +398,11 @@ class _Watch:
                 )
             return
         before = self.before.get(key)
-        if before is not None and before != (st.st_mtime_ns, st.st_size):
+        if before is None:
+            if self.lazy:
+                self.before[key] = (st.st_mtime_ns, st.st_size)
+            return
+        if before != (st.st_mtime_ns, st.st_size):
             raise StaleSourceError(
                 f"module '{name}' changed on disk since it was imported ({path!r}); reload it or restart the process, then build "
                 "again. It was imported before tilefish, and its size or modification time is not what it was when tilefish was "
@@ -412,7 +421,16 @@ _watch = _adopt()
 
 
 def install_import_watch() -> None:
-    """Start recording the modules that are imported from now on (called when ``tilefish`` is imported; harmless to call again)."""
+    """Start recording the modules that are imported from now on (called when ``tilefish`` is imported; harmless to call again).
+
+    ``TILEFISH_IMPORT_WATCH=0`` leaves the import system alone: no loader is wrapped. A module is then checked only by the size
+    and modification time its file had when tilefish was imported or, for a module imported later, when a build first read it.
+    That misses an edit made between such a module's import and the first build that reads it, and an edit that keeps both.
+    """
+    if os.environ.get("TILEFISH_IMPORT_WATCH", "").strip() == "0":
+        _watch.lazy = True
+        _watch.record_baseline()
+        return
     _watch.install()
 
 

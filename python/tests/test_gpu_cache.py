@@ -30,7 +30,7 @@ from lower_cases import softmax  # noqa: E402
 
 import tilefish  # noqa: E402
 from tilefish import Dim, Out, Tensor, TilefishBuildError, TilefishCacheWarning, f32, runtime  # noqa: E402
-from tilefish.aot import build, compile_specs  # noqa: E402
+from tilefish.aot import build  # noqa: E402
 from tilefish.dims import cdiv  # noqa: E402
 
 CAP = torch.cuda.get_device_capability()
