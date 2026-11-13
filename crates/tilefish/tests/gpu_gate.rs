@@ -5,15 +5,21 @@
 //!
 //! * `TILEFISH_GATE_GENERATED` (at compile time): the launchers `tilefish.hosts.rust.emit` wrote for the manifest (with `embed=True`);
 //! * `TILEFISH_GATE_DIR` (at run time): the directory `rust_gate.py prepare` filled: `manifest/` (the manifest directory),
-//!   `cases.json` (each case: the launcher, its tensors, the files of its inputs and of the outputs Python's `replay`
-//!   gave) and the raw bytes of every tensor.
+//!   `cases.json` (each case: the launcher, its stem, whether it is a kernel or a GEMM, its tensors, the files of its inputs and of the
+//!   outputs Python's `replay` gave; a view has its element `strides` and `offset` and the files hold the storage it is a view of) and the
+//!   raw bytes of every tensor; and `workspace_case/`, which `rust_workspace_case.py` writes (a GEMM whose algorithm needs a workspace).
 //!
 //! ```text
 //! python rust_gate.py prepare $WORK
+//! python rust_workspace_case.py $WORK
 //! TILEFISH_GATE_GENERATED=$WORK/generated.rs TILEFISH_GATE_DIR=$WORK \
 //!     cargo test -p tilefish --features gpu-gate --test gpu_gate -- --test-threads=1 --nocapture
 //! python rust_gate.py compare $WORK
 //! ```
+//!
+//! (`byte_identity` launches each case through its typed launcher where this file has an arm for it, and through `Manifest::kernel` or
+//! `Manifest::gemm` and untyped `TensorArg`s otherwise: the strided kernels, the device scalars, the prebuilt binaries and the GEMMs are
+//! generated launchers that compile with this file, and are run through the checked path of the crate.)
 //!
 //! The tests: `byte_identity` runs every case and writes every tensor after the launch (outputs, and the inputs, so that an `InOut`
 //! tensor that was updated in place is compared too), through tensors made of cudarc slices (no `unsafe`) and the safe `launch` on a
@@ -23,7 +29,10 @@
 //! graphs; `a_launch_on_another_stream_...` and the tests after it are the hazards of cudarc's event tracking between streams (a free
 //! under a queued launch, a second reader, a writer after two readers), with the launch stream held back by a host callback; the two
 //! `..._on_a_capturing_..._stream_...` tests are the refusal of a safe launch of slices while a stream captures a CUDA graph, in a
-//! context that tracks events and in one that does not; `launch_raw_puts_back_the_current_context` is what it says.
+//! context that tracks events and in one that does not; `launch_raw_puts_back_the_current_context` is what it says. Schema 3 adds
+//! `the_gate_has_a_case_for_every_feature_of_schema_3`, `refusals_of_schema_3`, `graph_capture_of_a_strided_kernel_and_of_a_gemm`,
+//! `a_gemm_of_slices_on_a_capturing_stream_...`, the free of the slices of a GEMM and of a strided kernel on another stream,
+//! `a_written_view_lands_at_its_offset_and_nowhere_else` and `a_gemm_whose_algorithm_needs_a_workspace_...`.
 
 #[allow(dead_code)]
 mod generated {
@@ -1736,5 +1745,115 @@ fn a_written_view_lands_at_its_offset_and_nowhere_else() {
     }
     println!(
         "rust gate: a written view of a slice (offsets 8, 16 and 24 elements) holds Python's replay and nothing around it changed"
+    );
+}
+
+/// The GEMMs of the gate are pinned to algorithms that need no workspace on this device, so none of them exercises the workspace of a launch.
+/// `python/tests/rust_workspace_case.py` pins one whose algorithm does (split-K: `workspace_case/`): it runs with the caller's workspace, a
+/// workspace of exactly the size the algorithm needs, one that is dirty (the result does not depend on its contents) and one captured in a CUDA
+/// graph with regions, each the bytes Python's `replay` computed with the workspace of torch's allocator; and one byte less is refused.
+#[test]
+fn a_gemm_whose_algorithm_needs_a_workspace_runs_with_the_callers_and_matches_replay() {
+    let dir = gate_dir().join("workspace_case");
+    assert!(
+        dir.exists(),
+        "{} is not there: run python/tests/rust_workspace_case.py on the gate directory",
+        dir.display()
+    );
+    let case = read_json(&dir.join("case.json"));
+    let gpu = Gpu::new();
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let manifest = Manifest::load(dir.join("manifest"), Pin::TrustDirectory).unwrap();
+    let stem = case["stem"].as_str().unwrap();
+    let gemm = manifest.gemm(&gpu.ctx, stem, &[], arch).unwrap();
+    let (m, n, k) = (
+        case["m"].as_u64().unwrap() as usize,
+        case["n"].as_u64().unwrap() as usize,
+        case["k"].as_u64().unwrap() as usize,
+    );
+    assert_eq!(gemm.sizes(), (m as u64, n as u64, k as u64));
+    let required = gemm.workspace_required() as usize;
+    assert!(
+        required > 0 && required as u64 <= gemm.workspace_bytes(),
+        "the pinned algorithm needs a workspace: {required}"
+    );
+    assert_eq!(
+        required as u64,
+        case["workspace_required"].as_u64().unwrap(),
+        "what cublasLtMatmulAlgoCheck says is what the heuristic said"
+    );
+    let (a, b, bias) = (read(&dir.join("a.bin")), read(&dir.join("b.bin")), read(&dir.join("bias.bin")));
+    let expect = read(&dir.join("expect.bin"));
+    let (a_shape, b_shape, bias_shape, out_shape) = ([m, k], [n, k], [n], [m, n]);
+    let (a_buf, b_buf, bias_buf) = (gpu.upload(&a), gpu.upload(&b), gpu.upload(&bias));
+
+    // a workspace of the entry's size (zeros), of exactly what the algorithm needs (dirty: 0xFF), and what a launch needs minus one
+    for (what, mut workspace) in [
+        ("the entry's workspace", gemm.alloc_workspace(&gpu.stream).unwrap()),
+        ("exactly the workspace the algorithm needs, dirty", gpu.stream.clone_htod(&vec![0xFFu8; required]).unwrap()),
+    ] {
+        let mut out = gpu.zeros(m * n * 2);
+        let ws_shape = [workspace.len()];
+        gemm.launch(
+            &gpu.stream,
+            &mut [
+                TensorRef::<Bf16>::from_cuda(&a_buf.slice, &a_shape).unwrap().into_arg(),
+                TensorRef::<Bf16>::from_cuda(&b_buf.slice, &b_shape).unwrap().into_arg(),
+                TensorRef::<Bf16>::from_cuda(&bias_buf.slice, &bias_shape).unwrap().into_arg(),
+                TensorMut::<Bf16>::from_cuda(&mut out.slice, &out_shape).unwrap().into_arg(),
+                TensorMut::<U8>::from_cuda(&mut workspace, &ws_shape).unwrap().into_arg(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(gpu.download(&out), expect, "{what}: the result is Python's replay, byte for byte");
+    }
+    let mut out = gpu.zeros(m * n * 2);
+    let mut short = gpu.zeros(required - 1);
+    let short_shape = [required - 1];
+    let e = gemm
+        .launch(
+            &gpu.stream,
+            &mut [
+                TensorRef::<Bf16>::from_cuda(&a_buf.slice, &a_shape).unwrap().into_arg(),
+                TensorRef::<Bf16>::from_cuda(&b_buf.slice, &b_shape).unwrap().into_arg(),
+                TensorRef::<Bf16>::from_cuda(&bias_buf.slice, &bias_shape).unwrap().into_arg(),
+                TensorMut::<Bf16>::from_cuda(&mut out.slice, &out_shape).unwrap().into_arg(),
+                TensorMut::<U8>::from_cuda(&mut short.slice, &short_shape).unwrap().into_arg(),
+            ],
+        )
+        .unwrap_err();
+    assert!(e.precondition_kind() == Some(PreconditionKind::Shape) && e.to_string().contains("workspace"), "{e}");
+    assert!(gpu.download(&out).iter().all(|b| *b == 0), "a refused launch writes nothing");
+
+    // captured in a CUDA graph with regions: the workspace is the caller's, so nothing is allocated inside the capture
+    let workspace = gemm.alloc_workspace(&gpu.stream).unwrap();
+    let ws_len = workspace.len();
+    gpu.stream.synchronize().unwrap();
+    let stream = gpu.stream.cu_stream();
+    // SAFETY: the buffers outlive the graph's launches (until the end of this function), and nothing else uses them meanwhile.
+    let (ar, br, biasr, outr) = unsafe {
+        (
+            gpu.unbound_region(&a_buf, a_buf.nbytes()),
+            gpu.unbound_region(&b_buf, b_buf.nbytes()),
+            gpu.unbound_region(&bias_buf, bias_buf.nbytes()),
+            gpu.unbound_region(&out, out.nbytes()),
+        )
+    };
+    let wsr = unsafe { DevicePtr::from_raw(workspace.device_ptr(&gpu.stream).0, ws_len as u64, 0) };
+    let ws_shape = [ws_len];
+    let launch = || {
+        let args = [
+            TensorRef::<Bf16>::new(ar, &a_shape)?.into_arg(),
+            TensorRef::<Bf16>::new(br, &b_shape)?.into_arg(),
+            TensorRef::<Bf16>::new(biasr, &bias_shape)?.into_arg(),
+            TensorMut::<Bf16>::new(outr, &out_shape)?.into_arg(),
+            TensorMut::<U8>::new(wsr, &ws_shape)?.into_arg(),
+        ];
+        // SAFETY: the stream is the GEMM's; the regions are the buffers' own, which outlive the graph.
+        unsafe { gemm.launch_raw(stream, &args) }
+    };
+    capture_and_run(&gpu, &launch, &mut out.slice, &expect);
+    println!(
+        "rust gate: the GEMM '{stem}' (m={m} n={n} k={k}, a split-K algorithm that needs {required} bytes of workspace) matches replay with the entry's workspace, with exactly {required} bytes (dirty) and in a CUDA graph; one byte less is refused"
     );
 }
