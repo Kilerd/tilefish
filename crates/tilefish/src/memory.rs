@@ -19,16 +19,32 @@
 //!   `device_ptr` does). Building a tensor, and throwing it away, or having it refused, changes nothing about when the slice may be
 //!   freed or written.
 //! * **A launch is tracked by cudarc on the launch stream** (the slices are given to its builder), which keeps cudarc's own ordering
-//!   of the launch after the slice's earlier writes (and reads, for a write) on any stream.
+//!   of the launch after the slice's earlier writes (and reads, for a write) on any stream, in a context that tracks (below).
 //! * **And by this crate, on the stream that owns the slice**: cudarc keeps one `read` event per slice, so two launches that read a
 //!   slice on two streams leave only the last one for the free to wait for. After the launch, for every slice whose owning stream (the
 //!   one it will be freed on) is not the launch stream, the owning stream waits for an event recorded right after the kernel. A free
 //!   (or a use) on the owning stream after that is ordered after the kernel, however many other launches read the slice. This is
-//!   not done for a region the host vouched for: nothing tracks those.
+//!   not done for a region the host vouched for: nothing tracks those. It is done in every context, whether cudarc tracks it or not.
+//! * **A writer waits for everything before it.** cudarc's writer waits for the slice's last `read` and last `write` record, which is
+//!   one launch: a writer launched after two readers on two streams would wait for the later of them only. So, before the kernel, for
+//!   every slice that the kernel writes and whose owning stream is not the launch stream, the launch stream waits for an event recorded
+//!   on the owning stream at that moment. The owning stream has waited for the end of every earlier launch of this crate that used the
+//!   slice (previous item), so the writer runs after all of them, readers and writers, on whatever streams.
+//! * **A launch of slices is refused while a stream is capturing a CUDA graph** (the launch stream, or a stream a slice is freed on):
+//!   a graph holds addresses and nothing that keeps the slice alive, and `CudaGraph::launch` is safe. cudarc alone does not refuse
+//!   it: a context that never made a stream of its own (it uses `per_thread_stream`, or the default stream) has no events to wait on,
+//!   and the kernel would be captured. Capture uses regions (`unsafe` [`DevicePtr::from_raw`](crate::DevicePtr::from_raw)) and
+//!   [`Kernel::launch_raw`](crate::Kernel::launch_raw).
+//! * **An error from a launch** is not a promise that the kernel was not enqueued: a driver error can come after it (cudarc's launch
+//!   records an event after the kernel, and on the slices). When a slice's owning stream is not the launch stream, the crate then
+//!   makes every owner wait for what it can, and blocks the host until the launch stream is idle (best effort), before it returns the
+//!   error, so no free of a slice is left unordered behind a kernel that may be running.
 //!
-//! What is *not* guaranteed: ordering between two launches on two different streams that both write, or one that writes and others
-//! that read, beyond what cudarc's one-event-per-slice tracking gives (a writer waits for the last reader that was recorded, not for
-//! all of them). Use one stream for work that must be ordered, or order streams yourself.
+//! What is *not* guaranteed: the ordering of a reader after a writer of the slice on another stream is cudarc's, which tracks it only in
+//! a context that has made a stream of its own (`CudaContext::new_stream`) and has event tracking on, and it is the tracking of one
+//! `write` event, which each writer's wait for the one before it makes enough; the uses of a slice that are not launches of this crate
+//! (cudarc's copies, another library) are cudarc's or the host's own; and calls from two threads are as ordered as the host orders
+//! them. Do not turn cudarc's event tracking off (`unsafe`) to get a graph: use regions.
 //!
 //! What a tensor can be made of is a closed set, [`CudaRead`] (`CudaSlice`, `CudaView`) and [`CudaWrite`] (`CudaSlice`,
 //! `CudaViewMut`): the two traits are sealed, because their implementations say what a launch reads and writes and where, and an

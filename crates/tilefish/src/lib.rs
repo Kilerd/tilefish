@@ -73,19 +73,25 @@
 //!   `unsafe`. **Making a tensor records nothing on the slice** (and neither does throwing it away, or a launch that is refused):
 //!   cudarc keeps one `read` event per slice, and recording on it replaces the record of a launch that is still queued on another stream.
 //! * [`Kernel::launch`] hands the slice to cudarc's launch builder on the stream it launches on, which orders the launch after the
-//!   slice's earlier writes (and reads, for a write) and records it on the slice, **and** makes the slice's own stream (the one it is
-//!   freed on) wait for an event recorded right after the kernel, when that is not the launch stream. So freeing the slice, or any
-//!   later work on its stream, runs after the kernel, however many other launches read the slice on other streams. What is not
-//!   guaranteed is more than cudarc's one-event-per-slice tracking gives between launches on different streams that write: a
-//!   writer waits for the last reader recorded, not for all of them. Order such work on one stream.
+//!   slice's earlier writes (and reads, for a write) and records it on the slice, and the crate adds, in every context (cudarc tracks
+//!   only one that has made a stream of its own): the slice's own stream (the one it is freed on) waits for an event recorded right
+//!   after the kernel, when that is not the launch stream, so freeing the slice, or any later work on its stream, runs after the
+//!   kernel, however many other launches read the slice on other streams; and a kernel that writes the slice, from a stream that is not
+//!   its own, first waits for everything enqueued on the slice's own stream, which includes the end of every earlier launch that used
+//!   the slice, so a writer runs after all earlier readers, not only the last one cudarc recorded. What is not guaranteed: a reader
+//!   after a writer on another stream is cudarc's tracking, which needs a context that has made a stream of its own; and uses of a
+//!   slice that are not launches of this crate are cudarc's or the host's. An `Err` from a launch does not promise that nothing was
+//!   launched (a driver error can come after the kernel was enqueued); the crate then still orders the slices' owners behind it
+//!   (best effort) before it returns.
 //! * A region has a lifetime ([`DevicePtr<'a>`]); the host that makes one says what it borrows from, and nothing tracks it: not its
 //!   ordering against other streams, and not its being freed.
-//! * **A CUDA graph is captured with [`Kernel::launch_raw`] and regions** (`unsafe` [`DevicePtr::from_raw`]). A graph holds the
-//!   addresses it captured and nothing that keeps the memory alive, so the contract of `from_raw` includes that the graph is not
-//!   replayed after the memory is gone. The safe [`Kernel::launch`] on a capturing stream with a tensor made of a slice is an
-//!   error (the driver refuses cudarc's waits on events recorded outside the capture, `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`), not a
-//!   graph. There is nothing to switch off: do not turn cudarc's event tracking off to capture slices, it leaves exactly the graph
-//!   that outlives its memory.
+//! * **A CUDA graph is captured with [`Kernel::launch_raw`] and regions** (`unsafe` [`DevicePtr::from_raw`]); [`Kernel::launch`] with
+//!   regions on a cudarc stream captures too. A graph holds the addresses it captured and nothing that keeps the memory alive, so the
+//!   contract of `from_raw` includes that the graph is not replayed after the memory is gone. **A launch of tensors made of slices is
+//!   refused while the launch stream, or a stream a slice is freed on, is capturing** (an `Error::Launch`; in every context: cudarc's
+//!   own waits would only refuse it in one that tracks events, and a kernel launched on `ctx.per_thread_stream()` would otherwise be
+//!   captured with the slices' addresses, and a replay after the free would write into reused memory). There is nothing to switch
+//!   off: do not turn cudarc's event tracking off to capture slices, it leaves exactly the graph that outlives its memory.
 //!
 //! # `unsafe`
 //!

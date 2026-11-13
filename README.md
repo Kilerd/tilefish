@@ -269,7 +269,7 @@ experiment that passes in `replay` is, kernel for kernel, what production runs.
 
 ## The Rust host
 
-The `tilefish` crate (`crates/tilefish`, version 0.0.0, not published) is the
+The `tilefish` crate (`crates/tilefish`, version 0.0.1) is the
 host of a manifest directory, without Python or Triton: it reads the manifest as
 strict JSON, recomputes the digests exactly as Python does (the `sha256` of each
 cubin, the `sha256_code` of its machine code, and the digest of the whole
@@ -287,12 +287,16 @@ DevicePtr::from_raw`, which has a lifetime and no tracking). The launch gives a
 slice to cudarc's launch builder on the stream it launches on, which orders it
 after the slice's earlier writes, and makes the slice's own stream wait for the
 kernel, so freeing the slice (or any later work on its stream) runs after the
-kernel however many other streams read it; between launches on different streams
-that write one slice, only cudarc's one event per slice orders them, so keep such
-work on one stream. A CUDA graph is captured with `launch_raw` and regions: the
-graph holds the addresses and nothing that keeps the memory alive, so it must not
-be replayed after the memory is gone, and a safe `launch` of slices on a capturing
-stream is an error, not a graph. The loaded function's parameter sizes are not compared with the ABI
+kernel however many other streams read it; a kernel that writes a slice from
+another stream first waits for everything enqueued on the slice's own stream, so
+it runs after all earlier readers. (A reader after a writer on another stream is
+cudarc's own tracking, which needs a context that has made a stream of its own;
+an `Err` from a launch does not promise that nothing was launched, and the crate
+orders the free behind a kernel that may have run.) A CUDA graph is captured
+with `launch_raw` (or `launch`) and regions: the graph holds the addresses and
+nothing that keeps the memory alive, so it must not be replayed after the memory
+is gone, and a launch of slices on a capturing stream is an error, not a graph,
+whatever the cudarc context. The loaded function's parameter sizes are not compared with the ABI
 (`cuFuncGetParamInfo`, which Python's `replay` asks): cudarc has no wrapper for it,
 and it adds nothing, because the cubin is the one whose digests the manifest
 pinned and the ABI is in the digest of the manifest. `cudarc` panics when there is

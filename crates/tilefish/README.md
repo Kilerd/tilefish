@@ -40,10 +40,11 @@ These checks happen before anything reaches the driver:
   `divisible_by`, `max_elements`, aliasing, alignment, device and context, and
   the grid limits are all checked.
 
-Safe code cannot free a slice under a running kernel. `unsafe` is needed in
-exactly two places: vouching for a raw device region, which is also how CUDA
-graphs are captured, and launching on a raw `CUstream`. See the crate docs for
-the exact contracts.
+Safe code cannot free a slice under a running kernel, and a launch of slices
+on a stream that is capturing a CUDA graph is refused, in every cudarc context.
+`unsafe` is needed in exactly two places: vouching for a raw device region,
+which is also how CUDA graphs are captured (with `launch_raw`), and launching on
+a raw `CUstream`. See the crate docs for the exact contracts.
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your
 option.

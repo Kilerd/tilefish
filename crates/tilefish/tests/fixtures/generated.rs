@@ -53,9 +53,10 @@ impl Axpy {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -132,9 +133,10 @@ impl BucketedRmsDb1000 {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -213,9 +215,10 @@ impl BucketedRmsDb512 {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -294,9 +297,10 @@ impl BucketedRmsDb96 {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -377,9 +381,10 @@ impl GeluErf {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -458,9 +463,10 @@ impl GeluExact {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -547,9 +553,10 @@ impl Layernorm {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -635,9 +642,10 @@ impl Mm {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -726,9 +734,10 @@ impl ResidualAddRmsnorm {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -816,9 +825,10 @@ impl Rmsnorm {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -901,9 +911,10 @@ impl Softmax {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched
@@ -990,9 +1001,10 @@ impl Swiglu {
     }
 
     /// Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of
-    /// a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after
-    /// it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a
-    /// CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).
+    /// a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,
+    /// and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host
+    /// vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with
+    /// `launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).
     ///
     /// Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the
     /// bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched

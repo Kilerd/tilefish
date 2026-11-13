@@ -23,7 +23,8 @@ What the module holds, in order:
 * one struct per stem. ``STEM`` and ``BUCKETS`` name the binary (bucket semantics are exact: ``BucketedRms96`` and
   ``BucketedRms512`` are different structs and there is no padding), ``SHAPES`` the declared shape of every tensor,
   ``load(&Manifest, &Arc<CudaContext>)`` loads the binary for the device of a context and ``launch(&CudaStream, tensors...)`` checks the call and
-  launches (also inside a CUDA graph capture), and ``unsafe launch_raw(CUstream, tensors...)`` does the same on a raw handle.
+  launches, and ``unsafe launch_raw(CUstream, tensors...)`` does the same on a raw handle. A CUDA graph is captured with regions
+  and ``launch_raw`` (a launch of cudarc slices on a capturing stream is an error).
 
 The output is deterministic: the same manifest gives the same bytes. Nothing in it depends on where the manifest was
 written, except the ``include_bytes!`` paths with ``embed=True``.
@@ -424,9 +425,10 @@ def _render_binary(b: _Binary) -> str:
     out.append("    pub fn kernel(&self) -> &Kernel {\n        &self.kernel\n    }\n\n")
     doc = [
         "Check the call and launch the kernel on `stream`, a stream of the context the kernel was loaded in (checked). A tensor made of",
-        "a cudarc slice is given to cudarc on `stream`, and the slice's own stream waits for the kernel, so freeing the slice runs after",
-        "it; a tensor made of a region the host vouched for is tracked by nothing. A launch of slices on a stream that is capturing a",
-        "CUDA graph is an error: capture with `launch_raw` and regions (see `tilefish::Kernel::launch`).",
+        "a cudarc slice is given to cudarc on `stream`; the slice's own stream waits for the kernel, so freeing the slice runs after it,",
+        "and a kernel that writes it first waits for everything enqueued on the slice's own stream. A tensor made of a region the host",
+        "vouched for is tracked by nothing. A launch of slices on a stream that is capturing a CUDA graph is an error: capture with",
+        "`launch_raw` and regions. An `Err` from the driver does not promise that nothing was launched (see `tilefish::Kernel::launch`).",
         "",
         "Every precondition of the binary is checked first (dtype, rank, static sizes, the dimensions against each other, the",
         "bucket, `divisible_by`, 16-byte alignment, `max_elements`, aliasing, the grid against the device); nothing is launched",
