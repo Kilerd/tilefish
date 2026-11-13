@@ -370,6 +370,26 @@ def _mutations():
         ("a kernel that uses shared memory with shared = 0", lambda d: doc(d, lambda v: entry(v, "softmax").update(shared=0))),
         ("an entry twice", lambda d: doc(d, duplicate_entry)),
         ("a missing key", lambda d: text(d, lambda t: t.replace('"symbol": "tf_softmax",', "", 1))),
+        # what schema 3 added
+        ("the schema 3.0, which is 3 to Python and not to a strict host", lambda d: text(d, lambda t: t.replace('"schema": 3,', '"schema": 3.0,', 1))),
+        ("the schema as a string", lambda d: text(d, lambda t: t.replace('"schema": 3,', '"schema": "3",', 1))),
+        ("the schema as true", lambda d: text(d, lambda t: t.replace('"schema": 3,', '"schema": true,', 1))),
+        ("no library section", lambda d: doc(d, lambda v: v.pop("library"))),
+        ("a library section that is not a list", lambda d: doc(d, lambda v: v.update(library={}))),
+        ("a kind that is neither triton nor binary", lambda d: doc(d, lambda v: entry(v, "softmax").update(kind="python"))),
+        ("no kind", lambda d: doc(d, lambda v: entry(v, "softmax").pop("kind"))),
+        ("scratch slots that are not the two of a Triton kernel", lambda d: doc(d, lambda v: entry(v, "softmax")["abi"].update(scratch_slots=3))),
+        ("a prebuilt binary with the settings of Triton", lambda d: doc(d, lambda v: entry(v, "axpy_ptx").update(num_warps=4))),
+        ("a prebuilt binary without its binary section", lambda d: doc(d, lambda v: entry(v, "axpy_ptx").pop("binary"))),
+        ("a binary section that is neither a cubin nor PTX", lambda d: doc(d, lambda v: entry(v, "axpy_ptx").update(binary={"source": "elf"}))),
+        ("a prebuilt binary without the digest of its source", lambda d: doc(d, lambda v: entry(v, "axpy_ptx").pop("source_digest"))),
+        ("a prebuilt binary with the scratch slots of Triton", lambda d: doc(d, lambda v: entry(v, "axpy_ptx")["abi"].update(scratch_slots=2))),
+        ("a library entry with a field more", lambda d: doc(d, lambda v: v["library"][0].update(extra=1))),
+        ("a library entry without its algorithm", lambda d: doc(d, lambda v: v["library"][0].pop("algo"))),
+        ("a library entry with an algorithm that is not 64 bytes of hex", lambda d: doc(d, lambda v: v["library"][0].update(algo="0" * 126))),
+        ("a library entry with leading dimensions that are not the problem's", lambda d: doc(d, lambda v: v["library"][0].update(lda=1))),
+        ("a library entry twice", lambda d: doc(d, lambda v: v["library"].append(dict(v["library"][0])))),
+        ("a library entry and a kernel of one stem and architecture", lambda d: doc(d, lambda v: entry(v, "softmax").update(stem=v["library"][0]["stem"], arch=v["library"][0]["arch"]))),
     ]
 
 

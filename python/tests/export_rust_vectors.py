@@ -13,11 +13,18 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
   order, the edges of the integers, floats, nesting, random strings;
 * ``python_elf.in``: small ELF files (``elf_builder.py``) and their ``code_digest``;
 * ``python_launches.json``: calls on the binaries of ``host_ops.ops()`` (a valid call per size and every single change of one input:
-  dtype, rank, an axis made larger, twice as large or empty, a misaligned address, a tensor too large for 32-bit offsets, an alias) and
+  dtype, rank, an axis made larger, twice as large or empty, a misaligned address, a tensor too large for 32-bit offsets, a tensor with gaps given to a
+  pointer that is dense, an alias; for manifest schema 3 also views with their strides, a size-1 axis, a stride that fits no ``i32`` or ``i64``, the
+  limit of ``max_extent``, addresses of every alignment, device scalars of every shape and dtype, and prebuilt binaries with fixed arguments) and
   what ``runtime._prepare`` of Python decides for each (the grid and the ``kernelParams`` values, or the kind of the refusal), run on
-  fake tensors; the Rust ``Plan::prepare`` must decide the same (``tests/python_launches.rs``);
-* ``python_manifests.in``: small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
-  alphabets) and their ``manifest_digest``, which has its own tag.
+  fake tensors; the Rust ``Plan::prepare`` must decide the same (``tests/python_launches.rs``). A tensor of a record is ``{"ptr", "shape", "dtype"}``, and
+  ``"strides"`` (element strides, as torch reports them; ``ptr`` is the address of the first element) when it is a view; ``params`` are the values of the
+  ``kernelParams``: pointers are addresses, ``i32`` and ``i64`` scalars their integer, a fixed argument its integer or the IEEE bits of an ``f32``, and a Triton
+  kernel's two null scratch slots follow (a prebuilt binary has none);
+* ``python_manifests.in``: ``MANIFESTS``, small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
+  alphabets; schema 3 with kernels and library entries in every order, every field it added, the spelling of floats, non-ASCII text escaped and as it is,
+  and the schemas ``3.0``, ``true``, ``"3"`` and ``4``) and their ``manifest_digest``, which has its own tag per schema; and ``MANIFEST_ERRORS``, documents
+  that ``manifest_digest`` refuses.
 
 The generators are seeded, so the files only change when a format does.
 """
