@@ -113,8 +113,8 @@ fn the_typed_tensors_are_refused_like_the_untyped_one() {
     let r = region(BASE, 16 * 16 * 2, 4);
     let x = TensorRef::<Bf16>::new(r, &shape).unwrap();
     let y = TensorMut::<F16>::new(r, &shape).unwrap();
-    assert_eq!((x.addr(), x.shape(), x.device(), x.elements()), (BASE, &shape[..], 4, 256));
-    assert_eq!((y.addr(), y.device(), y.elements()), (BASE, 4, 256));
+    assert_eq!((x.addr(), x.shape(), x.device(), x.elements()), (BASE, &shape[..], 4, Some(256)));
+    assert_eq!((y.addr(), y.device(), y.elements()), (BASE, 4, Some(256)));
     // the untyped form it turns into is what a launch checks, with what the kernel may do to it
     let arg = x.into_arg();
     assert_eq!(
@@ -135,4 +135,23 @@ fn the_typed_tensors_are_refused_like_the_untyped_one() {
     let second = TensorRef::<F32>::new(rows.slice(1024, 1024).unwrap(), &[16, 16]).unwrap();
     assert_eq!(second.addr(), BASE + 1024);
     assert!(TensorRef::<F32>::new(rows.slice(1024, 1023).unwrap(), &[16, 16]).is_err());
+}
+
+#[test]
+fn the_element_count_of_a_broadcast_view_never_wraps() {
+    // a view broadcast along both axes fits one element of memory, and has more elements than a usize counts: no count, rather than a
+    // panic (a debug build) or a wrapped number (a release build)
+    let r = region(BASE, 4, 0);
+    let (huge, zero) = ([usize::MAX, 2], [0usize, 0]);
+    let x = TensorRef::<F32>::new_strided(r, &huge, &zero, 0).unwrap();
+    assert_eq!(x.elements(), None);
+    let y = TensorMut::<F32>::new_strided(r, &huge, &zero, 0).unwrap();
+    assert_eq!(y.elements(), None);
+    // the largest count that fits is exact, and a size of 0 makes 0 whatever the others are (Python's `math.prod`)
+    let (edge, ones) = ([usize::MAX, 1], [0usize, 0]);
+    assert_eq!(TensorRef::<F32>::new_strided(r, &edge, &ones, 0).unwrap().elements(), Some(usize::MAX));
+    let (empty, strides) = ([usize::MAX, 2, 0], [0usize, 0, 1]);
+    assert_eq!(TensorRef::<F32>::new_strided(r, &empty, &strides, 0).unwrap().elements(), Some(0));
+    // such a view is a tensor like any other for a launch: the checks count its elements exactly, as Python does (`launch_checks.rs`)
+    assert_eq!(x.into_arg().shape(), huge);
 }

@@ -201,14 +201,18 @@ fn a_bucket_is_exact_there_is_no_padding() {
         .prepare(&[t(A, &[3, 96], DType::Bf16), t(B, &[96], DType::Bf16), t(C, &[3, 96], DType::Bf16)], Some(&DEVICE))
         .unwrap();
     assert_eq!(ok.grid, [3, 1, 1]);
-    for db in [95usize, 97, 100, 512] {
+    // a size that is no bucket at all is refused as Python's `check_dim_constraints` refuses it, another bucket as its `select_spec` does
+    for (db, why) in [
+        (95usize, "not one of its buckets"),
+        (97, "not one of its buckets"),
+        (100, "not one of its buckets"),
+        (512, "exactly 96"),
+    ] {
         let e = refused(&plan, &[t(A, &[3, db], DType::Bf16), t(B, &[db], DType::Bf16), t(C, &[3, db], DType::Bf16)]);
         assert_eq!(kind(&e), PreconditionKind::Bucket, "Db = {db}");
         let text = e.to_string();
         assert!(
-            text.contains(&format!("dimension Db is {db}"))
-                && text.contains("exactly 96")
-                && text.contains("no padding"),
+            text.contains(&format!("dimension Db is {db}")) && text.contains(why) && text.contains("no padding"),
             "{e}"
         );
     }
@@ -387,6 +391,45 @@ fn edited(stem: &str, change: impl FnOnce(&mut serde_json::Value)) -> (Copy, Pla
     (copy, plan)
 }
 
+/// The plan of the bucket `Db = 96` of `bucketed_rms` in a copy of the fixture whose entry `change` edited.
+fn edited_bucket(change: impl FnOnce(&mut serde_json::Value)) -> (Copy, Plan) {
+    let copy = Copy::of("sm_103");
+    copy.edit_json(|doc| change(Copy::entry(doc, "bucketed_rms.Db96")));
+    let manifest = Manifest::load(&copy.dir, Pin::TrustDirectory).expect("the edit is a manifest that reads");
+    let plan = manifest.plan("bucketed_rms.Db96", &[("Db", 96)], Arch::sm(103)).unwrap();
+    (copy, plan)
+}
+
+#[test]
+fn a_bucketed_dimension_is_what_the_tensors_say_and_never_taken_from_the_binary() {
+    // bucketed_rms with `Db` only inside a cdiv: no equation binds it, so Python's `solve_dims` finds every call ambiguous (a type error: no
+    // precondition of the binary is broken, the call does not determine the dimensions), whatever the bucket of the binary is
+    let (_copy, plan) = edited_bucket(|e| {
+        for (name, shape) in
+            [("x", r#"["M", "cdiv(Db, 2)"]"#), ("w", r#"["cdiv(Db, 2)"]"#), ("out", r#"["M", "cdiv(Db, 2)"]"#)]
+        {
+            param(e, name)["shape"] = serde_json::from_str(shape).unwrap();
+        }
+    });
+    for db in [48usize, 47, 256] {
+        let (x, w) = ([3, db], [db]);
+        let e = refused(&plan, &[t(A, &x, DType::Bf16), t(B, &w, DType::Bf16), t(C, &x, DType::Bf16)]);
+        assert!(
+            matches!(&e, Error::Launch(m) if m.contains("cannot infer the dimensions in cdiv(Db, 2)") && m.contains("ambiguous")),
+            "{e}"
+        );
+    }
+    // a bucketed dimension that no tensor mentions is not determined by the call either: Python's `select_spec` has no binary for it
+    let (_copy, plan) = edited_bucket(|e| {
+        for (name, shape) in [("x", r#"["M", 96]"#), ("w", "[96]"), ("out", r#"["M", 96]"#)] {
+            param(e, name)["shape"] = serde_json::from_str(shape).unwrap();
+        }
+    });
+    let e = refused(&plan, &[t(A, &[3, 96], DType::Bf16), t(B, &[96], DType::Bf16), t(C, &[3, 96], DType::Bf16)]);
+    assert_eq!(kind(&e), PreconditionKind::Bucket);
+    assert!(e.to_string().contains("dimension Db is not determined by the tensors"), "{e}");
+}
+
 fn param<'a>(entry: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {
     entry["abi"]["params"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == name).expect("a parameter")
 }
@@ -516,19 +559,20 @@ fn shapes_of_two_to_the_sixtieth_and_element_counts_of_two_to_the_sixty_third_ar
     let count = |count: usize| {
         bytes.prepare(&[t(BIG_A, &[count], DType::U8), t(BIG_B, &[count], DType::U8)], Some(&DEVICE)).unwrap_err()
     };
-    // 2^63 - 1 elements (the largest count that fits an i64) get past the count: it is not a multiple of 16
+    // every count is exact, as Python's integers are, and the refusal is the one Python makes first: 2^63 - 1 elements and 2^64 - 1 are
+    // not multiples of 16 (`Count` is declared divisible_by=16), 2^63 and 2^62 are, and then too many for the 32-bit scalar that counts them
+    // (the two tensors of 2^62 bytes and more overlap: the scalar's range is checked before the aliasing, as Python checks it)
     let e = count(i64::MAX as usize);
     assert_eq!(kind(&e), PreconditionKind::Divisible, "{e}");
     assert!(e.to_string().contains("dimension Count is 9223372036854775807"), "{e}");
-    // 2^63 elements are more than 64 bits can count
-    let e = count(1usize << 63);
-    assert_eq!(kind(&e), PreconditionKind::Shape);
-    assert!(e.to_string().contains("more elements than fit 64 bits"), "{e}");
     let e = count(usize::MAX);
-    assert!(e.to_string().contains("more elements than fit 64 bits"), "{e}");
-    // 2^62 elements are a count, and then too many for a 32-bit scalar
-    let e = count(1usize << 62);
-    assert!(e.to_string().contains("32-bit signed"), "{e}");
+    assert_eq!(kind(&e), PreconditionKind::Divisible, "{e}");
+    assert!(e.to_string().contains("dimension Count is 18446744073709551615"), "{e}");
+    for n in [1usize << 63, 1 << 62] {
+        let e = count(n);
+        assert_eq!(kind(&e), PreconditionKind::Shape, "{e}");
+        assert!(e.to_string().contains(&format!("is {n}, which does not fit the 32-bit signed")), "{e}");
+    }
     // the same for two axes: 2^54 rows of 1000 bytes is 1.8e19 elements, 2^53 rows is 9.0e18
     let (_copy, bytes) = edited("softmax", |e| {
         for name in ["x", "out"] {
@@ -541,8 +585,123 @@ fn shapes_of_two_to_the_sixtieth_and_element_counts_of_two_to_the_sixty_third_ar
             .prepare(&[t(LOW, &[rows, 1000], DType::U8), t(HIGH, &[rows, 1000], DType::U8)], Some(&DEVICE))
             .unwrap_err()
     };
-    assert!(rows(1 << 54).to_string().contains("more elements than fit 64 bits"));
-    assert_eq!(kind(&rows(1 << 53)), PreconditionKind::MaxElements);
+    // two tensors of 1.8e19 bytes cannot both fit 64 bits of address space: they overlap, which Python finds before `max_elements`
+    assert_eq!(kind(&rows(1 << 54)), PreconditionKind::Alias);
+    let e = rows(1 << 53);
+    assert_eq!(kind(&e), PreconditionKind::MaxElements);
+    assert!(e.to_string().contains("9007199254740992000 elements"), "{e}");
+}
+
+// -- a call that breaks two preconditions is refused for the one Python finds first -------------------------------------------------------
+
+/// A dense tensor on the device `device`.
+fn on<'a>(device: i32, addr: u64, shape: &'a [usize], dtype: DType) -> TensorArg<'a> {
+    // SAFETY: these addresses are never dereferenced: `prepare` only looks at the number. The region is as long as the tensor.
+    let ptr =
+        unsafe { DevicePtr::from_raw(addr, shape.iter().product::<usize>() as u64 * dtype.size() as u64, device) };
+    TensorArg::new(ptr, shape, dtype, Access::InOut).unwrap()
+}
+
+/// A view (`shape`, element `strides`) whose first element is at `addr`, in a region of 1 MiB.
+fn view<'a>(addr: u64, shape: &'a [usize], strides: &'a [usize], dtype: DType) -> TensorArg<'a> {
+    // SAFETY: as for `t`; the views here reach a few hundred elements, and the region is longer
+    let ptr = unsafe { DevicePtr::from_raw(addr, 1 << 20, 0) };
+    TensorArg::new_strided(ptr, shape, strides, 0, dtype, Access::InOut).unwrap()
+}
+
+#[test]
+fn a_call_that_breaks_two_preconditions_is_refused_for_the_one_python_finds_first() {
+    // what Python's `runtime._prepare` says of each call (on the operators of the fixture, with fake tensors): its checks are, in order, each
+    // tensor it is given (dtype, rank, ...), the binding of the dimensions, their divisible_by and buckets in the order they were bound, the
+    // binary of the bucket, the device, the scalars, their range, the aliasing, then the preconditions of the binary argument by argument
+    let refused_as = |plan: &Plan, tensors: &[TensorArg<'_>]| kind(&refused(plan, tensors));
+
+    // x of layernorm has more elements than i32 offsets reach and w is misaligned: x's max_elements is listed (and checked) before w's
+    // alignment (Python: max_elements)
+    let rows = [3_000_000usize, 768];
+    let call = [
+        t(BIG_A, &rows, DType::Bf16),
+        t(A + 8, &[768], DType::Bf16),
+        t(B, &[768], DType::Bf16),
+        t(BIG_B, &rows, DType::Bf16),
+    ];
+    assert_eq!(refused_as(&typed!(Layernorm), &call), PreconditionKind::MaxElements);
+    // and a misaligned x with a w that is fine: the alignment of x comes first
+    let call = [
+        t(BIG_A + 8, &rows, DType::Bf16),
+        t(A, &[768], DType::Bf16),
+        t(B, &[768], DType::Bf16),
+        t(BIG_B, &rows, DType::Bf16),
+    ];
+    assert_eq!(refused_as(&typed!(Layernorm), &call), PreconditionKind::PointerAlignment);
+
+    // a view of softmax3d broadcast along two axes of 2^62 (2^124 elements, in 127 of memory) whose static axis is 127: its element count is no
+    // reason to refuse it before its sizes are bound (Python: static_size), nor is a size beyond 64 bits. (Rust is given the Out tensor too: a
+    // view, which no memory holds densely, refused after.)
+    let softmax3d = plan("softmax3d", &[]);
+    for (rows, cols) in [(1usize << 62, 1usize << 62), ((1 << 63) + 1, 3)] {
+        let (x, y) = ([rows, cols, 127], [rows, cols, 128]);
+        let strides = if cols == 3 { [0, 128, 1] } else { [0, 0, 1] };
+        let call = [view(A, &x, &strides, DType::F32), view(B, &y, &strides, DType::F32)];
+        assert_eq!(refused_as(&softmax3d, &call), PreconditionKind::StaticSize, "{rows} x {cols}");
+    }
+
+    // masked_rows: the device scalar n_tok has two elements, and y, the Out tensor before it, has the wrong dtype: Python allocates y, so it
+    // finds n_tok (Python: shape)
+    let call = [t(A, &[5, 128], DType::F32), t(B, &[5, 128], DType::F16), t(C, &[2], DType::I32)];
+    assert_eq!(refused_as(&plan("masked_rows", &[]), &call), PreconditionKind::Shape);
+    // gelu_erf with a Count of 60 (not a multiple of 16) and an Out tensor of 61: Python allocates 60 (Python: divisible)
+    let call = [t(A, &[60], DType::Bf16), t(B, &[61], DType::Bf16)];
+    assert_eq!(refused_as(&typed!(GeluErf), &call), PreconditionKind::Divisible);
+
+    // the device is checked once the dtypes, the dimensions and the bucket are (Python: dtype, divisible, bucket), and before the aliasing and
+    // the alignment (Python: device)
+    let axpy = typed!(Axpy);
+    let call = [on(1, A, &[4096], DType::F32), on(0, B, &[4096], DType::F16)];
+    assert_eq!(refused_as(&axpy, &call), PreconditionKind::Dtype);
+    let call = [on(1, A, &[60], DType::F32), on(0, B, &[60], DType::F32)];
+    assert_eq!(refused_as(&axpy, &call), PreconditionKind::Divisible);
+    let call = [t(A, &[3, 100], DType::Bf16), on(1, B, &[100], DType::Bf16), t(C, &[3, 100], DType::Bf16)];
+    assert_eq!(refused_as(&typed!(BucketedRmsDb96), &call), PreconditionKind::Bucket);
+    let call = [on(0, A + 8, &[4096], DType::F32), on(1, B, &[4096], DType::F32)];
+    assert_eq!(refused_as(&axpy, &call), PreconditionKind::Device);
+    let call = [on(0, A, &[4096], DType::F32), on(1, A, &[4096], DType::F32)];
+    assert_eq!(refused_as(&axpy, &call), PreconditionKind::Device);
+}
+
+#[test]
+fn the_order_of_refusals_is_pythons_where_only_an_edited_manifest_can_break_two_preconditions() {
+    let refused_as = |plan: &Plan, tensors: &[TensorArg<'_>]| kind(&refused(plan, tensors));
+    // the dimensions are checked in the order they are bound (M by x's first axis, then Db), and a dimension's divisible_by before its
+    // buckets: bucketed_rms with M declared divisible_by=2, then with Db declared divisible_by=8 (both Python: divisible, from an extern that
+    // declares them so)
+    let call = [t(A, &[3, 100], DType::Bf16), t(B, &[100], DType::Bf16), t(C, &[3, 100], DType::Bf16)];
+    let (_copy, plan) = edited_bucket(|e| e["dims"]["M"]["divisible_by"] = 2.into());
+    let e = refused(&plan, &call);
+    assert_eq!(kind(&e), PreconditionKind::Divisible);
+    assert!(e.to_string().contains("dimension M is 3"), "{e}");
+    let (_copy, plan) = edited_bucket(|e| e["dims"]["Db"]["divisible_by"] = 8.into());
+    let e = refused(&plan, &call);
+    assert_eq!(kind(&e), PreconditionKind::Divisible);
+    assert!(e.to_string().contains("dimension Db is 100"), "{e}");
+
+    // a scalar's divisor (Python's `check_spec_preconditions`) is checked after the aliasing (its `check_no_alias`): axpy whose Count is no
+    // longer declared divisible_by=16 while n_elements keeps its divisor (Python never writes that: it gives a scalar a divisor only for a
+    // dimension declared divisible), with y over x
+    let (_copy, plan) = edited("axpy", |e| e["dims"]["Count"] = serde_json::json!({}));
+    assert_eq!(refused_as(&plan, &[t(A, &[4100], DType::F32), t(A, &[4100], DType::F32)]), PreconditionKind::Alias);
+    assert_eq!(refused_as(&plan, &[t(A, &[4100], DType::F32), t(B, &[4100], DType::F32)]), PreconditionKind::Divisible);
+
+    // the element count a scalar carries is compared once the dimensions are checked (Python's `_finish_launch` after `check_dim_constraints`):
+    // mm with n counting a_ptr, and an MmM of 100 (not a multiple of 128)
+    let (_copy, plan) = edited("mm", |e| {
+        param(e, "n")["dim"] = "MmN".into();
+        param(e, "n")["count_of"] = "a_ptr".into();
+    });
+    let call = [t(A, &[100, 64], DType::F16), t(B, &[64, 256], DType::F16), t(C, &[100, 256], DType::F32)];
+    let e = refused(&plan, &call);
+    assert_eq!(kind(&e), PreconditionKind::Divisible);
+    assert!(e.to_string().contains("dimension MmM is 100"), "{e}");
 }
 
 // -- externs index with i32 unless they declare index_bits=64 -----------------------------------------------------------------------------

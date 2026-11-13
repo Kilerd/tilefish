@@ -643,7 +643,7 @@ impl PlanRun {
         }
 
         // -- the dimensions, bound from the shapes of the parameters (as a single launch binds them), and the bucket
-        let mut dims: Vec<Option<i64>> = vec![None; inner.syms.len()];
+        let mut dims: Vec<Option<i128>> = vec![None; inner.syms.len()];
         let mut pending: Vec<(usize, usize, i64)> = Vec::new();
         for (i, b) in buffers.iter().enumerate().filter(|(_, b)| b.role.is_parameter()) {
             for (axis, size) in tensor(i).shape.iter().enumerate() {
@@ -661,10 +661,8 @@ impl PlanRun {
                 let solved = match pattern.expr.static_value() {
                     // an expression that folds to a constant (`4`, `M - M + 4`) is checked as one
                     Some(expected) if expected == i128::from(actual) => Ok(Solved::Checked),
-                    Some(expected) => {
-                        Err(Unsolvable::Mismatch { expected: i64::try_from(expected).unwrap_or(i64::MAX) })
-                    }
-                    None => pattern.solve_from(actual, &dims, 1),
+                    Some(expected) => Err(Unsolvable::Mismatch { expected }),
+                    None => pattern.solve_from(i128::from(actual), &dims, 1),
                 };
                 match solved {
                     Ok(Solved::Checked) => progress = true,
@@ -690,7 +688,7 @@ impl PlanRun {
                     format!("the dimension {name} of graph '{graph}' is not determined by the externals"),
                 ));
             };
-            if value < 1 || !allowed.contains(&(value as u64)) {
+            let Some(bucket) = u64::try_from(value).ok().filter(|v| *v >= 1 && allowed.contains(v)) else {
                 return Err(Error::precondition(
                     PreconditionKind::Bucket,
                     Some(name),
@@ -699,8 +697,8 @@ impl PlanRun {
                          dimension must equal a bucket exactly (there is no padding: pad or slice in the host)"
                     ),
                 ));
-            }
-            chosen.push((name.as_str(), value as u64));
+            };
+            chosen.push((name.as_str(), bucket));
         }
         let index = plan.bucket_index(&chosen).expect("every combination of the dims is a bucket");
         let Some(bucket) = inner.buckets.iter().position(|b| b.index == index) else {
