@@ -547,8 +547,15 @@ def build(
     ``sha256_code`` is the same. ``cache=False`` neither reads nor writes it. Whatever would make Triton compile something other than the IR is refused:
     its kernel override (``TRITON_KERNEL_OVERRIDE``) and the compile option ``ir_override`` replace the IR of a stage with a
     file, and an active instrumentation plugin patches the passes. A compile option that names a file Triton reads
-    (``extern_libs``), and ``LLVM_PASS_PLUGIN_PATH``, are in the cache key by the sha256 of the content of the file, not
-    by its path.
+    (``extern_libs``), ``LLVM_PASS_PLUGIN_PATH`` and the libdevice file are in the cache key by the sha256 of the content of
+    the file, not by its path, and Triton reads them later, during the compile: they are hashed again afterwards, and a build
+    in which one of them changed is refused and stores nothing (a file rewritten and put back within the compile is not seen).
+
+    **Concurrency.** Triton's frontend and compile are not known to be thread-safe, and a compile runs with a knob set that is
+    process-wide, so a build holds one lock (:data:`tilefish._ir.LOCK`) for the *whole* compile, not only for the frontend. That is
+    a latency trade-off: while one thread compiles (seconds, for a large kernel), every other thread's build, ``jit`` call and
+    replay that needs the frontend waits for it. A cache hit does not compile, but it still runs the frontend (milliseconds) and
+    waits for a compile in progress.
     """
     cap = parse_arch(arch)
     inp = spec.ast_source_inputs()  # raises TilefishSpecError for a spec that is not verified
@@ -572,6 +579,8 @@ def build(
     store = None
     cache_id = ""
     triton_version, ptxas = str(triton.__version__), ptxas_version()
+    environment = _cache.codegen_environment()
+    keyed = _cache.keyed_contents(files, environment)  # the content of every file the binary is identified by: hashed again after the compile
     if cache:
         store = _cache.default_cache()
     if store is not None:
@@ -581,7 +590,7 @@ def build(
             triton_version=triton_version,
             ptxas_version=ptxas,
             options=opts,
-            environment=_cache.codegen_environment(),
+            environment=environment,
             files=files,
         )
         hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
@@ -598,6 +607,13 @@ def build(
             compiled = triton.compile(src, target=GPUTarget("cuda", cap, 32), options=opts)
     except Exception as e:  # noqa: BLE001 - a compile failure of any kind is a build error, with Triton's message
         raise TilefishBuildError(f"Triton could not compile '{spec.stem}' ({spec.triton}) for sm_{cap}: {type(e).__name__}: {e}") from e
+    changed = _cache.changed_contents(keyed, opts)
+    if changed:
+        raise TilefishBuildError(
+            f"'{spec.stem}': {'; '.join(changed)} changed while Triton was compiling it, so the binary may be of the content the "
+            "build was identified by or of the new one, and the cache key (which holds the content of these files) cannot say which: "
+            "the binary was neither returned nor stored. Build again when nothing is rewriting the file"
+        )
     if src.ir_text is None or _ir.ir_digest(src.ir_text) != digest:
         raise TilefishBuildError(
             f"'{spec.stem}': the IR Triton compiled is not the IR whose digest {digest} the build was identified by (Triton's frontend "

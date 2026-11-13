@@ -47,7 +47,9 @@ _TAG = b"tilefish.triton-ir-digest.v1\0"
 # Triton's frontend (the code generator) and its compile are not known to be thread-safe, and the compile runs the frontend again inside
 # ``triton.compile`` (``ASTSource.make_ir``) with a knob set that is process-wide. So there is one lock, held by every run of the frontend
 # here and across the whole of every compile in :func:`tilefish._build.build`: no two frontends ever run at once. (Reentrant, so a
-# frontend inside a compile, which nothing here does, would not deadlock.)
+# frontend inside a compile, which nothing here does, would not deadlock.) This is a latency trade-off, taken on purpose: the lock is
+# held for the *whole* compile, which takes seconds for a large kernel, so a build, a ``jit`` call or a replay in another thread that
+# needs the frontend waits until it is done (a cache hit runs only the frontend, but waits for a compile in progress too).
 LOCK = threading.RLock()
 
 

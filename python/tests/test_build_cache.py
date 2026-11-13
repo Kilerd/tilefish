@@ -1288,6 +1288,67 @@ def test_llvm_pass_plugin_path_is_keyed_by_the_content_of_the_plugin(world, tmp_
     assert compiler.count == 3  # without the plug-in: its own entry
 
 
+FILE_ROUTES = [
+    ("extern_libs", "libdevice.10.bc", "extern_libs.libdevice"),
+    ("LLVM_PASS_PLUGIN_PATH", "plugin.so", "env.LLVM_PASS_PLUGIN_PATH"),
+    ("the libdevice knob", "libdevice.bc", "libdevice"),
+]
+
+
+@pytest.mark.parametrize("cache", [True, False], ids=["cache", "no cache"])
+@pytest.mark.parametrize("route, name, key", FILE_ROUTES, ids=[r[0] for r in FILE_ROUTES])
+def test_a_file_rewritten_between_the_key_and_the_compile_refuses_the_build_and_stores_nothing(world, tmp_path, monkeypatch, route, name, key, cache):
+    """The key holds the content of the files Triton reads, and Triton reads them later, inside the compile: a rewrite in between
+    would store a binary of the new content under the key of the old (and return it)."""
+    project, compiler = world
+    kernel = project.load()
+    library = tmp_path / name
+    library.write_bytes(b"content one")
+    options = {}
+    if route == "extern_libs":
+        options = {"extern_libs": {"libdevice": str(library)}}
+    elif route == "LLVM_PASS_PLUGIN_PATH":
+        monkeypatch.setenv("LLVM_PASS_PLUGIN_PATH", str(library))
+    else:
+        monkeypatch.setattr(sys.modules["triton"].knobs.nvidia, "libdevice_path", str(library))
+    compiler.during = lambda: library.write_bytes(b"content two")  # another process rewrites the file as Triton is about to read it
+    with pytest.raises(TilefishBuildError, match=rf"{re.escape(key)} .*changed while Triton was compiling it.*neither returned nor stored"):
+        build(SPEC, arch="sm_90", fn=kernel, options=options, cache=cache)
+    assert compiler.count == 1 and entries() == []  # compiled once, and nothing was stored
+
+    # the file is stable now: the build succeeds, and is stored under the key of the content it has (not the one before)
+    compiler.during = None
+    built = build(SPEC, arch="sm_90", fn=kernel, options=options, cache=cache)
+    assert built.cubin
+    assert len(entries()) == (1 if cache else 0)
+    if cache:
+        library.write_bytes(b"content one")  # the first content has no entry: it was never stored
+        build(SPEC, arch="sm_90", fn=kernel, options=options)
+        assert compiler.count == 3 and len(entries()) == 2
+
+
+def test_a_file_that_is_removed_during_the_compile_refuses_the_build_too(world, tmp_path):
+    project, compiler = world
+    kernel = project.load()
+    library = tmp_path / "libdevice.10.bc"
+    library.write_bytes(b"one")
+    compiler.during = library.unlink
+    with pytest.raises(TilefishBuildError, match=r"the extern library 'libdevice' .*cannot be read"):
+        build(SPEC, arch="sm_90", fn=kernel, options={"extern_libs": {"libdevice": str(library)}})
+    assert entries() == []
+
+
+def test_a_file_that_is_not_rewritten_is_hashed_twice_and_the_build_is_as_before(world, tmp_path):
+    project, compiler = world
+    kernel = project.load()
+    library = tmp_path / "libdevice.10.bc"
+    library.write_bytes(b"one")
+    options = {"extern_libs": {"libdevice": str(library)}}
+    first = build(SPEC, arch="sm_90", fn=kernel, options=options)
+    assert compiler.count == 1 and len(entries()) == 1 and first.cubin
+    assert _cache.changed_contents(_cache.keyed_contents(_cache.compile_files(options), _cache.codegen_environment()), options) == []
+
+
 def test_an_active_instrumentation_plugin_refuses_the_build(world, monkeypatch):
     """Proton's instrumentation backend patches the passes that lower the IR (``CUDABackend.instrumentation``)."""
     project, compiler = world

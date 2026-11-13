@@ -364,6 +364,21 @@ def test_an_ir_digest_made_by_another_triton_cannot_be_compared_and_needs_a_pin(
         m.built_kernel(spec, "sm_90", ir_digest=None, ir_triton=None)
 
 
+def test_an_entry_that_does_not_record_its_triton_says_so_and_never_says_none(directory):
+    """The toolchain of an entry can be missing (an entry written by hand, or an older tilefish): the message does not read 'built with Triton None'."""
+    spec, _ = specs()
+    edit_manifest(directory, lambda d: d["kernels"][0]["toolchain"].pop("triton"))
+    m = Manifest.load(directory)
+    other = hashlib.sha256(b"printed differently").hexdigest()
+    for digest in (other, None):
+        with pytest.raises(TilefishManifestError) as e:
+            m.built_kernel(spec, "sm_90", ir_digest=digest, ir_triton="3.6.0")
+        message = str(e.value)
+        assert "does not record which Triton built it, and this process has Triton 3.6.0" in message and "cannot be compared" in message
+        assert "Triton None" not in message
+    assert m.built_kernel(spec, "sm_90", ir_digest=other, ir_triton="3.6.0", pinned=True).stem == "scale"
+
+
 def test_a_generated_kernels_entry_records_its_ir_and_is_told_by_its_source_without_triton(tmp_path):
     low = rows_body(2.0).lower()
     (spec,) = low.specs()

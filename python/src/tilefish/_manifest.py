@@ -374,6 +374,11 @@ class Manifest:
             return  # a generated kernel is told by its source, a compared IR digest matched, or the caller vouches for the manifest
         if recorded is None:
             why = unusable
+        elif ir_triton is not None and built_with is None:
+            why = (
+                f"the entry does not record which Triton built it, and this process has Triton {ir_triton}, whose IR for the same "
+                "kernel may print differently from that of the Triton that did, so the two digests cannot be compared"
+            )
         elif ir_triton is not None and ir_triton != built_with:
             why = (
                 f"the entry was built with Triton {built_with}, this process has Triton {ir_triton}, whose IR for the same kernel "

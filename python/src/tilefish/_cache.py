@@ -47,6 +47,10 @@ identifies it; ``extern_libs`` (a compile option, the bitcode libraries that are
 ``TRITON_LIBCUDA_PATH`` (the launcher stub, which tilefish never builds), and ``TRITON_OVERRIDE_DIR`` (read only with the override
 on, which is refused).
 
+A file is read by Triton *after* its hash is in the key, so ``build`` hashes every one of them again once the compile is done
+(:func:`changed_contents`) and refuses the build, storing nothing, when one has changed: a binary compiled while a file was being
+rewritten is not of the content its key says. A file rewritten and put back within the compile is not seen.
+
 A kernel that Triton's frontend cannot build has no digest, so it has no key (``build`` raises). The IR is computed *before* the cache
 is looked up, so the lookup costs a run of the frontend (2 to 4 ms), and a binary is only ever stored under the digest of the IR it
 was compiled from (``build`` compiles from a source that records the IR it was given, and refuses a mismatch).
@@ -266,6 +270,32 @@ def codegen_environment() -> "dict[str, Any]":
         except Exception as e:  # noqa: BLE001
             out["libdevice"] = f"<unreadable: {type(e).__name__}>"
     return out
+
+
+def keyed_contents(files: "Mapping[str, str]", environment: "Mapping[str, Any]") -> "dict[str, str]":
+    """The sha256 of every file that a build's key holds by content, by name: ``files`` (:func:`compile_files`), the files that
+    environment variables name (``env.LLVM_PASS_PLUGIN_PATH``) and the libdevice file (``libdevice``), as
+    :func:`codegen_environment` reports them."""
+    out = dict(files)
+    for name, digest in dict(environment.get("env_files", {})).items():
+        out[f"env.{name}"] = digest
+    if "libdevice" in environment:
+        out["libdevice"] = environment["libdevice"]
+    return out
+
+
+def changed_contents(keyed: "Mapping[str, str]", options: "Mapping[str, Any]") -> "list[str]":
+    """What of ``keyed`` (:func:`keyed_contents`, made when the key was) is not as it was: the files whose content has changed since,
+    and a note when one cannot be read any more. Empty when nothing changed.
+
+    The key says which binary a compile is for by the content of these files, and Triton reads them *later*, inside the compile: a
+    file rewritten in between would give a binary of the new content under the key of the old. Hashing them again afterwards finds
+    that. What it cannot find is a file rewritten and put back within the compile."""
+    try:
+        now = keyed_contents(compile_files(options), codegen_environment())
+    except TilefishBuildError as e:  # a file that was readable when the key was made is not now
+        return [str(e)]
+    return [f"{name} (sha256 {keyed.get(name, 'none')[:12]} then, {now.get(name, 'none')[:12]} now)" for name in sorted({*keyed, *now}) if keyed.get(name) != now.get(name)]
 
 
 def cache_key(

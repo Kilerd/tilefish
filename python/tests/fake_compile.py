@@ -140,6 +140,7 @@ class FakeCompiler:
         self.frontends = 0  # how many times the frontend ran (a compile runs it once, a digest once)
         self.shared = 16
         self.fail = None  # an exception to raise from ``compile``
+        self.during = None  # a function to call when ``compile`` starts: where Triton would read the files an option names
         self.second_ir = None  # a text for the frontend to give the second time it runs (a frontend that is not deterministic)
         self.fail_frontend = None  # an exception for the frontend to raise
         self.delay = 0.0  # seconds a frontend takes (so that two that overlap are seen to)
@@ -152,6 +153,8 @@ class FakeCompiler:
         return len(self.calls)
 
     def compile(self, src, target=None, options=None):
+        if self.during is not None:
+            self.during()
         if self.fail is not None:
             raise self.fail
         options = dict(options or {})
