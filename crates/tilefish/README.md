@@ -88,7 +88,11 @@ The externals are given by the names of the plan's buffers: a parameter by its n
 returns a `WeightedRun`, whose `launch`, `launch_tapped`, `check` and `capture` take the inputs, the `inout` tensors and the outputs only (the
 weights are borrowed for the life of the `WeightedRun`). A plan set (several plans exported together with one manifest, `plans.json` its index)
 loads with one pin: `PlanSet::load(dir, Pin::Digest(set_digest))`, then `set.plan(name)` for each `LaunchPlan`, which share the set's manifest
-(`Manifest` is cheap to clone, and its clones share the modules they load). `PlanRun::launch_tapped` is a launch with debug
+(`Manifest` is cheap to clone, and its clones share the modules they load). Plans of a set that a host runs one at a time share one arena:
+`set.instantiate(&stream, &["a", "b", "c"])` is a `SetRun` whose `run("a")` is a `PlanRun` on one `SharedArena` of the largest plan's bytes (each
+plan at its own offsets; `SharedArena::new` and `LaunchPlan::instantiate_in` for a chosen set of buckets). Every launch, capture and replay of any
+of them is ordered with the others, so they never overlap on the device, and nothing in the arena outlives a launch: a stage's output is the next
+stage's external, in the caller's memory (a tensor in the arena is refused). `PlanRun::launch_tapped` is a launch with debug
 taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a step, with the plan and its digest unchanged (`PlanRun::capture_tapped`
 captures them as memcpy nodes, copied again at every replay). `PlanRun::launch_step` launches one step of a bucket on the caller's tensors, with the
 binary and the binding of the pinned plan (not on a capturing stream).

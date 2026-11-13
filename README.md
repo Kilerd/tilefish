@@ -501,6 +501,15 @@ parameter by its shape, as before (`weight` when it mentions no dimension: every
 plan, their manifest and every binary. A replay takes `plan="build/"` and the set's digest or the plan's; Rust `PlanSet::load(dir, pin)` and
 `set.plan("g2")` (the plans share the manifest and its loaded modules). `docs/plan-schema-1.md`, section 15, says why a set and not a repeated step range.
 
+**An arena shared by the plans of a set.** A host that runs plans of a set one at a time (a request's stage A, then B, then C) can give them one
+arena: `s = tilefish.runtime.share_arena([a, b, c], mode="replay", plan="build/", pin=planset.digest)`, then `s.run(a, x)`, `s.capture(b, ...)`,
+`s.bind_weights(c, {...})`. The arena has the bytes of the largest plan's arena (the gate's transformer block cut into three stages: 9 109 504 bytes
+instead of 26 476 800), each plan's buffers at their own offsets in it, so the documents and their pins are unchanged and every plan captures at
+fixed addresses. Every run, capture and replay of any of the plans is ordered with all the others (one lock, one order event), so two of them never
+overlap on the device; nothing in the arena outlives a run (a value the next plan reads is a returned value, in your tensor), and a tensor of yours
+anywhere in the arena is refused. Rust: `set.instantiate(&stream, &["a", "b", "c"])`, a `SetRun` of `PlanRun`s on one `SharedArena`.
+`docs/plan-schema-1.md`, section 15.1.
+
 **Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
 last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest
 unchanged (`plan.shape_of("t3", M=64)` gives the shape; `tilefish.capture` takes `taps=` too; Rust: `PlanRun::launch_tapped`, and

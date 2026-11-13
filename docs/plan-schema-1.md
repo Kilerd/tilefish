@@ -16,7 +16,7 @@ a manifest entry, checked and made exactly as a single launch is; the plan says 
 
 Contents: 1 what a plan is made of; 2 the top level; 3 the digest and the pin; 4 strict reading; 5 dimensions, buckets and shape expressions; 6 buffers and the
 arena; 7 steps; 8 order, liveness and reuse; 9 what a host does; 10 CUDA graphs; 11 the Python API; 12 what a plan does not do (version 1); 13 an example; 14 where it
-is tested; 15 plan sets (several plans over one manifest).
+is tested; 15 plan sets (several plans over one manifest), 15.1 an arena shared by the plans of a set.
 
 ## 1. What a plan is made of
 
@@ -278,6 +278,8 @@ what it always was.
    the stream. `clear_caches` frees nothing under an execution: it waits for every execution in progress on any thread to have recorded the event (executions, captures and replays hold a
    gate shared, `clear_caches` takes it exclusive, and the executions that start meanwhile wait for it, then allocate and load again), takes each arena's lock, waits for the event
    (`cuEventSynchronize`) before it frees the arena, and synchronizes every context before it unloads the modules. Plans of different layouts have different arenas and are not ordered with each other.
+   **The order is the arena's, not the plan's**: an arena shared by several plans (section 15.1) orders the executions of all of them, with the same lock and the same event
+   (Python) or stream (Rust).
    The Rust host (`PlanRun`, one arena per instantiation) gives the same order: an execution, under the arena's lock, makes its stream wait for what the arena's
    own stream (the one it was allocated on) holds, and makes that stream wait for an event recorded after its last launch (cudarc's events on the arena add the
    rest), so executions of one instantiation on any streams, from any threads, run one after the other in the order they are issued; dropping the last handle of
@@ -352,7 +354,7 @@ whoever holds it, with no lock of the host: item 7 says what its event nodes ord
    between, which writes the slots too, does not change what the graph reads. The Rust host's `CapturedPlan::replay` writes the slots with an asynchronous copy from pinned host memory
    before it launches the graph, whenever they do not hold that graph's values; `CapturedPlan::set_devscalar` changes them.)
 4. **A graph holds addresses, not values**: the externals are the same tensors at every replay (write into them in place), and **the arena of a captured graph is the plan's arena**, the one
-   the uncaptured executions use, at the address the graph holds.
+   the uncaptured executions use, at the address the graph holds (the shared arena, for a plan that runs on one: section 15.1).
 5. **One stream**: the capture is of the stream the steps are launched on; all steps go there. Every execution of one plan in one capture is on one stream: Python refuses a second
    execution of a plan's arena in the same capture (the same `cuStreamGetCaptureInfo` id) on another stream, such as a stream forked from the capturing one, before it enqueues anything
    (its wait node would not depend on the first execution's record node inside the graph, so one replay could run the two at once on the arena; CUDA does not say it orders them, though
@@ -393,6 +395,8 @@ tilefish.runtime.run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay",
 cap = tilefish.capture(graph, *externals, devscalars={"n": 5}, outputs=out) # a CapturedPlan: the plan in a CUDA graph of its own (mode=, plan=, pin= as for run)
 cap.replay(stream=None)                                                     # ordered with every run and replay of the plan, from any thread
 cap.set_devscalar("n", 7)                                                   # the value the next replays write (nothing is enqueued now)
+s = tilefish.runtime.share_arena([g1, g2], mode="replay", plan="build/", pin=planset.digest)  # plans of a set on one arena they share (section 15.1)
+a = s.run(g1, x); y = s.run(g2, a); s.capture(g2, a)                        # one at a time: every run and replay on the arena is ordered with the others
 ```
 
 * `buckets` maps a dimension name to the sizes to plan; it defaults to the dimension's own `buckets=` and is required for a dimension that has none. `reuse` defaults to `False`.
@@ -480,6 +484,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | on a GPU: replay == jit == per-op eager, replay vs reference, CUDA graph capture, tampering, the arena | `test_gpu_plan.py` |
 | on a GPU: runs of one plan on two streams (the race of the review, 0 of 20 rounds corrupted), from two threads, and replays of a captured graph between runs on other streams | `test_gpu_plan_streams.py` |
 | plan sets: one manifest, `<graph>.plan.json` per graph, the index `plans.json`, either pin (section 15) | `test_plan_sets.py`; the golden set `golden/plans/set` (`launch_plans.rs`); on a GPU `test_gpu_plan_sets.py` and `gpu_plan_gate.rs` (`a_plan_set_is_loaded_with_one_pin_and_its_plans_give_pythons_bytes`) |
+| an arena shared by the plans of a set: its size and layout, the one order, the refusals, the pin (section 15.1) | `test_shared_arena.py`; `test_plan_fixtures.py` and `launch_plans.rs` (`shared_arena_bytes` of the golden set); on a GPU `test_gpu_shared_arena.py` (the stages of the block on one arena: the bytes of separate arenas and of the block, captured, in a torch graph; two plans racing on two streams, 0 of 10 rounds wrong, 10 of 10 without the order event) and `gpu_plan_gate.rs` (`the_plans_of_a_set_on_one_shared_arena_...`, `launches_and_replays_of_different_plans_of_a_shared_arena_...`, `a_shared_arena_refuses_...`) |
 | **golden fixtures for a second implementation**: three plan directories (`manifest.json`, cubins and `plan.json`): the transformer block, without and with reuse, and `steps` (a result written over its input, two copy steps, a returned reshape, named outputs); `expected.json` with the plan digest, the manifest digest, the arena size, every arena offset and the outputs that a reader must reproduce from the files alone | `golden/plans/` (written by `export_plan_fixtures.py`, no GPU needed), `test_plan_fixtures.py` |
 
 The cubins of the golden fixtures are fake (a tiny ELF file per kernel entry, a made-up algorithm per GEMM): the format, the digests and the plan are real, so a reader can be checked against them; they cannot be launched.
@@ -516,3 +521,49 @@ Why sets and not a plan whose steps repeat: a repeated step range would need loo
 reads and writes, the views of each iteration, the step a tap or `run_step` names), and a stage whose tiles are not all alike (a last partial tile has
 other shapes) is not a repetition of one range; one plan per key keeps every plan a straight list whose every launch is checked before the first,
 and the set removes what was duplicated, the binaries and the pins.
+
+### 15.1 An arena shared by the plans of a set
+
+A host that runs several plans **one at a time** (a request's stage A, then B, then C; a variable number of tile plans) needs no arena per plan:
+the plans can share one. **It is a choice of the host, not part of any document**: every plan, its digest, the index and its digest are what
+they were.
+
+* **The layout.** The shared arena has `max(arena_bytes)` bytes over the plans that share it (the plans the host names: all of a set's, or
+  some of them), allocated once and aligned to 256 as any arena. **Each plan keeps its own memory plan in it, from the first byte**: buffer `b`
+  of plan `P` is at `arena + offset(P, b)`, exactly as on an arena of its own, so every rule of section 6 holds of each plan, and each plan is
+  captured in CUDA graphs at fixed addresses (section 10). The regions of different plans overlap: their intermediates, device-scalar slots and
+  cuBLASLt workspaces share bytes. So the arena holds each plan's workspace (at that plan's offset, with at least what every library step of the
+  plan declares, section 7.3): in effect one workspace, the largest of the plans', and the device-scalar slots the same way. The gate's three
+  stages of the transformer block (`plan_model.STAGES`) have arenas of 8 782 080, 8 585 216 and 9 109 504 bytes, and share one of 9 109 504
+  (three arenas: 26 476 800).
+* **Why that is sound: the order.** Two executions that use one arena must not overlap on the device (section 9, step 1), and that is said of
+  the arena, whatever plans run on it: a host orders **every execution on the shared arena, of any of its plans** (a run, a capture, the replay of
+  a host-owned graph, a step alone) with every other, under one lock and one order (Python: the arena's one order event; Rust: its one stream),
+  so the executions of two plans of the arena cannot run concurrently, from any threads and on any streams. A replay of plan A's graph is
+  ordered with every run and replay of plan B. Then an execution finds in the arena whatever the one before it left, and needs nothing of it: it
+  writes every arena buffer it reads before it reads it (an intermediate, section 7.3; a device scalar's slot, before the first launch, section
+  9 step 4; the workspace is a GEMM's scratch). A graph the caller owns (`torch.cuda.graph`) takes its place in the arena's order as section 10,
+  item 7 says, with the same caveats; two executions on the arena in one capture on two streams are refused (item 5). (The Rust host writes the
+  device scalars of a host-owned graph's replay again whenever another execution on the arena, of any plan, may have written over them.)
+* **What outlives an execution: nothing in the arena.** A value one plan makes and a later plan reads is a **returned value** of the first, an
+  external in the caller's memory (role `output`: Python allocates it or takes `outputs=`, Rust takes the caller's), given as a parameter of the
+  second. There are no buffers "carried" in the arena from one plan to the next: a plan's results are externals already (so nothing is new in the
+  documents); a carried region would have to be placed where no later plan writes, a layout of the combination that depends on which plans run
+  in which order and would have to be in the index and its digest; and it would save nothing over a tensor of the caller's, which is allocated
+  once and used again as well. **What would be overwritten is refused, never corrupted**: a tensor of the caller that overlaps the shared arena
+  *anywhere* (not only the part of the plan that runs: the next plan writes the rest) is refused with the kind `alias` before anything is
+  launched, whether it is an external, a tap's tensor or a tensor of a step alone (section 9).
+* **The pin.** The layout of a shared arena is a function of the plans' documents (their `arena_bytes` and offsets), which their digests cover,
+  which the set's digest covers: **the set's pin covers the shared arena**, and `plans.json` has nothing new. A plan file edited to say another
+  layout is refused by the pin before an arena is sized from it. `expected.json` of the golden fixtures has each plan's `arena_bytes` and the
+  `shared_arena_bytes` of the golden set, which a reader reproduces from the files.
+
+Hosts. Python: `s = tilefish.runtime.share_arena([g1, g2, g3], mode="replay", plan="build/", pin=planset.digest)` (in `jit` the items are graphs
+or the `Plan`s `tilefish.plan` made), then `s.run(g1, *args, outputs=, taps=)`, `s.capture(g2, *externals, devscalars=, outputs=)`,
+`s.bind_weights(g3, {...})`, `s.run_step(g1, step, buffers)`, `s.prepare()`; `s.arena_bytes`, `s.sizes` (each plan's `arena_bytes`). Python keeps
+arenas per layout, as for one plan: every `SharedArena` of the same plans on one device is one arena, kept until `clear_caches`, and a plan run
+alone (`tilefish.run`) has its own. Rust: `let runs = set.instantiate(&stream, &["g1", "g2", "g3"])?` (a `SetRun`: `runs.run("g1")?` is a
+`PlanRun` on the shared arena, `runs.arena()` the `SharedArena`), or `SharedArena::new(&stream, &[&p1, &p2])` and `p1.instantiate_in(&arena,
+values)` / `instantiate_all_in(&arena)`, which refuse a plan the arena was not made for (by digest); every Rust `SharedArena` is an arena of its
+own (a host with several lanes makes one per lane). `PlanSet::shared_arena_bytes(names)` and `SharedArena::bytes_for(plans)` give the size with no
+GPU.
