@@ -122,7 +122,7 @@ The Python side has three modes:
 |---|---|---|
 | `jit` | the current source, built through its compile spec (the path of the build) in memory and launched through the CUDA driver | iterating on a kernel |
 | `reference` | the same bodies interpreted with torch | an oracle, compared within a tolerance |
-| `replay` | the prebuilt cubins of a manifest directory, checked against its digests, through the CUDA driver; the directory is trusted unless you pin its digest | the exact machine code the C++ and Rust hosts run |
+| `replay` | the prebuilt cubins of a manifest directory, checked against its digests, through the CUDA driver; it needs a trust anchor, the manifest's pinned digest or an explicit `trust_directory=True` | the exact machine code the C++ and Rust hosts run |
 
 ```python
 y = tilefish.run(residual_add_rmsnorm, x, residual, w)                        # jit
@@ -164,11 +164,25 @@ on a B300, once per process for `jit`).
 
 **Any edit to a file a hand-written kernel reaches, a comment included, means
 exporting again and pinning the new manifest.** The digest is of the files on
-disk, so a process that edited a file after importing it must reload before it
-builds (a build refuses a function whose imported lines are not the file's), and
-it does not see a value that a program assigned to a module attribute at run
-time. `build` also refuses source that is not its spec's: a stale
-`LoweredKernel.write` output on `sys.path`, or another function passed as `fn`.
+disk, and Triton compiles what the process holds, so no digest is made of a file
+the process holds in another version. `import tilefish` starts recording the
+files of the modules imported after it, and `jit`, `export` and `replay` of a
+hand-written kernel raise "module X changed on disk since it was imported;
+reload it or restart" when a module the kernel reaches was edited and not
+reloaded (in a notebook, say), whichever module it is, a helper two levels
+away included. It compares the content of the file, so a save without a change
+passes, and a module that was imported before `import tilefish` is compared by
+size and modification time only (`tilefish/_source.py` lists what the check does
+not see: an edit between a module's import and `import tilefish`, a module no
+source loader executed, a stale same-second `.pyc`). **Kernel inputs come from
+source files, not from module state a program assigns at run time**
+(`cfg.SCALE = 5.0`, `monkeypatch.setattr`): a build refuses a constant that a
+kernel function reads and that was reassigned since its module was imported
+(scalars and Triton constants; not a container changed in place or an attribute
+of an instance), and a constant that is not in a file could not be described by
+any source digest, cache entry or manifest. `build` also refuses source that is
+not its spec's: a stale `LoweredKernel.write` output on `sys.path`, or another
+function passed as `fn`.
 
 `replay` also refuses `shared` memory the cubin and the device cannot have (the
 driver's static shared memory of the function plus the manifest's dynamic size
