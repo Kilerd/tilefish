@@ -25,7 +25,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, sys};
 use serde_json::Value;
 use tilefish::{
     Access, Bf16, BufferRole, DType, DevScalar, DevicePtr, Element, Error, F16, F32, I32, I64, LaunchPlan, Pin,
-    PreconditionKind, Tap, TensorArg, TensorMut, TensorRef, U8, plan_digest,
+    PlanSet, PreconditionKind, Tap, TensorArg, TensorMut, TensorRef, U8, plan_digest,
 };
 
 fn gate_dir() -> PathBuf {
@@ -598,6 +598,52 @@ fn weights_bound_once_give_pythons_bytes() {
         );
     }
     println!("rust plan gate: {} cases launched and replayed with the weights bound once", cases.len());
+}
+
+/// A plan set (`set-tiles1..3`: one stage per key, 2, 3 and 4 steps, one manifest): `PlanSet::load` with the set's pin loads and verifies the
+/// manifest once, every plan comes from it with the digest the index lists (sharing that manifest), and every case of every plan, launched, is
+/// Python's bytes; a wrong pin of the set is refused.
+#[test]
+fn a_plan_set_is_loaded_with_one_pin_and_its_plans_give_pythons_bytes() {
+    let gpu = Gpu::new();
+    let members: Vec<Value> = plans().into_iter().filter(|p| p.get("set").is_some()).collect();
+    assert_eq!(members.len(), 3, "the gate's plan set has three plans");
+    let set_dir = gate_dir().join(members[0]["set"].as_str().unwrap());
+    let set = PlanSet::load(&set_dir, Pin::Digest(members[0]["set_digest"].as_str().unwrap()))
+        .expect("the set loads with its pin");
+    assert_eq!(set.names().collect::<Vec<_>>(), ["tiles1", "tiles2", "tiles3"]);
+    let stems: Vec<&str> = set.manifest().entries().iter().map(|e| e.stem.as_str()).collect();
+    assert_eq!(stems, ["halve", "scale_add"], "one entry per binary for the three plans");
+    let mut cases = 0;
+    for member in &members {
+        let plan = set.plan(member["graph"].as_str().unwrap()).unwrap();
+        assert_eq!(plan.digest(), member["digest"].as_str().unwrap());
+        let run = plan.instantiate_all(&gpu.stream).unwrap();
+        for case in member["cases"].as_array().unwrap() {
+            let id = case["id"].as_str().unwrap();
+            let mut exts = upload(&gpu.stream, case);
+            run.launch(&gpu.stream, &mut args(&mut exts, false), &named(&devscalars(case)))
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+            gpu.stream.synchronize().unwrap();
+            for e in exts.iter().filter(|e| e.expect.is_some()) {
+                let got = gpu.stream.clone_dtoh(&e.slice).unwrap();
+                assert!(
+                    got == *e.expect.as_ref().unwrap(),
+                    "{id}: '{}' differs in {} bytes",
+                    e.name,
+                    differing(&got, e.expect.as_ref().unwrap())
+                );
+            }
+            cases += 1;
+        }
+    }
+    let e = PlanSet::load(&set_dir, Pin::Digest(&"0".repeat(64))).unwrap_err();
+    assert!(matches!(e, Error::PlanPinMismatch { .. }), "{e}");
+    println!(
+        "rust plan gate: a plan set of {} plans over one manifest of {} entries: {cases} cases launched, Python's bytes",
+        members.len(),
+        stems.len()
+    );
 }
 
 fn upload_inputs(case: &Value) -> std::collections::HashMap<String, Vec<u8>> {

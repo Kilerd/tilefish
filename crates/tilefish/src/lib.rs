@@ -260,6 +260,7 @@ mod manifest;
 mod memory;
 mod plan;
 mod plan_run;
+mod plan_set;
 mod region;
 mod tensor;
 
@@ -281,6 +282,7 @@ pub use manifest::{
 pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, Plan, Prepared};
 pub use plan_run::{CapturedPlan, DevScalar, PlanRun, Tap, WeightedRun};
+pub use plan_set::{PLAN_SET_NAME, PLAN_SET_SCHEMA, PlanSet, plan_file_name, plan_set_digest};
 pub use region::DevicePtr;
 pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, Readable, TensorArg, TensorMut, TensorRef, U8};
 

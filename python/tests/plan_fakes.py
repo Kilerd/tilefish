@@ -33,3 +33,15 @@ def builds(plan, arch=ARCH):
 def export(plan, directory, *, arch=ARCH, overwrite=False):
     kernels, library = builds(plan, arch)
     return _planrun.write_export(plan, kernels, library, directory, arch, overwrite)
+
+
+def export_set(plans, directory, *, arch=ARCH, overwrite=False):
+    """A plan set of ``plans`` (one manifest, each binary once) the way ``tilefish.runtime.export([g1, g2, ...])`` writes it, with the fake builds."""
+    kernels, library = {}, {}
+    for plan in plans:
+        k, lib = builds(plan, arch)
+        for b in k:
+            kernels.setdefault(b.spec.stem, b)
+        for b in lib:
+            library.setdefault(b.spec.stem, b)
+    return _planrun.write_plan_set(plans, list(kernels.values()), list(library.values()), directory, arch, overwrite)

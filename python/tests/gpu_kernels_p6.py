@@ -55,3 +55,37 @@ def two_scales(x: Tensor[Rg, 64, f32]):
     """``(x * 3 - 2) * -1 + Rg``: one binary launched twice, with the values each call gives (the second ``c`` is the bucket's ``Rg``)."""
     a = scale_add(x.reshape(Rg * 64), k=3, c=-2)
     return scale_add(a, k=-1, c=Rg).reshape(Rg, 64)
+
+
+# -- a plan set: one graph per key, the launch count depending on the key, one manifest ----------------------------------------------------
+
+Nh = Dim("Nh")
+
+
+@tilefish.kernel
+def halve(x: Tensor[Nh, f32]) -> Tensor[Nh, f32]:
+    return x * 0.5
+
+
+def tile_chain(tiles):
+    """A stage whose launch count depends on its key: ``tiles`` launches of ``scale_add`` over ``[tiles * 64]`` (the ``i``-th with ``c = i``), then
+    ``halve``. One graph per key; exported together (``tilefish.runtime.export([...])``) they are a plan set with one manifest, in which ``scale_add``
+    and ``halve`` have one entry each, whatever the number of plans."""
+    n = tiles * 64
+
+    def body(x: Tensor[n, f32]):
+        y = x
+        for i in range(tiles):
+            y = scale_add(y, k=2, c=i)
+        return halve(y)
+
+    return tilefish.graph(body, name=f"tiles{tiles}", inputs=("x",))  # a static graph: without the declaration x would be labelled a weight
+
+
+def tile_chain_reference(x, tiles):
+    for i in range(tiles):
+        x = scale_add_reference(x, 2, i)
+    return x * 0.5
+
+
+TILES = {t: tile_chain(t) for t in (1, 2, 3)}

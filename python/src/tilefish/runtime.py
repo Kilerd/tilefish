@@ -790,6 +790,11 @@ def export(
     hand-written kernel must be the ones the process imported (see :func:`tilefish.aot.build`). Files are written
     through temporary files and renamed, and a symbolic link where a file goes is refused.
 
+    A graph exports its launch plan (``plan.json`` next to the manifest; returns the :class:`~tilefish._plan.Plan`); **several graphs** (or
+    ``(graph, buckets)`` pairs) export a *plan set*: one manifest for all of them, each binary built once whichever plans launch it,
+    ``<graph>.plan.json`` per graph and ``plans.json``, the index whose digest pins every plan (returns the :class:`~tilefish._plan.PlanSet`; a replay
+    takes ``plan=directory`` and ``pin=`` the plan's digest or the set's).
+
     A library op with an ``impl`` (a cuBLASLt GEMM) is pinned for the device (``arch`` must be its architecture) and gets an entry in the manifest's
     ``library`` section; a prebuilt PTX is assembled by ``ptxas`` and a cubin is taken as it is (:mod:`tilefish._binary`).
 
@@ -800,13 +805,22 @@ def export(
     must have the same digest, or this raises :class:`~tilefish.errors.TilefishManifestError`.
     """
     items = list(ops) if isinstance(ops, (list, tuple)) else [ops]
-    graphs = [o for o in items if isinstance(o, GraphOp) and not isinstance(o, KernelOp)]
-    if graphs:
-        if len(items) != 1:
-            raise TilefishRuntimeError("export takes one graph by itself (its manifest holds the binaries of its plan); export the other operators separately")
+    is_graph = [
+        (isinstance(o, GraphOp) and not isinstance(o, KernelOp))
+        or (isinstance(o, tuple) and len(o) == 2 and isinstance(o[0], GraphOp) and not isinstance(o[0], KernelOp))
+        for o in items
+    ]
+    if any(is_graph):
+        if not all(is_graph):
+            raise TilefishRuntimeError("export takes graphs, or kernels and externs, not both (a manifest of a plan holds the binaries of its plans); export them separately")
+        if len(items) > 1:  # a plan set: one manifest for every plan (docs/plan-schema-1.md, section 15)
+            from ._planrun import export_graphs
+
+            return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse)
         from ._planrun import export_graph
 
-        return export_graph(graphs[0], directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse)
+        graph, own = items[0] if isinstance(items[0], tuple) else (items[0], buckets)
+        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse)
     if buckets is not None or reuse:
         raise TilefishRuntimeError("buckets= and reuse= are for exporting a graph (they shape its launch plan); kernels and externs are built for the buckets of their own dimensions")
     if arch is None:

@@ -894,6 +894,7 @@ class Plan:
         self._layout: "str | None" = None
         self.directory: "pathlib.Path | None" = None  # where it was exported to or loaded from (a plan that was only made has none)
         self.manifest: Any = None  # the verified manifest of that directory (:class:`~tilefish.Manifest`)
+        self.set_digest: "str | None" = None  # the digest of the plan set it was loaded through, when that was the pin
 
     # -- what the document says -------------------------------------------------------------------------------------------------
 
@@ -1623,9 +1624,24 @@ def load_plan(path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" =
         raise TilefishPlanError(f"a plan is loaded for a @tilefish.graph, got {graph!r}")
     path = pathlib.Path(path)
     directory = path if path.is_dir() else path.parent
+    if path.is_dir() and (directory / plan_file_name(graph.graph.name)).is_file():  # a directory of a plan set: the graph's own file
+        path = directory / plan_file_name(graph.graph.name)
+    set_pin = None
+    if pin is not None and (directory / PLAN_SET_NAME).is_file():  # the pin may be the digest of the plan set that lists this plan
+        index = read_plan_set(directory)
+        if index["set_digest"] == pin:
+            listed = index["plans"].get(graph.graph.name)
+            if listed is None:
+                raise TilefishManifestError(
+                    f"the plan set in {str(directory)!r} (the one pinned) lists no plan of graph '{graph.graph.name}'; it has {_brief(sorted(index['plans']))}"
+                )
+            set_pin, pin = pin, listed
+            path = directory / plan_file_name(graph.graph.name)
     doc = read_plan(path, pin=pin)
     if doc["graph"] != graph.graph.name:
         raise TilefishManifestError(f"the plan in {str(directory)!r} is the plan of graph '{doc['graph']}', not of '{graph.graph.name}'")
+    if set_pin is not None and doc["manifest_digest"] != index["manifest_digest"]:
+        raise TilefishManifestError(f"the plan of graph '{graph.graph.name}' was built against the manifest {doc['manifest_digest']}, not the one of its plan set")
     manifest = Manifest.load(directory)
     check_against_manifest(doc, manifest)
     try:
@@ -1644,8 +1660,124 @@ def load_plan(path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" =
     loaded = derived.with_document(doc)
     loaded.directory = directory
     loaded.manifest = manifest
+    loaded.set_digest = set_pin
     manifest.pinned = pin is not None
     return loaded
+
+
+# -- a plan set: several plans over one manifest ----------------------------------------------------------------------------------------
+
+PLAN_SET_SCHEMA = "tilefish.plan-set.v1"
+PLAN_SET_NAME = "plans.json"
+SET_DIGEST_TAG = b"tilefish.plan-set-digest.v1\0"
+SET_KEYS = "schema tilefish arch manifest_digest plans set_digest".split()
+MAX_PLANS = 1 << 16
+
+
+def plan_file_name(graph: str) -> str:
+    """The file of the plan of graph ``graph`` in a directory of a plan set: ``<graph>.plan.json``, next to the shared ``manifest.json``."""
+    return f"{graph}.plan.json"
+
+
+def set_digest(doc: "Mapping[str, Any]") -> str:
+    """``sha256(b"tilefish.plan-set-digest.v1\\0" + canonical_json(doc without "set_digest" and "tilefish"))``: the digest of a plan set's index
+    (``plans.json``), which lists the digest of every plan, so pinning it pins every plan of the set, their one manifest and every binary."""
+    try:
+        body = {k: v for k, v in doc.items() if k not in ("set_digest", "tilefish")}
+        text = json.dumps(body, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (ValueError, TypeError, AttributeError, RecursionError) as e:
+        raise TilefishManifestError(f"the plan set cannot be digested, it is not plain JSON data: {type(e).__name__}: {str(e)[:200]}") from e
+    return hashlib.sha256(SET_DIGEST_TAG + text.encode("utf-8")).hexdigest()
+
+
+def validate_set(doc: Any) -> None:
+    """The rules of a plan set's index: exactly its keys, the schema, an architecture, the manifest's digest, and a non-empty object of graph names
+    (identifiers) to plan digests."""
+
+    def bad(message: str) -> Any:
+        raise TilefishManifestError(f"plans.json: {message[:1000]}")
+
+    if not isinstance(doc, dict):
+        bad(f"the document must be an object, got {type(doc).__name__}")
+    missing, unknown = [k for k in SET_KEYS if k not in doc], sorted(str(k) for k in set(doc) - set(SET_KEYS))
+    if missing or unknown:
+        bad(f"the document must have exactly the fields {SET_KEYS}" + (f"; missing {missing}" if missing else "") + (f"; unknown {unknown}" if unknown else ""))
+    if type(doc["schema"]) is not str or doc["schema"] != PLAN_SET_SCHEMA:
+        bad(f"schema must be the string {PLAN_SET_SCHEMA!r}, got {doc['schema']!r}")
+    if not isinstance(doc["tilefish"], str):
+        bad("tilefish must be a string")
+    if not isinstance(doc["arch"], str) or not _ARCH.match(doc["arch"]):
+        bad(f"arch must look like 'sm_103', got {doc['arch']!r}")
+    for key in ("manifest_digest", "set_digest"):
+        if not (isinstance(doc[key], str) and _HEX64.match(doc[key])):
+            bad(f"{key} must be 64 lowercase hex digits (a sha256), got {doc[key]!r}")
+    plans = doc["plans"]
+    if not isinstance(plans, dict) or not plans or len(plans) > MAX_PLANS:
+        bad(f"plans must be a non-empty object of at most {MAX_PLANS} graph names to plan digests")
+    for name, digest in plans.items():
+        if not _NAME.match(name) or not (isinstance(digest, str) and _HEX64.match(digest)):
+            bad(f"plans maps graph names (identifiers) to plan digests (64 lowercase hex digits), got {name!r}: {digest!r}")
+
+
+def read_plan_set(directory: "str | pathlib.Path", *, pin: "str | None" = None) -> "dict[str, Any]":
+    """Read the index of a plan set (``<directory>/plans.json``): strict JSON, its digest against ``pin`` when given and against the ``set_digest`` it
+    carries, then :func:`validate_set`. Returns the document. Raises :class:`~tilefish.errors.TilefishManifestError`."""
+    from ._manifest import _no_duplicate_keys, _parse_float, _reject_constant
+
+    file = pathlib.Path(directory) / PLAN_SET_NAME
+    try:
+        if file.is_symlink():
+            raise TilefishManifestError(f"{str(file)!r} is a symbolic link; refusing to read through it")
+        size = file.stat().st_size
+        if size > MAX_PLAN_BYTES:
+            raise TilefishManifestError(f"the plan set {str(file)!r} is {size} bytes, more than the {MAX_PLAN_BYTES} it may have")
+        text = file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise TilefishManifestError(f"cannot read the plan set {str(file)!r}: {e}") from e
+    try:
+        doc = json.loads(text, parse_constant=_reject_constant, parse_float=_parse_float, parse_int=_parse_int, object_pairs_hook=_no_duplicate_keys)
+    except RecursionError as e:
+        raise TilefishManifestError(f"the plan set {str(file)!r} is nested too deeply to be read") from e
+    except TilefishManifestError:
+        raise
+    except ValueError as e:
+        raise TilefishManifestError(f"the plan set {str(file)!r} is not valid JSON: {e}") from e
+    if not isinstance(doc, dict) or type(doc.get("schema")) is not str or doc["schema"] != PLAN_SET_SCHEMA:
+        raise TilefishManifestError(f"{str(file)!r} is not a tilefish plan set of schema {PLAN_SET_SCHEMA!r}")
+    if pin is not None and not (isinstance(pin, str) and _HEX64.match(pin)):
+        raise TilefishManifestError(f"pin= is the 64 lowercase hex digits of a plan set digest, got {pin!r}")
+    found = set_digest(doc)
+    if pin is not None and found != pin:
+        raise TilefishManifestError(f"the plan set in {str(file)!r} has digest {found}, but the pin is {pin}: it is not the plan set that was pinned")
+    if doc.get("set_digest") != found:
+        raise TilefishManifestError(f"the plan set in {str(file)!r} was edited: its set_digest says {doc.get('set_digest')!r}, but its content has digest {found}")
+    validate_set(doc)
+    return doc
+
+
+class PlanSet:
+    """Several plans exported to one directory with **one manifest** (``tilefish.runtime.export([g1, g2, ...], directory)``): ``<graph>.plan.json`` per
+    graph and ``plans.json``, the index that lists the digest of every plan. ``digest`` (the index's ``set_digest``) pins every plan, their manifest and
+    every binary; ``plans`` are the plans loaded back (``plans["g1"]``, each also pinned by its own digest)."""
+
+    def __init__(self, doc: "dict[str, Any]", directory: pathlib.Path, plans: "dict[str, Plan]") -> None:
+        self.doc = doc
+        self.directory = directory
+        self.plans = plans
+
+    @property
+    def digest(self) -> str:
+        return self.doc["set_digest"]
+
+    @property
+    def manifest_digest(self) -> str:
+        return self.doc["manifest_digest"]
+
+    def __getitem__(self, name: str) -> Plan:
+        return self.plans[name]
+
+    def __repr__(self) -> str:
+        return f"<PlanSet of {len(self.plans)} plans, manifest {self.manifest_digest[:12]}, digest {self.digest[:12]}>"
 
 
 MAX_INT = 1 << 53  # the integers a double holds exactly: a plan number is read as one in every language

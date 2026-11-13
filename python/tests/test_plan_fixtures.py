@@ -32,7 +32,7 @@ def without_version(path):
 def test_the_committed_fixtures_are_what_the_code_makes(committed, tmp_path):
     made = fx.export_all(tmp_path)
     assert made == committed
-    for name in fx.PLANS:
+    for name in [*fx.PLANS, fx.SET]:
         assert sorted(f.name for f in (tmp_path / name).iterdir()) == sorted(f.name for f in (fx.DEFAULT / name).iterdir())
         for f in sorted((fx.DEFAULT / name).iterdir()):
             if f.suffix == ".json":

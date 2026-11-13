@@ -86,7 +86,9 @@ The externals are given by the names of the plan's buffers: a parameter by its n
 (`LaunchPlan::output_buffer`), so a host written before graphs named their outputs keeps working. A plan whose graph declares its roles
 (`@tilefish.graph(inputs=..., weights=...)`, `LaunchPlan::roles_declared`) has its weights bound once: `PlanRun::bind_weights` checks them and
 returns a `WeightedRun`, whose `launch`, `launch_tapped`, `check` and `capture` take the inputs, the `inout` tensors and the outputs only (the
-weights are borrowed for the life of the `WeightedRun`). `PlanRun::launch_tapped` is a launch with debug
+weights are borrowed for the life of the `WeightedRun`). A plan set (several plans exported together with one manifest, `plans.json` its index)
+loads with one pin: `PlanSet::load(dir, Pin::Digest(set_digest))`, then `set.plan(name)` for each `LaunchPlan`, which share the set's manifest
+(`Manifest` is cheap to clone, and its clones share the modules they load). `PlanRun::launch_tapped` is a launch with debug
 taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a step, with the plan and its digest unchanged. `PlanRun::launch_step`
 launches one step of a bucket on the caller's tensors, with the binary and the binding of the pinned plan.
 

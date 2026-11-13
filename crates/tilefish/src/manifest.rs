@@ -546,14 +546,17 @@ impl Entry {
 }
 
 /// The binaries of a manifest directory, verified when it is loaded.
-#[derive(Debug)]
+///
+/// Cheap to clone: the clones share the entries and what was loaded from them (a module per context, a GEMM per context), so the plans of one
+/// plan set (`PlanSet`, or [`LaunchPlan::load_with_manifest`](crate::LaunchPlan::load_with_manifest)) load each binary once per context.
+#[derive(Debug, Clone)]
 pub struct Manifest {
     pub(crate) label: String,
     pub(crate) digest: String,
-    pub(crate) entries: Vec<Entry>,
-    pub(crate) library: Vec<LibraryEntry>,
-    pub(crate) kernels: Mutex<HashMap<(usize, usize), Cached>>,
-    pub(crate) gemms: Mutex<HashMap<(usize, usize), CachedGemm>>,
+    pub(crate) entries: Arc<Vec<Entry>>,
+    pub(crate) library: Arc<Vec<LibraryEntry>>,
+    pub(crate) kernels: Arc<Mutex<HashMap<(usize, usize), Cached>>>,
+    pub(crate) gemms: Arc<Mutex<HashMap<(usize, usize), CachedGemm>>>,
 }
 
 // -- the digest -------------------------------------------------------------------------------------------------------
@@ -2130,10 +2133,10 @@ impl Manifest {
         Ok(Self {
             label: label.to_owned(),
             digest,
-            entries,
-            library,
-            kernels: Mutex::new(HashMap::new()),
-            gemms: Mutex::new(HashMap::new()),
+            entries: Arc::new(entries),
+            library: Arc::new(library),
+            kernels: Arc::new(Mutex::new(HashMap::new())),
+            gemms: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 

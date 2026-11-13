@@ -1,0 +1,87 @@
+{
+  "schema": "tilefish.plan.v1",
+  "tilefish": "0.0.4",
+  "graph": "tiles1",
+  "arch": "sm_103",
+  "manifest_digest": "b0d66517f57337eff0366ab845d8f5ea84f710091df30f1b195418537547e42f",
+  "dims": {},
+  "reuse": false,
+  "arena_alignment": 256,
+  "arena_bytes": 256,
+  "buffers": [
+    {
+      "name": "x",
+      "role": "input",
+      "dtype": "f32",
+      "shape": [
+        64
+      ],
+      "offset": null,
+      "bytes": 256
+    },
+    {
+      "name": "t0",
+      "role": "intermediate",
+      "dtype": "f32",
+      "shape": [
+        64
+      ],
+      "offset": 0,
+      "bytes": 256
+    },
+    {
+      "name": "out0",
+      "role": "output",
+      "dtype": "f32",
+      "shape": [
+        64
+      ],
+      "offset": null,
+      "bytes": 256
+    }
+  ],
+  "outputs": [
+    "out0"
+  ],
+  "buckets": [
+    {
+      "values": {},
+      "steps": [
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "y",
+              "binding": "t0"
+            }
+          ],
+          "given": {
+            "k": 2,
+            "c": 0
+          }
+        },
+        {
+          "entry": "halve",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t0"
+            },
+            {
+              "name": "out",
+              "binding": "out0"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "roles": "declared",
+  "plan_digest": "f70e3f606d469d54959f48e935754e0644271412830801fbe90e9b21b481abd0"
+}

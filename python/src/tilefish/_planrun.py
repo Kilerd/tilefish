@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import json
 import os
 import pathlib
 import threading
@@ -1333,6 +1334,12 @@ def _directory_stamp(path: pathlib.Path) -> "tuple[str, tuple]":
     return str(path.resolve()), stamp
 
 
+def directory_has_set(path: pathlib.Path) -> bool:
+    """Whether the plan directory of ``path`` (a directory or a plan file) has the index of a plan set, whose digest a pin may be."""
+    directory = path if path.is_dir() else path.parent
+    return (directory / _plan.PLAN_SET_NAME).is_file()
+
+
 def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory: bool) -> PlanRunner:
     _plan.check_anchor(pin, trust_directory)
     try:
@@ -1345,12 +1352,13 @@ def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory
         found = _loaded.get(key)
     if found is not None and found[0] == stamp and found[1].graph is graph:
         _, loaded, runner = found
-        if pin is not None and loaded.digest != pin:
-            raise TilefishManifestError(
-                f"the plan in {str(loaded.directory)!r} has digest {loaded.digest}, but the pin is {pin}: it is not the plan that was pinned "
-                "(it was changed, or it is another export)"
-            )
-        if (pin is not None) == runner.provider.pinned:  # a load with the other trust anchor is made again: the manifest's `pinned` differs
+        if pin is not None and pin not in (loaded.digest, loaded.set_digest):
+            if not directory_has_set(p):  # (in a plan set's directory the pin may be the set's digest: loaded again below, which checks it)
+                raise TilefishManifestError(
+                    f"the plan in {str(loaded.directory)!r} has digest {loaded.digest}, but the pin is {pin}: it is not the plan that was pinned "
+                    "(it was changed, or it is another export)"
+                )
+        elif (pin is not None) == runner.provider.pinned:  # a load with the other trust anchor is made again: the manifest's `pinned` differs
             return runner
     loaded = _plan.load_plan(p, graph, pin=pin, trust_directory=trust_directory)
     runner = PlanRunner(loaded, ReplayProvider(loaded.manifest, pinned=pin is not None))
@@ -1692,6 +1700,11 @@ def write_export(p: Plan, built: "Sequence[Any]", pinned: "Sequence[Any]", direc
 
     directory = pathlib.Path(directory)
     plan_path = directory / PLAN_NAME
+    if (directory / _plan.PLAN_SET_NAME).exists() and not overwrite:
+        raise TilefishManifestError(
+            f"{str(directory)!r} holds a plan set (plans.json): exporting one graph there would change the manifest its plans were built against; use "
+            "another directory, export the set again with the graph in it, or pass overwrite=True"
+        )
     if plan_path.exists() and not overwrite:
         previous = _existing_graph(plan_path)
         if previous is not None and previous != p.name:
@@ -1714,6 +1727,101 @@ def write_export(p: Plan, built: "Sequence[Any]", pinned: "Sequence[Any]", direc
     _plan.check_against_manifest(final._doc, loaded)
     write_file(plan_path, final.to_json().encode("utf-8"))
     return _plan.load_plan(plan_path, p.graph, pin=final.digest)
+
+
+def _graph_and_buckets(item: Any) -> "tuple[GraphOp, Any]":
+    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], GraphOp):
+        return item[0], item[1]
+    return item, None
+
+
+def export_graphs(
+    graphs: "Sequence[Any]",
+    directory: "str | os.PathLike[str]",
+    *,
+    arch: "int | str | None",
+    overwrite: bool,
+    buckets: Any,
+    reuse: bool,
+) -> "_plan.PlanSet":
+    """:func:`tilefish.runtime.export` of several graphs: a **plan set**, one manifest for all of them (each binary built once, whichever plans
+    launch it), ``<graph>.plan.json`` per graph and the index ``plans.json`` (``docs/plan-schema-1.md``, section 15). An item is a graph, or
+    ``(graph, buckets)``; ``buckets=`` may map a graph's name to its buckets instead. Returns the :class:`~tilefish._plan.PlanSet` loaded back."""
+    from . import _library
+    from ._build import build, parse_arch
+    from ._binary import build_binary
+
+    plans: "list[Plan]" = []
+    for item in graphs:
+        g, b = _graph_and_buckets(item)
+        if not isinstance(g, GraphOp) or isinstance(g, KernelOp):
+            raise TilefishRuntimeError(f"export of a plan set takes graphs (or (graph, buckets) pairs), got {item!r}")
+        if b is None and isinstance(buckets, Mapping):
+            b = buckets.get(g.name)
+        plans.append(make_plan(g, b, reuse=reuse))
+    names = [p.name for p in plans]
+    if len(set(names)) != len(names):
+        raise TilefishRuntimeError(f"the graphs of a plan set have distinct names (a plan's file is <graph>.plan.json), got {names}")
+    if arch is None:
+        torch = runtime._torch()
+        cap = runtime._capability(torch, torch.cuda.current_device())
+    else:
+        cap = parse_arch(arch)
+    callees: "dict[str, Any]" = {}
+    for p in plans:
+        for stem, callee in p.callees.items():
+            other = callees.setdefault(stem, callee)
+            if other is not callee and callee.by_stem[stem] != other.by_stem[stem]:
+                raise TilefishRuntimeError(f"two plans of the set launch different binaries under one name '{stem}': rename one of the operators")
+    built: list = []
+    pinned: list = []
+    for stem, callee in sorted(callees.items(), key=lambda kv: kv[0]):
+        spec = callee.by_stem[stem]
+        if callee.kind == "library":
+            pinned.append(_library.build_library(spec, arch=cap))
+        elif callee.extern.binary is not None:  # type: ignore[union-attr]
+            built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
+        else:
+            built.append(build(spec, arch=cap, fn=callee.target.jit_function(spec)))
+    return write_plan_set(plans, built, pinned, directory, cap, overwrite)
+
+
+def write_plan_set(
+    plans: "Sequence[Plan]", built: "Sequence[Any]", pinned: "Sequence[Any]", directory: "str | os.PathLike[str]", cap: int, overwrite: bool
+) -> "_plan.PlanSet":
+    """The half of :func:`export_graphs` that writes: one manifest of every build (merged into one that is there), each plan against its digest as
+    ``<graph>.plan.json``, the index ``plans.json``; then the set is read back (verified, every plan through the set's pin) and returned."""
+    from . import __version__
+    from ._build import write_file, write_manifest_doc
+    from ._manifest import MANIFEST_NAME, Manifest, manifest_digest
+
+    directory = pathlib.Path(directory)
+    if (directory / PLAN_NAME).exists() and not overwrite:
+        raise TilefishManifestError(f"{str(directory)!r} holds the plan of one graph (plan.json): a plan set goes to another directory (or pass overwrite=True)")
+    path, written = write_manifest_doc(built, directory / MANIFEST_NAME, cubins=True, merge=True, overwrite=overwrite, library=pinned)
+    loaded = Manifest.load(path)
+    if loaded.digest != manifest_digest(written):
+        raise TilefishManifestError(f"the manifest in {str(path.parent)!r} changed while the plan set was being exported")
+    digests: "dict[str, str]" = {}
+    for p in plans:
+        final = p.with_manifest(f"sm_{cap}", loaded.digest)
+        _plan.validate_doc(final._doc)
+        _plan.check_against_manifest(final._doc, loaded)
+        write_file(directory / _plan.plan_file_name(p.name), final.to_json().encode("utf-8"))
+        digests[p.name] = final.digest
+    index: "dict[str, Any]" = {
+        "schema": _plan.PLAN_SET_SCHEMA,
+        "tilefish": __version__,
+        "arch": f"sm_{cap}",
+        "manifest_digest": loaded.digest,
+        "plans": dict(sorted(digests.items())),
+    }
+    index["set_digest"] = _plan.set_digest(index)
+    _plan.validate_set(index)
+    write_file(directory / _plan.PLAN_SET_NAME, (json.dumps(index, indent=2) + "\n").encode("utf-8"))
+    doc = _plan.read_plan_set(directory, pin=index["set_digest"])
+    back = {p.name: _plan.load_plan(directory, p.graph, pin=index["set_digest"]) for p in plans}
+    return _plan.PlanSet(doc, directory, back)
 
 
 def _existing_graph(path: pathlib.Path) -> "str | None":

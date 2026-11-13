@@ -739,9 +739,25 @@ def prepare_plans(work):
     root.mkdir(parents=True)
     plans = []
     total = 0
+    exports = []  # (name, graph, reuse, make_cases, directory, the plan exported, the pin a replay is given, the entry's extra fields)
     for name, graph, reuse, make_cases in plan_graphs():
         directory = root / name
         exported = runtime.export(graph, directory, reuse=reuse)
+        exports.append((name, graph, reuse, make_cases, directory, exported, exported.digest, {"dir": f"plans/{name}"}))
+    # a plan set: the plans of one stage per key (gpu_kernels_p6.tile_chain) over one manifest, replayed through the set's pin
+    import gpu_kernels_p6 as p6
+
+    set_dir = root / "set"
+    planset = runtime.export([p6.TILES[t] for t in (1, 2, 3)], set_dir)
+    for t in (1, 2, 3):
+        g = p6.TILES[t]
+
+        def tiles_cases(t=t):
+            return [(f"seed{seed}", {"x": randn((t * 64,), F32, seed=90 + 3 * t + seed)}) for seed in (0, 1)]
+
+        extra = {"dir": f"plans/set/{g.name}.plan.json", "set": "plans/set", "set_digest": planset.digest}
+        exports.append((f"set-{g.name}", g, False, tiles_cases, set_dir, planset[g.name], planset.digest, extra))
+    for name, graph, reuse, make_cases, directory, exported, pin, extra in exports:
         doc = exported.doc
         params = [b for b in doc["buffers"] if b["role"] in ("input", "weight", "inout", "devscalar")]
         shared = {}  # a weight's file, written once per plan
@@ -752,7 +768,7 @@ def prepare_plans(work):
             case_dir.mkdir(parents=True)
             given = [args[b["name"]].clone() for b in params]  # a fresh tensor per call: an inout one is updated in place
             before = {b["name"]: raw(args[b["name"]]) for b in params}
-            result = tilefish.run(graph, *given, mode="replay", plan=directory, pin=exported.digest)
+            result = tilefish.run(graph, *given, mode="replay", plan=directory, pin=pin)
             results = list(result) if isinstance(result, tuple) else [result]
             after = {b["name"]: t for b, t in zip(params, given)}
             after.update(zip(doc["outputs"], results))
@@ -793,7 +809,7 @@ def prepare_plans(work):
             cases.append(record)
             total += 1
         plans.append(
-            {"name": name, "dir": f"plans/{name}", "digest": exported.digest, "graph": doc["graph"], "reuse": reuse, "arena_bytes": doc["arena_bytes"], "cases": cases}
+            {"name": name, **extra, "digest": exported.digest, "graph": doc["graph"], "reuse": reuse, "arena_bytes": doc["arena_bytes"], "cases": cases}
         )
     (work / "plans.json").write_text(json.dumps({"plans": plans}, indent=1) + "\n", encoding="utf-8")
     print(f"prepared {len(plans)} plans and {total} cases of plan replay", file=sys.stderr)

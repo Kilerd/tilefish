@@ -16,7 +16,7 @@ a manifest entry, checked and made exactly as a single launch is; the plan says 
 
 Contents: 1 what a plan is made of; 2 the top level; 3 the digest and the pin; 4 strict reading; 5 dimensions, buckets and shape expressions; 6 buffers and the
 arena; 7 steps; 8 order, liveness and reuse; 9 what a host does; 10 CUDA graphs; 11 the Python API; 12 what a plan does not do (version 1); 13 an example; 14 where it
-is tested.
+is tested; 15 plan sets (several plans over one manifest).
 
 ## 1. What a plan is made of
 
@@ -470,6 +470,40 @@ and 9 240 832 with it (720 896 for the intermediates).
 | the runner: order, addresses, scalars, preconditions before the first launch, captures, the order event of the arena (fake backend) | `test_planrun.py` |
 | on a GPU: replay == jit == per-op eager, replay vs reference, CUDA graph capture, tampering, the arena | `test_gpu_plan.py` |
 | on a GPU: runs of one plan on two streams (the race of the review, 0 of 20 rounds corrupted), from two threads, and replays of a captured graph between runs on other streams | `test_gpu_plan_streams.py` |
+| plan sets: one manifest, `<graph>.plan.json` per graph, the index `plans.json`, either pin (section 15) | `test_plan_sets.py`; the golden set `golden/plans/set` (`launch_plans.rs`); on a GPU `test_gpu_plan_sets.py` and `gpu_plan_gate.rs` (`a_plan_set_is_loaded_with_one_pin_and_its_plans_give_pythons_bytes`) |
 | **golden fixtures for a second implementation**: three plan directories (`manifest.json`, cubins and `plan.json`): the transformer block, without and with reuse, and `steps` (a result written over its input, two copy steps, a returned reshape, named outputs); `expected.json` with the plan digest, the manifest digest, the arena size, every arena offset and the outputs that a reader must reproduce from the files alone | `golden/plans/` (written by `export_plan_fixtures.py`, no GPU needed), `test_plan_fixtures.py` |
 
 The cubins of the golden fixtures are fake (a tiny ELF file per kernel entry, a made-up algorithm per GEMM): the format, the digests and the plan are real, so a reader can be checked against them; they cannot be launched.
+
+## 15. Plan sets: several plans over one manifest
+
+A stage whose launch count depends on a key (a prologue that processes `ceil(T / tile)` tiles, each a fixed chain of launches) is one plan per key: a
+plan's steps are the same in every bucket. Exported one by one, every plan directory has its own manifest and its own copy of the same binaries. A
+**plan set** exports them together: `tilefish.runtime.export([g1, g2, ...], directory)` (an item may be `(graph, buckets)`) builds the binaries of all
+of them once and writes
+
+* one `manifest.json` (schema 3, sections there): an entry per binary, whichever plans launch it;
+* `<graph>.plan.json` per graph: a plan of this schema, exactly as `plan.json` is, whose `manifest_digest` is the one manifest's;
+* `plans.json`, the **index**: `{"schema": "tilefish.plan-set.v1", "tilefish": <version>, "arch": "sm_103", "manifest_digest": <64 hex>, "plans":
+  {"<graph>": "<plan digest>", ...}, "set_digest": <64 hex>}`, exactly these keys; `plans` a non-empty object (at most 65 536) of graph names
+  (identifiers) to plan digests. `set_digest` is `sha256(b"tilefish.plan-set-digest.v1\0" + canonical_json(index without "set_digest" and
+  "tilefish"))` (`_plan.set_digest`; Rust `plan_set_digest`).
+
+**The pin.** The set's digest covers the digest of every plan it lists, and each plan's digest covers the manifest's (section 3), so **one pin, the
+set's, covers every plan, their manifest and every binary they launch**. A host reads the index strictly (as a plan, section 4), checks its digest
+against the pin and against its own `set_digest`, then every rule above, loads the manifest once with the index's `manifest_digest` as its pin, and
+loads a plan from `<graph>.plan.json` with the digest the index lists as its pin (so a plan file that is not the listed plan is refused) and with
+that manifest. Each plan file is also an ordinary plan: it loads alone with its own digest as the pin (the manifest next to it).
+
+Hosts: Python `tilefish.run(graph, ..., mode="replay", plan=directory, pin=<the set's digest or the plan's>)` (the directory's `<graph>.plan.json`;
+`tilefish.capture`, `prepare`, `run_step` and `bind_weights` alike), and `export` returns a `PlanSet` (`.digest`, `.manifest_digest`, `.plans`).
+Rust: `PlanSet::load(directory, Pin::Digest(set_digest))`, `set.plan("tiles2")` (a `LaunchPlan` that shares the set's manifest, so the modules of its
+binaries are loaded once per context for all the plans), `set.names()`, `set.manifest()`; `LaunchPlan::load_with_manifest(file, &manifest, pin)` for
+a plan file with a manifest already loaded. A directory holds one plan (`plan.json`) or one plan set, not both: an export of one into a directory of
+the other is refused (without `overwrite=True`). An export of a set with another graph builds another manifest, so every plan of the set gets a new
+digest, and so does the set.
+
+Why sets and not a plan whose steps repeat: a repeated step range would need loop-carried rules both readers agree on (liveness, the order of
+reads and writes, the views of each iteration, the step a tap or `run_step` names), and a stage whose tiles are not all alike (a last partial tile has
+other shapes) is not a repetition of one range; one plan per key keeps every plan a straight list whose every launch is checked before the first,
+and the set removes what was duplicated, the binaries and the pins.

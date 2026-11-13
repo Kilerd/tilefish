@@ -1,0 +1,143 @@
+{
+  "schema": "tilefish.plan.v1",
+  "tilefish": "0.0.4",
+  "graph": "tiles3",
+  "arch": "sm_103",
+  "manifest_digest": "b0d66517f57337eff0366ab845d8f5ea84f710091df30f1b195418537547e42f",
+  "dims": {},
+  "reuse": false,
+  "arena_alignment": 256,
+  "arena_bytes": 2304,
+  "buffers": [
+    {
+      "name": "x",
+      "role": "input",
+      "dtype": "f32",
+      "shape": [
+        192
+      ],
+      "offset": null,
+      "bytes": 768
+    },
+    {
+      "name": "t0",
+      "role": "intermediate",
+      "dtype": "f32",
+      "shape": [
+        192
+      ],
+      "offset": 0,
+      "bytes": 768
+    },
+    {
+      "name": "t1",
+      "role": "intermediate",
+      "dtype": "f32",
+      "shape": [
+        192
+      ],
+      "offset": 768,
+      "bytes": 768
+    },
+    {
+      "name": "t2",
+      "role": "intermediate",
+      "dtype": "f32",
+      "shape": [
+        192
+      ],
+      "offset": 1536,
+      "bytes": 768
+    },
+    {
+      "name": "out0",
+      "role": "output",
+      "dtype": "f32",
+      "shape": [
+        192
+      ],
+      "offset": null,
+      "bytes": 768
+    }
+  ],
+  "outputs": [
+    "out0"
+  ],
+  "buckets": [
+    {
+      "values": {},
+      "steps": [
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "y",
+              "binding": "t0"
+            }
+          ],
+          "given": {
+            "k": 2,
+            "c": 0
+          }
+        },
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t0"
+            },
+            {
+              "name": "y",
+              "binding": "t1"
+            }
+          ],
+          "given": {
+            "k": 2,
+            "c": 1
+          }
+        },
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t1"
+            },
+            {
+              "name": "y",
+              "binding": "t2"
+            }
+          ],
+          "given": {
+            "k": 2,
+            "c": 2
+          }
+        },
+        {
+          "entry": "halve",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t2"
+            },
+            {
+              "name": "out",
+              "binding": "out0"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "roles": "declared",
+  "plan_digest": "ac406b816bda8f7e74322017431f0e4418384d14cf4c9a1505135c31a1d47e36"
+}

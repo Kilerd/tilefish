@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
-use tilefish::{BufferRole, Error, LaunchPlan, Manifest, Pin, StepKind, plan_digest};
+use tilefish::{BufferRole, Error, LaunchPlan, Manifest, Pin, PlanSet, StepKind, plan_digest};
 
 fn golden() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/tests/golden/plans")
@@ -104,6 +104,72 @@ fn the_golden_plans_load_with_their_pins_and_give_every_number_python_has() {
         // trusting the directory loads the same plan
         let trusted = LaunchPlan::load(golden().join(name).join("plan.json"), Pin::TrustDirectory).unwrap();
         assert_eq!(trusted.digest(), pin);
+    }
+}
+
+/// The golden plan set `set` (`gpu_kernels_p6.tile_chain` for 1, 2 and 3 tiles: 2, 3 and 4 steps): one manifest with one entry per binary, the
+/// index listing every plan's digest. `PlanSet::load` with the set's pin, every plan through it (sharing the manifest) and with its own pin; a
+/// wrong pin, an edited index, an index of another manifest, a plan the index does not list and a plan file that is not the listed plan are refused.
+#[test]
+fn the_golden_plan_set_shares_one_manifest_and_one_pin_covers_every_plan() {
+    let e = &expected()["set"];
+    let pin = e["set_digest"].as_str().unwrap();
+    let set = PlanSet::load(golden().join("set"), Pin::Digest(pin)).unwrap();
+    assert_eq!(set.digest(), pin);
+    assert_eq!(set.arch(), "sm_103");
+    assert_eq!(set.manifest().digest(), e["manifest_digest"].as_str().unwrap());
+    let stems: Vec<&str> = set.manifest().entries().iter().map(|x| x.stem.as_str()).collect();
+    assert_eq!(stems, ["halve", "scale_add"], "one entry per binary, whatever the number of plans");
+    assert_eq!(set.names().collect::<Vec<_>>(), ["tiles1", "tiles2", "tiles3"]);
+    for name in ["tiles1", "tiles2", "tiles3"] {
+        let plan = set.plan(name).unwrap();
+        assert_eq!(plan.digest(), e["plans"][name].as_str().unwrap());
+        assert_eq!(plan.buckets()[0].steps.len() as u64, e["steps"][name].as_u64().unwrap());
+        assert_eq!(plan.manifest().digest(), set.manifest().digest());
+        // the plan file alone, with its own pin, is the same plan
+        let alone =
+            LaunchPlan::load(golden().join("set").join(format!("{name}.plan.json")), Pin::Digest(plan.digest()))
+                .unwrap();
+        assert_eq!(alone.digest(), plan.digest());
+        assert_eq!(tilefish::plan_file_name(name), format!("{name}.plan.json"));
+    }
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(golden().join("set").join("plans.json")).unwrap()).unwrap();
+    assert_eq!(tilefish::plan_set_digest(&doc), pin);
+    // refusals
+    let e1 = PlanSet::load(golden().join("set"), Pin::Digest(&"0".repeat(64))).unwrap_err();
+    assert!(matches!(e1, Error::PlanPinMismatch { .. }), "{e1}");
+    assert!(set.plan("tiles4").unwrap_err().to_string().contains("lists no plan of graph 'tiles4'"));
+    let copy = Copy::of("set");
+    let mut edited = copy.doc("plans.json");
+    edited["arch"] = Value::from("sm_90");
+    copy.write("plans.json", &edited);
+    assert!(PlanSet::load(&copy.dir, Pin::TrustDirectory).unwrap_err().to_string().contains("was edited"));
+    let mut other = copy.doc("plans.json");
+    other["arch"] = Value::from("sm_103");
+    other["manifest_digest"] = Value::from("0".repeat(64));
+    other["set_digest"] = Value::from(tilefish::plan_set_digest(&other));
+    copy.write("plans.json", &other);
+    let e2 = PlanSet::load(&copy.dir, Pin::TrustDirectory).unwrap_err();
+    assert!(e2.to_string().contains("built against the manifest"), "{e2}");
+    let mut swapped = copy.doc("plans.json");
+    swapped["manifest_digest"] = Value::from(e["manifest_digest"].as_str().unwrap());
+    swapped["plans"]["tiles1"] = swapped["plans"]["tiles2"].clone();
+    swapped["set_digest"] = Value::from(tilefish::plan_set_digest(&swapped));
+    copy.write("plans.json", &swapped);
+    let swapped_set = PlanSet::load(&copy.dir, Pin::TrustDirectory).unwrap();
+    let e3 = swapped_set.plan("tiles1").unwrap_err();
+    assert!(matches!(e3, Error::PlanPinMismatch { .. }), "{e3}");
+    for (key, value) in [
+        ("extra", Value::from(1)),
+        ("plans", serde_json::json!({})),
+        ("plans", serde_json::json!({"1x": "0".repeat(64)})),
+    ] {
+        let mut bad = copy.doc("plans.json");
+        bad[key] = value;
+        bad["set_digest"] = Value::from(tilefish::plan_set_digest(&bad));
+        copy.write("plans.json", &bad);
+        assert!(PlanSet::load(&copy.dir, Pin::TrustDirectory).is_err(), "{key}");
     }
 }
 

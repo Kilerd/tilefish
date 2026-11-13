@@ -116,6 +116,21 @@
     "steps_per_bucket": 2,
     "weights": []
   },
+  "set": {
+    "arch": "sm_103",
+    "manifest_digest": "b0d66517f57337eff0366ab845d8f5ea84f710091df30f1b195418537547e42f",
+    "plans": {
+      "tiles1": "f70e3f606d469d54959f48e935754e0644271412830801fbe90e9b21b481abd0",
+      "tiles2": "37b3f91df901cb70501f327b0aa4334ed87bd70d21e068693ca41d13a6a57056",
+      "tiles3": "ac406b816bda8f7e74322017431f0e4418384d14cf4c9a1505135c31a1d47e36"
+    },
+    "set_digest": "8219868f518c4e5295e83597ce233d56861d27ffb13873e35bdaff1c8e229492",
+    "steps": {
+      "tiles1": 2,
+      "tiles2": 3,
+      "tiles3": 4
+    }
+  },
   "steps": {
     "arch": "sm_103",
     "arena_bytes": 6144,

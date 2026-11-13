@@ -1,0 +1,115 @@
+{
+  "schema": "tilefish.plan.v1",
+  "tilefish": "0.0.4",
+  "graph": "tiles2",
+  "arch": "sm_103",
+  "manifest_digest": "b0d66517f57337eff0366ab845d8f5ea84f710091df30f1b195418537547e42f",
+  "dims": {},
+  "reuse": false,
+  "arena_alignment": 256,
+  "arena_bytes": 1024,
+  "buffers": [
+    {
+      "name": "x",
+      "role": "input",
+      "dtype": "f32",
+      "shape": [
+        128
+      ],
+      "offset": null,
+      "bytes": 512
+    },
+    {
+      "name": "t0",
+      "role": "intermediate",
+      "dtype": "f32",
+      "shape": [
+        128
+      ],
+      "offset": 0,
+      "bytes": 512
+    },
+    {
+      "name": "t1",
+      "role": "intermediate",
+      "dtype": "f32",
+      "shape": [
+        128
+      ],
+      "offset": 512,
+      "bytes": 512
+    },
+    {
+      "name": "out0",
+      "role": "output",
+      "dtype": "f32",
+      "shape": [
+        128
+      ],
+      "offset": null,
+      "bytes": 512
+    }
+  ],
+  "outputs": [
+    "out0"
+  ],
+  "buckets": [
+    {
+      "values": {},
+      "steps": [
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "y",
+              "binding": "t0"
+            }
+          ],
+          "given": {
+            "k": 2,
+            "c": 0
+          }
+        },
+        {
+          "entry": "scale_add",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t0"
+            },
+            {
+              "name": "y",
+              "binding": "t1"
+            }
+          ],
+          "given": {
+            "k": 2,
+            "c": 1
+          }
+        },
+        {
+          "entry": "halve",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "t1"
+            },
+            {
+              "name": "out",
+              "binding": "out0"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "roles": "declared",
+  "plan_digest": "37b3f91df901cb70501f327b0aa4334ed87bd70d21e068693ca41d13a6a57056"
+}

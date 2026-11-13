@@ -494,6 +494,11 @@ host binds once, when it loads the model. The plan records the roles (`"roles": 
 (Rust: `PlanRun::bind_weights`, a `WeightedRun` whose `launch` and `capture` take the inputs only). Without the declaration a plan labels a
 parameter by its shape, as before (`weight` when it mentions no dimension: every parameter of a fully static graph), and `bind_weights` refuses it.
 
+**Plan sets.** A stage whose launch count depends on a key is one plan per key; `tilefish.runtime.export([g1, g2, ...], "build/")` exports them as a
+*plan set*: one manifest (each binary once, whichever plans launch it), `<graph>.plan.json` per graph and `plans.json`, an index whose digest pins every
+plan, their manifest and every binary. A replay takes `plan="build/"` and the set's digest or the plan's; Rust `PlanSet::load(dir, pin)` and
+`set.plan("g2")` (the plans share the manifest and its loaded modules). `docs/plan-schema-1.md`, section 15, says why a set and not a repeated step range.
+
 **Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
 last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest
 unchanged (`plan.shape_of("t3", M=64)` gives the shape; `tilefish.capture` takes `taps=` too; Rust: `PlanRun::launch_tapped`).

@@ -1281,6 +1281,19 @@ impl LaunchPlan {
         Self::finish(label, validated, digest, manifest)
     }
 
+    /// Load a plan file (`<directory>/<graph>.plan.json` of a plan set, or a `plan.json`) with a manifest the caller loaded and verified once
+    /// (`Manifest::load`, or [`crate::PlanSet::manifest`]): verified as [`LaunchPlan::load`] verifies it (the pin, the digests, every rule, every
+    /// step against the manifest), and refused when it was built against another manifest. The plan shares the manifest: the plans of one set
+    /// load each binary once per context.
+    pub fn load_with_manifest(path: impl AsRef<Path>, manifest: &Manifest, pin: Pin<'_>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = if path.is_dir() { path.join(PLAN_NAME) } else { path.to_owned() };
+        let label = file.display().to_string();
+        let bytes = read_plan_file(&file)?;
+        let (validated, digest) = read_document(&label, &bytes, pin)?;
+        Self::finish(label, validated, digest, manifest.clone())
+    }
+
     /// A plan whose `plan.json` is in memory, run with a manifest the caller loaded and verified (`Manifest::load` or
     /// `Manifest::from_embedded`): verified as [`LaunchPlan::load`] verifies a directory, the manifest's digest included.
     pub fn from_embedded(plan: &[u8], manifest: Manifest, pin: Pin<'_>) -> Result<Self> {
