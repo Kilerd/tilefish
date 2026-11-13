@@ -116,6 +116,8 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
                                                                                          one FMA (note 2).
 ``a / b``                   ``a / b``                                                       f32 only (note 4): ``div.full.f32``,
                                                                                          not IEEE division.
+``i // c``, ``i % c``       ``i // c``, ``i % c`` (C's), then moved to the floor:           integers, a positive constant ``c``:
+                            ``tl.where(r < 0, ...)``                                        Python's semantics, exact (note 11).
 ``rsqrt(x)``                ``tl.rsqrt(x)``                                                 f32 only; approximate (note 5).
 ``exp(x)``                  ``tl.exp(x)``                                                   f32 only; fast exp (note 5).
 ``sqrt(x)``                 ``tl.sqrt_rn(x)``                                               f32 only; IEEE round to nearest, but
@@ -280,6 +282,13 @@ Notes (the facts behind the table):
     libdevice with ``__CUDA_FTZ = 1``, so the only inputs on which they differ from the non-FTZ library (torch's CUDA ``sinf`` /
     ``cosf``) are the subnormals, where ``sin(x)`` is ``±0`` (the sign of ``x``) instead of ``x``; ``cos`` is the same on every input. The
     reference is torch's with that flush, so it is byte-identical to the binary (``tests/test_gpu_trig.py``). f32 only.
+11. **``//`` and ``%`` of integers.** Index arithmetic: an ``i32``, ``i64`` or ``u8`` tensor divided by a positive constant (a python int,
+    an integer ``const``, a static dimension; a tensor divisor could be zero and is refused). The semantics are Python's: the quotient
+    rounds toward minus infinity and the remainder is in ``[0, c)`` (``-7 // 2 == -4``, ``-7 % 2 == 1``). Triton's ``//`` and ``%`` are C's
+    (``sdiv`` truncates, ``srem`` takes the dividend's sign), so for a signed type the lowering computes C's remainder and moves a
+    negative one: ``tl.where(r < 0, r + c, r)`` and ``tl.where(r < 0, i // c - 1, i // c)``; an unsigned type needs nothing. Exact, with no
+    overflow (``r + c`` and ``i // c - 1`` are taken only where ``r < 0``). The reference is ``torch.div(..., rounding_mode="floor")`` and
+    ``torch.remainder``.
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -356,6 +365,7 @@ _LOGICAL = {"and": "&", "or": "|", "xor": "^"}
 _UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos")
 _REDUCTIONS = ("sum", "mean", "max")
 _ARG_REDUCTIONS = ("argmax", "argmin")
+_OTHER_OPS = ("not", "where", "iota", "gather_rows", "scatter_rows", "floordiv", "mod")  # dtypes checked like a load's
 # Triton's own type of a python literal: a scalar of any other dtype is written as a typed constant (tl.cast(0.1, tl.bfloat16)),
 # because Triton compares a bf16 or f16 tensor with a float literal in f32 (the literal is not rounded to the tensor's dtype first)
 _LITERAL_DTYPES = frozenset({"f32", "i32"})
@@ -545,8 +555,8 @@ def _check_common(op: KernelOp) -> None:
                 None,
                 "declared-op-call",
                 f"the body calls the {n.attrs['kind']} op '{n.op}'; only the built-in ops (+ - * /, comparisons, & | ^ ~ of masks, "
-                "where, iota, silu, gelu, rsqrt, exp, sqrt, sin, cos, .to, sum, mean, max, argmax, argmin, gather_rows, scatter_rows, load and "
-                "stores) are lowered",
+                "where, iota, // and % by a constant, silu, gelu, rsqrt, exp, sqrt, sin, cos, .to, sum, mean, max, argmax, argmin, gather_rows, "
+                "scatter_rows, load and stores) are lowered",
             )
         if n.op == "split":
             views = [str(t) for t in n.output_types if not t.contiguous]
@@ -630,7 +640,7 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
             )
     elif n.op == "load":
         _check_dtype(kernel, f"the DevScalar read by {n}", n.outputs[0].type.dtype)
-    elif n.op in _COMPARE or n.op in _LOGICAL or n.op in ("not", "where", "iota", "gather_rows", "scatter_rows") or n.op in _ARG_REDUCTIONS:
+    elif n.op in _COMPARE or n.op in _LOGICAL or n.op in _OTHER_OPS or n.op in _ARG_REDUCTIONS:
         for v in (*n.outputs, *(i for i in n.inputs if isinstance(i, Value))):
             _check_dtype(kernel, f"{v.ref} of {n}", v.type.dtype)
     elif n.op != "store":
@@ -1345,6 +1355,21 @@ class _Body:
         store = f"tl.store({ptr}, {self.var[src]})" if mask is None else f"tl.store({ptr}, {self.var[src]}, mask={mask})"
         self.emit(store, f"InOut {dst.name}: rows written at the index")
 
+    def int_division(self, n: Node, v: str) -> str:
+        """``x // c`` or ``x % c`` with a positive constant ``c`` and Python's semantics (note 11): Triton's are C's (``sdiv`` truncates,
+        ``srem`` has the sign of the dividend), so a negative remainder is moved into ``[0, c)`` and the quotient down by one."""
+        x, c = n.inputs
+        assert isinstance(x, Value)
+        a, k = self.var[x], self.typed(c)
+        sym = "//" if n.op == "floordiv" else "%"
+        if not x.type.dtype.signed:  # unsigned: C's division is the floor
+            return f"{a} {sym} {k}"
+        r = self.names.fresh(f"{v}_r")
+        self.emit(f"{r} = {a} % {k}", "C's remainder: the sign of the dividend")
+        if n.op == "mod":
+            return f"tl.where({r} < 0, {r} + {k}, {r})"
+        return f"tl.where({r} < 0, {a} // {k} - 1, {a} // {k})"
+
     def arg_reduce(self, n: Node, v: str) -> str:
         """``argmax`` / ``argmin`` of an ``[R, D]`` value along the row (the row template; note 8): the index of the first lane that
         holds the extreme value, or of the first NaN when the row has one. Every reduction here is a max or a min, which are exact
@@ -1394,6 +1419,8 @@ class _Body:
         if op == "iota":
             index = self.layout.iota(n.outputs[0])
             return index if n.outputs[0].type.dtype.name == "i32" else f"{index}.to(tl.{_TL[n.outputs[0].type.dtype.name]})"
+        if op in ("floordiv", "mod"):
+            return self.int_division(n, v)
         a = [self.operand(i) for i in n.inputs]
         if op in _LOGICAL:
             return f"{a[0]} {_LOGICAL[op]} {a[1]}"

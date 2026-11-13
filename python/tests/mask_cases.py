@@ -86,3 +86,18 @@ def positions(x: Tensor[R, D, f32]) -> tuple[Tensor[R, D, i32], Tensor[R, 1, i64
 @tilefish.kernel
 def flat_positions(x: Tensor[N, f32]) -> Tensor[N, i64]:
     return tilefish.iota(x, axis=0, dtype=i64)
+
+
+@tilefish.kernel
+def int_divmod(
+    x: Tensor[N, i32], y: Tensor[N, i64], z: Tensor[N, u8], *, c: const = 7
+) -> tuple[Tensor[N, i32], Tensor[N, i32], Tensor[N, i64], Tensor[N, i64], Tensor[N, u8], Tensor[N, u8]]:
+    """Python's // and % (floor; a remainder in [0, c)) of signed and unsigned integers by positive constants."""
+    return x // c, x % c, y // 3, y % 1000000007, z // 5, z % 5
+
+
+@tilefish.kernel
+def tile_coords(x: Tensor[R, D, f32]) -> tuple[Tensor[R, D, i32], Tensor[R, D, i32]]:
+    """The tile and the position in it of every element, from its flat index: index arithmetic in the row template."""
+    flat = tilefish.iota(x, axis=0) * 96 + tilefish.iota(x, axis=-1)
+    return flat // 8, flat % 8

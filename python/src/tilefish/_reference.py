@@ -171,6 +171,10 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
             elif op in ("argmax", "argmin"):
                 (ax,) = n.attrs["axes"]
                 r = arg_reduce(torch, a[0], ax, n.attrs["keepdims"], op == "argmax", torch_dtype(torch, n.attrs["dtype"]))
+            elif op == "floordiv":  # Python's semantics: toward minus infinity
+                r = torch.div(a[0], a[1], rounding_mode="floor")
+            elif op == "mod":  # Python's semantics: in [0, c) for a positive c
+                r = torch.remainder(a[0], a[1])
             elif op == "add":
                 r = a[0] + a[1]
             elif op == "sub":

@@ -73,7 +73,10 @@ def all_same(a, b):
     return len(a) == len(b) and all(same_bytes(x, y) for x, y in zip(a, b))
 
 
-KERNELS = [mc.mask_rows, mc.zero_rows, mc.key_mask, mc.compare_f32, mc.compare_scalar_bf16, mc.compare_scalar_f16, mc.select, mc.logic, mc.int_compare, mc.positions, mc.flat_positions]
+KERNELS = [
+    mc.mask_rows, mc.zero_rows, mc.key_mask, mc.compare_f32, mc.compare_scalar_bf16, mc.compare_scalar_f16, mc.select, mc.logic, mc.int_compare,
+    mc.positions, mc.flat_positions, mc.int_divmod, mc.tile_coords,
+]  # fmt: skip
 
 
 def inputs_of(k):
@@ -102,6 +105,10 @@ def inputs_of(k):
         return [(randn((37, 96), F32, seed=3),)]
     if k is mc.flat_positions:
         return [(randn((5000,), F32, seed=4),)]
+    if k is mc.int_divmod:
+        return [divmod_inputs()]
+    if k is mc.tile_coords:
+        return [(randn((29, 96), F32, seed=5),)]
     raise AssertionError(k)
 
 
@@ -196,6 +203,31 @@ def test_iota_is_the_row_and_the_column():
     assert torch.equal(rc, (rows * 1000 + torch.arange(96, device=CUDA)).to(torch.int32))
     assert torch.equal(r, rows.to(torch.int64))
     assert torch.equal(tilefish.run(mc.flat_positions, randn((5000,), F32)), torch.arange(5000, device=CUDA))
+
+
+def divmod_inputs():
+    gen = torch.Generator().manual_seed(9)
+    x = torch.cat([torch.arange(-50, 50), torch.tensor([-(2**31), 2**31 - 1, -(2**31) + 1, -7, 7, -14, 14]), torch.randint(-(2**31), 2**31, (5000,), generator=gen)])
+    y = torch.cat([torch.arange(-50, 50), torch.tensor([-(2**63), 2**63 - 1, -(2**63) + 1, -1000000007, 1000000007, -2000000014, 3]), torch.randint(-(2**62), 2**62, (5000,), generator=gen) * 2])
+    z = torch.arange(x.numel()) % 256
+    return x.to(torch.int32).to(CUDA), y.to(torch.int64).to(CUDA), z.to(torch.uint8).to(CUDA)
+
+
+def test_integer_division_and_modulo_are_pythons():
+    x, y, z = divmod_inputs()
+    got = tilefish.run(mc.int_divmod, x, y, z)
+    want = [
+        torch.div(x, 7, rounding_mode="floor"), torch.remainder(x, 7), torch.div(y, 3, rounding_mode="floor"), torch.remainder(y, 1000000007),
+        torch.div(z, 5, rounding_mode="floor"), torch.remainder(z, 5),
+    ]  # fmt: skip
+    for g, w in zip(got, want):
+        assert torch.equal(g, w)
+    assert got[0][x == -7].unique().tolist() == [-1] and got[1][x == -7].unique().tolist() == [0]
+    assert got[0][x == -8].tolist() == [-2] and got[1][x == -8].tolist() == [6]  # -8 // 7 == -2 and -8 % 7 == 6, not C's -1 and -1
+    assert (got[1] >= 0).all() and (got[1] < 7).all()
+    tile, at = tilefish.run(mc.tile_coords, randn((29, 96), F32))
+    flat = torch.arange(29 * 96, device=CUDA, dtype=torch.int32).reshape(29, 96)
+    assert torch.equal(tile, flat // 8) and torch.equal(at, flat % 8)
 
 
 # -- in a launch plan ----------------------------------------------------------------------------------------------------------

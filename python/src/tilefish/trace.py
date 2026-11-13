@@ -130,10 +130,6 @@ _UNSUPPORTED = {
     "__rpow__": ("exponentiation (**)", "multiply explicitly, or use exp, sqrt or rsqrt"),
     "__matmul__": ("matrix multiplication (@)", "declare a library op such as gemm and call it"),
     "__rmatmul__": ("matrix multiplication (@)", "declare a library op such as gemm and call it"),
-    "__floordiv__": ("floor division (//)", "use / on floating-point tensors"),
-    "__rfloordiv__": ("floor division (//)", "use / on floating-point tensors"),
-    "__mod__": ("modulo (%)", "there is no modulo op yet"),
-    "__rmod__": ("modulo (%)", "there is no modulo op yet"),
     "__lshift__": ("shift (<<)", "there are no bitwise ops yet"),
     "__rshift__": ("shift (>>)", "there are no bitwise ops yet"),
     "__len__": ("len()", "use .shape"),
@@ -263,8 +259,8 @@ class Value:
         raise TilefishAttributeError(
             f"traced tensor {self.ref} ({self.type}) has no attribute '{name}': a tensor has "
             ".shape, .dtype, .rank, .to(dtype), .split(size, axis), the views .reshape(*dims), .permute(*axes), .select(axis, i) "
-            "and x[i], .sum/.mean/.max(axis, keepdims), .argmax/.argmin(axis, dtype=...), the operators + - * /, the comparisons == != < <= > >= (a mask) and, "
-            "on masks, & | ^ ~"
+            "and x[i], .sum/.mean/.max(axis, keepdims), .argmax/.argmin(axis, dtype=...), the operators + - * /, // and % of an integer by a positive constant, the comparisons "
+            "== != < <= > >= (a mask) and, on masks, & | ^ ~"
         )
 
     # -- methods ------------------------------------------------------------
@@ -371,6 +367,28 @@ class Value:
         from . import ops
 
         return ops.binary("div", other, self)
+
+    # integer index arithmetic: // and % by a positive constant, with Python's (floor) semantics
+
+    def __floordiv__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.int_division("floordiv", self, other)
+
+    def __rfloordiv__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.int_division("floordiv", other, self)
+
+    def __mod__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.int_division("mod", self, other)
+
+    def __rmod__(self, other: Any) -> "Value":
+        from . import ops
+
+        return ops.int_division("mod", other, self)
 
     # comparisons give a mask (bool_); a reflected comparison (0.5 < x) arrives here as its mirror (x > 0.5)
 

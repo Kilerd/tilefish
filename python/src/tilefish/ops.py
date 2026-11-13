@@ -195,6 +195,38 @@ def binary(op: str, left: Any, right: Any) -> Value:
     return out
 
 
+_INT_DIVISION = {"floordiv": "//", "mod": "%"}
+
+
+def int_division(op: str, x: Any, divisor: Any) -> Value:
+    """``x // c`` (``floordiv``) or ``x % c`` (``mod``) of an integer tensor by a positive constant, with Python's semantics: the quotient
+    rounds toward minus infinity and the remainder is in ``[0, c)`` (not C's, which truncate: ``-7 // 2`` is ``-4`` and ``-7 % 2`` is ``1``).
+
+    The divisor is a python int, an integer ``const`` or a static dimension, and positive: a tensor divisor could be zero or negative, so it
+    is refused. Exact (no overflow is possible). For index arithmetic: ``iota(x, -1) % H``, ``(p // W, p % W)``.
+    """
+    named = f"{op} ({_INT_DIVISION[op]})"
+    if not isinstance(x, Value):
+        raise TilefishTypeError(
+            f"{named}: the divisor {divisor!r} is a traced tensor; a divisor is a positive constant (a python int, an integer const or a static "
+            "dimension), because a tensor could be zero or negative"
+        )
+    x = _require_value(named, "the dividend", x)
+    dt = _require_computable(named, "the dividend", x)
+    if not dt.is_int:
+        raise TilefishTypeError(f"{named}: {x.ref} is {x.type}; // and % are integer index arithmetic here (use / on floating-point tensors)")
+    if isinstance(divisor, Value):
+        raise TilefishTypeError(
+            f"{named}: the divisor {divisor.ref} is a traced tensor; a divisor is a positive constant (a python int, an integer const or a "
+            "static dimension), because a tensor could be zero or negative"
+        )
+    c = _scalar_operand(named, "the divisor", divisor, dt)
+    if c.value < 1:
+        raise TilefishTypeError(f"{named}: the divisor must be positive, got {c.value}")
+    (out,) = x.ctx.emit(op, [x, c], {}, [x.type.materialized()])
+    return out
+
+
 # -- comparisons, masks, where, iota -------------------------------------------------------------------------------------------
 
 COMPARISONS = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
