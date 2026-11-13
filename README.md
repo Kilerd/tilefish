@@ -5,12 +5,12 @@ quantization format of every tensor live in its type, operators come from a
 typed library, and a model is built once into GPU binaries plus a manifest.
 Thin Python, C++ and Rust hosts are generated from the same signatures.
 
-**Status: early preview (0.0.1 on PyPI).** The Python package type-checks:
+**Status: early preview (0.0.2 on PyPI).** The Python package type-checks:
 tensor types and block-scaled formats, the four declarations below, tracing
 into a typed IR, and Triton ahead-of-time compile specs for `extern` kernels,
-in pure Python with no dependencies. On `main` (after 0.0.1) a `@kernel` also
-lowers to Triton source, as a row kernel or an elementwise kernel
-(`tilefish.lower`), with its numerics contract written down in the module.
+in pure Python with no dependencies. A `@kernel` also lowers to Triton
+source, as a row kernel or an elementwise kernel (`tilefish.lower`), with its
+numerics contract written down in the module.
 With the `gpu` extra (`pip install "tilefish[gpu]"`: torch, Triton,
 cuda-python) a compile spec builds into a cubin (`tilefish.aot.build`, with a
 manifest and a digest of the machine code) and a kernel runs from Python in

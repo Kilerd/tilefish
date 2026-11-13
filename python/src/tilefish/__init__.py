@@ -52,7 +52,7 @@ from .runtime import run
 from .trace import Const, Value
 from .types import InOut, Out, Tensor, TensorType, const
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # Reductions with numpy semantics. They share a name with a builtin, so they are not in
 # __all__ (`from tilefish import *` must not shadow the builtins); use tilefish.sum etc.
