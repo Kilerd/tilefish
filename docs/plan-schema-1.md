@@ -95,6 +95,9 @@ fine (`trust_directory=True` in Python); a replay with neither, or with both, is
 The file is read as strict JSON, as the manifest is: **no duplicate keys in an object, no `NaN`/`Infinity`, no number that does not fit a double**; a file larger than
 256 MiB, nested too deeply, or that is not UTF-8 is refused. An object has exactly the fields listed for it: a missing or an unknown field is a refusal.
 
+**Limits**, so that a document cannot make a reader do work out of proportion to its size (a reader counts before it lists): at most **4096** bucket combinations (the product of the lengths of the
+`dims` lists), **32768** buffers, **1 048 576** steps in a bucket and **256** arguments in a step. A refusal that quotes the document quotes at most the first 1000 characters of what it refuses.
+
 ## 5. Dimensions, buckets and shape expressions
 
 * `dims` names every dimension that appears in any shape. The **bucket combinations** are the Cartesian product of the lists, with the names sorted (code point order),

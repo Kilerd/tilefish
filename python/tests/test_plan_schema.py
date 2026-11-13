@@ -441,6 +441,59 @@ def test_a_damaged_document_is_refused_with_a_manifest_error_or_still_valid_neve
     assert refused + accepted == 25 and refused > 10
 
 
+def test_a_document_cannot_make_a_reader_do_work_out_of_proportion_to_its_size(good):
+    import time
+
+    doc = copy.deepcopy(good)
+    doc["dims"] = {f"D{i}": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] for i in range(30)}  # 10**30 combinations: counted, not listed
+    start = time.perf_counter()
+    with pytest.raises(TilefishManifestError, match="more than the 4096 a plan may have"):
+        _plan.validate_doc(doc)
+    assert time.perf_counter() - start < 1
+    doc = copy.deepcopy(good)
+    doc["buffers"] = doc["buffers"] * (_plan.MAX_BUFFERS // len(doc["buffers"]) + 1)
+    with pytest.raises(TilefishManifestError, match="at most 32768 buffers"):
+        _plan.validate_doc(doc)
+    doc = copy.deepcopy(good)
+    doc["buckets"][0]["steps"][0]["args"] = doc["buckets"][0]["steps"][0]["args"] * 100
+    with pytest.raises(TilefishManifestError, match="at most 256 arguments"):
+        _plan.validate_doc(doc)
+    doc = copy.deepcopy(good)
+    doc["dims"]["M"] = list(range(1, 100001))
+    with pytest.raises(TilefishManifestError) as e:
+        _plan.validate_doc(doc)
+    assert len(str(e.value)) < 1200  # a refusal quotes what it refuses, cut
+
+    @tilefish.kernel
+    def two_dims(x: Tensor[Dim("R"), Dim("C"), f32]) -> Tensor[Dim("R"), Dim("C"), f32]:
+        return x * 2.0
+
+    R, C = Dim("R"), Dim("C")
+
+    @tilefish.graph
+    def wide(a: Tensor[R, C, f32]) -> Tensor[R, C, f32]:
+        return two_dims(a)
+
+    with pytest.raises(TilefishPlanError, match="10000 bucket combinations are planned, more than the 4096 a plan may have"):
+        tilefish.plan(wide, buckets={"R": list(range(1, 101)), "C": list(range(1, 101))})
+    with pytest.raises(TilefishPlanError) as e:
+        tilefish.plan(pm.block, buckets={"M": list(range(1, 4098))})
+    assert len(str(e.value)) < 600 and "in all" in str(e.value)
+
+
+def test_the_overlap_check_is_a_sweep_that_finds_every_overlapping_pair(good_reuse):
+    """Many buffers sharing one region is what reuse makes; a pair in the middle of them that does not have disjoint live ranges is still found."""
+    doc = copy.deepcopy(good_reuse)
+    names = [b["name"] for b in doc["buffers"] if b["role"] == "intermediate"]
+    shared = [n for n in names if sum(1 for m in names if buffer(doc, m)["offset"] == buffer(doc, n)["offset"]) > 1]
+    assert len(shared) >= 3
+    _plan.validate_doc(doc)
+    victim = next(n for n in names if buffer(doc, n)["offset"] not in {buffer(doc, s)["offset"] for s in shared})
+    buffer(doc, victim)["offset"] = buffer(doc, shared[1])["offset"]  # lands in the middle of the shared region: used together with at least one of them
+    with pytest.raises(TilefishManifestError, match="no step uses together|overlap"):
+        _plan.validate_doc(doc)
+
+
 def test_a_document_that_is_not_an_object_or_has_odd_types_is_a_refusal_not_a_crash(good):
     for bad in (None, [], "plan", 1, {"schema": "tilefish.plan.v1"}):
         with pytest.raises(TilefishManifestError):

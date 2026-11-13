@@ -63,6 +63,10 @@ PLAN_NAME = "plan.json"
 ARENA_ALIGNMENT = 256
 DIGEST_TAG = b"tilefish.plan-digest.v1\0"  # part of what is hashed: another canonical form must change it
 MAX_PLAN_BYTES = 1 << 28
+MAX_BUCKETS = 1 << 12  # bucket combinations of one plan
+MAX_BUFFERS = 1 << 15
+MAX_STEPS = 1 << 20  # per bucket
+MAX_ARGS = 256  # pointer arguments of one step
 
 ROLES = ("input", "output", "inout", "weight", "intermediate", "devscalar", "workspace")
 EXTERNAL_ROLES = ("input", "output", "inout", "weight")
@@ -222,6 +226,14 @@ class _Walk:
     steps: "list[_SymStep]"
     outputs: "list[_Buffer]"
     dims: "tuple[Dim, ...]"
+
+
+def _brief(value: Any, limit: int = 12) -> str:
+    """``repr`` of a list that is cut after ``limit`` entries (a message must not echo a list of thousands)."""
+    items = list(value) if isinstance(value, (list, tuple, set, frozenset)) else None
+    if items is None or len(items) <= limit:
+        return repr(value if items is None else items)
+    return repr(items[:limit])[:-1] + f", ... ({len(items)} in all)]"
 
 
 def _fail(graph: str, message: str) -> Any:
@@ -430,13 +442,13 @@ def _bucket_values(graph: str, dims: "Sequence[Dim]", buckets: Any) -> "dict[str
                     raise TypeError
                 values = list(values)
             except TypeError:
-                raise TilefishPlanError(f"graph '{graph}': buckets[{d.name!r}] is a list of sizes, got {values!r}") from None
+                raise TilefishPlanError(f"graph '{graph}': buckets[{d.name!r}] is a list of sizes, got {_brief(values)}") from None
             if not values or any(not _is_int(v) or v < 1 for v in values):
-                raise TilefishPlanError(f"graph '{graph}': buckets[{d.name!r}] must be a non-empty list of positive ints, got {values!r}")
+                raise TilefishPlanError(f"graph '{graph}': buckets[{d.name!r}] must be a non-empty list of positive ints, got {_brief(values)}")
             chosen = tuple(sorted(set(values)))
             if d.buckets is not None and not set(chosen) <= set(d.buckets):
                 raise TilefishPlanError(
-                    f"graph '{graph}': buckets[{d.name!r}] = {list(chosen)} has values that {d.name} is not declared with (its buckets are {list(d.buckets)}): "
+                    f"graph '{graph}': buckets[{d.name!r}] = {_brief(chosen)} has values that {d.name} is not declared with (its buckets are {_brief(d.buckets)}): "
                     "an operator the graph calls may have binaries for those sizes only"
                 )
         elif d.buckets is not None:
@@ -449,7 +461,7 @@ def _bucket_values(graph: str, dims: "Sequence[Dim]", buckets: Any) -> "dict[str
         if d.divisible_by:
             bad = [v for v in chosen if v % d.divisible_by]
             if bad:
-                raise TilefishPlanError(f"graph '{graph}': {d.name} is declared divisible_by={d.divisible_by}, but buckets[{d.name!r}] has {bad}")
+                raise TilefishPlanError(f"graph '{graph}': {d.name} is declared divisible_by={d.divisible_by}, but buckets[{d.name!r}] has {_brief(bad)}")
         out[d.name] = chosen
     return out
 
@@ -813,6 +825,9 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
     w = _walk(graph)
     _name_buffers(w.buffers, w.outputs)
     dims = _bucket_values(name, w.dims, buckets)
+    count = math.prod(len(v) for v in dims.values())
+    if count > MAX_BUCKETS:
+        raise TilefishPlanError(f"graph '{name}': {count} bucket combinations are planned, more than the {MAX_BUCKETS} a plan may have (plan fewer sizes)")
     combos = bucket_combinations(dims)
     by_name = {d.name: d for d in w.dims}
 
@@ -967,6 +982,8 @@ def buffer_shapes(doc: "Mapping[str, Any]", values: "Mapping[str, int]") -> "dic
 
 
 def _bad(message: str) -> Any:
+    if len(message) > 1000:  # a refusal quotes what it refuses, and what it refuses may be a list of a million entries
+        message = message[:1000] + f"... ({len(message)} characters in all)"
     raise TilefishManifestError(f"plan.json: {message}")
 
 
@@ -1025,6 +1042,8 @@ def _validate(doc: Any) -> None:
     buffers = doc["buffers"]
     if not isinstance(buffers, list) or not buffers:
         _bad("buffers must be a non-empty list")
+    if len(buffers) > MAX_BUFFERS:
+        _bad(f"a plan has at most {MAX_BUFFERS} buffers, this one has {len(buffers)}")
     by_name: "dict[str, dict[str, Any]]" = {}
     for i, b in enumerate(buffers):
         _keys(b, f"buffers[{i}]", BUFFER_KEYS)
@@ -1059,11 +1078,14 @@ def _validate(doc: Any) -> None:
             _bad(f"the devscalar '{b['name']}' is one element in device memory: its shape must be []")
         if b["role"] == "workspace" and (b["dtype"] != "u8" or len(b["shape"]) != 1 or not _is_int(b["shape"][0])):
             _bad(f"the workspace '{b['name']}' must be a u8 buffer with one static size")
-    # buckets
-    combos = bucket_combinations({n: v for n, v in dims.items()})
+    # buckets (counted before they are listed: a document must not make a reader build a list of 10**30 combinations)
+    n_combos = math.prod(len(v) for v in dims.values())
+    if n_combos > MAX_BUCKETS:
+        _bad(f"dims have {n_combos} bucket combinations, more than the {MAX_BUCKETS} a plan may have")
     buckets = doc["buckets"]
-    if not isinstance(buckets, list) or len(buckets) != len(combos):
-        _bad(f"buckets must have one entry per combination of the dims ({len(combos)}), in order")
+    if not isinstance(buckets, list) or len(buckets) != n_combos:
+        _bad(f"buckets must have one entry per combination of the dims ({n_combos}), in order")
+    combos = bucket_combinations({n: v for n, v in dims.items()})
     sizes = {n: 0 for n in by_name}
     shapes_by_bucket: "list[dict[str, tuple[str, tuple[int, ...]]]]" = []
     for combo, bucket in zip(combos, buckets):
@@ -1084,6 +1106,8 @@ def _validate(doc: Any) -> None:
             _bad(f"buffers '{n}': bytes must be the largest size of its shape over the buckets ({sizes[n]}), got {b['bytes']}")
     # steps
     n_steps = len(buckets[0]["steps"]) if isinstance(buckets[0].get("steps"), list) else 0
+    if n_steps > MAX_STEPS:
+        _bad(f"a bucket has at most {MAX_STEPS} steps, this one has {n_steps}")
     skeleton: "list[Any] | None" = None
     first: "dict[str, int]" = {}
     last: "dict[str, int]" = {}
@@ -1106,8 +1130,8 @@ def _validate(doc: Any) -> None:
                 ws = by_name.get(st["workspace"])
                 if ws is None or ws["role"] != "workspace":
                     _bad(f"step #{si}: workspace must name the buffer of role workspace, got {st['workspace']!r}")
-            if not isinstance(st["args"], list) or not st["args"]:
-                _bad(f"step #{si}: args must be a non-empty list")
+            if not isinstance(st["args"], list) or not st["args"] or len(st["args"]) > MAX_ARGS:
+                _bad(f"step #{si}: args must be a non-empty list of at most {MAX_ARGS} arguments")
             names_here = []
             for ai, a in enumerate(st["args"]):
                 _keys(a, f"step #{si} args[{ai}]", ["name", "binding"], ["view"])
@@ -1156,18 +1180,20 @@ def _validate(doc: Any) -> None:
     end = max((b["offset"] + align_up(b["bytes"]) for b in arena), default=0)
     if not _is_int(doc["arena_bytes"]) or doc["arena_bytes"] != align_up(end):
         _bad(f"arena_bytes must be the end of the last region rounded up to {ARENA_ALIGNMENT} ({align_up(end)}), got {doc['arena_bytes']!r}")
-    for i, a in enumerate(arena):
-        for b in arena[i + 1 :]:
-            if a["offset"] < b["offset"] + align_up(b["bytes"]) and b["offset"] < a["offset"] + align_up(a["bytes"]):
-                ok = (
-                    doc["reuse"]
-                    and a["role"] == b["role"] == "intermediate"
-                    and a["name"] in first
-                    and b["name"] in first
-                    and (last[a["name"]] < first[b["name"]] or last[b["name"]] < first[a["name"]])
-                )
-                if not ok:
-                    _bad(f"the regions of '{a['name']}' and '{b['name']}' overlap, which only reuse=true allows, and only for two intermediates that no step uses together")
+    active: "list[tuple[int, dict[str, Any]]]" = []  # a sweep over the regions by offset: every pair that overlaps is looked at once, when the later one starts
+    for b in sorted(arena, key=lambda r: (r["offset"], r["bytes"])):
+        active = [(e, o) for e, o in active if e > b["offset"]]
+        for _, a in active:
+            ok = (
+                doc["reuse"]
+                and a["role"] == b["role"] == "intermediate"
+                and a["name"] in first
+                and b["name"] in first
+                and (last[a["name"]] < first[b["name"]] or last[b["name"]] < first[a["name"]])
+            )
+            if not ok:
+                _bad(f"the regions of '{a['name']}' and '{b['name']}' overlap, which only reuse=true allows, and only for two intermediates that no step uses together")
+        active.append((b["offset"] + align_up(b["bytes"]), b))
     # (that an intermediate or an output is written before it is read needs the access of each pointer, which the manifest has: check_against_manifest)
 
 
