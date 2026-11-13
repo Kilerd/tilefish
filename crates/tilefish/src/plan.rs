@@ -13,8 +13,9 @@
 //! value the manifest holds. The checks, in order: the number of tensors; for each tensor its device, dtype and rank (a device scalar
 //! is one element), that no dimension is empty, and that a tensor given for a parameter that is not strided is contiguous; the
 //! binding of the dimensions from the sizes of the tensors, and from the canonical strides of the views, which must agree across
-//! arguments and with the static sizes (a port of `solve_dims`); the bucket (a bucketed dimension is the bucket exactly: there is no
-//! padding) and `divisible_by` of every dimension; the runtime scalars, derived from their dimension expression, from the element count
+//! arguments and with the static sizes (a port of `solve_dims`: a call that leaves a dimension undetermined is ambiguous, an error that is not
+//! a precondition); the bucket (a bucketed dimension is the bucket exactly: there is no padding, and it is what the tensors say, never taken
+//! from the binary) and `divisible_by` of every dimension; the runtime scalars, derived from their dimension expression, from the element count
 //! of the tensor they count or from the stride they carry, and their range (`i32` or `i64`); aliasing of the tensors that are written;
 //! the alignment of every pointer the parameter promises; `max_elements` and `max_extent`. Last, the grid is evaluated from its
 //! expression and checked against the device's limits. A call has nothing but its tensors: there is no way to tell a launch what a
@@ -624,12 +625,15 @@ impl Plan {
         }
         self.solve(&mut dims, &equations)?;
 
-        // -- what the manifest says of each dimension: a bucket is exact (there is no padding), and divisible_by
+        // -- what the manifest says of each dimension: a bucket is exact (there is no padding), and divisible_by. A bucketed dimension is
+        // what the tensors say it is, never the bucket the binary was built for: one that no tensor determines is refused, as Python's
+        // `select_spec` finds no binary for it
         for (i, info) in self.dims.iter().enumerate() {
             let name = self.syms.name(i);
             if let Some((value, all)) = &info.bucket {
                 match dims[i] {
-                    Some(found) if found != *value => {
+                    Some(found) if found == *value => {}
+                    Some(found) => {
                         return Err(Error::precondition(
                             PreconditionKind::Bucket,
                             Some(name),
@@ -639,7 +643,16 @@ impl Plan {
                             ),
                         ));
                     }
-                    _ => dims[i] = Some(*value),
+                    None => {
+                        return Err(Error::precondition(
+                            PreconditionKind::Bucket,
+                            Some(name),
+                            format!(
+                                "dimension {name} is not determined by the tensors, but '{stem}' is built for exactly {value} (buckets {all:?}): \
+                                 a bucketed dimension is the size of the tensors, it is never taken from the binary"
+                            ),
+                        ));
+                    }
                 }
             }
             if let (Some(by), Some(v)) = (info.divisible_by, dims[i])
@@ -836,49 +849,32 @@ impl Plan {
             if progress {
                 continue;
             }
-            // nothing more can be solved: a bucketed dimension is known from the binary itself
-            let mut bound_any = false;
-            for (dim, info) in self.dims.iter().enumerate() {
-                let Some((value, _)) = &info.bucket else { continue };
-                let wanted = equations.iter().zip(&done).any(|(eq, d)| !*d && eq.pattern.vars.contains(&dim));
-                if wanted && dims[dim].is_none() {
-                    dims[dim] = Some(*value);
-                    bound_any = true;
+            // nothing more can be solved, and what is left is ambiguous: Python's `solve_dims` raises a type error (no precondition of the
+            // binary is broken: the call does not determine the dimensions). A bucketed dimension is not taken from the binary here either
+            // (a dimension that only occurs inside a `cdiv` is not bound by any equation, whatever its bucket)
+            let stuck =
+                equations.iter().zip(&done).find(|(_, d)| !**d).map(|(eq, _)| eq).expect("not all equations are done");
+            let what = match stuck.origin {
+                Origin::Tensor { t, axis } => format!(
+                    "argument '{}' ({}): dimension {axis} (size {})",
+                    self.tensors[t].name,
+                    self.describe_tensor(t),
+                    stuck.actual
+                ),
+                Origin::Stride { t, axis } => format!(
+                    "argument '{}' ({}): the stride of axis {axis} (value {})",
+                    self.tensors[t].name,
+                    self.describe_tensor(t),
+                    stuck.actual
+                ),
+                Origin::Scalar { s } => {
+                    format!("runtime argument '{}' (value {})", self.scalars[s].name, stuck.actual)
                 }
-            }
-            if !bound_any {
-                let stuck = equations
-                    .iter()
-                    .zip(&done)
-                    .find(|(_, d)| !**d)
-                    .map(|(eq, _)| eq)
-                    .expect("not all equations are done");
-                let what = match stuck.origin {
-                    Origin::Tensor { t, axis } => format!(
-                        "argument '{}' ({}): dimension {axis} (size {})",
-                        self.tensors[t].name,
-                        self.describe_tensor(t),
-                        stuck.actual
-                    ),
-                    Origin::Stride { t, axis } => format!(
-                        "argument '{}' ({}): the stride of axis {axis} (value {})",
-                        self.tensors[t].name,
-                        self.describe_tensor(t),
-                        stuck.actual
-                    ),
-                    Origin::Scalar { s } => {
-                        format!("runtime argument '{}' (value {})", self.scalars[s].name, stuck.actual)
-                    }
-                };
-                return Err(Error::precondition(
-                    PreconditionKind::Shape,
-                    None,
-                    format!(
-                        "'{}': {what}: cannot infer the dimensions in {}; the signature is ambiguous at this call",
-                        self.stem, stuck.pattern.text
-                    ),
-                ));
-            }
+            };
+            return Err(Error::Launch(format!(
+                "'{}': {what}: cannot infer the dimensions in {}; the signature is ambiguous at this call",
+                self.stem, stuck.pattern.text
+            )));
         }
     }
 }

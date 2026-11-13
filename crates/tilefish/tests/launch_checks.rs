@@ -387,6 +387,45 @@ fn edited(stem: &str, change: impl FnOnce(&mut serde_json::Value)) -> (Copy, Pla
     (copy, plan)
 }
 
+/// The plan of the bucket `Db = 96` of `bucketed_rms` in a copy of the fixture whose entry `change` edited.
+fn edited_bucket(change: impl FnOnce(&mut serde_json::Value)) -> (Copy, Plan) {
+    let copy = Copy::of("sm_103");
+    copy.edit_json(|doc| change(Copy::entry(doc, "bucketed_rms.Db96")));
+    let manifest = Manifest::load(&copy.dir, Pin::TrustDirectory).expect("the edit is a manifest that reads");
+    let plan = manifest.plan("bucketed_rms.Db96", &[("Db", 96)], Arch::sm(103)).unwrap();
+    (copy, plan)
+}
+
+#[test]
+fn a_bucketed_dimension_is_what_the_tensors_say_and_never_taken_from_the_binary() {
+    // bucketed_rms with `Db` only inside a cdiv: no equation binds it, so Python's `solve_dims` finds every call ambiguous (a type error: no
+    // precondition of the binary is broken, the call does not determine the dimensions), whatever the bucket of the binary is
+    let (_copy, plan) = edited_bucket(|e| {
+        for (name, shape) in
+            [("x", r#"["M", "cdiv(Db, 2)"]"#), ("w", r#"["cdiv(Db, 2)"]"#), ("out", r#"["M", "cdiv(Db, 2)"]"#)]
+        {
+            param(e, name)["shape"] = serde_json::from_str(shape).unwrap();
+        }
+    });
+    for db in [48usize, 47, 256] {
+        let (x, w) = ([3, db], [db]);
+        let e = refused(&plan, &[t(A, &x, DType::Bf16), t(B, &w, DType::Bf16), t(C, &x, DType::Bf16)]);
+        assert!(
+            matches!(&e, Error::Launch(m) if m.contains("cannot infer the dimensions in cdiv(Db, 2)") && m.contains("ambiguous")),
+            "{e}"
+        );
+    }
+    // a bucketed dimension that no tensor mentions is not determined by the call either: Python's `select_spec` has no binary for it
+    let (_copy, plan) = edited_bucket(|e| {
+        for (name, shape) in [("x", r#"["M", 96]"#), ("w", "[96]"), ("out", r#"["M", 96]"#)] {
+            param(e, name)["shape"] = serde_json::from_str(shape).unwrap();
+        }
+    });
+    let e = refused(&plan, &[t(A, &[3, 96], DType::Bf16), t(B, &[96], DType::Bf16), t(C, &[3, 96], DType::Bf16)]);
+    assert_eq!(kind(&e), PreconditionKind::Bucket);
+    assert!(e.to_string().contains("dimension Db is not determined by the tensors"), "{e}");
+}
+
 fn param<'a>(entry: &'a mut serde_json::Value, name: &str) -> &'a mut serde_json::Value {
     entry["abi"]["params"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == name).expect("a parameter")
 }
