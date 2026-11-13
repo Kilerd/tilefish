@@ -486,6 +486,12 @@ fn graph_capture() {
     let stream = gpu.stream.cu_stream();
 
     for raw in [false, true] {
+        // the tensors are made before the capture: cudarc's `device_ptr` (which gives the address of a slice) waits on the slice's
+        // events, which a capturing stream may not do
+        // SAFETY: the buffers outlive the graph's launches (they are used until the end of this function), and nothing else
+        // uses them while the graph is captured or run.
+        let (xr, yr) = unsafe { (gpu.region(&x, x.nbytes()), gpu.region(&y, y.nbytes())) };
+        let (xt, yt) = (TensorRef::<Bf16>::new(xr, &x.shape).unwrap(), TensorMut::<Bf16>::new(yr, &y.shape).unwrap());
         let mut graph: sys::CUgraph = std::ptr::null_mut();
         // SAFETY (the driver calls below): `stream` is a live stream of the current context; the graph handles come from the driver.
         unsafe {
@@ -493,18 +499,11 @@ fn graph_capture() {
                 sys::cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
             assert_eq!(begin, sys::CUresult::CUDA_SUCCESS, "cuStreamBeginCapture");
         }
-        let launched = {
-            // SAFETY: the buffers outlive the graph's launches (they are used until the end of this function), and nothing else
-            // uses them while the graph is captured or run.
-            let (xr, yr) = unsafe { (gpu.region(&x, x.nbytes()), gpu.region(&y, y.nbytes())) };
-            let (xt, yt) =
-                (TensorRef::<Bf16>::new(xr, &x.shape).unwrap(), TensorMut::<Bf16>::new(yr, &y.shape).unwrap());
-            if raw {
-                // SAFETY: `stream` is the handle of a stream of the kernel's context; the buffers outlive the graph.
-                unsafe { launcher.launch_raw(stream, xt, yt) }
-            } else {
-                launcher.launch(&gpu.stream, xt, yt)
-            }
+        let launched = if raw {
+            // SAFETY: `stream` is the handle of a stream of the kernel's context; the buffers outlive the graph.
+            unsafe { launcher.launch_raw(stream, xt, yt) }
+        } else {
+            launcher.launch(&gpu.stream, xt, yt)
         };
         unsafe {
             let end = sys::cuStreamEndCapture(stream, &mut graph);
@@ -589,15 +588,15 @@ fn a_launch_on_another_stream_is_ordered_against_the_free_of_its_slices() {
                 TensorMut::<Bf16>::from_cuda(&mut y, &shape).unwrap(),
             )
             .unwrap();
-        // freed on s1 (where they were allocated) while the kernel has not run; then the memory is allocated again, and cleared
+        // freed on s1 (where they were allocated) while the kernel has not run; then the memory is allocated again, and filled with the 1.5s of `ones` (what the kernel would change)
         drop(x);
         drop(y);
-        let z1 = s1.alloc_zeros::<u8>(n * 2).unwrap();
-        let z2 = s1.alloc_zeros::<u8>(n * 2).unwrap();
+        let z1 = s1.clone_htod(&ones).unwrap();
+        let z2 = s1.clone_htod(&ones).unwrap();
         releaser.join().unwrap();
         gpu.ctx.synchronize().unwrap();
         let (got1, got2) = (s1.clone_dtoh(&z1).unwrap(), s1.clone_dtoh(&z2).unwrap());
-        if got1.iter().chain(&got2).any(|b| *b != 0) {
+        if got1 != ones || got2 != ones {
             stale_writes += 1;
             println!("round {round}: the kernel wrote into memory that was allocated after its slices were freed");
         }
@@ -617,21 +616,22 @@ fn launch_raw_puts_back_the_current_context() {
     let ((_, x), (_, y)) = (tensors.next().unwrap(), tensors.next().unwrap());
     let expect = read(&gate_dir().join(case["tensors"][1]["expect"].as_str().unwrap()));
     let stream = gpu.stream.cu_stream() as usize;
-    let others = CudaContext::device_count().unwrap();
+    let devices = CudaContext::device_count().unwrap();
 
+    // the regions are made here, on the thread that has the context: `device_ptr` binds it, and the thread below must start with none
+    // SAFETY: the buffers outlive the launches, which are waited for below; nothing else uses them meanwhile.
+    let (xr, yr) = unsafe { (gpu.region(&x, x.nbytes()), gpu.region(&y, y.nbytes())) };
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
                 assert!(result::ctx::get_current().unwrap().is_none(), "a new thread has no current context");
-                // SAFETY: the buffers outlive the launch, which is waited for below; the stream is the kernel's.
-                let (xr, yr) = unsafe { (gpu.region(&x, x.nbytes()), gpu.region(&y, y.nbytes())) };
                 let args = |xr, yr| {
                     [
                         TensorRef::<Bf16>::new(xr, &x.shape).unwrap().into_arg(),
                         TensorMut::<Bf16>::new(yr, &y.shape).unwrap().into_arg(),
                     ]
                 };
-                // SAFETY: as above.
+                // SAFETY: the stream is the kernel's; the memory is what the regions say, and stays until the join.
                 unsafe { launcher.kernel().launch_raw(stream as sys::CUstream, &args(xr, yr)) }.unwrap();
                 assert!(
                     result::ctx::get_current().unwrap().is_none(),
@@ -648,7 +648,7 @@ fn launch_raw_puts_back_the_current_context() {
                 assert_eq!(e.precondition_kind(), Some(PreconditionKind::Access));
                 assert!(result::ctx::get_current().unwrap().is_none());
 
-                if others > 1 {
+                if devices > 1 {
                     let other = CudaContext::new(1).unwrap(); // makes device 1's context current on this thread
                     let before = result::ctx::get_current().unwrap();
                     assert_eq!(before, Some(other.cu_ctx()));
@@ -671,5 +671,5 @@ fn launch_raw_puts_back_the_current_context() {
             .unwrap();
     });
     assert_eq!(gpu.download(&y), expect, "and the launches computed what Python's replay did");
-    println!("rust gate: launch_raw restores the current context ({others} device(s))");
+    println!("rust gate: launch_raw restores the current context ({devices} device(s))");
 }
