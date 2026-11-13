@@ -711,6 +711,7 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
         attrs["inout"] = tuple(p.name for p, _, _ in inout_args)
     outs = ctx.emit(op.name, inputs, attrs, out_types)
     node = ctx.nodes[-1]
+    node.callee = op
     for (p, arg, read), version in zip(inout_args, outs[n_results:]):
         # The call consumes the version it read and replaces it: a temporary, a chunk or an older version
         # is a value, so reading it again raises; a parameter's name follows its newest version.

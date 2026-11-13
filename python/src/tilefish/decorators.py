@@ -482,10 +482,17 @@ class ExternOp(Op):
         source_sha256: "str | None" = None,
         index_bits: int = 32,
         binary: "BinaryTarget | None" = None,
+        reference: "Callable[..., Any] | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         if type(index_bits) is not int or index_bits not in (32, 64):
             raise TilefishDeclarationError(f"extern '{name}': index_bits must be 32 or 64, got {index_bits!r}")
+        if reference is not None and not callable(reference):
+            raise TilefishDeclarationError(f"extern '{name}': reference must be a callable, got {reference!r}")
+        # An oracle in torch for ``mode="reference"`` of a graph that calls this op (see ``tilefish.run``): called with the op's tensor inputs
+        # as keyword arguments (by parameter name) it returns its ``Out`` tensors, a tensor or a tuple in order. It is not part of the
+        # declaration: it is not in a digest, a compile spec or a manifest, and no binary depends on it.
+        self.reference: "Callable[..., Any] | None" = reference
         self.index_bits: int = index_bits
         self.binary: "BinaryTarget | None" = binary  # a prebuilt PTX or cubin instead of a Triton kernel (triton is "" then)
         self.triton = triton
@@ -715,6 +722,7 @@ def extern(
     grid: Any = None,
     name: str | None = None,
     index_bits: int = 32,
+    reference: "Callable[..., Any] | None" = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
 
@@ -743,6 +751,11 @@ def extern(
     a Rust host check at launch, because a kernel that indexes with ``i32`` (``row * N_COLS + col`` on ``tl.int32`` values) goes
     through memory it was not given, silently, on a tensor that is any larger. A kernel that computes its offsets in ``i64``
     (``row.to(tl.int64) * N_COLS``) declares ``index_bits=64`` and has no such limit. The choice is in the declaration digest.
+
+    ``reference=`` is an oracle in torch for ``tilefish.run(graph, ..., mode="reference")``, where a graph that calls this op has nothing to
+    interpret (a hand-written kernel has no IR): a callable that takes the op's tensor inputs as keyword arguments, by parameter name (a
+    ``DevScalar`` as a tensor of one element), and returns its ``Out`` tensors, one tensor or a tuple in order. It is not part of the declaration
+    (not in a digest, a compile spec or a manifest), so a binary does not depend on it.
 
     The decorated stub lists **the Triton kernel's parameters, in order**:
     a ``Tensor``/``InOut``/``Out`` is a pointer, a parameter annotated with a
@@ -861,6 +874,7 @@ def extern(
             max_elements=limits,
             index_bits=index_bits,
             binary=binary,
+            reference=reference,
         )
 
     return deco

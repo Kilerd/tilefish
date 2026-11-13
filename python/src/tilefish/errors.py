@@ -24,6 +24,12 @@ class TilefishSpecError(TilefishError, ValueError):
     """A declaration cannot be turned into an ahead-of-time compile spec."""
 
 
+class TilefishPlanError(TilefishError, ValueError):
+    """A graph cannot be turned into a launch plan: it has something that is not a launch of a declared operator or a view (a traced
+    arithmetic op, a store, a nested graph), a dimension without buckets, an in-place call on a view, a returned value that is a view or an
+    input, or a step that no binary can serve. The message names the graph, the node and the rule."""
+
+
 class TilefishLoweringError(TilefishError, ValueError):
     """A kernel body does not fit a lowering template, so no Triton source can be generated for it.
 

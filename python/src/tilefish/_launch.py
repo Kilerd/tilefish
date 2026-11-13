@@ -147,7 +147,6 @@ def bind_call(op_name: str, sig: "Signature", args: Sequence[Any], kwargs: Mappi
     tensors: dict[str, Any] = {}
     infos: dict[str, TensorInfo] = {}
     consts: dict[str, Any] = {}
-    equations: list[tuple[str, int, DimExpr, int, str, str]] = []
     for p in sig.params:
         if p.kind == "const":
             if p.name in explicit:
@@ -157,9 +156,25 @@ def bind_call(op_name: str, sig: "Signature", args: Sequence[Any], kwargs: Mappi
             continue
         t = bound.arguments[p.name]
         info = tensor_info(p.name, t)
-        check_tensor(p, info)
+        check_tensor(p, info)  # in argument order: the first argument that is wrong is the one reported
         tensors[p.name] = t
         infos[p.name] = info
+    return Call(tensors, infos, consts, bind_infos(op_name, sig, infos))
+
+
+def bind_infos(op_name: str, sig: "Signature", infos: "Mapping[str, TensorInfo]") -> "dict[Dim, int]":
+    """Check the supplied tensors (``infos``: every ``In`` and ``InOut`` tensor parameter of ``sig``, by name) against their declared types
+    and unify their shapes (and, for a ``Strided[...]`` parameter, their strides) into dimension values.
+
+    This is the part of :func:`bind_call` that needs no tensor, only facts about one: a plan binds the dimensions of a step from the shapes
+    and strides of the views it launches with, which are not torch tensors.
+    """
+    equations: list[tuple[str, int, DimExpr, int, str, str]] = []
+    for p in sig.params:
+        if p.kind != "tensor" or p.access == "out":
+            continue
+        info = infos[p.name]
+        check_tensor(p, info)
         assert p.type is not None
         for axis, (pattern, actual) in enumerate(zip(p.type.shape, info.shape)):
             equations.append((p.name, axis, pattern, actual, str(p.type), "dimension"))
@@ -169,8 +184,7 @@ def bind_call(op_name: str, sig: "Signature", args: Sequence[Any], kwargs: Mappi
             for axis, (pattern, actual) in enumerate(zip(p.type.strides, actual_strides)):
                 if pattern is not None:
                     equations.append((p.name, axis, pattern, actual, str(p), "stride"))
-    dims = solve_dims(op_name, equations)
-    return Call(tensors, infos, consts, dims)
+    return solve_dims(op_name, equations)
 
 
 def check_tensor(p: "Param", info: TensorInfo) -> None:

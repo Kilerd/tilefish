@@ -93,6 +93,7 @@ import tempfile
 import threading
 import weakref
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 from . import _cache, _cuda, _ir
@@ -113,7 +114,7 @@ from ._launch import (
     tf_dtype_name,
 )
 from .aot import CompileSpec, compile_specs
-from .decorators import ExternOp, KernelOp, LibraryOp, Op
+from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp, Op
 from .dims import Dim, DimExpr
 from ._manifest import MANIFEST_NAME, Manifest, manifest_digest
 from .errors import (
@@ -152,6 +153,9 @@ def clear_caches() -> None:
         _builds.clear()
         _manifests.clear()
         _pins.clear()
+    from . import _planrun
+
+    _planrun.clear_caches()  # the runners of launch plans, and the arenas they hold
     try:
         _cuda.unload_all()
     except TilefishError:
@@ -344,6 +348,17 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]")
         results = [allocated[p.name] for p in out_params]
 
     infos = {name: tensor_info(name, t) for name, t in tensors.items()}
+    scalars, grid = _finish_launch(extern, spec, call.dims, infos)
+    return _Prepared(target, spec, str(device), tensors, scalars, grid, results)
+
+
+def _finish_launch(extern: ExternOp, spec: CompileSpec, dims: "dict[Dim, int]", infos: "dict[str, TensorInfo]") -> "tuple[dict[str, int], tuple[int, ...]]":
+    """The runtime scalars and the grid of one launch of ``spec``, after every check a launch makes (``dims`` are the bound dimensions,
+    ``infos`` the facts about every pointer argument of the launched kernel by its parameter name).
+
+    This is the half of :func:`_prepare` that does not depend on where the facts come from: a call on torch tensors has them from the
+    tensors, a plan from the views it launches with (:mod:`tilefish._plan`).
+    """
     by_name = {p.name: p for p in extern.signature.params}
     scalars: "dict[str, int]" = {}
     for a in spec.args:
@@ -351,7 +366,7 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]")
             continue
         p = by_name[a.name]
         assert p.dim is not None
-        v = eval_dim(p.dim, call.dims)
+        v = eval_dim(p.dim, dims)
         if a.count_of is not None:  # a generated kernel's n: the element count of that tensor argument
             count = math.prod(infos[a.count_of].shape)
             if v is not None and v != count:
@@ -361,19 +376,18 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]")
                     arg=a.name,
                 )
             if v is None and isinstance(p.dim, Dim):
-                call.dims[p.dim] = count  # the grid may be written over it
+                dims[p.dim] = count  # the grid may be written over it
             v = count
         elif v is None:
             raise TilefishRuntimeError(f"cannot determine the runtime argument '{a.name}' ({p.dim}) from the tensor shapes")
         scalars[a.name] = v
-    check_dim_constraints(call.dims)
+    check_dim_constraints(dims)
     check_scalar_ranges(spec, scalars)
     written = {p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in"}
     check_no_alias(infos, written)
-    check_spec_preconditions(spec, infos, scalars, call.dims)
+    check_spec_preconditions(spec, infos, scalars, dims)
     assert extern.grid is not None
-    grid = eval_grid(spec, extern.grid, call.dims)
-    return _Prepared(target, spec, str(device), tensors, scalars, grid, results)
+    return scalars, eval_grid(spec, extern.grid, dims)
 
 
 def _launch_values(prep: _Prepared) -> "list[tuple[str, str, Any]]":
@@ -495,16 +509,20 @@ def build_binary_for_device(spec: CompileSpec, target: Any, device_index: int) -
     return built
 
 
+def jit_built(target: _Target, spec: CompileSpec, index: int) -> BuiltKernel:
+    """The binary of ``spec`` as ``jit`` builds it (in memory, for the architecture of device ``index``): the current source through the compile
+    spec, or a prebuilt PTX assembled / a cubin taken for the device."""
+    extern = target.launch_extern()
+    if extern.binary is not None:
+        return build_binary_for_device(spec, extern.binary, index)
+    return build_for_device(spec, target.jit_function(spec), index)
+
+
 def _run_jit(prep: _Prepared) -> None:
     """Build the current source through the compile spec, in memory, and launch that binary."""
     torch = _torch()
     index = _device_index(torch, prep.device)
-    extern = prep.target.launch_extern()
-    if extern.binary is not None:
-        _launch_built(prep, build_binary_for_device(prep.spec, extern.binary, index), index)
-        return
-    fn = prep.target.jit_function(prep.spec)
-    _launch_built(prep, build_for_device(prep.spec, fn, index), index)
+    _launch_built(prep, jit_built(prep.target, prep.spec, index), index)
 
 
 def _load_manifest(manifest: Any) -> Manifest:
@@ -552,22 +570,28 @@ def _current_ir(prep: "_Prepared", cap: int, built_with: "str | None") -> "tuple
     return _ir_digest_of(prep.spec, fn, cap, {}), version
 
 
+def replay_built(target: _Target, spec: CompileSpec, manifest: Manifest, pinned: bool, index: int) -> BuiltKernel:
+    """The binary of ``spec`` in a manifest for the architecture of device ``index``, after every check a replay makes: the entry is what the
+    spec asks for, and the IR digest of the kernel this process holds is the entry's when it can be recomputed (``pinned`` says the caller
+    vouches for the manifest)."""
+    torch = _torch()
+    cap = _capability(torch, index)
+    arch = f"sm_{cap}"
+    if spec.binary is not None:  # a prebuilt binary is identified by the sha256 of its PTX or cubin, compared without Triton
+        return manifest.built_kernel(spec, arch, pinned=pinned)
+    artifact = manifest.get(spec.stem, arch)
+    digest = version = None
+    if artifact is not None and artifact.entry.get("source_digest_kind") == _ir.IR_DIGEST_KIND:  # an entry with no IR digest has nothing to compare
+        toolchain = artifact.entry.get("toolchain")
+        digest, version = _current_ir(SimpleNamespace(target=target, spec=spec), cap, toolchain.get("triton") if isinstance(toolchain, dict) else None)  # type: ignore[arg-type]
+    return manifest.built_kernel(spec, arch, ir_digest=digest, ir_triton=version, pinned=pinned)
+
+
 def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
     """Launch the prebuilt cubin of the manifest for this spec and this device's architecture."""
     torch = _torch()
     index = _device_index(torch, prep.device)
-    cap = _capability(torch, index)
-    arch = f"sm_{cap}"
-    if prep.spec.binary is not None:  # a prebuilt binary is identified by the sha256 of its PTX or cubin, compared without Triton
-        _launch_built(prep, manifest.built_kernel(prep.spec, arch, pinned=pinned), index)
-        return
-    artifact = manifest.get(prep.spec.stem, arch)
-    digest = version = None
-    if artifact is not None and artifact.entry.get("source_digest_kind") == _ir.IR_DIGEST_KIND:  # an entry with no IR digest has nothing to compare
-        toolchain = artifact.entry.get("toolchain")
-        digest, version = _current_ir(prep, cap, toolchain.get("triton") if isinstance(toolchain, dict) else None)
-    built = manifest.built_kernel(prep.spec, arch, ir_digest=digest, ir_triton=version, pinned=pinned)
-    _launch_built(prep, built, index)
+    _launch_built(prep, replay_built(prep.target, prep.spec, manifest, pinned, index), index)
 
 
 _library_specs: "weakref.WeakKeyDictionary[LibraryOp, list[Any]]" = weakref.WeakKeyDictionary()  # an op is immutable
@@ -578,7 +602,7 @@ def _run_library(op: LibraryOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]
     """Run a pinned library operation (a cuBLASLt GEMM). ``jit`` pins the algorithm in memory exactly as ``export`` does and runs it; ``replay``
     runs the algorithm a manifest recorded, after checking that its entry is what the declaration asks for and that cuBLASLt is the version that
     chose it; ``reference`` is torch: an f32 matmul of the operands with the bias added in f32, rounded once to bf16."""
-    from . import _cublaslt, _library
+    from . import _library
 
     torch = _torch()
     call = bind_call(op.name, op.signature, args, kwargs)
@@ -600,23 +624,38 @@ def _run_library(op: LibraryOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]
     out = torch.empty(shape, dtype=torch.bfloat16, device=device)
     check_spec_preconditions(spec, {**call.infos, "out": tensor_info("out", out)}, {}, call.dims)
     index = _device_index(torch, str(device))
-    cap = _capability(torch, index)
-    arch = f"sm_{cap}"
     if mode == "jit":
-        key = (spec.stem, arch, spec.workspace_bytes, _cublaslt.version(), spec.declaration_digest)
-        with _lock:
-            built = _pins.get(key)
-        if built is None:
-            built = _library.build_library(spec, arch=cap, device_index=index)
-            with _lock:
-                _pins[key] = built
+        built = jit_pin(spec, index)
     else:
         assert manifest is not None
-        built = _library.built_from_manifest(manifest, spec, arch)
+        built = replay_pin(spec, manifest, index)
     with torch.cuda.device(index):
         stream = torch.cuda.current_stream(index).cuda_stream
         _library.run_gemm(spec, built.algo, call.tensors, out, stream, index)
     return out
+
+
+def jit_pin(spec: Any, index: int) -> Any:
+    """The algorithm ``jit`` pins in memory for a library spec on device ``index`` (what ``export`` writes), cached for the process."""
+    from . import _cublaslt, _library
+
+    cap = _capability(_torch(), index)
+    key = (spec.stem, f"sm_{cap}", spec.workspace_bytes, _cublaslt.version(), spec.declaration_digest)
+    with _lock:
+        built = _pins.get(key)
+    if built is None:
+        built = _library.build_library(spec, arch=cap, device_index=index)
+        with _lock:
+            _pins[key] = built
+    return built
+
+
+def replay_pin(spec: Any, manifest: Manifest, index: int) -> Any:
+    """The algorithm a manifest recorded for a library spec on device ``index``, after checking that its entry is what the declaration asks for and
+    that cuBLASLt is the version that chose it."""
+    from . import _library
+
+    return _library.built_from_manifest(manifest, spec, f"sm_{_capability(_torch(), index)}")
 
 
 def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:
@@ -646,8 +685,14 @@ def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, 
 
 
 def export(
-    ops: Any, directory: "str | os.PathLike[str]", *, arch: "int | str | None" = None, overwrite: bool = False
-) -> Manifest:
+    ops: Any,
+    directory: "str | os.PathLike[str]",
+    *,
+    arch: "int | str | None" = None,
+    overwrite: bool = False,
+    buckets: Any = None,
+    reuse: bool = False,
+) -> Any:
     """Build every binary of one or several kernels and externs and write them as a manifest directory.
 
     For each compile spec of each operator (one per bucket) the cubin is built for ``arch`` (default: the
@@ -673,6 +718,15 @@ def export(
     must have the same digest, or this raises :class:`~tilefish.errors.TilefishManifestError`.
     """
     items = list(ops) if isinstance(ops, (list, tuple)) else [ops]
+    graphs = [o for o in items if isinstance(o, GraphOp) and not isinstance(o, KernelOp)]
+    if graphs:
+        if len(items) != 1:
+            raise TilefishRuntimeError("export takes one graph by itself (its manifest holds the binaries of its plan); export the other operators separately")
+        from ._planrun import export_graph
+
+        return export_graph(graphs[0], directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse)
+    if buckets is not None or reuse:
+        raise TilefishRuntimeError("buckets= and reuse= are for exporting a graph (they shape its launch plan); kernels and externs are built for the buckets of their own dimensions")
     if arch is None:
         torch = _torch()
         cap = _capability(torch, torch.cuda.current_device())
@@ -712,6 +766,33 @@ def export(
     return loaded
 
 
+def _run_graph(op: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", mode: str, manifest: Any, pin: "str | None", trust_directory: bool) -> Any:
+    """``run`` of a ``@tilefish.graph``: its launch plan (:mod:`tilefish._plan`), run by :mod:`tilefish._planrun`. ``plan=`` and ``outputs=`` are the two
+    keywords that are not arguments of the graph (a graph with a parameter of those names takes it positionally)."""
+    plan = kwargs.pop("plan", None)
+    outputs = kwargs.pop("outputs", None)
+    if manifest is not None:
+        raise TilefishRuntimeError("manifest= is for a kernel or an extern; a graph replays plan=<directory> (written by tilefish.runtime.export(graph, directory))")
+    if mode != "replay" and (pin is not None or trust_directory):
+        raise TilefishRuntimeError(f"pin= and trust_directory= are for mode='replay' (they vouch for a plan directory); mode {mode!r} runs no plan directory")
+    if trust_directory is not True and trust_directory is not False:
+        raise TilefishRuntimeError(f"trust_directory= is True or False, got {trust_directory!r}")
+    if pin is not None and not (isinstance(pin, str) and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin)):
+        raise TilefishRuntimeError(f"pin= is the 64 lowercase hex digits of a plan digest, got {pin!r}")
+    from ._planrun import run_graph
+
+    return run_graph(op, args, kwargs, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, outputs=outputs)
+
+
+def prepare(op: GraphOp, **options: Any) -> None:
+    """Do ahead of time what a run of a graph's plan does for itself the first time (allocate its arena, build or load every binary, create the cuBLASLt
+    handle), none of which can happen while a CUDA graph is being captured. ``prepare(graph, mode="jit" | "replay", plan=..., pin=..., device=..., buckets=...)``;
+    see :func:`tilefish._planrun.prepare`."""
+    from ._planrun import prepare as _prepare_plan
+
+    _prepare_plan(op, **options)
+
+
 def run(
     op: Any,
     /,
@@ -722,7 +803,12 @@ def run(
     trust_directory: bool = False,
     **kwargs: Any,
 ) -> Any:
-    """Run a kernel or an extern op on tensors. See the module docstring for the three modes.
+    """Run a kernel or an extern op on tensors, or a graph through its launch plan. See the module docstring for the three modes.
+
+    ``op`` can be a ``@tilefish.graph``: ``jit`` runs its plan (``plan=tilefish.plan(graph, ...)`` or, by default, ``tilefish.plan(graph)``) with binaries built in
+    memory, ``replay`` runs the plan of an exported directory (``plan=<directory>``, with ``pin=<the plan's digest>`` or ``trust_directory=True``: the plan
+    pins its manifest, so it pins every binary), ``reference`` composes the references of its ops in torch. ``outputs=`` gives the tensors a plan writes its
+    returned values into instead of allocating them. See :mod:`tilefish._plan` and ``docs/plan-schema-1.md``.
 
     ``op`` is a ``@tilefish.kernel`` (or its :class:`~tilefish.lower.LoweredKernel`) or an ``@tilefish.extern`` whose
     Triton function can be imported. ``mode`` is ``"jit"``, ``"replay"`` or ``"reference"``. ``manifest`` is the
@@ -744,6 +830,8 @@ def run(
     """
     if mode not in MODES:
         raise TilefishRuntimeError(f"unknown mode {mode!r}: use one of {', '.join(MODES)}")
+    if isinstance(op, GraphOp) and not isinstance(op, KernelOp):
+        return _run_graph(op, args, kwargs, mode, manifest, pin, trust_directory)
     if mode == "replay" and manifest is None:
         raise TilefishRuntimeError(
             "replay runs prebuilt cubins from a manifest directory: pass manifest=<directory> (write one with "

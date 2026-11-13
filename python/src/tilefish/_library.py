@@ -542,14 +542,31 @@ def validate_entry(entry: Any, index: int = 0) -> None:
 def run_gemm(spec: LibrarySpec, algo: str, tensors: "dict[str, Any]", out: Any, stream: int, device_index: int) -> None:
     """Launch ``cublasLtMatmul`` with the pinned ``algo`` on ``stream``: ``tensors`` are ``a``, ``b`` (and ``bias``) by the op's parameter
     names in order, ``out`` the result tensor; all are contiguous, 16-byte aligned and have the shapes of ``spec`` (the caller checked)."""
+    a, b, *rest = tensors.values()
+    run_gemm_ptrs(
+        spec, algo, int(a.data_ptr()), int(b.data_ptr()), int(rest[0].data_ptr()) if rest else None, int(out.data_ptr()), stream, device_index
+    )
+
+
+def run_gemm_ptrs(
+    spec: LibrarySpec,
+    algo: str,
+    a_ptr: int,
+    b_ptr: int,
+    bias_ptr: "int | None",
+    out_ptr: int,
+    stream: int,
+    device_index: int,
+    workspace_ptr: "int | None" = None,
+) -> None:
+    """:func:`run_gemm` on device addresses. With ``workspace_ptr`` (``spec.workspace_bytes`` bytes, 256-byte aligned: a buffer of a launch plan's
+    arena) the workspace is that memory and the call allocates nothing; without it the workspace comes from torch's caching allocator."""
     from . import _cublaslt
 
-    a, b, *rest = tensors.values()
-    bias_ptr = int(rest[0].data_ptr()) if rest else None
     _cublaslt.matmul(
-        int(a.data_ptr()),
-        int(b.data_ptr()),
-        int(out.data_ptr()),
+        a_ptr,
+        b_ptr,
+        out_ptr,
         bias_ptr,
         spec.m,
         spec.n,
@@ -558,6 +575,7 @@ def run_gemm(spec: LibrarySpec, algo: str, tensors: "dict[str, Any]", out: Any, 
         workspace_bytes=spec.workspace_bytes,
         stream=stream,
         device_index=device_index,
+        workspace_ptr=workspace_ptr,
     )
 
 

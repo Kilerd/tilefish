@@ -45,12 +45,14 @@ from .errors import (
     TilefishLoweringError,
     TilefishManifestError,
     TilefishPicklingError,
+    TilefishPlanError,
     TilefishPreconditionError,
     TilefishRuntimeError,
     TilefishSpecError,
     TilefishTypeError,
 )
 from ._manifest import Manifest
+from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import exp, gelu, load, rsqrt, silu, sqrt
@@ -87,6 +89,7 @@ __all__ = [
     "Node",
     "Op",
     "Out",
+    "Plan",
     "Requirement",
     "Scalar",
     "StrideOf",
@@ -101,6 +104,7 @@ __all__ = [
     "TilefishLoweringError",
     "TilefishManifestError",
     "TilefishPicklingError",
+    "TilefishPlanError",
     "TilefishPreconditionError",
     "TilefishRuntimeError",
     "TilefishSpecError",
@@ -126,6 +130,7 @@ __all__ = [
     "load",
     "lower",
     "mean",
+    "plan",
     "rsqrt",
     "run",
     "silu",
