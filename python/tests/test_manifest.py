@@ -16,10 +16,11 @@ import os
 
 import pytest
 from built_fakes import FAKE_SOURCE_DIGEST, fake_build, rowop, scale
-from elf_builder import S, SHT_PROGBITS, build_elf, cubin_like
+from elf_builder import S, SHT_PROGBITS, arch_header, build_elf
+from elf_builder import cubin_like as any_cubin_like
 
 import tilefish
-from tilefish import Dim, Manifest, Out, Tensor, TilefishBuildError, TilefishManifestError, TilefishRuntimeError, bf16, const, f32
+from tilefish import Dim, Manifest, Out, Tensor, TilefishBuildError, TilefishManifestError, TilefishRuntimeError, TilefishSpecError, bf16, const, f32
 from tilefish._elf import code_digest, parse_elf
 from tilefish._manifest import manifest_digest
 from tilefish._ir import IR_DIGEST_KIND
@@ -28,6 +29,11 @@ from tilefish.runtime import _load_manifest
 
 SRC = FAKE_SOURCE_DIGEST
 TRITON = "3.5.1"  # the Triton version fake_build says built it
+
+
+def cubin_like(arch="sm_90", **kw):
+    """A small cubin for ``arch`` (sm_90, the architecture of the manifests here): its ELF header names it, as a reader requires."""
+    return any_cubin_like(**{**arch_header(arch), **kw})
 
 
 @pytest.fixture
@@ -220,13 +226,12 @@ ENTRY_CHANGES = [
     (lambda e: e.update(block=[64, 1, 1]), "block"),
     (lambda e: e.update(num_warps=8), "num_warps"),
     (lambda e: e["constexprs"][1].update(value=512), "constexprs[1].value"),
-    (lambda e: e["abi"]["params"][0].update(dtype="f32"), "abi.params[0].dtype"),
+    (lambda e: e["abi"]["params"][0].update(dtype="f32", type="*fp32"), "abi.params[0].type"),  # (a dtype that is not its type the reader refuses)
     (lambda e: e["abi"]["scratch"].pop(), "abi.scratch"),
     (lambda e: e["preconditions"].pop(), "preconditions"),
     (lambda e: e.update(declaration_digest="0" * 64), "declaration_digest"),
     (lambda e: e["options"].update(enable_fp_fusion=False), "options.enable_fp_fusion"),
     (lambda e: e["options"].update(num_stages=2), "options.num_stages"),
-    (lambda e: e.update(buckets={"S": 32}), "buckets.S"),
 ]
 
 
@@ -239,11 +244,19 @@ def test_built_kernel_refuses_an_entry_that_is_not_what_the_spec_asks_for(direct
         m.built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
 
-@pytest.mark.parametrize("key", ["op", "abi", "grid", "block", "num_warps", "num_stages", "constexprs", "buckets", "preconditions", "declaration_digest"])
+@pytest.mark.parametrize("key", ["op", "abi", "grid", "block", "num_warps", "num_stages", "constexprs", "buckets", "preconditions", "declaration_digest", "dims"])
 def test_an_entry_that_lacks_a_field_of_the_spec_is_not_taken_to_agree_with_it(directory, key):
-    """A missing field must not read as "whatever the spec says": the entry has to say it."""
+    """A missing field must not read as "whatever the spec says": the entry has to say it.
+
+    What an entry says of itself (its operator and buckets, which make its stem, its ABI, grid, dimensions, preconditions and declaration
+    digest) the reader requires, as the Rust reader does; the rest is told missing when the entry is compared with the spec.
+    """
     edit_manifest(directory, lambda d: d["kernels"][0].pop(key))
     spec, _ = specs()
+    if key in ("op", "abi", "grid", "buckets", "preconditions", "declaration_digest", "dims"):
+        with pytest.raises(TilefishManifestError, match=rf"manifest kernel 0 \('scale'\) is missing \['{key}'\]"):
+            Manifest.load(directory)
+        return
     with pytest.raises(TilefishManifestError, match=r"not what the compile spec asks for: first difference at " + key):
         Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
 
@@ -447,6 +460,151 @@ def test_a_source_digest_of_another_kind_says_nothing_about_the_ir(tmp_path):
         Manifest.load(tmp_path)
 
 
+# -- what an entry says of itself is read as the Rust reader reads it (crates/tilefish/src/manifest.rs) -----------------------------------
+#
+# Each document below is a valid manifest changed in one place, and loaded with its digest pinned again: the pin vouches for the document, so
+# the refusal can only be the check of the reader (the Rust reader refuses each of them, with the same message).
+
+
+def repinned(directory, change):
+    """Change the manifest in ``directory`` with ``change(doc)`` and load it pinned to the digest of the changed document."""
+    edit_manifest(directory, change)
+    return Manifest.load(directory, pin=manifest_digest(json.loads((directory / "manifest.json").read_text())))
+
+
+def kernel(doc, stem="scale"):
+    return next(e for e in doc["kernels"] if e["stem"] == stem)
+
+
+def param_of(entry, name):
+    return next(p for p in entry["abi"]["params"] if p["name"] == name)
+
+
+@pytest.mark.parametrize("field, value", [("dtype", "i32"), ("access", "in"), ("shape", []), ("strides", [1]), ("offset", "n_offset"), ("value", 7)])
+def test_a_scalar_parameter_with_a_field_of_a_pointer_or_a_fixed_argument_is_refused(directory, field, value):
+    with pytest.raises(TilefishManifestError, match=rf"'scale' \(sm_90\): parameter n_elem is a scalar: it has a dim and no dtype, access, shape, strides or value \(it has \['{field}'\]\)"):
+        repinned(directory, lambda d: param_of(kernel(d), "n_elem").update({field: value}))
+
+
+def test_a_field_of_a_parameter_that_is_null_is_as_absent_and_one_no_parameter_has_is_refused(directory):
+    assert repinned(directory, lambda d: param_of(kernel(d), "n_elem").update(dtype=None, access=None)).get("scale", "sm_90") is not None
+    with pytest.raises(TilefishManifestError, match=r"parameter x is not a well-formed 64-bit pointer"):  # and a pointer has no dim
+        repinned(directory, lambda d: param_of(kernel(d), "x").update(dim="n"))
+    with pytest.raises(TilefishManifestError, match=r"abi.params\[0\] \('x'\) has unknown fields \['note'\]"):
+        repinned(directory, lambda d: param_of(kernel(d), "x").update(note="anything"))
+
+
+@pytest.mark.parametrize(
+    "stem, change, message",
+    [
+        ("scale", lambda e: e.update(buckets={"S": 32}), r"stem 'scale' does not match op 'scale' and buckets \{'S': 32\}: .* 'scale.S32'"),
+        ("rowop.S32", lambda e: e.update(stem="rowop.S64"), r"stem 'rowop.S64' does not match op 'rowop' and buckets \{'S': 32\}"),
+        ("rowop.S32", lambda e: e.update(stem="rowop.S32x"), r"stem 'rowop.S32x' does not match op 'rowop'"),
+        ("scale", lambda e: e.update(op="scaled"), r"stem 'scale' does not match op 'scaled' and buckets \{\}"),
+        ("rowop.S32", lambda e: e.update(buckets={"S": True}), r"bucket value of S must be an int >= 1, got True"),
+        ("rowop.S32", lambda e: e.update(buckets={"S": 0}), r"bucket value of S must be an int >= 1, got 0"),
+        ("scale", lambda e: e.update(op="scale.x"), r"op must be an identifier, got 'scale.x'"),
+    ],
+)
+def test_a_stem_that_is_not_its_operator_and_its_buckets_is_refused(directory, stem, change, message):
+    """The stem of a binary is its operator and the value of each of its buckets (``rowop.S32``), the name a host chooses a binary by."""
+    with pytest.raises(TilefishManifestError, match=message):
+        repinned(directory, lambda d: change(kernel(d, stem)))
+
+
+@pytest.mark.parametrize("value", [None, "A" * 64, "a" * 63, 5])
+def test_a_declaration_digest_that_is_null_or_not_a_sha256_is_refused(directory, value):
+    with pytest.raises(TilefishManifestError, match=rf"'scale' \(sm_90\): declaration_digest must be 64 lowercase hex digits \(a sha256\), got {value!r}"):
+        repinned(directory, lambda d: kernel(d).update(declaration_digest=value))
+
+
+def test_an_entry_whose_architecture_is_not_the_one_its_cubin_is_for_is_refused(directory):
+    """A cubin is used as it is, for the architecture its ELF header names: an entry relabelled ``sm_90`` that holds an sm_103 cubin is refused."""
+    sm103 = cubin_like("sm_103")
+    cubin_of(directory).write_bytes(sm103)
+    with pytest.raises(TilefishManifestError, match=r"'scale' \(sm_90\): 'scale.sm_90.cubin' is for sm_103 \(its ELF header says so\), but the manifest says sm_90"):
+        repinned(directory, lambda d: kernel(d).update(sha256=hashlib.sha256(sm103).hexdigest(), sha256_code=code_digest(sm103)))
+    with pytest.raises(TilefishManifestError, match=r"arch must look like 'sm_103', got 'sm_103\\n'"):
+        repinned(directory, lambda d: kernel(d).update(arch="sm_103\n"))
+    assert repinned(directory, lambda d: kernel(d).update(arch="sm_103")).get("scale", "sm_103").cubin == sm103  # the label that is the cubin's
+    for arch in ("sm_9", "sm_1030", "sm_90a", "SM_90", "sm_٩٠"):
+        with pytest.raises(TilefishManifestError, match=r"arch must look like 'sm_103'"):
+            repinned(directory, lambda d, arch=arch: kernel(d, "rowop.S32").update(arch=arch))
+
+
+def test_a_triton_cubin_whose_header_names_no_architecture_is_left_to_the_driver(directory):
+    """As the Rust reader: only a prebuilt binary must name its architecture (``test_binary_externs.py`` has that refusal)."""
+    other = cubin_like(osabi=0x07)
+    cubin_of(directory).write_bytes(other)
+    m = repinned(directory, lambda d: kernel(d).update(sha256=hashlib.sha256(other).hexdigest(), sha256_code=code_digest(other)))
+    assert m.get("scale", "sm_90").cubin == other
+
+
+# -- the dimension names of an entry, and the 128-bit fold of its expressions -------------------------------------------------------------
+
+
+def test_an_entry_names_at_most_32_dimensions_and_every_one_it_uses_is_in_dims(directory):
+    """The Rust host binds at most 32 dimension names per entry (``expr::MAX_DIMS``): the names of ``dims`` and of every expression together."""
+    from tilefish._manifest import MAX_DIMS
+
+    assert MAX_DIMS == 32
+    names = {f"d{i}": {} for i in range(31)}  # and n: 32
+    assert repinned(directory, lambda d: kernel(d)["dims"].update(names)).get("scale", "sm_90") is not None
+    with pytest.raises(TilefishManifestError, match=r"'scale' \(sm_90\): a kernel may use at most 32 dimension names, and this one has 33"):
+        repinned(directory, lambda d: kernel(d)["dims"].update(d31={}))
+    with pytest.raises(TilefishManifestError, match=r"at most 32 dimension names, and this one has 33"):  # the 33rd in an expression only
+        repinned(directory, lambda d: (kernel(d)["dims"].pop("d31"), kernel(d).update(grid="(cdiv(n + m - m, 256),)")))
+    edit_manifest(directory, lambda d: kernel(d)["dims"].pop("d30"))
+    with pytest.raises(TilefishManifestError, match=r"dims does not name \['m'\], which the declared shapes"):
+        repinned(directory, lambda d: kernel(d).update(grid="(cdiv(n + m - m, 256),)"))
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (lambda e: e.update(grid="(n)"), r"grid '\(n\)': a single entry needs a trailing comma"),
+        (lambda e: e.update(grid="(1234567890123,)"), r"grid '\(1234567890123,\)': expected \), got '3'"),
+        (lambda e: e.update(grid="(n - n,)"), r"entry 0 is the static size 0"),
+        (lambda e: param_of(e, "x").update(shape=["n // 0"]), r"parameter x shape\[0\] 'n // 0': division by 0"),
+        (lambda e: param_of(e, "n_elem").update(dim="n.real"), r"parameter n_elem dim 'n.real' has a character the dimension grammar does not allow"),
+        (lambda e: param_of(e, "n_elem").update(dim=5), r"parameter n_elem: dim must be a str, got 5"),
+    ],
+)
+def test_the_dimension_expressions_of_an_entry_are_in_the_grammar(directory, change, message):
+    with pytest.raises(TilefishManifestError, match=message):
+        repinned(directory, lambda d: change(kernel(d)))
+
+
+X = "549755813888*549755813888*549755813888*1024"  # 2**127, the first integer beyond i128 (four 12-digit numbers)
+Y = "549755813888*549755813888*549755813888*512"  # 2**126
+
+
+def test_expressions_fold_in_128_bits_as_the_rust_reader_folds_them():
+    """A constant or coefficient beyond i128 has no folded value in either reader: a static check that needs one is not made, in both."""
+    from tilefish._specvalid import FOLD_RANGE, _value_of, parse_grid
+
+    assert FOLD_RANGE == range(-(2**127), 2**127)
+    assert _value_of(X, "e") is None and _value_of(Y, "e") == 2**126 and _value_of("-" + X, "e") == -(2**127)  # -2**127 is the least i128
+    assert _value_of(f"0 - (-{X})", "e") is None  # negating -2**127 overflows
+    assert _value_of(f"-1 - (-{X}) - {Y} - {Y}", "e") is None  # even when the result would fit: Rust subtracts by adding the negation
+    assert parse_grid(f"({X} - {X},)") == set()  # 0 only in unbounded arithmetic: not the static grid (0,) here, nor in Rust
+    with pytest.raises(TilefishSpecError, match="entry 0 is the static size 0"):
+        parse_grid(f"({Y} - {Y},)")  # within 128 bits it is
+    # a cdiv by a symbolic divisor whose ratio is 2**127 stays the cdiv atom (Rust's checked ratio), so that `* 0` folds it to 0
+    assert str(_value_of(f"cdiv(-{X}*n, -n)", "e")).startswith("cdiv(") and _value_of("cdiv(2*n, -n)", "e") == -2
+    with pytest.raises(TilefishSpecError, match="entry 0 is the static size 0"):
+        parse_grid(f"(cdiv(-{X}*n, -n)*0,)")
+    assert parse_grid(f"(cdiv(-{X}*n, -n) - {Y} - {Y},)") == {"n"}
+
+
+def test_a_manifest_whose_expressions_leave_128_bits_is_read_as_the_rust_reader_reads_it(directory):
+    assert repinned(directory, lambda d: kernel(d).update(grid=f"(cdiv(n, 256) + {X} - {X},)")).get("scale", "sm_90") is not None
+    with pytest.raises(TilefishManifestError, match="entry 0 is the static size 0"):
+        repinned(directory, lambda d: kernel(d).update(grid=f"({Y} - {Y},)"))
+    with pytest.raises(TilefishManifestError, match=r"parameter x shape\[0\] .*: cdiv by 0 \(the divisor must be positive\)"):
+        repinned(directory, lambda d: param_of(kernel(d), "x").update(shape=[f"cdiv(n, {Y} - {Y})"]))
+
+
 # -- the digest of the manifest --------------------------------------------------------------------------------------------------------
 
 
@@ -538,7 +696,7 @@ def test_pin_is_a_digest_and_belongs_to_replay(directory):
 
 def test_merging_keeps_the_other_architectures_and_kernels(directory):
     (spec,) = compile_specs(scale)
-    other_arch = fake_build(spec, arch="sm_100", cubin=cubin_like(code=b"\x09" * 64))
+    other_arch = fake_build(spec, arch="sm_100", cubin=cubin_like("sm_100", code=b"\x09" * 64))
     path = write_manifest([other_arch], directory / "manifest.json", cubins=True, merge=True)
     m = Manifest.load(path)
     assert sorted((a.stem, a.arch) for a in m.artifacts) == [("rowop.S32", "sm_90"), ("rowop.S64", "sm_90"), ("scale", "sm_100"), ("scale", "sm_90")]
@@ -766,7 +924,7 @@ def test_a_generated_kernels_manifest_names_its_contraction_and_its_warps_per_bu
 
 
 def test_a_minimal_cubin_with_its_code_section_loads(tmp_path):
-    only_debug = build_elf([S(".text.tf_k", SHT_PROGBITS, data=b"\1\2\3\4"), S(".debug_line", data=b"x")])
+    only_debug = build_elf([S(".text.tf_k", SHT_PROGBITS, data=b"\1\2\3\4"), S(".debug_line", data=b"x")], **arch_header("sm_90"))
     (spec,) = compile_specs(scale)
     write_manifest([fake_build(spec, cubin=only_debug, shared=0)], tmp_path / "manifest.json", cubins=True)
     assert Manifest.load(tmp_path).get("scale", "sm_90").sha256_code == code_digest(only_debug)

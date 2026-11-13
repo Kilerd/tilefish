@@ -25,7 +25,7 @@ from collections import namedtuple
 
 import fake_jit
 import fake_triton
-from elf_builder import cubin_like
+from elf_builder import arch_header, cubin_like
 
 GPUTarget = namedtuple("GPUTarget", "backend arch warp_size")
 
@@ -175,7 +175,7 @@ class FakeCompiler:
             launch_cooperative_grid=False,
             **options,
         )
-        return types.SimpleNamespace(metadata=md, asm={"cubin": cubin_like(code=code, shared=1024), "ptx": ptx})
+        return types.SimpleNamespace(metadata=md, asm={"cubin": cubin_like(code=code, shared=1024, **arch_header(target.arch)), "ptx": ptx})
 
 
 def install(monkeypatch, version="3.5.1"):

@@ -30,6 +30,16 @@ The file is read as strict JSON: no ``NaN`` or ``Infinity``, no number that does
 key twice (which parsers disagree about), and every field a replay reads has the type it needs, so a malformed
 manifest is a :class:`~tilefish.errors.TilefishManifestError` and never a bare ``KeyError`` or ``AttributeError``.
 
+What an entry says of itself is read as the Rust reader reads it (``crates/tilefish/src/manifest.rs``), so that the two readers refuse
+the same documents, pinned or not (a re-pinned digest vouches for a document, not for its sense): the architecture is ``sm_`` and two or
+three digits and is the one the cubin's ELF header names (:func:`tilefish._elf.sm_of`; a prebuilt binary's header must name one); the stem
+is the operator and the value of each of its buckets (``rowop.S32``); the ``declaration_digest`` is a sha256; every parameter of the ABI has
+the fields of its kind and no other (a ``scalar`` has no ``dtype``, ``access``, ``shape``, ``strides``, ``offset`` or ``value``; a ``pointer``
+has no ``dim``, ``count_of``, ``stride_of`` or ``value``, takes ``strides`` and ``offset`` together and only when it is ``in``; a ``fixed``
+argument belongs to a prebuilt binary); and the dimension expressions (shapes, strides, offsets, scalars, preconditions, grid) are in the
+grammar, mention only names of ``dims``, and at most :data:`MAX_DIMS` names in all. The rest of what an entry promises (its ABI as a whole,
+its grid, its preconditions) is compared with the operator's compile spec by :meth:`Manifest.built_kernel`.
+
 Nothing here needs Triton, torch or a GPU: it is the part of a host that is just files and digests.
 """
 
@@ -39,8 +49,9 @@ import hashlib
 import json
 import math
 import pathlib
+import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from ._build import (
     BINARY_DIGEST_KIND,
@@ -52,8 +63,10 @@ from ._build import (
     spec_entry,
 )
 from ._ir import IR_DIGEST_KIND
-from ._elf import code_digest, parse_elf, uses_shared
-from .errors import TilefishBuildError, TilefishManifestError
+from ._elf import code_digest, parse_elf, sm_of, uses_shared
+from ._specvalid import parse_expression, parse_grid
+from .dtypes import ALL_DTYPES
+from .errors import TilefishBuildError, TilefishManifestError, TilefishSpecError
 
 if TYPE_CHECKING:
     from .aot import CompileSpec
@@ -61,6 +74,7 @@ if TYPE_CHECKING:
 MANIFEST_NAME = "manifest.json"
 DIGEST_TAG = b"tilefish.manifest-digest.v3\0"  # part of what is hashed: another canonical form must change it
 LEGACY_DIGEST_TAG = b"tilefish.manifest-digest.v2\0"  # schema 2, the one the Rust host (crate 0.0.1) computes
+MAX_DIMS = 32  # the most dimension names one kernel entry may use: the Rust reader's `expr::MAX_DIMS` (crates/tilefish/src/expr.rs)
 
 
 def manifest_digest(doc: "dict[str, Any]") -> str:
@@ -143,6 +157,259 @@ def _check_pin(directory: pathlib.Path, doc: "dict[str, Any]", pin: Any) -> None
             f"the manifest in {str(directory)!r} has digest {found}, but the pin is {pin}: it is not the manifest that was "
             "pinned (it was changed, or it is another export)"
         )
+
+
+# -- what an entry says of itself, read as the Rust reader reads it (crates/tilefish/src/manifest.rs) ------------------------------
+
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
+_ARCH = re.compile(r"sm_[0-9]{2,3}", re.ASCII)  # `is_arch`
+_SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)  # `is_digest`
+_U64_MAX = 2**64 - 1
+# every field a parameter of the ABI may have (`RawParam`), the ones it must have, and the width each scalar type is passed with
+_PARAM_FIELDS = frozenset("slot index name kind type ptx_type size dtype access shape dim count_of strides offset stride_of value".split())
+_PARAM_REQUIRED = ("slot", "index", "name", "kind", "type", "ptx_type", "size")
+_PASSED_AS = {"scalar": {"i32": ("u32", 4), "i64": ("u64", 8)}, "fixed": {"i32": ("u32", 4), "i64": ("u64", 8), "f32": ("f32", 4)}}
+
+
+def _is_ident(x: Any) -> bool:
+    return isinstance(x, str) and _IDENT.fullmatch(x) is not None
+
+
+def _is_count(x: Any, minimum: int) -> bool:
+    """An int (not a bool) from ``minimum`` to ``2**64 - 1``: what the Rust reader reads as a ``u64`` (or a ``usize``)."""
+    return type(x) is int and minimum <= x <= _U64_MAX
+
+
+def _has(p: "dict[str, Any]", key: str) -> bool:
+    """Whether a parameter has the field ``key``: a JSON ``null`` is as absent, as the Rust reader reads an optional field."""
+    return p.get(key) is not None
+
+
+def _check_identity(who: str, entry: "dict[str, Any]") -> None:
+    """The architecture, the stem and the declaration digest of an entry (the Rust reader's ``Entry::check_raw``).
+
+    The stem of a binary is its operator and the value of each of its buckets, in the order of ``buckets`` (``rowop.S32``): a stem that
+    names another operator or other buckets is refused, whatever the entry's digest. The ``declaration_digest`` is a sha256 (a JSON
+    ``null`` is not one).
+    """
+
+    def bad(message: str) -> NoReturn:
+        raise TilefishManifestError(f"{who}: {message}")
+
+    arch = entry["arch"]
+    if not (isinstance(arch, str) and _ARCH.fullmatch(arch)):
+        bad(f"arch must look like 'sm_103', got {arch!r}")
+    op, buckets = entry["op"], entry["buckets"]
+    if not _is_ident(op):
+        bad(f"op must be an identifier, got {op!r}")
+    if not isinstance(buckets, dict):
+        bad(f"buckets must be an object (the value of each bucketed dimension), got {buckets!r}")
+    stem = op
+    for dim, value in buckets.items():
+        if not _is_ident(dim):
+            bad(f"bucket dimension name must be an identifier, got {dim!r}")
+        if not _is_count(value, 1):
+            bad(f"bucket value of {dim} must be an int >= 1, got {value!r}")
+        stem += f".{dim}{value}"
+    if stem != entry["stem"]:
+        bad(
+            f"stem {entry['stem']!r} does not match op {op!r} and buckets {buckets!r}: the stem of a binary is its operator and the value of "
+            f"each of its buckets, {stem!r}"
+        )
+    digest = entry["declaration_digest"]
+    if not (isinstance(digest, str) and _SHA256.fullmatch(digest)):
+        bad(f"declaration_digest must be 64 lowercase hex digits (a sha256), got {digest!r}")
+
+
+def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
+    """Every parameter of the ABI on its own: its kind, its type and width, and which fields it has (the Rust reader's ``read_params``).
+
+    A ``pointer`` has a ``dtype`` whose Triton pointer type is its ``type``, an ``access`` (``in``, ``inout``, ``out``) and a ``shape`` (sizes
+    of at least 1 and dimension expressions), is passed as a ``u64`` of 8 bytes, and has no ``dim``, ``count_of``, ``stride_of`` or ``value``;
+    it takes ``strides`` (one per axis: a stride dimension, or the fixed stride 1 on the last axis) and ``offset`` (the name of its offset
+    dimension) together, and only when it is ``in``. A ``scalar`` is an ``i32`` or an ``i64`` with its ``dim``, a ``count_of`` or a
+    ``stride_of``, and nothing of a pointer. A ``fixed`` argument belongs to a prebuilt binary and has a ``value`` of its type, and nothing
+    else. How the parameters fit together (strides and the scalars that carry them, preconditions) is compared with the compile spec.
+    """
+
+    def bad(message: str) -> NoReturn:
+        raise TilefishManifestError(f"{who}: {message}")
+
+    abi = entry["abi"]
+    params = abi.get("params")
+    if not isinstance(params, list):
+        bad(f"abi.params must be a list, got {params!r}")
+    for position, p in enumerate(params):
+        if not isinstance(p, dict):
+            bad(f"abi.params[{position}] must be an object (its fields by name), got {p!r}")
+        unknown = sorted(str(k) for k in set(p) - _PARAM_FIELDS)
+        if unknown:
+            bad(f"abi.params[{position}] ({p.get('name')!r}) has unknown fields {unknown}")
+        missing = [k for k in _PARAM_REQUIRED if p.get(k) is None]
+        if missing:
+            bad(f"abi.params[{position}] ({p.get('name')!r}) is missing {missing}")
+        name = p["name"]
+        if not _is_ident(name):
+            bad(f"parameter name must be an identifier, got {name!r}")
+        for key in ("slot", "index", "size"):
+            if not _is_count(p[key], 0):
+                bad(f"parameter {name}: {key} must be an int >= 0, got {p[key]!r}")
+        typed = (("kind", str), ("type", str), ("ptx_type", str), ("dtype", str), ("access", str), ("shape", list), ("dim", str))
+        for key, kind_of_value in (*typed, ("count_of", str), ("strides", list), ("stride_of", dict)):
+            if _has(p, key) and not isinstance(p[key], kind_of_value):
+                bad(f"parameter {name}: {key} must be a {kind_of_value.__name__}, got {p[key]!r}")
+        if p["slot"] != position:
+            bad(f"parameter {name} has slot {p['slot']} but is at position {position}")
+        pkind, ty = p["kind"], p["type"]
+        if pkind == "pointer":
+            dtype = p.get("dtype") or ""
+            if ALL_DTYPES.get(dtype) is None or ALL_DTYPES[dtype].triton_ptr != ty:
+                bad(f"parameter {name}: pointer type {ty!r} does not match dtype {dtype!r}")
+            access = p.get("access")
+            if access not in ("in", "inout", "out"):
+                bad(f"parameter {name}: access must be in, inout or out, got {access!r}")
+            if any(_has(p, k) for k in ("dim", "count_of", "stride_of", "value")) or p["ptx_type"] != "u64" or p["size"] != 8:
+                bad(
+                    f"parameter {name} is not a well-formed 64-bit pointer: a pointer is passed as a u64 of 8 bytes and has a dtype, an access "
+                    "and a shape, and no dim, count_of, stride_of or value"
+                )
+            shape = p.get("shape")
+            if shape is None:
+                bad(f"parameter {name} has no shape: a pointer records its declared shape")
+            for axis, d in enumerate(shape):
+                if not (_is_count(d, 1) or isinstance(d, str)):
+                    bad(f"parameter {name}: shape[{axis}] must be an int size of at least 1 or a dimension expression, got {d!r}")
+            strides, offset = p.get("strides"), p.get("offset")
+            if (strides is None) != (offset is None):
+                bad(f"parameter {name}: strides and offset come together")
+            if strides is not None:
+                if not shape or len(strides) != len(shape):
+                    bad(
+                        f"parameter {name}: strides must be a list with one entry per axis of shape (at least one axis), got {len(strides)} "
+                        f"for {len(shape)} axes"
+                    )
+                if access != "in":
+                    bad(f"parameter {name} is {access} and takes strides, but only an `in` pointer may be strided")
+                for axis, s in enumerate(strides):
+                    if type(s) is int:
+                        if s != 1:
+                            bad(f"the stride of axis {axis} of '{name}' is the fixed size {s}: a fixed stride is 1 (and only on the last axis)")
+                        if axis + 1 != len(strides):
+                            bad(f"the stride of axis {axis} of '{name}' is fixed, but only the last axis may be")
+                    elif not isinstance(s, str):
+                        bad(f"parameter {name}: strides[{axis}] must be an int or a dimension expression, got {s!r}")
+                if not _is_ident(offset):
+                    bad(f"the offset of '{name}' (the name of the offset dimension) must be an identifier, got {offset!r}")
+        elif pkind == "scalar":
+            if ty not in _PASSED_AS["scalar"]:
+                bad(f"parameter {name}: a runtime scalar must be i32 or i64, got {ty!r}")
+            ptx, size = _PASSED_AS["scalar"][ty]
+            if p["ptx_type"] != ptx or p["size"] != size:
+                bad(f"parameter {name}: an {ty} scalar is passed as a {ptx} of {size} bytes, got {p['ptx_type']} of {p['size']}")
+            extra = [k for k in ("dtype", "access", "shape", "strides", "offset", "value") if _has(p, k)]
+            if extra:
+                bad(f"parameter {name} is a scalar: it has a dim and no dtype, access, shape, strides or value (it has {extra})")
+            if _has(p, "count_of") and _has(p, "stride_of"):
+                bad(f"parameter {name}: a scalar is the element count of a pointer or the stride of one, not both")
+            if not _has(p, "dim"):
+                bad(f"parameter {name}: dim is missing")
+            if _has(p, "stride_of"):
+                so = p["stride_of"]
+                if set(so) != {"arg", "axis"} or not _is_ident(so["arg"]) or not _is_count(so["axis"], 0):
+                    bad(f"parameter {name}: stride_of must be {{'arg': <an identifier>, 'axis': <an int >= 0>}}, got {so!r}")
+        elif pkind == "fixed":
+            if kind != ENTRY_KIND_BINARY:
+                bad(f"parameter {name}: a fixed argument belongs to a prebuilt binary, and this is a {kind} kernel")
+            if ty not in _PASSED_AS["fixed"]:
+                bad(f"parameter {name}: a fixed argument is one of i32, i64, f32, got {ty!r}")
+            ptx, size = _PASSED_AS["fixed"][ty]
+            if p["ptx_type"] != ptx or p["size"] != size:
+                bad(f"parameter {name}: a fixed {ty} is passed as a {ptx} of {size} bytes, got {p['ptx_type']} of {p['size']}")
+            if any(_has(p, k) for k in ("dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "dtype")):
+                bad(f"parameter {name} is a fixed argument: it has a value and no dim or shape")
+            value = p.get("value")
+            if value is None:
+                bad(f"parameter {name} is a fixed argument and has no value")
+            if ty == "f32":
+                if isinstance(value, dict) and len(value) == 1:
+                    if value.get("float") not in ("inf", "-inf", "nan"):
+                        bad(f"parameter {name}: {value!r} is not a valid tagged float")
+                elif not isinstance(value, float):
+                    bad(f"parameter {name}: the value of a fixed f32 argument must be a float, got {value!r}")
+            elif type(value) is not int:
+                bad(f"parameter {name}: the value of a fixed {ty} argument must be an int, got {value!r}")
+            elif not -(2**63) <= value < 2**63 or (ty == "i32" and not -(2**31) <= value < 2**31):
+                bad(f"parameter {name}: the value {value} does not fit {ty}")
+        else:
+            bad(f"parameter {name}: kind must be pointer, scalar or fixed, got {pkind!r}")
+
+
+def _check_dimension_names(who: str, entry: "dict[str, Any]") -> None:
+    """The dimension expressions of an entry are in the grammar, and name at most :data:`MAX_DIMS` dimensions, all of them in ``dims``.
+
+    The expressions are the ones the Rust reader parses into the one table of names of the entry (``Symbols``, after the names of
+    ``dims``): the ``dim`` of a ``divisible`` precondition and the ``shape`` of a ``max_elements`` one, every axis of a declared shape that is
+    an expression, every stride dimension and offset dimension of a strided pointer, the ``dim`` of every scalar, and the grid. A table that
+    would hold more than 32 names is refused ("a kernel may use at most 32 dimension names": a strided pointer of rank ``r`` alone takes up
+    to ``r + 1``), and so is a name that ``dims`` does not have. Each expression is parsed by :mod:`tilefish._specvalid` (the Rust parser is a port
+    of it, with its limits: 512 characters, 256 tokens, a depth of 24, 12 digits a number), which refuses what the grammar does not have and a
+    static grid entry or divisor below 1.
+    """
+
+    def bad(message: str) -> NoReturn:
+        raise TilefishManifestError(f"{who}: {message}")
+
+    dims, preconditions = entry["dims"], entry["preconditions"]
+    if not isinstance(dims, dict):
+        bad(f"dims must be an object (the constraints of each named dimension), got {dims!r}")
+    if not isinstance(preconditions, list):
+        bad(f"preconditions must be a list, got {preconditions!r}")
+    for name in dims:
+        if not _is_ident(name):
+            bad(f"dims name must be an identifier, got {name!r}")
+    used: "set[str]" = set()
+
+    def expression(text: Any, where: str, grid: bool = False) -> None:
+        if not isinstance(text, str):
+            bad(f"{where} must be a string (a dimension expression), got {text!r}")
+        try:
+            used.update(parse_grid(text) if grid else parse_expression(text, where))
+        except TilefishSpecError as e:
+            bad(str(e).removeprefix("malformed compile spec: "))
+
+    for i, pre in enumerate(preconditions):
+        if not isinstance(pre, dict):
+            bad(f"a precondition must be an object, got {pre!r}")
+        if pre.get("kind") == "divisible":
+            expression(pre.get("dim"), f"preconditions[{i}] (divisible) dim")
+        elif pre.get("kind") == "max_elements":
+            shape = pre.get("shape")
+            if not isinstance(shape, list):
+                bad(f"preconditions[{i}] (max_elements) shape must be a list of dimension strings, got {shape!r}")
+            for axis, d in enumerate(shape):
+                expression(d, f"preconditions[{i}] (max_elements) shape[{axis}]")
+    for p in entry["abi"]["params"]:  # (each read by `_check_params`)
+        if p["kind"] == "pointer":
+            for axis, d in enumerate(p["shape"]):
+                if isinstance(d, str):
+                    expression(d, f"parameter {p['name']} shape[{axis}]")
+            if _has(p, "strides"):
+                for axis, s in enumerate(p["strides"]):
+                    if isinstance(s, str):
+                        expression(s, f"parameter {p['name']} strides[{axis}]")
+                used.add(p["offset"])
+        elif p["kind"] == "scalar":
+            expression(p["dim"], f"parameter {p['name']} dim")
+    expression(entry["grid"], "grid", grid=True)
+    names = set(dims) | used
+    if len(names) > MAX_DIMS:
+        bad(
+            f"a kernel may use at most {MAX_DIMS} dimension names, and this one has {len(names)} (in dims and in its shapes, strides, "
+            "offsets, scalars, preconditions and grid): the Rust host binds at most that many"
+        )
+    unnamed = sorted(used - set(dims))
+    if unnamed:
+        bad(f"dims does not name {unnamed}, which the declared shapes, the strides, the scalars, the preconditions or the grid mention")
 
 
 class Manifest:
@@ -260,10 +527,18 @@ class Manifest:
                 f"manifest kernel {i} ({entry.get('stem')!r}) has kind {entry_kind!r}, which is not '{ENTRY_KIND_TRITON}' or '{ENTRY_KIND_BINARY}'"
             )
         needed = ("stem", "arch", "symbol", "cubin", "sha256", "sha256_code", "shared", "launch", "toolchain")
-        needed += ("options",) if entry_kind == ENTRY_KIND_TRITON else ("binary",)  # what the spec determines (abi, grid, block, warps, ...) is checked against the spec
+        needed += ("options",) if entry_kind == ENTRY_KIND_TRITON else ("binary",)
+        # (what the entry says of itself, as the Rust reader reads it; the rest the spec determines, block, warps, ..., is checked against the spec)
+        needed += ("op", "abi", "grid", "buckets", "dims", "preconditions", "declaration_digest")
         missing = [k for k in needed if k not in entry]
         if missing:
             raise TilefishManifestError(f"manifest kernel {i} ({entry.get('stem')!r}) is missing {missing}")
+        for field in ("options", "toolchain", "launch", "abi"):
+            if field in entry and not isinstance(entry[field], dict):
+                raise TilefishManifestError(f"'{entry['stem']}' ({entry['arch']}): '{field}' must be an object, got {entry[field]!r}")
+        who = f"'{entry['stem']}' ({entry['arch']})"
+        _check_identity(who, entry)
+        _check_params(who, entry, entry_kind)
         if entry_kind == ENTRY_KIND_BINARY:
             extra = [k for k in ("options", "num_warps", "num_stages") if k in entry]
             if extra:
@@ -295,10 +570,21 @@ class Manifest:
             )
         if elf.section(f".text.{entry['symbol']}") is None:
             raise TilefishManifestError(f"'{stem}' ({arch}): {name!r} has no code section '.text.{entry['symbol']}'")
-        for field in ("options", "toolchain", "launch", "abi"):
-            if field in entry and not isinstance(entry[field], dict):
-                raise TilefishManifestError(f"'{stem}' ({arch}): '{field}' must be an object, got {entry[field]!r}")
-        if "abi" in entry and "scratch_slots" in entry["abi"]:
+        # the architecture the cubin is for is in its ELF header (as the Rust reader's `verify_cubin` reads it): a cubin is used as it is, for
+        # its own architecture, so one whose header names another is refused; a prebuilt binary's header must name one (a Triton cubin whose
+        # header names none is left to the driver)
+        sm = sm_of(elf)
+        if sm is not None and sm != int(arch[3:]):  # (the number: "sm_090" is sm_90, as the Rust reader parses it)
+            raise TilefishManifestError(
+                f"'{stem}' ({arch}): {name!r} is for sm_{sm} (its ELF header says so), but the manifest says {arch}: a cubin is used as it "
+                "is, for the architecture it was built for"
+            )
+        if sm is None and entry_kind == ENTRY_KIND_BINARY:
+            raise TilefishManifestError(
+                f"'{stem}' ({arch}): the ELF header of {name!r} is not that of a CUDA cubin of a known architecture: its architecture cannot be read"
+            )
+        _check_dimension_names(f"'{stem}' ({arch})", entry)
+        if "scratch_slots" in entry["abi"]:
             slots = entry["abi"]["scratch_slots"]
             if type(slots) is not int or slots != (2 if entry_kind == ENTRY_KIND_TRITON else 0):
                 raise TilefishManifestError(

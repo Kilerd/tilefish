@@ -7,7 +7,7 @@ import hashlib
 import pathlib
 import stat
 
-from elf_builder import cubin_like
+from elf_builder import arch_header, cubin_like
 
 import tilefish
 from tilefish import Dim, Out, Tensor, const, f32, i64
@@ -61,7 +61,7 @@ def fake_binary_build(spec, target, *, arch="sm_90", cubin=None, flags=("-linein
     key = "ptx" if spec.binary["kind"] == "ptx" else arch
     if cubin is None and spec.binary["kind"] == "cubin" and key in target.sources:
         cubin = target.sources[key]
-    cubin = cubin_like(shared=None, **SM90) if cubin is None else cubin  # (a prebuilt binary may have static shared memory: the section is no sign of dynamic use)
+    cubin = cubin_like(shared=None, **arch_header(arch)) if cubin is None else cubin  # (a prebuilt binary may have static shared memory: the section is no sign of dynamic use)
     build = {"source": "ptx", "ptxas_flags": list(flags)} if spec.binary["kind"] == "ptx" else {"source": "cubin"}
     values = dict(
         spec=spec,

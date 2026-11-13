@@ -33,7 +33,7 @@ from tilefish import (
     i32,
     i64,
 )
-from tilefish import _binary
+from tilefish import _binary, _elf
 from tilefish._build import BINARY_DIGEST_KIND, abi_of, spec_entry
 from tilefish._manifest import manifest_digest
 from tilefish.aot import CompileSpec, Manifest, compile_specs, declaration_digest, write_manifest
@@ -413,6 +413,22 @@ def test_a_cubin_entry_has_no_toolchain(tmp_path):
         Manifest.load(tmp_path / "m")
 
 
+def test_a_prebuilt_cubin_must_be_for_the_architecture_of_its_entry_and_say_which_it_is(tmp_path, op):
+    """As the Rust reader (``verify_cubin``): the ELF header of a prebuilt binary names its architecture, and it is the entry's."""
+    manifest_of(tmp_path, op)
+    path = tmp_path / "m" / "manifest.json"
+    for cubin, message in (
+        (cubin_like(shared=None, **SM103A), r"'axpy' \(sm_90\): 'axpy.sm_90.cubin' is for sm_103 \(its ELF header says so\), but the manifest says sm_90"),
+        (cubin_like(shared=None, osabi=0x07), r"'axpy' \(sm_90\): the ELF header of 'axpy.sm_90.cubin' is not that of a CUDA cubin of a known architecture"),
+    ):
+        doc = json.loads(path.read_text())
+        (tmp_path / "m" / doc["kernels"][0]["cubin"]).write_bytes(cubin)
+        doc["kernels"][0].update(sha256=hashlib.sha256(cubin).hexdigest(), sha256_code=_elf.code_digest(cubin))
+        path.write_text(json.dumps(doc))
+        with pytest.raises(TilefishManifestError, match=message):
+            Manifest.load(tmp_path / "m", pin=manifest_digest(doc))
+
+
 def test_a_replay_refuses_an_entry_built_from_other_bytes_or_for_another_kind(tmp_path, op, ptx):
     m, spec = manifest_of(tmp_path, op)
     other = make_ptx_op(write_ptx(tmp_path, "edited.ptx", PTX_TEXT + "// the same code, another file\n"))
@@ -425,6 +441,11 @@ def test_a_replay_refuses_an_entry_built_from_other_bytes_or_for_another_kind(tm
     doc["kernels"][0]["num_warps"] = 4
     doc["kernels"][0]["num_stages"] = 3
     doc["kernels"][0]["abi"]["scratch_slots"] = 2
+    (tmp_path / "m" / "manifest.json").write_text(json.dumps(doc))
+    with pytest.raises(TilefishManifestError, match="parameter alpha: a fixed argument belongs to a prebuilt binary, and this is a triton kernel"):
+        Manifest.load(tmp_path / "m")  # its fixed arguments say what it is, to the reader (as to the Rust reader)
+    params = doc["kernels"][0]["abi"]["params"]
+    doc["kernels"][0]["abi"]["params"] = [p for p in params if p["kind"] != "fixed"]
     (tmp_path / "m" / "manifest.json").write_text(json.dumps(doc))
     with pytest.raises(TilefishManifestError, match="is a triton kernel, but the compile spec is for a prebuilt binary"):
         Manifest.load(tmp_path / "m").built_kernel(spec, "sm_90")

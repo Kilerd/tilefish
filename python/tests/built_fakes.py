@@ -5,7 +5,7 @@ No ``from __future__ import annotations`` here: tilefish evaluates annotations a
 
 import hashlib
 
-from elf_builder import cubin_like
+from elf_builder import arch_header, cubin_like
 
 import tilefish
 from tilefish import Dim, Out, Tensor, bf16, const, f32
@@ -30,8 +30,8 @@ FAKE_SOURCE_DIGEST = hashlib.sha256(b"the source of a hand-written kernel").hexd
 
 
 def fake_build(spec, *, arch="sm_90", cubin=None, launch=None, **kw):
-    """A ``BuiltKernel`` of ``spec`` around a small ELF file (its symbol is ``tf_k``); ``kw`` overrides any field."""
-    cubin = cubin_like() if cubin is None else cubin
+    """A ``BuiltKernel`` of ``spec`` around a small ELF file (its symbol is ``tf_k``) for ``arch`` (its ELF header says so); ``kw`` overrides any field."""
+    cubin = cubin_like(**arch_header(arch)) if cubin is None else cubin
     values = dict(
         spec=spec,
         arch=arch,

@@ -154,7 +154,7 @@ knows it, the element offset from the start of the allocation).
 
 `max_extent` (section 6) bounds the view. For aliasing, a strided tensor occupies `[address, address + extent * itemsize)`, with `extent` as there;
 a tensor that is written (`out`, `inout`) must not overlap any other argument. (Only `in` pointers are strided in this version: the declaration of an
-`inout` or `out` strided pointer is refused by the Python frontend, so a reader may refuse `strides` on a pointer whose `access` is not `in`.)
+`inout` or `out` strided pointer is refused by the Python frontend, and both readers refuse `strides` on a pointer whose `access` is not `in`.)
 
 ### 5.2 Device scalars: a pointer with the shape `[]`
 
@@ -197,6 +197,40 @@ on a pointer exactly when its `pointer_alignment` is 16 bytes, and on a scalar e
 dimensions of a strided pointer: every stride dimension (`x_s0`) and the offset dimension (`x_offset`) are named in it, each with `{}` or with its
 constraints (`{"divisible_by": 8}` on the offset dimension of a `Strided[..., 16]` pointer; `{"divisible_by": k}` on a stride that the declaration
 says is a multiple of `k`). A name used in a shape, a `strides`/`offset` entry, a scalar's `dim` or the grid must be in `dims`.
+
+### 7.1 Dimension expressions: the limits both readers hold
+
+A shape axis, a stride dimension, a scalar's `dim`, the `dim` of a `divisible` precondition, an axis of the `shape` of a `max_elements` precondition and
+every grid entry are *dimension expressions*: integers, names, `cdiv(a, b)`, `+`, `-`, `*`, `//`, unary `-` and parentheses (`_specvalid._ExprParser`
+in Python; `crates/tilefish/src/expr.rs` is a port of it). An expression is at most 512 characters and 256 tokens, nested at most 24 deep, and an integer
+literal has at most 12 digits (`1234567890123` is two tokens, and refused). Both readers parse every one of them when they read the manifest (Python:
+`Manifest.load`, `_manifest._check_dimension_names`), so both refuse the same texts.
+
+**At most 32 names per kernel entry.** The unit is the entry, not a shape: the names of `dims` and every name the expressions above mention, together,
+are at most 32 (`MAX_DIMS` in `expr.rs`, `tilefish._manifest.MAX_DIMS`). A strided pointer of rank `r` takes up to `r + 1` of them (a stride
+dimension for each axis whose stride is not the fixed `1`, and its offset dimension). An entry with a 33rd name, in `dims` or only in an expression, is
+refused with "a kernel may use at most 32 dimension names" (`TilefishManifestError` in Python, `Error::Manifest` in Rust), and a name an expression uses
+that `dims` does not have with "dims does not name [...]". (The Rust runner of a launch plan binds at most 32 dimensions of a plan too.)
+
+**Folding in 128 bits.** To know the value of an expression that is a constant (a static grid entry, the divisor of a `//` or a `cdiv`) and to compare two
+expressions, a reader folds it to its affine form, `constant + Σ coefficient × atom` (an atom is a name or a `cdiv` that does not fold): what Python's
+`DimExpr` is. The Rust reader folds in signed 128-bit integers, `[-2**127, 2**127 - 1]`, with checked arithmetic, and Python's reader folds in the same
+range (`_specvalid.FOLD_RANGE`; its integers are unbounded, so it checks). With 12-digit literals only a product of four of them (or a sum of such
+products) leaves the range: `549755813888*549755813888*549755813888*1024` is `2**127`. A fold that leaves the range has **no folded value**: a
+constant or a coefficient outside it, a negation of `-2**127`, and so `a - b` when `b` holds `-2**127` (it is `a + (-1) × b`), whatever the difference
+would be. Such an expression is then read as one that is not affine: nothing is refused for it, and the checks that need its value are not made. So,
+with `X` that product and `Y = 549755813888*549755813888*549755813888*512` (`2**126`):
+
+* `(X - X,)` is not the static grid `(0,)` for either reader and is read; `(Y - Y,)` is, and is refused ("entry 0 is the static size 0; grid sizes must be
+  at least 1"); likewise `cdiv(n, X - X)` is read and `cdiv(n, Y - Y)` refused ("cdiv by 0 (the divisor must be positive)");
+* a `cdiv` by a symbolic divisor whose quotient is beyond the range (the one case is `-2**127` by `-1`: `cdiv(-X*n, -n)`) stays the `cdiv` atom, so
+  `(cdiv(-X*n, -n)*0,)` is the static `0` and refused, and `(cdiv(-X*n, -n) - Y - Y,)` is read;
+* where two expressions are compared (the Rust reader's checks of the element count a `count_of` scalar carries and of the `shape` of a `max_elements`
+  precondition, and the same checks of a compile spec in Python), an expression without a folded value is equal to no folded one.
+
+No manifest `tilefish` writes comes near the range. At launch the values are computed, not folded: the Rust host computes the value of a folded form in
+128 bits, and an expression that is not affine as it is written with every intermediate result at most `2**100` in magnitude, and refuses an overflow
+("a dimension expression overflows"); Python computes exactly. Either refuses a value that does not fit the type the kernel takes it as.
 
 ## 8. Prebuilt binaries (`kind: "binary"`)
 
@@ -329,8 +363,21 @@ document tilefish writes next to a build and the host does not read):
   for `binary`: `binary` not exactly one of `{"source":"cubin"}` and `{"source":"ptx","ptxas_flags":[strings]}`, `source_digest_kind` not
   `"tilefish.binary.v1"`, no `source_digest`, a `source_sha256`, a cubin used as it is whose `source_digest` is not its `sha256`; the cubin file name not a plain file name; the cubin's `sha256`, `sha256_code` or
   `.text.<symbol>` section wrong; for `triton` the shared-memory section rule.
-* the ABI (a host that reads without a spec checks these itself; Python checks them by comparing the entry with the compile spec, and `_specvalid`
-  checks them in the spec): `params` kinds in `pointer`/`scalar`/`fixed`; a `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
+* what an entry says of itself, which both readers check when they read it (Python: `Manifest._read`, as `crates/tilefish/src/manifest.rs` does; the
+  digests of a document a caller pinned again vouch for the document, not for its sense): a missing `op`, `abi`, `grid`, `buckets`, `dims`,
+  `preconditions` or `declaration_digest`; an `arch` that is not `sm_` and two or three digits, or that is not the architecture the cubin's ELF header
+  names (`_elf.sm_of`, the Rust `Elf::sm`: an entry relabelled `sm_90` that holds an sm_103 cubin), or, for `binary`, a header that names none; a `stem`
+  that is not `op` and `.<dim><value>` for each of `buckets`, in order (`rowop.S32`); a `declaration_digest` that is not 64 lowercase hex digits (`null`
+  included); a parameter with a field no parameter has, without `slot`, `index`, `name`, `kind`, `type`, `ptx_type`, `size`, or at another `slot` than
+  its position, and the fields of each kind (`read_params`): a `pointer` whose `type` is not the pointer type of its `dtype`, whose `access` is not
+  `in`/`inout`/`out`, that has `dim`, `count_of`, `stride_of` or `value`, is not a `u64` of 8 bytes, or has no `shape` (axes: an int ≥ 1 or an
+  expression), or has `strides` and `offset` not together, on an access other than `in`, not one per axis of its shape (a name, or the fixed `1` on
+  the last axis only), or an `offset` that is not a name; a `scalar` that has `dtype`, `access`, `shape`, `strides`, `offset` or `value`, no `dim`, both
+  `count_of` and `stride_of`, or another width than `u32`/4 or `u64`/8; a `fixed` argument on a Triton kernel, or with a `dim`, `count_of`,
+  `stride_of`, `access`, `shape`, `strides`, `offset` or `dtype`, or without a `value` of its type (a JSON `null` is as absent, in each); an
+  expression outside the grammar, a name that `dims` does not have, more than 32 names, a static grid entry or divisor below 1 (section 7.1).
+* the ABI as a whole (a host that reads without a spec checks these itself; Python checks them by comparing the entry with the compile spec, and
+  `_specvalid` checks them in the spec): `params` kinds in `pointer`/`scalar`/`fixed`; a `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
   `offset` or the reverse; `strides` of the wrong length or empty, with an integer other than `1`, an integer on a non-last axis, a string that no
   `stride_of` scalar carries, or two scalars for one axis; an `offset` that is not a string; `stride_of` with a missing/extra key, a negative axis, an
   axis out of range, a target that is not a strided pointer, a `dim` different from the target's `strides` entry, or together with `count_of`; a `fixed`
@@ -370,11 +417,12 @@ and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter th
   says "once per strided pointer", and a kernel with `index_bits=64` has none, so Python's reader does not require it). `max_elements` or `max_extent`
   on a device scalar is refused, `fixed` on a Triton kernel is refused (section 5's table), `strides` on a pointer that is not `in` is refused
   (section 5.1 allows a reader to), and a stride entry is a dimension expression that must be exactly the `dim` of the scalar that carries it.
-* A cubin is checked against the architecture of its entry when it is read: `Elf::sm()` (Python's `cubin_sm`: the SM in the low byte of `e_flags` for OS
+* A cubin is checked against the architecture of its entry when it is read, by both readers: `Elf::sm()` (Python's `_elf.sm_of`: the SM in the low byte of `e_flags` for OS
   ABI `0x33`, in the second byte for `0x41`). A prebuilt binary whose header names no readable architecture, or another one than its entry, is refused
   (section 8); a Triton cubin is refused when it names another one, and left to the driver when the header cannot be read.
 * The function the driver loads must take the parameter sizes of the ABI (`cuFuncGetParamInfo`, as Python checks at load, for every kernel).
-* An entry may name at most 32 dimensions (a strided pointer has one per axis and one for its offset).
+* An entry may name at most 32 dimensions (a strided pointer has one per axis and one for its offset), and its expressions are folded in 128 bits
+  (section 7.1); Python's reader holds both.
 
 **Launching a kernel** (`plan.rs`). The steps of section 5.1, in Python's order: shapes, strides and scalars bind the dimensions, `divisible_by`, the exact
 bucket, the range of every scalar (`i32` or `i64`), aliasing (a view by its extent), the alignment each pointer promises, `max_elements`/`max_extent`,

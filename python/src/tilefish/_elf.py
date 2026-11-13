@@ -160,6 +160,22 @@ def parse_elf(blob: "bytes | bytearray | memoryview") -> Elf:
     return Elf(bytes(ident), e_type, machine, version, flags, tuple(sections), blob, shstrndx)
 
 
+def sm_of(elf: Elf) -> "int | None":
+    """The SM version a cubin is for (``103`` for sm_103), from its ELF header, or ``None`` when the header does not say it.
+
+    The Rust reader's ``Elf::sm`` (``crates/tilefish/src/elf.rs``) and :func:`tilefish._binary.cubin_sm`, which refuses where this
+    gives ``None``: checked on cubins that ptxas 12.9 made for sm_80 to sm_120, a cubin whose ``EI_OSABI`` is 0x33 (up to sm_90) has the
+    version in the low byte of ``e_flags`` (80, 86, 89, 90; bit 11 is the ``a`` suffix), one whose ``EI_OSABI`` is 0x41 (sm_100 and
+    later, the ``a``/``f`` suffix in the low byte) has it in the second byte (100, 103, 120). Another OS ABI says no version.
+    """
+    osabi = elf.ident[7]
+    if osabi == 0x33:
+        return elf.flags & 0xFF
+    if osabi == 0x41:
+        return (elf.flags >> 8) & 0xFF
+    return None
+
+
 def uses_shared(elf: Elf, symbol: str) -> bool:
     """Whether the kernel ``symbol`` uses shared memory: it has a ``.nv.shared.<symbol>`` section.
 

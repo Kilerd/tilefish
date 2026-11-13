@@ -25,7 +25,7 @@ import math
 import re
 from typing import Any
 
-from .dims import Dim, DimExpr, cdiv
+from .dims import Dim, DimExpr, _CDiv, cdiv
 from .dtypes import ALL_DTYPES
 from .errors import TilefishError, TilefishSpecError
 
@@ -62,6 +62,7 @@ PRE_FIELDS = {
     "max_extent": {"arg", "index", "value"},  # schema 3; the same for a strided pointer: the largest element offset it reaches
 }
 MAX_ELEMENTS = 2**31 - 1  # the limit of i32 offsets, the only bound a max_elements precondition may carry
+FOLD_RANGE = range(-(2**127), 2**127)  # the integers a folded expression may hold: the i128 of the Rust reader (crates/tilefish/src/expr.rs)
 
 
 def bad(msg: str) -> Any:
@@ -122,6 +123,29 @@ def same_scalar(a: Any, b: Any) -> bool:
 # -- the restricted expression grammar ------------------------------------------------------------------------------
 
 
+def in_fold_range(e: "DimExpr | None") -> "DimExpr | None":
+    """``e`` when its constant and every coefficient are in :data:`FOLD_RANGE` (128 bits, as the Rust reader folds), else ``None``.
+
+    The atom of a ``cdiv`` holds forms that were folded (and checked) before it was made, so the terms of ``e`` are all there is to look at.
+    """
+    if e is None or e.offset not in FOLD_RANGE or any(c not in FOLD_RANGE for _, c in e.terms):
+        return None
+    return e
+
+
+def _cdiv_in_range(a: DimExpr, b: DimExpr) -> DimExpr:
+    """``cdiv(a, b)`` folded as the Rust reader folds it: a symbolic divisor whose ratio to the dividend is beyond 128 bits leaves the atom.
+
+    (Rust's ``Affine::ratio`` divides coefficient by coefficient with checked arithmetic, and the one quotient that overflows, ``-2**127``
+    by ``-1``, makes it find no ratio; the ``cdiv`` is then an atom of its folded parts, where Python's unbounded ``exact_div`` finds
+    ``2**127``.)
+    """
+    out = cdiv(a, b)
+    if isinstance(out, DimExpr) and out.is_static and not b.folded().is_static and in_fold_range(out) is None:
+        return _CDiv(a.folded(), b.folded())
+    return out
+
+
 class _ExprParser:
     """ints, identifiers, ``cdiv(a, b)``, ``+ - * //``, unary minus, parentheses. Never evaluated as code.
 
@@ -129,6 +153,15 @@ class _ExprParser:
     ``compile_specs`` uses (:class:`~tilefish.dims.DimExpr`), so a grid entry that is a constant,
     including ``1 - 1`` or ``n - n``, is known. Its methods return the folded value, or ``None`` when
     the expression is outside the affine language (two symbolic factors, an inexact ``//``).
+
+    The fold is the one the Rust reader makes (``Expr::affine`` in ``crates/tilefish/src/expr.rs``), which is exact in 128-bit
+    integers: a fold whose constant or coefficient leaves ``[-2**127, 2**127 - 1]`` (:data:`FOLD_RANGE`), or that negates the least
+    of them (``a - b`` with ``-2**127`` in ``b``), has no value here either, where Python's unbounded integers would have one. So
+    the two readers know the same constants: ``(X - X,)`` with a literal product ``X`` of ``2**127`` or more (four 12-digit
+    factors) is not the static grid ``(0,)`` for either, and is not refused for it (its value overflows when a launch computes it);
+    a divisor that folds to a constant below 1 only in unbounded arithmetic is not refused either. A ``cdiv`` by a symbolic divisor
+    whose ratio leaves the range is the ``cdiv`` atom, as the Rust ``Affine::ratio`` keeps it. No expression ``tilefish`` writes comes
+    near the range.
     """
 
     MAX_LEN, MAX_TOKENS, MAX_DEPTH = 512, 256, 24
@@ -167,11 +200,11 @@ class _ExprParser:
             bad(f"{self.where} {self.text!r}: unexpected {self.peek()!r}")
 
     def _fold(self, fn: Any, *operands: "DimExpr | None") -> "DimExpr | None":
-        """Apply a dimension operation; ``None`` when an operand is opaque or the result is not affine."""
+        """Apply a dimension operation; ``None`` when an operand is opaque, the result is not affine or it leaves 128 bits."""
         if any(o is None for o in operands):
             return None
         try:
-            return fn(*operands)
+            return in_fold_range(fn(*operands))
         except TilefishError:
             return None
 
@@ -184,7 +217,8 @@ class _ExprParser:
         while self.peek() in ("+", "-"):
             op = self.take()
             rhs = self.term(depth)
-            acc = self._fold((lambda a, b: a + b) if op == "+" else (lambda a, b: a - b), acc, rhs)
+            # (Rust subtracts by adding the negated operand: a -2**127 in it overflows, whatever the difference)
+            acc = self._fold((lambda a, b: a + b) if op == "+" else (lambda a, b: None if in_fold_range(-b) is None else a - b), acc, rhs)
         return acc
 
     def term(self, depth: int) -> "DimExpr | None":
@@ -219,7 +253,7 @@ class _ExprParser:
                 den = self.expr(depth + 1)
                 self.take(")")
                 self._positive_divisor(den, "cdiv")
-                return self._fold(cdiv, num, den)
+                return self._fold(_cdiv_in_range, num, den)
             if self.peek() == "(":
                 bad(f"{self.where} {self.text!r}: only cdiv(a, b) may be called, not {tok}(...)")
             self.ids.add(tok)
@@ -288,8 +322,8 @@ def _check_count_of(scalar: dict, by_name: dict) -> None:
     product: "DimExpr | None" = DimExpr.const(1)
     for i, entry in enumerate(target["shape"]):
         factor = _value_of(entry, f"{where} shape[{i}]")
-        try:
-            product = None if factor is None or product is None else product * factor
+        try:  # (in 128 bits, as the Rust reader's `check_count_of` folds the product: one beyond them is not affine)
+            product = None if factor is None or product is None else in_fold_range(product * factor)
         except TilefishError:
             product = None
     if product is not None:

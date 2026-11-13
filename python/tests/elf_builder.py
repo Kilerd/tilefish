@@ -102,6 +102,22 @@ def build_elf(
     return header + body + headers
 
 
+def arch_header(arch):
+    """The ELF header fields (``osabi``, ``abiversion``, ``flags``) of a cubin ptxas makes for ``arch`` (``"sm_90"``, ``"sm_103"`` or ``103``).
+
+    A manifest reader checks the ``arch`` of an entry against them (``tilefish._elf.sm_of``, the Rust ``Elf::sm``): up to sm_90 the OS ABI is
+    0x33 and the SM is the low byte of ``e_flags``, from sm_100 it is 0x41 and the SM is the second byte. ``build_elf`` without them makes an
+    sm_103 cubin, so ``cubin_like(**arch_header("sm_103"))`` is ``cubin_like()``, byte for byte.
+    """
+    try:
+        sm = arch if isinstance(arch, int) else int(arch.removeprefix("sm_"))
+    except ValueError:
+        return {}  # (a name that is no architecture, which a test hands a writer to see it refused: any header)
+    if sm < 100:
+        return dict(osabi=0x33, abiversion=7, flags=0x00500500 | sm)
+    return dict(osabi=0x41, abiversion=8, flags=0x09000000 | (sm << 8) | 0x0A)
+
+
 def cubin_like(*, debug="path/a.py", code=b"\x01\x02\x03\x04" * 16, gap=0, debug_first=False, shared=1024, **kw):
     """A small file shaped like a Mercury cubin: code and constants, symbol tables, and debug sections that hold ``debug``.
 

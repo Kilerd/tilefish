@@ -122,6 +122,45 @@ def test_the_entry_must_match_the_compile_spec_in_the_new_fields_too(tmp_path):
             Manifest.load(tmp_path / "m2").built_kernel(spec, "sm_90", pinned=True)
 
 
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        (lambda x: x.update(access="inout"), r"parameter x is inout and takes strides, but only an `in` pointer may be strided"),
+        (lambda x: x.update(access="out"), r"parameter x is out and takes strides, but only an `in` pointer may be strided"),
+        (lambda x: x.pop("offset"), r"parameter x: strides and offset come together"),
+        (lambda x: x.update(strides=["x_s0", 1]), r"parameter x: strides must be a list with one entry per axis of shape \(at least one axis\), got 2 for 3 axes"),
+        (lambda x: x.update(strides=["x_s0", "x_s1", 2]), r"the stride of axis 2 of 'x' is the fixed size 2: a fixed stride is 1"),
+        (lambda x: x.update(strides=["x_s0", 1, "x_s1"]), r"the stride of axis 1 of 'x' is fixed, but only the last axis may be"),
+        (lambda x: x.update(offset="x offset"), r"the offset of 'x' \(the name of the offset dimension\) must be an identifier"),
+    ],
+)
+def test_a_strided_pointer_that_is_written_or_malformed_is_refused_when_the_manifest_is_loaded(tmp_path, change, message):
+    """Only an ``in`` pointer takes ``strides`` and ``offset``, together (section 5.1): the Rust reader refuses a strided pointer that is written, and
+    so does this one, with the digest of the changed document pinned (so the refusal is the reader's, not the pin's)."""
+    manifest_of(tmp_path, head_copy)
+    path = tmp_path / "m" / "manifest.json"
+    doc = json.loads(path.read_text())
+    change(doc["kernels"][0]["abi"]["params"][0])
+    path.write_text(json.dumps(doc))
+    with pytest.raises(TilefishManifestError, match=r"'head_copy' \(sm_90\): " + message):
+        Manifest.load(tmp_path / "m", pin=manifest_digest(doc))
+
+
+def test_a_strided_entry_of_32_dimension_names_is_read_and_one_of_33_is_not(tmp_path):
+    """A strided pointer of rank ``r`` takes ``r + 1`` names (its strides and its offset): head_copy has S, x_offset, x_s0 and x_s1."""
+    manifest_of(tmp_path, head_copy)
+    path = tmp_path / "m" / "manifest.json"
+    doc = json.loads(path.read_text())
+    assert sorted(doc["kernels"][0]["dims"]) == ["S", "x_offset", "x_s0", "x_s1"]
+    doc["kernels"][0]["dims"].update({f"d{i}": {} for i in range(28)})
+    path.write_text(json.dumps(doc))
+    Manifest.load(tmp_path / "m", pin=manifest_digest(doc))
+    doc["kernels"][0]["dims"]["d28"] = {}
+    path.write_text(json.dumps(doc))
+    with pytest.raises(TilefishManifestError, match=r"a kernel may use at most 32 dimension names, and this one has 33"):
+        Manifest.load(tmp_path / "m", pin=manifest_digest(doc))
+
+
 # -- what the Rust host launches (test_rust_host_schema3.py has the details) ----------------------------------------------------------------
 
 

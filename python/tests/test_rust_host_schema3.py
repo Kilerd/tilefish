@@ -9,6 +9,7 @@ reader of the crate refuses (``fixed`` on a Triton kernel, ``strides`` on a poin
 """
 
 import copy
+import hashlib
 import json
 import os
 import pathlib
@@ -20,13 +21,14 @@ import pytest
 from binary_fakes import PTX_TEXT, SM90, fake_binary_build, make_ptx_op, write_ptx
 from built_fakes import fake_build
 from conftest import REPO_ROOT
-from elf_builder import cubin_like
+from elf_builder import arch_header, cubin_like
 from host_ops import gpu_kernels_p1
 from test_library_ops import ALGO, SMS, VERSION, gemm, gemm_bias
 from test_rust_host import check_golden, needs_new_crate, pinned
 
 import tilefish
 from tilefish import Dim, Out, StrideOf, Strided, Tensor, TilefishBuildError, TilefishManifestError, bf16, const, f32, i32, i64, runtime
+from tilefish._elf import code_digest
 from tilefish._library import BuiltLibrary, library_specs
 from tilefish.aot import Manifest, write_manifest
 from tilefish.hosts import rust
@@ -237,6 +239,9 @@ def test_a_stem_is_a_kernel_or_a_library_entry_not_both(tmp_path):
     shutil.copytree(manifest.directory, tmp_path / "edited")
     doc = json.loads((tmp_path / "edited" / "manifest.json").read_text())
     doc["kernels"][0]["arch"] = "sm_103"  # the kernel and the library entry are now for the same architecture
+    sm103 = cubin_like(**arch_header("sm_103"))  # (and the cubin is one for it: the reader holds a cubin to the architecture of its entry)
+    (tmp_path / "edited" / doc["kernels"][0]["cubin"]).write_bytes(sm103)
+    doc["kernels"][0].update(sha256=hashlib.sha256(sm103).hexdigest(), sha256_code=code_digest(sm103))
     (tmp_path / "edited" / "manifest.json").write_text(json.dumps(doc))
     with pytest.raises(TilefishManifestError, match="lists 'g' for sm_103 twice"):
         Manifest.load(tmp_path / "edited")

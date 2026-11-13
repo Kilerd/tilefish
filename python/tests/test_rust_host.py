@@ -21,7 +21,7 @@ import subprocess
 import pytest
 from built_fakes import fake_build, rowop, scale
 from conftest import REPO_ROOT
-from elf_builder import cubin_like
+from elf_builder import arch_header, cubin_like
 
 import tilefish
 from tilefish import Dim, Out, Tensor, TilefishBuildError, TilefishManifestError, bf16, const, e2m1, f32
@@ -210,7 +210,7 @@ def test_a_declaration_that_is_not_what_the_manifest_was_built_from_is_refused(f
 def test_the_binaries_of_a_stem_must_agree_across_architectures(tmp_path):
     (spec,) = compile_specs(scale)
     a = fake_build(spec, arch="sm_90")
-    b = fake_build(spec, arch="sm_100", cubin=cubin_like(code=b"\x09\x08\x07\x06" * 16))
+    b = fake_build(spec, arch="sm_100", cubin=cubin_like(code=b"\x09\x08\x07\x06" * 16, **arch_header("sm_100")))
     write_manifest([a, b], tmp_path / "manifest.json", cubins=True)
     manifest = pinned(Manifest.load(tmp_path))
     source = rust.render(manifest, ops=[scale])
@@ -476,6 +476,19 @@ def edited(fake_manifest, tmp_path, change):
     return Manifest.load(other)
 
 
+def edited_in_memory(fake_manifest, tmp_path, change):
+    """A copy of the directory of ``fake_manifest``, loaded, whose entry ``scale`` is then changed by ``change(entry, directory)`` in memory.
+
+    The reader refuses most of the files :func:`edited` writes (as the Rust reader does); a :class:`Manifest` is an object its holder can still
+    change, and what it holds is what the emitter validates again before any of it reaches the source it writes.
+    """
+    other = tmp_path / "in-memory"
+    shutil.copytree(fake_manifest.directory, other)
+    manifest = Manifest.load(other)
+    change(next(a.entry for a in manifest.artifacts if a.stem == "scale"), other)
+    return manifest
+
+
 def param(entry, name):
     return next(p for p in entry["abi"]["params"] if p["name"] == name)
 
@@ -524,17 +537,24 @@ FIELDS = {
 
 @pytest.mark.parametrize("name", sorted(FIELDS))
 def test_a_field_that_is_not_what_it_must_be_is_refused_and_writes_nothing(name, fake_manifest, tmp_path):
-    manifest = edited(fake_manifest, tmp_path, FIELDS[name])
     out = tmp_path / "launchers.rs"
-    for embed in (False, True):
-        with pytest.raises(TilefishManifestError, match="cannot write Rust launchers for"):
-            rust.emit(manifest, out, pin=manifest.digest, embed=embed)
+    try:  # the file: the reader refuses it, or the emitter does
+        manifests = [edited(fake_manifest, tmp_path, FIELDS[name])]
+    except TilefishManifestError:
+        manifests = []
+    manifests.append(edited_in_memory(fake_manifest, tmp_path, FIELDS[name]))  # and the emitter's own guard, whatever the reader let through
+    for manifest in manifests:
+        for embed in (False, True):
+            with pytest.raises(TilefishManifestError, match="cannot write Rust launchers for"):
+                rust.emit(manifest, out, pin=manifest.digest, embed=embed)
     assert not out.exists()  # and the file is not written half way
 
 
 def test_the_reviewers_grid_with_a_newline_cannot_inject_items(fake_manifest, tmp_path):
     """A newline in the grid ended the doc comment and wrote ``pub fn`` items into the generated file."""
-    manifest = edited(fake_manifest, tmp_path, lambda e, d: e.update(grid="(n,)\npub fn pwned() {}\n// "))
+    with pytest.raises(TilefishManifestError, match=r"grid .* has a character the dimension grammar does not allow"):
+        edited(fake_manifest, tmp_path, lambda e, d: e.update(grid="(n,)\npub fn pwned() {}\n// "))  # the reader refuses the file
+    manifest = edited_in_memory(fake_manifest, tmp_path, lambda e, d: e.update(grid="(n,)\npub fn pwned() {}\n// "))
     with pytest.raises(TilefishManifestError, match=r"the grid is not a grid expression"):
         rust.render(manifest, pin=manifest.digest)
 
@@ -560,7 +580,7 @@ def test_the_names_that_clash_with_the_module_or_the_language_are_renamed(fake_m
     """A tensor called ``stream`` is a second parameter of that name, and a stem that gives ``Self`` or ``Error`` a struct of that name."""
 
     def clash(entry, directory):
-        entry["stem"] = "kernel"
+        entry["stem"] = entry["op"] = "kernel"  # (a stem is its operator and its buckets)
         param(entry, "x").update(name="stream")
         param(entry, "y").update(name="type")
         for pre in entry["preconditions"]:  # the preconditions name the pointers they are about
