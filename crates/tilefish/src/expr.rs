@@ -81,29 +81,29 @@ impl Expr {
     /// The value under `dims` (`None` for a dimension that is not bound), or an error for a division by a non-positive
     /// number or a value that does not fit 64 bits.
     pub fn eval(&self, dims: &[Option<i64>]) -> Result<Option<i64>, String> {
-        match self.eval_wide(dims)? {
+        match self.eval_by(&|i| dims.get(i).copied().flatten().map(i128::from))? {
             None => Ok(None),
             Some(v) => i64::try_from(v).map(Some).map_err(|_| format!("the value {v} does not fit 64 bits")),
         }
     }
 
-    fn eval_wide(&self, dims: &[Option<i64>]) -> Result<Option<i128>, String> {
+    /// The value of the expression as it is written, each dimension's value given by `lookup` (`None`: not bound). A sum or a product
+    /// beyond `2^100` is an overflow.
+    fn eval_by(&self, lookup: &dyn Fn(usize) -> Option<i128>) -> Result<Option<i128>, String> {
         let two = |a: &Expr, b: &Expr| -> Result<Option<(i128, i128)>, String> {
-            match (a.eval_wide(dims)?, b.eval_wide(dims)?) {
+            match (a.eval_by(lookup)?, b.eval_by(lookup)?) {
                 (Some(x), Some(y)) => Ok(Some((x, y))),
                 _ => Ok(None),
             }
         };
+        let checked = |v: Option<i128>| v.ok_or(OVERFLOW).map_err(str::to_owned).and_then(bounded);
         Ok(match self {
             Expr::Num(n) => Some(*n),
-            Expr::Var(i) => dims.get(*i).copied().flatten().map(i128::from),
-            Expr::Neg(a) => a.eval_wide(dims)?.map(|v| -v),
-            Expr::Add(a, b) => two(a, b)?.map(|(x, y)| bounded(x + y)).transpose()?,
-            Expr::Sub(a, b) => two(a, b)?.map(|(x, y)| bounded(x - y)).transpose()?,
-            Expr::Mul(a, b) => match two(a, b)? {
-                Some((x, y)) => Some(bounded(x.checked_mul(y).ok_or("a dimension expression overflows")?)?),
-                None => None,
-            },
+            Expr::Var(i) => lookup(*i),
+            Expr::Neg(a) => a.eval_by(lookup)?.map(|v| checked(v.checked_neg())).transpose()?,
+            Expr::Add(a, b) => two(a, b)?.map(|(x, y)| checked(x.checked_add(y))).transpose()?,
+            Expr::Sub(a, b) => two(a, b)?.map(|(x, y)| checked(x.checked_sub(y))).transpose()?,
+            Expr::Mul(a, b) => two(a, b)?.map(|(x, y)| checked(x.checked_mul(y))).transpose()?,
             Expr::FloorDiv(a, b) | Expr::CDiv(a, b) => match two(a, b)? {
                 Some((_, d)) if d < 1 => return Err(format!("a division by {d}: the divisor must be positive")),
                 Some((x, d)) => Some(if matches!(self, Expr::CDiv(..)) { ceil_div(x, d) } else { x.div_euclid(d) }),
@@ -620,7 +620,7 @@ pub enum Solved {
     /// Every dimension was bound and the equation holds.
     Checked,
     /// One dimension was bound by it.
-    Bound(usize, i64),
+    Bound(usize, i128),
     /// It cannot be used yet (two or more unbound dimensions, or the one is not affine in it).
     Stuck,
 }
@@ -629,11 +629,11 @@ pub enum Solved {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Unsolvable {
     /// A fully bound pattern is another value than the size.
-    Mismatch { expected: i64 },
+    Mismatch { expected: i128 },
     /// `coefficient * var = target` has no integer solution.
-    NotWhole { var: usize, target: i64, coefficient: i64 },
-    /// The solution is below 1.
-    NotPositive { var: usize, value: i64 },
+    NotWhole { var: usize, target: i128, coefficient: i128 },
+    /// The solution is below the least value the dimension may have.
+    NotPositive { var: usize, value: i128 },
     /// The expression cannot be evaluated (a division by a non-positive number, an overflow).
     Eval(String),
 }
@@ -654,24 +654,38 @@ impl Pattern {
         Ok(Self::new(text, parse_expr(text, what, syms)?))
     }
 
+    /// The dimension the pattern is, when its folded form is one dimension and nothing else (Python's `isinstance(p.dim, Dim)`).
+    pub fn as_var(&self) -> Option<usize> {
+        match self.affine.as_ref()? {
+            Affine { c: 0, terms } if terms.len() == 1 => match &terms[0] {
+                (Atom::Var(i), 1) => Some(*i),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The value under `dims` (`None` while it needs a dimension that is not bound): the folded form's (see [`Affine::eval`]), or for an
-    /// expression that is not affine, the value of the expression as it is written.
-    pub fn eval(&self, dims: &[Option<i64>]) -> Result<Option<i64>, String> {
+    /// expression that is not affine, the value of the expression as it is written. A dimension is an integer of 128 bits here, as
+    /// wide as a size or a stride of a view can make one (Python's are unbounded): whether a value fits what a kernel takes is checked
+    /// where it is given to the kernel.
+    pub fn eval(&self, dims: &[Option<i128>]) -> Result<Option<i128>, String> {
+        let lookup = |i: usize| dims.get(i).copied().flatten();
         match &self.affine {
-            Some(a) => a.eval(dims),
-            None => self.expr.eval(dims),
+            Some(a) => a.value(&lookup),
+            None => self.expr.eval_by(&lookup),
         }
     }
 
     /// Bind or check one dimension against `actual`, as Python's `_solve_one` does: a dimension is at least 1.
     #[cfg(test)]
-    pub fn solve(&self, actual: i64, dims: &[Option<i64>]) -> Result<Solved, Unsolvable> {
+    pub fn solve(&self, actual: i128, dims: &[Option<i128>]) -> Result<Solved, Unsolvable> {
         self.solve_from(actual, dims, 1)
     }
 
     /// As [`Pattern::solve`], with the dimension it binds at least `minimum`: 1 for a size, 0 for a stride (the stride of an expanded view
     /// is 0, as Python's `_solve_one` allows for the equations of a stride).
-    pub fn solve_from(&self, actual: i64, dims: &[Option<i64>], minimum: i64) -> Result<Solved, Unsolvable> {
+    pub fn solve_from(&self, actual: i128, dims: &[Option<i128>], minimum: i128) -> Result<Solved, Unsolvable> {
         let mut unbound = self.vars.iter().copied().filter(|v| dims.get(*v).copied().flatten().is_none());
         let Some(var) = unbound.next() else {
             return match self.eval(dims).map_err(Unsolvable::Eval)? {
@@ -689,7 +703,7 @@ impl Pattern {
             return Ok(Solved::Stuck); // the dimension only occurs inside a cdiv
         }
         // the rest of the form (Python's `pattern - var * coef`), which must have a value with `var` unbound
-        let lookup = |i: usize| dims.get(i).copied().flatten().map(i128::from);
+        let lookup = |i: usize| dims.get(i).copied().flatten();
         let base = match affine.numeric(Some(var), &lookup).map_err(Unsolvable::Eval)? {
             Some(base) => base,
             None => {
@@ -701,22 +715,16 @@ impl Pattern {
                 }
             }
         };
-        let target = i128::from(actual).checked_sub(base).ok_or_else(|| Unsolvable::Eval(OVERFLOW.to_owned()))?;
-        if target % coefficient != 0 {
-            return Err(Unsolvable::NotWhole {
-                var,
-                target: i64::try_from(target).unwrap_or(i64::MAX),
-                coefficient: i64::try_from(coefficient).unwrap_or(i64::MAX),
-            });
+        let overflow = || Unsolvable::Eval(OVERFLOW.to_owned());
+        let target = actual.checked_sub(base).ok_or_else(overflow)?;
+        if target.checked_rem(coefficient).ok_or_else(overflow)? != 0 {
+            return Err(Unsolvable::NotWhole { var, target, coefficient });
         }
-        let value = target / coefficient;
-        if value < i128::from(minimum) {
-            return Err(Unsolvable::NotPositive { var, value: i64::try_from(value).unwrap_or(i64::MIN) });
+        let value = target.checked_div(coefficient).ok_or_else(overflow)?;
+        if value < minimum {
+            return Err(Unsolvable::NotPositive { var, value });
         }
-        match i64::try_from(value) {
-            Ok(v) => Ok(Solved::Bound(var, v)),
-            Err(_) => Err(Unsolvable::Eval("a dimension does not fit 64 bits".to_owned())),
-        }
+        Ok(Solved::Bound(var, value))
     }
 }
 
@@ -845,20 +853,21 @@ mod tests {
         let q = pattern("999999999999*999999999999*M + N", &["M", "N"]);
         let e = q.solve(5, &[Some(1 << 62), None]).unwrap_err();
         assert_eq!(e, Unsolvable::Eval("a dimension expression overflows".to_owned()));
-        // a coefficient that big has no i64 form: the message shows the largest
+        // a coefficient, a target or a solution beyond 64 bits is exact, as Python's integers are (its messages show them as they are)
+        let big = 999_999_999_998_000_000_000_001i128; // 999999999999 squared
         let r = pattern("999999999999*999999999999*N", &["N"]);
-        assert_eq!(r.solve(5, &[None]), Err(Unsolvable::NotWhole { var: 0, target: 5, coefficient: i64::MAX }));
-        // a target that big shows as the largest i64, a negative one as the smallest
+        assert_eq!(r.solve(5, &[None]), Err(Unsolvable::NotWhole { var: 0, target: 5, coefficient: big }));
         let up = pattern("2*N - 999999999999*999999999999", &["N"]);
-        assert_eq!(up.solve(0, &[None]), Err(Unsolvable::NotWhole { var: 0, target: i64::MAX, coefficient: 2 }));
+        assert_eq!(up.solve(0, &[None]), Err(Unsolvable::NotWhole { var: 0, target: big, coefficient: 2 }));
         let down = pattern("N + 999999999999*999999999999", &["N"]);
-        assert_eq!(down.solve(5, &[None]), Err(Unsolvable::NotPositive { var: 0, value: i64::MIN }));
-        // a solution that is not a 64-bit size
+        assert_eq!(down.solve(5, &[None]), Err(Unsolvable::NotPositive { var: 0, value: 5 - big }));
+        // a dimension of 80 bits is bound (Python binds it too): whether it fits what a kernel takes is checked where it is given one
         let wide = pattern("N - 999999999999*999999999999", &["N"]);
-        assert_eq!(wide.solve(5, &[None]), Err(Unsolvable::Eval("a dimension does not fit 64 bits".to_owned())));
-        // the edge: N = i64::MAX is a solution, 2^63 is not a 64-bit actual at all
+        assert_eq!(wide.solve(5, &[None]), Ok(Solved::Bound(0, 5 + big)));
+        // the edges of a size: 2^63 - 1 and 2^64 - 1 (one-byte elements) are dimensions
         let n = pattern("N", &["N"]);
-        assert_eq!(n.solve(i64::MAX, &[None]), Ok(Solved::Bound(0, i64::MAX)));
+        assert_eq!(n.solve(i64::MAX.into(), &[None]), Ok(Solved::Bound(0, i64::MAX.into())));
+        assert_eq!(n.solve(u64::MAX.into(), &[None]), Ok(Solved::Bound(0, u64::MAX.into())));
         assert_eq!(n.solve(1, &[None]), Ok(Solved::Bound(0, 1)));
         assert_eq!(n.solve(0, &[None]), Err(Unsolvable::NotPositive { var: 0, value: 0 }));
         assert_eq!(n.solve(-1, &[None]), Err(Unsolvable::NotPositive { var: 0, value: -1 }));
@@ -964,7 +973,7 @@ mod tests {
     #[test]
     fn a_folded_form_is_evaluated_as_python_substitutes_into_it() {
         let names = &["M", "N"];
-        let value = |text: &str, values: &[Option<i64>]| pattern(text, names).eval(values);
+        let value = |text: &str, values: &[Option<i128>]| pattern(text, names).eval(values);
         // a name that cancels inside a cdiv needs no value (Python's `eval_dim` of `cdiv(M, 2)`)
         assert_eq!(value("cdiv(M + N - N, 2)", &[Some(5), None]), Ok(Some(3)));
         assert_eq!(pattern("cdiv(M + N - N, 2)", names).vars, [0]);
