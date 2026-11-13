@@ -320,7 +320,8 @@ slot per `DevScalar` input and the cuBLASLt workspace. Every arena buffer has a 
 can be captured in a CUDA graph once per bucket at fixed addresses. The steps run on one stream in the order of the IR, with no synchronization between them and none implied (an in-place call
 keeps the storage of the version it consumes). `reuse=True` lets intermediates share bytes where no step uses both: the transformer block of the gate (rmsnorm, a bias GEMM whose output is split
 into q, k and v views, an attention that masks the keys at a device scalar `n`, a GEMM, a residual add and rmsnorm, two GEMMs around a gelu, a residual add; rows bucketed over 32, 64 and 128)
-needs 9 634 048 bytes without reuse (8 519 680 of them the workspace) and 9 240 832 with it.
+needs 9 634 048 bytes without reuse (8 519 680 of them the workspace) and 9 240 832 with it; unrolled 24 times (216 launches per bucket, the weights of the layers views of stacked
+parameters) the arena is 36 765 952 bytes without reuse and 9 306 368 with it, one layer's intermediates plus the workspace whatever the depth.
 
 ```python
 plan = tilefish.plan(block, buckets={"M": [32, 64, 128]}, reuse=False)       # no GPU, no torch: steps, buffers, offsets

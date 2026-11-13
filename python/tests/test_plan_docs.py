@@ -54,6 +54,19 @@ def test_the_steps_with_views_and_the_arena_numbers_of_the_block_are_the_ones_th
         assert spaced(n) in text, n
 
 
+def test_the_arena_numbers_of_the_readme_are_the_ones_the_plans_have():
+    readme = REPO_ROOT / "README.md"
+    if not readme.exists():
+        pytest.skip("README.md is not available (not running from a source checkout)")
+    text = readme.read_text(encoding="utf-8")
+    block = tilefish.plan(pm.block, reuse=True)
+    deep = tilefish.plan(pm.deep_block(24), reuse=True)
+    spaced = lambda n: f"{n:,}".replace(",", " ")  # noqa: E731
+    for n in (block.arena_bytes_without_reuse, block.arena_bytes_with_reuse, deep.arena_bytes_without_reuse, deep.arena_bytes_with_reuse):
+        assert spaced(n) in text, n
+    assert len(deep.steps(M=64)) == 216 and "216 launches" in text
+
+
 def test_every_key_and_role_the_document_names_is_the_code_s(text):
     for key in _plan.TOP_KEYS + _plan.BUFFER_KEYS + _plan.STEP_KEYS + list(_plan.ROLES):
         assert f"`{key}`" in text, key
