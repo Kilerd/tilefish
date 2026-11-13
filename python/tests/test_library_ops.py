@@ -291,12 +291,13 @@ def test_a_replay_refuses_a_missing_entry_and_an_entry_that_differs_from_the_dec
         built_from_manifest(m, library_specs(wider)[0], "sm_103")
 
 
-def test_the_rust_host_does_not_run_library_entries_yet(tmp_path):
+def test_the_rust_emitter_writes_a_launcher_for_a_library_entry(tmp_path):
+    """One struct per stem, wrapping the crate's ``Gemm`` (``test_rust_host_schema3.py`` has the rest)."""
     from tilefish.hosts import rust
 
     m = write(tmp_path, built(library_specs(gemm)[0]))
-    with pytest.raises(TilefishManifestError, match="has library entries \\(gemm.M32: pinned cuBLASLt GEMMs\\), which are not yet supported by the Rust host"):
-        rust.render(m.check_pin(m.digest))
+    source = rust.render(m.check_pin(m.digest), ops=[gemm])
+    assert "pub struct GemmM32 {\n    gemm: Gemm,\n}" in source and "manifest.gemm(ctx, Self::STEM, Self::BUCKETS" in source
 
 
 def test_pinning_asks_the_device_of_the_architecture(monkeypatch):

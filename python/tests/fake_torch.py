@@ -1,13 +1,17 @@
 """Tensors and a ``torch`` module with only what ``tilefish.runtime._prepare`` reads (not collected: the name has no ``test_`` prefix).
 
 ``_prepare`` is the part of ``replay`` that checks a call and decides the binary, the scalars and the grid; it needs facts about
-tensors (shape, dtype, address, contiguity, device) and, for an ``Out`` tensor, an allocator. No GPU is needed for that: a
+tensors (shape, dtype, address, strides, contiguity, device) and, for an ``Out`` tensor, an allocator. No GPU is needed for that: a
 ``FakeTensor`` has the facts, and ``FakeTorch.empty`` hands out addresses. ``prepare(op, args)`` runs the real ``_prepare``
 with them. It is what the cross-language vectors of the launch checks are made with (``export_rust_vectors.py``): Python's
 verdict on a call is the oracle for what the Rust host decides.
+
+A ``FakeTensor`` is dense unless it is given ``strides`` (element strides, as ``t.stride()`` reports them): then it is a view whose ``ptr`` is the address of its first
+element (``data_ptr()``), like a torch view with a storage offset.
 """
 
 import math
+import struct
 from dataclasses import dataclass
 
 from tilefish import runtime
@@ -33,19 +37,42 @@ class FakeDevice:
         return "cuda:0"
 
 
-class FakeTensor:
-    """What the checks read off a torch tensor: a contiguous tensor on ``cuda:0`` at ``ptr``."""
+def dense_strides(shape):
+    """The row-major element strides of a tensor of this shape."""
+    out, acc = [0] * len(shape), 1
+    for i in range(len(shape) - 1, -1, -1):
+        out[i] = acc
+        acc *= shape[i]
+    return tuple(out)
 
-    def __init__(self, shape, dtype, ptr):
+
+class FakeTensor:
+    """What the checks read off a torch tensor: a tensor on ``cuda:0`` whose first element is at ``ptr`` (dense, or with ``strides``)."""
+
+    def __init__(self, shape, dtype, ptr, strides=None):
         self.shape = tuple(shape)
         self.dtype = dtype if isinstance(dtype, FakeDtype) else FakeDtype(dtype)
         self._ptr = ptr
+        self.strides = None if strides is None else tuple(strides)
+        assert self.strides is None or len(self.strides) == len(self.shape), (self.shape, self.strides)
         self.device = FakeDevice()
 
     def data_ptr(self):
         return self._ptr
 
+    def stride(self):
+        return dense_strides(self.shape) if self.strides is None else self.strides
+
     def is_contiguous(self):
+        """torch's rule: the strides of the axes of size 1 do not matter."""
+        if math.prod(self.shape) == 0:
+            return True
+        expected = 1
+        for size, stride in zip(reversed(self.shape), reversed(self.stride())):
+            if size != 1:
+                if stride != expected:
+                    return False
+                expected *= size
         return True
 
     def numel(self):
@@ -83,8 +110,18 @@ def prepare(op, args, *, next_slab):
         runtime._torch = saved
 
 
+def f32_bits(value):
+    """The IEEE 754 binary32 bits of a number, as an unsigned integer: what a ``float`` kernel parameter holds."""
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
 def verdict(prepared, error):
-    """What Python decided, as plain data: the binary, the grid and the ``kernelParams`` values, or the kind of the refusal."""
+    """What Python decided, as plain data: the binary, the grid and the ``kernelParams`` values, or the kind of the refusal.
+
+    ``params`` are the values of the ``kernelParams`` slots: a pointer is its address, an ``i32`` or ``i64`` scalar its integer, a fixed argument
+    of a prebuilt binary its value (an integer, or the bits of an ``f32``) and, for a Triton kernel, the two null scratch pointers at the end (a
+    prebuilt binary has none).
+    """
     if error is not None:
         return {"ok": False, "kind": error.kind if isinstance(error, TilefishPreconditionError) else "other"}
     spec = prepared.spec
@@ -94,4 +131,7 @@ def verdict(prepared, error):
             params.append(prepared.tensors[a.name].data_ptr())
         elif a.kind == "scalar":
             params.append(prepared.scalars[a.name])
-    return {"ok": True, "stem": spec.stem, "grid": list(prepared.grid) + [1] * (3 - len(prepared.grid)), "params": params + [0, 0]}
+        elif a.kind == "fixed":
+            params.append(f32_bits(a.value) if a.type == "f32" else int(a.value))
+    scratch = [] if spec.binary is not None else [0, 0]
+    return {"ok": True, "stem": spec.stem, "grid": list(prepared.grid) + [1] * (3 - len(prepared.grid)), "params": params + scratch}

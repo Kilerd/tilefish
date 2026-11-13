@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import pathlib
+import re
 import sys
 
 import pytest
@@ -475,9 +476,12 @@ def test_the_digest_of_a_manifest_covers_the_binary_section_and_the_flags(tmp_pa
         assert manifest_digest(other) != m.digest
 
 
-def test_the_rust_host_does_not_launch_a_prebuilt_binary_yet(tmp_path, op):
+def test_the_rust_emitter_writes_a_launcher_for_a_prebuilt_binary(tmp_path, op):
+    """The launcher of a prebuilt binary has no scratch slots to pass and no parameter for a fixed argument (``test_rust_host_schema3.py`` has the rest)."""
     from tilefish.hosts import rust
 
     m, _ = manifest_of(tmp_path, op)
-    with pytest.raises(TilefishManifestError, match="'axpy' \\(sm_90\\): it is a 'binary' kernel \\(a prebuilt PTX or cubin\\), which is not yet supported by the Rust host"):
-        rust.render(m.check_pin(m.digest))
+    source = rust.render(m.check_pin(m.digest), ops=[op])
+    text = re.sub(r"\n\s*///[ ]?", " ", source)  # the doc comments, a wrapped paragraph as one run of words
+    assert "pub struct Axpy " in source and "`alpha` = 2.0 (f32)" in text and "`scratch` = 0 (i64)" in text
+    assert "x: TensorRef<'a, F32>" in source and "alpha" not in source.split("pub fn launch<'a>")[1].split("Result<(), Error>")[0]

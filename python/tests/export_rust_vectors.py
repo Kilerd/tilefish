@@ -13,11 +13,18 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
   order, the edges of the integers, floats, nesting, random strings;
 * ``python_elf.in``: small ELF files (``elf_builder.py``) and their ``code_digest``;
 * ``python_launches.json``: calls on the binaries of ``host_ops.ops()`` (a valid call per size and every single change of one input:
-  dtype, rank, an axis made larger, twice as large or empty, a misaligned address, a tensor too large for 32-bit offsets, an alias) and
+  dtype, rank, an axis made larger, twice as large or empty, a misaligned address, a tensor too large for 32-bit offsets, a tensor with gaps given to a
+  pointer that is dense, an alias; for manifest schema 3 also views with their strides, a size-1 axis, a stride that fits no ``i32`` or ``i64``, the
+  limit of ``max_extent``, addresses of every alignment, device scalars of every shape and dtype, and prebuilt binaries with fixed arguments) and
   what ``runtime._prepare`` of Python decides for each (the grid and the ``kernelParams`` values, or the kind of the refusal), run on
-  fake tensors; the Rust ``Plan::prepare`` must decide the same (``tests/python_launches.rs``);
-* ``python_manifests.in``: small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
-  alphabets) and their ``manifest_digest``, which has its own tag.
+  fake tensors; the Rust ``Plan::prepare`` must decide the same (``tests/python_launches.rs``). A tensor of a record is ``{"ptr", "shape", "dtype"}``, and
+  ``"strides"`` (element strides, as torch reports them; ``ptr`` is the address of the first element) when it is a view; ``params`` are the values of the
+  ``kernelParams``: pointers are addresses, ``i32`` and ``i64`` scalars their integer, a fixed argument its integer or the IEEE bits of an ``f32``, and a Triton
+  kernel's two null scratch slots follow (a prebuilt binary has none);
+* ``python_manifests.in``: ``MANIFESTS``, small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
+  alphabets; schema 3 with kernels and library entries in every order, every field it added, the spelling of floats, non-ASCII text escaped and as it is,
+  and the schemas ``3.0``, ``true``, ``"3"`` and ``4``) and their ``manifest_digest``, which has its own tag per schema; and ``MANIFEST_ERRORS``, documents
+  that ``manifest_digest`` refuses.
 
 The generators are seeded, so the files only change when a format does.
 """
@@ -31,6 +38,7 @@ import sys
 
 from elf_builder import SHF_ALLOC, SHF_EXECINSTR, SHT_NOBITS, SHT_PROGBITS, S, build_elf, cubin_like
 
+from fake_torch import dense_strides
 from tilefish._elf import code_digest
 
 
@@ -193,16 +201,105 @@ def elfs():
     return "\n".join([*out, "];"]) + "\n"
 
 
-def manifest_digests():
-    """Small manifests and their ``manifest_digest``: the tag, the sorting of the entries and the canonical form together."""
+def _text_and_digest(doc, ensure_ascii=True, indent=1):
+    """The JSON text of a document (as a file would hold it) and the digest Python gives it. The text is what is digested, not ``doc``: a
+    float is what it reads back as (``1e-06``) and ``"schema": 3.0`` is the float 3.0."""
     import json
 
     from tilefish._manifest import manifest_digest
 
+    text = json.dumps(doc, indent=indent, ensure_ascii=ensure_ascii)
+    return text, manifest_digest(json.loads(text))
+
+
+def manifest_documents():
+    """``(a manifest document, ensure_ascii of its text, its indent)``: schema 2 (digested in the form the crate 0.0.1 uses), then schema 3 (the
+    first few indented as a manifest file is, the rest on one line: the whitespace is not part of the digest) and the schemas that are neither."""
+
     def entry(stem, arch, **extra):
         return {"stem": stem, "arch": arch, "shared": 16, "shape": ["M", 1024], "dims": {"M": {}}, **extra}
 
-    docs = [
+    # an entry of schema 3: what a Triton kernel, a strided pointer, a device scalar, a prebuilt binary and a library entry write (the fields are
+    # the ones of docs/manifest-schema-3.md, which the digest takes as they are)
+    def triton(stem, arch="sm_103", **extra):
+        return entry(
+            stem,
+            arch,
+            op=stem.split(".")[0],
+            kind="triton",
+            abi={
+                "params": [
+                    {"slot": 0, "index": 0, "name": "x", "kind": "pointer", "type": "*bf16", "ptx_type": "u64", "size": 8, "dtype": "bf16", "access": "in",
+                     "shape": ["S", 8, 64], "strides": ["x_s0", "x_s1", 1], "offset": "x_offset"},
+                    {"slot": 1, "index": 1, "name": "x_s0", "kind": "scalar", "type": "i32", "ptx_type": "u32", "size": 4, "dim": "x_s0",
+                     "stride_of": {"arg": "x", "axis": 0}},
+                    {"slot": 2, "index": 2, "name": "n_tok", "kind": "pointer", "type": "*i32", "ptx_type": "u64", "size": 8, "dtype": "i32", "access": "in", "shape": []},
+                ],
+                "scratch": [{"name": "global_scratch", "type": "*i8", "value": 0}, {"name": "profile_scratch", "type": "*i8", "value": 0}],
+                "scratch_slots": 2,
+            },
+            preconditions=[
+                {"kind": "pointer_alignment", "arg": "x", "index": 0, "bytes": 2},
+                {"kind": "max_extent", "arg": "x", "index": 0, "value": 2147483647},
+                {"kind": "pointer_alignment", "arg": "n_tok", "index": 2, "bytes": 16},
+            ],
+            **extra,
+        )
+
+    def binary(stem, arch="sm_103", alpha=2.0):
+        return entry(
+            stem,
+            arch,
+            op=stem,
+            kind="binary",
+            abi={
+                "params": [
+                    {"slot": 0, "index": 0, "name": "x", "kind": "pointer", "type": "*fp32", "ptx_type": "u64", "size": 8, "dtype": "f32", "access": "in", "shape": ["n"]},
+                    {"slot": 1, "index": 1, "name": "alpha", "kind": "fixed", "type": "f32", "ptx_type": "f32", "size": 4, "value": alpha},
+                    {"slot": 2, "index": 2, "name": "zero", "kind": "fixed", "type": "i64", "ptx_type": "u64", "size": 8, "value": 0},
+                    {"slot": 3, "index": 3, "name": "eps", "kind": "fixed", "type": "f32", "ptx_type": "f32", "size": 4, "value": {"float": "inf"}},
+                ],
+                "scratch": [],
+                "scratch_slots": 0,
+            },
+            binary={"source": "ptx", "ptxas_flags": ["-lineinfo", "-v", "--gpu-name=sm_103a"]},
+            source_digest="0123456789abcdef" * 4,
+            source_digest_kind="tilefish.binary.v1",
+            toolchain={"ptxas": "Cuda compilation tools, release 12.9, V12.9.86"},
+            block=[128, 1, 1],
+            max_elements=2**31 - 1,
+        )
+
+    def library(stem, arch="sm_103", algo="0123456789abcdef" * 8, version=120804):
+        return {
+            "stem": stem,
+            "op": stem.split(".")[0],
+            "arch": arch,
+            "impl": "cublaslt.gemm",
+            "abi": {"params": [{"index": 0, "name": "a", "kind": "pointer", "dtype": "bf16", "access": "in", "shape": ["M", 1024]}]},
+            "buckets": {"M": 32},
+            "dims": {"M": {"buckets": [32, 64], "bucket": 32}},
+            "preconditions": [{"kind": "pointer_alignment", "arg": "a", "index": 0, "bytes": 16}],
+            "dtypes": {"a": "bf16", "b": "bf16", "out": "bf16"},
+            "compute_type": "CUBLAS_COMPUTE_32F",
+            "scale_type": "CUDA_R_32F",
+            "transa": "T",
+            "transb": "N",
+            "m": 32,
+            "n": 2048,
+            "k": 1024,
+            "lda": 1024,
+            "ldb": 1024,
+            "ldc": 2048,
+            "ldd": 2048,
+            "epilogue": "none",
+            "workspace_bytes": 8519680,
+            "algo": algo,
+            "cublaslt_version": version,
+            "declaration_digest": "f" * 64,
+        }
+
+    legacy = [
         {"schema": 2, "kernels": []},
         {"schema": 2, "tilefish": "0.0.2", "kernels": [entry("a", "sm_90")]},
         {"schema": 2, "tilefish": "9.9.9", "kernels": [entry("a", "sm_90")]},  # the version of the tool is not part of it
@@ -212,14 +309,109 @@ def manifest_digests():
         {"schema": 2, "kernels": [entry("caf\u00e9.\u4e2d", "sm_90", note="\U0001f600\x7f", pi=3.14159, big=2**63, tiny=1e-07)]},
         {"schema": 2, "kernels": [entry("a", "sm_90", dims={"S": {"buckets": [32, 64], "bucket": 32}, "M": {}})]},
     ]
+    non_ascii = {
+        "schema": 3,
+        "kernels": [triton("café.中", note='\U0001f600\x7f  "quoted" \\', pi=3.14159, big=2**63, tiny=1e-07)],
+        "library": [library("gé.M32")],
+    }
+    v3 = [
+        {"schema": 3, "kernels": [], "library": []},  # f66955caeb4e878dbe95483da2607d19ea4f734977e86282fff6f92f1a87fe6e
+        {"schema": 3, "tilefish": "0.0.3", "kernels": [triton("k")], "library": [library("g.M32")]},
+        {"schema": 3, "tilefish": "9.9.9", "kernels": [triton("k")], "library": [library("g.M32")]},  # the version of the tool is not digested
+        # kernels and library entries, in several orders: the digest does not depend on the order of either list
+        {"schema": 3, "kernels": [triton("b"), triton("a", "sm_120"), triton("a")], "library": [library("y.M32"), library("x.M32", "sm_120"), library("x.M32")]},
+        {"schema": 3, "kernels": [triton("a"), triton("a", "sm_120"), triton("b")], "library": [library("x.M32"), library("x.M32", "sm_120"), library("y.M32")]},
+        {"schema": 3, "library": [library("x.M32"), library("x.M32", "sm_120"), library("y.M32")], "kernels": [triton("a"), triton("b"), triton("a", "sm_120")]},
+        # the key order of a document is not the order of the digest, and the entries of the two lists sort apart
+        {"schema": 3, "kernels": [triton("k", "sm_90"), triton("k", "sm_103")], "library": [library("k.M32", "sm_90"), library("k.M32", "sm_103")]},
+        # every field a version 3 entry adds is in the digest: kind, scratch_slots, strides, offset, stride_of, a device scalar, fixed values, binary, max_extent
+        {"schema": 3, "kernels": [triton("s")], "library": []},
+        {"schema": 3, "kernels": [binary("p")], "library": []},
+        {"schema": 3, "kernels": [binary("p", alpha=2.5)], "library": []},
+        # the spelling of a float: python's shortest repr (2.0, 1e-06, 1e+16, 5e-324) and what it reads back as
+        {"schema": 3, "kernels": [binary("p", alpha=1e-06)], "library": []},
+        {"schema": 3, "kernels": [binary("p", alpha=1e16)], "library": []},
+        {"schema": 3, "kernels": [binary("p", alpha=5e-324)], "library": []},
+        {"schema": 3, "kernels": [binary("p", alpha=0.1)], "library": []},
+        {"schema": 3, "kernels": [binary("p", alpha=123456789.123456789)], "library": []},
+        {"schema": 3, "kernels": [binary("p", alpha=-0.0)], "library": []},
+        # the fields of a library entry: the algorithm and the version are in it
+        {"schema": 3, "kernels": [], "library": [library("g.M32", algo="f" * 128)]},
+        {"schema": 3, "kernels": [], "library": [library("g.M32", version=120805)]},
+        # non-ASCII, escaped (and, at the end of the list, as it is)
+        non_ascii,
+        # a schema that is not the integer 3: the digest still has a form for each, and 3.0 is the same number as 3 in Python
+        {"schema": 3.0, "kernels": [triton("k")], "library": [library("g.M32")]},
+        {"schema": 3.0, "kernels": [], "library": []},
+        {"schema": True, "kernels": [triton("k")]},
+        {"schema": "3", "kernels": [triton("k")]},
+        {"schema": 4, "kernels": [triton("k")], "library": [library("g.M32")]},
+        {"schema": 0, "kernels": []},
+    ]
+    return (
+        [(d, True, 1) for d in legacy]
+        + [(d, True, 2 if i < 3 else None) for i, d in enumerate(v3)]
+        + [(non_ascii, False, None)]  # the same document with its non-ASCII text as it is, not escaped: the same digest
+    )
+
+
+def manifest_digests():
+    """Small manifests and their ``manifest_digest``: the tag, the sorting of the entries and the canonical form together."""
     out = ["// generated by python: (a manifest document, tilefish._manifest.manifest_digest of it)", "pub const MANIFESTS: &[(&str, &str)] = &["]
-    for doc in docs:
-        text = json.dumps(doc, indent=1)
-        out.append(f"    ({rust_string(text)}, {rust_string(manifest_digest(json.loads(text)))}),")
+    for doc, ensure_ascii, indent in manifest_documents():
+        text, digest = _text_and_digest(doc, ensure_ascii, indent)
+        out.append(f"    ({rust_string(text)}, {rust_string(digest)}),")
+    out += ["];", ""]
+    out += [
+        "// generated by python: documents that tilefish._manifest.manifest_digest refuses (it is not JSON data it can digest)",
+        "pub const MANIFEST_ERRORS: &[&str] = &[",
+    ]
+    for text in manifest_error_documents():
+        out.append(f"    {rust_string(text)},")
     return "\n".join([*out, "];"]) + "\n"
 
 
-# (the operator of host_ops.ops(), the inputs of a valid call for one size, the sizes): what a call is built from
+def manifest_error_documents():
+    """JSON texts that Python's ``manifest_digest`` refuses (a schema 3 without ``library``, ``kernels`` that is not a list, a value JSON cannot hold ...)."""
+    import json
+
+    from tilefish._manifest import manifest_digest
+    from tilefish.errors import TilefishManifestError
+
+    texts = [
+        '{"schema": 3, "kernels": []}',  # no library
+        '{"schema": 3, "library": []}',  # no kernels
+        '{"kernels": [], "library": []}',  # no schema
+        '{"schema": 2}',  # no kernels
+        '{"schema": 2, "kernels": 5}',
+        '{"schema": 2, "kernels": "k"}',
+        '{"schema": 3, "kernels": 5, "library": []}',
+        '{"schema": 3, "kernels": [], "library": 5}',
+        '{"schema": 3, "kernels": [], "library": "x"}',
+        '{"schema": 3, "kernels": [5], "library": []}',  # an entry that is not an object
+        '{"schema": 3, "kernels": [], "library": ["x"]}',
+        '{"schema": 2, "kernels": [[]]}',
+        '{"schema": 2, "kernels": [{"stem": "a", "arch": "sm_90", "v": NaN}]}',  # not JSON: a host that reads strict JSON refuses the file first
+        '{"schema": 2, "kernels": [{"stem": "a", "arch": "sm_90", "v": Infinity}]}',
+        '{"schema": 3, "kernels": [], "library": [{"stem": "g", "arch": "sm_90", "v": -Infinity}]}',
+        '{"schema": 2, "kernels": [{"stem": "a", "arch": "sm_90", "v": 1e999}]}',  # a number that does not fit a double
+        "[]",
+        "null",
+        '"a string"',
+        "5",
+        "true",
+    ]
+    for text in texts:  # each one must be refused: the file is regenerated only from what Python refuses
+        try:
+            manifest_digest(json.loads(text))
+        except TilefishManifestError:
+            continue
+        raise AssertionError(f"Python digests {text!r}")
+    return texts
+
+
+# (the operator of host_ops.ops(), the inputs of a valid call for one size, the sizes): what a call is built from. An input is ``(dtype, shape)`` (a dense
+# tensor) or ``(dtype, shape, strides)`` (a view: element strides as ``t.stride()`` reports them, and the address of its first element)
 LAUNCH_CASES = [
     ("softmax", lambda r: [("f32", (r, 1000))], (1, 5)),
     ("layernorm", lambda r: [("bf16", (r, 768)), ("bf16", (768,)), ("bf16", (768,))], (1, 5)),
@@ -231,36 +423,106 @@ LAUNCH_CASES = [
     ("gelu_erf", lambda n: [("bf16", (n,))], (16, 1040)),
     ("axpy", lambda n: [("f32", (n,)), ("f32", (n,))], (16, 1040)),
     ("mm", lambda mnk: [("f16", (mnk[0], mnk[2])), ("f16", (mnk[2], mnk[1]))], ((128, 128, 64), (256, 384, 192))),
+    # manifest schema 3: strided views (the q, k or v of a fused qkv: strides (1536, 64, 1)), device scalars, prebuilt binaries with fixed arguments
+    ("head_copy", lambda r: [("bf16", (r, 8, 64), (1536, 64, 1))], (1, 5)),
+    ("head_copy16", lambda r: [("bf16", (r, 8, 64), (1536, 64, 1))], (1, 5)),
+    ("head_copy64", lambda r: [("bf16", (r, 8, 64), (1536, 64, 1))], (1, 5)),
+    ("softmax3d", lambda ab: [("f32", (ab[0], ab[1], 128), (128, ab[0] * 128, 1))], ((5, 3), (2, 9))),
+    ("masked_rows", lambda rs: [("f32", (rs[0], 128)), ("i32", rs[1])], ((5, ()), (3, (1,)))),
+    ("scale_by", lambda r: [("f32", (r, 256)), ("f32", ())], (1, 5)),
+    ("scale_flat", lambda n: [("f32", (n,)), ("f32", ()), ("f32", ())], (16, 1040)),
+    ("axpy_ptx", lambda n: [("f32", (n,)), ("f32", (n,))], (16, 1040)),
+    ("strided_copy", lambda r: [("bf16", (r, 64), (200, 1))], (1, 5)),
 ]
-_OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16"}
+_OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16", "i32": "i64"}
+I31 = (1 << 31) - 1
 
 
-def _mutations(dtype, shape, ptr):
-    """Single changes to one input tensor: ``(what, (dtype, shape, ptr))``."""
-    yield "dtype", (_OTHER_DTYPE[dtype], shape, ptr)
-    if len(shape) >= 2:
-        yield "drop an axis", (dtype, shape[:-1], ptr)
-    yield "add an axis", (dtype, (*shape, 2), ptr)
+def _mutations(dtype, shape, ptr, strides):
+    """Single changes to one input tensor: ``(what, (dtype, shape, ptr, strides))`` (``strides`` is ``None`` for a dense tensor)."""
+
+    yield "dtype", (_OTHER_DTYPE[dtype], shape, ptr, strides)
+    if len(shape) >= 2:  # the strides of a view go with its axes
+        yield "drop an axis", (dtype, shape[:-1], ptr, None if strides is None else strides[:-1])
+    yield "add an axis", (dtype, (*shape, 2), ptr, None if strides is None else (*strides, 1))
     for axis, size in enumerate(shape):
-        yield f"axis {axis} + 1", (dtype, (*shape[:axis], size + 1, *shape[axis + 1 :]), ptr)
-        yield f"axis {axis} * 2", (dtype, (*shape[:axis], size * 2, *shape[axis + 1 :]), ptr)
-        yield f"axis {axis} = 0", (dtype, (*shape[:axis], 0, *shape[axis + 1 :]), ptr)
-    yield "address + 8", (dtype, shape, ptr + 8)
-    yield "address + 16", (dtype, shape, ptr + 16)
-    yield "more elements than 32-bit offsets reach", (dtype, (2_200_000, *shape[1:]), ptr)
-    yield "2^31 rows", (dtype, (1 << 31, *shape[1:]), ptr)
-    if len(shape) == 2:  # the row count at which the tensor has 2^31 - 1 elements or fewer, and the first that has more
+        yield f"axis {axis} + 1", (dtype, (*shape[:axis], size + 1, *shape[axis + 1 :]), ptr, strides)
+        yield f"axis {axis} * 2", (dtype, (*shape[:axis], size * 2, *shape[axis + 1 :]), ptr, strides)
+        yield f"axis {axis} = 0", (dtype, (*shape[:axis], 0, *shape[axis + 1 :]), ptr, strides)
+    yield "address + 8", (dtype, shape, ptr + 8, strides)
+    yield "address + 16", (dtype, shape, ptr + 16, strides)
+    yield "more elements than 32-bit offsets reach", (dtype, (2_200_000, *shape[1:]), ptr, strides)
+    yield "2^31 rows", (dtype, (1 << 31, *shape[1:]), ptr, strides)
+    if len(shape) == 2 and strides is None:  # the row count at which the tensor has 2^31 - 1 elements or fewer, and the first that has more
         for rows in (((1 << 31) - 1) // shape[1], ((1 << 31) - 1) // shape[1] + 1):
-            yield f"{rows} rows", (dtype, (rows, shape[1]), ptr)
+            yield f"{rows} rows", (dtype, (rows, shape[1]), ptr, strides)
+    if strides is None and any(size != 1 for size in shape):  # a dense pointer is given a tensor with gaps
+        yield "not contiguous", (dtype, shape, ptr, tuple(2 * s for s in dense_strides(shape)))
+
+
+def _views(key, ptr, high):
+    """Calls of schema 3 that no single change of the valid call makes, for the first input of ``key``: ``(what, (dtype, shape, ptr, strides))``.
+
+    A view with a huge extent starts at ``high``, above every other tensor of the call (the allocator of the fake torch puts them 64 GiB apart, and a view
+    that reaches over the ``Out`` tensor is refused as an alias: that is not what these calls are about)."""
+    qkv = "bf16", (40, 8, 64)
+    if key in ("head_copy", "head_copy16", "head_copy64"):
+        yield "transposed", (*qkv, ptr, (64, 2560, 1))
+        yield "expanded (stride 0)", (*qkv, ptr, (0, 64, 1))
+        yield "one row, torch's stride", ("bf16", (1, 8, 64), ptr, (1536, 64, 1))
+        yield "one row, a stride that fits no i32", ("bf16", (1, 8, 64), ptr, (1 << 40, 64, 1))
+        yield "last axis stride 2", (*qkv, ptr, (1024, 128, 2))
+        yield "last axis stride 0", (*qkv, ptr, (1536, 64, 0))
+        yield "a stride beyond i32", (*qkv, high, (1 << 31, 64, 1))
+        yield "a stride of 2^31 - 1", (*qkv, high, (I31, 64, 1))
+        yield "an extent of 2^31 - 1", ("bf16", (2, 8, 64), high, (I31 - 512, 64, 1))
+        yield "an extent of 2^31", ("bf16", (2, 8, 64), high, (I31 - 511, 64, 1))
+        yield "strides 2^41 and 2^40", ("bf16", (2, 8, 64), high, (1 << 41, 1 << 40, 1))
+        yield "strides 2^63 and 2^62", ("bf16", (2, 8, 64), high, (1 << 63, 1 << 62, 1))
+        yield "a stride of 2^63 - 1", ("bf16", (2, 8, 64), high, (2**63 - 1, 64, 1))
+        for offset in (1, 2, 4, 6, 8, 10, 16):
+            yield f"address + {offset}", (*qkv, ptr + offset, (1536, 64, 1))
+        yield "a stride that is not a multiple of 8", (*qkv, ptr, (1537, 64, 1))
+        yield "another stride that is not a multiple of 8", (*qkv, ptr, (1536, 60, 1))
+    elif key == "softmax3d":
+        yield "broadcast along the first axis", ("f32", (5, 3, 128), ptr, (0, 128, 1))
+        yield "last axis stride 2", ("f32", (5, 3, 128), ptr, (256, 1280, 2))
+        yield "one row", ("f32", (1, 3, 128), ptr, (1 << 40, 128, 1))
+        yield "address + 4", ("f32", (5, 3, 128), ptr + 4, (128, 640, 1))
+    elif key == "strided_copy":
+        yield "a row stride of 2^33", ("bf16", (7, 64), high, (1 << 33, 1))
+        yield "a row stride of 2^63 - 1", ("bf16", (7, 64), high, (2**63 - 1, 1))
+        yield "a row stride of 2^63", ("bf16", (7, 64), high, (2**63, 1))
+        yield "one row", ("bf16", (1, 64), ptr, (1 << 40, 1))
+        yield "last axis stride 2", ("bf16", (7, 64), ptr, (200, 2))
+        yield "address + 1", ("bf16", (7, 64), ptr + 1, (200, 1))
+        yield "address + 2", ("bf16", (7, 64), ptr + 2, (200, 1))
+
+
+def _device_scalars(key, base):
+    """Device scalars of every shape and alignment: ``(input index, (dtype, shape, ptr, strides))``."""
+    if key not in ("masked_rows", "scale_by", "scale_flat"):
+        return
+    dtype = "i32" if key == "masked_rows" else "f32"
+    for j in range(1, len(base)):  # every input after the first is a device scalar
+        ptr = base[j][2]
+        for shape in ((), (1,), (2,), (1, 1), (0,), (4,)):
+            yield j, (dtype, shape, ptr, None)
+        for offset in (4, 8, 16):
+            yield j, (dtype, (), ptr + offset, None)
 
 
 def launches():
     """Calls and what ``runtime._prepare`` of Python decides for each (the oracle for the Rust ``Plan::prepare``): ``(records, how_many_binaries)``.
 
     For each binary of ``host_ops.ops()`` a valid call per size, and every single change of one input (dtype, rank, an axis made
-    larger, twice as large or empty, a misaligned address, a tensor too large for 32-bit offsets, an in-place tensor aliased).
+    larger, twice as large or empty, a misaligned address, a tensor too large for 32-bit offsets, a tensor with gaps given to a pointer that is
+    dense, an in-place tensor aliased); and for what manifest schema 3 added: views (a transposed one, an expanded one, an axis of size 1 whose stride
+    is not the one a kernel is given, a last stride that is not 1, a stride that fits no ``i32`` or no ``i64``, the extent at the limit of 32-bit offsets, addresses
+    of every alignment, strides that are not multiples of what the binary assumes), device scalars of every shape, dtype and alignment, and
+    prebuilt binaries (a fixed argument is in the ``kernelParams`` at its own slot, and no scratch slot follows).
     A record is the stem of a binary, the tensors of the call in the order of its ABI (an ``Out`` tensor is what Python would
-    allocate) and what Python decided: the grid and the ``kernelParams`` values, or the kind of the refusal. A call that Python sends
+    allocate; a view has its ``strides``) and what Python decided: the grid and the ``kernelParams`` values, or the kind of the refusal. A call that Python sends
     to another bucket is a valid call of that binary, and a ``bucket`` refusal of this one.
     """
     from fake_torch import FakeTensor, prepare, verdict
@@ -274,12 +536,16 @@ def launches():
     first_slab, slab = 1 << 44, 1 << 36
     declared = ops()
 
+    def fake(t):
+        d, sh, ptr, st = t
+        return FakeTensor(sh, d, ptr, st)
+
     def allocated_outs(op, call, after, fallback):
         """What Python would allocate for the ``Out`` tensors of ``call``: shaped by the dimensions its inputs bind (as ``_prepare`` does
         once they are bound), or ``fallback`` when they cannot be bound (the refusal is then about an input)."""
         target = _target(op)
         try:
-            dims = bind_call(target.name, target.public, [FakeTensor(sh, d, p) for d, sh, p in call], {}).dims
+            dims = bind_call(target.name, target.public, [fake(t) for t in call], {}).dims
         except TilefishError:
             return fallback
         outs = {}
@@ -299,11 +565,16 @@ def launches():
             records.append(record)
 
     def abi_tensors(spec, by_name):
-        return [
-            {"ptr": by_name[a.name].data_ptr(), "shape": list(by_name[a.name].shape), "dtype": by_name[a.name].dtype.short}
-            for a in spec.args
-            if a.kind == "pointer"
-        ]
+        out = []
+        for a in spec.args:
+            if a.kind != "pointer":
+                continue
+            t = by_name[a.name]
+            record = {"ptr": t.data_ptr(), "shape": list(t.shape), "dtype": t.dtype.short}
+            if t.strides is not None:  # a view: its element strides, as torch reports them (the address is the one of its first element)
+                record["strides"] = list(t.strides)
+            out.append(record)
+        return out
 
     stems = set()
     for key, build, sizes in LAUNCH_CASES:
@@ -312,38 +583,42 @@ def launches():
         specs = {sp.stem: sp for sp in _target(op).compile_specs()}
         stems |= set(specs)
         for size in sizes:
-            base = [(d, tuple(sh), first_slab + i * slab) for i, (d, sh) in enumerate(build(size))]
+            base = [(item[0], tuple(item[1]), first_slab + i * slab, tuple(item[2]) if len(item) > 2 else None) for i, item in enumerate(build(size))]
             after = first_slab + len(base) * slab
-            prepared, error = prepare(op, [FakeTensor(sh, d, ptr) for d, sh, ptr in base], next_slab=after)
+            prepared, error = prepare(op, [fake(t) for t in base], next_slab=after)
             assert error is None, (key, size, error)
             intended = prepared.spec
             by_abi_base = dict(prepared.tensors)  # the allocated Out tensors of the valid call
             inout = [i for i, name in enumerate(inputs) if any(a.name == name and a.access == "inout" for a in intended.args)]
             add(intended.stem, abi_tensors(intended, by_abi_base), {k: v for k, v in verdict(prepared, None).items() if k != "stem"})
             calls = []  # every call: the valid one with a single change
-            for j, (d, sh, ptr) in enumerate(base):
-                for _, new in _mutations(d, sh, ptr):
+            for j, t in enumerate(base):
+                for _, new in _mutations(*t):
                     calls.append([*base[:j], new, *base[j + 1 :]])
                 for i in inout:
                     if i != j:
-                        calls.append([*base[:j], (d, sh, base[i][2]), *base[j + 1 :]])
+                        calls.append([*base[:j], (t[0], t[1], base[i][2], t[3]), *base[j + 1 :]])
+            for _, new in _views(key, base[0][2], after + 8 * slab):
+                calls.append([new, *base[1:]])
+            for j, new in _device_scalars(key, base):
+                calls.append([*base[:j], new, *base[j + 1 :]])
             if key == "bucketed_rms":  # the bucketed dimension moved in every tensor that has it: another bucket, or none
                 rows = size[0]
                 for db in (95, 100, 512, 1000):
-                    calls.append([(base[0][0], (rows, db), base[0][2]), (base[1][0], (db,), base[1][2])])
+                    calls.append([(base[0][0], (rows, db), base[0][2], None), (base[1][0], (db,), base[1][2], None)])
             for call in calls:
-                prepared, error = prepare(op, [FakeTensor(sh_, d_, p_) for d_, sh_, p_ in call], next_slab=after)
+                prepared, error = prepare(op, [fake(t) for t in call], next_slab=after)
                 got = verdict(prepared, error)
                 if prepared is not None:
                     # a binary Python selected: a valid call of that binary, and a bucket refusal of the one intended
                     selected = prepared.spec
                     add(selected.stem, abi_tensors(selected, dict(prepared.tensors)), {k: v for k, v in got.items() if k != "stem"})
                     if selected.stem != intended.stem:
-                        by_name = {inputs[i]: FakeTensor(sh_, d_, p_) for i, (d_, sh_, p_) in enumerate(call)}
+                        by_name = {inputs[i]: fake(t) for i, t in enumerate(call)}
                         outs = allocated_outs(op, call, after, {n: t for n, t in by_abi_base.items() if n not in by_name})
                         add(intended.stem, abi_tensors(intended, {**outs, **by_name}), {"ok": False, "kind": "bucket"})
                 else:
-                    by_name = {inputs[i]: FakeTensor(sh_, d_, p_) for i, (d_, sh_, p_) in enumerate(call)}
+                    by_name = {inputs[i]: fake(t) for i, t in enumerate(call)}
                     outs = allocated_outs(op, call, after, {n: t for n, t in by_abi_base.items() if n not in by_name})
                     add(intended.stem, abi_tensors(intended, {**outs, **by_name}), got)
     return records, len(stems)
