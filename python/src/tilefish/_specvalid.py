@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from .dims import Dim, DimExpr, _CDiv, cdiv
 from .dtypes import ALL_DTYPES
@@ -95,6 +95,40 @@ def _int(x: Any, where: str, minimum: int = 0) -> int:
     if not is_int(x) or x < minimum:
         bad(f"{where} must be an int >= {minimum}, got {x!r}")
     return x
+
+
+def stride_of_json(targets: "Sequence[tuple[str, int]]") -> Any:
+    """``stride_of`` as a compile spec, a manifest entry and a declaration digest write it: the object ``{"arg", "axis"}`` of the one view whose
+    stride a scalar carries, or a list of them, in the order of the declaration, for the views that share it (``StrideOf(("q", "k", "v"), 0)``).
+    A stride of one view is written as it always was, so the digests of the declarations and manifests that have one do not change."""
+    items = [{"arg": arg, "axis": axis} for arg, axis in targets]
+    return items[0] if len(items) == 1 else items
+
+
+def stride_of_targets(value: Any) -> "tuple[tuple[str, int], ...]":
+    """The ``(argument, axis)`` pairs of a ``stride_of`` that :func:`validate_stride_of` accepted (the inverse of :func:`stride_of_json`)."""
+    items = [value] if isinstance(value, dict) else value
+    return tuple((item["arg"], item["axis"]) for item in items)
+
+
+def validate_stride_of(so: Any, where: str) -> None:
+    """A ``stride_of``: ``{"arg": <identifier>, "axis": <int >= 0>}``, or a list of two or more of them with distinct ``(arg, axis)`` pairs."""
+    if isinstance(so, list):
+        if len(so) < 2:
+            bad(f"{where} stride_of is a list of the views that share a stride, so it has two or more of them, got {so!r} (one view is an object)")
+        items = so
+    elif isinstance(so, dict):
+        items = [so]
+    else:
+        bad(f"{where} stride_of must be an object {{arg, axis}} or a list of two or more of them, got {type(so).__name__}")
+    pairs = set()
+    for item in items:
+        _keys(item, f"{where} stride_of", ["arg", "axis"])
+        _ident(item["arg"], f"{where} stride_of arg")
+        _int(item["axis"], f"{where} stride_of axis")
+        if (item["arg"], item["axis"]) in pairs:
+            bad(f"{where} stride_of names axis {item['axis']} of '{item['arg']}' twice")
+        pairs.add((item["arg"], item["axis"]))
 
 
 def decode_scalar(v: Any, where: str) -> Any:
@@ -459,10 +493,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         if "count_of" in d:
             _ident(d["count_of"], f"arg {d['name']} count_of")
         if "stride_of" in d:
-            so = d["stride_of"]
-            _keys(so, f"arg {d['name']} stride_of", ["arg", "axis"])
-            _ident(so["arg"], f"arg {d['name']} stride_of arg")
-            _int(so["axis"], f"arg {d['name']} stride_of axis")
+            validate_stride_of(d["stride_of"], f"arg {d['name']}")
             if "count_of" in d:
                 bad(f"arg {d['name']}: a scalar is the element count of a pointer or the stride of one, not both")
     else:
@@ -498,25 +529,26 @@ def validate_binary(b: Any) -> None:
 
 
 def _check_strides(args: "list[dict]", by_name: "dict[str, dict]") -> None:
-    """A scalar's ``stride_of`` and the ``strides`` of the pointer it names must say the same thing, axis by axis."""
+    """A scalar's ``stride_of`` and the ``strides`` of the pointers it names must say the same thing, axis by axis (a scalar that several views
+    share is the stride entry of each of them)."""
     carried: "dict[tuple[str, int], str]" = {}
     for a in args:
         if a["kind"] != "scalar" or "stride_of" not in a:
             continue
-        so = a["stride_of"]
-        target = by_name.get(so["arg"])
-        if target is None or target["kind"] != "pointer" or "strides" not in target:
-            bad(f"arg {a['name']} is the stride of '{so['arg']}', which is not a strided pointer argument")
-        if so["axis"] >= len(target["strides"]):
-            bad(f"arg {a['name']} is the stride of axis {so['axis']} of '{so['arg']}', which has {len(target['strides'])} axes")
-        if target["strides"][so["axis"]] != a["dim"]:
-            bad(
-                f"arg {a['name']} carries {a['dim']!r} as the stride of axis {so['axis']} of '{so['arg']}', "
-                f"but the strides of that pointer say {target['strides'][so['axis']]!r}"
-            )
-        if (so["arg"], so["axis"]) in carried:
-            bad(f"axis {so['axis']} of '{so['arg']}' has two stride scalars ({carried[(so['arg'], so['axis'])]} and {a['name']})")
-        carried[(so["arg"], so["axis"])] = a["name"]
+        for arg, axis in stride_of_targets(a["stride_of"]):
+            target = by_name.get(arg)
+            if target is None or target["kind"] != "pointer" or "strides" not in target:
+                bad(f"arg {a['name']} is the stride of '{arg}', which is not a strided pointer argument")
+            if axis >= len(target["strides"]):
+                bad(f"arg {a['name']} is the stride of axis {axis} of '{arg}', which has {len(target['strides'])} axes")
+            if target["strides"][axis] != a["dim"]:
+                bad(
+                    f"arg {a['name']} carries {a['dim']!r} as the stride of axis {axis} of '{arg}', "
+                    f"but the strides of that pointer say {target['strides'][axis]!r}"
+                )
+            if (arg, axis) in carried:
+                bad(f"axis {axis} of '{arg}' has two stride scalars ({carried[(arg, axis)]} and {a['name']})")
+            carried[(arg, axis)] = a["name"]
     for a in args:
         if a["kind"] == "pointer" and "strides" in a:
             for axis, entry in enumerate(a["strides"]):

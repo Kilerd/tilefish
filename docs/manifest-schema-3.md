@@ -23,7 +23,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | `abi` | `params`, `scratch` | adds `scratch_slots` (2 for Triton, 0 for a prebuilt binary) |
 | ABI pointer | dense, row-major, offset 0 | may take a strided view: adds `strides` and `offset` |
 | ABI pointer, shape `[]` | not used | a *device scalar*: one element in device memory |
-| ABI scalar | `i32`, carries a dimension (`dim`) or an element count (`count_of`) | may be `i64`; may carry a stride (`stride_of`) |
+| ABI scalar | `i32`, carries a dimension (`dim`) or an element count (`count_of`) | may be `i64`; may carry a stride (`stride_of`), of one view or of several views that share it |
 | ABI argument kinds | `pointer`, `scalar` | adds `fixed`: a scalar whose value is in the manifest |
 | preconditions | `pointer_alignment` always 16 bytes | a strided pointer may promise only its element alignment; adds `max_extent` |
 | `dims` | names from shapes, scalars and the grid | also the stride dimensions and the offset dimension of a strided pointer |
@@ -130,12 +130,22 @@ row-major tensor at offset 0, as before.) Both fields are present together or ne
   name of a *stride dimension*).
   * A fixed stride is `1`, only ever on the **last** axis (the kernel loads along that axis contiguously). A reader refuses any other integer and a
     fixed stride on any other axis.
-  * A string entry is the `dim` of exactly one `scalar` argument whose `stride_of` is `{"arg": <this pointer's name>, "axis": <this axis>}`; that
-    scalar carries the stride. Python checks both directions (`_specvalid._check_strides`): each `stride_of` names a strided pointer and an axis of
-    it, whose entry is the scalar's `dim` string, once per axis; each string entry has its scalar.
+  * A string entry is the `dim` of exactly one `scalar` argument whose `stride_of` names this pointer and this axis (is the object
+    `{"arg": <this pointer's name>, "axis": <this axis>}`, or has it in its list); that scalar carries the stride. Python checks both directions
+    (`_specvalid._check_strides`): each object of a `stride_of` names a strided pointer and an axis of it, whose entry is the scalar's `dim` string, once
+    per axis; each string entry has its scalar.
 * `offset` is a string: the name of the **offset dimension** of this pointer. (It is `"<pointer name>_offset"`.) It is not carried by a scalar:
   the pointer passed to the kernel is already `base + offset * itemsize` (the address of the first element of the view).
-* `stride_of` on a scalar is the object `{"arg": <identifier>, "axis": <int ≥ 0>}`; a scalar has `stride_of` **or** `count_of`, never both.
+* `stride_of` on a scalar is the object `{"arg": <identifier>, "axis": <int ≥ 0>}`, or **a list of two or more such objects** with distinct
+  `(arg, axis)` pairs; a scalar has `stride_of` **or** `count_of`, never both.
+
+**A stride that several views share** (`StrideOf(("q", "k", "v"), 0)` in Python, written as the list
+`[{"arg": "q", "axis": 0}, {"arg": "k", "axis": 0}, {"arg": "v", "axis": 0}]` in the order of the declaration) is one scalar for an axis of several strided
+pointers: a kernel that reads several views of one buffer with one stride pair, such as the q, k and v column blocks of a fused `[B, 3 * D]` tensor at
+offsets 0, `D` and `2 * D`. Each of those pointers has the scalar's `dim` as its `strides` entry for that axis (so the dimension is named once in `dims`,
+with its constraints), and its own `offset` and its own address. The scalar is passed once. A stride of one view is the object, as it always was, so a
+manifest without a shared stride, and its digest, are unchanged; a reader that predates the list (the published crate 0.0.2, tilefish 0.0.4) refuses
+a manifest that has one.
 
 **What a host does to launch.** The host is given a view: its pointer (the address of its first element), shape, element strides (and, if it
 knows it, the element offset from the start of the allocation).
@@ -147,7 +157,10 @@ knows it, the element offset from the start of the allocation).
    A stride must be ≥ 0 (a stride of 0, as of an expanded view, is allowed); a negative stride is refused.
 3. For each axis whose `strides` entry is an integer `1`: the view's canonical stride along it must be 1, else refused (kind `stride`).
 4. For each axis whose entry is a name `x_s0`: bind the dimension `x_s0` to the canonical stride (it is an unknown to solve like a shape dimension:
-   it appears in `dims`, and a `scalar` with `dim: "x_s0"` carries its value). Check the constraint `dims["x_s0"].divisible_by` if present.
+   it appears in `dims`, and a `scalar` with `dim: "x_s0"` carries its value). Check the constraint `dims["x_s0"].divisible_by` if present. A name that
+   several views share (a shared stride) is one unknown: the first of those pointers in the ABI binds it, and each other one must have that canonical
+   stride along its axis, else the call is refused (kind `stride`, naming the pointer, the stride it has and the one required), before anything is
+   launched.
 5. A `scalar` with `stride_of` is passed as that bound stride, as a signed integer of its `type`. **It must fit the type:** `0 ≤ v ≤ 2^31 − 1` for
    `i32`, `0 ≤ v ≤ 2^63 − 1` for `i64`; else refused. (The `type` is `i64` exactly when the op declares `index_bits=64`; every other scalar, a
    dimension or an element count, stays `i32`.)
@@ -382,7 +395,8 @@ document tilefish writes next to a build and the host does not read):
 * the ABI as a whole (a host that reads without a spec checks these itself; Python checks them by comparing the entry with the compile spec, and
   `_specvalid` checks them in the spec): `params` kinds in `pointer`/`scalar`/`fixed`; a `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
   `offset` or the reverse; `strides` of the wrong length or empty, with an integer other than `1`, an integer on a non-last axis, a string that no
-  `stride_of` scalar carries, or two scalars for one axis; an `offset` that is not a string; `stride_of` with a missing/extra key, a negative axis, an
+  `stride_of` scalar carries, or two scalars for one axis; an `offset` that is not a string; a `stride_of` list of fewer than two objects or with an
+  `(arg, axis)` pair twice; a `stride_of` object with a missing/extra key, a negative axis, an
   axis out of range, a target that is not a strided pointer, a `dim` different from the target's `strides` entry, or together with `count_of`; a `fixed`
   argument with a type not in `i32`/`i64`/`f32`, an `f32` value that is not a float, an integer type with a non-integer, a bool, or an out-of-range value.
 * preconditions: `max_extent` more than once on a pointer (a kernel with `index_bits=64` has none, so it is not required), with a value other than `2147483647`, or on a pointer without `strides`;
@@ -470,6 +484,7 @@ stride scalars and `fixed` arguments are not parameters) and for each library en
 | top level, digest, the three additions, refusal of schema 2 | `test_manifest.py`, `test_manifest_schema3.py`, `test_rust_host.py` |
 | `kind`, `abi.scratch_slots`, prebuilt binary entries | `test_binary_externs.py`, `test_manifest_schema3.py` |
 | strided pointers, `strides`/`offset`/`stride_of`, `max_extent`, alignment | `test_strided_specs.py`, `test_views.py`; on a GPU `test_gpu_strided.py` |
+| a stride that several views share (`stride_of` a list) | `test_shared_strides.py`, `test_rust_host_schema3.py`; on a GPU `test_gpu_shared_strides.py` |
 | device scalars | `test_devscalar.py`; on a GPU `test_gpu_devscalar.py` |
 | prebuilt PTX and cubin, byte identity with the Triton path | `test_binary_externs.py`; on a GPU `test_gpu_binary.py`, `ptx/*.ptx` |
 | the `library` section | `test_library_ops.py`, `test_cublaslt.py`; on a GPU `test_gpu_gemm.py`, `test_gpu_cublaslt.py` |

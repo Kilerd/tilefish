@@ -88,9 +88,8 @@ fn a_strided_pointer_is_read_with_its_strides_its_offset_and_the_scalars_that_ca
     assert_eq!(view.strides, [StrideEntry::Dim("x_s0".into()), StrideEntry::Dim("x_s1".into()), StrideEntry::Unit]);
     assert_eq!(view.offset, "x_offset");
     assert_eq!((shape.len(), *access), (3, Access::In));
-    let ParamKind::Scalar { stride_of: Some(so), dim, .. } = &entry.params[2].kind else {
-        panic!("x_s0 carries a stride")
-    };
+    let ParamKind::Scalar { stride_of, dim, .. } = &entry.params[2].kind else { panic!("x_s0 carries a stride") };
+    let [so] = stride_of.as_slice() else { panic!("x_s0 carries the stride of one view") };
     assert_eq!((so.arg.as_str(), so.axis, dim.as_str()), ("x", 0, "x_s0"));
     assert_eq!(entry.scratch_slots, 2);
 }
@@ -284,6 +283,119 @@ fn a_view_made_for_a_parameter_that_is_written_is_refused_at_the_reading_of_the_
     let mut k = head_copy(2, false);
     k.entry["abi"]["params"][0]["access"] = "inout".into();
     assert!(refusal(&[k], &[]).contains("only an `in` pointer may be strided"));
+}
+
+// -- views that share a stride ----------------------------------------------------------------------------------------------------
+
+/// `qkv_sum(q, k, v: Strided[Tensor[R, 4, 64, bf16]], o: Out[Tensor[R, 4, 64, bf16]], s_row: StrideOf(("q", "k", "v"), 0),
+/// s_head: StrideOf(("q", "k", "v"), 1))`: one stride pair for the three views, each with its own offset.
+fn qkv_sum() -> Kernel {
+    let strided = |slot: usize, name: &str| {
+        pointer(
+            slot,
+            name,
+            "bf16",
+            "in",
+            json!(["R", 4, 64]),
+            Some((json!(["s_row", "s_head", 1]), &*format!("{name}_offset"))),
+        )
+    };
+    let shared =
+        |axis: usize| json!([{"arg": "q", "axis": axis}, {"arg": "k", "axis": axis}, {"arg": "v", "axis": axis}]);
+    Kernel::new(
+        "triton",
+        "qkv_sum",
+        103,
+        vec![
+            strided(0, "q"),
+            strided(1, "k"),
+            strided(2, "v"),
+            pointer(3, "o", "bf16", "out", json!(["R", 4, 64]), None),
+            scalar(4, "s_row", "i32", "s_row", json!({"stride_of": shared(0)})),
+            scalar(5, "s_head", "i32", "s_head", json!({"stride_of": shared(1)})),
+        ],
+        vec![
+            alignment(0, "q", 2),
+            max_extent(0, "q"),
+            alignment(1, "k", 2),
+            max_extent(1, "k"),
+            alignment(2, "v", 2),
+            max_extent(2, "v"),
+            alignment(3, "o", 16),
+        ],
+        json!({"R": {}, "k_offset": {}, "q_offset": {}, "s_head": {}, "s_row": {}, "v_offset": {}}),
+        "(R, 4)",
+    )
+}
+
+#[test]
+fn a_scalar_carries_the_one_stride_that_several_views_share() {
+    let manifest = read(&[qkv_sum()], &[]).unwrap();
+    let entry = manifest.entry("qkv_sum", "sm_103").unwrap();
+    let ParamKind::Scalar { stride_of, .. } = &entry.params[4].kind else { panic!("s_row is a stride") };
+    let carried: Vec<(&str, usize)> = stride_of.iter().map(|s| (s.arg.as_str(), s.axis)).collect();
+    assert_eq!(carried, [("q", 0), ("k", 0), ("v", 0)]);
+    // the q, k and v of a fused [7, 3, 4, 64] tensor: offsets 0, 256 and 512 elements, strides (768, 64, 1) each
+    let (shape, strides, out) = ([7usize, 4, 64], [768usize, 64, 1], [7usize, 4, 64]);
+    let (q, k, v) = (X, X + 512, X + 1024);
+    let plan = plan_of(&manifest, "qkv_sum");
+    let call = |k_strides: &'static [usize]| {
+        vec![
+            view(q, &shape, &strides, DType::Bf16),
+            view(k, &shape, k_strides, DType::Bf16),
+            view(v, &shape, &strides, DType::Bf16),
+            dense(Y, &out, DType::Bf16, Access::InOut),
+        ]
+    };
+    let p = plan.prepare(&call(&[768, 64, 1]), None).unwrap();
+    assert_eq!(p.params(), [q, k, v, Y, 768, 64, 0, 0], "three pointers, and the one stride pair once");
+    assert_eq!(p.grid, [7, 4, 1]);
+    // a view that does not have the stride the first one bound is refused, as Python refuses it
+    for (k_strides, axis, got) in
+        [(&[769usize, 64, 1][..], 0, 769), (&[768, 65, 1][..], 1, 65), (&[256, 64, 1][..], 0, 256)]
+    {
+        let e = plan.prepare(&call(k_strides), None).unwrap_err();
+        assert_eq!(kind(&e), PreconditionKind::Stride, "{e}");
+        let text = e.to_string();
+        assert!(text.contains("argument 'k'") && text.contains(&format!("the stride of axis {axis} is {got}")), "{e}");
+        assert!(text.contains("each must have it"), "{e}");
+    }
+}
+
+#[test]
+fn a_shared_stride_that_is_not_what_it_says_is_refused() {
+    let set = |s_row: Value| {
+        let mut k = qkv_sum();
+        k.entry["abi"]["params"][4]["stride_of"] = s_row;
+        k
+    };
+    let cases: [(&str, Value, &str); 7] = [
+        ("a list of one", json!([{"arg": "q", "axis": 0}]), "two or more"),
+        (
+            "a view twice",
+            json!([{"arg": "q", "axis": 0}, {"arg": "q", "axis": 0}, {"arg": "k", "axis": 0}]),
+            "names axis 0 of 'q' twice",
+        ),
+        ("an item that is not an object", json!([{"arg": "q", "axis": 0}, "k"]), "stride_of must be an object"),
+        ("an item without its axis", json!([{"arg": "q", "axis": 0}, {"arg": "k"}]), "axis"),
+        (
+            "a pointer that is not strided",
+            json!([{"arg": "q", "axis": 0}, {"arg": "o", "axis": 0}]),
+            "not a strided pointer",
+        ),
+        ("another axis", json!([{"arg": "q", "axis": 0}, {"arg": "k", "axis": 1}]), "the strides of that pointer say"),
+        ("a view left out", json!([{"arg": "q", "axis": 0}, {"arg": "k", "axis": 0}]), "carried by no scalar"),
+    ];
+    for (what, value, why) in cases {
+        let message = refusal(&[set(value)], &[]);
+        assert!(message.contains(why), "{what}: {message}");
+    }
+    // the axis of a view carried by two scalars: s_head made a second carrier of s_row
+    let mut k = qkv_sum();
+    k.entry["abi"]["params"][5] =
+        scalar(5, "s_head", "i32", "s_row", json!({"stride_of": [{"arg": "q", "axis": 0}, {"arg": "k", "axis": 0}]}));
+    let message = refusal(&[k], &[]);
+    assert!(message.contains("axis 0 of 'q' has two stride scalars (s_row and s_head)"), "{message}");
 }
 
 // -- a device scalar -------------------------------------------------------------------------------------------------------------

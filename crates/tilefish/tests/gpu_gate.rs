@@ -33,7 +33,7 @@
 //! `the_gate_has_a_case_for_every_feature_of_schema_3`, `refusals_of_schema_3`, `graph_capture_of_a_strided_kernel_and_of_a_gemm`,
 //! `a_gemm_of_slices_on_a_capturing_stream_...`, the free of the slices of a GEMM and of a strided kernel on another stream,
 //! `a_written_view_lands_at_its_offset_and_nowhere_else` and `a_gemm_whose_algorithm_needs_a_workspace_...`. M3.3 adds
-//! `the_gate_has_a_case_for_every_feature_of_m3_3`.
+//! `the_gate_has_a_case_for_every_feature_of_m3_3` and `views_that_share_a_stride_must_all_have_it`.
 
 #[allow(dead_code)]
 mod generated {
@@ -1205,7 +1205,8 @@ fn the_gate_has_a_case_for_every_feature_of_schema_3() {
 }
 
 /// What M3.3 added is in the gate: one hand-written kernel compiled without and with FMA contraction (`enable_fp_fusion` of its
-/// declaration, in the options of its entry), whose bytes `byte_identity` holds to Python's.
+/// declaration, in the options of its entry), and a kernel that reads three views with one stride pair (`StrideOf(("q", "k", "v"), axis)`),
+/// given the q, k and v of one fused tensor and three tensors of their own; `byte_identity` holds their bytes to Python's.
 #[test]
 fn the_gate_has_a_case_for_every_feature_of_m3_3() {
     let cases = cases();
@@ -1218,6 +1219,88 @@ fn the_gate_has_a_case_for_every_feature_of_m3_3() {
         let entry = manifest.entry(stem, &arch).expect("the gate's manifest has the entry");
         assert_eq!(entry.enable_fp_fusion, Some(fused), "{stem}: the contraction its binary was compiled with");
     }
+    for stem in ["qkv_sum", "qkv_sum16"] {
+        let shared = cases_where(&cases, |c| {
+            c["stem"] == stem
+                && tensors_json(c)[..3].iter().all(|t| t["strides"] == serde_json::json!([768, 64, 1]))
+                && tensors_json(c)[..3].iter().map(|t| t["offset"].as_u64().unwrap()).collect::<Vec<_>>()
+                    == [0, 256, 512]
+        });
+        assert!(shared.len() >= 3, "{stem}: the gate has no case of the q, k and v of one fused tensor");
+        let entry = manifest.entry(stem, &arch).expect("the gate's manifest has the entry");
+        let carried = entry
+            .params
+            .iter()
+            .filter_map(|p| match &p.kind {
+                tilefish::ParamKind::Scalar { stride_of, .. } if !stride_of.is_empty() => Some(stride_of.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(carried, [3, 3], "{stem}: two stride scalars, each the stride of three views");
+    }
+}
+
+/// The bf16 nearest to an f32 (round to nearest, ties to even), as Triton's `.to(tl.bfloat16)` rounds a finite value.
+fn bf16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+/// One stride pair for three views (`StrideOf(("q", "k", "v"), axis)`), on the GPU through the checked `Kernel::launch`: the q, k and v of one
+/// fused buffer run and give `(q + k) + v`, and a `k` of other strides (a tensor of its own, whose row stride is 256 where `q` bound 768) is
+/// refused before anything is written, as Python refuses it.
+#[test]
+fn views_that_share_a_stride_must_all_have_it() {
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let s: &CudaStream = &gpu.stream;
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let kernel = manifest.kernel(&gpu.ctx, "qkv_sum", &[], arch).unwrap();
+    let rows = 7usize;
+    // q, k and v hold 1.0, 2.0 and 4.0 (bf16 0x3f80, 0x4000, 0x4080) in each row of the fused [7, 3, 4, 64] tensor
+    let mut fused = Vec::with_capacity(rows * 768 * 2);
+    for _ in 0..rows {
+        for bits in [0x3f80u16, 0x4000, 0x4080] {
+            for _ in 0..256 {
+                fused.extend_from_slice(&bits.to_le_bytes());
+            }
+        }
+    }
+    let fused = gpu.upload(&fused);
+    let other = gpu.upload(&vec![0u8; rows * 256 * 2]);
+    let mut o = gpu.zeros(rows * 256 * 2);
+    let (shape, fused_strides, dense_strides) = ([rows, 4, 64], [768usize, 64, 1], [256usize, 64, 1]);
+    // (a function, not a closure: a launch's tensors have one lifetime, and a closure would keep the first launch's output borrowed)
+    fn view<'a>(fused: &'a Buf, shape: &'a [usize], strides: &'a [usize], offset: usize) -> TensorRef<'a, Bf16> {
+        TensorRef::<Bf16>::from_cuda_strided(&fused.slice, shape, strides, offset).unwrap()
+    }
+    let k_other = TensorRef::<Bf16>::from_cuda_strided(&other.slice, &shape, &dense_strides, 0).unwrap();
+    let out = TensorMut::<Bf16>::from_cuda(&mut o.slice, &shape).unwrap();
+    let e = kernel
+        .launch(
+            s,
+            &mut [
+                view(&fused, &shape, &fused_strides, 0).into_arg(),
+                k_other.into_arg(),
+                view(&fused, &shape, &fused_strides, 512).into_arg(),
+                out.into_arg(),
+            ],
+        )
+        .unwrap_err();
+    assert_eq!(e.precondition_kind(), Some(PreconditionKind::Stride), "{e}");
+    assert!(
+        e.to_string().contains("argument 'k'")
+            && e.to_string().contains("the stride of axis 0 is 256")
+            && e.to_string().contains("768"),
+        "{e}"
+    );
+    assert!(gpu.download(&o).iter().all(|b| *b == 0), "a refused launch writes nothing");
+    let out = TensorMut::<Bf16>::from_cuda(&mut o.slice, &shape).unwrap();
+    let qkv = [0, 256, 512].map(|offset| view(&fused, &shape, &fused_strides, offset).into_arg());
+    let [q, k, v] = qkv;
+    kernel.launch(s, &mut [q, k, v, out.into_arg()]).unwrap();
+    let want = bf16_bits((1.0f32 + 2.0) + 4.0).to_le_bytes();
+    let got = gpu.download(&o);
+    assert!(got.chunks(2).all(|b| b == want), "every element is 1 + 2 + 4 = 7 (bf16 {want:02x?})");
 }
 
 /// A copy of the gate's manifest directory in a fresh temporary directory.

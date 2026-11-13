@@ -45,7 +45,9 @@ class Param:
     A tensor parameter declared ``Strided[...]`` has ``strided=True``: its ``type`` carries the strides (each the dimension of
     the ``StrideOf`` parameter of that axis, or ``1`` for the last axis when it has none) and an offset dimension, which a call
     binds like it binds the shape; ``align`` is ``16`` when the declaration says the pointer is compiled as 16-byte aligned. A
-    ``"dim"`` parameter declared ``StrideOf(arg, axis)`` has ``stride_of=(arg, axis)``: its ``dim`` is the stride.
+    ``"dim"`` parameter declared ``StrideOf(arg, axis)`` has ``stride_of=((arg, axis),)``: its ``dim`` is the stride. One declared
+    ``StrideOf(("q", "k", "v"), axis)`` has a pair per view that shares it, ``(("q", axis), ("k", axis), ("v", axis))``, and its ``dim`` is the
+    stride of each of them along that axis.
     """
 
     name: str
@@ -59,7 +61,7 @@ class Param:
     keyword_only: bool = False
     strided: bool = False
     align: "int | None" = None
-    stride_of: "tuple[str, int] | None" = None
+    stride_of: "tuple[tuple[str, int], ...] | None" = None
 
     @property
     def is_callable_arg(self) -> bool:
@@ -81,13 +83,19 @@ class Param:
             elif self.access == "out":
                 ann = f"Out[{ann}]"
         elif self.kind == "dim":
-            ann = f"{self.dim}" if self.stride_of is None else repr(StrideOf(*self.stride_of))
+            ann = f"{self.dim}" if self.stride_of is None else repr(stride_annotation(self.stride_of))
         else:
             ann = "const" if self.const_dtype is None else f"const[{self.const_dtype}]"
         text = f"{self.name}: {ann}"
         if self.default is not MISSING:
             text += f" = {self.default}"
         return text
+
+
+def stride_annotation(targets: "tuple[tuple[str, int], ...]") -> StrideOf:
+    """The ``StrideOf`` annotation of a stride scalar's targets (the views of one axis that share it)."""
+    names = tuple(arg for arg, _ in targets)
+    return StrideOf(names[0] if len(names) == 1 else names, targets[0][1])
 
 
 class Signature:
@@ -219,9 +227,7 @@ def parse_signature(
                 raise TilefishDeclarationError(f"{where}: parameter '{pname}' is {ann!r}, which only an extern op can take")
             if has_default:
                 raise TilefishDeclarationError(f"{where}: stride parameter '{pname}' cannot have a default")
-            param = Param(
-                pname, index, "dim", dim=Dim(pname, divisible_by=ann.divisible_by), keyword_only=kw, stride_of=(ann.arg, ann.axis)
-            )
+            param = Param(pname, index, "dim", dim=Dim(pname, divisible_by=ann.divisible_by), keyword_only=kw, stride_of=ann.targets)
         elif isinstance(ann, Marked):
             _require_contiguous(where, what, f"parameter '{pname}'", ann.type)
             param = Param(pname, index, "tensor", ann.mode, type=ann.type, keyword_only=kw)
@@ -296,7 +302,8 @@ def _require_contiguous(where: str, what: str, label: str, t: TensorType) -> Non
 def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":
     """Give every ``Strided[...]`` tensor parameter the strides and the offset its ``StrideOf`` parameters declare.
 
-    Axis ``a`` of ``x`` has the stride dimension of the parameter declared ``StrideOf("x", a)``; the last axis, when it has none,
+    Axis ``a`` of ``x`` has the stride dimension of the parameter declared ``StrideOf("x", a)`` (or ``StrideOf((..., "x", ...), a)``:
+    a stride that several views share, which is then the stride dimension of axis ``a`` of each); the last axis, when it has none,
     has stride 1 (the kernel loads along it contiguously). The offset is the dimension ``<x>_offset``: when the declaration says
     ``Strided[..., 16]`` it is ``divisible_by`` the number of elements in 16 bytes, so that 16-byte alignment of the pointer is
     *provable* from the type, and ``tt.divisibility`` follows from that proof alone.
@@ -306,20 +313,20 @@ def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":
     for p in params:
         if p.stride_of is None:
             continue
-        arg, axis = p.stride_of
-        target = by_name.get(arg)
-        if target is None or target.kind != "tensor" or not target.strided:
-            raise TilefishDeclarationError(
-                f"{where}: {p.name} is StrideOf({arg!r}, {axis}), but '{arg}' is not a Strided[...] tensor parameter of this op"
-            )
-        assert target.type is not None
-        if axis >= target.type.rank:
-            raise TilefishDeclarationError(f"{where}: {p.name} is the stride of axis {axis} of '{arg}', which has rank {target.type.rank}")
-        if (arg, axis) in stride_params:
-            raise TilefishDeclarationError(
-                f"{where}: the stride of axis {axis} of '{arg}' is declared twice ({stride_params[(arg, axis)].name} and {p.name})"
-            )
-        stride_params[(arg, axis)] = p
+        for arg, axis in p.stride_of:
+            target = by_name.get(arg)
+            if target is None or target.kind != "tensor" or not target.strided:
+                raise TilefishDeclarationError(
+                    f"{where}: {p.name} is {stride_annotation(p.stride_of)!r}, but '{arg}' is not a Strided[...] tensor parameter of this op"
+                )
+            assert target.type is not None
+            if axis >= target.type.rank:
+                raise TilefishDeclarationError(f"{where}: {p.name} is the stride of axis {axis} of '{arg}', which has rank {target.type.rank}")
+            if (arg, axis) in stride_params:
+                raise TilefishDeclarationError(
+                    f"{where}: the stride of axis {axis} of '{arg}' is declared twice ({stride_params[(arg, axis)].name} and {p.name})"
+                )
+            stride_params[(arg, axis)] = p
     out: list[Param] = []
     for p in params:
         if not (p.kind == "tensor" and p.strided):
@@ -505,8 +512,10 @@ class _Unifier:
         if required != expected_text:
             required += f" = {expected_text}"
         text = f"{self._origin(pname)} ({atype}): {self._where(what, axis)} is {actual_text}, but the signature requires {required}"
-        if what == "stride":
+        if what == "stride" and pattern.is_static:
             text += " (the kernel loads along that axis contiguously: pass a view whose last axis has stride 1)"
+        elif what == "stride":
+            text += " (the kernel takes one stride for the views that share it: each must have it)"
         notes = [
             f"{v} was bound to {dim_text(self.bindings[v])} by {self.bound_by[v]}"
             for v in pattern.free_dims()

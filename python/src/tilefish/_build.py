@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
 
 from ._elf import parse_elf, code_digest
 from . import _ir, _source
+from ._specvalid import stride_of_json
 from ._ir import IR_DIGEST_KIND
 from .errors import TilefishBuildError, TilefishManifestError
 
@@ -325,8 +326,8 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
             entry["dim"] = a.dim
             if a.count_of is not None:  # the value is the element count of that pointer argument
                 entry["count_of"] = a.count_of
-            if a.stride_of is not None:  # the value is the stride of that pointer argument along that axis
-                entry["stride_of"] = {"arg": a.stride_of[0], "axis": a.stride_of[1]}
+            if a.stride_of is not None:  # the value is the stride of that pointer argument along that axis (of each of them, for a shared one)
+                entry["stride_of"] = stride_of_json(a.stride_of)
         params.append(entry)
     scratch = [
         {"slot": len(params) + k, "name": p.name, "type": p.type, "ptx_type": "u64", "size": 8, "value": p.value}

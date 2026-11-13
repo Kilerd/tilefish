@@ -342,19 +342,46 @@ class StrideOf:
     The scalar is ``i32`` (``i64`` for an op that declares ``index_bits=64``); the stride is range-checked at a launch. ``x`` must be
     declared ``Strided[...]``. ``divisible_by=k`` says the stride is a multiple of ``k`` elements (it is checked, and a multiple of 16 is
     given to Triton as ``tt.divisibility``).
+
+    ``StrideOf(("q", "k", "v"), 0)`` is **one** scalar that carries the stride of axis 0 of each of the ``Strided[...]`` parameters ``q``, ``k``
+    and ``v``: a kernel that takes one stride pair for several views of one buffer (the q, k and v column blocks of a fused ``[B, 3 * D]``
+    tensor, at offsets 0, ``D`` and ``2 * D``). The views share the stride dimension, so a call binds it from the first and requires every
+    other one to have that stride along that axis (a trace refuses another stride, and so does a launch on either host: a view that does not
+    have it is not passed). Each view keeps its own pointer and its own offset. ``("q",)`` is ``"q"``.
     """
 
-    arg: str
+    arg: "str | tuple[str, ...]"
     axis: int
     divisible_by: "int | None" = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.arg, str) or not self.arg.isidentifier():
+        names = self.arg
+        if isinstance(names, list):
+            names = tuple(names)
+        if isinstance(names, tuple):
+            if not names or not all(isinstance(n, str) and n.isidentifier() for n in names):
+                raise TilefishDeclarationError(
+                    f"StrideOf: the first argument names a tensor parameter, or a tuple of the tensor parameters that share the stride, got {self.arg!r}"
+                )
+            if len(set(names)) != len(names):
+                raise TilefishDeclarationError(f"StrideOf: a tensor parameter is named twice in {list(names)}")
+            object.__setattr__(self, "arg", names[0] if len(names) == 1 else names)
+        elif not isinstance(names, str) or not names.isidentifier():
             raise TilefishDeclarationError(f"StrideOf: the first argument names a tensor parameter, got {self.arg!r}")
         if isinstance(self.axis, bool) or not isinstance(self.axis, int) or self.axis < 0:
             raise TilefishDeclarationError(f"StrideOf({self.arg!r}, ...): the axis must be a non-negative int, got {self.axis!r}")
         if self.divisible_by is not None and (isinstance(self.divisible_by, bool) or not isinstance(self.divisible_by, int) or self.divisible_by < 1):
             raise TilefishDeclarationError(f"StrideOf: divisible_by must be a positive int, got {self.divisible_by!r}")
+
+    @property
+    def args(self) -> "tuple[str, ...]":
+        """The tensor parameters whose stride along ``axis`` this scalar carries: one, or the views that share it."""
+        return (self.arg,) if isinstance(self.arg, str) else tuple(self.arg)
+
+    @property
+    def targets(self) -> "tuple[tuple[str, int], ...]":
+        """``(parameter, axis)`` for each tensor parameter whose stride this scalar carries."""
+        return tuple((a, self.axis) for a in self.args)
 
     def __repr__(self) -> str:
         extra = f", divisible_by={self.divisible_by}" if self.divisible_by else ""

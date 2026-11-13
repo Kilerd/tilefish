@@ -24,6 +24,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   PTX with a float fixed argument and with a 64-bit stride, and a cubin;
 * **an extern's contraction** (``gpu_kernels_p4.py``): ``y = a * b + c`` declared with ``enable_fp_fusion=False`` (checked here to be torch's two
   roundings) and ``True`` (one rounding);
+* **strides that several views share** (``gpu_kernels_p4.py``): ``o = q + k + v`` over the q, k and v of one fused tensor, read with one stride pair
+  (``StrideOf(("q", "k", "v"), axis)``), and over three tensors of their own with the same strides; the plan ``fused_qkv`` binds the three views in one
+  step;
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
@@ -236,6 +239,22 @@ def args_fma(n, seed):
     return (randn((n,), F32, seed), randn((n,), F32, seed + 100), randn((n,), F32, seed + 200))
 
 
+def args_qkv_fused(rows, seed):
+    """The q, k and v of one fused ``[rows, 3, 4, 64]`` tensor: offsets 0, 256 and 512 elements, strides ``(768, 64, 1)`` each."""
+    fused = randn((rows, 3, 4, 64), BF16, seed * 100 + rows)
+    return fused[:, 0], fused[:, 1], fused[:, 2]
+
+
+def args_qkv_separate(rows, seed):
+    """Three tensors of their own: the same strides ``(256, 64, 1)``, three buffers."""
+    return tuple(randn((rows, 4, 64), BF16, seed * 100 + rows + i) for i in range(3))
+
+
+def must_sum(args, got):
+    q, k, v = args
+    assert same_bytes(got, ((q.float() + k.float()) + v.float()).to(BF16))
+
+
 def build_cases():
     cases: "list[Case]" = [
         *plain("softmax", "softmax", args_softmax, ROW_SIZES),
@@ -279,6 +298,10 @@ def build_cases():
     # -- an extern's contraction
     cases += plain("fma_plain", "fma_plain", args_fma, (16, 1040, 65539), seeds=(0, 1), check=must_round_twice)
     cases += plain("fma_fused", "fma_fused", args_fma, (16, 1040, 65539), seeds=(0, 1), check=must_round_once)
+    # -- strides that several views share
+    for op in ("qkv_sum", "qkv_sum16"):
+        cases += [Case(op, op, f"fused-{rows}-seed0", lambda rows=rows: args_qkv_fused(rows, 0), must_sum) for rows in (1, 7, 40)]
+        cases += [Case(op, op, f"separate-{rows}-seed0", lambda rows=rows: args_qkv_separate(rows, 0), must_sum) for rows in (1, 7, 40)]
     return cases
 
 
@@ -467,6 +490,11 @@ def plan_graphs():
                 out.append((f"Q{q}-seed{seed}", {"a": randn((q, 128), F32, seed=q + seed), "state": randn((q, 128), F32, seed=q + seed + 7)}))
         return out
 
+    import gpu_kernels_p4 as p4
+
+    def fused_qkv_cases():
+        return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 768), BF16, seed=rb + seed)}) for rb in (8, 24) for seed in (0, 1)]
+
     return [
         ("block", pm.block, False, block_cases),
         ("block-reuse", pm.block, True, block_cases),
@@ -474,6 +502,7 @@ def plan_graphs():
         (f"deep{layers}-reuse", deep, True, deep_cases),
         ("prebuilt", pm.prebuilt, False, prebuilt_cases),
         ("accumulate", pm.accumulate, False, accumulate_cases),
+        ("fused_qkv", p4.fused_qkv, False, fused_qkv_cases),  # one step that reads three views with one stride pair
     ]
 
 

@@ -118,7 +118,8 @@ pub struct DimInfo {
 pub enum StrideEntry {
     /// Fixed: 1, the unit stride of the axis the kernel loads along (only ever the last axis).
     Unit,
-    /// A *stride dimension*, bound from the view's stride (the `dim` of the one scalar that carries it).
+    /// A *stride dimension*, bound from the view's stride (the `dim` of the one scalar that carries it; a scalar that several views
+    /// share is the stride dimension of each of them, which must all have the stride it binds).
     Dim(String),
 }
 
@@ -132,7 +133,7 @@ pub struct View {
     pub offset: String,
 }
 
-/// The pointer and the axis whose stride a scalar carries.
+/// A pointer and the axis whose stride a scalar carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrideOf {
     /// The strided pointer parameter.
@@ -235,8 +236,10 @@ pub enum ParamKind {
         dim: String,
         /// The pointer parameter whose element count this scalar is, for a generated kernel.
         count_of: Option<String>,
-        /// The strided pointer parameter and the axis whose stride this scalar is.
-        stride_of: Option<StrideOf>,
+        /// The strided pointer parameters and the axes whose stride this scalar is: one, or several views that share one stride
+        /// (`StrideOf(("q", "k", "v"), 0)`: the q, k and v of a fused tensor, which a kernel reads with one stride pair). Empty for a
+        /// scalar that is not a stride.
+        stride_of: Vec<StrideOf>,
     },
     /// A scalar whose value is in the manifest (a prebuilt binary's constant argument): the launch writes it at its own slot.
     Fixed {
@@ -704,6 +707,32 @@ struct RawStrideOf {
     axis: u64,
 }
 
+/// `stride_of` as a manifest has it: the object of one view, or a list of them for the views that share the stride.
+enum RawStrideOfs {
+    One(RawStrideOf),
+    Many(Vec<RawStrideOf>),
+}
+
+impl<'de> serde::Deserialize<'de> for RawStrideOfs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let value = Value::deserialize(d)?;
+        let one = <RawStrideOf as serde::Deserialize>::deserialize; // an object only, at every depth (`by_name!`)
+        match value {
+            Value::Object(_) => one(value).map(Self::One).map_err(serde::de::Error::custom),
+            Value::Array(items) => items
+                .into_iter()
+                .map(one)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map(Self::Many)
+                .map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!(
+                "stride_of must be an object (its fields by name) or a list of them, got {}",
+                type_name(&other)
+            ))),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(remote = "Self", deny_unknown_fields)]
 struct RawParam {
@@ -730,7 +759,7 @@ struct RawParam {
     #[serde(default)]
     offset: Option<Value>,
     #[serde(default)]
-    stride_of: Option<RawStrideOf>,
+    stride_of: Option<RawStrideOfs>,
     #[serde(default)]
     value: Option<Value>,
 }
@@ -1177,15 +1206,28 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                     ));
                 }
                 let dim = str_field(&p.dim, "dim", name)?.to_owned();
-                let stride_of = match &p.stride_of {
-                    Some(s) => {
-                        want_ident(&Value::String(s.arg.clone()), "stride_of arg")?;
-                        let axis = usize::try_from(s.axis)
-                            .map_err(|_| format!("parameter {name}: stride_of axis is too large"))?;
-                        Some(StrideOf { arg: s.arg.clone(), axis })
+                let items: &[RawStrideOf] = match &p.stride_of {
+                    None => &[],
+                    Some(RawStrideOfs::One(s)) => std::slice::from_ref(s),
+                    Some(RawStrideOfs::Many(list)) if list.len() < 2 => {
+                        return Err(format!(
+                            "parameter {name}: stride_of is a list of the views that share the stride, so it has two or more of them (one \
+                             view is an object)"
+                        ));
                     }
-                    None => None,
+                    Some(RawStrideOfs::Many(list)) => list,
                 };
+                let mut stride_of: Vec<StrideOf> = Vec::with_capacity(items.len());
+                for s in items {
+                    want_ident(&Value::String(s.arg.clone()), "stride_of arg")?;
+                    let axis = usize::try_from(s.axis)
+                        .map_err(|_| format!("parameter {name}: stride_of axis is too large"))?;
+                    let target = StrideOf { arg: s.arg.clone(), axis };
+                    if stride_of.contains(&target) {
+                        return Err(format!("parameter {name}: stride_of names axis {axis} of '{}' twice", s.arg));
+                    }
+                    stride_of.push(target);
+                }
                 ParamKind::Scalar { ty, dim, count_of: p.count_of.clone(), stride_of }
             }
             "fixed" => {
@@ -1546,7 +1588,7 @@ impl Entry {
                     if let Some(target) = count_of {
                         self.check_count_of(&p.name, dim, target, syms)?;
                     }
-                    if let Some(StrideOf { arg, axis }) = stride_of {
+                    for StrideOf { arg, axis } in stride_of {
                         let Some(ParamKind::Pointer { view: Some(view), .. }) = self.param(arg).map(|t| &t.kind) else {
                             return Err(format!(
                                 "parameter {} is the stride of '{arg}', which is not a strided pointer parameter",

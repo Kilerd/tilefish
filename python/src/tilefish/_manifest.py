@@ -228,7 +228,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
     of at least 1 and dimension expressions), is passed as a ``u64`` of 8 bytes, and has no ``dim``, ``count_of``, ``stride_of`` or ``value``;
     it takes ``strides`` (one per axis: a stride dimension, or the fixed stride 1 on the last axis) and ``offset`` (the name of its offset
     dimension) together, and only when it is ``in``. A ``scalar`` is an ``i32`` or an ``i64`` with its ``dim``, a ``count_of`` or a
-    ``stride_of``, and nothing of a pointer. A ``fixed`` argument belongs to a prebuilt binary and has a ``value`` of its type, and nothing
+    ``stride_of`` (an object ``{arg, axis}``, or a list of two or more of them: the views that share the stride), and nothing of a pointer. A ``fixed`` argument belongs to a prebuilt binary and has a ``value`` of its type, and nothing
     else. How the parameters fit together (strides and the scalars that carry them, preconditions) is compared with the compile spec.
     """
 
@@ -255,9 +255,11 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
             if not _is_count(p[key], 0):
                 bad(f"parameter {name}: {key} must be an int >= 0, got {p[key]!r}")
         typed = (("kind", str), ("type", str), ("ptx_type", str), ("dtype", str), ("access", str), ("shape", list), ("dim", str))
-        for key, kind_of_value in (*typed, ("count_of", str), ("strides", list), ("stride_of", dict)):
+        for key, kind_of_value in (*typed, ("count_of", str), ("strides", list)):
             if _has(p, key) and not isinstance(p[key], kind_of_value):
                 bad(f"parameter {name}: {key} must be a {kind_of_value.__name__}, got {p[key]!r}")
+        if _has(p, "stride_of") and not isinstance(p["stride_of"], (dict, list)):
+            bad(f"parameter {name}: stride_of must be an object or a list of them, got {p['stride_of']!r}")
         if p["slot"] != position:
             bad(f"parameter {name} has slot {p['slot']} but is at position {position}")
         pkind, ty = p["kind"], p["type"]
@@ -315,8 +317,15 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
                 bad(f"parameter {name}: dim is missing")
             if _has(p, "stride_of"):
                 so = p["stride_of"]
-                if set(so) != {"arg", "axis"} or not _is_ident(so["arg"]) or not _is_count(so["axis"], 0):
-                    bad(f"parameter {name}: stride_of must be {{'arg': <an identifier>, 'axis': <an int >= 0>}}, got {so!r}")
+                items = so if isinstance(so, list) else [so]
+                ok = (not isinstance(so, list) or len(so) >= 2) and all(
+                    isinstance(i, dict) and set(i) == {"arg", "axis"} and _is_ident(i["arg"]) and _is_count(i["axis"], 0) for i in items
+                )
+                if not ok or len({(i["arg"], i["axis"]) for i in items}) != len(items):
+                    bad(
+                        f"parameter {name}: stride_of must be {{'arg': <an identifier>, 'axis': <an int >= 0>}}, or a list of two or more of them "
+                        f"(the views that share the stride, each once), got {so!r}"
+                    )
         elif pkind == "fixed":
             if kind != ENTRY_KIND_BINARY:
                 bad(f"parameter {name}: a fixed argument belongs to a prebuilt binary, and this is a {kind} kernel")

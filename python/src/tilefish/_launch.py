@@ -332,10 +332,18 @@ def _solve_one(op_name: str, eq: "tuple[Any, ...]", dims: "dict[Dim, int]") -> b
         if expected != actual:
             static = pattern.folded().is_static
             shown = f"{pattern} = {expected}" if not static else f"{expected}"
-            note = " (the kernel loads along that axis contiguously: pass a view whose last axis has stride 1)" if what == "stride" else ""
+            note = ""
+            if what == "stride":
+                note = (
+                    " (the kernel loads along that axis contiguously: pass a view whose last axis has stride 1)"
+                    if static
+                    else " (the kernel takes one stride for the views that share it: each must have it)"
+                )
             raise TilefishPreconditionError(
                 f"{op_name}: argument '{pname}' ({ptype}): {_what(what, axis)} is {actual}, but the signature requires {shown}{note}",
-                kind=("stride" if what == "stride" else "static_size") if static else "shape",
+                # a stride that is not the one required is a refusal of kind `stride`: the fixed unit stride of the last axis, or a stride
+                # dimension that another view bound first (views that share a stride, StrideOf(("q", "k", "v"), 0))
+                kind="stride" if what == "stride" else ("static_size" if static else "shape"),
                 arg=pname,
             )
         return True

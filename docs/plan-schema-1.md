@@ -30,7 +30,9 @@ is tested.
 * **the memory plan**: `arena_bytes` and the `offset` of every arena buffer, in bytes from the start of the arena, aligned to 256, the same in every bucket.
 
 Views copy nothing. A step that reads the `q`, `k` and `v` of a fused `[M, 3, H, D]` tensor passes three views of one buffer (offsets 0, `H*D` and `2*H*D`
-elements, strides `3*H*D`, `D`, `1`), and the kernel is handed three pointers and the strides as scalars, as for any `Strided[...]` pointer (manifest schema 3, section 5.1).
+elements, strides `3*H*D`, `D`, `1`), and the kernel is handed three pointers and the strides as scalars, as for any `Strided[...]` pointer (manifest schema 3, section 5.1);
+a kernel that takes one stride pair for the three (a stride that several views share, `StrideOf(("q", "k", "v"), axis)`) is handed it once, and the step binds
+it from the first view and holds the others to it, as a single launch does.
 
 ## 2. The top level
 

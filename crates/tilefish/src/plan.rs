@@ -412,15 +412,19 @@ impl Plan {
             Unsolvable::Mismatch { expected } => {
                 let what =
                     if pattern.is_static { expected.to_string() } else { format!("{} = {expected}", pattern.text) };
-                let note = if stride && pattern.is_static {
-                    " (the kernel loads along that axis contiguously: pass a view whose last axis has stride 1)"
-                } else {
-                    ""
+                let note = match (stride, pattern.is_static) {
+                    (true, true) => {
+                        " (the kernel loads along that axis contiguously: pass a view whose last axis has stride 1)"
+                    }
+                    (true, false) => " (the kernel takes one stride for the views that share it: each must have it)",
+                    (false, _) => "",
                 };
+                // a stride that is not the one required is a refusal of kind `stride` (Python's `_solve_one`): the fixed unit stride of the
+                // last axis, or a stride dimension that another view bound first (views that share a stride)
                 let kind = match (pattern.is_static, stride) {
-                    (true, true) => PreconditionKind::Stride,
+                    (_, true) => PreconditionKind::Stride,
                     (true, false) => PreconditionKind::StaticSize,
-                    (false, _) => PreconditionKind::Shape,
+                    (false, false) => PreconditionKind::Shape,
                 };
                 Error::precondition(kind, Some(name), format!("{head}, but the signature requires {what}{note}"))
             }

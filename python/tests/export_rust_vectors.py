@@ -248,6 +248,12 @@ def manifest_documents():
             **extra,
         )
 
+    def shared_stride(stem):
+        """The entry of ``triton`` with its stride scalar carrying the stride of two views (a ``stride_of`` list, which M3.3 added)."""
+        e = triton(stem)
+        e["abi"]["params"][1]["stride_of"] = [{"arg": "x", "axis": 0}, {"arg": "y", "axis": 0}]
+        return e
+
     def binary(stem, arch="sm_103", alpha=2.0):
         return entry(
             stem,
@@ -328,6 +334,7 @@ def manifest_documents():
         {"schema": 3, "kernels": [triton("k", "sm_90"), triton("k", "sm_103")], "library": [library("k.M32", "sm_90"), library("k.M32", "sm_103")]},
         # every field a version 3 entry adds is in the digest: kind, scratch_slots, strides, offset, stride_of, a device scalar, fixed values, binary, max_extent
         {"schema": 3, "kernels": [triton("s")], "library": []},
+        {"schema": 3, "kernels": [shared_stride("s")], "library": []},  # a stride that two views share: stride_of is a list
         {"schema": 3, "kernels": [binary("p")], "library": []},
         {"schema": 3, "kernels": [binary("p", alpha=2.5)], "library": []},
         # the spelling of a float: python's shortest repr (2.0, 1e-06, 1e+16, 5e-324) and what it reads back as
@@ -438,6 +445,9 @@ LAUNCH_CASES = [
     # M3.3: an extern declared with enable_fp_fusion= (the option is in the manifest entry; a launch is as any other)
     ("fma_plain", lambda n: [("f32", (n,)), ("f32", (n,)), ("f32", (n,))], (16, 1040)),
     ("fma_fused", lambda n: [("f32", (n,)), ("f32", (n,)), ("f32", (n,))], (16, 1040)),
+    # M3.3: three views read with one stride pair, the q, k and v of a fused [R, 3, 4, 64] tensor (strides (768, 64, 1) each)
+    ("qkv_sum", lambda r: [("bf16", (r, 4, 64), (768, 64, 1))] * 3, (1, 5)),
+    ("qkv_sum16", lambda r: [("bf16", (r, 4, 64), (768, 64, 1))] * 3, (1, 5)),
 ]
 _OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16", "i32": "i64"}
 I31 = (1 << 31) - 1
@@ -502,6 +512,20 @@ def _views(key, ptr, high):
         yield "last axis stride 2", ("bf16", (7, 64), ptr, (200, 2))
         yield "address + 1", ("bf16", (7, 64), ptr + 1, (200, 1))
         yield "address + 2", ("bf16", (7, 64), ptr + 2, (200, 1))
+
+
+def _shared_strides(key, base):
+    """Calls of an op whose views share one stride pair (``qkv_sum``): another view (k, then v) of other strides than the first one's, which the first
+    binds and the others must have, and all three of other strides alike: ``(input index, (dtype, shape, ptr, strides))``."""
+    if key not in ("qkv_sum", "qkv_sum16"):
+        return
+    for j in (1, 2):
+        dtype, shape, ptr, _ = base[j]
+        for strides in ((769, 64, 1), (768, 65, 1), (256, 64, 1), (1536, 64, 1), (768, 128, 1), (0, 64, 1)):
+            yield [j], (dtype, shape, ptr, strides)
+    # the same strides on all three: separate dense tensors, a wider fused tensor, a broadcast first axis
+    for strides in ((256, 64, 1), (1536, 64, 1), (0, 64, 1), (768, 64, 1)):
+        yield [0, 1, 2], (base[0][0], base[0][1], None, strides)
 
 
 def _device_scalars(key, base):
@@ -607,6 +631,11 @@ def launches():
                 calls.append([new, *base[1:]])
             for j, new in _device_scalars(key, base):
                 calls.append([*base[:j], new, *base[j + 1 :]])
+            for which, (dtype, shape, ptr, strides) in _shared_strides(key, base):
+                call = list(base)
+                for j in which:
+                    call[j] = (dtype, shape, base[j][2] if ptr is None else ptr, strides)
+                calls.append(call)
             if key == "bucketed_rms":  # the bucketed dimension moved in every tensor that has it: another bucket, or none
                 rows = size[0]
                 for db in (95, 100, 512, 1000):

@@ -22,7 +22,7 @@ from binary_fakes import PTX_TEXT, SM90, fake_binary_build, make_ptx_op, write_p
 from built_fakes import fake_build
 from conftest import REPO_ROOT
 from elf_builder import arch_header, cubin_like
-from host_ops import gpu_kernels_p1
+from host_ops import gpu_kernels_p1, gpu_kernels_p4
 from test_library_ops import ALGO, SMS, VERSION, gemm, gemm_bias
 from test_rust_host import check_golden, needs_new_crate, pinned
 
@@ -294,12 +294,13 @@ def _drop(entry, **match):
 
 @pytest.fixture(scope="module")
 def schema3_manifest(tmp_path_factory):
-    """A pinned manifest with a strided kernel, a 64-bit one, a device scalar, a prebuilt binary with fixed arguments and a GEMM (for sm_90 and sm_103)."""
+    """A pinned manifest with a strided kernel, a 64-bit one, one whose views share their strides, a device scalar, a prebuilt binary with fixed
+    arguments and a GEMM (for sm_90 and sm_103)."""
     tmp = tmp_path_factory.mktemp("schema3")
     p1 = gpu_kernels_p1()
     ptx = write_ptx(tmp)
     axpy = make_ptx_op(ptx)
-    ops = [p1.head_copy, p1.head_copy16, p1.head_copy64, p1.masked_rows, axpy]
+    ops = [p1.head_copy, p1.head_copy16, p1.head_copy64, gpu_kernels_p4().qkv_sum, p1.masked_rows, axpy]
     return build_manifest(tmp / "m", ops, pins(gemm)[:1])
 
 
@@ -329,6 +330,25 @@ KERNEL_FIELDS = {
     "a stride_of with a dimension that is not the stride's": ("head_copy", lambda e: _param(e, "x_s0").update(dim="x_s1")),
     "two scalars for one stride": ("head_copy", lambda e: _param(e, "x_s1")["stride_of"].update(axis=0)),
     "a stride_of together with a count_of": ("head_copy", lambda e: _param(e, "x_s0").update(count_of="x")),
+    # a stride that several views share: stride_of is a list of two or more of them, each once, whose strides name the scalar
+    "a shared stride_of of one view": ("qkv_sum", lambda e: _param(e, "s_row").update(stride_of=[{"arg": "q", "axis": 0}])),
+    "a shared stride_of with a view twice": (
+        "qkv_sum",
+        lambda e: _param(e, "s_row").update(stride_of=[{"arg": "q", "axis": 0}, {"arg": "q", "axis": 0}, {"arg": "k", "axis": 0}, {"arg": "v", "axis": 0}]),
+    ),
+    "a shared stride_of with an item that is not an object": (
+        "qkv_sum",
+        lambda e: _param(e, "s_row").update(stride_of=[{"arg": "q", "axis": 0}, "k", {"arg": "v", "axis": 0}]),
+    ),
+    "a shared stride_of that leaves a view out": ("qkv_sum", lambda e: _param(e, "s_row").update(stride_of=[{"arg": "q", "axis": 0}, {"arg": "k", "axis": 0}])),
+    "a shared stride_of of another axis": (
+        "qkv_sum",
+        lambda e: _param(e, "s_row").update(stride_of=[{"arg": "q", "axis": 0}, {"arg": "k", "axis": 1}, {"arg": "v", "axis": 0}]),
+    ),
+    "a shared stride_of that names the output": (
+        "qkv_sum",
+        lambda e: _param(e, "s_row").update(stride_of=[{"arg": "q", "axis": 0}, {"arg": "k", "axis": 0}, {"arg": "v", "axis": 0}, {"arg": "o", "axis": 0}]),
+    ),
     "a scalar of a type that is not i32 or i64": ("head_copy", lambda e: _param(e, "x_s0").update(type="i16")),
     "a scalar type with a newline": ("head_copy", lambda e: _param(e, "x_s0").update(type="i32\n")),
     # preconditions
@@ -408,6 +428,7 @@ def test_a_kernel_entry_the_reader_refuses_is_refused_and_writes_nothing(name, s
 def test_the_unmutated_manifest_is_accepted_and_has_no_injected_code(schema3_manifest):
     source = rust.render(schema3_manifest)
     assert "pwned" not in source and "pub struct HeadCopy " in source and "pub struct MaskedRows " in source and "pub struct Axpy " in source and "pub struct GemmM32 " in source
+    assert "pub struct QkvSum " in source and "the stride of axis 1 of `q`, `k` and `v`, in elements (one stride, which each of them must have)" in source
 
 
 LIBRARY_FIELDS = {

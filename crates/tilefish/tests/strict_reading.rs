@@ -212,7 +212,7 @@ fn an_object_given_as_the_list_of_its_values_is_refused() {
         let params = Copy::entry(d, "strided_copy")["abi"]["params"].as_array_mut().unwrap();
         params.iter_mut().find_map(|p| p.get_mut("stride_of")).expect("a scalar that carries a stride")
     };
-    let cases: [(&str, Pick, &str); 14] = [
+    let cases: [(&str, Pick, &str); 13] = [
         ("a kernel entry", |d| Copy::entry(d, "softmax"), "a kernel entry must be an object"),
         ("abi", |d| &mut Copy::entry(d, "softmax")["abi"], "abi must be an object"),
         (
@@ -220,7 +220,6 @@ fn an_object_given_as_the_list_of_its_values_is_refused() {
             |d| &mut Copy::entry(d, "softmax")["abi"]["params"][0],
             "a parameter of abi.params must be an object",
         ),
-        ("stride_of", stride_of, "stride_of must be an object"),
         (
             "a scratch slot",
             |d| &mut Copy::entry(d, "softmax")["abi"]["scratch"][1],
@@ -246,6 +245,12 @@ fn an_object_given_as_the_list_of_its_values_is_refused() {
         let message = refused(&copy);
         assert!(message.contains(why) && message.contains("got list"), "{what}: {message}");
     }
+    // `stride_of` may be a list (of the objects of the views that share a stride), so `{"arg": "x", "axis": 0}` given as `["x", 0]` is a list
+    // whose items are not objects
+    let copy = Copy::of("sm_103");
+    copy.edit_json(|doc| by_position(stride_of(doc)));
+    let message = refused(&copy);
+    assert!(message.contains("stride_of must be an object") && message.contains("got str"), "stride_of: {message}");
     let copy = Copy::of("sm_103");
     copy.edit_json(|doc| by_position(&mut doc["library"][0]["abi"]["params"][0]));
     let message = refused(&copy);

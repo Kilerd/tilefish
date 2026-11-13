@@ -96,7 +96,7 @@ def test_replay_of_prebuilt_ptx_is_byte_identical_to_jit(tmp_path):
 def test_a_stride_is_a_64_bit_scalar_in_the_abi(tmp_path):
     (spec,) = compile_specs(strided_copy)
     assert [(a.name, a.kind, a.type) for a in spec.args] == [("x", "pointer", "*bf16"), ("y", "pointer", "*bf16"), ("cols", "fixed", "i32"), ("x_s0", "scalar", "i64")]
-    assert spec.args[3].stride_of == ("x", 0)
+    assert spec.args[3].stride_of == (("x", 0),)
     assert spec.binary["kind"] == "ptx" and spec.block == (64, 1, 1) and spec.num_warps == 0
     assert [p.name for p in spec.launch_params] == ["x", "y", "cols", "x_s0"]  # no scratch slots
 

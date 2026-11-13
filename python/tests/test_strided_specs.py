@@ -70,7 +70,7 @@ def test_a_strided_parameter_has_the_strides_and_the_offset_its_stub_declares():
     assert p.type.offset.divisible_by is None
     q = head_copy16.signature.params[0]
     assert q.align == 16 and q.type.offset.divisible_by == 8  # the elements in 16 bytes of bf16
-    assert head_copy16.signature.params[2].dim.divisible_by == 16 and head_copy16.signature.params[2].stride_of == ("x", 0)
+    assert head_copy16.signature.params[2].dim.divisible_by == 16 and head_copy16.signature.params[2].stride_of == (("x", 0),)
     assert str(head_copy) == (
         "extern head_copy(x: Strided[Tensor[S, 8, 64, bf16]], y: Out[Tensor[S, 8, 64, bf16]], x_s0: StrideOf('x', 0), x_s1: StrideOf('x', 1), D: const = 64)"
     )
@@ -284,8 +284,8 @@ def test_a_strided_pointer_records_its_strides_and_offset_and_a_stride_scalar_it
     assert (x.kind, x.strides, x.offset, x.shape_dims) == ("pointer", ("x_s0", "x_s1", 1), "x_offset", ("S", 8, 64))
     assert y.strides is None and y.offset is None  # an Out tensor is dense
     assert [(a.name, a.kind, a.type, a.dim, a.stride_of) for a in (s0, s1)] == [
-        ("x_s0", "scalar", "i32", "x_s0", ("x", 0)),
-        ("x_s1", "scalar", "i32", "x_s1", ("x", 1)),
+        ("x_s0", "scalar", "i32", "x_s0", (("x", 0),)),
+        ("x_s1", "scalar", "i32", "x_s1", (("x", 1),)),
     ]
     assert spec.signature == {"x": "*bf16", "y": "*bf16", "x_s0": "i32", "x_s1": "i32", "D": "constexpr"}
     assert spec.dims == {"S": {}, "x_s0": {}, "x_s1": {}, "x_offset": {}}  # the names a host binds
@@ -361,7 +361,7 @@ def test_a_spec_with_strides_round_trips_and_verifies():
         again = CompileSpec.from_json(spec.to_json())
         assert again == spec and again.to_dict() == spec.to_dict() and again.schema == 3
         again.verify_against(op)
-        assert again.verified and again.args[0].strides == spec.args[0].strides and again.args[2].stride_of == ("x", 0)
+        assert again.verified and again.args[0].strides == spec.args[0].strides and again.args[2].stride_of == (("x", 0),)
 
 
 def test_a_spec_that_says_a_stride_is_another_one_does_not_verify():

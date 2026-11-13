@@ -316,21 +316,24 @@ def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> No
                     _bad(who, f"{where}.count_of must name a parameter, got {target!r}")
             if "stride_of" in p:
                 so = p["stride_of"]
-                if not isinstance(so, dict) or set(so) != {"arg", "axis"}:
-                    _bad(who, f"{where}.stride_of must be an object with exactly 'arg' and 'axis', got {so!r}")
-                owner = by_name.get(_name(who, f"{where}.stride_of.arg", so["arg"]))
-                axis = so["axis"]
-                if isinstance(axis, bool) or not isinstance(axis, int) or axis < 0:
-                    _bad(who, f"{where}.stride_of.axis must be an integer from 0, got {axis!r}")
-                if owner is None or owner.get("kind") != "pointer" or "strides" not in owner:
-                    _bad(who, f"{where}.stride_of names '{so['arg']}', which is not a strided pointer")
-                if axis >= len(owner["strides"]):
-                    _bad(who, f"{where}.stride_of.axis is {axis}, but '{so['arg']}' has {len(owner['strides'])} axes")
-                if owner["strides"][axis] != p["dim"]:
-                    _bad(who, f"{where}.dim is {p['dim']!r}, but the stride of axis {axis} of '{so['arg']}' is {owner['strides'][axis]!r}")
-                if (so["arg"], axis) in carried:
-                    _bad(who, f"axis {axis} of '{so['arg']}' has two stride scalars, '{carried[(so['arg'], axis)]}' and '{p['name']}'")
-                carried[(so["arg"], axis)] = p["name"]
+                if isinstance(so, list) and len(so) < 2:
+                    _bad(who, f"{where}.stride_of is a list of the views that share the stride: it has two or more, got {so!r}")
+                for item in so if isinstance(so, list) else [so]:  # one view, or the views that share the stride
+                    if not isinstance(item, dict) or set(item) != {"arg", "axis"}:
+                        _bad(who, f"{where}.stride_of must be an object with exactly 'arg' and 'axis', or a list of them, got {so!r}")
+                    owner = by_name.get(_name(who, f"{where}.stride_of.arg", item["arg"]))
+                    axis = item["axis"]
+                    if isinstance(axis, bool) or not isinstance(axis, int) or axis < 0:
+                        _bad(who, f"{where}.stride_of.axis must be an integer from 0, got {axis!r}")
+                    if owner is None or owner.get("kind") != "pointer" or "strides" not in owner:
+                        _bad(who, f"{where}.stride_of names '{item['arg']}', which is not a strided pointer")
+                    if axis >= len(owner["strides"]):
+                        _bad(who, f"{where}.stride_of.axis is {axis}, but '{item['arg']}' has {len(owner['strides'])} axes")
+                    if owner["strides"][axis] != p["dim"]:
+                        _bad(who, f"{where}.dim is {p['dim']!r}, but the stride of axis {axis} of '{item['arg']}' is {owner['strides'][axis]!r}")
+                    if (item["arg"], axis) in carried:
+                        _bad(who, f"axis {axis} of '{item['arg']}' has two stride scalars, '{carried[(item['arg'], axis)]}' and '{p['name']}'")
+                    carried[(item["arg"], axis)] = p["name"]
         elif pkind == "fixed":
             if kind != "binary":
                 _bad(who, f"{where} is a fixed argument, which only a prebuilt binary has (this is a {kind} kernel)")
@@ -767,12 +770,24 @@ def _doc(binary: _Binary) -> "list[str]":
             if "count_of" in s:
                 how = f"the element count of `{binary.arg_names[s['count_of']]}`"
             elif "stride_of" in s:
-                so = s["stride_of"]
-                how = f"the stride of axis {so['axis']} of `{binary.arg_names[so['arg']]}`, in elements"
+                how = _stride_text(s["stride_of"], binary.arg_names)
             else:
                 how = f"`{s['dim']}`"
             lines.append(f"- `{s['name']}` is {how}" + ("" if s["type"] == "i32" else f" ({s['type']})"))
     return lines
+
+
+def _stride_text(so: Any, arg_names: "dict[str, str]") -> str:
+    """What a stride scalar carries, for the docs: the stride of one view, or the one stride the views that share it must all have."""
+    items = so if isinstance(so, list) else [so]
+    if len(items) == 1:
+        return f"the stride of axis {items[0]['axis']} of `{arg_names[items[0]['arg']]}`, in elements"
+    names = [f"`{arg_names[i['arg']]}`" for i in items]
+    listed = ", ".join(names[:-1]) + f" and {names[-1]}"
+    if len({i["axis"] for i in items}) == 1:
+        return f"the stride of axis {items[0]['axis']} of {listed}, in elements (one stride, which each of them must have)"
+    each = ", ".join(f"axis {i['axis']} of {n}" for i, n in zip(items, names))
+    return f"the stride of {each}, in elements (one stride, which each of them must have)"
 
 
 def _doc_comment(lines: "list[str]", indent: str = "") -> str:

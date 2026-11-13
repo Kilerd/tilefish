@@ -96,6 +96,8 @@ from ._specvalid import (
     LEGACY_SCHEMA,
     SCHEMA_VERSION,
     decode_scalar,
+    stride_of_json,
+    stride_of_targets,
     validate_arg,
     validate_launch_param,
     validate_precondition,
@@ -200,8 +202,9 @@ class ArgSpec:
     # ``base + offset * itemsize``. A pointer without them is dense row-major at offset 0.
     strides: tuple["str | int", ...] | None = None
     offset: "str | int | None" = None
-    # scalars that carry a stride: ``(argument, axis)`` of the pointer argument whose stride along that axis this scalar is
-    stride_of: "tuple[str, int] | None" = None
+    # scalars that carry a stride: ``(argument, axis)`` of the pointer argument whose stride along that axis this scalar is, one pair, or one per
+    # view that shares the stride (``StrideOf(("q", "k", "v"), 0)``; serialized as a list then, see ``stride_of_json``)
+    stride_of: "tuple[tuple[str, int], ...] | None" = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"index": self.index, "name": self.name, "kind": self.kind, "type": self.type}
@@ -219,7 +222,7 @@ class ArgSpec:
             out["strides"] = list(self.strides)
             out["offset"] = self.offset
         if self.stride_of is not None:
-            out["stride_of"] = {"arg": self.stride_of[0], "axis": self.stride_of[1]}
+            out["stride_of"] = stride_of_json(self.stride_of)
         return out
 
     @classmethod
@@ -235,7 +238,7 @@ class ArgSpec:
             if kw.get("strides") is not None:
                 kw["strides"] = tuple(kw["strides"])
             if kw.get("stride_of") is not None:
-                kw["stride_of"] = (kw["stride_of"]["arg"], kw["stride_of"]["axis"])
+                kw["stride_of"] = stride_of_targets(kw["stride_of"])
             if "value" in kw:
                 kw["value"] = decode_scalar(kw["value"], "arg value")
             return cls(**kw)
@@ -724,7 +727,7 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
             assert p.dim is not None
             entry["dim"] = _canonical_dim(p.dim)
             if p.stride_of is not None:
-                entry["stride_of"] = {"arg": p.stride_of[0], "axis": p.stride_of[1]}
+                entry["stride_of"] = stride_of_json(p.stride_of)  # one view as it always was; the views that share a stride as a list
         else:
             entry["dtype"] = None if p.const_dtype is None else _canonical_dtype(p.const_dtype)
             # a scalar default is hashed as the typed value a spec compiles in; a dimension expression is

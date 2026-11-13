@@ -299,6 +299,10 @@ def head_copy(x: Strided[Tensor[S, 8, 64, bf16]], y: Out[Tensor[S, 8, 64, bf16]]
 y = tilefish.run(head_copy, qkv[:, 1])        # a view of a fused qkv tensor: its pointer and its two strides go to the kernel
 ```
 
+A kernel that reads several views of one buffer with **one** stride pair (the q, k and v column blocks of a fused `[B, 3 * D]` tensor) declares the stride
+once for all of them, `s_row: StrideOf(("q", "k", "v"), 0)`: the views share the stride dimension, so a call binds it from `q` and refuses a `k` or a `v` that
+does not have it (a trace call, a launch in Python and in Rust, and every step of a plan), and the kernel is given the stride once and a pointer per view.
+
 An axis without a `StrideOf` must be the last one (its stride is then 1, and a view that does not have it is refused); the strides are bound at a
 call like shapes are, range-checked as `i32` (`i64` for `index_bits=64`), and a strided pointer is bounded by its extent (`max_extent`), not its element
 count. The pointer passed is `base + offset * itemsize`. `Strided[Tensor[...], 16]` compiles the kernel for a 16-byte aligned pointer
