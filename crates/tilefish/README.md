@@ -95,7 +95,8 @@ its partitions in `Entry::total_num_warps` (next to `Entry::num_warps`, the
 declared warps of its default partition), and every launch, step of a plan and
 captured graph takes the block they make (`Plan::block()`: the entry's
 `block`, `32 * total_num_warps`).
-cudarc opens `libcublasLt.so.12` by name: where cuBLASLt comes from a Python
+cudarc opens cuBLASLt by name (`libcublasLt.so`, then `libcublasLt.so.13` for the
+default `cuda-13020` bindings, then older majors): where cuBLASLt comes from a Python
 wheel (`nvidia-cublas`, torch's), put that wheel's `nvidia/cublas/lib` on
 `LD_LIBRARY_PATH`. A missing library is an error, and another build of it is
 refused by the version check.

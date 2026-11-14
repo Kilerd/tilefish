@@ -872,8 +872,8 @@ shape, gives these bytes in this process. Only the 16 bytes of the sums cross to
 ordered with no other stream): the zeroed buffers, the fills, the convolution, the digest and the copy of its sums back, which waits for that stream
 alone.
 
-**What a canary costs.** The first form made the operands on the host (SHA-256 in counter mode) and hashed `y` on the host: for the 743 entries of a
-production-shaped plan set (38 GB of `x` and 38 GB of `y` in all, the largest 169 MB each) a Rust load took 93 s on a B300 MIG slice and 150 s on an
+**What a canary costs.** The first form made the operands on the host (SHA-256 in counter mode) and hashed `y` on the host: for a plan set of 743
+entries (38 GB of `x` and 38 GB of `y` in all, the largest 169 MB each) a Rust load took 93 s on a B300 MIG slice and 150 s on an
 RTX 5090, of it 64 s / 101 s making the operands, 15 s / 21 s hashing `y` and 8 s / 19 s copying it back (measured per phase, release build, cuDNN
 9.13.0). Made and digested on the device, the same 743 entries load in 1.4 s on the B300 slice and 1.1 s on the RTX 5090 (2.1 s the first time, the driver
 compiling the PTX), against 0.08 s / 0.10 s with no canary; Python gives the same 743 canaries in 1.1 s on each. It never uses the NULL stream, which a CUDA green context does not order
