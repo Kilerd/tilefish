@@ -43,7 +43,7 @@ workspace limit; an engine configuration must be of an engine whose numerical no
 the engine (each once, in its range and on its stride: ``CUDNN_ATTR_KNOB_INFO_*``), and whose plan finalizes and needs at most the limit.
 
 **The process.** The cuDNN version (``cudnnGetVersion()``: ``91002`` for 9.10.2) is what a pin is compared on: cuDNN exposes no build number. And
-``NVIDIA_TF32_OVERRIDE`` changes what cuDNN picks and runs behind the declared math (measured on the encoder this op was made for; any value), so every
+``NVIDIA_TF32_OVERRIDE`` changes what cuDNN picks and runs behind the declared math (measured, with any value), so every
 pin, check and run refuses a process that has it set (:func:`refuse_tf32_override`).
 
 The library is the ``libcudnn`` the process already has mapped (torch's, from the ``nvidia-cudnn`` wheel): it is found in ``/proc/self/maps`` and opened

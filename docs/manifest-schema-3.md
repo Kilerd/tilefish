@@ -843,7 +843,7 @@ workspace must be at most `workspace_bytes`.
 on this device"); Python compares the entry with the declaration (the first difference is named) and the pin's API with the declaration's; the process's
 `cudnnGetVersion()` must be `cudnn_version` (a pin names other kernels in another version; cuDNN has no build number, so two builds of one version are not
 told apart); **a process with `NVIDIA_TF32_OVERRIDE` set, to any value, is refused** ("unset it"): it changes what cuDNN picks and runs behind the
-declared math (measured on the encoder this op was made for), so no pin is made in such a process either; an imported pin must be the table's; then the
+declared math (measured), so no pin is made in such a process either; an imported pin must be the table's; then the
 checks of the pin. A Rust host on a partition (`Manifest::with_sm_partition(Some(P))`) takes only an entry chosen for `P` SMs (its `sm_count_target`, or
 its `sm_count` without one), as for a GEMM.
 
