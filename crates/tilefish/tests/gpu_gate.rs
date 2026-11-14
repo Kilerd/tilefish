@@ -2513,11 +2513,20 @@ fn graph_capture_of_kernels_with_tma_descriptors() {
         eprintln!("no TMA descriptor in this gate");
         return;
     }
+    capture_f16_kernels(&cases, &["tma_matmul", "shift_rows", "tile_copy_view", "gluon_tile_copy"]);
+    println!(
+        "rust gate: four kernels with TMA descriptors captured in CUDA graphs (launch_raw and launch, regions) ran 3 times each and matched Python's replay"
+    );
+}
+
+/// The last case of each of `stems` (kernels of f16 tensors, plain or views) captured in a CUDA graph with `unsafe launch_raw` and with the safe
+/// `launch`, on regions, replayed by `capture_and_run`, which compares every replay with Python's bytes.
+fn capture_f16_kernels(cases: &Value, stems: &[&str]) {
     let (gpu, manifest) = (Gpu::new(), manifest());
     let arch = Arch::of_context(&gpu.ctx).unwrap();
     let stream = gpu.stream.cu_stream();
-    for stem in ["tma_matmul", "shift_rows", "tile_copy_view", "gluon_tile_copy"] {
-        let case = cases_where(&cases, |c| c["stem"] == stem).into_iter().last().expect("a case");
+    for &stem in stems {
+        let case = cases_where(cases, |c| c["stem"] == stem).into_iter().last().expect("a case");
         let kernel = manifest.kernel(&gpu.ctx, stem, &[], arch).unwrap();
         let mut tensors = tensors_of(&gpu, &case);
         let last = tensors.len() - 1;
@@ -2556,7 +2565,70 @@ fn graph_capture_of_kernels_with_tma_descriptors() {
             capture_and_run(&gpu, &launch, &mut tensors[last].1.slice, &expect);
         }
     }
+}
+
+/// The warp-specialised kernels of the gate (`python/tests/ws_kernels.py`; docs/manifest-schema-3.md section 4.2), which a fresh export on sm_90 or
+/// newer has: each entry keeps the declared `num_warps` (its default partition's) and records the warps of all its partitions (`total_num_warps`),
+/// whose block every launch takes; the Gluon matmuls (tcgen05) are on sm_100 and sm_103 only, and Triton warp-specialises a loop from sm_100 on.
+fn warp_specialised_stems(manifest: &tilefish::Manifest, arch: &str) -> Vec<(&'static str, u32, Option<u32>)> {
+    let sm: u32 = arch.strip_prefix("sm_").and_then(|n| n.parse().ok()).unwrap_or(0);
+    let mut out = vec![("ws_scale", 4, Some(8)), ("tl_ws_matmul", 4, if sm >= 100 { Some(8) } else { None })];
+    if manifest.entry("ws_matmul", arch).is_some() {
+        out.extend([("ws_matmul", 4, Some(8)), ("ws_matmul_wide", 8, Some(12))]);
+    }
+    out
+}
+
+/// Warp-specialised kernels: the entry has the declared warps and those of all the partitions, its block is theirs, the plan of a launch takes that
+/// block, the kernel loads (the driver checks the parameter sizes), and the gate runs at least two cases of each (compared with Python's replay).
+#[test]
+fn the_gate_has_warp_specialised_kernels() {
+    let cases = cases();
+    if !has_tma(&cases) {
+        eprintln!("the gate runs a committed fixture, or a device before sm_90: no warp-specialised kernel");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let stems = warp_specialised_stems(&manifest, &arch.to_string());
+    for &(stem, declared, total) in &stems {
+        let entry = manifest.entry(stem, &arch.to_string()).unwrap_or_else(|| panic!("the gate's manifest has {stem}"));
+        let warps = total.unwrap_or(declared);
+        assert_eq!(
+            (entry.num_warps, entry.total_num_warps, entry.block),
+            (Some(declared), total, [32 * warps, 1, 1]),
+            "{stem}"
+        );
+        assert_eq!(manifest.plan(stem, &[], arch).unwrap().block(), [32 * warps, 1, 1], "{stem}");
+        let _ = manifest.kernel(&gpu.ctx, stem, &[], arch).unwrap_or_else(|e| panic!("{stem} loads: {e}"));
+        let n = cases_where(&cases, |c| c["stem"] == stem).len();
+        assert!(n >= 2, "the gate has {n} cases of {stem}");
+    }
     println!(
-        "rust gate: four kernels with TMA descriptors captured in CUDA graphs (launch_raw and launch, regions) ran 3 times each and matched Python's replay"
+        "rust gate: {} warp-specialised kernels load with the block of all their partitions ({})",
+        stems.len(),
+        stems
+            .iter()
+            .map(|(s, d, t)| format!("{s}: {d} declared, {} in all", t.unwrap_or(*d)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// Warp-specialised kernels captured in a CUDA graph (`unsafe launch_raw` and the safe `launch`, on regions): the graph's kernel nodes have the block
+/// of all the partitions, and every replay computes Python's bytes.
+#[test]
+fn graph_capture_of_warp_specialised_kernels() {
+    let cases = cases();
+    if !has_tma(&cases) {
+        eprintln!("no warp-specialised kernel in this gate");
+        return;
+    }
+    let arch = cases["arch"].as_str().expect("the gate's architecture");
+    let stems: Vec<&str> = warp_specialised_stems(&manifest(), arch).into_iter().map(|(s, ..)| s).collect();
+    capture_f16_kernels(&cases, &stems);
+    println!(
+        "rust gate: {} warp-specialised kernels captured in CUDA graphs (launch_raw and launch, regions) ran 3 times each and matched Python's replay",
+        stems.len()
     );
 }
