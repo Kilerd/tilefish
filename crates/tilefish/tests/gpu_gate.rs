@@ -33,7 +33,9 @@
 //! `the_gate_has_a_case_for_every_feature_of_schema_3`, `refusals_of_schema_3`, `graph_capture_of_a_strided_kernel_and_of_a_gemm`,
 //! `a_gemm_of_slices_on_a_capturing_stream_...`, the free of the slices of a GEMM and of a strided kernel on another stream,
 //! `a_written_view_lands_at_its_offset_and_nowhere_else` and `a_gemm_whose_algorithm_needs_a_workspace_...`. M3.3 adds
-//! `the_gate_has_a_case_for_every_feature_of_m3_3` and `views_that_share_a_stride_must_all_have_it`, and `the_gate_has_a_gluon_kernel`.
+//! `the_gate_has_a_case_for_every_feature_of_m3_3` and `views_that_share_a_stride_must_all_have_it`, and `the_gate_has_a_gluon_kernel`. M3.4 adds
+//! TMA descriptors: `the_gate_has_tma_descriptors`, `a_descriptor_of_a_tensor_the_driver_refuses_is_refused_before_the_launch` and
+//! `graph_capture_of_kernels_with_tma_descriptors`.
 
 #[allow(dead_code)]
 mod generated {
@@ -2254,5 +2256,182 @@ fn a_gemm_whose_algorithm_needs_a_workspace_runs_with_the_callers_and_matches_re
     capture_and_run(&gpu, &launch, &mut out.slice, &expect);
     println!(
         "rust gate: the GEMM '{stem}' (m={m} n={n} k={k}, a split-K algorithm that needs {required} bytes of workspace) matches replay with the entry's workspace, with exactly {required} bytes (dirty) and in a CUDA graph; one byte less is refused"
+    );
+}
+
+// -- TMA descriptors ---------------------------------------------------------------------------------------------------------------------
+
+/// Whether the gate exported the kernels of `tma_kernels.py` (a fresh export on sm_90 or newer: a committed fixture has none).
+fn has_tma(cases: &Value) -> bool {
+    cases["manifest"] == "manifest"
+        && cases["arch"]
+            .as_str()
+            .and_then(|a| a.strip_prefix("sm_"))
+            .and_then(|n| n.parse::<u32>().ok())
+            .is_some_and(|n| n >= 90)
+}
+
+/// Parameters that are TMA descriptors (`TensorDesc`, manifest kind `tensordesc`): the crate reads each as a pointer with its `tensor_map`, takes
+/// `1 + 2 * rank` slots of `kernelParams` for it (the loaded function was checked to take them: 128 bytes, then 4 and 8 per axis), and records
+/// the box the compiled kernel copies (a [32, 256] bf16 block with a 128-byte swizzle is copied as [32, 64] boxes); the gate runs every kernel of
+/// `tma_kernels.py`, whose bytes `byte_identity` holds to Python's.
+#[test]
+fn the_gate_has_tma_descriptors() {
+    let cases = cases();
+    if !has_tma(&cases) {
+        eprintln!("the gate runs a committed fixture, or a device before sm_90: no TMA descriptor");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let mm = manifest.entry("tma_matmul", &arch.to_string()).expect("the gate's manifest has tma_matmul");
+    let layout: Vec<(String, usize, Vec<usize>)> =
+        mm.params.iter().map(|p| (p.name.clone(), p.slot, p.slots())).collect();
+    assert_eq!(
+        layout,
+        [
+            ("a".to_owned(), 0, vec![128, 4, 4, 8, 8]),
+            ("b".to_owned(), 5, vec![128, 4, 4, 8, 8]),
+            ("c".to_owned(), 10, vec![128, 4, 4, 8, 8]),
+            ("k_len".to_owned(), 15, vec![4])
+        ]
+    );
+    let c = mm.param("c").unwrap().tensor_map().expect("c is a descriptor");
+    assert_eq!((c.block.as_slice(), c.box_shape.as_slice(), c.swizzle), (&[128, 128][..], &[128, 64][..], 128));
+    let wide = manifest.entry("wide_copy", &arch.to_string()).unwrap();
+    let x = wide.param("x").unwrap().tensor_map().unwrap();
+    assert_eq!((x.data_type.as_str(), x.box_shape.as_slice()), ("CU_TENSOR_MAP_DATA_TYPE_BFLOAT16", &[32, 64][..]));
+    let view = manifest.entry("tile_copy_view", &arch.to_string()).unwrap();
+    assert!(matches!(
+        &view.param("x").unwrap().kind,
+        tilefish::ParamKind::Pointer { view: Some(_), tensor_map: Some(_), .. }
+    ));
+    for stem in ["tile_copy", "shift_rows", "wide_copy", "tma_matmul", "tile_copy_view", "gluon_tile_copy"] {
+        let _ = manifest.kernel(&gpu.ctx, stem, &[], arch).unwrap_or_else(|e| panic!("{stem} loads: {e}"));
+        let n = cases_where(&cases, |c| c["stem"] == stem).len();
+        assert!(n >= 2, "the gate has {n} cases of {stem}");
+    }
+    assert_eq!(
+        manifest.entry("gluon_tile_copy", &arch.to_string()).unwrap().source_digest_kind.as_deref(),
+        Some("tilefish.gluon-ir.v1")
+    );
+    println!(
+        "rust gate: six kernels with TMA descriptors (Triton and Gluon) load, and their maps are as the build recorded them"
+    );
+}
+
+/// A tensor the driver could not make a map of is refused with a kind before anything is launched: an address that is not 16-byte aligned
+/// (`pointer_alignment`), rows that are not a multiple of 16 bytes and a view whose row stride is not (`tensor_map`).
+#[test]
+fn a_descriptor_of_a_tensor_the_driver_refuses_is_refused_before_the_launch() {
+    let cases = cases();
+    if !has_tma(&cases) {
+        eprintln!("no TMA descriptor in this gate");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let copy = manifest.kernel(&gpu.ctx, "tile_copy", &[], arch).unwrap();
+    let view = manifest.kernel(&gpu.ctx, "tile_copy_view", &[], arch).unwrap();
+    // an address 2 bytes past a 16-byte boundary (a dense view that starts at element 1)
+    let src = gpu.upload(&vec![1u8; (64 * 64 + 8) * 2]);
+    let mut out = gpu.zeros(64 * 64 * 2);
+    let shape = [64usize, 64];
+    let e = copy
+        .launch(
+            &gpu.stream,
+            &mut [
+                TensorRef::<F16>::from_cuda_strided(&src.slice, &shape, &[64, 1], 1).unwrap().into_arg(),
+                TensorMut::<F16>::from_cuda(&mut out.slice, &shape).unwrap().into_arg(),
+            ],
+        )
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::PointerAlignment, "{e}");
+    // rows of 36 f16, 72 bytes
+    let narrow = [64usize, 36];
+    let e = copy
+        .launch(
+            &gpu.stream,
+            &mut [
+                TensorRef::<F16>::from_cuda(&src.slice, &narrow).unwrap().into_arg(),
+                TensorMut::<F16>::from_cuda(&mut out.slice, &narrow).unwrap().into_arg(),
+            ],
+        )
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::TensorMap, "{e}");
+    assert!(e.to_string().contains("multiples of 16 bytes"), "{e}");
+    // a view of 64 columns of a [32, 130] tensor: a row stride of 260 bytes
+    let wide = gpu.upload(&vec![1u8; 32 * 130 * 2]);
+    let cols = [32usize, 64];
+    let e = view
+        .launch(
+            &gpu.stream,
+            &mut [
+                TensorRef::<F16>::from_cuda_strided(&wide.slice, &cols, &[130, 1], 0).unwrap().into_arg(),
+                TensorMut::<F16>::from_cuda(&mut out.slice, &cols).unwrap().into_arg(),
+            ],
+        )
+        .unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::TensorMap, "{e}");
+    assert!(gpu.download(&out).iter().all(|b| *b == 0), "a refused launch wrote");
+    println!(
+        "rust gate: a misaligned descriptor and strides that are not 16 bytes are refused (pointer_alignment, tensor_map)"
+    );
+}
+
+/// Kernels with TMA descriptors captured in a CUDA graph (`unsafe launch_raw` and the safe `launch`, on regions): the graph holds the maps the
+/// capture encoded (of the regions' addresses), by value, and every replay computes Python's bytes.
+#[test]
+fn graph_capture_of_kernels_with_tma_descriptors() {
+    let cases = cases();
+    if !has_tma(&cases) {
+        eprintln!("no TMA descriptor in this gate");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let stream = gpu.stream.cu_stream();
+    for stem in ["tma_matmul", "shift_rows", "tile_copy_view", "gluon_tile_copy"] {
+        let case = cases_where(&cases, |c| c["stem"] == stem).into_iter().last().expect("a case");
+        let kernel = manifest.kernel(&gpu.ctx, stem, &[], arch).unwrap();
+        let mut tensors = tensors_of(&gpu, &case);
+        let last = tensors.len() - 1;
+        let expect = read(&gate_dir().join(case["tensors"][last]["expect"].as_str().unwrap()));
+        type Spec = (Vec<usize>, Option<(Vec<usize>, usize)>, bool);
+        let specs: Vec<Spec> = tensors_json(&case)
+            .iter()
+            .map(|t| {
+                let view = t.get("strides").map(|s| (usizes(s), t["offset"].as_u64().unwrap() as usize));
+                (usizes(&t["shape"]), view, t["role"] == "out")
+            })
+            .collect();
+        gpu.stream.synchronize().unwrap();
+        // SAFETY: the buffers outlive the graph's launches (until the end of this iteration), and nothing else uses them meanwhile.
+        let regions: Vec<DevicePtr<'static>> =
+            unsafe { tensors.iter().map(|(_, b)| gpu.unbound_region(b, b.nbytes())).collect() };
+        for raw in [true, false] {
+            let launch = || {
+                let mut args: Vec<TensorArg<'_>> = Vec::new();
+                for (region, (shape, view, out)) in regions.iter().zip(&specs) {
+                    let access = if *out { Access::Out } else { Access::In };
+                    args.push(match view {
+                        Some((strides, offset)) => {
+                            TensorArg::new_strided(*region, shape, strides, *offset, DType::F16, access)?
+                        }
+                        None => TensorArg::new(*region, shape, DType::F16, access)?,
+                    });
+                }
+                if raw {
+                    // SAFETY: `stream` is the handle of a stream of the kernel's context; the buffers outlive the graph.
+                    unsafe { kernel.launch_raw(stream, &args) }
+                } else {
+                    kernel.launch(&gpu.stream, &mut args)
+                }
+            };
+            capture_and_run(&gpu, &launch, &mut tensors[last].1.slice, &expect);
+        }
+    }
+    println!(
+        "rust gate: four kernels with TMA descriptors captured in CUDA graphs (launch_raw and launch, regions) ran 3 times each and matched Python's replay"
     );
 }
