@@ -1639,14 +1639,16 @@ fn refusals_of_schema_3() {
         )
         .unwrap_err();
     check("a GEMM workspace that is not bytes", e.precondition_kind() == Some(PreconditionKind::Dtype));
-    // 256-byte aligned: a workspace that starts 8 bytes into its slice is not
+    // 256-byte aligned: a workspace that starts 8 bytes into its slice is not (with every byte the algorithm needs, so that only its address is
+    // refused: a pinned algorithm may need the whole allocation)
     let strides = [1usize];
+    let mut padded = gpu.zeros(ws_shape[0] + 8);
     let e = gemm
         .launch(
             s,
             &mut operands!(
                 TensorMut::<Bf16>::from_cuda(&mut out.slice, &out_shape).unwrap().into_arg(),
-                TensorMut::<U8>::from_cuda_strided(&mut workspace, &[ws_shape[0] - 8], &strides, 8).unwrap().into_arg(),
+                TensorMut::<U8>::from_cuda_strided(&mut padded.slice, &ws_shape, &strides, 8).unwrap().into_arg(),
             ),
         )
         .unwrap_err();
