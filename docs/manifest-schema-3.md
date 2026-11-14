@@ -815,11 +815,11 @@ inside it, as a dense tensor has and as torch's `fixSizeOneDimStride` writes). T
 | `alignment` | 16, 32, 64, 128 or 256: the byte alignment every pointer has and the backend tensors declare |
 | `workspace_bytes` | int from 1 to 2^40: the limit the pin was chosen under, the size a launch provides, and what a legacy call is given |
 | `choice` | how the pin was chosen: `"v7"` (a legacy pin), `"instant"` or `"mode_b"` (a backend pin), or `"imported"` (either) |
-| `pin` | `{"api": "legacy", "algo": a}` with `a` a `cudnnConvolutionFwdAlgo_t` (0 to 7), or `{"api": "backend", "engine": e, "knobs": [[t, v], ...]}` with `e` an engine's global index (from 0), `t` a knob type (0 to 42) and `v` an int64, the pairs sorted by type, each type once |
+| `pin` | `{"api": "legacy", "algo": a}` with `a` a `cudnnConvolutionFwdAlgo_t` (0 to 7), or `{"api": "backend", "engine": e, "knobs": [[t, v], ...]}` with `e` an engine's global index (from 0), `t` a knob type (0 to 42) and `v` an int64 other than -1, the pairs sorted by type, each type once. -1 is cuDNN's "not set" (how a plan's JSON and the heuristic's knob choices show a knob left at the engine's default; no knob of the engines measured takes it as a value, every `CUDNN_ATTR_KNOB_INFO_MINIMUM_VALUE` being 0 or more): a pin leaves such a knob out, so the plan made from it leaves the knob at its default, as the heuristic's did |
 | `cudnn_version` | int >= 1: `cudnnGetVersion()` of the library that chose the pin (`91002` for 9.10.2); it does not tell two builds of one version apart (the canary does) |
 | `sm_count` | int >= 1: the multiprocessor count of the device the pin was chosen on |
 | `sm_count_target` | *optional*: an int from 1 to `sm_count`, the partition the pin was chosen for; set on the engine (`CUDNN_ATTR_ENGINE_SM_COUNT_TARGET`) of a backend pin at every load; on a legacy pin (the legacy API takes no target) only when it was imported |
-| `canary` | *optional* (an entry without one loads as before): `{"seed": s, "y_sha256": h}`, `s` an int from 0 to 2^32 - 1, `h` 64 lowercase hex digits: the sha256 of the bytes of `y` the pin computed at export from the operands of `s` (below). `export` records it with the seed 1 |
+| `canary` | *optional* (an entry without one loads as before): `{"seed": s, "y_digest": d}`, `s` an int from 0 to 2^32 - 1, `d` 32 lowercase hex digits: the digest of the `y` the pin computed at export from the operands of `s`, both made on the device (below). `export` records it with the seed 1. The first form of the field, `{"seed", "y_sha256"}` (host-made operands, a host sha256), is refused: export the manifest again |
 
 **How the pin is chosen** (`@tilefish.library(..., impl="cudnn.conv_fwd", api=..., heuristic=...)`, `python/src/tilefish/_conv.py`):
 
@@ -828,7 +828,7 @@ inside it, as a dense tensor has and as torch's `fixSizeOneDimStride` writes). T
 | `"v7"` (legacy; the default of `api="legacy"`) | `cudnnGetConvolutionForwardAlgorithm_v7`, all of its answers, and the first whose status is `CUDNN_STATUS_SUCCESS`, whose determinism is `CUDNN_DETERMINISTIC` and whose `cudnnGetConvolutionForwardWorkspaceSize` is at most `workspace_bytes` |
 | `"instant"` (backend; the default of `api="backend"`) | what torch 2.9 asks with `torch.backends.cudnn.deterministic = True` and `benchmark = False` (`Conv_v8.cpp`, `get_configs_from_heuristics`): the engine configurations of the heuristic in `CUDNN_HEUR_MODE_INSTANT`, then those of `CUDNN_HEUR_MODE_FALLBACK`, each filtered as torch filters them (no numerical note `NONDETERMINISTIC` or `DOWN_CONVERT_INPUTS`; for the math `"fma"` none with `TENSOR_CORE`, torch's `allow_tf32 = False`), and the first whose execution plan finalizes and needs at most `workspace_bytes`. The pin is that configuration's engine and every knob choice of it; the plan made again from the pin must have the heuristic's own plan's `CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION` (which names the engine and every knob, the default ones as -1), or nothing is pinned |
 | `"mode_b"` (backend) | the same with `CUDNN_HEUR_MODE_B` first (torch's `TORCH_CUDNN_USE_HEURISTIC_MODE_B`) |
-| `"imported"` | the declaration's `algos=` (`tilefish.CudnnTable(arch, sm_count, cudnn_version, {(n, c, k, input, filter, stride, padding, dilation, groups): pin})`, a pin being an int for the legacy API or `{"engine": e, "knobs": {t: v}}` for the backend) gives it; cuDNN is not asked; a device no table is for is refused at the build. The rows the declaration uses are in its canonical declaration |
+| `"imported"` | the declaration's `algos=` (`tilefish.CudnnTable(arch, sm_count, cudnn_version, {(n, c, k, input, filter, stride, padding, dilation, groups): pin})`, a pin being an int for the legacy API or `{"engine": e, "knobs": {t: v}}` for the backend) gives it; cuDNN is not asked; a device no table is for is refused at the build. A knob of the value -1 in a table's pin (not set) is dropped, so a table with it and one without give one pin and one digest. The rows the declaration uses are in its canonical declaration |
 
 The canonical declaration (format 1) has the name, `impl`, `acc`, `workspace_bytes`, the signature, `layout`, `stride`, `padding`, `dilation`, `groups`,
 `math`, `api`, `heuristic`, `alignment`, `sm_count_target` when it has one, and the tables' rows; an entry's `declaration_digest` adds its `sm_count`.
@@ -849,19 +849,34 @@ checks of the pin; then the canary, when the entry has one. A Rust host on a par
 chosen for `P` SMs (its `sm_count_target`, or its `sm_count` without one), as for a GEMM.
 
 **The canary.** Two builds of one cuDNN version (the PyPI wheel and the system package of 9.13.0.50, say) answer the same `cudnnGetVersion()` and map
-other engine libraries. So `export` runs each pin once more, on operands made of a seed, and records the sha256 of the bytes of `y`; a replay (Python, at the
+other engine libraries. So `export` runs each pin once more, on operands made of a seed, and records the digest of its `y`; a replay (Python, at the
 first replay of the entry in the process and device: `tilefish._conv.check_canary`) and the crate's load (`Manifest::conv`, once per context) run it
-again before the pin is used, and refuse the pin when the bytes differ ("the canary of the cuDNN convolution ... gives y with sha256 ... here, and the
-manifest recorded ..."). A Python replay inside a CUDA graph capture that would run a canary is refused ("run it once before the capture"). The
-operands (`tilefish._conv.canary_operands`, the crate's `canary_operands`, the same bytes: `python_conv.rs` holds them to Python's): `x` and `w` are
-dense in the layout, of `n * c * prod(input)` and `k * (c / groups) * prod(filter)` elements of the data type, little-endian; each is SHA-256 in counter
-mode, block `j` (from 0) the digest of the bytes `tilefish.conv.canary\0`, the seed (8 bytes little-endian), a tag (one byte: 0 for `x`, 1 for `w`) and
-`j` (8 bytes little-endian), the blocks concatenated and cut to the size; then the most significant byte `b` of each element becomes, for f16
-(`s eeeee mm`), `(b & 0x80) | ((7 + ((b >> 2) & 7)) << 2) | (b & 3)` (an exponent field of 7 to 14: magnitudes in [2^-8, 1)), and for bf16 and f32
-(`s eeeeeee`), `(b & 0x80) | (55 + (b & 7))` (exponents 110 to 125: magnitudes in [2^-17, 2^-1)): finite, normal numbers of many magnitudes and both
-signs, whose sums round by their order. `y` (`n * k * prod(output)` elements) and the workspace start zeroed. **The canary runs on a stream of its own**
-(torch's pool, `ctx.new_stream()` in Rust: non-blocking, ordered with no other stream): the copies of the operands, the zeroing, the workspace, the
-convolution and the copy of `y` back, which waits for that stream alone. It never uses the NULL stream, which a CUDA green context does not order
+again before the pin is used, and refuse the pin when the digest differs ("the canary of the cuDNN convolution ... gives y with digest ... here, and the
+manifest recorded ..."). A Python replay inside a CUDA graph capture that would run a canary is refused ("run it once before the capture").
+
+**The canary's operands and digest are made on the device**, by two kernels of one PTX module, the same text in both hosts (Python's
+`tilefish._canary.CANARY_PTX`, the crate's `src/canary.ptx`; a test holds them equal), which the driver compiles for the device it is loaded on (PTX for
+sm_70 and later: no compiler on the host). `mix(v)` is splitmix64's finalizer of `v + 0x9E3779B97F4A7C15` (modulo 2^64). `x` and `w` are dense in
+the layout, of `n * c * prod(input)` and `k * (c / groups) * prod(filter)` elements of the data type, little-endian; element `i` of an operand (tag 0
+for `x`, 1 for `w`) is made of `h = mix(base + i)`, `base = mix(2 * seed + tag)`: its low 16 bits (f16, bf16) or 32 bits (f32), with the most
+significant byte `b` of the element becoming, for f16 (`s eeeee mm`), `(b & 0x80) | ((7 + ((b >> 2) & 7)) << 2) | (b & 3)` (an exponent field of 7
+to 14: magnitudes in [2^-8, 1)), and for bf16 and f32 (`s eeeeeee`), `(b & 0x80) | (55 + (b & 7))` (exponents 110 to 125: magnitudes in [2^-17,
+2^-1)): finite, normal numbers of many magnitudes and both signs, whose sums round by their order. `y` (`n * k * prod(output)` elements, zero-padded to
+a whole 32-bit word) and the workspace start zeroed. The digest is of all of `y`: its words `w_j` (little-endian), `s1 = sum w_j * (mix(j ^ K1) | 1)`
+and `s2 = sum w_j * (mix(j ^ K2) | 1)` modulo 2^64 with `K1 = 0x243F6A8885A308D3`, `K2 = 0x13198A2E03707344`, written as `s1` then `s2` in 16 lowercase
+hex digits each. A sum does not depend on its order, so the device adds it in any grid (each warp's sums, then an atomic add); a change of one word
+always changes it (the multipliers are odd), of several words with a chance of about 2^-128 to go unseen: the canary still says that this pin, at this
+shape, gives these bytes in this process. Only the 16 bytes of the sums cross to the host. `tilefish._canary.canary_bytes` / `digest_of` and the crate's
+`canary_bytes` / `canary_digest` are the same computations on the host (references; `python_conv.rs` holds the crate's to Python's, and
+`test_gpu_conv.py` the device's to the host's). **The canary runs on a stream of its own** (torch's pool, `ctx.new_stream()` in Rust: non-blocking,
+ordered with no other stream): the zeroed buffers, the fills, the convolution, the digest and the copy of its sums back, which waits for that stream
+alone.
+
+**What a canary costs.** The first form made the operands on the host (SHA-256 in counter mode) and hashed `y` on the host: for the 743 entries of a
+production-shaped plan set (38 GB of `x` and 38 GB of `y` in all, the largest 169 MB each) a Rust load took 93 s on a B300 MIG slice and 150 s on an
+RTX 5090, of it 64 s / 101 s making the operands, 15 s / 21 s hashing `y` and 8 s / 19 s copying it back (measured per phase, release build, cuDNN
+9.13.0). Made and digested on the device, the same 743 entries load in 1.4 s on the B300 slice and 1.1 s on the RTX 5090 (2.1 s the first time, the driver
+compiling the PTX), against 0.08 s / 0.10 s with no canary; Python gives the same 743 canaries in 1.1 s on each. It never uses the NULL stream, which a CUDA green context does not order
 against another stream (a harness whose copies were on the NULL stream raced the convolution inside a green context). Merging an export into a manifest
 replaces an entry without a canary; two entries whose canaries differ are two binaries (`overwrite=True` to replace). A `cudnn_engines_sha256` of the
 mapped engine libraries is not recorded: hashing them (about 570 MB for 9.10.2) at every load costs seconds in Python and much more in a debug build of
@@ -975,8 +990,9 @@ document tilefish writes next to a build and the host does not read):
   not the convolution's; an `alignment` not one of 16 to 256, or a `pointer_alignment` precondition of another; a `workspace_bytes` out of range; a
   `choice` not of the four, or one whose API is not the pin's; a `pin` that is not exactly one of the two forms (an algorithm above 7, a negative engine, a
   knob type above 42, knobs unsorted or repeated); a `cudnn_version` or `sm_count` that is not a positive int; an `sm_count_target` out of 1..`sm_count`,
-  or on a legacy pin that was not imported; a `canary` that is not exactly `{seed, y_sha256}` (a seed out of 0..2^32 - 1, not an int, or `true`; a
-  digest not 64 lowercase hex digits), `null` included; the shapes of `x`, `w`, `out` not the problem's in the layout under the buckets.
+  or on a legacy pin that was not imported; a `canary` that is not exactly `{seed, y_digest}` (a seed out of 0..2^32 - 1, not an int, or `true`; a
+  digest not 32 lowercase hex digits), `null` included, and the first form `{seed, y_sha256}`; a knob of the value -1 (not set: left out of a pin); the
+  shapes of `x`, `w`, `out` not the problem's in the layout under the buckets.
 * *spec* only, for prebuilt binaries: a `binary` section that is not `{kind, symbol, shared, digests}`; `attrs` not empty; `launch_params` not every arg
   in order; a `block` that is not three ints from 1 to 1024 with product ≤ 1024; a `constexpr` argument.
 
@@ -1073,7 +1089,8 @@ a capture holds them in the kernel node.
 `Conv::launch(&stream, &mut [x, w, out, workspace])` runs it (`launch_raw` with regions captures it). Load refuses, in order: a partition the pin was
 not chosen for, a device of another SM count, `NVIDIA_TF32_OVERRIDE` set, a libcudnn that cannot be opened (cudarc's `cudnn` feature, dynamically loaded:
 opened only when a convolution is loaded, so a manifest without one never opens it), another `cudnnGetVersion()`, a pin that fails the checks of
-section 9.4, and a canary of other bytes (run on a stream of its own; `canary_bytes`, `canary_operands`; `Conv::check_canary` runs it again); it
+section 9.4, and a canary of another digest (made and digested on the device, on a stream of its own; `canary_bytes`, `canary_operands` and
+`canary_digest` are the host references; `Conv::check_canary` runs it again); it
 makes the legacy descriptors or the finalized execution plan once, with the context's cuDNN handle, which every convolution loaded in the context
 shares (`Conv::shares_cudnn_handle`). A launch takes the handle's lock (the handle's stream is its state), sets the stream and runs; the tensors go through the plan of the entry as a GEMM's do, and the workspace through the same checks, with at least
 `Conv::workspace_required()` bytes (the plan's need, or the whole `workspace_bytes` of a legacy pin). `ConvEntry` holds the reading

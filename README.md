@@ -545,9 +545,10 @@ cudnn_version, {(n, c, k, input, filter, stride, padding, dilation, groups): pin
 how it was chosen, the cuDNN version (`cudnnGetVersion()`), the SM count and an `sm_count_target`; `replay` and the Rust host refuse another cuDNN version,
 another SM count and a process with `NVIDIA_TF32_OVERRIDE` set (it changes what cuDNN picks behind the declared math), and vet the pin (a deterministic answer
 of `cudnnGetConvolutionForwardAlgorithm_v7`; an engine of allowed notes whose knobs are in range and whose plan finalizes). Since two builds of one cuDNN
-version answer the same `cudnnGetVersion()`, `export` also records a canary per entry, the sha256 of the pin's output on operands made of a seed, which
-`replay` and the Rust host run again (once, on a stream of their own, never the NULL stream) and refuse when the bytes differ; an entry without one loads as
-before. Every call sets cuDNN's stream to the one it is given. There is no bias (torch's cuDNN convolution adds it with a separate `add_`, as a tilefish
+version answer the same `cudnnGetVersion()`, `export` also records a canary per entry, the digest of the pin's output on operands made of a seed (both
+made on the device by one PTX module in both hosts: 743 production-shaped entries load in 1 to 2 s), which `replay` and the Rust host run again (once,
+on a stream of their own, never the NULL stream) and refuse when the digest differs; an entry without one loads as before. A knob of -1 in an imported pin
+is cuDNN's "not set" and is left out. Every call sets cuDNN's stream to the one it is given. There is no bias (torch's cuDNN convolution adds it with a separate `add_`, as a tilefish
 kernel does).
 
 The `"instant"` pin is `torch.nn.functional.conv1d` / `conv2d` / `conv3d`'s bytes where torch runs cuDNN (`test_gpu_conv.py`: 15 problems, three operand sets,
