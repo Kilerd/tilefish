@@ -134,8 +134,21 @@ pub(crate) fn enqueue_steps(stream: &CudaStream, steps: &[Ready<'_>]) -> Result<
         match step {
             Ready::Kernel(kernel, prepared) => {
                 let mut launch = stream.launch_builder(kernel.function());
-                for value in prepared.params() {
-                    launch.arg(value);
+                for (slot, value) in prepared.params().iter().enumerate() {
+                    match prepared.map_at(slot) {
+                        // a TMA descriptor: the 128 bytes of the map `Kernel::check_with` encoded from the step's binding (a graph holds
+                        // them by value, of the addresses it holds)
+                        Some(map) => {
+                            let bytes = map
+                                .bytes
+                                .as_ref()
+                                .ok_or_else(|| Error::Launch("a tensor map was not encoded".to_owned()))?;
+                            launch.arg(bytes);
+                        }
+                        None => {
+                            launch.arg(value);
+                        }
+                    }
                 }
                 let (grid, block) = (prepared.grid, kernel.plan().block());
                 let config = LaunchConfig {

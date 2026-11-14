@@ -88,6 +88,57 @@ pub fn pointer(slot: usize, name: &str, dtype: &str, access: &str, shape: Value,
     p
 }
 
+/// A TMA descriptor parameter (kind `tensordesc`) of a tensor of `dtype` and `shape` whose slots begin at `slot`, at position `index` of the
+/// declaration, with the map of `block` and `box_shape` (outermost first) and the swizzle `swizzle` (bytes); `view` is `(strides, offset)` of a
+/// descriptor of a view.
+#[allow(clippy::too_many_arguments)]
+pub fn tensordesc(
+    slot: usize,
+    index: usize,
+    name: &str,
+    dtype: &str,
+    access: &str,
+    shape: Value,
+    block: Value,
+    box_shape: Value,
+    swizzle: u32,
+    view: Option<(Value, &str)>,
+) -> Value {
+    let data_type = match dtype {
+        "f16" => "CU_TENSOR_MAP_DATA_TYPE_FLOAT16",
+        "bf16" => "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
+        "f32" => "CU_TENSOR_MAP_DATA_TYPE_FLOAT32",
+        "i32" => "CU_TENSOR_MAP_DATA_TYPE_INT32",
+        "u8" => "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+        other => panic!("no tensor map data type for {other}"),
+    };
+    let rank = shape.as_array().unwrap().len();
+    let swizzle = match swizzle {
+        0 => "CU_TENSOR_MAP_SWIZZLE_NONE",
+        32 => "CU_TENSOR_MAP_SWIZZLE_32B",
+        64 => "CU_TENSOR_MAP_SWIZZLE_64B",
+        _ => "CU_TENSOR_MAP_SWIZZLE_128B",
+    };
+    let mut p = json!({"slot": slot, "index": index, "name": name, "kind": "tensordesc", "type": "tensordesc", "ptx_type": "b8[128]", "size": 128,
+                       "dtype": dtype, "access": access, "shape": shape,
+                       "tensor_map": {"data_type": data_type, "block": block, "box": box_shape, "element_strides": vec![1; rank],
+                                      "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE", "swizzle": swizzle,
+                                      "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_L2_128B", "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"}});
+    if let Some((strides, offset)) = view {
+        p["strides"] = strides;
+        p["offset"] = offset.into();
+    }
+    p
+}
+
+/// The `kernelParams` slots the parameters of an ABI take: a descriptor `1 + 2 * rank`, every other one 1.
+pub fn slots_of(params: &[Value]) -> usize {
+    params
+        .iter()
+        .map(|p| if p["kind"] == "tensordesc" { 1 + 2 * p["shape"].as_array().map_or(0, Vec::len) } else { 1 })
+        .sum()
+}
+
 /// A runtime scalar parameter (`ty` is `i32` or `i64`); `extra` is merged into it (`count_of`, `stride_of`).
 pub fn scalar(slot: usize, name: &str, ty: &str, dim: &str, extra: Value) -> Value {
     let (ptx, size) = if ty == "i64" { ("u64", 8) } else { ("u32", 4) };
@@ -150,7 +201,7 @@ impl Kernel {
         let sha = tilefish::elf::sha256_hex(&cubin);
         let code = tilefish::elf::Elf::parse(&cubin).unwrap().code_digest();
         let triton = kind == "triton";
-        let n = params.len();
+        let n = slots_of(&params); // (the scratch slots follow the slots of the parameters: a descriptor takes 1 + 2 * rank)
         let scratch = if triton {
             json!([{"slot": n, "name": "global_scratch", "type": "u64", "ptx_type": "u64", "size": 8, "value": 0},
                    {"slot": n + 1, "name": "profile_scratch", "type": "u64", "ptx_type": "u64", "size": 8, "value": 0}])

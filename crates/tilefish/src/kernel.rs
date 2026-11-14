@@ -150,8 +150,15 @@ impl Kernel {
 
     /// [`Kernel::check`] of a call that gives the values of the binary's fixed arguments per call (`given`, by name: a prebuilt binary's
     /// `const[i32]` or `const[i64]` with no default; [`Plan::given_names`]).
+    ///
+    /// The `CUtensorMap` of every TMA descriptor parameter is encoded here (`cuTensorMapEncodeTiled`), from the tensor of the call: a launch
+    /// passes the maps of its own tensors, and a launch on a capturing stream is captured with them by value.
     pub fn check_with(&self, tensors: &[TensorArg<'_>], given: &[(&str, i64)]) -> Result<Prepared> {
-        self.plan.prepare_with(tensors, given, Some(&self.loaded.device))
+        let mut prepared = self.plan.prepare_with(tensors, given, Some(&self.loaded.device))?;
+        if !prepared.maps.is_empty() {
+            ffi::encode_tensor_maps(&mut prepared)?;
+        }
+        Ok(prepared)
     }
 
     /// Check the call and launch the kernel on `stream`.
@@ -253,8 +260,9 @@ impl Manifest {
         // the loaded function must take the parameters of the manifest's ABI, with the sizes it says (Python's `_check_params`): a prebuilt
         // binary's ABI is declared by its author, and a function that read more than it was given would read what follows the array
         let reported = ffi::param_sizes(&function)?;
+        // (a TMA descriptor is its 128-byte map, then its shape and its strides, a slot each)
         let expected: Vec<usize> =
-            entry.params.iter().map(Param::size).chain(std::iter::repeat_n(8, entry.scratch_slots)).collect();
+            entry.params.iter().flat_map(Param::slots).chain(std::iter::repeat_n(8, entry.scratch_slots)).collect();
         if reported != expected {
             return Err(Error::Manifest(format!(
                 "{who}: the loaded function '{}' takes parameters of {reported:?} bytes, but the ABI in the manifest says {expected:?}",

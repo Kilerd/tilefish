@@ -36,6 +36,10 @@ pub enum PreconditionKind {
     /// A tensor that may only be read is given for a parameter that the kernel writes. (Only the Rust host has this one: Python's
     /// tensors have no access mode.)
     Access,
+    /// A tensor given for a TMA descriptor parameter is one `cuTensorMapEncodeTiled` refuses: a stride (but the innermost) that is not a
+    /// multiple of 16 bytes or is `2**40` bytes or more, an innermost stride that is not 1, a dimension beyond the `i32` the kernel is given
+    /// it as. (Its address is the descriptor's `pointer_alignment` of 16 bytes.)
+    TensorMap,
 }
 
 impl PreconditionKind {
@@ -56,6 +60,7 @@ impl PreconditionKind {
             Self::Alias => "alias",
             Self::Device => "device",
             Self::Access => "access",
+            Self::TensorMap => "tensor_map",
         }
     }
 }
