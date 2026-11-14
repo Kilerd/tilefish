@@ -10,10 +10,11 @@
 //! a host on a partition the pin was not chosen for, and a pin that is not valid for its problem (a legacy algorithm that
 //! `cudnnGetConvolutionForwardAlgorithm_v7` does not answer as successful and deterministic; an engine whose numerical notes the math does not
 //! allow, whose knobs are not the engine's, or whose plan does not finalize; a workspace above the entry's). Then it runs the entry's canary, when
-//! it has one ([`ConvCanary`]: the sha256 of the bytes the pin computed at export from operands made of a seed, [`canary_operands`]), and refuses
-//! other bytes: two builds of one cuDNN version answer the same `cudnnGetVersion()`. The canary runs on a stream of its own (`ctx.new_stream()`,
-//! non-blocking), with its copies, its zeroed buffers and its frees, never on the NULL stream, which a CUDA green context does not order against
-//! another stream. A launch is [`Conv::launch`] on a cudarc stream, with the checks of [`Kernel::launch`](crate::Kernel::launch) of its tensors and
+//! it has one ([`ConvCanary`]: the digest of the `y` the pin computed at export from operands made of a seed, both made on the device by the kernels
+//! of `canary.ptx`; [`canary_bytes`] and [`canary_digest`] are the host references), and refuses another digest: two builds of one cuDNN version
+//! answer the same `cudnnGetVersion()`. The canary runs on a stream of its own (`ctx.new_stream()`, non-blocking), with its zeroed buffers, its kernels
+//! and its frees, never on the NULL stream, which a CUDA green context does not order against another stream; only the digest's 16 bytes cross to the
+//! host. A launch is [`Conv::launch`] on a cudarc stream, with the checks of [`Kernel::launch`](crate::Kernel::launch) of its tensors and
 //! the workspace as the last tensor, or `unsafe` [`Conv::launch_raw`], which is how it is captured in a CUDA graph (measured with both APIs: a
 //! capture works even when nothing of cuDNN has run in the process before). Every call sets the handle's stream to its own right before it runs.
 
@@ -454,13 +455,14 @@ pub struct ConvEntry {
     pub canary: Option<ConvCanary>,
 }
 
-/// The canary of a convolution entry: the sha256 of the bytes of `y` its pin computed at export from the operands of `seed` ([`canary_operands`]).
+/// The canary of a convolution entry: the digest ([`canary_digest`]) of the `y` its pin computed at export from the operands of `seed`
+/// ([`canary_bytes`]), both made on the device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvCanary {
     /// The seed of the operands (0 to 2^32 - 1).
     pub seed: u64,
-    /// The sha256 of the bytes of `y`, 64 lowercase hex digits.
-    pub y_sha256: String,
+    /// The digest of `y`, 32 lowercase hex digits.
+    pub y_digest: String,
 }
 
 impl ConvEntry {
@@ -746,11 +748,7 @@ impl ConvEntry {
         }
         let canary = match &raw.canary {
             None => None,
-            Some(v) => Some(canary_of(v).ok_or_else(|| {
-                format!(
-                    "canary is absent or {{\"seed\": an int from 0 to 2**32 - 1, \"y_sha256\": 64 lowercase hex digits}}, got {v}"
-                )
-            })?),
+            Some(v) => Some(canary_of(v)?),
         };
         if !is_digest(&raw.declaration_digest) {
             return Err(format!(
@@ -892,60 +890,107 @@ impl ConvEntry {
     }
 }
 
-/// The canary of an entry: an object of exactly `seed` and `y_sha256`.
-fn canary_of(v: &Value) -> Option<ConvCanary> {
-    let map = v.as_object().filter(|m| m.len() == 2)?;
-    let seed = map.get("seed")?.as_u64().filter(|s| *s <= MAX_CANARY_SEED)?;
-    let y_sha256 = map.get("y_sha256")?.as_str().filter(|h| is_digest(h))?;
-    Some(ConvCanary { seed, y_sha256: y_sha256.to_owned() })
+/// The canary of an entry: an object of exactly `seed` and `y_digest`.
+fn canary_of(v: &Value) -> std::result::Result<ConvCanary, String> {
+    let bad = || {
+        format!(
+            "canary is absent or {{\"seed\": an int from 0 to 2**32 - 1, \"y_digest\": 32 lowercase hex digits}}, got {v}"
+        )
+    };
+    let map = v.as_object().ok_or_else(bad)?;
+    if map.contains_key("y_sha256") {
+        return Err(
+            "a canary of tilefish's first form ('y_sha256': host-made operands, a host sha256) is no longer read: export the manifest again"
+                .to_owned(),
+        );
+    }
+    if map.len() != 2 {
+        return Err(bad());
+    }
+    let seed = map.get("seed").and_then(Value::as_u64).filter(|s| *s <= MAX_CANARY_SEED).ok_or_else(bad)?;
+    let digest = map.get("y_digest").and_then(Value::as_str).filter(|h| is_digest32(h)).ok_or_else(bad)?;
+    Ok(ConvCanary { seed, y_digest: digest.to_owned() })
 }
 
-// -- the canary's operands -------------------------------------------------------------------------------------------------------------
+fn is_digest32(h: &str) -> bool {
+    h.len() == 32 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
-/// The prefix of the canary's SHA-256 blocks.
-const CANARY_PREFIX: &[u8] = b"tilefish.conv.canary\0";
+// -- the canary: its operands and its digest -----------------------------------------------------------------------------------------
+
+/// The PTX of the canary's kernels (the operands and the digest), the same text as Python's `tilefish._canary.CANARY_PTX`: the driver compiles
+/// it for the device it is loaded on.
+const CANARY_PTX: &str = include_str!("canary.ptx");
 const MAX_CANARY_SEED: u64 = (1 << 32) - 1;
+const CANARY_BLOCK: u32 = 256;
+const CANARY_FILL_BLOCKS: u64 = 65535;
+const CANARY_DIGEST_BLOCKS: u64 = 1024;
+const MIX_GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+const DIGEST_K1: u64 = 0x243F_6A88_85A3_08D3;
+const DIGEST_K2: u64 = 0x1319_8A2E_0370_7344;
 
-/// What the most significant byte of an element becomes (Python's `tilefish._conv._top_byte_table`): f16 (`s eeeee mm`) an exponent field of 7 to 14,
-/// bf16 and f32 (`s eeeeeee`) exponents 110 to 125; the sign and the low bits stay.
-fn canary_top_byte(dtype: DType, b: u8) -> u8 {
+/// splitmix64's finalizer of `v + 0x9E3779B97F4A7C15` (wrapping), the mix of the canary's kernels.
+fn mix64(v: u64) -> u64 {
+    let mut z = v.wrapping_add(MIX_GOLDEN);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The base of a canary operand's elements: `mix(2 * seed + tag)`.
+fn canary_base(seed: u64, tag: u8) -> u64 {
+    mix64(2 * seed + u64::from(tag))
+}
+
+/// The most significant byte of a canary element: f16 an exponent field of 7 to 14, bf16 and f32 exponents 110 to 125; the sign and the low bits stay.
+fn canary_top_byte(dtype: DType, b: u32) -> u32 {
     match dtype {
         DType::F16 => (b & 0x80) | ((7 + ((b >> 2) & 7)) << 2) | (b & 3),
         _ => (b & 0x80) | (55 + (b & 7)),
     }
 }
 
-/// The bytes of a canary operand of `elements` elements of `dtype` (f16, bf16 or f32; little-endian, in memory order), as Python's
-/// `tilefish._conv.canary_bytes` makes them: SHA-256 in counter mode, block `j` the digest of the prefix `tilefish.conv.canary\0`, `seed` (8 bytes
-/// little-endian), `tag` (1 byte: 0 for `x`, 1 for `w`) and `j` (8 bytes little-endian), cut to the size, the most significant byte of each element
-/// put in a range of exponents (finite, normal, many orders of magnitude: sums whose rounding depends on their order).
+/// The first `elements` elements of a canary operand of `dtype` (f16, bf16 or f32; tag 0 for `x`, 1 for `w`), little-endian, made on the host: what
+/// the fill kernel of `canary.ptx` makes on the device (Python's `tilefish._canary.canary_bytes`). Element `i` is made of `h = mix(base + i)`, `base =
+/// mix(2 * seed + tag)`: its low 16 bits (f16, bf16) or 32 bits (f32), the most significant byte put in a range of exponents (finite, normal, many
+/// orders of magnitude: sums whose rounding depends on their order). A reference, for the tests.
 pub fn canary_bytes(dtype: DType, seed: u64, tag: u8, elements: u64) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    let size = dtype.size();
-    let count = elements as usize * size;
-    let mut base = Sha256::new();
-    base.update(CANARY_PREFIX);
-    base.update(seed.to_le_bytes());
-    base.update([tag]);
-    let mut out = Vec::with_capacity(count.div_ceil(32) * 32);
-    for j in 0..count.div_ceil(32) as u64 {
-        let mut h = base.clone();
-        h.update(j.to_le_bytes());
-        out.extend_from_slice(&h.finalize());
-    }
-    out.truncate(count);
-    for b in out.iter_mut().skip(size - 1).step_by(size) {
-        *b = canary_top_byte(dtype, *b);
+    let first = canary_base(seed, tag);
+    let mut out = Vec::with_capacity(elements as usize * dtype.size());
+    for i in 0..elements {
+        let h = mix64(first.wrapping_add(i));
+        if dtype == DType::F32 {
+            let r = h as u32;
+            out.extend_from_slice(&((canary_top_byte(dtype, r >> 24) << 24) | (r & 0x00FF_FFFF)).to_le_bytes());
+        } else {
+            let r = (h & 0xFFFF) as u32;
+            out.extend_from_slice(&(((canary_top_byte(dtype, r >> 8) << 8) | (r & 0xFF)) as u16).to_le_bytes());
+        }
     }
     out
 }
 
-/// The bytes of the canary's `x` and `w` for `problem`, dense in its layout (Python's `tilefish._conv.canary_operands`).
+/// The canary's `x` and `w` for `problem`, dense in its layout, made on the host (a reference: Python's `tilefish._conv.canary_operands`).
 pub fn canary_operands(problem: &ConvProblem, seed: u64) -> (Vec<u8>, Vec<u8>) {
     (
         canary_bytes(problem.dtype, seed, 0, problem.x_dims().iter().product()),
         canary_bytes(problem.dtype, seed, 1, problem.w_dims().iter().product()),
     )
+}
+
+/// The canary's digest of `y`'s bytes, on the host: what the digest kernel of `canary.ptx` adds on the device (Python's `tilefish._canary.digest_of`).
+/// The bytes as 32-bit little-endian words `w_j` (zero-padded to a whole word), `s1 = sum w_j * (mix(j ^ K1) | 1)` and `s2 = sum w_j * (mix(j ^ K2) |
+/// 1)` modulo 2^64, written as 16 lowercase hex digits each: a sum that does not depend on its order, which one changed word always changes.
+pub fn canary_digest(bytes: &[u8]) -> String {
+    let (mut s1, mut s2) = (0u64, 0u64);
+    for (j, chunk) in bytes.chunks(4).enumerate() {
+        let mut word = [0u8; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let w = u64::from(u32::from_le_bytes(word));
+        s1 = s1.wrapping_add(w.wrapping_mul(mix64(j as u64 ^ DIGEST_K1) | 1));
+        s2 = s2.wrapping_add(w.wrapping_mul(mix64(j as u64 ^ DIGEST_K2) | 1));
+    }
+    format!("{s1:016x}{s2:016x}")
 }
 
 // -- loading ------------------------------------------------------------------------------------------------------------------
@@ -971,8 +1016,17 @@ enum Engine {
 #[derive(Debug)]
 struct SharedHandle {
     handle: Mutex<Handle>,
+    /// The canary's kernels in the context, loaded at its first canary (the driver compiles `canary.ptx`).
+    canary: std::sync::OnceLock<CanaryKernels>,
     /// The context the handle was made in, alive as long as the handle.
     _context: Arc<CudaContext>,
+}
+
+/// The kernels of `canary.ptx` in one context.
+#[derive(Debug)]
+struct CanaryKernels {
+    fill: cudarc::driver::CudaFunction,
+    digest: cudarc::driver::CudaFunction,
 }
 
 /// The shared handle of each context that has one alive, by the address of its `CUcontext` (an entry whose handle is gone is replaced; one that is
@@ -987,7 +1041,11 @@ fn shared_handle(ctx: &Arc<CudaContext>) -> Result<Arc<SharedHandle>> {
     if let Some(found) = handles.iter().find(|(k, _)| *k == key).and_then(|(_, weak)| weak.upgrade()) {
         return Ok(found);
     }
-    let shared = Arc::new(SharedHandle { handle: Mutex::new(Handle::new(ctx)?), _context: Arc::clone(ctx) });
+    let shared = Arc::new(SharedHandle {
+        handle: Mutex::new(Handle::new(ctx)?),
+        canary: std::sync::OnceLock::new(),
+        _context: Arc::clone(ctx),
+    });
     handles.push((key, Arc::downgrade(&shared)));
     Ok(shared)
 }
@@ -995,6 +1053,19 @@ fn shared_handle(ctx: &Arc<CudaContext>) -> Result<Arc<SharedHandle>> {
 impl SharedHandle {
     fn lock(&self) -> std::sync::MutexGuard<'_, Handle> {
         self.handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The canary's kernels, loaded in the context at the first call (under the handle's lock, as every canary is).
+    fn canary_kernels(&self, ctx: &Arc<CudaContext>) -> Result<&CanaryKernels> {
+        if let Some(kernels) = self.canary.get() {
+            return Ok(kernels);
+        }
+        let module = ctx
+            .load_module(cudarc::nvrtc::Ptx::from_src(CANARY_PTX))
+            .map_err(Error::driver("cuModuleLoadData(canary.ptx)"))?;
+        let fill = module.load_function("tilefish_canary_fill").map_err(Error::driver("cuModuleGetFunction"))?;
+        let digest = module.load_function("tilefish_canary_digest").map_err(Error::driver("cuModuleGetFunction"))?;
+        Ok(self.canary.get_or_init(|| CanaryKernels { fill, digest }))
     }
 }
 
@@ -1218,7 +1289,7 @@ fn load(entry: &ConvEntry, ctx: &Arc<CudaContext>) -> Result<LoadedConv> {
     };
     if let Some(canary) = &entry.canary {
         let mine = CanaryOf { who: &who, pin: &entry.pin, cudnn_version: entry.cudnn_version, problem, required };
-        check_canary(ctx, &handle, &engine, &mine, canary)?;
+        check_canary(ctx, &shared, &handle, &engine, &mine, canary)?;
     }
     drop(handle);
     Ok(LoadedConv {
@@ -1252,23 +1323,24 @@ struct CanaryOf<'a> {
     required: u64,
 }
 
-/// Run a canary ([`run_canary`]) and refuse other bytes.
+/// Run a canary ([`run_canary`]) and refuse another digest.
 fn check_canary(
     ctx: &Arc<CudaContext>,
+    shared: &SharedHandle,
     handle: &Handle,
     engine: &Engine,
     of: &CanaryOf<'_>,
     canary: &ConvCanary,
 ) -> Result<()> {
-    let got = run_canary(ctx, handle, engine, of.required, of.problem, canary.seed)?;
-    if got != canary.y_sha256 {
+    let got = run_canary(ctx, shared, handle, engine, of.required, of.problem, canary.seed)?;
+    if got != canary.y_digest {
         return Err(Error::Manifest(format!(
-            "the canary of the cuDNN convolution {} ({}) gives y with sha256 {got} here, and the manifest recorded {} (seed {}): this process's \
+            "the canary of the cuDNN convolution {} ({}) gives y with digest {got} here, and the manifest recorded {} (seed {}): this process's \
              cuDNN (version {} too) or this device runs other kernels for the pin, so it is refused; export the manifest again with this cuDNN \
              build, or run with the build that made it",
             of.who,
             of.pin.what(),
-            canary.y_sha256,
+            canary.y_digest,
             canary.seed,
             of.cudnn_version
         )));
@@ -1276,49 +1348,76 @@ fn check_canary(
     Ok(())
 }
 
-/// Run the canary of a loaded pin: its `y` from the operands of `seed`, and the sha256 of its bytes (hex).
+/// Run the canary of a loaded pin (under the handle's lock): its operands made of `seed` by the fill kernel, its `y`, and the digest of `y` by the
+/// digest kernel (`canary.ptx`), whose 16 bytes are all that crosses to the host.
 ///
 /// Everything is on a stream made for it (`ctx.new_stream()`: non-blocking, ordered with no other stream, the NULL stream included, which a green
-/// context does not order against another stream): the copies of the operands, the zeroed `y` and workspace, the convolution, the copy of `y` back
-/// (which waits for that stream alone) and the frees.
+/// context does not order against another stream): the zeroed buffers, the two fills, the convolution, the digest, the copy of the digest back (which
+/// waits for that stream alone) and the frees.
 #[allow(unsafe_code)]
 fn run_canary(
     ctx: &Arc<CudaContext>,
+    shared: &SharedHandle,
     handle: &Handle,
     engine: &Engine,
     required: u64,
     problem: &ConvProblem,
     seed: u64,
 ) -> Result<String> {
-    use cudarc::driver::DevicePtr;
-    use sha2::{Digest, Sha256};
+    use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+    let kernels = shared.canary_kernels(ctx)?;
     let stream = ctx.new_stream().map_err(Error::driver("cuStreamCreate"))?;
-    let (x_host, w_host) = canary_operands(problem, seed);
-    let y_bytes = problem.y_dims().iter().product::<u64>() as usize * problem.dtype.size();
-    let x = stream.clone_htod(&x_host).map_err(Error::driver("cuMemcpyHtoDAsync"))?;
-    let w = stream.clone_htod(&w_host).map_err(Error::driver("cuMemcpyHtoDAsync"))?;
-    let mut y = stream.alloc_zeros::<u8>(y_bytes).map_err(Error::driver("cuMemAllocAsync"))?;
-    let mut workspace = if required > 0 {
-        Some(stream.alloc_zeros::<u8>(required as usize).map_err(Error::driver("cuMemAllocAsync"))?)
-    } else {
-        None
+    let size = problem.dtype.size() as u64;
+    let kind: u32 = match problem.dtype {
+        DType::F16 => 0,
+        DType::Bf16 => 1,
+        _ => 2,
     };
+    let x_elements: u64 = problem.x_dims().iter().product();
+    let w_elements: u64 = problem.w_dims().iter().product();
+    let y_bytes = (problem.y_dims().iter().product::<u64>() * size).div_ceil(4) * 4;
+    let alloc = |bytes: u64| stream.alloc_zeros::<u8>(bytes as usize).map_err(Error::driver("cuMemAllocAsync"));
+    let x = alloc(x_elements * size)?;
+    let w = alloc(w_elements * size)?;
+    let mut y = alloc(y_bytes)?;
+    let mut workspace = if required > 0 { Some(alloc(required)?) } else { None };
+    let mut sums = stream.alloc_zeros::<u64>(2).map_err(Error::driver("cuMemAllocAsync"))?;
     {
-        use cudarc::driver::DevicePtrMut;
         let (x_ptr, _x) = x.device_ptr(&stream);
         let (w_ptr, _w) = w.device_ptr(&stream);
         let (y_ptr, _y) = y.device_ptr_mut(&stream);
+        let (sums_ptr, _sums) = sums.device_ptr_mut(&stream);
         let ws = workspace.as_mut().map(|s| s.device_ptr_mut(&stream));
+        let blocks = |count: u64, most: u64| LaunchConfig {
+            grid_dim: (count.div_ceil(u64::from(CANARY_BLOCK)).clamp(1, most) as u32, 1, 1),
+            block_dim: (CANARY_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        for (ptr, elements, tag) in [(x_ptr, x_elements, 0u8), (w_ptr, w_elements, 1u8)] {
+            let base = canary_base(seed, tag);
+            let mut launch = stream.launch_builder(&kernels.fill);
+            launch.arg(&ptr).arg(&elements).arg(&base).arg(&kind);
+            // SAFETY: the kernel's parameters are (u64 address, u64 count, u64 base, u32 kind), as pushed; the address is a slice of this context of
+            // `elements` elements of the data type, alive until the copy back below has waited for the stream.
+            unsafe { launch.launch(blocks(elements, CANARY_FILL_BLOCKS)) }
+                .map_err(Error::driver("cuLaunchKernel(tilefish_canary_fill)"))?;
+        }
         let call = ConvCall { x: x_ptr, w: w_ptr, out: y_ptr, workspace: ws.as_ref().map_or(0, |(p, _)| *p) };
         ctx.bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
         // SAFETY: the stream is a live stream of the handle's context, current on this thread; the addresses are slices of that context made above with
         // the sizes of the problem (and the workspace with what the pin needs), alive until the copy back below has waited for the stream.
         unsafe { run_engine(handle, engine, required, stream.cu_stream(), &call) }?;
+        let words = y_bytes / 4;
+        let mut launch = stream.launch_builder(&kernels.digest);
+        launch.arg(&y_ptr).arg(&words).arg(&sums_ptr);
+        // SAFETY: the kernel's parameters are (u64 address, u64 count, u64 address), as pushed; `y` holds `words` words (zero-padded), `sums` two
+        // zeroed u64, both slices of this context alive until the copy back below has waited for the stream.
+        unsafe { launch.launch(blocks(words, CANARY_DIGEST_BLOCKS)) }
+            .map_err(Error::driver("cuLaunchKernel(tilefish_canary_digest)"))?;
     }
-    let host = stream.clone_dtoh(&y).map_err(Error::driver("cuMemcpyDtoHAsync"))?;
-    drop((x, w, y, workspace));
-    let digest = Sha256::digest(&host);
-    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+    let host = stream.clone_dtoh(&sums).map_err(Error::driver("cuMemcpyDtoHAsync"))?;
+    drop((x, w, y, workspace, sums));
+    Ok(format!("{:016x}{:016x}", host[0], host[1]))
 }
 
 /// Run a pin on `stream`: set the handle's stream, then the legacy call (given `required` bytes of workspace, the entry's whole limit, when it has
@@ -1441,7 +1540,7 @@ impl Conv {
             problem: &loaded.problem,
             required: loaded.required,
         };
-        check_canary(&loaded.context, &handle, loaded.engine(), &of, canary)
+        check_canary(&loaded.context, &loaded.handle, &handle, loaded.engine(), &of, canary)
     }
 
     /// Whether this convolution and `other` run with one cuDNN handle: every convolution loaded in one CUDA context does, from any manifest.

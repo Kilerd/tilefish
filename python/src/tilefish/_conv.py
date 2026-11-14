@@ -20,10 +20,10 @@ records the cuDNN version, the SM count of the device (and ``sm_count_target`` f
 another device and a process with ``NVIDIA_TF32_OVERRIDE`` set.
 
 **A canary.** ``cudnnGetVersion()`` does not tell two builds of one version apart, and they may map other engine libraries. So ``export`` records a
-canary in each entry, ``{"seed": s, "y_sha256": h}``: the sha256 of the bytes of ``y`` the pin computes from operands made of the seed
-(:func:`canary_operands`) at the entry's shape. A replay runs it once per process and device before the pin is used, on a stream of its own with its copies
-on that stream (never the NULL stream, which a green context does not order against another stream), and refuses the pin when the bytes differ. The field
-is optional: an entry without one loads as before.
+canary in each entry, ``{"seed": s, "y_digest": d}``: the digest of the ``y`` the pin computes from operands made of the seed at the entry's shape, both
+made on the device (:mod:`tilefish._canary`: a PTX module, the same in both hosts). A replay runs it once per process and device before the pin is
+used, on a stream of its own (never the NULL stream, which a green context does not order against another stream), and refuses the pin when the digest
+differs. The field is optional: an entry without one loads as before.
 
 The math is part of the declaration: 16-bit data takes ``"tensor_op"`` (the default) or ``"fma"``; f32 data must say ``"fma"`` (TF32 off) or
 ``"tf32"`` (TF32 on). See ``docs/manifest-schema-3.md``, section 9.4.
@@ -31,11 +31,11 @@ The math is part of the declaration: 16-bit data takes ``"tensor_op"`` (the defa
 
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import itertools
 import json
 import math
+import re
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -62,46 +62,22 @@ ENTRY_KEYS = (
 OPTIONAL_COUNT_FIELDS = ("sm_count_target",)
 OPTIONAL_FIELDS = (*OPTIONAL_COUNT_FIELDS, "canary")
 CANARY_SEED = 1  # the seed export records
-CANARY_PREFIX = b"tilefish.conv.canary\x00"
 MAX_CANARY_SEED = (1 << 32) - 1
+_DIGEST32 = re.compile(r"^[0-9a-f]{32}\Z")
 _ARCH_LEN = (2, 3)
 _ELEMENT_BYTES = {"f16": 2, "bf16": 2, "f32": 4}
 
 
-# -- the canary's operands ------------------------------------------------------------------------------------------------------------------------
-
-
-def _top_byte_table(dtype: str) -> bytes:
-    """What the most significant byte of each element becomes: the sign and the low bits stay, the exponent is put in a range. f16 (``s eeeee mm``):
-    an exponent field of 7 to 14, magnitudes in [2**-8, 1). bf16 and f32 (``s eeeeeee``, the exponent's high 7 bits; its low bit is the top bit of the next
-    byte): exponents 110 to 125, magnitudes in [2**-17, 2**-1). Finite, normal, and many orders of magnitude: sums whose rounding depends on their order."""
-    if dtype == "f16":
-        return bytes((b & 0x80) | ((7 + ((b >> 2) & 7)) << 2) | (b & 3) for b in range(256))
-    return bytes((b & 0x80) | (55 + (b & 7)) for b in range(256))
-
-
-_TOP_BYTE = {dtype: _top_byte_table(dtype) for dtype in _ELEMENT_BYTES}
-
-
 def canary_bytes(dtype: str, seed: int, tag: int, elements: int) -> bytes:
-    """The bytes of a canary operand of ``elements`` elements of ``dtype`` (little-endian, in memory order): SHA-256 in counter mode, block ``j`` the digest
-    of ``CANARY_PREFIX + seed (8 bytes LE) + tag (1 byte: 0 for x, 1 for w) + j (8 bytes LE)``, the blocks concatenated and cut to the size, and the most
-    significant byte of each element mapped by :func:`_top_byte_table`. The Rust host makes the same bytes (``tilefish::canary_bytes``)."""
-    size = _ELEMENT_BYTES[dtype]
-    count = elements * size
-    base = hashlib.sha256(CANARY_PREFIX + seed.to_bytes(8, "little") + bytes([tag]))
-    blocks = []
-    for j in range((count + 31) // 32):
-        h = base.copy()
-        h.update(j.to_bytes(8, "little"))
-        blocks.append(h.digest())
-    raw = bytearray(b"".join(blocks)[:count])
-    raw[size - 1 :: size] = raw[size - 1 :: size].translate(_TOP_BYTE[dtype])
-    return bytes(raw)
+    """The first ``elements`` elements of a canary operand (tag 0: ``x``, 1: ``w``), made on the host: what the device makes (:mod:`tilefish._canary`).
+    A reference for the tests: slow for large operands."""
+    from . import _canary
+
+    return _canary.canary_bytes(dtype, seed, tag, elements)
 
 
 def canary_operands(problem: Any, seed: int) -> "tuple[bytes, bytes]":
-    """The bytes of the canary's ``x`` and ``w`` for ``problem`` (a :class:`tilefish._cudnn.Problem`), dense in its layout."""
+    """The canary's ``x`` and ``w`` for ``problem`` (a :class:`tilefish._cudnn.Problem`), dense in its layout, made on the host (a reference)."""
     return (
         canary_bytes(problem.dtype, seed, 0, math.prod(problem.x_dims)),
         canary_bytes(problem.dtype, seed, 1, math.prod(problem.w_dims)),
@@ -609,7 +585,7 @@ class BuiltConv:
     pin: Any  # tilefish._cudnn.LegacyPin | EnginePin
     cudnn_version: int
     sm_count: int
-    canary: "dict[str, Any] | None" = None  # {"seed": s, "y_sha256": h}: made by export, checked by a replay
+    canary: "dict[str, Any] | None" = None  # {"seed": s, "y_digest": d}: made by export, checked by a replay
 
     @property
     def stem(self) -> str:
@@ -686,7 +662,7 @@ def build_conv(spec: ConvSpec, *, arch: "int | str", device_index: "int | None" 
         raise TilefishBuildError(f"cannot pin '{spec.stem}' on sm_{cap}: {source} pin is refused: {e}") from e
     made = None
     if canary:
-        made = {"seed": CANARY_SEED, "y_sha256": canary_digest(spec, pin, CANARY_SEED, index)}
+        made = {"seed": CANARY_SEED, "y_digest": canary_digest(spec, pin, CANARY_SEED, index)}
     return BuiltConv(spec, f"sm_{cap}", pin, version, sms, made)
 
 
@@ -696,29 +672,36 @@ def _run_target(spec: ConvSpec, pin: Any) -> "int | None":
 
 
 def canary_digest(spec: ConvSpec, pin: Any, seed: int, device_index: int) -> str:
-    """The sha256 (hex) of the bytes of ``y`` the pin computes from the canary operands of ``seed`` at the spec's shape, on device ``device_index``.
+    """The digest of the ``y`` the pin computes from the canary operands of ``seed`` at the spec's shape, on device ``device_index``
+    (:mod:`tilefish._canary`).
 
-    Everything is on one stream made for it (torch's pool: a non-blocking stream, ordered with no other, the NULL stream included): the copies of the
-    operands, the zeroing of ``y``, the workspace, the convolution and the copy of ``y`` back, which waits for that stream alone."""
-    from . import _cudnn
+    Everything is on one stream made for it (torch's pool: a non-blocking stream, ordered with no other, the NULL stream included): the operands made
+    by the fill kernel, the zeroed ``y`` (a whole number of words), the workspace, the convolution, the digest kernel, and the copy of its 16 bytes back,
+    which waits for that stream alone. Nothing of the operands or of ``y`` crosses to the host."""
+    from . import _canary, _cudnn
 
     torch = _cudnn._torch()
     p = spec.problem
-    xb, wb = canary_operands(p, seed)
-    y_bytes = math.prod(p.y_dims) * _ELEMENT_BYTES[p.dtype]
+    size = _ELEMENT_BYTES[p.dtype]
+    x_elements, w_elements = math.prod(p.x_dims), math.prod(p.w_dims)
+    y_bytes = math.prod(p.y_dims) * size
     device = f"cuda:{device_index}"
     with torch.cuda.device(device_index):
         stream = torch.cuda.Stream(device=device_index)
         with torch.cuda.stream(stream):
-            x = torch.frombuffer(bytearray(xb), dtype=torch.uint8).to(device)
-            w = torch.frombuffer(bytearray(wb), dtype=torch.uint8).to(device)
-            y = torch.zeros(y_bytes, dtype=torch.uint8, device=device)
+            x = torch.empty(x_elements * size, dtype=torch.uint8, device=device)
+            w = torch.empty(w_elements * size, dtype=torch.uint8, device=device)
+            _canary.fill(x.data_ptr(), x_elements, p.dtype, seed, 0, stream.cuda_stream, device_index)
+            _canary.fill(w.data_ptr(), w_elements, p.dtype, seed, 1, stream.cuda_stream, device_index)
+            y = torch.zeros(-(-y_bytes // 4) * 4, dtype=torch.uint8, device=device)
             _cudnn.convolution(
                 x.data_ptr(), w.data_ptr(), y.data_ptr(), p, pin, workspace_bytes=spec.workspace_bytes, stream=stream.cuda_stream,
                 device_index=device_index, sm_count_target=_run_target(spec, pin),
             )  # fmt: skip
-            host = y.cpu()  # a copy on this stream, which it then waits for
-    return hashlib.sha256(ctypes.string_at(host.data_ptr(), y_bytes)).hexdigest()
+            sums = torch.zeros(2, dtype=torch.int64, device=device)
+            _canary.digest(y.data_ptr(), y.numel() // 4, sums.data_ptr(), stream.cuda_stream, device_index)
+            s1, s2 = (int(v) for v in sums.cpu())  # a copy on this stream, which it then waits for
+    return _canary.hex_of(s1, s2)
 
 
 _canary_lock = threading.Lock()
@@ -732,7 +715,7 @@ def check_canary(built: BuiltConv, device_index: int) -> None:
         return
     spec = built.spec
     pin_json = json.dumps(built.pin.to_json(), sort_keys=True)
-    key = (device_index, built.stem, built.arch, pin_json, built.cudnn_version, spec.workspace_bytes, canary["seed"], canary["y_sha256"])
+    key = (device_index, built.stem, built.arch, pin_json, built.cudnn_version, spec.workspace_bytes, canary["seed"], canary["y_digest"])
     with _canary_lock:
         if key in _canaries_passed:
             return
@@ -746,10 +729,10 @@ def check_canary(built: BuiltConv, device_index: int) -> None:
                 "capture: run it once before the capture"
             )
     got = canary_digest(spec, built.pin, canary["seed"], device_index)
-    if got != canary["y_sha256"]:
+    if got != canary["y_digest"]:
         raise TilefishManifestError(
-            f"the canary of the cuDNN convolution '{built.stem}' ({built.arch}, {built.pin.what}) gives y with sha256 {got} here, and the manifest recorded "
-            f"{canary['y_sha256']} (seed {canary['seed']}): this process's cuDNN (version {built.cudnn_version} too) or this device runs other kernels for "
+            f"the canary of the cuDNN convolution '{built.stem}' ({built.arch}, {built.pin.what}) gives y with digest {got} here, and the manifest recorded "
+            f"{canary['y_digest']} (seed {canary['seed']}): this process's cuDNN (version {built.cudnn_version} too) or this device runs other kernels for "
             "the pin, so it is refused; export the manifest again with this cuDNN build, or run with the build that made it"
         )
     with _canary_lock:
@@ -856,7 +839,7 @@ def validate_entry(entry: Any, index: int = 0) -> None:
     ``groups``, the spatial lists, ``math``, ``alignment``) is one cuDNN takes, ``output`` is its output, the shapes of ``x``, ``w`` and ``out`` are its
     shapes in the layout under the buckets, every pointer is aligned to ``alignment``, the pin is of the API its ``choice`` asks (``v7``: legacy;
     ``instant``, ``mode_b``: backend), an ``sm_count_target`` is at most ``sm_count`` (on a legacy pin only when it was imported), and a ``canary`` is
-    ``{"seed": s, "y_sha256": h}`` (``s`` from 0 to 2**32 - 1, ``h`` 64 lowercase hex digits)."""
+    ``{"seed": s, "y_digest": d}`` (``s`` from 0 to 2**32 - 1, ``d`` 32 lowercase hex digits)."""
     from . import _cudnn
 
     where = f"#{index}"
@@ -946,15 +929,17 @@ def validate_entry(entry: Any, index: int = 0) -> None:
                 _bad(where, "a legacy pin has an sm_count_target only when it was imported (the legacy API takes no target)")
         if "canary" in entry:
             canary = entry["canary"]
+            if isinstance(canary, dict) and "y_sha256" in canary:
+                _bad(where, "a canary of tilefish's first form ('y_sha256': host-made operands, a host sha256) is no longer read: export the manifest again")
             if (
                 not isinstance(canary, dict)
-                or set(canary) != {"seed", "y_sha256"}
+                or set(canary) != {"seed", "y_digest"}
                 or not sv.is_int(canary["seed"])
                 or not 0 <= canary["seed"] <= MAX_CANARY_SEED
-                or not isinstance(canary["y_sha256"], str)
-                or not sv._DIGEST.match(canary["y_sha256"])
+                or not isinstance(canary["y_digest"], str)
+                or not _DIGEST32.match(canary["y_digest"])
             ):
-                _bad(where, f"canary is absent or {{'seed': an int from 0 to 2**32 - 1, 'y_sha256': 64 lowercase hex digits}}, got {canary!r}")
+                _bad(where, f"canary is absent or {{'seed': an int from 0 to 2**32 - 1, 'y_digest': 32 lowercase hex digits}}, got {canary!r}")
         if not (isinstance(entry["declaration_digest"], str) and sv._DIGEST.match(entry["declaration_digest"])):
             _bad(where, f"declaration_digest must be 64 lowercase hex digits (a sha256), got {entry['declaration_digest']!r}")
         buckets = entry["buckets"]

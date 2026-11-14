@@ -343,13 +343,42 @@ def test_an_entry_may_have_a_canary_and_the_reader_holds_its_form():
     plain = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS).entry()
     assert "canary" not in plain
     validate_entry(plain)
-    e = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS, {"seed": 1, "y_sha256": "0f" * 32}).entry()
-    assert e["canary"] == {"seed": 1, "y_sha256": "0f" * 32}
+    e = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS, {"seed": 1, "y_digest": "0f" * 16}).entry()
+    assert e["canary"] == {"seed": 1, "y_digest": "0f" * 16}
     validate_entry(e)
-    validate_entry({**e, "canary": {"seed": (1 << 32) - 1, "y_sha256": "0f" * 32}})
-    for bad in (None, [], {"seed": 1}, {"seed": -1, "y_sha256": "0f" * 32}, {"seed": 1 << 32, "y_sha256": "0f" * 32}, {"seed": True, "y_sha256": "0f" * 32},
-                {"seed": 1, "y_sha256": "0F" * 32}, {"seed": 1, "y_sha256": "0f" * 32, "x": 1}):  # fmt: skip
+    validate_entry({**e, "canary": {"seed": (1 << 32) - 1, "y_digest": "0f" * 16}})
+    for bad in (None, [], {"seed": 1}, {"seed": -1, "y_digest": "0f" * 16}, {"seed": 1 << 32, "y_digest": "0f" * 16}, {"seed": True, "y_digest": "0f" * 16},
+                {"seed": 1, "y_digest": "0F" * 16}, {"seed": 1, "y_digest": "0f" * 16, "x": 1}):  # fmt: skip
         refuses(e, lambda e, bad=bad: e.update(canary=bad), "canary is absent or")
+    refuses(e, lambda e: e.update(canary={"seed": 1, "y_sha256": "0f" * 32}), "a canary of tilefish's first form .* is no longer read: export the manifest again")
+
+
+def test_the_canary_ptx_is_the_crates():
+    """The PTX of the canary's kernels is one text in both hosts: the Python package's constant and the crate's ``src/canary.ptx``."""
+    from conftest import REPO_ROOT
+
+    from tilefish import _canary
+
+    assert _canary.CANARY_PTX == (REPO_ROOT / "crates" / "tilefish" / "src" / "canary.ptx").read_text()
+    assert ".entry tilefish_canary_fill(" in _canary.CANARY_PTX and ".entry tilefish_canary_digest(" in _canary.CANARY_PTX
+
+
+def test_the_canary_digest_is_a_sum_of_words_that_any_one_change_changes():
+    from tilefish import _canary
+
+    data = _conv.canary_bytes("f16", 3, 0, 1000)
+    d = _canary.digest_of(data)
+    assert len(d) == 32 and d == _canary.digest_of(data + b"\x00\x00")  # zero padding to a whole word
+    for at in (0, 1, 2, 3, 999, 1998, 1999):  # one changed byte, wherever
+        changed = bytearray(data)
+        changed[at] ^= 0x01
+        assert _canary.digest_of(bytes(changed)) != d, at
+    words = data[:400]
+    split = _canary.digest_of(words[:200] + b"\x00" * 200)
+    rest = _canary.digest_of(b"\x00" * 200 + words[200:])
+    s1 = (int(split[:16], 16) + int(rest[:16], 16)) % 2**64
+    s2 = (int(split[16:], 16) + int(rest[16:], 16)) % 2**64
+    assert _canary.hex_of(s1, s2) == _canary.digest_of(words)  # a sum: the device adds it in any order
 
 
 def test_two_canaries_that_differ_are_two_binaries_and_an_entry_without_one_is_replaced():
@@ -358,9 +387,9 @@ def test_two_canaries_that_differ_are_two_binaries_and_an_entry_without_one_is_r
     op = conv(layout="NHWC", padding=6)(nhwc_k7)
     spec = _conv.conv_specs(op)[0]
     old = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS).entry()
-    new = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS, {"seed": 1, "y_sha256": "0f" * 32}).entry()
+    new = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS, {"seed": 1, "y_digest": "0f" * 16}).entry()
     assert _conflicts(old, new) is None and _conflicts(new, new) is None
-    assert _conflicts(new, {**new, "canary": {"seed": 1, "y_sha256": "1f" * 32}}) == "canary"
+    assert _conflicts(new, {**new, "canary": {"seed": 1, "y_digest": "1f" * 16}}) == "canary"
 
 
 def test_a_replay_runs_the_canary_once_and_refuses_other_bytes(tmp_path, monkeypatch):
@@ -371,8 +400,8 @@ def test_a_replay_runs_the_canary_once_and_refuses_other_bytes(tmp_path, monkeyp
 
     op = conv(layout="NHWC", padding=6)(nhwc_k7)
     specs = _conv.conv_specs(op)
-    good = "0f" * 32
-    library = [_conv.BuiltConv(specs[0], "sm_103", ENGINE, VERSION, SMS, {"seed": 3, "y_sha256": good}), _conv.BuiltConv(specs[1], "sm_103", ENGINE, VERSION, SMS)]
+    good = "0f" * 16
+    library = [_conv.BuiltConv(specs[0], "sm_103", ENGINE, VERSION, SMS, {"seed": 3, "y_digest": good}), _conv.BuiltConv(specs[1], "sm_103", ENGINE, VERSION, SMS)]
     write_manifest([], tmp_path / "m" / "manifest.json", cubins=True, library=library)
     m = Manifest.load(tmp_path / "m")
     capturing = [False]
@@ -391,11 +420,11 @@ def test_a_replay_runs_the_canary_once_and_refuses_other_bytes(tmp_path, monkeyp
     capturing[0] = False
     for _ in range(3):
         got = _conv.built_from_manifest(m, specs[0], "sm_103", SMS)
-        assert got.canary == {"seed": 3, "y_sha256": good}
+        assert got.canary == {"seed": 3, "y_digest": good}
         assert _conv.built_from_manifest(m, specs[1], "sm_103", SMS).canary is None  # none recorded: nothing runs
     assert runs == [("c.T64", 3, 0)]  # once per process and device
     _conv.built_from_manifest(m, specs[0], "sm_103", SMS, device_index=1)
     assert runs[-1] == ("c.T64", 3, 1)
-    answer[0] = "1f" * 32
-    with pytest.raises(TilefishManifestError, match=f"the canary of the cuDNN convolution 'c.T64' .* gives y with sha256 {'1f' * 32} here, and the manifest recorded {good} \\(seed 3\\)"):
+    answer[0] = "1f" * 16
+    with pytest.raises(TilefishManifestError, match=f"the canary of the cuDNN convolution 'c.T64' .* gives y with digest {'1f' * 16} here, and the manifest recorded {good} \\(seed 3\\)"):
         _conv.built_from_manifest(m, specs[0], "sm_103", SMS, device_index=2)

@@ -1,0 +1,221 @@
+// The kernels of a cuDNN convolution's canary (docs/manifest-schema-3.md, section 9.4): the operands, made on the device, and the digest of y.
+// The same text is in the Python package (tilefish/_canary.py, CANARY_PTX) and in the crate (src/canary.ptx, include_str!): a test holds them
+// equal. The driver compiles it for the device it is loaded on (PTX for sm_70 and later), so neither host needs a compiler.
+//
+// mix(v) is splitmix64's finalizer of v + 0x9E3779B97F4A7C15 (constants written as nvcc writes 64-bit constants: signed decimal).
+//
+// tilefish_canary_fill(out, count, base, kind): element i (i < count) of an operand is made of h = mix(base + i) (wrapping): its low 16 bits for
+// f16 (kind 0) and bf16 (kind 1), its low 32 bits for f32 (kind 2), the most significant byte b of the element mapped: f16
+// (b & 0x80) | ((7 + ((b >> 2) & 7)) << 2) | (b & 3), bf16 and f32 (b & 0x80) | (55 + (b & 7)). Stored little-endian at out + i * size.
+//
+// tilefish_canary_digest(words, count, out): over the count 32-bit little-endian words w_j of y (zero-padded to a whole word), two sums modulo
+// 2^64, s1 = sum w_j * (mix(j ^ K1) | 1), s2 = sum w_j * (mix(j ^ K2) | 1), K1 = 0x243F6A8885A308D3, K2 = 0x13198A2E03707344, added with
+// atomics to out[0] and out[1] (which start at zero): an order-independent sum, so the digest is the same for any grid.
+
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry tilefish_canary_fill(
+	.param .u64 tilefish_canary_fill_out,
+	.param .u64 tilefish_canary_fill_count,
+	.param .u64 tilefish_canary_fill_base,
+	.param .u32 tilefish_canary_fill_kind
+)
+{
+	.reg .pred 	%p<4>;
+	.reg .b32 	%r<12>;
+	.reg .b64 	%rd<12>;
+
+	ld.param.u64 	%rd1, [tilefish_canary_fill_out];
+	ld.param.u64 	%rd2, [tilefish_canary_fill_count];
+	ld.param.u64 	%rd3, [tilefish_canary_fill_base];
+	ld.param.u32 	%r1, [tilefish_canary_fill_kind];
+	cvta.to.global.u64 	%rd1, %rd1;
+	mov.u32 	%r2, %ctaid.x;
+	mov.u32 	%r3, %ntid.x;
+	mov.u32 	%r4, %tid.x;
+	mov.u32 	%r5, %nctaid.x;
+	mul.wide.u32 	%rd4, %r2, %r3;
+	cvt.u64.u32 	%rd5, %r4;
+	add.u64 	%rd4, %rd4, %rd5;
+	mul.wide.u32 	%rd6, %r5, %r3;
+$FILL_LOOP:
+	setp.ge.u64 	%p1, %rd4, %rd2;
+	@%p1 bra 	$FILL_DONE;
+	add.u64 	%rd7, %rd3, %rd4;
+	add.u64 	%rd8, %rd7, -7046029254386353131;
+	shr.u64 	%rd9, %rd8, 30;
+	xor.b64 	%rd8, %rd8, %rd9;
+	mul.lo.u64 	%rd8, %rd8, -4658895280553007687;
+	shr.u64 	%rd9, %rd8, 27;
+	xor.b64 	%rd8, %rd8, %rd9;
+	mul.lo.u64 	%rd8, %rd8, -7723592293110705685;
+	shr.u64 	%rd9, %rd8, 31;
+	xor.b64 	%rd8, %rd8, %rd9;
+	cvt.u32.u64 	%r6, %rd8;
+	setp.eq.u32 	%p2, %r1, 2;
+	@%p2 bra 	$FILL_F32;
+	and.b32 	%r7, %r6, 255;
+	shr.u32 	%r8, %r6, 8;
+	and.b32 	%r8, %r8, 255;
+	and.b32 	%r9, %r8, 128;
+	setp.eq.u32 	%p3, %r1, 0;
+	@%p3 bra 	$FILL_F16;
+	and.b32 	%r10, %r8, 7;
+	add.u32 	%r10, %r10, 55;
+	or.b32 	%r10, %r10, %r9;
+	bra.uni 	$FILL_STORE16;
+$FILL_F16:
+	shr.u32 	%r10, %r8, 2;
+	and.b32 	%r10, %r10, 7;
+	add.u32 	%r10, %r10, 7;
+	shl.b32 	%r10, %r10, 2;
+	or.b32 	%r10, %r10, %r9;
+	and.b32 	%r11, %r8, 3;
+	or.b32 	%r10, %r10, %r11;
+$FILL_STORE16:
+	shl.b32 	%r10, %r10, 8;
+	or.b32 	%r10, %r10, %r7;
+	shl.b64 	%rd10, %rd4, 1;
+	add.u64 	%rd10, %rd1, %rd10;
+	st.global.u16 	[%rd10], %r10;
+	bra.uni 	$FILL_NEXT;
+$FILL_F32:
+	shr.u32 	%r8, %r6, 24;
+	and.b32 	%r9, %r8, 128;
+	and.b32 	%r10, %r8, 7;
+	add.u32 	%r10, %r10, 55;
+	or.b32 	%r10, %r10, %r9;
+	shl.b32 	%r10, %r10, 24;
+	and.b32 	%r11, %r6, 16777215;
+	or.b32 	%r10, %r10, %r11;
+	shl.b64 	%rd10, %rd4, 2;
+	add.u64 	%rd10, %rd1, %rd10;
+	st.global.u32 	[%rd10], %r10;
+$FILL_NEXT:
+	add.u64 	%rd4, %rd4, %rd6;
+	bra.uni 	$FILL_LOOP;
+$FILL_DONE:
+	ret;
+}
+
+.visible .entry tilefish_canary_digest(
+	.param .u64 tilefish_canary_digest_words,
+	.param .u64 tilefish_canary_digest_count,
+	.param .u64 tilefish_canary_digest_out
+)
+{
+	.reg .pred 	%p<4>;
+	.reg .b32 	%r<12>;
+	.reg .b64 	%rd<20>;
+
+	ld.param.u64 	%rd1, [tilefish_canary_digest_words];
+	ld.param.u64 	%rd2, [tilefish_canary_digest_count];
+	ld.param.u64 	%rd3, [tilefish_canary_digest_out];
+	cvta.to.global.u64 	%rd1, %rd1;
+	cvta.to.global.u64 	%rd3, %rd3;
+	mov.u32 	%r2, %ctaid.x;
+	mov.u32 	%r3, %ntid.x;
+	mov.u32 	%r4, %tid.x;
+	mov.u32 	%r5, %nctaid.x;
+	mul.wide.u32 	%rd4, %r2, %r3;
+	cvt.u64.u32 	%rd5, %r4;
+	add.u64 	%rd4, %rd4, %rd5;
+	mul.wide.u32 	%rd6, %r5, %r3;
+	mov.u64 	%rd11, 0;
+	mov.u64 	%rd12, 0;
+$DIGEST_LOOP:
+	setp.ge.u64 	%p1, %rd4, %rd2;
+	@%p1 bra 	$DIGEST_REDUCE;
+	shl.b64 	%rd7, %rd4, 2;
+	add.u64 	%rd7, %rd1, %rd7;
+	ld.global.u32 	%r6, [%rd7];
+	cvt.u64.u32 	%rd13, %r6;
+	xor.b64 	%rd8, %rd4, 2611923443488327891;
+	add.u64 	%rd8, %rd8, -7046029254386353131;
+	shr.u64 	%rd9, %rd8, 30;
+	xor.b64 	%rd8, %rd8, %rd9;
+	mul.lo.u64 	%rd8, %rd8, -4658895280553007687;
+	shr.u64 	%rd9, %rd8, 27;
+	xor.b64 	%rd8, %rd8, %rd9;
+	mul.lo.u64 	%rd8, %rd8, -7723592293110705685;
+	shr.u64 	%rd9, %rd8, 31;
+	xor.b64 	%rd8, %rd8, %rd9;
+	or.b64 	%rd8, %rd8, 1;
+	mul.lo.u64 	%rd8, %rd8, %rd13;
+	add.u64 	%rd11, %rd11, %rd8;
+	xor.b64 	%rd8, %rd4, 1376283091369227076;
+	add.u64 	%rd8, %rd8, -7046029254386353131;
+	shr.u64 	%rd9, %rd8, 30;
+	xor.b64 	%rd8, %rd8, %rd9;
+	mul.lo.u64 	%rd8, %rd8, -4658895280553007687;
+	shr.u64 	%rd9, %rd8, 27;
+	xor.b64 	%rd8, %rd8, %rd9;
+	mul.lo.u64 	%rd8, %rd8, -7723592293110705685;
+	shr.u64 	%rd9, %rd8, 31;
+	xor.b64 	%rd8, %rd8, %rd9;
+	or.b64 	%rd8, %rd8, 1;
+	mul.lo.u64 	%rd8, %rd8, %rd13;
+	add.u64 	%rd12, %rd12, %rd8;
+	add.u64 	%rd4, %rd4, %rd6;
+	bra.uni 	$DIGEST_LOOP;
+$DIGEST_REDUCE:
+	mov.b64 	{%r7, %r8}, %rd11;
+	shfl.sync.down.b32 	%r9, %r7, 16, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 16, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd11, %rd11, %rd14;
+	mov.b64 	{%r7, %r8}, %rd11;
+	shfl.sync.down.b32 	%r9, %r7, 8, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 8, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd11, %rd11, %rd14;
+	mov.b64 	{%r7, %r8}, %rd11;
+	shfl.sync.down.b32 	%r9, %r7, 4, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 4, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd11, %rd11, %rd14;
+	mov.b64 	{%r7, %r8}, %rd11;
+	shfl.sync.down.b32 	%r9, %r7, 2, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 2, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd11, %rd11, %rd14;
+	mov.b64 	{%r7, %r8}, %rd11;
+	shfl.sync.down.b32 	%r9, %r7, 1, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 1, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd11, %rd11, %rd14;
+	mov.b64 	{%r7, %r8}, %rd12;
+	shfl.sync.down.b32 	%r9, %r7, 16, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 16, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd12, %rd12, %rd14;
+	mov.b64 	{%r7, %r8}, %rd12;
+	shfl.sync.down.b32 	%r9, %r7, 8, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 8, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd12, %rd12, %rd14;
+	mov.b64 	{%r7, %r8}, %rd12;
+	shfl.sync.down.b32 	%r9, %r7, 4, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 4, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd12, %rd12, %rd14;
+	mov.b64 	{%r7, %r8}, %rd12;
+	shfl.sync.down.b32 	%r9, %r7, 2, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 2, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd12, %rd12, %rd14;
+	mov.b64 	{%r7, %r8}, %rd12;
+	shfl.sync.down.b32 	%r9, %r7, 1, 31, -1;
+	shfl.sync.down.b32 	%r10, %r8, 1, 31, -1;
+	mov.b64 	%rd14, {%r9, %r10};
+	add.u64 	%rd12, %rd12, %rd14;
+	and.b32 	%r11, %r4, 31;
+	setp.ne.u32 	%p2, %r11, 0;
+	@%p2 bra 	$DIGEST_DONE;
+	atom.global.add.u64 	%rd15, [%rd3], %rd11;
+	atom.global.add.u64 	%rd15, [%rd3+8], %rd12;
+$DIGEST_DONE:
+	ret;
+}

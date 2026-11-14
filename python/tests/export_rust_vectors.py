@@ -874,7 +874,7 @@ def conv_entries():
 
     import tilefish
     from tilefish import CudnnTable, Dim, Tensor, TilefishManifestError, bf16, f16, f32
-    from tilefish import _conv, _cudnn
+    from tilefish import _canary, _conv, _cudnn
     from tilefish._library import validate_entry
 
     t = {"bf16": bf16, "f16": f16, "f32": f32}
@@ -906,7 +906,7 @@ def conv_entries():
             canary = None
             if len(goods) % 2 == 0:
                 seed = (len(goods) * 2654435761) % (1 << 32) if len(goods) else (1 << 32) - 1
-                canary = {"seed": seed, "y_sha256": hashlib.sha256(spec.stem.encode()).hexdigest()}
+                canary = {"seed": seed, "y_digest": hashlib.sha256(spec.stem.encode()).hexdigest()[:32]}
             goods.append(_conv.BuiltConv(spec, "sm_103", pin, 91002, 30, canary).entry())
 
     def changed(entry, path, value):
@@ -960,19 +960,21 @@ def conv_entries():
             (["preconditions", 0, "bytes"], 16 if good["alignment"] != 16 else 32),
             (["declaration_digest"], "x" * 64),
             (["note"], 1),
+            (["canary"], {"seed": 1, "y_digest": "ab" * 16}),
             (["canary"], {"seed": 1, "y_sha256": "ab" * 32}),
             (["canary"], None),
-            (["canary"], ["seed", "y_sha256"]),
+            (["canary"], ["seed", "y_digest"]),
             (["canary"], {"seed": 1}),
-            (["canary"], {"seed": 1, "y_sha256": "ab" * 32, "note": 0}),
+            (["canary"], {"seed": 1, "y_digest": "ab" * 16, "note": 0}),
             (["canary", "seed"], -1),
             (["canary", "seed"], 1 << 32),
             (["canary", "seed"], 1.0),
             (["canary", "seed"], True),
             (["canary", "seed"], "1"),
-            (["canary", "y_sha256"], "AB" * 32),
-            (["canary", "y_sha256"], "ab" * 31),
-            (["canary", "y_sha256"], 7),
+            (["canary", "y_digest"], "AB" * 16),
+            (["canary", "y_digest"], "ab" * 15),
+            (["canary", "y_digest"], "ab" * 32),
+            (["canary", "y_digest"], 7),
         ]:
             if path[0] == "sm_count_target" and value is _DELETE and "sm_count_target" not in good:
                 continue
@@ -988,8 +990,18 @@ def conv_entries():
             continue
         problem = _conv.problem_of_entry(entry)
         seed = entry["canary"]["seed"] if "canary" in entry else 7
-        x, w = _conv.canary_operands(problem, seed)
-        operands = {"seed": seed, "x_sha256": hashlib.sha256(x).hexdigest(), "w_sha256": hashlib.sha256(w).hexdigest(), "x_head": x[:16].hex()}
+        # the first 512 elements of each operand, as the host reference makes them (element by element, so a prefix is what the device makes there too)
+        x = _conv.canary_bytes(problem.dtype, seed, 0, min(512, math.prod(problem.x_dims)))
+        w = _conv.canary_bytes(problem.dtype, seed, 1, min(512, math.prod(problem.w_dims)))
+        operands = {
+            "seed": seed,
+            "head_elements": [min(512, math.prod(problem.x_dims)), min(512, math.prod(problem.w_dims))],
+            "x_head_sha256": hashlib.sha256(x).hexdigest(),
+            "w_head_sha256": hashlib.sha256(w).hexdigest(),
+            "x_head": x[:16].hex(),
+            "x_head_digest": _canary.digest_of(x),
+            "x_head_odd_digest": _canary.digest_of(x[:-2]),
+        }
         out.append({"entry": entry, "accepted": True, "pin": entry["pin"], "describe": _cudnn.describe(problem), "canary_operands": operands})
     return out
 

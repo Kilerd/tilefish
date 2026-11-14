@@ -440,14 +440,14 @@ def test_export_records_a_canary_a_replay_runs_it_and_refuses_other_bytes(tmp_pa
             e = manifest.library_entry(spec.stem, _arch())
             assert e["canary"]["seed"] == _conv.CANARY_SEED, spec.stem
             # the pin's bytes from the operands of the seed: computed again (another stream, another allocation), the same
-            assert _conv.canary_digest(spec, _cudnn.pin_of(e["pin"]), e["canary"]["seed"], 0) == e["canary"]["y_sha256"], spec.stem
-    assert len({e["canary"]["y_sha256"] for e in manifest.library_entries}) == 4
+            assert _conv.canary_digest(spec, _cudnn.pin_of(e["pin"]), e["canary"]["seed"], 0) == e["canary"]["y_digest"], spec.stem
+    assert len({e["canary"]["y_digest"] for e in manifest.library_entries}) == 4
     x, w = ck.operands(ck.conv_k7, {"T": 64})
     jit = tilefish.run(ck.conv_k7, x, w)
     monkeypatch.setattr(_conv, "_canaries_passed", set())
     # a canary another build of cuDNN (or another device) computed: refused before the pin runs
-    _, digest = _patched(tmp_path, lambda e: e["canary"].update(y_sha256="0" * 64), "canary")
-    with pytest.raises(TilefishManifestError, match="the canary of the cuDNN convolution 'conv_k7.T64' .* gives y with sha256 [0-9a-f]{64} here, and the manifest recorded 0{64}"):
+    _, digest = _patched(tmp_path, lambda e: e["canary"].update(y_digest="0" * 32), "canary")
+    with pytest.raises(TilefishManifestError, match="the canary of the cuDNN convolution 'conv_k7.T64' .* gives y with digest [0-9a-f]{32} here, and the manifest recorded 0{32}"):
         tilefish.run(ck.conv_k7, x, w, mode="replay", manifest=tmp_path / "canary", pin=digest)
     # the field is optional: an entry exported without one runs as before
     _, digest = _patched(tmp_path, lambda e: e.pop("canary"), "none")
@@ -548,3 +548,32 @@ def test_a_global_capture_holds_a_replay_of_the_op_and_of_a_plan(tmp_path):
         g.replay()
         torch.cuda.synchronize()
         assert same_bytes(out, eager), name
+
+
+def test_the_canary_kernels_are_the_host_reference():
+    """The fill kernel writes the host reference's bytes (each data type, sizes around a block and past one grid), and the digest kernel adds the
+    host's digest (odd and even sizes)."""
+    import ctypes
+    import random
+
+    from tilefish import _canary
+
+    s = torch.cuda.Stream()
+    for dtype in ("f16", "bf16", "f32"):
+        for n in (1, 255, 256, 257, 70001):
+            x = torch.empty(n * _canary.ELEMENT_BYTES[dtype], dtype=torch.uint8, device="cuda")
+            _canary.fill(x.data_ptr(), n, dtype, 7, 1, s.cuda_stream, 0)
+            s.synchronize()
+            on_host = x.cpu()
+            assert ctypes.string_at(on_host.data_ptr(), on_host.numel()) == _canary.canary_bytes(dtype, 7, 1, n), (dtype, n)
+    rng = random.Random(3)
+    for nbytes in (2, 4, 6, 1022, 4096 * 4 + 2, 300001 * 2):
+        data = bytes(rng.getrandbits(8) for _ in range(nbytes))
+        padded = data + b"\x00" * (-nbytes % 4)
+        y = torch.frombuffer(bytearray(padded), dtype=torch.uint8).cuda()
+        sums = torch.zeros(2, dtype=torch.int64, device="cuda")
+        torch.cuda.synchronize()
+        _canary.digest(y.data_ptr(), len(padded) // 4, sums.data_ptr(), s.cuda_stream, 0)
+        s.synchronize()
+        assert _canary.hex_of(*(int(v) for v in sums.cpu())) == _canary.digest_of(data), nbytes
+

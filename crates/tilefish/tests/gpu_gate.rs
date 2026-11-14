@@ -1663,19 +1663,19 @@ fn the_gate_has_cudnn_convolutions() {
     for case in &convs {
         let stem = case["stem"].as_str().unwrap();
         let canary = manifest.conv_entry(stem, &arch.to_string()).unwrap().canary.clone();
-        assert!(canary.is_some_and(|c| c.seed == 1 && c.y_sha256.len() == 64), "{stem}: export records a canary");
+        assert!(canary.is_some_and(|c| c.seed == 1 && c.y_digest.len() == 32), "{stem}: export records a canary");
     }
     let tmp = copy_of_the_manifest("canary");
     let mut doc = read_json(&tmp.join("manifest.json"));
     for e in doc["library"].as_array_mut().unwrap() {
         if e["impl"] == "cudnn.conv_fwd" {
-            e["canary"]["y_sha256"] = Value::from("0".repeat(64));
+            e["canary"]["y_digest"] = Value::from("0".repeat(32));
         }
     }
     write_json(&tmp.join("manifest.json"), &doc);
     let refused = Manifest::load(&tmp, Pin::TrustDirectory).unwrap().conv(&gpu.ctx, first, &[], arch);
     assert!(
-        matches!(&refused, Err(Error::Manifest(m)) if m.contains("the canary of the cuDNN convolution") && m.contains(&format!("the manifest recorded {}", "0".repeat(64)))),
+        matches!(&refused, Err(Error::Manifest(m)) if m.contains("the canary of the cuDNN convolution") && m.contains(&format!("the manifest recorded {}", "0".repeat(32)))),
         "{refused:?}"
     );
     for e in doc["library"].as_array_mut().unwrap() {

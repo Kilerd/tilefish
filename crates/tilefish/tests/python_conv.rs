@@ -5,14 +5,14 @@
 //! paddings and dilations, a bucketed length, the alignments, an SM count target, an imported pin), each changed in one field, with what Python's
 //! `validate_entry` decides: accepted, with the pin and the cuDNN-level problem it reads (`tilefish._cudnn.describe`), or refused. Rust reads each in
 //! a manifest of its own and must accept exactly those, with the same pin, the same canary and the same `describe` (`docs/manifest-schema-3.md`,
-//! section 9.4), and make the canary operands Python makes for the problem (their sha256). No GPU.
+//! section 9.4), and make the canary's operands (their first elements) and digests Python makes, on the host. No GPU.
 
 mod common;
 
 use common::synthetic::read;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tilefish::{ConvPin, canary_operands};
+use tilefish::{ConvPin, canary_bytes, canary_digest};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -44,13 +44,22 @@ fn the_reader_accepts_and_refuses_the_entries_python_does_and_describes_the_same
                 };
                 assert_eq!(pin, case["pin"], "{stem}");
                 assert_eq!(e.sm_count_target, case["entry"]["sm_count_target"].as_u64(), "{stem}");
-                let canary = e.canary.as_ref().map(|c| json!({"seed": c.seed, "y_sha256": c.y_sha256}));
+                let canary = e.canary.as_ref().map(|c| json!({"seed": c.seed, "y_digest": c.y_digest}));
                 assert_eq!(canary.as_ref(), case["entry"].get("canary"), "{stem}");
                 let operands = &case["canary_operands"];
-                let (x, w) = canary_operands(&e.problem, operands["seed"].as_u64().unwrap());
+                let seed = operands["seed"].as_u64().unwrap();
+                let heads = operands["head_elements"].as_array().unwrap();
+                let x = canary_bytes(e.problem.dtype, seed, 0, heads[0].as_u64().unwrap());
+                let w = canary_bytes(e.problem.dtype, seed, 1, heads[1].as_u64().unwrap());
                 assert_eq!(hex(&x[..16.min(x.len())]), operands["x_head"], "{stem}: the first bytes of the canary's x");
-                assert_eq!(hex(&Sha256::digest(&x)), operands["x_sha256"], "{stem}: the canary's x");
-                assert_eq!(hex(&Sha256::digest(&w)), operands["w_sha256"], "{stem}: the canary's w");
+                assert_eq!(hex(&Sha256::digest(&x)), operands["x_head_sha256"], "{stem}: the canary's x");
+                assert_eq!(hex(&Sha256::digest(&w)), operands["w_head_sha256"], "{stem}: the canary's w");
+                assert_eq!(canary_digest(&x), operands["x_head_digest"], "{stem}: the digest of bytes");
+                assert_eq!(
+                    canary_digest(&x[..x.len() - 2]),
+                    operands["x_head_odd_digest"],
+                    "{stem}: the digest of bytes, a half word last"
+                );
                 if canary.is_some() {
                     with_canary += 1;
                 }

@@ -270,8 +270,8 @@ mod tensor;
 
 pub use conv::{
     CONV_COMPUTE_TYPE, CONV_IMPL, Conv, ConvCanary, ConvChoice, ConvEntry, ConvLayout, ConvMath, ConvPin, ConvProblem,
-    TF32_OVERRIDE, canary_bytes, canary_operands, cudnn_version, dense_strides, knobs_problem, math_problem,
-    notes_problem, output_size,
+    TF32_OVERRIDE, canary_bytes, canary_digest, canary_operands, cudnn_version, dense_strides, knobs_problem,
+    math_problem, notes_problem, output_size,
 };
 pub use cudarc;
 pub use error::{Error, PreconditionKind, Result};
