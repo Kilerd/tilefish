@@ -342,7 +342,8 @@ class KernelOp(GraphOp):
     ``num_warps`` (``None`` for the template's default rule) is the launch warp count the
     lowering uses, for every bucket; ``fp_fusion`` says whether ``a * b + c`` may be contracted
     into one FMA with one rounding (``True``, Triton's default) or must round twice (``False``);
-    see :func:`tilefish.lower`.
+    ``math`` is the f32 math of the body (``"fast"``, the default, or ``"ieee"``: note 13 of
+    :mod:`tilefish.lower`); see :func:`tilefish.lower`.
     """
 
     kind = "kernel"
@@ -355,10 +356,12 @@ class KernelOp(GraphOp):
         graph: Graph,
         num_warps: "int | None" = None,
         fp_fusion: bool = True,
+        math: str = "fast",
     ) -> None:
         super().__init__(fn, name, signature, graph)
         self.num_warps = num_warps
         self.fp_fusion = fp_fusion
+        self.math = math
 
     def lower(self, **options: Any) -> Any:
         """Lower this kernel to Triton source: ``tilefish.lower(self, **options)``."""
@@ -496,12 +499,17 @@ def kernel(
     name: str | None = None,
     num_warps: int | None = None,
     fp_fusion: bool = True,
+    math: str = "fast",
 ) -> Any:
     """``@tilefish.kernel``: trace and type-check a kernel body; ``.lower()`` turns it into Triton source.
 
     ``num_warps`` pins the warp count of every binary (a power of two from 1 to 32); without it the
     lowering's rule gives each binary its own. ``fp_fusion=False`` compiles without FMA contraction, so that
     ``a * b + c`` rounds the product and then the sum (the default, ``True``, lets the compiler round once).
+    ``math="ieee"`` makes the f32 math of the body CUDA's without fast math and without flush to zero: ``/`` and
+    ``sqrt`` are IEEE 754 (``div.rn.f32``, ``sqrt.rn.f32``), ``exp`` is ``expf``, ``silu`` is ``x / (1 + expf(-x))``
+    (torch's), ``rsqrt`` is ``rsqrtf``, and ``sin`` keeps a subnormal (note 13 of :mod:`tilefish.lower`);
+    the default, ``"fast"``, is the contract of before. One op can say it alone: ``tilefish.exp(x, math="ieee")``.
     """
     _check_decorator_arg("kernel", fn)
     if num_warps is not None and (
@@ -510,9 +518,12 @@ def kernel(
         raise TilefishDeclarationError(f"kernel: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
     if not isinstance(fp_fusion, bool):
         raise TilefishDeclarationError(f"kernel: fp_fusion must be True or False, got {fp_fusion!r}")
+    if math not in _MATH_MODES:
+        raise TilefishDeclarationError(f"kernel: math must be one of {list(_MATH_MODES)}, got {math!r}")
+    options = {"num_warps": num_warps, "fp_fusion": fp_fusion, "math": math}
     if fn is None:
-        return lambda f: _declare_traced(f, name, KernelOp, "kernel", num_warps=num_warps, fp_fusion=fp_fusion)
-    return _declare_traced(fn, name, KernelOp, "kernel", num_warps=num_warps, fp_fusion=fp_fusion)
+        return lambda f: _declare_traced(f, name, KernelOp, "kernel", **options)
+    return _declare_traced(fn, name, KernelOp, "kernel", **options)
 
 
 # -- extern -----------------------------------------------------------------------------------
@@ -521,6 +532,7 @@ _TRITON_REF = re.compile(r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*\Z")
 LANGUAGES = ("triton", "gluon")  # the frontends of Triton a hand-written kernel is compiled by: triton.jit, and Gluon's gluon.jit
 _OP_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")  # ASCII only: an op name is part of a stem, which is part of a file name
 _NUM_WARPS = (1, 2, 4, 8, 16, 32)
+_MATH_MODES = ("fast", "ieee")  # the f32 math of a kernel body (note 13 of tilefish.lower)
 
 
 class _TritonTarget:

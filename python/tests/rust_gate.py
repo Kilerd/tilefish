@@ -89,7 +89,7 @@ from typing import Any, Callable
 
 import torch
 from gpu_util import randn, same_bytes
-from host_ops import GEMM_SHAPES, abi_of, broadcast_ops, gemm_name, generated_ops, gluon_ops, gpu_ops, library_ops, ops, per_arch_ops
+from host_ops import GEMM_SHAPES, abi_of, broadcast_ops, gemm_name, generated_ops, gluon_ops, gpu_ops, ieee_ops, library_ops, ops, per_arch_ops
 
 import tilefish
 from tilefish import runtime
@@ -451,6 +451,36 @@ def must_be_causal(args, got):
     assert same_bytes(got, torch.where(i[None, :] <= i[:, None], s, float("-inf")))
 
 
+def f32_words(n, seed):
+    """``n`` random f32 bit patterns (every exponent: NaNs, infinities, subnormals), the specials first."""
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(seed)
+    words = torch.randint(-(2**31), 2**31, (n,), generator=gen, device="cuda", dtype=torch.int64).to(torch.int32).view(F32)
+    words[:6] = torch.tensor([0.0, -0.0, 1e-40, -1e-40, float("inf"), float("nan")], device="cuda")
+    return words
+
+
+def must_be_torchs_exp(args, got):
+    """The first result of ``math_ieee`` is torch's ``exp`` (the others are held to torch by ``test_gpu_ieee.py``, and to Python by the gate)."""
+    (x,) = args
+    assert same_bytes(got, torch.exp(x))
+
+
+def must_divide(args, got):
+    x, y = args
+    assert same_bytes(got, x / y)
+
+
+def args_periodic(spec, seed):
+    rows, cols = spec
+    return randn((rows, cols), F32, seed + rows, scale=4.0), randn((cols,), F32, seed + cols).abs() + 0.05
+
+
+def must_be_periodic(args, got):
+    x, a = args
+    assert same_bytes(got, x + (1.0 / (a + 1e-9)) * torch.sin(a * x) ** 2)
+
+
 def given_ops():
     """``{name: extern}``: a prebuilt PTX whose ``k: const[i32]`` and ``c: const[i64]`` every call gives (``gpu_kernels_p6.scale_add``). Not in the committed
     fixtures, so only a fresh export has it."""
@@ -602,6 +632,11 @@ def build_cases():
     cases += plain("key_mask_heads", "key_mask_heads", args_heads, (1, 7, 33, 130), seeds=(0,), check=must_mask_keys)
     cases += plain("middle_rows", "middle_rows", args_middle, ((1, 1, 1), (2, 5, 7), (3, 40, 64)), seeds=(0,), check=must_scale_the_middle)
     cases += plain("causal_heads", "causal_heads", lambda length, seed: args_heads(length, seed)[:1], (1, 7, 33), seeds=(0,), check=must_be_causal)
+    # -- IEEE math: inline PTX of CUDA's expf, sqrtf, rsqrtf, sinf, torch's silu and IEEE division, on random bit patterns; a row kernel per bucket
+    cases += plain("math_ieee", "math_ieee", lambda n, seed: (f32_words(n, seed),), (6, 1000, 1 << 20), seeds=(0, 1), check=must_be_torchs_exp)
+    cases += plain("div_ieee", "div_ieee", lambda n, seed: (f32_words(n, seed), f32_words(n, seed + 7)), (6, 1000, 1 << 20), seeds=(0, 1), check=must_divide)
+    for cols in (96, 1000):
+        cases += plain("periodic", f"periodic.Db{cols}", args_periodic, ((1, cols), (40, cols)), seeds=(0,), check=must_be_periodic)
     return cases
 
 
@@ -823,6 +858,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(f16_ops())
         declared.update(tma_ops())
         declared.update(broadcast_ops())
+        declared.update(ieee_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)

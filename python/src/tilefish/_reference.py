@@ -26,6 +26,10 @@ What stays different, and what a tolerance has to cover, is everything the binar
 order of a reduction, and FMA contraction (the binaries fuse ``a * b + c`` into one rounding, the
 reference rounds twice). The gpu tests measure the resulting error per kernel.
 
+In IEEE math (``@tilefish.kernel(math="ieee")``, or ``math="ieee"`` at an op: note 13 of :mod:`tilefish.lower`) the reference is torch's
+own CUDA op: ``/`` is ``torch.div`` (a scalar divisor too, as a 0-d tensor: no reciprocal), ``exp``, ``sqrt``, ``rsqrt`` and ``sin`` torch's,
+and ``silu`` ``torch.nn.functional.silu``; on a GPU these are the binary's bytes.
+
 An ``InOut`` or ``Out`` parameter is written once, with the final version stored into it, after the whole
 body has been evaluated, like the lowered kernel does: reads never see a store.
 """
@@ -126,6 +130,7 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
     """
     torch = _torch()
     graph = kernel.graph
+    math = getattr(kernel, "math", "fast")  # an op that says its own math (math= at the call) keeps it
     device = next(iter(tensors.values())).device
     env: dict[Value, Any] = {}
     for p in graph.inputs:
@@ -202,6 +207,8 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 r = a[0] - a[1]
             elif op == "mul":
                 r = a[0] * a[1]
+            elif op == "div" and n.attrs.get("math", math) == "ieee":  # IEEE division, a scalar divisor too (a 0-d tensor: torch divides)
+                r = torch.div(a[0], a[1])
             elif op == "div":
                 divisor = n.inputs[1]
                 if isinstance(divisor, Scalar) and divisor.dtype.name == "f32":  # a constant divisor: a multiply by 1/c
@@ -216,8 +223,12 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 r = torch.sqrt(a[0])
             elif op == "cos":
                 r = torch.cos(a[0])
+            elif op == "sin" and n.attrs.get("math", math) == "ieee":  # without flush to zero: torch's
+                r = torch.sin(a[0])
             elif op == "sin":  # libdevice built with FTZ: a subnormal argument is a zero of its sign, and sin(±0) = ±0
                 r = torch.where(a[0].abs() < 2.0**-126, a[0] * 0.0, torch.sin(a[0]))
+            elif op == "silu" and n.attrs.get("math", math) == "ieee":  # torch's: x / (1 + expf(-x))
+                r = torch.nn.functional.silu(a[0])
             elif op == "silu":  # x * sigmoid(x), sigmoid(x) = 1 / (1 + exp(-x))
                 r = a[0] * (1.0 / (1.0 + torch.exp(-a[0])))
             elif op == "gelu":  # exact erf form, evaluated left to right

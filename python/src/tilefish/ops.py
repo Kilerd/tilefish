@@ -322,16 +322,39 @@ def iota(x: Any, axis: int = -1, *, dtype: "DType | None" = None) -> Value:
 # -- unary math -----------------------------------------------------------------
 
 
-def _unary(op: str, x: Any) -> Value:
+MATH_MODES = ("fast", "ieee")  # the f32 math of an op (note 13 of tilefish.lower): None takes the kernel's
+
+
+def _math_attrs(op: str, math: Any) -> "dict[str, Any]":
+    """The node's ``math`` attribute: none when the call does not say (the kernel's ``math=`` decides), else the mode it asks for."""
+    if math is None:
+        return {}
+    if not isinstance(math, str) or math not in MATH_MODES:
+        raise TilefishTypeError(f"{op}: math must be one of {list(MATH_MODES)} (or None: the kernel's), got {math!r}")
+    return {"math": math}
+
+
+def _unary(op: str, x: Any, math: Any = None) -> Value:
+    attrs = _math_attrs(op, math)
     x = _require_value(op, "argument 'x'", x)
     _require_computable(op, "argument 'x'", x, floating=True)
-    (out,) = x.ctx.emit(op, [x], {}, [x.type.materialized()])
+    (out,) = x.ctx.emit(op, [x], attrs, [x.type.materialized()])
     return out
 
 
-def silu(x: Value) -> Value:
-    """``x * sigmoid(x)``."""
-    return _unary("silu", x)
+def div(left: Any, right: Any, *, math: Any = None) -> Value:
+    """``left / right`` of floating-point tensors (or a tensor and a scalar), as the ``/`` operator, with the math of the op said here:
+    ``math="ieee"`` is IEEE 754 division (``div.rn.f32``: correctly rounded, subnormals kept), ``"fast"`` is ``div.full.f32`` (note 4 of
+    :mod:`tilefish.lower`), and ``None`` (``/``) is the kernel's ``math=``."""
+    attrs = _math_attrs("div", math)
+    ctx, operands, dtype, shape = _operands("div (/)", [("left operand", left), ("right operand", right)], floating=True)
+    (out,) = ctx.emit("div", operands, attrs, [TensorType(shape, dtype)])
+    return out
+
+
+def silu(x: Value, *, math: Any = None) -> Value:
+    """``x * sigmoid(x)``; with ``math="ieee"`` torch's ``x / (1 + expf(-x))`` (note 13 of :mod:`tilefish.lower`)."""
+    return _unary("silu", x, math)
 
 
 def gelu(x: Value) -> Value:
@@ -339,27 +362,30 @@ def gelu(x: Value) -> Value:
     return _unary("gelu", x)
 
 
-def rsqrt(x: Value) -> Value:
-    """``1 / sqrt(x)``."""
-    return _unary("rsqrt", x)
+def rsqrt(x: Value, *, math: Any = None) -> Value:
+    """``1 / sqrt(x)`` (``rsqrt.approx``; with ``math="ieee"`` without flush to zero, CUDA's ``rsqrtf``)."""
+    return _unary("rsqrt", x, math)
 
 
-def exp(x: Value) -> Value:
-    return _unary("exp", x)
+def exp(x: Value, *, math: Any = None) -> Value:
+    """``e ** x``: ``ex2.approx`` of ``x * log2(e)`` by default, CUDA's ``expf`` (without flush to zero) with ``math="ieee"`` (note 13 of
+    :mod:`tilefish.lower`)."""
+    return _unary("exp", x, math)
 
 
-def sqrt(x: Value) -> Value:
-    return _unary("sqrt", x)
+def sqrt(x: Value, *, math: Any = None) -> Value:
+    """The square root, correctly rounded (``sqrt.rn``; a subnormal argument flushed to zero, but with ``math="ieee"``)."""
+    return _unary("sqrt", x, math)
 
 
-def sin(x: Value) -> Value:
-    """The sine (libdevice's ``sinf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`)."""
-    return _unary("sin", x)
+def sin(x: Value, *, math: Any = None) -> Value:
+    """The sine (libdevice's ``sinf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`; with ``math="ieee"`` a subnormal is kept)."""
+    return _unary("sin", x, math)
 
 
-def cos(x: Value) -> Value:
-    """The cosine (libdevice's ``cosf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`)."""
-    return _unary("cos", x)
+def cos(x: Value, *, math: Any = None) -> Value:
+    """The cosine (libdevice's ``cosf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`: the same in both math modes)."""
+    return _unary("cos", x, math)
 
 
 # -- casts ------------------------------------------------------------------------

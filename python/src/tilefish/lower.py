@@ -123,21 +123,27 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
 ``a * b``                                                                                    ``a * b + c`` may round once, as
                                                                                          one FMA (note 2).
 ``a / b``                   ``a / b``                                                       f32 only (note 4): ``div.full.f32``,
-                                                                                         not IEEE division.
+                                                                                         not IEEE division; IEEE math (note 13):
+                                                                                         ``div.rn.f32``.
 ``i // c``, ``i % c``       ``i // c``, ``i % c`` (C's), then moved to the floor:           integers, a positive constant ``c``:
                             ``tl.where(r < 0, ...)``                                        Python's semantics, exact (note 11).
-``rsqrt(x)``                ``tl.rsqrt(x)``                                                 f32 only; approximate (note 5).
-``exp(x)``                  ``tl.exp(x)``                                                   f32 only; fast exp (note 5).
+``rsqrt(x)``                ``tl.rsqrt(x)``                                                 f32 only; approximate (note 5). IEEE
+                                                                                         math: ``rsqrtf`` (note 13).
+``exp(x)``                  ``tl.exp(x)``                                                   f32 only; fast exp (note 5). IEEE math:
+                                                                                         CUDA's ``expf`` (note 13).
 ``sqrt(x)``                 ``tl.sqrt_rn(x)``                                               f32 only; IEEE round to nearest, but
-                                                                                         subnormals flush to zero (note 5).
+                                                                                         subnormals flush to zero (note 5). IEEE
+                                                                                         math: ``sqrt.rn.f32`` (note 13).
 ``silu(x)``                 ``x * tl.sigmoid(x)``                                           f32 only; ``tl.sigmoid`` is
-                                                                                         ``1 / (1 + tl.exp(-x))``.
+                                                                                         ``1 / (1 + tl.exp(-x))``. IEEE math:
+                                                                                         torch's ``x / (1 + expf(-x))``.
 ``gelu(x)``                 ``0.5 * x * (1.0 + tl.math.erf(x * 0.7071067811865476))``       f32 only; exact erf form, evaluated
                                                                                          left to right (note 5).
 ``sin(x)``, ``cos(x)``      ``tl.sin(x)``, ``tl.cos(x)``                                    f32 only; libdevice ``__nv_sinf`` /
                                                                                          ``__nv_cosf``, built with FTZ: torch's
                                                                                          CUDA bits except ``sin`` of a
-                                                                                         subnormal, which is ±0 (note 10).
+                                                                                         subnormal, which is ±0 (note 10); in
+                                                                                         IEEE math that is ``x`` (note 13).
 ``sum(x, axis=-1)``         ``tl.sum(tl.where(mask, x, 0.0), axis=0)``                      f32 only. The reduction is over all
                                                                                          ``BLOCK_D`` lanes; masked lanes are
                                                                                          set to 0 explicitly (intermediates
@@ -330,6 +336,36 @@ Notes (the facts behind the table):
     the broadcast counts), which a host derives from the shapes like any dimension scalar, so one binary serves every size. Exact: integer
     arithmetic on ``i32``, every intermediate below ``n``, which is below ``2**31``. A broadcast operand is never written; a gather or a scatter of a
     broadcast shape is not lowered (rule ``elementwise.broadcast-index``).
+13. **IEEE math** (``@tilefish.kernel(math="ieee")``, or ``math="ieee"`` at one op: ``tilefish.div(a, b, math="ieee")``, ``tilefish.exp(x,
+    math="ieee")``, ...; an op's own ``math=`` wins over the kernel's, ``"fast"`` included). The f32 math of CUDA C++ compiled without fast math and
+    without flush to zero (nvcc's defaults ``-ftz=false -prec-div=true -prec-sqrt=true``, what torch's CUDA kernels are built with), written out
+    as the inline PTX nvcc emits (NVRTC 12.8, sm_100), because Triton links libdevice with ``__CUDA_FTZ = 1`` and emits ``.ftz`` for its own
+    ``div_rn`` and ``sqrt_rn``. Each op is a module-level helper (``_tf_exp_ieee``) whose ``add`` and ``mul`` carry ``.rn``, which rounds as the
+    plain form does and keeps ``ptxas`` from contracting them with an instruction outside the block:
+
+    * ``a / b`` is ``div.rn.f32``: IEEE 754 division, correctly rounded, subnormals kept; a constant divisor too (it is divided by, not
+      multiplied by its reciprocal; torch's ``x / 3.0`` of a python scalar multiplies by ``f32(1 / 3)``, its ``x / tensor`` divides);
+    * ``exp(x)`` is CUDA's ``expf``: ``j`` = ``x * log2(e)`` rounded down to an integer through ``fma.rm`` (with the bias ``12582913``), ``r = x *
+      log2(e) - j`` in two ``fma.rn`` (``log2(e)`` as ``0x3FB8AA3B`` plus ``0x32A57060``), ``ex2.approx.ftz(r)`` (``r`` is in ``[-1, 1]``: nothing to
+      flush) times ``2**j`` built in the exponent bits, one ``mul.rn``: at most 2 ULP, subnormal results kept (``x`` from about ``-103.97`` to
+      ``-87.34``, which the default math's ``ex2.approx`` of ``x * log2(e)`` and libdevice's FTZ ``expf`` give as 0);
+    * ``silu(x)`` is torch's ``x / (1 + expf(-x))`` as nvcc compiles it: the negation folded into the constants of ``expf`` (exact), ``2**r * 2**j +
+      1`` one ``fma.rn`` (nvcc contracts the multiply that ends ``expf`` with the add, ``-fmad=true``), then ``div.rn.f32``. A body that writes
+      ``x / (1.0 + tilefish.exp(-x))`` instead rounds the multiply first: tilefish never contracts across an op of IEEE math;
+    * ``sqrt(x)`` is ``sqrt.rn.f32`` (correctly rounded, a subnormal argument kept), ``rsqrt(x)`` is CUDA's ``rsqrtf``, ``rsqrt.approx.f32``
+      without flush to zero;
+    * ``sin(x)`` is libdevice's ``sinf`` (built with FTZ, which differs from the library without it only on a subnormal argument, note 10) with
+      that argument passed through as its own sine: ``tl.where(tl.abs(x) < 2**-126, x, tl.sin(x))``; ``cos`` is the same in both maths.
+
+    Measured on every one of the ``2**32`` f32 bit patterns (``tests/test_gpu_ieee.py``; torch 2.9.1 on a B300 MIG slice, sm_103, built with CUDA 12.8
+    and with 13.0, and on an RTX 5090, sm_120, built with CUDA 13.0): ``exp``,
+    ``sqrt``, ``rsqrt``, ``sin`` and ``silu`` are torch's CUDA bits on every input, NaNs, infinities, zeros and subnormals included (the default math
+    differs on 129 346 491 inputs for ``exp``, 146 046 470 for ``silu``, and on the 16 777 214 subnormals and nothing else for ``sqrt``, ``rsqrt`` and
+    ``sin``); ``/`` is torch's division of tensors on three sets of 2**26 random bit-pattern pairs, every subnormal as the numerator and as the divisor and the special values pairwise (the default math's
+    differs in 49 229 767 of those 234 881 216 pairs on sm_103, 49 247 968 on sm_120). Other ops (``gelu``'s ``erf``, the reductions, the casts) are the same in both maths, and so is ``mean``
+    (``sum * f32(1 / D)``, as torch's ``mean`` multiplies by ``1 / N``). With ``fp_fusion=False`` too, a body of these ops rounds where torch's
+    eager ops round, so it is torch's eager composition byte for byte. The ``reference`` mode in IEEE math is torch's own op (``torch.div`` of
+    tensors, ``torch.exp``, ``torch.nn.functional.silu``, ...).
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -417,6 +453,74 @@ _INDEX_SENTINEL = 2147483647  # the column of a masked lane in an argmax / argmi
 
 _FULL, _COL, _ROW = "full", "col", "row"  # row template: [R, D], [D], [R] / [R, 1]
 _SCALAR, _DEV = "scalar", "devscalar"  # rank 0: a value read from a DevScalar (broadcast), and the DevScalar parameter itself (a pointer to one element)
+
+
+# -- f32 math in IEEE mode (note 13) ----------------------------------------------------------------
+# The PTX that CUDA C++ compiles each to without fast math and without flush to zero (nvcc's defaults: -ftz=false -prec-div=true -prec-sqrt=true,
+# what torch's CUDA kernels are built with), read from NVRTC 12.8 for sm_100, written out as inline PTX so that Triton, which links libdevice with
+# __CUDA_FTZ = 1 and emits ``.ftz`` for its own division and square root, compiles exactly this. ``add`` and ``mul`` carry ``.rn``, which rounds as the
+# plain form does and keeps ptxas from contracting them with an instruction outside the block.
+
+_EXPF = (  # expf(x): a range reduction j = round(x * log2 e) (fma.rm onto 1.5 * 2**23 + 1), r = x * log2 e - j in two parts, 2**r * 2**j
+    "fma.rn.f32 t0, $1, 0f3BBB989D, 0f3F000000;",  # x * log2(e) / 252 + 0.5
+    "cvt.sat.f32.f32 t1, t0;",  # clamped to [0, 1]
+    "fma.rm.f32 t2, t1, 0f437C0000, 0f4B400001;",  # * 252 + 12582913, rounded down: j in the low bits
+    "add.rn.f32 t3, t2, 0fCB40007F;",  # - 12583039
+    "neg.f32 t3, t3;",
+    "fma.rn.f32 t4, $1, 0f3FB8AA3B, t3;",  # x * log2(e) (high part) - j
+    "fma.rn.f32 t4, $1, 0f32A57060, t4;",  # + x * log2(e) (low part)
+    "mov.b32 r0, t2;",
+    "shl.b32 r1, r0, 23;",  # 2**j as the bits of an f32
+    "mov.b32 t5, r1;",
+    "ex2.approx.ftz.f32 t6, t4;",  # 2**r (r in [-1, 1]: nothing to flush)
+)
+_SILU = (  # x / (1 + expf(-x)), as torch's silu kernel compiles: the negation folded into the constants, 2**r * 2**j + 1 one fma
+    "fma.rn.f32 t0, $1, 0fBBBB989D, 0f3F000000;",
+    "cvt.sat.f32.f32 t1, t0;",
+    "fma.rm.f32 t2, t1, 0f437C0000, 0f4B400001;",
+    "add.rn.f32 t3, t2, 0fCB40007F;",
+    "neg.f32 t3, t3;",
+    "fma.rn.f32 t4, $1, 0fBFB8AA3B, t3;",
+    "fma.rn.f32 t4, $1, 0fB2A57060, t4;",
+    "mov.b32 r0, t2;",
+    "shl.b32 r1, r0, 23;",
+    "mov.b32 t5, r1;",
+    "ex2.approx.ftz.f32 t6, t4;",
+    "fma.rn.f32 t7, t6, t5, 0f3F800000;",  # expf(-x) + 1, one rounding (nvcc contracts the multiply of expf with the add)
+    "div.rn.f32 $0, $1, t7;",
+)
+
+
+_IEEE_HEADER = "math: ieee (note 13: / and sqrt are IEEE 754, exp is expf, silu torch's, rsqrt rsqrtf, sin keeps a subnormal; no flush to zero)"
+
+
+def _asm(instructions: "Iterable[str]", constraints: str, args: str, regs: str = "") -> "list[str]":
+    """The body of a helper that is one block of inline PTX (one element per instance), its instructions one per line of the string."""
+    lines = ["return tl.inline_asm_elementwise("]
+    if regs:
+        lines.append(f'    "{{ {regs} "')
+        lines += [f'    "{i} "' for i in instructions]
+        lines.append('    "}",')
+    else:
+        (only,) = instructions
+        lines.append(f'    "{only}",')
+    lines += [f'    "{constraints}",', f"    [{args}],", "    dtype=tl.float32,", "    is_pure=True,", "    pack=1,", ")"]
+    return lines
+
+
+_IEEE: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {  # op -> (parameters, comment, body) of its helper in IEEE math (note 13)
+    "div": ("a, b", ("IEEE 754 division: correctly rounded, subnormals kept (CUDA's '/', not Triton's div.full or div.rn.ftz)",),
+            _asm(["div.rn.f32 $0, $1, $2;"], "=f,f,f", "a, b")),
+    "sqrt": ("x", ("IEEE 754 square root: correctly rounded, a subnormal argument kept (CUDA's sqrtf, not sqrt.rn.ftz)",),
+             _asm(["sqrt.rn.f32 $0, $1;"], "=f,f", "x")),
+    "rsqrt": ("x", ("CUDA's rsqrtf: rsqrt.approx without flush to zero",), _asm(["rsqrt.approx.f32 $0, $1;"], "=f,f", "x")),
+    "exp": ("x", ("CUDA's expf without flush to zero (note 13 of tilefish.lower): the sequence nvcc emits",),
+            _asm([*_EXPF, "mul.rn.f32 $0, t6, t5;"], "=f,f", "x", ".reg .f32 t<7>; .reg .b32 r<2>;")),
+    "silu": ("x", ("torch's silu, x / (1 + expf(-x)), as nvcc compiles it without flush to zero (note 13 of tilefish.lower)",),
+             _asm(list(_SILU), "=f,f", "x", ".reg .f32 t<8>; .reg .b32 r<2>;")),
+    "sin": ("x", ("libdevice's sinf (built with flush to zero), but a subnormal argument is its own sine, as without flush to zero",),
+            ["return tl.where(tl.abs(x) < 1.1754943508222875e-38, x, tl.sin(x))"]),
+}  # (cos is libdevice's cosf in both: it has the same bits with and without flush to zero, note 10)
 
 
 # -- the result ---------------------------------------------------------------------------------
@@ -1546,13 +1650,14 @@ class _Body:
     """Emits the statements of the kernel body, one local per SSA value."""
 
     def __init__(
-        self, op: KernelOp, layout: _Layout, names: _Names, out_names: "list[str]", rename: "dict[str, str]"
+        self, op: KernelOp, layout: _Layout, names: _Names, out_names: "list[str]", rename: "dict[str, str]", math: str = "fast"
     ) -> None:
         self.graph = op.graph
         self.layout = layout
         self.names = names
         self.out_names = out_names
         self.rename = rename  # kernel parameter name -> its name in the generated function, where they differ
+        self.math = math  # the kernel's f32 math (note 13); an op may say its own
         self.params = {p.name: p for p in op.graph.inputs}
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
@@ -1616,6 +1721,8 @@ class _Body:
             v = self.local()
             self.var[out] = v
             rounding = "rounding point" if n.is_rounding_point else ""
+            if n.op in _IEEE and self.math_of(n) == "ieee" and self.math != "ieee":
+                rounding = "math: ieee"  # an op that says its own math in a kernel of the default math
             self.emit(f"{v} = {self.expression(n, v)}", rounding)  # an expression may emit the statements it needs first
 
     def run(self) -> "list[str]":
@@ -1807,6 +1914,19 @@ class _Body:
             self.helpers[key] = (name, lines)
         return self.helpers[key][0]
 
+    def math_of(self, n: Node) -> str:
+        """The f32 math of an op: what the call said (``tilefish.exp(x, math="ieee")``), else the kernel's (note 13)."""
+        return str(n.attrs.get("math", self.math))
+
+    def ieee_helper(self, op: str) -> str:
+        """The name of the module-level helper of an op in IEEE math (note 13), written into :attr:`helpers` the first time it is needed."""
+        key = ("ieee", op)
+        if key not in self.helpers:
+            name = self.names.fresh(f"_tf_{op}_ieee")
+            params, doc, body = _IEEE[op]
+            self.helpers[key] = (name, ["@triton.jit", f"def {name}({params}):", *(f"    # {line}" for line in doc), *(f"    {line}" for line in body)])
+        return self.helpers[key][0]
+
     def arg_lanes(self, n: Node, v: str) -> "tuple[str, str]":
         """The (value, index) pair each lane of the row (or of the chunk) offers an argmax / argmin; a masked lane loses to every lane."""
         layout = self.layout
@@ -1853,6 +1973,8 @@ class _Body:
             return f"{a[0]} {_LOGICAL[op]} {a[1]}"
         if op == "not":
             return f"~{a[0]}"
+        if self.math_of(n) == "ieee" and op in _IEEE:  # note 13: CUDA's f32 math without fast math or flush to zero
+            return f"{self.ieee_helper(op)}({', '.join(a)})"
         if op in _BINARY:
             return f"{a[0]} {_BINARY[op]} {a[1]}"
         if op == "rsqrt":
@@ -1915,6 +2037,7 @@ def lower(
     template: "str | None" = None,
     num_warps: "int | None" = None,
     fp_fusion: "bool | None" = None,
+    math: "str | None" = None,
 ) -> LoweredKernel:
     """Lower a ``@tilefish.kernel`` to Triton source.
 
@@ -1924,8 +2047,9 @@ def lower(
     tried first and then the row template. ``num_warps`` overrides the kernel's own
     ``num_warps=`` and the template's rule, and pins the warp count of every bucket; without either,
     each bucket of a bucketed ``D`` gets the warps of its own size. ``fp_fusion`` overrides the kernel's
-    own ``fp_fusion=`` (``False``: no FMA contraction). Raises :class:`~tilefish.errors.TilefishLoweringError`
-    when the body fits no template.
+    own ``fp_fusion=`` (``False``: no FMA contraction), and ``math`` its ``math=`` (``"ieee"``: note 13; an op
+    that says its own keeps it). Raises :class:`~tilefish.errors.TilefishLoweringError` when the body fits
+    no template.
     """
     module, fn_name = _check_names(op, module)
     if template is not None and template not in TEMPLATES:
@@ -1934,6 +2058,10 @@ def lower(
         fp_fusion = op.fp_fusion
     if not isinstance(fp_fusion, bool):
         raise TilefishLoweringError(f"lower: fp_fusion must be True or False, got {fp_fusion!r}", rule="fp-fusion")
+    if math is None:
+        math = getattr(op, "math", "fast")
+    if math not in ("fast", "ieee"):
+        raise TilefishLoweringError(f"lower: math must be 'fast' or 'ieee', got {math!r}", rule="math")
     if num_warps is None:
         num_warps = op.num_warps
     if num_warps is not None and (isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in NUM_WARPS):
@@ -1955,7 +2083,7 @@ def lower(
             if not (t == "elementwise" and not bcast):  # the broadcasting attempt says more
                 failed.append((t, e))
             continue
-        return _assemble(op, layout, module, fn_name, num_warps, fp_fusion)
+        return _assemble(op, layout, module, fn_name, num_warps, fp_fusion, math)
     errors = [e for _, e in sorted(failed, key=lambda f: TEMPLATES.index(f[0]))]
     if len(errors) == 1:
         raise errors[0]
@@ -1966,7 +2094,7 @@ def lower(
 
 
 def _assemble(
-    op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warps: "int | None", fp_fusion: bool
+    op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warps: "int | None", fp_fusion: bool, math: str = "fast"
 ) -> LoweredKernel:
     graph = op.graph
     user = list(op.signature.params)
@@ -2025,13 +2153,14 @@ def _assemble(
         )
         element_counts.update({k: rename.get(v, v) for k, v in layout.counts.items()})  # a broadcast operand's own count
 
-    body_emitter = _Body(op, layout, names, out_names, rename)
+    body_emitter = _Body(op, layout, names, out_names, rename, math)
     body = body_emitter.run()
     header = [
         f"Generated by tilefish.lower from the kernel '{op.name}'. Do not edit.",
         *layout.header(),
         warps_header,
         *(["fp_fusion: False (no FMA contraction: a * b + c rounds twice)"] if not fp_fusion else []),
+        *([_IEEE_HEADER] if math == "ieee" else []),
         *[f"parameter '{old}' of the kernel is '{new}' here (the name is used by this module)" for old, new in rename.items()],
         "Numerics contract: see the docstring of tilefish.lower.",
     ]

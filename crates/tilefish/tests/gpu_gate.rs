@@ -1451,6 +1451,30 @@ fn the_gate_has_broadcasts_along_any_axis() {
     }
 }
 
+/// Lowered kernels in IEEE math (`python/tests/ieee_cases.py`, `host_ops.ieee_ops`; note 13 of `tilefish.lower`): their binaries hold inline PTX
+/// (CUDA's `expf`, `sqrtf`, `rsqrtf`, IEEE division, torch's silu) and are entries like any other, with the sha256 of the generated source; a
+/// row kernel in IEEE math without contraction has one per bucket. `byte_identity` holds their bytes to Python's (which `rust_gate.py` holds to
+/// torch's). A committed fixture has none.
+#[test]
+fn the_gate_has_kernels_in_ieee_math() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no kernel in IEEE math");
+        return;
+    }
+    let arch = cases["arch"].as_str().unwrap().to_owned();
+    let manifest = manifest();
+    for stem in ["math_ieee", "div_ieee", "periodic.Db96", "periodic.Db1000"] {
+        let entry = manifest.entry(stem, &arch).unwrap_or_else(|| panic!("the gate's manifest has no {stem}"));
+        assert!(entry.source_sha256.is_some(), "{stem}: the sha256 of the generated source");
+        let n = cases_where(&cases, |c| c["stem"] == stem).len();
+        assert!(n >= 2, "{stem}: {n} cases");
+        println!("rust gate: the kernel in IEEE math {stem}: {n} cases");
+    }
+    let periodic = manifest.entry("periodic.Db96", &arch).unwrap();
+    assert_eq!(periodic.enable_fp_fusion, Some(false), "periodic: no contraction");
+}
+
 /// The GEMMs of the forms of section 9.2 of the manifest schema (on a fresh export): f16 operands in TN (with 64 MiB of workspace) and in NN (with a
 /// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN, f16 operands pinned for a partition of 16 SMs
 /// (`sm_count_target`: the Rust host sets it on every launch, and a host on a partition takes only the pins chosen for it), and f32 operands with

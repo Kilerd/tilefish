@@ -234,6 +234,15 @@ def broadcast_ops():
     return {"key_mask_heads": bc.key_mask_heads, "middle_rows": bc.middle_rows, "causal_heads": bc.causal_heads}
 
 
+def ieee_ops():
+    """``{name: kernel}``: lowered kernels in IEEE math (``ieee_cases.py``, note 13 of ``tilefish.lower``), whose binaries hold inline PTX:
+    ``math_ieee`` (CUDA's ``expf``, ``sqrtf``, ``rsqrtf``, ``sinf`` and torch's silu), ``div_ieee`` (``div.rn.f32``) and ``periodic`` (a row kernel in
+    IEEE math without contraction, one binary per bucket of its columns). The committed fixtures do not have them."""
+    import ieee_cases as ic
+
+    return {"math_ieee": ic.math_ieee, "div_ieee": ic.div_ieee, "periodic": ic.periodic}
+
+
 def gemm_name(n, k, bias):
     return f"gemm_{n}_{k}{'_bias' if bias else ''}"
 
