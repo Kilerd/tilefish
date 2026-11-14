@@ -1341,7 +1341,14 @@ def _parse_extern_stub(fn: Callable[..., Any], name: "str | None", index_bits: i
     if not _OP_NAME.fullmatch(nm):
         raise TilefishDeclarationError(f"extern: the function name {nm!r} is not a plain identifier; pass name=... to give the op one")
     sig = parse_signature(
-        fn, what="extern op", name=nm, allow_dim_const_defaults=not prebuilt, allow_strided=True, allow_output_dims=True, allow_alias=True
+        fn,
+        what="extern op",
+        name=nm,
+        allow_dim_const_defaults=not prebuilt,
+        allow_strided=True,
+        allow_output_dims=True,
+        allow_alias=True,
+        allow_tensor_map=not prebuilt,
     )
     if sig.returns:
         raise TilefishDeclarationError(
@@ -1360,6 +1367,8 @@ def _parse_extern_stub(fn: Callable[..., Any], name: "str | None", index_bits: i
     if index_bits == 32:
         for p in sig.params:
             if p.kind != "tensor" or p.is_devscalar:  # one element: nothing to overflow
+                continue
+            if p.tensor_map is not None:  # a descriptor: the kernel addresses it by coordinates through TMA (each axis bounded by its i32 shape slot)
                 continue
             if p.strided:  # the limit is on the largest offset the view reaches (a max_extent precondition), known at launch only
                 limits[p.name] = MAX_ELEMENTS

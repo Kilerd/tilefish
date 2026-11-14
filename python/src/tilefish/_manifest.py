@@ -167,7 +167,7 @@ _ARCH = re.compile(r"sm_[0-9]{2,3}", re.ASCII)  # `is_arch`
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)  # `is_digest`
 _U64_MAX = 2**64 - 1
 # every field a parameter of the ABI may have (`RawParam`), the ones it must have, and the width each scalar type is passed with
-_PARAM_FIELDS = frozenset("slot index name kind type ptx_type size dtype access shape dim count_of strides offset stride_of value alias".split())
+_PARAM_FIELDS = frozenset("slot index name kind type ptx_type size dtype access shape dim count_of strides offset stride_of value alias tensor_map".split())
 _PARAM_REQUIRED = ("slot", "index", "name", "kind", "type", "ptx_type", "size")
 _PASSED_AS = {"scalar": {"i32": ("u32", 4), "i64": ("u64", 8)}, "fixed": {"i32": ("u32", 4), "i64": ("u64", 8), "f32": ("f32", 4)}}
 
@@ -240,6 +240,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
     params = abi.get("params")
     if not isinstance(params, list):
         bad(f"abi.params must be a list, got {params!r}")
+    slot = 0  # where the next parameter's slots begin: a descriptor takes 1 + 2 * rank, every other parameter one
     for position, p in enumerate(params):
         if not isinstance(p, dict):
             bad(f"abi.params[{position}] must be an object (its fields by name), got {p!r}")
@@ -261,10 +262,15 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
                 bad(f"parameter {name}: {key} must be a {kind_of_value.__name__}, got {p[key]!r}")
         if _has(p, "stride_of") and not isinstance(p["stride_of"], (dict, list)):
             bad(f"parameter {name}: stride_of must be an object or a list of them, got {p['stride_of']!r}")
-        if p["slot"] != position:
-            bad(f"parameter {name} has slot {p['slot']} but is at position {position}")
+        if p["slot"] != slot:
+            bad(f"parameter {name} has slot {p['slot']}, but its slots begin at {slot} (position {position}; a descriptor takes 1 + 2 * rank slots)")
         pkind, ty = p["kind"], p["type"]
-        if pkind == "pointer":
+        slot += 1 + 2 * len(p["shape"]) if pkind == "tensordesc" and isinstance(p.get("shape"), list) else 1
+        if _has(p, "tensor_map") and pkind != "tensordesc":
+            bad(f"parameter {name} is a {pkind} and has a tensor_map: only a tensor descriptor (kind tensordesc) has one")
+        if pkind == "tensordesc":
+            _check_tensordesc(name, p, kind, bad)
+        elif pkind == "pointer":
             dtype = p.get("dtype") or ""
             if ALL_DTYPES.get(dtype) is None or ALL_DTYPES[dtype].triton_ptr != ty:
                 bad(f"parameter {name}: pointer type {ty!r} does not match dtype {dtype!r}")
@@ -361,7 +367,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
             if any(_has(p, k) for k in ("dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "dtype", "alias", "value")):
                 bad(f"parameter {name} is a fixed argument per call: it has no value, dim or shape (each call gives its value)")
         else:
-            bad(f"parameter {name}: kind must be pointer, scalar, fixed or given, got {pkind!r}")
+            bad(f"parameter {name}: kind must be pointer, tensordesc, scalar, fixed or given, got {pkind!r}")
     # an out pointer that may be written over an in pointer (`alias`, the Rust reader's `check_consistent`): that pointer is an `in` one, not strided and
     # not a device scalar, of the same dtype and declared shape, and no other out pointer names it
     from ._specvalid import check_alias_target
@@ -378,6 +384,47 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
         if p["alias"] in taken:
             bad(f"the out pointers {taken[p['alias']]} and {p['name']} both may alias '{p['alias']}': at most one is written over an input")
         taken[p["alias"]] = p["name"]
+
+
+def _check_tensordesc(name: str, p: "dict[str, Any]", kind: str, bad: Any) -> None:
+    """A ``tensordesc`` parameter (a TMA descriptor of a tensor, manifest schema 3 section 5.5): of a ``triton`` entry; ``type`` ``"tensordesc"``,
+    passed first as the CUtensorMap (``ptx_type`` ``b8[128]``, ``size`` 128; its shape and strides follow in its own slots); the fields of a pointer
+    (``dtype``, ``access``, ``shape`` of 1 to 5 axes, and for a descriptor of a view ``strides``/``offset``: its own stride dimensions, the last axis's
+    1, only when it is ``in``) and no ``dim``, ``count_of``, ``stride_of``, ``value`` or ``alias``; and a ``tensor_map`` the box, swizzle, fill and
+    data type of which agree with its dtype and rank (:func:`tilefish._tensormap.read_json`)."""
+    from . import _tensormap
+    from ._specvalid import check_tensordesc_layout
+
+    if kind != ENTRY_KIND_TRITON:
+        bad(f"parameter {name}: a tensor descriptor belongs to a Triton (or Gluon) kernel, and this is a {kind} kernel")
+    if p["type"] != "tensordesc" or p["ptx_type"] != "b8[128]" or p["size"] != 128:
+        bad(f"parameter {name}: a tensor descriptor has type 'tensordesc' and is passed as the 128 bytes of a CUtensorMap (ptx_type 'b8[128]', size 128)")
+    extra = [k for k in ("dim", "count_of", "stride_of", "value", "alias") if _has(p, k)]
+    if extra:
+        bad(f"parameter {name} is a tensor descriptor: it has the fields of a pointer and a tensor_map, and no {extra}")
+    dtype, access, shape = p.get("dtype"), p.get("access"), p.get("shape")
+    if not isinstance(dtype, str) or dtype not in _tensormap.DATA_TYPES:
+        bad(f"parameter {name}: a tensor descriptor describes one of {sorted(_tensormap.DATA_TYPES)}, got {dtype!r}")
+    if access not in ("in", "inout", "out"):
+        bad(f"parameter {name}: access must be in, inout or out, got {access!r}")
+    if not isinstance(shape, list) or not 1 <= len(shape) <= _tensormap.MAX_RANK:
+        bad(f"parameter {name}: a tensor descriptor has a shape of 1 to {_tensormap.MAX_RANK} axes, got {shape!r}")
+    for axis, d in enumerate(shape):
+        if not (_is_count(d, 1) or isinstance(d, str)):
+            bad(f"parameter {name}: shape[{axis}] must be an int size of at least 1 or a dimension expression, got {d!r}")
+    strides, offset = p.get("strides"), p.get("offset")
+    if (strides is None) != (offset is None):
+        bad(f"parameter {name}: strides and offset come together")
+    if strides is not None:
+        if len(strides) != len(shape):
+            bad(f"parameter {name}: strides must be a list with one entry per axis of shape, got {len(strides)} for {len(shape)} axes")
+        try:
+            check_tensordesc_layout(name, access, strides, offset)
+        except TilefishSpecError as e:
+            bad(str(e).removeprefix("malformed compile spec: "))
+    why = _tensormap.read_json(p.get("tensor_map"), dtype, len(shape))
+    if why is not None:
+        bad(f"parameter {name}: {why}")
 
 
 def _check_dimension_names(who: str, entry: "dict[str, Any]") -> None:
@@ -425,7 +472,7 @@ def _check_dimension_names(who: str, entry: "dict[str, Any]") -> None:
             for axis, d in enumerate(shape):
                 expression(d, f"preconditions[{i}] (max_elements) shape[{axis}]")
     for p in entry["abi"]["params"]:  # (each read by `_check_params`)
-        if p["kind"] == "pointer":
+        if p["kind"] in ("pointer", "tensordesc"):
             for axis, d in enumerate(p["shape"]):
                 if isinstance(d, str):
                     expression(d, f"parameter {p['name']} shape[{axis}]")

@@ -208,6 +208,10 @@ class ArgSpec:
     # an ``out`` pointer only: the ``in`` pointer argument it may be written over (``Out[..., MayAlias("r")]``); a launch accepts the two as
     # exactly one tensor. Absent for every other pointer, so a spec without it (and its digest) is what it always was
     alias: str | None = None
+    # a ``tensordesc`` argument only (a TMA descriptor of a tensor, ``TensorDesc(...)``): the ``tensor_map`` object of the manifest, every argument
+    # of ``cuTensorMapEncodeTiled`` that is not the tensor's (``tilefish._tensormap.TensorMapSpec.to_json``). Its ``type`` is the Triton signature
+    # entry (``tensordesc<fp16[128, 64]>``), and it has the fields of a pointer (``access``, ``dtype``, ``shape``, a view's ``strides``/``offset``)
+    tensor_map: "dict[str, Any] | None" = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"index": self.index, "name": self.name, "kind": self.kind, "type": self.type}
@@ -215,6 +219,8 @@ class ArgSpec:
             v = getattr(self, k)
             if v is not None:
                 out[k] = v
+        if self.tensor_map is not None:
+            out["tensor_map"] = copy.deepcopy(self.tensor_map)
         if self.value is not None:
             out["value"] = _encode(self.value)
         if self.shape is not None:
@@ -244,7 +250,14 @@ class ArgSpec:
                 kw["stride_of"] = stride_of_targets(kw["stride_of"])
             if "value" in kw:
                 kw["value"] = decode_scalar(kw["value"], "arg value")
+            if kw.get("tensor_map") is not None:
+                kw["tensor_map"] = copy.deepcopy(kw["tensor_map"])
             return cls(**kw)
+
+    @property
+    def is_tensor(self) -> bool:
+        """Whether the argument is a tensor the call gives: a pointer, or a TMA descriptor of the tensor (``tensordesc``)."""
+        return self.kind in ("pointer", "tensordesc")
 
 
 @dataclass(frozen=True)
@@ -427,7 +440,11 @@ class CompileSpec:
         return (
             self.binary is not None
             or any(
-                a.strides is not None or a.stride_of is not None or a.alias is not None or a.kind in ("fixed", "given") or (a.kind == "scalar" and a.type == "i64")
+                a.strides is not None
+                or a.stride_of is not None
+                or a.alias is not None
+                or a.kind in ("fixed", "given", "tensordesc")
+                or (a.kind == "scalar" and a.type == "i64")
                 for a in self.args
             )
             or any(p.kind == "max_extent" for p in self.preconditions)
@@ -750,6 +767,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
                 entry["devscalar"] = True
             if p.alias is not None:  # only an Out that may be written over an input has it: every other declaration digests as it did
                 entry["alias"] = p.alias
+            if p.tensor_map is not None:  # only a TMA descriptor has it: the box, swizzle, L2 promotion and fill its kernel is built and launched with
+                entry["tensor_map"] = p.tensor_map.canonical()
         elif p.kind == "dim":
             assert p.dim is not None
             entry["dim"] = _canonical_dim(p.dim)
@@ -866,6 +885,59 @@ def _shape_entry(d: DimExpr) -> "str | int":
     return folded.value if folded.is_static else str(folded)
 
 
+def _tensordesc_arg(
+    op: ExternOp,
+    p: Any,
+    mapping: "dict[Dim, int]",
+    signature: "dict[str, str]",
+    preconditions: "list[Precondition]",
+    args: "list[ArgSpec]",
+    note: Any,
+) -> None:
+    """The argument of a ``TensorDesc`` parameter: a ``tensordesc`` whose type is Triton's signature entry (with the shared layout of the tile for a
+    Gluon kernel), with the pointer facts of its tensor (access, dtype, declared shape, a view's strides and offset), a pointer alignment of 16
+    bytes (the global address of a TMA descriptor), the static sizes, and its ``tensor_map``. No Triton attribute (a descriptor takes none) and no
+    ``max_elements``: the kernel addresses the tensor by coordinates, which the shape slots (``i32``) bound."""
+    from . import _tensormap
+
+    t = p.type
+    if op.binary is not None:  # pragma: no cover - the declaration refuses it
+        raise TilefishSpecError(f"extern op '{op.name}': a prebuilt binary takes no tensor descriptor ('{p.name}')")
+    sig_type = _tensormap.signature_type(t.dtype.triton_scalar, p.tensor_map, t.dtype.bits, op.language)
+    signature[p.name] = sig_type
+    strides_entries: "tuple[str | int, ...] | None" = None
+    offset_entry: "str | None" = None
+    if p.strided:
+        assert t.strides is not None and t.offset is not None
+        strides_entries = tuple(_shape_entry(s) for s in t.strides)
+        offset_entry = _shape_entry(t.offset)  # type: ignore[assignment]
+        for s in t.strides:
+            note(s)
+        note(t.offset)
+    i = p.index
+    preconditions.append(Precondition("pointer_alignment", arg=p.name, index=i, bytes=ALIGNMENT))
+    for axis, d in enumerate(t.shape):
+        if d.is_static:
+            preconditions.append(Precondition("static_size", arg=p.name, index=i, axis=axis, value=d.value))
+    for d in t.shape:
+        note(d)
+    args.append(
+        ArgSpec(
+            i,
+            p.name,
+            "tensordesc",
+            sig_type,
+            access=p.access,
+            dtype=str(t.dtype),
+            shape=tuple(str(d.subst(mapping).folded()) for d in t.shape),
+            shape_dims=tuple(_shape_entry(d) for d in t.shape),
+            strides=strides_entries,
+            offset=offset_entry,
+            tensor_map=p.tensor_map.to_json(t.dtype.name),
+        )
+    )
+
+
 def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
     signature: dict[str, str] = {}
     constants: dict[tuple[int, ...], Any] = {}
@@ -894,6 +966,9 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                     f"extern op '{op.name}': parameter '{p.name}' is {t}; block-scaled tensors (data plus scale "
                     "pointers) are not supported in AOT specs yet"
                 )
+            if p.tensor_map is not None:  # a TMA descriptor of the tensor: Triton's ``tensordesc<...>`` parameter
+                _tensordesc_arg(op, p, mapping, signature, preconditions, args, note)
+                continue
             ptr = t.dtype.triton_ptr
             signature[p.name] = ptr
             strides_entries: "tuple[str | int, ...] | None" = None

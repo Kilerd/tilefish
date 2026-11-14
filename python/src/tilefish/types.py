@@ -337,6 +337,58 @@ class Strided:
 
 
 @dataclass(frozen=True)
+class TensorDescType:
+    """What ``TensorDesc(...)`` evaluates to: a tensor parameter that the kernel takes as a TMA descriptor (see :func:`TensorDesc`)."""
+
+    type: TensorType
+    tensor_map: Any  # a tilefish._tensormap.TensorMapSpec
+    strided: bool = False
+
+    def __repr__(self) -> str:
+        m = self.tensor_map
+        inner = f"Strided[{self.type!r}]" if self.strided else repr(self.type)
+        return f"TensorDesc({inner}, block={m.block}, swizzle={m.swizzle}, l2_promotion={m.l2_promotion}, oob_fill={m.oob_fill!r})"
+
+
+def TensorDesc(  # noqa: N802 - an annotation, spelled as one
+    tensor: Any, *, block: Any, swizzle: "int | None" = None, l2_promotion: int = 128, oob_fill: str = "zero"
+) -> TensorDescType:
+    """``TensorDesc(Tensor[T, C, f16], block=(128, 64))``: an extern parameter that the kernel takes as a **TMA tensor descriptor** of the tensor
+    (a Triton ``tl.tensor_descriptor`` or a Gluon one, made on the host): a caller passes the tensor, and the host encodes a ``CUtensorMap`` of it
+    at every launch (``cuTensorMapEncodeTiled``: its address, shape and strides, and the box, swizzle, L2 promotion and out-of-bounds fill
+    declared here) and passes it by value, followed by the tensor's shape (``i32`` each) and element strides (``i64`` each), as Triton's launcher
+    passes a host ``TensorDescriptor``::
+
+        @tilefish.extern(gluon=k.tma_copy, num_warps=4, grid=lambda R, C: (tilefish.cdiv(R, 64), tilefish.cdiv(C, 64)))
+        def tma_copy(x: TensorDesc(Tensor[R, C, f16], block=(64, 64)), y: Out[TensorDesc(Tensor[R, C, f16], block=(64, 64))]): ...
+
+    * ``block`` is the box: a tile of one power of two from 1 to 256 per axis, outermost first, whose inner dimension is a multiple of 16 bytes.
+    * ``swizzle`` (bytes: 0, 32, 64 or 128) is the shared-memory swizzle of the tile, which the compiled kernel expects; ``None`` is the largest
+      that divides the inner dimension's bytes (none for a box of rank 1 or of fewer than 8 rows). A Gluon kernel's descriptor type carries it
+      (its ``NVMMASharedLayout``); a Triton kernel's compiler chooses one, and the build refuses a declaration that is not the compiler's choice.
+    * ``l2_promotion`` (bytes: 0, 64, 128, 256; Triton's 128) and ``oob_fill`` (``"zero"``: an element outside the tensor reads as zero and a store
+      there is dropped; ``"nan"``: a float reads as NaN) are what the host puts in the map.
+
+    The tensor is ``Tensor[...]`` (dense) or, for a descriptor the kernel only reads, ``Strided[Tensor[...]]``: a view whose last axis has stride 1,
+    whose other strides are its own (no ``StrideOf`` parameter: they are passed in the descriptor's own slots). ``Out[TensorDesc(...)]`` and
+    ``InOut[TensorDesc(...)]`` are descriptors the kernel stores through. A launch checks what the driver requires of the tensor: a 16-byte aligned
+    address, strides that are multiples of 16 bytes (a row of a dense ``[T, C]`` tensor is ``C`` elements), dimensions that fit ``i32``; the box,
+    swizzle and fill are checked here. Only a Triton or Gluon kernel (not a prebuilt binary) takes one."""
+    from . import _tensormap
+
+    strided = False
+    if isinstance(tensor, StridedType):
+        strided, tensor = True, tensor.type
+    if not isinstance(tensor, TensorType):
+        raise TilefishDeclarationError(f"TensorDesc(...) describes a tensor: TensorDesc(Tensor[R, C, f16], block=(64, 64)), got {tensor!r}")
+    if tensor.devscalar or isinstance(tensor.dtype, BlockScaled):
+        raise TilefishDeclarationError(f"TensorDesc({tensor!r}): a descriptor describes a plain tensor (not a DevScalar, not a block-scaled tensor)")
+    where = f"TensorDesc({tensor!r})"
+    spec = _tensormap.make_spec(where, tensor.dtype.name, tensor.rank, block, swizzle, l2_promotion, oob_fill, tensor.dtype.bits)
+    return TensorDescType(tensor, spec, strided)
+
+
+@dataclass(frozen=True)
 class StrideOf:
     """``StrideOf("x", 0)``: a runtime scalar parameter that carries the element stride of axis 0 of the tensor parameter ``x``.
 
@@ -407,9 +459,13 @@ class Marked:
     mode: str  # "inout" | "out"
     type: TensorType
     alias: "str | None" = None  # an Out only: the tensor input it may be written over (MayAlias)
+    tensor_map: Any = None  # a TensorDesc the kernel stores through: its tilefish._tensormap.TensorMapSpec
 
     def __repr__(self) -> str:
         inner = repr(self.type) + (f", {MayAlias(self.alias)!r}" if self.alias is not None else "")
+        if self.tensor_map is not None:
+            m = self.tensor_map
+            inner = f"TensorDesc({self.type!r}, block={m.block}, swizzle={m.swizzle}, l2_promotion={m.l2_promotion}, oob_fill={m.oob_fill!r})"
         return f"{'InOut' if self.mode == 'inout' else 'Out'}[{inner}]"
 
 
@@ -448,6 +504,17 @@ class _AccessMarker:
                     f"{cls.__name__}[..., {item[1]!r}]: only an Out tensor names an input it may be written over (an InOut tensor is that input)"
                 )
             item, alias = item[0], item[1].arg
+        if isinstance(item, TensorDescType):
+            if item.strided:
+                raise TilefishDeclarationError(
+                    f"{cls.__name__}[TensorDesc(Strided[...])]: only a descriptor the kernel reads may describe a strided view; an {cls.__name__} tensor is "
+                    "contiguous"
+                )
+            if alias is not None:
+                raise TilefishDeclarationError(
+                    f"{cls.__name__}[TensorDesc(...), MayAlias(...)]: a tensor descriptor may not be written over an input (MayAlias is for pointers)"
+                )
+            return Marked(cls.mode, item.type, None, item.tensor_map)
         if isinstance(item, StridedType):
             raise TilefishDeclarationError(
                 f"{cls.__name__}[Strided[...]]: only input tensors can be strided in this version; an {cls.__name__} tensor is contiguous"

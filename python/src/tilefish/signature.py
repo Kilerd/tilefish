@@ -20,7 +20,7 @@ from .dtypes import DType
 from .errors import TilefishDeclarationError, TilefishError, TilefishTypeError
 from .ir import BucketRequirement, Requirement
 from .trace import Const, TraceContext, Value
-from .types import ConstType, Marked, StrideOf, StridedType, TensorType, const
+from .types import ConstType, Marked, StrideOf, StridedType, TensorDescType, TensorType, const
 
 if TYPE_CHECKING:
     from .decorators import Op
@@ -64,6 +64,9 @@ class Param:
     stride_of: "tuple[tuple[str, int], ...] | None" = None
     stride_dtype: "DType | None" = None  # a stride scalar declared StrideOf(..., dtype=i32 | i64); None: as wide as the op's offsets
     alias: "str | None" = None  # an Out tensor only: the tensor input it may be written over (``Out[..., MayAlias("r")]``)
+    # a tensor the kernel takes as a TMA descriptor (``TensorDesc(...)``): its box, swizzle, L2 promotion and fill (a
+    # tilefish._tensormap.TensorMapSpec). A caller passes the tensor; a launch encodes the descriptor of it.
+    tensor_map: Any = None
 
     @property
     def is_callable_arg(self) -> bool:
@@ -79,7 +82,12 @@ class Param:
             ann = repr(self.type)
             if self.strided:
                 assert self.type is not None
-                ann = f"Strided[Tensor[{', '.join([*(str(d) for d in self.type.shape), str(self.type.dtype)])}]" + (f", {self.align}" if self.align else "") + "]"
+                ann = f"Strided[Tensor[{', '.join([*(str(d) for d in self.type.shape), str(self.type.dtype)])}]" + (f", {self.align}" if self.align and self.tensor_map is None else "") + "]"
+            if self.tensor_map is not None:
+                m = self.tensor_map
+                if not self.strided:
+                    ann = repr(self.type)
+                ann = f"TensorDesc({ann}, block={m.block}, swizzle={m.swizzle}, l2_promotion={m.l2_promotion}, oob_fill={m.oob_fill!r})"
             if self.access == "inout":
                 ann = f"InOut[{ann}]"
             elif self.access == "out":
@@ -220,13 +228,15 @@ def parse_signature(
     allow_devscalar: bool = True,
     allow_output_dims: bool = False,
     allow_alias: bool = False,
+    allow_tensor_map: bool = False,
 ) -> Signature:
     """Read ``fn``'s annotations into a :class:`Signature`.
 
     ``allow_strided`` lets a tensor parameter be ``Strided[...]`` and a scalar parameter ``StrideOf(...)`` (an extern op does;
     see :class:`~tilefish.types.Strided`). ``allow_output_dims`` lets the shape of an ``Out`` parameter mention a dimension that no input
     determines (an extern op does: :attr:`Signature.output_dims`). ``allow_alias`` lets an ``Out`` name the input it may be written over
-    (``Out[..., MayAlias("r")]``, an extern op: :class:`~tilefish.types.MayAlias`).
+    (``Out[..., MayAlias("r")]``, an extern op: :class:`~tilefish.types.MayAlias`). ``allow_tensor_map`` lets a tensor parameter be a TMA
+    descriptor (``TensorDesc(...)``: a Triton or Gluon extern).
     """
     where = f"{what} '{name}'"
     sig = inspect.signature(fn)
@@ -243,7 +253,19 @@ def parse_signature(
         ann = _resolve(p.annotation, fn, where)
         kw = p.kind is inspect.Parameter.KEYWORD_ONLY
         has_default = p.default is not inspect.Parameter.empty
-        if isinstance(ann, TensorType):
+        if (isinstance(ann, TensorDescType) or (isinstance(ann, Marked) and ann.tensor_map is not None)) and not allow_tensor_map:
+            raise TilefishDeclarationError(
+                f"{where}: parameter '{pname}' is a TMA tensor descriptor (TensorDesc), which only the extern of a Triton or Gluon kernel takes (Triton's "
+                "launch ABI of a host tensor descriptor); here tensors are pointers"
+            )
+        if isinstance(ann, TensorDescType):
+            if ann.strided:
+                require_storable(where, f"parameter '{pname}'", ann.type)
+                param = Param(pname, index, "tensor", "in", type=ann.type, keyword_only=kw, strided=True, align=16, tensor_map=ann.tensor_map)
+            else:
+                _require_contiguous(where, what, f"parameter '{pname}'", ann.type)
+                param = Param(pname, index, "tensor", "in", type=ann.type, keyword_only=kw, tensor_map=ann.tensor_map)
+        elif isinstance(ann, TensorType):
             if ann.devscalar and not allow_devscalar:
                 raise TilefishDeclarationError(f"{where}: parameter '{pname}' is a DevScalar, which a {what} cannot take")
             _require_contiguous(where, what, f"parameter '{pname}'", ann)
@@ -270,7 +292,7 @@ def parse_signature(
                     f"{where}: parameter '{pname}' is {ann!r}, which only an extern op can declare (the promise of a hand-written kernel that it reads "
                     "an element before it writes it)"
                 )
-            param = Param(pname, index, "tensor", ann.mode, type=ann.type, keyword_only=kw, alias=ann.alias)
+            param = Param(pname, index, "tensor", ann.mode, type=ann.type, keyword_only=kw, alias=ann.alias, tensor_map=ann.tensor_map)
         elif ann is const or isinstance(ann, ConstType):
             dtype = None if ann is const else ann.dtype
             default = (
@@ -342,10 +364,11 @@ def _check_aliases(where: str, params: "Sequence[Param]") -> None:
         target = by_name.get(p.alias)
         if target is None or target.kind != "tensor" or target.access != "in":
             raise TilefishDeclarationError(f"{where}: the Out '{p.name}' may alias '{p.alias}', which is not a tensor input of this op")
-        if target.strided or target.is_devscalar:
+        if target.strided or target.is_devscalar or target.tensor_map is not None:
+            what = "a strided view" if target.strided else "a DevScalar" if target.is_devscalar else "a tensor descriptor"
             raise TilefishDeclarationError(
-                f"{where}: the Out '{p.name}' may alias '{p.alias}', which is {'a strided view' if target.strided else 'a DevScalar'}: an Out written over "
-                "an input is that whole, contiguous tensor"
+                f"{where}: the Out '{p.name}' may alias '{p.alias}', which is {what}: an Out written over an input is that whole, contiguous tensor, "
+                "passed as a pointer"
             )
         assert p.type is not None and target.type is not None
         if p.type.dtype != target.type.dtype or tuple(p.type.shape) != tuple(target.type.shape):
@@ -397,6 +420,11 @@ def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":
                 raise TilefishDeclarationError(
                     f"{where}: {p.name} is {stride_annotation(p.stride_of)!r}, but '{arg}' is not a Strided[...] tensor parameter of this op"
                 )
+            if target.tensor_map is not None:
+                raise TilefishDeclarationError(
+                    f"{where}: {p.name} is {stride_annotation(p.stride_of)!r}, but '{arg}' is a tensor descriptor, whose strides are passed in its own "
+                    "slots (after the descriptor): it has no StrideOf parameter"
+                )
             assert target.type is not None
             if axis >= target.type.rank:
                 raise TilefishDeclarationError(f"{where}: {p.name} is the stride of axis {axis} of '{arg}', which has rank {target.type.rank}")
@@ -417,7 +445,14 @@ def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":
         strides: list[Any] = []
         for axis in range(t.rank):
             sp = stride_params.get((p.name, axis))
-            if sp is not None:
+            if p.tensor_map is not None and axis < t.rank - 1:  # a descriptor's view: its stride dimensions are its own (passed in its stride slots)
+                implicit = f"{p.name}_s{axis}"
+                if implicit in by_name:
+                    raise TilefishDeclarationError(
+                        f"{where}: the parameter '{implicit}' clashes with the stride dimension of axis {axis} of the descriptor '{p.name}'"
+                    )
+                strides.append(Dim(implicit))
+            elif sp is not None:
                 strides.append(sp.dim)
             elif axis == t.rank - 1:
                 strides.append(1)
@@ -434,7 +469,9 @@ def _resolve_strides(where: str, params: "list[Param]") -> "list[Param]":
         offset = Dim(offset_name, divisible_by=elems16 if p.align == 16 else None)
         typed = TensorType(t.shape, t.dtype, strides=strides, offset=offset, aligned=False, normalize=False)
         out.append(
-            Param(p.name, p.index, "tensor", p.access, type=typed, keyword_only=p.keyword_only, strided=True, align=p.align)
+            Param(
+                p.name, p.index, "tensor", p.access, type=typed, keyword_only=p.keyword_only, strided=True, align=p.align, tensor_map=p.tensor_map
+            )
         )
     return out
 

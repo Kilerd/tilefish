@@ -310,7 +310,12 @@ class Backend:
     def load(self, built: Any, index: int) -> Any:
         raise NotImplementedError
 
-    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]", stream: int) -> None:
+    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int) -> None:
+        raise NotImplementedError
+
+    def encode_tensor_map(self, arguments: Any) -> bytes:
+        """The 128 bytes of the ``CUtensorMap`` of a TMA descriptor argument (``cuTensorMapEncodeTiled`` of a
+        :class:`~tilefish._tensormap.EncodeArguments`)."""
         raise NotImplementedError
 
     def copy(self, dst: int, src: int, nbytes: int, stream: int) -> None:
@@ -456,8 +461,13 @@ class TorchBackend(Backend):
                     load(loaded.function)
         return loaded
 
-    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]", stream: int) -> None:
+    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int) -> None:
         loaded.launch(grid, args, stream)
+
+    def encode_tensor_map(self, arguments: Any) -> bytes:
+        from . import _cuda
+
+        return _cuda.encode_tensor_map(arguments)
 
     def copy(self, dst: int, src: int, nbytes: int, stream: int) -> None:
         from . import _cuda
@@ -617,6 +627,9 @@ class _Call:
     slots: "list[tuple[dict, Any, bool]]"  # (buffer, source, on_device) of every device scalar
     results: "list[Any]"  # the outputs, in the order the graph returns them
     taps: "list[_Tap]" = dataclasses.field(default_factory=list)  # the copies of buffers the caller asked for, each after a step (taps=)
+    # per step, its TMA descriptors by argument name (a TensorMapArg each), encoded from the checked tensors of this call: a run launches with them, and a
+    # captured graph holds their bytes (a descriptor is a function of the addresses, shapes and strides the call binds, which a graph holds too)
+    descs: "list[dict[str, Any]]" = dataclasses.field(default_factory=list)
 
 
 def _ordered(be: Backend, arena: _Arena, stream: int, capturing: bool, work: Any) -> None:
@@ -790,7 +803,7 @@ class PlanRunner:
                 built = self.provider.kernel(callee, bound.spec, index)
                 if built.spec.block != bound.spec.block or built.num_warps != bound.spec.num_warps:
                     raise TilefishRuntimeError(f"the binary of '{bound.spec.stem}' disagrees with its spec about num_warps")
-                order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "scalar", "given"))
+                order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "tensordesc", "scalar", "given"))
                 loaded = be.load(built, index)
                 be.check_grid(loaded, bound.grid)
                 steps.append(_StepRT(bound, loaded, order, None, None))
@@ -903,6 +916,8 @@ class PlanRunner:
         self._check_externals(bases, written, rt, arena)
         # every precondition of every step, before anything is launched
         checked = [st.bound.check(bases) for st in rt.steps]
+        with be.scope(index):  # the TMA descriptors of every step, encoded from these addresses, also before anything is launched (an encode may fail)
+            descs = [self._descriptors(st, real) for st, real in zip(rt.steps, checked)]
         slots = []
         for b in doc["buffers"]:
             if b["role"] == "devscalar":
@@ -915,7 +930,16 @@ class PlanRunner:
                     )
                 slots.append((b, source, on_device))
         results = [t for _, t in sorted(made, key=lambda p: p[0])]
-        return _Call(rt, arena, checked, bases, slots, results, self._taps(taps, rt, bases, arena, index))
+        return _Call(rt, arena, checked, bases, slots, results, self._taps(taps, rt, bases, arena, index), descs)
+
+    def _descriptors(self, st: "_StepRT", real: Any) -> "dict[str, Any]":
+        """The TMA descriptors of a checked kernel step (``real``: its tensors with the addresses of the call), by argument name: each encoded from
+        its tensor's address, shape and strides (:func:`tilefish.runtime.tensor_map_arg`). Encoded at every execution from what it binds, so a
+        descriptor is never one of another binding (another external, another arena)."""
+        if isinstance(st.bound, _CopyBound) or st.algo is not None:
+            return {}
+        spec = st.bound.spec
+        return {a.name: runtime.tensor_map_arg(spec, a.name, real[a.name], self.backend.encode_tensor_map) for a in spec.args if a.kind == "tensordesc"}
 
     def _enqueue(self, call: "_Call", stream: int, index: int, slots: bool) -> None:
         """Enqueue the device-scalar writes (``slots``) and the launches of the steps on ``stream``, the current stream (the caller orders them: :func:`_ordered`)."""
@@ -926,13 +950,15 @@ class PlanRunner:
         taps = iter(call.taps)  # sorted by the step they follow
         tap = next(taps, None)
         for i, (st, real) in enumerate(zip(call.rt.steps, call.checked)):
-            self._enqueue_step(st, real, call.bases, stream, index)
+            self._enqueue_step(st, real, call.bases, stream, index, call.descs[i] if call.descs else {})
             while tap is not None and tap.after == i:  # a debug tap: the buffer as this step left it, copied out before the next step may reuse its bytes
                 be.copy(tap.dst, call.bases[tap.buffer], tap.nbytes, stream)
                 tap = next(taps, None)
 
-    def _enqueue_step(self, st: "_StepRT", real: Any, bases: "Mapping[str, int]", stream: int, index: int) -> None:
-        """Enqueue one checked step (``real``: what its ``check`` returned with the real addresses) on ``stream``."""
+    def _enqueue_step(
+        self, st: "_StepRT", real: Any, bases: "Mapping[str, int]", stream: int, index: int, descs: "Mapping[str, Any] | None" = None
+    ) -> None:
+        """Enqueue one checked step (``real``: what its ``check`` returned with the real addresses; ``descs``: its encoded TMA descriptors) on ``stream``."""
         be = self.backend
         if isinstance(st.bound, _CopyBound):
             src, dst, nbytes = real
@@ -943,7 +969,14 @@ class PlanRunner:
             bias = real[names[2]].ptr if len(names) == 4 else None
             be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
         else:
-            launch_args = [("pointer", real[n].ptr) if kind == "pointer" else (kind, st.bound.scalars[n]) for kind, n in st.order]
+            launch_args: "list[tuple[str, Any]]" = []
+            for kind, n in st.order:
+                if kind == "pointer":
+                    launch_args.append(("pointer", real[n].ptr))
+                elif kind == "tensordesc":
+                    launch_args.append(("tensordesc", (descs or {})[n]))
+                else:
+                    launch_args.append((kind, st.bound.scalars[n]))
             be.launch(st.loaded, st.bound.grid, launch_args, stream)
 
     def _written(self, st: "_StepRT") -> "set[str]":
@@ -1162,9 +1195,11 @@ class PlanRunner:
                     if other != name and (name in written or other in written) and lo < ohi and olo < hi:
                         raise TilefishPreconditionError(f"run_step: the tensors of '{name}' and '{other}' overlap, and the step writes one", kind="alias", arg=name)
             real = st.bound.check(bases)  # every precondition of the step with the caller's addresses
+            with be.scope(index):
+                descs = self._descriptors(st, real)  # of the caller's tensors
             with arena.lock, be.scope(index):
                 stream = be.stream(index)
-                _ordered(be, arena, stream, False, lambda: self._enqueue_step(st, real, bases, stream, index))
+                _ordered(be, arena, stream, False, lambda: self._enqueue_step(st, real, bases, stream, index, descs))
 
     def _check_output(self, name: str, t: Any, dtype: str, shape: "tuple[int, ...]", index: int) -> None:
         info = tensor_info(f"outputs[{name}]", t)

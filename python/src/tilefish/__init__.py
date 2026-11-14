@@ -27,6 +27,10 @@ axes; a graph materialises a view (:func:`contiguous`) and the patches of a conv
 :mod:`tilefish.lower` (notes 7 to 11) and :mod:`tilefish._copyops`. An ``extern`` takes a Gluon kernel (``extern(gluon=...)``: Triton's
 ``triton.experimental.gluon``, layouts written out), identified by the TTGIR Gluon's frontend builds, and a ``StrideOf`` says the type of
 its scalar (``dtype=i32`` or ``i64``) when it is not the width of the kernel's offsets.
+
+M3.4: an extern of a Triton or Gluon kernel takes TMA tensor descriptors (:func:`TensorDesc`): a call passes the tensor, every launch encodes its
+``CUtensorMap`` (``cuTensorMapEncodeTiled``) and passes it by value as Triton launches a host ``TensorDescriptor``; the manifest records the map
+(manifest schema 3, section 5.5) and both hosts check and encode it, in single launches, in plans and in CUDA graphs.
 """
 
 from . import aot
@@ -75,7 +79,7 @@ from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
 from .trace import Const, Value
-from .types import DevScalar, InOut, MayAlias, Out, StrideOf, Strided, Tensor, TensorType, const
+from .types import DevScalar, InOut, MayAlias, Out, StrideOf, Strided, Tensor, TensorDesc, TensorType, const
 
 __version__ = "0.0.5"
 
@@ -115,6 +119,7 @@ __all__ = [
     "StrideOf",
     "Strided",
     "Tensor",
+    "TensorDesc",
     "TensorType",
     "TilefishAttributeError",
     "TilefishBuildError",
