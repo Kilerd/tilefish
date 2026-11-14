@@ -127,6 +127,8 @@ def test_the_stages_in_one_torch_graph_on_one_stream_replay_and_a_forked_stream_
             s.run(pm.stage_ffn, r, h2, *stage_weights(weights, pm.stage_ffn), outputs=y)
             main = torch.cuda.current_stream()
             forked = torch.cuda.Stream()
+            while forked.cuda_stream == main.cuda_stream:  # torch's stream pool hands out the capture stream again every 32 streams
+                forked = torch.cuda.Stream()
             forked.wait_stream(main)
             with torch.cuda.stream(forked):
                 try:
