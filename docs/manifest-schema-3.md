@@ -32,6 +32,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | library entry (0.0.6, crate 0.0.4) | — | f16 operands, an f32 result and the layout `NN` in the fields an entry always had (`dtypes`, `transa`, `lda`, the operands); the optional `allow_f16_reduction` (section 9.2) and `sm_count_target` (section 9.3) |
 | kernel entry (0.0.5, crate 0.0.3) | — | an optional `implementation`: which implementation of an operator declared with an implementation per architecture the binary is (section 4.1) |
 | ABI argument kinds (0.0.6, crate 0.0.4) | — | adds `tensordesc`: a TMA descriptor of a tensor (a `CUtensorMap` the host encodes at every launch, passed by value), which takes `1 + 2 * rank` slots of `kernelParams`, so `slot` is where a parameter's slots begin (section 5.5) |
+| kernel entry (0.0.6, crate 0.0.4) | — | an optional `total_num_warps`: the warps of a block of a warp-specialised kernel, whose partitions add warps to the `num_warps` of its default partition; its `block` is `32 * total_num_warps` (section 4.2) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -81,7 +82,8 @@ A `kernels` entry has a `kind`, which is required and is exactly one of `"triton
 **`kind: "triton"`** is schema 2's entry plus `kind` and `abi.scratch_slots`. Its fields are
 
 `stem op kind arch ptx_target symbol cubin abi grid block shared num_warps num_stages launch constexprs buckets dims preconditions options
-declaration_digest sha256 sha256_code toolchain` and optionally `source_sha256`, `source_digest` + `source_digest_kind` (as in schema 2:
+declaration_digest sha256 sha256_code toolchain` and optionally `implementation` (section 4.1), `total_num_warps` (section 4.2), `source_sha256`,
+`source_digest` + `source_digest_kind` (as in schema 2:
 `source_digest_kind` is `"tilefish.triton-ir.v1"` for the digest of the Triton IR, the TTIR of a `triton.jit` kernel, and `"tilefish.gluon-ir.v1"` for that of
 a Gluon kernel, `@tilefish.extern(gluon=...)`: the TTGIR Gluon's frontend builds, layouts and `num_warps` included, hashed under its own tag. A Gluon kernel is
 compiled by Triton and launched like any other, so its entry is a `triton` entry with nothing else that differs; a reader that does not recompute IR
@@ -141,6 +143,65 @@ neither is refused by the export (and by `jit` and `replay`). The entry of such 
   not a string) or that is on a `binary` entry. The Rust host reads it into `Entry::implementation` and needs nothing else from it: it launches the entry of its
   device's architecture, as for any operator.
 
+### 4.2 Warp-specialised kernels: `total_num_warps` (tilefish 0.0.6, crate 0.0.4)
+
+A Triton or Gluon kernel is **warp-specialised** when its partitions run on warps of their own: Gluon's `gl.warp_specialize(default_args,
+default_partition, worker_args, worker_partitions, worker_num_warps, worker_num_regs)` (say a 1-warp TMA producer and a 1-warp MMA issuer beside the
+compute warps), or Triton's own warp specialisation of a `tl.range(..., warp_specialize=True)` loop (sm_100 and up). Its TTGIR has
+`ttg.warp_specialize` regions.
+
+**What `num_warps` means.** The declaration's `num_warps` (`@tilefish.extern(..., num_warps=4)`, the compile option Triton is given) is the warps of
+the kernel's **default partition**: those its code outside the warp-specialised regions and its default partition run on, which a Gluon kernel's
+layouts are written for. For a kernel that is not warp-specialised that is all its warps. It is not a hint. The worker partitions add warps of their
+own, and Triton 3.5.1 reports the total after warp specialisation (`ttg.total-num-warps`, padded to a warp group: a 4-warp default partition and two
+1-warp workers are 8, an 8-warp one with the same workers 12) as the compiled kernel's `metadata.num_warps`, the warps its own launcher makes a block of.
+
+**The entry.**
+
+| field | type and rule |
+|---|---|
+| `num_warps` | as for any Triton entry: the compile option, equal to `options.num_warps`, so the warps of the default partition |
+| `total_num_warps` | optional int, only on a `triton` entry: the warps of a block of the compiled kernel, all its partitions'. Present exactly when the kernel is warp-specialised, and then more than `num_warps` and at most 32. Absent (or `null`) for any other kernel |
+| `block` | `[32 * total_num_warps, 1, 1]` for a warp-specialised kernel, `[32 * num_warps, 1, 1]` for any other Triton kernel |
+
+**The compiled launch configuration.** Everything a launch takes besides its arguments and its grid is a compiled fact the entry records:
+* `block`: `32 *` the compiled warps;
+* `shared`: Triton's `metadata.shared`, the dynamic shared memory;
+* `launch`: `cluster_dims`, `num_ctas`, the scratch sizes, PDL and a cooperative launch.
+
+What a plain `cuLaunchKernel` cannot set up is still refused, so `cluster_dims` is `[1, 1, 1]` and `num_ctas` is 1. Every launch uses these values,
+in Python and in Rust: a single launch, a step of a plan, and a launch captured in a CUDA graph.
+
+**The build** (`_build.build`) checks what Triton did:
+* a kernel whose TTGIR has no `ttg.warp_specialize` region must have exactly the declared `num_warps`. A silent change is refused: "the compile
+  option num_warps=4 was not applied (Triton used 8)";
+* a warp-specialised kernel must have more warps than `num_warps`, and at most 32;
+* either way, the `.reqntid` of its PTX entry must be `32 *` the warps the metadata reports. Triton writes it for every kernel, and the driver refuses
+  a launch with another block.
+
+The build records the total (`BuiltKernel.num_warps`, `BuiltKernel.warp_specialized`), and so does the build cache, which checks it against the
+options and the PTX on every read.
+
+**Identity.** The total is a function of what identifies the binary (its IR, its compile options, its architecture and its toolchain), so it adds
+nothing to a compile spec or a declaration digest. A compile spec's `block` stays `32 * num_warps`: a spec is made before anything compiles. The entry
+records the total, so the manifest digest covers it, like every field: a binary of other warps is another manifest. A replay compares the entry with
+the spec as for any kernel, with the block `32 * total_num_warps` in place of the spec's (`_build.expected_entry`), launches with that block, and
+refuses a binary whose warps are not the spec's, or more than them for a warp-specialised one (`_build.check_launch_config`). A merge refuses to
+replace an entry of other warps (`total_num_warps` is one of the fields `_conflicts` compares).
+
+**One operator on several architectures.** Triton warp-specialises a loop on sm_100 and up only, so one declaration may have a warp-specialised
+binary on one architecture and a plain one on another. `block` and `total_num_warps` are per entry, like `shared`; the Rust emitter lists the block of
+each architecture.
+
+**Readers.** Both readers refuse:
+* a `total_num_warps` that is not an integer, that is not more than `num_warps`, or that is more than 32;
+* a `block` that is not `[32 * total_num_warps, 1, 1]`;
+* the field on a `binary` entry.
+
+A JSON `null` is as absent. A reader from before this change refuses an entry with the field: the crate's reader refuses unknown fields, and the
+replay of Python 0.0.5 finds a block that is not the spec's. So no host launches a warp-specialised kernel with the declared block. Manifests without
+the field are unchanged, and so are their digests.
+
 ## 5. The ABI
 
 `abi` is `{"params": [...], "scratch": [...], "scratch_slots": <int>}`. `params` are the kernel's launch arguments in order, one `kernelParams` slot
@@ -160,7 +221,9 @@ Every `params` entry has `slot`, `index` (the position in the declaration), `nam
 | `given` (prebuilt binaries only) | `i32` or `i64` | `u32`/4 or `u64`/8 | none: every call gives the value (section 5.3) |
 
 A launch passes: a `pointer` as its 64-bit address (see 5.1), a `scalar` as a signed integer of its `type`, a `fixed` as its `value` in its `type`
-(`ctypes.c_int32`/`c_int64`/`c_float`: an `f32` value is the JSON number rounded to the nearest `f32`).
+(`ctypes.c_int32`/`c_int64`/`c_float`: an `f32` value is the JSON number rounded to the nearest `f32`). It is `cuLaunchKernel` with the grid the
+entry's `grid` evaluates to, the entry's `block` (`32 *` the warps of the compiled kernel, all its partitions' for a warp-specialised one: section 4.2)
+and its `shared` bytes of dynamic shared memory.
 
 ### 5.1 Strided views: `strides` and `offset` on a pointer
 
@@ -647,7 +710,9 @@ document tilefish writes next to a build and the host does not read):
   `toolchain`; `options` missing on `triton` and present on `binary`; `num_warps`/`num_stages` present on `binary`; `binary` missing on `binary`;
   `shared` not a non-negative int; `toolchain`, `launch`, `abi`, `options` not objects; `abi.scratch_slots` present and not `2`/`0` by kind;
   `source_sha256`/`source_digest` not 64 lowercase hex digits; `source_digest` and `source_digest_kind` not both present or both absent; an
-  `implementation` (section 4.1) that is not the entry's `arch` or `"fallback"`, or on a `binary` entry;
+  `implementation` (section 4.1) that is not the entry's `arch` or `"fallback"`, or on a `binary` entry; a `total_num_warps` (section 4.2) on a
+  `binary` entry, not an integer, not more than `num_warps` or more than 32, or with a `block` that is not `[32 * total_num_warps, 1, 1]` (the Rust
+  reader refuses a Triton entry whose `block` is not `[32 * num_warps, 1, 1]` without it; Python compares that block with the spec's);
   for `binary`: `binary` not exactly one of `{"source":"cubin"}` and `{"source":"ptx","ptxas_flags":[strings]}`, `source_digest_kind` not
   `"tilefish.binary.v1"`, no `source_digest`, a `source_sha256`, a cubin used as it is whose `source_digest` is not its `sha256`; the cubin file name not a plain file name; the cubin's `sha256`, `sha256_code` or
   `.text.<symbol>` section wrong; for `triton` the shared-memory section rule.
@@ -729,6 +794,9 @@ and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter th
   (section 7.1); Python's reader holds both.
 * `implementation` (section 4.1) is read into `Entry::implementation` (`Option<String>`), held to the rule of section 10, and used for nothing else: the
   crate loads the entry of the device's architecture, which is the implementation the export chose for it.
+* `total_num_warps` (section 4.2) is read into `Entry::total_num_warps` (`Option<u32>`, next to `Entry::num_warps`, the declared warps) and held to the
+  rules of section 10. Every launch takes the entry's `block` (`Plan::block()`): a single launch, a step of a launch plan, and a captured graph. For a
+  warp-specialised kernel that block is `32 * total_num_warps`, so the crate needs nothing else to launch one.
 
 **Launching a kernel** (`plan.rs`). The steps of section 5.1, in Python's order: shapes, strides and scalars bind the dimensions (then the `out` tensors bind
 the dimensions those leave unbound, section 7), `divisible_by`, the exact
@@ -807,6 +875,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 | `options.enable_fp_fusion` of a hand-written kernel (`@tilefish.extern(enable_fp_fusion=...)`) | `test_lower_options.py`; on a GPU `test_gpu_extern_fusion.py` |
 | `implementation`: an operator with an implementation per architecture (section 4.1) | `test_per_arch.py`; on a GPU `test_gpu_per_arch.py` (and the Rust gate) |
 | `tensordesc`: TMA descriptors (section 5.5): the declaration, the spec, the slots, the readers, the launch checks, the encode, a plan on a fake backend, the emitter | `test_tensordesc.py`; on a GPU `test_gpu_tma.py` (Triton and Gluon kernels against Triton's own launch, plans and captures) and the Rust gate |
+| `total_num_warps`: warp-specialised kernels (section 4.2): the build's checks, the cache, the readers, the block of a launch, the emitter | `test_warp_specialization.py`; on a GPU `test_gpu_warp_specialization.py` (Gluon and Triton warp-specialised kernels against Triton's own launch, CUDA graphs, plans and captures) and the Rust gate |
 
 The Rust crate (`crates/tilefish/tests/`):
 
@@ -817,4 +886,5 @@ The Rust crate (`crates/tilefish/tests/`):
 | views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
 | `tensordesc` (section 5.5): reading, refusals, the slots, the launch checks and the arguments of the encode | `tensor_maps.rs` |
+| `total_num_warps` (section 4.2): reading, refusals, the block of a plan, the digest | `warp_specialization.rs` |
 | on a GPU, byte identity with Python's `replay` of every feature, the refusals, graph capture of a GEMM and of a strided kernel, the hazards of other streams | `gpu_gate.rs` with `python/tests/rust_gate.py` (TMA descriptors: `the_gate_has_tma_descriptors`, `a_descriptor_of_a_tensor_the_driver_refuses_...`, `graph_capture_of_kernels_with_tma_descriptors`) |
