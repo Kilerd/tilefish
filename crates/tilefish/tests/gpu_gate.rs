@@ -1706,7 +1706,13 @@ fn refusals_of_schema_3() {
         .map(|e| (manifest.gemm(&gpu.ctx, &e.stem, &[], arch).unwrap().workspace_required(), e.stem.as_str()))
         .collect();
     println!("rust gate: the workspace each pinned gemm_bias needs: {needs:?}");
-    let entry = candidates.iter().zip(&needs).find(|(_, (bytes, _))| *bytes > 16).map_or(candidates[0], |(e, _)| *e);
+    // (and one whose need leaves room in its workspace: a workspace that starts 8 bytes in is refused for its alignment, not for its size;
+    // cuBLASLt 13.1 on an RTX 5090 pins an algorithm for gemm_torch.M32 that needs the whole 1 MiB of its limit)
+    let entry = candidates
+        .iter()
+        .zip(&needs)
+        .find(|(e, (bytes, _))| *bytes > 16 && bytes + 256 <= e.workspace_bytes)
+        .map_or(candidates[0], |(e, _)| *e);
     let gemm = manifest.gemm(&gpu.ctx, &entry.stem, &[], arch).unwrap();
     let (m, n, k) = (entry.m as usize, entry.n as usize, entry.k as usize);
     let (a, b, bias) = (gpu.zeros(m * k * 2), gpu.zeros(n * k * 2), gpu.zeros(n * 2));
