@@ -45,7 +45,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
   and (on a fresh export) how an algorithm is chosen (:func:`option_ops`): a ``gemm_bias`` under ``heuristic="torch"``, and one with ``algos=`` imported
   for this device, whose split-K adds its partial sums in bf16 at one bucket in the output and at another in a workspace (``allow_bf16_reduction=True``),
-  and a ``gemm_bias`` whose ``K`` is 9 (rows that do not start on 16 bytes);
+  and a ``gemm_bias`` whose ``K`` is 9 (rows that do not start on 16 bytes); and the other forms (:data:`F16_FORMS`): f16 operands in ``TN``, f16 in
+  ``NN`` with an f16 bias under ``heuristic="torch"`` (with torch's workspace: checked here to be ``torch.addmm``'s bytes), f16 operands in ``TN`` with
+  64 MiB of workspace, f16 operands with an f32 result and bias, bf16 operands in ``NN`` with an f32 result;
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
   exported and run through Python's plan replay; ``crates/tilefish/tests/gpu_plan_gate.rs`` launches and captures each case, and ``compare`` holds the
@@ -505,6 +507,72 @@ def option_cases(declared):
     ]
 
 
+# (name: (dtype, out, layout, bias, N, K, options)): GEMMs of the forms of section 9.2 of the manifest schema, on a fresh export
+F16_FORMS = {
+    "gemm_f16_tn": ("f16", "f16", "TN", False, 3072, 1024, {"workspace_bytes": 64 << 20}),
+    "gemm_f16_nn_bias": ("f16", "f16", "NN", True, 1536, 7168, {"heuristic": "torch", "allow_f16_reduction": True}),
+    "gemm_f16_f32": ("f16", "f32", "TN", True, 1024, 3072, {}),
+    "gemm_bf16_nn_f32": ("bf16", "f32", "NN", False, 640, 96, {}),
+}
+
+
+def f16_ops():
+    """``{name: library op}`` of :data:`F16_FORMS`, over the buckets ``GEMM_M`` of ``M``."""
+    from tilefish import Dim, Tensor, bf16, f16, f32
+
+    M = Dim("M", buckets=list(GEMM_M))
+    types = {"bf16": bf16, "f16": f16, "f32": f32}
+    out = {}
+    for name, (dtype, result, layout, bias, n, k, kw) in F16_FORMS.items():
+        t, d = types[dtype], types[result]
+        b0, b1 = (n, k) if layout == "TN" else (k, n)
+        impl = "cublaslt.gemm_bias" if bias else "cublaslt.gemm"
+        if bias:
+
+            def fn(a: Tensor[M, k, t], b: Tensor[b0, b1, t], bias: Tensor[n, d]) -> Tensor[M, n, d]: ...
+
+        else:
+
+            def fn(a: Tensor[M, k, t], b: Tensor[b0, b1, t]) -> Tensor[M, n, d]: ...
+
+        out[name] = tilefish.library(name, acc=f32, impl=impl, layout=layout, **kw)(fn)
+    return out
+
+
+def f16_operands(name, m, seed):
+    dtype, result, layout, bias, n, k, _ = F16_FORMS[name]
+    t, d = TORCH_OF[dtype], TORCH_OF[result]
+    a = randn((m, k), t, seed + m)
+    b = randn((n, k) if layout == "TN" else (k, n), t, seed + m + 1, scale=1 / k**0.5)
+    return (a, b, randn((n,), d, seed + m + 2)) if bias else (a, b)
+
+
+def must_be_torchs(layout):
+    """The ``"torch"`` posture's result is ``torch.addmm`` in f16, byte for byte."""
+
+    def check(args, got):
+        a, b, bias = args
+        assert same_bytes(got, torch.addmm(bias, a, b.t() if layout == "TN" else b)), "not torch.addmm's bytes"
+
+    return check
+
+
+def f16_cases(declared):
+    return [
+        Case(
+            name,
+            f"{name}.M{m}",
+            "seed0",
+            lambda name=name, m=m: f16_operands(name, m, 0),
+            kind="gemm",
+            check=must_be_torchs(F16_FORMS[name][2]) if F16_FORMS[name][6].get("heuristic") == "torch" else None,
+        )
+        for name in F16_FORMS
+        if name in declared
+        for m in GEMM_M
+    ]
+
+
 def gemm_cases():
     return [
         Case(
@@ -585,6 +653,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(per_arch_ops())
         declared.update(given_ops())
         declared.update(generated_ops())
+        declared.update(f16_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -597,7 +666,7 @@ def prepare(work, manifest_dir=None, pin=None):
     # embedded: the generated module also carries the manifest and the cubins (include_bytes!), which the Rust test runs too
     rust.emit(manifest, work / "generated.rs", ops=all_ops, embed=True)
     cases, skipped, tensors_total = [], [], 0
-    for case in [*build_cases(), *gemm_cases(), *option_cases(declared)]:
+    for case in [*build_cases(), *gemm_cases(), *option_cases(declared), *f16_cases(declared)]:
         if manifest.get(case.stem, arch) is None and manifest.library_entry(case.stem, arch) is None:
             skipped.append(case.stem)
             continue

@@ -51,7 +51,7 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, result};
 use serde_json::Value;
 use tilefish::{
-    Access, AlgoSource, Arch, Bf16, DType, DevicePtr, Element, Error, F16, F32, I32, I64, Manifest, Pin,
+    Access, AlgoSource, Arch, Bf16, DType, DevicePtr, Element, Error, F16, F32, GemmLayout, I32, I64, Manifest, Pin,
     PreconditionKind, TensorArg, TensorMut, TensorRef, U8, elf::sha256_hex,
 };
 
@@ -1077,7 +1077,7 @@ fn the_per_thread_default_stream_is_refused() {
     let arch = Arch::of_context(&gpu.ctx).unwrap();
     let cases = cases();
     let case =
-        cases_where(&cases, |c| is_gemm(c) && tensors_json(c).len() == 3).into_iter().next().expect("a GEMM case");
+        cases_where(&cases, |c| is_bf16_gemm(c) && tensors_json(c).len() == 3).into_iter().next().expect("a GEMM case");
     let gemm = manifest.gemm(&gpu.ctx, case["stem"].as_str().unwrap(), &[], arch).unwrap();
     let mut workspace = gemm.alloc_workspace(&gpu.stream).unwrap();
     let mut tensors = tensors_of(&gpu, &case);
@@ -1195,6 +1195,13 @@ fn has_device_scalar(case: &Value) -> bool {
 
 fn is_gemm(case: &Value) -> bool {
     case["kind"] == "gemm"
+}
+
+/// A GEMM of the form of tilefish 0.0.5 (bf16 in and out, TN): the tests that build their own bf16 operands take one of these.
+fn is_bf16_gemm(case: &Value) -> bool {
+    is_gemm(case)
+        && tensors_json(case).iter().all(|t| t["dtype"] == "bf16")
+        && tensors_json(case)[1]["shape"][1] == tensors_json(case)[0]["shape"][1]
 }
 
 fn element_size(dtype: &str) -> u64 {
@@ -1386,6 +1393,76 @@ fn the_gate_has_generated_ops() {
         let views = of_stem.iter().filter(|c| has_view(c)).count();
         assert!(of_stem.len() >= 3 && views >= 3, "{stem}: {} cases, {views} of them over views", of_stem.len());
         println!("rust gate: the generated op {stem}: {} cases, {views} of them over views", of_stem.len());
+    }
+}
+
+/// The GEMMs of the forms of section 9.2 of the manifest schema (on a fresh export): f16 operands in TN (with 64 MiB of workspace) and in NN (with a
+/// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN. Rust reads each form from its entry, and loads,
+/// vets and runs it (`byte_identity` holds its bytes to Python's replay); here each is also captured in a CUDA graph with `launch_raw` and
+/// matches Python's bytes.
+#[test]
+fn the_gate_has_gemms_of_every_form() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has only bf16 GEMMs of the layout TN");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let forms = [
+        ("gemm_f16_tn", DType::F16, DType::F16, GemmLayout::Tn, false),
+        ("gemm_f16_nn_bias", DType::F16, DType::F16, GemmLayout::Nn, true),
+        ("gemm_f16_f32", DType::F16, DType::F32, GemmLayout::Tn, false),
+        ("gemm_bf16_nn_f32", DType::Bf16, DType::F32, GemmLayout::Nn, false),
+    ];
+    for (op, dtype, out_dtype, layout, opted) in forms {
+        let of_op = cases_where(&cases, |c| c["stem"].as_str().unwrap().starts_with(&format!("{op}.M")));
+        assert_eq!(of_op.len(), 3, "{op}: a case per bucket of M");
+        for case in &of_op {
+            let stem = case["stem"].as_str().unwrap();
+            let entry = manifest.library_entry(stem, &arch.to_string()).unwrap();
+            assert_eq!(
+                (entry.dtype, entry.out_dtype, entry.layout, entry.allow_f16_reduction),
+                (dtype, out_dtype, layout, opted),
+                "{stem}"
+            );
+            let gemm = manifest.gemm(&gpu.ctx, stem, &[], arch).unwrap();
+            assert_eq!((gemm.dtype(), gemm.out_dtype(), gemm.layout()), (dtype, out_dtype, layout), "{stem}");
+        }
+        // the largest bucket, captured in a CUDA graph with launch_raw and regions, three times
+        let case = of_op.iter().max_by_key(|c| tensors_json(c)[0]["shape"][0].as_u64().unwrap()).unwrap();
+        let stem = case["stem"].as_str().unwrap().to_owned();
+        let gemm = manifest.gemm(&gpu.ctx, &stem, &[], arch).unwrap();
+        let mut workspace = gemm.alloc_workspace(&gpu.stream).unwrap();
+        let mut tensors = tensors_of(&gpu, case);
+        let last = tensors.len() - 1;
+        let expect = read(&gate_dir().join(case["tensors"][last]["expect"].as_str().unwrap()));
+        let shapes: Vec<Vec<usize>> = tensors_json(case).iter().map(|t| usizes(&t["shape"])).collect();
+        let dtypes: Vec<DType> =
+            tensors_json(case).iter().map(|t| DType::from_name(t["dtype"].as_str().unwrap()).unwrap()).collect();
+        let ws_shape = [workspace.len()];
+        gpu.stream.synchronize().unwrap();
+        // SAFETY: the buffers outlive the graph; nothing else uses them meanwhile.
+        let regions: Vec<DevicePtr<'static>> =
+            unsafe { tensors.iter().map(|(_, b)| gpu.unbound_region(b, b.nbytes())).collect() };
+        let ws = unsafe { DevicePtr::from_raw(workspace.device_ptr(&gpu.stream).0, workspace.len() as u64, 0) };
+        let stream = gpu.stream.cu_stream();
+        let launch = || {
+            let mut args: Vec<TensorArg<'_>> = Vec::new();
+            for (i, shape) in shapes.iter().enumerate() {
+                let access = if i == last { Access::InOut } else { Access::In };
+                args.push(TensorArg::new(regions[i], shape, dtypes[i], access)?);
+            }
+            args.push(TensorArg::new(ws, &ws_shape, DType::U8, Access::InOut)?);
+            // SAFETY: the stream is the GEMM's; the regions are the buffers' own, which outlive the graph.
+            unsafe { gemm.launch_raw(stream, &args) }
+        };
+        capture_and_run(&gpu, &launch, &mut tensors[last].1.slice, &expect);
+        let _ = &mut workspace;
+        println!(
+            "rust gate: {op}: {} cases; {stem} captured in a CUDA graph ran 3 times and matched Python's replay",
+            of_op.len()
+        );
     }
 }
 
@@ -1604,8 +1681,12 @@ fn refusals_of_schema_3() {
     // the library: a GEMM with a bias for this architecture
     assert!(!manifest.library().is_empty(), "the gate's manifest has library entries");
     // (one whose pinned algorithm needs a workspace, so that a workspace that is too small is refused; some algorithms need none)
-    let candidates: Vec<_> =
-        manifest.library().iter().filter(|e| e.implementation.has_bias() && e.arch == arch.to_string()).collect();
+    let candidates: Vec<_> = manifest
+        .library()
+        .iter()
+        .filter(|e| e.implementation.has_bias() && e.arch == arch.to_string())
+        .filter(|e| (e.dtype, e.out_dtype, e.layout) == (DType::Bf16, DType::Bf16, GemmLayout::Tn))
+        .collect();
     assert!(!candidates.is_empty(), "a gemm_bias for this architecture");
     let needs: Vec<(u64, &str)> = candidates
         .iter()
@@ -1938,7 +2019,7 @@ fn graph_capture_of_a_strided_kernel_and_of_a_gemm() {
     );
 
     // -- a GEMM with a bias, the smallest of the gate
-    let case = cases_where(&cases, |c| is_gemm(c) && tensors_json(c).len() == 4)
+    let case = cases_where(&cases, |c| is_bf16_gemm(c) && tensors_json(c).len() == 4)
         .into_iter()
         .min_by_key(|c| tensors_json(c)[1]["nbytes"].as_u64().unwrap())
         .expect("a GEMM case with a bias");
@@ -1977,7 +2058,7 @@ fn graph_capture_of_a_strided_kernel_and_of_a_gemm() {
 fn a_gemm_of_slices_on_a_capturing_stream_is_an_error_and_not_a_graph() {
     let (gpu, manifest, cases) = (Gpu::new(), manifest(), cases());
     let arch = Arch::of_context(&gpu.ctx).unwrap();
-    let case = cases_where(&cases, |c| is_gemm(c) && tensors_json(c).len() == 3)
+    let case = cases_where(&cases, |c| is_bf16_gemm(c) && tensors_json(c).len() == 3)
         .into_iter()
         .min_by_key(|c| tensors_json(c)[1]["nbytes"].as_u64().unwrap())
         .expect("a GEMM case without a bias");
