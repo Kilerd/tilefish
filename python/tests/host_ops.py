@@ -32,6 +32,9 @@ declaration records of it.
 one ``i32`` stride, declared with ``enable_fp_fusion=False`` and ``True``); importing them needs Triton's Gluon, so only the gate and the gpu tests
 call it, and the committed fixtures do not have them.
 
+``generated_ops()`` is two ops whose Triton tilefish generates (``tilefish.im2col1d`` in its two column orders): strided externs like any other to
+the Rust host. Only a fresh export of the gate has them.
+
 ``export_rust_fixtures.py`` builds these into the fixtures of the crate, and ``rust_gate.py`` runs them in Python (``replay``) and in Rust.
 
 No ``from __future__ import annotations`` here: tilefish evaluates annotations at declaration.
@@ -202,6 +205,18 @@ def per_arch_ops():
     import per_arch_kernels
 
     return {"row_sum": per_arch_kernels.row_sum}
+
+
+def generated_ops():
+    """``{name: extern}``: generated ops (Triton tilefish writes) of ``tilefish.im2col1d``, one per column order: ``im2col1d_tap``, a causal window of
+    7 taps at dilation 3 over 256 static channels (what a channel-last activation permuted to ``[N, C, L]`` gives), and ``im2col1d_channel``, 3 taps
+    at stride 2 with a padding of ``(2, 5)`` and a runtime channel count. Their stems are their names; the committed fixtures do not have them."""
+    from tilefish._copyops import im2col1d_op
+
+    return {
+        "im2col1d_tap": im2col1d_op(bf16, 7, dilation=3, padding=(18, 0), order="tap", channels=256),
+        "im2col1d_channel": im2col1d_op(bf16, 3, stride=2, padding=(2, 5)),
+    }
 
 
 def gemm_name(n, k, bias):

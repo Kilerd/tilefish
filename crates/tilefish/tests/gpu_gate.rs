@@ -33,7 +33,8 @@
 //! `the_gate_has_a_case_for_every_feature_of_schema_3`, `refusals_of_schema_3`, `graph_capture_of_a_strided_kernel_and_of_a_gemm`,
 //! `a_gemm_of_slices_on_a_capturing_stream_...`, the free of the slices of a GEMM and of a strided kernel on another stream,
 //! `a_written_view_lands_at_its_offset_and_nowhere_else` and `a_gemm_whose_algorithm_needs_a_workspace_...`. M3.3 adds
-//! `the_gate_has_a_case_for_every_feature_of_m3_3` and `views_that_share_a_stride_must_all_have_it`, and `the_gate_has_a_gluon_kernel`.
+//! `the_gate_has_a_case_for_every_feature_of_m3_3` and `views_that_share_a_stride_must_all_have_it`, and `the_gate_has_a_gluon_kernel`;
+//! `the_gate_has_generated_ops` checks that it runs the generated ops of `tilefish.im2col1d`.
 
 #[allow(dead_code)]
 mod generated {
@@ -1364,6 +1365,28 @@ fn the_gate_has_an_implementation_per_architecture() {
         entry.num_warps.unwrap_or(0),
         entry.grid
     );
+}
+
+/// Generated ops (`tilefish.im2col1d` in its two column orders, whose Triton tilefish writes from a template: `python/tests/host_ops.py`,
+/// `generated_ops`) are strided externs to the Rust host: their entries carry the sha256 of the generated source, and `byte_identity` launches them
+/// over views like any entry (`rust_gate.py` holds Python's bytes to the patches computed on the bits). A committed fixture has none.
+#[test]
+fn the_gate_has_generated_ops() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no generated op");
+        return;
+    }
+    let arch = cases["arch"].as_str().unwrap().to_owned();
+    let manifest = manifest();
+    for stem in ["im2col1d_bf16_k7_s1_d3_p18x0_tap_c256", "im2col1d_bf16_k3_s2_d1_p2x5_channel"] {
+        let entry = manifest.entry(stem, &arch).unwrap_or_else(|| panic!("the gate's manifest has no {stem}"));
+        assert!(entry.source_sha256.is_some(), "{stem}: the sha256 of the generated source");
+        let of_stem = cases_where(&cases, |c| c["stem"] == stem);
+        let views = of_stem.iter().filter(|c| has_view(c)).count();
+        assert!(of_stem.len() >= 3 && views >= 3, "{stem}: {} cases, {views} of them over views", of_stem.len());
+        println!("rust gate: the generated op {stem}: {} cases, {views} of them over views", of_stem.len());
+    }
 }
 
 /// The bf16 nearest to an f32 (round to nearest, ties to even), as Triton's `.to(tl.bfloat16)` rounds a finite value.

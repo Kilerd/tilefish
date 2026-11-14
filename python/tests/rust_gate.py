@@ -27,6 +27,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **strides that several views share** (``gpu_kernels_p4.py``): ``o = q + k + v`` over the q, k and v of one fused tensor, read with one stride pair
   (``StrideOf(("q", "k", "v"), axis)``), and over three tensors of their own with the same strides; the plan ``fused_qkv`` binds the three views in one
   step;
+* **generated ops** (``host_ops.generated_ops``, exported only): ``tilefish.im2col1d`` in the tap order (a causal, dilated window over 256 static
+  channels of a channel-last activation permuted to ``[N, C, L]``) and in the channel order (stride 2, padding ``(2, 5)``, a runtime channel count, over
+  contiguous tensors and views with an offset), checked here against the patches computed on the bits;
 * **an Out that may be written over an input** (``gpu_kernels_p5.py``): ``add_into`` launched with its outputs apart; the plan ``residual_chain``
   (without and with reuse) writes both of its calls in place, over the residual it made in the arena; the plan ``copy_steps`` has two copy steps
   (``tilefish.copy`` of a dense view into the arena, a store into an ``InOut`` parameter), launched and captured; the plan ``view_returns`` returns a
@@ -74,7 +77,7 @@ from typing import Any, Callable
 
 import torch
 from gpu_util import randn, same_bytes
-from host_ops import GEMM_SHAPES, abi_of, gemm_name, gluon_ops, gpu_ops, library_ops, ops, per_arch_ops
+from host_ops import GEMM_SHAPES, abi_of, gemm_name, generated_ops, gluon_ops, gpu_ops, library_ops, ops, per_arch_ops
 
 import tilefish
 from tilefish import runtime
@@ -332,6 +335,36 @@ def must_scale_add(k, c):
     return lambda args, got: same_bytes(got, args[0] * float(k) + float(c))
 
 
+def args_channel_last(spec, seed):
+    """A channel-last ``[n, length, 256]`` activation read as ``[n, 256, length]`` (strides ``(256 * length, 1, 256)``)."""
+    n, length = spec
+    return (randn((n, length, 256), BF16, seed + n * 1000 + length).permute(0, 2, 1),)
+
+
+def args_ncl(spec, seed):
+    """``[n, c, length]``: a contiguous tensor, or (``sliced``) a view with an offset into a larger one."""
+    n, c, length, sliced = spec
+    if sliced:
+        return (randn((n, c + 3, length + 4), BF16, seed + n * 1000 + c)[:, 1 : c + 1, 2 : length + 2],)
+    return (randn((n, c, length), BF16, seed + n * 1000 + c),)
+
+
+def must_be_patches(k, s, d, pad, order):
+    """The patches of a 1-D convolution, computed on the bits: tap ``j`` of position ``t`` reads ``t * s - left + j * d``, ``+0.0`` outside."""
+
+    def check(args, got):
+        (x,) = args
+        n, c, length = x.shape
+        lo = (length + pad[0] + pad[1] - d * (k - 1) - 1) // s + 1
+        pos = torch.arange(lo, device=x.device)[:, None] * s - pad[0] + torch.arange(k, device=x.device)[None, :] * d
+        taken = x.view(torch.int16)[:, :, pos.clamp(0, length - 1)]  # [n, c, lo, k]
+        bits = torch.where((pos >= 0) & (pos < length), taken, torch.zeros((), dtype=torch.int16, device=x.device))
+        cols = bits.permute(0, 2, 1, 3) if order == "channel" else bits.permute(0, 2, 3, 1)
+        assert torch.equal(got.view(torch.int16), cols.reshape(n, lo, c * k))
+
+    return check
+
+
 def given_ops():
     """``{name: extern}``: a prebuilt PTX whose ``k: const[i32]`` and ``c: const[i64]`` every call gives (``gpu_kernels_p6.scale_add``). Not in the committed
     fixtures, so only a fresh export has it."""
@@ -408,6 +441,11 @@ def build_cases():
     cases += plain("row_sum", "row_sum", args_rows, (1, 2, 7, 40, 1000), seeds=(0, 1), check=must_be_this_tiling)
     # -- an Out that may be written over an input (MayAlias): launched apart here; in place in the plan residual_chain
     cases += plain("add_into", "add_into", args_add_into, (8, 24), seeds=(0, 1), check=must_add_into)
+    # -- generated ops: the patches of a 1-D convolution in both column orders, over channel-last views, offsets and contiguous tensors
+    tap, channel = generated_ops()["im2col1d_tap"].name, generated_ops()["im2col1d_channel"].name
+    cases += plain("im2col1d_tap", tap, args_channel_last, ((1, 1), (2, 19), (3, 100)), seeds=(0,), check=must_be_patches(7, 1, 3, (18, 0), "tap"))
+    sizes = [(n, c, length, sliced) for n, c, length in ((1, 1, 1), (2, 40, 33), (3, 300, 64)) for sliced in (False, True)]
+    cases += plain("im2col1d_channel", channel, args_ncl, sizes, seeds=(0,), check=must_be_patches(3, 2, 1, (2, 5), "channel"))
     return cases
 
 
@@ -546,6 +584,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(gluon_ops())
         declared.update(per_arch_ops())
         declared.update(given_ops())
+        declared.update(generated_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
