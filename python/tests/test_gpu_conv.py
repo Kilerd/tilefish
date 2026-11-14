@@ -2,8 +2,9 @@
 
 * the backend posture ``"instant"`` pins what torch runs: the result is ``torch.nn.functional.conv1d`` / ``conv2d`` / ``conv3d`` byte for byte with
   ``torch.backends.cudnn.deterministic = True``, ``benchmark = False`` and TF32 off (NHWC through ``conv2d`` of channels-last tensors), over 1-D,
-  2-D and 3-D problems of f16, bf16 and f32 with strides, paddings, dilations and groups, three operand sets each (asserted); the pin is an
-  engine configuration whose execution plan is the heuristic's own (their JSON is compared when it is pinned);
+  2-D and 3-D problems of f16, bf16 and f32 with strides, paddings, dilations and groups, three operand sets each (asserted), where torch runs cuDNN
+  (``torch._C._select_conv_backend``); the pin is an engine configuration whose execution plan is the heuristic's own (their JSON is compared when it is
+  pinned); a problem torch runs otherwise, or 16-bit data with the math ``"fma"`` (no torch setting), is held to the f64 result instead;
 * a legacy pin of ``CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM`` is what torch's legacy path runs (``TORCH_CUDNN_V8_API_DISABLED=1``, a process
   of its own: its deterministic default), f16 and f32;
 * a pin gives the same bytes run after run and in another process;
@@ -111,14 +112,16 @@ PROBLEMS = [
     ("f16", "NCHW", 2, 32, 64, 2, (33, 47), (3, 5), (2, 1), (1, 2), (1, 1), "tensor_op"),
     ("f32", "NCHW", 1, 32, 64, 1, (777,), (5,), (1,), (2,), (1,), "fma"),
     ("f32", "NHWC", 1, 16, 32, 1, (24, 24), (3, 3), (2, 2), (1, 1), (1, 1), "fma"),
-    ("f16", "NHWC", 1, 64, 64, 1, (646,), (7,), (1,), (3,), (1,), "fma"),
     ("f32", "NCHW", 1, 16, 16, 2, (10, 10, 10), (3, 3, 3), (2, 1, 1), (1, 0, 1), (1, 1, 2), "fma"),
 ]
 
 
-# problems torch runs without cuDNN (torch._C._select_conv_backend: a bf16 depthwise one is CudaDepthwise2d, an f16 3-D one SlowDilated3d on sm_103): a
-# pin of each runs, repeats its bytes and is the f64 result within one accumulation, but there are no torch bytes of cuDNN to compare with
+# problems with no torch bytes of cuDNN to compare with: torch runs them without cuDNN (torch._C._select_conv_backend: a bf16 depthwise one is
+# CudaDepthwise2d, an f16 3-D one SlowDilated3d on sm_103), or 16-bit data with the math "fma", which torch has no setting for (it filters tensor-core
+# engines for f32 only: measured with cuDNN 9.13.0 on sm_103, where the first engine of f16 is a tensor-core one). A pin of each runs, repeats its
+# bytes and is the f64 result within one accumulation and one rounding
 OTHER_PROBLEMS = [
+    ("f16", "NHWC", 1, 64, 64, 1, (646,), (7,), (1,), (3,), (1,), "fma"),
     ("bf16", "NCHW", 2, 96, 96, 96, (500,), (7,), (1,), (3,), (1,), "tensor_op"),
     ("f16", "NCHW", 1, 32, 32, 1, (12, 12, 12), (3, 3, 3), (1, 1, 1), (1, 1, 1), (1, 1, 1), "tensor_op"),
 ]
@@ -166,15 +169,19 @@ def test_the_instant_posture_pins_what_torch_runs(spec):
 def test_a_pin_of_a_problem_torch_runs_without_cudnn_is_the_f64_result_within_one_accumulation(spec):
     p = _cudnn.Problem(*spec)
     x, w = tensors(p, 2)
-    assert not str(torch_backend(p, x, w)).endswith("Cudnn"), "torch runs it with cuDNN: it belongs with the comparisons of pins"
+    fma16 = p.math == "fma" and p.dtype != "f32"
+    assert fma16 or not str(torch_backend(p, x, w)).endswith("Cudnn"), "torch runs it with cuDNN: it belongs with the comparisons of pins"
     for heuristic in ("instant", "v7"):
         pin = _cudnn.pin_conv(p, heuristic=heuristic, workspace_bytes=64 << 20).pin
         y, again = ours(p, pin, x, w), ours(p, pin, x, w)
         torch.cuda.synchronize()
         assert same_bytes(y, again), (heuristic, pin.what)
         fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[p.spatial]
-        exact = fn(x.double().cpu(), w.double().cpu(), None, p.stride, p.padding, p.dilation, p.groups)
-        absolute = fn(x.double().cpu().abs(), w.double().cpu().abs(), None, p.stride, p.padding, p.dilation, p.groups)
+        to_nchw = (0, p.spatial + 1, *range(1, p.spatial + 1)) if p.layout == "NHWC" else tuple(range(p.spatial + 2))
+        x64, w64 = x.double().cpu().permute(*to_nchw), w.double().cpu().permute(*to_nchw)
+        y = y.permute(*to_nchw)
+        exact = fn(x64, w64, None, p.stride, p.padding, p.dilation, p.groups)
+        absolute = fn(x64.abs(), w64.abs(), None, p.stride, p.padding, p.dilation, p.groups)
         terms = p.c // p.groups
         for r in p.filter:
             terms *= r
