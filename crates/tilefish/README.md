@@ -74,8 +74,10 @@ forward convolution (`impl: "cudnn.conv_fwd"`, `Manifest::conv`, `Conv`,
 `ConvEntry`): the pin is a legacy algorithm enum or a backend engine
 configuration (an engine and its knobs), with the cuDNN version that chose it;
 the crate refuses another cuDNN version, another SM count and a process with
-`NVIDIA_TF32_OVERRIDE` set, vets the pin as Python does, and opens libcudnn
-only for a manifest that has a convolution. The entry of an operator declared
+`NVIDIA_TF32_OVERRIDE` set, vets the pin as Python does, runs the entry's
+canary (its output on operands made of a seed, on a stream of its own) and
+refuses other bytes, and opens libcudnn only for a manifest that has a
+convolution. The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
 which one it is (`Entry::implementation`: its own architecture, or
 `"fallback"`); the crate launches the entry of the device's architecture, as

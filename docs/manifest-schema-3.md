@@ -800,7 +800,7 @@ inside it, as a dense tensor has and as torch's `fixSizeOneDimStride` writes). T
   engine configuration of them and an execution plan, finalized once when the entry is loaded; a variant pack of the three pointers and the workspace
   per launch.
 
-**The fields** (exactly these; `sm_count_target` is optional):
+**The fields** (exactly these; `sm_count_target` and `canary` are optional):
 
 | field | type and rule |
 |---|---|
@@ -816,9 +816,10 @@ inside it, as a dense tensor has and as torch's `fixSizeOneDimStride` writes). T
 | `workspace_bytes` | int from 1 to 2^40: the limit the pin was chosen under, the size a launch provides, and what a legacy call is given |
 | `choice` | how the pin was chosen: `"v7"` (a legacy pin), `"instant"` or `"mode_b"` (a backend pin), or `"imported"` (either) |
 | `pin` | `{"api": "legacy", "algo": a}` with `a` a `cudnnConvolutionFwdAlgo_t` (0 to 7), or `{"api": "backend", "engine": e, "knobs": [[t, v], ...]}` with `e` an engine's global index (from 0), `t` a knob type (0 to 42) and `v` an int64, the pairs sorted by type, each type once |
-| `cudnn_version` | int >= 1: `cudnnGetVersion()` of the library that chose the pin (`91002` for 9.10.2) |
+| `cudnn_version` | int >= 1: `cudnnGetVersion()` of the library that chose the pin (`91002` for 9.10.2); it does not tell two builds of one version apart (the canary does) |
 | `sm_count` | int >= 1: the multiprocessor count of the device the pin was chosen on |
 | `sm_count_target` | *optional*: an int from 1 to `sm_count`, the partition the pin was chosen for; set on the engine (`CUDNN_ATTR_ENGINE_SM_COUNT_TARGET`) of a backend pin at every load; on a legacy pin (the legacy API takes no target) only when it was imported |
+| `canary` | *optional* (an entry without one loads as before): `{"seed": s, "y_sha256": h}`, `s` an int from 0 to 2^32 - 1, `h` 64 lowercase hex digits: the sha256 of the bytes of `y` the pin computed at export from the operands of `s` (below). `export` records it with the seed 1 |
 
 **How the pin is chosen** (`@tilefish.library(..., impl="cudnn.conv_fwd", api=..., heuristic=...)`, `python/src/tilefish/_conv.py`):
 
@@ -844,8 +845,39 @@ on this device"); Python compares the entry with the declaration (the first diff
 `cudnnGetVersion()` must be `cudnn_version` (a pin names other kernels in another version; cuDNN has no build number, so two builds of one version are not
 told apart); **a process with `NVIDIA_TF32_OVERRIDE` set, to any value, is refused** ("unset it"): it changes what cuDNN picks and runs behind the
 declared math (measured), so no pin is made in such a process either; an imported pin must be the table's; then the
-checks of the pin. A Rust host on a partition (`Manifest::with_sm_partition(Some(P))`) takes only an entry chosen for `P` SMs (its `sm_count_target`, or
-its `sm_count` without one), as for a GEMM.
+checks of the pin; then the canary, when the entry has one. A Rust host on a partition (`Manifest::with_sm_partition(Some(P))`) takes only an entry
+chosen for `P` SMs (its `sm_count_target`, or its `sm_count` without one), as for a GEMM.
+
+**The canary.** Two builds of one cuDNN version (the PyPI wheel and the system package of 9.13.0.50, say) answer the same `cudnnGetVersion()` and map
+other engine libraries. So `export` runs each pin once more, on operands made of a seed, and records the sha256 of the bytes of `y`; a replay (Python, at the
+first replay of the entry in the process and device: `tilefish._conv.check_canary`) and the crate's load (`Manifest::conv`, once per context) run it
+again before the pin is used, and refuse the pin when the bytes differ ("the canary of the cuDNN convolution ... gives y with sha256 ... here, and the
+manifest recorded ..."). A Python replay inside a CUDA graph capture that would run a canary is refused ("run it once before the capture"). The
+operands (`tilefish._conv.canary_operands`, the crate's `canary_operands`, the same bytes: `python_conv.rs` holds them to Python's): `x` and `w` are
+dense in the layout, of `n * c * prod(input)` and `k * (c / groups) * prod(filter)` elements of the data type, little-endian; each is SHA-256 in counter
+mode, block `j` (from 0) the digest of the bytes `tilefish.conv.canary\0`, the seed (8 bytes little-endian), a tag (one byte: 0 for `x`, 1 for `w`) and
+`j` (8 bytes little-endian), the blocks concatenated and cut to the size; then the most significant byte `b` of each element becomes, for f16
+(`s eeeee mm`), `(b & 0x80) | ((7 + ((b >> 2) & 7)) << 2) | (b & 3)` (an exponent field of 7 to 14: magnitudes in [2^-8, 1)), and for bf16 and f32
+(`s eeeeeee`), `(b & 0x80) | (55 + (b & 7))` (exponents 110 to 125: magnitudes in [2^-17, 2^-1)): finite, normal numbers of many magnitudes and both
+signs, whose sums round by their order. `y` (`n * k * prod(output)` elements) and the workspace start zeroed. **The canary runs on a stream of its own**
+(torch's pool, `ctx.new_stream()` in Rust: non-blocking, ordered with no other stream): the copies of the operands, the zeroing, the workspace, the
+convolution and the copy of `y` back, which waits for that stream alone. It never uses the NULL stream, which a CUDA green context does not order
+against another stream (a harness whose copies were on the NULL stream raced the convolution inside a green context). Merging an export into a manifest
+replaces an entry without a canary; two entries whose canaries differ are two binaries (`overwrite=True` to replace). A `cudnn_engines_sha256` of the
+mapped engine libraries is not recorded: hashing them (about 570 MB for 9.10.2) at every load costs seconds in Python and much more in a debug build of
+the crate, and the canary is the check.
+
+**Streams.** Every call sets the handle's stream (`cudnnSetStream`) right before it runs, under the handle's lock, to the stream the call is given (a
+launch's, a plan's); the memory the hosts touch for a convolution is on that stream too: Python's workspace, when the call is given none, comes from
+torch's caching allocator on that stream (no memset), the crate's `Conv::alloc_workspace` zeroes on the stream it is given, and a plan's arena is the
+plan's. `test_gpu_conv.py` captures calls of both APIs (the workspace given or allocated) with `capture_error_mode="global"` on a non-blocking stream: the
+output is untouched until the replay, which is the eager bytes, so no part of a call is on the NULL stream or another; and the canaries of a manifest
+run and pass with the NULL stream held busy, which is still busy when they return. The Rust gate captures its convolutions in
+`CU_STREAM_CAPTURE_MODE_GLOBAL`, and runs every canary again (`Conv::check_canary`, the code of the load) with the NULL stream held by a host function,
+which is still held when they return (`the_canary_of_a_load_is_never_on_the_null_stream`). What does wait for the NULL stream is cuDNN's `cudnnCreate`:
+a load with the NULL stream held returns only when it is done (measured, cuDNN 9.10.2; Python makes one handle per device, at its first convolution, the
+crate one per loaded convolution). That is a wait at the load (for the NULL stream's work at least; whether for other streams' too was not measured),
+which orders nothing wrongly.
 
 **The workspace and plans.** A launch is given a workspace by the caller, the last tensor (a `u8` vector, 256-byte aligned, overlapping no operand): at
 least what the plan needs for a backend pin, and the entry's whole `workspace_bytes` for a legacy pin (which the call is given). A launch plan's library
@@ -936,7 +968,8 @@ document tilefish writes next to a build and the host does not read):
   not the convolution's; an `alignment` not one of 16 to 256, or a `pointer_alignment` precondition of another; a `workspace_bytes` out of range; a
   `choice` not of the four, or one whose API is not the pin's; a `pin` that is not exactly one of the two forms (an algorithm above 7, a negative engine, a
   knob type above 42, knobs unsorted or repeated); a `cudnn_version` or `sm_count` that is not a positive int; an `sm_count_target` out of 1..`sm_count`,
-  or on a legacy pin that was not imported; the shapes of `x`, `w`, `out` not the problem's in the layout under the buckets.
+  or on a legacy pin that was not imported; a `canary` that is not exactly `{seed, y_sha256}` (a seed out of 0..2^32 - 1, not an int, or `true`; a
+  digest not 64 lowercase hex digits), `null` included; the shapes of `x`, `w`, `out` not the problem's in the layout under the buckets.
 * *spec* only, for prebuilt binaries: a `binary` section that is not `{kind, symbol, shared, digests}`; `attrs` not empty; `launch_params` not every arg
   in order; a `block` that is not three ints from 1 to 1024 with product ≤ 1024; a `constexpr` argument.
 
@@ -1032,11 +1065,12 @@ a capture holds them in the kernel node.
 **Launching a convolution** (`conv.rs`, `ffi/cudnn.rs`). `Manifest::conv(&ctx, name, buckets, arch)` loads a `Conv` once per context and
 `Conv::launch(&stream, &mut [x, w, out, workspace])` runs it (`launch_raw` with regions captures it). Load refuses, in order: a partition the pin was
 not chosen for, a device of another SM count, `NVIDIA_TF32_OVERRIDE` set, a libcudnn that cannot be opened (cudarc's `cudnn` feature, dynamically loaded:
-opened only when a convolution is loaded, so a manifest without one never opens it), another `cudnnGetVersion()`, and a pin that fails the checks of
-section 9.4; it makes the legacy descriptors or the finalized execution plan once. A launch takes the handle's lock (the handle's stream is its state), sets
+opened only when a convolution is loaded, so a manifest without one never opens it), another `cudnnGetVersion()`, a pin that fails the checks of
+section 9.4, and a canary of other bytes (run on a stream of its own; `canary_bytes`, `canary_operands`; `Conv::check_canary` runs it again); it
+makes the legacy descriptors or the finalized execution plan once. A launch takes the handle's lock (the handle's stream is its state), sets
 the stream and runs; the tensors go through the plan of the entry as a GEMM's do, and the workspace through the same checks, with at least
 `Conv::workspace_required()` bytes (the plan's need, or the whole `workspace_bytes` of a legacy pin). `ConvEntry` holds the reading
-(`problem: ConvProblem`, `pin: ConvPin`, `choice`, `cudnn_version`, `sm_count`, `sm_count_target`); `Manifest::library()` is the GEMMs and
+(`problem: ConvProblem`, `pin: ConvPin`, `choice`, `cudnn_version`, `sm_count`, `sm_count_target`, `canary: Option<ConvCanary>`); `Manifest::library()` is the GEMMs and
 `Manifest::convolutions()` the convolutions. A launch plan's library step loads whichever its entry is.
 
 **The emitter** (`tilefish.hosts.rust`). It writes a struct for each kernel (Triton or prebuilt: `launch` takes every pointer as a `TensorRef` or `TensorMut`;
@@ -1064,7 +1098,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 | its optional fields (section 9.1): the posture, imported algorithms, bf16 split-K partial sums | `test_library_options.py`, `test_cublaslt.py`; on a GPU `test_gpu_cublaslt.py` (torch's bytes, the opt-in), `test_gpu_gemm.py` (jit and replay) |
 | f16 operands, an f32 result, the layout NN, `allow_f16_reduction` (section 9.2) | `test_library_f16.py`; on a GPU `test_gpu_gemm_f16.py` (torch's bytes in both layouts, the f64 reference, jit, replay, plans, imported tables, the opt-in) |
 | the layouts TT and NT (section 9.2) | `test_library_layouts.py`; on a GPU `test_gpu_gemm_layouts.py` (torch's bytes for bf16, f16 and f32, the f64 reference, jit, replay, a plan and its capture, an imported table) and the Rust gate |
-| a cuDNN convolution (section 9.4) | `test_library_conv.py` (the declaration, the entry, the reader, a replay's checks, a plan, the emitter, the binding's rules); on a GPU `test_gpu_conv.py` (torch's bytes, torch's legacy path, repeatability across processes, jit, replay, a plan and its capture, imported pins, the refusals, the SM count target) and the Rust gate |
+| a cuDNN convolution (section 9.4) | `test_library_conv.py` (the declaration, the entry, the reader, a replay's checks, a plan, the emitter, the binding's rules); on a GPU `test_gpu_conv.py` (torch's bytes, torch's legacy path, repeatability across processes, jit, replay, a plan and its capture, imported pins, the refusals, the SM count target, the canary and its stream, global-mode captures) and the Rust gate |
 | f32 operands, TF32 off, `allow_f32_reduction` (section 9.2) | `test_library_f32.py` (the declaration, the vetting rule, the digests of older entries); on a GPU `test_gpu_gemm_f32.py` (torch's bytes in both layouts and two workspace configurations, the TF32 and layout traps, the f64 reference, TF32 and emulation refused, jit, replay, plans, imported tables, the opt-in) |
 | `sm_count_target` (section 9.3) | `test_library_sm_target.py`; on a GPU `test_gpu_gemm_sm_target.py` (a green context: the first-handle rule and the target; the bytes do not depend on the target) |
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
@@ -1079,7 +1113,7 @@ The Rust crate (`crates/tilefish/tests/`):
 |---|---|
 | strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs` (the optional fields of section 9.1 and the forms of 9.2 too), `schema3.rs` (synthetic manifests, `common/synthetic.rs`; `implementation` of section 4.1) |
 | the forms of section 9.2: Python's verdict on entries of every form and on each changed in one field | `python_library.rs` (`data/python_library.json`, made by `export_rust_vectors.py`) |
-| the convolutions of section 9.4: Python's verdict on entries of every form and on each changed in one field, the pin and the cuDNN problem each describes | `python_conv.rs` (`data/python_conv.json`, made by `export_rust_vectors.py`); the checks of a call with no GPU: `conv.rs` |
+| the convolutions of section 9.4: Python's verdict on entries of every form and on each changed in one field, the pin, the canary and the cuDNN problem each describes, and the canary's operands | `python_conv.rs` (`data/python_conv.json`, made by `export_rust_vectors.py`); the checks of a call with no GPU: `conv.rs` |
 | views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
 | `tensordesc` (section 5.5): reading, refusals, the slots, the launch checks and the arguments of the encode | `tensor_maps.rs` |

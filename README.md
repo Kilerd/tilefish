@@ -544,8 +544,11 @@ down-conversion and, for `"fma"`, no tensor cores), or `"mode_b"`; `api="legacy"
 cudnn_version, {(n, c, k, input, filter, stride, padding, dilation, groups): pin})` imports pins instead. The entry records the problem, the math, the pin,
 how it was chosen, the cuDNN version (`cudnnGetVersion()`), the SM count and an `sm_count_target`; `replay` and the Rust host refuse another cuDNN version,
 another SM count and a process with `NVIDIA_TF32_OVERRIDE` set (it changes what cuDNN picks behind the declared math), and vet the pin (a deterministic answer
-of `cudnnGetConvolutionForwardAlgorithm_v7`; an engine of allowed notes whose knobs are in range and whose plan finalizes). There is no bias (torch's cuDNN
-convolution adds it with a separate `add_`, as a tilefish kernel does).
+of `cudnnGetConvolutionForwardAlgorithm_v7`; an engine of allowed notes whose knobs are in range and whose plan finalizes). Since two builds of one cuDNN
+version answer the same `cudnnGetVersion()`, `export` also records a canary per entry, the sha256 of the pin's output on operands made of a seed, which
+`replay` and the Rust host run again (once, on a stream of their own, never the NULL stream) and refuse when the bytes differ; an entry without one loads as
+before. Every call sets cuDNN's stream to the one it is given. There is no bias (torch's cuDNN convolution adds it with a separate `add_`, as a tilefish
+kernel does).
 
 The `"instant"` pin is `torch.nn.functional.conv1d` / `conv2d` / `conv3d`'s bytes where torch runs cuDNN (`test_gpu_conv.py`: 15 problems, three operand sets,
 1-D, 2-D and 3-D, f16, bf16 and f32 with TF32 off, strides, dilations, groups; a B300 MIG slice with cuDNN 9.10.2 and 9.13.0, an RTX 5090 with 9.13.0),
