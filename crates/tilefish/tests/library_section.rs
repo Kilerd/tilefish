@@ -519,6 +519,32 @@ fn an_entry_whose_types_or_layout_disagree_is_refused() {
     );
 }
 
+/// `sm_count_target` (section 9.3): absent, the heuristic chose for the device's count; present, an integer from 8 to `sm_count`.
+#[test]
+fn an_sm_count_target_is_read_from_8_to_the_sm_count() {
+    let mut entry = gemm_of(true, 32, 3072, 1024, "f16", "f16", "NN");
+    entry["sm_count_target"] = 16.into();
+    let manifest = read(&[], &[entry.clone()]).unwrap();
+    let e = &manifest.library()[0];
+    assert_eq!((e.sm_count, e.sm_count_target, e.sm_count_chosen_for()), (30, Some(16), 16));
+    let plain = read(&[], &[gemm(true, 32, 1024, 1024)]).unwrap();
+    assert_eq!((plain.library()[0].sm_count_target, plain.library()[0].sm_count_chosen_for()), (None, 30));
+    for bad in [json!(7), json!(31), json!(0), json!(16.0), json!("16"), json!(true), Value::Null] {
+        let mut wrong = entry.clone();
+        wrong["sm_count_target"] = bad.clone();
+        let message = refusal(&[], &[wrong]);
+        assert!(
+            message.contains("sm_count_target is absent or an int from 8 to sm_count (30), got"),
+            "{bad}: {message}"
+        );
+    }
+    // the digest covers it
+    let doc = |e: Value| -> Value { serde_json::from_str(&common::synthetic::manifest_text(&[], &[e])).unwrap() };
+    let mut other = entry.clone();
+    other["sm_count_target"] = 24.into();
+    assert_ne!(manifest_digest(&doc(entry)).unwrap(), manifest_digest(&doc(other)).unwrap());
+}
+
 // -- the digest --------------------------------------------------------------------------------------------------------------------
 
 #[test]

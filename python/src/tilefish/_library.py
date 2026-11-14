@@ -78,6 +78,8 @@ ENTRY_KEYS = (
 # of a default declaration is what tilefish 0.0.4 wrote): the heuristic posture, an imported algorithm, the opt-in to split-K partial sums in the
 # output type (named by the operands' type: allow_bf16_reduction on bf16 operands, allow_f16_reduction on f16 ones).
 OPTIONAL_ENTRY_FIELDS = {"heuristic": "torch", "algo_source": "imported", "allow_bf16_reduction": True, "allow_f16_reduction": True}
+# An optional field with a count: present only when the declaration targets an SM count (sm_count_target=), an int from 8 to the entry's sm_count.
+OPTIONAL_COUNT_FIELDS = ("sm_count_target",)
 
 
 def has_bias(impl: str) -> bool:
@@ -204,7 +206,13 @@ def table_for(tables: "tuple[AlgoTable, ...]", arch: str, sm_count: int, version
 
 
 def check_options(
-    name: str, heuristic: Any, allow_bf16_reduction: Any, algos: Any, allow_f16_reduction: Any = False, layout: Any = "TN"
+    name: str,
+    heuristic: Any,
+    allow_bf16_reduction: Any,
+    algos: Any,
+    allow_f16_reduction: Any = False,
+    layout: Any = "TN",
+    sm_count_target: Any = None,
 ) -> "tuple[AlgoTable, ...] | None":
     """Check the options of a ``@library(impl=...)`` declaration that say how its algorithms are chosen (the posture, the opt-ins to split-K
     partial sums in the output type, the imported tables) and its layout; return the tables (``None`` without). Raises a
@@ -219,6 +227,15 @@ def check_options(
         raise TilefishDeclarationError(
             f"{where}: layout must be one of {list(LAYOUTS)} (TN: b is [N, K], out = a @ b^T; NN: b is [K, N], out = a @ b), got {layout!r}"
         )
+    if sm_count_target is not None:
+        from ._cublaslt import INT32_MAX, MIN_SM_COUNT_TARGET
+
+        v = sm_count_target
+        if isinstance(v, bool) or not isinstance(v, int) or not MIN_SM_COUNT_TARGET <= v <= INT32_MAX:
+            raise TilefishDeclarationError(
+                f"{where}: sm_count_target must be None or an int of at least {MIN_SM_COUNT_TARGET} (the SMs of the partition the algorithm is "
+                f"chosen for; cuBLASLt 12.8.4 kills the process for a target below 8), got {v!r}"
+            )
     return None if algos is None else _check_tables(where, algos)
 
 
@@ -382,6 +399,8 @@ def _canonical(op: "LibraryOp") -> "dict[str, Any]":
         out["allow_f16_reduction"] = True
     if layout_of(op) != "TN":
         out["layout"] = layout_of(op)  # b is [K, N]: with K = N the signature alone would not tell the layouts apart
+    if getattr(op, "sm_count_target", None) is not None:
+        out["sm_count_target"] = op.sm_count_target
     tables = getattr(op, "algos", None)
     if tables:
         keys = _problem_keys(op)
@@ -433,6 +452,7 @@ class LibrarySpec:
     out_dtype: str = "bf16"  # of the result and of a bias
     layout: str = "TN"  # TN: b is [n, k]; NN: b is [k, n]
     allow_f16_reduction: bool = False  # whether split-K may add its partial sums in the output type (the opt-in of f16 operands)
+    sm_count_target: "int | None" = None  # the SM count the heuristic is asked for (CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET), None: the device's
 
     @property
     def bias(self) -> bool:
@@ -501,6 +521,8 @@ class LibrarySpec:
             out["allow_bf16_reduction"] = True
         if self.allow_f16_reduction:
             out["allow_f16_reduction"] = True
+        if self.sm_count_target is not None:
+            out["sm_count_target"] = self.sm_count_target
         return out
 
 
@@ -587,6 +609,7 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
                 out_dtype=form.out,
                 layout=form.layout,
                 allow_f16_reduction=getattr(op, "allow_f16_reduction", False),
+                sm_count_target=getattr(op, "sm_count_target", None),
             )
         )
     return specs
@@ -643,6 +666,11 @@ def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | 
             f"cannot pin '{spec.stem}' for sm_{cap}: cuBLASLt chooses an algorithm for the device it runs on, and device {index} is sm_{have}"
         )
     version, sms = _cublaslt.version(), sm_count(index)
+    if spec.sm_count_target is not None and spec.sm_count_target > sms:
+        raise TilefishBuildError(
+            f"cannot pin '{spec.stem}' on sm_{cap} with {sms} SMs: its declaration targets {spec.sm_count_target} SMs (sm_count_target=), more than "
+            "the device has"
+        )
     if spec.algos:
         algo = imported_algo(spec, f"sm_{cap}", sms, version, index)
         if algo is None:
@@ -654,11 +682,12 @@ def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | 
     else:
         algo = _cublaslt.pin_algo(
             spec.m, spec.n, spec.k, spec.bias, workspace_bytes=spec.workspace_bytes, device_index=index, heuristic=spec.heuristic,
-            form=spec.form, **spec.opt_ins,
+            form=spec.form, sm_count_target=spec.sm_count_target, **spec.opt_ins,
         ).algo_hex  # fmt: skip
     try:
         _cublaslt.check_algo(
-            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form, **spec.opt_ins,
+            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form,
+            sm_count_target=spec.sm_count_target, **spec.opt_ins,
         )  # fmt: skip
     except TilefishRuntimeError as e:
         source = "the imported" if spec.algos else "the heuristic's"
@@ -723,6 +752,14 @@ def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str, sm_count: i
             "an algorithm is chosen for the number of multiprocessors it runs on (a MIG slice has fewer than the whole GPU), so the pin is refused; "
             "re-export the manifest on this device (or on one with the same SM count)"
         )
+    if entry.get("sm_count_target") != spec.sm_count_target:
+        def chosen(t: "int | None") -> str:
+            return "the whole device" if t is None else f"{t} SMs (sm_count_target={t})"
+
+        raise TilefishManifestError(
+            f"the manifest pinned the cuBLASLt algorithm of '{spec.stem}' ({arch}) for {chosen(entry.get('sm_count_target'))}, but the declaration "
+            f"asks for {chosen(spec.sm_count_target)}: re-export the manifest from this declaration"
+        )
     expected = json.loads(json.dumps(spec.entry(sm_count)))
     got = {k: entry.get(k) for k in expected}
     found = _first_difference(expected, got, "")
@@ -784,11 +821,11 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         _bad(where, f"is not an object: {entry!r}")
     where = f"#{index} ({entry.get('stem')!r})"
     missing = [k for k in ENTRY_KEYS if k not in entry]
-    unknown = sorted(str(k) for k in set(entry) - set(ENTRY_KEYS) - set(OPTIONAL_ENTRY_FIELDS))
+    unknown = sorted(str(k) for k in set(entry) - set(ENTRY_KEYS) - set(OPTIONAL_ENTRY_FIELDS) - set(OPTIONAL_COUNT_FIELDS))
     if missing or unknown:
         _bad(
             where,
-            f"must have exactly the fields {ENTRY_KEYS} and may have {list(OPTIONAL_ENTRY_FIELDS)}"
+            f"must have exactly the fields {ENTRY_KEYS} and may have {list(OPTIONAL_ENTRY_FIELDS) + list(OPTIONAL_COUNT_FIELDS)}"
             + (f"; missing {missing}" if missing else "")
             + (f"; unknown {unknown}" if unknown else ""),
         )
@@ -847,6 +884,10 @@ def validate_entry(entry: Any, index: int = 0) -> None:
             _bad(where, f"cublaslt_version must be a positive int, got {entry['cublaslt_version']!r}")
         if not sv.is_int(entry["sm_count"]) or entry["sm_count"] < 1:
             _bad(where, f"sm_count must be a positive int (the multiprocessors of the device the algorithm was pinned on), got {entry['sm_count']!r}")
+        if "sm_count_target" in entry:  # absent: the heuristic was asked for the device's count; present: a count from 8 to the device's
+            target = entry["sm_count_target"]
+            if not sv.is_int(target) or not 8 <= target <= entry["sm_count"]:
+                _bad(where, f"sm_count_target is absent or an int from 8 to sm_count ({entry['sm_count']}), got {target!r}")
         if not (isinstance(entry["declaration_digest"], str) and sv._DIGEST.match(entry["declaration_digest"])):
             _bad(where, f"declaration_digest must be 64 lowercase hex digits (a sha256), got {entry['declaration_digest']!r}")
         buckets = entry["buckets"]
@@ -977,6 +1018,7 @@ def run_gemm_ptrs(
         device_index=device_index,
         workspace_ptr=workspace_ptr,
         form=spec.form,
+        sm_count_target=spec.sm_count_target,
         **spec.opt_ins,
     )
 

@@ -179,6 +179,10 @@ pub struct LibraryEntry {
     /// the multiprocessors it runs on (a MIG slice has fewer than the whole GPU, and a stream-K algorithm partitions its work by the count), so a
     /// device of another count refuses the entry.
     pub sm_count: u64,
+    /// The SM count the heuristic was asked to choose for (`sm_count_target`: `CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`, from 8 to `sm_count`), for
+    /// a GEMM run on a partition of the device's SMs; every check and run sets it too. `None`: the heuristic chose for the device's count.
+    /// [`LibraryEntry::sm_count_chosen_for`] is the count either way.
+    pub sm_count_target: Option<u64>,
     /// The sha256 of the canonical declaration the entry was made from.
     pub declaration_digest: String,
     /// How the heuristic was asked (`heuristic`, absent: [`Heuristic::Tilefish`]).
@@ -202,6 +206,11 @@ impl LibraryEntry {
     /// Whether split-K may add its partial sums in the output type: the opt-in of the operands' type.
     pub fn allows_output_type_reduction(&self) -> bool {
         self.allow_bf16_reduction || self.allow_f16_reduction
+    }
+
+    /// The SM count the algorithm was chosen for: the target, or the device's count.
+    pub fn sm_count_chosen_for(&self) -> u64 {
+        self.sm_count_target.unwrap_or(self.sm_count)
     }
 
     pub(crate) fn form(&self) -> GemmForm {
@@ -248,6 +257,8 @@ pub(crate) struct RawLibrary {
     allow_bf16_reduction: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     allow_f16_reduction: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    sm_count_target: Option<Value>,
 }
 
 /// A field that is there, whatever its value: `null` included (serde's `Option` would read a `null` as an absent field, which Python does not).
@@ -411,6 +422,18 @@ impl LibraryEntry {
                     raw.sm_count
                 ));
             }
+        };
+        // absent: the heuristic chose for the device's count; present: an integer from 8 (cuBLASLt kills the process below) to the device's
+        let sm_count_target = match &raw.sm_count_target {
+            None => None,
+            Some(v) => match v.as_u64() {
+                Some(t) if (8..=sm_count).contains(&t) => Some(t),
+                _ => {
+                    return Err(format!(
+                        "sm_count_target is absent or an int from 8 to sm_count ({sm_count}), got {v}"
+                    ));
+                }
+            },
         };
         if !is_digest(&raw.declaration_digest) {
             return Err(format!(
@@ -586,6 +609,7 @@ impl LibraryEntry {
             algo,
             cublaslt_version,
             sm_count,
+            sm_count_target,
             declaration_digest: raw.declaration_digest,
             heuristic,
             algo_source,

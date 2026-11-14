@@ -29,7 +29,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | `dims` | names from shapes, scalars and the grid | also the stride dimensions and the offset dimension of a strided pointer |
 | library | none | a pinned cuBLASLt GEMM, for one device (its architecture and SM count): `library` entries (no file) |
 | library entry (0.0.5) | — | three optional fields, present only when not the default: `heuristic`, `algo_source`, `allow_bf16_reduction` (section 9.1) |
-| library entry (0.0.6, crate 0.0.4) | — | f16 operands, an f32 result and the layout `NN` in the fields an entry always had (`dtypes`, `transa`, `lda`, the operands); the optional `allow_f16_reduction` (section 9.2) |
+| library entry (0.0.6, crate 0.0.4) | — | f16 operands, an f32 result and the layout `NN` in the fields an entry always had (`dtypes`, `transa`, `lda`, the operands); the optional `allow_f16_reduction` (section 9.2) and `sm_count_target` (section 9.3) |
 | kernel entry (0.0.5, crate 0.0.3) | — | an optional `implementation`: which implementation of an operator declared with an implementation per architecture the binary is (section 4.1) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
@@ -404,6 +404,7 @@ run; the pointers stay 16-byte aligned.
 | `algo_source` | *optional* (section 9.1): absent, or exactly `"imported"` |
 | `allow_bf16_reduction` | *optional* (section 9.1): absent, or exactly `true`; only on an entry of bf16 operands |
 | `allow_f16_reduction` | *optional* (section 9.2): absent, or exactly `true`; only on an entry of f16 operands |
+| `sm_count_target` | *optional* (section 9.3): absent, or an int from 8 to `sm_count`: the SM count the heuristic chose for, which every check and run sets |
 
 `abi.params[i]` has exactly `index` (= i), `name`, `kind` (`"pointer"`), `dtype` (its type in `dtypes`: `"bf16"` in the form of 0.0.5), `access`
 (`"in"`, and `"out"` for the last), `shape` (a list of ints and dimension expressions: `a` is rank 2, `b` rank 2, `bias` rank 1, `out` rank 2). The
@@ -519,6 +520,46 @@ An `AlgoTable` row of the layout `NN` says it in its key, `(m, n, k, bias, "NN")
 with the types of the declaration that imports it. The canonical declaration has `"layout": "NN"` when the layout is `NN` (with `K = N` the signature
 alone would not tell the layouts apart) and `"allow_f16_reduction": true` when it opts in; the types are in its signature.
 
+### 9.3 SM partitions: `sm_count_target` (tilefish 0.0.6, crate 0.0.4)
+
+A process may run its GEMMs on a partition of the device's SMs: a *green context* (`cuGreenCtxCreate` over `cuDevSmResourceSplitByCount`). What
+cuBLASLt does there was measured with cuBLASLt 12.8.4 on a B300 MIG slice of 30 SMs (sm_103), green contexts of 8 and 16 SMs, f16 GEMMs of 124 problems
+(31 shapes, `TN` and `NN`, with and without a bias):
+
+* **Every SM-count query reports the device's count in a green context** (`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)`, `cudaGetDeviceProperties`,
+  torch's `multi_processor_count`: 30); only `cuCtxGetDevResource` reports the partition. So the entry's `sm_count` stays the device's, and a host
+  on a partition passes the check of step 2 of section 9.
+* **The heuristic's answers depend on the context that was current at the process's first `cublasLtCreate`**, not on an SM count: in a process
+  whose first handle was made in a green context of 8 (16) SMs, 90 (80) of the 124 answer lists differ from the primary context's (mostly smaller
+  clusters), for every later handle in every context, and its wave counts are still those of 30 SMs.
+* **`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET = T`** makes the heuristic choose for `T` SMs (the wave counts scale by 30/`T`, the tiles and split-K
+  counts change), and its answers are the same in the primary context and in a process whose first handle was made in a green context of at least
+  `T` SMs (0 of 124 differ for `T` = 8 and 16). A target of the device's count (or more) answers as no target (0 of 124 differ). **Targets from 1 to 7
+  kill the process** (`SIGFPE` inside `cublasLtMatmulAlgoGetHeuristic`).
+* **What a pinned algorithm computes depends on neither the context nor the target**: 864 runs (10 problems, 32 algorithms, 9 context and target
+  settings, 3 processes of different first contexts) and 192 runs of hand-made split-K algorithms gave identical bytes, with one launch
+  configuration per algorithm in every setting; `cublasLtMatmulAlgoCheck`'s workspace does not change with the target.
+
+So the bytes of a pin are the bytes on a partition, and what a partition changes is which algorithm a heuristic would choose. A declaration
+that wants the algorithm for a partition says so: `@tilefish.library(..., sm_count_target=T)`, `T` an int of at least 8. Then:
+
+| | |
+|---|---|
+| the entry | has the optional field `sm_count_target`: absent when the declaration has none (the heuristic chose for the device's count, as before), else an int from 8 to the entry's `sm_count` (a reader refuses any other value, `null` included). It is in the canonical declaration (`"sm_count_target": T`), so in `declaration_digest` too |
+| pinning | the heuristic is asked with `SM_COUNT_TARGET = T` (and the device must have at least `T` SMs); an imported algorithm (`algos=`) is taken as it is, its table keyed by the device's `sm_count` |
+| every check and run | both hosts set `SM_COUNT_TARGET = T` on the matmul descriptor of `cublasLtMatmulAlgoCheck` and of `cublasLtMatmul`, so a call is the call the pin was checked with |
+| replay | Python refuses an entry whose target is not the declaration's ("pinned ... for 16 SMs (sm_count_target=16), but the declaration asks for the whole device") |
+
+**How a host on a partition uses it.** Declare the GEMMs that run on a partition of `P` SMs with `sm_count_target=P`, and export them on the
+device, in any context (the pins are the same in the primary context and in a partition of at least `P` SMs). The Rust host says which partition it
+runs on with `Manifest::with_sm_partition(Some(P))` (a clone of the manifest; a plan takes it through `LaunchPlan::from_embedded`): `Manifest::gemm`
+then refuses an entry chosen for another count (`LibraryEntry::sm_count_chosen_for`: its `sm_count_target`, or its `sm_count` when it has none), with
+"was chosen for ..., but this host runs it on a partition of P SMs". A pin without a target runs on a partition with the bytes it has on the whole
+device; only the choice was made for the whole device. A process that pins (`jit`, `export`) makes its first cuBLASLt handle in the primary
+context (torch's, in Python), or else its pins without a target are those of the partition its first handle was made in; with a target they are not.
+`Gemm::sm_count_target` and `BuiltLibrary.spec.sm_count_target` say the target of a loaded pin. `test_gpu_gemm_sm_target.py` checks the first-handle
+rule and the target in a green context on the GPU it runs on.
+
 ## 10. Strict reading: every refusal
 
 A reader of schema 3 refuses (Python: `TilefishManifestError` unless marked *spec*, which are `TilefishSpecError` of the per-binary compile spec, a
@@ -561,7 +602,8 @@ document tilefish writes next to a build and the host does not read):
   `max_elements` on a pointer with `strides`; `pointer_alignment` of a strided pointer other than 16 or its element size (of any other pointer other
   than 16); every pointer must have exactly one `pointer_alignment`.
 * every `library` entry: the field list, the types and the cross-field equalities of section 9, each by the rule given there; an optional field of section 9.1
-  or 9.2 with any value but its one (`"torch"`, `"imported"`, `true`), `null` included; a form section 9.2 does not list (operands of two types or of
+  or 9.2 with any value but its one (`"torch"`, `"imported"`, `true`), `null` included; an `sm_count_target` (section 9.3) that is not an int from 8 to
+  `sm_count`; a form section 9.2 does not list (operands of two types or of
   another type than bf16 and f16, a result of another type than theirs or f32, a bias of another type than the result, `transa`/`transb` other than
   `T`/`N` and `N`/`N`, an `lda`, a `b` shape or a pointer `dtype` that is not the form's); the opt-in of the other operand type.
 * *spec* only, for prebuilt binaries: a `binary` section that is not `{kind, symbol, shared, digests}`; `attrs` not empty; `launch_params` not every arg
@@ -629,7 +671,9 @@ ranges are checked (kind `shape`); `launch` gives no value, so it is refused for
   `COMPUTE_TYPE`, or also `INPLACE` or `OUTPUT_TYPE` for an entry with `allow_bf16_reduction`), an algorithm `cublasLtMatmulAlgoCheck` does not approve for the
   problem, and one that needs more than `workspace_bytes`. The optional fields of section 9.1 are read into `LibraryEntry::heuristic` (`Heuristic`),
   `algo_source` (`AlgoSource`) and `allow_bf16_reduction`; the form of section 9.2 into `LibraryEntry::dtype`, `out_dtype` (`DType`), `layout`
-  (`GemmLayout::Tn` or `Nn`) and `allow_f16_reduction`, and the algorithm is vetted and run with those types and that layout. The check runs once at
+  (`GemmLayout::Tn` or `Nn`) and `allow_f16_reduction`, and the algorithm is vetted and run with those types and that layout; `sm_count_target` (section
+  9.3) into `LibraryEntry::sm_count_target`, set on the descriptor of the check and of every launch, and checked against the partition a host gives
+  (`Manifest::with_sm_partition`). The check runs once at
   load, not at every launch (the problem of an entry is fixed); the descriptors of a call are made and destroyed in the call.
 * The process must map the same cuBLASLt build that chose the pin (cudarc tries `libcublasLt.so` and then `.so.<major>`, `.so.12`, ...; on a machine whose torch
   ships its own cuBLASLt, put that directory on `LD_LIBRARY_PATH`): a different build is refused by the version check, and by nothing else.
@@ -665,6 +709,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 | the `library` section | `test_library_ops.py`, `test_cublaslt.py`; on a GPU `test_gpu_gemm.py`, `test_gpu_cublaslt.py` |
 | its optional fields (section 9.1): the posture, imported algorithms, bf16 split-K partial sums | `test_library_options.py`, `test_cublaslt.py`; on a GPU `test_gpu_cublaslt.py` (torch's bytes, the opt-in), `test_gpu_gemm.py` (jit and replay) |
 | f16 operands, an f32 result, the layout NN, `allow_f16_reduction` (section 9.2) | `test_library_f16.py`; on a GPU `test_gpu_gemm_f16.py` (torch's bytes in both layouts, the f64 reference, jit, replay, plans, imported tables, the opt-in) |
+| `sm_count_target` (section 9.3) | `test_library_sm_target.py`; on a GPU `test_gpu_gemm_sm_target.py` (a green context: the first-handle rule and the target; the bytes do not depend on the target) |
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
 | `options.enable_fp_fusion` of a hand-written kernel (`@tilefish.extern(enable_fp_fusion=...)`) | `test_lower_options.py`; on a GPU `test_gpu_extern_fusion.py` |
 | `implementation`: an operator with an implementation per architecture (section 4.1) | `test_per_arch.py`; on a GPU `test_gpu_per_arch.py` (and the Rust gate) |

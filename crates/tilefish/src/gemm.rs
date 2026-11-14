@@ -68,6 +68,7 @@ struct LoadedGemm {
     form: GemmForm,
     workspace_bytes: u64,
     sm_count: u64,
+    sm_count_target: Option<u64>,
 }
 
 /// A pinned GEMM of a manifest, loaded in a context and ready to launch. Cheap to clone; it can be shared between threads. It keeps its
@@ -239,6 +240,9 @@ impl Manifest {
     pub fn gemm(&self, ctx: &Arc<CudaContext>, name: &str, buckets: &[(&str, u64)], arch: Arch) -> Result<Gemm> {
         let index = self.select_library(name, buckets, &arch.to_string())?;
         let entry = &self.library[index];
+        if let Some(partition) = self.sm_partition {
+            partition_matches(entry, partition)?;
+        }
         let plan = Plan::for_library(entry)?;
         let device_arch = Arch::of_context(ctx)?;
         if device_arch != arch {
@@ -269,6 +273,39 @@ impl Manifest {
         let index = self.select_library(name, buckets, &arch.to_string())?;
         Plan::for_library(&self.library[index])
     }
+}
+
+impl Manifest {
+    /// This manifest for a host that runs its GEMMs on a partition of `sms` SMs of the device (a green context): [`Manifest::gemm`] (and a plan
+    /// made over it) then refuses an entry whose algorithm was chosen for another count ([`LibraryEntry::sm_count_chosen_for`]: its
+    /// `sm_count_target`, or the device's count when it has none). `None` (the default) refuses none for this reason. What a pinned algorithm
+    /// computes does not depend on the partition (measured with cuBLASLt 12.8.4: `docs/manifest-schema-3.md`, section 9.3); the check is
+    /// that the pin was chosen for the SMs the host gives it. The clone shares the modules and GEMMs this manifest loaded.
+    pub fn with_sm_partition(&self, sms: Option<u64>) -> Manifest {
+        Manifest { sm_partition: sms, ..self.clone() }
+    }
+
+    /// The partition [`Manifest::with_sm_partition`] set.
+    pub fn sm_partition(&self) -> Option<u64> {
+        self.sm_partition
+    }
+}
+
+/// Refuse an entry whose algorithm was chosen for another SM count than the partition the host runs it on.
+fn partition_matches(entry: &LibraryEntry, partition: u64) -> Result<()> {
+    let chosen_for = entry.sm_count_chosen_for();
+    if chosen_for != partition {
+        let what = match entry.sm_count_target {
+            Some(t) => format!("{t} SMs (its sm_count_target)"),
+            None => format!("the whole device ({} SMs)", entry.sm_count),
+        };
+        return Err(Error::Manifest(format!(
+            "the cuBLASLt algorithm of '{}' ({}) was chosen for {what}, but this host runs it on a partition of {partition} SMs: declare the GEMM \
+             with sm_count_target={partition} and export it again, or give the host the partition the pin is for",
+            entry.stem, entry.arch
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse an entry pinned on a device of another multiprocessor count than this one (`device`), before any other field of the entry is
@@ -314,8 +351,14 @@ fn load(entry: &LibraryEntry, ctx: &Arc<CudaContext>) -> Result<LoadedGemm> {
     let algo = Algo::from_bytes(&entry.algo);
     let form = entry.form();
     vet(&handle, &algo, &who, entry.allows_output_type_reduction(), entry.implementation.has_bias(), &form)?;
-    let problem =
-        cublaslt::Problem::new(entry.m, entry.n, entry.k, entry.implementation.has_bias().then_some(16), &form)?;
+    let problem = cublaslt::Problem::new(
+        entry.m,
+        entry.n,
+        entry.k,
+        entry.implementation.has_bias().then_some(16),
+        &form,
+        entry.sm_count_target,
+    )?;
     let checked = cublaslt::check(&handle, &problem, &algo).map_err(|e| {
         Error::Manifest(format!(
             "{who}: the pinned cuBLASLt algorithm is not valid for the matmul m={} n={} k={}: {e}",
@@ -347,6 +390,7 @@ fn load(entry: &LibraryEntry, ctx: &Arc<CudaContext>) -> Result<LoadedGemm> {
         form,
         workspace_bytes: entry.workspace_bytes,
         sm_count: entry.sm_count,
+        sm_count_target: entry.sm_count_target,
     })
 }
 
@@ -408,6 +452,12 @@ impl Gemm {
         self.loaded.sm_count
     }
 
+    /// The SM count the algorithm was chosen for when it is not the device's (`sm_count_target` of the entry: a partition of the device), which
+    /// every launch sets too (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`).
+    pub fn sm_count_target(&self) -> Option<u64> {
+        self.loaded.sm_count_target
+    }
+
     /// The workspace limit of the entry: the limit the heuristic was asked under, and the size of the workspace Python provides. The size
     /// [`Gemm::alloc_workspace`] allocates.
     pub fn workspace_bytes(&self) -> u64 {
@@ -434,9 +484,16 @@ impl Gemm {
     }
 
     /// The engine of a launch: what `ffi` calls cuBLASLt with.
-    pub(crate) fn engine(&self) -> (&Handle, &Algo, usize, [u64; 3], GemmForm) {
+    pub(crate) fn engine(&self) -> (&Handle, &Algo, usize, [u64; 3], GemmForm, Option<u64>) {
         let loaded = &*self.loaded;
-        (&loaded.handle, &loaded.algo, loaded.required, [loaded.m, loaded.n, loaded.k], loaded.form)
+        (
+            &loaded.handle,
+            &loaded.algo,
+            loaded.required,
+            [loaded.m, loaded.n, loaded.k],
+            loaded.form,
+            loaded.sm_count_target,
+        )
     }
 
     /// Check a call (see [`Gemm::launch`]) and return the addresses to run it with.
@@ -1077,6 +1134,31 @@ mod tests {
             "{e}"
         );
         assert!(e.to_string().contains("re-export the manifest on this device"), "{e}");
+    }
+
+    /// A host on a partition of P SMs (`Manifest::with_sm_partition`) takes an entry chosen for P SMs: its target, or the device's count.
+    #[test]
+    fn a_host_on_a_partition_takes_the_pins_chosen_for_it() {
+        let (mut entry, _) = library(PLAIN);
+        assert_eq!(entry.sm_count, 30);
+        assert!(partition_matches(&entry, 30).is_ok(), "no target: chosen for the whole device");
+        let e = partition_matches(&entry, 16).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("was chosen for the whole device (30 SMs), but this host runs it on a partition of 16 SMs"),
+            "{e}"
+        );
+        entry.sm_count_target = Some(16);
+        assert!(partition_matches(&entry, 16).is_ok());
+        let e = partition_matches(&entry, 30).unwrap_err();
+        assert!(
+            e.to_string().contains("was chosen for 16 SMs (its sm_count_target)")
+                && e.to_string().contains("sm_count_target=30"),
+            "{e}"
+        );
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("sm_103");
+        let manifest = Manifest::load(dir, Pin::TrustDirectory).unwrap();
+        assert_eq!((manifest.sm_partition(), manifest.with_sm_partition(Some(16)).sm_partition()), (None, Some(16)));
     }
 
     /// The rule in the words of the form, as Python's `reduction_problem` says them for f16 operands and for an f32 result.

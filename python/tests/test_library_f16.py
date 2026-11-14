@@ -267,7 +267,7 @@ def test_an_imported_configuration_is_encoded_with_the_types_of_the_declaration(
     opt_in = {"allow_bf16_reduction": False, "allow_f16_reduction": True}
     assert calls == [
         ("encode", CONFIG, {"device_index": 0, "form": form}),
-        ("check", (32, 3072, 1024, False, ALGO), {"workspace_bytes": 8_519_680, "device_index": 0, "form": form, **opt_in}),
+        ("check", (32, 3072, 1024, False, ALGO), {"workspace_bytes": 8_519_680, "device_index": 0, "form": form, "sm_count_target": None, **opt_in}),
     ]
 
 

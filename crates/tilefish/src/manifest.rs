@@ -564,6 +564,8 @@ pub struct Manifest {
     pub(crate) library: Arc<Vec<LibraryEntry>>,
     pub(crate) kernels: Arc<Mutex<HashMap<(usize, usize), Cached>>>,
     pub(crate) gemms: Arc<Mutex<HashMap<(usize, usize), CachedGemm>>>,
+    /// The partition of the device's SMs the host runs its GEMMs on, when it said (`Manifest::with_sm_partition`).
+    pub(crate) sm_partition: Option<u64>,
 }
 
 // -- the digest -------------------------------------------------------------------------------------------------------
@@ -2156,6 +2158,7 @@ impl Manifest {
             library: Arc::new(library),
             kernels: Arc::new(Mutex::new(HashMap::new())),
             gemms: Arc::new(Mutex::new(HashMap::new())),
+            sm_partition: None,
         })
     }
 

@@ -198,6 +198,7 @@ class LibraryOp(Op):
         algos: "tuple[Any, ...] | None" = None,
         layout: str = "TN",
         allow_f16_reduction: bool = False,
+        sm_count_target: "int | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         self.acc = acc
@@ -208,6 +209,7 @@ class LibraryOp(Op):
         self.algos = algos
         self.layout = layout
         self.allow_f16_reduction = allow_f16_reduction
+        self.sm_count_target = sm_count_target
 
     def node_attrs(self) -> dict[str, Any]:
         return {"acc": self.acc} if self.acc is not None else {}
@@ -224,6 +226,7 @@ def library(
     algos: Any = None,
     layout: "str | None" = None,
     allow_f16_reduction: "bool | None" = None,
+    sm_count_target: "int | None" = None,
 ) -> Any:
     """``@tilefish.library("gemm", acc=f32)``: declare an operator by signature only.
 
@@ -243,16 +246,24 @@ def library(
       output type (torch's ``allow_bf16_reduced_precision_reduction`` and ``allow_fp16_reduced_precision_reduction``, its defaults), which rounds
       more than once; without it they are added in f32 and the result is rounded once;
     * ``algos``: a :class:`~tilefish.AlgoTable` (or a list of them, one per device) whose algorithms are pinned instead of asking the
-      heuristic, on the devices they are for.
+      heuristic, on the devices they are for;
+    * ``sm_count_target``: the SM count the heuristic chooses for (``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET``, at least 8 and at most the
+      device's), for a GEMM that runs on a partition of the device's SMs (a green context); every check and run of the pin sets it too
+      (``docs/manifest-schema-3.md``, section 9.3).
     """
     if acc is not None and not isinstance(acc, DType):
         raise TilefishDeclarationError(f"library: acc must be a dtype such as f32, got {acc!r}")
     if impl is None and workspace_bytes is not None:
         raise TilefishDeclarationError("library: workspace_bytes needs an impl")
     if impl is None and (
-        heuristic is not None or allow_bf16_reduction is not None or algos is not None or layout is not None or allow_f16_reduction is not None
+        heuristic is not None
+        or allow_bf16_reduction is not None
+        or algos is not None
+        or layout is not None
+        or allow_f16_reduction is not None
+        or sm_count_target is not None
     ):
-        raise TilefishDeclarationError("library: heuristic, allow_bf16_reduction, allow_f16_reduction, algos and layout need an impl")
+        raise TilefishDeclarationError("library: heuristic, allow_bf16_reduction, allow_f16_reduction, algos, layout and sm_count_target need an impl")
 
     def make(fn: Callable[..., Any], op_name: str | None) -> LibraryOp:
         nm = op_name or fn.__name__
@@ -270,12 +281,12 @@ def library(
         bf16_reduction = False if allow_bf16_reduction is None else allow_bf16_reduction
         f16_reduction = False if allow_f16_reduction is None else allow_f16_reduction
         lay = "TN" if layout is None else layout
-        tables = _library.check_options(nm, posture, bf16_reduction, algos, f16_reduction, lay)
+        tables = _library.check_options(nm, posture, bf16_reduction, algos, f16_reduction, lay, sm_count_target)
         if impl not in _library.IMPLS:
             raise TilefishDeclarationError(f"library op '{nm}': impl must be one of {sorted(_library.IMPLS)}, got {impl!r}")
         ws = _library.default_workspace_bytes(impl, posture) if workspace_bytes is None else workspace_bytes
         _library.check_declaration(nm, impl, sig, acc, ws, lay, bf16_reduction, f16_reduction)
-        op = LibraryOp(fn, nm, sig, acc, impl, ws, posture, bf16_reduction, tables, lay, f16_reduction)
+        op = LibraryOp(fn, nm, sig, acc, impl, ws, posture, bf16_reduction, tables, lay, f16_reduction, sm_count_target)
         _library.check_coverage(op)
         return op
 

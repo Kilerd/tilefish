@@ -441,6 +441,12 @@ The opt-in to split-K partial sums in the output type is named by the operands' 
 operand sets each, measured on a B300 MIG slice with cuBLASLt 12.8.4). An `AlgoTable` row of the layout `NN` is keyed `(m, n, k, bias, "NN")`; a
 configuration is encoded with the declaration's types. The entry says the form in `dtypes`, `transa` and `lda` (`docs/manifest-schema-3.md`, section 9.2).
 
+**SM partitions.** On a green context (a partition of the device's SMs) every SM-count query still reports the device's count, and a pinned
+algorithm computes the same bytes with or without a partition (measured, cuBLASLt 12.8.4); what changes is the heuristic's choice, through the
+context of the process's first cuBLASLt handle. `sm_count_target=P` pins the algorithm the heuristic chooses for `P` SMs
+(`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`, which every check and run sets too), the same in any context; the entry records it, and a Rust host on a
+partition of `P` SMs takes only pins chosen for it with `Manifest::with_sm_partition(Some(P))` (`docs/manifest-schema-3.md`, section 9.3).
+
 ## Masks, indices, gathers and copies
 
 A lowered `@kernel` also compares, selects, counts positions, reduces to an index, and gathers and scatters rows at indices that are device

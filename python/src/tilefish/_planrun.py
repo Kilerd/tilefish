@@ -488,7 +488,8 @@ class TorchBackend(Backend):
         from . import _cublaslt
 
         _cublaslt.check_algo(
-            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form, **spec.opt_ins,
+            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form,
+            sm_count_target=spec.sm_count_target, **spec.opt_ins,
         )  # fmt: skip
 
 

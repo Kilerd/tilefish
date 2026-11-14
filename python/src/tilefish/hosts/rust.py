@@ -112,7 +112,7 @@ _IMPLEMENTATION_FIELDS = ("grid", "block", "num_warps", "num_stages", "constexpr
 # covers the SM count) and what the pin chose on it
 _LIBRARY_SHARED_FIELDS = (
     "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes "
-    "heuristic algo_source allow_bf16_reduction allow_f16_reduction"  # (the last four are absent by default: they are compared as present or not too)
+    "heuristic algo_source allow_bf16_reduction allow_f16_reduction sm_count_target"  # (the last five are absent by default: compared as present or not too)
 ).split()
 
 _RUST_KEYWORDS = frozenset(
@@ -993,6 +993,12 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
         lines.append("")
         lines += _wrap(
             "The declaration allows split-K to add its partial sums in bf16 (`allow_bf16_reduction`): the result may be rounded more than once."
+        )
+    if e.get("sm_count_target") is not None:
+        lines.append("")
+        lines += _wrap(
+            f"The algorithm was chosen for {e['sm_count_target']} SMs (`sm_count_target`: a partition of the device), and every run sets that target "
+            "too (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`)."
         )
     if e.get("allow_f16_reduction") is True:
         lines.append("")

@@ -1397,7 +1397,8 @@ fn the_gate_has_generated_ops() {
 }
 
 /// The GEMMs of the forms of section 9.2 of the manifest schema (on a fresh export): f16 operands in TN (with 64 MiB of workspace) and in NN (with a
-/// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN. Rust reads each form from its entry, and loads,
+/// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN, and f16 operands pinned for a partition of 16 SMs
+/// (`sm_count_target`: the Rust host sets it on every launch, and a host on a partition takes only the pins chosen for it). Rust reads each form from its entry, and loads,
 /// vets and runs it (`byte_identity` holds its bytes to Python's replay); here each is also captured in a CUDA graph with `launch_raw` and
 /// matches Python's bytes.
 #[test]
@@ -1410,12 +1411,13 @@ fn the_gate_has_gemms_of_every_form() {
     let (gpu, manifest) = (Gpu::new(), manifest());
     let arch = Arch::of_context(&gpu.ctx).unwrap();
     let forms = [
-        ("gemm_f16_tn", DType::F16, DType::F16, GemmLayout::Tn, false),
-        ("gemm_f16_nn_bias", DType::F16, DType::F16, GemmLayout::Nn, true),
-        ("gemm_f16_f32", DType::F16, DType::F32, GemmLayout::Tn, false),
-        ("gemm_bf16_nn_f32", DType::Bf16, DType::F32, GemmLayout::Nn, false),
+        ("gemm_f16_tn", DType::F16, DType::F16, GemmLayout::Tn, false, None),
+        ("gemm_f16_nn_bias", DType::F16, DType::F16, GemmLayout::Nn, true, None),
+        ("gemm_f16_f32", DType::F16, DType::F32, GemmLayout::Tn, false, None),
+        ("gemm_bf16_nn_f32", DType::Bf16, DType::F32, GemmLayout::Nn, false, None),
+        ("gemm_f16_t16", DType::F16, DType::F16, GemmLayout::Tn, false, Some(16)),
     ];
-    for (op, dtype, out_dtype, layout, opted) in forms {
+    for (op, dtype, out_dtype, layout, opted, target) in forms {
         let of_op = cases_where(&cases, |c| c["stem"].as_str().unwrap().starts_with(&format!("{op}.M")));
         assert_eq!(of_op.len(), 3, "{op}: a case per bucket of M");
         for case in &of_op {
@@ -1426,8 +1428,19 @@ fn the_gate_has_gemms_of_every_form() {
                 (dtype, out_dtype, layout, opted),
                 "{stem}"
             );
+            assert_eq!(entry.sm_count_target, target, "{stem}");
             let gemm = manifest.gemm(&gpu.ctx, stem, &[], arch).unwrap();
             assert_eq!((gemm.dtype(), gemm.out_dtype(), gemm.layout()), (dtype, out_dtype, layout), "{stem}");
+            assert_eq!(gemm.sm_count_target(), target, "{stem}");
+            // a host on a partition takes the pins chosen for it, and refuses the others
+            let partition = target.unwrap_or(entry.sm_count);
+            assert!(manifest.with_sm_partition(Some(partition)).gemm(&gpu.ctx, stem, &[], arch).is_ok(), "{stem}");
+            let other = if partition == 16 { entry.sm_count } else { 16 };
+            let refused = manifest.with_sm_partition(Some(other)).gemm(&gpu.ctx, stem, &[], arch);
+            assert!(
+                matches!(&refused, Err(Error::Manifest(m)) if m.contains("but this host runs it on a partition of")),
+                "{stem}"
+            );
         }
         // the largest bucket, captured in a CUDA graph with launch_raw and regions, three times
         let case = of_op.iter().max_by_key(|c| tensors_json(c)[0]["shape"][0].as_u64().unwrap()).unwrap();

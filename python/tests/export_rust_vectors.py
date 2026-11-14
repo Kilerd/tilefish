@@ -23,7 +23,7 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
   kernel's two null scratch slots follow (a prebuilt binary has none);
 * ``python_plans.json``: plan documents and what Python decides of each (``export_plan_vectors.py``);
 * ``python_library.json``: ``library`` entries of every form (operand and result types, a bias, the layouts, the opt-ins), each also changed in one field,
-  and what Python's strict reader decides of each (accepted, with the form it reads, or refused);
+  and what Python's strict reader decides of each (accepted, with the form it reads and the SM count it targets, or refused);
 * ``python_manifests.in``: ``MANIFESTS``, small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
   alphabets; schema 3 with kernels and library entries in every order, every field it added, the spelling of floats, non-ASCII text escaped and as it is,
   and the schemas ``3.0``, ``true``, ``"3"`` and ``4``) and their ``manifest_digest``, which has its own tag per schema; and ``MANIFEST_ERRORS``, documents
@@ -765,6 +765,7 @@ def library_entries():
         declare("f16", "f32", "TN", True, allow_f16_reduction=True),
         declare("bf16", "f32", "NN", False),
         declare("f16", "f16", "NN", False, n=96, k=9),
+        declare("f16", "f16", "NN", True, sm_count_target=16),
     ]
     goods = [BuiltLibrary(library_specs(op)[0], "sm_103", "0123456789abcdef" * 8, 120804, 30).entry() for op in ops]
 
@@ -795,6 +796,10 @@ def library_entries():
             (["allow_bf16_reduction"], True),
             (["allow_f16_reduction"], True),
             (["allow_f16_reduction"], False),
+            (["sm_count_target"], 8),
+            (["sm_count_target"], 7),
+            (["sm_count_target"], 31),
+            (["sm_count_target"], 16.0),
         ]:
             cases.append(changed(good, path, value))
         if "bias" in good["dtypes"]:
@@ -807,7 +812,14 @@ def library_entries():
         except TilefishManifestError as e:
             out.append({"entry": entry, "accepted": False, "refusal": str(e)})
             continue
-        form = [entry["dtypes"]["a"], entry["dtypes"]["out"], entry["transa"] + entry["transb"], "allow_bf16_reduction" in entry, "allow_f16_reduction" in entry]
+        form = [
+            entry["dtypes"]["a"],
+            entry["dtypes"]["out"],
+            entry["transa"] + entry["transb"],
+            "allow_bf16_reduction" in entry,
+            "allow_f16_reduction" in entry,
+            entry.get("sm_count_target"),
+        ]
         out.append({"entry": entry, "accepted": True, "form": form})
     return out
 

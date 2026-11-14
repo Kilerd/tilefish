@@ -63,9 +63,9 @@ def test_the_posture_is_tilefish_unless_it_says_torch_and_torch_has_its_own_work
         with pytest.raises(TilefishDeclarationError, match="allow_bf16_reduction must be a bool"):
             declare(allow_bf16_reduction=bad)
     assert declare(allow_bf16_reduction=True).allow_bf16_reduction is True
-    with pytest.raises(TilefishDeclarationError, match="heuristic, allow_bf16_reduction, allow_f16_reduction, algos and layout need an impl"):
+    with pytest.raises(TilefishDeclarationError, match="heuristic, allow_bf16_reduction, allow_f16_reduction, algos, layout and sm_count_target need an impl"):
         tilefish.library("x", heuristic="torch")
-    with pytest.raises(TilefishDeclarationError, match="heuristic, allow_bf16_reduction, allow_f16_reduction, algos and layout need an impl"):
+    with pytest.raises(TilefishDeclarationError, match="heuristic, allow_bf16_reduction, allow_f16_reduction, algos, layout and sm_count_target need an impl"):
         tilefish.library("x", algos=table())
 
 
@@ -188,8 +188,8 @@ def test_the_posture_and_the_opt_in_reach_the_heuristic(device):
     got = build_library(spec, arch="sm_103")
     assert got.algo == ALGO
     assert device == [
-        ("pin", (32, 2048, 1024, True), {"workspace_bytes": 1_048_576, "device_index": 0, "heuristic": "torch", "form": _cublaslt.Form(), "allow_bf16_reduction": True, "allow_f16_reduction": False}),
-        ("check", (32, 2048, 1024, True, ALGO), {"workspace_bytes": 1_048_576, "device_index": 0, "form": _cublaslt.Form(), "allow_bf16_reduction": True, "allow_f16_reduction": False}),
+        ("pin", (32, 2048, 1024, True), {"workspace_bytes": 1_048_576, "device_index": 0, "heuristic": "torch", "form": _cublaslt.Form(), "sm_count_target": None, "allow_bf16_reduction": True, "allow_f16_reduction": False}),
+        ("check", (32, 2048, 1024, True, ALGO), {"workspace_bytes": 1_048_576, "device_index": 0, "form": _cublaslt.Form(), "sm_count_target": None, "allow_bf16_reduction": True, "allow_f16_reduction": False}),
     ]
     assert got.entry()["heuristic"] == "torch" and got.entry()["allow_bf16_reduction"] is True
 
@@ -277,7 +277,7 @@ def test_the_optional_fields_are_absent_or_their_one_value():
     ):
         with pytest.raises(TilefishManifestError, match=rf"{key} is absent \(the default\) or {json.dumps(_library.OPTIONAL_ENTRY_FIELDS[key])}, got"):
             validate_entry(entry_with(**{key: bad}))
-    with pytest.raises(TilefishManifestError, match="may have \\['heuristic', 'algo_source', 'allow_bf16_reduction', 'allow_f16_reduction'\\]; unknown \\['reduction'\\]"):
+    with pytest.raises(TilefishManifestError, match="may have \\['heuristic', 'algo_source', 'allow_bf16_reduction', 'allow_f16_reduction', 'sm_count_target'\\]; unknown \\['reduction'\\]"):
         validate_entry(entry_with(reduction="bf16"))
 
 

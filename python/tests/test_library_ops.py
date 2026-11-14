@@ -354,9 +354,9 @@ def test_pinning_asks_the_device_of_the_architecture(monkeypatch):
     got = build_library(spec, arch="sm_90")
     assert got.algo == ALGO and got.arch == "sm_90" and got.cublaslt_version == VERSION and got.sm_count == 132 and got.entry()["sm_count"] == 132
     assert calls == [
-        ((32, 2048, 1024, False), {"workspace_bytes": 8_519_680, "device_index": 0, "heuristic": "tilefish", "form": FORM, **NO_OPT_IN}),
+        ((32, 2048, 1024, False), {"workspace_bytes": 8_519_680, "device_index": 0, "heuristic": "tilefish", "form": FORM, "sm_count_target": None, **NO_OPT_IN}),
         # the pin passes the checks of a run before it is recorded
-        ("check", (32, 2048, 1024, False, ALGO), {"workspace_bytes": 8_519_680, "device_index": 0, "form": FORM, **NO_OPT_IN}),
+        ("check", (32, 2048, 1024, False, ALGO), {"workspace_bytes": 8_519_680, "device_index": 0, "form": FORM, "sm_count_target": None, **NO_OPT_IN}),
     ]
     with pytest.raises(tilefish.TilefishBuildError, match="cannot pin 'gemm.M32' for sm_103: cuBLASLt chooses an algorithm for the device it runs on, and device 0 is sm_90"):
         build_library(spec, arch="sm_103")

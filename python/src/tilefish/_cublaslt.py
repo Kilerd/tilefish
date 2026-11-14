@@ -61,6 +61,15 @@ see :func:`_validate_algo`), so the string is first held to what cuBLASLt itself
 cuBLASLt build (:func:`version`) and one device (compute capability, and the SM count of a MIG slice). An algorithm encodes the types of
 its operands and result (``cublasLtMatmulAlgoInit`` writes them), so a pin of one :class:`Form` is not one of another; the layout is not in it.
 
+**An SM count to target.** ``sm_count_target`` (``None``, or an int of at least :data:`MIN_SM_COUNT_TARGET`) sets
+``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`` on the matmul descriptor of the heuristic, of the check and of the run alike: the heuristic then
+chooses for that many SMs (a partition of the device, a green context), not for the count the device reports. Measured with cuBLASLt 12.8.4
+on a B300 MIG slice of 30 SMs (``docs/manifest-schema-3.md``, section 9.3): every SM-count query reports the device's count in a green context,
+and the heuristic's answers there depend on the context of the process's *first* ``cublasLtCreate``, not on an SM count; with a target ``T``
+the answers are the same in the primary context and in a green context of at least ``T`` SMs; a target of the device's count (or more)
+answers as no target; targets below 8 kill the process (``SIGFPE`` inside ``cublasLtMatmulAlgoGetHeuristic``), so they are refused; and what
+a pinned algorithm computes depends on neither the context nor the target. ``None`` leaves the attribute unset (the library's default, 0).
+
 Descriptors are built per call and destroyed at its end, so nothing mutable is shared between threads; the one thing that is
 shared is the cuBLASLt handle (one per device, created once under a lock, never destroyed before the process ends), which holds
 no per-call state (the workspace is an argument of the call).
@@ -121,12 +130,16 @@ CUDA_R_16F = 2
 CUDA_R_16BF = 14
 CUDA_TYPES = {"bf16": CUDA_R_16BF, "f16": CUDA_R_16F, "f32": CUDA_R_32F}  # tilefish's dtype -> cudaDataType_t
 CUDA_TYPE_NAMES = {"bf16": "CUDA_R_16BF", "f16": "CUDA_R_16F", "f32": "CUDA_R_32F"}
-# cublasLt.h, cublasLtMatmulDescAttributes_t (types: TRANSA/TRANSB/BIAS_DATA_TYPE int32_t, EPILOGUE uint32_t, BIAS_POINTER const void*)
+# cublasLt.h, cublasLtMatmulDescAttributes_t (types: TRANSA/TRANSB/BIAS_DATA_TYPE/SM_COUNT_TARGET int32_t, EPILOGUE uint32_t, BIAS_POINTER const void*)
 CUBLASLT_MATMUL_DESC_TRANSA = 3
 CUBLASLT_MATMUL_DESC_TRANSB = 4
 CUBLASLT_MATMUL_DESC_EPILOGUE = 7
 CUBLASLT_MATMUL_DESC_BIAS_POINTER = 8
+CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET = 15
 CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE = 26
+# The smallest SM count a pin may target: cuBLASLt 12.8.4 kills the process with SIGFPE inside cublasLtMatmulAlgoGetHeuristic for the targets 1 to
+# 7 (measured on sm_103), and 8 is the smallest partition a green context has there.
+MIN_SM_COUNT_TARGET = 8
 # cublasLt.h, cublasLtEpilogue_t
 CUBLASLT_EPILOGUE_DEFAULT = 1
 CUBLASLT_EPILOGUE_BIAS = 4
@@ -565,6 +578,13 @@ def _check_flag(name: str, value: object) -> bool:
     return value
 
 
+def _check_target(sm_count_target: object) -> "int | None":
+    """``None`` (the attribute unset) or an ``int32`` of at least :data:`MIN_SM_COUNT_TARGET`: the SM count the library chooses for."""
+    if sm_count_target is None:
+        return None
+    return _int_arg("sm_count_target", sm_count_target, low=MIN_SM_COUNT_TARGET, high=INT32_MAX)
+
+
 def describe(
     m: int,
     n: int,
@@ -574,6 +594,7 @@ def describe(
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
     form: "Form | None" = None,
+    sm_count_target: "int | None" = None,
 ) -> "dict[str, Any]":
     """The exact cuBLAS-level problem that tilefish's ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` without the transpose for the
     layout ``NN``) is posed as (pure: no GPU, no library).
@@ -584,6 +605,7 @@ def describe(
     m, n, k, bias = _check_problem(m, n, k, bias)
     form = check_form(form)
     allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    target = _check_target(sm_count_target)
     ab, cd = CUDA_TYPE_NAMES[form.dtype], CUDA_TYPE_NAMES[form.out]
     return {
         "library": "cublasLt",
@@ -619,6 +641,7 @@ def describe(
         # cublasLtReductionScheme_t values a split-K may use: NONE, COMPUTE_TYPE, and with the opt-in INPLACE and OUTPUT_TYPE (partial sums in
         # the output type)
         "reduction_schemes": list(allowed_reduction_schemes(allow, bias)),
+        "sm_count_target": target,  # CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, or None: unset (the device's count)
     }
 
 
@@ -642,7 +665,8 @@ def preferences(heuristic: str, workspace_bytes: int, allow_bf16_reduction: bool
 class _Problem:
     """The descriptors of one call: matmul descriptor, the layouts of the two operands and of ``D`` (``C`` is the same), and
     optionally a preference (the attributes of :func:`preferences`). Everything is destroyed by :meth:`close`; nothing of it is shared
-    with another call. ``form`` is the types and the layout (``None``: bf16, ``TN``)."""
+    with another call. ``form`` is the types and the layout (``None``: bf16, ``TN``); ``sm_count_target`` sets
+    ``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`` (``None``: unset)."""
 
     def __init__(
         self,
@@ -654,10 +678,12 @@ class _Problem:
         bias_ptr: int,
         preference: "list[tuple[int, int]] | None",
         form: "Form | None" = None,
+        sm_count_target: "int | None" = None,
     ) -> None:
         self.lib = lib
         self.bias = bias
         self.form = form = DEFAULT_FORM if form is None else form
+        self.sm_count_target = sm_count_target
         ab, cd = CUDA_TYPES[form.dtype], CUDA_TYPES[form.out]
         self._owned: "list[tuple[str, ctypes.c_void_p]]" = []
         try:
@@ -670,6 +696,8 @@ class _Problem:
                 self._set(CUBLASLT_MATMUL_DESC_BIAS_POINTER, ctypes.c_void_p(bias_ptr))
             else:
                 self._set(CUBLASLT_MATMUL_DESC_EPILOGUE, ctypes.c_uint32(CUBLASLT_EPILOGUE_DEFAULT))
+            if sm_count_target is not None:
+                self._set(CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, ctypes.c_int32(sm_count_target))
             if form.layout == "TN":
                 # the "A operand" is tilefish's B[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
                 self.a = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, k, n, k)
@@ -957,6 +985,7 @@ def pin_algo(
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
     form: "Form | None" = None,
+    sm_count_target: "int | None" = None,
 ) -> Pinned:
     """Ask the heuristic for the algorithm of ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``form``: the types and the layout) under a workspace
     limit, and pin the first.
@@ -966,7 +995,7 @@ def pin_algo(
     16-byte alignment minimums (the pointers are not known here, and 16-byte alignment is all that is relied on), ``"torch"`` for one
     result under the workspace limit alone, as torch's ``addmm`` does. The opt-in of the operands' type (``allow_bf16_reduction`` for bf16,
     ``allow_f16_reduction`` for f16) lets split-K add its partial sums in the output type (no reduction-scheme mask); without it they are added
-    in f32.
+    in f32. ``sm_count_target`` asks for the algorithm of that many SMs (``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET``).
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     limit = _check_workspace(workspace_bytes)
@@ -974,6 +1003,7 @@ def pin_algo(
     heuristic = _check_heuristic(heuristic)
     form = check_form(form)
     allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    target = _check_target(sm_count_target)
     count = REQUESTED_ALGO_COUNT if heuristic == "tilefish" else 1
     dummy = HEURISTIC_BIAS_POINTER if heuristic == "tilefish" else TORCH_HEURISTIC_BIAS_POINTER
     lib = _lib()
@@ -981,7 +1011,7 @@ def pin_algo(
     handle = _handle(lib, index)
     no_split_k = f"; a GEMM with a bias is asked for one without split-K, unless it opts in with {form.opt_in}=True" if bias and not allow else ""
     what = f"the matmul m={m} n={n} k={k} bias={bias}{form.label}"
-    with _on_device(index), _Problem(lib, m, n, k, bias, dummy, preferences(heuristic, limit, allow, bias), form) as p:
+    with _on_device(index), _Problem(lib, m, n, k, bias, dummy, preferences(heuristic, limit, allow, bias), form, target) as p:
         results = (_HeuristicResult * count)()
         returned = ctypes.c_int(0)
         status = lib.call(
@@ -1115,8 +1145,9 @@ def check_algo(
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
     form: "Form | None" = None,
+    sm_count_target: "int | None" = None,
 ) -> int:
-    """The workspace the pinned algorithm needs for this problem (of ``form``), after ``cublasLtMatmulAlgoCheck``
+    """The workspace the pinned algorithm needs for this problem (of ``form``, for ``sm_count_target`` SMs), after ``cublasLtMatmulAlgoCheck``
     approved it.
 
     Raises :class:`~tilefish.errors.TilefishRuntimeError` when the algorithm is not valid for the problem on this device, or needs
@@ -1128,11 +1159,12 @@ def check_algo(
     device_index = _check_device_arg(device_index)
     form = check_form(form)
     allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    target = _check_target(sm_count_target)
     algo_from_hex(algo_hex)  # the format, before anything reaches the library
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    with _on_device(index), _Problem(lib, m, n, k, bias, HEURISTIC_BIAS_POINTER, None, form) as p:
+    with _on_device(index), _Problem(lib, m, n, k, bias, HEURISTIC_BIAS_POINTER, None, form, target) as p:
         return _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}{form.label}", allow)
 
 
@@ -1160,9 +1192,10 @@ def matmul(
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
     form: "Form | None" = None,
+    sm_count_target: "int | None" = None,
 ) -> None:
     """``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` for the layout ``NN``; the types of ``form``) with the pinned algorithm,
-    enqueued on ``stream`` (a ``CUstream`` as an int).
+    enqueued on ``stream`` (a ``CUstream`` as an int), for ``sm_count_target`` SMs when it is given (as the pin was chosen).
 
     ``a_ptr``, ``b_ptr``, ``d_ptr`` and ``bias_ptr`` (``None`` for no bias) are device addresses, 16-byte aligned. The
     algorithm is checked for this problem first (see :func:`check_algo`); ``workspace_bytes`` is the workspace recorded with
@@ -1190,10 +1223,11 @@ def matmul(
     given = None if workspace_ptr is None else _check_workspace_pointer(workspace_ptr)
     form = check_form(form)
     allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    target = _check_target(sm_count_target)
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None, form) as p:
+    with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None, form, target) as p:
         required = _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}{form.label}", allow)
         workspace = None
         address = given

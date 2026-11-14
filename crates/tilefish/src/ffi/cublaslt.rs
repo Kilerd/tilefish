@@ -338,8 +338,16 @@ fn desc_set<T: Copy>(
 }
 
 impl Problem {
-    /// The problem of sizes `m`, `n`, `k` (tilefish's) of `form`, with `bias` the address of the bias vector for a `gemm_bias`.
-    pub(crate) fn new(m: u64, n: u64, k: u64, bias: Option<u64>, form: &GemmForm) -> Result<Self> {
+    /// The problem of sizes `m`, `n`, `k` (tilefish's) of `form`, with `bias` the address of the bias vector for a `gemm_bias`, for
+    /// `sm_count_target` SMs (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`; `None`: unset, the device's count).
+    pub(crate) fn new(
+        m: u64,
+        n: u64,
+        k: u64,
+        bias: Option<u64>,
+        form: &GemmForm,
+        sm_count_target: Option<u64>,
+    ) -> Result<Self> {
         use sys::cublasLtMatmulDescAttributes_t as D;
         let ld = |v: u64| {
             i64::try_from(v).map_err(|_| Error::Launch("a size of the problem does not fit 64 bits".to_owned()))
@@ -366,6 +374,11 @@ impl Problem {
                 desc_set(desc, D::CUBLASLT_MATMUL_DESC_BIAS_POINTER, pointer as *const c_void)?;
             }
             None => desc_set(desc, D::CUBLASLT_MATMUL_DESC_EPILOGUE, EPILOGUE_DEFAULT)?,
+        }
+        if let Some(target) = sm_count_target {
+            let target = i32::try_from(target)
+                .map_err(|_| Error::Launch("the SM count target does not fit an int32".to_owned()))?;
+            desc_set(desc, D::CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, target)?;
         }
         problem.a = match form.layout {
             // the "A operand" is tilefish's b[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
