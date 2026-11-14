@@ -1659,7 +1659,38 @@ fn the_gate_has_cudnn_convolutions() {
     // SAFETY: as above.
     unsafe { std::env::remove_var("NVIDIA_TF32_OVERRIDE") };
     assert!(matches!(&refused, Err(Error::Manifest(m)) if m.contains("NVIDIA_TF32_OVERRIDE is set")), "{refused:?}");
-    // the largest bucket of each, captured in a CUDA graph with launch_raw and regions, three times
+    // every entry has the canary its export ran, which each load above ran again; a canary of other bytes is refused, and an entry without one loads
+    for case in &convs {
+        let stem = case["stem"].as_str().unwrap();
+        let canary = manifest.conv_entry(stem, &arch.to_string()).unwrap().canary.clone();
+        assert!(canary.is_some_and(|c| c.seed == 1 && c.y_sha256.len() == 64), "{stem}: export records a canary");
+    }
+    let tmp = copy_of_the_manifest("canary");
+    let mut doc = read_json(&tmp.join("manifest.json"));
+    for e in doc["library"].as_array_mut().unwrap() {
+        if e["impl"] == "cudnn.conv_fwd" {
+            e["canary"]["y_sha256"] = Value::from("0".repeat(64));
+        }
+    }
+    write_json(&tmp.join("manifest.json"), &doc);
+    let refused = Manifest::load(&tmp, Pin::TrustDirectory).unwrap().conv(&gpu.ctx, first, &[], arch);
+    assert!(
+        matches!(&refused, Err(Error::Manifest(m)) if m.contains("the canary of the cuDNN convolution") && m.contains(&format!("the manifest recorded {}", "0".repeat(64)))),
+        "{refused:?}"
+    );
+    for e in doc["library"].as_array_mut().unwrap() {
+        if e["impl"] == "cudnn.conv_fwd" {
+            e.as_object_mut().unwrap().remove("canary");
+        }
+    }
+    write_json(&tmp.join("manifest.json"), &doc);
+    let plain = Manifest::load(&tmp, Pin::TrustDirectory).unwrap();
+    assert!(plain.conv_entry(first, &arch.to_string()).unwrap().canary.is_none());
+    assert!(plain.conv(&gpu.ctx, first, &[], arch).is_ok(), "an entry without a canary loads");
+    let _ = std::fs::remove_dir_all(&tmp);
+    // the largest bucket of each, captured in a CUDA graph with launch_raw and regions, three times: in the global mode, on the gate's stream (a
+    // non-blocking one), so that nothing of a call on the NULL stream or another goes unnoticed (it would run during the capture, which the check of an
+    // untouched output sees, or be refused by it)
     for case in &convs {
         let stem = case["stem"].as_str().unwrap();
         if stem.ends_with(".T64") {
@@ -1690,13 +1721,84 @@ fn the_gate_has_cudnn_convolutions() {
             // SAFETY: the stream is the convolution's; the regions are the buffers' own, which outlive the graph.
             unsafe { conv.launch_raw(stream, &args) }
         };
-        capture_and_run(&gpu, &launch, &mut tensors[last].1.slice, &expect);
+        capture_and_run_in(
+            &gpu,
+            &launch,
+            &mut tensors[last].1.slice,
+            &expect,
+            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+        );
         let _ = &mut workspace;
         println!(
-            "rust gate: {stem} ({}): captured in a CUDA graph, ran 3 times and matched Python's replay",
+            "rust gate: {stem} ({}): captured in a CUDA graph (global mode), ran 3 times and matched Python's replay",
             conv.pin().api()
         );
     }
+}
+
+/// The canary of a convolution is on a stream of its own, never on the NULL stream (the legacy default stream, which a green context does not order
+/// against another stream): every convolution of the gate loaded, then, with the NULL stream held by a host function for four seconds, each canary runs
+/// again ([`tilefish::Conv::check_canary`], the code of the load: its copies, its zeroed buffers, the convolution, the copy back, the frees) and passes,
+/// and the NULL stream is still busy when they have (a canary copy there would wait for it, or run after the convolution read the operands, and the
+/// canary would fail). A load itself waits for the NULL stream: `cudnnCreate`, of the handle each load makes, does (printed, measured once: cuDNN's).
+#[test]
+fn the_canary_of_a_load_is_never_on_the_null_stream() {
+    extern "C" fn hold(_: *mut c_void) {
+        std::thread::sleep(Duration::from_secs(4));
+    }
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no convolution");
+        return;
+    }
+    let gpu = Gpu::new();
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let convs = cases_where(&cases, |c| c["kind"] == "conv");
+    let manifest = manifest();
+    let loaded: Vec<_> =
+        convs.iter().map(|c| manifest.conv(&gpu.ctx, c["stem"].as_str().unwrap(), &[], arch).unwrap()).collect();
+    assert!(loaded.iter().all(|c| c.canary().is_some()));
+    let hold_null = || {
+        gpu.ctx.bind_to_thread().unwrap();
+        // SAFETY: the context is current; the null stream is its legacy default stream; `hold` takes no data.
+        let held = unsafe { sys::cuLaunchHostFunc(std::ptr::null_mut(), Some(hold), std::ptr::null_mut()) };
+        assert_eq!(held, sys::CUresult::CUDA_SUCCESS, "cuLaunchHostFunc");
+    };
+    // SAFETY (the two calls below): the context is current; the null stream is its legacy default stream.
+    let null_busy = || unsafe { sys::cuStreamQuery(std::ptr::null_mut()) } == sys::CUresult::CUDA_ERROR_NOT_READY;
+    let null_wait = || unsafe { sys::cuStreamSynchronize(std::ptr::null_mut()) };
+    hold_null();
+    let began = std::time::Instant::now();
+    let checked: Vec<_> = loaded.iter().map(|c| (c.stem().to_owned(), c.check_canary())).collect();
+    let took = began.elapsed();
+    let busy = null_busy();
+    null_wait();
+    for (stem, check) in &checked {
+        assert!(check.is_ok(), "{stem}: {:?}", check.as_ref().err());
+    }
+    assert!(
+        busy,
+        "the {} canaries took {took:?}, and the NULL stream was done when they returned: one of them waited for it",
+        checked.len()
+    );
+    println!(
+        "rust gate: {} canaries ran in {took:?} with the NULL stream held, and none of them waited for it",
+        checked.len()
+    );
+    // a load of its own (a manifest that has loaded nothing): its handle's creation waits for the NULL stream (cuDNN's, not tilefish's)
+    let fresh = Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap();
+    hold_null();
+    let began = std::time::Instant::now();
+    let load = fresh.conv(&gpu.ctx, convs[0]["stem"].as_str().unwrap(), &[], arch);
+    let took = began.elapsed();
+    let busy = null_busy();
+    null_wait();
+    assert!(load.is_ok(), "{:?}", load.err());
+    println!(
+        "rust gate: a load with the NULL stream held took {took:?} (the NULL stream {} when it returned: cudnnCreate {})",
+        if busy { "was busy" } else { "was done" },
+        if busy { "did not wait for it" } else { "waited for it" }
+    );
 }
 
 /// The bf16 nearest to an f32 (round to nearest, ties to even), as Triton's `.to(tl.bfloat16)` rounds a finite value.
@@ -2162,11 +2264,22 @@ fn refusals_of_schema_3() {
 /// Capture `launch` (which enqueues on the stream of `gpu`) in a CUDA graph, run the graph three times (`out` cleared before each) and compare
 /// `out` with what Python's replay computed.
 fn capture_and_run(gpu: &Gpu, launch: &dyn Fn() -> Result<(), Error>, out: &mut CudaSlice<u8>, expect: &[u8]) {
+    capture_and_run_in(gpu, launch, out, expect, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+}
+
+/// [`capture_and_run`] with the capture in `mode`.
+fn capture_and_run_in(
+    gpu: &Gpu,
+    launch: &dyn Fn() -> Result<(), Error>,
+    out: &mut CudaSlice<u8>,
+    expect: &[u8],
+    mode: sys::CUstreamCaptureMode,
+) {
     let stream = gpu.stream.cu_stream();
     let mut graph: sys::CUgraph = std::ptr::null_mut();
     // SAFETY (the driver calls below): `stream` is a live stream of the current context; the graph handles come from the driver.
     unsafe {
-        let begin = sys::cuStreamBeginCapture_v2(stream, sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+        let begin = sys::cuStreamBeginCapture_v2(stream, mode);
         assert_eq!(begin, sys::CUresult::CUDA_SUCCESS, "cuStreamBeginCapture");
     }
     let launched = launch();

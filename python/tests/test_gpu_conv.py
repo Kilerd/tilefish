@@ -11,13 +11,17 @@
 * ``jit`` and ``replay`` agree byte for byte for both APIs, the reference (f64, one rounding) is close, and a plan of two convolutions runs the same
   in ``jit``, ``replay``, a CUDA graph capture and alone;
 * an imported pin (``CudnnTable``) is the heuristic's; refusals: another cuDNN version, another SM count, ``NVIDIA_TF32_OVERRIDE`` set, a pin of
-  the other API, an engine the math does not allow, knobs out of range, a legacy algorithm cuDNN does not answer as deterministic.
+  the other API, an engine the math does not allow, knobs out of range, a legacy algorithm cuDNN does not answer as deterministic;
+* export records a canary per entry, a replay runs it (on a stream of its own: it passes with the NULL stream busy, which is still busy after it) and
+  refuses other bytes, and an entry without one runs; a call of either API captured in a CUDA graph in the global mode on a non-blocking stream writes
+  nothing until the replay, which is the eager bytes (nothing of it on the NULL stream or another), and so do a replay of the op and of a plan.
 """
 
 import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -418,3 +422,129 @@ def test_an_sm_count_target_is_set_on_the_engine_and_recorded(tmp_path):
 
     with pytest.raises(TilefishBuildError, match="the legacy API takes no SM count target"):
         runtime.export([aimed_legacy], tmp_path / "legacy")
+
+
+# -- the canary, and the streams the calls are on -----------------------------------------------------------------------------------------------
+
+
+def _arch():
+    major, minor = torch.cuda.get_device_capability()
+    return f"sm_{major * 10 + minor}"
+
+
+def test_export_records_a_canary_a_replay_runs_it_and_refuses_other_bytes(tmp_path, monkeypatch):
+    manifest = runtime.export([ck.conv_k7, ck.conv_k7_dil], tmp_path / "m")
+    assert len(manifest.library_entries) == 4
+    for op in (ck.conv_k7, ck.conv_k7_dil):
+        for spec in _conv.conv_specs(op):
+            e = manifest.library_entry(spec.stem, _arch())
+            assert e["canary"]["seed"] == _conv.CANARY_SEED, spec.stem
+            # the pin's bytes from the operands of the seed: computed again (another stream, another allocation), the same
+            assert _conv.canary_digest(spec, _cudnn.pin_of(e["pin"]), e["canary"]["seed"], 0) == e["canary"]["y_sha256"], spec.stem
+    assert len({e["canary"]["y_sha256"] for e in manifest.library_entries}) == 4
+    x, w = ck.operands(ck.conv_k7, {"T": 64})
+    jit = tilefish.run(ck.conv_k7, x, w)
+    monkeypatch.setattr(_conv, "_canaries_passed", set())
+    # a canary another build of cuDNN (or another device) computed: refused before the pin runs
+    _, digest = _patched(tmp_path, lambda e: e["canary"].update(y_sha256="0" * 64), "canary")
+    with pytest.raises(TilefishManifestError, match="the canary of the cuDNN convolution 'conv_k7.T64' .* gives y with sha256 [0-9a-f]{64} here, and the manifest recorded 0{64}"):
+        tilefish.run(ck.conv_k7, x, w, mode="replay", manifest=tmp_path / "canary", pin=digest)
+    # the field is optional: an entry exported without one runs as before
+    _, digest = _patched(tmp_path, lambda e: e.pop("canary"), "none")
+    assert same_bytes(tilefish.run(ck.conv_k7, x, w, mode="replay", manifest=tmp_path / "none", pin=digest), jit)
+    _, digest = _patched(tmp_path, lambda e: None, "ok")
+    assert same_bytes(tilefish.run(ck.conv_k7, x, w, mode="replay", manifest=tmp_path / "ok", pin=digest), jit)
+
+
+def _sleep_cycles(seconds):
+    """The cycles of ``torch.cuda._sleep`` that take about ``seconds`` on this device."""
+    s = torch.cuda.Stream()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    with torch.cuda.stream(s):
+        start.record()
+        torch.cuda._sleep(20_000_000)
+        end.record()
+    end.synchronize()
+    return int(20_000_000 * seconds * 1000 / start.elapsed_time(end))
+
+
+def test_the_canary_runs_on_a_stream_of_its_own_and_never_on_the_null_stream(tmp_path, monkeypatch):
+    """With the NULL stream (the legacy default stream) busy for two seconds, the canaries of a manifest run and pass, and the NULL stream is still busy when
+    they return: no copy, memset, allocation or wait of a canary was on it (an operand copied there would be copied after the convolution read it, and a
+    copy back there would wait for the sleep). Inside a green context the NULL stream does not order against another stream, so a canary on it would
+    race."""
+    manifest = runtime.export([ck.conv_k7, ck.conv_k7_dil, ck.conv_in], tmp_path)
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    built = [
+        _conv.built_from_manifest(manifest, spec, _arch(), sms, 0) for op in (ck.conv_k7, ck.conv_k7_dil, ck.conv_in) for spec in _conv.conv_specs(op)
+    ]  # the pins prepared, their canaries passed once
+    cycles = _sleep_cycles(2.0)
+    monkeypatch.setattr(_conv, "_canaries_passed", set())
+    torch.cuda.synchronize()
+    null = torch.cuda.default_stream()
+    assert null.cuda_stream == 0, "torch's default stream is the legacy NULL stream"
+    with torch.cuda.stream(null):
+        torch.cuda._sleep(cycles)
+    began = time.monotonic()
+    for b in built:
+        _conv.check_canary(b, 0)
+    busy = not null.query()
+    took = time.monotonic() - began
+    torch.cuda.synchronize()
+    assert len(_conv._canaries_passed) == len(built) == 6
+    assert busy and took < 1.5, f"the canaries took {took:.2f} s and the NULL stream is {'busy' if busy else 'idle'}: one of them waited for it"
+
+
+CAPTURED = [PROBLEMS[0], PROBLEMS[6], PROBLEMS[12]]
+
+
+@pytest.mark.parametrize("spec", CAPTURED, ids=lambda s: f"{s[0]}-{s[1]}-c{s[3]}-k{s[4]}")
+def test_a_global_capture_on_a_non_blocking_stream_holds_every_call_of_a_pin(spec):
+    """Captured with ``capture_error_mode="global"`` on a non-blocking stream, a call of either API with the workspace given (a plan's arena) or allocated
+    by the call writes nothing until the graph is replayed, and the replay is the eager bytes: nothing of the call is on the NULL stream or another stream
+    (it would run during the capture, or be refused by it), the handle's stream being set before the call."""
+    p = _cudnn.Problem(*spec)
+    x, w = tensors(p, 5)
+    limit = 64 << 20
+    for heuristic in ("instant", "v7"):
+        pin = _cudnn.pin_conv(p, heuristic=heuristic, workspace_bytes=limit).pin
+        eager = ours(p, pin, x, w, limit)
+        for given in (True, False):
+            y = torch.zeros(p.tilefish_shape("y"), dtype=DT[p.dtype], device="cuda")
+            workspace = torch.empty(limit, dtype=torch.uint8, device="cuda") if given else None
+            s = torch.cuda.Stream()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=s, capture_error_mode="global"):
+                _cudnn.convolution(
+                    x.data_ptr(), w.data_ptr(), y.data_ptr(), p, pin, workspace_bytes=limit, stream=s.cuda_stream,
+                    workspace_ptr=workspace.data_ptr() if given else None,
+                )  # fmt: skip
+            torch.cuda.synchronize()
+            assert not y.view(torch.uint8).any(), (heuristic, given, "the capture ran something")
+            g.replay()
+            torch.cuda.synchronize()
+            assert same_bytes(y, eager), (heuristic, given)
+
+
+def test_a_global_capture_holds_a_replay_of_the_op_and_of_a_plan(tmp_path):
+    """``tilefish.run`` in replay, the op and a plan of two convolutions, captured with ``torch.cuda.graph`` in its global mode after a first run (where the
+    canaries run): the replay of the graph is the eager bytes."""
+    manifest = runtime.export([ck.conv_k7, ck.conv_k7_dil], tmp_path / "ops")
+    plan = runtime.export(ck.conv_chain, tmp_path / "plan")
+    x, w1 = ck.operands(ck.conv_k7, {"T": 646}, seed=3)
+    _, w2 = ck.operands(ck.conv_k7_dil, {"T": 646}, seed=4)
+    runs = {
+        "op": lambda: tilefish.run(ck.conv_k7_dil, x, w2, mode="replay", manifest=tmp_path / "ops", pin=manifest.digest),
+        "plan": lambda: tilefish.run(ck.conv_chain, x, w1, w2, mode="replay", plan=tmp_path / "plan", pin=plan.digest),
+    }
+    for name, run in runs.items():
+        eager = run()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, capture_error_mode="global"):
+            out = run()
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert same_bytes(out, eager), name
