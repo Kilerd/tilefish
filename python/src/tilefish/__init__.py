@@ -39,6 +39,7 @@ or flush to zero (:func:`div`, note 13); and :func:`tanh` is libdevice's ``tanhf
 
 from . import aot
 from . import ops as _ops
+from ._conv import CudnnTable
 from ._library import AlgoTable
 from .decorators import ExternOp, GraphOp, Implementation, KernelOp, LibraryOp, Op, extern, graph, impl, kernel, library
 from .dims import Dim, DimExpr, cdiv
@@ -100,6 +101,7 @@ __all__ = [
     "BucketRequirement",
     "CapturedPlan",
     "Const",
+    "CudnnTable",
     "DType",
     "DevScalar",
     "Dim",

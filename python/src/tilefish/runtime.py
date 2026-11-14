@@ -701,25 +701,36 @@ _library_specs: "weakref.WeakKeyDictionary[LibraryOp, list[Any]]" = weakref.Weak
 _pins: "dict[tuple, Any]" = {}  # (stem, arch, device, its SM count, workspace, cuBLASLt version, declaration) -> the BuiltLibrary that jit pinned in memory
 
 
+def library_specs_of(op: LibraryOp) -> "list[Any]":
+    """The specs of a library op with an implementation, one per bucket combination (cached): ``LibrarySpec`` of a cuBLASLt GEMM, ``ConvSpec`` of a
+    cuDNN convolution."""
+    from . import _conv, _library
+
+    with _lock:
+        specs = _library_specs.get(op)
+    if specs is None:
+        specs = _conv.conv_specs(op) if _conv.is_conv(op) else _library.library_specs(op)
+        with _lock:
+            _library_specs[op] = specs
+    return specs
+
+
 def _run_library(op: LibraryOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", mode: str, manifest: "Manifest | None") -> Any:
-    """Run a pinned library operation (a cuBLASLt GEMM). ``jit`` pins the algorithm in memory exactly as ``export`` does and runs it; ``replay``
-    runs the algorithm a manifest recorded, after checking that its entry is what the declaration asks for and that cuBLASLt is the version that
-    chose it; ``reference`` is torch: an f32 matmul of the operands with the bias added in f32, rounded once to the result's type."""
-    from . import _library
+    """Run a pinned library operation (a cuBLASLt GEMM, a cuDNN convolution). ``jit`` pins it in memory exactly as ``export`` does and runs it;
+    ``replay`` runs the pin a manifest recorded, after checking that its entry is what the declaration asks for and that the library is the version
+    that chose it; ``reference`` is torch: a GEMM is an f32 matmul of the operands with the bias added in f32, rounded once to the result's type, a
+    convolution is computed in f64 and rounded once."""
+    from . import _conv, _library
     from ._launch import TORCH_DTYPE_NAMES
 
     torch = _torch()
     call = bind_call(op.name, op.signature, args, kwargs)
     check_dim_constraints(call.dims, buckets=mode != "reference")
+    conv = _conv.is_conv(op)
     if mode == "reference":
         device = _device_of(call.infos, call.tensors)
-        return _library.reference_of(op, call.tensors).to(device)
-    with _lock:
-        specs = _library_specs.get(op)
-    if specs is None:
-        specs = _library.library_specs(op)
-        with _lock:
-            _library_specs[op] = specs
+        return (_conv.reference_conv(op, call.tensors) if conv else _library.reference_of(op, call.tensors)).to(device)
+    specs = library_specs_of(op)
     spec = select_spec(op.name, specs, call.dims)
     device = _device_of(call.infos, call.tensors)
     if getattr(device, "type", None) != "cuda":
@@ -736,32 +747,45 @@ def _run_library(op: LibraryOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]
         built = replay_pin(spec, manifest, index)
     with torch.cuda.device(index):
         stream = torch.cuda.current_stream(index).cuda_stream
-        _library.run_gemm(spec, built.algo, call.tensors, out, stream, index)
+        if conv:
+            _conv.run_conv(built, call.tensors, out, stream, index)
+        else:
+            _library.run_gemm(spec, built.algo, call.tensors, out, stream, index)
     return out
 
 
 def jit_pin(spec: Any, index: int) -> Any:
-    """The algorithm ``jit`` pins in memory for a library spec on device ``index`` (what ``export`` writes), cached for the process."""
-    from . import _cublaslt, _library
+    """The pin ``jit`` makes in memory for a library spec on device ``index`` (what ``export`` writes), cached for the process."""
+    from . import _conv, _library
 
     cap = _capability(_torch(), index)
     # a pin is for one device: its index (two devices of one architecture may have other SM counts, a MIG slice fewer than the whole GPU) and its SM count
-    key = (spec.stem, f"sm_{cap}", index, _library.sm_count(index), spec.workspace_bytes, _cublaslt.version(), spec.declaration_digest)
+    if isinstance(spec, _conv.ConvSpec):
+        from . import _cudnn
+
+        key: "tuple[Any, ...]" = (spec.stem, f"sm_{cap}", index, _library.sm_count(index), spec.workspace_bytes, "cudnn", _cudnn.version(), spec.declaration_digest)
+    else:
+        from . import _cublaslt
+
+        key = (spec.stem, f"sm_{cap}", index, _library.sm_count(index), spec.workspace_bytes, _cublaslt.version(), spec.declaration_digest)
     with _lock:
         built = _pins.get(key)
     if built is None:
-        built = _library.build_library(spec, arch=cap, device_index=index)
+        built = _conv.build_conv(spec, arch=cap, device_index=index) if isinstance(spec, _conv.ConvSpec) else _library.build_library(spec, arch=cap, device_index=index)
         with _lock:
             _pins[key] = built
     return built
 
 
 def replay_pin(spec: Any, manifest: Manifest, index: int) -> Any:
-    """The algorithm a manifest recorded for a library spec on device ``index``, after checking that it was pinned on a device of this one's SM count,
-    that its entry is what the declaration asks for and that cuBLASLt is the version that chose it."""
-    from . import _library
+    """The pin a manifest recorded for a library spec on device ``index``, after checking that it was pinned on a device of this one's SM count,
+    that its entry is what the declaration asks for and that the library is the version that chose it."""
+    from . import _conv, _library
 
-    return _library.built_from_manifest(manifest, spec, f"sm_{_capability(_torch(), index)}", _library.sm_count(index), index)
+    arch, sms = f"sm_{_capability(_torch(), index)}", _library.sm_count(index)
+    if isinstance(spec, _conv.ConvSpec):
+        return _conv.built_from_manifest(manifest, spec, arch, sms, index)
+    return _library.built_from_manifest(manifest, spec, arch, sms, index)
 
 
 def _run_extern_reference(op: ExternOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:
@@ -878,11 +902,12 @@ def export(
     built: "list[BuiltKernel]" = []
     pinned_library: "list[Any]" = []
     for op in items:
-        if isinstance(op, LibraryOp) and op.impl is not None:  # a pinned library operation (a cuBLASLt GEMM): an entry, no file
-            from ._library import build_library, library_specs
+        if isinstance(op, LibraryOp) and op.impl is not None:  # a pinned library operation (a cuBLASLt GEMM, a cuDNN convolution): an entry, no file
+            from ._conv import build_conv, is_conv
+            from ._library import build_library
 
-            for lspec in library_specs(op):
-                pinned_library.append(build_library(lspec, arch=cap))
+            for lspec in library_specs_of(op):
+                pinned_library.append(build_conv(lspec, arch=cap) if is_conv(op) else build_library(lspec, arch=cap))
             continue
         target = _target(op).at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
         extern = target.launch_extern()

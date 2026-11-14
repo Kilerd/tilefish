@@ -1039,6 +1039,8 @@ def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
         "cublaslt_version",
         "sm_count",
         "workspace_bytes",
+        "pin",
+        "cudnn_version",
     ):
         if old.get(key) != new.get(key):
             return key

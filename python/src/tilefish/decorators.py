@@ -180,7 +180,8 @@ class LibraryOp(Op):
     ``tilefish.runtime.export`` writes to the ``library`` section of a manifest: ``out[M, N] = a[M, K] @ b[N, K]^T`` (``b[K, N]`` without the
     transpose for ``layout="NN"`` and ``"NT"``, ``a[K, M]`` transposed for ``"TT"`` and ``"NT"``; ``+ bias[N]``), bf16, f16 or f32 operands with an f32 accumulator and one rounding to the result's type (theirs,
     or f32; f32 operands are multiplied as f32, TF32 off), the algorithm the heuristic ranks first under a ``workspace_bytes`` limit and a ``heuristic`` posture (or the one an imported table,
-    ``algos``, gives), recorded with the cuBLASLt version (see :mod:`tilefish._library`). Without ``impl`` it is a signature only.
+    ``algos``, gives), recorded with the cuBLASLt version (see :mod:`tilefish._library`). With ``impl="cudnn.conv_fwd"`` it is a pinned cuDNN
+    forward convolution (``conv`` holds its options: see :mod:`tilefish._conv`). Without ``impl`` it is a signature only.
     """
 
     kind = "library"
@@ -200,6 +201,7 @@ class LibraryOp(Op):
         allow_f16_reduction: bool = False,
         sm_count_target: "int | None" = None,
         allow_f32_reduction: bool = False,
+        conv: Any = None,
     ) -> None:
         super().__init__(fn, name, signature)
         self.acc = acc
@@ -212,6 +214,7 @@ class LibraryOp(Op):
         self.allow_f16_reduction = allow_f16_reduction
         self.sm_count_target = sm_count_target
         self.allow_f32_reduction = allow_f32_reduction
+        self.conv = conv  # tilefish._conv.ConvOptions of a cudnn.conv_fwd, else None
 
     def node_attrs(self) -> dict[str, Any]:
         return {"acc": self.acc} if self.acc is not None else {}
@@ -230,6 +233,13 @@ def library(
     allow_f16_reduction: "bool | None" = None,
     sm_count_target: "int | None" = None,
     allow_f32_reduction: "bool | None" = None,
+    stride: Any = None,
+    padding: Any = None,
+    dilation: Any = None,
+    groups: "int | None" = None,
+    math: "str | None" = None,
+    api: "str | None" = None,
+    alignment: "int | None" = None,
 ) -> Any:
     """``@tilefish.library("gemm", acc=f32)``: declare an operator by signature only.
 
@@ -256,6 +266,15 @@ def library(
     * ``sm_count_target``: the SM count the heuristic chooses for (``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET``, at least 8 and at most the
       device's), for a GEMM that runs on a partition of the device's SMs (a green context); every check and run of the pin sets it too
       (``docs/manifest-schema-3.md``, section 9.3).
+
+    ``impl="cudnn.conv_fwd"`` says a pinned cuDNN forward convolution runs it (:mod:`tilefish._conv`, ``docs/manifest-schema-3.md``, section 9.4): the
+    signature is ``(x, w) -> y`` in the order of ``layout`` (``"NCHW"``, the default: ``x [N, C, *S]``, ``w [K, C/G, *R]``; ``"NHWC"``: ``x [N, *S, C]``,
+    ``w [K, *R, C/G]``) with 1 to 3 spatial axes, one type ``f16``, ``bf16`` or ``f32``, and the convolution is ``stride``, ``padding`` (symmetric,
+    zeros), ``dilation`` (an int, or one per spatial axis) and ``groups``; ``math`` is ``"tensor_op"`` (the default of 16-bit data) or ``"fma"``, and
+    for f32 data ``"fma"`` (TF32 off) or ``"tf32"``, said explicitly; ``api`` is ``"backend"`` (the default: an engine configuration is pinned, chosen as
+    torch chooses it, ``heuristic="instant"`` or ``"mode_b"``) or ``"legacy"`` (the algorithm enum of ``cudnnConvolutionForward``, ``heuristic="v7"``);
+    ``algos`` imports the pins (:class:`~tilefish.CudnnTable`); ``workspace_bytes`` (default 64 MiB), ``sm_count_target`` and ``alignment`` (16 bytes:
+    the alignment of every pointer, ``CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT``) are the rest of the pin.
     """
     if acc is not None and not isinstance(acc, DType):
         raise TilefishDeclarationError(f"library: acc must be a dtype such as f32, got {acc!r}")
@@ -273,6 +292,8 @@ def library(
         raise TilefishDeclarationError(
             "library: heuristic, allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction, algos, layout and sm_count_target need an impl"
         )
+    if impl is None and any(v is not None for v in (stride, padding, dilation, groups, math, api, alignment)):
+        raise TilefishDeclarationError("library: stride, padding, dilation, groups, math, api and alignment need impl='cudnn.conv_fwd'")
 
     def make(fn: Callable[..., Any], op_name: str | None) -> LibraryOp:
         nm = op_name or fn.__name__
@@ -284,7 +305,30 @@ def library(
         ws = workspace_bytes
         if impl is None:
             return LibraryOp(fn, nm, sig, acc)
-        from . import _library
+        from . import _conv, _library
+
+        conv_options = {"stride": stride, "padding": padding, "dilation": dilation, "groups": groups, "math": math, "api": api, "alignment": alignment}
+        if impl == _conv.IMPL:
+            gemm_only = {
+                "allow_bf16_reduction": allow_bf16_reduction, "allow_f16_reduction": allow_f16_reduction, "allow_f32_reduction": allow_f32_reduction,
+            }  # fmt: skip
+            given = sorted(k for k, v in gemm_only.items() if v is not None)
+            if given:
+                raise TilefishDeclarationError(f"library op '{nm}': {', '.join(given)} are options of a cuBLASLt GEMM, not of {_conv.IMPL}")
+            options = _conv.check_options(
+                nm, sig, layout="NCHW" if layout is None else layout, stride=1 if stride is None else stride, padding=0 if padding is None else padding,
+                dilation=1 if dilation is None else dilation, groups=1 if groups is None else groups, math=math, api="backend" if api is None else api,
+                heuristic=heuristic, alignment=16 if alignment is None else alignment,
+            )  # fmt: skip
+            tables = None if algos is None else _conv.check_tables(nm, algos, options.api)
+            ws = _conv.DEFAULT_WORKSPACE_BYTES if workspace_bytes is None else workspace_bytes
+            _conv.check_declaration(nm, sig, acc, ws, options, sm_count_target)
+            op = LibraryOp(fn, nm, sig, acc, impl, ws, options.heuristic, False, tables, options.layout, False, sm_count_target, False, options)
+            _conv.check_coverage(op)
+            return op
+        given = sorted(k for k, v in conv_options.items() if v is not None)
+        if given:
+            raise TilefishDeclarationError(f"library op '{nm}': {', '.join(given)} are options of {_conv.IMPL}, not of a cuBLASLt GEMM")
 
         posture = "tilefish" if heuristic is None else heuristic
         bf16_reduction = False if allow_bf16_reduction is None else allow_bf16_reduction
@@ -293,7 +337,7 @@ def library(
         lay = "TN" if layout is None else layout
         tables = _library.check_options(nm, posture, bf16_reduction, algos, f16_reduction, lay, sm_count_target, f32_reduction)
         if impl not in _library.IMPLS:
-            raise TilefishDeclarationError(f"library op '{nm}': impl must be one of {sorted(_library.IMPLS)}, got {impl!r}")
+            raise TilefishDeclarationError(f"library op '{nm}': impl must be one of {sorted([*_library.IMPLS, _conv.IMPL])}, got {impl!r}")
         ws = _library.default_workspace_bytes(impl, posture) if workspace_bytes is None else workspace_bytes
         _library.check_declaration(nm, impl, sig, acc, ws, lay, bf16_reduction, f16_reduction, f32_reduction)
         op = LibraryOp(fn, nm, sig, acc, impl, ws, posture, bf16_reduction, tables, lay, f16_reduction, sm_count_target, f32_reduction)

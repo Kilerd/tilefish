@@ -125,7 +125,7 @@ class Callee:
     """A declared operator a graph calls, with what a step needs to bind and check a launch of it.
 
     ``kind`` is ``"kernel"`` (a Triton kernel or a prebuilt binary: a kernel, a lowered ``@tilefish.kernel`` or an extern) or ``"library"`` (a pinned
-    cuBLASLt GEMM). ``specs`` are its compile specs (``CompileSpec``) or library specs (``LibrarySpec``), one per bucket.
+    cuBLASLt GEMM or cuDNN convolution). ``specs`` are its compile specs (``CompileSpec``) or library specs (``LibrarySpec``, ``ConvSpec``), one per bucket.
     """
 
     kind: str
@@ -162,21 +162,16 @@ def callee_of(op: Any) -> Callee:
     found = getattr(op, "__dict__", {}).get("_tf_callee")
     if found is not None:
         return found
-    from . import _library, runtime
+    from . import runtime
 
     try:
         if isinstance(op, LibraryOp):
             if op.impl is None:
                 raise TilefishPlanError(
                     f"the library op '{op.name}' has no implementation (impl=...), so there is nothing to launch: declare it with "
-                    "impl='cublaslt.gemm' or 'cublaslt.gemm_bias'"
+                    "impl='cublaslt.gemm', 'cublaslt.gemm_bias' or 'cudnn.conv_fwd'"
                 )
-            with runtime._lock:
-                specs = runtime._library_specs.get(op)
-            if specs is None:
-                specs = _library.library_specs(op)
-                with runtime._lock:
-                    runtime._library_specs[op] = specs
+            specs = runtime.library_specs_of(op)
             callee = Callee("library", op, op.name, op.signature, None, None, {}, list(specs))
         elif isinstance(op, ExternOp) and op.implementations is not None:  # an implementation per architecture: a callee of each
             target = runtime._target(op)

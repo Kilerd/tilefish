@@ -890,8 +890,14 @@ def validate_entry(entry: Any, index: int = 0) -> None:
     ``b`` is ``[n, k]`` and ``lda = k``, ``N``: ``b`` is ``[k, n]`` and ``lda = n``; ``transb`` ``N``: ``a`` is ``[m, k]`` and ``ldb = k``, ``T``:
     ``a`` is ``[k, m]`` and ``ldb = m``); the other leading dimensions and the shapes of the operands follow from ``impl``, ``m``, ``n`` and ``k``;
     the opt-in, if any, is the one of the operands' type.
+
+    An entry of ``impl`` ``"cudnn.conv_fwd"`` is a cuDNN convolution, read by :func:`tilefish._conv.validate_entry`.
     """
     where = f"#{index}"
+    if isinstance(entry, dict) and entry.get("impl") == "cudnn.conv_fwd":
+        from . import _conv
+
+        return _conv.validate_entry(entry, index)
     if not isinstance(entry, dict):
         _bad(where, f"is not an object: {entry!r}")
     where = f"#{index} ({entry.get('stem')!r})"
@@ -916,7 +922,7 @@ def validate_entry(entry: Any, index: int = 0) -> None:
             _bad(where, f"arch must look like 'sm_103', got {entry['arch']!r}")
         impl = entry["impl"]
         if impl not in IMPLS:
-            _bad(where, f"impl must be one of {sorted(IMPLS)}, got {impl!r}")
+            _bad(where, f"impl must be one of {sorted([*IMPLS, 'cudnn.conv_fwd'])}, got {impl!r}")
         bias = IMPLS[impl]
         for key in ("m", "n", "k", "lda", "ldb", "ldc", "ldd"):
             v = entry[key]

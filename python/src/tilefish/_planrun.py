@@ -326,6 +326,10 @@ class Backend:
     def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
         raise NotImplementedError
 
+    def conv(self, built: Any, x: int, w: int, out: int, workspace: int, stream: int, index: int) -> None:
+        """Run a pinned cuDNN convolution (a ``BuiltConv``) on device addresses, the workspace in the arena."""
+        raise NotImplementedError
+
     def warm(self, index: int, library: bool) -> None:
         raise NotImplementedError
 
@@ -334,6 +338,9 @@ class Backend:
 
     def check_gemm(self, spec: Any, algo: str, index: int) -> None:
         """Refuse a pinned algorithm that is not valid for the problem on this device, or needs more workspace than recorded (the same: once per bucket)."""
+
+    def check_conv(self, built: Any, index: int) -> None:
+        """Refuse a cuDNN pin that is not valid for its problem on this device (once per bucket, outside any capture: it also makes the plan)."""
 
 
 class TorchBackend(Backend):
@@ -480,6 +487,11 @@ class TorchBackend(Backend):
 
         _library.run_gemm_ptrs(spec, algo, a, b, bias, out, stream, index, workspace_ptr=workspace)
 
+    def conv(self, built: Any, x: int, w: int, out: int, workspace: int, stream: int, index: int) -> None:
+        from . import _conv
+
+        _conv.run_conv_ptrs(built, x, w, out, stream, index, workspace_ptr=workspace)
+
     def warm(self, index: int, library: bool) -> None:
         if library:
             from . import _cublaslt
@@ -502,6 +514,11 @@ class TorchBackend(Backend):
             spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form,
             sm_count_target=spec.sm_count_target, **spec.opt_ins,
         )  # fmt: skip
+
+    def check_conv(self, built: Any, index: int) -> None:
+        from . import _conv
+
+        _conv.check_built(built, index)
 
 
 # -- where a step's binary comes from ----------------------------------------------------------------------------------------------------
@@ -591,12 +608,18 @@ class _Tap:
     nbytes: int
 
 
+def _is_conv_spec(spec: Any) -> bool:
+    from . import _conv
+
+    return isinstance(spec, _conv.ConvSpec)
+
+
 @dataclass
 class _StepRT:
     bound: "Bound | _CopyBound"
     loaded: Any  # the loaded kernel of a kernel step
     order: "tuple[tuple[str, str], ...]"  # (kind, name) of the arguments of a launch, in the ABI's order
-    algo: "str | None"  # the pinned algorithm of a library step
+    algo: Any  # the pinned algorithm of a GEMM step (its hex), the BuiltConv of a convolution step; None for the other steps
     workspace: "str | None"
 
 
@@ -798,8 +821,13 @@ class PlanRunner:
                 if shapes[ws][1][0] < bound.spec.workspace_bytes:
                     raise TilefishManifestError(f"{where}: the workspace '{ws}' has {shapes[ws][1][0]} bytes, but the entry needs {bound.spec.workspace_bytes}")
                 built = self.provider.pin(bound.spec, index)
-                be.check_gemm(bound.spec, built.algo, index)  # once, here: a launch repeats it, but a refusal must not come after another step has run (or inside a capture)
-                steps.append(_StepRT(bound, None, (), built.algo, ws))
+                # once, here: a launch repeats it, but a refusal must not come after another step has run (or inside a capture)
+                if _is_conv_spec(bound.spec):
+                    be.check_conv(built, index)
+                    steps.append(_StepRT(bound, None, (), built, ws))  # a convolution step runs its BuiltConv
+                else:
+                    be.check_gemm(bound.spec, built.algo, index)
+                    steps.append(_StepRT(bound, None, (), built.algo, ws))
             else:
                 built = self.provider.kernel(callee, bound.spec, index)
                 check_launch_config(built, bound.spec)  # the declared warps (a warp-specialised kernel's default partition, and more)
@@ -963,6 +991,9 @@ class PlanRunner:
         if isinstance(st.bound, _CopyBound):
             src, dst, nbytes = real
             be.copy(dst, src, nbytes, stream)
+        elif st.algo is not None and _is_conv_spec(st.bound.spec):
+            names = list(st.bound.names)
+            be.conv(st.algo, real[names[0]].ptr, real[names[1]].ptr, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
         elif st.algo is not None:
             names = [a for a in st.bound.names]
             a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
@@ -1862,7 +1893,6 @@ def export_graph(
 ) -> Plan:
     """:func:`tilefish.runtime.export` of a graph: build the binary of every step (and pin every GEMM), write the manifest (merged into one that is
     already there) and ``plan.json`` next to it, read both back, and return the plan loaded from the directory, which has the digest to pin."""
-    from . import _library
     from ._build import build, parse_arch
     from ._binary import build_binary
 
@@ -1878,12 +1908,19 @@ def export_graph(
         callee = callee.at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
         spec = callee.by_stem[stem]
         if callee.kind == "library":
-            pinned.append(_library.build_library(spec, arch=cap))
+            pinned.append(_pin_library(spec, cap))
         elif callee.extern.binary is not None:  # type: ignore[union-attr]
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         else:
             built.append(build(spec, arch=cap, fn=callee.target.jit_function(spec)))
     return write_export(p, built, pinned, directory, cap, overwrite)
+
+
+def _pin_library(spec: Any, cap: int) -> Any:
+    """Pin a library step's spec for ``cap``: a cuBLASLt GEMM's algorithm or a cuDNN convolution's pin."""
+    from . import _conv, _library
+
+    return _conv.build_conv(spec, arch=cap) if isinstance(spec, _conv.ConvSpec) else _library.build_library(spec, arch=cap)
 
 
 def write_export(p: Plan, built: "Sequence[Any]", pinned: "Sequence[Any]", directory: "str | os.PathLike[str]", cap: int, overwrite: bool) -> Plan:
@@ -1942,7 +1979,6 @@ def export_graphs(
     """:func:`tilefish.runtime.export` of several graphs: a **plan set**, one manifest for all of them (each binary built once, whichever plans
     launch it), ``<graph>.plan.json`` per graph and the index ``plans.json`` (``docs/plan-schema-1.md``, section 15). An item is a graph, or
     ``(graph, buckets)``; ``buckets=`` may map a graph's name to its buckets instead. Returns the :class:`~tilefish._plan.PlanSet` loaded back."""
-    from . import _library
     from ._build import build, parse_arch
     from ._binary import build_binary
 
@@ -1974,7 +2010,7 @@ def export_graphs(
     for stem, callee in sorted(callees.items(), key=lambda kv: kv[0]):
         spec = callee.by_stem[stem]
         if callee.kind == "library":
-            pinned.append(_library.build_library(spec, arch=cap))
+            pinned.append(_pin_library(spec, cap))
         elif callee.extern.binary is not None:  # type: ignore[union-attr]
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         else:
@@ -2136,12 +2172,12 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
                 if p.access == "inout" and v in views:
                     ins[p.name] = ins[p.name].clone()  # the IR: updating a chunk or a view does not change its parent
             if isinstance(op, LibraryOp):
-                from . import _library
+                from . import _conv, _library
 
                 if op.impl is None:
                     raise TilefishRuntimeError(f"reference mode needs the library op '{op.name}' to have an impl (a pinned GEMM): it has only a signature")
                 device = next(iter(ins.values())).device
-                produced = [_library.reference_of(op, ins).to(device)]
+                produced = [(_conv.reference_conv(op, ins) if _conv.is_conv(op) else _library.reference_of(op, ins)).to(device)]
             elif isinstance(op, KernelOp):
                 given = n.attrs.get("consts") or {}
                 changed = {p.name: given[p.name] for p in op_sig.consts if p.name in given and given[p.name] is not p.default}  # refused when it differs from what is compiled in

@@ -25,6 +25,8 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
 * ``python_library.json``: ``library`` entries of every form (bf16, f16 and f32 operands, result types, a bias, the layouts, the opt-ins), each also
   changed in one field,
   and what Python's strict reader decides of each (accepted, with the form it reads and the SM count it targets, or refused);
+* ``python_conv.json``: ``cudnn.conv_fwd`` library entries of every form, each also changed in one field, and what Python's strict reader decides of
+  each (accepted, with the pin and the cuDNN-level problem it describes, or refused);
 * ``python_manifests.in``: ``MANIFESTS``, small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
   alphabets; schema 3 with kernels and library entries in every order, every field it added, the spelling of floats, non-ASCII text escaped and as it is,
   and the schemas ``3.0``, ``true``, ``"3"`` and ``4``) and their ``manifest_digest``, which has its own tag per schema; and ``MANIFEST_ERRORS``, documents
@@ -862,6 +864,115 @@ def library_entries_json():
     return "[\n" + ",\n".join(json.dumps(c, sort_keys=True, separators=(",", ":")) for c in library_entries()) + "\n]\n"
 
 
+def conv_entries():
+    """``cudnn.conv_fwd`` entries of every form (both APIs and every choice, both layouts, 1 to 3 spatial axes, f16, bf16 and f32 with each math,
+    groups, strides, paddings and dilations, a bucketed length, the alignments, an SM count target) as ``tilefish._conv`` writes them, and each
+    changed in one field, with what Python's strict reader (``validate_entry``) decides: accepted, with the pin and the cuDNN-level problem it
+    reads (``tilefish._cudnn.describe``), or refused. The Rust reader must decide the same and describe the same problem (``tests/python_conv.rs``)."""
+    import copy
+
+    import tilefish
+    from tilefish import CudnnTable, Dim, Tensor, TilefishManifestError, bf16, f16, f32
+    from tilefish import _conv, _cudnn
+    from tilefish._library import validate_entry
+
+    t = {"bf16": bf16, "f16": f16, "f32": f32}
+    T = Dim("T", buckets=[64, 646])
+    ops = []
+
+    def declare(name, dtype, x, w, y, **kw):
+        def fn(x_: Tensor[(*x, t[dtype])], w_: Tensor[(*w, t[dtype])]) -> Tensor[(*y, t[dtype])]: ...
+
+        ops.append(tilefish.library(name, impl="cudnn.conv_fwd", **kw)(fn))
+
+    declare("k7_nhwc", "f16", (1, T, 64), (64, 7, 64), (1, T + 6, 64), layout="NHWC", padding=6)
+    declare("k7_dil", "f16", (1, T, 64), (64, 7, 64), (1, T + 18, 64), layout="NHWC", padding=18, dilation=3, api="legacy")
+    declare("down", "bf16", (2, 32, 100), (64, 32, 4), (2, 64, 50), stride=2, padding=1)
+    declare("depthwise", "f16", (1, 64, 300), (64, 1, 7), (1, 64, 300), padding=3, groups=64, heuristic="mode_b")
+    declare("img", "f16", (2, 40, 40, 32), (64, 3, 3, 32), (2, 40, 40, 64), layout="NHWC", padding=1, alignment=32)
+    declare("img_f32", "f32", (1, 16, 24, 24), (32, 16, 3, 3), (1, 32, 12, 12), stride=2, padding=1, math="fma")
+    declare("tf32", "f32", (1, 32, 777), (64, 32, 5), (1, 64, 777), padding=2, math="tf32", api="legacy")
+    declare("vol", "f16", (1, 8, 6, 6, 6), (8, 8, 3, 3, 3), (1, 8, 6, 6, 6), padding=(1, 1, 1))
+    declare("target", "f16", (1, 64, 128), (64, 64, 3), (1, 64, 128), padding=1, sm_count_target=16)
+    rows = {(1, 1, 64, (2048,), (7,), (1,), (6,), (1,), 1): 1}
+    declare("conv_in", "f16", (1, 2048, 1), (64, 7, 1), (1, 2048 + 6, 64), layout="NHWC", padding=6, api="legacy", sm_count_target=16,
+            algos=CudnnTable("sm_103", 30, 91002, rows))  # fmt: skip
+    goods = []
+    for op in ops:
+        for spec in _conv.conv_specs(op):
+            pin = _cudnn.LegacyPin(1) if spec.api == "legacy" else _cudnn.EnginePin(28, ((2, 4), (3, 0)))
+            goods.append(_conv.BuiltConv(spec, "sm_103", pin, 91002, 30).entry())
+
+    def changed(entry, path, value):
+        e = copy.deepcopy(entry)
+        target = e
+        for key in path[:-1]:
+            target = target[key]
+        if value is _DELETE:
+            del target[path[-1]]
+        else:
+            target[path[-1]] = value
+        return e
+
+    cases = list(goods)
+    for good in goods:
+        sp = len(good["input"])
+        legacy = good["pin"]["api"] == "legacy"
+        for path, value in [
+            (["dtypes", "w"], "f32" if good["dtypes"]["x"] != "f32" else "f16"),
+            (["dtypes", "x"], "e4m3"),
+            (["compute_type"], "CUDNN_DATA_HALF"),
+            (["math"], "tf32" if good["dtypes"]["x"] != "f32" else "tensor_op"),
+            (["math"], "fast"),
+            (["layout"], "NHWC" if good["layout"] == "NCHW" else "NCHW"),
+            (["n"], 0),
+            (["c"], good["c"] + 1),
+            (["k"], good["k"] * 2),
+            (["groups"], 3),
+            (["input", 0], good["input"][0] + 1),
+            (["output", 0], good["output"][0] + 1),
+            (["filter"], good["filter"] + [1]),
+            (["stride", 0], 0),
+            (["padding", 0], -1),
+            (["dilation", 0], 2),
+            (["alignment"], 8),
+            (["alignment"], 64),
+            (["workspace_bytes"], 0),
+            (["choice"], "instant" if legacy else "v7"),
+            (["choice"], "imported"),
+            (["choice"], "heuristic"),
+            (["pin", "algo" if legacy else "engine"], 9 if legacy else -1),
+            (["pin"], {"api": "legacy", "algo": 1, "engine": 0}),
+            (["pin", "knobs"] if not legacy else ["pin", "algo"], [[3, 0], [2, 4]] if not legacy else 1.0),
+            (["cudnn_version"], 0),
+            (["sm_count"], 30.0),
+            (["sm_count_target"], 16),
+            (["sm_count_target"], 31),
+            (["sm_count_target"], _DELETE),
+            (["abi", "params", 0, "shape", -1], "T" if sp == 1 else 7),
+            (["abi", "params", 2, "dtype"], "f32" if good["dtypes"]["x"] != "f32" else "f16"),
+            (["preconditions", 0, "bytes"], 16 if good["alignment"] != 16 else 32),
+            (["declaration_digest"], "x" * 64),
+            (["note"], 1),
+        ]:
+            if path[0] == "sm_count_target" and value is _DELETE and "sm_count_target" not in good:
+                continue
+            cases.append(changed(good, path, value))
+    out = []
+    for entry in cases:
+        try:
+            validate_entry(entry)
+        except TilefishManifestError as e:
+            out.append({"entry": entry, "accepted": False, "refusal": str(e)})
+            continue
+        out.append({"entry": entry, "accepted": True, "pin": entry["pin"], "describe": _cudnn.describe(_conv.problem_of_entry(entry))})
+    return out
+
+
+def conv_entries_json():
+    return "[\n" + ",\n".join(json.dumps(c, sort_keys=True, separators=(",", ":")) for c in conv_entries()) + "\n]\n"
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
@@ -876,6 +987,7 @@ def main(argv=None):
         ("python_launches.json", launches_json()),
         ("python_plans.json", plan_vectors_json()),
         ("python_library.json", library_entries_json()),
+        ("python_conv.json", conv_entries_json()),
     ):
         (directory / name).write_text(text, encoding="utf-8")
 

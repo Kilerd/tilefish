@@ -75,7 +75,9 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .._build import expected_entry, write_file
+from .._conv import IMPL as CONV_IMPL
 from .._library import IMPLS as LIBRARY_IMPLS
+from .._conv import conv_specs
 from .._library import library_specs, validate_entry as validate_library_entry
 from .._manifest import Manifest
 from .._specvalid import parse_expression, parse_grid
@@ -113,6 +115,11 @@ _IMPLEMENTATION_FIELDS = ("grid", "block", "num_warps", "num_stages", "constexpr
 _LIBRARY_SHARED_FIELDS = (
     "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes "
     "heuristic algo_source allow_bf16_reduction allow_f16_reduction allow_f32_reduction sm_count_target"  # (the last six are absent by default: compared as present or not too)
+).split()
+# what the entries of a cuDNN convolution on several architectures share (the pin, its cuDNN, the device and the digest are per architecture)
+_CONV_SHARED_FIELDS = (
+    "op impl abi buckets dims preconditions dtypes compute_type math layout n c k groups input filter output stride padding dilation alignment "
+    "workspace_bytes choice sm_count_target"
 ).split()
 
 _RUST_KEYWORDS = frozenset(
@@ -175,6 +182,11 @@ class _Gemm:
     @property
     def archs(self) -> "list[str]":
         return [e["arch"] for e in self.entries]
+
+    @property
+    def conv(self) -> bool:
+        """A cuDNN convolution (``cudnn.conv_fwd``: x, w, out), not a cuBLASLt GEMM."""
+        return self.entry["impl"] == CONV_IMPL
 
 
 def _rs_str(text: str) -> str:
@@ -573,8 +585,18 @@ def _validate_library_entry(entry: Any) -> None:
         _bad(who, str(e))
     _name(who, "the operator", entry.get("op"))
     impl = entry.get("impl")
+    if impl == CONV_IMPL:
+        for key in ("n", "c", "k", "groups", "workspace_bytes", "cudnn_version", "sm_count", "alignment"):
+            _count(who, key, entry.get(key), 1)
+        params = _field(who, "abi.params", _field(who, "abi", entry, "abi", dict), "params", list)
+        for i, p in enumerate(params):
+            where = f"abi.params[{i}]"
+            _name(who, f"{where}.name", p.get("name") if isinstance(p, dict) else None)
+            _validate_pointer(who, f"{where} ('{p['name']}')", p)
+        _validate_dims(who, entry)
+        return
     if impl not in LIBRARY_IMPLS:
-        _bad(who, f"impl must be one of {sorted(LIBRARY_IMPLS)}, got {impl!r}")
+        _bad(who, f"impl must be one of {sorted([*LIBRARY_IMPLS, CONV_IMPL])}, got {impl!r}")
     for key in ("m", "n", "k", "workspace_bytes", "cublaslt_version", "sm_count"):
         _count(who, key, entry.get(key), 1)
     params = _field(who, "abi.params", _field(who, "abi", entry, "abi", dict), "params", list)
@@ -639,7 +661,7 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
         entries = sorted(library_by_stem[stem], key=lambda e: e["arch"])
         first = entries[0]
         for other in entries[1:]:
-            for key in _LIBRARY_SHARED_FIELDS:
+            for key in _CONV_SHARED_FIELDS if first["impl"] == CONV_IMPL else _LIBRARY_SHARED_FIELDS:
                 if other.get(key) != first.get(key):
                     raise TilefishManifestError(
                         f"the library entries of '{stem}' for {first['arch']} and {other['arch']} disagree about '{key}': a launcher is "
@@ -708,7 +730,9 @@ def _check_declarations(binaries: "list[_Binary]", gemms: "list[_Gemm]", ops: "I
         op = library.get(gemm.entry["op"])
         if op is None:
             continue
-        specs = {s.stem: s for s in library_specs(op)}
+        if (op.impl == CONV_IMPL) != gemm.conv:
+            raise TilefishManifestError(f"the declaration of '{op.name}' is a {op.impl}, and the manifest's library entry '{gemm.stem}' is a {gemm.entry['impl']}")
+        specs = {s.stem: s for s in (conv_specs(op) if gemm.conv else library_specs(op))}
         spec = specs.get(gemm.stem)
         if spec is None:
             raise TilefishManifestError(
@@ -1158,6 +1182,135 @@ def _render_gemm(g: _Gemm) -> str:
     return "".join(out)
 
 
+def _cudnn_text(version: int) -> str:
+    """``91002`` as ``9.10.2 (91002)``: cuDNN's ``major * 10000 + minor * 100 + patch``."""
+    return f"{version // 10000}.{version // 100 % 100}.{version % 100} ({version})"
+
+
+def _pin_text(pin: "dict[str, Any]") -> str:
+    if pin["api"] == "legacy":
+        return f"legacy algorithm {pin['algo']}"
+    return f"engine {pin['engine']}" + (f" with knobs {pin['knobs']}" if pin["knobs"] else "")
+
+
+def _doc_conv(g: _Gemm) -> "list[str]":
+    e = g.entry
+    lines: "list[str]" = []
+    if g.signature:
+        lines += [f"`{g.signature}`", ""]
+    lines += _wrap(f"The pinned cuDNN convolution `{g.stem}` of operator `{e['op']}` (`{e['impl']}`), for {', '.join(g.archs)}.")
+    x, w = (g.arg_names[p["name"]] for p in g.params[:2])
+    out = g.arg_names[g.params[-1]["name"]]
+    axes = lambda v: str(v[0]) if len(v) == 1 else str(v)  # noqa: E731
+    groups = f", {e['groups']} groups" if e["groups"] != 1 else ""
+    lines.append("")
+    lines += _wrap(
+        f"It computes `{out} = conv({x}, {w})` ({e['layout']}, {len(e['input'])} spatial ax{'is' if len(e['input']) == 1 else 'es'}, stride "
+        f"{axes(e['stride'])}, padding "
+        f"{axes(e['padding'])}, dilation {axes(e['dilation'])}{groups}): a cross-correlation of {e['dtypes']['x']} data with an f32 accumulator, "
+        f"rounded once (math `{e['math']}`). Every tensor is contiguous and {e['alignment']}-byte aligned."
+    )
+    lines.append("")
+    lines.append("Tensors, in the order of `launch`:")
+    for p in g.params:
+        lines.append(f"- `{g.arg_names[p['name']]}`: {p['access']}, {p['dtype']}, `[{_shape_text(p['shape'])}]`")
+    lines.append(f"- `{g.workspace}`: u8, rank 1, at least `workspace_required()` bytes (`WORKSPACE_BYTES` is the size the pin was chosen under;")
+    lines.append("  `Conv::alloc_workspace` allocates one)")
+    constraints = [
+        f"`{name}` is exactly {c['bucket']} (a bucket of {c['buckets']}; there is no padding, and the other buckets are other structs)"
+        for name, c in e["dims"].items()
+        if "bucket" in c
+    ]
+    if constraints:
+        lines.append("")
+        lines.append("`launch` binds the dimensions from the sizes of the tensors and refuses a call where they disagree.")
+        lines += _wrap("Constraints: " + "; ".join(constraints) + ".")
+    lines.append("")
+    chosen = {
+        "v7": "The pin is the first deterministic algorithm of cudnnGetConvolutionForwardAlgorithm_v7 that fits the workspace",
+        "instant": "The pin is the engine configuration torch's heuristic posture chose (CUDNN_HEUR_MODE_INSTANT)",
+        "mode_b": "The pin is the engine configuration of the heuristic in CUDNN_HEUR_MODE_B",
+        "imported": "The pin is the one the declaration imported for the device (`algos=`)",
+    }[e["choice"]]
+    lines += _wrap(
+        chosen + ", run as it is; a cuDNN of another version than the one that chose it, a device of another number of SMs and a process with "
+        "NVIDIA_TF32_OVERRIDE set are refused. Pinned with: "
+        + ", ".join(f"{x['arch']}: cuDNN {_cudnn_text(x['cudnn_version'])} on {x['sm_count']} SMs, {_pin_text(x['pin'])}" for x in g.entries)
+        + "."
+    )
+    if e.get("sm_count_target") is not None:
+        lines.append("")
+        lines += _wrap(f"The pin was chosen for {e['sm_count_target']} SMs (`sm_count_target`: a partition of the device).")
+    return lines
+
+
+def _render_conv(g: _Gemm) -> str:
+    e = g.entry
+    tensor_params = [
+        f"{g.arg_names[p['name']]}: {'TensorMut' if p['access'] == 'out' else 'TensorRef'}<'a, {RUST_ELEMENTS[p['dtype']]}>" for p in g.params
+    ]
+    tensor_params.append(f"{g.workspace}: TensorMut<'a, U8>")
+    names = [g.arg_names[p["name"]] for p in g.params] + [g.workspace]
+    args = ", ".join(f"{n}.into_arg()" for n in names)
+    out = [_doc_comment(_doc_conv(g)), "#[derive(Debug, Clone)]\n", f"pub struct {g.struct} {{\n    conv: Conv,\n}}\n\n", f"impl {g.struct} {{\n"]
+    out.append("    /// The stem of the library entry in the manifest.\n")
+    out.append(f"    pub const STEM: &'static str = {_rs_str(g.stem)};\n")
+    buckets = ", ".join(f"({_rs_str(d)}, {v})" for d, v in e["buckets"].items())
+    out.append("    /// The bucket values the entry is built for (none when it is not bucketed).\n")
+    out.append(f"    pub const BUCKETS: &'static [(&'static str, u64)] = &[{buckets}];\n")
+    rows = ", ".join("&[" + ", ".join(_rs_str(str(d)) for d in p["shape"]) + "]" for p in g.params)
+    out.append("    /// The declared shape of each tensor (not the workspace), in the order of `launch`, as dimension expressions (a number is a size baked in).\n")
+    out.append(f"    pub const SHAPES: &'static [&'static [&'static str]] = &[{rows}];\n")
+    out.append("    /// The workspace the pin was chosen under: the size of the workspace to give `launch`, in bytes.\n")
+    out.append(f"    pub const WORKSPACE_BYTES: usize = {e['workspace_bytes']};\n")
+    pins = ", ".join(f"({_rs_str(x['arch'])}, {x['cudnn_version']})" for x in g.entries)
+    out.append("    /// The version of cuDNN (`cudnnGetVersion`) that chose the pin, for each architecture the manifest has it for.\n")
+    out.append(f"    pub const PINNED_WITH: &'static [(&'static str, u64)] = &[{pins}];\n")
+    out.append("\n")
+    out.append("    /// Load the convolution for the device of `ctx` from `manifest`, in that context (which the launcher then keeps alive).\n")
+    out.append("    ///\n")
+    out.append("    /// Refuses a manifest whose digest is not [`MANIFEST_DIGEST`], one without an entry for the device, a cuDNN of another version than the\n")
+    out.append("    /// one that chose the pin (see `PINNED_WITH`), a device of another number of SMs and a process with `NVIDIA_TF32_OVERRIDE` set.\n")
+    out.append("    pub fn load(manifest: &Manifest, ctx: &Arc<CudaContext>) -> Result<Self, Error> {\n")
+    out.append("        manifest.require_digest(MANIFEST_DIGEST)?;\n")
+    out.append("        let conv = manifest.conv(ctx, Self::STEM, Self::BUCKETS, Arch::of_context(ctx)?)?;\n")
+    out.append("        Ok(Self { conv })\n")
+    out.append("    }\n\n")
+    out.append("    /// The loaded convolution.\n")
+    out.append("    pub fn conv(&self) -> &Conv {\n        &self.conv\n    }\n\n")
+    doc = [
+        "Check the call and run the convolution on `stream`, a stream of the context it was loaded in (checked). The tensors are the input, the",
+        "filter, the result and the workspace (see `tilefish::Conv::launch`). Every precondition is checked first (dtype, rank, the sizes,",
+        "alignment, contiguity, aliasing); nothing is launched when one fails.",
+    ]
+    out.append(_doc_comment(doc, "    "))
+    out.append("    #[allow(clippy::too_many_arguments, non_snake_case)]\n")
+    out.append("    pub fn launch<'a>(\n        &self,\n        stream: &CudaStream,\n")
+    for p in tensor_params:
+        out.append(f"        {p},\n")
+    out.append("    ) -> Result<(), Error> {\n")
+    out.append(f"        self.conv.launch(stream, &mut [{args}])\n")
+    out.append("    }\n\n")
+    raw_doc = [
+        "Check the call and run the convolution on a raw `CUstream`: another library's stream, or one a CUDA graph is being captured on.",
+        "",
+        "# Safety",
+        "",
+        "`stream` must be a valid `CUstream` of the CUDA context the convolution was loaded in, and the memory of the tensors must stay allocated,",
+        "and be ordered against the other streams that use it, until the launch has completed on `stream` (see `tilefish::Conv::launch_raw`).",
+    ]
+    out.append(_doc_comment(raw_doc, "    "))
+    out.append("    #[allow(clippy::too_many_arguments, non_snake_case)]\n")
+    out.append("    pub unsafe fn launch_raw<'a>(\n        &self,\n        stream: CUstream,\n")
+    for p in tensor_params:
+        out.append(f"        {p},\n")
+    out.append("    ) -> Result<(), Error> {\n")
+    out.append("        // SAFETY: the caller vouches for the stream, as this function's contract says.\n")
+    out.append(f"        unsafe {{ self.conv.launch_raw(stream, &[{args}]) }}\n")
+    out.append("    }\n}\n")
+    return "".join(out)
+
+
 def _trusted(manifest: Any, pin: "str | None") -> Manifest:
     """The manifest to generate from: a directory with ``pin``, or a :class:`Manifest` that is pinned (see the module docstring)."""
     if isinstance(manifest, (str, os.PathLike)):
@@ -1200,8 +1353,12 @@ def render(
     uses = {"Arch", "CUstream", "CudaContext", "CudaStream", "Error", "Manifest"}
     if binaries or not gemms:
         uses.add("Kernel")
+    if any(not g.conv for g in gemms):
+        uses.add("Gemm")
+    if any(g.conv for g in gemms):
+        uses.add("Conv")
     if gemms:
-        uses |= {"Gemm", "U8", "TensorRef", "TensorMut"} | {RUST_ELEMENTS[p["dtype"]] for g in gemms for p in g.params}
+        uses |= {"U8", "TensorRef", "TensorMut"} | {RUST_ELEMENTS[p["dtype"]] for g in gemms for p in g.params}
     if embed:
         uses.add("Pin")
     if any(p["access"] == "in" for b in binaries for p in b.params):
@@ -1239,7 +1396,7 @@ def render(
         out.append(_render_binary(binary))
     for gemm in gemms:
         out.append("\n")
-        out.append(_render_gemm(gemm))
+        out.append(_render_conv(gemm) if gemm.conv else _render_gemm(gemm))
     return "".join(out)
 
 
