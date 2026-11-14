@@ -547,8 +547,9 @@ another SM count and a process with `NVIDIA_TF32_OVERRIDE` set (it changes what 
 of `cudnnGetConvolutionForwardAlgorithm_v7`; an engine of allowed notes whose knobs are in range and whose plan finalizes). There is no bias (torch's cuDNN
 convolution adds it with a separate `add_`, as a tilefish kernel does).
 
-The `"instant"` pin is `torch.nn.functional.conv1d` / `conv2d` / `conv3d`'s bytes where torch runs cuDNN (`test_gpu_conv.py`: 16 problems, three operand sets,
-1-D, 2-D and 3-D, f16, bf16 and f32 with TF32 off, strides, dilations, groups; a B300 MIG slice with torch's cuDNN 9.10.2), and a legacy pin of
+The `"instant"` pin is `torch.nn.functional.conv1d` / `conv2d` / `conv3d`'s bytes where torch runs cuDNN (`test_gpu_conv.py`: 15 problems, three operand sets,
+1-D, 2-D and 3-D, f16, bf16 and f32 with TF32 off, strides, dilations, groups; a B300 MIG slice with cuDNN 9.10.2 and 9.13.0, an RTX 5090 with 9.13.0),
+and a legacy pin of
 `IMPLICIT_PRECOMP_GEMM` is torch's legacy path's. Both APIs run in launch plans (the workspace is the arena's) and capture in CUDA graphs; the binding is
 ctypes on the `libcudnn` the process has (torch's), and the Rust crate loads cuDNN only for a manifest that has a convolution (`Manifest::conv`, `Conv`). See
 `docs/manifest-schema-3.md`, section 9.4.

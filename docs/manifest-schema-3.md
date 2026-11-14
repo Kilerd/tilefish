@@ -656,7 +656,10 @@ refuses it (its `transb` is not `"N"`). Every operand type and result above, the
 f16 and f32 (TF32 off) operands: `python/tests/test_gpu_gemm_layouts.py`, 6 shapes (`K` from 8 to 3072) at 6 values of `M` from 2 to 2048, two operand sets
 each, measured on a B300 MIG slice (sm_103) with cuBLASLt 12.8.4; for f32 that is the algorithm cuBLAS chooses for `cublasSgemm` with both transposes.
 At `M = 1` an `a [k, 1]` is also a contiguous `[1, k]`, which torch multiplies as `TN` (or `NN`): there torch's bytes are those of that layout (measured:
-`torch.addmm` of a bf16 `a [1024, 1].t()` differs from the `TT` pin at 2 of 6 shapes), so a declaration for one row takes `TN` or `NN`.
+`torch.addmm` of a bf16 `a [1024, 1].t()` differs from the `TT` pin at 2 of 6 shapes), so a declaration for one row takes `TN` or `NN`. The same test passes
+on an RTX 5090 (sm_120) with cuBLASLt 13.1.0, except that there, at `M = 2`, the heuristic answers some f32 problems of `TT` (11 of 12) and `NT` (5 of 12)
+with algorithm 10, a split-K count of 0 and the reduction scheme 1, which the vetting of step 4 refuses in both hosts ("split-K count 0 is below 1"): such a
+pin is not made, so an f32 GEMM of a stored `[k, 2]` there takes another algorithm (`algos=`) or the layout `TN`/`NN`.
 
 `workspace_bytes` is per declaration, any size up to 2^40 (a 64 MiB limit is `64 << 20`): the heuristic is asked under it and a launch provides it.
 
@@ -851,22 +854,25 @@ allocated in a launch. **Capture works with both APIs**: `cudnnConvolutionForwar
 `torch.cuda.graph` even as the first execution of the process (no warm call), and the replay is the eager call's bytes (measured, cuDNN 9.10.2 on a B300
 MIG slice); the plans' captures of `test_gpu_conv.py` and the Rust gate's `launch_raw` captures replay to Python's bytes.
 
-**What was measured** (`python/tests/test_gpu_conv.py`, a B300 MIG slice of 30 SMs, sm_103, torch 2.9.1 and its cuDNN 9.10.2):
+**What was measured** (`python/tests/test_gpu_conv.py`, on three devices: a B300 MIG slice of 30 SMs, sm_103, with torch 2.9.1+cu128 and its cuDNN
+9.10.2; the same slice with torch 2.9.1+cu130 and its cuDNN 9.13.0; an RTX 5090, sm_120, with torch 2.9.1+cu130 and cuDNN 9.13.0; every point below on each):
 
 * the `"instant"` pin is torch's bytes (`torch.backends.cudnn.deterministic = True`, `benchmark = False`, TF32 off; NHWC through `conv2d` of channels-last
-  tensors) for 16 problems, three operand sets each, where torch runs cuDNN (`torch._C._select_conv_backend` is `Cudnn`): 1-D NHWC f16 of 1 to 1024 channels
+  tensors) for 15 problems, three operand sets each, where torch runs cuDNN (`torch._C._select_conv_backend` is `Cudnn`): 1-D NHWC f16 of 1 to 1024 channels
   with strides 1, 2 and 8, dilations 1, 3 and 9, 1-D NCHW f16 and bf16 with groups (depthwise f16 included), 2-D NHWC and NCHW f16 with a stride and groups,
-  f32 with TF32 off in 1-D, 2-D and 3-D, and f16 with the math `"fma"`. On sm_103 cuDNN 9.10.2's heuristic answers nothing in `CUDNN_HEUR_MODE_INSTANT` (nor
-  in mode B) for these problems, and both torch and tilefish take `CUDNN_HEUR_MODE_FALLBACK`'s list: the posture is still torch's;
-* torch runs some convolutions without cuDNN (a bf16 depthwise one as `CudaDepthwise2d`, an f16 3-D one as `SlowDilated3d`): there a pin runs, repeats
-  its bytes and is the f64 result within one f32 accumulation and one rounding, and there are no cuDNN bytes of torch to compare with;
+  and f32 with TF32 off in 1-D, 2-D and 3-D. On sm_103 cuDNN 9.10.2's heuristic answers nothing in `CUDNN_HEUR_MODE_INSTANT` (nor in mode B) for these
+  problems, and both torch and tilefish take `CUDNN_HEUR_MODE_FALLBACK`'s list: the posture is still torch's;
+* there are no cuDNN bytes of torch for 16-bit data with the math `"fma"` (torch filters tensor-core engines for f32 only: with cuDNN 9.13.0 the first
+  engine of an f16 problem is a tensor-core one, which `"fma"` refuses, and the bytes differ), and for the convolutions torch runs without cuDNN (a bf16
+  depthwise one as `CudaDepthwise2d`, an f16 3-D one as `SlowDilated3d`): there a pin runs, repeats its bytes and is the f64 result within one f32
+  accumulation and one rounding;
 * a legacy pin of `CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM` (1) is torch's legacy path (`TORCH_CUDNN_V8_API_DISABLED=1`: with `deterministic`
   and no benchmark torch runs that algorithm with the math type of its data, `onlyDefaultAlgorithm`) for the f16 and f32 problems; the `"v7"` posture
   pinned that algorithm for every problem tried;
 * a pin repeats its bytes in the process and in another process; `jit`, `replay`, a plan, its capture and the call alone give the same bytes;
-* an SM count target of the device's count is as none; with targets below it (15 of 30) no engine of these convolutions finalizes in cuDNN 9.10.2 (the
-  heuristic answers nothing, and the engine of the plain pin is `CUDNN_STATUS_NOT_SUPPORTED`), so a declaration with such a target is refused at the build,
-  never run without its target.
+* an SM count target of the device's count is as none; with targets below it (15 of 30 SMs on the B300 slice, 85 of 170 on the RTX 5090) no engine of
+  these convolutions finalizes in cuDNN 9.10.2 or 9.13.0 (the heuristic answers nothing, and the engine of the plain pin is
+  `CUDNN_STATUS_NOT_SUPPORTED`), so a declaration with such a target is refused at the build, never run without its target.
 
 ## 10. Strict reading: every refusal
 
