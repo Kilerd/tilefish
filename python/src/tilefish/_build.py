@@ -1044,6 +1044,9 @@ def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
     ):
         if old.get(key) != new.get(key):
             return key
+    # a cuDNN convolution's canary: two of them that differ are two builds of cuDNN (an entry without one, an older export, is replaced by one with it)
+    if "canary" in old and "canary" in new and old["canary"] != new["canary"]:
+        return "canary"
     return None
 
 

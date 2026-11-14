@@ -300,3 +300,102 @@ def test_the_pins_and_the_rules_they_are_held_to():
     _cudnn.refuse_tf32_override({})
     with pytest.raises(TilefishRuntimeError, match="NVIDIA_TF32_OVERRIDE is set \\(to ''\\) in this process"):
         _cudnn.refuse_tf32_override({"NVIDIA_TF32_OVERRIDE": ""})
+
+
+# -- the canary -------------------------------------------------------------------------------------------------------------------------------
+
+
+def _values(dtype, raw):
+    """The floats of canary bytes (little-endian)."""
+    import struct
+
+    if dtype == "f16":
+        return struct.unpack(f"<{len(raw) // 2}e", raw)
+    if dtype == "f32":
+        return struct.unpack(f"<{len(raw) // 4}f", raw)
+    halves = struct.unpack(f"<{len(raw) // 2}H", raw)
+    return struct.unpack(f"<{len(halves)}f", struct.pack(f"<{len(halves)}I", *(h << 16 for h in halves)))
+
+
+def test_the_canary_operands_are_normal_numbers_of_many_magnitudes_made_of_the_seed():
+    import math
+
+    for dtype, low, high in (("f16", 2.0**-8, 1.0), ("bf16", 2.0**-17, 0.5), ("f32", 2.0**-17, 0.5)):
+        raw = _conv.canary_bytes(dtype, 1, 0, 4096)
+        assert len(raw) == 4096 * {"f16": 2, "bf16": 2, "f32": 4}[dtype]
+        values = _values(dtype, raw)
+        assert all(math.isfinite(v) and low <= abs(v) < high for v in values), dtype
+        assert len({math.frexp(abs(v))[1] for v in values}) == (8 if dtype == "f16" else 16), dtype  # every exponent of the range
+        assert 0.4 < sum(v < 0 for v in values) / len(values) < 0.6, dtype
+        assert raw == _conv.canary_bytes(dtype, 1, 0, 4096)
+        size = len(raw) // 4096
+        assert raw[: 100 * size] == _conv.canary_bytes(dtype, 1, 0, 100)  # a prefix of the stream: the size does not change the first elements
+        assert raw != _conv.canary_bytes(dtype, 2, 0, 4096) and raw != _conv.canary_bytes(dtype, 1, 1, 4096)
+    p = _cudnn.Problem("f16", "NHWC", 1, 64, 64, 1, (646,), (7,), (1,), (3,), (1,), "tensor_op")
+    x, w = _conv.canary_operands(p, 5)
+    assert (len(x), len(w)) == (646 * 64 * 2, 64 * 7 * 64 * 2)
+    assert x == _conv.canary_bytes("f16", 5, 0, 646 * 64) and w == _conv.canary_bytes("f16", 5, 1, 64 * 7 * 64)
+
+
+def test_an_entry_may_have_a_canary_and_the_reader_holds_its_form():
+    op = conv(layout="NHWC", padding=6)(nhwc_k7)
+    spec = _conv.conv_specs(op)[0]
+    plain = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS).entry()
+    assert "canary" not in plain
+    validate_entry(plain)
+    e = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS, {"seed": 1, "y_sha256": "0f" * 32}).entry()
+    assert e["canary"] == {"seed": 1, "y_sha256": "0f" * 32}
+    validate_entry(e)
+    validate_entry({**e, "canary": {"seed": (1 << 32) - 1, "y_sha256": "0f" * 32}})
+    for bad in (None, [], {"seed": 1}, {"seed": -1, "y_sha256": "0f" * 32}, {"seed": 1 << 32, "y_sha256": "0f" * 32}, {"seed": True, "y_sha256": "0f" * 32},
+                {"seed": 1, "y_sha256": "0F" * 32}, {"seed": 1, "y_sha256": "0f" * 32, "x": 1}):  # fmt: skip
+        refuses(e, lambda e, bad=bad: e.update(canary=bad), "canary is absent or")
+
+
+def test_two_canaries_that_differ_are_two_binaries_and_an_entry_without_one_is_replaced():
+    from tilefish._build import _conflicts
+
+    op = conv(layout="NHWC", padding=6)(nhwc_k7)
+    spec = _conv.conv_specs(op)[0]
+    old = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS).entry()
+    new = _conv.BuiltConv(spec, "sm_103", ENGINE, VERSION, SMS, {"seed": 1, "y_sha256": "0f" * 32}).entry()
+    assert _conflicts(old, new) is None and _conflicts(new, new) is None
+    assert _conflicts(new, {**new, "canary": {"seed": 1, "y_sha256": "1f" * 32}}) == "canary"
+
+
+def test_a_replay_runs_the_canary_once_and_refuses_other_bytes(tmp_path, monkeypatch):
+    import contextlib
+    import types
+
+    from tilefish import _library
+
+    op = conv(layout="NHWC", padding=6)(nhwc_k7)
+    specs = _conv.conv_specs(op)
+    good = "0f" * 32
+    library = [_conv.BuiltConv(specs[0], "sm_103", ENGINE, VERSION, SMS, {"seed": 3, "y_sha256": good}), _conv.BuiltConv(specs[1], "sm_103", ENGINE, VERSION, SMS)]
+    write_manifest([], tmp_path / "m" / "manifest.json", cubins=True, library=library)
+    m = Manifest.load(tmp_path / "m")
+    capturing = [False]
+    fake_cuda = types.SimpleNamespace(device=lambda i: contextlib.nullcontext(), is_current_stream_capturing=lambda: capturing[0])
+    monkeypatch.setattr(_cudnn, "_torch", lambda: types.SimpleNamespace(cuda=fake_cuda))
+    monkeypatch.setattr(_cudnn, "version", lambda: VERSION)
+    monkeypatch.setattr(_library, "_device_index", lambda i: 0 if i is None else i)
+    monkeypatch.delenv("NVIDIA_TF32_OVERRIDE", raising=False)
+    monkeypatch.setattr(_conv, "_canaries_passed", set())
+    runs = []
+    answer = [good]
+    monkeypatch.setattr(_conv, "canary_digest", lambda spec, pin, seed, index: runs.append((spec.stem, seed, index)) or answer[0])
+    capturing[0] = True
+    with pytest.raises(TilefishRuntimeError, match="runs its canary at its first replay in the process, and this one is inside a CUDA graph capture"):
+        _conv.built_from_manifest(m, specs[0], "sm_103", SMS)
+    capturing[0] = False
+    for _ in range(3):
+        got = _conv.built_from_manifest(m, specs[0], "sm_103", SMS)
+        assert got.canary == {"seed": 3, "y_sha256": good}
+        assert _conv.built_from_manifest(m, specs[1], "sm_103", SMS).canary is None  # none recorded: nothing runs
+    assert runs == [("c.T64", 3, 0)]  # once per process and device
+    _conv.built_from_manifest(m, specs[0], "sm_103", SMS, device_index=1)
+    assert runs[-1] == ("c.T64", 3, 1)
+    answer[0] = "1f" * 32
+    with pytest.raises(TilefishManifestError, match=f"the canary of the cuDNN convolution 'c.T64' .* gives y with sha256 {'1f' * 32} here, and the manifest recorded {good} \\(seed 3\\)"):
+        _conv.built_from_manifest(m, specs[0], "sm_103", SMS, device_index=2)

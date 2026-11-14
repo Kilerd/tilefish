@@ -35,6 +35,7 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
 The generators are seeded, so the files only change when a format does.
 """
 
+import hashlib
 import json
 import math
 import pathlib
@@ -901,7 +902,12 @@ def conv_entries():
     for op in ops:
         for spec in _conv.conv_specs(op):
             pin = _cudnn.LegacyPin(1) if spec.api == "legacy" else _cudnn.EnginePin(28, ((2, 4), (3, 0)))
-            goods.append(_conv.BuiltConv(spec, "sm_103", pin, 91002, 30).entry())
+            # every other entry has a canary (the field is optional), with seeds from 0 to 2**32 - 1
+            canary = None
+            if len(goods) % 2 == 0:
+                seed = (len(goods) * 2654435761) % (1 << 32) if len(goods) else (1 << 32) - 1
+                canary = {"seed": seed, "y_sha256": hashlib.sha256(spec.stem.encode()).hexdigest()}
+            goods.append(_conv.BuiltConv(spec, "sm_103", pin, 91002, 30, canary).entry())
 
     def changed(entry, path, value):
         e = copy.deepcopy(entry)
@@ -954,8 +960,23 @@ def conv_entries():
             (["preconditions", 0, "bytes"], 16 if good["alignment"] != 16 else 32),
             (["declaration_digest"], "x" * 64),
             (["note"], 1),
+            (["canary"], {"seed": 1, "y_sha256": "ab" * 32}),
+            (["canary"], None),
+            (["canary"], ["seed", "y_sha256"]),
+            (["canary"], {"seed": 1}),
+            (["canary"], {"seed": 1, "y_sha256": "ab" * 32, "note": 0}),
+            (["canary", "seed"], -1),
+            (["canary", "seed"], 1 << 32),
+            (["canary", "seed"], 1.0),
+            (["canary", "seed"], True),
+            (["canary", "seed"], "1"),
+            (["canary", "y_sha256"], "AB" * 32),
+            (["canary", "y_sha256"], "ab" * 31),
+            (["canary", "y_sha256"], 7),
         ]:
             if path[0] == "sm_count_target" and value is _DELETE and "sm_count_target" not in good:
+                continue
+            if path[0] == "canary" and len(path) > 1 and "canary" not in good:
                 continue
             cases.append(changed(good, path, value))
     out = []
@@ -965,7 +986,11 @@ def conv_entries():
         except TilefishManifestError as e:
             out.append({"entry": entry, "accepted": False, "refusal": str(e)})
             continue
-        out.append({"entry": entry, "accepted": True, "pin": entry["pin"], "describe": _cudnn.describe(_conv.problem_of_entry(entry))})
+        problem = _conv.problem_of_entry(entry)
+        seed = entry["canary"]["seed"] if "canary" in entry else 7
+        x, w = _conv.canary_operands(problem, seed)
+        operands = {"seed": seed, "x_sha256": hashlib.sha256(x).hexdigest(), "w_sha256": hashlib.sha256(w).hexdigest(), "x_head": x[:16].hex()}
+        out.append({"entry": entry, "accepted": True, "pin": entry["pin"], "describe": _cudnn.describe(problem), "canary_operands": operands})
     return out
 
 

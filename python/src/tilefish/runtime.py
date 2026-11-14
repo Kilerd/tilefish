@@ -907,7 +907,7 @@ def export(
             from ._library import build_library
 
             for lspec in library_specs_of(op):
-                pinned_library.append(build_conv(lspec, arch=cap) if is_conv(op) else build_library(lspec, arch=cap))
+                pinned_library.append(build_conv(lspec, arch=cap, canary=True) if is_conv(op) else build_library(lspec, arch=cap))
             continue
         target = _target(op).at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
         extern = target.launch_extern()

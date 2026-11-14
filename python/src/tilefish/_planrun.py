@@ -1920,7 +1920,7 @@ def _pin_library(spec: Any, cap: int) -> Any:
     """Pin a library step's spec for ``cap``: a cuBLASLt GEMM's algorithm or a cuDNN convolution's pin."""
     from . import _conv, _library
 
-    return _conv.build_conv(spec, arch=cap) if isinstance(spec, _conv.ConvSpec) else _library.build_library(spec, arch=cap)
+    return _conv.build_conv(spec, arch=cap, canary=True) if isinstance(spec, _conv.ConvSpec) else _library.build_library(spec, arch=cap)
 
 
 def write_export(p: Plan, built: "Sequence[Any]", pinned: "Sequence[Any]", directory: "str | os.PathLike[str]", cap: int, overwrite: bool) -> Plan:

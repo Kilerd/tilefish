@@ -9,10 +9,13 @@
 //! of the device it was chosen on. [`Manifest::conv`] refuses another cuDNN version, another SM count, a process with `NVIDIA_TF32_OVERRIDE` set,
 //! a host on a partition the pin was not chosen for, and a pin that is not valid for its problem (a legacy algorithm that
 //! `cudnnGetConvolutionForwardAlgorithm_v7` does not answer as successful and deterministic; an engine whose numerical notes the math does not
-//! allow, whose knobs are not the engine's, or whose plan does not finalize; a workspace above the entry's). A launch is [`Conv::launch`] on a
-//! cudarc stream, with the checks of [`Kernel::launch`](crate::Kernel::launch) of its tensors and the workspace as the last tensor, or `unsafe`
-//! [`Conv::launch_raw`], which is how it is captured in a CUDA graph (measured with both APIs: a capture works even when nothing of cuDNN has run
-//! in the process before).
+//! allow, whose knobs are not the engine's, or whose plan does not finalize; a workspace above the entry's). Then it runs the entry's canary, when
+//! it has one ([`ConvCanary`]: the sha256 of the bytes the pin computed at export from operands made of a seed, [`canary_operands`]), and refuses
+//! other bytes: two builds of one cuDNN version answer the same `cudnnGetVersion()`. The canary runs on a stream of its own (`ctx.new_stream()`,
+//! non-blocking), with its copies, its zeroed buffers and its frees, never on the NULL stream, which a CUDA green context does not order against
+//! another stream. A launch is [`Conv::launch`] on a cudarc stream, with the checks of [`Kernel::launch`](crate::Kernel::launch) of its tensors and
+//! the workspace as the last tensor, or `unsafe` [`Conv::launch_raw`], which is how it is captured in a CUDA graph (measured with both APIs: a
+//! capture works even when nothing of cuDNN has run in the process before). Every call sets the handle's stream to its own right before it runs.
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -446,6 +449,18 @@ pub struct ConvEntry {
     pub sm_count_target: Option<u64>,
     /// The sha256 of the canonical declaration.
     pub declaration_digest: String,
+    /// What the pin computed at export from operands made of a seed ([`canary_operands`]), run again by [`Manifest::conv`] (absent in an entry exported
+    /// without one: then nothing is run).
+    pub canary: Option<ConvCanary>,
+}
+
+/// The canary of a convolution entry: the sha256 of the bytes of `y` its pin computed at export from the operands of `seed` ([`canary_operands`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvCanary {
+    /// The seed of the operands (0 to 2^32 - 1).
+    pub seed: u64,
+    /// The sha256 of the bytes of `y`, 64 lowercase hex digits.
+    pub y_sha256: String,
 }
 
 impl ConvEntry {
@@ -498,6 +513,8 @@ pub(crate) struct RawConv {
     declaration_digest: String,
     #[serde(default, deserialize_with = "present")]
     sm_count_target: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    canary: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -727,6 +744,14 @@ impl ConvEntry {
                     .to_owned(),
             );
         }
+        let canary = match &raw.canary {
+            None => None,
+            Some(v) => Some(canary_of(v).ok_or_else(|| {
+                format!(
+                    "canary is absent or {{\"seed\": an int from 0 to 2**32 - 1, \"y_sha256\": 64 lowercase hex digits}}, got {v}"
+                )
+            })?),
+        };
         if !is_digest(&raw.declaration_digest) {
             return Err(format!(
                 "declaration_digest must be 64 lowercase hex digits (a sha256), got {:?}",
@@ -862,8 +887,65 @@ impl ConvEntry {
             sm_count,
             sm_count_target,
             declaration_digest: raw.declaration_digest,
+            canary,
         })
     }
+}
+
+/// The canary of an entry: an object of exactly `seed` and `y_sha256`.
+fn canary_of(v: &Value) -> Option<ConvCanary> {
+    let map = v.as_object().filter(|m| m.len() == 2)?;
+    let seed = map.get("seed")?.as_u64().filter(|s| *s <= MAX_CANARY_SEED)?;
+    let y_sha256 = map.get("y_sha256")?.as_str().filter(|h| is_digest(h))?;
+    Some(ConvCanary { seed, y_sha256: y_sha256.to_owned() })
+}
+
+// -- the canary's operands -------------------------------------------------------------------------------------------------------------
+
+/// The prefix of the canary's SHA-256 blocks.
+const CANARY_PREFIX: &[u8] = b"tilefish.conv.canary\0";
+const MAX_CANARY_SEED: u64 = (1 << 32) - 1;
+
+/// What the most significant byte of an element becomes (Python's `tilefish._conv._top_byte_table`): f16 (`s eeeee mm`) an exponent field of 7 to 14,
+/// bf16 and f32 (`s eeeeeee`) exponents 110 to 125; the sign and the low bits stay.
+fn canary_top_byte(dtype: DType, b: u8) -> u8 {
+    match dtype {
+        DType::F16 => (b & 0x80) | ((7 + ((b >> 2) & 7)) << 2) | (b & 3),
+        _ => (b & 0x80) | (55 + (b & 7)),
+    }
+}
+
+/// The bytes of a canary operand of `elements` elements of `dtype` (f16, bf16 or f32; little-endian, in memory order), as Python's
+/// `tilefish._conv.canary_bytes` makes them: SHA-256 in counter mode, block `j` the digest of the prefix `tilefish.conv.canary\0`, `seed` (8 bytes
+/// little-endian), `tag` (1 byte: 0 for `x`, 1 for `w`) and `j` (8 bytes little-endian), cut to the size, the most significant byte of each element
+/// put in a range of exponents (finite, normal, many orders of magnitude: sums whose rounding depends on their order).
+pub fn canary_bytes(dtype: DType, seed: u64, tag: u8, elements: u64) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let size = dtype.size();
+    let count = elements as usize * size;
+    let mut base = Sha256::new();
+    base.update(CANARY_PREFIX);
+    base.update(seed.to_le_bytes());
+    base.update([tag]);
+    let mut out = Vec::with_capacity(count.div_ceil(32) * 32);
+    for j in 0..count.div_ceil(32) as u64 {
+        let mut h = base.clone();
+        h.update(j.to_le_bytes());
+        out.extend_from_slice(&h.finalize());
+    }
+    out.truncate(count);
+    for b in out.iter_mut().skip(size - 1).step_by(size) {
+        *b = canary_top_byte(dtype, *b);
+    }
+    out
+}
+
+/// The bytes of the canary's `x` and `w` for `problem`, dense in its layout (Python's `tilefish._conv.canary_operands`).
+pub fn canary_operands(problem: &ConvProblem, seed: u64) -> (Vec<u8>, Vec<u8>) {
+    (
+        canary_bytes(problem.dtype, seed, 0, problem.x_dims().iter().product()),
+        canary_bytes(problem.dtype, seed, 1, problem.w_dims().iter().product()),
+    )
 }
 
 // -- loading ------------------------------------------------------------------------------------------------------------------
@@ -898,6 +980,7 @@ struct LoadedConv {
     cudnn_version: u64,
     sm_count: u64,
     sm_count_target: Option<u64>,
+    canary: Option<ConvCanary>,
 }
 
 /// A pinned convolution of a manifest, loaded in a context and ready to launch. Cheap to clone; it can be shared between threads (a call
@@ -1081,6 +1164,10 @@ fn load(entry: &ConvEntry, ctx: &Arc<CudaContext>) -> Result<LoadedConv> {
             (Engine::Backend { plan, _graph: graph }, need as u64)
         }
     };
+    if let Some(canary) = &entry.canary {
+        let mine = CanaryOf { who: &who, pin: &entry.pin, cudnn_version: entry.cudnn_version, problem, required };
+        check_canary(ctx, &handle, &engine, &mine, canary)?;
+    }
     Ok(LoadedConv {
         engine: Mutex::new((handle, engine)),
         context: Arc::clone(ctx),
@@ -1098,7 +1185,124 @@ fn load(entry: &ConvEntry, ctx: &Arc<CudaContext>) -> Result<LoadedConv> {
         cudnn_version: entry.cudnn_version,
         sm_count: entry.sm_count,
         sm_count_target: entry.sm_count_target,
+        canary: entry.canary.clone(),
     })
+}
+
+/// What the check of a canary says of its convolution.
+struct CanaryOf<'a> {
+    who: &'a str,
+    pin: &'a ConvPin,
+    cudnn_version: u64,
+    problem: &'a ConvProblem,
+    required: u64,
+}
+
+/// Run a canary ([`run_canary`]) and refuse other bytes.
+fn check_canary(
+    ctx: &Arc<CudaContext>,
+    handle: &Handle,
+    engine: &Engine,
+    of: &CanaryOf<'_>,
+    canary: &ConvCanary,
+) -> Result<()> {
+    let got = run_canary(ctx, handle, engine, of.required, of.problem, canary.seed)?;
+    if got != canary.y_sha256 {
+        return Err(Error::Manifest(format!(
+            "the canary of the cuDNN convolution {} ({}) gives y with sha256 {got} here, and the manifest recorded {} (seed {}): this process's \
+             cuDNN (version {} too) or this device runs other kernels for the pin, so it is refused; export the manifest again with this cuDNN \
+             build, or run with the build that made it",
+            of.who,
+            of.pin.what(),
+            canary.y_sha256,
+            canary.seed,
+            of.cudnn_version
+        )));
+    }
+    Ok(())
+}
+
+/// Run the canary of a loaded pin: its `y` from the operands of `seed`, and the sha256 of its bytes (hex).
+///
+/// Everything is on a stream made for it (`ctx.new_stream()`: non-blocking, ordered with no other stream, the NULL stream included, which a green
+/// context does not order against another stream): the copies of the operands, the zeroed `y` and workspace, the convolution, the copy of `y` back
+/// (which waits for that stream alone) and the frees.
+#[allow(unsafe_code)]
+fn run_canary(
+    ctx: &Arc<CudaContext>,
+    handle: &Handle,
+    engine: &Engine,
+    required: u64,
+    problem: &ConvProblem,
+    seed: u64,
+) -> Result<String> {
+    use cudarc::driver::DevicePtr;
+    use sha2::{Digest, Sha256};
+    let stream = ctx.new_stream().map_err(Error::driver("cuStreamCreate"))?;
+    let (x_host, w_host) = canary_operands(problem, seed);
+    let y_bytes = problem.y_dims().iter().product::<u64>() as usize * problem.dtype.size();
+    let x = stream.clone_htod(&x_host).map_err(Error::driver("cuMemcpyHtoDAsync"))?;
+    let w = stream.clone_htod(&w_host).map_err(Error::driver("cuMemcpyHtoDAsync"))?;
+    let mut y = stream.alloc_zeros::<u8>(y_bytes).map_err(Error::driver("cuMemAllocAsync"))?;
+    let mut workspace = if required > 0 {
+        Some(stream.alloc_zeros::<u8>(required as usize).map_err(Error::driver("cuMemAllocAsync"))?)
+    } else {
+        None
+    };
+    {
+        use cudarc::driver::DevicePtrMut;
+        let (x_ptr, _x) = x.device_ptr(&stream);
+        let (w_ptr, _w) = w.device_ptr(&stream);
+        let (y_ptr, _y) = y.device_ptr_mut(&stream);
+        let ws = workspace.as_mut().map(|s| s.device_ptr_mut(&stream));
+        let call = ConvCall { x: x_ptr, w: w_ptr, out: y_ptr, workspace: ws.as_ref().map_or(0, |(p, _)| *p) };
+        ctx.bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+        // SAFETY: the stream is a live stream of the handle's context, current on this thread; the addresses are slices of that context made above with
+        // the sizes of the problem (and the workspace with what the pin needs), alive until the copy back below has waited for the stream.
+        unsafe { run_engine(handle, engine, required, stream.cu_stream(), &call) }?;
+    }
+    let host = stream.clone_dtoh(&y).map_err(Error::driver("cuMemcpyDtoHAsync"))?;
+    drop((x, w, y, workspace));
+    let digest = Sha256::digest(&host);
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Run a pin on `stream`: set the handle's stream, then the legacy call (given `required` bytes of workspace, the entry's whole limit, when it has
+/// one) or the execution of the backend plan.
+///
+/// # Safety
+///
+/// `stream` must be a valid `CUstream` of the handle's context, which is current on this thread, and the addresses of `call` must be device memory of
+/// that context holding what the problem says (the workspace at least `required` bytes, or 0 when the pin needs none), allocated until the work has
+/// completed on `stream`.
+#[allow(unsafe_code)]
+unsafe fn run_engine(
+    handle: &Handle,
+    engine: &Engine,
+    required: u64,
+    stream: cudarc::driver::sys::CUstream,
+    call: &ConvCall,
+) -> Result<()> {
+    // SAFETY: the contract of this function: the stream is a valid stream of the handle's context.
+    unsafe { handle.set_stream(stream) }?;
+    match engine {
+        // SAFETY: the contract of this function; the workspace has `required` bytes, which the call is given.
+        Engine::Legacy { legacy, algo } => unsafe {
+            legacy.forward(
+                handle,
+                *algo,
+                call.x,
+                call.w,
+                call.out,
+                call.workspace,
+                if call.workspace == 0 { 0 } else { required as usize },
+            )
+        },
+        // SAFETY: the contract of this function; the workspace has at least what the plan needs.
+        Engine::Backend { plan, .. } => unsafe {
+            cudnn::execute(handle, plan, call.x, call.w, call.out, call.workspace)
+        },
+    }
 }
 
 /// The addresses of a checked call.
@@ -1162,6 +1366,31 @@ impl Conv {
         self.loaded.sm_count_target
     }
 
+    /// The canary of the entry, which the load ran.
+    pub fn canary(&self) -> Option<&ConvCanary> {
+        self.loaded.canary.as_ref()
+    }
+
+    /// Run the entry's canary again, as the load did: on a stream of its own (never the NULL stream), under the handle's lock, refused
+    /// ([`Error::Manifest`]) when the bytes differ; nothing when the entry has none.
+    pub fn check_canary(&self) -> Result<()> {
+        let Some(canary) = &self.loaded.canary else {
+            return Ok(());
+        };
+        let loaded = &self.loaded;
+        let who = format!("'{}' ({})", loaded.stem, loaded.arch);
+        let guard = loaded.engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (handle, engine) = &*guard;
+        let of = CanaryOf {
+            who: &who,
+            pin: &loaded.pin,
+            cudnn_version: loaded.cudnn_version,
+            problem: &loaded.problem,
+            required: loaded.required,
+        };
+        check_canary(&loaded.context, handle, engine, &of, canary)
+    }
+
     /// The workspace limit of the entry, the size [`Conv::alloc_workspace`] allocates.
     pub fn workspace_bytes(&self) -> u64 {
         self.loaded.workspace_bytes
@@ -1222,26 +1451,9 @@ impl Conv {
     pub(crate) unsafe fn run(&self, stream: cudarc::driver::sys::CUstream, call: &ConvCall) -> Result<()> {
         let guard = self.loaded.engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let (handle, engine) = &*guard;
-        // SAFETY: the contract of this function: the stream is a valid stream of the handle's context.
-        unsafe { handle.set_stream(stream) }?;
-        match engine {
-            // SAFETY: the contract of this function; the workspace has the entry's workspace_bytes (checked), which the call is given.
-            Engine::Legacy { legacy, algo } => unsafe {
-                legacy.forward(
-                    handle,
-                    *algo,
-                    call.x,
-                    call.w,
-                    call.out,
-                    call.workspace,
-                    if call.workspace == 0 { 0 } else { self.loaded.required as usize },
-                )
-            },
-            // SAFETY: the contract of this function; the workspace has at least what the plan needs (checked).
-            Engine::Backend { plan, .. } => unsafe {
-                cudnn::execute(handle, plan, call.x, call.w, call.out, call.workspace)
-            },
-        }
+        // SAFETY: the contract of this function; the workspace has what the pin requires (checked by `check_call`: a legacy call's is the entry's whole
+        // workspace_bytes, which it is given).
+        unsafe { run_engine(handle, engine, self.loaded.required, stream, call) }
     }
 }
 
