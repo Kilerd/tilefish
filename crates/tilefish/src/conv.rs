@@ -964,10 +964,46 @@ enum Engine {
     Backend { plan: Desc, _graph: Graph },
 }
 
+/// The cuDNN handle of a CUDA context, shared by every convolution loaded in that context (from any manifest, alone or in a plan) and alive as long
+/// as the last of them: one `cudnnCreate` per context (which waits for the NULL stream, and allocates memory of its own), as Python has one per
+/// device. Every use of it is under its lock: the descriptors and plans of a load, a canary, and a call, which sets the handle's stream right before it
+/// runs (the stream is state of the handle).
+#[derive(Debug)]
+struct SharedHandle {
+    handle: Mutex<Handle>,
+    /// The context the handle was made in, alive as long as the handle.
+    _context: Arc<CudaContext>,
+}
+
+/// The shared handle of each context that has one alive, by the address of its `CUcontext` (an entry whose handle is gone is replaced; one that is
+/// alive keeps its context, so no other context has that address meanwhile).
+static SHARED_HANDLES: Mutex<Vec<(usize, Weak<SharedHandle>)>> = Mutex::new(Vec::new());
+
+/// The shared handle of `ctx`, made when the context has none alive.
+fn shared_handle(ctx: &Arc<CudaContext>) -> Result<Arc<SharedHandle>> {
+    let key = ctx.cu_ctx() as usize;
+    let mut handles = SHARED_HANDLES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    handles.retain(|(_, weak)| weak.strong_count() > 0);
+    if let Some(found) = handles.iter().find(|(k, _)| *k == key).and_then(|(_, weak)| weak.upgrade()) {
+        return Ok(found);
+    }
+    let shared = Arc::new(SharedHandle { handle: Mutex::new(Handle::new(ctx)?), _context: Arc::clone(ctx) });
+    handles.push((key, Arc::downgrade(&shared)));
+    Ok(shared)
+}
+
+impl SharedHandle {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Handle> {
+        self.handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 #[derive(Debug)]
 struct LoadedConv {
-    // the handle and the engine under one lock: a call sets the handle's stream and runs on it (the stream is state of the handle)
-    engine: Mutex<(Handle, Engine)>,
+    /// The context's cuDNN handle, shared.
+    handle: Arc<SharedHandle>,
+    /// The descriptors or the plan of the pin, used under the handle's lock (and destroyed under it: `Drop`). `None` only while dropped.
+    engine: Option<Engine>,
     context: Arc<CudaContext>,
     device: DeviceInfo,
     /// What the pin needs for the problem (a legacy call is given the entry's `workspace_bytes`, so that is what it requires).
@@ -983,8 +1019,23 @@ struct LoadedConv {
     canary: Option<ConvCanary>,
 }
 
+impl LoadedConv {
+    fn engine(&self) -> &Engine {
+        self.engine.as_ref().expect("the engine of a live convolution")
+    }
+}
+
+impl Drop for LoadedConv {
+    fn drop(&mut self) {
+        // the plan was finalized with the shared handle: destroy it while no other convolution uses the handle
+        let _guard = self.handle.lock();
+        drop(self.engine.take());
+    }
+}
+
 /// A pinned convolution of a manifest, loaded in a context and ready to launch. Cheap to clone; it can be shared between threads (a call
-/// runs under a lock of its own: the handle's stream is its state). It keeps its context and its cuDNN handle alive.
+/// runs under the lock of the context's cuDNN handle, which every convolution of the context shares: the handle's stream is its state). It keeps its
+/// context and that handle alive.
 #[derive(Debug, Clone)]
 pub struct Conv {
     loaded: Arc<LoadedConv>,
@@ -1102,7 +1153,8 @@ fn load(entry: &ConvEntry, ctx: &Arc<CudaContext>) -> Result<LoadedConv> {
             entry.stem, entry.arch, entry.cudnn_version
         )));
     }
-    let handle = Handle::new(ctx)?;
+    let shared = shared_handle(ctx)?;
+    let handle = shared.lock();
     let problem = &entry.problem;
     let head = format!("{who}: the pinned cuDNN {} is not valid for {}", entry.pin.what(), problem.what());
     let refuse = |why: String| Error::Manifest(format!("{head}: {why}"));
@@ -1168,8 +1220,10 @@ fn load(entry: &ConvEntry, ctx: &Arc<CudaContext>) -> Result<LoadedConv> {
         let mine = CanaryOf { who: &who, pin: &entry.pin, cudnn_version: entry.cudnn_version, problem, required };
         check_canary(ctx, &handle, &engine, &mine, canary)?;
     }
+    drop(handle);
     Ok(LoadedConv {
-        engine: Mutex::new((handle, engine)),
+        handle: shared,
+        engine: Some(engine),
         context: Arc::clone(ctx),
         device: DeviceInfo {
             ordinal: ctx.ordinal() as i32,
@@ -1379,8 +1433,7 @@ impl Conv {
         };
         let loaded = &self.loaded;
         let who = format!("'{}' ({})", loaded.stem, loaded.arch);
-        let guard = loaded.engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (handle, engine) = &*guard;
+        let handle = loaded.handle.lock();
         let of = CanaryOf {
             who: &who,
             pin: &loaded.pin,
@@ -1388,7 +1441,12 @@ impl Conv {
             problem: &loaded.problem,
             required: loaded.required,
         };
-        check_canary(&loaded.context, handle, engine, &of, canary)
+        check_canary(&loaded.context, &handle, loaded.engine(), &of, canary)
+    }
+
+    /// Whether this convolution and `other` run with one cuDNN handle: every convolution loaded in one CUDA context does, from any manifest.
+    pub fn shares_cudnn_handle(&self, other: &Conv) -> bool {
+        Arc::ptr_eq(&self.loaded.handle, &other.loaded.handle)
     }
 
     /// The workspace limit of the entry, the size [`Conv::alloc_workspace`] allocates.
@@ -1449,11 +1507,10 @@ impl Conv {
     /// `Conv::check_call` checks of the tensors they came from.
     #[allow(unsafe_code)]
     pub(crate) unsafe fn run(&self, stream: cudarc::driver::sys::CUstream, call: &ConvCall) -> Result<()> {
-        let guard = self.loaded.engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (handle, engine) = &*guard;
+        let handle = self.loaded.handle.lock();
         // SAFETY: the contract of this function; the workspace has what the pin requires (checked by `check_call`: a legacy call's is the entry's whole
         // workspace_bytes, which it is given).
-        unsafe { run_engine(handle, engine, self.loaded.required, stream, call) }
+        unsafe { run_engine(&handle, self.loaded.engine(), self.loaded.required, stream, call) }
     }
 }
 

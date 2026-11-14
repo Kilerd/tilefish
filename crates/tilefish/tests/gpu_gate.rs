@@ -1740,7 +1740,9 @@ fn the_gate_has_cudnn_convolutions() {
 /// against another stream): every convolution of the gate loaded, then, with the NULL stream held by a host function for four seconds, each canary runs
 /// again ([`tilefish::Conv::check_canary`], the code of the load: its copies, its zeroed buffers, the convolution, the copy back, the frees) and passes,
 /// and the NULL stream is still busy when they have (a canary copy there would wait for it, or run after the convolution read the operands, and the
-/// canary would fail). A load itself waits for the NULL stream: `cudnnCreate`, of the handle each load makes, does (printed, measured once: cuDNN's).
+/// canary would fail). Every convolution of the context shares one cuDNN handle, a manifest loaded afterwards too; `cudnnCreate` waits for the NULL
+/// stream, so only the context's first load does: the loads of another manifest, which share the handle (their descriptors, plans and canaries), run
+/// with the NULL stream held and return while it is still held.
 #[test]
 fn the_canary_of_a_load_is_never_on_the_null_stream() {
     extern "C" fn hold(_: *mut c_void) {
@@ -1758,6 +1760,7 @@ fn the_canary_of_a_load_is_never_on_the_null_stream() {
     let loaded: Vec<_> =
         convs.iter().map(|c| manifest.conv(&gpu.ctx, c["stem"].as_str().unwrap(), &[], arch).unwrap()).collect();
     assert!(loaded.iter().all(|c| c.canary().is_some()));
+    assert!(loaded.iter().all(|c| c.shares_cudnn_handle(&loaded[0])), "one cuDNN handle per context");
     let hold_null = || {
         gpu.ctx.bind_to_thread().unwrap();
         // SAFETY: the context is current; the null stream is its legacy default stream; `hold` takes no data.
@@ -1785,19 +1788,26 @@ fn the_canary_of_a_load_is_never_on_the_null_stream() {
         "rust gate: {} canaries ran in {took:?} with the NULL stream held, and none of them waited for it",
         checked.len()
     );
-    // a load of its own (a manifest that has loaded nothing): its handle's creation waits for the NULL stream (cuDNN's, not tilefish's)
+    // the loads of another manifest (which has loaded nothing: its own descriptors, plans and canaries) share the context's handle: no cudnnCreate
     let fresh = Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap();
     hold_null();
     let began = std::time::Instant::now();
-    let load = fresh.conv(&gpu.ctx, convs[0]["stem"].as_str().unwrap(), &[], arch);
+    let loads: Vec<_> = convs.iter().map(|c| fresh.conv(&gpu.ctx, c["stem"].as_str().unwrap(), &[], arch)).collect();
     let took = began.elapsed();
     let busy = null_busy();
     null_wait();
-    assert!(load.is_ok(), "{:?}", load.err());
+    for load in &loads {
+        let conv = load.as_ref().unwrap();
+        assert!(conv.shares_cudnn_handle(&loaded[0]), "{}: the context's handle", conv.stem());
+    }
+    assert!(
+        busy,
+        "the {} loads took {took:?}, and the NULL stream was done when they returned: one of them waited for it",
+        loads.len()
+    );
     println!(
-        "rust gate: a load with the NULL stream held took {took:?} (the NULL stream {} when it returned: cudnnCreate {})",
-        if busy { "was busy" } else { "was done" },
-        if busy { "did not wait for it" } else { "waited for it" }
+        "rust gate: {} loads of another manifest with the NULL stream held took {took:?}, sharing the context's cuDNN handle, and none waited for it",
+        loads.len()
     );
 }
 
