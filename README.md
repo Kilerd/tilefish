@@ -520,6 +520,39 @@ context of the process's first cuBLASLt handle. `sm_count_target=P` pins the alg
 (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`, which every check and run sets too), the same in any context; the entry records it, and a Rust host on a
 partition of `P` SMs takes only pins chosen for it with `Manifest::with_sm_partition(Some(P))` (`docs/manifest-schema-3.md`, section 9.3).
 
+**A pinned cuDNN convolution.** `impl="cudnn.conv_fwd"` declares a forward convolution by its signature, `(x, w) -> y` in the order of `layout`
+(`"NCHW"`, the default: `x [N, C, *S]`, `w [K, C/G, *R]`; `"NHWC"`: `x [N, *S, C]`, `w [K, *R, C/G]`) with one to three spatial axes, f16, bf16 or f32
+data, an f32 accumulator and one rounding, and pins what cuDNN runs for every bucket:
+
+```python
+T = Dim("T", buckets=[64, 646])
+
+# the backend API (the default): an engine configuration, an engine and its knobs, chosen as torch chooses it
+@tilefish.library("conv", impl="cudnn.conv_fwd", layout="NHWC", padding=3)
+def conv(x: Tensor[1, T, 64, f16], w: Tensor[64, 7, 64, f16]) -> Tensor[1, T, 64, f16]: ...
+
+# the legacy API: the algorithm enum of cudnnConvolutionForward, cudnnGetConvolutionForwardAlgorithm_v7's first deterministic answer that fits
+@tilefish.library("down", impl="cudnn.conv_fwd", layout="NHWC", stride=2, padding=1, api="legacy")
+def down(x: Tensor[1, T, 64, f16], w: Tensor[128, 4, 64, f16]) -> Tensor[1, tilefish.cdiv(T, 2), 128, f16]: ...
+```
+
+The declared result must be the convolution's output at every bucket (`(S + 2 * padding - dilation * (R - 1) - 1) // stride + 1`; `cdiv(T, 2)` is that
+here). The math is part of the declaration: `"tensor_op"` (the default of 16-bit data) or `"fma"`, and for f32 data `"fma"` (TF32 off) or `"tf32"`, said
+explicitly. `api="backend"` pins an engine configuration (the engine's global index and every knob choice: it names a kernel) under `heuristic="instant"`,
+torch 2.9's posture with `deterministic = True` and `benchmark = False` (`CUDNN_HEUR_MODE_INSTANT`, then the fallback list, filtered for determinism, no
+down-conversion and, for `"fma"`, no tensor cores), or `"mode_b"`; `api="legacy"` pins the algorithm enum. `algos=tilefish.CudnnTable(arch, sm_count,
+cudnn_version, {(n, c, k, input, filter, stride, padding, dilation, groups): pin})` imports pins instead. The entry records the problem, the math, the pin,
+how it was chosen, the cuDNN version (`cudnnGetVersion()`), the SM count and an `sm_count_target`; `replay` and the Rust host refuse another cuDNN version,
+another SM count and a process with `NVIDIA_TF32_OVERRIDE` set (it changes what cuDNN picks behind the declared math), and vet the pin (a deterministic answer
+of `cudnnGetConvolutionForwardAlgorithm_v7`; an engine of allowed notes whose knobs are in range and whose plan finalizes). There is no bias (torch's cuDNN
+convolution adds it with a separate `add_`, as a tilefish kernel does).
+
+The `"instant"` pin is `torch.nn.functional.conv1d` / `conv2d` / `conv3d`'s bytes where torch runs cuDNN (`test_gpu_conv.py`: 16 problems, three operand sets,
+1-D, 2-D and 3-D, f16, bf16 and f32 with TF32 off, strides, dilations, groups; a B300 MIG slice with torch's cuDNN 9.10.2), and a legacy pin of
+`IMPLICIT_PRECOMP_GEMM` is torch's legacy path's. Both APIs run in launch plans (the workspace is the arena's) and capture in CUDA graphs; the binding is
+ctypes on the `libcudnn` the process has (torch's), and the Rust crate loads cuDNN only for a manifest that has a convolution (`Manifest::conv`, `Conv`). See
+`docs/manifest-schema-3.md`, section 9.4.
+
 ## Masks, indices, gathers and copies
 
 A lowered `@kernel` also compares, selects, counts positions, reduces to an index, and gathers and scatters rows at indices that are device

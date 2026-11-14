@@ -10,7 +10,7 @@ expression grammar, the canonical JSON of the digest, and the launch checks the 
 field that is not mentioned is as in schema 2.
 
 Contents: 1 what changed; 2 the top level; 3 the digest; 4 kernel entries; 5 the ABI (strided views, device scalars, fixed arguments, scratch
-slots, an `out` written over its input, TMA descriptors); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM); 10 strict reading, every
+slots, an `out` written over its input, TMA descriptors); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM, and in 9.4 a pinned cuDNN convolution); 10 strict reading, every
 refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where it is tested.
 
 ## 1. What changed
@@ -33,6 +33,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | kernel entry (0.0.5, crate 0.0.3) | — | an optional `implementation`: which implementation of an operator declared with an implementation per architecture the binary is (section 4.1) |
 | ABI argument kinds (0.0.6, crate 0.0.4) | — | adds `tensordesc`: a TMA descriptor of a tensor (a `CUtensorMap` the host encodes at every launch, passed by value), which takes `1 + 2 * rank` slots of `kernelParams`, so `slot` is where a parameter's slots begin (section 5.5) |
 | kernel entry (0.0.6, crate 0.0.4) | — | an optional `total_num_warps`: the warps of a block of a warp-specialised kernel, whose partitions add warps to the `num_warps` of its default partition; its `block` is `32 * total_num_warps` (section 4.2) |
+| library entry (0.0.6, crate 0.0.4) | — | `impl: "cudnn.conv_fwd"`: a pinned cuDNN forward convolution, an entry of fields of its own (the problem, the math, the pin of the legacy or the backend API and how it was chosen, the cuDNN version, the device) (section 9.4) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -758,6 +759,115 @@ context (torch's, in Python), or else its pins without a target are those of the
 `Gemm::sm_count_target` and `BuiltLibrary.spec.sm_count_target` say the target of a loaded pin. `test_gpu_gemm_sm_target.py` checks the first-handle
 rule and the target in a green context on the GPU it runs on.
 
+### 9.4 A pinned cuDNN convolution: `impl: "cudnn.conv_fwd"` (tilefish 0.0.6, crate 0.0.4)
+
+A `library` entry whose `impl` is `"cudnn.conv_fwd"` is a forward convolution that cuDNN runs, with what cuDNN runs pinned. Its fields are its own (a reader
+dispatches on `impl` first: Python's `tilefish._library.validate_entry` hands it to `tilefish._conv.validate_entry`, the crate reads it into a `ConvEntry`),
+and everything of sections 2 and 3 holds for it: a `(stem, arch)` pair is unique across kernels and every library entry, and the entry is digested whole.
+
+**The operation.** `y = conv(x, w)`, the cross-correlation torch's `conv1d` / `conv2d` / `conv3d` compute, with `G` groups and, per spatial axis (one, two
+or three), a stride, a zero padding on both sides and a dilation:
+
+| layout | `x` | `w` | `y` |
+|---|---|---|---|
+| `NCHW` | `[N, C, *S]` | `[K, C/G, *R]` | `[N, K, *P]` |
+| `NHWC` | `[N, *S, C]` | `[K, *R, C/G]` | `[N, *P, K]` |
+
+`P = (S + 2 * padding - dilation * (R - 1) - 1) // stride + 1` per axis. `x`, `w` and `y` are of one type, `f16`, `bf16` or `f32`, dense in the layout,
+aligned to the entry's `alignment`; the accumulator is f32 (`CUDNN_DATA_FLOAT`) and the result is rounded once; `alpha = 1`, `beta = 0`. There is no
+bias: torch's cuDNN convolution adds its bias with a separate `add_` (an f16 add of the rounded result), which a tilefish kernel does the same way, and a
+bias fused into a backend operation graph would change both the engines that can run it and the roundings. Asymmetric padding and transposed
+convolutions are not offered.
+
+**How cuDNN is called** (`python/src/tilefish/_cudnn.py`, `describe`; the crate's `ConvProblem::describe` gives the same, value for value, on every entry
+of the cross-language vectors). A problem of one spatial axis is posed as one of two whose first spatial axis has size 1 (padding 0, stride 1, dilation 1):
+cuDNN's way, torch's (`conv1d` views `[N, C, L]` as `[N, C, 1, L]`) and what the legacy API's 4-D descriptors take. Every tensor is given in cuDNN's
+order, dims `[N, C, (D,) H, W]` (`[K, C/G, ...]` for `w`), with the strides of the layout (an axis of size 1 has the product of the sizes of the axes
+inside it, as a dense tensor has and as torch's `fixSizeOneDimStride` writes). The convolution is `CUDNN_CROSS_CORRELATION` with the compute type
+`CUDNN_DATA_FLOAT`, the paddings both pre and post. Then, by the API of the pin:
+
+* **legacy** (`cudnnConvolutionForward`): `cudnnSetTensorNdDescriptorEx` with the layout's format (`CUDNN_TENSOR_NCHW` or `_NHWC`) for `x` and `y`,
+  `cudnnSetFilterNdDescriptor` with that format for `w`, `cudnnSetConvolutionNdDescriptor`, `cudnnSetConvolutionGroupCount` and
+  `cudnnSetConvolutionMathType`: `CUDNN_TENSOR_OP_MATH` for the math `"tensor_op"`, `CUDNN_FMA_MATH` for `"fma"`, `CUDNN_DEFAULT_MATH` for `"tf32"`. The
+  call is given a workspace of the entry's `workspace_bytes` at every launch (what the algorithm needs is at most that), so that the call is the same at
+  every launch: whether cuDNN chooses another kernel inside an algorithm for another workspace size is not known, and a pin must not depend on it;
+* **backend** (`cudnnBackendExecute`): three backend tensors (`CUDNN_ATTR_TENSOR_UNIQUE_ID` 120 for `x`, 119 for `w`, 121 for `y`, torch's `'x'`,
+  `'w'`, `'y'`; `CUDNN_ATTR_TENSOR_BYTE_ALIGNMENT` the entry's `alignment`), a convolution descriptor, a `CONVOLUTION_FORWARD` operation (`alpha` and
+  `beta` of `CUDNN_TYPE_FLOAT`) and an operation graph of it; an engine of the pin's global index, knob choices of the pin's `(type, value)` pairs, an
+  engine configuration of them and an execution plan, finalized once when the entry is loaded; a variant pack of the three pointers and the workspace
+  per launch.
+
+**The fields** (exactly these; `sm_count_target` is optional):
+
+| field | type and rule |
+|---|---|
+| `stem`, `op`, `arch`, `abi`, `buckets`, `dims`, `preconditions`, `declaration_digest` | as in a GEMM's entry; `abi.params` are the pointers `x`, `w` (`in`) and `out` (`out`, the name every library result has), of the data type, with the shapes of the layout (an expression entry evaluates to the problem's size under `buckets`); every pointer has one `pointer_alignment` of the entry's `alignment` |
+| `impl` | `"cudnn.conv_fwd"` |
+| `dtypes` | `{"x": T, "w": T, "y": T}`, `T` one of `f16`, `bf16`, `f32` |
+| `compute_type` | `"CUDNN_DATA_FLOAT"` |
+| `math` | `"tensor_op"` or `"fma"` for 16-bit data; `"fma"` (TF32 off) or `"tf32"` for f32 data |
+| `layout` | `"NCHW"` or `"NHWC"` |
+| `n`, `c`, `k`, `groups` | ints from 1 to 2^31 - 1; `groups` divides `c` and `k` |
+| `input`, `filter`, `output`, `stride`, `padding`, `dilation` | lists of one int per spatial axis (1 to 3 of them), `padding` from 0, the others from 1; `output` is the convolution's |
+| `alignment` | 16, 32, 64, 128 or 256: the byte alignment every pointer has and the backend tensors declare |
+| `workspace_bytes` | int from 1 to 2^40: the limit the pin was chosen under, the size a launch provides, and what a legacy call is given |
+| `choice` | how the pin was chosen: `"v7"` (a legacy pin), `"instant"` or `"mode_b"` (a backend pin), or `"imported"` (either) |
+| `pin` | `{"api": "legacy", "algo": a}` with `a` a `cudnnConvolutionFwdAlgo_t` (0 to 7), or `{"api": "backend", "engine": e, "knobs": [[t, v], ...]}` with `e` an engine's global index (from 0), `t` a knob type (0 to 42) and `v` an int64, the pairs sorted by type, each type once |
+| `cudnn_version` | int >= 1: `cudnnGetVersion()` of the library that chose the pin (`91002` for 9.10.2) |
+| `sm_count` | int >= 1: the multiprocessor count of the device the pin was chosen on |
+| `sm_count_target` | *optional*: an int from 1 to `sm_count`, the partition the pin was chosen for; set on the engine (`CUDNN_ATTR_ENGINE_SM_COUNT_TARGET`) of a backend pin at every load; on a legacy pin (the legacy API takes no target) only when it was imported |
+
+**How the pin is chosen** (`@tilefish.library(..., impl="cudnn.conv_fwd", api=..., heuristic=...)`, `python/src/tilefish/_conv.py`):
+
+| `choice` | what is asked |
+|---|---|
+| `"v7"` (legacy; the default of `api="legacy"`) | `cudnnGetConvolutionForwardAlgorithm_v7`, all of its answers, and the first whose status is `CUDNN_STATUS_SUCCESS`, whose determinism is `CUDNN_DETERMINISTIC` and whose `cudnnGetConvolutionForwardWorkspaceSize` is at most `workspace_bytes` |
+| `"instant"` (backend; the default of `api="backend"`) | what torch 2.9 asks with `torch.backends.cudnn.deterministic = True` and `benchmark = False` (`Conv_v8.cpp`, `get_configs_from_heuristics`): the engine configurations of the heuristic in `CUDNN_HEUR_MODE_INSTANT`, then those of `CUDNN_HEUR_MODE_FALLBACK`, each filtered as torch filters them (no numerical note `NONDETERMINISTIC` or `DOWN_CONVERT_INPUTS`; for the math `"fma"` none with `TENSOR_CORE`, torch's `allow_tf32 = False`), and the first whose execution plan finalizes and needs at most `workspace_bytes`. The pin is that configuration's engine and every knob choice of it; the plan made again from the pin must have the heuristic's own plan's `CUDNN_ATTR_EXECUTION_PLAN_JSON_REPRESENTATION` (which names the engine and every knob, the default ones as -1), or nothing is pinned |
+| `"mode_b"` (backend) | the same with `CUDNN_HEUR_MODE_B` first (torch's `TORCH_CUDNN_USE_HEURISTIC_MODE_B`) |
+| `"imported"` | the declaration's `algos=` (`tilefish.CudnnTable(arch, sm_count, cudnn_version, {(n, c, k, input, filter, stride, padding, dilation, groups): pin})`, a pin being an int for the legacy API or `{"engine": e, "knobs": {t: v}}` for the backend) gives it; cuDNN is not asked; a device no table is for is refused at the build. The rows the declaration uses are in its canonical declaration |
+
+The canonical declaration (format 1) has the name, `impl`, `acc`, `workspace_bytes`, the signature, `layout`, `stride`, `padding`, `dilation`, `groups`,
+`math`, `api`, `heuristic`, `alignment`, `sm_count_target` when it has one, and the tables' rows; an entry's `declaration_digest` adds its `sm_count`.
+
+**The checks of a pin**, before it is recorded and when it is loaded (both hosts; Python's `tilefish._cudnn.check_pin`, the crate's `Manifest::conv`): a
+legacy algorithm must be an answer of `cudnnGetConvolutionForwardAlgorithm_v7` for the problem with `CUDNN_STATUS_SUCCESS` and `CUDNN_DETERMINISTIC`, and its
+workspace at most `workspace_bytes`; an engine must be one of the problem's (it finalizes for the operation graph, with the target), its numerical notes
+must pass the filter above (`notes_problem`, the same words in both hosts), its knob choices must be knobs of the engine, each in its
+`CUDNN_ATTR_KNOB_INFO_MINIMUM_VALUE`..`MAXIMUM_VALUE` and on its `STRIDE` (`knobs_problem`), the configuration and the plan must finalize, and the plan's
+workspace must be at most `workspace_bytes`.
+
+**Replay** (and the crate's load), in this order: the entry is found by `(stem, arch)`; the device's SM count must be `sm_count` ("re-export the manifest
+on this device"); Python compares the entry with the declaration (the first difference is named) and the pin's API with the declaration's; the process's
+`cudnnGetVersion()` must be `cudnn_version` (a pin names other kernels in another version; cuDNN has no build number, so two builds of one version are not
+told apart); **a process with `NVIDIA_TF32_OVERRIDE` set, to any value, is refused** ("unset it"): it changes what cuDNN picks and runs behind the
+declared math (measured on the encoder this op was made for), so no pin is made in such a process either; an imported pin must be the table's; then the
+checks of the pin. A Rust host on a partition (`Manifest::with_sm_partition(Some(P))`) takes only an entry chosen for `P` SMs (its `sm_count_target`, or
+its `sm_count` without one), as for a GEMM.
+
+**The workspace and plans.** A launch is given a workspace by the caller, the last tensor (a `u8` vector, 256-byte aligned, overlapping no operand): at
+least what the plan needs for a backend pin, and the entry's whole `workspace_bytes` for a legacy pin (which the call is given). A launch plan's library
+steps take cuDNN convolutions as they take GEMMs: the arena's one workspace buffer is the largest `workspace_bytes` of its library steps, so nothing is
+allocated in a launch. **Capture works with both APIs**: `cudnnConvolutionForward` and `cudnnBackendExecute` were captured in a CUDA graph by torch's
+`torch.cuda.graph` even as the first execution of the process (no warm call), and the replay is the eager call's bytes (measured, cuDNN 9.10.2 on a B300
+MIG slice); the plans' captures of `test_gpu_conv.py` and the Rust gate's `launch_raw` captures replay to Python's bytes.
+
+**What was measured** (`python/tests/test_gpu_conv.py`, a B300 MIG slice of 30 SMs, sm_103, torch 2.9.1 and its cuDNN 9.10.2):
+
+* the `"instant"` pin is torch's bytes (`torch.backends.cudnn.deterministic = True`, `benchmark = False`, TF32 off; NHWC through `conv2d` of channels-last
+  tensors) for 16 problems, three operand sets each, where torch runs cuDNN (`torch._C._select_conv_backend` is `Cudnn`): 1-D NHWC f16 of 1 to 1024 channels
+  with strides 1, 2 and 8, dilations 1, 3 and 9, 1-D NCHW f16 and bf16 with groups (depthwise f16 included), 2-D NHWC and NCHW f16 with a stride and groups,
+  f32 with TF32 off in 1-D, 2-D and 3-D, and f16 with the math `"fma"`. On sm_103 cuDNN 9.10.2's heuristic answers nothing in `CUDNN_HEUR_MODE_INSTANT` (nor
+  in mode B) for these problems, and both torch and tilefish take `CUDNN_HEUR_MODE_FALLBACK`'s list: the posture is still torch's;
+* torch runs some convolutions without cuDNN (a bf16 depthwise one as `CudaDepthwise2d`, an f16 3-D one as `SlowDilated3d`): there a pin runs, repeats
+  its bytes and is the f64 result within one f32 accumulation and one rounding, and there are no cuDNN bytes of torch to compare with;
+* a legacy pin of `CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM` (1) is torch's legacy path (`TORCH_CUDNN_V8_API_DISABLED=1`: with `deterministic`
+  and no benchmark torch runs that algorithm with the math type of its data, `onlyDefaultAlgorithm`) for the f16 and f32 problems; the `"v7"` posture
+  pinned that algorithm for every problem tried;
+* a pin repeats its bytes in the process and in another process; `jit`, `replay`, a plan, its capture and the call alone give the same bytes;
+* an SM count target of the device's count is as none; with targets below it (15 of 30) no engine of these convolutions finalizes in cuDNN 9.10.2 (the
+  heuristic answers nothing, and the engine of the plain pin is `CUDNN_STATUS_NOT_SUPPORTED`), so a declaration with such a target is refused at the build,
+  never run without its target.
+
 ## 10. Strict reading: every refusal
 
 A reader of schema 3 refuses (Python: `TilefishManifestError` unless marked *spec*, which are `TilefishSpecError` of the per-binary compile spec, a
@@ -814,6 +924,13 @@ document tilefish writes next to a build and the host does not read):
   `sm_count`; a form section 9.2 does not list (operands of two types or of
   another type than bf16, f16 and f32, a result of another type than theirs or f32, a bias of another type than the result, a `transa` or `transb`
   other than `T` and `N`, an `lda`, an `ldb`, an `a` or `b` shape or a pointer `dtype` that is not the form's); the opt-in of the other operand type.
+* every `cudnn.conv_fwd` entry (section 9.4): a missing or unknown field; `dtypes` that are not one type of `f16`, `bf16`, `f32`; another `compute_type`;
+  a `math` not of section 9.4 or not of the data type; a `layout` other than `NCHW`/`NHWC`; `n`, `c`, `k`, `groups` not ints from 1, `groups` not dividing
+  `c` and `k`; spatial lists not of one length from 1 to 3, with values out of range, or a problem with no output or too many elements; an `output` that is
+  not the convolution's; an `alignment` not one of 16 to 256, or a `pointer_alignment` precondition of another; a `workspace_bytes` out of range; a
+  `choice` not of the four, or one whose API is not the pin's; a `pin` that is not exactly one of the two forms (an algorithm above 7, a negative engine, a
+  knob type above 42, knobs unsorted or repeated); a `cudnn_version` or `sm_count` that is not a positive int; an `sm_count_target` out of 1..`sm_count`,
+  or on a legacy pin that was not imported; the shapes of `x`, `w`, `out` not the problem's in the layout under the buckets.
 * *spec* only, for prebuilt binaries: a `binary` section that is not `{kind, symbol, shared, digests}`; `attrs` not empty; `launch_params` not every arg
   in order; a `block` that is not three ints from 1 to 1024 with product ≤ 1024; a `constexpr` argument.
 
@@ -906,6 +1023,16 @@ a capture holds them in the kernel node.
   context, aliasing), the stream and context are checked, and the slices are ordered as a kernel's (cudarc's wait and record through the guards of
   `device_ptr`, the owners' wait for the end of the work, a refusal while a stream is capturing). `unsafe Gemm::launch_raw` with regions captures a GEMM.
 
+**Launching a convolution** (`conv.rs`, `ffi/cudnn.rs`). `Manifest::conv(&ctx, name, buckets, arch)` loads a `Conv` once per context and
+`Conv::launch(&stream, &mut [x, w, out, workspace])` runs it (`launch_raw` with regions captures it). Load refuses, in order: a partition the pin was
+not chosen for, a device of another SM count, `NVIDIA_TF32_OVERRIDE` set, a libcudnn that cannot be opened (cudarc's `cudnn` feature, dynamically loaded:
+opened only when a convolution is loaded, so a manifest without one never opens it), another `cudnnGetVersion()`, and a pin that fails the checks of
+section 9.4; it makes the legacy descriptors or the finalized execution plan once. A launch takes the handle's lock (the handle's stream is its state), sets
+the stream and runs; the tensors go through the plan of the entry as a GEMM's do, and the workspace through the same checks, with at least
+`Conv::workspace_required()` bytes (the plan's need, or the whole `workspace_bytes` of a legacy pin). `ConvEntry` holds the reading
+(`problem: ConvProblem`, `pin: ConvPin`, `choice`, `cudnn_version`, `sm_count`, `sm_count_target`); `Manifest::library()` is the GEMMs and
+`Manifest::convolutions()` the convolutions. A launch plan's library step loads whichever its entry is.
+
 **The emitter** (`tilefish.hosts.rust`). It writes a struct for each kernel (Triton or prebuilt: `launch` takes every pointer as a `TensorRef` or `TensorMut`;
 stride scalars and `fixed` arguments are not parameters) and for each library entry (`launch` takes `a`, `b`, `bias`, `out`, `workspace`; `gemm()`, `M`, `N`, `K`,
 `BIAS`, `WORKSPACE_BYTES`, `PINNED_WITH`), with the digest of the manifest embedded. It refuses what the reader refuses. The entries of one stem on several
@@ -931,6 +1058,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 | its optional fields (section 9.1): the posture, imported algorithms, bf16 split-K partial sums | `test_library_options.py`, `test_cublaslt.py`; on a GPU `test_gpu_cublaslt.py` (torch's bytes, the opt-in), `test_gpu_gemm.py` (jit and replay) |
 | f16 operands, an f32 result, the layout NN, `allow_f16_reduction` (section 9.2) | `test_library_f16.py`; on a GPU `test_gpu_gemm_f16.py` (torch's bytes in both layouts, the f64 reference, jit, replay, plans, imported tables, the opt-in) |
 | the layouts TT and NT (section 9.2) | `test_library_layouts.py`; on a GPU `test_gpu_gemm_layouts.py` (torch's bytes for bf16, f16 and f32, the f64 reference, jit, replay, a plan and its capture, an imported table) and the Rust gate |
+| a cuDNN convolution (section 9.4) | `test_library_conv.py` (the declaration, the entry, the reader, a replay's checks, a plan, the emitter, the binding's rules); on a GPU `test_gpu_conv.py` (torch's bytes, torch's legacy path, repeatability across processes, jit, replay, a plan and its capture, imported pins, the refusals, the SM count target) and the Rust gate |
 | f32 operands, TF32 off, `allow_f32_reduction` (section 9.2) | `test_library_f32.py` (the declaration, the vetting rule, the digests of older entries); on a GPU `test_gpu_gemm_f32.py` (torch's bytes in both layouts and two workspace configurations, the TF32 and layout traps, the f64 reference, TF32 and emulation refused, jit, replay, plans, imported tables, the opt-in) |
 | `sm_count_target` (section 9.3) | `test_library_sm_target.py`; on a GPU `test_gpu_gemm_sm_target.py` (a green context: the first-handle rule and the target; the bytes do not depend on the target) |
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
@@ -945,6 +1073,7 @@ The Rust crate (`crates/tilefish/tests/`):
 |---|---|
 | strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs` (the optional fields of section 9.1 and the forms of 9.2 too), `schema3.rs` (synthetic manifests, `common/synthetic.rs`; `implementation` of section 4.1) |
 | the forms of section 9.2: Python's verdict on entries of every form and on each changed in one field | `python_library.rs` (`data/python_library.json`, made by `export_rust_vectors.py`) |
+| the convolutions of section 9.4: Python's verdict on entries of every form and on each changed in one field, the pin and the cuDNN problem each describes | `python_conv.rs` (`data/python_conv.json`, made by `export_rust_vectors.py`); the checks of a call with no GPU: `conv.rs` |
 | views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
 | `tensordesc` (section 5.5): reading, refusals, the slots, the launch checks and the arguments of the encode | `tensor_maps.rs` |

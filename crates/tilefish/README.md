@@ -69,7 +69,13 @@ split-K partial sums in the output with `allow_f32_reduction`
 (`LibraryEntry::allow_f32_reduction`). An entry pinned for a partition of the device's SMs
 (`sm_count_target`) sets that target on every launch, and a host that runs on a
 partition says so with `Manifest::with_sm_partition(Some(sms))`: entries chosen
-for another count are refused. The entry of an operator declared
+for another count are refused. A library entry may also be a pinned cuDNN
+forward convolution (`impl: "cudnn.conv_fwd"`, `Manifest::conv`, `Conv`,
+`ConvEntry`): the pin is a legacy algorithm enum or a backend engine
+configuration (an engine and its knobs), with the cuDNN version that chose it;
+the crate refuses another cuDNN version, another SM count and a process with
+`NVIDIA_TF32_OVERRIDE` set, vets the pin as Python does, and opens libcudnn
+only for a manifest that has a convolution. The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
 which one it is (`Entry::implementation`: its own architecture, or
 `"fallback"`); the crate launches the entry of the device's architecture, as
