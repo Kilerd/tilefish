@@ -156,7 +156,7 @@ not compile:
 
 ```toml
 cudarc = { version = "0.19.10", default-features = false, features = ["driver", "cuda-13000"] }
-tilefish = { version = "0.0.2", default-features = false, features = ["cuda-13000"] }
+tilefish = { version = "0.0.4", default-features = false, features = ["cuda-13000"] }
 ```
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

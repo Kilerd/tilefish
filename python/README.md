@@ -20,10 +20,16 @@ library GEMM runs a pinned cuBLASLt algorithm, and a `@tilefish.graph`
 compiles into a launch plan over one arena (`tilefish.plan`, written to
 `plan.json` by the export) that runs in the same three modes and captures in
 a CUDA graph (`tilefish.capture`). Lowered kernels also compare, select,
-gather and scatter rows and reduce to an index; an extern may be a Gluon
-kernel or have one implementation per architecture; a GEMM's algorithm is
-chosen as torch chooses it or imported; plans exported together share one
-manifest and can share one arena. The `tilefish` crate on crates.io runs the
+gather and scatter rows, reduce to an index, broadcast along any axis and may
+use IEEE f32 math (`math="ieee"`) and `tanh`; `im2col1d` and `col2im1d` are
+generated ops for 1-D convolutions; an extern may be a Gluon kernel, have one
+implementation per architecture, take TMA tensor descriptors (`TensorDesc`)
+and be warp-specialised; a pinned GEMM takes bf16, f16 or f32 operands, an f32
+result, the layouts `TN`, `NN`, `TT` and `NT` and an SM partition, and its
+algorithm is chosen as torch chooses it or imported; a pinned cuDNN forward
+convolution (`cudnn.conv_fwd`) is a library op too; no build makes an IEEE f32
+dot into TF32 tensor-core MMAs; plans exported together share one manifest and
+can share one arena. The `tilefish` crate on crates.io runs the
 same manifest and plan from Rust, and `tilefish.hosts.rust.emit` generates
 typed Rust launchers for it. The API will change.
 
