@@ -209,6 +209,8 @@ class CudnnTable:
     ``pins`` maps a problem, ``(n, c, k, input, filter, stride, padding, dilation, groups)`` (the spatial values as tuples, one entry per spatial
     axis of the declaration: ``(1, 64, 64, (646,), (7,), (1,), (6,), (1,), 1)``), to a pin: an int, the legacy algorithm enum, or ``{"engine": e,
     "knobs": {type: value}}`` (or ``[[type, value], ...]``), a backend engine configuration; the form of every pin of a declaration is its ``api``'s.
+    A knob of the value -1 is cuDNN's 'not set' (how a plan's JSON shows a knob left at the engine's default): it is dropped, so the pin is the same with
+    it or without it (and so is the declaration's digest).
     A declaration with ``algos=`` runs, on a device a table is for, the table's pin for each of its entries after the checks of a pin of the heuristic
     (``tilefish._cudnn.check_pin``), recorded as ``"choice": "imported"``. Rows for other problems are allowed and do not reach a declaration's
     digest."""
@@ -236,7 +238,7 @@ class CudnnTable:
             if row in rows:
                 raise TilefishDeclarationError(f"{where}: two rows are for {row}")
             try:
-                rows[row] = _cudnn.pin_of(pin, f"{where} ({self.arch}, {self.sm_count} SMs) pin for {key}")
+                rows[row] = _cudnn.pin_of(pin, f"{where} ({self.arch}, {self.sm_count} SMs) pin for {key}", imported=True)
             except TilefishRuntimeError as e:
                 raise TilefishDeclarationError(str(e)) from None
         object.__setattr__(self, "pins", rows)

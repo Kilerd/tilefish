@@ -949,6 +949,7 @@ def conv_entries():
             (["choice"], "heuristic"),
             (["pin", "algo" if legacy else "engine"], 9 if legacy else -1),
             (["pin"], {"api": "legacy", "algo": 1, "engine": 0}),
+            (["pin", "knobs"] if not legacy else ["pin", "algo"], [[2, 4], [3, -1]] if not legacy else -1),
             (["pin", "knobs"] if not legacy else ["pin", "algo"], [[3, 0], [2, 4]] if not legacy else 1.0),
             (["cudnn_version"], 0),
             (["sm_count"], 30.0),

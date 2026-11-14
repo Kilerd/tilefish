@@ -49,6 +49,8 @@ const NOTE_TENSOR_CORE: i32 = 0;
 const NOTE_DOWN_CONVERT_INPUTS: i32 = 1;
 const NOTE_NONDETERMINISTIC: i32 = 4;
 const INT32_MAX: u64 = (1 << 31) - 1;
+/// The knob value cuDNN shows for a knob that is not chosen (in a plan's JSON): a pin never has it (Python's `KNOB_UNSET`).
+const KNOB_UNSET: i64 = -1;
 
 /// The order of the tensors' axes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -589,6 +591,12 @@ fn pin_of(raw: &Map<String, Value>) -> std::result::Result<ConvPin, String> {
                 let pair = kv.as_array().filter(|p| p.len() == 2).ok_or_else(bad)?;
                 let t = pair[0].as_i64().ok_or_else(bad)?;
                 let v = pair[1].as_i64().ok_or_else(bad)?;
+                if v == KNOB_UNSET {
+                    return Err(format!(
+                        "knob {t} of a backend cuDNN pin is -1, cuDNN's 'not set' (a plan's JSON shows a knob left at the engine's default so): a \
+                         pin leaves such a knob out (a table's pin drops it when it is imported)"
+                    ));
+                }
                 if !(0..cudnn::KNOB_TYPE_COUNT as i64).contains(&t) {
                     return Err(format!(
                         "a knob type of a backend cuDNN pin is an int from 0 to {}, got {t}",

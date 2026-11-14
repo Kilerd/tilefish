@@ -577,3 +577,28 @@ def test_the_canary_kernels_are_the_host_reference():
         s.synchronize()
         assert _canary.hex_of(*(int(v) for v in sums.cpu())) == _canary.digest_of(data), nbytes
 
+
+def test_a_knob_the_heuristic_leaves_unset_is_left_out_of_the_pin():
+    """cuDNN shows a knob it leaves at the engine's default as -1 among a configuration's choices (measured with cuDNN 9.13.0: engine 23's SPLIT_K_BUF for
+    a stride-8 k16 convolution, 512 to 1024 channels, 646 long). The pin leaves it out: its plan is the heuristic's (the JSON check) and its bytes are
+    torch's. No knob of these engines takes -1 as a value (every KNOB_INFO minimum is 0 or more)."""
+    p = _cudnn.Problem("f16", "NHWC", 1, 512, 1024, 1, (646,), (16,), (8,), (4,), (1,), "tensor_op")
+    lib = _cudnn._lib()
+    h = _cudnn._handle(lib, 0)
+    with h.lock:
+        graph = _cudnn._Graph(lib, h.handle, p)
+        try:
+            configs = [cfg for mode in _cudnn.HEUR_MODES["instant"] for cfg in graph.heuristic(mode, None)]
+            raw = [graph.config_knobs(cfg) for cfg in configs]
+            minimums = [lo for cfg in configs for lo, _, _ in graph.engine_facts(graph.config_engine(cfg))["knobs"].values()]
+        finally:
+            graph.close()
+    assert min(minimums, default=0) >= 0
+    pinned = _cudnn.pin_conv(p, heuristic="instant", workspace_bytes=1 << 30)
+    assert all(v != -1 for _, v in pinned.pin.knobs)
+    unset = [t for t, v in raw[0] if v == -1] if raw else []
+    if unset:
+        assert set(dict(raw[0])) - set(dict(pinned.pin.knobs)) == set(unset)
+    print(f"\nthe heuristic's first configuration leaves knobs {unset} unset (-1); the pin is {pinned.pin.what}")
+    x, w = tensors(p, 4)
+    assert same_bytes(ours(p, pinned.pin, x, w, 1 << 30), torch_conv(p, x, w))

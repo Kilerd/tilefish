@@ -353,6 +353,30 @@ def test_an_entry_may_have_a_canary_and_the_reader_holds_its_form():
     refuses(e, lambda e: e.update(canary={"seed": 1, "y_sha256": "0f" * 32}), "a canary of tilefish's first form .* is no longer read: export the manifest again")
 
 
+def test_a_knob_of_minus_one_is_not_set_an_imported_pin_drops_it_and_a_pin_never_has_it():
+    """-1 is cuDNN's 'not set' (a plan's JSON shows a knob left at the engine's default so): a table's pin drops it, so the pin, the entry and the
+    declaration's digest are the same with it or without it, and the pin written to an entry reads back the same; a pin or an entry with it is
+    refused."""
+    key = (1, 64, 64, (646,), (7,), (1,), (3,), (1,), 1)
+    plain = CudnnTable("sm_103", SMS, VERSION, {key: {"engine": 23, "knobs": {3: 0}}})
+    unset = CudnnTable("sm_103", SMS, VERSION, {key: {"engine": 23, "knobs": {12: -1, 3: 0}}})
+    assert unset.pins[key] == plain.pins[key] == _cudnn.EnginePin(23, ((3, 0),))
+    assert CudnnTable("sm_103", SMS, VERSION, {key: {"engine": 23, "knobs": [[12, -1]]}}).pins[key] == _cudnn.EnginePin(23)
+
+    def k7(x: Tensor[1, 646, 64, f16], w: Tensor[64, 7, 64, f16]) -> Tensor[1, 646, 64, f16]: ...
+
+    a = conv("k7", layout="NHWC", padding=3, algos=plain)(k7)
+    b = conv("k7", layout="NHWC", padding=3, algos=unset)(k7)
+    assert _conv.declaration_digest(a) == _conv.declaration_digest(b)
+    entry = _conv.BuiltConv(_conv.conv_specs(b)[0], "sm_103", unset.pins[key], VERSION, SMS).entry()
+    assert entry["pin"] == {"api": "backend", "engine": 23, "knobs": [[3, 0]]}
+    validate_entry(entry)
+    assert _cudnn.pin_of(json.loads(json.dumps(entry["pin"]))) == unset.pins[key]  # the round trip
+    with pytest.raises(TilefishRuntimeError, match="knob 12 of a backend cuDNN pin is -1, cuDNN's 'not set'"):
+        _cudnn.EnginePin(23, ((3, 0), (12, -1)))
+    refuses(entry, lambda e: e["pin"].update(knobs=[[3, 0], [12, -1]]), "knob 12 of a backend cuDNN pin is -1")
+
+
 def test_the_canary_ptx_is_the_crates():
     """The PTX of the canary's kernels is one text in both hosts: the Python package's constant and the crate's ``src/canary.ptx``."""
     from conftest import REPO_ROOT

@@ -216,6 +216,7 @@ NOTE_NAMES = {
 # cudnnBackendBehaviorNote_t
 BEHAVIOR_NAMES = {0: "RUNTIME_COMPILATION", 1: "REQUIRES_FILTER_INT8x32_REORDER", 2: "REQUIRES_BIAS_INT8x32_REORDER", 3: "SUPPORTS_CUDA_GRAPH_NATIVE_API"}
 KNOB_TYPE_COUNT = 43  # CUDNN_KNOB_TYPE_COUNTS in 9.10.2: knob types are 0 to 42
+KNOB_UNSET = -1  # a knob value cuDNN shows for a knob not chosen (a plan's JSON): an imported pin drops it, a pin never has it
 MAX_NOTES = 16
 
 
@@ -468,6 +469,11 @@ class EnginePin:
                 raise TilefishRuntimeError(f"a knob type of a backend cuDNN pin is an int from 0 to {KNOB_TYPE_COUNT - 1}, got {t!r}")
             if isinstance(v, bool) or not isinstance(v, int) or not -(1 << 63) <= v <= INT64_MAX:
                 raise TilefishRuntimeError(f"a knob value of a backend cuDNN pin is an int64, got {v!r}")
+            if v == KNOB_UNSET:
+                raise TilefishRuntimeError(
+                    f"knob {t} of a backend cuDNN pin is -1, cuDNN's 'not set' (a plan's JSON shows a knob left at the engine's default so): a pin "
+                    "leaves such a knob out (a table's pin drops it when it is imported)"
+                )
         types = [t for t, _ in knobs]
         if types != sorted(set(types)):
             raise TilefishRuntimeError(f"the knobs of a backend cuDNN pin are sorted by type, each type once, got {list(knobs)}")
@@ -484,9 +490,15 @@ class EnginePin:
         return f"engine {self.engine} with knobs {[list(kv) for kv in self.knobs]}"
 
 
-def pin_of(value: object, what: str = "a cuDNN pin") -> "LegacyPin | EnginePin":
+def unset_dropped(pairs: "tuple[Any, ...]") -> "tuple[Any, ...]":
+    """Knob choices without those of the value -1, cuDNN's 'not set' (the engine's default): what an imported pin keeps."""
+    return tuple(kv for kv in pairs if not (isinstance(kv, (list, tuple)) and len(kv) == 2 and kv[1] == KNOB_UNSET and not isinstance(kv[1], bool)))
+
+
+def pin_of(value: object, what: str = "a cuDNN pin", imported: bool = False) -> "LegacyPin | EnginePin":
     """A pin from what an entry or a table holds: ``{"api": "legacy", "algo": a}``, ``{"api": "backend", "engine": e, "knobs": [[t, v], ...]}``; for
-    a table also an int (a legacy algorithm) or ``{"engine": e, "knobs": {t: v} or [[t, v], ...]}``. Pure."""
+    a table also an int (a legacy algorithm) or ``{"engine": e, "knobs": {t: v} or [[t, v], ...]}``. With ``imported`` (a table's pin) a knob of the
+    value -1, cuDNN's 'not set', is dropped (the engine's default is what it says); in an entry it is refused (:class:`EnginePin`). Pure."""
     if isinstance(value, (LegacyPin, EnginePin)):
         return value
     if isinstance(value, int) and not isinstance(value, bool):
@@ -508,6 +520,8 @@ def pin_of(value: object, what: str = "a cuDNN pin") -> "LegacyPin | EnginePin":
             pairs = tuple(tuple(kv) if isinstance(kv, (list, tuple)) else kv for kv in knobs)  # type: ignore[misc]
         else:
             raise TilefishRuntimeError(f"{what}: the knobs are a list of [type, value] pairs, got {knobs!r}")
+        if imported:
+            pairs = unset_dropped(pairs)
         return EnginePin(value["engine"], pairs)  # type: ignore[arg-type]
     raise TilefishRuntimeError(f"{what}: api is 'legacy' or 'backend', got {api!r}")
 
@@ -1171,7 +1185,7 @@ def pin_conv(
                     need = graph.workspace(plan)
                     if need > limit:
                         continue
-                    pin = EnginePin(facts["engine"], graph.config_knobs(config))
+                    pin = EnginePin(facts["engine"], unset_dropped(graph.config_knobs(config)))
                     json_text = graph.b.json_of(plan)
                     checked = _check_backend(graph, pin, problem, limit, target)
                     if checked[1] and json_text and checked[1] != json_text:
