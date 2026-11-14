@@ -494,8 +494,8 @@ impl Gemm {
         &self.plan
     }
 
-    /// The sizes of the problem in tilefish's row-major terms: `a` is `[m, k]`, `b` is `[n, k]` (`[k, n]` for [`GemmLayout::Nn`]), `out` is
-    /// `[m, n]`.
+    /// The sizes of the problem in tilefish's row-major terms: `a` is `[m, k]` (`[k, m]` for [`GemmLayout::Tt`] and [`GemmLayout::Nt`]), `b` is
+    /// `[n, k]` (`[k, n]` for [`GemmLayout::Nn`] and [`GemmLayout::Nt`]), `out` is `[m, n]`.
     pub fn sizes(&self) -> (u64, u64, u64) {
         (self.loaded.m, self.loaded.n, self.loaded.k)
     }
@@ -515,7 +515,8 @@ impl Gemm {
         self.loaded.form.out
     }
 
-    /// How `b` is stored: `[n, k]` ([`GemmLayout::Tn`]) or `[k, n]` ([`GemmLayout::Nn`]).
+    /// How `b` and `a` are stored: `b` `[n, k]` ([`GemmLayout::Tn`], [`GemmLayout::Tt`]) or `[k, n]` ([`GemmLayout::Nn`], [`GemmLayout::Nt`]),
+    /// `a` `[m, k]` (TN, NN) or `[k, m]` (TT, NT).
     pub fn layout(&self) -> GemmLayout {
         self.loaded.form.layout
     }
@@ -593,7 +594,7 @@ impl Gemm {
 
     /// Check the call and run the GEMM on `stream`.
     ///
-    /// `tensors` are `a` `[m, k]`, `b` `[n, k]` (`[k, n]` for [`GemmLayout::Nn`]), `bias` `[n]` (for `gemm_bias`), `out` `[m, n]` (written)
+    /// `tensors` are `a` `[m, k]` (`[k, m]` for TT and NT), `b` `[n, k]` (`[k, n]` for NN and NT), `bias` `[n]` (for `gemm_bias`), `out` `[m, n]` (written)
     /// and the workspace (written), in this order: tensors of the entry's dtypes but the workspace, which is bytes, contiguous, 16-byte aligned
     /// (the workspace 256), with the entry's static sizes and bucket exactly. The stream must be a stream of the context the GEMM was loaded in (checked); that context is made current on
     /// this thread, as cudarc does for its own calls. The launch is asynchronous: `stream` orders it with the host's other work.
@@ -648,12 +649,10 @@ impl Checks<'_> {
         // the operands: shapes bound to the entry's dimensions, the exact bucket, dtype, contiguity, alignment, device and context, aliasing
         self.plan.prepare(operand_args, Some(self.device))?;
         // (the entry's shapes agree with m, n, k, and its dimensions are bucketed to them: a defense for the memory the library reads)
-        let (m, n, k) = (self.m as usize, self.n as usize, self.k as usize);
-        let b_shape = match self.layout {
-            GemmLayout::Tn => vec![n, k],
-            GemmLayout::Nn => vec![k, n],
-        };
-        let mut wanted: Vec<Vec<usize>> = vec![vec![m, k], b_shape.clone()];
+        let (m, n) = (self.m as usize, self.n as usize);
+        let a_shape = self.layout.a_shape(self.m, self.k).map(|d| d as usize).to_vec();
+        let b_shape = self.layout.b_shape(self.n, self.k).map(|d| d as usize).to_vec();
+        let mut wanted: Vec<Vec<usize>> = vec![a_shape.clone(), b_shape.clone()];
         if self.bias {
             wanted.push(vec![n]);
         }
@@ -664,8 +663,8 @@ impl Checks<'_> {
                     PreconditionKind::Shape,
                     None,
                     format!(
-                        "'{stem}': an operand has shape {:?}, but the problem is a [{m}, {k}] by [{}, {}] GEMM",
-                        arg.shape, b_shape[0], b_shape[1]
+                        "'{stem}': an operand has shape {:?}, but the problem is a [{}, {}] by [{}, {}] GEMM",
+                        arg.shape, a_shape[0], a_shape[1], b_shape[0], b_shape[1]
                     ),
                 ));
             }

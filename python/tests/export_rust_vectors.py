@@ -733,7 +733,7 @@ def launches_json():
 
 
 def library_entries():
-    """``library`` entries of every form (bf16, f16 or f32 operands, a result of their type or f32, a bias, the layouts TN and NN, the opt-ins) as
+    """``library`` entries of every form (bf16, f16 or f32 operands, a result of their type or f32, a bias, the layouts TN, NN, TT and NT, the opt-ins) as
     ``tilefish._library`` writes them, and each changed in one field, with what Python's strict reader (``validate_entry``) decides: accepted,
     with the form it reads (operand type, result type, layout, the opt-ins of bf16 and f16, the SM count target, the opt-in of f32), or refused.
     The Rust reader must decide the same (``tests/python_library.rs``)."""
@@ -747,15 +747,16 @@ def library_entries():
     t = {"bf16": bf16, "f16": f16, "f32": f32}
 
     def declare(dtype, out, layout, bias, n=1536, k=1024, **kw):
-        b_shape = (n, k) if layout == "TN" else (k, n)
+        b_shape = (n, k) if layout[0] == "T" else (k, n)
+        a_shape = (M, k) if layout[1] == "N" else (k, M)
         name = f"g_{dtype}_{out}_{layout.lower()}{'_bias' if bias else ''}"
         if bias:
 
-            def fn(a: Tensor[M, k, t[dtype]], b: Tensor[b_shape[0], b_shape[1], t[dtype]], bias: Tensor[n, t[out]]) -> Tensor[M, n, t[out]]: ...
+            def fn(a: Tensor[a_shape[0], a_shape[1], t[dtype]], b: Tensor[b_shape[0], b_shape[1], t[dtype]], bias: Tensor[n, t[out]]) -> Tensor[M, n, t[out]]: ...
 
         else:
 
-            def fn(a: Tensor[M, k, t[dtype]], b: Tensor[b_shape[0], b_shape[1], t[dtype]]) -> Tensor[M, n, t[out]]: ...
+            def fn(a: Tensor[a_shape[0], a_shape[1], t[dtype]], b: Tensor[b_shape[0], b_shape[1], t[dtype]]) -> Tensor[M, n, t[out]]: ...
 
         impl = "cublaslt.gemm_bias" if bias else "cublaslt.gemm"
         return tilefish.library(name, acc=f32, impl=impl, layout=layout, **kw)(fn)
@@ -772,6 +773,13 @@ def library_entries():
         declare("f32", "f32", "TN", False),
         declare("f32", "f32", "NN", True, allow_f32_reduction=True),
         declare("f32", "f32", "TN", True, n=96, k=9),
+        # the layouts with a stored [K, M]: every operand type
+        declare("bf16", "bf16", "TT", False),
+        declare("f16", "f16", "NT", True),
+        declare("f16", "f32", "TT", True, allow_f16_reduction=True),
+        declare("bf16", "f32", "NT", False, n=96, k=9),
+        declare("f32", "f32", "TT", False, allow_f32_reduction=True),
+        declare("f32", "f32", "NT", True),
     ]
     goods = [BuiltLibrary(library_specs(op)[0], "sm_103", "0123456789abcdef" * 8, 120804, 30).entry() for op in ops]
 
@@ -789,10 +797,14 @@ def library_entries():
     cases = list(goods)
     for good in goods:
         nn = good["transa"] == "N"
+        at = good["transb"] == "T"
         for path, value in [
             (["transa"], "T" if nn else "N"),
-            (["transb"], "T"),
+            (["transb"], "N" if at else "T"),
+            (["transb"], "X"),
             (["lda"], good["k"] if nn else good["n"]),
+            (["ldb"], good["k"] if at else good["m"]),
+            (["abi", "params", 0, "shape"], list(reversed(good["abi"]["params"][0]["shape"]))),
             (["dtypes", "a"], "f16" if good["dtypes"]["a"] == "bf16" else "bf16"),
             (["dtypes", "b"], "f32" if good["dtypes"]["a"] != "f32" else "f16"),
             (["dtypes", "out"], "bf16" if good["dtypes"]["out"] != "bf16" else "f16"),

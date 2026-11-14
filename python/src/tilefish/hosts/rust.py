@@ -1007,10 +1007,12 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
     a, b = (g.arg_names[p["name"]] for p in g.params[:2])
     out = g.arg_names[g.params[-1]["name"]]
     dtype, out_dtype = e["dtypes"]["a"], e["dtypes"]["out"]
-    nn = e["transa"] == "N"  # the layout NN: b is [k, n] and is not transposed
+    nn = e["transa"] == "N"  # the layouts NN and NT: b is [k, n] and is not transposed
+    at = e["transb"] == "T"  # the layouts TT and NT: a is [k, m] and is transposed
     lines.append("")
     lines += _wrap(
-        f"It computes `{out}[{m}, {n}] = {a}[{m}, {k}] @ "
+        f"It computes `{out}[{m}, {n}] = "
+        + (f"{a}[{k}, {m}]^T @ " if at else f"{a}[{m}, {k}] @ ")
         + (f"{b}[{k}, {n}]" if nn else f"{b}[{n}, {k}]^T")
         + (f" + {g.arg_names[g.params[2]['name']]}[{n}]" if bias else "")
         + f"` on {dtype} operands with an f32 accumulator, and rounds to {out_dtype} once"
@@ -1089,16 +1091,20 @@ def _render_gemm(g: _Gemm) -> str:
     rows = ", ".join("&[" + ", ".join(_rs_str(str(d)) for d in p["shape"]) + "]" for p in g.params)
     out.append("    /// The declared shape of each tensor (not the workspace), in the order of `launch`, as dimension expressions (a number is a size baked in).\n")
     out.append(f"    pub const SHAPES: &'static [&'static [&'static str]] = &[{rows}];\n")
-    out.append("    /// Rows of `a` and of the result.\n")
+    layout = e["transa"] + e["transb"]
+    if e["transb"] == "N":
+        out.append("    /// Rows of `a` and of the result.\n")
+    else:
+        out.append(f"    /// Columns of `a` (`[K, M]`: the layout {layout}), and rows of the result.\n")
     out.append(f"    pub const M: usize = {e['m']};\n")
     if e["transa"] == "N":
-        out.append("    /// Columns of `b` (`[K, N]`: the layout NN), and of the result.\n")
+        out.append(f"    /// Columns of `b` (`[K, N]`: the layout {layout}), and of the result.\n")
         out.append(f"    pub const N: usize = {e['n']};\n")
-        out.append("    /// The columns of `a` and the rows of `b`.\n")
+        out.append("    /// The columns of `a` and the rows of `b`.\n" if e["transb"] == "N" else "    /// The rows of `a` and of `b`.\n")
     else:
         out.append("    /// Rows of `b`, and columns of the result.\n")
         out.append(f"    pub const N: usize = {e['n']};\n")
-        out.append("    /// The columns of `a` and of `b`.\n")
+        out.append("    /// The columns of `a` and of `b`.\n" if e["transb"] == "N" else "    /// The rows of `a` and the columns of `b`.\n")
     out.append(f"    pub const K: usize = {e['k']};\n")
     out.append("    /// Whether the GEMM adds a bias.\n")
     out.append(f"    pub const BIAS: bool = {'true' if bias else 'false'};\n")

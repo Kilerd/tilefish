@@ -20,13 +20,15 @@ fn gemm(bias: bool, m: u64, n: u64, k: u64) -> Value {
 }
 
 /// The entry Python writes for a GEMM of `dtype` operands, an `out` result (and bias), in `layout` (`"TN"`: `b` is `[n, k]`; `"NN"`:
-/// `b` is `[k, n]`).
+/// `b` is `[k, n]`; `"TT"` and `"NT"`: those, and `a` is `[k, m]`).
 fn gemm_of(bias: bool, m: u64, n: u64, k: u64, dtype: &str, out: &str, layout: &str) -> Value {
     let op = if bias { "gemm_bias" } else { "gemm" };
-    let nn = layout == "NN";
+    let nn = layout.starts_with('N');
+    let at = layout.ends_with('T');
     let ptr = |i: usize, name: &str, dtype: &str, access: &str, shape: Value| json!({"index": i, "name": name, "kind": "pointer", "dtype": dtype, "access": access, "shape": shape});
     let b_shape = if nn { [k, n] } else { [n, k] };
-    let mut params = vec![ptr(0, "a", dtype, "in", json!(["M", k])), ptr(1, "b", dtype, "in", json!(b_shape))];
+    let a_shape = if at { json!([k, "M"]) } else { json!(["M", k]) };
+    let mut params = vec![ptr(0, "a", dtype, "in", a_shape), ptr(1, "b", dtype, "in", json!(b_shape))];
     if bias {
         params.push(ptr(2, "bias", out, "in", json!([n])));
     }
@@ -37,7 +39,7 @@ fn gemm_of(bias: bool, m: u64, n: u64, k: u64, dtype: &str, out: &str, layout: &
     let statics = |pres: &mut Vec<Value>, i: usize, name: &str, axis: usize, value: u64| {
         pres.push(json!({"kind": "static_size", "arg": name, "index": i, "axis": axis, "value": value}));
     };
-    statics(&mut pres, 0, "a", 1, k);
+    statics(&mut pres, 0, "a", if at { 0 } else { 1 }, k);
     statics(&mut pres, 1, "b", 0, b_shape[0]);
     statics(&mut pres, 1, "b", 1, b_shape[1]);
     if bias {
@@ -54,8 +56,8 @@ fn gemm_of(bias: bool, m: u64, n: u64, k: u64, dtype: &str, out: &str, layout: &
         "abi": {"params": params}, "buckets": {"M": m},
         "dims": {"M": {"buckets": [32, 64, 320], "bucket": m}},
         "preconditions": pres, "dtypes": dtypes,
-        "compute_type": "CUBLAS_COMPUTE_32F", "scale_type": "CUDA_R_32F", "transa": if nn { "N" } else { "T" }, "transb": "N",
-        "m": m, "n": n, "k": k, "lda": if nn { n } else { k }, "ldb": k, "ldc": n, "ldd": n,
+        "compute_type": "CUBLAS_COMPUTE_32F", "scale_type": "CUDA_R_32F", "transa": if nn { "N" } else { "T" }, "transb": if at { "T" } else { "N" },
+        "m": m, "n": n, "k": k, "lda": if nn { n } else { k }, "ldb": if at { m } else { k }, "ldc": n, "ldd": n,
         "epilogue": if bias { "bias" } else { "none" }, "workspace_bytes": 8519680,
         "algo": ALGO, "cublaslt_version": 120804, "sm_count": 30, "declaration_digest": "a".repeat(64),
     })
@@ -230,7 +232,7 @@ fn a_stem_and_an_architecture_are_unique_across_kernels_and_library_together() {
 #[test]
 fn a_library_entry_that_is_not_what_python_writes_is_refused() {
     type Change = fn(&mut Value);
-    let cases: [(&str, Change, &str); 35] = [
+    let cases: [(&str, Change, &str); 36] = [
         ("an unknown field", |e| e["note"] = 1.into(), "unknown field"),
         (
             "a missing field",
@@ -247,8 +249,10 @@ fn a_library_entry_that_is_not_what_python_writes_is_refused() {
         ("m as a float", |e| e["m"] = 32.0.into(), "m must be an int"),
         ("lda that is not k", |e| e["lda"] = 8.into(), "leading dimensions must be"),
         ("ldd that is not n", |e| e["ldd"] = 1.into(), "leading dimensions must be"),
-        ("transa X", |e| e["transa"] = "X".into(), "transa and transb must be"),
-        ("transb T", |e| e["transb"] = "T".into(), "transa and transb must be"),
+        ("transa X", |e| e["transa"] = "X".into(), "transa and transb must each be \"T\" or \"N\""),
+        ("transb X", |e| e["transb"] = "X".into(), "transa and transb must each be \"T\" or \"N\""),
+        // T, T is the layout TT, whose ldb is m
+        ("transb T", |e| e["transb"] = "T".into(), "the leading dimensions of the layout TT must be lda = k, ldb = m"),
         ("another compute type", |e| e["compute_type"] = "CUBLAS_COMPUTE_16F".into(), "compute_type and scale_type"),
         ("another scale type", |e| e["scale_type"] = "CUDA_R_16F".into(), "compute_type and scale_type"),
         ("an epilogue that is not the impl's", |e| e["epilogue"] = "bias".into(), "the epilogue of"),
@@ -422,6 +426,73 @@ fn an_entry_of_f16_operands_an_f32_result_or_the_layout_nn_is_read_with_its_type
     );
 }
 
+/// The layouts TT and NT (`a` stored `[k, m]`) are read from `transa`, `transb` and the leading dimensions, for every operand type, and their
+/// plan binds `a` as `[K, M]`.
+#[test]
+fn an_entry_of_the_layout_tt_or_nt_is_read_and_binds_a_as_k_by_m() {
+    let entries = [
+        gemm_of(true, 32, 3072, 1024, "f16", "f16", "TT"),
+        gemm_of(false, 64, 3072, 1024, "bf16", "f32", "NT"),
+        gemm_of(true, 320, 96, 9, "f32", "f32", "NT"),
+    ];
+    let manifest = read(&[], &entries).unwrap();
+    let tt = manifest.library_entry("gemm_bias.M32", "sm_103").unwrap();
+    assert_eq!((tt.dtype, tt.out_dtype, tt.layout), (DType::F16, DType::F16, GemmLayout::Tt));
+    let nt = manifest.library_entry("gemm.M64", "sm_103").unwrap();
+    assert_eq!((nt.dtype, nt.out_dtype, nt.layout), (DType::Bf16, DType::F32, GemmLayout::Nt));
+    let f32_nt = manifest.library_entry("gemm_bias.M320", "sm_103").unwrap();
+    assert_eq!((f32_nt.dtype, f32_nt.layout, f32_nt.m, f32_nt.n, f32_nt.k), (DType::F32, GemmLayout::Nt, 320, 96, 9));
+    for (layout, word, lda, ldb, a, b) in [
+        (GemmLayout::Tn, "TN", 1024, 1024, [64, 1024], [3072, 1024]),
+        (GemmLayout::Nn, "NN", 3072, 1024, [64, 1024], [1024, 3072]),
+        (GemmLayout::Tt, "TT", 1024, 64, [1024, 64], [3072, 1024]),
+        (GemmLayout::Nt, "NT", 3072, 64, [1024, 64], [1024, 3072]),
+    ] {
+        assert_eq!(
+            (
+                layout.as_str(),
+                layout.lda(3072, 1024),
+                layout.ldb(64, 1024),
+                layout.a_shape(64, 1024),
+                layout.b_shape(3072, 1024)
+            ),
+            (word, lda, ldb, a, b)
+        );
+        assert_eq!((layout.b_transposed(), layout.a_transposed()), (word.starts_with('T'), word.ends_with('T')));
+    }
+    let plan = manifest.library_plan("gemm", &[("M", 64)], Arch::sm(103)).unwrap();
+    let at = |x: u64| 0x7000_0000_0000 + x * 0x1000_0000;
+    let typed = |addr: u64, shape: &'static [usize], dtype: DType, access: Access| {
+        let bytes = shape.iter().product::<usize>() as u64 * dtype.size() as u64;
+        // SAFETY: nothing is dereferenced: `prepare` only looks at the numbers.
+        let region = unsafe { DevicePtr::from_raw(addr, bytes, 0) };
+        TensorArg::new(region, shape, dtype, access).unwrap()
+    };
+    let call = |a: &'static [usize]| {
+        plan.prepare(
+            &[
+                typed(at(0), a, DType::Bf16, Access::In),
+                typed(at(1), &[1024, 3072], DType::Bf16, Access::In),
+                typed(at(2), &[64, 3072], DType::F32, Access::Out),
+            ],
+            None,
+        )
+    };
+    assert!(call(&[1024, 64]).is_ok());
+    let e = call(&[64, 1024]).unwrap_err();
+    assert_eq!(e.precondition_kind(), Some(PreconditionKind::StaticSize), "a given as [M, K] to an NT GEMM: {e}");
+    // the leading dimensions of a stored [k, m]: ldb = k is refused, with the rule in Python's words
+    let mut wrong = gemm_of(false, 64, 3072, 1024, "bf16", "f32", "NT");
+    wrong["ldb"] = 1024.into();
+    assert!(refusal(&[], &[wrong]).contains(
+        "the leading dimensions of the layout NT must be lda = n, ldb = m and ldc = ldd = n (cuBLAS sees b [k, n] as its A, a [k, m] as its B \
+         and the result as C and D)"
+    ));
+    let mut wrong = gemm_of(true, 32, 3072, 1024, "f16", "f16", "TT");
+    wrong["abi"]["params"][0]["shape"] = json!(["M", 1024]);
+    assert!(refusal(&[], &[wrong]).contains("m, n and k say"));
+}
+
 /// The plan of a GEMM of the layout NN binds `b` as `[K, N]` and takes tensors of the entry's dtypes.
 #[test]
 fn the_operands_of_an_nn_gemm_are_bound_as_k_by_n_and_of_the_entrys_dtypes() {
@@ -469,9 +540,9 @@ fn an_entry_whose_types_or_layout_disagree_is_refused() {
         ),
         ("TN with the lda of NN", |e| e["transa"] = "T".into(), "the leading dimensions must be lda = ldb = k"),
         (
-            "transb T",
+            "transb T: the layout NT, whose ldb is m",
             |e| e["transb"] = "T".into(),
-            "transa and transb must be \"T\" and \"N\" (b is [n, k]) or \"N\" and \"N\"",
+            "the leading dimensions of the layout NT must be lda = n, ldb = m and ldc = ldd = n (cuBLAS sees b [k, n] as its A, a [k, m] as its B",
         ),
         ("b of another type", |e| e["dtypes"]["b"] = "bf16".into(), "dtypes must be"),
         ("an f32 bias with an f16 result", |e| e["dtypes"]["bias"] = "f32".into(), "dtypes must be"),

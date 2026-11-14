@@ -62,7 +62,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   64 MiB of workspace, f16 operands with an f32 result and bias, bf16 operands in ``NN`` with an f32 result, f16 operands in ``TN`` pinned for
   a partition of 16 SMs (``sm_count_target=16``, which the Rust host sets on every launch too), and f32 operands with TF32 off: in ``TN``, in
   ``TN`` with a bias, in ``NN`` with a bias under ``heuristic="torch"`` with ``allow_f32_reduction`` (checked here to be ``torch.addmm``'s bytes in
-  f32) and in ``TN`` under ``heuristic="torch"`` (checked to be ``torch.mm``'s);
+  f32) and in ``TN`` under ``heuristic="torch"`` (checked to be ``torch.mm``'s); and ``a`` stored ``[K, M]``: bf16 in ``TT`` under
+  ``heuristic="torch"`` (checked to be ``torch.mm(a.t(), b.t())``'s bytes), f16 in ``NT`` with a bias, f32 in ``TT`` with ``K = 8`` under
+  ``heuristic="torch"`` (``torch.mm``'s bytes) and f32 in ``NT`` with a bias;
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
   exported and run through Python's plan replay; ``crates/tilefish/tests/gpu_plan_gate.rs`` launches and captures each case, and ``compare`` holds the
@@ -752,6 +754,11 @@ F16_FORMS = {
     "gemm_f32_tn_bias": ("f32", "f32", "TN", True, 1024, 3072, {"workspace_bytes": 64 << 20}),
     "gemm_f32_nn_bias": ("f32", "f32", "NN", True, 1536, 7168, {"heuristic": "torch", "allow_f32_reduction": True}),
     "gemm_f32_tn_torch": ("f32", "f32", "TN", False, 1024, 4096, {"heuristic": "torch", "allow_f32_reduction": True}),
+    # a stored [K, M] (the layouts TT and NT), of every operand type
+    "gemm_bf16_tt": ("bf16", "bf16", "TT", False, 1024, 1024, {"heuristic": "torch", "allow_bf16_reduction": True}),
+    "gemm_f16_nt_bias": ("f16", "f16", "NT", True, 1536, 3072, {}),
+    "gemm_f32_tt_k8": ("f32", "f32", "TT", False, 1024, 8, {"heuristic": "torch", "allow_f32_reduction": True}),
+    "gemm_f32_nt": ("f32", "f32", "NT", True, 96, 672, {}),
 }
 
 
@@ -764,15 +771,16 @@ def f16_ops():
     out = {}
     for name, (dtype, result, layout, bias, n, k, kw) in F16_FORMS.items():
         t, d = types[dtype], types[result]
-        b0, b1 = (n, k) if layout == "TN" else (k, n)
+        b0, b1 = (n, k) if layout[0] == "T" else (k, n)
+        a0, a1 = (M, k) if layout[1] == "N" else (k, M)
         impl = "cublaslt.gemm_bias" if bias else "cublaslt.gemm"
         if bias:
 
-            def fn(a: Tensor[M, k, t], b: Tensor[b0, b1, t], bias: Tensor[n, d]) -> Tensor[M, n, d]: ...
+            def fn(a: Tensor[a0, a1, t], b: Tensor[b0, b1, t], bias: Tensor[n, d]) -> Tensor[M, n, d]: ...
 
         else:
 
-            def fn(a: Tensor[M, k, t], b: Tensor[b0, b1, t]) -> Tensor[M, n, d]: ...
+            def fn(a: Tensor[a0, a1, t], b: Tensor[b0, b1, t]) -> Tensor[M, n, d]: ...
 
         out[name] = tilefish.library(name, acc=f32, impl=impl, layout=layout, **kw)(fn)
     return out
@@ -781,8 +789,8 @@ def f16_ops():
 def f16_operands(name, m, seed):
     dtype, result, layout, bias, n, k, _ = F16_FORMS[name]
     t, d = TORCH_OF[dtype], TORCH_OF[result]
-    a = randn((m, k), t, seed + m)
-    b = randn((n, k) if layout == "TN" else (k, n), t, seed + m + 1, scale=1 / k**0.5)
+    a = randn((m, k) if layout[1] == "N" else (k, m), t, seed + m)
+    b = randn((n, k) if layout[0] == "T" else (k, n), t, seed + m + 1, scale=1 / k**0.5)
     return (a, b, randn((n,), d, seed + m + 2)) if bias else (a, b)
 
 
@@ -791,7 +799,8 @@ def must_be_torchs(layout):
 
     def check(args, got):
         a, b, *bias = args
-        rhs = b.t() if layout == "TN" else b
+        rhs = b.t() if layout[0] == "T" else b
+        a = a if layout[1] == "N" else a.t()  # a stored [K, M]: torch's mm of the transposed view
         tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
         try:

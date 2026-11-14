@@ -178,7 +178,7 @@ class LibraryOp(Op):
 
     With ``impl="cublaslt.gemm"`` (or ``"cublaslt.gemm_bias"``) it is also a pinned cuBLASLt GEMM that ``tilefish.run`` runs and
     ``tilefish.runtime.export`` writes to the ``library`` section of a manifest: ``out[M, N] = a[M, K] @ b[N, K]^T`` (``b[K, N]`` without the
-    transpose for ``layout="NN"``; ``+ bias[N]``), bf16, f16 or f32 operands with an f32 accumulator and one rounding to the result's type (theirs,
+    transpose for ``layout="NN"`` and ``"NT"``, ``a[K, M]`` transposed for ``"TT"`` and ``"NT"``; ``+ bias[N]``), bf16, f16 or f32 operands with an f32 accumulator and one rounding to the result's type (theirs,
     or f32; f32 operands are multiplied as f32, TF32 off), the algorithm the heuristic ranks first under a ``workspace_bytes`` limit and a ``heuristic`` posture (or the one an imported table,
     ``algos``, gives), recorded with the cuBLASLt version (see :mod:`tilefish._library`). Without ``impl`` it is a signature only.
     """
@@ -240,8 +240,9 @@ def library(
     operands are multiplied as f32, with TF32 off (``CUBLAS_COMPUTE_32F``, and an algorithm that reads its inputs as TF32 or in 16-bit pieces is
     refused). The layout and how its algorithm is chosen are part of the declaration:
 
-    * ``layout``: ``"TN"`` (the default: ``b`` is ``[N, K]``, as a weight of ``torch.nn.Linear``) or ``"NN"`` (``b`` is ``Tensor[K, N, T]``, and
-      the result is ``a @ b``), named by the transposes cuBLASLt is called with;
+    * ``layout``: ``"TN"`` (the default: ``b`` is ``[N, K]``, as a weight of ``torch.nn.Linear``), ``"NN"`` (``b`` is ``Tensor[K, N, T]``, and
+      the result is ``a @ b``), ``"TT"`` or ``"NT"`` (those ``b``, and ``a`` is ``Tensor[K, M, T]``: the result is ``a^T @ b^T`` or ``a^T @ b``),
+      named by the transposes cuBLASLt is called with (``transa`` for ``b``, ``transb`` for ``a``);
     * ``heuristic``: the posture cuBLASLt's heuristic is asked under, ``"tilefish"`` (the default: 16-byte alignment minimums) or ``"torch"``
       (what torch's ``addmm`` asks: the workspace limit alone, so the heuristic answers what ``torch.addmm`` / ``torch.mm`` run);
     * ``workspace_bytes``: the workspace limit (default 8 519 680, torch's ``CUBLAS_WORKSPACE_CONFIG``; under ``"torch"`` 1 048 576 for

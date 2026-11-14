@@ -483,6 +483,18 @@ The opt-in to split-K partial sums in the output type is named by the operands' 
 operand sets each, measured on a B300 MIG slice with cuBLASLt 12.8.4). An `AlgoTable` row of the layout `NN` is keyed `(m, n, k, bias, "NN")`; a
 configuration is encoded with the declaration's types. The entry says the form in `dtypes`, `transa` and `lda` (`docs/manifest-schema-3.md`, section 9.2).
 
+**`a` stored `[K, M]`.** `layout="TT"` takes `a: Tensor[K, M, T]` with `b: Tensor[N, K, T]` and computes `a.T @ b.T`; `layout="NT"` takes it with
+`b: Tensor[K, N, T]` and computes `a.T @ b`, for every operand type above:
+
+```python
+@tilefish.library("scores", acc=f32, impl="cublaslt.gemm", layout="TT", heuristic="torch", allow_f32_reduction=True)
+def scores(a: Tensor[8, M, f32], b: Tensor[1024, 8, f32]) -> Tensor[M, 1024, f32]: ...   # torch.mm(a.t(), b.t()), TF32 off, byte for byte
+```
+
+Under `heuristic="torch"` the pin is what torch runs for `torch.mm(a.t(), b.t())` / `torch.mm(a.t(), b)` and `torch.addmm` of a contiguous `a [K, M]`, byte
+for byte, for bf16, f16 and f32 (`test_gpu_gemm_layouts.py`, `M` from 2 to 2048; at `M = 1` torch multiplies `a [K, 1]` as the contiguous `[1, K]` it also
+is, so a one-row GEMM is declared `TN` or `NN`). The entry says it in `transb` and `ldb` (`docs/manifest-schema-3.md`, section 9.2).
+
 **f32, TF32 off.** f32 operands have an f32 result (and an f32 bias), and are multiplied as f32:
 
 ```python

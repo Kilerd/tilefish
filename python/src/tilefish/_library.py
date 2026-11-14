@@ -3,11 +3,13 @@
 ``@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")`` declares an operation by its signature and says which library
 routine runs it. For ``impl="cublaslt.gemm"`` the signature is ``(a: Tensor[M, K, T], b: Tensor[N, K, T]) -> Tensor[M, N, D]``
 and for ``"cublaslt.gemm_bias"`` it has a third parameter ``bias: Tensor[N, D]``, where ``T`` is ``bf16``, ``f16`` or ``f32`` and ``D`` is ``T``
-or ``f32`` (``f32`` for ``f32`` operands). With ``layout="NN"`` (the default is ``"TN"``) ``b`` is ``Tensor[K, N, T]``. Semantics, in tilefish's
-row-major terms:
+or ``f32`` (``f32`` for ``f32`` operands). With ``layout="NN"`` (the default is ``"TN"``) ``b`` is ``Tensor[K, N, T]``, and with ``"TT"`` and
+``"NT"`` ``a`` is ``Tensor[K, M, T]`` (stored transposed) with the ``b`` of ``"TN"`` and ``"NN"``. Semantics, in tilefish's row-major terms:
 
     out[M, N] = a[M, K] @ b[N, K]^T        (+ bias[N])          layout "TN"
     out[M, N] = a[M, K] @ b[K, N]          (+ bias[N])          layout "NN"
+    out[M, N] = a[K, M]^T @ b[N, K]^T      (+ bias[N])          layout "TT"
+    out[M, N] = a[K, M]^T @ b[K, N]        (+ bias[N])          layout "NT"
 
 with an f32 accumulator and **one** rounding, to ``D``, at the end; the bias goes through ``CUBLASLT_EPILOGUE_BIAS``, so it is added in
 f32 to the accumulator before that rounding (cuBLASLt takes a bias of the result's type only: measured, :mod:`tilefish._cublaslt`). f32 operands
@@ -69,7 +71,9 @@ DIGEST_FORMAT = 2  # of the canonical declaration below (2: the digest of an ent
 COMPUTE_TYPE = "CUBLAS_COMPUTE_32F"
 SCALE_TYPE = "CUDA_R_32F"
 TRANSA, TRANSB = "T", "N"  # cuBLAS is column-major: its A operand is tilefish's b (op T), its B operand is tilefish's a (op N); the layout TN
-LAYOUTS = ("TN", "NN")  # transa then transb as cuBLASLt is called: b is [N, K] for TN (transa T, lda = k), [K, N] for NN (transa N, lda = n)
+# transa then transb as cuBLASLt is called: b is [N, K] for transa T (lda = k), [K, N] for transa N (lda = n); a is [M, K] for transb N (ldb = k),
+# [K, M] for transb T (ldb = m)
+LAYOUTS = ("TN", "NN", "TT", "NT")
 OPERAND_DTYPES = ("bf16", "f16", "f32")  # of a and b; the result (and a bias) is of their type or f32 (f32 for f32 operands)
 
 _ALGO = re.compile(r"^[0-9a-f]{128}\Z")
@@ -103,6 +107,43 @@ def table_key(m: int, n: int, k: int, bias: bool, layout: str = "TN") -> "tuple[
     return (m, n, k, bias) if layout == "TN" else (m, n, k, bias, layout)
 
 
+def a_dims(layout: str) -> str:
+    """How ``a`` is stored in ``layout``, as a message says it: ``"M, K"`` (``TN``, ``NN``) or ``"K, M"`` (``TT``, ``NT``)."""
+    return "M, K" if layout[1] == "N" else "K, M"
+
+
+def b_dims(layout: str) -> str:
+    """How ``b`` is stored in ``layout``, as a message says it: ``"N, K"`` (``TN``, ``TT``) or ``"K, N"`` (``NN``, ``NT``)."""
+    return "N, K" if layout[0] == "T" else "K, N"
+
+
+def operand_shapes(layout: str, m: Any, n: Any, k: Any) -> "tuple[tuple[Any, Any], tuple[Any, Any]]":
+    """The shapes of ``a`` and of ``b`` of the problem ``m``, ``n``, ``k`` in ``layout``."""
+    a = (m, k) if layout[1] == "N" else (k, m)
+    b = (n, k) if layout[0] == "T" else (k, n)
+    return a, b
+
+
+def leading_dimensions(layout: str, m: int, n: int, k: int) -> "tuple[int, int, int, int]":
+    """``lda``, ``ldb``, ``ldc``, ``ldd`` as cuBLASLt is called: ``lda`` is ``k`` for ``b [n, k]`` and ``n`` for ``b [k, n]``, ``ldb`` is ``k`` for
+    ``a [m, k]`` and ``m`` for ``a [k, m]``, and the result is ``n x m`` column-major."""
+    return (k if layout[0] == "T" else n, k if layout[1] == "N" else m, n, n)
+
+
+def leading_dimensions_rule(layout: str) -> str:
+    """The rule of :func:`leading_dimensions` in the words a refusal uses (tilefish 0.0.5's for ``TN``, 0.0.6's for ``NN``)."""
+    if layout == "TN":
+        return "the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)"
+    lda = "k" if layout[0] == "T" else "n"
+    ldb = "k" if layout[1] == "N" else "m"
+    b = "b" if layout[0] == "T" else "b [k, n]"
+    a = "a" if layout[1] == "N" else "a [k, m]"
+    return (
+        f"the leading dimensions of the layout {layout} must be lda = {lda}, ldb = {ldb} and ldc = ldd = n (cuBLAS sees {b} as its A, {a} as its B "
+        "and the result as C and D)"
+    )
+
+
 def default_workspace_bytes(impl: str, heuristic: str) -> int:
     """The workspace limit of a declaration that gives none: torch's ``addmm`` limit for a biased GEMM under the ``"torch"`` posture, torch's
     cuBLAS workspace otherwise."""
@@ -122,7 +163,8 @@ class AlgoTable:
     ``stages_id``, ``inner_shape_id``, ``cluster_shape_id``: what ``cublasLtMatmulAlgoConfigGetAttribute`` reads back, and what
     ``tilefish._cublaslt.algo_info`` returns), which is encoded as cuBLASLt itself encodes it (with the operand and result types of the
     declaration that uses it: a configuration has no types), or the 128 hex digits of a pin (which have them: the checks refuse a pin of other
-    types). A key of another layout than ``TN`` says it: ``(m, n, k, bias, "NN")`` (``(m, n, k, bias, "TN")`` is ``(m, n, k, bias)``). A declaration
+    types). A key of another layout than ``TN`` says it: ``(m, n, k, bias, "NN")``, ``"TT"`` or ``"NT"`` (``(m, n, k, bias, "TN")`` is
+    ``(m, n, k, bias)``). A declaration
     with ``algos=`` runs, on a device a table is for, the table's algorithm for each of its entries, after the same checks as a pin of the
     heuristic (the bytes are what cuBLASLt encodes, the capabilities of the id, ``cublasLtMatmulAlgoCheck`` for the problem, the workspace limit,
     and a split-K reduction in the output type only with the opt-in of the operands' type); it is recorded in the entry as
@@ -237,7 +279,8 @@ def check_options(
             raise TilefishDeclarationError(f"{where}: {flag} must be a bool, got {value!r}")
     if layout not in LAYOUTS:
         raise TilefishDeclarationError(
-            f"{where}: layout must be one of {list(LAYOUTS)} (TN: b is [N, K], out = a @ b^T; NN: b is [K, N], out = a @ b), got {layout!r}"
+            f"{where}: layout must be one of {list(LAYOUTS)} (TN: b is [N, K], out = a @ b^T; NN: b is [K, N], out = a @ b; TT and NT: a is [K, M], "
+            f"out = a^T @ b^T and a^T @ b), got {layout!r}"
         )
     if sm_count_target is not None:
         from ._cublaslt import INT32_MAX, MIN_SM_COUNT_TARGET
@@ -274,12 +317,12 @@ def check_declaration(
     bias = IMPLS[impl]
     params = list(sig.params)
     want = 3 if bias else 2
-    b_text = "b: Tensor[N, K, T]" if layout == "TN" else "b: Tensor[K, N, T]"
+    b_text = f"b: Tensor[{b_dims(layout)}, T]"
     if len(params) != want or any(p.kind != "tensor" or p.access != "in" or p.strided or p.is_devscalar for p in params):
         raise TilefishDeclarationError(
             f"{where}: {impl} takes {want} input tensors "
-            f"(a: Tensor[M, K, T], {b_text}{', bias: Tensor[N, D]' if bias else ''}), and returns Tensor[M, N, D], where T is bf16, f16 or f32 and D "
-            f"is T or f32 (layout {layout}); the signature is {sig}"
+            f"(a: Tensor[{a_dims(layout)}, T], {b_text}{', bias: Tensor[N, D]' if bias else ''}), and returns Tensor[M, N, D], where T is bf16, f16 or "
+            f"f32 and D is T or f32 (layout {layout}); the signature is {sig}"
         )
     if len(sig.returns) != 1 or sig.tensor_outputs:
         raise TilefishDeclarationError(f"{where}: {impl} returns exactly one tensor, Tensor[M, N, D] (not an Out parameter)")
@@ -305,12 +348,16 @@ def check_declaration(
             raise TilefishDeclarationError(
                 f"{where}: bias must be a {out.dtype.name} tensor of rank 1, the type of the result (cuBLASLt takes no other bias type), got {bt}"  # type: ignore[union-attr]
             )
-    m, k = a.shape[0], a.shape[1]  # type: ignore[union-attr]
-    n, b_k = (b.shape[0], b.shape[1]) if layout == "TN" else (b.shape[1], b.shape[0])  # type: ignore[union-attr]
+    m, k = (a.shape[0], a.shape[1]) if layout[1] == "N" else (a.shape[1], a.shape[0])  # type: ignore[union-attr]
+    n, b_k = (b.shape[0], b.shape[1]) if layout[0] == "T" else (b.shape[1], b.shape[0])  # type: ignore[union-attr]
     if b_k != k:
         if layout == "TN":
             raise TilefishDeclarationError(f"{where}: a is [M, K] and b is [N, K]: their last axes must be the same ({k} vs {b_k})")
-        raise TilefishDeclarationError(f"{where}: a is [M, K] and b is [K, N] (layout NN): the last axis of a and the first of b must be the same ({k} vs {b_k})")
+        a_axis, b_axis = ("last" if layout[1] == "N" else "first"), ("last" if layout[0] == "T" else "first")
+        axes = f"their {a_axis} axes" if a_axis == b_axis else f"the {a_axis} axis of a and the {b_axis} of b"
+        raise TilefishDeclarationError(
+            f"{where}: a is [{a_dims(layout)}] and b is [{b_dims(layout)}] (layout {layout}): {axes} must be the same ({k} vs {b_k})"
+        )
     if tuple(out.shape) != (m, n) or (bias and params[2].type.shape != (n,)):  # type: ignore[union-attr]
         raise TilefishDeclarationError(f"{where}: the result must be [M, N] = [{m}, {n}]" + (f" and bias [N] = [{n}]" if bias else ""))
     for flag, value in zip(OPT_INS, (allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)):
@@ -353,11 +400,14 @@ def layout_of(op: "LibraryOp") -> str:
 
 
 def _mnk_exprs(op: "LibraryOp") -> "tuple[DimExpr, DimExpr, DimExpr]":
-    """The dimension expressions of ``m``, ``n`` and ``k`` of a library op: ``a`` is ``[M, K]``, ``b`` is ``[N, K]`` (TN) or ``[K, N]`` (NN)."""
+    """The dimension expressions of ``m``, ``n`` and ``k`` of a library op: ``a`` is ``[M, K]`` (TN, NN) or ``[K, M]`` (TT, NT), ``b`` is ``[N, K]``
+    (TN, TT) or ``[K, N]`` (NN, NT)."""
     sig = op.signature
-    m_expr, k_expr = sig.params[0].type.shape  # type: ignore[union-attr]
+    layout = layout_of(op)
+    a_shape = sig.params[0].type.shape  # type: ignore[union-attr]
+    m_expr, k_expr = (a_shape[0], a_shape[1]) if layout[1] == "N" else (a_shape[1], a_shape[0])
     b_shape = sig.params[1].type.shape  # type: ignore[union-attr]
-    n_expr = b_shape[0] if layout_of(op) == "TN" else b_shape[1]
+    n_expr = b_shape[0] if layout[0] == "T" else b_shape[1]
     return m_expr, n_expr, k_expr
 
 
@@ -469,7 +519,7 @@ class LibrarySpec:
     algos: "tuple[AlgoTable, ...] | None" = None  # imported algorithms, one table per device
     dtype: str = "bf16"  # of a and b
     out_dtype: str = "bf16"  # of the result and of a bias
-    layout: str = "TN"  # TN: b is [n, k]; NN: b is [k, n]
+    layout: str = "TN"  # TN: b is [n, k]; NN: b is [k, n]; TT and NT: those, and a is [k, m]
     allow_f16_reduction: bool = False  # whether split-K may add its partial sums in the output type (the opt-in of f16 operands)
     sm_count_target: "int | None" = None  # the SM count the heuristic is asked for (CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET), None: the device's
     allow_f32_reduction: bool = False  # whether split-K may add its partial sums in the output (the opt-in of f32 operands)
@@ -523,10 +573,7 @@ class LibrarySpec:
             "m": self.m,
             "n": self.n,
             "k": self.k,
-            "lda": self.k if self.layout == "TN" else self.n,
-            "ldb": self.k,
-            "ldc": self.n,
-            "ldd": self.n,
+            **dict(zip(("lda", "ldb", "ldc", "ldd"), leading_dimensions(self.layout, self.m, self.n, self.k))),
             "epilogue": "bias" if self.bias else "none",
             "workspace_bytes": self.workspace_bytes,
             "sm_count": sm_count,
@@ -839,9 +886,10 @@ def validate_entry(entry: Any, index: int = 0) -> None:
     """Strict reading of one entry of the manifest's ``library`` section (raises :class:`~tilefish.errors.TilefishManifestError`).
 
     Every field must be present and exactly typed, and the redundant ones must agree: the dtypes are a pair of operand types (``bf16``, ``f16``
-    or ``f32``) with a result of their type or ``f32`` (and a bias of the result's type); ``transa`` says the layout (``T``: ``b`` is ``[n, k]`` and
-    ``lda = k``; ``N``: ``b`` is ``[k, n]`` and ``lda = n``); the other leading dimensions and the shapes of the operands follow from ``impl``,
-    ``m``, ``n`` and ``k``; the opt-in, if any, is the one of the operands' type.
+    or ``f32``) with a result of their type or ``f32`` (and a bias of the result's type); ``transa`` and ``transb`` say the layout (``transa`` ``T``:
+    ``b`` is ``[n, k]`` and ``lda = k``, ``N``: ``b`` is ``[k, n]`` and ``lda = n``; ``transb`` ``N``: ``a`` is ``[m, k]`` and ``ldb = k``, ``T``:
+    ``a`` is ``[k, m]`` and ``ldb = m``); the other leading dimensions and the shapes of the operands follow from ``impl``, ``m``, ``n`` and ``k``;
+    the opt-in, if any, is the one of the operands' type.
     """
     where = f"#{index}"
     if not isinstance(entry, dict):
@@ -877,12 +925,13 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         m, n, k = entry["m"], entry["n"], entry["k"]
         layout = f"{entry['transa']}{entry['transb']}" if isinstance(entry["transa"], str) and isinstance(entry["transb"], str) else None
         if layout not in LAYOUTS:
-            _bad(where, f"transa and transb must be 'T' and 'N' (b is [n, k]) or 'N' and 'N' (b is [k, n]), got {entry['transa']!r} and {entry['transb']!r}")
-        lda = k if layout == "TN" else n
-        if (entry["lda"], entry["ldb"], entry["ldc"], entry["ldd"]) != (lda, k, n, n):
-            if layout == "TN":
-                _bad(where, "the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)")
-            _bad(where, "the leading dimensions of the layout NN must be lda = n, ldb = k and ldc = ldd = n (cuBLAS sees b [k, n] as its A, a as its B and the result as C and D)")
+            _bad(
+                where,
+                f"transa and transb must each be 'T' or 'N' (transa 'T': b is [n, k], 'N': b is [k, n]; transb 'N': a is [m, k], 'T': a is [k, m]), "
+                f"got {entry['transa']!r} and {entry['transb']!r}",
+            )
+        if (entry["lda"], entry["ldb"], entry["ldc"], entry["ldd"]) != leading_dimensions(layout, m, n, k):
+            _bad(where, leading_dimensions_rule(layout))
         if entry["compute_type"] != COMPUTE_TYPE or entry["scale_type"] != SCALE_TYPE:
             _bad(where, f"compute_type and scale_type must be {COMPUTE_TYPE!r} and {SCALE_TYPE!r}")
         if entry["epilogue"] != ("bias" if bias else "none"):
@@ -923,12 +972,13 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         for name, value in buckets.items():
             sv._ident(name, "bucket dimension name")
             sv._int(value, f"bucket value of {name}", 1)
-        # the operands: a [M, K], b [N, K] (TN) or [K, N] (NN), [bias [N]], out [M, N], in this order, each of its type in dtypes
+        # the operands: a [M, K] (TN, NN) or [K, M] (TT, NT), b [N, K] (TN, TT) or [K, N] (NN, NT), [bias [N]], out [M, N], in this order, each of
+        # its type in dtypes
         abi = entry["abi"]
         sv._keys(abi, "abi", ["params"])
         params = abi["params"]
         names = ["a", "b"] + (["bias"] if bias else []) + ["out"]
-        expected_shapes = [(m, k), (n, k) if layout == "TN" else (k, n)] + ([(n,)] if bias else []) + [(m, n)]
+        expected_shapes = [*operand_shapes(layout, m, n, k)] + ([(n,)] if bias else []) + [(m, n)]
         expected_dtypes = [dtype, dtype] + ([out_dtype] if bias else []) + [out_dtype]
         if not isinstance(params, list) or len(params) != len(names):
             _bad(where, f"abi.params must list {len(names)} pointers ({', '.join(names)} in this order)")
@@ -1054,12 +1104,13 @@ _TORCH_DTYPES = {"bf16": "bfloat16", "f16": "float16", "f32": "float32"}
 
 
 def reference_gemm(tensors: "dict[str, Any]", layout: str = "TN", out_dtype: "str | None" = None) -> Any:
-    """The result in torch, as the semantics say: an f32 matmul of the operands (``b`` transposed for the layout ``TN``), the bias added in f32,
-    one rounding to ``out_dtype`` (the operands' type when ``None``)."""
+    """The result in torch, as the semantics say: an f32 matmul of the operands (``b`` transposed for the layouts ``TN`` and ``TT``, ``a`` for ``TT``
+    and ``NT``), the bias added in f32, one rounding to ``out_dtype`` (the operands' type when ``None``)."""
     import torch
 
     a, b, *rest = tensors.values()
-    acc = a.to(torch.float32) @ (b.to(torch.float32).t() if layout == "TN" else b.to(torch.float32))
+    lhs = a.to(torch.float32) if layout[1] == "N" else a.to(torch.float32).t()
+    acc = lhs @ (b.to(torch.float32).t() if layout[0] == "T" else b.to(torch.float32))
     if rest:
         acc = acc + rest[0].to(torch.float32)
     return acc.to(a.dtype if out_dtype is None else getattr(torch, _TORCH_DTYPES[out_dtype]))

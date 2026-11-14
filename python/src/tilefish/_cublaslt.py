@@ -4,6 +4,8 @@ The operation, in tilefish terms (row-major, contiguous, every pointer 16-byte a
 
     D[M, N] = A[M, K] @ B[N, K]^T          (+ bias[N])          the layout "TN" (the default)
     D[M, N] = A[M, K] @ B[K, N]            (+ bias[N])          the layout "NN"
+    D[M, N] = A[K, M]^T @ B[N, K]^T        (+ bias[N])          the layout "TT"
+    D[M, N] = A[K, M]^T @ B[K, N]          (+ bias[N])          the layout "NT"
 
 ``A`` and ``B`` are bf16, f16 or f32 (both the same), ``D`` is of their type or f32 (f32 for f32 operands; a :class:`Form`), the accumulator is
 f32, and the result is rounded to the type of ``D`` once, at the end (the bias, of the type of ``D``, is added in f32 to the accumulator before that
@@ -23,13 +25,14 @@ every algorithm needs (:func:`numerics_problems`).
 cuBLASLt is column-major, so the problem is posed as a gemm of ``m = N``, ``n = M``, ``k = K`` in cuBLAS terms (the layout names the
 transposes as cuBLASLt is called, ``transa`` then ``transb``):
 
-* the "A operand" is tilefish's ``B``: for ``TN``, ``[N, K]`` row-major is ``K x N`` column-major, ``lda = K``, used with ``transa = T``; for ``NN``,
-  ``[K, N]`` row-major is ``N x K`` column-major, ``lda = N``, used with ``transa = N``;
-* the "B operand" is tilefish's ``A`` (``[M, K]`` row-major is ``K x M`` column-major, ``ldb = K``) with ``transb = N``,
+* the "A operand" is tilefish's ``B``: for ``TN`` and ``TT``, ``[N, K]`` row-major is ``K x N`` column-major, ``lda = K``, used with ``transa = T``;
+  for ``NN`` and ``NT``, ``[K, N]`` row-major is ``N x K`` column-major, ``lda = N``, used with ``transa = N``;
+* the "B operand" is tilefish's ``A``: for ``TN`` and ``NN``, ``[M, K]`` row-major is ``K x M`` column-major, ``ldb = K``, used with ``transb = N``;
+  for ``TT`` and ``NT``, ``[K, M]`` row-major is ``M x K`` column-major, ``ldb = M``, used with ``transb = T``;
 * ``D`` is tilefish's ``D`` (``[M, N]`` row-major is ``N x M`` column-major, ``ldd = N``); the ``C`` layout is the ``D`` layout.
 
-The two other layouts, an ``A`` stored ``[K, M]`` (``transb = T``, ``ldb = M``) with either ``B``, are the same code with two more rows of the
-table; they are not offered because nothing has needed them.
+The first letter of a layout says how ``B`` is stored and the second how ``A`` is (``N``: as the product reads it), as cuBLASLt's ``transa`` and
+``transb`` do.
 
 The library is the ``libcublasLt`` the process already has mapped (torch's, from the ``nvidia-cublas`` wheel): it is
 found in ``/proc/self/maps`` and opened by that path, so the dynamic loader hands back the mapping that is there and no
@@ -194,14 +197,17 @@ BF16_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_INPLACE, CUBLASLT_REDUCTION_
 
 
 OPERAND_DTYPES = ("bf16", "f16", "f32")  # the types of A and B (both the same); f32 operands have an f32 result
-LAYOUTS = ("TN", "NN")  # the transposes as cuBLASLt is called (transa, transb): B is [N, K] for TN, [K, N] for NN
+# the transposes as cuBLASLt is called (transa, transb): B is [N, K] for a first T, [K, N] for a first N; A is [M, K] for a second N, [K, M] for a
+# second T (tilefish 0.0.5 had TN only, 0.0.6 added NN, then TT and NT)
+LAYOUTS = ("TN", "NN", "TT", "NT")
 
 
 @dataclass(frozen=True)
 class Form:
     """What a GEMM is besides its sizes and its bias: the type of ``A`` and ``B`` (``dtype``, ``"bf16"``, ``"f16"`` or ``"f32"``), the type of ``C``
     and ``D`` (``out``: ``dtype``, or ``"f32"``; ``"f32"`` for f32 operands; a bias has this type too) and the layout (``"TN"``: ``B`` is ``[N, K]``;
-    ``"NN"``: ``B`` is ``[K, N]``). The default is tilefish 0.0.5's only GEMM, bf16 in and out, ``TN``."""
+    ``"NN"``: ``B`` is ``[K, N]``; ``"TT"`` and ``"NT"``: the same ``B``, and ``A`` is ``[K, M]``). The default is tilefish 0.0.5's only GEMM, bf16
+    in and out, ``TN``."""
 
     dtype: str = "bf16"
     out: str = "bf16"
@@ -219,11 +225,19 @@ class Form:
 
     @property
     def transa(self) -> int:
-        return CUBLAS_OP_T if self.layout == "TN" else CUBLAS_OP_N
+        return CUBLAS_OP_T if self.layout[0] == "T" else CUBLAS_OP_N
+
+    @property
+    def transb(self) -> int:
+        return CUBLAS_OP_T if self.layout[1] == "T" else CUBLAS_OP_N
 
     def lda(self, n: int, k: int) -> int:
-        """The leading dimension of the cuBLAS A operand (tilefish's ``B``): ``k`` for ``[N, K]`` (TN), ``n`` for ``[K, N]`` (NN)."""
-        return k if self.layout == "TN" else n
+        """The leading dimension of the cuBLAS A operand (tilefish's ``B``): ``k`` for ``[N, K]`` (TN, TT), ``n`` for ``[K, N]`` (NN, NT)."""
+        return k if self.layout[0] == "T" else n
+
+    def ldb(self, m: int, k: int) -> int:
+        """The leading dimension of the cuBLAS B operand (tilefish's ``A``): ``k`` for ``[M, K]`` (TN, NN), ``m`` for ``[K, M]`` (TT, NT)."""
+        return k if self.layout[1] == "N" else m
 
     @property
     def opt_in(self) -> str:
@@ -680,7 +694,7 @@ def describe(
     sm_count_target: "int | None" = None,
 ) -> "dict[str, Any]":
     """The exact cuBLAS-level problem that tilefish's ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` without the transpose for the
-    layout ``NN``) is posed as (pure: no GPU, no library).
+    layouts ``NN`` and ``NT``, ``A[k, m]^T`` for ``TT`` and ``NT``) is posed as (pure: no GPU, no library).
 
     The keys are what is passed to cuBLASLt: the types, the transposes, the compute and scale types, the sizes ``cublas_m = n``,
     ``cublas_n = m``, ``cublas_k = k`` and the leading dimensions of the column-major operands.
@@ -709,11 +723,11 @@ def describe(
         "cublas_n": m,
         "cublas_k": k,
         "lda": form.lda(n, k),
-        "ldb": k,
+        "ldb": form.ldb(m, k),
         "ldc": n,
         "ldd": n,
-        "a_operand": "B[N, K]" if form.layout == "TN" else "B[K, N]",
-        "b_operand": "A[M, K]",
+        "a_operand": "B[N, K]" if form.layout[0] == "T" else "B[K, N]",
+        "b_operand": "A[M, K]" if form.layout[1] == "N" else "A[K, M]",
         "alpha": 1.0,
         "beta": 0.0,
         "pointer_mode": "host",
@@ -772,7 +786,7 @@ class _Problem:
         try:
             self.desc = self._create("cublasLtMatmulDescDestroy", "cublasLtMatmulDescCreate", CUBLAS_COMPUTE_32F, CUDA_R_32F)
             self._set(CUBLASLT_MATMUL_DESC_TRANSA, ctypes.c_int32(form.transa))
-            self._set(CUBLASLT_MATMUL_DESC_TRANSB, ctypes.c_int32(CUBLAS_OP_N))
+            self._set(CUBLASLT_MATMUL_DESC_TRANSB, ctypes.c_int32(form.transb))
             if bias:
                 self._set(CUBLASLT_MATMUL_DESC_EPILOGUE, ctypes.c_uint32(CUBLASLT_EPILOGUE_BIAS))
                 self._set(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, ctypes.c_int32(cd))  # the bias has the type of D (the only one the library takes)
@@ -781,14 +795,18 @@ class _Problem:
                 self._set(CUBLASLT_MATMUL_DESC_EPILOGUE, ctypes.c_uint32(CUBLASLT_EPILOGUE_DEFAULT))
             if sm_count_target is not None:
                 self._set(CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, ctypes.c_int32(sm_count_target))
-            if form.layout == "TN":
-                # the "A operand" is tilefish's B[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
+            if form.layout[0] == "T":
+                # TN, TT: the "A operand" is tilefish's B[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
                 self.a = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, k, n, k)
             else:
-                # NN: the "A operand" is tilefish's B[k, n]: stored n x k column-major, lda = n, used as it is
+                # NN, NT: the "A operand" is tilefish's B[k, n]: stored n x k column-major, lda = n, used as it is
                 self.a = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, n, k, n)
-            # the "B operand" is tilefish's A[m, k]: stored k x m column-major, ldb = k, used as it is
-            self.b = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, k, m, k)
+            if form.layout[1] == "N":
+                # TN, NN: the "B operand" is tilefish's A[m, k]: stored k x m column-major, ldb = k, used as it is
+                self.b = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, k, m, k)
+            else:
+                # TT, NT: the "B operand" is tilefish's A[k, m]: stored m x k column-major, ldb = m, used transposed (k x m)
+                self.b = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, m, k, m)
             # D[m, n] row-major is n x m column-major, ldd = n; C has the layout (and the type) of D
             self.d = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", cd, n, m, n)
             self.preference = None
@@ -1279,7 +1297,8 @@ def matmul(
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
 ) -> None:
-    """``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` for the layout ``NN``; the types of ``form``) with the pinned algorithm,
+    """``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` for the layouts ``NN`` and ``NT``, ``A[k, m]`` for ``TT`` and ``NT``; the types of
+    ``form``) with the pinned algorithm,
     enqueued on ``stream`` (a ``CUstream`` as an int), for ``sm_count_target`` SMs when it is given (as the pin was chosen).
 
     ``a_ptr``, ``b_ptr``, ``d_ptr`` and ``bias_ptr`` (``None`` for no bias) are device addresses, 16-byte aligned. The

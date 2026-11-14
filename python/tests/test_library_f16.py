@@ -111,8 +111,8 @@ def test_the_layout_says_where_k_is_in_b():
         declare(nn_f16)
     with pytest.raises(TilefishDeclarationError, match=r"a is \[M, K\] and b is \[K, N\] \(layout NN\): the last axis of a and the first of b must be the same"):
         declare(_nn_k_mismatch, layout="NN")
-    with pytest.raises(TilefishDeclarationError, match=r"layout must be one of \['TN', 'NN'\]"):
-        declare(tn_f16, layout="NT")
+    with pytest.raises(TilefishDeclarationError, match=r"layout must be one of \['TN', 'NN', 'TT', 'NT'\]"):
+        declare(tn_f16, layout="TX")
     with pytest.raises(TilefishDeclarationError, match="layout must be one of"):
         declare(tn_f16, layout="tn")
     with pytest.raises(TilefishDeclarationError, match="need an impl"):
@@ -195,8 +195,10 @@ def test_the_reader_holds_the_types_and_the_layout_together():
     refuses(nn, lambda e: e.update(lda=1024), "the leading dimensions of the layout NN must be lda = n, ldb = k and ldc = ldd = n")
     refuses(nn, lambda e: e.update(transa="T"), "the leading dimensions must be lda = ldb = k")  # TN with lda = n
     refuses(nn, lambda e: e.update(transa="T", lda=1024), r"abi.params\[1\].shape\[0\] is 1024 = 1024, but m, n and k say 3072")  # b is [k, n]
-    refuses(nn, lambda e: e.update(transa="X"), "transa and transb must be")
-    refuses(nn, lambda e: e.update(transb="T"), "transa and transb must be")
+    refuses(nn, lambda e: e.update(transa="X"), "transa and transb must each be 'T' or 'N'")
+    refuses(nn, lambda e: e.update(transb="X"), "transa and transb must each be 'T' or 'N'")
+    # N, T is the layout NT (a is [k, m]): the leading dimensions of NN are not its
+    refuses(nn, lambda e: e.update(transb="T"), "the leading dimensions of the layout NT must be lda = n, ldb = m and ldc = ldd = n")
     refuses(nn, lambda e: e["dtypes"].update(b="bf16"), "dtypes must be")
     refuses(nn, lambda e: e["dtypes"].update(bias="f32"), "dtypes must be")  # a bias of another type than the result
     refuses(nn, lambda e: e["dtypes"].update(out="bf16"), "dtypes must be")
@@ -242,7 +244,7 @@ def test_a_table_row_of_another_layout_says_it():
     assert AlgoTable("sm_103", SMS, VERSION, {(32, 3072, 1024, True, "TN"): CONFIG}).algos == {(32, 3072, 1024, True): CONFIG}
     with pytest.raises(TilefishDeclarationError, match="two rows are for"):
         AlgoTable("sm_103", SMS, VERSION, {(32, 3072, 1024, True, "TN"): CONFIG, (32, 3072, 1024, True): CONFIG})
-    for bad in [(32, 3072, 1024, True, "NT"), (32, 3072, 1024, True, "nn"), (32, 3072, 1024, True, "NN", 1)]:
+    for bad in [(32, 3072, 1024, True, "TX"), (32, 3072, 1024, True, "nn"), (32, 3072, 1024, True, "NN", 1)]:
         with pytest.raises(TilefishDeclarationError, match="a key is"):
             AlgoTable("sm_103", SMS, VERSION, {bad: CONFIG})
     # the rows of the declaration reach its digest, without the layout (the declaration says it)
@@ -300,8 +302,8 @@ def test_the_form_and_the_opt_in_are_checked_before_the_library(monkeypatch):
         L.Form("e4m3", "f32")
     with pytest.raises(TilefishRuntimeError, match="the result of f16 operands is f16 or f32"):
         L.Form("f16", "bf16")
-    with pytest.raises(TilefishRuntimeError, match=r"the layout is one of \['TN', 'NN'\]"):
-        L.Form("f16", "f16", "TT")
+    with pytest.raises(TilefishRuntimeError, match=r"the layout is one of \['TN', 'NN', 'TT', 'NT'\]"):
+        L.Form("f16", "f16", "tt")
     with pytest.raises(TilefishRuntimeError, match="form must be a tilefish._cublaslt.Form"):
         L.check_algo(8, 16, 32, False, ALGO, workspace_bytes=0, form=("f16", "f16", "NN"))
     with pytest.raises(TilefishRuntimeError, match="allow_bf16_reduction is the opt-in of bf16 operands; f16 operands opt in with allow_f16_reduction=True"):

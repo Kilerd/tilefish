@@ -404,7 +404,8 @@ def test_the_problem_is_a_tn_gemm_and_its_redundant_fields_must_agree():
     refuses(lambda e: e.update(lda=3), "the leading dimensions must be lda = ldb = k and ldc = ldd = n")
     refuses(lambda e: e.update(ldd=1), "the leading dimensions must be")
     refuses(lambda e: e.update(transa="N"), "the leading dimensions of the layout NN must be lda = n, ldb = k")  # N, N is the layout NN: lda = k is not its
-    refuses(lambda e: e.update(transb="T"), "transa and transb must be 'T' and 'N' \\(b is \\[n, k\\]\\) or 'N' and 'N'")
+    refuses(lambda e: e.update(transb="X"), "transa and transb must each be 'T' or 'N' \\(transa 'T': b is \\[n, k\\], 'N': b is \\[k, n\\]; transb 'N'")
+    refuses(lambda e: e.update(transb="T"), "the leading dimensions of the layout TT must be lda = k, ldb = m")  # T, T is the layout TT: ldb = k is not its
     refuses(lambda e: e.update(compute_type="CUBLAS_COMPUTE_16F"), "compute_type and scale_type must be")
     refuses(lambda e: e.update(scale_type="CUDA_R_16F"), "compute_type and scale_type must be")
     refuses(lambda e: e.update(epilogue="bias"), "the epilogue of cublaslt.gemm must be 'none'")

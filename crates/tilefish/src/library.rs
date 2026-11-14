@@ -3,7 +3,8 @@
 //!
 //! A port of `validate_entry` of `python/src/tilefish/_library.py`. An entry has exactly the fields of [`ENTRY_KEYS`], each of the type it
 //! needs, and the redundant ones must agree: the dtypes are two operands of one type (`bf16`, `f16` or `f32`) and a result of their type or
-//! `f32` (a bias has the result's type); `transa` says the layout (`T`: `b` is `[n, k]`, `N`: `b` is `[k, n]`), and the leading dimensions and the
+//! `f32` (a bias has the result's type); `transa` and `transb` say the layout (`transa` `T`: `b` is `[n, k]`, `N`: `b` is `[k, n]`; `transb` `N`:
+//! `a` is `[m, k]`, `T`: `a` is `[k, m]`), and the leading dimensions and the
 //! shapes of the operands follow from it, `impl`, `m`, `n` and `k`, which may be any size (an algorithm that cannot take the leading
 //! dimensions they make is refused by `cublasLtMatmulAlgoCheck` when it is loaded). The pinned algorithm is 64 bytes (128 lowercase hex digits) that
 //! only the library that made them can judge: running one is [`crate::gemm`].
@@ -35,38 +36,75 @@ pub enum LibraryImpl {
     GemmBias,
 }
 
-/// How `b` is stored, named by the transposes cuBLASLt is called with (`transa`, then `transb`; cuBLAS's A operand is tilefish's `b`).
+/// How `b` and `a` are stored, named by the transposes cuBLASLt is called with (`transa`, then `transb`; cuBLAS's A operand is tilefish's `b`,
+/// its B operand tilefish's `a`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GemmLayout {
     /// `"TN"`: `b` is `[N, K]` (a weight of `torch.nn.Linear`), `out = a @ b^T`; `lda = k`.
     Tn,
     /// `"NN"`: `b` is `[K, N]`, `out = a @ b`; `lda = n`.
     Nn,
+    /// `"TT"`: `b` is `[N, K]` and `a` is `[K, M]`, `out = a^T @ b^T`; `lda = k`, `ldb = m`.
+    Tt,
+    /// `"NT"`: `b` is `[K, N]` and `a` is `[K, M]`, `out = a^T @ b`; `lda = n`, `ldb = m`.
+    Nt,
 }
 
 impl GemmLayout {
-    /// The word an entry's `transa` and `transb` spell (`"TN"`, `"NN"`).
+    /// The word an entry's `transa` and `transb` spell (`"TN"`, `"NN"`, `"TT"`, `"NT"`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tn => "TN",
             Self::Nn => "NN",
+            Self::Tt => "TT",
+            Self::Nt => "NT",
         }
+    }
+
+    /// Whether `b` is stored `[N, K]` and used transposed (`transa = T`: the layouts TN and TT).
+    pub fn b_transposed(self) -> bool {
+        matches!(self, Self::Tn | Self::Tt)
+    }
+
+    /// Whether `a` is stored `[K, M]` and used transposed (`transb = T`: the layouts TT and NT).
+    pub fn a_transposed(self) -> bool {
+        matches!(self, Self::Tt | Self::Nt)
     }
 
     /// The leading dimension of cuBLAS's A operand (tilefish's `b`): `k` for `[N, K]`, `n` for `[K, N]`.
     pub fn lda(self, n: u64, k: u64) -> u64 {
-        match self {
-            Self::Tn => k,
-            Self::Nn => n,
-        }
+        if self.b_transposed() { k } else { n }
+    }
+
+    /// The leading dimension of cuBLAS's B operand (tilefish's `a`): `k` for `[M, K]`, `m` for `[K, M]`.
+    pub fn ldb(self, m: u64, k: u64) -> u64 {
+        if self.a_transposed() { m } else { k }
+    }
+
+    /// The shape of `a`.
+    pub fn a_shape(self, m: u64, k: u64) -> [u64; 2] {
+        if self.a_transposed() { [k, m] } else { [m, k] }
     }
 
     /// The shape of `b`.
     pub fn b_shape(self, n: u64, k: u64) -> [u64; 2] {
-        match self {
-            Self::Tn => [n, k],
-            Self::Nn => [k, n],
+        if self.b_transposed() { [n, k] } else { [k, n] }
+    }
+
+    /// The rule of the leading dimensions in the words a refusal uses (Python's `leading_dimensions_rule`).
+    pub(crate) fn leading_dimensions_rule(self) -> String {
+        if self == Self::Tn {
+            return "the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C \
+                    and D)"
+                .to_owned();
         }
+        let (lda, b) = if self.b_transposed() { ("k", "b") } else { ("n", "b [k, n]") };
+        let (ldb, a) = if self.a_transposed() { ("m", "a [k, m]") } else { ("k", "a") };
+        format!(
+            "the leading dimensions of the layout {} must be lda = {lda}, ldb = {ldb} and ldc = ldd = n (cuBLAS sees {b} as its A, {a} as its \
+             B and the result as C and D)",
+            self.as_str()
+        )
     }
 }
 
@@ -153,10 +191,10 @@ pub struct LibraryEntry {
     pub dtype: DType,
     /// The type of the result and of a bias (`dtypes.out`): `dtype`, or [`DType::F32`] (f32 for f32 operands).
     pub out_dtype: DType,
-    /// How `b` is stored (`transa`, `transb`).
+    /// How `b` and `a` are stored (`transa`, `transb`).
     pub layout: GemmLayout,
-    /// The operands in launch order: `a [M, K]`, `b [N, K]` (`[K, N]` for [`GemmLayout::Nn`]), `bias [N]` (only for `gemm_bias`), `out [M, N]`,
-    /// pointers of their dtypes (`out` is written).
+    /// The operands in launch order: `a [M, K]` (`[K, M]` for [`GemmLayout::Tt`] and [`GemmLayout::Nt`]), `b [N, K]` (`[K, N]` for
+    /// [`GemmLayout::Nn`] and [`GemmLayout::Nt`]), `bias [N]` (only for `gemm_bias`), `out [M, N]`, pointers of their dtypes (`out` is written).
     pub params: Vec<Param>,
     /// The bucket value of each bucketed dimension, in the order of the stem.
     pub buckets: Vec<(String, u64)>,
@@ -164,7 +202,7 @@ pub struct LibraryEntry {
     pub dims: Vec<DimInfo>,
     /// What a launch must check: the 16-byte alignment of every pointer, the static sizes and the buckets.
     pub preconditions: Vec<Precondition>,
-    /// The sizes of the problem, in tilefish's row-major terms: `a` is `[m, k]`, `b` is `[n, k]`, `out` is `[m, n]`.
+    /// The sizes of the problem, in tilefish's row-major terms: `a` is `[m, k]`, `b` is `[n, k]`, `out` is `[m, n]` (in the layout TN).
     pub m: u64,
     /// See `m`.
     pub n: u64,
@@ -366,19 +404,18 @@ impl LibraryEntry {
         let layout = match (raw.transa.as_str(), raw.transb.as_str()) {
             ("T", "N") => GemmLayout::Tn,
             ("N", "N") => GemmLayout::Nn,
+            ("T", "T") => GemmLayout::Tt,
+            ("N", "T") => GemmLayout::Nt,
             _ => {
                 return Err(format!(
-                    "transa and transb must be \"T\" and \"N\" (b is [n, k]) or \"N\" and \"N\" (b is [k, n]), got {:?} and {:?}",
+                    "transa and transb must each be \"T\" or \"N\" (transa \"T\": b is [n, k], \"N\": b is [k, n]; transb \"N\": a is [m, k], \
+                     \"T\": a is [k, m]), got {:?} and {:?}",
                     raw.transa, raw.transb
                 ));
             }
         };
-        if ld != [layout.lda(n, k), k, n, n] {
-            return Err(match layout {
-                GemmLayout::Tn => "the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)",
-                GemmLayout::Nn => "the leading dimensions of the layout NN must be lda = n, ldb = k and ldc = ldd = n (cuBLAS sees b [k, n] as its A, a as its B and the result as C and D)",
-            }
-            .to_owned());
+        if ld != [layout.lda(n, k), layout.ldb(m, k), n, n] {
+            return Err(layout.leading_dimensions_rule());
         }
         if raw.compute_type != COMPUTE_TYPE || raw.scale_type != SCALE_TYPE {
             return Err(format!("compute_type and scale_type must be {COMPUTE_TYPE:?} and {SCALE_TYPE:?}"));
@@ -485,12 +522,14 @@ impl LibraryEntry {
             stem.push_str(&format!(".{name}{v}"));
             buckets.push((name.clone(), v));
         }
-        // the operands: a [M, K], b [N, K] (TN) or [K, N] (NN), [bias [N]], out [M, N], in this order, each of its type in dtypes
-        let expected: Vec<(Vec<u64>, DType)> = [(vec![m, k], dtype), (layout.b_shape(n, k).to_vec(), dtype)]
-            .into_iter()
-            .chain(bias.then(|| (vec![n], out_dtype)))
-            .chain([(vec![m, n], out_dtype)])
-            .collect();
+        // the operands: a [M, K] (TN, NN) or [K, M] (TT, NT), b [N, K] (TN, TT) or [K, N] (NN, NT), [bias [N]], out [M, N], in this order, each
+        // of its type in dtypes
+        let expected: Vec<(Vec<u64>, DType)> =
+            [(layout.a_shape(m, k).to_vec(), dtype), (layout.b_shape(n, k).to_vec(), dtype)]
+                .into_iter()
+                .chain(bias.then(|| (vec![n], out_dtype)))
+                .chain([(vec![m, n], out_dtype)])
+                .collect();
         let params_raw = &raw.abi.params;
         if params_raw.len() != expected.len() {
             return Err(format!(

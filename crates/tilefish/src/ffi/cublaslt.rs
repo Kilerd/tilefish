@@ -17,7 +17,7 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::CudaContext;
 
 use crate::error::{Error, Result};
-use crate::library::{GemmForm, GemmLayout};
+use crate::library::GemmForm;
 use crate::tensor::DType;
 
 const COMPUTE_32F: sys::cublasComputeType_t = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
@@ -311,8 +311,9 @@ impl Drop for Layout {
 /// The problem is the one `docs/manifest-schema-3.md` (section 9) gives, tilefish's `out[m, n] = a[m, k] @ b[n, k]^T (+ bias[n])` posed to the
 /// column-major library as the TN gemm `m_cublas = n`, `n_cublas = m`, `k_cublas = k`: the cuBLAS "A" operand is tilefish's `b` (`transa = T`,
 /// a `k x n` column-major matrix with `lda = k`), the "B" operand is tilefish's `a` (`transb = N`, `k x m`, `ldb = k`), and `C` and `D` are
-/// tilefish's `out` (`n x m` column-major, `ldc = ldd = n`). For the layout NN, `b` is `[k, n]`: an `n x k` column-major matrix with `lda = n`,
-/// used with `transa = N`. `a` and `b` have the operand type of the form, `C`, `D` and a bias its result type; the compute type is
+/// tilefish's `out` (`n x m` column-major, `ldc = ldd = n`). For the layouts NN and NT, `b` is `[k, n]`: an `n x k` column-major matrix with
+/// `lda = n`, used with `transa = N`; for TT and NT, `a` is `[k, m]`: an `m x k` column-major matrix with `ldb = m`, used with `transb = T`. `a`
+/// and `b` have the operand type of the form, `C`, `D` and a bias its result type; the compute type is
 /// `CUBLAS_COMPUTE_32F`, the scale type `CUDA_R_32F`. A bias goes through `CUBLASLT_EPILOGUE_BIAS` with `BIAS_DATA_TYPE` the result type. Python's
 /// `describe` is the reference.
 #[derive(Debug)]
@@ -360,12 +361,10 @@ impl Problem {
             b: Layout(std::ptr::null_mut()),
             d: Layout(std::ptr::null_mut()),
         };
-        let transa = match form.layout {
-            GemmLayout::Tn => OP_T,
-            GemmLayout::Nn => OP_N,
-        };
+        let transa = if form.layout.b_transposed() { OP_T } else { OP_N };
+        let transb = if form.layout.a_transposed() { OP_T } else { OP_N };
         desc_set(desc, D::CUBLASLT_MATMUL_DESC_TRANSA, transa)?;
-        desc_set(desc, D::CUBLASLT_MATMUL_DESC_TRANSB, OP_N)?;
+        desc_set(desc, D::CUBLASLT_MATMUL_DESC_TRANSB, transb)?;
         match bias {
             Some(pointer) => {
                 desc_set(desc, D::CUBLASLT_MATMUL_DESC_EPILOGUE, EPILOGUE_BIAS)?;
@@ -380,14 +379,20 @@ impl Problem {
                 .map_err(|_| Error::Launch("the SM count target does not fit an int32".to_owned()))?;
             desc_set(desc, D::CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, target)?;
         }
-        problem.a = match form.layout {
-            // the "A operand" is tilefish's b[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
-            GemmLayout::Tn => Layout::new(form.dtype, k, n, ld(k)?)?,
-            // NN: the "A operand" is tilefish's b[k, n]: stored n x k column-major, lda = n, used as it is
-            GemmLayout::Nn => Layout::new(form.dtype, n, k, ld(n)?)?,
+        problem.a = if form.layout.b_transposed() {
+            // TN, TT: the "A operand" is tilefish's b[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
+            Layout::new(form.dtype, k, n, ld(k)?)?
+        } else {
+            // NN, NT: the "A operand" is tilefish's b[k, n]: stored n x k column-major, lda = n, used as it is
+            Layout::new(form.dtype, n, k, ld(n)?)?
         };
-        // the "B operand" is tilefish's a[m, k]: stored k x m column-major, ldb = k, used as it is
-        problem.b = Layout::new(form.dtype, k, m, ld(k)?)?;
+        problem.b = if form.layout.a_transposed() {
+            // TT, NT: the "B operand" is tilefish's a[k, m]: stored m x k column-major, ldb = m, used transposed (k x m)
+            Layout::new(form.dtype, m, k, ld(m)?)?
+        } else {
+            // TN, NN: the "B operand" is tilefish's a[m, k]: stored k x m column-major, ldb = k, used as it is
+            Layout::new(form.dtype, k, m, ld(k)?)?
+        };
         // out[m, n] row-major is n x m column-major, ldd = n; C has the layout (and the type) of D
         problem.d = Layout::new(form.out, n, m, ld(n)?)?;
         Ok(problem)
@@ -453,7 +458,7 @@ pub(crate) struct Addresses {
 /// # Safety
 ///
 /// `stream` must be a valid `CUstream` of the context the handle was made in, which must be current on this thread; the addresses must be
-/// device memory of that context holding what `problem` says (`a` `[m, k]`, `b` `[n, k]` or `[k, n]`, `out` `[m, n]`, of its types, and the bias `[n]` of the
+/// device memory of that context holding what `problem` says (`a` `[m, k]` or `[k, m]`, `b` `[n, k]` or `[k, n]`, `out` `[m, n]`, of its types, and the bias `[n]` of the
 /// problem), allocated until the work has completed on `stream`, and the workspace at least `workspace_size` bytes.
 #[allow(unsafe_code)]
 pub(crate) unsafe fn matmul(
