@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus};
 use cudarc::driver::{CudaContext, CudaEvent, CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut};
 
+use crate::conv::{Conv, ConvCall};
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Expr, MAX_DIMS, Pattern, Solved, Symbols, Unsolvable};
 use crate::ffi;
@@ -166,6 +167,7 @@ impl std::fmt::Debug for Tap<'_> {
 pub(crate) enum Ready<'r> {
     Kernel(&'r Kernel, Box<Prepared>),
     Gemm(&'r Gemm, Call),
+    Conv(&'r Conv, ConvCall),
     /// A copy step: `bytes` bytes from `src` to `dst`, checked to be inside their buffers and not to overlap.
     Copy {
         src: u64,
@@ -187,6 +189,7 @@ struct Slot {
 enum Op {
     Kernel(Kernel),
     Gemm(Gemm),
+    Conv(Conv),
     /// A copy step: no binary.
     Copy,
 }
@@ -689,6 +692,9 @@ impl PlanRun {
                                 ctx.bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
                                 ffi::plan::load_function(kernel.function())?;
                                 Op::Kernel(kernel)
+                            }
+                            StepKind::Library if plan.manifest().conv_entry(&st.entry, plan.arch()).is_some() => {
+                                Op::Conv(plan.manifest().conv(&ctx, &st.entry, &[], arch)?)
                             }
                             StepKind::Library => Op::Gemm(plan.manifest().gemm(&ctx, &st.entry, &[], arch)?),
                             StepKind::Copy => unreachable!("a copy step loads nothing"),
@@ -1233,6 +1239,12 @@ impl PlanRun {
                     let region = ffi::plan::check_region(bases[*w], region_bytes(*w), inner.arena.device);
                     args.push(TensorArg::new(region, shape, DType::U8, Access::InOut).map_err(|e| in_step(e, &what))?);
                     Ready::Gemm(gemm, gemm.check_call(&args).map_err(|e| in_step(e, &what))?)
+                }
+                Op::Conv(conv) => {
+                    let (w, shape) = step.workspace.as_ref().expect("a library step has a workspace");
+                    let region = ffi::plan::check_region(bases[*w], region_bytes(*w), inner.arena.device);
+                    args.push(TensorArg::new(region, shape, DType::U8, Access::InOut).map_err(|e| in_step(e, &what))?);
+                    Ready::Conv(conv, conv.check_call(&args).map_err(|e| in_step(e, &what))?)
                 }
                 Op::Copy => {
                     // the dense bytes of src into dst: each was made a tensor of its region above (so it lies inside its buffer), and the

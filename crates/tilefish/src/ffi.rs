@@ -18,6 +18,7 @@ use cudarc::driver::{
     PushKernelArg, SyncOnDrop, result, sys,
 };
 
+use crate::conv::{Conv, ConvCall};
 use crate::error::{Error, Result};
 use crate::gemm::{Call, Gemm};
 use crate::kernel::Kernel;
@@ -26,6 +27,7 @@ use crate::plan::{MAX_PARAMS, NOT_A_TENSOR, Prepared};
 use crate::tensor::{Backing, TensorArg};
 
 pub(crate) mod cublaslt;
+pub(crate) mod cudnn;
 pub(crate) mod plan;
 
 #[cfg(target_endian = "big")]
@@ -700,6 +702,64 @@ pub(crate) fn enqueue_gemm(gemm: &Gemm, stream: &CudaStream, call: &Call, tensor
         drop(guards);
         Ok(end)
     })
+}
+
+/// Enqueue the pinned convolution of a checked call on `stream`, ordered as a GEMM is ([`enqueue_gemm`]).
+#[allow(unsafe_code)]
+pub(crate) fn enqueue_conv(
+    conv: &Conv,
+    stream: &CudaStream,
+    call: &ConvCall,
+    tensors: &mut [TensorArg<'_>],
+) -> Result<()> {
+    ordered(stream, tensors, |tensors, want_end| {
+        let mut guards = Vec::with_capacity(tensors.len());
+        for tensor in tensors.iter_mut() {
+            match &mut tensor.backing {
+                Backing::Raw => {}
+                Backing::Read(memory) => guards.push(memory.sync_read(stream)),
+                Backing::Write(memory) => guards.push(memory.sync_write(stream)),
+            }
+        }
+        stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+        // SAFETY: as `enqueue_gemm`: the stream is the cudarc stream of this convolution's context, current on this thread; the addresses in
+        // `call` are those of tensors `Conv::check_call` checked (shapes of the problem, dtype, alignment, the workspace, no overlap where one is
+        // written, this context), borrowed for the whole call and handed to cudarc's tracking on this stream.
+        unsafe { conv.run(stream.cu_stream(), call) }?;
+        let end = if want_end {
+            Some(
+                stream
+                    .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+                    .map_err(Error::driver("cuEventRecord"))?,
+            )
+        } else {
+            None
+        };
+        drop(guards);
+        Ok(end)
+    })
+}
+
+impl Conv {
+    /// Check the call and run the convolution on a raw `CUstream`: [`Conv::launch`] for a handle that nothing owns, or the stream a CUDA graph is
+    /// being captured on (the call is captured like any other; the workspace is the caller's, so nothing is allocated).
+    ///
+    /// **This is how a convolution is captured in a CUDA graph**, with tensors made of regions: the contract is that of [`Gemm::launch_raw`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Gemm::launch_raw`]: `stream` must be a valid `CUstream` of the CUDA context the convolution was loaded in ([`Conv::context`]) until
+    /// this returns, and the tensors' memory (the workspace included) must stay allocated until the work has completed on `stream`, and be ordered
+    /// against the other streams that use it.
+    #[allow(unsafe_code)]
+    pub unsafe fn launch_raw(&self, stream: sys::CUstream, tensors: &[TensorArg<'_>]) -> Result<()> {
+        let call = self.check_call(tensors)?;
+        let _current = Current::make(self.context())?;
+        refuse_capture_raw(stream, tensors)?;
+        // SAFETY: `stream` is the caller's valid stream of this convolution's context, as the contract above says; the pointers are the addresses
+        // of tensors that were checked to fit their memory and the shapes of the problem, which the caller keeps allocated.
+        unsafe { self.run(stream, &call) }
+    }
 }
 
 impl Gemm {

@@ -307,7 +307,9 @@ pub(crate) struct RawLibrary {
 }
 
 /// A field that is there, whatever its value: `null` included (serde's `Option` would read a `null` as an absent field, which Python does not).
-fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<Value>, D::Error> {
+pub(crate) fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
     Value::deserialize(deserializer).map(Some)
 }
 
@@ -353,7 +355,7 @@ fn optional_field(value: &Option<Value>, name: &str, only: &Value) -> std::resul
 }
 
 /// The value of the dimension expression `text` when the bucketed dimensions have their bucket values.
-fn eval_static(text: &str, buckets: &[(String, u64)], where_: &str) -> std::result::Result<i64, String> {
+pub(crate) fn eval_static(text: &str, buckets: &[(String, u64)], where_: &str) -> std::result::Result<i64, String> {
     let mut syms = Symbols::default();
     let mut values = Vec::with_capacity(buckets.len());
     for (name, value) in buckets {

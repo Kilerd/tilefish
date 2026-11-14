@@ -169,6 +169,12 @@ pub(crate) fn enqueue_steps(stream: &CudaStream, steps: &[Ready<'_>]) -> Result<
                 // algorithm needs) and are used as the doc comment of this function says.
                 unsafe { gemm.run(stream.cu_stream(), call) }?;
             }
+            Ready::Conv(conv, call) => {
+                stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+                // SAFETY: as for a GEMM: a cudarc stream of the convolution's context, current on this thread; addresses checked by
+                // `Conv::check_call` (the shapes of the problem, the dtype, the alignment, the workspace in the arena with what the pin needs).
+                unsafe { conv.run(stream.cu_stream(), call) }?;
+            }
             Ready::Copy { src, dst, bytes } => {
                 stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
                 // SAFETY: `src` and `dst` are the first bytes of two arguments of a copy step, each checked by the run to lie inside its

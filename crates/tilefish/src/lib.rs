@@ -59,7 +59,8 @@
 //! * **`i64` scalars** and **`fixed` arguments** (a value the manifest holds, written at its slot: an `i32`, an `i64` or an `f32`);
 //! * a **library operation**: a GEMM of bf16, f16 or f32 operands (a result of their type or f32; f32 operands multiplied as f32, TF32 off;
 //!   `b` as `[N, K]` or `[K, N]`, `a` as `[M, K]` or `[K, M]`) through cuBLASLt with the algorithm the manifest pinned ([`Manifest::gemm`], [`Gemm`];
-//!   [`LibraryEntry::dtype`], [`LibraryEntry::layout`]).
+//!   [`LibraryEntry::dtype`], [`LibraryEntry::layout`]), and a forward convolution through cuDNN with the legacy algorithm or the backend
+//!   engine configuration the manifest pinned ([`Manifest::conv`], [`Conv`], [`ConvEntry`]).
 //!
 //! ```no_run
 //! use tilefish::cudarc::driver::CudaContext;
@@ -249,6 +250,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+mod conv;
 pub mod elf;
 mod error;
 mod expr;
@@ -266,6 +268,10 @@ mod plan_set;
 mod region;
 mod tensor;
 
+pub use conv::{
+    CONV_COMPUTE_TYPE, CONV_IMPL, Conv, ConvChoice, ConvEntry, ConvLayout, ConvMath, ConvPin, ConvProblem,
+    TF32_OVERRIDE, cudnn_version, dense_strides, knobs_problem, math_problem, notes_problem, output_size,
+};
 pub use cudarc;
 pub use error::{Error, PreconditionKind, Result};
 pub use ffi::driver_available;

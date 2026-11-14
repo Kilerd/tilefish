@@ -194,7 +194,7 @@ fn launch(gpu: &Gpu, manifest: &Manifest, case: &Value, bufs: &mut [Buf]) -> Res
     use generated::*;
     let s: &CudaStream = &gpu.stream;
     let launcher = case["launcher"].as_str().expect("the case names its launcher");
-    if case["kind"] == "gemm" {
+    if case["kind"] == "gemm" || case["kind"] == "conv" {
         return launch_generic(gpu, manifest, case, bufs);
     }
     match (launcher, &mut *bufs) {
@@ -248,6 +248,14 @@ fn launch_generic(gpu: &Gpu, manifest: &Manifest, case: &Value, bufs: &mut [Buf]
         args.push(TensorMut::<U8>::from_cuda(&mut workspace, &shape)?.into_arg());
         gemm.launch(s, &mut args)?;
         // the workspace is freed after the launch: cudarc orders its free behind the GEMM that used it
+        return Ok(());
+    }
+    if case["kind"] == "conv" {
+        let conv = manifest.conv(&gpu.ctx, stem, &[], arch)?;
+        let mut workspace = conv.alloc_workspace(&gpu.stream)?;
+        let shape = [workspace.len()];
+        args.push(TensorMut::<U8>::from_cuda(&mut workspace, &shape)?.into_arg());
+        conv.launch(s, &mut args)?;
         return Ok(());
     }
     // a prebuilt binary's fixed arguments per call: the values the case gave
@@ -1598,6 +1606,99 @@ fn the_gate_has_gemms_of_every_form() {
     }
 }
 
+/// The cuDNN convolutions (`conv_kernels.py`: a backend pin and legacy ones, NHWC and NCHW, one and two spatial axes, f16, bf16 and f32): Rust reads each
+/// entry (the problem it describes is the one Python posed), loads it (the cuDNN version, the device, the pin vetted as Python vets it), runs it
+/// (`byte_identity` holds its bytes to Python's replay), refuses a host on another partition and a process with `NVIDIA_TF32_OVERRIDE` set, and
+/// captures the largest bucket of each in a CUDA graph with `launch_raw`, which replays to Python's bytes.
+#[test]
+fn the_gate_has_cudnn_convolutions() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no convolution");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let convs = cases_where(&cases, |c| c["kind"] == "conv");
+    assert!(convs.len() >= 8, "{} convolution cases", convs.len());
+    assert_eq!(
+        tilefish::cudnn_version(),
+        cases["cudnn_version"].as_u64(),
+        "the process maps the cuDNN that chose the pins"
+    );
+    let mut apis = std::collections::BTreeSet::new();
+    for case in &convs {
+        let stem = case["stem"].as_str().unwrap();
+        let entry = manifest.conv_entry(stem, &arch.to_string()).unwrap_or_else(|| panic!("{stem}: no entry"));
+        apis.insert(entry.pin.api());
+        let conv = manifest.conv(&gpu.ctx, stem, &[], arch).unwrap();
+        assert_eq!((conv.problem(), conv.pin()), (&entry.problem, &entry.pin), "{stem}");
+        assert!(conv.workspace_required() <= conv.workspace_bytes(), "{stem}");
+        if entry.pin.api() == "legacy" {
+            assert_eq!(
+                conv.workspace_required(),
+                entry.workspace_bytes,
+                "{stem}: a legacy call is given the whole limit"
+            );
+        }
+        // a host on a partition takes the pins chosen for it, and refuses the others
+        assert!(manifest.with_sm_partition(Some(entry.sm_count)).conv(&gpu.ctx, stem, &[], arch).is_ok(), "{stem}");
+        let refused = manifest.with_sm_partition(Some(entry.sm_count / 2)).conv(&gpu.ctx, stem, &[], arch);
+        assert!(
+            matches!(&refused, Err(Error::Manifest(m)) if m.contains("but this host runs it on a partition of")),
+            "{stem}"
+        );
+    }
+    assert_eq!(apis.into_iter().collect::<Vec<_>>(), ["backend", "legacy"]);
+    // a process with NVIDIA_TF32_OVERRIDE set (any value) is refused at the load, before anything of cuDNN is asked
+    let first = convs[0]["stem"].as_str().unwrap();
+    let fresh = Manifest::load(gate_dir().join("manifest"), tilefish::Pin::TrustDirectory).unwrap();
+    // SAFETY: the gate runs with --test-threads=1, and the variable is removed before anything else reads the environment.
+    unsafe { std::env::set_var("NVIDIA_TF32_OVERRIDE", "0") };
+    let refused = fresh.conv(&gpu.ctx, first, &[], arch);
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("NVIDIA_TF32_OVERRIDE") };
+    assert!(matches!(&refused, Err(Error::Manifest(m)) if m.contains("NVIDIA_TF32_OVERRIDE is set")), "{refused:?}");
+    // the largest bucket of each, captured in a CUDA graph with launch_raw and regions, three times
+    for case in &convs {
+        let stem = case["stem"].as_str().unwrap();
+        if stem.ends_with(".T64") {
+            continue;
+        }
+        let conv = manifest.conv(&gpu.ctx, stem, &[], arch).unwrap();
+        let mut workspace = conv.alloc_workspace(&gpu.stream).unwrap();
+        let mut tensors = tensors_of(&gpu, case);
+        let last = tensors.len() - 1;
+        let expect = read(&gate_dir().join(case["tensors"][last]["expect"].as_str().unwrap()));
+        let shapes: Vec<Vec<usize>> = tensors_json(case).iter().map(|t| usizes(&t["shape"])).collect();
+        let dtypes: Vec<DType> =
+            tensors_json(case).iter().map(|t| DType::from_name(t["dtype"].as_str().unwrap()).unwrap()).collect();
+        let ws_shape = [workspace.len()];
+        gpu.stream.synchronize().unwrap();
+        // SAFETY: the buffers outlive the graph; nothing else uses them meanwhile.
+        let regions: Vec<DevicePtr<'static>> =
+            unsafe { tensors.iter().map(|(_, b)| gpu.unbound_region(b, b.nbytes())).collect() };
+        let ws = unsafe { DevicePtr::from_raw(workspace.device_ptr(&gpu.stream).0, workspace.len() as u64, 0) };
+        let stream = gpu.stream.cu_stream();
+        let launch = || {
+            let mut args: Vec<TensorArg<'_>> = Vec::new();
+            for (i, shape) in shapes.iter().enumerate() {
+                let access = if i == last { Access::InOut } else { Access::In };
+                args.push(TensorArg::new(regions[i], shape, dtypes[i], access)?);
+            }
+            args.push(TensorArg::new(ws, &ws_shape, DType::U8, Access::InOut)?);
+            // SAFETY: the stream is the convolution's; the regions are the buffers' own, which outlive the graph.
+            unsafe { conv.launch_raw(stream, &args) }
+        };
+        capture_and_run(&gpu, &launch, &mut tensors[last].1.slice, &expect);
+        let _ = &mut workspace;
+        println!(
+            "rust gate: {stem} ({}): captured in a CUDA graph, ran 3 times and matched Python's replay",
+            conv.pin().api()
+        );
+    }
+}
+
 /// The bf16 nearest to an f32 (round to nearest, ties to even), as Triton's `.to(tl.bfloat16)` rounds a finite value.
 fn bf16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
@@ -1949,8 +2050,8 @@ fn refusals_of_schema_3() {
     let here = tilefish::cublaslt_version().expect("cuBLASLt is on this machine");
     let tmp = copy_of_the_manifest("version");
     let mut doc = read_json(&tmp.join("manifest.json"));
-    for e in doc["library"].as_array_mut().unwrap() {
-        e["cublaslt_version"] = (here + 100).into();
+    for e in doc["library"].as_array_mut().unwrap().iter_mut().filter(|e| e.get("cublaslt_version").is_some()) {
+        e["cublaslt_version"] = (here + 100).into(); // (the GEMMs: a cuDNN convolution has no cublaslt_version)
     }
     write_json(&tmp.join("manifest.json"), &doc);
     let other = Manifest::load(&tmp, Pin::TrustDirectory).unwrap();
@@ -1964,7 +2065,7 @@ fn refusals_of_schema_3() {
     // ... and an algorithm that cuBLASLt would not have written (a tile id past what its id has) is refused before cublasLtMatmulAlgoCheck, which
     // crashes the process on some of those, can see it
     let mut doc = read_json(&tmp.join("manifest.json"));
-    for e in doc["library"].as_array_mut().unwrap() {
+    for e in doc["library"].as_array_mut().unwrap().iter_mut().filter(|e| e.get("cublaslt_version").is_some()) {
         e["cublaslt_version"] = here.into();
         let mut algo = e["algo"].as_str().unwrap().to_owned().into_bytes();
         algo[8..16].fill(b'f'); // the second 32-bit word of the first eight bytes: the tile id

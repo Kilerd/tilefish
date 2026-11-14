@@ -21,7 +21,9 @@ categories = ["compilers", "science"]
 # call of a GEMM is made, and a manifest without `library` entries never opens it. 0.19.10 is the oldest cudarc this crate builds
 # with: it calls `CudaFunction::cu_function` and `CUgraphInstantiate_flags(0)`, which 0.19.10 added (README: "In a workspace that uses
 # cudarc itself").
-cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "nvrtc", "cublaslt"] }
+# `cudnn` is cudarc's cuDNN bindings (`cudnn::sys`: the legacy and the backend API, which this crate calls to run a pinned convolution); with
+# `dynamic-loading` libcudnn is opened only when a convolution is loaded, and a manifest without one never opens it.
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "nvrtc", "cublaslt", "cudnn"] }
 ryu = "1.0.23"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }

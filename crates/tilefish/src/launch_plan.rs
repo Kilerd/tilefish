@@ -1091,17 +1091,23 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
                     pointers_of(&entry.params)
                 }
                 StepKind::Library => {
-                    let Some(entry) = manifest.library_entry(stem, arch) else {
-                        return refuse(format!("{at}: the manifest has no library entry '{stem}' for {arch}"));
-                    };
+                    // a cuBLASLt GEMM or a cuDNN convolution: the pointers of its entry, and the workspace it is given
+                    let (params, workspace_bytes) =
+                        match (manifest.library_entry(stem, arch), manifest.conv_entry(stem, arch)) {
+                            (Some(entry), _) => (&entry.params, entry.workspace_bytes),
+                            (None, Some(entry)) => (&entry.params, entry.workspace_bytes),
+                            (None, None) => {
+                                return refuse(format!("{at}: the manifest has no library entry '{stem}' for {arch}"));
+                            }
+                        };
                     let ws = &v.buffers[st.workspace_buffer.expect("a library step has a workspace")];
-                    if ws.bytes < entry.workspace_bytes {
+                    if ws.bytes < workspace_bytes {
                         return refuse(format!(
-                            "{at}: the workspace '{}' has {} bytes, but the entry needs {}",
-                            ws.name, ws.bytes, entry.workspace_bytes
+                            "{at}: the workspace '{}' has {} bytes, but the entry needs {workspace_bytes}",
+                            ws.name, ws.bytes
                         ));
                     }
-                    pointers_of(&entry.params)
+                    pointers_of(params)
                 }
                 StepKind::Copy => unreachable!("handled above"),
             };

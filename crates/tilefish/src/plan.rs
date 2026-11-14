@@ -292,6 +292,22 @@ impl Plan {
         })
     }
 
+    /// The plan of a convolution entry: what its tensors `x`, `w` and `out` are checked against (it launches nothing by itself).
+    pub(crate) fn for_conv(entry: &crate::conv::ConvEntry) -> Result<Self> {
+        Self::build(&Source {
+            stem: &entry.stem,
+            arch: &entry.arch,
+            params: &entry.params,
+            dims: &entry.dims,
+            preconditions: &entry.preconditions,
+            grid: "(1,)",
+            block: [1, 1, 1],
+            shared: 0,
+            scratch_slots: 0,
+            launch: None,
+        })
+    }
+
     fn build(source: &Source<'_>) -> Result<Self> {
         let who = format!("'{}' ({})", source.stem, source.arch);
         let blockers = source.launch.map(LaunchAttributes::blockers).unwrap_or_default();

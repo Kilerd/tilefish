@@ -669,18 +669,38 @@ impl Checks<'_> {
                 ));
             }
         }
-        self.check_workspace(workspace, operand_args)?;
+        check_workspace(
+            stem,
+            self.device,
+            workspace,
+            operand_args,
+            self.plan,
+            self.required as u64,
+            self.workspace_bytes,
+            &format!("the pinned algorithm of '{stem}'"),
+        )?;
         let address = |i: usize| operand_args[i].ptr;
         let (a, b) = (address(0), address(1));
         let (bias, out) = if self.bias { (Some(address(2)), address(3)) } else { (None, address(2)) };
         Ok(Call { a, b, bias, out, workspace: if self.required == 0 { 0 } else { workspace.ptr } })
     }
+}
 
-    /// The workspace is a tensor that is written: bytes, enough of them, aligned, in this context, overlapping no operand.
-    fn check_workspace(&self, workspace: &TensorArg<'_>, operands: &[TensorArg<'_>]) -> Result<()> {
-        let stem = self.stem;
+/// The workspace of a library call (a GEMM's, a convolution's) is a tensor that is written: bytes, at least `required` of them, aligned, in the
+/// context of `device`, overlapping no operand. `who` names what needs it in a message (`the pinned algorithm of 'gemm.M32'`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_workspace(
+    stem: &str,
+    device: &DeviceInfo,
+    workspace: &TensorArg<'_>,
+    operands: &[TensorArg<'_>],
+    plan: &Plan,
+    required: u64,
+    workspace_bytes: u64,
+    who: &str,
+) -> Result<()> {
+    {
         let name = Some("workspace");
-        let device = self.device;
         if workspace.device != device.ordinal {
             return Err(Error::precondition(
                 PreconditionKind::Device,
@@ -725,13 +745,13 @@ impl Checks<'_> {
                 ),
             ));
         }
-        if (workspace.shape[0] as u64) < self.required as u64 {
+        if (workspace.shape[0] as u64) < required {
             return Err(Error::precondition(
                 PreconditionKind::Shape,
                 name,
                 format!(
-                    "the workspace has {} bytes, but the pinned algorithm of '{stem}' needs {} (the entry's limit is {})",
-                    workspace.shape[0], self.required, self.workspace_bytes
+                    "the workspace has {} bytes, but {who} needs {required} (the entry's limit is {workspace_bytes})",
+                    workspace.shape[0]
                 ),
             ));
         }
@@ -746,7 +766,7 @@ impl Checks<'_> {
             ));
         }
         let (start, end) = (u128::from(workspace.ptr), u128::from(workspace.ptr) + workspace.shape[0] as u128);
-        for (arg, plan_name) in operands.iter().zip(self.plan.tensor_names()) {
+        for (arg, plan_name) in operands.iter().zip(plan.tensor_names()) {
             let bytes = crate::tensor::reach(arg.shape, arg.strides).saturating_mul(arg.dtype.size() as u128);
             let (a_start, a_end) = (u128::from(arg.ptr), u128::from(arg.ptr).saturating_add(bytes));
             if start < a_end && a_start < end {

@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::conv::{CONV_IMPL, CachedConv, ConvEntry, RawConv};
 use crate::elf::{Elf, sha256_hex};
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Expr, Symbols, parse_expr, parse_grid};
@@ -657,8 +658,11 @@ pub struct Manifest {
     pub(crate) digest: String,
     pub(crate) entries: Arc<Vec<Entry>>,
     pub(crate) library: Arc<Vec<LibraryEntry>>,
+    /// The cuDNN convolutions of the `library` section (`impl: "cudnn.conv_fwd"`).
+    pub(crate) convs: Arc<Vec<ConvEntry>>,
     pub(crate) kernels: Arc<Mutex<HashMap<(usize, usize), Cached>>>,
     pub(crate) gemms: Arc<Mutex<HashMap<(usize, usize), CachedGemm>>>,
+    pub(crate) conv_cache: Arc<Mutex<HashMap<(usize, usize), CachedConv>>>,
     /// The partition of the device's SMs the host runs its GEMMs on, when it said (`Manifest::with_sm_partition`).
     pub(crate) sm_partition: Option<u64>,
 }
@@ -2457,11 +2461,19 @@ impl Manifest {
             Entry::check_raw(raw).map_err(|e| Error::manifest(format!("'{}' ({}): {e}", raw.stem, raw.arch)))?;
         }
         let mut library = Vec::with_capacity(raw.library.len());
+        let mut convs = Vec::new();
         for (i, value) in raw.library.iter().enumerate() {
-            let entry: RawLibrary = serde_json::from_value(value.clone()).map_err(|e| {
+            let what = |e: serde_json::Error| {
                 Error::manifest(format!("library entry #{i} ({:?}): {e}", value.get("stem").and_then(Value::as_str)))
-            })?;
-            library.push(LibraryEntry::from_raw(entry, i)?);
+            };
+            // a cuDNN convolution has its own fields (`docs/manifest-schema-3.md`, section 9.4); every other entry is a cuBLASLt GEMM's
+            if value.get("impl").and_then(Value::as_str) == Some(CONV_IMPL) {
+                let entry: RawConv = serde_json::from_value(value.clone()).map_err(what)?;
+                convs.push(ConvEntry::from_raw(entry, i)?);
+            } else {
+                let entry: RawLibrary = serde_json::from_value(value.clone()).map_err(what)?;
+                library.push(LibraryEntry::from_raw(entry, i)?);
+            }
         }
         let digest =
             manifest_digest(&doc).map_err(|e| Error::manifest(format!("the manifest cannot be digested: {e}")))?;
@@ -2480,9 +2492,10 @@ impl Manifest {
             let cubin = verify_cubin(&raw, &stem, &arch, &mut read_cubin)?;
             entries.push(Entry::from_raw(raw, cubin.into())?);
         }
-        for entry in &library {
-            if !seen.insert((entry.stem.clone(), entry.arch.clone())) {
-                return Err(Error::manifest(format!("the manifest lists '{}' for {} twice", entry.stem, entry.arch)));
+        let library_keys = library.iter().map(|e| (&e.stem, &e.arch)).chain(convs.iter().map(|e| (&e.stem, &e.arch)));
+        for (stem, arch) in library_keys {
+            if !seen.insert((stem.clone(), arch.clone())) {
+                return Err(Error::manifest(format!("the manifest lists '{stem}' for {arch} twice")));
             }
         }
         Ok(Self {
@@ -2490,8 +2503,10 @@ impl Manifest {
             digest,
             entries: Arc::new(entries),
             library: Arc::new(library),
+            convs: Arc::new(convs),
             kernels: Arc::new(Mutex::new(HashMap::new())),
             gemms: Arc::new(Mutex::new(HashMap::new())),
+            conv_cache: Arc::new(Mutex::new(HashMap::new())),
             sm_partition: None,
         })
     }
@@ -2516,7 +2531,7 @@ impl Manifest {
         self.entries.iter().find(|e| e.stem == stem && e.arch == arch)
     }
 
-    /// Every library operation of the manifest (a pinned cuBLASLt GEMM), in file order.
+    /// Every pinned cuBLASLt GEMM of the manifest's `library` section, in file order (its cuDNN convolutions are [`Manifest::convolutions`]).
     pub fn library(&self) -> &[LibraryEntry] {
         &self.library
     }
@@ -2553,6 +2568,26 @@ impl Manifest {
             Error::NoBinary(m) if self.library.iter().any(|l| l.stem == name || l.op == name) => Error::NoBinary(
                 format!("{m}; '{name}' is a library operation (a pinned cuBLASLt GEMM): load it with Manifest::gemm"),
             ),
+            Error::NoBinary(m) if self.convs.iter().any(|l| l.stem == name || l.op == name) => {
+                Error::NoBinary(format!(
+                    "{m}; '{name}' is a library operation (a pinned cuDNN convolution): load it with Manifest::conv"
+                ))
+            }
+            other => other,
+        })
+    }
+
+    /// The index of the convolution entry for `name` (a stem, or an operator) with exactly these bucket values on `arch`.
+    pub(crate) fn select_conv(&self, name: &str, buckets: &[(&str, u64)], arch: &str) -> Result<usize> {
+        let items: Vec<Named<'_>> =
+            self.convs.iter().map(|e| Named { stem: &e.stem, op: &e.op, arch: &e.arch, buckets: &e.buckets }).collect();
+        select_among(&self.label, "cuDNN convolution", &items, name, buckets, arch).map_err(|e| match e {
+            Error::NoBinary(m) if self.library.iter().any(|l| l.stem == name || l.op == name) => {
+                Error::NoBinary(format!("{m}; '{name}' is a pinned cuBLASLt GEMM: load it with Manifest::gemm"))
+            }
+            Error::NoBinary(m) if self.entries.iter().any(|k| k.stem == name || k.op == name) => {
+                Error::NoBinary(format!("{m}; '{name}' is a kernel: load it with Manifest::kernel"))
+            }
             other => other,
         })
     }
@@ -2567,6 +2602,9 @@ impl Manifest {
         select_among(&self.label, "library operation", &items, name, buckets, arch).map_err(|e| match e {
             Error::NoBinary(m) if self.entries.iter().any(|k| k.stem == name || k.op == name) => {
                 Error::NoBinary(format!("{m}; '{name}' is a kernel: load it with Manifest::kernel"))
+            }
+            Error::NoBinary(m) if self.convs.iter().any(|k| k.stem == name || k.op == name) => {
+                Error::NoBinary(format!("{m}; '{name}' is a cuDNN convolution: load it with Manifest::conv"))
             }
             other => other,
         })

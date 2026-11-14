@@ -812,6 +812,27 @@ def must_be_torchs(layout):
     return check
 
 
+def conv_ops():
+    """The cuDNN convolutions of ``conv_kernels`` (both APIs, both layouts, one and two spatial axes, f16, bf16 and f32)."""
+    import conv_kernels as ck
+
+    return dict(ck.CONVS)
+
+
+def conv_cases(declared):
+    import conv_kernels as ck
+
+    out = []
+    for name, op in ck.CONVS.items():
+        if name not in declared:
+            continue
+        bucketed = any(d.free_dims() for p in op.signature.params for d in p.type.shape)
+        for values in ({"T": 64}, {"T": 646}) if bucketed else ({},):
+            stem = name + "".join(f".{k}{v}" for k, v in values.items())
+            out.append(Case(name, stem, "seed0", lambda op=op, values=values: ck.operands(op, values, seed=len(op.name)), kind="conv"))
+    return out
+
+
 def f16_cases(declared):
     return [
         Case(
@@ -914,6 +935,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(ieee_ops())
         declared.update(tanh_ops())
         declared.update(ws_ops())
+        declared.update(conv_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -926,12 +948,12 @@ def prepare(work, manifest_dir=None, pin=None):
     # embedded: the generated module also carries the manifest and the cubins (include_bytes!), which the Rust test runs too
     rust.emit(manifest, work / "generated.rs", ops=all_ops, embed=True)
     cases, skipped, tensors_total = [], [], 0
-    for case in [*build_cases(), *gemm_cases(), *option_cases(declared), *f16_cases(declared)]:
+    for case in [*build_cases(), *gemm_cases(), *option_cases(declared), *f16_cases(declared), *conv_cases(declared)]:
         if manifest.get(case.stem, arch) is None and manifest.library_entry(case.stem, arch) is None:
             skipped.append(case.stem)
             continue
         op = declared[case.op]
-        library = case.kind == "gemm"
+        library = case.kind in ("gemm", "conv")
         tensors, inputs, outputs = library_abi(op) if library else abi_of(op)
         (work / "cases" / case.id).mkdir(parents=True)
         args = case.make()
@@ -965,9 +987,12 @@ def prepare(work, manifest_dir=None, pin=None):
     if not cases:
         sys.exit(f"no case has a binary in the manifest for {arch}")
     doc = {"arch": arch, "digest": digest, "manifest": manifest_ref}
-    versions = sorted({e["cublaslt_version"] for e in manifest.library_entries if e["arch"] == arch})
+    versions = sorted({e["cublaslt_version"] for e in manifest.library_entries if e["arch"] == arch and "cublaslt_version" in e})
     if versions:
         doc["cublaslt_version"] = versions[0] if len(versions) == 1 else versions
+    cudnn = sorted({e["cudnn_version"] for e in manifest.library_entries if e["arch"] == arch and "cudnn_version" in e})
+    if cudnn:
+        doc["cudnn_version"] = cudnn[0]
     doc["cases"] = cases
     (work / "cases.json").write_text(json.dumps(doc, indent=1) + "\n", encoding="utf-8")
     note = f" ({len(skipped)} cases skipped: the manifest has no binary of {sorted(set(skipped))[:6]}...)" if skipped else ""
@@ -1153,8 +1178,16 @@ def plan_graphs():
             for seed in (0, 1)
         ]
 
+    import conv_kernels as ck
+
+    def conv_chain_cases():
+        _, w1 = ck.operands(ck.conv_k7, {"T": 64}, seed=120)
+        _, w2 = ck.operands(ck.conv_k7_dil, {"T": 64}, seed=121)
+        return [(f"T{t}-seed{seed}", {"x": ck.operands(ck.conv_k7, {"T": t}, seed=122 + t + seed)[0], "w1": w1, "w2": w2}) for t in (64, 646) for seed in (0, 1)]
+
     return [
         ("block", pm.block, False, block_cases),
+        ("conv_chain", ck.conv_chain, False, conv_chain_cases),  # two cuDNN convolutions, a backend pin and a legacy one, the workspace in the arena
         ("block-reuse", pm.block, True, block_cases),
         (f"deep{layers}", deep, False, deep_cases),
         (f"deep{layers}-reuse", deep, True, deep_cases),

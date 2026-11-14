@@ -150,6 +150,14 @@ pub enum Error {
         /// The status it returned (cudarc's `CublasError`, as text).
         status: String,
     },
+    /// A cuDNN call failed: the call and the `cudnnStatus_t` it returned.
+    #[error("cuDNN call {call} failed: {status}")]
+    Cudnn {
+        /// The function of cuDNN.
+        call: &'static str,
+        /// The status it returned (cudarc's `CudnnError`, as text).
+        status: String,
+    },
     /// A CUDA driver call failed: cudarc's `DriverError`, which is the `CUresult` with the name and the text the driver gives it.
     #[error("CUDA driver call {call} failed: {source}")]
     Driver {
@@ -173,6 +181,11 @@ impl Error {
     /// The error of a cuBLASLt call, for `map_err`.
     pub(crate) fn cublas(call: &'static str) -> impl FnOnce(cudarc::cublaslt::result::CublasError) -> Self {
         move |source| Self::Cublas { call, status: format!("{:?}", source.0) }
+    }
+
+    /// The error of a cuDNN call, for `map_err`.
+    pub(crate) fn cudnn(call: &'static str) -> impl FnOnce(cudarc::cudnn::result::CudnnError) -> Self {
+        move |source| Self::Cudnn { call, status: format!("{:?}", source.0) }
     }
 
     pub(crate) fn manifest(message: impl Into<String>) -> Self {
