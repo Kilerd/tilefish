@@ -23,7 +23,7 @@ use crate::tensor::DType;
 const COMPUTE_32F: sys::cublasComputeType_t = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
 const R_32F: sys::cudaDataType = sys::cudaDataType::CUDA_R_32F;
 
-/// The `cudaDataType_t` of a type a GEMM has (bf16 and f16 operands, and an f32 result); the reader of an entry has refused every other.
+/// The `cudaDataType_t` of a type a GEMM has (bf16, f16 and f32 operands, and an f32 result); the reader of an entry has refused every other.
 fn data_type(dtype: DType) -> sys::cudaDataType {
     match dtype {
         DType::F16 => sys::cudaDataType::CUDA_R_16F,

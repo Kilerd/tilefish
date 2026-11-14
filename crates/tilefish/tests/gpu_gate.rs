@@ -1399,8 +1399,9 @@ fn the_gate_has_generated_ops() {
 }
 
 /// The GEMMs of the forms of section 9.2 of the manifest schema (on a fresh export): f16 operands in TN (with 64 MiB of workspace) and in NN (with a
-/// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN, and f16 operands pinned for a partition of 16 SMs
-/// (`sm_count_target`: the Rust host sets it on every launch, and a host on a partition takes only the pins chosen for it). Rust reads each form from its entry, and loads,
+/// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN, f16 operands pinned for a partition of 16 SMs
+/// (`sm_count_target`: the Rust host sets it on every launch, and a host on a partition takes only the pins chosen for it), and f32 operands with
+/// TF32 off (TN, TN with a bias, NN with a bias and TN under the torch posture with `allow_f32_reduction`). Rust reads each form from its entry, and loads,
 /// vets and runs it (`byte_identity` holds its bytes to Python's replay); here each is also captured in a CUDA graph with `launch_raw` and
 /// matches Python's bytes.
 #[test]
@@ -1418,6 +1419,10 @@ fn the_gate_has_gemms_of_every_form() {
         ("gemm_f16_f32", DType::F16, DType::F32, GemmLayout::Tn, false, None),
         ("gemm_bf16_nn_f32", DType::Bf16, DType::F32, GemmLayout::Nn, false, None),
         ("gemm_f16_t16", DType::F16, DType::F16, GemmLayout::Tn, false, Some(16)),
+        ("gemm_f32_tn", DType::F32, DType::F32, GemmLayout::Tn, false, None),
+        ("gemm_f32_tn_bias", DType::F32, DType::F32, GemmLayout::Tn, false, None),
+        ("gemm_f32_nn_bias", DType::F32, DType::F32, GemmLayout::Nn, true, None),
+        ("gemm_f32_tn_torch", DType::F32, DType::F32, GemmLayout::Tn, true, None),
     ];
     for (op, dtype, out_dtype, layout, opted, target) in forms {
         let of_op = cases_where(&cases, |c| c["stem"].as_str().unwrap().starts_with(&format!("{op}.M")));
@@ -1425,11 +1430,14 @@ fn the_gate_has_gemms_of_every_form() {
         for case in &of_op {
             let stem = case["stem"].as_str().unwrap();
             let entry = manifest.library_entry(stem, &arch.to_string()).unwrap();
+            // the opt-in is the operands' type's: allow_f32_reduction for f32 operands, allow_f16_reduction for the f16 forms here
+            let opt_in = if dtype == DType::F32 { entry.allow_f32_reduction } else { entry.allow_f16_reduction };
             assert_eq!(
-                (entry.dtype, entry.out_dtype, entry.layout, entry.allow_f16_reduction),
+                (entry.dtype, entry.out_dtype, entry.layout, opt_in),
                 (dtype, out_dtype, layout, opted),
                 "{stem}"
             );
+            assert_eq!(entry.allows_output_type_reduction(), opted, "{stem}");
             assert_eq!(entry.sm_count_target, target, "{stem}");
             let gemm = manifest.gemm(&gpu.ctx, stem, &[], arch).unwrap();
             assert_eq!((gemm.dtype(), gemm.out_dtype(), gemm.layout()), (dtype, out_dtype, layout), "{stem}");

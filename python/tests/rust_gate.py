@@ -51,8 +51,10 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   for this device, whose split-K adds its partial sums in bf16 at one bucket in the output and at another in a workspace (``allow_bf16_reduction=True``),
   and a ``gemm_bias`` whose ``K`` is 9 (rows that do not start on 16 bytes); and the other forms (:data:`F16_FORMS`): f16 operands in ``TN``, f16 in
   ``NN`` with an f16 bias under ``heuristic="torch"`` (with torch's workspace: checked here to be ``torch.addmm``'s bytes), f16 operands in ``TN`` with
-  64 MiB of workspace, f16 operands with an f32 result and bias, bf16 operands in ``NN`` with an f32 result, and f16 operands in ``TN`` pinned for
-  a partition of 16 SMs (``sm_count_target=16``, which the Rust host sets on every launch too);
+  64 MiB of workspace, f16 operands with an f32 result and bias, bf16 operands in ``NN`` with an f32 result, f16 operands in ``TN`` pinned for
+  a partition of 16 SMs (``sm_count_target=16``, which the Rust host sets on every launch too), and f32 operands with TF32 off: in ``TN``, in
+  ``TN`` with a bias, in ``NN`` with a bias under ``heuristic="torch"`` with ``allow_f32_reduction`` (checked here to be ``torch.addmm``'s bytes in
+  f32) and in ``TN`` under ``heuristic="torch"`` (checked to be ``torch.mm``'s);
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
   exported and run through Python's plan replay; ``crates/tilefish/tests/gpu_plan_gate.rs`` launches and captures each case, and ``compare`` holds the
@@ -576,6 +578,11 @@ F16_FORMS = {
     "gemm_f16_f32": ("f16", "f32", "TN", True, 1024, 3072, {}),
     "gemm_bf16_nn_f32": ("bf16", "f32", "NN", False, 640, 96, {}),
     "gemm_f16_t16": ("f16", "f16", "TN", True, 1536, 3072, {"sm_count_target": 16}),  # pinned for a partition of 16 SMs (section 9.3)
+    # f32 operands and result, TF32 off (section 9.2)
+    "gemm_f32_tn": ("f32", "f32", "TN", False, 3072, 1024, {}),
+    "gemm_f32_tn_bias": ("f32", "f32", "TN", True, 1024, 3072, {"workspace_bytes": 64 << 20}),
+    "gemm_f32_nn_bias": ("f32", "f32", "NN", True, 1536, 7168, {"heuristic": "torch", "allow_f32_reduction": True}),
+    "gemm_f32_tn_torch": ("f32", "f32", "TN", False, 1024, 4096, {"heuristic": "torch", "allow_f32_reduction": True}),
 }
 
 
@@ -611,11 +618,18 @@ def f16_operands(name, m, seed):
 
 
 def must_be_torchs(layout):
-    """The ``"torch"`` posture's result is ``torch.addmm`` in f16, byte for byte."""
+    """The ``"torch"`` posture's result is ``torch.addmm`` (``torch.mm`` without a bias) byte for byte, in f16, or in f32 with TF32 off."""
 
     def check(args, got):
-        a, b, bias = args
-        assert same_bytes(got, torch.addmm(bias, a, b.t() if layout == "TN" else b)), "not torch.addmm's bytes"
+        a, b, *bias = args
+        rhs = b.t() if layout == "TN" else b
+        tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            want = torch.addmm(bias[0], a, rhs) if bias else torch.mm(a, rhs)
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = tf32
+        assert same_bytes(got, want), f"not torch.{'addmm' if bias else 'mm'}'s bytes"
 
     return check
 

@@ -25,7 +25,7 @@ ALGO = "0123456789abcdef" * 8  # 64 bytes of hex: not an algorithm anyone chose,
 VERSION = 120804
 SMS = 30  # the multiprocessors of the device a pin is made on (a B300 MIG slice of 1g has 30)
 FORM = _cublaslt.Form()  # bf16 in and out, TN: the form of every op of this file
-NO_OPT_IN = {"allow_bf16_reduction": False, "allow_f16_reduction": False}
+NO_OPT_IN = {"allow_bf16_reduction": False, "allow_f16_reduction": False, "allow_f32_reduction": False}
 
 
 @tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")
@@ -92,14 +92,14 @@ def _bias_rank2(a: Tensor[M, 1024, bf16], b: Tensor[2048, 1024, bf16], bias: Ten
 def _bias_wrong_size(a: Tensor[M, 1024, bf16], b: Tensor[2048, 1024, bf16], bias: Tensor[1024, bf16]) -> Tensor[M, 2048, bf16]: ...
 
 
-def test_the_signature_must_be_a_gemm_of_bf16_or_f16_operands():
+def test_the_signature_must_be_a_gemm_of_bf16_f16_or_f32_operands():
     with pytest.raises(TilefishDeclarationError, match="takes 2 input tensors"):
         declare(_one_arg)
     with pytest.raises(TilefishDeclarationError, match="takes 3 input tensors"):
         declare(_two_args, "cublaslt.gemm_bias")
     with pytest.raises(TilefishDeclarationError, match="declare a return type"):
         declare(_no_return)
-    with pytest.raises(TilefishDeclarationError, match="a and b must both be bf16 or both be f16 tensors"):
+    with pytest.raises(TilefishDeclarationError, match="a and b must both be bf16, both be f16 or both be f32 tensors"):
         declare(_f32_operand)
     with pytest.raises(TilefishDeclarationError, match=r"a is \[M, K\] and b is \[N, K\]: their last axes must be the same"):
         declare(_k_mismatch)

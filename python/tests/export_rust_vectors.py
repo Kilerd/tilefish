@@ -22,7 +22,8 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
   ``kernelParams``: pointers are addresses, ``i32`` and ``i64`` scalars their integer, a fixed argument its integer or the IEEE bits of an ``f32``, and a Triton
   kernel's two null scratch slots follow (a prebuilt binary has none);
 * ``python_plans.json``: plan documents and what Python decides of each (``export_plan_vectors.py``);
-* ``python_library.json``: ``library`` entries of every form (operand and result types, a bias, the layouts, the opt-ins), each also changed in one field,
+* ``python_library.json``: ``library`` entries of every form (bf16, f16 and f32 operands, result types, a bias, the layouts, the opt-ins), each also
+  changed in one field,
   and what Python's strict reader decides of each (accepted, with the form it reads and the SM count it targets, or refused);
 * ``python_manifests.in``: ``MANIFESTS``, small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
   alphabets; schema 3 with kernels and library entries in every order, every field it added, the spelling of floats, non-ASCII text escaped and as it is,
@@ -352,6 +353,8 @@ def manifest_documents():
         {"schema": 3, "kernels": [], "library": [library("g.M32", version=120805)]},
         # an entry of f16 operands, an f32 result and the layout NN (section 9.2): its form is in fields every entry has, digested as they are
         {"schema": 3, "kernels": [], "library": [library("g.M32", dtypes={"a": "f16", "b": "f16", "out": "f32"}, transa="N", lda=2048, allow_f16_reduction=True)]},
+        # an entry of f32 operands that opts in to split-K partial sums in the output (section 9.2)
+        {"schema": 3, "kernels": [], "library": [library("g.M32", dtypes={"a": "f32", "b": "f32", "out": "f32"}, allow_f32_reduction=True)]},
         # non-ASCII, escaped (and, at the end of the list, as it is)
         non_ascii,
         # a schema that is not the integer 3: the digest still has a form for each, and 3.0 is the same number as 3 in Python
@@ -730,10 +733,10 @@ def launches_json():
 
 
 def library_entries():
-    """``library`` entries of every form (bf16 or f16 operands, a result of their type or f32, a bias, the layouts TN and NN, the opt-ins) as
+    """``library`` entries of every form (bf16, f16 or f32 operands, a result of their type or f32, a bias, the layouts TN and NN, the opt-ins) as
     ``tilefish._library`` writes them, and each changed in one field, with what Python's strict reader (``validate_entry``) decides: accepted,
-    with the form it reads (operand type, result type, layout, the two opt-ins), or refused. The Rust reader must decide the same
-    (``tests/python_library.rs``)."""
+    with the form it reads (operand type, result type, layout, the opt-ins of bf16 and f16, the SM count target, the opt-in of f32), or refused.
+    The Rust reader must decide the same (``tests/python_library.rs``)."""
     import copy
 
     import tilefish
@@ -766,6 +769,9 @@ def library_entries():
         declare("bf16", "f32", "NN", False),
         declare("f16", "f16", "NN", False, n=96, k=9),
         declare("f16", "f16", "NN", True, sm_count_target=16),
+        declare("f32", "f32", "TN", False),
+        declare("f32", "f32", "NN", True, allow_f32_reduction=True),
+        declare("f32", "f32", "TN", True, n=96, k=9),
     ]
     goods = [BuiltLibrary(library_specs(op)[0], "sm_103", "0123456789abcdef" * 8, 120804, 30).entry() for op in ops]
 
@@ -788,14 +794,16 @@ def library_entries():
             (["transb"], "T"),
             (["lda"], good["k"] if nn else good["n"]),
             (["dtypes", "a"], "f16" if good["dtypes"]["a"] == "bf16" else "bf16"),
-            (["dtypes", "b"], "f32"),
+            (["dtypes", "b"], "f32" if good["dtypes"]["a"] != "f32" else "f16"),
             (["dtypes", "out"], "bf16" if good["dtypes"]["out"] != "bf16" else "f16"),
             (["abi", "params", 1, "shape"], list(reversed(good["abi"]["params"][1]["shape"]))),
-            (["abi", "params", 0, "dtype"], "f32"),
+            (["abi", "params", 0, "dtype"], "f32" if good["dtypes"]["a"] != "f32" else "bf16"),
             (["abi", "params", len(good["abi"]["params"]) - 1, "dtype"], "f16" if good["dtypes"]["out"] != "f16" else "f32"),
             (["allow_bf16_reduction"], True),
             (["allow_f16_reduction"], True),
             (["allow_f16_reduction"], False),
+            (["allow_f32_reduction"], True),
+            (["allow_f32_reduction"], False),
             (["sm_count_target"], 8),
             (["sm_count_target"], 7),
             (["sm_count_target"], 31),
@@ -803,8 +811,17 @@ def library_entries():
         ]:
             cases.append(changed(good, path, value))
         if "bias" in good["dtypes"]:
-            cases.append(changed(good, ["dtypes", "bias"], "f32" if good["dtypes"]["out"] != "f32" else good["dtypes"]["a"]))
-            cases.append(changed(good, ["abi", "params", 2, "dtype"], "f32" if good["dtypes"]["out"] != "f32" else good["dtypes"]["a"]))
+            other = "f32" if good["dtypes"]["out"] != "f32" else (good["dtypes"]["a"] if good["dtypes"]["a"] != "f32" else "f16")
+            cases.append(changed(good, ["dtypes", "bias"], other))
+            cases.append(changed(good, ["abi", "params", 2, "dtype"], other))
+        if good["dtypes"]["a"] == "f32":  # f32 operands with a 16-bit result (and bias): refused
+            for out in ("bf16", "f16"):
+                e = changed(good, ["dtypes", "out"], out)
+                if "bias" in e["dtypes"]:
+                    e["dtypes"]["bias"] = out
+                    e["abi"]["params"][2]["dtype"] = out
+                e["abi"]["params"][-1]["dtype"] = out
+                cases.append(e)
     out = []
     for entry in cases:
         try:
@@ -819,6 +836,7 @@ def library_entries():
             "allow_bf16_reduction" in entry,
             "allow_f16_reduction" in entry,
             entry.get("sm_count_target"),
+            "allow_f32_reduction" in entry,
         ]
         out.append({"entry": entry, "accepted": True, "form": form})
     return out

@@ -57,8 +57,9 @@
 //! * a pointer with the empty shape, a **device scalar**: one element of device memory (a tensor of shape `[]` or `[1]`) that the kernel
 //!   reads with `tl.load`, so that one binary runs for every value;
 //! * **`i64` scalars** and **`fixed` arguments** (a value the manifest holds, written at its slot: an `i32`, an `i64` or an `f32`);
-//! * a **library operation**: a GEMM of bf16 or f16 operands (a result of their type or f32; `b` as `[N, K]` or `[K, N]`) through cuBLASLt
-//!   with the algorithm the manifest pinned ([`Manifest::gemm`], [`Gemm`]; [`LibraryEntry::dtype`], [`LibraryEntry::layout`]).
+//! * a **library operation**: a GEMM of bf16, f16 or f32 operands (a result of their type or f32; f32 operands multiplied as f32, TF32 off;
+//!   `b` as `[N, K]` or `[K, N]`) through cuBLASLt with the algorithm the manifest pinned ([`Manifest::gemm`], [`Gemm`];
+//!   [`LibraryEntry::dtype`], [`LibraryEntry::layout`]).
 //!
 //! ```no_run
 //! use tilefish::cudarc::driver::CudaContext;

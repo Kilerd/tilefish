@@ -1,9 +1,9 @@
-//! The `library` section of a manifest: operations that a vendor library runs, with no file. Today: a GEMM of bf16 or f16 operands through
-//! cuBLASLt with the algorithm pinned (`docs/manifest-schema-3.md`, section 9).
+//! The `library` section of a manifest: operations that a vendor library runs, with no file. Today: a GEMM of bf16, f16 or f32 operands
+//! through cuBLASLt with the algorithm pinned (`docs/manifest-schema-3.md`, section 9).
 //!
 //! A port of `validate_entry` of `python/src/tilefish/_library.py`. An entry has exactly the fields of [`ENTRY_KEYS`], each of the type it
-//! needs, and the redundant ones must agree: the dtypes are two operands of one type (`bf16` or `f16`) and a result of their type or `f32`
-//! (a bias has the result's type); `transa` says the layout (`T`: `b` is `[n, k]`, `N`: `b` is `[k, n]`), and the leading dimensions and the
+//! needs, and the redundant ones must agree: the dtypes are two operands of one type (`bf16`, `f16` or `f32`) and a result of their type or
+//! `f32` (a bias has the result's type); `transa` says the layout (`T`: `b` is `[n, k]`, `N`: `b` is `[k, n]`), and the leading dimensions and the
 //! shapes of the operands follow from it, `impl`, `m`, `n` and `k`, which may be any size (an algorithm that cannot take the leading
 //! dimensions they make is refused by `cublasLtMatmulAlgoCheck` when it is loaded). The pinned algorithm is 64 bytes (128 lowercase hex digits) that
 //! only the library that made them can judge: running one is [`crate::gemm`].
@@ -74,9 +74,9 @@ impl GemmLayout {
 /// library is called (the layout).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct GemmForm {
-    /// The type of `a` and `b` (bf16 or f16).
+    /// The type of `a` and `b` (bf16, f16 or f32).
     pub dtype: DType,
-    /// The type of the result and of a bias (`dtype`, or f32).
+    /// The type of the result and of a bias (`dtype`, or f32; f32 for f32 operands).
     pub out: DType,
     pub layout: GemmLayout,
 }
@@ -95,7 +95,8 @@ impl GemmForm {
         }
     }
 
-    /// The keyword of the opt-in to split-K partial sums in the output type, named by the operands' type (`allow_f16_reduction`).
+    /// The keyword of the opt-in to split-K partial sums in the output type, named by the operands' type (`allow_f16_reduction`,
+    /// `allow_f32_reduction`).
     pub fn opt_in(&self) -> String {
         format!("allow_{}_reduction", self.dtype.name())
     }
@@ -147,9 +148,10 @@ pub struct LibraryEntry {
     pub arch: String,
     /// Which routine runs it.
     pub implementation: LibraryImpl,
-    /// The type of `a` and `b` (`dtypes.a`): [`DType::Bf16`] or [`DType::F16`].
+    /// The type of `a` and `b` (`dtypes.a`): [`DType::Bf16`], [`DType::F16`] or [`DType::F32`] (multiplied as f32, TF32 off: the crate
+    /// refuses an algorithm that would not; `docs/manifest-schema-3.md`, section 9.2).
     pub dtype: DType,
-    /// The type of the result and of a bias (`dtypes.out`): `dtype`, or [`DType::F32`].
+    /// The type of the result and of a bias (`dtypes.out`): `dtype`, or [`DType::F32`] (f32 for f32 operands).
     pub out_dtype: DType,
     /// How `b` is stored (`transa`, `transb`).
     pub layout: GemmLayout,
@@ -195,6 +197,9 @@ pub struct LibraryEntry {
     pub allow_bf16_reduction: bool,
     /// The same opt-in of f16 operands (`allow_f16_reduction: true`, only on f16 operands; absent: no).
     pub allow_f16_reduction: bool,
+    /// The same opt-in of f32 operands (`allow_f32_reduction: true`, only on f32 operands; absent: no): split-K may add its partial sums in the
+    /// output (`INPLACE`, `OUTPUT_TYPE`), not only in a workspace of the compute type.
+    pub allow_f32_reduction: bool,
 }
 
 impl LibraryEntry {
@@ -205,7 +210,7 @@ impl LibraryEntry {
 
     /// Whether split-K may add its partial sums in the output type: the opt-in of the operands' type.
     pub fn allows_output_type_reduction(&self) -> bool {
-        self.allow_bf16_reduction || self.allow_f16_reduction
+        self.allow_bf16_reduction || self.allow_f16_reduction || self.allow_f32_reduction
     }
 
     /// The SM count the algorithm was chosen for: the target, or the device's count.
@@ -257,6 +262,8 @@ pub(crate) struct RawLibrary {
     allow_bf16_reduction: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     allow_f16_reduction: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    allow_f32_reduction: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     sm_count_target: Option<Value>,
 }
@@ -383,10 +390,10 @@ impl LibraryEntry {
                 raw.implementation, raw.epilogue
             ));
         }
-        // a and b of one type, bf16 or f16; the result (and a bias) of theirs or f32; anything else is held to the default form in the message
+        // a and b of one type, bf16, f16 or f32; the result (and a bias) of theirs or f32; anything else is held to the default form in the message
         let named = |key: &str| raw.dtypes.get(key).and_then(Value::as_str).and_then(DType::from_name);
         let (dtype, out_dtype) = match (named("a"), named("out")) {
-            (Some(a @ (DType::Bf16 | DType::F16)), Some(out)) if out == a || out == DType::F32 => (a, out),
+            (Some(a @ (DType::Bf16 | DType::F16 | DType::F32)), Some(out)) if out == a || out == DType::F32 => (a, out),
             _ => (DType::Bf16, DType::Bf16),
         };
         let mut want_dtypes = Map::new();
@@ -399,7 +406,8 @@ impl LibraryEntry {
         }
         if raw.dtypes != want_dtypes {
             return Err(format!(
-                "dtypes must be {}, got {} (a and b are both bf16 or both f16, the result is of their type or f32, a bias of the result's type)",
+                "dtypes must be {}, got {} (a and b are both bf16, both f16 or both f32, the result is of their type or f32, a bias of the \
+                 result's type)",
                 Value::Object(want_dtypes),
                 Value::Object(raw.dtypes)
             ));
@@ -454,10 +462,12 @@ impl LibraryEntry {
         let allow_bf16_reduction =
             optional_field(&raw.allow_bf16_reduction, "allow_bf16_reduction", &Value::Bool(true))?;
         let allow_f16_reduction = optional_field(&raw.allow_f16_reduction, "allow_f16_reduction", &Value::Bool(true))?;
+        let allow_f32_reduction = optional_field(&raw.allow_f32_reduction, "allow_f32_reduction", &Value::Bool(true))?;
         // the opt-in is named by the operands' type, as torch's flags are
         for (flag, set, of) in [
             ("allow_bf16_reduction", allow_bf16_reduction, DType::Bf16),
             ("allow_f16_reduction", allow_f16_reduction, DType::F16),
+            ("allow_f32_reduction", allow_f32_reduction, DType::F32),
         ] {
             if set && dtype != of {
                 return Err(format!(
@@ -616,6 +626,7 @@ impl LibraryEntry {
             algo_source,
             allow_bf16_reduction,
             allow_f16_reduction,
+            allow_f32_reduction,
         })
     }
 }

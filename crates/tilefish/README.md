@@ -61,7 +61,12 @@ entry that opts in (`allow_bf16_reduction`). A GEMM may have f16 operands, an
 f32 result and `b` stored `[K, N]` (`LibraryEntry::dtype`, `out_dtype`,
 `layout`: `GemmLayout::Tn` or `Nn`); its tensors are checked against those
 types and shapes, and an f16 entry opts in to f16 partial sums with
-`allow_f16_reduction`. An entry pinned for a partition of the device's SMs
+`allow_f16_reduction`. A GEMM of f32 operands (and an f32 result) is multiplied
+as f32, TF32 off: the crate refuses its algorithm where the library would run
+it as TF32 or as a bf16x9 emulation (an `NVIDIA_TF32_OVERRIDE=1` or
+`CUBLAS_EMULATE_SINGLE_PRECISION=1` process), and an f32 entry opts in to
+split-K partial sums in the output with `allow_f32_reduction`
+(`LibraryEntry::allow_f32_reduction`). An entry pinned for a partition of the device's SMs
 (`sm_count_target`) sets that target on every launch, and a host that runs on a
 partition says so with `Manifest::with_sm_partition(Some(sms))`: entries chosen
 for another count are refused. The entry of an operator declared

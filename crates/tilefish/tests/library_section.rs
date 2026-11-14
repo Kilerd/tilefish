@@ -477,9 +477,9 @@ fn an_entry_whose_types_or_layout_disagree_is_refused() {
         ("an f32 bias with an f16 result", |e| e["dtypes"]["bias"] = "f32".into(), "dtypes must be"),
         ("a bf16 result of f16 operands", |e| e["dtypes"]["out"] = "bf16".into(), "dtypes must be"),
         (
-            "f32 operands",
+            "f32 dtypes over f16 pointers",
             |e| e["dtypes"] = json!({"a": "f32", "b": "f32", "bias": "f32", "out": "f32"}),
-            "dtypes must be",
+            "must be the f32 pointer #0",
         ),
         (
             "a pointer of another type than dtypes",
@@ -516,6 +516,73 @@ fn an_entry_whose_types_or_layout_disagree_is_refused() {
     assert!(
         refusal(&[], &[wrong])
             .contains("allow_f16_reduction is the opt-in of f16 operands, and the operands of this entry are bf16")
+    );
+}
+
+/// f32 operands (section 9.2) have an f32 result and bias, in both layouts, and opt in to split-K partial sums in the output with
+/// `allow_f32_reduction`; a 16-bit result of f32 operands, or an opt-in of another type, is refused.
+#[test]
+fn an_entry_of_f32_operands_is_read_with_an_f32_result_and_its_own_opt_in() {
+    let manifest =
+        read(&[], &[gemm_of(true, 32, 1024, 3072, "f32", "f32", "TN"), gemm_of(false, 64, 96, 9, "f32", "f32", "NN")])
+            .unwrap();
+    let tn = manifest.library_entry("gemm_bias.M32", "sm_103").unwrap();
+    assert_eq!((tn.dtype, tn.out_dtype, tn.layout), (DType::F32, DType::F32, GemmLayout::Tn));
+    let dtypes: Vec<_> = tn
+        .params
+        .iter()
+        .map(|p| match &p.kind {
+            ParamKind::Pointer { dtype, .. } => dtype.unwrap(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(dtypes, [DType::F32; 4]);
+    assert!(!tn.allows_output_type_reduction());
+    let nn = manifest.library_entry("gemm.M64", "sm_103").unwrap();
+    assert_eq!((nn.dtype, nn.out_dtype, nn.layout, nn.k), (DType::F32, DType::F32, GemmLayout::Nn, 9));
+    let mut opted = gemm_of(false, 32, 1024, 1024, "f32", "f32", "NN");
+    opted["allow_f32_reduction"] = true.into();
+    let manifest = read(&[], &[opted]).unwrap();
+    let e = &manifest.library()[0];
+    assert!(
+        e.allow_f32_reduction && !e.allow_f16_reduction && !e.allow_bf16_reduction && e.allows_output_type_reduction()
+    );
+    type Change = fn(&mut Value);
+    let cases: [(&str, Change, &str); 7] = [
+        ("an f16 result of f32 operands", |e| e["dtypes"]["out"] = "f16".into(), "dtypes must be"),
+        (
+            "a bf16 result and bias of f32 operands",
+            |e| {
+                e["dtypes"]["out"] = "bf16".into();
+                e["dtypes"]["bias"] = "bf16".into();
+            },
+            "dtypes must be",
+        ),
+        ("f32 a with an f16 b", |e| e["dtypes"]["b"] = "f16".into(), "dtypes must be"),
+        ("a pointer of another type", |e| e["abi"]["params"][1]["dtype"] = "f16".into(), "must be the f32 pointer #1"),
+        (
+            "the f16 opt-in on f32 operands",
+            |e| e["allow_f16_reduction"] = true.into(),
+            "allow_f16_reduction is the opt-in of f16 operands, and the operands of this entry are f32",
+        ),
+        (
+            "the f32 opt-in written as false",
+            |e| e["allow_f32_reduction"] = false.into(),
+            "allow_f32_reduction is absent (the default) or true, got false",
+        ),
+        ("the f32 opt-in as a string", |e| e["allow_f32_reduction"] = "true".into(), "allow_f32_reduction is absent"),
+    ];
+    for (what, change, why) in cases {
+        let mut entry = gemm_of(true, 32, 1024, 3072, "f32", "f32", "TN");
+        change(&mut entry);
+        let message = refusal(&[], &[entry]);
+        assert!(message.contains(why), "{what}: {message}");
+    }
+    let mut wrong = gemm(false, 32, 1024, 1024);
+    wrong["allow_f32_reduction"] = true.into();
+    assert!(
+        refusal(&[], &[wrong])
+            .contains("allow_f32_reduction is the opt-in of f32 operands, and the operands of this entry are bf16")
     );
 }
 

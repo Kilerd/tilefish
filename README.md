@@ -462,6 +462,25 @@ The opt-in to split-K partial sums in the output type is named by the operands' 
 operand sets each, measured on a B300 MIG slice with cuBLASLt 12.8.4). An `AlgoTable` row of the layout `NN` is keyed `(m, n, k, bias, "NN")`; a
 configuration is encoded with the declaration's types. The entry says the form in `dtypes`, `transa` and `lda` (`docs/manifest-schema-3.md`, section 9.2).
 
+**f32, TF32 off.** f32 operands have an f32 result (and an f32 bias), and are multiplied as f32:
+
+```python
+@tilefish.library("proj32", acc=f32, impl="cublaslt.gemm_bias", heuristic="torch", allow_f32_reduction=True)
+def proj32(a: Tensor[M, 1024, f32], b: Tensor[3072, 1024, f32], bias: Tensor[3072, f32]) -> Tensor[M, 3072, f32]: ...   # torch.addmm(bias, a, b.t()), TF32 off
+```
+
+The compute type is `CUBLAS_COMPUTE_32F`, never `CUBLAS_COMPUTE_32F_FAST_TF32` (what torch's `allow_tf32` selects) nor the bf16x9 emulation of cuBLAS 13
+(`CUBLAS_COMPUTE_32F_EMULATED_16BFX9`). Both hosts refuse an f32 algorithm that would not multiply f32 as f32: one encoded for another compute type
+(cuBLASLt writes it into the 64 bytes, and the TF32 and emulated algorithm ids cannot be encoded under `CUBLAS_COMPUTE_32F` at all), one whose
+numerical-implementation flags say TF32 or 16-bit inputs, and every f32 pin in a process where cuBLASLt runs `CUBLAS_COMPUTE_32F` as TF32
+(`NVIDIA_TF32_OVERRIDE=1`) or as the emulation (`CUBLAS_EMULATE_SINGLE_PRECISION=1`): measured, the encoding shows both. The opt-in to split-K partial sums
+in the output is `allow_f32_reduction`; torch has no such flag and never restricts the reduction of an f32 GEMM, so its choice needs it. Under
+`heuristic="torch"` with it and torch's workspaces (8 519 680 bytes for `mm`, `CUBLAS_WORKSPACE_CONFIG`'s; 1 MiB for `addmm`), the result is `torch.mm` /
+`torch.addmm` in f32 with TF32 off, byte for byte, in both layouts (`test_gpu_gemm_f32.py`: 756 of 756 runs, 63 shapes with `M` from 1 to 2048, three
+operand sets, `mm` and `addmm`, `TN` and `NN`, with the default workspace and with `CUBLAS_WORKSPACE_CONFIG=:4096:8` and a 32 MiB limit; measured on a B300
+MIG slice with cuBLASLt 12.8.4 and 13.1.0 and on an RTX 5090 with 13.1.0). torch's `mm` runs `cublasSgemm`, and cuBLAS chooses for it the algorithm the
+cuBLASLt heuristic answers under that posture. See `docs/manifest-schema-3.md`, section 9.2.
+
 **SM partitions.** On a green context (a partition of the device's SMs) every SM-count query still reports the device's count, and a pinned
 algorithm computes the same bytes with or without a partition (measured, cuBLASLt 12.8.4); what changes is the heuristic's choice, through the
 context of the process's first cuBLASLt handle. `sm_count_target=P` pins the algorithm the heuristic chooses for `P` SMs

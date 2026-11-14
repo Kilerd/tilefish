@@ -5,10 +5,20 @@ The operation, in tilefish terms (row-major, contiguous, every pointer 16-byte a
     D[M, N] = A[M, K] @ B[N, K]^T          (+ bias[N])          the layout "TN" (the default)
     D[M, N] = A[M, K] @ B[K, N]            (+ bias[N])          the layout "NN"
 
-``A`` and ``B`` are bf16 or f16 (both the same), ``D`` is of their type or f32 (a :class:`Form`), the accumulator is f32, and the result is
-rounded to the type of ``D`` once, at the end (the bias, of the type of ``D``, is added in f32 to the accumulator before that rounding).
-``alpha = 1``, ``beta = 0``, host pointer mode. cuBLASLt 12.8.4 takes no other bias type for these operands (an f32 bias with a 16-bit ``D``, or
-a 16-bit bias with an f32 ``D``, is ``CUBLAS_STATUS_INVALID_VALUE`` from the heuristic: measured on sm_103), so none is offered.
+``A`` and ``B`` are bf16, f16 or f32 (both the same), ``D`` is of their type or f32 (f32 for f32 operands; a :class:`Form`), the accumulator is
+f32, and the result is rounded to the type of ``D`` once, at the end (the bias, of the type of ``D``, is added in f32 to the accumulator before that
+rounding). ``alpha = 1``, ``beta = 0``, host pointer mode. cuBLASLt 12.8.4 takes no other bias type for these operands (an f32 bias with a 16-bit
+``D``, or a 16-bit bias with an f32 ``D``, is ``CUBLAS_STATUS_INVALID_VALUE`` from the heuristic: measured on sm_103), so none is offered.
+
+**f32 operands, TF32 off.** The compute type is always ``CUBLAS_COMPUTE_32F`` (and the scale type ``CUDA_R_32F``), never
+``CUBLAS_COMPUTE_32F_FAST_TF32`` (what torch's ``allow_tf32`` selects), ``_FAST_16F``, ``_FAST_16BF`` or ``CUBLAS_COMPUTE_32F_EMULATED_16BFX9``
+(cuBLAS 12.9 and later: f32 emulated with bf16 products). An algorithm encodes its compute type (``cublasLtMatmulAlgoInit`` writes it), so a pin
+made for another compute type has other bytes and is refused, and the TF32 and emulated algorithm ids (72, 73, 77, 78 in 12.8.4 and 13.1.0) are
+not even encodable under ``CUBLAS_COMPUTE_32F``. Two environment variables make cuBLASLt run ``CUBLAS_COMPUTE_32F`` as another compute type,
+``NVIDIA_TF32_OVERRIDE=1`` (TF32) and ``CUBLAS_EMULATE_SINGLE_PRECISION=1`` (cuBLAS 13: the bf16x9 emulation), and the encoding shows it, so the
+vetting of an algorithm of f32 operands refuses it in such a process; and where the numerical-implementation flags
+(``CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS``) are reported they must say f32 inputs (``INPUT_32F``, not ``INPUT_TF32``) besides the f32 accumulator
+every algorithm needs (:func:`numerics_problems`).
 
 cuBLASLt is column-major, so the problem is posed as a gemm of ``m = N``, ``n = M``, ``k = K`` in cuBLAS terms (the layout names the
 transposes as cuBLASLt is called, ``transa`` then ``transb``):
@@ -43,14 +53,17 @@ and to vet a pinned algorithm, ``cublasLtMatmulAlgoInit``, ``cublasLtMatmulAlgoC
   workspace limit alone (the alignment minimums it sets are those of its own pointers, 256 bytes from its allocator, which is
   the library's default, so none is set here, and the bias pointer is a 256-byte aligned dummy). With the limit torch uses
   (:data:`TORCH_LT_WORKSPACE_BYTES` for ``addmm``, :data:`DEFAULT_WORKSPACE_BYTES` for ``mm``, which runs ``cublasGemmEx`` and
-  is matched by this posture with its workspace) the heuristic answers what torch runs.
+  is matched by this posture with its workspace) the heuristic answers what torch runs. For f32 operands with TF32 off ``mm`` runs
+  ``cublasSgemm``, matched the same way, and ``addmm`` asks with no reduction-scheme mask, so the posture needs ``allow_f32_reduction=True``
+  (measured byte for byte, ``docs/manifest-schema-3.md``, section 9.2).
 
 In both, the reduction-scheme mask lets split-K add its partial sums only in f32 (a bf16 or f16 partial sum rounds more than once),
 which is what torch does with ``allow_bf16_reduced_precision_reduction = False`` (``allow_fp16_reduced_precision_reduction`` for f16
 operands), and a GEMM with a bias gets no split-K at all (with the bias epilogue a split-K was measured to round twice even with f32 partial
 sums, see :data:`NO_SPLIT_K_MASK`); with the opt-in of the operands' type (``allow_bf16_reduction=True`` for bf16 operands,
-``allow_f16_reduction=True`` for f16 ones: torch's default) no mask is set, and an algorithm whose split-K reduces in the output type
-(``INPLACE``, ``OUTPUT_TYPE``) is accepted. The opt-in is named by the operands' type, as torch's flags are, whatever the type of ``D``.
+``allow_f16_reduction=True`` for f16 ones: torch's default; ``allow_f32_reduction=True`` for f32 ones, where torch has no flag because it never
+masks the reduction scheme of an f32 GEMM) no mask is set, and an algorithm whose split-K reduces in the output type (``INPLACE``,
+``OUTPUT_TYPE``) is accepted. The opt-in is named by the operands' type, as torch's flags are, whatever the type of ``D``.
 
 An algorithm can also be imported: :func:`encode_algo` turns its nine configuration attributes into the 64 bytes cuBLASLt
 writes for them. The pin is the 64-byte ``cublasLtMatmulAlgo_t`` as a 128-character hex string, and the workspace it needs.
@@ -122,8 +135,18 @@ _STATUS_NAMES = {
 # cublas_api.h, cublasOperation_t
 CUBLAS_OP_N = 0
 CUBLAS_OP_T = 1
-# cublas_api.h, cublasComputeType_t
+# cublas_api.h, cublasComputeType_t (the f32 compute types; _EMULATED_16BFX9 is new in cuBLAS 12.9, read from the 13.1.0 header)
 CUBLAS_COMPUTE_32F = 68
+COMPUTE_TYPE_NAMES = {
+    68: "CUBLAS_COMPUTE_32F",
+    69: "CUBLAS_COMPUTE_32F_PEDANTIC",
+    74: "CUBLAS_COMPUTE_32F_FAST_16F",
+    75: "CUBLAS_COMPUTE_32F_FAST_16BF",
+    77: "CUBLAS_COMPUTE_32F_FAST_TF32",
+    78: "CUBLAS_COMPUTE_32F_EMULATED_16BFX9",
+}
+# Where cublasLtMatmulAlgoInit writes the compute type in the 64 bytes of an algorithm (a little-endian int32; measured with 12.8.4 and 13.1.0)
+ALGO_COMPUTE_TYPE_OFFSET = 52
 # library_types.h, cudaDataType_t
 CUDA_R_32F = 0
 CUDA_R_16F = 2
@@ -170,15 +193,15 @@ ALLOWED_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_NONE, CUBLASLT_REDUCTION_
 BF16_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_INPLACE, CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE)  # allowed too with allow_bf16_reduction
 
 
-OPERAND_DTYPES = ("bf16", "f16")  # the types of A and B (both the same)
+OPERAND_DTYPES = ("bf16", "f16", "f32")  # the types of A and B (both the same); f32 operands have an f32 result
 LAYOUTS = ("TN", "NN")  # the transposes as cuBLASLt is called (transa, transb): B is [N, K] for TN, [K, N] for NN
 
 
 @dataclass(frozen=True)
 class Form:
-    """What a GEMM is besides its sizes and its bias: the type of ``A`` and ``B`` (``dtype``, ``"bf16"`` or ``"f16"``), the type of ``C`` and
-    ``D`` (``out``: ``dtype``, or ``"f32"``; a bias has this type too) and the layout (``"TN"``: ``B`` is ``[N, K]``; ``"NN"``: ``B`` is ``[K, N]``).
-    The default is tilefish 0.0.5's only GEMM, bf16 in and out, ``TN``."""
+    """What a GEMM is besides its sizes and its bias: the type of ``A`` and ``B`` (``dtype``, ``"bf16"``, ``"f16"`` or ``"f32"``), the type of ``C``
+    and ``D`` (``out``: ``dtype``, or ``"f32"``; ``"f32"`` for f32 operands; a bias has this type too) and the layout (``"TN"``: ``B`` is ``[N, K]``;
+    ``"NN"``: ``B`` is ``[K, N]``). The default is tilefish 0.0.5's only GEMM, bf16 in and out, ``TN``."""
 
     dtype: str = "bf16"
     out: str = "bf16"
@@ -187,6 +210,8 @@ class Form:
     def __post_init__(self) -> None:
         if self.dtype not in OPERAND_DTYPES:
             raise TilefishRuntimeError(f"cuBLASLt matmul: the operands are one of {list(OPERAND_DTYPES)}, got {self.dtype!r}")
+        if self.dtype == "f32" and self.out != "f32":
+            raise TilefishRuntimeError(f"cuBLASLt matmul: the result of f32 operands is f32, got {self.out!r}")
         if self.out not in (self.dtype, "f32"):
             raise TilefishRuntimeError(f"cuBLASLt matmul: the result of {self.dtype} operands is {self.dtype} or f32, got {self.out!r}")
         if self.layout not in LAYOUTS:
@@ -229,17 +254,18 @@ def check_form(form: object) -> Form:
     return form
 
 
-def opt_in(form: Form, allow_bf16_reduction: object, allow_f16_reduction: object) -> bool:
+def opt_in(form: Form, allow_bf16_reduction: object, allow_f16_reduction: object, allow_f32_reduction: object = False) -> bool:
     """The opt-in to split-K partial sums in the output type for ``form``: each flag is a bool, and only the flag of the operands' type may be set
-    (``allow_bf16_reduction`` for bf16 operands, ``allow_f16_reduction`` for f16 ones). Pure."""
-    for name, value in (("allow_bf16_reduction", allow_bf16_reduction), ("allow_f16_reduction", allow_f16_reduction)):
+    (``allow_bf16_reduction`` for bf16 operands, ``allow_f16_reduction`` for f16 ones, ``allow_f32_reduction`` for f32 ones). Pure."""
+    flags = (("allow_bf16_reduction", allow_bf16_reduction), ("allow_f16_reduction", allow_f16_reduction), ("allow_f32_reduction", allow_f32_reduction))
+    for name, value in flags:
         if not isinstance(value, bool):
             raise TilefishRuntimeError(f"cuBLASLt matmul: {name} must be a bool, got {value!r}")
         if value and name != form.opt_in:
             raise TilefishRuntimeError(
                 f"cuBLASLt matmul: {name} is the opt-in of {name.split('_')[1]} operands; {form.dtype} operands opt in with {form.opt_in}=True"
             )
-    return bool(allow_bf16_reduction or allow_f16_reduction)
+    return bool(allow_bf16_reduction or allow_f16_reduction or allow_f32_reduction)
 
 
 def allowed_reduction_schemes(allow_bf16_reduction: bool, bias: bool = False) -> "tuple[int, ...]":
@@ -279,6 +305,50 @@ def reduction_problem(splitk_num: int, reduction_scheme: int, allow_bf16_reducti
             f"sums too), which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with {form.opt_in}=True"
         )
     return None
+
+
+def compute_type_of(raw: bytes) -> int:
+    """The compute type an encoded algorithm is for: the little-endian ``int32`` at :data:`ALGO_COMPUTE_TYPE_OFFSET` of its 64 bytes, where
+    ``cublasLtMatmulAlgoInit`` writes it (measured with cuBLASLt 12.8.4 and 13.1.0: ``CUBLAS_COMPUTE_32F`` is ``0x44`` there, and only that word
+    changes with the compute type). Pure."""
+    return int.from_bytes(bytes(raw)[ALGO_COMPUTE_TYPE_OFFSET : ALGO_COMPUTE_TYPE_OFFSET + 4], "little")
+
+
+def numerics_problems(flags: int, compute_type: int, form: "Form | None" = None) -> "list[str]":
+    """What is wrong with how an algorithm of ``form`` computes, by its numerical-implementation flags (``CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS``)
+    and the compute type cuBLASLt encodes ``CUBLAS_COMPUTE_32F`` as in this process (:func:`compute_type_of` of a fresh algorithm); empty:
+    nothing. Pure: the Rust crate's ``numerics_problems`` has the same words.
+
+    Every algorithm accumulates in f32. An algorithm of f32 operands also multiplies them as f32, with TF32 off:
+
+    * cuBLASLt must encode ``CUBLAS_COMPUTE_32F`` as itself. With ``NVIDIA_TF32_OVERRIDE=1`` in its environment it encodes (and runs) it as
+      ``CUBLAS_COMPUTE_32F_FAST_TF32``, and with ``CUBLAS_EMULATE_SINGLE_PRECISION=1`` (cuBLAS 13) as ``CUBLAS_COMPUTE_32F_EMULATED_16BFX9``, a
+      bf16x9 emulation (measured, 12.8.4 and 13.1.0 on sm_103 and 13.1.0 on sm_120): there an f32 pin is refused, whoever made it;
+    * the flags, when the library reports them, say an f32 accumulator and f32 inputs (``INPUT_32F`` alone: ``INPUT_TF32`` rounds every input to
+      10 bits of mantissa). An algorithm that reports none (the flags are 0: measured for id 76, a CUTLASS 3 SIMT sgemm that cuBLASLt 12.8.4 and
+      13.1.0 choose for most f32 problems on sm_103) is held to its compute type alone.
+    """
+    form = DEFAULT_FORM if form is None else form
+    problems: "list[str]" = []
+    if form.dtype == "f32":
+        if compute_type != CUBLAS_COMPUTE_32F:
+            name = f"{COMPUTE_TYPE_NAMES[compute_type]} ({compute_type})" if compute_type in COMPUTE_TYPE_NAMES else f"compute type {compute_type}"
+            problems.append(
+                f"cuBLASLt encodes CUBLAS_COMPUTE_32F as {name} in this process, which does not multiply f32 operands as f32 (NVIDIA_TF32_OVERRIDE=1 "
+                "turns on TF32, CUBLAS_EMULATE_SINGLE_PRECISION=1 a bf16x9 emulation): an f32 GEMM is not run here"
+            )
+        if flags == 0:
+            return problems
+    if flags & _IMPL_ACCUMULATOR_TYPE_MASK != _IMPL_ACCUMULATOR_32F:
+        problems.append("it does not accumulate in f32")
+    inputs = flags & _IMPL_INPUT_TYPE_MASK
+    if form.dtype == "f32" and inputs != _IMPL_INPUT_32F:
+        names = " and ".join(name for bit, name in _IMPL_INPUT_NAMES if inputs & bit) or "no input type"
+        problems.append(f"its products read the f32 operands as {names}, not as f32 (CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS {flags:#x})")
+    return problems
+
+
+
 # cublasLt.h, cublasLtMatmulAlgoConfigAttributes_t
 _ALGO_CONFIG = {  # name -> (attribute, ctypes type)
     "id": (0, ctypes.c_int32),  # CUBLASLT_ALGO_CONFIG_ID
@@ -301,9 +371,21 @@ _CAP_CUSTOM_OPTION_MAX = 7  # int32_t
 _CAP_STAGES_IDS = 13  # array of uint32_t
 _CAP_NUMERICAL_IMPL_FLAGS = 15  # uint64_t
 _CAP_MIN_ALIGNMENT_BYTES = (16, 17, 18, 19)  # uint32_t, of A, B, C, D
-# cublasLt.h, cublasLtNumericalImplFlags_t
+# cublasLt.h, cublasLtNumericalImplFlags_t (the same values in the headers of cuBLAS 12.8.4 and 13.1.0)
 _IMPL_ACCUMULATOR_TYPE_MASK = 0xFF << 8  # CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_TYPE_MASK
 _IMPL_ACCUMULATOR_32F = 0x02 << 8  # CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_32F
+_IMPL_INPUT_TYPE_MASK = 0xFF << 16  # CUBLASLT_NUMERICAL_IMPL_FLAGS_OP_INPUT_TYPE_MASK: the type the products read their inputs as
+_IMPL_INPUT_32F = 0x08 << 16  # CUBLASLT_NUMERICAL_IMPL_FLAGS_INPUT_32F
+_IMPL_INPUT_NAMES = (  # CUBLASLT_NUMERICAL_IMPL_FLAGS_INPUT_*, as a message names them
+    (0x01 << 16, "f16"),
+    (0x02 << 16, "bf16"),
+    (0x04 << 16, "tf32"),
+    (0x08 << 16, "f32"),
+    (0x10 << 16, "f64"),
+    (0x20 << 16, "i8"),
+    (0x40 << 16, "e4m3"),
+    (0x80 << 16, "e5m2"),
+)
 
 
 # -- the structs of the header -----------------------------------------------------------------------------------------------
@@ -593,6 +675,7 @@ def describe(
     *,
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
+    allow_f32_reduction: bool = False,
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
 ) -> "dict[str, Any]":
@@ -604,7 +687,7 @@ def describe(
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     form = check_form(form)
-    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)
     target = _check_target(sm_count_target)
     ab, cd = CUDA_TYPE_NAMES[form.dtype], CUDA_TYPE_NAMES[form.out]
     return {
@@ -878,8 +961,8 @@ def _validate_algo(
     2**31 or more. So the bytes are held to what the library encodes for the configuration they read back as: the algorithm
     is rebuilt with ``cublasLtMatmulAlgoInit`` (which also writes the data types of ``form``, the compute type and the version) and
     ``cublasLtMatmulAlgoConfigSetAttribute``, and must be byte for byte the same; the configuration must be one that the
-    capabilities of its id list (tile, stages, swizzling, custom option); it must accumulate in f32 and need no more than
-    16-byte alignment, and its split-K must go with a reduction scheme that does not round in the output type, and a GEMM with a bias has no
+    capabilities of its id list (tile, stages, swizzling, custom option); it must accumulate in f32 (and, for f32 operands, multiply them as f32,
+    not as TF32 nor in a bf16 emulation: :func:`numerics_problems`) and need no more than 16-byte alignment, and its split-K must go with a reduction scheme that does not round in the output type, and a GEMM with a bias has no
     split-K (or, with the opt-in of the operands' type, passed here as ``allow_bf16_reduction``, any reduction scheme cuBLASLt defines:
     :func:`reduction_problem`). What this cannot see is a flip to another valid configuration (another tile, say): that is a different,
     legitimate algorithm.
@@ -939,8 +1022,7 @@ def _validate_algo_bytes(
     reduction = reduction_problem(cfg["splitk_num"], cfg["reduction_scheme"], allow_bf16_reduction, bias, form)
     if reduction is not None:
         problems.append(reduction)
-    if _cap(lib, fresh, _CAP_NUMERICAL_IMPL_FLAGS, ctypes.c_uint64) & _IMPL_ACCUMULATOR_TYPE_MASK != _IMPL_ACCUMULATOR_32F:
-        problems.append("it does not accumulate in f32")
+    problems += numerics_problems(_cap(lib, fresh, _CAP_NUMERICAL_IMPL_FLAGS, ctypes.c_uint64), compute_type_of(bytes(fresh)), form)
     for name, attr in zip("ABCD", _CAP_MIN_ALIGNMENT_BYTES):
         needed = _cap(lib, fresh, attr, ctypes.c_uint32)
         if needed > ALIGNMENT_BYTES:
@@ -984,6 +1066,7 @@ def pin_algo(
     heuristic: str = "tilefish",
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
+    allow_f32_reduction: bool = False,
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
 ) -> Pinned:
@@ -994,15 +1077,15 @@ def pin_algo(
     config). ``heuristic`` is the posture (:data:`HEURISTICS`, see the module docstring): ``"tilefish"`` asks for a few results with
     16-byte alignment minimums (the pointers are not known here, and 16-byte alignment is all that is relied on), ``"torch"`` for one
     result under the workspace limit alone, as torch's ``addmm`` does. The opt-in of the operands' type (``allow_bf16_reduction`` for bf16,
-    ``allow_f16_reduction`` for f16) lets split-K add its partial sums in the output type (no reduction-scheme mask); without it they are added
-    in f32. ``sm_count_target`` asks for the algorithm of that many SMs (``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET``).
+    ``allow_f16_reduction`` for f16, ``allow_f32_reduction`` for f32) lets split-K add its partial sums in the output type (no reduction-scheme
+    mask); without it they are added in f32. ``sm_count_target`` asks for the algorithm of that many SMs (``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET``).
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     limit = _check_workspace(workspace_bytes)
     device_index = _check_device_arg(device_index)
     heuristic = _check_heuristic(heuristic)
     form = check_form(form)
-    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)
     target = _check_target(sm_count_target)
     count = REQUESTED_ALGO_COUNT if heuristic == "tilefish" else 1
     dummy = HEURISTIC_BIAS_POINTER if heuristic == "tilefish" else TORCH_HEURISTIC_BIAS_POINTER
@@ -1144,6 +1227,7 @@ def check_algo(
     device_index: "int | None" = None,
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
+    allow_f32_reduction: bool = False,
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
 ) -> int:
@@ -1158,7 +1242,7 @@ def check_algo(
     budget = _check_workspace(workspace_bytes)
     device_index = _check_device_arg(device_index)
     form = check_form(form)
-    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)
     target = _check_target(sm_count_target)
     algo_from_hex(algo_hex)  # the format, before anything reaches the library
     lib = _lib()
@@ -1191,6 +1275,7 @@ def matmul(
     workspace_ptr: "int | None" = None,
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
+    allow_f32_reduction: bool = False,
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
 ) -> None:
@@ -1208,7 +1293,7 @@ def matmul(
     allocates nothing and can be captured in a CUDA graph). Besides the matmul itself the call touches the device not at all.
 
     An algorithm whose split-K adds its partial sums in the output type runs only with the opt-in of the operands' type
-    (``allow_bf16_reduction=True`` or ``allow_f16_reduction=True``: the declaration's).
+    (``allow_bf16_reduction=True``, ``allow_f16_reduction=True`` or ``allow_f32_reduction=True``: the declaration's).
     """
     bias = bias_ptr is not None
     m, n, k, bias = _check_problem(m, n, k, bias)
@@ -1222,7 +1307,7 @@ def matmul(
     algo = _algo_struct(algo_hex)
     given = None if workspace_ptr is None else _check_workspace_pointer(workspace_ptr)
     form = check_form(form)
-    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)
     target = _check_target(sm_count_target)
     lib = _lib()
     index = _device(device_index)

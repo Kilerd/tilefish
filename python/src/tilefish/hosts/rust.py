@@ -112,7 +112,7 @@ _IMPLEMENTATION_FIELDS = ("grid", "block", "num_warps", "num_stages", "constexpr
 # covers the SM count) and what the pin chose on it
 _LIBRARY_SHARED_FIELDS = (
     "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes "
-    "heuristic algo_source allow_bf16_reduction allow_f16_reduction sm_count_target"  # (the last five are absent by default: compared as present or not too)
+    "heuristic algo_source allow_bf16_reduction allow_f16_reduction allow_f32_reduction sm_count_target"  # (the last six are absent by default: compared as present or not too)
 ).split()
 
 _RUST_KEYWORDS = frozenset(
@@ -1041,6 +1041,12 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
         lines += _wrap(
             "The declaration allows split-K to add its partial sums in the output type (`allow_f16_reduction`): the result may be rounded more "
             "than once."
+        )
+    if e.get("allow_f32_reduction") is True:
+        lines.append("")
+        lines += _wrap(
+            "The declaration allows split-K to add its partial sums in the output (`allow_f32_reduction`), not only in a workspace of the "
+            "compute type."
         )
     return lines
 

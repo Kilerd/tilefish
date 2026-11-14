@@ -2,14 +2,17 @@
 
 ``@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")`` declares an operation by its signature and says which library
 routine runs it. For ``impl="cublaslt.gemm"`` the signature is ``(a: Tensor[M, K, T], b: Tensor[N, K, T]) -> Tensor[M, N, D]``
-and for ``"cublaslt.gemm_bias"`` it has a third parameter ``bias: Tensor[N, D]``, where ``T`` is ``bf16`` or ``f16`` and ``D`` is ``T`` or
-``f32``. With ``layout="NN"`` (the default is ``"TN"``) ``b`` is ``Tensor[K, N, T]``. Semantics, in tilefish's row-major terms:
+and for ``"cublaslt.gemm_bias"`` it has a third parameter ``bias: Tensor[N, D]``, where ``T`` is ``bf16``, ``f16`` or ``f32`` and ``D`` is ``T``
+or ``f32`` (``f32`` for ``f32`` operands). With ``layout="NN"`` (the default is ``"TN"``) ``b`` is ``Tensor[K, N, T]``. Semantics, in tilefish's
+row-major terms:
 
     out[M, N] = a[M, K] @ b[N, K]^T        (+ bias[N])          layout "TN"
     out[M, N] = a[M, K] @ b[K, N]          (+ bias[N])          layout "NN"
 
 with an f32 accumulator and **one** rounding, to ``D``, at the end; the bias goes through ``CUBLASLT_EPILOGUE_BIAS``, so it is added in
-f32 to the accumulator before that rounding (cuBLASLt takes a bias of the result's type only: measured, :mod:`tilefish._cublaslt`). Every
+f32 to the accumulator before that rounding (cuBLASLt takes a bias of the result's type only: measured, :mod:`tilefish._cublaslt`). f32 operands
+are multiplied as f32, with TF32 off: the compute type is ``CUBLAS_COMPUTE_32F``, an algorithm is refused where cuBLASLt would run it as TF32 or
+as a bf16x9 emulation, and its numerical-implementation flags, where reported, must say f32 inputs (:func:`tilefish._cublaslt.numerics_problems`). Every
 operand is contiguous with a 16-byte aligned pointer (a strided operand is not supported in this version: pass ``.contiguous()``). ``K`` and
 ``N`` may be any size: when a row of ``k`` or ``n`` elements does not start on 16 bytes (``K`` or ``N`` not a multiple of 8 for 16-bit
 operands), an algorithm that needs aligned rows is not valid for the problem, which ``cublasLtMatmulAlgoCheck`` says (it sees the leading
@@ -26,8 +29,9 @@ How the heuristic is asked is the declaration's ``heuristic=`` (:mod:`tilefish._
 8 519 680, torch's default ``CUBLAS_WORKSPACE_CONFIG``, and 16-byte alignment minimums) or ``"torch"`` (what torch's ``addmm`` asks: one
 result under the workspace limit alone; the limit is 1 048 576 for ``gemm_bias``, torch's default ``CUBLASLT_WORKSPACE_SIZE``, and
 8 519 680 for ``gemm``, the workspace of the ``cublasGemmEx`` that ``torch.mm`` runs). Split-K adds its partial sums in f32 unless the
-declaration opts in with the flag of its operands' type, ``allow_bf16_reduction=True`` or ``allow_f16_reduction=True`` (torch's
-``allow_bf16_reduced_precision_reduction`` and ``allow_fp16_reduced_precision_reduction``). And ``algos=`` (:class:`AlgoTable`, one per device)
+declaration opts in with the flag of its operands' type, ``allow_bf16_reduction=True``, ``allow_f16_reduction=True`` (torch's
+``allow_bf16_reduced_precision_reduction`` and ``allow_fp16_reduced_precision_reduction``) or ``allow_f32_reduction=True`` (torch has no flag for
+f32: it never masks the reduction scheme of an f32 GEMM, so its choice may need this opt-in). And ``algos=`` (:class:`AlgoTable`, one per device)
 imports the algorithms instead: on a device a table is for, the heuristic is not asked, and each entry runs the algorithm the table gives for its
 ``(M, N, K, bias)`` (and layout).
 
@@ -66,7 +70,7 @@ COMPUTE_TYPE = "CUBLAS_COMPUTE_32F"
 SCALE_TYPE = "CUDA_R_32F"
 TRANSA, TRANSB = "T", "N"  # cuBLAS is column-major: its A operand is tilefish's b (op T), its B operand is tilefish's a (op N); the layout TN
 LAYOUTS = ("TN", "NN")  # transa then transb as cuBLASLt is called: b is [N, K] for TN (transa T, lda = k), [K, N] for NN (transa N, lda = n)
-OPERAND_DTYPES = ("bf16", "f16")  # of a and b; the result (and a bias) is of their type or f32
+OPERAND_DTYPES = ("bf16", "f16", "f32")  # of a and b; the result (and a bias) is of their type or f32 (f32 for f32 operands)
 
 _ALGO = re.compile(r"^[0-9a-f]{128}\Z")
 _ARCH = re.compile(r"^sm_[0-9]{2,3}\Z")
@@ -76,8 +80,15 @@ ENTRY_KEYS = (
 ).split()
 # Fields an entry has only when its declaration is not the default, each with the one value it may then have (absent: the default, so an entry
 # of a default declaration is what tilefish 0.0.4 wrote): the heuristic posture, an imported algorithm, the opt-in to split-K partial sums in the
-# output type (named by the operands' type: allow_bf16_reduction on bf16 operands, allow_f16_reduction on f16 ones).
-OPTIONAL_ENTRY_FIELDS = {"heuristic": "torch", "algo_source": "imported", "allow_bf16_reduction": True, "allow_f16_reduction": True}
+# output type (named by the operands' type: allow_bf16_reduction on bf16 operands, allow_f16_reduction on f16 ones, allow_f32_reduction on f32 ones).
+OPTIONAL_ENTRY_FIELDS = {
+    "heuristic": "torch",
+    "algo_source": "imported",
+    "allow_bf16_reduction": True,
+    "allow_f16_reduction": True,
+    "allow_f32_reduction": True,
+}
+OPT_INS = ("allow_bf16_reduction", "allow_f16_reduction", "allow_f32_reduction")  # the opt-in of each operand type, in the order of OPERAND_DTYPES
 # An optional field with a count: present only when the declaration targets an SM count (sm_count_target=), an int from 8 to the entry's sm_count.
 OPTIONAL_COUNT_FIELDS = ("sm_count_target",)
 
@@ -213,6 +224,7 @@ def check_options(
     allow_f16_reduction: Any = False,
     layout: Any = "TN",
     sm_count_target: Any = None,
+    allow_f32_reduction: Any = False,
 ) -> "tuple[AlgoTable, ...] | None":
     """Check the options of a ``@library(impl=...)`` declaration that say how its algorithms are chosen (the posture, the opt-ins to split-K
     partial sums in the output type, the imported tables) and its layout; return the tables (``None`` without). Raises a
@@ -220,7 +232,7 @@ def check_options(
     where = f"library op '{name}'"
     if heuristic not in HEURISTICS:
         raise TilefishDeclarationError(f"{where}: heuristic must be one of {list(HEURISTICS)}, got {heuristic!r}")
-    for flag, value in (("allow_bf16_reduction", allow_bf16_reduction), ("allow_f16_reduction", allow_f16_reduction)):
+    for flag, value in zip(OPT_INS, (allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)):
         if not isinstance(value, bool):
             raise TilefishDeclarationError(f"{where}: {flag} must be a bool, got {value!r}")
     if layout not in LAYOUTS:
@@ -248,6 +260,7 @@ def check_declaration(
     layout: str = "TN",
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
+    allow_f32_reduction: bool = False,
 ) -> None:
     """Check that a ``@library(impl=...)`` declaration has the signature of its implementation in its layout, and that its opt-in is the one of
     its operands' type; raise a ``TilefishDeclarationError``."""
@@ -265,8 +278,8 @@ def check_declaration(
     if len(params) != want or any(p.kind != "tensor" or p.access != "in" or p.strided or p.is_devscalar for p in params):
         raise TilefishDeclarationError(
             f"{where}: {impl} takes {want} input tensors "
-            f"(a: Tensor[M, K, T], {b_text}{', bias: Tensor[N, D]' if bias else ''}), and returns Tensor[M, N, D], where T is bf16 or f16 and D is "
-            f"T or f32 (layout {layout}); the signature is {sig}"
+            f"(a: Tensor[M, K, T], {b_text}{', bias: Tensor[N, D]' if bias else ''}), and returns Tensor[M, N, D], where T is bf16, f16 or f32 and D "
+            f"is T or f32 (layout {layout}); the signature is {sig}"
         )
     if len(sig.returns) != 1 or sig.tensor_outputs:
         raise TilefishDeclarationError(f"{where}: {impl} returns exactly one tensor, Tensor[M, N, D] (not an Out parameter)")
@@ -278,7 +291,11 @@ def check_declaration(
             raise TilefishDeclarationError(f"{where}: {label} must be a contiguous tensor of rank 2, got {t}")
     dtype = a.dtype.name  # type: ignore[union-attr]
     if dtype not in OPERAND_DTYPES or b.dtype.name != dtype:  # type: ignore[union-attr]
-        raise TilefishDeclarationError(f"{where}: a and b must both be bf16 or both be f16 tensors, got {a} and {b}")
+        raise TilefishDeclarationError(f"{where}: a and b must both be bf16, both be f16 or both be f32 tensors, got {a} and {b}")
+    if dtype == "f32" and out.dtype.name != "f32":  # type: ignore[union-attr]
+        raise TilefishDeclarationError(
+            f"{where}: the result of f32 operands must be an f32 tensor (they are multiplied as f32, TF32 off, and rounded once to the result), got {out}"
+        )
     if out.dtype.name not in (dtype, "f32"):  # type: ignore[union-attr]
         raise TilefishDeclarationError(f"{where}: the result of {dtype} operands must be a {dtype} or an f32 tensor, got {out}")
     if bias:
@@ -296,7 +313,7 @@ def check_declaration(
         raise TilefishDeclarationError(f"{where}: a is [M, K] and b is [K, N] (layout NN): the last axis of a and the first of b must be the same ({k} vs {b_k})")
     if tuple(out.shape) != (m, n) or (bias and params[2].type.shape != (n,)):  # type: ignore[union-attr]
         raise TilefishDeclarationError(f"{where}: the result must be [M, N] = [{m}, {n}]" + (f" and bias [N] = [{n}]" if bias else ""))
-    for flag, value in (("allow_bf16_reduction", allow_bf16_reduction), ("allow_f16_reduction", allow_f16_reduction)):
+    for flag, value in zip(OPT_INS, (allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)):
         if value and flag != f"allow_{dtype}_reduction":
             raise TilefishDeclarationError(
                 f"{where}: {flag} is the opt-in of {flag.split('_')[1]} operands; a GEMM of {dtype} operands opts in with allow_{dtype}_reduction=True"
@@ -397,6 +414,8 @@ def _canonical(op: "LibraryOp") -> "dict[str, Any]":
         out["allow_bf16_reduction"] = True
     if getattr(op, "allow_f16_reduction", False):
         out["allow_f16_reduction"] = True
+    if getattr(op, "allow_f32_reduction", False):
+        out["allow_f32_reduction"] = True
     if layout_of(op) != "TN":
         out["layout"] = layout_of(op)  # b is [K, N]: with K = N the signature alone would not tell the layouts apart
     if getattr(op, "sm_count_target", None) is not None:
@@ -453,6 +472,7 @@ class LibrarySpec:
     layout: str = "TN"  # TN: b is [n, k]; NN: b is [k, n]
     allow_f16_reduction: bool = False  # whether split-K may add its partial sums in the output type (the opt-in of f16 operands)
     sm_count_target: "int | None" = None  # the SM count the heuristic is asked for (CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET), None: the device's
+    allow_f32_reduction: bool = False  # whether split-K may add its partial sums in the output (the opt-in of f32 operands)
 
     @property
     def bias(self) -> bool:
@@ -467,8 +487,12 @@ class LibrarySpec:
 
     @property
     def opt_ins(self) -> "dict[str, bool]":
-        """The opt-ins as the binding takes them (``allow_bf16_reduction=``, ``allow_f16_reduction=``)."""
-        return {"allow_bf16_reduction": self.allow_bf16_reduction, "allow_f16_reduction": self.allow_f16_reduction}
+        """The opt-ins as the binding takes them (``allow_bf16_reduction=``, ``allow_f16_reduction=``, ``allow_f32_reduction=``)."""
+        return {
+            "allow_bf16_reduction": self.allow_bf16_reduction,
+            "allow_f16_reduction": self.allow_f16_reduction,
+            "allow_f32_reduction": self.allow_f32_reduction,
+        }
 
     @property
     def key(self) -> "tuple[Any, ...]":
@@ -521,6 +545,8 @@ class LibrarySpec:
             out["allow_bf16_reduction"] = True
         if self.allow_f16_reduction:
             out["allow_f16_reduction"] = True
+        if self.allow_f32_reduction:
+            out["allow_f32_reduction"] = True
         if self.sm_count_target is not None:
             out["sm_count_target"] = self.sm_count_target
         return out
@@ -610,6 +636,7 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
                 layout=form.layout,
                 allow_f16_reduction=getattr(op, "allow_f16_reduction", False),
                 sm_count_target=getattr(op, "sm_count_target", None),
+                allow_f32_reduction=getattr(op, "allow_f32_reduction", False),
             )
         )
     return specs
@@ -811,8 +838,8 @@ def _eval_static(text: str, buckets: "dict[str, int]", where: str) -> int:
 def validate_entry(entry: Any, index: int = 0) -> None:
     """Strict reading of one entry of the manifest's ``library`` section (raises :class:`~tilefish.errors.TilefishManifestError`).
 
-    Every field must be present and exactly typed, and the redundant ones must agree: the dtypes are a pair of operand types (``bf16`` or
-    ``f16``) with a result of their type or ``f32`` (and a bias of the result's type); ``transa`` says the layout (``T``: ``b`` is ``[n, k]`` and
+    Every field must be present and exactly typed, and the redundant ones must agree: the dtypes are a pair of operand types (``bf16``, ``f16``
+    or ``f32``) with a result of their type or ``f32`` (and a bias of the result's type); ``transa`` says the layout (``T``: ``b`` is ``[n, k]`` and
     ``lda = k``; ``N``: ``b`` is ``[k, n]`` and ``lda = n``); the other leading dimensions and the shapes of the operands follow from ``impl``,
     ``m``, ``n`` and ``k``; the opt-in, if any, is the one of the operands' type.
     """
@@ -863,16 +890,16 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         dtypes = entry["dtypes"]
         dtype = dtypes.get("a") if isinstance(dtypes, dict) else None
         out_dtype = dtypes.get("out") if isinstance(dtypes, dict) else None
-        if dtype not in OPERAND_DTYPES or out_dtype not in (dtype, "f32"):
+        if dtype not in OPERAND_DTYPES or out_dtype not in (dtype, "f32"):  # (f32 operands: dtype and "f32" are one type)
             dtype, out_dtype = "bf16", "bf16"  # the message names the default form
         want_dtypes = {"a": dtype, "b": dtype, **({"bias": out_dtype} if bias else {}), "out": out_dtype}
         if dtypes != want_dtypes:
             _bad(
                 where,
-                f"dtypes must be {want_dtypes}, got {dtypes!r} (a and b are both bf16 or both f16, the result is of their type or f32, a bias of the "
-                "result's type)",
+                f"dtypes must be {want_dtypes}, got {dtypes!r} (a and b are both bf16, both f16 or both f32, the result is of their type or f32, a "
+                "bias of the result's type)",
             )
-        for flag in ("allow_bf16_reduction", "allow_f16_reduction"):
+        for flag in OPT_INS:
             if flag in entry and flag != f"allow_{dtype}_reduction":
                 _bad(where, f"{flag} is the opt-in of {flag.split('_')[1]} operands, and the operands of this entry are {dtype}")
         ws = entry["workspace_bytes"]

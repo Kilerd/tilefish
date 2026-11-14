@@ -2055,7 +2055,7 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
     """``mode="reference"`` of a graph: the eager composition of the reference of each op, in torch, node by node.
 
     A view operation is torch's (``reshape``, ``permute``, ``select``, ``split``); a call to a lowered ``@tilefish.kernel`` is its IR interpreted
-    (:mod:`tilefish._reference`); a pinned cuBLASLt GEMM is an f32 matmul rounded once to bf16; a hand-written extern is its ``reference=`` (a torch
+    (:mod:`tilefish._reference`); a pinned cuBLASLt GEMM is an f32 matmul rounded once to its result's type; a hand-written extern is its ``reference=`` (a torch
     function given to ``@tilefish.extern``), and an extern that has none is refused. An in-place call on a view updates a copy of it: the IR says
     a chunk that is updated does not change its parent. Needs no CUDA: it runs where the tensors are. (A torch view of a tensor that an op then updates in place
     sees the update here, where the IR says a view keeps the contents it had: a plan refuses such a graph, so the two never disagree on a graph that can be planned.)

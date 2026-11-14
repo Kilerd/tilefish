@@ -93,10 +93,9 @@ def _nn_k_mismatch(a: Tensor[M, 1024, f16], b: Tensor[3072, 1024, f16]) -> Tenso
 
 
 def test_the_types_go_together_and_the_bias_has_the_type_of_the_result():
-    with pytest.raises(TilefishDeclarationError, match="a and b must both be bf16 or both be f16 tensors"):
+    with pytest.raises(TilefishDeclarationError, match="a and b must both be bf16, both be f16 or both be f32 tensors"):
         declare(_mixed)
-    with pytest.raises(TilefishDeclarationError, match="a and b must both be bf16 or both be f16 tensors"):
-        declare(_f32_in)
+    assert _library.form_of(declare(_f32_in)) == L.Form("f32", "f32")  # f32 operands: test_library_f32.py
     with pytest.raises(TilefishDeclarationError, match="the result of f16 operands must be a f16 or an f32 tensor"):
         declare(_f16_to_bf16)
     # cuBLASLt 12.8.4 answers CUBLAS_STATUS_INVALID_VALUE for these two (measured): a declaration cannot have them
@@ -264,7 +263,7 @@ def test_an_imported_configuration_is_encoded_with_the_types_of_the_declaration(
     got = build_library(spec, arch="sm_103")
     assert got.algo == ALGO and got.entry()["algo_source"] == "imported" and got.entry()["allow_f16_reduction"] is True
     form = L.Form("f16", "f16", "TN")
-    opt_in = {"allow_bf16_reduction": False, "allow_f16_reduction": True}
+    opt_in = {"allow_bf16_reduction": False, "allow_f16_reduction": True, "allow_f32_reduction": False}
     assert calls == [
         ("encode", CONFIG, {"device_index": 0, "form": form}),
         ("check", (32, 3072, 1024, False, ALGO), {"workspace_bytes": 8_519_680, "device_index": 0, "form": form, "sm_count_target": None, **opt_in}),
@@ -297,8 +296,8 @@ def test_the_problem_of_an_f32_result_has_f32_c_d_and_bias():
 
 def test_the_form_and_the_opt_in_are_checked_before_the_library(monkeypatch):
     monkeypatch.setattr(L, "_lib", lambda: (_ for _ in ()).throw(AssertionError("the library was reached")))
-    with pytest.raises(TilefishRuntimeError, match=r"the operands are one of \['bf16', 'f16'\]"):
-        L.Form("f32", "f32")
+    with pytest.raises(TilefishRuntimeError, match=r"the operands are one of \['bf16', 'f16', 'f32'\]"):
+        L.Form("e4m3", "f32")
     with pytest.raises(TilefishRuntimeError, match="the result of f16 operands is f16 or f32"):
         L.Form("f16", "bf16")
     with pytest.raises(TilefishRuntimeError, match=r"the layout is one of \['TN', 'NN'\]"):

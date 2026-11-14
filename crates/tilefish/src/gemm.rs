@@ -1,8 +1,8 @@
 //! A pinned cuBLASLt GEMM of a manifest's `library` section, loaded and launched with the checks of a kernel.
 //!
-//! `out[M, N] = a[M, K] @ b[N, K]^T (+ bias[N])` in tilefish's row-major terms (`b[K, N]` and no transpose for the layout NN): bf16 or f16
-//! operands, an f32 accumulator, one rounding to the result's type (theirs, or f32) at the end, the bias (of the result's type) added in f32
-//! before it (`docs/manifest-schema-3.md`, section 9). The entry pins the 64 bytes of the algorithm that
+//! `out[M, N] = a[M, K] @ b[N, K]^T (+ bias[N])` in tilefish's row-major terms (`b[K, N]` and no transpose for the layout NN): bf16, f16
+//! or f32 operands (f32 ones multiplied as f32, TF32 off), an f32 accumulator, one rounding to the result's type (theirs, or f32) at the end,
+//! the bias (of the result's type) added in f32 before it (`docs/manifest-schema-3.md`, section 9). The entry pins the 64 bytes of the algorithm that
 //! cuBLASLt's heuristic ranked first under a workspace limit, with the cuBLASLt version that chose it and the SM count of the device it
 //! was chosen on; [`Manifest::gemm`] refuses a device of another SM count (an algorithm is chosen for the multiprocessors it runs on: a MIG
 //! slice has fewer than the whole GPU), another version (an algorithm id names other kernels in another version), vets the 64 bytes the way Python's binding does (a weak check by the
@@ -33,8 +33,35 @@ use crate::tensor::{DType, TensorArg};
 
 /// The alignment of the workspace pointer (cuBLASLt asks for 16 bytes at least, and recommends 256: cudarc's allocations are).
 const WORKSPACE_ALIGNMENT: u64 = 256;
+// cublasLt.h, cublasLtNumericalImplFlags_t (the same values in the headers of cuBLAS 12.8.4 and 13.1.0)
 const ACCUMULATOR_TYPE_MASK: u64 = 0xFF << 8;
 const ACCUMULATOR_32F: u64 = 0x02 << 8;
+const INPUT_TYPE_MASK: u64 = 0xFF << 16;
+const INPUT_32F: u64 = 0x08 << 16;
+/// `CUBLASLT_NUMERICAL_IMPL_FLAGS_INPUT_*`, as a message names them.
+const INPUT_NAMES: [(u64, &str); 8] = [
+    (0x01 << 16, "f16"),
+    (0x02 << 16, "bf16"),
+    (0x04 << 16, "tf32"),
+    (0x08 << 16, "f32"),
+    (0x10 << 16, "f64"),
+    (0x20 << 16, "i8"),
+    (0x40 << 16, "e4m3"),
+    (0x80 << 16, "e5m2"),
+];
+/// cublas_api.h, `cublasComputeType_t`: the f32 compute types (`_EMULATED_16BFX9` is new in cuBLAS 12.9, read from the 13.1.0 header).
+const COMPUTE_32F: u32 = 68;
+const COMPUTE_TYPE_NAMES: [(u32, &str); 6] = [
+    (68, "CUBLAS_COMPUTE_32F"),
+    (69, "CUBLAS_COMPUTE_32F_PEDANTIC"),
+    (74, "CUBLAS_COMPUTE_32F_FAST_16F"),
+    (75, "CUBLAS_COMPUTE_32F_FAST_16BF"),
+    (77, "CUBLAS_COMPUTE_32F_FAST_TF32"),
+    (78, "CUBLAS_COMPUTE_32F_EMULATED_16BFX9"),
+];
+/// Where `cublasLtMatmulAlgoInit` writes the compute type in the 64 bytes of an algorithm (a little-endian `int32`; measured with cuBLASLt 12.8.4
+/// and 13.1.0, as Python's `ALGO_COMPUTE_TYPE_OFFSET`).
+const ALGO_COMPUTE_TYPE_OFFSET: usize = 52;
 const REDUCTION_NONE: u32 = 0;
 const REDUCTION_INPLACE: u32 = 1;
 const REDUCTION_COMPUTE_TYPE: u32 = 2;
@@ -101,9 +128,10 @@ fn refuse(who: &str, why: impl std::fmt::Display) -> Error {
 /// the bytes are held to what the library encodes for the configuration they read back as: the algorithm is rebuilt with
 /// `cublasLtMatmulAlgoInit` (which also writes the data types, the compute type and the version) and the configuration attributes, and must
 /// be byte for byte the same; the configuration must be one that the capabilities of its id list (tile, stages, swizzling, custom option);
-/// it must accumulate in f32 and need no more than 16-byte alignment, and its split-K must go with a reduction scheme that does not round in
-/// the output type (none, or f32 partial sums), and a GEMM with a bias has no split-K, or, for an entry that opts in (`allow_bf16_reduction`
-/// or `allow_f16_reduction`, by the operands' type), any scheme cuBLASLt defines ([`reduction_problem`]). The algorithm is rebuilt with the
+/// it must accumulate in f32 (and, for f32 operands, multiply them as f32, not as TF32 nor in a bf16 emulation: [`numerics_problems`]) and need
+/// no more than 16-byte alignment, and its split-K must go with a reduction scheme that does not round in the output type (none, or f32
+/// partial sums), and a GEMM with a bias has no split-K, or, for an entry that opts in (`allow_bf16_reduction`, `allow_f16_reduction` or
+/// `allow_f32_reduction`, by the operands' type), any scheme cuBLASLt defines ([`reduction_problem`]). The algorithm is rebuilt with the
 /// types of the entry (`form`): a pin of other types has other bytes and is refused. What this cannot see is a flip to another valid
 /// configuration (another tile, say): that is a different, legitimate algorithm, and only the digest of the manifest vouches for the file.
 fn vet(
@@ -159,9 +187,7 @@ fn vet(
     if let Some(problem) = reduction_problem(config.splitk_num, config.reduction_scheme, allow_reduction, bias, form) {
         problems.push(problem);
     }
-    if caps.numerical_impl_flags & ACCUMULATOR_TYPE_MASK != ACCUMULATOR_32F {
-        problems.push("it does not accumulate in f32".to_owned());
-    }
+    problems.extend(numerics_problems(caps.numerical_impl_flags, compute_type_of(&fresh.to_bytes()), form));
     for (name, needed) in ["A", "B", "C", "D"].into_iter().zip(caps.min_alignment) {
         if needed > OPERAND_ALIGNMENT {
             problems.push(format!(
@@ -181,9 +207,56 @@ fn vet(
     if problems.is_empty() { Ok(config) } else { Err(Error::Manifest(format!("{head}: {}", problems.join("; ")))) }
 }
 
+/// The compute type an encoded algorithm is for: the little-endian `int32` at [`ALGO_COMPUTE_TYPE_OFFSET`] of its 64 bytes (Python's
+/// `compute_type_of`).
+fn compute_type_of(bytes: &[u8; 64]) -> u32 {
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&bytes[ALGO_COMPUTE_TYPE_OFFSET..ALGO_COMPUTE_TYPE_OFFSET + 4]);
+    u32::from_le_bytes(word)
+}
+
+/// What is wrong with how an algorithm of `form` computes, by its numerical-implementation flags (`CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS`) and
+/// the compute type cuBLASLt encodes `CUBLAS_COMPUTE_32F` as in this process ([`compute_type_of`] a fresh algorithm); empty: nothing. The rule of
+/// Python's `tilefish._cublaslt.numerics_problems`, word for word: every algorithm accumulates in f32; for f32 operands cuBLASLt must encode
+/// `CUBLAS_COMPUTE_32F` as itself (`NVIDIA_TF32_OVERRIDE=1` makes it TF32 and `CUBLAS_EMULATE_SINGLE_PRECISION=1` a bf16x9 emulation, and the
+/// encoding shows it: measured with 12.8.4 and 13.1.0), and the flags, when the library reports them, say f32 inputs (`INPUT_32F` alone); an
+/// algorithm that reports none (flags 0: id 76, a CUTLASS 3 SIMT sgemm, on sm_103) is held to its compute type alone.
+pub(crate) fn numerics_problems(flags: u64, compute_type: u32, form: &GemmForm) -> Vec<String> {
+    let mut problems = Vec::new();
+    let f32_operands = form.dtype == DType::F32;
+    if f32_operands {
+        if compute_type != COMPUTE_32F {
+            let name = match COMPUTE_TYPE_NAMES.iter().find(|(value, _)| *value == compute_type) {
+                Some((_, name)) => format!("{name} ({compute_type})"),
+                None => format!("compute type {compute_type}"),
+            };
+            problems.push(format!(
+                "cuBLASLt encodes CUBLAS_COMPUTE_32F as {name} in this process, which does not multiply f32 operands as f32 \
+                 (NVIDIA_TF32_OVERRIDE=1 turns on TF32, CUBLAS_EMULATE_SINGLE_PRECISION=1 a bf16x9 emulation): an f32 GEMM is not run here"
+            ));
+        }
+        if flags == 0 {
+            return problems;
+        }
+    }
+    if flags & ACCUMULATOR_TYPE_MASK != ACCUMULATOR_32F {
+        problems.push("it does not accumulate in f32".to_owned());
+    }
+    let inputs = flags & INPUT_TYPE_MASK;
+    if f32_operands && inputs != INPUT_32F {
+        let names: Vec<&str> = INPUT_NAMES.iter().filter(|(bit, _)| inputs & bit != 0).map(|(_, name)| *name).collect();
+        let names = if names.is_empty() { "no input type".to_owned() } else { names.join(" and ") };
+        problems.push(format!(
+            "its products read the f32 operands as {names}, not as f32 (CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS {flags:#x})"
+        ));
+    }
+    problems
+}
+
 /// What is wrong with a split-K count and a reduction scheme for a pinned algorithm of a GEMM of `form` with or without a bias (`None`:
 /// nothing): the rule of Python's `tilefish._cublaslt.reduction_problem`, word for word. No split-K has no reduction scheme and split-K has
-/// one; without the entry's opt-in (`allow_bf16_reduction` or `allow_f16_reduction`, named by the operands' type) the scheme keeps the one
+/// one; without the entry's opt-in (`allow_bf16_reduction`, `allow_f16_reduction` or `allow_f32_reduction`, named by the operands' type) the
+/// scheme keeps the one
 /// rounding (f32 partial sums, `COMPUTE_TYPE`) and a GEMM with a bias has no split-K at all (with the bias epilogue a split-K was measured to
 /// round twice, f32 partial sums included: cuBLASLt 12.8.4 on sm_120); with it the two that add the partial sums in the output type
 /// (`INPLACE`, `OUTPUT_TYPE`) are allowed too.
@@ -432,7 +505,7 @@ impl Gemm {
         self.loaded.bias
     }
 
-    /// The type of `a` and `b` (bf16 or f16).
+    /// The type of `a` and `b` (bf16, f16 or f32).
     pub fn dtype(&self) -> crate::tensor::DType {
         self.loaded.form.dtype
     }
@@ -1190,6 +1263,61 @@ mod tests {
             (f16.what(), f32_out.what(), GemmForm::DEFAULT.what()),
             ("f16".to_owned(), "f16 operands and an f32 result".to_owned(), "bf16".to_owned())
         );
+    }
+
+    /// The rule of the numerical implementation, as Python's `numerics_problems` says it: an f32 accumulator for every form; for f32 operands
+    /// `CUBLAS_COMPUTE_32F` encoded as itself and, where the flags are reported, f32 inputs.
+    #[test]
+    fn f32_operands_are_multiplied_as_f32_and_tf32_or_an_emulation_is_refused() {
+        let f32_tn = GemmForm { dtype: DType::F32, out: DType::F32, layout: GemmLayout::Tn };
+        let (fma_f32, hmma_tf32, fma_tf32) = (0x80201u64, 0x40202u64, 0x40201u64);
+        assert!(numerics_problems(fma_f32, COMPUTE_32F, &f32_tn).is_empty());
+        assert!(
+            numerics_problems(0, COMPUTE_32F, &f32_tn).is_empty(),
+            "flags 0: the library reports none (id 76 on sm_103)"
+        );
+        assert_eq!(
+            numerics_problems(hmma_tf32, COMPUTE_32F, &f32_tn),
+            ["its products read the f32 operands as tf32, not as f32 (CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS 0x40202)"]
+        );
+        assert_eq!(numerics_problems(fma_tf32, COMPUTE_32F, &f32_tn).len(), 1);
+        assert_eq!(
+            numerics_problems(0x201, COMPUTE_32F, &f32_tn),
+            [
+                "its products read the f32 operands as no input type, not as f32 (CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS 0x201)"
+            ]
+        );
+        assert_eq!(
+            numerics_problems(0x20202, COMPUTE_32F, &f32_tn),
+            ["its products read the f32 operands as bf16, not as f32 (CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS 0x20202)"]
+        );
+        for (compute, name) in [
+            (77, "CUBLAS_COMPUTE_32F_FAST_TF32 (77)"),
+            (78, "CUBLAS_COMPUTE_32F_EMULATED_16BFX9 (78)"),
+            (99, "compute type 99"),
+        ] {
+            let got = numerics_problems(0, compute, &f32_tn);
+            assert_eq!(
+                got,
+                [format!(
+                    "cuBLASLt encodes CUBLAS_COMPUTE_32F as {name} in this process, which does not multiply f32 operands as f32 \
+                     (NVIDIA_TF32_OVERRIDE=1 turns on TF32, CUBLAS_EMULATE_SINGLE_PRECISION=1 a bf16x9 emulation): an f32 GEMM is not run here"
+                )]
+            );
+            assert_eq!(numerics_problems(fma_f32, compute, &f32_tn).len(), 1);
+        }
+        // the accumulator is asked of every form, and a 16-bit form is asked nothing else (its flags 0 are refused, as in 0.0.5)
+        assert_eq!(numerics_problems(0x80101, COMPUTE_32F, &f32_tn), ["it does not accumulate in f32"]);
+        assert_eq!(numerics_problems(0, COMPUTE_32F, &GemmForm::DEFAULT), ["it does not accumulate in f32"]);
+        assert!(numerics_problems(0x20202, 77, &GemmForm::DEFAULT).is_empty());
+        // the compute type of the bytes: CUBLAS_COMPUTE_32F as cuBLASLt 12.8.4 and 13.1.0 write it
+        let mut bytes = [0u8; 64];
+        bytes[52] = 0x44;
+        assert_eq!(compute_type_of(&bytes), COMPUTE_32F);
+        bytes[52] = 0x4d;
+        assert_eq!(compute_type_of(&bytes), 77);
+        let (fixture, _) = library(PLAIN);
+        assert_eq!(compute_type_of(&fixture.algo), COMPUTE_32F, "a bf16 pin of the sm_103 fixture");
     }
 
     /// An NN GEMM takes `b` as `[k, n]`: the checks of a call hold the operands to the shapes of the problem in its layout.
