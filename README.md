@@ -478,6 +478,8 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
 - The elementwise template broadcasts an operand over the leading axes (a `[T, D]` table added to a `[K, T, D]` batch).
 - In a graph, `tilefish.contiguous(view)` and `tilefish.im2col(x, kernel, stride, padding)` are ops whose Triton tilefish generates, reading
   a strided view: a materialised permutation, and convolution patches with channel-major columns and `+0.0` padding.
+  `tilefish.im2col1d(x, kernel, stride=, dilation=, padding=, order="channel" | "tap")` gives the patches of a 1-D convolution of `[N, C, L]` as
+  `[N, Lo, C * K]`, with a dilation, a padding `(left, right)` (a causal one is `(dilation * (K - 1), 0)`) and the columns channel-major or tap-major.
 
 ## Launch plans: a graph as a static list of launches over one arena
 

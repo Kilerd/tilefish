@@ -1,12 +1,14 @@
-"""Copies that tilefish writes the Triton for: ``contiguous`` (a view, materialised) and ``im2col`` (the patches of a convolution).
+"""Copies that tilefish writes the Triton for: ``contiguous`` (a view, materialised), ``im2col`` and ``im2col1d`` (the patches of a 2-D and of a
+1-D convolution).
 
-Neither is a ``@tilefish.kernel`` body: a lowered kernel takes contiguous tensors, and both read a strided view. Each is a *generated op*: an
-``extern`` operator whose Triton source tilefish generates from a fixed template, whose input is ``Strided[...]`` (so a view goes to it as it is,
-with its strides as scalar arguments, through the machinery every strided ``extern`` uses: compile specs, launches, manifests, plans, the Rust
-host), and which has a torch reference. One op exists per rank and dtype (``contiguous``) or per dtype, window and channel count (``im2col``),
-made the first time it is asked for and kept; called in a ``@tilefish.graph``, it is a step of the plan.
+None of them is a ``@tilefish.kernel`` body: a lowered kernel takes contiguous tensors, and each reads a strided view. Each is a *generated op*:
+an ``extern`` operator whose Triton source tilefish generates from a fixed template, whose input is ``Strided[...]`` (so a view goes to it as it
+is, with its strides as scalar arguments, through the machinery every strided ``extern`` uses: compile specs, launches, manifests, plans, the Rust
+host), and which has a torch reference. One op exists per rank and dtype (``contiguous``), per dtype, window and channel count (``im2col``) or
+per dtype, window, column order and channel count (``im2col1d``), made the first time it is asked for and kept; called in a ``@tilefish.graph``,
+it is a step of the plan.
 
-Both are raw copies: values are loaded and stored with no arithmetic, so a NaN keeps its payload and a zero its sign, and any tiling gives the
+All are raw copies: values are loaded and stored with no arithmetic, so a NaN keeps its payload and a zero its sign, and any tiling gives the
 same bytes. Offsets are ``i64`` (``index_bits=64``): the strides are ``i64`` scalars, and no size limit applies.
 
 ``contiguous(v)`` copies the view ``v`` (rank 1 to 4) into a new contiguous tensor of its shape, in its logical (row-major) order. A program
@@ -18,6 +20,15 @@ with ``Ho = (H + 2 PH - KH) // SH + 1`` (and ``Wo`` likewise): ``out[n, oh, ow, 
 kw]`` where that position is inside ``x``, and ``+0.0`` (all bits clear: the load is masked) where it is in the padding. The columns are
 channel-major, the order of a ``Conv2d`` weight flattened (``F.unfold``'s), so the weight is the GEMM's operand as it is. One program per output
 pixel (grid ``(Wo, Ho, N)``), a loop over the columns in blocks (one block of ``next_pow2(C * KH * KW)`` up to 1024 when ``C`` is static).
+
+``im2col1d(x, kernel=K, stride=S, dilation=D, padding=(PL, PR), order=...)`` takes ``x: [N, C, L]`` (any strides: a channel-last ``[N, L, C]``
+activation permuted, for one) and gives ``[N, Lo, C * K]`` with ``Lo = (L + PL + PR - D * (K - 1) - 1) // S + 1``. Tap ``j`` of output position
+``t`` is ``x[n, c, t * S - PL + j * D]`` where that position is inside ``[0, L)`` and ``+0.0`` (all bits clear) where it is not; a causal
+convolution pads ``(D * (K - 1), 0)``. ``order="channel"`` puts it in column ``c * K + j`` (a ``Conv1d`` weight ``[C_out, C, K]`` flattened),
+``order="tap"`` in column ``j * C + c`` (the weight permuted to ``[C_out, K, C]``): the columns are the reduction axis of the GEMM that consumes
+them, so both orders exist and the weight is flattened to match. One program per output position (grid ``(Lo, N)``), a loop over the columns in
+blocks as ``im2col``; in the tap order consecutive lanes walk the channels of one tap (a channel-last input is read in contiguous runs), in the
+channel order the taps of one channel.
 """
 
 from __future__ import annotations
@@ -305,6 +316,137 @@ def im2col(x: Any, kernel: Any = (3, 3), stride: Any = (1, 1), padding: Any = (0
     return _cached(("im2col", dt.name, k, s, p, channels), lambda: _im2col_op(dt, k, s, p, channels))(x)
 
 
+# -- im2col1d ---------------------------------------------------------------------------------------------------------------------
+
+_ORDERS = ("channel", "tap")
+
+
+def _at_least(what: str, v: Any, low: int) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < low:
+        raise TilefishTypeError(f"im2col1d: {what} must be an int of at least {low}, got {v!r}")
+    return v
+
+
+def _im2col1d_args(kernel: Any, stride: Any, dilation: Any, padding: Any, order: Any) -> "tuple[int, int, int, tuple[int, int], str]":
+    k, s, d = _at_least("kernel", kernel, 1), _at_least("stride", stride, 1), _at_least("dilation", dilation, 1)
+    pad = (padding, padding) if isinstance(padding, int) and not isinstance(padding, bool) else None
+    if isinstance(padding, (tuple, list)):
+        pad = tuple(padding)
+    if pad is None or len(pad) != 2 or any(isinstance(e, bool) or not isinstance(e, int) or e < 0 for e in pad):
+        raise TilefishTypeError(f"im2col1d: padding must be an int or a pair (left, right) of ints of at least 0, got {padding!r}")
+    if not isinstance(order, str) or order not in _ORDERS:
+        raise TilefishTypeError(f'im2col1d: order must be "channel" or "tap", got {order!r}')
+    return k, s, d, (pad[0], pad[1]), order
+
+
+def _im2col1d_op(dtype: DType, k: int, s: int, d: int, pad: "tuple[int, int]", order: str, channels: "int | None") -> ExternOp:
+    left, right = pad
+    name = f"im2col1d_{dtype.name}_k{k}_s{s}_d{d}_p{left}x{right}_{order}" + ("" if channels is None else f"_c{channels}")
+    block = 1024 if channels is None else min(1024, 1 << (channels * k - 1).bit_length())
+    warps = 4 if block >= 512 else 1
+    c_src = "C" if channels is None else str(channels)
+    ncol = f"C * {k}" if channels is None else str(channels * k)
+    pos = ("t" if s == 1 else f"t * {s}") + (f" - {left}" if left else "") + (" + tap" if d == 1 else f" + tap * {d}")
+    if order == "channel":  # column c * K + j: consecutive lanes walk the taps of one channel
+        split = [f"        ch = col // {k}", f"        tap = col % {k}"]
+        column = f"c * {k} + j"
+    else:  # column j * C + c: consecutive lanes walk the channels of one tap (a channel-last input is read in contiguous runs)
+        split = [f"        tap = col // {c_src}", f"        ch = col % {c_src}"]
+        column = f"j * {c_src} + c"
+    formula = f"# out[n, t, {column}] = x[n, c, {pos.replace('tap', 'j')}]"
+    params = ["x", "out", *(["C"] if channels is None else []), "L", "Lo", "x_s0", "x_s1", "x_s2", "BLOCK: tl.constexpr"]
+    source = "\n".join(
+        [
+            f"# Generated by tilefish (tilefish.im2col1d) for {dtype.name}, kernel {k}, stride {s}, dilation {d}, padding {left} before and "
+            + f"{right} after, {order} order"
+            + ("" if channels is None else f", {channels} channels")
+            + ". Do not edit.",
+            formula + ", +0.0 outside [0, L): a raw copy, i64 offsets.",
+            "import triton",
+            "import triton.language as tl",
+            "",
+            "",
+            "@triton.jit",
+            f"def tf_{name}(",
+            *[f"    {q}," for q in params],
+            "):",
+            "    t = tl.program_id(0)",
+            "    n = tl.program_id(1).to(tl.int64)",
+            f"    ncol = {ncol}",
+            "    row = n * Lo + t",
+            "    for c0 in range(0, ncol, BLOCK):",
+            "        col = c0 + tl.arange(0, BLOCK)",
+            "        cm = col < ncol",
+            *split,
+            f"        pos = {pos}",
+            "        ok = cm & (pos >= 0) & (pos < L)",
+            "        v = tl.load(x + n * x_s0 + ch * x_s1 + pos * x_s2, mask=ok, other=0)",
+            "        tl.store(out + row * ncol + col, v, mask=cm)",
+        ]
+    ) + "\n"
+    c_text = "CH" if channels is None else str(channels)
+    stub = "\n".join(
+        [
+            f"def tf_{name}(",
+            f"    x: Strided[Tensor[NB, {c_text}, LI, dt]],",
+            f"    out: Out[Tensor[NB, LO, {c_text} * {k}, dt]],",
+            *(["    C: CH,"] if channels is None else []),
+            "    L: LI,",
+            "    Lo: LO,",
+            "    x_s0: StrideOf('x', 0),",
+            "    x_s1: StrideOf('x', 1),",
+            "    x_s2: StrideOf('x', 2),",
+            f"    BLOCK: const = {block},",
+            "): ...",
+        ]
+    )
+    nb, li = Dim("N"), Dim("L")
+    lo = as_dim(cdiv(li + (left + right - d * (k - 1)), s))  # (L + left + right - d (K - 1) - 1) // s + 1 for a window that fits
+    namespace = {"Strided": Strided, "Tensor": Tensor, "Out": Out, "StrideOf": StrideOf, "const": const, "dt": dtype}
+    namespace.update({"NB": nb, "LI": li, "LO": lo, "CH": Dim("C")})
+
+    def reference(x: Any) -> Any:
+        import torch.nn.functional as F
+
+        patches = F.pad(x, (left, right)).unfold(2, d * (k - 1) + 1, s)[..., ::d]  # [N, C, Lo, K], +0.0 in the padding
+        n_, c_, lo_ = patches.shape[:3]
+        cols = patches.permute(0, 2, 1, 3) if order == "channel" else patches.permute(0, 2, 3, 1)
+        return cols.reshape(n_, lo_, c_ * k).contiguous()
+
+    return _generated(name, source, stub, namespace, (lo, nb), warps, reference)
+
+
+def im2col1d(x: Any, kernel: Any, *, stride: Any = 1, dilation: Any = 1, padding: Any = 0, order: str = "channel") -> Value:
+    """``tilefish.im2col1d(x, kernel, *, stride=1, dilation=1, padding=0, order="channel")``: the patches of a 1-D convolution of
+    ``x: [N, C, L]`` (any strides: a channel-last ``[N, L, C]`` activation ``.permute(0, 2, 1)``, for one), as ``[N, Lo, C * K]``.
+
+    ``kernel`` is the number of taps ``K``, ``stride`` and ``dilation`` are ints of at least 1, and ``padding`` is an int (as many zeros on both
+    sides) or a pair ``(left, right)``: a causal convolution is ``padding=(dilation * (K - 1), 0)``. ``Lo = (L + left + right - dilation * (K - 1)
+    - 1) // stride + 1``. Tap ``j`` of output position ``t`` is ``x[n, c, t * stride - left + j * dilation]``, ``+0.0`` (all bits clear) where that
+    position is outside ``[0, L)``; it is column ``c * K + j`` with ``order="channel"`` (the order of a ``Conv1d`` weight ``[C_out, C, K]``
+    flattened) and ``j * C + c`` with ``order="tap"`` (the weight permuted to ``[C_out, K, C]`` and flattened). The columns are the reduction axis
+    of the GEMM that consumes them, so the weight must be flattened in the same order.
+
+    A step of a ``@tilefish.graph`` (a generated op, see :mod:`tilefish._copyops`) and a raw copy. Reshaped to ``[N * Lo, C * K]`` it is the left
+    operand of the convolution as a GEMM against the ``[C_out, C * K]`` weight.
+    """
+    if not isinstance(x, Value):
+        raise TilefishTypeError(f"im2col1d: takes a traced tensor [N, C, L], got {type(x).__name__}")
+    if x.rank != 3:
+        raise TilefishTypeError(f"im2col1d: {x.ref} ({x.type}) has rank {x.rank}; it takes [N, C, L]")
+    dt = _check_storable("im2col1d", x)
+    k, s, d, pad, order = _im2col1d_args(kernel, stride, dilation, padding, order)
+    size = x.shape[2].folded()
+    if size.is_static and size.value + pad[0] + pad[1] < d * (k - 1) + 1:
+        raise TilefishTypeError(
+            f"im2col1d: axis 2 of {x.type} is {size.value}, too short for {k} taps at dilation {d} (a window of {d * (k - 1) + 1}) "
+            f"with padding {pad}"
+        )
+    c = x.shape[1].folded()
+    channels = c.value if c.is_static else None
+    return _cached(("im2col1d", dt.name, k, s, d, pad, order, channels), lambda: _im2col1d_op(dt, k, s, d, pad, order, channels))(x)
+
+
 def contiguous_op(rank: int, dtype: DType, last: "int | None" = None) -> ExternOp:
     """The generated op behind :func:`contiguous` for views of ``rank`` and ``dtype`` (to run it on a torch view with ``tilefish.run``); ``last``
     is a static size of the last axis (the tile is fitted to it and it is compiled in), ``None`` a runtime one."""
@@ -327,4 +469,16 @@ def im2col_op(dtype: DType, kernel: Any = (3, 3), stride: Any = (1, 1), padding:
     return _cached(("im2col", dtype.name, k, s, p, channels), lambda: _im2col_op(dtype, k, s, p, channels))
 
 
-__all__ = ["contiguous", "contiguous_op", "generated_source", "im2col", "im2col_op"]
+def im2col1d_op(
+    dtype: DType, kernel: Any, *, stride: Any = 1, dilation: Any = 1, padding: Any = 0, order: str = "channel", channels: "int | None" = None
+) -> ExternOp:
+    """The generated op behind :func:`im2col1d` (``channels``: a static channel count, written into the source; ``None``: a runtime one)."""
+    if not isinstance(dtype, DType) or dtype.is_bool or dtype.name not in _TL:
+        raise TilefishTypeError(f"im2col1d_op: {dtype!r} is not a plain storage type")
+    if channels is not None and (isinstance(channels, bool) or not isinstance(channels, int) or channels < 1):
+        raise TilefishTypeError(f"im2col1d_op: channels must be a positive int or None, got {channels!r}")
+    k, s, d, pad, order = _im2col1d_args(kernel, stride, dilation, padding, order)
+    return _cached(("im2col1d", dtype.name, k, s, d, pad, order, channels), lambda: _im2col1d_op(dtype, k, s, d, pad, order, channels))
+
+
+__all__ = ["contiguous", "contiguous_op", "generated_source", "im2col", "im2col1d", "im2col1d_op", "im2col_op"]
