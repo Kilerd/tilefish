@@ -1,8 +1,8 @@
 [package]
 name = "tilefish"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
-description = "Typed tensor DSL for GPU kernels: shapes, dtypes and quantization formats in the type, one compiled artifact for Python, C++ and Rust hosts. This crate is the Rust host of a tilefish manifest: it verifies a manifest directory and launches its cubins, its pinned cuBLASLt GEMMs and its launch plans."
+description = "Typed tensor DSL for GPU kernels: shapes, dtypes and quantization formats in the type, one compiled artifact for Python, C++ and Rust hosts. This crate is the Rust host of a tilefish manifest: it verifies a manifest directory and launches its cubins, its pinned cuBLASLt GEMMs and its launch plans, alone, as plan sets or on a shared arena."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Kilerd/tilefish"
 readme = "README.md"

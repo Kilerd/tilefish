@@ -19,7 +19,11 @@ pinned digest, or an explicit `trust_directory=True`) and `reference` mode
 library GEMM runs a pinned cuBLASLt algorithm, and a `@tilefish.graph`
 compiles into a launch plan over one arena (`tilefish.plan`, written to
 `plan.json` by the export) that runs in the same three modes and captures in
-a CUDA graph (`tilefish.capture`). The `tilefish` crate on crates.io runs the
+a CUDA graph (`tilefish.capture`). Lowered kernels also compare, select,
+gather and scatter rows and reduce to an index; an extern may be a Gluon
+kernel or have one implementation per architecture; a GEMM's algorithm is
+chosen as torch chooses it or imported; plans exported together share one
+manifest and can share one arena. The `tilefish` crate on crates.io runs the
 same manifest and plan from Rust, and `tilefish.hosts.rust.emit` generates
 typed Rust launchers for it. The API will change.
 
