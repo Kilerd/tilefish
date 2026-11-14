@@ -48,8 +48,10 @@ pin, check and run refuses a process that has it set (:func:`refuse_tf32_overrid
 
 The library is the ``libcudnn`` the process already has mapped (torch's, from the ``nvidia-cudnn`` wheel): it is found in ``/proc/self/maps`` and opened
 by that path; when none is mapped, ``import torch`` maps it (``libtorch_cuda`` needs it), and only then is the one of the ``nvidia.cudnn`` wheel opened.
-The handle is one per device, created once under a lock; a call sets the handle's stream and runs under the handle's lock (the stream is state of the
-handle). Descriptors, plans and legacy descriptors of a problem are made once per device and kept.
+The handle is one per device, created once, shared by every pin and call on the device (the crate has one per CUDA context, shared by every
+convolution loaded in it); every use of it is under its lock: the heuristic queries, the descriptors and plans of a pin, and a call, which sets the
+handle's stream right before it runs (the stream is state of the handle). Descriptors, plans and legacy descriptors of a problem are made once per
+device and kept.
 """
 
 from __future__ import annotations
@@ -787,7 +789,9 @@ def _on_device(index: int) -> Iterator[None]:
 
 
 def _handle(lib: _Library, index: int) -> _Handle:
-    """The cuDNN handle of a device, created on first use (one per device, under a lock)."""
+    """The cuDNN handle of a device, created on first use: one per device, shared by every pin and call on it (the crate has one per CUDA context).
+    Every use of it is under its ``lock`` (a handle is not to be used by two threads at once): the heuristic queries, the descriptors and plans of a
+    pin, and a call, which sets the handle's stream right before it runs."""
     h = _handles.get(index)
     if h is None:
         with _handle_lock:
@@ -1134,7 +1138,7 @@ def pin_conv(
     lib = _lib()
     index = _device(device_index)
     h = _handle(lib, index)
-    with _on_device(index):
+    with h.lock, _on_device(index):
         if heuristic == "v7":
             legacy = _Legacy(lib, problem)
             try:
@@ -1289,7 +1293,7 @@ def _prepare(problem: Problem, pin: "LegacyPin | EnginePin", limit: int, target:
         with _prepared_lock:
             found = _prepared.get(key)
             if found is None:
-                with _on_device(index):
+                with h.lock, _on_device(index):
                     found = _prepared[key] = _Prepared(lib, h, problem, pin, limit, target)
     return found
 
@@ -1371,7 +1375,7 @@ def engine_list(problem: Problem, *, heuristic: str = "instant", device_index: "
     index = _device(device_index)
     h = _handle(lib, index)
     out = []
-    with _on_device(index):
+    with h.lock, _on_device(index):
         graph = _Graph(lib, h.handle, problem)
         try:
             for mode in HEUR_MODES[heuristic]:
@@ -1401,7 +1405,7 @@ def legacy_list(problem: Problem, *, device_index: "int | None" = None) -> "list
     lib = _lib()
     index = _device(device_index)
     h = _handle(lib, index)
-    with _on_device(index):
+    with h.lock, _on_device(index):
         legacy = _Legacy(lib, problem)
         try:
             return [{**c, "workspace": legacy.workspace(h.handle, c["algo"])} for c in legacy.candidates(h.handle)]
