@@ -2,7 +2,7 @@
 # template: elementwise; every tensor is [N], flattened to n = N elements
 # grid (cdiv(N, 1024),), BLOCK = 1024
 # num_warps: 4
-# math: ieee (note 13: / and sqrt are IEEE 754, exp is expf, silu torch's, rsqrt rsqrtf, sin keeps a subnormal; no flush to zero)
+# math: ieee (note 13: / and sqrt are IEEE 754, exp is expf, silu torch's, rsqrt rsqrtf, sin and tanh keep a subnormal; no flush to zero)
 # Numerics contract: see the docstring of tilefish.lower.
 import triton
 import triton.language as tl

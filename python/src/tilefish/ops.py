@@ -383,6 +383,12 @@ def sin(x: Value, *, math: Any = None) -> Value:
     return _unary("sin", x, math)
 
 
+def tanh(x: Value, *, math: Any = None) -> Value:
+    """The hyperbolic tangent: libdevice's ``tanhf`` in a lowered kernel, built with flush to zero (a subnormal argument gives a zero of its sign);
+    with ``math="ieee"`` the subnormal is kept, which is torch's CUDA ``tanh`` on every f32 (note 14 of :mod:`tilefish.lower`)."""
+    return _unary("tanh", x, math)
+
+
 def cos(x: Value, *, math: Any = None) -> Value:
     """The cosine (libdevice's ``cosf`` in a lowered kernel; see note 10 of :mod:`tilefish.lower`: the same in both math modes)."""
     return _unary("cos", x, math)

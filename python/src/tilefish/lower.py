@@ -73,7 +73,7 @@ value (``out``, or ``out0``, ``out1``, ... for several), then the template's par
 generated name that collides with a kernel parameter is suffixed (``mask_1``). Constexpr values come
 from the spec (``compile_specs(lowered.extern)``), not from defaults in the source.
 
-A kernel parameter whose name the generated module itself uses (``tl``, ``triton``, ``float``) or
+A kernel parameter whose name the generated module itself uses (``tl``, ``triton``, ``float``, ``libdevice``) or
 that Triton's JIT launcher takes as a launch option (``grid``, ``warmup``, ``debug``, ``num_warps``,
 ``num_stages``, ``num_ctas``, ``maxnreg``) is renamed with a numeric suffix (``tl_1``), in the
 generated function, the extern stub and every spec alike: a spec's signature must name the
@@ -144,6 +144,10 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
                                                                                          CUDA bits except ``sin`` of a
                                                                                          subnormal, which is ±0 (note 10); in
                                                                                          IEEE math that is ``x`` (note 13).
+``tanh(x)``                 ``libdevice.tanh(x)`` (``from triton.language.extra import       f32 only; libdevice ``__nv_tanhf``,
+                            libdevice``)                                                    built with FTZ: torch's CUDA bits
+                                                                                         except on a subnormal, which is ±0;
+                                                                                         in IEEE math that is ``x`` (note 14).
 ``sum(x, axis=-1)``         ``tl.sum(tl.where(mask, x, 0.0), axis=0)``                      f32 only. The reduction is over all
                                                                                          ``BLOCK_D`` lanes; masked lanes are
                                                                                          set to 0 explicitly (intermediates
@@ -355,7 +359,8 @@ Notes (the facts behind the table):
     * ``sqrt(x)`` is ``sqrt.rn.f32`` (correctly rounded, a subnormal argument kept), ``rsqrt(x)`` is CUDA's ``rsqrtf``, ``rsqrt.approx.f32``
       without flush to zero;
     * ``sin(x)`` is libdevice's ``sinf`` (built with FTZ, which differs from the library without it only on a subnormal argument, note 10) with
-      that argument passed through as its own sine: ``tl.where(tl.abs(x) < 2**-126, x, tl.sin(x))``; ``cos`` is the same in both maths.
+      that argument passed through as its own sine: ``tl.where(tl.abs(x) < 2**-126, x, tl.sin(x))``; ``cos`` is the same in both maths;
+    * ``tanh(x)`` is libdevice's ``tanhf`` with a subnormal argument passed through likewise (note 14).
 
     Measured on every one of the ``2**32`` f32 bit patterns (``tests/test_gpu_ieee.py``; torch 2.9.1 on a B300 MIG slice, sm_103, built with CUDA 12.8
     and with 13.0, and on an RTX 5090, sm_120, built with CUDA 13.0): ``exp``,
@@ -366,6 +371,16 @@ Notes (the facts behind the table):
     (``sum * f32(1 / D)``, as torch's ``mean`` multiplies by ``1 / N``). With ``fp_fusion=False`` too, a body of these ops rounds where torch's
     eager ops round, so it is torch's eager composition byte for byte. The ``reference`` mode in IEEE math is torch's own op (``torch.div`` of
     tensors, ``torch.exp``, ``torch.nn.functional.silu``, ...).
+14. **``tanh``.** ``tilefish.tanh(x)`` (f32) is libdevice's ``__nv_tanhf``, called by name (``libdevice.tanh`` of ``triton.language.extra``, which
+    the generated module imports when the body has a ``tanh``) and inlined; Triton links libdevice with ``__CUDA_FTZ = 1``, so its ``fma``,
+    ``mul`` and ``add`` are ``.ftz``. The function is CUDA's ``tanhf``: for ``|x| >= 0.6``, ``1 - 2 / (2**(2 |x| log2 e) + 1)`` from
+    ``ex2.approx.ftz`` and ``rcp.approx.ftz`` (1 from ``|x| >= 9.0109``), the sign of ``x`` put back on the bits; below, the odd polynomial
+    ``x + x * x**2 * p(x**2)`` of four ``fma``. Measured over every one of the ``2**32`` f32 bit patterns against torch's CUDA ``tanh`` (torch
+    2.9.1 on a B300 MIG slice built with CUDA 12.8 and with 13.0, and on an RTX 5090 with 13.0; ``tests/test_gpu_tanh.py``): the bits are torch's on every input but the 16 777 214 subnormals, where
+    the binary gives a zero of the argument's sign (torch: the argument itself), as ``sin`` does (note 10). In IEEE math (note 13) a subnormal
+    argument is passed through, ``tl.where(tl.abs(x) < 2**-126, x, libdevice.tanh(x))``, and the bits are torch's on every input. The
+    ``reference`` mode models the flush in the default math (``torch.where(|x| < 2**-126, x * 0.0, torch.tanh(x))``) and is torch's ``tanh`` in
+    IEEE math: byte-identical to the binary in both. ``tanh.approx.f32`` (one instruction, about ``2**-11`` relative error) is not used.
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -420,7 +435,7 @@ TEMPLATES = ("elementwise", "row")
 INDEX_MAX = MAX_ELEMENTS  # offsets are i32: a tensor has at most 2**31 - 1 elements
 # Names a kernel parameter cannot keep in the generated function: what the module itself uses, and what
 # Triton's JIT launcher takes as launch options (a parameter of that name could not be passed by keyword).
-_RESERVED = frozenset({"tl", "triton", "float", "grid", "warmup", "debug", "num_warps", "num_stages", "num_ctas", "maxnreg"})
+_RESERVED = frozenset({"tl", "triton", "float", "libdevice", "grid", "warmup", "debug", "num_warps", "num_stages", "num_ctas", "maxnreg"})
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")  # ASCII only, like the identifiers a compile spec accepts
 _MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
@@ -442,7 +457,7 @@ _MATH = frozenset({"f32"})
 _BINARY = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 _COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 _LOGICAL = {"and": "&", "or": "|", "xor": "^"}
-_UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos")
+_UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos", "tanh")
 _REDUCTIONS = ("sum", "mean", "max")
 _ARG_REDUCTIONS = ("argmax", "argmin")
 _OTHER_OPS = ("not", "where", "iota", "gather_rows", "scatter_rows", "floordiv", "mod")  # dtypes checked like a load's
@@ -491,7 +506,7 @@ _SILU = (  # x / (1 + expf(-x)), as torch's silu kernel compiles: the negation f
 )
 
 
-_IEEE_HEADER = "math: ieee (note 13: / and sqrt are IEEE 754, exp is expf, silu torch's, rsqrt rsqrtf, sin keeps a subnormal; no flush to zero)"
+_IEEE_HEADER = "math: ieee (note 13: / and sqrt are IEEE 754, exp is expf, silu torch's, rsqrt rsqrtf, sin and tanh keep a subnormal; no flush to zero)"
 
 
 def _asm(instructions: "Iterable[str]", constraints: str, args: str, regs: str = "") -> "list[str]":
@@ -520,6 +535,8 @@ _IEEE: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {  # op -> (paramet
              _asm(list(_SILU), "=f,f", "x", ".reg .f32 t<8>; .reg .b32 r<2>;")),
     "sin": ("x", ("libdevice's sinf (built with flush to zero), but a subnormal argument is its own sine, as without flush to zero",),
             ["return tl.where(tl.abs(x) < 1.1754943508222875e-38, x, tl.sin(x))"]),
+    "tanh": ("x", ("libdevice's tanhf (built with flush to zero), but a subnormal argument is its own tanh, as without flush to zero (note 14)",),
+             ["return tl.where(tl.abs(x) < 1.1754943508222875e-38, x, libdevice.tanh(x))"]),
 }  # (cos is libdevice's cosf in both: it has the same bits with and without flush to zero, note 10)
 
 
@@ -704,7 +721,7 @@ def _check_common(op: KernelOp) -> None:
                 None,
                 "declared-op-call",
                 f"the body calls the {n.attrs['kind']} op '{n.op}'; only the built-in ops (+ - * /, comparisons, & | ^ ~ of masks, "
-                "where, iota, // and % by a constant, silu, gelu, rsqrt, exp, sqrt, sin, cos, .to, sum, mean, max, argmax, argmin, gather_rows, "
+                "where, iota, // and % by a constant, silu, gelu, rsqrt, exp, sqrt, sin, cos, tanh, .to, sum, mean, max, argmax, argmin, gather_rows, "
                 "scatter_rows, load and stores) are lowered",
             )
         if n.op == "split":
@@ -1658,6 +1675,7 @@ class _Body:
         self.out_names = out_names
         self.rename = rename  # kernel parameter name -> its name in the generated function, where they differ
         self.math = math  # the kernel's f32 math (note 13); an op may say its own
+        self.libdevice = False  # whether the body calls libdevice by name (tanh), which the module then imports
         self.params = {p.name: p for p in op.graph.inputs}
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
@@ -1973,8 +1991,12 @@ class _Body:
             return f"{a[0]} {_LOGICAL[op]} {a[1]}"
         if op == "not":
             return f"~{a[0]}"
+        if op == "tanh":
+            self.libdevice = True  # libdevice's tanhf (note 14): the module imports it
         if self.math_of(n) == "ieee" and op in _IEEE:  # note 13: CUDA's f32 math without fast math or flush to zero
             return f"{self.ieee_helper(op)}({', '.join(a)})"
+        if op == "tanh":
+            return f"libdevice.tanh({a[0]})"
         if op in _BINARY:
             return f"{a[0]} {_BINARY[op]} {a[1]}"
         if op == "rsqrt":
@@ -2166,6 +2188,8 @@ def _assemble(
     ]
     lines = [f"# {h}" for h in header]
     lines += ["import triton", "import triton.language as tl"]
+    if body_emitter.libdevice:  # tanh: libdevice by name (note 14)
+        lines.append("from triton.language.extra import libdevice")
     for _, helper in body_emitter.helpers.values():
         lines += ["", "", *helper]
     lines += ["", "", "@triton.jit", f"def {fn_name}("]

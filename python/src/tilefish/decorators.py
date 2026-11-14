@@ -508,7 +508,7 @@ def kernel(
     ``a * b + c`` rounds the product and then the sum (the default, ``True``, lets the compiler round once).
     ``math="ieee"`` makes the f32 math of the body CUDA's without fast math and without flush to zero: ``/`` and
     ``sqrt`` are IEEE 754 (``div.rn.f32``, ``sqrt.rn.f32``), ``exp`` is ``expf``, ``silu`` is ``x / (1 + expf(-x))``
-    (torch's), ``rsqrt`` is ``rsqrtf``, and ``sin`` keeps a subnormal (note 13 of :mod:`tilefish.lower`);
+    (torch's), ``rsqrt`` is ``rsqrtf``, and ``sin`` and ``tanh`` keep a subnormal (note 13 of :mod:`tilefish.lower`);
     the default, ``"fast"``, is the contract of before. One op can say it alone: ``tilefish.exp(x, math="ieee")``.
     """
     _check_decorator_arg("kernel", fn)

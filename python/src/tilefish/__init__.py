@@ -33,8 +33,8 @@ M3.4: an extern of a Triton or Gluon kernel takes TMA tensor descriptors (:func:
 ``CUtensorMap`` (``cuTensorMapEncodeTiled``) and passes it by value as Triton launches a host ``TensorDescriptor``; the manifest records the map
 (manifest schema 3, section 5.5) and both hosts check and encode it, in single launches, in plans and in CUDA graphs. A stride or an offset may be
 a product of symbolic sizes (``L*L`` for an ``[H, L, L]`` tensor: :func:`tilefish.dims.mul`), which views, ``Strided`` arguments and plans take;
-the elementwise template broadcasts along any axis (note 12); and a kernel or an op says its f32 math, ``math="ieee"`` for CUDA's without fast
-math or flush to zero (:func:`div`, note 13).
+the elementwise template broadcasts along any axis (note 12); a kernel or an op says its f32 math, ``math="ieee"`` for CUDA's without fast math
+or flush to zero (:func:`div`, note 13); and :func:`tanh` is libdevice's ``tanhf`` (note 14).
 """
 
 from . import aot
@@ -77,7 +77,7 @@ from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in __all__, `from tilefish import *` must not shadow the module copy
-from .ops import argmax, argmin, cos, div, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sin, sqrt, where
+from .ops import argmax, argmin, cos, div, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sin, sqrt, tanh, where
 from ._copyops import col2im1d, contiguous, im2col, im2col1d
 from .ops import reduce_mean as mean
 from .runtime import capture, run
@@ -179,6 +179,7 @@ __all__ = [
     "silu",
     "sin",
     "sqrt",
+    "tanh",
     "u8",
     "ue8m0",
     "where",

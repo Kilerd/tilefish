@@ -1475,6 +1475,28 @@ fn the_gate_has_kernels_in_ieee_math() {
     assert_eq!(periodic.enable_fp_fusion, Some(false), "periodic: no contraction");
 }
 
+/// Lowered kernels of `tilefish.tanh` (`python/tests/tanh_cases.py`, `host_ops.tanh_ops`; note 14 of `tilefish.lower`): libdevice's `tanhf`, inlined
+/// into the binary (built with flush to zero), elementwise on random bit patterns and as a row kernel of bf16 activations in IEEE math. Entries
+/// like any other; `byte_identity` holds their bytes to Python's (which `rust_gate.py` holds to torch's `tanh`, a subnormal argument aside in the
+/// default math). A committed fixture has none.
+#[test]
+fn the_gate_has_tanh() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no tanh");
+        return;
+    }
+    let arch = cases["arch"].as_str().unwrap().to_owned();
+    let manifest = manifest();
+    for stem in ["tanh_fast", "tanh_rows"] {
+        let entry = manifest.entry(stem, &arch).unwrap_or_else(|| panic!("the gate's manifest has no {stem}"));
+        assert!(entry.source_sha256.is_some(), "{stem}: the sha256 of the generated source");
+        let n = cases_where(&cases, |c| c["stem"] == stem).len();
+        assert!(n >= 3, "{stem}: {n} cases");
+        println!("rust gate: the tanh kernel {stem}: {n} cases");
+    }
+}
+
 /// The GEMMs of the forms of section 9.2 of the manifest schema (on a fresh export): f16 operands in TN (with 64 MiB of workspace) and in NN (with a
 /// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN, f16 operands pinned for a partition of 16 SMs
 /// (`sm_count_target`: the Rust host sets it on every launch, and a host on a partition takes only the pins chosen for it), and f32 operands with

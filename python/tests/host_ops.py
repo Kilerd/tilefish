@@ -243,6 +243,15 @@ def ieee_ops():
     return {"math_ieee": ic.math_ieee, "div_ieee": ic.div_ieee, "periodic": ic.periodic}
 
 
+def tanh_ops():
+    """``{name: kernel}``: lowered kernels of ``tilefish.tanh`` (``tanh_cases.py``, note 14 of ``tilefish.lower``), whose binaries inline libdevice's
+    ``tanhf``: ``tanh_fast`` (built with flush to zero) and ``tanh_rows`` (a bias and a tanh of bf16 rows in IEEE math). The committed fixtures do
+    not have them."""
+    import tanh_cases as tc
+
+    return {"tanh_fast": tc.tanh_fast, "tanh_rows": tc.tanh_rows}
+
+
 def gemm_name(n, k, bias):
     return f"gemm_{n}_{k}{'_bias' if bias else ''}"
 

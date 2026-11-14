@@ -522,12 +522,13 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   (value, index) pairs); a row of up to 16384 columns is walked in chunks of 1024.
 - `tilefish.gather_rows(x, idx, oob="zero" | "clamp")` and `tilefish.scatter_rows(dst, idx, src, oob="skip")` copy rows (or elements) as raw
   bits, with the out-of-range policy declared at the call.
-- `x.to(bf16, nan="preserve")` keeps a NaN's sign and payload (the default, `"canonical"`, gives `0x7FFF`); `tilefish.sin` and `tilefish.cos`
-  are libdevice's, built with flush-to-zero like every libdevice function Triton links.
+- `x.to(bf16, nan="preserve")` keeps a NaN's sign and payload (the default, `"canonical"`, gives `0x7FFF`); `tilefish.sin`, `tilefish.cos` and
+  `tilefish.tanh` are libdevice's (`sinf`, `cosf`, `tanhf`), built with flush-to-zero like every libdevice function Triton links: over every f32,
+  torch's CUDA bits but `sin` and `tanh` of a subnormal, which are a zero of its sign (notes 10 and 14).
 - **IEEE math.** `@tilefish.kernel(math="ieee")`, or `math="ieee"` at one op (`tilefish.div(a, b, math="ieee")`, `tilefish.exp(x, math="ieee")`),
   makes the f32 math CUDA C++'s without fast math and without flush to zero, what torch's CUDA kernels are built with: `/` and `sqrt` are IEEE 754
   (`div.rn.f32`, `sqrt.rn.f32`; a constant divisor is divided by), `exp` is `expf`, `silu` torch's `x / (1 + expf(-x))`, `rsqrt` `rsqrtf`, and `sin`
-  keeps a subnormal, each written out as the inline PTX nvcc emits (Triton links libdevice with flush to zero). On every one of the 2**32 f32 bit
+  and `tanh` keep a subnormal, each written out as the inline PTX nvcc emits (Triton links libdevice with flush to zero). On every one of the 2**32 f32 bit
   patterns these are torch's CUDA bits, and `/` is torch's division of tensors; with `fp_fusion=False` too, a body of these ops is torch's eager
   composition of the same ops byte for byte. The default, `math="fast"`, is the contract of before (note 13 of `tilefish.lower`).
 - The elementwise template broadcasts an operand over the leading axes (a `[T, D]` table added to a `[K, T, D]` batch), and along any axis by

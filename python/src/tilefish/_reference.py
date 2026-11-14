@@ -27,7 +27,7 @@ order of a reduction, and FMA contraction (the binaries fuse ``a * b + c`` into 
 reference rounds twice). The gpu tests measure the resulting error per kernel.
 
 In IEEE math (``@tilefish.kernel(math="ieee")``, or ``math="ieee"`` at an op: note 13 of :mod:`tilefish.lower`) the reference is torch's
-own CUDA op: ``/`` is ``torch.div`` (a scalar divisor too, as a 0-d tensor: no reciprocal), ``exp``, ``sqrt``, ``rsqrt`` and ``sin`` torch's,
+own CUDA op: ``/`` is ``torch.div`` (a scalar divisor too, as a 0-d tensor: no reciprocal), ``exp``, ``sqrt``, ``rsqrt``, ``sin`` and ``tanh`` torch's,
 and ``silu`` ``torch.nn.functional.silu``; on a GPU these are the binary's bytes.
 
 An ``InOut`` or ``Out`` parameter is written once, with the final version stored into it, after the whole
@@ -227,6 +227,10 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 r = torch.sin(a[0])
             elif op == "sin":  # libdevice built with FTZ: a subnormal argument is a zero of its sign, and sin(±0) = ±0
                 r = torch.where(a[0].abs() < 2.0**-126, a[0] * 0.0, torch.sin(a[0]))
+            elif op == "tanh" and n.attrs.get("math", math) == "ieee":  # without flush to zero: torch's
+                r = torch.tanh(a[0])
+            elif op == "tanh":  # libdevice built with FTZ: a subnormal argument is a zero of its sign (note 14)
+                r = torch.where(a[0].abs() < 2.0**-126, a[0] * 0.0, torch.tanh(a[0]))
             elif op == "silu" and n.attrs.get("math", math) == "ieee":  # torch's: x / (1 + expf(-x))
                 r = torch.nn.functional.silu(a[0])
             elif op == "silu":  # x * sigmoid(x), sigmoid(x) = 1 / (1 + exp(-x))

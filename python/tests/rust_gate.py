@@ -89,7 +89,7 @@ from typing import Any, Callable
 
 import torch
 from gpu_util import randn, same_bytes
-from host_ops import GEMM_SHAPES, abi_of, broadcast_ops, gemm_name, generated_ops, gluon_ops, gpu_ops, ieee_ops, library_ops, ops, per_arch_ops
+from host_ops import GEMM_SHAPES, abi_of, broadcast_ops, gemm_name, generated_ops, gluon_ops, gpu_ops, ieee_ops, library_ops, ops, per_arch_ops, tanh_ops
 
 import tilefish
 from tilefish import runtime
@@ -481,6 +481,21 @@ def must_be_periodic(args, got):
     assert same_bytes(got, x + (1.0 / (a + 1e-9)) * torch.sin(a * x) ** 2)
 
 
+def must_be_torchs_tanh_but_on_a_subnormal(args, got):
+    (x,) = args
+    subnormal = (x != 0) & (x.abs() < 2.0**-126)
+    assert same_bytes(got, torch.where(subnormal, x * 0.0, torch.tanh(x)))
+
+
+def args_tanh_rows(rows, seed):
+    return randn((rows, 64), BF16, seed + rows, scale=3.0), randn((64,), BF16, seed + rows + 1)
+
+
+def must_be_a_tanh_of_rows(args, got):
+    x, b = args
+    assert same_bytes(got, torch.tanh(x.float() + b.float()).to(BF16))
+
+
 def given_ops():
     """``{name: extern}``: a prebuilt PTX whose ``k: const[i32]`` and ``c: const[i64]`` every call gives (``gpu_kernels_p6.scale_add``). Not in the committed
     fixtures, so only a fresh export has it."""
@@ -637,6 +652,10 @@ def build_cases():
     cases += plain("div_ieee", "div_ieee", lambda n, seed: (f32_words(n, seed), f32_words(n, seed + 7)), (6, 1000, 1 << 20), seeds=(0, 1), check=must_divide)
     for cols in (96, 1000):
         cases += plain("periodic", f"periodic.Db{cols}", args_periodic, ((1, cols), (40, cols)), seeds=(0,), check=must_be_periodic)
+    # -- tanh: libdevice's tanhf (FTZ) on random bit patterns; a bias and a tanh of bf16 rows in IEEE math
+    tanh_check = must_be_torchs_tanh_but_on_a_subnormal
+    cases += plain("tanh_fast", "tanh_fast", lambda n, seed: (f32_words(n, seed),), (6, 1000, 1 << 20), seeds=(0, 1), check=tanh_check)
+    cases += plain("tanh_rows", "tanh_rows", args_tanh_rows, (1, 7, 300), seeds=(0,), check=must_be_a_tanh_of_rows)
     return cases
 
 
@@ -859,6 +878,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(tma_ops())
         declared.update(broadcast_ops())
         declared.update(ieee_ops())
+        declared.update(tanh_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
