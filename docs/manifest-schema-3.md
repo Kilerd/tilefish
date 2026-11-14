@@ -874,10 +874,17 @@ plan's. `test_gpu_conv.py` captures calls of both APIs (the workspace given or a
 output is untouched until the replay, which is the eager bytes, so no part of a call is on the NULL stream or another; and the canaries of a manifest
 run and pass with the NULL stream held busy, which is still busy when they return. The Rust gate captures its convolutions in
 `CU_STREAM_CAPTURE_MODE_GLOBAL`, and runs every canary again (`Conv::check_canary`, the code of the load) with the NULL stream held by a host function,
-which is still held when they return (`the_canary_of_a_load_is_never_on_the_null_stream`). What does wait for the NULL stream is cuDNN's `cudnnCreate`:
-a load with the NULL stream held returns only when it is done (measured, cuDNN 9.10.2; Python makes one handle per device, at its first convolution, the
-crate one per loaded convolution). That is a wait at the load (for the NULL stream's work at least; whether for other streams' too was not measured),
-which orders nothing wrongly.
+which is still held when they return, and loads the convolutions of another manifest, which share the context's handle, with the NULL stream held:
+they return while it is still held (`the_canary_of_a_load_is_never_on_the_null_stream`). What does wait for the NULL stream is cuDNN's `cudnnCreate`:
+a load that makes a handle returns only when the NULL stream is done (measured, cuDNN 9.10.2). That is a wait (for the NULL stream's work at least;
+whether for other streams' too was not measured), which orders nothing wrongly, and it is once per context: **one cuDNN handle per CUDA context**,
+shared by every convolution loaded in it from any manifest, alone or in a plan, and alive as long as the last of them (Python has one per device). Every
+use of a handle is under its lock in both hosts: the heuristic queries and the descriptors and plans of a load or a pin, a canary, and a call (which
+sets the stream right before it runs); the crate also destroys a convolution's plan under it. Measured on a B300 MIG slice (cuDNN 9.10.2, release
+build), loading 700 small entries (`[1, T, 64]` f16 by a k7 filter, T from 16 to 365, half legacy, half backend) in one context: with a handle per
+entry, as before, 7.1 to 7.6 ms per load (6.5 to 6.8 of them the handle) and 6.0 GiB of device memory held (about 8.6 MiB per handle); with one handle,
+1.6 ms per load with its canary (0.8 ms without), 12 MiB held; the canaries alone, run again on the loaded convolutions, 0.7 to 0.8 ms each. A Python
+replay load of the same 700 takes 2.1 ms per entry (the pin prepared and its canary run; the canary 0.85 ms).
 
 **The workspace and plans.** A launch is given a workspace by the caller, the last tensor (a `u8` vector, 256-byte aligned, overlapping no operand): at
 least what the plan needs for a backend pin, and the entry's whole `workspace_bytes` for a legacy pin (which the call is given). A launch plan's library
@@ -1067,8 +1074,8 @@ a capture holds them in the kernel node.
 not chosen for, a device of another SM count, `NVIDIA_TF32_OVERRIDE` set, a libcudnn that cannot be opened (cudarc's `cudnn` feature, dynamically loaded:
 opened only when a convolution is loaded, so a manifest without one never opens it), another `cudnnGetVersion()`, a pin that fails the checks of
 section 9.4, and a canary of other bytes (run on a stream of its own; `canary_bytes`, `canary_operands`; `Conv::check_canary` runs it again); it
-makes the legacy descriptors or the finalized execution plan once. A launch takes the handle's lock (the handle's stream is its state), sets
-the stream and runs; the tensors go through the plan of the entry as a GEMM's do, and the workspace through the same checks, with at least
+makes the legacy descriptors or the finalized execution plan once, with the context's cuDNN handle, which every convolution loaded in the context
+shares (`Conv::shares_cudnn_handle`). A launch takes the handle's lock (the handle's stream is its state), sets the stream and runs; the tensors go through the plan of the entry as a GEMM's do, and the workspace through the same checks, with at least
 `Conv::workspace_required()` bytes (the plan's need, or the whole `workspace_bytes` of a legacy pin). `ConvEntry` holds the reading
 (`problem: ConvProblem`, `pin: ConvPin`, `choice`, `cudnn_version`, `sm_count`, `sm_count_target`, `canary: Option<ConvCanary>`); `Manifest::library()` is the GEMMs and
 `Manifest::convolutions()` the convolutions. A launch plan's library step loads whichever its entry is.

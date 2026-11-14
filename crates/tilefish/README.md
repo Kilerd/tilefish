@@ -76,7 +76,8 @@ configuration (an engine and its knobs), with the cuDNN version that chose it;
 the crate refuses another cuDNN version, another SM count and a process with
 `NVIDIA_TF32_OVERRIDE` set, vets the pin as Python does, runs the entry's
 canary (its output on operands made of a seed, on a stream of its own) and
-refuses other bytes, and opens libcudnn only for a manifest that has a
+refuses other bytes, shares one cuDNN handle per CUDA context between all
+its convolutions, and opens libcudnn only for a manifest that has a
 convolution. The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
 which one it is (`Entry::implementation`: its own architecture, or
