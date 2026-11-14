@@ -61,7 +61,14 @@ entry that opts in (`allow_bf16_reduction`). The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
 which one it is (`Entry::implementation`: its own architecture, or
 `"fallback"`); the crate launches the entry of the device's architecture, as
-for any operator.
+for any operator. A parameter that is a TMA descriptor of a tensor (manifest
+kind `tensordesc`, `ParamKind::Pointer` with a `tensor_map`) is given its
+tensor like a pointer: every launch (and every step of a plan, at every
+execution) checks what the driver would refuse (`PreconditionKind::TensorMap`)
+and encodes the `CUtensorMap` of that tensor with `cuTensorMapEncodeTiled`
+(cudarc's `sys`), then passes it by value with the tensor's shape and strides,
+as Triton launches a host `TensorDescriptor`; a captured graph holds the map
+of the addresses it captured.
 cudarc opens `libcublasLt.so.12` by name: where cuBLASLt comes from a Python
 wheel (`nvidia-cublas`, torch's), put that wheel's `nvidia/cublas/lib` on
 `LD_LIBRARY_PATH`. A missing library is an error, and another build of it is
