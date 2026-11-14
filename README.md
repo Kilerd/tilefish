@@ -259,6 +259,22 @@ ABI, and a grid beyond the device's limits. The manifest is read as strict JSON
 written through a temporary file and renamed, and a symbolic link where a file
 is to go is refused.
 
+**An IEEE f32 dot is not built into TF32 MMAs.** A tensor core has no f32 multiply: an f32 MMA rounds its inputs to TF32, 10 of the 23 bits of
+the mantissa. Triton 3.5.1 nevertheless compiles some `tl.dot(a, b, input_precision="ieee")` of f32 operands to `tcgen05.mma ... kind::tf32` on
+sm_100 and sm_103: its MMAv5 path skips the precision check when an operand derives from a load narrower than 32 bits (an f16 or bf16 tile
+converted to f32) or from `tl.join`, and the tile has `M % 64 == 0`, `N % 16 == 0` and 4 or 8 warps. Measured on a B300 with `a = 1` (f16),
+`b = 1 + 2**-12`, 16 terms: every output is 16 instead of `16 + 2**-8`; the same kernel at `M = 32`, or on sm_90 and sm_120, is exact. So every
+build (`jit`, `export`, a plan, a cache hit) refuses a kernel whose IR asks for an IEEE f32 dot when its binary has TF32 tensor-core MMAs made of
+such a dot (`tilefish._tf32guard`). The check reads what the compiler made, not a copy of Triton's rule: the dots and their precision in the TTIR
+the frontend builds, and the TF32 MMA instructions of the PTX (`tcgen05.mma` of `kind::tf32`, `wgmma` and `mma.sync` of `.tf32` operands). A kernel
+whose f32 dots all ask for IEEE is refused when its binary has any TF32 MMA; one that also has dots that allow TF32 is judged dot by dot, each `ttng.tc_gen5_mma` of
+its TTGIR traced to the TTIR dot it was made of by source location, and an MMA it cannot trace is refused too. A dot that says
+`input_precision="tf32"` or `"tf32x3"` asks for TF32 and is never refused. The error names the dot and the fixes: a tile of fewer than 64 rows
+for that dot, the product written as a loop of `tl.fma` (no `tl.dot`), or `input_precision="tf32"` where TF32 is what the kernel may compute.
+Gluon kernels are checked the same way (in Triton 3.5.1 Gluon has no IEEE f32 dot that compiles: `warpgroup_mma` refuses one, and `tcgen05_mma`
+of f32 operands is TF32 by the kernel's own choice); a lowered `@kernel` has no dot. A prebuilt PTX or cubin has no IR to say what it asked for and
+is not checked, and neither is a manifest exported before this check (re-export it).
+
 **Trust.** A replay needs a trust anchor, `pin=` or `trust_directory=True`, and
 raises without one. The digests in a manifest directory sit next to the files
 they describe, so whoever can write the directory can rewrite both.
