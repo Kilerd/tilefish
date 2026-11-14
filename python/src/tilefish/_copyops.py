@@ -1,15 +1,15 @@
 """Copies that tilefish writes the Triton for: ``contiguous`` (a view, materialised), ``im2col`` and ``im2col1d`` (the patches of a 2-D and of a
-1-D convolution).
+1-D convolution); and ``col2im1d``, the other direction (the overlap-add of a 1-D transposed convolution), which adds.
 
 None of them is a ``@tilefish.kernel`` body: a lowered kernel takes contiguous tensors, and each reads a strided view. Each is a *generated op*:
 an ``extern`` operator whose Triton source tilefish generates from a fixed template, whose input is ``Strided[...]`` (so a view goes to it as it
 is, with its strides as scalar arguments, through the machinery every strided ``extern`` uses: compile specs, launches, manifests, plans, the Rust
-host), and which has a torch reference. One op exists per rank and dtype (``contiguous``), per dtype, window and channel count (``im2col``) or
-per dtype, window, column order and channel count (``im2col1d``), made the first time it is asked for and kept; called in a ``@tilefish.graph``,
-it is a step of the plan.
+host), and which has a torch reference. One op exists per rank and dtype (``contiguous``), per dtype, window and channel count (``im2col``),
+per dtype, window, column order and channel count (``im2col1d``) or per dtype, window, output padding, column order, layout, bias and channel
+count (``col2im1d``), made the first time it is asked for and kept; called in a ``@tilefish.graph``, it is a step of the plan.
 
-All are raw copies: values are loaded and stored with no arithmetic, so a NaN keeps its payload and a zero its sign, and any tiling gives the
-same bytes. Offsets are ``i64`` (``index_bits=64``): the strides are ``i64`` scalars, and no size limit applies.
+All but ``col2im1d`` are raw copies: values are loaded and stored with no arithmetic, so a NaN keeps its payload and a zero its sign, and any
+tiling gives the same bytes. Offsets are ``i64`` (``index_bits=64``): the strides are ``i64`` scalars, and no size limit applies.
 
 ``contiguous(v)`` copies the view ``v`` (rank 1 to 4) into a new contiguous tensor of its shape, in its logical (row-major) order. A program
 copies a ``32 x 32`` tile of the last two axes for one index of the third axis from the end; a rank-4 view loops over its first axis inside the
@@ -29,6 +29,34 @@ convolution pads ``(D * (K - 1), 0)``. ``order="channel"`` puts it in column ``c
 them, so both orders exist and the weight is flattened to match. One program per output position (grid ``(Lo, N)``), a loop over the columns in
 blocks as ``im2col``; in the tap order consecutive lanes walk the channels of one tap (a channel-last input is read in contiguous runs), in the
 channel order the taps of one channel.
+
+``col2im1d(cols, kernel=K, stride=S, dilation=D, padding=(PL, PR), output_padding=OP, order=..., bias=b, layout=...)`` is the overlap-add of a
+1-D transposed convolution. ``cols: [N, Li, C * K]`` (any strides: a GEMM's output reshaped, or a transposed view of one, goes in as it is) holds,
+for input position ``i``, the products of a ``ConvTranspose1d`` weight ``W: [C_in, C, K]``: ``cols = x^T @ W.reshape(C_in, C * K)``, tap ``j`` of
+channel ``c`` in column ``c * K + j`` (``order="channel"``, the weight as it is stored) or ``j * C + c`` (``order="tap"``, the weight permuted to
+``[C_in, K, C]``). The result is contiguous, ``y: [N, C, Lo]`` (``layout="ncl"``) or ``[N, Lo, C]`` (``layout="nlc"``), of the dtype of ``cols``,
+with ``Lo = (Li - 1) * S - PL - PR + D * (K - 1) + OP + 1``: ``(PL, PR)`` are trimmed from the full output and ``OP`` positions added at its end
+(torch's ``conv_transpose1d(padding=p, output_padding=op)`` is ``padding=(p, p), output_padding=op``). ``y[n, c, t]`` is the sum of every
+``cols[n, i, col(c, j)]`` with ``t + PL = i * S + j * D`` (``0 <= i < Li``, ``0 <= j < K``), plus ``b[c]``.
+
+The order of the adds is the contract, because it decides the bits: float addition is not associative, and three terms or more added in another
+order round differently (with two, any order gives the same sum). It is the order of ATen's CUDA ``col2im`` (``col2im_device`` in
+``aten/src/ATen/native/cuda/im2col.cuh``, which ``F.fold`` and torch's transposed convolution without cuDNN run on CUDA: ``val = 0``, then
+``val += data_col[...]`` over the input positions in ascending order, in the accumulation type, then one cast at the store), so the bytes are
+``F.fold``'s on CUDA. Precisely: an f32 accumulator starts at ``+0.0`` and adds the terms in ascending input position ``i`` (descending tap
+``j``: ``i * S = t + PL - j * D``), each add one f32 rounding; a 16-bit value is widened exactly first; a position no term reaches stays ``+0.0``;
+then ``+ b[c]`` (widened) in f32, and one rounding to the dtype of ``cols`` at the store (round to nearest even). There is no multiply, the ops
+are compiled with ``enable_fp_fusion=False`` all the same, and nothing is reassociated. (ATen's CPU ``col2im`` adds tap by tap, ascending ``j``,
+in the dtype of the data; cuDNN chooses its own algorithm.) A tap that reaches no input position adds a masked ``+0.0``, which changes nothing:
+the accumulator is never ``-0.0`` (it starts at ``+0.0``, and a sum that cancels is ``+0.0`` under round to nearest). Subnormals are kept (no
+flush to zero), as ATen keeps them; a NaN anywhere in a sum gives a NaN, whose payload is the device's. Each output element is the sum of one
+lane, so the tiling and the warp count do not change the bits. The torch reference adds the same terms in the same order (one tensor add per
+tap, from the last tap to the first, ``+0.0`` where a tap reaches nothing), on any device.
+
+One program per output position and batch index (grid ``(Lo, N)``), a loop over the channels in blocks (``next_pow2(C)`` up to 1024 when ``C``
+is static, else 1024), the taps unrolled (``tl.static_range``) from the last to the first; a static channel count is compiled in, a runtime one is
+a scalar. ``Lo`` follows ``Li`` at each call; a call whose ``Lo`` would be less than 1 is refused at launch (its grid is empty), and ``col2im1d``
+in a graph refuses a ``cols`` whose type allows such a length.
 """
 
 from __future__ import annotations
@@ -38,7 +66,7 @@ import threading
 from typing import Any
 
 from .decorators import ExternOp
-from .dims import Dim, as_dim, cdiv
+from .dims import Dim, DimExpr, as_dim, cdiv
 from .dtypes import DType
 from .errors import TilefishTypeError
 from .lower import NUM_STAGES, LoweredKernel, _TL
@@ -53,10 +81,19 @@ TILE_ELEMENTS = 2048  # contiguous: a program copies a tile of about this many e
 COPY_WARPS = 4
 
 
-def _generated(name: str, source: str, stub_source: str, namespace: "dict[str, Any]", grid: Any, num_warps: int, reference: Any) -> ExternOp:
+def _generated(
+    name: str,
+    source: str,
+    stub_source: str,
+    namespace: "dict[str, Any]",
+    grid: Any,
+    num_warps: int,
+    reference: Any,
+    fp_fusion: "bool | None" = None,
+) -> ExternOp:
     """An extern op over the generated Triton ``source`` (module ``tilefish_generated.<name>``, function ``tf_<name>``), declared by the stub in
     ``stub_source`` (evaluated in ``namespace``; its parameters are the Triton function's, in order), with the source attached so that every
-    mode runs it."""
+    mode runs it. ``fp_fusion`` is Triton's ``enable_fp_fusion`` (``None``: not given, Triton's default; the copies do no arithmetic)."""
     module, fn_name = f"{_MODULE}.{name}", f"tf_{name}"
     ns = dict(namespace)
     exec(compile(stub_source, f"<tilefish generated stub {name}>", "exec"), ns)  # noqa: S102 - text generated here
@@ -74,6 +111,7 @@ def _generated(name: str, source: str, stub_source: str, namespace: "dict[str, A
         source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
         index_bits=64,
         reference=reference,
+        fp_fusion=fp_fusion,
     )
     op.__dict__["_tf_generated"] = LoweredKernel(name, fn_name, module, "generated", source, op, num_warps, None)
     return op
@@ -321,22 +359,27 @@ def im2col(x: Any, kernel: Any = (3, 3), stride: Any = (1, 1), padding: Any = (0
 _ORDERS = ("channel", "tap")
 
 
-def _at_least(what: str, v: Any, low: int) -> int:
+def _at_least(what: str, v: Any, low: int, who: str = "im2col1d") -> int:
     if isinstance(v, bool) or not isinstance(v, int) or v < low:
-        raise TilefishTypeError(f"im2col1d: {what} must be an int of at least {low}, got {v!r}")
+        raise TilefishTypeError(f"{who}: {what} must be an int of at least {low}, got {v!r}")
     return v
 
 
-def _im2col1d_args(kernel: Any, stride: Any, dilation: Any, padding: Any, order: Any) -> "tuple[int, int, int, tuple[int, int], str]":
-    k, s, d = _at_least("kernel", kernel, 1), _at_least("stride", stride, 1), _at_least("dilation", dilation, 1)
+def _window_args(who: str, kernel: Any, stride: Any, dilation: Any, padding: Any, order: Any) -> "tuple[int, int, int, tuple[int, int], str]":
+    """The window of a 1-D convolution (``im2col1d``, ``col2im1d``): taps, stride, dilation, padding ``(left, right)`` and column order."""
+    k, s, d = _at_least("kernel", kernel, 1, who), _at_least("stride", stride, 1, who), _at_least("dilation", dilation, 1, who)
     pad = (padding, padding) if isinstance(padding, int) and not isinstance(padding, bool) else None
     if isinstance(padding, (tuple, list)):
         pad = tuple(padding)
     if pad is None or len(pad) != 2 or any(isinstance(e, bool) or not isinstance(e, int) or e < 0 for e in pad):
-        raise TilefishTypeError(f"im2col1d: padding must be an int or a pair (left, right) of ints of at least 0, got {padding!r}")
+        raise TilefishTypeError(f"{who}: padding must be an int or a pair (left, right) of ints of at least 0, got {padding!r}")
     if not isinstance(order, str) or order not in _ORDERS:
-        raise TilefishTypeError(f'im2col1d: order must be "channel" or "tap", got {order!r}')
+        raise TilefishTypeError(f'{who}: order must be "channel" or "tap", got {order!r}')
     return k, s, d, (pad[0], pad[1]), order
+
+
+def _im2col1d_args(kernel: Any, stride: Any, dilation: Any, padding: Any, order: Any) -> "tuple[int, int, int, tuple[int, int], str]":
+    return _window_args("im2col1d", kernel, stride, dilation, padding, order)
 
 
 def _im2col1d_op(dtype: DType, k: int, s: int, d: int, pad: "tuple[int, int]", order: str, channels: "int | None") -> ExternOp:
@@ -447,6 +490,206 @@ def im2col1d(x: Any, kernel: Any, *, stride: Any = 1, dilation: Any = 1, padding
     return _cached(("im2col1d", dt.name, k, s, d, pad, order, channels), lambda: _im2col1d_op(dt, k, s, d, pad, order, channels))(x)
 
 
+# -- col2im1d ---------------------------------------------------------------------------------------------------------------------
+
+_LAYOUTS = ("ncl", "nlc")
+_SUMMED = ("f32", "bf16", "f16")  # col2im1d adds: it takes the float types it accumulates in f32
+
+
+def _col2im1d_args(
+    kernel: Any, stride: Any, dilation: Any, padding: Any, output_padding: Any, order: Any, layout: Any
+) -> "tuple[int, int, int, tuple[int, int], int, str, str]":
+    k, s, d, pad, order = _window_args("col2im1d", kernel, stride, dilation, padding, order)
+    extra = _at_least("output_padding", output_padding, 0, "col2im1d")
+    if not isinstance(layout, str) or layout not in _LAYOUTS:
+        raise TilefishTypeError(f'col2im1d: layout must be "ncl" or "nlc", got {layout!r}')
+    return k, s, d, pad, extra, order, layout
+
+
+def _col2im1d_length(li: int, k: int, s: int, d: int, pad: "tuple[int, int]", extra: int) -> int:
+    """``Lo = (Li - 1) * s - left - right + d * (K - 1) + output_padding + 1``."""
+    return (li - 1) * s - pad[0] - pad[1] + d * (k - 1) + extra + 1
+
+
+def _col2im1d_op(
+    dtype: DType, k: int, s: int, d: int, pad: "tuple[int, int]", extra: int, order: str, layout: str, bias: bool, channels: "int | None"
+) -> ExternOp:
+    left, right = pad
+    name = (
+        f"col2im1d_{dtype.name}_k{k}_s{s}_d{d}_p{left}x{right}_op{extra}_{order}_{layout}"
+        + ("_bias" if bias else "")
+        + ("" if channels is None else f"_c{channels}")
+    )
+    block = 1024 if channels is None else min(1024, 1 << (channels - 1).bit_length())
+    warps = 4 if block >= 512 else 1
+    c_src = "C" if channels is None else str(channels)
+    column = f"c * {k} + j" if order == "channel" else f"j * {c_src} + c"
+    # output position t is position t + left of the untrimmed output, which tap j of input position i reaches when t + left = i * s + j * d
+    lands = ("t" if not left else f"t + {left}") + " = " + ("i" if s == 1 else f"i * {s}") + (" + j" if d == 1 else f" + j * {d}")
+    reach = ("t" if not left else f"t + {left}") + (" - j" if d == 1 else f" - j * {d}")
+    if s == 1:
+        position = [f"            i = {reach}", "            ok = (i >= 0) & (i < Li)"]
+    else:
+        position = [f"            q = {reach}", f"            i = q // {s}", f"            ok = (q >= 0) & (q % {s} == 0) & (i < Li)"]
+    widen = "" if dtype.name == "f32" else ".to(tl.float32)"
+    out = f"y + (n * Lo + t) * {c_src} + c" if layout == "nlc" else f"y + (n * {c_src} + c) * Lo + t"
+    result = "acc" if dtype.name == "f32" else f"acc.to(tl.{_TL[dtype.name]})"
+    params = ["cols", *(["bias"] if bias else []), "y", *(["C"] if channels is None else []), "Li", "Lo"]
+    params += ["cols_s0", "cols_s1", "cols_s2", "BLOCK: tl.constexpr"]
+    y_index = "y[n, c, t]" if layout == "ncl" else "y[n, t, c]"
+    source = "\n".join(
+        [
+            f"# Generated by tilefish (tilefish.col2im1d) for {dtype.name}, kernel {k}, stride {s}, dilation {d}, padding {left} before and {right} "
+            + f"after, output padding {extra}, {order} order, {layout} layout"
+            + (", a bias" if bias else "")
+            + ("" if channels is None else f", {channels} channels")
+            + ". Do not edit.",
+            f"# {y_index} = +0.0 + cols[n, i, {column}] + ... over every (i, j) with {lands}, in ascending i (descending j), one f32 add each"
+            + (", then + bias[c]" if bias else "")
+            + f"; rounded once to {dtype.name} at the store. i64 offsets.",
+            "import triton",
+            "import triton.language as tl",
+            "",
+            "",
+            "@triton.jit",
+            f"def tf_{name}(",
+            *[f"    {q}," for q in params],
+            "):",
+            "    t = tl.program_id(0)",
+            "    n = tl.program_id(1).to(tl.int64)",
+            "    src = cols + n * cols_s0",
+            f"    for c0 in range(0, {c_src}, BLOCK):",
+            "        c = c0 + tl.arange(0, BLOCK)",
+            f"        cm = c < {c_src}",
+            "        acc = tl.zeros([BLOCK], dtype=tl.float32)",
+            f"        for r in tl.static_range({k}):",
+            "            j = r  # the only tap" if k == 1 else f"            j = {k - 1} - r  # descending taps: ascending input positions",
+            *position,
+            f"            v = tl.load(src + i * cols_s1 + ({column}) * cols_s2, mask=cm & ok, other=0.0)",
+            f"            acc = acc + v{widen}",
+            *([f"        acc = acc + tl.load(bias + c, mask=cm, other=0.0){widen}"] if bias else []),
+            f"        tl.store({out}, {result}, mask=cm)",
+        ]
+    ) + "\n"
+    c_text = "CH" if channels is None else str(channels)
+    out_shape = f"NB, {c_text}, LO" if layout == "ncl" else f"NB, LO, {c_text}"
+    stub = "\n".join(
+        [
+            f"def tf_{name}(",
+            f"    cols: Strided[Tensor[NB, LI, {c_text} * {k}, dt]],",
+            *([f"    bias: Tensor[{c_text}, dt],"] if bias else []),
+            f"    y: Out[Tensor[{out_shape}, dt]],",
+            *(["    C: CH,"] if channels is None else []),
+            "    Li: LI,",
+            "    Lo: LO,",
+            "    cols_s0: StrideOf('cols', 0),",
+            "    cols_s1: StrideOf('cols', 1),",
+            "    cols_s2: StrideOf('cols', 2),",
+            f"    BLOCK: const = {block},",
+            "): ...",
+        ]
+    )
+    nb, li = Dim("N"), Dim("L")
+    lo = as_dim(li * s + (d * (k - 1) + extra + 1 - s - left - right))  # (L - 1) s - left - right + d (K - 1) + output_padding + 1
+    namespace = {"Strided": Strided, "Tensor": Tensor, "Out": Out, "StrideOf": StrideOf, "const": const, "dt": dtype}
+    namespace.update({"NB": nb, "LI": li, "LO": lo, "CH": Dim("C")})
+
+    def reference(cols: Any, bias: Any = None) -> Any:
+        """The same sum in torch on any device: ``acc = +0.0``, then for each tap from the last to the first, ``acc + (that tap's terms, shifted to
+        the positions they reach, +0.0 elsewhere)``, one f32 add per element and tap; then ``+ bias`` and one rounding."""
+        import torch
+
+        n_, li_, ck = cols.shape
+        c_ = ck // k
+        lo_ = _col2im1d_length(li_, k, s, d, pad, extra)
+        taps = cols.reshape(n_, li_, c_, k) if order == "channel" else cols.reshape(n_, li_, k, c_).transpose(2, 3)  # [N, Li, C, K]
+        span = (li_ - 1) * s + 1
+        acc = torch.zeros((n_, c_, lo_), dtype=torch.float32, device=cols.device)
+        for j in reversed(range(k)):  # descending taps: ascending input positions at every output position
+            part = torch.zeros((n_, c_, max(left + lo_, j * d + span)), dtype=torch.float32, device=cols.device)
+            part[:, :, j * d : j * d + span : s] = taps[:, :, :, j].transpose(1, 2).float()  # input i reaches i * s + j * d
+            acc = acc + part[:, :, left : left + lo_]
+        if bias is not None:
+            acc = acc + bias.float()[None, :, None]
+        y = acc.to(cols.dtype)
+        return y.contiguous() if layout == "ncl" else y.transpose(1, 2).contiguous()
+
+    return _generated(name, source, stub, namespace, (lo, nb), warps, reference, fp_fusion=False)
+
+
+def _least(size: Any) -> int:
+    """The smallest value a size of a traced tensor can take: its value; for a sum of dimensions with positive coefficients, its value at the
+    smallest bucket of each (1 for one without buckets); else 1."""
+    size = size.folded()
+    if size.is_static:
+        return int(size.value)
+    if all(c > 0 and isinstance(a, Dim) for a, c in size.terms):
+        least = size.subst({a: min(a.buckets) if a.buckets else 1 for a, _ in size.terms})
+        return max(1, int(least.value))
+    return 1
+
+
+def col2im1d(
+    cols: Any,
+    kernel: Any,
+    *,
+    stride: Any = 1,
+    dilation: Any = 1,
+    padding: Any = 0,
+    output_padding: Any = 0,
+    order: str = "channel",
+    bias: Any = None,
+    layout: str = "ncl",
+) -> Value:
+    """``tilefish.col2im1d(cols, kernel, *, stride=1, dilation=1, padding=0, output_padding=0, order="channel", bias=None, layout="ncl")``: the
+    overlap-add of a 1-D transposed convolution, from the products of each input position (``cols``) to the output.
+
+    ``cols: [N, Li, C * K]`` (any strides: a GEMM's output reshaped, or a view of it, goes in as it is) holds, for input position ``i``, the
+    ``C * K`` products of a ``ConvTranspose1d`` weight ``W: [C_in, C, K]``: ``cols = x.transpose(1, 2) @ W.reshape(C_in, C * K)``, tap ``j`` of
+    channel ``c`` in column ``c * K + j`` (``order="channel"``, the weight as it is stored) or ``j * C + c`` (``order="tap"``, the weight
+    ``.permute(0, 2, 1)``). The result is contiguous, ``[N, C, Lo]`` (``layout="ncl"``) or ``[N, Lo, C]`` (``layout="nlc"``), of the dtype of
+    ``cols``, with ``Lo = (Li - 1) * stride - left - right + dilation * (K - 1) + output_padding + 1``: ``padding`` is an int or a pair
+    ``(left, right)`` of positions trimmed from the full output, ``output_padding`` adds positions at the end (torch's
+    ``conv_transpose1d(padding=p, output_padding=op)`` is ``padding=(p, p), output_padding=op``). ``bias`` is ``[C]`` of the dtype of ``cols``.
+
+    Output position ``t`` of channel ``c`` adds every ``cols[n, i, col(c, j)]`` with ``t + left = i * stride + j * dilation``: in f32, from
+    ``+0.0``, in ascending input position ``i`` (descending tap ``j``), one rounding per add, then ``+ bias[c]`` in f32, rounded once to the dtype
+    of ``cols``. That is the order of ATen's CUDA ``col2im`` (``F.fold`` on CUDA): the bytes are ``F.fold``'s (the numerics contract is in
+    :mod:`tilefish._copyops`). Supported for f32, bf16 and f16; a static channel count is compiled in.
+
+    A step of a ``@tilefish.graph`` (a generated op, see :mod:`tilefish._copyops`).
+    """
+    if not isinstance(cols, Value):
+        raise TilefishTypeError(f"col2im1d: takes a traced tensor [N, Li, C * K], got {type(cols).__name__}")
+    if cols.rank != 3:
+        raise TilefishTypeError(f"col2im1d: {cols.ref} ({cols.type}) has rank {cols.rank}; it takes [N, Li, C * K]")
+    dt = cols.dtype
+    if not isinstance(dt, DType) or dt.name not in _SUMMED:
+        raise TilefishTypeError(f"col2im1d: {cols.ref} has dtype {dt}; it adds in f32 and takes f32, bf16 or f16")
+    k, s, d, pad, extra, order, layout = _col2im1d_args(kernel, stride, dilation, padding, output_padding, order, layout)
+    width = cols.shape[2].folded()
+    c_expr = (DimExpr.const(width.value // k) if width.value % k == 0 else None) if width.is_static else width._div_exact_int(k)
+    if c_expr is None:
+        raise TilefishTypeError(f"col2im1d: axis 2 of {cols.type} is {width}, which is not C * {k} for {k} taps")
+    channels = c_expr.value if c_expr.is_static else None
+    if bias is not None:
+        if not isinstance(bias, Value):
+            raise TilefishTypeError(f"col2im1d: bias must be a traced tensor [C] or None, got {type(bias).__name__}")
+        if bias.rank != 1 or bias.shape[0].folded() != c_expr or bias.dtype != dt:
+            raise TilefishTypeError(f"col2im1d: bias {bias.ref} ({bias.type}) must be [C] = [{c_expr}] of the dtype of cols ({dt})")
+    least = _least(cols.shape[1])
+    lo = _col2im1d_length(least, k, s, d, pad, extra)
+    if lo < 1:
+        some = "is" if cols.shape[1].folded().is_static else "can be"
+        raise TilefishTypeError(
+            f"col2im1d: axis 1 of {cols.type} {some} {least}, which gives an output of {lo} positions ({k} taps at stride {s}, dilation {d}, "
+            f"padding {pad}, output_padding {extra}: Lo = (Li - 1) * stride - left - right + dilation * (K - 1) + output_padding + 1)"
+        )
+    key = ("col2im1d", dt.name, k, s, d, pad, extra, order, layout, bias is not None, channels)
+    op = _cached(key, lambda: _col2im1d_op(dt, k, s, d, pad, extra, order, layout, bias is not None, channels))
+    return op(cols, bias) if bias is not None else op(cols)
+
+
 def contiguous_op(rank: int, dtype: DType, last: "int | None" = None) -> ExternOp:
     """The generated op behind :func:`contiguous` for views of ``rank`` and ``dtype`` (to run it on a torch view with ``tilefish.run``); ``last``
     is a static size of the last axis (the tile is fitted to it and it is compiled in), ``None`` a runtime one."""
@@ -481,4 +724,31 @@ def im2col1d_op(
     return _cached(("im2col1d", dtype.name, k, s, d, pad, order, channels), lambda: _im2col1d_op(dtype, k, s, d, pad, order, channels))
 
 
-__all__ = ["contiguous", "contiguous_op", "generated_source", "im2col", "im2col1d", "im2col1d_op", "im2col_op"]
+def col2im1d_op(
+    dtype: DType,
+    kernel: Any,
+    *,
+    stride: Any = 1,
+    dilation: Any = 1,
+    padding: Any = 0,
+    output_padding: Any = 0,
+    order: str = "channel",
+    layout: str = "ncl",
+    bias: bool = False,
+    channels: "int | None" = None,
+) -> ExternOp:
+    """The generated op behind :func:`col2im1d` (``bias``: whether it takes one; ``channels``: a static channel count, written into the source;
+    ``None``: a runtime one). It takes ``cols`` (and ``bias``) and gives ``y``; ``Lo`` is computed from ``Li`` at each call, and a call whose
+    ``Lo`` is less than 1 is refused at launch (its grid would be empty)."""
+    if not isinstance(dtype, DType) or dtype.name not in _SUMMED:
+        raise TilefishTypeError(f"col2im1d_op: {dtype!r} is not f32, bf16 or f16 (col2im1d adds in f32)")
+    if not isinstance(bias, bool):
+        raise TilefishTypeError(f"col2im1d_op: bias must be True or False, got {bias!r}")
+    if channels is not None and (isinstance(channels, bool) or not isinstance(channels, int) or channels < 1):
+        raise TilefishTypeError(f"col2im1d_op: channels must be a positive int or None, got {channels!r}")
+    k, s, d, pad, extra, order, layout = _col2im1d_args(kernel, stride, dilation, padding, output_padding, order, layout)
+    key = ("col2im1d", dtype.name, k, s, d, pad, extra, order, layout, bias, channels)
+    return _cached(key, lambda: _col2im1d_op(dtype, k, s, d, pad, extra, order, layout, bias, channels))
+
+
+__all__ = ["col2im1d", "col2im1d_op", "contiguous", "contiguous_op", "generated_source", "im2col", "im2col1d", "im2col1d_op", "im2col_op"]

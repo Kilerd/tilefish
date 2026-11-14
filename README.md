@@ -526,6 +526,15 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   a strided view: a materialised permutation, and convolution patches with channel-major columns and `+0.0` padding.
   `tilefish.im2col1d(x, kernel, stride=, dilation=, padding=, order="channel" | "tap")` gives the patches of a 1-D convolution of `[N, C, L]` as
   `[N, Lo, C * K]`, with a dilation, a padding `(left, right)` (a causal one is `(dilation * (K - 1), 0)`) and the columns channel-major or tap-major.
+- `tilefish.col2im1d(cols, kernel, stride=, dilation=, padding=, output_padding=, order="channel" | "tap", bias=, layout="ncl" | "nlc")` is the
+  overlap-add of a 1-D transposed convolution: `cols: [N, Li, C * K]` (any strides: a GEMM's `x^T @ W.reshape(C_in, C * K)` reshaped, as it is)
+  becomes `[N, C, Lo]` or a channel-last `[N, Lo, C]`, `Lo = (Li - 1) * stride - left - right + dilation * (K - 1) + output_padding + 1`
+  (torch's `conv_transpose1d(padding=p, output_padding=op)` is `padding=(p, p), output_padding=op`). Unlike the copies it adds, so the order of
+  the adds is the contract, and it is the order of ATen's CUDA `col2im` (`F.fold` on CUDA): an f32 sum from `+0.0` over the input positions in
+  ascending order (the taps descending), one rounding per add and nothing contracted (`enable_fp_fusion=False`), then the bias in f32, then one
+  rounding to the dtype of `cols`. Three terms or more added in another order round differently, so this order is what makes the bytes
+  `F.fold`'s: measured byte for byte against `F.fold` on CUDA in f32, bf16 and f16, and against `conv_transpose1d` on small integers, where every
+  order is exact.
 
 ## Launch plans: a graph as a static list of launches over one arena
 

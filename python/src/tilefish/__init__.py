@@ -23,8 +23,9 @@ M3.2 (P2): :func:`plan` compiles a graph into a static launch plan with an arena
 M3.3: a lowered kernel compares (a mask, :data:`bool_`), selects (:func:`where`), counts positions (:func:`iota`, integer ``//`` and ``%``),
 reduces to an index (:func:`argmax`, :func:`argmin`), gathers and scatters rows (:func:`gather_rows`, :func:`scatter_rows`), takes
 :func:`sin` and :func:`cos`, keeps a NaN's payload in a cast (``x.to(bf16, nan="preserve")``) and broadcasts an operand over the leading
-axes; a graph materialises a view (:func:`contiguous`) and the patches of a 2-D or 1-D convolution (:func:`im2col`, :func:`im2col1d`). The
-numerics contract of each is in :mod:`tilefish.lower` (notes 7 to 11) and :mod:`tilefish._copyops`. An ``extern`` takes a Gluon kernel
+axes; a graph materialises a view (:func:`contiguous`), the patches of a 2-D or 1-D convolution (:func:`im2col`, :func:`im2col1d`) and the
+overlap-add of a 1-D transposed convolution (:func:`col2im1d`, in ATen's CUDA order of adds). The numerics contract of each is in
+:mod:`tilefish.lower` (notes 7 to 11) and :mod:`tilefish._copyops`. An ``extern`` takes a Gluon kernel
 (``extern(gluon=...)``: Triton's ``triton.experimental.gluon``, layouts written out), identified by the TTGIR Gluon's frontend builds, and a
 ``StrideOf`` says the type of its scalar (``dtype=i32`` or ``i64``) when it is not the width of the kernel's offsets.
 
@@ -74,7 +75,7 @@ from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in __all__, `from tilefish import *` must not shadow the module copy
 from .ops import argmax, argmin, cos, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sin, sqrt, where
-from ._copyops import contiguous, im2col, im2col1d
+from ._copyops import col2im1d, contiguous, im2col, im2col1d
 from .ops import reduce_mean as mean
 from .runtime import capture, run
 from ._planrun import CapturedPlan
@@ -142,6 +143,7 @@ __all__ = [
     "bool_",
     "capture",
     "cdiv",
+    "col2im1d",
     "const",
     "contiguous",
     "cos",

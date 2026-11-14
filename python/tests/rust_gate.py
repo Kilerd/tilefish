@@ -29,7 +29,10 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   step;
 * **generated ops** (``host_ops.generated_ops``, exported only): ``tilefish.im2col1d`` in the tap order (a causal, dilated window over 256 static
   channels of a channel-last activation permuted to ``[N, C, L]``) and in the channel order (stride 2, padding ``(2, 5)``, a runtime channel count, over
-  contiguous tensors and views with an offset), checked here against the patches computed on the bits;
+  contiguous tensors and views with an offset), checked here against the patches computed on the bits; ``tilefish.col2im1d`` in the channel order
+  (f32, a bias, a runtime channel count, to ``[N, C, Lo]``, over contiguous tensors, views with an offset and transposed views) and in the tap order
+  (bf16, 64 static channels, to a channel-last ``[N, Lo, C]``, over transposed views and views with an offset), checked here against ``F.fold`` (ATen's
+  CUDA ``col2im``, the order of the adds the op keeps) and against the op's torch reference;
 * **an Out that may be written over an input** (``gpu_kernels_p5.py``): ``add_into`` launched with its outputs apart; the plan ``residual_chain``
   (without and with reuse) writes both of its calls in place, over the residual it made in the arena; the plan ``copy_steps`` has two copy steps
   (``tilefish.copy`` of a dense view into the arena, a store into an ``InOut`` parameter), launched and captured; the plan ``view_returns`` returns a
@@ -374,6 +377,48 @@ def must_be_patches(k, s, d, pad, order):
     return check
 
 
+def args_cols(dtype, c, k, bias):
+    """``(cols, bias)`` or ``(cols,)`` of a ``col2im1d`` case ``(n, li, view)``: ``cols: [n, li, c * k]`` contiguous, a view with an offset into a larger
+    tensor, or a transposed view (a ``[n, c * k, li]`` product read as ``[n, li, c * k]``); ``bias: [c]``."""
+
+    def make(spec, seed):
+        n, li, view = spec
+        at = seed + n * 1000 + li
+        if view == "offset":
+            cols = randn((n, li + 3, c * k + 5), dtype, at)[:, 2 : li + 2, 3 : c * k + 3]
+        elif view == "transposed":
+            cols = randn((n, c * k, li), dtype, at).transpose(1, 2)
+        else:
+            cols = randn((n, li, c * k), dtype, at)
+        return (cols, randn((c,), dtype, at + 1)) if bias else (cols,)
+
+    return make
+
+
+def must_be_col2im(op, k, s, d, pad, extra, order, layout):
+    """``F.fold`` on CUDA (ATen's ``col2im``: an f32 sum from +0.0 in ascending input position) of the widened ``cols``, untrimmed, then trimmed to
+    ``pad`` and extended by ``output_padding``, ``+ bias`` in f32 and one rounding; and the op's torch reference, byte for byte."""
+
+    def check(args, got):
+        cols, bias = args[0], (args[1] if len(args) > 1 else None)
+        n, li, ck = cols.shape
+        c = ck // k
+        channel = cols if order == "channel" else cols.reshape(n, li, k, c).transpose(2, 3).reshape(n, li, ck)
+        full = (li - 1) * s + d * (k - 1) + 1
+        lo = full - pad[0] - pad[1] + extra
+        y = torch.nn.functional.fold(channel.float().transpose(1, 2), (1, full), (1, k), dilation=(1, d), stride=(1, s))[:, :, 0, :]
+        if pad[0] + lo > full:
+            y = torch.cat([y, y.new_zeros(n, c, pad[0] + lo - full)], dim=2)
+        y = y[:, :, pad[0] : pad[0] + lo]
+        if bias is not None:
+            y = y + bias.float()[None, :, None]
+        y = y.to(cols.dtype)
+        assert same_bytes(got, y if layout == "ncl" else y.transpose(1, 2).contiguous())
+        assert same_bytes(got, op.reference(*args))
+
+    return check
+
+
 def given_ops():
     """``{name: extern}``: a prebuilt PTX whose ``k: const[i32]`` and ``c: const[i64]`` every call gives (``gpu_kernels_p6.scale_add``). Not in the committed
     fixtures, so only a fresh export has it."""
@@ -512,6 +557,15 @@ def build_cases():
     cases += plain("tma_matmul", "tma_matmul", args_tma_mm, ((128, 128, 64), (200, 136, 72), (64, 64, 512), (256, 384, 192)), seeds=(0,), check=must_be_a_matmul)
     cases += plain("tile_copy_view", "tile_copy_view", args_tile_view, (0, 8, 136), seeds=(0,), check=must_be_the_tile)
     cases += plain("gluon_tile_copy", "gluon_tile_copy", args_tile, ((64, 64), (130, 200)), seeds=(0,), check=must_be_the_tile)
+    # -- generated ops: the overlap-add of a 1-D transposed convolution, f32 with a bias to [N, C, Lo] and bf16 to a channel-last [N, Lo, C]
+    op = generated_ops()["col2im1d_channel"]
+    sizes = [(1, 1, "contiguous"), (2, 33, "contiguous"), (2, 33, "offset"), (3, 50, "transposed"), (1, 7, "offset")]
+    for c in (1, 24, 1100):  # a runtime channel count: one lane, one block, two blocks
+        check = must_be_col2im(op, 4, 2, 1, (1, 1), 0, "channel", "ncl")
+        cases += plain("col2im1d_channel", op.name, args_cols(F32, c, 4, True), sizes, seeds=(c,), check=check)
+    op = generated_ops()["col2im1d_tap"]
+    sizes = [(1, 1, "contiguous"), (2, 19, "transposed"), (3, 40, "transposed"), (2, 25, "offset")]
+    cases += plain("col2im1d_tap", op.name, args_cols(BF16, 64, 7, False), sizes, seeds=(0,), check=must_be_col2im(op, 7, 3, 2, (2, 5), 1, "tap", "nlc"))
     return cases
 
 

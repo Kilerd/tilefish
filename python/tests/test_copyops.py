@@ -1,12 +1,12 @@
-"""``tilefish.contiguous``, ``tilefish.im2col`` and ``tilefish.im2col1d``: generated ops over a strided view, their declarations, sources and
-plans (bytes: ``test_gpu_copyops.py``)."""
+"""``tilefish.contiguous``, ``tilefish.im2col``, ``tilefish.im2col1d`` and ``tilefish.col2im1d``: generated ops over a strided view, their
+declarations, sources and plans (bytes: ``test_gpu_copyops.py``, ``test_gpu_im2col1d.py``, ``test_gpu_col2im1d.py``)."""
 
 import pytest
 from test_lower import check_golden
 
 import tilefish
 from tilefish import Dim, Tensor, TilefishTypeError, bf16, f16, f32
-from tilefish._copyops import contiguous_op, generated_source, im2col1d_op, im2col_op
+from tilefish._copyops import col2im1d_op, contiguous_op, generated_source, im2col1d_op, im2col_op
 from tilefish.aot import compile_specs
 
 N = Dim("N", buckets=[4, 8])
@@ -196,3 +196,138 @@ def test_graphs_of_im2col1d_plan():
     assert "im2col1d_bf16_k7_s1_d3_p18x0_tap_c1024" in str(step)
     (step,) = tilefish.plan(strided_channels).steps(B=2, T=64)
     assert "im2col1d_f16_k3_s2_d1_p2x5_channel_c80" in str(step)
+
+
+# -- col2im1d -----------------------------------------------------------------------------------------------------------------------
+
+LI = Dim("LI", buckets=[16, 50])
+
+
+@tilefish.graph
+def upsampled(cols: Tensor[2, LI, 384, f32], bias: Tensor[24, f32]):  # a GEMM's [N * Li, C * K] products, reshaped
+    return tilefish.col2im1d(cols, 16, stride=8, padding=4, bias=bias)
+
+
+@tilefish.graph
+def transposed_taps(products: Tensor[2, 448, LI, bf16]):  # products stored [N, C * K, Li], read as [N, Li, C * K]
+    return tilefish.col2im1d(products.permute(0, 2, 1), 7, dilation=3, padding=(18, 0), output_padding=2, order="tap", layout="nlc")
+
+
+def test_col2im1d_is_a_call_of_a_generated_op():
+    (call,) = upsampled.graph.nodes
+    op = col2im1d_op(f32, 16, stride=8, padding=4, bias=True, channels=24)
+    assert call.attrs["kind"] == "extern" and call.callee is op and op.name == "col2im1d_f32_k16_s8_d1_p4x4_op0_channel_ncl_bias_c24"
+    assert call.outputs[0].type == Tensor[2, 24, LI * 8, f32]  # (Li - 1) * 8 - 8 + 15 + 1
+    params = [(p.name, p.kind, p.strided, p.stride_of) for p in op.signature.params]
+    assert params[0] == ("cols", "tensor", True, None) and params[1] == ("bias", "tensor", False, None) and params[2][:2] == ("y", "tensor")
+    assert [p[0] for p in params] == ["cols", "bias", "y", "Li", "Lo", "cols_s0", "cols_s1", "cols_s2", "BLOCK"]
+    assert [p[3] for p in params[5:8]] == [(("cols", 0),), (("cols", 1),), (("cols", 2),)]
+    assert op.index_bits == 64 and op.grid_string == "(8*L, N)" and op.fp_fusion is False and op.reference is not None
+    view, call = transposed_taps.graph.nodes
+    assert view.op == "permute" and not view.outputs[0].type.contiguous
+    assert call.callee is col2im1d_op(bf16, 7, dilation=3, padding=(18, 0), output_padding=2, order="tap", layout="nlc", channels=64)
+    assert call.outputs[0].type == Tensor[2, LI + 2, 64, bf16]  # (Li - 1) - 18 + 18 + 2 + 1, channel-last
+
+
+def test_col2im1d_compile_spec_and_sources():
+    (spec,) = compile_specs(col2im1d_op(bf16, 16, stride=8, dilation=3, padding=(5, 2), order="tap", layout="nlc"))
+    assert spec.signature == {
+        "cols": "*bf16", "y": "*bf16", "C": "i32", "Li": "i32", "Lo": "i32", "cols_s0": "i64", "cols_s1": "i64", "cols_s2": "i64",
+        "BLOCK": "constexpr",
+    }  # fmt: skip
+    assert spec.grid == "(8*L + 31, N)" and spec.enable_fp_fusion is False and spec.source_sha256 is not None
+    assert next(a.value for a in spec.args if a.name == "BLOCK") == 1024 and spec.num_warps == 4
+    channel = col2im1d_op(f32, 7, stride=2, padding=3, output_padding=1, bias=True, channels=80)
+    (spec,) = compile_specs(channel)
+    assert spec.signature["bias"] == "*fp32" and spec.grid == "(2*L, N)" and spec.num_warps == 1
+    assert next(a.value for a in spec.args if a.name == "BLOCK") == 128
+    check_golden("col2im1d_channel_ncl_bias_c80", generated_source(channel))
+    check_golden("col2im1d_tap_nlc", generated_source(col2im1d_op(bf16, 16, stride=8, dilation=3, padding=(5, 2), order="tap", layout="nlc")))
+    check_golden("col2im1d_k1_nlc_c1100", generated_source(col2im1d_op(f16, 1, layout="nlc", channels=1100)))  # two blocks of 1024 channels
+
+
+def test_one_col2im1d_op_per_configuration():
+    op = col2im1d_op(f32, 4, stride=2, padding=1)
+    assert op is col2im1d_op(f32, 4, stride=2, padding=(1, 1)) is col2im1d_op(f32, 4, stride=2, padding=[1, 1], output_padding=0)
+    assert op.name == "col2im1d_f32_k4_s2_d1_p1x1_op0_channel_ncl"
+    others = [
+        col2im1d_op(bf16, 4, stride=2, padding=1),
+        col2im1d_op(f32, 5, stride=2, padding=1),
+        col2im1d_op(f32, 4, stride=3, padding=1),
+        col2im1d_op(f32, 4, stride=2, dilation=2, padding=1),
+        col2im1d_op(f32, 4, stride=2, padding=(2, 0)),
+        col2im1d_op(f32, 4, stride=2, padding=(0, 2)),
+        col2im1d_op(f32, 4, stride=2, padding=1, output_padding=1),
+        col2im1d_op(f32, 4, stride=2, padding=1, order="tap"),
+        col2im1d_op(f32, 4, stride=2, padding=1, layout="nlc"),
+        col2im1d_op(f32, 4, stride=2, padding=1, bias=True),
+        col2im1d_op(f32, 4, stride=2, padding=1, channels=64),
+    ]
+    assert len({op.name, *(o.name for o in others)}) == len(others) + 1 and all(o is not op for o in others)
+
+
+def test_col2im1d_refusals(tr):
+    cols = tr.val(Tensor[2, 20, 56, f32])  # C = 8, K = 7
+    with pytest.raises(TilefishTypeError, match="it takes \\[N, Li, C \\* K\\]"):
+        tilefish.col2im1d(tr.val(Tensor[20, 56, f32]), 7)
+    with pytest.raises(TilefishTypeError, match="takes a traced tensor"):
+        tilefish.col2im1d(3, 7)
+    for dt in (tilefish.i32, tilefish.bool_):
+        with pytest.raises(TilefishTypeError, match="it adds in f32 and takes f32, bf16 or f16"):
+            tilefish.col2im1d(tr.val(Tensor[2, 20, 56, dt]), 7)
+    for kwargs, match in [
+        ({"kernel": 0}, "col2im1d: kernel must be an int of at least 1, got 0"),
+        ({"kernel": True}, "kernel must be an int of at least 1"),
+        ({"kernel": 7, "stride": 0}, "col2im1d: stride must be an int of at least 1"),
+        ({"kernel": 7, "dilation": 1.0}, "dilation must be an int of at least 1"),
+        ({"kernel": 7, "padding": -1}, "col2im1d: padding must be an int or a pair \\(left, right\\) of ints of at least 0, got -1"),
+        ({"kernel": 7, "padding": (1, 2, 3)}, "padding must be"),
+        ({"kernel": 7, "output_padding": -1}, "col2im1d: output_padding must be an int of at least 0, got -1"),
+        ({"kernel": 7, "output_padding": False}, "output_padding must be"),
+        ({"kernel": 7, "order": "row"}, 'col2im1d: order must be "channel" or "tap", got \'row\''),
+        ({"kernel": 7, "layout": "lnc"}, 'col2im1d: layout must be "ncl" or "nlc", got \'lnc\''),
+        ({"kernel": 7, "layout": None}, "layout must be"),
+        ({"kernel": 5}, "axis 2 of Tensor\\[2, 20, 56, f32\\] is 56, which is not C \\* 5 for 5 taps"),
+        ({"kernel": 7, "bias": 1.0}, "bias must be a traced tensor \\[C\\] or None, got float"),
+        ({"kernel": 7, "bias": tr.val(Tensor[7, f32])}, "bias .* must be \\[C\\] = \\[8\\] of the dtype of cols \\(f32\\)"),
+        ({"kernel": 7, "bias": tr.val(Tensor[8, bf16])}, "must be \\[C\\] = \\[8\\]"),
+        ({"kernel": 7, "bias": tr.val(Tensor[1, 8, f32])}, "must be \\[C\\] = \\[8\\]"),
+    ]:
+        with pytest.raises(TilefishTypeError, match=match):
+            tilefish.col2im1d(cols, **kwargs)
+    assert tilefish.col2im1d(cols, 7, bias=tr.val(Tensor[8, f32])).type == Tensor[2, 8, 26, f32]
+    assert tilefish.col2im1d(cols, 7, padding=(13, 12)).type == Tensor[2, 8, 1, f32]  # 26 - 25: exactly one position
+    with pytest.raises(TilefishTypeError, match="axis 1 of Tensor\\[2, 20, 56, f32\\] is 20, which gives an output of 0 positions"):
+        tilefish.col2im1d(cols, 7, padding=13)
+    t = Dim("T", buckets=[4, 9])
+    short = tr.val(Tensor[2, t, 56, f32])
+    assert tilefish.col2im1d(short, 7, stride=2, padding=6).type == Tensor[2, 8, t * 2 - 7, f32]  # 1 position at the smallest bucket
+    with pytest.raises(TilefishTypeError, match="axis 1 of Tensor\\[2, T, 56, f32\\] can be 4, which gives an output of -1 positions"):
+        tilefish.col2im1d(short, 7, stride=2, padding=7)
+    with pytest.raises(TilefishTypeError, match="can be 1, which gives an output of 0 positions"):
+        tilefish.col2im1d(tr.val(Tensor[2, Dim("A"), 12, f32]), 4, stride=4, padding=2)  # Lo = 4 Li - 4
+    with pytest.raises(TilefishTypeError, match="col2im1d_op: .* is not f32, bf16 or f16"):
+        col2im1d_op(tilefish.i32, 3)
+    with pytest.raises(TilefishTypeError, match="col2im1d_op: bias must be True or False, got None"):
+        col2im1d_op(f32, 3, bias=None)
+    with pytest.raises(TilefishTypeError, match="col2im1d_op: channels must be a positive int"):
+        col2im1d_op(f32, 3, channels=0)
+
+
+def test_col2im1d_with_a_runtime_channel_count(tr):
+    a = Dim("A")
+    out = tilefish.col2im1d(tr.val(Tensor[2, 20, a * 3, f32]), 3, stride=2, bias=tr.val(Tensor[a, f32]))
+    assert out.type == Tensor[2, a, 41, f32] and out.producer.callee is col2im1d_op(f32, 3, stride=2, bias=True)  # (20 - 1) * 2 + 2 + 1
+    with pytest.raises(TilefishTypeError, match="axis 2 of Tensor\\[2, 20, A, f32\\] is A, which is not C \\* 3 for 3 taps"):
+        tilefish.col2im1d(tr.val(Tensor[2, 20, a, f32]), 3)
+    with pytest.raises(TilefishTypeError, match="must be \\[C\\] = \\[A\\]"):
+        tilefish.col2im1d(tr.val(Tensor[2, 20, a * 3, f32]), 3, bias=tr.val(Tensor[a * 3, f32]))
+
+
+def test_graphs_of_col2im1d_plan():
+    p = tilefish.plan(upsampled)
+    assert p.buckets() == [{"LI": 16}, {"LI": 50}]
+    (step,) = p.steps(LI=50)
+    assert "col2im1d_f32_k16_s8_d1_p4x4_op0_channel_ncl_bias_c24" in str(step)
+    (step,) = tilefish.plan(transposed_taps).steps(LI=16)
+    assert "col2im1d_bf16_k7_s1_d3_p18x0_op2_tap_nlc_c64" in str(step) and "'strides': [7168, 1, 16]" in str(step)

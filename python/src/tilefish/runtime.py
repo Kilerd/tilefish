@@ -242,7 +242,7 @@ def _target(op: Any) -> _Target:
         return _Target(op.name, op.kernel.signature, op.kernel, op.extern, op)
     if isinstance(op, KernelOp):
         return _Target(op.name, op.signature, op, None, None)
-    if isinstance(op, ExternOp):  # a generated op (tilefish.contiguous, tilefish.im2col, im2col1d) carries the Triton source tilefish wrote for it
+    if isinstance(op, ExternOp):  # a generated op (tilefish.contiguous, im2col, im2col1d, col2im1d) carries the Triton source tilefish wrote for it
         return _Target(op.name, op.signature, None, op, op.__dict__.get("_tf_generated"))
     if isinstance(op, Op):
         raise TilefishRuntimeError(

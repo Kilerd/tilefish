@@ -32,8 +32,8 @@ declaration records of it.
 one ``i32`` stride, declared with ``enable_fp_fusion=False`` and ``True``); importing them needs Triton's Gluon, so only the gate and the gpu tests
 call it, and the committed fixtures do not have them.
 
-``generated_ops()`` is two ops whose Triton tilefish generates (``tilefish.im2col1d`` in its two column orders): strided externs like any other to
-the Rust host. Only a fresh export of the gate has them.
+``generated_ops()`` is four ops whose Triton tilefish generates (``tilefish.im2col1d`` in its two column orders, and ``tilefish.col2im1d`` in its
+two column orders and layouts): strided externs like any other to the Rust host. Only a fresh export of the gate has them.
 
 ``export_rust_fixtures.py`` builds these into the fixtures of the crate, and ``rust_gate.py`` runs them in Python (``replay``) and in Rust.
 
@@ -208,14 +208,19 @@ def per_arch_ops():
 
 
 def generated_ops():
-    """``{name: extern}``: generated ops (Triton tilefish writes) of ``tilefish.im2col1d``, one per column order: ``im2col1d_tap``, a causal window of
-    7 taps at dilation 3 over 256 static channels (what a channel-last activation permuted to ``[N, C, L]`` gives), and ``im2col1d_channel``, 3 taps
-    at stride 2 with a padding of ``(2, 5)`` and a runtime channel count. Their stems are their names; the committed fixtures do not have them."""
-    from tilefish._copyops import im2col1d_op
+    """``{name: extern}``: generated ops (Triton tilefish writes). Of ``tilefish.im2col1d``, one per column order: ``im2col1d_tap``, a causal window
+    of 7 taps at dilation 3 over 256 static channels (what a channel-last activation permuted to ``[N, C, L]`` gives), and ``im2col1d_channel``, 3
+    taps at stride 2 with a padding of ``(2, 5)`` and a runtime channel count. Of ``tilefish.col2im1d``: ``col2im1d_channel``, f32 in the channel
+    order to ``[N, C, Lo]`` with a bias (4 taps at stride 2, padding 1: an upsampling by 2) and a runtime channel count, and ``col2im1d_tap``, bf16 in
+    the tap order to a channel-last ``[N, Lo, C]`` (7 taps at stride 3, dilation 2, padding ``(2, 5)``, output padding 1) over 64 static channels.
+    Their stems are their names; the committed fixtures do not have them."""
+    from tilefish._copyops import col2im1d_op, im2col1d_op
 
     return {
         "im2col1d_tap": im2col1d_op(bf16, 7, dilation=3, padding=(18, 0), order="tap", channels=256),
         "im2col1d_channel": im2col1d_op(bf16, 3, stride=2, padding=(2, 5)),
+        "col2im1d_channel": col2im1d_op(f32, 4, stride=2, padding=1, bias=True),
+        "col2im1d_tap": col2im1d_op(bf16, 7, stride=3, dilation=2, padding=(2, 5), output_padding=1, order="tap", layout="nlc", channels=64),
     }
 
 
