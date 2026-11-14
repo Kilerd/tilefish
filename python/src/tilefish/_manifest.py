@@ -59,9 +59,10 @@ from ._build import (
     ENTRY_KIND_BINARY,
     ENTRY_KIND_TRITON,
     MANIFEST_SCHEMA,
+    MAX_WARPS,
     BuiltKernel,
     LaunchAttributes,
-    spec_entry,
+    expected_entry,
 )
 from ._ir import LANGUAGE_OF_KIND, digest_kind
 from ._elf import code_digest, parse_elf, sm_of, uses_shared
@@ -220,6 +221,28 @@ def _check_identity(who: str, entry: "dict[str, Any]") -> None:
     digest = entry["declaration_digest"]
     if not (isinstance(digest, str) and _SHA256.fullmatch(digest)):
         bad(f"declaration_digest must be 64 lowercase hex digits (a sha256), got {digest!r}")
+
+
+def _check_warps(who: str, entry: "dict[str, Any]", kind: str) -> None:
+    """The warps of a block, as the Rust reader's ``Entry::check_raw`` reads them: ``total_num_warps`` (a JSON ``null`` is as absent) is only on a
+    ``triton`` entry, the kernel is then warp-specialised, and it is an int above the entry's ``num_warps`` (the warps of its default partition)
+    and at most 32; the ``block`` is ``[32 * total_num_warps, 1, 1]``. (The block of any other Triton entry, ``32 * num_warps``, is compared with
+    the compile spec by :meth:`Manifest.built_kernel`.)"""
+    total = entry.get("total_num_warps")
+    if total is None:
+        return
+    if kind != ENTRY_KIND_TRITON:
+        raise TilefishManifestError(f"{who}: a prebuilt binary has no total_num_warps (only a warp-specialised Triton kernel has)")
+    declared = entry.get("num_warps")
+    if not (type(declared) is int and type(total) is int and declared < total <= MAX_WARPS):
+        raise TilefishManifestError(
+            f"{who}: total_num_warps must be an int above num_warps ({declared!r}, the warps of the default partition of a warp-specialised kernel) "
+            f"and at most {MAX_WARPS}, got {total!r}"
+        )
+    if entry.get("block") != [32 * total, 1, 1]:
+        raise TilefishManifestError(
+            f"{who}: the block of a warp-specialised kernel is [32 * total_num_warps, 1, 1] = {[32 * total, 1, 1]}, got {entry.get('block')!r}"
+        )
 
 
 def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
@@ -622,6 +645,7 @@ class Manifest:
         who = f"'{entry['stem']}' ({entry['arch']})"
         _check_identity(who, entry)
         _check_params(who, entry, entry_kind)
+        _check_warps(who, entry, entry_kind)
         if entry_kind == ENTRY_KIND_BINARY:
             extra = [k for k in ("options", "num_warps", "num_stages") if k in entry]
             if extra:
@@ -754,7 +778,8 @@ class Manifest:
 
         The manifest entry must be what the spec asks for: every field the spec determines (ABI, grid, block,
         ``num_warps``, constants, buckets, preconditions, compile options, declaration digest and, for a generated
-        kernel, the ``source_sha256``) must equal the spec's. The entry's ``source_digest`` (an IR digest, see
+        kernel, the ``source_sha256``) must equal the spec's. The block of a warp-specialised kernel is the one its build found
+        (``32 * total_num_warps``, the warps of all its partitions), and the binary is launched with it. The entry's ``source_digest`` (an IR digest, see
         :mod:`tilefish._ir`) must equal ``ir_digest``, the digest the caller recomputed from the kernel in its process, made with
         Triton version ``ir_triton`` (which must be the version the entry was built with, or the two are not comparable). A
         recomputed digest that differs from the entry's is a refusal, pinned or not. For a hand-written kernel (a spec without a
@@ -791,7 +816,8 @@ class Manifest:
         else:
             self._check_source(spec, arch, entry, ir_digest, ir_triton, pinned)
 
-        expected = json.loads(json.dumps(spec_entry(spec)))  # as JSON read it back: lists, strings, plain numbers
+        expected = expected_entry(spec, entry)  # (a warp-specialised kernel: the block of its partitions' warps in all, which _read checked)
+        total = entry.get("total_num_warps")
         got = {k: entry.get(k) for k in expected}
         found = _first_difference(expected, got, "")
         if found is not None:
@@ -813,7 +839,7 @@ class Manifest:
                 ptx="",
                 symbol=entry["symbol"],
                 shared=int(entry["shared"]),
-                num_warps=int(entry.get("num_warps", spec.num_warps)),
+                num_warps=int(total if total is not None else entry.get("num_warps", spec.num_warps)),
                 sha256=entry["sha256"],
                 sha256_code=entry["sha256_code"],
                 triton_version=str(toolchain.get("triton", "")),
@@ -824,6 +850,7 @@ class Manifest:
                 ir_digest=entry.get("source_digest") if entry.get("source_digest_kind") in LANGUAGE_OF_KIND else None,
                 binary_digest=entry.get("source_digest") if entry.get("source_digest_kind") == BINARY_DIGEST_KIND else None,
                 binary_build=dict(entry["binary"]) if spec.binary is not None else None,
+                warp_specialized=total is not None,
             )
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             raise TilefishManifestError(f"'{spec.stem}' ({arch}): the manifest entry is malformed: {type(e).__name__}: {e}") from e

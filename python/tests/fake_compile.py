@@ -143,11 +143,24 @@ def _module(name, **attrs):
     return module
 
 
-def ptx_of(signature, arch):
-    """The PTX of a kernel with this signature (name -> Triton type): the entry point ``tf_k`` with the parameters its ABI has."""
+def ptx_of(signature, arch, reqntid=None):
+    """The PTX of a kernel with this signature (name -> Triton type): the entry point ``tf_k`` with the parameters its ABI has, and the threads
+    it requires (``.reqntid``, among the directives before its body, as Triton 3.5.1 writes them) when ``reqntid`` is given."""
     params = [".param .u64 p%d" % i if t.startswith("*") else ".param .u32 p%d" % i for i, t in enumerate(t for t in signature.values() if t != "constexpr")]
     params += [".param .u64 scratch0", ".param .u64 scratch1"]
-    return f".version 8.8\n.target sm_{arch}a\n.visible .entry tf_k(\n\t" + ",\n\t".join(params) + "\n)\n{\n"
+    directives = "" if reqntid is None else f".reqntid {reqntid}\n.maxnreg 168\n"
+    return f".version 8.8\n.target sm_{arch}a\n.visible .entry tf_k(\n\t" + ",\n\t".join(params) + "\n)\n" + directives + "{\n"
+
+
+# the TTGIR of a warp-specialised region (Gluon's gl.warp_specialize: a default partition, and a worker partition of one warp), as Triton 3.5.1 prints it
+WARP_SPECIALIZE_TTGIR = """    ttg.warp_specialize(%x_desc, %bufs) attributes {requestedRegisters = array<i32: 24>}
+    default {
+      ttg.warp_yield
+    }
+    partition0(%arg0: !tt.tensordesc<tensor<64x64xf16, #shared>>, %arg1: !ttg.memdesc<3x64x64xf16, #shared, #smem, mutable>) num_warps(1) {
+      ttg.warp_return
+    } : (!tt.tensordesc<tensor<64x64xf16, #shared>>, !ttg.memdesc<3x64x64xf16, #shared, #smem, mutable>) -> ()
+"""
 
 
 class FakeCompiler:
@@ -165,6 +178,12 @@ class FakeCompiler:
         self.active = 0  # frontends running now, and the most there ever were at once
         self.max_active = 0
         self.lock = threading.Lock()
+        # warp specialisation: ``total_warps`` makes the compiled kernel warp-specialised (its TTGIR has a ``ttg.warp_specialize`` region) with that
+        # many warps in all, which the metadata reports as ``num_warps``; ``metadata_warps`` makes the metadata report that many for a kernel that is
+        # not (a silent change); ``reqntid`` is the ``.reqntid`` of its PTX (``"block"``: 32 times the warps the metadata reports; ``None``: none)
+        self.total_warps = None
+        self.metadata_warps = None
+        self.reqntid = None
 
     @property
     def count(self):
@@ -180,8 +199,8 @@ class FakeCompiler:
         self.languages.append(src.language)
         module = src.make_ir(target, types.SimpleNamespace(**options), {}, {}, FakeContext())
         text = module.str_nodebug() + repr(sorted(options.items())) + repr(target.arch)
-        code = hashlib.sha256(text.encode()).digest() * 2
-        ptx = ptx_of(src.signature, target.arch)
+        ttgir = f"module {{\n  tt.func public @tf_k() {{\n{WARP_SPECIALIZE_TTGIR if self.total_warps else ''}    tt.return\n  }}\n}}\n"
+        code = hashlib.sha256((text + (f"ws{self.total_warps}" if self.total_warps else "")).encode()).digest() * 2
         md = types.SimpleNamespace(
             name="tf_k",
             shared=self.shared,
@@ -194,7 +213,12 @@ class FakeCompiler:
             launch_cooperative_grid=False,
             **options,
         )
-        return types.SimpleNamespace(metadata=md, asm={"cubin": cubin_like(code=code, shared=1024, **arch_header(target.arch)), "ptx": ptx})
+        if self.total_warps is not None or self.metadata_warps is not None:  # Triton's metadata num_warps: the total of a warp-specialised kernel
+            md.num_warps = self.total_warps if self.total_warps is not None else self.metadata_warps
+        reqntid = 32 * md.num_warps if self.reqntid == "block" else self.reqntid
+        ptx = ptx_of(src.signature, target.arch, reqntid)
+        cubin = cubin_like(code=code, shared=1024, **arch_header(target.arch))
+        return types.SimpleNamespace(metadata=md, asm={"cubin": cubin, "ptx": ptx, "ttgir": ttgir})
 
 
 def install(monkeypatch, version="3.5.1"):

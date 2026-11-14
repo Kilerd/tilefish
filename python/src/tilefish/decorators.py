@@ -1197,6 +1197,12 @@ def extern(
     refused with the argument to use; a string reference is checked when the kernel is built. The layouts of a Gluon kernel are written for
     a number of warps, so ``num_warps`` must be that number: Gluon's frontend refuses another one when the kernel is built.
 
+    **A warp-specialised kernel** (Gluon's ``gl.warp_specialize``, or Triton's own warp specialisation of a ``tl.range(..., warp_specialize=True)``
+    loop) is declared the same way, and ``num_warps`` is the warps of its **default partition**: the worker partitions add warps of their own (a 1-warp
+    TMA producer and a 1-warp MMA issuer beside 4 compute warps make 8 in Triton 3.5.1, and beside 8 make 12). The build takes the compiled kernel's
+    total when its TTGIR has warp-specialised regions, and launches with that block; it refuses any other kernel whose warps Triton changed. The manifest
+    entry records the total (``total_num_warps``, manifest schema 3 section 4.2).
+
     **A prebuilt binary that Triton does not compile** is declared with ``ptx="file.ptx"`` or ``cubin={"sm_103": "file.cubin", ...}``
     instead of ``triton=``, together with ``symbol="entry_name"``, ``block=(x, y, z)`` and ``grid=...`` (and ``shared=0``, the bytes of
     dynamic shared memory the kernel addresses)::

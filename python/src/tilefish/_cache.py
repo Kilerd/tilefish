@@ -59,7 +59,9 @@ was compiled from (``build`` compiles from a source that records the IR it was g
 The value is one JSON file: the cubin (base64), the PTX, the IR digest, and what ``build`` returns besides them. A read recomputes
 everything it can instead of believing the file: the ``sha256`` of the cubin, its ``sha256_code`` (the machine code, by
 parsing the ELF file), the sha256 of the PTX, the entry point and its parameters against the spec (the ABI check of a
-fresh build), the options, the IR digest and the versions against what is being built. Anything that is not as it was written is a
+fresh build), the threads the entry requires (``.reqntid``) against the warps the entry records, the warps against the options (exactly
+``num_warps``, or more for a warp-specialised kernel, which the entry says it is), the options, the IR digest and the versions against what is
+being built. Anything that is not as it was written is a
 miss with a :class:`~tilefish.errors.TilefishCacheWarning` and the kernel is built again (and the entry rewritten); the cache
 never hands back a binary it could not check, and it never fails a build.
 
@@ -93,7 +95,7 @@ import pathlib
 import warnings
 from typing import Any, Mapping
 
-from ._build import BuiltKernel, LaunchAttributes, _check_abi, write_file
+from ._build import BuiltKernel, LaunchAttributes, _check_abi, check_threads, warps_problem, write_file
 from ._elf import code_digest, parse_elf
 from ._ir import IR_DIGEST_KIND, digest_kind
 from .errors import TilefishBuildError, TilefishCacheWarning
@@ -344,6 +346,7 @@ def encode(key: str, built: BuiltKernel) -> bytes:
         "symbol": built.symbol,
         "shared": built.shared,
         "num_warps": built.num_warps,
+        "warp_specialized": built.warp_specialized,
         "sha256": built.sha256,
         "sha256_code": built.sha256_code,
         "ptx_sha256": hashlib.sha256(built.ptx.encode("utf-8")).hexdigest(),
@@ -423,10 +426,15 @@ def decode(
     if kind != digest_kind(spec.language):
         raise _Invalid(f"its IR digest is of kind {kind!r}, not {digest_kind(spec.language)!r}")
     num_warps = _field(doc, "num_warps", int)
-    if num_warps != wanted.get("num_warps", spec.num_warps):
-        raise _Invalid(f"its num_warps is {num_warps}, not what the options ask for")
+    warp_specialized = doc.get("warp_specialized", False)  # (an entry written before warp-specialised kernels were built has no such field)
+    if not isinstance(warp_specialized, bool):
+        raise _Invalid("the field 'warp_specialized' is not a bool")
+    problem = warps_problem(wanted.get("num_warps", spec.num_warps), num_warps, warp_specialized)
+    if problem is not None:
+        raise _Invalid(f"its num_warps is not what the options ask for: {problem}")
     try:
         _check_abi(spec, ptx, symbol)
+        check_threads(spec, ptx, symbol, num_warps)
         launch = LaunchAttributes.from_dict(_field(doc, "launch", dict))
     except TilefishBuildError as e:
         raise _Invalid(str(e)) from e
@@ -448,6 +456,7 @@ def decode(
         options=dict(options),
         launch=launch,
         ir_digest=ir_digest,
+        warp_specialized=warp_specialized,
     )
 
 

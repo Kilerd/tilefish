@@ -101,7 +101,7 @@ def load_key(built: "BuiltKernel", device_index: int) -> "tuple[Any, ...]":
         built.symbol,
         built.shared,
         tuple((k, tuple(v) if isinstance(v, list) else v) for k, v in sorted(launch.items())),
-        tuple(built.spec.block),
+        tuple(built.block),  # the compiled kernel's (every partition of a warp-specialised kernel)
         json.dumps(built.abi(), sort_keys=True),
     )
 
@@ -162,7 +162,7 @@ class LoadedKernel:
         except BaseException:
             drv.cuModuleUnload(self.module)  # a kernel that is refused must not stay loaded
             raise
-        self.block = tuple(built.spec.block)
+        self.block = built.block  # 32 * the warps of the compiled kernel (a warp-specialised kernel's partitions in all), or a binary's declared block
         abi = built.abi()
         self._abi = abi["params"]
 

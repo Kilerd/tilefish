@@ -16,6 +16,7 @@ import contextlib
 import functools
 import importlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -53,6 +54,13 @@ _ENTRY = re.compile(r"\.entry\s+(\w+)\s*\(")
 _PTX_PARAM = re.compile(r"\.param\s+(?:\.align\s+\d+\s+)?\.(\w+)[^,\[)]*?(?:\[(\d+)\])?\s*(?=,|\)|$)")
 TENSORDESC_PTX = "b8[128]"  # the PTX type of a CUtensorMap parameter, as the manifest names it (``.param .align 64 .b8 name[128]``)
 _PTX_TARGET = re.compile(r"^\s*\.target\s+(\S+)", re.M)
+# the threads a PTX entry requires of a launch, among the directives between its parameter list and its body: ``.reqntid 256`` (or
+# ``.reqntid 256, 1, 1``); Triton 3.5.1 writes it for every kernel (``32 * num_warps``, the total of a warp-specialised kernel's partitions)
+_PTX_REQNTID = re.compile(r"\.reqntid\s+(\d+)(?:\s*,\s*(\d+))?(?:\s*,\s*(\d+))?")
+# a warp-specialised region of a kernel in its TTGIR (Gluon's ``gl.warp_specialize``, or the partitions Triton's own warp specialisation makes):
+# ``ttg.warp_specialize(%a, %b) attributes {...}``, or ``%0:2 = ttg.warp_specialize(...)`` when the default partition returns values
+_WARP_SPECIALIZE = re.compile(r"^\s*(?:%[^=\n]*=\s*)?ttg\.warp_specialize\(", re.M)
+MAX_WARPS = 32  # 1024 threads: the most a block has
 _MISSING = object()
 _compile_lock = _ir.LOCK  # a Triton knob is process-wide state, and Triton's frontend is not known to be thread-safe: one compile (or frontend) at a time
 
@@ -412,6 +420,12 @@ class BuiltKernel:
     what tells a manifest that the kernel it was built from is not the kernel a process holds now, for a hand-written ``extern``
     (whose declaration says nothing about its body) and a lowered kernel alike: whatever the process holds that the frontend reads
     (the body, a constant read by any route, a closure) is in the IR, so a change of any of them changes it.
+
+    ``num_warps`` is the warps of a block of the compiled kernel, as Triton's metadata says: the declared ``num_warps`` (the compile option),
+    except for a **warp-specialised** kernel (``warp_specialized``: its TTGIR has ``ttg.warp_specialize`` regions, from Gluon's
+    ``gl.warp_specialize`` or from Triton's own warp specialisation), whose partitions add their warps to the declared ones, the warps of its
+    default partition: there it is their total (Triton's ``ttg.total-num-warps``, 8 for a 4-warp default partition and two 1-warp workers). A
+    launch takes ``block`` = ``32 * num_warps`` threads, and a prebuilt binary (``num_warps`` 0) its declared block.
     """
 
     spec: "CompileSpec"
@@ -420,7 +434,7 @@ class BuiltKernel:
     ptx: str
     symbol: str
     shared: int
-    num_warps: int
+    num_warps: int  # the warps of a block of the compiled kernel (a warp-specialised kernel: every partition's), 0 for a prebuilt binary
     sha256: str
     sha256_code: str
     triton_version: str
@@ -433,10 +447,20 @@ class BuiltKernel:
     # ``"tilefish.binary.v1"``), and how it was made: ``{"source": "ptx", "ptxas_flags": [...]}`` or ``{"source": "cubin"}``
     binary_digest: "str | None" = None
     binary_build: "dict[str, Any] | None" = None
+    # a warp-specialised kernel: its partitions add warps to the declared num_warps (its default partition's), and ``num_warps`` is their total
+    warp_specialized: bool = False
 
     @property
     def stem(self) -> str:
         return self.spec.stem
+
+    @property
+    def block(self) -> "tuple[int, int, int]":
+        """The thread block a launch takes: ``32 * num_warps`` threads of the compiled kernel (every partition of a warp-specialised one), or the
+        block a prebuilt binary declares."""
+        if self.spec.binary is not None:
+            return tuple(self.spec.block)  # type: ignore[return-value]
+        return (32 * self.num_warps, 1, 1)
 
     @property
     def cubin_name(self) -> str:
@@ -517,6 +541,69 @@ def _check_abi(spec: "CompileSpec", ptx: str, symbol: str) -> None:
         raise TilefishBuildError(
             f"the binary of '{spec.stem}' does not have the ABI its spec promises: the PTX entry '{symbol}' takes "
             f"{found}, the spec's launch parameters {[p.name for p in spec.launch_params]} need {expected}"
+        )
+
+
+def warps_problem(declared: int, num_warps: Any, warp_specialized: bool) -> "str | None":
+    """What is wrong with a binary of a kernel declared with ``declared`` warps that is launched with ``num_warps`` (``None``: nothing).
+
+    A kernel that is not warp-specialised has exactly the warps it was declared with (a silent change of them is an error: the block, the
+    layouts and the reduction trees are written for that number). A warp-specialised one has more, from ``declared + 1`` (its partitions each
+    have a warp at least) to 32 (1024 threads). A prebuilt binary (``declared`` 0) has no warps to change and is never warp-specialised.
+    """
+    if not isinstance(num_warps, int) or isinstance(num_warps, bool):
+        return f"its warp count is {num_warps!r}, not an int"
+    if not warp_specialized:
+        return None if num_warps == declared else f"it has {num_warps} warps, but the declaration gives num_warps={declared}"
+    if declared == 0:
+        return "a prebuilt binary is not warp-specialised"
+    if not declared < num_warps <= MAX_WARPS:
+        return (
+            f"it is warp-specialised with {num_warps} warps in all, but its partitions add warps to the {declared} of its default partition (the "
+            f"declared num_warps), and a block has at most {MAX_WARPS}"
+        )
+    return None
+
+
+def check_launch_config(built: BuiltKernel, spec: "CompileSpec") -> None:
+    """Raise :class:`~tilefish.errors.TilefishRuntimeError` unless ``built`` is a binary of ``spec``'s launch configuration: its block, and the
+    warps its declaration gives (all of them, or those of the default partition of a warp-specialised kernel)."""
+    from .errors import TilefishRuntimeError
+
+    problem = warps_problem(spec.num_warps, built.num_warps, built.warp_specialized)
+    if built.spec.block != spec.block or built.spec.num_warps != spec.num_warps or problem is not None:
+        raise TilefishRuntimeError(f"the binary of '{spec.stem}' disagrees with its spec about num_warps" + (f": {problem}" if problem else ""))
+
+
+def is_warp_specialized(ttgir: Any) -> bool:
+    """Whether a kernel's TTGIR (``compiled.asm["ttgir"]``) has a warp-specialised region (``ttg.warp_specialize``): Gluon's
+    ``gl.warp_specialize``, or the partitions of Triton's own warp specialisation (``tl.range(..., warp_specialize=True)`` on sm_100 and up)."""
+    return isinstance(ttgir, str) and _WARP_SPECIALIZE.search(ttgir) is not None
+
+
+def ptx_reqntid(ptx: str, symbol: str) -> "int | None":
+    """The threads per block the PTX entry ``symbol`` requires (its ``.reqntid``, the product of its sizes), or ``None`` when it states none."""
+    m = next((e for e in _ENTRY.finditer(ptx) if e.group(1) == symbol), None)
+    if m is None:
+        return None
+    close = ptx.find(")", m.end())
+    body = ptx.find("{", close)
+    if close < 0 or body < 0:
+        return None
+    found = _PTX_REQNTID.search(ptx, close, body)
+    if found is None:
+        return None
+    return math.prod(int(g) for g in found.groups() if g is not None)
+
+
+def check_threads(spec: "CompileSpec", ptx: str, symbol: str, num_warps: int) -> None:
+    """The threads the PTX entry requires (``.reqntid``, which Triton writes for every kernel) must be ``32 * num_warps``, the block a launch takes:
+    the machine code and the metadata agree about the warps of a block (the driver refuses a launch of a ``.reqntid`` kernel with another block)."""
+    threads = ptx_reqntid(ptx, symbol)
+    if threads is not None and threads != 32 * num_warps:
+        raise TilefishBuildError(
+            f"'{spec.stem}': the PTX entry '{symbol}' requires {threads} threads per block (.reqntid), but Triton's metadata says {num_warps} warps "
+            f"({32 * num_warps} threads)"
         )
 
 
@@ -663,6 +750,13 @@ def build(
     not know. The result is checked against the spec: the options in effect, the symbol, and the parameters of
     the PTX entry (the ABI). Raises :class:`~tilefish.errors.TilefishBuildError`.
 
+    **Warp specialisation.** ``num_warps`` is the warps of the kernel's default partition, which is all of a kernel that is not
+    warp-specialised: Triton must report exactly that number for it. A kernel whose TTGIR has ``ttg.warp_specialize`` regions (Gluon's
+    ``gl.warp_specialize``, or Triton's own warp specialisation of a ``tl.range(..., warp_specialize=True)`` loop) has partitions that add their
+    warps, and Triton reports the total (a 4-warp default partition and two 1-warp workers: 8): it must be more than ``num_warps`` and at most 32,
+    and :attr:`BuiltKernel.num_warps` is that total, the block of a launch (``warp_specialized`` is set). Either way the threads the PTX entry
+    requires (``.reqntid``) must be ``32 *`` the reported warps.
+
     **The identity of the binary is the IR that Triton compiles** (:mod:`tilefish._ir`). Before anything is looked up or compiled,
     Triton's frontend is run on the spec's source (the first step of ``triton.compile``) and the TTIR it builds (the TTGIR of a Gluon
     kernel), without locations or names, is hashed: that is :attr:`BuiltKernel.ir_digest`, which must equal ``ir_digest`` when that is
@@ -759,10 +853,18 @@ def build(
         )
 
     md = compiled.metadata
+    # a warp-specialised kernel: Triton's metadata num_warps is the total of its partitions, which add warps to the num_warps it was given (its
+    # default partition's); any other kernel has exactly the num_warps it was given
+    warp_specialized = is_warp_specialized(getattr(compiled, "asm", {}).get("ttgir"))
     for key, want in opts.items():
         got = getattr(md, key, _MISSING)
         if got is _MISSING:
             raise TilefishBuildError(f"'{spec.stem}': Triton does not know the compile option '{key}' (it ignored it)")
+        if key == "num_warps" and warp_specialized:
+            problem = warps_problem(want, got, True)
+            if problem is not None:
+                raise TilefishBuildError(f"'{spec.stem}': the compile option num_warps={want!r} was not applied as it should be: {problem}")
+            continue
         if not _applied(key, want, got):
             raise TilefishBuildError(f"'{spec.stem}': the compile option {key}={want!r} was not applied (Triton used {got!r})")
     if getattr(md.target, "arch", None) != cap:
@@ -774,6 +876,7 @@ def build(
     if elf.section(f".text.{symbol}") is None:
         raise TilefishBuildError(f"the cubin of '{spec.stem}' has no code section '.text.{symbol}'")
     _check_abi(spec, ptx, symbol)
+    check_threads(spec, ptx, symbol, int(md.num_warps))
     check_tensordesc_meta(spec, getattr(md, "tensordesc_meta", None))
     from hashlib import sha256
 
@@ -794,6 +897,7 @@ def build(
         options=opts,
         launch=_launch_attributes(md),
         ir_digest=digest,
+        warp_specialized=warp_specialized,
     )
     if store is not None:
         store.store(cache_id, built)
@@ -843,6 +947,17 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
     return entry
 
 
+def expected_entry(spec: "CompileSpec", entry: "Mapping[str, Any]") -> dict[str, Any]:
+    """What a manifest ``entry`` of a binary of ``spec`` must have, as JSON reads it back (lists, strings, plain numbers): :func:`spec_entry`, with
+    the block a warp-specialised kernel's build found (``32 * total_num_warps``: the warps of all its partitions; a reader checks the field
+    itself, that it is more than the declared ``num_warps``) in place of the declared one."""
+    expected = json.loads(json.dumps(spec_entry(spec)))
+    total = entry.get("total_num_warps")
+    if total is not None and spec.binary is None:
+        expected["block"] = [32 * total, 1, 1]
+    return expected
+
+
 def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     spec_part = spec_entry(b.spec)
     entry: dict[str, Any] = {
@@ -855,12 +970,17 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         "cubin": b.cubin_name,
         "abi": spec_part["abi"],
         "grid": spec_part["grid"],
-        "block": spec_part["block"],
+        "block": list(b.block),  # the compiled kernel's: 32 * the warps of every partition of a warp-specialised kernel
         "shared": b.shared,
     }
     if b.spec.binary is None:
-        entry["num_warps"] = b.num_warps
+        problem = warps_problem(b.spec.num_warps, b.num_warps, b.warp_specialized)
+        if problem is not None:
+            raise TilefishBuildError(f"'{b.stem}' ({b.arch}): {problem}")
+        entry["num_warps"] = spec_part["num_warps"]  # the compile option: the declared warps (a warp-specialised kernel's default partition)
         entry["num_stages"] = spec_part["num_stages"]
+        if b.warp_specialized:  # its partitions' warps in all, which the block is made of
+            entry["total_num_warps"] = b.num_warps
     entry["launch"] = b.launch.to_dict()
     entry["constexprs"] = spec_part["constexprs"]
     entry["buckets"] = spec_part["buckets"]
@@ -914,6 +1034,7 @@ def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
         "source_digest_kind",
         "options",
         "shared",
+        "total_num_warps",
         "algo",
         "cublaslt_version",
         "sm_count",
@@ -942,7 +1063,8 @@ def write_manifest(
     records its declared ``shape``, a list of dimension expressions and sizes such as ``["Rows", 1024]``), ``dims`` (for each
     named dimension its ``divisible_by`` and ``buckets`` and, for a bucketed one, the ``bucket`` this binary is built for: a
     host binds the dimensions from the shapes of its tensors and checks them with these alone), ``grid`` (an expression over the
-    dimension names, with ``cdiv(a, b)``), ``block``, ``shared``, ``launch``
+    dimension names, with ``cdiv(a, b)``), ``block`` (``32 *`` the warps of a block of the compiled kernel: the declared ``num_warps``, or for a
+    warp-specialised kernel the total of its partitions, which ``total_num_warps`` records), ``shared``, ``launch``
     (scratch sizes, PDL, cluster and cooperative flags: all zero or false for a binary a plain
     ``cuLaunchKernel`` can run), ``constexprs``, ``preconditions`` (what a host checks before it launches),
     ``declaration_digest`` and, for a generated kernel, ``source_sha256`` (the Triton source it was built from), for every kernel
