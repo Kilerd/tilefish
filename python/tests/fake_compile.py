@@ -184,6 +184,11 @@ class FakeCompiler:
         self.total_warps = None
         self.metadata_warps = None
         self.reqntid = None
+        # the TF32 guard: ``ptx_body`` goes into the body of the PTX (an instruction: ``tcgen05.mma.cta_group::1.kind::tf32 ...``), ``ttgir_body`` into
+        # the function of the TTGIR (an op: ``ttng.tc_gen5_mma ...``), and ``ttir`` is the TTIR of the compile (``asm["ttir"]``, none by default)
+        self.ptx_body = ""
+        self.ttgir_body = ""
+        self.ttir = None
 
     @property
     def count(self):
@@ -199,7 +204,7 @@ class FakeCompiler:
         self.languages.append(src.language)
         module = src.make_ir(target, types.SimpleNamespace(**options), {}, {}, FakeContext())
         text = module.str_nodebug() + repr(sorted(options.items())) + repr(target.arch)
-        ttgir = f"module {{\n  tt.func public @tf_k() {{\n{WARP_SPECIALIZE_TTGIR if self.total_warps else ''}    tt.return\n  }}\n}}\n"
+        ttgir = f"module {{\n  tt.func public @tf_k() {{\n{WARP_SPECIALIZE_TTGIR if self.total_warps else ''}{self.ttgir_body}    tt.return\n  }}\n}}\n"
         code = hashlib.sha256((text + (f"ws{self.total_warps}" if self.total_warps else "")).encode()).digest() * 2
         md = types.SimpleNamespace(
             name="tf_k",
@@ -216,9 +221,10 @@ class FakeCompiler:
         if self.total_warps is not None or self.metadata_warps is not None:  # Triton's metadata num_warps: the total of a warp-specialised kernel
             md.num_warps = self.total_warps if self.total_warps is not None else self.metadata_warps
         reqntid = 32 * md.num_warps if self.reqntid == "block" else self.reqntid
-        ptx = ptx_of(src.signature, target.arch, reqntid)
+        ptx = ptx_of(src.signature, target.arch, reqntid) + self.ptx_body
         cubin = cubin_like(code=code, shared=1024, **arch_header(target.arch))
-        return types.SimpleNamespace(metadata=md, asm={"cubin": cubin, "ptx": ptx, "ttgir": ttgir})
+        asm = {"cubin": cubin, "ptx": ptx, "ttgir": ttgir, **({"ttir": self.ttir} if self.ttir is not None else {})}
+        return types.SimpleNamespace(metadata=md, asm=asm)
 
 
 def install(monkeypatch, version="3.5.1"):

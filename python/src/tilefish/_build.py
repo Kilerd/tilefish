@@ -640,6 +640,39 @@ def check_tensordesc_meta(spec: "CompileSpec", meta: Any) -> None:
             )
 
 
+TF32_FIXES = (
+    "Fixes: give that dot a tile of fewer than 64 rows (M = 32 or 16), which Triton 3.5.1 keeps on FMAs; write the product in a SIMT form (a loop "
+    'of tl.fma over k, no tl.dot); or, where TF32 is what the kernel may compute, say so on the dot with input_precision="tf32" (or "tf32x3"), '
+    "which this check never refuses"
+)
+
+
+def _text_or_none(value: Any) -> "str | None":
+    return value if isinstance(value, str) else None
+
+
+def check_tf32(
+    spec: "CompileSpec", cap: int, frontend_ir: str, ptx: str, triton_version: str, *, ttir: "str | None" = None, ttgir: "str | None" = None
+) -> None:
+    """Refuse a binary whose kernel asks for IEEE f32 dots but was compiled into TF32 tensor-core MMAs (:mod:`tilefish._tf32guard`).
+
+    ``frontend_ir`` is the IR the frontend built (the text of the IR digest), ``ptx`` the binary's, and ``ttir`` and ``ttgir`` those of the compile
+    (``compiled.asm``; a cache hit has none). Every kernel Triton builds is checked, a lowered ``@kernel`` (it has no dot today) as much as an
+    ``extern``; a kernel whose dots allow TF32 is never refused. Raises :class:`~tilefish.errors.TilefishBuildError` with the fixes.
+    """
+    from . import _tf32guard
+
+    found = _tf32guard.problem(frontend_ir, ptx, language=spec.language, ttir=ttir, ttgir=ttgir)
+    if found is None:
+        return
+    raise TilefishBuildError(
+        f"'{spec.stem}' ({spec.triton}) for sm_{cap} with Triton {triton_version}: {found}. A TF32 MMA keeps 10 of the 23 bits of each f32 "
+        "mantissa, so the binary would not compute what the kernel asks for, and nothing at run time would say so: refusing to build it. (Triton "
+        "3.5.1 sends an IEEE f32 dot to tcgen05 on sm_100 and sm_103 when an operand derives from a load narrower than 32 bits, an f16, bf16 or "
+        f"i8 tensor converted to f32, or from tl.join, and its tile has M % 64 == 0, N % 16 == 0 and 4 or 8 warps.) {TF32_FIXES}"
+    )
+
+
 @contextlib.contextmanager
 def _always_compile(triton: Any) -> "Iterator[None]":
     """Make ``triton.compile`` compile, never read its disk cache, for the duration of the block.
@@ -757,6 +790,11 @@ def build(
     and :attr:`BuiltKernel.num_warps` is that total, the block of a launch (``warp_specialized`` is set). Either way the threads the PTX entry
     requires (``.reqntid``) must be ``32 *`` the reported warps.
 
+    **IEEE f32 dots.** A kernel whose IR asks for an f32 dot with IEEE input precision (``tl.dot(..., input_precision="ieee")``) is refused when
+    its binary has TF32 tensor-core MMAs made of such a dot (:func:`check_tf32`, :mod:`tilefish._tf32guard`): Triton 3.5.1 lowers some of them to
+    ``tcgen05.mma ... kind::tf32`` on sm_100 and sm_103. It is judged from the PTX, and from the TTGIR traced back to the TTIR by source location
+    where the kernel also has dots that allow TF32; a cache hit is checked again from its PTX.
+
     **The identity of the binary is the IR that Triton compiles** (:mod:`tilefish._ir`). Before anything is looked up or compiled,
     Triton's frontend is run on the spec's source (the first step of ``triton.compile``) and the TTIR it builds (the TTGIR of a Gluon
     kernel), without locations or names, is hashed: that is :attr:`BuiltKernel.ir_digest`, which must equal ``ir_digest`` when that is
@@ -802,7 +840,8 @@ def build(
 
     files = _cache.compile_files(opts)  # refuses ir_override; the sha256 of the files the options name (extern_libs)
     what = f"'{spec.stem}' ({spec.triton})"
-    digest = _ir.ir_digest(_ir.ttir_text(jit, inp, arch=cap, options=opts, what=what), spec.language)
+    frontend_ir = _ir.ttir_text(jit, inp, arch=cap, options=opts, what=what)
+    digest = _ir.ir_digest(frontend_ir, spec.language)
     if ir_digest is not None and digest != ir_digest:
         raise TilefishBuildError(
             f"the IR of {what} has digest {digest}, but {ir_digest} was expected: it is not the kernel the caller meant to build"
@@ -828,6 +867,7 @@ def build(
         )
         hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
+            check_tf32(spec, cap, frontend_ir, hit.ptx, triton_version)  # an entry has its PTX only, which the build that stored it was judged by too
             return hit
 
     from triton.backends.compiler import GPUTarget
@@ -878,6 +918,8 @@ def build(
     _check_abi(spec, ptx, symbol)
     check_threads(spec, ptx, symbol, int(md.num_warps))
     check_tensordesc_meta(spec, getattr(md, "tensordesc_meta", None))
+    asm = getattr(compiled, "asm", {})
+    check_tf32(spec, cap, frontend_ir, ptx, triton_version, ttir=_text_or_none(asm.get("ttir")), ttgir=_text_or_none(asm.get("ttgir")))
     from hashlib import sha256
 
     target = _PTX_TARGET.search(ptx)
