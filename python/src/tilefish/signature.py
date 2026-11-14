@@ -795,8 +795,8 @@ def _add_layout_equations(op: "Op", p: Param, pt: TensorType, at: TensorType, un
         assert pattern is not None
         if got is None:
             raise TilefishTypeError(
-                f"{op.name}: argument '{p.name}' is the view {at} whose stride along axis {axis} is not an affine expression "
-                "(a product of two symbolic dimensions), so it cannot be passed as a stride; make one of the factors static"
+                f"{op.name}: argument '{p.name}' is the view {at} whose stride along axis {axis} is unknown (an opaque view), so it cannot "
+                "be passed as a stride"
             )
         if pattern.is_static and at.shape[axis].is_static and at.shape[axis].value == 1:
             continue  # the stride of a size-1 axis is never used
@@ -805,7 +805,7 @@ def _add_layout_equations(op: "Op", p: Param, pt: TensorType, at: TensorType, un
     if at.offset is None:
         if p.align:
             raise TilefishTypeError(
-                f"{op.name}: argument '{p.name}': the offset of the view {at} is not an affine expression, so it cannot be shown "
+                f"{op.name}: argument '{p.name}': the offset of the view {at} is unknown (an opaque view), so it cannot be shown "
                 f"to be a multiple of {p.align} bytes, which this Strided[..., {p.align}] parameter needs"
             )
         return

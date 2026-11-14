@@ -33,7 +33,9 @@ warps of its own ``BLOCK_D`` (the spec of the ``D = 96`` binary says 1 warp whet
 ``n = prod(shape)`` (but an ``[N]`` table of ``gather_rows`` / ``scatter_rows``, addressed by an index),
 or the trailing axes of it: such an operand (``pe: [T, D]`` of a ``[K, T, D]`` kernel) broadcasts over the
 leading axes, lane ``o`` reading its element ``o % pe_n`` (``pe_n`` a runtime ``i32``, its element count), and
-is never written. Python and ``const`` scalars broadcast too; there are no reductions. ``n`` is a
+is never written. Any other shape that broadcasts to the kernel's (numpy's rules: ``[H, 1, L]`` or ``[H, L, 1]``
+of an ``[H, L, L]`` kernel) is read at the offset of the lane's coordinates, and an ``iota`` along any axis is
+the lane's coordinate there (note 12). Python and ``const`` scalars broadcast too; there are no reductions. ``n`` is a
 runtime ``i32`` parameter whose dimension is that product (``3072*M``), so a spec says how to
 compute it and ``compile_specs`` emits ``tt.divisibility`` when the product is provably a multiple
 of 16. When the product is not affine (two symbolic dimensions), ``n`` gets a fresh dimension that
@@ -317,6 +319,17 @@ Notes (the facts behind the table):
     negative one: ``tl.where(r < 0, r + c, r)`` and ``tl.where(r < 0, i // c - 1, i // c)``; an unsigned type needs nothing. Exact, with no
     overflow (``r + c`` and ``i // c - 1`` are taken only where ``r < 0``). The reference is ``torch.div(..., rounding_mode="floor")`` and
     ``torch.remainder``.
+12. **Broadcasts along any axis** (the elementwise template). The kernel's shape ``S`` (rank ``r``) is the one every tensor broadcasts to; an
+    operand of shape ``T`` is aligned on the last axes, and along each axis it either *has* the axis (its size is ``S``'s) or repeats (size 1, or
+    no such axis). An operand whose axes are ``S``'s last ones is read at ``o % count`` (above). Any other is read at the offset of the lane's
+    coordinates: for each maximal run ``[a, b]`` of the axes it has, the lane's index along the run taken as one axis,
+    ``(o // prod(S[b+1:])) % prod(S[a:b+1])`` (no division for the last axes, no remainder for the first), times the operand's own stride after the
+    run (the product of the sizes it has after ``b``), summed over the runs: ``[H, 1, L]`` of ``[H, L, L]`` is ``(o // (L * L)) * L + o % L``, and
+    ``[K, T, 1]`` of ``[K, T, D]`` is ``o // D``. ``iota(x, axis)`` is the lane's coordinate along that kernel axis, ``(o // prod(S[k+1:])) % S[k]``. A
+    static size is written as a number; a symbolic one is a runtime ``i32`` parameter of the dimension it is (``size_L``, after the template's own and
+    the broadcast counts), which a host derives from the shapes like any dimension scalar, so one binary serves every size. Exact: integer
+    arithmetic on ``i32``, every intermediate below ``n``, which is below ``2**31``. A broadcast operand is never written; a gather or a scatter of a
+    broadcast shape is not lowered (rule ``elementwise.broadcast-index``).
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -1218,15 +1231,26 @@ class _ElementwiseLayout(_Layout):
             if v.type.rank == 0:
                 raise _fail(name, "elementwise", "elementwise.scalar-output", f"the returned {_label(v)} is a scalar; combine it with a tensor first")
         widest = max(values, key=lambda v: v.type.rank)  # the first of the largest rank
+        if broadcast:  # the kernel's shape is the one every operand broadcasts to (an operand of the largest rank may itself be broadcast)
+            widest = next(
+                (w for w in values if w.type.rank == widest.type.rank and all(_kept_axes(v.type.shape, w.type.shape) is not None for v in values)),
+                widest,
+            )
         self.shape = widest.type.shape
-        # an operand whose shape is the trailing axes of the kernel's shape broadcasts over the leading ones: lane o reads its element o % n
+        # an operand whose shape is the trailing axes of the kernel's shape (after leading 1s) broadcasts over the leading ones: lane o reads its
+        # element o % n. Any other shape that broadcasts to the kernel's (numpy's rules: a size-1 axis or a missing leading axis repeats) is read
+        # at the offset of the lane's coordinates along the axes it has (note 12): ``self.general``
         self.broadcast: dict[Value, str] = {}
+        self.general: dict[Value, list[bool]] = {}
         for v in values:
             shape = v.type.shape
             if shape == self.shape:
                 continue
-            if broadcast and len(shape) < len(self.shape) and tuple(self.shape[len(self.shape) - len(shape) :]) == tuple(shape):
+            kept = _kept_axes(shape, self.shape) if broadcast else None
+            if kept is not None:
                 self.broadcast[v] = ""
+                if not _is_suffix(kept, self.shape):
+                    self.general[v] = kept
                 continue
             if not broadcast:
                 raise _fail(
@@ -1240,9 +1264,9 @@ class _ElementwiseLayout(_Layout):
                 name,
                 "elementwise",
                 "elementwise.same-shape",
-                f"{_label(v)} does not have the shape {_shape_text(self.shape)} of {_label(widest)}, nor its trailing axes: the "
-                "elementwise template does not broadcast other shapes (an operand over the leading axes, a [T, D] operand of a "
-                "[K, T, D] kernel, and python and const scalars do)",
+                f"{_label(v)} does not broadcast to the shape {_shape_text(self.shape)} of {_label(widest)}: the elementwise template "
+                "broadcasts an operand whose every axis is 1 or the kernel's (numpy's rules, the shapes aligned on their last axes: a [T, D] "
+                "operand of a [K, T, D] kernel, a [K, 1, D] one), and python and const scalars",
             )
         for v in [*(p for p in graph.inputs if p.access != "in"), *graph.outputs]:
             if v in self.broadcast:
@@ -1254,13 +1278,23 @@ class _ElementwiseLayout(_Layout):
                     f"{_shape_text(self.shape)}: every lane that maps onto one of its elements would write it. What is written has the kernel's shape",
                 )
         for n in graph.nodes:
-            if n.op in ("gather_rows", "scatter_rows", "iota") and any(o in self.broadcast for o in (*n.outputs, *n.inputs) if isinstance(o, Value)):
+            if n.op in ("gather_rows", "scatter_rows") and any(o in self.broadcast for o in (*n.outputs, *n.inputs) if isinstance(o, Value)):
                 raise _fail(
                     name,
                     "elementwise",
                     "elementwise.broadcast-index",
-                    f"{n}: a gather, a scatter or an iota of a broadcast shape is not lowered here; give it the kernel's shape {_shape_text(self.shape)}",
+                    f"{n}: a gather or a scatter of a broadcast shape is not lowered here; give it the kernel's shape {_shape_text(self.shape)}",
                 )
+        # the kernel axes whose sizes a coordinate needs (see coordinate): those after a run of axes, and the run's own unless it starts at 0
+        r = len(self.shape)
+        runs = [run for kept in self.general.values() for run in _runs(kept)]
+        runs += [(r - n.outputs[0].type.rank,) * 2 for n in graph.nodes if n.op == "iota" and n.outputs[0] in self.broadcast]
+        size_axes: set[int] = set()
+        for a, b in runs:
+            size_axes.update(range(b + 1, r))
+            if a > 0:
+                size_axes.update(range(a, b + 1))
+        self.size_axes = sorted(k for k in size_axes if not self.shape[k].folded().is_static)
         self.total = _product(self.shape)
 
     def extras(self, names: _Names, taken_dims: "set[str]") -> "list[_Extra]":
@@ -1283,19 +1317,63 @@ class _ElementwiseLayout(_Layout):
         self.counts: dict[str, str] = {}
         bcast: list[_Extra] = []
         for v in self.broadcast:
-            if not v.is_param:
+            if not v.is_param or v in self.general:  # a general broadcast operand is read at its coordinates' offset: no count
                 continue
             nm = self.broadcast[v] = names.fresh(f"{v.name}_n")
             total = _product(v.type.shape)
             dim = total if total is not None else Dim(nm)
             bcast.append(_Extra(nm, False, Param(nm, 0, "dim", dim=dim)))
             self.counts[nm] = v.name
+        # the sizes of the kernel axes a coordinate needs: one runtime i32 per distinct symbolic size (a static one is written as a number)
+        self.size_names: dict[int, str] = {}
+        sizes: list[_Extra] = []
+        by_expr: dict[DimExpr, str] = {}
+        for k in self.size_axes:
+            d = self.shape[k].folded()
+            if d not in by_expr:
+                nm = by_expr[d] = names.fresh(f"size_{d.name}" if isinstance(d, Dim) else f"size{k}")
+                sizes.append(_Extra(nm, False, Param(nm, 0, "dim", dim=d)))
+            self.size_names[k] = by_expr[d]
         return [
             _Extra(self.n_name, False, Param(self.n_name, 0, "dim", dim=self.n_dim)),
             _Extra(self.BLOCK_name, True, _const_param(self.BLOCK_name, ELEMENTWISE_BLOCK)),
             *bcast,
+            *sizes,
             *self.table_extras(names),
         ]
+
+    def _size(self, axes: "Iterable[int]") -> str:
+        """The product of the kernel's sizes along ``axes`` as Triton source: the static ones folded into one number, the symbolic ones the
+        names of their runtime ``i32`` parameters (``"4 * size_L"``; ``"1"`` for none)."""
+        static, symbolic = 1, []
+        for k in axes:
+            d = self.shape[k].folded()
+            if d.is_static:
+                static *= d.value
+            else:
+                symbolic.append(self.size_names[k])
+        return " * ".join(([str(static)] if static != 1 or not symbolic else []) + symbolic)
+
+    def coordinate(self, lane: str, first: int, last: int) -> str:
+        """The index of the lane ``lane`` along the kernel axes ``first`` to ``last`` taken as one axis (row-major): ``(lane // inner) % size``,
+        without the division for the last axes and without the remainder for the first ones (a lane is below the element count)."""
+        inner = self._size(range(last + 1, len(self.shape)))
+        out = lane if inner == "1" else f"{lane} // ({inner})" if " * " in inner else f"{lane} // {inner}"
+        if first > 0:
+            size = self._size(range(first, last + 1))
+            out = (f"({out})" if out != lane else out) + (f" % ({size})" if " * " in size else f" % {size}")
+        return out
+
+    def broadcast_offset(self, v: Value, lane: str) -> str:
+        """The element of the general broadcast operand ``v`` that the lane ``lane`` reads (note 12): the sum, over each run of the axes ``v`` has,
+        of the lane's coordinate along the run times ``v``'s own stride there (the product of its sizes after the run)."""
+        kept = self.general[v]
+        terms = []
+        for a, b in _runs(kept):
+            coord = self.coordinate(lane, a, b)
+            stride = self._size(k for k in range(b + 1, len(self.shape)) if kept[k])
+            terms.append(coord if stride == "1" else f"({coord}) * {stride}")
+        return " + ".join(terms) if terms else "0"
 
     def row_mask(self, v: Value, ok: "str | None") -> "str | None":
         return self.mask if ok is None else f"{self.mask} & {ok}"
@@ -1317,11 +1395,18 @@ class _ElementwiseLayout(_Layout):
             f"grid {_grid_text(self.grid)}, BLOCK = {ELEMENTWISE_BLOCK}",
         ]
         for v, count in self.broadcast.items():
-            if v.is_param:
+            if v.is_param and v in self.general:
+                lines.append(
+                    f"'{v.name}' {_shape_text(v.type.shape)} broadcasts over the axes where it has size 1: lane o reads its element "
+                    f"{self.broadcast_offset(v, 'o')}"
+                )
+            elif v.is_param:
                 lines.append(f"'{v.name}' {_shape_text(v.type.shape)} broadcasts over the leading axes: lane o reads its element o % {count}")
         return lines
 
     def load(self, p: str, v: Value) -> str:
+        if v in self.general:
+            return f"tl.load({p} + ({self.broadcast_offset(v, self.offs)}), mask={self.mask}, other=0)"
         if v in self.broadcast:
             return f"tl.load({p} + {self.offs} % {self.broadcast[v]}, mask={self.mask}, other=0)"
         return f"tl.load({p} + {self.offs}, mask={self.mask}, other=0)"
@@ -1333,7 +1418,60 @@ class _ElementwiseLayout(_Layout):
         raise AssertionError("the elementwise template has no reductions")
 
     def iota(self, v: Value) -> str:
-        return self.offs  # the result has the kernel's shape, which is rank 1 (every other iota is broadcast, which this template refuses)
+        if v not in self.broadcast:
+            return self.offs  # the result has the kernel's shape, which is then rank 1
+        # [S, 1, ..., 1] aligned on the kernel's last axes: the lane's coordinate along kernel axis k (note 12)
+        k = len(self.shape) - v.type.rank
+        if _is_one(v.type.shape[0]) and not _is_one(self.shape[k]):
+            return f"{self.offs} * 0"  # an axis of size 1: every lane is at index 0
+        return self.coordinate(self.offs, k, k)
+
+
+def _kept_axes(shape: "tuple[DimExpr, ...]", kernel: "tuple[DimExpr, ...]") -> "list[bool] | None":
+    """Whether an operand of ``shape`` broadcasts to ``kernel`` (numpy's rules: aligned on the last axes, an axis of size 1 or a missing leading axis
+    repeats) and, if so, per axis of ``kernel``, whether the operand has it (its size is the kernel's) or repeats along it. ``None``: it does not."""
+    r, s = len(kernel), len(shape)
+    if s > r:
+        return None
+    out = []
+    for k in range(r):
+        j = k - (r - s)
+        if j < 0:
+            out.append(False)
+        elif shape[j] == kernel[k]:
+            out.append(True)
+        elif _is_one(shape[j]):
+            out.append(False)
+        else:
+            return None
+    return out
+
+
+def _is_suffix(kept: "list[bool]", kernel: "tuple[DimExpr, ...]") -> bool:
+    """Whether the axes an operand has are the kernel's last ones (an axis of size 1 of the kernel counts either way): the operand is then read
+    at the lane's index modulo its own element count."""
+    seen = False
+    for has, d in zip(kept, kernel):
+        if _is_one(d):
+            continue
+        if has:
+            seen = True
+        elif seen:
+            return False
+    return True
+
+
+def _runs(kept: "list[bool]") -> "list[tuple[int, int]]":
+    """The maximal runs ``(first, last)`` of the axes an operand has."""
+    out: list[tuple[int, int]] = []
+    start = None
+    for k, has in enumerate([*kept, False]):
+        if has and start is None:
+            start = k
+        elif not has and start is not None:
+            out.append((start, k - 1))
+            start = None
+    return out
 
 
 def _product(shape: "tuple[DimExpr, ...]") -> "DimExpr | None":

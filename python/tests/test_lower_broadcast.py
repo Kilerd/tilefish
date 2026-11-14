@@ -46,22 +46,24 @@ def test_a_broadcast_operand_is_never_written_or_indexed():
     def returns(y: Tensor[M, N, D, f32], z: Tensor[N, D, f32]) -> tuple[Tensor[M, N, D, f32], Tensor[N, D, f32]]:
         return y + z, z + 1.0
 
-    @tilefish.kernel
-    def counts(y: Tensor[M, N, D, f32], z: Tensor[N, D, f32]) -> Tensor[M, N, D, i32]:
-        return (y + z > 0.0).to(i32) + tilefish.iota(z, axis=1)
+    V = Dim("V")
 
-    for k, rule in ((writes, "elementwise.broadcast-write"), (returns, "elementwise.broadcast-write"), (counts, "elementwise.broadcast-index")):
+    @tilefish.kernel
+    def gathers(y: Tensor[M, N, D, f32], table: Tensor[V, f32], idx: Tensor[N, D, i32]) -> Tensor[M, N, D, f32]:
+        return y + tilefish.gather_rows(table, idx, oob="zero")
+
+    for k, rule in ((writes, "elementwise.broadcast-write"), (returns, "elementwise.broadcast-write"), (gathers, "elementwise.broadcast-index")):
         with pytest.raises(TilefishLoweringError) as e:
             k.lower(template="elementwise")
         assert e.value.rule == rule, k.name
 
 
-def test_other_shapes_still_do_not_broadcast():
+def test_a_shape_that_does_not_broadcast_fits_no_template():
     @tilefish.kernel
-    def middle(y: Tensor[M, N, D, f32], z: Tensor[M, 1, D, f32]) -> Tensor[M, N, D, f32]:
-        return y * z
+    def two(y: Tensor[M, N, D, f32], z: Tensor[M, 3, f32]) -> tuple[Tensor[M, N, D, f32], Tensor[M, 3, f32]]:
+        return y * 2.0, z * 2.0
 
     with pytest.raises(TilefishLoweringError) as e:
-        middle.lower()
+        two.lower()
     assert e.value.rule == "no-template"
-    assert "does not broadcast other shapes" in str(e.value)
+    assert "parameter 'z' (Tensor[M, 3, f32]) does not broadcast to the shape [M, N, D]" in str(e.value)

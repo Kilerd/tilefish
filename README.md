@@ -291,7 +291,10 @@ A real model needs four things that a dense, compiled-in, Triton-only operator c
 
 **Strided views.** A tensor type has element strides and an element offset, in the dimension algebra (`TensorType.strides`, `.offset`); dense
 and 16-byte aligned (`contiguous`) is the default. `x.reshape(M, 3, H, D)` (a dense input), `x.permute(1, 0, 2)`, `x[:, 1]` / `x.select(axis, i)` and
-`x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A view is a `View[...]` and can go into traced
+`x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A stride or an offset may be a product of
+symbolic sizes: an `[H, L, L]` tensor has the stride `L*L` along its first axis, and `x[h]` the offset `h*L*L` (`tilefish.dims.mul`; the declared
+language stays affine, a shape of `L * L` is still refused), which a `Strided[...]` argument binds and a plan evaluates at every bucket, so attention
+scores `[H, L, L]` are a buffer of a plan and their transposes and heads are views of it. A view is a `View[...]` and can go into traced
 elementwise and reduction ops; a declared operator takes one only where its parameter says so. Every other tensor parameter (and result) of a kernel,
 extern, library op or graph is contiguous: an annotation that is a `TensorType` with other strides, an offset or no alignment is refused at the
 declaration, and a launch refuses a tensor that is not contiguous for such a parameter. An `extern` parameter `x: Strided[Tensor[S, H, D, bf16]]`
@@ -521,7 +524,10 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   bits, with the out-of-range policy declared at the call.
 - `x.to(bf16, nan="preserve")` keeps a NaN's sign and payload (the default, `"canonical"`, gives `0x7FFF`); `tilefish.sin` and `tilefish.cos`
   are libdevice's, built with flush-to-zero like every libdevice function Triton links.
-- The elementwise template broadcasts an operand over the leading axes (a `[T, D]` table added to a `[K, T, D]` batch).
+- The elementwise template broadcasts an operand over the leading axes (a `[T, D]` table added to a `[K, T, D]` batch), and along any axis by
+  numpy's rules (a `[H, 1, L]` mask of the keys over `[H, L, L]` scores, a `[K, T, 1]` scale per row): such an operand is read at the offset of the
+  lane's coordinates, and `tilefish.iota(x, axis)` is the lane's coordinate along any axis (a causal mask is `iota(s, 2) <= iota(s, 1)`). The sizes the
+  coordinates need are runtime scalars of the dimensions, so one binary serves every size (note 12).
 - In a graph, `tilefish.contiguous(view)` and `tilefish.im2col(x, kernel, stride, padding)` are ops whose Triton tilefish generates, reading
   a strided view: a materialised permutation, and convolution patches with channel-major columns and `+0.0` padding.
   `tilefish.im2col1d(x, kernel, stride=, dilation=, padding=, order="channel" | "tap")` gives the patches of a 1-D convolution of `[N, C, L]` as

@@ -410,8 +410,16 @@ def test_the_elementwise_template_broadcasts_trailing_axes_only_when_the_row_tem
     def per_row(x: Tensor[M, D, f32], s: Tensor[M, 1, f32]) -> Tensor[M, D, f32]:
         return x * s
 
-    err = fails(per_row, "elementwise.same-shape", template="elementwise", contains=["does not broadcast", "parameter 's'"])
-    assert "kernel 'per_row' with the elementwise template" in str(err)
+    assert per_row.lower().template == "row"  # the row template takes a per-row value
+    # forced, the elementwise template reads s at the lane's row (note 12)
+    assert f"tl.load(s + (offs // {D.value}), mask=mask, other=0)" in per_row.lower(template="elementwise").source
+
+    @tilefish.kernel
+    def other(x: Tensor[M, D, f32], s: Tensor[M, 2, f32]) -> tuple[Tensor[M, D, f32], Tensor[M, 2, f32]]:
+        return x * 2.0, s * 2.0
+
+    err = fails(other, "elementwise.same-shape", template="elementwise", contains=["does not broadcast", "parameter 's'"])
+    assert "kernel 'other' with the elementwise template" in str(err)
     # a scalar is not a broadcast
     @tilefish.kernel
     def scalar(x: Tensor[M, D, f32]) -> Tensor[M, D, f32]:
@@ -420,12 +428,19 @@ def test_the_elementwise_template_broadcasts_trailing_axes_only_when_the_row_tem
     assert scalar.lower(template="elementwise").template == "elementwise"
 
 
-def test_row_vector_and_per_row_values_do_not_fit_elementwise():
+def test_row_vector_and_per_row_values_fit_elementwise_as_broadcasts():
     @tilefish.kernel
     def per_row(x: Tensor[M, D, f32], s: Tensor[M, 1, f32]) -> Tensor[M, D, f32]:
         return x * s
 
-    fails(per_row, "elementwise.same-shape", template="elementwise")
+    assert per_row.lower(template="elementwise").template == "elementwise"
+
+    @tilefish.kernel
+    def row_vector(x: Tensor[M, D, f32], w: Tensor[1, D, f32]) -> Tensor[M, D, f32]:
+        return x * w
+
+    low = row_vector.lower()  # [1, D] is no shape of the row template: the elementwise template reads it modulo its count, as [D]
+    assert low.template == "elementwise" and "tl.load(w + offs % w_n, mask=mask, other=0)" in low.source
 
 
 def test_reduction_over_a_non_last_axis_is_rejected():

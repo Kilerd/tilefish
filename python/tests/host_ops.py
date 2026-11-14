@@ -224,6 +224,16 @@ def generated_ops():
     }
 
 
+def broadcast_ops():
+    """``{name: kernel}``: lowered kernels of ``broadcast_cases.py`` that read an operand broadcast along an axis that is not a leading one, whose
+    binaries take the sizes the lane's coordinates need as runtime scalars of the dimensions: ``key_mask_heads`` (a ``[4, 1, L]`` mask over
+    ``[4, L, L]`` scores, whose stride is ``L*L``), ``middle_rows`` (``[K, 1, D]`` over ``[K, T, D]``) and ``causal_heads`` (an ``iota`` along two axes).
+    The committed fixtures do not have them."""
+    import broadcast_cases as bc
+
+    return {"key_mask_heads": bc.key_mask_heads, "middle_rows": bc.middle_rows, "causal_heads": bc.causal_heads}
+
+
 def gemm_name(n, k, bias):
     return f"gemm_{n}_{k}{'_bias' if bias else ''}"
 

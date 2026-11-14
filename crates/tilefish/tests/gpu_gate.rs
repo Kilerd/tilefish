@@ -1409,6 +1409,48 @@ fn the_gate_has_generated_ops() {
     }
 }
 
+/// Lowered kernels that read an operand broadcast along an axis that is not a leading one (`python/tests/broadcast_cases.py`, `host_ops.broadcast_ops`):
+/// a `[4, 1, L]` mask of the keys over `[4, L, L]` scores, a `[K, 1, D]` row over `[K, T, D]` and a causal mask from the lane's coordinates. The lane's
+/// offset in the operand needs the sizes of the kernel's axes, which the binary takes as runtime scalars of the dimensions (`size_L` is the
+/// dimension `L`): the Rust host derives them from the shapes like any dimension scalar, and `byte_identity` holds the bytes to Python's (which
+/// `rust_gate.py` holds to torch's broadcasting). A committed fixture has none.
+#[test]
+fn the_gate_has_broadcasts_along_any_axis() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no broadcast along a middle axis");
+        return;
+    }
+    let arch = cases["arch"].as_str().unwrap().to_owned();
+    let manifest = manifest();
+    for (stem, sizes) in [
+        ("key_mask_heads", &["size_L"][..]),
+        ("middle_rows", &["size_T", "size_D"][..]),
+        ("causal_heads", &["size_L"][..]),
+    ] {
+        let entry = manifest.entry(stem, &arch).unwrap_or_else(|| panic!("the gate's manifest has no {stem}"));
+        for name in sizes {
+            match &entry.param(name).unwrap_or_else(|| panic!("{stem}: no {name}")).kind {
+                tilefish::ParamKind::Scalar { ty, dim, count_of, stride_of } => {
+                    assert_eq!(
+                        (*ty, dim.as_str()),
+                        (tilefish::ScalarType::I32, &name[5..]),
+                        "{stem}: {name} is the dimension"
+                    );
+                    assert!(
+                        count_of.is_none() && stride_of.is_empty(),
+                        "{stem}: {name} is a dimension, not a count or a stride"
+                    );
+                }
+                other => panic!("{stem}: {name} is {other:?}"),
+            }
+        }
+        let n = cases_where(&cases, |c| c["stem"] == stem).len();
+        assert!(n >= 3, "{stem}: {n} cases");
+        println!("rust gate: the broadcast along a middle axis {stem}: {n} cases");
+    }
+}
+
 /// The GEMMs of the forms of section 9.2 of the manifest schema (on a fresh export): f16 operands in TN (with 64 MiB of workspace) and in NN (with a
 /// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN, f16 operands pinned for a partition of 16 SMs
 /// (`sm_count_target`: the Rust host sets it on every launch, and a host on a partition takes only the pins chosen for it), and f32 operands with

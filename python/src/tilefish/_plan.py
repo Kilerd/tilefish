@@ -270,7 +270,7 @@ def _fail(graph: str, message: str) -> Any:
 def _layout(graph: str, what: str, t: Any) -> "tuple[tuple[DimExpr, ...], DimExpr]":
     strides = t.layout_strides()
     if any(s is None for s in strides) or t.offset is None:
-        _fail(graph, f"{what} has the type {t}, whose strides or offset are not affine expressions (a product of two symbolic dimensions), so it cannot be planned")
+        _fail(graph, f"{what} has the type {t}, a view whose strides or offset are unknown, so it cannot be planned")
     return tuple(strides), t.offset  # type: ignore[arg-type]
 
 
@@ -391,21 +391,16 @@ def _walk(gop: GraphOp) -> _Walk:
                 "contiguous row-major tensor, and a run checks that it is one (a parameter that is a view is declared Strided[...], which a graph does not take)",
             )
         b = new_buffer(role, v.type.dtype, v.type.shape, v.name)
-        strides = row_major_strides(v.type.shape)
-        if any(s is None for s in strides):
-            _fail(name, f"the parameter '{v.name}' has the type {v.type}, whose strides are not affine expressions, so it cannot be planned")
-        loc[v] = _Loc(b, tuple(v.type.shape), tuple(strides), DimExpr.const(0), True)  # type: ignore[arg-type]
+        loc[v] = _Loc(b, tuple(v.type.shape), row_major_strides(v.type.shape), DimExpr.const(0), True)  # type: ignore[arg-type]
 
     def fresh(value: Value, role: str = "intermediate") -> _Loc:
         t = value.type
         if isinstance(t.dtype, BlockScaled):
             _fail(name, f"{value.ref} is block-scaled ({t}); block-scaled tensors are not planned yet")
         b = new_buffer(role, t.dtype, t.shape, "")
-        strides = row_major_strides(t.shape)
-        if any(s is None for s in strides):
-            _fail(name, f"{value.ref} has the type {t}, whose strides are not affine expressions, so it cannot be planned")
         b.version = 1  # the step that makes it writes it once
-        return _Loc(b, tuple(t.shape), tuple(strides), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
+        # (the row-major strides of [H, L, L] are (L*L, L, 1): a product of sizes, which the plan writes per bucket as a number)
+        return _Loc(b, tuple(t.shape), row_major_strides(t.shape), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
 
     for index, n in enumerate(g.nodes):
         kind = n.attrs.get("kind")
@@ -530,10 +525,7 @@ def _walk(gop: GraphOp) -> _Walk:
             outputs.append(l.buffer)
         else:  # a parameter, a part of a tensor, a value returned twice: a copy step at the end into a buffer of the caller's
             out = new_buffer("output", v.type.dtype, tuple(v.type.shape), "")
-            strides = row_major_strides(v.type.shape)
-            if any(s is None for s in strides):
-                _fail(name, f"the returned value {v.ref} has the type {v.type}, whose strides are not affine expressions, so it cannot be planned")
-            dst = _Loc(out, tuple(v.type.shape), tuple(strides), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
+            dst = _Loc(out, tuple(v.type.shape), row_major_strides(v.type.shape), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
             steps.append(_SymStep(None, [_Arg("src", l, "in"), _Arg("dst", dst, "out")], f"the return of {v.ref} ({v.type})", copy=True))
             outputs.append(out)
     if any(s.library for s in steps):

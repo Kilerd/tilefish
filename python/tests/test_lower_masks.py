@@ -12,7 +12,7 @@ import pytest
 from test_lower import check_golden
 
 import tilefish
-from tilefish import DevScalar, Dim, InOut, Out, Tensor, TilefishDeclarationError, TilefishLoweringError, TilefishTypeError
+from tilefish import DevScalar, Dim, InOut, Out, Tensor, TilefishDeclarationError, TilefishTypeError
 from tilefish import bf16, bool_, const, e4m3, f16, f32, i32, i64, u8
 from tilefish.aot import compile_specs
 from tilefish.lower import _round_float
@@ -181,9 +181,9 @@ def test_the_elementwise_template_counts_the_flat_index():
 def test_a_broadcast_iota_goes_to_the_row_template():
     low = mc.mask_rows.lower()
     assert low.template == "row"
-    with pytest.raises(TilefishLoweringError) as e:
-        tilefish.lower(mc.mask_rows, template="elementwise")
-    assert e.value.rule == "elementwise.same-shape"
+    # forced, the elementwise template counts the rows from the lane's coordinates (note 12): the row of lane o is o // D
+    forced = tilefish.lower(mc.mask_rows, template="elementwise")
+    assert "v1 = offs // 96" in forced.source and "size_" not in forced.source  # D = 96 is static: no size parameter
 
 
 def test_scalars_of_comparisons_and_selects_are_typed_constants_rounded_to_their_dtype():

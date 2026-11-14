@@ -177,7 +177,9 @@ An argument is `{"name": <string>, "binding": <buffer name>}` and optionally `"v
 * `view` is `{"shape": [...], "strides": [...], "offset": n}`: `shape` a list of integers >= 1, `strides` a list of integers >= 0 of the same length, `offset` an integer >= 0, **in elements
   of the buffer's dtype**. Without a `view` the argument is **the whole buffer**: the buffer's shape at the bucket, the row-major strides, offset 0. A view must lie inside its
   buffer: `offset + 1 + sum((shape[a] - 1) * strides[a]) <= product(buffer shape at the bucket)`. The writer of a plan (Python) omits `view` exactly when the argument is the whole
-  buffer; a reader accepts a view that equals the whole buffer too. A device scalar is bound whole, with no `view`.
+  buffer; a reader accepts a view that equals the whole buffer too. A device scalar is bound whole, with no `view`. The numbers are the view's at the bucket, whatever the
+  expressions they come from: a buffer of shape `[4, "L", "L"]` (each entry an affine form, section 5) has the stride `L*L` along its first axis, a product of two sizes that no
+  shape entry writes, and its transpose is `"strides": [576, 1, 24]` at `L = 24` (Python 0.0.5 refused to plan such a buffer; nothing changes for a reader).
 
 **The pointer of an argument is `address(buffer) + view.offset * itemsize(buffer dtype)`**, where `address(buffer)` is the address of the external tensor, or `arena + buffer.offset`.
 
@@ -481,6 +483,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | the walk, the steps and views, the buffers, roles, buckets, the refusals of section 12 | `test_plan.py` |
 | a step that reads three views with one stride pair; a step whose dimension only its `Out` buffer has (section 5) | `test_shared_strides.py`, `test_output_dims.py`; on a GPU `test_gpu_shared_strides.py`, `test_gpu_output_dims.py` |
 | a result written over its input (`MayAlias`, section 8) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
+| buffers whose strides are products of sizes (`[4, Lb, Lb]`: views at a stride and an offset of `Lb*Lb`, section 7.1) | `test_product_strides.py`; on a GPU `test_gpu_product_strides.py`; the Rust gate's plan `product_strides` (`gpu_plan_gate.rs`) |
 | copy steps (`tilefish.copy`, a store into an `InOut` parameter; section 7.5) | `test_plan_copy.py`; on a GPU `test_gpu_plan_copy.py`; the Rust reader: `python_plans.json` (`copy ...` documents) |
 | returned views and parameters (section 12) | `test_plan_returns.py`; on a GPU `test_gpu_plan_returns.py` |
 | one step alone (section 9) | `test_plan_step.py`; on a GPU `test_gpu_plan_step.py` and `gpu_plan_gate.rs` (`the_steps_launched_one_by_one_give_the_bytes_of_the_plan`) |

@@ -35,11 +35,12 @@ def test_a_fresh_tensor_is_dense_at_offset_zero_and_contiguous():
     assert t.layout_text() == "strides (512, 64, 1), offset 0"
 
 
-def test_row_major_strides_of_symbolic_shapes_are_unknown_where_they_are_not_affine():
+def test_row_major_strides_of_symbolic_shapes_are_products_where_two_sizes_are_symbolic():
     assert [str(s) for s in row_major_strides(Tensor[M, 4, 8, f32].shape)] == ["32", "8", "1"]
-    # A * B is not an affine expression: the stride of the first axis of [X, A, B] is unknown, the others are not
+    # A * B is not an affine expression: the stride of the first axis of [X, A, B] is a product atom, which a plan evaluates per bucket
     strides = row_major_strides(Tensor[M, A, B, f32].shape)
-    assert strides[0] is None and str(strides[1]) == "B" and str(strides[2]) == "1"
+    assert str(strides[0]) == "A*B" and str(strides[1]) == "B" and str(strides[2]) == "1"
+    assert strides[0] == row_major_strides(Tensor[M, B, A, f32].shape)[0]  # the factors are sorted: B*A is A*B
 
 
 def test_explicit_strides_equal_to_the_row_major_ones_are_the_default():

@@ -89,7 +89,7 @@ from typing import Any, Callable
 
 import torch
 from gpu_util import randn, same_bytes
-from host_ops import GEMM_SHAPES, abi_of, gemm_name, generated_ops, gluon_ops, gpu_ops, library_ops, ops, per_arch_ops
+from host_ops import GEMM_SHAPES, abi_of, broadcast_ops, gemm_name, generated_ops, gluon_ops, gpu_ops, library_ops, ops, per_arch_ops
 
 import tilefish
 from tilefish import runtime
@@ -110,7 +110,7 @@ MASKED_N = (0, 1, 5, 17, 63, 64, 40)
 SCALES = (0.5, -3.25, 1e-3)
 GEMM_M = (32, 64, 320)
 
-DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32", torch.int32: "i32"}
+DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32", torch.int32: "i32", torch.uint8: "u8"}
 TORCH_OF = {v: k for k, v in DTYPES.items()}
 
 
@@ -419,6 +419,38 @@ def must_be_col2im(op, k, s, d, pad, extra, order, layout):
     return check
 
 
+def keep_mask(shape, seed):
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(seed)
+    return torch.randint(0, 2, shape, generator=gen, device="cuda", dtype=torch.uint8)
+
+
+def args_heads(length, seed):
+    """Scores ``[4, length, length]`` (the stride ``length * length``) and a mask of the keys per head, ``[4, 1, length]``."""
+    return randn((4, length, length), F32, seed + length), keep_mask((4, 1, length), seed + length)
+
+
+def must_mask_keys(args, got):
+    s, keep = args
+    assert same_bytes(got, torch.where(keep != 0, s, float("-inf")))
+
+
+def args_middle(spec, seed):
+    k, t, d = spec
+    return randn((k, t, d), BF16, seed + t), randn((k, 1, d), BF16, seed + t + 1)
+
+
+def must_scale_the_middle(args, got):
+    x, z = args
+    assert same_bytes(got, (x.float() * z.float()).to(BF16))
+
+
+def must_be_causal(args, got):
+    (s,) = args
+    i = torch.arange(s.shape[-1], device=s.device)
+    assert same_bytes(got, torch.where(i[None, :] <= i[:, None], s, float("-inf")))
+
+
 def given_ops():
     """``{name: extern}``: a prebuilt PTX whose ``k: const[i32]`` and ``c: const[i64]`` every call gives (``gpu_kernels_p6.scale_add``). Not in the committed
     fixtures, so only a fresh export has it."""
@@ -566,6 +598,10 @@ def build_cases():
     op = generated_ops()["col2im1d_tap"]
     sizes = [(1, 1, "contiguous"), (2, 19, "transposed"), (3, 40, "transposed"), (2, 25, "offset")]
     cases += plain("col2im1d_tap", op.name, args_cols(BF16, 64, 7, False), sizes, seeds=(0,), check=must_be_col2im(op, 7, 3, 2, (2, 5), 1, "tap", "nlc"))
+    # -- broadcasts along any axis: a mask of the keys per head over [4, L, L], a row per chunk over the middle axis, a causal mask from coordinates
+    cases += plain("key_mask_heads", "key_mask_heads", args_heads, (1, 7, 33, 130), seeds=(0,), check=must_mask_keys)
+    cases += plain("middle_rows", "middle_rows", args_middle, ((1, 1, 1), (2, 5, 7), (3, 40, 64)), seeds=(0,), check=must_scale_the_middle)
+    cases += plain("causal_heads", "causal_heads", lambda length, seed: args_heads(length, seed)[:1], (1, 7, 33), seeds=(0,), check=must_be_causal)
     return cases
 
 
@@ -786,6 +822,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(generated_ops())
         declared.update(f16_ops())
         declared.update(tma_ops())
+        declared.update(broadcast_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -1000,6 +1037,18 @@ def plan_graphs():
             ("tma_view", tk.tma_view, False, tma_view_cases),
         ]
 
+    import gpu_kernels_p7 as p7
+
+    def attention_mask_cases():
+        return [
+            (
+                f"Lb{lb}-seed{seed}",
+                {"q": randn((4, lb, 1), F32, seed=100 + lb + seed), "k": randn((4, 1, lb), F32, seed=200 + lb + seed), "keep": keep_mask((4, 1, lb), lb + seed)},
+            )
+            for lb in (8, 24)
+            for seed in (0, 1)
+        ]
+
     return [
         ("block", pm.block, False, block_cases),
         ("block-reuse", pm.block, True, block_cases),
@@ -1018,6 +1067,9 @@ def plan_graphs():
         ("weighted", p6.static_affine, False, weighted_cases),  # a static graph that declares its roles: weights bound once (PlanRun::bind_weights)
         ("given_steps", p6.two_scales, False, given_cases),  # one prebuilt binary, two steps with the values each call gives (one of them the bucket's)
         ("strided_returns", p6.strided_returns, False, given_cases),  # a transpose and a column block materialised by tilefish.contiguous, a row copied
+        # [4, Lb, Lb] buffers (the stride Lb*Lb): broadcasts along the middle axis, a transpose to tilefish.contiguous, a head at the offset Lb*Lb
+        ("product_strides", p7.attention_mask, False, attention_mask_cases),
+        ("product_strides-reuse", p7.attention_mask, True, attention_mask_cases),
     ] + tma
 
 

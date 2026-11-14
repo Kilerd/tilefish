@@ -127,11 +127,15 @@ def test_symbolic_chunks_need_provable_divisibility(tr):
     assert flags(tr.val(Tensor[2 * known, 3, f32]).split(known, axis=0)) == [True, True]
 
 
-def test_a_product_of_symbolic_dims_is_never_provably_aligned(tr):
+def test_a_product_of_symbolic_dims_is_aligned_by_what_its_factors_prove(tr):
     x = tr.val(Tensor[A + B, C, bf16])
-    assert flags(x.split([A, B], axis=0)) == [True, False]  # the offset A*C is not affine
+    assert flags(x.split([A, B], axis=0)) == [True, False]  # the offset A*C: nothing is known of A or C
     c8 = Dim("c8", divisible_by=8)
-    assert flags(tr.val(Tensor[A + B, c8, bf16]).split([A, B], axis=0)) == [True, False]
+    assert flags(tr.val(Tensor[A + B, c8, bf16]).split([A, B], axis=0)) == [True, True]  # A*c8: a multiple of 8 bf16, 16 bytes
+    c4 = Dim("c4", divisible_by=4)
+    assert flags(tr.val(Tensor[A + B, c4, bf16]).split([A, B], axis=0)) == [True, False]  # 8 bytes
+    a2 = Dim("a2", divisible_by=2)
+    assert flags(tr.val(Tensor[a2 + B, c4, bf16]).split([a2, B], axis=0)) == [True, True]  # a2*c4: 2 * 4 bf16
 
 
 def test_chunks_along_a_later_axis_after_size_one_dims(tr):

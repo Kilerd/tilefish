@@ -10,7 +10,8 @@ The view operations (:func:`split`, :func:`reshape`, :func:`permute`, :func:`sel
 :class:`~tilefish.types.TensorType` with the strides and the element offset of the view, in the dimension algebra. A view
 that is dense and provably starts on a 16-byte boundary is a contiguous tensor (it can be passed anywhere a ``Tensor[...]``
 is wanted); any other view is a ``View[...]``, and only a ``Strided[...]`` parameter of an extern takes it. A stride or an
-offset that is not an affine expression (a product of two symbolic dimensions) is unknown, and such a view is opaque.
+offset may be a product of symbolic sizes (``L*L`` for ``x[h]`` of an ``[H, L, L]`` tensor: :func:`tilefish.dims.mul`), which a
+``Strided[...]`` argument and a plan take like any other; only an opaque view (``as_view()``) has an unknown layout.
 """
 
 from __future__ import annotations

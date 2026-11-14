@@ -140,6 +140,9 @@ class DimExpr:
                 out |= atom.num.free_dims() | atom.den.free_dims()
             elif isinstance(atom, _NextPow2):
                 out |= atom.arg.free_dims()
+            elif isinstance(atom, _Prod):
+                for f in atom.factors:
+                    out |= f.free_dims()
         return frozenset(out)
 
     def named_dims(self) -> "dict[str, Dim]":
@@ -432,6 +435,88 @@ class _NextPow2(DimExpr):
         return f"next_pow2({self.arg})"
 
 
+class _Prod(DimExpr):
+    """A product of two or more symbolic dimension expressions (``L*L``, ``(L + 6)*H``): the element stride of a dense ``[H, L, L]`` tensor along
+    its first axis, the offset of ``x[h]`` in it, its element count.
+
+    It is not part of the declared language: a shape, a grid and a ``//`` stay affine (``__mul__`` of two symbolic dimensions raises), and a host
+    never reads one. It exists for what tilefish derives from shapes, the strides and offsets of tensors and views (:func:`mul`), so that a view
+    of an ``[H, L, L]`` tensor and a plan of one have a layout. Its value at a bucket is the product of its factors' values. Each factor is a
+    symbolic affine expression whose coefficients and constant have no common divisor (the integer content is the atom's coefficient), sorted, so
+    two products of the same factors are one atom: ``(2*L)*L == 2*(L*L) == L*(2*L)``.
+    """
+
+    __slots__ = ("factors",)
+
+    def __init__(self, factors: "tuple[DimExpr, ...]") -> None:
+        object.__setattr__(self, "factors", factors)
+        object.__setattr__(self, "_terms", ((self, 1),))
+        object.__setattr__(self, "_const", 0)
+
+    def __reduce__(self) -> Any:
+        return (_Prod, (self.factors,))
+
+    def _atom_key(self) -> tuple:
+        return ("prod", tuple(f._key for f in self.factors))
+
+    def _atom_divisor(self, known: "Mapping[DimExpr, int] | None") -> int:
+        k = (known or {}).get(self, 1)
+        d = 1
+        for f in self.factors:
+            d *= _divisor(f, known)
+        return _lcm(k, d)
+
+    def _subst_atom(self, mapping: "Mapping[Dim, Any]") -> DimExpr:
+        out: DimExpr = DimExpr.const(1)
+        for f in self.factors:
+            out = mul(out, f.subst(mapping))
+        return out
+
+    def __str__(self) -> str:
+        return "*".join(str(f) if f.is_atom else f"({f})" for f in self.factors)
+
+
+def _divisor(d: DimExpr, known: "Mapping[DimExpr, int] | None" = None) -> int:
+    """The largest integer that provably divides ``d`` (``0`` for the constant 0)."""
+    d = d.folded()
+    g = abs(d.offset)
+    for atom, coef in d.terms:
+        g = math.gcd(g, abs(coef) * atom._atom_divisor(known))
+    if known:
+        extra = known.get(d)
+        if extra:
+            g = _lcm(g, extra) if g else extra
+    return g
+
+
+def _content(d: DimExpr) -> "tuple[int, DimExpr]":
+    """``(k, p)`` with ``d == k * p`` and the coefficients and the constant of ``p`` without a common divisor (``k > 0``)."""
+    g = abs(d.offset)
+    for _, coef in d.terms:
+        g = math.gcd(g, abs(coef))
+    if g <= 1:
+        return 1, d
+    return g, DimExpr._make({a: c // g for a, c in d.terms}, d.offset // g)
+
+
+def mul(a: Any, b: Any) -> DimExpr:
+    """``a * b`` of two dimension expressions, also when both are symbolic (then a product atom, see :class:`_Prod`), for strides, offsets and
+    element counts that tilefish derives. A static factor scales as ``*`` does, so an affine result stays affine."""
+    da, db = as_dim(a).folded(), as_dim(b).folded()
+    if da.is_static or db.is_static:
+        return da * db
+    ka, pa = _content(da)
+    kb, pb = _content(db)
+    factors: "list[DimExpr]" = []
+    for p in (pa, pb):
+        if p.is_atom and isinstance(p, _Prod):
+            factors.extend(p.factors)
+        else:
+            factors.append(p)
+    factors.sort(key=lambda f: repr(f._key))
+    return _Prod(tuple(factors)) * (ka * kb)
+
+
 class Dim(DimExpr):
     """A named dimension.
 
@@ -608,6 +693,13 @@ def _atom_bounds(atom: DimExpr) -> "tuple[int, int | None]":
         if atom.buckets:
             return min(atom.buckets), max(atom.buckets)  # a binary exists for these sizes only
         return (atom.divisible_by or 1), None
+    if isinstance(atom, _Prod):
+        lo, hi = 1, 1
+        for f in atom.factors:
+            f_lo, f_hi = dim_bounds(f)
+            lo *= f_lo
+            hi = None if hi is None or f_hi is None else hi * f_hi
+        return lo, hi
     num, den = getattr(atom, "num", None), getattr(atom, "den", None)
     if num is None or den is None:  # pragma: no cover - the other atoms never appear in a shape
         return 1, None

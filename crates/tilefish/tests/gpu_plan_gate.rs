@@ -454,6 +454,26 @@ fn the_steps_launched_one_by_one_give_the_bytes_of_the_plan() {
     assert!(e.to_string().contains("which is not given"), "{e}");
 }
 
+/// A plan over `[4, Lb, Lb]` buffers (`python/tests/gpu_kernels_p7.py`, `attention_mask`): the stride of their first axis is `Lb*Lb`, a product of
+/// two sizes, which the plan writes per bucket as numbers. Rust reads the transpose handed to `tilefish.contiguous` (strides `(Lb*Lb, 1, Lb)`) and the
+/// head copied out (the offset `Lb*Lb`) from the document, and `every_case_launched_and_replayed_is_pythons_bytes` holds the bytes to Python's.
+#[test]
+fn a_plan_has_views_whose_strides_and_offsets_are_products_of_sizes() {
+    let lp = load(&plan_named("product_strides"));
+    for lb in [8usize, 24] {
+        let bucket = lp.bucket(&[("Lb", lb as u64)]).expect("the bucket");
+        let transpose = bucket.steps.iter().find(|s| s.entry.starts_with("contiguous_r3_f32")).expect("the transpose");
+        let view = transpose.args[0].view.as_ref().expect("a view");
+        assert_eq!((&view.shape[..], &view.strides[..], view.offset), (&[4, lb, lb][..], &[lb * lb, 1, lb][..], 0));
+        let copy = bucket.steps.iter().find(|s| s.entry.is_empty()).expect("the copy of the head");
+        let head = copy.args[0].view.as_ref().expect("a view");
+        assert_eq!((&head.shape[..], &head.strides[..], head.offset), (&[lb, lb][..], &[lb, 1][..], lb * lb));
+    }
+    println!(
+        "rust plan gate: the views of a plan whose strides and offsets are products of sizes, as Python wrote them"
+    );
+}
+
 /// The outputs of a plan whose graph names them (`residual_chain`: `y` and `residual`) are given by those names or by `out0`, `out1` (the names
 /// of before), with the same bytes; both names of one output are refused as one external given twice.
 #[test]

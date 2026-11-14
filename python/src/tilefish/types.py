@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence, Union
 
-from .dims import DimExpr, as_dim
+from .dims import DimExpr, as_dim, mul
 from .dtypes import BlockScaled, DType
 from .errors import TilefishDeclarationError, TilefishTypeError
 
@@ -14,17 +14,15 @@ AnyDType = Union[DType, BlockScaled]
 
 
 def _mul(a: "DimExpr | None", b: "DimExpr | None") -> "DimExpr | None":
-    """Product of two affine dimensions, or ``None`` when it is not affine (two symbolic factors) or either is unknown."""
+    """Product of two dimensions, or ``None`` when either is unknown. Two symbolic factors give a product atom (``L*L``, :func:`tilefish.dims.mul`):
+    a stride or an offset of a layout is a product of sizes, which the declared (affine) language does not write but a plan evaluates per bucket."""
     if a is None or b is None:
         return None
-    try:
-        return a * b
-    except TilefishTypeError:
-        return None
+    return mul(a, b)
 
 
 def product(dims: "Sequence[DimExpr]") -> "DimExpr | None":
-    """The product of dimensions, or ``None`` when it is not an affine expression."""
+    """The product of dimensions (a product atom where two factors are symbolic)."""
     out: "DimExpr | None" = DimExpr.const(1)
     for d in dims:
         out = _mul(out, d)
@@ -32,7 +30,7 @@ def product(dims: "Sequence[DimExpr]") -> "DimExpr | None":
 
 
 def row_major_strides(shape: "Sequence[DimExpr]") -> "tuple[DimExpr | None, ...]":
-    """The element strides of a dense row-major tensor of ``shape``; an entry is ``None`` where it is not an affine expression."""
+    """The element strides of a dense row-major tensor of ``shape`` (``[H, L, L]`` has ``(L*L, L, 1)``, the first a product atom)."""
     out: "list[DimExpr | None]" = []
     running: "DimExpr | None" = DimExpr.const(1)
     for d in reversed(tuple(shape)):
@@ -70,9 +68,10 @@ class TensorType:
     The layout is ``strides`` (element strides, dimension expressions) and ``offset`` (the element offset of the first element
     from the start of the allocation the tensor lives in). A tensor that is dense and row-major has ``strides is None``, which is
     the default; ``offset`` is ``0`` for a tensor that owns its allocation. A *view* (``split``, ``permute``, ``select``,
-    ``reshape``) shares the allocation of its parent and has the layout the view operation says. A stride or an offset that is not
-    an affine expression (a product of two symbolic dimensions) is *unknown* (``None``), and a type with an unknown layout can
-    flow into traced elementwise and reduction ops but cannot be passed to a declared operator.
+    ``reshape``) shares the allocation of its parent and has the layout the view operation says. A stride or an offset may be a
+    product of symbolic sizes (the stride ``L*L`` of a dense ``[H, L, L]``: a product atom, :func:`tilefish.dims.mul`, which has a
+    value at every binding of its dimensions). A stride or an offset nothing is known of is *unknown* (``None``, an opaque view), and
+    a type with an unknown layout can flow into traced elementwise and reduction ops but cannot be passed to a declared operator.
 
     ``contiguous`` says the tensor is dense **and** provably starts on a 16-byte boundary: it is what every declared operator's
     pointer arguments are promised to be (the contract of a pointer), so such a tensor can be passed to a parameter written
