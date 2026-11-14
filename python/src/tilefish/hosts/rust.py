@@ -74,7 +74,7 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from .._build import spec_entry, write_file
+from .._build import expected_entry, write_file
 from .._library import IMPLS as LIBRARY_IMPLS
 from .._library import library_specs, validate_entry as validate_library_entry
 from .._manifest import Manifest
@@ -87,13 +87,13 @@ RUST_ELEMENTS = {"bf16": "Bf16", "f16": "F16", "f32": "F32", "i32": "I32", "i64"
 # the size in bytes of an element of each dtype that has a Rust element type: the alignment a strided pointer may promise is 16 or this
 _ITEMSIZE = {"bf16": 2, "f16": 2, "f32": 4, "i32": 4, "i64": 8, "u8": 1, "e4m3": 1, "e5m2": 1}
 
-# what the binaries of one stem must agree on, whatever their architecture
+# what the binaries of one stem must agree on, whatever their architecture (not what the compile gives each: its shared memory, and the block of a
+# kernel that Triton warp-specialises on one architecture and not on another, with its total_num_warps)
 _SHARED_FIELDS = (
     "op",
     "kind",
     "abi",
     "grid",
-    "block",
     "num_warps",
     "num_stages",
     "constexprs",
@@ -480,7 +480,7 @@ def _validate_binary_section(who: str, entry: "dict[str, Any]") -> None:
     digest = entry.get("source_digest")
     if not isinstance(digest, str) or not _DIGEST.fullmatch(digest) or entry.get("source_digest_kind") != "tilefish.binary.v1":
         _bad(who, "a prebuilt binary has the sha256 of its PTX or cubin as source_digest, with source_digest_kind 'tilefish.binary.v1'")
-    for key in ("options", "num_warps", "num_stages"):
+    for key in ("options", "num_warps", "num_stages", "total_num_warps"):
         if key in entry:
             _bad(who, f"a prebuilt binary has no '{key}' (that is a Triton compile setting)")
 
@@ -548,6 +548,15 @@ def _validate_entry(entry: Any) -> None:
     for k, b in enumerate(block):
         _count(who, f"block[{k}]", b, 1)
     _count(who, "shared", entry.get("shared"))
+    total = entry.get("total_num_warps")
+    if total is not None:  # a warp-specialised kernel, as the strict reader reads it: its partitions' warps in all, above its default partition's
+        declared = entry.get("num_warps")
+        if not (type(declared) is int and type(total) is int and declared < total <= 32) or block != [32 * total, 1, 1]:
+            _bad(
+                who,
+                f"total_num_warps must be an int above num_warps and at most 32, with the block [32 * total_num_warps, 1, 1], got {total!r} "
+                f"and {block!r}",
+            )
 
 
 def _validate_library_entry(entry: Any) -> None:
@@ -682,7 +691,7 @@ def _check_declarations(binaries: "list[_Binary]", gemms: "list[_Gemm]", ops: "I
                     f"the declaration of '{extern.name}' has no binary '{binary.stem}' (it has {sorted(specs)}): it is not what the "
                     "manifest was built from"
                 )
-            expected = json.loads(json.dumps(spec_entry(spec)))
+            expected = expected_entry(spec, entry)  # (a warp-specialised binary: the block its build found)
             got = {k: entry.get(k) for k in expected}
             if "implementation" in entry and "implementation" not in expected:
                 got["implementation"], expected["implementation"] = entry["implementation"], None
@@ -730,6 +739,13 @@ def _shape_text(shape: "list[Any]") -> str:
 
 def _block_text(block: "list[int]") -> str:
     return f"{block[0]} threads" if block[1] == block[2] == 1 else f"{block[0]}x{block[1]}x{block[2]} threads"
+
+
+def _warps_text(entry: "dict[str, Any]") -> str:
+    """What the docs add to the block of a warp-specialised kernel: the warps of all its partitions, and those of its default partition (declared)."""
+    if entry.get("total_num_warps") is None:
+        return ""
+    return f" (warp-specialised: {entry['total_num_warps']} warps, {entry['num_warps']} of them in its default partition)"
 
 
 def _pointer_line(binary: _Binary, p: "dict[str, Any]") -> str:
@@ -836,11 +852,15 @@ def _doc(binary: _Binary) -> "list[str]":
         )
         for x in binary.entries:
             lines += _wrap(
-                f"- {x['arch']}: the implementation `{x['implementation']}`, grid `{x['grid']}`, block {_block_text(x['block'])}, {x['shared']} bytes of "
-                "dynamic shared memory" + (", compiled in: " + _constexprs_text(x) if x["constexprs"] else "") + "."
+                f"- {x['arch']}: the implementation `{x['implementation']}`, grid `{x['grid']}`, block {_block_text(x['block'])}{_warps_text(x)}, "
+                f"{x['shared']} bytes of dynamic shared memory" + (", compiled in: " + _constexprs_text(x) if x["constexprs"] else "") + "."
             )
+    elif any(x["block"] != e["block"] for x in binary.entries):  # a kernel that its compile warp-specialises on some architectures only
+        lines.append(f"Grid `{e['grid']}`; the block and the dynamic shared memory of the binary of each architecture:")
+        for x in binary.entries:
+            lines += _wrap(f"- {x['arch']}: block {_block_text(x['block'])}{_warps_text(x)}, {x['shared']} bytes.")
     else:
-        lines.append(f"Grid `{e['grid']}`, block {_block_text(e['block'])}, {e['shared']} bytes of dynamic shared memory.")
+        lines.append(f"Grid `{e['grid']}`, block {_block_text(e['block'])}{_warps_text(e)}, {e['shared']} bytes of dynamic shared memory.")
     if binary.scalars:
         lines.append("")
         plain = all(s["type"] == "i32" and "stride_of" not in s for s in binary.scalars)

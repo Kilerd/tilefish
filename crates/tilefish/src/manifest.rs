@@ -46,6 +46,8 @@ pub(crate) const MAX_ELEMENTS: u64 = (1 << 31) - 1;
 /// Every pointer of a binary is compiled as this many bytes aligned (a strided pointer may promise only its element's size).
 pub(crate) const ALIGNMENT: u64 = 16;
 const NUM_WARPS: [u32; 6] = [1, 2, 4, 8, 16, 32];
+/// The most warps a block has (1024 threads): the bound of the `total_num_warps` of a warp-specialised kernel. Python's `MAX_WARPS`.
+const MAX_WARPS: u32 = 32;
 const MAX_STAGES: u32 = 16;
 /// The `implementation` of an entry built from the fallback of an operator declared with an implementation per architecture (the
 /// implementation declared for an architecture is named by that architecture). Python's `IMPLEMENTATION_FALLBACK`.
@@ -583,12 +585,18 @@ pub struct Entry {
     pub scratch_slots: usize,
     /// The grid, an expression over dimension names (`(cdiv(n, 1024),)`).
     pub grid: String,
-    /// The thread block.
+    /// The thread block a launch takes: for a Triton kernel `32 * num_warps` threads, or `32 * total_num_warps` for a warp-specialised one;
+    /// for a prebuilt binary the block it declares.
     pub block: [u32; 3],
     /// The dynamic shared memory a launch passes, in bytes.
     pub shared: u32,
-    /// Warps per block (a Triton kernel).
+    /// The warps the kernel was compiled with (a Triton kernel's compile option, equal to `options.num_warps`): the warps of a block, or of the
+    /// default partition of a warp-specialised kernel.
     pub num_warps: Option<u32>,
+    /// The warps of a block of a warp-specialised Triton kernel (Gluon's `gl.warp_specialize`, or Triton's own warp specialisation): its
+    /// partitions add warps to the `num_warps` of its default partition, and the build recorded their total, Triton's `ttg.total-num-warps`
+    /// (more than `num_warps`, at most 32). `None` for any other kernel.
+    pub total_num_warps: Option<u32>,
     /// Pipeline stages the kernel was compiled with (a Triton kernel).
     pub num_stages: Option<u32>,
     /// What the binary asks of the launch.
@@ -782,6 +790,8 @@ struct RawEntry {
     shared: u32,
     #[serde(default)]
     num_warps: Option<u32>,
+    #[serde(default)]
+    total_num_warps: Option<u32>,
     #[serde(default)]
     num_stages: Option<u32>,
     launch: LaunchAttributes,
@@ -1722,6 +1732,7 @@ impl Entry {
             block: raw.block,
             shared: raw.shared,
             num_warps: raw.num_warps,
+            total_num_warps: raw.total_num_warps,
             num_stages: raw.num_stages,
             launch: raw.launch,
             constexprs: raw
@@ -1806,12 +1817,29 @@ impl Entry {
                 if !(1..=MAX_STAGES).contains(&num_stages) {
                     return Err(format!("num_stages must be an int from 1 to {MAX_STAGES}, got {num_stages}"));
                 }
-                if raw.block != [32 * num_warps, 1, 1] {
-                    return Err(format!(
-                        "block must be [32 * num_warps, 1, 1] = {:?}, got {:?}",
-                        [32 * num_warps, 1, 1],
-                        raw.block
-                    ));
+                match raw.total_num_warps {
+                    None if raw.block != [32 * num_warps, 1, 1] => {
+                        return Err(format!(
+                            "block must be [32 * num_warps, 1, 1] = {:?}, got {:?}",
+                            [32 * num_warps, 1, 1],
+                            raw.block
+                        ));
+                    }
+                    // a warp-specialised kernel: its partitions add warps to the num_warps of its default partition, and its block is all of them
+                    Some(total) if total <= num_warps || total > MAX_WARPS => {
+                        return Err(format!(
+                            "total_num_warps must be more than num_warps ({num_warps}, the warps of the default partition of a warp-specialised \
+                             kernel) and at most {MAX_WARPS}, got {total}"
+                        ));
+                    }
+                    Some(total) if raw.block != [32 * total, 1, 1] => {
+                        return Err(format!(
+                            "the block of a warp-specialised kernel is [32 * total_num_warps, 1, 1] = {:?}, got {:?}",
+                            [32 * total, 1, 1],
+                            raw.block
+                        ));
+                    }
+                    _ => {}
                 }
                 let Some(options) = &raw.options else {
                     return Err("a triton kernel has the compile options it was built with".to_owned());
@@ -1829,6 +1857,7 @@ impl Entry {
             EntryKind::Binary => {
                 let extra: Vec<&str> = [
                     ("num_warps", raw.num_warps.is_some()),
+                    ("total_num_warps", raw.total_num_warps.is_some()),
                     ("num_stages", raw.num_stages.is_some()),
                     ("options", raw.options.is_some()),
                 ]

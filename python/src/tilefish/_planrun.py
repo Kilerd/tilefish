@@ -75,6 +75,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from . import _plan, runtime
+from ._build import check_launch_config
 from ._launch import (
     TORCH_DTYPE_NAMES,
     bind_call,
@@ -801,8 +802,7 @@ class PlanRunner:
                 steps.append(_StepRT(bound, None, (), built.algo, ws))
             else:
                 built = self.provider.kernel(callee, bound.spec, index)
-                if built.spec.block != bound.spec.block or built.num_warps != bound.spec.num_warps:
-                    raise TilefishRuntimeError(f"the binary of '{bound.spec.stem}' disagrees with its spec about num_warps")
+                check_launch_config(built, bound.spec)  # the declared warps (a warp-specialised kernel's default partition, and more)
                 order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "tensordesc", "scalar", "given"))
                 loaded = be.load(built, index)
                 be.check_grid(loaded, bound.grid)

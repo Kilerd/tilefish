@@ -102,7 +102,7 @@ from types import SimpleNamespace
 from typing import Any, Iterator
 
 from . import _cache, _cuda, _ir
-from ._build import BuiltKernel, build, resolve_triton, write_manifest_doc
+from ._build import BuiltKernel, build, check_launch_config, resolve_triton, write_manifest_doc
 from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
@@ -580,8 +580,7 @@ def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKern
 def _launch_built(prep: _Prepared, built: BuiltKernel, index: int) -> None:
     """Launch a binary through the CUDA driver on torch's current stream, with the ABI of the manifest."""
     torch = _torch()
-    if built.spec.block != prep.spec.block or built.num_warps != prep.spec.num_warps:
-        raise TilefishRuntimeError(f"the binary of '{prep.spec.stem}' disagrees with its spec about num_warps")
+    check_launch_config(built, prep.spec)  # its warps are the declared ones (a warp-specialised kernel: those of its default partition, and more)
     with torch.cuda.device(index):
         args: "list[tuple[str, Any]]" = []
         for kind, name, v in _launch_values(prep):

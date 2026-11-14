@@ -191,7 +191,8 @@ canonical strides for axes of size 1; a dimension the arguments the entry reads 
 (`pointer_alignment` of the passed pointer, `static_size`, `divisible`, `bucket`, `max_elements`, `max_extent`), that a pointer without `strides` in its ABI entry gets a **dense** tensor
 (the strides of its axes of size > 1 are the row-major ones), that the ranks and dtypes are the ABI's, that a written pointer (`access` `out` or `inout`) overlaps no other argument of the step
 (but an `out` pointer with `alias` and the `in` pointer it names, which may be exactly one tensor: manifest schema 3, section 5.4), and
-the grid against the device's limits. A kernel is launched with `cuLaunchKernel` (a Triton kernel with its two zero scratch slots, a prebuilt one with exactly its parameters); a library entry
+the grid against the device's limits. A kernel is launched with `cuLaunchKernel` (a Triton kernel with its two zero scratch slots, a prebuilt one with exactly its parameters), the entry's
+`block` (of a warp-specialised kernel: the warps of all its partitions, manifest schema 3, section 4.2) and its `shared` memory; a library entry
 with `cublasLtMatmul` and its pinned algorithm (manifest schema 3, section 9), whose **workspace is the buffer named by `workspace`**, at its address in the arena (`workspace_bytes` of the entry
 are always there; the matmul is given the size the algorithm needs, at most that), so the call allocates nothing.
 

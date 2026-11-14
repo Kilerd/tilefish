@@ -497,7 +497,9 @@ impl Plan {
         self.given.iter().map(|(n, _)| n.as_str())
     }
 
-    pub(crate) fn block(&self) -> [u32; 3] {
+    /// The thread block every launch of the entry takes: the entry's `block`, which for a Triton kernel is `32 *` the warps of the compiled
+    /// kernel (all the partitions of a warp-specialised one, its `total_num_warps`).
+    pub fn block(&self) -> [u32; 3] {
         self.block
     }
 

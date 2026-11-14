@@ -156,7 +156,7 @@ class FakeBackend(Backend):
 
 class FakeProvider:
     def kernel(self, callee, spec, index):
-        return SimpleNamespace(spec=spec, num_warps=spec.num_warps)
+        return SimpleNamespace(spec=spec, num_warps=spec.num_warps, warp_specialized=False)
 
     def pin(self, spec, index):
         return SimpleNamespace(algo="ab" * 64)

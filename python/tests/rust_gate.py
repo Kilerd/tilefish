@@ -49,6 +49,11 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   than its box, a ``tl.dot`` matmul of swizzled tiles, a descriptor of a column block of a wider tensor and a Gluon kernel, every map encoded by the host from
   the tensor of the launch; the plans ``tma_chain`` (with and without reuse: descriptors of arena buffers and of the caller's output) and ``tma_view`` (of a
   view of the caller's input);
+* **warp-specialised kernels** (``ws_kernels.py``, exported only, on sm_90 or newer): a Gluon TMA producer partition feeding a compute partition
+  (``ws_scale``, 4 + 1 warps: 8), Triton's own warp specialisation of a ``tl.dot`` loop (``tl_ws_matmul``, 8 warps from sm_100 on) and, on sm_100 and
+  sm_103, a Gluon tcgen05 matmul of a TMA producer, an MMA issuer and an epilogue (``ws_matmul``, 4 + 1 + 1: 8; ``ws_matmul_wide``, 8 + 1 + 1: 12),
+  each launched with the block of all its partitions (the entry's ``total_num_warps``); the plans ``ws_chain`` (a warp-specialised step and a plain one)
+  and, on sm_100 and sm_103, ``ws_mm_chain`` (two warp-specialised steps);
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
   and (on a fresh export) how an algorithm is chosen (:func:`option_ops`): a ``gemm_bias`` under ``heuristic="torch"``, and one with ``algos=`` imported
   for this device, whose split-K adds its partial sums in bf16 at one bucket in the output and at another in a workspace (``allow_bf16_reduction=True``),
@@ -518,6 +523,21 @@ def tma_ops():
     return tk.ops()
 
 
+def ws_ops():
+    """``{name: extern}``: the warp-specialised kernels of ``ws_kernels.py`` this device runs, on sm_90 or newer. Not in the committed fixtures."""
+    if not tma_capable():
+        return {}
+    import ws_kernels as wk
+
+    return wk.ops(torch.cuda.get_device_capability())
+
+
+def must_be_scaled(args, got):
+    import ws_kernels as wk
+
+    assert same_bytes(got, wk.scaled(args[0]))
+
+
 def args_tile(shape, seed):
     return (randn(shape, F16, seed),)
 
@@ -656,6 +676,11 @@ def build_cases():
     tanh_check = must_be_torchs_tanh_but_on_a_subnormal
     cases += plain("tanh_fast", "tanh_fast", lambda n, seed: (f32_words(n, seed),), (6, 1000, 1 << 20), seeds=(0, 1), check=tanh_check)
     cases += plain("tanh_rows", "tanh_rows", args_tanh_rows, (1, 7, 300), seeds=(0,), check=must_be_a_tanh_of_rows)
+    # -- warp-specialised kernels (sm_90 and newer; the tcgen05 matmuls on sm_100 and sm_103): launched with the block of all their partitions
+    cases += plain("ws_scale", "ws_scale", args_tile, ((64, 64), (130, 200), (256, 512)), seeds=(0,), check=must_be_scaled)
+    mm_sizes = ((128, 128, 64), (200, 136, 72), (64, 64, 512), (256, 384, 192))
+    for key in ("tl_ws_matmul", "ws_matmul", "ws_matmul_wide"):
+        cases += plain(key, key, args_tma_mm, mm_sizes, seeds=(0,), check=must_be_a_matmul)
     return cases
 
 
@@ -879,6 +904,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(broadcast_ops())
         declared.update(ieee_ops())
         declared.update(tanh_ops())
+        declared.update(ws_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -1092,6 +1118,19 @@ def plan_graphs():
             ("tma_chain-reuse", tk.tma_chain, True, chain_cases),
             ("tma_view", tk.tma_view, False, tma_view_cases),
         ]
+        # warp-specialised steps: a block of all the partitions of the kernel, next to a plain step's (and, with tcgen05, two of them)
+        import ws_kernels as wk
+
+        def ws_chain_cases():
+            return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 256), F16, seed=100 + rb + seed)}) for rb in (64, 192) for seed in (0, 1)]
+
+        def ws_mm_cases():
+            b = randn((128, 192), F16, seed=110, scale=0.5)
+            return [(f"Mb{mb}-seed{seed}", {"a": randn((mb, 192), F16, seed=111 + mb + seed, scale=0.5), "b": b}) for mb in (128, 256) for seed in (0, 1)]
+
+        tma.append(("ws_chain", wk.ws_chain, False, ws_chain_cases))
+        if wk.tcgen05(torch.cuda.get_device_capability()):
+            tma.append(("ws_mm_chain", wk.ws_mm_chain, False, ws_mm_cases))
 
     import gpu_kernels_p7 as p7
 

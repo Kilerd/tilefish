@@ -404,6 +404,24 @@ tensor of that launch, and for a plan at every execution from the buffers each s
 with, as it holds the addresses. `TensorDesc(Strided[Tensor[...]], ...)` describes a view the kernel reads (its row stride is the view's). Triton's
 *device-side* descriptors (`tl.make_tensor_descriptor`, which need a global scratch) are still refused: declare the descriptor as a parameter.
 
+**Warp-specialised kernels.** A Blackwell kernel is often fastest when its partitions run on warps of their own: Gluon's `gl.warp_specialize` (a
+1-warp TMA producer and a 1-warp MMA issuer feeding 4 compute warps, say), or Triton's own warp specialisation of a `tl.range(..., warp_specialize=True)`
+loop. Such a kernel is declared like any other:
+
+```python
+@tilefish.extern(gluon=my_gluon_kernels.ws_matmul, num_warps=4, grid=lambda M, N: (tilefish.cdiv(M, 128), tilefish.cdiv(N, 128)))
+def ws_matmul(a: TensorDesc(Tensor[M, K, f16], block=(128, 64)), b: TensorDesc(Tensor[N, K, f16], block=(128, 64)),
+              c: Out[TensorDesc(Tensor[M, N, f16], block=(128, 128))], k_len: K): ...
+```
+
+`num_warps` is the warps of the kernel's **default partition** (those its layouts outside the worker partitions are written for; all its warps when it is
+not warp-specialised). The workers add warps of their own, and the compiled kernel has the total: Triton 3.5.1 reports 8 for 4 + 1 + 1 (and 12 for
+8 + 1 + 1, so declaring 8 would not give 8). The build takes that total from the compiled kernel when its TTGIR has warp-specialised regions, and refuses
+any other kernel whose warps Triton changed, as before; either way the PTX's `.reqntid` must be the block. The manifest entry keeps `num_warps` (the compile
+option) and records `total_num_warps` with the block it makes (`32 * total_num_warps`; manifest schema 3, section 4.2), which is in the manifest digest, and
+every launch takes that block: `jit`, `replay`, a step of a plan, a CUDA graph, and the Rust crate (`Entry::total_num_warps`, `Plan::block()`).
+Clusters (`num_ctas` above 1) are still refused, as for any kernel.
+
 **A pinned cuBLASLt GEMM.** `@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")` over `(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) ->
 Tensor[M, N, bf16]` computes `a @ b.T` with an f32 accumulator and one rounding (`impl="cublaslt.gemm_bias"` adds `bias: Tensor[N, bf16]`, added in f32 before it).
 For each `(M, N, K, bias)` (`M` from its buckets) the algorithm that cuBLASLt's heuristic ranks first under a fixed workspace limit (8 519 680 bytes,
