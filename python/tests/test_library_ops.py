@@ -24,6 +24,8 @@ Kb = Dim("Kb", buckets=[1024, 2048])
 ALGO = "0123456789abcdef" * 8  # 64 bytes of hex: not an algorithm anyone chose, but a well-formed one
 VERSION = 120804
 SMS = 30  # the multiprocessors of the device a pin is made on (a B300 MIG slice of 1g has 30)
+FORM = _cublaslt.Form()  # bf16 in and out, TN: the form of every op of this file
+NO_OPT_IN = {"allow_bf16_reduction": False, "allow_f16_reduction": False}
 
 
 @tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")
@@ -90,20 +92,20 @@ def _bias_rank2(a: Tensor[M, 1024, bf16], b: Tensor[2048, 1024, bf16], bias: Ten
 def _bias_wrong_size(a: Tensor[M, 1024, bf16], b: Tensor[2048, 1024, bf16], bias: Tensor[1024, bf16]) -> Tensor[M, 2048, bf16]: ...
 
 
-def test_the_signature_must_be_a_gemm_of_bf16_operands():
+def test_the_signature_must_be_a_gemm_of_bf16_or_f16_operands():
     with pytest.raises(TilefishDeclarationError, match="takes 2 input tensors"):
         declare(_one_arg)
     with pytest.raises(TilefishDeclarationError, match="takes 3 input tensors"):
         declare(_two_args, "cublaslt.gemm_bias")
     with pytest.raises(TilefishDeclarationError, match="declare a return type"):
         declare(_no_return)
-    with pytest.raises(TilefishDeclarationError, match="a must be a bf16 tensor of rank 2"):
+    with pytest.raises(TilefishDeclarationError, match="a and b must both be bf16 or both be f16 tensors"):
         declare(_f32_operand)
     with pytest.raises(TilefishDeclarationError, match=r"a is \[M, K\] and b is \[N, K\]: their last axes must be the same"):
         declare(_k_mismatch)
     with pytest.raises(TilefishDeclarationError, match=r"the result must be \[M, N\] = \[M, 2048\]"):
         declare(_wrong_result)
-    with pytest.raises(TilefishDeclarationError, match="bias must be a bf16 tensor of rank 1"):
+    with pytest.raises(TilefishDeclarationError, match="bias must be a bf16 tensor of rank 1, the type of the result"):
         declare(_bias_rank2, "cublaslt.gemm_bias")
     with pytest.raises(TilefishDeclarationError, match=r"and bias \[N\] = \[2048\]"):
         declare(_bias_wrong_size, "cublaslt.gemm_bias")
@@ -352,9 +354,9 @@ def test_pinning_asks_the_device_of_the_architecture(monkeypatch):
     got = build_library(spec, arch="sm_90")
     assert got.algo == ALGO and got.arch == "sm_90" and got.cublaslt_version == VERSION and got.sm_count == 132 and got.entry()["sm_count"] == 132
     assert calls == [
-        ((32, 2048, 1024, False), {"workspace_bytes": 8_519_680, "device_index": 0, "heuristic": "tilefish", "allow_bf16_reduction": False}),
+        ((32, 2048, 1024, False), {"workspace_bytes": 8_519_680, "device_index": 0, "heuristic": "tilefish", "form": FORM, **NO_OPT_IN}),
         # the pin passes the checks of a run before it is recorded
-        ("check", (32, 2048, 1024, False, ALGO), {"workspace_bytes": 8_519_680, "device_index": 0, "allow_bf16_reduction": False}),
+        ("check", (32, 2048, 1024, False, ALGO), {"workspace_bytes": 8_519_680, "device_index": 0, "form": FORM, **NO_OPT_IN}),
     ]
     with pytest.raises(tilefish.TilefishBuildError, match="cannot pin 'gemm.M32' for sm_103: cuBLASLt chooses an algorithm for the device it runs on, and device 0 is sm_90"):
         build_library(spec, arch="sm_103")
@@ -401,8 +403,8 @@ def test_the_sizes_are_ints_from_1_to_2_31_minus_1(key, bad):
 def test_the_problem_is_a_tn_gemm_and_its_redundant_fields_must_agree():
     refuses(lambda e: e.update(lda=3), "the leading dimensions must be lda = ldb = k and ldc = ldd = n")
     refuses(lambda e: e.update(ldd=1), "the leading dimensions must be")
-    refuses(lambda e: e.update(transa="N"), "transa and transb must be 'T' and 'N'")
-    refuses(lambda e: e.update(transb="T"), "transa and transb must be 'T' and 'N'")
+    refuses(lambda e: e.update(transa="N"), "the leading dimensions of the layout NN must be lda = n, ldb = k")  # N, N is the layout NN: lda = k is not its
+    refuses(lambda e: e.update(transb="T"), "transa and transb must be 'T' and 'N' \\(b is \\[n, k\\]\\) or 'N' and 'N'")
     refuses(lambda e: e.update(compute_type="CUBLAS_COMPUTE_16F"), "compute_type and scale_type must be")
     refuses(lambda e: e.update(scale_type="CUDA_R_16F"), "compute_type and scale_type must be")
     refuses(lambda e: e.update(epilogue="bias"), "the epilogue of cublaslt.gemm must be 'none'")

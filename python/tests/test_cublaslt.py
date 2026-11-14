@@ -325,7 +325,7 @@ def fake_runtime(monkeypatch):
     monkeypatch.setattr(L, "_device", lambda index: 0)
     monkeypatch.setattr(L, "_handle", lambda lib_, index: ctypes.c_void_p(7))
     monkeypatch.setattr(L, "_on_device", lambda index: contextlib.nullcontext())
-    monkeypatch.setattr(L, "_validate_algo", lambda lib_, handle, index, algo_hex, allow_bf16_reduction=False, bias=False: {})
+    monkeypatch.setattr(L, "_validate_algo", lambda lib_, handle, index, algo_hex, allow_bf16_reduction=False, bias=False, form=None: {})
     return lib
 
 
@@ -1001,7 +1001,7 @@ def test_split_k_reduces_in_f32_unless_the_declaration_opts_in_to_bf16_partial_s
 
 def test_the_opt_in_reaches_the_check_of_the_algorithm(fake_runtime, monkeypatch):
     seen = []
-    monkeypatch.setattr(L, "_validate_algo", lambda lib_, handle, index, algo_hex, allow=False, bias=False: seen.append((allow, bias)) or {})
+    monkeypatch.setattr(L, "_validate_algo", lambda lib_, handle, index, algo_hex, allow=False, bias=False, form=None: seen.append((allow, bias)) or {})
     L.check_algo(4, 8, 16, False, "00" * 64, workspace_bytes=0)
     L.check_algo(4, 8, 16, True, "00" * 64, workspace_bytes=0, allow_bf16_reduction=True)
     L.matmul(0x1000, 0x2000, 0x3000, 0x4000, 4, 8, 16, "00" * 64, workspace_bytes=0, stream=0, allow_bf16_reduction=True)

@@ -57,7 +57,8 @@
 //! * a pointer with the empty shape, a **device scalar**: one element of device memory (a tensor of shape `[]` or `[1]`) that the kernel
 //!   reads with `tl.load`, so that one binary runs for every value;
 //! * **`i64` scalars** and **`fixed` arguments** (a value the manifest holds, written at its slot: an `i32`, an `i64` or an `f32`);
-//! * a **library operation**: a bf16 GEMM through cuBLASLt with the algorithm the manifest pinned ([`Manifest::gemm`], [`Gemm`]).
+//! * a **library operation**: a GEMM of bf16 or f16 operands (a result of their type or f32; `b` as `[N, K]` or `[K, N]`) through cuBLASLt
+//!   with the algorithm the manifest pinned ([`Manifest::gemm`], [`Gemm`]; [`LibraryEntry::dtype`], [`LibraryEntry::layout`]).
 //!
 //! ```no_run
 //! use tilefish::cudarc::driver::CudaContext;
@@ -273,7 +274,7 @@ pub use launch_plan::{
     ARENA_ALIGNMENT, BufferRole, LaunchPlan, PLAN_NAME, PLAN_SCHEMA, PlanArg, PlanBucket, PlanBuffer, PlanStep,
     PlanView, StepKind, plan_digest,
 };
-pub use library::{AlgoSource, Heuristic, LibraryEntry, LibraryImpl};
+pub use library::{AlgoSource, GemmLayout, Heuristic, LibraryEntry, LibraryImpl};
 pub use manifest::{
     Access, BinarySource, Constexpr, DimInfo, Entry, EntryKind, FixedValue, IMPLEMENTATION_FALLBACK, LaunchAttributes,
     MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin, Precondition, ScalarType, ShapeDim, StrideEntry,

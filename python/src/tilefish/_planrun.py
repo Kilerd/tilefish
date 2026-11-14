@@ -488,8 +488,7 @@ class TorchBackend(Backend):
         from . import _cublaslt
 
         _cublaslt.check_algo(
-            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index,
-            allow_bf16_reduction=spec.allow_bf16_reduction,
+            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form, **spec.opt_ins,
         )  # fmt: skip
 
 
@@ -2106,7 +2105,7 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
                 if op.impl is None:
                     raise TilefishRuntimeError(f"reference mode needs the library op '{op.name}' to have an impl (a pinned GEMM): it has only a signature")
                 device = next(iter(ins.values())).device
-                produced = [_library.reference_gemm(ins).to(device)]
+                produced = [_library.reference_of(op, ins).to(device)]
             elif isinstance(op, KernelOp):
                 given = n.attrs.get("consts") or {}
                 changed = {p.name: given[p.name] for p in op_sig.consts if p.name in given and given[p.name] is not p.default}  # refused when it differs from what is compiled in

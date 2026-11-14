@@ -8,46 +8,54 @@ use common::synthetic::{Kernel, alignment, cubin, elf, fixed, json, pointer, rea
 use serde_json::Value;
 use tilefish::json::{canonical, parse_strict};
 use tilefish::{
-    Access, AlgoSource, Arch, DType, DevicePtr, Error, Heuristic, LibraryImpl, Manifest, ParamKind, Pin,
+    Access, AlgoSource, Arch, DType, DevicePtr, Error, GemmLayout, Heuristic, LibraryImpl, Manifest, ParamKind, Pin,
     PreconditionKind, TensorArg, manifest_digest,
 };
 
 const ALGO: &str = "0100000000000000030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f";
 
-/// The entry Python writes for `out[M, N] = a[M, K] @ b[N, K]^T (+ bias[N])` at the bucket `m`.
+/// The entry Python writes for `out[M, N] = a[M, K] @ b[N, K]^T (+ bias[N])` of bf16 at the bucket `m`.
 fn gemm(bias: bool, m: u64, n: u64, k: u64) -> Value {
+    gemm_of(bias, m, n, k, "bf16", "bf16", "TN")
+}
+
+/// The entry Python writes for a GEMM of `dtype` operands, an `out` result (and bias), in `layout` (`"TN"`: `b` is `[n, k]`; `"NN"`:
+/// `b` is `[k, n]`).
+fn gemm_of(bias: bool, m: u64, n: u64, k: u64, dtype: &str, out: &str, layout: &str) -> Value {
     let op = if bias { "gemm_bias" } else { "gemm" };
-    let ptr = |i: usize, name: &str, access: &str, shape: Value| json!({"index": i, "name": name, "kind": "pointer", "dtype": "bf16", "access": access, "shape": shape});
-    let mut params = vec![ptr(0, "a", "in", json!(["M", k])), ptr(1, "b", "in", json!([n, k]))];
+    let nn = layout == "NN";
+    let ptr = |i: usize, name: &str, dtype: &str, access: &str, shape: Value| json!({"index": i, "name": name, "kind": "pointer", "dtype": dtype, "access": access, "shape": shape});
+    let b_shape = if nn { [k, n] } else { [n, k] };
+    let mut params = vec![ptr(0, "a", dtype, "in", json!(["M", k])), ptr(1, "b", dtype, "in", json!(b_shape))];
     if bias {
-        params.push(ptr(2, "bias", "in", json!([n])));
+        params.push(ptr(2, "bias", out, "in", json!([n])));
     }
     let last = params.len();
-    params.push(ptr(last, "out", "out", json!(["M", n])));
+    params.push(ptr(last, "out", out, "out", json!(["M", n])));
     let names: Vec<String> = params.iter().map(|p| p["name"].as_str().unwrap().to_owned()).collect();
     let mut pres: Vec<Value> = names.iter().enumerate().map(|(i, n)| alignment(i, n, 16)).collect();
     let statics = |pres: &mut Vec<Value>, i: usize, name: &str, axis: usize, value: u64| {
         pres.push(json!({"kind": "static_size", "arg": name, "index": i, "axis": axis, "value": value}));
     };
     statics(&mut pres, 0, "a", 1, k);
-    statics(&mut pres, 1, "b", 0, n);
-    statics(&mut pres, 1, "b", 1, k);
+    statics(&mut pres, 1, "b", 0, b_shape[0]);
+    statics(&mut pres, 1, "b", 1, b_shape[1]);
     if bias {
         statics(&mut pres, 2, "bias", 0, n);
     }
     statics(&mut pres, last, "out", 1, n);
     pres.push(json!({"kind": "bucket", "dim": "M", "value": m, "buckets": [32, 64, 320]}));
-    let mut dtypes = json!({"a": "bf16", "b": "bf16", "out": "bf16"});
+    let mut dtypes = json!({"a": dtype, "b": dtype, "out": out});
     if bias {
-        dtypes["bias"] = "bf16".into();
+        dtypes["bias"] = out.into();
     }
     json!({
         "stem": format!("{op}.M{m}"), "op": op, "arch": "sm_103", "impl": format!("cublaslt.{op}"),
         "abi": {"params": params}, "buckets": {"M": m},
         "dims": {"M": {"buckets": [32, 64, 320], "bucket": m}},
         "preconditions": pres, "dtypes": dtypes,
-        "compute_type": "CUBLAS_COMPUTE_32F", "scale_type": "CUDA_R_32F", "transa": "T", "transb": "N",
-        "m": m, "n": n, "k": k, "lda": k, "ldb": k, "ldc": n, "ldd": n,
+        "compute_type": "CUBLAS_COMPUTE_32F", "scale_type": "CUDA_R_32F", "transa": if nn { "N" } else { "T" }, "transb": "N",
+        "m": m, "n": n, "k": k, "lda": if nn { n } else { k }, "ldb": k, "ldc": n, "ldd": n,
         "epilogue": if bias { "bias" } else { "none" }, "workspace_bytes": 8519680,
         "algo": ALGO, "cublaslt_version": 120804, "sm_count": 30, "declaration_digest": "a".repeat(64),
     })
@@ -239,7 +247,7 @@ fn a_library_entry_that_is_not_what_python_writes_is_refused() {
         ("m as a float", |e| e["m"] = 32.0.into(), "m must be an int"),
         ("lda that is not k", |e| e["lda"] = 8.into(), "leading dimensions must be"),
         ("ldd that is not n", |e| e["ldd"] = 1.into(), "leading dimensions must be"),
-        ("transa N", |e| e["transa"] = "N".into(), "transa and transb must be"),
+        ("transa X", |e| e["transa"] = "X".into(), "transa and transb must be"),
         ("transb T", |e| e["transb"] = "T".into(), "transa and transb must be"),
         ("another compute type", |e| e["compute_type"] = "CUBLAS_COMPUTE_16F".into(), "compute_type and scale_type"),
         ("another scale type", |e| e["scale_type"] = "CUDA_R_16F".into(), "compute_type and scale_type"),
@@ -373,6 +381,142 @@ fn n_and_k_may_be_any_size() {
             assert_eq!((e.n, e.k), (n, k));
         }
     }
+}
+
+/// f16 operands, an f32 result and the layout NN (`b` is `[k, n]`) are read from the fields an entry always had: `dtypes`, `transa` and the
+/// leading dimensions, the dtypes and shapes of the operands.
+#[test]
+fn an_entry_of_f16_operands_an_f32_result_or_the_layout_nn_is_read_with_its_types_and_layout() {
+    let entries = [
+        gemm_of(true, 32, 3072, 1024, "f16", "f16", "NN"),
+        gemm_of(false, 64, 3072, 1024, "f16", "f32", "TN"),
+        gemm_of(true, 320, 512, 1536, "bf16", "f32", "NN"),
+        gemm_of(false, 32, 96, 9, "f16", "f16", "NN"),
+    ];
+    let manifest = read(&[], &entries).unwrap();
+    let e = manifest.library_entry("gemm_bias.M32", "sm_103").unwrap();
+    assert_eq!((e.dtype, e.out_dtype, e.layout), (DType::F16, DType::F16, GemmLayout::Nn));
+    let dtypes: Vec<_> = e
+        .params
+        .iter()
+        .map(|p| match &p.kind {
+            ParamKind::Pointer { dtype, .. } => dtype.unwrap(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(dtypes, [DType::F16, DType::F16, DType::F16, DType::F16]);
+    let f32_out = manifest.library_entry("gemm.M64", "sm_103").unwrap();
+    assert_eq!((f32_out.dtype, f32_out.out_dtype, f32_out.layout), (DType::F16, DType::F32, GemmLayout::Tn));
+    let bf16_nn = manifest.library_entry("gemm_bias.M320", "sm_103").unwrap();
+    assert_eq!((bf16_nn.dtype, bf16_nn.out_dtype, bf16_nn.layout), (DType::Bf16, DType::F32, GemmLayout::Nn));
+    assert_eq!(
+        (GemmLayout::Nn.as_str(), GemmLayout::Nn.lda(3072, 1024), GemmLayout::Nn.b_shape(3072, 1024)),
+        ("NN", 3072, [1024, 3072])
+    );
+    // a bf16 entry of 0.0.5 reads as before: TN, bf16 in and out
+    let old = read(&[], &[gemm(true, 64, 1024, 1024)]).unwrap();
+    let e = &old.library()[0];
+    assert_eq!(
+        (e.dtype, e.out_dtype, e.layout, e.allow_f16_reduction),
+        (DType::Bf16, DType::Bf16, GemmLayout::Tn, false)
+    );
+}
+
+/// The plan of a GEMM of the layout NN binds `b` as `[K, N]` and takes tensors of the entry's dtypes.
+#[test]
+fn the_operands_of_an_nn_gemm_are_bound_as_k_by_n_and_of_the_entrys_dtypes() {
+    let manifest = read(&[], &[gemm_of(true, 64, 3072, 1024, "f16", "f32", "NN")]).unwrap();
+    let plan = manifest.library_plan("gemm_bias", &[("M", 64)], Arch::sm(103)).unwrap();
+    let at = |x: u64| 0x7000_0000_0000 + x * 0x1000_0000;
+    let typed = |addr: u64, shape: &'static [usize], dtype: DType, access: Access| {
+        let bytes = shape.iter().product::<usize>() as u64 * dtype.size() as u64;
+        // SAFETY: nothing is dereferenced: `prepare` only looks at the numbers.
+        let region = unsafe { DevicePtr::from_raw(addr, bytes, 0) };
+        TensorArg::new(region, shape, dtype, access).unwrap()
+    };
+    let call = |b: &'static [usize], bias: DType, out: DType| {
+        plan.prepare(
+            &[
+                typed(at(0), &[64, 1024], DType::F16, Access::In),
+                typed(at(1), b, DType::F16, Access::In),
+                typed(at(2), &[3072], bias, Access::In),
+                typed(at(3), &[64, 3072], out, Access::Out),
+            ],
+            None,
+        )
+    };
+    assert!(call(&[1024, 3072], DType::F32, DType::F32).is_ok());
+    let e = call(&[3072, 1024], DType::F32, DType::F32).unwrap_err();
+    assert_eq!(e.precondition_kind(), Some(PreconditionKind::StaticSize), "b given as [N, K] to an NN GEMM: {e}");
+    let e = call(&[1024, 3072], DType::F16, DType::F32).unwrap_err();
+    assert_eq!(
+        e.precondition_kind(),
+        Some(PreconditionKind::Dtype),
+        "a bias of the operands' type where the result is f32: {e}"
+    );
+    let e = call(&[1024, 3072], DType::F32, DType::F16).unwrap_err();
+    assert_eq!(e.precondition_kind(), Some(PreconditionKind::Dtype), "{e}");
+}
+
+#[test]
+fn an_entry_whose_types_or_layout_disagree_is_refused() {
+    type Change = fn(&mut Value);
+    let cases: [(&str, Change, &str); 12] = [
+        (
+            "NN with lda = k",
+            |e| e["lda"] = 1024.into(),
+            "the leading dimensions of the layout NN must be lda = n, ldb = k",
+        ),
+        ("TN with the lda of NN", |e| e["transa"] = "T".into(), "the leading dimensions must be lda = ldb = k"),
+        (
+            "transb T",
+            |e| e["transb"] = "T".into(),
+            "transa and transb must be \"T\" and \"N\" (b is [n, k]) or \"N\" and \"N\"",
+        ),
+        ("b of another type", |e| e["dtypes"]["b"] = "bf16".into(), "dtypes must be"),
+        ("an f32 bias with an f16 result", |e| e["dtypes"]["bias"] = "f32".into(), "dtypes must be"),
+        ("a bf16 result of f16 operands", |e| e["dtypes"]["out"] = "bf16".into(), "dtypes must be"),
+        (
+            "f32 operands",
+            |e| e["dtypes"] = json!({"a": "f32", "b": "f32", "bias": "f32", "out": "f32"}),
+            "dtypes must be",
+        ),
+        (
+            "a pointer of another type than dtypes",
+            |e| e["abi"]["params"][2]["dtype"] = "f32".into(),
+            "must be the f16 pointer #2",
+        ),
+        ("b given as [n, k]", |e| e["abi"]["params"][1]["shape"] = json!([3072, 1024]), "m, n and k say"),
+        (
+            "the opt-in of bf16 on f16 operands",
+            |e| e["allow_bf16_reduction"] = true.into(),
+            "allow_bf16_reduction is the opt-in of bf16 operands, and the operands of this entry are f16",
+        ),
+        (
+            "the f16 opt-in written as false",
+            |e| e["allow_f16_reduction"] = false.into(),
+            "allow_f16_reduction is absent (the default) or true, got false",
+        ),
+        ("the f16 opt-in as 1", |e| e["allow_f16_reduction"] = 1.into(), "allow_f16_reduction is absent"),
+    ];
+    for (what, change, why) in cases {
+        let mut entry = gemm_of(true, 32, 3072, 1024, "f16", "f16", "NN");
+        change(&mut entry);
+        let message = refusal(&[], &[entry]);
+        assert!(message.contains(why), "{what}: {message}");
+    }
+    // the f16 opt-in on f16 operands is read; on bf16 operands it is refused
+    let mut opted = gemm_of(false, 32, 3072, 1024, "f16", "f32", "TN");
+    opted["allow_f16_reduction"] = true.into();
+    let manifest = read(&[], &[opted]).unwrap();
+    let e = &manifest.library()[0];
+    assert!(e.allow_f16_reduction && !e.allow_bf16_reduction && e.allows_output_type_reduction());
+    let mut wrong = gemm(false, 32, 1024, 1024);
+    wrong["allow_f16_reduction"] = true.into();
+    assert!(
+        refusal(&[], &[wrong])
+            .contains("allow_f16_reduction is the opt-in of f16 operands, and the operands of this entry are bf16")
+    );
 }
 
 // -- the digest --------------------------------------------------------------------------------------------------------------------

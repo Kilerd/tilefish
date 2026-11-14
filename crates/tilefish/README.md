@@ -57,7 +57,11 @@ nothing is allocated in a launch and it can be captured in a CUDA graph). An
 entry says how its algorithm was chosen (`LibraryEntry::heuristic`,
 `algo_source`: the heuristic under tilefish's or torch's posture, or imported),
 and an algorithm whose split-K adds its partial sums in bf16 is run only for an
-entry that opts in (`allow_bf16_reduction`). The entry of an operator declared
+entry that opts in (`allow_bf16_reduction`). A GEMM may have f16 operands, an
+f32 result and `b` stored `[K, N]` (`LibraryEntry::dtype`, `out_dtype`,
+`layout`: `GemmLayout::Tn` or `Nn`); its tensors are checked against those
+types and shapes, and an f16 entry opts in to f16 partial sums with
+`allow_f16_reduction`. The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
 which one it is (`Entry::implementation`: its own architecture, or
 `"fallback"`); the crate launches the entry of the device's architecture, as

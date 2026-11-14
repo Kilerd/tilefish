@@ -594,8 +594,8 @@ impl Gemm {
     /// `Gemm::check_call` checks of the tensors they came from.
     #[allow(unsafe_code)]
     pub(crate) unsafe fn run(&self, stream: sys::CUstream, call: &Call) -> Result<()> {
-        let (handle, algo, required, [m, n, k]) = self.engine();
-        let problem = cublaslt::Problem::new(m, n, k, call.bias)?;
+        let (handle, algo, required, [m, n, k], form) = self.engine();
+        let problem = cublaslt::Problem::new(m, n, k, call.bias, &form)?;
         let addresses = cublaslt::Addresses { a: call.a, b: call.b, out: call.out, workspace: call.workspace };
         // SAFETY: the contract of this function.
         unsafe { cublaslt::matmul(handle, &problem, algo, &addresses, required, stream) }

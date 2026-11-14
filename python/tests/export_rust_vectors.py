@@ -22,6 +22,8 @@ cubins) prove it on what ``tilefish`` writes; these vectors prove it on the edge
   ``kernelParams``: pointers are addresses, ``i32`` and ``i64`` scalars their integer, a fixed argument its integer or the IEEE bits of an ``f32``, and a Triton
   kernel's two null scratch slots follow (a prebuilt binary has none);
 * ``python_plans.json``: plan documents and what Python decides of each (``export_plan_vectors.py``);
+* ``python_library.json``: ``library`` entries of every form (operand and result types, a bias, the layouts, the opt-ins), each also changed in one field,
+  and what Python's strict reader decides of each (accepted, with the form it reads, or refused);
 * ``python_manifests.in``: ``MANIFESTS``, small manifest documents (schema 2 shapes and dimensions, other orders, other schemas, other
   alphabets; schema 3 with kernels and library entries in every order, every field it added, the spelling of floats, non-ASCII text escaped and as it is,
   and the schemas ``3.0``, ``true``, ``"3"`` and ``4``) and their ``manifest_digest``, which has its own tag per schema; and ``MANIFEST_ERRORS``, documents
@@ -278,7 +280,7 @@ def manifest_documents():
             max_elements=2**31 - 1,
         )
 
-    def library(stem, arch="sm_103", algo="0123456789abcdef" * 8, version=120804):
+    def library(stem, arch="sm_103", algo="0123456789abcdef" * 8, version=120804, **changes):
         return {
             "stem": stem,
             "op": stem.split(".")[0],
@@ -305,6 +307,7 @@ def manifest_documents():
             "algo": algo,
             "cublaslt_version": version,
             "declaration_digest": "f" * 64,
+            **changes,
         }
 
     legacy = [
@@ -347,6 +350,8 @@ def manifest_documents():
         # the fields of a library entry: the algorithm and the version are in it
         {"schema": 3, "kernels": [], "library": [library("g.M32", algo="f" * 128)]},
         {"schema": 3, "kernels": [], "library": [library("g.M32", version=120805)]},
+        # an entry of f16 operands, an f32 result and the layout NN (section 9.2): its form is in fields every entry has, digested as they are
+        {"schema": 3, "kernels": [], "library": [library("g.M32", dtypes={"a": "f16", "b": "f16", "out": "f32"}, transa="N", lda=2048, allow_f16_reduction=True)]},
         # non-ASCII, escaped (and, at the end of the list, as it is)
         non_ascii,
         # a schema that is not the integer 3: the digest still has a form for each, and 3.0 is the same number as 3 in Python
@@ -724,6 +729,97 @@ def launches_json():
     return json.dumps(records, indent=None, separators=(",", ":")) + "\n"
 
 
+def library_entries():
+    """``library`` entries of every form (bf16 or f16 operands, a result of their type or f32, a bias, the layouts TN and NN, the opt-ins) as
+    ``tilefish._library`` writes them, and each changed in one field, with what Python's strict reader (``validate_entry``) decides: accepted,
+    with the form it reads (operand type, result type, layout, the two opt-ins), or refused. The Rust reader must decide the same
+    (``tests/python_library.rs``)."""
+    import copy
+
+    import tilefish
+    from tilefish import Dim, Tensor, TilefishManifestError, bf16, f16, f32
+    from tilefish._library import BuiltLibrary, library_specs, validate_entry
+
+    M = Dim("M", buckets=[32, 64])
+    t = {"bf16": bf16, "f16": f16, "f32": f32}
+
+    def declare(dtype, out, layout, bias, n=1536, k=1024, **kw):
+        b_shape = (n, k) if layout == "TN" else (k, n)
+        name = f"g_{dtype}_{out}_{layout.lower()}{'_bias' if bias else ''}"
+        if bias:
+
+            def fn(a: Tensor[M, k, t[dtype]], b: Tensor[b_shape[0], b_shape[1], t[dtype]], bias: Tensor[n, t[out]]) -> Tensor[M, n, t[out]]: ...
+
+        else:
+
+            def fn(a: Tensor[M, k, t[dtype]], b: Tensor[b_shape[0], b_shape[1], t[dtype]]) -> Tensor[M, n, t[out]]: ...
+
+        impl = "cublaslt.gemm_bias" if bias else "cublaslt.gemm"
+        return tilefish.library(name, acc=f32, impl=impl, layout=layout, **kw)(fn)
+
+    ops = [
+        declare("bf16", "bf16", "TN", False),
+        declare("bf16", "bf16", "TN", True, allow_bf16_reduction=True),
+        declare("f16", "f16", "TN", False),
+        declare("f16", "f16", "NN", True),
+        declare("f16", "f32", "TN", True, allow_f16_reduction=True),
+        declare("bf16", "f32", "NN", False),
+        declare("f16", "f16", "NN", False, n=96, k=9),
+    ]
+    goods = [BuiltLibrary(library_specs(op)[0], "sm_103", "0123456789abcdef" * 8, 120804, 30).entry() for op in ops]
+
+    def changed(entry, path, value):
+        e = copy.deepcopy(entry)
+        target = e
+        for key in path[:-1]:
+            target = target[key]
+        if value is _DELETE:
+            del target[path[-1]]
+        else:
+            target[path[-1]] = value
+        return e
+
+    cases = list(goods)
+    for good in goods:
+        nn = good["transa"] == "N"
+        for path, value in [
+            (["transa"], "T" if nn else "N"),
+            (["transb"], "T"),
+            (["lda"], good["k"] if nn else good["n"]),
+            (["dtypes", "a"], "f16" if good["dtypes"]["a"] == "bf16" else "bf16"),
+            (["dtypes", "b"], "f32"),
+            (["dtypes", "out"], "bf16" if good["dtypes"]["out"] != "bf16" else "f16"),
+            (["abi", "params", 1, "shape"], list(reversed(good["abi"]["params"][1]["shape"]))),
+            (["abi", "params", 0, "dtype"], "f32"),
+            (["abi", "params", len(good["abi"]["params"]) - 1, "dtype"], "f16" if good["dtypes"]["out"] != "f16" else "f32"),
+            (["allow_bf16_reduction"], True),
+            (["allow_f16_reduction"], True),
+            (["allow_f16_reduction"], False),
+        ]:
+            cases.append(changed(good, path, value))
+        if "bias" in good["dtypes"]:
+            cases.append(changed(good, ["dtypes", "bias"], "f32" if good["dtypes"]["out"] != "f32" else good["dtypes"]["a"]))
+            cases.append(changed(good, ["abi", "params", 2, "dtype"], "f32" if good["dtypes"]["out"] != "f32" else good["dtypes"]["a"]))
+    out = []
+    for entry in cases:
+        try:
+            validate_entry(entry)
+        except TilefishManifestError as e:
+            out.append({"entry": entry, "accepted": False, "refusal": str(e)})
+            continue
+        form = [entry["dtypes"]["a"], entry["dtypes"]["out"], entry["transa"] + entry["transb"], "allow_bf16_reduction" in entry, "allow_f16_reduction" in entry]
+        out.append({"entry": entry, "accepted": True, "form": form})
+    return out
+
+
+_DELETE = object()
+
+
+def library_entries_json():
+    """One case per line, so that a change of the format shows as the cases it changes."""
+    return "[\n" + ",\n".join(json.dumps(c, sort_keys=True, separators=(",", ":")) for c in library_entries()) + "\n]\n"
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
@@ -737,6 +833,7 @@ def main(argv=None):
         ("python_manifests.in", manifest_digests()),
         ("python_launches.json", launches_json()),
         ("python_plans.json", plan_vectors_json()),
+        ("python_library.json", library_entries_json()),
     ):
         (directory / name).write_text(text, encoding="utf-8")
 

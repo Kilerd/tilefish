@@ -112,7 +112,7 @@ _IMPLEMENTATION_FIELDS = ("grid", "block", "num_warps", "num_stages", "constexpr
 # covers the SM count) and what the pin chose on it
 _LIBRARY_SHARED_FIELDS = (
     "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes "
-    "heuristic algo_source allow_bf16_reduction"  # (the last three are absent by default: they are compared as present or not too)
+    "heuristic algo_source allow_bf16_reduction allow_f16_reduction"  # (the last four are absent by default: they are compared as present or not too)
 ).split()
 
 _RUST_KEYWORDS = frozenset(
@@ -551,8 +551,9 @@ def _validate_library_entry(entry: Any) -> None:
         where = f"abi.params[{i}]"
         _name(who, f"{where}.name", p.get("name") if isinstance(p, dict) else None)
         _validate_pointer(who, f"{where} ('{p['name']}')", p)
-        if p["dtype"] != "bf16" or p["access"] != ("out" if i == len(params) - 1 else "in") or "strides" in p:
-            _bad(who, f"{where} must be a dense bf16 pointer with access {'out' if i == len(params) - 1 else 'in'}")
+        # (the reader held the dtype of each pointer to the entry's dtypes: bf16 or f16 operands, a result and a bias of their type or f32)
+        if p["dtype"] not in ("bf16", "f16", "f32") or p["access"] != ("out" if i == len(params) - 1 else "in") or "strides" in p:
+            _bad(who, f"{where} must be a dense bf16, f16 or f32 pointer with access {'out' if i == len(params) - 1 else 'in'}")
     _validate_dims(who, entry)
 
 
@@ -949,11 +950,14 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
     lines += _wrap(f"The pinned cuBLASLt GEMM `{g.stem}` of operator `{e['op']}` (`{e['impl']}`), for {', '.join(g.archs)}.")
     a, b = (g.arg_names[p["name"]] for p in g.params[:2])
     out = g.arg_names[g.params[-1]["name"]]
+    dtype, out_dtype = e["dtypes"]["a"], e["dtypes"]["out"]
+    nn = e["transa"] == "N"  # the layout NN: b is [k, n] and is not transposed
     lines.append("")
     lines += _wrap(
-        f"It computes `{out}[{m}, {n}] = {a}[{m}, {k}] @ {b}[{n}, {k}]^T"
+        f"It computes `{out}[{m}, {n}] = {a}[{m}, {k}] @ "
+        + (f"{b}[{k}, {n}]" if nn else f"{b}[{n}, {k}]^T")
         + (f" + {g.arg_names[g.params[2]['name']]}[{n}]" if bias else "")
-        + "` on bf16 operands with an f32 accumulator, and rounds to bf16 once"
+        + f"` on {dtype} operands with an f32 accumulator, and rounds to {out_dtype} once"
         + (" (the bias is added in f32 before the rounding)" if bias else "")
         + ". Every operand is contiguous and 16-byte aligned."
     )
@@ -990,13 +994,21 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
         lines += _wrap(
             "The declaration allows split-K to add its partial sums in bf16 (`allow_bf16_reduction`): the result may be rounded more than once."
         )
+    if e.get("allow_f16_reduction") is True:
+        lines.append("")
+        lines += _wrap(
+            "The declaration allows split-K to add its partial sums in the output type (`allow_f16_reduction`): the result may be rounded more "
+            "than once."
+        )
     return lines
 
 
 def _render_gemm(g: _Gemm) -> str:
     e = g.entry
     bias = LIBRARY_IMPLS[e["impl"]]
-    tensor_params = [f"{g.arg_names[p['name']]}: {'TensorMut' if p['access'] == 'out' else 'TensorRef'}<'a, Bf16>" for p in g.params]
+    tensor_params = [
+        f"{g.arg_names[p['name']]}: {'TensorMut' if p['access'] == 'out' else 'TensorRef'}<'a, {RUST_ELEMENTS[p['dtype']]}>" for p in g.params
+    ]
     tensor_params.append(f"{g.workspace}: TensorMut<'a, U8>")
     names = [g.arg_names[p["name"]] for p in g.params] + [g.workspace]
     args = ", ".join(f"{n}.into_arg()" for n in names)
@@ -1011,9 +1023,14 @@ def _render_gemm(g: _Gemm) -> str:
     out.append(f"    pub const SHAPES: &'static [&'static [&'static str]] = &[{rows}];\n")
     out.append("    /// Rows of `a` and of the result.\n")
     out.append(f"    pub const M: usize = {e['m']};\n")
-    out.append("    /// Rows of `b`, and columns of the result.\n")
-    out.append(f"    pub const N: usize = {e['n']};\n")
-    out.append("    /// The columns of `a` and of `b`.\n")
+    if e["transa"] == "N":
+        out.append("    /// Columns of `b` (`[K, N]`: the layout NN), and of the result.\n")
+        out.append(f"    pub const N: usize = {e['n']};\n")
+        out.append("    /// The columns of `a` and the rows of `b`.\n")
+    else:
+        out.append("    /// Rows of `b`, and columns of the result.\n")
+        out.append(f"    pub const N: usize = {e['n']};\n")
+        out.append("    /// The columns of `a` and of `b`.\n")
     out.append(f"    pub const K: usize = {e['k']};\n")
     out.append("    /// Whether the GEMM adds a bias.\n")
     out.append(f"    pub const BIAS: bool = {'true' if bias else 'false'};\n")
@@ -1110,7 +1127,7 @@ def render(
     if binaries or not gemms:
         uses.add("Kernel")
     if gemms:
-        uses |= {"Gemm", "Bf16", "U8", "TensorRef", "TensorMut"}
+        uses |= {"Gemm", "U8", "TensorRef", "TensorMut"} | {RUST_ELEMENTS[p["dtype"]] for g in gemms for p in g.params}
     if embed:
         uses.add("Pin")
     if any(p["access"] == "in" for b in binaries for p in b.params):

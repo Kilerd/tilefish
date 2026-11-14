@@ -177,10 +177,10 @@ class LibraryOp(Op):
     """An operator with an opaque body (CUTLASS, cuBLASLt, ...): a typed signature only.
 
     With ``impl="cublaslt.gemm"`` (or ``"cublaslt.gemm_bias"``) it is also a pinned cuBLASLt GEMM that ``tilefish.run`` runs and
-    ``tilefish.runtime.export`` writes to the ``library`` section of a manifest: ``out[M, N] = a[M, K] @ b[N, K]^T`` (``+ bias[N]``), bf16
-    with an f32 accumulator and one rounding, the algorithm the heuristic ranks first under a ``workspace_bytes`` limit and a ``heuristic``
-    posture (or the one an imported table, ``algos``, gives), recorded with the cuBLASLt version (see :mod:`tilefish._library`). Without
-    ``impl`` it is a signature only.
+    ``tilefish.runtime.export`` writes to the ``library`` section of a manifest: ``out[M, N] = a[M, K] @ b[N, K]^T`` (``b[K, N]`` without the
+    transpose for ``layout="NN"``; ``+ bias[N]``), bf16 or f16 operands with an f32 accumulator and one rounding to the result's type (theirs, or
+    f32), the algorithm the heuristic ranks first under a ``workspace_bytes`` limit and a ``heuristic`` posture (or the one an imported table,
+    ``algos``, gives), recorded with the cuBLASLt version (see :mod:`tilefish._library`). Without ``impl`` it is a signature only.
     """
 
     kind = "library"
@@ -196,6 +196,8 @@ class LibraryOp(Op):
         heuristic: str = "tilefish",
         allow_bf16_reduction: bool = False,
         algos: "tuple[Any, ...] | None" = None,
+        layout: str = "TN",
+        allow_f16_reduction: bool = False,
     ) -> None:
         super().__init__(fn, name, signature)
         self.acc = acc
@@ -204,6 +206,8 @@ class LibraryOp(Op):
         self.heuristic = heuristic
         self.allow_bf16_reduction = allow_bf16_reduction
         self.algos = algos
+        self.layout = layout
+        self.allow_f16_reduction = allow_f16_reduction
 
     def node_attrs(self) -> dict[str, Any]:
         return {"acc": self.acc} if self.acc is not None else {}
@@ -218,20 +222,26 @@ def library(
     heuristic: "str | None" = None,
     allow_bf16_reduction: "bool | None" = None,
     algos: Any = None,
+    layout: "str | None" = None,
+    allow_f16_reduction: "bool | None" = None,
 ) -> Any:
     """``@tilefish.library("gemm", acc=f32)``: declare an operator by signature only.
 
     ``impl="cublaslt.gemm"`` (or ``"cublaslt.gemm_bias"``) says a pinned cuBLASLt GEMM runs it: the signature must be
-    ``(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) -> Tensor[M, N, bf16]`` (with ``bias: Tensor[N, bf16]`` for the second), ``M``, ``N`` and
-    ``K`` static or bucketed (of any size: the library judges the leading dimensions an algorithm can take). How its algorithm is chosen is
+    ``(a: Tensor[M, K, T], b: Tensor[N, K, T]) -> Tensor[M, N, D]`` (with ``bias: Tensor[N, D]`` for the second), where ``T`` is ``bf16`` or
+    ``f16`` and ``D`` is ``T`` or ``f32``; ``M``, ``N`` and ``K`` static or bucketed (of any size: the library judges the leading dimensions an
+    algorithm can take). The result is ``a @ b^T`` with an f32 accumulator, rounded once to ``D``. The layout and how its algorithm is chosen are
     part of the declaration:
 
+    * ``layout``: ``"TN"`` (the default: ``b`` is ``[N, K]``, as a weight of ``torch.nn.Linear``) or ``"NN"`` (``b`` is ``Tensor[K, N, T]``, and
+      the result is ``a @ b``), named by the transposes cuBLASLt is called with;
     * ``heuristic``: the posture cuBLASLt's heuristic is asked under, ``"tilefish"`` (the default: 16-byte alignment minimums) or ``"torch"``
       (what torch's ``addmm`` asks: the workspace limit alone, so the heuristic answers what ``torch.addmm`` / ``torch.mm`` run);
     * ``workspace_bytes``: the workspace limit (default 8 519 680, torch's ``CUBLAS_WORKSPACE_CONFIG``; under ``"torch"`` 1 048 576 for
-      ``gemm_bias``, torch's ``CUBLASLT_WORKSPACE_SIZE``);
-    * ``allow_bf16_reduction=True``: split-K may add its partial sums in bf16 (torch's ``allow_bf16_reduced_precision_reduction``, its
-      default), which rounds more than once; without it they are added in f32 and the result is rounded once;
+      ``gemm_bias``, torch's ``CUBLASLT_WORKSPACE_SIZE``); a launch provides this many bytes, so it is per op (64 MiB is ``64 << 20``);
+    * ``allow_bf16_reduction=True`` (bf16 operands) or ``allow_f16_reduction=True`` (f16 operands): split-K may add its partial sums in the
+      output type (torch's ``allow_bf16_reduced_precision_reduction`` and ``allow_fp16_reduced_precision_reduction``, its defaults), which rounds
+      more than once; without it they are added in f32 and the result is rounded once;
     * ``algos``: a :class:`~tilefish.AlgoTable` (or a list of them, one per device) whose algorithms are pinned instead of asking the
       heuristic, on the devices they are for.
     """
@@ -239,8 +249,10 @@ def library(
         raise TilefishDeclarationError(f"library: acc must be a dtype such as f32, got {acc!r}")
     if impl is None and workspace_bytes is not None:
         raise TilefishDeclarationError("library: workspace_bytes needs an impl")
-    if impl is None and (heuristic is not None or allow_bf16_reduction is not None or algos is not None):
-        raise TilefishDeclarationError("library: heuristic, allow_bf16_reduction and algos need an impl")
+    if impl is None and (
+        heuristic is not None or allow_bf16_reduction is not None or algos is not None or layout is not None or allow_f16_reduction is not None
+    ):
+        raise TilefishDeclarationError("library: heuristic, allow_bf16_reduction, allow_f16_reduction, algos and layout need an impl")
 
     def make(fn: Callable[..., Any], op_name: str | None) -> LibraryOp:
         nm = op_name or fn.__name__
@@ -256,12 +268,14 @@ def library(
 
         posture = "tilefish" if heuristic is None else heuristic
         bf16_reduction = False if allow_bf16_reduction is None else allow_bf16_reduction
-        tables = _library.check_options(nm, posture, bf16_reduction, algos)
+        f16_reduction = False if allow_f16_reduction is None else allow_f16_reduction
+        lay = "TN" if layout is None else layout
+        tables = _library.check_options(nm, posture, bf16_reduction, algos, f16_reduction, lay)
         if impl not in _library.IMPLS:
             raise TilefishDeclarationError(f"library op '{nm}': impl must be one of {sorted(_library.IMPLS)}, got {impl!r}")
         ws = _library.default_workspace_bytes(impl, posture) if workspace_bytes is None else workspace_bytes
-        _library.check_declaration(nm, impl, sig, acc, ws)
-        op = LibraryOp(fn, nm, sig, acc, impl, ws, posture, bf16_reduction, tables)
+        _library.check_declaration(nm, impl, sig, acc, ws, lay, bf16_reduction, f16_reduction)
+        op = LibraryOp(fn, nm, sig, acc, impl, ws, posture, bf16_reduction, tables, lay, f16_reduction)
         _library.check_coverage(op)
         return op
 

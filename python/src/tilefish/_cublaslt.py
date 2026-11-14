@@ -2,16 +2,24 @@
 
 The operation, in tilefish terms (row-major, contiguous, every pointer 16-byte aligned)::
 
-    D[M, N] = A[M, K] @ B[N, K]^T          (+ bias[N])
+    D[M, N] = A[M, K] @ B[N, K]^T          (+ bias[N])          the layout "TN" (the default)
+    D[M, N] = A[M, K] @ B[K, N]            (+ bias[N])          the layout "NN"
 
-``A``, ``B``, ``bias`` and ``D`` are bf16, the accumulator is f32, and the result is rounded to bf16 once, at the end
-(the bias is added in f32 to the accumulator before that rounding). ``alpha = 1``, ``beta = 0``, host pointer mode.
+``A`` and ``B`` are bf16 or f16 (both the same), ``D`` is of their type or f32 (a :class:`Form`), the accumulator is f32, and the result is
+rounded to the type of ``D`` once, at the end (the bias, of the type of ``D``, is added in f32 to the accumulator before that rounding).
+``alpha = 1``, ``beta = 0``, host pointer mode. cuBLASLt 12.8.4 takes no other bias type for these operands (an f32 bias with a 16-bit ``D``, or
+a 16-bit bias with an f32 ``D``, is ``CUBLAS_STATUS_INVALID_VALUE`` from the heuristic: measured on sm_103), so none is offered.
 
-cuBLASLt is column-major, so the problem is posed as the usual ``TN`` gemm, in cuBLAS terms ``m = N``, ``n = M``, ``k = K``:
+cuBLASLt is column-major, so the problem is posed as a gemm of ``m = N``, ``n = M``, ``k = K`` in cuBLAS terms (the layout names the
+transposes as cuBLASLt is called, ``transa`` then ``transb``):
 
-* the "A operand" is tilefish's ``B`` (``[N, K]`` row-major is ``K x N`` column-major, ``lda = K``) with ``transa = T``,
+* the "A operand" is tilefish's ``B``: for ``TN``, ``[N, K]`` row-major is ``K x N`` column-major, ``lda = K``, used with ``transa = T``; for ``NN``,
+  ``[K, N]`` row-major is ``N x K`` column-major, ``lda = N``, used with ``transa = N``;
 * the "B operand" is tilefish's ``A`` (``[M, K]`` row-major is ``K x M`` column-major, ``ldb = K``) with ``transb = N``,
 * ``D`` is tilefish's ``D`` (``[M, N]`` row-major is ``N x M`` column-major, ``ldd = N``); the ``C`` layout is the ``D`` layout.
+
+The two other layouts, an ``A`` stored ``[K, M]`` (``transb = T``, ``ldb = M``) with either ``B``, are the same code with two more rows of the
+table; they are not offered because nothing has needed them.
 
 The library is the ``libcublasLt`` the process already has mapped (torch's, from the ``nvidia-cublas`` wheel): it is
 found in ``/proc/self/maps`` and opened by that path, so the dynamic loader hands back the mapping that is there and no
@@ -37,11 +45,12 @@ and to vet a pinned algorithm, ``cublasLtMatmulAlgoInit``, ``cublasLtMatmulAlgoC
   (:data:`TORCH_LT_WORKSPACE_BYTES` for ``addmm``, :data:`DEFAULT_WORKSPACE_BYTES` for ``mm``, which runs ``cublasGemmEx`` and
   is matched by this posture with its workspace) the heuristic answers what torch runs.
 
-In both, the reduction-scheme mask lets split-K add its partial sums only in f32 (a bf16 partial sum rounds more than once),
-which is what torch does with ``allow_bf16_reduced_precision_reduction = False``, and a GEMM with a bias gets no split-K at all (with
-the bias epilogue a split-K was measured to round twice even with f32 partial sums, see :data:`NO_SPLIT_K_MASK`); with
-``allow_bf16_reduction=True`` (torch's default) no mask is set, and an algorithm whose split-K reduces in bf16 (``INPLACE``,
-``OUTPUT_TYPE``) is accepted.
+In both, the reduction-scheme mask lets split-K add its partial sums only in f32 (a bf16 or f16 partial sum rounds more than once),
+which is what torch does with ``allow_bf16_reduced_precision_reduction = False`` (``allow_fp16_reduced_precision_reduction`` for f16
+operands), and a GEMM with a bias gets no split-K at all (with the bias epilogue a split-K was measured to round twice even with f32 partial
+sums, see :data:`NO_SPLIT_K_MASK`); with the opt-in of the operands' type (``allow_bf16_reduction=True`` for bf16 operands,
+``allow_f16_reduction=True`` for f16 ones: torch's default) no mask is set, and an algorithm whose split-K reduces in the output type
+(``INPLACE``, ``OUTPUT_TYPE``) is accepted. The opt-in is named by the operands' type, as torch's flags are, whatever the type of ``D``.
 
 An algorithm can also be imported: :func:`encode_algo` turns its nine configuration attributes into the 64 bytes cuBLASLt
 writes for them. The pin is the 64-byte ``cublasLtMatmulAlgo_t`` as a 128-character hex string, and the workspace it needs.
@@ -49,7 +58,8 @@ writes for them. The pin is the 64-byte ``cublasLtMatmulAlgo_t`` as a 128-charac
 the problem before it runs; an algorithm that is not valid for the problem, or that needs more workspace than recorded, is
 refused. ``cublasLtMatmulAlgoCheck`` is a weak judge of bytes (it accepts several corruptions and crashes the process on some,
 see :func:`_validate_algo`), so the string is first held to what cuBLASLt itself would have encoded. The pin belongs to one
-cuBLASLt build (:func:`version`) and one device (compute capability, and the SM count of a MIG slice).
+cuBLASLt build (:func:`version`) and one device (compute capability, and the SM count of a MIG slice). An algorithm encodes the types of
+its operands and result (``cublasLtMatmulAlgoInit`` writes them), so a pin of one :class:`Form` is not one of another; the layout is not in it.
 
 Descriptors are built per call and destroyed at its end, so nothing mutable is shared between threads; the one thing that is
 shared is the cuBLASLt handle (one per device, created once under a lock, never destroyed before the process ends), which holds
@@ -107,7 +117,10 @@ CUBLAS_OP_T = 1
 CUBLAS_COMPUTE_32F = 68
 # library_types.h, cudaDataType_t
 CUDA_R_32F = 0
+CUDA_R_16F = 2
 CUDA_R_16BF = 14
+CUDA_TYPES = {"bf16": CUDA_R_16BF, "f16": CUDA_R_16F, "f32": CUDA_R_32F}  # tilefish's dtype -> cudaDataType_t
+CUDA_TYPE_NAMES = {"bf16": "CUDA_R_16BF", "f16": "CUDA_R_16F", "f32": "CUDA_R_32F"}
 # cublasLt.h, cublasLtMatmulDescAttributes_t (types: TRANSA/TRANSB/BIAS_DATA_TYPE int32_t, EPILOGUE uint32_t, BIAS_POINTER const void*)
 CUBLASLT_MATMUL_DESC_TRANSA = 3
 CUBLASLT_MATMUL_DESC_TRANSB = 4
@@ -144,32 +157,113 @@ ALLOWED_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_NONE, CUBLASLT_REDUCTION_
 BF16_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_INPLACE, CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE)  # allowed too with allow_bf16_reduction
 
 
+OPERAND_DTYPES = ("bf16", "f16")  # the types of A and B (both the same)
+LAYOUTS = ("TN", "NN")  # the transposes as cuBLASLt is called (transa, transb): B is [N, K] for TN, [K, N] for NN
+
+
+@dataclass(frozen=True)
+class Form:
+    """What a GEMM is besides its sizes and its bias: the type of ``A`` and ``B`` (``dtype``, ``"bf16"`` or ``"f16"``), the type of ``C`` and
+    ``D`` (``out``: ``dtype``, or ``"f32"``; a bias has this type too) and the layout (``"TN"``: ``B`` is ``[N, K]``; ``"NN"``: ``B`` is ``[K, N]``).
+    The default is tilefish 0.0.5's only GEMM, bf16 in and out, ``TN``."""
+
+    dtype: str = "bf16"
+    out: str = "bf16"
+    layout: str = "TN"
+
+    def __post_init__(self) -> None:
+        if self.dtype not in OPERAND_DTYPES:
+            raise TilefishRuntimeError(f"cuBLASLt matmul: the operands are one of {list(OPERAND_DTYPES)}, got {self.dtype!r}")
+        if self.out not in (self.dtype, "f32"):
+            raise TilefishRuntimeError(f"cuBLASLt matmul: the result of {self.dtype} operands is {self.dtype} or f32, got {self.out!r}")
+        if self.layout not in LAYOUTS:
+            raise TilefishRuntimeError(f"cuBLASLt matmul: the layout is one of {list(LAYOUTS)}, got {self.layout!r}")
+
+    @property
+    def transa(self) -> int:
+        return CUBLAS_OP_T if self.layout == "TN" else CUBLAS_OP_N
+
+    def lda(self, n: int, k: int) -> int:
+        """The leading dimension of the cuBLAS A operand (tilefish's ``B``): ``k`` for ``[N, K]`` (TN), ``n`` for ``[K, N]`` (NN)."""
+        return k if self.layout == "TN" else n
+
+    @property
+    def opt_in(self) -> str:
+        """The keyword of the opt-in to split-K partial sums in the output type: named by the operands' type, as torch's flags are."""
+        return f"allow_{self.dtype}_reduction"
+
+    @property
+    def what(self) -> str:
+        """The types, as a message says them: ``"bf16"``, ``"f16"``, ``"f16 operands and an f32 result"``."""
+        return self.dtype if self.out == self.dtype else f"{self.dtype} operands and an {self.out} result"
+
+    @property
+    def label(self) -> str:
+        """The form in a message about a problem: empty for the default (so 0.0.5's messages are unchanged), else ``" (f16 -> f32, NN)"``."""
+        if self == DEFAULT_FORM:
+            return ""
+        return f" ({self.dtype}{'' if self.out == self.dtype else ' -> ' + self.out}, {self.layout})"
+
+
+DEFAULT_FORM = Form()
+
+
+def check_form(form: object) -> Form:
+    if form is None:
+        return DEFAULT_FORM
+    if not isinstance(form, Form):
+        raise TilefishRuntimeError(f"cuBLASLt matmul: form must be a tilefish._cublaslt.Form, got {form!r}")
+    return form
+
+
+def opt_in(form: Form, allow_bf16_reduction: object, allow_f16_reduction: object) -> bool:
+    """The opt-in to split-K partial sums in the output type for ``form``: each flag is a bool, and only the flag of the operands' type may be set
+    (``allow_bf16_reduction`` for bf16 operands, ``allow_f16_reduction`` for f16 ones). Pure."""
+    for name, value in (("allow_bf16_reduction", allow_bf16_reduction), ("allow_f16_reduction", allow_f16_reduction)):
+        if not isinstance(value, bool):
+            raise TilefishRuntimeError(f"cuBLASLt matmul: {name} must be a bool, got {value!r}")
+        if value and name != form.opt_in:
+            raise TilefishRuntimeError(
+                f"cuBLASLt matmul: {name} is the opt-in of {name.split('_')[1]} operands; {form.dtype} operands opt in with {form.opt_in}=True"
+            )
+    return bool(allow_bf16_reduction or allow_f16_reduction)
+
+
 def allowed_reduction_schemes(allow_bf16_reduction: bool, bias: bool = False) -> "tuple[int, ...]":
     """The ``cublasLtReductionScheme_t`` values a pinned algorithm may have: no split-K and f32 partial sums (only no split-K with a bias), and with
-    the opt-in also the two that add the partial sums in bf16 (in the output buffer, or in a workspace of the output type)."""
+    the opt-in (``allow_bf16_reduction`` here stands for the opt-in of the operands' type) also the two that add the partial sums in the output type
+    (in the output buffer, or in a workspace of the output type)."""
     if allow_bf16_reduction:
         return ALLOWED_REDUCTION_SCHEMES + BF16_REDUCTION_SCHEMES
     return (CUBLASLT_REDUCTION_SCHEME_NONE,) if bias else ALLOWED_REDUCTION_SCHEMES
 
 
-def reduction_problem(splitk_num: int, reduction_scheme: int, allow_bf16_reduction: bool, bias: bool = False) -> "str | None":
-    """What is wrong with this split-K count and reduction scheme for a pin of a GEMM with or without a bias (``None``: nothing). Pure: the rule
-    both hosts hold an algorithm to (the Rust crate's ``reduction_problem`` has the same words)."""
+def reduction_problem(splitk_num: int, reduction_scheme: int, allow_bf16_reduction: bool, bias: bool = False, form: "Form | None" = None) -> "str | None":
+    """What is wrong with this split-K count and reduction scheme for a pin of a GEMM with or without a bias, of ``form`` (``None``: nothing).
+    ``allow_bf16_reduction`` is the opt-in of the operands' type (:func:`opt_in`). Pure: the rule both hosts hold an algorithm to (the Rust crate's
+    ``reduction_problem`` has the same words); for the default form the words are tilefish 0.0.5's."""
+    form = DEFAULT_FORM if form is None else form
     if splitk_num < 1:
         return f"split-K count {splitk_num} is below 1"
     if (splitk_num > 1) != (reduction_scheme != CUBLASLT_REDUCTION_SCHEME_NONE):
         return f"split-K count {splitk_num} does not go with reduction scheme {reduction_scheme} (split-K needs one, no split-K has none)"
     if reduction_scheme in BF16_REDUCTION_SCHEMES and not allow_bf16_reduction:
+        if form.out == "f32":
+            return (
+                f"reduction scheme {reduction_scheme} adds the split-K partial sums in the output (f32), not in a workspace of the compute type "
+                f"(only no split-K, 0, and f32 partial sums in the workspace, 2, are taken without the opt-in); a declaration may opt in with "
+                f"{form.opt_in}=True"
+            )
         return (
-            f"reduction scheme {reduction_scheme} adds the split-K partial sums in bf16, which rounds more than once (only no split-K, 0, and f32 "
-            "partial sums, 2, keep the one rounding); a declaration may opt in with allow_bf16_reduction=True"
+            f"reduction scheme {reduction_scheme} adds the split-K partial sums in {form.out}, which rounds more than once (only no split-K, 0, and f32 "
+            f"partial sums, 2, keep the one rounding); a declaration may opt in with {form.opt_in}=True"
         )
     if reduction_scheme not in ALLOWED_REDUCTION_SCHEMES + BF16_REDUCTION_SCHEMES:
         return f"reduction scheme {reduction_scheme} is not one cuBLASLt defines (0, 1, 2 or 4)"
     if bias and splitk_num > 1 and not allow_bf16_reduction:
         return (
-            f"split-K count {splitk_num} with the bias epilogue may add the bias to a sum already rounded to bf16 (measured with f32 partial "
-            "sums too), which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with allow_bf16_reduction=True"
+            f"split-K count {splitk_num} with the bias epilogue may add the bias to a sum already rounded to {form.out} (measured with f32 partial "
+            f"sums too), which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with {form.opt_in}=True"
         )
     return None
 # cublasLt.h, cublasLtMatmulAlgoConfigAttributes_t
@@ -471,45 +565,60 @@ def _check_flag(name: str, value: object) -> bool:
     return value
 
 
-def describe(m: int, n: int, k: int, bias: bool, *, allow_bf16_reduction: bool = False) -> "dict[str, Any]":
-    """The exact cuBLAS-level problem that tilefish's ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` is posed as (pure: no GPU, no library).
+def describe(
+    m: int,
+    n: int,
+    k: int,
+    bias: bool,
+    *,
+    allow_bf16_reduction: bool = False,
+    allow_f16_reduction: bool = False,
+    form: "Form | None" = None,
+) -> "dict[str, Any]":
+    """The exact cuBLAS-level problem that tilefish's ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` without the transpose for the
+    layout ``NN``) is posed as (pure: no GPU, no library).
 
-    The keys are what is passed to cuBLASLt: the transposes, the compute and scale types, the sizes ``cublas_m = n``,
+    The keys are what is passed to cuBLASLt: the types, the transposes, the compute and scale types, the sizes ``cublas_m = n``,
     ``cublas_n = m``, ``cublas_k = k`` and the leading dimensions of the column-major operands.
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
-    allow_bf16_reduction = _check_flag("allow_bf16_reduction", allow_bf16_reduction)
+    form = check_form(form)
+    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
+    ab, cd = CUDA_TYPE_NAMES[form.dtype], CUDA_TYPE_NAMES[form.out]
     return {
         "library": "cublasLt",
         "operation": "matmul",
-        "dtype": "bf16",
-        "a_type": "CUDA_R_16BF",
-        "b_type": "CUDA_R_16BF",
-        "c_type": "CUDA_R_16BF",
-        "d_type": "CUDA_R_16BF",
+        "dtype": form.dtype,
+        "out_dtype": form.out,
+        "layout": form.layout,
+        "a_type": ab,
+        "b_type": ab,
+        "c_type": cd,
+        "d_type": cd,
         "compute_type": "CUBLAS_COMPUTE_32F",
         "scale_type": "CUDA_R_32F",
         "order": "col",
-        "transa": "T",
-        "transb": "N",
+        "transa": form.layout[0],
+        "transb": form.layout[1],
         "cublas_m": n,
         "cublas_n": m,
         "cublas_k": k,
-        "lda": k,
+        "lda": form.lda(n, k),
         "ldb": k,
         "ldc": n,
         "ldd": n,
-        "a_operand": "B[N, K]",
+        "a_operand": "B[N, K]" if form.layout == "TN" else "B[K, N]",
         "b_operand": "A[M, K]",
         "alpha": 1.0,
         "beta": 0.0,
         "pointer_mode": "host",
         "epilogue": "bias" if bias else "none",
-        "bias_type": "CUDA_R_16BF" if bias else None,
+        "bias_type": cd if bias else None,
         "bias_length": n if bias else None,  # one value per row of the column-major D, which is one per column of tilefish's D
         "min_alignment_bytes": ALIGNMENT_BYTES,
-        # cublasLtReductionScheme_t values a split-K may use: NONE, COMPUTE_TYPE, and with the opt-in INPLACE and OUTPUT_TYPE (bf16 partial sums)
-        "reduction_schemes": list(allowed_reduction_schemes(allow_bf16_reduction, bias)),
+        # cublasLtReductionScheme_t values a split-K may use: NONE, COMPUTE_TYPE, and with the opt-in INPLACE and OUTPUT_TYPE (partial sums in
+        # the output type)
+        "reduction_schemes": list(allowed_reduction_schemes(allow, bias)),
     }
 
 
@@ -533,7 +642,7 @@ def preferences(heuristic: str, workspace_bytes: int, allow_bf16_reduction: bool
 class _Problem:
     """The descriptors of one call: matmul descriptor, the layouts of the two operands and of ``D`` (``C`` is the same), and
     optionally a preference (the attributes of :func:`preferences`). Everything is destroyed by :meth:`close`; nothing of it is shared
-    with another call."""
+    with another call. ``form`` is the types and the layout (``None``: bf16, ``TN``)."""
 
     def __init__(
         self,
@@ -544,26 +653,33 @@ class _Problem:
         bias: bool,
         bias_ptr: int,
         preference: "list[tuple[int, int]] | None",
+        form: "Form | None" = None,
     ) -> None:
         self.lib = lib
         self.bias = bias
+        self.form = form = DEFAULT_FORM if form is None else form
+        ab, cd = CUDA_TYPES[form.dtype], CUDA_TYPES[form.out]
         self._owned: "list[tuple[str, ctypes.c_void_p]]" = []
         try:
             self.desc = self._create("cublasLtMatmulDescDestroy", "cublasLtMatmulDescCreate", CUBLAS_COMPUTE_32F, CUDA_R_32F)
-            self._set(CUBLASLT_MATMUL_DESC_TRANSA, ctypes.c_int32(CUBLAS_OP_T))
+            self._set(CUBLASLT_MATMUL_DESC_TRANSA, ctypes.c_int32(form.transa))
             self._set(CUBLASLT_MATMUL_DESC_TRANSB, ctypes.c_int32(CUBLAS_OP_N))
             if bias:
                 self._set(CUBLASLT_MATMUL_DESC_EPILOGUE, ctypes.c_uint32(CUBLASLT_EPILOGUE_BIAS))
-                self._set(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, ctypes.c_int32(CUDA_R_16BF))
+                self._set(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, ctypes.c_int32(cd))  # the bias has the type of D (the only one the library takes)
                 self._set(CUBLASLT_MATMUL_DESC_BIAS_POINTER, ctypes.c_void_p(bias_ptr))
             else:
                 self._set(CUBLASLT_MATMUL_DESC_EPILOGUE, ctypes.c_uint32(CUBLASLT_EPILOGUE_DEFAULT))
-            # the "A operand" is tilefish's B[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
-            self.a = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", CUDA_R_16BF, k, n, k)
+            if form.layout == "TN":
+                # the "A operand" is tilefish's B[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
+                self.a = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, k, n, k)
+            else:
+                # NN: the "A operand" is tilefish's B[k, n]: stored n x k column-major, lda = n, used as it is
+                self.a = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, n, k, n)
             # the "B operand" is tilefish's A[m, k]: stored k x m column-major, ldb = k, used as it is
-            self.b = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", CUDA_R_16BF, k, m, k)
-            # D[m, n] row-major is n x m column-major, ldd = n; C has the layout of D
-            self.d = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", CUDA_R_16BF, n, m, n)
+            self.b = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", ab, k, m, k)
+            # D[m, n] row-major is n x m column-major, ldd = n; C has the layout (and the type) of D
+            self.d = self._create("cublasLtMatrixLayoutDestroy", "cublasLtMatrixLayoutCreate", cd, n, m, n)
             self.preference = None
             if preference is not None:
                 self.preference = self._create("cublasLtMatmulPreferenceDestroy", "cublasLtMatmulPreferenceCreate")
@@ -703,7 +819,7 @@ def _algo_config(lib: _Library, algo: _Algo) -> "dict[str, int]":
     return info
 
 
-_validated: "dict[tuple[int, str, bool, bool], dict[str, int]]" = {}  # (device, hex, allow_bf16_reduction, bias) -> the configuration that passed _validate_algo
+_validated: "dict[tuple[int, str, bool, bool, Form], dict[str, int]]" = {}  # (device, hex, opt-in, bias, form) -> the configuration that passed _validate_algo
 
 
 def _cap(lib: _Library, algo: _Algo, attr: int, ctype: Any, *, array: bool = False) -> Any:
@@ -719,27 +835,35 @@ def _cap(lib: _Library, algo: _Algo, attr: int, ctype: Any, *, array: bool = Fal
 
 
 def _validate_algo(
-    lib: _Library, handle: ctypes.c_void_p, index: int, algo_hex: str, allow_bf16_reduction: bool = False, bias: bool = False
+    lib: _Library,
+    handle: ctypes.c_void_p,
+    index: int,
+    algo_hex: str,
+    allow_bf16_reduction: bool = False,
+    bias: bool = False,
+    form: "Form | None" = None,
 ) -> "dict[str, int]":
     """Refuse an algorithm that cuBLASLt itself would not have produced, before ``cublasLtMatmulAlgoCheck`` sees it.
 
     Measured (cuBLASLt 12.8.4 on a B300): ``cublasLtMatmulAlgoCheck`` accepts an algorithm with a changed version field, changed
     padding, a reserved CTA swizzling or an out-of-range custom option, and it crashes the process (SIGSEGV) on a tile id of
     2**31 or more. So the bytes are held to what the library encodes for the configuration they read back as: the algorithm
-    is rebuilt with ``cublasLtMatmulAlgoInit`` (which also writes the data types, the compute type and the version) and
+    is rebuilt with ``cublasLtMatmulAlgoInit`` (which also writes the data types of ``form``, the compute type and the version) and
     ``cublasLtMatmulAlgoConfigSetAttribute``, and must be byte for byte the same; the configuration must be one that the
     capabilities of its id list (tile, stages, swizzling, custom option); it must accumulate in f32 and need no more than
-    16-byte alignment, and its split-K must go with a reduction scheme that does not round in bf16, and a GEMM with a bias has no split-K
-    (or, with ``allow_bf16_reduction``, any reduction scheme cuBLASLt defines: :func:`reduction_problem`). What this cannot see is a flip to
-    another valid configuration (another tile, say): that is a different, legitimate algorithm.
+    16-byte alignment, and its split-K must go with a reduction scheme that does not round in the output type, and a GEMM with a bias has no
+    split-K (or, with the opt-in of the operands' type, passed here as ``allow_bf16_reduction``, any reduction scheme cuBLASLt defines:
+    :func:`reduction_problem`). What this cannot see is a flip to another valid configuration (another tile, say): that is a different,
+    legitimate algorithm.
     """
-    key = (index, algo_hex, allow_bf16_reduction, bias)
+    form = DEFAULT_FORM if form is None else form
+    key = (index, algo_hex, allow_bf16_reduction, bias, form)
     cached = _validated.get(key)
     if cached is not None:
         return cached
-    head = f"the pinned cuBLASLt algorithm {algo_hex[:16]}... is not one cuBLASLt produces for bf16 with f32 accumulation"
+    head = f"the pinned cuBLASLt algorithm {algo_hex[:16]}... is not one cuBLASLt produces for {form.what} with f32 accumulation"
     try:
-        cfg = _validate_algo_bytes(lib, handle, algo_hex, head, allow_bf16_reduction, bias)
+        cfg = _validate_algo_bytes(lib, handle, algo_hex, head, allow_bf16_reduction, bias, form)
     except TilefishRuntimeError as e:
         if str(e).startswith(head):
             raise
@@ -748,17 +872,26 @@ def _validate_algo(
     return cfg
 
 
+def _init(lib: _Library, handle: ctypes.c_void_p, algo_id: int, form: Form, algo: _Algo) -> None:
+    """``cublasLtMatmulAlgoInit`` of ``algo`` for ``algo_id`` with the types of ``form`` (A, B, C, D) and an f32 accumulator and scale."""
+    ab, cd = CUDA_TYPES[form.dtype], CUDA_TYPES[form.out]
+    lib.call("cublasLtMatmulAlgoInit", handle, CUBLAS_COMPUTE_32F, CUDA_R_32F, ab, ab, cd, cd, algo_id, ctypes.byref(algo))
+
+
 def _validate_algo_bytes(
-    lib: _Library, handle: ctypes.c_void_p, algo_hex: str, head: str, allow_bf16_reduction: bool = False, bias: bool = False
+    lib: _Library,
+    handle: ctypes.c_void_p,
+    algo_hex: str,
+    head: str,
+    allow_bf16_reduction: bool = False,
+    bias: bool = False,
+    form: Form = DEFAULT_FORM,
 ) -> "dict[str, int]":
     algo = _algo_struct(algo_hex)
     cfg = _algo_config(lib, algo)
     fresh = _Algo()
     try:
-        lib.call(
-            "cublasLtMatmulAlgoInit",
-            handle, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, cfg["id"], ctypes.byref(fresh),
-        )
+        _init(lib, handle, cfg["id"], form, fresh)
     except TilefishRuntimeError as e:
         raise TilefishRuntimeError(f"{head}: algorithm id {cfg['id']} is unknown ({e})") from e
     problems: list[str] = []
@@ -775,7 +908,7 @@ def _validate_algo_bytes(
     custom_max = _cap(lib, fresh, _CAP_CUSTOM_OPTION_MAX, ctypes.c_int32)
     if cfg["custom_option"] > custom_max:
         problems.append(f"custom option {cfg['custom_option']} is above the maximum {custom_max} of algorithm {cfg['id']}")
-    reduction = reduction_problem(cfg["splitk_num"], cfg["reduction_scheme"], allow_bf16_reduction, bias)
+    reduction = reduction_problem(cfg["splitk_num"], cfg["reduction_scheme"], allow_bf16_reduction, bias, form)
     if reduction is not None:
         problems.append(reduction)
     if _cap(lib, fresh, _CAP_NUMERICAL_IMPL_FLAGS, ctypes.c_uint64) & _IMPL_ACCUMULATOR_TYPE_MASK != _IMPL_ACCUMULATOR_32F:
@@ -822,27 +955,33 @@ def pin_algo(
     device_index: "int | None" = None,
     heuristic: str = "tilefish",
     allow_bf16_reduction: bool = False,
+    allow_f16_reduction: bool = False,
+    form: "Form | None" = None,
 ) -> Pinned:
-    """Ask the heuristic for the algorithm of ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` under a workspace limit, and pin the first.
+    """Ask the heuristic for the algorithm of ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``form``: the types and the layout) under a workspace
+    limit, and pin the first.
 
     ``workspace_bytes`` is the limit the heuristic works under (:data:`DEFAULT_WORKSPACE_BYTES` is torch's default workspace
     config). ``heuristic`` is the posture (:data:`HEURISTICS`, see the module docstring): ``"tilefish"`` asks for a few results with
     16-byte alignment minimums (the pointers are not known here, and 16-byte alignment is all that is relied on), ``"torch"`` for one
-    result under the workspace limit alone, as torch's ``addmm`` does. ``allow_bf16_reduction`` lets split-K add its partial sums in bf16
-    (no reduction-scheme mask); without it they are added in f32.
+    result under the workspace limit alone, as torch's ``addmm`` does. The opt-in of the operands' type (``allow_bf16_reduction`` for bf16,
+    ``allow_f16_reduction`` for f16) lets split-K add its partial sums in the output type (no reduction-scheme mask); without it they are added
+    in f32.
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     limit = _check_workspace(workspace_bytes)
     device_index = _check_device_arg(device_index)
     heuristic = _check_heuristic(heuristic)
-    allow_bf16_reduction = _check_flag("allow_bf16_reduction", allow_bf16_reduction)
+    form = check_form(form)
+    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
     count = REQUESTED_ALGO_COUNT if heuristic == "tilefish" else 1
     dummy = HEURISTIC_BIAS_POINTER if heuristic == "tilefish" else TORCH_HEURISTIC_BIAS_POINTER
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    no_split_k = "; a GEMM with a bias is asked for one without split-K, unless it opts in with allow_bf16_reduction=True" if bias and not allow_bf16_reduction else ""
-    with _on_device(index), _Problem(lib, m, n, k, bias, dummy, preferences(heuristic, limit, allow_bf16_reduction, bias)) as p:
+    no_split_k = f"; a GEMM with a bias is asked for one without split-K, unless it opts in with {form.opt_in}=True" if bias and not allow else ""
+    what = f"the matmul m={m} n={n} k={k} bias={bias}{form.label}"
+    with _on_device(index), _Problem(lib, m, n, k, bias, dummy, preferences(heuristic, limit, allow, bias), form) as p:
         results = (_HeuristicResult * count)()
         returned = ctypes.c_int(0)
         status = lib.call(
@@ -853,24 +992,18 @@ def pin_algo(
         if status == CUBLAS_STATUS_NOT_SUPPORTED:
             returned.value = 0
         if returned.value < 1:
-            raise TilefishRuntimeError(
-                f"cuBLASLt returned no algorithm for the matmul m={m} n={n} k={k} bias={bias} under a workspace limit of {limit} bytes{no_split_k}"
-            )
+            raise TilefishRuntimeError(f"cuBLASLt returned no algorithm for {what} under a workspace limit of {limit} bytes{no_split_k}")
         first = results[0]
         if first.state != CUBLAS_STATUS_SUCCESS:
-            raise TilefishRuntimeError(
-                f"cuBLASLt's first algorithm for the matmul m={m} n={n} k={k} bias={bias} is unusable: {lib.status_name(first.state)}"
-            )
+            raise TilefishRuntimeError(f"cuBLASLt's first algorithm for {what} is unusable: {lib.status_name(first.state)}")
         required = int(first.workspaceSize)
         if required > limit:
-            raise TilefishRuntimeError(
-                f"cuBLASLt's first algorithm for the matmul m={m} n={n} k={k} bias={bias} needs {required} bytes of workspace, over the limit of {limit}"
-            )
+            raise TilefishRuntimeError(f"cuBLASLt's first algorithm for {what} needs {required} bytes of workspace, over the limit of {limit}")
         # The pin is the algorithm cuBLASLt encodes for the configuration the heuristic chose, not the 64 bytes it returned: those may hold
         # bytes that are no part of the configuration (measured, cuBLASLt 12.8.4 on an RTX 5090: two bytes that change from process to
         # process, in split-K algorithms of id 21), which would make the pin differ from run to run and fail the check of its bytes. The
         # configuration is all a pin is held to and all a replay rebuilds (_validate_algo), as the heuristic's own algorithm would be.
-        canonical = _encode(lib, handle, _algo_config(lib, first.algo))
+        canonical = _encode(lib, handle, _algo_config(lib, first.algo), form)
         return Pinned(algo_hex=algo_to_hex(bytes(canonical)), workspace_required=required, workspace_limit=limit)
 
 
@@ -910,32 +1043,30 @@ def check_config(config: object, what: str = "an algorithm configuration") -> "d
     return out
 
 
-def encode_algo(config: "dict[str, int]", *, device_index: "int | None" = None) -> str:
+def encode_algo(config: "dict[str, int]", *, device_index: "int | None" = None, form: "Form | None" = None) -> str:
     """The pin (:func:`algo_to_hex`) of an algorithm given by its nine configuration attributes (:data:`ALGO_CONFIG_FIELDS`, the names
-    :func:`algo_info` reads them back as): ``cublasLtMatmulAlgoInit`` for its id with bf16 operands and results and an f32 accumulator and
-    scale, then ``cublasLtMatmulAlgoConfigSetAttribute`` for the other eight, which is how cuBLASLt itself encodes them (the heuristic's own
-    algorithms come out byte for byte the same this way). Nothing is checked here beyond the types: :func:`check_algo` holds the result
-    to the capabilities of its id and has ``cublasLtMatmulAlgoCheck`` approve it for a problem."""
+    :func:`algo_info` reads them back as): ``cublasLtMatmulAlgoInit`` for its id with the operand and result types of ``form`` (bf16 by
+    default) and an f32 accumulator and scale, then ``cublasLtMatmulAlgoConfigSetAttribute`` for the other eight, which is how cuBLASLt itself
+    encodes them (the heuristic's own algorithms come out byte for byte the same this way). Nothing is checked here beyond the types:
+    :func:`check_algo` holds the result to the capabilities of its id and has ``cublasLtMatmulAlgoCheck`` approve it for a problem."""
     cfg = check_config(config)
     device_index = _check_device_arg(device_index)
+    form = check_form(form)
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
     with _on_device(index):
         try:
-            algo = _encode(lib, handle, cfg)
+            algo = _encode(lib, handle, cfg, form)
         except TilefishRuntimeError as e:
-            raise TilefishRuntimeError(f"the algorithm configuration {cfg} cannot be encoded for bf16 with f32 accumulation: {e}") from e
+            raise TilefishRuntimeError(f"the algorithm configuration {cfg} cannot be encoded for {form.what} with f32 accumulation: {e}") from e
     return algo_to_hex(bytes(algo))
 
 
-def _encode(lib: _Library, handle: ctypes.c_void_p, cfg: "dict[str, int]") -> _Algo:
-    """``cublasLtMatmulAlgoInit`` for ``cfg["id"]`` (bf16 operands and results, f32 accumulator and scale), then the other eight attributes."""
+def _encode(lib: _Library, handle: ctypes.c_void_p, cfg: "dict[str, int]", form: Form = DEFAULT_FORM) -> _Algo:
+    """``cublasLtMatmulAlgoInit`` for ``cfg["id"]`` (the types of ``form``, f32 accumulator and scale), then the other eight attributes."""
     algo = _Algo()
-    lib.call(
-        "cublasLtMatmulAlgoInit",
-        handle, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, cfg["id"], ctypes.byref(algo),
-    )  # fmt: skip
+    _init(lib, handle, cfg["id"], form, algo)
     for name, (attr, ctype) in _ALGO_CONFIG.items():
         if name != "id":
             value = ctype(cfg[name])
@@ -953,7 +1084,7 @@ def _check(
     what: str,
     allow_bf16_reduction: bool = False,
 ) -> int:
-    _validate_algo(lib, handle, index, algo_hex, allow_bf16_reduction, p.bias)
+    _validate_algo(lib, handle, index, algo_hex, allow_bf16_reduction, p.bias, p.form)
     algo = _algo_struct(algo_hex)
     result = _HeuristicResult()
     try:
@@ -982,23 +1113,27 @@ def check_algo(
     workspace_bytes: int,
     device_index: "int | None" = None,
     allow_bf16_reduction: bool = False,
+    allow_f16_reduction: bool = False,
+    form: "Form | None" = None,
 ) -> int:
-    """The workspace the pinned algorithm needs for this problem, after ``cublasLtMatmulAlgoCheck`` approved it.
+    """The workspace the pinned algorithm needs for this problem (of ``form``), after ``cublasLtMatmulAlgoCheck``
+    approved it.
 
     Raises :class:`~tilefish.errors.TilefishRuntimeError` when the algorithm is not valid for the problem on this device, or needs
-    more than ``workspace_bytes`` (the workspace recorded with the pin), or adds split-K partial sums in bf16 without
-    ``allow_bf16_reduction``.
+    more than ``workspace_bytes`` (the workspace recorded with the pin), or adds split-K partial sums in the output type without the opt-in
+    of the operands' type.
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     budget = _check_workspace(workspace_bytes)
     device_index = _check_device_arg(device_index)
-    allow_bf16_reduction = _check_flag("allow_bf16_reduction", allow_bf16_reduction)
+    form = check_form(form)
+    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
     algo_from_hex(algo_hex)  # the format, before anything reaches the library
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    with _on_device(index), _Problem(lib, m, n, k, bias, HEURISTIC_BIAS_POINTER, None) as p:
-        return _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}", allow_bf16_reduction)
+    with _on_device(index), _Problem(lib, m, n, k, bias, HEURISTIC_BIAS_POINTER, None, form) as p:
+        return _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}{form.label}", allow)
 
 
 def warm(device_index: "int | None" = None) -> None:
@@ -1023,8 +1158,11 @@ def matmul(
     device_index: "int | None" = None,
     workspace_ptr: "int | None" = None,
     allow_bf16_reduction: bool = False,
+    allow_f16_reduction: bool = False,
+    form: "Form | None" = None,
 ) -> None:
-    """``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` with the pinned algorithm, enqueued on ``stream`` (a ``CUstream`` as an int).
+    """``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` for the layout ``NN``; the types of ``form``) with the pinned algorithm,
+    enqueued on ``stream`` (a ``CUstream`` as an int).
 
     ``a_ptr``, ``b_ptr``, ``d_ptr`` and ``bias_ptr`` (``None`` for no bias) are device addresses, 16-byte aligned. The
     algorithm is checked for this problem first (see :func:`check_algo`); ``workspace_bytes`` is the workspace recorded with
@@ -1036,7 +1174,8 @@ def matmul(
     that memory and nothing is allocated: this is how a launch plan runs it (the workspace is a buffer of the plan's arena, so the call
     allocates nothing and can be captured in a CUDA graph). Besides the matmul itself the call touches the device not at all.
 
-    An algorithm whose split-K adds its partial sums in bf16 runs only with ``allow_bf16_reduction=True`` (the declaration's opt-in).
+    An algorithm whose split-K adds its partial sums in the output type runs only with the opt-in of the operands' type
+    (``allow_bf16_reduction=True`` or ``allow_f16_reduction=True``: the declaration's).
     """
     bias = bias_ptr is not None
     m, n, k, bias = _check_problem(m, n, k, bias)
@@ -1049,12 +1188,13 @@ def matmul(
     device_index = _check_device_arg(device_index)
     algo = _algo_struct(algo_hex)
     given = None if workspace_ptr is None else _check_workspace_pointer(workspace_ptr)
-    allow_bf16_reduction = _check_flag("allow_bf16_reduction", allow_bf16_reduction)
+    form = check_form(form)
+    allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction)
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None) as p:
-        required = _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}", allow_bf16_reduction)
+    with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None, form) as p:
+        required = _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}{form.label}", allow)
         workspace = None
         address = given
         if required and given is None:

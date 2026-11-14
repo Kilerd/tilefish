@@ -29,6 +29,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | `dims` | names from shapes, scalars and the grid | also the stride dimensions and the offset dimension of a strided pointer |
 | library | none | a pinned cuBLASLt GEMM, for one device (its architecture and SM count): `library` entries (no file) |
 | library entry (0.0.5) | — | three optional fields, present only when not the default: `heuristic`, `algo_source`, `allow_bf16_reduction` (section 9.1) |
+| library entry (0.0.6, crate 0.0.4) | — | f16 operands, an f32 result and the layout `NN` in the fields an entry always had (`dtypes`, `transa`, `lda`, the operands); the optional `allow_f16_reduction` (section 9.2) |
 | kernel entry (0.0.5, crate 0.0.3) | — | an optional `implementation`: which implementation of an operator declared with an implementation per architecture the binary is (section 4.1) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
@@ -363,14 +364,17 @@ compiled by Triton, so there are no `tt.divisibility` attributes; the preconditi
 
 ## 9. The `library` section: a pinned cuBLASLt GEMM
 
-`library` entries describe operations that a vendor library runs, with no file: today, a bf16 GEMM through cuBLASLt with the algorithm pinned.
+`library` entries describe operations that a vendor library runs, with no file: today, a GEMM of bf16 or f16 operands through cuBLASLt with the
+algorithm pinned.
 
 **The operation.** In tilefish's row-major terms, `out[M, N] = a[M, K] @ b[N, K]^T` (`+ bias[N]` for `impl: "cublaslt.gemm_bias"`): `a`, `b`, `bias`
 and `out` are bf16, contiguous, 16-byte aligned; the accumulator is f32; the result is rounded to bf16 **once**; the bias is added in f32 to the
-accumulator before that rounding (`CUBLASLT_EPILOGUE_BIAS`). `M`, `N`, `K` are static or bucketed: one entry per bucket combination (the stem names
-the buckets, like a kernel's). `N` and `K` may be any size (tilefish 0.0.5; 0.0.4 and crate 0.0.2 required multiples of 8): where a row of `k` or `n`
-bf16 elements does not start on 16 bytes, the leading dimensions are what decides which algorithms are valid, and `cublasLtMatmulAlgoCheck` (which
-sees them) judges the pinned one when it is pinned, when a host loads it and, in Python, before every run; the pointers stay 16-byte aligned.
+accumulator before that rounding (`CUBLASLT_EPILOGUE_BIAS`). That is the form of tilefish 0.0.5, and the form of every entry it wrote; section 9.2
+says the others: f16 operands, an f32 result, and `b` stored `[K, N]` (`out = a @ b`, the layout `NN`). `M`, `N`, `K` are static or bucketed: one
+entry per bucket combination (the stem names the buckets, like a kernel's). `N` and `K` may be any size (tilefish 0.0.5; 0.0.4 and crate 0.0.2
+required multiples of 8): where a row of `k` or `n` elements does not start on 16 bytes, the leading dimensions are what decides which algorithms
+are valid, and `cublasLtMatmulAlgoCheck` (which sees them) judges the pinned one when it is pinned, when a host loads it and, in Python, before every
+run; the pointers stay 16-byte aligned.
 
 **The fields** (exactly these; a reader refuses missing and unknown ones; `python/src/tilefish/_library.py`, `ENTRY_KEYS`, `validate_entry`):
 
@@ -384,12 +388,12 @@ sees them) judges the pinned one when it is pinned, when a host loads it and, in
 | `buckets` | object: dimension name → its bucket value (int ≥ 1) |
 | `dims` | the table of section 7 (`divisible_by`, `buckets`, `bucket`), every bucketed dimension with its `bucket` |
 | `preconditions` | list: one `pointer_alignment` of 16 bytes per pointer, a `static_size` per static axis, a `bucket` per bucketed dimension; no other kind |
-| `dtypes` | `{"a": "bf16", "b": "bf16", "out": "bf16"}` plus `"bias": "bf16"` for the bias op |
+| `dtypes` | `{"a": "bf16", "b": "bf16", "out": "bf16"}` plus `"bias": "bf16"` for the bias op (the other types: section 9.2) |
 | `compute_type` | `"CUBLAS_COMPUTE_32F"` |
 | `scale_type` | `"CUDA_R_32F"` |
-| `transa`, `transb` | `"T"` and `"N"`: the transposes **as cuBLASLt is called** (below) |
-| `m`, `n`, `k` | ints from 1 to 2147483647: the **tilefish** sizes, `a` is `[m, k]`, `b` is `[n, k]`, `out` is `[m, n]` |
-| `lda`, `ldb`, `ldc`, `ldd` | ints: the leading dimensions as cuBLASLt is called; exactly `lda = ldb = k`, `ldc = ldd = n` |
+| `transa`, `transb` | `"T"` and `"N"`: the transposes **as cuBLASLt is called** (below); `"N"` and `"N"` for the layout `NN` (section 9.2) |
+| `m`, `n`, `k` | ints from 1 to 2147483647: the **tilefish** sizes, `a` is `[m, k]`, `b` is `[n, k]` (`[k, n]` for `NN`), `out` is `[m, n]` |
+| `lda`, `ldb`, `ldc`, `ldd` | ints: the leading dimensions as cuBLASLt is called; exactly `lda = ldb = k`, `ldc = ldd = n` (`lda = n` for `NN`) |
 | `epilogue` | `"none"` for `gemm`, `"bias"` for `gemm_bias` |
 | `workspace_bytes` | int from 1 to 2^40: the workspace limit the heuristic was asked under **and the size of the workspace a launch provides** (default `8519680`, torch's default `CUBLAS_WORKSPACE_CONFIG`) |
 | `algo` | 128 lowercase hex digits: the 64 bytes of the `cublasLtMatmulAlgo_t`, in memory order (eight `uint64_t`, as the host stores them) |
@@ -398,12 +402,13 @@ sees them) judges the pinned one when it is pinned, when a host loads it and, in
 | `declaration_digest` | 64 lowercase hex digits: sha256 over the canonical declaration (name, impl, workspace limit, signature with the dimensions' constraints, and the options of section 9.1 that are not the default) **and the `sm_count`** (the canonical declaration object with the key `"sm_count"` added, format 2): a pin is the declaration on one device |
 | `heuristic` | *optional* (section 9.1): absent, or exactly `"torch"` |
 | `algo_source` | *optional* (section 9.1): absent, or exactly `"imported"` |
-| `allow_bf16_reduction` | *optional* (section 9.1): absent, or exactly `true` |
+| `allow_bf16_reduction` | *optional* (section 9.1): absent, or exactly `true`; only on an entry of bf16 operands |
+| `allow_f16_reduction` | *optional* (section 9.2): absent, or exactly `true`; only on an entry of f16 operands |
 
-`abi.params[i]` has exactly `index` (= i), `name`, `kind` (`"pointer"`), `dtype` (`"bf16"`), `access` (`"in"`, and `"out"` for the last), `shape` (a list
-of ints and dimension expressions: `a` is rank 2, `b` rank 2, `bias` rank 1, `out` rank 2). The shapes must agree with `m`, `n`, `k`: an integer entry
-equals the size, an expression entry evaluates to it when the bucketed dimensions have their `buckets` values (an expression that mentions a
-dimension with no bucket is refused).
+`abi.params[i]` has exactly `index` (= i), `name`, `kind` (`"pointer"`), `dtype` (its type in `dtypes`: `"bf16"` in the form of 0.0.5), `access`
+(`"in"`, and `"out"` for the last), `shape` (a list of ints and dimension expressions: `a` is rank 2, `b` rank 2, `bias` rank 1, `out` rank 2). The
+shapes must agree with `m`, `n`, `k` (and the layout): an integer entry equals the size, an expression entry evaluates to it when the bucketed
+dimensions have their `buckets` values (an expression that mentions a dimension with no bucket is refused).
 
 **The cuBLASLt problem.** cuBLASLt is column-major, so tilefish's `a`, `b`, `out` are passed as the TN gemm `m_cublas = n`, `n_cublas = m`, `k_cublas = k`:
 the cuBLAS "A" operand is tilefish's **`b`** (`transa = T`, a `k × n` column-major matrix with `lda = k`), the cuBLAS "B" operand is tilefish's **`a`**
@@ -478,6 +483,42 @@ These fields are provenance for a host that runs the pin (it runs `algo` either 
 `test_the_torch_posture_pins_what_torch_runs`, on 48 shapes with and without a bias and three operand sets each; measured on a B300 MIG slice, sm_103, and
 an RTX 5090, sm_120, with cuBLASLt 12.8.4).
 
+### 9.2 f16 operands, an f32 result, the layout `NN` (tilefish 0.0.6, crate 0.0.4)
+
+The form of a GEMM is the type of its operands, the type of its result and how `b` is stored. An entry says it in the fields it always had, so the
+schema is unchanged and an entry of tilefish 0.0.5 (bf16, `TN`) is byte for byte what it was, with the same digests. A reader of 0.0.5 or crate
+0.0.3 refuses an entry of another form (its `dtypes` or `transa` are not the ones it knows), which is right: it would run it as bf16 `TN`.
+
+| | the form of 0.0.5 | the other forms |
+|---|---|---|
+| operands `a`, `b` | bf16 | bf16 or f16, both the same (`dtypes.a`, `dtypes.b`, the `dtype` of the pointers `a` and `b`) |
+| result `out` | bf16 | the operands' type, or f32 (`dtypes.out`) |
+| `bias` | bf16 | the result's type (`dtypes.bias`): cuBLASLt takes no other. Measured on 12.8.4 (sm_103): an f32 bias with a 16-bit result, and a 16-bit bias with an f32 result, are `CUBLAS_STATUS_INVALID_VALUE` from the heuristic, so a declaration cannot have them |
+| layout | `TN`: `b` is `[n, k]`, `out = a @ b^T`; `transa = "T"`, `lda = k` | `NN`: `b` is `[k, n]`, `out = a @ b`; `transa = "N"`, `transb = "N"`, `lda = n`, `ldb = k`, `ldc = ldd = n`; the pointer `b` has the shape `[k, n]` |
+| opt-in to split-K partial sums in the output type | `allow_bf16_reduction` | named by the **operands'** type, as torch's flags are: `allow_f16_reduction` for f16 operands (whatever the result's type). Each is refused on an entry of the other type |
+
+How cuBLASLt is called: the layouts of `a` and `b` (cuBLAS's B and A operands) have the operands' type, `C` and `D` the result's type and the layout
+of `D`, `BIAS_DATA_TYPE` is the result's type, and for `NN` cuBLAS's A operand is the `n x k` column-major matrix that `b [k, n]` is, used with
+`transa = N`. `cublasLtMatmulAlgoInit` writes the four types into the algorithm, so the 64 bytes of a pin are for one pair of operand and result types
+(not for one layout): step 4 rebuilds the algorithm with the entry's types, and a pin of other types is refused there ("its bytes are not those
+cuBLASLt encodes"). The rule of step 4 is the same with the words of the form: split-K partial sums "in f16", or, for an f32 result, "in the output
+(f32)", need the opt-in of the operands' type.
+
+The other two layouts, `a` stored `[k, m]` (`transb = "T"`, `ldb = m`) with either `b`, are two more rows of the same tables in both hosts; they are not
+offered because nothing has needed them yet.
+
+`workspace_bytes` is per declaration, any size up to 2^40 (a 64 MiB limit is `64 << 20`): the heuristic is asked under it and a launch provides it.
+
+The `"torch"` posture of section 9.1 is torch's for f16 too: `@tilefish.library(..., heuristic="torch", allow_f16_reduction=True)` pins what
+`torch.mm(a, b.t())` / `torch.addmm(bias, a, b.t())` run in f16 (`TN`), and what `torch.mm(a, b)` / `torch.addmm(bias, a, b)` run (`NN`), byte for
+byte: `python/tests/test_gpu_gemm_f16.py`, `test_the_torch_posture_pins_what_torch_runs_in_f16`, 63 shapes (`M` from 1 to 2048, `N` and `K` of
+projections and of convolutions as GEMMs) with three operand sets each, in both layouts, with and without a bias, measured on a B300 MIG slice
+(sm_103) with cuBLASLt 12.8.4.
+
+An `AlgoTable` row of the layout `NN` says it in its key, `(m, n, k, bias, "NN")` (`(m, n, k, bias)` is a row of `TN`); a configuration is encoded
+with the types of the declaration that imports it. The canonical declaration has `"layout": "NN"` when the layout is `NN` (with `K = N` the signature
+alone would not tell the layouts apart) and `"allow_f16_reduction": true` when it opts in; the types are in its signature.
+
 ## 10. Strict reading: every refusal
 
 A reader of schema 3 refuses (Python: `TilefishManifestError` unless marked *spec*, which are `TilefishSpecError` of the per-binary compile spec, a
@@ -520,7 +561,9 @@ document tilefish writes next to a build and the host does not read):
   `max_elements` on a pointer with `strides`; `pointer_alignment` of a strided pointer other than 16 or its element size (of any other pointer other
   than 16); every pointer must have exactly one `pointer_alignment`.
 * every `library` entry: the field list, the types and the cross-field equalities of section 9, each by the rule given there; an optional field of section 9.1
-  with any value but its one (`"torch"`, `"imported"`, `true`), `null` included.
+  or 9.2 with any value but its one (`"torch"`, `"imported"`, `true`), `null` included; a form section 9.2 does not list (operands of two types or of
+  another type than bf16 and f16, a result of another type than theirs or f32, a bias of another type than the result, `transa`/`transb` other than
+  `T`/`N` and `N`/`N`, an `lda`, a `b` shape or a pointer `dtype` that is not the form's); the opt-in of the other operand type.
 * *spec* only, for prebuilt binaries: a `binary` section that is not `{kind, symbol, shared, digests}`; `attrs` not empty; `launch_params` not every arg
   in order; a `block` that is not three ints from 1 to 1024 with product ≤ 1024; a `constexpr` argument.
 
@@ -585,7 +628,8 @@ ranges are checked (kind `shape`); `launch` gives no value, so it is refused for
   and swizzling and custom option within the capabilities of its id, an f32 accumulator, alignment at most 16 bytes, split-K with a reduction scheme of `NONE` or
   `COMPUTE_TYPE`, or also `INPLACE` or `OUTPUT_TYPE` for an entry with `allow_bf16_reduction`), an algorithm `cublasLtMatmulAlgoCheck` does not approve for the
   problem, and one that needs more than `workspace_bytes`. The optional fields of section 9.1 are read into `LibraryEntry::heuristic` (`Heuristic`),
-  `algo_source` (`AlgoSource`) and `allow_bf16_reduction`. The check runs once at
+  `algo_source` (`AlgoSource`) and `allow_bf16_reduction`; the form of section 9.2 into `LibraryEntry::dtype`, `out_dtype` (`DType`), `layout`
+  (`GemmLayout::Tn` or `Nn`) and `allow_f16_reduction`, and the algorithm is vetted and run with those types and that layout. The check runs once at
   load, not at every launch (the problem of an entry is fixed); the descriptors of a call are made and destroyed in the call.
 * The process must map the same cuBLASLt build that chose the pin (cudarc tries `libcublasLt.so` and then `.so.<major>`, `.so.12`, ...; on a machine whose torch
   ships its own cuBLASLt, put that directory on `LD_LIBRARY_PATH`): a different build is refused by the version check, and by nothing else.
@@ -620,6 +664,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 | prebuilt PTX and cubin, byte identity with the Triton path | `test_binary_externs.py`; on a GPU `test_gpu_binary.py`, `ptx/*.ptx` |
 | the `library` section | `test_library_ops.py`, `test_cublaslt.py`; on a GPU `test_gpu_gemm.py`, `test_gpu_cublaslt.py` |
 | its optional fields (section 9.1): the posture, imported algorithms, bf16 split-K partial sums | `test_library_options.py`, `test_cublaslt.py`; on a GPU `test_gpu_cublaslt.py` (torch's bytes, the opt-in), `test_gpu_gemm.py` (jit and replay) |
+| f16 operands, an f32 result, the layout NN, `allow_f16_reduction` (section 9.2) | `test_library_f16.py`; on a GPU `test_gpu_gemm_f16.py` (torch's bytes in both layouts, the f64 reference, jit, replay, plans, imported tables, the opt-in) |
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
 | `options.enable_fp_fusion` of a hand-written kernel (`@tilefish.extern(enable_fp_fusion=...)`) | `test_lower_options.py`; on a GPU `test_gpu_extern_fusion.py` |
 | `implementation`: an operator with an implementation per architecture (section 4.1) | `test_per_arch.py`; on a GPU `test_gpu_per_arch.py` (and the Rust gate) |
@@ -628,7 +673,8 @@ The Rust crate (`crates/tilefish/tests/`):
 
 | what | tests |
 |---|---|
-| strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs` (the optional fields of section 9.1 too), `schema3.rs` (synthetic manifests, `common/synthetic.rs`; `implementation` of section 4.1) |
+| strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs` (the optional fields of section 9.1 and the forms of 9.2 too), `schema3.rs` (synthetic manifests, `common/synthetic.rs`; `implementation` of section 4.1) |
+| the forms of section 9.2: Python's verdict on entries of every form and on each changed in one field | `python_library.rs` (`data/python_library.json`, made by `export_rust_vectors.py`) |
 | views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
 | on a GPU, byte identity with Python's `replay` of every feature, the refusals, graph capture of a GEMM and of a strided kernel, the hazards of other streams | `gpu_gate.rs` with `python/tests/rust_gate.py` |

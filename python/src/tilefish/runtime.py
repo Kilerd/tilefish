@@ -675,15 +675,16 @@ _pins: "dict[tuple, Any]" = {}  # (stem, arch, device, its SM count, workspace, 
 def _run_library(op: LibraryOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", mode: str, manifest: "Manifest | None") -> Any:
     """Run a pinned library operation (a cuBLASLt GEMM). ``jit`` pins the algorithm in memory exactly as ``export`` does and runs it; ``replay``
     runs the algorithm a manifest recorded, after checking that its entry is what the declaration asks for and that cuBLASLt is the version that
-    chose it; ``reference`` is torch: an f32 matmul of the operands with the bias added in f32, rounded once to bf16."""
+    chose it; ``reference`` is torch: an f32 matmul of the operands with the bias added in f32, rounded once to the result's type."""
     from . import _library
+    from ._launch import TORCH_DTYPE_NAMES
 
     torch = _torch()
     call = bind_call(op.name, op.signature, args, kwargs)
     check_dim_constraints(call.dims, buckets=mode != "reference")
     if mode == "reference":
         device = _device_of(call.infos, call.tensors)
-        return _library.reference_gemm(call.tensors).to(device)
+        return _library.reference_of(op, call.tensors).to(device)
     with _lock:
         specs = _library_specs.get(op)
     if specs is None:
@@ -695,7 +696,8 @@ def _run_library(op: LibraryOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]
     if getattr(device, "type", None) != "cuda":
         raise TilefishRuntimeError(f"jit and replay run on a CUDA device; the tensors are on {device}")
     shape = [eval_dim(d, call.dims) for d in op.signature.returns[0].shape]
-    out = torch.empty(shape, dtype=torch.bfloat16, device=device)
+    out_dtype = getattr(torch, TORCH_DTYPE_NAMES[op.signature.returns[0].dtype.name].removeprefix("torch."))
+    out = torch.empty(shape, dtype=out_dtype, device=device)
     check_spec_preconditions(spec, {**call.infos, "out": tensor_info("out", out)}, {}, call.dims)
     index = _device_index(torch, str(device))
     if mode == "jit":

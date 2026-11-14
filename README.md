@@ -425,6 +425,22 @@ A manifest entry records them as `heuristic`, `algo_source` and `allow_bf16_redu
 (`docs/manifest-schema-3.md`, section 9). A pin is the configuration the heuristic chose, encoded by the library: the 64 bytes the heuristic returns can carry
 bytes that are no part of it, which change from process to process.
 
+**f16, an f32 result, `b` as `[K, N]`.** The operands may be f16 (both of one type), the result f32 (and a bias has the result's type: cuBLASLt takes no
+other, measured), and `layout="NN"` takes `b: Tensor[K, N, T]` and computes `a @ b` (the default, `"TN"`, is `a @ b.T` with `b: Tensor[N, K, T]`):
+
+```python
+@tilefish.library("up", acc=f32, impl="cublaslt.gemm_bias", layout="NN", heuristic="torch", allow_f16_reduction=True, workspace_bytes=64 << 20)
+def up(a: Tensor[M, 7168, f16], b: Tensor[7168, 1536, f16], bias: Tensor[1536, f16]) -> Tensor[M, 1536, f16]: ...   # torch.addmm(bias, a, b), byte for byte
+
+@tilefish.library("down", acc=f32, impl="cublaslt.gemm")
+def down(a: Tensor[M, 3072, f16], b: Tensor[1024, 3072, f16]) -> Tensor[M, 1024, f32]: ...   # a @ b.T, rounded once to f32
+```
+
+The opt-in to split-K partial sums in the output type is named by the operands' type, as torch's flags are (`allow_f16_reduction` for f16 operands). Under
+`heuristic="torch"` with it, the result is `torch.mm` / `torch.addmm` in f16 byte for byte in both layouts (`test_gpu_gemm_f16.py`: 63 shapes, three
+operand sets each, measured on a B300 MIG slice with cuBLASLt 12.8.4). An `AlgoTable` row of the layout `NN` is keyed `(m, n, k, bias, "NN")`; a
+configuration is encoded with the declaration's types. The entry says the form in `dtypes`, `transa` and `lda` (`docs/manifest-schema-3.md`, section 9.2).
+
 ## Masks, indices, gathers and copies
 
 A lowered `@kernel` also compares, selects, counts positions, reduces to an index, and gathers and scatters rows at indices that are device

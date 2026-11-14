@@ -1,16 +1,19 @@
 """Library operations with a pinned implementation: a cuBLASLt GEMM.
 
 ``@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")`` declares an operation by its signature and says which library
-routine runs it. For ``impl="cublaslt.gemm"`` the signature is ``(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) -> Tensor[M, N, bf16]``
-and for ``"cublaslt.gemm_bias"`` it has a third parameter ``bias: Tensor[N, bf16]``. Semantics, in tilefish's row-major terms:
+routine runs it. For ``impl="cublaslt.gemm"`` the signature is ``(a: Tensor[M, K, T], b: Tensor[N, K, T]) -> Tensor[M, N, D]``
+and for ``"cublaslt.gemm_bias"`` it has a third parameter ``bias: Tensor[N, D]``, where ``T`` is ``bf16`` or ``f16`` and ``D`` is ``T`` or
+``f32``. With ``layout="NN"`` (the default is ``"TN"``) ``b`` is ``Tensor[K, N, T]``. Semantics, in tilefish's row-major terms:
 
-    out[M, N] = a[M, K] @ b[N, K]^T        (+ bias[N])
+    out[M, N] = a[M, K] @ b[N, K]^T        (+ bias[N])          layout "TN"
+    out[M, N] = a[M, K] @ b[K, N]          (+ bias[N])          layout "NN"
 
-with an f32 accumulator and **one** rounding, to bf16, at the end; the bias goes through ``CUBLASLT_EPILOGUE_BIAS``, so it is added in
-f32 to the accumulator before that rounding. Every operand is contiguous with a 16-byte aligned pointer (a strided operand is not
-supported in this version: pass ``.contiguous()``). ``K`` and ``N`` may be any size: when a row of ``k`` or ``n`` bf16 elements does not start on
-16 bytes (``K`` or ``N`` not a multiple of 8), an algorithm that needs aligned rows is not valid for the problem, which
-``cublasLtMatmulAlgoCheck`` says (it sees the leading dimensions) when the algorithm is pinned and before every run.
+with an f32 accumulator and **one** rounding, to ``D``, at the end; the bias goes through ``CUBLASLT_EPILOGUE_BIAS``, so it is added in
+f32 to the accumulator before that rounding (cuBLASLt takes a bias of the result's type only: measured, :mod:`tilefish._cublaslt`). Every
+operand is contiguous with a 16-byte aligned pointer (a strided operand is not supported in this version: pass ``.contiguous()``). ``K`` and
+``N`` may be any size: when a row of ``k`` or ``n`` elements does not start on 16 bytes (``K`` or ``N`` not a multiple of 8 for 16-bit
+operands), an algorithm that needs aligned rows is not valid for the problem, which ``cublasLtMatmulAlgoCheck`` says (it sees the leading
+dimensions) when the algorithm is pinned and before every run.
 
 **A binary is a pinned algorithm.** For every ``(M, N, K, bias)`` (``M``, ``N`` and ``K`` are static or bucketed: one entry per bucket
 combination, like a kernel) the heuristic of cuBLASLt is asked, with a fixed workspace limit (``workspace_bytes``), for its best
@@ -23,8 +26,10 @@ How the heuristic is asked is the declaration's ``heuristic=`` (:mod:`tilefish._
 8 519 680, torch's default ``CUBLAS_WORKSPACE_CONFIG``, and 16-byte alignment minimums) or ``"torch"`` (what torch's ``addmm`` asks: one
 result under the workspace limit alone; the limit is 1 048 576 for ``gemm_bias``, torch's default ``CUBLASLT_WORKSPACE_SIZE``, and
 8 519 680 for ``gemm``, the workspace of the ``cublasGemmEx`` that ``torch.mm`` runs). Split-K adds its partial sums in f32 unless the
-declaration says ``allow_bf16_reduction=True``. And ``algos=`` (:class:`AlgoTable`, one per device) imports the algorithms instead: on a
-device a table is for, the heuristic is not asked, and each entry runs the algorithm the table gives for its ``(M, N, K, bias)``.
+declaration opts in with the flag of its operands' type, ``allow_bf16_reduction=True`` or ``allow_f16_reduction=True`` (torch's
+``allow_bf16_reduced_precision_reduction`` and ``allow_fp16_reduced_precision_reduction``). And ``algos=`` (:class:`AlgoTable`, one per device)
+imports the algorithms instead: on a device a table is for, the heuristic is not asked, and each entry runs the algorithm the table gives for its
+``(M, N, K, bias)`` (and layout).
 
 Nothing here imports torch or loads cuBLASLt until a build or a run needs them (:mod:`tilefish._cublaslt`).
 """
@@ -59,7 +64,9 @@ DIGEST_FORMAT = 2  # of the canonical declaration below (2: the digest of an ent
 # what every entry of this implementation says about the problem, as cuBLASLt is called (see the module docstring and describe())
 COMPUTE_TYPE = "CUBLAS_COMPUTE_32F"
 SCALE_TYPE = "CUDA_R_32F"
-TRANSA, TRANSB = "T", "N"  # cuBLAS is column-major: its A operand is tilefish's b (op T), its B operand is tilefish's a (op N)
+TRANSA, TRANSB = "T", "N"  # cuBLAS is column-major: its A operand is tilefish's b (op T), its B operand is tilefish's a (op N); the layout TN
+LAYOUTS = ("TN", "NN")  # transa then transb as cuBLASLt is called: b is [N, K] for TN (transa T, lda = k), [K, N] for NN (transa N, lda = n)
+OPERAND_DTYPES = ("bf16", "f16")  # of a and b; the result (and a bias) is of their type or f32
 
 _ALGO = re.compile(r"^[0-9a-f]{128}\Z")
 _ARCH = re.compile(r"^sm_[0-9]{2,3}\Z")
@@ -68,12 +75,19 @@ ENTRY_KEYS = (
     "epilogue workspace_bytes algo cublaslt_version sm_count declaration_digest"
 ).split()
 # Fields an entry has only when its declaration is not the default, each with the one value it may then have (absent: the default, so an entry
-# of a default declaration is what tilefish 0.0.4 wrote): the heuristic posture, an imported algorithm, the opt-in to bf16 split-K partial sums.
-OPTIONAL_ENTRY_FIELDS = {"heuristic": "torch", "algo_source": "imported", "allow_bf16_reduction": True}
+# of a default declaration is what tilefish 0.0.4 wrote): the heuristic posture, an imported algorithm, the opt-in to split-K partial sums in the
+# output type (named by the operands' type: allow_bf16_reduction on bf16 operands, allow_f16_reduction on f16 ones).
+OPTIONAL_ENTRY_FIELDS = {"heuristic": "torch", "algo_source": "imported", "allow_bf16_reduction": True, "allow_f16_reduction": True}
 
 
 def has_bias(impl: str) -> bool:
     return IMPLS[impl]
+
+
+def table_key(m: int, n: int, k: int, bias: bool, layout: str = "TN") -> "tuple[Any, ...]":
+    """The key of an :class:`AlgoTable` row: ``(m, n, k, bias)`` for the layout ``TN`` (tilefish 0.0.5's only one), ``(m, n, k, bias, layout)``
+    for another."""
+    return (m, n, k, bias) if layout == "TN" else (m, n, k, bias, layout)
 
 
 def default_workspace_bytes(impl: str, heuristic: str) -> int:
@@ -93,16 +107,19 @@ class AlgoTable:
     ``algos`` maps ``(m, n, k, bias)`` (tilefish's sizes, ``a [m, k]``, ``b [n, k]``, and whether the GEMM has a bias) to an algorithm: a dict
     of its nine configuration attributes (``id``, ``tile_id``, ``splitk_num``, ``reduction_scheme``, ``cta_swizzling``, ``custom_option``,
     ``stages_id``, ``inner_shape_id``, ``cluster_shape_id``: what ``cublasLtMatmulAlgoConfigGetAttribute`` reads back, and what
-    ``tilefish._cublaslt.algo_info`` returns), which is encoded as cuBLASLt itself encodes it, or the 128 hex digits of a pin. A declaration
+    ``tilefish._cublaslt.algo_info`` returns), which is encoded as cuBLASLt itself encodes it (with the operand and result types of the
+    declaration that uses it: a configuration has no types), or the 128 hex digits of a pin (which have them: the checks refuse a pin of other
+    types). A key of another layout than ``TN`` says it: ``(m, n, k, bias, "NN")`` (``(m, n, k, bias, "TN")`` is ``(m, n, k, bias)``). A declaration
     with ``algos=`` runs, on a device a table is for, the table's algorithm for each of its entries, after the same checks as a pin of the
     heuristic (the bytes are what cuBLASLt encodes, the capabilities of the id, ``cublasLtMatmulAlgoCheck`` for the problem, the workspace limit,
-    and a bf16 split-K reduction only with ``allow_bf16_reduction=True``); it is recorded in the entry as ``"algo_source": "imported"``.
-    Rows for other shapes are allowed (one table can serve several declarations) and do not reach a declaration's digest."""
+    and a split-K reduction in the output type only with the opt-in of the operands' type); it is recorded in the entry as
+    ``"algo_source": "imported"``. Rows for other shapes are allowed (one table can serve several declarations) and do not reach a declaration's
+    digest."""
 
     arch: str
     sm_count: int
     cublaslt_version: int
-    algos: "dict[tuple[int, int, int, bool], Any]"
+    algos: "dict[tuple[Any, ...], Any]"
 
     def __post_init__(self) -> None:
         from . import _cublaslt
@@ -116,22 +133,29 @@ class AlgoTable:
                 raise TilefishDeclarationError(f"{where}: {name} must be a positive int, got {v!r}")
         if not isinstance(self.algos, dict) or not self.algos:
             raise TilefishDeclarationError(f"{where}: algos must be a non-empty dict of (m, n, k, bias) -> algorithm, got {self.algos!r}")
-        rows: "dict[tuple[int, int, int, bool], Any]" = {}
+        rows: "dict[tuple[Any, ...], Any]" = {}
         for key, algo in self.algos.items():
             if (
                 not isinstance(key, tuple)
-                or len(key) != 4
+                or len(key) not in (4, 5)
                 or any(isinstance(x, bool) or not isinstance(x, int) or not 1 <= x <= _cublaslt.INT32_MAX for x in key[:3])
                 or not isinstance(key[3], bool)
+                or (len(key) == 5 and key[4] not in LAYOUTS)
             ):
-                raise TilefishDeclarationError(f"{where}: a key is (m, n, k, bias), three ints from 1 to 2**31 - 1 and a bool, got {key!r}")
+                raise TilefishDeclarationError(
+                    f"{where}: a key is (m, n, k, bias), three ints from 1 to 2**31 - 1 and a bool, or (m, n, k, bias, layout) with a layout of "
+                    f"{list(LAYOUTS)}, got {key!r}"
+                )
+            row = table_key(*key)
+            if row in rows:
+                raise TilefishDeclarationError(f"{where}: two rows are for {row} (a key of the layout TN may leave it out, but not both)")
             what = f"{where} ({self.arch}, {self.sm_count} SMs) algorithm for {key}"
             try:
                 if isinstance(algo, str):
                     _cublaslt.algo_from_hex(algo)  # 128 lowercase hex digits
-                    rows[key] = algo
+                    rows[row] = algo
                 else:
-                    rows[key] = _cublaslt.check_config(algo, what)
+                    rows[row] = _cublaslt.check_config(algo, what)
             except TilefishRuntimeError as e:  # the binding's pure checks; about a declaration here
                 raise TilefishDeclarationError(str(e)) from None
         object.__setattr__(self, "algos", rows)
@@ -140,13 +164,14 @@ class AlgoTable:
     def device(self) -> "tuple[str, int, int]":
         return (self.arch, self.sm_count, self.cublaslt_version)
 
-    def canonical(self, keys: "list[tuple[int, int, int, bool]]") -> "dict[str, Any]":
-        """The table restricted to ``keys``, as canonical JSON-able data (what a declaration's digest covers)."""
+    def canonical(self, keys: "list[tuple[Any, ...]]") -> "dict[str, Any]":
+        """The table restricted to ``keys`` (of one declaration, so of one layout, which its canonical form says), as canonical JSON-able data
+        (what a declaration's digest covers): a row is ``[m, n, k, bias, algorithm]``."""
         return {
             "arch": self.arch,
             "sm_count": self.sm_count,
             "cublaslt_version": self.cublaslt_version,
-            "algos": [[m, n, k, bias, self.algos[(m, n, k, bias)]] for (m, n, k, bias) in sorted(keys)],
+            "algos": [[*key[:4], self.algos[key]] for key in sorted(keys)],
         }
 
     def __repr__(self) -> str:
@@ -178,19 +203,37 @@ def table_for(tables: "tuple[AlgoTable, ...]", arch: str, sm_count: int, version
 # -- the declaration -------------------------------------------------------------------------------------------------------
 
 
-def check_options(name: str, heuristic: Any, allow_bf16_reduction: Any, algos: Any) -> "tuple[AlgoTable, ...] | None":
-    """Check the options of a ``@library(impl=...)`` declaration that say how its algorithms are chosen (the posture, the opt-in to bf16 split-K
-    partial sums, the imported tables); return the tables (``None`` without). Raises a ``TilefishDeclarationError``."""
+def check_options(
+    name: str, heuristic: Any, allow_bf16_reduction: Any, algos: Any, allow_f16_reduction: Any = False, layout: Any = "TN"
+) -> "tuple[AlgoTable, ...] | None":
+    """Check the options of a ``@library(impl=...)`` declaration that say how its algorithms are chosen (the posture, the opt-ins to split-K
+    partial sums in the output type, the imported tables) and its layout; return the tables (``None`` without). Raises a
+    ``TilefishDeclarationError``. (Which opt-in a declaration may set depends on its operands: :func:`check_declaration`.)"""
     where = f"library op '{name}'"
     if heuristic not in HEURISTICS:
         raise TilefishDeclarationError(f"{where}: heuristic must be one of {list(HEURISTICS)}, got {heuristic!r}")
-    if not isinstance(allow_bf16_reduction, bool):
-        raise TilefishDeclarationError(f"{where}: allow_bf16_reduction must be a bool, got {allow_bf16_reduction!r}")
+    for flag, value in (("allow_bf16_reduction", allow_bf16_reduction), ("allow_f16_reduction", allow_f16_reduction)):
+        if not isinstance(value, bool):
+            raise TilefishDeclarationError(f"{where}: {flag} must be a bool, got {value!r}")
+    if layout not in LAYOUTS:
+        raise TilefishDeclarationError(
+            f"{where}: layout must be one of {list(LAYOUTS)} (TN: b is [N, K], out = a @ b^T; NN: b is [K, N], out = a @ b), got {layout!r}"
+        )
     return None if algos is None else _check_tables(where, algos)
 
 
-def check_declaration(name: str, impl: Any, sig: "Signature", acc: Any, workspace_bytes: Any) -> None:
-    """Check that a ``@library(impl=...)`` declaration has the signature of its implementation; raise a ``TilefishDeclarationError``."""
+def check_declaration(
+    name: str,
+    impl: Any,
+    sig: "Signature",
+    acc: Any,
+    workspace_bytes: Any,
+    layout: str = "TN",
+    allow_bf16_reduction: bool = False,
+    allow_f16_reduction: bool = False,
+) -> None:
+    """Check that a ``@library(impl=...)`` declaration has the signature of its implementation in its layout, and that its opt-in is the one of
+    its operands' type; raise a ``TilefishDeclarationError``."""
     where = f"library op '{name}'"
     if impl not in IMPLS:
         raise TilefishDeclarationError(f"{where}: impl must be one of {sorted(IMPLS)}, got {impl!r}")
@@ -201,25 +244,46 @@ def check_declaration(name: str, impl: Any, sig: "Signature", acc: Any, workspac
     bias = IMPLS[impl]
     params = list(sig.params)
     want = 3 if bias else 2
+    b_text = "b: Tensor[N, K, T]" if layout == "TN" else "b: Tensor[K, N, T]"
     if len(params) != want or any(p.kind != "tensor" or p.access != "in" or p.strided or p.is_devscalar for p in params):
         raise TilefishDeclarationError(
             f"{where}: {impl} takes {want} input tensors "
-            f"({'a: Tensor[M, K, bf16], b: Tensor[N, K, bf16], bias: Tensor[N, bf16]' if bias else 'a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]'}), "
-            f"and returns Tensor[M, N, bf16]; the signature is {sig}"
+            f"(a: Tensor[M, K, T], {b_text}{', bias: Tensor[N, D]' if bias else ''}), and returns Tensor[M, N, D], where T is bf16 or f16 and D is "
+            f"T or f32 (layout {layout}); the signature is {sig}"
         )
     if len(sig.returns) != 1 or sig.tensor_outputs:
-        raise TilefishDeclarationError(f"{where}: {impl} returns exactly one tensor, Tensor[M, N, bf16] (not an Out parameter)")
+        raise TilefishDeclarationError(f"{where}: {impl} returns exactly one tensor, Tensor[M, N, D] (not an Out parameter)")
     a, b = params[0].type, params[1].type
     out = sig.returns[0]
-    for label, t, rank in (("a", a, 2), ("b", b, 2), ("the result", out, 2)) + ((("bias", params[2].type, 1),) if bias else ()):
+    for label, t in (("a", a), ("b", b), ("the result", out)):
         assert t is not None
-        if t.rank != rank or t.dtype.name != "bf16" or not t.contiguous:  # type: ignore[union-attr]
-            raise TilefishDeclarationError(f"{where}: {label} must be a bf16 tensor of rank {rank}, got {t}")
-    m, k, n = a.shape[0], a.shape[1], b.shape[0]  # type: ignore[union-attr]
-    if b.shape[1] != k:  # type: ignore[union-attr]
-        raise TilefishDeclarationError(f"{where}: a is [M, K] and b is [N, K]: their last axes must be the same ({a.shape[1]} vs {b.shape[1]})")  # type: ignore[union-attr]
+        if t.rank != 2 or not t.contiguous:  # type: ignore[union-attr]
+            raise TilefishDeclarationError(f"{where}: {label} must be a contiguous tensor of rank 2, got {t}")
+    dtype = a.dtype.name  # type: ignore[union-attr]
+    if dtype not in OPERAND_DTYPES or b.dtype.name != dtype:  # type: ignore[union-attr]
+        raise TilefishDeclarationError(f"{where}: a and b must both be bf16 or both be f16 tensors, got {a} and {b}")
+    if out.dtype.name not in (dtype, "f32"):  # type: ignore[union-attr]
+        raise TilefishDeclarationError(f"{where}: the result of {dtype} operands must be a {dtype} or an f32 tensor, got {out}")
+    if bias:
+        bt = params[2].type
+        assert bt is not None
+        if bt.rank != 1 or not bt.contiguous or bt.dtype.name != out.dtype.name:  # type: ignore[union-attr]
+            raise TilefishDeclarationError(
+                f"{where}: bias must be a {out.dtype.name} tensor of rank 1, the type of the result (cuBLASLt takes no other bias type), got {bt}"  # type: ignore[union-attr]
+            )
+    m, k = a.shape[0], a.shape[1]  # type: ignore[union-attr]
+    n, b_k = (b.shape[0], b.shape[1]) if layout == "TN" else (b.shape[1], b.shape[0])  # type: ignore[union-attr]
+    if b_k != k:
+        if layout == "TN":
+            raise TilefishDeclarationError(f"{where}: a is [M, K] and b is [N, K]: their last axes must be the same ({k} vs {b_k})")
+        raise TilefishDeclarationError(f"{where}: a is [M, K] and b is [K, N] (layout NN): the last axis of a and the first of b must be the same ({k} vs {b_k})")
     if tuple(out.shape) != (m, n) or (bias and params[2].type.shape != (n,)):  # type: ignore[union-attr]
         raise TilefishDeclarationError(f"{where}: the result must be [M, N] = [{m}, {n}]" + (f" and bias [N] = [{n}]" if bias else ""))
+    for flag, value in (("allow_bf16_reduction", allow_bf16_reduction), ("allow_f16_reduction", allow_f16_reduction)):
+        if value and flag != f"allow_{dtype}_reduction":
+            raise TilefishDeclarationError(
+                f"{where}: {flag} is the opt-in of {flag.split('_')[1]} operands; a GEMM of {dtype} operands opts in with allow_{dtype}_reduction=True"
+            )
     for label, d in (("M", m), ("N", n), ("K", k)):
         free = d.free_dims()
         loose = sorted(f.name for f in free if not f.buckets)
@@ -243,17 +307,38 @@ def check_coverage(op: "LibraryOp") -> None:
     for t in tables:
         missing = [key for key in keys if key not in t.algos]
         if missing:
+            named = "(m, n, k, bias)" if layout_of(op) == "TN" else "(m, n, k, bias, layout)"
             raise TilefishDeclarationError(
                 f"library op '{op.name}': the algorithm table for {t.arch} with {t.sm_count} SMs (cuBLASLt {t.cublaslt_version}) has no algorithm for "
-                f"(m, n, k, bias) = {', '.join(map(str, missing[:4]))}{' ...' if len(missing) > 4 else ''}: a table gives one for every entry of the declaration"
+                f"{named} = {', '.join(map(str, missing[:4]))}{' ...' if len(missing) > 4 else ''}: a table gives one for every entry of the declaration"
             )
 
 
-def _problem_keys(op: "LibraryOp") -> "list[tuple[int, int, int, bool]]":
-    """The ``(m, n, k, bias)`` of every entry of a library op (one per bucket combination), sorted, without repeats."""
+def layout_of(op: "LibraryOp") -> str:
+    return getattr(op, "layout", "TN")
+
+
+def _mnk_exprs(op: "LibraryOp") -> "tuple[DimExpr, DimExpr, DimExpr]":
+    """The dimension expressions of ``m``, ``n`` and ``k`` of a library op: ``a`` is ``[M, K]``, ``b`` is ``[N, K]`` (TN) or ``[K, N]`` (NN)."""
     sig = op.signature
     m_expr, k_expr = sig.params[0].type.shape  # type: ignore[union-attr]
-    n_expr = sig.params[1].type.shape[0]  # type: ignore[union-attr]
+    b_shape = sig.params[1].type.shape  # type: ignore[union-attr]
+    n_expr = b_shape[0] if layout_of(op) == "TN" else b_shape[1]
+    return m_expr, n_expr, k_expr
+
+
+def form_of(op: "LibraryOp") -> Any:
+    """The :class:`tilefish._cublaslt.Form` of a library op: the type of its operands and of its result, and its layout."""
+    from ._cublaslt import Form
+
+    sig = op.signature
+    return Form(sig.params[0].type.dtype.name, sig.returns[0].dtype.name, layout_of(op))  # type: ignore[union-attr]
+
+
+def _problem_keys(op: "LibraryOp") -> "list[tuple[Any, ...]]":
+    """The table key (:func:`table_key`: ``(m, n, k, bias)``, and the layout when it is not ``TN``) of every entry of a library op (one per
+    bucket combination), sorted, without repeats."""
+    m_expr, n_expr, k_expr = _mnk_exprs(op)
     free: "dict[str, Dim]" = {}
     for d in (m_expr, n_expr, k_expr):
         for f in d.free_dims():
@@ -263,14 +348,15 @@ def _problem_keys(op: "LibraryOp") -> "list[tuple[int, int, int, bool]]":
     for combo in itertools.product(*(d.buckets for d in dims)) if dims else [()]:  # type: ignore[arg-type]
         mapping = dict(zip(dims, combo))
         m, n, k = (int(e.subst(mapping).folded().value) for e in (m_expr, n_expr, k_expr))
-        keys.add((m, n, k, IMPLS[op.impl]))  # type: ignore[index]
+        keys.add(table_key(m, n, k, IMPLS[op.impl], layout_of(op)))  # type: ignore[index]
     return sorted(keys)
 
 
 def _canonical(op: "LibraryOp") -> "dict[str, Any]":
     """The canonical declaration the digests are taken over. The options a declaration has only when it is not the default (the posture
-    ``"torch"``, the opt-in to bf16 split-K partial sums, imported algorithms: the rows of each table that the declaration uses) are keys only
-    then, so the digest of a declaration without them is the one tilefish 0.0.4 computed."""
+    ``"torch"``, the opt-in to split-K partial sums in the output type, imported algorithms: the rows of each table that the declaration uses, the
+    layout ``NN``) are keys only then, so the digest of a declaration without them is the one tilefish 0.0.4 computed. (The types of the operands
+    and of the result are in the signature, which is always there.)"""
     from .aot import _canonical_dim
 
     sig = op.signature
@@ -292,6 +378,10 @@ def _canonical(op: "LibraryOp") -> "dict[str, Any]":
         out["heuristic"] = op.heuristic
     if getattr(op, "allow_bf16_reduction", False):
         out["allow_bf16_reduction"] = True
+    if getattr(op, "allow_f16_reduction", False):
+        out["allow_f16_reduction"] = True
+    if layout_of(op) != "TN":
+        out["layout"] = layout_of(op)  # b is [K, N]: with K = N the signature alone would not tell the layouts apart
     tables = getattr(op, "algos", None)
     if tables:
         keys = _problem_keys(op)
@@ -337,17 +427,33 @@ class LibrarySpec:
     declaration_digest: str
     canonical: "dict[str, Any]"  # the canonical declaration (_canonical) the digests are taken over
     heuristic: str = "tilefish"  # the posture the heuristic is asked under (tilefish._cublaslt.HEURISTICS)
-    allow_bf16_reduction: bool = False  # whether split-K may add its partial sums in bf16
+    allow_bf16_reduction: bool = False  # whether split-K may add its partial sums in bf16 (the opt-in of bf16 operands)
     algos: "tuple[AlgoTable, ...] | None" = None  # imported algorithms, one table per device
+    dtype: str = "bf16"  # of a and b
+    out_dtype: str = "bf16"  # of the result and of a bias
+    layout: str = "TN"  # TN: b is [n, k]; NN: b is [k, n]
+    allow_f16_reduction: bool = False  # whether split-K may add its partial sums in the output type (the opt-in of f16 operands)
 
     @property
     def bias(self) -> bool:
         return IMPLS[self.impl]
 
     @property
-    def key(self) -> "tuple[int, int, int, bool]":
-        """The ``(m, n, k, bias)`` of the problem: what an :class:`AlgoTable` is indexed by."""
-        return (self.m, self.n, self.k, self.bias)
+    def form(self) -> Any:
+        """The :class:`tilefish._cublaslt.Form`: the types and the layout."""
+        from ._cublaslt import Form
+
+        return Form(self.dtype, self.out_dtype, self.layout)
+
+    @property
+    def opt_ins(self) -> "dict[str, bool]":
+        """The opt-ins as the binding takes them (``allow_bf16_reduction=``, ``allow_f16_reduction=``)."""
+        return {"allow_bf16_reduction": self.allow_bf16_reduction, "allow_f16_reduction": self.allow_f16_reduction}
+
+    @property
+    def key(self) -> "tuple[Any, ...]":
+        """The ``(m, n, k, bias)`` of the problem (with the layout when it is not ``TN``): what an :class:`AlgoTable` is indexed by."""
+        return table_key(self.m, self.n, self.k, self.bias, self.layout)
 
     def pinned_digest(self, sm_count: int) -> str:
         """The ``declaration_digest`` of an entry of this spec pinned on a device of ``sm_count`` multiprocessors."""
@@ -356,7 +462,7 @@ class LibrarySpec:
     def entry(self, sm_count: int) -> "dict[str, Any]":
         """The fields of the library entry that the declaration and the SM count of the device determine (a replay checks the manifest's entry
         against them); the build adds ``arch``, ``algo`` and ``cublaslt_version``."""
-        dtypes = {"a": "bf16", "b": "bf16", **({"bias": "bf16"} if self.bias else {}), "out": "bf16"}
+        dtypes = {"a": self.dtype, "b": self.dtype, **({"bias": self.out_dtype} if self.bias else {}), "out": self.out_dtype}
         return {
             "stem": self.stem,
             "op": self.op,
@@ -368,12 +474,12 @@ class LibrarySpec:
             "dtypes": dtypes,
             "compute_type": COMPUTE_TYPE,
             "scale_type": SCALE_TYPE,
-            "transa": TRANSA,
-            "transb": TRANSB,
+            "transa": self.layout[0],
+            "transb": self.layout[1],
             "m": self.m,
             "n": self.n,
             "k": self.k,
-            "lda": self.k,
+            "lda": self.k if self.layout == "TN" else self.n,
             "ldb": self.k,
             "ldc": self.n,
             "ldd": self.n,
@@ -393,6 +499,8 @@ class LibrarySpec:
             out["algo_source"] = "imported"
         if self.allow_bf16_reduction:
             out["allow_bf16_reduction"] = True
+        if self.allow_f16_reduction:
+            out["allow_f16_reduction"] = True
         return out
 
 
@@ -409,8 +517,8 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
         raise TilefishSpecError(f"library op '{op.name}' has no implementation (impl=...): there is nothing to build")
     sig = op.signature
     tensors = [(p.name, p.type, "in") for p in sig.params] + [("out", sig.returns[0], "out")]
-    m_expr, k_expr = sig.params[0].type.shape  # type: ignore[union-attr]
-    n_expr = sig.params[1].type.shape[0]  # type: ignore[union-attr]
+    m_expr, n_expr, k_expr = _mnk_exprs(op)
+    form = form_of(op)
     free: "dict[str, Dim]" = {}
     for d in (m_expr, n_expr, k_expr):
         for f in d.free_dims():
@@ -444,7 +552,7 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
                     "index": i,
                     "name": name,
                     "kind": "pointer",
-                    "dtype": "bf16",
+                    "dtype": t.dtype.name,  # type: ignore[union-attr]
                     "access": access,
                     "shape": [_shape_entry(d) for d in t.shape],
                 }
@@ -475,6 +583,10 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
                 heuristic=getattr(op, "heuristic", "tilefish"),
                 allow_bf16_reduction=getattr(op, "allow_bf16_reduction", False),
                 algos=getattr(op, "algos", None),
+                dtype=form.dtype,
+                out_dtype=form.out,
+                layout=form.layout,
+                allow_f16_reduction=getattr(op, "allow_f16_reduction", False),
             )
         )
     return specs
@@ -542,12 +654,11 @@ def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | 
     else:
         algo = _cublaslt.pin_algo(
             spec.m, spec.n, spec.k, spec.bias, workspace_bytes=spec.workspace_bytes, device_index=index, heuristic=spec.heuristic,
-            allow_bf16_reduction=spec.allow_bf16_reduction,
+            form=spec.form, **spec.opt_ins,
         ).algo_hex  # fmt: skip
     try:
         _cublaslt.check_algo(
-            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index,
-            allow_bf16_reduction=spec.allow_bf16_reduction,
+            spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form, **spec.opt_ins,
         )  # fmt: skip
     except TilefishRuntimeError as e:
         source = "the imported" if spec.algos else "the heuristic's"
@@ -565,7 +676,7 @@ def imported_algo(spec: LibrarySpec, arch: str, sms: int, version: int, device_i
     if table is None:
         return None
     algo = table.algos[spec.key]  # every key of the declaration is in every table (check_coverage)
-    return algo if isinstance(algo, str) else _cublaslt.encode_algo(algo, device_index=device_index)
+    return algo if isinstance(algo, str) else _cublaslt.encode_algo(algo, device_index=device_index, form=spec.form)
 
 
 def _device_index(index: "int | None") -> int:
@@ -663,8 +774,10 @@ def _eval_static(text: str, buckets: "dict[str, int]", where: str) -> int:
 def validate_entry(entry: Any, index: int = 0) -> None:
     """Strict reading of one entry of the manifest's ``library`` section (raises :class:`~tilefish.errors.TilefishManifestError`).
 
-    Every field must be present and exactly typed, and the redundant ones must agree: the dtypes, the cuBLAS-level problem (the T/N
-    transposes, the leading dimensions) and the shapes of the operands follow from ``impl``, ``m``, ``n`` and ``k``.
+    Every field must be present and exactly typed, and the redundant ones must agree: the dtypes are a pair of operand types (``bf16`` or
+    ``f16``) with a result of their type or ``f32`` (and a bias of the result's type); ``transa`` says the layout (``T``: ``b`` is ``[n, k]`` and
+    ``lda = k``; ``N``: ``b`` is ``[k, n]`` and ``lda = n``); the other leading dimensions and the shapes of the operands follow from ``impl``,
+    ``m``, ``n`` and ``k``; the opt-in, if any, is the one of the operands' type.
     """
     where = f"#{index}"
     if not isinstance(entry, dict):
@@ -698,17 +811,33 @@ def validate_entry(entry: Any, index: int = 0) -> None:
             if not sv.is_int(v) or not 1 <= v <= sv.MAX_ELEMENTS:
                 _bad(where, f"{key} must be an int from 1 to {sv.MAX_ELEMENTS}, got {v!r}")
         m, n, k = entry["m"], entry["n"], entry["k"]
-        if (entry["lda"], entry["ldb"], entry["ldc"], entry["ldd"]) != (k, k, n, n):
-            _bad(where, "the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)")
-        if (entry["transa"], entry["transb"]) != (TRANSA, TRANSB):
-            _bad(where, f"transa and transb must be {TRANSA!r} and {TRANSB!r}, got {entry['transa']!r} and {entry['transb']!r}")
+        layout = f"{entry['transa']}{entry['transb']}" if isinstance(entry["transa"], str) and isinstance(entry["transb"], str) else None
+        if layout not in LAYOUTS:
+            _bad(where, f"transa and transb must be 'T' and 'N' (b is [n, k]) or 'N' and 'N' (b is [k, n]), got {entry['transa']!r} and {entry['transb']!r}")
+        lda = k if layout == "TN" else n
+        if (entry["lda"], entry["ldb"], entry["ldc"], entry["ldd"]) != (lda, k, n, n):
+            if layout == "TN":
+                _bad(where, "the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)")
+            _bad(where, "the leading dimensions of the layout NN must be lda = n, ldb = k and ldc = ldd = n (cuBLAS sees b [k, n] as its A, a as its B and the result as C and D)")
         if entry["compute_type"] != COMPUTE_TYPE or entry["scale_type"] != SCALE_TYPE:
             _bad(where, f"compute_type and scale_type must be {COMPUTE_TYPE!r} and {SCALE_TYPE!r}")
         if entry["epilogue"] != ("bias" if bias else "none"):
             _bad(where, f"the epilogue of {impl} must be {'bias' if bias else 'none'!r}, got {entry['epilogue']!r}")
-        want_dtypes = {"a": "bf16", "b": "bf16", **({"bias": "bf16"} if bias else {}), "out": "bf16"}
-        if entry["dtypes"] != want_dtypes:
-            _bad(where, f"dtypes must be {want_dtypes}, got {entry['dtypes']!r}")
+        dtypes = entry["dtypes"]
+        dtype = dtypes.get("a") if isinstance(dtypes, dict) else None
+        out_dtype = dtypes.get("out") if isinstance(dtypes, dict) else None
+        if dtype not in OPERAND_DTYPES or out_dtype not in (dtype, "f32"):
+            dtype, out_dtype = "bf16", "bf16"  # the message names the default form
+        want_dtypes = {"a": dtype, "b": dtype, **({"bias": out_dtype} if bias else {}), "out": out_dtype}
+        if dtypes != want_dtypes:
+            _bad(
+                where,
+                f"dtypes must be {want_dtypes}, got {dtypes!r} (a and b are both bf16 or both f16, the result is of their type or f32, a bias of the "
+                "result's type)",
+            )
+        for flag in ("allow_bf16_reduction", "allow_f16_reduction"):
+            if flag in entry and flag != f"allow_{dtype}_reduction":
+                _bad(where, f"{flag} is the opt-in of {flag.split('_')[1]} operands, and the operands of this entry are {dtype}")
         ws = entry["workspace_bytes"]
         if not sv.is_int(ws) or not 1 <= ws <= MAX_WORKSPACE_BYTES:
             _bad(where, f"workspace_bytes must be an int from 1 to 2**40, got {ws!r}")
@@ -726,20 +855,21 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         for name, value in buckets.items():
             sv._ident(name, "bucket dimension name")
             sv._int(value, f"bucket value of {name}", 1)
-        # the operands: a [M, K], b [N, K], [bias [N]], out [M, N], in this order
+        # the operands: a [M, K], b [N, K] (TN) or [K, N] (NN), [bias [N]], out [M, N], in this order, each of its type in dtypes
         abi = entry["abi"]
         sv._keys(abi, "abi", ["params"])
         params = abi["params"]
         names = ["a", "b"] + (["bias"] if bias else []) + ["out"]
-        expected_shapes = [(m, k), (n, k)] + ([(n,)] if bias else []) + [(m, n)]
+        expected_shapes = [(m, k), (n, k) if layout == "TN" else (k, n)] + ([(n,)] if bias else []) + [(m, n)]
+        expected_dtypes = [dtype, dtype] + ([out_dtype] if bias else []) + [out_dtype]
         if not isinstance(params, list) or len(params) != len(names):
             _bad(where, f"abi.params must list {len(names)} pointers ({', '.join(names)} in this order)")
         seen: "set[str]" = set()
-        for i, (p, shape) in enumerate(zip(params, expected_shapes)):
+        for i, (p, shape, pdtype) in enumerate(zip(params, expected_shapes, expected_dtypes)):
             sv._keys(p, f"abi.params[{i}]", ["index", "name", "kind", "dtype", "access", "shape"])
             sv._ident(p["name"], f"abi.params[{i}].name")
-            if not sv.is_int(p["index"]) or p["index"] != i or p["kind"] != "pointer" or p["dtype"] != "bf16" or p["access"] != ("out" if i == len(params) - 1 else "in"):  # 0.0 and true are not 0 and 1
-                _bad(where, f"abi.params[{i}] must be the bf16 pointer #{i} with access {'out' if i == len(params) - 1 else 'in'}")
+            if not sv.is_int(p["index"]) or p["index"] != i or p["kind"] != "pointer" or p["dtype"] != pdtype or p["access"] != ("out" if i == len(params) - 1 else "in"):  # 0.0 and true are not 0 and 1
+                _bad(where, f"abi.params[{i}] must be the {pdtype} pointer #{i} with access {'out' if i == len(params) - 1 else 'in'}")
             if p["name"] in seen:
                 _bad(where, f"the name {p['name']!r} is used twice")
             seen.add(p["name"])
@@ -846,19 +976,29 @@ def run_gemm_ptrs(
         stream=stream,
         device_index=device_index,
         workspace_ptr=workspace_ptr,
-        allow_bf16_reduction=spec.allow_bf16_reduction,
+        form=spec.form,
+        **spec.opt_ins,
     )
 
 
-def reference_gemm(tensors: "dict[str, Any]") -> Any:
-    """The result in torch, as the semantics say: an f32 matmul of the bf16 operands, the bias added in f32, one rounding to bf16."""
+_TORCH_DTYPES = {"bf16": "bfloat16", "f16": "float16", "f32": "float32"}
+
+
+def reference_gemm(tensors: "dict[str, Any]", layout: str = "TN", out_dtype: "str | None" = None) -> Any:
+    """The result in torch, as the semantics say: an f32 matmul of the operands (``b`` transposed for the layout ``TN``), the bias added in f32,
+    one rounding to ``out_dtype`` (the operands' type when ``None``)."""
     import torch
 
     a, b, *rest = tensors.values()
-    acc = a.to(torch.float32) @ b.to(torch.float32).t()
+    acc = a.to(torch.float32) @ (b.to(torch.float32).t() if layout == "TN" else b.to(torch.float32))
     if rest:
         acc = acc + rest[0].to(torch.float32)
-    return acc.to(torch.bfloat16)
+    return acc.to(a.dtype if out_dtype is None else getattr(torch, _TORCH_DTYPES[out_dtype]))
+
+
+def reference_of(op: "LibraryOp", tensors: "dict[str, Any]") -> Any:
+    """:func:`reference_gemm` of a library op: its layout and the type of its result."""
+    return reference_gemm(tensors, layout_of(op), op.signature.returns[0].dtype.name)  # type: ignore[union-attr]
 
 
 __all__ = [

@@ -1,7 +1,8 @@
 //! A pinned cuBLASLt GEMM of a manifest's `library` section, loaded and launched with the checks of a kernel.
 //!
-//! `out[M, N] = a[M, K] @ b[N, K]^T (+ bias[N])` in tilefish's row-major terms: bf16 operands, an f32 accumulator, one rounding to bf16 at
-//! the end, the bias added in f32 before it (`docs/manifest-schema-3.md`, section 9). The entry pins the 64 bytes of the algorithm that
+//! `out[M, N] = a[M, K] @ b[N, K]^T (+ bias[N])` in tilefish's row-major terms (`b[K, N]` and no transpose for the layout NN): bf16 or f16
+//! operands, an f32 accumulator, one rounding to the result's type (theirs, or f32) at the end, the bias (of the result's type) added in f32
+//! before it (`docs/manifest-schema-3.md`, section 9). The entry pins the 64 bytes of the algorithm that
 //! cuBLASLt's heuristic ranked first under a workspace limit, with the cuBLASLt version that chose it and the SM count of the device it
 //! was chosen on; [`Manifest::gemm`] refuses a device of another SM count (an algorithm is chosen for the multiprocessors it runs on: a MIG
 //! slice has fewer than the whole GPU), another version (an algorithm id names other kernels in another version), vets the 64 bytes the way Python's binding does (a weak check by the
@@ -25,7 +26,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use crate::error::{Error, PreconditionKind, Result};
 use crate::ffi::cublaslt::{self, Algo, AlgoConfig, Handle};
 use crate::kernel::Arch;
-use crate::library::LibraryEntry;
+use crate::library::{GemmForm, GemmLayout, LibraryEntry};
 use crate::manifest::{Access, Manifest};
 use crate::plan::{DeviceInfo, Plan};
 use crate::tensor::{DType, TensorArg};
@@ -64,6 +65,7 @@ struct LoadedGemm {
     n: u64,
     k: u64,
     bias: bool,
+    form: GemmForm,
     workspace_bytes: u64,
     sm_count: u64,
 }
@@ -99,18 +101,27 @@ fn refuse(who: &str, why: impl std::fmt::Display) -> Error {
 /// `cublasLtMatmulAlgoInit` (which also writes the data types, the compute type and the version) and the configuration attributes, and must
 /// be byte for byte the same; the configuration must be one that the capabilities of its id list (tile, stages, swizzling, custom option);
 /// it must accumulate in f32 and need no more than 16-byte alignment, and its split-K must go with a reduction scheme that does not round in
-/// bf16 (none, or f32 partial sums), and a GEMM with a bias has no split-K, or, for an entry that opts in (`allow_bf16_reduction`), any
-/// scheme cuBLASLt defines ([`reduction_problem`]). What this cannot see is a flip to another valid configuration (another tile, say): that
-/// is a different, legitimate algorithm, and only the digest of the manifest vouches for the file.
-fn vet(handle: &Handle, algo: &Algo, who: &str, allow_bf16_reduction: bool, bias: bool) -> Result<AlgoConfig> {
+/// the output type (none, or f32 partial sums), and a GEMM with a bias has no split-K, or, for an entry that opts in (`allow_bf16_reduction`
+/// or `allow_f16_reduction`, by the operands' type), any scheme cuBLASLt defines ([`reduction_problem`]). The algorithm is rebuilt with the
+/// types of the entry (`form`): a pin of other types has other bytes and is refused. What this cannot see is a flip to another valid
+/// configuration (another tile, say): that is a different, legitimate algorithm, and only the digest of the manifest vouches for the file.
+fn vet(
+    handle: &Handle,
+    algo: &Algo,
+    who: &str,
+    allow_reduction: bool,
+    bias: bool,
+    form: &GemmForm,
+) -> Result<AlgoConfig> {
     let bytes = algo.to_bytes();
     let hex: String = bytes[..8].iter().map(|b| format!("{b:02x}")).collect();
     let head = format!(
-        "{who}: the pinned cuBLASLt algorithm {hex}... is not one cuBLASLt produces for bf16 with f32 accumulation"
+        "{who}: the pinned cuBLASLt algorithm {hex}... is not one cuBLASLt produces for {} with f32 accumulation",
+        form.what()
     );
     let library = |e: Error| refuse(&head, e);
     let config = algo.config().map_err(library)?;
-    let fresh = Algo::init(handle, config.id)
+    let fresh = Algo::init(handle, config.id, form)
         .map_err(|e| Error::Manifest(format!("{head}: algorithm id {} is unknown ({e})", config.id)))?;
     let caps = fresh.caps().map_err(library)?;
     let mut problems: Vec<String> = Vec::new();
@@ -144,7 +155,7 @@ fn vet(handle: &Handle, algo: &Algo, who: &str, allow_bf16_reduction: bool, bias
             config.custom_option, caps.custom_option_max, config.id
         ));
     }
-    if let Some(problem) = reduction_problem(config.splitk_num, config.reduction_scheme, allow_bf16_reduction, bias) {
+    if let Some(problem) = reduction_problem(config.splitk_num, config.reduction_scheme, allow_reduction, bias, form) {
         problems.push(problem);
     }
     if caps.numerical_impl_flags & ACCUMULATOR_TYPE_MASK != ACCUMULATOR_32F {
@@ -169,17 +180,20 @@ fn vet(handle: &Handle, algo: &Algo, who: &str, allow_bf16_reduction: bool, bias
     if problems.is_empty() { Ok(config) } else { Err(Error::Manifest(format!("{head}: {}", problems.join("; ")))) }
 }
 
-/// What is wrong with a split-K count and a reduction scheme for a pinned algorithm of a GEMM with or without a bias (`None`: nothing): the
-/// rule of Python's `tilefish._cublaslt.reduction_problem`, word for word. No split-K has no reduction scheme and split-K has one; without the
-/// entry's opt-in (`allow_bf16_reduction`) the scheme keeps the one rounding (f32 partial sums, `COMPUTE_TYPE`) and a GEMM with a bias has no
-/// split-K at all (with the bias epilogue a split-K was measured to round twice, f32 partial sums included: cuBLASLt 12.8.4 on sm_120); with
-/// it the two that add the partial sums in bf16 (`INPLACE`, `OUTPUT_TYPE`) are allowed too.
+/// What is wrong with a split-K count and a reduction scheme for a pinned algorithm of a GEMM of `form` with or without a bias (`None`:
+/// nothing): the rule of Python's `tilefish._cublaslt.reduction_problem`, word for word. No split-K has no reduction scheme and split-K has
+/// one; without the entry's opt-in (`allow_bf16_reduction` or `allow_f16_reduction`, named by the operands' type) the scheme keeps the one
+/// rounding (f32 partial sums, `COMPUTE_TYPE`) and a GEMM with a bias has no split-K at all (with the bias epilogue a split-K was measured to
+/// round twice, f32 partial sums included: cuBLASLt 12.8.4 on sm_120); with it the two that add the partial sums in the output type
+/// (`INPLACE`, `OUTPUT_TYPE`) are allowed too.
 pub(crate) fn reduction_problem(
     splitk_num: i32,
     reduction_scheme: u32,
-    allow_bf16_reduction: bool,
+    allow_reduction: bool,
     bias: bool,
+    form: &GemmForm,
 ) -> Option<String> {
+    let (out, opt_in) = (form.out.name(), form.opt_in());
     if splitk_num < 1 {
         return Some(format!("split-K count {splitk_num} is below 1"));
     }
@@ -188,20 +202,27 @@ pub(crate) fn reduction_problem(
             "split-K count {splitk_num} does not go with reduction scheme {reduction_scheme} (split-K needs one, no split-K has none)"
         ));
     }
-    let bf16 = [REDUCTION_INPLACE, REDUCTION_OUTPUT_TYPE].contains(&reduction_scheme);
-    if bf16 && !allow_bf16_reduction {
+    let in_output_type = [REDUCTION_INPLACE, REDUCTION_OUTPUT_TYPE].contains(&reduction_scheme);
+    if in_output_type && !allow_reduction {
+        if form.out == crate::tensor::DType::F32 {
+            return Some(format!(
+                "reduction scheme {reduction_scheme} adds the split-K partial sums in the output (f32), not in a workspace of the compute \
+                 type (only no split-K, 0, and f32 partial sums in the workspace, 2, are taken without the opt-in); a declaration may opt in \
+                 with {opt_in}=True"
+            ));
+        }
         return Some(format!(
-            "reduction scheme {reduction_scheme} adds the split-K partial sums in bf16, which rounds more than once (only no split-K, 0, and \
-             f32 partial sums, 2, keep the one rounding); a declaration may opt in with allow_bf16_reduction=True"
+            "reduction scheme {reduction_scheme} adds the split-K partial sums in {out}, which rounds more than once (only no split-K, 0, and \
+             f32 partial sums, 2, keep the one rounding); a declaration may opt in with {opt_in}=True"
         ));
     }
-    if !bf16 && ![REDUCTION_NONE, REDUCTION_COMPUTE_TYPE].contains(&reduction_scheme) {
+    if !in_output_type && ![REDUCTION_NONE, REDUCTION_COMPUTE_TYPE].contains(&reduction_scheme) {
         return Some(format!("reduction scheme {reduction_scheme} is not one cuBLASLt defines (0, 1, 2 or 4)"));
     }
-    if bias && splitk_num > 1 && !allow_bf16_reduction {
+    if bias && splitk_num > 1 && !allow_reduction {
         return Some(format!(
-            "split-K count {splitk_num} with the bias epilogue may add the bias to a sum already rounded to bf16 (measured with f32 partial \
-             sums too), which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with allow_bf16_reduction=True"
+            "split-K count {splitk_num} with the bias epilogue may add the bias to a sum already rounded to {out} (measured with f32 partial \
+             sums too), which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with {opt_in}=True"
         ));
     }
     None
@@ -291,8 +312,10 @@ fn load(entry: &LibraryEntry, ctx: &Arc<CudaContext>) -> Result<LoadedGemm> {
     }
     let handle = Handle::new(ctx)?;
     let algo = Algo::from_bytes(&entry.algo);
-    vet(&handle, &algo, &who, entry.allow_bf16_reduction, entry.implementation.has_bias())?;
-    let problem = cublaslt::Problem::new(entry.m, entry.n, entry.k, entry.implementation.has_bias().then_some(16))?;
+    let form = entry.form();
+    vet(&handle, &algo, &who, entry.allows_output_type_reduction(), entry.implementation.has_bias(), &form)?;
+    let problem =
+        cublaslt::Problem::new(entry.m, entry.n, entry.k, entry.implementation.has_bias().then_some(16), &form)?;
     let checked = cublaslt::check(&handle, &problem, &algo).map_err(|e| {
         Error::Manifest(format!(
             "{who}: the pinned cuBLASLt algorithm is not valid for the matmul m={} n={} k={}: {e}",
@@ -321,6 +344,7 @@ fn load(entry: &LibraryEntry, ctx: &Arc<CudaContext>) -> Result<LoadedGemm> {
         n: entry.n,
         k: entry.k,
         bias: entry.implementation.has_bias(),
+        form,
         workspace_bytes: entry.workspace_bytes,
         sm_count: entry.sm_count,
     })
@@ -353,7 +377,8 @@ impl Gemm {
         &self.plan
     }
 
-    /// The sizes of the problem in tilefish's row-major terms: `a` is `[m, k]`, `b` is `[n, k]`, `out` is `[m, n]`.
+    /// The sizes of the problem in tilefish's row-major terms: `a` is `[m, k]`, `b` is `[n, k]` (`[k, n]` for [`GemmLayout::Nn`]), `out` is
+    /// `[m, n]`.
     pub fn sizes(&self) -> (u64, u64, u64) {
         (self.loaded.m, self.loaded.n, self.loaded.k)
     }
@@ -361,6 +386,21 @@ impl Gemm {
     /// Whether the operation has a `bias` operand (`cublaslt.gemm_bias`).
     pub fn has_bias(&self) -> bool {
         self.loaded.bias
+    }
+
+    /// The type of `a` and `b` (bf16 or f16).
+    pub fn dtype(&self) -> crate::tensor::DType {
+        self.loaded.form.dtype
+    }
+
+    /// The type of the result and of a bias (the operands' type, or f32).
+    pub fn out_dtype(&self) -> crate::tensor::DType {
+        self.loaded.form.out
+    }
+
+    /// How `b` is stored: `[n, k]` ([`GemmLayout::Tn`]) or `[k, n]` ([`GemmLayout::Nn`]).
+    pub fn layout(&self) -> GemmLayout {
+        self.loaded.form.layout
     }
 
     /// The multiprocessor count of the device the algorithm was pinned on (the device it is loaded on has it: [`Manifest::gemm`] refuses another).
@@ -394,8 +434,9 @@ impl Gemm {
     }
 
     /// The engine of a launch: what `ffi` calls cuBLASLt with.
-    pub(crate) fn engine(&self) -> (&Handle, &Algo, usize, [u64; 3]) {
-        (&self.loaded.handle, &self.loaded.algo, self.loaded.required, [self.loaded.m, self.loaded.n, self.loaded.k])
+    pub(crate) fn engine(&self) -> (&Handle, &Algo, usize, [u64; 3], GemmForm) {
+        let loaded = &*self.loaded;
+        (&loaded.handle, &loaded.algo, loaded.required, [loaded.m, loaded.n, loaded.k], loaded.form)
     }
 
     /// Check a call (see [`Gemm::launch`]) and return the addresses to run it with.
@@ -414,6 +455,7 @@ impl Gemm {
             n: loaded.n,
             k: loaded.k,
             bias: loaded.bias,
+            layout: loaded.form.layout,
             required: loaded.required,
             workspace_bytes: loaded.workspace_bytes,
         }
@@ -421,9 +463,9 @@ impl Gemm {
 
     /// Check the call and run the GEMM on `stream`.
     ///
-    /// `tensors` are `a` `[m, k]`, `b` `[n, k]`, `bias` `[n]` (for `gemm_bias`), `out` `[m, n]` (written) and the workspace (written), in this
-    /// order: bf16 tensors but the workspace, which is bytes, contiguous, 16-byte aligned (the workspace 256), with the entry's static sizes
-    /// and bucket exactly. The stream must be a stream of the context the GEMM was loaded in (checked); that context is made current on
+    /// `tensors` are `a` `[m, k]`, `b` `[n, k]` (`[k, n]` for [`GemmLayout::Nn`]), `bias` `[n]` (for `gemm_bias`), `out` `[m, n]` (written)
+    /// and the workspace (written), in this order: tensors of the entry's dtypes but the workspace, which is bytes, contiguous, 16-byte aligned
+    /// (the workspace 256), with the entry's static sizes and bucket exactly. The stream must be a stream of the context the GEMM was loaded in (checked); that context is made current on
     /// this thread, as cudarc does for its own calls. The launch is asynchronous: `stream` orders it with the host's other work.
     ///
     /// The slices are ordered exactly as for [`Kernel::launch`](crate::Kernel::launch): cudarc's launch tracking on `stream`, the slices'
@@ -452,6 +494,7 @@ pub(crate) struct Checks<'a> {
     n: u64,
     k: u64,
     bias: bool,
+    layout: GemmLayout,
     /// What the library says the algorithm needs for the problem.
     required: usize,
     workspace_bytes: u64,
@@ -476,7 +519,11 @@ impl Checks<'_> {
         self.plan.prepare(operand_args, Some(self.device))?;
         // (the entry's shapes agree with m, n, k, and its dimensions are bucketed to them: a defense for the memory the library reads)
         let (m, n, k) = (self.m as usize, self.n as usize, self.k as usize);
-        let mut wanted: Vec<Vec<usize>> = vec![vec![m, k], vec![n, k]];
+        let b_shape = match self.layout {
+            GemmLayout::Tn => vec![n, k],
+            GemmLayout::Nn => vec![k, n],
+        };
+        let mut wanted: Vec<Vec<usize>> = vec![vec![m, k], b_shape.clone()];
         if self.bias {
             wanted.push(vec![n]);
         }
@@ -487,8 +534,8 @@ impl Checks<'_> {
                     PreconditionKind::Shape,
                     None,
                     format!(
-                        "'{stem}': an operand has shape {:?}, but the problem is a [{m}, {k}] by [{n}, {k}] GEMM",
-                        arg.shape
+                        "'{stem}': an operand has shape {:?}, but the problem is a [{m}, {k}] by [{}, {}] GEMM",
+                        arg.shape, b_shape[0], b_shape[1]
                     ),
                 ));
             }
@@ -601,7 +648,7 @@ mod tests {
     use super::*;
     use crate::manifest::Pin;
     use crate::region::DevicePtr;
-    use crate::tensor::{TensorMut, TensorRef, U8};
+    use crate::tensor::{DType, TensorMut, TensorRef, U8};
 
     /// The context the made-up device has (a GEMM is always loaded in one).
     const CONTEXT: usize = 0xC0_0000;
@@ -644,6 +691,7 @@ mod tests {
             n: entry.n,
             k: entry.k,
             bias: entry.implementation.has_bias(),
+            layout: entry.layout,
             required,
             workspace_bytes: entry.workspace_bytes,
         }
@@ -971,39 +1019,46 @@ mod tests {
     fn split_k_reduces_in_f32_unless_the_entry_opts_in_to_bf16_partial_sums() {
         for allow in [false, true] {
             // no split-K and f32 partial sums: always (without a bias)
-            assert_eq!(reduction_problem(1, REDUCTION_NONE, allow, false), None);
-            assert_eq!(reduction_problem(1, REDUCTION_NONE, allow, true), None);
-            assert_eq!(reduction_problem(4, REDUCTION_COMPUTE_TYPE, allow, false), None);
+            assert_eq!(reduction_problem(1, REDUCTION_NONE, allow, false, &GemmForm::DEFAULT), None);
+            assert_eq!(reduction_problem(1, REDUCTION_NONE, allow, true, &GemmForm::DEFAULT), None);
+            assert_eq!(reduction_problem(4, REDUCTION_COMPUTE_TYPE, allow, false, &GemmForm::DEFAULT), None);
             // split-K without a scheme, a scheme without split-K, a count below 1, a scheme cuBLASLt does not define: never
             assert_eq!(
-                reduction_problem(4, REDUCTION_NONE, allow, false).unwrap(),
+                reduction_problem(4, REDUCTION_NONE, allow, false, &GemmForm::DEFAULT).unwrap(),
                 "split-K count 4 does not go with reduction scheme 0 (split-K needs one, no split-K has none)"
             );
-            assert!(reduction_problem(1, REDUCTION_COMPUTE_TYPE, allow, false).unwrap().contains("does not go with"));
-            assert_eq!(reduction_problem(0, REDUCTION_NONE, allow, false).unwrap(), "split-K count 0 is below 1");
+            assert!(
+                reduction_problem(1, REDUCTION_COMPUTE_TYPE, allow, false, &GemmForm::DEFAULT)
+                    .unwrap()
+                    .contains("does not go with")
+            );
             assert_eq!(
-                reduction_problem(2, 8, allow, false).unwrap(),
+                reduction_problem(0, REDUCTION_NONE, allow, false, &GemmForm::DEFAULT).unwrap(),
+                "split-K count 0 is below 1"
+            );
+            assert_eq!(
+                reduction_problem(2, 8, allow, false, &GemmForm::DEFAULT).unwrap(),
                 "reduction scheme 8 is not one cuBLASLt defines (0, 1, 2 or 4)"
             );
         }
         // a GEMM with a bias: no split-K without the opt-in, f32 partial sums included
-        assert_eq!(reduction_problem(4, REDUCTION_COMPUTE_TYPE, true, true), None);
+        assert_eq!(reduction_problem(4, REDUCTION_COMPUTE_TYPE, true, true, &GemmForm::DEFAULT), None);
         assert_eq!(
-            reduction_problem(4, REDUCTION_COMPUTE_TYPE, false, true).unwrap(),
+            reduction_problem(4, REDUCTION_COMPUTE_TYPE, false, true, &GemmForm::DEFAULT).unwrap(),
             "split-K count 4 with the bias epilogue may add the bias to a sum already rounded to bf16 (measured with f32 partial sums too), \
              which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with allow_bf16_reduction=True"
         );
         assert!(
-            reduction_problem(4, REDUCTION_OUTPUT_TYPE, false, true)
+            reduction_problem(4, REDUCTION_OUTPUT_TYPE, false, true, &GemmForm::DEFAULT)
                 .unwrap()
                 .contains("adds the split-K partial sums in bf16")
         );
         // bf16 partial sums (in the output, or in a workspace of the output type): only with the opt-in
         for scheme in [REDUCTION_INPLACE, REDUCTION_OUTPUT_TYPE] {
-            assert_eq!(reduction_problem(43, scheme, true, false), None);
-            assert_eq!(reduction_problem(43, scheme, true, true), None);
+            assert_eq!(reduction_problem(43, scheme, true, false, &GemmForm::DEFAULT), None);
+            assert_eq!(reduction_problem(43, scheme, true, true, &GemmForm::DEFAULT), None);
             assert_eq!(
-                reduction_problem(43, scheme, false, false).unwrap(),
+                reduction_problem(43, scheme, false, false, &GemmForm::DEFAULT).unwrap(),
                 format!(
                     "reduction scheme {scheme} adds the split-K partial sums in bf16, which rounds more than once (only no split-K, 0, and \
                      f32 partial sums, 2, keep the one rounding); a declaration may opt in with allow_bf16_reduction=True"
@@ -1022,5 +1077,50 @@ mod tests {
             "{e}"
         );
         assert!(e.to_string().contains("re-export the manifest on this device"), "{e}");
+    }
+
+    /// The rule in the words of the form, as Python's `reduction_problem` says them for f16 operands and for an f32 result.
+    #[test]
+    fn the_reduction_rule_speaks_of_the_output_type_and_the_opt_in_of_the_operands() {
+        let f16 = GemmForm { dtype: DType::F16, out: DType::F16, layout: GemmLayout::Nn };
+        assert_eq!(
+            reduction_problem(4, REDUCTION_OUTPUT_TYPE, false, false, &f16).unwrap(),
+            "reduction scheme 4 adds the split-K partial sums in f16, which rounds more than once (only no split-K, 0, and f32 partial sums, 2, \
+             keep the one rounding); a declaration may opt in with allow_f16_reduction=True"
+        );
+        let biased = reduction_problem(4, REDUCTION_COMPUTE_TYPE, false, true, &f16).unwrap();
+        assert!(
+            biased.contains("a sum already rounded to f16")
+                && biased.ends_with("opts in with allow_f16_reduction=True"),
+            "{biased}"
+        );
+        let f32_out = GemmForm { dtype: DType::F16, out: DType::F32, layout: GemmLayout::Tn };
+        assert_eq!(
+            reduction_problem(4, REDUCTION_INPLACE, false, false, &f32_out).unwrap(),
+            "reduction scheme 1 adds the split-K partial sums in the output (f32), not in a workspace of the compute type (only no split-K, 0, \
+             and f32 partial sums in the workspace, 2, are taken without the opt-in); a declaration may opt in with allow_f16_reduction=True"
+        );
+        for form in [f16, f32_out] {
+            assert_eq!(reduction_problem(4, REDUCTION_OUTPUT_TYPE, true, true, &form), None);
+            assert_eq!(reduction_problem(4, REDUCTION_COMPUTE_TYPE, false, false, &form), None);
+        }
+        assert_eq!(
+            (f16.what(), f32_out.what(), GemmForm::DEFAULT.what()),
+            ("f16".to_owned(), "f16 operands and an f32 result".to_owned(), "bf16".to_owned())
+        );
+    }
+
+    /// An NN GEMM takes `b` as `[k, n]`: the checks of a call hold the operands to the shapes of the problem in its layout.
+    #[test]
+    fn the_operands_of_an_nn_gemm_have_the_shapes_of_its_layout() {
+        let (entry, plan) = library(PLAIN);
+        let tn = checks(&entry, &plan, REQUIRED);
+        let nn = Checks { layout: GemmLayout::Nn, n: 2048, ..tn };
+        // (the plan of the square TN fixture binds [1024, 1024]: an NN problem of n = 2048 asks for b [1024, 2048] and refuses it)
+        let e = nn.check_call(&plain_call(workspace(WS, &WS_SHAPE))).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "'gemm_1024_1024.M32': an operand has shape [1024, 1024], but the problem is a [32, 1024] by [1024, 2048] GEMM"
+        );
     }
 }

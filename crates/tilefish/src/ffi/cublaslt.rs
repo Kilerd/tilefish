@@ -17,10 +17,20 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::CudaContext;
 
 use crate::error::{Error, Result};
+use crate::library::{GemmForm, GemmLayout};
+use crate::tensor::DType;
 
 const COMPUTE_32F: sys::cublasComputeType_t = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
 const R_32F: sys::cudaDataType = sys::cudaDataType::CUDA_R_32F;
-const R_16BF: sys::cudaDataType = sys::cudaDataType::CUDA_R_16BF;
+
+/// The `cudaDataType_t` of a type a GEMM has (bf16 and f16 operands, and an f32 result); the reader of an entry has refused every other.
+fn data_type(dtype: DType) -> sys::cudaDataType {
+    match dtype {
+        DType::F16 => sys::cudaDataType::CUDA_R_16F,
+        DType::F32 => sys::cudaDataType::CUDA_R_32F,
+        _ => sys::cudaDataType::CUDA_R_16BF,
+    }
+}
 /// `cublasOperation_t`: `CUBLAS_OP_N` and `CUBLAS_OP_T`.
 const OP_N: i32 = 0;
 const OP_T: i32 = 1;
@@ -101,15 +111,15 @@ impl Algo {
         out
     }
 
-    /// A fresh algorithm of the library's id `id` for bf16 operands, bf16 results and an f32 accumulator and scale
+    /// A fresh algorithm of the library's id `id` for the operand and result types of `form` and an f32 accumulator and scale
     /// (`cublasLtMatmulAlgoInit`): what the library itself would write for that configuration, to compare 64 bytes with.
     #[allow(unsafe_code)]
-    pub(crate) fn init(handle: &Handle, id: i32) -> Result<Self> {
+    pub(crate) fn init(handle: &Handle, id: i32, form: &GemmForm) -> Result<Self> {
         let mut algo = sys::cublasLtMatmulAlgo_t { data: [0; 8] };
+        let (ab, cd) = (data_type(form.dtype), data_type(form.out));
         // SAFETY: `handle` is live; `algo` is a live local struct the library fills.
-        let status = unsafe {
-            sys::cublasLtMatmulAlgoInit(handle.raw, COMPUTE_32F, R_32F, R_16BF, R_16BF, R_16BF, R_16BF, id, &mut algo)
-        };
+        let status =
+            unsafe { sys::cublasLtMatmulAlgoInit(handle.raw, COMPUTE_32F, R_32F, ab, ab, cd, cd, id, &mut algo) };
         status.result().map_err(Error::cublas("cublasLtMatmulAlgoInit"))?;
         Ok(Self(algo))
     }
@@ -275,10 +285,10 @@ impl Algo {
 struct Layout(sys::cublasLtMatrixLayout_t);
 
 impl Layout {
-    /// A column-major bf16 matrix of `rows` x `cols` with leading dimension `ld`.
-    fn bf16(rows: u64, cols: u64, ld: i64) -> Result<Self> {
+    /// A column-major matrix of `dtype`, `rows` x `cols` with leading dimension `ld`.
+    fn new(dtype: DType, rows: u64, cols: u64, ld: i64) -> Result<Self> {
         Ok(Self(
-            result::create_matrix_layout(R_16BF, rows, cols, ld)
+            result::create_matrix_layout(data_type(dtype), rows, cols, ld)
                 .map_err(Error::cublas("cublasLtMatrixLayoutCreate"))?,
         ))
     }
@@ -301,8 +311,10 @@ impl Drop for Layout {
 /// The problem is the one `docs/manifest-schema-3.md` (section 9) gives, tilefish's `out[m, n] = a[m, k] @ b[n, k]^T (+ bias[n])` posed to the
 /// column-major library as the TN gemm `m_cublas = n`, `n_cublas = m`, `k_cublas = k`: the cuBLAS "A" operand is tilefish's `b` (`transa = T`,
 /// a `k x n` column-major matrix with `lda = k`), the "B" operand is tilefish's `a` (`transb = N`, `k x m`, `ldb = k`), and `C` and `D` are
-/// tilefish's `out` (`n x m` column-major, `ldc = ldd = n`); every layout is `CUDA_R_16BF`, the compute type `CUBLAS_COMPUTE_32F`, the scale type
-/// `CUDA_R_32F`. A bias goes through `CUBLASLT_EPILOGUE_BIAS` with a `CUDA_R_16BF` bias pointer. Python's `describe` is the reference.
+/// tilefish's `out` (`n x m` column-major, `ldc = ldd = n`). For the layout NN, `b` is `[k, n]`: an `n x k` column-major matrix with `lda = n`,
+/// used with `transa = N`. `a` and `b` have the operand type of the form, `C`, `D` and a bias its result type; the compute type is
+/// `CUBLAS_COMPUTE_32F`, the scale type `CUDA_R_32F`. A bias goes through `CUBLASLT_EPILOGUE_BIAS` with `BIAS_DATA_TYPE` the result type. Python's
+/// `describe` is the reference.
 #[derive(Debug)]
 pub(crate) struct Problem {
     desc: sys::cublasLtMatmulDesc_t,
@@ -326,8 +338,8 @@ fn desc_set<T: Copy>(
 }
 
 impl Problem {
-    /// The problem of sizes `m`, `n`, `k` (tilefish's), with `bias` the address of the bias vector for a `gemm_bias`.
-    pub(crate) fn new(m: u64, n: u64, k: u64, bias: Option<u64>) -> Result<Self> {
+    /// The problem of sizes `m`, `n`, `k` (tilefish's) of `form`, with `bias` the address of the bias vector for a `gemm_bias`.
+    pub(crate) fn new(m: u64, n: u64, k: u64, bias: Option<u64>, form: &GemmForm) -> Result<Self> {
         use sys::cublasLtMatmulDescAttributes_t as D;
         let ld = |v: u64| {
             i64::try_from(v).map_err(|_| Error::Launch("a size of the problem does not fit 64 bits".to_owned()))
@@ -340,22 +352,31 @@ impl Problem {
             b: Layout(std::ptr::null_mut()),
             d: Layout(std::ptr::null_mut()),
         };
-        desc_set(desc, D::CUBLASLT_MATMUL_DESC_TRANSA, OP_T)?;
+        let transa = match form.layout {
+            GemmLayout::Tn => OP_T,
+            GemmLayout::Nn => OP_N,
+        };
+        desc_set(desc, D::CUBLASLT_MATMUL_DESC_TRANSA, transa)?;
         desc_set(desc, D::CUBLASLT_MATMUL_DESC_TRANSB, OP_N)?;
         match bias {
             Some(pointer) => {
                 desc_set(desc, D::CUBLASLT_MATMUL_DESC_EPILOGUE, EPILOGUE_BIAS)?;
-                desc_set(desc, D::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, R_16BF as i32)?;
+                // the bias has the type of D: the only one the library takes (an other is CUBLAS_STATUS_INVALID_VALUE, measured on 12.8.4)
+                desc_set(desc, D::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, data_type(form.out) as i32)?;
                 desc_set(desc, D::CUBLASLT_MATMUL_DESC_BIAS_POINTER, pointer as *const c_void)?;
             }
             None => desc_set(desc, D::CUBLASLT_MATMUL_DESC_EPILOGUE, EPILOGUE_DEFAULT)?,
         }
-        // the "A operand" is tilefish's b[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
-        problem.a = Layout::bf16(k, n, ld(k)?)?;
+        problem.a = match form.layout {
+            // the "A operand" is tilefish's b[n, k]: stored k x n column-major, lda = k, used transposed (n x k)
+            GemmLayout::Tn => Layout::new(form.dtype, k, n, ld(k)?)?,
+            // NN: the "A operand" is tilefish's b[k, n]: stored n x k column-major, lda = n, used as it is
+            GemmLayout::Nn => Layout::new(form.dtype, n, k, ld(n)?)?,
+        };
         // the "B operand" is tilefish's a[m, k]: stored k x m column-major, ldb = k, used as it is
-        problem.b = Layout::bf16(k, m, ld(k)?)?;
-        // out[m, n] row-major is n x m column-major, ldd = n; C has the layout of D
-        problem.d = Layout::bf16(n, m, ld(n)?)?;
+        problem.b = Layout::new(form.dtype, k, m, ld(k)?)?;
+        // out[m, n] row-major is n x m column-major, ldd = n; C has the layout (and the type) of D
+        problem.d = Layout::new(form.out, n, m, ld(n)?)?;
         Ok(problem)
     }
 }
@@ -413,13 +434,13 @@ pub(crate) struct Addresses {
     pub workspace: u64,
 }
 
-/// Enqueue `cublasLtMatmul` of the pinned algorithm on `stream`: `out = 1.0 * (a @ b^T) + 0.0 * out` (with the problem's epilogue), the
+/// Enqueue `cublasLtMatmul` of the pinned algorithm on `stream`: `out = 1.0 * (a @ b^T) + 0.0 * out` (`a @ b` for the layout NN; with the problem's epilogue), the
 /// workspace being `workspace_size` bytes at `addresses.workspace`.
 ///
 /// # Safety
 ///
 /// `stream` must be a valid `CUstream` of the context the handle was made in, which must be current on this thread; the addresses must be
-/// device memory of that context holding what `problem` says (`a` `[m, k]`, `b` `[n, k]`, `out` `[m, n]`, bf16, and the bias `[n]` of the
+/// device memory of that context holding what `problem` says (`a` `[m, k]`, `b` `[n, k]` or `[k, n]`, `out` `[m, n]`, of its types, and the bias `[n]` of the
 /// problem), allocated until the work has completed on `stream`, and the workspace at least `workspace_size` bytes.
 #[allow(unsafe_code)]
 pub(crate) unsafe fn matmul(

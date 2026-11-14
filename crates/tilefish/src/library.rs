@@ -1,9 +1,10 @@
-//! The `library` section of a manifest: operations that a vendor library runs, with no file. Today: a bf16 GEMM through cuBLASLt with
-//! the algorithm pinned (`docs/manifest-schema-3.md`, section 9).
+//! The `library` section of a manifest: operations that a vendor library runs, with no file. Today: a GEMM of bf16 or f16 operands through
+//! cuBLASLt with the algorithm pinned (`docs/manifest-schema-3.md`, section 9).
 //!
 //! A port of `validate_entry` of `python/src/tilefish/_library.py`. An entry has exactly the fields of [`ENTRY_KEYS`], each of the type it
-//! needs, and the redundant ones must agree: the dtypes, the cuBLAS-level problem (the `T`/`N` transposes, the leading dimensions)
-//! and the shapes of the operands follow from `impl`, `m`, `n` and `k`, which may be any size (an algorithm that cannot take the leading
+//! needs, and the redundant ones must agree: the dtypes are two operands of one type (`bf16` or `f16`) and a result of their type or `f32`
+//! (a bias has the result's type); `transa` says the layout (`T`: `b` is `[n, k]`, `N`: `b` is `[k, n]`), and the leading dimensions and the
+//! shapes of the operands follow from it, `impl`, `m`, `n` and `k`, which may be any size (an algorithm that cannot take the leading
 //! dimensions they make is refused by `cublasLtMatmulAlgoCheck` when it is loaded). The pinned algorithm is 64 bytes (128 lowercase hex digits) that
 //! only the library that made them can judge: running one is [`crate::gemm`].
 
@@ -27,10 +28,77 @@ const MAX_WORKSPACE_BYTES: u64 = 1 << 40;
 /// Which routine runs an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryImpl {
-    /// `cublaslt.gemm`: `out[M, N] = a[M, K] @ b[N, K]^T`, an f32 accumulator, one rounding to bf16.
+    /// `cublaslt.gemm`: `out[M, N] = a[M, K] @ b[N, K]^T` (`b[K, N]` for [`GemmLayout::Nn`]), an f32 accumulator, one rounding to the result's
+    /// type.
     Gemm,
     /// `cublaslt.gemm_bias`: the same with `bias[N]` added in f32 before the rounding (`CUBLASLT_EPILOGUE_BIAS`).
     GemmBias,
+}
+
+/// How `b` is stored, named by the transposes cuBLASLt is called with (`transa`, then `transb`; cuBLAS's A operand is tilefish's `b`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GemmLayout {
+    /// `"TN"`: `b` is `[N, K]` (a weight of `torch.nn.Linear`), `out = a @ b^T`; `lda = k`.
+    Tn,
+    /// `"NN"`: `b` is `[K, N]`, `out = a @ b`; `lda = n`.
+    Nn,
+}
+
+impl GemmLayout {
+    /// The word an entry's `transa` and `transb` spell (`"TN"`, `"NN"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tn => "TN",
+            Self::Nn => "NN",
+        }
+    }
+
+    /// The leading dimension of cuBLAS's A operand (tilefish's `b`): `k` for `[N, K]`, `n` for `[K, N]`.
+    pub fn lda(self, n: u64, k: u64) -> u64 {
+        match self {
+            Self::Tn => k,
+            Self::Nn => n,
+        }
+    }
+
+    /// The shape of `b`.
+    pub fn b_shape(self, n: u64, k: u64) -> [u64; 2] {
+        match self {
+            Self::Tn => [n, k],
+            Self::Nn => [k, n],
+        }
+    }
+}
+
+/// The types and the layout of a GEMM (Python's `tilefish._cublaslt.Form`): what its algorithm is encoded for (the types) and how the
+/// library is called (the layout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct GemmForm {
+    /// The type of `a` and `b` (bf16 or f16).
+    pub dtype: DType,
+    /// The type of the result and of a bias (`dtype`, or f32).
+    pub out: DType,
+    pub layout: GemmLayout,
+}
+
+impl GemmForm {
+    /// tilefish 0.0.5's only GEMM: bf16 in and out, TN.
+    #[cfg(test)]
+    pub const DEFAULT: Self = Self { dtype: DType::Bf16, out: DType::Bf16, layout: GemmLayout::Tn };
+
+    /// The types, as a message says them: `"bf16"`, `"f16"`, `"f16 operands and an f32 result"` (Python's `Form.what`).
+    pub fn what(&self) -> String {
+        if self.out == self.dtype {
+            self.dtype.name().to_owned()
+        } else {
+            format!("{} operands and an {} result", self.dtype.name(), self.out.name())
+        }
+    }
+
+    /// The keyword of the opt-in to split-K partial sums in the output type, named by the operands' type (`allow_f16_reduction`).
+    pub fn opt_in(&self) -> String {
+        format!("allow_{}_reduction", self.dtype.name())
+    }
 }
 
 /// How the heuristic was asked for an entry's algorithm (`heuristic`; absent means [`Heuristic::Tilefish`]). Provenance: a host runs the
@@ -79,7 +147,14 @@ pub struct LibraryEntry {
     pub arch: String,
     /// Which routine runs it.
     pub implementation: LibraryImpl,
-    /// The operands in launch order: `a [M, K]`, `b [N, K]`, `bias [N]` (only for `gemm_bias`), `out [M, N]`, all bf16 pointers (`out` is written).
+    /// The type of `a` and `b` (`dtypes.a`): [`DType::Bf16`] or [`DType::F16`].
+    pub dtype: DType,
+    /// The type of the result and of a bias (`dtypes.out`): `dtype`, or [`DType::F32`].
+    pub out_dtype: DType,
+    /// How `b` is stored (`transa`, `transb`).
+    pub layout: GemmLayout,
+    /// The operands in launch order: `a [M, K]`, `b [N, K]` (`[K, N]` for [`GemmLayout::Nn`]), `bias [N]` (only for `gemm_bias`), `out [M, N]`,
+    /// pointers of their dtypes (`out` is written).
     pub params: Vec<Param>,
     /// The bucket value of each bucketed dimension, in the order of the stem.
     pub buckets: Vec<(String, u64)>,
@@ -110,15 +185,27 @@ pub struct LibraryEntry {
     pub heuristic: Heuristic,
     /// Where the algorithm comes from (`algo_source`, absent: [`AlgoSource::Heuristic`]).
     pub algo_source: AlgoSource,
-    /// Whether the declaration opted in to split-K partial sums in bf16 (`allow_bf16_reduction: true`; absent: no). Without it an algorithm
-    /// whose split-K reduction scheme is `INPLACE` or `OUTPUT_TYPE` (bf16 partial sums, more than one rounding) is refused.
+    /// Whether the declaration opted in to split-K partial sums in bf16 (`allow_bf16_reduction: true`, only on bf16 operands; absent: no).
+    /// Without it an algorithm whose split-K reduction scheme is `INPLACE` or `OUTPUT_TYPE` (partial sums in the output type, more than one
+    /// rounding) is refused.
     pub allow_bf16_reduction: bool,
+    /// The same opt-in of f16 operands (`allow_f16_reduction: true`, only on f16 operands; absent: no).
+    pub allow_f16_reduction: bool,
 }
 
 impl LibraryEntry {
     /// The operand parameter called `name`.
     pub fn param(&self, name: &str) -> Option<&Param> {
         self.params.iter().find(|p| p.name == name)
+    }
+
+    /// Whether split-K may add its partial sums in the output type: the opt-in of the operands' type.
+    pub fn allows_output_type_reduction(&self) -> bool {
+        self.allow_bf16_reduction || self.allow_f16_reduction
+    }
+
+    pub(crate) fn form(&self) -> GemmForm {
+        GemmForm { dtype: self.dtype, out: self.out_dtype, layout: self.layout }
     }
 }
 
@@ -159,6 +246,8 @@ pub(crate) struct RawLibrary {
     algo_source: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     allow_bf16_reduction: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    allow_f16_reduction: Option<Value>,
 }
 
 /// A field that is there, whatever its value: `null` included (serde's `Option` would read a `null` as an absent field, which Python does not).
@@ -256,14 +345,22 @@ impl LibraryEntry {
             size_field(&raw.ldc, "ldc")?,
             size_field(&raw.ldd, "ldd")?,
         ];
-        if ld != [k, k, n, n] {
-            return Err("the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)".to_owned());
-        }
-        if (raw.transa.as_str(), raw.transb.as_str()) != ("T", "N") {
-            return Err(format!(
-                "transa and transb must be \"T\" and \"N\", got {:?} and {:?}",
-                raw.transa, raw.transb
-            ));
+        let layout = match (raw.transa.as_str(), raw.transb.as_str()) {
+            ("T", "N") => GemmLayout::Tn,
+            ("N", "N") => GemmLayout::Nn,
+            _ => {
+                return Err(format!(
+                    "transa and transb must be \"T\" and \"N\" (b is [n, k]) or \"N\" and \"N\" (b is [k, n]), got {:?} and {:?}",
+                    raw.transa, raw.transb
+                ));
+            }
+        };
+        if ld != [layout.lda(n, k), k, n, n] {
+            return Err(match layout {
+                GemmLayout::Tn => "the leading dimensions must be lda = ldb = k and ldc = ldd = n (cuBLAS sees b as its A, a as its B and the result as C and D)",
+                GemmLayout::Nn => "the leading dimensions of the layout NN must be lda = n, ldb = k and ldc = ldd = n (cuBLAS sees b [k, n] as its A, a as its B and the result as C and D)",
+            }
+            .to_owned());
         }
         if raw.compute_type != COMPUTE_TYPE || raw.scale_type != SCALE_TYPE {
             return Err(format!("compute_type and scale_type must be {COMPUTE_TYPE:?} and {SCALE_TYPE:?}"));
@@ -275,12 +372,26 @@ impl LibraryEntry {
                 raw.implementation, raw.epilogue
             ));
         }
+        // a and b of one type, bf16 or f16; the result (and a bias) of theirs or f32; anything else is held to the default form in the message
+        let named = |key: &str| raw.dtypes.get(key).and_then(Value::as_str).and_then(DType::from_name);
+        let (dtype, out_dtype) = match (named("a"), named("out")) {
+            (Some(a @ (DType::Bf16 | DType::F16)), Some(out)) if out == a || out == DType::F32 => (a, out),
+            _ => (DType::Bf16, DType::Bf16),
+        };
         let mut want_dtypes = Map::new();
-        for name in ["a", "b"].into_iter().chain(bias.then_some("bias")).chain(["out"]) {
-            want_dtypes.insert(name.to_owned(), Value::String("bf16".to_owned()));
+        for (name, dt) in [("a", dtype), ("b", dtype)]
+            .into_iter()
+            .chain(bias.then_some(("bias", out_dtype)))
+            .chain([("out", out_dtype)])
+        {
+            want_dtypes.insert(name.to_owned(), Value::String(dt.name().to_owned()));
         }
         if raw.dtypes != want_dtypes {
-            return Err(format!("dtypes must be {}, got {}", Value::Object(want_dtypes), Value::Object(raw.dtypes)));
+            return Err(format!(
+                "dtypes must be {}, got {} (a and b are both bf16 or both f16, the result is of their type or f32, a bias of the result's type)",
+                Value::Object(want_dtypes),
+                Value::Object(raw.dtypes)
+            ));
         }
         let workspace_bytes = match raw.workspace_bytes.as_u64() {
             Some(w) if (1..=MAX_WORKSPACE_BYTES).contains(&w) => w,
@@ -319,6 +430,20 @@ impl LibraryEntry {
         };
         let allow_bf16_reduction =
             optional_field(&raw.allow_bf16_reduction, "allow_bf16_reduction", &Value::Bool(true))?;
+        let allow_f16_reduction = optional_field(&raw.allow_f16_reduction, "allow_f16_reduction", &Value::Bool(true))?;
+        // the opt-in is named by the operands' type, as torch's flags are
+        for (flag, set, of) in [
+            ("allow_bf16_reduction", allow_bf16_reduction, DType::Bf16),
+            ("allow_f16_reduction", allow_f16_reduction, DType::F16),
+        ] {
+            if set && dtype != of {
+                return Err(format!(
+                    "{flag} is the opt-in of {} operands, and the operands of this entry are {}",
+                    of.name(),
+                    dtype.name()
+                ));
+            }
+        }
         let mut buckets = Vec::with_capacity(raw.buckets.len());
         let mut stem = raw.op.clone();
         for (name, value) in &raw.buckets {
@@ -327,24 +452,30 @@ impl LibraryEntry {
             stem.push_str(&format!(".{name}{v}"));
             buckets.push((name.clone(), v));
         }
-        // the operands: a [M, K], b [N, K], [bias [N]], out [M, N], in this order
-        let expected_shapes: Vec<Vec<u64>> =
-            [vec![m, k], vec![n, k]].into_iter().chain(bias.then(|| vec![n])).chain([vec![m, n]]).collect();
+        // the operands: a [M, K], b [N, K] (TN) or [K, N] (NN), [bias [N]], out [M, N], in this order, each of its type in dtypes
+        let expected: Vec<(Vec<u64>, DType)> = [(vec![m, k], dtype), (layout.b_shape(n, k).to_vec(), dtype)]
+            .into_iter()
+            .chain(bias.then(|| (vec![n], out_dtype)))
+            .chain([(vec![m, n], out_dtype)])
+            .collect();
         let params_raw = &raw.abi.params;
-        if params_raw.len() != expected_shapes.len() {
+        if params_raw.len() != expected.len() {
             return Err(format!(
                 "abi.params must list {} pointers ({} in this order)",
-                expected_shapes.len(),
+                expected.len(),
                 if bias { "a, b, bias, out" } else { "a, b, out" }
             ));
         }
         let mut params = Vec::with_capacity(params_raw.len());
-        for (i, (p, size)) in params_raw.iter().zip(&expected_shapes).enumerate() {
+        for (i, (p, (size, pdtype))) in params_raw.iter().zip(&expected).enumerate() {
             want_ident(&Value::String(p.name.clone()), &format!("abi.params[{i}].name"))?;
             let last = i + 1 == params_raw.len();
             let want_access = if last { "out" } else { "in" };
-            if p.index != i as u64 || p.kind != "pointer" || p.dtype != "bf16" || p.access != want_access {
-                return Err(format!("abi.params[{i}] must be the bf16 pointer #{i} with access {want_access}"));
+            if p.index != i as u64 || p.kind != "pointer" || p.dtype != pdtype.name() || p.access != want_access {
+                return Err(format!(
+                    "abi.params[{i}] must be the {} pointer #{i} with access {want_access}",
+                    pdtype.name()
+                ));
             }
             if params_raw[..i].iter().any(|q| q.name == p.name) {
                 return Err(format!("the name {:?} is used twice", p.name));
@@ -371,8 +502,8 @@ impl LibraryEntry {
                 index: i,
                 name: p.name.clone(),
                 kind: ParamKind::Pointer {
-                    dtype_name: "bf16".to_owned(),
-                    dtype: Some(DType::Bf16),
+                    dtype_name: pdtype.name().to_owned(),
+                    dtype: Some(*pdtype),
                     access: if last { Access::Out } else { Access::In },
                     shape,
                     view: None,
@@ -441,6 +572,9 @@ impl LibraryEntry {
             op: raw.op,
             arch: raw.arch,
             implementation,
+            dtype,
+            out_dtype,
+            layout,
             params,
             buckets,
             dims,
@@ -456,6 +590,7 @@ impl LibraryEntry {
             heuristic,
             algo_source,
             allow_bf16_reduction,
+            allow_f16_reduction,
         })
     }
 }
