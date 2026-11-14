@@ -79,6 +79,58 @@ struct TensorPlan {
     alignment: u64,
     /// An `out` pointer that may be written over an input (`alias`): the index of that input, which it may be exactly (not overlap otherwise).
     alias: Option<usize>,
+    /// A TMA descriptor of the tensor: what its map is encoded with besides the tensor.
+    map: Option<MapPlan>,
+}
+
+/// The map of a TMA descriptor parameter: the numbers of `cuTensorMapEncodeTiled` that are not the tensor's.
+#[derive(Debug, Clone)]
+struct MapPlan {
+    data_type: u32,
+    /// The box, innermost first.
+    box_dim: Vec<u32>,
+    swizzle: u32,
+    l2_promotion: u32,
+    oob_fill: u32,
+}
+
+/// The arguments of one `cuTensorMapEncodeTiled` call of a launch (a TMA descriptor parameter): every number of it, the innermost
+/// dimension first, as both hosts compute them (Python's `_tensormap.encode_arguments`): the tensor's address, its dimensions, the strides
+/// of its outer axes in bytes (then, as Triton's `fillTMADescriptor` passes them, the bytes of the whole tensor: `rank` entries, of which
+/// the driver reads `rank - 1`), the box, element strides of 1, interleave `NONE` (0), and the map's swizzle, L2 promotion and fill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorMapEncode {
+    /// `CUtensorMapDataType`.
+    pub data_type: u32,
+    /// The number of dimensions, 1 to 5.
+    pub rank: u32,
+    /// The address of the tensor's first element.
+    pub address: u64,
+    /// Its dimensions, innermost first.
+    pub global_dim: Vec<u64>,
+    /// The strides of its outer axes in bytes, innermost first, then its bytes in all.
+    pub global_strides: Vec<u64>,
+    /// The box, innermost first.
+    pub box_dim: Vec<u32>,
+    /// The element strides (all 1).
+    pub element_strides: Vec<u32>,
+    /// `CUtensorMapInterleave` (0: none).
+    pub interleave: u32,
+    /// `CUtensorMapSwizzle`.
+    pub swizzle: u32,
+    /// `CUtensorMapL2promotion`.
+    pub l2_promotion: u32,
+    /// `CUtensorMapFloatOOBfill`.
+    pub oob_fill: u32,
+}
+
+/// One TMA descriptor of a checked launch: its slot of `kernelParams`, the tensor it is of, the arguments it is encoded with, and its bytes
+/// once a loaded kernel has encoded it ([`crate::Kernel::check`]).
+#[derive(Debug, Clone)]
+pub(crate) struct MapSlot {
+    pub(crate) slot: usize,
+    pub(crate) encode: TensorMapEncode,
+    pub(crate) bytes: Option<crate::ffi::TensorMapBytes>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +174,12 @@ enum Slot {
     Fixed(u64),
     /// A fixed argument per call: the index of its value in what the call gives.
     Given(usize),
+    /// The `CUtensorMap` of a TMA descriptor of the tensor: encoded from it at the launch, passed by value.
+    Map(usize),
+    /// The size of an axis of the tensor of a TMA descriptor (an `i32`), after its map.
+    MapShape(usize, usize),
+    /// The element stride of an axis of the tensor of a TMA descriptor (an `i64`), after its shape.
+    MapStride(usize, usize),
 }
 
 /// One manifest entry, ready to check a call against.
@@ -151,8 +209,11 @@ pub struct Prepared {
     pub grid: [u32; 3],
     pub(crate) values: [u64; MAX_PARAMS],
     pub(crate) count: usize,
-    /// For each slot, the index of the tensor it holds (`NOT_A_TENSOR` for a scalar, a fixed argument or a scratch slot).
+    /// For each slot, the index of the tensor it holds (`NOT_A_TENSOR` for a scalar, a fixed argument or a scratch slot). The slot of the map
+    /// of a TMA descriptor holds its tensor too (a launch orders the tensor's memory as a pointer's, and passes the map).
     pub(crate) tensor_of: [u8; MAX_PARAMS],
+    /// The TMA descriptors of the call, in the order of their slots.
+    pub(crate) maps: Vec<MapSlot>,
 }
 
 /// What `Prepared::tensor_of` holds for a slot that is not a tensor.
@@ -160,9 +221,21 @@ pub(crate) const NOT_A_TENSOR: u8 = u8::MAX;
 
 impl Prepared {
     /// The `kernelParams` values, one 64-bit slot each: an address, an `i32` or an `f32` in the low four bytes, an `i64`, then the scratch
-    /// slots of a Triton kernel (null pointers; a prebuilt binary has none).
+    /// slots of a Triton kernel (null pointers; a prebuilt binary has none). The slot of the map of a TMA descriptor holds 0 here: the launch
+    /// passes the 128 bytes of the map it encoded ([`Prepared::tensor_maps`]); its shape and strides follow in slots of their own.
     pub fn params(&self) -> &[u64] {
         &self.values[..self.count]
+    }
+
+    /// The `cuTensorMapEncodeTiled` arguments of each TMA descriptor of the call, in the order of their slots: what a launch encodes.
+    pub fn tensor_maps(&self) -> impl Iterator<Item = &TensorMapEncode> {
+        self.maps.iter().map(|m| &m.encode)
+    }
+
+    /// The map that a launch passes at `slot`, when that is the slot of a TMA descriptor (`None` for any other slot). It has its bytes once a
+    /// loaded kernel has checked the call.
+    pub(crate) fn map_at(&self, slot: usize) -> Option<&MapSlot> {
+        self.maps.iter().find(|m| m.slot == slot)
     }
 }
 
@@ -228,9 +301,10 @@ impl Plan {
                 blockers.join(", ")
             )));
         }
-        if source.params.len() + source.scratch_slots > MAX_PARAMS {
+        let slot_count: usize = source.params.iter().map(|p| p.slots().len()).sum();
+        if slot_count + source.scratch_slots > MAX_PARAMS {
             return Err(Error::Unsupported(format!(
-                "{who}: a kernel with {} parameters is not supported",
+                "{who}: a kernel with {} parameters ({slot_count} slots of kernelParams) is not supported",
                 source.params.len()
             )));
         }
@@ -252,7 +326,7 @@ impl Plan {
         let mut slots = Vec::new();
         for p in source.params {
             match &p.kind {
-                ParamKind::Pointer { dtype_name, dtype, access, shape, view, .. } => {
+                ParamKind::Pointer { dtype_name, dtype, access, shape, view, tensor_map, .. } => {
                     let Some(dtype) = *dtype else {
                         return Err(Error::Unsupported(format!(
                             "{who}: parameter '{}' has dtype {dtype_name}, which has no storage type here (packed formats cannot be run yet)",
@@ -290,7 +364,22 @@ impl Plan {
                         }
                         None => None,
                     };
-                    slots.push(Slot::Tensor(tensors.len()));
+                    let t = tensors.len();
+                    let map = tensor_map.as_ref().map(|m| MapPlan {
+                        data_type: m.data_type_value(),
+                        box_dim: m.box_shape.iter().rev().copied().collect(),
+                        swizzle: m.swizzle_value(),
+                        l2_promotion: m.l2_promotion_value(),
+                        oob_fill: u32::from(m.oob_nan),
+                    });
+                    if map.is_some() {
+                        // the map, then the shape (i32 each) and the element strides (i64 each) of the tensor: Triton's expansion
+                        slots.push(Slot::Map(t));
+                        slots.extend((0..shape.len()).map(|axis| Slot::MapShape(t, axis)));
+                        slots.extend((0..shape.len()).map(|axis| Slot::MapStride(t, axis)));
+                    } else {
+                        slots.push(Slot::Tensor(t));
+                    }
                     tensors.push(TensorPlan {
                         name: p.name.clone(),
                         dtype,
@@ -300,6 +389,7 @@ impl Plan {
                         strides,
                         alignment: 16,
                         alias: None,
+                        map,
                     });
                 }
                 ParamKind::Scalar { ty, dim, .. } => {
@@ -976,6 +1066,20 @@ impl Plan {
             }
         }
 
+        // -- what `cuTensorMapEncodeTiled` requires of the tensor of each TMA descriptor, in the order of the ABI (Python's `check_tensor_maps`):
+        // dimensions that fit the i32 the kernel gets them as, the innermost stride 1, the other strides multiples of 16 bytes below 2**40 bytes
+        // (the canonical strides; its address is its pointer_alignment, checked above)
+        let mut map_strides: Vec<Vec<u128>> = vec![Vec::new(); self.tensors.len()];
+        for (t, plan) in self.tensors.iter().enumerate() {
+            if plan.map.is_none() {
+                continue;
+            }
+            let a = &tensors[t];
+            let strides = canonical_strides(a.shape, a.strides);
+            check_tensor_map(stem, &plan.name, plan.dtype.size(), a.shape, &strides)?;
+            map_strides[t] = strides;
+        }
+
         // -- the grid, from its expression, against what the device takes
         let mut grid = [1u32; 3];
         for (axis, entry) in self.grid.iter().enumerate() {
@@ -1013,12 +1117,27 @@ impl Plan {
         // -- the kernelParams values (every scalar is in the range of its type: checked above)
         let mut values = [0u64; MAX_PARAMS];
         let mut tensor_of = [NOT_A_TENSOR; MAX_PARAMS];
+        let mut maps = Vec::new();
         for (k, slot) in self.slots.iter().enumerate() {
             values[k] = match slot {
                 Slot::Tensor(t) => {
                     tensor_of[k] = *t as u8; // at most MAX_PARAMS tensors: `Plan::new` refuses more parameters
                     tensors[*t].ptr
                 }
+                Slot::Map(t) => {
+                    tensor_of[k] = *t as u8;
+                    let (plan, a) = (&self.tensors[*t], &tensors[*t]);
+                    let map = plan.map.as_ref().expect("a map slot is of a descriptor");
+                    maps.push(MapSlot {
+                        slot: k,
+                        encode: encode_of(map, plan.dtype.size(), a, &map_strides[*t]),
+                        bytes: None,
+                    });
+                    0 // the map's 128 bytes are passed from the encoded map
+                }
+                // (each fits: checked above, a dimension in i32, a stride below 2**40 bytes)
+                Slot::MapShape(t, axis) => u64::from(tensors[*t].shape[*axis] as u32),
+                Slot::MapStride(t, axis) => map_strides[*t][*axis] as u64,
                 Slot::Scalar(s) => {
                     let v = scalar_values[*s];
                     match self.scalars[*s].ty {
@@ -1034,7 +1153,7 @@ impl Plan {
             };
         }
         // (the scratch slots of a Triton kernel stay 0: null pointers)
-        Ok(Prepared { grid, values, count: self.slots.len() + self.scratch_slots, tensor_of })
+        Ok(Prepared { grid, values, count: self.slots.len() + self.scratch_slots, tensor_of, maps })
     }
 
     /// Bind the dimensions from `equations`, as Python's `solve_dims` does: in passes over the equations in order, each binding the one
@@ -1127,6 +1246,69 @@ fn canonical_strides(shape: &[usize], strides: Option<&[usize]>) -> Vec<u128> {
         }
     }
     out
+}
+
+/// The largest dimension of a tensor of a TMA descriptor: its shape is passed to the kernel as `i32` (the driver takes up to `2**32`).
+const MAP_MAX_DIM: usize = i32::MAX as usize;
+/// A stride of a tensor of a TMA descriptor is less than this many bytes.
+const MAP_MAX_STRIDE_BYTES: u128 = 1 << 40;
+
+/// What `cuTensorMapEncodeTiled` requires of the tensor of a TMA descriptor (Python's `_tensormap.check_tensor_map`, in its order), with its
+/// canonical element `strides`: every dimension at most `2**31 - 1`, the innermost stride 1, every other stride a multiple of 16 bytes below
+/// `2**40` bytes. A refusal of kind `tensor_map`.
+fn check_tensor_map(stem: &str, name: &str, item: usize, shape: &[usize], strides: &[u128]) -> Result<()> {
+    let refuse = |message: String| Err(Error::precondition(PreconditionKind::TensorMap, Some(name), message));
+    let rank = shape.len();
+    for (axis, n) in shape.iter().enumerate() {
+        if *n > MAP_MAX_DIM {
+            return refuse(format!(
+                "'{stem}': argument '{name}' has {n} elements along axis {axis}: the dimensions of a tensor descriptor are passed to the kernel \
+                 as i32, so at most {MAP_MAX_DIM}"
+            ));
+        }
+    }
+    if strides[rank - 1] != 1 {
+        return refuse(format!(
+            "'{stem}': argument '{name}' has stride {} along its last axis: a tensor descriptor reads the last axis contiguously (stride 1)",
+            strides[rank - 1]
+        ));
+    }
+    for axis in 0..rank - 1 {
+        let bytes = strides[axis].saturating_mul(item as u128);
+        if !bytes.is_multiple_of(16) || bytes >= MAP_MAX_STRIDE_BYTES {
+            return refuse(format!(
+                "'{stem}': argument '{name}' (shape {shape:?}, strides {strides:?}) has a stride of {bytes} bytes along axis {axis}: the strides \
+                 of a tensor descriptor are multiples of 16 bytes and less than 2**40 bytes (pad the rows of the tensor to a multiple of 16 bytes)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The arguments of `cuTensorMapEncodeTiled` for the tensor `a` (its checked canonical element `strides`) of a descriptor with `map` (Python's
+/// `_tensormap.encode_arguments`): the dimensions reversed (innermost first), the strides of the outer axes in bytes, innermost first, then the
+/// bytes of the whole tensor, as Triton's `fillTMADescriptor` passes them.
+fn encode_of(map: &MapPlan, item: usize, a: &TensorArg<'_>, strides: &[u128]) -> TensorMapEncode {
+    let rank = a.shape.len();
+    let item = item as u64;
+    let global_dim: Vec<u64> = a.shape.iter().rev().map(|n| *n as u64).collect();
+    let mut global_strides: Vec<u64> =
+        (0..rank.saturating_sub(1)).rev().map(|axis| strides[axis] as u64 * item).collect();
+    let outermost = global_strides.last().copied().unwrap_or(item);
+    global_strides.push(global_dim[rank - 1] * outermost);
+    TensorMapEncode {
+        data_type: map.data_type,
+        rank: rank as u32,
+        address: a.ptr,
+        global_dim,
+        global_strides,
+        box_dim: map.box_dim.clone(),
+        element_strides: vec![1; rank],
+        interleave: 0,
+        swizzle: map.swizzle,
+        l2_promotion: map.l2_promotion,
+        oob_fill: map.oob_fill,
+    }
 }
 
 /// One more than the largest element offset a tensor of this shape and these (canonical) strides reaches.

@@ -164,7 +164,7 @@ magnitude, so that every language reads the same number); a file larger than
 |---|---|
 | `entry` | string: the stem of a manifest entry (`rmsnorm`, `attention`, `gemm_qkv.M64`: an identifier, then `.<Dim><value>` per bucketed dimension of the operator). It is the entry's own bucket, which differs between buckets of the plan for an operator whose binaries are bucketed. |
 | `kind` | `"kernel"`: an entry of the manifest's `kernels` (Triton or prebuilt binary). `"library"`: an entry of its `library` (a pinned GEMM). The manifest must have the entry **for `arch`** in that section. `"copy"`: a device-to-device copy (section 7.5), which names no entry. |
-| `args` | non-empty list, one object per **pointer parameter of the entry's `abi.params`, in order** (a kernel's scalar and `fixed` parameters are not arguments: the host derives them). Names in one step are distinct. |
+| `args` | non-empty list, one object per **pointer parameter of the entry's `abi.params`, in order** (a kernel's scalar and `fixed` parameters are not arguments: the host derives them). A `tensordesc` parameter (a TMA descriptor of a tensor, manifest schema 3, section 5.5) is a pointer parameter here: the step binds its tensor. Names in one step are distinct. |
 | `workspace` | present exactly when `kind` is `"library"`: the name of the buffer of role `workspace`. |
 | `given` | present exactly when the entry has fixed arguments given per call (manifest schema 3, section 5.3: a prebuilt binary's `kind: "given"` parameters), on a step of kind `"kernel"`: a non-empty object, the name of every one of them (an identifier) to the JSON integer the call gave, in range of its type (`i32`, `i64`; a plan number is at most `2**53` in magnitude). The value may differ between buckets (a call may give an expression of the graph's dimensions, `c=Rg`, evaluated at each bucket); the names may not. It is part of the digest. |
 
@@ -193,6 +193,12 @@ the grid against the device's limits. A kernel is launched with `cuLaunchKernel`
 with `cublasLtMatmul` and its pinned algorithm (manifest schema 3, section 9), whose **workspace is the buffer named by `workspace`**, at its address in the arena (`workspace_bytes` of the entry
 are always there; the matmul is given the size the algorithm needs, at most that), so the call allocates nothing.
 
+**A TMA descriptor argument** (a `tensordesc` parameter of the entry: manifest schema 3, section 5.5) is checked as that section says (its address 16-byte aligned, its strides multiples of
+16 bytes, its dimensions within `i32`: kind `tensor_map`) and its `CUtensorMap` is **encoded from the tensor of the argument, at every execution, with every check of section 9 step 3**:
+the address `address(buffer) + view.offset * itemsize` (an arena buffer at `arena + offset`, an external at the caller's tensor), the view's shape and canonical strides, and the map of the
+entry. So an encode the driver refuses launches nothing, and a step launches with the maps of the memory it binds at this execution; no map is computed when the plan is made or loaded (the
+document has no addresses). Python keeps the last 4096 encodings by their arguments, which makes a repeated execution of one binding encode nothing new, and any other binding another key.
+
 The one binary an entry names serves every size of its unbucketed dimensions: a plan for `M in {32, 64, 128}` of a row kernel names the entry `rmsnorm` in all three buckets, with `M` bound from
 the shapes of the views; and every value of its fixed arguments given per call: two steps of one prebuilt binary with other `given` values name one entry.
 
@@ -201,7 +207,7 @@ the shapes of the views; and every value of its fixed arguments given per call: 
 `check_against_manifest` (and Python's `export`, which refuses to write a plan that fails it). For every step of every bucket:
 
 * the entry exists in the section `kind` says, for `arch`; for a `library` step the `workspace` buffer's `bytes` is at least the entry's `workspace_bytes`;
-* the entry has as many pointer parameters as the step has arguments, and argument `i` has the name of pointer `i`;
+* the entry has as many pointer parameters (`pointer` and `tensordesc`) as the step has arguments, and argument `i` has the name of pointer `i`;
 * the step's `given` names exactly the entry's parameters of kind `given` (none: no `given`), and each value fits the parameter's type;
 * **the dtype** of the buffer is the pointer's `dtype`; **the rank** of the view (or buffer) is `len(shape)` of the ABI pointer;
 * a pointer with shape `[]` (a device scalar) is bound to a buffer of role `devscalar`, and only such a pointer is;
@@ -355,6 +361,12 @@ whoever holds it, with no lock of the host: item 7 says what its event nodes ord
    before it launches the graph, whenever they do not hold that graph's values; `CapturedPlan::set_devscalar` changes them.)
 4. **A graph holds addresses, not values**: the externals are the same tensors at every replay (write into them in place), and **the arena of a captured graph is the plan's arena**, the one
    the uncaptured executions use, at the address the graph holds (the shared arena, for a plan that runs on one: section 15.1).
+   **A TMA descriptor is held by value**: the kernel node of a step with a `tensordesc` argument (section 7.2) holds the 128 bytes of the `CUtensorMap` encoded for the capture, which say
+   the address, the shape and the strides the capture bound: an arena buffer at its offset in this arena, an external at the tensor the capture was given, the view and the bucket of the
+   step. So a graph's descriptors are fixed by its bucket, its arena (its address and the layout of the plan) and its externals, exactly as its pointers are, and they are right for every
+   replay for as long as those are (which item 4 already requires: nothing else is). There is nothing to patch in a graph: binding another tensor, or another arena, is another execution
+   or another capture, which encodes the maps of what it binds (Python's `tilefish.capture` and a `torch.cuda.graph` of `tilefish.run`, Rust's `PlanRun::capture`, all encode in the checks
+   before the capture begins). Writing new values into the same tensors between replays (item 4) changes no descriptor.
 5. **One stream**: the capture is of the stream the steps are launched on; all steps go there. Every execution of one plan in one capture is on one stream: Python refuses a second
    execution of a plan's arena in the same capture (the same `cuStreamGetCaptureInfo` id) on another stream, such as a stream forked from the capturing one, before it enqueues anything
    (its wait node would not depend on the first execution's record node inside the graph, so one replay could run the two at once on the arena; CUDA does not say it orders them, though
@@ -472,6 +484,7 @@ and 9 240 832 with it (720 896 for the intermediates).
 | copy steps (`tilefish.copy`, a store into an `InOut` parameter; section 7.5) | `test_plan_copy.py`; on a GPU `test_gpu_plan_copy.py`; the Rust reader: `python_plans.json` (`copy ...` documents) |
 | returned views and parameters (section 12) | `test_plan_returns.py`; on a GPU `test_gpu_plan_returns.py` |
 | one step alone (section 9) | `test_plan_step.py`; on a GPU `test_gpu_plan_step.py` and `gpu_plan_gate.rs` (`the_steps_launched_one_by_one_give_the_bytes_of_the_plan`) |
+| steps with TMA descriptors (sections 7.2 and 10): encoded from the buffers they bind before the first launch, held by value in a graph | `test_tensordesc.py` (a fake backend); on a GPU `test_gpu_tma.py` (jit, replay, `tilefish.capture`, `torch.cuda.graph`, a step alone) and the gate plans `tma_chain`, `tma_chain-reuse`, `tma_view` (`gpu_plan_gate.rs`: launched and replayed from a graph) |
 | debug taps (section 9) | `test_plan_taps.py`; on a GPU `test_gpu_plan_taps.py` and `gpu_plan_gate.rs` (`taps_are_pythons_bytes`: Rust taps against Python's) |
 | the roles of the parameters, declared or chosen from the shapes (sections 2, 6), and weights bound once (section 9) | `test_plan_roles.py`; the golden plan `steps` (`launch_plans.rs`); on a GPU `test_gpu_plan_roles.py` and `gpu_plan_gate.rs` (`weights_bound_once_give_pythons_bytes`) |
 | the fixed arguments given per call of a prebuilt binary: a step's `given` (section 7) | `test_given_args.py`; the golden plan `given` (`launch_plans.rs`, and the `given ...` documents of `python_plans.json`); on a GPU `test_gpu_given_args.py`, `gpu_gate.rs` (`one_binary_serves_the_values_each_call_gives`) and the gate plan `given_steps` |

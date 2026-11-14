@@ -214,11 +214,75 @@ impl FixedValue {
     }
 }
 
+/// The `CUtensorMap` a TMA descriptor parameter (manifest kind `tensordesc`) is encoded with, besides its tensor: the `tensor_map` of the
+/// parameter (manifest schema 3, section 5.5). The interleave is `CU_TENSOR_MAP_INTERLEAVE_NONE` and the element strides are 1, always.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorMap {
+    /// The `CUtensorMapDataType` (the name of its enumerator: `CU_TENSOR_MAP_DATA_TYPE_FLOAT16`, ...), the one of the parameter's dtype.
+    pub data_type: String,
+    /// The block of the descriptor: the tile one `load` or `store` of the kernel moves (outermost first), which is in its Triton type.
+    pub block: Vec<u32>,
+    /// The box of the map (outermost first): the block, with its inner dimension cut to the swizzle span (the kernel copies a wider block
+    /// as several boxes). What `cuTensorMapEncodeTiled` is given (innermost first).
+    pub box_shape: Vec<u32>,
+    /// The swizzle span in bytes: 0 (none), 32, 64 or 128.
+    pub swizzle: u32,
+    /// The L2 promotion in bytes: 0 (none), 64, 128 or 256.
+    pub l2_promotion: u32,
+    /// The out-of-bounds fill: `true` for `CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA` (a float reads as NaN), `false` for
+    /// `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE` (an element outside the tensor reads as zero, and a store there is dropped).
+    pub oob_nan: bool,
+}
+
+/// The dtypes a TMA descriptor describes, with the `CUtensorMapDataType` of each (its enumerator's name and value).
+pub(crate) const TENSOR_MAP_TYPES: [(&str, &str, u32); 8] = [
+    ("u8", "CU_TENSOR_MAP_DATA_TYPE_UINT8", 0),
+    ("e4m3", "CU_TENSOR_MAP_DATA_TYPE_UINT8", 0),
+    ("e5m2", "CU_TENSOR_MAP_DATA_TYPE_UINT8", 0),
+    ("i32", "CU_TENSOR_MAP_DATA_TYPE_INT32", 3),
+    ("i64", "CU_TENSOR_MAP_DATA_TYPE_INT64", 5),
+    ("f16", "CU_TENSOR_MAP_DATA_TYPE_FLOAT16", 6),
+    ("f32", "CU_TENSOR_MAP_DATA_TYPE_FLOAT32", 7),
+    ("bf16", "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16", 9),
+];
+
+impl TensorMap {
+    /// The `CUtensorMapDataType` value of the map (`cuda.h`).
+    pub fn data_type_value(&self) -> u32 {
+        TENSOR_MAP_TYPES.iter().find(|(_, name, _)| *name == self.data_type).map_or(0, |(_, _, v)| *v)
+    }
+
+    /// The `CUtensorMapSwizzle` value of the map: 0 none, 1 32 B, 2 64 B, 3 128 B.
+    pub fn swizzle_value(&self) -> u32 {
+        match self.swizzle {
+            32 => 1,
+            64 => 2,
+            128 => 3,
+            _ => 0,
+        }
+    }
+
+    /// The `CUtensorMapL2promotion` value of the map: 0 none, 1 64 B, 2 128 B, 3 256 B.
+    pub fn l2_promotion_value(&self) -> u32 {
+        match self.l2_promotion {
+            64 => 1,
+            128 => 2,
+            256 => 3,
+            _ => 0,
+        }
+    }
+}
+
 /// What a launch parameter is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamKind {
     /// A device pointer. With a `view` it takes a strided view of a tensor; with an empty `shape` it is a *device scalar* (one element in
     /// device memory, read by the kernel with `tl.load(ptr)`).
+    ///
+    /// With a `tensor_map` it is a **TMA descriptor** of the tensor (manifest kind `tensordesc`): a launch is given the tensor, as for a pointer,
+    /// and passes the `CUtensorMap` it encodes of it (`cuTensorMapEncodeTiled`: the tensor's address, shape and strides, and the map's box,
+    /// swizzle, L2 promotion and fill), by value, then the tensor's shape (`i32` each) and element strides (`i64` each): `1 + 2 * rank` slots
+    /// of `kernelParams` ([`Param::slots`]), as Triton passes a host `TensorDescriptor`.
     Pointer {
         /// The element dtype as the manifest names it (`"bf16"`, `"e2m1"`, ...).
         dtype_name: String,
@@ -233,6 +297,8 @@ pub enum ParamKind {
         /// An `out` pointer only: the `in` pointer it may be written over (`Out[..., MayAlias("r")]` in Python), the two given as exactly one
         /// tensor (one address, shape and strides). Any other overlap of a written tensor is refused, as always.
         alias: Option<String>,
+        /// A TMA descriptor of the tensor (`TensorDesc(...)` in Python): the map it is encoded with. `None` for a pointer.
+        tensor_map: Option<TensorMap>,
     },
     /// A runtime integer: the value of a dimension expression, the element count of a pointer, or one stride of a strided pointer.
     Scalar {
@@ -263,7 +329,7 @@ pub enum ParamKind {
 /// One non-constexpr parameter of the launch ABI.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
-    /// Position in `kernelParams`.
+    /// Position in `kernelParams` of its first slot (a TMA descriptor takes `1 + 2 * rank` slots from there: [`Param::slots`]).
     pub slot: usize,
     /// Position among all the kernel's parameters, constexprs included.
     pub index: usize,
@@ -279,10 +345,31 @@ impl Param {
         matches!(&self.kind, ParamKind::Pointer { shape, .. } if shape.is_empty())
     }
 
-    /// The bytes the parameter takes in `kernelParams`: 8 for a pointer, as many as its type for a scalar or a fixed argument (the `size` of
-    /// the manifest, which the loaded function is asked to report).
+    /// Whether this is a TMA descriptor of a tensor (a pointer with a `tensor_map`: manifest kind `tensordesc`).
+    pub fn tensor_map(&self) -> Option<&TensorMap> {
+        match &self.kind {
+            ParamKind::Pointer { tensor_map, .. } => tensor_map.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The bytes of each `kernelParams` slot the parameter takes: one slot of [`Param::size`] bytes, or for a TMA descriptor of a tensor of
+    /// rank `r` the 128 bytes of its `CUtensorMap`, then `r` of 4 (its shape) and `r` of 8 (its strides).
+    pub fn slots(&self) -> Vec<usize> {
+        match &self.kind {
+            ParamKind::Pointer { tensor_map: Some(_), shape, .. } => std::iter::once(128)
+                .chain(std::iter::repeat_n(4, shape.len()))
+                .chain(std::iter::repeat_n(8, shape.len()))
+                .collect(),
+            _ => vec![self.size()],
+        }
+    }
+
+    /// The bytes the parameter takes in `kernelParams` (its first slot, for a TMA descriptor): 8 for a pointer, 128 for a descriptor, as many
+    /// as its type for a scalar or a fixed argument (the `size` of the manifest, which the loaded function is asked to report).
     pub fn size(&self) -> usize {
         match &self.kind {
+            ParamKind::Pointer { tensor_map: Some(_), .. } => 128,
             ParamKind::Pointer { .. } => 8,
             ParamKind::Scalar { ty, .. } => match ty {
                 ScalarType::I32 => 4,
@@ -792,6 +879,8 @@ struct RawParam {
     value: Option<Value>,
     #[serde(default)]
     alias: Option<Value>,
+    #[serde(default)]
+    tensor_map: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1123,19 +1212,178 @@ fn str_field<'a>(v: &'a Option<String>, what: &str, name: &str) -> std::result::
     v.as_deref().ok_or_else(|| format!("parameter {name}: {what} is missing"))
 }
 
+/// The largest dimension of the block of a TMA descriptor (its inner one may be wider than the box), Python's `_tensormap.MAX_BLOCK`.
+const MAX_TENSOR_MAP_BLOCK: u64 = 1 << 16;
+
+/// The `tensor_map` of a TMA descriptor parameter of `dtype` and `rank` (Python's `_tensormap.read_json` and `check_map`): exactly its eight
+/// fields; the data type of the dtype; a block of powers of two and a box that tiles it, each of `rank` ints; element strides of 1; interleave
+/// `NONE`; and what `cuTensorMapEncodeTiled` refuses of the box (1 to 256 elements per axis, an inner dimension of a multiple of 16 bytes and,
+/// swizzled, within the swizzle span) and of the fill (NaN for a float only).
+fn read_tensor_map(v: Option<&Value>, dtype: &str, rank: usize, name: &str) -> std::result::Result<TensorMap, String> {
+    let bad = |what: String| Err(format!("parameter {name}: {what}"));
+    let Some(Value::Object(m)) = v else {
+        return bad(format!(
+            "tensor_map must be an object, got {}",
+            v.map_or("nothing".to_owned(), ToString::to_string)
+        ));
+    };
+    const KEYS: [&str; 8] =
+        ["data_type", "block", "box", "element_strides", "interleave", "swizzle", "l2_promotion", "oob_fill"];
+    if m.len() != KEYS.len() || KEYS.iter().any(|k| !m.contains_key(*k)) {
+        return bad(format!(
+            "tensor_map must have exactly the fields {KEYS:?}, has {:?}",
+            m.keys().collect::<Vec<_>>()
+        ));
+    }
+    let Some((_, data_type, _)) = TENSOR_MAP_TYPES.iter().find(|(d, _, _)| *d == dtype) else {
+        return bad(format!("a tensor descriptor of {dtype:?} is not supported"));
+    };
+    if m["data_type"].as_str() != Some(data_type) {
+        return bad(format!("tensor_map.data_type of a {dtype} tensor is {data_type}, got {}", m["data_type"]));
+    }
+    let ints = |key: &str| -> std::result::Result<Vec<u64>, String> {
+        let list = m[key].as_array().filter(|a| a.len() == rank);
+        list.and_then(|a| a.iter().map(|x| if x.is_u64() { x.as_u64() } else { None }).collect::<Option<Vec<u64>>>())
+            .ok_or_else(|| format!("parameter {name}: tensor_map.{key} must be a list of {rank} ints (one per axis of the shape), got {}", m[key]))
+    };
+    let block = ints("block")?;
+    let box_shape = ints("box")?;
+    if ints("element_strides")?.iter().any(|e| *e != 1) {
+        return bad(format!(
+            "tensor_map.element_strides must be all 1 (Triton's kernels take element strides of 1), got {}",
+            m["element_strides"]
+        ));
+    }
+    if m["interleave"].as_str() != Some("CU_TENSOR_MAP_INTERLEAVE_NONE") {
+        return bad(format!("tensor_map.interleave must be CU_TENSOR_MAP_INTERLEAVE_NONE, got {}", m["interleave"]));
+    }
+    let swizzle = match m["swizzle"].as_str() {
+        Some("CU_TENSOR_MAP_SWIZZLE_NONE") => 0,
+        Some("CU_TENSOR_MAP_SWIZZLE_32B") => 32,
+        Some("CU_TENSOR_MAP_SWIZZLE_64B") => 64,
+        Some("CU_TENSOR_MAP_SWIZZLE_128B") => 128,
+        _ => {
+            return bad(format!(
+                "tensor_map.swizzle must be one of CU_TENSOR_MAP_SWIZZLE_NONE/_32B/_64B/_128B, got {}",
+                m["swizzle"]
+            ));
+        }
+    };
+    let l2_promotion = match m["l2_promotion"].as_str() {
+        Some("CU_TENSOR_MAP_L2_PROMOTION_NONE") => 0,
+        Some("CU_TENSOR_MAP_L2_PROMOTION_L2_64B") => 64,
+        Some("CU_TENSOR_MAP_L2_PROMOTION_L2_128B") => 128,
+        Some("CU_TENSOR_MAP_L2_PROMOTION_L2_256B") => 256,
+        _ => {
+            return bad(format!(
+                "tensor_map.l2_promotion must be one of CU_TENSOR_MAP_L2_PROMOTION_NONE/_L2_64B/_L2_128B/_L2_256B, got {}",
+                m["l2_promotion"]
+            ));
+        }
+    };
+    let oob_nan = match m["oob_fill"].as_str() {
+        Some("CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE") => false,
+        Some("CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA") => true,
+        _ => {
+            return bad(format!(
+                "tensor_map.oob_fill must be CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE or _NAN_REQUEST_ZERO_FMA, got {}",
+                m["oob_fill"]
+            ));
+        }
+    };
+    if !(1..=5).contains(&rank) {
+        return bad(format!("a tensor descriptor describes a tensor of rank 1 to 5, this one has rank {rank}"));
+    }
+    for (axis, b) in block.iter().enumerate() {
+        if !(1..=MAX_TENSOR_MAP_BLOCK).contains(b) || !b.is_power_of_two() {
+            return bad(format!(
+                "block[{axis}] is {b}: a block dimension is a power of two (Triton's rule) from 1 to {MAX_TENSOR_MAP_BLOCK}"
+            ));
+        }
+    }
+    for (axis, (n, b)) in box_shape.iter().zip(&block).enumerate() {
+        if !(1..=256).contains(n) {
+            return bad(format!(
+                "the box of the descriptor is {box_shape:?}, but a box dimension is 1 to 256 elements (axis {axis})"
+            ));
+        }
+        if b % n != 0 {
+            return bad(format!("the box {box_shape:?} does not tile the block {block:?} (axis {axis})"));
+        }
+    }
+    let item = DType::from_name(dtype).map_or(1, |d| d.size() as u64);
+    let inner = box_shape[rank - 1] * item;
+    if !inner.is_multiple_of(16) {
+        return bad(format!(
+            "the inner dimension of the box is {inner} bytes, which is not a multiple of 16 (cuTensorMapEncodeTiled refuses it)"
+        ));
+    }
+    if swizzle != 0 && inner > swizzle {
+        return bad(format!(
+            "the inner dimension of the box is {inner} bytes, more than the {swizzle}-byte swizzle span"
+        ));
+    }
+    if oob_nan && !matches!(dtype, "f16" | "bf16" | "f32") {
+        return bad(format!("oob_fill NaN fills with a float NaN, and {dtype} is not a float type of a descriptor"));
+    }
+    let to_u32 = |v: Vec<u64>| v.into_iter().map(|x| x as u32).collect(); // (each at most 2^16: checked above)
+    Ok(TensorMap {
+        data_type: (*data_type).to_owned(),
+        block: to_u32(block),
+        box_shape: to_u32(box_shape),
+        swizzle: swizzle as u32,
+        l2_promotion,
+        oob_nan,
+    })
+}
+
 /// The ABI parameters of an entry, each checked on its own (the kinds, the types and their widths, which fields each has).
 fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param>, String> {
     let mut out = Vec::with_capacity(raw.abi.params.len());
+    let mut next_slot = 0usize; // where the slots of the next parameter begin: a TMA descriptor takes 1 + 2 * rank, every other one 1
     for (position, p) in raw.abi.params.iter().enumerate() {
         want_ident(&Value::String(p.name.clone()), "parameter name")?;
-        if p.slot != position {
-            return Err(format!("parameter {} has slot {} but is at position {position}", p.name, p.slot));
+        if p.slot != next_slot {
+            return Err(format!(
+                "parameter {} has slot {}, but its slots begin at {next_slot} (position {position}; a descriptor takes 1 + 2 * rank slots)",
+                p.name, p.slot
+            ));
         }
+        next_slot += match (p.kind.as_str(), &p.shape) {
+            ("tensordesc", Some(shape)) => 1 + 2 * shape.len(),
+            _ => 1,
+        };
         let name = p.name.as_str();
+        if p.tensor_map.is_some() && p.kind != "tensordesc" {
+            return Err(format!(
+                "parameter {name} is a {} and has a tensor_map: only a tensor descriptor (kind tensordesc) has one",
+                p.kind
+            ));
+        }
         let kind_of = match p.kind.as_str() {
-            "pointer" => {
+            "pointer" | "tensordesc" => {
+                let desc = p.kind == "tensordesc";
                 let dtype = p.dtype.as_deref().unwrap_or("");
-                if pointer_type_of(dtype) != Some(p.ty.as_str()) {
+                if desc {
+                    if kind != EntryKind::Triton {
+                        return Err(format!(
+                            "parameter {name}: a tensor descriptor belongs to a Triton (or Gluon) kernel, and this is a {} kernel",
+                            kind.as_str()
+                        ));
+                    }
+                    if p.ty != "tensordesc" || p.ptx_type != "b8[128]" || p.size != 128 {
+                        return Err(format!(
+                            "parameter {name}: a tensor descriptor has type 'tensordesc' and is passed as the 128 bytes of a CUtensorMap \
+                             (ptx_type 'b8[128]', size 128)"
+                        ));
+                    }
+                    if !TENSOR_MAP_TYPES.iter().any(|(d, _, _)| *d == dtype) {
+                        return Err(format!(
+                            "parameter {name}: a tensor descriptor describes one of {:?}, got {dtype:?}",
+                            TENSOR_MAP_TYPES.iter().map(|(d, _, _)| *d).collect::<Vec<_>>()
+                        ));
+                    }
+                } else if pointer_type_of(dtype) != Some(p.ty.as_str()) {
                     return Err(format!("parameter {name}: pointer type {:?} does not match dtype {dtype:?}", p.ty));
                 }
                 let access = match p.access.as_deref() {
@@ -1144,12 +1392,23 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                     Some("out") => Access::Out,
                     other => return Err(format!("parameter {name}: access must be in, inout or out, got {other:?}")),
                 };
+                if desc
+                    && (p.dim.is_some()
+                        || p.count_of.is_some()
+                        || p.stride_of.is_some()
+                        || p.value.is_some()
+                        || p.alias.is_some())
+                {
+                    return Err(format!(
+                        "parameter {name} is a tensor descriptor: it has the fields of a pointer and a tensor_map, and no dim, count_of, \
+                         stride_of, value or alias"
+                    ));
+                }
                 if p.dim.is_some()
                     || p.count_of.is_some()
                     || p.stride_of.is_some()
                     || p.value.is_some()
-                    || p.ptx_type != "u64"
-                    || p.size != 8
+                    || (!desc && (p.ptx_type != "u64" || p.size != 8))
                 {
                     return Err(format!("parameter {name} is not a well-formed 64-bit pointer"));
                 }
@@ -1211,9 +1470,40 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                         }
                         let offset =
                             want_ident(offset, &format!("the offset of '{name}' (the name of the offset dimension)"))?;
+                        if desc {
+                            // a descriptor of a view: its own stride dimensions (names, passed in its stride slots), the last axis's fixed 1
+                            let last = entries.len() - 1;
+                            for (axis, s) in entries.iter().enumerate() {
+                                let ok = match s {
+                                    StrideEntry::Unit => axis == last,
+                                    StrideEntry::Dim(text) => axis != last && is_ident(text),
+                                };
+                                if !ok {
+                                    return Err(format!(
+                                        "the stride of axis {axis} of the descriptor '{name}' must be {}",
+                                        if axis == last {
+                                            "the fixed 1 (a TMA descriptor reads its inner dimension contiguously)"
+                                        } else {
+                                            "the name of its stride dimension"
+                                        }
+                                    ));
+                                }
+                            }
+                        }
                         Some(View { strides: entries, offset })
                     }
                     _ => return Err(format!("parameter {name}: strides and offset come together")),
+                };
+                let tensor_map = if desc {
+                    if !(1..=5).contains(&shape.len()) {
+                        return Err(format!(
+                            "parameter {name}: a tensor descriptor has a shape of 1 to 5 axes, got {}",
+                            shape.len()
+                        ));
+                    }
+                    Some(read_tensor_map(p.tensor_map.as_ref(), dtype, shape.len(), name)?)
+                } else {
+                    None
                 };
                 ParamKind::Pointer {
                     dtype: DType::from_name(dtype),
@@ -1222,6 +1512,7 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                     shape,
                     view,
                     alias,
+                    tensor_map,
                 }
             }
             "scalar" => {
@@ -1361,7 +1652,9 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                 ParamKind::Given { ty }
             }
             other => {
-                return Err(format!("parameter {name}: kind must be pointer, scalar, fixed or given, got {other:?}"));
+                return Err(format!(
+                    "parameter {name}: kind must be pointer, tensordesc, scalar, fixed or given, got {other:?}"
+                ));
             }
         };
         out.push(Param { slot: p.slot, index: p.index, name: p.name.clone(), kind: kind_of });
@@ -1615,8 +1908,8 @@ impl Entry {
             }
         }
         parse_dims(&raw.dims, &raw.buckets)?;
-        let n = raw.abi.params.len();
-        read_params(raw, kind)?;
+        // the slots of the parameters (a TMA descriptor takes 1 + 2 * rank), after which the scratch slots come
+        let n: usize = read_params(raw, kind)?.iter().map(|p| p.slots().len()).sum();
         if raw.abi.scratch_slots != kind.scratch_slots() as u64 {
             return Err(format!(
                 "a {} kernel has {} scratch slots, but abi.scratch_slots is {}",
@@ -1673,12 +1966,18 @@ impl Entry {
             if !is_ident(alias) {
                 return Err(format!("arg {}: alias must be the name of a pointer argument, got {alias:?}", p.name));
             }
-            let Some(ParamKind::Pointer { access, dtype_name: target_dtype, shape: target_shape, view, .. }) =
-                self.param(alias).map(|t| &t.kind)
+            let Some(ParamKind::Pointer {
+                access,
+                dtype_name: target_dtype,
+                shape: target_shape,
+                view,
+                tensor_map,
+                ..
+            }) = self.param(alias).map(|t| &t.kind)
             else {
                 return Err(format!("arg {} may alias '{alias}', which is not an `in` pointer argument", p.name));
             };
-            if *access != Access::In {
+            if *access != Access::In || tensor_map.is_some() {
                 return Err(format!("arg {} may alias '{alias}', which is not an `in` pointer argument", p.name));
             }
             if view.is_some() || target_shape.is_empty() {
@@ -1727,9 +2026,12 @@ impl Entry {
                         self.check_count_of(&p.name, dim, target, syms)?;
                     }
                     for StrideOf { arg, axis } in stride_of {
-                        let Some(ParamKind::Pointer { view: Some(view), .. }) = self.param(arg).map(|t| &t.kind) else {
+                        let Some(ParamKind::Pointer { view: Some(view), tensor_map: None, .. }) =
+                            self.param(arg).map(|t| &t.kind)
+                        else {
                             return Err(format!(
-                                "parameter {} is the stride of '{arg}', which is not a strided pointer parameter",
+                                "parameter {} is the stride of '{arg}', which is not a strided pointer parameter (a descriptor passes its \
+                                 strides in its own slots)",
                                 p.name
                             ));
                         };
@@ -1758,7 +2060,8 @@ impl Entry {
             }
         }
         for p in &self.params {
-            if let ParamKind::Pointer { view: Some(view), .. } = &p.kind {
+            // (a descriptor's stride dimensions are carried by its own stride slots, not by scalars)
+            if let ParamKind::Pointer { view: Some(view), tensor_map: None, .. } = &p.kind {
                 for (axis, s) in view.strides.iter().enumerate() {
                     if matches!(s, StrideEntry::Dim(_)) && !carried.contains_key(&(p.name.as_str(), axis)) {
                         return Err(format!(
@@ -1801,6 +2104,8 @@ impl Entry {
             match pre {
                 Precondition::PointerAlignment { arg, bytes, .. } => {
                     let allowed = match kind_of(arg) {
+                        // the global address of a TMA descriptor is 16-byte aligned, a view's too
+                        Some(ParamKind::Pointer { tensor_map: Some(_), .. }) => Some(vec![ALIGNMENT]),
                         Some(ParamKind::Pointer { view: Some(_), dtype_name, .. }) => {
                             let element = DType::from_name(dtype_name).map_or(1, |d| d.size() as u64);
                             Some(vec![ALIGNMENT, element])
@@ -1826,8 +2131,8 @@ impl Entry {
                     }
                 }
                 Precondition::MaxElements { arg, .. } => {
-                    let dense =
-                        matches!(kind_of(arg), Some(ParamKind::Pointer { view: None, shape, .. }) if !shape.is_empty());
+                    // (not on a TMA descriptor: its kernel addresses it by coordinates)
+                    let dense = matches!(kind_of(arg), Some(ParamKind::Pointer { view: None, shape, tensor_map: None, .. }) if !shape.is_empty());
                     if !dense || !limited.insert(arg.clone()) {
                         return Err(format!(
                             "max_elements must be once, on a dense pointer argument that is not a device scalar ({arg})"
@@ -1835,7 +2140,7 @@ impl Entry {
                     }
                 }
                 Precondition::MaxExtent { arg, .. } => {
-                    if !matches!(kind_of(arg), Some(ParamKind::Pointer { view: Some(_), .. }))
+                    if !matches!(kind_of(arg), Some(ParamKind::Pointer { view: Some(_), tensor_map: None, .. }))
                         || !limited.insert(arg.clone())
                     {
                         return Err(format!("max_extent must be once, on a strided pointer argument ({arg})"));

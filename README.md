@@ -20,7 +20,7 @@ and a `@tilefish.graph` compiles into a launch plan over one arena
 (`tilefish.plan`) that runs from Python and captures in a CUDA graph
 (`tilefish.capture`). A lowered kernel also compares, selects, gathers and
 scatters rows and reduces to an index; an extern may be a Gluon kernel or have
-one implementation per architecture; a GEMM's algorithm is chosen as torch
+one implementation per architecture, and take TMA tensor descriptors (`TensorDesc`); a GEMM's algorithm is chosen as torch
 chooses it or imported; and the plans exported together share one manifest and
 can share one arena. A Rust host (the `tilefish` crate, `crates/tilefish`)
 loads a manifest directory and launches its cubins, its GEMMs and its plans
@@ -379,6 +379,27 @@ its declaration digest and its compile specs, and its manifest entries record it
 `docs/manifest-schema-3.md`, section 4.1). `replay` selects the implementation of the device's architecture as the export did, so an entry of another
 implementation, or of one that changed (its kernel, options, constants or grid), is refused as stale; another architecture's implementation changing
 leaves this architecture's manifest valid. The Rust crate reads the field (`Entry::implementation`) and launches the entry of its device's architecture.
+
+**TMA descriptors.** A Hopper or Blackwell kernel in Triton or Gluon gets its best speed from the Tensor Memory Accelerator, which takes a *tensor
+descriptor*: a 128-byte `CUtensorMap` that the host encodes (`cuTensorMapEncodeTiled`) and passes by value. A parameter declared `TensorDesc(...)` is one:
+
+```python
+@tilefish.extern(gluon=my_gluon_kernels.tma_copy, num_warps=4, grid=lambda R, C: (tilefish.cdiv(R, 64), tilefish.cdiv(C, 64)))
+def tma_copy(x: TensorDesc(Tensor[R, C, f16], block=(64, 64)), y: Out[TensorDesc(Tensor[R, C, f16], block=(64, 64))]): ...
+
+y = tilefish.run(tma_copy, x)    # a call passes the tensor: the host encodes its descriptor (address, shape, strides) for this launch
+```
+
+The declaration says the block (the tile one `load` or `store` moves), the swizzle (by default the largest the block's rows allow; a Gluon kernel's type has it,
+a Triton kernel's compiler picks one and the build refuses a declaration that is not its choice), the L2 promotion and the out-of-bounds fill (`"zero"`: a
+coordinate outside the tensor, a negative row included, reads zeros); the box of the map is the block with its rows cut to the swizzle span. The kernel is
+launched with the map, then the tensor's shape (`i32` each) and strides (`i64` each), exactly as Triton 3.5.1 launches a host `TensorDescriptor`, so the
+bytes are those of Triton's own launch (`test_gpu_tma.py` compares them). The manifest records each descriptor (kind `tensordesc`, its `tensor_map`: every
+argument of the encode but the tensor's; manifest schema 3, section 5.5), and both hosts check what the driver would refuse before they encode (a 16-byte
+address: `pointer_alignment`; strides that are multiples of 16 bytes and dimensions within `i32`: `tensor_map`). A map is encoded at every launch from the
+tensor of that launch, and for a plan at every execution from the buffers each step binds; a CUDA graph holds the maps of the addresses it was captured
+with, as it holds the addresses. `TensorDesc(Strided[Tensor[...]], ...)` describes a view the kernel reads (its row stride is the view's). Triton's
+*device-side* descriptors (`tl.make_tensor_descriptor`, which need a global scratch) are still refused: declare the descriptor as a parameter.
 
 **A pinned cuBLASLt GEMM.** `@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")` over `(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) ->
 Tensor[M, N, bf16]` computes `a @ b.T` with an f32 accumulator and one rounding (`impl="cublaslt.gemm_bias"` adds `bias: Tensor[N, bf16]`, added in f32 before it).

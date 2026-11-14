@@ -24,11 +24,13 @@ The driver binding is ``cuda-python`` (``cuda.bindings.driver``), imported when 
 from __future__ import annotations
 
 import ctypes
+import functools
 import json
 import threading
 from typing import TYPE_CHECKING, Any, Sequence
 
 from ._specvalid import decode_scalar
+from ._tensormap import DESCRIPTOR_BYTES, EncodeArguments, TensorMapArg
 from .errors import TilefishRuntimeError
 
 if TYPE_CHECKING:
@@ -181,8 +183,9 @@ class LoadedKernel:
             if res[0] != drv.CUresult.CUDA_SUCCESS:
                 break
             sizes.append(int(res[2]))
-        abi = self.built.abi()
-        expected = [p["size"] for p in abi["params"]] + [p["size"] for p in abi["scratch"]]
+        from ._build import abi_slot_sizes
+
+        expected = abi_slot_sizes(self.built.abi())  # a descriptor is its CUtensorMap, then its shape and strides
         if sizes != expected:
             raise TilefishRuntimeError(
                 f"the loaded function '{self.built.symbol}' takes parameters of {sizes} bytes, but the ABI in the "
@@ -203,6 +206,21 @@ class LoadedKernel:
                 raise TilefishRuntimeError(
                     f"{name} argument {position} ('{param['name']}') is a {param['kind']} in the ABI, but a {kind!r} was passed"
                 )
+            if kind == "tensordesc":
+                rank = len(param["shape"])
+                if (
+                    not isinstance(value, TensorMapArg)
+                    or len(value.descriptor) != DESCRIPTOR_BYTES
+                    or len(value.shape) != rank
+                    or len(value.strides) != rank
+                    or not all(0 < n <= INT32_MAX for n in value.shape)
+                    or not all(0 <= s <= INT64_MAX for s in value.strides)
+                ):
+                    raise TilefishRuntimeError(
+                        f"{name} argument {position} ('{param['name']}') is a tensor descriptor: it takes an encoded CUtensorMap of {DESCRIPTOR_BYTES} bytes "
+                        f"and the {rank} sizes (i32) and strides (i64) of its tensor, got {value!r}"
+                    )
+                continue
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TilefishRuntimeError(f"{name} argument {position} ('{param['name']}') must be an int, got {value!r}")
             if kind == "pointer":
@@ -226,9 +244,10 @@ class LoadedKernel:
                 )
         return padded  # type: ignore[return-value]
 
-    def launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]", stream: int) -> None:
-        """Launch on ``stream`` (a ``CUstream`` handle as an int). ``args`` are ``("pointer", address)`` or ``("scalar", i32)``
-        in the manifest's order; the two scratch slots are appended here.
+    def launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int) -> None:
+        """Launch on ``stream`` (a ``CUstream`` handle as an int). ``args`` are ``("pointer", address)``, ``("scalar", i32)`` or, for a TMA
+        descriptor, ``("tensordesc", TensorMapArg)`` (its encoded CUtensorMap, then its shape and strides, each in a slot of its own) in the
+        manifest's order; the two scratch slots are appended here.
 
         The arguments are checked against the ABI first (count, kinds, ranges) and the grid against the device's
         limits; a mismatch is a :class:`~tilefish.errors.TilefishRuntimeError` and nothing is launched.
@@ -236,15 +255,33 @@ class LoadedKernel:
         g = self._check_launch(grid, args)
         drv = _driver()
         values: list[Any] = []
+        addresses: list[int] = []
         passed = iter(args)
+
+        def put(value: Any) -> None:
+            values.append(value)
+            addresses.append(ctypes.addressof(value))
+
         for p in self._abi:  # the manifest's order: the caller's arguments, with each fixed argument at its own slot
             if p["kind"] == "fixed":
-                values.append(_ctype(p["type"])(decode_scalar(p["value"], f"fixed argument {p['name']}")))
+                put(_ctype(p["type"])(decode_scalar(p["value"], f"fixed argument {p['name']}")))
                 continue
             kind, v = next(passed)
-            values.append(ctypes.c_uint64(v) if kind == "pointer" else _ctype(p["type"])(v))
-        values += [ctypes.c_uint64(0) for _ in self.built.abi()["scratch"]]  # global_scratch, profile_scratch: a Triton kernel's; a prebuilt binary has none
-        slots = (ctypes.c_void_p * len(values))(*[ctypes.addressof(v) for v in values])
+            if kind == "tensordesc":  # the 128 bytes of the CUtensorMap (64-byte aligned, as its PTX parameter is), its shape (i32), its strides (i64)
+                held = (ctypes.c_uint8 * (2 * DESCRIPTOR_BYTES))()
+                at = (ctypes.addressof(held) + 63) & ~63
+                ctypes.memmove(at, v.descriptor, DESCRIPTOR_BYTES)
+                values.append(held)
+                addresses.append(at)
+                for n in v.shape:
+                    put(ctypes.c_int32(n))
+                for s in v.strides:
+                    put(ctypes.c_int64(s))
+                continue
+            put(ctypes.c_uint64(v) if kind == "pointer" else _ctype(p["type"])(v))
+        for _ in self.built.abi()["scratch"]:  # global_scratch, profile_scratch: a Triton kernel's; a prebuilt binary has none
+            put(ctypes.c_uint64(0))
+        slots = (ctypes.c_void_p * len(addresses))(*addresses)
         b = self.block
         _check(
             drv.cuLaunchKernel(
@@ -252,6 +289,34 @@ class LoadedKernel:
             ),
             f"cuLaunchKernel({self.built.symbol})",
         )
+
+
+@functools.lru_cache(maxsize=4096)
+def encode_tensor_map(arguments: EncodeArguments) -> bytes:
+    """The 128 bytes of the ``CUtensorMap`` that ``cuTensorMapEncodeTiled`` encodes from ``arguments`` (every number of the call; see
+    :func:`tilefish._tensormap.encode_arguments`). The map is a function of those numbers alone (the driver encodes the same bytes for the same
+    call), so the last 4096 are kept: a launch of the same tensor again does not call the driver, and a launch of another address, shape or stride
+    is another key, so a descriptor is never one of another binding. A call the driver refuses is a :class:`~tilefish.errors.TilefishRuntimeError`
+    (the launch checks of a ``TensorDesc`` argument come first, so a refusal here is one they do not know)."""
+    drv = _driver()
+    u64 = getattr(drv, "cuuint64_t")
+    u32 = getattr(drv, "cuuint32_t")
+    a = arguments
+    result = drv.cuTensorMapEncodeTiled(
+        drv.CUtensorMapDataType(a.data_type),
+        a.rank,
+        a.address,
+        [u64(v) for v in a.global_dim],
+        [u64(v) for v in a.global_strides],
+        [u32(v) for v in a.box_dim],
+        [u32(v) for v in a.element_strides],
+        drv.CUtensorMapInterleave(a.interleave),
+        drv.CUtensorMapSwizzle(a.swizzle),
+        drv.CUtensorMapL2promotion(a.l2_promotion),
+        drv.CUtensorMapFloatOOBfill(a.oob_fill),
+    )
+    (tensor_map,) = _check(result, f"cuTensorMapEncodeTiled({a})")
+    return ctypes.string_at(int(tensor_map.getPtr()), DESCRIPTOR_BYTES)
 
 
 def load(built: "BuiltKernel", device_index: int) -> LoadedKernel:

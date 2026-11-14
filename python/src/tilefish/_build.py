@@ -48,7 +48,10 @@ ENTRY_KIND_BINARY = "binary"
 MIN_TRITON = (3, 5)
 _ARCH = re.compile(r"(?:sm_?)?([0-9]{2,3})a?\Z")
 _ENTRY = re.compile(r"\.entry\s+(\w+)\s*\(")
-_PTX_PARAM = re.compile(r"\.param\s+\.(\w+)")
+# one parameter of a PTX entry: ``.param .u64 .ptr .global .align 1 k_param_0`` (a scalar or a pointer: its type) or ``.param .align 64 .b8
+# k_param_0[128]`` (a by-value array, a CUtensorMap: ``b8[128]``)
+_PTX_PARAM = re.compile(r"\.param\s+(?:\.align\s+\d+\s+)?\.(\w+)[^,\[)]*?(?:\[(\d+)\])?\s*(?=,|\)|$)")
+TENSORDESC_PTX = "b8[128]"  # the PTX type of a CUtensorMap parameter, as the manifest names it (``.param .align 64 .b8 name[128]``)
 _PTX_TARGET = re.compile(r"^\s*\.target\s+(\S+)", re.M)
 _MISSING = object()
 _compile_lock = _ir.LOCK  # a Triton knob is process-wide state, and Triton's frontend is not known to be thread-safe: one compile (or frontend) at a time
@@ -58,8 +61,19 @@ _PTX_SCALARS = {"i32": ("u32", 4), "i64": ("u64", 8), "f32": ("f32", 4)}
 
 
 def ptx_type_of(kind: str, type_: str) -> "tuple[str, int]":
-    """The PTX type name and the size in bytes of one launch parameter, as Triton declares it."""
+    """The PTX type name and the size in bytes of one launch parameter, as Triton declares it (a descriptor: its first slot, the CUtensorMap)."""
+    if kind == "tensordesc":
+        return (TENSORDESC_PTX, 128)
     return ("u64", 8) if kind == "pointer" else _PTX_SCALARS[type_]
+
+
+def ptx_slots_of(kind: str, type_: str, rank: int = 0) -> "list[tuple[str, int]]":
+    """The PTX type and size of every ``kernelParams`` slot one launch parameter takes: one for a pointer or a scalar, and for a TMA descriptor of a
+    tensor of ``rank`` axes the CUtensorMap, then ``rank`` ``u32`` (its shape) and ``rank`` ``u64`` (its element strides), as Triton 3.5.1
+    expands a host tensor descriptor."""
+    if kind == "tensordesc":
+        return [(TENSORDESC_PTX, 128)] + [("u32", 4)] * rank + [("u64", 8)] * rank
+    return [ptx_type_of(kind, type_)]
 
 
 def parse_arch(arch: "int | str") -> int:
@@ -308,22 +322,36 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
     tensor is a view, and the ``scalar`` that is a ``stride_of`` carries one of its strides. A ``fixed`` argument is a scalar whose
     value is in the manifest (a prebuilt binary's constant argument, such as a scratch slot written out as a parameter); a ``given`` one is
     a fixed argument per call, whose value each call gives (a plan records it in the step).
+
+    A ``tensordesc`` (a TMA descriptor of a tensor, ``TensorDesc(...)``) has the fields of a pointer and its ``tensor_map``, and takes ``1 + 2 * rank``
+    consecutive slots from its ``slot`` on: the 128-byte CUtensorMap, the shape (``u32`` each), the element strides (``u64`` each); its ``type`` is
+    ``"tensordesc"`` and its ``ptx_type``/``size`` are those of the first. The ``slot`` of every parameter is where its slots begin.
     """
     params: list[dict[str, Any]] = []
+    slot = 0
     for a in spec.args:
         if a.kind == "constexpr":
             continue
         ptx_type, size = ptx_type_of(a.kind, a.type)
         entry: dict[str, Any] = {
-            "slot": len(params),
+            "slot": slot,
             "index": a.index,
             "name": a.name,
             "kind": a.kind,
-            "type": a.type,
+            "type": "tensordesc" if a.kind == "tensordesc" else a.type,
             "ptx_type": ptx_type,
             "size": size,
         }
-        if a.kind == "pointer":
+        slot += len(ptx_slots_of(a.kind, a.type, len(a.shape or ())))
+        if a.kind == "tensordesc":
+            entry["dtype"] = a.dtype
+            entry["access"] = a.access
+            entry["shape"] = list(a.shape_dims or ())
+            if a.strides is not None:  # a descriptor of a view: its own stride dimensions (passed in its stride slots), the last axis's 1
+                entry["strides"] = list(a.strides)
+                entry["offset"] = a.offset
+            entry["tensor_map"] = json.loads(json.dumps(a.tensor_map))
+        elif a.kind == "pointer":
             if a.shape_dims is None:
                 raise TilefishBuildError(
                     f"the compile spec of '{spec.stem}' has no declared shape for '{a.name}' (it was written by a tilefish before "
@@ -351,10 +379,23 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
                 entry["stride_of"] = stride_of_json(a.stride_of)
         params.append(entry)
     scratch = [
-        {"slot": len(params) + k, "name": p.name, "type": p.type, "ptx_type": "u64", "size": 8, "value": p.value}
+        {"slot": slot + k, "name": p.name, "type": p.type, "ptx_type": "u64", "size": 8, "value": p.value}
         for k, p in enumerate(spec.launch_params[len(params) :])
     ]
     return {"params": params, "scratch": scratch, "scratch_slots": len(scratch)}
+
+
+def abi_slot_sizes(abi: "Mapping[str, Any]") -> "list[int]":
+    """The size of every ``kernelParams`` slot of a manifest's ABI, in order: each parameter's (a descriptor's ``1 + 2 * rank`` slots), then the
+    scratch slots. What the loaded function must report (``cuFuncGetParamInfo``)."""
+    sizes: "list[int]" = []
+    for p in abi["params"]:
+        if p["kind"] == "tensordesc":
+            rank = len(p["shape"])
+            sizes += [p["size"]] + [4] * rank + [8] * rank
+        else:
+            sizes.append(p["size"])
+    return sizes + [p["size"] for p in abi["scratch"]]
 
 
 @dataclass(frozen=True, eq=False)
@@ -456,6 +497,12 @@ def _launch_attributes(md: Any) -> LaunchAttributes:
     )
 
 
+def ptx_params(text: str) -> "list[str]":
+    """The type of every parameter of a PTX entry's parameter list (``text``, from after its ``(``): ``u64``, ``u32``, ... and ``b8[128]`` for a
+    by-value array of 128 bytes."""
+    return [f"{ty}[{n}]" if n else ty for ty, n in _PTX_PARAM.findall(text)]
+
+
 def _check_abi(spec: "CompileSpec", ptx: str, symbol: str) -> None:
     """The PTX entry point must take exactly the parameters the spec's launch list promises (types in order)."""
     m = next((e for e in _ENTRY.finditer(ptx) if e.group(1) == symbol), None)
@@ -464,13 +511,46 @@ def _check_abi(spec: "CompileSpec", ptx: str, symbol: str) -> None:
     close = ptx.find(")", m.end())
     if close < 0:
         raise TilefishBuildError(f"the PTX entry '{symbol}' of '{spec.stem}' has no parameter list end")
-    found = _PTX_PARAM.findall(ptx[m.end() : close])
-    expected = [ptx_type_of(a.kind, a.type)[0] for a in spec.args if a.kind != "constexpr"] + ["u64", "u64"]
+    found = ptx_params(ptx[m.end() : close])
+    expected = [t for a in spec.args if a.kind != "constexpr" for t, _ in ptx_slots_of(a.kind, a.type, len(a.shape or ()))] + ["u64", "u64"]
     if found != expected:
         raise TilefishBuildError(
             f"the binary of '{spec.stem}' does not have the ABI its spec promises: the PTX entry '{symbol}' takes "
             f"{found}, the spec's launch parameters {[p.name for p in spec.launch_params]} need {expected}"
         )
+
+
+def check_tensordesc_meta(spec: "CompileSpec", meta: Any) -> None:
+    """The compiled kernel expects, for each of its descriptor parameters in order, the map the declaration says (Triton's
+    ``metadata.tensordesc_meta``: the swizzle, the element size and type, the box, no fp4 padding). A Triton kernel's compiler chooses the swizzle
+    of a descriptor, so a declaration that names another is refused here with the compiler's choice; a kernel the compiler did not lower to TMA
+    (an architecture before sm_90) has no metadata, and another launch ABI, and is refused too."""
+    from . import _tensormap
+
+    descs = [a for a in spec.args if a.kind == "tensordesc"]
+    if not descs:
+        return
+    if not meta or len(meta) != len(descs):
+        raise TilefishBuildError(
+            f"'{spec.stem}': Triton did not lower the descriptor parameters {[a.name for a in descs]} to TMA descriptors (its metadata has "
+            f"{len(meta or [])} of them): a TMA descriptor needs sm_90 or newer, and the kernel would take another launch ABI"
+        )
+    for a, got in zip(descs, meta):
+        assert a.tensor_map is not None and a.dtype is not None
+        want = _tensormap.spec_of_json(a.tensor_map).triton_meta(a.dtype)
+        got = {k: (list(v) if isinstance(v, (list, tuple)) else v) for k, v in dict(got).items()}
+        if got != want:
+            swizzles = {v: k for k, v in _tensormap.SWIZZLE_CODES.items()}
+            hint = ""
+            spec_map = _tensormap.spec_of_json(a.tensor_map)
+            other = swizzles.get(got.get("swizzle"))  # type: ignore[arg-type]
+            if other is not None:
+                box = list(_tensormap.box_of(spec_map.block, other, _tensormap.ITEMSIZE[a.dtype] * 8))
+                if {**want, "swizzle": got["swizzle"], "block_size": box} == got:  # the compiled kernel expects another swizzle (and so its box)
+                    hint = f": the compiled kernel expects a {other}-byte swizzle, declare swizzle={other}"
+            raise TilefishBuildError(
+                f"'{spec.stem}': the descriptor '{a.name}' is declared {want}, but the compiled kernel expects {got} (Triton's tensordesc_meta){hint}"
+            )
 
 
 @contextlib.contextmanager
@@ -694,6 +774,7 @@ def build(
     if elf.section(f".text.{symbol}") is None:
         raise TilefishBuildError(f"the cubin of '{spec.stem}' has no code section '.text.{symbol}'")
     _check_abi(spec, ptx, symbol)
+    check_tensordesc_meta(spec, getattr(md, "tensordesc_meta", None))
     from hashlib import sha256
 
     target = _PTX_TARGET.search(ptx)

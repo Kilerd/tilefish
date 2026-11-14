@@ -1618,7 +1618,8 @@ def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
                 artifact = manifest.get(stem, arch)
                 if artifact is None:
                     _bad(f"{where}: the manifest has no kernel '{stem}' for {arch}")
-                pointers = [p for p in artifact.entry["abi"]["params"] if p["kind"] == "pointer"]
+                # the tensors of the binary: its pointers and its TMA descriptors (a step binds a descriptor's tensor as it binds a pointer's)
+                pointers = [p for p in artifact.entry["abi"]["params"] if p["kind"] in ("pointer", "tensordesc")]
                 # the fixed arguments per call of a prebuilt binary: the step gives a value for every one of them, of its type, and for nothing else
                 wanted = {p["name"]: p["type"] for p in artifact.entry["abi"]["params"] if p["kind"] == "given"}
                 values = st.get("given", {})

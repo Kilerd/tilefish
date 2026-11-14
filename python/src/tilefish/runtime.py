@@ -108,6 +108,7 @@ from ._launch import (
     TensorInfo,
     bind_call,
     bind_outputs,
+    canonical_strides,
     check_tensor,
     check_consts,
     check_dim_constraints,
@@ -457,16 +458,43 @@ def _finish_launch(
     written = {p.name for p in extern.signature.params if p.kind == "tensor" and p.access != "in"}
     check_no_alias(infos, written, {p.name: p.alias for p in extern.signature.params if p.alias is not None})
     check_spec_preconditions(spec, infos, scalars, dims)
+    check_tensor_maps(spec, infos)
     assert extern.grid is not None
     return scalars, eval_grid(spec, extern.grid, dims)
+
+
+def check_tensor_maps(spec: CompileSpec, infos: "dict[str, TensorInfo]") -> None:
+    """For each TMA descriptor of ``spec`` (a ``tensordesc`` argument), in the order of its arguments, what ``cuTensorMapEncodeTiled`` requires of
+    its tensor besides the 16-byte address of its ``pointer_alignment`` precondition: strides that are multiples of 16 bytes (the innermost 1),
+    dimensions that fit the ``i32`` the kernel gets them as (:func:`tilefish._tensormap.check_tensor_map`, a refusal of kind ``tensor_map``)."""
+    from ._tensormap import check_tensor_map
+
+    for a in spec.args:
+        if a.kind == "tensordesc":
+            info = infos[a.name]
+            check_tensor_map(spec.stem, a.name, a.dtype or "", info.shape, canonical_strides(info.shape, info.strides))
+
+
+def tensor_map_arg(spec: CompileSpec, name: str, info: TensorInfo, encode: Any) -> Any:
+    """The launch argument of the descriptor ``name`` of ``spec`` for the tensor ``info`` (its real address, shape and strides): the
+    ``CUtensorMap`` encoded by ``encode`` (a function of :class:`~tilefish._tensormap.EncodeArguments`: the driver's ``cuTensorMapEncodeTiled``),
+    the shape and the canonical element strides (:class:`~tilefish._tensormap.TensorMapArg`). Encoded for every launch from what the launch has, so
+    a descriptor is always of the tensor it is launched with (a CUDA graph holds the bytes of the launch it captured, of the addresses it holds)."""
+    from . import _tensormap
+
+    a = next(x for x in spec.args if x.name == name)
+    assert a.kind == "tensordesc" and a.tensor_map is not None and a.dtype is not None
+    strides = canonical_strides(info.shape, info.strides)
+    arguments = _tensormap.encode_arguments(a.dtype, _tensormap.spec_of_json(a.tensor_map), info.ptr, info.shape, strides)
+    return _tensormap.TensorMapArg(encode(arguments), tuple(info.shape), tuple(strides))
 
 
 def _launch_values(prep: _Prepared) -> "list[tuple[str, str, Any]]":
     """The kernel's arguments in declaration order: ``(kind, name, value)`` with a tensor, an int or a constexpr value."""
     out = []
     for a in prep.spec.args:
-        if a.kind == "pointer":
-            out.append(("pointer", a.name, prep.tensors[a.name]))
+        if a.kind in ("pointer", "tensordesc"):  # a tensor: its pointer, or the descriptor the launch encodes of it
+            out.append((a.kind, a.name, prep.tensors[a.name]))
         elif a.kind in ("scalar", "given"):  # a runtime scalar, or a fixed argument per call (the value the call gave)
             out.append((a.kind, a.name, prep.scalars[a.name]))
         elif a.kind == "fixed":
@@ -554,13 +582,15 @@ def _launch_built(prep: _Prepared, built: BuiltKernel, index: int) -> None:
     torch = _torch()
     if built.spec.block != prep.spec.block or built.num_warps != prep.spec.num_warps:
         raise TilefishRuntimeError(f"the binary of '{prep.spec.stem}' disagrees with its spec about num_warps")
-    args: "list[tuple[str, int]]" = []
-    for kind, _, v in _launch_values(prep):
-        if kind == "pointer":
-            args.append(("pointer", int(v.data_ptr())))
-        elif kind in ("scalar", "given"):
-            args.append((kind, int(v)))
     with torch.cuda.device(index):
+        args: "list[tuple[str, Any]]" = []
+        for kind, name, v in _launch_values(prep):
+            if kind == "pointer":
+                args.append(("pointer", int(v.data_ptr())))
+            elif kind == "tensordesc":  # encoded for this launch, from the tensor it is given
+                args.append(("tensordesc", tensor_map_arg(prep.spec, name, tensor_info(name, v), _cuda.encode_tensor_map)))
+            elif kind in ("scalar", "given"):
+                args.append((kind, int(v)))
         loaded = _cuda.load(built, index)
         stream = torch.cuda.current_stream(index).cuda_stream
         loaded.launch(prep.grid, args, stream)

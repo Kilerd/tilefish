@@ -10,7 +10,7 @@ expression grammar, the canonical JSON of the digest, and the launch checks the 
 field that is not mentioned is as in schema 2.
 
 Contents: 1 what changed; 2 the top level; 3 the digest; 4 kernel entries; 5 the ABI (strided views, device scalars, fixed arguments, scratch
-slots); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM); 10 strict reading, every
+slots, an `out` written over its input, TMA descriptors); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM); 10 strict reading, every
 refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where it is tested.
 
 ## 1. What changed
@@ -31,6 +31,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | library entry (0.0.5) | — | three optional fields, present only when not the default: `heuristic`, `algo_source`, `allow_bf16_reduction` (section 9.1) |
 | library entry (0.0.6, crate 0.0.4) | — | f16 operands, an f32 result and the layout `NN` in the fields an entry always had (`dtypes`, `transa`, `lda`, the operands); the optional `allow_f16_reduction` (section 9.2) and `sm_count_target` (section 9.3) |
 | kernel entry (0.0.5, crate 0.0.3) | — | an optional `implementation`: which implementation of an operator declared with an implementation per architecture the binary is (section 4.1) |
+| ABI argument kinds (0.0.6, crate 0.0.4) | — | adds `tensordesc`: a TMA descriptor of a tensor (a `CUtensorMap` the host encodes at every launch, passed by value), which takes `1 + 2 * rank` slots of `kernelParams`, so `slot` is where a parameter's slots begin (section 5.5) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -143,15 +144,17 @@ neither is refused by the export (and by `jit` and `replay`). The entry of such 
 ## 5. The ABI
 
 `abi` is `{"params": [...], "scratch": [...], "scratch_slots": <int>}`. `params` are the kernel's launch arguments in order, one `kernelParams` slot
-each (`slot` is the position in `params`). `scratch` is what a Triton kernel is launched with after `params`: two null 64-bit pointers
-(`global_scratch`, `profile_scratch`, `value` 0), unchanged. **A prebuilt binary has `scratch: []` and `scratch_slots: 0`: it is launched with exactly
-`params`, no more.**
+each (`slot` is the position in `params`), except a `tensordesc`, which takes `1 + 2 * rank` slots (section 5.5): `slot` is where the slots of a
+parameter begin, the slots of the parameters before it counted. `scratch` is what a Triton kernel is launched with after `params`: two null 64-bit pointers
+(`global_scratch`, `profile_scratch`, `value` 0, at the slots after those of the last parameter), unchanged. **A prebuilt binary has `scratch: []` and
+`scratch_slots: 0`: it is launched with exactly `params`, no more.**
 
 Every `params` entry has `slot`, `index` (the position in the declaration), `name`, `kind`, `type`, `ptx_type`, `size`. The kinds and what else each has:
 
 | `kind` | `type` | `ptx_type`, `size` | other fields |
 |---|---|---|---|
 | `pointer` | `*bf16`, `*fp32`, `*i32`, ... (Triton's pointer type of the dtype) | `u64`, 8 | `dtype`, `access` (`in`/`out`/`inout`), `shape`; optional `strides` and `offset` (together); on an `out` pointer, optionally `alias` (section 5.4) |
+| `tensordesc` (Triton and Gluon kernels only) | `tensordesc` | `b8[128]`, 128 (its first slot: the `CUtensorMap`) | the fields of a pointer (`dtype`, `access`, `shape`, and on an `in` one optional `strides` and `offset`), and `tensor_map`; no `alias` (section 5.5) |
 | `scalar` | `i32` or `i64` | `u32`/4 or `u64`/8 | `dim` (an expression); optionally one of `count_of` or `stride_of` |
 | `fixed` (prebuilt binaries only) | `i32`, `i64` or `f32` | `u32`/4, `u64`/8, `f32`/4 | `value` |
 | `given` (prebuilt binaries only) | `i32` or `i64` | `u32`/4 or `u64`/8 | none: every call gives the value (section 5.3) |
@@ -253,6 +256,78 @@ overlap of either with a third argument. A pointer without `alias` is what it al
 a reader that predates it (the published crate 0.0.2, tilefish 0.0.4) refuses a manifest that has one (an unknown field). The declaration digest of
 the operator has it (`"alias"` on the parameter), only when present.
 
+### 5.5 TMA descriptors: `tensordesc` (tilefish 0.0.6, crate 0.0.4)
+
+A Hopper or Blackwell kernel written in Triton or Gluon moves tiles with the Tensor Memory Accelerator when a parameter is a *host tensor descriptor*:
+a `CUtensorMap` that the host encodes with `cuTensorMapEncodeTiled` and passes **by value** (in PTX `.param .align 64 .b8 name[128]`, a
+`__grid_constant__`). Python declares one with `x: TensorDesc(Tensor[T, C, f16], block=(128, 64))` (`Out[TensorDesc(...)]`, `InOut[TensorDesc(...)]`;
+`TensorDesc(Strided[Tensor[...]], ...)` for a view the kernel reads), and a call passes the **tensor**: its descriptor is made by the host.
+
+**The slots.** Triton 3.5.1 expands a descriptor parameter (its launcher, `backends/nvidia/driver.py`, `make_tensordesc_arg`) into, in this order:
+
+1. the 128 bytes of the `CUtensorMap`, by value;
+2. the global shape of the tensor, one `i32` per axis, outermost first (`u32`, 4 bytes each);
+3. the element strides of the tensor, one `i64` per axis, outermost first (`u64`, 8 bytes each);
+
+so a `tensordesc` of a tensor of rank `r` is **`1 + 2r` slots** of `kernelParams` (the loaded function reports `128`, then `4` `r` times, then `8` `r` times,
+which both hosts check), all from the one parameter entry, whose `slot` is the first. The shape and strides are those of the tensor of the launch (the
+canonical strides of section 5.1, step 2). The next parameter's `slot` follows the last of them, and so do the scratch slots.
+
+**The entry.** `{"slot", "index", "name", "kind": "tensordesc", "type": "tensordesc", "ptx_type": "b8[128]", "size": 128, "dtype", "access", "shape",
+["strides", "offset"], "tensor_map"}`: the fields of a pointer (section 5), its dtype one of `bf16 f16 f32 i32 i64 u8 e4m3 e5m2`, a shape of 1 to 5 axes, no
+`alias` (neither on it nor naming it), and on a descriptor of a view (`in` only) `strides` whose last entry is the fixed `1` and every other one the name of
+a stride dimension (`x_s0`; bound from the view, passed in the descriptor's own stride slots, so no `stride_of` scalar carries it, and a `stride_of` may
+not name a descriptor) and the `offset` dimension (`divisible_by` the elements in 16 bytes). `tensor_map` is every argument of `cuTensorMapEncodeTiled`
+that is not the tensor's, exactly these fields:
+
+| field | type and rule |
+|---|---|
+| `data_type` | the `CUtensorMapDataType` of the dtype, by the name of its enumerator: `CU_TENSOR_MAP_DATA_TYPE_UINT8` (`u8`, `e4m3`, `e5m2`), `_INT32`, `_INT64`, `_FLOAT16`, `_FLOAT32`, `_BFLOAT16` |
+| `block` | the block of the descriptor (the tile one `load` or `store` of the kernel moves, in its Triton type `tensordesc<fp16[128, 64]>`), outermost first: `rank` powers of two from 1 to 65536 |
+| `box` | the box of the map, outermost first: `rank` ints from 1 to 256, each dividing the block's; the inner one is a multiple of 16 bytes and, with a swizzle, at most the swizzle span. A declaration makes it the block with its inner dimension cut to the swizzle span (a [128, 128] f16 block with a 128-byte swizzle is moved as two [128, 64] boxes: what Triton records) |
+| `element_strides` | `[1, ..., 1]` (`rank` of them) |
+| `interleave` | `CU_TENSOR_MAP_INTERLEAVE_NONE` |
+| `swizzle` | `CU_TENSOR_MAP_SWIZZLE_NONE`, `_32B`, `_64B` or `_128B` |
+| `l2_promotion` | `CU_TENSOR_MAP_L2_PROMOTION_NONE`, `_L2_64B`, `_L2_128B` (Triton's) or `_L2_256B` |
+| `oob_fill` | `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE` (an element outside the tensor reads as zero, a store there is dropped) or `_NAN_REQUEST_ZERO_FMA` (a float reads as NaN; a float dtype only) |
+
+**Where the map comes from, and what checks it.** The declaration states the block, the swizzle (by default the largest of 128, 64 and 32 bytes that
+divides the bytes of the block's rows; none for a block of rank 1 or of fewer than 8 rows), the L2 promotion and the fill; they are in its declaration
+digest and in the compile spec (whose `signature` entry is Triton's `tensordesc<fp16[128, 64]>`, followed for a Gluon kernel by the `NVMMASharedLayout` of
+the tile, as Gluon's `TensorDescriptor` spells it). The compiled kernel records what it expects of each descriptor (`metadata.tensordesc_meta`: the swizzle,
+the element type and size, the box), and the build refuses a kernel whose record is not the declaration's (a Triton kernel's compiler picks the swizzle:
+the refusal says which one to declare), and one Triton did not lower to TMA (before sm_90). A reader holds `tensor_map` to the rules of the table (what
+the driver and Triton refuse), not to how a declaration derives the box.
+
+**What a host does at a launch.** It binds the descriptor's tensor as a pointer's (dimensions from the shape, a view's stride dimensions from its canonical
+strides, dtype, rank, contiguity of a dense one, aliasing, the `pointer_alignment` of 16 bytes: the global address of a map), then, after every
+precondition of section 6 and before the grid, for each `tensordesc` in the order of the ABI, what `cuTensorMapEncodeTiled` requires of the tensor, each a
+refusal of kind **`tensor_map`**: every dimension at most `2**31 - 1` (the driver takes `2**32`; the kernel gets it as `i32`), the innermost canonical stride
+1, every other one a multiple of 16 bytes and below `2**40` bytes (a stride of 0, an expanded axis, is one). Then it encodes the map:
+`cuTensorMapEncodeTiled(map, data_type, rank, address, globalDim, globalStrides, box, elementStrides, NONE, swizzle, l2_promotion, oob_fill)` with the
+dimensions and the box innermost first, the strides of the outer axes in bytes innermost first followed by the bytes of the whole tensor (what Triton's
+`fillTMADescriptor` passes: `rank` entries, of which the driver reads `rank - 1`), and element strides of 1. Python calls it through cuda-python, the crate
+through `cudarc::driver::sys`; both compute the same numbers (`_tensormap.encode_arguments`, `TensorMapEncode`).
+
+**Per launch, and in a graph.** A map is a function of the tensor's address, shape and strides and of the declaration: it is encoded **at every launch**
+from the tensor of that launch (Python keeps the last 4096 encodings by their arguments, so a repeated launch does not call the driver; any other address,
+shape or stride is another encoding), and for a plan at every execution, for every step, from the buffer and the view the step binds (an arena buffer at
+its offset, or the caller's tensor), with every precondition and before the first launch. A launch on a capturing stream is captured with the map **by
+value** in the kernel node: a CUDA graph of a plan holds the maps of the bucket and the arena layout and the externals it was captured with, as it holds
+their addresses, so it is right for every replay exactly as long as those addresses are (plan schema 1, section 10). Binding another tensor is another
+launch or another capture, which encodes its own maps; nothing patches a captured map.
+
+**`global_scratch` is still refused.** Triton's *device-side* descriptors (`tl.make_tensor_descriptor`) write their maps into a per-program global
+scratch (`launch.global_scratch_size` bytes per program, aligned to the compiled `global_scratch_align`, which the manifest does not record): a host would
+allocate `size * gridX * gridY * gridZ * num_ctas` bytes per launch, and a plan a scratch buffer in its arena (a new role, a step field, per-bucket sizes,
+and the alignment in the `launch` object of the entries, which the digests of every manifest cover). That is a change of both documents and both hosts
+for what host descriptors give at lower cost (a host descriptor is encoded once per launch, on the host; a device-side one by every program, on the
+device, before its first load), so both hosts still refuse to launch an entry whose `global_scratch_size` is not 0 (a plain `cuLaunchKernel` passes a null scratch pointer):
+declare the descriptor as a parameter instead.
+
+A reader that predates the kind (tilefish 0.0.5, crate 0.0.3) refuses a manifest that has one (`kind must be pointer, scalar, fixed or given`). A manifest
+without one, and its digest, are unchanged.
+
 ## 6. Preconditions
 
 The list is as in schema 2, with these differences.
@@ -261,7 +336,8 @@ The list is as in schema 2, with these differences.
   For a pointer that has `strides`: **either 16, or the size in bytes of its element** (`max(1, bits // 8)` of its dtype). 16 means the operator was
   declared as 16-byte aligned (`Strided[..., 16]`), the offset dimension is `divisible_by` the elements in 16 bytes, and, for a Triton kernel, the
   pointer has `tt.divisibility=16` (see below); the element size means no alignment is assumed beyond the element's own, and Triton was given no hint.
-  A device scalar's is 16.
+  A device scalar's is 16. A `tensordesc`'s is 16 (the global address of a TMA map), whether it describes a dense tensor or a view; Triton is given no
+  attribute for it.
 * new kind **`max_extent`**: `{"kind": "max_extent", "arg": <pointer>, "index": <its position>, "value": 2147483647}`, once per pointer that has
   `strides` of a kernel that indexes with `i32`, and no more than once on any pointer (and only on a pointer that has `strides`; `max_elements` is not allowed on it). It says: for a kernel that indexes with `i32` (`index_bits=32`, the
   default), the view's **extent** must not exceed `value` elements, where
@@ -581,7 +657,13 @@ document tilefish writes next to a build and the host does not read):
   names (`_elf.sm_of`, the Rust `Elf::sm`: an entry relabelled `sm_90` that holds an sm_103 cubin), or, for `binary`, a header that names none; a `stem`
   that is not `op` and `.<dim><value>` for each of `buckets`, in order (`rowop.S32`); a `declaration_digest` that is not 64 lowercase hex digits (`null`
   included); a parameter with a field no parameter has, without `slot`, `index`, `name`, `kind`, `type`, `ptx_type`, `size`, or at another `slot` than
-  its position, and the fields of each kind (`read_params`): a `pointer` whose `type` is not the pointer type of its `dtype`, whose `access` is not
+  where its slots begin (its position, the `2 * rank` extra slots of every `tensordesc` before it counted), a scratch slot at another `slot` than after the
+  last parameter's, and the fields of each kind (`read_params`): a `tensordesc` (section 5.5) on a `binary` entry, whose `type`, `ptx_type` and
+  `size` are not `tensordesc`, `b8[128]` and 128, whose `dtype` has no map, with `dim`, `count_of`, `stride_of`, `value` or `alias`, a shape of no axis or more
+  than 5, `strides` on an access other than `in` or whose last entry is not the fixed `1` or another one not a name, or a `tensor_map` that is not exactly
+  its fields with the rules of section 5.5 (a box beyond 256 or that does not tile the block, an inner box that is not a multiple of 16 bytes or is
+  wider than the swizzle span, a block that is not powers of two, element strides other than 1, an interleave other than `NONE`, a NaN fill of an
+  integer, a data type of another dtype); a `tensor_map` on any other kind; a `pointer` whose `type` is not the pointer type of its `dtype`, whose `access` is not
   `in`/`inout`/`out`, that has `dim`, `count_of`, `stride_of` or `value`, or an `alias` that is not a string or is on an access other than `out`, is not a `u64` of 8 bytes, or has no `shape` (axes: an int ≥ 1 or an
   expression), or has `strides` and `offset` not together, on an access other than `in`, not one per axis of its shape (a name, or the fixed `1` on
   the last axis only), or an `offset` that is not a name; a `scalar` that has `dtype`, `access`, `shape`, `strides`, `offset`, `value` or `alias`, no `dim`, both
@@ -591,7 +673,8 @@ document tilefish writes next to a build and the host does not read):
   `count_of`, `stride_of`, `access`, `shape`, `strides`, `offset`, `dtype` or `alias`; an
   expression outside the grammar, a name that `dims` does not have, more than 32 names, a static grid entry or divisor below 1 (section 7.1).
 * the ABI as a whole (a host that reads without a spec checks these itself; Python checks them by comparing the entry with the compile spec, and
-  `_specvalid` checks them in the spec): `params` kinds in `pointer`/`scalar`/`fixed`/`given`; a `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
+  `_specvalid` checks them in the spec): `params` kinds in `pointer`/`tensordesc`/`scalar`/`fixed`/`given`; a `stride_of` that names a `tensordesc`; a
+  `scalar` type other than `i32`/`i64`, or `dtype` ≠ `type`; `strides` without
   `offset` or the reverse; `strides` of the wrong length or empty, with an integer other than `1`, an integer on a non-last axis, a string that no
   `stride_of` scalar carries, or two scalars for one axis; an `offset` that is not a string; a `stride_of` list of fewer than two objects or with an
   `(arg, axis)` pair twice; a `stride_of` object with a missing/extra key, a negative axis, an
@@ -599,8 +682,9 @@ document tilefish writes next to a build and the host does not read):
   argument with a type not in `i32`/`i64`/`f32`, an `f32` value that is not a float, an integer type with a non-integer, a bool, or an out-of-range value;
   an `alias` (section 5.4) that names no `in` pointer, a strided one or a device scalar, one of another `dtype` or declared `shape`, or an input another `out` pointer names.
 * preconditions: `max_extent` more than once on a pointer (a kernel with `index_bits=64` has none, so it is not required), with a value other than `2147483647`, or on a pointer without `strides`;
-  `max_elements` on a pointer with `strides`; `pointer_alignment` of a strided pointer other than 16 or its element size (of any other pointer other
-  than 16); every pointer must have exactly one `pointer_alignment`.
+  `max_elements` on a pointer with `strides`; `max_elements` or `max_extent` on a `tensordesc`; `pointer_alignment` of a strided pointer other than 16
+  or its element size (of any other pointer, and of every `tensordesc`, other than 16); every pointer and every `tensordesc` must have exactly one
+  `pointer_alignment`.
 * every `library` entry: the field list, the types and the cross-field equalities of section 9, each by the rule given there; an optional field of section 9.1
   or 9.2 with any value but its one (`"torch"`, `"imported"`, `true`), `null` included; an `sm_count_target` (section 9.3) that is not an int from 8 to
   `sm_count`; a form section 9.2 does not list (operands of two types or of
@@ -661,6 +745,15 @@ argument's value is the call's: `Kernel::launch_with(stream, tensors, &[(name, v
 the entry does not have, a name twice and a missing one are refused first (`Error::Launch`), and a value that does not fit an `i32` where the scalars'
 ranges are checked (kind `shape`); `launch` gives no value, so it is refused for an entry that has one. A plan step's values are its `given`.
 
+A `tensordesc` (section 5.5) is read into `ParamKind::Pointer` with `tensor_map: Some(TensorMap)` (its block, box, swizzle, L2 promotion, fill and data
+type; `Param::slots()` is its `1 + 2 * rank` slot sizes, `Param::tensor_map()`), so it binds and is checked as a pointer is; a launch takes its tensor
+(`TensorRef`/`TensorMut`), and after the preconditions `Plan::prepare` refuses what the driver would (kind `PreconditionKind::TensorMap`, Python's
+`tensor_map`) and computes the arguments of `cuTensorMapEncodeTiled` (`Prepared::tensor_maps()`, `TensorMapEncode`: Python's `encode_arguments`, number
+for number), with the shape and the strides at their slots (`Prepared::params()` has 0 at the map's own slot). `Kernel::check` (so every launch, and every
+step of a plan at every execution) encodes the maps through `cudarc::driver::sys::cuTensorMapEncodeTiled`; `launch` passes the 128 bytes by value with
+cudarc's launch builder and orders the tensor's slice through cudarc's tracking guards for the time of the launch, `launch_raw` points the slot at them, and
+a capture holds them in the kernel node.
+
 **Launching a library entry** (`gemm.rs`, `ffi/cublaslt.rs`). `Manifest::gemm(&ctx, name, buckets, arch)` loads a `Gemm` for the device of `ctx` once and
 `Gemm::launch(&stream, &mut [a, b, [bias], out, workspace])` runs it:
 
@@ -713,6 +806,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
 | `options.enable_fp_fusion` of a hand-written kernel (`@tilefish.extern(enable_fp_fusion=...)`) | `test_lower_options.py`; on a GPU `test_gpu_extern_fusion.py` |
 | `implementation`: an operator with an implementation per architecture (section 4.1) | `test_per_arch.py`; on a GPU `test_gpu_per_arch.py` (and the Rust gate) |
+| `tensordesc`: TMA descriptors (section 5.5): the declaration, the spec, the slots, the readers, the launch checks, the encode, a plan on a fake backend, the emitter | `test_tensordesc.py`; on a GPU `test_gpu_tma.py` (Triton and Gluon kernels against Triton's own launch, plans and captures) and the Rust gate |
 
 The Rust crate (`crates/tilefish/tests/`):
 
@@ -722,4 +816,5 @@ The Rust crate (`crates/tilefish/tests/`):
 | the forms of section 9.2: Python's verdict on entries of every form and on each changed in one field | `python_library.rs` (`data/python_library.json`, made by `export_rust_vectors.py`) |
 | views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
-| on a GPU, byte identity with Python's `replay` of every feature, the refusals, graph capture of a GEMM and of a strided kernel, the hazards of other streams | `gpu_gate.rs` with `python/tests/rust_gate.py` |
+| `tensordesc` (section 5.5): reading, refusals, the slots, the launch checks and the arguments of the encode | `tensor_maps.rs` |
+| on a GPU, byte identity with Python's `replay` of every feature, the refusals, graph capture of a GEMM and of a strided kernel, the hazards of other streams | `gpu_gate.rs` with `python/tests/rust_gate.py` (TMA descriptors: `the_gate_has_tma_descriptors`, `a_descriptor_of_a_tensor_the_driver_refuses_...`, `graph_capture_of_kernels_with_tma_descriptors`) |

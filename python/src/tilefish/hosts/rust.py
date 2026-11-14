@@ -305,6 +305,25 @@ def _validate_pointer(who: str, where: str, p: "dict[str, Any]") -> None:
             _bad(who, f"{where} may alias {p['alias']!r} with access {access!r}: only an 'out' pointer may be written over an input")
 
 
+def _validate_tensordesc(who: str, kind: str, where: str, p: "dict[str, Any]") -> None:
+    """A TMA descriptor of the ABI (``kind`` ``tensordesc``, manifest schema 3 section 5.5): of a Triton kernel, passed as a CUtensorMap, of a
+    tensor of 1 to 5 axes whose view (if it is one) has its own stride dimensions and the unit stride last, with a ``tensor_map`` its reader
+    accepts."""
+    from .. import _tensormap
+
+    if kind != "triton":
+        _bad(who, f"{where} is a tensor descriptor, which only a Triton (or Gluon) kernel takes (this is a {kind} kernel)")
+    if p.get("type") != "tensordesc" or p.get("ptx_type") != "b8[128]" or p.get("size") != 128 or "alias" in p:
+        _bad(who, f"{where} is a tensor descriptor: its type is 'tensordesc', passed as the 128 bytes of a CUtensorMap, and it may not alias an input")
+    if not 1 <= len(p["shape"]) <= _tensormap.MAX_RANK:
+        _bad(who, f"{where} is a tensor descriptor of a tensor of {len(p['shape'])} axes (1 to {_tensormap.MAX_RANK})")
+    if "strides" in p and p["strides"][-1] != 1:
+        _bad(who, f"{where} is a tensor descriptor of a view whose last axis is not the fixed stride 1")
+    why = _tensormap.read_json(p.get("tensor_map"), p["dtype"], len(p["shape"]))
+    if why is not None:
+        _bad(who, f"{where}: {why}")
+
+
 def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> None:
     """The scalars and fixed arguments of the ABI, once every pointer is known (a stride scalar names the pointer it carries a stride of)."""
     by_name = {p["name"]: p for p in params}
@@ -312,7 +331,7 @@ def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> No
     for i, p in enumerate(params):
         where = f"abi.params[{i}] ('{p['name']}')"
         pkind = p.get("kind")
-        if pkind == "pointer":
+        if pkind in ("pointer", "tensordesc"):
             continue
         if pkind == "scalar":
             if p.get("type") not in ("i32", "i64"):
@@ -356,7 +375,7 @@ def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> No
             if any(k in p for k in ("value", "dim", "count_of", "stride_of")):
                 _bad(who, f"{where} is a fixed argument per call: every launch gives its value, it has no value, dim, count_of or stride_of")
         else:
-            _bad(who, f"{where}.kind must be 'pointer', 'scalar', 'fixed' or 'given', got {pkind!r}")
+            _bad(who, f"{where}.kind must be 'pointer', 'tensordesc', 'scalar', 'fixed' or 'given', got {pkind!r}")
     for p in params:
         for axis, s in enumerate(p.get("strides", ()) if p.get("kind") == "pointer" else ()):
             if isinstance(s, str) and (p["name"], axis) not in carried:
@@ -400,13 +419,16 @@ def _validate_preconditions(who: str, entry: "dict[str, Any]", pointers: "dict[s
         if p is None:
             _bad(who, f"{where} ({kind}) names '{arg}', which is not a pointer of the ABI")
         strided, scalar = "strides" in p, not p["shape"]
+        desc = p.get("kind") == "tensordesc"
         if pre.get("index") != p.get("index") or isinstance(pre.get("index"), bool):
             _bad(who, f"{where}.index is {pre.get('index')!r}, but '{arg}' is parameter {p.get('index')!r}")
+        if desc and kind in ("max_elements", "max_extent"):
+            _bad(who, f"{where}: {kind} does not belong on '{arg}', a tensor descriptor (the kernel addresses it by coordinates)")
         if kind == "pointer_alignment":
             if arg in aligned:
                 _bad(who, f"'{arg}' has two pointer_alignment preconditions")
             aligned.add(arg)
-            allowed = {_DEFAULT_ALIGNMENT} | ({_ITEMSIZE[p["dtype"]]} if strided and p["dtype"] in _ITEMSIZE else set())
+            allowed = {_DEFAULT_ALIGNMENT} | ({_ITEMSIZE[p["dtype"]]} if strided and not desc and p["dtype"] in _ITEMSIZE else set())
             if pre.get("bytes") not in allowed or isinstance(pre.get("bytes"), bool):
                 _bad(who, f"{where}.bytes must be {' or '.join(map(str, sorted(allowed)))} for '{arg}', got {pre.get('bytes')!r}")
         elif kind == "max_extent":  # (a kernel with index_bits=64 has none: at most once)
@@ -495,9 +517,11 @@ def _validate_entry(entry: Any) -> None:
         names.add(name)
     pointers = {}
     for i, p in enumerate(params):
-        if p.get("kind") == "pointer":
+        if p.get("kind") in ("pointer", "tensordesc"):
             _validate_pointer(who, f"abi.params[{i}] ('{p['name']}')", p)
             pointers[p["name"]] = p
+        if p.get("kind") == "tensordesc":
+            _validate_tensordesc(who, kind, f"abi.params[{i}] ('{p['name']}')", p)
     _validate_scalars(who, kind, params)
     _validate_preconditions(who, entry, pointers)
     _validate_dims(who, entry)
@@ -586,7 +610,7 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
                         "typed from one signature, and the binaries of a stem must share it"
                     )
         binary = _Binary(stem, first, [e["arch"] for e in entries], struct=_camel(stem), entries=entries)
-        binary.params = [p for p in first["abi"]["params"] if p["kind"] == "pointer"]
+        binary.params = [p for p in first["abi"]["params"] if p["kind"] in ("pointer", "tensordesc")]  # every tensor: a pointer or a descriptor's
         binary.scalars = [p for p in first["abi"]["params"] if p["kind"] == "scalar"]
         binary.fixed = [p for p in first["abi"]["params"] if p["kind"] == "fixed"]
         binary.given = [p for p in first["abi"]["params"] if p["kind"] == "given"]
@@ -715,6 +739,12 @@ def _pointer_line(binary: _Binary, p: "dict[str, Any]") -> str:
     line = f"- `{name}`: {p['access']}, {p['dtype']}, `[{_shape_text(p['shape'])}]`"
     if "strides" in p:
         line += f", a strided view (strides `[{_shape_text(p['strides'])}]`)"
+    if p.get("kind") == "tensordesc":
+        m = p["tensor_map"]
+        line += (
+            f", passed as a TMA descriptor (box `[{_shape_text(m['box'])}]`, {m['swizzle'].removeprefix('CU_TENSOR_MAP_')}, "
+            f"{m['l2_promotion'].removeprefix('CU_TENSOR_MAP_')}, {m['oob_fill'].removeprefix('CU_TENSOR_MAP_')})"
+        )
     return line
 
 
@@ -757,6 +787,12 @@ def _doc(binary: _Binary) -> "list[str]":
         lines += _wrap(
             "A device scalar is a `TensorRef` over one element (made with the shape `&[]` or `&[1]`), 16-byte aligned: the kernel reads its value "
             "when it runs, so the value may be written after the launch is enqueued."
+        )
+    if any(p.get("kind") == "tensordesc" for p in binary.params):
+        lines.append("")
+        lines += _wrap(
+            "A tensor passed as a TMA descriptor is given like any tensor: `launch` encodes its `CUtensorMap` (`cuTensorMapEncodeTiled`) from its "
+            "address, shape and strides, and refuses an address that is not 16-byte aligned and a stride that is not a multiple of 16 bytes."
         )
     constraints = []
     for name, c in e["dims"].items():

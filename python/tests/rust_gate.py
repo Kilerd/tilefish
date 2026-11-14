@@ -42,6 +42,10 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 * **an implementation per architecture** (``per_arch_kernels.py``, exported only): ``row_sum``, declared with ``by_arch=`` (one tiling of a row
   reduction on sm_103, another on sm_120 and as the fallback), whose entry is the implementation of the device's architecture; checked here to give
   the bytes of that tiling declared alone; the plan ``scaled_row_sum`` runs it in a step;
+* **TMA descriptors** (``tma_kernels.py``, exported only, on sm_90 or newer): a tiled copy over edge tiles, a negative row coordinate (zeros), a block wider
+  than its box, a ``tl.dot`` matmul of swizzled tiles, a descriptor of a column block of a wider tensor and a Gluon kernel, every map encoded by the host from
+  the tensor of the launch; the plans ``tma_chain`` (with and without reuse: descriptors of arena buffers and of the caller's output) and ``tma_view`` (of a
+  view of the caller's input);
 * **pinned cuBLASLt GEMMs** (``gemm`` and ``gemm_bias``, ``M`` in 32, 64 and 320, five ``(N, K)`` shapes), run through ``tilefish.run`` of the library op;
   and (on a fresh export) how an algorithm is chosen (:func:`option_ops`): a ``gemm_bias`` under ``heuristic="torch"``, and one with ``algos=`` imported
   for this device, whose split-K adds its partial sums in bf16 at one bucket in the output and at another in a workspace (``allow_bf16_reduction=True``),
@@ -376,6 +380,54 @@ def given_ops():
     return {"scale_add": p6.scale_add}
 
 
+def tma_capable():
+    return torch.cuda.get_device_capability()[0] >= 9
+
+
+def tma_ops():
+    """``{name: extern}``: the kernels of ``tma_kernels.py``, whose parameters are TMA descriptors (``TensorDesc``), on sm_90 or newer. Not in the committed
+    fixtures, so only a fresh export has them."""
+    if not tma_capable():
+        return {}
+    import tma_kernels as tk
+
+    return tk.ops()
+
+
+def args_tile(shape, seed):
+    return (randn(shape, F16, seed),)
+
+
+def args_wide(shape, seed):
+    return (randn(shape, BF16, seed),)
+
+
+def args_tma_mm(mnk, seed):
+    m, n, k = mnk
+    return (randn((m, k), F16, seed, scale=0.5), randn((n, k), F16, seed + 100, scale=0.5))
+
+
+def args_tile_view(first, seed):
+    """A column block of a wider tensor: a view whose row stride (512 elements) is not its width (192), starting on a 16-byte boundary."""
+    wide = randn((96, 512), F16, seed + first)
+    return (wide[:, first : first + 192],)
+
+
+def must_be_the_tile(args, got):
+    assert same_bytes(got, args[0].contiguous())
+
+
+def must_be_shifted(args, got):
+    import tma_kernels as tk
+
+    assert same_bytes(got, tk._shifted(args[0]))
+
+
+def must_be_a_matmul(args, got):
+    a, b = args
+    assert torch.allclose(got.float(), (a.double() @ b.double().T).float(), rtol=2e-2, atol=2e-2)
+
+
 def build_cases():
     cases: "list[Case]" = [
         *plain("softmax", "softmax", args_softmax, ROW_SIZES),
@@ -449,6 +501,15 @@ def build_cases():
     cases += plain("im2col1d_tap", tap, args_channel_last, ((1, 1), (2, 19), (3, 100)), seeds=(0,), check=must_be_patches(7, 1, 3, (18, 0), "tap"))
     sizes = [(n, c, length, sliced) for n, c, length in ((1, 1, 1), (2, 40, 33), (3, 300, 64)) for sliced in (False, True)]
     cases += plain("im2col1d_channel", channel, args_ncl, sizes, seeds=(0,), check=must_be_patches(3, 2, 1, (2, 5), "channel"))
+    # -- TMA descriptors (sm_90 and newer): the edge tiles of sizes that are no multiple of the block, a negative row coordinate (zeros), a block wider
+    # than its box, a matmul of swizzled tiles, a descriptor of a view, a Gluon kernel; every map is encoded by the host from the tensor of the launch
+    cases += plain("tile_copy", "tile_copy", args_tile, ((64, 64), (100, 72), (300, 520), (7, 8)), seeds=(0,), check=must_be_the_tile)
+    cases += plain("shift_rows", "shift_rows", args_tile, ((1, 128), (3, 128)), seeds=(0,), check=must_be_shifted, may_be_zero=("y",))  # every row before the first
+    cases += plain("shift_rows", "shift_rows", args_tile, ((65, 128), (200, 64)), seeds=(0,), check=must_be_shifted)
+    cases += plain("wide_copy", "wide_copy", args_wide, ((32, 256), (33, 264), (96, 512)), seeds=(0,), check=must_be_the_tile)
+    cases += plain("tma_matmul", "tma_matmul", args_tma_mm, ((128, 128, 64), (200, 136, 72), (64, 64, 512), (256, 384, 192)), seeds=(0,), check=must_be_a_matmul)
+    cases += plain("tile_copy_view", "tile_copy_view", args_tile_view, (0, 8, 136), seeds=(0,), check=must_be_the_tile)
+    cases += plain("gluon_tile_copy", "gluon_tile_copy", args_tile, ((64, 64), (130, 200)), seeds=(0,), check=must_be_the_tile)
     return cases
 
 
@@ -656,6 +717,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(given_ops())
         declared.update(generated_ops())
         declared.update(f16_ops())
+        declared.update(tma_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -854,6 +916,22 @@ def plan_graphs():
     def given_cases():
         return [(f"Rg{rg}-seed{seed}", {"x": randn((rg, 64), F32, seed=80 + rg + seed)}) for rg in (8, 24) for seed in (0, 1)]
 
+    tma = []
+    if tma_capable():  # TMA descriptors in steps: of arena buffers and of the caller's output, and of a view of the caller's input
+        import tma_kernels as tk
+
+        def chain_cases():
+            return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 256), F16, seed=90 + rb + seed)}) for rb in (64, 192) for seed in (0, 1)]
+
+        def tma_view_cases():
+            return [(f"Rb{rb}-seed{seed}", {"x": randn((rb, 512), F16, seed=95 + rb + seed)}) for rb in (64, 192) for seed in (0, 1)]
+
+        tma = [
+            ("tma_chain", tk.tma_chain, False, chain_cases),
+            ("tma_chain-reuse", tk.tma_chain, True, chain_cases),
+            ("tma_view", tk.tma_view, False, tma_view_cases),
+        ]
+
     return [
         ("block", pm.block, False, block_cases),
         ("block-reuse", pm.block, True, block_cases),
@@ -872,7 +950,7 @@ def plan_graphs():
         ("weighted", p6.static_affine, False, weighted_cases),  # a static graph that declares its roles: weights bound once (PlanRun::bind_weights)
         ("given_steps", p6.two_scales, False, given_cases),  # one prebuilt binary, two steps with the values each call gives (one of them the bucket's)
         ("strided_returns", p6.strided_returns, False, given_cases),  # a transpose and a column block materialised by tilefish.contiguous, a row copied
-    ]
+    ] + tma
 
 
 TAPPED = ("block-reuse",)  # the plans whose cases also record debug taps (intermediates whose bytes later steps reuse)

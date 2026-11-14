@@ -413,15 +413,45 @@ def _layout_entry(entry: Any, where: str) -> None:
         bad(f"{where} must be an int or a dimension expression, got {entry!r}")
 
 
+def _check_shape_dims(d: "dict[str, Any]") -> None:
+    """``shape_dims`` of a pointer (or a descriptor): one entry per axis of ``shape``, an int size (the static size of that axis) or an expression."""
+    declared = d["shape_dims"]
+    if not isinstance(declared, list) or len(declared) != len(d["shape"]):
+        bad(f"arg {d['name']}: shape_dims must be a list with one entry per axis of shape")
+    for i, entry in enumerate(declared):
+        if is_int(entry):
+            if entry < 1 or str(entry) != d["shape"][i]:
+                bad(f"arg {d['name']}: shape_dims[{i}] is the size {entry}, but shape[{i}] is {d['shape'][i]!r}")
+        elif isinstance(entry, str):
+            parse_expression(entry, f"arg {d['name']} shape_dims[{i}]")
+        else:
+            bad(f"arg {d['name']}: shape_dims[{i}] must be an int size or a dimension expression, got {entry!r}")
+
+
+def _check_layout(d: "dict[str, Any]") -> None:
+    """``strides`` and ``offset`` of a pointer (or a descriptor) that takes a view: one stride per axis, an int or an expression, and the offset."""
+    strides = d["strides"]
+    if not isinstance(strides, list) or len(strides) != len(d["shape"]) or not strides:
+        bad(f"arg {d['name']}: strides must be a list with one entry per axis of shape (at least one axis)")
+    for i, entry in enumerate(strides):
+        _layout_entry(entry, f"arg {d['name']} strides[{i}]")
+    _layout_entry(d["offset"], f"arg {d['name']} offset")
+
+
 def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     """Check one serialized argument. From schema 2 on a constexpr may carry its declared ``dtype``; from schema 3 a pointer
     may be strided (``strides`` and ``offset``), a scalar may carry a stride (``stride_of``) and be 64-bit, and a prebuilt
     binary has ``fixed`` arguments (a value written in the manifest)."""
-    _keys(d, "arg", ["index", "name", "kind", "type"], ["access", "dtype", "shape", "shape_dims", "dim", "value", "count_of", "strides", "offset", "stride_of", "alias"])
+    _keys(
+        d,
+        "arg",
+        ["index", "name", "kind", "type"],
+        ["access", "dtype", "shape", "shape_dims", "dim", "value", "count_of", "strides", "offset", "stride_of", "alias", "tensor_map"],
+    )
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
     kind, ty = d["kind"], d["type"]
-    kinds = ("pointer", "scalar", "constexpr") + (("fixed", "given") if schema >= STRIDED_SCHEMA else ())
+    kinds = ("pointer", "scalar", "constexpr") + (("fixed", "given", "tensordesc") if schema >= STRIDED_SCHEMA else ())
     if kind not in kinds or not isinstance(ty, str):
         bad(f"arg {d['name']}: kind must be {', '.join(kinds)} and type a string, got {kind!r}, {ty!r}")
     present = set(d) - {"index", "name", "kind", "type"}
@@ -431,6 +461,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         "constexpr": {"value"},
         "fixed": {"dtype", "value"},
         "given": {"dtype"},  # a fixed argument per call: its value is the call's (a plan step's), not the spec's
+        "tensordesc": {"access", "dtype", "shape", "tensor_map"},  # a TMA descriptor of a tensor: a pointer's facts, and the map
     }[kind]
     optional: "set[str]" = set()
     if kind == "constexpr" and schema >= DIGEST_SCHEMA:
@@ -443,10 +474,32 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         optional = {"shape_dims"}  # the declared shape: what a host binds the dimensions from
         if schema >= STRIDED_SCHEMA:
             optional = {"shape_dims", "strides", "offset", "alias"}  # a pointer that accepts a strided view; an Out that may be written over an input
+    if kind == "tensordesc":
+        optional = {"shape_dims", "strides", "offset"}
     if not expected <= present <= expected | optional:
         bad(f"arg {d['name']} ({kind}) must have exactly the fields {sorted(expected)}, has {sorted(present)}")
     if ("strides" in d) != ("offset" in d):
         bad(f"arg {d['name']}: strides and offset come together")
+    if kind == "tensordesc":
+        from . import _tensormap
+
+        dtype = d["dtype"]
+        if not isinstance(dtype, str) or dtype not in _tensormap.DATA_TYPES:
+            bad(f"arg {d['name']}: a tensor descriptor describes one of {sorted(_tensormap.DATA_TYPES)}, got {dtype!r}")
+        if d["access"] not in ("in", "inout", "out"):
+            bad(f"arg {d['name']}: access must be in, inout or out, got {d['access']!r}")
+        if not isinstance(d["shape"], list):
+            bad(f"arg {d['name']}: shape must be a list of dimension strings")
+        for i, dim in enumerate(d["shape"]):
+            parse_expression(dim, f"arg {d['name']} shape[{i}]")
+        why = _tensormap.read_json(d["tensor_map"], dtype, len(d["shape"]))
+        if why is not None:
+            bad(f"arg {d['name']}: {why}")
+        if "shape_dims" in d:
+            _check_shape_dims(d)
+        if "strides" in d:
+            _check_layout(d)
+        return
     if kind == "given":
         if ty not in ("i32", "i64") or d["dtype"] != ty:
             bad(f"arg {d['name']}: a fixed argument per call is i32 or i64, got {ty!r}/{d['dtype']!r}")
@@ -471,24 +524,9 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         for i, dim in enumerate(d["shape"]):
             parse_expression(dim, f"arg {d['name']} shape[{i}]")
         if "shape_dims" in d:
-            declared = d["shape_dims"]
-            if not isinstance(declared, list) or len(declared) != len(d["shape"]):
-                bad(f"arg {d['name']}: shape_dims must be a list with one entry per axis of shape")
-            for i, entry in enumerate(declared):
-                if is_int(entry):
-                    if entry < 1 or str(entry) != d["shape"][i]:
-                        bad(f"arg {d['name']}: shape_dims[{i}] is the size {entry}, but shape[{i}] is {d['shape'][i]!r}")
-                elif isinstance(entry, str):
-                    parse_expression(entry, f"arg {d['name']} shape_dims[{i}]")
-                else:
-                    bad(f"arg {d['name']}: shape_dims[{i}] must be an int size or a dimension expression, got {entry!r}")
+            _check_shape_dims(d)
         if "strides" in d:
-            strides = d["strides"]
-            if not isinstance(strides, list) or len(strides) != len(d["shape"]) or not strides:
-                bad(f"arg {d['name']}: strides must be a list with one entry per axis of shape (at least one axis)")
-            for i, entry in enumerate(strides):
-                _layout_entry(entry, f"arg {d['name']} strides[{i}]")
-            _layout_entry(d["offset"], f"arg {d['name']} offset")
+            _check_layout(d)
     elif kind == "scalar":
         allowed = ("i32", "i64") if schema >= STRIDED_SCHEMA else ("i32",)
         if ty not in allowed or d["dtype"] != ty:
@@ -548,7 +586,7 @@ def _check_strides(args: "list[dict]", by_name: "dict[str, dict]") -> None:
         for arg, axis in stride_of_targets(a["stride_of"]):
             target = by_name.get(arg)
             if target is None or target["kind"] != "pointer" or "strides" not in target:
-                bad(f"arg {a['name']} is the stride of '{arg}', which is not a strided pointer argument")
+                bad(f"arg {a['name']} is the stride of '{arg}', which is not a strided pointer argument (a descriptor passes its strides in its own slots)")
             if axis >= len(target["strides"]):
                 bad(f"arg {a['name']} is the stride of axis {axis} of '{arg}', which has {len(target['strides'])} axes")
             if target["strides"][axis] != a["dim"]:
@@ -570,6 +608,25 @@ def _check_strides(args: "list[dict]", by_name: "dict[str, dict]") -> None:
                     bad(f"the stride of axis {axis} of '{a['name']}' is fixed, but only the last axis may be")
             if not isinstance(a["offset"], str):
                 bad(f"the offset of '{a['name']}' must be the name of the offset dimension, got {a['offset']!r}")
+        if a["kind"] == "tensordesc" and "strides" in a:  # a descriptor of a view: its strides are its own stride dimensions, the last axis's 1
+            check_tensordesc_layout(a["name"], a["access"], a["strides"], a["offset"])
+
+
+def check_tensordesc_layout(name: str, access: Any, strides: "Sequence[Any]", offset: Any) -> None:
+    """The layout of a descriptor of a view (a ``tensordesc`` with ``strides`` and ``offset``): only one the kernel reads (``in``), every stride but the
+    last the name of a stride dimension (bound from the view, passed in the descriptor's stride slots, carried by no scalar), the last the fixed 1 (the
+    innermost dimension of a TMA descriptor is contiguous), and the offset the name of the offset dimension. Shared by the spec and the manifest
+    reader."""
+    if access != "in":
+        bad(f"the descriptor '{name}' is {access} and describes a view, but only a descriptor the kernel reads may (an Out tensor is contiguous)")
+    for axis, entry in enumerate(strides):
+        last = axis == len(strides) - 1
+        if last and not (is_int(entry) and entry == 1):
+            bad(f"the stride of the last axis of the descriptor '{name}' must be the fixed 1 (a TMA descriptor reads its inner dimension contiguously), got {entry!r}")
+        if not last and not (isinstance(entry, str) and _IDENT.match(entry)):
+            bad(f"the stride of axis {axis} of the descriptor '{name}' must be the name of its stride dimension, got {entry!r}")
+    if not (isinstance(offset, str) and _IDENT.match(offset)):
+        bad(f"the offset of the descriptor '{name}' must be the name of its offset dimension, got {offset!r}")
 
 
 def check_alias_target(name: str, alias: Any, access: Any, by_name: "Mapping[str, Mapping[str, Any]]", shape_key: str = "shape") -> None:
@@ -683,9 +740,10 @@ def validate_spec(d: Any) -> None:
         if a["index"] != position:
             bad(f"arg {a['name']} has index {a['index']} but is at position {position}")
         names.append(a["name"])
-        for expr in (a["shape"] if a["kind"] == "pointer" else [a["dim"]] if a["kind"] == "scalar" else []):
+        tensor = a["kind"] in ("pointer", "tensordesc")
+        for expr in (a["shape"] if tensor else [a["dim"]] if a["kind"] == "scalar" else []):
             dims |= parse_expression(expr, f"arg {a['name']} dimension")
-        if a["kind"] == "pointer" and "strides" in a:
+        if tensor and "strides" in a:
             for entry in (*a["strides"], a["offset"]):
                 if isinstance(entry, str):
                     dims |= parse_expression(entry, f"arg {a['name']} layout")
@@ -693,10 +751,20 @@ def validate_spec(d: Any) -> None:
             bad(f"arg {a['name']}: a prebuilt binary has no constexprs")
         if not is_binary and a["kind"] == "given":
             bad(f"arg {a['name']}: a fixed argument per call belongs to a prebuilt binary")
+        if a["kind"] == "tensordesc":
+            if is_binary:
+                bad(f"arg {a['name']}: a prebuilt binary takes no tensor descriptor (Triton's launch ABI of a host descriptor is a Triton kernel's)")
+            from . import _tensormap
+
+            dtype = ALL_DTYPES[a["dtype"]]
+            spec = _tensormap.spec_of_json(a["tensor_map"])
+            want = _tensormap.signature_type(dtype.triton_scalar or "", spec, dtype.bits, d.get("language", "triton"))
+            if a["type"] != want:
+                bad(f"arg {a['name']}: the signature type of the descriptor must be {want!r}, got {a['type']!r}")
     if len(set(names)) != len(names):
         bad("argument names must be unique")
     by_name = {a["name"]: a for a in args}
-    pointers = [a for a in args if a["kind"] == "pointer"]
+    pointers = [a for a in args if a["kind"] in ("pointer", "tensordesc")]  # every tensor argument has its pointer_alignment
     scalars = [a for a in args if a["kind"] == "scalar"]
     constexprs = [a for a in args if a["kind"] == "constexpr"]
 
@@ -754,8 +822,13 @@ def validate_spec(d: Any) -> None:
         if a is None or a["index"] != p["index"]:
             bad(f"{kind} precondition refers to {p['arg']}@{p['index']}, which is not an argument")
         if kind == "pointer_alignment":
-            if a["kind"] != "pointer" or p["index"] in aligned:
+            if a["kind"] not in ("pointer", "tensordesc") or p["index"] in aligned:
                 bad(f"pointer_alignment must be {ALIGNMENT} bytes, once, on a pointer argument ({p['arg']})")
+            if a["kind"] == "tensordesc":  # the global address of a TMA descriptor is 16-byte aligned; Triton gets no attribute for it
+                if p["bytes"] != ALIGNMENT:
+                    bad(f"pointer_alignment of the descriptor {p['arg']} must be {ALIGNMENT} bytes (the global address of a TMA descriptor), got {p['bytes']}")
+                aligned.add(p["index"])
+                continue
             if "strides" in a:  # a strided pointer is 16-byte aligned only when its declaration says so, else aligned to its element
                 itemsize = max(1, ALL_DTYPES[a["dtype"]].bits // 8)
                 if p["bytes"] not in (ALIGNMENT, itemsize):
@@ -779,7 +852,7 @@ def validate_spec(d: Any) -> None:
                 bad(f"max_extent must be once, on a strided pointer argument, with the value {MAX_ELEMENTS} ({p['arg']})")
             limited.add(p["index"])
         else:  # static_size
-            if a["kind"] != "pointer" or p["axis"] >= len(a["shape"]) or a["shape"][p["axis"]] != str(p["value"]):
+            if a["kind"] not in ("pointer", "tensordesc") or p["axis"] >= len(a["shape"]) or a["shape"][p["axis"]] != str(p["value"]):
                 bad(f"static_size of {p['arg']} axis {p['axis']} does not match its shape")
     if bucket_pres.keys() != buckets.keys():
         bad("every bucket needs exactly one bucket precondition")
@@ -869,7 +942,7 @@ def validate_spec(d: Any) -> None:
             for entry in a.get("shape_dims", ()):
                 if isinstance(entry, str):
                     used |= parse_expression(entry, "shape_dims")
-            if a["kind"] == "pointer" and "strides" in a:
+            if a["kind"] in ("pointer", "tensordesc") and "strides" in a:
                 for entry in (*a["strides"], a["offset"]):
                     if isinstance(entry, str):
                         used |= parse_expression(entry, "layout")

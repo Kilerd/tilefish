@@ -531,6 +531,7 @@ impl LibraryEntry {
                     shape,
                     view: None,
                     alias: None,
+                    tensor_map: None,
                 },
             });
         }

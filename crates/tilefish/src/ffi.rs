@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DeviceSlice as _, LaunchConfig,
-    PushKernelArg, result, sys,
+    PushKernelArg, SyncOnDrop, result, sys,
 };
 
 use crate::error::{Error, Result};
@@ -162,13 +162,105 @@ pub(crate) fn all_bytes_of_view_mut_mut<'a, E>(view: &'a mut CudaViewMut<'_, E>)
     unsafe { view.transmute_mut::<u8>(bytes) }
 }
 
-/// What a launch pushes for one tensor: the value in the slot (a region), the slice itself, or a view of it from the first element on.
+/// The 128 bytes of an encoded `CUtensorMap`, 64-byte aligned as its kernel parameter is (`.param .align 64 .b8 [128]`): what a launch passes
+/// by value for a TMA descriptor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub(crate) struct TensorMapBytes(pub(crate) [u64; 16]);
+
+impl std::fmt::Debug for TensorMapBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TensorMapBytes(")?;
+        for w in &self.0 {
+            write!(f, "{w:016x}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+// SAFETY: a plain array of 16 `u64`, `repr(C)`, with no padding and no pointer the kernel follows: the driver copies its 128 bytes into the
+// parameter of the kernel, which reads them as the `CUtensorMap` that `cuTensorMapEncodeTiled` wrote into them (`encode_tensor_maps`).
+#[allow(unsafe_code)]
+unsafe impl cudarc::driver::DeviceRepr for TensorMapBytes {}
+
+/// Encode the TMA descriptors of a checked call (`cuTensorMapEncodeTiled`, which cudarc has no wrapper of): each with the arguments
+/// `Plan::prepare` computed from its tensor (the address, shape and strides it was checked with) and the map of its parameter. A call the driver
+/// refuses is an `Error::Driver`; the checks of `Plan::prepare` refuse, with a kind, everything the driver is documented to refuse of a tensor.
+/// The map is a function of those numbers alone: a launch encodes its own, and a graph that captured a launch holds the bytes of that one.
+#[allow(unsafe_code)]
+pub(crate) fn encode_tensor_maps(prepared: &mut Prepared) -> Result<()> {
+    for map in &mut prepared.maps {
+        let e = &map.encode;
+        let rank = e.rank as usize;
+        if !(1..=5).contains(&rank)
+            || [e.global_dim.len(), e.global_strides.len(), e.box_dim.len(), e.element_strides.len()] != [rank; 4]
+        {
+            return Err(Error::Launch(format!("a tensor map of rank {rank} has arguments of other lengths: {e:?}")));
+        }
+        let data_type = match e.data_type {
+            0 => sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            3 => sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT32,
+            5 => sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
+            6 => sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+            7 => sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+            9 => sys::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            other => return Err(Error::Launch(format!("a tensor map of data type {other} is not supported"))),
+        };
+        let swizzle = match e.swizzle {
+            0 => sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+            1 => sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_32B,
+            2 => sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
+            _ => sys::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+        };
+        let l2 = match e.l2_promotion {
+            0 => sys::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+            1 => sys::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_64B,
+            2 => sys::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+            _ => sys::CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        };
+        let fill = if e.oob_fill == 1 {
+            sys::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
+        } else {
+            sys::CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        };
+        let mut out = std::mem::MaybeUninit::<sys::CUtensorMap>::zeroed();
+        // SAFETY: `out` is a live, aligned `CUtensorMap` (cudarc's type has the alignment the driver requires) that the call writes; the four
+        // arrays are live locals of `rank` entries each (checked above: the driver reads `rank` dimensions, box sizes and element strides and
+        // `rank - 1` strides of them); the address is only recorded in the map (the driver does not dereference it), and the enumerators are
+        // valid values of their types. The function exists in every driver this crate runs on (CUDA 12.0 and newer).
+        let status = unsafe {
+            sys::cuTensorMapEncodeTiled(
+                out.as_mut_ptr(),
+                data_type,
+                e.rank,
+                e.address as *mut c_void,
+                e.global_dim.as_ptr(),
+                e.global_strides.as_ptr(),
+                e.box_dim.as_ptr(),
+                e.element_strides.as_ptr(),
+                sys::CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+                swizzle,
+                l2,
+                fill,
+            )
+        };
+        status.result().map_err(Error::driver("cuTensorMapEncodeTiled"))?;
+        // SAFETY: the call succeeded, so it wrote the whole map (and it was zeroed before).
+        let encoded = unsafe { out.assume_init() };
+        map.bytes = Some(TensorMapBytes(encoded.opaque));
+    }
+    Ok(())
+}
+
+/// What a launch pushes for one tensor: the value in the slot (a region), the slice itself, or a view of it from the first element on; or,
+/// for the tensor of a TMA descriptor (whose slot is the map), the guard of the slice's tracking for the time of the launch.
 enum Holder<'t> {
     Value,
     Read(&'t dyn sealed::Read),
     Write(&'t mut dyn sealed::Write),
     ReadView(CudaView<'t, u8>),
     WriteView(CudaViewMut<'t, u8>),
+    Guard(#[allow(dead_code)] SyncOnDrop<'t>),
 }
 
 /// Enqueue `function` on `stream` with the arguments of `prepared` in the order of the ABI of the manifest: a tensor's pointer, a scalar or
@@ -192,12 +284,26 @@ pub(crate) fn enqueue(
     shared: u32,
     tensors: &mut [TensorArg<'_>],
 ) -> Result<()> {
+    let mapped: Vec<usize> = prepared.maps.iter().map(|m| usize::from(prepared.tensor_of[m.slot])).collect();
+    if prepared.maps.iter().any(|m| m.bytes.is_none()) {
+        return Err(Error::Launch("a tensor map of the launch was not encoded".to_owned()));
+    }
     ordered(stream, tensors, |tensors, want_end| {
         // what the builder is given for each tensor: made before the builder, which holds pointers into it until the launch
         let mut holders: Vec<Holder<'_>> = Vec::with_capacity(tensors.len());
-        for tensor in tensors.iter_mut() {
+        for (t, tensor) in tensors.iter_mut().enumerate() {
             let offset = tensor.byte_offset;
             let missing = || Error::Launch("a view starts past the end of its slice".to_owned());
+            if mapped.contains(&t) {
+                // the tensor of a TMA descriptor: its slot is the map, and its slice is tracked by a guard that lives until after the launch
+                // (cudarc's wait for the slice's earlier uses on `stream` now, the record of this use when the guard is dropped)
+                holders.push(match &mut tensor.backing {
+                    Backing::Raw => Holder::Value,
+                    Backing::Read(memory) => Holder::Guard(memory.sync_read(stream)),
+                    Backing::Write(memory) => Holder::Guard(memory.sync_write(stream)),
+                });
+                continue;
+            }
             holders.push(match &mut tensor.backing {
                 Backing::Raw => Holder::Value,
                 Backing::Read(memory) => {
@@ -230,8 +336,14 @@ pub(crate) fn enqueue(
             let Some(holder) = pushed.next() else {
                 return Err(Error::Launch("fewer tensors than the ABI has".to_owned()));
             };
+            if let Some(map) = prepared.map_at(slot) {
+                // the slot of a TMA descriptor: the 128 bytes of its map, by value (its tensor is held by the guard above)
+                let bytes = map.bytes.as_ref().expect("encoded: checked above");
+                launch.arg(bytes);
+                continue;
+            }
             match holder {
-                Holder::Value => {
+                Holder::Value | Holder::Guard(_) => {
                     launch.arg(value);
                 }
                 Holder::Read(memory) => {
@@ -533,9 +645,15 @@ impl Kernel {
         for (slot, value) in params.iter_mut().zip(prepared.values.iter_mut()).take(count) {
             *slot = std::ptr::from_mut(value).cast::<c_void>();
         }
+        for map in &mut prepared.maps {
+            // the slot of a TMA descriptor points at the 128 bytes of its encoded map (which `check_with` made)
+            let bytes = map.bytes.as_mut().ok_or_else(|| Error::Launch("a tensor map was not encoded".to_owned()))?;
+            params[map.slot] = std::ptr::from_mut(bytes).cast::<c_void>();
+        }
         let (grid, block) = (prepared.grid, self.plan().block());
-        // SAFETY: `params[..count]` point at the live 64-bit slots of `prepared`, which the driver reads before it returns, in the
-        // order of the manifest's ABI; the rest is as in `enqueue`, and the stream is the caller's, as the contract above says.
+        // SAFETY: `params[..count]` point at the live 64-bit slots of `prepared` (and, at the slot of a TMA descriptor, at the 128 bytes of its
+        // encoded map in `prepared`), which the driver reads before it returns, in the order of the manifest's ABI; the rest is as in
+        // `enqueue`, and the stream is the caller's, as the contract above says.
         unsafe {
             result::launch_kernel(
                 self.function().cu_function(),
