@@ -4,6 +4,21 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### Numerics in the DSL (notes 15 to 17 of `tilefish.lower`)
+
+- `tilefish.erf(x)`: libdevice's `erff` by default (what `gelu` uses), CUDA's `erff` without flush to zero with `math="ieee"` (the bits of
+  CUDA 12.8 to 13.1; CUDA 13.2 changed the function).
+- `tilefish.sin_approx(x)` (`sin.approx.f32`, CUDA's `__sinf`), `tilefish.rcp(x)` (`rcp.rn.f32`, `__frcp_rn`), `tilefish.fma(a, b, c)` (`fma.rn.f32`,
+  one rounding whatever `fp_fusion` says) and `-x` / `tilefish.neg(x)` (CUDA's negation: `neg.f32`, `neg.bf16`, `neg.f16`, or `0 - x` of an
+  integer). `-x` was refused before.
+- Ordered sums: `tilefish.sum(x, axis=-1, order="sequential" | tilefish.tree(lanes, offsets, vector), fma=False)` (row template, f32): lanes of
+  chains from `+0.0` and a fixed tree over the lanes, every add `add.rn`; `fma=True` fuses the multiply of `a * b` into each step. Byte for byte
+  the CUDA kernels of those orders, and the same bytes at every `num_warps`.
+- `num_warps` stays part of every kernel's identity; the contract now says which ops depend on it (Triton's own reductions) and which do not
+  (per-element ops, `argmax` / `argmin`, ordered sums), measured.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

@@ -148,6 +148,16 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
                             libdevice``)                                                    built with FTZ: torch's CUDA bits
                                                                                          except on a subnormal, which is ±0;
                                                                                          in IEEE math that is ``x`` (note 14).
+``erf(x)``                  ``tl.math.erf(x)``; IEEE math: ``_tf_erf_ieee(x)``              f32 only; libdevice ``__nv_erff``
+                                                                                         (gelu's; FTZ, not CUDA's erff). IEEE
+                                                                                         math: CUDA's ``erff`` without FTZ
+                                                                                         (CUDA 12.8 to 13.1; note 15).
+``sin_approx(x)``,          a module-level helper of one PTX instruction (inline asm):      CUDA's ``__sinf``, ``__frcp_rn``,
+``rcp(x)``, ``fma(a, b,     ``sin.approx.f32``, ``rcp.rn.f32``, ``fma.rn.f32``,         ``fmaf`` (one rounding, whatever
+c)``, ``neg(x)`` / ``-x``   ``neg.f32``, ``neg.bf16``, ``neg.f16``; integers ``-v``      ``fp_fusion``) and ``-x`` (a NaN gives
+                                                                                         the canonical NaN), in either math;
+                                                                                         f32 (``neg``: f16, bf16, i32, i64
+                                                                                         too). Note 16.
 ``sum(x, axis=-1)``         ``tl.sum(tl.where(mask, x, 0.0), axis=0)``                      f32 only. The reduction is over all
                                                                                          ``BLOCK_D`` lanes; masked lanes are
                                                                                          set to 0 explicitly (intermediates
@@ -155,6 +165,10 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
                                                                                          are not 0 there). The order is
                                                                                          Triton's, and depends on
                                                                                          ``num_warps`` (note 6).
+``sum(x, axis=-1,           a module-level helper per order: ``lanes`` chains of            f32 only; the order of every add is
+order=...)``                ``add.rn`` (``fma.rn``: ``fma=True``) over the columns,      the call's (``"sequential"`` or
+                            then ``tl.split`` steps of the tree over the lanes          ``tilefish.tree(...)``), the same at
+                                                                                         every ``num_warps`` (note 17).
 ``mean(x, axis=-1)``        ``tl.sum(tl.where(mask, x, 0.0), axis=0) / D``                  f32 only; ``D`` is the constexpr:
                                                                                          ``sum * f32(1 / D)`` (note 4).
 ``max(x, axis=-1)``         ``tl.max(tl.where(mask, x, float("-inf")), axis=0)``            f32 only; masked lanes are ``-inf``
@@ -381,14 +395,62 @@ Notes (the facts behind the table):
     argument is passed through, ``tl.where(tl.abs(x) < 2**-126, x, libdevice.tanh(x))``, and the bits are torch's on every input. The
     ``reference`` mode models the flush in the default math (``torch.where(|x| < 2**-126, x * 0.0, torch.tanh(x))``) and is torch's ``tanh`` in
     IEEE math: byte-identical to the binary in both. ``tanh.approx.f32`` (one instruction, about ``2**-11`` relative error) is not used.
+15. **``erf``.** ``tilefish.erf(x)`` (f32) is ``tl.math.erf``, libdevice's ``__nv_erff`` as Triton links it (with FTZ): the ``erf`` of ``gelu``
+    (note 5). That library is not CUDA's: over every f32 it differs from CUDA's ``erff`` on 24 071 628 inputs (by at most ``2**-22`` from torch's
+    ``erf``). In IEEE math (note 13) it is CUDA's ``erff`` without flush to zero, a module-level helper of the inline PTX NVRTC emits for it
+    (``_tf_erf_ieee``: a polynomial in ``x * x`` below ``|x| = 1.0029547``, one in ``|x|`` above that ends in ``1 - ex2.approx.ftz``, the sign of
+    ``x`` put back with ``copysign``; nvcc's one branch is a select), every ``add`` and ``mul`` ``.rn``. Measured over every one of the ``2**32`` f32
+    bit patterns (``tests/test_gpu_primitives.py``, sm_103): the bits of CUDA 12.8's ``erff`` (NVRTC, and torch's ``erf`` built with CUDA 12.8),
+    of 12.9's, 13.0's and 13.1's, which are the same function; CUDA 13.2 changed ``erff`` (other coefficients and threshold), which differs on
+    353 987 744 inputs by one ULP. The CUDA math guard records this (``docs/numerics.md``). ``gelu`` keeps libdevice's ``erf`` in both maths (its
+    bits are part of its contract); CUDA's exact gelu in IEEE math is written with ``tilefish.erf``. The ``reference`` mode is ``torch.erf``:
+    byte-identical in IEEE math where torch is built with CUDA 12.8 to 13.1, within ``2**-22`` in the default math.
+16. **One-instruction primitives**, each a module-level helper of one inline PTX instruction, in either math and whatever ``fp_fusion`` says
+    (an inline-asm result is never contracted with anything): ``tilefish.sin_approx(x)`` is ``sin.approx.f32``, CUDA's ``__sinf`` (the hardware's
+    sine: absolute error below ``2**-20.5`` on ``[-pi, pi]``, measured ``3.6e-7``, growing outside; a subnormal argument gives a zero of its sign,
+    with or without ``.ftz``, which give the same bits on every f32); ``tilefish.rcp(x)`` is ``rcp.rn.f32``, the correctly rounded ``1 / x`` with
+    subnormals kept, CUDA's ``__frcp_rn`` and its ``1.0f / x`` without fast math, and ``torch.reciprocal``; ``tilefish.fma(a, b, c)`` is
+    ``fma.rn.f32``, ``a * b + c`` rounded once with subnormals kept, CUDA's ``fmaf`` (operands broadcast like ``+``'s; a scalar is rounded to f32);
+    ``tilefish.neg(x)``, which ``-x`` is, is CUDA's negation: ``neg.f32`` (and ``neg.bf16`` / ``neg.f16`` for those dtypes) flips the sign of every
+    number, zeros and infinities included, where Triton's ``-x`` is ``0 - x`` (``+0.0`` for ``+0.0``), and gives the canonical NaN (``0x7FFFFFFF``,
+    ``0x7FFF``) for every NaN, which a flip of the sign bit does not; ``-x`` of an ``i32`` or ``i64`` is ``0 - x`` (two's complement). Measured
+    against CUDA C++ compiled by NVRTC and against PTX on every f32 (and every bf16 and f16 for ``neg``), and ``fma`` on 3 sets of ``2**24``
+    operand triples (bit patterns, cancellations ``c ~ -a * b``, the subnormal range, every combination of the special values):
+    ``tests/test_gpu_primitives.py``. The ``reference`` mode is exact for ``rcp`` (``torch.reciprocal``), ``neg`` and ``fma`` (an f64 product and
+    sum, rounded to odd, then to f32; NaNs canonical), and ``torch.sin`` within the bound for ``sin_approx``.
+17. **Ordered sums.** ``tilefish.sum(x, axis=-1, order=...)`` (f32, the last axis of ``[R, D]``, the row template) adds in the order the call
+    says, which is what a CUDA kernel's bytes depend on; without ``order`` it is Triton's tree (note 6). ``order=tilefish.tree(lanes, offsets,
+    vector)``: ``lanes`` partial sums, each a chain from ``+0.0``: lane ``j`` takes the columns ``c * lanes * vector + j * vector + v`` that are
+    below ``D``, in the order ``(c, v)`` (``c = 0, 1, ...``, ``v`` from 0 to ``vector - 1``), each step ``acc + x`` rounded once (``add.rn.f32``);
+    a lane with no column keeps ``+0.0``. Then, for each ``o`` of ``offsets`` in turn, every lane ``j`` adds lane ``j + o`` (``p[j] = p[j] + p[j +
+    o]``, ``add.rn``), and the sum is lane 0's. ``offsets`` is a permutation of the powers of two below ``lanes`` (default: ``lanes / 2``, ...,
+    1, the halving tree of a shared-memory reduction ``s[t] += s[t + o]``); a warp-shuffle tree (``__shfl_down_sync`` or ``__shfl_xor_sync`` with
+    16, ..., 1: IEEE addition commutes, so lane 0 is the same) followed by one over the 4 warps of a 128-thread block,
+    ``(w0 + w2) + (w1 + w3)``, is ``offsets=(16, 8, 4, 2, 1, 64, 32)``. ``order="sequential"`` is ``tree(lanes=1)``: one chain over the row, left
+    to right from ``+0.0``. ``fma=True`` (with an order, of a product ``a * b`` only) makes each step of a chain ``acc = fma(a, b, acc)``, one
+    rounding: what nvcc compiles ``acc += a * b`` to. Lowered as a module-level helper per order: a loop over a lane's steps that takes each
+    step's terms with ``tl.gather`` (``tl.where`` keeps a lane's value where the column is at or past ``D``: skipped, not added as ``+0.0``, so a
+    chain that holds ``-0.0``, which an fma of tiny products of opposite signs gives, keeps it as a CUDA loop that stops at ``D`` does), then one
+    ``tl.reshape`` / ``tl.permute`` / ``tl.split`` per offset (data movement: exact) and one ``add.rn``; ``tl.reduce`` with a combine that keeps its
+    first operand takes lane 0. Nothing in it depends on ``num_warps`` or on Triton's layouts: the same bytes at 1, 2, 4, 8 and 16 warps.
+    Measured byte for byte against CUDA C++ kernels of each order (one thread per row; 256 threads and a halving tree; 128 threads of 8 columns
+    with ``acc += x * x``, a shuffle tree and the warps; 64 threads of ``fmaf`` chains of a dot product), on rows of 1 to 4096 columns of every
+    magnitude, signed zeros, NaNs, infinities and subnormals, and an rmsnorm of 128 threads: ``tests/test_gpu_reduction_order.py``. Every add is
+    one rounding and never contracted, so with ``fma=False`` a product summed is rounded first (``acc + round(a * b)``). The cost is the order's:
+    a sequential row of 4096 columns is 4096 dependent adds. The ``reference`` mode computes the same order in torch (f32 adds, an fma as in note
+    16, NaNs canonical): byte-identical to the binary.
 
-``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
-kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
-accumulator dtype (a numerics-changing rewrite in the README's terms), and two binaries that differ in ``num_warps`` are not
-byte-comparable. It is therefore recorded everywhere an identity is: the declaration digest, the compile spec, the manifest
-entry (a replay refuses an entry whose ``num_warps`` is not the spec's) and the manifest digest. Pin it
-(``@tilefish.kernel(num_warps=N)``) where bytes must not move when a size is added to a bucketed dimension, and treat a
-change of it, or of the rule that picks it (``clamp(BLOCK_D // 256, 1, 16)``), as a change of the numerics contract.
+**``num_warps`` and the numerics identity** (decided on measurements, ``tests/test_gpu_reduction_order.py``). What depends on ``num_warps`` is
+Triton's own reductions: ``tl.sum`` (``sum`` without ``order``, ``mean``) adds in a tree that the warp count shapes (note 6; on 1024 rows of
+values of every magnitude, 669 to 878 rows differ between 1 warp and 2 to 16, at 96, 1000 and 4096 columns), and ``tl.max`` reduces in the same
+tree. Per element ops, casts, ``argmax`` / ``argmin`` (a total order, note 8) and ordered sums (note 17) do not: their bytes are the same at every
+warp count. ``num_warps`` is part of every kernel's identity all the same: recorded everywhere an identity is, the declaration digest, the compile
+spec, the manifest entry (a replay refuses an entry whose ``num_warps`` is not the spec's) and the manifest digest. A binary of another warp
+count is other machine code, and one rule for every kernel is checked mechanically where a per-kernel argument would not be. For a kernel with a
+Triton reduction it is also its numerics: the same kernel with another warp count differs in the last bits, like a changed reduction order or
+accumulator dtype (a numerics-changing rewrite in the README's terms). Pin it (``@tilefish.kernel(num_warps=N)``) where bytes must not move when a
+size is added to a bucketed dimension, and treat a change of it, or of the rule that picks it (``clamp(BLOCK_D // 256, 1, 16)``), as a change of
+the numerics contract; or give every reduction an ``order``, and the warp count is a choice of speed only.
 
 The ``reference`` mode is held to the binary within tolerances that are measured per input distribution, not stated once:
 a ULP count only means something where the result is far from zero, so for a bf16 output the bound is half a bf16 step of the
@@ -457,7 +519,8 @@ _MATH = frozenset({"f32"})
 _BINARY = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 _COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 _LOGICAL = {"and": "&", "or": "|", "xor": "^"}
-_UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos", "tanh")
+_UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos", "tanh", "erf", "sin_approx", "rcp")
+_NEG = frozenset({"f32", "bf16", "f16", "i32", "i64"})  # neg: the floats by CUDA's neg (note 16), the signed integers by 0 - x
 _REDUCTIONS = ("sum", "mean", "max")
 _ARG_REDUCTIONS = ("argmax", "argmin")
 _OTHER_OPS = ("not", "where", "iota", "gather_rows", "scatter_rows", "floordiv", "mod")  # dtypes checked like a load's
@@ -509,7 +572,7 @@ _SILU = (  # x / (1 + expf(-x)), as torch's silu kernel compiles: the negation f
 _IEEE_HEADER = "math: ieee (note 13: / and sqrt are IEEE 754, exp is expf, silu torch's, rsqrt rsqrtf, sin and tanh keep a subnormal; no flush to zero)"
 
 
-def _asm(instructions: "Iterable[str]", constraints: str, args: str, regs: str = "") -> "list[str]":
+def _asm(instructions: "Iterable[str]", constraints: str, args: str, regs: str = "", dtype: str = "float32") -> "list[str]":
     """The body of a helper that is one block of inline PTX (one element per instance), its instructions one per line of the string."""
     lines = ["return tl.inline_asm_elementwise("]
     if regs:
@@ -519,8 +582,37 @@ def _asm(instructions: "Iterable[str]", constraints: str, args: str, regs: str =
     else:
         (only,) = instructions
         lines.append(f'    "{only}",')
-    lines += [f'    "{constraints}",', f"    [{args}],", "    dtype=tl.float32,", "    is_pure=True,", "    pack=1,", ")"]
+    lines += [f'    "{constraints}",', f"    [{args}],", f"    dtype=tl.{dtype},", "    is_pure=True,", "    pack=1,", ")"]
     return lines
+
+
+_ERFF = (  # CUDA's erff (nvcc's defaults, no flush to zero) as NVRTC 12.8 to 13.1 emit it, its one branch made a select (note 15)
+    "abs.f32 t0, $1;",
+    "setp.ltu.f32 p0, t0, 0f3F8060FE;",  # |x| < 1.0029547 (or a NaN): erf is the polynomial below
+    "setp.ge.f32 p1, t0, 0f3F8060FE;",
+    "mul.rn.f32 t1, $1, $1;",
+    "selp.f32 t2, t0, t1, p1;",  # the variable of the polynomial: |x| above the threshold, x * x below
+    "selp.f32 t3, 0f38EB4C3A, 0f38B1E96A, p1;",
+    "selp.f32 t4, 0fBAAE005B, 0fBA574D20, p1;",
+    "fma.rn.f32 t3, t3, t2, t4;",
+    "selp.f32 t4, 0f3C09919F, 0f3BAAD5EA, p1;",
+    "fma.rn.f32 t3, t3, t2, t4;",
+    "selp.f32 t4, 0fBD24D99A, 0fBCDC1BE7, p1;",
+    "fma.rn.f32 t3, t3, t2, t4;",
+    "selp.f32 t4, 0f3E235519, 0f3DE718AF, p1;",
+    "fma.rn.f32 t3, t3, t2, t4;",
+    "selp.f32 t4, 0f3F69B4F9, 0fBEC093AC, p1;",
+    "fma.rn.f32 t3, t3, t2, t4;",
+    "selp.f32 t4, 0f3F210A14, 0f3E0375D3, p1;",
+    "fma.rn.f32 t3, t3, t2, t4;",
+    "neg.f32 t5, t0;",
+    "selp.f32 t5, t5, $1, p1;",  # -|x| above, x below
+    "fma.rn.f32 t6, t3, t5, t5;",  # p * s + s: erf(x) below the threshold
+    "ex2.approx.ftz.f32 t7, t6;",
+    "sub.rn.f32 t7, 0f3F800000, t7;",  # 1 - 2**(p * s + s)
+    "copysign.f32 t7, $1, t7;",  # with the sign of x: erf(x) above the threshold
+    "selp.f32 $0, t6, t7, p0;",
+)
 
 
 _IEEE: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {  # op -> (parameters, comment, body) of its helper in IEEE math (note 13)
@@ -537,7 +629,26 @@ _IEEE: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {  # op -> (paramet
             ["return tl.where(tl.abs(x) < 1.1754943508222875e-38, x, tl.sin(x))"]),
     "tanh": ("x", ("libdevice's tanhf (built with flush to zero), but a subnormal argument is its own tanh, as without flush to zero (note 14)",),
              ["return tl.where(tl.abs(x) < 1.1754943508222875e-38, x, libdevice.tanh(x))"]),
+    "erf": ("x", ("CUDA's erff without flush to zero, the sequence nvcc emits (CUDA 12.8 to 13.1; note 15 of tilefish.lower)",),
+            _asm(list(_ERFF), "=f,f", "x", ".reg .f32 t<8>; .reg .pred p<2>;")),
 }  # (cos is libdevice's cosf in both: it has the same bits with and without flush to zero, note 10)
+
+# Ops that are one PTX instruction in either math (note 16), and the adds of an ordered sum (note 17): (parameters, comment, body) of the helper
+_PTX: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {
+    "sin_approx": ("x", ("sin.approx.f32: CUDA's __sinf (note 16 of tilefish.lower)",), _asm(["sin.approx.f32 $0, $1;"], "=f,f", "x")),
+    "rcp": ("x", ("rcp.rn.f32: 1 / x correctly rounded, subnormals kept (CUDA's __frcp_rn; note 16 of tilefish.lower)",),
+            _asm(["rcp.rn.f32 $0, $1;"], "=f,f", "x")),
+    "fma": ("a, b, c", ("fma.rn.f32: a * b + c rounded once, whatever fp_fusion says (CUDA's fmaf; note 16 of tilefish.lower)",),
+            _asm(["fma.rn.f32 $0, $1, $2, $3;"], "=f,f,f,f", "a, b, c")),
+    "neg.f32": ("x", ("neg.f32: CUDA's -x, the sign flipped (-0.0 for +0.0; a NaN gives the canonical NaN; note 16 of tilefish.lower)",),
+                _asm(["neg.f32 $0, $1;"], "=f,f", "x")),
+    "neg.bf16": ("x", ("neg.bf16: CUDA's -x of a bf16, the sign flipped (note 16 of tilefish.lower)",),
+                 _asm(["neg.bf16 $0, $1;"], "=h,h", "x", dtype="bfloat16")),
+    "neg.f16": ("x", ("neg.f16: CUDA's -x of an f16, the sign flipped (note 16 of tilefish.lower)",),
+                _asm(["neg.f16 $0, $1;"], "=h,h", "x", dtype="float16")),
+    "add.rn": ("a, b", ("add.rn.f32: one rounding, never contracted with a multiply (an ordered sum, note 17 of tilefish.lower)",),
+               _asm(["add.rn.f32 $0, $1, $2;"], "=f,f,f", "a, b")),
+}
 
 
 # -- the result ---------------------------------------------------------------------------------
@@ -721,8 +832,8 @@ def _check_common(op: KernelOp) -> None:
                 None,
                 "declared-op-call",
                 f"the body calls the {n.attrs['kind']} op '{n.op}'; only the built-in ops (+ - * /, comparisons, & | ^ ~ of masks, "
-                "where, iota, // and % by a constant, silu, gelu, rsqrt, exp, sqrt, sin, cos, tanh, .to, sum, mean, max, argmax, argmin, gather_rows, "
-                "scatter_rows, load and stores) are lowered",
+                "where, iota, // and % by a constant, silu, gelu, rsqrt, exp, sqrt, sin, cos, tanh, erf, sin_approx, rcp, neg, fma, .to, sum, mean, max, "
+                "argmax, argmin, gather_rows, scatter_rows, load and stores) are lowered",
             )
         if n.op == "split":
             views = [str(t) for t in n.output_types if not t.contiguous]
@@ -778,7 +889,7 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
                 "arithmetic-dtype",
                 f"{n}: arithmetic on {dt} is not lowered (supported: {', '.join(sorted(_ARITHMETIC))}); cast with .to() first",
             )
-    elif n.op in _UNARY:
+    elif n.op in _UNARY or n.op == "fma":
         dt = n.outputs[0].type.dtype
         if dt.name not in _MATH:
             raise _fail(
@@ -786,6 +897,15 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
                 None,
                 "math-dtype",
                 f"{n}: {n.op} of a {dt} tensor is not lowered (Triton's math functions are f32 here); cast with .to(f32) first",
+            )
+    elif n.op == "neg":
+        dt = n.outputs[0].type.dtype
+        if dt.name not in _NEG:
+            raise _fail(
+                kernel,
+                None,
+                "arithmetic-dtype",
+                f"{n}: negation of a {dt} tensor is not lowered (supported: {', '.join(sorted(_NEG))}); cast with .to() first",
             )
     elif n.op in _REDUCTIONS:
         dt = n.inputs[0].type.dtype  # type: ignore[union-attr]
@@ -1677,6 +1797,18 @@ class _Body:
         self.math = math  # the kernel's f32 math (note 13); an op may say its own
         self.libdevice = False  # whether the body calls libdevice by name (tanh), which the module then imports
         self.params = {p.name: p for p in op.graph.inputs}
+        self.producer = {o: n for n in op.graph.nodes for o in n.outputs}  # the node that made each value (an fma sum reads its product's operands)
+        # a product that only fma sums read is not computed on its own: each step of their chains multiplies (note 17)
+        users: dict[Value, list[Node]] = {}
+        for n in op.graph.nodes:
+            for i in n.inputs:
+                if isinstance(i, Value):
+                    users.setdefault(i, []).append(n)
+        self.fused_only = {
+            self.producer[v]
+            for v, ns in users.items()
+            if v in self.producer and all(u.op == "sum" and u.attrs.get("fma") for u in ns) and not any(v is o for o in op.graph.outputs)
+        }
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
         self.helpers: dict[tuple, tuple[str, list[str]]] = {}  # module-level @triton.jit functions the body calls (an argmax combine)
@@ -1730,6 +1862,8 @@ class _Body:
         self.emit(f"{v} = {self.layout.load(self.rename.get(p.name, p.name), p)}", p.name)
 
     def node(self, n: Node, last_store: "dict[str, Node]") -> None:
+        if n in self.fused_only:  # a product only fma sums read: they multiply in their chains
+            return
         if n.op == "store":
             self.store(n, last_store)
         elif n.op == "scatter_rows":
@@ -1945,6 +2079,94 @@ class _Body:
             self.helpers[key] = (name, ["@triton.jit", f"def {name}({params}):", *(f"    # {line}" for line in doc), *(f"    {line}" for line in body)])
         return self.helpers[key][0]
 
+    def ptx_helper(self, key: str) -> str:
+        """The name of the module-level helper of an op that is one PTX instruction in either math (note 16), or of an ordered sum's add
+        (note 17), written into :attr:`helpers` the first time it is needed."""
+        if ("ptx", key) not in self.helpers:
+            name = self.names.fresh(f"_tf_{key.replace('.', '_')}")
+            params, doc, body = _PTX[key]
+            self.helpers[("ptx", key)] = (name, ["@triton.jit", f"def {name}({params}):", *(f"    # {line}" for line in doc), *(f"    {line}" for line in body)])
+        return self.helpers[("ptx", key)][0]
+
+    def first_helper(self) -> str:
+        """A combine that keeps its first operand: ``tl.reduce`` of a one-lane tensor with it is that lane's value, bit for bit."""
+        if ("first",) not in self.helpers:
+            name = self.names.fresh("_tf_first")
+            self.helpers[("first",)] = (name, ["@triton.jit", f"def {name}(a, b):", "    # the value of a one-lane tensor as it is (no add)", "    return a"])
+        return self.helpers[("first",)][0]
+
+    def sum_helper(self, order: Any, fused: bool) -> str:
+        """The name of the module-level helper of an ordered sum (note 17): ``order.lanes`` chains over the columns of the row, in the order the
+        order says, then its tree over the lanes; ``fused``: each step of a chain is ``fma(a, b, acc)``."""
+        key = ("sum", order.lanes, order.vector, order.offsets, fused)
+        if key in self.helpers:
+            return self.helpers[key][0]
+        lanes, vector, width = order.lanes, order.vector, order.lanes * order.vector
+        add = self.ptx_helper("add.rn")
+        step = self.ptx_helper("fma") if fused else ""
+        first = self.first_helper()
+        stem = f"_tf_sum{'_fma' if fused else ''}_seq" if lanes == 1 else f"_tf_sum{'_fma' if fused else ''}_l{lanes}_v{vector}_o" + "_".join(map(str, order.offsets))
+        name = self.names.fresh(stem)
+        columns = "the columns in order" if lanes == 1 else (
+            f"lane j adds the columns c * {width} + j * {vector} + v, in the order (c, v)" if vector > 1 else f"lane j adds the columns c * {lanes} + j in order"
+        )
+        what = "fma(a, b, acc)" if fused else "acc + x"
+        steps = "BLOCK" if width == 1 else f"(BLOCK + {width - 1}) // {width}" + (f" * {vector}" if vector > 1 else "")  # a lane's steps
+        lines = [
+            "@triton.jit",
+            f"def {name}({'a, b' if fused else 'x'}, D: tl.constexpr, BLOCK: tl.constexpr):",
+            f"    # an ordered sum (note 17 of tilefish.lower), {order}: {columns}, each step {what} rounded once, from +0.0;",
+            "    # a column at or past D is skipped" + (
+                "" if lanes == 1 else f"; then p[j] = p[j] + p[j + o] for o = {', '.join(map(str, order.offsets))} (add.rn); the sum is lane 0's"
+            ),
+            f"    lane = tl.arange(0, {lanes})",
+            f"    p = tl.zeros(({lanes},), tl.float32)",
+            f"    for s in range({steps}):",
+        ]
+        if vector == 1:
+            lines.append(f"        col = s * {width} + lane" if lanes > 1 else "        col = s + lane")
+        else:
+            lines.append(f"        col = (s // {vector}) * {width} + lane * {vector} + s % {vector}")
+        lines.append("        k = tl.minimum(col, BLOCK - 1)")
+        if fused:
+            lines.append(f"        p = tl.where(col < D, {step}(tl.gather(a, k, 0), tl.gather(b, k, 0), p), p)")
+        else:
+            lines.append(f"        p = tl.where(col < D, {add}(p, tl.gather(x, k, 0)), p)")
+        n, removed = lanes, []
+        for o in order.offsets:  # the live lanes, compacted: a lane's index without the bits of the offsets already taken
+            q = o >> sum(1 for r in removed if r < o)
+            lines.append(f"    a_, b_ = tl.split(tl.permute(tl.reshape(p, ({n // (2 * q)}, 2, {q})), (0, 2, 1)))  # o = {o}: lanes j and j + {o}")
+            lines.append(f"    p = tl.reshape({add}(a_, b_), ({n // 2},))")
+            n //= 2
+            removed.append(o)
+        lines.append(f"    return tl.reduce(p, 0, {first})")
+        self.helpers[key] = (name, lines)
+        return name
+
+    def as_row(self, x: "Value | Scalar") -> str:
+        """An operand of an fma sum as a ``[BLOCK_D]`` tensor: a per-row value or a scalar broadcast (exactly) along the row."""
+        layout = self.layout
+        assert isinstance(layout, _RowLayout)
+        if isinstance(x, Value):
+            if layout.cls[x] in (_FULL, _COL):
+                return self.var[x]
+            return f"tl.broadcast_to({self.var[x]}, ({layout.BLOCK_name},))"
+        return f"tl.full(({layout.BLOCK_name},), {self.operand(x)}, tl.float32)"
+
+    def ordered_sum(self, n: Node) -> str:
+        """``sum(x, order=...)`` of an ``[R, D]`` value (note 17): the helper of its order on the row (on the operands of its product, ``fma=True``)."""
+        layout = self.layout
+        assert isinstance(layout, _RowLayout)
+        x = n.inputs[0]
+        assert isinstance(x, Value)
+        fused = bool(n.attrs.get("fma"))
+        if fused:
+            product = self.producer[x]
+            args = ", ".join(self.as_row(i) for i in product.inputs)
+        else:
+            args = self.var[x]
+        return f"{self.sum_helper(n.attrs['order'], fused)}({args}, {layout.D_name}, {layout.BLOCK_name})"
+
     def arg_lanes(self, n: Node, v: str) -> "tuple[str, str]":
         """The (value, index) pair each lane of the row (or of the chunk) offers an argmax / argmin; a masked lane loses to every lane."""
         layout = self.layout
@@ -1971,6 +2193,8 @@ class _Body:
         op = n.op
         if op in _ARG_REDUCTIONS:
             return self.arg_reduce(n, v)
+        if op == "sum" and "order" in n.attrs:  # note 17 (an fma sum reads its product's operands, not the product)
+            return self.ordered_sum(n)
         if op == "gather_rows":
             return self.gather(n, v)
         if op == "load":  # one element from device memory, broadcast: no mask, no offsets
@@ -1997,6 +2221,13 @@ class _Body:
             return f"{self.ieee_helper(op)}({', '.join(a)})"
         if op == "tanh":
             return f"libdevice.tanh({a[0]})"
+        if op == "erf":
+            return f"tl.math.erf({a[0]})"
+        if op in ("sin_approx", "rcp", "fma"):  # one PTX instruction in either math (note 16)
+            return f"{self.ptx_helper(op)}({', '.join(a)})"
+        if op == "neg":
+            dt = n.outputs[0].type.dtype
+            return f"{self.ptx_helper('neg.' + dt.name)}({a[0]})" if dt.is_float else f"-{a[0]}"  # an integer: 0 - x, two's complement
         if op in _BINARY:
             return f"{a[0]} {_BINARY[op]} {a[1]}"
         if op == "rsqrt":

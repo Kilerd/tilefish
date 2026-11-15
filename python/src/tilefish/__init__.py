@@ -35,6 +35,9 @@ M3.4: an extern of a Triton or Gluon kernel takes TMA tensor descriptors (:func:
 a product of symbolic sizes (``L*L`` for an ``[H, L, L]`` tensor: :func:`tilefish.dims.mul`), which views, ``Strided`` arguments and plans take;
 the elementwise template broadcasts along any axis (note 12); a kernel or an op says its f32 math, ``math="ieee"`` for CUDA's without fast math
 or flush to zero (:func:`div`, note 13); and :func:`tanh` is libdevice's ``tanhf`` (note 14).
+
+M3.5: the primitives a CUDA kernel is reproduced with: :func:`erf` (CUDA's ``erff`` in IEEE math), :func:`sin_approx`, :func:`rcp`, :func:`fma`
+and :func:`neg` (``-x``), and sums in a fixed order (``tilefish.sum(x, -1, order="sequential" | tree(...), fma=...)``, :func:`tree`); notes 15 to 17.
 """
 
 from . import aot
@@ -78,7 +81,8 @@ from ._plan import Plan, plan
 from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in __all__, `from tilefish import *` must not shadow the module copy
-from .ops import argmax, argmin, cos, div, exp, gather_rows, gelu, iota, load, rsqrt, scatter_rows, silu, sin, sqrt, tanh, where
+from .ops import argmax, argmin, cos, div, erf, exp, fma, gather_rows, gelu, iota, load, neg, rcp, rsqrt, scatter_rows, silu, sin, sin_approx
+from .ops import sqrt, tanh, tree, where
 from ._copyops import col2im1d, contiguous, im2col, im2col1d
 from .ops import reduce_mean as mean
 from .runtime import capture, run
@@ -156,10 +160,12 @@ __all__ = [
     "e2m1",
     "e4m3",
     "e5m2",
+    "erf",
     "exp",
     "extern",
     "f16",
     "f32",
+    "fma",
     "gather_rows",
     "gelu",
     "graph",
@@ -174,14 +180,18 @@ __all__ = [
     "load",
     "lower",
     "mean",
+    "neg",
     "plan",
+    "rcp",
     "rsqrt",
     "run",
     "scatter_rows",
     "silu",
     "sin",
+    "sin_approx",
     "sqrt",
     "tanh",
+    "tree",
     "u8",
     "ue8m0",
     "where",

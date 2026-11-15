@@ -20,7 +20,9 @@ and a `@tilefish.graph` compiles into a launch plan over one arena
 (`tilefish.plan`) that runs from Python and captures in a CUDA graph
 (`tilefish.capture`). A lowered kernel also compares, selects, gathers and
 scatters rows and reduces to an index, broadcasts along any axis, and may use
-IEEE f32 math (`math="ieee"`) and `tilefish.tanh`; `tilefish.im2col1d` and
+IEEE f32 math (`math="ieee"`), `tilefish.tanh`, CUDA's `erff`, `__sinf`,
+`__frcp_rn`, `fmaf` and negation, and sums in a fixed order (a sequential
+chain, or lanes and a tree as a CUDA block adds); `tilefish.im2col1d` and
 `tilefish.col2im1d` are generated ops for 1-D convolutions; an extern may be a
 Gluon kernel or have one implementation per architecture, take TMA tensor
 descriptors (`TensorDesc`) and be warp-specialised; a pinned GEMM takes bf16,
@@ -622,6 +624,23 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   and `tanh` keep a subnormal, each written out as the inline PTX nvcc emits (Triton links libdevice with flush to zero). On every one of the 2**32 f32 bit
   patterns these are torch's CUDA bits, and `/` is torch's division of tensors; with `fp_fusion=False` too, a body of these ops is torch's eager
   composition of the same ops byte for byte. The default, `math="fast"`, is the contract of before (note 13 of `tilefish.lower`).
+- **Primitives for reproducing a CUDA kernel.** `tilefish.erf(x, math="ieee")` is CUDA's `erff` without flush to zero (the default math's is
+  libdevice's, `gelu`'s); `tilefish.sin_approx(x)` is `__sinf` (`sin.approx.f32`), `tilefish.rcp(x)` `__frcp_rn` (`rcp.rn.f32`),
+  `tilefish.fma(a, b, c)` `fmaf` (one rounding, whatever `fp_fusion` says), and `-x` (`tilefish.neg`) is CUDA's negation, `-0.0` for `+0.0`
+  where Triton's `-x` is `0 - x`. Each is the bits of the CUDA C++ function on every f32, measured against NVRTC on the GPU (notes 15 and 16).
+- **Ordered sums.** `tilefish.sum(x, axis=-1, order=...)` adds in the order a CUDA kernel does: `order="sequential"` is one thread's loop from
+  `+0.0`, `tilefish.tree(256)` is 256 threads over strided columns and a shared-memory halving tree, and
+  `tilefish.tree(128, offsets=(16, 8, 4, 2, 1, 64, 32), vector=8)` is 128 threads of 8 consecutive columns, a warp-shuffle tree and then the
+  warps; `fma=True` makes each step of a chain `acc = fma(a, b, acc)` for `tilefish.sum(a * b, ...)`, as nvcc compiles `acc += a * b`. The bytes
+  are those kernels' and the same at every `num_warps` (note 17):
+
+  ```python
+  @tilefish.kernel(math="ieee")
+  def rmsnorm(x: Tensor[R, 1024, bf16], w: Tensor[1024, bf16]) -> Tensor[R, 1024, bf16]:
+      v = x.to(f32)
+      ss = tilefish.sum(v * v, -1, keepdims=True, order=tilefish.tree(128, offsets=(16, 8, 4, 2, 1, 64, 32), vector=8), fma=True)
+      return ((v * tilefish.rsqrt(ss / 1024.0 + 1e-6)) * w.to(f32)).to(bf16)   # a 128-thread CUDA rmsnorm, byte for byte
+  ```
 - The elementwise template broadcasts an operand over the leading axes (a `[T, D]` table added to a `[K, T, D]` batch), and along any axis by
   numpy's rules (a `[H, 1, L]` mask of the keys over `[H, L, L]` scores, a `[K, T, 1]` scale per row): such an operand is read at the offset of the
   lane's coordinates, and `tilefish.iota(x, axis)` is the lane's coordinate along any axis (a causal mask is `iota(s, 2) <= iota(s, 1)`). The sizes the
