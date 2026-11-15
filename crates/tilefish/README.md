@@ -172,7 +172,7 @@ not compile:
 
 ```toml
 cudarc = { version = "0.19.10", default-features = false, features = ["driver", "cuda-13000"] }
-tilefish = { version = "0.0.4", default-features = false, features = ["cuda-13000"] }
+tilefish = { version = "0.0.5", default-features = false, features = ["cuda-13000"] }
 ```
 
 **Reproducible builds of a host.** The crate embeds no path of its own: it has no

@@ -4,7 +4,7 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## tilefish 0.0.7, crate 0.0.5 (unreleased)
+## tilefish 0.0.7, crate 0.0.5 (2026-11-15)
 
 ### Breaking changes
 
