@@ -454,6 +454,35 @@ def test_the_headers_compile_against_tilefish_hpp(tmp_path, fake_manifest):
 
 
 @needs_cxx
+def test_the_runners_and_launchers_of_fused_plans_compile(tmp_path):
+    """A graph whose body computes (``fusion_graphs.CASES``, fused, and its unfused twin with a region per op): the runner of its plan and the
+    launchers of its manifest, whose kernels are the regions tilefish generates (``fused_<hash>``, one class each, named by the stem), are written like any other and compile
+    against ``tilefish.hpp``. (On a GPU, ``rust_gate.py prepare`` writes the runner of every fused plan and ``cpp_gate.cpp`` runs it.)"""
+    import fusion_graphs as fg
+    import plan_fakes
+
+    out = tmp_path / "gen"
+    headers = []
+    for name in sorted(fg.CASES):
+        for twin, graph in zip(("fused", "unfused"), fg.CASES[name]):
+            directory = tmp_path / f"{twin}_{name}"
+            exported = plan_fakes.export(tilefish.plan(graph), directory)
+            stems = {s["entry"] for b in exported.buckets() for s in exported.steps(**b) if s["kind"] == "kernel"}
+            regions = {s for s in stems if s.startswith("fused_")}
+            assert regions, (name, twin, stems)  # the unfused twin has a region per op
+            namespace = f"{twin}_{name}"
+            runner = cpp.emit_plan(exported, out / f"{namespace}_runner.hpp", namespace=namespace).read_text()
+            assert f"class {''.join(w.capitalize() for w in graph.name.split('_'))} {{" in runner
+            launchers = cpp.emit(pinned(Manifest.load(directory)), out / f"{namespace}_launchers.hpp", namespace=f"{namespace}_kernels").read_text()
+            for stem in regions:
+                assert f'static constexpr const char* STEM = "{stem}";' in launchers, stem
+            headers += [f"{namespace}_runner.hpp", f"{namespace}_launchers.hpp"]
+    main = out / "fused.cpp"
+    main.write_text("".join(f'#include "{h}"\n' for h in headers) + "int main() { return 0; }\n")
+    compile_syntax([main], [out])
+
+
+@needs_cxx
 @needs_cargo
 @needs_capi
 def test_an_embedded_manifest_loads_through_the_c_abi(tmp_path, fake_manifest):

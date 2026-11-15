@@ -11,7 +11,8 @@ bytes. The gate has three steps, on a machine with a GPU, the ``gpu`` extra and 
 
 The C++ host (``crates/tilefish-capi``: the C ABI over the crate and ``tilefish.hpp``) runs the same cases from the same directory: ``prepare`` also
 writes ``WORK/generated.hpp`` and ``WORK/generated_embedded.cpp`` (``tilefish.hosts.cpp.emit``, the manifest and the cubins embedded) and
-``WORK/block_runner.hpp`` (``tilefish.hosts.cpp.emit_plan`` of the plan ``block``), and::
+``WORK/block_runner.hpp`` (``tilefish.hosts.cpp.emit_plan`` of the plan ``block``) and ``WORK/fused_runners.hpp`` (a runner of every plan ``fused_*``,
+:func:`write_fused_runners`), and::
 
     cmake -S crates/tilefish-capi -B BUILD -DTILEFISH_BUILD_GPU_GATE=ON -DTILEFISH_GATE_DIR=WORK && cmake --build BUILD
     BUILD/tilefish_cpp_gate WORK                      # crates/tilefish-capi/tests/gpu/cpp_gate.cpp
@@ -1464,6 +1465,60 @@ def record_taps(work, exported, graph, args, params, bucket, case_id):
     return out
 
 
+def write_fused_runners(work, fused):
+    """The C++ runners of the fused plans (``fused_*``: ``(name, the plan exported)`` each): ``tilefish.hosts.cpp.emit_plan`` writes one per plan
+    to ``WORK/fused_runners/<name>.hpp`` (namespace ``gate_<name>``), and ``WORK/fused_runners.hpp``, code of the gate and not of the emitter, includes
+    them and has per plan a function template that loads the plan through its runner and hands ``each`` a launch: given the tensors of a case by
+    name (a ``(tilefish::Region, tilefish::Dims)`` each) and its device scalars by name, it fills the runner's typed ``Externals`` and ``Scalars``
+    and launches. ``run(name, ...)`` picks the plan; the test ``fused_runners`` of ``cpp_gate.cpp`` runs every case of every fused plan with it."""
+    import re
+
+    out = [
+        "// Written by python/tests/rust_gate.py prepare (write_fused_runners): the fused plans of the gate through the runners tilefish.hosts.cpp.emit_plan\n",
+        "// wrote for them (fused_runners/<plan>.hpp). Test code of the gate: a case's tensors go into each runner's typed Externals and Scalars.\n",
+        "#pragma once\n\n#include <cstddef>\n#include <cstdint>\n#include <string>\n\n",
+    ]
+    funcs, names = [], []
+    for name, exported in fused:
+        namespace = f"gate_{name}"
+        header = cpp.emit_plan(exported, work / "fused_runners" / f"{name}.hpp", namespace=namespace)
+        cls = re.search(r"^class (\w+) \{$", header.read_text(), re.M).group(1)
+        out.append(f'#include "fused_runners/{name}.hpp"\n')
+        doc = exported.doc
+        tensors = []
+        for b in doc["buffers"]:
+            if b["role"] in ("input", "weight", "inout", "output"):
+                kind = "TensorMut" if b["role"] in ("inout", "output") else "TensorRef"
+                tensors.append(f'tilefish::{kind}<{cpp.CPP_ELEMENTS[b["dtype"]]}>(t("{b["name"]}").first, t("{b["name"]}").second)')
+        ints = {"i32": "int32_t", "i64": "int64_t", "u8": "uint8_t"}
+        scalars = [f'static_cast<{ints[b["dtype"]]}>(v("{b["name"]}"))' for b in doc["buffers"] if b["role"] == "devscalar"]
+        funcs.append(
+            f"/// `{name}` (graph `{doc['graph']}`): its plan loaded through `{namespace}::{cls}`, and `each(launch)`.\n"
+            "template <class Each>\n"
+            f"void {name}(const std::string& directory, const tilefish::Context& ctx, CUstream stream, Each&& each) {{\n"
+            f"    using P = {namespace}::{cls};\n"
+            "    P plan = P::load(directory, ctx, stream);\n"
+            "    each([&](const auto& t, const auto& v) {\n"
+            "        (void)t;\n        (void)v;\n"
+            "        P::Externals e{\n" + "".join(f"            {x},\n" for x in tensors) + "        };\n"
+            "        P::Scalars s{" + ", ".join(scalars) + "};\n"
+            "        plan.launch(stream, e, s);\n"
+            "    });\n"
+            "}\n\n"
+        )
+        names.append(name)
+    out.append("\nnamespace fused_runners {\n\n")
+    out.extend(funcs)
+    out.append("/// The fused plans of the gate.\n")
+    out.append(f"constexpr std::size_t COUNT = {len(names)};\n\n")
+    out.append("/// Run plan `name` through its runner (see above); false if the gate has no runner of that name.\n")
+    out.append("template <class Each>\nbool run(const std::string& name, const std::string& directory, const tilefish::Context& ctx, CUstream stream, Each&& each) {\n")
+    for n in names:
+        out.append(f'    if (name == "{n}") {{\n        {n}(directory, ctx, stream, each);\n        return true;\n    }}\n')
+    out.append("    return false;\n}\n\n}  // namespace fused_runners\n")
+    (work / "fused_runners.hpp").write_text("".join(out), encoding="utf-8")
+
+
 def prepare_plans(work):
     """Export the plans of :func:`plan_graphs` to ``WORK/plans/<name>`` and run every case through ``tilefish.run(..., mode="replay", plan=...)`` with
     the pin; write ``WORK/plans.json`` for ``gpu_gate.rs``::
@@ -1487,6 +1542,7 @@ def prepare_plans(work):
         exports.append((name, graph, reuse, make_cases, directory, exported, exported.digest, {"dir": f"plans/{name}"}))
         if name == "block":
             cpp.emit_plan(exported, work / "block_runner.hpp")  # the C++ gate runs the block through its generated runner too
+    write_fused_runners(work, [(e[0], e[5]) for e in exports if e[0].startswith("fused_")])  # and every fused plan through its own
     # a plan set: the plans of one stage per key (gpu_kernels_p6.tile_chain) over one manifest, replayed through the set's pin
     import gpu_kernels_p6 as p6
 
@@ -1620,16 +1676,20 @@ def prepare_carried(work, root):
 def compare_plans(work, host="rust"):
     """The outputs (and in-place tensors) the Rust plan wrote, for its launch (``rust_plans``) and its CUDA graph replay (``rust_plans_graph``), and for
     the plans of a shared arena their launches and replays one after the other on one ``SharedArena`` (``rust_shared``, ``rust_shared_graph``), against
-    what Python's plan replay left; with ``host="cpp"``, what the C++ gate wrote (``cpp_plans``, ...). Returns ``(passed, cases, failures)``."""
+    what Python's plan replay left; with ``host="cpp"``, what the C++ gate wrote (``cpp_plans``, ..., and ``cpp_fused_runners``: the fused plans through
+    their generated runners). Returns ``(passed, cases, failures)``."""
     path = work / "plans.json"
     if not path.exists():
         return 0, 0, []
     doc = json.loads(path.read_text(encoding="utf-8"))
     failed, passed, count = [], 0, 0
-    for subdir in (f"{host}_plans", f"{host}_plans_graph", f"{host}_shared", f"{host}_shared_graph"):
+    subdirs = [f"{host}_plans", f"{host}_plans_graph", f"{host}_shared", f"{host}_shared_graph"] + (["cpp_fused_runners"] if host == "cpp" else [])
+    for subdir in subdirs:
         for plan in doc["plans"]:
             if subdir.startswith(f"{host}_shared") and not plan.get("shared"):
                 continue  # the plans of the shared arena run again, one after the other on one SharedArena (launched, and replayed)
+            if subdir == "cpp_fused_runners" and not plan["name"].startswith("fused_"):
+                continue  # the fused plans again, each through the runner tilefish.hosts.cpp.emit_plan wrote for it
             for case in plan["cases"]:
                 count += 1
                 bad = []

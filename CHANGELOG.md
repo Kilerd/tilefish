@@ -54,7 +54,7 @@ each section names the release that added it.
   plan, with the validation of `tilefish.hosts.rust`.
 - **The C++ GPU gate** (`crates/tilefish-capi/tests/gpu/cpp_gate.cpp`, built with `-DTILEFISH_BUILD_GPU_GATE=ON`) runs the cases of
   `python/tests/rust_gate.py` from the same directory, and `rust_gate.py compare WORK --host cpp` holds them to Python's replay byte for
-  byte; `rust_gate.py prepare` writes the C++ launchers and a plan runner too. `tests/gpu_overhead.rs` reports the host time a launch takes
+  byte; `rust_gate.py prepare` writes the C++ launchers and plan runners too (the block's, and every fused plan's, `fused_*`). `tests/gpu_overhead.rs` reports the host time a launch takes
   through the C ABI and through the crate.
 
 ### Fixed

@@ -17,7 +17,8 @@
 // `plan_set` (a set loaded with one pin), `shared` (the stages of a set on one shared arena, launched and replayed one after the other,
 // cpp_shared/ and cpp_shared_graph/), `carried` (carried buffers handed from plan to plan on a shared arena, launched and replayed, cpp_carried/
 // and cpp_carried_graph/, and the refusals of a fresh arena), `weighted` (weights bound once), `runner` (the generated runner of the plan
-// `block`) and `capturing` (a plan launch on a stream the host is capturing is refused).
+// `block`), `fused_runners` (every plan `fused_*`, whose graph body computes, through the runner generated for it, cpp_fused_runners/) and
+// `capturing` (a plan launch on a stream the host is capturing is refused).
 
 #include <algorithm>
 #include <cstdio>
@@ -38,6 +39,10 @@
 #if __has_include("block_runner.hpp")
 #include "block_runner.hpp"
 #define TILEFISH_GATE_HAVE_RUNNER 1
+#endif
+#if __has_include("fused_runners.hpp")
+#include "fused_runners.hpp"
+#define TILEFISH_GATE_HAVE_FUSED_RUNNERS 1
 #endif
 
 namespace fs = std::filesystem;
@@ -574,9 +579,10 @@ tilefish::LaunchPlan load_plan(const json::Value& p) { return tilefish::LaunchPl
 
 void test_plans() {
     Gpu& g = gpu();
-    int cases = 0, tensors = 0;
+    int cases = 0, tensors = 0, fused = 0;
     auto doc = plans_doc();
     for (const auto& p : doc["plans"].array()) {
+        if (p["name"].str().rfind("fused_", 0) == 0) ++fused;  // a graph body that computes: its arithmetic is kernel steps of fused regions
         auto plan = load_plan(p);
         CHECK(plan.digest() == p["digest"].str() && plan.arena_bytes() == p["arena_bytes"].u64(), "%s", p["name"].str().c_str());
         auto run = plan.instantiate(g.ctx, g.s());
@@ -610,7 +616,9 @@ void test_plans() {
             }
         }
     }
-    std::printf("cpp gate: %d plan cases, each launched and replayed twice from a captured plan: Python's bytes (%d tensors)\n", cases, tensors);
+    CHECK(fused > 0, "the gate's plans include fused plans (fused_*)");
+    std::printf("cpp gate: %d plan cases (%d plans fused_*), each launched and replayed twice from a captured plan: Python's bytes (%d tensors)\n", cases,
+                fused, tensors);
 }
 
 void test_plan_set() {
@@ -920,6 +928,45 @@ void test_runner() {
 #endif
 }
 
+void test_fused_runners() {
+#ifdef TILEFISH_GATE_HAVE_FUSED_RUNNERS
+    Gpu& g = gpu();
+    auto doc = plans_doc();
+    int plans = 0, cases = 0;
+    for (const auto& p : doc["plans"].array()) {
+        const std::string& name = p["name"].str();
+        if (name.rfind("fused_", 0) != 0) continue;
+        ++plans;
+        try {
+            bool known = fused_runners::run(name, (gate / p["dir"].str()).string(), g.ctx, g.s(), [&](const auto& launch) {
+                for (const auto& c : p["cases"].array()) {
+                    auto exts = upload(c);
+                    std::map<std::string, const Ext*> by;
+                    for (const auto& e : exts) by[e.name] = &e;
+                    auto t = [&](const char* n) {
+                        const Ext* e = by.at(n);
+                        return std::make_pair(Region{e->mem.address(), e->mem.bytes(), 0}, e->shape);
+                    };
+                    auto v = [&](const char* n) { return c["devscalars"][n].i64(); };
+                    launch(t, v);
+                    g.stream.sync();
+                    check_outputs(exts, "cpp_fused_runners", c["id"].str(), "the generated runner");
+                    ++cases;
+                }
+            });
+            CHECK(known, "%s: fused_runners.hpp has no runner of it", name.c_str());
+        } catch (const std::exception& e) {
+            CHECK(false, "%s: %s", name.c_str(), e.what());
+        }
+    }
+    CHECK(plans > 0 && static_cast<size_t>(plans) == fused_runners::COUNT, "the gate has %d fused plans, fused_runners.hpp %zu", plans,
+          fused_runners::COUNT);
+    std::printf("cpp gate: %d fused plans through their generated runners: %d cases, Python's bytes\n", plans, cases);
+#else
+    CHECK(false, "fused_runners.hpp is not in the gate directory (rust_gate.py prepare writes it)");
+#endif
+}
+
 void test_capturing() {
     Gpu& g = gpu();
     auto doc = plans_doc();
@@ -961,7 +1008,7 @@ int main(int argc, char** argv) {
         {"refusals", test_refusals}, {"single_launch_graph", test_single_launch_graph},
         {"context", test_context},   {"plans", test_plans},       {"plan_set", test_plan_set},
         {"shared", test_shared},     {"carried", test_carried},   {"weighted", test_weighted},
-        {"runner", test_runner},     {"capturing", test_capturing},
+        {"runner", test_runner},     {"fused_runners", test_fused_runners}, {"capturing", test_capturing},
     };
     std::set<std::string> wanted(argv + std::min(argc, 2), argv + argc);
     int ran = 0;

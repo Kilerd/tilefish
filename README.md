@@ -1132,11 +1132,11 @@ What the host owns, and how the boundary behaves:
 
 The C++ half of the byte-identity gate runs the cases of the Rust gate from the
 same directory: `python rust_gate.py prepare WORK` also writes the C++
-launchers and a plan runner, `cmake -S crates/tilefish-capi -B build
+launchers and plan runners (the block's, and every fused plan's), `cmake -S crates/tilefish-capi -B build
 -DTILEFISH_BUILD_GPU_GATE=ON -DTILEFISH_GATE_DIR=WORK` builds
 `tilefish_cpp_gate` (`crates/tilefish-capi/tests/gpu/cpp_gate.cpp`: kernels,
-GEMMs, convolutions, plans launched and replayed, a shared arena, carried
-buffers, weights bound once, refusals, graphs of single launches), and
+GEMMs, convolutions, plans launched and replayed, fused plans, a shared arena,
+carried buffers, weights bound once, refusals, graphs of single launches), and
 `python rust_gate.py compare WORK --host cpp` holds what it wrote to Python's
 replay byte for byte.
 

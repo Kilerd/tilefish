@@ -331,13 +331,15 @@ moves the handle's creation, which waits for the device, to start-up. An explici
   * `uv run pytest`: emitter unit tests (validation, refusal of an unpinned manifest, determinism, golden output; the rendered headers compiled with
     `-Wall -Wextra -Werror`; an embedded manifest linked against the library and verified).
   * The existing gates are unchanged.
-* **GPU: the C++ gate.** `rust_gate.py prepare WORK` writes `generated.hpp`, `generated_embedded.cpp` and `block_runner.hpp` next to `generated.rs`, with
+* **GPU: the C++ gate.** `rust_gate.py prepare WORK` writes `generated.hpp`, `generated_embedded.cpp`, `block_runner.hpp` and `fused_runners.hpp` (the
+  runner of every fused plan, `fused_*`, and a call of each from a case) next to `generated.rs`, with
   the same inputs and the same replay bytes. A C++ program (`crates/tilefish-capi/tests/gpu/cpp_gate.cpp`, built by CMake) runs every case of
   `cases.json` and `plans.json` through the C ABI, with the typed launchers where it has an arm. That covers kernels (views, device scalars, prebuilt
   binaries, TMA descriptors, warp-specialised kernels, clusters, persistent grids, global scratch, given values), GEMMs (and the workspace case) and
   convolutions, with the manifest directory and with the embedded manifest; plans launched and captured and replayed twice; a plan set; the stages of a
-  set on one shared arena; carried buffers handed from plan to plan; weights bound once; and the generated runner of the plan `block`. It writes the
-  outputs to `cpp/`, `cpp_embedded/`, `cpp_plans/`, `cpp_plans_graph/`, `cpp_shared/`, `cpp_shared_graph/`, `cpp_carried/` and `cpp_carried_graph/`, and
+  set on one shared arena; carried buffers handed from plan to plan; weights bound once; the generated runner of the plan `block`; and the plans whose
+  graph body computes (`fused_*`, plan fusion), untyped and through their generated runners. It writes the outputs to `cpp/`, `cpp_embedded/`,
+  `cpp_plans/`, `cpp_plans_graph/`, `cpp_shared/`, `cpp_shared_graph/`, `cpp_carried/`, `cpp_carried_graph/` and `cpp_fused_runners/`, and
   `rust_gate.py compare WORK --host cpp` holds them byte for byte to Python's replay, as it does for Rust. The gate also checks refusals by status: a
   precondition of each kind it can make (shape, access, dtype), a tensor larger than its region, a wrong pin, a tampered cubin, another architecture, a
   plan launched on a capturing stream, and on a fresh arena a carried buffer nothing wrote. It checks that a kernel and a GEMM captured in the host's own
