@@ -8,18 +8,29 @@
 //!
 //! [`PlanSet::instantiate`] puts plans of the set on **one arena they share** ([`SharedArena`], section 15.1 of the document): a host that runs
 //! them one at a time pays for the largest of their arenas, not for each, and every launch and replay of any of them is ordered with the others.
+//!
+//! **Start-up.** A set verified in this process is verified once: a second [`PlanSet::load`] of the same set digest, while a clone of the first
+//! one's manifest is alive, takes that manifest (its cubins verified then, its modules and GEMMs loaded since) and reads only the index.
+//! [`PlanSet::plans`] loads many plans on several threads, and [`PlanSet::instantiate`] loads and instantiates its plans on several threads (the
+//! binaries and GEMMs themselves are loaded on one: the driver's and cuBLASLt's loads do not get faster on threads).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use cudarc::driver::CudaStream;
 use serde_json::Value;
 
+use crate::conv::{CachedConv, Conv, ConvEntry};
 use crate::elf::sha256_hex;
 use crate::error::{Error, Result};
+use crate::gemm::{CachedGemm, Gemm};
 use crate::json::{canonical, parse_strict, type_name};
-use crate::launch_plan::LaunchPlan;
-use crate::manifest::{MANIFEST_NAME, Manifest, Pin, is_arch, is_digest, is_ident};
+use crate::kernel::{Arch, Cached, Kernel};
+use crate::launch_plan::{LaunchPlan, StepKind};
+use crate::library::LibraryEntry;
+use crate::manifest::{Entry, MANIFEST_NAME, Manifest, Pin, is_arch, is_digest, is_ident};
+use crate::par;
 use crate::plan_run::{PlanRun, SharedArena};
 
 /// The `schema` of a plan set's index.
@@ -50,6 +61,89 @@ pub fn plan_set_digest(doc: &Value) -> String {
     let mut bytes = SET_DIGEST_TAG.to_vec();
     bytes.extend_from_slice(canonical(&body).as_bytes());
     sha256_hex(&bytes)
+}
+
+/// The manifests of the plan sets verified in this process, by set digest, held weakly (a set that nothing holds any more is verified again
+/// when it is loaded next). Each set has a slot of its own, whose lock a second load of the set waits on while the first one verifies it.
+type Slot = Arc<Mutex<Option<WeakManifest>>>;
+static VERIFIED: Mutex<Vec<(String, Slot)>> = Mutex::new(Vec::new());
+
+/// A verified [`Manifest`], held weakly: everything a clone shares (its entries and the modules, GEMMs and convolutions loaded from them).
+#[derive(Debug)]
+struct WeakManifest {
+    digest: String,
+    entries: Weak<Vec<Entry>>,
+    library: Weak<Vec<LibraryEntry>>,
+    convs: Weak<Vec<ConvEntry>>,
+    kernels: Weak<Mutex<HashMap<(usize, usize), Cached>>>,
+    gemms: Weak<Mutex<HashMap<(usize, usize), CachedGemm>>>,
+    conv_cache: Weak<Mutex<HashMap<(usize, usize), CachedConv>>>,
+}
+
+impl WeakManifest {
+    fn of(m: &Manifest) -> Self {
+        Self {
+            digest: m.digest.clone(),
+            entries: Arc::downgrade(&m.entries),
+            library: Arc::downgrade(&m.library),
+            convs: Arc::downgrade(&m.convs),
+            kernels: Arc::downgrade(&m.kernels),
+            gemms: Arc::downgrade(&m.gemms),
+            conv_cache: Arc::downgrade(&m.conv_cache),
+        }
+    }
+
+    /// The manifest again, with `label` (where this load found it), when a clone of it is still alive somewhere.
+    fn upgrade(&self, label: &str) -> Option<Manifest> {
+        Some(Manifest {
+            label: label.to_owned(),
+            digest: self.digest.clone(),
+            entries: self.entries.upgrade()?,
+            library: self.library.upgrade()?,
+            convs: self.convs.upgrade()?,
+            kernels: self.kernels.upgrade()?,
+            gemms: self.gemms.upgrade()?,
+            conv_cache: self.conv_cache.upgrade()?,
+            sm_partition: None,
+        })
+    }
+}
+
+/// The manifest of the plan set of digest `set_digest`, whose index names the manifest of digest `manifest_digest`: the one this process
+/// verified already, while any clone of it is alive (a set digest covers its manifest's digest, which covers every file's), else `load()`.
+///
+/// So the second and later loads of one set in a process (one per worker, say) read no cubin and digest nothing but the index, and share the
+/// first one's loaded modules and GEMMs; two loads of one set at the same time verify it once (the second waits for the first). What a later load
+/// gets is exactly the content the pin names, verified when it was first read, whatever the files in the directory are now.
+fn verified(
+    set_digest: &str,
+    manifest_digest: &str,
+    label: &str,
+    load: impl FnOnce() -> Result<Manifest>,
+) -> Result<Manifest> {
+    let slot = {
+        let mut all = VERIFIED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // forget the sets nothing holds and no load is waiting for
+        all.retain(|(_, slot)| {
+            Arc::strong_count(slot) > 1
+                || slot.try_lock().is_ok_and(|held| held.as_ref().is_some_and(|w| w.entries.strong_count() > 0))
+        });
+        match all.iter().find(|(d, _)| d == set_digest) {
+            Some((_, slot)) => Arc::clone(slot),
+            None => {
+                let slot: Slot = Arc::new(Mutex::new(None));
+                all.push((set_digest.to_owned(), Arc::clone(&slot)));
+                slot
+            }
+        }
+    };
+    let mut held = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(m) = held.as_ref().and_then(|w| w.upgrade(label)).filter(|m| m.digest == manifest_digest) {
+        return Ok(m);
+    }
+    let m = load()?;
+    *held = Some(WeakManifest::of(&m));
+    Ok(m)
 }
 
 fn bad(message: impl Into<String>) -> Error {
@@ -155,7 +249,11 @@ impl PlanSet {
                 }
             }
         }
-        let manifest = match Manifest::load(directory.join(MANIFEST_NAME), Pin::Digest(&manifest_digest)) {
+        let label = directory.display().to_string();
+        let loaded = verified(&found, &manifest_digest, &label, || {
+            Manifest::load(directory.join(MANIFEST_NAME), Pin::Digest(&manifest_digest))
+        });
+        let manifest = match loaded {
             Ok(m) => m,
             Err(Error::PinMismatch { directory, found, pinned }) => {
                 return Err(bad(format!(
@@ -183,6 +281,13 @@ impl PlanSet {
             return Err(Error::Plan(format!("the file of graph '{name}' is the plan of graph '{}'", plan.graph())));
         }
         Ok(plan)
+    }
+
+    /// The plans of graphs `names`, each as [`PlanSet::plan`] loads it, in the order of `names`, loaded on several threads (at most 8, and the
+    /// machine's parallelism): what a host that runs many plans of a set loads at start-up. The error is the one [`PlanSet::plan`] gives for the
+    /// first name, in the order of `names`, that it refuses.
+    pub fn plans(&self, names: &[&str]) -> Result<Vec<LaunchPlan>> {
+        par::map(names, |name| self.plan(name))
     }
 
     /// The digest of the set (`set_digest`): what a pin is compared with.
@@ -224,14 +329,16 @@ impl PlanSet {
                     .to_owned(),
             ));
         }
+        // loaded on several threads, then refused as a loop over the names would: at the first name that is given again or does not load
+        let loaded = par::map(names, |name| Ok(self.plan(name)))?;
         let mut plans: Vec<LaunchPlan> = Vec::with_capacity(names.len());
-        for (i, name) in names.iter().enumerate() {
+        for (i, (name, plan)) in names.iter().zip(loaded).enumerate() {
             if names[..i].contains(name) {
                 return Err(Error::Launch(format!(
                     "a shared arena has each plan once: the plan of graph '{name}' is given twice"
                 )));
             }
-            plans.push(self.plan(name)?);
+            plans.push(plan?);
         }
         Ok(plans)
     }
@@ -248,16 +355,59 @@ impl PlanSet {
     /// ([`LaunchPlan::instantiate_all_in`]). A host that runs them one at a time (a request's stage A, then B, then C) pays for one arena, not
     /// one per plan: every launch and replay of any of them is ordered with those of the others, so none run concurrently, and nothing in the
     /// arena outlives a launch (a value a later plan reads is a returned value of the earlier one, in a tensor of the caller's).
+    ///
+    /// The host's part of the start-up runs on several threads (at most 8, and the machine's parallelism): the plans are loaded ([`PlanSet::plans`])
+    /// and instantiated on threads, and in between every binary, GEMM and convolution they launch is loaded once, on this thread (the driver's and
+    /// cuBLASLt's loads do not get faster on threads: measured on a B300, 1022 GEMMs took 98 to 112 ms on one thread and 113 to 140 ms on eight). A
+    /// refusal is the one a loop over the names would give first (a plan that does not load, then an entry that does not load, in the order the
+    /// plans launch them, then a plan that does not instantiate).
     pub fn instantiate(&self, stream: &Arc<CudaStream>, names: &[&str]) -> Result<SetRun> {
         let plans = self.plans_named(names)?;
         let arena = SharedArena::new(stream, &plans.iter().collect::<Vec<_>>())?;
-        let mut runs = Vec::with_capacity(plans.len());
-        for plan in &plans {
-            runs.push((plan.graph().to_owned(), plan.instantiate_all_in(&arena)?));
+        // held until every plan is instantiated: the caches hold what they loaded weakly
+        let loaded = self.load_entries(&arena, &plans)?;
+        let runs = par::map(&plans, |plan| plan.instantiate_all_in(&arena))?;
+        drop(loaded);
+        Ok(SetRun { arena, runs: plans.iter().map(|p| p.graph().to_owned()).zip(runs).collect() })
+    }
+
+    /// Every entry `plans` launch, each once, loaded in the arena's context (the manifest's caches then have them, and the instantiations on
+    /// threads find them loaded); the first refusal in the order the plans launch them.
+    fn load_entries(&self, arena: &SharedArena, plans: &[LaunchPlan]) -> Result<Vec<Loaded>> {
+        let ctx = arena.context();
+        let arch = Arch::of_context(ctx)?;
+        let mut seen = std::collections::HashSet::new();
+        let mut entries: Vec<(StepKind, &str)> = Vec::new();
+        for plan in plans {
+            for step in plan.buckets().iter().flat_map(|b| &b.steps) {
+                if step.kind != StepKind::Copy && seen.insert((step.kind == StepKind::Library, step.entry.as_str())) {
+                    entries.push((step.kind, &step.entry));
+                }
+            }
         }
-        Ok(SetRun { arena, runs })
+        let m = &self.manifest;
+        entries
+            .iter()
+            .map(|&(kind, stem)| match kind {
+                StepKind::Kernel => m.kernel(ctx, stem, &[], arch).map(Loaded::Kernel),
+                StepKind::Library if m.conv_entry(stem, &self.arch).is_some() => {
+                    m.conv(ctx, stem, &[], arch).map(Loaded::Conv)
+                }
+                _ => m.gemm(ctx, stem, &[], arch).map(Loaded::Gemm),
+            })
+            .collect()
     }
 }
+
+/// An entry loaded ahead of the instantiations of a set, held until they are made.
+#[allow(dead_code)] // held, not read
+enum Loaded {
+    Kernel(Kernel),
+    Gemm(Gemm),
+    Conv(Conv),
+}
+
+impl PlanSet {}
 
 /// Plans of a set instantiated on one [`SharedArena`] ([`PlanSet::instantiate`]): a [`PlanRun`] per plan, every one on the same arena. Cheap
 /// to clone (the clones share the instantiations and the arena).

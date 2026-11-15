@@ -262,6 +262,7 @@ mod launch_plan;
 mod library;
 mod manifest;
 mod memory;
+mod par;
 mod plan;
 mod plan_run;
 mod plan_set;

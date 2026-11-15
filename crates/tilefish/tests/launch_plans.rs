@@ -173,6 +173,38 @@ fn the_golden_plan_set_shares_one_manifest_and_one_pin_covers_every_plan() {
     }
 }
 
+/// A plan set verified in this process is not verified again while a clone of its manifest is alive: a second `PlanSet::load` of the same set
+/// digest (from any directory) takes the manifest the first one verified, with its own label, and reads no cubin; once nothing holds the set, the
+/// next load verifies the files again. (The index here lists two of the golden set's plans, so its set digest is this test's own: the other tests
+/// load the golden set itself.) `PlanSet::plans` loads the plans on several threads, as `plan` does one by one, and refuses as a loop would.
+#[test]
+fn a_plan_set_verified_in_the_process_is_not_verified_again_while_it_is_alive() {
+    let copy = Copy::of("set");
+    let mut index = copy.doc("plans.json");
+    index["plans"].as_object_mut().unwrap().remove("tiles3");
+    index["set_digest"] = Value::from(tilefish::plan_set_digest(&index));
+    copy.write("plans.json", &index);
+    let digest = index["set_digest"].as_str().unwrap().to_owned();
+    let first = PlanSet::load(&copy.dir, Pin::Digest(&digest)).unwrap();
+    // a cubin changed under the loaded set
+    let cubin = copy.dir.join("halve.sm_103.cubin");
+    let mut bytes = std::fs::read(&cubin).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&cubin, &bytes).unwrap();
+    let again = PlanSet::load(&copy.dir, Pin::Digest(&digest)).expect("the set verified already is not read again");
+    assert_eq!(again.manifest().digest(), first.manifest().digest());
+    assert_eq!(again.manifest().label(), copy.dir.display().to_string());
+    let plans = again.plans(&["tiles2", "tiles1"]).unwrap();
+    assert_eq!(plans.iter().map(|p| p.graph()).collect::<Vec<_>>(), ["tiles2", "tiles1"]);
+    let e = again.plans(&["tiles1", "tiles3", "tiles4"]).unwrap_err();
+    assert!(e.to_string().contains("lists no plan of graph 'tiles3'"), "{e}");
+    drop((first, again, plans));
+    // nothing holds it now: the next load reads every file again, and refuses the changed cubin
+    let e = PlanSet::load(&copy.dir, Pin::Digest(&digest)).unwrap_err();
+    assert!(e.to_string().contains("has sha256"), "{e}");
+}
+
 /// The arena the plans of the golden set share (`docs/plan-schema-1.md`, section 15.1): the largest `arena_bytes` of the plans, read from their
 /// pinned files, as Python's `share_arena` has it (`expected.json`), for every subset; the documents are unchanged, so the set's pin still covers
 /// them; no plan, a plan given twice and a plan the set does not list are refused.
