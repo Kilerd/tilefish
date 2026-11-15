@@ -1,0 +1,127 @@
+{
+  "schema": "tilefish.plan.v1",
+  "tilefish": "0.0.6",
+  "graph": "stage_a",
+  "arch": "sm_103",
+  "manifest_digest": "ae9a33f481d1458693dae2359a90c2415c68c6ab842cc8191d195dc6ad377d7c",
+  "dims": {
+    "Rs": [
+      8,
+      24
+    ]
+  },
+  "reuse": false,
+  "arena_alignment": 256,
+  "arena_bytes": 0,
+  "buffers": [
+    {
+      "name": "x",
+      "role": "input",
+      "dtype": "f32",
+      "shape": [
+        "Rs",
+        64
+      ],
+      "offset": null,
+      "bytes": 6144
+    },
+    {
+      "name": "h",
+      "role": "carried",
+      "dtype": "f32",
+      "shape": [
+        "Rs",
+        64
+      ],
+      "offset": null,
+      "bytes": 6144
+    },
+    {
+      "name": "y",
+      "role": "output",
+      "dtype": "f32",
+      "shape": [
+        "Rs",
+        64
+      ],
+      "offset": null,
+      "bytes": 6144
+    }
+  ],
+  "outputs": [
+    "y"
+  ],
+  "buckets": [
+    {
+      "values": {
+        "Rs": 8
+      },
+      "steps": [
+        {
+          "entry": "tripled",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "out",
+              "binding": "h"
+            }
+          ]
+        },
+        {
+          "entry": "plus_one",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "out",
+              "binding": "y"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "values": {
+        "Rs": 24
+      },
+      "steps": [
+        {
+          "entry": "tripled",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "out",
+              "binding": "h"
+            }
+          ]
+        },
+        {
+          "entry": "plus_one",
+          "kind": "kernel",
+          "args": [
+            {
+              "name": "x",
+              "binding": "x"
+            },
+            {
+              "name": "out",
+              "binding": "y"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "plan_digest": "a8dc0dea2ab7df63ddf18b274777b485ff4dc1bad633cbbd0b60abc2c83bbc6d"
+}

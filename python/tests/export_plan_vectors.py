@@ -163,6 +163,8 @@ def mutations():
         ("an output no step writes", lambda d: [b["steps"][8]["args"][2].update(binding="t0") for b in d["buckets"]]),
     ]
     out += copy_mutations()
+    out += memset_mutations()
+    out += carried_mutations()
     # shape expressions: the same sizes, written so that Python's dimension algebra folds them (accepted) or cannot (refused)
     for text in ("2*M//2", "M + 0", "M*1", "(M+M)//2", "M//1", "cdiv(M, 1)", "cdiv(2*M, 2)", "M - M + M", "-(-M)", "cdiv(M, 2) * 2", "M*M//M",
                  "cdiv(M*M, M)", "M // 2 * 2", "M // 0", "cdiv(M, 0)", "M - 2*M + 2*M", "N", "M+N-N", "((M))", "M//2+M//2", "2*(M//2)", "M  "):
@@ -262,6 +264,69 @@ def copy_mutations():
         ("copy writes before it is read", with_step(copy_step(("x", whole), ("t0", whole)), at=0)),
         ("copy in one bucket only", with_step(copy_step(("x", whole), ("t0", whole)), buckets=[1])),
         ("copy kind is not a string", with_step(lambda m: {"kind": ["copy"], "args": [arg("src", "x"), arg("dst", "t0")]})),
+    ]
+
+
+def memset_step(dst, *extra):
+    """A memset step made per bucket: ``dst`` is ``(binding, view(rows) or None)``; ``extra`` are more keys (refused)."""
+
+    def make(rows):
+        step = {"kind": "memset", "args": [arg("dst", dst[0], dst[1] and dst[1](rows))]}
+        for k, v in extra:
+            step[k] = v
+        return step
+
+    return make
+
+
+def memset_mutations():
+    """Memset steps (``kind: "memset"``) added to the block's plan: valid ones (an intermediate, an output, a dense view at an offset, the buffer a
+    later step reads before any other step writes it), and every rule both readers hold one to: the fields, the one argument ``dst``, dense, a
+    buffer a step may write, the same step in every bucket."""
+    dense = lambda offset: lambda m: {"shape": [m, 256], "strides": [256, 1], "offset": offset(m)}  # noqa: E731
+    strided = lambda m: {"shape": [m, 256], "strides": [768, 1], "offset": 0}  # noqa: E731
+    whole = None
+    return [
+        ("memset of an intermediate", with_step(memset_step(("t0", whole)), at=0)),
+        ("memset into an output", with_step(memset_step(("out0", whole)))),
+        ("memset of a dense view at an offset", with_step(memset_step(("t1", dense(lambda m: m * 256))))),
+        ("memset of a view that is not dense", with_step(memset_step(("t1", strided)))),
+        ("memset makes a buffer written", lambda d: (with_step(memset_step(("t4", whole)), at=0)(d), [b["steps"][2]["args"][0].update(binding="t4") for b in d["buckets"]])),
+        ("memset into an input", with_step(memset_step(("x", whole)))),
+        ("memset into a weight", with_step(memset_step(("w_ln1", whole)))),
+        ("memset into a device scalar", with_step(memset_step(("n", whole)))),
+        ("memset of the workspace", with_step(memset_step(("workspace", whole)))),
+        ("memset with an entry", with_step(memset_step(("t0", whole), ("entry", "memset")))),
+        ("memset with a workspace", with_step(memset_step(("t0", whole), ("workspace", "workspace")))),
+        ("memset with its argument named src", with_step(lambda m: {"kind": "memset", "args": [arg("src", "t0")]})),
+        ("memset with two arguments", with_step(lambda m: {"kind": "memset", "args": [arg("dst", "t0"), arg("dst2", "t1")]})),
+        ("memset in one bucket only", with_step(memset_step(("t0", whole)), buckets=[1])),
+        ("memset kind is not a string", with_step(lambda m: {"kind": ["memset"], "args": [arg("dst", "t0")]})),
+    ]
+
+
+def carried(name, offset=None):
+    """The buffer ``name`` made a carried buffer (role ``carried``, its offset ``offset``: ``None`` as the host places it)."""
+
+    def apply(doc):
+        doc["buffers"][buffer_index(doc, name)].update(role="carried", offset=offset)
+
+    return apply
+
+
+def carried_mutations():
+    """Carried buffers (role ``carried``, section 15.2): a parameter that steps read (provided, as an earlier execution on the arena wrote it), an
+    intermediate the steps write and read, one with an offset, a carried device scalar, a carried output (no longer an output), the workspace."""
+    return [
+        ("carried input", carried("x")),
+        ("carried weight", carried("w_qkv")),
+        ("carried with an offset", carried("x", 0)),
+        ("carried with an unaligned offset", carried("x", 100)),
+        ("carried intermediate", carried("t0")),
+        ("carried device scalar", carried("n")),
+        ("carried output", carried("out0")),
+        ("carried output not listed", lambda d: (carried("out0")(d), d.update(outputs=[]))),
+        ("carried workspace", carried("workspace")),
     ]
 
 

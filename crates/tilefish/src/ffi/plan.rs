@@ -187,6 +187,15 @@ pub(crate) fn enqueue_steps(stream: &CudaStream, steps: &[Ready<'_>]) -> Result<
                 unsafe { result::memcpy_dtod_async(*dst, *src, *bytes, stream.cu_stream()) }
                     .map_err(Error::driver("cuMemcpyDtoDAsync"))?;
             }
+            Ready::Memset { dst, bytes } => {
+                stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+                // SAFETY: `dst` is the first byte of the argument of a memset step, checked by the run to lie inside its buffer (an external the
+                // call borrows, or a region of the arena) with `bytes` bytes; the stream is a live cudarc stream of the plan's context, current on
+                // this thread. A capturing stream records the memset as a memset node, with this address, held as the doc comment of this function
+                // says.
+                unsafe { result::memset_d8_async(*dst, 0, *bytes, stream.cu_stream()) }
+                    .map_err(Error::driver("cuMemsetD8Async"))?;
+            }
         }
     }
     Ok(())

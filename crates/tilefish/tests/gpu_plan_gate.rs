@@ -1715,3 +1715,144 @@ fn launches_and_replays_allocate_nothing_and_their_time_is_reported() {
         drop(graph);
     }
 }
+
+// -- carried buffers: the plans of a set handing buffers of their arena to each other ----------------------------------------------------------------
+
+/// The `carried` section of `plans.json` (`rust_gate.py`'s `prepare_carried`).
+fn carried_doc() -> Value {
+    let text = std::fs::read_to_string(gate_dir().join("plans.json")).expect("plans.json (run rust_gate.py prepare)");
+    let doc: Value = serde_json::from_str(&text).expect("plans.json is JSON");
+    doc["carried"].clone()
+}
+
+/// The plans of `plans/carried` (`gpu_kernels_plans.CARRIED_SET`, `docs/plan-schema-1.md` section 15.2) instantiated on one `SharedArena`
+/// (`PlanSet::instantiate`) and called in the order `rust_gate.py` called them (`CARRIED_CALLS`): a stage writes `h` into the arena's carried region,
+/// the next reads it (`stage_b` is given nothing but its output: its dimension is the size `h` was written with), another updates it in place, zeroes
+/// it (a memset of the carried buffer) or writes the other carried buffer `g`. Every call's outputs are Python's bytes, launched, and again on a fresh
+/// arena with each call captured in a graph and replayed (the replay checks and writes what the carried buffers hold). The arena has the bytes of
+/// the largest plan's region and of the carried regions after it (`g`, then `h`).
+#[test]
+fn carried_buffers_handed_from_plan_to_plan_on_a_shared_arena_are_pythons_bytes() {
+    let gpu = Gpu::new();
+    let doc = carried_doc();
+    let set =
+        PlanSet::load(gate_dir().join(doc["dir"].as_str().unwrap()), Pin::Digest(doc["set_digest"].as_str().unwrap()))
+            .expect("the carried set loads with its pin");
+    let graphs: Vec<&str> = doc["graphs"].as_array().unwrap().iter().map(|g| g.as_str().unwrap()).collect();
+    let calls = doc["calls"].as_array().unwrap();
+    for (subdir, captured) in [("rust_carried", false), ("rust_carried_graph", true)] {
+        let runs = set.instantiate(&gpu.stream, &graphs).expect("the stages instantiate on one arena");
+        let layout = runs.arena().carried().clone();
+        assert_eq!(runs.arena().bytes(), layout.total);
+        assert_eq!(layout.regions.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["g", "h"]);
+        for call in calls {
+            let id = call["id"].as_str().unwrap();
+            let run = runs.run(call["graph"].as_str().unwrap()).unwrap();
+            let mut exts = upload(&gpu.stream, call);
+            if captured {
+                let mut graph =
+                    run.capture(&gpu.stream, args(&mut exts, false), &[]).unwrap_or_else(|e| panic!("{id}: {e}"));
+                graph.replay(&gpu.stream).unwrap_or_else(|e| panic!("{id}: {e}"));
+                gpu.stream.synchronize().unwrap();
+                drop(graph);
+            } else {
+                run.launch(&gpu.stream, &mut args(&mut exts, false), &[]).unwrap_or_else(|e| panic!("{id}: {e}"));
+                gpu.stream.synchronize().unwrap();
+            }
+            for e in exts.iter().filter(|e| e.expect.is_some()) {
+                let got = gpu.stream.clone_dtoh(&e.slice).unwrap();
+                write_out(subdir, id, &e.name, &got);
+                let expect = e.expect.as_ref().unwrap();
+                assert!(
+                    got == *expect,
+                    "{id}: {subdir}: '{}' differs from Python's in {} bytes",
+                    e.name,
+                    differing(&got, expect)
+                );
+            }
+        }
+    }
+    // a fresh arena: stage_b reads h, which no call wrote, so nothing binds its dimension; stage_update reads it before it writes it, and is
+    // refused before anything is enqueued (its output stays zero); after stage_a wrote 8 rows, stage_update of 24 rows is refused too
+    let fresh = set.instantiate(&gpu.stream, &graphs).unwrap();
+    let call_of = |graph: &str| calls.iter().find(|c| c["graph"] == graph).unwrap();
+    let mut exts = upload(&gpu.stream, call_of("stage_b"));
+    let e = fresh.run("stage_b").unwrap().launch(&gpu.stream, &mut args(&mut exts, false), &[]).unwrap_err();
+    assert!(matches!(e, Error::Precondition { kind: PreconditionKind::Bucket, .. }), "{e}");
+    let mut exts = upload(&gpu.stream, call_of("stage_update"));
+    let e = fresh.run("stage_update").unwrap().launch(&gpu.stream, &mut args(&mut exts, false), &[]).unwrap_err();
+    assert!(e.to_string().contains("no execution on this arena has written it"), "{e}");
+    gpu.stream.synchronize().unwrap();
+    for e in exts.iter().filter(|e| e.role == "output") {
+        assert!(gpu.stream.clone_dtoh(&e.slice).unwrap().iter().all(|b| *b == 0), "a refused call wrote '{}'", e.name);
+    }
+    let mut exts = upload(&gpu.stream, &calls[0]);
+    assert_eq!(calls[0]["graph"], "stage_a");
+    fresh.run("stage_a").unwrap().launch(&gpu.stream, &mut args(&mut exts, false), &[]).unwrap();
+    let wide = calls.iter().find(|c| c["graph"] == "stage_update" && c["externals"][0]["shape"][0] == 24).unwrap();
+    let mut exts = upload(&gpu.stream, wide);
+    let e = fresh.run("stage_update").unwrap().launch(&gpu.stream, &mut args(&mut exts, false), &[]).unwrap_err();
+    assert!(matches!(e, Error::Precondition { kind: PreconditionKind::Shape, .. }), "{e}");
+    // a plan alone has its carried buffer in an arena of its own (after its own region): stage_a launches on it
+    let alone = set.plan("stage_a").unwrap().instantiate_all(&gpu.stream).unwrap();
+    assert_eq!(alone.arena_bytes(), 24 * 64 * 4);
+    let mut exts = upload(&gpu.stream, &calls[0]);
+    alone.launch(&gpu.stream, &mut args(&mut exts, false), &[]).unwrap();
+    gpu.stream.synchronize().unwrap();
+    println!(
+        "rust plan gate: {} calls handing carried buffers from plan to plan on one shared arena of {} bytes (carried {:?}), launched and replayed: \
+         Python's bytes",
+        calls.len(),
+        layout_total(&set, &graphs),
+        set.plan("stage_a").unwrap().carried().collect::<Vec<_>>()
+    );
+}
+
+fn layout_total(set: &PlanSet, graphs: &[&str]) -> u64 {
+    set.shared_arena_bytes(graphs).unwrap()
+}
+
+/// An arena per lane: two `SetRun`s of the carried set (each its own `SharedArena`, its own stream, its own carried buffers), driven from two
+/// threads at once, each making every call of `CARRIED_CALLS` in order, three times: every output of both lanes is Python's. The two arenas are
+/// not ordered with each other (nothing makes one lane wait for the other), and a lane's `h` is never the other's.
+#[test]
+fn two_lanes_of_the_carried_set_each_on_its_own_arena_from_two_threads_give_pythons_bytes() {
+    let gpu = Gpu::new();
+    let doc = carried_doc();
+    let set =
+        PlanSet::load(gate_dir().join(doc["dir"].as_str().unwrap()), Pin::Digest(doc["set_digest"].as_str().unwrap()))
+            .expect("the carried set loads with its pin");
+    let graphs: Vec<&str> = doc["graphs"].as_array().unwrap().iter().map(|g| g.as_str().unwrap()).collect();
+    let calls = doc["calls"].as_array().unwrap();
+    let rounds = 3;
+    let lane = |k: usize| -> (u64, usize) {
+        let stream = gpu.ctx.new_stream().unwrap();
+        let runs = set.instantiate(&stream, &graphs).unwrap();
+        let mut wrong = 0;
+        for _ in 0..rounds {
+            for call in calls {
+                let mut exts = upload(&stream, call);
+                runs.run(call["graph"].as_str().unwrap())
+                    .unwrap()
+                    .launch(&stream, &mut args(&mut exts, false), &[])
+                    .unwrap_or_else(|e| panic!("lane {k}, {}: {e}", call["id"]));
+                stream.synchronize().unwrap();
+                for e in exts.iter().filter(|e| e.expect.is_some()) {
+                    wrong += usize::from(stream.clone_dtoh(&e.slice).unwrap() != *e.expect.as_ref().unwrap());
+                }
+            }
+        }
+        (runs.arena().address(), wrong)
+    };
+    let ((address0, wrong0), (address1, wrong1)) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| lane(0));
+        let second = scope.spawn(|| lane(1));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_ne!(address0, address1, "two lanes, two arenas");
+    assert_eq!((wrong0, wrong1), (0, 0), "outputs that are not Python's (lane 0, lane 1)");
+    println!(
+        "rust plan gate: two lanes of the carried set, each on a SharedArena of its own, from two threads: {} calls each, every output Python's",
+        rounds * calls.len()
+    );
+}

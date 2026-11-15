@@ -150,6 +150,16 @@ Validation rules that are new (Python: `Manifest._read`):
 * For `triton` the existing rule stands: an entry whose `shared` is 0 but whose cubin has a section `.nv.shared.<symbol>` is refused. **For `binary`
   it does not apply**: a hand-written kernel with *static* shared memory has that section too, and the declaration (`shared`) says how much
   *dynamic* shared memory it addresses; the loader's check (static + dynamic ≤ the device's opt-in maximum) is the guard.
+* **A `shared` that is nonzero but too small is not detected, and cannot be from the file.** Triton gives a kernel that needs shared memory an
+  `extern` array of *dynamic* shared memory, and the size is Triton's (`metadata.shared`, from its allocation of the TTGIR), which ptxas never sees:
+  the cubin does not record it. Measured on sm_103 with Triton 3.5.1 and ptxas 12.9 (`python/tests/test_gpu_shared_size.py`): three `tl.dot` kernels
+  whose `metadata.shared` are 16 400, 49 168 and 65 552 bytes have the same `.nv.shared.<symbol>` section (1024 bytes: the per-block system reserve
+  from sm_90 on), the same `.nv.info.<symbol>` attributes but for their parameter records, and the same static shared memory as the driver reports it
+  (`CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES`, 0). So a loader can check what the file says (the section, and `shared ≠ 0`; static + `shared` ≤ the
+  opt-in maximum) and no more; knowing the size again would mean compiling the kernel's TTGIR again at load (Python only, and seconds for a large
+  set), and a manifest whose `shared` was edited may as well have had its cubin replaced. What vouches for `shared` is what vouches for the cubin:
+  the pin (the manifest digest covers `shared`, and the export wrote Triton's value). Without a pin (`trust_directory=True`) the directory is
+  trusted for both. The test fails when a later Triton or ptxas records the size, and a check at load becomes possible then.
 * `toolchain` for `binary` is `{}` (a cubin used as it is) or `{"ptxas": <the `--version` text>}` (PTX that was assembled).
 
 ### 4.1 An implementation per architecture: `implementation` (tilefish 0.0.5, crate 0.0.3; names, prebuilt binaries and an ABI per implementation: unreleased)
@@ -1284,6 +1294,7 @@ descriptors, scalars, fixed arguments and views; and `ops=` checks each entry ag
 | top level, digest, the three additions, refusal of schema 2 | `test_manifest.py`, `test_manifest_schema3.py`, `test_rust_host.py` |
 | `kind`, `abi.scratch_slots`, prebuilt binary entries | `test_binary_externs.py`, `test_manifest_schema3.py` |
 | `cuda_math` (section 4.3) | `test_cudamath.py`, `crates/tilefish/tests/cuda_math.rs`; on a GPU `test_gpu_cuda_math.py` |
+| the cubin does not record the dynamic shared memory of a Triton kernel (`shared` too small is not detectable, section 4) | on a GPU `test_gpu_shared_size.py` |
 | strided pointers, `strides`/`offset`/`stride_of`, `max_extent`, alignment | `test_strided_specs.py`, `test_views.py`; on a GPU `test_gpu_strided.py` |
 | a stride that several views share (`stride_of` a list) | `test_shared_strides.py`, `test_rust_host_schema3.py`; on a GPU `test_gpu_shared_strides.py` |
 | a dimension only an `out` tensor determines (section 7) | `test_output_dims.py`; on a GPU `test_gpu_output_dims.py` |

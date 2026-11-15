@@ -91,6 +91,61 @@
       "w_down"
     ]
   },
+  "carried": {
+    "arch": "sm_103",
+    "arena_bytes": {
+      "stage_a": 0,
+      "stage_b": 0,
+      "stage_chain": 6144,
+      "stage_g": 0,
+      "stage_update": 0,
+      "stage_zero": 0
+    },
+    "carried": {
+      "g": [
+        6144,
+        6144,
+        "f32"
+      ],
+      "h": [
+        12288,
+        6144,
+        "f32"
+      ]
+    },
+    "carried_base": 6144,
+    "carried_of": {
+      "stage_a": [
+        "h"
+      ],
+      "stage_b": [
+        "h"
+      ],
+      "stage_chain": [
+        "h"
+      ],
+      "stage_g": [
+        "g"
+      ],
+      "stage_update": [
+        "h"
+      ],
+      "stage_zero": [
+        "h"
+      ]
+    },
+    "manifest_digest": "ae9a33f481d1458693dae2359a90c2415c68c6ab842cc8191d195dc6ad377d7c",
+    "plans": {
+      "stage_a": "a8dc0dea2ab7df63ddf18b274777b485ff4dc1bad633cbbd0b60abc2c83bbc6d",
+      "stage_b": "61bae3a5eed246c5c610d0cefc2e90e457d956c15360f8db6a0c8768469922c6",
+      "stage_chain": "d62572be3a70d88e380a19599e96de06dcf927c38c858c342160a9f8d7021fe5",
+      "stage_g": "6f96672212f757c98be2ec6c35f3c3ffbf99f7659fa34446aacd3f3dee54845d",
+      "stage_update": "6317213b604c38021bff84b40cf10ff9705574a3d272c66ee73b3c30ab3de24d",
+      "stage_zero": "6f9795de7ce0959c9f8e02a0d9f9ec2afc45066b7dbbcb6871feeb6d6ff2d715"
+    },
+    "set_digest": "43fa57fe0512ba027eaa72312efdee9e0ca56ce0c4a5faa883c525ba7a05a51c",
+    "shared_arena_bytes": 18432
+  },
   "given": {
     "arch": "sm_103",
     "arena_bytes": 6144,

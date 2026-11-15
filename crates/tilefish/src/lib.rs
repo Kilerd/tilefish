@@ -291,7 +291,7 @@ pub use manifest::{
 };
 pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, Plan, Prepared, TensorMapEncode};
-pub use plan_run::{CapturedPlan, DevScalar, PlanRun, SharedArena, Tap, WeightedRun};
+pub use plan_run::{CapturedPlan, CarriedLayout, DevScalar, PlanRun, SharedArena, Tap, WeightedRun};
 pub use plan_set::{PLAN_SET_NAME, PLAN_SET_SCHEMA, PlanSet, SetRun, plan_file_name, plan_set_digest};
 pub use region::DevicePtr;
 pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, Readable, TensorArg, TensorMut, TensorRef, U8};

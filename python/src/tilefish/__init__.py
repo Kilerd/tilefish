@@ -70,6 +70,7 @@ from .errors import (
     TilefishError,
     TilefishLoweringError,
     TilefishManifestError,
+    TilefishOrderWarning,
     TilefishPicklingError,
     TilefishPlanError,
     TilefishPreconditionError,
@@ -83,7 +84,7 @@ from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in __all__, `from tilefish import *` must not shadow the module copy
 from .ops import argmax, argmin, cos, div, erf, exp, fma, gather_rows, gelu, iota, load, neg, rcp, rsqrt, scatter_rows, silu, sin, sin_approx
-from .ops import sqrt, tanh, tree, where
+from .ops import sqrt, tanh, tree, where, zeros_like
 from ._copyops import col2im1d, contiguous, im2col, im2col1d
 from .ops import reduce_mean as mean
 from .runtime import capture, run
@@ -141,6 +142,7 @@ __all__ = [
     "TilefishError",
     "TilefishLoweringError",
     "TilefishManifestError",
+    "TilefishOrderWarning",
     "TilefishPicklingError",
     "TilefishPlanError",
     "TilefishPreconditionError",
@@ -198,4 +200,5 @@ __all__ = [
     "u8",
     "ue8m0",
     "where",
+    "zeros_like",
 ]

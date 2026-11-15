@@ -362,7 +362,11 @@ class GraphOp(Op):
 
     ``param_roles`` maps every read-only tensor parameter (not ``InOut``, not ``DevScalar``) to ``"input"`` (given at every call) or ``"weight"``
     (bound once by a host, at load), as ``@tilefish.graph(inputs=..., weights=...)`` declares them, or is ``None``: a launch plan then labels a
-    parameter by its shape (``weight`` when it mentions no dimension), which a host cannot rely on."""
+    parameter by its shape (``weight`` when it mentions no dimension), which a host cannot rely on.
+
+    ``carried`` are the tensor parameters (``In`` or ``InOut``) whose tensor the plan's arena holds instead of the caller
+    (``@tilefish.graph(carried=("h",))``): a run takes the other parameters, and the arena keeps the carried buffer between executions, so one plan
+    of a shared arena hands it to the next (``docs/plan-schema-1.md``, section 15.2)."""
 
     kind = "graph"
 
@@ -374,11 +378,13 @@ class GraphOp(Op):
         graph: Graph,
         output_names: "tuple[str, ...] | None" = None,
         param_roles: "dict[str, str] | None" = None,
+        carried: "tuple[str, ...]" = (),
     ) -> None:
         super().__init__(fn, name, signature)
         self.graph = graph
         self.output_names = output_names
         self.param_roles = param_roles
+        self.carried = carried
 
 
 class KernelOp(GraphOp):
@@ -504,7 +510,7 @@ def _param_roles(op: GraphOp, inputs: "tuple[str, ...] | None", weights: "tuple[
     if inputs is None and weights is None:
         return None
     params = {p.name: p for p in op.signature.params}
-    eligible = [p.name for p in op.signature.params if p.kind == "tensor" and p.access == "in" and not p.is_devscalar]
+    eligible = [p.name for p in op.signature.params if p.kind == "tensor" and p.access == "in" and not p.is_devscalar and p.name not in op.carried]
     for key, names in (("inputs", inputs), ("weights", weights)):
         for n in names or ():
             p = params.get(n)
@@ -514,6 +520,8 @@ def _param_roles(op: GraphOp, inputs: "tuple[str, ...] | None", weights: "tuple[
                 what = (
                     "a DevScalar (a value the host writes at every call)"
                     if p.kind == "tensor" and p.is_devscalar
+                    else "carried (the arena holds its tensor)"
+                    if n in op.carried
                     else f"an {p.access.capitalize()} parameter (the caller's tensor at every call)"
                     if p.kind == "tensor"
                     else "not a tensor"
@@ -536,10 +544,36 @@ def _param_roles(op: GraphOp, inputs: "tuple[str, ...] | None", weights: "tuple[
     return {n: ("weight" if n in weights else "input") for n in eligible}
 
 
-def _declare_graph(fn: Callable[..., Any], name: str | None, outputs: Any, inputs: Any = None, weights: Any = None) -> GraphOp:
+def _carried_params(op: GraphOp, names: "tuple[str, ...] | None") -> "tuple[str, ...]":
+    """The parameters ``@tilefish.graph(carried=...)`` names: tensor parameters, ``In`` or ``InOut``, not a ``DevScalar``, each once."""
+    if not names:
+        return ()
+    params = {p.name: p for p in op.signature.params}
+    for n in names:
+        p = params.get(n)
+        if p is None:
+            raise TilefishDeclarationError(f"graph '{op.name}': carried= names '{n}', which is not a parameter (the parameters are {', '.join(params)})")
+        if p.kind != "tensor" or p.is_devscalar or p.access not in ("in", "inout"):
+            if p.kind != "tensor":
+                what = "not a tensor"
+            elif p.is_devscalar:
+                what = "a DevScalar (a value the host writes at every call)"
+            else:
+                what = f"an {p.access.capitalize()} parameter"
+            raise TilefishDeclarationError(
+                f"graph '{op.name}': carried= names '{n}', which is {what}: a carried buffer is a tensor parameter, In (read) or InOut (written), "
+                "that the plan's arena holds"
+            )
+    return tuple(names)
+
+
+def _declare_graph(
+    fn: Callable[..., Any], name: str | None, outputs: Any, inputs: Any = None, weights: Any = None, carried: Any = None
+) -> GraphOp:
     names = None
     nm = name or getattr(fn, "__name__", "?")
     input_names, weight_names = _role_names(nm, "inputs", inputs), _role_names(nm, "weights", weights)
+    carried_names = _role_names(nm, "carried", carried)
     if outputs is not None:
         if isinstance(outputs, (str, bytes)) or not isinstance(outputs, (list, tuple)):
             raise TilefishDeclarationError(f"graph '{nm}': outputs= is a list of the names of the returned values, in order, got {outputs!r}")
@@ -561,6 +595,7 @@ def _declare_graph(fn: Callable[..., Any], name: str | None, outputs: Any, input
                 "named apart from them"
             )
         op.output_names = names
+    op.carried = _carried_params(op, carried_names)
     op.param_roles = _param_roles(op, input_names, weight_names)
     return op
 
@@ -572,6 +607,7 @@ def graph(
     outputs: "Sequence[str] | None" = None,
     inputs: "Sequence[str] | None" = None,
     weights: "Sequence[str] | None" = None,
+    carried: "Sequence[str] | None" = None,
 ) -> Any:
     """``@tilefish.graph``: trace and type-check a model body.
 
@@ -582,11 +618,16 @@ def graph(
     host binds once, when it loads the model (the weights). One list makes the rest of those parameters the other role; two must name every one
     of them once. A launch plan records the roles (``"roles": "declared"``), so a host can bind the weights once per instantiation and only the
     inputs per launch or capture (``tilefish.runtime.bind_weights``; Rust ``PlanRun::bind_weights``). Without either list a plan labels a
-    parameter by its shape (``weight`` when it mentions no dimension), as before, and those labels are not a contract."""
+    parameter by its shape (``weight`` when it mentions no dimension), as before, and those labels are not a contract.
+
+    ``carried=("h",)`` names tensor parameters (``In`` or ``InOut``) whose tensor the plan's **arena** holds, not the caller: a run takes the other
+    parameters, a plan that writes ``h`` leaves it in the arena, and a later execution on the same arena (of this plan, or of another plan of a
+    shared arena that names ``h`` too) reads it there: stage A hands an intermediate to stage B without a tensor of the caller's
+    (``docs/plan-schema-1.md``, section 15.2). ``reference`` mode, which has no arena, takes it as an argument like any other."""
     _check_decorator_arg("graph", fn)
     if fn is None:
-        return lambda f: _declare_graph(f, name, outputs, inputs, weights)
-    return _declare_graph(fn, name, outputs, inputs, weights)
+        return lambda f: _declare_graph(f, name, outputs, inputs, weights, carried)
+    return _declare_graph(fn, name, outputs, inputs, weights, carried)
 
 
 def kernel(

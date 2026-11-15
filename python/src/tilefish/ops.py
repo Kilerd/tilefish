@@ -1254,6 +1254,30 @@ def copy(x: Any) -> Value:
     return out
 
 
+def zeros_like(x: Any, *, dtype: "DType | None" = None) -> Value:
+    """``tilefish.zeros_like(x)``: a new contiguous tensor of the shape of ``x`` (and its dtype, or ``dtype``) whose bytes are all zero, for a graph
+    body.
+
+    Only the shape of ``x`` is used (nothing is read). A launch plan makes it a **memset step** (``cuMemsetD8Async`` of the buffer's bytes to 0) into a
+    buffer of its own, which an in-place call may then update (an accumulator) or which may be returned (the caller's output is the buffer the memset
+    writes). ``param[...] = tilefish.zeros_like(param)`` into an ``InOut`` parameter is one memset of the caller's tensor. Zero bytes are ``+0.0`` for a
+    float and ``0`` for an integer. A kernel body has no memset: it computes its values.
+    """
+    x = _require_value("zeros_like", "the tensor", x)
+    if x.ctx.kind != "graph":
+        raise TilefishTypeError(
+            "zeros_like is an op of a graph body (a memset step of a launch plan); a kernel body computes its values (tilefish.where(mask, x, 0.0), say)"
+        )
+    t = x.type
+    want = t.dtype if dtype is None else dtype
+    if isinstance(want, BlockScaled) or not isinstance(want, DType) or want.is_bool:
+        raise TilefishTypeError(f"zeros_like: the dtype is a dtype with a storage type (bf16, f16, f32, i32, i64, u8, e4m3, e5m2), got {want!r}")
+    if t.devscalar:
+        raise TilefishTypeError(f"zeros_like: {x.ref} is a DevScalar (one element the host writes); a zeroed tensor has the shape of a tensor")
+    (out,) = x.ctx.emit("zeros", [], {}, [TensorType(t.shape, want)])
+    return out
+
+
 # -- stores ----------------------------------------------------------------------------
 
 
@@ -1277,6 +1301,10 @@ def store(target: Any, key: Any, value: Any) -> None:
     earlier, a no-op cast of the parameter) raises and points to ``.live``, instead of needing a hidden
     copy at lowering time. The name of the parameter follows its newest version. The stored ``value`` is
     only copied and is not consumed (``x[...] = x`` is the one case where it is the replaced version).
+
+    In a graph body the stored value may be a view that is not dense (a transpose, a column block) of the
+    parameter's shape and dtype: a launch plan copies it through ``tilefish.contiguous``. A kernel body stores
+    a value of the parameter's type only.
     """
     if not isinstance(target, Value):
         raise TilefishTypeError(f"store: target must be a traced tensor, got {type(target).__name__}")
@@ -1289,7 +1317,18 @@ def store(target: Any, key: Any, value: Any) -> None:
     value = _require_value("store", "the stored value", value)
     if value.ctx is not target.ctx:
         raise TilefishTypeError(f"store into '{target.name}': the stored value belongs to a different trace")
-    if value.type != target.type:
+    # In a graph body a view that is not dense may be stored into an InOut parameter of its shape and dtype: a launch plan copies it through
+    # tilefish.contiguous, as it materialises a returned view that is not dense. A kernel body has no such copy.
+    graph_view = (
+        target.ctx.kind == "graph"
+        and target.access == "inout"
+        and not value.type.contiguous
+        and not value.type.devscalar
+        and not target.type.devscalar
+        and value.type.shape == target.type.shape
+        and value.dtype == target.dtype
+    )
+    if value.type != target.type and not graph_view:
         hint = ""
         if not value.type.contiguous:
             hint = "; a strided view cannot be stored (a store copies a contiguous tensor): combine it in an elementwise op first (x + 0 is a copy)"

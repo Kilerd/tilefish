@@ -45,7 +45,10 @@
 //! of a set: [`PlanSet::instantiate`](crate::PlanSet::instantiate)) can be instantiated on one arena of the largest one's bytes
 //! ([`LaunchPlan::instantiate_in`]), each with its buffers at its own offsets from the first byte. Their instantiations hold the one arena, with
 //! its one lock and its one order event, so everything above is said of all of them together: a launch, a replay or a `launch_step` of any
-//! plan of the arena is ordered with those of every other, and they never overlap on the device. Nothing in the arena outlives a launch.
+//! plan of the arena is ordered with those of every other, and they never overlap on the device. Nothing in the plans' own regions outlives a
+//! launch; a **carried buffer** (`docs/plan-schema-1.md` section 15.2) lives in a region of the arena after them ([`CarriedLayout`]), and the arena
+//! notes, in the order of the executions, what each holds: a launch or a replay that reads one it does not hold in the right shape is refused.
+//! Every arena is its own: executions that must run concurrently take an instantiation (or a [`SharedArena`]) each.
 //!
 //! What is not this module's: the ordering of a use of an external that is not a launch of this crate (cudarc's tracking, or the host's), as
 //! everywhere in the crate.
@@ -178,6 +181,11 @@ pub(crate) enum Ready<'r> {
         dst: u64,
         bytes: usize,
     },
+    /// A memset step: `bytes` bytes at `dst` set to zero, checked to be inside its buffer.
+    Memset {
+        dst: u64,
+        bytes: usize,
+    },
 }
 
 /// The value of one device scalar, at its slot of the arena.
@@ -196,6 +204,8 @@ enum Op {
     Conv(Conv),
     /// A copy step: no binary.
     Copy,
+    /// A memset step: no binary.
+    Memset,
 }
 
 /// One pointer argument of a step at one bucket: the buffer, the shape, and the view (none: the whole buffer, dense).
@@ -241,6 +251,9 @@ struct Arena {
     staging: Option<ffi::plan::Staging>,
     /// What orders the executions on the arena (none for an arena of no bytes: its executions share no memory).
     order: Option<Order>,
+    /// What each carried buffer holds, in the order the executions on the arena were issued (under the lock, which is the order they run in):
+    /// the shape at the bucket of the execution that wrote it last. Absent when no execution wrote it, or one that wrote it failed.
+    carried: HashMap<String, Vec<usize>>,
 }
 
 /// The order of the executions on an arena: its **order event**, recorded on an execution's stream after the execution, and waited for by the
@@ -302,6 +315,62 @@ impl Order {
     }
 }
 
+/// Where the carried buffers of the plans of one arena are (`docs/plan-schema-1.md`, section 15.2): after the plans' own regions.
+///
+/// `base` is the largest `arena_bytes` of the plans (each plan's buffers keep their offsets from the arena's first byte, below it); every carried
+/// name of any of the plans has one region from there, in code point order of the names, each `bytes` rounded up to 256 long, where `bytes` is the
+/// largest the plans give the name. A function of the plans' documents alone, which their digests cover (Python's `carried_layout`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriedLayout {
+    /// The largest `arena_bytes` of the plans: where the carried regions begin.
+    pub base: u64,
+    /// `(name, offset from the arena's first byte, bytes, dtype)` of every carried buffer, in code point order of the names.
+    pub regions: Vec<(String, u64, u64, DType)>,
+    /// The bytes of the arena: `base` and the carried regions.
+    pub total: u64,
+}
+
+impl CarriedLayout {
+    /// The layout of an arena of `plans` (one plan for an arena of its own). Two plans that give one carried name two dtypes are refused: a carried
+    /// buffer is one tensor of the arena.
+    pub fn of(plans: &[&LaunchPlan]) -> Result<Self> {
+        let base = plans.iter().map(|p| p.arena_bytes()).max().unwrap_or(0);
+        let mut found: Vec<(String, u64, DType, String)> = Vec::new(); // name, bytes, dtype, the graph that gave the dtype
+        for p in plans {
+            for b in p.buffers().iter().filter(|b| b.role == BufferRole::Carried) {
+                match found.iter_mut().find(|(n, ..)| *n == b.name) {
+                    Some((_, _, dtype, graph)) if *dtype != b.dtype => {
+                        return Err(Error::Launch(format!(
+                            "the carried buffer '{}' is {} in the plan of graph '{graph}' but {} in the plan of graph '{}': the plans of one arena \
+                             name one tensor by a carried name (give them one dtype, or another name)",
+                            b.name,
+                            dtype.name(),
+                            b.dtype.name(),
+                            p.graph()
+                        )));
+                    }
+                    Some((_, bytes, ..)) => *bytes = (*bytes).max(b.bytes),
+                    None => found.push((b.name.clone(), b.bytes, b.dtype, p.graph().to_owned())),
+                }
+            }
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        let align = |n: u64| n.div_ceil(crate::launch_plan::ARENA_ALIGNMENT) * crate::launch_plan::ARENA_ALIGNMENT;
+        let mut cursor = align(base);
+        let mut regions = Vec::with_capacity(found.len());
+        for (name, bytes, dtype, _) in found {
+            regions.push((name, cursor, bytes, dtype));
+            cursor += align(bytes);
+        }
+        Ok(Self { base, regions, total: cursor })
+    }
+
+    /// The offset of the carried buffer `name` from the arena's first byte.
+    pub fn offset(&self, name: &str) -> Option<u64> {
+        self.regions.iter().find(|(n, ..)| n == name).map(|(_, offset, ..)| *offset)
+    }
+}
+
 /// An arena and what orders the executions on it: the memory of the intermediates, the device-scalar slots and the cuBLASLt workspace of the
 /// one plan of an instantiation, or of the plans of a [`SharedArena`], which run on it one at a time, each with its own layout from the first
 /// byte. Every launch, replay and `launch_step` of every instantiation on it takes the one lock (`state`) and is ordered by the one order event
@@ -320,6 +389,8 @@ struct ArenaCore {
     /// The plans that may be instantiated on the arena, `(graph, plan digest)`, when it is a [`SharedArena`]'s; empty for the arena of one
     /// instantiation.
     members: Vec<(String, String)>,
+    /// Where the carried buffers of its plans are.
+    carried: CarriedLayout,
 }
 
 impl Drop for ArenaCore {
@@ -337,13 +408,15 @@ impl Drop for ArenaCore {
 }
 
 impl ArenaCore {
-    /// Allocate `bytes` bytes on `stream` (aligned to 256), and the pinned staging memory of the device scalars when `devscalars`.
+    /// Allocate the bytes of `carried` (the plans' regions and the carried ones) on `stream` (aligned to 256), and the pinned staging memory of
+    /// the device scalars when `devscalars`.
     fn allocate(
         stream: &Arc<CudaStream>,
-        bytes: u64,
+        carried: CarriedLayout,
         devscalars: bool,
         members: Vec<(String, String)>,
     ) -> Result<Arc<Self>> {
+        let bytes = carried.total;
         let ctx = Arc::clone(stream.context());
         let arena_bytes = usize::try_from(bytes)
             .map_err(|_| Error::Unsupported("the arena does not fit the address space".to_owned()))?;
@@ -366,11 +439,12 @@ impl ArenaCore {
             context: Arc::clone(&ctx),
             home: Arc::clone(stream),
             device: ctx.ordinal() as i32,
-            state: Mutex::new(Arena { slice, slots_of: 0, staging, order }),
+            state: Mutex::new(Arena { slice, slots_of: 0, staging, order, carried: HashMap::new() }),
             addr,
             bytes,
             captures: AtomicU64::new(0),
             members,
+            carried,
         }))
     }
 
@@ -391,7 +465,7 @@ impl ArenaCore {
     fn shared_note(&self) -> &'static str {
         if self.shared() {
             " (the arena is shared with other plans, which write all of its bytes: a value that outlives a launch is a returned value, in a \
-             tensor of the caller)"
+             tensor of the caller, or a carried buffer of the arena)"
         } else {
             ""
         }
@@ -406,8 +480,12 @@ struct Instance {
     by_name: HashMap<String, usize>,
     /// The dimensions, numbered in the order of the plan's `dims` (what the externals' shapes bind).
     syms: Symbols,
-    /// The shape of every external, as patterns over the dimensions (empty for an arena buffer).
+    /// The shape of every external and every carried buffer, as patterns over the dimensions (empty for an arena buffer).
     patterns: Vec<Vec<Pattern>>,
+    /// The carried buffers the steps read before any of them writes them (an earlier execution on the arena must have written them, in the
+    /// shape this one reads: the dimensions are bound from it), and the ones a step writes. The same in every bucket.
+    carried_reads: Vec<usize>,
+    carried_writes: Vec<usize>,
 }
 
 impl Drop for Instance {
@@ -451,9 +529,16 @@ impl Instance {
 /// of one instantiation are: they cannot run concurrently. A replay of plan A's graph is ordered with every launch and replay of plan B. Plans
 /// of the arena may be captured at the same time from several threads, each on a stream of its own.
 ///
-/// **What outlives a launch.** Nothing in the arena: the next execution, of any plan of the arena, writes over it. A value one plan makes and a
-/// later plan reads is a **returned value** of the first (a tensor of the caller's) given as an external of the second. A tensor of the caller
-/// that overlaps the arena anywhere (not only the part of the plan that runs), an external, a tap or a tensor of `launch_step`, is refused.
+/// **What outlives a launch.** In the plans' own regions, nothing: the next execution, of any plan of the arena, writes over it. A value one plan
+/// makes and a later plan reads is a **returned value** of the first (a tensor of the caller's) given as an external of the second, or a
+/// **carried buffer** (section 15.2: a buffer of role `carried`, which the arena holds in a region of its own after the plans' regions,
+/// [`SharedArena::carried`], shared by every plan of the arena that names it and by no other buffer). A launch or a replay that reads a carried
+/// buffer is refused unless the executions issued before it on the arena left it in the shape it reads. A tensor of the caller that overlaps the
+/// arena anywhere (not only the part of the plan that runs), an external, a tap or a tensor of `launch_step`, is refused.
+///
+/// **Several arenas.** Every `SharedArena::new` (and every [`LaunchPlan::instantiate`]) allocates an arena of its own, with its own lock, order
+/// event and carried buffers: executions on one arena run one after the other, executions on two arenas run concurrently. A host that runs the same
+/// plans on several streams at once makes an arena per stream.
 ///
 /// Cheap to clone (the clones are one arena); the arena is freed with the last of its clones and of the instantiations on it, after its last
 /// execution is complete.
@@ -464,11 +549,13 @@ pub struct SharedArena {
 
 impl SharedArena {
     /// Allocate the arena of `plans` on `stream` (which it is freed on; the first execution on that stream does not wait for the allocation):
-    /// the bytes of the largest of their arenas ([`SharedArena::bytes_for`]), with the pinned staging memory of the device scalars when some
-    /// plan has one. Every plan must be for the architecture of the stream's device; the plans are given each once (by graph name). Refused on
-    /// the per-thread default stream and on a stream that is capturing a CUDA graph.
+    /// the bytes of the largest of their arenas and of their carried buffers ([`SharedArena::bytes_for`]), with the pinned staging memory of
+    /// the device scalars when some plan has one. Every plan must be for the architecture of the stream's device; the plans are given each
+    /// once (by graph name), and give a carried name one dtype. Refused on the per-thread default stream and on a stream that is capturing a
+    /// CUDA graph.
     pub fn new(stream: &Arc<CudaStream>, plans: &[&LaunchPlan]) -> Result<Self> {
-        let bytes = Self::bytes_for(plans)?;
+        Self::bytes_for(plans)?;
+        let carried = CarriedLayout::of(plans)?;
         ffi::refuse_per_thread(stream, std::iter::empty())?;
         let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
         if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
@@ -488,11 +575,12 @@ impl SharedArena {
         }
         let devscalars = plans.iter().any(|p| p.buffers().iter().any(|b| b.role == BufferRole::Devscalar));
         let members = plans.iter().map(|p| (p.graph().to_owned(), p.digest().to_owned())).collect();
-        Ok(Self { core: ArenaCore::allocate(stream, bytes, devscalars, members)? })
+        Ok(Self { core: ArenaCore::allocate(stream, carried, devscalars, members)? })
     }
 
     /// The bytes of the arena `plans` share: the largest `arena_bytes` of their documents (each plan's buffers keep their offsets, from the
-    /// arena's first byte). Refused for no plan, and for a graph given twice. Needs no GPU.
+    /// arena's first byte), and the regions of their carried buffers after it ([`CarriedLayout`]). Refused for no plan, for a graph given twice
+    /// and for a carried name given two dtypes. Needs no GPU.
     pub fn bytes_for(plans: &[&LaunchPlan]) -> Result<u64> {
         if plans.is_empty() {
             return Err(Error::Launch(
@@ -507,12 +595,17 @@ impl SharedArena {
                 )));
             }
         }
-        Ok(plans.iter().map(|p| p.arena_bytes()).max().unwrap_or(0))
+        Ok(CarriedLayout::of(plans)?.total)
     }
 
     /// The bytes of the arena.
     pub fn bytes(&self) -> u64 {
         self.core.bytes
+    }
+
+    /// Where the carried buffers of the arena's plans are (after the plans' own regions).
+    pub fn carried(&self) -> &CarriedLayout {
+        &self.core.carried
     }
 
     /// The device address of the arena's first byte (0 when it has no bytes): a host's own memory must not overlap
@@ -608,6 +701,51 @@ impl LaunchPlan {
         let all: Vec<usize> = (0..self.buckets().len()).collect();
         PlanRun::new(self, Place::Shared(arena), &all)
     }
+}
+
+/// `(reads, writes)` of a plan's carried buffers (indices of [`LaunchPlan::buffers`]; Python's `carried_uses`): the ones whose first use in the
+/// steps of the first bucket is a read (a pointer of the entry that is `in` or `inout`, an operand of a library step, the source of a copy), and the
+/// ones a step writes. The bindings and the access of every pointer are the same in every bucket.
+fn carried_uses(plan: &LaunchPlan) -> (Vec<usize>, Vec<usize>) {
+    let buffers = plan.buffers();
+    let (mut reads, mut writes, mut seen) = (Vec::new(), Vec::new(), Vec::new());
+    if !buffers.iter().any(|b| b.role == BufferRole::Carried) {
+        return (reads, writes);
+    }
+    let Some(bucket) = plan.buckets().first() else { return (reads, writes) };
+    for st in &bucket.steps {
+        let access: Vec<Access> = match st.kind {
+            StepKind::Copy => vec![Access::In, Access::Out],
+            StepKind::Memset => vec![Access::Out],
+            StepKind::Library => {
+                st.args.iter().map(|a| if a.name == "out" { Access::Out } else { Access::In }).collect()
+            }
+            StepKind::Kernel => {
+                let entry = plan.manifest().entry(&st.entry, plan.arch()).expect("the reader checked the entry");
+                entry
+                    .params
+                    .iter()
+                    .filter_map(|p| match &p.kind {
+                        ParamKind::Pointer { access, .. } => Some(*access),
+                        _ => None,
+                    })
+                    .collect()
+            }
+        };
+        for (a, how) in st.args.iter().zip(access) {
+            if buffers[a.buffer].role != BufferRole::Carried {
+                continue;
+            }
+            if !seen.contains(&a.buffer) && how != Access::Out {
+                reads.push(a.buffer);
+            }
+            seen.push(a.buffer);
+            if how != Access::In && !writes.contains(&a.buffer) {
+                writes.push(a.buffer);
+            }
+        }
+    }
+    (reads, writes)
 }
 
 fn in_step(e: Error, what: &str) -> Error {
@@ -761,7 +899,7 @@ impl PlanRun {
         let mut patterns = Vec::with_capacity(buffers.len());
         for b in buffers {
             let mut axes = Vec::new();
-            if b.role.is_external() {
+            if b.role.is_host_placed() {
                 for (axis, d) in b.shape.iter().enumerate() {
                     axes.push(match d {
                         ShapeDim::Static(n) => Pattern::new(&n.to_string(), Expr::Num(i128::from(*n))),
@@ -786,6 +924,7 @@ impl PlanRun {
                 let key = (st.kind == StepKind::Library, st.entry.clone());
                 let op = match ops.get(&key) {
                     _ if st.kind == StepKind::Copy => Op::Copy, // a device-to-device copy: nothing to load
+                    _ if st.kind == StepKind::Memset => Op::Memset, // bytes set to zero: nothing to load either
                     Some(op) => op.clone(),
                     None => {
                         let op = match st.kind {
@@ -799,7 +938,7 @@ impl PlanRun {
                                 Op::Conv(plan.manifest().conv(&ctx, &st.entry, &[], arch)?)
                             }
                             StepKind::Library => Op::Gemm(plan.manifest().gemm(&ctx, &st.entry, &[], arch)?),
-                            StepKind::Copy => unreachable!("a copy step loads nothing"),
+                            StepKind::Copy | StepKind::Memset => unreachable!("a copy or a memset step loads nothing"),
                         };
                         ops.insert(key, op.clone());
                         op
@@ -823,6 +962,7 @@ impl PlanRun {
                 // inout pointers (the reader checked the arguments are the entry's pointers, in order)
                 let written: Vec<usize> = match st.kind {
                     StepKind::Copy => vec![st.args[1].buffer],
+                    StepKind::Memset => vec![st.args[0].buffer],
                     StepKind::Library => st.args.last().map(|a| a.buffer).into_iter().collect(),
                     StepKind::Kernel => {
                         let entry =
@@ -844,30 +984,52 @@ impl PlanRun {
             runs.push(BucketRun { index, steps });
         }
 
-        // -- the arena, once (or the shared one)
+        // -- the carried buffers the steps read first, and the ones they write (from the first bucket: the bindings, and the access of each
+        // pointer, are the same in every bucket)
+        let (carried_reads, carried_writes) = carried_uses(plan);
+
+        // -- the arena, once (or the shared one): the plan's region, then the regions of its carried buffers
         let arena = match place {
             Place::Own(stream) => ArenaCore::allocate(
                 stream,
-                plan.arena_bytes(),
+                CarriedLayout::of(&[plan])?,
                 buffers.iter().any(|b| b.role == BufferRole::Devscalar),
                 Vec::new(),
             )?,
             Place::Shared(shared) => Arc::clone(&shared.core),
         };
+        if let Some(b) =
+            buffers.iter().find(|b| b.role == BufferRole::Carried && arena.carried.offset(&b.name).is_none())
+        {
+            return Err(Error::Launch(format!(
+                "the arena has no region for the carried buffer '{}' of the plan of graph '{}'",
+                b.name,
+                plan.graph()
+            )));
+        }
         let arena_addr = arena.addr;
-        let run =
-            Self { inner: Arc::new(Instance { plan: plan.clone(), arena, buckets: runs, by_name, syms, patterns }) };
+        let place_of = |i: usize, b: &PlanBuffer| match (b.offset, b.role) {
+            (Some(offset), _) => arena_addr + offset,
+            (None, BufferRole::Carried) => arena_addr + arena.carried.offset(&b.name).expect("checked above"),
+            (None, _) => ((i as u64) + 1) << 44,
+        };
         // -- every step's preconditions that no address can change, with made-up addresses for the externals (Python's virtual ones, distinct
         // per buffer): a refusal comes now, not at the first launch
+        let bases: Vec<u64> = buffers.iter().enumerate().map(|(i, b)| place_of(i, b)).collect();
+        let run = Self {
+            inner: Arc::new(Instance {
+                plan: plan.clone(),
+                arena,
+                buckets: runs,
+                by_name,
+                syms,
+                patterns,
+                carried_reads,
+                carried_writes,
+            }),
+        };
         for (k, bucket) in run.inner.buckets.iter().enumerate() {
-            let bases: Vec<u64> = buffers
-                .iter()
-                .enumerate()
-                .map(|(i, b)| match b.offset {
-                    Some(offset) => arena_addr + offset,
-                    None => ((i as u64) + 1) << 44,
-                })
-                .collect();
+            let bases = bases.clone();
             run.ready(&Bound { bucket: k, bases, slots: Vec::new() })
                 .map_err(|e| in_step(e, &format!("at {}", describe_values(&plan.buckets()[bucket.index].values))))?;
         }
@@ -1018,6 +1180,19 @@ impl PlanRun {
                 pending.push((i, axis, actual));
             }
         }
+        // a carried buffer the plan reads before it writes it: the shape the arena's carried buffer was last written with (an execution in between
+        // that leaves another shape is refused under the arena's lock, before anything is enqueued)
+        if !inner.carried_reads.is_empty() {
+            let state = inner.lock_arena();
+            for &i in &inner.carried_reads {
+                if let Some(shape) = state.carried.get(&buffers[i].name).filter(|s| s.len() == inner.patterns[i].len())
+                {
+                    for (axis, size) in shape.iter().enumerate() {
+                        pending.push((i, axis, *size as i64));
+                    }
+                }
+            }
+        }
         loop {
             let mut progress = false;
             let mut rest = Vec::with_capacity(pending.len());
@@ -1131,9 +1306,13 @@ impl PlanRun {
         let bases = buffers
             .iter()
             .enumerate()
-            .map(|(i, b)| match b.offset {
-                Some(offset) => inner.arena.addr + offset,
-                None => tensor(i).ptr,
+            .map(|(i, b)| match (b.offset, b.role) {
+                (Some(offset), _) => inner.arena.addr + offset,
+                (None, BufferRole::Carried) => {
+                    inner.arena.addr
+                        + inner.arena.carried.offset(&b.name).expect("the arena has every carried buffer of the plan")
+                }
+                (None, _) => tensor(i).ptr,
             })
             .collect();
         Ok(Bound { bucket, bases, slots })
@@ -1266,7 +1445,11 @@ impl PlanRun {
     fn unsolvable(&self, buffer: usize, axis: usize, actual: i64, e: Unsolvable) -> Error {
         let b = &self.inner.plan.buffers()[buffer];
         let pattern = &self.inner.patterns[buffer][axis];
-        let head = format!("the external '{}' has size {actual} on axis {axis}", b.name);
+        let head = if b.role == BufferRole::Carried {
+            format!("the carried buffer '{}' was written with size {actual} on axis {axis}", b.name)
+        } else {
+            format!("the external '{}' has size {actual} on axis {axis}", b.name)
+        };
         let name = Some(b.name.as_str());
         match e {
             Unsolvable::Mismatch { expected } if pattern.is_static => Error::precondition(
@@ -1318,7 +1501,11 @@ impl PlanRun {
             |i: usize| combo.shapes[i].iter().product::<usize>() as u64 * plan.buffers()[i].dtype.size() as u64;
         {
             let step = &bucket.steps[si];
-            let stem = if matches!(step.op, Op::Copy) { "copy" } else { step.stem.as_str() };
+            let stem = match step.op {
+                Op::Copy => "copy",
+                Op::Memset => "memset",
+                _ => step.stem.as_str(),
+            };
             let what = format!("step #{si} ({stem}) at {}", describe_values(&combo.values));
             let mut args: Vec<TensorArg<'_>> = Vec::with_capacity(step.args.len() + 1);
             for a in &step.args {
@@ -1361,6 +1548,11 @@ impl PlanRun {
                         ));
                     }
                     Ready::Copy { src, dst, bytes }
+                }
+                Op::Memset => {
+                    // the dense bytes of dst set to zero: made a tensor of its region above (so it lies inside its buffer), dense by the reader
+                    let bytes = args[0].shape.iter().product::<usize>() * args[0].dtype.size();
+                    Ready::Memset { dst: args[0].ptr, bytes }
                 }
             })
         }
@@ -1508,7 +1700,54 @@ impl PlanRun {
     /// Check a call as [`PlanRun::launch`] does, and launch nothing.
     pub fn check(&self, externals: &[(&str, TensorArg<'_>)], devscalars: &[(&str, DevScalar)]) -> Result<()> {
         let bound = self.bind(externals, devscalars)?;
-        self.ready(&bound).map(drop)
+        self.ready(&bound)?;
+        self.check_carried(&self.inner.lock_arena(), bound.bucket)
+    }
+
+    /// Refuse an execution of the instantiated bucket `bucket` (under the arena's lock, before anything is enqueued) that reads a carried buffer
+    /// the executions issued before it on the arena have not left in the shape it reads.
+    fn check_carried(&self, arena: &Arena, bucket: usize) -> Result<()> {
+        let inner = &*self.inner;
+        let shapes = &inner.plan.buckets()[inner.buckets[bucket].index].shapes;
+        for &i in &inner.carried_reads {
+            let name = &inner.plan.buffers()[i].name;
+            let want = &shapes[i];
+            match arena.carried.get(name) {
+                Some(have) if have == want => {}
+                have => {
+                    let why = match have {
+                        None => "no execution on this arena has written it (launch a plan that writes it first: one that stores into it, zeroes it \
+                                 or updates it in place)"
+                            .to_owned(),
+                        Some(have) => format!("the execution on this arena that wrote it last left the shape {have:?}"),
+                    };
+                    return Err(Error::precondition(
+                        PreconditionKind::Shape,
+                        Some(name),
+                        format!(
+                            "the plan of graph '{}' reads the carried buffer '{name}' with the shape {want:?}, but {why}",
+                            inner.plan.graph()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// After an execution of the instantiated bucket `bucket` was enqueued (`done`) or failed: what the carried buffers it writes hold (its
+    /// shapes; unknown after a failure).
+    fn carried_written(&self, arena: &mut Arena, bucket: usize, done: bool) {
+        let inner = &*self.inner;
+        let shapes = &inner.plan.buckets()[inner.buckets[bucket].index].shapes;
+        for &i in &inner.carried_writes {
+            let name = inner.plan.buffers()[i].name.clone();
+            if done {
+                arena.carried.insert(name, shapes[i].clone());
+            } else {
+                arena.carried.remove(&name);
+            }
+        }
     }
 
     /// Run the plan on `stream`: the externals by name (`TensorRef` for a buffer the plan reads, `TensorMut` for one it writes: an `output` or
@@ -1561,6 +1800,7 @@ impl PlanRun {
         }
         let region = (self.inner.arena.addr, self.inner.arena.bytes);
         let mut arena = self.inner.lock_arena();
+        self.check_carried(&arena, bound.bucket)?;
         let launched = {
             let mut tensors: Vec<TensorArg<'_>> = externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
             tensors.extend(taps.iter_mut().map(|t| t.into.reborrow()));
@@ -1569,6 +1809,7 @@ impl PlanRun {
             })
         };
         arena.slots_of = 0;
+        self.carried_written(&mut arena, bound.bucket, launched.is_ok());
         launched
     }
 
@@ -1918,6 +2159,7 @@ impl<'ext> CapturedPlan<'ext> {
         let inner = &*self.run.inner;
         let region = (inner.arena.addr, inner.arena.bytes);
         let mut arena = inner.lock_arena();
+        self.run.check_carried(&arena, self.bucket)?;
         let write = !(self.current && arena.slots_of == self.id);
         let replayed = {
             let mut tensors: Vec<TensorArg<'_>> = self.externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
@@ -1928,6 +2170,7 @@ impl<'ext> CapturedPlan<'ext> {
                 ffi::plan::launch_graph(graph, captured_on, stream)
             })
         };
+        self.run.carried_written(&mut arena, self.bucket, replayed.is_ok());
         match replayed {
             Ok(()) => {
                 if write {

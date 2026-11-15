@@ -409,6 +409,13 @@ def copy_async(dst: int, src: int, nbytes: int, stream: int) -> None:
     _check(drv.cuMemcpyDtoDAsync(drv.CUdeviceptr(dst), drv.CUdeviceptr(src), nbytes, drv.CUstream(stream)), "cuMemcpyDtoDAsync")
 
 
+def memset_async(dst: int, nbytes: int, stream: int) -> None:
+    """Set ``nbytes`` bytes of device memory at ``dst`` to zero on ``stream`` (``cuMemsetD8Async``: stream-ordered, and a memset node of the graph when
+    the stream is being captured). The memset step of a launch plan."""
+    drv = _driver()
+    _check(drv.cuMemsetD8Async(drv.CUdeviceptr(dst), 0, nbytes, drv.CUstream(stream)), "cuMemsetD8Async")
+
+
 def synchronize_stream(stream: int) -> None:
     """Wait on the host until the work enqueued on ``stream`` is done (``cuStreamSynchronize``)."""
     drv = _driver()

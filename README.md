@@ -311,7 +311,10 @@ and pass it as `pin=` to refuse a directory that changed.
 holds is fine (a directory you wrote a moment ago); it does not combine with
 `pin=`. A pin vouches for the manifest, not for an IR digest that is known to
 differ, and not for a `shared` that is nonzero but too small for the kernel
-(nothing but the manifest says how much it needs). Triton's own JIT launcher,
+(nothing but the manifest says how much it needs: the cubin of a Triton kernel
+does not record its dynamic shared memory, measured in
+`python/tests/test_gpu_shared_size.py`; the export writes Triton's value, which
+the pin covers, and `trust_directory=True` trusts it with the cubins). Triton's own JIT launcher,
 which specializes on argument values, is not a mode. Neither `jit` nor `replay`
 needs a C compiler, and a `replay` of a generated kernel needs neither Triton nor
 `ptxas`.
@@ -779,11 +782,15 @@ graph replays byte-identically** (`runtime.prepare` does the allocating and the 
 capture). Every run of a plan on a device uses the one arena, so **runs of one plan on several streams (or threads) are ordered on the device** by an event of the arena: a run waits on its
 stream for the run before it and records the event after its last launch, so they never overlap and their results are correct, at the cost of running one after the other
 (a run on the stream of the event's last record skips the wait: runs that stay on one stream cost one `cuEventRecord` each).
+Runs that must run concurrently need an arena each: `lane = tilefish.runtime.share_arena([graph], name="lane1")` is another arena of the same plan
+(its own memory, lock and event; `lane.run(graph, x)` on its stream does not wait for the runs on the first), one per stream (Rust: one instantiation per lane).
 `tilefish.capture(graph, *inputs, devscalars=..., outputs=...)` captures the plan in a CUDA graph of its own: its `replay()` takes the arena's lock and waits for and records that event
 around the graph, as a run does, so **its replays are ordered with every run and replay of the plan, from any thread and on any stream**, and `set_devscalar` changes a device scalar for
 the next replays with no synchronization. A plan run inside your own `torch.cuda.graph(...)` captures too: the wait and the record are external event nodes of the graph, so its arena is
 the plan's arena and its replays are ordered with the runs whose record they see. But torch's `replay()` takes no lock: **a raw graph replayed while another thread is in the middle of a run
-of the same plan overlaps that run** (wrong bytes, no error), so order the two yourself or use `tilefish.capture`. `jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
+of the same plan overlaps that run** (wrong bytes, no error), so order the two yourself, replay with `tilefish.runtime.replay_graph(g)` (which takes the arena's lock around `g.replay()`), or use
+`tilefish.capture`. The second thread that uses an arena such a graph holds gets a `TilefishOrderWarning` (an error with `warnings.simplefilter("error", tilefish.TilefishOrderWarning)`).
+`jit` and `replay` are one code path over binaries from two places, so they are identical by construction, and the gate checks on a GPU that plan replay, plan jit and the per-op
 eager composition of the same ops give the same bytes for every bucket and two values of `n`.
 
 **An `Out` written over its input.** A hand-written kernel `k(x, r, y, r_out)` that reads every element of `r` before it writes the same element of `r_out`
@@ -795,7 +802,12 @@ buffer of its own; otherwise the result gets one, so the values are the same eit
 buffer of its own with `cuMemcpyDtoDAsync`, a memcpy node in a CUDA graph. The copy is an intermediate an in-place call may update, where `x`, the caller's,
 is never written. `state[...] = r` into an `InOut` parameter is a copy step into the caller's tensor. A copy of a view that is not dense is a launch of
 `tilefish.contiguous` instead (a strided view of rank 1 to 4 into a dense tensor), as the
-plan is made (`docs/plan-schema-1.md`, section 7.5).
+plan is made, and so is a store of one: `state[...] = t.permute(1, 0)` writes the transpose into the caller's tensor (`docs/plan-schema-1.md`, section 7.5).
+
+**Memset steps.** `acc = tilefish.zeros_like(x)` (or `zeros_like(x, dtype=i32)`) in a graph is a step of kind `memset`: a buffer of its own whose bytes are
+set to zero with `cuMemsetD8Async` (a memset node in a CUDA graph), which an in-place call may then accumulate into, or which the graph returns (the memset
+writes your output). `state[...] = tilefish.zeros_like(state)` is one memset of your `InOut` tensor. No kernel has to zero a buffer any more
+(`docs/plan-schema-1.md`, section 7.6).
 
 **Returned views.** A graph may return a reshape of a result at no cost (`return y.reshape(M, N)` of a flat `y`: the caller's output is `y`'s buffer, in the
 returned shape, and the step that writes it binds it through a flat view), and any other dense view, a parameter or a value twice, which a copy step after
@@ -822,9 +834,16 @@ arena: `s = tilefish.runtime.share_arena([a, b, c], mode="replay", plan="build/"
 `s.bind_weights(c, {...})`. The arena has the bytes of the largest plan's arena (the gate's transformer block cut into three stages: 9 109 504 bytes
 instead of 26 476 800), each plan's buffers at their own offsets in it, so the documents and their pins are unchanged and every plan captures at
 fixed addresses. Every run, capture and replay of any of the plans is ordered with all the others (one lock, one order event), so two of them never
-overlap on the device; nothing in the arena outlives a run (a value the next plan reads is a returned value, in your tensor), and a tensor of yours
-anywhere in the arena is refused. Rust: `set.instantiate(&stream, &["a", "b", "c"])`, a `SetRun` of `PlanRun`s on one `SharedArena`.
-`docs/plan-schema-1.md`, section 15.1.
+overlap on the device; nothing in the plans' own regions outlives a run, and a tensor of yours anywhere in the arena is refused. Rust:
+`set.instantiate(&stream, &["a", "b", "c"])`, a `SetRun` of `PlanRun`s on one `SharedArena`. `share_arena(..., name="lane1")` is another arena of the
+same plans, for a lane that runs concurrently. `docs/plan-schema-1.md`, section 15.1.
+
+**Carried buffers.** A stage can hand an intermediate to the next with no tensor of yours: `@tilefish.graph(carried=("h",))` on both graphs makes the
+parameter `h` a buffer the arena holds (role `carried`), in a region after the plans' own regions, the same for every plan of the arena that names it.
+`stage_a(x, h: InOut[...])` writes it (`h[...] = encode(x)`: the launch of `encode` writes the arena's `h` directly), `stage_b(h)` reads it, and a run gives
+every parameter but the carried ones: `s.run(stage_a, x)`, then `s.run(stage_b)`, whose sizes are the ones `h` was written with. A run that reads `h` before
+any run on the arena wrote it, or in another shape, is refused before anything is enqueued; the captures of `tilefish.capture` check and note `h` at every
+replay. Both hosts compute the same layout from the documents, which the pins cover (`docs/plan-schema-1.md`, section 15.2).
 
 **Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
 last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest

@@ -15,16 +15,17 @@ expression grammar, the `preconditions`, canonical JSON and the launch checks a 
 a manifest entry, checked and made exactly as a single launch is; the plan says which entry, with which memory.**
 
 Contents: 1 what a plan is made of; 2 the top level; 3 the digest and the pin; 4 strict reading; 5 dimensions, buckets and shape expressions; 6 buffers and the
-arena; 7 steps; 8 order, liveness and reuse; 9 what a host does; 10 CUDA graphs; 11 the Python API; 12 what a plan does not do (version 1); 13 an example; 14 where it
-is tested; 15 plan sets (several plans over one manifest), 15.1 an arena shared by the plans of a set.
+arena; 7 steps (7.5 copy steps, 7.6 memset steps); 8 order, liveness and reuse; 9 what a host does; 10 CUDA graphs; 11 the Python API; 12 what a plan does not do
+(version 1); 13 an example; 14 where it is tested; 15 plan sets (several plans over one manifest), 15.1 an arena shared by the plans of a set, 15.2 carried buffers.
 
 ## 1. What a plan is made of
 
 * **`dims`**: the dimensions of the graph (the free dimensions of its parameters' shapes), each with the list of sizes planned for it (its *buckets*). A bucket
   combination is one size for every dimension. There is one list of steps per combination, and a call selects one by the sizes of its tensors, which must equal a
   bucket exactly (there is no padding).
-* **`buffers`**: every tensor the plan names, in one table. A buffer is *external* (the caller provides it: a parameter or a returned value) or lives in the *arena*
-  (an intermediate, the slot of a device scalar, the workspace of the GEMMs). Its dtype and shape are fixed by the graph; the shape is an expression over `dims`.
+* **`buffers`**: every tensor the plan names, in one table. A buffer is *external* (the caller provides it: a parameter or a returned value), lives in the *arena*
+  (an intermediate, the slot of a device scalar, the workspace of the GEMMs), or is *carried* (a parameter whose tensor the arena holds between executions, in a
+  region the host places after the plans' own: section 15.2). Its dtype and shape are fixed by the graph; the shape is an expression over `dims`.
 * **`buckets[i].steps`**: the launches of one bucket combination, in order. A step names a manifest entry (`entry`, whose stem includes the entry's own buckets, such as
   `gemm_up.M64`) and binds each pointer parameter of that entry, in the order of the entry's ABI, to a buffer and, optionally, to a view of it.
 * **the memory plan**: `arena_bytes` and the `offset` of every arena buffer, in bytes from the start of the arena, aligned to 256, the same in every bucket.
@@ -125,10 +126,10 @@ magnitude, so that every language reads the same number); a file larger than
 | field | type and rule |
 |---|---|
 | `name` | string, an identifier, unique in the plan. The graph's parameters keep their own names; the returned values have the names the graph gives them (`@tilefish.graph(outputs=("y", "residual"))`, in the order it returns them) or, when it gives none, `out0`, `out1`, ...; an intermediate is `t0`, `t1`, ... in the order the steps make them, the workspace `workspace`. A name that would collide with a parameter's or a returned value's gets underscores. **A host takes a returned value by its name, or by `out<i>` for the `i`-th returned value whatever its name** (the name every returned value had before a graph could name them), when no buffer of the plan is called `out<i>` (Python `_plan.output_buffer`, Rust `LaunchPlan::output_buffer`). |
-| `role` | one of the seven below. |
+| `role` | one of the eight below. |
 | `dtype` | one of `bf16 f16 f32 i32 i64 u8 e4m3 e5m2` (the dtypes that have a storage type). |
 | `shape` | list of integers >= 1 and dimension expressions (section 5); `[]` for a device scalar. |
-| `offset` | `null` for an external role; for an arena role an integer >= 0 that is a multiple of 256. |
+| `offset` | `null` for an external role and for `carried` (the host places it: section 15.2); for an arena role an integer >= 0 that is a multiple of 256. |
 | `bytes` | integer >= 1, **exactly** the largest of `product(shape) * itemsize(dtype)` over the bucket combinations. |
 
 | `role` | what it is | who provides it | a step may |
@@ -140,9 +141,10 @@ magnitude, so that every language reads the same number); a file larger than
 | `intermediate` | a result that is not returned | the arena | write (first), then read and write |
 | `devscalar` | a `DevScalar` parameter: one element in device memory (`DevScalar[i32]`: a token count) | the host writes the value into its slot before the first launch | read |
 | `workspace` | the cuBLASLt workspace: dtype `u8`, shape `[N]` with a static `N` | the arena | (only as the `workspace` of a library step) |
+| `carried` | a parameter the graph declares carried (`@tilefish.graph(carried=("h",))`): a tensor the arena holds between executions (section 15.2) | the arena, in its carried region (an earlier execution on the arena wrote it) | read and write |
 
-* The buffers listed first are the graph's parameters, in the order of its signature; they have the roles `input`, `weight`, `inout` and `devscalar`. The rest are made by the
-  steps, then the workspace. Neither `input` nor `weight` is written, and a reader checks nothing else about the two. **Who chose them:** with `"roles": "declared"`
+* The buffers listed first are the graph's parameters, in the order of its signature; they have the roles `input`, `weight`, `inout`, `devscalar` and `carried`. The rest
+  are made by the steps, then the workspace. Neither `input` nor `weight` is written, and a reader checks nothing else about the two. **Who chose them:** with `"roles": "declared"`
   the graph did (`@tilefish.graph(inputs=("x",))`, `weights=(...)` or both: every read-only tensor parameter is one or the other, an `InOut` is `inout` and a
   `DevScalar` is `devscalar`), and a host may bind the weights once per instantiation and only the inputs at every call (section 9). Without `roles` the writer
   labelled a parameter by its shape (`weight` when it mentions no dimension), which is not a contract: every parameter of a fully static graph is a `weight`,
@@ -151,19 +153,20 @@ magnitude, so that every language reads the same number); a file larger than
   largest `workspace_bytes` of the library entries the plan uses (a reader requires it to be at least each one's: section 7.3).
 * **The arena** is `arena_bytes` bytes of device memory, allocated once by the host and **aligned to 256 bytes**. The region of an arena buffer is
   `[offset, offset + align_up(bytes, 256))`, which must lie inside the arena. A buffer's region is large enough for every bucket: a smaller bucket uses a prefix of it, so a
-  buffer is at the same address in every bucket. Without `reuse` (section 8) no two regions overlap.
+  buffer is at the same address in every bucket. Without `reuse` (section 8) no two regions overlap. A `carried` buffer has no region in this layout: the host allocates the
+  arena with a carried region after the `arena_bytes` of its plans, and places it there (section 15.2), so it overlaps no buffer of any plan.
 * An external's `bytes` is informative for the host's own allocation (the largest bucket); at a call its size is the bucket's `product(shape) * itemsize`, which the host checks.
 
 ## 7. Steps
 
 ### 7.1 The fields
 
-`buckets[i].steps` is a list (the same length in every bucket) of objects with the fields `entry kind args` and, for kind `library` only, `workspace`, and for a kernel step whose entry has fixed arguments given per call, `given`; a step of kind `copy` has exactly the fields `kind args` (section 7.5):
+`buckets[i].steps` is a list (the same length in every bucket) of objects with the fields `entry kind args` and, for kind `library` only, `workspace`, and for a kernel step whose entry has fixed arguments given per call, `given`; a step of kind `copy` has exactly the fields `kind args` (section 7.5), and so does a step of kind `memset` (section 7.6):
 
 | field | type and rule |
 |---|---|
 | `entry` | string: the stem of a manifest entry (`rmsnorm`, `attention`, `gemm_qkv.M64`: an identifier, then `.<Dim><value>` per bucketed dimension of the operator). It is the entry's own bucket, which differs between buckets of the plan for an operator whose binaries are bucketed. |
-| `kind` | `"kernel"`: an entry of the manifest's `kernels` (Triton or prebuilt binary). `"library"`: an entry of its `library` (a pinned GEMM). The manifest must have the entry **for `arch`** in that section. `"copy"`: a device-to-device copy (section 7.5), which names no entry. |
+| `kind` | `"kernel"`: an entry of the manifest's `kernels` (Triton or prebuilt binary). `"library"`: an entry of its `library` (a pinned GEMM). The manifest must have the entry **for `arch`** in that section. `"copy"`: a device-to-device copy (section 7.5), which names no entry. `"memset"`: bytes set to zero (section 7.6), which names no entry. |
 | `args` | non-empty list, one object per **pointer parameter of the entry's `abi.params`, in order** (a kernel's scalar and `fixed` parameters are not arguments: the host derives them). A `tensordesc` parameter (a TMA descriptor of a tensor, manifest schema 3, section 5.5) is a pointer parameter here: the step binds its tensor. Names in one step are distinct. |
 | `workspace` | present exactly when `kind` is `"library"`: the name of the buffer of role `workspace`. |
 | `given` | present exactly when the entry has fixed arguments given per call (manifest schema 3, section 5.3: a prebuilt binary's `kind: "given"` parameters), on a step of kind `"kernel"`: a non-empty object, the name of every one of them (an identifier) to the JSON integer the call gave, in range of its type (`i32`, `i64`; a plan number is at most `2**53` in magnitude). The value may differ between buckets (a call may give an expression of the graph's dimensions, `c=Rg`, evaluated at each bucket); the names may not. It is part of the digest. |
@@ -221,12 +224,14 @@ the shapes of the views; and every value of its fixed arguments given per call: 
 * the step's `given` names exactly the entry's parameters of kind `given` (none: no `given`), and each value fits the parameter's type;
 * **the dtype** of the buffer is the pointer's `dtype`; **the rank** of the view (or buffer) is `len(shape)` of the ABI pointer;
 * a pointer with shape `[]` (a device scalar) is bound to a buffer of role `devscalar`, and only such a pointer is;
-* a pointer with access `out` or `inout` is bound to a buffer whose role is `intermediate`, `output` or `inout` (a step never writes an `input`, a `weight`, a `devscalar`);
-* **a buffer is written before it is read**: a pointer with access `in` or `inout` is bound to a buffer that is `input`, `weight`, `inout` or `devscalar`, or that an earlier step of the same bucket wrote
-  (a pointer with access `out`; an `inout` pointer on a buffer not yet written is refused);
+* a pointer with access `out` or `inout` is bound to a buffer whose role is `intermediate`, `output`, `inout` or `carried` (a step never writes an `input`, a `weight`, a `devscalar`);
+* **a buffer is written before it is read**: a pointer with access `in` or `inout` is bound to a buffer that is `input`, `weight`, `inout`, `devscalar` or `carried` (an earlier
+  execution on the arena wrote it: a host checks that when it runs the plan, section 15.2), or that an earlier step of the same bucket wrote (a pointer with access `out`; an `inout`
+  pointer on a buffer not yet written is refused);
 * **every `output` is written** by some step of every bucket (a returned value no step writes would come back as whatever its tensor held).
 
-A copy step (section 7.5) has no entry: of the rules above it has the last two, its `src` read (written before) and its `dst` written.
+A copy step (section 7.5) has no entry: of the rules above it has the last two, its `src` read (written before) and its `dst` written. A memset step (section 7.6) has no
+entry either: its `dst` is written.
 
 ### 7.4 What the rules of `validate_doc` say about steps and buckets (no manifest needed)
 
@@ -234,7 +239,7 @@ A copy step (section 7.5) has no entry: of the rules above it has the last two, 
   bucket**; only `entry`, the views' numbers and the `given` values may differ between buckets;
 * a `given` is a non-empty object of identifiers to JSON integers, on a kernel step;
 * every `binding` is a buffer; a `workspace` is the buffer of role `workspace`; a `view` is well formed and inside its buffer at that bucket;
-* a copy step is what section 7.5 says, at every bucket.
+* a copy step is what section 7.5 says, and a memset step what section 7.6 says, at every bucket.
 
 ### 7.5 Copy steps
 
@@ -255,8 +260,28 @@ an in-place call may then update, where `x`, a parameter, is the caller's and ne
 into the caller's tensor; `param[...] = param` is no step). A copy of a view that is not dense at some bucket (a permutation, a column block) is not a copy
 step: the writer makes it a step of kind `kernel` that launches the generated op `tilefish.contiguous` (a strided view of rank 1 to 4, read through its strides,
 into the dense destination; `python/src/tilefish/_copyops.py`) at every bucket, so the document has nothing new (a view of rank 5 or more is refused).
+That holds of a store too: `param[...] = view` of a view that is not dense (a transpose, a column block) into an `InOut` parameter of its shape and dtype is a launch
+of `tilefish.contiguous` into the caller's tensor (the tracer of tilefish 0.0.6 and earlier refused such a store; a kernel body still does). A view of the parameter
+itself is refused (the source and the destination overlap).
 A reader that predates copy steps (the published crate 0.0.2, tilefish 0.0.4) refuses a plan that has one (`kind` must be `kernel` or `library`); a plan without one is
 what it always was.
+
+### 7.6 Memset steps
+
+A step of kind `"memset"` is `{"kind": "memset", "args": [{"name": "dst", ...}]}`: exactly those two fields (no `entry`: it launches no binary; no `workspace`),
+and exactly one argument, named `dst`, a buffer and optionally a view of it, as any argument. At every bucket `dst` is **dense** (the whole buffer, or a view whose
+axes of a size other than 1 have the row-major strides: one run of elements from the view's `offset`) and is a buffer a step may write (`intermediate`, `output`,
+`inout`, `carried`). It writes `dst` (section 7.3), and counts in the live range of its buffer like any argument (section 8).
+
+**What a host does.** The memset is `cuMemsetD8Async(address(dst) + dst.offset * itemsize, 0, count * itemsize)` on the plan's stream, in its place among the steps:
+every byte of the run is zero (`+0.0` for a float, `0` for an integer). A stream that is being captured records it as a memset node, so a plan with memset steps
+captures in a CUDA graph as before, and every replay zeroes again.
+
+**Where they come from.** `tilefish.zeros_like(x, dtype=None)` in a graph body: a new tensor of the shape of `x` (nothing of `x` is read) and its dtype or `dtype`,
+all zero, which an in-place call may then update (an accumulator) or the graph may return (the memset then writes the caller's output buffer). `param[...] =
+tilefish.zeros_like(param)` into an `InOut` (or `carried`) parameter is one memset of that buffer: the memset writes it directly, with no intermediate and no copy,
+when nothing reads the zeroed value again. A kernel body has no memset (`zeros_like` is refused there). The step is additive: a plan without one is what it
+always was, digest included, and a reader that predates memset steps (the published crate 0.0.4, tilefish 0.0.6) refuses a plan that has one.
 
 ## 8. Order, liveness and reuse
 
@@ -269,7 +294,8 @@ what it always was.
 * **Reuse.** `"reuse": false` means no two arena regions overlap. `"reuse": true` allows two regions to overlap **only if** both buffers are `intermediate` and their live ranges are disjoint
   (`last` of one < `first` of the other). A device scalar's slot and the workspace never share bytes. `validate_doc` checks this from the steps of the first bucket (the bindings are the same
   in every bucket). Python lays out a reusing plan first-fit by first step; the layout is part of the document, and a host uses it as it is.
-* A buffer with no step (a parameter that no operator reads) is allowed; it has no live range.
+* A buffer with no step (a parameter that no operator reads) is allowed; it has no live range. A `carried` buffer has a live range like any buffer, but no region in
+  the plan's layout: it is never part of the reuse.
 * **A result written over its input.** A call to an operator whose `Out` may be written over an input (`Out[..., MayAlias("r")]`, an `alias` in the
   manifest) has its result bound to the buffer of `r`, the same view, when that changes no value the graph computes: `r` is a whole `intermediate`
   at its current version (made by a call of the graph: not a parameter, which is the caller's, and not a view), no later node of the graph reads its
@@ -280,7 +306,8 @@ what it always was.
 
 ## 9. What a host does
 
-1. **Load** (section 3): the file, the pin or the trust statement, the manifest, the rules, the entries. Allocate the arena once per device: `arena_bytes` bytes, 256-aligned (nothing if it is 0).
+1. **Load** (section 3): the file, the pin or the trust statement, the manifest, the rules, the entries. Allocate the arena once per device: `arena_bytes` bytes, 256-aligned (nothing if it is
+   0), and the regions of the plan's carried buffers after them when it has some (section 15.2).
    Keep it for as long as the plan is in use, **and for as long as any CUDA graph captured from the plan can be replayed** (the graph holds its address: a host-owned graph, section 10,
    keeps its arena alive; nothing keeps it alive for a graph the caller captured with `torch.cuda.graph`: Python keeps an arena per plan layout and device until
    `tilefish.runtime.clear_caches()`, however many runners and plan objects come and go; a host that frees an arena must drop the graphs, and must first wait for the work of the last
@@ -300,6 +327,12 @@ what it always was.
    gate shared, `clear_caches` takes it exclusive, and the executions that start meanwhile wait for it, then allocate and load again), takes each arena's lock, waits for the event
    (`cuEventSynchronize`) before it frees the arena, and synchronizes every context before it unloads the modules. Plans of different layouts have different arenas and are not ordered with each other.
    **The order is the arena's, not the plan's**: an arena shared by several plans (section 15.1) orders the executions of all of them, with the same lock and the same event.
+   **So executions that must run concurrently need an arena each.** Runs of one plan, or of one shared arena, are serialised on the device whatever their streams; a host that runs
+   the same plans on several streams at once (one stream per request lane, say) gives each lane an arena of its own, with its own lock, order and carried buffers. Python:
+   `tilefish.runtime.share_arena([g, ...], name="lane0")`, `share_arena([g, ...], name="lane1")` (every arena of the same plans and the same name is one; a plan alone is
+   a shared arena of one plan); Rust: every `LaunchPlan::instantiate` and every `SharedArena::new` allocates an arena of its own (an instantiation, or a `SharedArena`,
+   per lane). An execution on one arena never waits for one on another (behind a stream that sleeps 600 ms before a run on arena `lane0`, a run on `lane1` on another
+   stream finishes in about a millisecond; on `lane0` it waits for the sleep: `test_gpu_arena_lanes.py`).
    The Rust host (`PlanRun`, one arena per instantiation) gives the same order with an order event of its own (`plan_run::Order`): an execution, under the arena's lock, makes
    its stream wait for the event (skipped when its most recent record is on that stream) and records it after its last launch, so executions of one instantiation on any
    streams, from any threads, run one after the other in the order they are issued; nothing is enqueued on any other stream than the execution's own and the streams its
@@ -309,15 +342,18 @@ what it always was.
    captured stream (when executions did make the arena's own stream wait, a capture of that stream had to hold the lock to its end: 3 to 18 of 200 captures failed with
    `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` or `..._INVALIDATED` against a loop of launches on another thread).
 2. **Bind the externals.** The caller gives a tensor (address, shape, strides, dtype) for every buffer of role `input`, `weight` and `inout`, and for every `output` (or the host allocates it), and a
-   value for every `devscalar`. Check each external against its buffer: dtype, rank, contiguous row-major (a parameter is a dense tensor), and bind the dimensions (section 5). Select the bucket.
-   The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`), and none may overlap the arena.
-3. **Check, before anything is launched**: for every step of the selected bucket, resolve it (section 7.2) with the real addresses and run every check of a single launch. **If any check fails,
-   nothing is launched and nothing is written**, not even a device scalar: the checks are all done first, then the writes and the launches.
+   value for every `devscalar` (and nothing for a `carried` buffer: the arena holds it). Check each external against its buffer: dtype, rank, contiguous row-major (a parameter is a dense tensor), and
+   bind the dimensions (section 5; a carried buffer the plan reads before it writes it binds them too, with the shape it was written with: section 15.2). Select the bucket.
+   The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`), and none may overlap the arena (its carried region included).
+3. **Check, before anything is launched**: for every step of the selected bucket, resolve it (section 7.2) with the real addresses and run every check of a single launch, and, under the arena's
+   lock, that every carried buffer the plan reads before it writes it holds the shape it reads (section 15.2). **If any check fails, nothing is launched and nothing is written**, not even a
+   device scalar: the checks are all done first, then the writes and the launches.
 4. **Write the device scalars**, after the stream waits for the previous execution on the arena (step 1). Each `devscalar` slot (at `arena + offset`) gets the value the caller gave, as the
    little-endian bytes of its dtype, ordered on the stream before the first launch: a copy from device memory (stream-ordered), or an asynchronous copy from pinned host memory. (Python:
    `_planrun.TorchBackend.write_devscalar`; Rust: a pinned staging buffer per instantiation, `ffi::plan::Staging`. A copy from pageable memory may synchronize with the stream, as
    CUDA documents `cuMemcpyHtoDAsync` from pageable memory.)
-5. **Launch** the steps in order on the stream (section 7.2), then record the arena's order event on it (step 1). Nothing else: no allocation, no synchronization of the host.
+5. **Launch** the steps in order on the stream (section 7.2), then record the arena's order event on it (step 1), and note what each carried buffer the plan writes holds now (its shape at
+   the bucket; unknown when a launch failed). Nothing else: no allocation, no synchronization of the host.
 
 A host may cache everything of steps 1 to 3 that does not depend on an address (the dimension bindings, scalars, grids, the entries' loaded functions and pinned algorithms) per bucket, as Python's
 runner does; the address-dependent checks are repeated at every execution.
@@ -354,7 +390,7 @@ its own launches it from the manifest the plan pins (`LaunchPlan::manifest().ker
 
 A plan does nothing during execution that a stream capture forbids: no allocation (the workspace of a GEMM, the intermediates and the device scalars are in the arena), no synchronization of
 the host (the order event of the arena is waited for and recorded on the stream, as event nodes: item 7), no host write to device memory but the copy of a device scalar, no module loading, no
-handle creation, every launch on one stream. So **a plan can be captured once per bucket, at fixed addresses, and the
+handle creation, every launch on one stream (a copy step is a memcpy node, a memset step a memset node). So **a plan can be captured once per bucket, at fixed addresses, and the
 graph replays byte-identically** (Python gate: `test_gpu_plan.py`, byte-identical to the uncaptured replay and to per-op eager execution, with 0 allocations inside the capture).
 
 A plan is captured in one of two kinds of graph. **A graph the host owns** (Python: `tilefish.capture`, which returns a `CapturedPlan`; Rust: `PlanRun::capture`, a `CapturedPlan`) holds
@@ -398,6 +434,15 @@ whoever holds it, with no lock of the host: item 7 says what its event nodes ord
    another caller-owned graph) must order them itself (one thread, or a lock of its own around all of them), or capture the plan in a host-owned graph. Issued from one thread, replays and
    uncaptured executions of one plan, on any streams, are ordered with each other in the order the host issues them, exactly as executions are. The caller orders nothing but its own
    tensors (an input written on another stream, an output read on one), as for any launch.
+   **The hazard is loud, and the cure is one call.** A replay of a caller-owned graph is a call into torch, which tilefish does not see, so it cannot be made safe behind the caller's
+   back (a replay would have to take the arena's lock, and only a call of the host can; the wait and the record cannot be made one driver call; a lock-free order on the device would
+   need a ticket a graph cannot take at replay). Python therefore (a) warns: an arena that a caller-owned graph holds, used by a second thread (a run, a replay of a host-owned
+   graph, a step alone, another capture), gives one `TilefishOrderWarning` (with `warnings.simplefilter("error", tilefish.TilefishOrderWarning)` it is an error that refuses
+   every such use before anything is enqueued; one thread never warns, and the warning is not given once the caller replays through (b)); and (b) offers `tilefish.runtime.replay_graph(g, stream=None)`, which replays `g` under the lock of every
+   arena a caller-owned graph was captured on, so no execution of another thread is between its wait and its record while `g` is launched, and the event nodes do the rest: 0 of 3 000
+   runs wrong against a loop of `replay_graph` on another thread (`test_gpu_arena_lanes.py`). The warning cannot see a replay made with `g.replay()` itself on a thread that never
+   calls tilefish; it sees the second thread that does. The Rust host has no caller-owned graph: a launch on a capturing stream is refused, and `PlanRun::capture` is how a plan is
+   captured.
    (A host-owned graph has no event node: Python's `CapturedPlan.replay` and Rust's `CapturedPlan::replay` order a replay exactly as an execution, step 1 of section 9, so replays and
    executions of one plan, or of one Rust instantiation, are ordered the same way, whatever thread issues them.)
 8. Not a plan's doing, but a reason a capture can fail: a binary that is not capturable by itself (the manifest refuses cooperative launches, PDL, clusters and scratch memory for a plain
@@ -425,7 +470,13 @@ cap.replay(stream=None)                                                     # or
 cap.set_devscalar("n", 7)                                                   # the value the next replays write (nothing is enqueued now)
 s = tilefish.runtime.share_arena([g1, g2], mode="replay", plan="build/", pin=planset.digest)  # plans of a set on one arena they share (section 15.1)
 a = s.run(g1, x); y = s.run(g2, a); s.capture(g2, a)                        # one at a time: every run and replay on the arena is ordered with the others
+lane1 = tilefish.runtime.share_arena([g1, g2], name="lane1", ...)          # another arena of the same plans: its executions run concurrently with s's
+s.run(stage_a, x); z = s.run(stage_b)                                       # carried buffers (section 15.2): stage_a leaves h in the arena, stage_b reads it
+tilefish.runtime.replay_graph(g)                                            # replay a torch.cuda.graph holding plans, ordered with every thread (section 10)
 ```
+
+In a graph body, `tilefish.copy(x)` is a copy step (section 7.5), `tilefish.zeros_like(x, dtype=None)` a memset step (section 7.6), `param[...] = x` into an `InOut`
+parameter a copy step or a launch of `tilefish.contiguous`, and `@tilefish.graph(carried=("h",))` declares carried parameters (section 15.2).
 
 * `buckets` maps a dimension name to the sizes to plan; it defaults to the dimension's own `buckets=` and is required for a dimension that has none. `reuse` defaults to `False`.
 * A `DevScalar` parameter takes an `int` (a number that is not an integer of its dtype, such as `3.7` for an `i32`, is refused in `jit`, `replay` and `reference` alike: it is never truncated), a CPU tensor or a CUDA tensor of one element at a call.
@@ -450,7 +501,7 @@ A graph body that a plan cannot make is refused by `tilefish.plan` with the rule
 * **arithmetic traced in the graph body** (`x + y`, a cast, a reduction, a load): a plan launches declared operators; put it in a `@tilefish.kernel`. Views (`reshape`, `permute`, `select`, `split`,
   `x[i]`) are fine. There is no fusion in this version: the steps are the calls the graph makes.
 * an **`Out`** parameter of the graph (and so a `store` into one) and a runtime **`Dim`** parameter: a graph's results are its returned values (a `store` into an `InOut`
-  parameter is a copy step, section 7.5);
+  parameter is a copy step, or a launch of `tilefish.contiguous` for a view that is not dense, section 7.5);
 * a call to **another graph** (it is not inlined yet).
 * an **in-place call on a view** of another tensor (the IR says updating a view does not change its parent; a plan has no copy to make that true), and a view **read after its tensor was updated
   in place**.
@@ -499,6 +550,10 @@ and 9 240 832 with it (720 896 for the intermediates).
 | a result written over its input (`MayAlias`, section 8) | `test_alias.py`; on a GPU `test_gpu_alias.py` |
 | buffers whose strides are products of sizes (`[4, Lb, Lb]`: views at a stride and an offset of `Lb*Lb`, section 7.1) | `test_product_strides.py`; on a GPU `test_gpu_product_strides.py`; the Rust gate's plan `product_strides` (`gpu_plan_gate.rs`) |
 | copy steps (`tilefish.copy`, a store into an `InOut` parameter; section 7.5) | `test_plan_copy.py`; on a GPU `test_gpu_plan_copy.py`; the Rust reader: `python_plans.json` (`copy ...` documents) |
+| a view that is not dense stored into an `InOut` parameter: a launch of `tilefish.contiguous` (section 7.5) | `test_plan_strided_store.py`, `test_trace.py`; on a GPU `test_gpu_plan_strided_store.py` (jit, replay, reference, `tilefish.capture`, `torch.cuda.graph`) and the gate plan `strided_store` |
+| memset steps (`tilefish.zeros_like`; section 7.6) | `test_plan_memset.py`; the Rust reader: `python_plans.json` (`memset ...` documents); on a GPU `test_gpu_plan_memset.py` (the caller's tensors filled with NaN first; captured as memset nodes) and the gate plan `memset_steps` |
+| carried buffers (section 15.2): the role, the store written by the step that makes the value, the layout of the carried region, the order of what each holds, the dimensions bound from it, the refusals | `test_plan_carried.py`; `test_plan_fixtures.py` and `launch_plans.rs` (the golden set `carried`: `the_golden_set_of_carried_buffers_...`); the Rust reader: `python_plans.json` (`carried ...` documents); on a GPU `test_gpu_plan_carried.py` (jit and replay against torch, `tilefish.capture` between runs on other streams, a `torch.cuda.graph` of two stages, two arenas from two threads) and `gpu_plan_gate.rs` (`carried_buffers_handed_from_plan_to_plan_...`: the calls of `rust_gate.py`'s `CARRIED_CALLS` on one `SharedArena`, launched and replayed) |
+| an arena per stream (`share_arena(..., name=)`, section 9) and the warning and `replay_graph` for a graph of the caller's (section 10, item 7) | `test_arena_lanes.py`; on a GPU `test_gpu_arena_lanes.py` (a run on another arena does not wait for a sleeping stream; two threads; 0 of 3 000 runs wrong against `replay_graph` on another thread) |
 | returned views and parameters (section 12) | `test_plan_returns.py`; on a GPU `test_gpu_plan_returns.py` |
 | one step alone (section 9) | `test_plan_step.py`; on a GPU `test_gpu_plan_step.py` and `gpu_plan_gate.rs` (`the_steps_launched_one_by_one_give_the_bytes_of_the_plan`) |
 | steps with TMA descriptors (sections 7.2 and 10): encoded from the buffers they bind before the first launch, held by value in a graph | `test_tensordesc.py` (a fake backend); on a GPU `test_gpu_tma.py` (jit, replay, `tilefish.capture`, `torch.cuda.graph`, a step alone) and the gate plans `tma_chain`, `tma_chain-reuse`, `tma_view` (`gpu_plan_gate.rs`: launched and replayed from a graph) |
@@ -570,19 +625,18 @@ they were.
   the arena, whatever plans run on it: a host orders **every execution on the shared arena, of any of its plans** (a run, a capture, the replay of
   a host-owned graph, a step alone) with every other, under one lock and one order event (both hosts),
   so the executions of two plans of the arena cannot run concurrently, from any threads and on any streams. A replay of plan A's graph is
-  ordered with every run and replay of plan B. Then an execution finds in the arena whatever the one before it left, and needs nothing of it: it
-  writes every arena buffer it reads before it reads it (an intermediate, section 7.3; a device scalar's slot, before the first launch, section
-  9 step 4; the workspace is a GEMM's scratch). A graph the caller owns (`torch.cuda.graph`) takes its place in the arena's order as section 10,
+  ordered with every run and replay of plan B. Then an execution finds in the arena whatever the one before it left, and needs nothing of it but
+  its carried buffers (section 15.2, which the order hands on): it writes every arena buffer of its own region it reads before it reads it (an
+  intermediate, section 7.3; a device scalar's slot, before the first launch, section 9 step 4; the workspace is a GEMM's scratch). A graph the caller owns (`torch.cuda.graph`) takes its place in the arena's order as section 10,
   item 7 says, with the same caveats; two executions on the arena in one capture on two streams are refused (item 5). (The Rust host writes the
   device scalars of a host-owned graph's replay again whenever another execution on the arena, of any plan, may have written over them.)
-* **What outlives an execution: nothing in the arena.** A value one plan makes and a later plan reads is a **returned value** of the first, an
-  external in the caller's memory (role `output`: Python allocates it or takes `outputs=`, Rust takes the caller's), given as a parameter of the
-  second. There are no buffers "carried" in the arena from one plan to the next: a plan's results are externals already (so nothing is new in the
-  documents); a carried region would have to be placed where no later plan writes, a layout of the combination that depends on which plans run
-  in which order and would have to be in the index and its digest; and it would save nothing over a tensor of the caller's, which is allocated
-  once and used again as well. **What would be overwritten is refused, never corrupted**: a tensor of the caller that overlaps the shared arena
-  *anywhere* (not only the part of the plan that runs: the next plan writes the rest) is refused with the kind `alias` before anything is
-  launched, whether it is an external, a tap's tensor or a tensor of a step alone (section 9).
+* **What outlives an execution: nothing in the plans' regions; the carried buffers.** A value one plan makes and a later plan reads is a
+  **returned value** of the first, an external in the caller's memory (role `output`: Python allocates it or takes `outputs=`, Rust takes the
+  caller's), given as a parameter of the second; or a **carried buffer** (section 15.2), which the arena holds in a region of its own after the
+  plans' regions, so no buffer of any plan writes it but a step bound to it. **What would be overwritten is refused, never corrupted**: a tensor of
+  the caller that overlaps the shared arena *anywhere* (not only the part of the plan that runs: the next plan writes the rest; the carried region
+  too) is refused with the kind `alias` before anything is launched, whether it is an external, a tap's tensor or a tensor of a step alone
+  (section 9).
 * **The pin.** The layout of a shared arena is a function of the plans' documents (their `arena_bytes` and offsets), which their digests cover,
   which the set's digest covers: **the set's pin covers the shared arena**, and `plans.json` has nothing new. A plan file edited to say another
   layout is refused by the pin before an arena is sized from it. `expected.json` of the golden fixtures has each plan's `arena_bytes` and the
@@ -590,10 +644,61 @@ they were.
 
 Hosts. Python: `s = tilefish.runtime.share_arena([g1, g2, g3], mode="replay", plan="build/", pin=planset.digest)` (in `jit` the items are graphs
 or the `Plan`s `tilefish.plan` made), then `s.run(g1, *args, outputs=, taps=)`, `s.capture(g2, *externals, devscalars=, outputs=)`,
-`s.bind_weights(g3, {...})`, `s.run_step(g1, step, buffers)`, `s.prepare()`; `s.arena_bytes`, `s.sizes` (each plan's `arena_bytes`). Python keeps
-arenas per layout, as for one plan: every `SharedArena` of the same plans on one device is one arena, kept until `clear_caches`, and a plan run
-alone (`tilefish.run`) has its own. Rust: `let runs = set.instantiate(&stream, &["g1", "g2", "g3"])?` (a `SetRun`: `runs.run("g1")?` is a
+`s.bind_weights(g3, {...})`, `s.run_step(g1, step, buffers)`, `s.prepare()`; `s.arena_bytes`, `s.sizes` (each plan's `arena_bytes`), `s.carried`
+(section 15.2). Python keeps arenas per layout, as for one plan: every `SharedArena` of the same plans and the same `name=` (or none) on one device
+is one arena, kept until `clear_caches`, another name is another arena (`share_arena([...], name="lane1")`: one per stream), and a plan run alone
+(`tilefish.run`) has its own. Rust: `let runs = set.instantiate(&stream, &["g1", "g2", "g3"])?` (a `SetRun`: `runs.run("g1")?` is a
 `PlanRun` on the shared arena, `runs.arena()` the `SharedArena`), or `SharedArena::new(&stream, &[&p1, &p2])` and `p1.instantiate_in(&arena,
-values)` / `instantiate_all_in(&arena)`, which refuse a plan the arena was not made for (by digest); every Rust `SharedArena` is an arena of its
-own (a host with several lanes makes one per lane). `PlanSet::shared_arena_bytes(names)` and `SharedArena::bytes_for(plans)` give the size with no
-GPU.
+values)` / `instantiate_all_in(&arena)`, which refuse a plan the arena was not made for (by digest); every Rust `SharedArena` (and every `SetRun`)
+is an arena of its own (a host with several lanes makes one per lane). `PlanSet::shared_arena_bytes(names)` and `SharedArena::bytes_for(plans)`
+give the size with no GPU.
+
+### 15.2 Carried buffers
+
+A stage that hands an intermediate to the next stage need not make it a returned value that the caller allocates: the graphs declare it **carried**,
+and the arena holds it.
+
+* **The declaration.** `@tilefish.graph(carried=("h",))` names tensor parameters of the graph, `In` (the plan reads `h`) or `InOut` (it writes `h`,
+  or updates it in place), not a `DevScalar`, and neither an input nor a weight of `inputs=`/`weights=`. The name is the buffer's identity across
+  plans: every plan of an arena that has a carried parameter `h` uses the one tensor `h` of that arena. In the document such a parameter is a buffer
+  of role `carried`, with `offset` `null`, like an external, and the `bytes` of its largest bucket (section 6). It is listed in the order of the
+  signature with the other parameters; a step may read it (it counts as provided, section 7.3) and write it. Nothing else of the document is new: a
+  plan without one is what it always was, digest included, and a reader that predates the role (the published crate 0.0.4, tilefish 0.0.6) refuses a
+  plan that has one.
+* **The writer.** `h[...] = value` into a carried parameter is written by the step that makes the value (its result is bound to `h`: no
+  intermediate and no copy) when the value is a whole intermediate the step just before made and nothing reads it again; otherwise it is a copy
+  step (or a launch of `tilefish.contiguous`). `h[...] = tilefish.zeros_like(h)` is a memset of `h` (section 7.6). An in-place call
+  (`accumulate(h, y)`, an `InOut` operand) updates it where it is.
+* **The layout** (`_plan.carried_layout`; Rust `CarriedLayout::of`). The arena of a set of plans (one plan for an arena of its own) is their regions
+  (from the arena's first byte, each plan's own `offset`s, `base = max(arena_bytes)`), then one region per carried name of any of the plans, in
+  code point order of the names, each `align_up(max bytes over the plans that name it, 256)` long, at a multiple of 256. Two plans that give a name
+  two dtypes are refused. The layout is a function of the documents alone, so a plan's or a set's pin covers it as it covers the rest of the arena
+  (15.1), and `plans.json` has nothing new. The golden set `carried` (`expected.json`: `carried_base`, `carried`, `shared_arena_bytes`) has two names
+  after a plan with a region of its own; a reader reproduces it from the files.
+* **The lifetime.** A carried buffer lives as long as its arena (Python: until `clear_caches`; Rust: the last handle of the arena), and holds what
+  the last execution on the arena that wrote it left there. Nothing else writes its bytes (it is in no plan's region; the caller's tensors may not
+  overlap the arena). An arena of its own (`tilefish.run` of one plan, a Rust `instantiate`) has its own carried regions, so two plans that are not
+  on one shared arena do not share a carried buffer, and a plan that reads a carried buffer first is refused alone (nothing but itself could have
+  written its arena's): it runs on a shared arena with a plan that writes the buffer.
+* **What each holds, and the checks.** A host keeps, under the arena's lock and so in the order the executions run in, the shape (at its bucket)
+  of the execution that wrote each carried buffer last, or nothing (no execution wrote it, or one that did failed after it was enqueued). A plan
+  that reads a carried buffer before it writes it (its first use in the steps is a pointer that is `in` or `inout`, an operand of a library step,
+  the source of a copy) **binds its dimensions from that shape**, as from an external's (so `stage_b(h)` is called with nothing: its `T` is the size
+  `h` was written with), and is **refused before anything is enqueued** unless the buffer holds exactly the shape it reads (kind `shape`; "no
+  execution on this arena has written it", or "left the shape ..."). After an execution, every carried buffer it writes holds its shape. A run, the
+  replay of a host-owned graph (`CapturedPlan.replay`, Rust `CapturedPlan::replay`) and a Rust `check` do this; a capture (`tilefish.capture`,
+  `PlanRun::capture`) runs nothing and checks nothing of what they hold, but binds its dimensions as a run does (so a plan whose dimensions only a
+  carried buffer binds is captured after that buffer was written); a caller-owned graph (`torch.cuda.graph`) is checked and noted when it is
+  captured, not at its replays, which tilefish does not see: a replay of such a graph that writes `h` in another shape than the last execution the
+  arena noted leaves the note wrong, and a later run that reads `h` binds the noted shape (capture the stages that hand a buffer on in one graph, in
+  their order, or use `tilefish.capture`, whose replays are checked and noted). The dimensions are bound from the carried buffers a plan reads first,
+  not from those it only writes: a stage that only writes `h` (a reset by a memset) takes a tensor that has its dimensions. A step alone (`run_step`, `launch_step`) takes the caller's tensor for
+  a carried buffer, as for any buffer, and touches no carried region.
+* **The calls.** A run gives every parameter but the carried ones (Python: positionally in the order of the signature without them, or by name;
+  giving one is refused: "held by the plan's arena"); `tilefish.capture` and `bind_weights` alike. The reference mode, which has no arena, takes a
+  carried parameter as an argument like any other. A plan whose parameters are all carried runs on torch's current device.
+
+Hosts. Python: `@tilefish.graph(carried=...)`, `Plan.carried`, `SharedArena.carried` (`{name: (offset, bytes, dtype)}`), `share_arena` as in 15.1,
+`tilefish.run`, `capture`, `bind_weights`, taps of a carried buffer (`taps={"h": t}`). Rust: `BufferRole::Carried`, `LaunchPlan::carried()`,
+`CarriedLayout`, `SharedArena::carried()`; `PlanRun::launch` and `CapturedPlan::replay` check and note what the carried buffers hold. Tests: section
+14.

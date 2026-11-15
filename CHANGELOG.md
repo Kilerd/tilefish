@@ -169,6 +169,34 @@ each section names the release that added it.
   entry. Readers of 0.0.6 and crate 0.0.4 refuse a name and an `implementation` on a `binary` entry; manifests without them, and their digests, are
   unchanged.
 
+### Plans and arenas
+
+- **Carried buffers.** `@tilefish.graph(carried=("h",))` names parameters (`In` or `InOut`) whose tensor the plan's arena holds instead of the
+  caller: buffer role `carried` (offset `null`), placed by the host after the plans' own regions, one region per carried name in code point order
+  (`_plan.carried_layout`, Rust `CarriedLayout`), so one stage of a shared arena hands an intermediate to the next with no allocation of the
+  caller's. A run gives every parameter but the carried ones; a plan that reads a carried buffer before it writes it binds its dimensions from the
+  shape the buffer was written with, and is refused before anything is enqueued when no execution on the arena wrote it, or wrote another shape
+  (both hosts, launches and host-owned replays). `h[...] = op(x)` is written by the launch of `op` (no copy). `docs/plan-schema-1.md`, section 15.2.
+- **Memset steps.** `tilefish.zeros_like(x, dtype=None)` in a graph body is a step of kind `memset` (`cuMemsetD8Async` of a dense buffer, a memset
+  node under capture), in both hosts; `state[...] = tilefish.zeros_like(state)` is one memset of the caller's tensor. Additive: no schema bump, and
+  a plan without one is unchanged (section 7.6).
+- **Several arenas of the same plans.** `tilefish.runtime.share_arena(graphs, name="lane1")`: arenas are kept per plan layout, device and name, so
+  a lane that runs concurrently (one per stream) takes an arena of its own; documented for both hosts (the Rust host already made one per
+  instantiation and per `SharedArena`) in section 9.
+- **A view that is not dense stored into an `InOut` parameter** of a graph (`state[...] = t.permute(1, 0)`) is accepted and planned as a launch of
+  `tilefish.contiguous` into the caller's tensor, as a returned view already was. A kernel body still refuses it.
+- **Graphs of the caller's.** The second thread that uses an arena a `torch.cuda.graph` capture of `tilefish.run` holds gets one
+  `tilefish.TilefishOrderWarning` (such a graph's `replay()` takes no lock), and `tilefish.runtime.replay_graph(g)` replays one under the arena's
+  lock, ordered with every thread (0 of 3 000 runs wrong against it). Section 10, item 7, says why it cannot be made safe behind the caller's back.
+- A `shared` that is nonzero but too small stays undetectable without a pin: measured, a Triton cubin does not record the dynamic shared memory it
+  addresses (`test_gpu_shared_size.py`; `docs/manifest-schema-3.md`, section 4).
+- A shared arena of runners of which some have run and some not is no longer refused for "another backend".
+
+### Compatibility
+
+- Readers of tilefish 0.0.6 and crate 0.0.4 refuse a plan with a memset step or a carried buffer; every other plan, and its digest, is unchanged.
+- The crate's public enums gained variants (`BufferRole::Carried`, `StepKind::Memset`), and `SharedArena::bytes_for` counts the carried regions.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes
