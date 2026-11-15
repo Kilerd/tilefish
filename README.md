@@ -302,7 +302,9 @@ needs a C compiler, and a `replay` of a generated kernel needs neither Triton no
 CI asserts, on a GPU (the tests marked `gpu`), that a `jit`-built cubin has the
 digest of the manifest's, that `jit` and `replay` agree byte for byte, and that
 `replay` stays within tolerance of `reference`. The tolerances are measured per
-input distribution and tabulated in `python/tests/test_gpu_reference.py`: a ULP
+input distribution and dtype (f32, bf16 and f16 in and out; normal, uniform,
+heavy-tailed, sparse outliers, values of every magnitude) and tabulated in
+`python/tests/test_gpu_reference.py`: a ULP
 count only means something where the result is far from zero (a layernorm of
 data with a large mean has tiny outputs), so a bf16 output is bounded by half a
 bf16 step of the largest reference value and a fraction of elements that may

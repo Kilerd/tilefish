@@ -70,6 +70,29 @@ The ULP columns of the layernorm with a large mean are not a tolerance: 117 to 2
 ``x - mean`` (the data is bf16, so ``x - mean`` of numbers near 1000 is quantized in steps of 4, and the near-zero
 results are meaningless in ULP). What bounds the error there is that it stays within half a bf16 step of the largest
 value. The 128 ULP of the gelu are the same effect (``1 + erf(x/sqrt 2)`` for large negative ``x``).
+
+**Every float dtype, more distributions** (``test_the_matrix_of_dtypes_and_distributions``; the kernels of ``reference_cases.py``: the goldens with f32,
+bf16 or f16 inputs and outputs and f32 math inside). Distributions: ``normal`` N(0, 1); ``uniform`` U(-2, 2); ``heavy`` N(0, 1) / U(0.05, 1) (tails
+to about 60); ``outliers`` N(0, 0.1) with 0.1% of the elements +-50; ``magnitudes`` N(0, 1) times ``2**k``, ``k`` uniform in [-10, 5]; ``rows`` (the
+layernorm only) one value per row. The worst over the five distributions and 3 seeds, and the ``rows`` case apart (measured on a B300, sm_103):
+
+====================  ===============================  ==================  ==================  =====================================================
+kernel                f32: max abs / max|ref|, differ  bf16 (bound 2**-7)  f16 (bound 2**-10)  the rows of one value (layernorm)
+====================  ===============================  ==================  ==================  =====================================================
+layernorm (257, 768)  2.0e-7, 33%                      1.0e-3, 0.004%      4.7e-4, 0.021%      f32 8.9e-5, 96%; bf16 3.8e-5, 0.24%; f16 3.8e-5, 1.6%
+gelu (2**18)          1.1e-7, 5.5%                     3.4e-6, 0.70%       8.6e-7, 1.1%
+swiglu (257, 3072)    1.4e-7, 26%                      1.1e-3, 0.001%      5.6e-4, 0.006%
+softmax (257, 1000)   3.6e-7, 97%                      3.4e-3, 0.023%      4.4e-4, 0.016%
+====================  ===============================  ==================  ==================  =====================================================
+
+Asserted: the largest error within ``2**-20`` of the largest reference value for an f32 output and within the step of the table for bf16 and f16
+(every case is), and the fraction that differ within :data:`MATRIX_DIFFER` (about twice the measured worst). The layernorm of rows of one value is
+the one case outside: ``x - mean`` is then the rounding error of the mean, which ``rsqrt(0 + eps)`` multiplies by 316, so its f32 output is ``b`` plus
+a noise that the two orders of the sum make differently (bound ``2**-12``, :data:`MATRIX_ROWS`). The heavy tails, the outliers and the values of every
+magnitude change no bound: with outputs in f32 most elements differ in the last bits (the reductions' order, ``ex2.approx``, ``div.full``,
+``rsqrt.approx``, contraction), and a narrow output hides nearly all of it. Where the reference is exact (the ops of IEEE math, ``rcp``, ``neg``,
+``fma`` and ordered sums: notes 13 and 15 to 17 of ``tilefish.lower``) the binary is its bytes, which ``test_gpu_ieee.py``, ``test_gpu_primitives.py``
+and ``test_gpu_reduction_order.py`` assert.
 """
 
 import pytest
@@ -213,3 +236,80 @@ def test_the_reference_is_deterministic_and_does_not_depend_on_the_binary(manife
     b = tilefish.run(softmax, *args, mode="reference")
     assert same_bytes(a, b)
     assert differing(a, tilefish.run(softmax, *args, mode="replay", manifest=manifest, trust_directory=True)) > 0
+
+
+# -- the matrix widened: every float dtype, more input distributions -------------------------------------------------------------------------
+
+from reference_cases import KERNELS  # noqa: E402
+
+STEP = {"f32": 2.0**-23, "bf16": 2.0**-7, "f16": 2.0**-10}  # the bound of the largest error, as a fraction of the largest reference value
+
+
+def distribution(kind, shape, seed):
+    """f32 samples of ``kind``: ``normal`` N(0, 1); ``uniform`` U(-2, 2); ``heavy`` N(0, 1) / U(0.05, 1) (tails to about 60); ``outliers`` N(0, 0.1)
+    with 0.1% of the elements +-50; ``magnitudes`` N(0, 1) times 2**k, k uniform in [-10, 5] (values of every magnitude); ``rows`` one value per row
+    (a layernorm's variance is 0)."""
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(seed)
+    if kind == "normal":
+        return torch.randn(shape, generator=gen, device="cuda")
+    if kind == "uniform":
+        return torch.rand(shape, generator=gen, device="cuda") * 4 - 2
+    if kind == "heavy":
+        return torch.randn(shape, generator=gen, device="cuda") / (torch.rand(shape, generator=gen, device="cuda") * 0.95 + 0.05)
+    if kind == "outliers":
+        x = torch.randn(shape, generator=gen, device="cuda") * 0.1
+        hit = torch.rand(shape, generator=gen, device="cuda") < 0.001
+        return torch.where(hit, torch.sign(x) * 50.0, x)
+    if kind == "magnitudes":
+        return torch.randn(shape, generator=gen, device="cuda") * torch.pow(2.0, torch.randint(-10, 6, shape, generator=gen, device="cuda").float())
+    assert kind == "rows"
+    return torch.randn((shape[0], 1), generator=gen, device="cuda").expand(shape).contiguous()
+
+
+def args_of(name, dt, kind, seed):
+    t = {"f32": F32, "bf16": BF16, "f16": torch.float16}[dt]
+    if name == "layernorm":
+        return (distribution(kind, (257, 768), seed).to(t), randn((768,), t, seed + 100), randn((768,), t, seed + 200))
+    if name == "gelu":
+        return (distribution(kind, (1 << 18,), seed).to(t),)
+    if name == "swiglu":
+        return (distribution(kind, (257, 3072), seed).to(t), distribution(kind, (257, 3072), seed + 100).to(t))
+    return (distribution(kind, (257, 1000), seed).to(t),)
+
+
+MATRIX_KINDS = ("normal", "uniform", "heavy", "outliers", "magnitudes")
+# (kernel, dtype) -> the largest fraction of elements that may differ over the distributions of MATRIX_KINDS: the measured worst case of the module
+# docstring's second table, with a margin; the layernorm of rows of one value has its own (MATRIX_ROWS)
+MATRIX_DIFFER = {
+    ("layernorm", "f32"): 0.40, ("layernorm", "bf16"): 0.0002, ("layernorm", "f16"): 0.0005,
+    ("gelu", "f32"): 0.08, ("gelu", "bf16"): 0.015, ("gelu", "f16"): 0.02,
+    ("swiglu", "f32"): 0.35, ("swiglu", "bf16"): 0.0001, ("swiglu", "f16"): 0.0002,
+    ("softmax", "f32"): 1.0, ("softmax", "bf16"): 0.0005, ("softmax", "f16"): 0.0005,
+}  # fmt: skip
+# the layernorm of rows of one value: x - mean is the rounding error of the mean, which rsqrt(0 + eps) multiplies by 316, so the output is b plus
+# noise that the two orders of the sum make differently: (the largest error as a fraction of the largest reference value, the fraction that differ)
+MATRIX_ROWS = {"f32": (2.0**-12, 1.0), "bf16": (2.0**-7, 0.005), "f16": (2.0**-10, 0.03)}
+
+
+@pytest.fixture(scope="module")
+def matrix_manifest(tmp_path_factory):
+    return runtime.export(list(KERNELS.values()), tmp_path_factory.mktemp("matrix")).directory
+
+
+@pytest.mark.parametrize("dt", ["f32", "bf16", "f16"])
+@pytest.mark.parametrize("name", ["layernorm", "gelu", "swiglu", "softmax"])
+def test_the_matrix_of_dtypes_and_distributions(matrix_manifest, name, dt):
+    op = KERNELS[(name, dt)]
+    for kind in MATRIX_KINDS + (("rows",) if name == "layernorm" else ()):
+        rel = fraction = 0.0
+        for seed in SEEDS:
+            r = both(matrix_manifest, op, *args_of(name, dt, kind, seed))
+            got, want = r["replay"][0], r["reference"][0]
+            assert torch.equal(torch.isfinite(got), torch.isfinite(want)), (name, dt, kind)
+            ulp, absolute, relative, frac = measure(f"{name} {dt} {kind} seed {seed}", got, want)
+            rel, fraction = max(rel, relative), max(fraction, frac)
+        print(f"[matrix] {name} {dt} {kind}: max abs / max|ref| {rel:.3g}, elements that differ {fraction:.3%}")
+        bound, differ = MATRIX_ROWS[dt] if kind == "rows" else (max(STEP[dt], 2.0**-20), MATRIX_DIFFER[(name, dt)])
+        assert rel <= bound, (name, dt, kind, rel)
+        assert fraction <= differ, (name, dt, kind, fraction)

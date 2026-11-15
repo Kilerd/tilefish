@@ -31,6 +31,11 @@ each section names the release that added it.
   to the table's check. `docs/numerics.md` is the procedure on a CUDA or torch change, the `num_warps` decision, and a design for device-global
   state (counters), which waits for a memset step in plans.
 
+### The reference mode
+
+- The tolerance matrix of `test_gpu_reference.py` covers f32, bf16 and f16 inputs and outputs of the layernorm, gelu, swiglu and softmax goldens
+  on five more distributions (uniform, heavy-tailed, sparse outliers, values of every magnitude, rows of one value), measured and asserted.
+
 ### Pinned GEMMs
 
 - `test_gpu_gemm.py` asserts that `heuristic="torch"` (with torch's default reduction) gives `torch.mm` / `torch.addmm` byte for byte on the 30

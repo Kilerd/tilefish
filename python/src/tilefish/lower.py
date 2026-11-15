@@ -456,8 +456,9 @@ The ``reference`` mode is held to the binary within tolerances that are measured
 a ULP count only means something where the result is far from zero, so for a bf16 output the bound is half a bf16 step of the
 largest value of the reference (``2**-7 * max|ref|``) together with a fraction of elements allowed to differ, for the f32 softmax an
 absolute error of 5e-7 (and ULP where meaningful), for the gelu an absolute error of 3e-5. They differ by dtype, kernel and
-distribution (the mean of a layernorm's data, the scale of a softmax's), and the measured bounds are tabulated, and asserted, in
-``tests/test_gpu_reference.py``.
+distribution (the mean of a layernorm's data, the scale of a softmax's; heavy tails, outliers, values of every magnitude) and by the dtype of
+the output (f32, bf16, f16), and the measured bounds are tabulated, and asserted, in ``tests/test_gpu_reference.py``. Where the reference is exact
+(IEEE math, notes 15 to 17) the binary is its bytes.
 """
 
 from __future__ import annotations
