@@ -775,6 +775,53 @@ def check_tf32(
     )
 
 
+CONTRACTION_FIXES = (
+    "Fixes: write each multiply (and add) whose rounding matters as scalar inline PTX with an explicit rounding, "
+    'tl.inline_asm_elementwise("mul.rn.f32 $0, $1, $2;", "=f,f,f", [a, b], dtype=tl.float32, is_pure=True, pack=1) and "add.rn.f32" likewise, '
+    "which no compiler packs or contracts; or, where the compiler may contract, declare enable_fp_fusion=True"
+)
+
+
+def check_contraction(spec: "CompileSpec", cap: int, ptx: str, cubin: bytes, options: "Mapping[str, Any]", sha256: str) -> None:
+    """Refuse a binary compiled with ``enable_fp_fusion=False`` in which ``ptxas`` fused a multiply and an add (:mod:`tilefish._fpcontract`).
+
+    Every kernel Triton builds with that option is checked, from its PTX and its cubin (a cache hit too): a hand-written ``extern`` (Triton or
+    Gluon) that declares it, a lowered ``@kernel(fp_fusion=False)`` and a graph's fused region (whose every float ``+ - *`` is a scalar ``.rn``
+    instruction, note 2 of :mod:`tilefish.lower`: a refusal there is a bug of tilefish), and a generated op that is compiled so (``col2im1d``).
+    A binary with nothing to contract (no float multiply, or no float add) is not disassembled. Raises :class:`~tilefish.errors.TilefishBuildError`
+    with the fixes.
+    """
+    if options.get("enable_fp_fusion") is not False or spec.binary is not None:
+        return
+    from . import _fpcontract
+
+    verdict = _fpcontract.check(ptx, cubin, dict(options), key=sha256)
+    if verdict is None or not verdict.contracted:
+        return
+    examples = "; ".join(f"/*{f.address:04x}*/ {f.text}" for f in verdict.instructions[:3])
+    read = f"read in its SASS ({verdict.nvdisasm})"
+    if verdict.proxy:
+        read = (
+            f"read in the SASS of its PTX assembled for {verdict.target}, the base of its architecture's family, by {verdict.nvdisasm}, which cannot "
+            f"decode sm_{cap} ({_fpcontract.NVDISASM_ENV} names one that can)"
+        )
+    if spec.source_sha256 is not None:
+        tail = (
+            "Every float + - * of a kernel lowered with fp_fusion=False, and of a fused region, is one scalar .rn instruction (note 2 of "
+            "tilefish.lower), so this is a bug of tilefish's lowering: please report it with the kernel."
+        )
+    else:
+        tail = CONTRACTION_FIXES
+    raise TilefishBuildError(
+        f"'{spec.stem}' ({spec.triton}) for sm_{cap} is compiled with enable_fp_fusion=False, every multiply and add rounded on its own, but "
+        f"ptxas fused multiplies and adds into one rounding: {verdict.lanes} lanes of fused multiply-adds where the same PTX with its multiplies "
+        f"kept apart has {verdict.allowed} (its explicit fma instructions and what ptxas expands division, square root and reciprocal into), "
+        f"{read}: {examples}. Refusing to build it: the binary would not compute what the declaration says, and nothing at run time would say "
+        "so. (On sm_100 and later LLVM packs two lanes' f32 operations into mul.rn.f32x2 and add.rn.f32x2, and ptxas 12.9 contracts such a pair "
+        f"whatever --fmad says: into FFMA2 on sm_100 and sm_103, into FFMA on sm_120.) {tail}"
+    )
+
+
 @contextlib.contextmanager
 def _always_compile(triton: Any) -> "Iterator[None]":
     """Make ``triton.compile`` compile, never read its disk cache, for the duration of the block.
@@ -996,6 +1043,7 @@ def build(
         hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
             check_tf32(spec, cap, frontend_ir, hit.ptx, triton_version)  # an entry has its PTX only, which the build that stored it was judged by too
+            check_contraction(spec, cap, hit.ptx, hit.cubin, opts, hit.sha256)  # (an entry a tilefish without the check stored, too)
             check_launch_attributes(spec, hit.launch)  # the scratch and the cluster the declaration states, as for a compile
             return dataclasses.replace(hit, cuda_math=cuda_math)  # (read from the source and the libdevice here, not from the cache)
 
@@ -1053,6 +1101,8 @@ def build(
     asm = getattr(compiled, "asm", {})
     check_tf32(spec, cap, frontend_ir, ptx, triton_version, ttir=_text_or_none(asm.get("ttir")), ttgir=_text_or_none(asm.get("ttgir")))
     from hashlib import sha256
+
+    check_contraction(spec, cap, ptx, cubin, opts, sha256(cubin).hexdigest())
 
     target = _PTX_TARGET.search(ptx)
     built = BuiltKernel(
