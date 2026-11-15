@@ -1,5 +1,6 @@
 //! Launch plans read with no GPU: the golden plan directories of `python/tests/golden/plans` (written by `export_plan_fixtures.py`: the
-//! transformer block of `plan_model.py`, without and with reuse, with a real manifest of fake cubins) load with their pins and give every
+//! transformer block of `plan_model.py`, without and with reuse, with a real manifest of fake cubins: reader fixtures, which no GPU loads, since a
+//! driver refuses their cubins as an invalid image whatever architecture the documents name; the GPU gates export their own) load with their pins and give every
 //! number `expected.json` has; the digests are reproduced from the files; and every refusal of section 3 of `docs/plan-schema-1.md` (a wrong pin,
 //! an edit, an edit that rewrites the digest, a plan of another manifest, a manifest or a cubin changed under the plan) is a refusal here.
 //!

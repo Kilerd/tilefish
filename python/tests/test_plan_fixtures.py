@@ -23,6 +23,21 @@ def committed():
     return json.loads((fx.DEFAULT / "expected.json").read_text())
 
 
+def test_the_golden_cubins_are_fakes_that_no_gpu_loads(committed):
+    """The golden plans are reader fixtures, for every machine: each cubin is the fake ELF file of ``plan_fakes`` (an ELF header for ``sm_103``, the
+    placeholder code of ``elf_builder.cubin_like``, no machine code), so a driver refuses it (``cuModuleLoadData``: ``CUDA_ERROR_INVALID_IMAGE`` on a
+    B300, where the committed fixtures of the crate load; another GPU refuses the architecture first). No test instantiates a golden plan; the GPU
+    tests export their plans on the device (``rust_gate.py prepare``)."""
+    from elf_builder import cubin_like
+
+    placeholder = cubin_like.__kwdefaults__["code"]
+    cubins = sorted(fx.DEFAULT.rglob("*.cubin"))
+    assert len(cubins) == 18 and all(c.name.endswith(".sm_103.cubin") for c in cubins)
+    for cubin in cubins:
+        data = cubin.read_bytes()
+        assert data[:4] == b"\x7fELF" and len(data) < 2048 and placeholder in data, cubin
+
+
 def without_version(path):
     doc = json.loads(path.read_text())
     doc.pop("tilefish", None)  # the version of the package that wrote the file: not digested, so not compared

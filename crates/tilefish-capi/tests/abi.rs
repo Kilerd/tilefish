@@ -29,6 +29,8 @@ fn fixture_pin() -> String {
         .to_owned()
 }
 
+/// A golden plan directory of `python/tests/golden/plans` and what `expected.json` says of it: real documents over fake cubins, read here and never
+/// instantiated (no driver loads those cubins; the C++ GPU gate runs the plans `rust_gate.py prepare` exports on the device).
 fn golden(name: &str) -> (PathBuf, Value) {
     let dir = repo().join("python/tests/golden/plans");
     (dir.join(name), json(&dir.join("expected.json"))[name].clone())

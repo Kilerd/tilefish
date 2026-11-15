@@ -5,7 +5,9 @@
 Three directories, ``block`` and ``block-reuse`` (the transformer block of ``plan_model`` planned without and with liveness reuse) and ``steps`` (the graph
 ``plan_model.steps``: a result written over its input, two copy steps, a returned reshape and named outputs), each exported to ``sm_103`` the way
 ``tilefish.runtime.export`` does, but with the *fake* builds of ``plan_fakes`` (a tiny ELF file per kernel entry, a made-up 64-byte algorithm per GEMM): what is real is
-the format, the digests and the plan; the machine code is not, so the fixtures validate a reader and cannot be launched. Each directory has ``manifest.json`` (schema 3),
+the format, the digests and the plan; the machine code is not, so the fixtures validate a reader and cannot be launched (``sm_103`` is the architecture
+the documents name, not one a driver loads the cubins on: ``cuModuleLoadData`` refuses them, with ``CUDA_ERROR_INVALID_IMAGE`` on a B300 (sm_103), and
+no test instantiates them; a test that launches a plan exports it on its device, as ``rust_gate.py prepare`` does). Each directory has ``manifest.json`` (schema 3),
 the cubins and ``plan.json``; ``expected.json`` has, for each, the plan digest and the manifest digest that Python computes, the arena size and every buffer's offset, which a
 reader in another language must reproduce from the files alone (``docs/plan-schema-1.md``). Two plan sets: ``set`` (one stage per key) and ``carried`` (stages
 that hand carried buffers to each other, with the layout of the arena they share and its carried regions in ``expected.json``). ``test_plan_fixtures.py`` regenerates all of it and requires the committed files

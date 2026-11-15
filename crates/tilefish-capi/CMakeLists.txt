@@ -121,6 +121,7 @@ if(TILEFISH_BUILD_TESTS)
     set(tilefish_repo "${CMAKE_CURRENT_SOURCE_DIR}/../..")
     file(READ "${tilefish_repo}/crates/tilefish/tests/fixtures/expected.json" tilefish_fixtures_json)
     string(JSON tilefish_fixture_pin GET "${tilefish_fixtures_json}" fixtures sm_103 manifest_digest)
+    # the golden plans are reader fixtures (real documents, fake cubins that no driver loads): the tests read them and instantiate none
     file(READ "${tilefish_repo}/python/tests/golden/plans/expected.json" tilefish_plans_json)
     string(JSON tilefish_block_pin GET "${tilefish_plans_json}" block plan_digest)
     string(JSON tilefish_carried_pin GET "${tilefish_plans_json}" carried set_digest)

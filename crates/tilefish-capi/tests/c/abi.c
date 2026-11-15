@@ -4,7 +4,8 @@
  *
  *     tilefish_c_abi <manifest dir> <manifest pin> <plan dir> <plan pin> <plan set dir> <plan set pin>
  *
- * (ctest passes the committed fixtures: crates/tilefish/tests/fixtures/sm_103, python/tests/golden/plans/block and .../carried.)
+ * (ctest passes the committed fixtures: crates/tilefish/tests/fixtures/sm_103, python/tests/golden/plans/block and .../carried. The golden plans
+ * hold fake cubins, which no driver loads: they are read here, never instantiated.)
  */
 #include <stddef.h>
 #include <stdint.h>
