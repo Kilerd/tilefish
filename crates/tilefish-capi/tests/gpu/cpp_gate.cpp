@@ -109,8 +109,9 @@ tilefish::Dims dims_of(const json::Value& v) {
 /// The host: a context on device 0 (the primary context, which the gate's own driver calls use too) and a stream of its own.
 struct Gpu {
     tilefish::Context ctx = tilefish::Context::primary(0);
+    // the gate's own driver calls (memory, streams, graphs) run in that context: current from here on (tilefish leaves it so)
+    bool current = (driver::check(driver::api().cuCtxSetCurrent(ctx.handle()), "cuCtxSetCurrent"), true);
     driver::Stream stream;
-    Gpu() { driver::check(driver::api().cuCtxSetCurrent(ctx.handle()), "cuCtxSetCurrent"); }
     CUstream s() const { return stream.get(); }
 };
 
@@ -949,6 +950,12 @@ int main(int argc, char** argv) {
         return 2;
     }
     gate = fs::absolute(dir);
+    try {
+        gpu();  // the context and the stream, before any test allocates
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "cpp gate: no GPU: %s\n", e.what());
+        return 1;
+    }
     const std::vector<std::pair<const char*, void (*)()>> tests = {
         {"cases", test_cases},       {"embedded", test_embedded}, {"workspace", test_workspace},
         {"refusals", test_refusals}, {"single_launch_graph", test_single_launch_graph},
