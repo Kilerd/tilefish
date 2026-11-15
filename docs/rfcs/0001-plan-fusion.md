@@ -29,6 +29,7 @@ that can change NaN payloads), and the tests that prove it.
 ## Contents
 
 Decisions (2026-11-15)
+Phase 0 results (2026-11-15, sm_103)
 0. Background: what exists
 1. Use cases and non-goals
 2. Surface syntax and capture
@@ -64,6 +65,38 @@ The draft was reviewed on 2026-11-15. The questions of section 9.4 that are sett
 
 D3 and D4 were the recommended defaults and were not objected to. Q4b and Q8 to Q11 stay open; section 9.4 gives the recommended default of
 each.
+
+## Phase 0 results (2026-11-15, sm_103)
+
+Measured on a B300 MIG slice (sm_103) with torch 2.9.1 (CUDA 12.8), Triton 3.5.1, ptxas 12.9 and cuBLASLt 12.8.4. None of the results changes
+a decision; E5 confirms hazard H1, and phase 1 closes it.
+
+* **E1, tree reductions in context.** A `tl.sum` row reduction of `r * r` alone (the operand stored by an elementwise kernel) against the same
+  reduction fused after loads of a bf16 `x` and an f32 residual, with the same warp count: at 96 columns (1 warp) no row differs; at 1000,
+  1024 and 4096 columns (4, 4 and 16 warps) **357 to 399 of 1024 rows differ** (three seeds). The ordered sum (`tree(128)`) differs in no row.
+  This is the premise of D2: a Triton tree reduction's bytes depend on the rest of its kernel.
+* **E2, `tl.max`.** At 1, 2, 4, 8 and 16 warps, and with every row's elements permuted, `max` over rows of `+0.0` / `-0.0` mixes, zeros with
+  negatives, and NaNs with random payloads among numbers (2048 rows each of 100, 1000 and 4096 columns): **no row differs**. A row with a
+  `+0.0` gives `+0.0`, and NaNs are dropped. So `max` is order-free on these inputs and may join row regions (phase 2) without a new lowering;
+  the phase 2 tests keep checking it.
+* **E3, speed** (plans captured in CUDA graphs; microseconds per plan run; the fused kernel is what a region generates, `fp_fusion=False`):
+
+  | case | rows | fused | unfused (one kernel per op) | notes |
+  |---|---|---|---|---|
+  | bias + SiLU, `[M, 3072]` bf16 | 32 / 4096 | 1.45 / 58.6 | 8.61 / 208.5 | fused and unfused byte-identical |
+  | SwiGLU on contiguous halves, `[M, 3072]` | 32 / 4096 | 1.34 / 51.5 | 8.74 / 278.2 | fused and unfused byte-identical |
+  | residual add + rmsnorm, 1024 columns | 32 / 4096 | ordered `tree(128)` 2.05 / 80.2; tree 1.23 / 28.6 | D2 (three kernels) 6.07 / 61.4 | |
+  | softmax, 1024 columns | 32 / 4096 | ordered 2.05 / 54.5; tree 1.44 / 18.0 | D2 (four steps) 6.04 / 44.8 | |
+
+  Elementwise fusion is 3.6 to 6.5 times faster. D2 costs about 5 times the tree form at 32 rows and 2 to 2.5 times at 4096; an ordered sum
+  recovers most of it at 32 rows, but the current ordered-sum lowering is slower than D2 at 4096 rows, so its speed is phase 2 work.
+* **E4, the cuBLASLt bias epilogue.** `(gemm_f32(a, b) + bias.to(f32)).to(bf16)` against `gemm_bias(a, b, bias)` with a bf16 output, both
+  pinned under the torch posture and under the default posture, `M` of 32, 64, 128 and 1024 with `N x K` of 1536 x 512, 3072 x 1024 and
+  1024 x 3072, special values in the bias: **no element differs** in any of the 24 comparisons. Measured, not proven: it informs section 11.2.
+* **E5, H1.** Inside one kernel, `x.to(f32).to(bf16)` of every bf16 bit pattern **keeps the payload of all 254 NaNs**, where the two kernels of
+  the unfused composition give `0x7FFF` for each; the same holds for f16 (2046 of 2046 NaNs). A `where` between two widened values, narrowed
+  after it, differs on 506 outputs, all NaNs: the fold reaches through a select too. Every non-NaN output is the same. Phase 1 therefore emits
+  **every** narrowing float cast of a region (not only one directly after a widening cast) as inline PTX, which no fold can see.
 
 ## 0. Background: what exists
 
@@ -352,7 +385,7 @@ they compile to the same instructions.
 | extension | needed for | phase |
 |---|---|---|
 | strided (non-dense) inputs in the elementwise template: an operand read at `sum(coordinate_k * stride_k)`, the coordinates as note 12 computes them | gated activations, heads of a fused `qkv`, transposed operands | 1 |
-| narrowing float casts as inline PTX when fused after a widening cast (hazard H1) | NaN-payload exactness | 1 |
+| every narrowing float cast in a region as inline PTX (hazard H1, confirmed by E5) | NaN-payload exactness | 1 |
 | strided inputs in the row template (a row stride; column stride 1 or general) | norms over views | 2 |
 | strided outputs (a store into a column block) | writing `q`, `k`, `v` in place | 2 |
 | dense reshapes inside an elementwise region | heads, `[B, T, D]` reshaped | 2 |
@@ -415,11 +448,11 @@ It holds by construction when these obligations hold. Each has a test (5.6) and,
 
 | | hazard | effect | resolution |
 |---|---|---|---|
-| H1 | LLVM's instcombine (and MLIR's arith folders) can fold `fptrunc(fpext(x))` to `x`, which they treat as exact, wherever a cast reaches them as an ordinary conversion. In `U` the widening and the narrowing are two kernels and the narrowing is `cvt.rn.bf16.f32`, which makes every NaN canonical (`0x7FFF`, note 1); fused and folded, the input's payload survives. Whether Triton 3.5.1's casts reach the fold is experiment E5 | `x.to(f32).to(bf16)` of an input NaN with a non-canonical payload differs (only NaNs, and only NaNs that come from an input: GPU arithmetic produces canonical ones) | a narrowing float cast whose operand is a widening cast in the same region is emitted as inline PTX (`cvt.rn.bf16.f32`, the instruction the standalone cast compiles to), which LLVM cannot fold; the rewrites never emit such a pair; NaN-payload tests on every cast pair |
+| H1 | MLIR's arith folders or LLVM's instcombine fold `fptrunc(fpext(x))` to `x`, which they treat as exact, and reach through a select between widened values too (confirmed by E5). In `U` the widening and the narrowing are two kernels and the narrowing is `cvt.rn.bf16.f32`, which makes every NaN canonical (`0x7FFF`, note 1); fused and folded, the input's payload survives | `x.to(f32).to(bf16)` of an input NaN with a non-canonical payload differs (only NaNs, and only NaNs that come from an input: GPU arithmetic produces canonical ones) | every narrowing float cast in a region is emitted as inline PTX (`cvt.rn.bf16.f32` / `cvt.rn.f16.f32`, the instruction the standalone cast compiles to), which no fold can see; tested on every bit pattern of each cast and on cast pairs with NaN payloads |
 | H2 | a value `U` loads from memory becomes a constant in `F` (a memset folded into a region, a known zero), and MLIR or LLVM folders then apply (`x + (-0.0) -> x` keeps a NaN payload that a GPU `add` would canonicalise) | NaN payload and signed-zero differences | rule: **a value `U` loads, `F` loads or computes by the same ops; it is never replaced by a constant**. Constants are only the IR's own literals, which are per node and so folded identically in `F` and `U` |
 | H3 | contraction across an op boundary (`a * b` in one op, `+ c` in the next) | 23% of elements differ (note 2) | O3: no contraction unless declared |
 | H4 | a Triton tree reduction's operand layout (elements per thread, from the loads that anchor the layout) depends on the whole kernel, so the same `tl.sum` may add in another tree when other loads of other dtypes share its kernel | last-bit differences, data-dependent | D2: unordered reductions run alone, and their operand is stored; experiment E1 measures how often the tree really changes |
-| H5 | `tl.max` on `+0.0` and `-0.0`, and on NaN, may depend on the order | a sign of zero | experiment E2; if it is not order-free, a total-order combine (as `argmax` has) replaces it in regions |
+| H5 | `tl.max` on `+0.0` and `-0.0`, and on NaN, might depend on the order | a sign of zero | E2: order-free on every tested row at 1 to 16 warps and under permutation; `max` may join row regions, and the phase 2 tests keep checking it |
 | H6 | the library behind a math op changes with the CUDA or libdevice version (CUDA 13.2 changed `erff`) | other bytes, `F` and `U` alike | not a fusion hazard (O7); the CUDA math guard warns |
 
 ### 5.4 Modes
