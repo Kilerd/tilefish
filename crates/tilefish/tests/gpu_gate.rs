@@ -1505,6 +1505,38 @@ fn the_gate_has_tanh() {
     }
 }
 
+/// Lowered kernels of the primitives of notes 15 to 17 of `tilefish.lower` (`python/tests/primitive_cases.py`, `host_ops.primitive_ops`): CUDA's
+/// `erff` in IEEE math, an `fma`, CUDA's negation and an rmsnorm whose sum of squares is an ordered `fma` sum; `byte_identity` holds their bytes to
+/// Python's (which `rust_gate.py` holds to the exact reference). The export records the CUDA math functions of its generated kernels (section 4.3 of
+/// the manifest schema): `erf_ieee` copies CUDA's `erff`, which CUDA 13.2 changed, so `check_cuda_math` refuses that release and takes 12.8.
+#[test]
+fn the_gate_has_the_numerics_primitives_and_their_cuda_math() {
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no primitives");
+        return;
+    }
+    let arch = cases["arch"].as_str().unwrap().to_owned();
+    let manifest = manifest();
+    for stem in ["erf_ieee", "fma3", "neg_f32", "rmsnorm_ordered"] {
+        let entry = manifest.entry(stem, &arch).unwrap_or_else(|| panic!("the gate's manifest has no {stem}"));
+        assert!(entry.source_sha256.is_some(), "{stem}: the sha256 of the generated source");
+        let n = cases_where(&cases, |c| c["stem"] == stem).len();
+        assert!(n >= 2, "{stem}: {n} cases");
+        println!("rust gate: the primitive {stem}: {n} cases");
+    }
+    let erf = manifest.entry("erf_ieee", &arch).unwrap().cuda_math.clone().expect("erf_ieee records its CUDA math");
+    assert_eq!(erf.functions, ["erff"]);
+    assert!(erf.cuda.iter().any(|r| r == "12.8") && !erf.cuda.iter().any(|r| r == "13.2"), "{:?}", erf.cuda);
+    assert!(manifest.entry("fma3", &arch).unwrap().cuda_math.is_none(), "an fma copies no library function");
+    let tanh = manifest.entry("tanh_fast", &arch).unwrap().cuda_math.clone().expect("tanh_fast records its CUDA math");
+    assert_eq!(tanh.functions, ["tanhf"]);
+    assert!(tanh.libdevice.is_some(), "tanh_fast links libdevice");
+    manifest.check_cuda_math("12.8").expect("every function of the gate's kernels was measured on CUDA 12.8");
+    let refused = manifest.check_cuda_math("13.2").expect_err("CUDA 13.2 changed erff").to_string();
+    assert!(refused.contains("'erf_ieee'"), "{refused}");
+}
+
 /// The GEMMs of the forms of section 9.2 of the manifest schema (on a fresh export): f16 operands in TN (with 64 MiB of workspace) and in NN (with a
 /// bias, under the torch posture), an f32 result of f16 operands and of bf16 ones in NN, f16 operands pinned for a partition of 16 SMs
 /// (`sm_count_target`: the Rust host sets it on every launch, and a host on a partition takes only the pins chosen for it), and f32 operands with
