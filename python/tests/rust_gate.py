@@ -33,6 +33,10 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   (f32, a bias, a runtime channel count, to ``[N, C, Lo]``, over contiguous tensors, views with an offset and transposed views) and in the tap order
   (bf16, 64 static channels, to a channel-last ``[N, Lo, C]``, over transposed views and views with an offset), checked here against ``F.fold`` (ATen's
   CUDA ``col2im``, the order of the adds the op keeps) and against the op's torch reference;
+* **64-bit dimension scalars and null pointers** (``types_kernels.py``): ``add_one_wide`` (an ``i64[n]`` count), ``scale_null`` / ``scale_bias`` (one Triton
+  kernel declared with a null bias and with a tensor) and ``scale_null_ptx`` / ``scale_bias_ptx`` (a hand-written PTX that reads the bias only when it is not
+  null, with a 64-bit count), checked here against torch; and ``add_rows_ua``, the specialisation of a lowered kernel for a first row that starts off 16
+  bytes (``KernelOp.unaligned``), launched on rows of an int32 plane;
 * **an Out that may be written over an input** (``gpu_kernels_p5.py``): ``add_into`` launched with its outputs apart; the plan ``residual_chain``
   (without and with reuse) writes both of its calls in place, over the residual it made in the arena; the plan ``copy_steps`` has two copy steps
   (``tilefish.copy`` of a dense view into the arena, a store into an ``InOut`` parameter), launched and captured; the plan ``view_returns`` returns a
@@ -340,6 +344,44 @@ def args_add_into(rows, seed):
     return randn((rows, 64), F32, seed), randn((rows, 64), F32, seed + 50)
 
 
+def args_bytes(n, seed):
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(seed + n)
+    return (torch.randint(0, 256, (n,), dtype=torch.uint8, device="cuda", generator=gen),)
+
+
+def must_add_one(args, got):
+    assert torch.equal(got, args[0] + 1)
+
+
+def args_scale_null(n, seed):
+    return (randn((n,), F32, seed + n),)
+
+
+def args_scale_bias(n, seed):
+    return (randn((n,), F32, seed + n), randn((n,), F32, seed + n + 1))
+
+
+def must_double(args, got):
+    assert same_bytes(got, args[0] * 2.0)
+
+
+def must_double_and_add(args, got):
+    assert same_bytes(got, args[0] * 2.0 + args[1])
+
+
+def args_plane_rows(r, seed):
+    """Rows 1 and 0 of a ``[3, r]`` int32 plane: the first starts ``4 * r`` bytes in (off 16 bytes for an odd ``r``)."""
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(seed + r)
+    plane = torch.randint(-(2**20), 2**20, (3, r), dtype=torch.int32, device="cuda", generator=gen)
+    return (plane[1], plane[0])
+
+
+def must_add_rows(args, got):
+    assert torch.equal(got, args[0] + args[1])
+
+
 def must_add_into(args, got):
     x, r = args
     y = got  # the first result (the check of a case sees that one): y = 0.5 * (r + x), which needs r_out = r + x
@@ -642,6 +684,14 @@ def build_cases():
     cases += plain("row_sum", "row_sum", args_rows, (1, 2, 7, 40, 1000), seeds=(0, 1), check=must_be_this_tiling)
     # -- an Out that may be written over an input (MayAlias): launched apart here; in place in the plan residual_chain
     cases += plain("add_into", "add_into", args_add_into, (8, 24), seeds=(0, 1), check=must_add_into)
+    # -- a 64-bit dimension scalar, null pointers (a Triton kernel and a prebuilt PTX that reads the bias only when it is not null), and the specialisation of
+    # a lowered kernel for a first row that starts off 16 bytes (M3.5)
+    cases += plain("add_one_wide", "add_one_wide", args_bytes, (1, 1000, 65539), seeds=(0,), check=must_add_one)
+    for op in ("scale_null", "scale_null_ptx"):
+        cases += plain(op, op, args_scale_null, (1, 1000, 65539), seeds=(0,), check=must_double)
+    for op in ("scale_bias", "scale_bias_ptx"):
+        cases += plain(op, op, args_scale_bias, (1, 1000, 65539), seeds=(0,), check=must_double_and_add)
+    cases += plain("add_rows_ua", "add_rows__ua0", args_plane_rows, (5, 8, 13), seeds=(0,), check=must_add_rows)
     # -- generated ops: the patches of a 1-D convolution in both column orders, over channel-last views, offsets and contiguous tensors
     tap, channel = generated_ops()["im2col1d_tap"].name, generated_ops()["im2col1d_channel"].name
     cases += plain("im2col1d_tap", tap, args_channel_last, ((1, 1), (2, 19), (3, 100)), seeds=(0,), check=must_be_patches(7, 1, 3, (18, 0), "tap"))
