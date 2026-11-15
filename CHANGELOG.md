@@ -41,6 +41,8 @@ each section names the release that added it.
   did not change). A build now names each file by a path that does not depend on the host: `kernels/rms.py` for the module
   `kernels.rms`, `tilefish_generated/<name>.py` for a generated source, otherwise the base name. Two exports with the same toolchain
   for the same device are the same files and digests, from any directory, process or machine, and a recorded pin checks a rebuild.
+  `ptxas` runs in an empty directory, so that it does not find a source file by such a relative name and record its modification time
+  and size (a build run from the directory of the sources would have).
   The machine code is unchanged: every `sha256_code` is what 0.0.6 built. Manifest schema 3, the digest and both readers are unchanged,
   and manifests of 0.0.6 or earlier load and replay as before (`docs/manifest-schema-3.md`, section 3.1, says why the digest still covers
   the files rather than `sha256_code`).

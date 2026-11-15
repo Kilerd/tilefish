@@ -45,6 +45,8 @@ file by a path that does not depend on the host (:func:`tilefish._source.source_
 ``tilefish_generated/rmsnorm.py`` for a generated kernel, ``triton/language/standard.py`` for Triton's own), not by where the checkout, the
 virtual environment or a scratch directory happens to be (:func:`host_independent_paths`). Two builds of one kernel with one toolchain are
 then the same bytes on any machine, from any directory, in any process. The digest above never had a location in it.
+``ptxas`` runs in an empty directory (:func:`ptxas_in_an_empty_directory`): it would otherwise record the modification time and size of a
+source file it finds under such a relative name from its working directory.
 ``TILEFISH_DEBUG_PATHS=absolute`` keeps the absolute paths instead, for a profiler that opens the source files where they are; the
 builds are then not reproducible (:func:`tilefish._source.debug_paths`).
 """
@@ -53,6 +55,8 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import shutil
+import tempfile
 import threading
 from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
@@ -76,6 +80,7 @@ _TAGS = {"triton": _TAG, "gluon": b"tilefish.gluon-ir-digest.v1\0"}
 # needs the frontend waits until it is done (a cache hit runs only the frontend, but waits for a compile in progress too).
 LOCK = threading.RLock()
 _naming = threading.local()  # .depth > 0 in a thread whose frontend names source files by host-independent paths (host_independent_paths)
+_ptxas_cwd = threading.local()  # .depth > 0 (and .directory) in a thread whose compile runs Triton's ptxas in an empty directory
 
 
 def triton_importable() -> bool:
@@ -242,6 +247,60 @@ def host_independent_paths() -> "Iterator[None]":
             yield
         finally:
             _naming.depth -= 1
+
+
+class _PtxasCwd:
+    """The ``subprocess`` module as Triton's NVIDIA backend sees it, but for ``run``: in a thread inside :func:`ptxas_in_an_empty_directory`
+    a command that names no working directory runs in that block's empty directory. Everything else is the module's."""
+
+    _tilefish_ptxas_cwd = True
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        if getattr(_ptxas_cwd, "depth", 0) > 0 and kwargs.get("cwd") is None:
+            kwargs["cwd"] = _ptxas_cwd.directory
+        return self._module.run(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def ptxas_in_an_empty_directory() -> "Iterator[None]":
+    """Within the block, the ``ptxas`` that Triton runs in this thread (``make_cubin``) runs in an empty private directory.
+
+    ``ptxas`` looks up each file a PTX ``.file`` directive names, from its own working directory, and where it finds one it writes the file's
+    modification time and size into the cubin's line table. The names are the host-independent ones (:func:`host_independent_paths`), and
+    relative: so a compile run from the directory that holds ``kernels/rms.py`` (the root of a checkout, or a directory of top-level modules)
+    would record when that file was last written, and two checkouts of the same sources, or one touched file, would give other bytes. In an empty
+    directory nothing is found, wherever the build runs. ``subprocess`` of Triton's NVIDIA backend is wrapped once per process, under
+    :data:`LOCK`, and the wrapper changes nothing in any other thread or outside the block. Nothing is done when the backend is not importable."""
+    try:
+        from triton.backends.nvidia import compiler
+    except ImportError:  # no NVIDIA backend (or no Triton): no ptxas is run by it
+        yield
+        return
+    with LOCK:
+        current = getattr(compiler, "subprocess", None)
+        if current is None:
+            raise TilefishBuildError(
+                "this Triton's NVIDIA backend has no subprocess module through which a build runs its ptxas in an empty directory (so that "
+                "the cubin does not record the modification time of a source file; Triton 3.5.1 has it)"
+            )
+        if not getattr(current, "_tilefish_ptxas_cwd", False):
+            compiler.subprocess = _PtxasCwd(current)
+        depth = getattr(_ptxas_cwd, "depth", 0)
+        if depth == 0:
+            _ptxas_cwd.directory = tempfile.mkdtemp(prefix="tilefish-ptxas-")
+        _ptxas_cwd.depth = depth + 1
+        try:
+            yield
+        finally:
+            _ptxas_cwd.depth -= 1
+            if _ptxas_cwd.depth == 0:
+                shutil.rmtree(_ptxas_cwd.directory, ignore_errors=True)
 
 
 def recording_source(ASTSource: Any) -> Any:

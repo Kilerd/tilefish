@@ -1004,7 +1004,7 @@ def build(
     src = _ir.recording_source(_ir.source_class(spec.language))(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
     src.constants = inp.constants
     try:
-        with _always_compile(triton):
+        with _always_compile(triton), _ir.ptxas_in_an_empty_directory():
             compiled = triton.compile(src, target=GPUTarget("cuda", cap, 32), options=opts)
     except Exception as e:  # noqa: BLE001 - a compile failure of any kind is a build error, with Triton's message
         hint = _ptxas_target_hint(e, triton, ptxas)

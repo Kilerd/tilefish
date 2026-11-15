@@ -158,6 +158,37 @@ def test_the_frontend_names_files_by_module_path_only_in_the_thread_that_builds(
     assert hooked(kernel) == original(kernel)  # outside the block: what Triton says, line number included
 
 
+def test_triton_runs_ptxas_in_an_empty_directory_only_in_the_thread_that_builds(fake, monkeypatch):
+    """ptxas looks up the (relative, host-independent) names of a PTX's .file directives from its working directory and records the modification
+    time and size of a file it finds there; inside a build it runs in an empty directory instead, in that thread only."""
+    import types
+
+    calls = []
+    fake_subprocess = types.SimpleNamespace(run=lambda *a, **k: calls.append(k.get("cwd")), CalledProcessError=RuntimeError)
+    compiler = types.ModuleType("triton.backends.nvidia.compiler")
+    compiler.subprocess = fake_subprocess
+    nvidia = types.ModuleType("triton.backends.nvidia")
+    nvidia.compiler = compiler
+    monkeypatch.setitem(sys.modules, "triton.backends.nvidia", nvidia)
+    monkeypatch.setitem(sys.modules, "triton.backends.nvidia.compiler", compiler)
+    with _ir.ptxas_in_an_empty_directory():
+        wrapped = compiler.subprocess
+        assert wrapped is not fake_subprocess and wrapped.CalledProcessError is RuntimeError  # everything else is the module's
+        wrapped.run(["ptxas", "k.ptx"])
+        empty = calls[-1]
+        assert empty and pathlib.Path(empty).is_dir() and not any(pathlib.Path(empty).iterdir())
+        wrapped.run(["ptxas"], cwd="/given")  # a working directory the caller gives is kept
+        other = threading.Thread(target=lambda: wrapped.run(["ptxas"]))  # another thread's ptxas: as it is
+        other.start()
+        other.join()
+        with _ir.ptxas_in_an_empty_directory():  # nested: wrapped once, the same directory
+            assert compiler.subprocess is wrapped
+            wrapped.run(["ptxas"])
+    wrapped.run(["ptxas"])  # outside the block: as it is
+    assert calls[1:] == ["/given", None, empty, None]
+    assert not pathlib.Path(empty).exists()  # removed with the block
+
+
 def test_a_triton_without_the_entry_point_is_refused(fake, monkeypatch):
     monkeypatch.delattr(sys.modules["triton.compiler.code_generator"], "get_jit_fn_file_line")
     with pytest.raises(tilefish.TilefishBuildError, match="get_jit_fn_file_line"):

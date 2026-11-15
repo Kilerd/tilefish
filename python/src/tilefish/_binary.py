@@ -197,7 +197,9 @@ def build_binary(spec: "CompileSpec", target: "BinaryTarget", *, arch: "int | st
         with tempfile.TemporaryDirectory(prefix="tilefish-ptx-") as tmp:
             src, out = pathlib.Path(tmp) / "kernel.ptx", pathlib.Path(tmp) / "kernel.cubin"
             src.write_bytes(target.sources["ptx"])
-            done = subprocess.run([ptxas, *flags, str(src), "-o", str(out)], capture_output=True, text=True, timeout=600)
+            empty = pathlib.Path(tmp) / "cwd"  # ptxas runs where no file a .file directive names is found (it records its mtime and size)
+            empty.mkdir()
+            done = subprocess.run([ptxas, *flags, str(src), "-o", str(out)], capture_output=True, text=True, timeout=600, cwd=empty)
             if done.returncode != 0:
                 raise TilefishBuildError(f"ptxas could not assemble the PTX of '{spec.stem}' for {gpu}: {done.stderr.strip()[:2000]}")
             cubin = out.read_bytes()

@@ -107,7 +107,9 @@ path that does not depend on the host (`python/src/tilefish/_source.py`, `source
 * any other file (a script run as `__main__`): its base name.
 
 The names are applied to the frontend of a compile (`python/src/tilefish/_ir.py`, `host_independent_paths`), so the locations, the PTX and the cubin
-all carry them. Line and column numbers, and the machine code, are unchanged: an export of this version has the `sha256_code` of every binary an earlier
+all carry them. `ptxas` runs in an empty directory (`ptxas_in_an_empty_directory`; a prebuilt PTX's too): it looks each name up from its
+working directory and writes the modification time and size of a file it finds there into the line table, which a build run from the
+directory that holds `kernels/rms.py` would otherwise carry. Line and column numbers, and the machine code, are unchanged: an export of this version has the `sha256_code` of every binary an earlier
 version built from the same sources with the same toolchain, and other `sha256`s. Two exports of the same operators with the same toolchain (Triton,
 `ptxas`, cuBLASLt, cuDNN) for the same device are the same files with the same digest, from any directory, in any process, on any machine: a pin taken on
 one machine checks a rebuild on another. Options that were considered and not taken:

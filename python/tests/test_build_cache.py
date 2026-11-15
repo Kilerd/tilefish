@@ -1382,7 +1382,8 @@ def test_an_active_instrumentation_plugin_refuses_the_build(world, monkeypatch):
     kernel = project.load()
     backend = type("CUDABackend", (), {"instrumentation": None})
     monkeypatch.setitem(sys.modules, "triton.backends.nvidia", types.ModuleType("triton.backends.nvidia"))
-    monkeypatch.setitem(sys.modules, "triton.backends.nvidia.compiler", types.SimpleNamespace(CUDABackend=backend))
+    # (and the subprocess module the backend runs ptxas with, which a build makes run in an empty directory)
+    monkeypatch.setitem(sys.modules, "triton.backends.nvidia.compiler", types.SimpleNamespace(CUDABackend=backend, subprocess=subprocess))
     build(SPEC, arch="sm_90", fn=kernel)  # the backend is there and no instrumentation is on
     backend.instrumentation = object()
     with pytest.raises(TilefishBuildError, match=r"instrumentation plugin of Triton is active \(CUDABackend.instrumentation"):

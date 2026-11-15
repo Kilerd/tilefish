@@ -59,12 +59,15 @@ print(json.dumps({
 """
 
 
-def export_elsewhere(root: pathlib.Path, seed: str, **extra_env: str):
-    """Copy the graph's sources under ``root`` and export it from a child process with a working directory, caches and a TMPDIR of its own."""
+def export_elsewhere(root: pathlib.Path, seed: str, cwd_is_sources: bool = False, mtime: "float | None" = None, **extra_env: str):
+    """Copy the graph's sources under ``root`` and export it from a child process with a working directory, caches and a TMPDIR of its own
+    (``cwd_is_sources``: the directory of the sources is the working directory; ``mtime``: the modification time of the graph's module)."""
     sources = root / "sources"
     (sources / "ptx").mkdir(parents=True)
     shutil.copy(TESTS / "repro_graph.py", sources / "repro_graph.py")
     shutil.copy(TESTS / "ptx" / "axpy_f32.ptx", sources / "ptx" / "axpy_f32.ptx")
+    if mtime is not None:
+        os.utime(sources / "repro_graph.py", (mtime, mtime))
     for name in ("cwd", "tmp"):
         (root / name).mkdir()
     env = dict(os.environ)
@@ -76,7 +79,8 @@ def export_elsewhere(root: pathlib.Path, seed: str, **extra_env: str):
         PYTHONPATH=os.pathsep.join([str(SRC), str(TESTS), env.get("PYTHONPATH", "")]),
     )
     env.update(extra_env)
-    r = subprocess.run([sys.executable, "-c", CHILD, str(sources), str(root / "out")], cwd=root / "cwd", env=env, capture_output=True, text=True)
+    cwd = sources if cwd_is_sources else root / "cwd"
+    r = subprocess.run([sys.executable, "-c", CHILD, str(sources), str(root / "out")], cwd=cwd, env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-4000:]
     result = json.loads(r.stdout.strip().splitlines()[-1])
     result["root"] = root
@@ -151,3 +155,13 @@ def test_absolute_debug_paths_name_the_build_directory_with_the_same_machine_cod
     root = str(absolute["root"]).encode()
     named = [p.name for p in (absolute["root"] / "out").iterdir() if p.suffix == ".cubin" and root in p.read_bytes()]
     assert any(n.startswith("softmax_rows") for n in named) and any(n.startswith("scale_rows") for n in named), named
+
+
+def test_an_export_from_the_directory_of_its_sources_records_no_modification_time(exports, tmp_path):
+    """From the directory that holds ``repro_graph.py``, ptxas would find the file by its module-path name and write its modification time and size
+    into the line table; it runs in an empty directory, so two exports with two other modification times are the files of the exports above."""
+    first, _ = exports
+    a = export_elsewhere(tmp_path / "a", "4", cwd_is_sources=True, mtime=1_700_000_000)
+    b = export_elsewhere(tmp_path / "b", "5", cwd_is_sources=True, mtime=1_800_000_000)
+    assert a["files"] == b["files"] == first["files"]
+    assert a["manifest_digest"] == first["manifest_digest"] and a["plan_digest"] == first["plan_digest"]
