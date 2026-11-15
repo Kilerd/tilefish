@@ -14,8 +14,8 @@
 //! bytes (and written to `rust_plans/` and `rust_plans_graph/` for `compare`); one graph per bucket replayed with the inputs and the device
 //! scalars of every case of its bucket written between replays, a launch with other values in between; two launches of one run on two streams
 //! back to back; the refusals (a tampered plan, a wrong pin, a plan of another manifest, a missing or extra external, a wrong shape, dtype or
-//! bucket, ...), each of which launches nothing; the device memory over 100 launches and 100 replays after instantiation, which does not grow;
-//! and the host time of a launch and of a replay (reported).
+//! bucket, ...), each of which launches nothing; the memory this process allocates (from the device's memory pool and its graph memory) over
+//! 100 launches and 100 replays after instantiation, which is none; and the host time of a launch and of a replay (reported).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1525,25 +1525,95 @@ fn the_per_thread_default_stream_is_refused_by_a_plan() {
     );
 }
 
-/// The used memory of the device's default memory pool (what cudarc allocates from) and the free memory of the device.
-fn memory(ctx: &CudaContext) -> (u64, u64, usize) {
-    ctx.bind_to_thread().unwrap();
-    let (free, _) = cudarc::driver::result::mem_get_info().unwrap();
-    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
-    let (mut used, mut reserved) = (0u64, 0u64);
-    // SAFETY (the driver calls below): the out-pointers are live locals; the device is the context's.
-    unsafe {
-        assert_eq!(sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()), sys::CUresult::CUDA_SUCCESS);
-        let attr = sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT;
-        assert_eq!(sys::cuMemPoolGetAttribute(pool, attr, (&raw mut used).cast()), sys::CUresult::CUDA_SUCCESS);
-        let attr = sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT;
-        assert_eq!(sys::cuMemPoolGetAttribute(pool, attr, (&raw mut reserved).cast()), sys::CUresult::CUDA_SUCCESS);
-    }
-    (used, reserved, free)
+/// What this process holds of the device's memory. The pool is the device's current memory pool, which `cuMemAllocAsync` (and so cudarc,
+/// and every allocation of this crate) allocates from; graph allocation nodes allocate from the device's graph memory instead. Both belong to
+/// this process alone. The free memory of the device does not: other processes on a shared GPU change it, so it is only reported.
+#[derive(Debug, Clone, Copy)]
+struct Memory {
+    pool_used: u64,
+    pool_reserved: u64,
+    /// The high watermarks of the pool's used and reserved memory since `reset_peaks`.
+    pool_used_peak: u64,
+    pool_reserved_peak: u64,
+    graph_used: u64,
+    /// The high watermark of the graph memory's used memory since `reset_peaks`.
+    graph_used_peak: u64,
+    #[allow(dead_code)] // reported (`Debug`), never compared
+    device_free: usize,
 }
 
-/// Nothing is allocated after instantiation: the memory of the device is the same after 100 launches, and after 100 replays (the
-/// instantiation of the graph itself is measured on its own); and the host time of a launch and of a replay at M = 64 (reported).
+fn mem_pool(ctx: &CudaContext) -> sys::CUmemoryPool {
+    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+    // SAFETY: the out-pointer is a live local; the device is the context's.
+    let r = unsafe { sys::cuDeviceGetMemPool(&mut pool, ctx.cu_device()) };
+    assert_eq!(r, sys::CUresult::CUDA_SUCCESS);
+    pool
+}
+
+fn memory(ctx: &CudaContext) -> Memory {
+    use sys::CUgraphMem_attribute as G;
+    use sys::CUmemPool_attribute as P;
+    ctx.bind_to_thread().unwrap();
+    let (device_free, _) = cudarc::driver::result::mem_get_info().unwrap();
+    let pool = mem_pool(ctx);
+    let pool_attr = |attr: P| {
+        let mut value = 0u64;
+        // SAFETY: the out-pointer is a live u64, the type of the pool's memory attributes; the pool is the device's.
+        let r = unsafe { sys::cuMemPoolGetAttribute(pool, attr, (&raw mut value).cast()) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "{attr:?}");
+        value
+    };
+    let graph_attr = |attr: G| {
+        let mut value = 0u64;
+        // SAFETY: the out-pointer is a live u64, the type of the graph memory attributes; the device is the context's.
+        let r = unsafe { sys::cuDeviceGetGraphMemAttribute(ctx.cu_device(), attr, (&raw mut value).cast()) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "{attr:?}");
+        value
+    };
+    Memory {
+        pool_used: pool_attr(P::CU_MEMPOOL_ATTR_USED_MEM_CURRENT),
+        pool_reserved: pool_attr(P::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT),
+        pool_used_peak: pool_attr(P::CU_MEMPOOL_ATTR_USED_MEM_HIGH),
+        pool_reserved_peak: pool_attr(P::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH),
+        graph_used: graph_attr(G::CU_GRAPH_MEM_ATTR_USED_MEM_CURRENT),
+        graph_used_peak: graph_attr(G::CU_GRAPH_MEM_ATTR_USED_MEM_HIGH),
+        device_free,
+    }
+}
+
+/// Reset the high watermarks of [`Memory`] (a high watermark can only be reset to zero, which restarts it from the current value).
+fn reset_peaks(ctx: &CudaContext) {
+    use sys::CUmemPool_attribute as P;
+    ctx.bind_to_thread().unwrap();
+    let pool = mem_pool(ctx);
+    for attr in [P::CU_MEMPOOL_ATTR_USED_MEM_HIGH, P::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH] {
+        let mut zero = 0u64;
+        // SAFETY: the value is a live u64, the type of the pool's memory attributes; the pool is the device's.
+        let r = unsafe { sys::cuMemPoolSetAttribute(pool, attr, (&raw mut zero).cast()) };
+        assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "{attr:?}");
+    }
+    let attr = sys::CUgraphMem_attribute::CU_GRAPH_MEM_ATTR_USED_MEM_HIGH;
+    let mut zero = 0u64;
+    // SAFETY: the value is a live u64, the type of the graph memory attributes; the device is the context's.
+    let r = unsafe { sys::cuDeviceSetGraphMemAttribute(ctx.cu_device(), attr, (&raw mut zero).cast()) };
+    assert_eq!(r, sys::CUresult::CUDA_SUCCESS, "{attr:?}");
+}
+
+/// Nothing was allocated between `before` (measured right after `reset_peaks`) and `after`: the pool holds as much as before, and its used
+/// memory never rose above that in between (so nothing was allocated and freed again either); it reserved no more memory (its reserved memory
+/// itself may shrink: at a synchronize the pool releases the memory it holds unused above its release threshold); and the same for the graph
+/// memory.
+fn assert_allocated_nothing(before: Memory, after: Memory, what: &str) {
+    assert_eq!(after.pool_used, before.pool_used, "{what} hold memory of the pool: {before:?} -> {after:?}");
+    assert!(after.pool_used_peak <= before.pool_used, "{what} allocated from the pool: {before:?} -> {after:?}");
+    assert!(after.pool_reserved_peak <= before.pool_reserved, "{what} grew the pool: {before:?} -> {after:?}");
+    assert_eq!(after.graph_used, before.graph_used, "{what} hold graph memory: {before:?} -> {after:?}");
+    assert!(after.graph_used_peak <= before.graph_used, "{what} allocated graph memory: {before:?} -> {after:?}");
+}
+
+/// Nothing is allocated after instantiation: neither 100 launches nor 100 replays allocate from the device's memory pool or its graph memory,
+/// not even for a moment (the instantiation of the graph itself is measured on its own); and the host time of a launch and of a replay at M =
+/// 64 (reported). Only this process's own memory is compared, so another process on a shared GPU does not change the outcome.
 #[test]
 fn launches_and_replays_allocate_nothing_and_their_time_is_reported() {
     let gpu = Gpu::new();
@@ -1558,7 +1628,14 @@ fn launches_and_replays_allocate_nothing_and_their_time_is_reported() {
         let start = memory(&gpu.ctx);
         let run = lp.instantiate(&gpu.stream, &[("M", 64)]).unwrap();
         gpu.stream.synchronize().unwrap();
+        reset_peaks(&gpu.ctx);
         let instantiated = memory(&gpu.ctx);
+        // what is measured sees this crate's allocations: the run's arena is allocated from the pool
+        assert!(
+            instantiated.pool_used >= start.pool_used + lp.arena_bytes(),
+            "{name}: the arena ({} bytes) is not allocated from the device's memory pool: {start:?} -> {instantiated:?}",
+            lp.arena_bytes()
+        );
         let mut launch_time = Duration::ZERO;
         let n = 100;
         for _ in 0..n {
@@ -1573,6 +1650,7 @@ fn launches_and_replays_allocate_nothing_and_their_time_is_reported() {
         let mut graph = run.capture(&gpu.stream, args(&mut graph_exts, false), &named(&values)).unwrap();
         let capture_time = t.elapsed();
         gpu.stream.synchronize().unwrap();
+        reset_peaks(&gpu.ctx);
         let captured = memory(&gpu.ctx);
         let mut replay_time = Duration::ZERO;
         for _ in 0..n {
@@ -1619,8 +1697,8 @@ fn launches_and_replays_allocate_nothing_and_their_time_is_reported() {
         assert_eq!(gpu.stream.clone_dtoh(&out).unwrap(), read(expect["expect"].as_str().unwrap()));
         let steps = lp.bucket(&[("M", 64)]).unwrap().steps.len();
         println!(
-            "rust plan gate [{name}, M=64, {steps} steps]: memory (pool used, pool reserved, device free) at start {start:?}, instantiated \
-             {instantiated:?} (arena {} bytes), after {n} launches {launched:?}, after the capture {captured:?}, after {n} replays {replayed:?}",
+            "rust plan gate [{name}, M=64, {steps} steps]: memory at start {start:?}, instantiated {instantiated:?} (arena {} bytes), after \
+             {n} launches {launched:?}, after the capture {captured:?}, after {n} replays {replayed:?}",
             lp.arena_bytes()
         );
         println!(
@@ -1632,8 +1710,8 @@ fn launches_and_replays_allocate_nothing_and_their_time_is_reported() {
             launch_wall.as_secs_f64() * 1e6 / n as f64,
             replay_wall.as_secs_f64() * 1e6 / n as f64
         );
-        assert_eq!(launched, instantiated, "{name}: {n} launches allocated device memory");
-        assert_eq!(replayed, captured, "{name}: {n} replays allocated device memory");
+        assert_allocated_nothing(instantiated, launched, &format!("{name}: {n} launches"));
+        assert_allocated_nothing(captured, replayed, &format!("{name}: {n} replays"));
         drop(graph);
     }
 }
