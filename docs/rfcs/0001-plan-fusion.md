@@ -1,6 +1,7 @@
 # RFC 0001: Plan fusion
 
-* **Status:** reviewed; the decisions of 2026-11-15 are recorded in "Decisions" below. Design only: nothing here is implemented yet.
+* **Status:** reviewed; the decisions of 2026-11-15 are recorded in "Decisions" below. Phase 0 is measured and phase 1 is implemented
+  ("Phase 1" below); the rest is design.
 * **Date:** 2026-11-15.
 * **Scope:** the Python planner (`tilefish.plan`, `tilefish.runtime.export`), the lowering (`tilefish.lower`), the tracer of graph bodies and
   the `reference` mode. The hosts (the Python plan runner and the Rust crate) and both schemas are unchanged.
@@ -30,6 +31,7 @@ that can change NaN payloads), and the tests that prove it.
 
 Decisions (2026-11-15)
 Phase 0 results (2026-11-15, sm_103)
+Phase 1 (2026-11-15)
 0. Background: what exists
 1. Use cases and non-goals
 2. Surface syntax and capture
@@ -97,6 +99,29 @@ a decision; E5 confirms hazard H1, and phase 1 closes it.
   the unfused composition give `0x7FFF` for each; the same holds for f16 (2046 of 2046 NaNs). A `where` between two widened values, narrowed
   after it, differs on 506 outputs, all NaNs: the fold reaches through a select too. Every non-NaN output is the same. Phase 1 therefore emits
   **every** narrowing float cast of a region (not only one directly after a widening cast) as inline PTX, which no fold can see.
+
+## Phase 1 (2026-11-15)
+
+Implemented on the integration branch of the next release, as `tilefish._fusion` (the pass), note 20 of `tilefish.lower` (the code of a region),
+`tilefish.fusion`, `tilefish.barrier`, `tilefish.fusion_report` and `tilefish.verify_fusion`, the export-time verification and
+`<graph>.fusion.json`:
+
+* **As designed:** D1 to D7; elementwise regions (whatever the lowering takes: a region may lower with the row template when an operand is a
+  per-row or per-column value); a reduction as a region of its own; free ops (`load`, `iota`) copied into every region that reads them; masks
+  across regions as `u8`; `intermediates="opmath"` and `fp_contract="mul-add"` (both brought forward from phase 3); dead ops not computed; a
+  region with no input of its output's shape (`iota(x, 0) < load(n)` alone) joined to its consumer, so that every region is a kernel that can
+  be launched; the fusion report; the Rust gate runs the use cases as plans (`fused_*`).
+* **Found while testing, and closed:** H8 and H9 (section 5.3). With H1 they make the code of a region *context-free*: the lowering option
+  `context_free=True` of note 20, which every region kernel and every kernel of the unfused composition is lowered with.
+* **Not yet:** strided inputs inside a region (a view that is not dense is materialised by `tilefish.contiguous` first, as rule 5 of 3.5
+  allows); `tilefish.fused(...)` scopes; the `intermediates="f32"` mode. `@tilefish.kernel(fp_fusion=False)` keeps its code: H9 applies to it
+  too, which is the numerics contract's to decide (note 2).
+* **Tests:** `tests/test_fusion.py` (no GPU: grouping, legality, names, modes, report, refusals, the same plans in another process) and
+  `tests/test_gpu_fusion.py` (sm_103; arch-agnostic): the inline casts are `.to()` on every f32 and every bf16 and f16 pattern; the use cases
+  fused against unfused at every bucket on special values, and against the reference where it is exact; chains of ops on every bf16 and f16
+  pattern; binary ops on `2**22` bit patterns; 120 random graphs of up to 24 ops, each also through `verify_fusion`; `opmath` in IEEE math
+  against torch's eager ops on every bit pattern, and two-tensor 16-bit `+ - *` against torch's on every pair (`2**32` per op and dtype); the
+  export check refuses a contracting region, writes the report, and the plan replays and captures.
 
 ## 0. Background: what exists
 
@@ -437,7 +462,7 @@ It holds by construction when these obligations hold. Each has a test (5.6) and,
 |---|---|---|---|
 | O1 | storing a value and loading it back is the identity | loads and stores move bits (every storage dtype, NaN payloads included); a mask stored as `u8` 0/1 and read as `!= 0` is the same mask | special-value tests |
 | O2 | an op's code does not depend on its neighbours | the lowering emits each node's expression from the node alone; scalars are typed per node | source equality: the region's source equals the kernel of the same nodes |
-| O3 | nothing contracts across two ops | `enable_fp_fusion=False` (LLVM emits `mul.rn` / `add.rn`, ptxas gets `-fmad false`); a declared contraction is an explicit `tilefish.fma` (inline PTX); IEEE helpers carry `.rn` | the options in every entry; a PTX check that a region has no `fma` its nodes did not ask for |
+| O3 | nothing contracts across two ops | `enable_fp_fusion=False` is not enough on sm_100 and later (H9): a region writes every float `+ - *` as one scalar `.rn` instruction of inline PTX (`context_free=True`), which ptxas does not contract; a declared contraction is an explicit `tilefish.fma` (inline PTX); IEEE helpers carry `.rn` | the options in every entry; the SASS of the case H9 was found in; the random graphs |
 | O4 | no fold, reassociation or fast-math rewrite across two ops changes a bit | Triton is not expected to set fast-math flags other than contraction (the guard checks it on every build); LLVM folds only what it considers exact, and one fold it considers exact is not exact on NaN payloads (H1) | a guard scanning each region's LLVM IR for `reassoc`, `nnan`, `ninf`, `nsz`, `arcp`, `afn`; NaN-payload tests |
 | O5 | a per-element op's result depends only on its operands at that element | per-lane code; a packed `x2` instruction computes each half as the scalar one does; the block size, vector width and warp count only distribute lanes | the same region at several configurations gives the same bytes |
 | O6 | every reduction inside a region is layout-independent | ordered sums (note 17), `argmax` / `argmin` (note 8); a Triton tree reduction is not (H4), so it runs alone (D2) | E1 and E2; ordered-sum tests at several warp counts |
@@ -454,6 +479,8 @@ It holds by construction when these obligations hold. Each has a test (5.6) and,
 | H4 | a Triton tree reduction's operand layout (elements per thread, from the loads that anchor the layout) depends on the whole kernel, so the same `tl.sum` may add in another tree when other loads of other dtypes share its kernel | last-bit differences, data-dependent | D2: unordered reductions run alone, and their operand is stored; experiment E1 measures how often the tree really changes |
 | H5 | `tl.max` on `+0.0` and `-0.0`, and on NaN, might depend on the order | a sign of zero | E2: order-free on every tested row at 1 to 16 warps and under permutation; `max` may join row regions, and the phase 2 tests keep checking it |
 | H6 | the library behind a math op changes with the CUDA or libdevice version (CUDA 13.2 changed `erff`) | other bytes, `F` and `U` alike | not a fusion hazard (O7); the CUDA math guard warns |
+| H8 | (found in phase 1) ptxas folds `neg.f32` into its consumer as a negated operand (a `where` of `-x`: `FSEL` of `-R`), which flips a NaN's sign, where `neg.f32` alone gives the canonical NaN | a NaN `0xFFFFFFFF` fused, `0x7FFFFFFF` unfused (61 of 1536 elements of a random graph) | a region's negation gives the canonical NaN explicitly (`testp.notanumber` or `setp.nan`, `selp`) |
+| H9 | (found in phase 1) LLVM packs two lanes' f32 ops into `mul.rn.f32x2` / `add.rn.f32x2`, and ptxas 12.9 contracts that pair into `FFMA2` even with `--fmad=false` (read in the SASS of the same PTX assembled for sm_100a) | one ULP, 33 of 1536 elements of a random graph; and `@tilefish.kernel(fp_fusion=False)` is not two roundings where its ops are packed | a region writes every float `+ - *` (and the multiplies of `silu` and `gelu`) as scalar `.rn` inline PTX: separate `FMUL` and `FADD` in the SASS |
 
 ### 5.4 Modes
 

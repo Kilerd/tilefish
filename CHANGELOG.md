@@ -127,6 +127,30 @@ each section names the release that added it.
   (`tl.make_tensor_descriptor`). Python allocates it per launch; the Rust crate takes it as the last tensor of a launch (`GLOBAL_SCRATCH`,
   `Prepared::scratch_bytes`); a plan's kernel step names the workspace as its scratch. New optional `launch.global_scratch_align`.
 
+### Plan fusion: arithmetic in a graph body (`docs/rfcs/0001-plan-fusion.md`, phase 1)
+
+- **A graph body may compute.** Arithmetic traced in a `@tilefish.graph` body (casts, `+ - * /`, comparisons and `where`, math functions,
+  `iota` and `load`, reductions) is planned instead of refused: the planner groups it into regions, each a `@tilefish.kernel` that tilefish
+  generates (`fused_<hash>`, named by its content, so the same region in two graphs or two plans of a set is one manifest entry) and one kernel
+  step of the plan. Plan schema 1, manifest schema 3 and both hosts are unchanged; a graph without arithmetic plans exactly as before.
+- **Exact.** A fused plan writes the bytes of its unfused composition (each op a kernel of its own, every intermediate stored in its dtype, a
+  mask as `u8`): region kernels contract nothing and are lowered with `context_free=True` (note 20 of `tilefish.lower`): every float `+ - *` one
+  scalar `.rn` instruction of inline PTX, every narrowing float cast inline PTX, a negation's NaN canonical. A reduction is a kernel of its own
+  (version 1), as is a view that is not dense (a `tilefish.contiguous` copy before the region); an op whose value nothing reads is not computed.
+- **`tilefish.fusion(version=1, grouping="auto" | "none", math="fast" | "ieee", intermediates="declared" | "opmath", fp_contract="none" |
+  "mul-add", verify=True)`**, given as `@tilefish.graph(fusion=...)`: every choice exact; `"opmath"` (torch's eager rule for a 16-bit op with a
+  python scalar) and `"mul-add"` (an f32 product that nothing else reads, contracted into `tilefish.fma`) are rewrites of the IR made before
+  the regions are formed. `tilefish.barrier(x)` makes `x` a region boundary with a buffer of the plan (a tap reads it).
+- **Verified at export.** `export` (and `export([...])` of a plan set) runs every region of more than one op against its ops one by one on the
+  device at every bucket, on seeded inputs with special values, and raises `TilefishFusionError` before writing anything at a difference;
+  `export(..., verify=False)` opts out, and a device of another architecture skips the check with a `TilefishFusionWarning`. It writes
+  `<graph>.fusion.json`, the fusion report (the ops each region took, what it reads and writes, the roundings it keeps, the rewrites of the mode).
+  `tilefish.fusion_report(graph)` and `tilefish.verify_fusion(graph)` give them on demand. `reference` mode of a graph interprets its arithmetic.
+- **Found on the way** (sm_103, ptxas 12.9; `tests/test_gpu_fusion.py`): ptxas contracts a packed `mul.rn.f32x2` and `add.rn.f32x2`, which LLVM
+  makes of two lanes' f32 ops, into `FFMA2` even with `--fmad=false`, so `@tilefish.kernel(fp_fusion=False)` does not guarantee two roundings
+  on sm_100 and later where the ops are packed; and `neg.f32` folded into a select flips a NaN's sign where alone it gives the canonical NaN.
+  Fused regions avoid both; a `@tilefish.kernel` is unchanged in this release.
+
 ### Plans and arenas
 
 - **Carried buffers.** `@tilefish.graph(carried=("h",))` names parameters (`In` or `InOut`) whose tensor the plan's arena holds instead of the
