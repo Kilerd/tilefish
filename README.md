@@ -888,7 +888,11 @@ point in the IR, and rules come in two kinds:
 `num_warps` is part of a kernel's numerics identity in the same way: it fixes
 the tree a `tl.sum` adds in, so the same kernel with another warp count differs
 in the last bits. It is recorded in the declaration digest, the compile spec
-and the manifest, and a replay refuses an entry that has another. So is FMA
+and the manifest, and a replay refuses an entry that has another. Measured, it
+is Triton's own reductions that depend on it; per-element ops, `argmax` and
+sums with an `order=` have the same bytes at every warp count, so a kernel
+whose every reduction has an order may change it for speed alone
+(`docs/numerics.md`). So is FMA
 contraction: a generated kernel always says whether `a * b + c` may be one
 rounding (`@tilefish.kernel(fp_fusion=False)` says no), and a hand-written one
 says it with `@tilefish.extern(triton=..., enable_fp_fusion=False)` (Triton's
