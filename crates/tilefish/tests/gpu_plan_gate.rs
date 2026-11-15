@@ -1680,3 +1680,48 @@ fn carried_buffers_handed_from_plan_to_plan_on_a_shared_arena_are_pythons_bytes(
 fn layout_total(set: &PlanSet, graphs: &[&str]) -> u64 {
     set.shared_arena_bytes(graphs).unwrap()
 }
+
+/// An arena per lane: two `SetRun`s of the carried set (each its own `SharedArena`, its own stream, its own carried buffers), driven from two
+/// threads at once, each making every call of `CARRIED_CALLS` in order, three times: every output of both lanes is Python's. The two arenas are
+/// not ordered with each other (nothing makes one lane wait for the other), and a lane's `h` is never the other's.
+#[test]
+fn two_lanes_of_the_carried_set_each_on_its_own_arena_from_two_threads_give_pythons_bytes() {
+    let gpu = Gpu::new();
+    let doc = carried_doc();
+    let set =
+        PlanSet::load(gate_dir().join(doc["dir"].as_str().unwrap()), Pin::Digest(doc["set_digest"].as_str().unwrap()))
+            .expect("the carried set loads with its pin");
+    let graphs: Vec<&str> = doc["graphs"].as_array().unwrap().iter().map(|g| g.as_str().unwrap()).collect();
+    let calls = doc["calls"].as_array().unwrap();
+    let rounds = 3;
+    let lane = |k: usize| -> (u64, usize) {
+        let stream = gpu.ctx.new_stream().unwrap();
+        let runs = set.instantiate(&stream, &graphs).unwrap();
+        let mut wrong = 0;
+        for _ in 0..rounds {
+            for call in calls {
+                let mut exts = upload(&stream, call);
+                runs.run(call["graph"].as_str().unwrap())
+                    .unwrap()
+                    .launch(&stream, &mut args(&mut exts, false), &[])
+                    .unwrap_or_else(|e| panic!("lane {k}, {}: {e}", call["id"]));
+                stream.synchronize().unwrap();
+                for e in exts.iter().filter(|e| e.expect.is_some()) {
+                    wrong += usize::from(stream.clone_dtoh(&e.slice).unwrap() != *e.expect.as_ref().unwrap());
+                }
+            }
+        }
+        (runs.arena().address(), wrong)
+    };
+    let ((address0, wrong0), (address1, wrong1)) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| lane(0));
+        let second = scope.spawn(|| lane(1));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    assert_ne!(address0, address1, "two lanes, two arenas");
+    assert_eq!((wrong0, wrong1), (0, 0), "outputs that are not Python's (lane 0, lane 1)");
+    println!(
+        "rust plan gate: two lanes of the carried set, each on a SharedArena of its own, from two threads: {} calls each, every output Python's",
+        rounds * calls.len()
+    );
+}
