@@ -16,7 +16,10 @@ node by node:
 * ``x / c`` with a scalar or ``const`` divisor is ``x * f32(1 / c)``, which is what the binary computes
   (``div.full.f32`` of a constant divisor is a multiply by the correctly rounded f32 reciprocal), and so
   is ``mean`` (``sum / D``);
-* reductions are torch's; ``argmax`` and ``argmin`` follow the contract (the first NaN, else the first extreme value), written out in torch;
+* reductions are torch's, but an ordered sum (``order=``, note 17), which adds in its order with one rounding per add (and an ``fma`` per step
+  with ``fma=True``): exact; ``argmax`` and ``argmin`` follow the contract (the first NaN, else the first extreme value), written out in torch;
+* ``rcp`` is ``torch.reciprocal``, ``neg`` CUDA's negation (a NaN canonical) and ``fma`` one rounding (an f64 product and sum rounded to odd, then to
+  f32): exact (note 16); ``sin_approx`` is torch's sine, approximately;
 * comparisons, masks, ``where`` and ``iota`` are torch's, with a scalar rounded to the IR dtype as above: exact, like the binary;
 * ``gather_rows`` and ``scatter_rows`` are torch indexing with the out-of-range policy of the call: raw copies, exact (where a scatter's
   indices in range are distinct; with duplicates neither the binary nor the reference says which row lands).
