@@ -4,6 +4,24 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### Types and arguments (lane types)
+
+- **64-bit dimension scalars.** An extern's runtime scalar that carries a dimension may be an `i64`: `n_elem: i64[n]` (`i32[n]` is `n`, as before).
+  Its value is derived from the shapes and range-checked as an `i64` by both hosts, where an `i64` count used to be a per-call `given` value nothing
+  checked. The declaration digest has `"scalar_type": "i64"` on the parameter; the manifest has a `scalar` of type `i64` (schema 3, section 5.7).
+- **Null pointers.** A pointer parameter of an extern's kernel that the declaration does not use is `Null[dtype]`: a call passes nothing for it, and both
+  hosts write the 64-bit zero at its slot (a Triton kernel's and a prebuilt binary's alike; manifest kind `null`, section 5.6), where a one-element dummy
+  tensor was needed before. The Rust crate reads it into `ParamKind::Null`.
+- **Lowered kernels on views that do not start on 16 bytes.** A graph that passes a dense view not provably aligned to 16 bytes (a row of a `[K, R]` int32
+  plane with an odd `R`) to a read-only parameter of a lowered kernel runs the kernel's specialisation for it, `kernel.unaligned("a")`
+  (`<kernel>__ua<indices>`), instead of refusing the call; so does `tilefish.run` of an address that is not 16-byte aligned. Its pointers for those
+  parameters have no divisibility hint and promise their element's alignment (a `pointer_alignment` a dense pointer may now have, section 6); its stems,
+  declaration digest, IR and build cache key are its own, its source the kernel's.
+- Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`null` parameters, an element-aligned dense pointer); manifests without them load and digest as
+  before. The crate's `ParamKind` gained the variant `Null`.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

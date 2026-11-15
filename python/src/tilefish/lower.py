@@ -73,6 +73,11 @@ value (``out``, or ``out0``, ``out1``, ... for several), then the template's par
 generated name that collides with a kernel parameter is suffixed (``mask_1``). Constexpr values come
 from the spec (``compile_specs(lowered.extern)``), not from defaults in the source.
 
+Every pointer of a generated kernel is compiled as 16-byte aligned (``tt.divisibility=16``). The specialisation of a kernel for read-only
+parameters aligned to their element only (``kernel.unaligned("a")``, which a graph calls for a dense view that does not provably start on 16 bytes)
+is lowered to the same source: only its ``ExternOp`` differs, named ``<kernel>__ua<indices>``, with those parameters marked ``unaligned``, so its
+compile specs give them no divisibility hint and a ``pointer_alignment`` of their element size.
+
 A kernel parameter whose name the generated module itself uses (``tl``, ``triton``, ``float``, ``libdevice``) or
 that Triton's JIT launcher takes as a launch option (``grid``, ``warmup``, ``debug``, ``num_warps``,
 ``num_stages``, ``num_ctas``, ``maxnreg``) is renamed with a numeric suffix (``tl_1``), in the

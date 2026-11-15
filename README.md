@@ -344,6 +344,25 @@ the stride to an `i32` and the extent of the view to nothing. The pointer passed
 checks the address); without the `16` Triton gets no hint and any element-aligned view runs. Lowered `@kernel`s still take contiguous tensors only: a
 view in a kernel body is refused with the rule that says so.
 
+**Views that do not start on 16 bytes, given to a lowered kernel.** Every pointer of a lowered kernel is compiled as 16-byte aligned, so a dense view that
+does not provably start on 16 bytes, such as a row `plane[k]` of a `[K, R]` int32 plane with an odd `R`, is not a contiguous tensor. Such a view given to a
+read-only parameter runs the kernel's **specialisation** for it: `kernel.unaligned("a")`, the same kernel with `a` compiled aligned to its element only (no
+`tt.divisibility` for it, a `pointer_alignment` of its element size that every launch checks). It is an operator of its own, keyed apart from the kernel
+everywhere a binary is (its name `add_rows__ua0`, after the indices of those parameters, its stems, its declaration digest, its Triton IR and so its build cache
+key, its manifest entries), and its generated source is the kernel's:
+
+```python
+@tilefish.graph
+def plane_sum(plane: Tensor[3, R, i32]):
+    s = add_rows(plane[1], plane[0])        # plane[1] starts 4 * R bytes in: the step launches add_rows__ua0
+    return add_rows(s, plane[2])            # plane[2] starts 8 * R bytes in: add_rows__ua1
+
+y = tilefish.run(add_rows, plane[1], plane[0])   # an address that is not 16-byte aligned runs add_rows__ua0 too
+```
+
+A graph's export has the specialisations its plan's steps launch; `tilefish.runtime.export(add_rows.unaligned("a"), directory)` writes one for the kernel
+alone, and a replay of a manifest that lacks it says so (`docs/manifest-schema-3.md`, section 6).
+
 **Device scalars.** `n_tok: DevScalar[i32]` is one element in device memory: in the ABI a pointer with the shape `[]`, at the API a tensor of one
 element. A binary reads it with `tl.load`, so one binary serves every value and a value changes by writing memory, never by building; a lowered kernel
 reads it with `tilefish.load(s)` (one `tl.load(ptr)`, broadcast).
@@ -364,6 +383,16 @@ size, an offset) that no tensor determines. One declaration and one binary serve
 Rust `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`; in a graph the value may be an expression of the graph's dimensions (`h_out=H // 2`),
 and each step of the plan records the values of its call at its bucket (`"given": {"h_out": 5}`), so they are in the plan's digest and both hosts
 check them against the entry (`docs/manifest-schema-3.md`, section 5.3).
+
+**Null pointers and 64-bit dimension scalars.** A pointer an extern's kernel does not use in the declared use (a bias it reads only when it is not
+null, or only under a constexpr flag the declaration turns off) is declared `Null[dtype]`: a call does not pass it, and both hosts pass the null pointer
+at its slot (manifest kind `null`, section 5.6). A dimension scalar is an `i32` unless it is declared `i64[n]`: the same scalar passed as an `i64`, its value
+still derived from the shapes and checked against them, for a kernel whose count is 64 bits wide (section 5.7). Both together:
+
+```python
+@tilefish.extern(ptx="scale_bias.ptx", symbol="scale_bias_f32", block=(256,), grid=lambda n: (tilefish.cdiv(n, 256),), index_bits=64)
+def scale(x: Tensor[n, f32], bias: Null[f32], out: Out[Tensor[n, f32]], n_elem: i64[n]): ...    # (const float*, const float*, float*, long long)
+```
 
 **Gluon kernels.** A kernel written in Triton's Gluon dialect (`triton.experimental.gluon`: `@gluon.jit`, layouts written out, so the kernel pins
 which thread holds which element and so the order of its reductions) is declared with `gluon=` in place of `triton=`, and everything else is the same:
