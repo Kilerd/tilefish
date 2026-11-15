@@ -73,6 +73,8 @@ const BUFFER_KEYS: [&str; 6] = ["name", "role", "dtype", "shape", "offset", "byt
 const STEP_KEYS: [&str; 3] = ["entry", "kind", "args"];
 /// A copy step has no entry (it launches no binary) and no workspace.
 const COPY_KEYS: [&str; 2] = ["kind", "args"];
+/// A memset step neither: the bytes of its one argument, `dst`, set to zero.
+const MEMSET_KEYS: [&str; 2] = ["kind", "args"];
 
 /// What a buffer of a plan is, and who provides it (`docs/plan-schema-1.md`, section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,11 +95,23 @@ pub enum BufferRole {
     Devscalar,
     /// The cuBLASLt workspace of the GEMMs: in the arena.
     Workspace,
+    /// A parameter whose tensor the arena holds, not the caller (`docs/plan-schema-1.md`, section 15.2): in the arena's carried region, after the
+    /// regions of its plans, where the host places it (its `offset` is `null`). A step may read it (an earlier execution on the arena wrote it) and
+    /// write it.
+    Carried,
 }
 
 impl BufferRole {
-    const ALL: [Self; 7] =
-        [Self::Input, Self::Output, Self::Inout, Self::Weight, Self::Intermediate, Self::Devscalar, Self::Workspace];
+    const ALL: [Self; 8] = [
+        Self::Input,
+        Self::Output,
+        Self::Inout,
+        Self::Weight,
+        Self::Intermediate,
+        Self::Devscalar,
+        Self::Workspace,
+        Self::Carried,
+    ];
 
     /// The word a plan uses (`"input"`, `"devscalar"`, ...).
     pub fn as_str(self) -> &'static str {
@@ -109,6 +123,7 @@ impl BufferRole {
             Self::Intermediate => "intermediate",
             Self::Devscalar => "devscalar",
             Self::Workspace => "workspace",
+            Self::Carried => "carried",
         }
     }
 
@@ -121,9 +136,15 @@ impl BufferRole {
         matches!(self, Self::Input | Self::Output | Self::Inout | Self::Weight)
     }
 
-    /// Whether a step may write the buffer (`intermediate`, `output`, `inout`).
+    /// Whether a step may write the buffer (`intermediate`, `output`, `inout`, `carried`).
     pub fn is_writable(self) -> bool {
-        matches!(self, Self::Intermediate | Self::Output | Self::Inout)
+        matches!(self, Self::Intermediate | Self::Output | Self::Inout | Self::Carried)
+    }
+
+    /// Whether the plan gives the buffer no offset: an external (the caller's tensor) or a carried buffer (the host places it in the arena's
+    /// carried region).
+    pub fn is_host_placed(self) -> bool {
+        self.is_external() || self == Self::Carried
     }
 
     /// Whether the caller's tensor for the buffer is a graph parameter (`input`, `weight`, `inout`): what binds the dimensions of a call.
@@ -164,6 +185,8 @@ pub enum StepKind {
     Library,
     /// A copy of the dense bytes of one argument (`src`) into another (`dst`): `cuMemcpyDtoDAsync`, no manifest entry.
     Copy,
+    /// The dense bytes of one argument (`dst`) set to zero: `cuMemsetD8Async`, no manifest entry.
+    Memset,
 }
 
 /// A view of a buffer that a step passes: element shape, element strides and the element offset of its first element.
@@ -192,7 +215,7 @@ pub struct PlanArg {
 /// One launch of a manifest entry (section 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanStep {
-    /// The stem of the entry (`rmsnorm`, `gemm_qkv.M64`); empty for a copy step, which launches no entry.
+    /// The stem of the entry (`rmsnorm`, `gemm_qkv.M64`); empty for a copy or a memset step, which launches no entry.
     pub entry: String,
     /// The section of the manifest the entry is in.
     pub kind: StepKind,
@@ -528,10 +551,15 @@ fn validate(doc: &Value) -> Check<Validated> {
             Some(n) if n >= 1 => n as u64,
             _ => return refuse(format!("buffers[{i}].bytes must be a positive int, got {}", brief(&b["bytes"]))),
         };
-        let offset = if role.is_external() {
+        let offset = if role.is_host_placed() {
             if !b["offset"].is_null() {
+                let place = if role == BufferRole::Carried {
+                    "carried (the host places it in the arena's carried region)".to_owned()
+                } else {
+                    format!("external (role {role})")
+                };
                 return refuse(format!(
-                    "buffers[{i}] ('{name}') is external (role {role}): its offset must be null, not {}",
+                    "buffers[{i}] ('{name}') is {place}: its offset must be null, not {}",
                     brief(&b["offset"])
                 ));
             }
@@ -680,10 +708,13 @@ fn validate(doc: &Value) -> Check<Validated> {
         let mut this: Skeleton = Vec::with_capacity(n_steps);
         let mut steps = Vec::with_capacity(n_steps);
         for (si, st) in steps_doc.iter().enumerate() {
-            // a copy step has no entry (it launches no binary) and no workspace
+            // a copy step and a memset step have no entry (they launch no binary) and no workspace
             let is_copy = st.get("kind").and_then(Value::as_str) == Some("copy");
+            let is_memset = st.get("kind").and_then(Value::as_str) == Some("memset");
             let (st, entry) = if is_copy {
                 (keys(st, &format!("step #{si}"), &COPY_KEYS, &[])?, String::new())
+            } else if is_memset {
+                (keys(st, &format!("step #{si}"), &MEMSET_KEYS, &[])?, String::new())
             } else {
                 let st = keys(st, &format!("step #{si}"), &STEP_KEYS, &["workspace", "given"])?;
                 match st["entry"].as_str() {
@@ -700,9 +731,10 @@ fn validate(doc: &Value) -> Check<Validated> {
                 Some("kernel") => StepKind::Kernel,
                 Some("library") => StepKind::Library,
                 Some("copy") => StepKind::Copy,
+                Some("memset") => StepKind::Memset,
                 _ => {
                     return refuse(format!(
-                        "step #{si}: kind must be one of [\"kernel\", \"library\", \"copy\"], got {}",
+                        "step #{si}: kind must be one of [\"kernel\", \"library\", \"copy\", \"memset\"], got {}",
                         brief(&st["kind"])
                     ));
                 }
@@ -841,6 +873,18 @@ fn validate(doc: &Value) -> Check<Validated> {
                     ));
                 }
             }
+            if kind == StepKind::Memset {
+                if let Some(problem) = memset_problem(&args, &shapes) {
+                    return refuse(format!("step #{si} at {}: {problem}", describe_values(combo)));
+                }
+                let dst = &buffers[args[0].buffer];
+                if !dst.role.is_writable() {
+                    return refuse(format!(
+                        "step #{si}: a memset step writes '{}', whose role is {}",
+                        dst.name, dst.role
+                    ));
+                }
+            }
             this.push((kind, workspace.clone(), names_here, given.iter().map(|(n, _)| n.clone()).collect()));
             if bi == 0 {
                 for a in &args {
@@ -869,7 +913,7 @@ fn validate(doc: &Value) -> Check<Validated> {
     }
 
     // -- the arena: every region inside, overlaps only where the live ranges are disjoint
-    let arena: Vec<usize> = (0..buffers.len()).filter(|i| !buffers[*i].role.is_external()).collect();
+    let arena: Vec<usize> = (0..buffers.len()).filter(|i| !buffers[*i].role.is_host_placed()).collect();
     let region_end = |i: usize| u128::from(buffers[i].offset.unwrap_or(0)) + align_up(u128::from(buffers[i].bytes));
     let end = arena.iter().map(|i| region_end(*i)).max().unwrap_or(0);
     let arena_bytes = match int_of(&top["arena_bytes"]) {
@@ -1019,6 +1063,23 @@ fn copy_problem(args: &[PlanArg], shapes: &[Vec<usize>], buffers: &[PlanBuffer])
     None
 }
 
+/// What is wrong with the arguments of a memset step at a bucket (Python's `memset_problem`): exactly one, `dst`, dense.
+fn memset_problem(args: &[PlanArg], shapes: &[Vec<usize>]) -> Option<String> {
+    let names: Vec<&str> = args.iter().map(|a| a.name.as_str()).collect();
+    if names != ["dst"] {
+        return Some(format!("a memset step has the one argument [\"dst\"], got {names:?}"));
+    }
+    let (shape, strides, _) = arg_layout(&args[0], shapes);
+    if !is_dense(&shape, &strides) {
+        return Some(format!(
+            "the dst of a memset is a view of '{}' with the shape {shape:?} and the strides {strides:?}, which is not dense: a memset step sets one \
+             run of bytes",
+            args[0].binding
+        ));
+    }
+    None
+}
+
 /// Every step of every bucket against the manifest (Python's `check_against_manifest`): the digest, the entry for the plan's architecture in
 /// the section the step says, the pointers of its ABI against the arguments (count, names, dtype, rank, which buffers may be written, the
 /// device scalars), the workspace of a library step, that a buffer is written before it is read, and that every output is written by a step of every bucket.
@@ -1034,11 +1095,16 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
     }
     let arch = v.arch.as_str();
     for bucket in &v.buckets {
+        // provided by the caller, by the host (a device scalar) or by an earlier execution on the arena (a carried buffer)
         let mut written: HashSet<usize> = (0..v.buffers.len())
             .filter(|i| {
                 matches!(
                     v.buffers[*i].role,
-                    BufferRole::Input | BufferRole::Weight | BufferRole::Inout | BufferRole::Devscalar
+                    BufferRole::Input
+                        | BufferRole::Weight
+                        | BufferRole::Inout
+                        | BufferRole::Devscalar
+                        | BufferRole::Carried
                 )
             })
             .collect();
@@ -1054,6 +1120,11 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
                     ));
                 }
                 written.insert(dst);
+                continue;
+            }
+            if st.kind == StepKind::Memset {
+                // no entry: it writes dst (`validate` held it to its rules)
+                written.insert(st.args[0].buffer);
                 continue;
             }
             let stem = st.entry.as_str();
@@ -1109,7 +1180,7 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
                     }
                     pointers_of(params)
                 }
-                StepKind::Copy => unreachable!("handled above"),
+                StepKind::Copy | StepKind::Memset => unreachable!("handled above"),
             };
             if pointers.len() != st.args.len() {
                 let names: Vec<&str> = pointers.iter().map(|p| p.0).collect();
@@ -1392,6 +1463,12 @@ impl LaunchPlan {
     /// The parameters of role `weight`, in the order of the graph's signature.
     pub fn weights(&self) -> impl Iterator<Item = &str> {
         self.inner.buffers.iter().filter(|b| b.role == BufferRole::Weight).map(|b| b.name.as_str())
+    }
+
+    /// The parameters of role `carried`, in the order of the graph's signature: the buffers the arena holds between executions, not the caller
+    /// (`docs/plan-schema-1.md`, section 15.2).
+    pub fn carried(&self) -> impl Iterator<Item = &str> {
+        self.inner.buffers.iter().filter(|b| b.role == BufferRole::Carried).map(|b| b.name.as_str())
     }
 
     /// The dimensions and the sizes planned for each (its buckets), in the order of the file.
