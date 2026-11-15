@@ -13,8 +13,8 @@
 //! never wait for the device: a copy from pageable memory may, as CUDA documents it), and launches the steps in order.
 //! The externals are ordered against other
 //! streams as a single launch's tensors are ([`Kernel::launch`]): cudarc's tracking on the launch stream, each slice's own stream waiting for
-//! the end of the plan, a written slice's own stream waited for first; and the arena is ordered the same way, as a slice that every launch
-//! writes, owned by the stream it was allocated on: two launches of one instantiation on two streams run one after the other.
+//! the end of the plan, a written slice's own stream waited for first; and the arena by its order event (below): two launches of one
+//! instantiation on two streams run one after the other.
 //!
 //! [`PlanRun::capture`] makes a [`CapturedPlan`]: the same checks, then the steps captured in a CUDA graph on the stream. The graph holds
 //! addresses: the arena's (the `CapturedPlan` holds the instantiation, so the arena outlives the graph) and the externals' (the `CapturedPlan`
@@ -25,22 +25,26 @@
 //! instantiation in between does not change what this graph reads).
 //!
 //! **The order of the runs of one instantiation** (`docs/plan-schema-1.md`, section 9, step 1: two executions that use one arena must not
-//! overlap on the device). Every launch and every replay of an instantiation, whatever its stream and its thread, takes the arena's lock, makes
-//! its stream wait for what the arena's own stream holds (the stream the arena was allocated on, which has waited for the end of every earlier
-//! run made elsewhere; cudarc's read and write events on the arena are waited for too), and makes the arena's stream wait for an event recorded
-//! after its last launch (also when a launch fails after others were enqueued). So the runs of one instantiation (launches, and replays of its
-//! graphs of one bucket or several) run on the device one after the other, in the order they are issued: the contract of Python's *order
-//! event* of an arena. Python captures its event's wait and record as event nodes, because a torch graph is replayed by whoever holds it; the
-//! graph of a [`CapturedPlan`] is replayed only by [`CapturedPlan::replay`], which orders the replay as a launch, so it has no event node.
-//! A capture ([`PlanRun::capture`]) holds the arena's lock from the beginning of the capture to its end, so no launch or replay of the
-//! instantiation, on any thread, makes the arena's stream wait for an event while that stream is being captured.
-//! Dropping the last handle of an instantiation waits for the arena's stream, so nothing of the plan runs when its arena is freed and its modules
-//! unloaded.
+//! overlap on the device). The arena has an *order event*, as Python's arena has: every launch and every replay of an instantiation, whatever
+//! its stream and its thread, takes the arena's lock, makes its stream wait for the event's most recent record before it writes anything, and
+//! records the event on its stream after its last launch (also when a launch fails after others were enqueued). The wait is skipped when that
+//! most recent record was made on the same stream (stream order already puts the run after it): runs that stay on one stream cost one
+//! `cuEventRecord` each, and a run on another stream one `cuStreamWaitEvent` more. Since every run records after it waited (or after the record
+//! before it, on its own stream), the event's most recent record stands for every run before it, whatever their streams. So the runs of one
+//! instantiation (launches, and replays of its graphs of one bucket or several) run on the device one after the other, in the order they are
+//! issued. The event is recorded once when the arena is allocated, on the stream it was allocated (and zeroed) on. Nothing is enqueued on any
+//! other stream than the run's own and the streams its externals are freed on. Python captures its event's wait and record as event nodes,
+//! because a torch graph is replayed by whoever holds it; the graph of a [`CapturedPlan`] is replayed only by [`CapturedPlan::replay`], which
+//! orders the replay as a launch, so it has no event node, and a launch or a replay is refused while its stream captures a graph. A capture
+//! ([`PlanRun::capture`]) begins under the arena's lock, so a launch of the arena on the stream being captured is refused rather than captured;
+//! the rest of the capture does not hold the lock (no execution enqueues anything on the captured stream), so launches, replays and captures on
+//! other streams go on meanwhile. Dropping the last handle of an instantiation waits on the host for the event's most recent record, so nothing
+//! of the plan runs when its arena is freed and its modules unloaded.
 //!
 //! **An arena shared by several plans** ([`SharedArena`], `docs/plan-schema-1.md` section 15.1). Plans that a host runs one at a time (the plans
 //! of a set: [`PlanSet::instantiate`](crate::PlanSet::instantiate)) can be instantiated on one arena of the largest one's bytes
 //! ([`LaunchPlan::instantiate_in`]), each with its buffers at its own offsets from the first byte. Their instantiations hold the one arena, with
-//! its one lock and its one stream, so everything above is said of all of them together: a launch, a capture, a replay or a `launch_step` of any
+//! its one lock and its one order event, so everything above is said of all of them together: a launch, a replay or a `launch_step` of any
 //! plan of the arena is ordered with those of every other, and they never overlap on the device. Nothing in the arena outlives a launch.
 //!
 //! What is not this module's: the ordering of a use of an external that is not a launch of this crate (cudarc's tracking, or the host's), as
@@ -48,7 +52,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus};
 use cudarc::driver::{CudaContext, CudaEvent, CudaGraph, CudaSlice, CudaStream, CudaView, CudaViewMut};
@@ -63,7 +67,7 @@ use crate::launch_plan::{BufferRole, LaunchPlan, PlanBuffer, StepKind, describe_
 use crate::manifest::{Access, ParamKind, ShapeDim};
 use crate::memory::sealed;
 use crate::plan::Prepared;
-use crate::tensor::{Backing, DType, TensorArg, TensorMut, U8};
+use crate::tensor::{Backing, DType, TensorArg};
 
 /// The value of a device scalar (a buffer of role `devscalar`), which a launch writes into its slot of the arena.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -226,22 +230,86 @@ struct BucketRun {
 
 #[derive(Debug)]
 struct Arena {
+    /// The memory (none for an arena of no bytes). Held, not read: the steps address it through `ArenaCore::addr`, the executions are ordered by
+    /// `order` (not by cudarc's events of the slice), and dropping it frees the memory, after the arena has waited for its last execution.
+    #[allow(dead_code)]
     slice: Option<CudaSlice<u8>>,
     /// Whose device scalar values the slots hold: the id of a `CapturedPlan`, or 0 (a launch, or nothing yet).
     slots_of: u64,
     /// The pinned host memory the device scalars are copied from (a plan with device scalars only): after the slice, so that it is freed
-    /// after the arena, when the instantiation has waited for its stream.
+    /// after the arena, when the instantiation has waited for its last execution.
     staging: Option<ffi::plan::Staging>,
+    /// What orders the executions on the arena (none for an arena of no bytes: its executions share no memory).
+    order: Option<Order>,
+}
+
+/// The order of the executions on an arena: its **order event**, recorded on an execution's stream after the execution, and waited for by the
+/// next execution on its own stream before it writes anything, as Python's `_planrun._Arena` does (`docs/plan-schema-1.md`, section 9, step 1).
+///
+/// The wait is skipped when the event's most recent record was made on the same stream (`last`): stream order already puts the execution after
+/// the work that record stands for. The record is always made, so a later execution on another stream waits for this one; and since every
+/// execution records after it waited (or after the record before it, on its own stream), the most recent record stands for every execution
+/// before it, whatever their streams: an execution of the arena is never in flight unordered behind it. The stream of the last record is held
+/// weakly: a stream that was dropped (and destroyed, when cudarc owns it) is never "the same stream" again, and a live one's handle names it.
+#[derive(Debug)]
+struct Order {
+    event: CudaEvent,
+    last: Option<Weak<CudaStream>>,
+}
+
+impl Order {
+    /// Make an order event, recorded on `stream` (the arena was just allocated and zeroed there: a first execution elsewhere waits for that).
+    fn new(stream: &Arc<CudaStream>) -> Result<Self> {
+        let event = stream
+            .context()
+            .new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))
+            .map_err(Error::driver("cuEventCreate"))?;
+        event.record(stream).map_err(Error::driver("cuEventRecord"))?;
+        Ok(Self { event, last: Some(Arc::downgrade(stream)) })
+    }
+
+    /// Whether the event's most recent record was made on `stream`.
+    fn last_is(&self, stream: &CudaStream) -> bool {
+        self.last.as_ref().and_then(Weak::upgrade).is_some_and(|last| last.cu_stream() == stream.cu_stream())
+    }
+
+    /// `work`, which enqueues an execution on `stream`, between the wait for the event (unless its most recent record is on `stream`) and its
+    /// record on `stream`. **Once the wait is enqueued (or skipped), the record is made whatever `work` returns**: an execution that failed after
+    /// it enqueued something still uses the arena. A record that fails is tried again; if that fails too, the host waits for the stream (the
+    /// work is done before the next execution is enqueued, under the arena's lock) and the next execution waits for the record before. A wait
+    /// that fails has enqueued nothing, and nothing is recorded.
+    fn around<T>(&mut self, stream: &Arc<CudaStream>, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.last_is(stream) {
+            stream.wait(&self.event).map_err(Error::driver("cuStreamWaitEvent"))?;
+        }
+        let done = work();
+        match self.event.record(stream).or_else(|_| self.event.record(stream)) {
+            Ok(()) => {
+                self.last = Some(Arc::downgrade(stream));
+                done
+            }
+            Err(e) => {
+                self.last = None;
+                let _ = stream.synchronize(); // best effort: if this fails too, there is nothing more to do
+                done.and(Err(Error::driver("cuEventRecord")(e)))
+            }
+        }
+    }
+
+    /// Wait on the host for the most recent record: for every execution on the arena.
+    fn synchronize(&self) -> Result<()> {
+        self.event.synchronize().map_err(Error::driver("cuEventSynchronize"))
+    }
 }
 
 /// An arena and what orders the executions on it: the memory of the intermediates, the device-scalar slots and the cuBLASLt workspace of the
 /// one plan of an instantiation, or of the plans of a [`SharedArena`], which run on it one at a time, each with its own layout from the first
-/// byte. Every launch, replay and `launch_step` of every instantiation on it takes the one lock (`state`) and is ordered through the one stream
-/// it was allocated on (`home`), so no two of them overlap on the device.
+/// byte. Every launch, replay and `launch_step` of every instantiation on it takes the one lock (`state`) and is ordered by the one order event
+/// ([`Order`]), so no two of them overlap on the device.
 #[derive(Debug)]
 struct ArenaCore {
     context: Arc<CudaContext>,
-    /// The stream the arena was allocated on, and is freed on: an execution elsewhere is ordered against it, as a slice's own stream is.
+    /// The stream the arena was allocated on, and is freed on (after the arena waited for its last execution).
     home: Arc<CudaStream>,
     device: i32,
     state: Mutex<Arena>,
@@ -256,9 +324,15 @@ struct ArenaCore {
 
 impl Drop for ArenaCore {
     fn drop(&mut self) {
-        // The home stream has waited for the end of every execution on the arena made on another stream, and has the ones made on it: when it
-        // is idle nothing uses the arena, so freeing it and the pinned staging memory (which the fields do next) cannot happen under a step.
-        let _ = self.home.synchronize();
+        // Every execution on the arena, on any stream, is behind the order event's most recent record (and so is the zeroing of the arena on its
+        // home stream): once that is complete nothing uses the arena, so freeing it and the pinned staging memory (which the fields do next)
+        // cannot happen under a step. If the host cannot wait for the event, it waits for the whole context.
+        let arena = self.lock();
+        let waited = arena.order.as_ref().map_or(Ok(()), Order::synchronize);
+        drop(arena);
+        if waited.is_err() {
+            let _ = self.context.synchronize();
+        }
     }
 }
 
@@ -286,11 +360,13 @@ impl ArenaCore {
             )));
         }
         let staging = if devscalars { Some(ffi::plan::Staging::new(&ctx)?) } else { None };
+        // recorded right after the allocation and its zeroing on `stream`: an execution on another stream waits for them, one on `stream` need not
+        let order = if slice.is_some() { Some(Order::new(stream)?) } else { None };
         Ok(Arc::new(Self {
             context: Arc::clone(&ctx),
             home: Arc::clone(stream),
             device: ctx.ordinal() as i32,
-            state: Mutex::new(Arena { slice, slots_of: 0, staging }),
+            state: Mutex::new(Arena { slice, slots_of: 0, staging, order }),
             addr,
             bytes,
             captures: AtomicU64::new(0),
@@ -336,10 +412,20 @@ struct Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        // The arena's own stream has waited for the end of every launch and replay on the arena made on another stream, and has the ones made
-        // on it: when it is idle nothing of the plan runs, so unloading the modules and destroying the cuBLASLt handles (which the fields do
-        // next; the arena is freed with its last holder) cannot happen under a step. A failure cannot be reported from a destructor.
-        let _ = self.arena.home.synchronize();
+        // Every launch and replay of the instantiation, on any stream, is behind the arena's order event's most recent record: once that is
+        // complete nothing of the plan runs, so unloading the modules and destroying the cuBLASLt handles (which the fields do next; the arena is
+        // freed with its last holder) cannot happen under a step. If the host cannot wait for the event, it waits for the whole context. An arena
+        // of no bytes orders nothing; its stream is waited for, as before. A failure cannot be reported from a destructor.
+        let arena = self.arena.lock();
+        match arena.order.as_ref().map(Order::synchronize) {
+            Some(Ok(())) => {}
+            Some(Err(_)) => {
+                let _ = self.arena.context.synchronize();
+            }
+            None => {
+                let _ = self.arena.home.synchronize();
+            }
+        }
     }
 }
 
@@ -360,23 +446,24 @@ impl Instance {
 /// scalar's slot before the first launch).
 ///
 /// **The order.** A plan is instantiated on it with [`LaunchPlan::instantiate_in`] (or `instantiate_all_in`, or every plan of a set at once with
-/// [`PlanSet::instantiate`](crate::PlanSet::instantiate)); the [`PlanRun`]s share the arena's one lock and its one stream, so every launch,
-/// [`CapturedPlan::replay`], capture and `launch_step` of any of them is ordered with all the others, from any thread and on any stream, exactly
-/// as those of one instantiation are: they cannot run concurrently. A replay of plan A's graph is ordered with every launch and replay of plan B.
+/// [`PlanSet::instantiate`](crate::PlanSet::instantiate)); the [`PlanRun`]s share the arena's one lock and its one order event, so every launch,
+/// [`CapturedPlan::replay`] and `launch_step` of any of them is ordered with all the others, from any thread and on any stream, exactly as those
+/// of one instantiation are: they cannot run concurrently. A replay of plan A's graph is ordered with every launch and replay of plan B. Plans
+/// of the arena may be captured at the same time from several threads, each on a stream of its own.
 ///
 /// **What outlives a launch.** Nothing in the arena: the next execution, of any plan of the arena, writes over it. A value one plan makes and a
 /// later plan reads is a **returned value** of the first (a tensor of the caller's) given as an external of the second. A tensor of the caller
 /// that overlaps the arena anywhere (not only the part of the plan that runs), an external, a tap or a tensor of `launch_step`, is refused.
 ///
-/// Cheap to clone (the clones are one arena); the arena is freed with the last of its clones and of the instantiations on it, after its stream
-/// has finished what it has.
+/// Cheap to clone (the clones are one arena); the arena is freed with the last of its clones and of the instantiations on it, after its last
+/// execution is complete.
 #[derive(Debug, Clone)]
 pub struct SharedArena {
     core: Arc<ArenaCore>,
 }
 
 impl SharedArena {
-    /// Allocate the arena of `plans` on `stream` (which it is freed on; an execution on that stream needs no extra ordering): the bytes of the
+    /// Allocate the arena of `plans` on `stream` (which it is freed on; the first execution on that stream does not wait for the allocation): the bytes of the
     /// largest of their arenas ([`SharedArena::bytes_for`]), with the pinned staging memory of the device scalars when some plan has one. Every
     /// plan must be for the architecture of the stream's device; the plans are given each once (by graph name). Refused on the per-thread
     /// default stream and on a stream that is capturing a CUDA graph.
@@ -497,8 +584,8 @@ impl LaunchPlan {
 
     /// Instantiate the plan for the bucket combination `values` (one value per dimension, `&[]` for a plan without dimensions): load every
     /// kernel and GEMM of its steps in the context of `stream`, check every step's preconditions that do not depend on an address, and
-    /// allocate the arena on `stream` (which it is freed on; a launch on that stream needs no extra ordering). The device must be of the
-    /// plan's architecture.
+    /// allocate the arena on `stream` (which it is freed on; the first launch on that stream does not wait for the allocation). The device must
+    /// be of the plan's architecture.
     pub fn instantiate(&self, stream: &Arc<CudaStream>, values: &[(&str, u64)]) -> Result<PlanRun> {
         PlanRun::new(self, Place::Own(stream), &self.bucket_indices(values)?)
     }
@@ -534,42 +621,57 @@ fn in_step(e: Error, what: &str) -> Error {
     }
 }
 
-/// Write `bytes` at byte `at` of written cudarc memory, on `stream`: an asynchronous copy from the pinned memory of `staging` (no
-/// synchronization of the host, see [`ffi::plan::Staging`]), ordered after the memory's earlier uses on any stream and recorded as a write
-/// by cudarc's tracking.
-fn write_bytes(
-    memory: &mut dyn sealed::Write,
-    staging: &mut ffi::plan::Staging,
+/// An execution on the arena (a launch, a replay, a step alone) on `stream`, under the arena's lock (the caller holds it: `arena`). The
+/// externals (`tensors`) are ordered as the crate promises for any launch (`ffi::ordered`: refused while a stream captures, a written slice's own
+/// stream waited for first, the slices' own streams made to wait for the end), and the execution is ordered with every other on the arena by
+/// its order event ([`Order::around`]: the wait, unless the event's last record is on `stream`, and the record after); in between, [`tracked`].
+fn execute(
+    arena: &mut Arena,
+    region: (u64, u64),
     stream: &Arc<CudaStream>,
-    at: u64,
-    bytes: &[u8],
+    tensors: &mut [TensorArg<'_>],
+    slots: &[Slot],
+    work: impl FnOnce(&CudaStream) -> Result<()>,
 ) -> Result<()> {
-    let missing = || Error::Launch("a slot of a device scalar is outside the arena".to_owned());
-    let mut all = memory.bytes_mut().ok_or_else(missing)?;
-    let at = usize::try_from(at).map_err(|_| missing())?;
-    let mut part = all.try_slice_mut(at..at + bytes.len()).ok_or_else(missing)?;
-    staging.copy(stream, bytes, &mut part)
+    let Arena { staging, order, .. } = arena;
+    if order.is_some() {
+        // (`ffi::ordered` refuses it too when a tensor is cudarc memory; with regions only, this is the refusal)
+        let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
+        if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
+            return Err(Error::Launch(
+                "an execution of a plan is refused while its stream captures a CUDA graph: its wait for the arena's order event and its record \
+                 would be captured (PlanRun::capture captures a plan)"
+                    .to_owned(),
+            ));
+        }
+    }
+    ffi::ordered(stream, tensors, |tensors, want_end| {
+        let run = || tracked(stream, tensors, slots, region, staging.as_mut(), want_end, work);
+        match order {
+            Some(order) => order.around(stream, run),
+            None => run(),
+        }
+    })
 }
 
-/// The work of a launch or a replay, inside `ffi::ordered` (which refused a capturing stream and made `stream` wait for what a written slice's
-/// own stream holds): the device scalars into their slots (the arena is the last tensor), cudarc's tracking of every slice on `stream` (a
-/// wait for the earlier writes, and reads for a write; the use recorded when the guards are dropped, after the work), the work, and the event
-/// after it when an owning stream is not `stream`.
+/// The work of an execution, inside `ffi::ordered` and the arena's order ([`execute`]): the device scalars into their slots of the arena
+/// (`region`: its address and bytes), cudarc's tracking of every slice on `stream` (a wait for the earlier writes, and reads for a write; the
+/// use recorded when the guards are dropped, after the work), the work, and the event after it when an owning stream is not `stream`.
 fn tracked(
     stream: &Arc<CudaStream>,
     tensors: &mut [TensorArg<'_>],
     slots: &[Slot],
+    region: (u64, u64),
     staging: Option<&mut ffi::plan::Staging>,
     want_end: bool,
     work: impl FnOnce(&CudaStream) -> Result<()>,
 ) -> Result<Option<CudaEvent>> {
     if !slots.is_empty() {
-        let (Some(TensorArg { backing: Backing::Write(arena), .. }), Some(staging)) = (tensors.last_mut(), staging)
-        else {
-            return Err(Error::Launch("a plan with device scalars has no arena".to_owned()));
+        let Some(staging) = staging else {
+            return Err(Error::Launch("a plan with device scalars has no staging memory".to_owned()));
         };
         for slot in slots {
-            write_bytes(&mut **arena, staging, stream, slot.offset, &slot.bytes)?;
+            staging.copy(stream, &slot.bytes, region, slot.offset)?;
         }
     }
     let mut guards = Vec::with_capacity(tensors.len());
@@ -598,8 +700,8 @@ impl PlanRun {
     fn new(plan: &LaunchPlan, place: Place<'_>, buckets: &[usize]) -> Result<Self> {
         let ctx = match place {
             Place::Own(stream) => {
-                // the arena's stream orders every launch of the run against the others: it cannot be the per-thread default stream
-                // (`ffi::refuse_per_thread`)
+                // the arena is allocated and freed on this stream, and its order event first recorded there: it cannot be the per-thread
+                // default stream (`ffi::refuse_per_thread`)
                 ffi::refuse_per_thread(stream, std::iter::empty())?;
                 let status = stream.capture_status().map_err(Error::driver("cuStreamIsCapturing"))?;
                 if status != CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE {
@@ -1391,19 +1493,11 @@ impl PlanRun {
             bases[w] = inner.arena.addr + all[w].offset.expect("the workspace is in the arena");
         }
         let ready = [self.ready_step(b, step, &bases)?];
-        let shape = [inner.arena.bytes as usize];
+        let region = (inner.arena.addr, inner.arena.bytes);
         let mut arena = inner.lock_arena();
         let launched = {
-            let Arena { slice, staging, .. } = &mut *arena;
             let mut tensors: Vec<TensorArg<'_>> = buffers.iter_mut().map(|(_, t)| t.reborrow()).collect();
-            if let Some(slice) = slice.as_mut() {
-                tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
-            }
-            ffi::ordered(stream, &mut tensors, |tensors, want_end| {
-                tracked(stream, tensors, &[], staging.as_mut(), want_end, |stream| {
-                    ffi::plan::enqueue_steps(stream, &ready)
-                })
-            })
+            execute(&mut arena, region, stream, &mut tensors, &[], |stream| ffi::plan::enqueue_steps(stream, &ready))
         };
         // a step's workspace may lie over the device-scalar slots of another plan of a shared arena: the next replay of a graph writes its
         // slots again
@@ -1429,11 +1523,11 @@ impl PlanRun {
     /// launched in order on `stream`: nothing is allocated.
     ///
     /// Ordering: as for [`Kernel::launch`], for every external made of a cudarc slice (cudarc's tracking on `stream`, the slice's own stream
-    /// waiting for the end of the plan, a written slice's own stream waited for first), and for the arena, which every launch writes: a
-    /// launch on another stream than the one the run was instantiated on waits for that stream first, and that stream waits for the end of
-    /// the launch, so two launches of one run, or a launch and a replay, never overlap. A launch is refused while `stream`, or a stream an
-    /// external or the arena is freed on, captures a CUDA graph ([`PlanRun::capture`] is how a plan is captured). An `Err` from a driver
-    /// call may come after some steps were enqueued, as for a single launch.
+    /// waiting for the end of the plan, a written slice's own stream waited for first), and for the arena, which every launch writes, by its
+    /// order event: `stream` waits for the event's most recent record (unless that record was made on `stream`) and records it after the
+    /// launch, so two launches of one run, or a launch and a replay, never overlap. A launch is refused while `stream`, or a stream an external
+    /// is freed on, captures a CUDA graph ([`PlanRun::capture`] is how a plan is captured). An `Err` from a driver call may come after some
+    /// steps were enqueued, as for a single launch.
     pub fn launch(
         &self,
         stream: &Arc<CudaStream>,
@@ -1465,20 +1559,13 @@ impl PlanRun {
                 ready.insert(after + 1, copy); // from the last: an index is not moved by an insertion after it
             }
         }
-        let shape = [self.inner.arena.bytes as usize];
+        let region = (self.inner.arena.addr, self.inner.arena.bytes);
         let mut arena = self.inner.lock_arena();
         let launched = {
-            let Arena { slice, staging, .. } = &mut *arena;
             let mut tensors: Vec<TensorArg<'_>> = externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
             tensors.extend(taps.iter_mut().map(|t| t.into.reborrow()));
-            if let Some(slice) = slice.as_mut() {
-                tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
-            }
-            let slots = bound.slots.as_slice();
-            ffi::ordered(stream, &mut tensors, |tensors, want_end| {
-                tracked(stream, tensors, slots, staging.as_mut(), want_end, |stream| {
-                    ffi::plan::enqueue_steps(stream, &ready)
-                })
+            execute(&mut arena, region, stream, &mut tensors, &bound.slots, |stream| {
+                ffi::plan::enqueue_steps(stream, &ready)
             })
         };
         arena.slots_of = 0;
@@ -1585,9 +1672,10 @@ impl PlanRun {
     /// Everything [`PlanRun::launch`] checks is checked first (a refusal captures nothing); then the steps are captured on `stream`
     /// (`CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`), which must not be capturing already. Nothing runs, and nothing is allocated: the workspace and
     /// the device scalars are in the arena, every function and handle was loaded when the plan was instantiated. `devscalars` are the values the
-    /// first replay reads (see [`CapturedPlan::set_devscalar`]). The arena's lock is held from the beginning of the capture to its end, so a
-    /// launch or a replay of this instantiation on another thread waits for the capture to end (it would otherwise make the arena's stream, which
-    /// may be the one captured, wait for an event from outside the capture: `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`, and the capture invalidated).
+    /// first replay reads (see [`CapturedPlan::set_devscalar`]). The capture begins under the arena's lock, so a launch or a replay of the arena
+    /// on `stream` from another thread is refused (its stream captures) rather than captured into the graph; the rest of the capture does not
+    /// hold the lock, since no execution enqueues anything on another stream than its own and its externals' (launches and replays on other
+    /// streams go on meanwhile, and plans of a shared arena may be captured from several threads at once, each on a stream of its own).
     pub fn capture<'ext>(
         &self,
         stream: &Arc<CudaStream>,
@@ -1623,17 +1711,21 @@ impl PlanRun {
                 ready.insert(after + 1, copy); // from the last: an index is not moved by an insertion after it
             }
         }
-        // The arena's lock is held from the beginning of the capture to its end: a launch or a replay of this instantiation on another thread
-        // makes the arena's own stream wait for its end, which would be a wait on an event from outside the capture if that stream is the one
-        // captured (`CUDA_ERROR_STREAM_CAPTURE_ISOLATION`, then the capture invalidated); they wait for the capture to end instead.
-        let arena = self.inner.lock_arena();
-        stream
-            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-            .map_err(Error::driver("cuStreamBeginCapture"))?;
+        // The capture begins under the arena's lock: an execution on the arena takes the lock and is refused while its stream (or a stream an
+        // external of it is freed on) captures (`ffi::ordered`), so one that comes after the beginning sees this stream capturing and is
+        // refused, and one that came before was enqueued before it: no execution on the arena is enqueued into this capture. Nothing else of an
+        // execution touches this stream (an execution enqueues on its own stream and on the streams its externals are freed on, never on the
+        // arena's), so the lock is not held for the rest of the capture, and captures on other streams, from other threads, of any plans of the
+        // arena run at the same time (a plan set's start-up).
+        {
+            let _arena = self.inner.lock_arena();
+            stream
+                .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(Error::driver("cuStreamBeginCapture"))?;
+        }
         let enqueued = ffi::plan::enqueue_steps(stream, &ready);
         // the capture is ended whatever happened, so that the stream is usable again (a graph of a failed capture is dropped)
         let ended = stream.end_capture(CUgraphInstantiate_flags(0)).map_err(Error::driver("cuStreamEndCapture"));
-        drop(arena);
         enqueued?;
         let graph = ended?.ok_or_else(|| Error::Launch("the capture made no graph".to_owned()))?;
         drop(ready);
@@ -1819,26 +1911,21 @@ impl<'ext> CapturedPlan<'ext> {
     /// The device scalars are written into their slots first, on `stream`, when the slots do not hold this graph's values (it was never
     /// replayed, a value was set, or a launch or another graph on the arena, of any of its plans, wrote them since). The externals and the
     /// arena are ordered exactly as for [`PlanRun::launch`]: a replay is refused while a stream captures, waits for the earlier uses of what it
-    /// writes, and the streams the externals and the arena are freed on wait for its end.
+    /// writes (and for the arena's order event, unless its last record is on `stream`), records the event, and the streams the externals are
+    /// freed on wait for its end.
     pub fn replay(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
         self.run.check_stream(stream)?;
         let inner = &*self.run.inner;
-        let shape = [inner.arena.bytes as usize];
+        let region = (inner.arena.addr, inner.arena.bytes);
         let mut arena = inner.lock_arena();
         let write = !(self.current && arena.slots_of == self.id);
         let replayed = {
-            let Arena { slice, staging, .. } = &mut *arena;
             let mut tensors: Vec<TensorArg<'_>> = self.externals.iter_mut().map(|(_, t)| t.reborrow()).collect();
             tensors.extend(self.taps.iter_mut().map(|(_, _, t)| t.reborrow()));
-            if let Some(slice) = slice.as_mut() {
-                tensors.push(TensorMut::<U8>::from_cuda(slice, &shape)?.into_arg());
-            }
             let slots: &[Slot] = if write { &self.slots } else { &[] };
             let (graph, captured_on) = (&self.graph, &self.captured_on);
-            ffi::ordered(stream, &mut tensors, |tensors, want_end| {
-                tracked(stream, tensors, slots, staging.as_mut(), want_end, |stream| {
-                    ffi::plan::launch_graph(graph, captured_on, stream)
-                })
+            execute(&mut arena, region, stream, &mut tensors, slots, |stream| {
+                ffi::plan::launch_graph(graph, captured_on, stream)
             })
         };
         match replayed {

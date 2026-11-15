@@ -23,7 +23,9 @@ not overlap on the device. The arena has an *order event* (:class:`_Arena`): a r
 record, enqueues its device-scalar writes and its launches, and records the event on its stream, all under the arena's lock (:func:`_ordered`; the record is
 made whenever anything was enqueued after the wait, also when a launch fails or an interrupt lands). So **runs of one plan on different streams, from one
 thread or many, are correct, and execute on the device one after the other**, in the order their host calls took the lock (the lock alone would order the
-enqueueing, not the device); runs on one stream are ordered by the stream as before. Nothing waits on the host. (Runs of one plan do not overlap on the device,
+enqueueing, not the device); runs on one stream are ordered by the stream as before, so **a run on the stream of the event's most recent record skips the wait**
+(one ``cuEventRecord`` per run while the runs stay on one stream, one ``cuStreamWaitEvent`` more for a run on another stream; never inside a capture, on the
+per-thread default stream, or on an arena a ``torch.cuda.graph`` captured; the event is first recorded where the arena was allocated). Nothing waits on the host. (Runs of one plan do not overlap on the device,
 so a run on another stream is not concurrent with one in flight; two plans with different layouts have different arenas and do run concurrently.) The externals
 are the caller's: an input written on another stream, or an output read on one, is ordered by the caller, as for any torch op. :func:`clear_caches` frees
 nothing under a run: it waits for the runs in progress on every thread (:class:`_Gate`) and for the last record of every arena's event.
@@ -563,6 +565,11 @@ class _Arena:
 
     ``captured`` is ``(capture id, stream)`` of the last run captured in a ``torch.cuda.graph`` on this arena: a second run of the arena in the same capture on
     another stream is refused (its external wait node would not depend on the first run's record node, so one replay would race with itself).
+
+    ``last`` is the stream of the event's most recent record, when tilefish made it outside a capture (the record after the arena's allocation, on the stream
+    it was allocated on, or the record of a run or a replay); ``None`` when that is not known. A run on that same stream skips the wait (:func:`_ordered`):
+    stream order already puts it after the work the record stands for. ``raw`` says a run of the arena was captured in a ``torch.cuda.graph``: the replays
+    of that graph record the event on streams and at times tilefish does not see, so from then on every run waits.
     """
 
     handle: Any
@@ -571,6 +578,8 @@ class _Arena:
     lock: threading.Lock
     event: Any = None
     captured: "tuple[int, int] | None" = None
+    last: "int | None" = None
+    raw: bool = False
 
 
 @dataclass
@@ -665,14 +674,27 @@ def _ordered(be: Backend, arena: _Arena, stream: int, capturing: bool, work: Any
     twice), and if it fails again the host waits for the stream (``cuStreamSynchronize``, outside a capture) before the error is raised and the lock
     released: then the work is done before the next run on the arena is enqueued, so it cannot overlap it (a capture whose record failed is broken, and its
     graph cannot be made). A wait that failed has enqueued nothing, and is not followed by a record: a record then would stand for this stream's work
-    alone, and the next run would no longer wait for the one before."""
+    alone, and the next run would no longer wait for the one before.
+
+    **The wait is skipped when the event's most recent record was made on this same stream** by tilefish, outside a capture (``arena.last``): everything
+    enqueued on a stream runs after what was enqueued on it before, so the run already comes after the work that record stands for, and the wait would
+    add nothing but host time. The record is always made, so a later run on another stream waits for this one; and since every run records after it
+    has waited (or after the record before it on its own stream), the most recent record still stands for every run before it. The wait is never skipped
+    inside a capture (the graph must hold the wait node), for the per-thread default stream (one handle, another stream in each thread), or on an arena
+    a ``torch.cuda.graph`` captured (``arena.raw``: the graph's replays record the event where tilefish does not see them). A stream is told by its
+    handle: the driver releases a destroyed stream (whose handle a new stream could get) only once its work is done, so a new stream at the handle of
+    the last record's stream comes after that work too."""
     event = arena.event
     if event is None:  # a plan with no arena shares no memory between its runs: nothing to order
         work()
         return
+    if capturing:
+        arena.raw = True
+    skip = not capturing and not arena.raw and arena.last is not None and arena.last == stream and stream != _PER_THREAD_STREAM
     waited = failed = False
     try:
-        be.wait_event(event, stream, capturing)
+        if not skip:
+            be.wait_event(event, stream, capturing)
         waited = True  # from here on, the record must follow (an interrupt before this line comes before anything but the wait is enqueued)
         failed = True
         work()
@@ -681,22 +703,31 @@ def _ordered(be: Backend, arena: _Arena, stream: int, capturing: bool, work: Any
         if waited:
             if failed:  # the error of the work is the one raised; the record is made all the same
                 with contextlib.suppress(BaseException):
-                    _record(be, event, stream, capturing)
+                    _record(be, arena, stream, capturing)
             else:
-                _record(be, event, stream, capturing)
+                _record(be, arena, stream, capturing)
 
 
-def _record(be: Backend, event: Any, stream: int, capturing: bool) -> None:
+# The handle of the per-thread default stream (CU_STREAM_PER_THREAD): one handle that names another stream in each thread.
+_PER_THREAD_STREAM = 0x2
+
+
+def _record(be: Backend, arena: _Arena, stream: int, capturing: bool) -> None:
     """The record of :func:`_ordered`: tried twice, then the stream is drained on the host (see there). A failure of the first try is raised once the
-    record is made (or the stream drained): a ``KeyboardInterrupt`` is not lost."""
+    record is made (or the stream drained): a ``KeyboardInterrupt`` is not lost. Once a record is made, ``arena.last`` is its stream (``None`` for a record
+    node of a capture, or on the per-thread default stream); when neither try made one, ``last`` is forgotten, and the next run waits."""
+    event = arena.event
     try:
         be.record_event(event, stream, capturing)
+        arena.last = None if capturing or stream == _PER_THREAD_STREAM else stream
         return
     except BaseException as first:  # noqa: BLE001 - a KeyboardInterrupt too: the record is what must not be lost
         error = first
     try:
         be.record_event(event, stream, capturing)
+        arena.last = None if capturing or stream == _PER_THREAD_STREAM else stream
     except BaseException:  # noqa: BLE001
+        arena.last = None
         if not capturing:
             with contextlib.suppress(Exception):
                 be.synchronize_stream(stream)
@@ -774,7 +805,18 @@ class PlanRunner:
                 if nbytes and ptr % _plan.ARENA_ALIGNMENT:
                     raise TilefishRuntimeError(f"the arena was allocated at {ptr:#x}, which is not aligned to {_plan.ARENA_ALIGNMENT} bytes")
                 event = be.new_event(index) if nbytes else None  # a plan with no arena shares no memory between its runs: nothing to order
-                arena = be.arena_registry()[(self._arena_key, index)] = _Arena(handle, ptr, nbytes, threading.Lock(), event)
+                arena = _Arena(handle, ptr, nbytes, threading.Lock(), event)
+                if event is not None:
+                    # the memory was allocated on the current stream, after whatever used it before there (torch's allocator reuses it in stream
+                    # order): the event stands for that from the start, so a first run on another stream waits for it, and one on this stream need not
+                    try:
+                        with be.scope(index):
+                            _record(be, arena, be.stream(index), False)
+                    except BaseException:
+                        with contextlib.suppress(Exception):
+                            be.destroy_event(event, index)
+                        raise
+                be.arena_registry()[(self._arena_key, index)] = arena
         return arena
 
     def _bucket(self, values: "Mapping[str, int]", index: int) -> _BucketRT:

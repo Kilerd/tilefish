@@ -86,7 +86,7 @@ def test_runs_of_different_plans_on_the_shared_arena_wait_for_and_record_one_ord
     """A run of stage A on one stream and of stage B on another must not overlap on the device: they share every byte. Each waits for the most recent
     record of the arena's one event before its first write and records it after its last launch, under the arena's one lock, as the runs of one plan do."""
     s, be = shared()
-    streams = iter([11, 22, 33, 11, 22, 33])
+    streams = iter([5, 11, 22, 33, 11, 22, 33])  # the arena is allocated on 5, then the runs: each on another stream than the last record's
     be.stream = lambda index: next(streams)
     t = Tensors(32)
     pipeline(s, t)
@@ -109,8 +109,8 @@ def test_a_captured_plan_on_the_shared_arena_is_ordered_with_the_runs_of_the_oth
     s.run(pm.stage_ffn, r, h2, *t.weights(pm.stage_ffn))
     cap.replay(stream=44)
     ops = [e for e in be.log[start:] if e[0] in ("wait", "record", "devscalar", "graph")]
-    assert ops[0] == ("wait", "event1", 7, False) and ops[1] == ("record", "event1", 7, False)  # the ffn's run
-    assert ops[2:] == [
+    assert ops[0] == ("record", "event1", 7, False)  # the ffn's run, on the stream of the last record: no wait
+    assert ops[1:] == [
         ("wait", "event1", 44, False),
         ("devscalar", offsets(s.plans["stage_attn"])["n"], 5, False),
         ("graph", "graph1", 44),
@@ -169,7 +169,7 @@ def test_one_step_alone_and_weights_bound_once_are_on_the_shared_arena():
     s.run_step(pm.stage_ffn, 0, {"h2": h2, "w_up": t.w["w_up"], "t0": t.make((64, 1024))})
     gemm = [e for e in be.log[start:] if e[0] == "gemm"]
     assert gemm[0][6] == ARENA + offsets(s.plans["stage_ffn"])["workspace"]
-    assert [e[:2] for e in be.log[start:] if e[0] in ("wait", "record")] == [("wait", "event1"), ("record", "event1")]
+    assert [e[:2] for e in be.log[start:] if e[0] in ("wait", "record")] == [("record", "event1")]  # on the stream of the last record
     w = s.bind_weights(pm.stage_mix, {"w_o": t.w["w_o"], "w_ln2": t.w["w_ln2"]})
     w.run(a, t.x)
     assert w._runner is s.runner(pm.stage_mix) and be.arenas == 1

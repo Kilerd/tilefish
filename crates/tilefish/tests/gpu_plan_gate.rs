@@ -1107,6 +1107,59 @@ fn two_launches_of_one_run_on_two_streams_do_not_disturb_each_other() {
     println!("rust plan gate: two launches of one run on two streams, back to back, 5 rounds: both are Python's bytes");
 }
 
+/// The wait for the arena's order event is skipped on the stream of its last record, and the order across streams still holds: stream A is held
+/// by a host function for 300 ms, three launches are queued on A behind it (the second and the third skip the wait), then one launch on stream B,
+/// which must run after all three: when B is done, A is done too. Then the other way round (B held, one launch on B, two on A, which wait for it).
+/// Every result is Python's.
+#[test]
+fn launches_that_skip_the_wait_on_their_stream_are_still_ordered_with_another_stream() {
+    extern "C" fn hold(_: *mut std::ffi::c_void) {
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let gpu = Gpu::new();
+    let plan = plan_named("block");
+    let run = load(&plan).instantiate_all(&gpu.stream).unwrap();
+    let cases: Vec<&Value> = plan["cases"].as_array().unwrap().iter().filter(|c| c["bucket"]["M"] == 128).collect();
+    let (a, b) = (gpu.ctx.new_stream().unwrap(), gpu.ctx.new_stream().unwrap());
+    for (round, (first, second, on_first)) in [(&a, &b, 3), (&b, &a, 1)].into_iter().enumerate() {
+        let mut firsts: Vec<Vec<Ext>> = (0..on_first).map(|_| upload(first, cases[0])).collect();
+        let mut seconds: Vec<Vec<Ext>> = (0..4 - on_first).map(|_| upload(second, cases[1])).collect();
+        first.synchronize().unwrap();
+        second.synchronize().unwrap();
+        gpu.ctx.bind_to_thread().unwrap();
+        // SAFETY: the context is current; the stream is a live stream of it; `hold` takes no data.
+        let held = unsafe { sys::cuLaunchHostFunc(first.cu_stream(), Some(hold), std::ptr::null_mut()) };
+        assert_eq!(held, sys::CUresult::CUDA_SUCCESS, "cuLaunchHostFunc");
+        for exts in firsts.iter_mut() {
+            run.launch(first, &mut args(exts, false), &named(&devscalars(cases[0]))).unwrap();
+        }
+        for exts in seconds.iter_mut() {
+            run.launch(second, &mut args(exts, false), &named(&devscalars(cases[1]))).unwrap();
+        }
+        second.synchronize().unwrap();
+        // SAFETY: the stream is a live stream of the context, which is current.
+        let first_done = unsafe { sys::cuStreamQuery(first.cu_stream()) } == sys::CUresult::CUDA_SUCCESS;
+        first.synchronize().unwrap();
+        assert!(
+            first_done,
+            "round {round}: the launches on the second stream were done before the ones on the first stream they follow"
+        );
+        for (exts, stream) in firsts.iter().map(|e| (e, first)).chain(seconds.iter().map(|e| (e, second))) {
+            for e in exts.iter().filter(|e| e.expect.is_some()) {
+                assert!(
+                    stream.clone_dtoh(&e.slice).unwrap() == *e.expect.as_ref().unwrap(),
+                    "round {round}: '{}'",
+                    e.name
+                );
+            }
+        }
+    }
+    println!(
+        "rust plan gate: three launches on a held stream (two of them skip the wait for the order event), then one on another stream: it ran after \
+         all three; and the other way round; Python's bytes"
+    );
+}
+
 /// The order of the runs of one instantiation (`docs/plan-schema-1.md`, section 9: two executions that use one arena must not overlap on the
 /// device): two threads at once, one launching a case of one bucket 12 times on its stream (each into an output of its own), the other replaying
 /// the graph of a case of another bucket 12 times on its stream (copying the output after each replay), with no synchronization between them.

@@ -668,7 +668,8 @@ and keeps it, and checks **every step's preconditions before the first launch**:
 (`outputs=` gives them) and waits for nothing: the GEMM workspace is in the arena, a device scalar is written by a stream-ordered copy. So **a replay under `torch.cuda.graph` captures and the
 graph replays byte-identically** (`runtime.prepare` does the allocating and the loading that cannot happen inside a capture; `docs/plan-schema-1.md` lists every reason a plan could fail to
 capture). Every run of a plan on a device uses the one arena, so **runs of one plan on several streams (or threads) are ordered on the device** by an event of the arena: a run waits on its
-stream for the run before it and records the event after its last launch, so they never overlap and their results are correct, at the cost of running one after the other.
+stream for the run before it and records the event after its last launch, so they never overlap and their results are correct, at the cost of running one after the other
+(a run on the stream of the event's last record skips the wait: runs that stay on one stream cost one `cuEventRecord` each).
 `tilefish.capture(graph, *inputs, devscalars=..., outputs=...)` captures the plan in a CUDA graph of its own: its `replay()` takes the arena's lock and waits for and records that event
 around the graph, as a run does, so **its replays are ordered with every run and replay of the plan, from any thread and on any stream**, and `set_devscalar` changes a device scalar for
 the next replays with no synchronization. A plan run inside your own `torch.cuda.graph(...)` captures too: the wait and the record are external event nodes of the graph, so its arena is

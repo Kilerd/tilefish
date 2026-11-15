@@ -282,19 +282,25 @@ what it always was.
    orders them. Python does it with one *order event* per arena (`_planrun._Arena`): an execution, under the arena's lock, makes its stream wait for the event's most recent record
    (`cuStreamWaitEvent`) before its first write (step 4), and records the event on its stream (`cuEventRecord`) after its last launch (step 5), also when a launch fails after others were
    enqueued, and when an interrupt lands after the wait (a record that fails is tried again, and if it fails again the host waits for the stream before the error is raised; a wait that
-   failed enqueued nothing and is followed by no record). So executions of one plan on different streams, from one thread or several, are correct and run on the device one after the other, in the order the host issued them
+   failed enqueued nothing and is followed by no record). **The wait is skipped when the event's most recent record was made on the execution's own stream**, outside a capture: stream
+   order already puts the execution after the work that record stands for, so executions that stay on one stream cost one `cuEventRecord` each, and one on another stream one
+   `cuStreamWaitEvent` more. The record is always made; since every execution records after it waited (or after the record before it, on its own stream), the most recent record
+   stands for every execution before it, whatever their streams. Python never skips inside a capture, on the per-thread default stream, or on an arena a `torch.cuda.graph` captured
+   (that graph's replays record the event where the host does not see them); the event is recorded once when the arena is allocated, on the stream it was allocated on, so a first
+   execution on another stream waits for what used the memory before. So executions of one plan on different streams, from one thread or several, are correct and run on the device one after the other, in the order the host issued them
    (a lock that orders only the enqueueing is not enough: the race it leaves corrupted the outputs of two runs on two streams in 5 of 5 tries). Executions on one stream are ordered by
    the stream. `clear_caches` frees nothing under an execution: it waits for every execution in progress on any thread to have recorded the event (executions, captures and replays hold a
    gate shared, `clear_caches` takes it exclusive, and the executions that start meanwhile wait for it, then allocate and load again), takes each arena's lock, waits for the event
    (`cuEventSynchronize`) before it frees the arena, and synchronizes every context before it unloads the modules. Plans of different layouts have different arenas and are not ordered with each other.
-   **The order is the arena's, not the plan's**: an arena shared by several plans (section 15.1) orders the executions of all of them, with the same lock and the same event
-   (Python) or stream (Rust).
-   The Rust host (`PlanRun`, one arena per instantiation) gives the same order: an execution, under the arena's lock, makes its stream wait for what the arena's
-   own stream (the one it was allocated on) holds, and makes that stream wait for an event recorded after its last launch (cudarc's events on the arena add the
-   rest), so executions of one instantiation on any streams, from any threads, run one after the other in the order they are issued; dropping the last handle of
-   an instantiation waits for that stream before the arena is freed. A capture (`PlanRun::capture`) holds the arena's lock from the beginning of the capture to its end,
-   so no execution on another thread makes the arena's stream wait for an event while that stream is being captured (before, 3 to 18 of 200 captures on the arena's
-   stream failed with `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` or `..._INVALIDATED` against a loop of launches on another thread, and some runs crashed; now none).
+   **The order is the arena's, not the plan's**: an arena shared by several plans (section 15.1) orders the executions of all of them, with the same lock and the same event.
+   The Rust host (`PlanRun`, one arena per instantiation) gives the same order with an order event of its own (`plan_run::Order`): an execution, under the arena's lock, makes
+   its stream wait for the event (skipped when its most recent record is on that stream) and records it after its last launch, so executions of one instantiation on any
+   streams, from any threads, run one after the other in the order they are issued; nothing is enqueued on any other stream than the execution's own and the streams its
+   externals are freed on; dropping the last handle of an instantiation waits on the host for the event before its modules are unloaded and its arena freed. (Up to crate 0.0.4
+   the Rust host ordered the arena through the stream it was allocated on, as a slice owned by that stream.) A capture (`PlanRun::capture`) begins under the arena's lock,
+   so an execution of the arena on the stream being captured is refused rather than captured; the capture does not hold the lock after that, since no execution touches the
+   captured stream (when executions did make the arena's own stream wait, a capture of that stream had to hold the lock to its end: 3 to 18 of 200 captures failed with
+   `CUDA_ERROR_STREAM_CAPTURE_ISOLATION` or `..._INVALIDATED` against a loop of launches on another thread).
 2. **Bind the externals.** The caller gives a tensor (address, shape, strides, dtype) for every buffer of role `input`, `weight` and `inout`, and for every `output` (or the host allocates it), and a
    value for every `devscalar`. Check each external against its buffer: dtype, rank, contiguous row-major (a parameter is a dense tensor), and bind the dimensions (section 5). Select the bucket.
    The external tensors of one call must not overlap each other where one of them is written (`output`, `inout`), and none may overlap the arena.
@@ -555,7 +561,7 @@ they were.
   (three arenas: 26 476 800).
 * **Why that is sound: the order.** Two executions that use one arena must not overlap on the device (section 9, step 1), and that is said of
   the arena, whatever plans run on it: a host orders **every execution on the shared arena, of any of its plans** (a run, a capture, the replay of
-  a host-owned graph, a step alone) with every other, under one lock and one order (Python: the arena's one order event; Rust: its one stream),
+  a host-owned graph, a step alone) with every other, under one lock and one order event (both hosts),
   so the executions of two plans of the arena cannot run concurrently, from any threads and on any streams. A replay of plan A's graph is
   ordered with every run and replay of plan B. Then an execution finds in the arena whatever the one before it left, and needs nothing of it: it
   writes every arena buffer it reads before it reads it (an intermediate, section 7.3; a device scalar's slot, before the first launch, section
