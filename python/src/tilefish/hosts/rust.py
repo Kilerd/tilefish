@@ -46,7 +46,9 @@ What the module holds, in order:
   ``WORKSPACE_BYTES`` and ``PINNED_WITH`` (the cuBLASLt version of each architecture's pin; its doc names the SM count each was pinned on) and ``gemm()``.
 
 The output is deterministic: the same manifest gives the same bytes. Nothing in it depends on where the manifest was
-written, except the ``include_bytes!`` paths with ``embed=True``.
+written, except the ``include_bytes!`` paths with ``embed=True`` (relative to the generated file). An export is reproducible (a cubin
+names its sources by module path), so a host that embeds one is the same binary on two machines once rustc's own paths are remapped
+(``crates/tilefish/README.md``, "Reproducible builds of a host").
 
 What it trusts. The output is Rust source that a developer compiles and runs, and a manifest directory vouches for nothing by
 itself: whoever can write it can put any text in any field. So :func:`emit` (and :func:`render`) take a *pinned* manifest only: a

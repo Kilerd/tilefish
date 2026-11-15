@@ -9,7 +9,7 @@ A reader of this document is assumed to know schema 2: the entry fields of a Tri
 expression grammar, the canonical JSON of the digest, and the launch checks the crate already makes. Only what is new or changed is specified; a
 field that is not mentioned is as in schema 2.
 
-Contents: 1 what changed; 2 the top level; 3 the digest; 4 kernel entries; 5 the ABI (strided views, device scalars, fixed arguments, scratch
+Contents: 1 what changed; 2 the top level; 3 the digest (3.1 what a pin vouches for, reproducible exports); 4 kernel entries; 5 the ABI (strided views, device scalars, fixed arguments, scratch
 slots, an `out` written over its input, TMA descriptors); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM, and in 9.4 a pinned cuDNN convolution); 10 strict reading, every
 refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where it is tested.
 
@@ -75,6 +75,39 @@ sha256( b"tilefish.manifest-digest.v3\0" + canonical_json({"schema": 3, "kernels
   and `"3"` are not. A schema 3 document without a `library` list, a `kernels` or `library` that is not a list, and an entry that is not an object cannot be
   digested (the same file `python_manifests.in` lists them in `MANIFEST_ERRORS`; the Rust `manifest_digest` returns an error for each). A schema 3 digest is
   never equal to a schema 2 one.
+
+### 3.1 What a pin vouches for, and reproducible exports (after 0.0.6)
+
+A pin is the digest of one exported artifact: the entries above, and through each entry's `sha256` every cubin file byte for byte (debug sections
+included). This is unchanged, and so are the schema, the digest function, both readers and every manifest written before.
+
+What changed is what goes into a cubin. Triton records the file of a kernel, and of every jit function it calls, in the locations of its IR, and
+`ptxas` writes them into the cubin's debug sections (`.debug_line`, `.nv_debug_ptx_txt`, `.rela.debug_line` and their `.nv.merc.*` copies). Up to
+0.0.6 those were absolute paths: the checkout of a hand-written kernel, the virtual environment of Triton's own `triton/language/standard.py`, and the
+random `/tmp/tilefish-gen-XXXXXXXX` directory a lowered kernel's or a generated op's source was written to. So two exports of the same operators had
+the same `sha256_code` and different `sha256`s, and a different digest, from one directory or process to the next. Now a build names each file by a
+path that does not depend on the host (`python/src/tilefish/_source.py`, `source_name`):
+
+* a module `a.b.c` whose file ends in `a/b/c.py` (or `a/b/c/__init__.py`): that tail, its path relative to the `sys.path` entry it was imported from;
+* a generated source (a lowered kernel, `tilefish.contiguous`, `im2col`, `im2col1d`, `col2im1d`): `tilefish_generated/<name>.py`, what
+  `LoweredKernel.write(directory)` writes and imports as `tilefish_generated.<name>`; the file itself is
+  `<cache>/generated/<sha256 of the source>/tilefish_generated/<name>.py` (`$TILEFISH_CACHE_DIR`, else `~/.cache/tilefish`), written atomically and used
+  only when it holds the source, or a private scratch directory of the process when that cannot be written;
+* any other file (a script run as `__main__`): its base name.
+
+The names are applied to the frontend of a compile (`python/src/tilefish/_ir.py`, `host_independent_paths`), so the locations, the PTX and the cubin
+all carry them. Line and column numbers, and the machine code, are unchanged: an export of this version has the `sha256_code` of every binary an earlier
+version built from the same sources with the same toolchain, and other `sha256`s. Two exports of the same operators with the same toolchain (Triton,
+`ptxas`, cuBLASLt, cuDNN) for the same device are the same files with the same digest, from any directory, in any process, on any machine: a pin taken on
+one machine checks a rebuild on another. Options that were considered and not taken:
+
+* *let the digest cover `sha256_code` instead of the files*: a pin would no longer vouch for the bytes a host loads (the debug sections would be
+  outside it), every reader would need a second digest form, and old pins would change meaning;
+* *normalise the paths inside the cubins before hashing*: the same, plus an ELF rewrite in both readers;
+* *drop the line information*: it removes and renumbers sections, so every `sha256_code` would change, and profilers lose the source lines.
+
+A manifest exported by 0.0.6 or earlier still names the directories of its build; it loads, pins and replays exactly as before. A prebuilt binary
+(section 8) is taken as it is: a PTX with `.file` directives or a cubin built elsewhere keeps whatever paths it has.
 
 ## 4. Kernel entries
 
@@ -1130,6 +1163,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 | `implementation`: an operator with an implementation per architecture (section 4.1) | `test_per_arch.py`; on a GPU `test_gpu_per_arch.py` (and the Rust gate) |
 | `tensordesc`: TMA descriptors (section 5.5): the declaration, the spec, the slots, the readers, the launch checks, the encode, a plan on a fake backend, the emitter | `test_tensordesc.py`; on a GPU `test_gpu_tma.py` (Triton and Gluon kernels against Triton's own launch, plans and captures) and the Rust gate |
 | `total_num_warps`: warp-specialised kernels (section 4.2): the build's checks, the cache, the readers, the block of a launch, the emitter | `test_warp_specialization.py`; on a GPU `test_gpu_warp_specialization.py` (Gluon and Triton warp-specialised kernels against Triton's own launch, CUDA graphs, plans and captures) and the Rust gate |
+| reproducible exports (section 3.1): the names of source files, the content-addressed generated sources (atomic, checked, the fallback, processes at once), two exports from two checkouts | `test_reproducible_builds.py`; on a GPU `test_gpu_repro.py` (a graph with a lowered kernel, generated ops, a hand-written extern and a PTX, exported in two processes from two directories: the same files and digests), `test_gpu_build.py`, `test_gpu_plan.py` |
 
 The Rust crate (`crates/tilefish/tests/`):
 

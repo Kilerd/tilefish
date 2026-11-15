@@ -159,5 +159,40 @@ cudarc = { version = "0.19.10", default-features = false, features = ["driver", 
 tilefish = { version = "0.0.4", default-features = false, features = ["cuda-13000"] }
 ```
 
+**Reproducible builds of a host.** The crate embeds no path of its own: it has no
+build script, and uses `env!` and `file!` only in its tests. Two things made
+builds of the same host on two machines differ:
+
+- **An embedded manifest** (`tilefish.hosts.rust.emit(..., embed=True)`, whose
+  `include_bytes!` paths are relative to the generated file). Up to tilefish 0.0.6
+  a cubin's debug sections named the directory it was built in, so each export had
+  other bytes and another `MANIFEST_DIGEST`. tilefish after 0.0.6 names the sources
+  by module path, so the same operators exported with the same toolchain for the same
+  device are the same files on any machine. Export a manifest of 0.0.6 or earlier
+  again to embed it reproducibly.
+- **The paths rustc writes into the binary**: the source file of every panic
+  location (`std::panic::Location`), including those of this crate, cudarc and
+  serde. A workspace member's are relative to the workspace root, but a crate from
+  a registry is under `$CARGO_HOME` (by default `~/.cargo`), which names the user.
+  Build with the same toolchain, `Cargo.lock`, target and profile, and remap the
+  prefixes:
+
+  ```sh
+  RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$PWD=/build --remap-path-prefix=$(rustc --print sysroot)=/rustc" \
+    cargo build --release --locked
+  ```
+
+  The sysroot prefix matters when the `rust-src` component is installed: rustc
+  then writes the local paths of std's sources. Cargo's `trim-paths` profile option
+  does the same, but cargo 1.100 still needs nightly for it. A path dependency outside the
+  workspace root (`tilefish = { path = "../tilefish" }` from another workspace)
+  cannot be remapped: cargo hashes its absolute path into the crate's metadata, and
+  that changes symbol hashes and the code layout. Keep a vendored copy inside the
+  workspace, or depend on the crate from a registry.
+
+Checked on Linux (cargo 1.100) and macOS (cargo 1.99): a host that embeds a
+manifest, built in two checkouts at different paths with different `CARGO_HOME`s,
+has the same binary sha256 with these flags, and a different one without them.
+
 Licensed under either of Apache License, Version 2.0 or MIT license at your
 option.
