@@ -32,7 +32,7 @@ def without_version(path):
 def test_the_committed_fixtures_are_what_the_code_makes(committed, tmp_path):
     made = fx.export_all(tmp_path)
     assert made == committed
-    for name in [*fx.PLANS, fx.SET]:
+    for name in [*fx.PLANS, fx.SET, fx.CARRIED]:
         assert sorted(f.name for f in (tmp_path / name).iterdir()) == sorted(f.name for f in (fx.DEFAULT / name).iterdir())
         for f in sorted((fx.DEFAULT / name).iterdir()):
             if f.suffix == ".json":
@@ -110,3 +110,19 @@ def test_the_arena_the_plans_of_the_golden_set_share_is_the_largest_of_theirs(co
     s = runtime.share_arena([p6.TILES[t] for t in (1, 2, 3)], mode="replay", plan=fx.DEFAULT / fx.SET, pin=e["set_digest"])
     assert s.sizes == e["arena_bytes"] == {"tiles1": 256, "tiles2": 1024, "tiles3": 2304}
     assert s.arena_bytes == e["shared_arena_bytes"] == 2304
+
+
+def test_the_golden_set_of_carried_buffers_loads_with_its_pin_and_lays_its_arena_out(committed):
+    """The golden set ``carried`` (``gpu_kernels_plans.CARRIED_SET``, section 15.2 of the plan schema): every plan loads through the set's pin, and the
+    arena they share is the largest plan's region (``stage_chain``'s intermediate) and then a region per carried name in code point order (``g``,
+    then ``h``): what Rust's ``CarriedLayout::of`` and ``SharedArena::bytes_for`` reproduce from the files."""
+    import gpu_kernels_plans as kp
+
+    from tilefish import runtime
+
+    e = committed[fx.CARRIED]
+    s = runtime.share_arena(list(kp.CARRIED_SET), mode="replay", plan=fx.DEFAULT / fx.CARRIED, pin=e["set_digest"])
+    assert {n: p.carried for n, p in s.plans.items()} == e["carried_of"]
+    assert s.sizes == e["arena_bytes"] and e["carried_base"] == max(e["arena_bytes"].values()) == 6144
+    assert s.carried == {n: tuple(r) for n, r in e["carried"].items()} == {"g": (6144, 6144, "f32"), "h": (12288, 6144, "f32")}
+    assert s.arena_bytes == e["shared_arena_bytes"] == 18432

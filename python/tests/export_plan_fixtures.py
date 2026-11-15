@@ -7,7 +7,8 @@ Three directories, ``block`` and ``block-reuse`` (the transformer block of ``pla
 ``tilefish.runtime.export`` does, but with the *fake* builds of ``plan_fakes`` (a tiny ELF file per kernel entry, a made-up 64-byte algorithm per GEMM): what is real is
 the format, the digests and the plan; the machine code is not, so the fixtures validate a reader and cannot be launched. Each directory has ``manifest.json`` (schema 3),
 the cubins and ``plan.json``; ``expected.json`` has, for each, the plan digest and the manifest digest that Python computes, the arena size and every buffer's offset, which a
-reader in another language must reproduce from the files alone (``docs/plan-schema-1.md``). ``test_plan_fixtures.py`` regenerates all of it and requires the committed files
+reader in another language must reproduce from the files alone (``docs/plan-schema-1.md``). Two plan sets: ``set`` (one stage per key) and ``carried`` (stages
+that hand carried buffers to each other, with the layout of the arena they share and its carried regions in ``expected.json``). ``test_plan_fixtures.py`` regenerates all of it and requires the committed files
 to be the same bytes (the ``tilefish`` version in a file is not compared: it is not digested), and loads each directory as a replay does.
 """
 
@@ -20,12 +21,13 @@ import plan_fakes
 import plan_model as pm
 
 import tilefish
-from tilefish import Manifest
+from tilefish import Manifest, _plan
 
 HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT = HERE / "golden" / "plans"
 PLANS = {"block": ("block", False), "block-reuse": ("block", True), "steps": ("steps", False), "given": ("two_scales", False)}  # directory: (the graph of plan_model, reuse)
 SET = "set"  # a plan set: the plans of gpu_kernels_p6.tile_chain for 1, 2 and 3 tiles over one manifest (plans.json, <graph>.plan.json)
+CARRIED = "carried"  # a plan set with carried buffers: gpu_kernels_plans.CARRIED_SET (docs/plan-schema-1.md, section 15.2)
 
 
 def export_all(output: pathlib.Path) -> dict:
@@ -67,6 +69,26 @@ def export_all(output: pathlib.Path) -> dict:
         # the arena the three plans share (docs/plan-schema-1.md, section 15.1): the largest of their arenas, each plan at its own offsets
         "arena_bytes": {name: p.arena_bytes for name, p in exported_set.plans.items()},
         "shared_arena_bytes": max(p.arena_bytes for p in exported_set.plans.values()),
+    }
+    import gpu_kernels_plans as kp
+
+    directory = output / CARRIED
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir(parents=True)
+    carried_set = plan_fakes.export_set([tilefish.plan(g) for g in kp.CARRIED_SET], directory)
+    layout = _plan.carried_layout([p.doc for p in carried_set.plans.values()])
+    expected[CARRIED] = {
+        "arch": carried_set.doc["arch"],
+        "set_digest": carried_set.digest,
+        "manifest_digest": carried_set.manifest_digest,
+        "plans": {name: p.digest for name, p in carried_set.plans.items()},
+        "carried_of": {name: p.carried for name, p in carried_set.plans.items()},
+        "arena_bytes": {name: p.arena_bytes for name, p in carried_set.plans.items()},
+        # the arena of all of them (docs/plan-schema-1.md, section 15.2): the largest plan's region, then each carried name's, in code point order
+        "shared_arena_bytes": layout.total,
+        "carried_base": layout.base,
+        "carried": {name: list(region) for name, region in layout.regions.items()},
     }
     (output / "expected.json").write_text(json.dumps(expected, indent=2, sort_keys=True) + "\n")
     return expected

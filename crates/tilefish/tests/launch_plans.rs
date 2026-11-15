@@ -203,6 +203,52 @@ fn the_plans_of_the_golden_set_share_an_arena_of_the_largest_of_theirs() {
     assert!(e5.to_string().contains("'tiles1' is given twice"), "{e5}");
 }
 
+/// The golden plan set `carried` (`gpu_kernels_plans.CARRIED_SET`, `docs/plan-schema-1.md` section 15.2): plans whose carried buffers (role
+/// `carried`, offset `null`) the arena they share holds after the largest plan's region, a region per carried name in code point order, as
+/// Python's `carried_layout` has it (`expected.json`); a plan alone has its own carried regions after its own region; a carried name of two dtypes
+/// is refused.
+#[test]
+fn the_golden_set_of_carried_buffers_lays_its_arena_out_as_python_does() {
+    let e = &expected()["carried"];
+    let set = PlanSet::load(golden().join("carried"), Pin::Digest(e["set_digest"].as_str().unwrap())).unwrap();
+    let names: Vec<&str> = set.names().collect();
+    let plans: Vec<LaunchPlan> = names.iter().map(|n| set.plan(n).unwrap()).collect();
+    for p in &plans {
+        let carried: Vec<&str> = p.carried().collect();
+        let want: Vec<&str> =
+            e["carried_of"][p.graph()].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(carried, want, "{}", p.graph());
+        assert_eq!(p.arena_bytes(), e["arena_bytes"][p.graph()].as_u64().unwrap());
+        for b in p.buffers().iter().filter(|b| b.role == BufferRole::Carried) {
+            assert_eq!(b.offset, None);
+        }
+    }
+    let refs: Vec<&LaunchPlan> = plans.iter().collect();
+    let layout = tilefish::CarriedLayout::of(&refs).unwrap();
+    assert_eq!(layout.base, e["carried_base"].as_u64().unwrap());
+    assert_eq!(layout.total, e["shared_arena_bytes"].as_u64().unwrap());
+    let want: Vec<(String, u64, u64, String)> = e["carried"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(n, r)| (n.clone(), r[0].as_u64().unwrap(), r[1].as_u64().unwrap(), r[2].as_str().unwrap().to_owned()))
+        .collect();
+    let got: Vec<(String, u64, u64, String)> =
+        layout.regions.iter().map(|(n, o, b, d)| (n.clone(), *o, *b, d.name().to_owned())).collect();
+    assert_eq!(got, want);
+    assert_eq!(tilefish::SharedArena::bytes_for(&refs).unwrap(), layout.total);
+    assert_eq!(set.shared_arena_bytes(&names).unwrap(), 18432);
+    // a plan alone: its own region (none for stage_a), then its carried buffer
+    let a = set.plan("stage_a").unwrap();
+    let alone = tilefish::CarriedLayout::of(&[&a]).unwrap();
+    assert_eq!((alone.base, alone.total, alone.offset("h")), (0, 6144, Some(0)));
+    let chain = set.plan("stage_chain").unwrap();
+    assert_eq!(tilefish::CarriedLayout::of(&[&chain]).unwrap().offset("h"), Some(6144));
+    // the steps read and write the carried buffer: a memset of it, and a kernel writing it
+    let zero = set.plan("stage_zero").unwrap();
+    assert_eq!(zero.buckets()[0].steps[0].kind, StepKind::Memset);
+}
+
 /// The golden plan `given` (`plan_model.two_scales`): one prebuilt binary (one manifest entry) launched by two steps, each with the values its call
 /// gives to the fixed arguments per call `k` (`i32`) and `c` (`i64`), the second `c` the bucket's `Rg`; the entry has them as `given` parameters.
 #[test]

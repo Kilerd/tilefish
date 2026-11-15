@@ -508,12 +508,27 @@ def test_views_flow_into_elementwise_ops_reductions_and_casts(tr):
     assert c.type.materialized() == contiguous and contiguous.materialized() is contiguous
 
 
-def test_a_view_cannot_be_stored(tr):
+def test_a_view_cannot_be_stored_in_a_kernel_body(tr):
+    tr.ctx.kind = "kernel"
     res = tr.val(Tensor[4, 4, f32], name="res", access="inout")
     c, _ = tr.val(Tensor[4, 8, f32]).split(4, axis=1)
     with pytest.raises(TilefishTypeError, match=r"expected Tensor\[4, 4, f32\], got View\[4, 4, f32\].*strided view cannot be stored"):
         res[...] = c
     res[...] = c * 1  # computing from it is fine
+
+
+def test_a_view_is_stored_into_an_inout_parameter_of_a_graph_body(tr):
+    # a launch plan copies it through tilefish.contiguous (test_plan_materialise.py); of another shape or dtype it is refused as before
+    res = tr.val(Tensor[4, 4, f32], name="res", access="inout")
+    c, _ = tr.val(Tensor[4, 8, f32]).split(4, axis=1)
+    res[...] = c
+    assert tr.nodes[-1].op == "store" and tr.nodes[-1].inputs[1] is c
+    wide = tr.val(Tensor[8, 4, f32]).permute(1, 0)
+    with pytest.raises(TilefishTypeError, match=r"expected Tensor\[4, 4, f32\], got View\[4, 8, f32\]"):
+        res[...] = wide
+    other, _ = tr.val(Tensor[4, 8, bf16]).split(4, axis=1)
+    with pytest.raises(TilefishTypeError, match=r"expected Tensor\[4, 4, f32\], got View\[4, 4, bf16\]"):
+        res[...] = other
 
 
 def test_split_needs_at_least_one_whole_chunk(tr):

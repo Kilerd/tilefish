@@ -70,7 +70,10 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   exported and run through Python's plan replay; ``crates/tilefish/tests/gpu_plan_gate.rs`` launches and captures each case, and ``compare`` holds the
   Rust plan's launch and its CUDA graph replay to Python's bytes. The three stages of the block (``plan_model.STAGES``) are a plan set whose plans
   ``gpu_plan_gate.rs`` also runs one after the other on one shared arena (``SharedArena``), launched and replayed, each stage's outputs the next one's
-  inputs on the device; ``compare`` holds those to Python's bytes too.
+  inputs on the device; ``compare`` holds those to Python's bytes too. The plans ``strided_store`` (views that are not dense stored into ``InOut``
+  parameters) and ``memset_steps`` (memset steps of an output and of an ``InOut`` tensor) are cases like the others; the plans of
+  ``gpu_kernels_plans.CARRIED_SET`` are a plan set whose plans hand **carried buffers** to each other on one shared arena (:func:`prepare_carried`),
+  called in the order of :data:`CARRIED_CALLS` on one ``SharedArena`` by ``gpu_plan_gate.rs`` (launched, and captured and replayed).
 
 ``WORK/cases.json`` is what ``crates/tilefish/tests/gpu_gate.rs`` reads::
 
@@ -1178,6 +1181,21 @@ def plan_graphs():
             for seed in (0, 1)
         ]
 
+    import gpu_kernels_plans as kp
+
+    def strided_store_cases():  # the caller's InOut tensors get a transpose and a column block (launches of tilefish.contiguous)
+        return [
+            (
+                f"Rs{rs}-seed{seed}",
+                {"x": randn((rs, 64), F32, seed=130 + rs + seed), "tr": randn((64, rs), F32, seed=131 + rs + seed), "cols": randn((rs, 32), F32, seed=132 + rs + seed)},
+            )
+            for rs in (8, 24)
+            for seed in (0, 1)
+        ]
+
+    def memset_cases():  # the caller's InOut tensor is zeroed by a memset before it is updated (its input bytes are not zero)
+        return [(f"Rs{rs}-seed{seed}", {"x": randn((rs, 64), F32, seed=140 + rs + seed), "state": randn((rs, 64), F32, seed=141 + rs + seed)}) for rs in (8, 24) for seed in (0, 1)]
+
     import conv_kernels as ck
 
     def conv_chain_cases():
@@ -1207,6 +1225,8 @@ def plan_graphs():
         # [4, Lb, Lb] buffers (the stride Lb*Lb): broadcasts along the middle axis, a transpose to tilefish.contiguous, a head at the offset Lb*Lb
         ("product_strides", p7.attention_mask, False, attention_mask_cases),
         ("product_strides-reuse", p7.attention_mask, True, attention_mask_cases),
+        ("strided_store", kp.strided_store, False, strided_store_cases),  # views that are not dense stored into InOut parameters (tilefish.contiguous)
+        ("memset_steps", kp.memset_steps, False, memset_cases),  # memset steps: the returned value's buffer and the caller's InOut tensor zeroed
     ] + tma
 
 
@@ -1330,8 +1350,60 @@ def prepare_plans(work):
         plans.append(
             {"name": name, **extra, "digest": exported.digest, "graph": doc["graph"], "reuse": reuse, "arena_bytes": doc["arena_bytes"], "cases": cases}
         )
-    (work / "plans.json").write_text(json.dumps({"plans": plans}, indent=1) + "\n", encoding="utf-8")
-    print(f"prepared {len(plans)} plans and {total} cases of plan replay", file=sys.stderr)
+    carried = prepare_carried(work, root)
+    (work / "plans.json").write_text(json.dumps({"plans": plans, "carried": carried}, indent=1) + "\n", encoding="utf-8")
+    print(f"prepared {len(plans)} plans and {total} cases of plan replay, and {len(carried['calls'])} calls handing carried buffers on", file=sys.stderr)
+
+
+# the calls of the plans of gpu_kernels_plans.CARRIED_SET, one after the other on one shared arena: each (graph, its arguments: name -> (shape, seed))
+CARRIED_CALLS = [
+    ("stage_a", {"x": ((8, 64), 150)}),  # h = 3x (8 rows)
+    ("stage_b", {}),  # reads h: no argument
+    ("stage_update", {"y": ((8, 64), 151)}),  # h += y
+    ("stage_chain", {}),  # 3h + 1 through an intermediate of the plan's own region
+    ("stage_g", {"x": ((24, 64), 152)}),  # g = x + 1: another carried buffer, h untouched
+    ("stage_b", {}),
+    ("stage_zero", {"x": ((24, 64), 153)}),  # h = 0 (24 rows)
+    ("stage_update", {"y": ((24, 64), 154)}),
+    ("stage_b", {}),
+    ("stage_a", {"x": ((24, 64), 155)}),
+    ("stage_chain", {}),
+]
+
+
+def prepare_carried(work, root):
+    """The plans of ``gpu_kernels_plans.CARRIED_SET`` exported as a plan set to ``WORK/plans/carried`` and called one after the other on one shared arena
+    through Python's replay (:data:`CARRIED_CALLS`): each stage hands its carried buffers to the next. ``gpu_plan_gate.rs`` makes the same calls on one
+    ``SharedArena`` (launched, and captured and replayed), against these bytes::
+
+        {"dir", "set_digest", "graphs": [...], "calls": [{"id", "graph", "externals": [{"name", "role", "dtype", "shape", "input"?, "expect"?}]}]}
+    """
+    import gpu_kernels_plans as kp
+
+    directory = root / "carried"
+    planset = runtime.export(list(kp.CARRIED_SET), directory)
+    s = runtime.share_arena(list(kp.CARRIED_SET), mode="replay", plan=directory, pin=planset.digest)
+    calls = []
+    for i, (name, args) in enumerate(CARRIED_CALLS):
+        g = getattr(kp, name)
+        given = {n: randn(shape, F32, seed=seed) for n, (shape, seed) in args.items()}
+        result = s.run(g, **{n: t.clone() for n, t in given.items()})
+        results = list(result) if isinstance(result, tuple) else [result]
+        doc = planset[name].doc
+        case_id = f"carried-{i}-{name}"
+        case_dir = root / "cases" / case_id
+        case_dir.mkdir(parents=True)
+        externals = []
+        for n, t in given.items():
+            path = f"plans/cases/{case_id}/{n}.in.bin"
+            (work / path).write_bytes(raw(t))
+            externals.append({"name": n, "role": "input", "dtype": DTYPES[t.dtype], "shape": list(t.shape), "input": path})
+        for n, t in zip(doc["outputs"], results):
+            path = f"plans/cases/{case_id}/{n}.expect.bin"
+            (work / path).write_bytes(raw(t))
+            externals.append({"name": n, "role": "output", "dtype": DTYPES[t.dtype], "shape": list(t.shape), "expect": path})
+        calls.append({"id": case_id, "graph": name, "externals": externals})
+    return {"dir": "plans/carried", "set_digest": planset.digest, "graphs": [g.name for g in kp.CARRIED_SET], "calls": calls}
 
 
 def compare_plans(work):
@@ -1364,6 +1436,23 @@ def compare_plans(work):
                     failed.append((f"{subdir}/{case['id']}", bad))
                 else:
                     passed += 1
+    carried = doc.get("carried")
+    for subdir in ("rust_carried", "rust_carried_graph") if carried else ():  # the calls handing carried buffers on, launched and replayed
+        for call in carried["calls"]:
+            count += 1
+            bad = []
+            for t in call["externals"]:
+                if "expect" not in t:
+                    continue
+                expect = (work / t["expect"]).read_bytes()
+                got_path = work / subdir / call["id"] / f"{t['name']}.bin"
+                got = got_path.read_bytes() if got_path.exists() else None
+                if got != expect:
+                    bad.append(f"{t['name']} ({'missing' if got is None else sum(a != b for a, b in zip(got, expect))} bytes differ)")
+            if bad:
+                failed.append((f"{subdir}/{call['id']}", bad))
+            else:
+                passed += 1
     return passed, count, failed
 
 
