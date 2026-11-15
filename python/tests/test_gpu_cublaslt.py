@@ -670,7 +670,7 @@ def test_report_how_often_the_pinned_result_is_torchs():
 # -- the "torch" posture, imported configurations and bf16 partial sums ----------------------------------------------------------------------
 
 # (M, N, K): transformer projections at several M, and the shapes where a split-K is chosen (a small M * N and a large K)
-TORCH_SHAPES = [(m, n, k) for m in (1, 32, 64, 320, 1000, 2048) for n, k in TORCH_MN_K + [(1024, 4096), (1024, 7680), (3000, 1024)]]
+TORCH_SHAPES = [(m, n, k) for m in (1, 32, 64, 320, 1000, 2048) for n, k in TORCH_MN_K + [(1024, 4096), (1024, 8192), (3000, 1024)]]
 
 
 def torch_pin(m, n, k, with_bias):
@@ -728,7 +728,7 @@ def test_the_torch_posture_pins_what_torch_runs(with_bias):
 
 def test_an_imported_configuration_is_the_heuristics_algorithm_byte_for_byte():
     """``encode_algo`` of what a pin reads back as is the pin (a pin is the encoded configuration), and runs to the same bytes."""
-    for m, n, k in [(32, 1024, 1024), (320, 3072, 1024), (1, 1024, 7680), (64, 1024, 4096)]:
+    for m, n, k in [(32, 1024, 1024), (320, 3072, 1024), (1, 1024, 8192), (64, 1024, 4096)]:
         for with_bias in (False, True):
             pin = torch_pin(m, n, k, with_bias)
             assert L.encode_algo(L.algo_info(pin.algo_hex)) == pin.algo_hex
@@ -736,11 +736,21 @@ def test_an_imported_configuration_is_the_heuristics_algorithm_byte_for_byte():
             assert same(run_allowing_bf16(a, b, bias, pin), run_allowing_bf16(a, b, bias, L.Pinned(L.encode_algo(L.algo_info(pin.algo_hex)), 0, pin.workspace_limit)))
 
 
+# the problems of the process-stability test: small M, N = 1024 and a long K, where the heuristic chooses a split-K (the case whose stray bytes were
+# measured, on sm_120), and one with a bias, which is pinned without split-K
+STABILITY_SHAPES = [(1, 1024, 8192, False), (2, 1024, 8192, False), (1, 1024, 16384, False), (32, 1024, 4096, True)]
+
+
 def test_the_heuristic_pin_is_the_same_in_another_process():
-    """A pin is the encoded configuration, so it does not carry bytes that change from process to process (measured on an RTX 5090 in what the
-    heuristic itself returns for a split-K of id 21)."""
-    shapes = [(1, 1024, 7680, False), (2, 1024, 7680, False), (32, 1024, 4096, True)]
+    """A pin is the encoded configuration, so it does not carry bytes that change from process to process (two that did were measured on an
+    sm_120 GPU, in what the heuristic itself returns for a split-K of algorithm id 21). On sm_120 one of the problems must still get a split-K
+    (``splitk_num > 1``), so that the test still covers that case there; elsewhere the heuristic may choose none."""
+    shapes = STABILITY_SHAPES
     here = [torch_pin(*s).algo_hex for s in shapes]
+    splits = {s[:3]: L.algo_info(pin)["splitk_num"] for s, pin in zip(shapes, here)}
+    print(f"STABILITY sm_{''.join(map(str, torch.cuda.get_device_capability()))}: split-K count by problem {splits}")
+    if torch.cuda.get_device_capability() == (12, 0):
+        assert any(count > 1 for count in splits.values()), f"no problem gets a split-K on this sm_120 device: {splits}"
     code = textwrap.dedent(
         f"""
         import json, torch
