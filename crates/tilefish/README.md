@@ -182,7 +182,7 @@ builds of the same host on two machines differ:
 - **An embedded manifest** (`tilefish.hosts.rust.emit(..., embed=True)`, whose
   `include_bytes!` paths are relative to the generated file). Up to tilefish 0.0.6
   a cubin's debug sections named the directory it was built in, so each export had
-  other bytes and another `MANIFEST_DIGEST`. tilefish after 0.0.6 names the sources
+  other bytes and another `MANIFEST_DIGEST`. tilefish 0.0.7 names the sources
   by module path, so the same operators exported with the same toolchain for the same
   device are the same files on any machine. Export a manifest of 0.0.6 or earlier
   again to embed it reproducibly.

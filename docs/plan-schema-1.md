@@ -278,7 +278,7 @@ itself is refused (the source and the destination overlap).
 A reader that predates copy steps (the published crate 0.0.2, tilefish 0.0.4) refuses a plan that has one (`kind` must be `kernel` or `library`); a plan without one is
 what it always was.
 
-### 7.6 Memset steps
+### 7.6 Memset steps (tilefish 0.0.7, crate 0.0.5)
 
 A step of kind `"memset"` is `{"kind": "memset", "args": [{"name": "dst", ...}]}`: exactly those two fields (no `entry`: it launches no binary; no `workspace`),
 and exactly one argument, named `dst`, a buffer and optionally a view of it, as any argument. At every bucket `dst` is **dense** (the whole buffer, or a view whose
@@ -666,7 +666,7 @@ values)` / `instantiate_all_in(&arena)`, which refuse a plan the arena was not m
 is an arena of its own (a host with several lanes makes one per lane). `PlanSet::shared_arena_bytes(names)` and `SharedArena::bytes_for(plans)`
 give the size with no GPU.
 
-### 15.2 Carried buffers
+### 15.2 Carried buffers (tilefish 0.0.7, crate 0.0.5)
 
 A stage that hands an intermediate to the next stage need not make it a returned value that the caller allocates: the graphs declare it **carried**,
 and the arena holds it.

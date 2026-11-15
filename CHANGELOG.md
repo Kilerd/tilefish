@@ -4,7 +4,33 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## Unreleased
+## tilefish 0.0.7, crate 0.0.5 (unreleased)
+
+### Breaking changes
+
+- A float to integer cast in a kernel body says its rounding: `x.to(i32)` of a float tensor raises a `TilefishTypeError` at the
+  declaration (it used to trace and then be refused by the lowering, rule `cast.float-to-int`). Write
+  `x.to(i32, rounding="rz")` for a truncation.
+- The build cache recipe is 5: entries stored by 0.0.6 named their build directory, so they are not read, and kernels are built again once.
+- Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`null` parameters, an element-aligned dense pointer); manifests without them load and digest as
+  before. The crate's `ParamKind` gained the variant `Null`.
+- Readers of tilefish 0.0.6 and crate 0.0.4 refuse a plan with a memset step or a carried buffer; every other plan, and its digest, is unchanged.
+- The crate's public enums gained variants (`BufferRole::Carried`, `StepKind::Memset`), and `SharedArena::bytes_for` counts the carried regions.
+- Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`persistent`, `options.num_ctas`, `global_scratch_align`, a kernel step with a `workspace`,
+  clusters and global scratch at launch). Manifests and plans without them are unchanged, digests included. A 0.0.6 manifest whose kernel has a
+  global scratch still loads, and is refused at launch (no alignment recorded): export it again.
+- The crate: `Entry::persistent`, `Persistent`, `LaunchAttributes::global_scratch_align` and `cluster()`, `Plan::prepare_for`, `Plan::cluster()`,
+  `Plan::global_scratch()`, `Prepared::cluster`, `Prepared::scratch_bytes` and `Kernel::sm_count()` are new; `Prepared::grid` is the grid of blocks
+  (programs times the cluster).
+- An export now writes `cuda_math` (manifest schema 3, section 4.7) on the entry of every generated kernel whose ops copy a CUDA math function
+  or that links libdevice. The crate 0.0.4 refuses an entry with a field it does not know, so a Rust host loads a new export with such kernels
+  only with crate 0.0.5; manifests of 0.0.6 and earlier load as before.
+- The Rust host refuses a plan launch on a stream that is capturing a CUDA graph (`PlanRun::capture` makes a plan's graph), a capture no longer
+  holds the arena's lock to its end, and `PlanSet::load` of a set the process verified already, while a clone of its manifest is alive, takes
+  the verified manifest without reading the files again (`Pin::TrustDirectory` included).
+- Python's strict manifest reader refuses the table of dimensions of a kernel entry that the Rust reader refuses (a `divisible_by` below 1,
+  an unknown field, unsorted `buckets`, a `bucket` that is not the entry's), where it used to leave that to the comparison with the spec at
+  replay; the Rust reader checks the `static_size` preconditions in their order, so the one it names is the same in every run.
 
 ### Reproducible exports and builds
 
@@ -23,13 +49,142 @@ each section names the release that added it.
   cache directory, through a temporary file and an atomic rename, and uses a file there only when it holds exactly the source. The
   module runs from the checked text, never from a byte code cache. When the directory is switched off or cannot be written, the
   source goes to a private scratch directory of the process (one `TilefishCacheWarning`); otherwise no scratch directory is made.
-- The build cache recipe is 5: entries stored by 0.0.6 named their build directory, so they are not read, and kernels are built again once.
 - `TILEFISH_DEBUG_PATHS=absolute` keeps the absolute source paths in a cubin's debug sections, for a profiler that opens the files where
   they are. Off by default; it breaks reproducibility (that export's bytes and digests name where it was built; its `sha256_code`s do not
   change), and its binaries are cached under a key of their own. Any other value is refused.
 - **Hosts.** The Rust crate embeds no path of its own. A host that embeds a manifest (`emit(..., embed=True)`) is reproducible once
   the manifest is (export one made by 0.0.6 or earlier again); the paths rustc writes for panic locations are remapped with
   `--remap-path-prefix` (crate README, "Reproducible builds of a host").
+
+### Types, arguments and ops
+
+- **64-bit dimension scalars.** An extern's runtime scalar that carries a dimension may be an `i64`: `n_elem: i64[n]` (`i32[n]` is `n`, as before).
+  Its value is derived from the shapes and range-checked as an `i64` by both hosts, where an `i64` count used to be a per-call `given` value nothing
+  checked. The declaration digest has `"scalar_type": "i64"` on the parameter; the manifest has a `scalar` of type `i64` (schema 3, section 5.7).
+- **Null pointers.** A pointer parameter of an extern's kernel that the declaration does not use is `Null[dtype]`: a call passes nothing for it, and both
+  hosts write the 64-bit zero at its slot (a Triton kernel's and a prebuilt binary's alike; manifest kind `null`, section 5.6), where a one-element dummy
+  tensor was needed before. The Rust crate reads it into `ParamKind::Null`.
+- **Lowered kernels on views that do not start on 16 bytes.** A graph that passes a dense view not provably aligned to 16 bytes (a row of a `[K, R]` int32
+  plane with an odd `R`) to a read-only parameter of a lowered kernel runs the kernel's specialisation for it, `kernel.unaligned("a")`
+  (`<kernel>__ua<indices>`), instead of refusing the call; so does `tilefish.run` of an address that is not 16-byte aligned. Its pointers for those
+  parameters have no divisibility hint and promise their element's alignment (a `pointer_alignment` a dense pointer may now have, section 6); its stems,
+  declaration digest, IR and build cache key are its own, its source the kernel's.
+- Float to integer casts are lowered: `x.to(i32 | i64 | u8, rounding="rn" | "rz" | "rd" | "ru", saturate=True | False)` (from f32, bf16,
+  f16, e4m3 or e5m2). `saturate=True`, the default, clamps to the type's range with a NaN 0; `saturate=False` keeps the low bits of the
+  `i64`. Each is a helper of inline PTX (`cvt.rni.s32.f32`, ...), and the `reference` mode computes the declared mode exactly: the two are
+  byte-identical on every f32 bit pattern. Note 18 of `tilefish.lower` says what torch's casts are in these terms.
+- The row template reads a static slice `x[k]` (`x.select(0, k)`) of a read-only parameter at its offset: `codes[k]` of a `[K, R]` codes
+  plane is a per-row operand, such as the index of `gather_rows`, and `tables[k]` of a `[K, N, D]` parameter is a table. A dynamic
+  dimension of the offset is a runtime `i32` parameter (`size_R`) that a host derives from the shapes. Every other view is still refused
+  (rule `view`). Note 19 of `tilefish.lower`.
+- `x.split(16, axis=1)` of a dimension declared only `divisible_by=16` (or whose buckets are all multiples of 16) returns
+  `tilefish.ops.Chunks`, a sequence whose `chunks[0]` and `chunks[-1]` (and any chunk the dimension's smallest size proves) are views,
+  where it used to raise "not a whole number of chunks"; `len()`, iteration and unpacking raise. A split whose count is a number still
+  returns a tuple. Plans and the graph `reference` mode take these chunks.
+
+### Implementations per architecture (manifest schema 3, section 4.1)
+
+- **Named implementations.** `tilefish.impl(..., name="tcgen05")` is one implementation of every architecture `by_arch=` maps to it (and of the
+  fallback, which may be named too): its key is its name, so those architectures share one declaration digest and one set of compile specs, and
+  their manifest entries say `"implementation": "tcgen05"`. A name is an ASCII identifier of at most 64 characters that is not `fallback` and does
+  not begin with `sm_` and a digit; two different implementations may not share one. Without a name nothing changes: keys are architectures, and
+  digests are those of 0.0.6.
+- **Prebuilt binaries as implementations.** `tilefish.impl(ptx="k.ptx", symbol=..., block=..., shared=...)` and `tilefish.impl(cubin={"sm_120":
+  "k.cubin"}, ...)` (paths relative to the file that declares the op). Their entries are `binary` entries with `implementation`. A cubin
+  implementation must have a cubin for every architecture that runs it: refused at the declaration for the architectures `by_arch=` names, at the
+  build for those that fall back to it (PTX whose `.target` an architecture cannot build is refused likewise).
+- **An ABI per implementation.** `tilefish.impl(..., stub=f)` gives an implementation its own stub, the kernel's parameters in order: a TMA
+  descriptor (`TensorDesc`) where the op's stub has a pointer, other scalars, constexprs or fixed arguments. Every implementation must share the op's
+  public signature: its tensors (names, order, access, dtype, shape, `Strided` or not, `MayAlias`), the constraints of their dimensions, its fixed
+  arguments per call and its buckets. `jit` and `replay` launch the implementation of the device with its own ABI; the planner binds every step
+  with every implementation, preconditions included, so a plan never relies on an architecture; the Rust emitter types `launch` from the shared
+  tensors and documents each architecture's ABI.
+- The build refuses a spec of one implementation for an architecture the declaration does not run it on, which now includes the fallback on an
+  architecture that has an implementation of its own (that build's entry was always refused by `replay`).
+- A call that restates a const of an op declared with `by_arch=` is held to the value of the op's stub, as a graph's call is, and to the launched
+  implementation's where it has a constexpr or fixed argument of that name.
+- Both manifest readers accept, as an entry's `implementation`, its architecture, `"fallback"` or a name of that form, on a `triton` or a `binary`
+  entry. Readers of 0.0.6 and crate 0.0.4 refuse a name and an `implementation` on a `binary` entry; manifests without them, and their digests, are
+  unchanged.
+
+### Launch shapes (manifest schema 3, sections 4.3 to 4.6; plan schema 1, sections 6 and 7)
+
+- A grid may multiply dimensions: `grid=lambda T, C: (tilefish.cdiv(T * C, 1024),)` (written `(cdiv(C*T, 1024),)`), one binary for every `T` and
+  `C`, in both hosts, plans and captures. The readers always took such a grid; a shape stays affine.
+- Persistent grids: `@tilefish.extern(..., persistent=tilefish.persistent(programs_per_sm=1))`. The grid is the tiles, and the host launches at most
+  `programs_per_sm * SMs // CTAs per program` programs, the SMs resolved when the binary is loaded (the device's, or a partition's:
+  `Manifest::with_sm_partition` in Rust, `tilefish.runtime.sm_partition(n)` in Python). The kernel's bytes must not depend on the number of programs,
+  unless it declares the SM count it is for (`sm_count=30`), which a host on another count refuses. New optional entry field `persistent`.
+- A configuration per bucket: `@tilefish.extern(..., by_bucket=lambda TB: tilefish.config(num_warps=..., num_stages=..., num_ctas=..., BLOCK=...))`,
+  each bucket's binary built with its own warps, stages, CTAs and constexpr values and launched with the grid under them; the declaration digest covers
+  every bucket's configuration. Nothing new in the manifest.
+- Thread-block clusters: `num_ctas=2` (Triton's compile option, 1 to 8) and, for a prebuilt binary, `cluster=(x, y, z)`. Both hosts launch them with
+  `cuLaunchKernelEx` and the cluster attribute (the grid counts clusters), in single launches, plans and CUDA graphs; a Triton entry records
+  `options.num_ctas`.
+- A global scratch: `global_scratch=N` (bytes per CTA, checked against Triton's metadata) for kernels with device-side TMA descriptors
+  (`tl.make_tensor_descriptor`). Python allocates it per launch; the Rust crate takes it as the last tensor of a launch (`GLOBAL_SCRATCH`,
+  `Prepared::scratch_bytes`); a plan's kernel step names the workspace as its scratch. New optional `launch.global_scratch_align`.
+
+### Plans and arenas
+
+- **Carried buffers.** `@tilefish.graph(carried=("h",))` names parameters (`In` or `InOut`) whose tensor the plan's arena holds instead of the
+  caller: buffer role `carried` (offset `null`), placed by the host after the plans' own regions, one region per carried name in code point order
+  (`_plan.carried_layout`, Rust `CarriedLayout`), so one stage of a shared arena hands an intermediate to the next with no allocation of the
+  caller's. A run gives every parameter but the carried ones; a plan that reads a carried buffer before it writes it binds its dimensions from the
+  shape the buffer was written with, and is refused before anything is enqueued when no execution on the arena wrote it, or wrote another shape
+  (both hosts, launches and host-owned replays). `h[...] = op(x)` is written by the launch of `op` (no copy). `docs/plan-schema-1.md`, section 15.2.
+- **Memset steps.** `tilefish.zeros_like(x, dtype=None)` in a graph body is a step of kind `memset` (`cuMemsetD8Async` of a dense buffer, a memset
+  node under capture), in both hosts; `state[...] = tilefish.zeros_like(state)` is one memset of the caller's tensor. Additive: no schema bump, and
+  a plan without one is unchanged (section 7.6).
+- **Several arenas of the same plans.** `tilefish.runtime.share_arena(graphs, name="lane1")`: arenas are kept per plan layout, device and name, so
+  a lane that runs concurrently (one per stream) takes an arena of its own; documented for both hosts (the Rust host already made one per
+  instantiation and per `SharedArena`) in section 9.
+- **A view that is not dense stored into an `InOut` parameter** of a graph (`state[...] = t.permute(1, 0)`) is accepted and planned as a launch of
+  `tilefish.contiguous` into the caller's tensor, as a returned view already was. A kernel body still refuses it.
+- **Graphs of the caller's.** The second thread that uses an arena a `torch.cuda.graph` capture of `tilefish.run` holds gets one
+  `tilefish.TilefishOrderWarning` (such a graph's `replay()` takes no lock), and `tilefish.runtime.replay_graph(g)` replays one under the arena's
+  lock, ordered with every thread (0 of 3 000 runs wrong against it). Section 10, item 7, says why it cannot be made safe behind the caller's back.
+- A `shared` that is nonzero but too small stays undetectable without a pin: measured, a Triton cubin does not record the dynamic shared memory it
+  addresses (`test_gpu_shared_size.py`; `docs/manifest-schema-3.md`, section 4).
+- A shared arena of runners of which some have run and some not is no longer refused for "another backend".
+
+### Numerics in the DSL (notes 15 to 17 of `tilefish.lower`)
+
+- `tilefish.erf(x)`: libdevice's `erff` by default (what `gelu` uses), CUDA's `erff` without flush to zero with `math="ieee"` (the bits of
+  CUDA 12.8 to 13.1; CUDA 13.2 changed the function).
+- `tilefish.sin_approx(x)` (`sin.approx.f32`, CUDA's `__sinf`), `tilefish.rcp(x)` (`rcp.rn.f32`, `__frcp_rn`), `tilefish.fma(a, b, c)` (`fma.rn.f32`,
+  one rounding whatever `fp_fusion` says) and `-x` / `tilefish.neg(x)` (CUDA's negation: `neg.f32`, `neg.bf16`, `neg.f16`, or `0 - x` of an
+  integer). `-x` was refused before.
+- Ordered sums: `tilefish.sum(x, axis=-1, order="sequential" | tilefish.tree(lanes, offsets, vector), fma=False)` (row template, f32): lanes of
+  chains from `+0.0` and a fixed tree over the lanes, every add `add.rn`; `fma=True` fuses the multiply of `a * b` into each step. Byte for byte
+  the CUDA kernels of those orders, and the same bytes at every `num_warps`.
+- `num_warps` stays part of every kernel's identity; the contract now says which ops depend on it (Triton's own reductions) and which do not
+  (per-element ops, `argmax` / `argmin`, ordered sums), measured.
+
+### The CUDA math guard (manifest schema 3, section 4.7; `docs/numerics.md`)
+
+- The manifest entry of a generated kernel whose ops copy a CUDA math library function (`expf`, `rsqrtf`, `erff` in IEEE math; `sinf`, `cosf`,
+  `tanhf` from libdevice) or that links libdevice has `cuda_math`: the functions, the CUDA releases tilefish measured each on over every f32
+  (12.8 to 13.2, `erff` 12.8 to 13.1), and the sha256 of the libdevice. Optional and additive: an entry without it reads as before, and no
+  generated source or source digest changes.
+- `jit`, `replay` and `reference` warn with `tilefish.TilefishCudaMathWarning` where torch is built with a release the functions were not measured on,
+  or where a replay's process would link another libdevice. Rust: `Entry::cuda_math` (`CudaMath`) and `Manifest::check_cuda_math(release)`.
+- `pytest -m cuda_math` runs the exhaustive comparisons with CUDA's math library again; `TILEFISH_NVRTC_PATHS` adds the NVRTC of more releases
+  to the table's check. `docs/numerics.md` is the procedure on a CUDA or torch change, the `num_warps` decision, and a design for device-global
+  state (counters), which waits for a memset step in plans.
+
+### Pinned GEMMs
+
+- `test_gpu_gemm.py` asserts that `heuristic="torch"` (with torch's default reduction) gives `torch.mm` / `torch.addmm` byte for byte on the 30
+  shapes whose default-posture rate it reports, with cuBLASLt 12.8.4 and 13.1.0. Why the default posture matches `addmm` on only 13 of the 15
+  biased shapes under cuBLASLt 13.1 is documented: it gives a GEMM with a bias no split-K, a rule of tilefish's, where `addmm` runs the split-K of
+  3 with f32 partial sums that the heuristic ranks first for 32 and 64 x 1024 x 3072. No pin changes. The rule stays: it is what lets the
+  default posture promise one rounding for every pin without measuring each split-K algorithm (`docs/numerics.md`, section 4).
+
+### The reference mode
+
+- The tolerance matrix of `test_gpu_reference.py` covers f32, bf16 and f16 inputs and outputs of the layernorm, gelu, swiglu and softmax goldens
+  on five more distributions (uniform, heavy-tailed, sparse outliers, values of every magnitude, rows of one value), measured and asserted.
 
 ### Hosts
 
@@ -57,9 +212,6 @@ each section names the release that added it.
 - The crate no longer turns on serde_json's `preserve_order` for the whole host process, and reads the same with or without it: the
   order of an entry's `buckets` and `dims` and of a plan's `dims` comes from the file; `tilefish::json::parse_strict` returns every
   object in code point order.
-- Python's strict manifest reader refuses the table of dimensions of a kernel entry that the Rust reader refuses (a `divisible_by` below 1,
-  an unknown field, unsorted `buckets`, a `bucket` that is not the entry's), where it used to leave that to the comparison with the spec at
-  replay; the Rust reader checks the `static_size` preconditions in their order, so the one it names is the same in every run.
 
 ### Tooling and tests
 
@@ -78,155 +230,6 @@ each section names the release that added it.
   no build. The published crate is unchanged (`tests/` is not packaged).
 - The cuBLASLt process-stability tests use neutral shapes (N = 1024 with K = 8192 and 16384) instead of `(N, K) = (1024, 7680)`;
   on an sm_120 device the test asserts that one of its problems still gets a split-K configuration.
-
-### Numerics in the DSL (notes 15 to 17 of `tilefish.lower`)
-
-- `tilefish.erf(x)`: libdevice's `erff` by default (what `gelu` uses), CUDA's `erff` without flush to zero with `math="ieee"` (the bits of
-  CUDA 12.8 to 13.1; CUDA 13.2 changed the function).
-- `tilefish.sin_approx(x)` (`sin.approx.f32`, CUDA's `__sinf`), `tilefish.rcp(x)` (`rcp.rn.f32`, `__frcp_rn`), `tilefish.fma(a, b, c)` (`fma.rn.f32`,
-  one rounding whatever `fp_fusion` says) and `-x` / `tilefish.neg(x)` (CUDA's negation: `neg.f32`, `neg.bf16`, `neg.f16`, or `0 - x` of an
-  integer). `-x` was refused before.
-- Ordered sums: `tilefish.sum(x, axis=-1, order="sequential" | tilefish.tree(lanes, offsets, vector), fma=False)` (row template, f32): lanes of
-  chains from `+0.0` and a fixed tree over the lanes, every add `add.rn`; `fma=True` fuses the multiply of `a * b` into each step. Byte for byte
-  the CUDA kernels of those orders, and the same bytes at every `num_warps`.
-- `num_warps` stays part of every kernel's identity; the contract now says which ops depend on it (Triton's own reductions) and which do not
-  (per-element ops, `argmax` / `argmin`, ordered sums), measured.
-
-### The CUDA math guard (manifest schema 3, section 4.7; `docs/numerics.md`)
-
-- The manifest entry of a generated kernel whose ops copy a CUDA math library function (`expf`, `rsqrtf`, `erff` in IEEE math; `sinf`, `cosf`,
-  `tanhf` from libdevice) or that links libdevice has `cuda_math`: the functions, the CUDA releases tilefish measured each on over every f32
-  (12.8 to 13.2, `erff` 12.8 to 13.1), and the sha256 of the libdevice. Optional and additive: an entry without it reads as before, and no
-  generated source or source digest changes.
-- `jit`, `replay` and `reference` warn with `tilefish.TilefishCudaMathWarning` where torch is built with a release the functions were not measured on,
-  or where a replay's process would link another libdevice. Rust: `Entry::cuda_math` (`CudaMath`) and `Manifest::check_cuda_math(release)`.
-- `pytest -m cuda_math` runs the exhaustive comparisons with CUDA's math library again; `TILEFISH_NVRTC_PATHS` adds the NVRTC of more releases
-  to the table's check. `docs/numerics.md` is the procedure on a CUDA or torch change, the `num_warps` decision, and a design for device-global
-  state (counters), which waits for a memset step in plans.
-
-### The reference mode
-
-- The tolerance matrix of `test_gpu_reference.py` covers f32, bf16 and f16 inputs and outputs of the layernorm, gelu, swiglu and softmax goldens
-  on five more distributions (uniform, heavy-tailed, sparse outliers, values of every magnitude, rows of one value), measured and asserted.
-
-### Pinned GEMMs
-
-- `test_gpu_gemm.py` asserts that `heuristic="torch"` (with torch's default reduction) gives `torch.mm` / `torch.addmm` byte for byte on the 30
-  shapes whose default-posture rate it reports, with cuBLASLt 12.8.4 and 13.1.0. Why the default posture matches `addmm` on only 13 of the 15
-  biased shapes under cuBLASLt 13.1 is documented: it gives a GEMM with a bias no split-K, a rule of tilefish's, where `addmm` runs the split-K of
-  3 with f32 partial sums that the heuristic ranks first for 32 and 64 x 1024 x 3072. No pin changes. The rule stays: it is what lets the
-  default posture promise one rounding for every pin without measuring each split-K algorithm (`docs/numerics.md`, section 4).
-
-### Breaking changes
-
-- A float to integer cast in a kernel body says its rounding: `x.to(i32)` of a float tensor raises a `TilefishTypeError` at the
-  declaration (it used to trace and then be refused by the lowering, rule `cast.float-to-int`). Write
-  `x.to(i32, rounding="rz")` for a truncation.
-
-### Types, arguments and ops (lane types)
-
-- **64-bit dimension scalars.** An extern's runtime scalar that carries a dimension may be an `i64`: `n_elem: i64[n]` (`i32[n]` is `n`, as before).
-  Its value is derived from the shapes and range-checked as an `i64` by both hosts, where an `i64` count used to be a per-call `given` value nothing
-  checked. The declaration digest has `"scalar_type": "i64"` on the parameter; the manifest has a `scalar` of type `i64` (schema 3, section 5.7).
-- **Null pointers.** A pointer parameter of an extern's kernel that the declaration does not use is `Null[dtype]`: a call passes nothing for it, and both
-  hosts write the 64-bit zero at its slot (a Triton kernel's and a prebuilt binary's alike; manifest kind `null`, section 5.6), where a one-element dummy
-  tensor was needed before. The Rust crate reads it into `ParamKind::Null`.
-- **Lowered kernels on views that do not start on 16 bytes.** A graph that passes a dense view not provably aligned to 16 bytes (a row of a `[K, R]` int32
-  plane with an odd `R`) to a read-only parameter of a lowered kernel runs the kernel's specialisation for it, `kernel.unaligned("a")`
-  (`<kernel>__ua<indices>`), instead of refusing the call; so does `tilefish.run` of an address that is not 16-byte aligned. Its pointers for those
-  parameters have no divisibility hint and promise their element's alignment (a `pointer_alignment` a dense pointer may now have, section 6); its stems,
-  declaration digest, IR and build cache key are its own, its source the kernel's.
-- Float to integer casts are lowered: `x.to(i32 | i64 | u8, rounding="rn" | "rz" | "rd" | "ru", saturate=True | False)` (from f32, bf16,
-  f16, e4m3 or e5m2). `saturate=True`, the default, clamps to the type's range with a NaN 0; `saturate=False` keeps the low bits of the
-  `i64`. Each is a helper of inline PTX (`cvt.rni.s32.f32`, ...), and the `reference` mode computes the declared mode exactly: the two are
-  byte-identical on every f32 bit pattern. Note 18 of `tilefish.lower` says what torch's casts are in these terms.
-- The row template reads a static slice `x[k]` (`x.select(0, k)`) of a read-only parameter at its offset: `codes[k]` of a `[K, R]` codes
-  plane is a per-row operand, such as the index of `gather_rows`, and `tables[k]` of a `[K, N, D]` parameter is a table. A dynamic
-  dimension of the offset is a runtime `i32` parameter (`size_R`) that a host derives from the shapes. Every other view is still refused
-  (rule `view`). Note 19 of `tilefish.lower`.
-- `x.split(16, axis=1)` of a dimension declared only `divisible_by=16` (or whose buckets are all multiples of 16) returns
-  `tilefish.ops.Chunks`, a sequence whose `chunks[0]` and `chunks[-1]` (and any chunk the dimension's smallest size proves) are views,
-  where it used to raise "not a whole number of chunks"; `len()`, iteration and unpacking raise. A split whose count is a number still
-  returns a tuple. Plans and the graph `reference` mode take these chunks.
-- Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`null` parameters, an element-aligned dense pointer); manifests without them load and digest as
-  before. The crate's `ParamKind` gained the variant `Null`.
-
-### Implementations per architecture (manifest schema 3, section 4.1)
-
-- **Named implementations.** `tilefish.impl(..., name="tcgen05")` is one implementation of every architecture `by_arch=` maps to it (and of the
-  fallback, which may be named too): its key is its name, so those architectures share one declaration digest and one set of compile specs, and
-  their manifest entries say `"implementation": "tcgen05"`. A name is an ASCII identifier of at most 64 characters that is not `fallback` and does
-  not begin with `sm_` and a digit; two different implementations may not share one. Without a name nothing changes: keys are architectures, and
-  digests are those of 0.0.6.
-- **Prebuilt binaries as implementations.** `tilefish.impl(ptx="k.ptx", symbol=..., block=..., shared=...)` and `tilefish.impl(cubin={"sm_120":
-  "k.cubin"}, ...)` (paths relative to the file that declares the op). Their entries are `binary` entries with `implementation`. A cubin
-  implementation must have a cubin for every architecture that runs it: refused at the declaration for the architectures `by_arch=` names, at the
-  build for those that fall back to it (PTX whose `.target` an architecture cannot build is refused likewise).
-- **An ABI per implementation.** `tilefish.impl(..., stub=f)` gives an implementation its own stub, the kernel's parameters in order: a TMA
-  descriptor (`TensorDesc`) where the op's stub has a pointer, other scalars, constexprs or fixed arguments. Every implementation must share the op's
-  public signature: its tensors (names, order, access, dtype, shape, `Strided` or not, `MayAlias`), the constraints of their dimensions, its fixed
-  arguments per call and its buckets. `jit` and `replay` launch the implementation of the device with its own ABI; the planner binds every step
-  with every implementation, preconditions included, so a plan never relies on an architecture; the Rust emitter types `launch` from the shared
-  tensors and documents each architecture's ABI.
-- The build refuses a spec of one implementation for an architecture the declaration does not run it on, which now includes the fallback on an
-  architecture that has an implementation of its own (that build's entry was always refused by `replay`).
-- A call that restates a const of an op declared with `by_arch=` is held to the value of the op's stub, as a graph's call is, and to the launched
-  implementation's where it has a constexpr or fixed argument of that name.
-- Both manifest readers accept, as an entry's `implementation`, its architecture, `"fallback"` or a name of that form, on a `triton` or a `binary`
-  entry. Readers of 0.0.6 and crate 0.0.4 refuse a name and an `implementation` on a `binary` entry; manifests without them, and their digests, are
-  unchanged.
-
-### Plans and arenas
-
-- **Carried buffers.** `@tilefish.graph(carried=("h",))` names parameters (`In` or `InOut`) whose tensor the plan's arena holds instead of the
-  caller: buffer role `carried` (offset `null`), placed by the host after the plans' own regions, one region per carried name in code point order
-  (`_plan.carried_layout`, Rust `CarriedLayout`), so one stage of a shared arena hands an intermediate to the next with no allocation of the
-  caller's. A run gives every parameter but the carried ones; a plan that reads a carried buffer before it writes it binds its dimensions from the
-  shape the buffer was written with, and is refused before anything is enqueued when no execution on the arena wrote it, or wrote another shape
-  (both hosts, launches and host-owned replays). `h[...] = op(x)` is written by the launch of `op` (no copy). `docs/plan-schema-1.md`, section 15.2.
-- **Memset steps.** `tilefish.zeros_like(x, dtype=None)` in a graph body is a step of kind `memset` (`cuMemsetD8Async` of a dense buffer, a memset
-  node under capture), in both hosts; `state[...] = tilefish.zeros_like(state)` is one memset of the caller's tensor. Additive: no schema bump, and
-  a plan without one is unchanged (section 7.6).
-- **Several arenas of the same plans.** `tilefish.runtime.share_arena(graphs, name="lane1")`: arenas are kept per plan layout, device and name, so
-  a lane that runs concurrently (one per stream) takes an arena of its own; documented for both hosts (the Rust host already made one per
-  instantiation and per `SharedArena`) in section 9.
-- **A view that is not dense stored into an `InOut` parameter** of a graph (`state[...] = t.permute(1, 0)`) is accepted and planned as a launch of
-  `tilefish.contiguous` into the caller's tensor, as a returned view already was. A kernel body still refuses it.
-- **Graphs of the caller's.** The second thread that uses an arena a `torch.cuda.graph` capture of `tilefish.run` holds gets one
-  `tilefish.TilefishOrderWarning` (such a graph's `replay()` takes no lock), and `tilefish.runtime.replay_graph(g)` replays one under the arena's
-  lock, ordered with every thread (0 of 3 000 runs wrong against it). Section 10, item 7, says why it cannot be made safe behind the caller's back.
-- A `shared` that is nonzero but too small stays undetectable without a pin: measured, a Triton cubin does not record the dynamic shared memory it
-  addresses (`test_gpu_shared_size.py`; `docs/manifest-schema-3.md`, section 4).
-- A shared arena of runners of which some have run and some not is no longer refused for "another backend".
-
-### Compatibility
-
-- Readers of tilefish 0.0.6 and crate 0.0.4 refuse a plan with a memset step or a carried buffer; every other plan, and its digest, is unchanged.
-- The crate's public enums gained variants (`BufferRole::Carried`, `StepKind::Memset`), and `SharedArena::bytes_for` counts the carried regions.
-
-### Launch shapes (manifest schema 3, sections 4.3 to 4.6; plan schema 1, sections 6 and 7)
-
-- A grid may multiply dimensions: `grid=lambda T, C: (tilefish.cdiv(T * C, 1024),)` (written `(cdiv(C*T, 1024),)`), one binary for every `T` and
-  `C`, in both hosts, plans and captures. The readers always took such a grid; a shape stays affine.
-- Persistent grids: `@tilefish.extern(..., persistent=tilefish.persistent(programs_per_sm=1))`. The grid is the tiles, and the host launches at most
-  `programs_per_sm * SMs // CTAs per program` programs, the SMs resolved when the binary is loaded (the device's, or a partition's:
-  `Manifest::with_sm_partition` in Rust, `tilefish.runtime.sm_partition(n)` in Python). The kernel's bytes must not depend on the number of programs,
-  unless it declares the SM count it is for (`sm_count=30`), which a host on another count refuses. New optional entry field `persistent`.
-- A configuration per bucket: `@tilefish.extern(..., by_bucket=lambda TB: tilefish.config(num_warps=..., num_stages=..., num_ctas=..., BLOCK=...))`,
-  each bucket's binary built with its own warps, stages, CTAs and constexpr values and launched with the grid under them; the declaration digest covers
-  every bucket's configuration. Nothing new in the manifest.
-- Thread-block clusters: `num_ctas=2` (Triton's compile option, 1 to 8) and, for a prebuilt binary, `cluster=(x, y, z)`. Both hosts launch them with
-  `cuLaunchKernelEx` and the cluster attribute (the grid counts clusters), in single launches, plans and CUDA graphs; a Triton entry records
-  `options.num_ctas`.
-- A global scratch: `global_scratch=N` (bytes per CTA, checked against Triton's metadata) for kernels with device-side TMA descriptors
-  (`tl.make_tensor_descriptor`). Python allocates it per launch; the Rust crate takes it as the last tensor of a launch (`GLOBAL_SCRATCH`,
-  `Prepared::scratch_bytes`); a plan's kernel step names the workspace as its scratch. New optional `launch.global_scratch_align`.
-- Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`persistent`, `options.num_ctas`, `global_scratch_align`, a kernel step with a `workspace`,
-  clusters and global scratch at launch). Manifests and plans without them are unchanged, digests included. A 0.0.6 manifest whose kernel has a
-  global scratch still loads, and is refused at launch (no alignment recorded): export it again.
-- The crate: `Entry::persistent`, `Persistent`, `LaunchAttributes::global_scratch_align` and `cluster()`, `Plan::prepare_for`, `Plan::cluster()`,
-  `Plan::global_scratch()`, `Prepared::cluster`, `Prepared::scratch_bytes` and `Kernel::sm_count()` are new; `Prepared::grid` is the grid of blocks
-  (programs times the cluster).
 
 ## tilefish 0.0.6, crate 0.0.4
 

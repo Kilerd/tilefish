@@ -34,13 +34,13 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | library entry (0.0.6, crate 0.0.4) | — | f16 and f32 operands, an f32 result and the layouts `NN`, `TT` and `NT` in the fields an entry always had (`dtypes`, `transa`, `transb`, `lda`, `ldb`, the operands); the optional `allow_f16_reduction` and `allow_f32_reduction` (section 9.2) and `sm_count_target` (section 9.3) |
 | kernel entry (0.0.5, crate 0.0.3) | — | an optional `implementation`: which implementation of an operator declared with an implementation per architecture the binary is (section 4.1) |
 | ABI argument kinds (0.0.6, crate 0.0.4) | — | adds `tensordesc`: a TMA descriptor of a tensor (a `CUtensorMap` the host encodes at every launch, passed by value), which takes `1 + 2 * rank` slots of `kernelParams`, so `slot` is where a parameter's slots begin (section 5.5) |
-| kernel entry (unreleased) | — | `implementation` may be the name of a named implementation, which several architectures share, and may be on a `binary` entry (a prebuilt binary as an implementation); the entries of one stem of such an operator may have an ABI per architecture (section 4.1) |
+| kernel entry (0.0.7, crate 0.0.5) | — | `implementation` may be the name of a named implementation, which several architectures share, and may be on a `binary` entry (a prebuilt binary as an implementation); the entries of one stem of such an operator may have an ABI per architecture (section 4.1) |
 | kernel entry (0.0.6, crate 0.0.4) | — | an optional `total_num_warps`: the warps of a block of a warp-specialised kernel, whose partitions add warps to the `num_warps` of its default partition; its `block` is `32 * total_num_warps` (section 4.2) |
 | library entry (0.0.6, crate 0.0.4) | — | `impl: "cudnn.conv_fwd"`: a pinned cuDNN forward convolution, an entry of fields of its own (the problem, the math, the pin of the legacy or the backend API and how it was chosen, the cuDNN version, the device) (section 9.4) |
-| kernel entry (unreleased) | — | an optional `cuda_math` on a generated kernel: the CUDA math functions whose bits its ops are, the CUDA releases they were measured on, and the sha256 of the libdevice it links (section 4.7) |
-| ABI argument kinds (unreleased) | — | adds `null`: a pointer every launch passes as the null pointer (Python's `Null[dtype]`), of a Triton kernel or a prebuilt binary (section 5.6) |
-| ABI scalar (unreleased) | — | a dimension scalar (a `scalar` with a `dim` and no `stride_of`) may be `i64` (Python's `i64[n]`) where only a stride could be before (section 5.7) |
-| preconditions (unreleased) | — | a dense pointer that is not a device scalar may promise only its element's alignment: the specialisation of a lowered kernel for views that do not start on 16 bytes (section 6) |
+| kernel entry (0.0.7, crate 0.0.5) | — | an optional `cuda_math` on a generated kernel: the CUDA math functions whose bits its ops are, the CUDA releases they were measured on, and the sha256 of the libdevice it links (section 4.7) |
+| ABI argument kinds (0.0.7, crate 0.0.5) | — | adds `null`: a pointer every launch passes as the null pointer (Python's `Null[dtype]`), of a Triton kernel or a prebuilt binary (section 5.6) |
+| ABI scalar (0.0.7, crate 0.0.5) | — | a dimension scalar (a `scalar` with a `dim` and no `stride_of`) may be `i64` (Python's `i64[n]`) where only a stride could be before (section 5.7) |
+| preconditions (0.0.7, crate 0.0.5) | — | a dense pointer that is not a device scalar may promise only its element's alignment: the specialisation of a lowered kernel for views that do not start on 16 bytes (section 6) |
 | `grid` (0.0.7, crate 0.0.5) | affine in the dimensions (what Python wrote) | may multiply dimensions (`(cdiv(C*T, 1024),)`): the grammar always had `*`, and both readers always took it; a host computes a grid, it never solves one (section 7.1) |
 | kernel entry (0.0.7, crate 0.0.5) | — | an optional `persistent`: a persistent grid, the tiles cut at launch to the programs the SMs of the device (or of its partition) run (section 4.3) |
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.cluster_dims` and `launch.num_ctas` of a thread-block cluster (a Triton kernel's `num_ctas`, a prebuilt binary's declared cluster) are launched with `cuLaunchKernelEx`, and `options.num_ctas` says it (section 4.5) |
@@ -87,7 +87,7 @@ sha256( b"tilefish.manifest-digest.v3\0" + canonical_json({"schema": 3, "kernels
   digested (the same file `python_manifests.in` lists them in `MANIFEST_ERRORS`; the Rust `manifest_digest` returns an error for each). A schema 3 digest is
   never equal to a schema 2 one.
 
-### 3.1 What a pin vouches for, and reproducible exports (after 0.0.6)
+### 3.1 What a pin vouches for, and reproducible exports (tilefish 0.0.7)
 
 A pin is the digest of one exported artifact: the entries above, and through each entry's `sha256` every cubin file byte for byte (debug sections
 included). This is unchanged, and so are the schema, the digest function, both readers and every manifest written before.
@@ -175,7 +175,7 @@ Validation rules that are new (Python: `Manifest._read`):
   trusted for both. The test fails when a later Triton or ptxas records the size, and a check at load becomes possible then.
 * `toolchain` for `binary` is `{}` (a cubin used as it is) or `{"ptxas": <the `--version` text>}` (PTX that was assembled).
 
-### 4.1 An implementation per architecture: `implementation` (tilefish 0.0.5, crate 0.0.3; names, prebuilt binaries and an ABI per implementation: unreleased)
+### 4.1 An implementation per architecture: `implementation` (tilefish 0.0.5, crate 0.0.3; names, prebuilt binaries and an ABI per implementation: tilefish 0.0.7, crate 0.0.5)
 
 An operator declared with an implementation per architecture (`@tilefish.extern(by_arch={"sm_103": tilefish.impl(...), "sm_120": ...},
 fallback=...)`: one public signature, and for each architecture a Triton or Gluon kernel with its own compile options, constexpr values and grid, or a
@@ -404,7 +404,7 @@ pool); the Rust host takes it from the caller, **the last tensor of a launch** (
 can be captured; a launch plan gives every kernel step with a global scratch the plan's workspace (plan schema 1, sections 6 and 7). Both hosts refuse at
 load a manifest of tilefish 0.0.6 that has a global scratch (it did not record the alignment: export it again). Profile scratch stays refused.
 
-### 4.7 The CUDA math functions of a generated kernel: `cuda_math` (unreleased)
+### 4.7 The CUDA math functions of a generated kernel: `cuda_math` (tilefish 0.0.7, crate 0.0.5)
 
 Some ops of a kernel tilefish generates are, by the numerics contract, the bits of a function of CUDA's math library: in IEEE math `exp` and `silu`
 are built on `expf`, `rsqrt` is `rsqrtf` and `erf` is `erff` (inline PTX read from NVRTC), and in either math `sin`, `cos` and `tanh` are libdevice's
@@ -622,7 +622,7 @@ by every program, on the device, before its first load).
 A reader that predates the kind (tilefish 0.0.5, crate 0.0.3) refuses a manifest that has one (`kind must be pointer, scalar, fixed or given`). A manifest
 without one, and its digest, are unchanged.
 
-### 5.6 A null pointer: `null` (unreleased)
+### 5.6 A null pointer: `null` (tilefish 0.0.7, crate 0.0.5)
 
 A kernel may take a pointer that the use being declared never dereferences: a prebuilt kernel `k(const half* x, const half* bias, half* y, int n)` that reads
 `bias` only when it is not null, or a Triton kernel that reads it only under a constexpr flag the declaration sets to false. Python declares that parameter
@@ -644,7 +644,7 @@ A kernel may take a pointer that the use being declared never dereferences: a pr
 A reader that predates the kind (tilefish 0.0.6, crate 0.0.4) refuses a manifest that has one (`kind must be pointer, tensordesc, scalar, fixed or given`).
 A manifest without one, and its digest, are unchanged.
 
-### 5.7 64-bit dimension scalars (unreleased)
+### 5.7 64-bit dimension scalars (tilefish 0.0.7, crate 0.0.5)
 
 A `scalar` that carries a dimension or an expression of dimensions (a `dim` and no `stride_of`) may be `i64` (`u64`, 8 bytes): Python declares it
 `n_elem: i64[n]` (an extern; `n_elem: n` is the `i32` it always was). It is a scalar like any other: its value is the expression evaluated at the dimensions
@@ -659,7 +659,7 @@ schema 3 began (for a stride), so no reader changes: a manifest of tilefish 0.0.
 The list is as in schema 2, with these differences.
 
 * `pointer_alignment`: `bytes` is the alignment the pointer *passed* must have (`address % bytes == 0`). For an ordinary pointer it is 16, as before,
-  or (unreleased) the size in bytes of its element, for a dense pointer that is not a device scalar: the **specialisation of a lowered
+  or (tilefish 0.0.7, crate 0.0.5) the size in bytes of its element, for a dense pointer that is not a device scalar: the **specialisation of a lowered
   kernel for views that do not start on 16 bytes** (below). For a pointer that has `strides`: **either 16, or the size in bytes of its element** (`max(1, bits // 8)` of its dtype). 16 means the operator was
   declared as 16-byte aligned (`Strided[..., 16]`), the offset dimension is `divisible_by` the elements in 16 bytes, and, for a Triton kernel, the
   pointer has `tt.divisibility=16` (see below); the element size means no alignment is assumed beyond the element's own, and Triton was given no hint.
@@ -677,7 +677,7 @@ The list is as in schema 2, with these differences.
 For a `triton` entry the **attributes Triton was given** are not in the manifest (they are in the compile spec), but they follow: `tt.divisibility=16`
 on a pointer exactly when its `pointer_alignment` is 16 bytes, and on a scalar exactly when it has a `divisible` precondition.
 
-**The specialisation of a lowered kernel for views that do not start on 16 bytes** (unreleased). A lowered kernel compiles every pointer
+**The specialisation of a lowered kernel for views that do not start on 16 bytes** (tilefish 0.0.7, crate 0.0.5). A lowered kernel compiles every pointer
 as 16-byte aligned. `kernel.unaligned("a")` (Python) is the same kernel with the read-only parameter `a` compiled aligned to its element only: no
 `tt.divisibility` for it, and a `pointer_alignment` of its element size. It is an operator of its own, `<kernel>__ua<indices>` (the indices of those
 parameters in the declaration: `add_rows__ua0`), so its entries have their own stems, its declaration digest has `"align": <bytes>` on those parameters,
