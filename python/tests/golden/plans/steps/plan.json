@@ -1,6 +1,6 @@
 {
   "schema": "tilefish.plan.v1",
-  "tilefish": "0.0.6",
+  "tilefish": "0.0.7",
   "graph": "steps",
   "arch": "sm_103",
   "manifest_digest": "de3f0c145ab58933824fd65db5fbda8d5b4213c75cbf7c79956fd0178d0aae24",
