@@ -101,6 +101,7 @@ pub unsafe extern "C" fn tilefish_context_primary(device: i32, out: *mut *mut ti
         // SAFETY: the caller's contract.
         let out = unsafe { out_arg(out) }?;
         require_driver()?;
+        result::init().map_err(driver("cuInit"))?; // before anything else asks the driver (cuCtxGetCurrent too)
         let _keep = KeepCurrent::new()?;
         let count = result::device::get_count().map_err(driver("cuDeviceGetCount"))?;
         if device < 0 || device >= count {
@@ -134,6 +135,7 @@ pub unsafe extern "C" fn tilefish_context_borrow(
             return Err(Failure::Invalid("the context is NULL".to_owned()));
         }
         require_driver()?;
+        result::init().map_err(driver("cuInit"))?; // before anything else asks the driver (cuCtxGetCurrent too)
         let _keep = KeepCurrent::new()?;
         // SAFETY: the caller vouches for the context; it is current only for this call (`KeepCurrent` puts back what was).
         unsafe { result::ctx::set_current(context) }.map_err(driver("cuCtxSetCurrent"))?;

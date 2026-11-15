@@ -80,6 +80,7 @@ inline const Api& api() {
         bind(lib, x.cuGraphLaunch, "cuGraphLaunch");
         bind(lib, x.cuGraphExecDestroy, "cuGraphExecDestroy");
         bind(lib, x.cuGraphDestroy, "cuGraphDestroy");
+        if (x.cuInit(0) != 0) throw std::runtime_error("cuInit failed");
         return x;
     }();
     return a;
