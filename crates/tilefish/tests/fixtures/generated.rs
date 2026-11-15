@@ -14,6 +14,8 @@ pub static MANIFEST_JSON: &[u8] = include_bytes!("sm_103/manifest.json");
 /// The cubins of the manifest, embedded, by file name.
 pub static CUBINS: &[(&str, &[u8])] = &[
     ("add_into.sm_103.cubin", include_bytes!("sm_103/add_into.sm_103.cubin")),
+    ("add_one_wide.sm_103.cubin", include_bytes!("sm_103/add_one_wide.sm_103.cubin")),
+    ("add_rows__ua0.sm_103.cubin", include_bytes!("sm_103/add_rows__ua0.sm_103.cubin")),
     ("axpy.sm_103.cubin", include_bytes!("sm_103/axpy.sm_103.cubin")),
     ("axpy_cubin.sm_103.cubin", include_bytes!("sm_103/axpy_cubin.sm_103.cubin")),
     ("axpy_ptx.sm_103.cubin", include_bytes!("sm_103/axpy_ptx.sm_103.cubin")),
@@ -37,8 +39,12 @@ pub static CUBINS: &[(&str, &[u8])] = &[
     ("qkv_sum16.sm_103.cubin", include_bytes!("sm_103/qkv_sum16.sm_103.cubin")),
     ("residual_add_rmsnorm.sm_103.cubin", include_bytes!("sm_103/residual_add_rmsnorm.sm_103.cubin")),
     ("rmsnorm.sm_103.cubin", include_bytes!("sm_103/rmsnorm.sm_103.cubin")),
+    ("scale_bias.sm_103.cubin", include_bytes!("sm_103/scale_bias.sm_103.cubin")),
+    ("scale_bias_ptx.sm_103.cubin", include_bytes!("sm_103/scale_bias_ptx.sm_103.cubin")),
     ("scale_by.sm_103.cubin", include_bytes!("sm_103/scale_by.sm_103.cubin")),
     ("scale_flat.sm_103.cubin", include_bytes!("sm_103/scale_flat.sm_103.cubin")),
+    ("scale_null.sm_103.cubin", include_bytes!("sm_103/scale_null.sm_103.cubin")),
+    ("scale_null_ptx.sm_103.cubin", include_bytes!("sm_103/scale_null_ptx.sm_103.cubin")),
     ("softmax.sm_103.cubin", include_bytes!("sm_103/softmax.sm_103.cubin")),
     ("softmax3d.sm_103.cubin", include_bytes!("sm_103/softmax3d.sm_103.cubin")),
     ("softmax_ptx.sm_103.cubin", include_bytes!("sm_103/softmax_ptx.sm_103.cubin")),

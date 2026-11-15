@@ -1,6 +1,6 @@
 {
   "schema": 3,
-  "tilefish": "0.0.3",
+  "tilefish": "0.0.6",
   "kernels": [
     {
       "stem": "add",
