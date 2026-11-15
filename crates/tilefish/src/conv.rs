@@ -1683,6 +1683,32 @@ pub fn cudnn_version() -> Option<u64> {
     cudnn::available().then(cudnn::version)
 }
 
+/// The cuDNN handle of a CUDA context, made now, and kept for as long as this value (or a convolution loaded in the context) lives: what a host
+/// makes at start-up, before it enqueues any work, and holds for as long as it may load convolutions.
+///
+/// `cudnnCreate` waits for **all** the work queued on the device, on every stream, not only the NULL stream (measured with cuDNN 9.10.2 on a B300:
+/// one second of work queued on the NULL stream, on a blocking stream, on a non-blocking stream or on a stream of another library each made it take
+/// one second). A context has one handle, made by the first convolution loaded in it and shared by every later one (from any manifest, alone or in a
+/// plan) while one of them is alive, so the load that makes it stalls behind whatever the host has queued. With a `CudnnHandle` alive, no load in
+/// the context makes a handle, and none waits for the device. Refused when cuDNN cannot be loaded.
+#[derive(Debug, Clone)]
+pub struct CudnnHandle {
+    _shared: Arc<SharedHandle>,
+}
+
+impl CudnnHandle {
+    /// The handle of `ctx`: the one its convolutions share when one is alive, else a new one (`cudnnCreate`, which waits for the device).
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        if !cudnn::available() {
+            return Err(Error::Unsupported(
+                "libcudnn cannot be loaded on this machine (with LD_LIBRARY_PATH or the like, give the process the cuDNN its manifests were pinned with)"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self { _shared: shared_handle(ctx)? })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1811,6 +1811,66 @@ fn the_canary_of_a_load_is_never_on_the_null_stream() {
     );
 }
 
+/// `cudnnCreate` waits for all the work on the device, not only the NULL stream's: a `CudnnHandle` made while a non-blocking stream of the
+/// context is held by a host function returns only when that stream is done. Made first, and kept, it is the handle every convolution loaded in
+/// the context shares: loads made with it alive, while the stream is held again, return before the stream is done (no load makes a handle).
+#[test]
+fn a_cudnn_handle_made_first_spares_the_loads_the_wait_of_cudnn_create() {
+    extern "C" fn hold(_: *mut c_void) {
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no convolution");
+        return;
+    }
+    let gpu = Gpu::new();
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let convs = cases_where(&cases, |c| c["kind"] == "conv");
+    let busy = gpu.ctx.new_stream().unwrap(); // non-blocking: ordered with no other stream, the NULL stream included
+    let hold_busy = || {
+        gpu.ctx.bind_to_thread().unwrap();
+        // SAFETY: the context is current; the stream is a live stream of it; `hold` takes no data.
+        let held = unsafe { sys::cuLaunchHostFunc(busy.cu_stream(), Some(hold), std::ptr::null_mut()) };
+        assert_eq!(held, sys::CUresult::CUDA_SUCCESS, "cuLaunchHostFunc");
+    };
+    // SAFETY: the stream is a live stream of the context, which is current.
+    let busy_now = || unsafe { sys::cuStreamQuery(busy.cu_stream()) } == sys::CUresult::CUDA_ERROR_NOT_READY;
+    gpu.stream.synchronize().unwrap();
+    hold_busy();
+    let began = std::time::Instant::now();
+    let handle = tilefish::CudnnHandle::new(&gpu.ctx).expect("a cuDNN handle");
+    let made = began.elapsed();
+    let waited = !busy_now();
+    busy.synchronize().unwrap();
+    // with the handle alive, loads of a manifest that has loaded nothing make no handle, and do not wait for the held stream
+    let fresh = Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap();
+    hold_busy();
+    let began = std::time::Instant::now();
+    let loads: Vec<_> = convs.iter().map(|c| fresh.conv(&gpu.ctx, c["stem"].as_str().unwrap(), &[], arch)).collect();
+    let took = began.elapsed();
+    let still_busy = busy_now();
+    busy.synchronize().unwrap();
+    for load in &loads {
+        assert!(load.is_ok(), "{:?}", load.as_ref().err());
+    }
+    println!(
+        "rust gate: a cuDNN handle made with a non-blocking stream held took {made:?} (the stream done when it returned: {waited}); {} loads with \
+         the handle alive and the stream held again took {took:?} (the stream still held: {still_busy})",
+        loads.len()
+    );
+    assert!(
+        waited,
+        "cudnnCreate returned in {made:?} with the non-blocking stream still held: it did not wait for the device"
+    );
+    assert!(
+        still_busy,
+        "the loads took {took:?}, and the held stream was done when they returned: a load made a handle"
+    );
+    drop(loads);
+    drop(handle);
+}
+
 /// The bf16 nearest to an f32 (round to nearest, ties to even), as Triton's `.to(tl.bfloat16)` rounds a finite value.
 fn bf16_bits(x: f32) -> u16 {
     let bits = x.to_bits();

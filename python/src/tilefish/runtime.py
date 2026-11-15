@@ -1001,6 +1001,18 @@ def prepare(op: GraphOp, **options: Any) -> None:
     _prepare_plan(op, **options)
 
 
+def warm_cudnn(device: Any = None) -> None:
+    """Load cuDNN and create the cuDNN handle of ``device`` (default: the current device) now. ``cudnnCreate`` waits for **all** the work queued on the device,
+    on every stream (measured with cuDNN 9.10.2 on a B300: one second of work queued on the NULL stream, on a blocking stream, on a non-blocking stream or on
+    a torch stream each made it take one second), so the first pinned convolution prepared while other work runs stalls behind that work. Called at start-up,
+    before any work is queued, it costs a few milliseconds; the handle is kept for the process, and every convolution (alone, in a plan, in any manifest)
+    uses it, so none waits again. A plan with convolutions creates it in :func:`prepare` too."""
+    from . import _cudnn
+
+    index = device if device is None or isinstance(device, int) else _device_index(_torch(), str(device))
+    _cudnn.warm(index)
+
+
 def run_step(op: GraphOp, step: int, buffers: Any, **options: Any) -> None:
     """Launch one step of a graph's plan, with the binary and the binding of its arguments the (verified) plan says, on the caller's tensors:
     ``run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest, bucket=None)``. ``buffers`` gives a tensor for every
