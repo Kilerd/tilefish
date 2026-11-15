@@ -277,10 +277,14 @@ def test_built_kernel_refuses_a_binary_of_another_declaration(directory):
 
 
 def test_launch_attributes_that_replay_cannot_set_up_are_kept_for_the_driver_check(directory):
-    edit_manifest(directory, lambda d: d["kernels"][0]["launch"].update(global_scratch_size=64, launch_pdl=True))
+    edit_manifest(directory, lambda d: d["kernels"][0]["launch"].update(launch_pdl=True))
     spec, _ = specs()
     b = Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
-    assert b.launch.replay_blockers() == ["global_scratch_size=64", "launch_pdl=True"]  # refused when it is loaded into the driver
+    assert b.launch.replay_blockers() == ["launch_pdl=True"]  # refused when it is loaded into the driver
+    # a global scratch the declaration does not state is another binary (and one of tilefish 0.0.6 records no alignment: refused at load)
+    edit_manifest(directory, lambda d: d["kernels"][0]["launch"].update(global_scratch_size=64))
+    with pytest.raises(TilefishManifestError, match="64 bytes of global scratch per CTA"):
+        Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)
     edit_manifest(directory, lambda d: d["kernels"][0].update(launch={"global_scratch_size": 0}))
     with pytest.raises(TilefishManifestError, match="launch attributes are malformed"):
         Manifest.load(directory).built_kernel(spec, "sm_90", ir_digest=SRC, ir_triton=TRITON)

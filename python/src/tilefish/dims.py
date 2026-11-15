@@ -15,10 +15,28 @@ uses :meth:`DimExpr.folded`, which replaces a static ``Dim`` by its value.
 
 from __future__ import annotations
 
+import contextlib
 import math
-from typing import Any, Iterable, Mapping
+import threading
+from typing import Any, Iterable, Iterator, Mapping
 
 from .errors import TilefishDeclarationError, TilefishTypeError
+
+_products = threading.local()  # ``products()``: ``*`` of two symbolic dimensions is their product atom on this thread, for the block
+
+
+@contextlib.contextmanager
+def products() -> "Iterator[None]":
+    """Inside the block (on this thread), ``a * b`` of two symbolic dimensions is their product (:func:`mul`, a product atom) instead of an
+    error. A launch grid is evaluated so (``grid=lambda T, C: (tilefish.cdiv(T * C, 1024),)``: one program per 1024 elements of a ``[T, C]``
+    tensor): a host computes a grid entry, it never solves one. A shape, a stride and a ``//`` stay affine, as a host binds the dimensions of a
+    call from the shapes by solving them."""
+    previous = getattr(_products, "on", False)
+    _products.on = True
+    try:
+        yield
+    finally:
+        _products.on = previous
 
 
 def _is_int(x: Any) -> bool:
@@ -263,9 +281,11 @@ class DimExpr:
             return DimExpr._make({a: c * k for a, c in self._terms}, self._const * k)
         if self.is_static:
             return o * self._const
+        if getattr(_products, "on", False):  # a launch grid (see ``products``)
+            return mul(self, o)
         raise TilefishTypeError(
             f"cannot multiply dimensions {self} and {o}: dimension arithmetic is affine "
-            "(a symbolic dimension can only be scaled by an integer)"
+            "(a symbolic dimension can only be scaled by an integer; a launch grid may multiply two)"
         )
 
     __rmul__ = __mul__
@@ -439,9 +459,10 @@ class _Prod(DimExpr):
     """A product of two or more symbolic dimension expressions (``L*L``, ``(L + 6)*H``): the element stride of a dense ``[H, L, L]`` tensor along
     its first axis, the offset of ``x[h]`` in it, its element count.
 
-    It is not part of the declared language: a shape, a grid and a ``//`` stay affine (``__mul__`` of two symbolic dimensions raises), and a host
-    never reads one. It exists for what tilefish derives from shapes, the strides and offsets of tensors and views (:func:`mul`), so that a view
-    of an ``[H, L, L]`` tensor and a plan of one have a layout. Its value at a bucket is the product of its factors' values. Each factor is a
+    A shape, a stride and a ``//`` stay affine (``__mul__`` of two symbolic dimensions raises), as a host solves them. It exists for what tilefish
+    derives from shapes, the strides and offsets of tensors and views (:func:`mul`), so that a view of an ``[H, L, L]`` tensor and a plan of one
+    have a layout, and for a launch grid (evaluated inside :func:`products`: ``cdiv(T*C, 1024)``), which a host computes and never solves (the
+    manifest writes it as ``T*C``). Its value at a bucket is the product of its factors' values. Each factor is a
     symbolic affine expression whose coefficients and constant have no common divisor (the integer content is the atom's coefficient), sorted, so
     two products of the same factors are one atom: ``(2*L)*L == 2*(L*L) == L*(2*L)``.
     """

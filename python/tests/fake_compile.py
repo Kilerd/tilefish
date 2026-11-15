@@ -189,6 +189,11 @@ class FakeCompiler:
         self.ptx_body = ""
         self.ttgir_body = ""
         self.ttir = None
+        # launch shapes: the global scratch per CTA and its alignment the compiled kernel reports (Triton's metadata), and the cluster it reports
+        # (``None``: ``(num_ctas, 1, 1)`` of the options, as Triton plans a cluster of num_ctas along x)
+        self.global_scratch = 0
+        self.global_scratch_align = 1
+        self.cluster_dims = None
 
     @property
     def count(self):
@@ -210,13 +215,13 @@ class FakeCompiler:
             name="tf_k",
             shared=self.shared,
             target=target,
-            global_scratch_size=0,
+            global_scratch_size=self.global_scratch,
+            global_scratch_align=self.global_scratch_align,
             profile_scratch_size=0,
             launch_pdl=False,
-            cluster_dims=(1, 1, 1),
-            num_ctas=1,
+            cluster_dims=self.cluster_dims or (options.get("num_ctas", 1), 1, 1),
             launch_cooperative_grid=False,
-            **options,
+            **{"num_ctas": 1, **options},
         )
         if self.total_warps is not None or self.metadata_warps is not None:  # Triton's metadata num_warps: the total of a warp-specialised kernel
             md.num_warps = self.total_warps if self.total_warps is not None else self.metadata_warps

@@ -335,9 +335,8 @@ def mutations():
         ("step key", setter(["buckets", 0, "steps", 0, "extra"], 1), "unknown"),
         ("step entry", setter(["buckets", 0, "steps", 0, "entry"], "a b"), "manifest stem"),
         ("step kind", setter(["buckets", 0, "steps", 0, "kind"], "launch"), "kind must be one of"),
-        ("step kind swapped", setter(["buckets", 0, "steps", 0, "kind"], "library"), "exactly the steps of kind 'library' have a workspace"),
-        ("workspace on a kernel", setter(["buckets", 0, "steps", 0, "workspace"], "workspace"), "exactly the steps of kind 'library' have a workspace"),
-        ("workspace missing", deleter(["buckets", 0, "steps", 1, "workspace"]), "exactly the steps of kind 'library' have a workspace"),
+        ("step kind swapped", setter(["buckets", 0, "steps", 0, "kind"], "library"), "a step of kind 'library' has a workspace"),
+        ("workspace missing", deleter(["buckets", 0, "steps", 1, "workspace"]), "a step of kind 'library' has a workspace"),
         ("workspace is not one", setter(["buckets", 0, "steps", 1, "workspace"], "x"), "must name the buffer of role workspace"),
         ("args empty", setter(["buckets", 0, "steps", 0, "args"], []), "non-empty list"),
         ("arg key", setter(["buckets", 0, "steps", 0, "args", 0, "extra"], 1), "unknown"),
@@ -351,7 +350,8 @@ def mutations():
         ("view offset", setter(["buckets", 0, "steps", 2, "args", 0, "view", "offset"], -1), "view must be"),
         ("view past the buffer", setter(["buckets", 0, "steps", 2, "args", 0, "view", "offset"], 10**6), "reaches past the end"),
         ("view of a devscalar", setter(["buckets", 0, "steps", 2, "args", 4, "view"], {"shape": [1], "strides": [1], "offset": 0}), "bound whole"),
-        ("kinds differ across buckets", setter(["buckets", 1, "steps", 0, "kind"], "library"), "exactly the steps of kind 'library' have a workspace|other kinds"),
+        ("kinds differ across buckets", setter(["buckets", 1, "steps", 0, "kind"], "library"), "a step of kind 'library' has a workspace|other kinds"),
+        ("workspaces differ across buckets", setter(["buckets", 1, "steps", 0, "workspace"], "workspace"), "other kinds, workspaces"),
         ("bindings differ across buckets", setter(["buckets", 1, "steps", 0, "args", 0, "binding"], "w_ln1"), "other kinds, workspaces, argument names or bindings"),
         ("step counts differ", lambda d: d["buckets"][1]["steps"].pop(), "same number of steps"),
         ("overlap without reuse", setter(["buffers", 10, "offset"], 0), "overlap, which only reuse=true allows"),
@@ -387,10 +387,16 @@ def test_regions_may_overlap_only_with_reuse_and_only_where_no_step_uses_both(go
 def test_there_is_a_workspace_exactly_when_a_step_launches_a_gemm():
     doc = tilefish.plan(pm.accumulate).with_manifest("sm_103", "a" * 64).doc  # no GEMM, no workspace
     _plan.validate_doc(doc)
-    doc["buffers"].append({"name": "workspace", "role": "workspace", "dtype": "u8", "shape": [256], "offset": 0, "bytes": 256})
-    doc["arena_bytes"] = 16384
-    with pytest.raises(TilefishManifestError, match="a buffer of role workspace exactly when some step has kind library"):
+    end = doc["arena_bytes"]
+    doc["buffers"].append({"name": "workspace", "role": "workspace", "dtype": "u8", "shape": [256], "offset": end, "bytes": 256})
+    doc["arena_bytes"] = end + 256
+    with pytest.raises(TilefishManifestError, match="a buffer of role workspace exactly when some step has a workspace"):
         _plan.validate_doc(doc)
+    # a kernel step may have the workspace (a kernel with a global scratch: whether its entry has one is the manifest's to say)
+    for st in doc["buckets"][0]["steps"][:1]:
+        st["workspace"] = "workspace"
+    doc["buckets"][1]["steps"][0]["workspace"] = "workspace"
+    _plan.validate_doc(doc)
 
 
 def leaves(node, path=()):
@@ -687,6 +693,8 @@ def test_every_step_must_be_what_the_manifests_entries_say(against):
     refused(broken(lambda d: steps(d)[0]["args"][2].update(binding="x")), manifest, "is written by the binary but bound to 'x', whose role is input")
     refused(broken(lambda d: buffer(d, "n").update(role="input", offset=None)), manifest, "a device scalar .a pointer of shape \\[\\]. is bound to the buffer of role devscalar")
     refused(broken(lambda d: steps(d)[0]["args"][0].update(binding="n")), manifest, "is bound to .n. .i32., but the binary takes bf16")
+    # a kernel step has the workspace exactly when its entry has a global scratch (it is the kernel's scratch): rmsnorm has none
+    refused(broken(lambda d: [b["steps"][0].update(workspace="workspace") for b in d["buckets"]]), manifest, "has 0 bytes of global scratch per CTA, and the step has a workspace")
 
 
 def test_a_buffer_is_written_before_it_is_read(against):

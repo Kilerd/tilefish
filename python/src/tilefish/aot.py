@@ -104,7 +104,7 @@ from ._specvalid import (
     validate_spec,
 )
 from .decorators import ExternOp, grid_to_string
-from .dims import Dim, DimExpr, _NextPow2
+from .dims import Dim, DimExpr, _NextPow2, _Prod
 from .dtypes import BlockScaled
 from .errors import TilefishError, TilefishSpecError
 from .signature import MISSING
@@ -353,6 +353,15 @@ class CompileSpec:
     # The implementation of an op declared with ``extern(by_arch=...)`` this spec is of: the architecture it was declared for (``"sm_103"``) or
     # ``"fallback"``. It is in the declaration digest. ``None`` (and not written) for every other op.
     implementation: "str | None" = None
+    # Triton's ``num_ctas`` (``extern(num_ctas=)``, or a ``by_bucket=`` configuration): the CTAs of one program, launched as a thread-block cluster of
+    # ``(num_ctas, 1, 1)``. It is in the compile options when it is not 1; 1, and not written, for every other spec.
+    num_ctas: int = 1
+    # A persistent grid (``extern(persistent=tilefish.persistent(...))``): ``{"programs_per_sm": k}``, with ``"sm_count"`` for a kernel whose bytes
+    # depend on the number of programs. ``None`` (and not written) for any other spec.
+    persistent: "dict[str, int] | None" = None
+    # The bytes of global scratch each CTA of the compiled kernel addresses (``extern(global_scratch=)``), which the build checks against Triton's
+    # metadata. 0 (and not written) for any other spec.
+    global_scratch: int = 0
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
@@ -425,6 +434,8 @@ class CompileSpec:
         options: dict[str, Any] = {"num_warps": self.num_warps, "num_stages": self.num_stages}
         if self.enable_fp_fusion is not None:
             options["enable_fp_fusion"] = self.enable_fp_fusion
+        if self.num_ctas != 1:  # a cluster of CTAs per program (only then: every other spec compiles with the options it always had)
+            options["num_ctas"] = self.num_ctas
         return AstSourceInputs(
             signature=dict(self.signature),
             attrs=copy.deepcopy(self.attrs),
@@ -448,6 +459,9 @@ class CompileSpec:
                 for a in self.args
             )
             or any(p.kind == "max_extent" for p in self.preconditions)
+            or self.num_ctas != 1
+            or self.persistent is not None
+            or self.global_scratch != 0
         )
 
     @property
@@ -499,6 +513,12 @@ class CompileSpec:
             doc["enable_fp_fusion"] = self.enable_fp_fusion
         if self.source_sha256 is not None:
             doc["source_sha256"] = self.source_sha256
+        if self.num_ctas != 1:
+            doc["num_ctas"] = self.num_ctas
+        if self.persistent is not None:
+            doc["persistent"] = dict(self.persistent)
+        if self.global_scratch:
+            doc["global_scratch"] = self.global_scratch
         return doc
 
     def to_json(self, indent: int | None = 2) -> str:
@@ -547,6 +567,9 @@ class CompileSpec:
                 dims=copy.deepcopy(d.get("dims", {})),
                 language=d.get("language", "triton"),
                 implementation=d.get("implementation"),
+                num_ctas=d.get("num_ctas", 1),
+                persistent=copy.deepcopy(d.get("persistent")),
+                global_scratch=d.get("global_scratch", 0),
             )
 
     def verify_against(self, op: ExternOp) -> None:
@@ -683,6 +706,8 @@ def _canonical_atom(a: DimExpr) -> Any:
         return {"dim": a.name, "divisible_by": a.divisible_by, "buckets": None if a.buckets is None else list(a.buckets)}
     if isinstance(a, _NextPow2):  # the BLOCK constexpr a lowered kernel derives from a bucketed dimension
         return {"next_pow2": _canonical_dim(a.arg)}
+    if isinstance(a, _Prod):  # a product of dimensions, in a launch grid (cdiv(T*C, 1024)): its factors, in their canonical order
+        return {"prod": [_canonical_dim(f) for f in a.factors]}
     return {"cdiv": [_canonical_dim(a.num), _canonical_dim(a.den)]}  # type: ignore[attr-defined]
 
 
@@ -818,7 +843,32 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc["source_sha256"] = op.source_sha256
     if op.bucket_num_warps:
         doc["bucket_num_warps"] = dict(sorted(op.bucket_num_warps.items()))
+    # the launch shapes of manifest schema 3 (sections 4.3 to 4.6), each only when the declaration says it: every other digest is as it was
+    if op.num_ctas != 1:
+        doc["num_ctas"] = op.num_ctas
+    if op.persistent is not None:
+        doc["persistent"] = op.persistent.to_json()
+    if op.global_scratch:
+        doc["global_scratch"] = op.global_scratch
+    if op.binary is not None and tuple(op.binary.cluster) != (1, 1, 1):
+        doc["binary"]["cluster"] = list(op.binary.cluster)
+    if op.by_bucket_dims:  # the whole configuration of every bucket by_bucket= names, the grid under its consts included
+        doc["by_bucket"] = [
+            {
+                "buckets": dict(key),
+                "num_warps": c["num_warps"],
+                "num_stages": c["num_stages"],
+                "num_ctas": c["num_ctas"],
+                "consts": {k: _canonical_value(_typed_const(op.name, _const_param(op, k), v)) for k, v in sorted(c["consts"].items())},
+                "grid": None if c["grid"] is None else [_canonical_dim(g) for g in c["grid"]],
+            }
+            for key, c in op.bucket_configs.items()
+        ]
     return doc
+
+
+def _const_param(op: ExternOp, name: str) -> Any:
+    return next(p for p in op.signature.consts if p.name == name)
 
 
 def declaration_digest(op: ExternOp) -> str:
@@ -854,7 +904,8 @@ def stride_scalar_type(op: ExternOp, p: Any) -> str:
 
 
 def _bucket_dims(op: ExternOp) -> list[Dim]:
-    """Bucketed dims used by const defaults, in order of first appearance."""
+    """Bucketed dims used by const defaults, in order of first appearance, then those ``by_bucket=`` chooses a configuration by (in the order of
+    its parameters): one binary per bucket combination of these."""
     dims: list[Dim] = []
     for p in op.signature.consts:
         if isinstance(p.default, DimExpr):
@@ -866,6 +917,9 @@ def _bucket_dims(op: ExternOp) -> list[Dim]:
                     )
                 if d not in dims:
                     dims.append(d)
+    for d in op.by_bucket_dims:
+        if d not in dims:
+            dims.append(d)
     return dims
 
 
@@ -939,6 +993,8 @@ def _tensordesc_arg(
 
 
 def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
+    chosen = op.bucket_config({d.name: v for d, v in mapping.items()})  # this bucket's by_bucket= configuration (None: the declaration's)
+    chosen_consts: "dict[str, Any]" = chosen["consts"] if chosen is not None else {}
     signature: dict[str, str] = {}
     constants: dict[tuple[int, ...], Any] = {}
     attrs: dict[tuple[int, ...], list[list[Any]]] = {}
@@ -1050,7 +1106,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                 args.append(ArgSpec(i, p.name, "fixed", ty, dtype=ty, value=p.default))
         else:
             assert p.default is not MISSING
-            value = p.default
+            value = chosen_consts.get(p.name, p.default)
             if isinstance(value, DimExpr):
                 resolved = value.subst(mapping)
                 if not resolved.is_static:  # pragma: no cover - _bucket_dims rejects this earlier
@@ -1066,12 +1122,13 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         preconditions.append(Precondition("bucket", dim=d.name, value=v, buckets=d.buckets))
         note(d)
 
-    assert op.grid is not None
-    for g in op.grid:
+    op_grid = chosen["grid"] if chosen is not None else op.grid
+    assert op_grid is not None
+    for g in op_grid:
         note(g)
     for d, v in mapping.items():
         dims[d.name]["bucket"] = v  # after every mention was noted: two mentions are compared by their constraints
-    grid = tuple(g.subst(mapping).folded() for g in op.grid)  # exact buckets: the bucket value, folded
+    grid = tuple(g.subst(mapping).folded() for g in op_grid)  # exact buckets: the bucket value, folded
     for g in grid:
         if g.is_static and g.value < 1:
             raise TilefishSpecError(f"extern op '{op.name}': the grid has a non-positive size {g} for {mapping}")
@@ -1083,12 +1140,16 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
     if op.binary is None:
         launch += [LaunchParam("global_scratch", "u64", 0), LaunchParam("profile_scratch", "u64", 0)]
         num_warps = op.bucket_num_warps.get(suffix, op.num_warps)  # only a kernel that tilefish generated has one per bucket
+        if chosen is not None:  # an extern's by_bucket= configuration of this bucket
+            num_warps = chosen["num_warps"]
         block = (32 * num_warps, 1, 1)
     else:  # a prebuilt binary is launched with exactly its C parameters: no scratch slots, no warps; its block is declared
         attrs = {}  # (no Triton compiles it: no divisibility attributes)
         num_warps = 0
         block = op.binary.block
         binary = {"kind": op.binary.kind, "symbol": op.binary.symbol, "shared": op.binary.shared, "digests": op.binary.digests}
+        if tuple(op.binary.cluster) != (1, 1, 1):  # a thread-block cluster (only then: every other spec is as it was)
+            binary["cluster"] = list(op.binary.cluster)
     spec = CompileSpec(
         stem=stem,
         op=op.name,
@@ -1097,7 +1158,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         constants=constants,
         attrs=attrs,
         num_warps=num_warps,
-        num_stages=op.num_stages,
+        num_stages=chosen["num_stages"] if chosen is not None else op.num_stages,
         grid=grid_to_string(grid),
         block=block,
         launch_params=tuple(launch),
@@ -1111,6 +1172,9 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         binary=binary,
         language=op.language,
         implementation=op.implementation,
+        num_ctas=chosen["num_ctas"] if chosen is not None else op.num_ctas,
+        persistent=op.persistent.to_json() if op.persistent is not None else None,
+        global_scratch=op.global_scratch,
     )
     spec._mark_verified()  # generated from the declaration just now
     return spec

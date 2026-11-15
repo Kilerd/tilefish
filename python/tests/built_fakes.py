@@ -29,6 +29,12 @@ def rowop(x: Tensor[M, S, f32], y: Out[Tensor[M, S, f32]], *, EPS: const[f32] = 
 FAKE_SOURCE_DIGEST = hashlib.sha256(b"the source of a hand-written kernel").hexdigest()  # what an extern's cache_key stands in as
 
 
+def fake_launch(spec):
+    """What Triton's metadata would say of a binary of ``spec``: its declared global scratch (aligned to 128 bytes, as two TMA descriptors are) and a
+    cluster of its ``num_ctas`` along x."""
+    return LaunchAttributes(spec.global_scratch, 0, False, (spec.num_ctas, 1, 1), spec.num_ctas, False, 128 if spec.global_scratch else 0)
+
+
 def fake_build(spec, *, arch="sm_90", cubin=None, launch=None, **kw):
     """A ``BuiltKernel`` of ``spec`` around a small ELF file (its symbol is ``tf_k``) for ``arch`` (its ELF header says so); ``kw`` overrides any field."""
     cubin = cubin_like(**arch_header(arch)) if cubin is None else cubin
@@ -46,7 +52,7 @@ def fake_build(spec, *, arch="sm_90", cubin=None, launch=None, **kw):
         ptxas_version="Cuda compilation tools, release 12.9, V12.9.86",
         ptx_target="sm_90a",
         options=spec.ast_source_inputs().options,
-        launch=launch or LaunchAttributes(0, 0, False, (1, 1, 1), 1, False),
+        launch=launch or fake_launch(spec),
         ir_digest=FAKE_SOURCE_DIGEST,
     )
     values.update(kw)

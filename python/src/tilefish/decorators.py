@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import itertools
 import math
 import os
 import pathlib
 import re
 import sys
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from .dims import DimExpr, as_dim
+from .dims import Dim, DimExpr, as_dim, products
 from ._specvalid import IMPLEMENTATION_FALLBACK as FALLBACK, MAX_ELEMENTS
 from .dtypes import DType
 from .errors import TilefishDeclarationError, TilefishError, TilefishPicklingError, TilefishRuntimeError, TilefishTypeError
@@ -578,6 +579,71 @@ LANGUAGES = ("triton", "gluon")  # the frontends of Triton a hand-written kernel
 _OP_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")  # ASCII only: an op name is part of a stem, which is part of a file name
 _NUM_WARPS = (1, 2, 4, 8, 16, 32)
 _MATH_MODES = ("fast", "ieee")  # the f32 math of a kernel body (note 13 of tilefish.lower)
+_NUM_CTAS = (1, 2, 4, 8)  # Triton's num_ctas: the CTAs of one program, a thread-block cluster along x (8: the portable cluster size)
+MAX_CLUSTER = 8  # the CTAs of a cluster a launch asks for without CUDA's non-portable cluster size
+MAX_PROGRAMS_PER_SM = 32  # programs_per_sm of a persistent grid: at most the resident blocks an SM has
+MAX_GLOBAL_SCRATCH = 1 << 20  # bytes of global scratch per CTA a declaration may state
+
+
+@dataclass(frozen=True)
+class Persistent:
+    """A **persistent grid**, made by :func:`persistent`: the host launches ``min(tiles, programs_per_sm * SMs // ctas)`` programs, where
+    ``tiles`` is the declared grid (one entry: the work items), ``SMs`` the multiprocessor count of the device (or of the partition the host runs
+    on) and ``ctas`` the CTAs of one program (a cluster's, else 1), resolved when the binary is loaded. The kernel walks the tiles with a stride of
+    the programs launched (``for t in range(tl.program_id(0), tiles, tl.num_programs(0))``), so one binary serves every device shape.
+
+    ``sm_count=None`` (the default) is the kernel's promise that **its bytes do not depend on how many programs run**: each tile is computed by one
+    program from its inputs alone, whichever program and however many there are. A kernel whose bytes depend on it (a persistent reduction whose
+    programs each sum their own tiles, then combine) states the SM count it is declared for (``sm_count=30``): its entry records it, and a host on a
+    device or partition of another count refuses it (declare another op, or another value, for another device shape)."""
+
+    programs_per_sm: int = 1
+    sm_count: "int | None" = None
+
+    def to_json(self) -> "dict[str, int]":
+        """The manifest's ``persistent`` object (manifest schema 3, section 4.3)."""
+        out = {"programs_per_sm": self.programs_per_sm}
+        if self.sm_count is not None:
+            out["sm_count"] = self.sm_count
+        return out
+
+
+def persistent(*, programs_per_sm: int = 1, sm_count: "int | None" = None) -> Persistent:
+    """A persistent grid for ``@tilefish.extern(..., grid=lambda M, N: (tilefish.cdiv(M, 128) * tilefish.cdiv(N, 128),), persistent=tilefish.persistent())``:
+    the grid is the number of tiles, and the host launches at most ``programs_per_sm`` programs per SM of the device it loads the binary on (see
+    :class:`Persistent`; ``sm_count=`` for a kernel whose bytes depend on the number of programs)."""
+    if isinstance(programs_per_sm, bool) or not isinstance(programs_per_sm, int) or not 1 <= programs_per_sm <= MAX_PROGRAMS_PER_SM:
+        raise TilefishDeclarationError(f"tilefish.persistent: programs_per_sm must be an int from 1 to {MAX_PROGRAMS_PER_SM}, got {programs_per_sm!r}")
+    if sm_count is not None and (isinstance(sm_count, bool) or not isinstance(sm_count, int) or not 1 <= sm_count <= 1 << 20):
+        raise TilefishDeclarationError(
+            f"tilefish.persistent: sm_count is None (the kernel's bytes do not depend on how many programs run) or the SM count the kernel is declared "
+            f"for (an int from 1), got {sm_count!r}"
+        )
+    return Persistent(programs_per_sm, sm_count)
+
+
+@dataclass(frozen=True)
+class Config:
+    """The compile-time configuration of one bucket of an extern, made by :func:`config`: ``None`` keeps the declaration's ``num_warps``,
+    ``num_stages`` or ``num_ctas``, and ``consts`` gives const parameters of the stub the values compiled into this bucket's binary."""
+
+    num_warps: "int | None" = None
+    num_stages: "int | None" = None
+    num_ctas: "int | None" = None
+    consts: "tuple[tuple[str, Any], ...]" = ()
+
+
+def config(*, num_warps: "int | None" = None, num_stages: "int | None" = None, num_ctas: "int | None" = None, **consts: Any) -> Config:
+    """One bucket's configuration for ``@tilefish.extern(..., by_bucket=lambda T: tilefish.config(num_warps=8, BLOCK_T=128) if T > 256 else
+    tilefish.config(num_warps=2, BLOCK_T=32))``: the warps, stages and CTAs of the binary of that bucket, and the values of const parameters
+    (tile sizes, any constexpr of the kernel) compiled into it. What it leaves out is the declaration's."""
+    if num_warps is not None and (isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in _NUM_WARPS):
+        raise TilefishDeclarationError(f"tilefish.config: num_warps must be a power of two from 1 to 32, got {num_warps!r}")
+    if num_stages is not None and (isinstance(num_stages, bool) or not isinstance(num_stages, int) or num_stages < 1):
+        raise TilefishDeclarationError(f"tilefish.config: num_stages must be a positive int, got {num_stages!r}")
+    if num_ctas is not None and (isinstance(num_ctas, bool) or not isinstance(num_ctas, int) or num_ctas not in _NUM_CTAS):
+        raise TilefishDeclarationError(f"tilefish.config: num_ctas must be one of {list(_NUM_CTAS)}, got {num_ctas!r}")
+    return Config(num_warps, num_stages, num_ctas, tuple(sorted(consts.items())))
 
 
 class _TritonTarget:
@@ -770,6 +836,10 @@ class ExternOp(Op):
         language: str = "triton",
         implementation: "str | None" = None,
         implementations: "dict[str, ExternOp] | None" = None,
+        persistent: "Persistent | None" = None,
+        num_ctas: int = 1,
+        global_scratch: int = 0,
+        by_bucket: "Callable[..., Any] | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         # extern(by_arch=...): the op that a graph calls and a caller runs has ``implementations`` (its key -> an ExternOp of its own, the
@@ -795,7 +865,37 @@ class ExternOp(Op):
         self.triton = triton
         self.num_warps = num_warps
         self.num_stages = num_stages
+        self._grid_source = grid  # the grid as declared (a callable is evaluated again for a bucket whose by_bucket= config gives its consts other values)
         self.grid: tuple[DimExpr, ...] | None = self._eval_grid(grid)
+        if persistent is not None and not isinstance(persistent, Persistent):
+            raise TilefishDeclarationError(f"extern '{name}': persistent= is a tilefish.persistent(...) or None, got {persistent!r}")
+        # a persistent grid (tilefish.persistent): the grid is the number of tiles, and the host launches at most programs_per_sm per SM of the device
+        self.persistent: "Persistent | None" = persistent
+        if isinstance(num_ctas, bool) or not isinstance(num_ctas, int) or num_ctas not in _NUM_CTAS:
+            raise TilefishDeclarationError(f"extern '{name}': num_ctas must be one of {list(_NUM_CTAS)}, got {num_ctas!r}")
+        if num_ctas != 1 and (binary is not None or not triton):
+            raise TilefishDeclarationError(f"extern '{name}': num_ctas= is a Triton compile option; a prebuilt binary declares its cluster= instead")
+        # Triton's num_ctas: the CTAs of one program, launched as a thread-block cluster of (num_ctas, 1, 1) (cuLaunchKernelEx)
+        self.num_ctas: int = num_ctas
+        if isinstance(global_scratch, bool) or not isinstance(global_scratch, int) or not 0 <= global_scratch <= MAX_GLOBAL_SCRATCH:
+            raise TilefishDeclarationError(f"extern '{name}': global_scratch must be an int from 0 to {MAX_GLOBAL_SCRATCH} (bytes per CTA), got {global_scratch!r}")
+        if global_scratch and (binary is not None or not triton):
+            raise TilefishDeclarationError(f"extern '{name}': global_scratch= is the global scratch of a Triton kernel (its launch ABI has the slot); a prebuilt binary has none")
+        # the bytes of global scratch each CTA of the compiled kernel addresses (Triton's metadata.global_scratch_size, checked by the build): a host
+        # gives a launch global_scratch * (CTAs of the grid) bytes, a plan from its arena
+        self.global_scratch: int = global_scratch
+        # by_bucket=: one compile-time configuration per bucket combination of the dimensions it names (_bucket_configs), and the grid of each
+        self.by_bucket_dims: "tuple[Dim, ...]" = ()
+        self.bucket_configs: "dict[tuple[tuple[str, int], ...], dict[str, Any]]" = {}
+        if by_bucket is not None:
+            self._bucket_configs(by_bucket)
+        if self.persistent is not None:
+            for g in [self.grid, *(c["grid"] for c in self.bucket_configs.values())]:
+                if g is not None and len(g) != 1:
+                    raise TilefishDeclarationError(
+                        f"extern '{name}': a persistent grid has one entry, the number of tiles (the host launches at most programs_per_sm programs per "
+                        f"SM along x), got {grid_to_string(g)}"
+                    )
         by_name = {p.name: p for p in signature.params}
         self.max_elements: dict[str, int] = dict(max_elements or {})
         for k, v in self.max_elements.items():
@@ -876,6 +976,11 @@ class ExternOp(Op):
         return super().__reduce__()
 
     def check_const(self, param: Param, value: Any) -> Any:
+        if any(param.name in c["consts"] for c in self.bucket_configs.values()):
+            raise TilefishTypeError(
+                f"{self.name}: constexpr '{param.name}' is compiled into each bucket's binary with the value by_bucket= chooses for it, so a call "
+                "does not give it"
+            )
         if value != param.default:
             if self.binary is not None:
                 raise TilefishTypeError(
@@ -888,10 +993,93 @@ class ExternOp(Op):
             )
         return value
 
-    def _grid_names(self) -> dict[str, Any]:
+    def _bucket_configs(self, by_bucket: Any) -> None:
+        """Evaluate ``by_bucket=`` (a callable over names of bucketed dimensions of the signature, returning :func:`config` or ``None``) at every
+        bucket combination of the dimensions it names, and keep each combination's configuration, made whole with the declaration's values (warps,
+        stages, CTAs, the value of every const it sets, and the grid under those values)."""
+        nm = self.name
+        if self.binary is not None or not self.triton:
+            raise TilefishDeclarationError(
+                f"extern '{nm}': by_bucket= chooses the compile-time configuration of a Triton or Gluon kernel per bucket; a prebuilt binary is compiled "
+                "already (declare one op per binary)"
+            )
+        if not callable(by_bucket):
+            raise TilefishDeclarationError(
+                f"extern '{nm}': by_bucket= is a callable over bucketed dimension names that returns a tilefish.config(...) (or None), such as "
+                f"lambda T: tilefish.config(num_warps=8) if T > 256 else None; got {by_bucket!r}"
+            )
+        bucketed: "dict[str, Dim]" = {}
+        for p in self.signature.params:
+            exprs = list(p.type.shape) if p.kind == "tensor" else [p.dim] if p.kind == "dim" else []  # type: ignore[union-attr]
+            if p.kind == "const" and isinstance(p.default, DimExpr):
+                exprs.append(p.default)
+            for e in exprs:
+                for d in e.free_dims():  # type: ignore[union-attr]
+                    if d.buckets:
+                        bucketed.setdefault(d.name, d)
+        names: "list[str]" = []
+        for pname, gp in inspect.signature(by_bucket).parameters.items():
+            if gp.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+                raise TilefishDeclarationError(f"extern '{nm}': the by_bucket= callable may only take plain named parameters")
+            if pname not in bucketed:
+                raise TilefishDeclarationError(
+                    f"extern '{nm}': by_bucket= takes '{pname}', which is not a bucketed dimension of the signature (bucketed: "
+                    f"{', '.join(sorted(bucketed)) or 'none'}); a configuration is chosen per bucket of a Dim(..., buckets=[...])"
+                )
+            names.append(pname)
+        if not names:
+            raise TilefishDeclarationError(f"extern '{nm}': the by_bucket= callable names no bucketed dimension; it takes the ones it chooses by")
+        consts = {p.name: p for p in self.signature.consts}
+        dims = tuple(bucketed[n] for n in names)
+        for combo in itertools.product(*(d.buckets for d in dims)):  # type: ignore[misc]
+            values = dict(zip(names, combo))
+            try:
+                got = by_bucket(**values)
+            except TilefishError as e:
+                raise TilefishDeclarationError(f"extern '{nm}': by_bucket= failed at {values}: {e}") from None
+            if got is None:
+                got = Config()
+            if not isinstance(got, Config):
+                raise TilefishDeclarationError(f"extern '{nm}': by_bucket= returns a tilefish.config(...) or None, got {got!r} at {values}")
+            chosen: "dict[str, Any]" = {}
+            for cname, value in got.consts:
+                p = consts.get(cname)
+                if p is None:
+                    raise TilefishDeclarationError(
+                        f"extern '{nm}': by_bucket= sets '{cname}' at {values}, which is not a const parameter of the stub ({sorted(consts) or 'none'})"
+                    )
+                chosen[cname] = _check_const_default(f"extern '{nm}' (by_bucket= at {values})", cname, p.const_dtype, value, allow_dim=False)
+            try:
+                bucket_grid = self._eval_grid(self._grid_source, chosen) if chosen else self.grid
+            except TilefishDeclarationError as e:
+                raise TilefishDeclarationError(f"{e} (the grid under the consts by_bucket= gives at {values})") from None
+            num_ctas = self.num_ctas if got.num_ctas is None else got.num_ctas
+            self.bucket_configs[tuple(sorted(values.items()))] = {
+                "num_warps": self.num_warps if got.num_warps is None else got.num_warps,
+                "num_stages": self.num_stages if got.num_stages is None else got.num_stages,
+                "num_ctas": num_ctas,
+                "consts": chosen,
+                "grid": bucket_grid,
+            }
+        self.by_bucket_dims = dims
+
+    def bucket_config(self, buckets: "Mapping[str, int]") -> "dict[str, Any] | None":
+        """The ``by_bucket=`` configuration of the binary of these bucket values (by dimension name; ``None``: the op has no ``by_bucket=``)."""
+        if not self.by_bucket_dims:
+            return None
+        return self.bucket_configs[tuple(sorted((d.name, buckets[d.name]) for d in self.by_bucket_dims))]
+
+    def grid_for(self, buckets: "Mapping[str, int]") -> "tuple[DimExpr, ...] | None":
+        """The launch grid of the binary of these bucket values: the declared one, or the one ``by_bucket=`` gives it (its consts' values)."""
+        chosen = self.bucket_config(buckets)
+        return self.grid if chosen is None else chosen["grid"]
+
+    def _grid_names(self, overrides: "Mapping[str, Any] | None" = None) -> dict[str, Any]:
         table: dict[str, Any] = {}
         for p in self.signature.params:
-            if p.kind == "const" and p.default is not MISSING:
+            if p.kind == "const" and overrides and p.name in overrides:
+                table[p.name] = overrides[p.name]
+            elif p.kind == "const" and p.default is not MISSING:
                 table[p.name] = p.default.folded() if isinstance(p.default, DimExpr) else p.default
             elif p.kind == "dim":
                 table[p.name] = p.dim
@@ -909,11 +1097,11 @@ class ExternOp(Op):
                 table.update({k: v.folded() for k, v in named.items()})  # a static Dim is its value
         return table
 
-    def _eval_grid(self, grid: Any) -> "tuple[DimExpr, ...] | None":
+    def _eval_grid(self, grid: Any, overrides: "Mapping[str, Any] | None" = None) -> "tuple[DimExpr, ...] | None":
         if grid is None:
             return None
         if callable(grid):
-            table = self._grid_names()
+            table = self._grid_names(overrides)
             kwargs = {}
             for pname, gp in inspect.signature(grid).parameters.items():
                 if gp.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
@@ -928,7 +1116,8 @@ class ExternOp(Op):
                         f"signature (available: {', '.join(sorted(table)) or 'none'})"
                     )
             try:
-                grid = grid(**kwargs)
+                with products():  # a grid may multiply two dimensions (cdiv(T * C, 1024)): a host computes it, it never solves it
+                    grid = grid(**kwargs)
             except TilefishError as e:
                 raise TilefishDeclarationError(f"extern '{self.name}': the grid callable failed: {e}") from None
         if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3:
@@ -978,6 +1167,12 @@ class Implementation:
     fp_fusion: "bool | None"
     grid: Any
     consts: "dict[str, Any]"
+    # how it is launched besides its grid: a persistent grid, the CTAs of a program, its global scratch, a configuration per bucket (each None
+    # or 0 when the implementation does not say: the op's persistent= applies, one CTA, no scratch, one configuration)
+    persistent: "Persistent | None" = None
+    num_ctas: int = 1
+    global_scratch: int = 0
+    by_bucket: Any = None
 
     @property
     def ref(self) -> str:
@@ -1005,6 +1200,10 @@ def impl(
     enable_fp_fusion: "bool | None" = None,
     grid: Any = None,
     consts: "dict[str, Any] | None" = None,
+    persistent: "Persistent | None" = None,
+    num_ctas: int = 1,
+    global_scratch: int = 0,
+    by_bucket: Any = None,
 ) -> Implementation:
     """One implementation of an op with an implementation per architecture: ``@tilefish.extern(by_arch={"sm_103": tilefish.impl(triton=k_a,
     num_warps=8), "sm_120": tilefish.impl(triton=k_b)}, grid=...)``.
@@ -1012,7 +1211,8 @@ def impl(
     ``triton=`` (a ``triton.jit`` kernel) or ``gluon=`` (a Gluon kernel), a kernel object or a ``"module:function"`` string, as for
     :func:`extern`; ``num_warps``, ``num_stages`` and ``enable_fp_fusion`` are its compile options; ``grid`` its launch grid when it is not the
     op's (a callable over the names of the stub, or a tuple); ``consts`` other values for const parameters of the stub (``{"BLOCK": 64}``), which
-    are compiled in. The kernel takes the stub's parameters, in order, as the kernel of any extern does.
+    are compiled in. ``persistent``, ``num_ctas``, ``global_scratch`` and ``by_bucket`` are those of :func:`extern`, for this implementation (``persistent=None``
+    takes the op's). The kernel takes the stub's parameters, in order, as the kernel of any extern does.
     """
     given = [k for k, v in (("triton", triton), ("gluon", gluon)) if v is not None]
     if len(given) != 1:
@@ -1026,7 +1226,7 @@ def impl(
         consts = {}
     if not isinstance(consts, dict) or not all(isinstance(k, str) for k in consts):
         raise TilefishDeclarationError(f"tilefish.impl: consts= maps const parameter names to values ({{'BLOCK': 64}}), got {consts!r}")
-    return Implementation(target, language, num_warps, num_stages, enable_fp_fusion, grid, dict(consts))
+    return Implementation(target, language, num_warps, num_stages, enable_fp_fusion, grid, dict(consts), persistent, num_ctas, global_scratch, by_bucket)
 
 
 def _label(key: str) -> str:
@@ -1071,6 +1271,12 @@ def _check_implementations(nm: str, impls: "dict[str, ExternOp]") -> None:
         except TilefishError as e:
             raise TilefishDeclarationError(f"extern op '{nm}': the implementation for {_label(key)}: {e}") from None
         found[key] = {s.stem: {k: v for k, v in spec_entry(s).items() if k in _SHARED_BY_IMPLEMENTATIONS} for s in specs}
+    scratch = {key: op.global_scratch > 0 for key, op in impls.items()}
+    if len(set(scratch.values())) > 1:  # a plan of the op is one document for every architecture: its steps have the workspace, or none has
+        raise TilefishDeclarationError(
+            f"extern op '{nm}': the implementations for {', '.join(_label(k) for k, v in scratch.items() if v)} have a global scratch and the ones for "
+            f"{', '.join(_label(k) for k, v in scratch.items() if not v)} do not: every implementation has one (of any size), or none has"
+        )
     (first_key, first), *rest = found.items()
     for key, got in rest:
         if list(got) != list(first):
@@ -1090,10 +1296,10 @@ def _check_implementations(nm: str, impls: "dict[str, ExternOp]") -> None:
 
 
 def _extern_by_arch(
-    by_arch: Any, fallback: Any, grid: Any, name: "str | None", index_bits: int, reference: Any, others: "dict[str, Any]"
+    by_arch: Any, fallback: Any, grid: Any, name: "str | None", index_bits: int, reference: Any, others: "dict[str, Any]", persistent: Any = None
 ) -> Callable[[Callable[..., Any]], ExternOp]:
-    """``@tilefish.extern(by_arch={...}, fallback=..., grid=...)``: one op, one typed signature, an implementation per architecture."""
-    misplaced = [k for k, v in others.items() if v is not None and v is not _UNSET and not (k == "shared" and v == 0)]
+    """``@tilefish.extern(by_arch={...}, fallback=..., grid=..., persistent=...)``: one op, one typed signature, an implementation per architecture."""
+    misplaced = [k for k, v in others.items() if v is not None and v is not _UNSET and not (k in ("shared", "global_scratch") and v == 0)]
     if misplaced:
         raise TilefishDeclarationError(
             f"extern: with by_arch= each implementation names its kernel and its compile options (tilefish.impl(triton=..., num_warps=...)), "
@@ -1138,6 +1344,10 @@ def _extern_by_arch(
                     reference=reference,
                     language=im.language,
                     implementation=key,
+                    persistent=im.persistent if im.persistent is not None else persistent,
+                    num_ctas=im.num_ctas,
+                    global_scratch=im.global_scratch,
+                    by_bucket=im.by_bucket,
                 )
             except TilefishDeclarationError as e:  # its grid, under its constexpr values
                 raise TilefishDeclarationError(f"extern op '{nm}': the implementation for {_label(key)}: {e}") from None
@@ -1157,7 +1367,8 @@ class BinaryTarget:
     ``sources`` holds the bytes of the file(s) as they were when the operator was declared (the identity of the binary is the sha256 of
     those bytes, ``source_digest`` of kind ``"tilefish.binary.v1"``): ``{"ptx": ...}`` for PTX, ``{"sm_103": ...}`` per architecture
     for cubins. ``symbol`` is the kernel's entry point, ``block`` its thread block and ``shared`` its dynamic shared memory in bytes
-    (a prebuilt kernel's ABI says no more than its C parameters, so the declaration says the rest).
+    (a prebuilt kernel's ABI says no more than its C parameters, so the declaration says the rest). ``cluster`` is the thread-block cluster a launch
+    groups its blocks in (``(1, 1, 1)``: none; the grid then counts clusters, and a launch has ``grid * cluster`` blocks).
     """
 
     kind: str  # "ptx" | "cubin"
@@ -1165,6 +1376,7 @@ class BinaryTarget:
     block: "tuple[int, int, int]"
     shared: int
     sources: "dict[str, bytes]"
+    cluster: "tuple[int, int, int]" = (1, 1, 1)
 
     @property
     def digests(self) -> "dict[str, str]":
@@ -1204,8 +1416,21 @@ def _block_of(block: Any) -> "tuple[int, int, int]":
     return padded  # type: ignore[return-value]
 
 
+def _cluster_of(cluster: Any) -> "tuple[int, int, int]":
+    if cluster is None:
+        return (1, 1, 1)
+    if not isinstance(cluster, (tuple, list)) or not 1 <= len(cluster) <= 3 or any(isinstance(c, bool) or not isinstance(c, int) for c in cluster):
+        raise TilefishDeclarationError(f"extern: cluster must be a tuple of 1 to 3 ints (blocks per cluster along x, y, z), got {cluster!r}")
+    padded = tuple(cluster) + (1,) * (3 - len(cluster))
+    if any(c < 1 for c in padded) or math.prod(padded) > MAX_CLUSTER:
+        raise TilefishDeclarationError(
+            f"extern: cluster {tuple(cluster)} must have sizes of at least 1 and at most {MAX_CLUSTER} blocks in all (the portable cluster size)"
+        )
+    return padded  # type: ignore[return-value]
+
+
 def _binary_target(
-    kind: str, files: Any, symbol: Any, block: Any, shared: Any, base: "pathlib.Path | None", where: str
+    kind: str, files: Any, symbol: Any, block: Any, shared: Any, base: "pathlib.Path | None", where: str, cluster: Any = None
 ) -> BinaryTarget:
     if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
         raise TilefishDeclarationError(f"extern: symbol= names the kernel's entry point (a PTX/ELF symbol), got {symbol!r}")
@@ -1221,7 +1446,7 @@ def _binary_target(
             if not isinstance(arch, str) or not _ARCH_NAME.fullmatch(arch):
                 raise TilefishDeclarationError(f"extern: cubin= keys are architectures such as 'sm_103', got {arch!r}")
             sources[arch] = _read_binary_file(f"cubin[{arch!r}]", where, path, base)
-    return BinaryTarget(kind, symbol, _block_of(block), shared, sources)
+    return BinaryTarget(kind, symbol, _block_of(block), shared, sources, _cluster_of(cluster))
 
 
 def extern(
@@ -1242,6 +1467,11 @@ def extern(
     enable_fp_fusion: "bool | None" = None,
     by_arch: Any = None,
     fallback: Any = None,
+    persistent: "Persistent | None" = None,
+    num_ctas: Any = _UNSET,
+    cluster: Any = None,
+    global_scratch: int = 0,
+    by_bucket: Any = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
 
@@ -1330,6 +1560,25 @@ def extern(
     ``y``, ``n_elem``); arguments after the ``*`` are passed by keyword at call
     sites. When ``triton`` is a kernel object that exposes ``arg_names`` (and
     ``params[i].is_constexpr``), the stub is checked against it.
+
+    **Launch shapes** (manifest schema 3, sections 4.3 to 4.6):
+
+    * **A grid may multiply dimensions**: ``grid=lambda T, C: (tilefish.cdiv(T * C, 1024),)`` is one program per 1024 elements of a ``[T, C]`` tensor,
+      whatever ``T`` and ``C`` are. A host computes a grid; it never solves one, so a product is fine there (a shape stays affine).
+    * ``persistent=tilefish.persistent(programs_per_sm=1)``: the grid (one entry) is the number of tiles, and the host launches at most
+      ``programs_per_sm`` programs per SM of the device (or partition) it loads the binary on, so one binary serves every device shape; the kernel
+      walks the tiles with a stride of ``tl.num_programs(0)``. Its bytes must not depend on how many programs run, unless it says so with
+      ``sm_count=`` (see :class:`Persistent`).
+    * ``num_ctas=2`` (Triton's compile option, 1, 2, 4 or 8): a program is a thread-block cluster of that many CTAs, launched with
+      ``cuLaunchKernelEx`` (the grid counts programs: a launch has ``grid * num_ctas`` CTAs along x). A prebuilt binary declares ``cluster=(x, y, z)``
+      instead: its grid counts clusters, and a launch has ``grid * cluster`` blocks.
+    * ``global_scratch=256``: the bytes of global scratch each CTA of the compiled kernel addresses (Triton's ``global_scratch_size``: device-side TMA
+      descriptors, ``tl.make_tensor_descriptor``, write theirs there). The build checks it against Triton's metadata; a host gives every launch
+      ``global_scratch * CTAs`` bytes (a plan from its arena).
+    * ``by_bucket=lambda T: tilefish.config(num_warps=8, BLOCK=128) if T > 256 else tilefish.config(num_warps=2, BLOCK=32)``: one compile-time
+      configuration per bucket of the dimensions the callable names (each a ``Dim(..., buckets=[...])`` of the signature): the warps, stages and
+      CTAs of that bucket's binary and the values of const parameters compiled into it (tile sizes), the grid evaluated with them. Each binary is
+      built, keyed and digested with its own configuration; the declaration digest covers the configuration of every bucket.
     """
     if by_arch is not None or fallback is not None:
         if args:
@@ -1338,9 +1587,10 @@ def extern(
             raise TilefishDeclarationError("extern: fallback= is the implementation of an op declared with by_arch= for the architectures it does not name")
         others = dict(
             triton=triton, gluon=gluon, ptx=ptx, cubin=cubin, symbol=symbol, block=block, shared=shared, num_warps=num_warps,
-            num_stages=num_stages, enable_fp_fusion=enable_fp_fusion,
+            num_stages=num_stages, enable_fp_fusion=enable_fp_fusion, num_ctas=num_ctas, cluster=cluster, global_scratch=global_scratch,
+            by_bucket=by_bucket,
         )  # fmt: skip
-        return _extern_by_arch(by_arch, fallback, grid, name, index_bits, reference, others)
+        return _extern_by_arch(by_arch, fallback, grid, name, index_bits, reference, others, persistent)
     given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin)) if v is not None]
     if args or not given:
         raise TilefishDeclarationError(
@@ -1354,9 +1604,12 @@ def extern(
     if enable_fp_fusion is not None and not isinstance(enable_fp_fusion, bool):
         raise TilefishDeclarationError(f"extern: enable_fp_fusion must be True, False or None (Triton's default), got {enable_fp_fusion!r}")
     if prebuilt:
-        for key, value in (("num_warps", num_warps), ("num_stages", num_stages)):
+        for key, value in (("num_warps", num_warps), ("num_stages", num_stages), ("num_ctas", num_ctas)):
             if value is not _UNSET:
-                raise TilefishDeclarationError(f"extern: {key}= is a Triton compile option; a prebuilt binary has its block= (and nothing is compiled)")
+                raise TilefishDeclarationError(
+                    f"extern: {key}= is a Triton compile option; a prebuilt binary has its block= and cluster= (and nothing is compiled)"
+                )
+        num_ctas = 1
         if enable_fp_fusion is not None:
             raise TilefishDeclarationError(
                 "extern: enable_fp_fusion= is a Triton compile option; a prebuilt binary is not compiled by Triton (its PTX says how each "
@@ -1372,6 +1625,9 @@ def extern(
                 raise TilefishDeclarationError(f"extern: {key}= is for a prebuilt binary (ptx= or cubin=), not for a {language.title()} kernel")
         if shared != 0:
             raise TilefishDeclarationError("extern: shared= is for a prebuilt binary; Triton records the shared memory of the kernel it compiles")
+        if cluster is not None:
+            raise TilefishDeclarationError("extern: cluster= is the thread-block cluster of a prebuilt binary; a Triton or Gluon kernel says num_ctas=")
+        num_ctas = 1 if num_ctas is _UNSET else num_ctas
         target = _triton_target(gluon if gluon is not None else triton, language)
         num_warps = 4 if num_warps is _UNSET else num_warps
         num_stages = 3 if num_stages is _UNSET else num_stages
@@ -1401,7 +1657,7 @@ def extern(
             base = pathlib.Path(fn.__code__.co_filename).resolve().parent if getattr(fn, "__code__", None) is not None else None
             if base is not None and not base.is_dir():
                 base = None
-            binary = _binary_target("ptx" if ptx is not None else "cubin", ptx if ptx is not None else cubin, symbol, block, shared, base, nm)
+            binary = _binary_target("ptx" if ptx is not None else "cubin", ptx if ptx is not None else cubin, symbol, block, shared, base, nm, cluster)
         else:
             assert target is not None
             _check_against_kernel(nm, sig, target)
@@ -1419,6 +1675,10 @@ def extern(
             binary=binary,
             reference=reference,
             language=language,
+            persistent=persistent,
+            num_ctas=num_ctas,
+            global_scratch=global_scratch,
+            by_bucket=by_bucket,
         )
 
     return deco

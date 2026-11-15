@@ -216,11 +216,13 @@ def test_write_cubin(tmp_path):
 @pytest.mark.parametrize(
     "launch, text",
     [
-        (LaunchAttributes(64, 0, False, (1, 1, 1), 1, False), "global_scratch_size=64"),
+        (LaunchAttributes(64, 0, False, (1, 1, 1), 1, False), "global_scratch_size=64 of an alignment the manifest does not record"),
+        (LaunchAttributes(64, 0, False, (1, 1, 1), 1, False, 512), "global_scratch_size=64 aligned to 512 bytes"),
         (LaunchAttributes(0, 8, False, (1, 1, 1), 1, False), "profile_scratch_size=8"),
         (LaunchAttributes(0, 0, True, (1, 1, 1), 1, False), "launch_pdl=True"),
-        (LaunchAttributes(0, 0, False, (2, 1, 1), 2, False), "cluster_dims=(2, 1, 1)"),
+        (LaunchAttributes(0, 0, False, (4, 1, 1), 2, False), "cluster_dims=(4, 1, 1)"),
         (LaunchAttributes(0, 0, False, (1, 1, 1), 2, False), "num_ctas=2"),
+        (LaunchAttributes(0, 0, False, (16, 1, 1), 16, False), "num_ctas=16"),
         (LaunchAttributes(0, 0, False, (1, 1, 1), 1, True), "launch_cooperative_grid=True"),
     ],
 )
@@ -233,7 +235,7 @@ def test_replay_refuses_what_it_does_not_set_up(launch, text):
 
 def test_replay_names_every_blocker_at_once():
     (spec,) = compile_specs(scale)
-    launch = LaunchAttributes(16, 8, True, (2, 1, 1), 2, True)
+    launch = LaunchAttributes(16, 8, True, (4, 1, 1), 2, True)
     assert len(launch.replay_blockers()) == 5
     with pytest.raises(TilefishRuntimeError) as e:
         _cuda.refuse_unsupported(fake_build(spec, launch=launch))
@@ -245,6 +247,26 @@ def test_a_plain_binary_is_accepted():
     (spec,) = compile_specs(scale)
     assert LaunchAttributes(0, 0, False, (1, 1, 1), 1, False).replay_blockers() == []
     _cuda.refuse_unsupported(fake_build(spec))
+
+
+def test_a_cluster_of_num_ctas_and_an_aligned_global_scratch_are_launched():
+    # a cluster of num_ctas CTAs (cuLaunchKernelEx) and a global scratch whose alignment divides the 256 bytes every scratch a host gives starts on
+    for launch in (
+        LaunchAttributes(0, 0, False, (2, 1, 1), 2, False),
+        LaunchAttributes(0, 0, False, (2, 2, 2), 8, False),
+        LaunchAttributes(256, 0, False, (1, 1, 1), 1, False, 128),
+        LaunchAttributes(128, 0, False, (4, 1, 1), 4, False, 256),
+    ):
+        assert launch.replay_blockers() == [], launch
+    # what a launch is given: the grid of blocks is the program grid times the cluster, and the scratch is size * programs * CTAs per program
+    launch = LaunchAttributes(256, 0, False, (2, 1, 1), 2, False, 128)
+    assert launch.cuda_grid((3,)) == (6, 1, 1) and launch.cuda_grid((3, 5, 7)) == (6, 5, 7)
+    assert launch.scratch_bytes((3, 5)) == 256 * 15 * 2
+    assert LaunchAttributes(0, 0, False, (1, 1, 1), 1, False).cuda_grid((9, 2)) == (9, 2, 1)
+    # the manifest records the alignment with a scratch only: every other launch is the six fields it always was
+    assert "global_scratch_align" not in LaunchAttributes(0, 0, False, (1, 1, 1), 1, False, 1).to_dict()
+    assert LaunchAttributes(256, 0, False, (1, 1, 1), 1, False, 128).to_dict()["global_scratch_align"] == 128
+    assert LaunchAttributes.from_dict(LaunchAttributes(256, 0, False, (1, 1, 1), 1, False, 128).to_dict()).global_scratch_align == 128
 
 
 def test_built_kernels_are_frozen():
