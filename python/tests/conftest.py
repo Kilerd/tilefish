@@ -40,6 +40,9 @@ def _isolated_build_cache(tmp_path_factory, monkeypatch):
 def pytest_configure(config):
     # also registered in pyproject.toml; repeated here for a run from the repository root, which has no ini file
     config.addinivalue_line("markers", "gpu: needs a CUDA device with torch, triton and cuda-python; skipped automatically when any is missing")
+    config.addinivalue_line(
+        "markers", "cuda_math: the exhaustive comparisons with CUDA's math library, to run again on a CUDA or torch change (docs/numerics.md)"
+    )
 
 
 def pytest_collection_modifyitems(config, items):

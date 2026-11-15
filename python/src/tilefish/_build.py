@@ -13,6 +13,7 @@ Triton is imported inside the functions that need it, so ``import tilefish`` nev
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import importlib
 import json
@@ -449,6 +450,9 @@ class BuiltKernel:
     binary_build: "dict[str, Any] | None" = None
     # a warp-specialised kernel: its partitions add warps to the declared num_warps (its default partition's), and ``num_warps`` is their total
     warp_specialized: bool = False
+    # a generated kernel whose ops are the bits of CUDA math library functions, or that links libdevice: the ``cuda_math`` of its manifest entry
+    # (:mod:`tilefish._cudamath`: the functions, the CUDA releases they were measured on, the sha256 of the libdevice linked); ``None`` otherwise
+    cuda_math: "dict[str, Any] | None" = None
 
     @property
     def stem(self) -> str:
@@ -731,6 +735,24 @@ def _check_generated(jit: Any, spec: "CompileSpec") -> None:
     _source.check_imported_lines(_source.jit_function(jit))
 
 
+def _generated_cuda_math(jit: Any, spec: "CompileSpec", options: "Mapping[str, Any]") -> "dict[str, Any] | None":
+    """The ``cuda_math`` of a generated kernel's entry (:mod:`tilefish._cudamath`), from the header line of its source (which
+    :func:`_check_generated` has checked is the spec's) and the libdevice Triton links for ``options``; ``None`` for a hand-written kernel."""
+    if spec.source_sha256 is None:
+        return None
+    from . import _cudamath
+
+    path = _source.function_file(jit)
+    if path is None:  # pragma: no cover - _check_generated refuses it first
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+    except OSError as e:
+        raise TilefishBuildError(f"cannot read {path!r}, the source of '{spec.triton}': {e}") from e
+    return _cudamath.entry_field(source, options)
+
+
 def _refuse_unidentified(triton: Any, spec: "CompileSpec") -> None:
     """Refuse a process state in which Triton does not compile the IR that identifies the binary.
 
@@ -836,6 +858,7 @@ def build(
     _check_generated(jit, spec)
     _refuse_unidentified(triton, spec)
     opts: dict[str, Any] = {**inp.options, **dict(options or {})}
+    cuda_math = _generated_cuda_math(jit, spec, opts)
     from . import _cache
 
     files = _cache.compile_files(opts)  # refuses ir_override; the sha256 of the files the options name (extern_libs)
@@ -868,7 +891,7 @@ def build(
         hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
             check_tf32(spec, cap, frontend_ir, hit.ptx, triton_version)  # an entry has its PTX only, which the build that stored it was judged by too
-            return hit
+            return dataclasses.replace(hit, cuda_math=cuda_math)  # (read from the source and the libdevice here, not from the cache)
 
     from triton.backends.compiler import GPUTarget
 
@@ -940,6 +963,7 @@ def build(
         launch=_launch_attributes(md),
         ir_digest=digest,
         warp_specialized=warp_specialized,
+        cuda_math=cuda_math,
     )
     if store is not None:
         store.store(cache_id, built)
@@ -1043,6 +1067,8 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         entry["binary"] = json.loads(json.dumps(b.binary_build))
     if "source_sha256" in spec_part:
         entry["source_sha256"] = spec_part["source_sha256"]
+    if b.cuda_math is not None:  # the CUDA math functions whose bits the binary has, and the libdevice it links (section 4.3, tilefish._cudamath)
+        entry["cuda_math"] = json.loads(json.dumps(b.cuda_math))
     if b.ir_digest is not None:  # the digest of the Triton IR the binary was compiled from (the field and its kind, so a reader of schema 2 reads it as before)
         entry["source_digest"] = b.ir_digest
         entry["source_digest_kind"] = _ir.digest_kind(b.spec.language)  # the TTIR of a triton.jit kernel, the TTGIR of a Gluon one

@@ -22,7 +22,10 @@ dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["gpu: needs a CUDA device with torch, triton and cuda-python; skipped automatically when any is missing"]
+markers = [
+    "gpu: needs a CUDA device with torch, triton and cuda-python; skipped automatically when any is missing",
+    "cuda_math: the exhaustive comparisons with CUDA's math library, to run again on a CUDA or torch change (docs/numerics.md)",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14"]

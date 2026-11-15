@@ -19,6 +19,18 @@ each section names the release that added it.
 - `num_warps` stays part of every kernel's identity; the contract now says which ops depend on it (Triton's own reductions) and which do not
   (per-element ops, `argmax` / `argmin`, ordered sums), measured.
 
+### The CUDA math guard (manifest schema 3, section 4.3; `docs/numerics.md`)
+
+- The manifest entry of a generated kernel whose ops copy a CUDA math library function (`expf`, `rsqrtf`, `erff` in IEEE math; `sinf`, `cosf`,
+  `tanhf` from libdevice) or that links libdevice has `cuda_math`: the functions, the CUDA releases tilefish measured each on over every f32
+  (12.8 to 13.2, `erff` 12.8 to 13.1), and the sha256 of the libdevice. Optional and additive: an entry without it reads as before, and no
+  generated source or source digest changes.
+- `jit`, `replay` and `reference` warn with `tilefish.TilefishCudaMathWarning` where torch is built with a release the functions were not measured on,
+  or where a replay's process would link another libdevice. Rust: `Entry::cuda_math` (`CudaMath`) and `Manifest::check_cuda_math(release)`.
+- `pytest -m cuda_math` runs the exhaustive comparisons with CUDA's math library again; `TILEFISH_NVRTC_PATHS` adds the NVRTC of more releases
+  to the table's check. `docs/numerics.md` is the procedure on a CUDA or torch change, the `num_warps` decision, and a design for device-global
+  state (counters), which waits for a memset step in plans.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

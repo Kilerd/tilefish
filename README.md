@@ -628,6 +628,11 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   libdevice's, `gelu`'s); `tilefish.sin_approx(x)` is `__sinf` (`sin.approx.f32`), `tilefish.rcp(x)` `__frcp_rn` (`rcp.rn.f32`),
   `tilefish.fma(a, b, c)` `fmaf` (one rounding, whatever `fp_fusion` says), and `-x` (`tilefish.neg`) is CUDA's negation, `-0.0` for `+0.0`
   where Triton's `-x` is `0 - x`. Each is the bits of the CUDA C++ function on every f32, measured against NVRTC on the GPU (notes 15 and 16).
+- **The CUDA math guard.** `expf`, `erff`, `tanhf` and the other functions those ops copy are not the same in every CUDA release (CUDA 13.2
+  changed `erff`). The manifest entry of a generated kernel records the functions it uses, the releases tilefish measured each on, and the
+  libdevice it linked (`cuda_math`); a run warns (`TilefishCudaMathWarning`) where torch is built with another release or a replay's process would
+  link another libdevice, and the Rust host refuses a release with `Manifest::check_cuda_math`. `docs/numerics.md` has the table and the procedure
+  to run on a CUDA or torch change (`pytest -m cuda_math`).
 - **Ordered sums.** `tilefish.sum(x, axis=-1, order=...)` adds in the order a CUDA kernel does: `order="sequential"` is one thread's loop from
   `+0.0`, `tilefish.tree(256)` is 256 threads over strided columns and a shared-memory halving tree, and
   `tilefish.tree(128, offsets=(16, 8, 4, 2, 1, 64, 32), vector=8)` is 128 threads of 8 consecutive columns, a warp-shuffle tree and then the

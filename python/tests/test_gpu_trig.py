@@ -7,7 +7,7 @@ A rotary table (an angle per position and frequency, its cosine and sine in bf16
 
 import pytest
 
-pytestmark = pytest.mark.gpu
+pytestmark = [pytest.mark.gpu, pytest.mark.cuda_math]  # the exhaustive comparisons with CUDA's math library: docs/numerics.md
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")

@@ -646,6 +646,14 @@ class Manifest:
         _check_identity(who, entry)
         _check_params(who, entry, entry_kind)
         _check_warps(who, entry, entry_kind)
+        if entry.get("cuda_math") is not None:  # section 4.3: the CUDA math functions of a generated kernel, and its libdevice
+            from ._cudamath import check_field
+
+            problem = check_field(who, entry["cuda_math"])
+            if problem is None and (entry_kind != ENTRY_KIND_TRITON or entry.get("source_sha256") is None):
+                problem = f"{who}: cuda_math is only on the entry of a kernel tilefish generated (a triton entry with a source_sha256)"
+            if problem is not None:
+                raise TilefishManifestError(problem)
         if entry_kind == ENTRY_KIND_BINARY:
             extra = [k for k in ("options", "num_warps", "num_stages") if k in entry]
             if extra:
@@ -851,6 +859,7 @@ class Manifest:
                 binary_digest=entry.get("source_digest") if entry.get("source_digest_kind") == BINARY_DIGEST_KIND else None,
                 binary_build=dict(entry["binary"]) if spec.binary is not None else None,
                 warp_specialized=total is not None,
+                cuda_math=entry.get("cuda_math"),
             )
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             raise TilefishManifestError(f"'{spec.stem}' ({arch}): the manifest entry is malformed: {type(e).__name__}: {e}") from e

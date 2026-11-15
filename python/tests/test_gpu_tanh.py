@@ -7,7 +7,7 @@ byte for byte. A bias and a tanh of a bf16 activation (the row template) match t
 
 import pytest
 
-pytestmark = pytest.mark.gpu
+pytestmark = [pytest.mark.gpu, pytest.mark.cuda_math]  # the exhaustive comparisons with CUDA's math library: docs/numerics.md
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
