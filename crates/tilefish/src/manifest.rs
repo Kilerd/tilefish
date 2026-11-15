@@ -563,6 +563,21 @@ pub enum BinarySource {
     },
 }
 
+/// The CUDA math library functions a generated kernel's bits are (`docs/manifest-schema-3.md` section 4.3, `docs/numerics.md`): in IEEE math
+/// `exp` and `silu` are built on `expf`, `rsqrt` is `rsqrtf` and `erf` `erff`, and `sin`, `cos` and `tanh` are libdevice's `sinf`, `cosf` and
+/// `tanhf`. Those functions are not the same in every CUDA release (13.2 changed `erff`), so the entry records which it uses and the releases
+/// tilefish measured each on; [`Manifest::check_cuda_math`] refuses a manifest whose functions were not measured on a host's release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaMath {
+    /// The functions (`["erff", "tanhf"]`), sorted; empty for a kernel that only links libdevice (`gelu`'s `erf`).
+    pub functions: Vec<String>,
+    /// The CUDA releases on which every listed function, compiled by that release's NVRTC with nvcc's defaults, is the kernel's bits on every
+    /// f32 (`["12.8", "12.9", "13.0", "13.1"]`), sorted by release.
+    pub cuda: Vec<String>,
+    /// The sha256 of the libdevice the kernel was linked with, when it calls a libdevice function.
+    pub libdevice: Option<String>,
+}
+
 /// One binary of a manifest: its entry, and its cubin whose digests have been checked.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -630,6 +645,8 @@ pub struct Entry {
     pub binary: Option<BinarySource>,
     /// The sha256 of the Triton source of a generated kernel.
     pub source_sha256: Option<String>,
+    /// The CUDA math library functions a generated kernel's bits are, the releases they were measured on, and its libdevice (section 4.3).
+    pub cuda_math: Option<CudaMath>,
     /// The identity of what was built: the digest of the Triton IR (TTIR without locations) the binary was built from, for generated and
     /// hand-written kernels alike (the TTGIR of Gluon's frontend for a Gluon kernel; Python recomputes it to tell a stale binary; a Rust
     /// host has no Triton and trusts it through the pinned manifest digest), or, for a prebuilt binary, the sha256 of its PTX or cubin file.
@@ -772,6 +789,7 @@ by_name! {
     RawConstexpr => RawConstexpr::deserialize, "an entry of constexprs";
     RawOptions => RawOptions::deserialize, "options";
     RawToolchain => RawToolchain::deserialize, "toolchain";
+    RawCudaMath => RawCudaMath::deserialize, "cuda_math";
 }
 
 #[derive(Deserialize)]
@@ -823,9 +841,20 @@ struct RawEntry {
     #[serde(default)]
     source_sha256: Option<String>,
     #[serde(default)]
+    cuda_math: Option<RawCudaMath>,
+    #[serde(default)]
     source_digest: Option<String>,
     #[serde(default)]
     source_digest_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct RawCudaMath {
+    functions: Vec<String>,
+    cuda: Vec<String>,
+    #[serde(default)]
+    libdevice: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1699,6 +1728,51 @@ fn read_binary(v: &Value) -> std::result::Result<BinarySource, String> {
     }
 }
 
+/// A CUDA release as `cuda_math` writes it (`"13.0"`): two decimal numbers without leading zeros, and their value.
+fn cuda_release(s: &str) -> Option<(u64, u64)> {
+    let (major, minor) = s.split_once('.')?;
+    let number = |p: &str| {
+        (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && (p == "0" || !p.starts_with('0')))
+            .then(|| p.parse().ok())
+            .flatten()
+    };
+    Some((number(major)?, number(minor)?))
+}
+
+/// The rules of section 4.3 that Python's `_cudamath.check_field` holds too.
+fn check_cuda_math(math: &RawCudaMath) -> std::result::Result<(), String> {
+    let name_ok = |f: &String| {
+        let mut chars = f.chars();
+        chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    };
+    if !math.functions.iter().all(name_ok) {
+        return Err(format!("cuda_math.functions must be a list of function names, got {:?}", math.functions));
+    }
+    if !math.functions.windows(2).all(|w| w[0] < w[1]) {
+        return Err(format!("cuda_math.functions must be sorted, each once, got {:?}", math.functions));
+    }
+    let releases = math.cuda.iter().map(|r| cuda_release(r)).collect::<Option<Vec<_>>>();
+    let Some(releases) = releases else {
+        return Err(format!("cuda_math.cuda must be a list of CUDA releases such as \"13.0\", got {:?}", math.cuda));
+    };
+    if !releases.windows(2).all(|w| w[0] < w[1]) {
+        return Err(format!("cuda_math.cuda must be sorted by release, each once, got {:?}", math.cuda));
+    }
+    if math.functions.is_empty() && !math.cuda.is_empty() {
+        return Err(format!("cuda_math.cuda lists releases {:?} for no function", math.cuda));
+    }
+    if let Some(sha) = math.libdevice.as_ref().filter(|d| !is_digest(d)) {
+        return Err(format!("cuda_math.libdevice must be a sha256 (64 lowercase hex digits), got {sha:?}"));
+    }
+    if math.functions.is_empty() && math.libdevice.is_none() {
+        return Err(
+            "cuda_math names no function and no libdevice (an entry without either has no cuda_math)".to_owned()
+        );
+    }
+    Ok(())
+}
+
 fn entry_kind(raw: &RawEntry) -> std::result::Result<EntryKind, String> {
     match raw.kind.as_str() {
         "triton" => Ok(EntryKind::Triton),
@@ -1760,6 +1834,7 @@ impl Entry {
             ptxas: raw.toolchain.ptxas,
             binary,
             source_sha256: raw.source_sha256,
+            cuda_math: raw.cuda_math.map(|c| CudaMath { functions: c.functions, cuda: c.cuda, libdevice: c.libdevice }),
             source_digest: raw.source_digest,
             source_digest_kind: raw.source_digest_kind,
             cubin,
@@ -1813,6 +1888,12 @@ impl Entry {
                  with by_arch= that it is), on a triton entry, got {chosen:?}",
                 raw.arch
             ));
+        }
+        if let Some(math) = &raw.cuda_math {
+            check_cuda_math(math)?;
+            if kind != EntryKind::Triton || raw.source_sha256.is_none() {
+                return Err("cuda_math is only on the entry of a kernel tilefish generated (a triton entry with a source_sha256)".to_owned());
+            }
         }
         match kind {
             EntryKind::Triton => {
@@ -2553,6 +2634,34 @@ impl Manifest {
     /// The library operation of `stem` for `arch` (`"sm_103"`).
     pub fn library_entry(&self, stem: &str, arch: &str) -> Option<&LibraryEntry> {
         self.library.iter().find(|e| e.stem == stem && e.arch == arch)
+    }
+
+    /// Refuse a manifest whose generated kernels' CUDA math functions (section 4.3) were not measured on the CUDA release `cuda` (`"13.0"`): the
+    /// release whose math library the rest of the host (its other CUDA kernels, the framework it is compared with) is built with. Such a
+    /// binary still computes what it was exported with, but its `erff`, `tanhf`, ... may not be the host's bits; the error names each entry
+    /// and the releases its functions were measured on. Entries without functions (or without `cuda_math`) pass.
+    pub fn check_cuda_math(&self, cuda: &str) -> Result<()> {
+        if cuda_release(cuda).is_none() {
+            return Err(Error::manifest(format!("check_cuda_math: a CUDA release looks like \"13.0\", got {cuda:?}")));
+        }
+        let off: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|e| e.cuda_math.as_ref().map(|m| (e, m)))
+            .filter(|(_, m)| !m.functions.is_empty() && !m.cuda.iter().any(|r| r == cuda))
+            .map(|(e, m)| {
+                format!("'{}' ({}): {} measured on CUDA {:?}", e.stem, e.arch, m.functions.join(", "), m.cuda)
+            })
+            .collect();
+        if off.is_empty() {
+            return Ok(());
+        }
+        Err(Error::manifest(format!(
+            "the manifest in {:?} has kernels whose CUDA math functions were not measured on CUDA {cuda}, so their bits may not be that \
+             release's: {}. Re-run the CUDA math tests on it (docs/numerics.md) and export again",
+            self.label,
+            off.join("; ")
+        )))
     }
 
     /// Refuse unless the digest is `pinned`: what a generated launcher does with the digest of the manifest it was

@@ -106,7 +106,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterator
 
-from . import _cache, _cuda, _ir, _source
+from . import _cache, _cuda, _cudamath, _ir, _source
 from ._build import BuiltKernel, build, check_launch_config, resolve_triton, write_file, write_manifest_doc
 from ._launch import (
     TORCH_DTYPE_NAMES,
@@ -656,6 +656,7 @@ def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKern
         built = build(spec, arch=cap, fn=fn, options=extra, ir_digest=digest)
         with _lock:
             _builds[key] = built
+    _cudamath.check(f"'{spec.stem}' (sm_{cap})", built.cuda_math)  # torch's CUDA release against the one its math was measured on
     return built
 
 
@@ -769,7 +770,10 @@ def replay_built(target: _Target, spec: CompileSpec, manifest: Manifest, pinned:
     if artifact is not None and artifact.entry.get("source_digest_kind") == _ir.digest_kind(spec.language):
         toolchain = artifact.entry.get("toolchain")
         digest, version = _current_ir(SimpleNamespace(target=target, spec=spec), cap, toolchain.get("triton") if isinstance(toolchain, dict) else None)  # type: ignore[arg-type]
-    return manifest.built_kernel(spec, arch, ir_digest=digest, ir_triton=version, pinned=pinned)
+    built = manifest.built_kernel(spec, arch, ir_digest=digest, ir_triton=version, pinned=pinned)
+    if built.cuda_math:  # torch's CUDA release, and the libdevice a build here would link, against the entry's (tilefish._cudamath)
+        _cudamath.check(f"'{spec.stem}' ({arch})", built.cuda_math, libdevice_here=_cudamath.libdevice_sha256(built.options))
+    return built
 
 
 def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
@@ -913,6 +917,7 @@ def _run_reference(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, 
         outs.append(t)
     written = {p.name for p in kernel.signature.params if p.kind == "tensor" and p.access != "in"}
     check_no_alias({n: tensor_info(n, t) for n, t in tensors.items()}, written)
+    _cudamath.check_graph(f"kernel '{kernel.name}'", kernel.graph, getattr(kernel, "math", "fast"))  # torch's ops are the reference's
     returned = interpret(kernel, tensors, call.dims)
     return _result(returned + outs)
 

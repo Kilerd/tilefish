@@ -9,8 +9,9 @@ manifest with the cuBLASLt version. ``jit`` pins in memory the same way, so ``ji
 Checked here: ``jit`` and ``replay`` agree byte for byte; the pinned replay is byte-identical across two processes (and the pin itself is); the
 result is the f64 reference within what one f32 accumulation and one rounding can do; a cuBLASLt of another version is refused; the
 preconditions (contiguous, aligned, an exact bucket) are. How often the result of the default posture is torch's byte for byte is *reported*
-(informational: it is not asserted); a declaration with ``heuristic="torch"`` is torch's (asserted), and one with ``algos=`` runs its table's
-algorithms, a split-K with bf16 partial sums only with ``allow_bf16_reduction=True``, the same in ``jit`` and ``replay``.
+(informational: the default posture is not torch's, and the rate depends on the cuBLASLt version); on the same shapes and operands a declaration
+with ``heuristic="torch"`` is torch's (asserted), and one with ``algos=`` runs its table's algorithms, a split-K with bf16 partial sums only with
+``allow_bf16_reduction=True``, the same in ``jit`` and ``replay``.
 """
 
 import hashlib
@@ -38,16 +39,16 @@ BUCKETS = [32, 64, 320]
 SHAPES = [(1024, 1024), (3072, 1024), (1024, 3072), (4096, 3072), (3072, 4096)]  # (N, K)
 
 
-def make_gemm(name, n, k, bias):
+def make_gemm(name, n, k, bias, **kw):
     M = Dim("M", buckets=BUCKETS)
     if bias:
 
-        @tilefish.library(name, acc=f32, impl="cublaslt.gemm_bias")
+        @tilefish.library(name, acc=f32, impl="cublaslt.gemm_bias", **kw)
         def gemm_bias(a: Tensor[M, k, bf16], b: Tensor[n, k, bf16], bias: Tensor[n, bf16]) -> Tensor[M, n, bf16]: ...
 
         return gemm_bias
 
-    @tilefish.library(name, acc=f32, impl="cublaslt.gemm")
+    @tilefish.library(name, acc=f32, impl="cublaslt.gemm", **kw)
     def gemm(a: Tensor[M, k, bf16], b: Tensor[n, k, bf16]) -> Tensor[M, n, bf16]: ...
 
     return gemm
@@ -267,9 +268,25 @@ def test_the_reference_mode_is_torch_in_f32(ops):
     assert same_bytes(got, (a.float() @ b.float().t() + bias.float()).to(BF16))
 
 
-def test_how_often_the_pinned_result_is_the_result_of_torch_byte_for_byte(ops, exported, capsys):
-    """Informational: nothing here fails on the rate. (The algorithm is cuBLASLt's top heuristic result under the same workspace limit as torch's.)"""
-    rows = {"gemm": [0, 0, 0], "gemm_bias": [0, 0, 0]}
+@pytest.fixture(scope="module")
+def torch_ops():
+    """The GEMMs of ``ops`` under the "torch" posture, with torch's default reduction and torch's workspace limits (the declaration's defaults)."""
+    return {
+        (n, k, bias): make_gemm(f"torch_gemm_{n}_{k}{'_bias' if bias else ''}", n, k, bias, heuristic="torch", allow_bf16_reduction=True)
+        for n, k in SHAPES
+        for bias in (False, True)
+    }
+
+
+def test_how_often_the_pinned_result_is_the_result_of_torch_byte_for_byte(ops, torch_ops, exported, capsys):
+    """The default posture's rate is reported (nothing fails on it); on the same shapes and operands the "torch" posture is torch's (asserted).
+
+    The default posture is not torch's, so how often its result is torch's depends on the cuBLASLt version: it gives a GEMM with a bias no
+    split-K (``_cublaslt.NO_SPLIT_K_MASK``), where ``torch.addmm`` runs whatever the heuristic ranks first. Measured on a B300 MIG slice with torch
+    2.9.1: the default posture's result is ``addmm``'s on all 15 biased shapes here with cuBLASLt 12.8.4, and on 13 with 13.1.0, whose heuristic ranks a
+    split-K of 3 with f32 partial sums first for 32 and 64 x 1024 x 3072 (see the module docstring of ``tilefish._cublaslt``)."""
+    rows = {"gemm": [0, 0, 0, []], "gemm_bias": [0, 0, 0, []]}
+    misses = []
     for (n, k, bias), op in ops.items():
         for m in BUCKETS:
             args = operands(m, n, k, bias, seed=1000 + m)
@@ -281,10 +298,19 @@ def test_how_often_the_pinned_result_is_the_result_of_torch_byte_for_byte(ops, e
                 a = ours.view(torch.int16).to(torch.int64)
                 b = ref.view(torch.int16).to(torch.int64)
                 row[2] = max(row[2], int((a - b).abs().max()))
+                row[3].append(f"{m}x{n}x{k}")
+            if not same_bytes(tilefish.run(torch_ops[(n, k, bias)], *args), ref):
+                misses.append((m, n, k, bias))
     with capsys.disabled():
-        for name, (same, total, ulp) in rows.items():
-            print(f"\n[gemm torch match] {name}: {same} of {total} shapes byte-identical to torch" + (f" (largest bf16 distance {ulp} steps)" if same != total else ""))
+        for name, (same, total, ulp, shapes) in rows.items():
+            print(
+                f"\n[gemm torch match] {name}: {same} of {total} shapes byte-identical to torch"
+                + (f" (largest bf16 distance {ulp} steps; not on {', '.join(shapes)})" if same != total else "")
+            )
+        total = len(ops) * len(BUCKETS)
+        print(f'\n[gemm torch match] heuristic="torch": {total - len(misses)} of {total} shapes byte-identical to torch (asserted)')
     assert sum(r[1] for r in rows.values()) == len(ops) * len(BUCKETS)
+    assert not misses, f'under heuristic="torch" the result is not torch\'s for (m, n, k, bias) in {misses}'
 
 
 # -- the "torch" posture, imported algorithms and bf16 partial sums, through declarations ----------------------------------------------------

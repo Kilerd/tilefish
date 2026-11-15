@@ -394,6 +394,136 @@ def cos(x: Value, *, math: Any = None) -> Value:
     return _unary("cos", x, math)
 
 
+def erf(x: Value, *, math: Any = None) -> Value:
+    """The error function (f32). By default libdevice's ``erff`` as Triton links it (flush to zero; what ``gelu`` uses); with ``math="ieee"``
+    CUDA's ``erff`` without flush to zero, the sequence nvcc emits (the same bits from CUDA 12.8 to 13.1; note 15 of :mod:`tilefish.lower`)."""
+    return _unary("erf", x, math)
+
+
+def sin_approx(x: Value) -> Value:
+    """``sin.approx.f32``: CUDA's ``__sinf``, the hardware's approximate sine, in either math (note 16 of :mod:`tilefish.lower`)."""
+    return _unary("sin_approx", x)
+
+
+def rcp(x: Value) -> Value:
+    """``rcp.rn.f32``: ``1 / x`` correctly rounded, subnormals kept (CUDA's ``__frcp_rn``, and ``1.0f / x`` without fast math), in either
+    math (note 16 of :mod:`tilefish.lower`)."""
+    return _unary("rcp", x)
+
+
+def neg(x: Any) -> Value:
+    """``-x``: CUDA's negation (``neg.f32`` for f32, ``neg.bf16`` / ``neg.f16`` for the half types): the sign of every number flipped, a zero's
+    and an infinity's included (``-(+0.0)`` is ``-0.0``, where Triton's ``-x`` is ``0 - x``, which gives ``+0.0``); a NaN gives the canonical NaN.
+    An integer is negated in two's complement (``0 - x``). Note 16 of :mod:`tilefish.lower`."""
+    x = _require_value("neg (-x)", "argument 'x'", x)
+    _require_computable("neg (-x)", "argument 'x'", x)
+    (out,) = x.ctx.emit("neg", [x], {}, [x.type.materialized()])
+    return out
+
+
+def fma(a: Any, b: Any, c: Any) -> Value:
+    """``a * b + c`` rounded once (``fma.rn.f32``, subnormals kept), whatever the kernel's ``fp_fusion`` and ``math`` say: CUDA's ``fmaf`` and
+    ``__fmaf_rn``. Operands broadcast like those of ``+``; f32 (note 16 of :mod:`tilefish.lower`)."""
+    ctx, operands, dtype, shape = _operands("fma", [("argument 'a'", a), ("argument 'b'", b), ("argument 'c'", c)], floating=True)
+    (out,) = ctx.emit("fma", operands, {}, [TensorType(shape, dtype)])
+    return out
+
+
+# -- reduction orders -----------------------------------------------------------------
+
+
+MAX_TREE_LANES = 1024
+MAX_TREE_VECTOR = 16
+
+
+class ReductionOrder:
+    """The order in which an ordered ``tilefish.sum`` adds a row (note 17 of :mod:`tilefish.lower`), made by :func:`tree` (or ``order="sequential"``).
+
+    ``lanes`` partial sums, each a chain from ``+0.0``: lane ``j`` adds the columns ``c * lanes * vector + j * vector + v`` that are in the row, in
+    the order ``(c, v)`` (``c = 0, 1, ...``, ``v`` from 0 to ``vector - 1``), one rounding per add. Then, for each ``o`` in ``offsets`` in turn, every
+    lane ``j`` adds lane ``j + o`` to itself (``p[j] = p[j] + p[j + o]``); the sum is lane 0's. ``tree(lanes=1)`` is the sequential chain over the
+    row, left to right from ``+0.0``.
+    """
+
+    __slots__ = ("lanes", "vector", "offsets")
+
+    def __init__(self, lanes: int, vector: int, offsets: "tuple[int, ...]") -> None:
+        self.lanes = lanes
+        self.vector = vector
+        self.offsets = offsets
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ReductionOrder) and (self.lanes, self.vector, self.offsets) == (other.lanes, other.vector, other.offsets)
+
+    def __hash__(self) -> int:
+        return hash((self.lanes, self.vector, self.offsets))
+
+    @property
+    def sequential(self) -> bool:
+        return self.lanes == 1
+
+    @property
+    def width(self) -> int:
+        """The columns the lanes take in one round: ``lanes * vector``."""
+        return self.lanes * self.vector
+
+    def __str__(self) -> str:
+        if self.sequential:
+            return "sequential"
+        return f"tree(lanes={self.lanes}, vector={self.vector}, offsets=({', '.join(map(str, self.offsets))}))"
+
+    __repr__ = __str__
+
+
+def _power_of_two(name: str, v: Any, limit: int) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1 or v > limit or v & (v - 1):
+        raise TilefishTypeError(f"tilefish.tree: {name} must be a power of two from 1 to {limit}, got {v!r}")
+    return v
+
+
+def tree(lanes: int, offsets: "Sequence[int] | None" = None, vector: int = 1) -> ReductionOrder:
+    """A fixed reduction order for ``tilefish.sum(..., order=...)`` (note 17 of :mod:`tilefish.lower`): ``lanes`` chains over the columns, then a
+    tree over the lanes.
+
+    ``lanes`` is a power of two up to 1024 (the threads of a CUDA block that share a row); ``vector`` a power of two up to 16 (the consecutive
+    columns a lane takes at a time, a vectorized load); ``offsets`` the lane distances of the tree in the order they are combined, each a power of
+    two below ``lanes``, every one once. The default is the halving tree of a shared-memory reduction (``lanes // 2``, ..., 2, 1, as
+    ``s[t] += s[t + o]`` for ``o = blockDim.x / 2, ..., 1``); a warp-shuffle tree followed by one over the warps of a 128-thread block is
+    ``offsets=(16, 8, 4, 2, 1, 64, 32)``.
+    """
+    lanes = _power_of_two("lanes", lanes, MAX_TREE_LANES)
+    vector = _power_of_two("vector", vector, MAX_TREE_VECTOR)
+    every = tuple(1 << k for k in range(lanes.bit_length() - 1))  # the powers of two below lanes
+    if offsets is None:
+        offsets = tuple(reversed(every))
+    else:
+        if isinstance(offsets, (str, bytes)) or not isinstance(offsets, (tuple, list)):
+            raise TilefishTypeError(f"tilefish.tree: offsets must be a tuple of lane distances, got {offsets!r}")
+        offsets = tuple(offsets)
+        for o in offsets:
+            if isinstance(o, bool) or not isinstance(o, int):
+                raise TilefishTypeError(f"tilefish.tree: offsets must be ints, got {o!r} in {offsets!r}")
+        if sorted(offsets) != list(every):
+            raise TilefishTypeError(
+                f"tilefish.tree: offsets {offsets!r} must be the powers of two below lanes={lanes}, each once, in any order "
+                f"({', '.join(map(str, reversed(every))) or 'none for one lane'}): every lane is then added to lane 0 exactly once"
+            )
+    if lanes == 1:
+        vector = 1  # one lane takes the columns in order whatever the width of a step
+    return ReductionOrder(lanes, vector, offsets)
+
+
+SEQUENTIAL = ReductionOrder(1, 1, ())
+
+
+def _order(op: str, order: Any) -> "ReductionOrder | None":
+    if order is None or isinstance(order, ReductionOrder):
+        return order
+    if isinstance(order, str) and order == "sequential":
+        return SEQUENTIAL
+    raise TilefishTypeError(f"{op}: order must be None (Triton's), 'sequential' or tilefish.tree(...), got {order!r}")
+
+
 # -- casts ------------------------------------------------------------------------
 
 
@@ -462,7 +592,7 @@ def _normalize_axes(op: str, x: Value, axis: Any) -> tuple[int, ...]:
     return tuple(sorted(out))
 
 
-def _reduce(op: str, x: Any, axis: Any, keepdims: bool) -> Value:
+def _reduce(op: str, x: Any, axis: Any, keepdims: bool, extra: "dict[str, Any] | None" = None) -> Value:
     x = _require_value(op, "argument 'x'", x)
     _require_computable(op, "argument 'x'", x, floating=(op == "mean"))
     axes = _normalize_axes(op, x, axis)
@@ -473,13 +603,36 @@ def _reduce(op: str, x: Any, axis: Any, keepdims: bool) -> Value:
                 shape.append(as_dim(1))
         else:
             shape.append(d)
-    (out,) = x.ctx.emit(op, [x], {"axes": axes, "keepdims": bool(keepdims)}, [TensorType(shape, x.dtype)])
+    (out,) = x.ctx.emit(op, [x], {"axes": axes, "keepdims": bool(keepdims), **(extra or {})}, [TensorType(shape, x.dtype)])
     return out
 
 
-def reduce_sum(x: Value, axis: Any = None, keepdims: bool = False) -> Value:
-    """Sum over ``axis`` (an int, a tuple, or ``None`` for all axes) with numpy semantics."""
-    return _reduce("sum", x, axis, keepdims)
+def reduce_sum(x: Value, axis: Any = None, keepdims: bool = False, *, order: Any = None, fma: bool = False) -> Value:
+    """Sum over ``axis`` (an int, a tuple, or ``None`` for all axes) with numpy semantics.
+
+    ``order`` fixes the order of the adds (note 17 of :mod:`tilefish.lower`): ``None`` is Triton's tree (it depends on ``num_warps``),
+    ``"sequential"`` a chain over the row from ``+0.0``, and :func:`tree` lanes of chains and then a tree over the lanes, as a CUDA block reduces a
+    row. An ordered sum is f32, over the last axis of an ``[R, D]`` tensor, and every add is one rounding (``add.rn``). ``fma=True`` (an ordered
+    sum of a product ``a * b`` only) makes each step of a lane's chain ``acc = fma(a, b, acc)``, one rounding, as CUDA compiles ``acc += a * b``.
+    """
+    if not isinstance(fma, bool):
+        raise TilefishTypeError(f"sum: fma must be True or False, got {fma!r}")
+    resolved = _order("sum", order)
+    if resolved is None:
+        if fma:
+            raise TilefishTypeError("sum: fma=True needs an explicit order (order='sequential' or order=tilefish.tree(...)): it says how each lane's chain adds")
+        return _reduce("sum", x, axis, keepdims)
+    extra: dict[str, Any] = {"order": resolved}
+    if fma:
+        x = _require_value("sum", "argument 'x'", x)
+        producer = next((n for n in reversed(x.ctx.nodes) if any(o is x for o in n.outputs)), None)
+        if producer is None or producer.op != "mul":
+            made = f"made by {producer.op}" if producer is not None else "a parameter"
+            raise TilefishTypeError(
+                f"sum: fma=True takes a product a * b, whose multiply each step fuses into the chain (acc = fma(a, b, acc)); {x.ref} ({x.type}) is {made}"
+            )
+        extra["fma"] = True
+    return _reduce("sum", x, axis, keepdims, extra)
 
 
 def reduce_mean(x: Value, axis: Any = None, keepdims: bool = False) -> Value:

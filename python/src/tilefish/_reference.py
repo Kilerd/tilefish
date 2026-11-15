@@ -16,7 +16,10 @@ node by node:
 * ``x / c`` with a scalar or ``const`` divisor is ``x * f32(1 / c)``, which is what the binary computes
   (``div.full.f32`` of a constant divisor is a multiply by the correctly rounded f32 reciprocal), and so
   is ``mean`` (``sum / D``);
-* reductions are torch's; ``argmax`` and ``argmin`` follow the contract (the first NaN, else the first extreme value), written out in torch;
+* reductions are torch's, but an ordered sum (``order=``, note 17), which adds in its order with one rounding per add (and an ``fma`` per step
+  with ``fma=True``): exact; ``argmax`` and ``argmin`` follow the contract (the first NaN, else the first extreme value), written out in torch;
+* ``rcp`` is ``torch.reciprocal``, ``neg`` CUDA's negation (a NaN canonical) and ``fma`` one rounding (an f64 product and sum rounded to odd, then to
+  f32): exact (note 16); ``sin_approx`` is torch's sine, approximately;
 * comparisons, masks, ``where`` and ``iota`` are torch's, with a scalar rounded to the IR dtype as above: exact, like the binary;
 * ``gather_rows`` and ``scatter_rows`` are torch indexing with the out-of-range policy of the call: raw copies, exact (where a scatter's
   indices in range are distinct; with duplicates neither the binary nor the reference says which row lands).
@@ -103,6 +106,70 @@ def cast(torch: Any, x: Any, src: Any, dst: Any, nan: "str | None" = None) -> An
     return x.to(target)
 
 
+def canonical_nan(torch: Any, x: Any) -> Any:
+    """``x`` with every NaN made the canonical NaN ``0x7FFFFFFF`` (f32), what the GPU's f32 arithmetic gives for a NaN result."""
+    nan = torch.tensor(0x7FFFFFFF, dtype=torch.int32, device=x.device).view(torch.float32)
+    return torch.where(torch.isnan(x), nan, x)
+
+
+def fma_f32(torch: Any, a: Any, b: Any, c: Any) -> Any:
+    """``fma.rn.f32``: ``a * b + c`` with one rounding, computed in f64 and rounded to odd, then to f32 (note 16 of :mod:`tilefish.lower`).
+
+    The product of two f32 is exact in f64 (48 bits, and neither overflows nor underflows there); the sum is rounded to f64 and the error of
+    that rounding found exactly (TwoSum). Rounding the f64 sum to odd (towards the error when it is inexact and its last bit is even) and
+    then to f32 gives the correctly rounded f32 of the exact value, because f64 has more than two bits beyond f32's; the f32 conversion
+    rounds a subnormal and an overflow as the instruction does. A NaN result is the canonical NaN, as the GPU's.
+    """
+    a64, b64, c64 = (t.to(torch.float64) for t in torch.broadcast_tensors(a, b, c))
+    p = a64 * b64
+    s = p + c64
+    bb = s - p
+    err = (p - (s - bb)) + (c64 - bb)
+    inexact = torch.isfinite(s) & torch.isfinite(err) & (err != 0)
+    even = (s.view(torch.int64) & 1) == 0
+    toward = torch.nextafter(s, torch.where(err > 0, torch.full_like(s, float("inf")), torch.full_like(s, float("-inf"))))
+    odd = torch.where(inexact & even, toward, s)
+    return canonical_nan(torch, odd.to(torch.float32))
+
+
+def neg(torch: Any, x: Any) -> Any:
+    """CUDA's ``-x`` (note 16 of :mod:`tilefish.lower`): a float's sign flipped, zeros and infinities included, a NaN the canonical NaN of its
+    dtype; an integer negated in two's complement."""
+    if not x.is_floating_point():
+        return torch.neg(x)
+    r = torch.neg(x)
+    if x.dtype == torch.float32:
+        return canonical_nan(torch, r)
+    word = torch.tensor(0x7FFF, dtype=torch.int16, device=x.device).view(x.dtype)  # the canonical NaN of bf16 and f16 alike
+    return torch.where(torch.isnan(x), word, r)
+
+
+def ordered_sum(torch: Any, terms: "tuple[Any, ...]", order: Any) -> Any:
+    """The sum of the last axis in ``order`` (note 17 of :mod:`tilefish.lower`), every step one rounding: ``terms`` is ``(x,)`` (each step adds
+    ``x``) or ``(a, b)`` (each step is ``fma(a, b, acc)``), broadcast to one ``[..., D]`` shape. Lane ``j`` of ``order.lanes`` starts from ``+0.0``
+    and takes the columns ``c * lanes * vector + j * vector + v`` below ``D`` in the order ``(c, v)``; then ``p[j] += p[j + o]`` for each offset
+    ``o``; the result is lane 0's. A NaN is the canonical one, as the GPU's adds give."""
+    terms = torch.broadcast_tensors(*terms)
+    d = terms[0].shape[-1]
+    lanes, vector, width = order.lanes, order.vector, order.lanes * order.vector
+    lane = torch.arange(lanes, device=terms[0].device)
+    p = torch.zeros((*terms[0].shape[:-1], lanes), dtype=torch.float32, device=terms[0].device)
+    for c in range(-(-d // width)):
+        for v in range(vector):
+            col = c * width + lane * vector + v
+            valid = col < d
+            if not bool(valid.any()):
+                continue
+            k = col.clamp(max=d - 1)
+            got = [t[..., k] for t in terms]
+            step = canonical_nan(torch, p + got[0]) if len(got) == 1 else fma_f32(torch, got[0], got[1], p)
+            p = torch.where(valid, step, p)
+    for o in order.offsets:  # p[j] += p[j + o] for every lane j at once (the lanes past the end take nothing: they are not read again)
+        shifted = torch.cat([p[..., o:], torch.zeros_like(p[..., :o])], dim=-1)
+        p = canonical_nan(torch, p + shifted)
+    return p[..., 0]
+
+
 def arg_reduce(torch: Any, x: Any, axis: int, keepdim: bool, largest: bool, dtype: Any) -> Any:
     """``argmax`` (``largest``) or ``argmin`` along ``axis`` by the contract (note 8 of :mod:`tilefish.lower`), written out in torch rather
     than trusted to ``torch.argmax``: the first NaN wins when there is one, else the first position of the extreme value (``-0.0 == +0.0``)."""
@@ -142,6 +209,7 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
             return env[x]
         return torch.tensor(x.value, dtype=torch_dtype(torch, x.dtype), device=device)  # the scalar, rounded to the IR dtype
 
+    producer = {o: n for n in graph.nodes for o in n.outputs}  # an fma sum reads the operands of its product
     final: dict[str, Any] = {}
     with torch.no_grad():
         for n in graph.nodes:
@@ -223,6 +291,28 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 r = torch.sqrt(a[0])
             elif op == "cos":
                 r = torch.cos(a[0])
+            elif op == "erf":  # CUDA's erff in IEEE math (torch's on CUDA 12.8 to 13.1); libdevice's, approximately, in the default math
+                r = torch.erf(a[0])
+            elif op == "sin_approx":  # the hardware's approximate sine (a subnormal argument is a zero of its sign): torch's sine, approximately
+                r = torch.where(a[0].abs() < 2.0**-126, a[0] * 0.0, torch.sin(a[0]))
+            elif op == "rcp":  # rcp.rn.f32: correctly rounded
+                r = torch.reciprocal(a[0])
+            elif op == "neg":
+                r = neg(torch, a[0])
+            elif op == "fma":
+                r = fma_f32(torch, a[0], a[1], a[2])
+            elif op == "sum" and "order" in n.attrs:  # an ordered sum (note 17): exact, the binary's order
+                (ax,) = n.attrs["axes"]
+                if n.attrs.get("fma"):  # each step fma(a, b, acc) of the product's operands
+                    product = producer[n.inputs[0]]  # type: ignore[index]
+                    terms = tuple(operand(i) for i in product.inputs)
+                else:
+                    terms = (a[0],)
+                shape = torch.broadcast_shapes(*(t.shape for t in terms))
+                terms = tuple(t.expand(shape).movedim(ax, -1) for t in terms)
+                r = ordered_sum(torch, terms, n.attrs["order"])
+                if n.attrs["keepdims"]:
+                    r = r.unsqueeze(ax)
             elif op == "sin" and n.attrs.get("math", math) == "ieee":  # without flush to zero: torch's
                 r = torch.sin(a[0])
             elif op == "sin":  # libdevice built with FTZ: a subnormal argument is a zero of its sign, and sin(±0) = ±0

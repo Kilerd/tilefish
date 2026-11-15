@@ -20,7 +20,9 @@ and a `@tilefish.graph` compiles into a launch plan over one arena
 (`tilefish.plan`) that runs from Python and captures in a CUDA graph
 (`tilefish.capture`). A lowered kernel also compares, selects, gathers and
 scatters rows and reduces to an index, broadcasts along any axis, and may use
-IEEE f32 math (`math="ieee"`) and `tilefish.tanh`; `tilefish.im2col1d` and
+IEEE f32 math (`math="ieee"`), `tilefish.tanh`, CUDA's `erff`, `__sinf`,
+`__frcp_rn`, `fmaf` and negation, and sums in a fixed order (a sequential
+chain, or lanes and a tree as a CUDA block adds); `tilefish.im2col1d` and
 `tilefish.col2im1d` are generated ops for 1-D convolutions; an extern may be a
 Gluon kernel or have one implementation per architecture, take TMA tensor
 descriptors (`TensorDesc`) and be warp-specialised; a pinned GEMM takes bf16,
@@ -317,7 +319,9 @@ needs a C compiler, and a `replay` of a generated kernel needs neither Triton no
 CI asserts, on a GPU (the tests marked `gpu`), that a `jit`-built cubin has the
 digest of the manifest's, that `jit` and `replay` agree byte for byte, and that
 `replay` stays within tolerance of `reference`. The tolerances are measured per
-input distribution and tabulated in `python/tests/test_gpu_reference.py`: a ULP
+input distribution and dtype (f32, bf16 and f16 in and out; normal, uniform,
+heavy-tailed, sparse outliers, values of every magnitude) and tabulated in
+`python/tests/test_gpu_reference.py`: a ULP
 count only means something where the result is far from zero (a layernorm of
 data with a large mean has tiny outputs), so a bf16 output is bounded by half a
 bf16 step of the largest reference value and a fraction of elements that may
@@ -492,8 +496,12 @@ def proj32(a: Tensor[32, 512, bf16], b: Tensor[1536, 512, bf16], bias: Tensor[15
   (`CUBLASLT_WORKSPACE_SIZE`) and 8 519 680 for `gemm` (`torch.mm` runs `cublasGemmEx` with `CUBLAS_WORKSPACE_CONFIG`'s workspace, and the heuristic under that
   limit answers what it runs; on an sm_90 exactly torch's default is 32 MiB, `workspace_bytes=33_554_432`). With torch's default reduction
   (`allow_bf16_reduction=True`) the result is torch's byte for byte: `test_gpu_cublaslt.py` asserts it over 48 shapes, with and without a bias, on three
-  operand sets each, and it was measured on a B300 MIG slice (sm_103) and an RTX 5090 (sm_120) with cuBLASLt 12.8.4. The default posture, `"tilefish"`, adds
-  16-byte alignment minimums.
+  operand sets each, and it was measured on a B300 MIG slice (sm_103) and an RTX 5090 (sm_120) with cuBLASLt 12.8.4, and on the B300 slice with 13.1.0
+  (`test_gpu_gemm.py`, 30 shapes). The default posture, `"tilefish"`, adds 16-byte alignment minimums, asks for 8 results and, without the opt-in, gives a
+  GEMM with a bias no split-K (below), which torch does not do. It is not torch's, and how often its result is torch's depends on the cuBLASLt version: on
+  the 15 biased shapes of `test_gpu_gemm.py`, all of them with 12.8.4, 13 with 13.1.0, whose heuristic ranks a split-K of 3 with f32 partial sums first
+  for 32 and 64 x 1024 x 3072 (neither the workspace limit, nor the alignment minimums, nor the number of results asked changes its first answer there;
+  the reduction-scheme mask does).
 * `allow_bf16_reduction=True` lets split-K add its partial sums in bf16 (`INPLACE`, `OUTPUT_TYPE`: torch's default,
   `allow_bf16_reduced_precision_reduction`), which rounds more than once. Without it the heuristic is asked for f32 partial sums only, and a GEMM with a
   bias for no split-K at all (with the bias epilogue, a split-K with f32 partial sums was measured to round twice: cuBLASLt 12.8.4 on an RTX 5090); an
@@ -639,6 +647,28 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   and `tanh` keep a subnormal, each written out as the inline PTX nvcc emits (Triton links libdevice with flush to zero). On every one of the 2**32 f32 bit
   patterns these are torch's CUDA bits, and `/` is torch's division of tensors; with `fp_fusion=False` too, a body of these ops is torch's eager
   composition of the same ops byte for byte. The default, `math="fast"`, is the contract of before (note 13 of `tilefish.lower`).
+- **Primitives for reproducing a CUDA kernel.** `tilefish.erf(x, math="ieee")` is CUDA's `erff` without flush to zero (the default math's is
+  libdevice's, `gelu`'s); `tilefish.sin_approx(x)` is `__sinf` (`sin.approx.f32`), `tilefish.rcp(x)` `__frcp_rn` (`rcp.rn.f32`),
+  `tilefish.fma(a, b, c)` `fmaf` (one rounding, whatever `fp_fusion` says), and `-x` (`tilefish.neg`) is CUDA's negation, `-0.0` for `+0.0`
+  where Triton's `-x` is `0 - x`. Each is the bits of the CUDA C++ function on every f32, measured against NVRTC on the GPU (notes 15 and 16).
+- **The CUDA math guard.** `expf`, `erff`, `tanhf` and the other functions those ops copy are not the same in every CUDA release (CUDA 13.2
+  changed `erff`). The manifest entry of a generated kernel records the functions it uses, the releases tilefish measured each on, and the
+  libdevice it linked (`cuda_math`); a run warns (`TilefishCudaMathWarning`) where torch is built with another release or a replay's process would
+  link another libdevice, and the Rust host refuses a release with `Manifest::check_cuda_math`. `docs/numerics.md` has the table and the procedure
+  to run on a CUDA or torch change (`pytest -m cuda_math`).
+- **Ordered sums.** `tilefish.sum(x, axis=-1, order=...)` adds in the order a CUDA kernel does: `order="sequential"` is one thread's loop from
+  `+0.0`, `tilefish.tree(256)` is 256 threads over strided columns and a shared-memory halving tree, and
+  `tilefish.tree(128, offsets=(16, 8, 4, 2, 1, 64, 32), vector=8)` is 128 threads of 8 consecutive columns, a warp-shuffle tree and then the
+  warps; `fma=True` makes each step of a chain `acc = fma(a, b, acc)` for `tilefish.sum(a * b, ...)`, as nvcc compiles `acc += a * b`. The bytes
+  are those kernels' and the same at every `num_warps` (note 17):
+
+  ```python
+  @tilefish.kernel(math="ieee")
+  def rmsnorm(x: Tensor[R, 1024, bf16], w: Tensor[1024, bf16]) -> Tensor[R, 1024, bf16]:
+      v = x.to(f32)
+      ss = tilefish.sum(v * v, -1, keepdims=True, order=tilefish.tree(128, offsets=(16, 8, 4, 2, 1, 64, 32), vector=8), fma=True)
+      return ((v * tilefish.rsqrt(ss / 1024.0 + 1e-6)) * w.to(f32)).to(bf16)   # a 128-thread CUDA rmsnorm, byte for byte
+  ```
 - The elementwise template broadcasts an operand over the leading axes (a `[T, D]` table added to a `[K, T, D]` batch), and along any axis by
   numpy's rules (a `[H, 1, L]` mask of the keys over `[H, L, L]` scores, a `[K, T, 1]` scale per row): such an operand is read at the offset of the
   lane's coordinates, and `tilefish.iota(x, axis)` is the lane's coordinate along any axis (a causal mask is `iota(s, 2) <= iota(s, 1)`). The sizes the
@@ -876,7 +906,11 @@ point in the IR, and rules come in two kinds:
 `num_warps` is part of a kernel's numerics identity in the same way: it fixes
 the tree a `tl.sum` adds in, so the same kernel with another warp count differs
 in the last bits. It is recorded in the declaration digest, the compile spec
-and the manifest, and a replay refuses an entry that has another. So is FMA
+and the manifest, and a replay refuses an entry that has another. Measured, it
+is Triton's own reductions that depend on it; per-element ops, `argmax` and
+sums with an `order=` have the same bytes at every warp count, so a kernel
+whose every reduction has an order may change it for speed alone
+(`docs/numerics.md`). So is FMA
 contraction: a generated kernel always says whether `a * b + c` may be one
 rounding (`@tilefish.kernel(fp_fusion=False)` says no), and a hand-written one
 says it with `@tilefish.extern(triton=..., enable_fp_fusion=False)` (Triton's

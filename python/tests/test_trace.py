@@ -347,7 +347,6 @@ def test_value_is_not_indexable_iterable_or_truthy(tr):
 @pytest.mark.parametrize(
     "use",
     [
-        lambda x: -x,
         lambda x: +x,
         lambda x: abs(x),
         lambda x: x**2,

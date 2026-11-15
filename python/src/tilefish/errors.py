@@ -87,6 +87,13 @@ class TilefishPreconditionError(TilefishRuntimeError):
         self.arg = arg
 
 
+class TilefishCudaMathWarning(UserWarning):
+    """A lowered kernel's CUDA math functions (``expf``, ``erff``, ``tanhf``, ...; :mod:`tilefish._cudamath`) were measured on other CUDA releases
+    than the one torch is built with here, or a replay's binary links another libdevice than a build here would. The binary runs as it was
+    exported; torch's own ops, and the reference mode, may not be its bits. Make it an error with
+    ``warnings.simplefilter("error", TilefishCudaMathWarning)``."""
+
+
 class TilefishCacheWarning(UserWarning):
     """tilefish's build cache could not be used as it is: an entry is corrupt or stale (it is ignored and the kernel is built
     again), or the cache directory cannot be written (builds are not cached there). It is a warning, never an error: a build

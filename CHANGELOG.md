@@ -73,6 +73,43 @@ each section names the release that added it.
 - The cuBLASLt process-stability tests use neutral shapes (N = 1024 with K = 8192 and 16384) instead of `(N, K) = (1024, 7680)`;
   on an sm_120 device the test asserts that one of its problems still gets a split-K configuration.
 
+### Numerics in the DSL (notes 15 to 17 of `tilefish.lower`)
+
+- `tilefish.erf(x)`: libdevice's `erff` by default (what `gelu` uses), CUDA's `erff` without flush to zero with `math="ieee"` (the bits of
+  CUDA 12.8 to 13.1; CUDA 13.2 changed the function).
+- `tilefish.sin_approx(x)` (`sin.approx.f32`, CUDA's `__sinf`), `tilefish.rcp(x)` (`rcp.rn.f32`, `__frcp_rn`), `tilefish.fma(a, b, c)` (`fma.rn.f32`,
+  one rounding whatever `fp_fusion` says) and `-x` / `tilefish.neg(x)` (CUDA's negation: `neg.f32`, `neg.bf16`, `neg.f16`, or `0 - x` of an
+  integer). `-x` was refused before.
+- Ordered sums: `tilefish.sum(x, axis=-1, order="sequential" | tilefish.tree(lanes, offsets, vector), fma=False)` (row template, f32): lanes of
+  chains from `+0.0` and a fixed tree over the lanes, every add `add.rn`; `fma=True` fuses the multiply of `a * b` into each step. Byte for byte
+  the CUDA kernels of those orders, and the same bytes at every `num_warps`.
+- `num_warps` stays part of every kernel's identity; the contract now says which ops depend on it (Triton's own reductions) and which do not
+  (per-element ops, `argmax` / `argmin`, ordered sums), measured.
+
+### The CUDA math guard (manifest schema 3, section 4.3; `docs/numerics.md`)
+
+- The manifest entry of a generated kernel whose ops copy a CUDA math library function (`expf`, `rsqrtf`, `erff` in IEEE math; `sinf`, `cosf`,
+  `tanhf` from libdevice) or that links libdevice has `cuda_math`: the functions, the CUDA releases tilefish measured each on over every f32
+  (12.8 to 13.2, `erff` 12.8 to 13.1), and the sha256 of the libdevice. Optional and additive: an entry without it reads as before, and no
+  generated source or source digest changes.
+- `jit`, `replay` and `reference` warn with `tilefish.TilefishCudaMathWarning` where torch is built with a release the functions were not measured on,
+  or where a replay's process would link another libdevice. Rust: `Entry::cuda_math` (`CudaMath`) and `Manifest::check_cuda_math(release)`.
+- `pytest -m cuda_math` runs the exhaustive comparisons with CUDA's math library again; `TILEFISH_NVRTC_PATHS` adds the NVRTC of more releases
+  to the table's check. `docs/numerics.md` is the procedure on a CUDA or torch change, the `num_warps` decision, and a design for device-global
+  state (counters), which waits for a memset step in plans.
+
+### The reference mode
+
+- The tolerance matrix of `test_gpu_reference.py` covers f32, bf16 and f16 inputs and outputs of the layernorm, gelu, swiglu and softmax goldens
+  on five more distributions (uniform, heavy-tailed, sparse outliers, values of every magnitude, rows of one value), measured and asserted.
+
+### Pinned GEMMs
+
+- `test_gpu_gemm.py` asserts that `heuristic="torch"` (with torch's default reduction) gives `torch.mm` / `torch.addmm` byte for byte on the 30
+  shapes whose default-posture rate it reports, with cuBLASLt 12.8.4 and 13.1.0. Why the default posture matches `addmm` on only 13 of the 15
+  biased shapes under cuBLASLt 13.1 is documented: it gives a GEMM with a bias no split-K, a rule of tilefish's, where `addmm` runs the split-K of
+  3 with f32 partial sums that the heuristic ranks first for 32 and 64 x 1024 x 3072. No pin changes.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

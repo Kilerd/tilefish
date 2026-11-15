@@ -252,6 +252,15 @@ def tanh_ops():
     return {"tanh_fast": tc.tanh_fast, "tanh_rows": tc.tanh_rows}
 
 
+def primitive_ops():
+    """``{name: kernel}``: lowered kernels of the primitives of notes 15 to 17 of ``tilefish.lower`` (``primitive_cases.py``): CUDA's ``erff`` in IEEE
+    math (an entry with ``cuda_math``), an ``fma``, CUDA's negation, and an rmsnorm whose sum of squares is an ordered ``fma`` sum. The committed
+    fixtures do not have them."""
+    import primitive_cases as pc
+
+    return {"erf_ieee": pc.erf_ieee, "fma3": pc.fma3, "neg_f32": pc.neg_f32, "rmsnorm_ordered": pc.rmsnorm_ordered}
+
+
 def gemm_name(n, k, bias):
     return f"gemm_{n}_{k}{'_bias' if bias else ''}"
 

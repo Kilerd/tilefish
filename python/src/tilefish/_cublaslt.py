@@ -62,11 +62,24 @@ and to vet a pinned algorithm, ``cublasLtMatmulAlgoInit``, ``cublasLtMatmulAlgoC
 
 In both, the reduction-scheme mask lets split-K add its partial sums only in f32 (a bf16 or f16 partial sum rounds more than once),
 which is what torch does with ``allow_bf16_reduced_precision_reduction = False`` (``allow_fp16_reduced_precision_reduction`` for f16
-operands), and a GEMM with a bias gets no split-K at all (with the bias epilogue a split-K was measured to round twice even with f32 partial
-sums, see :data:`NO_SPLIT_K_MASK`); with the opt-in of the operands' type (``allow_bf16_reduction=True`` for bf16 operands,
-``allow_f16_reduction=True`` for f16 ones: torch's default; ``allow_f32_reduction=True`` for f32 ones, where torch has no flag because it never
-masks the reduction scheme of an f32 GEMM) no mask is set, and an algorithm whose split-K reduces in the output type (``INPLACE``,
-``OUTPUT_TYPE``) is accepted. The opt-in is named by the operands' type, as torch's flags are, whatever the type of ``D``.
+operands), and a GEMM with a bias gets no split-K at all, a rule of tilefish's that torch does not have (with the bias epilogue a split-K was
+measured to round twice even with f32 partial sums, see :data:`NO_SPLIT_K_MASK`); with the opt-in of the operands' type
+(``allow_bf16_reduction=True`` for bf16 operands, ``allow_f16_reduction=True`` for f16 ones: torch's default; ``allow_f32_reduction=True``
+for f32 ones, where torch has no flag because it never masks the reduction scheme of an f32 GEMM) no mask is set, and an algorithm whose
+split-K reduces in the output type (``INPLACE``, ``OUTPUT_TYPE``) is accepted. The opt-in is named by the operands' type, as torch's flags are, whatever the type of ``D``.
+
+**The default posture is not torch's**, so where its pin is the algorithm torch runs, that is a property of the cuBLASLt version. What tells
+them apart is the reduction-scheme mask of a GEMM with a bias: the default posture asks for no split-K, while ``addmm`` runs whatever the
+heuristic ranks first, split-K or not (with ``allow_bf16_reduced_precision_reduction = False`` too: it sets a reduction-scheme mask then, and
+still runs the split-K with f32 partial sums below, so the ``"torch"`` posture without the opt-in is not torch's there either). Measured with
+torch 2.9.1 on a B300 MIG slice of 30 SMs, on the 15 biased shapes of ``tests/test_gpu_gemm.py`` (M of 32, 64, 320; N x K of 1024 x 1024,
+3072 x 1024, 1024 x 3072, 4096 x 3072, 3072 x 4096): with cuBLASLt 12.8.4 the heuristic ranks no split-K first for any of them, and every
+posture pins the algorithm ``addmm`` runs; with 13.1.0 it ranks a split-K of 3 with f32 partial sums first (id 66, ``COMPUTE_TYPE``, 393 232
+and 786 448 bytes of workspace) for 32 x 1024 x 3072 and 64 x 1024 x 3072, which ``addmm`` runs (its cuBLASLt log says so) and the default
+posture does not (it pins id 21 without split-K; the two results differ by up to 8 bf16 steps, and both keep the one rounding). On those
+shapes, in both versions, neither the workspace limit, nor the alignment minimums, nor the alignment of the dummy bias pointer, nor the
+number of results asked changes the heuristic's first answer; the mask alone does (with 13.1.0). The ``"torch"`` posture with torch's default reduction
+(``allow_bf16_reduction=True``) and workspace limit pins what ``addmm`` runs on all 15 in both versions.
 
 An algorithm can also be imported: :func:`encode_algo` turns its nine configuration attributes into the 64 bytes cuBLASLt
 writes for them. The pin is the 64-byte ``cublasLtMatmulAlgo_t`` as a 128-character hex string, and the workspace it needs.
@@ -189,7 +202,9 @@ CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE = 4
 # A GEMM with a bias gets no split-K at all without the opt-in (the mask 0: only NONE, measured to return algorithms without split-K):
 # with the bias epilogue, a split-K with f32 partial sums was measured to add the bias to a sum already rounded to bf16 (cuBLASLt 12.8.4,
 # RTX 5090, sm_120, algorithm 21: 32x1024x3072, 8409 of 32768 elements not the correctly rounded result and errors past what one rounding
-# and an f32 accumulation allow; the same configuration without the bias, and without split-K, keep the bound).
+# and an f32 accumulation allow; the same configuration without the bias, and without split-K, keep the bound). Not every such split-K
+# rounds twice (algorithm 66 with a split-K of 3, which torch's addmm runs for 32x1024x3072 with cuBLASLt 13.1.0 on sm_103, keeps the one
+# rounding: 28 of 32768 elements not the correctly rounded result, measured), but the rule holds for every algorithm.
 REDUCTION_SCHEME_MASK = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE
 NO_SPLIT_K_MASK = 0
 ALLOWED_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_NONE, CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)

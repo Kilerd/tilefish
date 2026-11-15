@@ -34,6 +34,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | ABI argument kinds (0.0.6, crate 0.0.4) | — | adds `tensordesc`: a TMA descriptor of a tensor (a `CUtensorMap` the host encodes at every launch, passed by value), which takes `1 + 2 * rank` slots of `kernelParams`, so `slot` is where a parameter's slots begin (section 5.5) |
 | kernel entry (0.0.6, crate 0.0.4) | — | an optional `total_num_warps`: the warps of a block of a warp-specialised kernel, whose partitions add warps to the `num_warps` of its default partition; its `block` is `32 * total_num_warps` (section 4.2) |
 | library entry (0.0.6, crate 0.0.4) | — | `impl: "cudnn.conv_fwd"`: a pinned cuDNN forward convolution, an entry of fields of its own (the problem, the math, the pin of the legacy or the backend API and how it was chosen, the cuDNN version, the device) (section 9.4) |
+| kernel entry (unreleased) | — | an optional `cuda_math` on a generated kernel: the CUDA math functions whose bits its ops are, the CUDA releases they were measured on, and the sha256 of the libdevice it links (section 4.3) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -235,6 +236,37 @@ each architecture.
 A JSON `null` is as absent. A reader from before this change refuses an entry with the field: the crate's reader refuses unknown fields, and the
 replay of Python 0.0.5 finds a block that is not the spec's. So no host launches a warp-specialised kernel with the declared block. Manifests without
 the field are unchanged, and so are their digests.
+
+### 4.3 The CUDA math functions of a generated kernel: `cuda_math` (unreleased)
+
+Some ops of a kernel tilefish generates are, by the numerics contract, the bits of a function of CUDA's math library: in IEEE math `exp` and `silu`
+are built on `expf`, `rsqrt` is `rsqrtf` and `erf` is `erff` (inline PTX read from NVRTC), and in either math `sin`, `cos` and `tanh` are libdevice's
+`sinf`, `cosf` and `tanhf` (notes 10 and 13 to 15 of `tilefish.lower`). Those functions are not the same in every CUDA release (CUDA 13.2 changed
+`erff`), and libdevice is a file Triton links (Triton's own, or the one `TRITON_LIBDEVICE_PATH` names). The entry of such a binary says so:
+
+| field | type and rule |
+|---|---|
+| `cuda_math` | optional object, only on a `triton` entry that has a `source_sha256` (a generated kernel). Absent (or `null`) for every other entry and for a generated kernel that uses none of these functions and links no libdevice |
+| `cuda_math.functions` | list of the CUDA math functions whose bits the binary's ops are (`"erff"`, `"expf"`, ...: names of lowercase letters, digits and `_`), sorted, each once; empty for a kernel that only links libdevice (`gelu`'s `erf` is libdevice's own and claims no release) |
+| `cuda_math.cuda` | list of CUDA releases (`"13.0"`: two decimal numbers, no leading zero), sorted by release (`"12.9"` before `"12.10"`), each once: those on which every listed function, compiled by that release's NVRTC with nvcc's defaults, was measured to be the op's bits on every f32, when the binary was exported (`tilefish._cudamath.VERIFIED`). Empty when `functions` is; may be empty when no release is common to them |
+| `cuda_math.libdevice` | optional string, 64 lowercase hex digits: the sha256 of the libdevice file the binary was linked with, present when the kernel calls a libdevice function |
+
+* **What it is.** A statement of where the binary's bits come from, not a part of what is built: the build reads the functions from the code of the
+  generated source (the helpers and calls `tilefish.lower` writes for them; the source is not changed for it, so no source digest moves), the
+  releases from tilefish's table, and the libdevice from the file Triton links for the compile options. Like every field it is in the manifest
+  digest. It is not compared with the compile spec, and a merge does not compare it (another libdevice gives other machine code, which
+  `sha256_code` tells).
+* **Python** checks it on every run: where `torch.version.cuda` (the release torch's own ops are built with) is not in `cuda` while `functions` is not
+  empty, and, in a replay, where a build in the process would link another libdevice than `libdevice`, it warns with `TilefishCudaMathWarning`
+  (an error under `warnings.simplefilter("error", TilefishCudaMathWarning)`). The binary still runs: what the warning says is that torch's ops,
+  and the reference mode built on them, may not be its bits there. The reference mode warns the same way from the kernel's IR.
+* **The Rust host** reads it into `Entry::cuda_math` (`CudaMath { functions, cuda, libdevice }`) and checks nothing on its own (it cannot tell the
+  release of the host's other CUDA code); `Manifest::check_cuda_math("13.0")` refuses a manifest with an entry whose `functions` is not empty and
+  whose `cuda` does not list that release, naming each.
+* **Readers.** Both readers refuse: a `cuda_math` that is not an object or has another field; `functions` or `cuda` missing, not lists of the forms
+  above, not sorted or with a repeat; `cuda` not empty for no function; a `libdevice` that is not a sha256; no function and no libdevice; the field on
+  a `binary` entry or on an entry without `source_sha256`.
+* Where it is measured and kept: `docs/numerics.md` (the procedure to run on a CUDA or torch change), `python/tests/test_gpu_cuda_math.py`.
 
 ## 5. The ABI
 
@@ -982,7 +1014,8 @@ document tilefish writes next to a build and the host does not read):
   `toolchain`; `options` missing on `triton` and present on `binary`; `num_warps`/`num_stages` present on `binary`; `binary` missing on `binary`;
   `shared` not a non-negative int; `toolchain`, `launch`, `abi`, `options` not objects; `abi.scratch_slots` present and not `2`/`0` by kind;
   `source_sha256`/`source_digest` not 64 lowercase hex digits; `source_digest` and `source_digest_kind` not both present or both absent; an
-  `implementation` (section 4.1) that is not the entry's `arch` or `"fallback"`, or on a `binary` entry; a `total_num_warps` (section 4.2) on a
+  `implementation` (section 4.1) that is not the entry's `arch` or `"fallback"`, or on a `binary` entry; a `cuda_math` (section 4.3) that is
+  malformed or not on a generated kernel's `triton` entry; a `total_num_warps` (section 4.2) on a
   `binary` entry, not an integer, not more than `num_warps` or more than 32, or with a `block` that is not `[32 * total_num_warps, 1, 1]` (the Rust
   reader refuses a Triton entry whose `block` is not `[32 * num_warps, 1, 1]` without it; Python compares that block with the spec's);
   for `binary`: `binary` not exactly one of `{"source":"cubin"}` and `{"source":"ptx","ptxas_flags":[strings]}`, `source_digest_kind` not
@@ -1078,6 +1111,9 @@ and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter th
 * `total_num_warps` (section 4.2) is read into `Entry::total_num_warps` (`Option<u32>`, next to `Entry::num_warps`, the declared warps) and held to the
   rules of section 10. Every launch takes the entry's `block` (`Plan::block()`): a single launch, a step of a launch plan, and a captured graph. For a
   warp-specialised kernel that block is `32 * total_num_warps`, so the crate needs nothing else to launch one.
+* `cuda_math` (section 4.3) is read into `Entry::cuda_math` (`Option<CudaMath>`) and held to the rules of section 10. The crate cannot tell the CUDA
+  release of the host's other code, so it checks nothing at load; `Manifest::check_cuda_math(release)` is the host's statement of it, and refuses a
+  manifest whose generated kernels' functions were not measured on that release.
 
 **Launching a kernel** (`plan.rs`). The steps of section 5.1, in Python's order: shapes, strides and scalars bind the dimensions (then the `out` tensors bind
 the dimensions those leave unbound, section 7), `divisible_by`, the exact
@@ -1155,6 +1191,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 |---|---|
 | top level, digest, the three additions, refusal of schema 2 | `test_manifest.py`, `test_manifest_schema3.py`, `test_rust_host.py` |
 | `kind`, `abi.scratch_slots`, prebuilt binary entries | `test_binary_externs.py`, `test_manifest_schema3.py` |
+| `cuda_math` (section 4.3) | `test_cudamath.py`, `crates/tilefish/tests/cuda_math.rs`; on a GPU `test_gpu_cuda_math.py` |
 | strided pointers, `strides`/`offset`/`stride_of`, `max_extent`, alignment | `test_strided_specs.py`, `test_views.py`; on a GPU `test_gpu_strided.py` |
 | a stride that several views share (`stride_of` a list) | `test_shared_strides.py`, `test_rust_host_schema3.py`; on a GPU `test_gpu_shared_strides.py` |
 | a dimension only an `out` tensor determines (section 7) | `test_output_dims.py`; on a GPU `test_gpu_output_dims.py` |

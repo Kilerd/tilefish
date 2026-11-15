@@ -99,7 +99,8 @@ from typing import Any, Callable
 
 import torch
 from gpu_util import randn, same_bytes
-from host_ops import GEMM_SHAPES, abi_of, broadcast_ops, gemm_name, generated_ops, gluon_ops, gpu_ops, ieee_ops, library_ops, ops, per_arch_ops, tanh_ops
+from host_ops import GEMM_SHAPES, abi_of, broadcast_ops, gemm_name, generated_ops, gluon_ops, gpu_ops, ieee_ops, library_ops, ops, per_arch_ops
+from host_ops import primitive_ops, tanh_ops
 
 import tilefish
 from tilefish import runtime
@@ -506,6 +507,27 @@ def must_be_a_tanh_of_rows(args, got):
     assert same_bytes(got, torch.tanh(x.float() + b.float()).to(BF16))
 
 
+def must_be_the_reference(op, exact=lambda: True):
+    """The binary is the reference mode's bytes (an exact reference: notes 15 to 17), where ``exact()`` says the reference is exact here."""
+
+    def check(args, got):
+        if exact():
+            assert same_bytes(got, tilefish.run(op, *[a.clone() for a in args], mode="reference"))
+
+    return check
+
+
+def torch_has_cudas_erff():
+    """Whether torch's ``erf`` here is the ``erff`` the IEEE ``erf`` reproduces (CUDA 12.8 to 13.1: tilefish._cudamath.VERIFIED)."""
+    from tilefish import _cudamath
+
+    return _cudamath.torch_release() in _cudamath.VERIFIED["erff"]
+
+
+def args_rmsnorm_ordered(rows, seed):
+    return randn((rows, 1024), BF16, seed + rows, scale=4.0), randn((1024,), BF16, seed + rows + 1)
+
+
 def given_ops():
     """``{name: extern}``: a prebuilt PTX whose ``k: const[i32]`` and ``c: const[i64]`` every call gives (``gpu_kernels_p6.scale_add``). Not in the committed
     fixtures, so only a fresh export has it."""
@@ -681,6 +703,15 @@ def build_cases():
     tanh_check = must_be_torchs_tanh_but_on_a_subnormal
     cases += plain("tanh_fast", "tanh_fast", lambda n, seed: (f32_words(n, seed),), (6, 1000, 1 << 20), seeds=(0, 1), check=tanh_check)
     cases += plain("tanh_rows", "tanh_rows", args_tanh_rows, (1, 7, 300), seeds=(0,), check=must_be_a_tanh_of_rows)
+    # -- the primitives of notes 15 to 17: CUDA's erff, an fma, CUDA's negation, an rmsnorm whose sum of squares is an ordered fma sum
+    prims = primitive_ops()
+    erf_check = must_be_the_reference(prims["erf_ieee"], torch_has_cudas_erff)
+    cases += plain("erf_ieee", "erf_ieee", lambda n, seed: (f32_words(n, seed),), (6, 1000, 1 << 20), seeds=(0, 1), check=erf_check)
+    fma_args = lambda n, seed: (f32_words(n, seed), f32_words(n, seed + 3), f32_words(n, seed + 5))  # noqa: E731
+    cases += plain("fma3", "fma3", fma_args, (6, 1000, 1 << 20), seeds=(0,), check=must_be_the_reference(prims["fma3"]))
+    cases += plain("neg_f32", "neg_f32", lambda n, seed: (f32_words(n, seed),), (6, 1 << 20), seeds=(0,), check=must_be_the_reference(prims["neg_f32"]))
+    rms_check = must_be_the_reference(prims["rmsnorm_ordered"])
+    cases += plain("rmsnorm_ordered", "rmsnorm_ordered", args_rmsnorm_ordered, (1, 7, 300), seeds=(0,), check=rms_check)
     # -- warp-specialised kernels (sm_90 and newer; the tcgen05 matmuls on sm_100 and sm_103): launched with the block of all their partitions
     cases += plain("ws_scale", "ws_scale", args_tile, ((64, 64), (130, 200), (256, 512)), seeds=(0,), check=must_be_scaled)
     mm_sizes = ((128, 128, 64), (200, 136, 72), (64, 64, 512), (256, 384, 192))
@@ -937,6 +968,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(broadcast_ops())
         declared.update(ieee_ops())
         declared.update(tanh_ops())
+        declared.update(primitive_ops())
         declared.update(ws_ops())
         declared.update(conv_ops())
     all_ops = list(declared.values())

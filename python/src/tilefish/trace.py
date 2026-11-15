@@ -126,7 +126,6 @@ class Const:
 
 # Operators a traced tensor does not support in M1, with what to do instead.
 _UNSUPPORTED = {
-    "__neg__": ("negation (-x)", "write 0 - x or x * -1"),
     "__pos__": ("unary plus (+x)", "just use x"),
     "__abs__": ("abs()", "there is no abs op yet"),
     "__pow__": ("exponentiation (**)", "multiply explicitly, or use exp, sqrt or rsqrt"),
@@ -303,10 +302,10 @@ class Value:
 
         return ops.select(self, axis, index)
 
-    def sum(self, axis: Any = None, keepdims: bool = False) -> "Value":
+    def sum(self, axis: Any = None, keepdims: bool = False, *, order: Any = None, fma: bool = False) -> "Value":
         from . import ops
 
-        return ops.reduce_sum(self, axis, keepdims)
+        return ops.reduce_sum(self, axis, keepdims, order=order, fma=fma)
 
     def mean(self, axis: Any = None, keepdims: bool = False) -> "Value":
         from . import ops
@@ -366,6 +365,12 @@ class Value:
         from . import ops
 
         return ops.binary("div", self, other)
+
+    def __neg__(self) -> "Value":
+        """``tilefish.neg(self)``: CUDA's negation, which flips the sign of a zero too (Triton's ``-x`` is ``0 - x``)."""
+        from . import ops
+
+        return ops.neg(self)
 
     def __rtruediv__(self, other: Any) -> "Value":
         from . import ops
