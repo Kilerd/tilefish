@@ -276,20 +276,23 @@ def test_a_kernel_or_anything_that_is_not_a_graph_is_not_planned():
         tilefish.plan(pm.block, reuse=1)
 
 
-def test_arithmetic_in_the_graph_body_has_no_kernel_and_is_refused_with_the_rule():
+def test_arithmetic_in_the_graph_body_is_a_launch_of_a_fused_region():
+    """Arithmetic traced in a graph body is planned (RFC 0001): each fused region is a kernel step of a generated kernel (tests/test_fusion.py
+    has the rules)."""
+
     @tilefish.graph
     def arith(a: Tensor[Q, W, f32]) -> Tensor[Q, W, f32]:
         return a + a
 
-    with pytest.raises(TilefishPlanError, match=r"arithmetic traced in the graph body.*@tilefish.kernel"):
-        tilefish.plan(arith)
+    steps = tilefish.plan(arith)._doc["buckets"][0]["steps"]
+    assert [s["kind"] for s in steps] == ["kernel"] and steps[0]["entry"].startswith("fused_")
 
     @tilefish.graph
     def cast(a: Tensor[Q, W, f32]) -> Tensor[Q, W, bf16]:
         return twice(a).to(bf16)
 
-    with pytest.raises(TilefishPlanError, match="the op 'cast'"):
-        tilefish.plan(cast)
+    steps = tilefish.plan(cast)._doc["buckets"][0]["steps"]
+    assert steps[0]["entry"].startswith("twice") and steps[1]["entry"].startswith("fused_")
 
 
 def test_a_store_an_out_parameter_a_runtime_scalar_and_a_nested_graph_are_refused():
