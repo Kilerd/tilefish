@@ -43,7 +43,8 @@ ARCH = f"sm_{CC}"
 # what each op runs on the architectures the tests know: (its key, kind, how it takes its tensors)
 EXPECTED = {
     103: {"copy2d": ("tma", "triton", "tensordesc"), "copy2d_ptx": ("ptx", "binary", "pointer"), "copy2d_rows": ("sm_103", "triton", "pointer")},
-    120: {"copy2d": ("fallback", "triton", "pointer"), "copy2d_ptx": ("fallback", "triton", "pointer"), "copy2d_rows": ("fallback", "triton", "tensordesc")},
+    # (copy2d_rows falls back to the named TMA form: a named fallback's key is its name)
+    120: {"copy2d": ("fallback", "triton", "pointer"), "copy2d_ptx": ("fallback", "triton", "pointer"), "copy2d_rows": ("tma", "triton", "tensordesc")},
 }
 
 
@@ -180,7 +181,8 @@ def test_a_cubin_implementation_for_this_architecture(tmp_path):
 @pytest.mark.skipif(CC != 120, reason="needs an sm_120 GPU: there the fallbacks run (the pointer form of copy2d and copy2d_ptx, the TMA form of copy2d_rows)")
 def test_on_sm_120_the_fallbacks_run(exported):
     _, manifest = exported
-    assert {n: manifest.get(n, "sm_120").entry["implementation"] for n in pk.OPS} == {n: "fallback" for n in pk.OPS}
+    # every op runs its fallback there; copy2d_rows's is the named TMA form, whose key is its name
+    assert {n: manifest.get(n, "sm_120").entry["implementation"] for n in pk.OPS} == {"copy2d": "fallback", "copy2d_ptx": "fallback", "copy2d_rows": "tma"}
     x = inputs()["view"]
     for op in pk.OPS.values():
         assert same_bytes(tilefish.run(op, x), x.contiguous())
