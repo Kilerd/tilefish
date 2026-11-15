@@ -1016,12 +1016,22 @@ def share_arena(graphs: Any, **options: Any) -> Any:
     """The plans of several graphs (the plans of a set) on **one arena** they share and run **one at a time**: a
     :class:`~tilefish._planrun.SharedArena`, ``s = share_arena([g1, g2, g3], mode="replay", plan="build/", pin=planset.digest)``, then ``s.run(g1, x)``,
     ``s.capture(g2, ...)``, ``s.bind_weights(g3, {...})``, ``s.run_step(...)``, ``s.prepare()``. The arena has the bytes of the largest arena of the plans,
-    each plan's buffers at their own offsets in it; every execution on it, of any of the plans, is ordered with every other (one lock, one order event),
-    and nothing in it outlives a run: a value a later plan reads is a returned value of the earlier one. See :func:`tilefish._planrun.share_arena` and
-    ``docs/plan-schema-1.md``, section 15.1."""
+    each plan's buffers at their own offsets in it, then the carried buffers the plans declare; every execution on it, of any of the plans, is ordered with
+    every other (one lock, one order event). What a later plan reads is a returned value of an earlier one, or a carried buffer (``@tilefish.graph(carried=
+    ("h",))``), which the arena holds between executions. ``name=`` makes another arena of the same plans (one per stream: executions on two arenas run
+    concurrently). See :func:`tilefish._planrun.share_arena` and ``docs/plan-schema-1.md``, sections 15.1 and 15.2."""
     from ._planrun import share_arena as _share_arena
 
     return _share_arena(graphs, **options)
+
+
+def replay_graph(graph: Any, stream: Any = None) -> None:
+    """Replay a ``torch.cuda.CUDAGraph`` in which ``tilefish.run`` of plans was captured, ordered with every execution of those plans on any thread
+    (under the lock of the arenas such graphs hold): ``replay_graph(g)`` instead of ``g.replay()`` where another thread may run the same plans. See
+    :func:`tilefish._planrun.replay_graph` and ``docs/plan-schema-1.md``, section 10, item 7."""
+    from ._planrun import replay_graph as _replay_graph
+
+    _replay_graph(graph, stream)
 
 
 def run(

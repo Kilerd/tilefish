@@ -21,7 +21,8 @@ Triton and no GPU. :mod:`tilefish._planrun` runs a plan.
 What a plan accepts. A graph body is calls to declared operators (``kernel``, ``extern``, ``library`` with an ``impl``) and views. A traced
 arithmetic op in the graph body (``x + y``, a cast, a reduction), a call to another ``graph``, a ``Dim`` parameter and an ``Out``
 parameter are refused with the rule that says so (wrap arithmetic in a ``@tilefish.kernel``; a graph's results are its returned values); ``tilefish.copy``
-and a ``store`` into an ``InOut`` parameter are copy steps (a device-to-device copy of dense bytes). An in-place
+and a ``store`` into an ``InOut`` parameter are copy steps (a device-to-device copy of dense bytes), ``tilefish.zeros_like`` a memset step, and a parameter
+declared ``carried=`` a buffer of role ``carried`` that the arena holds between executions (section 15.2 of the plan schema). An in-place
 call (``InOut``) must take a whole buffer, not a view of another tensor (the IR says a chunk that is updated does not change its parent; a plan
 has no copy to make that true). A returned value is the buffer a call made (all of it, in any shape: a reshape costs nothing), or a copy step at the end
 copies it (a dense view, a parameter, a value returned twice); a view that is not dense (and a ``tilefish.copy`` of one) is materialised by a launch
@@ -74,17 +75,21 @@ MAX_BUFFERS = 1 << 15
 MAX_STEPS = 1 << 20  # per bucket
 MAX_ARGS = 256  # pointer arguments of one step
 
-ROLES = ("input", "output", "inout", "weight", "intermediate", "devscalar", "workspace")
+ROLES = ("input", "output", "inout", "weight", "intermediate", "devscalar", "workspace", "carried")
 EXTERNAL_ROLES = ("input", "output", "inout", "weight")
 ARENA_ROLES = ("intermediate", "devscalar", "workspace")
-WRITABLE_ROLES = ("intermediate", "output", "inout")  # what a step may write
+CARRIED = "carried"  # a parameter whose tensor the arena holds, in its carried region (section 15.2): placed by the host, not by the plan
+HOST_PLACED_ROLES = EXTERNAL_ROLES + (CARRIED,)  # the buffers whose offset is null: the caller's tensors, and the carried buffers
+WRITABLE_ROLES = ("intermediate", "output", "inout", CARRIED)  # what a step may write
+PROVIDED_ROLES = ("input", "weight", "inout", "devscalar", CARRIED)  # what a step may read before any step of the plan wrote it
 TOP_KEYS = "schema tilefish graph arch manifest_digest dims reuse arena_alignment arena_bytes buffers outputs buckets plan_digest".split()
 OPTIONAL_TOP_KEYS = ("roles",)  # "roles": "declared" when the graph declares its inputs and weights (absent: the roles were chosen from the shapes)
 ROLES_DECLARED = "declared"
 BUFFER_KEYS = "name role dtype shape offset bytes".split()
 STEP_KEYS = "entry kind args".split()
-KINDS = ("kernel", "library", "copy")
+KINDS = ("kernel", "library", "copy", "memset")
 COPY_KEYS = "kind args".split()  # a copy step has no entry (it launches no binary) and no workspace
+MEMSET_KEYS = "kind args".split()  # a memset step neither: the bytes of its one argument, dst, set to zero
 _VIEW_OPS = ("reshape", "permute", "select", "split")
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _ARCH = re.compile(r"sm_[0-9]{2,3}\Z")
@@ -240,6 +245,7 @@ class _SymStep:
     library: bool = False
     consts: "dict[str, Any] | None" = None  # the compile-time arguments the call gave a value other than the declared default: a binary cannot take them
     copy: bool = False  # a copy step (tilefish.copy, or a store into an InOut parameter): args src and dst, no binary
+    memset: bool = False  # a memset step (tilefish.zeros_like): arg dst, its bytes set to zero, no binary
 
 
 @dataclass
@@ -342,6 +348,43 @@ def _in_place(
     return src
 
 
+def _store_in_place(
+    value: Value,
+    target: _Loc,
+    loc: "Mapping[Value, _Loc]",
+    makers: "Mapping[Value, int]",
+    steps: "list[_SymStep]",
+    buffers: "list[_Buffer]",
+    roots: "Mapping[Value, Value]",
+    last_use: "Mapping[Value, int]",
+    index: int,
+) -> bool:
+    """``param[...] = value`` (node ``index``) written by the step that made ``value`` instead of a copy step after it, when that changes no value
+    the graph computes. Only for what has no plan of before to keep: a value of ``tilefish.zeros_like`` (its memset writes the parameter) and a store
+    into a carried parameter (the step that made the value writes the arena's carried buffer). The value is a whole intermediate the latest step made
+    (one argument of that step, which no other argument of it shares with the parameter), at its first version, and nothing reads its storage after
+    the store. Then that argument is the parameter, and the value's buffer is dropped."""
+    at = makers.get(value)
+    if at is None or at != len(steps) - 1:
+        return False
+    step = steps[at]
+    src = loc[value]
+    if not target.whole or not (step.memset or target.buffer.role == CARRIED):
+        return False
+    if not src.whole or src.buffer.role != "intermediate" or src.version != 1 or src.buffer.version != 1:
+        return False
+    if last_use.get(roots.get(value, value), -1) != index:
+        return False
+    if tuple(d.folded() for d in src.shape) != tuple(d.folded() for d in target.shape) or src.buffer.dtype != target.buffer.dtype:
+        return False
+    mine = [a for a in step.args if a.loc.buffer is src.buffer]
+    if len(mine) != 1 or mine[0].access != "out" or any(a.loc.buffer is target.buffer for a in step.args):
+        return False
+    mine[0].loc = target
+    buffers.remove(src.buffer)
+    return True
+
+
 def _walk(gop: GraphOp) -> _Walk:
     g = gop.graph
     name = g.name
@@ -372,6 +415,8 @@ def _walk(gop: GraphOp) -> _Walk:
             _fail(name, f"the parameter '{v.name}' is block-scaled ({v.type}); block-scaled tensors are not planned yet")
         if v.type.devscalar:
             role = "devscalar"
+        elif v.name in gop.carried:  # the arena holds it (section 15.2): read (In) or read and written (InOut), never the caller's
+            role = CARRIED
         elif v.access == "inout":
             role = "inout"
         elif gop.param_roles is not None:  # declared: @tilefish.graph(inputs=..., weights=...)
@@ -397,6 +442,7 @@ def _walk(gop: GraphOp) -> _Walk:
         # (the row-major strides of [H, L, L] are (L*L, L, 1): a product of sizes, which the plan writes per bucket as a number)
         return _Loc(b, tuple(t.shape), row_major_strides(t.shape), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
 
+    makers: "dict[Value, int]" = {}  # a value a step made in a buffer of its own (a fresh one) -> the index of that step
     for index, n in enumerate(g.nodes):
         kind = n.attrs.get("kind")
         where = f"the call to '{n.op}' (node #{index})" if kind else f"the op '{n.op}' (node #{index})"
@@ -407,6 +453,17 @@ def _walk(gop: GraphOp) -> _Walk:
                     strides, offset = _layout(name, f"the view {out.ref} made by {n.op} (node #{index})", out.type)
                     loc[out] = _Loc(parent.buffer, tuple(out.type.shape), strides, offset, False, parent.version)
                 continue
+            if n.op == "zeros":  # tilefish.zeros_like: a memset step into a buffer of its own
+                dst = loc[n.outputs[0]] = fresh(n.outputs[0])
+                makers[n.outputs[0]] = len(steps)
+                steps.append(_SymStep(None, [_Arg("dst", dst, "out")], where, memset=True))
+                continue
+            if n.op == "store" and n.inputs[1] is not n.inputs[0]:
+                target = loc[n.inputs[0]]  # type: ignore[index]
+                if _store_in_place(n.inputs[1], target, loc, makers, steps, buffers, roots, last_use, index):  # type: ignore[arg-type]
+                    target.buffer.version += 1
+                    loc[n.outputs[0]] = replace(target, version=target.buffer.version)
+                    continue
             if n.op in ("copy", "store"):
                 value = n.inputs[0] if n.op == "copy" else n.inputs[1]
                 src = loc[value]  # type: ignore[index]
@@ -457,6 +514,7 @@ def _walk(gop: GraphOp) -> _Walk:
         out_locs: "dict[Value, _Loc]" = {}
         for o in returned:
             out_locs[o] = loc[o] = fresh(o)
+            makers[o] = len(steps)
         for p, o in zip(sig_op.tensor_outputs, outs):
             over = _in_place(p, ins, loc, roots, last_use, n, index)
             if over is not None:  # Out[..., MayAlias(r)]: the result is written over r, whose storage nothing reads after this call
@@ -464,6 +522,7 @@ def _walk(gop: GraphOp) -> _Walk:
                 out_locs[o] = loc[o] = replace(over, version=over.buffer.version)
             else:
                 out_locs[o] = loc[o] = fresh(o)
+                makers[o] = len(steps)
         for p, version in zip((p for p in sig_op.tensor_inputs if p.access == "inout"), inouts):
             src = loc[ins[p.name]]
             if not src.whole:
@@ -693,6 +752,23 @@ def copy_problem(args: "Sequence[Mapping[str, Any]]", shapes: "Mapping[str, tupl
     return None
 
 
+MEMSET_ARGS = ("dst",)
+
+
+def memset_problem(args: "Sequence[Mapping[str, Any]]", shapes: "Mapping[str, tuple[str, tuple[int, ...]]]") -> "str | None":
+    """What is wrong with the arguments of a memset step at a bucket (``None``: nothing): exactly one, ``dst``, a dense tensor (the whole buffer or a
+    view whose axes of a size other than 1 have the row-major strides: one run of bytes, which the host sets to zero)."""
+    if [a.get("name") for a in args] != list(MEMSET_ARGS):
+        return f"a memset step has the one argument {list(MEMSET_ARGS)}, got {[a.get('name') for a in args]}"
+    shape, strides, _ = copy_view(args[0], shapes)
+    if not _contiguous(shape, strides):
+        return (
+            f"the dst of a memset is a view of '{args[0]['binding']}' with the shape {list(shape)} and the strides {list(strides)}, which is not dense: a "
+            "memset step sets one run of bytes"
+        )
+    return None
+
+
 # -- binding one step at one bucket ----------------------------------------------------------------------------------------------------
 
 
@@ -873,6 +949,47 @@ def plan_arena(items: "Sequence[ArenaItem]", reuse: bool) -> "tuple[dict[str, in
     return offsets, align_up(end)
 
 
+@dataclass(frozen=True)
+class CarriedLayout:
+    """Where the carried buffers of the plans of one arena are (``docs/plan-schema-1.md``, section 15.2): after the plans' own regions.
+
+    ``base`` is the largest ``arena_bytes`` of the plans (each plan's buffers keep their offsets from the arena's first byte, below it); every carried
+    name of any of the plans has one region from there, in code point order of the names, each ``align_up(bytes)`` long, where ``bytes`` is the largest
+    ``bytes`` the plans give the name, at a multiple of 256. ``total`` is the bytes of the arena: ``base`` and the carried regions. A function of the
+    plans' documents alone, which their digests cover: the pin of the plans (or of their set) covers it, and both hosts compute it alike."""
+
+    base: int
+    regions: "dict[str, tuple[int, int, str]]"  # carried name -> (offset from the arena's first byte, bytes, dtype)
+    total: int
+
+
+def carried_layout(docs: "Sequence[Mapping[str, Any]]") -> CarriedLayout:
+    """The :class:`CarriedLayout` of an arena of the plans ``docs`` (one plan's document for an arena of its own). Two plans that give one carried name
+    two dtypes are refused (:class:`~tilefish.errors.TilefishRuntimeError`): a carried buffer is one tensor of the arena."""
+    from .errors import TilefishRuntimeError
+
+    base = max((d["arena_bytes"] for d in docs), default=0)
+    found: "dict[str, tuple[int, str, str]]" = {}  # name -> (bytes, dtype, the graph that gave the dtype)
+    for d in docs:
+        for b in d["buffers"]:
+            if b["role"] != CARRIED:
+                continue
+            have = found.get(b["name"])
+            if have is not None and have[1] != b["dtype"]:
+                raise TilefishRuntimeError(
+                    f"the carried buffer '{b['name']}' is {have[1]} in the plan of graph '{have[2]}' but {b['dtype']} in the plan of graph '{d['graph']}': "
+                    "the plans of one arena name one tensor by a carried name (give them one dtype, or another name)"
+                )
+            found[b["name"]] = (max(b["bytes"], have[0]) if have else b["bytes"], b["dtype"], have[2] if have else d["graph"])
+    regions: "dict[str, tuple[int, int, str]]" = {}
+    cursor = align_up(base)
+    for name in sorted(found):
+        nbytes, dtype, _ = found[name]
+        regions[name] = (cursor, nbytes, dtype)
+        cursor += align_up(nbytes)
+    return CarriedLayout(base, regions, cursor)
+
+
 def first_fit(base: int, size: int, taken: "Sequence[tuple[int, int]]") -> int:
     """The lowest offset ``>= base`` at which ``[offset, offset + size)`` meets none of the half-open regions ``taken``, which may overlap or nest
     (:func:`plan_arena` happens to give it disjoint ones: every buffer it conflicts with is live at its first step, so they are live together)."""
@@ -979,6 +1096,11 @@ class Plan:
         """The parameters of role ``input``, in the order of the signature (what a call gives every time, with the ``inout`` and ``devscalar`` ones)."""
         return [b["name"] for b in self._doc["buffers"] if b["role"] == "input"]
 
+    @property
+    def carried(self) -> "list[str]":
+        """The parameters of role ``carried``, in the order of the signature: what the arena holds, not the caller (section 15.2)."""
+        return [b["name"] for b in self._doc["buffers"] if b["role"] == CARRIED]
+
     def shape_of(self, name: str, **values: int) -> "tuple[int, ...]":
         """The shape of the buffer ``name`` at the bucket ``values`` (``plan.shape_of("t3", M=64)``): what a tap of it (``taps=``) is given; its dtype
         is in :attr:`buffers`."""
@@ -1011,13 +1133,13 @@ class Plan:
             "buffers:",
         ]
         for b in d["buffers"]:
-            place = "external" if b["offset"] is None else f"arena +{b['offset']}"
+            place = "carried (the arena's carried region)" if b["role"] == CARRIED else "external" if b["offset"] is None else f"arena +{b['offset']}"
             lines.append(f"  {b['name']:<12} {b['role']:<12} {b['dtype']:<5} {b['shape']} {b['bytes']} bytes, {place}")
         last = d["buckets"][-1]
         lines.append(f"steps at {last['values'] or 'the only size'}:")
         for i, st in enumerate(last["steps"]):
             args = ", ".join(a["binding"] + ("[view]" if "view" in a else "") for a in st["args"])
-            lines.append(f"  #{i} {st.get('entry', 'copy')} ({st['kind']}): {args}")
+            lines.append(f"  #{i} {st.get('entry', st['kind'])} ({st['kind']}): {args}")
         return "\n".join(lines)
 
     # -- what a runner needs ----------------------------------------------------------------------------------------------------
@@ -1139,6 +1261,12 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
                 if problem is not None:
                     raise TilefishPlanError(f"graph '{name}' at {combo or 'its only size'}, {s.what}: {problem}")
                 steps_doc.append({"kind": "copy", "args": args_doc})
+                continue
+            if s.memset:  # a memset step: the dense bytes of dst set to zero (no binary, no manifest entry)
+                problem = memset_problem(args_doc, shapes)
+                if problem is not None:  # pragma: no cover - the writer's dst is a whole buffer
+                    raise TilefishPlanError(f"graph '{name}' at {combo or 'its only size'}, {s.what}: {problem}")
+                steps_doc.append({"kind": "memset", "args": args_doc})
                 continue
             assert s.callee is not None
             values: "dict[str, Any]" = {}  # the call's constants by the launched kernel's names: a fixed argument per call is evaluated at the bucket
@@ -1288,7 +1416,7 @@ def _check_resolves(p: Plan) -> None:
     for b in doc["buckets"]:
         shapes = buffer_shapes(doc, b["values"])
         for i, st in enumerate(b["steps"]):
-            if st["kind"] == "copy":  # no binary: copy_problem held it to its rules when it was made
+            if st["kind"] in ("copy", "memset"):  # no binary: copy_problem (memset_problem) held it to its rules when it was made
                 continue
             for callee in p._callees[st["entry"]].variants():
                 bound = resolve_step(callee, st["args"], shapes, f"graph '{doc['graph']}' at {b['values'] or 'its only size'}, step #{i}", st.get("given"))
@@ -1402,9 +1530,10 @@ def _validate(doc: Any, made: bool = False) -> None:
             _bad(f"buffers[{i}].shape must be a list of positive ints and dimension expressions")
         if not _is_int(b["bytes"]) or b["bytes"] < 1:
             _bad(f"buffers[{i}].bytes must be a positive int, got {b['bytes']!r}")
-        if b["role"] in EXTERNAL_ROLES:
+        if b["role"] in HOST_PLACED_ROLES:
             if b["offset"] is not None:
-                _bad(f"buffers[{i}] ('{b['name']}') is external (role {b['role']}): its offset must be null, not {b['offset']!r}")
+                where = "carried (the host places it in the arena's carried region)" if b["role"] == CARRIED else f"external (role {b['role']})"
+                _bad(f"buffers[{i}] ('{b['name']}') is {where}: its offset must be null, not {b['offset']!r}")
         elif not _is_int(b["offset"]) or b["offset"] < 0 or b["offset"] % ARENA_ALIGNMENT:
             _bad(f"buffers[{i}] ('{b['name']}') lives in the arena: its offset must be a non-negative multiple of {ARENA_ALIGNMENT}, got {b['offset']!r}")
         by_name[b["name"]] = b
@@ -1464,8 +1593,11 @@ def _validate(doc: Any, made: bool = False) -> None:
         this: "list[Any]" = []
         for si, st in enumerate(steps):
             is_copy = isinstance(st, dict) and type(st.get("kind")) is str and st.get("kind") == "copy"
+            is_memset = isinstance(st, dict) and type(st.get("kind")) is str and st.get("kind") == "memset"
             if is_copy:  # a copy step: no entry, no workspace
                 _keys(st, f"step #{si}", COPY_KEYS)
+            elif is_memset:  # a memset step: no entry, no workspace
+                _keys(st, f"step #{si}", MEMSET_KEYS)
             else:
                 _keys(st, f"step #{si}", STEP_KEYS, ["workspace", "given"])
                 if not isinstance(st["entry"], str) or not sv._STEM.match(st["entry"]):
@@ -1526,6 +1658,13 @@ def _validate(doc: Any, made: bool = False) -> None:
                 dst = by_name[st["args"][1]["binding"]]
                 if dst["role"] not in WRITABLE_ROLES:
                     _bad(f"step #{si}: a copy step writes '{dst['name']}', whose role is {dst['role']}")
+            if is_memset:  # one dense dst, a buffer a step may write
+                problem = memset_problem(st["args"], shapes)
+                if problem is not None:
+                    _bad(f"step #{si} at {bucket['values']}: {problem}")
+                dst = by_name[st["args"][0]["binding"]]
+                if dst["role"] not in WRITABLE_ROLES:
+                    _bad(f"step #{si}: a memset step writes '{dst['name']}', whose role is {dst['role']}")
             this.append((st["kind"], st.get("workspace"), tuple(names_here), given_names))
             if bi == 0:
                 for a in st["args"]:
@@ -1591,13 +1730,17 @@ def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
     arch = doc["arch"]
     by_name = {b["name"]: b for b in doc["buffers"]}
     for bucket in doc["buckets"]:
-        written: "set[str]" = {b["name"] for b in doc["buffers"] if b["role"] in ("input", "weight", "inout", "devscalar")}  # provided by the caller / the host
+        # provided by the caller, by the host (a device scalar) or by an earlier execution on the arena (a carried buffer, section 15.2)
+        written: "set[str]" = {b["name"] for b in doc["buffers"] if b["role"] in PROVIDED_ROLES}
         for si, st in enumerate(bucket["steps"]):
             if st["kind"] == "copy":  # no entry: it reads src and writes dst (validate_doc held it to its rules)
                 src, dst = (a["binding"] for a in st["args"])
                 if src not in written:
                     _bad(f"step #{si} (copy) of bucket {bucket['values']}: argument 'src' reads '{src}' before any step has written it")
                 written.add(dst)
+                continue
+            if st["kind"] == "memset":  # no entry: it writes dst (validate_doc held it to its rules)
+                written.add(st["args"][0]["binding"])
                 continue
             stem = st["entry"]
             where = f"step #{si} ({stem}) of bucket {bucket['values']}"

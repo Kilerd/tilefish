@@ -52,12 +52,16 @@ launched come after it. A run on another thread that is between its wait and its
 has not recorded yet: **the replay and that run overlap on the arena** (the same intermediates, device scalar slots and workspace) and give wrong bytes with
 no error (3 of 4000 runs of a plan on one thread, against a loop of replays on another, on a B300). A caller who replays a raw graph while another thread
 may use the same plan (``tilefish.run``, the replay of a :class:`CapturedPlan`, whose wait and record are two calls too, or the replay of another raw graph)
-must order them itself (one thread, or a lock of its own around all of them), or use :func:`capture`, whose replay takes the arena's lock.
+must order them itself (one thread, or a lock of its own around all of them), replay through :func:`replay_graph` (which takes the arena's lock), or use
+:func:`capture`, whose replay takes the arena's lock. The second thread that uses an arena such a graph holds gets a ``TilefishOrderWarning``
+(:func:`_note_thread`).
 
 **An arena shared by several plans.** :func:`share_arena` (``tilefish.runtime.share_arena([g1, g2, g3], ...)``) runs the plans of a set on one arena of
 the largest plan's size, each plan's buffers at their own offsets in it (:class:`SharedArena`). Its runners hold one :class:`_Arena` between them, so
 everything above holds for the executions of all of them as for the runs of one plan: one lock and one order event, so a run, a capture, the replay of a
-:class:`CapturedPlan` and a ``run_step`` of plan A are ordered with those of plan B, whatever their threads and streams. Nothing in the arena outlives a run.
+:class:`CapturedPlan` and a ``run_step`` of plan A are ordered with those of plan B, whatever their threads and streams. Nothing in the plans' own regions
+outlives a run; a **carried buffer** (``@tilefish.graph(carried=("h",))``) lives in a region of the arena after them, and the arena notes what each holds in
+the order of the executions (:func:`_check_carried`). Executions that must run concurrently take an arena each (``share_arena(..., name=...)``).
 """
 
 from __future__ import annotations
@@ -69,6 +73,7 @@ import json
 import os
 import pathlib
 import threading
+import warnings
 import weakref
 import dataclasses
 from dataclasses import dataclass
@@ -90,7 +95,7 @@ from ._launch import (
 from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp
 from .dims import DimExpr
 from .signature import MISSING
-from .errors import TilefishManifestError, TilefishPreconditionError, TilefishRuntimeError
+from .errors import TilefishManifestError, TilefishOrderWarning, TilefishPreconditionError, TilefishRuntimeError
 from ._plan import PLAN_NAME, Bound, Plan, plan as make_plan
 from .trace import Value
 
@@ -237,6 +242,10 @@ class Backend:
     def device_index(self, device: Any) -> int:
         raise NotImplementedError
 
+    def current_device(self) -> int:
+        """The index of torch's current CUDA device: where a call that gives no tensor runs (a plan whose parameters are all carried)."""
+        raise NotImplementedError
+
     def capability(self, index: int) -> int:
         raise NotImplementedError
 
@@ -323,6 +332,10 @@ class Backend:
         """Copy ``nbytes`` bytes of device memory from ``src`` to ``dst`` on ``stream`` (a copy step of the plan; captured as a memcpy node)."""
         raise NotImplementedError
 
+    def memset(self, dst: int, nbytes: int, stream: int) -> None:
+        """Set ``nbytes`` bytes of device memory at ``dst`` to zero on ``stream`` (a memset step of the plan; captured as a memset node)."""
+        raise NotImplementedError
+
     def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
         raise NotImplementedError
 
@@ -351,6 +364,9 @@ class TorchBackend(Backend):
         if isinstance(device, int) and not isinstance(device, bool):
             return device
         return runtime._device_index(self.torch, str(device))
+
+    def current_device(self) -> int:
+        return int(self.torch.cuda.current_device())
 
     def capability(self, index: int) -> int:
         return runtime._capability(self.torch, index)
@@ -482,6 +498,11 @@ class TorchBackend(Backend):
 
         _cuda.copy_async(dst, src, nbytes, stream)
 
+    def memset(self, dst: int, nbytes: int, stream: int) -> None:
+        from . import _cuda
+
+        _cuda.memset_async(dst, nbytes, stream)
+
     def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
         from . import _library
 
@@ -563,6 +584,15 @@ class _Arena:
 
     ``captured`` is ``(capture id, stream)`` of the last run captured in a ``torch.cuda.graph`` on this arena: a second run of the arena in the same capture on
     another stream is refused (its external wait node would not depend on the first run's record node, so one replay would race with itself).
+
+    ``carried`` is where the carried buffers of the arena's plans are (section 15.2 of the plan schema: after the plans' own regions), and ``shapes`` what
+    each holds, in the order the executions on the arena were issued (under ``lock``, which is the order they run in on the device): the shape at the bucket
+    of the execution that wrote it last, or ``None`` when no execution wrote it (or one that may have failed). An execution that reads a carried buffer
+    before it writes it is refused unless it holds the shape that execution reads.
+
+    ``caller_graphs`` says a run on this arena was captured in a CUDA graph of the caller's (``torch.cuda.graph``), whose replays take no lock;
+    ``threads`` are the threads that ran, captured, replayed or ``run_step``-ed on the arena; ``warned`` that the warning of :func:`_note_thread` was given;
+    ``ordered`` that a caller's graph was replayed through :func:`replay_graph`, which takes the lock.
     """
 
     handle: Any
@@ -571,6 +601,12 @@ class _Arena:
     lock: threading.Lock
     event: Any = None
     captured: "tuple[int, int] | None" = None
+    carried: "_plan.CarriedLayout | None" = None
+    shapes: "dict[str, tuple[int, ...] | None]" = dataclasses.field(default_factory=dict)
+    caller_graphs: bool = False
+    threads: "set[int]" = dataclasses.field(default_factory=set)
+    warned: bool = False
+    ordered: bool = False
 
 
 @dataclass
@@ -598,6 +634,25 @@ class _CopyBound:
 
 
 @dataclass
+class _MemsetBound:
+    """A memset step at one bucket: ``nbytes`` bytes of ``dst`` (from byte ``dst_offset`` of that buffer) set to zero."""
+
+    dst: str
+    dst_offset: int
+    nbytes: int
+
+    @classmethod
+    def of(cls, args: "Sequence[Mapping[str, Any]]", shapes: "Mapping[str, tuple[str, tuple[int, ...]]]") -> "_MemsetBound":
+        shape, _, offset = _plan.copy_view(args[0], shapes)
+        itemsize = _plan.ITEMSIZE[shapes[args[0]["binding"]][0]]
+        return cls(args[0]["binding"], offset * itemsize, math.prod(shape) * itemsize)
+
+    def check(self, bases: "Mapping[str, int]") -> "tuple[int, int]":
+        """``(dst, nbytes)`` with the real address."""
+        return bases[self.dst] + self.dst_offset, self.nbytes
+
+
+@dataclass
 class _Tap:
     """A debug tap of a run: the buffer ``buffer`` (``nbytes`` bytes, at the bucket) copied into the caller's tensor at ``dst`` after step ``after``."""
 
@@ -616,7 +671,7 @@ def _is_conv_spec(spec: Any) -> bool:
 
 @dataclass
 class _StepRT:
-    bound: "Bound | _CopyBound"
+    bound: "Bound | _CopyBound | _MemsetBound"
     loaded: Any  # the loaded kernel of a kernel step
     order: "tuple[tuple[str, str], ...]"  # (kind, name) of the arguments of a launch, in the ABI's order
     algo: Any  # the pinned algorithm of a GEMM step (its hex), the BuiltConv of a convolution step; None for the other steps
@@ -628,6 +683,10 @@ class _BucketRT:
     values: "dict[str, int]"
     shapes: "dict[str, tuple[str, tuple[int, ...]]]"
     steps: "list[_StepRT]"
+    # the carried buffers the steps read before any of them writes them (which an earlier execution on the arena must have written, in this shape),
+    # and the ones they write (which hold this bucket's shape after the execution)
+    carried_reads: "tuple[str, ...]" = ()
+    carried_writes: "tuple[str, ...]" = ()
 
 
 @dataclass
@@ -703,13 +762,91 @@ def _record(be: Backend, event: Any, stream: int, capturing: bool) -> None:
     raise error
 
 
+def carried_uses(plan: Plan) -> "tuple[tuple[str, ...], tuple[str, ...]]":
+    """``(reads, writes)`` of a plan's carried buffers (section 15.2): the ones whose first use in the steps is a read (a pointer of the binary that is
+    ``in`` or ``inout``, an operand of a GEMM, the source of a copy), which an earlier execution on the arena must have written, and the ones a step
+    writes. The same in every bucket (the bindings are, and so is the ABI of an operator); read from the document and the operators, so it needs no
+    binary."""
+    carried = set(plan.carried)
+    if not carried:
+        return (), ()
+    reads: "list[str]" = []
+    writes: "list[str]" = []
+    seen: "set[str]" = set()
+    for st in plan._doc["buckets"][0]["steps"]:
+        names = [a["name"] for a in st["args"]]
+        if st["kind"] == "copy":
+            access = {"src": "in", "dst": "out"}
+        elif st["kind"] == "memset":
+            access = {"dst": "out"}
+        elif st["kind"] == "library":
+            access = {n: "out" if n == "out" else "in" for n in names}
+        else:
+            extern = plan._callees[st["entry"]].variants()[0].extern
+            assert extern is not None
+            access = {p.name: p.access for p in extern.signature.params if p.kind == "tensor"}
+        for a in st["args"]:
+            name, how = a["binding"], access.get(a["name"], "in")
+            if name not in carried:
+                continue
+            if name not in seen and how in ("in", "inout"):
+                reads.append(name)
+            seen.add(name)
+            if how in ("out", "inout") and name not in writes:
+                writes.append(name)
+    return tuple(reads), tuple(writes)
+
+
+def _check_carried(arena: _Arena, rt: "_BucketRT", graph: str) -> None:
+    """Refuse an execution (under the arena's lock, before anything is enqueued) that reads a carried buffer the executions issued before it on the
+    arena have not left in the shape it reads (none wrote it, or one wrote another shape, or one that wrote it failed)."""
+    for name in rt.carried_reads:
+        want = rt.shapes[name][1]
+        have = arena.shapes.get(name)
+        if have != want:
+            why = (
+                "no execution on this arena has written it (run a plan that writes it first: one that stores into it, zeroes it or updates it in place)"
+                if have is None
+                else f"the execution on this arena that wrote it last left the shape {list(have)}"
+            )
+            raise TilefishPreconditionError(
+                f"the plan of graph '{graph}' reads the carried buffer '{name}' with the shape {list(want)}, but {why}", kind="shape", arg=name
+            )
+
+
+def _carried_written(arena: _Arena, rt: "_BucketRT", done: bool) -> None:
+    """After an execution was enqueued (``done``) or failed: what the carried buffers it writes hold now (its shapes; unknown after a failure)."""
+    for name in rt.carried_writes:
+        arena.shapes[name] = rt.shapes[name][1] if done else None
+
+
+def _note_thread(arena: _Arena, graph: str, caller_graph: bool = False) -> None:
+    """Note the thread that uses the arena (under its lock), and warn once when an arena that a CUDA graph of the caller's holds is used by a second
+    thread: a replay of such a graph takes no lock of tilefish, so it is not ordered with an execution another thread has between its wait for the
+    order event and its record (docs/plan-schema-1.md, section 10, item 7). ``caller_graph``: this use is the capture of such a graph."""
+    arena.threads.add(threading.get_ident())
+    arena.caller_graphs = arena.caller_graphs or caller_graph
+    if arena.caller_graphs and len(arena.threads) > 1 and not arena.warned and not arena.ordered:
+        arena.warned = True
+        warnings.warn(
+            f"the arena of the plan of graph '{graph}' is used by a CUDA graph you captured (tilefish.run inside torch.cuda.graph) and from more than "
+            "one thread: the replay of such a graph takes no lock of tilefish, so it can overlap an execution of the arena on another thread (wrong "
+            "bytes, no error). Capture with tilefish.capture (its replays are ordered), replay your graphs with tilefish.runtime.replay_graph(graph), "
+            "or order them yourself (docs/plan-schema-1.md, section 10, item 7)",
+            TilefishOrderWarning,
+            stacklevel=2,
+        )
+
+
 class PlanRunner:
     """Runs one plan (:class:`~tilefish._plan.Plan`) with binaries from a provider, on a backend. See the module docstring.
 
-    ``arena`` is ``(key, bytes)`` of the arena the runner uses when it is not the plan's own (one per plan layout and device): the arena of a
-    :class:`SharedArena`, which several plans use one at a time."""
+    ``arena`` is ``(key, layout)`` of the arena the runner uses when it is not the plan's own (one per plan layout and device): the arena of a
+    :class:`SharedArena`, which several plans use one at a time, and where its carried buffers are (:class:`~tilefish._plan.CarriedLayout`)."""
 
-    def __init__(self, plan: Plan, provider: Any, backend: "Backend | None" = None, *, arena: "tuple[str, int] | None" = None) -> None:
+    def __init__(
+        self, plan: Plan, provider: Any, backend: "Backend | None" = None, *, arena: "tuple[str, _plan.CarriedLayout] | None" = None
+    ) -> None:
         self.plan = plan
         self.provider = provider
         self._backend = backend
@@ -719,9 +856,17 @@ class PlanRunner:
         self._lock = threading.RLock()
         self.has_library = any(s["kind"] == "library" for s in self._doc["buckets"][0]["steps"])
         self.shared = arena is not None  # the arena is a SharedArena's (other plans run on it too)
-        self._arena_key, self._arena_bytes = arena if arena is not None else (plan.layout_key, self._doc["arena_bytes"])
-        if self._arena_bytes < self._doc["arena_bytes"]:  # pragma: no cover - a SharedArena is sized for every plan it has
-            raise TilefishRuntimeError(f"the arena of {self._arena_bytes} bytes cannot hold the {self._doc['arena_bytes']} of the plan of graph '{plan.name}'")
+        # an arena of its own: the plan's region, then the regions of its carried buffers (section 15.2), which a plan alone keeps between its runs
+        self._arena_key, self._carried = arena if arena is not None else (plan.layout_key, _plan.carried_layout([self._doc]))
+        self._arena_bytes = self._carried.total
+        missing = [b["name"] for b in self._doc["buffers"] if b["role"] == _plan.CARRIED and b["name"] not in self._carried.regions]
+        if self._arena_bytes < self._doc["arena_bytes"] or missing:  # pragma: no cover - a SharedArena is laid out for every plan it has
+            raise TilefishRuntimeError(f"the arena of {self._arena_bytes} bytes was not laid out for the plan of graph '{plan.name}'")
+        sig = plan.graph.signature
+        carried = set(plan.carried)
+        # what a call takes: the parameters but the carried ones, which the arena holds
+        self._call_signature = sig.call_signature.replace(parameters=[q for q in sig.call_signature.parameters.values() if q.name not in carried])
+        self._carried_uses = carried_uses(plan)
         _runners.add(self)
 
     @property
@@ -774,7 +919,8 @@ class PlanRunner:
                 if nbytes and ptr % _plan.ARENA_ALIGNMENT:
                     raise TilefishRuntimeError(f"the arena was allocated at {ptr:#x}, which is not aligned to {_plan.ARENA_ALIGNMENT} bytes")
                 event = be.new_event(index) if nbytes else None  # a plan with no arena shares no memory between its runs: nothing to order
-                arena = be.arena_registry()[(self._arena_key, index)] = _Arena(handle, ptr, nbytes, threading.Lock(), event)
+                arena = _Arena(handle, ptr, nbytes, threading.Lock(), event, carried=self._carried)
+                be.arena_registry()[(self._arena_key, index)] = arena
         return arena
 
     def _bucket(self, values: "Mapping[str, int]", index: int) -> _BucketRT:
@@ -807,6 +953,9 @@ class PlanRunner:
             if st["kind"] == "copy":  # a device-to-device copy: no binary to build or load
                 steps.append(_StepRT(_CopyBound.of(st["args"], shapes), None, (), None, None))
                 continue
+            if st["kind"] == "memset":  # bytes set to zero: no binary either
+                steps.append(_StepRT(_MemsetBound.of(st["args"], shapes), None, (), None, None))
+                continue
             callee = callees.get(st["entry"])
             where = f"graph '{self.plan.name}' at {values or 'its only size'}, step #{i} ({st['entry']})"
             if callee is None:
@@ -836,7 +985,7 @@ class PlanRunner:
                 be.check_grid(loaded, bound.grid)
                 steps.append(_StepRT(bound, loaded, order, None, None))
         be.warm(index, self.has_library)
-        return _BucketRT(dict(values), shapes, steps)
+        return _BucketRT(dict(values), shapes, steps, *self._carried_uses)
 
     # -- running ----------------------------------------------------------------------------------------------------------------
 
@@ -852,7 +1001,14 @@ class PlanRunner:
                 stream = be.stream(index)
                 if capturing:
                     self._check_one_stream_per_capture(arena, stream)
-                _ordered(be, arena, stream, capturing, lambda: self._enqueue(call, stream, index, slots=True))
+                _check_carried(arena, call.rt, self.plan.name)
+                _note_thread(arena, self.plan.name, caller_graph=capturing)
+                done = False
+                try:
+                    _ordered(be, arena, stream, capturing, lambda: self._enqueue(call, stream, index, slots=True))
+                    done = True
+                finally:
+                    _carried_written(arena, call.rt, done)
         return runtime._result(call.results)
 
     def _bind(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> "_BoundCall":
@@ -862,10 +1018,12 @@ class PlanRunner:
         graph = self.plan.graph
         sig = graph.signature
         doc = self._doc
+        carried = self.plan.carried
         try:
-            bound = sig.call_signature.bind(*args, **kwargs)
+            bound = self._call_signature.bind(*args, **kwargs)
         except TypeError as e:
-            raise TilefishPreconditionError(f"{graph.name}: {e}; signature {sig}", kind="shape") from None
+            held = f" (the carried parameters {', '.join(carried)} are held by the plan's arena: a call does not give them)" if carried else ""
+            raise TilefishPreconditionError(f"{graph.name}: {e}; signature {sig}{held}", kind="shape") from None
         bound.apply_defaults()
         scalar_params = [p for p in sig.params if p.kind == "tensor" and p.is_devscalar]
         sources: "dict[str, Any]" = {}
@@ -874,7 +1032,20 @@ class PlanRunner:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 bound.arguments[p.name] = v = be.devscalar_tensor(devscalar_number(p, v), p.type.dtype.name)  # type: ignore[union-attr]
             sources[p.name] = v
-        call = bind_call(graph.name, sig, bound.args, bound.kwargs)
+        if not carried:
+            call = bind_call(graph.name, sig, bound.args, bound.kwargs)
+            index = self._device_index(call, sources)
+        else:  # the tensors of the other parameters, then the dimensions from them and from the carried buffers the plan reads (their shapes)
+            call, equations = self._bind_given(bound.arguments)
+            index = self._device_index(call, sources)
+            arena = self.arena_of(index)
+            params = {p.name: p for p in sig.params}
+            for name in self._carried_uses[0]:
+                have = arena.shapes.get(name) if arena is not None else None
+                p = params[name]
+                if have is not None and len(have) == len(p.type.shape):  # (otherwise the read is refused under the arena's lock)
+                    equations.extend((name, axis, pattern, actual, f"{p.type} (the carried buffer)", "dimension") for axis, (pattern, actual) in enumerate(zip(p.type.shape, have)))
+            call.dims = solve_dims(graph.name, equations)
         check_dim_constraints(call.dims, buckets=False)
         by_name = dims_by_name(call.dims)
         values: "dict[str, int]" = {}
@@ -889,12 +1060,6 @@ class PlanRunner:
                     arg=n,
                 )
             values[n] = by_name[n]
-        tensors = {n: t for n, t in call.tensors.items() if n not in sources}
-        infos = {n: i for n, i in call.infos.items() if n not in sources}
-        device = runtime._device_of(infos, tensors)
-        if getattr(device, "type", None) != "cuda":
-            raise TilefishRuntimeError(f"jit and replay run on a CUDA device; the tensors are on {device}")
-        index = be.device_index(device)
         arch = self.plan.arch
         if arch is not None and arch != f"sm_{be.capability(index)}":
             raise TilefishRuntimeError(f"the plan of graph '{graph.name}' was built for {arch}, but device {index} is sm_{be.capability(index)}")
@@ -903,6 +1068,42 @@ class PlanRunner:
             if where != "cpu" and be.device_index(where) != index:
                 raise TilefishPreconditionError(f"the device scalar '{name}' is on {where}, but the other tensors of the call are on device {index}", kind="device", arg=name)
         return _BoundCall(call, sources, values, index)
+
+    def _device_index(self, call: Any, sources: "Mapping[str, Any]") -> int:
+        """The device of a call: its tensors' (not the device scalars', which may be on the host). A call of a plan whose parameters are all carried or
+        device scalars has none: it runs on torch's current device."""
+        be = self.backend
+        tensors = {n: t for n, t in call.tensors.items() if n not in sources}
+        infos = {n: i for n, i in call.infos.items() if n not in sources}
+        if not tensors and self.plan.carried:
+            return be.current_device()
+        device = runtime._device_of(infos, tensors)
+        if getattr(device, "type", None) != "cuda":
+            raise TilefishRuntimeError(f"jit and replay run on a CUDA device; the tensors are on {device}")
+        return be.device_index(device)
+
+    def _bind_given(self, arguments: "Mapping[str, Any]") -> "tuple[Any, list[tuple[Any, ...]]]":
+        """What :func:`~tilefish._launch.bind_call` does for a graph with carried parameters, up to the dimensions: the tensor of every other ``In`` and
+        ``InOut`` parameter checked against its type (dtype, rank, density) and its shape as equations, which the caller solves with those of the carried
+        buffers the plan reads."""
+        from ._launch import Call
+
+        sig = self.plan.graph.signature
+        carried = set(self.plan.carried)
+        tensors: "dict[str, Any]" = {}
+        infos: "dict[str, Any]" = {}
+        equations: "list[tuple[Any, ...]]" = []
+        for p in sig.params:
+            if p.kind != "tensor" or p.access == "out" or p.name in carried:
+                continue
+            t = arguments[p.name]
+            info = tensor_info(p.name, t)
+            check_tensor(p, info)
+            tensors[p.name] = t
+            infos[p.name] = info
+            assert p.type is not None
+            equations.extend((p.name, axis, pattern, actual, str(p.type), "dimension") for axis, (pattern, actual) in enumerate(zip(p.type.shape, info.shape)))
+        return Call(tensors, infos, {}, {}), equations
 
     def _call(self, bound: "_BoundCall", outputs: Any, slots_in_graph: bool, taps: Any = None) -> "_Call":
         """The bucket's binaries and the arena (made the first time, outside a capture), the outputs (the caller's, or allocated), the address of every
@@ -939,6 +1140,8 @@ class PlanRunner:
                 made.append((position, t_out))
                 bases[name] = int(t_out.data_ptr())
                 written.append(name)
+            elif role == _plan.CARRIED:  # in the arena's carried region, after the plans' own regions
+                bases[name] = arena.ptr + self._carried.regions[name][0]
             else:  # in the arena
                 bases[name] = arena.ptr + b["offset"]
         self._check_externals(bases, written, rt, arena)
@@ -964,7 +1167,7 @@ class PlanRunner:
         """The TMA descriptors of a checked kernel step (``real``: its tensors with the addresses of the call), by argument name: each encoded from
         its tensor's address, shape and strides (:func:`tilefish.runtime.tensor_map_arg`). Encoded at every execution from what it binds, so a
         descriptor is never one of another binding (another external, another arena)."""
-        if isinstance(st.bound, _CopyBound) or st.algo is not None:
+        if isinstance(st.bound, (_CopyBound, _MemsetBound)) or st.algo is not None:
             return {}
         spec = st.bound.spec
         return {a.name: runtime.tensor_map_arg(spec, a.name, real[a.name], self.backend.encode_tensor_map) for a in spec.args if a.kind == "tensordesc"}
@@ -991,6 +1194,9 @@ class PlanRunner:
         if isinstance(st.bound, _CopyBound):
             src, dst, nbytes = real
             be.copy(dst, src, nbytes, stream)
+        elif isinstance(st.bound, _MemsetBound):
+            dst, nbytes = real
+            be.memset(dst, nbytes, stream)
         elif st.algo is not None and _is_conv_spec(st.bound.spec):
             names = list(st.bound.names)
             be.conv(st.algo, real[names[0]].ptr, real[names[1]].ptr, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
@@ -1011,9 +1217,9 @@ class PlanRunner:
             be.launch(st.loaded, st.bound.grid, launch_args, stream)
 
     def _written(self, st: "_StepRT") -> "set[str]":
-        """The buffers a step writes: a copy's destination, a GEMM's ``out``, the ``out`` and ``inout`` pointers of a kernel."""
+        """The buffers a step writes: a copy's or a memset's destination, a GEMM's ``out``, the ``out`` and ``inout`` pointers of a kernel."""
         b = st.bound
-        if isinstance(b, _CopyBound):
+        if isinstance(b, (_CopyBound, _MemsetBound)):
             return {b.dst}
         written = {"out"} if st.algo is not None else b.written
         return {binding for name, binding in zip(b.names, b.bindings) if name in written}
@@ -1088,7 +1294,7 @@ class PlanRunner:
         be = self.backend
         sig = self.plan.graph.signature
         scalar_names = [p.name for p in sig.params if p.kind == "tensor" and p.is_devscalar]
-        others = [n for n in sig.call_signature.parameters if n not in scalar_names]
+        others = [n for n in self._call_signature.parameters if n not in scalar_names]  # (not the carried parameters: the arena holds them)
         if len(externals) > len(others):
             raise TilefishPreconditionError(
                 f"tilefish.capture of graph '{self.plan.name}' takes at most {len(others)} externals ({', '.join(others)}): the device scalars "
@@ -1230,6 +1436,7 @@ class PlanRunner:
                 descs = self._descriptors(st, real)  # of the caller's tensors
             with arena.lock, be.scope(index):
                 stream = be.stream(index)
+                _note_thread(arena, self.plan.name)
                 _ordered(be, arena, stream, False, lambda: self._enqueue_step(st, real, bases, stream, index, descs))
 
     def _check_output(self, name: str, t: Any, dtype: str, shape: "tuple[int, ...]", index: int) -> None:
@@ -1258,7 +1465,7 @@ class PlanRunner:
                         "caller must not be in it"
                         + (
                             " (the arena is shared with other plans, which write all of its bytes: a value that outlives a run is a returned value, in a "
-                            "tensor of the caller)"
+                            "tensor of the caller, or a carried buffer of the arena)"
                             if self.shared
                             else ""
                         ),
@@ -1333,7 +1540,15 @@ class CapturedPlan:
                     )
                 with arena.lock:
                     s = be.stream(index)
-                    _ordered(be, arena, s, False, lambda: self._enqueue(s))
+                    rt = self._call.rt
+                    _check_carried(arena, rt, runner.plan.name)
+                    _note_thread(arena, runner.plan.name)
+                    done = False
+                    try:
+                        _ordered(be, arena, s, False, lambda: self._enqueue(s))
+                        done = True
+                    finally:
+                        _carried_written(arena, rt, done)
 
     def _enqueue(self, stream: int) -> None:
         be = self._runner.backend
@@ -1558,9 +1773,10 @@ class WeightedRun:
         self._runner = runner
         self._weights = weights
         sig = runner.plan.graph.signature
-        self._names = [n for n in sig.call_signature.parameters if n not in weights]  # what a run takes, in the order of the signature
+        call = runner._call_signature  # the parameters a call gives (not the carried ones, which the arena holds)
+        self._names = [n for n in call.parameters if n not in weights]  # what a run takes, in the order of the signature
         scalars = {p.name for p in sig.params if p.kind == "tensor" and p.is_devscalar}
-        self._others = [n for n in sig.call_signature.parameters if n not in scalars]  # the externals of a capture, weights included
+        self._others = [n for n in call.parameters if n not in scalars]  # the externals of a capture, weights included
 
     def __repr__(self) -> str:
         return f"WeightedRun(graph={self.plan.name!r}, weights={list(self._weights)}, takes={self._names})"
@@ -1696,32 +1912,52 @@ class SharedArena:
     device, in the order they were issued: they cannot run concurrently. A ``torch.cuda.graph`` capture of runs on the arena on two streams of one
     capture is refused, as for one plan.
 
-    **What outlives a run.** Nothing in the arena: the next execution, of any plan of the arena, writes over it. A value one plan makes and a later
-    plan reads is a **returned value** of the first (a tensor of the caller's: ``outputs=``, or allocated by the run) passed as an argument of the
-    second. A tensor of the caller that overlaps the arena, anywhere in it (not only in the part of the plan that runs), is refused, as is a tap or a
-    tensor of :meth:`run_step` that does: what would be overwritten is refused, never corrupted.
+    **What outlives a run.** In the plans' own regions, nothing: the next execution, of any plan of the arena, writes over it. A value one plan
+    makes and a later plan reads is a **returned value** of the first (a tensor of the caller's: ``outputs=``, or allocated by the run) passed as an
+    argument of the second, or a **carried buffer** (section 15.2): a parameter the plans declare ``carried=`` (``@tilefish.graph(carried=("h",))``),
+    which the arena holds in a region of its own after the plans' regions (:attr:`carried`), which no other buffer of any plan shares, and which a
+    plan that writes it leaves there for the next. An execution that reads a carried buffer is refused unless the executions issued before it on the
+    arena left it in the shape it reads. A tensor of the caller that overlaps the arena, anywhere in it (not only in the part of the plan that
+    runs), is refused, as is a tap or a tensor of :meth:`run_step` that does: what would be overwritten is refused, never corrupted.
 
-    Arenas are kept per layout as for one plan: every ``SharedArena`` of the same plans (the same layouts, in ``jit`` or ``replay``) on one device uses
-    one arena, kept until ``tilefish.runtime.clear_caches()``; a plan run alone (``tilefish.run``) has its own arena, not this one."""
+    Arenas are kept per layout as for one plan: every ``SharedArena`` of the same plans (the same layouts, in ``jit`` or ``replay``) and the same
+    ``name`` on one device uses one arena, kept until ``tilefish.runtime.clear_caches()``; another ``name`` is another arena, with its own lock, order
+    event and carried buffers, so executions on two of them run concurrently (one arena per stream, say). A plan run alone (``tilefish.run``) has its
+    own arena, not this one."""
 
-    def __init__(self, runners: "Sequence[PlanRunner]") -> None:
+    def __init__(self, runners: "Sequence[PlanRunner]", name: "str | None" = None) -> None:
         runners = list(runners)
         if not runners:
             raise TilefishRuntimeError("a shared arena is the arena of one plan or more: give the plans that share it")
+        if name is not None and (not isinstance(name, str) or not name):
+            raise TilefishRuntimeError(f"name= of a shared arena is a non-empty string (one arena per name: one per stream, say), got {name!r}")
         names = [r.plan.name for r in runners]
         twice = sorted({n for n in names if names.count(n) > 1})
         if twice:
             raise TilefishRuntimeError(f"a shared arena has each plan once: {', '.join(twice)} is given twice")
-        backends = {id(r._backend) for r in runners}
+        # a runner that has not run yet has no backend: it gets the process's TorchBackend when it first needs one (as a runner that ran has it)
+        default = _torch_backend[0] if _torch_backend else None
+        backends = {id(r._backend if r._backend is not None else default) for r in runners}
         if len(backends) != 1:
             raise TilefishRuntimeError("the plans of a shared arena run on one backend")
         layouts = sorted(r.plan.layout_key for r in runners)
+        self.name = name
         self.key = "shared:" + hashlib.sha256(SHARED_ARENA_TAG + "\0".join(layouts).encode("ascii")).hexdigest()
-        self.arena_bytes = max(r.plan.arena_bytes for r in runners)
-        self._runners = {r.plan.name: PlanRunner(r.plan, r.provider, r._backend, arena=(self.key, self.arena_bytes)) for r in runners}
+        if name is not None:  # another arena of the same plans: its own memory, lock, order event and carried buffers
+            self.key += ":" + hashlib.sha256(name.encode("utf-8")).hexdigest()
+        self.layout = _plan.carried_layout([r.plan._doc for r in runners])
+        self.arena_bytes = self.layout.total
+        self._runners = {r.plan.name: PlanRunner(r.plan, r.provider, r._backend, arena=(self.key, self.layout)) for r in runners}
 
     def __repr__(self) -> str:
-        return f"SharedArena(plans={list(self._runners)}, arena_bytes={self.arena_bytes})"
+        named = "" if self.name is None else f", name={self.name!r}"
+        return f"SharedArena(plans={list(self._runners)}, arena_bytes={self.arena_bytes}{named})"
+
+    @property
+    def carried(self) -> "dict[str, tuple[int, int, str]]":
+        """The carried buffers of the plans (section 15.2), by name: ``(offset from the arena's first byte, bytes, dtype)``, after the plans' own
+        regions."""
+        return dict(self.layout.regions)
 
     @property
     def names(self) -> "list[str]":
@@ -1789,11 +2025,16 @@ def share_arena(
     plan: Any = None,
     pin: "str | None" = None,
     trust_directory: bool = False,
+    name: "str | None" = None,
 ) -> SharedArena:
     """The plans of ``graphs`` on **one arena** they share, run one at a time (:class:`SharedArena`; ``docs/plan-schema-1.md``, section 15.1).
 
     ``replay``: the plans of the graphs in the plan set ``plan=<directory>``, verified with ``pin=`` (the set's digest) or ``trust_directory=True``, as
-    :func:`tilefish.run` loads them. ``jit``: an item is a graph (its default plan) or a :class:`~tilefish._plan.Plan` that ``tilefish.plan`` made."""
+    :func:`tilefish.run` loads them. ``jit``: an item is a graph (its default plan) or a :class:`~tilefish._plan.Plan` that ``tilefish.plan`` made.
+
+    ``name=`` names the arena: every ``share_arena`` of the same plans with the same name (or without one) on a device is one arena, and another name
+    is another one. The executions on one arena run one after the other on the device, whatever their streams; executions that must run concurrently
+    (on two streams) need an arena each: ``share_arena([g], name="lane0")``, ``share_arena([g], name="lane1")`` for one plan on two streams."""
     if isinstance(graphs, (str, GraphOp, Plan)) or not isinstance(graphs, (list, tuple)):
         raise TilefishRuntimeError(f"share_arena takes a list of graphs (or of plans, in jit), got {graphs!r}")
     if mode not in ("jit", "replay"):
@@ -1808,7 +2049,27 @@ def share_arena(
             runners.append(_runner_for(item, "share_arena", mode, plan, pin, trust_directory))
         else:
             raise TilefishRuntimeError(f"share_arena takes @tilefish.graph objects{' (or plans)' if mode == 'jit' else ''}, got {item!r}")
-    return SharedArena(runners)
+    return SharedArena(runners, name=name)
+
+
+def replay_graph(graph: Any, stream: Any = None) -> None:
+    """Replay a CUDA graph of the caller's (a ``torch.cuda.CUDAGraph`` in which ``tilefish.run`` of plans was captured) **ordered with every
+    execution of those plans on any thread**: ``graph.replay()`` on ``stream`` (default: the current stream) under the lock of every arena such a
+    graph was captured on. Its event nodes order it on the device (``docs/plan-schema-1.md``, section 10, item 7), and the lock makes sure no
+    execution of another thread is between its wait for the order event and its record while the graph is launched. A replay that bypasses this
+    (``graph.replay()`` itself) is ordered only with what the thread that issues it does; ``tilefish.capture`` makes a graph whose own replay is
+    ordered."""
+    be = torch_backend()
+    with _gate.shared():
+        arenas = sorted((a for a in list(be.arena_registry().values()) if a.caller_graphs), key=id)  # one order of the locks: no two replays deadlock
+        with contextlib.ExitStack() as held:
+            for a in arenas:
+                held.enter_context(a.lock)
+            for a in arenas:
+                a.ordered = True  # the caller orders the replays of its graphs: the warning of _note_thread is not for it
+                a.threads.add(threading.get_ident())
+            with be.torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+                graph.replay()
 
 
 def _plan_directory(plan: Any) -> Any:
@@ -2135,6 +2396,11 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
             kind = n.attrs.get("kind")
             if kind is None and n.op == "copy":  # a new tensor of its own
                 env[n.outputs[0]] = env[n.inputs[0]].contiguous().clone()  # type: ignore[index]
+                continue
+            if kind is None and n.op == "zeros":  # tilefish.zeros_like: a new tensor of zero bytes
+                t = n.outputs[0].type
+                dtype = getattr(torch, TORCH_DTYPE_NAMES[t.dtype.name].split(".")[1])  # type: ignore[union-attr]
+                env[n.outputs[0]] = torch.zeros([size(d) for d in t.shape], dtype=dtype, device=getattr(anchor, "device", None))
                 continue
             if kind is None and n.op == "store":  # `param[...] = value` into an InOut parameter: the caller's tensor gets the value
                 target = env[n.inputs[0]]  # type: ignore[index]
