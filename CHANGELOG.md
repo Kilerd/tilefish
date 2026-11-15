@@ -4,6 +4,21 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### Breaking changes
+
+- A float to integer cast in a kernel body says its rounding: `x.to(i32)` of a float tensor raises a `TilefishTypeError` at the
+  declaration (it used to trace and then be refused by the lowering, rule `cast.float-to-int`). Write
+  `x.to(i32, rounding="rz")` for a truncation.
+
+### Kernels and ops
+
+- Float to integer casts are lowered: `x.to(i32 | i64 | u8, rounding="rn" | "rz" | "rd" | "ru", saturate=True | False)` (from f32, bf16,
+  f16, e4m3 or e5m2). `saturate=True`, the default, clamps to the type's range with a NaN 0; `saturate=False` keeps the low bits of the
+  `i64`. Each is a helper of inline PTX (`cvt.rni.s32.f32`, ...), and the `reference` mode computes the declared mode exactly: the two are
+  byte-identical on every f32 bit pattern. Note 15 of `tilefish.lower` says what torch's casts are in these terms.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

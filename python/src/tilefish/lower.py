@@ -99,10 +99,15 @@ load of a tensor            ``tl.load(p + offs, mask=mask, other=0)``           
                                                                                          ``tl.load(p + row)``, no mask.
 ``x.to(dt)``                ``v.to(tl.<dt>)``, exactly where the IR has the cast        Triton's default conversion (note 1);
                                                                                          no ``fp_downcast_rounding`` argument.
-                                                                                         A float to integer cast is rejected
-                                                                                         (rule ``cast.float-to-int``).
+                                                                                         A float to integer cast says its
+                                                                                         rounding (the next row).
                                                                                          A narrowing cast gets ``# rounding
                                                                                          point``. Nothing else is ever cast.
+``x.to(i32 | i64 | u8,      a helper of inline PTX: ``cvt.rni.s32.f32`` (``rzi``,        round to nearest even, toward zero,
+rounding="rn" | "rz" |      ``rmi``, ``rpi``); ``u8``: then ``max.s32``, ``min.s32``     down or up, no default; saturating
+"rd" | "ru",                (to [0, 255]); ``i64`` and every wrapping cast:              (the default): clamped to the type's
+saturate=True | False)``    ``cvt.rni.s64.f32``, a NaN made 0 (``testp``, ``selp``),     range, NaN 0; wrapping: the low bits
+                            then the low bits (``.to()``)                                of the i64 (note 15).
 ``x.to(bf16,                f32 to bf16 on the bits: ``b = x.to(tl.uint32,                  the same rounding; a NaN keeps its
 nan="preserve")``           bitcast=True)``, ``(b + 0x7FFF + ((b >> 16) & 1)) >> 16``,      sign and top payload bits, quiet
                             a NaN ``(b >> 16) | 0x40``                                      (note 1). ``nan="canonical"`` is the
@@ -202,10 +207,10 @@ Notes (the facts behind the table):
    round to nearest even and **satfinite**, saturating at the largest finite value (448, 57344) with
    infinities included, where torch overflows to NaN (1000 to ``e4m3``) or infinity (1e5 to ``e5m2``); NaN stays
    NaN. The ``reference`` mode models ``satfinite``, not torch's cast. Integer to float and integer to integer
-   casts are the plain conversions. A **float to integer cast is rejected** by the lowering (rule
-   ``cast.float-to-int``), because its rounding and saturation modes are not supported yet; what Triton does,
-   measured for a hand-written kernel on sm_103, is the reason: ``i32`` is ``cvt.rzi.s32.f32`` (truncation toward zero,
-   saturating, NaN is 0), ``i64`` is ``cvt.rzi.s64.f32`` (the same, but NaN is ``-2**63``), and ``u8`` is
+   casts are the plain conversions. A **float to integer cast says its rounding and saturation** (note 15) and is written out as
+   inline PTX, not Triton's ``.to()``, because of what Triton does, measured for a hand-written kernel on sm_103: ``i32`` is
+   ``cvt.rzi.s32.f32`` (truncation toward zero, saturating, NaN is 0), ``i64`` is ``cvt.rzi.s64.f32`` (the same, but NaN is
+   ``-2**63``), and ``u8`` is
    ``cvt.rzi.u16.f32`` followed by keeping the low byte: truncated and clamped to [0, 65535] (negative and NaN
    give 0), then reduced modulo 256, so ``-1.5`` is 0, ``255.5`` is 255, ``256`` is 0, ``300`` is 44, ``1000`` is
    232 and anything from 65535 up is 255; it neither saturates at 255 nor wraps like C. torch differs again
@@ -381,6 +386,28 @@ Notes (the facts behind the table):
     argument is passed through, ``tl.where(tl.abs(x) < 2**-126, x, libdevice.tanh(x))``, and the bits are torch's on every input. The
     ``reference`` mode models the flush in the default math (``torch.where(|x| < 2**-126, x * 0.0, torch.tanh(x))``) and is torch's ``tanh`` in
     IEEE math: byte-identical to the binary in both. ``tanh.approx.f32`` (one instruction, about ``2**-11`` relative error) is not used.
+15. **Float to integer casts.** ``x.to(i32, rounding=..., saturate=...)`` (also ``i64`` and ``u8``; from f32, or from bf16, f16, e4m3 or e5m2,
+    which are widened to f32 first, exactly) says how it rounds and what a value out of range becomes; ``rounding`` has no default, and no other
+    cast takes either. ``rounding="rn"`` rounds to the nearest integer, a tie to the even one (``2.5`` is 2, ``-0.5`` is 0), ``"rz"`` toward zero,
+    ``"rd"`` down (toward ``-inf``), ``"ru"`` up; a subnormal is rounded as it is (``ru`` of ``1e-45`` is 1, ``rd`` of ``-1e-45`` is -1).
+    ``saturate=True``, the default, clamps the rounded value to the type's range (an infinity to its bound) and makes a NaN 0, for every type
+    alike: Rust's ``as`` with that rounding, CUDA's ``__float2int_rn`` family for 32 bits. ``saturate=False`` keeps the low ``bits`` bits of the
+    rounded value as an ``i64`` (two's complement, modulo ``2**bits``), where a value outside the ``i64`` range has saturated first and a NaN is
+    0: what C and torch do for a narrow type (``-1.5`` to ``u8`` with ``rz`` is 255, ``300`` is 44). For ``i64`` the two modes are one. The
+    default saturates because a saturated value is never far from the true one and is the same on every type, where a wrapped one is the cast
+    of C, chosen on purpose; the rounding has no default because a truncation and a rounding are both common and differ by one everywhere.
+    Each cast is a module-level helper of inline PTX (``_tf_f2i_s32_rn``), so the instruction is the contract and Triton's ``.to()`` (whose ``u8``
+    is neither of these, note 1) is not involved: ``cvt.rni.s32.f32`` (``rzi``, ``rmi``, ``rpi`` for the others), which saturates and gives 0
+    for a NaN, for a saturating ``i32``; the same then ``max.s32`` and ``min.s32`` with 0 and 255 for a saturating ``u8``, whose ``.to(tl.uint8)``
+    then keeps the value; ``cvt.rni.s64.f32`` with a NaN made 0 (``testp.notanumber`` and ``selp``: the ``cvt`` makes a NaN ``-2**63``) for
+    ``i64`` and for every wrapping cast, which then takes the low bits with ``.to(tl.int32)`` / ``.to(tl.uint8)`` (a truncation of an
+    integer). None has ``.ftz``. The ``reference`` mode computes the declared mode exactly (in float64 and int64, not torch's cast), and is
+    byte-identical to the binary on every one of the ``2**32`` f32 bit patterns for every type, rounding and mode (and on every bf16 and f16),
+    measured on a B300 MIG slice (``tests/test_gpu_f2i.py``). Measured there, over every f32, against torch 2.9.1's CUDA casts:
+    ``x.to(torch.int32)`` is ``rz`` saturating on every input (``cvt.rzi.s32.f32``); ``x.to(torch.int64)`` is ``rz`` except on the 16 777 214
+    NaNs, which it makes ``-2**63``; ``x.to(torch.uint8)`` is ``rz`` wrapping on every input (c10 casts through ``int64``), and differs from
+    ``rz`` saturating on 712 048 640; ``x.to(torch.int64).to(torch.int32)`` is ``rz`` wrapping; ``torch.round(x)``, ``torch.floor(x)`` and
+    ``torch.ceil(x)`` then ``.to(torch.int32)`` are ``rn``, ``rd`` and ``ru`` saturating.
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -509,7 +536,7 @@ _SILU = (  # x / (1 + expf(-x)), as torch's silu kernel compiles: the negation f
 _IEEE_HEADER = "math: ieee (note 13: / and sqrt are IEEE 754, exp is expf, silu torch's, rsqrt rsqrtf, sin and tanh keep a subnormal; no flush to zero)"
 
 
-def _asm(instructions: "Iterable[str]", constraints: str, args: str, regs: str = "") -> "list[str]":
+def _asm(instructions: "Iterable[str]", constraints: str, args: str, regs: str = "", dtype: str = "tl.float32") -> "list[str]":
     """The body of a helper that is one block of inline PTX (one element per instance), its instructions one per line of the string."""
     lines = ["return tl.inline_asm_elementwise("]
     if regs:
@@ -519,7 +546,7 @@ def _asm(instructions: "Iterable[str]", constraints: str, args: str, regs: str =
     else:
         (only,) = instructions
         lines.append(f'    "{only}",')
-    lines += [f'    "{constraints}",', f"    [{args}],", "    dtype=tl.float32,", "    is_pure=True,", "    pack=1,", ")"]
+    lines += [f'    "{constraints}",', f"    [{args}],", f"    dtype={dtype},", "    is_pure=True,", "    pack=1,", ")"]
     return lines
 
 
@@ -538,6 +565,31 @@ _IEEE: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {  # op -> (paramet
     "tanh": ("x", ("libdevice's tanhf (built with flush to zero), but a subnormal argument is its own tanh, as without flush to zero (note 14)",),
              ["return tl.where(tl.abs(x) < 1.1754943508222875e-38, x, libdevice.tanh(x))"]),
 }  # (cos is libdevice's cosf in both: it has the same bits with and without flush to zero, note 10)
+
+
+# -- float to integer casts (note 15) ------------------------------------------------------------------
+# Each is a block of inline PTX, so that the instruction is the contract (not what Triton's .to() lowers to). The f32 source has no
+# ``.ftz``: a subnormal rounds up to 1 (``ru``) or down to -1 (``rd``) as it should.
+
+_F2I_ROUND = {"rn": "rni", "rz": "rzi", "rd": "rmi", "ru": "rpi"}  # the integer rounding of the cvt of each mode
+
+
+def _f2i_helper(kind: str, rounding: str) -> "tuple[tuple[str, ...], list[str]]":
+    """The comment and the body of the helper that converts an f32 to ``kind`` with ``rounding``: ``s32`` (saturating, NaN 0), ``u8`` (an
+    ``i32`` in ``[0, 255]``: saturating, NaN 0) or ``s64`` (saturating, NaN 0; the wrapping casts take their low bits)."""
+    r = _F2I_ROUND[rounding]
+    if kind == "s32":  # PTX: a float to integer cvt saturates, and a NaN of an f32 is 0 for a destination narrower than 64 bits
+        return (f"f32 to i32, {rounding}: cvt.{r}.s32.f32, which saturates (an infinity to the bound) and gives 0 for a NaN",), _asm(
+            [f"cvt.{r}.s32.f32 $0, $1;"], "=r,f", "x", dtype="tl.int32"
+        )
+    if kind == "u8":
+        return (f"f32 to u8, {rounding}, saturating: cvt.{r}.s32.f32 (NaN 0), then clamped to [0, 255]",), _asm(
+            [f"cvt.{r}.s32.f32 t, $1;", "max.s32 t, t, 0;", "min.s32 $0, t, 255;"], "=r,f", "x", ".reg .s32 t;", dtype="tl.int32"
+        )
+    assert kind == "s64", kind
+    return (f"f32 to i64, {rounding}: cvt.{r}.s64.f32, which saturates; a NaN, which the cvt makes -2**63, is 0",), _asm(
+        [f"cvt.{r}.s64.f32 t, $1;", "testp.notanumber.f32 p, $1;", "selp.s64 $0, 0, t, p;"], "=l,f", "x", ".reg .s64 t; .reg .pred p;", dtype="tl.int64"
+    )
 
 
 # -- the result ---------------------------------------------------------------------------------
@@ -801,15 +853,13 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
         dst = n.outputs[0].type.dtype
         _check_dtype(kernel, f"the source of {n}", src)
         _check_dtype(kernel, f"the target of {n}", dst)
-        if src.is_float and dst.is_int:
+        if src.is_float and dst.is_int and n.attrs.get("round") not in _F2I_ROUND:
             raise _fail(
                 kernel,
                 None,
                 "cast.float-to-int",
-                f"{n}: casting {src} to {dst} is not lowered: the rounding and saturation modes of a float to integer "
-                "cast are not supported yet (Triton truncates toward zero and, out of range, saturates or keeps only "
-                "the low byte, depending on the integer type; see note 1 of the numerics contract). Round or clamp "
-                "explicitly in a typed op once one exists, or declare the kernel with extern",
+                f"{n}: casting {src} to {dst} without a rounding mode is not lowered: a float to integer cast says it "
+                "(x.to(i32, rounding='rn' | 'rz' | 'rd' | 'ru', saturate=True | False); note 15 of the numerics contract)",
             )
     elif n.op == "load":
         _check_dtype(kernel, f"the DevScalar read by {n}", n.outputs[0].type.dtype)
@@ -1945,6 +1995,35 @@ class _Body:
             self.helpers[key] = (name, ["@triton.jit", f"def {name}({params}):", *(f"    # {line}" for line in doc), *(f"    {line}" for line in body)])
         return self.helpers[key][0]
 
+    def f2i_helper(self, kind: str, rounding: str) -> str:
+        """The name of the module-level helper of a float to integer conversion (note 15), written into :attr:`helpers` the first time."""
+        key = ("f2i", kind, rounding)
+        if key not in self.helpers:
+            name = self.names.fresh(f"_tf_f2i_{kind}_{rounding}")
+            doc, body = _f2i_helper(kind, rounding)
+            self.helpers[key] = (name, ["@triton.jit", f"def {name}(x):", *(f"    # {line}" for line in doc), *(f"    {line}" for line in body)])
+        return self.helpers[key][0]
+
+    def float_to_int(self, n: Node, a: str, v: str) -> str:
+        """A float to integer cast with its declared rounding and saturation (note 15): a narrower float is widened to f32 first (exact), then
+        one helper of inline PTX. Saturating: ``cvt`` to ``s32`` (``i32``), to ``s32`` clamped to ``[0, 255]`` (``u8``) or to ``s64`` with a NaN
+        made 0 (``i64``). Wrapping: the ``s64`` helper, then the low bits (``.to()`` of an integer to a narrower one truncates)."""
+        x = n.inputs[0]
+        assert isinstance(x, Value)
+        dst, rounding, saturate = n.attrs["to"].name, n.attrs["round"], n.attrs["saturate"]
+        if x.type.dtype.name != "f32":
+            wide = self.names.fresh(f"{v}_x")
+            self.emit(f"{wide} = {a}.to(tl.float32)", "exact")
+            a = wide
+        if dst == "i32" and saturate:
+            return f"{self.f2i_helper('s32', rounding)}({a})"
+        if dst == "u8" and saturate:
+            return f"{self.f2i_helper('u8', rounding)}({a}).to(tl.uint8)"  # in [0, 255]: the low byte is the value
+        wide64 = f"{self.f2i_helper('s64', rounding)}({a})"
+        if dst == "i64":  # saturating and wrapping are one for i64
+            return wide64
+        return f"{wide64}.to(tl.{_TL[dst]})"  # wrapping: the low bits of the i64, modulo 2**bits
+
     def arg_lanes(self, n: Node, v: str) -> "tuple[str, str]":
         """The (value, index) pair each lane of the row (or of the chunk) offers an argmax / argmin; a masked lane loses to every lane."""
         layout = self.layout
@@ -2012,6 +2091,8 @@ class _Body:
         if op == "gelu":
             return f"0.5 * {a[0]} * (1.0 + tl.math.erf({a[0]} * 0.7071067811865476))"
         if op == "cast":
+            if "round" in n.attrs:  # float to integer, the declared rounding and saturation (note 15)
+                return self.float_to_int(n, a[0], v)
             if n.attrs.get("nan") == "preserve":  # f32 -> bf16 by the integer round to nearest even on the bits (note 1)
                 b, r, q = (self.names.fresh(f"{v}_{s}") for s in ("b", "r", "q"))
                 self.emit(f"{b} = {a[0]}.to(tl.uint32, bitcast=True)")

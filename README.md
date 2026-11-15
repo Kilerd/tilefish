@@ -613,6 +613,10 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   (value, index) pairs); a row of up to 16384 columns is walked in chunks of 1024.
 - `tilefish.gather_rows(x, idx, oob="zero" | "clamp")` and `tilefish.scatter_rows(dst, idx, src, oob="skip")` copy rows (or elements) as raw
   bits, with the out-of-range policy declared at the call.
+- `x.to(i32, rounding="rn" | "rz" | "rd" | "ru", saturate=True | False)` (also `i64` and `u8`): a float to integer cast says how it rounds
+  (to nearest even, toward zero, down, up; there is no default) and what a value out of range becomes: clamped to the type's range with a NaN
+  0 (`saturate=True`, the default, Rust's `as`), or the low bits of the `i64` (`saturate=False`, C's and torch's). Each is inline PTX
+  (`cvt.rni.s32.f32` and the like) and is byte-identical to the reference on every one of the 2**32 f32 bit patterns (note 15).
 - `x.to(bf16, nan="preserve")` keeps a NaN's sign and payload (the default, `"canonical"`, gives `0x7FFF`); `tilefish.sin`, `tilefish.cos` and
   `tilefish.tanh` are libdevice's (`sinf`, `cosf`, `tanhf`), built with flush-to-zero like every libdevice function Triton links: over every f32,
   torch's CUDA bits but `sin` and `tanh` of a subnormal, which are a zero of its sign (notes 10 and 14).

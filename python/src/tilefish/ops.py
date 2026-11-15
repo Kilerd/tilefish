@@ -398,15 +398,22 @@ def cos(x: Value, *, math: Any = None) -> Value:
 
 
 NAN_MODES = ("canonical", "preserve")
+ROUNDING_MODES = ("rn", "rz", "rd", "ru")  # a float to integer cast: to nearest even, toward zero, down (toward -inf), up (toward +inf)
 
 
-def cast(x: Value, dtype: DType, nan: "str | None" = None) -> Value:
+def cast(x: Value, dtype: DType, nan: "str | None" = None, rounding: "str | None" = None, saturate: "bool | None" = None) -> Value:
     """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point.
 
     ``nan`` says what the f32 to bf16 cast does with a NaN (note 1 of :mod:`tilefish.lower`): ``"canonical"`` (the default, PTX
     ``cvt.rn.bf16.f32``) gives the canonical NaN ``0x7FFF``; ``"preserve"`` is the integer round to nearest even on the bit pattern, which
     keeps a NaN's sign and the top of its payload (quiet bit set): ``0xFFC00000`` becomes ``0xFFC0``. The two agree on every other input.
     Only that cast has the option.
+
+    A float to integer cast (to ``i32``, ``i64`` or ``u8``) says how it rounds, ``rounding="rn"`` (to nearest, ties to even), ``"rz"``
+    (toward zero), ``"rd"`` (down) or ``"ru"`` (up), which has no default, and what a value out of range becomes (note 15 of
+    :mod:`tilefish.lower`): ``saturate=True`` (the default) clamps the rounded value to the integer type's range (an infinity to its
+    bound, a NaN to 0), ``saturate=False`` wraps it modulo ``2**bits`` as C and torch do for a narrow type, computed through ``i64`` (a
+    value outside the ``i64`` range saturates there first, a NaN is 0; for ``i64`` the two modes are one). No other cast takes either.
 
     A cast to the dtype the tensor already has emits no node and behaves exactly like reading the
     tensor at that point: it returns the version that is current at the time of the cast, and that
@@ -433,12 +440,34 @@ def cast(x: Value, dtype: DType, nan: "str | None" = None) -> Value:
             raise TilefishTypeError(
                 f"to: nan= is a mode of the f32 to bf16 cast; casting {x.type} to {dtype} has one NaN rule (see note 1 of the numerics contract)"
             )
+    float_to_int = x.dtype.is_float and dtype.is_int
+    if float_to_int:
+        if rounding is None:
+            raise TilefishTypeError(
+                f"to: casting {x.type} to {dtype} needs rounding='rn' | 'rz' | 'rd' | 'ru' (to nearest even, toward zero, down, up): a float to "
+                "integer cast says how it rounds, there is no default; saturate=True (the default) clamps a value out of range, saturate=False "
+                "wraps it (note 15 of the numerics contract)"
+            )
+        if rounding not in ROUNDING_MODES:
+            raise TilefishTypeError(f"to: rounding must be one of {list(ROUNDING_MODES)}, got {rounding!r}")
+        if saturate is None:
+            saturate = True
+        if not isinstance(saturate, bool):
+            raise TilefishTypeError(f"to: saturate must be True or False, got {saturate!r}")
+    elif rounding is not None or saturate is not None:
+        what = "rounding=" if rounding is not None else "saturate="
+        raise TilefishTypeError(
+            f"to: {what} is a mode of a float to integer cast; casting {x.type} to {dtype} has none (see note 1 of the numerics contract)"
+        )
     if dtype == x.dtype:
         return x._reference()
-    rounding = x.dtype.is_narrowing_to(dtype)
-    attrs: dict[str, Any] = {"to": dtype, "rounding": rounding}
+    narrowing = x.dtype.is_narrowing_to(dtype)
+    attrs: dict[str, Any] = {"to": dtype, "rounding": narrowing}
     if nan == "preserve":  # the default, "canonical", is the plain cast and leaves the node as it always was
         attrs["nan"] = nan
+    if float_to_int:  # the integer rounding and the saturation mode (note 15 of tilefish.lower)
+        attrs["round"] = rounding
+        attrs["saturate"] = saturate
     (out,) = x.ctx.emit("cast", [x], attrs, [x.type.with_dtype(dtype)])
     return out
 
