@@ -151,6 +151,7 @@ if(TILEFISH_BUILD_TESTS)
     add_test(NAME package_consumer COMMAND "${CMAKE_COMMAND}" "-DBUILD=${CMAKE_CURRENT_BINARY_DIR}"
         "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer" "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/consumer"
         "-DMANIFEST=${tilefish_repo}/crates/tilefish/tests/fixtures/sm_103" "-DPIN=${tilefish_fixture_pin}"
+        "-DGENERATOR=${CMAKE_GENERATOR}" "-DMAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}" "-DCXX=${CMAKE_CXX_COMPILER}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer/run.cmake")
 endif()
 
