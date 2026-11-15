@@ -461,6 +461,16 @@ def _mutations():
         ("a library entry with leading dimensions that are not the problem's", lambda d: doc(d, lambda v: v["library"][0].update(lda=1))),
         ("a library entry twice", lambda d: doc(d, lambda v: v["library"].append(dict(v["library"][0])))),
         ("a library entry and a kernel of one stem and architecture", lambda d: doc(d, lambda v: entry(v, "softmax").update(stem=v["library"][0]["stem"], arch=v["library"][0]["arch"]))),
+        # the table of dimensions, read as strictly as the Rust reader's parse_dims (shapes_and_dimensions_that_contradict_themselves_are_refused)
+        ("a divisor of 0", lambda d: doc(d, lambda v: entry(v, "softmax")["dims"]["M"].update(divisible_by=0))),
+        ("a negative divisor", lambda d: doc(d, lambda v: entry(v, "softmax")["dims"]["M"].update(divisible_by=-16))),
+        ("a divisor that is a string", lambda d: doc(d, lambda v: entry(v, "softmax")["dims"]["M"].update(divisible_by="16"))),
+        ("a dims entry with an unknown key", lambda d: doc(d, lambda v: entry(v, "softmax")["dims"]["M"].update(extra=1))),
+        ("a bucket that the entry does not have", lambda d: doc(d, lambda v: entry(v, "softmax")["dims"]["M"].update(bucket=4))),
+        ("buckets out of order", lambda d: doc(d, lambda v: entry(v, "softmax")["dims"]["M"].update(buckets=[4, 2]))),
+        ("a dims value that is not an object", lambda d: doc(d, lambda v: entry(v, "softmax")["dims"].update(M=3))),
+        ("dims of a bucketed entry without its bucket", lambda d: doc(d, lambda v: entry(v, "bucketed_rms.Db96")["dims"]["Db"].pop("bucket"))),
+        ("dims of a bucketed entry with another bucket", lambda d: doc(d, lambda v: entry(v, "bucketed_rms.Db96")["dims"]["Db"].update(bucket=512))),
     ]
 
 

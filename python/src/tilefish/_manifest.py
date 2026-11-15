@@ -506,6 +506,41 @@ def _check_tensordesc(name: str, p: "dict[str, Any]", kind: str, bad: Any) -> No
         bad(f"parameter {name}: {why}")
 
 
+def _check_dims_table(bad: Any, dims: "dict[str, Any]", buckets: Any) -> None:
+    """The constraints of each named dimension of an entry, as the Rust reader takes them (``parse_dims``): an object of at most ``divisible_by``
+    (an int of at least 1), ``buckets`` (a sorted list of distinct positive ints) and ``bucket`` (one of its buckets, and the entry's bucket of that
+    dimension; absent for a dimension the entry is not bucketed by), a ``null`` being as absent; and every bucketed dimension has its entry."""
+
+    def is_count(x: Any, least: int) -> bool:
+        return isinstance(x, int) and not isinstance(x, bool) and x >= least
+
+    mine = buckets if isinstance(buckets, dict) else {}
+    for name, c in dims.items():
+        if not isinstance(c, dict):
+            bad(f"dims.{name} must be an object (divisible_by, buckets, bucket), got {c!r}")
+        extra = sorted(set(c) - {"divisible_by", "buckets", "bucket"})
+        if extra:
+            bad(f"dims.{name} has unknown fields {extra}")
+        div, all_buckets, bucket = c.get("divisible_by"), c.get("buckets"), c.get("bucket")
+        if div is not None and not is_count(div, 1):
+            bad(f"dims.{name}.divisible_by must be at least 1, got {div!r}")
+        if all_buckets is not None and (
+            not isinstance(all_buckets, list)
+            or not all_buckets
+            or not all(is_count(b, 1) for b in all_buckets)
+            or any(a >= b for a, b in zip(all_buckets, all_buckets[1:]))
+        ):
+            bad(f"dims.{name}.buckets must be a sorted list of distinct positive ints, got {all_buckets!r}")
+        if bucket is not None and not is_count(bucket, 0):
+            bad(f"dims.{name}.bucket must be one of its buckets and the bucket of this entry")
+        ok = (bucket is not None and all_buckets is not None and bucket in all_buckets and mine.get(name) == bucket) or (bucket is None and name not in mine)
+        if not ok:
+            bad(f"dims.{name}.bucket must be one of its buckets and the bucket of this entry")
+    missing = [b for b in mine if b not in dims]
+    if missing:
+        bad(f"every bucketed dimension needs its entry in dims: {missing[0]} has none")
+
+
 def _check_dimension_names(who: str, entry: "dict[str, Any]") -> None:
     """The dimension expressions of an entry are in the grammar, and name at most :data:`MAX_DIMS` dimensions, all of them in ``dims``.
 
@@ -529,6 +564,7 @@ def _check_dimension_names(who: str, entry: "dict[str, Any]") -> None:
     for name in dims:
         if not _is_ident(name):
             bad(f"dims name must be an identifier, got {name!r}")
+    _check_dims_table(bad, dims, entry.get("buckets"))
     used: "set[str]" = set()
 
     def expression(text: Any, where: str, grid: bool = False) -> None:

@@ -57,6 +57,9 @@ each section names the release that added it.
 - The crate no longer turns on serde_json's `preserve_order` for the whole host process, and reads the same with or without it: the
   order of an entry's `buckets` and `dims` and of a plan's `dims` comes from the file; `tilefish::json::parse_strict` returns every
   object in code point order.
+- Python's strict manifest reader refuses the table of dimensions of a kernel entry that the Rust reader refuses (a `divisible_by` below 1,
+  an unknown field, unsorted `buckets`, a `bucket` that is not the entry's), where it used to leave that to the comparison with the spec at
+  replay; the Rust reader checks the `static_size` preconditions in their order, so the one it names is the same in every run.
 
 ### Tooling and tests
 

@@ -604,6 +604,31 @@ fn shapes_and_dimensions_that_contradict_themselves_are_refused() {
 }
 
 #[test]
+fn of_two_static_sizes_that_disagree_with_their_shapes_the_first_precondition_is_named_every_time() {
+    // the static sizes are checked in the order of the preconditions (as Python's reader does), not in the order of a hash map
+    let copy = Copy::of("sm_103");
+    let mut sized = Vec::new();
+    copy.edit_json(|doc| {
+        let entry = Copy::entry(doc, "softmax");
+        for pre in entry["preconditions"].as_array().unwrap() {
+            if pre["kind"] == "static_size" {
+                sized.push((pre["arg"].as_str().unwrap().to_owned(), pre["axis"].as_u64().unwrap() as usize));
+            }
+        }
+        assert!(sized.len() >= 2, "the fixture's softmax has a static size on its input and its output: {sized:?}");
+        for (arg, axis) in &sized {
+            let param = entry["abi"]["params"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == arg.as_str()).unwrap();
+            param["shape"][*axis] = 999.into();
+        }
+    });
+    let (arg, axis) = &sized[0];
+    for _ in 0..16 {
+        let message = refused(&copy);
+        assert!(message.contains(&format!("static_size of {arg} axis {axis} ")), "{message}");
+    }
+}
+
+#[test]
 fn the_bucket_of_a_bucketed_entry_is_in_dims_and_agrees_with_the_precondition() {
     let ok = Manifest::load(common::fixtures().join("sm_103"), Pin::TrustDirectory).unwrap();
     let entry = ok.entry("bucketed_rms.Db96", "sm_103").unwrap();

@@ -2487,12 +2487,12 @@ impl Entry {
             }
         }
         parse_grid(&self.grid, syms)?;
-        // a static_size is the size the shape has on that axis; the table of dimensions names every dimension in use
-        for (arg, axis) in sized.keys() {
+        // a static_size is the size the shape has on that axis (checked in the order of the preconditions, as Python's reader does, so the
+        // first one refused is the same in every run); the table of dimensions names every dimension in use
+        for pre in &self.preconditions {
+            let Precondition::StaticSize { arg, axis, value, .. } = pre else { continue };
             let agrees = match self.param(arg).map(|p| &p.kind) {
-                Some(ParamKind::Pointer { shape, .. }) => {
-                    matches!(shape.get(*axis), Some(ShapeDim::Static(n)) if Some(n) == sized.get(&(arg.clone(), *axis)))
-                }
+                Some(ParamKind::Pointer { shape, .. }) => matches!(shape.get(*axis), Some(ShapeDim::Static(n)) if n == value),
                 _ => false,
             };
             if !agrees {
