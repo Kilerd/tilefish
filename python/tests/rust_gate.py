@@ -9,6 +9,14 @@ bytes. The gate has three steps, on a machine with a GPU, the ``gpu`` extra and 
         cargo test -p tilefish --features gpu-gate --test gpu_gate -- --test-threads=1 --nocapture
     python rust_gate.py compare WORK                  # 3. Python: compare the bytes, tensor by tensor
 
+The C++ host (``crates/tilefish-capi``: the C ABI over the crate and ``tilefish.hpp``) runs the same cases from the same directory: ``prepare`` also
+writes ``WORK/generated.hpp`` and ``WORK/generated_embedded.cpp`` (``tilefish.hosts.cpp.emit``, the manifest and the cubins embedded) and
+``WORK/block_runner.hpp`` (``tilefish.hosts.cpp.emit_plan`` of the plan ``block``), and::
+
+    cmake -S crates/tilefish-capi -B BUILD -DTILEFISH_BUILD_GPU_GATE=ON -DTILEFISH_GATE_DIR=WORK && cmake --build BUILD
+    BUILD/tilefish_cpp_gate WORK                      # crates/tilefish-capi/tests/gpu/cpp_gate.cpp
+    python rust_gate.py compare WORK --host cpp       # its files (cpp/, cpp_embedded/, cpp_plans/, ...) against the same bytes
+
 (With no GPU, ``cargo clippy -p tilefish --all-targets --features gpu-gate`` builds the Rust test against the committed launchers instead:
 ``TILEFISH_GATE_GENERATED=$PWD/crates/tilefish/tests/fixtures/generated.rs`` from the root of the repository, see the header of ``gpu_gate.rs``.)
 
@@ -113,7 +121,7 @@ from host_ops import primitive_ops, tanh_ops
 import tilefish
 from tilefish import runtime
 from tilefish.aot import Manifest
-from tilefish.hosts import rust
+from tilefish.hosts import cpp, rust
 
 BF16, F16, F32, I32 = torch.bfloat16, torch.float16, torch.float32, torch.int32
 SEEDS = (0, 1, 2)
@@ -1090,6 +1098,7 @@ def prepare(work, manifest_dir=None, pin=None):
     directory = manifest_dir or work / "manifest"
     # embedded: the generated module also carries the manifest and the cubins (include_bytes!), which the Rust test runs too
     rust.emit(manifest, work / "generated.rs", ops=all_ops, embed=True)
+    cpp.emit(manifest, work / "generated.hpp", ops=all_ops, embed=True)  # and generated_embedded.cpp: the C++ gate's launchers
     cases, skipped, tensors_total = [], [], 0
     for case in [*build_cases(), *gemm_cases(), *option_cases(declared), *f16_cases(declared), *conv_cases(declared)]:
         if manifest.get(case.stem, arch) is None and manifest.library_entry(case.stem, arch) is None:
@@ -1441,6 +1450,8 @@ def prepare_plans(work):
         directory = root / name
         exported = runtime.export(graph, directory, reuse=reuse)
         exports.append((name, graph, reuse, make_cases, directory, exported, exported.digest, {"dir": f"plans/{name}"}))
+        if name == "block":
+            cpp.emit_plan(exported, work / "block_runner.hpp")  # the C++ gate runs the block through its generated runner too
     # a plan set: the plans of one stage per key (gpu_kernels_p6.tile_chain) over one manifest, replayed through the set's pin
     import gpu_kernels_p6 as p6
 
@@ -1571,18 +1582,18 @@ def prepare_carried(work, root):
     return {"dir": "plans/carried", "set_digest": planset.digest, "graphs": [g.name for g in kp.CARRIED_SET], "calls": calls}
 
 
-def compare_plans(work):
+def compare_plans(work, host="rust"):
     """The outputs (and in-place tensors) the Rust plan wrote, for its launch (``rust_plans``) and its CUDA graph replay (``rust_plans_graph``), and for
     the plans of a shared arena their launches and replays one after the other on one ``SharedArena`` (``rust_shared``, ``rust_shared_graph``), against
-    what Python's plan replay left. Returns ``(passed, cases, failures)``."""
+    what Python's plan replay left; with ``host="cpp"``, what the C++ gate wrote (``cpp_plans``, ...). Returns ``(passed, cases, failures)``."""
     path = work / "plans.json"
     if not path.exists():
         return 0, 0, []
     doc = json.loads(path.read_text(encoding="utf-8"))
     failed, passed, count = [], 0, 0
-    for subdir in ("rust_plans", "rust_plans_graph", "rust_shared", "rust_shared_graph"):
+    for subdir in (f"{host}_plans", f"{host}_plans_graph", f"{host}_shared", f"{host}_shared_graph"):
         for plan in doc["plans"]:
-            if subdir.startswith("rust_shared") and not plan.get("shared"):
+            if subdir.startswith(f"{host}_shared") and not plan.get("shared"):
                 continue  # the plans of the shared arena run again, one after the other on one SharedArena (launched, and replayed)
             for case in plan["cases"]:
                 count += 1
@@ -1602,7 +1613,7 @@ def compare_plans(work):
                 else:
                     passed += 1
     carried = doc.get("carried")
-    for subdir in ("rust_carried", "rust_carried_graph") if carried else ():  # the calls handing carried buffers on, launched and replayed
+    for subdir in (f"{host}_carried", f"{host}_carried_graph") if carried else ():  # the calls handing carried buffers on, launched and replayed
         for call in carried["calls"]:
             count += 1
             bad = []
@@ -1621,13 +1632,14 @@ def compare_plans(work):
     return passed, count, failed
 
 
-def compare(work):
-    """Every file the Rust test wrote, from the manifest directory and from the embedded manifest, against what replay left."""
+def compare(work, host="rust"):
+    """Every file the Rust test (or, with ``host="cpp"``, the C++ gate) wrote, from the manifest directory and from the embedded manifest, against
+    what replay left."""
     work = pathlib.Path(work).resolve()
     doc = json.loads((work / "cases.json").read_text(encoding="utf-8"))
     failed, tensors, total = [], 0, 0
     passed = {}
-    for subdir in ("rust", "rust_embedded"):
+    for subdir in (host, f"{host}_embedded"):
         passed[subdir] = 0
         for case in doc["cases"]:
             bad = []
@@ -1649,15 +1661,15 @@ def compare(work):
         print(f"FAIL {case_id}: {'; '.join(bad)}")
     n = len(doc["cases"])
     print(
-        f"rust vs replay: {passed['rust']} of {n} cases byte-identical with the manifest directory, "
-        f"{passed['rust_embedded']} of {n} with the embedded manifest ({tensors} tensors, {total} bytes compared)"
+        f"{host} vs replay: {passed[host]} of {n} cases byte-identical with the manifest directory, "
+        f"{passed[f'{host}_embedded']} of {n} with the embedded manifest ({tensors} tensors, {total} bytes compared)"
     )
-    plan_passed, plan_cases, plan_failed = compare_plans(work)
+    plan_passed, plan_cases, plan_failed = compare_plans(work, host)
     for case_id, bad in plan_failed:
         print(f"FAIL {case_id}: {'; '.join(bad)}")
     if plan_cases:
         print(
-            f"rust plan vs python plan replay: {plan_passed} of {plan_cases} cases byte-identical (the launch and the CUDA graph replay of each case; the "
+            f"{host} plan vs python plan replay: {plan_passed} of {plan_cases} cases byte-identical (the launch and the CUDA graph replay of each case; the "
             "cases of the plans of a shared arena again, one plan after the other on one SharedArena)"
         )
     return 0 if not failed and not plan_failed else 1
@@ -1672,6 +1684,7 @@ def main(argv=None):
     p.add_argument("--pin", help="the digest of --manifest (default: the one expected.json next to a fixture directory has)")
     c = sub.add_parser("compare")
     c.add_argument("work", type=pathlib.Path)
+    c.add_argument("--host", choices=("rust", "cpp"), default="rust", help="whose files to compare: the Rust test's, or the C++ gate's")
     args = parser.parse_args(argv)
     if args.command == "prepare":
         prepare(args.work, args.manifest, args.pin)
@@ -1681,7 +1694,7 @@ def main(argv=None):
         rust_workspace_case.main(args.work)
         prepare_plans(args.work)  # the launch plans (gpu_gate.rs reads WORK/plans.json)
         return 0
-    return compare(args.work)
+    return compare(args.work, args.host)
 
 
 if __name__ == "__main__":

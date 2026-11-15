@@ -34,3 +34,9 @@ cuda-12040 = ["tilefish/cuda-12040"]
 cuda-12080 = ["tilefish/cuda-12080"]
 cuda-13000 = ["tilefish/cuda-13000"]
 cuda-13020 = ["tilefish/cuda-13020"]
+# Builds `tests/gpu_overhead.rs` (it needs a GPU): the host time of a launch through the C ABI against the crate's.
+gpu-gate = []
+
+[[test]]
+name = "gpu_overhead"
+required-features = ["gpu-gate"]
