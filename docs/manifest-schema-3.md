@@ -1319,7 +1319,9 @@ manifests, and `expected.json` holds the digests Python computed for them.
 The Rust crate `tilefish` of this repository reads schema 3 in full and launches everything this document describes, with the safety model of its
 schema 2 launches (`DevicePtr<'a>` lifetimes, `from_cuda` sealed to cudarc's slices and views, the safe `launch` on a `CudaStream` with owner waits and
 writer-waits-for-readers, the refusal of a capture of slices; `unsafe` only in `region.rs` and `ffi.rs` with its `ffi/cublaslt.rs`; cudarc's safe layer
-and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter than Python, or differs from it, it is listed here.
+and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter than Python, or differs from it, it is listed here. The C++ host
+(`crates/tilefish-capi`: the C ABI `tilefish.h` and `tilefish.hpp`, `docs/rfcs/0002-cpp-host.md`) reads a manifest through this crate, so everything
+here holds for it as written; its tensors are regions (`DevicePtr::from_raw`).
 
 **Reading** (`crates/tilefish/src/manifest.rs`, `library.rs`).
 

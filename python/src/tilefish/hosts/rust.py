@@ -69,6 +69,7 @@ output, as :func:`emit` does.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import math
 import os
@@ -804,8 +805,15 @@ def _check_declarations(binaries: "list[_Binary]", gemms: "list[_Gemm]", ops: "I
         gemm.signature = f"{op.name}{op.signature}"
 
 
+# what `_wrap` does instead in the current context (`tilefish.hosts.cpp` reuses the doc paragraphs of this module and wraps them itself)
+_WRAP_HOOK: "contextvars.ContextVar[Any]" = contextvars.ContextVar("tilefish_hosts_rust_wrap", default=None)
+
+
 def _wrap(text: str) -> "list[str]":
     """A paragraph of a doc comment as lines of at most 128 characters (deterministic; a word that is longer stays whole)."""
+    hook = _WRAP_HOOK.get()
+    if hook is not None:
+        return hook(text)
     return textwrap.wrap(text, width=128, break_long_words=False, break_on_hyphens=False)
 
 
