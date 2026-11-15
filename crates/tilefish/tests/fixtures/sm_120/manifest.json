@@ -6046,478 +6046,6 @@
       "source_digest_kind": "tilefish.triton-ir.v1"
     },
     {
-      "stem": "add_one_wide",
-      "op": "add_one_wide",
-      "kind": "triton",
-      "arch": "sm_120",
-      "ptx_target": "sm_120a",
-      "symbol": "add_one_wide_kernel",
-      "cubin": "add_one_wide.sm_120.cubin",
-      "abi": {
-        "params": [
-          {
-            "slot": 0,
-            "index": 0,
-            "name": "x",
-            "kind": "pointer",
-            "type": "*u8",
-            "ptx_type": "u64",
-            "size": 8,
-            "dtype": "u8",
-            "access": "in",
-            "shape": [
-              "n"
-            ]
-          },
-          {
-            "slot": 1,
-            "index": 1,
-            "name": "y",
-            "kind": "pointer",
-            "type": "*u8",
-            "ptx_type": "u64",
-            "size": 8,
-            "dtype": "u8",
-            "access": "out",
-            "shape": [
-              "n"
-            ]
-          },
-          {
-            "slot": 2,
-            "index": 2,
-            "name": "n_elem",
-            "kind": "scalar",
-            "type": "i64",
-            "ptx_type": "u64",
-            "size": 8,
-            "dim": "n"
-          }
-        ],
-        "scratch": [
-          {
-            "slot": 3,
-            "name": "global_scratch",
-            "type": "u64",
-            "ptx_type": "u64",
-            "size": 8,
-            "value": 0
-          },
-          {
-            "slot": 4,
-            "name": "profile_scratch",
-            "type": "u64",
-            "ptx_type": "u64",
-            "size": 8,
-            "value": 0
-          }
-        ],
-        "scratch_slots": 2
-      },
-      "grid": "(cdiv(n, 1024),)",
-      "block": [
-        128,
-        1,
-        1
-      ],
-      "shared": 0,
-      "num_warps": 4,
-      "num_stages": 3,
-      "launch": {
-        "global_scratch_size": 0,
-        "profile_scratch_size": 0,
-        "launch_pdl": false,
-        "cluster_dims": [
-          1,
-          1,
-          1
-        ],
-        "num_ctas": 1,
-        "cooperative": false
-      },
-      "constexprs": [
-        {
-          "index": 3,
-          "name": "BLOCK",
-          "value": 1024
-        }
-      ],
-      "buckets": {},
-      "dims": {
-        "n": {}
-      },
-      "preconditions": [
-        {
-          "kind": "pointer_alignment",
-          "arg": "x",
-          "index": 0,
-          "bytes": 16
-        },
-        {
-          "kind": "pointer_alignment",
-          "arg": "y",
-          "index": 1,
-          "bytes": 16
-        }
-      ],
-      "options": {
-        "num_warps": 4,
-        "num_stages": 3
-      },
-      "declaration_digest": "d2411294a42de9417bb57945373983f09819aec055dd7a52a707cfb5d5e006aa",
-      "sha256": "65583ee49e156a60891c9d2f309942987c0f7b0aa0b697909a58531e387ad723",
-      "sha256_code": "f9c8ff7a4d3ad5c00ab193137bc8468ed81c17ec16c3a4f9a6f59777501fda9c",
-      "toolchain": {
-        "triton": "3.5.1",
-        "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
-      },
-      "source_digest": "01a9f4ef6d37d526d404be63d81dfd35385a34fffff5cbb2435829f5319bf603",
-      "source_digest_kind": "tilefish.triton-ir.v1"
-    },
-    {
-      "stem": "scale_null",
-      "op": "scale_null",
-      "kind": "triton",
-      "arch": "sm_120",
-      "ptx_target": "sm_120a",
-      "symbol": "scale_bias_kernel",
-      "cubin": "scale_null.sm_120.cubin",
-      "abi": {
-        "params": [
-          {
-            "slot": 0,
-            "index": 0,
-            "name": "x",
-            "kind": "pointer",
-            "type": "*fp32",
-            "ptx_type": "u64",
-            "size": 8,
-            "dtype": "f32",
-            "access": "in",
-            "shape": [
-              "n"
-            ]
-          },
-          {
-            "slot": 1,
-            "index": 1,
-            "name": "bias",
-            "kind": "null",
-            "type": "*fp32",
-            "ptx_type": "u64",
-            "size": 8,
-            "dtype": "f32"
-          },
-          {
-            "slot": 2,
-            "index": 2,
-            "name": "y",
-            "kind": "pointer",
-            "type": "*fp32",
-            "ptx_type": "u64",
-            "size": 8,
-            "dtype": "f32",
-            "access": "out",
-            "shape": [
-              "n"
-            ]
-          },
-          {
-            "slot": 3,
-            "index": 3,
-            "name": "n_elem",
-            "kind": "scalar",
-            "type": "i32",
-            "ptx_type": "u32",
-            "size": 4,
-            "dim": "n"
-          }
-        ],
-        "scratch": [
-          {
-            "slot": 4,
-            "name": "global_scratch",
-            "type": "u64",
-            "ptx_type": "u64",
-            "size": 8,
-            "value": 0
-          },
-          {
-            "slot": 5,
-            "name": "profile_scratch",
-            "type": "u64",
-            "ptx_type": "u64",
-            "size": 8,
-            "value": 0
-          }
-        ],
-        "scratch_slots": 2
-      },
-      "grid": "(cdiv(n, 256),)",
-      "block": [
-        128,
-        1,
-        1
-      ],
-      "shared": 0,
-      "num_warps": 4,
-      "num_stages": 3,
-      "launch": {
-        "global_scratch_size": 0,
-        "profile_scratch_size": 0,
-        "launch_pdl": false,
-        "cluster_dims": [
-          1,
-          1,
-          1
-        ],
-        "num_ctas": 1,
-        "cooperative": false
-      },
-      "constexprs": [
-        {
-          "index": 4,
-          "name": "HAS_BIAS",
-          "value": false
-        },
-        {
-          "index": 5,
-          "name": "BLOCK",
-          "value": 256
-        }
-      ],
-      "buckets": {},
-      "dims": {
-        "n": {}
-      },
-      "preconditions": [
-        {
-          "kind": "pointer_alignment",
-          "arg": "x",
-          "index": 0,
-          "bytes": 16
-        },
-        {
-          "kind": "max_elements",
-          "arg": "x",
-          "index": 0,
-          "value": 2147483647,
-          "shape": [
-            "n"
-          ]
-        },
-        {
-          "kind": "pointer_alignment",
-          "arg": "y",
-          "index": 2,
-          "bytes": 16
-        },
-        {
-          "kind": "max_elements",
-          "arg": "y",
-          "index": 2,
-          "value": 2147483647,
-          "shape": [
-            "n"
-          ]
-        }
-      ],
-      "options": {
-        "num_warps": 4,
-        "num_stages": 3
-      },
-      "declaration_digest": "2b075e8a2f5e858b767dca181452f9a66a3569c8b9dd6ca6a6d96b589f9c8d55",
-      "sha256": "bb38113ebefd22d677e7dc05a03c89e1fb943c7e9b71c7a614d2cc7577e5fcc2",
-      "sha256_code": "8e4ea73567cff7e22c788c560a92d8228e4b8d71e1c1a12ffebc9fcfd02158d4",
-      "toolchain": {
-        "triton": "3.5.1",
-        "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
-      },
-      "source_digest": "010fc32e92558c14e44f0b493fc781773253b311bb1d11483d8da4365d3038fb",
-      "source_digest_kind": "tilefish.triton-ir.v1"
-    },
-    {
-      "stem": "scale_bias",
-      "op": "scale_bias",
-      "kind": "triton",
-      "arch": "sm_120",
-      "ptx_target": "sm_120a",
-      "symbol": "scale_bias_kernel",
-      "cubin": "scale_bias.sm_120.cubin",
-      "abi": {
-        "params": [
-          {
-            "slot": 0,
-            "index": 0,
-            "name": "x",
-            "kind": "pointer",
-            "type": "*fp32",
-            "ptx_type": "u64",
-            "size": 8,
-            "dtype": "f32",
-            "access": "in",
-            "shape": [
-              "n"
-            ]
-          },
-          {
-            "slot": 1,
-            "index": 1,
-            "name": "bias",
-            "kind": "pointer",
-            "type": "*fp32",
-            "ptx_type": "u64",
-            "size": 8,
-            "dtype": "f32",
-            "access": "in",
-            "shape": [
-              "n"
-            ]
-          },
-          {
-            "slot": 2,
-            "index": 2,
-            "name": "y",
-            "kind": "pointer",
-            "type": "*fp32",
-            "ptx_type": "u64",
-            "size": 8,
-            "dtype": "f32",
-            "access": "out",
-            "shape": [
-              "n"
-            ]
-          },
-          {
-            "slot": 3,
-            "index": 3,
-            "name": "n_elem",
-            "kind": "scalar",
-            "type": "i32",
-            "ptx_type": "u32",
-            "size": 4,
-            "dim": "n"
-          }
-        ],
-        "scratch": [
-          {
-            "slot": 4,
-            "name": "global_scratch",
-            "type": "u64",
-            "ptx_type": "u64",
-            "size": 8,
-            "value": 0
-          },
-          {
-            "slot": 5,
-            "name": "profile_scratch",
-            "type": "u64",
-            "ptx_type": "u64",
-            "size": 8,
-            "value": 0
-          }
-        ],
-        "scratch_slots": 2
-      },
-      "grid": "(cdiv(n, 256),)",
-      "block": [
-        128,
-        1,
-        1
-      ],
-      "shared": 0,
-      "num_warps": 4,
-      "num_stages": 3,
-      "launch": {
-        "global_scratch_size": 0,
-        "profile_scratch_size": 0,
-        "launch_pdl": false,
-        "cluster_dims": [
-          1,
-          1,
-          1
-        ],
-        "num_ctas": 1,
-        "cooperative": false
-      },
-      "constexprs": [
-        {
-          "index": 4,
-          "name": "HAS_BIAS",
-          "value": true
-        },
-        {
-          "index": 5,
-          "name": "BLOCK",
-          "value": 256
-        }
-      ],
-      "buckets": {},
-      "dims": {
-        "n": {}
-      },
-      "preconditions": [
-        {
-          "kind": "pointer_alignment",
-          "arg": "x",
-          "index": 0,
-          "bytes": 16
-        },
-        {
-          "kind": "max_elements",
-          "arg": "x",
-          "index": 0,
-          "value": 2147483647,
-          "shape": [
-            "n"
-          ]
-        },
-        {
-          "kind": "pointer_alignment",
-          "arg": "bias",
-          "index": 1,
-          "bytes": 16
-        },
-        {
-          "kind": "max_elements",
-          "arg": "bias",
-          "index": 1,
-          "value": 2147483647,
-          "shape": [
-            "n"
-          ]
-        },
-        {
-          "kind": "pointer_alignment",
-          "arg": "y",
-          "index": 2,
-          "bytes": 16
-        },
-        {
-          "kind": "max_elements",
-          "arg": "y",
-          "index": 2,
-          "value": 2147483647,
-          "shape": [
-            "n"
-          ]
-        }
-      ],
-      "options": {
-        "num_warps": 4,
-        "num_stages": 3
-      },
-      "declaration_digest": "3f04fc69d83bf48e4f32093e7b246fd75e3012e8f1e8d3ee73ea6b4504ab6662",
-      "sha256": "4f3da8ddc5917442a962ee67d906922dbe786f612596b317b46622fd56e2c2c3",
-      "sha256_code": "c1732687680582c9f376bada0fcdfb3ee51494219d58b72fd353d8c20940594e",
-      "toolchain": {
-        "triton": "3.5.1",
-        "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
-      },
-      "source_digest": "82fadeb4e675342ac60423c3e310e7de3e819846d90994126452e23903239d1b",
-      "source_digest_kind": "tilefish.triton-ir.v1"
-    },
-    {
       "stem": "scale_null_ptx",
       "op": "scale_null_ptx",
       "kind": "binary",
@@ -6762,6 +6290,478 @@
       "source_digest_kind": "tilefish.binary.v1"
     },
     {
+      "stem": "add_one_wide",
+      "op": "add_one_wide",
+      "kind": "triton",
+      "arch": "sm_120",
+      "ptx_target": "sm_120a",
+      "symbol": "add_one_wide_kernel",
+      "cubin": "add_one_wide.sm_120.cubin",
+      "abi": {
+        "params": [
+          {
+            "slot": 0,
+            "index": 0,
+            "name": "x",
+            "kind": "pointer",
+            "type": "*u8",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "u8",
+            "access": "in",
+            "shape": [
+              "n"
+            ]
+          },
+          {
+            "slot": 1,
+            "index": 1,
+            "name": "y",
+            "kind": "pointer",
+            "type": "*u8",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "u8",
+            "access": "out",
+            "shape": [
+              "n"
+            ]
+          },
+          {
+            "slot": 2,
+            "index": 2,
+            "name": "n_elem",
+            "kind": "scalar",
+            "type": "i64",
+            "ptx_type": "u64",
+            "size": 8,
+            "dim": "n"
+          }
+        ],
+        "scratch": [
+          {
+            "slot": 3,
+            "name": "global_scratch",
+            "type": "u64",
+            "ptx_type": "u64",
+            "size": 8,
+            "value": 0
+          },
+          {
+            "slot": 4,
+            "name": "profile_scratch",
+            "type": "u64",
+            "ptx_type": "u64",
+            "size": 8,
+            "value": 0
+          }
+        ],
+        "scratch_slots": 2
+      },
+      "grid": "(cdiv(n, 1024),)",
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "shared": 0,
+      "num_warps": 4,
+      "num_stages": 3,
+      "launch": {
+        "global_scratch_size": 0,
+        "profile_scratch_size": 0,
+        "launch_pdl": false,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "num_ctas": 1,
+        "cooperative": false
+      },
+      "constexprs": [
+        {
+          "index": 3,
+          "name": "BLOCK",
+          "value": 1024
+        }
+      ],
+      "buckets": {},
+      "dims": {
+        "n": {}
+      },
+      "preconditions": [
+        {
+          "kind": "pointer_alignment",
+          "arg": "x",
+          "index": 0,
+          "bytes": 16
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "y",
+          "index": 1,
+          "bytes": 16
+        }
+      ],
+      "options": {
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "declaration_digest": "d2411294a42de9417bb57945373983f09819aec055dd7a52a707cfb5d5e006aa",
+      "sha256": "e9e2936c57d5d9bf0d0314d51ed346c0ae9bf92f8eee338b6df3075457d4e26b",
+      "sha256_code": "f9c8ff7a4d3ad5c00ab193137bc8468ed81c17ec16c3a4f9a6f59777501fda9c",
+      "toolchain": {
+        "triton": "3.5.1",
+        "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
+      },
+      "source_digest": "01a9f4ef6d37d526d404be63d81dfd35385a34fffff5cbb2435829f5319bf603",
+      "source_digest_kind": "tilefish.triton-ir.v1"
+    },
+    {
+      "stem": "scale_null",
+      "op": "scale_null",
+      "kind": "triton",
+      "arch": "sm_120",
+      "ptx_target": "sm_120a",
+      "symbol": "scale_bias_kernel",
+      "cubin": "scale_null.sm_120.cubin",
+      "abi": {
+        "params": [
+          {
+            "slot": 0,
+            "index": 0,
+            "name": "x",
+            "kind": "pointer",
+            "type": "*fp32",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f32",
+            "access": "in",
+            "shape": [
+              "n"
+            ]
+          },
+          {
+            "slot": 1,
+            "index": 1,
+            "name": "bias",
+            "kind": "null",
+            "type": "*fp32",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f32"
+          },
+          {
+            "slot": 2,
+            "index": 2,
+            "name": "y",
+            "kind": "pointer",
+            "type": "*fp32",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f32",
+            "access": "out",
+            "shape": [
+              "n"
+            ]
+          },
+          {
+            "slot": 3,
+            "index": 3,
+            "name": "n_elem",
+            "kind": "scalar",
+            "type": "i32",
+            "ptx_type": "u32",
+            "size": 4,
+            "dim": "n"
+          }
+        ],
+        "scratch": [
+          {
+            "slot": 4,
+            "name": "global_scratch",
+            "type": "u64",
+            "ptx_type": "u64",
+            "size": 8,
+            "value": 0
+          },
+          {
+            "slot": 5,
+            "name": "profile_scratch",
+            "type": "u64",
+            "ptx_type": "u64",
+            "size": 8,
+            "value": 0
+          }
+        ],
+        "scratch_slots": 2
+      },
+      "grid": "(cdiv(n, 256),)",
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "shared": 0,
+      "num_warps": 4,
+      "num_stages": 3,
+      "launch": {
+        "global_scratch_size": 0,
+        "profile_scratch_size": 0,
+        "launch_pdl": false,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "num_ctas": 1,
+        "cooperative": false
+      },
+      "constexprs": [
+        {
+          "index": 4,
+          "name": "HAS_BIAS",
+          "value": false
+        },
+        {
+          "index": 5,
+          "name": "BLOCK",
+          "value": 256
+        }
+      ],
+      "buckets": {},
+      "dims": {
+        "n": {}
+      },
+      "preconditions": [
+        {
+          "kind": "pointer_alignment",
+          "arg": "x",
+          "index": 0,
+          "bytes": 16
+        },
+        {
+          "kind": "max_elements",
+          "arg": "x",
+          "index": 0,
+          "value": 2147483647,
+          "shape": [
+            "n"
+          ]
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "y",
+          "index": 2,
+          "bytes": 16
+        },
+        {
+          "kind": "max_elements",
+          "arg": "y",
+          "index": 2,
+          "value": 2147483647,
+          "shape": [
+            "n"
+          ]
+        }
+      ],
+      "options": {
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "declaration_digest": "2b075e8a2f5e858b767dca181452f9a66a3569c8b9dd6ca6a6d96b589f9c8d55",
+      "sha256": "20ba071e0c95352c13ad1f5b5d278d63ab8b5c0c2d4aa146fa87ac77e0194e7e",
+      "sha256_code": "8e4ea73567cff7e22c788c560a92d8228e4b8d71e1c1a12ffebc9fcfd02158d4",
+      "toolchain": {
+        "triton": "3.5.1",
+        "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
+      },
+      "source_digest": "010fc32e92558c14e44f0b493fc781773253b311bb1d11483d8da4365d3038fb",
+      "source_digest_kind": "tilefish.triton-ir.v1"
+    },
+    {
+      "stem": "scale_bias",
+      "op": "scale_bias",
+      "kind": "triton",
+      "arch": "sm_120",
+      "ptx_target": "sm_120a",
+      "symbol": "scale_bias_kernel",
+      "cubin": "scale_bias.sm_120.cubin",
+      "abi": {
+        "params": [
+          {
+            "slot": 0,
+            "index": 0,
+            "name": "x",
+            "kind": "pointer",
+            "type": "*fp32",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f32",
+            "access": "in",
+            "shape": [
+              "n"
+            ]
+          },
+          {
+            "slot": 1,
+            "index": 1,
+            "name": "bias",
+            "kind": "pointer",
+            "type": "*fp32",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f32",
+            "access": "in",
+            "shape": [
+              "n"
+            ]
+          },
+          {
+            "slot": 2,
+            "index": 2,
+            "name": "y",
+            "kind": "pointer",
+            "type": "*fp32",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f32",
+            "access": "out",
+            "shape": [
+              "n"
+            ]
+          },
+          {
+            "slot": 3,
+            "index": 3,
+            "name": "n_elem",
+            "kind": "scalar",
+            "type": "i32",
+            "ptx_type": "u32",
+            "size": 4,
+            "dim": "n"
+          }
+        ],
+        "scratch": [
+          {
+            "slot": 4,
+            "name": "global_scratch",
+            "type": "u64",
+            "ptx_type": "u64",
+            "size": 8,
+            "value": 0
+          },
+          {
+            "slot": 5,
+            "name": "profile_scratch",
+            "type": "u64",
+            "ptx_type": "u64",
+            "size": 8,
+            "value": 0
+          }
+        ],
+        "scratch_slots": 2
+      },
+      "grid": "(cdiv(n, 256),)",
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "shared": 0,
+      "num_warps": 4,
+      "num_stages": 3,
+      "launch": {
+        "global_scratch_size": 0,
+        "profile_scratch_size": 0,
+        "launch_pdl": false,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "num_ctas": 1,
+        "cooperative": false
+      },
+      "constexprs": [
+        {
+          "index": 4,
+          "name": "HAS_BIAS",
+          "value": true
+        },
+        {
+          "index": 5,
+          "name": "BLOCK",
+          "value": 256
+        }
+      ],
+      "buckets": {},
+      "dims": {
+        "n": {}
+      },
+      "preconditions": [
+        {
+          "kind": "pointer_alignment",
+          "arg": "x",
+          "index": 0,
+          "bytes": 16
+        },
+        {
+          "kind": "max_elements",
+          "arg": "x",
+          "index": 0,
+          "value": 2147483647,
+          "shape": [
+            "n"
+          ]
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "bias",
+          "index": 1,
+          "bytes": 16
+        },
+        {
+          "kind": "max_elements",
+          "arg": "bias",
+          "index": 1,
+          "value": 2147483647,
+          "shape": [
+            "n"
+          ]
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "y",
+          "index": 2,
+          "bytes": 16
+        },
+        {
+          "kind": "max_elements",
+          "arg": "y",
+          "index": 2,
+          "value": 2147483647,
+          "shape": [
+            "n"
+          ]
+        }
+      ],
+      "options": {
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "declaration_digest": "3f04fc69d83bf48e4f32093e7b246fd75e3012e8f1e8d3ee73ea6b4504ab6662",
+      "sha256": "9d34093cb03c9998608abdba97884a9b5b4aad27998a896aa4a58ec5453da6fa",
+      "sha256_code": "c1732687680582c9f376bada0fcdfb3ee51494219d58b72fd353d8c20940594e",
+      "toolchain": {
+        "triton": "3.5.1",
+        "ptxas": "Cuda compilation tools, release 12.9, V12.9.86; Build cuda_12.9.r12.9/compiler.36037853_0"
+      },
+      "source_digest": "82fadeb4e675342ac60423c3e310e7de3e819846d90994126452e23903239d1b",
+      "source_digest_kind": "tilefish.triton-ir.v1"
+    },
+    {
       "stem": "add_rows__ua0",
       "op": "add_rows__ua0",
       "kind": "triton",
@@ -6909,7 +6909,7 @@
         "enable_fp_fusion": true
       },
       "declaration_digest": "6448b69f05c17b55971a9d390a1f32ebbac7d316b58f3e6c930a71f6bb356e87",
-      "sha256": "9ea43c2cc23d03f42c631719645a09bda85bd0101c2e95b4fb90b24f37e4f87a",
+      "sha256": "eff246e0a46f7110382b5a1944f50b2ad8fe9d58b9a369fc4683b1621fcf6e19",
       "sha256_code": "9a85daceb6a5c2aa931ada7cfd9f0f7c17179aca107cd92253b423899fb2fc90",
       "toolchain": {
         "triton": "3.5.1",

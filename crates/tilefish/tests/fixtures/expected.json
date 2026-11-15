@@ -1,7 +1,7 @@
 {
   "fixtures": {
     "sm_103": {
-      "manifest_digest": "43e60be4ab7cb58897f61f6df8981e7d54c7e024d38ba0e32c12adac66717072",
+      "manifest_digest": "dc5ca684e64b756545bfba2979e205470e25596f1cc90380782b87c9bb0eda28",
       "kernels": [
         {
           "stem": "add_into",
@@ -16,7 +16,7 @@
           "arch": "sm_103",
           "kind": "triton",
           "cubin": "add_one_wide.sm_103.cubin",
-          "sha256": "980e166a5b1788f1a5b46e694d67f66d827a16b0a24586a395b5b81b471c9c1d",
+          "sha256": "682639d6b0fe4d4f87543b5a8de0fa8e2cf97f2786b1912c8125bb3be5002d17",
           "sha256_code": "ba8f993a36f2aa54b9290365781d9dd4084681b8be6839b891fee8a3b763281d"
         },
         {
@@ -24,7 +24,7 @@
           "arch": "sm_103",
           "kind": "triton",
           "cubin": "add_rows__ua0.sm_103.cubin",
-          "sha256": "7174b500a22dccca0d0b6e3faba0ce3a483cdbac4dc129960c35b3474d51367f",
+          "sha256": "db5d72e739b7d89138d113cd15077ba96dfcd9e9ab43b5d5b42373bb1aeb191d",
           "sha256_code": "c7dc43416f4499445e2295d130f310e39b9775b58e8f2f58d99b0b8ead3d51f0"
         },
         {
@@ -216,7 +216,7 @@
           "arch": "sm_103",
           "kind": "triton",
           "cubin": "scale_bias.sm_103.cubin",
-          "sha256": "6cacfd3e0b6752b464007ee7a4a8cbac801e07c1c1f02d8917270e197eee996f",
+          "sha256": "baf51b76f7d5178fde6b67f11b234b52c9ff93275b808bfe83071e8dece16632",
           "sha256_code": "b28796941e0f0fe82363e888f9aab4d0b81e10d27eed001aa8b38b6a16e2ff56"
         },
         {
@@ -248,7 +248,7 @@
           "arch": "sm_103",
           "kind": "triton",
           "cubin": "scale_null.sm_103.cubin",
-          "sha256": "54e866f12eecba4065d861e832530fc9140895d0aab7b898bebefe69978f94f5",
+          "sha256": "a94cff5cb3293e324f2671d3c9fe4c9ee204a616a2e1a38086c5492a92e903b6",
           "sha256_code": "5be94e7ed6fdad7eacdb6fcb84cacb4e14d3bae024efae90ccb130c8103997e9"
         },
         {
@@ -412,7 +412,7 @@
       ]
     },
     "sm_120": {
-      "manifest_digest": "c34b13e9d75f0d8263bbce5c481654ce9848e0546525b84c84cc5f3ed094171a",
+      "manifest_digest": "832e2d4c5bbb23b97a75367ea4cdb88236529a5b04d49320b516ef01e94cb7be",
       "kernels": [
         {
           "stem": "add_into",
@@ -427,7 +427,7 @@
           "arch": "sm_120",
           "kind": "triton",
           "cubin": "add_one_wide.sm_120.cubin",
-          "sha256": "65583ee49e156a60891c9d2f309942987c0f7b0aa0b697909a58531e387ad723",
+          "sha256": "e9e2936c57d5d9bf0d0314d51ed346c0ae9bf92f8eee338b6df3075457d4e26b",
           "sha256_code": "f9c8ff7a4d3ad5c00ab193137bc8468ed81c17ec16c3a4f9a6f59777501fda9c"
         },
         {
@@ -435,7 +435,7 @@
           "arch": "sm_120",
           "kind": "triton",
           "cubin": "add_rows__ua0.sm_120.cubin",
-          "sha256": "9ea43c2cc23d03f42c631719645a09bda85bd0101c2e95b4fb90b24f37e4f87a",
+          "sha256": "eff246e0a46f7110382b5a1944f50b2ad8fe9d58b9a369fc4683b1621fcf6e19",
           "sha256_code": "9a85daceb6a5c2aa931ada7cfd9f0f7c17179aca107cd92253b423899fb2fc90"
         },
         {
@@ -627,7 +627,7 @@
           "arch": "sm_120",
           "kind": "triton",
           "cubin": "scale_bias.sm_120.cubin",
-          "sha256": "4f3da8ddc5917442a962ee67d906922dbe786f612596b317b46622fd56e2c2c3",
+          "sha256": "9d34093cb03c9998608abdba97884a9b5b4aad27998a896aa4a58ec5453da6fa",
           "sha256_code": "c1732687680582c9f376bada0fcdfb3ee51494219d58b72fd353d8c20940594e"
         },
         {
@@ -659,7 +659,7 @@
           "arch": "sm_120",
           "kind": "triton",
           "cubin": "scale_null.sm_120.cubin",
-          "sha256": "bb38113ebefd22d677e7dc05a03c89e1fb943c7e9b71c7a614d2cc7577e5fcc2",
+          "sha256": "20ba071e0c95352c13ad1f5b5d278d63ab8b5c0c2d4aa146fa87ac77e0194e7e",
           "sha256_code": "8e4ea73567cff7e22c788c560a92d8228e4b8d71e1c1a12ffebc9fcfd02158d4"
         },
         {
