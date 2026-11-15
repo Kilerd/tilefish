@@ -17,6 +17,14 @@
 //! python rust_gate.py compare $WORK
 //! ```
 //!
+//! Without a GPU or a gate directory, the gate (with `tests/gpu_plan_gate.rs`) is built against the committed launchers of the `sm_103`
+//! fixture, which embed it too (`python/tests/export_rust_fixtures.py` writes them with `embed=True`), from the root of the repository:
+//!
+//! ```text
+//! TILEFISH_GATE_GENERATED=$PWD/crates/tilefish/tests/fixtures/generated.rs \
+//!     cargo clippy -p tilefish --all-targets --features gpu-gate -- -D warnings
+//! ```
+//!
 //! (`byte_identity` launches each case through its typed launcher where this file has an arm for it, and through `Manifest::kernel` or
 //! `Manifest::gemm` and untyped `TensorArg`s otherwise: the strided kernels, the device scalars, the prebuilt binaries and the GEMMs are
 //! generated launchers that compile with this file, and are run through the checked path of the crate.)
@@ -1809,6 +1817,82 @@ fn the_canary_of_a_load_is_never_on_the_null_stream() {
         "rust gate: {} loads of another manifest with the NULL stream held took {took:?}, sharing the context's cuDNN handle, and none waited for it",
         loads.len()
     );
+}
+
+/// `cudnnCreate` waits for all the work on the device, not only the NULL stream's: a `CudnnHandle` made while a non-blocking stream of the
+/// context is held by a host function returns only when that stream is done. Kept, it is the handle every convolution loaded in the context
+/// shares, also once every convolution was dropped: loads of a manifest that has loaded nothing, with the stream held again, return before it is
+/// done (no load makes a handle). Without it, the first load after every convolution and the handle were dropped makes a handle, and waits.
+/// (The convolutions are loaded once with nothing held first: the first run of a cuDNN engine in a context, a load's canary, may wait for the
+/// device too, while CUDA loads its kernels lazily; measured for one of the gate's ten convolutions.)
+#[test]
+fn a_cudnn_handle_made_first_spares_the_loads_the_wait_of_cudnn_create() {
+    extern "C" fn hold(_: *mut c_void) {
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no convolution");
+        return;
+    }
+    let gpu = Gpu::new();
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let convs = cases_where(&cases, |c| c["kind"] == "conv");
+    let busy = gpu.ctx.new_stream().unwrap(); // non-blocking: ordered with no other stream, the NULL stream included
+    let hold_busy = || {
+        gpu.ctx.bind_to_thread().unwrap();
+        // SAFETY: the context is current; the stream is a live stream of it; `hold` takes no data.
+        let held = unsafe { sys::cuLaunchHostFunc(busy.cu_stream(), Some(hold), std::ptr::null_mut()) };
+        assert_eq!(held, sys::CUresult::CUDA_SUCCESS, "cuLaunchHostFunc");
+    };
+    // SAFETY: the stream is a live stream of the context, which is current.
+    let busy_now = || unsafe { sys::cuStreamQuery(busy.cu_stream()) } == sys::CUresult::CUDA_ERROR_NOT_READY;
+    gpu.stream.synchronize().unwrap();
+    hold_busy();
+    let began = std::time::Instant::now();
+    let handle = tilefish::CudnnHandle::new(&gpu.ctx).expect("a cuDNN handle");
+    let made = began.elapsed();
+    let waited = !busy_now();
+    busy.synchronize().unwrap();
+    let load_all = |m: &Manifest| -> Vec<tilefish::Conv> {
+        convs.iter().map(|c| m.conv(&gpu.ctx, c["stem"].as_str().unwrap(), &[], arch).unwrap()).collect()
+    };
+    // every convolution run once (nothing held), then dropped: only the CudnnHandle holds the context's handle
+    drop(load_all(&Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap()));
+    // loads of a manifest that has loaded nothing, the stream held: no handle is made, and nothing waits for the stream
+    let fresh = Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap();
+    hold_busy();
+    let began = std::time::Instant::now();
+    let loads = load_all(&fresh);
+    let took = began.elapsed();
+    let still_busy = busy_now();
+    busy.synchronize().unwrap();
+    // without it: every convolution and the handle dropped, the next load makes a handle, and waits for the held stream
+    drop(loads);
+    drop(handle);
+    let other = Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap();
+    hold_busy();
+    let began = std::time::Instant::now();
+    let one = other.conv(&gpu.ctx, convs[0]["stem"].as_str().unwrap(), &[], arch).unwrap();
+    let remade = began.elapsed();
+    let waited_again = !busy_now();
+    busy.synchronize().unwrap();
+    drop(one);
+    println!(
+        "rust gate: a cuDNN handle made with a non-blocking stream held took {made:?} (the stream done when it returned: {waited}); {} loads with \
+         the handle kept and the stream held again took {took:?} (the stream still held: {still_busy}); without it, a load that made a handle \
+         took {remade:?} (the stream done: {waited_again})",
+        convs.len()
+    );
+    assert!(
+        waited,
+        "cudnnCreate returned in {made:?} with the non-blocking stream still held: it did not wait for the device"
+    );
+    assert!(
+        still_busy,
+        "the loads took {took:?}, and the held stream was done when they returned: a load made a handle"
+    );
+    assert!(waited_again, "a load that made a handle returned in {remade:?} with the stream still held");
 }
 
 /// The bf16 nearest to an f32 (round to nearest, ties to even), as Triton's `.to(tl.bfloat16)` rounds a finite value.

@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 use crate::elf::sha256_hex;
 use crate::error::{Error, Result};
 use crate::expr::{Symbols, parse_expr};
-use crate::json::{canonical, parse_strict, type_name};
+use crate::json::{KeyOrder, PathStep, canonical, parse_strict_keeping, type_name};
 use crate::manifest::{
     Access, MANIFEST_NAME, Manifest, ParamKind, Pin, ScalarType, ShapeDim, is_arch, is_digest, is_ident, is_stem,
 };
@@ -435,8 +435,25 @@ struct Validated {
     buckets: Vec<PlanBucket>,
 }
 
-/// Every rule of sections 2 and 5 to 8, in the order of Python's `_validate` (`validate_doc`).
-fn validate(doc: &Value) -> Check<Validated> {
+/// The objects of a plan whose order Python's reader follows: `dims` (the order of [`LaunchPlan::dims`]) and the `given` of a step (the
+/// first value that is not an int is the one refused).
+fn is_ordered_object(path: &[PathStep]) -> bool {
+    match path {
+        [PathStep::Key(dims)] => dims == "dims",
+        [
+            PathStep::Key(buckets),
+            PathStep::Index(_),
+            PathStep::Key(steps),
+            PathStep::Index(_),
+            PathStep::Key(given),
+        ] => buckets == "buckets" && steps == "steps" && given == "given",
+        _ => false,
+    }
+}
+
+/// Every rule of sections 2 and 5 to 8, in the order of Python's `_validate` (`validate_doc`). `order` is the order of the file of the
+/// objects of [`is_ordered_object`].
+fn validate(doc: &Value, order: &KeyOrder) -> Check<Validated> {
     let top = keys(doc, "the document", &TOP_KEYS, &OPTIONAL_TOP_KEYS)?;
     let roles_declared = match top.get("roles") {
         None => false,
@@ -474,7 +491,7 @@ fn validate(doc: &Value) -> Check<Validated> {
     }
     let Value::Object(dims_doc) = &top["dims"] else { return refuse("dims must be an object") };
     let mut dims: Vec<(String, Vec<u64>)> = Vec::with_capacity(dims_doc.len());
-    for (name, list) in dims_doc {
+    for (name, list) in order.members(&[PathStep::Key("dims".to_owned())], dims_doc) {
         if !is_ident(name) {
             return refuse(format!("the dimension name {name:?} is not an identifier"));
         }
@@ -736,7 +753,14 @@ fn validate(doc: &Value) -> Check<Validated> {
                         return malformed();
                     }
                     let mut out = Vec::with_capacity(map.len());
-                    for (name, v) in map {
+                    let path = [
+                        PathStep::Key("buckets".to_owned()),
+                        PathStep::Index(bi),
+                        PathStep::Key("steps".to_owned()),
+                        PathStep::Index(si),
+                        PathStep::Key("given".to_owned()),
+                    ];
+                    for (name, v) in order.members(&path, map) {
                         match int_of(v) {
                             Some(value) if is_ident(name) => out.push((name.clone(), value)),
                             _ => {
@@ -1232,7 +1256,8 @@ fn read_document(label: &str, bytes: &[u8], pin: Pin<'_>) -> Result<(Validated, 
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::Plan(format!("cannot read the plan {label:?}: it is not UTF-8 text: {e}")))?;
-    let doc = parse_strict(text).map_err(|e| Error::Plan(format!("the plan {label:?} is not valid JSON: {e}")))?;
+    let (doc, order) = parse_strict_keeping(text, is_ordered_object)
+        .map_err(|e| Error::Plan(format!("the plan {label:?} is not valid JSON: {e}")))?;
     integers_fit_a_double(&doc)?;
     if doc.get("schema").and_then(Value::as_str) != Some(PLAN_SCHEMA) {
         let schema = doc.get("schema").map_or_else(|| "None".to_owned(), brief);
@@ -1252,7 +1277,7 @@ fn read_document(label: &str, bytes: &[u8], pin: Pin<'_>) -> Result<(Validated, 
             "the plan in {label:?} was edited: its plan_digest says {carried}, but its content has digest {found}"
         )));
     }
-    Ok((validate(&doc)?, found))
+    Ok((validate(&doc, &order)?, found))
 }
 
 impl LaunchPlan {

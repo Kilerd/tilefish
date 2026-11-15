@@ -951,7 +951,7 @@ def test_a_pin_is_what_the_library_encodes_for_the_configuration_the_heuristic_c
     """The 64 bytes the heuristic returns may hold bytes that are no part of the configuration (two that change from process to process were
     measured on an RTX 5090): the pin is the configuration encoded by ``AlgoInit`` and the setters, which is what a replay rebuilds."""
     lib = heuristic_runtime
-    pin = L.pin_algo(1, 1024, 7680, False, heuristic="torch")
+    pin = L.pin_algo(1, 1024, 8192, False, heuristic="torch")
     assert pin.algo_hex == "00" * 64 != HeuristicLib.STRAY.hex()
     assert len(lib.named("cublasLtMatmulAlgoConfigGetAttribute")) == 9  # the configuration read back
     assert [a[7] for a in lib.named("cublasLtMatmulAlgoInit")] == [0]  # and encoded: the id read back (0 here) ...

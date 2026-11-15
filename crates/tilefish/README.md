@@ -78,7 +78,12 @@ the crate refuses another cuDNN version, another SM count and a process with
 canary (its output on operands made of a seed, on a stream of its own) and
 refuses other bytes, shares one cuDNN handle per CUDA context between all
 its convolutions, and opens libcudnn only for a manifest that has a
-convolution. The entry of an operator declared
+convolution. Making that handle (`cudnnCreate`) waits for all the work queued
+on the device, on every stream: a host that loads convolutions while work runs
+makes `CudnnHandle::new(&ctx)` at start-up, before it queues any, and keeps it,
+so that no load makes a handle (the first run of a cuDNN engine, a load's
+canary, may wait too while CUDA loads its kernels: load them at start-up as
+well). The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
 which one it is (`Entry::implementation`: its own architecture, or
 `"fallback"`); the crate launches the entry of the device's architecture, as
@@ -126,10 +131,12 @@ The externals are given by the names of the plan's buffers: a parameter by its n
 returns a `WeightedRun`, whose `launch`, `launch_tapped`, `check` and `capture` take the inputs, the `inout` tensors and the outputs only (the
 weights are borrowed for the life of the `WeightedRun`). A plan set (several plans exported together with one manifest, `plans.json` its index)
 loads with one pin: `PlanSet::load(dir, Pin::Digest(set_digest))`, then `set.plan(name)` for each `LaunchPlan`, which share the set's manifest
-(`Manifest` is cheap to clone, and its clones share the modules they load). Plans of a set that a host runs one at a time share one arena:
+(`Manifest` is cheap to clone, and its clones share the modules they load); a set this process verified already, and still holds, is not read again
+by a second `PlanSet::load` (one per worker, say), and `set.plans(&names)` loads many plans on several threads. Plans of a set that a host runs one at a time share one arena:
 `set.instantiate(&stream, &["a", "b", "c"])` is a `SetRun` whose `run("a")` is a `PlanRun` on one `SharedArena` of the largest plan's bytes (each
-plan at its own offsets; `SharedArena::new` and `LaunchPlan::instantiate_in` for a chosen set of buckets). Every launch, capture and replay of any
-of them is ordered with the others, so they never overlap on the device, and nothing in the arena outlives a launch: a stage's output is the next
+plan at its own offsets; `SharedArena::new` and `LaunchPlan::instantiate_in` for a chosen set of buckets), loaded and instantiated on several threads.
+Every launch and replay of any of them is ordered with the others by the arena's order event (a launch on the stream of its last record does not
+wait for it: one `cuEventRecord` per launch while they stay on one stream), so they never overlap on the device, and nothing in the arena outlives a launch: a stage's output is the next
 stage's external, in the caller's memory (a tensor in the arena is refused). `PlanRun::launch_tapped` is a launch with debug
 taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a step, with the plan and its digest unchanged (`PlanRun::capture_tapped`
 captures them as memcpy nodes, copied again at every replay). `PlanRun::launch_step` launches one step of a bucket on the caller's tensors, with the
@@ -193,6 +200,12 @@ builds of the same host on two machines differ:
 Checked on Linux (cargo 1.100) and macOS (cargo 1.99): a host that embeds a
 manifest, built in two checkouts at different paths with different `CARGO_HOME`s,
 has the same binary sha256 with these flags, and a different one without them.
+
+The crate turns on no feature of serde_json, so it does not change the key order
+of the host's own JSON (cargo would turn `preserve_order` on for the whole
+build). A host that turns it on itself gets the same reading of a manifest or a
+plan: where the order of an object's keys means something (the buckets of an
+entry make its stem in their order), the crate takes it from the file.
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your
 option.

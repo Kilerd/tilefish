@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, CudaViewMut, DevicePtrMut, LaunchConfig,
-    PinnedHostSlice, PushKernelArg, result, sys,
+    CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, LaunchConfig, PinnedHostSlice, PushKernelArg, result,
+    sys,
 };
 
 use crate::error::{Error, Result};
@@ -24,13 +24,14 @@ use crate::region::DevicePtr;
 /// cannot (on the B300 of the gate it did not, for these copies of at most 8 bytes: a launch behind 3 ms of queued replays took 96 us of the
 /// host before this, 86 us with it). From pinned memory the copy is asynchronous by definition, so a launch, and a replay that rewrites the
 /// slots, never waits for the device. The bytes are put in an entry of a pinned buffer allocated once per instantiation, copied
-/// asynchronously from it (`cuMemcpyHtoDAsync`), and an event is recorded after the copy; an entry is written again only once its event is
-/// complete. The entries are used in turn, so the host waits only when [`Staging::ENTRIES`] copies are still pending on the device (it is that
-/// many writes of device scalars ahead of it), and then for the oldest of them alone.
+/// asynchronously from it (`cuMemcpyHtoDAsync`), and the entry's event is recorded after the copy; an entry is written again only once its
+/// event is complete. The entries are used in turn, so the host waits only when [`Staging::ENTRIES`] copies are still pending on the device (it
+/// is that many writes of device scalars ahead of it), and then for the oldest of them alone. An entry's event is made with its first copy and
+/// recorded again by the next ones (a record replaces the one before, which was complete when the entry was taken).
 #[derive(Debug)]
 pub(crate) struct Staging {
     memory: PinnedHostSlice<u8>,
-    /// Per entry, the event recorded after the last copy from it.
+    /// Per entry, the event recorded after the last copy from it (none before its first copy).
     copied: Vec<Option<CudaEvent>>,
     next: usize,
 }
@@ -51,27 +52,28 @@ impl Staging {
         Ok(Self { memory, copied: (0..Self::ENTRIES).map(|_| None).collect(), next: 0 })
     }
 
-    /// Copy `bytes` (one element of a device scalar, at most 8 bytes) into `slot` (the slot's bytes of the arena) on `stream`, asynchronously.
+    /// Copy `bytes` (one element of a device scalar, at most 8 bytes) into its slot at byte `offset` of the arena `arena` (its device address
+    /// and its bytes) on `stream`, asynchronously.
     ///
-    /// The slot is used through cudarc's tracking (`device_ptr_mut` on `stream`: the copy waits for the earlier uses of the arena on other
-    /// streams, and is recorded as a write of it when the guard is dropped, after the copy), as `memcpy_htod` does.
+    /// The copy is ordered against the other executions on the arena by the arena's order event (`crate::plan_run`: it is enqueued between the
+    /// execution's wait for the event and its record), not by cudarc's tracking of the arena's slice, which nothing else uses.
     #[allow(unsafe_code)]
     pub(crate) fn copy(
         &mut self,
         stream: &Arc<CudaStream>,
         bytes: &[u8],
-        slot: &mut CudaViewMut<'_, u8>,
+        arena: (u64, u64),
+        offset: u64,
     ) -> Result<()> {
-        if bytes.len() > Self::ENTRY || bytes.len() != slot.len() {
-            return Err(Error::Launch(format!(
-                "a device scalar of {} bytes does not fit its slot of {} bytes",
-                bytes.len(),
-                slot.len()
-            )));
+        if bytes.len() > Self::ENTRY {
+            return Err(Error::Launch(format!("a device scalar of {} bytes does not fit a slot", bytes.len())));
+        }
+        if offset.checked_add(bytes.len() as u64).is_none_or(|end| end > arena.1) {
+            return Err(Error::Launch("a slot of a device scalar is outside the arena".to_owned()));
         }
         let entry = self.next;
         self.next = (entry + 1) % Self::ENTRIES;
-        if let Some(event) = self.copied[entry].take()
+        if let Some(event) = &self.copied[entry]
             && !event.is_complete()
         {
             event.synchronize().map_err(Error::driver("cuEventSynchronize"))?; // ENTRIES copies are pending: wait for the oldest
@@ -82,21 +84,22 @@ impl Staging {
         let host = &mut all[entry * Self::ENTRY..entry * Self::ENTRY + bytes.len()];
         host.copy_from_slice(bytes);
         stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
-        let (dst, guard) = slot.device_ptr_mut(stream);
-        // SAFETY: `dst` is the address of the slot, `bytes.len()` bytes of the arena (a view of the arena's slice, which the instantiation
-        // owns), on the stream's device; `host` is pinned memory owned by this `Staging`, which the arena owns, and which is dropped only
-        // after the instantiation has waited for the arena's stream (that stream waits for every launch made elsewhere), so it outlives the
-        // copy; and the entry is not written again before the event recorded below is complete. The stream is a live cudarc stream of the
-        // context made current above.
-        unsafe { result::memcpy_htod_async(dst, host, stream.cu_stream()) }
+        // SAFETY: the destination is `bytes.len()` bytes inside the arena (checked above: `arena` is the address and the size of the arena's
+        // slice, which the instantiation owns and frees only after its last execution is complete), on the stream's device, and nothing else
+        // uses them while this execution may (the arena's order event); `host` is pinned memory owned by this `Staging`, which the arena owns,
+        // and which is dropped only after the arena's last execution is complete (the instantiation and the arena wait for the order event's
+        // most recent record first), so it outlives the copy; and the entry is not written again before the event recorded below is complete.
+        // The stream is a live cudarc stream of the context made current above.
+        unsafe { result::memcpy_htod_async(arena.0 + offset, host, stream.cu_stream()) }
             .map_err(Error::driver("cuMemcpyHtoDAsync"))?;
-        drop(guard);
-        match stream.record_event(None) {
-            Ok(event) => self.copied[entry] = Some(event),
-            Err(e) => {
-                let _ = stream.synchronize(); // the copy is done before the entry can be written again
-                return Err(Error::driver("cuEventRecord")(e));
-            }
+        let recorded = match &self.copied[entry] {
+            Some(event) => event.record(stream),
+            None => stream.record_event(None).map(|event| self.copied[entry] = Some(event)),
+        };
+        if let Err(e) = recorded {
+            self.copied[entry] = None;
+            let _ = stream.synchronize(); // the copy is done before the entry can be written again
+            return Err(Error::driver("cuEventRecord")(e));
         }
         Ok(())
     }

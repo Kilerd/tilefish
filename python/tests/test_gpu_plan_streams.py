@@ -111,6 +111,49 @@ def test_the_reviewers_two_runs_on_two_streams_are_never_corrupted(inputs, cycle
     assert corrupted == []
 
 
+def test_runs_that_skip_the_wait_on_their_stream_are_still_ordered_with_another_stream(inputs, cycles_per_ms, run_ms, monkeypatch):
+    """A run on the stream of the order event's last record skips the wait (the host cost of the order): three runs on ``s1`` wait at most once, then a
+    run on ``s2`` behind two and a half runs of sleep would start in the middle of the third if it did not wait for the last record; and the next run
+    on ``s1`` waits for ``s2``'s. 0 of ROUNDS rounds corrupted, and per round two waits for five records."""
+    from tilefish import _cuda
+
+    counts = {"wait": 0, "record": 0}
+    wait, record = _cuda.wait_event, _cuda.record_event
+
+    def counted(kind, f):
+        def call(*args, **kwargs):
+            counts[kind] += 1
+            return f(*args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(_cuda, "wait_event", counted("wait", wait))
+    monkeypatch.setattr(_cuda, "record_event", counted("record", record))
+    x1, x2 = inputs
+    want1, want2 = expected(x1), expected(x2)
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    sleep = max(1, int(cycles_per_ms * run_ms * 2.5))
+    with torch.cuda.stream(s1):
+        tilefish.run(three_x, x1)  # the last record is on s1 from here on
+    corrupted = []
+    counts.update(wait=0, record=0)
+    for i in range(ROUNDS):
+        torch.cuda.synchronize()
+        with torch.cuda.stream(s1):
+            ys = [tilefish.run(three_x, x1) for _ in range(3)]
+        with torch.cuda.stream(s2):
+            torch.cuda._sleep(sleep)
+            y2 = tilefish.run(three_x, x2)
+        with torch.cuda.stream(s1):
+            ys.append(tilefish.run(three_x, x1))
+        torch.cuda.synchronize()
+        if not (all(same_bytes(y, want1) for y in ys) and same_bytes(y2, want2)):
+            corrupted.append(i)
+    print(f"\n[streams] skipped waits: {counts['wait']} waits and {counts['record']} records for {5 * ROUNDS} runs; {len(corrupted)} of {ROUNDS} rounds corrupted")
+    assert corrupted == []
+    assert counts == {"wait": 2 * ROUNDS, "record": 5 * ROUNDS}
+
+
 def test_runs_from_two_threads_each_on_its_own_stream_are_all_correct(inputs, cycles_per_ms, run_ms):
     x1, x2 = inputs
     results = {0: [], 1: []}

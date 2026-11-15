@@ -27,7 +27,7 @@ use crate::elf::{Elf, sha256_hex};
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Expr, Symbols, parse_expr, parse_grid};
 use crate::gemm::CachedGemm;
-use crate::json::{canonical, parse_strict, type_name};
+use crate::json::{Members, PathStep, canonical, parse_strict_keeping, type_name};
 use crate::kernel::Cached;
 use crate::library::{LibraryEntry, RawLibrary};
 use crate::tensor::DType;
@@ -606,7 +606,7 @@ pub struct Entry {
     pub constexprs: Vec<Constexpr>,
     /// The bucket value of each bucketed dimension, in the order of the stem.
     pub buckets: Vec<(String, u64)>,
-    /// The named dimensions of the signature and what is known of each.
+    /// The named dimensions of the signature and what is known of each, in the order of the file.
     pub dims: Vec<DimInfo>,
     /// What a launch must check.
     pub preconditions: Vec<Precondition>,
@@ -690,6 +690,13 @@ fn is_schema_3(schema: &Value) -> bool {
         Value::Number(n) => n.as_i64() == Some(3) || n.as_u64() == Some(3) || (n.is_f64() && n.as_f64() == Some(3.0)),
         _ => false,
     }
+}
+
+/// The objects of a manifest whose order means something, as Python's reader takes them: the `buckets` of an entry (its stem names them in
+/// their order, and so does [`Entry::buckets`]) and its `dims` (the order of [`Entry::dims`]), of a kernel entry and of a library entry.
+fn is_ordered_object(path: &[PathStep]) -> bool {
+    matches!(path, [PathStep::Key(section), PathStep::Index(_), PathStep::Key(field)]
+        if (section == "kernels" || section == "library") && (field == "buckets" || field == "dims"))
 }
 
 /// The sha256 (lowercase hex) of a manifest document: its schema, every kernel entry and every library entry in full.
@@ -800,8 +807,8 @@ struct RawEntry {
     num_stages: Option<u32>,
     launch: LaunchAttributes,
     constexprs: Vec<RawConstexpr>,
-    buckets: Map<String, Value>,
-    dims: Map<String, Value>,
+    buckets: Members,
+    dims: Members,
     preconditions: Vec<Value>,
     #[serde(default)]
     options: Option<RawOptions>,
@@ -1138,11 +1145,8 @@ pub(crate) fn parse_shape(name: &str, shape: &[Value]) -> std::result::Result<Ve
         .collect()
 }
 
-/// The table of named dimensions, checked against the buckets of the entry.
-pub(crate) fn parse_dims(
-    dims: &Map<String, Value>,
-    buckets: &Map<String, Value>,
-) -> std::result::Result<Vec<DimInfo>, String> {
+/// The table of named dimensions, checked against the buckets of the entry: both in the order of the file (see [`Members`]).
+pub(crate) fn parse_dims(dims: &Members, buckets: &Members) -> std::result::Result<Vec<DimInfo>, String> {
     let mut out = Vec::with_capacity(dims.len());
     for (name, value) in dims {
         want_ident(&Value::String(name.clone()), "dims name")?;
@@ -2423,8 +2427,12 @@ impl Manifest {
         }
         let text = std::str::from_utf8(manifest)
             .map_err(|e| Error::manifest(format!("the manifest {label:?} is not UTF-8 text: {e}")))?;
-        let doc = parse_strict(text)
+        let (doc, order) = parse_strict_keeping(text, is_ordered_object)
             .map_err(|e| Error::manifest(format!("the manifest {label:?} is not strict JSON: {e}")))?;
+        // the buckets and the dims of entry `i` of a section, in the order of the file
+        let file_order = |section: &str, i: usize, field: &str| {
+            order.keys(&[PathStep::Key(section.to_owned()), PathStep::Index(i), PathStep::Key(field.to_owned())])
+        };
         // the schema is looked at first, so that a manifest of an older schema is told to be exported again, whatever else it lacks
         if let Some(older) = doc.get("schema").and_then(older_schema) {
             return Err(Error::manifest(format!(
@@ -2451,9 +2459,11 @@ impl Manifest {
         }
         let mut raws = Vec::with_capacity(raw.kernels.len());
         for (i, value) in raw.kernels.iter().enumerate() {
-            let entry: RawEntry = serde_json::from_value(value.clone()).map_err(|e| {
+            let mut entry: RawEntry = serde_json::from_value(value.clone()).map_err(|e| {
                 Error::manifest(format!("manifest kernel {i} ({:?}): {e}", value.get("stem").and_then(Value::as_str)))
             })?;
+            entry.buckets.follow(file_order("kernels", i, "buckets"));
+            entry.dims.follow(file_order("kernels", i, "dims"));
             raws.push(entry);
         }
         for raw in &raws {
@@ -2468,10 +2478,14 @@ impl Manifest {
             };
             // a cuDNN convolution has its own fields (`docs/manifest-schema-3.md`, section 9.4); every other entry is a cuBLASLt GEMM's
             if value.get("impl").and_then(Value::as_str) == Some(CONV_IMPL) {
-                let entry: RawConv = serde_json::from_value(value.clone()).map_err(what)?;
+                let mut entry: RawConv = serde_json::from_value(value.clone()).map_err(what)?;
+                entry.buckets.follow(file_order("library", i, "buckets"));
+                entry.dims.follow(file_order("library", i, "dims"));
                 convs.push(ConvEntry::from_raw(entry, i)?);
             } else {
-                let entry: RawLibrary = serde_json::from_value(value.clone()).map_err(what)?;
+                let mut entry: RawLibrary = serde_json::from_value(value.clone()).map_err(what)?;
+                entry.buckets.follow(file_order("library", i, "buckets"));
+                entry.dims.follow(file_order("library", i, "dims"));
                 library.push(LibraryEntry::from_raw(entry, i)?);
             }
         }

@@ -27,6 +27,7 @@ use serde_json::{Map, Value};
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::Symbols;
 use crate::ffi::cudnn::{self, Desc, Graph, Handle, Legacy};
+use crate::json::Members;
 use crate::kernel::Arch;
 use crate::library::{eval_static, present};
 use crate::manifest::{
@@ -322,14 +323,15 @@ impl ConvProblem {
         }
     }
 
-    /// The exact cuDNN-level problem (Python's `tilefish._cudnn.describe`, value for value: `tests/python_conv.rs` holds them together).
+    /// The exact cuDNN-level problem (Python's `tilefish._cudnn.describe`, value for value: `tests/python_conv.rs` holds them together). Its keys
+    /// are in code point order, whatever map serde_json was built with.
     pub fn describe(&self) -> Value {
         let data_type = match self.dtype {
             DType::F16 => "CUDNN_DATA_HALF",
             DType::Bf16 => "CUDNN_DATA_BFLOAT16",
             _ => "CUDNN_DATA_FLOAT",
         };
-        serde_json::json!({
+        let mut problem = serde_json::json!({
             "library": "cudnn",
             "operation": "convolution_forward",
             "data_type": data_type,
@@ -351,7 +353,9 @@ impl ConvProblem {
             "uids": {"x": cudnn::UID_X, "w": cudnn::UID_W, "y": cudnn::UID_Y},
             "alpha": 1.0,
             "beta": 0.0,
-        })
+        });
+        problem.sort_all_objects();
+        problem
     }
 
     fn what(&self) -> String {
@@ -434,7 +438,7 @@ pub struct ConvEntry {
     pub params: Vec<Param>,
     /// The bucket value of each bucketed dimension, in the order of the stem.
     pub buckets: Vec<(String, u64)>,
-    /// The named dimensions and what is known of each.
+    /// The named dimensions and what is known of each, in the order of the file.
     pub dims: Vec<DimInfo>,
     /// What a launch must check: the alignment of every pointer, the static sizes and the buckets.
     pub preconditions: Vec<Precondition>,
@@ -491,8 +495,8 @@ pub(crate) struct RawConv {
     #[serde(rename = "impl")]
     implementation: String,
     abi: RawConvAbi,
-    buckets: Map<String, Value>,
-    dims: Map<String, Value>,
+    pub(crate) buckets: Members,
+    pub(crate) dims: Members,
     preconditions: Vec<Value>,
     dtypes: Map<String, Value>,
     compute_type: String,
@@ -1681,6 +1685,34 @@ impl ConvChecks<'_> {
 /// The version of cuDNN this process has (`91002` for 9.10.2), or `None` when it cannot be loaded: what a pin is compared with.
 pub fn cudnn_version() -> Option<u64> {
     cudnn::available().then(cudnn::version)
+}
+
+/// The cuDNN handle of a CUDA context, made now, and kept for as long as this value (or a convolution loaded in the context) lives: what a host
+/// makes at start-up, before it enqueues any work, and holds for as long as it may load convolutions.
+///
+/// `cudnnCreate` waits for **all** the work queued on the device, on every stream, not only the NULL stream (measured with cuDNN 9.10.2 on a B300:
+/// one second of work queued on the NULL stream, on a blocking stream, on a non-blocking stream or on a stream of another library each made it take
+/// one second). A context has one handle, made by the first convolution loaded in it and shared by every later one (from any manifest, alone or in a
+/// plan) while one of them is alive, so the load that makes it stalls behind whatever the host has queued (again after every convolution of the
+/// context was dropped). With a `CudnnHandle` alive, no load in the context makes a handle. (The first run of a cuDNN engine in a context, a
+/// load's canary, may also wait for the device while CUDA loads its kernels lazily: load the convolutions at start-up too.) Refused when cuDNN
+/// cannot be loaded.
+#[derive(Debug, Clone)]
+pub struct CudnnHandle {
+    _shared: Arc<SharedHandle>,
+}
+
+impl CudnnHandle {
+    /// The handle of `ctx`: the one its convolutions share when one is alive, else a new one (`cudnnCreate`, which waits for the device).
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        if !cudnn::available() {
+            return Err(Error::Unsupported(
+                "libcudnn cannot be loaded on this machine (with LD_LIBRARY_PATH or the like, give the process the cuDNN its manifests were pinned with)"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self { _shared: shared_handle(ctx)? })
+    }
 }
 
 #[cfg(test)]

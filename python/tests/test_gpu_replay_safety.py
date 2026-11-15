@@ -32,6 +32,7 @@ torch = pytest.importorskip("torch")
 triton = pytest.importorskip("triton")
 pytest.importorskip("cuda.bindings.driver")
 
+from conftest import require_ptxas_for  # noqa: E402
 from gpu_util import randn, same_bytes  # noqa: E402
 from lower_cases import gelu_exact, softmax  # noqa: E402
 
@@ -273,7 +274,9 @@ def test_the_elf_of_every_triton_kernel_tells_whether_it_uses_shared_memory():
     """``.nv.shared.<symbol>`` is there exactly when Triton's metadata says the kernel needs dynamic shared memory."""
     from tilefish._elf import shared_sizes, uses_shared
 
-    for arch in ("sm_80", "sm_90", "sm_100", "sm_103", "sm_120", ARCH):
+    archs = ("sm_80", "sm_90", "sm_100", "sm_103", "sm_120", ARCH)
+    require_ptxas_for(*archs)
+    for arch in archs:
         for kernel in (softmax, gelu_exact):
             low = kernel.lower()
             (spec,) = low.specs()

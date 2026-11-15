@@ -923,10 +923,20 @@ output is untouched until the replay, which is the eager bytes, so no part of a 
 run and pass with the NULL stream held busy, which is still busy when they return. The Rust gate captures its convolutions in
 `CU_STREAM_CAPTURE_MODE_GLOBAL`, and runs every canary again (`Conv::check_canary`, the code of the load) with the NULL stream held by a host function,
 which is still held when they return, and loads the convolutions of another manifest, which share the context's handle, with the NULL stream held:
-they return while it is still held (`the_canary_of_a_load_is_never_on_the_null_stream`). What does wait for the NULL stream is cuDNN's `cudnnCreate`:
-a load that makes a handle returns only when the NULL stream is done (measured, cuDNN 9.10.2). That is a wait (for the NULL stream's work at least;
-whether for other streams' too was not measured), which orders nothing wrongly, and it is once per context: **one cuDNN handle per CUDA context**,
-shared by every convolution loaded in it from any manifest, alone or in a plan, and alive as long as the last of them (Python has one per device). Every
+they return while it is still held (`the_canary_of_a_load_is_never_on_the_null_stream`). What does wait is cuDNN's `cudnnCreate`, and **for all the
+work queued on the device, on every stream**, not only the NULL stream's: measured with cuDNN 9.10.2 on a B300 MIG slice, a `cudnnCreate` took 985 ms
+behind a one-second spin kernel queued on the NULL stream, on a blocking stream, on a non-blocking stream or on a torch stream alike (5 to 10 ms on an
+idle device); the Rust gate holds a non-blocking stream with a host function and sees `CudnnHandle::new` return only when it is done
+(`a_cudnn_handle_made_first_spares_the_loads_the_wait_of_cudnn_create`). That wait orders nothing wrongly, and it is once per context: **one cuDNN
+handle per CUDA context**, shared by every convolution loaded in it from any manifest, alone or in a plan, and alive as long as the last of them (Python
+has one per device, kept for the process). The first load of a convolution in a context therefore stalls behind whatever the host has queued (in the
+crate, again after every convolution of the context was dropped); a host that loads convolutions while work runs makes the handle at start-up, before
+it queues any work, and keeps it: `tilefish::CudnnHandle::new(&ctx)` in the crate (no load in the context makes a handle while it lives: the same test
+drops every convolution, then loads them from a manifest that has loaded nothing with the stream held again, and they return before it is done; with
+the handle dropped too, the next load waits), `tilefish.runtime.warm_cudnn(device)` in Python (or `tilefish.runtime.prepare` of a plan with
+convolutions). The handle is not all that can wait: the first run of a cuDNN engine in a context (a load's canary) may wait for the device too, while
+CUDA loads the engine's kernels lazily (measured for one of the gate's ten convolutions, with the handle made), so such a host loads its
+convolutions at start-up as well. Every
 use of a handle is under its lock in both hosts: the heuristic queries and the descriptors and plans of a load or a pin, a canary, and a call (which
 sets the stream right before it runs); the crate also destroys a convolution's plan under it. Measured on a B300 MIG slice (cuDNN 9.10.2, release
 build), loading 700 small entries (`[1, T, 64]` f16 by a k7 filter, T from 16 to 365, half legacy, half backend) in one context: with a handle per

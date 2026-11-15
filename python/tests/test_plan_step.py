@@ -35,7 +35,8 @@ def test_a_gemm_step_runs_on_the_callers_tensors_with_the_plans_workspace():
     offsets = {b["name"]: b["offset"] for b in p.buffers}
     (gemm,) = be.launches()
     assert gemm[1:] == ("gemm_o.M64", a._ptr, w._ptr, None, o._ptr, ARENA + offsets["workspace"], 7)
-    assert [e[0] for e in be.log].count("wait") == 1  # ordered with the runs of the plan, as a run is
+    # ordered with the runs of the plan, as a run is: on the stream the arena was allocated on (its event recorded there) it needs no wait, and it records
+    assert [e[0] for e in be.log].count("wait") == 0 and be.log[-1][0] == "record"
 
 
 def test_a_kernel_step_reads_the_views_the_plan_names():

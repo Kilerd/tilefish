@@ -106,12 +106,16 @@ class FakeBackend(Backend):
 
     def new_event(self, index):
         self.log.append(("event", index))
-        return SimpleNamespace(name=f"event{self.arenas}")
+        return SimpleNamespace(name=f"event{self.arenas}", fresh=True)
 
     def wait_event(self, event, stream, capturing):
         self.log.append(("wait", event.name, stream, capturing))
 
     def record_event(self, event, stream, capturing):
+        if event.fresh:  # the first record of an order event: right after the arena's allocation, on the stream it was allocated on
+            event.fresh = False
+            self.log.append(("allocated", event.name, stream, capturing))
+            return
         self.log.append(("record", event.name, stream, capturing))
 
     def synchronize_event(self, event, index):
@@ -419,13 +423,14 @@ def test_runs_on_two_streams_are_ordered_on_the_device_by_the_order_event_of_the
     record of the arena's event before its first write, and records the event on its stream after its last launch, so two runs on two streams never overlap
     on the device (the reviewer's race, 5 of 5 corrupted before: ``test_gpu_plan.py`` holds it at 0 of 20)."""
     be = FakeBackend()
-    streams = iter([11, 22, 11, 33])
+    streams = iter([5, 11, 22, 11, 33])  # the arena is allocated on stream 5 (the current stream of the first run's call), then the runs
     be.stream = lambda index: next(streams)
     r, _ = runner(backend=be)
     r2 = PlanRunner(r.plan, FakeProvider(), be)  # another runner of the same layout: the same arena, and the same event
     for runner_, m in ((r, 64), (r2, 32), (r, 64), (r2, 128)):
         runner_.run(Weights(m).args(), {})
     assert be.log.count(("event", 0)) == 1 and be.arenas == 1  # one event, made with the arena
+    assert ("allocated", "event1", 5, False) in be.log  # recorded where the arena was allocated: a first run elsewhere waits for that
     ops = _run_ops(be)
     assert len(ops) == 4 * 12
     for i, stream in enumerate((11, 22, 11, 33)):
@@ -435,6 +440,43 @@ def test_runs_on_two_streams_are_ordered_on_the_device_by_the_order_event_of_the
         assert [e[0] for e in run[2:-1]] == ["launch", "gemm", "launch", "gemm", "launch", "gemm", "launch", "gemm", "launch"]
         assert {e[-1] for e in run[2:-1]} == {stream}  # every launch on the run's stream
         assert run[-1] == ("record", "event1", stream, False)
+
+
+def test_a_run_on_the_stream_of_the_last_record_skips_the_wait_and_still_records():
+    """The host cost of the order (issue: tens of waits and records per request of a service): a run on the stream the event was last recorded on comes
+    after that record by stream order, so it does not wait; it still records, so a run on another stream waits for it, and the event's most recent record
+    stands for every run before it. On the per-thread default stream (one handle, another stream in each thread) and inside a capture every run waits."""
+    be = FakeBackend()
+    streams = iter([7, 7, 7, 7, 22, 22, 7, 2, 2])
+    be.stream = lambda index: next(streams)
+    r, _ = runner(backend=be)
+    r2 = PlanRunner(r.plan, FakeProvider(), be)  # the same arena
+    for runner_ in (r, r2, r, r2, r, r2, r, r2):
+        runner_.run(Weights(64).args(), {})
+    order = [(e[0], e[2]) for e in _run_ops(be) if e[0] in ("wait", "record")]
+    assert order == [
+        ("record", 7),  # the arena was allocated on 7: no wait
+        ("record", 7),
+        ("record", 7),
+        ("wait", 22),  # another stream waits for the last record, on 7
+        ("record", 22),
+        ("record", 22),
+        ("wait", 7),
+        ("record", 7),
+        ("wait", 2),  # the per-thread default stream: always waits
+        ("record", 2),
+        ("wait", 2),
+        ("record", 2),
+    ], order
+    # once a run is captured in a torch.cuda.graph, the graph's replays record the event where tilefish does not see them: every run waits
+    be.capture, be.capture_ident = True, 5
+    be.stream = lambda index: 7
+    r.run(Weights(64).args(), {}, outputs=FakeTensor((64, 256), "bf16", 1 << 50))
+    be.capture = False
+    start = len(be.log)
+    r.run(Weights(64).args(), {})
+    r.run(Weights(64).args(), {})
+    assert [e[0] for e in be.log[start:] if e[0] in ("wait", "record")] == ["wait", "record", "wait", "record"]
 
 
 def test_a_captured_run_waits_for_and_records_the_order_event_as_nodes_of_the_graph():
@@ -460,10 +502,12 @@ def test_a_run_that_fails_while_it_launches_still_records_the_order_event():
 
     be = Failing()
     r, _ = runner(backend=be)
+    r.prepare(0)  # the arena is allocated on stream 7; the run is on 8, so it waits first
+    be.current = 8
     with pytest.raises(TilefishRuntimeError, match="the launch failed"):
         r.run(Weights(64).args(), {})
     ops = _run_ops(be)
-    assert ops[0][0] == "wait" and [e[1] for e in ops[2:-1]] == ["rmsnorm", "gemm_qkv.M64"] and ops[-1] == ("record", "event1", 7, False)
+    assert ops[0][0] == "wait" and [e[1] for e in ops[2:-1]] == ["rmsnorm", "gemm_qkv.M64"] and ops[-1] == ("record", "event1", 8, False)
 
 
 def test_a_plan_with_no_arena_has_nothing_to_order():
@@ -584,25 +628,37 @@ def test_the_record_is_made_even_when_it_fails_once_and_the_stream_is_drained_wh
                 raise self.error
             super().record_event(event, stream, capturing)
 
-    be = Flaky(1, KeyboardInterrupt())
-    r, _ = runner(backend=be)
+    def prepared(be):
+        r, _ = runner(backend=be)
+        r.prepare(0)  # the arena, allocated on stream 7 (its event recorded there); the runs below are on 8, so they wait first
+        be.current = 8
+        return r
+
+    be = Flaky(0, KeyboardInterrupt())
+    r = prepared(be)
+    be.failures = 1
     with pytest.raises(KeyboardInterrupt):
         r.run(Weights(64).args(), {})
     ops = _run_ops(be)
-    assert ops[0][0] == "wait" and ops[-1] == ("record", "event1", 7, False) and len(be.launches()) == 9
+    assert ops[0][0] == "wait" and ops[-1] == ("record", "event1", 8, False) and len(be.launches()) == 9
 
-    be = Flaky(2, TilefishRuntimeError("cuEventRecord failed"))
-    r, _ = runner(backend=be)
+    be = Flaky(0, TilefishRuntimeError("cuEventRecord failed"))
+    r = prepared(be)
+    be.failures = 2
     with pytest.raises(TilefishRuntimeError, match="cuEventRecord failed"):
         r.run(Weights(64).args(), {})
-    assert be.log[-1] == ("drain", 7) and not any(e[0] == "record" for e in be.log)
+    assert be.log[-1] == ("drain", 8) and not any(e[0] == "record" for e in be.log)
+    # no record was made, so the stream of the last one is forgotten: the next run waits, even on that stream
+    be.current = 7
+    r.run(Weights(64).args(), {})
+    assert _run_ops(be)[-12][0] == "wait" and _run_ops(be)[-1] == ("record", "event1", 7, False)
 
     class NoWait(FakeBackend):
         def wait_event(self, event, stream, capturing):
             raise TilefishRuntimeError("cuStreamWaitEvent failed")
 
     be = NoWait()
-    r, _ = runner(backend=be)
+    r = prepared(be)
     with pytest.raises(TilefishRuntimeError, match="cuStreamWaitEvent failed"):
         r.run(Weights(64).args(), {})
     assert not any(e[0] in ("record", "launch", "gemm", "devscalar", "drain") for e in be.log)
@@ -649,9 +705,8 @@ def test_tilefish_capture_captures_only_the_launches_and_a_replay_orders_them_wi
     assert {e[-1] for e in captured[2:-1]} == {99}  # on the stream of the capture
     assert cap.bucket == {"M": 64} and cap.outputs.shape == (64, 256)
     start = len(be.log)
-    cap.replay()
+    cap.replay()  # on stream 7, where the run before it recorded the event: no wait
     assert be.log[start:] == [
-        ("wait", "event1", 7, False),
         ("devscalar", offsets_of(r.plan)["n"], 5, False),
         ("graph", "graph1", 7),
         ("record", "event1", 7, False),

@@ -23,7 +23,7 @@ triton = pytest.importorskip("triton")
 pytest.importorskip("cuda.bindings.driver")
 
 import gpu_kernels  # noqa: E402
-from conftest import REPO_ROOT, make_my_kernels, readme_snippet  # noqa: E402
+from conftest import REPO_ROOT, make_my_kernels, readme_snippet, require_ptxas_for  # noqa: E402
 from gpu_util import same_bytes  # noqa: E402
 from lower_cases import gelu_exact, layernorm, softmax, swiglu  # noqa: E402
 
@@ -346,6 +346,7 @@ def test_the_digest_covers_how_ptxas_was_called_not_only_the_instructions(lowere
 
 @pytest.mark.parametrize("arch", ["sm_80", "sm_90", "sm_100", "sm_120"])
 def test_specs_build_for_other_architectures(lowered, arch):
+    require_ptxas_for(arch)
     low = lowered["softmax"]
     (spec,) = low.specs()
     b = build(spec, arch=arch, fn=runtime.load_lowered(low))

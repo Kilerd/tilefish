@@ -513,6 +513,33 @@ def test_a_frontend_that_cannot_build_the_kernel_is_a_build_error_with_nothing_c
     assert compiler.count == 0 and entries() == []
 
 
+def test_a_ptxas_that_does_not_know_the_target_is_named_with_what_to_do(world):
+    """Triton's bundled ptxas (CUDA 12.8) has no sm_103a: the build error names that ptxas and ``TRITON_PTXAS_PATH`` before Triton's message, which
+    follows as it was. Any other ptxas failure gets no hint."""
+    project, compiler = world
+    kernel = project.load()
+
+    class PTXASError(RuntimeError):  # Triton's ``triton.runtime.errors.PTXASError``, as far as the build sees it
+        pass
+
+    compiler.fail = PTXASError(
+        "PTXAS error: Internal Triton PTX codegen error\n`ptxas` stderr:\nptxas fatal   : Value 'sm_103a' is not defined for option 'gpu-name'\n\n"
+        "Repro command: /fake/ptxas -lineinfo -v --gpu-name=sm_103a /tmp/k.ptx -o /tmp/k.ptx.o\n"
+    )
+    with pytest.raises(TilefishBuildError) as e:
+        build(SPEC, arch="sm_103", fn=kernel)
+    assert str(e.value).startswith(
+        "Triton could not compile 'op' (ic_kernel:kernel) for sm_103: the ptxas Triton compiles with (/fake/ptxas: Cuda compilation tools, release "
+        "12.9, V12.9.86) cannot target sm_103a; set TRITON_PTXAS_PATH to a ptxas that can (for sm_103, the ptxas of CUDA 12.9 or newer). PTXASError: "
+        "PTXAS error: Internal Triton PTX codegen error\n"
+    )
+    assert "Repro command: /fake/ptxas" in str(e.value) and entries() == []
+    compiler.fail = PTXASError("PTXAS error: Internal Triton PTX codegen error\n`ptxas` stderr:\nptxas fatal   : Unresolved extern function 'f'\n")
+    with pytest.raises(TilefishBuildError, match=r"for sm_90: PTXASError: PTXAS error: Internal Triton PTX codegen error\n") as e:
+        build(SPEC, arch="sm_90", fn=kernel)
+    assert "TRITON_PTXAS_PATH" not in str(e.value)
+
+
 def test_another_declaration_of_the_same_kernel_with_the_same_ir_shares_the_binary(world):
     """The spec is not in the key: the IR, the options and the toolchain are what make a binary. (The entry is checked against the spec on read.)"""
     project, compiler = world
