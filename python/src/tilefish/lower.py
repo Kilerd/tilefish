@@ -511,6 +511,11 @@ Notes (the facts behind the table):
       ``FFMA2`` even with ``--fmad=false`` (found by the random graphs, 33 of 1536 elements of one graph one ULP off, and read in the SASS of
       the same PTX assembled for sm_100a). A scalar ``.rn`` instruction is not contracted.
 
+    A context-free kernel may also take a **view where it is**: a ``Strided[...]`` parameter with a ``StrideOf`` per axis (a fused region's
+    input that is a column block, a head or a transpose), which the elementwise template reads at ``sum(coordinate_k * stride_k)``, the
+    coordinates as note 12 computes them (integer arithmetic, exact; a ``max_extent`` precondition holds the offsets within ``i32``). The row
+    template takes none (rule ``row.strided``): a fused region then copies the view with ``tilefish.contiguous`` first.
+
     Every non-NaN value is the same either way, and the inline cast is ``.to()``'s bits on every f32 (``tests/test_gpu_fusion.py``). A
     ``@tilefish.kernel`` keeps ``.to()`` and ``neg``.
 
@@ -938,8 +943,9 @@ def _check_common(op: KernelOp) -> None:
             raise _fail(
                 name, None, "const-default", f"const parameter '{p.name}' has no default; the value is compiled in as a constexpr"
             )
+    strided = _strided_params(op)
     for v in graph.inputs:
-        if not v.type.contiguous:
+        if not v.type.contiguous and v.name not in strided:
             raise _fail(
                 name,
                 None,
@@ -1001,6 +1007,23 @@ def _check_common(op: KernelOp) -> None:
         if not v.type.contiguous:
             raise _fail(name, None, "view-value", f"the returned {_label(v)} is a View; strided views are not lowered")
     _check_index_range(name, _all_values(graph))
+
+
+def _strided_params(op: KernelOp) -> "dict[str, list[str]]":
+    """The ``Strided[...]`` parameters of a context-free kernel (a fused region that reads a view where it is, note 20), each with the names of
+    its stride parameters by axis; empty for every other kernel, whose parameters are contiguous."""
+    if not getattr(op, "context_free", False):
+        return {}
+    strides: "dict[tuple[str, int], str]" = {}
+    for p in op.signature.params:
+        for arg, axis in p.stride_of or ():
+            strides[(arg, axis)] = p.name
+    out: "dict[str, list[str]]" = {}
+    for p in op.signature.params:
+        if p.kind == "tensor" and p.strided:
+            assert p.type is not None
+            out[p.name] = [strides[(p.name, axis)] for axis in range(p.type.rank)]
+    return out
 
 
 def _static_slice_problem(n: Node) -> str:
@@ -1345,6 +1368,8 @@ class _RowLayout(_Layout):
     def __init__(self, op: KernelOp, tables: _Tables) -> None:
         graph, name = op.graph, op.name
         self.tables = tables
+        if _strided_params(op):
+            raise _fail(name, "row", "row.strided", "a fused region that reads a view where it is is lowered by the elementwise template")
         values = [v for v in _all_values(graph) if not tables.skip(v)]
         for v in values:
             if v.type.rank > 2:
@@ -1684,6 +1709,19 @@ class _ElementwiseLayout(_Layout):
                 widest,
             )
         self.shape = widest.type.shape
+        # a strided parameter (a fused region's view input, note 20) is read at sum(coordinate_k * stride_k): it has the kernel's shape
+        self.strided: dict[Value, list[str]] = {}
+        names = _strided_params(op)
+        for v in graph.inputs:
+            if v.name in names:
+                if v.type.shape != self.shape or v.access != "in":
+                    raise _fail(
+                        name,
+                        "elementwise",
+                        "elementwise.strided-shape",
+                        f"the view {_label(v)} is read where it is only with the kernel's shape {_shape_text(self.shape)}",
+                    )
+                self.strided[v] = names[v.name]
         # an operand whose shape is the trailing axes of the kernel's shape (after leading 1s) broadcasts over the leading ones: lane o reads its
         # element o % n. Any other shape that broadcasts to the kernel's (numpy's rules: a size-1 axis or a missing leading axis repeats) is read
         # at the offset of the lane's coordinates along the axes it has (note 12): ``self.general``
@@ -1736,6 +1774,7 @@ class _ElementwiseLayout(_Layout):
         r = len(self.shape)
         runs = [run for kept in self.general.values() for run in _runs(kept)]
         runs += [(r - n.outputs[0].type.rank,) * 2 for n in graph.nodes if n.op == "iota" and n.outputs[0] in self.broadcast]
+        runs += [(k, k) for _ in self.strided for k in range(r)]  # a strided operand needs the lane's coordinate along every axis
         size_axes: set[int] = set()
         for a, b in runs:
             size_axes.update(range(b + 1, r))
@@ -1841,6 +1880,8 @@ class _ElementwiseLayout(_Layout):
             f"template: elementwise; every tensor is {_shape_text(self.shape)}, flattened to n = {n} elements",
             f"grid {_grid_text(self.grid)}, BLOCK = {ELEMENTWISE_BLOCK}",
         ]
+        for v in self.strided:
+            lines.append(f"'{v.name}' is a view read where it is: lane o reads its element {self.strided_offset(v, 'o')} (note 20)")
         for v, count in self.broadcast.items():
             if v.is_param and v in self.general:
                 lines.append(
@@ -1851,7 +1892,17 @@ class _ElementwiseLayout(_Layout):
                 lines.append(f"'{v.name}' {_shape_text(v.type.shape)} broadcasts over the leading axes: lane o reads its element o % {count}")
         return lines
 
+    def strided_offset(self, v: Value, lane: str) -> str:
+        """The element of the strided operand ``v`` that the lane ``lane`` reads: its coordinate along each axis times the stride the call passes."""
+        terms = []
+        for k, stride in enumerate(self.strided[v]):
+            coord = self.coordinate(lane, k, k)
+            terms.append(f"({coord}) * {stride}")  # (a stride parameter is named a<k>_s<axis>, which no reserved name is)
+        return " + ".join(terms)
+
     def load(self, p: str, v: Value) -> str:
+        if v in self.strided:
+            return f"tl.load({p} + ({self.strided_offset(v, self.offs)}), mask={self.mask}, other=0)"
         if v in self.general:
             return f"tl.load({p} + ({self.broadcast_offset(v, self.offs)}), mask={self.mask}, other=0)"
         if v in self.broadcast:
@@ -2694,8 +2745,8 @@ def _assemble(
         # (a parameter of a specialisation for unaligned pointers, KernelOp.unaligned, is compiled aligned to its element only)
         params.append(_reindexed(p, len(params), new, unaligned=p.name in op.unaligned_params))
         decls.append(f"{new}: tl.constexpr" if p.kind == "const" else new)
-        if p.kind == "tensor" and _numel_bounds(p.type.shape)[1] is None:  # type: ignore[union-attr]
-            max_elements[new] = INDEX_MAX
+        if p.kind == "tensor" and (p.strided or _numel_bounds(p.type.shape)[1] is None):  # type: ignore[union-attr]
+            max_elements[new] = INDEX_MAX  # (a view: its largest offset, max_extent)
     for k, v in enumerate(graph.outputs):
         params.append(Param(out_names[k], len(params), "tensor", "out", type=v.type))
         decls.append(out_names[k])
@@ -2766,5 +2817,9 @@ def _reindexed(p: Param, index: int, name: str, unaligned: bool = False) -> Para
         p.default,
         p.dim,
         p.keyword_only,
+        strided=p.strided,  # (a fused region's view input, note 20: its strides are its StrideOf parameters)
+        align=p.align,
+        stride_of=p.stride_of,
+        stride_dtype=p.stride_dtype,
         unaligned=unaligned,
     )

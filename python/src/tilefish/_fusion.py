@@ -575,8 +575,11 @@ class _Pass:
 
     # -- 3. a region's kernel ------------------------------------------------------------------------------------------------------
 
-    def _kernel(self, r: Region, trial: bool = False) -> None:
-        params: "list[tuple[str, TensorType, Value]]" = []
+    def _params(self, r: Region, strided: bool) -> "tuple[list[tuple[str, TensorType, Value, bool]], set[Value], list[str], dict[Value, str], list[Value]]":
+        """The parameters of a region's kernel: ``(name, type, value, strided)`` per input, the inputs that are masks (``u8`` here), the
+        parameters compiled for an element-aligned pointer, how each input is read, and what the call passes. A view that is not dense is read
+        where it is (``strided``: a ``Strided[...]`` parameter with a stride per axis) or materialised by ``tilefish.contiguous`` first."""
+        params: "list[tuple[str, TensorType, Value, bool]]" = []
         mask_inputs: "set[Value]" = set()
         unaligned: "list[str]" = []
         reads: "dict[Value, str]" = {}
@@ -587,16 +590,16 @@ class _Pass:
             if isinstance(t.dtype, DType) and t.dtype.is_bool:
                 mask_inputs.add(v)
                 u = self.masks_u8.get(v)
-                t = TensorType(t.shape, u8)
+                params.append((name, TensorType(t.shape, u8), v, False))
                 call_inputs.append(u if u is not None else v)
-                params.append((name, t, v))
                 reads[v] = "mask"
                 continue
             if t.devscalar:
-                params.append((name, t, v))
+                params.append((name, t, v, False))
                 call_inputs.append(v)
                 reads[v] = "devscalar"
                 continue
+            view = False
             if t.contiguous:
                 reads[v] = "contiguous"
             elif t.strides is None and t.offset is not None:
@@ -607,15 +610,27 @@ class _Pass:
                     self.fail(f"{v.ref} ({t}) is a view whose layout is unknown, which a fused region cannot read (pass a tensor)")
                 if not 1 <= t.rank <= 4:
                     self.fail(f"{v.ref} ({t}) is a view of rank {t.rank} that is not dense; a fused region reads one of rank 1 to 4")
-                reads[v] = "materialised"
-            params.append((name, TensorType(t.shape, t.dtype), v))
+                view = strided
+                reads[v] = "strided" if strided else "materialised"
+            params.append((name, TensorType(t.shape, t.dtype), v, view))
             call_inputs.append(v)
+        return params, mask_inputs, unaligned, reads, call_inputs
+
+    def _kernel(self, r: Region, trial: bool = False) -> None:
         out_types: "list[TensorType]" = []
         for o in r.outputs:
             t = o.type
             out_types.append(TensorType(t.shape, u8) if isinstance(t.dtype, DType) and t.dtype.is_bool else TensorType(t.shape, t.dtype))
         body = [self.prog[k] for k in sorted(r.free)] + [self.prog[k] for k in r.nodes]
-        kernel = _synthetic(params, mask_inputs, body, r.outputs, out_types, self.settings, self.name, trial)
+        params, mask_inputs, unaligned, reads, call_inputs = self._params(r, strided=True)
+        try:
+            kernel = _synthetic(params, mask_inputs, body, r.outputs, out_types, self.settings, self.name, trial)
+        except TilefishLoweringError:
+            if not any(s for *_, s in params):
+                raise
+            # the template cannot read the view where it is (a row region, a view of another shape): a copy of it first
+            params, mask_inputs, unaligned, reads, call_inputs = self._params(r, strided=False)
+            kernel = _synthetic(params, mask_inputs, body, r.outputs, out_types, self.settings, self.name, trial)
         if trial:
             return
         r.kernel = kernel
@@ -714,19 +729,23 @@ def _dim_key(d: DimExpr) -> "list[Any]":
     return [str(d.folded()), [[a.name, a.divisible_by, list(a.buckets) if a.buckets else None] for a in atoms]]
 
 
-def _type_key(t: TensorType) -> "list[Any]":
-    return [str(t.dtype), bool(t.devscalar), [_dim_key(d) for d in t.shape]]
+def _type_key(t: TensorType, strided: bool = False) -> "list[Any]":
+    return [str(t.dtype), bool(t.devscalar), [_dim_key(d) for d in t.shape], strided]
 
 
-def _declare(name: str, params: "list[tuple[str, TensorType, Value]]", mask_inputs: "set[Value]", body: "list[Node]", outputs: "list[Value]",
+def _declare(name: str, params: "list[tuple[str, TensorType, Value, bool]]", mask_inputs: "set[Value]", body: "list[Node]", outputs: "list[Value]",
              out_types: "list[TensorType]", settings: Fusion) -> Any:
-    from .decorators import kernel
+    """The ``@tilefish.kernel`` of a region's ops, named ``name``: a parameter per input (``Strided[...]`` with a ``StrideOf`` per axis for a view
+    read where it is), lowered without contraction and context-free (note 20 of :mod:`tilefish.lower`)."""
+    from .decorators import KernelOp, _trace_body, _with_traced_returns
+    from .signature import parse_signature
+    from .types import StrideOf, Strided
 
     def replay(**kw: Any) -> Any:
-        values = [kw[p] for p, _, _ in params]
+        values = [kw[p] for p, _, _, _ in params]
         ctx = values[0].ctx
         env: "dict[Value, Any]" = {}
-        for (pname, _, v), val in zip(params, values):
+        for (pname, _, v, _), val in zip(params, values):
             if v in mask_inputs:  # a mask that came from another region as u8: 0 or 1, read back as != 0 (exact, note 7)
                 (env[v],) = ctx.emit("ne", [val, Scalar(0, u8)], {}, [TensorType(v.type.shape, bool_)])
             else:
@@ -746,12 +765,18 @@ def _declare(name: str, params: "list[tuple[str, TensorType, Value]]", mask_inpu
         return results[0] if len(results) == 1 else tuple(results)
 
     ret: Any = out_types[0] if len(out_types) == 1 else tuple.__class_getitem__(tuple(out_types))
-    replay.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
-        [inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=t) for p, t, _ in params], return_annotation=ret
-    )
+    positional = inspect.Parameter.POSITIONAL_OR_KEYWORD
+    sig_params = []
+    for pname, ptype, _, view in params:
+        sig_params.append(inspect.Parameter(pname, positional, annotation=Strided[ptype] if view else ptype))
+        if view:  # its strides, in the kernel's argument order right after it: every axis (a view of a transpose has no axis of stride 1)
+            sig_params += [inspect.Parameter(f"{pname}_s{k}", positional, annotation=StrideOf(pname, k)) for k in range(ptype.rank)]
+    replay.__signature__ = inspect.Signature(sig_params, return_annotation=ret)  # type: ignore[attr-defined]
     replay.__name__ = replay.__qualname__ = name
     replay.__module__ = "tilefish_generated"
-    op = kernel(name=name, fp_fusion=False, math=settings.math)(replay)
+    sig = parse_signature(replay, what="kernel", name=name, check_derivable=True, allow_strided=True)
+    graph = _trace_body(replay, sig, name, "kernel")
+    op = KernelOp(replay, name, _with_traced_returns(sig, graph, "kernel", name), graph, None, False, settings.math)
     op.context_free = True
     return op
 
@@ -771,7 +796,7 @@ def _synthetic(params: Any, mask_inputs: Any, body: Any, outputs: Any, out_types
     if trial:  # a candidate union of regions: only whether it lowers
         return draft
     content = json.dumps(
-        {"fusion": settings.canonical(), "source": source, "params": [_type_key(t) for _, t, _ in params], "outputs": [_type_key(t) for t in out_types]},
+        {"fusion": settings.canonical(), "source": source, "params": [_type_key(t, s) for _, t, _, s in params], "outputs": [_type_key(t) for t in out_types]},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -896,6 +921,12 @@ def verify(gop: Any, combos: "Sequence[Mapping[str, int]]", *, seeds: "Sequence[
                         env[v] = torch.randint(0, 2, sizes, generator=torch.Generator(device="cpu").manual_seed(seed * 31 + k), dtype=torch.int64).to(torch.uint8).to(device)
                     elif t.devscalar:
                         env[v] = _sample(torch, TensorType((), t.dtype), (1,), seed * 31 + k, device).reshape(())
+                    elif r.reads.get(v) == "strided":  # a view of the graph's layout at this bucket, over a storage of its extent
+                        strides = tuple(int(eval_dim(s, dims)) for s in t.layout_strides())  # type: ignore[arg-type]
+                        offset = int(eval_dim(t.offset, dims))  # type: ignore[arg-type]
+                        extent = offset + 1 + sum((n - 1) * s for n, s in zip(sizes, strides))
+                        base = _sample(torch, TensorType((), t.dtype), (extent,), seed * 1009 + k * 31 + extent, device)
+                        env[v] = base.as_strided(sizes, strides, offset)
                     else:
                         env[v] = _sample(torch, t, sizes, seed * 1009 + k * 31 + sum(sizes), device)
                 got = runtime.run(r.kernel, *[env[v] for v in r.inputs])
