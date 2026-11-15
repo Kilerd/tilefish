@@ -9,6 +9,9 @@ bytes. The gate has three steps, on a machine with a GPU, the ``gpu`` extra and 
         cargo test -p tilefish --features gpu-gate --test gpu_gate -- --test-threads=1 --nocapture
     python rust_gate.py compare WORK                  # 3. Python: compare the bytes, tensor by tensor
 
+(With no GPU, ``cargo clippy -p tilefish --all-targets --features gpu-gate`` builds the Rust test against the committed launchers instead:
+``TILEFISH_GATE_GENERATED=$PWD/crates/tilefish/tests/fixtures/generated.rs`` from the root of the repository, see the header of ``gpu_gate.rs``.)
+
 ``prepare`` exports every operator of ``host_ops.ops()``, ``host_ops.gpu_ops()`` and ``host_ops.library_ops()`` (or reads ``--manifest``, for example the
 committed fixture, with ``--pin``: a case whose stem the manifest does not have is skipped), writes the generated launchers to ``WORK/generated.rs``
 (with the manifest and the cubins embedded), and for each case generates inputs, writes them as raw bytes, runs ``replay`` *with a pin* and

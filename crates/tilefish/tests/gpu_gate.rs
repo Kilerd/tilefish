@@ -17,6 +17,14 @@
 //! python rust_gate.py compare $WORK
 //! ```
 //!
+//! Without a GPU or a gate directory, the gate (with `tests/gpu_plan_gate.rs`) is built against the committed launchers of the `sm_103`
+//! fixture, which embed it too (`python/tests/export_rust_fixtures.py` writes them with `embed=True`), from the root of the repository:
+//!
+//! ```text
+//! TILEFISH_GATE_GENERATED=$PWD/crates/tilefish/tests/fixtures/generated.rs \
+//!     cargo clippy -p tilefish --all-targets --features gpu-gate -- -D warnings
+//! ```
+//!
 //! (`byte_identity` launches each case through its typed launcher where this file has an arm for it, and through `Manifest::kernel` or
 //! `Manifest::gemm` and untyped `TensorArg`s otherwise: the strided kernels, the device scalars, the prebuilt binaries and the GEMMs are
 //! generated launchers that compile with this file, and are run through the checked path of the crate.)

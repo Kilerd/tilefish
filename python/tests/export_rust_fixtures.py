@@ -20,9 +20,15 @@ fixture that is cross-compiled (any other architecture, which needs nothing but 
 * ``generated.rs``: the launchers ``tilefish.hosts.rust.emit`` writes for the fixture of the device's architecture (the first architecture when the
   device is none of them), from the declarations that need no GPU (``host_ops.ops()`` and the GEMMs: ``test_rust_host.py`` writes the same file without one; the
   docs of the prebuilt externs of ``gpu_ops`` have no tilefish signature). The launchers of another architecture differ only in ``MANIFEST_DIGEST``, and have no GEMM.
+  It is written with ``embed=True``: it also embeds the fixture's ``manifest.json`` and cubins (``include_bytes!`` of paths relative to ``OUTPUT_DIR``) and has
+  ``load_embedded()``, as the file ``rust_gate.py prepare`` writes does, so ``tests/gpu_gate.rs`` builds against it without a GPU (``cargo clippy --features
+  gpu-gate``, see its header).
 
 The fixtures are committed; they only change when a binary does (another Triton, ptxas, cuBLASLt, or kernel), and then the files
-of ``crates/tilefish/tests/fixtures`` are replaced together.
+of ``crates/tilefish/tests/fixtures`` are replaced together. When only the emitter changes, ``generated.rs`` is written again from the committed fixture
+with no build and no GPU::
+
+    python export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --generated-only
 
 Fixtures built before a library entry recorded the SM count of its device (``sm_count``) are migrated without a GPU, keeping every binary and algorithm::
 
@@ -110,6 +116,25 @@ def with_sm_count(doc, sm_count):
     return out
 
 
+def write_generated(manifest, output, declared):
+    """Write ``output/generated.rs``: the launchers of ``manifest`` (pinned) typed with the declarations ``declared``, with the manifest and its cubins
+    embedded (``include_bytes!`` of paths relative to ``output``, so the committed file builds wherever the checkout is)."""
+    rust.emit(manifest, output / "generated.rs", ops=declared, embed=True)
+
+
+def generated_only(output, caps):
+    """Write ``generated.rs`` again from the committed fixture in ``output`` of the device's architecture (the first of ``caps`` when the device is none of
+    them), loaded with the pin ``expected.json`` holds: no build and no GPU, for a change of the emitter. Every other file stays."""
+    from tilefish import Manifest
+
+    summary = json.loads((output / "expected.json").read_text())["fixtures"]
+    native = native_capability()
+    name = f"sm_{native if native in caps else caps[0]}"
+    manifest = Manifest.load(output / name, pin=summary[name]["manifest_digest"])
+    write_generated(manifest, output, list(ops().values()) + list(library_ops(GEMM_SHAPES_COMMITTED).values()))
+    print(f"{name}: generated.rs written again, manifest digest {manifest.digest}", file=sys.stderr)
+
+
 def migrate_sm_count(output, sm_count):
     """Give the library entries of the committed fixtures in ``output`` the ``sm_count`` of the device they were pinned on (no GPU: the algorithms stay), then write
     ``expected.json`` and ``generated.rs`` again from them. For the fixtures built before library entries had the field."""
@@ -124,7 +149,7 @@ def migrate_sm_count(output, sm_count):
         manifest = manifest.check_pin(manifest.digest)
         summary[name] = expected(manifest)
         if manifest.library_entries:
-            rust.emit(manifest, output / "generated.rs", ops=list(ops().values()) + list(library_ops(GEMM_SHAPES_COMMITTED).values()))
+            write_generated(manifest, output, list(ops().values()) + list(library_ops(GEMM_SHAPES_COMMITTED).values()))
         print(f"{name}: manifest digest {manifest.digest}", file=sys.stderr)
     (output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
 
@@ -148,7 +173,7 @@ def add_missing(output, caps):
         missing = [op for op in plain if any(s.stem not in stems for s in runtime._target(op).compile_specs())]
         manifest = runtime.export(missing, directory, arch=cap) if missing else have
         if cap == emit_cap:
-            rust.emit(manifest, output / "generated.rs", ops=plain + gemms)
+            write_generated(manifest, output, plain + gemms)
         summary[name] = expected(manifest)
         print(f"{name}: added {[op.name for op in missing]}, manifest digest {manifest.digest}", file=sys.stderr)
     (output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
@@ -170,6 +195,11 @@ def main(argv=None):
         action="store_true",
         help="build only the operators of ops() that the fixtures in OUTPUT have no binary of, merge them in, and write expected.json and generated.rs again",
     )
+    parser.add_argument(
+        "--generated-only",
+        action="store_true",
+        help="no build: write generated.rs again from the committed fixture in OUTPUT (for a change of the emitter)",
+    )
     args = parser.parse_args(argv)
     if args.migrate_sm_count is not None:
         migrate_sm_count(args.output, args.migrate_sm_count)
@@ -177,6 +207,9 @@ def main(argv=None):
     caps = [int(c) for c in args.archs.split(",")]
     if args.add_missing:
         add_missing(args.output, caps)
+        return
+    if args.generated_only:
+        generated_only(args.output, caps)
         return
     native = native_capability()
     emit_cap = native if native in caps else caps[0]
@@ -198,7 +231,7 @@ def main(argv=None):
         if cap == emit_cap:
             # the declarations that need no GPU (and those of the GEMMs, which the manifest may not have): what ``test_rust_host.py`` emits the committed file from,
             # so the three prebuilt externs of ``gpu_ops`` have no tilefish signature in their docs. The manifest that export returned is pinned.
-            rust.emit(manifest, args.output / "generated.rs", ops=plain + gemms)
+            write_generated(manifest, args.output, plain + gemms)
         summary[f"sm_{cap}"] = expected(manifest)
         print(
             f"sm_{cap}: {len(manifest.artifacts)} binaries and {len(manifest.library_entries)} library entries, manifest digest {manifest.digest}",

@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -312,12 +313,18 @@ def test_a_library_entry_without_its_sm_count_is_refused(tmp_path):
 @needs_crate
 @predates_sm_count
 def test_the_committed_launchers_are_what_the_emitter_writes_for_the_fixture(tmp_path):
-    emitted = rust.render(fixture(tmp_path), ops=committed_ops())
+    """With the manifest and the cubins embedded (``embed=True``, paths relative to the fixtures), as the gate's file is: ``gpu_gate.rs`` builds against it
+    with no GPU (``cargo clippy --features gpu-gate``)."""
+    emitted = rust.render(fixture(tmp_path), ops=committed_ops(), embed=True, relative_to=FIXTURES)
     assert emitted == (FIXTURES / "generated.rs").read_text(), (
         "crates/tilefish/tests/fixtures/generated.rs is not what tilefish.hosts.rust.emit writes for the sm_103 fixture: "
-        "regenerate it with python/tests/export_rust_fixtures.py (or, if only the emitter changed, with emit)"
+        "regenerate it with python/tests/export_rust_fixtures.py (or, if only the emitter changed, with its --generated-only)"
     )
     assert f'pub const MANIFEST_DIGEST: &str = "{expected_digest()}";' in emitted
+    assert "pub fn load_embedded() -> Result<Manifest, Error> {" in emitted
+    embedded = re.findall(r'include_bytes!\("([^"]+)"\)', emitted)
+    assert embedded[0] == "sm_103/manifest.json" and len(embedded) == 1 + len({a.entry["cubin"] for a in fixture(tmp_path).artifacts})
+    assert all((FIXTURES / p).is_file() for p in embedded), "every embedded file is a committed file of the fixture"
 
 
 def test_a_schema_2_manifest_is_refused_and_becomes_schema_3_by_three_additions(fake_manifest, tmp_path):

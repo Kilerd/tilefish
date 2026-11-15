@@ -3,10 +3,53 @@
 
 use std::sync::Arc;
 
-use tilefish::{Arch, Bf16, CUstream, CudaContext, CudaStream, Error, F16, F32, Gemm, I32, Kernel, Manifest, TensorMut, TensorRef, U8};
+use tilefish::{Arch, Bf16, CUstream, CudaContext, CudaStream, Error, F16, F32, Gemm, I32, Kernel, Manifest, Pin, TensorMut, TensorRef, U8};
 
 /// The digest of the manifest this module was generated from: `load` refuses any other manifest.
 pub const MANIFEST_DIGEST: &str = "72da0ae5063721cde8036ba8fc4dd669dda7ddfcc564d42d95c6168b44afba82";
+
+/// `manifest.json`, embedded.
+pub static MANIFEST_JSON: &[u8] = include_bytes!("sm_103/manifest.json");
+
+/// The cubins of the manifest, embedded, by file name.
+pub static CUBINS: &[(&str, &[u8])] = &[
+    ("add_into.sm_103.cubin", include_bytes!("sm_103/add_into.sm_103.cubin")),
+    ("axpy.sm_103.cubin", include_bytes!("sm_103/axpy.sm_103.cubin")),
+    ("axpy_cubin.sm_103.cubin", include_bytes!("sm_103/axpy_cubin.sm_103.cubin")),
+    ("axpy_ptx.sm_103.cubin", include_bytes!("sm_103/axpy_ptx.sm_103.cubin")),
+    ("bucketed_rms.Db1000.sm_103.cubin", include_bytes!("sm_103/bucketed_rms.Db1000.sm_103.cubin")),
+    ("bucketed_rms.Db512.sm_103.cubin", include_bytes!("sm_103/bucketed_rms.Db512.sm_103.cubin")),
+    ("bucketed_rms.Db96.sm_103.cubin", include_bytes!("sm_103/bucketed_rms.Db96.sm_103.cubin")),
+    ("fma_fused.sm_103.cubin", include_bytes!("sm_103/fma_fused.sm_103.cubin")),
+    ("fma_plain.sm_103.cubin", include_bytes!("sm_103/fma_plain.sm_103.cubin")),
+    ("gelu_erf.sm_103.cubin", include_bytes!("sm_103/gelu_erf.sm_103.cubin")),
+    ("gelu_exact.sm_103.cubin", include_bytes!("sm_103/gelu_exact.sm_103.cubin")),
+    ("gelu_ptx.sm_103.cubin", include_bytes!("sm_103/gelu_ptx.sm_103.cubin")),
+    ("head_copy.sm_103.cubin", include_bytes!("sm_103/head_copy.sm_103.cubin")),
+    ("head_copy16.sm_103.cubin", include_bytes!("sm_103/head_copy16.sm_103.cubin")),
+    ("head_copy64.sm_103.cubin", include_bytes!("sm_103/head_copy64.sm_103.cubin")),
+    ("key_mask.sm_103.cubin", include_bytes!("sm_103/key_mask.sm_103.cubin")),
+    ("key_mask_any.sm_103.cubin", include_bytes!("sm_103/key_mask_any.sm_103.cubin")),
+    ("layernorm.sm_103.cubin", include_bytes!("sm_103/layernorm.sm_103.cubin")),
+    ("masked_rows.sm_103.cubin", include_bytes!("sm_103/masked_rows.sm_103.cubin")),
+    ("mm.sm_103.cubin", include_bytes!("sm_103/mm.sm_103.cubin")),
+    ("qkv_sum.sm_103.cubin", include_bytes!("sm_103/qkv_sum.sm_103.cubin")),
+    ("qkv_sum16.sm_103.cubin", include_bytes!("sm_103/qkv_sum16.sm_103.cubin")),
+    ("residual_add_rmsnorm.sm_103.cubin", include_bytes!("sm_103/residual_add_rmsnorm.sm_103.cubin")),
+    ("rmsnorm.sm_103.cubin", include_bytes!("sm_103/rmsnorm.sm_103.cubin")),
+    ("scale_by.sm_103.cubin", include_bytes!("sm_103/scale_by.sm_103.cubin")),
+    ("scale_flat.sm_103.cubin", include_bytes!("sm_103/scale_flat.sm_103.cubin")),
+    ("softmax.sm_103.cubin", include_bytes!("sm_103/softmax.sm_103.cubin")),
+    ("softmax3d.sm_103.cubin", include_bytes!("sm_103/softmax3d.sm_103.cubin")),
+    ("softmax_ptx.sm_103.cubin", include_bytes!("sm_103/softmax_ptx.sm_103.cubin")),
+    ("strided_copy.sm_103.cubin", include_bytes!("sm_103/strided_copy.sm_103.cubin")),
+    ("swiglu.sm_103.cubin", include_bytes!("sm_103/swiglu.sm_103.cubin")),
+];
+
+/// Read the embedded manifest: verified like a directory, and pinned to [`MANIFEST_DIGEST`].
+pub fn load_embedded() -> Result<Manifest, Error> {
+    Manifest::from_embedded(MANIFEST_JSON, CUBINS, Pin::Digest(MANIFEST_DIGEST))
+}
 
 /// `add_into(x: Tensor[Rb, 64, f32], r: Tensor[Rb, 64, f32], y: Out[Tensor[Rb, 64, f32]], r_out: Out[Tensor[Rb, 64, f32], MayAlias('r')], D: const = 64)`
 ///

@@ -99,6 +99,20 @@ fn every_launcher_is_typed_with_shapes_that_agree_with_its_manifest() {
     assert_eq!(generated::MANIFEST_DIGEST, common::expected_digest("sm_103"));
 }
 
+/// The committed launchers embed the fixture (`embed=True`, as the gate's file does, so `tests/gpu_gate.rs` builds against them): the embedded manifest
+/// verifies, is pinned to `MANIFEST_DIGEST` and is the directory's manifest, cubin for cubin.
+#[test]
+fn the_committed_launchers_embed_the_fixture() {
+    let embedded = generated::load_embedded().expect("the embedded manifest verifies and is pinned");
+    let directory = manifest();
+    assert_eq!(embedded.digest(), generated::MANIFEST_DIGEST);
+    assert_eq!(embedded.digest(), directory.digest());
+    assert_eq!(generated::MANIFEST_JSON, std::fs::read(fixtures().join("sm_103").join("manifest.json")).unwrap());
+    for (name, bytes) in generated::CUBINS {
+        assert_eq!(*bytes, std::fs::read(fixtures().join("sm_103").join(name)).unwrap(), "{name}");
+    }
+}
+
 #[test]
 fn a_gelu_is_checked_and_its_grid_and_scalar_come_from_the_shapes() {
     let plan = typed!(GeluErf);
