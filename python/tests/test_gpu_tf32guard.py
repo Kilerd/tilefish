@@ -22,6 +22,7 @@ pytest.importorskip("triton")
 pytest.importorskip("cuda.bindings.driver")
 
 import tf32_kernels as tk  # noqa: E402
+from conftest import require_ptxas_for  # noqa: E402
 from gpu_util import differing, randn  # noqa: E402
 
 import tilefish  # noqa: E402
@@ -70,6 +71,7 @@ def test_the_trap_is_real_on_this_device():
 
 @pytest.mark.parametrize("arch", [100, 103])
 def test_tilefish_refuses_to_build_the_ieee_dot_of_64_rows_for_sm_100_and_sm_103(arch):
+    require_ptxas_for(arch)
     (spec,) = compile_specs(tk.ieee64, arch=arch)
     with pytest.raises(TilefishBuildError, match=REFUSED) as raised:
         build(spec, arch=arch, cache=False)
@@ -80,6 +82,7 @@ def test_tilefish_refuses_to_build_the_ieee_dot_of_64_rows_for_sm_100_and_sm_103
 
 @pytest.mark.parametrize("arch", [90, 120])
 def test_sm_90_and_sm_120_keep_it_on_fmas(arch):
+    require_ptxas_for(arch)
     (spec,) = compile_specs(tk.ieee64, arch=arch)
     built = build(spec, arch=arch, cache=False)
     assert _tf32guard.ptx_tf32_mmas(built.ptx) == [] and "fma.rn.f32" in built.ptx
@@ -96,6 +99,7 @@ def test_jit_and_export_refuse_it_on_this_device(tmp_path):
 
 
 def test_32_rows_build_and_are_exact(tmp_path):
+    require_ptxas_for(100, 103, CC)
     for arch in (100, 103):
         (spec,) = compile_specs(tk.ieee32, arch=arch)
         assert _tf32guard.ptx_tf32_mmas(build(spec, arch=arch, cache=False).ptx) == []
@@ -108,6 +112,7 @@ def test_32_rows_build_and_are_exact(tmp_path):
 
 
 def test_tf32_declared_builds_and_computes_tf32(tmp_path):
+    require_ptxas_for(100, 103, CC)
     for arch in (100, 103):
         (spec,) = compile_specs(tk.tf32_64, arch=arch)
         assert "tcgen05.mma.cta_group::1.kind::tf32" in _tf32guard.ptx_tf32_mmas(build(spec, arch=arch, cache=False).ptx)
@@ -120,6 +125,7 @@ def test_tf32_declared_builds_and_computes_tf32(tmp_path):
 
 
 def test_a_kernel_with_an_ieee_and_a_tf32_dot_is_judged_dot_by_dot():
+    require_ptxas_for(100, 103, CC)
     for arch in (100, 103):
         (spec,) = compile_specs(tk.mixed_f16, arch=arch)
         with pytest.raises(TilefishBuildError, match=r"1 TF32 tensor-core MMA of its TTGIR is made of it: 1 x ttng\.tc_gen5_mma of f32 operands"):

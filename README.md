@@ -35,6 +35,12 @@ its cubins, its GEMMs and convolutions and its plans
 `tilefish.hosts.rust.emit`; there is no C++ host, and the `tilefish build`
 command is still the plan.
 
+Building for sm_103 needs a newer `ptxas` than the one Triton 3.5.1 bundles
+(CUDA 12.8's, which cannot target `sm_103a`): set `TRITON_PTXAS_PATH` to the
+`ptxas` of CUDA 12.9 or newer. A build that fails for this reason says so, and
+the GPU tests that build for an architecture the `ptxas` cannot target skip,
+naming it.
+
 ## Why
 
 In inference code the contract of a kernel is usually written three times and

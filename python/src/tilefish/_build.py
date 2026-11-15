@@ -159,6 +159,22 @@ def ptxas_version() -> str:
     return _ptxas_version(str(path))
 
 
+def _ptxas_target_hint(error: BaseException, triton: Any, version: str) -> str:
+    """What to do when a compile failed because the ptxas Triton compiles with does not know the target (``ptxas fatal : Value 'sm_103a' is not
+    defined for option 'gpu-name'``: the ptxas bundled with Triton 3.5.1 is CUDA 12.8's, which has no sm_103a), or ``""`` for any other failure."""
+    m = re.search(r"Value '([A-Za-z0-9_]+)' is not defined for option 'gpu-name'", str(error))
+    if m is None:
+        return ""
+    try:
+        path = str(triton.knobs.nvidia.ptxas.path)
+    except Exception:  # noqa: BLE001 - it was found for the version a moment ago; the hint does without it
+        path = "?"
+    return (
+        f"the ptxas Triton compiles with ({path}: {version}) cannot target {m.group(1)}; set TRITON_PTXAS_PATH to a ptxas that can "
+        "(for sm_103, the ptxas of CUDA 12.9 or newer). "
+    )
+
+
 def resolve_triton(ref: str) -> Any:
     """Import ``module:function`` and return the object (a ``triton.JITFunction`` for a real kernel)."""
     module, _, name = ref.partition(":")
@@ -878,7 +894,8 @@ def build(
         with _always_compile(triton):
             compiled = triton.compile(src, target=GPUTarget("cuda", cap, 32), options=opts)
     except Exception as e:  # noqa: BLE001 - a compile failure of any kind is a build error, with Triton's message
-        raise TilefishBuildError(f"Triton could not compile '{spec.stem}' ({spec.triton}) for sm_{cap}: {type(e).__name__}: {e}") from e
+        hint = _ptxas_target_hint(e, triton, ptxas)
+        raise TilefishBuildError(f"Triton could not compile '{spec.stem}' ({spec.triton}) for sm_{cap}: {hint}{type(e).__name__}: {e}") from e
     changed = _cache.changed_contents(keyed, opts)
     if changed:
         raise TilefishBuildError(
