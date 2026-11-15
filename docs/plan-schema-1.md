@@ -139,7 +139,7 @@ magnitude, so that every language reads the same number); a file larger than
 | `output` | a returned value (a result of a call) | the caller (allocated by the Python `run` unless `outputs=` gives it) | write (first), then read and write |
 | `intermediate` | a result that is not returned | the arena | write (first), then read and write |
 | `devscalar` | a `DevScalar` parameter: one element in device memory (`DevScalar[i32]`: a token count) | the host writes the value into its slot before the first launch | read |
-| `workspace` | the cuBLASLt workspace: dtype `u8`, shape `[N]` with a static `N` | the arena | (only as the `workspace` of a library step) |
+| `workspace` | the cuBLASLt workspace, and the global scratch of the kernels that have one: dtype `u8`, shape `[N]` with a static `N` | the arena | (only as the `workspace` of a step) |
 
 * The buffers listed first are the graph's parameters, in the order of its signature; they have the roles `input`, `weight`, `inout` and `devscalar`. The rest are made by the
   steps, then the workspace. Neither `input` nor `weight` is written, and a reader checks nothing else about the two. **Who chose them:** with `"roles": "declared"`
@@ -147,8 +147,13 @@ magnitude, so that every language reads the same number); a file larger than
   `DevScalar` is `devscalar`), and a host may bind the weights once per instantiation and only the inputs at every call (section 9). Without `roles` the writer
   labelled a parameter by its shape (`weight` when it mentions no dimension), which is not a contract: every parameter of a fully static graph is a `weight`,
   its per-call inputs included, so a host does not bind the weights of such a plan once (both hosts refuse to).
-* A `devscalar` has shape `[]` (one element). There is at most one `workspace`, and it exists exactly when some step has kind `library`; its `bytes` is the
-  largest `workspace_bytes` of the library entries the plan uses (a reader requires it to be at least each one's: section 7.3).
+* A `devscalar` has shape `[]` (one element). There is at most one `workspace`, and it exists exactly when some step has a `workspace`: a step of kind
+  `library`, or (tilefish 0.0.7, crate 0.0.5) a step of kind `kernel` whose entry has a global scratch (manifest schema 3, section 4.6). Its `bytes` is the
+  largest of the `workspace_bytes` of the library entries the plan uses (a reader requires it to be at least each one's: section 7.3) and of the global
+  scratch of every such kernel step at every bucket: `global_scratch` bytes per CTA (the declaration's: a plan is made without building anything) times
+  the CTAs of the step's grid at the bucket (the tiles of a persistent grid, which the programs a device runs are at most, times `num_ctas`). The steps
+  run one after the other, so one scratch serves them all, as one workspace serves the GEMMs. A plan whose kernels have no global scratch is what it
+  always was.
 * **The arena** is `arena_bytes` bytes of device memory, allocated once by the host and **aligned to 256 bytes**. The region of an arena buffer is
   `[offset, offset + align_up(bytes, 256))`, which must lie inside the arena. A buffer's region is large enough for every bucket: a smaller bucket uses a prefix of it, so a
   buffer is at the same address in every bucket. Without `reuse` (section 8) no two regions overlap.
@@ -165,7 +170,7 @@ magnitude, so that every language reads the same number); a file larger than
 | `entry` | string: the stem of a manifest entry (`rmsnorm`, `attention`, `gemm_qkv.M64`: an identifier, then `.<Dim><value>` per bucketed dimension of the operator). It is the entry's own bucket, which differs between buckets of the plan for an operator whose binaries are bucketed. |
 | `kind` | `"kernel"`: an entry of the manifest's `kernels` (Triton or prebuilt binary). `"library"`: an entry of its `library` (a pinned GEMM). The manifest must have the entry **for `arch`** in that section. `"copy"`: a device-to-device copy (section 7.5), which names no entry. |
 | `args` | non-empty list, one object per **pointer parameter of the entry's `abi.params`, in order** (a kernel's scalar and `fixed` parameters are not arguments: the host derives them). A `tensordesc` parameter (a TMA descriptor of a tensor, manifest schema 3, section 5.5) is a pointer parameter here: the step binds its tensor. Names in one step are distinct. |
-| `workspace` | present exactly when `kind` is `"library"`: the name of the buffer of role `workspace`. |
+| `workspace` | present when `kind` is `"library"`, and on a step of kind `"kernel"` exactly when its entry has a global scratch (`launch.global_scratch_size` above 0, manifest schema 3, section 4.6; tilefish 0.0.7, crate 0.0.5): the name of the buffer of role `workspace`. A reader that predates the kernel step's refuses it. |
 | `given` | present exactly when the entry has fixed arguments given per call (manifest schema 3, section 5.3: a prebuilt binary's `kind: "given"` parameters), on a step of kind `"kernel"`: a non-empty object, the name of every one of them (an identifier) to the JSON integer the call gave, in range of its type (`i32`, `i64`; a plan number is at most `2**53` in magnitude). The value may differ between buckets (a call may give an expression of the graph's dimensions, `c=Rg`, evaluated at each bucket); the names may not. It is part of the digest. |
 
 An argument is `{"name": <string>, "binding": <buffer name>}` and optionally `"view"`: exactly the keys `name`, `binding` and `view`.
@@ -192,7 +197,11 @@ canonical strides for axes of size 1; a dimension the arguments the entry reads 
 (the strides of its axes of size > 1 are the row-major ones), that the ranks and dtypes are the ABI's, that a written pointer (`access` `out` or `inout`) overlaps no other argument of the step
 (but an `out` pointer with `alias` and the `in` pointer it names, which may be exactly one tensor: manifest schema 3, section 5.4), and
 the grid against the device's limits. A kernel is launched with `cuLaunchKernel` (a Triton kernel with its two zero scratch slots, a prebuilt one with exactly its parameters), the entry's
-`block` (of a warp-specialised kernel: the warps of all its partitions, manifest schema 3, section 4.2) and its `shared` memory; a library entry
+`block` (of a warp-specialised kernel: the warps of all its partitions, manifest schema 3, section 4.2) and its `shared` memory; the launch shapes of
+manifest schema 3 are those of a single launch: a persistent grid is cut to the programs the SMs the host loaded it for run (section 4.3: the device's,
+or the partition's, so a plan prepared on a partition runs its programs), a kernel of clusters is launched with `cuLaunchKernelEx` and its cluster
+(section 4.5), and a kernel with a global scratch (section 4.6) is given the buffer named by the step's `workspace` as its scratch, at its address in
+the arena, which a host checks holds the scratch of the launch at the bucket when it prepares the bucket; a library entry
 with `cublasLtMatmul` and its pinned algorithm (manifest schema 3, section 9), whose **workspace is the buffer named by `workspace`**, at its address in the arena (`workspace_bytes` of the entry
 are always there; the matmul is given the size the algorithm needs, at most that), so the call allocates nothing.
 
@@ -210,6 +219,8 @@ the shapes of the views; and every value of its fixed arguments given per call: 
 `check_against_manifest` (and Python's `export`, which refuses to write a plan that fails it). For every step of every bucket:
 
 * the entry exists in the section `kind` says, for `arch`; for a `library` step the `workspace` buffer's `bytes` is at least the entry's `workspace_bytes`;
+  a `kernel` step has a `workspace` exactly when its entry has a global scratch (`launch.global_scratch_size` above 0; how many bytes a launch of it needs
+  depends on its grid at the bucket, which a host checks when it prepares the bucket);
 * the entry has as many pointer parameters (`pointer` and `tensordesc`) as the step has arguments, and argument `i` has the name of pointer `i`;
 * the step's `given` names exactly the entry's parameters of kind `given` (none: no `given`), and each value fits the parameter's type;
 * **the dtype** of the buffer is the pointer's `dtype`; **the rank** of the view (or buffer) is `len(shape)` of the ABI pointer;
@@ -226,7 +237,8 @@ A copy step (section 7.5) has no entry: of the rules above it has the last two, 
 * every bucket has the same number of steps, and **in step `k` the `kind`, the `workspace`, the names of `given` and, for every argument, the `name` and the `binding` are the same in every
   bucket**; only `entry`, the views' numbers and the `given` values may differ between buckets;
 * a `given` is a non-empty object of identifiers to JSON integers, on a kernel step;
-* every `binding` is a buffer; a `workspace` is the buffer of role `workspace`; a `view` is well formed and inside its buffer at that bucket;
+* every `binding` is a buffer; a `workspace` is the buffer of role `workspace`, and a step of kind `library` has one; a `view` is well formed and inside its
+  buffer at that bucket;
 * a copy step is what section 7.5 says, at every bucket.
 
 ### 7.5 Copy steps
@@ -387,8 +399,9 @@ whoever holds it, with no lock of the host: item 7 says what its event nodes ord
    tensors (an input written on another stream, an output read on one), as for any launch.
    (A host-owned graph has no event node: Python's `CapturedPlan.replay` and Rust's `CapturedPlan::replay` order a replay exactly as an execution, step 1 of section 9, so replays and
    executions of one plan, or of one Rust instantiation, are ordered the same way, whatever thread issues them.)
-8. Not a plan's doing, but a reason a capture can fail: a binary that is not capturable by itself (the manifest refuses cooperative launches, PDL, clusters and scratch memory for a plain
-   replay, so none of those is in a plan), and the capture mode of the framework (torch's `global` mode refuses an unsafe call from another thread while it captures).
+8. Not a plan's doing, but a reason a capture can fail: a binary that is not capturable by itself (both hosts refuse cooperative launches, PDL and profile scratch, so none
+   of those is in a plan; a kernel of clusters is captured with its cluster, and a global scratch is the arena's workspace, at the address the graph holds), and the
+   capture mode of the framework (torch's `global` mode refuses an unsafe call from another thread while it captures).
 
 ## 11. The Python API
 

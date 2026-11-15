@@ -4,6 +4,32 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### Launch shapes (manifest schema 3, sections 4.3 to 4.6; plan schema 1, sections 6 and 7)
+
+- A grid may multiply dimensions: `grid=lambda T, C: (tilefish.cdiv(T * C, 1024),)` (written `(cdiv(C*T, 1024),)`), one binary for every `T` and
+  `C`, in both hosts, plans and captures. The readers always took such a grid; a shape stays affine.
+- Persistent grids: `@tilefish.extern(..., persistent=tilefish.persistent(programs_per_sm=1))`. The grid is the tiles, and the host launches at most
+  `programs_per_sm * SMs // CTAs per program` programs, the SMs resolved when the binary is loaded (the device's, or a partition's:
+  `Manifest::with_sm_partition` in Rust, `tilefish.runtime.sm_partition(n)` in Python). The kernel's bytes must not depend on the number of programs,
+  unless it declares the SM count it is for (`sm_count=30`), which a host on another count refuses. New optional entry field `persistent`.
+- A configuration per bucket: `@tilefish.extern(..., by_bucket=lambda TB: tilefish.config(num_warps=..., num_stages=..., num_ctas=..., BLOCK=...))`,
+  each bucket's binary built with its own warps, stages, CTAs and constexpr values and launched with the grid under them; the declaration digest covers
+  every bucket's configuration. Nothing new in the manifest.
+- Thread-block clusters: `num_ctas=2` (Triton's compile option, 1 to 8) and, for a prebuilt binary, `cluster=(x, y, z)`. Both hosts launch them with
+  `cuLaunchKernelEx` and the cluster attribute (the grid counts clusters), in single launches, plans and CUDA graphs; a Triton entry records
+  `options.num_ctas`.
+- A global scratch: `global_scratch=N` (bytes per CTA, checked against Triton's metadata) for kernels with device-side TMA descriptors
+  (`tl.make_tensor_descriptor`). Python allocates it per launch; the Rust crate takes it as the last tensor of a launch (`GLOBAL_SCRATCH`,
+  `Prepared::scratch_bytes`); a plan's kernel step names the workspace as its scratch. New optional `launch.global_scratch_align`.
+- Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`persistent`, `options.num_ctas`, `global_scratch_align`, a kernel step with a `workspace`,
+  clusters and global scratch at launch). Manifests and plans without them are unchanged, digests included. A 0.0.6 manifest whose kernel has a
+  global scratch still loads, and is refused at launch (no alignment recorded): export it again.
+- The crate: `Entry::persistent`, `Persistent`, `LaunchAttributes::global_scratch_align` and `cluster()`, `Plan::prepare_for`, `Plan::cluster()`,
+  `Plan::global_scratch()`, `Prepared::cluster`, `Prepared::scratch_bytes` and `Kernel::sm_count()` are new; `Prepared::grid` is the grid of blocks
+  (programs times the cluster).
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

@@ -9,8 +9,9 @@ A reader of this document is assumed to know schema 2: the entry fields of a Tri
 expression grammar, the canonical JSON of the digest, and the launch checks the crate already makes. Only what is new or changed is specified; a
 field that is not mentioned is as in schema 2.
 
-Contents: 1 what changed; 2 the top level; 3 the digest; 4 kernel entries; 5 the ABI (strided views, device scalars, fixed arguments, scratch
-slots, an `out` written over its input, TMA descriptors); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM, and in 9.4 a pinned cuDNN convolution); 10 strict reading, every
+Contents: 1 what changed; 2 the top level; 3 the digest; 4 kernel entries (4.1 an implementation per architecture, 4.2 warp-specialised kernels, 4.3
+persistent grids, 4.4 a configuration per bucket, 4.5 thread-block clusters, 4.6 a global scratch); 5 the ABI (strided views, device scalars, fixed
+arguments, scratch slots, an `out` written over its input, TMA descriptors); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM, and in 9.4 a pinned cuDNN convolution); 10 strict reading, every
 refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where it is tested.
 
 ## 1. What changed
@@ -34,6 +35,10 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | ABI argument kinds (0.0.6, crate 0.0.4) | — | adds `tensordesc`: a TMA descriptor of a tensor (a `CUtensorMap` the host encodes at every launch, passed by value), which takes `1 + 2 * rank` slots of `kernelParams`, so `slot` is where a parameter's slots begin (section 5.5) |
 | kernel entry (0.0.6, crate 0.0.4) | — | an optional `total_num_warps`: the warps of a block of a warp-specialised kernel, whose partitions add warps to the `num_warps` of its default partition; its `block` is `32 * total_num_warps` (section 4.2) |
 | library entry (0.0.6, crate 0.0.4) | — | `impl: "cudnn.conv_fwd"`: a pinned cuDNN forward convolution, an entry of fields of its own (the problem, the math, the pin of the legacy or the backend API and how it was chosen, the cuDNN version, the device) (section 9.4) |
+| `grid` (0.0.7, crate 0.0.5) | affine in the dimensions (what Python wrote) | may multiply dimensions (`(cdiv(C*T, 1024),)`): the grammar always had `*`, and both readers always took it; a host computes a grid, it never solves one (section 7.1) |
+| kernel entry (0.0.7, crate 0.0.5) | — | an optional `persistent`: a persistent grid, the tiles cut at launch to the programs the SMs of the device (or of its partition) run (section 4.3) |
+| kernel entry (0.0.7, crate 0.0.5) | — | `launch.cluster_dims` and `launch.num_ctas` of a thread-block cluster (a Triton kernel's `num_ctas`, a prebuilt binary's declared cluster) are launched with `cuLaunchKernelEx`, and `options.num_ctas` says it (section 4.5) |
+| kernel entry (0.0.7, crate 0.0.5) | — | `launch.global_scratch_size` above 0 is launched with a scratch of that many bytes per CTA, and `launch.global_scratch_align` records its alignment (section 4.6) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -83,7 +88,7 @@ A `kernels` entry has a `kind`, which is required and is exactly one of `"triton
 **`kind: "triton"`** is schema 2's entry plus `kind` and `abi.scratch_slots`. Its fields are
 
 `stem op kind arch ptx_target symbol cubin abi grid block shared num_warps num_stages launch constexprs buckets dims preconditions options
-declaration_digest sha256 sha256_code toolchain` and optionally `implementation` (section 4.1), `total_num_warps` (section 4.2), `source_sha256`,
+declaration_digest sha256 sha256_code toolchain` and optionally `implementation` (section 4.1), `total_num_warps` (section 4.2), `persistent` (section 4.3), `source_sha256`,
 `source_digest` + `source_digest_kind` (as in schema 2:
 `source_digest_kind` is `"tilefish.triton-ir.v1"` for the digest of the Triton IR, the TTIR of a `triton.jit` kernel, and `"tilefish.gluon-ir.v1"` for that of
 a Gluon kernel, `@tilefish.extern(gluon=...)`: the TTGIR Gluon's frontend builds, layouts and `num_warps` included, hashed under its own tag. A Gluon kernel is
@@ -99,7 +104,7 @@ with the compile spec of the operator.
 Its fields are
 
 `stem op kind arch ptx_target symbol cubin abi grid block shared launch constexprs buckets dims preconditions declaration_digest sha256 sha256_code
-toolchain binary source_digest source_digest_kind`
+toolchain binary source_digest source_digest_kind` and optionally `persistent` (section 4.3)
 
 with `constexprs` always `[]`, `source_digest_kind` always `"tilefish.binary.v1"`, `source_digest` always present, and no `source_sha256`.
 
@@ -170,8 +175,9 @@ own, and Triton 3.5.1 reports the total after warp specialisation (`ttg.total-nu
 * `shared`: Triton's `metadata.shared`, the dynamic shared memory;
 * `launch`: `cluster_dims`, `num_ctas`, the scratch sizes, PDL and a cooperative launch.
 
-What a plain `cuLaunchKernel` cannot set up is still refused, so `cluster_dims` is `[1, 1, 1]` and `num_ctas` is 1. Every launch uses these values,
-in Python and in Rust: a single launch, a step of a plan, and a launch captured in a CUDA graph.
+A thread-block cluster (section 4.5) and a global scratch (section 4.6) are launched since tilefish 0.0.7 and crate 0.0.5; what neither host sets up is
+still refused when the binary is loaded: profile scratch, programmatic dependent launch and a cooperative launch. Every launch uses these values, in
+Python and in Rust: a single launch, a step of a plan, and a launch captured in a CUDA graph.
 
 **The build** (`_build.build`) checks what Triton did:
 * a kernel whose TTGIR has no `ttg.warp_specialize` region must have exactly the declared `num_warps`. A silent change is refused: "the compile
@@ -203,12 +209,123 @@ A JSON `null` is as absent. A reader from before this change refuses an entry wi
 replay of Python 0.0.5 finds a block that is not the spec's. So no host launches a warp-specialised kernel with the declared block. Manifests without
 the field are unchanged, and so are their digests.
 
+### 4.3 Persistent grids: `persistent` (tilefish 0.0.7, crate 0.0.5)
+
+A **persistent** kernel launches about as many programs as the device runs at once, and each program walks the work items with a stride of the programs
+launched: `for t in range(tl.program_id(0), tiles, tl.num_programs(0))`. Its best grid is `min(tiles, programs per SM * SMs)`, which no dimension
+expression can say, since the SM count is the device's. Declared with `@tilefish.extern(..., grid=lambda M, N: (tilefish.cdiv(M, 128) *
+tilefish.cdiv(N, 128),), persistent=tilefish.persistent(programs_per_sm=1))` (a Triton or Gluon kernel, or a prebuilt binary), its grid is **the number
+of tiles**, and the host cuts it when the kernel is loaded:
+
+| field | type and rule |
+|---|---|
+| `persistent` | optional object, on a `triton` or `binary` entry: exactly `programs_per_sm` and, optionally, `sm_count`. Absent (or `null`) for every other kernel |
+| `persistent.programs_per_sm` | int from 1 to 32: the programs a launch runs per SM, at most |
+| `persistent.sm_count` | optional int from 1 to 2^20 (`null` is as absent): the SM count a kernel **whose bytes depend on how many programs run** is declared for |
+| `grid` | of a persistent entry: exactly one entry, the tiles |
+
+**What a launch runs.** `programs = max(1, min(tiles, programs_per_sm * SMs // ctas))`, where `tiles` is the grid's one entry at the launch, `ctas` the
+CTAs of one program (`launch.num_ctas`, section 4.5: a program of a cluster of 2 CTAs takes 2 SMs) and `SMs` the multiprocessor count the host resolves
+**when it loads the binary**: the device's (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`; a MIG slice has its own), or the partition's when the host runs
+on a partition of the device's SMs (a green context reports the device's count to every query, so the host says it: `Manifest::with_sm_partition(Some(n))`
+in Rust, `tilefish.runtime.sm_partition(n)` in Python, a context manager around the loads and runs). A launch has `programs` along x (times its cluster,
+section 4.5). The grid of blocks is checked against the device's limits as any grid; one binary serves every device shape, so a manifest exported for
+one SM count (a MIG slice) runs on another (the whole device) without being exported again. A launch plan and a CUDA graph hold the programs of the
+device and partition they were prepared or captured on.
+
+**The bytes of a persistent kernel.** The SM count changes how many programs run, and which program computes which tile: never the binary. So:
+
+* `sm_count` absent (the default) is the kernel's promise that **its bytes do not depend on the number of programs**: each tile is computed by one
+  program from its inputs, whichever program and however many there are (an elementwise tile, a GEMM tile, a row). This is the usual case, and what
+  the declaration states; tilefish cannot check it (as it cannot check a `MayAlias`), and the gpu tests hold it to the same bytes on 1, 8, 16 and 30 SMs.
+* A kernel whose bytes **do** depend on it (a persistent reduction whose programs each sum their own tiles and then combine the partial sums: another
+  number of programs adds in another order) declares the SM count it is for, `tilefish.persistent(sm_count=30)`. The entry records it, and a host on
+  a device or a partition of another count refuses the kernel when it loads it ("declared for 30 SMs, but this device has 148"): its bytes on 30 SMs
+  are the ones it was validated with. Running it on another device shape is another declaration (another value), so another export, as a cuBLASLt
+  pin of another SM count is (section 9).
+
+The field is digested like every field, and the declaration digest has it (only when it is declared); a reader that predates it refuses an entry with it
+(the crate's reader refuses unknown fields; Python 0.0.6's replay finds an entry that is not the spec's). Manifests without it are unchanged.
+
+### 4.4 A configuration per bucket (tilefish 0.0.7): `@tilefish.extern(..., by_bucket=...)`
+
+An extern of a bucketed dimension may choose its compile-time configuration per bucket, which used to take one operator per configuration and a choice
+at plan time:
+
+```python
+@tilefish.extern(triton=k.rows, num_warps=4, grid=lambda TB, BLOCK_T: (tilefish.cdiv(TB, BLOCK_T),),
+                 by_bucket=lambda TB: tilefish.config(num_warps=2, BLOCK_T=16) if TB <= 256 else tilefish.config(num_warps=8, BLOCK_T=64))
+def rows(x: Tensor[TB, 128, f32], y: Out[Tensor[TB, 128, f32]], n_rows: TB, BLOCK_T: const = 32): ...
+```
+
+`by_bucket` is a callable over names of bucketed dimensions of the signature (`Dim("TB", buckets=[...])`), called once per bucket combination of the
+dimensions it names, returning `tilefish.config(num_warps=, num_stages=, num_ctas=, **consts)` or `None`; what a configuration leaves out is the
+declaration's. Those dimensions are bucketed dimensions of the operator (one binary per bucket, as a constexpr that depends on a bucket makes one: after
+the ones of such constexprs in the stem, in the order of the callable's parameters). Each binary is compiled with its bucket's warps, stages and CTAs
+and its consts' values (the tile sizes, any constexpr), and launched with the grid the grid callable gives under those values.
+
+**Nothing is new in the manifest**: every entry already has its own `num_warps`, `num_stages`, `options`, `constexprs`, `grid` and `block`, and those of
+each bucket are its configuration's. **The identity**: the declaration digest covers the whole configuration of every bucket (the `by_bucket` key of
+the canonical declaration lists, per bucket combination, the warps, stages, CTAs, the typed value of every const it sets and the grid under them; only
+when `by_bucket=` is given), so it is one digest for every bucket of the operator, as before, and changing the configuration of one bucket makes every
+binary of the operator stale; each binary's compile spec has its configuration (its compile options, its constexpr values, its grid), so the build
+cache keys and the manifest entries are per configuration. A call cannot give a const that a configuration sets (its value is the bucket's). A prebuilt
+binary takes no `by_bucket=` (its configuration is compiled already), and with `by_arch=` each implementation says its own (`tilefish.impl(...,
+by_bucket=...)`).
+
+### 4.5 Thread-block clusters: `launch.cluster_dims`, `launch.num_ctas` (tilefish 0.0.7, crate 0.0.5)
+
+A Triton or Gluon kernel compiled with `num_ctas=2` (`@tilefish.extern(..., num_ctas=2)`, 1, 2, 4 or 8; the compile option of Triton 3.5.1, sm_90 and
+up) runs each program on a **thread-block cluster** of `num_ctas` CTAs along x, which share distributed shared memory and TMA multicast; Triton's
+metadata says `num_ctas` and `cluster_dims` (`(num_ctas, 1, 1)`). A prebuilt binary declares its cluster, `@tilefish.extern(ptx=..., cluster=(2, 1,
+1))` (at most 8 blocks), for a kernel written for one (`%cluster_ctarank`, `mapa`, `barrier.cluster`; `.explicitcluster` makes the driver refuse a launch
+without it).
+
+**The entry.** `launch.cluster_dims` and `launch.num_ctas` (the fields an entry always had) are the cluster, `num_ctas` their product; a Triton entry
+compiled with more than one CTA per program has `options.num_ctas` (its compile option, present exactly when it is not 1, and equal to
+`launch.num_ctas`). A prebuilt binary's `launch` is the zero value but for its cluster.
+
+**The launch.** The grid of the entry counts **programs** (clusters): a launch is `cuLaunchKernelEx` with the grid of blocks `grid * cluster_dims` (each
+axis; Triton's own launcher multiplies the grid by `cluster_dims` when `num_ctas` is not 1), the attribute `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION` of
+`cluster_dims`, and `CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE` = `SPREAD` (what Triton's launcher asks for), on every launch: a single launch,
+a step of a plan, and a launch captured in a CUDA graph (the graph's kernel node has the cluster). A kernel of `num_ctas=2` launched without its cluster
+computes other bytes (the gpu test shows it), which is why a reader of an earlier version refused it. Both hosts refuse at load a cluster that is not
+`num_ctas` CTAs or is larger than the portable 8 (no host asks for CUDA's non-portable cluster size). The build refuses a binary whose metadata cluster
+is not the declared `num_ctas`.
+
+### 4.6 A global scratch: `launch.global_scratch_size`, `launch.global_scratch_align` (tilefish 0.0.7, crate 0.0.5)
+
+Triton 3.5.1 gives a kernel a **global scratch** when it needs memory of its own in global memory: device-side TMA descriptors (`tl.make_tensor_descriptor`)
+write their `CUtensorMap`s there, 128 bytes each. The kernel takes the scratch pointer in the first scratch slot of its ABI (`global_scratch`, section 5),
+and addresses `global_scratch_size` bytes per CTA from it (`metadata.global_scratch_size`, aligned to `metadata.global_scratch_align`): Triton's own launcher
+allocates `global_scratch_size * gridX * gridY * gridZ * num_ctas` bytes per launch with the allocator `triton.set_allocator` installs, and passes the address.
+The scratch is the launch's: nothing in it survives the launch, and the next launch may write over it.
+
+**The declaration** states it, `@tilefish.extern(..., global_scratch=256)` (bytes per CTA, a Triton or Gluon kernel), because a launch plan sizes its
+arena without building anything (plan schema 1, section 6); the build refuses a kernel whose metadata says another size ("the compiled kernel addresses
+256 bytes of global scratch per CTA, but declare global_scratch=256"), and one whose alignment does not divide 256 bytes. It is in the declaration digest
+(only when declared) and in the compile spec (`global_scratch`).
+
+**The entry.** `launch.global_scratch_size` is the bytes per CTA, and `launch.global_scratch_align` (new, an int, a power of two) its alignment, which
+tilefish writes with every global scratch and a reader refuses without one: the `launch` of every other entry is the six fields it always was (an entry
+of tilefish 0.0.6 with a global scratch has no alignment, and is read as before and refused when its binary is loaded). A prebuilt binary has no global
+scratch (its C parameters are all it is launched with).
+
+**The launch** gives the kernel `global_scratch_size * (CTAs of its grid)` bytes, the programs of a persistent grid at that launch times `num_ctas`, starting
+on 256 bytes (every alignment Triton records divides it), at the `global_scratch` slot (the profile scratch slot stays null). Python's single launch
+allocates it on the launch's stream (torch's caching allocator, freed after the launch, stream-ordered; under a `torch.cuda.graph` capture from the graph's
+pool); the Rust host takes it from the caller, **the last tensor of a launch** (a writable `u8` tensor of at least `Prepared::scratch_bytes` bytes,
+256-byte aligned, overlapping no other tensor: `Plan::tensor_names()` ends with `global_scratch`), so that nothing is allocated in a launch and a launch
+can be captured; a launch plan gives every kernel step with a global scratch the plan's workspace (plan schema 1, sections 6 and 7). Both hosts refuse at
+load a manifest of tilefish 0.0.6 that has a global scratch (it did not record the alignment: export it again). Profile scratch stays refused.
+
 ## 5. The ABI
 
 `abi` is `{"params": [...], "scratch": [...], "scratch_slots": <int>}`. `params` are the kernel's launch arguments in order, one `kernelParams` slot
 each (`slot` is the position in `params`), except a `tensordesc`, which takes `1 + 2 * rank` slots (section 5.5): `slot` is where the slots of a
-parameter begin, the slots of the parameters before it counted. `scratch` is what a Triton kernel is launched with after `params`: two null 64-bit pointers
-(`global_scratch`, `profile_scratch`, `value` 0, at the slots after those of the last parameter), unchanged. **A prebuilt binary has `scratch: []` and
+parameter begin, the slots of the parameters before it counted. `scratch` is what a Triton kernel is launched with after `params`: two 64-bit pointers
+(`global_scratch`, `profile_scratch`, `value` 0, at the slots after those of the last parameter), unchanged: null, but the `global_scratch` of an entry
+whose `launch.global_scratch_size` is above 0, which is the address of the scratch the launch gives it (section 4.6). **A prebuilt binary has `scratch: []` and
 `scratch_slots: 0`: it is launched with exactly `params`, no more.**
 
 Every `params` entry has `slot`, `index` (the position in the declaration), `name`, `kind`, `type`, `ptx_type`, `size`. The kinds and what else each has:
@@ -381,13 +498,9 @@ value** in the kernel node: a CUDA graph of a plan holds the maps of the bucket 
 their addresses, so it is right for every replay exactly as long as those addresses are (plan schema 1, section 10). Binding another tensor is another
 launch or another capture, which encodes its own maps; nothing patches a captured map.
 
-**`global_scratch` is still refused.** Triton's *device-side* descriptors (`tl.make_tensor_descriptor`) write their maps into a per-program global
-scratch (`launch.global_scratch_size` bytes per program, aligned to the compiled `global_scratch_align`, which the manifest does not record): a host would
-allocate `size * gridX * gridY * gridZ * num_ctas` bytes per launch, and a plan a scratch buffer in its arena (a new role, a step field, per-bucket sizes,
-and the alignment in the `launch` object of the entries, which the digests of every manifest cover). That is a change of both documents and both hosts
-for what host descriptors give at lower cost (a host descriptor is encoded once per launch, on the host; a device-side one by every program, on the
-device, before its first load), so both hosts still refuse to launch an entry whose `global_scratch_size` is not 0 (a plain `cuLaunchKernel` passes a null scratch pointer):
-declare the descriptor as a parameter instead.
+**Device-side descriptors** (`tl.make_tensor_descriptor`, which write their maps into a global scratch) are launched since tilefish 0.0.7 and crate
+0.0.5 (section 4.6). A host descriptor is still the cheaper one where the tensor is a parameter (encoded once per launch, on the host; a device-side one
+by every program, on the device, before its first load).
 
 A reader that predates the kind (tilefish 0.0.5, crate 0.0.3) refuses a manifest that has one (`kind must be pointer, scalar, fixed or given`). A manifest
 without one, and its digest, are unchanged.
@@ -436,7 +549,12 @@ pointer.
 
 A shape axis, a stride dimension, a scalar's `dim`, the `dim` of a `divisible` precondition, an axis of the `shape` of a `max_elements` precondition and
 every grid entry are *dimension expressions*: integers, names, `cdiv(a, b)`, `+`, `-`, `*`, `//`, unary `-` and parentheses (`_specvalid._ExprParser`
-in Python; `crates/tilefish/src/expr.rs` is a port of it). An expression is at most 512 characters and 256 tokens, nested at most 24 deep, and an integer
+in Python; `crates/tilefish/src/expr.rs` is a port of it). **A grid entry may multiply dimensions** (tilefish 0.0.7): `@tilefish.extern(...,
+grid=lambda T, C: (tilefish.cdiv(T * C, 1024),))` is written `(cdiv(C*T, 1024),)`, one program per 1024 elements of a `[T, C]` tensor whatever `T` and `C`
+are (a grid callable is evaluated with products allowed, `tilefish.dims.products()`; the factors are written in a canonical order, and the declaration
+digest has the product as `{"prod": [...]}`). A host computes a grid at each launch, from dimensions the tensors bound, and never solves one, so a product
+is fine there; a shape, a stride and a scalar stay affine, as a host binds the dimensions of a call by solving them. Both readers always took such a
+grid: an expression that is not affine is evaluated as it is written (below). An expression is at most 512 characters and 256 tokens, nested at most 24 deep, and an integer
 literal has at most 12 digits (`1234567890123` is two tokens, and refused). Both readers parse every one of them when they read the manifest (Python:
 `Manifest.load`, `_manifest._check_dimension_names`), so both refuse the same texts.
 
@@ -477,8 +595,9 @@ A prebuilt binary is a kernel Triton does not compile: PTX assembled by `ptxas`,
 * `shared`: the bytes of **dynamic** shared memory to launch with, from the declaration (a reader checks `static + shared ≤` the device's opt-in
   maximum, as for Triton).
 * `grid`: an expression over the dimension names, as in schema 2.
-* `launch`: always the zero value `{"global_scratch_size": 0, "profile_scratch_size": 0, "launch_pdl": false, "cluster_dims": [1,1,1], "num_ctas": 1,
-  "cooperative": false}`, so a plain `cuLaunchKernel` runs it.
+* `launch`: the zero value `{"global_scratch_size": 0, "profile_scratch_size": 0, "launch_pdl": false, "cluster_dims": [1,1,1], "num_ctas": 1,
+  "cooperative": false}`, so a plain `cuLaunchKernel` runs it; or, for a binary declared with a thread-block cluster (`cluster=(2, 1, 1)`, section 4.5),
+  that value with its `cluster_dims` and their product as `num_ctas`, launched with `cuLaunchKernelEx` (its grid counts clusters).
 * `ptx_target`: for PTX the `--gpu-name` the PTX was assembled for (`sm_103a` when the PTX has `.target sm_103a`, else `sm_<arch>`); for a cubin `""`.
 * `binary`: `{"source": "cubin"}` or `{"source": "ptx", "ptxas_flags": [<strings>]}` (exactly those keys; the flags are the argument vector given to
   `ptxas` before the file names: `["-lineinfo", "-v", "--gpu-name=sm_103a"]`, the flags Triton 3.5 passes, in the same spelling, since ptxas records
@@ -941,7 +1060,11 @@ document tilefish writes next to a build and the host does not read):
   `source_sha256`/`source_digest` not 64 lowercase hex digits; `source_digest` and `source_digest_kind` not both present or both absent; an
   `implementation` (section 4.1) that is not the entry's `arch` or `"fallback"`, or on a `binary` entry; a `total_num_warps` (section 4.2) on a
   `binary` entry, not an integer, not more than `num_warps` or more than 32, or with a `block` that is not `[32 * total_num_warps, 1, 1]` (the Rust
-  reader refuses a Triton entry whose `block` is not `[32 * num_warps, 1, 1]` without it; Python compares that block with the spec's);
+  reader refuses a Triton entry whose `block` is not `[32 * num_warps, 1, 1]` without it; Python compares that block with the spec's); a `persistent`
+  (section 4.3) that is not exactly `{programs_per_sm[, sm_count]}`, a `programs_per_sm` not an int from 1 to 32, an `sm_count` not an int from 1 to
+  2^20, or a grid of more than one entry; a `launch.global_scratch_align` (section 4.6) without a global scratch or that is not a power of two; for a
+  Triton entry, an `options.num_ctas` (section 4.5) that is 1, is not `launch.num_ctas`, or is missing while `launch.num_ctas` is not 1; for a `binary`
+  entry, a `launch` that is not the zero value but for a cluster of `num_ctas` blocks (at most 8), or that has a global scratch;
   for `binary`: `binary` not exactly one of `{"source":"cubin"}` and `{"source":"ptx","ptxas_flags":[strings]}`, `source_digest_kind` not
   `"tilefish.binary.v1"`, no `source_digest`, a `source_sha256`, a cubin used as it is whose `source_digest` is not its `sha256`; the cubin file name not a plain file name; the cubin's `sha256`, `sha256_code` or
   `.text.<symbol>` section wrong; for `triton` the shared-memory section rule.
@@ -1035,6 +1158,19 @@ and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter th
 * `total_num_warps` (section 4.2) is read into `Entry::total_num_warps` (`Option<u32>`, next to `Entry::num_warps`, the declared warps) and held to the
   rules of section 10. Every launch takes the entry's `block` (`Plan::block()`): a single launch, a step of a launch plan, and a captured graph. For a
   warp-specialised kernel that block is `32 * total_num_warps`, so the crate needs nothing else to launch one.
+* `persistent` (section 4.3) is read into `Entry::persistent` (`Option<Persistent>`: `programs_per_sm`, `sm_count`). `Manifest::kernel` resolves the SMs of a
+  persistent kernel when it loads it, the partition of `Manifest::with_sm_partition` or the device's multiprocessor count (`Kernel::sm_count()`; a kernel is
+  cached per SM count too), refuses one declared for another count, and every launch cuts the grid to the programs they run (`Persistent::programs`;
+  `Plan::prepare_for(tensors, given, device, sm_count)`, of which `prepare` and `prepare_with` are the uncut grid, the tiles).
+* `launch.cluster_dims` and `launch.num_ctas` (section 4.5), with `LaunchAttributes::cluster()` and `Plan::cluster()`: `Prepared::grid` is the grid of
+  blocks (the programs times the cluster) and `Prepared::cluster` the cluster, and a launch of a kernel of clusters (`Kernel::launch`, `launch_raw`, a step
+  of a plan, a capture) is `cuLaunchKernelEx` with the cluster attribute (`cudarc::driver::sys::cuLaunchKernelEx`, which cudarc has no wrapper of: the
+  safe launch orders the tensors' slices through cudarc's guards, as a GEMM's). `LaunchAttributes::global_scratch_align` (section 4.6) is read
+  (`Option<u32>`); `blockers()` names what the crate does not launch.
+* A global scratch (section 4.6) is the last tensor of a launch (`Plan::global_scratch()`, `GLOBAL_SCRATCH` last in `Plan::tensor_names()`), held to the
+  bytes of the launch (`Prepared::scratch_bytes`), 256-byte alignment, `u8`, a written dense tensor of the kernel's device overlapping no other tensor;
+  its address is the `global_scratch` slot. The emitter's struct of such a kernel takes `global_scratch: TensorMut<U8>` last. A plan step gives its
+  workspace.
 
 **Launching a kernel** (`plan.rs`). The steps of section 5.1, in Python's order: shapes, strides and scalars bind the dimensions (then the `out` tensors bind
 the dimensions those leave unbound, section 7), `divisible_by`, the exact
@@ -1130,6 +1266,7 @@ constexprs, and `ops=` checks each entry against the implementation its architec
 | `implementation`: an operator with an implementation per architecture (section 4.1) | `test_per_arch.py`; on a GPU `test_gpu_per_arch.py` (and the Rust gate) |
 | `tensordesc`: TMA descriptors (section 5.5): the declaration, the spec, the slots, the readers, the launch checks, the encode, a plan on a fake backend, the emitter | `test_tensordesc.py`; on a GPU `test_gpu_tma.py` (Triton and Gluon kernels against Triton's own launch, plans and captures) and the Rust gate |
 | `total_num_warps`: warp-specialised kernels (section 4.2): the build's checks, the cache, the readers, the block of a launch, the emitter | `test_warp_specialization.py`; on a GPU `test_gpu_warp_specialization.py` (Gluon and Triton warp-specialised kernels against Triton's own launch, CUDA graphs, plans and captures) and the Rust gate |
+| launch shapes (sections 4.3 to 4.6, and a grid that multiplies, 7.1): the declarations, the specs and their digests, the build's checks, the readers, what a launch is given, a plan's workspace as a scratch | `test_launch_shapes.py`; on a GPU `test_gpu_launch_shapes.py` (`launch_kernels.py`: torch's bytes in jit, replay, plans, `tilefish.capture` and `torch.cuda.graph`; a persistent kernel on 1 to 30 SMs, a Triton cluster and a PTX one, device-side descriptors) and the Rust gate |
 
 The Rust crate (`crates/tilefish/tests/`):
 
@@ -1142,4 +1279,5 @@ The Rust crate (`crates/tilefish/tests/`):
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |
 | `tensordesc` (section 5.5): reading, refusals, the slots, the launch checks and the arguments of the encode | `tensor_maps.rs` |
 | `total_num_warps` (section 4.2): reading, refusals, the block of a plan, the digest | `warp_specialization.rs` |
+| launch shapes (sections 4.3 to 4.6, 7.1): a grid that multiplies, a persistent grid cut to the SMs, clusters and their compile option, a global scratch as the last tensor, the refusals, the digests | `launch_shapes.rs`; on a GPU `gpu_gate.rs` (`the_gate_has_launch_shapes`, `a_persistent_kernel_gives_the_same_bytes_on_every_partition`, `graph_capture_of_launch_shapes`, `a_global_scratch_that_does_not_hold_the_launch_is_refused`) and `gpu_plan_gate.rs` (`the_plans_of_launch_shapes_have_their_scratch_and_run_on_a_partition`) |
 | on a GPU, byte identity with Python's `replay` of every feature, the refusals, graph capture of a GEMM and of a strided kernel, the hazards of other streams | `gpu_gate.rs` with `python/tests/rust_gate.py` (TMA descriptors: `the_gate_has_tma_descriptors`, `a_descriptor_of_a_tensor_the_driver_refuses_...`, `graph_capture_of_kernels_with_tma_descriptors`) |
