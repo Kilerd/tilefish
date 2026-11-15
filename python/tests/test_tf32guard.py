@@ -315,7 +315,7 @@ def test_a_cache_entry_stored_without_the_check_is_refused_when_it_is_read(world
 
 
 def test_the_recipe_of_the_cache_is_the_one_with_the_check():
-    assert _cache.CACHE_RECIPE == 4
+    assert _cache.CACHE_RECIPE >= 4  # 4 added the check (5: host-independent debug paths)
 
 
 def test_a_mixed_kernel_is_judged_on_the_ttir_and_ttgir_of_its_compile(world):

@@ -9,7 +9,8 @@ returns the :class:`FakeCompiler` behind it. What it models is what the identity
   ``str_nodebug()`` is that text. (A function that cannot run on symbols, a generated kernel that needs the real ``tl``, is
   represented by the dump of its syntax tree, which has the same two properties.)
 * the **compiler** (``triton.compile``) calls the frontend, then makes a small ELF file whose code is a function of the IR text, the
-  options and the architecture, and counts the calls.
+  options and the architecture, and counts the calls. Its debug sections hold the name of the kernel's file as the frontend took it from
+  ``triton.compiler.code_generator.get_jit_fn_file_line`` (what Triton's locations, and so a real cubin's ``.debug_line``, are made of).
 * **Gluon's frontend** (``triton.experimental.gluon._runtime.GluonASTSource``): the IR of a Gluon kernel is its TTGIR, whose module carries
   ``ttg.num-warps`` and ``ttg.target`` (and the layouts, which here are whatever the function's body returns); Triton's own frontend cannot
   build a Gluon kernel (its layouts need ``ttg.num-warps``), and neither can it here. ``gluon.jit`` makes a ``FakeGluonJit``.
@@ -72,8 +73,9 @@ class Sym:
 
 
 class FakeModule:
-    def __init__(self, text):
+    def __init__(self, text, file_name="path/a.py"):
         self.text = text
+        self.file_name = file_name  # the file the locations of the module name (not in str_nodebug(), as in Triton)
 
     def str_nodebug(self):
         return self.text
@@ -102,7 +104,8 @@ class ASTSource:
         except Exception:  # noqa: BLE001 - a function that needs the real tl: its syntax tree is what is compiled
             body = ast.dump(ast.parse(textwrap.dedent("".join(self.fn.raw_src))))
         types_ = ",".join(f"{self.signature.get(n, '?')}" for n in names)
-        return FakeModule(f"module {{ func @{self.fn.__name__}({types_}) attrs={sorted(map(str, (self.attrs or {}).items()))} {{ {body} }} }}")
+        file_name, _ = sys.modules["triton.compiler.code_generator"].get_jit_fn_file_line(self.fn)  # looked up at the call, as Triton's ast_to_ttir does
+        return FakeModule(f"module {{ func @{self.fn.__name__}({types_}) attrs={sorted(map(str, (self.attrs or {}).items()))} {{ {body} }} }}", file_name)
 
 
 class GluonSourceMixin:
@@ -112,7 +115,7 @@ class GluonSourceMixin:
 
     def make_ir(self, target, options, codegen_fns, module_map, context):
         module = super().make_ir(target, options, codegen_fns, module_map, context)
-        return FakeModule(f'module attributes {{"ttg.num-warps" = {options.num_warps}, ttg.target = "cuda:{target.arch}"}} ttgir ' + module.text)
+        return FakeModule(f'module attributes {{"ttg.num-warps" = {options.num_warps}, ttg.target = "cuda:{target.arch}"}} ttgir ' + module.text, module.file_name)
 
 
 class FakeBackend:
@@ -135,6 +138,14 @@ class FakeBackend:
 class FakeContext:
     def disable_multithreading(self):
         pass
+
+
+def get_jit_fn_file_line(fn):
+    """Triton 3.5.1's ``triton.runtime.jit.get_jit_fn_file_line``: the file of the function behind ``fn`` (``co_filename``) and its first line."""
+    base = fn
+    while not hasattr(base, "raw_src"):
+        base = base.fn
+    return base.fn.__code__.co_filename, base.starting_line_number
 
 
 def _module(name, **attrs):
@@ -222,7 +233,7 @@ class FakeCompiler:
             md.num_warps = self.total_warps if self.total_warps is not None else self.metadata_warps
         reqntid = 32 * md.num_warps if self.reqntid == "block" else self.reqntid
         ptx = ptx_of(src.signature, target.arch, reqntid) + self.ptx_body
-        cubin = cubin_like(code=code, shared=1024, **arch_header(target.arch))
+        cubin = cubin_like(code=code, shared=1024, debug=module.file_name, **arch_header(target.arch))
         asm = {"cubin": cubin, "ptx": ptx, "ttgir": ttgir, **({"ttir": self.ttir} if self.ttir is not None else {})}
         return types.SimpleNamespace(metadata=md, asm=asm)
 
@@ -277,7 +288,9 @@ def install(monkeypatch, version="3.5.1"):
     monkeypatch.setitem(sys.modules, "triton.runtime.jit", _module("triton.runtime.jit", JITFunction=fake_jit.FakeJit))
     monkeypatch.setitem(sys.modules, "triton.backends", _module("triton.backends"))
     monkeypatch.setitem(sys.modules, "triton.backends.compiler", _module("triton.backends.compiler", GPUTarget=GPUTarget))
-    monkeypatch.setitem(sys.modules, "triton.compiler", _module("triton.compiler", ASTSource=CountingSource))
+    code_generator = _module("triton.compiler.code_generator", get_jit_fn_file_line=get_jit_fn_file_line)
+    monkeypatch.setitem(sys.modules, "triton.compiler", _module("triton.compiler", ASTSource=CountingSource, code_generator=code_generator))
+    monkeypatch.setitem(sys.modules, "triton.compiler.code_generator", code_generator)
 
     class GluonASTSource(GluonSourceMixin, CountingSource):
         pass

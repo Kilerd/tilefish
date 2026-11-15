@@ -356,6 +356,7 @@ def test_processes_that_build_the_same_kernel_at_once_leave_one_good_entry(tmp_p
         assert code == 0, err[-3000:]
         results.append(json.loads(out.strip().splitlines()[-1]))
     assert len({r["code"] for r in results}) == 1 and all(r["compiled"] <= 1 for r in results) and sum(r["compiled"] for r in results) >= 1  # they raced: each got a binary
+    assert len({r["sha"] for r in results}) == 1  # the same file, compiled or read (and the same generated source file, written by all four at once)
     assert len(entries()) == 1
     last = subprocess.run([sys.executable, "-c", CHILD, ARCH], env=env, capture_output=True, text=True, timeout=600)
     assert last.returncode == 0, last.stderr[-3000:]

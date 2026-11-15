@@ -4,6 +4,30 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### Reproducible exports and builds
+
+- **A cubin names its sources by module path.** Triton records the file of a kernel and of every jit function it calls in the IR's
+  locations, and `ptxas` writes them into the cubin's debug sections. These were absolute paths: the checkout, the virtual environment
+  (`triton/language/standard.py`), and the random `/tmp/tilefish-gen-XXXXXXXX` directory of a lowered kernel's or a generated op's source.
+  So every export of the same operators had other cubin bytes, another `sha256` and another manifest and plan digest (the `sha256_code`
+  did not change). A build now names each file by a path that does not depend on the host: `kernels/rms.py` for the module
+  `kernels.rms`, `tilefish_generated/<name>.py` for a generated source, otherwise the base name. Two exports with the same toolchain
+  for the same device are the same files and digests, from any directory, process or machine, and a recorded pin checks a rebuild.
+  The machine code is unchanged: every `sha256_code` is what 0.0.6 built. Manifest schema 3, the digest and both readers are unchanged,
+  and manifests of 0.0.6 or earlier load and replay as before (`docs/manifest-schema-3.md`, section 3.1, says why the digest still covers
+  the files rather than `sha256_code`).
+- **A generated source has a content-addressed file.** `runtime.load_lowered` writes the source of a lowered kernel or a generated op
+  (`tilefish.contiguous`, `im2col`, `im2col1d`, `col2im1d`) to `<cache>/generated/<sha256>/tilefish_generated/<name>.py` in tilefish's
+  cache directory, through a temporary file and an atomic rename, and uses a file there only when it holds exactly the source. The
+  module runs from the checked text, never from a byte code cache. When the directory is switched off or cannot be written, the
+  source goes to a private scratch directory of the process (one `TilefishCacheWarning`); otherwise no scratch directory is made.
+- The build cache recipe is 5: entries stored by 0.0.6 named their build directory, so they are not read, and kernels are built again once.
+- **Hosts.** The Rust crate embeds no path of its own. A host that embeds a manifest (`emit(..., embed=True)`) is reproducible once
+  the manifest is (export one made by 0.0.6 or earlier again); the paths rustc writes for panic locations are remapped with
+  `--remap-path-prefix` (crate README, "Reproducible builds of a host").
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

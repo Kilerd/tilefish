@@ -411,9 +411,9 @@ class BuiltKernel:
     """One compiled binary of a compile spec, with everything a host needs to load and launch it.
 
     ``cubin`` is the ELF file and ``ptx`` the PTX it was assembled from. ``sha256`` covers the whole file and
-    ``sha256_code`` only the machine code (see :func:`tilefish._elf.code_digest`): two builds of one kernel from
-    different directories have the same ``sha256_code`` and may differ in ``sha256``, because the debug
-    information holds the build path. ``options`` are the options handed to ``triton.compile``.
+    ``sha256_code`` only the machine code (see :func:`tilefish._elf.code_digest`). Two builds of one kernel with one toolchain,
+    from different directories, processes or machines, have the same ``sha256`` too: the debug information names each source
+    file by a host-independent path (:func:`tilefish._ir.host_independent_paths`). ``options`` are the options handed to ``triton.compile``.
 
     ``ir_digest`` is the digest of the Triton IR the binary was compiled from (:func:`tilefish._ir.ir_digest`: the TTIR that
     Triton's frontend builds for the kernel, without locations or names), or ``None`` for one that was not built here. It is
@@ -812,13 +812,20 @@ def build(
     verified on every read (the ``sha256`` and ``sha256_code`` of the cubin
     are recomputed, among other things): an entry that is not as it was written is a miss with a
     :class:`~tilefish.errors.TilefishCacheWarning`, and the kernel is compiled. A hit has the cubin of the build that made
-    it, so its ``sha256`` (whole file, with the debug path of that build) can differ from a fresh compile's while its
-    ``sha256_code`` is the same. ``cache=False`` neither reads nor writes it. Whatever would make Triton compile something other than the IR is refused:
+    it, which is the cubin a fresh compile makes: the debug information names the source files by host-independent paths
+    (below), so neither the directory nor the process of the build that stored it is in it. ``cache=False`` neither reads nor writes it. Whatever would make Triton compile something other than the IR is refused:
     its kernel override (``TRITON_KERNEL_OVERRIDE``) and the compile option ``ir_override`` replace the IR of a stage with a
     file, and an active instrumentation plugin patches the passes. A compile option that names a file Triton reads
     (``extern_libs``), ``LLVM_PASS_PLUGIN_PATH`` and the libdevice file are in the cache key by the sha256 of the content of
     the file, not by its path, and Triton reads them later, during the compile: they are hashed again afterwards, and a build
     in which one of them changed is refused and stores nothing (a file rewritten and put back within the compile is not seen).
+
+    **Reproducible bytes.** Triton writes the file of the kernel, and of every jit function it calls, into the locations of the IR,
+    and ``ptxas`` writes them into the cubin's ``.debug_line`` and ``.nv_debug_ptx_txt``. The frontend of a compile here names
+    each file by its module path instead of where it is (:func:`tilefish._ir.host_independent_paths`: ``kernels/rms.py``,
+    ``tilefish_generated/rmsnorm.py``, ``triton/language/standard.py``), so the cubin does not depend on the checkout, the
+    virtual environment, the directory a generated source was written to, the working directory or the process: two builds of one
+    spec with one toolchain are the same file. The machine code (``sha256_code``) is what it was before this naming.
 
     **Concurrency.** Triton's frontend and compile are not known to be thread-safe, and a compile runs with a knob set that is
     process-wide, so a build holds one lock (:data:`tilefish._ir.LOCK`) for the *whole* compile, not only for the frontend. That is

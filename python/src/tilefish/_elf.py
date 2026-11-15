@@ -9,6 +9,9 @@ and skips ``.debug_*`` and ``.nv_debug_*`` together with their wrapped variants 
 mercury copies ``.nv.merc.debug_line`` and ``.nv.merc.rela.debug_line``, ...). In a cubin built by Triton
 from two directories exactly the debug sections differ: ``.debug_line``, ``.nv_debug_ptx_txt``,
 ``.rela.debug_line`` and their ``.nv.merc.*`` copies, all of which hold the path of the source.
+A build of tilefish names the sources by host-independent paths (:func:`tilefish._ir.host_independent_paths`),
+so its cubins are the same file from any directory; the code digest still tells apart the machine code of a
+cubin that names a directory (one built by an earlier version, or a prebuilt binary built elsewhere).
 
 The walk is strict: anything that is not a well-formed little-endian ELF64 file with a section header
 table whose sections lie inside the file is a :class:`~tilefish.errors.TilefishBuildError`. Nothing is

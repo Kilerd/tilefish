@@ -38,14 +38,23 @@ function must then be a kernel of that frontend (``tilefish._build`` refuses ano
 
 What this costs: the frontend, about 2 to 4 ms per kernel on a B300 (no compile, no GPU), once for each build, ``jit`` call or
 replay call. Nothing here compiles anything.
+
+**Where the source is, in the binary.** The locations of the IR a compile builds name the file of the kernel and of every jit function it
+calls, and ``ptxas`` writes those names into the cubin's debug sections. So the frontend of a compile (:func:`recording_source`) names each
+file by a path that does not depend on the host (:func:`tilefish._source.source_name`: ``kernels/rms.py`` for the module ``kernels.rms``,
+``tilefish_generated/rmsnorm.py`` for a generated kernel, ``triton/language/standard.py`` for Triton's own), not by where the checkout, the
+virtual environment or a scratch directory happens to be (:func:`host_independent_paths`). Two builds of one kernel with one toolchain are
+then the same bytes on any machine, from any directory, in any process. The digest above never had a location in it.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import threading
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
+from . import _source
 from .errors import TilefishBuildError
 
 if TYPE_CHECKING:
@@ -64,6 +73,7 @@ _TAGS = {"triton": _TAG, "gluon": b"tilefish.gluon-ir-digest.v1\0"}
 # held for the *whole* compile, which takes seconds for a large kernel, so a build, a ``jit`` call or a replay in another thread that
 # needs the frontend waits until it is done (a cache hit runs only the frontend, but waits for a compile in progress too).
 LOCK = threading.RLock()
+_naming = threading.local()  # .depth > 0 in a thread whose frontend names source files by host-independent paths (host_independent_paths)
 
 
 def triton_importable() -> bool:
@@ -187,9 +197,55 @@ def ttir_text(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "Mappi
         raise TilefishBuildError(f"Triton could not compile {what} for sm_{arch}: {type(e).__name__}: {e}") from e
 
 
+def _naming_hook(original: Any) -> Any:
+    """``get_jit_fn_file_line`` of Triton's code generator, wrapped: in a thread inside :func:`host_independent_paths` the file it returns is
+    named by :func:`tilefish._source.source_name`; anywhere else it is exactly what ``original`` returns."""
+
+    def get_jit_fn_file_line(fn: Any) -> Any:
+        file_name, begin_line = original(fn)
+        if getattr(_naming, "depth", 0) > 0 and isinstance(file_name, str):
+            file_name = _source.source_name(file_name, _source.module_of(fn))
+        return file_name, begin_line
+
+    get_jit_fn_file_line.__wrapped__ = original  # type: ignore[attr-defined]
+    get_jit_fn_file_line._tilefish_source_names = True  # type: ignore[attr-defined]
+    return get_jit_fn_file_line
+
+
+@contextlib.contextmanager
+def host_independent_paths() -> "Iterator[None]":
+    """Within the block, the frontend run by this thread names every source file by a path that does not depend on the host.
+
+    Triton's code generator takes the file of a jit function (the kernel, and each jit function it calls) from
+    ``triton.compiler.code_generator.get_jit_fn_file_line``, which returns ``fn.__code__.co_filename``, and builds every location of the IR from
+    it; nothing else of the IR comes from the path. That function is wrapped once per process, under :data:`LOCK`, and the wrapper changes the
+    name only in a thread inside this block (another thread's frontend, a Triton JIT launch of the program's own, gets Triton's name). Line and
+    column numbers are kept. Raises :class:`~tilefish.errors.TilefishBuildError` when this Triton has no such function (it is in 3.5.1).
+    """
+    try:
+        from triton.compiler import code_generator
+    except ImportError as e:
+        raise TilefishBuildError(f"the frontend of a compile is Triton's code generator, which this Triton does not have ({e})") from e
+    with LOCK:
+        current = getattr(code_generator, "get_jit_fn_file_line", None)
+        if current is None:
+            raise TilefishBuildError(
+                "this Triton's code generator has no get_jit_fn_file_line, through which a build names the source files in a binary's debug "
+                "information by paths that do not depend on the host (Triton 3.5.1 has it)"
+            )
+        if not getattr(current, "_tilefish_source_names", False):
+            code_generator.get_jit_fn_file_line = _naming_hook(current)
+        _naming.depth = getattr(_naming, "depth", 0) + 1
+        try:
+            yield
+        finally:
+            _naming.depth -= 1
+
+
 def recording_source(ASTSource: Any) -> Any:
     """A subclass of ``ASTSource`` (or of Gluon's ``GluonASTSource``, :func:`source_class`) that keeps the IR text its ``make_ir`` builds in
-    ``.ir_text`` (what a compile then takes).
+    ``.ir_text`` (what a compile then takes), and whose frontend names the source files by host-independent paths
+    (:func:`host_independent_paths`), so that the binary's debug information does not depend on where the files are.
 
     ``build`` compiles from this and checks that the text it recorded has the digest it looked the cache up with, so a binary is
     only ever stored under the digest of the IR it was compiled from.
@@ -199,7 +255,8 @@ def recording_source(ASTSource: Any) -> Any:
         ir_text: "str | None" = None
 
         def make_ir(self, target: Any, options: Any, codegen_fns: Any, module_map: Any, context: Any) -> Any:
-            module = super().make_ir(target, options, codegen_fns, module_map, context)
+            with host_independent_paths():
+                module = super().make_ir(target, options, codegen_fns, module_map, context)
             self.ir_text = str(module.str_nodebug())  # before the passes of the first stage change the module in place
             return module
 

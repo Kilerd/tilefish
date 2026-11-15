@@ -156,11 +156,17 @@ is a deliberate breaking change in 0.0.x: until 0.0.2 a replay trusted the direc
 default, and the digests in it sit next to the files they describe, so whoever can write
 the directory could make it run any binary.
 
-A pin is of one exported artifact, not of a recipe. The manifest digest covers the cubin
-files, and a cubin's debug sections name the directory it was built in. Exporting the
-same graph again, elsewhere or after a build-cache hit, can therefore give another digest
-for the same machine code: every binary's `sha256_code`, the pinned GEMMs and the plan
-are unchanged. Pin what you exported, and ship that directory.
+A pin is of one exported artifact, not of a recipe: the manifest digest covers the cubin
+files byte for byte. Exports are reproducible. A cubin's debug sections name each source
+by its module path (`kernels/rms.py`, `tilefish_generated/softmax.py`,
+`triton/language/standard.py`), not by the checkout, the virtual environment or a scratch
+directory, and a generated kernel's source is written to a file addressed by its sha256.
+So the same graph exported again with the same toolchain (Triton, `ptxas`, cuBLASLt,
+cuDNN) on the same kind of device, from another directory, in another process or on another
+machine, gives the same files, the same manifest digest and the same plan digest, and a
+recorded pin checks a rebuild. A manifest exported by tilefish 0.0.6 or earlier names the
+directory it was built in; it loads and replays as before, and only its digest is not what
+a new export of the same graph gives. Pin what you exported, and ship that directory.
 
 Arguments are torch tensors, matched to the signature the way a call is
 matched in a trace: inputs and `InOut` tensors are passed (an `InOut` tensor
@@ -256,7 +262,12 @@ written through a temporary file and renamed, so builds that race do not tear
 one. A lookup is a run of the frontend and a read: 3 to 6 ms. Nothing evicts the
 cache, it is no defence against someone who can write the directory (a manifest
 is what to pin), and it tells a patched Triton that keeps its version string from
-the original no better than the version does.
+the original no better than the version does. The same directory holds, under
+`generated/<sha256>/tilefish_generated/`, the Triton source of each lowered kernel
+and generated op (Triton reads a kernel's source from a file): written atomically,
+used only when it holds exactly that source, and, when the directory cannot be
+written, kept in a private scratch directory of the process instead (with one
+warning). Where it is does not reach a binary.
 
 `replay` also refuses `shared` memory the cubin and the device cannot have (the
 driver's static shared memory of the function plus the manifest's dynamic size
