@@ -129,8 +129,12 @@ loads with one pin: `PlanSet::load(dir, Pin::Digest(set_digest))`, then `set.pla
 (`Manifest` is cheap to clone, and its clones share the modules they load). Plans of a set that a host runs one at a time share one arena:
 `set.instantiate(&stream, &["a", "b", "c"])` is a `SetRun` whose `run("a")` is a `PlanRun` on one `SharedArena` of the largest plan's bytes (each
 plan at its own offsets; `SharedArena::new` and `LaunchPlan::instantiate_in` for a chosen set of buckets). Every launch, capture and replay of any
-of them is ordered with the others, so they never overlap on the device, and nothing in the arena outlives a launch: a stage's output is the next
-stage's external, in the caller's memory (a tensor in the arena is refused). `PlanRun::launch_tapped` is a launch with debug
+of them is ordered with the others, so they never overlap on the device; every `SetRun`, `SharedArena` and instantiation is an arena of its own, so
+lanes that run concurrently take one each. Nothing in the plans' own regions outlives a launch: a stage's output is the next stage's external, in
+the caller's memory (a tensor in the arena is refused), or a **carried buffer** (`BufferRole::Carried`, a parameter the graphs declare
+`carried=("h",)`), which the arena holds after the plans' regions (`CarriedLayout`, `SharedArena::carried`): a stage writes it, the next reads it
+without being given it, and a launch or a replay that reads it before any launch on the arena wrote it, or in another shape, is refused. Memset steps
+(`StepKind::Memset`, `tilefish.zeros_like` in a graph) zero a buffer with `cuMemsetD8Async`, a memset node in a graph. `PlanRun::launch_tapped` is a launch with debug
 taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a step, with the plan and its digest unchanged (`PlanRun::capture_tapped`
 captures them as memcpy nodes, copied again at every replay). `PlanRun::launch_step` launches one step of a bucket on the caller's tensors, with the
 binary and the binding of the pinned plan (not on a capturing stream).
