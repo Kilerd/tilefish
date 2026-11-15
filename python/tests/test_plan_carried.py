@@ -204,13 +204,36 @@ def test_a_carried_buffer_read_before_any_execution_wrote_it_is_refused_and_noth
     assert be.launches() == [] and not [e for e in be.log if e[0] == "wait"]
 
 
-def test_a_carried_buffer_read_in_another_shape_than_it_was_written_is_refused():
+Nf = Dim("Nf", buckets=[512, 1536])
+
+
+@tilefish.kernel
+def flat_add(a: Tensor[Nf, f32], b: Tensor[Nf, f32]) -> Tensor[Nf, f32]:
+    return a + b
+
+
+@tilefish.graph(carried=("h",))
+def flat_reader(h: Tensor[Nf, f32], z: Tensor[Nf, f32]):
+    """Reads ``h`` as one flat axis: the shape the stages write (``[Rs, 64]``) is another rank, so it binds nothing and is refused under the lock."""
+    return flat_add(h, z)
+
+
+def test_a_carried_buffer_read_in_another_shape_than_it_was_written_is_refused_and_nothing_is_enqueued():
     s, be = shared()
     s.run(k.stage_a, x_of(8))
+    enqueued = len(be.launches()), len([e for e in be.log if e[0] == "wait"])
     with pytest.raises(TilefishPreconditionError, match="(the carried buffer)"):
-        s.run(k.stage_update, x_of(24))  # y says Rs = 24, h holds 8 rows
+        s.run(k.stage_update, x_of(24))  # y says Rs = 24, h holds 8 rows: the dimensions conflict
+    assert (len(be.launches()), len([e for e in be.log if e[0] == "wait"])) == enqueued
     s.run(k.stage_a, x_of(24))
     s.run(k.stage_update, x_of(24))
+    # a plan that reads h in a shape of another rank binds nothing from it and is refused by the check under the arena's lock, before its wait
+    s2, be2 = shared((k.stage_a, flat_reader))
+    s2.run(k.stage_a, x_of(8))
+    enqueued = len(be2.launches()), len([e for e in be2.log if e[0] == "wait"])
+    with pytest.raises(TilefishPreconditionError, match=r"reads the carried buffer 'h' with the shape \[512\], but the execution on this arena that wrote it last left the shape \[8, 64\]"):
+        s2.run(flat_reader, FakeTensor((512,), "f32", 9 << 36))
+    assert (len(be2.launches()), len([e for e in be2.log if e[0] == "wait"])) == enqueued
 
 
 def test_a_failed_execution_leaves_its_carried_buffers_unknown():
@@ -231,14 +254,18 @@ def test_a_failed_execution_leaves_its_carried_buffers_unknown():
         s.run(k.stage_b)
 
 
-def test_a_plan_alone_keeps_its_carried_buffer_in_an_arena_of_its_own():
+def test_a_plan_alone_has_its_carried_buffer_in_an_arena_of_its_own():
     be = Backend()
     a = PlanRunner(tilefish.plan(k.stage_a), FakeProvider(), be)
     a.run((x_of(8),), {})
     assert ("arena", 24 * ROW) in be.log  # the plan's region (no bytes) and its carried buffer
+    assert a.arena_of(0).shapes == {"h": (8, 64)}  # what this arena's h holds now
     b = PlanRunner(tilefish.plan(k.stage_b), FakeProvider(), be)
     with pytest.raises(TilefishPreconditionError, match="is not determined"):
         b.run((), {})  # another plan, another arena: it holds no h
+    u = PlanRunner(tilefish.plan(k.stage_update), FakeProvider(), be)
+    with pytest.raises(TilefishPreconditionError, match="no execution on this arena has written it"):
+        u.run((x_of(8),), {})  # a plan that reads h first never runs alone: nothing but its own runs could have written its arena's h
 
 
 def test_a_call_does_not_give_a_carried_parameter():

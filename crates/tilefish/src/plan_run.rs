@@ -621,6 +621,9 @@ impl LaunchPlan {
 fn carried_uses(plan: &LaunchPlan) -> (Vec<usize>, Vec<usize>) {
     let buffers = plan.buffers();
     let (mut reads, mut writes, mut seen) = (Vec::new(), Vec::new(), Vec::new());
+    if !buffers.iter().any(|b| b.role == BufferRole::Carried) {
+        return (reads, writes);
+    }
     let Some(bucket) = plan.buckets().first() else { return (reads, writes) };
     for st in &bucket.steps {
         let access: Vec<Access> = match st.kind {

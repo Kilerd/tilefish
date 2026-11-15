@@ -49,7 +49,7 @@ def test_a_name_is_another_arena_and_the_same_name_the_same_one():
     assert be.arenas == 3  # one arena per name (and one without a name): lane0's twice is one
     arenas = [s.arena_of(0) for s in (first, second, again, unnamed)]
     assert arenas[0] is arenas[2] and len({id(a) for a in arenas}) == 3
-    assert len({id(a.lock) for a in arenas}) == 3 and len({a.event.name for a in arenas if a.event is not None}) >= 1
+    assert len({id(a.lock) for a in arenas}) == 3 and len({id(a.event) for a in arenas}) == 3 and all(a.event is not None for a in arenas)
 
 
 def test_each_arena_has_its_own_order_event_and_its_own_carried_buffers():
@@ -95,6 +95,45 @@ def test_a_caller_graph_used_from_two_threads_warns_once_and_one_thread_does_not
     t.join()
     order = [w for w in caught if issubclass(w.category, TilefishOrderWarning)]
     assert len(order) == 1 and "tilefish.runtime.replay_graph" in str(order[0].message) and "tilefish.capture" in str(order[0].message)
+
+
+def test_as_an_error_the_warning_refuses_every_use_from_another_thread_and_enqueues_nothing():
+    be = Backend()
+    s = lane(None, be, graphs=(k.stage_a,))
+    s.run(k.stage_a, x_of(8))
+    be.capture = True
+    s.run(k.stage_a, x_of(8))  # a graph of the caller's holds the arena
+    be.capture = False
+    outcomes = []
+
+    def other():
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", TilefishOrderWarning)
+            for _ in range(3):
+                before = len(be.launches())
+                try:
+                    s.run(k.stage_a, x_of(8))
+                    outcomes.append("ran")
+                except TilefishOrderWarning:
+                    outcomes.append("refused" if len(be.launches()) == before else "refused after enqueueing")
+
+    t = threading.Thread(target=other)
+    t.start()
+    t.join()
+    assert outcomes == ["refused"] * 3 and not s.arena_of(0).warned
+
+
+def test_a_run_refused_inside_a_caller_capture_does_not_count_as_a_run_of_the_capture():
+    be = Backend()
+    s = lane(None, be, graphs=(k.stage_a, k.stage_update))
+    s.run(k.stage_a, x_of(8))  # h holds 8 rows
+    be.capture = True
+    be.current = 11
+    with pytest.raises(tilefish.TilefishPreconditionError, match="carried buffer"):
+        s.run(k.stage_update, x_of(24))  # refused on stream 11: the capture has no run of the arena on it
+    be.current = 12
+    s.run(k.stage_a, x_of(8))  # so a run on another stream of the same capture is the first, not a second on another stream
+    be.capture = False
 
 
 def test_an_arena_without_a_caller_graph_does_not_warn_from_many_threads():

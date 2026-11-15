@@ -205,8 +205,7 @@ fn the_plans_of_the_golden_set_share_an_arena_of_the_largest_of_theirs() {
 
 /// The golden plan set `carried` (`gpu_kernels_plans.CARRIED_SET`, `docs/plan-schema-1.md` section 15.2): plans whose carried buffers (role
 /// `carried`, offset `null`) the arena they share holds after the largest plan's region, a region per carried name in code point order, as
-/// Python's `carried_layout` has it (`expected.json`); a plan alone has its own carried regions after its own region; a carried name of two dtypes
-/// is refused.
+/// Python's `carried_layout` has it (`expected.json`); a plan alone has its own carried regions after its own region.
 #[test]
 fn the_golden_set_of_carried_buffers_lays_its_arena_out_as_python_does() {
     let e = &expected()["carried"];

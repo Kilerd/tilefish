@@ -827,7 +827,7 @@ def _note_thread(arena: _Arena, graph: str, caller_graph: bool = False) -> None:
     arena.threads.add(threading.get_ident())
     arena.caller_graphs = arena.caller_graphs or caller_graph
     if arena.caller_graphs and len(arena.threads) > 1 and not arena.warned and not arena.ordered:
-        arena.warned = True
+        # noted once the warning is given: under simplefilter("error", TilefishOrderWarning) it raises (before anything is enqueued) at every such use
         warnings.warn(
             f"the arena of the plan of graph '{graph}' is used by a CUDA graph you captured (tilefish.run inside torch.cuda.graph) and from more than "
             "one thread: the replay of such a graph takes no lock of tilefish, so it can overlap an execution of the arena on another thread (wrong "
@@ -836,6 +836,7 @@ def _note_thread(arena: _Arena, graph: str, caller_graph: bool = False) -> None:
             TilefishOrderWarning,
             stacklevel=2,
         )
+        arena.warned = True
 
 
 class PlanRunner:
@@ -999,9 +1000,9 @@ class PlanRunner:
             arena = call.arena
             with arena.lock, be.scope(index):
                 stream = be.stream(index)
+                _check_carried(arena, call.rt, self.plan.name)  # (before the capture is noted: a refused run is no run of the capture)
                 if capturing:
                     self._check_one_stream_per_capture(arena, stream)
-                _check_carried(arena, call.rt, self.plan.name)
                 _note_thread(arena, self.plan.name, caller_graph=capturing)
                 done = False
                 try:

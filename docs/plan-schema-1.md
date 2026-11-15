@@ -424,8 +424,8 @@ whoever holds it, with no lock of the host: item 7 says what its event nodes ord
    **The hazard is loud, and the cure is one call.** A replay of a caller-owned graph is a call into torch, which tilefish does not see, so it cannot be made safe behind the caller's
    back (a replay would have to take the arena's lock, and only a call of the host can; the wait and the record cannot be made one driver call; a lock-free order on the device would
    need a ticket a graph cannot take at replay). Python therefore (a) warns: an arena that a caller-owned graph holds, used by a second thread (a run, a replay of a host-owned
-   graph, a step alone, another capture), gives one `TilefishOrderWarning` (`warnings.simplefilter("error", tilefish.TilefishOrderWarning)` makes it an error; one thread never
-   warns, and the warning is not given once the caller replays through (b)); and (b) offers `tilefish.runtime.replay_graph(g, stream=None)`, which replays `g` under the lock of every
+   graph, a step alone, another capture), gives one `TilefishOrderWarning` (with `warnings.simplefilter("error", tilefish.TilefishOrderWarning)` it is an error that refuses
+   every such use before anything is enqueued; one thread never warns, and the warning is not given once the caller replays through (b)); and (b) offers `tilefish.runtime.replay_graph(g, stream=None)`, which replays `g` under the lock of every
    arena a caller-owned graph was captured on, so no execution of another thread is between its wait and its record while `g` is launched, and the event nodes do the rest: 0 of 3 000
    runs wrong against a loop of `replay_graph` on another thread (`test_gpu_arena_lanes.py`). The warning cannot see a replay made with `g.replay()` itself on a thread that never
    calls tilefish; it sees the second thread that does. The Rust host has no caller-owned graph: a launch on a capturing stream is refused, and `PlanRun::capture` is how a plan is
@@ -664,8 +664,9 @@ and the arena holds it.
   after a plan with a region of its own; a reader reproduces it from the files.
 * **The lifetime.** A carried buffer lives as long as its arena (Python: until `clear_caches`; Rust: the last handle of the arena), and holds what
   the last execution on the arena that wrote it left there. Nothing else writes its bytes (it is in no plan's region; the caller's tensors may not
-  overlap the arena). An arena of its own (`tilefish.run` of one plan, a Rust `instantiate`) has its own carried regions: a plan alone can keep a
-  state between its runs, and two plans that are not on one shared arena do not share a carried buffer.
+  overlap the arena). An arena of its own (`tilefish.run` of one plan, a Rust `instantiate`) has its own carried regions, so two plans that are not
+  on one shared arena do not share a carried buffer, and a plan that reads a carried buffer first is refused alone (nothing but itself could have
+  written its arena's): it runs on a shared arena with a plan that writes the buffer.
 * **What each holds, and the checks.** A host keeps, under the arena's lock and so in the order the executions run in, the shape (at its bucket)
   of the execution that wrote each carried buffer last, or nothing (no execution wrote it, or one that did failed after it was enqueued). A plan
   that reads a carried buffer before it writes it (its first use in the steps is a pointer that is `in` or `inout`, an operand of a library step,
@@ -675,7 +676,10 @@ and the arena holds it.
   replay of a host-owned graph (`CapturedPlan.replay`, Rust `CapturedPlan::replay`) and a Rust `check` do this; a capture (`tilefish.capture`,
   `PlanRun::capture`) runs nothing and checks nothing of what they hold, but binds its dimensions as a run does (so a plan whose dimensions only a
   carried buffer binds is captured after that buffer was written); a caller-owned graph (`torch.cuda.graph`) is checked and noted when it is
-  captured, not at its replays, which tilefish does not see (capture the stages that hand a buffer on in one graph, in their order). A step alone (`run_step`, `launch_step`) takes the caller's tensor for
+  captured, not at its replays, which tilefish does not see: a replay of such a graph that writes `h` in another shape than the last execution the
+  arena noted leaves the note wrong, and a later run that reads `h` binds the noted shape (capture the stages that hand a buffer on in one graph, in
+  their order, or use `tilefish.capture`, whose replays are checked and noted). The dimensions are bound from the carried buffers a plan reads first,
+  not from those it only writes: a stage that only writes `h` (a reset by a memset) takes a tensor that has its dimensions. A step alone (`run_step`, `launch_step`) takes the caller's tensor for
   a carried buffer, as for any buffer, and touches no carried region.
 * **The calls.** A run gives every parameter but the carried ones (Python: positionally in the order of the signature without them, or by name;
   giving one is refused: "held by the plan's arena"); `tilefish.capture` and `bind_weights` alike. The reference mode, which has no arena, takes a
