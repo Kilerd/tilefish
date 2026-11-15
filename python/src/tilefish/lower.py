@@ -1473,7 +1473,8 @@ class _ElementwiseLayout(_Layout):
     def __init__(self, op: KernelOp, tables: _Tables, broadcast: bool = True) -> None:
         graph, name = op.graph, op.name
         self.tables = tables
-        for v, n in tables.slices.items():
+        if tables.slices:
+            v, n = next(iter(tables.slices.items()))
             raise _fail(
                 name,
                 "elementwise",
