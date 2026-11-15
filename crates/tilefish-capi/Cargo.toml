@@ -1,0 +1,36 @@
+[package]
+name = "tilefish-capi"
+version = "0.0.1"
+edition = "2024"
+description = "The C ABI of the tilefish Rust host (libtilefish_capi and tilefish.h), with a header-only C++17 wrapper (tilefish.hpp): a C or C++ program loads and verifies a tilefish manifest and its plans, and launches its kernels, pinned GEMMs, pinned convolutions and plans, with every check of the tilefish crate."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Kilerd/tilefish"
+readme = "README.md"
+# Not on crates.io yet: the C++ host is built from this repository (cargo, or CMake), and prebuilt libraries come later (docs/rfcs/0002-cpp-host.md).
+publish = false
+build = "build.rs"
+
+[lib]
+name = "tilefish_capi"
+# the shared and the static C library; `rlib` for the crate's own Rust tests
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# the Rust host, whose every check the C ABI runs; its `cuda-*` feature is this crate's (cudarc builds its bindings for exactly one)
+tilefish = { path = "../tilefish", default-features = false }
+
+[dev-dependencies]
+# `tests/header.rs` generates `include/tilefish.h` again and requires the committed one to be the same (pinned: another cbindgen may format
+# the header differently)
+cbindgen = { version = "=0.29.4", default-features = false }
+# the tests read the pins of the committed fixtures
+serde_json = "1.0.154"
+
+[features]
+# Pick exactly one, as for the tilefish crate: the CUDA driver API version the bindings are generated for (the driver found at run time must be at
+# least as new).
+default = ["cuda-13020"]
+cuda-12040 = ["tilefish/cuda-12040"]
+cuda-12080 = ["tilefish/cuda-12080"]
+cuda-13000 = ["tilefish/cuda-13000"]
+cuda-13020 = ["tilefish/cuda-13020"]
