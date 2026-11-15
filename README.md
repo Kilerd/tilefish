@@ -617,6 +617,8 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   (to nearest even, toward zero, down, up; there is no default) and what a value out of range becomes: clamped to the type's range with a NaN
   0 (`saturate=True`, the default, Rust's `as`), or the low bits of the `i64` (`saturate=False`, C's and torch's). Each is inline PTX
   (`cvt.rni.s32.f32` and the like) and is byte-identical to the reference on every one of the 2**32 f32 bit patterns (note 15).
+- In the row template, `x[k]` of a read-only parameter is read at its offset: `codes[k]` of a `[K, R]` codes plane is a per-row operand (the
+  index of `gather_rows`), `tables[k]` of a `[K, N, D]` parameter a table, with the dimensions of the offset runtime scalars (note 16).
 - `x.to(bf16, nan="preserve")` keeps a NaN's sign and payload (the default, `"canonical"`, gives `0x7FFF`); `tilefish.sin`, `tilefish.cos` and
   `tilefish.tanh` are libdevice's (`sinf`, `cosf`, `tanhf`), built with flush-to-zero like every libdevice function Triton links: over every f32,
   torch's CUDA bits but `sin` and `tanh` of a subnormal, which are a zero of its sign (notes 10 and 14).

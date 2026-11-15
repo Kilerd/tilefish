@@ -12,7 +12,9 @@ is tried first, then the row template.
 
 **row** (``R`` rows, one program per row, grid ``(R,)``). Every tensor is ``[R, D]``, ``[D]``
 (shared by all rows), ``[R]`` or ``[R, 1]`` (one value per row), except a table of ``gather_rows`` or
-``scatter_rows`` (``[N, D]`` or ``[N]``, addressed by an index; note 9). Reductions (``sum``, ``mean``,
+``scatter_rows`` (``[N, D]`` or ``[N]``, addressed by an index; note 9). A static slice ``x[k]`` of a read-only
+parameter is one of these at a static offset: ``codes[k]`` of a ``[K, R]`` codes plane is an ``[R]`` operand (the index of a
+gather, say), ``tables[k]`` of a ``[K, N, D]`` parameter a table (note 16). Reductions (``sum``, ``mean``,
 ``max``, ``argmax``, ``argmin``) run over the last axis of an ``[R, D]`` tensor only. ``D`` is static, or bucketed (one
 compile spec per bucket); ``R`` is dynamic and only appears in the grid. Prologue::
 
@@ -50,7 +52,8 @@ A ``DevScalar[dtype]`` parameter (one element in device memory) is a plain point
 ``tl.load(s)``: no offsets, no mask, one load whose scalar broadcasts against the tensors it meets (the result has rank 0, and so does what
 is computed from it alone). It does not take part in the shape of the kernel (the elementwise template's ``n`` is the element count of a tensor
 parameter, never of a scalar); a scalar cannot be returned. A view (``reshape``, ``permute``, ``select`` and ``split`` are zero-copy views) is not
-lowered: rule ``view`` or ``split`` says so, and a strided view goes to an ``extern`` with a ``Strided[...]`` parameter.
+lowered: rule ``view`` or ``split`` says so, and a strided view goes to an ``extern`` with a ``Strided[...]`` parameter. The one exception is a
+static slice in the row template, ``x[k]`` (``x.select(0, k)``) of a read-only tensor parameter, read at its offset (note 16).
 
 Both templates: offsets are ``i32``, so a tensor may have at most ``2**31 - 1`` elements. A tensor
 that provably has more is rejected (rule ``index-range``; the largest bucket of a bucketed
@@ -108,6 +111,9 @@ rounding="rn" | "rz" |      ``rmi``, ``rpi``); ``u8``: then ``max.s32``, ``min.s
 "rd" | "ru",                (to [0, 255]); ``i64`` and every wrapping cast:              (the default): clamped to the type's
 saturate=True | False)``    ``cvt.rni.s64.f32``, a NaN made 0 (``testp``, ``selp``),     range, NaN 0; wrapping: the low bits
                             then the low bits (``.to()``)                                of the i64 (note 15).
+``x[k]``, ``x.select(0,     row template: ``tl.load(x + k * size_R + row)`` and the      a raw read of the slice's elements
+k)`` of a parameter         like (``size_R`` a runtime ``i32``); a table:                (note 16).
+                            ``tl.load(x + k * N * D + i * D + cols, ...)``
 ``x.to(bf16,                f32 to bf16 on the bits: ``b = x.to(tl.uint32,                  the same rounding; a NaN keeps its
 nan="preserve")``           bitcast=True)``, ``(b + 0x7FFF + ((b >> 16) & 1)) >> 16``,      sign and top payload bits, quiet
                             a NaN ``(b >> 16) | 0x40``                                      (note 1). ``nan="canonical"`` is the
@@ -408,6 +414,19 @@ Notes (the facts behind the table):
     NaNs, which it makes ``-2**63``; ``x.to(torch.uint8)`` is ``rz`` wrapping on every input (c10 casts through ``int64``), and differs from
     ``rz`` saturating on 712 048 640; ``x.to(torch.int64).to(torch.int32)`` is ``rz`` wrapping; ``torch.round(x)``, ``torch.floor(x)`` and
     ``torch.ceil(x)`` then ``.to(torch.int32)`` are ``rn``, ``rd`` and ``ru`` saturating.
+16. **Static slices** (the row template). ``x[k]``, ``x.select(0, k)`` with ``k`` a python int, of a read-only tensor parameter ``x`` of rank 2 or
+    more, is read where it is: a parameter of the shape ``x.shape[1:]`` at the element offset ``k * prod(x.shape[1:])``, which a header line of
+    the module states. It takes the role its shape has in the template: ``codes[k]`` of a ``[K, R]`` plane is an ``[R]`` operand,
+    ``tl.load(codes + k * size_R + row)`` (the index of a ``gather_rows``, or any per-row value; ``[K, R, 1]`` gives ``[R, 1]``), ``bias[k]`` of a
+    ``[K, D]`` parameter a ``[D]`` one, ``xs[k]`` of a ``[K, R, D]`` parameter an ``[R, D]`` one (read chunk by chunk in a chunked row), and
+    ``tables[k]`` of a ``[K, N, D]`` parameter the table of a gather, ``tl.load(tables + k * D * size_N + i * D + cols, ...)``. A dynamic
+    dimension of the offset is a runtime ``i32`` parameter of that dimension (``size_R``, after the template's own and the tables' rows), which a
+    host derives from the shapes like any dimension scalar; a static offset is a number. The offset is ``i32``: ``x`` has a ``max_elements``
+    precondition when its size is dynamic (or ``index-range`` holds it), so ``k * size_R + row`` is below its element count. A parameter read
+    only through its slices is not loaded and not fitted to the template. Every other view is refused (rule ``view``): a select along another
+    axis, of a computed value or of a parameter the kernel writes, an element of a rank-1 parameter (a ``DevScalar`` is that), an offset that is a
+    product of two dynamic sizes; so is a returned slice (``view-value``: return ``x[k] + 0``), and the elementwise template takes none
+    (``elementwise.slice``). The ``reference`` mode is torch's ``select``: a raw read, byte-identical (``tests/test_gpu_slices.py``).
 
 ``num_warps`` is part of a kernel's numerics identity. It fixes the tree of ``tl.sum`` and ``tl.max`` (note 6), so the same
 kernel with another warp count is another numerics: its result differs in the last bits, like a changed reduction order or
@@ -786,12 +805,18 @@ def _check_common(op: KernelOp) -> None:
                 f"split is not lowered{note}: a lowered kernel takes and gives contiguous tensors; a strided view goes to an "
                 "extern with a Strided[...] parameter",
             )
-        if n.op in ("reshape", "permute", "select"):
+        why = _static_slice_problem(n) if n.op == "select" else ""
+        if n.op in ("reshape", "permute") or why:
+            slice_note = (
+                f" (the row template reads x[k] of a read-only tensor parameter, a static slice (note 16); this select is not one: {why})"
+                if why
+                else ""
+            )
             raise _fail(
                 name,
                 None,
                 "view",
-                f"{n} is a view operation, and strided views are not lowered: a lowered kernel takes and gives contiguous tensors. "
+                f"{n} is a view operation, and strided views are not lowered: a lowered kernel takes and gives contiguous tensors{slice_note}. "
                 "Write the kernel over the tensor the view is of, or declare an extern with a Strided[...] parameter",
             )
         if n.op == "copy":
@@ -802,13 +827,37 @@ def _check_common(op: KernelOp) -> None:
                 f"{n} is tilefish.copy, a copy step of a graph's plan: in a kernel body a value is already its own (use it as it is)",
             )
         for v in n.outputs:
-            if not v.type.contiguous:
+            if not v.type.contiguous and n.op != "select":  # a static slice is read at its offset (note 16)
                 raise _fail(name, None, "view-value", f"{_label(v)} is a View; strided views are not lowered")
         _check_node_dtypes(name, n)
+    slices = {n.outputs[0] for n in graph.nodes if n.op == "select"}
     for v in graph.outputs:
+        if v in slices:
+            raise _fail(
+                name, None, "view-value", f"the returned {_label(v)} is a slice of a parameter; return what is computed from it (a copy is x[k] + 0)"
+            )
         if not v.type.contiguous:
             raise _fail(name, None, "view-value", f"the returned {_label(v)} is a View; strided views are not lowered")
     _check_index_range(name, _all_values(graph))
+
+
+def _static_slice_problem(n: Node) -> str:
+    """Why the select ``n`` is not a static slice that the row template reads (note 16), or ``""`` when it is one: ``x[k]`` (``x.select(0, k)``,
+    ``k`` a python int) of a read-only tensor parameter of rank 2 or more, whose element offset ``k * prod(x.shape[1:])`` is affine in plain
+    dimensions (each a runtime ``i32`` scalar of the kernel, or a number)."""
+    x, out = n.inputs[0], n.outputs[0]
+    if n.attrs["axis"] != 0:
+        return f"it selects along axis {n.attrs['axis']}, and a slice is along the first axis"
+    if not (isinstance(x, Value) and x.is_param):
+        return f"{_label(x) if isinstance(x, Value) else x} is not a parameter of the kernel, so it has no place in memory to read"  # type: ignore[arg-type]
+    if x.access != "in":
+        return f"the {x.access} parameter '{x.name}' is written by the kernel"
+    if x.type.rank < 2:
+        return f"it is one element of the rank-1 parameter '{x.name}' (a DevScalar is how a kernel reads one element)"
+    offset = out.type.offset
+    if offset is None or any(not isinstance(a, Dim) for a, _ in offset.folded().terms):
+        return f"its offset {offset} is not affine in the dimensions (a product of two dynamic sizes)"
+    return ""
 
 
 def _check_node_dtypes(kernel: str, n: Node) -> None:
@@ -863,6 +912,8 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
             )
     elif n.op == "load":
         _check_dtype(kernel, f"the DevScalar read by {n}", n.outputs[0].type.dtype)
+    elif n.op == "select":  # a static slice (note 16): its dtype is the parameter's, checked with the parameters
+        pass
     elif n.op in _COMPARE or n.op in _LOGICAL or n.op in _OTHER_OPS or n.op in _ARG_REDUCTIONS:
         for v in (*n.outputs, *(i for i in n.inputs if isinstance(i, Value))):
             _check_dtype(kernel, f"{v.ref} of {n}", v.type.dtype)
@@ -875,30 +926,39 @@ def _check_node_dtypes(kernel: str, n: Node) -> None:
 
 @dataclass
 class _Tables:
-    """The parameters that ``gather_rows`` reads and ``scatter_rows`` writes at computed rows (note 9).
+    """The parameters that ``gather_rows`` reads and ``scatter_rows`` writes at computed rows (note 9), and the static slices (note 16).
 
-    ``params`` maps each to ``"gather"`` or ``"scatter"``, in the order the kernel declares them; ``only`` are those that nothing else in the
-    body reads (the prologue does not load them and the template does not fit them to its shapes: their rows are addressed by the index);
-    ``versions`` are the versions of the targets that the scatters make (written in place, read by nothing).
+    ``params`` maps each to ``"gather"`` or ``"scatter"``, in the order the kernel declares them (then the slices that are gathered from, in IR
+    order); ``only`` are those that nothing else in the body reads (the prologue does not load them and the template does not fit them to
+    its shapes: their rows are addressed by the index); ``versions`` are the versions of the targets that the scatters make (written in place,
+    read by nothing). ``slices`` maps the value of each static slice ``x[k]`` to its select, and ``planes`` are the parameters that the body
+    reads through static slices only (not loaded, not fitted: each slice is read at its own offset).
     """
 
     params: "dict[Value, str]"
     only: "set[Value]"
     versions: "set[Value]"
+    slices: "dict[Value, Node]"
+    planes: "set[Value]"
 
     def skip(self, v: Value) -> bool:
-        """Whether the template leaves ``v`` out of its shapes: a table that only the index addresses, or the version a scatter makes."""
-        return v in self.only or v in self.versions
+        """Whether the template leaves ``v`` out of its shapes: a table that only the index addresses, the version a scatter makes, or a
+        parameter read through static slices only."""
+        return v in self.only or v in self.versions or v in self.planes
 
 
 def _tables(op: KernelOp) -> _Tables:
     graph, name = op.graph, op.name
     found: dict[Value, str] = {}
     versions: set[Value] = set()
+    slices = {n.outputs[0]: n for n in graph.nodes if n.op == "select"}  # every select left is a static slice (_check_common)
     for n in graph.nodes:
         if n.op == "gather_rows":
             x = n.inputs[0]
             assert isinstance(x, Value)
+            if x in slices:  # a table at a static offset of a parameter: tables[k] of a [K, N, D] parameter (note 16)
+                found.setdefault(x, "gather")
+                continue
             if not (x.is_param and x.access == "in") or x.type.devscalar:
                 raise _fail(
                     name,
@@ -929,7 +989,7 @@ def _tables(op: KernelOp) -> _Tables:
             )
     used: set[Value] = set()
     for n in graph.nodes:
-        ins = n.inputs[1:] if n.op in ("gather_rows", "scatter_rows") else n.inputs
+        ins = n.inputs[1:] if n.op in ("gather_rows", "scatter_rows") else () if n.op == "select" else n.inputs  # a slice reads at its offset
         used.update(i for i in ins if isinstance(i, Value))
     used.update(graph.outputs)
     for t, kind in found.items():
@@ -942,7 +1002,9 @@ def _tables(op: KernelOp) -> _Tables:
                 "computed in every program, so any other access races with them: a scatter is the only use of its target",
             )
     ordered = {v: found[v] for v in graph.inputs if v in found}
-    return _Tables(ordered, {t for t in ordered if t not in used}, versions)
+    ordered.update({v: found[v] for v in slices if v in found})  # the slices gathered from, in IR order
+    planes = {n.inputs[0] for n in slices.values()} - used - set(found)
+    return _Tables(ordered, {t for t in ordered if t not in used}, versions, slices, planes)  # type: ignore[arg-type]
 
 
 # -- names --------------------------------------------------------------------------------------
@@ -1020,9 +1082,16 @@ class _Layout:
         when ``N`` is static or bucketed (one binary per bucket), a runtime ``i32`` when it is dynamic."""
         self.rows_name = {}
         out = []
+        by_plane: dict[Any, str] = {}  # the slices of one parameter share its rows parameter (note 16)
         for t in self.tables.params:
             n = t.type.shape[0].folded()
-            nm = self.rows_name[t] = names.fresh(f"{t.name}_rows")
+            plane = self.tables.slices[t].inputs[0] if t in self.tables.slices else None
+            if plane is not None and plane in by_plane:
+                self.rows_name[t] = by_plane[plane]
+                continue
+            nm = self.rows_name[t] = names.fresh(f"{plane.name if plane is not None else t.name}_rows")  # type: ignore[union-attr]
+            if plane is not None:
+                by_plane[plane] = nm
             if n.is_static:
                 out.append(_Extra(nm, True, _const_param(nm, n.value)))
             elif all(d.buckets for d in n.free_dims()):
@@ -1271,7 +1340,29 @@ class _RowLayout(_Layout):
             _Extra(self.D_name, True, _const_param(self.D_name, d_default)),
             _Extra(self.BLOCK_name, True, _const_param(self.BLOCK_name, block_default)),
             *self.table_extras(names),
+            *self.slice_extras(names),
         ]
+
+    def slice_extras(self, names: _Names) -> "list[_Extra]":
+        """One runtime ``i32`` per dynamic dimension that the offset of a static slice needs (note 16): ``size_R`` for ``codes[3]`` of a ``[K, R]``
+        parameter, which a host derives from the shapes like any dimension scalar. A static offset is a number."""
+        self.size_names: dict[Dim, str] = {}
+        out = []
+        for v in self.tables.slices:
+            for atom, _ in sorted(v.type.offset.folded().terms, key=lambda t: str(t[0])):  # type: ignore[union-attr]
+                assert isinstance(atom, Dim)  # _static_slice_problem
+                if atom not in self.size_names:
+                    nm = self.size_names[atom] = names.fresh(f"size_{atom.name}")
+                    out.append(_Extra(nm, False, Param(nm, 0, "dim", dim=atom)))
+        return out
+
+    def slice_offset(self, v: Value) -> str:
+        """The element offset of the static slice ``v`` in its parameter, as Triton source: ``3 * size_R``, a number, or ``""`` for 0."""
+        offset = v.type.offset.folded()  # type: ignore[union-attr]
+        terms = [f"{c} * {self.size_names[a]}" if c != 1 else self.size_names[a] for a, c in sorted(offset.terms, key=lambda t: str(t[0]))]  # type: ignore[index]
+        if offset.offset:
+            terms.append(str(offset.offset))
+        return " + ".join(terms)
 
     def row_offset(self, t: Value, i: str) -> str:
         return f"{i} * {self.D_name} + {self.cols}" if t.type.rank == 2 else i
@@ -1320,12 +1411,17 @@ class _RowLayout(_Layout):
 
     def header(self) -> "list[str]":
         d = f"{self.D} (static)" if self.D.is_static else f"{self.D} (bucketed)"
+        slices = [
+            f"'{n.inputs[0].name}[{n.attrs['index']}]' {_shape_text(v.type.shape)} is read at {n.inputs[0].name} + {self.slice_offset(v) or 0} (a static slice, note 16)"  # type: ignore[union-attr]
+            for v, n in self.tables.slices.items()
+        ]
         if self.chunk is not None:
             return [
                 f"template: row; one program per row, grid {_grid_text(self.grid)}",
                 f"D = {d}, walked in chunks of BLOCK_D = {self.chunk} columns (argmax / argmin; note 8)",
+                *slices,
             ]
-        return [f"template: row; one program per row, grid {_grid_text(self.grid)}", f"D = {d}, BLOCK_D = next_pow2(D)"]
+        return [f"template: row; one program per row, grid {_grid_text(self.grid)}", f"D = {d}, BLOCK_D = next_pow2(D)", *slices]
 
     def load(self, p: str, v: Value) -> str:
         c = self.cls[v]
@@ -1377,6 +1473,14 @@ class _ElementwiseLayout(_Layout):
     def __init__(self, op: KernelOp, tables: _Tables, broadcast: bool = True) -> None:
         graph, name = op.graph, op.name
         self.tables = tables
+        for v, n in tables.slices.items():
+            raise _fail(
+                name,
+                "elementwise",
+                "elementwise.slice",
+                f"{n} is a static slice of the parameter '{n.inputs[0].name}' ({_label(v)}): the row template reads one (note 16), the "  # type: ignore[union-attr]
+                "elementwise template does not",
+            )
         for t in tables.params:
             if t.type.rank != 1:
                 raise _fail(
@@ -1770,9 +1874,39 @@ class _Body:
             else:
                 reads.update(i for i in n.inputs if isinstance(i, Value))
         reads.update(graph.outputs)
-        # an Out parameter is never read, a DevScalar only by tilefish.load, a table by its gathers
-        loads = [p for p in graph.inputs if p.access != "out" and p in reads and not p.type.devscalar and p not in layout.tables.only]
+        # an Out parameter is never read, a DevScalar only by tilefish.load, a table by its gathers, a plane by its static slices
+        skip = layout.tables.only | layout.tables.planes
+        loads = [p for p in graph.inputs if p.access != "out" and p in reads and not p.type.devscalar and p not in skip]
         return loads, last_store
+
+    def pointer(self, t: Value) -> str:
+        """The pointer to the first element of ``t``: the parameter, or for a static slice its parameter plus its offset (note 16)."""
+        n = self.layout.tables.slices.get(t)
+        if n is None:
+            return self.rename.get(t.name, t.name)
+        x = n.inputs[0]
+        assert isinstance(x, Value) and isinstance(self.layout, _RowLayout)
+        offset = self.layout.slice_offset(t)
+        return f"{self.rename.get(x.name, x.name)} + {offset}" if offset else self.rename.get(x.name, x.name)
+
+    def static_slice(self, n: Node) -> None:
+        """A static slice ``x[k]`` (note 16): read like a parameter of its shape at its offset, where something reads it as a value (a gather
+        from it reads its rows at the index instead)."""
+        (out,) = n.outputs
+        tables = self.layout.tables
+        read = any(
+            i is out
+            for n2 in self.graph.nodes
+            for i in (n2.inputs[1:] if n2.op in ("gather_rows", "scatter_rows") else (n2.inputs[1],) if n2.op == "store" else n2.inputs)
+        )
+        if not read:
+            return
+        assert out not in tables.only
+        v = self.local()
+        self.var[out] = v
+        x = n.inputs[0]
+        assert isinstance(x, Value)
+        self.emit(f"{v} = {self.layout.load(self.pointer(out), out)}", f"{x.name}[{n.attrs['index']}]")
 
     def load(self, p: Value) -> None:
         v = self.local()
@@ -1784,6 +1918,8 @@ class _Body:
             self.store(n, last_store)
         elif n.op == "scatter_rows":
             self.scatter(n)
+        elif n.op == "select":
+            self.static_slice(n)
         else:
             (out,) = n.outputs
             v = self.local()
@@ -1912,7 +2048,7 @@ class _Body:
         assert isinstance(t, Value)
         i, ok = self.row_index(n, v)
         mask = self.layout.row_mask(n.outputs[0], ok)
-        ptr = f"{self.rename.get(t.name, t.name)} + {self.layout.row_offset(t, i)}"
+        ptr = f"{self.pointer(t)} + {self.layout.row_offset(t, i)}"
         return f"tl.load({ptr})" if mask is None else f"tl.load({ptr}, mask={mask}, other=0)"
 
     def scatter(self, n: Node) -> None:

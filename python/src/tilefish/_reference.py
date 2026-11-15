@@ -19,7 +19,8 @@ node by node:
 * reductions are torch's; ``argmax`` and ``argmin`` follow the contract (the first NaN, else the first extreme value), written out in torch;
 * comparisons, masks, ``where`` and ``iota`` are torch's, with a scalar rounded to the IR dtype as above: exact, like the binary;
 * ``gather_rows`` and ``scatter_rows`` are torch indexing with the out-of-range policy of the call: raw copies, exact (where a scatter's
-  indices in range are distinct; with duplicates neither the binary nor the reference says which row lands).
+  indices in range are distinct; with duplicates neither the binary nor the reference says which row lands);
+* a static slice ``x[k]`` of a parameter is torch's ``select``, the row the binary reads at its offset.
 
 What stays different, and what a tolerance has to cover, is everything the binary does approximately:
 ``/`` between tensors (``div.full.f32``), ``exp`` (``ex2.approx``), ``rsqrt``, ``erf`` (libdevice), the
@@ -205,6 +206,8 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
             (out,) = n.outputs
             if op == "load":  # the one element of a DevScalar, as a 0-d tensor (it broadcasts like the kernel's scalar does)
                 r = a[0].reshape(())
+            elif op == "select":  # x[k]: a static slice of a parameter (note 16 of tilefish.lower), a view of it
+                r = a[0].select(n.attrs["axis"], n.attrs["index"])
             elif op in _COMPARE:  # IEEE comparisons (a NaN is unordered: only != is true), the scalar rounded to the IR dtype
                 r = getattr(torch, _COMPARE[op])(a[0], a[1])
             elif op in ("and", "or", "xor"):

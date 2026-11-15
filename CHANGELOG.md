@@ -18,6 +18,10 @@ each section names the release that added it.
   f16, e4m3 or e5m2). `saturate=True`, the default, clamps to the type's range with a NaN 0; `saturate=False` keeps the low bits of the
   `i64`. Each is a helper of inline PTX (`cvt.rni.s32.f32`, ...), and the `reference` mode computes the declared mode exactly: the two are
   byte-identical on every f32 bit pattern. Note 15 of `tilefish.lower` says what torch's casts are in these terms.
+- The row template reads a static slice `x[k]` (`x.select(0, k)`) of a read-only parameter at its offset: `codes[k]` of a `[K, R]` codes
+  plane is a per-row operand, such as the index of `gather_rows`, and `tables[k]` of a `[K, N, D]` parameter is a table. A dynamic
+  dimension of the offset is a runtime `i32` parameter (`size_R`) that a host derives from the shapes. Every other view is still refused
+  (rule `view`). Note 16 of `tilefish.lower`.
 
 ## tilefish 0.0.6, crate 0.0.4
 
