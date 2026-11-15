@@ -46,4 +46,46 @@ fn the_soname_has_the_abi_major_version() {
         tilefish_capi::tilefish_abi_version(),
         (tilefish_capi::TILEFISH_ABI_MAJOR << 16) | tilefish_capi::TILEFISH_ABI_MINOR
     );
+    let cmake = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("CMakeLists.txt")).unwrap();
+    assert!(
+        cmake.contains(&format!("set(TILEFISH_ABI_MAJOR {})", tilefish_capi::TILEFISH_ABI_MAJOR)),
+        "CMakeLists.txt disagrees"
+    );
+}
+
+/// Every function the library exports is declared in the header: cbindgen reads the source as written (it expands no macro), so an export made
+/// by a macro would be missing from the header, and none is.
+#[test]
+fn every_export_is_declared_in_the_header() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let header = std::fs::read_to_string(crate_dir.join("include").join("tilefish.h")).unwrap();
+    let mut exports = 0;
+    for entry in std::fs::read_dir(crate_dir.join("src")).unwrap() {
+        let path = entry.unwrap().path();
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(!source.contains("macro_rules!"), "{}: an export made by a macro is not in the header", path.display());
+        let lines: Vec<&str> = source.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(rest) = line.split("extern \"C\" fn ").nth(1) else { continue };
+            let name: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            assert!(
+                name.starts_with("tilefish_"),
+                "{}:{}: an export without the prefix: {name}",
+                path.display(),
+                i + 1
+            );
+            assert!(
+                lines[i.saturating_sub(3)..i].iter().any(|l| l.contains("#[unsafe(no_mangle)]")),
+                "{}:{}: {name} is not #[unsafe(no_mangle)]",
+                path.display(),
+                i + 1
+            );
+            assert!(
+                header.contains(&format!(" {name}(")) || header.contains(&format!("*{name}(")),
+                "{name} is not declared in include/tilefish.h"
+            );
+            exports += 1;
+        }
+    }
+    assert!(exports > 80, "{exports} exports");
 }

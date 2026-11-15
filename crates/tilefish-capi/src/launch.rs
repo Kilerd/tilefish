@@ -68,35 +68,71 @@ unsafe fn tensors_arg<'a>(p: *const tilefish_tensor, n: usize) -> Outcome<Vec<Te
     items.iter().enumerate().map(|(i, t)| unsafe { tensor_arg(t, &format!("tensor {i}")) }).collect()
 }
 
-macro_rules! accessors {
-    ($handle:ident, $stem:ident, $destroy:ident, $what:literal) => {
-        #[doc = concat!("The stem of a ", $what, " in the manifest, owned by the handle (NULL for NULL).")]
-        ///
-        /// # Safety
-        ///
-        /// The handle is NULL or live.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $stem(h: *const $handle) -> *const c_char {
-            // SAFETY: the caller's contract.
-            quiet(std::ptr::null(), || unsafe { h.as_ref() }.map_or(std::ptr::null(), |h| h.stem.as_ptr()))
-        }
-
-        #[doc = concat!("Destroy a ", $what, " handle (NULL is a no-op), after the launches that used it are enqueued (the driver keeps what they need).")]
-        ///
-        /// # Safety
-        ///
-        /// The handle is NULL or live, and not used after.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $destroy(h: *mut $handle) {
-            // SAFETY: the caller's contract.
-            quiet((), || unsafe { destroy_keeping_current(h) })
-        }
-    };
+/// The stem of a kernel in the manifest, owned by the handle (NULL for NULL).
+///
+/// # Safety
+///
+/// The handle is NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_kernel_stem(h: *const tilefish_kernel) -> *const c_char {
+    // SAFETY: the caller's contract.
+    quiet(std::ptr::null(), || unsafe { h.as_ref() }.map_or(std::ptr::null(), |h| h.stem.as_ptr()))
 }
 
-accessors!(tilefish_kernel, tilefish_kernel_stem, tilefish_kernel_destroy, "kernel");
-accessors!(tilefish_gemm, tilefish_gemm_stem, tilefish_gemm_destroy, "GEMM");
-accessors!(tilefish_conv, tilefish_conv_stem, tilefish_conv_destroy, "convolution");
+/// Destroy a kernel handle (NULL is a no-op), after the launches that used it are enqueued (the driver keeps what they need).
+///
+/// # Safety
+///
+/// The handle is NULL or live, and not used after.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_kernel_destroy(h: *mut tilefish_kernel) {
+    // SAFETY: the caller's contract.
+    quiet((), || unsafe { destroy_keeping_current(h) })
+}
+
+/// The stem of a GEMM in the manifest, owned by the handle (NULL for NULL).
+///
+/// # Safety
+///
+/// The handle is NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_gemm_stem(h: *const tilefish_gemm) -> *const c_char {
+    // SAFETY: the caller's contract.
+    quiet(std::ptr::null(), || unsafe { h.as_ref() }.map_or(std::ptr::null(), |h| h.stem.as_ptr()))
+}
+
+/// Destroy a GEMM handle (NULL is a no-op), after the launches that used it are enqueued (the driver keeps what they need).
+///
+/// # Safety
+///
+/// The handle is NULL or live, and not used after.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_gemm_destroy(h: *mut tilefish_gemm) {
+    // SAFETY: the caller's contract.
+    quiet((), || unsafe { destroy_keeping_current(h) })
+}
+
+/// The stem of a convolution in the manifest, owned by the handle (NULL for NULL).
+///
+/// # Safety
+///
+/// The handle is NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_conv_stem(h: *const tilefish_conv) -> *const c_char {
+    // SAFETY: the caller's contract.
+    quiet(std::ptr::null(), || unsafe { h.as_ref() }.map_or(std::ptr::null(), |h| h.stem.as_ptr()))
+}
+
+/// Destroy a convolution handle (NULL is a no-op), after the launches that used it are enqueued (the driver keeps what they need).
+///
+/// # Safety
+///
+/// The handle is NULL or live, and not used after.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_conv_destroy(h: *mut tilefish_conv) {
+    // SAFETY: the caller's contract.
+    quiet((), || unsafe { destroy_keeping_current(h) })
+}
 
 /// Load the binary `stem` (with its bucket values, `n_buckets` of them, for a bucketed kernel) of `manifest` for `arch` (`"sm_103"`, or NULL for
 /// the architecture of the context's device) in `context`. The function's parameters are checked against the manifest's ABI.

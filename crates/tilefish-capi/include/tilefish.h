@@ -748,6 +748,60 @@ void tilefish_last_error(struct tilefish_error_info *out);
 const char *tilefish_status_name(tilefish_status status);
 
 /**
+ * The stem of a kernel in the manifest, owned by the handle (NULL for NULL).
+ *
+ * # Safety
+ *
+ * The handle is NULL or live.
+ */
+const char *tilefish_kernel_stem(const struct tilefish_kernel *h);
+
+/**
+ * Destroy a kernel handle (NULL is a no-op), after the launches that used it are enqueued (the driver keeps what they need).
+ *
+ * # Safety
+ *
+ * The handle is NULL or live, and not used after.
+ */
+void tilefish_kernel_destroy(struct tilefish_kernel *h);
+
+/**
+ * The stem of a GEMM in the manifest, owned by the handle (NULL for NULL).
+ *
+ * # Safety
+ *
+ * The handle is NULL or live.
+ */
+const char *tilefish_gemm_stem(const struct tilefish_gemm *h);
+
+/**
+ * Destroy a GEMM handle (NULL is a no-op), after the launches that used it are enqueued (the driver keeps what they need).
+ *
+ * # Safety
+ *
+ * The handle is NULL or live, and not used after.
+ */
+void tilefish_gemm_destroy(struct tilefish_gemm *h);
+
+/**
+ * The stem of a convolution in the manifest, owned by the handle (NULL for NULL).
+ *
+ * # Safety
+ *
+ * The handle is NULL or live.
+ */
+const char *tilefish_conv_stem(const struct tilefish_conv *h);
+
+/**
+ * Destroy a convolution handle (NULL is a no-op), after the launches that used it are enqueued (the driver keeps what they need).
+ *
+ * # Safety
+ *
+ * The handle is NULL or live, and not used after.
+ */
+void tilefish_conv_destroy(struct tilefish_conv *h);
+
+/**
  * Load the binary `stem` (with its bucket values, `n_buckets` of them, for a bucketed kernel) of `manifest` for `arch` (`"sm_103"`, or NULL for
  * the architecture of the context's device) in `context`. The function's parameters are checked against the manifest's ABI.
  *
@@ -1072,6 +1126,51 @@ tilefish_status tilefish_plan_from_embedded(const uint8_t *plan,
                                             const struct tilefish_manifest *manifest,
                                             const char *pin,
                                             struct tilefish_plan **out);
+
+/**
+ * The digest of a plan, owned by the handle (NULL for NULL).
+ *
+ * # Safety
+ *
+ * `plan` is NULL or a live handle.
+ */
+const char *tilefish_plan_digest(const struct tilefish_plan *plan);
+
+/**
+ * The digest of the plan's manifest, owned by the handle (NULL for NULL).
+ *
+ * # Safety
+ *
+ * `plan` is NULL or a live handle.
+ */
+const char *tilefish_plan_manifest_digest(const struct tilefish_plan *plan);
+
+/**
+ * The name of the plan's graph, owned by the handle (NULL for NULL).
+ *
+ * # Safety
+ *
+ * `plan` is NULL or a live handle.
+ */
+const char *tilefish_plan_graph(const struct tilefish_plan *plan);
+
+/**
+ * The architecture the plan is for (`"sm_103"`), owned by the handle (NULL for NULL).
+ *
+ * # Safety
+ *
+ * `plan` is NULL or a live handle.
+ */
+const char *tilefish_plan_arch(const struct tilefish_plan *plan);
+
+/**
+ * Where the plan was read from, owned by the handle (NULL for NULL).
+ *
+ * # Safety
+ *
+ * `plan` is NULL or a live handle.
+ */
+const char *tilefish_plan_label(const struct tilefish_plan *plan);
 
 /**
  * The bytes of the plan's own arena (0 for NULL).

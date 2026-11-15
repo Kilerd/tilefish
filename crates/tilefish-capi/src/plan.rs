@@ -252,34 +252,60 @@ pub unsafe extern "C" fn tilefish_plan_from_embedded(
     })
 }
 
-macro_rules! plan_string {
-    ($name:ident, $field:ident, $doc:literal) => {
-        #[doc = $doc]
-        ///
-        /// # Safety
-        ///
-        /// `plan` is NULL or a live handle.
-        #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $name(plan: *const tilefish_plan) -> *const c_char {
-            // SAFETY: the caller's contract.
-            quiet(std::ptr::null(), || unsafe { plan.as_ref() }.map_or(std::ptr::null(), |p| p.$field.as_ptr()))
-        }
-    };
+/// The digest of a plan, owned by the handle (NULL for NULL).
+///
+/// # Safety
+///
+/// `plan` is NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_plan_digest(plan: *const tilefish_plan) -> *const c_char {
+    // SAFETY: the caller's contract.
+    quiet(std::ptr::null(), || unsafe { plan.as_ref() }.map_or(std::ptr::null(), |p| p.digest.as_ptr()))
 }
 
-plan_string!(tilefish_plan_digest, digest, "The digest of a plan, owned by the handle (NULL for NULL).");
-plan_string!(
-    tilefish_plan_manifest_digest,
-    manifest_digest,
-    "The digest of the plan's manifest, owned by the handle (NULL for NULL)."
-);
-plan_string!(tilefish_plan_graph, graph, "The name of the plan's graph, owned by the handle (NULL for NULL).");
-plan_string!(
-    tilefish_plan_arch,
-    arch,
-    "The architecture the plan is for (`\"sm_103\"`), owned by the handle (NULL for NULL)."
-);
-plan_string!(tilefish_plan_label, label, "Where the plan was read from, owned by the handle (NULL for NULL).");
+/// The digest of the plan's manifest, owned by the handle (NULL for NULL).
+///
+/// # Safety
+///
+/// `plan` is NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_plan_manifest_digest(plan: *const tilefish_plan) -> *const c_char {
+    // SAFETY: the caller's contract.
+    quiet(std::ptr::null(), || unsafe { plan.as_ref() }.map_or(std::ptr::null(), |p| p.manifest_digest.as_ptr()))
+}
+
+/// The name of the plan's graph, owned by the handle (NULL for NULL).
+///
+/// # Safety
+///
+/// `plan` is NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_plan_graph(plan: *const tilefish_plan) -> *const c_char {
+    // SAFETY: the caller's contract.
+    quiet(std::ptr::null(), || unsafe { plan.as_ref() }.map_or(std::ptr::null(), |p| p.graph.as_ptr()))
+}
+
+/// The architecture the plan is for (`"sm_103"`), owned by the handle (NULL for NULL).
+///
+/// # Safety
+///
+/// `plan` is NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_plan_arch(plan: *const tilefish_plan) -> *const c_char {
+    // SAFETY: the caller's contract.
+    quiet(std::ptr::null(), || unsafe { plan.as_ref() }.map_or(std::ptr::null(), |p| p.arch.as_ptr()))
+}
+
+/// Where the plan was read from, owned by the handle (NULL for NULL).
+///
+/// # Safety
+///
+/// `plan` is NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_plan_label(plan: *const tilefish_plan) -> *const c_char {
+    // SAFETY: the caller's contract.
+    quiet(std::ptr::null(), || unsafe { plan.as_ref() }.map_or(std::ptr::null(), |p| p.label.as_ptr()))
+}
 
 /// The bytes of the plan's own arena (0 for NULL).
 ///
