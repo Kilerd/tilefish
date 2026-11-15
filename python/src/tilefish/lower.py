@@ -399,9 +399,10 @@ Notes (the facts behind the table):
     ``saturate=True``, the default, clamps the rounded value to the type's range (an infinity to its bound) and makes a NaN 0, for every type
     alike: Rust's ``as`` with that rounding, CUDA's ``__float2int_rn`` family for 32 bits. ``saturate=False`` keeps the low ``bits`` bits of the
     rounded value as an ``i64`` (two's complement, modulo ``2**bits``), where a value outside the ``i64`` range has saturated first and a NaN is
-    0: what C and torch do for a narrow type (``-1.5`` to ``u8`` with ``rz`` is 255, ``300`` is 44). For ``i64`` the two modes are one. The
-    default saturates because a saturated value is never far from the true one and is the same on every type, where a wrapped one is the cast
-    of C, chosen on purpose; the rounding has no default because a truncation and a rounding are both common and differ by one everywhere.
+    0: C's narrowing of an integer, and torch's cast of a float to ``u8``, which goes through ``int64`` (``-1.5`` to ``u8`` with ``rz`` is 255,
+    ``300`` is 44). For ``i64`` the two modes are one. The default saturates because a saturated value is the representable one nearest to the
+    rounded value, by one rule for every type, where a wrapped one is far from it and is asked for on purpose; the rounding has no default
+    because a truncation and a rounding to nearest are both common, and differ on every value whose fraction is above one half.
     Each cast is a module-level helper of inline PTX (``_tf_f2i_s32_rn``), so the instruction is the contract and Triton's ``.to()`` (whose ``u8``
     is neither of these, note 1) is not involved: ``cvt.rni.s32.f32`` (``rzi``, ``rmi``, ``rpi`` for the others), which saturates and gives 0
     for a NaN, for a saturating ``i32``; the same then ``max.s32`` and ``min.s32`` with 0 and 255 for a saturating ``u8``, whose ``.to(tl.uint8)``
