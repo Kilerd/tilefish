@@ -6,7 +6,13 @@ each section names the release that added it.
 
 ## Unreleased
 
-### Types and arguments (lane types)
+### Breaking changes
+
+- A float to integer cast in a kernel body says its rounding: `x.to(i32)` of a float tensor raises a `TilefishTypeError` at the
+  declaration (it used to trace and then be refused by the lowering, rule `cast.float-to-int`). Write
+  `x.to(i32, rounding="rz")` for a truncation.
+
+### Types, arguments and ops (lane types)
 
 - **64-bit dimension scalars.** An extern's runtime scalar that carries a dimension may be an `i64`: `n_elem: i64[n]` (`i32[n]` is `n`, as before).
   Its value is derived from the shapes and range-checked as an `i64` by both hosts, where an `i64` count used to be a per-call `given` value nothing
@@ -19,6 +25,18 @@ each section names the release that added it.
   (`<kernel>__ua<indices>`), instead of refusing the call; so does `tilefish.run` of an address that is not 16-byte aligned. Its pointers for those
   parameters have no divisibility hint and promise their element's alignment (a `pointer_alignment` a dense pointer may now have, section 6); its stems,
   declaration digest, IR and build cache key are its own, its source the kernel's.
+- Float to integer casts are lowered: `x.to(i32 | i64 | u8, rounding="rn" | "rz" | "rd" | "ru", saturate=True | False)` (from f32, bf16,
+  f16, e4m3 or e5m2). `saturate=True`, the default, clamps to the type's range with a NaN 0; `saturate=False` keeps the low bits of the
+  `i64`. Each is a helper of inline PTX (`cvt.rni.s32.f32`, ...), and the `reference` mode computes the declared mode exactly: the two are
+  byte-identical on every f32 bit pattern. Note 15 of `tilefish.lower` says what torch's casts are in these terms.
+- The row template reads a static slice `x[k]` (`x.select(0, k)`) of a read-only parameter at its offset: `codes[k]` of a `[K, R]` codes
+  plane is a per-row operand, such as the index of `gather_rows`, and `tables[k]` of a `[K, N, D]` parameter is a table. A dynamic
+  dimension of the offset is a runtime `i32` parameter (`size_R`) that a host derives from the shapes. Every other view is still refused
+  (rule `view`). Note 16 of `tilefish.lower`.
+- `x.split(16, axis=1)` of a dimension declared only `divisible_by=16` (or whose buckets are all multiples of 16) returns
+  `tilefish.ops.Chunks`, a sequence whose `chunks[0]` and `chunks[-1]` (and any chunk the dimension's smallest size proves) are views,
+  where it used to raise "not a whole number of chunks"; `len()`, iteration and unpacking raise. A split whose count is a number still
+  returns a tuple. Plans and the graph `reference` mode take these chunks.
 - Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`null` parameters, an element-aligned dense pointer); manifests without them load and digest as
   before. The crate's `ParamKind` gained the variant `Null`.
 

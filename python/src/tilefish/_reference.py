@@ -8,8 +8,8 @@ node by node:
   half types round to nearest even like torch. f32 to bf16 is computed on the bits, in the NaN mode the cast declares: a NaN is
   ``0x7FFF`` for ``nan="canonical"`` (the default, what the binary's ``cvt.rn.bf16.f32`` gives) and keeps its sign and payload for
   ``nan="preserve"``; torch's own cast is neither everywhere (``0x7FFF`` on CUDA, ``0x7FC0`` or ``0xFFFF`` on the CPU), so it is not
-  used for that one. A float to integer cast is torch's, which is a plain truncation
-  in range; the lowering rejects it (rule ``cast.float-to-int``), so no binary has a behavior to compare with;
+  used for that one. A float to integer cast is computed in its declared rounding and saturation modes (note 15 of
+  :mod:`tilefish.lower`), exactly, in float64 and int64: not torch's cast, which neither rounds nor saturates as declared;
 * every other operation runs in the dtype the IR gave its result, and a python scalar or ``const`` is a 0-d
   tensor of that dtype (a bf16 tensor combined with a float scalar rounds the scalar to bf16 first, as
   Triton does);
@@ -19,7 +19,8 @@ node by node:
 * reductions are torch's; ``argmax`` and ``argmin`` follow the contract (the first NaN, else the first extreme value), written out in torch;
 * comparisons, masks, ``where`` and ``iota`` are torch's, with a scalar rounded to the IR dtype as above: exact, like the binary;
 * ``gather_rows`` and ``scatter_rows`` are torch indexing with the out-of-range policy of the call: raw copies, exact (where a scatter's
-  indices in range are distinct; with duplicates neither the binary nor the reference says which row lands).
+  indices in range are distinct; with duplicates neither the binary nor the reference says which row lands);
+* a static slice ``x[k]`` of a parameter is torch's ``select``, the row the binary reads at its offset.
 
 What stays different, and what a tolerance has to cover, is everything the binary does approximately:
 ``/`` between tensors (``div.full.f32``), ``exp`` (``ex2.approx``), ``rsqrt``, ``erf`` (libdevice), the
@@ -84,16 +85,50 @@ def f32_to_bf16(torch: Any, x: Any, nan: str) -> Any:
     return torch.where(word >= 0x8000, word - 0x10000, word).to(torch.int16).view(torch.bfloat16)
 
 
-def cast(torch: Any, x: Any, src: Any, dst: Any, nan: "str | None" = None) -> Any:
+_ROUND = {"rn": "round", "rz": "trunc", "rd": "floor", "ru": "ceil"}  # torch's rounding of a float64 to an integral value (round: ties to even)
+
+
+def float_to_int(torch: Any, x: Any, dst: Any, rounding: str, saturate: bool) -> Any:
+    """A float to integer cast in the declared mode (note 15 of :mod:`tilefish.lower`), computed exactly rather than with torch's cast.
+
+    The value is widened to float64 (exact for every float type) and rounded to an integral value there (``rn`` to nearest even, ``rz``
+    toward zero, ``rd`` down, ``ru`` up); a NaN is 0 and the value is clamped to the ``i64`` range (an infinity to its bound), which is
+    exact in float64. ``saturate=True`` then clamps it to the range of ``dst``; ``saturate=False`` keeps its low ``bits`` bits (two's
+    complement). torch's own casts are none of these everywhere (``x.to(torch.int64)`` gives ``-2**63`` for a NaN on CUDA).
+    """
+    v = getattr(torch, _ROUND[rounding])(x.to(torch.float32).to(torch.float64))
+    nan = torch.isnan(v)
+    over = v >= 2.0**63
+    under = v < -(2.0**63)
+    i = torch.where(nan | over | under, torch.zeros_like(v), v).to(torch.int64)  # integral and in range: exact
+    i = torch.where(over, torch.full_like(i, 2**63 - 1), torch.where(under, torch.full_like(i, -(2**63)), i))
+    target = torch_dtype(torch, dst)
+    if dst.name == "i64":  # the two modes are one
+        return i
+    if saturate:
+        lo, hi = dst.int_range()
+        return i.clamp(lo, hi).to(target)
+    bits = dst.bits
+    w = i & ((1 << bits) - 1)
+    if dst.signed:
+        w = torch.where(w >= 1 << (bits - 1), w - (1 << bits), w)
+    return w.to(target)
+
+
+def cast(torch: Any, x: Any, src: Any, dst: Any, nan: "str | None" = None, rounding: "str | None" = None, saturate: bool = True) -> Any:
     """``x.to(dst)``, with ``satfinite`` for the fp8 types and the binary's own f32 to bf16 rounding.
 
     ``src`` and ``dst`` are tilefish dtypes. Float to ``e4m3`` / ``e5m2``: round to nearest even, saturating at
     the largest finite value (448, 57344), infinities included, instead of overflowing to NaN or infinity as
     torch does; NaN stays NaN. f32 to bf16 is :func:`f32_to_bf16` in the NaN mode ``nan`` of the cast (``canonical`` by
-    default). Every other cast is torch's (a float to integer cast is not lowered, see
-    ``cast.float-to-int``, so only its in-range truncation toward zero is meaningful here).
+    default). A float to integer cast is :func:`float_to_int` in its declared ``rounding`` and ``saturate`` modes. Every other cast is
+    torch's.
     """
     target = torch_dtype(torch, dst)
+    if src.is_float and dst.is_int:
+        if rounding is None:
+            raise TilefishRuntimeError(f"reference mode: a cast of {src} to {dst} without a rounding mode (a float to integer cast says it)")
+        return float_to_int(torch, x, dst, rounding, saturate)
     if src.name == "f32" and dst.name == "bf16":
         return f32_to_bf16(torch, x, nan or "canonical")
     if src.is_float and dst.name == "e4m3":
@@ -171,6 +206,8 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
             (out,) = n.outputs
             if op == "load":  # the one element of a DevScalar, as a 0-d tensor (it broadcasts like the kernel's scalar does)
                 r = a[0].reshape(())
+            elif op == "select":  # x[k]: a static slice of a parameter (note 16 of tilefish.lower), a view of it
+                r = a[0].select(n.attrs["axis"], n.attrs["index"])
             elif op in _COMPARE:  # IEEE comparisons (a NaN is unordered: only != is true), the scalar rounded to the IR dtype
                 r = getattr(torch, _COMPARE[op])(a[0], a[1])
             elif op in ("and", "or", "xor"):
@@ -239,7 +276,7 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 r = 0.5 * a[0] * (1.0 + torch.erf(a[0] * 0.7071067811865476))
             elif op == "cast":
                 src = n.inputs[0].type.dtype  # type: ignore[union-attr]
-                r = cast(torch, a[0], src, n.attrs["to"], n.attrs.get("nan"))
+                r = cast(torch, a[0], src, n.attrs["to"], n.attrs.get("nan"), n.attrs.get("round"), n.attrs.get("saturate", True))
             elif op in ("sum", "mean", "max"):
                 axes = tuple(n.attrs["axes"])
                 keep = bool(n.attrs["keepdims"])

@@ -16,6 +16,7 @@ offset may be a product of symbolic sizes (``L*L`` for ``x[h]`` of an ``[H, L, L
 
 from __future__ import annotations
 
+import itertools
 import math
 from typing import Any, Sequence
 
@@ -398,15 +399,22 @@ def cos(x: Value, *, math: Any = None) -> Value:
 
 
 NAN_MODES = ("canonical", "preserve")
+ROUNDING_MODES = ("rn", "rz", "rd", "ru")  # a float to integer cast: to nearest even, toward zero, down (toward -inf), up (toward +inf)
 
 
-def cast(x: Value, dtype: DType, nan: "str | None" = None) -> Value:
+def cast(x: Value, dtype: DType, nan: "str | None" = None, rounding: "str | None" = None, saturate: "bool | None" = None) -> Value:
     """Cast to ``dtype``; a narrowing cast (one that can round) is flagged as a rounding point.
 
     ``nan`` says what the f32 to bf16 cast does with a NaN (note 1 of :mod:`tilefish.lower`): ``"canonical"`` (the default, PTX
     ``cvt.rn.bf16.f32``) gives the canonical NaN ``0x7FFF``; ``"preserve"`` is the integer round to nearest even on the bit pattern, which
     keeps a NaN's sign and the top of its payload (quiet bit set): ``0xFFC00000`` becomes ``0xFFC0``. The two agree on every other input.
     Only that cast has the option.
+
+    A float to integer cast (to ``i32``, ``i64`` or ``u8``) says how it rounds, ``rounding="rn"`` (to nearest, ties to even), ``"rz"``
+    (toward zero), ``"rd"`` (down) or ``"ru"`` (up), which has no default, and what a value out of range becomes (note 15 of
+    :mod:`tilefish.lower`): ``saturate=True`` (the default) clamps the rounded value to the integer type's range (an infinity to its
+    bound, a NaN to 0), ``saturate=False`` wraps it modulo ``2**bits`` as C and torch do for a narrow type, computed through ``i64`` (a
+    value outside the ``i64`` range saturates there first, a NaN is 0; for ``i64`` the two modes are one). No other cast takes either.
 
     A cast to the dtype the tensor already has emits no node and behaves exactly like reading the
     tensor at that point: it returns the version that is current at the time of the cast, and that
@@ -433,12 +441,34 @@ def cast(x: Value, dtype: DType, nan: "str | None" = None) -> Value:
             raise TilefishTypeError(
                 f"to: nan= is a mode of the f32 to bf16 cast; casting {x.type} to {dtype} has one NaN rule (see note 1 of the numerics contract)"
             )
+    float_to_int = x.dtype.is_float and dtype.is_int
+    if float_to_int:
+        if rounding is None:
+            raise TilefishTypeError(
+                f"to: casting {x.type} to {dtype} needs rounding='rn' | 'rz' | 'rd' | 'ru' (to nearest even, toward zero, down, up): a float to "
+                "integer cast says how it rounds, there is no default; saturate=True (the default) clamps a value out of range, saturate=False "
+                "wraps it (note 15 of the numerics contract)"
+            )
+        if rounding not in ROUNDING_MODES:
+            raise TilefishTypeError(f"to: rounding must be one of {list(ROUNDING_MODES)}, got {rounding!r}")
+        if saturate is None:
+            saturate = True
+        if not isinstance(saturate, bool):
+            raise TilefishTypeError(f"to: saturate must be True or False, got {saturate!r}")
+    elif rounding is not None or saturate is not None:
+        what = "rounding=" if rounding is not None else "saturate="
+        raise TilefishTypeError(
+            f"to: {what} is a mode of a float to integer cast; casting {x.type} to {dtype} has none (see note 1 of the numerics contract)"
+        )
     if dtype == x.dtype:
         return x._reference()
-    rounding = x.dtype.is_narrowing_to(dtype)
-    attrs: dict[str, Any] = {"to": dtype, "rounding": rounding}
+    narrowing = x.dtype.is_narrowing_to(dtype)
+    attrs: dict[str, Any] = {"to": dtype, "rounding": narrowing}
     if nan == "preserve":  # the default, "canonical", is the plain cast and leaves the node as it always was
         attrs["nan"] = nan
+    if float_to_int:  # the integer rounding and the saturation mode (note 15 of tilefish.lower)
+        attrs["round"] = rounding
+        attrs["saturate"] = saturate
     (out,) = x.ctx.emit("cast", [x], attrs, [x.type.with_dtype(dtype)])
     return out
 
@@ -540,8 +570,14 @@ def argmin(x: Any, axis: Any = -1, *, dtype: Any = _REQUIRED, keepdims: Any = Fa
 # -- split ---------------------------------------------------------------------------
 
 
-def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
+def split(x: Any, size: Any, axis: int) -> "tuple[Value, ...] | Chunks":
     """Split ``axis`` into equal chunks of ``size``, or into chunks of the sizes in a list.
+
+    When the number of chunks depends on a dimension (``C = Dim("C", divisible_by=16)`` split in chunks of 16: ``C // 16`` chunks), a trace
+    cannot return that many values, so ``split`` returns :class:`Chunks`, a sequence of symbolic length: ``chunks[0]`` and ``chunks[-1]``
+    always exist, ``chunks[k]`` where the dimension's bounds prove it (``k + 1`` chunks fit in its smallest size); ``len()``, iteration and
+    unpacking raise. That needs the chunk size to divide the dimension provably (``divisible_by``, the buckets, or a requirement); a count
+    that is a number gives the tuple, as it always did.
 
     The chunks are views of the parent, with their strides and offset in the type. Splitting along the leading axis (or after
     size-1 axes) gives dense slabs: a slab that provably starts on a 16-byte boundary is a contiguous tensor and can be passed to
@@ -579,30 +615,124 @@ def split(x: Any, size: Any, axis: int) -> tuple[Value, ...]:
         chunk = as_size(size)
         count = dim.exact_div(chunk)
         if count is None or count < 1:
+            if chunk.is_static and chunk.value >= 1 and not dim.is_static and _divides(x, dim, chunk.value):
+                return Chunks(x, ax, chunk)  # a whole number of chunks, but how many depends on a dimension
+            hint = (
+                f" (a count that depends on a dimension needs {dim} provably divisible by {chunk}: Dim(..., divisible_by={chunk.value}), or "
+                "buckets that all are)"
+                if chunk.is_static and not dim.is_static
+                else ""
+            )
             raise TilefishTypeError(
-                f"split: axis {axis} of {x.type} has size {dim}, which is not a whole number of chunks of size {chunk}"
+                f"split: axis {axis} of {x.type} has size {dim}, which is not a whole number of chunks of size {chunk}{hint}"
             )
         sizes = [chunk] * count
+    return x.ctx.emit("split", [x], {"axis": ax, "sizes": tuple(sizes)}, _chunk_types(x, ax, sizes))
+
+
+def _divides(x: Value, dim: DimExpr, k: int) -> bool:
+    """Whether ``k`` provably divides ``dim``: by the divisibility the dimensions declare (and the trace's requirements), or at every bucket when
+    each dimension in it is bucketed."""
+    if x.ctx.is_divisible(dim, k):
+        return True
+    free = sorted(dim.free_dims(), key=lambda d: d.name)
+    if not free or not all(d.buckets for d in free):
+        return False
+    return all(dim.subst(dict(zip(free, combo))).value % k == 0 for combo in itertools.product(*(d.buckets for d in free)))  # type: ignore[misc]
+
+
+def _chunk_types(x: Value, ax: int, sizes: "Sequence[DimExpr]", start: "DimExpr | None" = None) -> "list[TensorType]":
     if isinstance(x.dtype, BlockScaled):
-        out_types = _blockscaled_chunks(x, ax, sizes)
-    else:
-        out_types = _chunks(x, ax, sizes)
-    return x.ctx.emit("split", [x], {"axis": ax, "sizes": tuple(sizes)}, out_types)
+        return _blockscaled_chunks(x, ax, sizes, start)
+    return _chunks(x, ax, sizes, start)
 
 
-def _chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> "list[TensorType]":
+class Chunks:
+    """The chunks of a :func:`split` whose number depends on a dimension: ``x.split(16, axis=1)`` of ``x: [M, C]`` with
+    ``C = Dim("C", divisible_by=16)`` has ``C // 16`` chunks, which a trace cannot return as Python values.
+
+    ``chunks[k]`` is chunk ``k``, a view with the strides of ``x`` and the offset of its start, exactly like a chunk of a split whose count
+    is a number (one ``split`` node per chunk taken; its ``start`` attribute says where the chunk starts). ``chunks[0]`` and
+    ``chunks[-1]`` always exist (the dimension is a positive multiple of the size); ``chunks[k]`` (or ``chunks[-k - 1]``) only where every
+    size the dimension can have holds ``k + 1`` chunks, which its smallest size says (``divisible_by``, the smallest bucket). ``len()``,
+    iteration and unpacking raise: the count depends on the dimension (:attr:`count` is it, symbolic). The chunks are of ``x`` as it was
+    when it was split, like those of any split.
+    """
+
+    __slots__ = ("_x", "axis", "size", "dim")
+
+    def __init__(self, x: Value, axis: int, size: DimExpr) -> None:
+        self._x = x._reference()  # the version split now (an InOut parameter's name would follow later stores)
+        self.axis = axis
+        self.size = size
+        self.dim = x.shape[axis]
+
+    @property
+    def count(self) -> DimExpr:
+        """The number of chunks, ``dim / size``: a symbolic dimension expression (``cdiv(C, 16)``, exact)."""
+        return as_dim(cdiv(self.dim, self.size))
+
+    @property
+    def known(self) -> int:
+        """How many chunks every size of the dimension has: those at the start (``chunks[0]`` ...) and at the end (``chunks[-1]`` ...) that
+        can be taken."""
+        return dim_bounds(self.dim)[0] // self.size.value
+
+    def _describe(self) -> str:
+        return f"the {self.count} chunks of size {self.size} of axis {self.axis} of {self._x.ref} ({self._x.type})"
+
+    def __getitem__(self, k: Any) -> Value:
+        if isinstance(k, slice):
+            raise TilefishTypeError(f"split: {self._describe()} are taken one by one (chunks[0], chunks[-1]); a slice of them has no static length")
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TilefishTypeError(f"split: a chunk is taken with a python int (chunks[0], chunks[-1]), got {k!r}")
+        known = self.known
+        if (k >= 0 and k >= known) or (k < 0 and -k > known):
+            lo = dim_bounds(self.dim)[0]
+            raise TilefishTypeError(
+                f"split: chunk {k} of {self._describe()} is not provably there: {self.dim} can be as small as {lo}, which has {known} chunk(s) "
+                f"of {self.size}, so chunks[0] to chunks[{known - 1}] and chunks[-1] to chunks[-{known}] exist (a larger divisible_by or "
+                "smallest bucket proves more)"
+            )
+        x = self._x._current(f"split: chunk {k} of")
+        start = self.size * k if k >= 0 else self.dim + self.size * k  # chunk -1 starts one size before the end
+        types = _chunk_types(x, self.axis, [self.size], start)
+        (out,) = x.ctx.emit("split", [x], {"axis": self.axis, "sizes": (self.size,), "start": start}, types)
+        return out
+
+    def _no_count(self, what: str) -> TilefishTypeError:
+        return TilefishTypeError(
+            f"split: {what} {self._describe()}: their number depends on {self.dim}, which a trace does not know. Take a chunk with "
+            "chunks[k] (chunks[0] and chunks[-1] always exist), or split in a number of chunks"
+        )
+
+    def __len__(self) -> int:
+        raise self._no_count("len() of")
+
+    def __iter__(self) -> Any:
+        raise self._no_count("cannot iterate over or unpack")
+
+    def __bool__(self) -> bool:
+        return True  # at least one chunk (len() would raise)
+
+    def __repr__(self) -> str:
+        return f"<Chunks: {self._describe()}>"
+
+
+def _chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]", start: "DimExpr | None" = None) -> "list[TensorType]":
     """The types of the chunks of a plain tensor: the strides of the parent, and an offset that is the parent's plus the chunk's start.
 
-    A chunk starts ``(sizes before it) * (stride of the axis)`` elements in. A slab along axis ``ax`` of a dense tensor is dense
-    again only when everything before that axis has size 1 (or the axis is the first one); then its strides are the default and
-    only the offset says where it is. Any other chunk is a strided view with the parent's strides. Whether a chunk is a contiguous
-    tensor (dense and provably starting on a 16-byte boundary: the contract of every pointer) follows from its type.
+    A chunk starts ``(start + sizes before it) * (stride of the axis)`` elements in (``start`` is 0 but for a chunk of :class:`Chunks`). A
+    slab along axis ``ax`` of a dense tensor is dense again only when everything before that axis has size 1 (or the axis is the first
+    one); then its strides are the default and only the offset says where it is. Any other chunk is a strided view with the parent's
+    strides. Whether a chunk is a contiguous tensor (dense and provably starting on a 16-byte boundary: the contract of every pointer)
+    follows from its type.
     """
     t = x.type
     strides = t.layout_strides()
     dense_chunks = t.is_dense and all(d.is_static and d.value == 1 for d in x.shape[:ax])
     out_types: list[TensorType] = []
-    before = DimExpr.const(0)
+    before = DimExpr.const(0) if start is None else start
     for s in sizes:
         shape = list(x.shape)
         shape[ax] = s
@@ -624,7 +754,7 @@ def _chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> "list[TensorType]"
     return out_types
 
 
-def _blockscaled_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> "list[TensorType]":
+def _blockscaled_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]", start: "DimExpr | None" = None) -> "list[TensorType]":
     """A chunk of a block-scaled tensor is contiguous only when it is a dense slab whose data *and scales* start on 16-byte boundaries.
 
     Anything else is a view of unknown layout (data and scales are two buffers: a strided view of both is not expressed yet).
@@ -639,14 +769,14 @@ def _blockscaled_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> "list[
         except TilefishError as e:
             raise TilefishTypeError(f"split: chunk type is invalid: {e}") from None
     if dense:
-        aligned = _aligned_chunks(x, ax, sizes)
+        aligned = _aligned_chunks(x, ax, sizes, start)
         out_types = [t if ok else t.as_view() for t, ok in zip(out_types, aligned)]
     else:
         out_types = [t.as_view() for t in out_types]
     return out_types
 
 
-def _aligned_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> list[bool]:
+def _aligned_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]", start: "DimExpr | None" = None) -> list[bool]:
     """For a split of a dense tensor, whether each chunk starts on a 16-byte boundary.
 
     A chunk starts ``(sizes before it) * (product of the dims after the axis)`` elements in. For a
@@ -663,7 +793,7 @@ def _aligned_chunks(x: Value, ax: int, sizes: "Sequence[DimExpr]") -> list[bool]
         blocked = dtype.normalized_axis(t.rank)
         scale_inner = _product(dtype.scale_shape(t.shape, known)[ax + 1 :])
     flags: list[bool] = []
-    before = DimExpr.const(0)
+    before = DimExpr.const(0) if start is None else start
     for size in sizes:
         ok = before.is_static and before.value == 0  # the first chunk starts at the tensor's own (aligned) pointer
         if not ok:

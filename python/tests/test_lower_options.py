@@ -5,7 +5,7 @@
 * A generated kernel writes ``enable_fp_fusion`` into its specs (``True``, Triton's default, or ``False`` for
   ``@tilefish.kernel(fp_fusion=False)``); an ``extern`` has the key only when it declares ``enable_fp_fusion=``, and then it is in its
   specs, its manifest entries and its declaration digest like a generated kernel's.
-* A float to integer cast is rejected (rule ``cast.float-to-int``); float to ``e4m3``/``e5m2`` and the rest stay.
+* A float to integer cast says its rounding (``rounding=``, note 15) and lowers to inline PTX; float to ``e4m3``/``e5m2`` and the rest stay.
 
 No ``from __future__ import annotations`` here: tilefish evaluates annotations at declaration.
 """
@@ -344,30 +344,42 @@ def cast_kernel(src, dst):
 
 @pytest.mark.parametrize("src", [f32, bf16, f16], ids=str)
 @pytest.mark.parametrize("dst", [u8, i32, i64], ids=str)
-def test_a_float_to_integer_cast_is_not_lowered(src, dst):
-    with pytest.raises(TilefishLoweringError) as e:
-        cast_kernel(src, dst).lower()
-    assert e.value.rule == "cast.float-to-int"
-    message = str(e.value)
-    assert f"casting {src} to {dst} is not lowered" in message
-    assert "rounding and saturation modes of a float to integer cast are not supported yet" in message
-    assert "numerics contract" in message
+def test_a_float_to_integer_cast_says_its_rounding(src, dst):
+    with pytest.raises(tilefish.TilefishTypeError, match=rf"casting Tensor\[T, {src}\] to {dst} needs rounding='rn' \| 'rz' \| 'rd' \| 'ru'"):
+        cast_kernel(src, dst)
+
+    @tilefish.kernel
+    def cast(x: Tensor[T, src]) -> Tensor[T, dst]:
+        return x.to(dst, rounding="rn")
+
+    assert "inline_asm_elementwise" in cast.lower().source  # note 15: explicit PTX, not Triton's .to()
 
 
-def test_the_rule_applies_to_every_template():
-    for template in ("elementwise", None):
-        with pytest.raises(TilefishLoweringError) as e:
-            cast_kernel(f32, i32).lower(template=template)
-        assert e.value.rule == "cast.float-to-int"
+def test_a_float_to_integer_cast_lowers_in_every_template():
     rows = Dim("R")
 
     @tilefish.kernel
-    def rows_to_int(x: Tensor[rows, Dim("D", 64), f32]) -> Tensor[rows, Dim("D", 64), i32]:
-        return x.to(i32)
+    def flat(x: Tensor[T, f32]) -> Tensor[T, i32]:
+        return x.to(i32, rounding="rz")
 
+    @tilefish.kernel
+    def rows_to_int(x: Tensor[rows, Dim("D", 64), f32]) -> Tensor[rows, Dim("D", 64), i32]:
+        return x.to(i32, rounding="rz")
+
+    for k, template in ((flat, "elementwise"), (rows_to_int, "row")):
+        low = k.lower(template=template)
+        assert low.template == template and "v1 = _tf_f2i_s32_rz(v0)  # rounding point" in low.source
+
+
+def test_an_ir_float_to_integer_cast_without_a_rounding_is_refused():
+    @tilefish.kernel
+    def flat(x: Tensor[T, f32]) -> Tensor[T, i32]:
+        return x.to(i32, rounding="rz")
+
+    del flat.graph.nodes[0].attrs["round"]  # an IR made by hand: the API never makes one
     with pytest.raises(TilefishLoweringError) as e:
-        rows_to_int.lower()
-    assert e.value.rule == "cast.float-to-int"
+        flat.lower()
+    assert e.value.rule == "cast.float-to-int" and "without a rounding mode" in str(e.value)
 
 
 @pytest.mark.parametrize(

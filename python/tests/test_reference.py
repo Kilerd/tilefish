@@ -159,8 +159,8 @@ def probe(values):
 
 
 # What the binaries do (measured on an sm_103 GPU, asserted there by test_gpu_numerics.py): the tables of cast_cases.
-# A float to integer cast is not lowered, so the reference has no binary to follow there: it is torch's cast.
-def test_a_float_to_integer_cast_is_torchs_and_truncates_toward_zero_in_range():
+# A float to integer cast follows its declared mode (these: rounding="rz", saturating), as the binary does (test_gpu_f2i.py)
+def test_a_float_to_integer_cast_truncates_toward_zero_when_it_says_rz():
     values = [0.0, 0.5, 1.9, 127.5, 200.9, 254.9]
     x = probe(values)
     for kernel, dtype in ((cast_cases.to_i32, torch.int32), (cast_cases.to_i64, torch.int64), (cast_cases.to_u8, torch.uint8)):
