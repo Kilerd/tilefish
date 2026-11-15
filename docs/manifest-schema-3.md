@@ -34,7 +34,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | ABI argument kinds (0.0.6, crate 0.0.4) | — | adds `tensordesc`: a TMA descriptor of a tensor (a `CUtensorMap` the host encodes at every launch, passed by value), which takes `1 + 2 * rank` slots of `kernelParams`, so `slot` is where a parameter's slots begin (section 5.5) |
 | kernel entry (0.0.6, crate 0.0.4) | — | an optional `total_num_warps`: the warps of a block of a warp-specialised kernel, whose partitions add warps to the `num_warps` of its default partition; its `block` is `32 * total_num_warps` (section 4.2) |
 | library entry (0.0.6, crate 0.0.4) | — | `impl: "cudnn.conv_fwd"`: a pinned cuDNN forward convolution, an entry of fields of its own (the problem, the math, the pin of the legacy or the backend API and how it was chosen, the cuDNN version, the device) (section 9.4) |
-| kernel entry (0.0.7, crate 0.0.5) | — | an optional `cuda_math` on a generated kernel: the CUDA math functions whose bits its ops are, the CUDA releases they were measured on, and the sha256 of the libdevice it links (section 4.3) |
+| kernel entry (unreleased) | — | an optional `cuda_math` on a generated kernel: the CUDA math functions whose bits its ops are, the CUDA releases they were measured on, and the sha256 of the libdevice it links (section 4.3) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -204,7 +204,7 @@ A JSON `null` is as absent. A reader from before this change refuses an entry wi
 replay of Python 0.0.5 finds a block that is not the spec's. So no host launches a warp-specialised kernel with the declared block. Manifests without
 the field are unchanged, and so are their digests.
 
-### 4.3 The CUDA math functions of a generated kernel: `cuda_math` (tilefish 0.0.7, crate 0.0.5)
+### 4.3 The CUDA math functions of a generated kernel: `cuda_math` (unreleased)
 
 Some ops of a kernel tilefish generates are, by the numerics contract, the bits of a function of CUDA's math library: in IEEE math `exp` and `silu`
 are built on `expf`, `rsqrt` is `rsqrtf` and `erf` is `erff` (inline PTX read from NVRTC), and in either math `sin`, `cos` and `tanh` are libdevice's
