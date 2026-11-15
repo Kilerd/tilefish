@@ -1,0 +1,55 @@
+//
+// A kernel of thread-block clusters, written by hand for the tests of cluster launches (nothing generated it). Each cluster is two blocks of 128
+// threads along x; every block puts its 128 elements of x in its shared memory, waits for the cluster, and reads its partner's shared memory
+// through the distributed shared memory of the cluster (mapa + ld.shared::cluster):
+//     y[b * 128 + t] = x[(b ^ 1) * 128 + t] + rank        (rank = %cluster_ctarank = b % 2; an element past n reads as 0, and is not written)
+// The kernel requires a cluster launch (.explicitcluster): a launch without the cluster attribute is refused by the driver.
+// C ABI: (const float* x, float* y, int n). No Triton scratch slots.
+//
+.version 8.0
+.target sm_90
+.address_size 64
+
+.visible .entry cluster_swap_f32(
+	.param .u64 x,
+	.param .u64 y,
+	.param .u32 n
+)
+.explicitcluster
+.reqntid 128, 1, 1
+{
+	.reg .pred 	%p<2>;
+	.reg .b32 	%r<12>;
+	.reg .f32 	%f<4>;
+	.reg .b64 	%rd<6>;
+	.shared .align 4 .f32 buf[128];
+
+	ld.param.u64 	%rd1, [x];
+	ld.param.u64 	%rd2, [y];
+	ld.param.u32 	%r1, [n];
+	mov.u32 	%r2, %tid.x;
+	mov.u32 	%r3, %ctaid.x;
+	mov.u32 	%r4, %cluster_ctarank;
+	mad.lo.s32 	%r5, %r3, 128, %r2;
+	setp.lt.u32 	%p1, %r5, %r1;
+	mul.wide.u32 	%rd3, %r5, 4;
+	add.s64 	%rd4, %rd1, %rd3;
+	add.s64 	%rd5, %rd2, %rd3;
+	mov.f32 	%f1, 0f00000000;
+	@%p1 ld.global.f32 	%f1, [%rd4];
+	mov.u32 	%r6, buf;
+	shl.b32 	%r7, %r2, 2;
+	add.s32 	%r8, %r6, %r7;
+	st.shared.f32 	[%r8], %f1;
+	barrier.cluster.arrive;
+	barrier.cluster.wait;
+	xor.b32 	%r9, %r4, 1;
+	mapa.shared::cluster.u32 	%r10, %r8, %r9;
+	ld.shared::cluster.f32 	%f2, [%r10];
+	cvt.rn.f32.u32 	%f3, %r4;
+	add.rn.f32 	%f2, %f2, %f3;
+	@%p1 st.global.f32 	[%rd5], %f2;
+	barrier.cluster.arrive;
+	barrier.cluster.wait;
+	ret;
+}

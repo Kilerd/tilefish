@@ -474,6 +474,48 @@ fn a_plan_has_views_whose_strides_and_offsets_are_products_of_sizes() {
     );
 }
 
+/// The plans of the launch shapes (`python/tests/launch_kernels.py`, a fresh export on sm_90 or newer): the two steps of `scratch_plan` have the
+/// workspace as their global scratch (sized for the largest bucket: 16 programs of 256 bytes), each bucket of `bucket_plan` names the binary of its
+/// configuration, and `persistent_plan` loaded over a manifest on a partition of 8 SMs (`Manifest::with_sm_partition`) gives Python's bytes too
+/// (`every_case_launched_and_replayed_is_pythons_bytes` runs every plan on the whole device, launched and captured).
+#[test]
+fn the_plans_of_launch_shapes_have_their_scratch_and_run_on_a_partition() {
+    let all = plans();
+    if !all.iter().any(|p| p["name"] == "scratch_plan") {
+        eprintln!("no launch shape in this gate (a committed fixture, or a device before sm_90)");
+        return;
+    }
+    let lp = load(&plan_named("scratch_plan"));
+    let ws = lp.buffers().iter().position(|b| b.name == "workspace").expect("a workspace");
+    assert_eq!(lp.buffers()[ws].bytes, 256 * 16);
+    for mb in [64u64, 1000] {
+        let bucket = lp.bucket(&[("Mb", mb)]).expect("the bucket");
+        assert!(bucket.steps.iter().all(|s| s.workspace.as_deref() == Some("workspace")), "Mb={mb}");
+    }
+    let lp = load(&plan_named("bucket_plan"));
+    for tb in [64u64, 4096] {
+        assert_eq!(lp.bucket(&[("TB", tb)]).unwrap().steps[0].entry, format!("rows_by_bucket.TB{tb}"));
+    }
+    let gpu = Gpu::new();
+    let plan = plan_named("persistent_plan");
+    let pin = Pin::Digest(plan["digest"].as_str().unwrap());
+    let base = LaunchPlan::load(gate_dir().join(plan["dir"].as_str().unwrap()), pin).unwrap();
+    let on = base.manifest().with_sm_partition(Some(8));
+    let lp = LaunchPlan::load_with_manifest(gate_dir().join(plan["dir"].as_str().unwrap()), &on, pin).unwrap();
+    let run = lp.instantiate_all(&gpu.stream).unwrap();
+    for case in plan["cases"].as_array().unwrap() {
+        let mut exts = upload(&gpu.stream, case);
+        run.launch(&gpu.stream, &mut args(&mut exts, false), &[]).unwrap();
+        gpu.stream.synchronize().unwrap();
+        for e in exts.iter().filter(|e| e.expect.is_some()) {
+            assert_eq!(gpu.stream.clone_dtoh(&e.slice).unwrap(), *e.expect.as_ref().unwrap(), "{}", case["id"]);
+        }
+    }
+    println!(
+        "rust plan gate: the scratch of a plan is its workspace, each bucket its configuration, and a persistent plan runs on a partition"
+    );
+}
+
 /// The outputs of a plan whose graph names them (`residual_chain`: `y` and `residual`) are given by those names or by `out0`, `out1` (the names
 /// of before), with the same bytes; both names of one output are refused as one external given twice.
 #[test]

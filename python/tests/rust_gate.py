@@ -89,6 +89,7 @@ storage after the run (unchanged). An ``out`` tensor that is legitimately all ze
 import argparse
 import dataclasses
 import json
+import math
 import pathlib
 import shutil
 import sys
@@ -534,6 +535,31 @@ def ws_ops():
     return wk.ops(torch.cuda.get_device_capability())
 
 
+def launch_ops():
+    """``{name: extern}``: the kernels of every launch shape (``launch_kernels.py``: a grid that multiplies, a persistent grid, a configuration per
+    bucket, thread-block clusters, a global scratch), on sm_90 or newer; ``persistent_pinned`` (declared for 30 SMs) only on a device of 30. Not in
+    the committed fixtures, so only a fresh export has them."""
+    if not tma_capable():
+        return {}
+    import launch_kernels as lk
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    return {name: op for name, op in lk.ops().items() if name != "persistent_pinned" or sms == 30}
+
+
+def args_flat(shape, seed):
+    return (randn(shape, F32, seed),)
+
+
+def must_be(fn):
+    """A check that the result is ``fn`` of the first argument, byte for byte (the kernels of ``launch_kernels.py`` compute torch's rounding)."""
+
+    def check(args, got):
+        assert same_bytes(got, fn(args[0]))
+
+    return check
+
+
 def must_be_scaled(args, got):
     import ws_kernels as wk
 
@@ -683,7 +709,35 @@ def build_cases():
     mm_sizes = ((128, 128, 64), (200, 136, 72), (64, 64, 512), (256, 384, 192))
     for key in ("tl_ws_matmul", "ws_matmul", "ws_matmul_wide"):
         cases += plain(key, key, args_tma_mm, mm_sizes, seeds=(0,), check=must_be_a_matmul)
+    # -- launch shapes (sm_90 and newer): a grid that multiplies two dimensions, a persistent grid (one program per SM), a configuration per bucket,
+    # thread-block clusters (a Triton kernel of two CTAs per program, a prebuilt PTX that reads its partner's shared memory), a global scratch
+    # (device-side TMA descriptors), each the bytes of torch's arithmetic
+    cases += plain("product_scale", "product_scale", args_flat, ((1, 1), (7, 300), (513, 515)), seeds=(0,), check=must_be(lambda x: x * 2 + 1))
+    cases += plain("persistent_scale", "persistent_scale", args_flat, ((1,), (30 * 1024 + 1,), (1 << 22,)), seeds=(0,), check=must_be(lambda x: x * 2 + 0.25))
+    cases += plain("persistent_pinned", "persistent_pinned", args_flat, ((1000,), (70000,)), seeds=(0,), check=must_be(lambda x: x * 2 + 0.25))
+    for rows in (64, 4096):
+        cases += plain("rows_by_bucket", f"rows_by_bucket.TB{rows}", args_flat, ((rows, 128),), seeds=(0, 1), check=must_be(lambda x: x - x.max(dim=1, keepdim=True).values))
+    cases += plain("cluster_scale", "cluster_scale", args_flat, ((1,), (1000,), (65537,)), seeds=(0,), check=must_be(lambda x: x * 2 + 1))
+    # (one element: block 0 reads block 1's shared memory, which holds no element of x, so y is a zero, rank 0 added)
+    cases += plain("cluster_swap", "cluster_swap", args_flat, ((1,),), seeds=(0,), check=must_be(swap_reference), may_be_zero=("y",))
+    cases += plain("cluster_swap", "cluster_swap", args_flat, ((200,), (1000,), (70000,)), seeds=(0,), check=must_be(swap_reference))
+    cases += plain("desc_scale", "desc_scale", args_flat, ((1, 64), (100, 64), (1000, 64)), seeds=(0,), check=must_be(lambda x: x * 2))
     return cases
+
+
+def swap_reference(x):
+    import launch_kernels as lk
+
+    return lk.swap_reference(x)
+
+
+def scratch_bytes(op, args):
+    """The global scratch a launch of ``op`` on ``args`` is given (``global_scratch`` per CTA of its grid of programs; 0 for a kernel without one), what
+    the Rust gate allocates for the case."""
+    from tilefish.runtime import _prepare, _target
+
+    prep = _prepare(_target(op), tuple(args), {})
+    return prep.spec.global_scratch * math.prod(prep.grid) * prep.spec.num_ctas
 
 
 OPTION_N, OPTION_K = 1024, 4096
@@ -936,6 +990,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(tanh_ops())
         declared.update(ws_ops())
         declared.update(conv_ops())
+        declared.update(launch_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -983,6 +1038,8 @@ def prepare(work, manifest_dir=None, pin=None):
         record = {"id": case.id, "launcher": rust._camel(case.stem), "stem": case.stem, "kind": case.kind, "tensors": entries}
         if case.given:
             record["given"] = case.given
+        if not library and getattr(op, "global_scratch", 0):  # the scratch tensor a launch of the case is given (the Rust test allocates it)
+            record["global_scratch"] = scratch_bytes(op, given)
         cases.append(record)
     if not cases:
         sys.exit(f"no case has a binary in the manifest for {arch}")
@@ -1165,6 +1222,29 @@ def plan_graphs():
         tma.append(("ws_chain", wk.ws_chain, False, ws_chain_cases))
         if wk.tcgen05(torch.cuda.get_device_capability()):
             tma.append(("ws_mm_chain", wk.ws_mm_chain, False, ws_mm_cases))
+        # launch shapes in steps: a grid that multiplies, a persistent grid, a configuration per bucket, clusters (a Triton step and a prebuilt
+        # one), and two steps whose global scratch is the plan's workspace
+        import launch_kernels as lk
+
+        def grid_cases():
+            return [(f"Rb{r}-Cb{c}", {"x": randn((r, c), F32, seed=130 + r + c)}) for r in (8, 33) for c in (32, 100)]
+
+        def flat_cases():
+            return [(f"Nb{n}-seed{seed}", {"x": randn((n,), F32, seed=140 + n % 97 + seed)}) for n in (1000, 70000) for seed in (0, 1)]
+
+        def bucket_cases():
+            return [(f"TB{t}-seed{seed}", {"x": randn((t, 128), F32, seed=150 + t + seed)}) for t in (64, 4096) for seed in (0, 1)]
+
+        def scratch_cases():
+            return [(f"Mb{m}-seed{seed}", {"x": randn((m, 64), F32, seed=160 + m + seed)}) for m in (64, 1000) for seed in (0, 1)]
+
+        tma += [
+            ("grid_plan", lk.grid_plan, False, grid_cases),
+            ("persistent_plan", lk.persistent_plan, False, flat_cases),
+            ("bucket_plan", lk.bucket_plan, False, bucket_cases),
+            ("cluster_plan", lk.cluster_plan, False, flat_cases),
+            ("scratch_plan", lk.scratch_plan, False, scratch_cases),
+        ]
 
     import gpu_kernels_p7 as p7
 
