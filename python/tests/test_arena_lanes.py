@@ -60,8 +60,13 @@ def test_each_arena_has_its_own_order_event_and_its_own_carried_buffers():
         second.run(k.stage_b)  # lane1's h was never written: the carried buffers are the arena's
     second.run(k.stage_a, x_of(24))
     assert first.run(k.stage_b).shape == (8, 64) and second.run(k.stage_b).shape == (24, 64)
-    waits = [e for e in be.log if e[0] == "wait"]
-    assert len({w[1] for w in waits}) == 2  # two order events: an execution on lane0 never waits for one on lane1
+    records = [e for e in be.log if e[0] == "record"]
+    assert len({r[1] for r in records}) == 2  # two order events: an execution on lane0 never waits for one on lane1
+    assert not [e for e in be.log if e[0] == "wait"]  # all on one stream: each event's last record is on it, so no run waits (section 9)
+    be.current, before = be.current + 1, len(be.log)  # on another stream, each run waits for its own arena's event only
+    first.run(k.stage_b), second.run(k.stage_b)
+    waits = [e for e in be.log[before:] if e[0] == "wait"]
+    assert [w[1] for w in waits] == [first.arena_of(0).event.name, second.arena_of(0).event.name]
 
 
 def test_a_name_is_a_non_empty_string():
