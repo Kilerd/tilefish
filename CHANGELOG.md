@@ -4,6 +4,12 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+- The crate no longer turns on serde_json's `preserve_order` for the whole host process, and reads the same with or without it: the
+  order of an entry's `buckets` and `dims` and of a plan's `dims` comes from the file; `tilefish::json::parse_strict` returns every
+  object in code point order.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

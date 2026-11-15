@@ -164,5 +164,11 @@ cudarc = { version = "0.19.10", default-features = false, features = ["driver", 
 tilefish = { version = "0.0.4", default-features = false, features = ["cuda-13000"] }
 ```
 
+The crate turns on no feature of serde_json, so it does not change the key order
+of the host's own JSON (cargo would turn `preserve_order` on for the whole
+build). A host that turns it on itself gets the same reading of a manifest or a
+plan: where the order of an object's keys means something (the buckets of an
+entry make its stem in their order), the crate takes it from the file.
+
 Licensed under either of Apache License, Version 2.0 or MIT license at your
 option.
