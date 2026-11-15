@@ -1034,7 +1034,6 @@ class PlanRunner:
             sources[p.name] = v
         if not carried:
             call = bind_call(graph.name, sig, bound.args, bound.kwargs)
-            index = self._device_index(call, sources)
         else:  # the tensors of the other parameters, then the dimensions from them and from the carried buffers the plan reads (their shapes)
             call, equations = self._bind_given(bound.arguments)
             index = self._device_index(call, sources)
@@ -1060,6 +1059,8 @@ class PlanRunner:
                     arg=n,
                 )
             values[n] = by_name[n]
+        if not carried:  # (with carried buffers the device was found first: their shapes are the arena's on that device)
+            index = self._device_index(call, sources)
         arch = self.plan.arch
         if arch is not None and arch != f"sm_{be.capability(index)}":
             raise TilefishRuntimeError(f"the plan of graph '{graph.name}' was built for {arch}, but device {index} is sm_{be.capability(index)}")
