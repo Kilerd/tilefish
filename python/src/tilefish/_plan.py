@@ -1147,8 +1147,9 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
                     v = _eval(v, mapping, name, f"{s.what}: the value of '{k}'")
                 values[s.callee.names.get(k, k)] = v
             where = f"graph '{name}' at {combo or 'its only size'}, {s.what}"
-            # every implementation of an extern declared with by_arch= binds the step (the plan is for any architecture), to the same entry
-            bounds = [resolve_step(c, args_doc, shapes, where, values) for c in s.callee.variants()]
+            # every implementation of an extern declared with by_arch= binds the step (the plan is for any architecture), to the same entry, with
+            # its own ABI and preconditions (a TMA descriptor's 16-byte strides, say): a plan relies on no architecture
+            bounds = [resolve_step(c, args_doc, shapes, _variant_where(where, s.callee, c), values) for c in s.callee.variants()]
             bound = bounds[0]
             if any(b.stem != bound.stem or b.given != bound.given for b in bounds[1:]):  # pragma: no cover - the declaration holds them to one ABI
                 raise TilefishPlanError(f"{where}: the implementations of '{s.callee.name}' bind the step to {sorted({b.stem for b in bounds})}")
@@ -1282,6 +1283,13 @@ def _check_requirement(graph: str, req: "Requirement | BucketRequirement", mappi
         raise TilefishPlanError(f"graph '{graph}': at {dict(combo)} {req}: it is {value}")
 
 
+def _variant_where(where: str, callee: Callee, variant: Callee) -> str:
+    """Where a step is resolved, for messages: with the implementation of an extern declared with ``by_arch=`` that is being bound."""
+    if callee.implementations is None or variant.extern is None:
+        return where
+    return f"{where}, its implementation '{variant.extern.implementation}' (a plan is for every architecture)"
+
+
 def _check_resolves(p: Plan) -> None:
     """Resolve every step of the finished document again, the way a runner does (from the document alone): what a runner will bind is what the plan found."""
     doc = p._doc
@@ -1290,8 +1298,10 @@ def _check_resolves(p: Plan) -> None:
         for i, st in enumerate(b["steps"]):
             if st["kind"] == "copy":  # no binary: copy_problem held it to its rules when it was made
                 continue
-            for callee in p._callees[st["entry"]].variants():
-                bound = resolve_step(callee, st["args"], shapes, f"graph '{doc['graph']}' at {b['values'] or 'its only size'}, step #{i}", st.get("given"))
+            outer = p._callees[st["entry"]]
+            for callee in outer.variants():
+                where = _variant_where(f"graph '{doc['graph']}' at {b['values'] or 'its only size'}, step #{i}", outer, callee)
+                bound = resolve_step(callee, st["args"], shapes, where, st.get("given"))
                 if bound.stem != st["entry"]:  # pragma: no cover - the entry was taken from this very resolution
                     raise TilefishPlanError(f"step #{i} of graph '{doc['graph']}' resolves to '{bound.stem}', not '{st['entry']}'")
 

@@ -104,13 +104,41 @@ def parse_arch(arch: "int | str") -> int:
 
 
 def check_implementation_arch(spec: "CompileSpec", cap: int) -> None:
-    """The spec of the implementation an op declared with ``by_arch=`` declares for one architecture is built for that architecture only (a
-    fallback for any): a manifest entry's ``implementation`` is its ``arch`` or ``"fallback"``, which both readers hold it to."""
-    if spec.implementation is not None and spec.implementation not in (f"sm_{cap}", IMPLEMENTATION_FALLBACK):
+    """The spec of one implementation of an op declared with ``by_arch=`` is built only for an architecture the declaration runs it on: the one it
+    is declared for, the architectures a named implementation is declared for, any architecture the map does not name for the fallback. A spec that
+    was generated or verified against its declaration knows which (``CompileSpec._selection``); one that was not is held to what the readers can
+    tell: the implementation declared for an architecture is built for that one (a manifest entry's ``implementation`` is its ``arch``,
+    ``"fallback"`` or a name)."""
+    key = spec.implementation
+    if key is None:
+        return
+    arch = f"sm_{cap}"
+    selection = spec._selection
+    if selection is None:
+        if key not in (arch, IMPLEMENTATION_FALLBACK) and re.fullmatch(r"sm_[0-9]{2,3}", key) is not None:
+            raise TilefishBuildError(
+                f"'{spec.stem}' is the implementation declared for {key}, not for {arch}: build the implementation of {arch} (compile_specs(op, arch={cap}))"
+            )
+        return
+    pairs, fallback_key = selection
+    by_arch = dict(pairs)
+    runs = by_arch.get(arch, fallback_key)
+    if runs == key:
+        return
+    if key == IMPLEMENTATION_FALLBACK or (key == fallback_key and key not in by_arch.values()):
+        what = "the fallback" if key == IMPLEMENTATION_FALLBACK else f"the fallback '{key}'"
         raise TilefishBuildError(
-            f"'{spec.stem}' is the implementation declared for {spec.implementation}, not for sm_{cap}: build the implementation of sm_{cap} "
-            f"(compile_specs(op, arch={cap}))"
+            f"'{spec.stem}' is {what}, which the declaration does not run on {arch}: it runs "
+            + (f"its implementation '{runs}' there" if runs is not None else "nothing there")
+            + f"; build the implementation of {arch} (compile_specs(op, arch={cap}))"
         )
+    declared = sorted(a for a, k in by_arch.items() if k == key)
+    what = f"declared for {key}" if declared == [key] else f"'{key}' (declared for {', '.join(declared)}" + (", and the fallback)" if key == fallback_key else ")")
+    raise TilefishBuildError(
+        f"'{spec.stem}' is the implementation {what}, not for {arch}"
+        + (f" (the declaration runs its implementation '{runs}' there)" if runs is not None and runs != arch else "")
+        + f": build the implementation of {arch} (compile_specs(op, arch={cap}))"
+    )
 
 
 def _import_triton() -> Any:

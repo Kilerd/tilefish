@@ -32,7 +32,7 @@ import subprocess
 import tempfile
 from typing import TYPE_CHECKING
 
-from ._build import BINARY_DIGEST_KIND, BuiltKernel, LaunchAttributes, _ptxas_version, parse_arch, ptx_type_of
+from ._build import BINARY_DIGEST_KIND, BuiltKernel, LaunchAttributes, _ptxas_version, check_implementation_arch, parse_arch, ptx_type_of
 from ._elf import code_digest, parse_elf
 from .errors import TilefishBuildError
 
@@ -154,6 +154,7 @@ def build_binary(spec: "CompileSpec", target: "BinaryTarget", *, arch: "int | st
         raise TilefishBuildError(f"'{spec.stem}' is not a prebuilt binary")
     cap = parse_arch(arch)
     arch_name = f"sm_{cap}"
+    check_implementation_arch(spec, cap)  # one implementation of an op declared with by_arch=: an architecture that runs it
     if target.digests != spec.binary["digests"] or target.symbol != spec.binary["symbol"] or target.kind != spec.binary["kind"]:
         raise TilefishBuildError(
             f"the declaration passed to build is not the one the compile spec '{spec.stem}' was made from: its {target.kind} has "

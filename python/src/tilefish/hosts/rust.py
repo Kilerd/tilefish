@@ -82,7 +82,7 @@ from .._library import IMPLS as LIBRARY_IMPLS
 from .._conv import conv_specs
 from .._library import library_specs, validate_entry as validate_library_entry
 from .._manifest import Manifest
-from .._specvalid import parse_expression, parse_grid
+from .._specvalid import is_implementation_name, parse_expression, parse_grid
 from ..decorators import LibraryOp
 from ..dtypes import ALL_DTYPES
 from ..errors import TilefishManifestError, TilefishRuntimeError, TilefishSpecError
@@ -110,8 +110,11 @@ _SHARED_FIELDS = (
     "source_sha256",
 )
 # what the implementations of one op declared with by_arch= may differ in (each binary of the stem says which implementation it is): how the kernel
-# is compiled and launched, not its ABI
-_IMPLEMENTATION_FIELDS = ("grid", "block", "num_warps", "num_stages", "constexprs", "options", "declaration_digest")
+# is compiled and launched, and its ABI, so its kind, the dimensions it names and its preconditions; they share what a launcher is typed from, the
+# public part of the ABI (_public_abi) and the constraints of the dimensions of their tensors and buckets (_public_dims), which are compared instead
+_IMPLEMENTATION_FIELDS = (
+    "grid", "block", "num_warps", "num_stages", "constexprs", "options", "declaration_digest", "kind", "abi", "dims", "preconditions", "source_sha256",
+)  # fmt: skip
 
 # what the library entries of one stem must agree on: everything but the device (its architecture and SM count, and the declaration digest, which
 # covers the SM count) and what the pin chose on it
@@ -530,8 +533,9 @@ def _validate_entry(entry: Any) -> None:
         _bad(who, f"a {kind} kernel has {slots} scratch slots, but abi.scratch_slots is {abi.get('scratch_slots')!r} and abi.scratch has {scratch!r}")
     if kind == "binary":
         _validate_binary_section(who, entry)
-    if "implementation" in entry and (kind != "triton" or entry["implementation"] not in (arch, "fallback")):
-        _bad(who, f"implementation must be the entry's architecture '{arch}' or 'fallback', on a triton entry, got {entry['implementation']!r}")
+    chosen = entry.get("implementation")
+    if "implementation" in entry and not (chosen == arch or chosen == "fallback" or is_implementation_name(chosen)):
+        _bad(who, f"implementation must be the entry's architecture '{arch}', 'fallback' or the name of an implementation, got {chosen!r}")
     params = _field(who, "abi.params", abi, "params", list)
     names: "set[str]" = set()
     for i, p in enumerate(params):
@@ -625,6 +629,29 @@ def _validate_library_entry(entry: Any) -> None:
     _validate_dims(who, entry)
 
 
+def _public_abi(entry: "dict[str, Any]") -> "dict[str, Any]":
+    """What a launcher is typed from of an entry's ABI: its tensors in order (name, access, dtype, declared shape, whether a view is accepted, the
+    input an out pointer may be written over), however each is passed (a pointer or a TMA descriptor), and its fixed arguments per call."""
+    params = entry["abi"]["params"]
+    tensors = [
+        {"name": p["name"], "access": p["access"], "dtype": p["dtype"], "shape": p["shape"], "view": "strides" in p, "alias": p.get("alias")}
+        for p in params
+        if p["kind"] in ("pointer", "tensordesc")
+    ]
+    return {"tensors": tensors, "given": [{"name": p["name"], "type": p["type"]} for p in params if p["kind"] == "given"]}
+
+
+def _public_dims(entry: "dict[str, Any]") -> "dict[str, Any]":
+    """The constraints of the dimensions an entry's tensor shapes and buckets name (what a call is held to whichever implementation runs)."""
+    names = set(entry["buckets"])
+    for p in entry["abi"]["params"]:
+        if p["kind"] in ("pointer", "tensordesc"):
+            for d in p["shape"]:
+                if isinstance(d, str):
+                    names |= parse_expression(d, "a dimension")
+    return {n: entry["dims"].get(n) for n in sorted(names)}
+
+
 def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
     for artifact in manifest.artifacts:
         _validate_entry(artifact.entry)
@@ -643,7 +670,8 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
     for stem in sorted(by_stem):
         entries = sorted(by_stem[stem], key=lambda e: e["arch"])
         first = entries[0]
-        # the binaries of the implementations of an op declared with by_arch= share the ABI, and may be compiled and launched differently
+        # the binaries of the implementations of an op declared with by_arch= share the public part of the ABI (the tensors, the fixed arguments per
+        # call) and the constraints of their dimensions, and each has an ABI of its own and is compiled and launched as it is
         per_arch = all("implementation" in e for e in entries)
         shared = [k for k in _SHARED_FIELDS if not (per_arch and k in _IMPLEMENTATION_FIELDS)]
         for other in entries[1:]:
@@ -653,6 +681,14 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
                         f"the binaries of '{stem}' for {first['arch']} and {other['arch']} disagree about '{key}': a launcher is "
                         "typed from one signature, and the binaries of a stem must share it"
                     )
+            if per_arch:
+                for key, a, b in (("the tensors and the fixed arguments per call", _public_abi(first), _public_abi(other)),
+                                  ("the dimensions of the tensors and the buckets", _public_dims(first), _public_dims(other))):  # fmt: skip
+                    if a != b:
+                        raise TilefishManifestError(
+                            f"the binaries of '{stem}' for {first['arch']} and {other['arch']} disagree about {key}: a launcher is typed from one "
+                            "signature, and the implementations of an operator declared with by_arch= share it (each has its own ABI otherwise)"
+                        )
         binary = _Binary(stem, first, [e["arch"] for e in entries], struct=_camel(stem), entries=entries)
         binary.params = [p for p in first["abi"]["params"] if p["kind"] in ("pointer", "tensordesc")]  # every tensor: a pointer or a descriptor's
         binary.scalars = [p for p in first["abi"]["params"] if p["kind"] == "scalar"]
@@ -806,7 +842,130 @@ def _constexprs_text(e: "dict[str, Any]") -> str:
     return ", ".join(f"`{c['name']}` = {_scalar_text(c['value'])}" + (f" ({c['dtype']})" if "dtype" in c else "") for c in e["constexprs"])
 
 
+def _own_abi(entry: "dict[str, Any]") -> "tuple[Any, ...]":
+    """What an implementation of an operator declared with by_arch= has of its own besides how it is compiled: its kind, ABI, dimensions and
+    preconditions (a prebuilt binary: its source too)."""
+    return (entry["kind"], entry["abi"], entry["dims"], entry["preconditions"], entry.get("binary"), entry.get("source_digest") if entry["kind"] == "binary" else None)
+
+
+def _abis_per_arch(binary: _Binary) -> bool:
+    """Whether the docs say each architecture's ABI: the implementations of an operator declared with by_arch= whose ABIs differ, or one of which is a
+    prebuilt binary (its source is its own)."""
+    if "implementation" not in binary.entry:
+        return False
+    return any(_own_abi(x) != _own_abi(binary.entry) or x["kind"] == "binary" for x in binary.entries)
+
+
+def _abi_lines(binary: _Binary, x: "dict[str, Any]") -> "list[str]":
+    """The docs of the implementation of one architecture, ABI included."""
+    if x["kind"] == "binary":
+        source = "PTX that ptxas assembled" if x["binary"]["source"] == "ptx" else "a cubin used as it is"
+        what = f"a prebuilt binary ({source}, sha256 {x['source_digest']}), launched with exactly its parameters"
+    else:
+        what = "a Triton kernel"
+    text = f"- {x['arch']}: the implementation `{x['implementation']}`, {what}; grid `{x['grid']}`, block {_block_text(x['block'])}{_warps_text(x)}, "
+    text += f"{x['shared']} bytes of dynamic shared memory"
+    if x["constexprs"]:
+        text += "; compiled in: " + _constexprs_text(x)
+    params = x["abi"]["params"]
+    descriptors = [p for p in params if p["kind"] == "tensordesc"]
+    if descriptors:
+        text += "; passed as TMA descriptors: " + ", ".join(
+            f"`{binary.arg_names[p['name']]}` (box `[{_shape_text(p['tensor_map']['box'])}]`, "
+            f"{p['tensor_map']['swizzle'].removeprefix('CU_TENSOR_MAP_')})"
+            for p in descriptors
+        )
+    scalars = []
+    for s in (p for p in params if p["kind"] == "scalar"):
+        if "count_of" in s:
+            how = f"the element count of `{binary.arg_names[s['count_of']]}`"
+        elif "stride_of" in s:
+            how = _stride_text(s["stride_of"], binary.arg_names)
+        else:
+            how = f"`{s['dim']}`"
+        scalars.append(f"`{s['name']}` ({s['type']}) is {how}")
+    if scalars:
+        text += "; runtime scalars, derived by `launch`: " + ", ".join(scalars)
+    fixed = [f"`{f['name']}` = {_scalar_text(f['value'])} ({f['type']})" for f in params if f["kind"] == "fixed"]
+    if fixed:
+        text += "; fixed arguments: " + ", ".join(fixed)
+    strided = [p for p in params if p["kind"] in ("pointer", "tensordesc") and "strides" in p]
+    if strided:
+        aligns = {pre["arg"]: pre["bytes"] for pre in x["preconditions"] if pre["kind"] == "pointer_alignment"}
+        text += "; its views: " + ", ".join(
+            f"`{binary.arg_names[p['name']]}` (strides `[{_shape_text(p['strides'])}]`, {aligns.get(p['name'], 16)}-byte aligned)" for p in strided
+        )
+    return _wrap(text + ".")
+
+
+def _doc_by_arch(binary: _Binary) -> "list[str]":
+    """The docs of a stem whose implementations (an operator declared with by_arch=) have ABIs of their own: one signature, and each architecture's
+    implementation with its ABI."""
+    e = binary.entry
+    lines: "list[str]" = []
+    if binary.signature:
+        lines += [f"`{binary.signature}`", ""]
+    lines.append(f"The binary `{binary.stem}` of operator `{e['op']}`, built for {', '.join(binary.archs)}.")
+    lines.append("")
+    lines.append("Tensors, in the order of `launch`:")
+    for p in binary.params:
+        shared = _pointer_line(binary, {k: v for k, v in p.items() if k not in ("kind", "tensor_map", "strides")})  # (each its own strides)
+        lines.append(shared + (", a strided view" if "strides" in p else ""))
+    if any("strides" in p for p in binary.params):
+        lines.append("")
+        lines += _wrap(
+            "A strided tensor is a view: make it with `TensorRef::from_cuda_strided` or `TensorRef::new_strided` (its element strides, and the "
+            "element offset of its first element); a dense tensor is accepted too. The strides are not arguments of `launch`: the binary of each "
+            "architecture takes them as its ABI says (in stride scalars, or in a TMA descriptor), and `launch` refuses a view that it cannot take."
+        )
+    if any(not p["shape"] for p in binary.params):
+        lines.append("")
+        lines += _wrap(
+            "A device scalar is a `TensorRef` over one element (made with the shape `&[]` or `&[1]`), 16-byte aligned: the kernel reads its value "
+            "when it runs, so the value may be written after the launch is enqueued."
+        )
+    if any(p["kind"] == "tensordesc" for x in binary.entries for p in x["abi"]["params"]):
+        lines.append("")
+        lines += _wrap(
+            "A tensor passed as a TMA descriptor is given like any tensor: `launch` encodes its `CUtensorMap` (`cuTensorMapEncodeTiled`) from its "
+            "address, shape and strides, and refuses an address that is not 16-byte aligned and a stride that is not a multiple of 16 bytes."
+        )
+    sizes = [f"axis {i} of `{binary.arg_names[p['name']]}` is {d}" for p in binary.params for i, d in enumerate(p["shape"]) if isinstance(d, int)]
+    if sizes:
+        lines += ["", "Baked into the binary: " + "; ".join(sizes) + "."]
+    dims = _public_dims(e)
+    constraints = []
+    for name, c in dims.items():
+        if c is not None and "bucket" in c:
+            constraints.append(f"`{name}` is exactly {c['bucket']} (a bucket of {c['buckets']}; there is no padding, and the other buckets are other structs)")
+        elif c is not None and "divisible_by" in c:
+            constraints.append(f"`{name}` is a multiple of {c['divisible_by']}")
+    if dims:
+        lines.append("")
+        lines.append("`launch` binds the dimensions from the sizes of the tensors and refuses a call where they disagree.")
+        if constraints:
+            lines.append("Constraints: " + "; ".join(constraints) + ".")
+    if binary.given:
+        lines.append("")
+        lines += _wrap(
+            "Fixed arguments given per call (parameters of `launch`, after the tensors: one binary serves every value): "
+            + ", ".join(f"`{binary.arg_names[g['name']]}` ({g['type']})" for g in binary.given)
+            + "."
+        )
+    lines.append("")
+    lines += _wrap(
+        "An implementation per architecture (an operator declared with `by_arch=`): one signature (the tensors, and the fixed arguments per call), "
+        "and on each architecture its own kernel or prebuilt binary and its own ABI (how it takes each tensor, its scalars and preconditions), "
+        "which its manifest entry says and `launch` follows; `load` takes the one of the device's architecture."
+    )
+    for x in binary.entries:
+        lines += _abi_lines(binary, x)
+    return lines
+
+
 def _doc(binary: _Binary) -> "list[str]":
+    if _abis_per_arch(binary):
+        return _doc_by_arch(binary)
     e = binary.entry
     lines: "list[str]" = []
     if binary.signature:

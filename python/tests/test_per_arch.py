@@ -175,7 +175,7 @@ def test_every_implementation_has_the_same_binaries_and_abi():
         declare(fallback=narrow(grid=lambda R: (0,)))
     # the same binaries, but what a host checks of a dimension differs: another ABI
     Rb16 = Dim("Rb", buckets=[64, 128], divisible_by=16)
-    with pytest.raises(TilefishDeclarationError, match=r"the implementations for sm_103 and sm_120 are not launched the same way: 'row_sum.Rb64' differs at dims"):
+    with pytest.raises(TilefishDeclarationError, match=r"the implementations for sm_103 and sm_120 do not have the same buckets: 'row_sum.Rb64' differs at dims"):
         declare(by_arch={"sm_103": wide(consts={"ROWS": Rb}), "sm_120": narrow(consts={"ROWS": Rb16})})
     # a const that depends on a bucketed dimension in every implementation: the same binaries
     op = declare(by_arch={"sm_103": wide(consts={"ROWS": Rb}), "sm_120": narrow(consts={"ROWS": Rb})})
@@ -432,13 +432,24 @@ def edit_entry(path, change):
     path.write_text(json.dumps(doc))
 
 
-@pytest.mark.parametrize("value", ["sm_120", "sm_90", "fallback2", "", 103, True, ["sm_103"]])
+@pytest.mark.parametrize(
+    "value", ["sm_120", "sm_90", "SM_103", "sm_1x", "Fallback", "FALLBACK", "", "a-b", "2fast", "x" * 65, "té", 103, True, ["sm_103"]]
+)
 def test_the_reader_refuses_an_implementation_that_is_not_the_entrys(world, tmp_path, value):
     out = tmp_path / "build"
     runtime.export(declare(), out, arch=103)
     edit_entry(out / "manifest.json", lambda e: e.__setitem__("implementation", value))
-    with pytest.raises(TilefishManifestError, match=r"implementation must be the entry's architecture 'sm_103' or 'fallback'"):
+    with pytest.raises(TilefishManifestError, match=r"implementation must be the entry's architecture 'sm_103', 'fallback' or the name of an implementation"):
         Manifest.load(out)
+
+
+@pytest.mark.parametrize("value", ["tcgen05", "fallback2", "_", "x" * 64, "smem_ring", "sm_", "sm_x1"])
+def test_the_reader_takes_the_name_of_an_implementation(world, tmp_path, value):
+    """The reader cannot know the declaration's map, so it takes any name of the form (a replay compares it with the implementation it runs)."""
+    out = tmp_path / "build"
+    runtime.export(declare(), out, arch=103)
+    edit_entry(out / "manifest.json", lambda e: e.__setitem__("implementation", value))
+    assert Manifest.load(out).get("row_sum", "sm_103").entry["implementation"] == value
 
 
 def test_the_reader_takes_null_as_absent_and_fallback_on_any_architecture(world, tmp_path):

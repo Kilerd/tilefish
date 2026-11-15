@@ -80,9 +80,12 @@ refuses other bytes, shares one cuDNN handle per CUDA context between all
 its convolutions, and opens libcudnn only for a manifest that has a
 convolution. The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
-which one it is (`Entry::implementation`: its own architecture, or
-`"fallback"`); the crate launches the entry of the device's architecture, as
-for any operator. A parameter that is a TMA descriptor of a tensor (manifest
+which one it is (`Entry::implementation`: its own architecture, `"fallback"`,
+or the name of an implementation that several architectures share; a Triton
+kernel or a prebuilt binary); the crate launches the entry of the device's
+architecture with that entry's own ABI (the entries of one operator on other
+architectures may pass a tensor as a TMA descriptor instead of a pointer, or
+take other scalars), as for any operator. A parameter that is a TMA descriptor of a tensor (manifest
 kind `tensordesc`, `ParamKind::Pointer` with a `tensor_map`) is given its
 tensor like a pointer: every launch (and every step of a plan, at every
 execution) checks what the driver would refuse (`PreconditionKind::TensorMap`)

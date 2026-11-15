@@ -438,6 +438,30 @@ its declaration digest and its compile specs, and its manifest entries record it
 implementation, or of one that changed (its kernel, options, constants or grid), is refused as stale; another architecture's implementation changing
 leaves this architecture's manifest valid. The Rust crate reads the field (`Entry::implementation`) and launches the entry of its device's architecture.
 
+An implementation can be shared, be a prebuilt binary, and have an ABI of its own:
+
+```python
+def row_sum_tma(x: TensorDesc(Tensor[R, 1024, f32], block=(64, 1024)), y: Out[Tensor[R, f32]], BLOCK_R: const = 64): ...
+
+@tilefish.extern(
+    by_arch={
+        "sm_100": tilefish.impl(triton=my_kernels.row_sum_tma, stub=row_sum_tma, grid=lambda R: (tilefish.cdiv(R, 64),), name="tma"),
+        "sm_103": tilefish.impl(triton=my_kernels.row_sum_tma, stub=row_sum_tma, grid=lambda R: (tilefish.cdiv(R, 64),), name="tma"),
+        "sm_120": tilefish.impl(ptx="row_sum_sm120.ptx", symbol="row_sum", block=(256,)),   # the op's stub is its C ABI
+    },
+    grid=lambda R: (R,),
+)
+def row_sum(x: Tensor[R, 1024, f32], y: Out[Tensor[R, f32]], n_rows: R): ...
+```
+
+`name="tma"` makes one implementation of every architecture mapped to it: one key (`"implementation": "tma"`), one declaration digest, one set of compile
+specs (without a name each architecture has its own, as before). `ptx=` / `cubin=` with `symbol=` and `block=` is a prebuilt binary; a cubin implementation
+needs a cubin for every architecture that runs it. `stub=` lists the kernel's own parameters, so one implementation takes a tensor as a TMA descriptor
+where another takes a pointer, with other scalars, constexprs or fixed arguments. What every implementation must share is the op's public signature: its
+tensors (names, order, access, dtype, shape, `Strided` or not), its fixed arguments per call and its buckets, which is what a caller, a plan step and a typed
+Rust launcher bind. Each manifest entry carries its implementation's ABI, and a plan is checked against every implementation, so it never relies on an
+architecture.
+
 **TMA descriptors.** A Hopper or Blackwell kernel in Triton or Gluon gets its best speed from the Tensor Memory Accelerator, which takes a *tensor
 descriptor*: a 128-byte `CUtensorMap` that the host encodes (`cuTensorMapEncodeTiled`) and passes by value. A parameter declared `TensorDesc(...)` is one:
 

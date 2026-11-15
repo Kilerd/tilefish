@@ -51,8 +51,11 @@ const NUM_WARPS: [u32; 6] = [1, 2, 4, 8, 16, 32];
 const MAX_WARPS: u32 = 32;
 const MAX_STAGES: u32 = 16;
 /// The `implementation` of an entry built from the fallback of an operator declared with an implementation per architecture (the
-/// implementation declared for an architecture is named by that architecture). Python's `IMPLEMENTATION_FALLBACK`.
+/// implementation declared for an architecture is named by that architecture, a named implementation by its name). Python's
+/// `IMPLEMENTATION_FALLBACK`.
 pub const IMPLEMENTATION_FALLBACK: &str = "fallback";
+/// The most characters the name of a named implementation has (Python's `_specvalid._IMPLEMENTATION_NAME`).
+const MAX_IMPLEMENTATION_NAME: usize = 64;
 /// The `source_digest_kind` of a prebuilt binary: its `source_digest` is the sha256 of the PTX or cubin file.
 const BINARY_DIGEST_KIND: &str = "tilefish.binary.v1";
 
@@ -621,8 +624,10 @@ pub struct Entry {
     /// The sha256 of the declaration the binary was built from.
     pub declaration_digest: String,
     /// Which implementation of an operator declared with an implementation per architecture (`@tilefish.extern(by_arch=...)`) the binary is:
-    /// the entry's own architecture (`"sm_103"`, the one declared for it) or `"fallback"`. `None` for every other operator. It is in the
-    /// declaration digest; a host launches the entry of its device's architecture, so it needs nothing else from it.
+    /// the entry's own architecture (`"sm_103"`, the one declared for it), `"fallback"`, or the name of a named implementation that several
+    /// architectures may share (`"tcgen05"`: an identifier that is not `"fallback"` and does not begin with `sm_` and a digit). `None` for every
+    /// other operator. It is in the declaration digest; a host launches the entry of its device's architecture, with that entry's own ABI, so it
+    /// needs nothing else from it. A Triton entry or a prebuilt binary may have one.
     pub implementation: Option<String>,
     /// The sha256 of the cubin file.
     pub sha256: String,
@@ -958,6 +963,18 @@ pub(crate) fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The name of a named implementation (`tilefish.impl(..., name="tcgen05")`): an identifier of at most 64 characters that is not
+/// `"fallback"` and does not look like an architecture (it does not begin with `sm_` and a digit), in any case. Python's
+/// `_specvalid.is_implementation_name`.
+pub(crate) fn is_implementation_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    let looks_like_arch = b.len() > 3 && b[..3].eq_ignore_ascii_case(b"sm_") && b[3].is_ascii_digit();
+    is_ident(s)
+        && s.len() <= MAX_IMPLEMENTATION_NAME
+        && !s.eq_ignore_ascii_case(IMPLEMENTATION_FALLBACK)
+        && !looks_like_arch
 }
 
 pub(crate) fn is_stem(s: &str) -> bool {
@@ -1839,11 +1856,14 @@ impl Entry {
             return Err("source_digest and source_digest_kind come together".to_owned());
         }
         if let Some(chosen) = &raw.implementation
-            && (kind != EntryKind::Triton || (chosen != &raw.arch && chosen != IMPLEMENTATION_FALLBACK))
+            && chosen != &raw.arch
+            && chosen != IMPLEMENTATION_FALLBACK
+            && !is_implementation_name(chosen)
         {
             return Err(format!(
-                "implementation must be the entry's architecture {:?} or {IMPLEMENTATION_FALLBACK:?} (the implementation of an operator declared \
-                 with by_arch= that it is), on a triton entry, got {chosen:?}",
+                "implementation must be the entry's architecture {:?}, {IMPLEMENTATION_FALLBACK:?} or the name of an implementation (an identifier \
+                 of at most {MAX_IMPLEMENTATION_NAME} characters that is not \"fallback\" and does not begin with sm_ and a digit) of an operator \
+                 declared with by_arch=, got {chosen:?}",
                 raw.arch
             ));
         }

@@ -66,7 +66,7 @@ from ._build import (
 )
 from ._ir import LANGUAGE_OF_KIND, digest_kind
 from ._elf import code_digest, parse_elf, sm_of, uses_shared
-from ._specvalid import IMPLEMENTATION_FALLBACK, parse_expression, parse_grid
+from ._specvalid import IMPLEMENTATION_FALLBACK, is_implementation_name, parse_expression, parse_grid
 from .dtypes import ALL_DTYPES
 from .errors import TilefishBuildError, TilefishManifestError, TilefishSpecError
 
@@ -738,13 +738,15 @@ class Manifest:
             value = entry.get(field)
             if value is not None and not (isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)):
                 raise TilefishManifestError(f"'{stem}' ({arch}): {field} must be 64 lowercase hex digits (a sha256), got {value!r}")
-        # which implementation of an op declared with by_arch= the binary is, as the Rust reader reads it: the entry's own architecture or
-        # "fallback", on a Triton entry only (a JSON null is as absent)
+        # which implementation of an op declared with by_arch= the binary is, as the Rust reader reads it: the entry's own architecture,
+        # "fallback" or the name of a named implementation, on a Triton or a prebuilt entry (a JSON null is as absent). Which architectures a
+        # name is declared for is the declaration's to say (a replay compares the entry's with the implementation it runs there)
         chosen = entry.get("implementation")
-        if chosen is not None and (entry_kind != ENTRY_KIND_TRITON or chosen not in (arch, IMPLEMENTATION_FALLBACK)):
+        if chosen is not None and not (chosen == arch or chosen == IMPLEMENTATION_FALLBACK or is_implementation_name(chosen)):
             raise TilefishManifestError(
-                f"'{stem}' ({arch}): implementation must be the entry's architecture '{arch}' or '{IMPLEMENTATION_FALLBACK}' (the implementation of an "
-                f"op declared with by_arch= that it is), on a {ENTRY_KIND_TRITON} entry, got {chosen!r}"
+                f"'{stem}' ({arch}): implementation must be the entry's architecture '{arch}', '{IMPLEMENTATION_FALLBACK}' or the name of an "
+                "implementation (an identifier of at most 64 characters that is not 'fallback' and does not begin with sm_ and a digit) of an op "
+                f"declared with by_arch=, got {chosen!r}"
             )
         kind = entry.get("source_digest_kind")
         if kind is not None and not isinstance(kind, str):

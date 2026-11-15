@@ -40,6 +40,31 @@ each section names the release that added it.
 - Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`null` parameters, an element-aligned dense pointer); manifests without them load and digest as
   before. The crate's `ParamKind` gained the variant `Null`.
 
+### Implementations per architecture (manifest schema 3, section 4.1)
+
+- **Named implementations.** `tilefish.impl(..., name="tcgen05")` is one implementation of every architecture `by_arch=` maps to it (and of the
+  fallback, which may be named too): its key is its name, so those architectures share one declaration digest and one set of compile specs, and
+  their manifest entries say `"implementation": "tcgen05"`. A name is an ASCII identifier of at most 64 characters that is not `fallback` and does
+  not begin with `sm_` and a digit; two different implementations may not share one. Without a name nothing changes: keys are architectures, and
+  digests are those of 0.0.6.
+- **Prebuilt binaries as implementations.** `tilefish.impl(ptx="k.ptx", symbol=..., block=..., shared=...)` and `tilefish.impl(cubin={"sm_120":
+  "k.cubin"}, ...)` (paths relative to the file that declares the op). Their entries are `binary` entries with `implementation`. A cubin
+  implementation must have a cubin for every architecture that runs it: refused at the declaration for the architectures `by_arch=` names, at the
+  build for those that fall back to it (PTX whose `.target` an architecture cannot build is refused likewise).
+- **An ABI per implementation.** `tilefish.impl(..., stub=f)` gives an implementation its own stub, the kernel's parameters in order: a TMA
+  descriptor (`TensorDesc`) where the op's stub has a pointer, other scalars, constexprs or fixed arguments. Every implementation must share the op's
+  public signature: its tensors (names, order, access, dtype, shape, `Strided` or not, `MayAlias`), the constraints of their dimensions, its fixed
+  arguments per call and its buckets. `jit` and `replay` launch the implementation of the device with its own ABI; the planner binds every step
+  with every implementation, preconditions included, so a plan never relies on an architecture; the Rust emitter types `launch` from the shared
+  tensors and documents each architecture's ABI.
+- The build refuses a spec of one implementation for an architecture the declaration does not run it on, which now includes the fallback on an
+  architecture that has an implementation of its own (that build's entry was always refused by `replay`).
+- A call that restates a const of an op declared with `by_arch=` is held to the value of the op's stub, as a graph's call is, and to the launched
+  implementation's where it has a constexpr or fixed argument of that name.
+- Both manifest readers accept, as an entry's `implementation`, its architecture, `"fallback"` or a name of that form, on a `triton` or a `binary`
+  entry. Readers of 0.0.6 and crate 0.0.4 refuse a name and an `implementation` on a `binary` entry; manifests without them, and their digests, are
+  unchanged.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

@@ -351,13 +351,18 @@ class CompileSpec:
     # The frontend that compiles the kernel: ``"triton"`` (``triton.jit``, Triton's ``ASTSource``) or ``"gluon"`` (``gluon.jit``, Gluon's
     # ``GluonASTSource``: TTGIR with explicit layouts). Written to the spec only for Gluon, so every other spec is as it was.
     language: str = "triton"
-    # The implementation of an op declared with ``extern(by_arch=...)`` this spec is of: the architecture it was declared for (``"sm_103"``) or
-    # ``"fallback"``. It is in the declaration digest. ``None`` (and not written) for every other op.
+    # The implementation of an op declared with ``extern(by_arch=...)`` this spec is of: the architecture it was declared for (``"sm_103"``),
+    # ``"fallback"``, or the name of a named implementation (``tilefish.impl(..., name="tcgen05")``, which several architectures may share). It
+    # is in the declaration digest. ``None`` (and not written) for every other op.
     implementation: "str | None" = None
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
     _verified: str | None = field(default=None, init=False, repr=False, compare=False)
+    # For the spec of one implementation of an op declared with ``by_arch=``: which implementation the declaration runs on each architecture, as
+    # ``(((architecture, key), ...), the fallback's key or None)``, known when the spec was generated or verified against the declaration (the
+    # build refuses an architecture that does not run this implementation: ``_build.check_implementation_arch``). Not serialized, not compared.
+    _selection: "tuple[tuple[tuple[str, str], ...], str | None] | None" = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def triton_module(self) -> str:
@@ -481,6 +486,8 @@ class CompileSpec:
                 doc["implementation"] = self.implementation
         else:
             doc["binary"] = copy.deepcopy(self.binary)
+            if self.implementation is not None:  # one implementation (a prebuilt binary) of an op with an implementation per architecture
+                doc["implementation"] = self.implementation
         doc["buckets"] = dict(self.buckets)
         doc["args"] = [a.to_dict() for a in self.args]
         doc["signature"] = dict(self.signature)
@@ -598,6 +605,7 @@ class CompileSpec:
                 f"compile spec '{self.stem}' does not match the declaration of extern op '{op.name}': "
                 f"first difference at {path}: the spec has {_show(got)}, the declaration gives {_show(want)}"
             )
+        object.__setattr__(self, "_selection", expected._selection)  # which architectures run its implementation, as the declaration says
         self._mark_verified()
 
     @classmethod
@@ -800,8 +808,6 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc.update({"triton": op.triton, "num_warps": op.num_warps, "num_stages": op.num_stages})
         if op.language != "triton":  # a Gluon kernel (only then: every other declaration digests as it did)
             doc["language"] = op.language
-        if op.implementation is not None:  # one implementation of an op declared with by_arch= (only then)
-            doc["implementation"] = op.implementation
     else:  # a prebuilt binary: what it is made of (the sha256 of its PTX or cubin), its entry point, block and shared memory
         doc["binary"] = {
             "kind": op.binary.kind,
@@ -810,6 +816,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
             "shared": op.binary.shared,
             "digests": op.binary.digests,
         }
+    if op.implementation is not None:  # one implementation of an op declared with by_arch=, a kernel or a prebuilt binary (only then)
+        doc["implementation"] = op.implementation
     doc["grid"] = None if op.grid is None else [_canonical_dim(g) for g in op.grid]
     doc["params"] = params
     # only kernels that tilefish generated have these (and fp_fusion an extern declared with enable_fp_fusion=); leaving them out
@@ -1132,6 +1140,9 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         language=op.language,
         implementation=op.implementation,
     )
+    parent = op.__dict__.get("_tf_of") if op.implementation is not None else None  # the op declared with by_arch= this is an implementation of
+    if parent is not None and parent.selection is not None:
+        object.__setattr__(spec, "_selection", (tuple(sorted(parent.selection.items())), parent.fallback_key))
     spec._mark_verified()  # generated from the declaration just now
     return spec
 

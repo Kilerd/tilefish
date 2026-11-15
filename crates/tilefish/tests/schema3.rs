@@ -237,7 +237,7 @@ fn row_sum(sm: u32, implementation: Value) -> Kernel {
 }
 
 #[test]
-fn the_implementation_an_entry_is_of_is_read_and_must_be_its_own_architecture_or_the_fallback() {
+fn the_implementation_an_entry_is_of_is_read_and_must_be_its_own_architecture_the_fallback_or_a_name() {
     let manifest = read(&[row_sum(103, "sm_103".into()), row_sum(120, "fallback".into())], &[]).unwrap();
     assert_eq!(manifest.entry("row_sum", "sm_103").unwrap().implementation.as_deref(), Some("sm_103"));
     assert_eq!(manifest.entry("row_sum", "sm_120").unwrap().implementation.as_deref(), Some("fallback"));
@@ -246,19 +246,36 @@ fn the_implementation_an_entry_is_of_is_read_and_must_be_its_own_architecture_or
         read(&[row_sum(103, Value::Null)], &[]).unwrap().entry("row_sum", "sm_103").unwrap().implementation,
         None
     );
-    for bad in ["sm_120", "sm_90", "fallback2", "", "SM_103"] {
+    // the name of a named implementation (which the reader cannot hold to the declaration's map: a replay does), on any architecture
+    let long = "x".repeat(64);
+    for name in ["tcgen05", "fallback2", "_", "sm_", "sm_x1", long.as_str()] {
+        let m = read(&[row_sum(103, name.into()), row_sum(120, name.into())], &[]).unwrap();
+        assert_eq!(m.entry("row_sum", "sm_120").unwrap().implementation.as_deref(), Some(name));
+    }
+    let too_long = "x".repeat(65);
+    for bad in
+        ["sm_120", "sm_90", "", "SM_103", "sm_9x", "Fallback", "FALLBACK", "a-b", "2nd", "t\u{e9}", too_long.as_str()]
+    {
         let e = refusal(&[row_sum(103, bad.into())], &[]);
-        assert!(e.contains("implementation must be the entry's architecture \"sm_103\" or \"fallback\""), "{bad}: {e}");
+        assert!(
+            e.contains("implementation must be the entry's architecture \"sm_103\", \"fallback\" or the name of an implementation"),
+            "{bad}: {e}"
+        );
     }
     for bad in [json!(103), json!(true), json!(["sm_103"])] {
         let e = refusal(&[row_sum(103, bad.clone())], &[]);
         assert!(e.contains("expected a string"), "{bad}: {e}"); // (serde says the type, not the field)
     }
-    // a prebuilt binary is no implementation of a Triton or Gluon declaration
+    // a prebuilt binary may be an implementation too
+    for name in ["sm_103", "fallback", "ptx"] {
+        let mut binary = axpy_ptx();
+        binary.entry["implementation"] = name.into();
+        let m = read(&[binary], &[]).unwrap();
+        assert_eq!(m.entry("axpy_ptx", "sm_103").unwrap().implementation.as_deref(), Some(name));
+    }
     let mut binary = axpy_ptx();
-    binary.entry["implementation"] = "sm_103".into();
-    let e = refusal(&[binary], &[]);
-    assert!(e.contains("on a triton entry"), "{e}");
+    binary.entry["implementation"] = "sm_120".into();
+    assert!(refusal(&[binary], &[]).contains("implementation must be the entry's architecture"));
 }
 
 #[test]
