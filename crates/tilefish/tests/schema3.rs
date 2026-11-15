@@ -903,7 +903,11 @@ fn a_given_argument_that_is_not_what_it_says_is_refused() {
         ("with a dim", json!({"dim": "n"}), "it has no value, dim or shape"),
         ("an f32", json!({"type": "f32", "ptx_type": "f32"}), "is i32 or i64"),
         ("passed in 8 bytes", json!({"ptx_type": "u64", "size": 8}), "is passed as a u32 of 4 bytes"),
-        ("of an unknown kind", json!({"kind": "giving"}), "kind must be pointer, tensordesc, scalar, fixed, given or null"),
+        (
+            "of an unknown kind",
+            json!({"kind": "giving"}),
+            "kind must be pointer, tensordesc, scalar, fixed, given or null",
+        ),
     ];
     for (what, change, why) in cases {
         let mut k = axpy_given();
@@ -917,4 +921,96 @@ fn a_given_argument_that_is_not_what_it_says_is_refused() {
     let mut k = masked_rows();
     k.entry["abi"]["params"][2] = given(2, "alpha", "i32");
     assert!(refusal(&[k], &[]).contains("belongs to a prebuilt binary"));
+}
+
+// -- a null pointer, a 64-bit dimension scalar, a dense pointer aligned to its element -----------------------------------------------
+
+/// A null pointer parameter (kind `null`: Python's `Null[dtype]`) at `slot`.
+fn null(slot: usize, name: &str, dtype: &str, ty: &str) -> Value {
+    json!({"slot": slot, "index": slot, "name": name, "kind": "null", "type": ty, "ptx_type": "u64", "size": 8, "dtype": dtype})
+}
+
+/// `axpy` whose `y` is a null pointer and whose count is an `i64` dimension scalar: `(x, y, out, n_elem, alpha, zero)`.
+fn axpy_null() -> Kernel {
+    let mut k = axpy_ptx();
+    k.entry["abi"]["params"][1] = null(1, "y", "f32", "*fp32");
+    k.entry["abi"]["params"][3] = scalar(3, "n_elem", "i64", "n", json!({}));
+    let pres: Vec<Value> =
+        k.entry["preconditions"].as_array().unwrap().iter().filter(|p| p["arg"] != "y").cloned().collect();
+    k.entry["preconditions"] = Value::Array(pres);
+    k
+}
+
+#[test]
+fn a_null_pointer_is_passed_as_zero_and_takes_no_tensor() {
+    let manifest = read(&[axpy_null()], &[]).unwrap();
+    let entry = manifest.entry("axpy_ptx", "sm_103").unwrap();
+    assert!(matches!(&entry.params[1].kind, ParamKind::Null { dtype_name } if dtype_name == "f32"));
+    assert_eq!(entry.params[1].size(), 8);
+    assert!(matches!(entry.params[3].kind, ParamKind::Scalar { ty: tilefish::ScalarType::I64, .. }));
+    let plan = plan_of(&manifest, "axpy_ptx");
+    assert_eq!(plan.tensor_names().collect::<Vec<_>>(), ["x", "out"]);
+    let shape = [1040usize];
+    let p = plan
+        .prepare(&[dense(X, &shape, DType::F32, Access::In), dense(Y, &shape, DType::F32, Access::InOut)], None)
+        .unwrap();
+    // x, the null y, out, the i64 count, then the two fixed arguments: no scratch slot follows a prebuilt binary's parameters
+    assert_eq!(&p.params()[..4], &[X, 0, Y, 1040]);
+    assert_eq!(p.params().len(), 6);
+}
+
+#[test]
+fn a_null_pointer_that_is_not_what_it_says_is_refused() {
+    let cases: [(&str, Value, &str); 6] = [
+        ("of another pointer type", json!({"type": "*bf16"}), "the type of a null pointer"),
+        ("of an unknown dtype", json!({"dtype": "f8"}), "the type of a null pointer"),
+        ("passed in 4 bytes", json!({"ptx_type": "u32", "size": 4}), "a null pointer is passed as a u64 of 8 bytes"),
+        ("with an access", json!({"access": "in"}), "it has a dtype and nothing a tensor or a scalar has"),
+        ("with a shape", json!({"shape": ["n"]}), "it has a dtype and nothing a tensor or a scalar has"),
+        ("with a value", json!({"value": 0}), "it has a dtype and nothing a tensor or a scalar has"),
+    ];
+    for (what, change, why) in cases {
+        let mut k = axpy_null();
+        for (key, v) in change.as_object().unwrap() {
+            k.entry["abi"]["params"][1][key] = v.clone();
+        }
+        let message = refusal(&[k], &[]);
+        assert!(message.contains(why), "{what}: {message}");
+    }
+    // a null pointer has no precondition: an alignment of it is one on no pointer
+    let mut k = axpy_null();
+    k.entry["preconditions"].as_array_mut().unwrap().push(alignment(1, "y", 16));
+    assert!(refusal(&[k], &[]).contains("pointer_alignment"));
+}
+
+#[test]
+fn a_dense_pointer_may_promise_its_elements_alignment() {
+    // the specialisation of a lowered kernel for a view that does not start on 16 bytes: x is aligned to its element (4 bytes) only
+    let mut k = axpy_ptx();
+    k.entry["preconditions"][0] = alignment(0, "x", 4);
+    let manifest = read(&[k], &[]).unwrap();
+    let plan = plan_of(&manifest, "axpy_ptx");
+    let shape = [16usize];
+    let call = |x: u64, y: u64| {
+        vec![
+            dense(x, &shape, DType::F32, Access::In),
+            dense(y, &shape, DType::F32, Access::In),
+            dense(Y, &shape, DType::F32, Access::InOut),
+        ]
+    };
+    for offset in [0u64, 4, 8, 12, 20] {
+        assert!(plan.prepare(&call(X + offset, X + 0x1000), None).is_ok(), "{offset}");
+    }
+    let e = plan.prepare(&call(X + 2, X + 0x1000), None).unwrap_err();
+    assert_eq!(kind(&e), PreconditionKind::PointerAlignment, "{e}");
+    assert!(e.to_string().contains("not aligned to 4 bytes"), "{e}");
+    let e = plan.prepare(&call(X, X + 0x1004), None).unwrap_err(); // y is still 16-byte aligned
+    assert_eq!(kind(&e), PreconditionKind::PointerAlignment, "{e}");
+    // neither 16 nor the element size, and a device scalar aligned to its element only, are refused
+    let mut k = axpy_ptx();
+    k.entry["preconditions"][0] = alignment(0, "x", 8);
+    assert!(refusal(&[k], &[]).contains("pointer_alignment must be 16 bytes"));
+    let mut m = masked_rows();
+    m.entry["preconditions"][2] = alignment(2, "n_tok", 4);
+    assert!(refusal(&[m], &[]).contains("device scalar"));
 }

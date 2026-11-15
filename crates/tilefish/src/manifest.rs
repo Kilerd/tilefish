@@ -2178,7 +2178,9 @@ impl Entry {
                         Some(ParamKind::Pointer { tensor_map: Some(_), .. }) => Some(vec![ALIGNMENT]),
                         // a strided pointer, and a dense one that is not a device scalar (the specialisation of a lowered kernel for views
                         // that do not start on 16 bytes), may promise only its element's alignment
-                        Some(ParamKind::Pointer { view, shape, dtype_name, .. }) if view.is_some() || !shape.is_empty() => {
+                        Some(ParamKind::Pointer { view, shape, dtype_name, .. })
+                            if view.is_some() || !shape.is_empty() =>
+                        {
                             let element = DType::from_name(dtype_name).map_or(1, |d| d.size() as u64);
                             Some(vec![ALIGNMENT, element])
                         }
