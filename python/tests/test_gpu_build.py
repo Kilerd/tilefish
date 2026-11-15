@@ -1,8 +1,9 @@
 """``aot.build`` with real Triton: cubins, digests, the manifest, and reproducibility across build directories.
 
 The central test here is reproducibility: the same compile spec built from two different directories, with
-two different Triton cache directories, gives byte-different cubins (the debug information holds the path of
-the Python source) with the same ``sha256_code``, the digest of the machine code.
+two different Triton cache directories, gives the same cubin, byte for byte: the debug information names the
+Python source by its module path (``tilefish_generated/softmax.py``), not by the directory it was written to, so
+the ``sha256`` of the file is the same, and so is ``sha256_code``, the digest of the machine code.
 """
 
 import dataclasses
@@ -166,10 +167,10 @@ def test_the_same_spec_built_from_two_directories_has_the_same_code_digest(tmp_p
     assert sorted(a) == sorted(b) == sorted(["softmax", "layernorm", "gelu_exact", "swiglu", "residual_add_rmsnorm"])
     for stem in a:
         assert a[stem]["cwd"] != b[stem]["cwd"] and a[stem]["file"] != b[stem]["file"]
-        # the debug information holds the source path, so the files differ, and so does the digest of the whole file ...
-        assert a[stem]["sha256"] != b[stem]["sha256"], stem
-        assert a[stem]["size"] != b[stem]["size"], stem
-        # ... while the machine code is the same
+        # the debug information names the source by its module path, not by the directory it is in: the same file ...
+        assert a[stem]["sha256"] == b[stem]["sha256"], stem
+        assert a[stem]["size"] == b[stem]["size"], stem
+        # ... and the same machine code
         assert a[stem]["sha256_code"] == b[stem]["sha256_code"], stem
 
 
@@ -191,7 +192,7 @@ def test_a_manifest_written_elsewhere_has_the_machine_code_of_a_jit_build_and_re
         jit_built = runtime.build_for_device(spec, runtime.load_lowered(low), 0)
         artifact = manifest.get(spec.stem, ARCH)
         assert jit_built.sha256_code == artifact.sha256_code, name  # (a) the same machine code ...
-        assert jit_built.sha256 != artifact.entry["sha256"], name  # ... from another build path (the debug info differs)
+        assert jit_built.sha256 == artifact.entry["sha256"], name  # ... and the same file, from another build path and another way of importing the source
     inputs = {
         "softmax": (randn((9, 1000), torch.float32, 0, scale=3.0),),
         "layernorm": (randn((9, 768), torch.bfloat16, 0), randn((768,), torch.bfloat16, 1), randn((768,), torch.bfloat16, 2)),

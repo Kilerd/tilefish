@@ -29,7 +29,8 @@ Fixtures built before a library entry recorded the SM count of its device (``sm_
     python export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --migrate-sm-count 30
 
 An operator added to ``host_ops.ops()`` is added to the committed fixtures without building the others again (their cubins, and so their digests, stay
-as they are; a fresh export would give the same machine code in other files, since a cubin names the directory it was built in)::
+as they are; the committed cubins were built before a build named its sources by module path, so they name the directory they were built in, and a
+fresh export would give the same machine code in other files)::
 
     python export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --add-missing [--archs 103,120]
 

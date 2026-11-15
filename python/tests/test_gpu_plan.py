@@ -91,24 +91,22 @@ def test_export_writes_a_schema_3_manifest_and_a_plan_that_pins_it(exported):
     assert [b["values"] for b in plan_doc["buckets"]] == [{"M": 32}, {"M": 64}, {"M": 128}]
 
 
-def test_two_exports_of_the_same_graph_have_the_same_machine_code_and_the_same_plan(exported, tmp_path):
-    """The manifest pins the cubin *files*, and a cubin's debug sections name the directory it was built in (a build-cache hit returns a
-    binary built elsewhere), so two exports need not have the same manifest or plan digest: a pin is of one exported artifact, not of a
-    recipe. What two exports always share is the machine code of every binary (``sha256_code``), every pinned GEMM, and the plan itself."""
-    directory, _ = exported
-    runtime.export(pm.block, tmp_path)
+def test_two_exports_of_the_same_graph_are_the_same_files_and_digests(exported, tmp_path):
+    """The manifest pins the cubin *files*: a pin is of one exported artifact, not of a recipe. A cubin's debug sections name its sources by
+    their module paths (not by the directory a generated source was written to), so two exports of the same graph with the same toolchain on
+    the same device are the same files: the same machine code (``sha256_code``), the same pinned GEMMs, the same plan, and the same manifest
+    and plan digests. (``test_gpu_repro.py`` exports from two directories in two processes.)"""
+    directory, p = exported
+    again = runtime.export(pm.block, tmp_path)
     first, second = (json.loads((d / "manifest.json").read_text()) for d in (directory, tmp_path))
 
     def code(manifest):
-        return {(e["stem"], e["arch"]): (e["sha256_code"], e["symbol"], e["shared"]) for e in manifest["kernels"]}
+        return {(e["stem"], e["arch"]): (e["sha256"], e["sha256_code"], e["symbol"], e["shared"]) for e in manifest["kernels"]}
 
     assert code(first) == code(second)
     assert first["library"] == second["library"]
-    plans = [json.loads((d / "plan.json").read_text()) for d in (directory, tmp_path)]
-    for doc in plans:
-        for key in ("manifest_digest", "plan_digest", "tilefish"):
-            doc.pop(key, None)
-    assert plans[0] == plans[1]
+    assert again.manifest_digest == p.manifest_digest and again.digest == p.digest
+    assert (directory / "plan.json").read_bytes() == (tmp_path / "plan.json").read_bytes()
 
 
 # -- (a) replay == jit == per-op eager ---------------------------------------------------------------------------------------------------------------------
