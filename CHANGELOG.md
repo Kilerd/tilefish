@@ -16,12 +16,15 @@ each section names the release that added it.
   on the stream it was allocated on. The Rust host orders an arena by an order event of its own instead of as a slice owned by the
   stream it was allocated on (no work is enqueued on that stream any more), copies the device scalars with no cudarc tracking of the
   arena and one event per staging entry, and a capture holds the arena's lock only to begin (executions and captures on other streams
-  go on meanwhile). Measured on a B300 MIG slice, four plans per request: Rust replays 8.2 -> 7.0 us of host per request on one
-  stream and 10.3 -> 7.1 us alternating two streams.
+  go on meanwhile). Measured on a B300 MIG slice, four plans per request: Python makes 0 waits per request instead of 4 on one
+  stream (1 instead of 4 alternating two streams), and a `CapturedPlan.replay` takes 7.8 to 8.4 us of host instead of 9.8; Rust
+  replays take 5.9 to 7.7 us of host per request instead of 7.3 to 9.2 on one stream, 7.1 to 7.7 instead of 9.8 to 11.5 alternating.
 - **Start-up of a large plan set (Rust).** `PlanSet::load` verifies a set once per process: a second load of the same set digest,
-  while a clone of the first one's manifest is alive, reads only the index (131 -> 1.4 ms for a synthetic set of 1280 plans).
-  `PlanSet::plans(names)` loads plans on up to 8 threads (238 -> 35 ms), and `PlanSet::instantiate` loads and instantiates its plans
-  on threads (the binaries and GEMMs on one thread: the driver's and cuBLASLt's loads do not get faster on threads).
+  while a clone of the first one's manifest is alive, reads only the index (131 -> 1.1 ms for a synthetic set of 1280 plans, 96
+  kernels and 1024 GEMMs). `PlanSet::plans(names)` loads plans on up to 8 threads (238 -> 35 ms), and `PlanSet::instantiate` loads
+  and instantiates its plans on threads (the binaries and GEMMs on one thread: the driver's and cuBLASLt's loads do not get faster on
+  threads); loading and instantiating that set took 413 to 452 ms instead of 708 to 723, the whole start-up with its 2560 captures
+  1154 to 1166 ms instead of 1424 to 1436. Captures on several threads measured no faster (the driver serializes them).
 - **`cudnnCreate` waits for the whole device**, every stream, not only the NULL stream (measured, cuDNN 9.10.2), so the first
   convolution loaded while work runs stalls behind it. `tilefish::CudnnHandle::new(&ctx)` (crate) and
   `tilefish.runtime.warm_cudnn(device)` (Python) make the handle at start-up and keep it, so that no load makes one.

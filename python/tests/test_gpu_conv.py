@@ -602,3 +602,23 @@ def test_a_knob_the_heuristic_leaves_unset_is_left_out_of_the_pin():
     print(f"\nthe heuristic's first configuration leaves knobs {unset} unset (-1); the pin is {pinned.pin.what}")
     x, w = tensors(p, 4)
     assert same_bytes(ours(p, pinned.pin, x, w, 1 << 30), torch_conv(p, x, w))
+
+
+def test_warm_cudnn_makes_the_device_handle_once_and_a_later_pin_takes_it():
+    """``tilefish.runtime.warm_cudnn`` makes the device's cuDNN handle (``cudnnCreate``, which waits for all the work on the device) at a moment the
+    host chooses; the handle is kept for the process, so a pin made later, while a non-blocking stream is busy, makes none and does not wait for it."""
+    runtime.warm_cudnn()
+    index = torch.cuda.current_device()
+    handle = _cudnn._handles[index]
+    runtime.warm_cudnn(index)
+    runtime.warm_cudnn(f"cuda:{index}")
+    assert _cudnn._handles[index] is handle
+    busy = torch.cuda.Stream()
+    with torch.cuda.stream(busy):
+        torch.cuda._sleep(2_000_000_000)
+    p = _cudnn.Problem("f16", "NCHW", 1, 16, 32, 1, (64,), (3,), (1,), (1,), (1,), "tensor_op")
+    _cudnn.pin_conv(p, heuristic="instant", workspace_bytes=1 << 26)
+    still_busy = not busy.query()
+    busy.synchronize()
+    assert _cudnn._handles[index] is handle
+    assert still_busy, "the pin waited for the busy stream"

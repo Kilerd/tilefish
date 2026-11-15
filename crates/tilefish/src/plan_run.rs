@@ -463,10 +463,10 @@ pub struct SharedArena {
 }
 
 impl SharedArena {
-    /// Allocate the arena of `plans` on `stream` (which it is freed on; the first execution on that stream does not wait for the allocation): the bytes of the
-    /// largest of their arenas ([`SharedArena::bytes_for`]), with the pinned staging memory of the device scalars when some plan has one. Every
-    /// plan must be for the architecture of the stream's device; the plans are given each once (by graph name). Refused on the per-thread
-    /// default stream and on a stream that is capturing a CUDA graph.
+    /// Allocate the arena of `plans` on `stream` (which it is freed on; the first execution on that stream does not wait for the allocation):
+    /// the bytes of the largest of their arenas ([`SharedArena::bytes_for`]), with the pinned staging memory of the device scalars when some
+    /// plan has one. Every plan must be for the architecture of the stream's device; the plans are given each once (by graph name). Refused on
+    /// the per-thread default stream and on a stream that is capturing a CUDA graph.
     pub fn new(stream: &Arc<CudaStream>, plans: &[&LaunchPlan]) -> Result<Self> {
         let bytes = Self::bytes_for(plans)?;
         ffi::refuse_per_thread(stream, std::iter::empty())?;
