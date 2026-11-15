@@ -18,9 +18,10 @@ The plan is a document (``plan.json``, schema ``tilefish.plan.v1``, specified in
 of the manifest it was built against, so a pin of the plan digest pins every binary it launches. This module is pure Python: it needs no torch, no
 Triton and no GPU. :mod:`tilefish._planrun` runs a plan.
 
-What a plan accepts. A graph body is calls to declared operators (``kernel``, ``extern``, ``library`` with an ``impl``) and views. A traced
-arithmetic op in the graph body (``x + y``, a cast, a reduction), a call to another ``graph``, a ``Dim`` parameter and an ``Out``
-parameter are refused with the rule that says so (wrap arithmetic in a ``@tilefish.kernel``; a graph's results are its returned values); ``tilefish.copy``
+What a plan accepts. A graph body is calls to declared operators (``kernel``, ``extern``, ``library`` with an ``impl``), views and traced
+arithmetic (``x + y``, a cast, a comparison, a reduction): the arithmetic is grouped into fused regions, each a launch of a kernel tilefish
+generates, byte for byte the unfused composition of its ops (:mod:`tilefish._fusion`, ``docs/rfcs/0001-plan-fusion.md``). A call to another
+``graph``, a ``Dim`` parameter and an ``Out`` parameter are refused with the rule that says so (a graph's results are its returned values); ``tilefish.copy``
 and a ``store`` into an ``InOut`` parameter are copy steps (a device-to-device copy of dense bytes), ``tilefish.zeros_like`` a memset step, and a parameter
 declared ``carried=`` a buffer of role ``carried`` that the arena holds between executions (section 15.2 of the plan schema). An in-place
 call (``InOut``) must take a whole buffer, not a view of another tensor (the IR says a chunk that is updated does not change its parent; a plan
@@ -386,7 +387,9 @@ def _store_in_place(
 
 
 def _walk(gop: GraphOp) -> _Walk:
-    g = gop.graph
+    from ._fusion import planned_graph
+
+    g = planned_graph(gop)  # the arithmetic of the body as fused regions, each a call of a generated kernel (docs/rfcs/0001-plan-fusion.md)
     name = g.name
     sig = gop.signature
     buffers: "list[_Buffer]" = []
@@ -488,10 +491,9 @@ def _walk(gop: GraphOp) -> _Walk:
                     dst.buffer.version += 1
                     loc[n.outputs[0]] = replace(dst, version=dst.buffer.version)
                 continue
-            _fail(
+            _fail(  # pragma: no cover - the fusion pass makes every arithmetic op part of a region
                 name,
-                f"{where} is arithmetic traced in the graph body, which a plan cannot launch (there is no kernel for it): put it in a "
-                "@tilefish.kernel (a plan launches declared operators; views and the other ops are fine)",
+                f"{where} is arithmetic traced in the graph body that no fused region took (a bug of tilefish's fusion): put it in a @tilefish.kernel",
             )
         if kind == "graph":
             _fail(name, f"{where} calls another graph, which a plan does not inline yet: write its body in this graph, or make it a kernel")

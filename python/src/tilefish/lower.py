@@ -491,6 +491,28 @@ Notes (the facts behind the table):
     axis, of a computed value or of a parameter the kernel writes, an element of a rank-1 parameter (a ``DevScalar`` is that), an offset that is a
     product of two dynamic sizes; so is a returned slice (``view-value``: return ``x[k] + 0``), and the elementwise template takes none
     (``elementwise.slice``). The ``reference`` mode is torch's ``select``: a raw read, byte-identical (``tests/test_gpu_slices.py``).
+20. **Fused regions** (``docs/rfcs/0001-plan-fusion.md``, :mod:`tilefish._fusion`). The arithmetic written in a ``@tilefish.graph`` body is
+    planned as regions, each a kernel lowered here with ``fp_fusion=False`` and ``context_free=True``, so that a region is byte for byte the
+    composition of one kernel per op (the unfused composition). ``context_free`` makes the bits of the two ops whose PTX the compilers would
+    otherwise fit to their neighbours independent of them:
+
+    * **every narrowing float cast** (to bf16 or f16, from f32, f16 or bf16) is one helper of inline PTX, ``cvt.rn.bf16.f32`` /
+      ``cvt.rn.f16.f32`` (a 16-bit source widened to f32 first, exactly): the instruction ``.to()`` compiles to (note 1), but out of the reach of
+      the folds of MLIR and LLVM. Measured on sm_103 (the RFC's experiment E5): with ``.to()``, ``x.to(f32).to(bf16)`` in one kernel is folded to
+      ``x`` and keeps the payload of every input NaN (254 of 254 bf16 NaNs, 2046 of 2046 f16 NaNs), and a ``where`` between widened values
+      narrowed after it is folded too (506 NaN outputs differ), where two kernels give the canonical NaN (``0x7FFF``) for each;
+    * **a negation** (``-x``, note 16) gives the canonical NaN for a NaN explicitly (``testp.notanumber`` / ``setp.nan`` and ``selp``), and
+      ``neg`` for every other value. ``neg.f32`` alone gives the canonical NaN (what note 16 measured), but ptxas folds it into a consumer as a
+      negated operand when it can (a ``where`` of ``-x``: ``FSEL`` of ``-R``), which flips the sign of a NaN instead (``0xFFFFFFFF``): found by
+      the random graphs of ``tests/test_gpu_fusion.py``, 61 of 1536 elements of one graph;
+    * **every float ``+``, ``-`` and ``*``** (f32, f16, bf16), and the last multiply of ``silu`` and the multiplies and add of ``gelu``, is one
+      scalar instruction of inline PTX with ``.rn`` (``mul.rn.f32``, ``add.rn.bf16``, ...). ``fp_fusion=False`` is not enough on sm_100 and
+      later: LLVM packs two lanes' f32 ops into ``mul.rn.f32x2`` / ``add.rn.f32x2``, and ptxas 12.9 contracts a packed multiply and add into
+      ``FFMA2`` even with ``--fmad=false`` (found by the random graphs, 33 of 1536 elements of one graph one ULP off, and read in the SASS of
+      the same PTX assembled for sm_100a). A scalar ``.rn`` instruction is not contracted.
+
+    Every non-NaN value is the same either way, and the inline cast is ``.to()``'s bits on every f32 (``tests/test_gpu_fusion.py``). A
+    ``@tilefish.kernel`` keeps ``.to()`` and ``neg``.
 
 **``num_warps`` and the numerics identity** (decided on measurements, ``tests/test_gpu_reduction_order.py``). What depends on ``num_warps`` is
 Triton's own reductions: ``tl.sum`` (``sum`` without ``order``, ``mean``) adds in a tree that the warp count shapes (note 6; on 1024 rows of
@@ -573,7 +595,8 @@ _BINARY = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
 _COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
 _LOGICAL = {"and": "&", "or": "|", "xor": "^"}
 _UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos", "tanh", "erf", "sin_approx", "rcp")
-_NEG = frozenset({"f32", "bf16", "f16", "i32", "i64"})  # neg: the floats by CUDA's neg (note 16), the signed integers by 0 - x
+_NEG = frozenset({"f32", "bf16", "f16", "i32", "i64"})
+_RN = frozenset({"f32", "bf16", "f16"})  # the float dtypes whose + - * a fused region writes as one inline instruction each (note 20)  # neg: the floats by CUDA's neg (note 16), the signed integers by 0 - x
 _REDUCTIONS = ("sum", "mean", "max")
 _ARG_REDUCTIONS = ("argmax", "argmin")
 _OTHER_OPS = ("not", "where", "iota", "gather_rows", "scatter_rows", "floordiv", "mod")  # dtypes checked like a load's
@@ -701,6 +724,27 @@ _PTX: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {
                 _asm(["neg.f16 $0, $1;"], "=h,h", "x", dtype="float16")),
     "add.rn": ("a, b", ("add.rn.f32: one rounding, never contracted with a multiply (an ordered sum, note 17 of tilefish.lower)",),
                _asm(["add.rn.f32 $0, $1, $2;"], "=f,f,f", "a, b")),
+    # the arithmetic of a fused region (note 20): one scalar instruction each, which no compiler packs into f32x2 and contracts
+    **{
+        f"{op}.rn.{dt}": (
+            "a, b",
+            (f"{op}.rn.{ptx}: one rounding, never packed or contracted with a neighbour (a fused region, note 20 of tilefish.lower)",),
+            _asm([f"{op}.rn.{ptx} $0, $1, $2;"], f"={reg},{reg},{reg}", "a, b", dtype=tl_name),
+        )
+        for op in ("add", "sub", "mul")
+        for dt, ptx, reg, tl_name in (("f32", "f32", "f", "float32"), ("f16", "f16", "h", "float16"), ("bf16", "bf16", "h", "bfloat16"))
+    },
+    "cvt.bf16": ("x", ("cvt.rn.bf16.f32: f32 to bf16, to nearest even, every NaN the canonical 0x7FFF (note 1); inline, out of the reach of folds (note 20)",),
+                 _asm(["cvt.rn.bf16.f32 $0, $1;"], "=h,f", "x", dtype="bfloat16")),
+    "cvt.f16": ("x", ("cvt.rn.f16.f32: f32 to f16, to nearest even, every NaN the canonical 0x7FFF (note 1); inline, out of the reach of folds (note 20)",),
+                _asm(["cvt.rn.f16.f32 $0, $1;"], "=h,f", "x", dtype="float16")),
+    # a negation whose NaN is the canonical one whatever ptxas folds it into (note 20): ptxas may make neg a negated operand of its consumer
+    "negc.f32": ("x", ("-x: neg.f32, and the canonical NaN 0x7FFFFFFF for a NaN, explicitly (note 20; a folded neg.f32 flips a NaN's sign)",),
+                 _asm(["testp.notanumber.f32 p, $1;", "neg.f32 t, $1;", "selp.f32 $0, 0f7FFFFFFF, t, p;"], "=f,f", "x", ".reg .pred p; .reg .f32 t;")),
+    "negc.f16": ("x", ("-x: neg.f16, and the canonical NaN 0x7FFF for a NaN, explicitly (note 20)",),
+                 _asm(["setp.nan.f16 p, $1, $1;", "neg.f16 t, $1;", "selp.b16 $0, 0x7FFF, t, p;"], "=h,h", "x", ".reg .pred p; .reg .b16 t;", dtype="float16")),
+    "negc.bf16": ("x", ("-x: neg.bf16, and the canonical NaN 0x7FFF for a NaN, explicitly (note 20)",),
+                  _asm(["setp.nan.bf16 p, $1, $1;", "neg.bf16 t, $1;", "selp.b16 $0, 0x7FFF, t, p;"], "=h,h", "x", ".reg .pred p; .reg .b16 t;", dtype="bfloat16")),
 }
 
 
@@ -1949,9 +1993,17 @@ class _Body:
     """Emits the statements of the kernel body, one local per SSA value."""
 
     def __init__(
-        self, op: KernelOp, layout: _Layout, names: _Names, out_names: "list[str]", rename: "dict[str, str]", math: str = "fast"
+        self,
+        op: KernelOp,
+        layout: _Layout,
+        names: _Names,
+        out_names: "list[str]",
+        rename: "dict[str, str]",
+        math: str = "fast",
+        context_free: bool = False,
     ) -> None:
         self.graph = op.graph
+        self.context_free = context_free  # narrowing float casts inline, a negation's NaN canonical (note 20)
         self.layout = layout
         self.names = names
         self.out_names = out_names
@@ -2450,7 +2502,11 @@ class _Body:
             return f"{self.ptx_helper(op)}({', '.join(a)})"
         if op == "neg":
             dt = n.outputs[0].type.dtype
+            if dt.is_float and self.context_free:  # a NaN canonical whatever ptxas folds the negation into (note 20)
+                return f"{self.ptx_helper('negc.' + dt.name)}({a[0]})"
             return f"{self.ptx_helper('neg.' + dt.name)}({a[0]})" if dt.is_float else f"-{a[0]}"  # an integer: 0 - x, two's complement
+        if op in _BINARY and self.context_free and op != "div" and n.outputs[0].type.dtype.name in _RN:  # note 20: one rounding each
+            return f"{self.ptx_helper(op + '.rn.' + n.outputs[0].type.dtype.name)}({self.typed(n.inputs[0])}, {self.typed(n.inputs[1])})"
         if op in _BINARY:
             return f"{a[0]} {_BINARY[op]} {a[1]}"
         if op == "rsqrt":
@@ -2461,8 +2517,13 @@ class _Body:
             return f"tl.sqrt_rn({a[0]})"
         if op in ("sin", "cos"):
             return f"tl.{op}({a[0]})"
+        if op == "silu" and self.context_free:  # note 20: its last multiply one rounding, never contracted with what reads it
+            return f"{self.ptx_helper('mul.rn.f32')}({a[0]}, tl.sigmoid({a[0]}))"
         if op == "silu":
             return f"{a[0]} * tl.sigmoid({a[0]})"
+        if op == "gelu" and self.context_free:  # the same evaluation, every multiply and add one rounding (note 20)
+            mul, add = self.ptx_helper("mul.rn.f32"), self.ptx_helper("add.rn.f32")
+            return f"{mul}({mul}(0.5, {a[0]}), {add}(1.0, tl.math.erf({mul}({a[0]}, 0.7071067811865476))))"
         if op == "gelu":
             return f"0.5 * {a[0]} * (1.0 + tl.math.erf({a[0]} * 0.7071067811865476))"
         if op == "cast":
@@ -2474,7 +2535,15 @@ class _Body:
                 self.emit(f"{r} = ({b} + 0x7FFF + (({b} >> 16) & 1)) >> 16", "round to nearest even on the upper half")
                 self.emit(f"{q} = ({b} >> 16) | 0x40", "a NaN: its sign and payload, quiet")
                 return f"tl.where({a[0]} != {a[0]}, {q}, {r}).to(tl.uint16).to(tl.bfloat16, bitcast=True)"
-            return f"{a[0]}.to(tl.{_TL[n.attrs['to'].name]})"
+            dst = n.attrs["to"].name
+            src = n.inputs[0].type.dtype.name  # type: ignore[union-attr]
+            if self.context_free and n.attrs.get("rounding") and dst in ("bf16", "f16") and src in ("f32", "bf16", "f16"):  # note 20
+                x = a[0]
+                if src != "f32":
+                    x = self.names.fresh(f"{v}_x")
+                    self.emit(f"{x} = {a[0]}.to(tl.float32)", "exact")
+                return f"{self.ptx_helper('cvt.' + dst)}({x})"
+            return f"{a[0]}.to(tl.{_TL[dst]})"
         if op in _REDUCTIONS:
             return self.layout.reduce(op, a[0])
         raise AssertionError(f"unreachable op {op}")  # pragma: no cover - _check_common rejects it
@@ -2517,6 +2586,7 @@ def lower(
     num_warps: "int | None" = None,
     fp_fusion: "bool | None" = None,
     math: "str | None" = None,
+    context_free: "bool | None" = None,
 ) -> LoweredKernel:
     """Lower a ``@tilefish.kernel`` to Triton source.
 
@@ -2527,8 +2597,9 @@ def lower(
     ``num_warps=`` and the template's rule, and pins the warp count of every bucket; without either,
     each bucket of a bucketed ``D`` gets the warps of its own size. ``fp_fusion`` overrides the kernel's
     own ``fp_fusion=`` (``False``: no FMA contraction), and ``math`` its ``math=`` (``"ieee"``: note 13; an op
-    that says its own keeps it). Raises :class:`~tilefish.errors.TilefishLoweringError` when the body fits
-    no template.
+    that says its own keeps it). ``context_free`` overrides the kernel's own (``True``: every narrowing float cast
+    is inline PTX and a negation's NaN canonical, note 20; what a graph's fused regions are lowered with). Raises
+    :class:`~tilefish.errors.TilefishLoweringError` when the body fits no template.
     """
     module, fn_name = _check_names(op, module)
     if template is not None and template not in TEMPLATES:
@@ -2541,6 +2612,10 @@ def lower(
         math = getattr(op, "math", "fast")
     if math not in ("fast", "ieee"):
         raise TilefishLoweringError(f"lower: math must be 'fast' or 'ieee', got {math!r}", rule="math")
+    if context_free is None:
+        context_free = bool(getattr(op, "context_free", False))
+    if not isinstance(context_free, bool):
+        raise TilefishLoweringError(f"lower: context_free must be True or False, got {context_free!r}", rule="context-free")
     if num_warps is None:
         num_warps = op.num_warps
     if num_warps is not None and (isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in NUM_WARPS):
@@ -2562,7 +2637,7 @@ def lower(
             if not (t == "elementwise" and not bcast):  # the broadcasting attempt says more
                 failed.append((t, e))
             continue
-        return _assemble(op, layout, module, fn_name, num_warps, fp_fusion, math)
+        return _assemble(op, layout, module, fn_name, num_warps, fp_fusion, math, context_free)
     errors = [e for _, e in sorted(failed, key=lambda f: TEMPLATES.index(f[0]))]
     if len(errors) == 1:
         raise errors[0]
@@ -2573,7 +2648,14 @@ def lower(
 
 
 def _assemble(
-    op: KernelOp, layout: _Layout, module: str, fn_name: str, num_warps: "int | None", fp_fusion: bool, math: str = "fast"
+    op: KernelOp,
+    layout: _Layout,
+    module: str,
+    fn_name: str,
+    num_warps: "int | None",
+    fp_fusion: bool,
+    math: str = "fast",
+    context_free: bool = False,
 ) -> LoweredKernel:
     graph = op.graph
     user = list(op.signature.params)
@@ -2633,7 +2715,7 @@ def _assemble(
         )
         element_counts.update({k: rename.get(v, v) for k, v in layout.counts.items()})  # a broadcast operand's own count
 
-    body_emitter = _Body(op, layout, names, out_names, rename, math)
+    body_emitter = _Body(op, layout, names, out_names, rename, math, context_free)
     body = body_emitter.run()
     header = [
         f"Generated by tilefish.lower from the kernel '{op.base.name if op.base is not None else op.name}'. Do not edit.",  # (a specialisation has its kernel's source)
@@ -2641,6 +2723,7 @@ def _assemble(
         warps_header,
         *(["fp_fusion: False (no FMA contraction: a * b + c rounds twice)"] if not fp_fusion else []),
         *([_IEEE_HEADER] if math == "ieee" else []),
+        *(["context-free: every narrowing float cast is inline PTX, a negation's NaN canonical (note 20: a fused region of a graph)"] if context_free else []),
         *[f"parameter '{old}' of the kernel is '{new}' here (the name is used by this module)" for old, new in rename.items()],
         "Numerics contract: see the docstring of tilefish.lower.",
     ]

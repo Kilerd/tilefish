@@ -367,7 +367,10 @@ class GraphOp(Op):
 
     ``carried`` are the tensor parameters (``In`` or ``InOut``) whose tensor the plan's arena holds instead of the caller
     (``@tilefish.graph(carried=("h",))``): a run takes the other parameters, and the arena keeps the carried buffer between executions, so one plan
-    of a shared arena hands it to the next (``docs/plan-schema-1.md``, section 15.2)."""
+    of a shared arena hands it to the next (``docs/plan-schema-1.md``, section 15.2).
+
+    ``fusion`` is how the arithmetic traced in the body is planned (``@tilefish.graph(fusion=tilefish.fusion(...))``, :mod:`tilefish._fusion`), or
+    ``None``: the default, :func:`tilefish.fusion` with no arguments (exact, ``version=1``)."""
 
     kind = "graph"
 
@@ -380,12 +383,14 @@ class GraphOp(Op):
         output_names: "tuple[str, ...] | None" = None,
         param_roles: "dict[str, str] | None" = None,
         carried: "tuple[str, ...]" = (),
+        fusion: Any = None,
     ) -> None:
         super().__init__(fn, name, signature)
         self.graph = graph
         self.output_names = output_names
         self.param_roles = param_roles
         self.carried = carried
+        self.fusion = fusion
 
 
 class KernelOp(GraphOp):
@@ -428,6 +433,8 @@ class KernelOp(GraphOp):
         # a specialisation for pointers aligned to their element only (unaligned()): the kernel it is of, and the parameters it is for
         self.base: "KernelOp | None" = None
         self.unaligned_params: "frozenset[str]" = frozenset()
+        # narrowing float casts inline and a negation NaN-canonical (note 20 of tilefish.lower): set on the kernels of a graph's fused regions
+        self.context_free = False
 
     def lower(self, **options: Any) -> Any:
         """Lower this kernel to Triton source: ``tilefish.lower(self, **options)``."""
@@ -458,6 +465,7 @@ class KernelOp(GraphOp):
                 base.fn, f"{base.name}__ua{'_'.join(str(i) for i in indices)}", base.signature, base.graph, base.num_warps, base.fp_fusion, base.math
             )
             found.base, found.unaligned_params = base, wanted
+            found.context_free = base.context_free
             found.__doc__ = base.__doc__
             found = variants.setdefault(wanted, found)
         return found
@@ -569,10 +577,14 @@ def _carried_params(op: GraphOp, names: "tuple[str, ...] | None") -> "tuple[str,
 
 
 def _declare_graph(
-    fn: Callable[..., Any], name: str | None, outputs: Any, inputs: Any = None, weights: Any = None, carried: Any = None
+    fn: Callable[..., Any], name: str | None, outputs: Any, inputs: Any = None, weights: Any = None, carried: Any = None, fusion: Any = None
 ) -> GraphOp:
+    from ._fusion import Fusion
+
     names = None
     nm = name or getattr(fn, "__name__", "?")
+    if fusion is not None and not isinstance(fusion, Fusion):
+        raise TilefishDeclarationError(f"graph '{nm}': fusion= takes tilefish.fusion(...), got {fusion!r}")
     input_names, weight_names = _role_names(nm, "inputs", inputs), _role_names(nm, "weights", weights)
     carried_names = _role_names(nm, "carried", carried)
     if outputs is not None:
@@ -598,6 +610,7 @@ def _declare_graph(
         op.output_names = names
     op.carried = _carried_params(op, carried_names)
     op.param_roles = _param_roles(op, input_names, weight_names)
+    op.fusion = fusion
     return op
 
 
@@ -609,6 +622,7 @@ def graph(
     inputs: "Sequence[str] | None" = None,
     weights: "Sequence[str] | None" = None,
     carried: "Sequence[str] | None" = None,
+    fusion: Any = None,
 ) -> Any:
     """``@tilefish.graph``: trace and type-check a model body.
 
@@ -624,11 +638,15 @@ def graph(
     ``carried=("h",)`` names tensor parameters (``In`` or ``InOut``) whose tensor the plan's **arena** holds, not the caller: a run takes the other
     parameters, a plan that writes ``h`` leaves it in the arena, and a later execution on the same arena (of this plan, or of another plan of a
     shared arena that names ``h`` too) reads it there: stage A hands an intermediate to stage B without a tensor of the caller's
-    (``docs/plan-schema-1.md``, section 15.2). ``reference`` mode, which has no arena, takes it as an argument like any other."""
+    (``docs/plan-schema-1.md``, section 15.2). ``reference`` mode, which has no arena, takes it as an argument like any other.
+
+    ``fusion=tilefish.fusion(...)`` says how the arithmetic written in the body (``x * scale + bias``, casts, comparisons, math functions,
+    reductions) is planned: grouped into regions, each a kernel tilefish generates, byte for byte the composition of one kernel per op
+    (``docs/rfcs/0001-plan-fusion.md``; :mod:`tilefish._fusion`). Without it the default applies, ``tilefish.fusion()``."""
     _check_decorator_arg("graph", fn)
     if fn is None:
-        return lambda f: _declare_graph(f, name, outputs, inputs, weights, carried)
-    return _declare_graph(fn, name, outputs, inputs, weights, carried)
+        return lambda f: _declare_graph(f, name, outputs, inputs, weights, carried, fusion)
+    return _declare_graph(fn, name, outputs, inputs, weights, carried, fusion)
 
 
 def kernel(
