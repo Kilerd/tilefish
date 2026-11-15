@@ -396,15 +396,15 @@ Notes (the facts behind the table):
     ``reference`` mode models the flush in the default math (``torch.where(|x| < 2**-126, x * 0.0, torch.tanh(x))``) and is torch's ``tanh`` in
     IEEE math: byte-identical to the binary in both. ``tanh.approx.f32`` (one instruction, about ``2**-11`` relative error) is not used.
 15. **``erf``.** ``tilefish.erf(x)`` (f32) is ``tl.math.erf``, libdevice's ``__nv_erff`` as Triton links it (with FTZ): the ``erf`` of ``gelu``
-    (note 5). That library is not CUDA's: over every f32 it differs from CUDA's ``erff`` on 24 071 628 inputs (by at most ``2**-22`` from torch's
-    ``erf``). In IEEE math (note 13) it is CUDA's ``erff`` without flush to zero, a module-level helper of the inline PTX NVRTC emits for it
+    (note 5). That library is not CUDA's: over every f32 it differs from CUDA's ``erff`` on 24 071 628 inputs (by 6e-8 at most from torch's ``erf``
+    on N(0, 3) data). In IEEE math (note 13) it is CUDA's ``erff`` without flush to zero, a module-level helper of the inline PTX NVRTC emits for it
     (``_tf_erf_ieee``: a polynomial in ``x * x`` below ``|x| = 1.0029547``, one in ``|x|`` above that ends in ``1 - ex2.approx.ftz``, the sign of
     ``x`` put back with ``copysign``; nvcc's one branch is a select), every ``add`` and ``mul`` ``.rn``. Measured over every one of the ``2**32`` f32
     bit patterns (``tests/test_gpu_primitives.py``, sm_103): the bits of CUDA 12.8's ``erff`` (NVRTC, and torch's ``erf`` built with CUDA 12.8),
     of 12.9's, 13.0's and 13.1's, which are the same function; CUDA 13.2 changed ``erff`` (other coefficients and threshold), which differs on
     353 987 744 inputs by one ULP. The CUDA math guard records this (``docs/numerics.md``). ``gelu`` keeps libdevice's ``erf`` in both maths (its
     bits are part of its contract); CUDA's exact gelu in IEEE math is written with ``tilefish.erf``. The ``reference`` mode is ``torch.erf``:
-    byte-identical in IEEE math where torch is built with CUDA 12.8 to 13.1, within ``2**-22`` in the default math.
+    byte-identical in IEEE math where torch is built with CUDA 12.8 to 13.1, within ``2**-22`` in the default math (asserted on normal data).
 16. **One-instruction primitives**, each a module-level helper of one inline PTX instruction, in either math and whatever ``fp_fusion`` says
     (an inline-asm result is never contracted with anything): ``tilefish.sin_approx(x)`` is ``sin.approx.f32``, CUDA's ``__sinf`` (the hardware's
     sine: absolute error below ``2**-20.5`` on ``[-pi, pi]``, measured ``3.6e-7``, growing outside; a subnormal argument gives a zero of its sign,
