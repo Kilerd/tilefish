@@ -278,8 +278,9 @@ class Value:
             raise TilefishTypeError("to: needs a dtype, e.g. x.to(bf16)")
         return ops.cast(self, dtype, nan, rounding, saturate)
 
-    def split(self, size: Any = _MISSING, axis: Any = _MISSING) -> "tuple[Value, ...]":
-        """Split ``axis`` into equal chunks of ``size`` (or into chunks of the given sizes)."""
+    def split(self, size: Any = _MISSING, axis: Any = _MISSING) -> Any:
+        """Split ``axis`` into equal chunks of ``size`` (or into chunks of the given sizes): a tuple, or :class:`~tilefish.ops.Chunks` when the
+        number of chunks depends on a dimension (``chunks[0]``, ``chunks[-1]``); see :func:`tilefish.ops.split`."""
         from . import ops
 
         if size is _MISSING or axis is _MISSING:

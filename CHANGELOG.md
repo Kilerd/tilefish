@@ -22,6 +22,10 @@ each section names the release that added it.
   plane is a per-row operand, such as the index of `gather_rows`, and `tables[k]` of a `[K, N, D]` parameter is a table. A dynamic
   dimension of the offset is a runtime `i32` parameter (`size_R`) that a host derives from the shapes. Every other view is still refused
   (rule `view`). Note 16 of `tilefish.lower`.
+- `x.split(16, axis=1)` of a dimension declared only `divisible_by=16` (or whose buckets are all multiples of 16) returns
+  `tilefish.ops.Chunks`, a sequence whose `chunks[0]` and `chunks[-1]` (and any chunk the dimension's smallest size proves) are views,
+  where it used to raise "not a whole number of chunks"; `len()`, iteration and unpacking raise. A split whose count is a number still
+  returns a tuple. Plans and the graph `reference` mode take these chunks.
 
 ## tilefish 0.0.6, crate 0.0.4
 

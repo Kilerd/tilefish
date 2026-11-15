@@ -314,7 +314,9 @@ A real model needs four things that a dense, compiled-in, Triton-only operator c
 
 **Strided views.** A tensor type has element strides and an element offset, in the dimension algebra (`TensorType.strides`, `.offset`); dense
 and 16-byte aligned (`contiguous`) is the default. `x.reshape(M, 3, H, D)` (a dense input), `x.permute(1, 0, 2)`, `x[:, 1]` / `x.select(axis, i)` and
-`x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A stride or an offset may be a product of
+`x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A split whose number of chunks depends on a
+dimension (`x.split(16, axis=1)` of `x: [M, C]` with `C = Dim("C", divisible_by=16)`) returns `Chunks`, a sequence of symbolic length:
+`chunks[0]` and `chunks[-1]` always exist, any other chunk where the dimension's smallest size proves it, and `len()` and unpacking raise. A stride or an offset may be a product of
 symbolic sizes: an `[H, L, L]` tensor has the stride `L*L` along its first axis, and `x[h]` the offset `h*L*L` (`tilefish.dims.mul`; the declared
 language stays affine, a shape of `L * L` is still refused), which a `Strided[...]` argument binds and a plan evaluates at every bucket, so attention
 scores `[H, L, L]` are a buffer of a plan and their transposes and heads are views of it. A view is a `View[...]` and can go into traced
