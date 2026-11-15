@@ -1,10 +1,16 @@
 # Changelog
 
-Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish` on crates.io. The manifest is schema 3 and the
+Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish` on crates.io (and, from 0.0.8, the C ABI crate
+`tilefish-capi`, which is built from this repository). The manifest is schema 3 and the
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## Unreleased
+## tilefish 0.0.8, crate 0.0.6, tilefish-capi 0.0.1 (2026-11-15)
+
+`tilefish-capi` 0.0.1 (`libtilefish_capi`, ABI 1.0, `tilefish.h`, `tilefish.hpp` and the CMake package) is built from the release commit with cargo or CMake; it is
+not on crates.io. Manifest schema 3 and plan schema 1 are unchanged: a manifest or plan of 0.0.7 loads as before, but a lowered kernel with
+`fp_fusion=False`, a float negation or a narrowing cast of a widened value has another source and declaration digest, so a replay refuses its
+0.0.7 export (export it again; see "Fixed").
 
 ### Plan fusion: arithmetic in a graph body (`docs/rfcs/0001-plan-fusion.md`, phase 1)
 
