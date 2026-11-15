@@ -380,7 +380,10 @@ impl PlanSet {
         let mut entries: Vec<(StepKind, &str)> = Vec::new();
         for plan in plans {
             for step in plan.buckets().iter().flat_map(|b| &b.steps) {
-                if step.kind != StepKind::Copy && seen.insert((step.kind == StepKind::Library, step.entry.as_str())) {
+                // (a copy step and a memset step load nothing)
+                if !matches!(step.kind, StepKind::Copy | StepKind::Memset)
+                    && seen.insert((step.kind == StepKind::Library, step.entry.as_str()))
+                {
                     entries.push((step.kind, &step.entry));
                 }
             }
