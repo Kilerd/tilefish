@@ -202,6 +202,13 @@ the address `address(buffer) + view.offset * itemsize` (an arena buffer at `aren
 entry. So an encode the driver refuses launches nothing, and a step launches with the maps of the memory it binds at this execution; no map is computed when the plan is made or loaded (the
 document has no addresses). Python keeps the last 4096 encodings by their arguments, which makes a repeated execution of one binding encode nothing new, and any other binding another key.
 
+**An operator with an implementation per architecture** (manifest schema 3, section 4.1) is one entry name, its stem, whichever implementation runs, and
+its step's `args` name the operator's tensors, which every implementation takes in the same order; the manifest of the plan's `arch` has the entry of the
+implementation that architecture runs, with its own ABI (a tensor passed as a `pointer` or as a `tensordesc`, its own scalars and `fixed` arguments, its
+own preconditions), which the host follows as for any entry. Nothing in the plan says which implementation it is, so the plan of a graph is one document
+for every architecture. Python's planner resolves every step with every implementation, their preconditions included (a TMA descriptor's 16-byte
+strides, say), so a plan is made only when every implementation can run it.
+
 The one binary an entry names serves every size of its unbucketed dimensions: a plan for `M in {32, 64, 128}` of a row kernel names the entry `rmsnorm` in all three buckets, with `M` bound from
 the shapes of the views; and every value of its fixed arguments given per call: two steps of one prebuilt binary with other `given` values name one entry.
 

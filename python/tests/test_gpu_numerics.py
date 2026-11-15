@@ -219,12 +219,26 @@ def cast_runs(kernel, values):
     return x, {m: o[: len(values)] for m, o in outputs.items()}
 
 
-def test_a_float_to_integer_cast_is_not_lowered():
-    """The measured behavior below is why: it is not one a contract should promise, so the lowering rejects it."""
-    for kernel in (cast_cases.to_u8, cast_cases.to_i32, cast_cases.to_i64):
-        with pytest.raises(tilefish.TilefishLoweringError) as e:
-            kernel.lower()
-        assert e.value.rule == "cast.float-to-int" and "not supported yet" in str(e.value)
+def test_a_float_to_integer_cast_of_the_dsl_is_not_tritons():
+    """The measured behavior below is why a float to integer cast of the DSL says its rounding and saturation (note 18) and is written as
+    inline PTX: the same rz casts, saturating, differ from Triton's .to() for u8 out of [0, 256) and for an i64 NaN, and agree elsewhere."""
+    for kernel, extern, values in (
+        (cast_cases.to_u8, gpu_kernels.cast_to_u8, cast_cases.U8_INPUT),
+        (cast_cases.to_i32, gpu_kernels.cast_to_i32, cast_cases.I32_INPUT),
+        (cast_cases.to_i64, gpu_kernels.cast_to_i64, cast_cases.I64_INPUT),
+    ):
+        assert "inline_asm_elementwise" in kernel.lower().source
+        x = probe(values)
+        ours = tilefish.run(kernel, x)
+        assert same_bytes(ours, tilefish.run(kernel, x, mode="reference"))
+        theirs = tilefish.run(extern, x, mode="jit")
+        differ = {v for v, a, b in zip(values, ours.tolist(), theirs.tolist()) if a != b}
+        if kernel is cast_cases.to_u8:
+            assert differ == {256.0, 257.0, 300.0, 1000.0} and ours[values.index(1000.0)] == 255  # saturating, not the low byte of a u16
+        elif kernel is cast_cases.to_i64:
+            assert len(differ) == 1 and ours[values.index(cast_cases.NAN)] == 0  # a NaN is 0, not -2**63
+        else:
+            assert not differ
 
 
 @pytest.mark.parametrize(

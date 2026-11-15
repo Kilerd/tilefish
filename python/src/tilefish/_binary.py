@@ -32,7 +32,7 @@ import subprocess
 import tempfile
 from typing import TYPE_CHECKING
 
-from ._build import BINARY_DIGEST_KIND, BuiltKernel, LaunchAttributes, _ptxas_version, parse_arch, ptx_type_of
+from ._build import BINARY_DIGEST_KIND, BuiltKernel, LaunchAttributes, _ptxas_version, check_implementation_arch, parse_arch, ptx_type_of
 from ._elf import code_digest, parse_elf
 from .errors import TilefishBuildError
 
@@ -119,7 +119,7 @@ def check_ptx_abi(spec: "CompileSpec", ptx: str, symbol: str) -> None:
     if close < 0:
         raise TilefishBuildError(f"the PTX entry '{symbol}' of '{spec.stem}' has no parameter list end")
     found = _PARAM.findall(ptx[m.end() : close])
-    want = [("pointer" if a.kind == "pointer" else a.type) for a in spec.args]
+    want = [("pointer" if a.kind in ("pointer", "null") else a.type) for a in spec.args]  # a null pointer is a pointer of the C ABI
     ok = len(found) == len(want) and all(f in _ACCEPTED[w] for f, w in zip(found, want))
     if not ok:
         raise TilefishBuildError(
@@ -154,6 +154,7 @@ def build_binary(spec: "CompileSpec", target: "BinaryTarget", *, arch: "int | st
         raise TilefishBuildError(f"'{spec.stem}' is not a prebuilt binary")
     cap = parse_arch(arch)
     arch_name = f"sm_{cap}"
+    check_implementation_arch(spec, cap)  # one implementation of an op declared with by_arch=: an architecture that runs it
     if target.digests != spec.binary["digests"] or target.symbol != spec.binary["symbol"] or target.kind != spec.binary["kind"]:
         raise TilefishBuildError(
             f"the declaration passed to build is not the one the compile spec '{spec.stem}' was made from: its {target.kind} has "

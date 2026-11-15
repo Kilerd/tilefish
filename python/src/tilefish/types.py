@@ -452,6 +452,74 @@ class StrideOf:
 
 
 @dataclass(frozen=True)
+class NullType:
+    """What ``Null[dtype]`` evaluates to: a pointer parameter that every launch passes as the null pointer (see :class:`Null`)."""
+
+    dtype: DType
+
+    def __repr__(self) -> str:
+        return f"Null[{self.dtype}]"
+
+
+class Null:
+    """``Null[f16]``: a pointer parameter of an extern's kernel that the declaration does not use, passed as the **null pointer** at every launch.
+
+    A kernel that takes an optional pointer (a bias, a residual, a scale) and does not touch it in the use being declared, for example a prebuilt
+    kernel ``k(const half* x, const half* bias, half* y, int n)`` that reads ``bias`` only when it is not null, or a Triton kernel that reads it
+    only under a constexpr flag the declaration sets to ``False``, is declared with that parameter ``Null[dtype]`` (``dtype`` the element type
+    of the pointer, which is the parameter's type: ``*fp16``)::
+
+        @tilefish.extern(ptx="k.ptx", symbol="k", block=(256,), grid=lambda n: (tilefish.cdiv(n, 256),))
+        def k(x: Tensor[n, f16], bias: Null[f16], y: Out[Tensor[n, f16]], n_elem: n): ...
+
+    A caller does not pass it (it is not an argument of the call, as an ``Out`` is not), no tensor is bound to it, it binds no dimension and
+    has no precondition, and both hosts write the 64-bit zero at its slot (manifest kind ``null``, schema 3 section 5.6). A Triton kernel gets
+    it as a pointer argument whose value is 0 (no divisibility hint: nothing is loaded through it); a kernel that dereferences it faults, which
+    is the kernel's contract to keep. The use that does pass a tensor is another declaration of the same kernel, with ``Tensor[...]`` there.
+    Only an ``extern`` takes one."""
+
+    def __class_getitem__(cls, item: Any) -> NullType:
+        from .dtypes import ALL_DTYPES
+
+        if not isinstance(item, DType) or ALL_DTYPES.get(item.name) != item:
+            raise TilefishDeclarationError(f"Null[...] takes the element dtype of the pointer, such as Null[f16] or Null[i32], got {item!r}")
+        return NullType(item)
+
+
+@dataclass(frozen=True)
+class DimScalarType:
+    """What ``i64[n]`` evaluates to: a runtime scalar parameter that carries the value of the dimension expression ``dim``, passed as ``dtype``.
+
+    A parameter annotated with a dimension (``n_elem: n``) is an ``i32``, as it always was. ``n_elem: i64[n]`` is the same scalar passed as an
+    ``i64``, for a kernel whose count or size parameter is 64 bits wide (a ``long`` element count of a prebuilt kernel, an ``i64`` scalar of a
+    Triton kernel). Its value is what the tensors of the call bind the dimension to, exactly like an ``i32`` dimension scalar's, so it is
+    derived from the shapes and checked against them, and a launch refuses a value that does not fit (``0`` to ``2**63 - 1``). ``i32[n]`` is
+    ``n``. Only an ``extern`` takes one."""
+
+    dim: DimExpr
+    dtype: DType
+
+    def __repr__(self) -> str:
+        return f"{self.dtype}[{self.dim}]"
+
+
+def dim_scalar(dtype: DType, item: Any) -> "DimScalarType | DimExpr":
+    """``i64[n]`` (``DType.__getitem__``): the annotation of a runtime scalar of ``dtype`` that carries the dimension expression ``n``. ``i32[n]`` is
+    the dimension itself (an ``i32`` scalar, as a parameter annotated with ``n``)."""
+    if dtype.name not in ("i32", "i64"):
+        raise TilefishDeclarationError(
+            f"{dtype}[...]: a runtime scalar that carries a dimension is i32 or i64 (i64[n] for a 64-bit one), not {dtype}"
+        )
+    if isinstance(item, tuple):
+        raise TilefishDeclarationError(f"{dtype}[...] takes one dimension expression, such as {dtype}[n], got {item!r}")
+    try:
+        dim = as_dim(item)
+    except TilefishTypeError:
+        raise TilefishDeclarationError(f"{dtype}[...] takes a dimension expression, such as {dtype}[n], got {item!r}") from None
+    return dim if dtype.name == "i32" else DimScalarType(dim, dtype)
+
+
+@dataclass(frozen=True)
 class Marked:
     """A tensor annotation with an access mode: ``InOut[...]`` or ``Out[...]``."""
 

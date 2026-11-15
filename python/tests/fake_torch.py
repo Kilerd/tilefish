@@ -98,13 +98,15 @@ class FakeTorch:
         return FakeTensor(shape, dtype, ptr)
 
 
-def prepare(op, args, *, next_slab, outputs=None):
+def prepare(op, args, *, next_slab, outputs=None, specialise=True):
     """``runtime._prepare`` of ``op`` on ``args`` (fake tensors): ``(prepared, None)``, or ``(None, error)``. ``outputs`` are the fake tensors its
-    results are written into (``tilefish.run(..., outputs=...)``) instead of allocated ones."""
+    results are written into (``tilefish.run(..., outputs=...)``) instead of allocated ones. ``specialise=False`` decides the call for the binaries of
+    ``op`` itself: a kernel's call on a tensor that is not 16-byte aligned is refused by them, where ``tilefish.run`` runs the kernel's specialisation
+    for it (``KernelOp.unaligned``); what a host decides for one binary is what the cross-language vectors record."""
     saved = runtime._torch
     runtime._torch = lambda: FakeTorch(next_slab)
     try:
-        return runtime._prepare(runtime._target(op), tuple(args), {}, outputs), None
+        return runtime._prepare(runtime._target(op), tuple(args), {}, outputs, specialise=specialise), None
     except TilefishError as e:
         return None, e
     finally:
@@ -120,8 +122,8 @@ def verdict(prepared, error):
     """What Python decided, as plain data: the binary, the grid and the ``kernelParams`` values, or the kind of the refusal.
 
     ``params`` are the values of the ``kernelParams`` slots: a pointer is its address, an ``i32`` or ``i64`` scalar its integer, a fixed argument
-    of a prebuilt binary its value (an integer, or the bits of an ``f32``) and, for a Triton kernel, the two null scratch pointers at the end (a
-    prebuilt binary has none).
+    of a prebuilt binary its value (an integer, or the bits of an ``f32``), a null pointer 0 and, for a Triton kernel, the two null scratch pointers at
+    the end (a prebuilt binary has none).
     """
     if error is not None:
         return {"ok": False, "kind": error.kind if isinstance(error, TilefishPreconditionError) else "other"}
@@ -134,5 +136,7 @@ def verdict(prepared, error):
             params.append(prepared.scalars[a.name])
         elif a.kind == "fixed":
             params.append(f32_bits(a.value) if a.type == "f32" else int(a.value))
+        elif a.kind == "null":  # a pointer every launch passes as null
+            params.append(0)
     scratch = [] if spec.binary is not None else [0, 0]
     return {"ok": True, "stem": spec.stem, "grid": list(prepared.grid) + [1] * (3 - len(prepared.grid)), "params": params + scratch}

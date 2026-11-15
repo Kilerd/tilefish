@@ -464,8 +464,16 @@ LAUNCH_CASES = [
     ("key_mask_any", lambda b: [("i32", (1,)), ("bf16", (b,))], (1, 1000)),
     # M3.3: an Out that may be written over an input (MayAlias): the inputs, then the Out tensors the call is given (r_out apart from r)
     ("add_into", lambda r: [("f32", (r, 64))] * 4, (8, 24)),
+    # 64-bit dimension scalars and null pointers (M3.5): a Triton kernel and a prebuilt PTX that take an i64 count, one kernel declared with a null
+    # pointer and with a tensor, and the specialisation of a lowered kernel for a first row aligned to its element only
+    ("add_one_wide", lambda n: [("u8", (n,))], (16, 1040)),
+    ("scale_null", lambda n: [("f32", (n,))], (16, 1040)),
+    ("scale_bias", lambda n: [("f32", (n,)), ("f32", (n,))], (16, 1040)),
+    ("scale_null_ptx", lambda n: [("f32", (n,))], (16, 1040)),
+    ("scale_bias_ptx", lambda n: [("f32", (n,)), ("f32", (n,))], (16, 1040)),
+    ("add_rows_ua", lambda r: [("i32", (r,)), ("i32", (r,))], (5, 13)),
 ]
-_OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16", "i32": "i64"}
+_OTHER_DTYPE = {"bf16": "f32", "f32": "f16", "f16": "bf16", "i32": "i64", "u8": "i32"}
 I31 = (1 << 31) - 1
 
 
@@ -595,6 +603,18 @@ def _device_scalars(key, base):
             yield j, (dtype, (), ptr + offset, None)
 
 
+def _element_aligned(key, base):
+    """Addresses of every alignment for the inputs of the specialisation of a lowered kernel whose first pointer is aligned to its element only
+    (``add_rows_ua``): ``(input index, (dtype, shape, ptr, strides))``. The first is accepted at a multiple of 4 bytes and refused at 2, the second (still
+    16-byte aligned) refused at 4, 8 and 12."""
+    if key != "add_rows_ua":
+        return
+    for j, offsets in ((0, (2, 4, 12, 20)), (1, (4, 8, 12))):
+        dtype, shape, ptr, _ = base[j]
+        for offset in offsets:
+            yield j, (dtype, shape, ptr + offset, None)
+
+
 def launches():
     """Calls and what ``runtime._prepare`` of Python decides for each (the oracle for the Rust ``Plan::prepare``): ``(records, how_many_binaries)``.
 
@@ -671,8 +691,8 @@ def launches():
 
         def prepare_call(call, after):
             if not given_outs:
-                return prepare(op, [fake(t) for t in call], next_slab=after)
-            return prepare(op, [fake(t) for t in call[:n_in]], next_slab=after, outputs=[fake(t) for t in call[n_in:]])
+                return prepare(op, [fake(t) for t in call], next_slab=after, specialise=False)
+            return prepare(op, [fake(t) for t in call[:n_in]], next_slab=after, outputs=[fake(t) for t in call[n_in:]], specialise=False)
 
         specs = {sp.stem: sp for sp in _target(op).compile_specs()}
         stems |= set(specs)
@@ -695,6 +715,8 @@ def launches():
             for _, new in _views(key, base[0][2], after + 8 * slab):
                 calls.append([new, *base[1:]])
             for j, new in _device_scalars(key, base):
+                calls.append([*base[:j], new, *base[j + 1 :]])
+            for j, new in _element_aligned(key, base):
                 calls.append([*base[:j], new, *base[j + 1 :]])
             for which, (dtype, shape, ptr, strides) in _shared_strides(key, base):
                 call = list(base)

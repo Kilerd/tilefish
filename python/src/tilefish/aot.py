@@ -73,7 +73,8 @@ Schema 3 (written only by a spec that needs it: :attr:`CompileSpec.uses_strided_
 strided views, device scalars and prebuilt binaries need: on a pointer argument ``strides`` and ``offset`` (a ``Strided[...]`` parameter: the
 stride of each axis is the dimension that a ``StrideOf`` scalar carries, or ``1``; the offset is a dimension that is ``divisible_by`` the elements in
 16 bytes when the declaration says ``Strided[..., 16]``, and only then does the pointer get ``tt.divisibility=16``), on a scalar ``stride_of`` and
-the type ``i64`` (the width of the offsets of a kernel with ``index_bits=64``, or the ``dtype`` its ``StrideOf`` declares), the ``max_extent`` precondition (the largest offset a strided view
+the type ``i64`` (the width of the offsets of a kernel with ``index_bits=64``, or the ``dtype`` its ``StrideOf`` declares, or a dimension scalar
+declared ``i64[n]``), the ``max_extent`` precondition (the largest offset a strided view
 reaches, where ``max_elements`` bounds an element count) and a pointer alignment of its element size where nothing more is promised, and for a
 prebuilt PTX or cubin (``extern(ptx=...)``) the ``binary`` section in place of ``triton``, ``num_warps`` and ``num_stages``, ``fixed`` arguments
 (typed constants of its C ABI) and no scratch slots. A pointer with the shape ``[]`` is a ``DevScalar``.
@@ -183,7 +184,7 @@ class ArgSpec:
 
     index: int
     name: str
-    kind: str  # "pointer" | "scalar" | "constexpr"
+    kind: str  # "pointer" | "scalar" | "constexpr" | "tensordesc" | "fixed" | "given" | "null" (a pointer every launch passes as null)
     type: str  # the Triton signature entry
     access: str | None = None  # pointers: "in" | "inout" | "out"
     dtype: str | None = None  # pointers: element dtype; constexprs: the declared const[dtype], if any
@@ -350,13 +351,18 @@ class CompileSpec:
     # The frontend that compiles the kernel: ``"triton"`` (``triton.jit``, Triton's ``ASTSource``) or ``"gluon"`` (``gluon.jit``, Gluon's
     # ``GluonASTSource``: TTGIR with explicit layouts). Written to the spec only for Gluon, so every other spec is as it was.
     language: str = "triton"
-    # The implementation of an op declared with ``extern(by_arch=...)`` this spec is of: the architecture it was declared for (``"sm_103"``) or
-    # ``"fallback"``. It is in the declaration digest. ``None`` (and not written) for every other op.
+    # The implementation of an op declared with ``extern(by_arch=...)`` this spec is of: the architecture it was declared for (``"sm_103"``),
+    # ``"fallback"``, or the name of a named implementation (``tilefish.impl(..., name="tcgen05")``, which several architectures may share). It
+    # is in the declaration digest. ``None`` (and not written) for every other op.
     implementation: "str | None" = None
     # A fingerprint of the content this spec had when it was verified (None: not verified). Not an init
     # argument, so ``dataclasses.replace`` never carries it over to an edited copy; not compared, not
     # shown, and not in to_dict, so it never round-trips as "verified".
     _verified: str | None = field(default=None, init=False, repr=False, compare=False)
+    # For the spec of one implementation of an op declared with ``by_arch=``: which implementation the declaration runs on each architecture, as
+    # ``(((architecture, key), ...), the fallback's key or None)``, known when the spec was generated or verified against the declaration (the
+    # build refuses an architecture that does not run this implementation: ``_build.check_implementation_arch``). Not serialized, not compared.
+    _selection: "tuple[tuple[tuple[str, str], ...], str | None] | None" = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def triton_module(self) -> str:
@@ -436,14 +442,14 @@ class CompileSpec:
     @property
     def uses_strided_schema(self) -> bool:
         """Whether the spec has anything only schema 3 has: a strided pointer or a stride scalar, an ``out`` pointer that may alias an input, a 64-bit scalar, a ``fixed``
-        argument, a ``max_extent`` precondition or a prebuilt binary. A spec without any is schema 2, written as it always was."""
+        argument, a null pointer, a ``max_extent`` precondition or a prebuilt binary. A spec without any is schema 2, written as it always was."""
         return (
             self.binary is not None
             or any(
                 a.strides is not None
                 or a.stride_of is not None
                 or a.alias is not None
-                or a.kind in ("fixed", "given", "tensordesc")
+                or a.kind in ("fixed", "given", "tensordesc", "null")
                 or (a.kind == "scalar" and a.type == "i64")
                 for a in self.args
             )
@@ -480,6 +486,8 @@ class CompileSpec:
                 doc["implementation"] = self.implementation
         else:
             doc["binary"] = copy.deepcopy(self.binary)
+            if self.implementation is not None:  # one implementation (a prebuilt binary) of an op with an implementation per architecture
+                doc["implementation"] = self.implementation
         doc["buckets"] = dict(self.buckets)
         doc["args"] = [a.to_dict() for a in self.args]
         doc["signature"] = dict(self.signature)
@@ -597,6 +605,7 @@ class CompileSpec:
                 f"compile spec '{self.stem}' does not match the declaration of extern op '{op.name}': "
                 f"first difference at {path}: the spec has {_show(got)}, the declaration gives {_show(want)}"
             )
+        object.__setattr__(self, "_selection", expected._selection)  # which architectures run its implementation, as the declaration says
         self._mark_verified()
 
     @classmethod
@@ -769,9 +778,16 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
                 entry["alias"] = p.alias
             if p.tensor_map is not None:  # only a TMA descriptor has it: the box, swizzle, L2 promotion and fill its kernel is built and launched with
                 entry["tensor_map"] = p.tensor_map.canonical()
+            if p.unaligned:  # a dense pointer compiled aligned to its element only (only then: every other declaration digests as it did)
+                entry["align"] = max(1, p.type.dtype.bits // 8)
+        elif p.kind == "null":  # a pointer every launch passes as null (Null[dtype]): its element type, which is the parameter's pointer type
+            assert p.null_dtype is not None
+            entry["dtype"] = _canonical_dtype(p.null_dtype)
         elif p.kind == "dim":
             assert p.dim is not None
             entry["dim"] = _canonical_dim(p.dim)
+            if p.dim_dtype is not None:  # a dimension scalar declared i64[n] (only then: an i32 one digests as it always did)
+                entry["scalar_type"] = p.dim_dtype.name
             if p.stride_of is not None:
                 entry["stride_of"] = stride_of_json(p.stride_of)  # one view as it always was; the views that share a stride as a list
                 if p.stride_dtype is not None and p.stride_dtype.name != _default_stride_type(op):
@@ -792,8 +808,6 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc.update({"triton": op.triton, "num_warps": op.num_warps, "num_stages": op.num_stages})
         if op.language != "triton":  # a Gluon kernel (only then: every other declaration digests as it did)
             doc["language"] = op.language
-        if op.implementation is not None:  # one implementation of an op declared with by_arch= (only then)
-            doc["implementation"] = op.implementation
     else:  # a prebuilt binary: what it is made of (the sha256 of its PTX or cubin), its entry point, block and shared memory
         doc["binary"] = {
             "kind": op.binary.kind,
@@ -802,6 +816,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
             "shared": op.binary.shared,
             "digests": op.binary.digests,
         }
+    if op.implementation is not None:  # one implementation of an op declared with by_arch=, a kernel or a prebuilt binary (only then)
+        doc["implementation"] = op.implementation
     doc["grid"] = None if op.grid is None else [_canonical_dim(g) for g in op.grid]
     doc["params"] = params
     # only kernels that tilefish generated have these (and fp_fusion an extern declared with enable_fp_fusion=); leaving them out
@@ -851,6 +867,11 @@ def stride_scalar_type(op: ExternOp, p: Any) -> str:
     strides and widens them before it multiplies (``row.to(tl.int64) * s_row``) is ``index_bits=64`` with ``StrideOf(..., dtype=i32)``.
     """
     return p.stride_dtype.name if p.stride_dtype is not None else _default_stride_type(op)
+
+
+def dim_scalar_type(p: Any) -> str:
+    """The type a dimension parameter ``p`` (not a stride) is passed as: ``i64`` when it is declared ``i64[n]``, else ``i32``."""
+    return p.dim_dtype.name if p.dim_dtype is not None else "i32"
 
 
 def _bucket_dims(op: ExternOp) -> list[Dim]:
@@ -988,6 +1009,8 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                 for s in t.strides:
                     note(s)  # type: ignore[arg-type]
                 note(t.offset)
+            elif p.unaligned:  # a dense pointer compiled aligned to its element only: no divisibility hint, and the launch checks the element's alignment
+                aligned_bytes = max(1, t.dtype.bits // 8)  # type: ignore[union-attr]
             else:
                 attrs[(i,)] = [["tt.divisibility", ALIGNMENT]]
             preconditions.append(Precondition("pointer_alignment", arg=p.name, index=i, bytes=aligned_bytes))
@@ -1021,7 +1044,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
             )
         elif p.kind == "dim":
             assert p.dim is not None
-            scalar_type = stride_scalar_type(op, p) if p.stride_of is not None else "i32"
+            scalar_type = stride_scalar_type(op, p) if p.stride_of is not None else dim_scalar_type(p)
             signature[p.name] = scalar_type
             note(p.dim)
             dim_text = str(p.dim.folded())  # a static dimension is its size: a host cannot look a name up that it was not told
@@ -1040,6 +1063,11 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
                     stride_of=p.stride_of,
                 )
             )
+        elif p.kind == "null":  # a pointer that every launch passes as null: no tensor, no attribute (nothing is loaded through it), no precondition
+            assert p.null_dtype is not None
+            ptr = p.null_dtype.triton_ptr
+            signature[p.name] = ptr
+            args.append(ArgSpec(i, p.name, "null", ptr, dtype=str(p.null_dtype)))
         elif op.binary is not None:  # a prebuilt binary has no constexprs: a const is a fixed argument of its C ABI, with its value
             assert p.const_dtype is not None
             ty = p.const_dtype.name
@@ -1112,6 +1140,9 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         language=op.language,
         implementation=op.implementation,
     )
+    parent = op.__dict__.get("_tf_of") if op.implementation is not None else None  # the op declared with by_arch= this is an implementation of
+    if parent is not None and parent.selection is not None:
+        object.__setattr__(spec, "_selection", (tuple(sorted(parent.selection.items())), parent.fallback_key))
     spec._mark_verified()  # generated from the declaration just now
     return spec
 

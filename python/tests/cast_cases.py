@@ -11,19 +11,23 @@ import tilefish
 from tilefish import Tensor, bf16, e4m3, e5m2, f16, f32, i32, i64, u8
 
 
+# The float to integer casts of the DSL say their rounding (note 18 of tilefish.lower); these truncate toward zero and saturate, which is
+# not what Triton's own .to() does (the hand-written kernels of gpu_kernels and the tables below)
+
+
 @tilefish.kernel
 def to_u8(x: Tensor[T, f32]) -> Tensor[T, u8]:
-    return x.to(u8)
+    return x.to(u8, rounding="rz")
 
 
 @tilefish.kernel
 def to_i32(x: Tensor[T, f32]) -> Tensor[T, i32]:
-    return x.to(i32)
+    return x.to(i32, rounding="rz")
 
 
 @tilefish.kernel
 def to_i64(x: Tensor[T, f32]) -> Tensor[T, i64]:
-    return x.to(i64)
+    return x.to(i64, rounding="rz")
 
 
 @tilefish.kernel
@@ -48,6 +52,7 @@ def to_bf16(x: Tensor[T, f32]) -> Tensor[T, bf16]:
 
 NAN, INF = float("nan"), float("inf")
 
+# What Triton's own .to() does in a hand-written kernel (gpu_kernels.cast_to_u8 and the like):
 # f32 -> u8: truncate toward zero, clamp to [0, 65535] (negative and NaN give 0), keep the low 8 bits
 U8_INPUT = [-1000.0, -256.0, -129.0, -128.5, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 0.9999, 1.0, 1.5, 1.7, 127.5, 128.0,
             254.5, 254.9, 255.0, 255.5, 256.0, 257.0, 300.0, 1000.0, 65536.0, 1e10, 3e9, -3e9, INF, -INF, NAN, 2.5]

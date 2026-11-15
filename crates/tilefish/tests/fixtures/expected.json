@@ -1,7 +1,7 @@
 {
   "fixtures": {
     "sm_103": {
-      "manifest_digest": "72da0ae5063721cde8036ba8fc4dd669dda7ddfcc564d42d95c6168b44afba82",
+      "manifest_digest": "43e60be4ab7cb58897f61f6df8981e7d54c7e024d38ba0e32c12adac66717072",
       "kernels": [
         {
           "stem": "add_into",
@@ -10,6 +10,22 @@
           "cubin": "add_into.sm_103.cubin",
           "sha256": "d9137defd9d6a217f4e6a883b0b56636678f9de5fb8a0cb87dbe594e8cab62a1",
           "sha256_code": "11234a1811d80aff551337083dba56ef53b22d803ac31c1c00f029482c89e390"
+        },
+        {
+          "stem": "add_one_wide",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "add_one_wide.sm_103.cubin",
+          "sha256": "980e166a5b1788f1a5b46e694d67f66d827a16b0a24586a395b5b81b471c9c1d",
+          "sha256_code": "ba8f993a36f2aa54b9290365781d9dd4084681b8be6839b891fee8a3b763281d"
+        },
+        {
+          "stem": "add_rows__ua0",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "add_rows__ua0.sm_103.cubin",
+          "sha256": "7174b500a22dccca0d0b6e3faba0ce3a483cdbac4dc129960c35b3474d51367f",
+          "sha256_code": "c7dc43416f4499445e2295d130f310e39b9775b58e8f2f58d99b0b8ead3d51f0"
         },
         {
           "stem": "axpy",
@@ -196,6 +212,22 @@
           "sha256_code": "6cba2cf266aa385b800de94870c3984777710d405d57df945af6af13dd387a9e"
         },
         {
+          "stem": "scale_bias",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "scale_bias.sm_103.cubin",
+          "sha256": "6cacfd3e0b6752b464007ee7a4a8cbac801e07c1c1f02d8917270e197eee996f",
+          "sha256_code": "b28796941e0f0fe82363e888f9aab4d0b81e10d27eed001aa8b38b6a16e2ff56"
+        },
+        {
+          "stem": "scale_bias_ptx",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "scale_bias_ptx.sm_103.cubin",
+          "sha256": "38e9f2f03abddc65f19435c5910c2fa07f5445e4cfd6710e6f981e4944046d00",
+          "sha256_code": "d235d4caa1172470d42cef7d464701ccf83c732d8cb414776cbd9cbdb6479ca2"
+        },
+        {
           "stem": "scale_by",
           "arch": "sm_103",
           "kind": "triton",
@@ -210,6 +242,22 @@
           "cubin": "scale_flat.sm_103.cubin",
           "sha256": "f40c7309725a4c905af85bcf74570b9c27b670e2d27d2c0d4ebd6919b7b1e156",
           "sha256_code": "03e005e9e092da9a416257c464bde32c3c72d57f2eba2745fb057ea9d2449792"
+        },
+        {
+          "stem": "scale_null",
+          "arch": "sm_103",
+          "kind": "triton",
+          "cubin": "scale_null.sm_103.cubin",
+          "sha256": "54e866f12eecba4065d861e832530fc9140895d0aab7b898bebefe69978f94f5",
+          "sha256_code": "5be94e7ed6fdad7eacdb6fcb84cacb4e14d3bae024efae90ccb130c8103997e9"
+        },
+        {
+          "stem": "scale_null_ptx",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "scale_null_ptx.sm_103.cubin",
+          "sha256": "38e9f2f03abddc65f19435c5910c2fa07f5445e4cfd6710e6f981e4944046d00",
+          "sha256_code": "d235d4caa1172470d42cef7d464701ccf83c732d8cb414776cbd9cbdb6479ca2"
         },
         {
           "stem": "softmax",
@@ -364,7 +412,7 @@
       ]
     },
     "sm_120": {
-      "manifest_digest": "fdbffba5a5e91376b0ab8ac0a7391b73b9bdadba4d0bd5fb22a42c712078d7ad",
+      "manifest_digest": "c34b13e9d75f0d8263bbce5c481654ce9848e0546525b84c84cc5f3ed094171a",
       "kernels": [
         {
           "stem": "add_into",
@@ -373,6 +421,22 @@
           "cubin": "add_into.sm_120.cubin",
           "sha256": "95bfa9323e20fe69a949f28194dac6800c5f4d7841bb441717586862e2c854fb",
           "sha256_code": "47a370d5602bfa19bfd46bd61f361f22d9a769c74894e542fb415180bf3a4720"
+        },
+        {
+          "stem": "add_one_wide",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "add_one_wide.sm_120.cubin",
+          "sha256": "65583ee49e156a60891c9d2f309942987c0f7b0aa0b697909a58531e387ad723",
+          "sha256_code": "f9c8ff7a4d3ad5c00ab193137bc8468ed81c17ec16c3a4f9a6f59777501fda9c"
+        },
+        {
+          "stem": "add_rows__ua0",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "add_rows__ua0.sm_120.cubin",
+          "sha256": "9ea43c2cc23d03f42c631719645a09bda85bd0101c2e95b4fb90b24f37e4f87a",
+          "sha256_code": "9a85daceb6a5c2aa931ada7cfd9f0f7c17179aca107cd92253b423899fb2fc90"
         },
         {
           "stem": "axpy",
@@ -559,6 +623,22 @@
           "sha256_code": "0010a75c02ab1219146fe6c3ec350578082fb10b20bfef46cbae2e2b7d8f8f0f"
         },
         {
+          "stem": "scale_bias",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "scale_bias.sm_120.cubin",
+          "sha256": "4f3da8ddc5917442a962ee67d906922dbe786f612596b317b46622fd56e2c2c3",
+          "sha256_code": "c1732687680582c9f376bada0fcdfb3ee51494219d58b72fd353d8c20940594e"
+        },
+        {
+          "stem": "scale_bias_ptx",
+          "arch": "sm_120",
+          "kind": "binary",
+          "cubin": "scale_bias_ptx.sm_120.cubin",
+          "sha256": "79ba19c8cb4e1eed2cbe0df089a4bc902b1670c3b0a624d35531f3f9941384bd",
+          "sha256_code": "ea87aea545928040b3df569a40129cbbd0671b2e9a5b1376dc15202c77b1d563"
+        },
+        {
           "stem": "scale_by",
           "arch": "sm_120",
           "kind": "triton",
@@ -573,6 +653,22 @@
           "cubin": "scale_flat.sm_120.cubin",
           "sha256": "b89fa236a1ffe997ac826d33e142be9dfa3284dc73f9ccc6bee5e1870224dd90",
           "sha256_code": "10a8fa09fb7aa801cbe3e6e34d3f899940c8dd290c00720eccae068d85d4be95"
+        },
+        {
+          "stem": "scale_null",
+          "arch": "sm_120",
+          "kind": "triton",
+          "cubin": "scale_null.sm_120.cubin",
+          "sha256": "bb38113ebefd22d677e7dc05a03c89e1fb943c7e9b71c7a614d2cc7577e5fcc2",
+          "sha256_code": "8e4ea73567cff7e22c788c560a92d8228e4b8d71e1c1a12ffebc9fcfd02158d4"
+        },
+        {
+          "stem": "scale_null_ptx",
+          "arch": "sm_120",
+          "kind": "binary",
+          "cubin": "scale_null_ptx.sm_120.cubin",
+          "sha256": "79ba19c8cb4e1eed2cbe0df089a4bc902b1670c3b0a624d35531f3f9941384bd",
+          "sha256_code": "ea87aea545928040b3df569a40129cbbd0671b2e9a5b1376dc15202c77b1d563"
         },
         {
           "stem": "softmax",

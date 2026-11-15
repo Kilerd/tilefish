@@ -257,7 +257,7 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect(tmp_path):
         manifest = Manifest.load(directory, pin=pin)  # verifies every cubin against the manifest; schema 3, which Rust reads too
         if directory == FIXTURES / name:  # (a copy that stands in for a fixture that predates sm_count has a digest of its own)
             assert manifest.digest == want["manifest_digest"], name
-        assert len(manifest.artifacts) == len(want["kernels"]) == 31 and len(manifest.library_entries) == len(want["library"])
+        assert len(manifest.artifacts) == len(want["kernels"]) == 37 and len(manifest.library_entries) == len(want["library"])
         # an extern declared with enable_fp_fusion= records the option it was compiled with
         for stem, fused in (("fma_plain", False), ("fma_fused", True)):
             assert manifest.get(stem, name).entry["options"] == {"num_warps": 4, "num_stages": 3, "enable_fp_fusion": fused}
@@ -286,7 +286,7 @@ def test_the_fixture_digests_are_the_ones_the_rust_tests_expect(tmp_path):
     # the prebuilt binaries are in both: hand-written PTX, the PTX of a Triton build and a cubin
     for name in expected:
         kinds = {k["stem"]: k["kind"] for k in expected[name]["kernels"]}
-        assert {s for s, kind in kinds.items() if kind == "binary"} == {"axpy_cubin", "axpy_ptx", "gelu_ptx", "softmax_ptx", "strided_copy"}, name
+        assert {s for s, kind in kinds.items() if kind == "binary"} == {"axpy_cubin", "axpy_ptx", "gelu_ptx", "softmax_ptx", "strided_copy", "scale_null_ptx", "scale_bias_ptx"}, name
     # the same binary through both doors has the same machine code (the PTX of the Triton build, assembled with Triton's flags)
     by = {k["stem"]: k for k in expected["sm_103"]["kernels"]}
     assert by["gelu_ptx"]["sha256_code"] == by["gelu_exact"]["sha256_code"] and by["softmax_ptx"]["sha256_code"] == by["softmax"]["sha256_code"]

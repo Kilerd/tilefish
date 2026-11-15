@@ -335,7 +335,10 @@ A real model needs four things that a dense, compiled-in, Triton-only operator c
 
 **Strided views.** A tensor type has element strides and an element offset, in the dimension algebra (`TensorType.strides`, `.offset`); dense
 and 16-byte aligned (`contiguous`) is the default. `x.reshape(M, 3, H, D)` (a dense input), `x.permute(1, 0, 2)`, `x[:, 1]` / `x.select(axis, i)` and
-`x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A stride or an offset may be a product of
+`x.split(...)` copy nothing: they are views with the strides and the offset of the operation. A split whose number of chunks depends on a
+dimension (`x.split(16, axis=1)` of `x: [M, C]` with `C = Dim("C", divisible_by=16)`) returns `Chunks`, a sequence of symbolic length:
+`chunks[0]` and `chunks[-1]` always exist, any other chunk where the dimension's smallest size proves it, and `len()` and unpacking
+raise. A stride or an offset may be a product of
 symbolic sizes: an `[H, L, L]` tensor has the stride `L*L` along its first axis, and `x[h]` the offset `h*L*L` (`tilefish.dims.mul`; the declared
 language stays affine, a shape of `L * L` is still refused), which a `Strided[...]` argument binds and a plan evaluates at every bucket, so attention
 scores `[H, L, L]` are a buffer of a plan and their transposes and heads are views of it. A view is a `View[...]` and can go into traced
@@ -365,6 +368,25 @@ the stride to an `i32` and the extent of the view to nothing. The pointer passed
 checks the address); without the `16` Triton gets no hint and any element-aligned view runs. Lowered `@kernel`s still take contiguous tensors only: a
 view in a kernel body is refused with the rule that says so.
 
+**Views that do not start on 16 bytes, given to a lowered kernel.** Every pointer of a lowered kernel is compiled as 16-byte aligned, so a dense view that
+does not provably start on 16 bytes, such as a row `plane[k]` of a `[K, R]` int32 plane with an odd `R`, is not a contiguous tensor. Such a view given to a
+read-only parameter runs the kernel's **specialisation** for it: `kernel.unaligned("a")`, the same kernel with `a` compiled aligned to its element only (no
+`tt.divisibility` for it, a `pointer_alignment` of its element size that every launch checks). It is an operator of its own, keyed apart from the kernel
+everywhere a binary is (its name `add_rows__ua0`, after the indices of those parameters, its stems, its declaration digest, its Triton IR and so its build cache
+key, its manifest entries), and its generated source is the kernel's:
+
+```python
+@tilefish.graph
+def plane_sum(plane: Tensor[3, R, i32]):
+    s = add_rows(plane[1], plane[0])        # plane[1] starts 4 * R bytes in: the step launches add_rows__ua0
+    return add_rows(s, plane[2])            # plane[2] starts 8 * R bytes in: add_rows__ua1
+
+y = tilefish.run(add_rows, plane[1], plane[0])   # an address that is not 16-byte aligned runs add_rows__ua0 too
+```
+
+A graph's export has the specialisations its plan's steps launch; `tilefish.runtime.export(add_rows.unaligned("a"), directory)` writes one for the kernel
+alone, and a replay of a manifest that lacks it says so (`docs/manifest-schema-3.md`, section 6).
+
 **Device scalars.** `n_tok: DevScalar[i32]` is one element in device memory: in the ABI a pointer with the shape `[]`, at the API a tensor of one
 element. A binary reads it with `tl.load`, so one binary serves every value and a value changes by writing memory, never by building; a lowered kernel
 reads it with `tilefish.load(s)` (one `tl.load(ptr)`, broadcast).
@@ -385,6 +407,16 @@ size, an offset) that no tensor determines. One declaration and one binary serve
 Rust `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`; in a graph the value may be an expression of the graph's dimensions (`h_out=H // 2`),
 and each step of the plan records the values of its call at its bucket (`"given": {"h_out": 5}`), so they are in the plan's digest and both hosts
 check them against the entry (`docs/manifest-schema-3.md`, section 5.3).
+
+**Null pointers and 64-bit dimension scalars.** A pointer an extern's kernel does not use in the declared use (a bias it reads only when it is not
+null, or only under a constexpr flag the declaration turns off) is declared `Null[dtype]`: a call does not pass it, and both hosts pass the null pointer
+at its slot (manifest kind `null`, section 5.6). A dimension scalar is an `i32` unless it is declared `i64[n]`: the same scalar passed as an `i64`, its value
+still derived from the shapes and checked against them, for a kernel whose count is 64 bits wide (section 5.7). Both together:
+
+```python
+@tilefish.extern(ptx="scale_bias.ptx", symbol="scale_bias_f32", block=(256,), grid=lambda n: (tilefish.cdiv(n, 256),), index_bits=64)
+def scale(x: Tensor[n, f32], bias: Null[f32], out: Out[Tensor[n, f32]], n_elem: i64[n]): ...    # (const float*, const float*, float*, long long)
+```
 
 **Gluon kernels.** A kernel written in Triton's Gluon dialect (`triton.experimental.gluon`: `@gluon.jit`, layouts written out, so the kernel pins
 which thread holds which element and so the order of its reductions) is declared with `gluon=` in place of `triton=`, and everything else is the same:
@@ -426,6 +458,30 @@ its declaration digest and its compile specs, and its manifest entries record it
 `docs/manifest-schema-3.md`, section 4.1). `replay` selects the implementation of the device's architecture as the export did, so an entry of another
 implementation, or of one that changed (its kernel, options, constants or grid), is refused as stale; another architecture's implementation changing
 leaves this architecture's manifest valid. The Rust crate reads the field (`Entry::implementation`) and launches the entry of its device's architecture.
+
+An implementation can be shared, be a prebuilt binary, and have an ABI of its own:
+
+```python
+def row_sum_tma(x: TensorDesc(Tensor[R, 1024, f32], block=(64, 1024)), y: Out[Tensor[R, f32]], BLOCK_R: const = 64): ...
+
+@tilefish.extern(
+    by_arch={
+        "sm_100": tilefish.impl(triton=my_kernels.row_sum_tma, stub=row_sum_tma, grid=lambda R: (tilefish.cdiv(R, 64),), name="tma"),
+        "sm_103": tilefish.impl(triton=my_kernels.row_sum_tma, stub=row_sum_tma, grid=lambda R: (tilefish.cdiv(R, 64),), name="tma"),
+        "sm_120": tilefish.impl(ptx="row_sum_sm120.ptx", symbol="row_sum", block=(256,)),   # the op's stub is its C ABI
+    },
+    grid=lambda R: (R,),
+)
+def row_sum(x: Tensor[R, 1024, f32], y: Out[Tensor[R, f32]], n_rows: R): ...
+```
+
+`name="tma"` makes one implementation of every architecture mapped to it: one key (`"implementation": "tma"`), one declaration digest, one set of compile
+specs (without a name each architecture has its own, as before). `ptx=` / `cubin=` with `symbol=` and `block=` is a prebuilt binary; a cubin implementation
+needs a cubin for every architecture that runs it. `stub=` lists the kernel's own parameters, so one implementation takes a tensor as a TMA descriptor
+where another takes a pointer, with other scalars, constexprs or fixed arguments. What every implementation must share is the op's public signature: its
+tensors (names, order, access, dtype, shape, `Strided` or not), its fixed arguments per call and its buckets, which is what a caller, a plan step and a typed
+Rust launcher bind. Each manifest entry carries its implementation's ABI, and a plan is checked against every implementation, so it never relies on an
+architecture.
 
 **TMA descriptors.** A Hopper or Blackwell kernel in Triton or Gluon gets its best speed from the Tensor Memory Accelerator, which takes a *tensor
 descriptor*: a 128-byte `CUtensorMap` that the host encodes (`cuTensorMapEncodeTiled`) and passes by value. A parameter declared `TensorDesc(...)` is one:
@@ -638,6 +694,12 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
   (value, index) pairs); a row of up to 16384 columns is walked in chunks of 1024.
 - `tilefish.gather_rows(x, idx, oob="zero" | "clamp")` and `tilefish.scatter_rows(dst, idx, src, oob="skip")` copy rows (or elements) as raw
   bits, with the out-of-range policy declared at the call.
+- `x.to(i32, rounding="rn" | "rz" | "rd" | "ru", saturate=True | False)` (also `i64` and `u8`): a float to integer cast says how it rounds
+  (to nearest even, toward zero, down, up; there is no default) and what a value out of range becomes: clamped to the type's range with a NaN
+  0 (`saturate=True`, the default, Rust's `as`), or the low bits of the `i64` (`saturate=False`: C's narrowing, torch's cast to `u8`). Each is inline PTX
+  (`cvt.rni.s32.f32` and the like) and is byte-identical to the reference on every one of the 2**32 f32 bit patterns (note 18).
+- In the row template, `x[k]` of a read-only parameter is read at its offset: `codes[k]` of a `[K, R]` codes plane is a per-row operand (the
+  index of `gather_rows`), `tables[k]` of a `[K, N, D]` parameter a table, with the dimensions of the offset runtime scalars (note 19).
 - `x.to(bf16, nan="preserve")` keeps a NaN's sign and payload (the default, `"canonical"`, gives `0x7FFF`); `tilefish.sin`, `tilefish.cos` and
   `tilefish.tanh` are libdevice's (`sinf`, `cosf`, `tanhf`), built with flush-to-zero like every libdevice function Triton links: over every f32,
   torch's CUDA bits but `sin` and `tanh` of a subnormal, which are a zero of its sign (notes 10 and 14).

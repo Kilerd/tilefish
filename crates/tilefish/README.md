@@ -49,8 +49,10 @@ Everything schema 3 describes is launched: Triton kernels and prebuilt PTX and
 cubin binaries (launched with exactly their parameters, `fixed` arguments
 written at their slots, and the values of the `given` ones, fixed per call,
 passed by `Kernel::launch_with(stream, tensors, &[("h_out", 5)])` or a plan
-step), strided views (`TensorRef::from_cuda_strided`), device
-scalars (a tensor of one element), `i64` strides, and pinned cuBLASLt GEMMs
+step), null pointers (kind `null`: 0 at their slot, no tensor), strided views
+(`TensorRef::from_cuda_strided`), device scalars (a tensor of one element), `i64`
+strides and dimension scalars, dense pointers that promise only their element's
+alignment (a lowered kernel's specialisation for views), and pinned cuBLASLt GEMMs
 (`Manifest::gemm`, `Gemm::launch`: the cuBLASLt of the process must be the version
 that chose the algorithm, and the workspace is the caller's last tensor, so
 nothing is allocated in a launch and it can be captured in a CUDA graph). An
@@ -85,9 +87,12 @@ so that no load makes a handle (the first run of a cuDNN engine, a load's
 canary, may wait too while CUDA loads its kernels: load them at start-up as
 well). The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
-which one it is (`Entry::implementation`: its own architecture, or
-`"fallback"`); the crate launches the entry of the device's architecture, as
-for any operator. A parameter that is a TMA descriptor of a tensor (manifest
+which one it is (`Entry::implementation`: its own architecture, `"fallback"`,
+or the name of an implementation that several architectures share; a Triton
+kernel or a prebuilt binary); the crate launches the entry of the device's
+architecture with that entry's own ABI (the entries of one operator on other
+architectures may pass a tensor as a TMA descriptor instead of a pointer, or
+take other scalars), as for any operator. A parameter that is a TMA descriptor of a tensor (manifest
 kind `tensordesc`, `ParamKind::Pointer` with a `tensor_map`) is given its
 tensor like a pointer: every launch (and every step of a plan, at every
 execution) checks what the driver would refuse (`PreconditionKind::TensorMap`)

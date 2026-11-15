@@ -20,7 +20,7 @@ from export_rust_vectors import launches, launches_json
 VECTORS = REPO_ROOT / "crates" / "tilefish" / "tests" / "data" / "python_launches.json"
 # a Triton kernel is launched with its parameters and the two null scratch slots; these stems are prebuilt binaries, which are not: their
 # number of kernelParams is the number of parameters of their ABI (the pointers, the scalars and the fixed arguments)
-PREBUILT = {"axpy_ptx": 5, "strided_copy": 4}
+PREBUILT = {"axpy_ptx": 5, "strided_copy": 4, "scale_null_ptx": 4, "scale_bias_ptx": 4}  # the kernelParams of each: its C parameters, a null pointer included
 
 
 @pytest.fixture(scope="module")
@@ -46,7 +46,7 @@ def test_every_kind_of_refusal_a_host_makes_is_in_the_vectors(made):
         "static_size",
         "stride",
     }
-    assert binaries == 28 and len(records) > 900 and kinds["accepted"] > 200
+    assert binaries == 34 and len(records) > 900 and kinds["accepted"] > 200
     # what is accepted has the grid and the parameters of a launch: the pointers, scalars and fixed arguments of the ABI, then (for a Triton
     # kernel only) the two null scratch slots
     for r in records:

@@ -414,6 +414,8 @@ impl Plan {
                     scalars.push(ScalarPlan { name: p.name.clone(), ty: *ty, dim, count_of: None });
                 }
                 ParamKind::Fixed { value } => slots.push(Slot::Fixed(value.bits())),
+                // a null pointer: the 64-bit zero at its slot, as the bits of a fixed argument are written
+                ParamKind::Null { .. } => slots.push(Slot::Fixed(0)),
                 ParamKind::Given { ty } => {
                     slots.push(Slot::Given(given.len()));
                     given.push((p.name.clone(), *ty));

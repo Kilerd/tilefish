@@ -16,11 +16,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from .dims import Dim, DimExpr, describe_pair, dim_text
-from .dtypes import DType
+from .dtypes import BlockScaled, DType
 from .errors import TilefishDeclarationError, TilefishError, TilefishTypeError
 from .ir import BucketRequirement, Requirement
 from .trace import Const, TraceContext, Value
-from .types import ConstType, Marked, StrideOf, StridedType, TensorDescType, TensorType, const
+from .types import ConstType, DimScalarType, Marked, NullType, StrideOf, StridedType, TensorDescType, TensorType, const
 
 if TYPE_CHECKING:
     from .decorators import Op
@@ -39,8 +39,11 @@ class Param:
     """One parameter of an operator, in declaration order.
 
     ``kind`` is ``"tensor"`` (``type`` and ``access`` set), ``"const"``
-    (compile-time scalar; ``const_dtype`` and ``default``) or ``"dim"`` (a
-    runtime scalar carrying the value of the dimension expression ``dim``).
+    (compile-time scalar; ``const_dtype`` and ``default``), ``"dim"`` (a
+    runtime scalar carrying the value of the dimension expression ``dim``;
+    ``dim_dtype`` is ``i64`` for one declared ``i64[n]``) or ``"null"`` (an
+    extern's pointer parameter that every launch passes as the null pointer,
+    ``Null[dtype]``; ``null_dtype`` is its element type).
 
     A tensor parameter declared ``Strided[...]`` has ``strided=True``: its ``type`` carries the strides (each the dimension of
     the ``StrideOf`` parameter of that axis, or ``1`` for the last axis when it has none) and an offset dimension, which a call
@@ -67,6 +70,13 @@ class Param:
     # a tensor the kernel takes as a TMA descriptor (``TensorDesc(...)``): its box, swizzle, L2 promotion and fill (a
     # tilefish._tensormap.TensorMapSpec). A caller passes the tensor; a launch encodes the descriptor of it.
     tensor_map: Any = None
+    # a dimension scalar declared ``i64[n]`` (an extern only): the type it is passed as. ``None`` is an ``i32``, as a parameter annotated ``n``
+    dim_dtype: "DType | None" = None
+    # a null pointer parameter (``Null[dtype]``, an extern only): the element type of the pointer
+    null_dtype: "DType | None" = None
+    # a dense tensor parameter whose pointer is compiled aligned to its element only, not to 16 bytes (a parameter of the specialisation of a
+    # lowered kernel for views that do not start on 16 bytes, ``KernelOp.unaligned``): no divisibility hint, a pointer_alignment of its element size
+    unaligned: bool = False
 
     @property
     def is_callable_arg(self) -> bool:
@@ -92,8 +102,12 @@ class Param:
                 ann = f"InOut[{ann}]"
             elif self.access == "out":
                 ann = f"Out[{ann}" + (f", MayAlias({self.alias!r})" if self.alias is not None else "") + "]"
+        elif self.kind == "null":
+            ann = f"Null[{self.null_dtype}]"
         elif self.kind == "dim":
             ann = f"{self.dim}" if self.stride_of is None else repr(stride_annotation(self.stride_of, self.stride_dtype))
+            if self.dim_dtype is not None:
+                ann = f"{self.dim_dtype}[{self.dim}]"
         else:
             ann = "const" if self.const_dtype is None else f"const[{self.const_dtype}]"
         text = f"{self.name}: {ann}"
@@ -229,6 +243,8 @@ def parse_signature(
     allow_output_dims: bool = False,
     allow_alias: bool = False,
     allow_tensor_map: bool = False,
+    allow_wide_dims: bool = False,
+    allow_null: bool = False,
 ) -> Signature:
     """Read ``fn``'s annotations into a :class:`Signature`.
 
@@ -236,7 +252,9 @@ def parse_signature(
     see :class:`~tilefish.types.Strided`). ``allow_output_dims`` lets the shape of an ``Out`` parameter mention a dimension that no input
     determines (an extern op does: :attr:`Signature.output_dims`). ``allow_alias`` lets an ``Out`` name the input it may be written over
     (``Out[..., MayAlias("r")]``, an extern op: :class:`~tilefish.types.MayAlias`). ``allow_tensor_map`` lets a tensor parameter be a TMA
-    descriptor (``TensorDesc(...)``: a Triton or Gluon extern).
+    descriptor (``TensorDesc(...)``: a Triton or Gluon extern). ``allow_wide_dims`` lets a runtime scalar carry a dimension as an ``i64``
+    (``n_elem: i64[n]``, an extern: :class:`~tilefish.types.DimScalarType`). ``allow_null`` lets a parameter be a pointer that every launch passes
+    as null (``bias: Null[f16]``, an extern: :class:`~tilefish.types.Null`).
     """
     where = f"{what} '{name}'"
     sig = inspect.signature(fn)
@@ -311,10 +329,32 @@ def parse_signature(
             if has_default:
                 raise TilefishDeclarationError(f"{where}: runtime dimension parameter '{pname}' cannot have a default")
             param = Param(pname, index, "dim", dim=ann, keyword_only=kw)
+        elif isinstance(ann, NullType):
+            if not allow_null:
+                raise TilefishDeclarationError(
+                    f"{where}: parameter '{pname}' is {ann!r}, a pointer passed as null, which only an extern op takes (it is a parameter of a kernel "
+                    "that is not used in this declaration)"
+                )
+            if has_default:
+                raise TilefishDeclarationError(f"{where}: the null pointer parameter '{pname}' cannot have a default (a launch always passes null)")
+            param = Param(pname, index, "null", keyword_only=kw, null_dtype=ann.dtype)
+        elif isinstance(ann, DimScalarType):
+            if not allow_wide_dims:
+                raise TilefishDeclarationError(
+                    f"{where}: parameter '{pname}' is {ann!r}, a 64-bit dimension scalar, which only an extern op takes (a {what}'s runtime scalars are i32)"
+                )
+            if ann.dim.is_static:
+                raise TilefishDeclarationError(
+                    f"{where}: parameter '{pname}' is {ann!r}, a static dimension; a runtime scalar needs a dynamic Dim. For a compile-time constant write "
+                    f"`{pname}: const = {ann.dim}`"
+                )
+            if has_default:
+                raise TilefishDeclarationError(f"{where}: runtime dimension parameter '{pname}' cannot have a default")
+            param = Param(pname, index, "dim", dim=ann.dim, keyword_only=kw, dim_dtype=ann.dtype)
         else:
             raise TilefishDeclarationError(
                 f"{where}: parameter '{pname}' has unsupported annotation {ann!r}; "
-                "use Tensor[...], InOut[...], Out[...], DevScalar[...], const, const[dtype] or a Dim"
+                "use Tensor[...], InOut[...], Out[...], DevScalar[...], const, const[dtype], a Dim or (an extern) i64[Dim] or Null[dtype]"
             )
         if param.kind == "tensor" and has_default:
             raise TilefishDeclarationError(f"{where}: tensor parameter '{pname}' cannot have a default")
@@ -837,12 +877,30 @@ def _bind_output_dims(op: "Op", sig: Signature, unifier: _Unifier, ctx: TraceCon
         unifier._bind(d, d, out.name, axis)
 
 
+def _unaligned_ok(op: "Op", p: Param, at: TensorType) -> bool:
+    """Whether the argument type ``at`` of the parameter ``p`` of ``op`` is a view that the specialisation of a lowered kernel for unaligned pointers
+    takes (:meth:`tilefish.decorators.KernelOp.unaligned`): ``op`` is a ``@tilefish.kernel``, ``p`` a read-only tensor parameter of a plain dtype, and
+    the view is dense (row-major strides) at a known offset that is not provably a multiple of 16 bytes. Every element of such a view is at a multiple
+    of its element size, which is all the specialisation is compiled for."""
+    return (
+        getattr(op, "kind", None) == "kernel"
+        and p.access == "in"
+        and not p.is_devscalar
+        and not isinstance(at.dtype, BlockScaled)
+        and not isinstance(p.type.dtype, BlockScaled)  # type: ignore[union-attr]
+        and at.strides is None
+        and at.offset is not None
+        and not at.devscalar
+    )
+
+
 def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
     sig = op.signature
     unifier = _Unifier(op, ctx)
     inputs: list[Value] = []
     seen: dict[int, tuple[str, str]] = {}  # id of the live value -> (parameter, access)
     inout_args: list[tuple[Param, Value, Value]] = []  # parameter, the argument as given, the version it reads
+    unaligned: set[str] = set()  # read-only parameters of a lowered kernel given a dense view that does not provably start on 16 bytes
     for p in sig.tensor_inputs:
         arg = arguments[p.name]
         pt = p.type
@@ -875,7 +933,9 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
                 f"{op.name}: argument '{p.name}': expected {pt}, got {at}: a DevScalar (one element in device memory) is only "
                 "passed to a DevScalar parameter, and a DevScalar parameter takes nothing else"
             )
-        if not at.contiguous and not p.strided:
+        if not at.contiguous and not p.strided and _unaligned_ok(op, p, at):
+            unaligned.add(p.name)  # a dense view that does not provably start on 16 bytes: the kernel's specialisation for it (KernelOp.unaligned)
+        elif not at.contiguous and not p.strided:
             raise TilefishTypeError(
                 f"{op.name}: argument '{p.name}' is a strided view ({at}); this parameter takes a contiguous tensor: pass the "
                 "unsplit tensor, compute from the view (x + 0 is a contiguous copy), or have an extern declare the parameter "
@@ -929,9 +989,13 @@ def _call(op: "Op", arguments: dict[str, Any], ctx: TraceContext) -> Any:
         attrs["consts"] = consts
     if inout_args:
         attrs["inout"] = tuple(p.name for p, _, _ in inout_args)
+    callee = op
+    if unaligned:  # the specialisation of the kernel whose pointers for those parameters are aligned to their element only
+        callee = op.unaligned(*unaligned)  # type: ignore[attr-defined]
+        attrs["unaligned"] = tuple(sorted(unaligned))
     outs = ctx.emit(op.name, inputs, attrs, out_types)
     node = ctx.nodes[-1]
-    node.callee = op
+    node.callee = callee
     for (p, arg, read), version in zip(inout_args, outs[n_results:]):
         # The call consumes the version it read and replaces it: a temporary, a chunk or an older version
         # is a value, so reading it again raises; a parameter's name follows its newest version.

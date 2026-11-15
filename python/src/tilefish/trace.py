@@ -267,17 +267,19 @@ class Value:
 
     # -- methods ------------------------------------------------------------
 
-    def to(self, dtype: Any = _MISSING, *, nan: "str | None" = None) -> "Value":
+    def to(self, dtype: Any = _MISSING, *, nan: "str | None" = None, rounding: "str | None" = None, saturate: "bool | None" = None) -> "Value":
         """Cast to ``dtype``. A narrowing cast is flagged as a rounding point in the IR. ``nan="preserve"`` keeps a NaN's sign and payload
-        in the f32 to bf16 cast (``"canonical"``, the default, gives ``0x7FFF``)."""
+        in the f32 to bf16 cast (``"canonical"``, the default, gives ``0x7FFF``). A float to integer cast says its ``rounding`` (``"rn"``,
+        ``"rz"``, ``"rd"``, ``"ru"``) and may say ``saturate=False`` (wrap) instead of the default clamp; see :func:`tilefish.ops.cast`."""
         from . import ops
 
         if dtype is _MISSING:
             raise TilefishTypeError("to: needs a dtype, e.g. x.to(bf16)")
-        return ops.cast(self, dtype, nan)
+        return ops.cast(self, dtype, nan, rounding, saturate)
 
-    def split(self, size: Any = _MISSING, axis: Any = _MISSING) -> "tuple[Value, ...]":
-        """Split ``axis`` into equal chunks of ``size`` (or into chunks of the given sizes)."""
+    def split(self, size: Any = _MISSING, axis: Any = _MISSING) -> Any:
+        """Split ``axis`` into equal chunks of ``size`` (or into chunks of the given sizes): a tuple, or :class:`~tilefish.ops.Chunks` when the
+        number of chunks depends on a dimension (``chunks[0]``, ``chunks[-1]``); see :func:`tilefish.ops.split`."""
         from . import ops
 
         if size is _MISSING or axis is _MISSING:

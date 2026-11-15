@@ -451,7 +451,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
     kind, ty = d["kind"], d["type"]
-    kinds = ("pointer", "scalar", "constexpr") + (("fixed", "given", "tensordesc") if schema >= STRIDED_SCHEMA else ())
+    kinds = ("pointer", "scalar", "constexpr") + (("fixed", "given", "tensordesc", "null") if schema >= STRIDED_SCHEMA else ())
     if kind not in kinds or not isinstance(ty, str):
         bad(f"arg {d['name']}: kind must be {', '.join(kinds)} and type a string, got {kind!r}, {ty!r}")
     present = set(d) - {"index", "name", "kind", "type"}
@@ -462,6 +462,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         "fixed": {"dtype", "value"},
         "given": {"dtype"},  # a fixed argument per call: its value is the call's (a plan step's), not the spec's
         "tensordesc": {"access", "dtype", "shape", "tensor_map"},  # a TMA descriptor of a tensor: a pointer's facts, and the map
+        "null": {"dtype"},  # a pointer every launch passes as null (Null[dtype]): its element type, nothing a tensor would have
     }[kind]
     optional: "set[str]" = set()
     if kind == "constexpr" and schema >= DIGEST_SCHEMA:
@@ -500,7 +501,11 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         if "strides" in d:
             _check_layout(d)
         return
-    if kind == "given":
+    if kind == "null":
+        dtype = ALL_DTYPES.get(d["dtype"]) if isinstance(d["dtype"], str) else None
+        if dtype is None or dtype.triton_ptr != ty:
+            bad(f"arg {d['name']}: a null pointer's type is the pointer type of its dtype, got {ty!r}/{d['dtype']!r}")
+    elif kind == "given":
         if ty not in ("i32", "i64") or d["dtype"] != ty:
             bad(f"arg {d['name']}: a fixed argument per call is i32 or i64, got {ty!r}/{d['dtype']!r}")
     elif kind == "fixed":
@@ -549,11 +554,26 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
 _SYMBOL = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*\Z")  # a PTX / ELF symbol of a kernel
 _ARCH_KEY = re.compile(r"^sm_[0-9]{2,3}\Z")
 IMPLEMENTATION_FALLBACK = "fallback"
+# the name of a named implementation (``tilefish.impl(..., name="tcgen05")``): an ASCII identifier of at most 64 characters that is not "fallback"
+# and does not look like an architecture (it does not begin with "sm_" and a digit), in any case
+_IMPLEMENTATION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+_LOOKS_LIKE_ARCH = re.compile(r"^sm_[0-9]", re.IGNORECASE)
+
+
+def is_implementation_name(x: Any) -> bool:
+    """Whether ``x`` is the name of a named implementation of an op declared with ``extern(by_arch=...)`` (see ``_IMPLEMENTATION_NAME``)."""
+    return (
+        isinstance(x, str)
+        and _IMPLEMENTATION_NAME.match(x) is not None
+        and x.lower() != IMPLEMENTATION_FALLBACK
+        and _LOOKS_LIKE_ARCH.match(x) is None
+    )
 
 
 def is_implementation(x: Any) -> bool:
-    """Whether ``x`` names an implementation of an op declared with ``extern(by_arch=...)``: an architecture (``"sm_103"``) or ``"fallback"``."""
-    return isinstance(x, str) and (x == IMPLEMENTATION_FALLBACK or _ARCH_KEY.match(x) is not None)
+    """Whether ``x`` names an implementation of an op declared with ``extern(by_arch=...)``: an architecture (``"sm_103"``), ``"fallback"`` or the
+    name of a named implementation."""
+    return isinstance(x, str) and (x == IMPLEMENTATION_FALLBACK or _ARCH_KEY.match(x) is not None or is_implementation_name(x))
 
 
 def validate_binary(b: Any) -> None:
@@ -690,7 +710,7 @@ def validate_spec(d: Any) -> None:
     required = TOP_KEYS_V2 if schema >= DIGEST_SCHEMA else TOP_KEYS
     if is_binary:
         required = [k for k in required if k not in ("triton", "num_warps", "num_stages")] + ["binary"]
-        optional = ["dims"]
+        optional = ["dims", "implementation"]  # (implementation: one implementation of an op declared with extern(by_arch=...))
     _keys(d, "spec", required, optional)
     if "source_sha256" in d and not (isinstance(d["source_sha256"], str) and _DIGEST.match(d["source_sha256"])):
         bad(f"source_sha256 must be 64 lowercase hex digits (a sha256), got {d['source_sha256']!r}")
@@ -701,7 +721,10 @@ def validate_spec(d: Any) -> None:
     if "language" in d and d["language"] != "gluon":  # written only for a Gluon kernel: a Triton kernel's spec has no key (one canonical form)
         bad(f"language is \"gluon\" (the spec of a Gluon kernel) or absent (a triton.jit kernel), got {d['language']!r}")
     if "implementation" in d and not is_implementation(d["implementation"]):
-        bad(f"implementation is an architecture such as \"sm_103\" or \"fallback\" (the implementation of an op declared with by_arch=), got {d['implementation']!r}")
+        bad(
+            f"implementation is an architecture such as \"sm_103\", \"fallback\" or the name of an implementation (an identifier that is not "
+            f"\"fallback\" and does not begin with sm_ and a digit) of an op declared with by_arch=, got {d['implementation']!r}"
+        )
 
     # names
     op = _ident(d["op"], "op")
@@ -829,12 +852,15 @@ def validate_spec(d: Any) -> None:
                     bad(f"pointer_alignment of the descriptor {p['arg']} must be {ALIGNMENT} bytes (the global address of a TMA descriptor), got {p['bytes']}")
                 aligned.add(p["index"])
                 continue
-            if "strides" in a:  # a strided pointer is 16-byte aligned only when its declaration says so, else aligned to its element
+            # a strided pointer is 16-byte aligned only when its declaration says so, else aligned to its element; so is a dense one (a lowered
+            # kernel's specialisation for views that do not start on 16 bytes), but not a device scalar
+            if "strides" in a or a["shape"] != []:
                 itemsize = max(1, ALL_DTYPES[a["dtype"]].bits // 8)
                 if p["bytes"] not in (ALIGNMENT, itemsize):
-                    bad(f"pointer_alignment of the strided pointer {p['arg']} must be {ALIGNMENT} bytes or its element size {itemsize}, got {p['bytes']}")
+                    what = "strided pointer" if "strides" in a else "pointer"
+                    bad(f"pointer_alignment of the {what} {p['arg']} must be {ALIGNMENT} bytes or its element size {itemsize}, got {p['bytes']}")
             elif p["bytes"] != ALIGNMENT:
-                bad(f"pointer_alignment must be {ALIGNMENT} bytes, once, on a pointer argument ({p['arg']})")
+                bad(f"pointer_alignment of the device scalar {p['arg']} must be {ALIGNMENT} bytes, got {p['bytes']}")
             aligned.add(p["index"])
             if p["bytes"] == ALIGNMENT:
                 attr_pointers.add(p["index"])

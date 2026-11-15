@@ -110,6 +110,65 @@ each section names the release that added it.
   biased shapes under cuBLASLt 13.1 is documented: it gives a GEMM with a bias no split-K, a rule of tilefish's, where `addmm` runs the split-K of
   3 with f32 partial sums that the heuristic ranks first for 32 and 64 x 1024 x 3072. No pin changes.
 
+### Breaking changes
+
+- A float to integer cast in a kernel body says its rounding: `x.to(i32)` of a float tensor raises a `TilefishTypeError` at the
+  declaration (it used to trace and then be refused by the lowering, rule `cast.float-to-int`). Write
+  `x.to(i32, rounding="rz")` for a truncation.
+
+### Types, arguments and ops (lane types)
+
+- **64-bit dimension scalars.** An extern's runtime scalar that carries a dimension may be an `i64`: `n_elem: i64[n]` (`i32[n]` is `n`, as before).
+  Its value is derived from the shapes and range-checked as an `i64` by both hosts, where an `i64` count used to be a per-call `given` value nothing
+  checked. The declaration digest has `"scalar_type": "i64"` on the parameter; the manifest has a `scalar` of type `i64` (schema 3, section 5.7).
+- **Null pointers.** A pointer parameter of an extern's kernel that the declaration does not use is `Null[dtype]`: a call passes nothing for it, and both
+  hosts write the 64-bit zero at its slot (a Triton kernel's and a prebuilt binary's alike; manifest kind `null`, section 5.6), where a one-element dummy
+  tensor was needed before. The Rust crate reads it into `ParamKind::Null`.
+- **Lowered kernels on views that do not start on 16 bytes.** A graph that passes a dense view not provably aligned to 16 bytes (a row of a `[K, R]` int32
+  plane with an odd `R`) to a read-only parameter of a lowered kernel runs the kernel's specialisation for it, `kernel.unaligned("a")`
+  (`<kernel>__ua<indices>`), instead of refusing the call; so does `tilefish.run` of an address that is not 16-byte aligned. Its pointers for those
+  parameters have no divisibility hint and promise their element's alignment (a `pointer_alignment` a dense pointer may now have, section 6); its stems,
+  declaration digest, IR and build cache key are its own, its source the kernel's.
+- Float to integer casts are lowered: `x.to(i32 | i64 | u8, rounding="rn" | "rz" | "rd" | "ru", saturate=True | False)` (from f32, bf16,
+  f16, e4m3 or e5m2). `saturate=True`, the default, clamps to the type's range with a NaN 0; `saturate=False` keeps the low bits of the
+  `i64`. Each is a helper of inline PTX (`cvt.rni.s32.f32`, ...), and the `reference` mode computes the declared mode exactly: the two are
+  byte-identical on every f32 bit pattern. Note 18 of `tilefish.lower` says what torch's casts are in these terms.
+- The row template reads a static slice `x[k]` (`x.select(0, k)`) of a read-only parameter at its offset: `codes[k]` of a `[K, R]` codes
+  plane is a per-row operand, such as the index of `gather_rows`, and `tables[k]` of a `[K, N, D]` parameter is a table. A dynamic
+  dimension of the offset is a runtime `i32` parameter (`size_R`) that a host derives from the shapes. Every other view is still refused
+  (rule `view`). Note 19 of `tilefish.lower`.
+- `x.split(16, axis=1)` of a dimension declared only `divisible_by=16` (or whose buckets are all multiples of 16) returns
+  `tilefish.ops.Chunks`, a sequence whose `chunks[0]` and `chunks[-1]` (and any chunk the dimension's smallest size proves) are views,
+  where it used to raise "not a whole number of chunks"; `len()`, iteration and unpacking raise. A split whose count is a number still
+  returns a tuple. Plans and the graph `reference` mode take these chunks.
+- Readers of 0.0.6 and crate 0.0.4 refuse what this adds (`null` parameters, an element-aligned dense pointer); manifests without them load and digest as
+  before. The crate's `ParamKind` gained the variant `Null`.
+
+### Implementations per architecture (manifest schema 3, section 4.1)
+
+- **Named implementations.** `tilefish.impl(..., name="tcgen05")` is one implementation of every architecture `by_arch=` maps to it (and of the
+  fallback, which may be named too): its key is its name, so those architectures share one declaration digest and one set of compile specs, and
+  their manifest entries say `"implementation": "tcgen05"`. A name is an ASCII identifier of at most 64 characters that is not `fallback` and does
+  not begin with `sm_` and a digit; two different implementations may not share one. Without a name nothing changes: keys are architectures, and
+  digests are those of 0.0.6.
+- **Prebuilt binaries as implementations.** `tilefish.impl(ptx="k.ptx", symbol=..., block=..., shared=...)` and `tilefish.impl(cubin={"sm_120":
+  "k.cubin"}, ...)` (paths relative to the file that declares the op). Their entries are `binary` entries with `implementation`. A cubin
+  implementation must have a cubin for every architecture that runs it: refused at the declaration for the architectures `by_arch=` names, at the
+  build for those that fall back to it (PTX whose `.target` an architecture cannot build is refused likewise).
+- **An ABI per implementation.** `tilefish.impl(..., stub=f)` gives an implementation its own stub, the kernel's parameters in order: a TMA
+  descriptor (`TensorDesc`) where the op's stub has a pointer, other scalars, constexprs or fixed arguments. Every implementation must share the op's
+  public signature: its tensors (names, order, access, dtype, shape, `Strided` or not, `MayAlias`), the constraints of their dimensions, its fixed
+  arguments per call and its buckets. `jit` and `replay` launch the implementation of the device with its own ABI; the planner binds every step
+  with every implementation, preconditions included, so a plan never relies on an architecture; the Rust emitter types `launch` from the shared
+  tensors and documents each architecture's ABI.
+- The build refuses a spec of one implementation for an architecture the declaration does not run it on, which now includes the fallback on an
+  architecture that has an implementation of its own (that build's entry was always refused by `replay`).
+- A call that restates a const of an op declared with `by_arch=` is held to the value of the op's stub, as a graph's call is, and to the launched
+  implementation's where it has a constexpr or fixed argument of that name.
+- Both manifest readers accept, as an entry's `implementation`, its architecture, `"fallback"` or a name of that form, on a `triton` or a `binary`
+  entry. Readers of 0.0.6 and crate 0.0.4 refuse a name and an `implementation` on a `binary` entry; manifests without them, and their digests, are
+  unchanged.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

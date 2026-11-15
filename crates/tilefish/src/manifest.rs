@@ -51,8 +51,11 @@ const NUM_WARPS: [u32; 6] = [1, 2, 4, 8, 16, 32];
 const MAX_WARPS: u32 = 32;
 const MAX_STAGES: u32 = 16;
 /// The `implementation` of an entry built from the fallback of an operator declared with an implementation per architecture (the
-/// implementation declared for an architecture is named by that architecture). Python's `IMPLEMENTATION_FALLBACK`.
+/// implementation declared for an architecture is named by that architecture, a named implementation by its name). Python's
+/// `IMPLEMENTATION_FALLBACK`.
 pub const IMPLEMENTATION_FALLBACK: &str = "fallback";
+/// The most characters the name of a named implementation has (Python's `_specvalid._IMPLEMENTATION_NAME`).
+const MAX_IMPLEMENTATION_NAME: usize = 64;
 /// The `source_digest_kind` of a prebuilt binary: its `source_digest` is the sha256 of the PTX or cubin file.
 const BINARY_DIGEST_KIND: &str = "tilefish.binary.v1";
 
@@ -327,6 +330,12 @@ pub enum ParamKind {
         /// How it is passed.
         ty: ScalarType,
     },
+    /// A pointer that every launch passes as null (Python's `Null[dtype]`: a parameter of the kernel that the declaration does not use): the
+    /// 64-bit zero at its own slot. No tensor is bound to it, and it has no precondition.
+    Null {
+        /// The element dtype of the pointer as the manifest names it (its `type` is that dtype's pointer type).
+        dtype_name: String,
+    },
 }
 
 /// One non-constexpr parameter of the launch ABI.
@@ -373,7 +382,7 @@ impl Param {
     pub fn size(&self) -> usize {
         match &self.kind {
             ParamKind::Pointer { tensor_map: Some(_), .. } => 128,
-            ParamKind::Pointer { .. } => 8,
+            ParamKind::Pointer { .. } | ParamKind::Null { .. } => 8,
             ParamKind::Scalar { ty, .. } => match ty {
                 ScalarType::I32 => 4,
                 ScalarType::I64 => 8,
@@ -630,8 +639,10 @@ pub struct Entry {
     /// The sha256 of the declaration the binary was built from.
     pub declaration_digest: String,
     /// Which implementation of an operator declared with an implementation per architecture (`@tilefish.extern(by_arch=...)`) the binary is:
-    /// the entry's own architecture (`"sm_103"`, the one declared for it) or `"fallback"`. `None` for every other operator. It is in the
-    /// declaration digest; a host launches the entry of its device's architecture, so it needs nothing else from it.
+    /// the entry's own architecture (`"sm_103"`, the one declared for it), `"fallback"`, or the name of a named implementation that several
+    /// architectures may share (`"tcgen05"`: an identifier that is not `"fallback"` and does not begin with `sm_` and a digit). `None` for every
+    /// other operator. It is in the declaration digest; a host launches the entry of its device's architecture, with that entry's own ABI, so it
+    /// needs nothing else from it. A Triton entry or a prebuilt binary may have one.
     pub implementation: Option<String>,
     /// The sha256 of the cubin file.
     pub sha256: String,
@@ -988,6 +999,18 @@ pub(crate) fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The name of a named implementation (`tilefish.impl(..., name="tcgen05")`): an identifier of at most 64 characters that is not
+/// `"fallback"` and does not look like an architecture (it does not begin with `sm_` and a digit), in any case. Python's
+/// `_specvalid.is_implementation_name`.
+pub(crate) fn is_implementation_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    let looks_like_arch = b.len() > 3 && b[..3].eq_ignore_ascii_case(b"sm_") && b[3].is_ascii_digit();
+    is_ident(s)
+        && s.len() <= MAX_IMPLEMENTATION_NAME
+        && !s.eq_ignore_ascii_case(IMPLEMENTATION_FALLBACK)
+        && !looks_like_arch
 }
 
 pub(crate) fn is_stem(s: &str) -> bool {
@@ -1698,9 +1721,40 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                 }
                 ParamKind::Given { ty }
             }
+            "null" => {
+                // a pointer every launch passes as null: its dtype, whose pointer type is its type, and nothing else
+                let dtype = p.dtype.as_deref().unwrap_or("");
+                if pointer_type_of(dtype) != Some(p.ty.as_str()) {
+                    return Err(format!(
+                        "parameter {name}: the type of a null pointer {:?} is not the pointer type of its dtype {dtype:?}",
+                        p.ty
+                    ));
+                }
+                if p.ptx_type != "u64" || p.size != 8 {
+                    return Err(format!(
+                        "parameter {name}: a null pointer is passed as a u64 of 8 bytes, got {} of {}",
+                        p.ptx_type, p.size
+                    ));
+                }
+                if p.dim.is_some()
+                    || p.count_of.is_some()
+                    || p.stride_of.is_some()
+                    || p.access.is_some()
+                    || p.shape.is_some()
+                    || p.strides.is_some()
+                    || p.offset.is_some()
+                    || p.value.is_some()
+                    || p.alias.is_some()
+                {
+                    return Err(format!(
+                        "parameter {name} is a null pointer: it has a dtype and nothing a tensor or a scalar has"
+                    ));
+                }
+                ParamKind::Null { dtype_name: dtype.to_owned() }
+            }
             other => {
                 return Err(format!(
-                    "parameter {name}: kind must be pointer, tensordesc, scalar, fixed or given, got {other:?}"
+                    "parameter {name}: kind must be pointer, tensordesc, scalar, fixed, given or null, got {other:?}"
                 ));
             }
         };
@@ -1881,11 +1935,14 @@ impl Entry {
             return Err("source_digest and source_digest_kind come together".to_owned());
         }
         if let Some(chosen) = &raw.implementation
-            && (kind != EntryKind::Triton || (chosen != &raw.arch && chosen != IMPLEMENTATION_FALLBACK))
+            && chosen != &raw.arch
+            && chosen != IMPLEMENTATION_FALLBACK
+            && !is_implementation_name(chosen)
         {
             return Err(format!(
-                "implementation must be the entry's architecture {:?} or {IMPLEMENTATION_FALLBACK:?} (the implementation of an operator declared \
-                 with by_arch= that it is), on a triton entry, got {chosen:?}",
+                "implementation must be the entry's architecture {:?}, {IMPLEMENTATION_FALLBACK:?} or the name of an implementation (an identifier \
+                 of at most {MAX_IMPLEMENTATION_NAME} characters that is not \"fallback\" and does not begin with sm_ and a digit) of an operator \
+                 declared with by_arch=, got {chosen:?}",
                 raw.arch
             ));
         }
@@ -2174,7 +2231,7 @@ impl Entry {
                         }
                     }
                 }
-                ParamKind::Fixed { .. } | ParamKind::Given { .. } => {}
+                ParamKind::Fixed { .. } | ParamKind::Given { .. } | ParamKind::Null { .. } => {}
             }
         }
         for p in &self.params {
@@ -2224,7 +2281,11 @@ impl Entry {
                     let allowed = match kind_of(arg) {
                         // the global address of a TMA descriptor is 16-byte aligned, a view's too
                         Some(ParamKind::Pointer { tensor_map: Some(_), .. }) => Some(vec![ALIGNMENT]),
-                        Some(ParamKind::Pointer { view: Some(_), dtype_name, .. }) => {
+                        // a strided pointer, and a dense one that is not a device scalar (the specialisation of a lowered kernel for views
+                        // that do not start on 16 bytes), may promise only its element's alignment
+                        Some(ParamKind::Pointer { view, shape, dtype_name, .. })
+                            if view.is_some() || !shape.is_empty() =>
+                        {
                             let element = DType::from_name(dtype_name).map_or(1, |d| d.size() as u64);
                             Some(vec![ALIGNMENT, element])
                         }
@@ -2233,7 +2294,7 @@ impl Entry {
                     };
                     if !allowed.is_some_and(|a| a.contains(bytes)) || !aligned.insert(arg.clone()) {
                         return Err(format!(
-                            "pointer_alignment must be {ALIGNMENT} bytes (or, for a strided pointer, its element size), once, on a pointer argument ({arg})"
+                            "pointer_alignment must be {ALIGNMENT} bytes (or, for a pointer that is not a device scalar or a descriptor, its element size), once, on a pointer argument ({arg})"
                         ));
                     }
                 }

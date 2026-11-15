@@ -91,6 +91,13 @@ class DType:
         """True when casting ``self`` -> ``dst`` can round, saturate or truncate."""
         return dst != self and not dst.can_represent(self)
 
+    def __getitem__(self, item: Any) -> Any:
+        """``i64[n]``: the annotation of an extern's runtime scalar parameter that carries the dimension expression ``n`` as an ``i64`` (see
+        :class:`tilefish.types.DimScalarType`); ``i32[n]`` is ``n``. Any other dtype is refused."""
+        from .types import dim_scalar
+
+        return dim_scalar(self, item)
+
     def __reduce__(self) -> Any:
         fields = (
             self.name, self.bits, self.kind, self.triton_ptr, self.triton_scalar,

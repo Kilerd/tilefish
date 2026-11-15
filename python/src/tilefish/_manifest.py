@@ -66,7 +66,7 @@ from ._build import (
 )
 from ._ir import LANGUAGE_OF_KIND, digest_kind
 from ._elf import code_digest, parse_elf, sm_of, uses_shared
-from ._specvalid import IMPLEMENTATION_FALLBACK, parse_expression, parse_grid
+from ._specvalid import IMPLEMENTATION_FALLBACK, is_implementation_name, parse_expression, parse_grid
 from .dtypes import ALL_DTYPES
 from .errors import TilefishBuildError, TilefishManifestError, TilefishSpecError
 
@@ -253,6 +253,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
     it takes ``strides`` (one per axis: a stride dimension, or the fixed stride 1 on the last axis) and ``offset`` (the name of its offset
     dimension) together, and only when it is ``in``. A ``scalar`` is an ``i32`` or an ``i64`` with its ``dim``, a ``count_of`` or a
     ``stride_of`` (an object ``{arg, axis}``, or a list of two or more of them: the views that share the stride), and nothing of a pointer. A ``fixed`` argument belongs to a prebuilt binary and has a ``value`` of its type, and nothing
+    else. A ``null`` pointer (passed as 0 at every launch) has a ``dtype`` whose pointer type is its ``type``, is a ``u64`` of 8 bytes, and has nothing
     else. How the parameters fit together (strides and the scalars that carry them, preconditions) is compared with the compile spec.
     """
 
@@ -379,6 +380,15 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
                 bad(f"parameter {name}: the value of a fixed {ty} argument must be an int, got {value!r}")
             elif not -(2**63) <= value < 2**63 or (ty == "i32" and not -(2**31) <= value < 2**31):
                 bad(f"parameter {name}: the value {value} does not fit {ty}")
+        elif pkind == "null":  # a pointer every launch passes as null (Null[dtype]): of a Triton kernel or a prebuilt binary
+            dtype = p.get("dtype") or ""
+            if ALL_DTYPES.get(dtype) is None or ALL_DTYPES[dtype].triton_ptr != ty:
+                bad(f"parameter {name}: the type of a null pointer {ty!r} is not the pointer type of its dtype {dtype!r}")
+            if p["ptx_type"] != "u64" or p["size"] != 8:
+                bad(f"parameter {name}: a null pointer is passed as a u64 of 8 bytes, got {p['ptx_type']} of {p['size']}")
+            extra = [k for k in ("dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "value", "alias") if _has(p, k)]
+            if extra:
+                bad(f"parameter {name} is a null pointer: it has a dtype and nothing a tensor or a scalar has (it has {extra})")
         elif pkind == "given":  # a fixed argument per call: every launch (every step of a plan) gives its value
             if kind != ENTRY_KIND_BINARY:
                 bad(f"parameter {name}: a fixed argument per call belongs to a prebuilt binary, and this is a {kind} kernel")
@@ -390,7 +400,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
             if any(_has(p, k) for k in ("dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "dtype", "alias", "value")):
                 bad(f"parameter {name} is a fixed argument per call: it has no value, dim or shape (each call gives its value)")
         else:
-            bad(f"parameter {name}: kind must be pointer, tensordesc, scalar, fixed or given, got {pkind!r}")
+            bad(f"parameter {name}: kind must be pointer, tensordesc, scalar, fixed, given or null, got {pkind!r}")
     # an out pointer that may be written over an in pointer (`alias`, the Rust reader's `check_consistent`): that pointer is an `in` one, not strided and
     # not a device scalar, of the same dtype and declared shape, and no other out pointer names it
     from ._specvalid import check_alias_target
@@ -736,13 +746,15 @@ class Manifest:
             value = entry.get(field)
             if value is not None and not (isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)):
                 raise TilefishManifestError(f"'{stem}' ({arch}): {field} must be 64 lowercase hex digits (a sha256), got {value!r}")
-        # which implementation of an op declared with by_arch= the binary is, as the Rust reader reads it: the entry's own architecture or
-        # "fallback", on a Triton entry only (a JSON null is as absent)
+        # which implementation of an op declared with by_arch= the binary is, as the Rust reader reads it: the entry's own architecture,
+        # "fallback" or the name of a named implementation, on a Triton or a prebuilt entry (a JSON null is as absent). Which architectures a
+        # name is declared for is the declaration's to say (a replay compares the entry's with the implementation it runs there)
         chosen = entry.get("implementation")
-        if chosen is not None and (entry_kind != ENTRY_KIND_TRITON or chosen not in (arch, IMPLEMENTATION_FALLBACK)):
+        if chosen is not None and not (chosen == arch or chosen == IMPLEMENTATION_FALLBACK or is_implementation_name(chosen)):
             raise TilefishManifestError(
-                f"'{stem}' ({arch}): implementation must be the entry's architecture '{arch}' or '{IMPLEMENTATION_FALLBACK}' (the implementation of an "
-                f"op declared with by_arch= that it is), on a {ENTRY_KIND_TRITON} entry, got {chosen!r}"
+                f"'{stem}' ({arch}): implementation must be the entry's architecture '{arch}', '{IMPLEMENTATION_FALLBACK}' or the name of an "
+                "implementation (an identifier of at most 64 characters that is not 'fallback' and does not begin with sm_ and a digit) of an op "
+                f"declared with by_arch=, got {chosen!r}"
             )
         kind = entry.get("source_digest_kind")
         if kind is not None and not isinstance(kind, str):

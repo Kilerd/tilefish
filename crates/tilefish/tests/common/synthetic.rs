@@ -74,6 +74,7 @@ pub fn cubin(symbol: &str, sm: u32) -> Vec<u8> {
 pub fn pointer(slot: usize, name: &str, dtype: &str, access: &str, shape: Value, view: Option<(Value, &str)>) -> Value {
     let ty = match dtype {
         "bf16" => "*bf16",
+        "f16" => "*fp16",
         "f32" => "*fp32",
         "i32" => "*i32",
         "u8" => "*u8",

@@ -2194,7 +2194,10 @@ def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, An
                 elif n.op == "select":
                     results = [x.select(n.attrs["axis"], n.attrs["index"])]
                 elif n.op == "split":
-                    results = list(torch.split(x, [size(s) for s in n.attrs["sizes"]], dim=n.attrs["axis"]))
+                    sizes = [size(s) for s in n.attrs["sizes"]]
+                    if "start" in n.attrs:  # a chunk of a split whose count depends on a dimension (tilefish.ops.Chunks): from its start
+                        x = x.narrow(n.attrs["axis"], size(n.attrs["start"]), sum(sizes))
+                    results = list(torch.split(x, sizes, dim=n.attrs["axis"]))
                 else:
                     raise TilefishRuntimeError(
                         f"reference mode of graph '{graph.name}' evaluates the calls to declared operators and the views, not the op '{n.op}' (node #{index}), "

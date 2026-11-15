@@ -73,7 +73,7 @@ def ptx_type_of(kind: str, type_: str) -> "tuple[str, int]":
     """The PTX type name and the size in bytes of one launch parameter, as Triton declares it (a descriptor: its first slot, the CUtensorMap)."""
     if kind == "tensordesc":
         return (TENSORDESC_PTX, 128)
-    return ("u64", 8) if kind == "pointer" else _PTX_SCALARS[type_]
+    return ("u64", 8) if kind in ("pointer", "null") else _PTX_SCALARS[type_]
 
 
 def ptx_slots_of(kind: str, type_: str, rank: int = 0) -> "list[tuple[str, int]]":
@@ -105,13 +105,41 @@ def parse_arch(arch: "int | str") -> int:
 
 
 def check_implementation_arch(spec: "CompileSpec", cap: int) -> None:
-    """The spec of the implementation an op declared with ``by_arch=`` declares for one architecture is built for that architecture only (a
-    fallback for any): a manifest entry's ``implementation`` is its ``arch`` or ``"fallback"``, which both readers hold it to."""
-    if spec.implementation is not None and spec.implementation not in (f"sm_{cap}", IMPLEMENTATION_FALLBACK):
+    """The spec of one implementation of an op declared with ``by_arch=`` is built only for an architecture the declaration runs it on: the one it
+    is declared for, the architectures a named implementation is declared for, any architecture the map does not name for the fallback. A spec that
+    was generated or verified against its declaration knows which (``CompileSpec._selection``); one that was not is held to what the readers can
+    tell: the implementation declared for an architecture is built for that one (a manifest entry's ``implementation`` is its ``arch``,
+    ``"fallback"`` or a name)."""
+    key = spec.implementation
+    if key is None:
+        return
+    arch = f"sm_{cap}"
+    selection = spec._selection
+    if selection is None:
+        if key not in (arch, IMPLEMENTATION_FALLBACK) and re.fullmatch(r"sm_[0-9]{2,3}", key) is not None:
+            raise TilefishBuildError(
+                f"'{spec.stem}' is the implementation declared for {key}, not for {arch}: build the implementation of {arch} (compile_specs(op, arch={cap}))"
+            )
+        return
+    pairs, fallback_key = selection
+    by_arch = dict(pairs)
+    runs = by_arch.get(arch, fallback_key)
+    if runs == key:
+        return
+    if key == IMPLEMENTATION_FALLBACK or (key == fallback_key and key not in by_arch.values()):
+        what = "the fallback" if key == IMPLEMENTATION_FALLBACK else f"the fallback '{key}'"
         raise TilefishBuildError(
-            f"'{spec.stem}' is the implementation declared for {spec.implementation}, not for sm_{cap}: build the implementation of sm_{cap} "
-            f"(compile_specs(op, arch={cap}))"
+            f"'{spec.stem}' is {what}, which the declaration does not run on {arch}: it runs "
+            + (f"its implementation '{runs}' there" if runs is not None else "nothing there")
+            + f"; build the implementation of {arch} (compile_specs(op, arch={cap}))"
         )
+    declared = sorted(a for a, k in by_arch.items() if k == key)
+    what = f"declared for {key}" if declared == [key] else f"'{key}' (declared for {', '.join(declared)}" + (", and the fallback)" if key == fallback_key else ")")
+    raise TilefishBuildError(
+        f"'{spec.stem}' is the implementation {what}, not for {arch}"
+        + (f" (the declaration runs its implementation '{runs}' there)" if runs is not None and runs != arch else "")
+        + f": build the implementation of {arch} (compile_specs(op, arch={cap}))"
+    )
 
 
 def _import_triton() -> Any:
@@ -396,6 +424,8 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
             entry["value"] = _encode(a.value)
         elif a.kind == "given":  # a fixed argument per call: the call (a step of a plan) gives the value
             pass
+        elif a.kind == "null":  # a pointer every launch passes as null: its element type (the pointer type is its `type`), and nothing else
+            entry["dtype"] = a.dtype
         else:
             entry["dim"] = a.dim
             if a.count_of is not None:  # the value is the element count of that pointer argument
