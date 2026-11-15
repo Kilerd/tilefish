@@ -125,7 +125,15 @@ class Span {
 public:
     Span() = default;
     Span(const T* data, size_t size) : data_(data), size_(size) {}
+    // A Span is a parameter type only: the array of a braced list a call is given lives until the call returns, which is all a Span needs.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winit-list-lifetime"
+#endif
     Span(std::initializer_list<T> list) : data_(list.begin()), size_(list.size()) {}
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
     Span(const std::vector<T>& v) : data_(v.data()), size_(v.size()) {}  // NOLINT(google-explicit-constructor)
     const T* data() const noexcept { return data_; }
     size_t size() const noexcept { return size_; }

@@ -1678,7 +1678,8 @@ void tilefish_captured_plan_destroy(struct tilefish_captured_plan *captured);
  */
 static inline bool tilefish_abi_compatible(void) {
     uint32_t version = tilefish_abi_version();
-    return (version >> 16) == TILEFISH_ABI_MAJOR && (version & 0xffffu) >= TILEFISH_ABI_MINOR;
+    uint32_t minor = TILEFISH_ABI_MINOR; /* a variable: `>= 0` of an unsigned would warn (-Wtype-limits) while the minor version is 0 */
+    return (version >> 16) == TILEFISH_ABI_MAJOR && (version & 0xffffu) >= minor;
 }
 
 #endif /* TILEFISH_H */
