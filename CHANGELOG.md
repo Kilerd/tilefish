@@ -27,7 +27,8 @@ each section names the release that added it.
   1154 to 1166 ms instead of 1424 to 1436. Captures on several threads measured no faster (the driver serializes them).
 - **`cudnnCreate` waits for the whole device**, every stream, not only the NULL stream (measured, cuDNN 9.10.2), so the first
   convolution loaded while work runs stalls behind it. `tilefish::CudnnHandle::new(&ctx)` (crate) and
-  `tilefish.runtime.warm_cudnn(device)` (Python) make the handle at start-up and keep it, so that no load makes one.
+  `tilefish.runtime.warm_cudnn(device)` (Python) make the handle at start-up and keep it, so that no load makes one (the first run
+  of a cuDNN engine, a load's canary, may also wait while CUDA loads its kernels lazily: load convolutions at start-up too).
 - The crate no longer turns on serde_json's `preserve_order` for the whole host process, and reads the same with or without it: the
   order of an entry's `buckets` and `dims` and of a plan's `dims` comes from the file; `tilefish::json::parse_strict` returns every
   object in code point order.

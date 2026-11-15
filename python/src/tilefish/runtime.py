@@ -1006,7 +1006,8 @@ def warm_cudnn(device: Any = None) -> None:
     on every stream (measured with cuDNN 9.10.2 on a B300: one second of work queued on the NULL stream, on a blocking stream, on a non-blocking stream or on
     a torch stream each made it take one second), so the first pinned convolution prepared while other work runs stalls behind that work. Called at start-up,
     before any work is queued, it costs a few milliseconds; the handle is kept for the process, and every convolution (alone, in a plan, in any manifest)
-    uses it, so none waits again. A plan with convolutions creates it in :func:`prepare` too."""
+    uses it, so none makes one again. A plan with convolutions creates it in :func:`prepare` too. (The first run of a cuDNN engine on the device, a replay's
+    canary, may also wait for the device while CUDA loads its kernels lazily: prepare the convolutions at start-up too.)"""
     from . import _cudnn
 
     index = device if device is None or isinstance(device, int) else _device_index(_torch(), str(device))

@@ -1820,8 +1820,11 @@ fn the_canary_of_a_load_is_never_on_the_null_stream() {
 }
 
 /// `cudnnCreate` waits for all the work on the device, not only the NULL stream's: a `CudnnHandle` made while a non-blocking stream of the
-/// context is held by a host function returns only when that stream is done. Made first, and kept, it is the handle every convolution loaded in
-/// the context shares: loads made with it alive, while the stream is held again, return before the stream is done (no load makes a handle).
+/// context is held by a host function returns only when that stream is done. Kept, it is the handle every convolution loaded in the context
+/// shares, also once every convolution was dropped: loads of a manifest that has loaded nothing, with the stream held again, return before it is
+/// done (no load makes a handle). Without it, the first load after every convolution and the handle were dropped makes a handle, and waits.
+/// (The convolutions are loaded once with nothing held first: the first run of a cuDNN engine in a context, a load's canary, may wait for the
+/// device too, while CUDA loads its kernels lazily; measured for one of the gate's ten convolutions.)
 #[test]
 fn a_cudnn_handle_made_first_spares_the_loads_the_wait_of_cudnn_create() {
     extern "C" fn hold(_: *mut c_void) {
@@ -1851,21 +1854,35 @@ fn a_cudnn_handle_made_first_spares_the_loads_the_wait_of_cudnn_create() {
     let made = began.elapsed();
     let waited = !busy_now();
     busy.synchronize().unwrap();
-    // with the handle alive, loads of a manifest that has loaded nothing make no handle, and do not wait for the held stream
+    let load_all = |m: &Manifest| -> Vec<tilefish::Conv> {
+        convs.iter().map(|c| m.conv(&gpu.ctx, c["stem"].as_str().unwrap(), &[], arch).unwrap()).collect()
+    };
+    // every convolution run once (nothing held), then dropped: only the CudnnHandle holds the context's handle
+    drop(load_all(&Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap()));
+    // loads of a manifest that has loaded nothing, the stream held: no handle is made, and nothing waits for the stream
     let fresh = Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap();
     hold_busy();
     let began = std::time::Instant::now();
-    let loads: Vec<_> = convs.iter().map(|c| fresh.conv(&gpu.ctx, c["stem"].as_str().unwrap(), &[], arch)).collect();
+    let loads = load_all(&fresh);
     let took = began.elapsed();
     let still_busy = busy_now();
     busy.synchronize().unwrap();
-    for load in &loads {
-        assert!(load.is_ok(), "{:?}", load.as_ref().err());
-    }
+    // without it: every convolution and the handle dropped, the next load makes a handle, and waits for the held stream
+    drop(loads);
+    drop(handle);
+    let other = Manifest::load(gate_dir().join("manifest"), Pin::TrustDirectory).unwrap();
+    hold_busy();
+    let began = std::time::Instant::now();
+    let one = other.conv(&gpu.ctx, convs[0]["stem"].as_str().unwrap(), &[], arch).unwrap();
+    let remade = began.elapsed();
+    let waited_again = !busy_now();
+    busy.synchronize().unwrap();
+    drop(one);
     println!(
         "rust gate: a cuDNN handle made with a non-blocking stream held took {made:?} (the stream done when it returned: {waited}); {} loads with \
-         the handle alive and the stream held again took {took:?} (the stream still held: {still_busy})",
-        loads.len()
+         the handle kept and the stream held again took {took:?} (the stream still held: {still_busy}); without it, a load that made a handle \
+         took {remade:?} (the stream done: {waited_again})",
+        convs.len()
     );
     assert!(
         waited,
@@ -1875,8 +1892,7 @@ fn a_cudnn_handle_made_first_spares_the_loads_the_wait_of_cudnn_create() {
         still_busy,
         "the loads took {took:?}, and the held stream was done when they returned: a load made a handle"
     );
-    drop(loads);
-    drop(handle);
+    assert!(waited_again, "a load that made a handle returned in {remade:?} with the stream still held");
 }
 
 /// The bf16 nearest to an f32 (round to nearest, ties to even), as Triton's `.to(tl.bfloat16)` rounds a finite value.

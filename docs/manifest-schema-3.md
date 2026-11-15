@@ -896,10 +896,14 @@ behind a one-second spin kernel queued on the NULL stream, on a blocking stream,
 idle device); the Rust gate holds a non-blocking stream with a host function and sees `CudnnHandle::new` return only when it is done
 (`a_cudnn_handle_made_first_spares_the_loads_the_wait_of_cudnn_create`). That wait orders nothing wrongly, and it is once per context: **one cuDNN
 handle per CUDA context**, shared by every convolution loaded in it from any manifest, alone or in a plan, and alive as long as the last of them (Python
-has one per device, kept for the process). The first load of a convolution in a context therefore stalls behind whatever the host has queued; a host
-that loads convolutions while work runs makes the handle at start-up, before it queues any work, and keeps it: `tilefish::CudnnHandle::new(&ctx)` in
-the crate (no load in the context makes a handle while it lives: the same test loads the gate's convolutions with the stream held again, and they
-return before it is done), `tilefish.runtime.warm_cudnn(device)` in Python (or `tilefish.runtime.prepare` of a plan with convolutions). Every
+has one per device, kept for the process). The first load of a convolution in a context therefore stalls behind whatever the host has queued (in the
+crate, again after every convolution of the context was dropped); a host that loads convolutions while work runs makes the handle at start-up, before
+it queues any work, and keeps it: `tilefish::CudnnHandle::new(&ctx)` in the crate (no load in the context makes a handle while it lives: the same test
+drops every convolution, then loads them from a manifest that has loaded nothing with the stream held again, and they return before it is done; with
+the handle dropped too, the next load waits), `tilefish.runtime.warm_cudnn(device)` in Python (or `tilefish.runtime.prepare` of a plan with
+convolutions). The handle is not all that can wait: the first run of a cuDNN engine in a context (a load's canary) may wait for the device too, while
+CUDA loads the engine's kernels lazily (measured for one of the gate's ten convolutions, with the handle made), so such a host loads its
+convolutions at start-up as well. Every
 use of a handle is under its lock in both hosts: the heuristic queries and the descriptors and plans of a load or a pin, a canary, and a call (which
 sets the stream right before it runs); the crate also destroys a convolution's plan under it. Measured on a B300 MIG slice (cuDNN 9.10.2, release
 build), loading 700 small entries (`[1, T, 64]` f16 by a k7 filter, T from 16 to 365, half legacy, half backend) in one context: with a handle per

@@ -81,7 +81,9 @@ its convolutions, and opens libcudnn only for a manifest that has a
 convolution. Making that handle (`cudnnCreate`) waits for all the work queued
 on the device, on every stream: a host that loads convolutions while work runs
 makes `CudnnHandle::new(&ctx)` at start-up, before it queues any, and keeps it,
-so that no load waits. The entry of an operator declared
+so that no load makes a handle (the first run of a cuDNN engine, a load's
+canary, may wait too while CUDA loads its kernels: load them at start-up as
+well). The entry of an operator declared
 with an implementation per architecture (`@tilefish.extern(by_arch=...)`) says
 which one it is (`Entry::implementation`: its own architecture, or
 `"fallback"`); the crate launches the entry of the device's architecture, as
