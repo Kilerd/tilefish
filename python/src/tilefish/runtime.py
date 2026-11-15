@@ -108,6 +108,7 @@ from typing import Any, Iterator
 
 from . import _cache, _cuda, _cudamath, _ir, _source
 from ._build import BuiltKernel, build, check_launch_config, resolve_triton, write_file, write_manifest_doc
+from ._cuda import sm_partition as sm_partition  # tilefish.runtime.sm_partition(sms): the partition (a green context) a persistent grid is resolved for
 from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
@@ -530,6 +531,13 @@ def _specialised(target: _Target, infos: "dict[str, TensorInfo]") -> _Target:
     return _target(kernel.unaligned(*names))
 
 
+def _grid_of(extern: ExternOp, spec: CompileSpec) -> "tuple[DimExpr, ...]":
+    """The grid expressions of the binary ``spec`` of ``extern``: its declared grid, or the one ``by_bucket=`` gives that bucket."""
+    grid = extern.grid_for(spec.buckets)
+    assert grid is not None
+    return grid
+
+
 def _check_given(op_name: str, p: Param, info: TensorInfo, dims: "dict[Dim, int]") -> None:
     """An ``Out`` tensor a call is given: its dtype, rank and contiguity, and the shape its parameter has under the bound dimensions (what a launch
     would allocate)."""
@@ -577,8 +585,7 @@ def _finish_launch(
     check_no_alias(infos, written, {p.name: p.alias for p in extern.signature.params if p.alias is not None})
     check_spec_preconditions(spec, infos, scalars, dims)
     check_tensor_maps(spec, infos)
-    assert extern.grid is not None
-    return scalars, eval_grid(spec, extern.grid, dims)
+    return scalars, eval_grid(spec, _grid_of(extern, spec), dims)
 
 
 def check_tensor_maps(spec: CompileSpec, infos: "dict[str, TensorInfo]") -> None:
@@ -711,7 +718,13 @@ def _launch_built(prep: _Prepared, built: BuiltKernel, index: int) -> None:
                 args.append((kind, int(v)))
         loaded = _cuda.load(built, index)
         stream = torch.cuda.current_stream(index).cuda_stream
-        loaded.launch(prep.grid, args, stream)
+        if not built.launch.global_scratch_size:
+            loaded.launch(prep.grid, args, stream)
+            return
+        # the global scratch of this launch: allocated on its stream (torch's blocks start on 512 bytes), freed after it (the caching allocator
+        # reuses it on this stream only after the launch, which is ordered before any later work of the stream)
+        scratch = torch.empty(max(loaded.scratch_bytes(prep.grid), 1), dtype=torch.uint8, device=f"cuda:{index}")
+        loaded.launch(prep.grid, args, stream, scratch=int(scratch.data_ptr()))
 
 
 def build_binary_for_device(spec: CompileSpec, target: Any, device_index: int) -> BuiltKernel:

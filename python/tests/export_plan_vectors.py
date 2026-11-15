@@ -118,6 +118,8 @@ def mutations():
         ("step kind", setter([*steps0, 0, "kind"], "launch")),
         ("step kind swapped", setter([*steps0, 0, "kind"], "library")),
         ("workspace on a kernel", setter([*steps0, 0, "workspace"], "workspace")),
+        # (in every bucket: the document holds, and the manifest refuses it, as the entry has no global scratch: tilefish 0.0.7)
+        ("workspace on a kernel without a global scratch", lambda d: [b["steps"][0].update(workspace="workspace") for b in d["buckets"]]),
         ("workspace missing", deleter([*steps0, 1, "workspace"])),
         ("workspace is not one", setter([*steps0, 1, "workspace"], "x")),
         ("workspace is a list", setter([*steps0, 1, "workspace"], ["workspace"])),

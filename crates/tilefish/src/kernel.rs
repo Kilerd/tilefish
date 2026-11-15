@@ -80,6 +80,9 @@ struct Loaded {
     function: CudaFunction,
     context: Arc<CudaContext>,
     device: DeviceInfo,
+    /// The SMs a persistent kernel's grid is resolved for (the device's, or the partition the manifest says the host runs on); `None` for any
+    /// other kernel.
+    sm_count: Option<u64>,
     stem: String,
     arch: String,
 }
@@ -131,6 +134,12 @@ impl Kernel {
         &self.loaded.context
     }
 
+    /// The SMs a persistent kernel's grid is resolved for (the device's multiprocessor count, or the partition of
+    /// [`Manifest::with_sm_partition`]); `None` for any other kernel.
+    pub fn sm_count(&self) -> Option<u64> {
+        self.loaded.sm_count
+    }
+
     /// What a call is checked against.
     pub fn plan(&self) -> &Plan {
         &self.plan
@@ -154,7 +163,7 @@ impl Kernel {
     /// The `CUtensorMap` of every TMA descriptor parameter is encoded here (`cuTensorMapEncodeTiled`), from the tensor of the call: a launch
     /// passes the maps of its own tensors, and a launch on a capturing stream is captured with them by value.
     pub fn check_with(&self, tensors: &[TensorArg<'_>], given: &[(&str, i64)]) -> Result<Prepared> {
-        let mut prepared = self.plan.prepare_with(tensors, given, Some(&self.loaded.device))?;
+        let mut prepared = self.plan.prepare_for(tensors, given, Some(&self.loaded.device), self.loaded.sm_count)?;
         if !prepared.maps.is_empty() {
             ffi::encode_tensor_maps(&mut prepared)?;
         }
@@ -236,15 +245,46 @@ impl Manifest {
                 ctx.ordinal()
             )));
         }
-        let key = (index, ctx.cu_ctx() as usize);
+        let attribute =
+            |a: CUdevice_attribute, call: &'static str| ctx.attribute(a).map(i64::from).map_err(Error::driver(call));
+        // a persistent kernel: the SMs its grid is resolved for, the partition the host said it runs on or the device's (a green context reports
+        // the device's count to every query); one whose bytes depend on the count runs on the count it was declared for only
+        let sm_count = match entry.persistent {
+            None => None,
+            Some(p) => {
+                let sms = match self.sm_partition {
+                    Some(sms) => sms,
+                    None => u64::try_from(attribute(
+                        CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                        "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)",
+                    )?)
+                    .unwrap_or(0),
+                };
+                if sms == 0 {
+                    return Err(Error::Unsupported(format!(
+                        "'{}' ({}) is a persistent kernel, and a partition of 0 SMs runs no program of it",
+                        entry.stem, entry.arch
+                    )));
+                }
+                if let Some(declared) = p.sm_count.filter(|d| *d != sms) {
+                    return Err(Error::Unsupported(format!(
+                        "'{}' ({}) is a persistent kernel whose bytes depend on how many programs run, declared for {declared} SMs, but this \
+                         device{} has {sms}: declare it for this SM count (another operator) to run it here",
+                        entry.stem,
+                        entry.arch,
+                        if self.sm_partition.is_some() { " partition" } else { "" }
+                    )));
+                }
+                Some(sms)
+            }
+        };
+        let key = (index, ctx.cu_ctx() as usize, sm_count);
         let mut cache = self.kernels.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cached) = cache.get(&key)
             && let Some(loaded) = cached.loaded.upgrade()
         {
             return Ok(Kernel { loaded, plan: Arc::clone(&cached.plan) });
         }
-        let attribute =
-            |a: CUdevice_attribute, call: &'static str| ctx.attribute(a).map(i64::from).map_err(Error::driver(call));
         let max_grid = max_grid(attribute)?;
         let shared_optin = attribute(
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
@@ -287,6 +327,7 @@ impl Manifest {
                 function,
                 context: Arc::clone(ctx),
                 device: DeviceInfo { ordinal: ctx.ordinal() as i32, context: Some(ctx.cu_ctx() as usize), max_grid },
+                sm_count,
                 stem: entry.stem.clone(),
                 arch: entry.arch.clone(),
             }),

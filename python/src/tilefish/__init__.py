@@ -44,7 +44,7 @@ from . import aot
 from . import ops as _ops
 from ._conv import CudnnTable
 from ._library import AlgoTable
-from .decorators import ExternOp, GraphOp, Implementation, KernelOp, LibraryOp, Op, extern, graph, impl, kernel, library
+from .decorators import Config, ExternOp, GraphOp, Implementation, KernelOp, LibraryOp, Op, Persistent, config, extern, graph, impl, kernel, library, persistent
 from .dims import Dim, DimExpr, cdiv
 from .dtypes import (
     BlockScaled,
@@ -106,6 +106,7 @@ __all__ = [
     "BlockScaled",
     "BucketRequirement",
     "CapturedPlan",
+    "Config",
     "Const",
     "CudnnTable",
     "DType",
@@ -126,6 +127,7 @@ __all__ = [
     "Null",
     "Op",
     "Out",
+    "Persistent",
     "Plan",
     "Requirement",
     "Scalar",
@@ -158,6 +160,7 @@ __all__ = [
     "capture",
     "cdiv",
     "col2im1d",
+    "config",
     "const",
     "contiguous",
     "cos",
@@ -187,6 +190,7 @@ __all__ = [
     "mean",
     "neg",
     "plan",
+    "persistent",
     "rcp",
     "rsqrt",
     "run",

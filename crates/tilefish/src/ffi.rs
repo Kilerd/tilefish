@@ -2,7 +2,8 @@
 //!
 //! The CUDA driver is cudarc's safe layer: contexts, modules, functions, attributes and streams are cudarc's, and so is the launch
 //! builder that [`Kernel::launch`] goes through; [`Kernel::launch_raw`] uses cudarc's `result::launch_kernel` for a stream that
-//! cudarc does not own. cuBLASLt is cudarc's `cublaslt::result` and `cublaslt::sys`, called from the `cublaslt` submodule. The calls to
+//! cudarc does not own. A kernel of thread-block clusters (manifest schema 3, section 4.5) is launched with `cuLaunchKernelEx` and the cluster
+//! attribute ([`launch_prepared`]), which cudarc has no wrapper of. cuBLASLt is cudarc's `cublaslt::result` and `cublaslt::sys`, called from the `cublaslt` submodule. The calls to
 //! `cudarc::driver::sys` in this crate are the probe of [`driver_available`], the version of the driver (`cuDriverGetVersion`), the query of the
 //! parameter sizes of a loaded function (`cuFuncGetParamInfo`) and the eager load of a function of a plan (`cuFuncLoad`, in the `plan`
 //! submodule), which cudarc has no wrappers for; `result::graph::launch` launches a captured plan on another stream than its own. The `unsafe` code of the crate is in the items of this module and its
@@ -265,8 +266,102 @@ enum Holder<'t> {
     Guard(#[allow(dead_code)] SyncOnDrop<'t>),
 }
 
+/// The `cuLaunchKernelEx` attributes of a launch of a kernel of clusters: the cluster's dimensions, and the spread scheduling policy Triton's own
+/// launcher asks for (`CU_CLUSTER_SCHEDULING_POLICY_SPREAD`).
+fn cluster_attributes(cluster: [u32; 3]) -> [sys::CUlaunchAttribute; 2] {
+    let mut dimension = sys::CUlaunchAttributeValue { pad: [0; 64] };
+    dimension.clusterDim =
+        sys::CUlaunchAttributeValue_union__bindgen_ty_1 { x: cluster[0], y: cluster[1], z: cluster[2] };
+    let mut policy = sys::CUlaunchAttributeValue { pad: [0; 64] };
+    policy.clusterSchedulingPolicyPreference = sys::CUclusterSchedulingPolicy::CU_CLUSTER_SCHEDULING_POLICY_SPREAD;
+    [
+        sys::CUlaunchAttribute {
+            id: sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION,
+            pad: [0; 4],
+            value: dimension,
+        },
+        sys::CUlaunchAttribute {
+            id: sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE,
+            pad: [0; 4],
+            value: policy,
+        },
+    ]
+}
+
+/// Launch `function` on the raw `stream` with the `kernelParams` of `prepared` (each slot pointing at its value, the slot of a TMA descriptor at
+/// the 128 bytes of its encoded map): `cuLaunchKernel` (cudarc's `result::launch_kernel`), or for a kernel of clusters `cuLaunchKernelEx` with the
+/// cluster attribute (cudarc has no wrapper of it); the grid is `prepared.grid`, the blocks of the launch.
+///
+/// # Safety
+///
+/// `function` is a function of a loaded module whose function was checked to take the parameter sizes of the ABI `prepared` was made from (by
+/// `Plan::prepare`, for that very entry: its slots, its grid against the device, its addresses against their memory); `stream` is a valid stream
+/// of the function's context, which is current on this thread; and the memory the addresses name stays allocated, and is ordered against other
+/// streams, until the kernel has run (the caller's: `ordered`, a plan's arena, or the contract of `launch_raw`).
+#[allow(unsafe_code)]
+pub(crate) unsafe fn launch_prepared(
+    function: sys::CUfunction,
+    prepared: &Prepared,
+    block: [u32; 3],
+    shared: u32,
+    stream: sys::CUstream,
+) -> Result<()> {
+    let count = prepared.count;
+    let mut values = prepared.values;
+    let mut maps = prepared
+        .maps
+        .iter()
+        .map(|m| m.bytes.ok_or_else(|| Error::Launch("a tensor map was not encoded".to_owned())))
+        .collect::<Result<Vec<_>>>()?;
+    let mut params: [*mut c_void; MAX_PARAMS] = [std::ptr::null_mut(); MAX_PARAMS];
+    for (slot, value) in params.iter_mut().zip(values.iter_mut()).take(count) {
+        *slot = std::ptr::from_mut(value).cast::<c_void>();
+    }
+    for (map, bytes) in prepared.maps.iter().zip(maps.iter_mut()) {
+        params[map.slot] = std::ptr::from_mut(bytes).cast::<c_void>(); // the slot of a TMA descriptor: its 128 bytes, by value
+    }
+    let grid = prepared.grid;
+    match prepared.cluster {
+        // SAFETY: `params[..count]` point at the live slots copied from `prepared` (and the maps' bytes), which the driver reads before it
+        // returns, in the order of the manifest's ABI; the rest is the contract of this function.
+        None => unsafe {
+            result::launch_kernel(
+                function,
+                (grid[0], grid[1], grid[2]),
+                (block[0], block[1], block[2]),
+                shared,
+                stream,
+                &mut params[..count],
+            )
+        }
+        .map_err(Error::driver("cuLaunchKernel")),
+        Some(cluster) => {
+            let mut attributes = cluster_attributes(cluster);
+            let config = sys::CUlaunchConfig {
+                gridDimX: grid[0],
+                gridDimY: grid[1],
+                gridDimZ: grid[2],
+                blockDimX: block[0],
+                blockDimY: block[1],
+                blockDimZ: block[2],
+                sharedMemBytes: shared,
+                hStream: stream,
+                attrs: attributes.as_mut_ptr(),
+                numAttrs: attributes.len() as u32,
+            };
+            // SAFETY: as above, and `config` and its two attributes are live locals the driver reads before it returns (the grid is a whole number
+            // of clusters: `Plan::prepare` made it the programs times the cluster); `cuLaunchKernelEx` is in every driver this crate runs on (12.0
+            // and newer).
+            unsafe { sys::cuLaunchKernelEx(&config, function, params.as_mut_ptr(), std::ptr::null_mut()) }
+                .result()
+                .map_err(Error::driver("cuLaunchKernelEx"))
+        }
+    }
+}
+
 /// Enqueue `function` on `stream` with the arguments of `prepared` in the order of the ABI of the manifest: a tensor's pointer, a scalar or
-/// a fixed argument in its slot, then the scratch pointers (null) a Triton kernel has.
+/// a fixed argument in its slot, then the scratch pointers a Triton kernel has (null, but the global scratch of a kernel that has one). A kernel of
+/// clusters is launched with `cuLaunchKernelEx` ([`launch_prepared`]), its tensors ordered through cudarc's guards as a GEMM's are.
 ///
 /// This is cudarc's launch builder (`CudaStream::launch_builder`, `.arg`, `.launch`): it binds the stream's context to the thread
 /// and calls `cuLaunchKernel`, which copies the arguments before it returns. A tensor that is cudarc's own memory is given to the
@@ -289,6 +384,36 @@ pub(crate) fn enqueue(
     let mapped: Vec<usize> = prepared.maps.iter().map(|m| usize::from(prepared.tensor_of[m.slot])).collect();
     if prepared.maps.iter().any(|m| m.bytes.is_none()) {
         return Err(Error::Launch("a tensor map of the launch was not encoded".to_owned()));
+    }
+    if prepared.cluster.is_some() {
+        return ordered(stream, tensors, |tensors, want_end| {
+            // cudarc's tracking of every slice through its guards (the wait for its earlier uses now, the record of this use when the guard is
+            // dropped, after the launch), as `enqueue_gemm` does: cudarc's launch builder has no cluster attribute
+            let mut guards = Vec::with_capacity(tensors.len());
+            for tensor in tensors.iter_mut() {
+                match &mut tensor.backing {
+                    Backing::Raw => {}
+                    Backing::Read(memory) => guards.push(memory.sync_read(stream)),
+                    Backing::Write(memory) => guards.push(memory.sync_write(stream)),
+                }
+            }
+            stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+            // SAFETY: the function is the loaded kernel `prepared` was checked for (`Kernel::check_with`), the stream a cudarc stream of its
+            // context made current above, and the memory the tensors name is borrowed for the call and handed to cudarc's tracking on the stream
+            // (the guards), or vouched for by the host (a region): what `enqueue` argues for a launch through the builder.
+            unsafe { launch_prepared(function.cu_function(), prepared, block, shared, stream.cu_stream()) }?;
+            let end = if want_end {
+                Some(
+                    stream
+                        .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+                        .map_err(Error::driver("cuEventRecord"))?,
+                )
+            } else {
+                None
+            };
+            drop(guards);
+            Ok(end)
+        });
     }
     ordered(stream, tensors, |tensors, want_end| {
         // what the builder is given for each tensor: made before the builder, which holds pointers into it until the launch
@@ -639,34 +764,15 @@ impl Kernel {
         tensors: &[TensorArg<'_>],
         given: &[(&str, i64)],
     ) -> Result<()> {
-        let mut prepared = self.check_with(tensors, given)?;
+        let prepared = self.check_with(tensors, given)?;
         let _current = Current::make(self.context())?;
         refuse_capture_raw(stream, tensors)?;
-        let mut params: [*mut c_void; MAX_PARAMS] = [std::ptr::null_mut(); MAX_PARAMS];
-        let count = prepared.count;
-        for (slot, value) in params.iter_mut().zip(prepared.values.iter_mut()).take(count) {
-            *slot = std::ptr::from_mut(value).cast::<c_void>();
-        }
-        for map in &mut prepared.maps {
-            // the slot of a TMA descriptor points at the 128 bytes of its encoded map (which `check_with` made)
-            let bytes = map.bytes.as_mut().ok_or_else(|| Error::Launch("a tensor map was not encoded".to_owned()))?;
-            params[map.slot] = std::ptr::from_mut(bytes).cast::<c_void>();
-        }
-        let (grid, block) = (prepared.grid, self.plan().block());
-        // SAFETY: `params[..count]` point at the live 64-bit slots of `prepared` (and, at the slot of a TMA descriptor, at the 128 bytes of its
-        // encoded map in `prepared`), which the driver reads before it returns, in the order of the manifest's ABI; the rest is as in
-        // `enqueue`, and the stream is the caller's, as the contract above says.
+        // SAFETY: the kernel's function and the `Prepared` it checked (the slots, at the slot of a TMA descriptor the 128 bytes of its encoded map,
+        // the grid of blocks and, for a kernel of clusters, its cluster); its context is current (`_current`); the stream and the memory are the
+        // caller's, as the contract above says.
         unsafe {
-            result::launch_kernel(
-                self.function().cu_function(),
-                (grid[0], grid[1], grid[2]),
-                (block[0], block[1], block[2]),
-                self.plan().shared(),
-                stream,
-                &mut params[..count],
-            )
+            launch_prepared(self.function().cu_function(), &prepared, self.plan().block(), self.plan().shared(), stream)
         }
-        .map_err(Error::driver("cuLaunchKernel"))
     }
 }
 

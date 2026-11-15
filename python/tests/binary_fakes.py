@@ -11,7 +11,8 @@ from elf_builder import arch_header, cubin_like
 
 import tilefish
 from tilefish import Dim, Out, Tensor, const, f32, i64
-from tilefish._build import BuiltKernel, LaunchAttributes
+from tilefish._binary import _launch_of
+from tilefish._build import BuiltKernel, LaunchAttributes  # noqa: F401
 from tilefish._elf import code_digest
 
 n = Dim("n", divisible_by=16)
@@ -77,7 +78,7 @@ def fake_binary_build(spec, target, *, arch="sm_90", cubin=None, flags=("-linein
         ptxas_version="Cuda compilation tools, release 12.9, V12.9.86" if spec.binary["kind"] == "ptx" else "",
         ptx_target="sm_90" if spec.binary["kind"] == "ptx" else "",
         options={},
-        launch=LaunchAttributes(0, 0, False, (1, 1, 1), 1, False),
+        launch=_launch_of(spec),
         ir_digest=None,
         binary_digest=target.digests[key],
         binary_build=build,

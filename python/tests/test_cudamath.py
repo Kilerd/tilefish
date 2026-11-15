@@ -1,4 +1,4 @@
-"""The CUDA math guard (``tilefish._cudamath``; manifest schema 3, section 4.3; ``docs/numerics.md``) with no GPU: which functions a generated
+"""The CUDA math guard (``tilefish._cudamath``; manifest schema 3, section 4.7; ``docs/numerics.md``) with no GPU: which functions a generated
 source is made of, the ``cuda_math`` field and the strict reading of it (``crates/tilefish/tests/cuda_math.rs`` has the same refusals), and the
 warnings of a run whose torch is built with a CUDA release the functions were not measured on. On a GPU: ``test_gpu_cuda_math.py``."""
 

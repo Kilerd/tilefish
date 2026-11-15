@@ -4,8 +4,14 @@
 ``cuFuncSetAttribute`` when the kernel needs more than the default 48 KiB of dynamic shared memory, and
 ``cuLaunchKernel`` with ``kernelParams`` laid out exactly as the manifest's ABI says: the non-constexpr
 arguments in declaration order (a pointer as a 64-bit value, an ``i32`` as a 32-bit one), then the two
-scratch slots as null 64-bit pointers. Nothing else is set up, so a binary that wants more (scratch memory,
-programmatic dependent launch, clusters, a cooperative launch) is refused by :func:`load` before it runs.
+scratch slots: the global scratch a launch is given (a null pointer for a kernel that has none) and a null profile scratch.
+
+**Launch shapes** (manifest schema 3, sections 4.3 to 4.6). A grid is the entry's grid of programs: a **persistent** kernel's (one entry, the
+tiles) is cut to ``programs_per_sm * SMs // CTAs per program`` programs, with the SM count of the device (or of the partition :func:`sm_partition`
+says) read when the kernel is loaded; a kernel of **clusters** (``num_ctas`` CTAs per program, a prebuilt binary's declared cluster) is launched
+with ``cuLaunchKernelEx`` and the cluster attribute, its grid of blocks the grid of programs times the cluster; a kernel with a **global scratch**
+is given ``global_scratch_size`` bytes per CTA of the launch, which the caller allocates (a plan from its arena). What neither host sets up
+(profile scratch, programmatic dependent launch, a cooperative launch, a cluster of more than 8) is refused by :func:`load` before it runs.
 
 A launch is checked before it reaches the driver, because a wrong one does not fail cleanly: a missing
 argument reads whatever follows the array, an ``i32`` out of range wraps, a grid beyond the device's limits is an
@@ -23,11 +29,12 @@ The driver binding is ``cuda-python`` (``cuda.bindings.driver``), imported when 
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import functools
 import json
 import threading
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from ._specvalid import decode_scalar
 from ._tensormap import DESCRIPTOR_BYTES, EncodeArguments, TensorMapArg
@@ -48,6 +55,67 @@ def _ctype(type_: str) -> Any:
 
 _lock = threading.Lock()
 _loaded: "dict[tuple, LoadedKernel]" = {}
+_partition = threading.local()  # sm_partition(): the SMs of the partition this thread launches on
+_device_sms: "dict[int, int]" = {}
+
+
+@contextlib.contextmanager
+def sm_partition(sms: "int | None") -> "Iterator[None]":
+    """Launch on a partition of ``sms`` SMs of the device (a green context) inside the block, on this thread: a persistent kernel loaded inside it
+    launches at most ``programs_per_sm * sms`` programs, and one whose bytes depend on the SM count (``tilefish.persistent(sm_count=...)``) is held
+    to ``sms``. (A green context reports the device's SM count to every query, so the host says which partition it is on, as the Rust host's
+    ``Manifest::with_sm_partition`` does.) ``None`` is the whole device. A plan prepared inside it is prepared for it."""
+    if sms is not None and (isinstance(sms, bool) or not isinstance(sms, int) or sms < 1):
+        raise TilefishRuntimeError(f"sm_partition takes the SMs of the partition (a positive int) or None, got {sms!r}")
+    previous = getattr(_partition, "sms", None)
+    _partition.sms = sms
+    try:
+        yield
+    finally:
+        _partition.sms = previous
+
+
+def current_partition() -> "int | None":
+    """The partition :func:`sm_partition` set on this thread (``None``: the whole device)."""
+    return getattr(_partition, "sms", None)
+
+
+def sm_count(device_index: int) -> int:
+    """The SMs a launch on device ``device_index`` runs on: the partition :func:`sm_partition` says, else the device's multiprocessor count
+    (``CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT``; a MIG slice has its own)."""
+    sms = current_partition()
+    if sms is not None:
+        return sms
+    with _lock:
+        known = _device_sms.get(device_index)
+    if known is None:
+        drv = _driver()
+        (device,) = _check(drv.cuDeviceGet(device_index), "cuDeviceGet")
+        (known,) = _check(drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device), "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)")
+        known = int(known)
+        with _lock:
+            _device_sms[device_index] = known
+    return known
+
+
+def check_sm_count(built: "BuiltKernel", sms: "int | None") -> None:
+    """A persistent kernel whose bytes depend on how many programs run (``tilefish.persistent(sm_count=...)``) runs on that many SMs only."""
+    persistent = built.spec.persistent
+    if persistent is None:
+        return
+    declared = persistent.get("sm_count")
+    if declared is not None and declared != sms:
+        raise TilefishRuntimeError(
+            f"'{built.stem}' ({built.arch}) is a persistent kernel whose bytes depend on how many programs run, declared for {declared} SMs "
+            f"(tilefish.persistent(sm_count={declared})), but this device{' partition' if current_partition() is not None else ''} has {sms}: "
+            "declare it for this SM count (another op) to run it here"
+        )
+
+
+def persistent_programs(tiles: int, programs_per_sm: int, sms: int, ctas: int) -> int:
+    """The programs a persistent grid of ``tiles`` launches on ``sms`` SMs: at most ``programs_per_sm`` per SM, each program ``ctas`` CTAs (a cluster),
+    at least one, at most ``tiles`` (manifest schema 3, section 4.3)."""
+    return max(1, min(tiles, programs_per_sm * sms // ctas))
 
 
 def _driver() -> Any:
@@ -78,7 +146,8 @@ def _check(result: Any, what: str) -> "tuple[Any, ...]":
 
 
 def refuse_unsupported(built: "BuiltKernel") -> None:
-    """Raise unless a plain ``cuLaunchKernel`` can run this binary: no scratch memory, PDL, cluster or cooperative launch."""
+    """Raise unless this host can launch the binary: no profile scratch, PDL or cooperative launch, a cluster of ``num_ctas`` CTAs (at most 8), a
+    global scratch of an alignment that divides 256 bytes (:meth:`~tilefish.aot.LaunchAttributes.replay_blockers`)."""
     blockers = built.launch.replay_blockers()
     if blockers:
         raise TilefishRuntimeError(
@@ -87,8 +156,8 @@ def refuse_unsupported(built: "BuiltKernel") -> None:
         )
 
 
-def load_key(built: "BuiltKernel", device_index: int) -> "tuple[Any, ...]":
-    """What makes two loads the same: the cubin, the device, and everything the launch is made of.
+def load_key(built: "BuiltKernel", device_index: int, sms: "int | None" = None) -> "tuple[Any, ...]":
+    """What makes two loads the same: the cubin, the device, the SMs a persistent kernel's grid is resolved for, and everything the launch is made of.
 
     Two entries with one cubin but another symbol, shared memory, launch attributes, block or ABI are different
     kernels as far as a launch is concerned (the ABI is what the arguments of a launch are checked and packed by, and what
@@ -103,13 +172,18 @@ def load_key(built: "BuiltKernel", device_index: int) -> "tuple[Any, ...]":
         tuple((k, tuple(v) if isinstance(v, list) else v) for k, v in sorted(launch.items())),
         tuple(built.block),  # the compiled kernel's (every partition of a warp-specialised kernel)
         json.dumps(built.abi(), sort_keys=True),
+        json.dumps(built.spec.persistent, sort_keys=True),
+        sms,  # (None for a kernel that is not persistent: its launch does not depend on the SM count)
     )
 
 
 class LoadedKernel:
     """A kernel function loaded from a cubin into the current CUDA context (one per device)."""
 
-    def __init__(self, built: "BuiltKernel", device_index: int) -> None:
+    persistent: "dict[str, int] | None" = None  # a persistent kernel's grid (its spec's): None for any other
+    sms: "int | None" = None  # the SMs a persistent kernel's grid is resolved for
+
+    def __init__(self, built: "BuiltKernel", device_index: int, sms: "int | None" = None) -> None:
         refuse_unsupported(built)
         drv = _driver()
         (ctx,) = _check(drv.cuCtxGetCurrent(), "cuCtxGetCurrent")
@@ -127,6 +201,10 @@ class LoadedKernel:
             )
         self.built = built
         self.device_index = device_index
+        # a persistent kernel: the SMs its grid is resolved for (the device's, or the partition's), and the count its bytes are declared for
+        self.persistent = built.spec.persistent
+        self.sms = sms
+        check_sm_count(built, sms)
         self.grid_limits = tuple(
             int(
                 _check(
@@ -192,6 +270,22 @@ class LoadedKernel:
                 f"manifest says {expected}"
             )
 
+    def programs(self, grid: "Sequence[int]") -> "tuple[int, ...]":
+        """The grid of programs a launch of the entry's grid ``grid`` runs: ``grid`` itself, or for a persistent kernel its one entry (the tiles)
+        cut to ``programs_per_sm`` programs per SM this kernel was loaded for (:func:`persistent_programs`)."""
+        if self.persistent is None:
+            return tuple(grid)
+        assert self.sms is not None and len(grid) == 1
+        return (persistent_programs(grid[0], self.persistent["programs_per_sm"], self.sms, self.built.launch.num_ctas),)
+
+    def launch_grid(self, grid: "Sequence[int]") -> "tuple[int, int, int]":
+        """The grid of blocks of a launch of the entry's grid ``grid``: its programs (:meth:`programs`) times the cluster of a kernel of clusters."""
+        return self.built.launch.cuda_grid(self.programs(grid))
+
+    def scratch_bytes(self, grid: "Sequence[int]") -> int:
+        """The bytes of global scratch a launch of the entry's grid ``grid`` is given: ``global_scratch_size`` per CTA of its programs (0: none)."""
+        return self.built.launch.scratch_bytes(self.programs(grid))
+
     def _check_launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, int]]") -> "tuple[int, int, int]":
         name = f"'{self.built.stem}'"
         if len(args) != len(self._call_params):
@@ -236,23 +330,41 @@ class LoadedKernel:
         dims = tuple(grid)
         if not 1 <= len(dims) <= 3 or any(isinstance(g, bool) or not isinstance(g, int) for g in dims):
             raise TilefishRuntimeError(f"{name}: the grid must be one to three integers, got {tuple(grid)!r}")
-        padded = dims + (1,) * (3 - len(dims))
-        for axis, (g, limit) in enumerate(zip(padded, self.grid_limits)):
+        if self.persistent is not None and len(dims) != 1:
+            raise TilefishRuntimeError(f"{name}: a persistent grid has one entry (the tiles), got {dims!r}")
+        for axis, (g, limit) in enumerate(zip(dims + (1,) * (3 - len(dims)), self.grid_limits)):
+            if g < 1:
+                raise TilefishRuntimeError(f"{name}: the grid {dims} has {g} blocks along {'XYZ'[axis]}, but this device takes 1 to {limit} there")
+        blocks = self.launch_grid(dims)
+        for axis, (g, limit) in enumerate(zip(blocks, self.grid_limits)):
             if not 1 <= g <= limit:
+                shown = dims if blocks == dims + (1,) * (3 - len(dims)) else f"{dims} ({blocks} blocks)"
                 raise TilefishRuntimeError(
-                    f"{name}: the grid {dims} has {g} blocks along {'XYZ'[axis]}, but this device takes 1 to {limit} there"
+                    f"{name}: the grid {shown} has {g} blocks along {'XYZ'[axis]}, but this device takes 1 to {limit} there"
                 )
-        return padded  # type: ignore[return-value]
+        return blocks
 
-    def launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int) -> None:
+    def launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int, scratch: "int | None" = None) -> None:
         """Launch on ``stream`` (a ``CUstream`` handle as an int). ``args`` are ``("pointer", address)``, ``("scalar", i32)`` or, for a TMA
         descriptor, ``("tensordesc", TensorMapArg)`` (its encoded CUtensorMap, then its shape and strides, each in a slot of its own) in the
-        manifest's order; the two scratch slots are appended here.
+        manifest's order; the two scratch slots are appended here: ``scratch`` (the address of :meth:`scratch_bytes` bytes of device memory, 256-byte
+        aligned, which a kernel with a global scratch must be given and any other must not) and a null profile scratch.
+
+        ``grid`` is the entry's grid of programs: a persistent kernel's is cut to the programs the SMs it was loaded for run, and a kernel of clusters
+        is launched with ``cuLaunchKernelEx``, ``grid * cluster`` blocks in clusters of its ``cluster_dims``.
 
         The arguments are checked against the ABI first (count, kinds, ranges) and the grid against the device's
         limits; a mismatch is a :class:`~tilefish.errors.TilefishRuntimeError` and nothing is launched.
         """
         g = self._check_launch(grid, args)
+        needs = self.built.launch.global_scratch_size > 0
+        if needs != (scratch is not None):
+            raise TilefishRuntimeError(
+                f"'{self.built.stem}' "
+                + (f"addresses {self.built.launch.global_scratch_size} bytes of global scratch per CTA: give it a scratch" if needs else "has no global scratch: give it none")
+            )
+        if scratch is not None and (isinstance(scratch, bool) or not isinstance(scratch, int) or not 0 < scratch <= UINT64_MAX or scratch % 256):
+            raise TilefishRuntimeError(f"'{self.built.stem}': the global scratch must be a 256-byte aligned address, got {scratch!r}")
         drv = _driver()
         values: list[Any] = []
         addresses: list[int] = []
@@ -282,16 +394,34 @@ class LoadedKernel:
                     put(ctypes.c_int64(s))
                 continue
             put(ctypes.c_uint64(v) if kind == "pointer" else _ctype(p["type"])(v))
-        for _ in self.built.abi()["scratch"]:  # global_scratch, profile_scratch: a Triton kernel's; a prebuilt binary has none
-            put(ctypes.c_uint64(0))
+        for k, _ in enumerate(self.built.abi()["scratch"]):  # global_scratch, profile_scratch: a Triton kernel's; a prebuilt binary has none
+            put(ctypes.c_uint64(scratch if k == 0 and scratch is not None else 0))
         slots = (ctypes.c_void_p * len(addresses))(*addresses)
         b = self.block
-        _check(
-            drv.cuLaunchKernel(
-                self.function, g[0], g[1], g[2], b[0], b[1], b[2], self.built.shared, drv.CUstream(stream), ctypes.addressof(slots), 0
-            ),
-            f"cuLaunchKernel({self.built.symbol})",
-        )
+        launch = self.built.launch
+        if launch.num_ctas == 1:
+            _check(
+                drv.cuLaunchKernel(
+                    self.function, g[0], g[1], g[2], b[0], b[1], b[2], self.built.shared, drv.CUstream(stream), ctypes.addressof(slots), 0
+                ),
+                f"cuLaunchKernel({self.built.symbol})",
+            )
+            return
+        # a kernel of clusters: cuLaunchKernelEx with the cluster's dimensions and the spread scheduling policy Triton's launcher asks for
+        config = drv.CUlaunchConfig()
+        config.gridDimX, config.gridDimY, config.gridDimZ = g
+        config.blockDimX, config.blockDimY, config.blockDimZ = b
+        config.sharedMemBytes = self.built.shared
+        config.hStream = drv.CUstream(stream)
+        cluster = drv.CUlaunchAttribute()
+        cluster.id = drv.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+        cluster.value.clusterDim.x, cluster.value.clusterDim.y, cluster.value.clusterDim.z = launch.cluster_dims
+        policy = drv.CUlaunchAttribute()
+        policy.id = drv.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE
+        policy.value.clusterSchedulingPolicyPreference = drv.CUclusterSchedulingPolicy.CU_CLUSTER_SCHEDULING_POLICY_SPREAD
+        config.attrs = [cluster, policy]
+        config.numAttrs = 2
+        _check(drv.cuLaunchKernelEx(config, self.function, ctypes.addressof(slots), 0), f"cuLaunchKernelEx({self.built.symbol})")
 
 
 @functools.lru_cache(maxsize=4096)
@@ -323,12 +453,14 @@ def encode_tensor_map(arguments: EncodeArguments) -> bytes:
 
 
 def load(built: "BuiltKernel", device_index: int) -> LoadedKernel:
-    """The loaded kernel for this binary on this device, loading it the first time. The device's context must be current."""
-    key = load_key(built, device_index)
+    """The loaded kernel for this binary on this device, loading it the first time. The device's context must be current. A persistent kernel is
+    loaded for the SMs of the device, or of the partition :func:`sm_partition` says (each its own load)."""
+    sms = sm_count(device_index) if built.spec.persistent is not None else None
+    key = load_key(built, device_index, sms)
     with _lock:
         k = _loaded.get(key)
         if k is None:
-            k = _loaded[key] = LoadedKernel(built, device_index)
+            k = _loaded[key] = LoadedKernel(built, device_index, sms)
         return k
 
 

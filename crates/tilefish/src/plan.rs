@@ -38,7 +38,8 @@ use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Expr, MAX_DIMS, Pattern, Solved, Symbols, Unsolvable, parse_grid};
 use crate::library::LibraryEntry;
 use crate::manifest::{
-    Access, DimInfo, Entry, LaunchAttributes, Param, ParamKind, Precondition, ScalarType, ShapeDim, StrideEntry,
+    Access, DimInfo, Entry, LaunchAttributes, Param, ParamKind, Persistent, Precondition, SCRATCH_ALIGNMENT,
+    ScalarType, ShapeDim, StrideEntry,
 };
 use crate::tensor::{DType, TensorArg, reach};
 
@@ -200,13 +201,29 @@ pub struct Plan {
     grid_text: String,
     block: [u32; 3],
     shared: u32,
+    /// A persistent grid: the grid is the tiles, cut to the programs the SMs of the device run (manifest schema 3, section 4.3).
+    persistent: Option<Persistent>,
+    /// The cluster a launch groups its blocks in (`cuLaunchKernelEx`), for a kernel of more than one CTA per program; the grid counts clusters.
+    cluster: Option<[u32; 3]>,
+    /// The CTAs of a program (1, or the cluster's).
+    num_ctas: u32,
+    /// The bytes of global scratch each CTA addresses (a launch is given a scratch tensor of that many bytes per CTA: the last tensor).
+    scratch: Option<u64>,
 }
+
+/// The name [`Plan::tensor_names`] gives the global scratch of a kernel that has one: the last tensor of a launch.
+pub const GLOBAL_SCRATCH: &str = "global_scratch";
 
 /// What a checked call launches with.
 #[derive(Debug, Clone)]
 pub struct Prepared {
-    /// The grid, three sizes.
+    /// The grid of blocks a launch has, three sizes: the entry's grid of programs (a persistent grid cut to the programs the SMs of the device
+    /// run), times the cluster of a kernel of clusters.
     pub grid: [u32; 3],
+    /// The cluster the blocks are launched in (`cuLaunchKernelEx`'s cluster attribute), for a kernel of more than one CTA per program.
+    pub cluster: Option<[u32; 3]>,
+    /// The bytes of global scratch the launch gives the kernel (its scratch tensor has at least this many; 0 for a kernel that has none).
+    pub scratch_bytes: u64,
     pub(crate) values: [u64; MAX_PARAMS],
     pub(crate) count: usize,
     /// For each slot, the index of the tensor it holds (`NOT_A_TENSOR` for a scalar, a fixed argument or a scratch slot). The slot of the map
@@ -255,6 +272,7 @@ struct Source<'a> {
     shared: u32,
     scratch_slots: usize,
     launch: Option<&'a LaunchAttributes>,
+    persistent: Option<Persistent>,
 }
 
 impl Plan {
@@ -272,6 +290,7 @@ impl Plan {
             shared: entry.shared,
             scratch_slots: entry.scratch_slots,
             launch: Some(&entry.launch),
+            persistent: entry.persistent,
         })
     }
 
@@ -289,6 +308,7 @@ impl Plan {
             shared: 0,
             scratch_slots: 0,
             launch: None,
+            persistent: None,
         })
     }
 
@@ -305,6 +325,7 @@ impl Plan {
             shared: 0,
             scratch_slots: 0,
             launch: None,
+            persistent: None,
         })
     }
 
@@ -496,6 +517,10 @@ impl Plan {
             grid_text: source.grid.to_owned(),
             block: source.block,
             shared: source.shared,
+            persistent: source.persistent,
+            cluster: source.launch.and_then(LaunchAttributes::cluster),
+            num_ctas: source.launch.map_or(1, |l| l.num_ctas.max(1)),
+            scratch: source.launch.map(|l| l.global_scratch_size).filter(|s| *s > 0 && source.scratch_slots > 0),
         })
     }
 
@@ -504,9 +529,25 @@ impl Plan {
         &self.stem
     }
 
-    /// The names of the tensor parameters, in the order a launch gives its tensors.
+    /// The names of the tensor parameters, in the order a launch gives its tensors, and last [`GLOBAL_SCRATCH`] for a kernel with a global
+    /// scratch (a writable `u8` tensor of [`Prepared::scratch_bytes`] bytes, 256-byte aligned, that overlaps no other tensor).
     pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
-        self.tensors.iter().map(|t| t.name.as_str())
+        self.tensors.iter().map(|t| t.name.as_str()).chain(self.scratch.map(|_| GLOBAL_SCRATCH))
+    }
+
+    /// The bytes of global scratch each CTA of the kernel addresses (`None`: it has none): a launch is given that many per CTA of its grid.
+    pub fn global_scratch(&self) -> Option<u64> {
+        self.scratch
+    }
+
+    /// The persistent grid of the entry, when it has one.
+    pub fn persistent(&self) -> Option<Persistent> {
+        self.persistent
+    }
+
+    /// The cluster a launch groups its blocks in, for a kernel of more than one CTA per program (`cuLaunchKernelEx`).
+    pub fn cluster(&self) -> Option<[u32; 3]> {
+        self.cluster
     }
 
     /// The names of the fixed arguments per call (a prebuilt binary's `const[i32]` or `const[i64]` with no default), in the order of the ABI:
@@ -749,6 +790,19 @@ impl Plan {
         given: &[(&str, i64)],
         device: Option<&DeviceInfo>,
     ) -> Result<Prepared> {
+        self.prepare_for(tensors, given, device, None)
+    }
+
+    /// [`Plan::prepare_with`] for a device of `sm_count` SMs (or a partition of that many: [`Manifest::with_sm_partition`](crate::Manifest)):
+    /// a persistent grid (manifest schema 3, section 4.3) is cut to the programs they run, at most `programs_per_sm` per SM (`None`: the grid is
+    /// the tiles, uncut; a loaded kernel's [`Kernel::check`](crate::Kernel::check) gives its device's count).
+    pub fn prepare_for(
+        &self,
+        tensors: &[TensorArg<'_>],
+        given: &[(&str, i64)],
+        device: Option<&DeviceInfo>,
+        sm_count: Option<u64>,
+    ) -> Result<Prepared> {
         let stem = self.stem.as_str();
         let mut given_values = [0i64; MAX_PARAMS];
         let mut seen = [false; MAX_PARAMS];
@@ -770,14 +824,17 @@ impl Plan {
                  (Kernel::launch_with)"
             )));
         }
-        if tensors.len() != self.tensors.len() {
+        let wanted = self.tensors.len() + usize::from(self.scratch.is_some());
+        if tensors.len() != wanted {
             return Err(Error::Launch(format!(
-                "'{stem}' takes {} tensors ({}), got {}",
-                self.tensors.len(),
+                "'{stem}' takes {wanted} tensors ({}), got {}",
                 self.tensor_names().collect::<Vec<_>>().join(", "),
                 tensors.len()
             )));
         }
+        // the global scratch of a kernel that has one: the last tensor (checked once the grid says how much the launch needs)
+        let (tensors, scratch) = tensors.split_at(self.tensors.len());
+        let scratch = scratch.first();
         let read = |t: usize| self.tensors[t].access != Access::Out;
 
         // -- the tensors the kernel reads (In and InOut, what Python's `bind_call` is given), each on its own, in order
@@ -1100,10 +1157,10 @@ impl Plan {
             map_strides[t] = strides;
         }
 
-        // -- the grid, from its expression, against what the device takes
-        let mut grid = [1u32; 3];
+        // -- the grid, from its expression (a persistent grid's tiles cut to the programs the SMs run; a cluster's blocks), against what the
+        // device takes
+        let mut programs = [1i128; 3];
         for (axis, entry) in self.grid.iter().enumerate() {
-            let along = ["x", "y", "z"][axis];
             let value =
                 entry.eval(&dims).map_err(|e| Error::Launch(format!("'{stem}': the grid {}: {e}", self.grid_text)))?;
             let Some(value) = value else {
@@ -1120,6 +1177,17 @@ impl Plan {
                     self.grid_text
                 )));
             }
+            programs[axis] = value;
+        }
+        if let (Some(p), Some(sms)) = (self.persistent, sm_count) {
+            let tiles = u64::try_from(programs[0]).unwrap_or(u64::MAX);
+            programs[0] = i128::from(p.programs(tiles, sms, u64::from(self.num_ctas)));
+        }
+        let cluster = self.cluster.unwrap_or([1, 1, 1]);
+        let mut grid = [1u32; 3];
+        for (axis, programs) in programs.iter().enumerate() {
+            let along = ["x", "y", "z"][axis];
+            let value = programs.saturating_mul(i128::from(cluster[axis]));
             if let Some(limit) = device.map(|d| d.max_grid[axis]).filter(|limit| value > i128::from(*limit)) {
                 return Err(Error::Unsupported(format!(
                     "'{stem}': the grid {} is {value} blocks along {along} here, but this device takes 1 to {limit} there",
@@ -1172,8 +1240,127 @@ impl Plan {
                 },
             };
         }
-        // (the scratch slots of a Triton kernel stay 0: null pointers)
-        Ok(Prepared { grid, values, count: self.slots.len() + self.scratch_slots, tensor_of, maps })
+        // -- the global scratch: a writable u8 tensor of the bytes the launch needs (size per CTA, times the CTAs of its programs), 256-byte
+        // aligned, on the kernel's device, overlapping no other tensor; its address is the first scratch slot (the profile scratch stays 0)
+        let mut scratch_bytes = 0u64;
+        if let (Some(per_cta), Some(s)) = (self.scratch, scratch) {
+            let ctas = programs.iter().fold(i128::from(self.num_ctas), |acc, p| acc.saturating_mul(*p));
+            let need = i128::from(per_cta).saturating_mul(ctas);
+            scratch_bytes = u64::try_from(need).map_err(|_| {
+                Error::Unsupported(format!(
+                    "'{stem}': a global scratch of {need} bytes is more than this host can give"
+                ))
+            })?;
+            self.check_scratch(s, scratch_bytes, tensors, device)?;
+            let slot = self.slots.len();
+            values[slot] = s.ptr;
+            tensor_of[slot] = self.tensors.len() as u8; // the scratch tensor, after the others: a launch orders its memory as a written tensor's
+        }
+        // (the scratch slots of a Triton kernel stay 0, null pointers, but the global scratch of a kernel that has one)
+        Ok(Prepared {
+            grid,
+            cluster: self.cluster,
+            scratch_bytes,
+            values,
+            count: self.slots.len() + self.scratch_slots,
+            tensor_of,
+            maps,
+        })
+    }
+
+    /// The global scratch tensor `s` of a launch that needs `need` bytes of it: `u8`, writable, dense, at least `need` bytes, 256-byte aligned (the
+    /// alignment every scratch is given at, which the manifest's `global_scratch_align` divides), on the kernel's device and context, overlapping
+    /// none of `others`.
+    fn check_scratch(
+        &self,
+        s: &TensorArg<'_>,
+        need: u64,
+        others: &[TensorArg<'_>],
+        device: Option<&DeviceInfo>,
+    ) -> Result<()> {
+        let stem = self.stem.as_str();
+        let name = GLOBAL_SCRATCH;
+        if s.dtype != DType::U8 {
+            return Err(Error::precondition(
+                PreconditionKind::Dtype,
+                Some(name),
+                format!("the global scratch of '{stem}' is a u8 tensor, got {}", s.dtype.name()),
+            ));
+        }
+        if s.access == Access::In {
+            return Err(Error::precondition(
+                PreconditionKind::Access,
+                Some(name),
+                format!(
+                    "the global scratch of '{stem}' is written by the kernel: give it a tensor that may be written"
+                ),
+            ));
+        }
+        if let Some(strides) = s.strides
+            && !is_contiguous(s.shape, strides)
+        {
+            return Err(Error::precondition(
+                PreconditionKind::Contiguous,
+                Some(name),
+                format!("the global scratch of '{stem}' is one run of bytes: give it a contiguous tensor"),
+            ));
+        }
+        let bytes = reach(s.shape, None).saturating_mul(s.dtype.size() as u128);
+        if bytes < u128::from(need) {
+            return Err(Error::precondition(
+                PreconditionKind::Shape,
+                Some(name),
+                format!(
+                    "'{stem}' needs {need} bytes of global scratch for this launch, but its scratch tensor has {bytes}"
+                ),
+            ));
+        }
+        if !s.ptr.is_multiple_of(SCRATCH_ALIGNMENT) {
+            return Err(Error::precondition(
+                PreconditionKind::PointerAlignment,
+                Some(name),
+                format!(
+                    "the global scratch of '{stem}' is at address {:#x}, which is not aligned to {SCRATCH_ALIGNMENT} bytes",
+                    s.ptr
+                ),
+            ));
+        }
+        if let Some(d) = device.filter(|d| d.ordinal != s.device) {
+            return Err(Error::precondition(
+                PreconditionKind::Device,
+                Some(name),
+                format!(
+                    "the global scratch of '{stem}' is on device {}, but the kernel is loaded on device {}",
+                    s.device, d.ordinal
+                ),
+            ));
+        }
+        if let (Some(kernel), Some(tensor)) = (device.and_then(|d| d.context), s.context)
+            && kernel != tensor
+        {
+            return Err(Error::precondition(
+                PreconditionKind::Device,
+                Some(name),
+                format!(
+                    "the global scratch of '{stem}' is memory of another CUDA context than the one the kernel is loaded in"
+                ),
+            ));
+        }
+        let (start, end) = (u128::from(s.ptr), u128::from(s.ptr).saturating_add(u128::from(need.max(1))));
+        for (t, o) in self.tensors.iter().zip(others) {
+            let (b_start, b_end) = extent(o);
+            if start < b_end && b_start < end {
+                return Err(Error::precondition(
+                    PreconditionKind::Alias,
+                    Some(name),
+                    format!(
+                        "the global scratch of '{stem}' overlaps argument '{}': the kernel writes its scratch",
+                        t.name
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Bind the dimensions from `equations`, as Python's `solve_dims` does: in passes over the equations in order, each binding the one

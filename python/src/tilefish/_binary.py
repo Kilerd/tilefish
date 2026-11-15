@@ -53,6 +53,16 @@ _ACCEPTED = {
 }
 _ZERO_LAUNCH = LaunchAttributes(0, 0, False, (1, 1, 1), 1, False)
 
+
+def _launch_of(spec: "CompileSpec") -> LaunchAttributes:
+    """What a prebuilt binary asks of a launch: nothing (a plain launch), or the thread-block cluster its declaration says (``cluster=``), launched
+    with ``cuLaunchKernelEx`` (its grid counts clusters)."""
+    assert spec.binary is not None
+    cluster = tuple(spec.binary.get("cluster", (1, 1, 1)))
+    if cluster == (1, 1, 1):
+        return _ZERO_LAUNCH
+    return LaunchAttributes(0, 0, False, cluster, cluster[0] * cluster[1] * cluster[2], False)  # type: ignore[arg-type]
+
 __all__ = ["BINARY_DIGEST_KIND", "build_binary", "find_ptxas", "ptx_gpu_name", "check_ptx_abi", "cubin_sm"]
 
 
@@ -210,7 +220,7 @@ def build_binary(spec: "CompileSpec", target: "BinaryTarget", *, arch: "int | st
         ptxas_version=ptxas_version,
         ptx_target=ptx_target,
         options={},
-        launch=_ZERO_LAUNCH,
+        launch=_launch_of(spec),
         ir_digest=None,
         binary_digest=target.digests["ptx" if target.kind == "ptx" else arch_name],
         binary_build=build,

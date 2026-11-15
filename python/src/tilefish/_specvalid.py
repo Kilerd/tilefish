@@ -308,6 +308,15 @@ def parse_grid(text: Any) -> "set[str]":
 
     Like ``compile_specs``, it rejects a static entry below 1 (``(0,)``, ``(-1,)``, ``(n - n, 4)``).
     """
+    return _parse_grid(text)[1]
+
+
+def grid_entries(text: Any) -> int:
+    """The number of entries (1 to 3) of a grid that :func:`parse_grid` accepts."""
+    return _parse_grid(text)[0]
+
+
+def _parse_grid(text: Any) -> "tuple[int, set[str]]":
     p = _ExprParser(text, "grid")
     p.take("(")
     entries, trailing = [], False
@@ -329,7 +338,7 @@ def parse_grid(text: Any) -> "set[str]":
     for position, entry in enumerate(entries):
         if entry is not None and entry.is_static and entry.value < 1:
             bad(f"grid {text!r}: entry {position} is the static size {entry.value}; grid sizes must be at least 1")
-    return p.ids
+    return len(entries), p.ids
 
 
 # -- the pieces ----------------------------------------------------------------------------------------------------------
@@ -576,9 +585,48 @@ def is_implementation(x: Any) -> bool:
     return isinstance(x, str) and (x == IMPLEMENTATION_FALLBACK or _ARCH_KEY.match(x) is not None or is_implementation_name(x))
 
 
+MAX_CLUSTER = 8  # the CTAs of a portable thread-block cluster
+MAX_PROGRAMS_PER_SM = 32
+MAX_GLOBAL_SCRATCH = 1 << 20
+NUM_CTAS = (2, 4, 8)  # num_ctas of a spec when it is written (1, the default, is not)
+
+
+def check_persistent(p: Any, grid: Any, where: str = "persistent") -> None:
+    """A persistent grid: exactly ``programs_per_sm`` (1 to 32) and, for a kernel whose bytes depend on the number of programs, ``sm_count`` (1 to
+    2**20); its grid has one entry (the number of tiles). Shared by the spec and the manifest reader."""
+    _keys(p, where, ["programs_per_sm"], ["sm_count"])
+    k = p["programs_per_sm"]
+    if not is_int(k) or not 1 <= k <= MAX_PROGRAMS_PER_SM:
+        bad(f"{where}.programs_per_sm must be an int from 1 to {MAX_PROGRAMS_PER_SM}, got {k!r}")
+    if p.get("sm_count") is not None and (not is_int(p["sm_count"]) or not 1 <= p["sm_count"] <= 1 << 20):  # (a JSON null is as absent)
+        bad(f"{where}.sm_count must be an int from 1 to {1 << 20}, got {p['sm_count']!r}")
+    if isinstance(grid, str) and grid_entries(grid) != 1:
+        bad(f"a persistent grid has one entry (the number of tiles), got {grid!r}")
+
+
+def check_cluster(c: Any, where: str) -> None:
+    """A thread-block cluster: three sizes of at least 1 whose product is from 2 to 8 (a cluster of one block is no cluster: not written)."""
+    if not isinstance(c, list) or len(c) != 3 or not all(is_int(x) and x >= 1 for x in c) or not 2 <= math.prod(c) <= MAX_CLUSTER:
+        bad(f"{where} must be three sizes of at least 1 whose product is from 2 to {MAX_CLUSTER} (the portable cluster size), got {c!r}")
+
+
+def check_launch_shapes(d: "dict[str, Any]") -> None:
+    """The launch shapes a spec may have (schema 3): ``num_ctas`` (2, 4 or 8), ``persistent`` (:func:`check_persistent`) and ``global_scratch`` (bytes
+    per CTA, 1 to 2**20), each written only when it is not the default."""
+    if "num_ctas" in d and (not is_int(d["num_ctas"]) or d["num_ctas"] not in NUM_CTAS):
+        bad(f"num_ctas is one of {list(NUM_CTAS)} (it is not written when it is 1), got {d['num_ctas']!r}")
+    if "persistent" in d:
+        check_persistent(d["persistent"], d.get("grid"))
+    if "global_scratch" in d and (not is_int(d["global_scratch"]) or not 1 <= d["global_scratch"] <= MAX_GLOBAL_SCRATCH):
+        bad(f"global_scratch is an int from 1 to {MAX_GLOBAL_SCRATCH} (bytes per CTA; not written when it is 0), got {d['global_scratch']!r}")
+
+
 def validate_binary(b: Any) -> None:
-    """The ``binary`` section of a spec of a prebuilt (non-Triton) kernel: ``kind``, ``symbol``, dynamic ``shared`` memory and the sha256 of the source."""
-    _keys(b, "binary", ["kind", "symbol", "shared", "digests"])
+    """The ``binary`` section of a spec of a prebuilt (non-Triton) kernel: ``kind``, ``symbol``, dynamic ``shared`` memory and the sha256 of the
+    source, and its thread-block ``cluster`` when it has one."""
+    _keys(b, "binary", ["kind", "symbol", "shared", "digests"], ["cluster"])
+    if "cluster" in b:
+        check_cluster(b["cluster"], "binary cluster")
     if b["kind"] not in ("ptx", "cubin"):
         bad(f"binary kind must be 'ptx' or 'cubin', got {b['kind']!r}")
     if not isinstance(b["symbol"], str) or not _SYMBOL.match(b["symbol"]):
@@ -707,11 +755,15 @@ def validate_spec(d: Any) -> None:
     # those of an extern declared with enable_fp_fusion= too; language only in the spec of a Gluon kernel (extern(gluon=...))
     # (and implementation only in the spec of one implementation of an op declared with extern(by_arch=...))
     optional = ["enable_fp_fusion", "source_sha256", "dims", "language", "implementation"] if schema >= DIGEST_SCHEMA else []
+    # the launch shapes of schema 3: a cluster of CTAs per program, a persistent grid, the global scratch of a CTA (each only when it is not the default)
+    launch_shapes = ["num_ctas", "persistent", "global_scratch"] if schema >= STRIDED_SCHEMA else []
     required = TOP_KEYS_V2 if schema >= DIGEST_SCHEMA else TOP_KEYS
     if is_binary:
         required = [k for k in required if k not in ("triton", "num_warps", "num_stages")] + ["binary"]
         optional = ["dims", "implementation"]  # (implementation: one implementation of an op declared with extern(by_arch=...))
-    _keys(d, "spec", required, optional)
+        launch_shapes = ["persistent"] if schema >= STRIDED_SCHEMA else []
+    _keys(d, "spec", required, optional + launch_shapes)
+    check_launch_shapes(d)
     if "source_sha256" in d and not (isinstance(d["source_sha256"], str) and _DIGEST.match(d["source_sha256"])):
         bad(f"source_sha256 must be 64 lowercase hex digits (a sha256), got {d['source_sha256']!r}")
     if schema >= DIGEST_SCHEMA and not (isinstance(d["declaration_digest"], str) and _DIGEST.match(d["declaration_digest"])):

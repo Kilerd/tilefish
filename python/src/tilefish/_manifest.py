@@ -245,6 +245,52 @@ def _check_warps(who: str, entry: "dict[str, Any]", kind: str) -> None:
         )
 
 
+def _check_launch(who: str, entry: "dict[str, Any]", kind: str) -> None:
+    """The launch shapes of an entry, as the Rust reader's ``Entry::check_raw`` reads them (manifest schema 3, sections 4.3 to 4.6).
+
+    ``launch.global_scratch_align`` is only there with a global scratch (``global_scratch_size`` above 0), a power of two; a Triton entry compiled with
+    more than one CTA per program says so in its compile options (``options.num_ctas``, an int other than 1, equal to ``launch.num_ctas``); a prebuilt
+    binary is launched with nothing but its parameters and, when it declares one, its cluster (``cluster_dims`` of at least 1 each, ``num_ctas`` their
+    product, at most 8). ``persistent`` (a JSON ``null`` is as absent) is ``{"programs_per_sm"[, "sm_count"]}`` on an entry whose grid has one entry.
+    What neither host launches of a Triton entry (profile scratch, PDL, a cooperative launch, another cluster, a scratch of unknown alignment or
+    aligned to more than 256 bytes) is refused when it is loaded (:func:`tilefish._cuda.refuse_unsupported`), as before."""
+    from ._specvalid import check_persistent
+
+    launch = entry["launch"]
+    scratch = launch.get("global_scratch_size")
+    if launch.get("global_scratch_align") is not None:  # (a JSON null is as absent; at most 2**31, the u32 the Rust reader reads)
+        align = launch["global_scratch_align"]
+        if not (type(scratch) is int and scratch > 0) or type(align) is not int or not 1 <= align <= 1 << 31 or align & (align - 1):
+            raise TilefishManifestError(
+                f"{who}: launch.global_scratch_align is the alignment (a power of two) of a global scratch, only with global_scratch_size above 0; "
+                f"got {align!r} with {scratch!r}"
+            )
+    if kind == ENTRY_KIND_TRITON:
+        options = entry.get("options")
+        said = options.get("num_ctas") if isinstance(options, dict) else None
+        ctas = launch.get("num_ctas")
+        if (said is None and type(ctas) is int and ctas != 1) or (said is not None and (type(said) is not int or said == 1 or said != ctas)):
+            raise TilefishManifestError(
+                f"{who}: options.num_ctas (present when a program is more than one CTA) must be launch.num_ctas {ctas!r}, got {said!r}"
+            )
+    else:
+        try:
+            blockers = LaunchAttributes.from_dict(launch).replay_blockers()
+        except (KeyError, TypeError, ValueError):
+            blockers = ["malformed"]
+        if scratch or blockers:
+            raise TilefishManifestError(
+                f"{who}: a prebuilt binary is launched with its parameters and, when it declares one, its cluster (at most {8} blocks): its launch "
+                f"attributes are the zero ones but cluster_dims and num_ctas, got {launch!r}"
+            )
+    persistent = entry.get("persistent")
+    if persistent is not None:
+        try:
+            check_persistent(persistent, entry.get("grid"))
+        except TilefishSpecError as e:
+            raise TilefishManifestError(f"{who}: {str(e).removeprefix('malformed compile spec: ')}") from None
+
+
 def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
     """Every parameter of the ABI on its own: its kind, its type and width, and which fields it has (the Rust reader's ``read_params``).
 
@@ -656,7 +702,7 @@ class Manifest:
         _check_identity(who, entry)
         _check_params(who, entry, entry_kind)
         _check_warps(who, entry, entry_kind)
-        if entry.get("cuda_math") is not None:  # section 4.3: the CUDA math functions of a generated kernel, and its libdevice
+        if entry.get("cuda_math") is not None:  # section 4.7: the CUDA math functions of a generated kernel, and its libdevice
             from ._cudamath import check_field
 
             problem = check_field(who, entry["cuda_math"])
@@ -664,6 +710,7 @@ class Manifest:
                 problem = f"{who}: cuda_math is only on the entry of a kernel tilefish generated (a triton entry with a source_sha256)"
             if problem is not None:
                 raise TilefishManifestError(problem)
+        _check_launch(who, entry, entry_kind)
         if entry_kind == ENTRY_KIND_BINARY:
             extra = [k for k in ("options", "num_warps", "num_stages") if k in entry]
             if extra:
@@ -851,6 +898,20 @@ class Manifest:
             launch = LaunchAttributes.from_dict(entry["launch"])
         except (KeyError, TypeError, ValueError) as e:
             raise TilefishManifestError(f"'{spec.stem}' ({arch}): the launch attributes are malformed: {e}") from e
+        # the cluster, the global scratch and the persistent grid a launch is given are the declaration's (a binary of another one is another
+        # binary): a prebuilt binary's cluster as declared, a Triton kernel's num_ctas CTAs (its compiler lays them out); the persistent grid both
+        # ways (a host launches an entry's own)
+        if spec.binary is not None:
+            same_cluster = list(launch.cluster_dims) == list(spec.binary.get("cluster", [1, 1, 1]))
+        else:
+            same_cluster = launch.num_ctas == spec.num_ctas == math.prod(launch.cluster_dims)
+        if not same_cluster or launch.global_scratch_size != spec.global_scratch or entry.get("persistent") != spec.persistent:
+            raise TilefishManifestError(
+                f"the manifest entry for '{spec.stem}' ({arch}) is not what the compile spec asks for: its launch has the cluster "
+                f"{list(launch.cluster_dims)}, {launch.global_scratch_size} bytes of global scratch per CTA and the persistent grid "
+                f"{entry.get('persistent')}, the spec gives {spec.binary.get('cluster', [1, 1, 1]) if spec.binary is not None else spec.num_ctas} CTAs, "
+                f"{spec.global_scratch} and {spec.persistent}"
+            )
         try:
             return BuiltKernel(
                 spec=spec,

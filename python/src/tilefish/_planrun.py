@@ -322,7 +322,7 @@ class Backend:
     def load(self, built: Any, index: int) -> Any:
         raise NotImplementedError
 
-    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int) -> None:
+    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int, scratch: "int | None" = None) -> None:
         raise NotImplementedError
 
     def encode_tensor_map(self, arguments: Any) -> bytes:
@@ -487,8 +487,8 @@ class TorchBackend(Backend):
                     load(loaded.function)
         return loaded
 
-    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int) -> None:
-        loaded.launch(grid, args, stream)
+    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int, scratch: "int | None" = None) -> None:
+        loaded.launch(grid, args, stream, scratch=scratch)
 
     def encode_tensor_map(self, arguments: Any) -> bytes:
         from . import _cuda
@@ -523,11 +523,12 @@ class TorchBackend(Backend):
 
     def check_grid(self, loaded: Any, grid: "Sequence[int]") -> None:
         dims = tuple(grid)
-        padded = dims + (1,) * (3 - len(dims))
-        for axis, (g, limit) in enumerate(zip(padded, loaded.grid_limits)):
+        blocks = loaded.launch_grid(dims)  # (a persistent grid's programs on the SMs it was loaded for, times a cluster)
+        for axis, (g, limit) in enumerate(zip(blocks, loaded.grid_limits)):
             if not 1 <= g <= limit:
+                shown = dims if blocks == dims + (1,) * (3 - len(dims)) else f"{dims} ({blocks} blocks)"
                 raise TilefishRuntimeError(
-                    f"'{loaded.built.stem}': the grid {dims} has {g} blocks along {'XYZ'[axis]}, but this device takes 1 to {limit} there"
+                    f"'{loaded.built.stem}': the grid {shown} has {g} blocks along {'XYZ'[axis]}, but this device takes 1 to {limit} there"
                 )
 
     def check_gemm(self, spec: Any, algo: str, index: int) -> None:
@@ -965,7 +966,9 @@ class PlanRunner:
         return arena
 
     def _bucket(self, values: "Mapping[str, int]", index: int) -> _BucketRT:
-        key = (tuple(sorted(values.items())), index)
+        from . import _cuda
+
+        key = (tuple(sorted(values.items())), index, _cuda.current_partition())  # (a persistent kernel is loaded for the SMs of the partition)
         rt = self._rts.get(key)
         if rt is not None:
             return rt
@@ -1024,7 +1027,17 @@ class PlanRunner:
                 order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "tensordesc", "scalar", "given"))
                 loaded = be.load(built, index)
                 be.check_grid(loaded, bound.grid)
-                steps.append(_StepRT(bound, loaded, order, None, None))
+                ws = st.get("workspace")  # a kernel with a global scratch: the workspace of the arena, every CTA of the launch its share
+                if (ws is None) != (bound.spec.global_scratch == 0):
+                    raise TilefishManifestError(
+                        f"{where}: the entry has {bound.spec.global_scratch} bytes of global scratch per CTA, and the step "
+                        + ("names no workspace" if ws is None else f"names the workspace '{ws}'")
+                    )
+                if ws is not None:
+                    need = loaded.scratch_bytes(bound.grid)  # (of the programs a persistent grid runs on the SMs it was loaded for)
+                    if shapes[ws][1][0] < need:
+                        raise TilefishManifestError(f"{where}: the workspace '{ws}' has {shapes[ws][1][0]} bytes, but the global scratch of the launch is {need}")
+                steps.append(_StepRT(bound, loaded, order, None, ws))
         be.warm(index, self.has_library)
         return _BucketRT(dict(values), shapes, steps, *self._carried_uses)
 
@@ -1256,7 +1269,10 @@ class PlanRunner:
                     launch_args.append(("tensordesc", (descs or {})[n]))
                 else:
                     launch_args.append((kind, st.bound.scalars[n]))
-            be.launch(st.loaded, st.bound.grid, launch_args, stream)
+            if st.workspace is None:
+                be.launch(st.loaded, st.bound.grid, launch_args, stream)
+            else:  # the global scratch of the kernel: the arena's workspace
+                be.launch(st.loaded, st.bound.grid, launch_args, stream, scratch=bases[st.workspace])
 
     def _written(self, st: "_StepRT") -> "set[str]":
         """The buffers a step writes: a copy's or a memset's destination, a GEMM's ``out``, the ``out`` and ``inout`` pointers of a kernel."""

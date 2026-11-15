@@ -1,4 +1,4 @@
-"""The CUDA math library a lowered kernel's bits reproduce, and the guard on it (``docs/numerics.md``; manifest schema 3, section 4.3).
+"""The CUDA math library a lowered kernel's bits reproduce, and the guard on it (``docs/numerics.md``; manifest schema 3, section 4.7).
 
 Some ops of a lowered kernel are, by their numerics contract, the bits of a function of CUDA's math library: in IEEE math ``exp`` and ``silu``
 are built on ``expf``, ``rsqrt`` is ``rsqrtf`` and ``erf`` is ``erff`` (inline PTX read from NVRTC), and in either math ``sin``, ``cos`` and

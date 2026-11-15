@@ -223,7 +223,7 @@ struct StepRun {
     stem: String,
     op: Op,
     args: Vec<ArgRun>,
-    /// A library step's workspace: its buffer and its shape (`[bytes]`).
+    /// A library step's workspace, or the global scratch of a kernel step that has one: its buffer and its shape (`[bytes]`).
     workspace: Option<(usize, [usize; 1])>,
     /// The buffers the step writes.
     written: Vec<usize>,
@@ -1521,6 +1521,13 @@ impl PlanRun {
             Ok(match &step.op {
                 Op::Kernel(kernel) => {
                     let given: Vec<(&str, i64)> = step.given.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+                    if let Some((w, shape)) = step.workspace.as_ref() {
+                        // a kernel with a global scratch: the plan's workspace is its scratch (the steps run one after the other)
+                        let region = ffi::plan::check_region(bases[*w], region_bytes(*w), inner.arena.device);
+                        args.push(
+                            TensorArg::new(region, shape, DType::U8, Access::InOut).map_err(|e| in_step(e, &what))?,
+                        );
+                    }
                     Ready::Kernel(kernel, Box::new(kernel.check_with(&args, &given).map_err(|e| in_step(e, &what))?))
                 }
                 Op::Gemm(gemm) => {

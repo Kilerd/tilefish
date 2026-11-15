@@ -358,6 +358,22 @@ def manifest_documents():
         {"schema": 3, "kernels": [], "library": [library("g.M32", dtypes={"a": "f16", "b": "f16", "out": "f32"}, transa="N", lda=2048, allow_f16_reduction=True)]},
         # an entry of f32 operands that opts in to split-K partial sums in the output (section 9.2)
         {"schema": 3, "kernels": [], "library": [library("g.M32", dtypes={"a": "f32", "b": "f32", "out": "f32"}, allow_f32_reduction=True)]},
+        # the launch shapes of sections 4.3 to 4.6 (tilefish 0.0.7): a grid that multiplies, a persistent grid (with the SM count a kernel whose bytes
+        # depend on it is declared for), a cluster and its compile option, a global scratch and its alignment: each digested as it is
+        {"schema": 3, "kernels": [triton("s", grid="(cdiv(C*T, 1024),)", persistent={"programs_per_sm": 1})], "library": []},
+        {"schema": 3, "kernels": [triton("s", grid="(cdiv(C*T, 1024),)", persistent={"programs_per_sm": 2, "sm_count": 30})], "library": []},
+        {
+            "schema": 3,
+            "kernels": [
+                triton(
+                    "s",
+                    options={"num_warps": 4, "num_stages": 3, "num_ctas": 2},
+                    launch={"global_scratch_size": 256, "profile_scratch_size": 0, "launch_pdl": False, "cluster_dims": [2, 1, 1], "num_ctas": 2,
+                            "cooperative": False, "global_scratch_align": 128},
+                )
+            ],
+            "library": [],
+        },
         # non-ASCII, escaped (and, at the end of the list, as it is)
         non_ascii,
         # a schema that is not the integer 3: the digest still has a form for each, and 3.0 is the same number as 3 in Python

@@ -342,8 +342,8 @@ and 16-byte aligned (`contiguous`) is the default. `x.reshape(M, 3, H, D)` (a de
 dimension (`x.split(16, axis=1)` of `x: [M, C]` with `C = Dim("C", divisible_by=16)`) returns `Chunks`, a sequence of symbolic length:
 `chunks[0]` and `chunks[-1]` always exist, any other chunk where the dimension's smallest size proves it, and `len()` and unpacking
 raise. A stride or an offset may be a product of
-symbolic sizes: an `[H, L, L]` tensor has the stride `L*L` along its first axis, and `x[h]` the offset `h*L*L` (`tilefish.dims.mul`; the declared
-language stays affine, a shape of `L * L` is still refused), which a `Strided[...]` argument binds and a plan evaluates at every bucket, so attention
+symbolic sizes: an `[H, L, L]` tensor has the stride `L*L` along its first axis, and `x[h]` the offset `h*L*L` (`tilefish.dims.mul`; a shape stays
+affine, `L * L` is still refused there, and only a launch grid may multiply dimensions), which a `Strided[...]` argument binds and a plan evaluates at every bucket, so attention
 scores `[H, L, L]` are a buffer of a plan and their transposes and heads are views of it. A view is a `View[...]` and can go into traced
 elementwise and reduction ops; a declared operator takes one only where its parameter says so. Every other tensor parameter (and result) of a kernel,
 extern, library op or graph is contiguous: an annotation that is a `TensorType` with other strides, an offset or no alignment is refused at the
@@ -505,7 +505,7 @@ argument of the encode but the tensor's; manifest schema 3, section 5.5), and bo
 address: `pointer_alignment`; strides that are multiples of 16 bytes and dimensions within `i32`: `tensor_map`). A map is encoded at every launch from the
 tensor of that launch, and for a plan at every execution from the buffers each step binds; a CUDA graph holds the maps of the addresses it was captured
 with, as it holds the addresses. `TensorDesc(Strided[Tensor[...]], ...)` describes a view the kernel reads (its row stride is the view's). Triton's
-*device-side* descriptors (`tl.make_tensor_descriptor`, which need a global scratch) are still refused: declare the descriptor as a parameter.
+*device-side* descriptors (`tl.make_tensor_descriptor`) write their maps into a global scratch, which an extern declares (`global_scratch=`, below).
 
 **Warp-specialised kernels.** A Blackwell kernel is often fastest when its partitions run on warps of their own: Gluon's `gl.warp_specialize` (a
 1-warp TMA producer and a 1-warp MMA issuer feeding 4 compute warps, say), or Triton's own warp specialisation of a `tl.range(..., warp_specialize=True)`
@@ -523,7 +523,33 @@ not warp-specialised). The workers add warps of their own, and the compiled kern
 any other kernel whose warps Triton changed, as before; either way the PTX's `.reqntid` must be the block. The manifest entry keeps `num_warps` (the compile
 option) and records `total_num_warps` with the block it makes (`32 * total_num_warps`; manifest schema 3, section 4.2), which is in the manifest digest, and
 every launch takes that block: `jit`, `replay`, a step of a plan, a CUDA graph, and the Rust crate (`Entry::total_num_warps`, `Plan::block()`).
-Clusters (`num_ctas` above 1) are still refused, as for any kernel.
+
+**Launch shapes.** How an extern is launched can say more than an affine grid (manifest schema 3, sections 4.3 to 4.6):
+
+```python
+@tilefish.extern(triton=k.scale, grid=lambda T, C, BLOCK: (tilefish.cdiv(T * C, BLOCK),))       # a grid may multiply dimensions
+def scale(x: Tensor[T, C, f32], y: Out[Tensor[T, C, f32]], n_t: T, n_c: C, BLOCK: const = 1024): ...
+
+@tilefish.extern(triton=k.tiles, grid=lambda M, N: (tilefish.cdiv(M, 128) * tilefish.cdiv(N, 128),),
+                 persistent=tilefish.persistent(programs_per_sm=1))                              # min(tiles, 1 * SMs) programs
+def tiles(a: Tensor[M, K, f16], b: Tensor[N, K, f16], c: Out[Tensor[M, N, f16]], k_len: K): ...
+
+@tilefish.extern(triton=k.rows, grid=lambda TB, BLOCK_T: (tilefish.cdiv(TB, BLOCK_T),),
+                 by_bucket=lambda TB: tilefish.config(num_warps=2, BLOCK_T=16) if TB <= 256 else tilefish.config(num_warps=8, BLOCK_T=64))
+def rows(x: Tensor[TB, 128, f32], y: Out[Tensor[TB, 128, f32]], n_rows: TB, BLOCK_T: const = 32): ...
+```
+
+A grid is computed at each launch and never solved, so it may multiply dimensions (one binary for every `T` and `C`). A **persistent** grid is the
+number of tiles, and the host launches at most `programs_per_sm` programs per SM of the device it loads the binary on (or of the partition it says it runs
+on: `Manifest::with_sm_partition` in Rust, `tilefish.runtime.sm_partition(n)` in Python), so a manifest exported on a MIG slice runs on the whole GPU;
+the kernel walks the tiles with a stride of `tl.num_programs(0)`, and promises that its bytes do not depend on how many programs run, unless it states the
+SM count it is for (`sm_count=30`: a persistent reduction), which a host on another count refuses. `by_bucket=` gives each bucket of a bucketed
+dimension its own compile-time configuration (warps, stages, CTAs, the values of consts), each binary built, keyed and digested with its own.
+`num_ctas=2` (Triton's compile option) runs a program on a thread-block cluster of 2 CTAs, and a prebuilt binary declares `cluster=(2, 1, 1)`: both hosts
+launch it with `cuLaunchKernelEx` and the cluster, the grid counting clusters. `global_scratch=256` is the global scratch each CTA of the compiled kernel
+addresses (device-side TMA descriptors write theirs there), which the build checks against Triton's metadata: Python allocates it per launch, the Rust
+crate takes it as the last tensor of a launch (`Plan::tensor_names()` ends with `global_scratch`), and a plan gives its workspace. Profile scratch, PDL
+and cooperative launches stay refused.
 
 **A pinned cuBLASLt GEMM.** `@tilefish.library("gemm", acc=f32, impl="cublaslt.gemm")` over `(a: Tensor[M, K, bf16], b: Tensor[N, K, bf16]) ->
 Tensor[M, N, bf16]` computes `a @ b.T` with an f32 accumulator and one rounding (`impl="cublaslt.gemm_bias"` adds `bias: Tensor[N, bf16]`, added in f32 before it).

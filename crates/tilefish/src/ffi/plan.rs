@@ -135,6 +135,21 @@ pub(crate) fn check_region<'a>(addr: u64, len: u64, device: i32) -> DevicePtr<'a
 pub(crate) fn enqueue_steps(stream: &CudaStream, steps: &[Ready<'_>]) -> Result<()> {
     for step in steps {
         match step {
+            Ready::Kernel(kernel, prepared) if prepared.cluster.is_some() => {
+                stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
+                // SAFETY: a kernel of thread-block clusters, launched with `cuLaunchKernelEx` (cudarc's builder has no cluster attribute): the
+                // `Prepared` that `Plan::prepare` made for this very kernel (its slots, its grid of blocks, its cluster), on a cudarc stream of its
+                // context made current above, with the addresses the doc comment of this function says.
+                unsafe {
+                    crate::ffi::launch_prepared(
+                        kernel.function().cu_function(),
+                        prepared,
+                        kernel.plan().block(),
+                        kernel.plan().shared(),
+                        stream.cu_stream(),
+                    )
+                }?;
+            }
             Ready::Kernel(kernel, prepared) => {
                 let mut launch = stream.launch_builder(kernel.function());
                 for (slot, value) in prepared.params().iter().enumerate() {

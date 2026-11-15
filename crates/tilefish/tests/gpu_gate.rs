@@ -273,6 +273,16 @@ fn launch_generic(gpu: &Gpu, manifest: &Manifest, case: &Value, bufs: &mut [Buf]
         .map(|m| m.iter().map(|(n, v)| (n.clone(), v.as_i64().expect("a given value is an integer"))).collect())
         .unwrap_or_default();
     let given: Vec<(&str, i64)> = given.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+    // a kernel with a global scratch: the last tensor, as many bytes as the launch needs (cudarc's allocations start on 256 bytes); freed after the
+    // launch, which cudarc orders behind the kernel
+    let mut scratch = case
+        .get("global_scratch")
+        .and_then(Value::as_u64)
+        .map(|bytes| gpu.stream.alloc_zeros::<u8>(bytes as usize).expect("a global scratch"));
+    let scratch_shape = [scratch.as_ref().map_or(0, |s| s.len())];
+    if let Some(s) = scratch.as_mut() {
+        args.push(TensorMut::<U8>::from_cuda(s, &scratch_shape)?.into_arg());
+    }
     manifest.kernel(&gpu.ctx, stem, &[], arch)?.launch_with(s, &mut args, &given)
 }
 
@@ -1515,7 +1525,7 @@ fn the_gate_has_tanh() {
 
 /// Lowered kernels of the primitives of notes 15 to 17 of `tilefish.lower` (`python/tests/primitive_cases.py`, `host_ops.primitive_ops`): CUDA's
 /// `erff` in IEEE math, an `fma`, CUDA's negation and an rmsnorm whose sum of squares is an ordered `fma` sum; `byte_identity` holds their bytes to
-/// Python's (which `rust_gate.py` holds to the exact reference). The export records the CUDA math functions of its generated kernels (section 4.3 of
+/// Python's (which `rust_gate.py` holds to the exact reference). The export records the CUDA math functions of its generated kernels (section 4.7 of
 /// the manifest schema): `erf_ieee` copies CUDA's `erff`, which CUDA 13.2 changed, so `check_cuda_math` refuses that release and takes 12.8.
 #[test]
 fn the_gate_has_the_numerics_primitives_and_their_cuda_math() {
@@ -2839,6 +2849,198 @@ fn a_gemm_whose_algorithm_needs_a_workspace_runs_with_the_callers_and_matches_re
     println!(
         "rust gate: the GEMM '{stem}' (m={m} n={n} k={k}, a split-K algorithm that needs {required} bytes of workspace) matches replay with the entry's workspace, with exactly {required} bytes (dirty) and in a CUDA graph; one byte less is refused"
     );
+}
+
+// -- launch shapes ---------------------------------------------------------------------------------------------------------------------
+
+/// Whether the gate exported the kernels of `launch_kernels.py` (a fresh export on sm_90 or newer: a committed fixture has none).
+fn has_launch_shapes(cases: &Value) -> bool {
+    has_tma(cases) && !cases_where(cases, |c| c["stem"] == "product_scale").is_empty()
+}
+
+/// The launch shapes of `docs/manifest-schema-3.md`, sections 4.3 to 4.6, in a fresh export: a grid that multiplies two dimensions, a persistent
+/// grid, a configuration per bucket (each bucket's warps), clusters of a Triton kernel (its compile option and its launch) and of a prebuilt binary,
+/// a global scratch (its size per CTA and its alignment); each kernel loads, and the gate runs at least two cases of each (compared with Python's
+/// replay by `rust_gate.py compare`).
+#[test]
+fn the_gate_has_launch_shapes() {
+    let cases = cases();
+    if !has_launch_shapes(&cases) {
+        eprintln!("the gate runs a committed fixture, or a device before sm_90: no launch shape");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let entry = |stem: &str| {
+        manifest.entry(stem, &arch.to_string()).unwrap_or_else(|| panic!("the gate's manifest has {stem}"))
+    };
+    assert_eq!(entry("product_scale").grid, "(cdiv(C*T, 1024),)");
+    assert_eq!(entry("persistent_scale").persistent, Some(tilefish::Persistent { programs_per_sm: 1, sm_count: None }));
+    assert_eq!((entry("rows_by_bucket.TB64").num_warps, entry("rows_by_bucket.TB4096").num_warps), (Some(2), Some(8)));
+    let cluster = entry("cluster_scale");
+    assert_eq!((cluster.launch.cluster(), cluster.kind), (Some([2, 1, 1]), tilefish::EntryKind::Triton));
+    let swap = entry("cluster_swap");
+    assert_eq!((swap.launch.cluster(), swap.kind), (Some([2, 1, 1]), tilefish::EntryKind::Binary));
+    let desc = entry("desc_scale");
+    assert_eq!(desc.launch.global_scratch_size, 256);
+    assert!(desc.launch.global_scratch_align.is_some_and(|a| 256 % a == 0), "{:?}", desc.launch);
+    let stems = [
+        "product_scale",
+        "persistent_scale",
+        "rows_by_bucket.TB64",
+        "rows_by_bucket.TB4096",
+        "cluster_scale",
+        "cluster_swap",
+        "desc_scale",
+    ];
+    for stem in stems {
+        let kernel = manifest.kernel(&gpu.ctx, stem, &[], arch).unwrap_or_else(|e| panic!("{stem} loads: {e}"));
+        let n = cases_where(&cases, |c| c["stem"] == stem).len();
+        assert!(n >= 2, "the gate has {n} cases of {stem}");
+        if stem == "persistent_scale" {
+            let sms = u64::try_from(
+                gpu.ctx.attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(kernel.sm_count(), Some(sms), "a persistent kernel is loaded for the device's SMs");
+        } else {
+            assert_eq!(kernel.sm_count(), None);
+        }
+    }
+    println!("rust gate: {} kernels of every launch shape load as the manifest records them", stems.len());
+}
+
+/// A persistent kernel on a partition of the device's SMs (`Manifest::with_sm_partition`): loaded for that many SMs (another load than the whole
+/// device's), it gives Python's bytes on 1, 8 and 16 of them; one declared for 30 SMs (`persistent_pinned`, on a device of 30) is refused on 16.
+#[test]
+fn a_persistent_kernel_gives_the_same_bytes_on_every_partition() {
+    let cases = cases();
+    if !has_launch_shapes(&cases) {
+        eprintln!("no launch shape in this gate");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let case = cases_where(&cases, |c| c["stem"] == "persistent_scale").into_iter().last().expect("a case");
+    let expect = read(&gate_dir().join(case["tensors"][1]["expect"].as_str().unwrap()));
+    for sms in [1u64, 8, 16] {
+        let on = manifest.with_sm_partition(Some(sms));
+        let kernel = on.kernel(&gpu.ctx, "persistent_scale", &[], arch).unwrap();
+        assert_eq!(kernel.sm_count(), Some(sms));
+        let (_, mut bufs): (Vec<String>, Vec<Buf>) = tensors_of(&gpu, &case).into_iter().unzip();
+        let (x, y) = bufs.split_at_mut(1);
+        kernel
+            .launch(&gpu.stream, &mut [r::<F32>(&x[0]).unwrap().into_arg(), m::<F32>(&mut y[0]).unwrap().into_arg()])
+            .unwrap();
+        assert_eq!(gpu.download(&y[0]), expect, "on a partition of {sms} SMs");
+    }
+    if manifest.entry("persistent_pinned", &arch.to_string()).is_some() {
+        let e = manifest.with_sm_partition(Some(16)).kernel(&gpu.ctx, "persistent_pinned", &[], arch).unwrap_err();
+        assert!(e.to_string().contains("declared for 30 SMs"), "{e}");
+        let _ = manifest
+            .kernel(&gpu.ctx, "persistent_pinned", &[], arch)
+            .expect("it loads on the 30 SMs it is declared for");
+    }
+    println!("rust gate: a persistent kernel on partitions of 1, 8 and 16 SMs gave Python's bytes");
+}
+
+/// Kernels of every launch shape captured in a CUDA graph (`unsafe launch_raw` and the safe `launch`, on regions): clusters (`cuLaunchKernelEx` in a
+/// capture), a global scratch (a region of the bytes the launch needs, last), a persistent grid and a configuration per bucket; every replay computes
+/// Python's bytes.
+#[test]
+fn graph_capture_of_launch_shapes() {
+    let cases = cases();
+    if !has_launch_shapes(&cases) {
+        eprintln!("no launch shape in this gate");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let stream = gpu.stream.cu_stream();
+    let stems =
+        ["cluster_scale", "cluster_swap", "desc_scale", "persistent_scale", "rows_by_bucket.TB4096", "product_scale"];
+    for stem in stems {
+        let case = cases_where(&cases, |c| c["stem"] == stem).into_iter().last().expect("a case");
+        let kernel = manifest.kernel(&gpu.ctx, stem, &[], arch).unwrap();
+        let mut tensors = tensors_of(&gpu, &case);
+        let scratch_bytes = case.get("global_scratch").and_then(Value::as_u64);
+        let scratch = scratch_bytes.map(|n| gpu.zeros(n as usize));
+        let last = tensors.len() - 1;
+        let expect = read(&gate_dir().join(case["tensors"][last]["expect"].as_str().unwrap()));
+        let shapes: Vec<(Vec<usize>, bool)> =
+            tensors_json(&case).iter().map(|t| (usizes(&t["shape"]), t["role"] == "out")).collect();
+        gpu.stream.synchronize().unwrap();
+        // SAFETY: the buffers outlive the graph's launches (until the end of this iteration), and nothing else uses them meanwhile.
+        let regions: Vec<DevicePtr<'static>> =
+            unsafe { tensors.iter().map(|(_, b)| gpu.unbound_region(b, b.nbytes())).collect() };
+        // SAFETY: as above, for the scratch.
+        let scratch_region = scratch.as_ref().map(|s| unsafe { gpu.unbound_region(s, s.nbytes()) });
+        let scratch_shape = [scratch_bytes.unwrap_or(0) as usize];
+        for raw in [true, false] {
+            let launch = || {
+                let mut args: Vec<TensorArg<'_>> = Vec::new();
+                for (region, (shape, out)) in regions.iter().zip(&shapes) {
+                    args.push(TensorArg::new(*region, shape, DType::F32, if *out { Access::Out } else { Access::In })?);
+                }
+                if let Some(region) = scratch_region {
+                    args.push(TensorArg::new(region, &scratch_shape, DType::U8, Access::Out)?);
+                }
+                if raw {
+                    // SAFETY: `stream` is the handle of a stream of the kernel's context; the buffers outlive the graph.
+                    unsafe { kernel.launch_raw(stream, &args) }
+                } else {
+                    kernel.launch(&gpu.stream, &mut args)
+                }
+            };
+            capture_and_run(&gpu, &launch, &mut tensors[last].1.slice, &expect);
+        }
+    }
+    println!(
+        "rust gate: {} kernels of every launch shape captured in CUDA graphs (launch_raw and launch, regions) ran 3 times each and matched Python's replay",
+        stems.len()
+    );
+}
+
+/// A kernel with a global scratch is refused a scratch that is too small, misaligned or one of its own tensors, before anything is launched.
+#[test]
+fn a_global_scratch_that_does_not_hold_the_launch_is_refused() {
+    let cases = cases();
+    if !has_launch_shapes(&cases) {
+        eprintln!("no launch shape in this gate");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let kernel = manifest.kernel(&gpu.ctx, "desc_scale", &[], arch).unwrap();
+    let x = gpu.upload(&vec![1u8; 100 * 64 * 4]);
+    let mut y = gpu.zeros(100 * 64 * 4);
+    let mut scratch = gpu.zeros(4096);
+    let shape = [100usize, 64]; // 2 programs: 512 bytes
+    for (bytes, offset, want) in
+        [(511usize, 0usize, PreconditionKind::Shape), (512, 128, PreconditionKind::PointerAlignment)]
+    {
+        let scratch_shape = [bytes];
+        let view = &mut scratch.slice;
+        let mut args = [
+            TensorRef::<F32>::from_cuda(&x.slice, &shape).unwrap().into_arg(),
+            TensorMut::<F32>::from_cuda(&mut y.slice, &shape).unwrap().into_arg(),
+            TensorMut::<U8>::from_cuda_strided(view, &scratch_shape, &[1], offset).unwrap().into_arg(),
+        ];
+        let e = kernel.launch(&gpu.stream, &mut args).unwrap_err();
+        assert_eq!(kind(&e), want, "{e}");
+    }
+    let e = kernel
+        .launch(
+            &gpu.stream,
+            &mut [
+                TensorRef::<F32>::from_cuda(&x.slice, &shape).unwrap().into_arg(),
+                TensorMut::<F32>::from_cuda(&mut y.slice, &shape).unwrap().into_arg(),
+            ],
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("takes 3 tensors (x, y, global_scratch)"), "{e}");
+    assert!(gpu.download(&y).iter().all(|b| *b == 0), "a refused launch wrote");
+    println!("rust gate: a global scratch too small, misaligned, or missing is refused before the launch");
 }
 
 // -- TMA descriptors ---------------------------------------------------------------------------------------------------------------------

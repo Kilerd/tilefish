@@ -480,22 +480,27 @@ pub enum Precondition {
 
 /// What the binary asks of the launch besides grid, block and shared memory.
 ///
-/// Read (with serde) from a JSON object with exactly these six fields, by name: a list of the values in their order is refused, as Python
-/// refuses it.
+/// Read (with serde) from a JSON object with exactly these six fields, by name, and `global_scratch_align` with a global scratch (tilefish
+/// 0.0.7, crate 0.0.5: manifest schema 3, section 4.6): a list of the values in their order is refused, as Python refuses it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchAttributes {
-    /// Bytes of global scratch the kernel needs (a plain launch passes a null pointer).
+    /// Bytes of global scratch each CTA of the kernel addresses: a launch gives it this many bytes per CTA of its grid (the caller's memory, or a
+    /// plan's workspace); 0 for a kernel that has none (its scratch slot is a null pointer).
     pub global_scratch_size: u64,
     /// Bytes of profile scratch.
     pub profile_scratch_size: u64,
     /// Programmatic dependent launch.
     pub launch_pdl: bool,
-    /// Cluster dimensions.
+    /// Cluster dimensions: the CTAs of a thread-block cluster along x, y and z (`[1, 1, 1]`: no cluster).
     pub cluster_dims: [u32; 3],
-    /// Number of CTAs.
+    /// The CTAs of a cluster (the product of `cluster_dims`): a kernel of more than one is launched with `cuLaunchKernelEx` and the cluster
+    /// attribute, and its grid counts clusters (a launch has `grid * cluster_dims` blocks).
     pub num_ctas: u32,
     /// A cooperative launch.
     pub cooperative: bool,
+    /// The alignment of the global scratch (a power of two), recorded with a global scratch only; `None` for every other kernel, and for one of a
+    /// manifest of tilefish 0.0.6, which did not record it (refused at load: export it again).
+    pub global_scratch_align: Option<u32>,
 }
 
 /// The derived reader of [`LaunchAttributes`] (every field by name, none unknown), which `by_name!` hands an object only.
@@ -508,14 +513,33 @@ struct LaunchFields {
     cluster_dims: [u32; 3],
     num_ctas: u32,
     cooperative: bool,
+    #[serde(default)]
+    global_scratch_align: Option<u32>,
 }
 
+/// The CTAs of a portable thread-block cluster: a launch of more needs CUDA's non-portable cluster size, which this host does not ask for.
+pub(crate) const MAX_CLUSTER: u32 = 8;
+/// What every global scratch this host gives starts on (an arena offset, a buffer of the caller held to it): an alignment that divides it is met.
+pub(crate) const SCRATCH_ALIGNMENT: u64 = 256;
+
 impl LaunchAttributes {
-    /// The attributes a plain `cuLaunchKernel` does not set up, as `name=value` strings (Python's `replay_blockers`).
+    /// The attributes this host does not set up, as `name=value` strings (Python's `replay_blockers`): profile scratch, programmatic dependent
+    /// launch, a cooperative launch, a cluster that is not `num_ctas` CTAs or is larger than the portable 8, and a global scratch whose alignment
+    /// the manifest does not record or does not divide 256 bytes. (A cluster of `num_ctas` CTAs is launched with `cuLaunchKernelEx`, and a global
+    /// scratch is given from the caller's memory or a plan's workspace: manifest schema 3, sections 4.5 and 4.6.)
     pub fn blockers(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.global_scratch_size != 0 {
-            out.push(format!("global_scratch_size={}", self.global_scratch_size));
+            match self.global_scratch_align {
+                None | Some(0) => out.push(format!(
+                    "global_scratch_size={} of an alignment the manifest does not record (export it again)",
+                    self.global_scratch_size
+                )),
+                Some(align) if !SCRATCH_ALIGNMENT.is_multiple_of(u64::from(align)) => {
+                    out.push(format!("global_scratch_size={} aligned to {align} bytes", self.global_scratch_size));
+                }
+                Some(_) => {}
+            }
         }
         if self.profile_scratch_size != 0 {
             out.push(format!("profile_scratch_size={}", self.profile_scratch_size));
@@ -523,15 +547,50 @@ impl LaunchAttributes {
         if self.launch_pdl {
             out.push("launch_pdl=True".to_owned());
         }
-        if self.cluster_dims != [1, 1, 1] || self.num_ctas != 1 {
-            out.push(format!("cluster_dims={:?}, num_ctas={}", self.cluster_dims, self.num_ctas));
+        let product = self.cluster_dims.iter().map(|c| u64::from(*c)).product::<u64>();
+        if product != u64::from(self.num_ctas) || self.num_ctas > MAX_CLUSTER || self.cluster_dims.contains(&0) {
+            out.push(format!(
+                "cluster_dims=({}, {}, {}), num_ctas={}",
+                self.cluster_dims[0], self.cluster_dims[1], self.cluster_dims[2], self.num_ctas
+            ));
         }
         if self.cooperative {
             out.push("launch_cooperative_grid=True".to_owned());
         }
         out
     }
+
+    /// The cluster a launch groups its blocks in (`cuLaunchKernelEx`'s cluster attribute), when the kernel has one (`num_ctas` above 1).
+    pub fn cluster(&self) -> Option<[u32; 3]> {
+        (self.num_ctas > 1).then_some(self.cluster_dims)
+    }
 }
+
+/// A persistent grid (`persistent` of an entry: manifest schema 3, section 4.3, tilefish 0.0.7, crate 0.0.5): the grid (one entry) is the number
+/// of tiles, and a launch runs at most `programs_per_sm * SMs / CTAs per program` programs, with the SM count of the device (or of the partition
+/// the host says it runs on, [`Manifest::with_sm_partition`]) read when the kernel is loaded. The kernel walks the tiles with a stride of the programs
+/// launched, so one binary serves every device shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Persistent {
+    /// The programs a launch runs per SM, at most (1 to 32).
+    pub programs_per_sm: u32,
+    /// For a kernel whose bytes depend on how many programs run (a persistent reduction): the SM count it was declared for, which a host on
+    /// another count refuses at load. `None`: the kernel's bytes are the same for every SM count.
+    pub sm_count: Option<u64>,
+}
+
+impl Persistent {
+    /// The programs a launch of `tiles` runs on `sms` SMs, each program `ctas` CTAs: at most `programs_per_sm` per SM, at least one, at most
+    /// `tiles` (Python's `persistent_programs`).
+    pub fn programs(&self, tiles: u64, sms: u64, ctas: u64) -> u64 {
+        (u64::from(self.programs_per_sm).saturating_mul(sms) / ctas.max(1)).min(tiles).max(1)
+    }
+}
+
+/// The most programs per SM a persistent grid asks for, and the largest SM count one is declared for (Python's `MAX_PROGRAMS_PER_SM`, and
+/// `tilefish.persistent`'s bound).
+const MAX_PROGRAMS_PER_SM: u32 = 32;
+const MAX_SM_COUNT: u64 = 1 << 20;
 
 /// What a kernel entry is made of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,7 +631,7 @@ pub enum BinarySource {
     },
 }
 
-/// The CUDA math library functions a generated kernel's bits are (`docs/manifest-schema-3.md` section 4.3, `docs/numerics.md`): in IEEE math
+/// The CUDA math library functions a generated kernel's bits are (`docs/manifest-schema-3.md` section 4.7, `docs/numerics.md`): in IEEE math
 /// `exp` and `silu` are built on `expf`, `rsqrt` is `rsqrtf` and `erf` `erff`, and `sin`, `cos` and `tanh` are libdevice's `sinf`, `cosf` and
 /// `tanhf`. Those functions are not the same in every CUDA release (13.2 changed `erff`), so the entry records which it uses and the releases
 /// tilefish measured each on; [`Manifest::check_cuda_math`] refuses a manifest whose functions were not measured on a host's release.
@@ -656,7 +715,7 @@ pub struct Entry {
     pub binary: Option<BinarySource>,
     /// The sha256 of the Triton source of a generated kernel.
     pub source_sha256: Option<String>,
-    /// The CUDA math library functions a generated kernel's bits are, the releases they were measured on, and its libdevice (section 4.3).
+    /// The CUDA math library functions a generated kernel's bits are, the releases they were measured on, and its libdevice (section 4.7).
     pub cuda_math: Option<CudaMath>,
     /// The identity of what was built: the digest of the Triton IR (TTIR without locations) the binary was built from, for generated and
     /// hand-written kernels alike (the TTGIR of Gluon's frontend for a Gluon kernel; Python recomputes it to tell a stale binary; a Rust
@@ -665,6 +724,9 @@ pub struct Entry {
     /// How `source_digest` was computed (`tilefish.triton-ir.v1`, `tilefish.gluon-ir.v1` for a Gluon kernel, or `tilefish.binary.v1` for a
     /// prebuilt binary). A Gluon kernel is a `triton` entry like any other: Triton compiled it, and it is launched the same way.
     pub source_digest_kind: Option<String>,
+    /// A persistent grid (manifest schema 3, section 4.3): the grid is the tiles, and a launch runs at most `programs_per_sm` programs per SM of
+    /// the device (or partition) the kernel was loaded for. `None` for every other kernel.
+    pub persistent: Option<Persistent>,
     /// The verified cubin.
     pub cubin: Arc<[u8]>,
 }
@@ -675,6 +737,10 @@ impl Entry {
         self.params.iter().find(|p| p.name == name)
     }
 }
+
+/// What a loaded kernel is cached under: its entry, the `CUcontext` it is loaded in, and the SMs a persistent kernel's grid is resolved for (the
+/// partition of [`Manifest::with_sm_partition`], or the device's; `None` for any other kernel).
+pub(crate) type KernelKey = (usize, usize, Option<u64>);
 
 /// The binaries of a manifest directory, verified when it is loaded.
 ///
@@ -688,7 +754,7 @@ pub struct Manifest {
     pub(crate) library: Arc<Vec<LibraryEntry>>,
     /// The cuDNN convolutions of the `library` section (`impl: "cudnn.conv_fwd"`).
     pub(crate) convs: Arc<Vec<ConvEntry>>,
-    pub(crate) kernels: Arc<Mutex<HashMap<(usize, usize), Cached>>>,
+    pub(crate) kernels: Arc<Mutex<HashMap<KernelKey, Cached>>>,
     pub(crate) gemms: Arc<Mutex<HashMap<(usize, usize), CachedGemm>>>,
     pub(crate) conv_cache: Arc<Mutex<HashMap<(usize, usize), CachedConv>>>,
     /// The partition of the device's SMs the host runs its GEMMs on, when it said (`Manifest::with_sm_partition`).
@@ -790,6 +856,7 @@ pub(crate) use by_name;
 
 by_name! {
     LaunchAttributes => LaunchFields::deserialize, "launch";
+    RawPersistent => RawPersistent::deserialize, "persistent";
     RawDoc => RawDoc::deserialize, "the manifest";
     RawEntry => RawEntry::deserialize, "a kernel entry";
     RawAbi => RawAbi::deserialize, "abi";
@@ -857,6 +924,16 @@ struct RawEntry {
     source_digest: Option<String>,
     #[serde(default)]
     source_digest_kind: Option<String>,
+    #[serde(default)]
+    persistent: Option<RawPersistent>,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct RawPersistent {
+    programs_per_sm: u32,
+    #[serde(default)]
+    sm_count: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -984,6 +1061,8 @@ struct RawOptions {
     num_stages: u32,
     #[serde(default)]
     enable_fp_fusion: Option<bool>,
+    #[serde(default)]
+    num_ctas: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1793,7 +1872,7 @@ fn cuda_release(s: &str) -> Option<(u64, u64)> {
     Some((number(major)?, number(minor)?))
 }
 
-/// The rules of section 4.3 that Python's `_cudamath.check_field` holds too.
+/// The rules of section 4.7 that Python's `_cudamath.check_field` holds too.
 fn check_cuda_math(math: &RawCudaMath) -> std::result::Result<(), String> {
     let name_ok = |f: &String| {
         let mut chars = f.chars();
@@ -1891,6 +1970,7 @@ impl Entry {
             cuda_math: raw.cuda_math.map(|c| CudaMath { functions: c.functions, cuda: c.cuda, libdevice: c.libdevice }),
             source_digest: raw.source_digest,
             source_digest_kind: raw.source_digest_kind,
+            persistent: raw.persistent.map(|p| Persistent { programs_per_sm: p.programs_per_sm, sm_count: p.sm_count }),
             cubin,
         };
         strictly(entry.check_consistent(&mut syms), &who)?;
@@ -1993,6 +2073,22 @@ impl Entry {
                 if options.num_warps != num_warps || options.num_stages != num_stages {
                     return Err("the compile options disagree with num_warps and num_stages".to_owned());
                 }
+                // a program of more than one CTA (a cluster): the compile option says so, exactly then (Python's `_check_launch`)
+                match options.num_ctas {
+                    None if raw.launch.num_ctas != 1 => {
+                        return Err(format!(
+                            "options.num_ctas (present when a program is more than one CTA) must be launch.num_ctas {}, got None",
+                            raw.launch.num_ctas
+                        ));
+                    }
+                    Some(said) if said == 1 || said != raw.launch.num_ctas => {
+                        return Err(format!(
+                            "options.num_ctas (present when a program is more than one CTA) must be launch.num_ctas {}, got {said}",
+                            raw.launch.num_ctas
+                        ));
+                    }
+                    _ => {}
+                }
                 if raw.binary.is_some() {
                     return Err("a triton kernel is not a prebuilt binary: it has no `binary` section".to_owned());
                 }
@@ -2053,16 +2149,46 @@ impl Entry {
                     ));
                 }
                 let blockers = raw.launch.blockers();
-                if !blockers.is_empty() {
+                if !blockers.is_empty() || raw.launch.global_scratch_size != 0 {
                     return Err(format!(
-                        "a prebuilt binary is launched with a plain cuLaunchKernel: its launch attributes are the zero ones, got {}",
-                        blockers.join(", ")
+                        "a prebuilt binary is launched with its parameters and, when it declares one, its cluster (at most {MAX_CLUSTER} blocks): \
+                         its launch attributes are the zero ones but cluster_dims and num_ctas, got {}",
+                        if blockers.is_empty() {
+                            format!("global_scratch_size={}", raw.launch.global_scratch_size)
+                        } else {
+                            blockers.join(", ")
+                        }
                     ));
                 }
             }
         }
         if raw.launch.cluster_dims.contains(&0) || raw.launch.num_ctas == 0 {
             return Err("the launch attributes have a zero cluster dimension or CTA count".to_owned());
+        }
+        // the alignment of a global scratch: with a global scratch only, a power of two (Python's `_check_launch`)
+        if let Some(align) = raw.launch.global_scratch_align
+            && (raw.launch.global_scratch_size == 0 || !align.is_power_of_two())
+        {
+            return Err(format!(
+                "launch.global_scratch_align is the alignment (a power of two) of a global scratch, only with global_scratch_size above 0; got \
+                 {align} with {}",
+                raw.launch.global_scratch_size
+            ));
+        }
+        // a persistent grid: programs_per_sm from 1 to 32, an sm_count from 1 to 2**20, and a grid of one entry (the tiles)
+        if let Some(p) = &raw.persistent {
+            if !(1..=MAX_PROGRAMS_PER_SM).contains(&p.programs_per_sm) {
+                return Err(format!(
+                    "persistent.programs_per_sm must be an int from 1 to {MAX_PROGRAMS_PER_SM}, got {}",
+                    p.programs_per_sm
+                ));
+            }
+            if let Some(n) = p.sm_count.filter(|n| !(1..=MAX_SM_COUNT).contains(n)) {
+                return Err(format!("persistent.sm_count must be an int from 1 to {MAX_SM_COUNT}, got {n}"));
+            }
+            if parse_grid(&raw.grid, &mut Symbols::default())?.len() != 1 {
+                return Err(format!("a persistent grid has one entry (the number of tiles), got {:?}", raw.grid));
+            }
         }
         let mut stem = raw.op.clone();
         for (dim, value) in &raw.buckets {
@@ -2697,7 +2823,7 @@ impl Manifest {
         self.library.iter().find(|e| e.stem == stem && e.arch == arch)
     }
 
-    /// Refuse a manifest whose generated kernels' CUDA math functions (section 4.3) were not measured on the CUDA release `cuda` (`"13.0"`): the
+    /// Refuse a manifest whose generated kernels' CUDA math functions (section 4.7) were not measured on the CUDA release `cuda` (`"13.0"`): the
     /// release whose math library the rest of the host (its other CUDA kernels, the framework it is compared with) is built with. Such a
     /// binary still computes what it was exported with, but its `erff`, `tanhf`, ... may not be the host's bits; the error names each entry
     /// and the releases its functions were measured on. Entries without functions (or without `cuda_math`) pass.

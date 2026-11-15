@@ -24,7 +24,7 @@ import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
 from ._elf import parse_elf, code_digest
 from . import _ir, _source
@@ -317,9 +317,16 @@ def write_file(path: pathlib.Path, data: bytes) -> None:
         raise
 
 
+MAX_CLUSTER = 8  # the CTAs of a portable thread-block cluster: a launch of more needs CUDA's non-portable cluster size, which no host asks for
+SCRATCH_ALIGNMENT = 256  # every global scratch a host gives starts on this (an arena offset, an allocation): an alignment that divides it is met
+
+
 @dataclass(frozen=True)
 class LaunchAttributes:
-    """What the binary asks of the launch, besides grid, block and shared memory (all from Triton's metadata)."""
+    """What the binary asks of the launch, besides grid, block and shared memory (all from Triton's metadata).
+
+    ``global_scratch_align`` is the alignment of the global scratch (Triton's ``global_scratch_align``), written to a manifest only with a scratch
+    (``global_scratch_size`` above 0: manifest schema 3, section 4.6); 0 is not known (a manifest of tilefish 0.0.6 does not record it)."""
 
     global_scratch_size: int
     profile_scratch_size: int
@@ -327,17 +334,23 @@ class LaunchAttributes:
     cluster_dims: "tuple[int, int, int]"
     num_ctas: int
     cooperative: bool
+    global_scratch_align: int = 0
 
     def replay_blockers(self) -> "list[str]":
-        """The attributes a plain ``cuLaunchKernel`` replay does not set up, as ``name=value`` strings."""
+        """The attributes neither host sets up, as ``name=value`` strings: profile scratch, programmatic dependent launch, a cooperative launch, a
+        cluster that is not ``num_ctas`` CTAs or is larger than the portable 8, and a global scratch aligned to more than the 256 bytes every scratch
+        a host gives starts on. (A cluster of ``num_ctas`` CTAs is launched with ``cuLaunchKernelEx``, and a global scratch of the size a launch
+        needs is given from the caller's memory or a plan's arena: manifest schema 3, sections 4.5 and 4.6.)"""
         out = []
-        if self.global_scratch_size:
-            out.append(f"global_scratch_size={self.global_scratch_size}")
+        if self.global_scratch_size and self.global_scratch_align < 1:
+            out.append(f"global_scratch_size={self.global_scratch_size} of an alignment the manifest does not record (export it again)")
+        elif self.global_scratch_size and SCRATCH_ALIGNMENT % self.global_scratch_align:
+            out.append(f"global_scratch_size={self.global_scratch_size} aligned to {self.global_scratch_align} bytes")
         if self.profile_scratch_size:
             out.append(f"profile_scratch_size={self.profile_scratch_size}")
         if self.launch_pdl:
             out.append("launch_pdl=True")
-        if tuple(self.cluster_dims) != (1, 1, 1) or self.num_ctas != 1:
+        if math.prod(self.cluster_dims) != self.num_ctas or self.num_ctas > MAX_CLUSTER or min(self.cluster_dims) < 1:
             out.append(f"cluster_dims={tuple(self.cluster_dims)}, num_ctas={self.num_ctas}")
         if self.cooperative:
             out.append("launch_cooperative_grid=True")
@@ -353,10 +366,11 @@ class LaunchAttributes:
             cluster_dims=tuple(int(c) for c in d["cluster_dims"]),  # type: ignore[arg-type]
             num_ctas=int(d["num_ctas"]),
             cooperative=bool(d["cooperative"]),
+            global_scratch_align=int(d.get("global_scratch_align", 0)),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "global_scratch_size": self.global_scratch_size,
             "profile_scratch_size": self.profile_scratch_size,
             "launch_pdl": self.launch_pdl,
@@ -364,6 +378,22 @@ class LaunchAttributes:
             "num_ctas": self.num_ctas,
             "cooperative": self.cooperative,
         }
+        if self.global_scratch_size and self.global_scratch_align:  # only with a scratch: the launch of every other entry is the six fields it always was
+            out["global_scratch_align"] = self.global_scratch_align
+        return out
+
+    def scratch_bytes(self, grid: "Sequence[int]") -> int:
+        """The bytes of global scratch a launch of the program grid ``grid`` is given: ``global_scratch_size`` per CTA, ``num_ctas`` CTAs per program
+        (what Triton's launcher allocates); 0 for a kernel that has none."""
+        return self.global_scratch_size * math.prod(grid) * self.num_ctas
+
+    def cuda_grid(self, grid: "Sequence[int]") -> "tuple[int, int, int]":
+        """The grid of blocks a launch of the program grid ``grid`` has: each axis times the cluster's (Triton's launcher multiplies the grid by
+        ``cluster_dims`` when ``num_ctas`` is not 1; a prebuilt binary's grid counts clusters likewise)."""
+        padded = tuple(grid) + (1,) * (3 - len(grid))
+        if self.num_ctas == 1:
+            return padded  # type: ignore[return-value]
+        return tuple(g * c for g, c in zip(padded, self.cluster_dims))  # type: ignore[return-value]
 
 
 def abi_of(spec: "CompileSpec") -> dict[str, Any]:
@@ -561,14 +591,36 @@ def _launch_attributes(md: Any) -> LaunchAttributes:
             )
         return v
 
+    scratch = int(need("global_scratch_size"))
     return LaunchAttributes(
-        global_scratch_size=int(need("global_scratch_size")),
+        global_scratch_size=scratch,
         profile_scratch_size=int(need("profile_scratch_size")),
         launch_pdl=bool(need("launch_pdl")),
         cluster_dims=tuple(int(c) for c in need("cluster_dims")),  # type: ignore[arg-type]
         num_ctas=int(need("num_ctas")),
         cooperative=bool(need("launch_cooperative_grid")),
+        global_scratch_align=int(need("global_scratch_align")) if scratch else 0,  # (the alignment of no scratch is nothing a manifest records)
     )
+
+
+def check_launch_attributes(spec: "CompileSpec", launch: LaunchAttributes) -> None:
+    """What the compiled kernel asks of a launch must be what its spec declares and what both hosts set up: the global scratch its declaration
+    states (``extern(global_scratch=)``: Triton's ``global_scratch_size``, per CTA), aligned to a divisor of 256 bytes; a cluster of exactly
+    ``num_ctas`` CTAs (Triton's ``cluster_dims``, whose product is its ``num_ctas``), at most 8; no profile scratch, PDL or cooperative launch."""
+    if launch.global_scratch_size != spec.global_scratch:
+        if spec.global_scratch == 0:
+            hint = f"declare global_scratch={launch.global_scratch_size} on the extern (bytes per CTA; device-side tensor descriptors write theirs there)"
+        else:
+            hint = f"its declaration says global_scratch={spec.global_scratch}: declare global_scratch={launch.global_scratch_size}"
+        raise TilefishBuildError(f"'{spec.stem}': the compiled kernel addresses {launch.global_scratch_size} bytes of global scratch per CTA, but {hint}")
+    if math.prod(launch.cluster_dims) != spec.num_ctas or launch.num_ctas != spec.num_ctas:
+        raise TilefishBuildError(
+            f"'{spec.stem}': Triton compiled a cluster of {tuple(launch.cluster_dims)} with num_ctas={launch.num_ctas}, but the declaration says "
+            f"num_ctas={spec.num_ctas} (a program is a cluster of num_ctas CTAs along x)"
+        )
+    blockers = launch.replay_blockers()
+    if blockers:
+        raise TilefishBuildError(f"'{spec.stem}': the binary needs launch attributes that no host sets up: {', '.join(blockers)}")
 
 
 def ptx_params(text: str) -> "list[str]":
@@ -944,6 +996,7 @@ def build(
         hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
             check_tf32(spec, cap, frontend_ir, hit.ptx, triton_version)  # an entry has its PTX only, which the build that stored it was judged by too
+            check_launch_attributes(spec, hit.launch)  # the scratch and the cluster the declaration states, as for a compile
             return dataclasses.replace(hit, cuda_math=cuda_math)  # (read from the source and the libdevice here, not from the cache)
 
     from triton.backends.compiler import GPUTarget
@@ -995,6 +1048,8 @@ def build(
     _check_abi(spec, ptx, symbol)
     check_threads(spec, ptx, symbol, int(md.num_warps))
     check_tensordesc_meta(spec, getattr(md, "tensordesc_meta", None))
+    launch = _launch_attributes(md)
+    check_launch_attributes(spec, launch)
     asm = getattr(compiled, "asm", {})
     check_tf32(spec, cap, frontend_ir, ptx, triton_version, ttir=_text_or_none(asm.get("ttir")), ttgir=_text_or_none(asm.get("ttgir")))
     from hashlib import sha256
@@ -1014,7 +1069,7 @@ def build(
         ptxas_version=ptxas,
         ptx_target=target.group(1) if target else "",
         options=opts,
-        launch=_launch_attributes(md),
+        launch=launch,
         ir_digest=digest,
         warp_specialized=warp_specialized,
         cuda_math=cuda_math,
@@ -1064,6 +1119,8 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
         entry["implementation"] = spec.implementation
     if spec.source_sha256 is not None:  # a generated kernel: the sha256 of the Triton source it was built from
         entry["source_sha256"] = spec.source_sha256
+    if spec.persistent is not None:  # a persistent grid: the host launches at most programs_per_sm programs per SM (only then: section 4.3)
+        entry["persistent"] = dict(spec.persistent)
     return entry
 
 
@@ -1111,6 +1168,8 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     entry["declaration_digest"] = spec_part["declaration_digest"]
     if "implementation" in spec_part:
         entry["implementation"] = spec_part["implementation"]
+    if "persistent" in spec_part:
+        entry["persistent"] = spec_part["persistent"]
     entry["sha256"] = b.sha256
     entry["sha256_code"] = b.sha256_code
     if b.spec.binary is None:
@@ -1121,7 +1180,7 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         entry["binary"] = json.loads(json.dumps(b.binary_build))
     if "source_sha256" in spec_part:
         entry["source_sha256"] = spec_part["source_sha256"]
-    if b.cuda_math is not None:  # the CUDA math functions whose bits the binary has, and the libdevice it links (section 4.3, tilefish._cudamath)
+    if b.cuda_math is not None:  # the CUDA math functions whose bits the binary has, and the libdevice it links (section 4.7, tilefish._cudamath)
         entry["cuda_math"] = json.loads(json.dumps(b.cuda_math))
     if b.ir_digest is not None:  # the digest of the Triton IR the binary was compiled from (the field and its kind, so a reader of schema 2 reads it as before)
         entry["source_digest"] = b.ir_digest
@@ -1157,6 +1216,8 @@ def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
         "options",
         "shared",
         "total_num_warps",
+        "persistent",
+        "launch",
         "algo",
         "cublaslt_version",
         "sm_count",

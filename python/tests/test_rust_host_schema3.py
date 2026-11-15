@@ -516,7 +516,12 @@ def test_the_launchers_of_schema_3_compile_against_the_crate(p1, prebuilt, tmp_p
 
     given = rust.emit(build_manifest(tmp / "m5", [p6.scale_add]), crate / "src" / "given.rs", ops=[p6.scale_add]).read_text()
     assert "k: i32,\n        c: i64,\n" in given and 'launch_with(stream, &mut [x.into_arg(), y.into_arg()], &[("k", i64::from(k)), ("c", c)])' in given
-    (crate / "src" / "lib.rs").write_text("pub mod binary;\npub mod embedded;\npub mod given;\npub mod library;\npub mod strided;\n")
+    import test_launch_shapes as ls  # launch shapes: a kernel with a global scratch (`launch` takes it last), a plain one next to it
+
+    shapes = [ls.desc, ls.plain]
+    text = rust.emit(build_manifest(tmp / "m6", shapes), crate / "src" / "shapes.rs", ops=shapes).read_text()
+    assert "global_scratch: TensorMut<'a, U8>,\n" in text and "self.kernel.launch(stream, &mut [x.into_arg(), y.into_arg(), global_scratch.into_arg()])" in text
+    (crate / "src" / "lib.rs").write_text("pub mod binary;\npub mod embedded;\npub mod given;\npub mod library;\npub mod shapes;\npub mod strided;\n")
     env = {**os.environ, "RUSTFLAGS": "-D warnings", "CARGO_TARGET_DIR": str(REPO_ROOT / "target" / "launchers-check-schema3")}
     done = subprocess.run(["cargo", "check", "--manifest-path", str(crate / "Cargo.toml"), "--color", "never"], capture_output=True, text=True, env=env, timeout=900)
     assert done.returncode == 0, done.stderr[-4000:]

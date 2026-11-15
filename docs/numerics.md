@@ -30,7 +30,7 @@ contract is a tolerance, not a release.
 
 ## 2. The guard
 
-* **Recorded.** The manifest entry of a generated kernel that has such ops carries `cuda_math` (manifest schema 3, section 4.3): the functions, the
+* **Recorded.** The manifest entry of a generated kernel that has such ops carries `cuda_math` (manifest schema 3, section 4.7): the functions, the
   releases of the table on which every one of them was measured, and the sha256 of the libdevice it was linked with. It is in the manifest digest. The
   build reads the functions from the code of the generated source (the helpers and calls `tilefish.lower` writes for them); the source is not
   changed, so no source digest moves.

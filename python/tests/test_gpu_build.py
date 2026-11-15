@@ -436,6 +436,7 @@ def test_replay_refuses_a_binary_that_needs_more_than_a_plain_launch(lowered):
     low = lowered["softmax"]
     (spec,) = low.specs()
     b = build(spec, arch=ARCH, fn=runtime.load_lowered(low))
+    # a global scratch of an alignment the manifest does not record (tilefish 0.0.6 wrote none) and a programmatic dependent launch
     needy = dataclasses.replace(b, launch=dataclasses.replace(b.launch, global_scratch_size=128, launch_pdl=True))
-    with pytest.raises(TilefishRuntimeError, match="global_scratch_size=128, launch_pdl=True"):
+    with pytest.raises(TilefishRuntimeError, match="global_scratch_size=128 of an alignment the manifest does not record .export it again., launch_pdl=True"):
         _cuda.load(needy, 0)

@@ -29,7 +29,7 @@ use crate::json::{canonical, parse_strict, type_name};
 use crate::kernel::{Arch, Cached, Kernel};
 use crate::launch_plan::{LaunchPlan, StepKind};
 use crate::library::LibraryEntry;
-use crate::manifest::{Entry, MANIFEST_NAME, Manifest, Pin, is_arch, is_digest, is_ident};
+use crate::manifest::{Entry, KernelKey, MANIFEST_NAME, Manifest, Pin, is_arch, is_digest, is_ident};
 use crate::par;
 use crate::plan_run::{PlanRun, SharedArena};
 
@@ -75,7 +75,7 @@ struct WeakManifest {
     entries: Weak<Vec<Entry>>,
     library: Weak<Vec<LibraryEntry>>,
     convs: Weak<Vec<ConvEntry>>,
-    kernels: Weak<Mutex<HashMap<(usize, usize), Cached>>>,
+    kernels: Weak<Mutex<HashMap<KernelKey, Cached>>>,
     gemms: Weak<Mutex<HashMap<(usize, usize), CachedGemm>>>,
     conv_cache: Weak<Mutex<HashMap<(usize, usize), CachedConv>>>,
 }

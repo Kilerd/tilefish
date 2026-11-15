@@ -582,12 +582,27 @@ def _walk(gop: GraphOp) -> _Walk:
             dst = _Loc(out, tuple(v.type.shape), row_major_strides(v.type.shape), DimExpr.const(0), True, 1)  # type: ignore[arg-type]
             steps.append(_SymStep(None, [_Arg("src", l, "in"), _Arg("dst", dst, "out")], f"the return of {v.ref} ({v.type})", copy=True))
             outputs.append(out)
-    if any(s.library for s in steps):
-        words = max(s.callee.op.workspace_bytes for s in steps if s.library)
+    if any(s.library or _has_scratch(s.callee) for s in steps):  # a GEMM's workspace, a kernel's global scratch: one buffer of the arena
+        # (sized for the GEMMs here, and for the global scratch of every kernel step at every bucket once the steps are resolved: plan())
+        words = max((s.callee.op.workspace_bytes for s in steps if s.library), default=1)
         ws = _Buffer("", "workspace", "u8", (DimExpr.const(words),), len(buffers))
         buffers.append(ws)
     dims = g.symbols
     return _Walk(buffers, steps, outputs, dims)
+
+
+def _has_scratch(callee: "Callee | None") -> bool:
+    """Whether a step of ``callee`` launches a kernel with a global scratch (``extern(global_scratch=)``): its step has the plan's workspace, every CTA of
+    the launch its share (every implementation of an extern declared with ``by_arch=`` has one, or none has)."""
+    if callee is None or callee.kind != "kernel":
+        return False
+    return any(c.extern is not None and c.extern.global_scratch > 0 for c in callee.variants())
+
+
+def _scratch_bytes(bound: "Bound") -> int:
+    """The bytes of global scratch a launch of the resolved step ``bound`` needs at most: ``global_scratch`` per CTA of its grid (a persistent grid's tiles,
+    which the programs a device runs are at most)."""
+    return bound.spec.global_scratch * math.prod(bound.grid) * bound.spec.num_ctas
 
 
 def _name_buffers(buffers: "list[_Buffer]", outputs: "Sequence[_Buffer]", names: "Sequence[str] | None" = None) -> None:
@@ -1230,6 +1245,7 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
             b.first, b.last = 0, max(len(w.steps) - 1, 0)
 
     sizes: "dict[str, int]" = {b.name: 0 for b in w.buffers}
+    scratch = 0  # the most global scratch a kernel step needs, at any bucket: the workspace holds it
     buckets_doc: "list[dict[str, Any]]" = []
     callees: "dict[str, Callee]" = {}
     first_kinds: "list[tuple[str, str]] | None" = None
@@ -1295,6 +1311,11 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
             step: "dict[str, Any]" = {"entry": bound.stem, "kind": s.callee.kind, "args": args_doc}
             if s.library:
                 step["workspace"] = next(b.name for b in w.buffers if b.role == "workspace")
+            elif _has_scratch(s.callee):  # a kernel with a global scratch: the workspace is its scratch (the steps run one after the other)
+                if any(b.spec.global_scratch == 0 for b in bounds):  # pragma: no cover - the declaration holds the implementations to one
+                    raise TilefishPlanError(f"{where}: some implementations of '{s.callee.name}' have a global scratch and some do not")
+                step["workspace"] = next(b.name for b in w.buffers if b.role == "workspace")
+                scratch = max(scratch, *(_scratch_bytes(b) for b in bounds))
             given = bound.given
             if given:  # the fixed arguments per call of a prebuilt binary: the values this call gives, at this bucket (part of the digest)
                 big = [k for k, v in given.items() if abs(v) > MAX_INT]
@@ -1307,6 +1328,10 @@ def plan(graph: Any, buckets: Any = None, *, reuse: bool = False) -> Plan:
         buckets_doc.append({"values": dict(combo), "steps": steps_doc})
     if not combos:  # pragma: no cover - itertools.product of nothing is one empty combination
         raise TilefishPlanError(f"graph '{name}' has no bucket")
+    for b in w.buffers:  # the workspace holds the GEMMs' workspace and the global scratch of every kernel step, at every bucket
+        if b.role == "workspace" and scratch > sizes[b.name]:
+            sizes[b.name] = scratch
+            b.shape = (DimExpr.const(scratch),)
 
     items = [
         ArenaItem(b.name, sizes[b.name], b.first, b.last, b.role == "intermediate")
@@ -1614,8 +1639,8 @@ def _validate(doc: Any, made: bool = False) -> None:
                     _bad(f"step #{si}: entry must be a manifest stem such as 'gemm.M64', got {st['entry']!r}")
             if st["kind"] not in KINDS or type(st["kind"]) is not str:
                 _bad(f"step #{si}: kind must be one of {list(KINDS)}, got {st['kind']!r}")
-            if (st["kind"] == "library") != ("workspace" in st):
-                _bad(f"step #{si}: exactly the steps of kind 'library' have a workspace")
+            if st["kind"] == "library" and "workspace" not in st:  # (a kernel step has one when its entry has a global scratch: check_against_manifest)
+                _bad(f"step #{si}: a step of kind 'library' has a workspace")
             if "workspace" in st:
                 ws = by_name.get(st["workspace"])
                 if ws is None or ws["role"] != "workspace":
@@ -1640,7 +1665,7 @@ def _validate(doc: Any, made: bool = False) -> None:
                 if b is None:
                     _bad(f"step #{si} args[{ai}]: binding {a['binding']!r} is not a buffer")
                 if b["role"] == "workspace":
-                    _bad(f"step #{si} args[{ai}]: the workspace is not an argument, it is the workspace field of a library step")
+                    _bad(f"step #{si} args[{ai}]: the workspace is not an argument, it is the workspace field of a step")
                 names_here.append((a["name"], a["binding"]))
                 if "view" in a:
                     v = a["view"]
@@ -1685,9 +1710,9 @@ def _validate(doc: Any, made: bool = False) -> None:
             skeleton = this
         elif this != skeleton:
             _bad(f"bucket {bucket['values']} has other kinds, workspaces, argument names or bindings (or names of given values) than the first bucket: only the entries, the views and the given values may differ")
-    uses_library = any(st["kind"] == "library" for st in buckets[0]["steps"])
-    if uses_library != any(b["role"] == "workspace" for b in buffers):
-        _bad("there is a buffer of role workspace exactly when some step has kind library")
+    uses_workspace = any("workspace" in st for st in buckets[0]["steps"])
+    if uses_workspace != any(b["role"] == "workspace" for b in buffers):
+        _bad("there is a buffer of role workspace exactly when some step has a workspace (a library step, a kernel step with a global scratch)")
     # the arena: every region inside, overlaps only where the live ranges are disjoint
     arena = [b for b in buffers if b["role"] in ARENA_ROLES]
     end = max((b["offset"] + align_up(b["bytes"]) for b in arena), default=0)
@@ -1769,6 +1794,14 @@ def check_against_manifest(doc: "Mapping[str, Any]", manifest: Any) -> None:
                     lo, hi = (-(1 << 31), (1 << 31) - 1) if wanted[k] == "i32" else (-(1 << 63), (1 << 63) - 1)
                     if not lo <= v <= hi:
                         _bad(f"{where}: the value {v} of '{k}' does not fit the {wanted[k]} the binary takes")
+                # a kernel with a global scratch is given the plan's workspace (whose size for the launch a host checks when it prepares the bucket:
+                # it depends on the grid); any other kernel step has none
+                scratch = artifact.entry["launch"].get("global_scratch_size", 0)
+                if bool(scratch) != ("workspace" in st):
+                    _bad(
+                        f"{where}: the binary has {scratch} bytes of global scratch per CTA, and the step "
+                        + ("has no workspace" if scratch else "has a workspace (only a binary with a global scratch takes one)")
+                    )
             else:
                 entry = manifest.library_entry(stem, arch)
                 if entry is None:

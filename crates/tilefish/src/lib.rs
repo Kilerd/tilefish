@@ -286,11 +286,11 @@ pub use launch_plan::{
 pub use library::{AlgoSource, GemmLayout, Heuristic, LibraryEntry, LibraryImpl};
 pub use manifest::{
     Access, BinarySource, Constexpr, CudaMath, DimInfo, Entry, EntryKind, FixedValue, IMPLEMENTATION_FALLBACK,
-    LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Pin, Precondition, ScalarType,
+    LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Persistent, Pin, Precondition, ScalarType,
     ShapeDim, StrideEntry, StrideOf, TensorMap, View, manifest_digest,
 };
 pub use memory::{CudaRead, CudaWrite};
-pub use plan::{DeviceInfo, Plan, Prepared, TensorMapEncode};
+pub use plan::{DeviceInfo, GLOBAL_SCRATCH, Plan, Prepared, TensorMapEncode};
 pub use plan_run::{CapturedPlan, CarriedLayout, DevScalar, PlanRun, SharedArena, Tap, WeightedRun};
 pub use plan_set::{PLAN_SET_NAME, PLAN_SET_SCHEMA, PlanSet, SetRun, plan_file_name, plan_set_digest};
 pub use region::DevicePtr;
