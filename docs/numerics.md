@@ -34,7 +34,7 @@ contract is a tolerance, not a release.
   releases of the table on which every one of them was measured, and the sha256 of the libdevice it was linked with. It is in the manifest digest. The
   build reads the functions from the code of the generated source (the helpers and calls `tilefish.lower` writes for them); the source is not
   changed, so no source digest moves.
-* **Checked in Python.** Every `jit`, `replay` and `reference` run of such a kernel compares the release torch is built with (`torch.version.cuda`)
+* **Checked in Python.** A `jit`, `replay` or `reference` run of such a kernel (and the replay of a plan with one) compares the release torch is built with (`torch.version.cuda`)
   with the entry's releases, and a replay also compares the libdevice a build in the process would link with the entry's. A mismatch is a
   `tilefish.TilefishCudaMathWarning`: the binary runs as it was exported, and the warning says that torch's own ops, and the reference mode that uses
   them, may not be its bits here. To refuse instead: `warnings.simplefilter("error", tilefish.TilefishCudaMathWarning)` (or `pytest -W
