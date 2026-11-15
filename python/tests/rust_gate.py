@@ -1381,12 +1381,14 @@ def plan_graphs():
                             args[p.name] = torch.tensor([5 + 300 * seed], dtype=I32, device="cuda")
                             continue
                         shape = tuple(eval_dim(s, dims) for s in p.type.shape)
+                        # a parameter of a static shape is a weight, which a host binds once: the same tensor in every case
+                        s = 170 + k + (seed * 10 if p.type.free_dims() else 0)
                         name = p.type.dtype.name
                         if name == "u8":
-                            gen = torch.Generator(device="cuda").manual_seed(170 + seed * 10 + k)
+                            gen = torch.Generator(device="cuda").manual_seed(s)
                             args[p.name] = torch.randint(0, 256, shape, generator=gen, device="cuda", dtype=torch.int32).to(torch.uint8)
                         else:
-                            args[p.name] = randn(shape, dtypes[name], seed=170 + seed * 10 + k, scale=4.0)
+                            args[p.name] = randn(shape, dtypes[name], seed=s, scale=4.0)
                     out.append(("-".join(f"{n}{v}" for n, v in combo.items()) + f"-seed{seed}", args))
             return out
 

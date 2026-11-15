@@ -150,21 +150,45 @@ def test_a_barrier_makes_a_value_a_buffer_of_the_plan_and_is_refused_where_it_me
             return tilefish.barrier(x > 0)
 
 
-def test_views_are_read_as_tensors_materialised_or_through_the_unaligned_specialisation():
+def test_views_are_read_where_they_are_or_materialised_where_the_template_cannot():
+    # SwiGLU's halves, two column blocks of one tensor: read where they are (Strided parameters, a stride per axis), no copy
     s = steps(fg.swiglu, R=8)
-    assert [x["entry"].split("_")[0] for x in s] == ["contiguous", "contiguous", "fused"]
+    assert [x["entry"].split("_")[0] for x in s] == ["fused"]
+    assert [a.get("view", {}).get("strides") for a in s[0]["args"]] == [[128, 1], [128, 1], None]
     rep = tilefish.fusion_report(fg.swiglu)
-    assert [i["read"] for i in rep["regions"][0]["inputs"]] == ["materialised", "materialised"]
+    assert [i["read"] for i in rep["regions"][0]["inputs"]] == ["strided", "strided"]
+    k = _fusion.fused(fg.swiglu).regions[0].kernel
+    assert [p.name for p in k.signature.params if p.stride_of] == ["a0_s0", "a0_s1", "a1_s0", "a1_s1"]
+    src = k.lower().source
+    assert "tl.load(a0 + ((offs // 64) * a0_s0 + (offs % 64) * a0_s1)" in src
+
+    @tilefish.graph
+    def transposed(x: Tensor[D, R, f32], y: Tensor[R, D, f32]):
+        return x.permute(1, 0) * 2.0 + y  # a transpose: no axis of stride 1
+
+    assert [i["read"] for i in tilefish.fusion_report(transposed)["regions"][0]["inputs"]] == ["strided", "contiguous"]
+
+    # a row region (a per-row scale) cannot read a view where it is: the view is copied by tilefish.contiguous first
+    @tilefish.graph
+    def scaled_half(x: Tensor[R, 2 * D, f32], w: Tensor[D, f32]):
+        g, _ = x.split(D, axis=-1)
+        return g * w + 1.0
+
+    rep = tilefish.fusion_report(scaled_half)
+    assert rep["regions"][0]["template"] in ("row", "elementwise")
+    if rep["regions"][0]["template"] == "row":
+        assert rep["regions"][0]["inputs"][0]["read"] == "materialised"
+        assert [x["entry"].split("_")[0] for x in steps(scaled_half, R=8)] == ["contiguous", "fused"]
 
     P = Dim("P", 6)
 
     @tilefish.graph
     def rows(x: Tensor[R, P, D, f32]):
-        return x[1] * 2.0 + x[3]  # dense rows of a [R, P, D] tensor: views at offsets that are not 16-byte multiples in general
+        return x[1] * 2.0 + x[3]  # dense rows of a [R, P, D] tensor
 
     f = _fusion.fused(rows)
     (r,) = f.regions
-    assert set(r.reads.values()) <= {"contiguous", "unaligned", "materialised"}
+    assert set(r.reads.values()) <= {"contiguous", "unaligned", "strided"}
 
 
 def test_a_region_is_named_by_its_content():

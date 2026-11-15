@@ -168,8 +168,26 @@ def rms_unfused(x: Tensor[R, D, f32], w: Tensor[D, f32]):
     return _row_sum(x, w)
 
 
+def _views(x, y):
+    t = x.permute(1, 0)  # a transpose: no axis of stride 1
+    a, b = y.split(D, axis=-1)  # two column blocks
+    return (t * a + b).to(bf16)
+
+
+@tilefish.graph
+def views(x: Tensor[D, R, f32], y: Tensor[R, 2 * D, f32]):
+    """Views that are not dense, read where they are by the region (a stride per axis)."""
+    return _views(x, y)
+
+
+@tilefish.graph(fusion=UNFUSED)
+def views_unfused(x: Tensor[D, R, f32], y: Tensor[R, 2 * D, f32]):
+    return _views(x, y)
+
+
 # (fused graph, its unfused twin, how to make its arguments: {parameter: (shape at a bucket of R / N, dtype name)})
 CASES = {
+    "views": (views, views_unfused),
     "bias_act": (bias_act, bias_act_unfused),
     "bias_act_ieee": (bias_act_ieee, bias_act_ieee_unfused),
     "swiglu": (swiglu, swiglu_unfused),

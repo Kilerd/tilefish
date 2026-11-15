@@ -149,7 +149,7 @@ def test_a_round_trip_in_a_region_keeps_no_input_nan_payload():
 
 # -- the use cases ----------------------------------------------------------------------------------------------------------------------
 
-EXACT_REFERENCE = {"masked", "dequant", "around_call", "bias_act_ieee", "residual", "modes"}
+EXACT_REFERENCE = {"masked", "dequant", "around_call", "bias_act_ieee", "residual", "modes", "views"}
 
 
 @pytest.mark.parametrize("name", sorted(fg.CASES))
