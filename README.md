@@ -917,8 +917,10 @@ folds `neg.f32` into a select as a sign flip. A reduction is a kernel of its own
 **Checked at every export.** `export` runs every region of more than one op against its ops one by one, `jit` on the device, at every bucket, on seeded inputs that
 reach every corner (NaNs with payloads, infinities, subnormals, signed zeros), and refuses the export at a difference (`verify=False` opts out; on a device of
 another architecture the check is skipped with a `TilefishFusionWarning`). It writes `<graph>.fusion.json` next to the plan, the **fusion report**: for every
-region the ops of the body it took, what it reads (a view that is not dense is materialised by `tilefish.contiguous` first), what it writes, every rounding it
-keeps and the rewrites of the mode; `tilefish.fusion_report(graph)` and `tilefish.verify_fusion(graph)` give the same on demand. The tests hold fused to unfused
+region the ops of the body it took, what it reads (where it is, or a copy), what it writes, every rounding it
+keeps and the rewrites of the mode; `tilefish.fusion_report(graph)` and `tilefish.verify_fusion(graph)` give the same on demand. A view that is not
+dense (the halves above, a head, a transpose) is read where it is, a stride per axis, by a region of the elementwise template, and copied by
+`tilefish.contiguous` first for a region of the row template. The tests hold fused to unfused
 on every bf16 and f16 bit pattern, on grids of 2**22 bit patterns, on 120 random graphs of up to 24 ops, and the inline casts to `.to()` on every f32.
 
 **The mode** is declared, `@tilefish.graph(fusion=tilefish.fusion(...))`, and every choice is exact (the region's source carries it, so the pin does):
@@ -934,7 +936,7 @@ on every bf16 and f16 bit pattern, on grids of 2**22 bit patterns, on 120 random
 
 Each rewrite is made on the IR before the regions are formed, so its rounding points never depend on where the regions fall. `tilefish.barrier(x)` makes `x` a
 boundary of the regions (it gets a buffer of the plan, which `taps=` reads); it never changes a byte. Not yet planned: a scatter in a graph body, a reduction joined to
-a region (it runs alone), strided reads inside a region (a view that is not dense is copied first), modes that are not exact (`docs/rfcs/0001-plan-fusion.md`,
+a region (it runs alone), a view read where it is by a row region (it is copied first), modes that are not exact (`docs/rfcs/0001-plan-fusion.md`,
 section 11).
 
 ## The Rust host

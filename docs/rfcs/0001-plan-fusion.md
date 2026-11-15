@@ -113,8 +113,10 @@ Implemented on the integration branch of the next release, as `tilefish._fusion`
   be launched; the fusion report; the Rust gate runs the use cases as plans (`fused_*`).
 * **Found while testing, and closed:** H8 and H9 (section 5.3). With H1 they make the code of a region *context-free*: the lowering option
   `context_free=True` of note 20, which every region kernel and every kernel of the unfused composition is lowered with.
-* **Not yet:** strided inputs inside a region (a view that is not dense is materialised by `tilefish.contiguous` first, as rule 5 of 3.5
-  allows); `tilefish.fused(...)` scopes; the `intermediates="f32"` mode. `@tilefish.kernel(fp_fusion=False)` keeps its code: H9 applies to it
+* **Strided inputs** in the elementwise template, as rule 5 of 3.5 says: a view that is not dense is a `Strided[...]` parameter of the region's
+  kernel with a `StrideOf` per axis, read at `sum(coordinate_k * stride_k)`; SwiGLU's halves are one kernel step over two views of the GEMM's
+  output. A region the row template lowers still copies the view with `tilefish.contiguous` first.
+* **Not yet:** strided inputs in the row template; `tilefish.fused(...)` scopes; the `intermediates="f32"` mode. `@tilefish.kernel(fp_fusion=False)` keeps its code: H9 applies to it
   too, which is the numerics contract's to decide (note 2).
 * **Tests:** `tests/test_fusion.py` (no GPU: grouping, legality, names, modes, report, refusals, the same plans in another process) and
   `tests/test_gpu_fusion.py` (sm_103; arch-agnostic): the inline casts are `.to()` on every f32 and every bf16 and f16 pattern; the use cases

@@ -136,7 +136,9 @@ each section names the release that added it.
 - **Exact.** A fused plan writes the bytes of its unfused composition (each op a kernel of its own, every intermediate stored in its dtype, a
   mask as `u8`): region kernels contract nothing and are lowered with `context_free=True` (note 20 of `tilefish.lower`): every float `+ - *` one
   scalar `.rn` instruction of inline PTX, every narrowing float cast inline PTX, a negation's NaN canonical. A reduction is a kernel of its own
-  (version 1), as is a view that is not dense (a `tilefish.contiguous` copy before the region); an op whose value nothing reads is not computed.
+  (version 1). A view that is not dense (a column block, a head, a transpose) is read where it is by a region of the elementwise template (a
+  `Strided[...]` parameter of its kernel, a stride per axis) and copied by `tilefish.contiguous` first for one of the row template; an op whose
+  value nothing reads is not computed.
 - **`tilefish.fusion(version=1, grouping="auto" | "none", math="fast" | "ieee", intermediates="declared" | "opmath", fp_contract="none" |
   "mul-add", verify=True)`**, given as `@tilefish.graph(fusion=...)`: every choice exact; `"opmath"` (torch's eager rule for a 16-bit op with a
   python scalar) and `"mul-add"` (an f32 product that nothing else reads, contracted into `tilefish.fma`) are rewrites of the IR made before
