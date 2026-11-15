@@ -67,7 +67,10 @@ write the directory can rewrite both and make ``replay`` run any binary. ``pin=`
 (``Manifest.digest``, returned by :func:`export`): hold it somewhere you trust (a build log, a lock file) and a changed
 directory is refused. ``trust_directory=True`` is the explicit statement that whatever the directory holds is fine, for a
 directory you wrote yourself a moment ago; it does not combine with ``pin=``. A pin vouches for the manifest, not for the
-machine code being correct, and not for an IR digest that is known to differ.
+machine code being correct, and not for an IR digest that is known to differ. The digest covers the files byte for byte, and an
+export is reproducible: a cubin names its sources by module path (:func:`tilefish._ir.host_independent_paths`) and a generated
+source has a content-addressed file (:func:`load_lowered`), so the same operators exported with the same toolchain for the same
+device, from another directory, process or machine, have the same digest, and a pin recorded for one export checks another.
 
 What a process holds is what is compiled. ``export`` in a process whose module was edited and not reloaded compiles, and stamps,
 what the process holds; a fresh process that has the edited file computes another IR digest and refuses that manifest, with no
@@ -88,7 +91,9 @@ from __future__ import annotations
 import atexit
 import contextlib
 import hashlib
+import importlib.machinery
 import importlib.util
+import linecache
 import math
 import os
 import pathlib
@@ -101,8 +106,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterator
 
-from . import _cache, _cuda, _ir
-from ._build import BuiltKernel, build, check_launch_config, resolve_triton, write_manifest_doc
+from . import _cache, _cuda, _ir, _source
+from ._build import BuiltKernel, build, check_launch_config, resolve_triton, write_file, write_manifest_doc
 from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
@@ -144,7 +149,8 @@ _builds: "dict[tuple, BuiltKernel]" = {}
 _specs: "weakref.WeakKeyDictionary[ExternOp, list[CompileSpec]]" = weakref.WeakKeyDictionary()  # an op is immutable
 _manifests: "dict[tuple, Manifest]" = {}  # a loaded manifest directory, until a file in it changes
 _modules: "dict[str, Any]" = {}  # sha256 of a lowered source -> the imported JITFunction
-_gen_root: "list[pathlib.Path]" = []
+_gen_root: "list[pathlib.Path]" = []  # this process's private scratch directory for generated sources, once it was needed
+_warned_gen_roots: "set[str]" = set()
 
 
 def _torch() -> Any:
@@ -252,28 +258,104 @@ def _target(op: Any) -> _Target:
     raise TilefishRuntimeError(f"tilefish.run takes a kernel or an extern op (or a library op with an impl, or a graph), got {op!r}")
 
 
-def load_lowered(lowered: LoweredKernel) -> Any:
-    """Write the generated source of a lowered kernel to a scratch directory, import it, and return its ``JITFunction``.
+def _private_gen_root() -> pathlib.Path:
+    """This process's own scratch directory for generated sources (made once, private to the user, removed at exit): where a source goes when
+    the cache directory cannot hold it (:func:`_generated_file`)."""
+    if not _gen_root:
+        root = pathlib.Path(tempfile.mkdtemp(prefix="tilefish-gen-"))
+        atexit.register(shutil.rmtree, root, True)
+        _gen_root.append(root)
+    return _gen_root[0]
 
-    The module is imported from a file because Triton reads the source of a JIT function from disk. The
-    scratch directory lives until the process exits; the result is cached by the sha256 of the source.
+
+def _holds(path: pathlib.Path, data: bytes) -> bool:
+    """Whether ``path`` is a regular file (not a symbolic link) whose bytes are exactly ``data``."""
+    try:
+        return not path.is_symlink() and path.is_file() and path.read_bytes() == data
+    except OSError:
+        return False
+
+
+def _generated_file(lowered: LoweredKernel, key: str, data: bytes) -> pathlib.Path:
+    """The file that holds the generated source ``data`` (sha256 ``key``) of ``lowered``: ``<root>/<key>/tilefish_generated/<name>.py``.
+
+    The path is addressed by the content, so every process (and every user who shares the directory) that generates the same source uses the same
+    file, and a file that is there is used only when it holds exactly ``data``. The root is ``generated/`` in tilefish's cache directory
+    (``$TILEFISH_CACHE_DIR``, else ``~/.cache/tilefish``); a file is written through a temporary file and an atomic rename, so processes that write
+    it at the same time do not tear it, and it is read back before it is used. When that directory is switched off (an empty
+    ``$TILEFISH_CACHE_DIR``), cannot be written, or does not hold the source after the write, the source goes to this process's private scratch
+    directory (one :class:`~tilefish.errors.TilefishCacheWarning` per directory says why). Where the file is does not reach a binary: its debug
+    information names it ``tilefish_generated/<name>.py`` (:func:`tilefish._source.source_name`).
     """
-    key = hashlib.sha256(lowered.source.encode("utf-8")).hexdigest()
+    shared = _cache.cache_directory()
+    problems = []
+    for root in ([shared / "generated"] if shared is not None else []) + [None]:
+        path = (root if root is not None else _private_gen_root()) / key / lowered.filename
+        if _holds(path, data):
+            return path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_file(path, data)
+        except (OSError, TilefishBuildError) as e:  # a directory that cannot be written; a symbolic link where the file goes
+            problems.append(f"cannot write {str(path)!r} ({type(e).__name__}: {e})")
+            continue
+        if _holds(path, data):
+            return path
+        problems.append(f"{str(path)!r} does not hold the generated source after it was written")
+    raise TilefishRuntimeError(f"cannot write the generated source of '{lowered.name}' anywhere: {'; '.join(problems)}")
+
+
+def _fell_back(lowered: LoweredKernel, path: pathlib.Path) -> None:
+    """One warning per shared directory that could not take a generated source (the source went to the private scratch directory instead)."""
+    shared = _cache.cache_directory()
+    if shared is None or not _gen_root or not path.is_relative_to(_gen_root[0]):
+        return
+    where = str(shared / "generated")
+    if where in _warned_gen_roots:
+        return
+    _warned_gen_roots.add(where)
+    _cache._warn(
+        f"cannot keep the generated source of '{lowered.name}' in {where!r}; generated sources go to {str(_gen_root[0])!r} for this process "
+        f"instead (set {_cache.ENV_DIR} to a writable directory, or to an empty value to switch the cache off). Binaries do not depend on it"
+    )
+
+
+def load_lowered(lowered: LoweredKernel) -> Any:
+    """Write the generated source of a lowered kernel (or of a generated op) to its content-addressed file, import it, and return its ``JITFunction``.
+
+    The file is ``<tilefish cache directory>/generated/<sha256 of the source>/tilefish_generated/<name>.py`` (:func:`_generated_file`, with a
+    fallback to a private scratch directory), so its path is the same in every process that generates the source, and nothing is left in a
+    temporary directory. A file is there because Triton reads the source of a JIT function from a file, and because a build checks that the
+    function's file is the source its spec claims. The module is executed from the source in memory (the bytes the file was checked to hold, never
+    a byte code cache), and Python's line cache is given the same text, which is what Triton reads. The binaries do not depend on where the file is:
+    the frontend of a build names it ``tilefish_generated/<name>.py`` (:func:`tilefish._ir.host_independent_paths`), as it names the module of a
+    :meth:`~tilefish.lower.LoweredKernel.write` that was imported from a directory on ``sys.path``. The result is cached by the sha256 of the source;
+    a cached function whose file has gone is given its file back.
+    """
+    data = lowered.source.encode("utf-8")
+    key = hashlib.sha256(data).hexdigest()
     with _lock:
         fn = _modules.get(key)
         if fn is not None:
+            path = pathlib.Path(fn.__globals__["__file__"])
+            if not _holds(path, data):  # removed (a cache directory deleted under a running process): put it back where the function says it is
+                with contextlib.suppress(OSError, TilefishBuildError):
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    write_file(path, data)
             return fn
-        if not _gen_root:
-            root = pathlib.Path(tempfile.mkdtemp(prefix="tilefish-gen-"))
-            atexit.register(shutil.rmtree, root, True)
-            _gen_root.append(root)
-        path = lowered.write(_gen_root[0] / key[:16])
+        path = _generated_file(lowered, key, data)
+        _fell_back(lowered, path)
+        _source.register_source_name(str(path), lowered.filename)
         name = f"{lowered.module.replace('.', '_')}__{key[:12]}"
-        spec = importlib.util.spec_from_file_location(name, path)
-        assert spec is not None and spec.loader is not None
+        lines = lowered.source.splitlines(keepends=True)
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        linecache.cache[str(path)] = (len(lowered.source), None, lines, str(path))  # what Triton reads (inspect.getsource): the checked text
+        spec = importlib.machinery.ModuleSpec(name, None, origin=str(path))
         module = importlib.util.module_from_spec(spec)
+        module.__file__ = str(path)
         sys.modules[name] = module
-        spec.loader.exec_module(module)
+        exec(compile(lowered.source, str(path), "exec"), module.__dict__)  # noqa: S102 - the source tilefish generated, as checked on disk
         fn = getattr(module, lowered.fn_name)
         _modules[key] = fn
         return fn
