@@ -2492,7 +2492,9 @@ impl Entry {
         for pre in &self.preconditions {
             let Precondition::StaticSize { arg, axis, value, .. } = pre else { continue };
             let agrees = match self.param(arg).map(|p| &p.kind) {
-                Some(ParamKind::Pointer { shape, .. }) => matches!(shape.get(*axis), Some(ShapeDim::Static(n)) if n == value),
+                Some(ParamKind::Pointer { shape, .. }) => {
+                    matches!(shape.get(*axis), Some(ShapeDim::Static(n)) if n == value)
+                }
                 _ => false,
             };
             if !agrees {

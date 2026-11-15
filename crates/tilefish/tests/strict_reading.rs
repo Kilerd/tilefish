@@ -617,7 +617,8 @@ fn of_two_static_sizes_that_disagree_with_their_shapes_the_first_precondition_is
         }
         assert!(sized.len() >= 2, "the fixture's softmax has a static size on its input and its output: {sized:?}");
         for (arg, axis) in &sized {
-            let param = entry["abi"]["params"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == arg.as_str()).unwrap();
+            let param =
+                entry["abi"]["params"].as_array_mut().unwrap().iter_mut().find(|p| p["name"] == arg.as_str()).unwrap();
             param["shape"][*axis] = 999.into();
         }
     });
