@@ -1,0 +1,48 @@
+//
+// out[i] = 2 * x[i] + bias[i] for i < n, and out[i] = 2 * x[i] when bias is the null pointer: a kernel written by hand for the tests of null
+// pointer arguments and 64-bit dimension scalars (nothing generated it). The index and the count are 64-bit.
+// C ABI: (const float* x, const float* bias, float* out, long long n). No Triton scratch slots.
+//
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry scale_bias_f32(
+	.param .u64 x,
+	.param .u64 bias,
+	.param .u64 out,
+	.param .u64 n
+)
+{
+	.reg .pred 	%p<3>;
+	.reg .b32 	%r<4>;
+	.reg .f32 	%f<4>;
+	.reg .b64 	%rd<12>;
+
+	ld.param.u64 	%rd1, [x];
+	ld.param.u64 	%rd2, [bias];
+	ld.param.u64 	%rd3, [out];
+	ld.param.u64 	%rd4, [n];
+	mov.u32 	%r1, %ctaid.x;
+	mov.u32 	%r2, %ntid.x;
+	mov.u32 	%r3, %tid.x;
+	mul.wide.u32 	%rd5, %r1, %r2;
+	cvt.u64.u32 	%rd6, %r3;
+	add.s64 	%rd7, %rd5, %rd6;
+	setp.ge.u64 	%p1, %rd7, %rd4;
+	@%p1 bra 	DONE;
+	shl.b64 	%rd8, %rd7, 2;
+	add.s64 	%rd9, %rd1, %rd8;
+	ld.global.f32 	%f1, [%rd9];
+	add.rn.f32 	%f2, %f1, %f1;
+	setp.eq.u64 	%p2, %rd2, 0;
+	@%p2 bra 	STORE;
+	add.s64 	%rd10, %rd2, %rd8;
+	ld.global.f32 	%f3, [%rd10];
+	add.rn.f32 	%f2, %f2, %f3;
+STORE:
+	add.s64 	%rd11, %rd3, %rd8;
+	st.global.f32 	[%rd11], %f2;
+DONE:
+	ret;
+}

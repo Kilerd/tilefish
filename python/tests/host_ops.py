@@ -11,7 +11,10 @@ kernels declared with ``tilefish.extern`` (an rmsnorm, an exact-erf gelu and an 
 * prebuilt binaries that need no toolchain to be declared: the hand-written PTX of ``ptx/`` (``axpy_ptx``: a float fixed argument;
   ``strided_copy``: a 64-bit stride and a fixed ``i32``);
 
-and what M3.3 added (``gpu_kernels_p4.py``): ``fma_plain`` and ``fma_fused``, one hand-written kernel declared with ``enable_fp_fusion=False``
+and what M3.5 added (``types_kernels.py``): ``add_one_wide``, a Triton kernel whose count is an ``i64[n]`` scalar; ``scale_null`` and ``scale_bias``, one
+Triton kernel declared with a null pointer (``Null[f32]``) and with a tensor; ``scale_null_ptx`` and ``scale_bias_ptx``, the same of a hand-written PTX
+that takes a 64-bit count; ``add_rows_ua``, the specialisation of a lowered kernel for a first pointer aligned to its element only
+(``KernelOp.unaligned``); and what M3.3 added (``gpu_kernels_p4.py``): ``fma_plain`` and ``fma_fused``, one hand-written kernel declared with ``enable_fp_fusion=False``
 and ``True``; ``qkv_sum`` and ``qkv_sum16``, a kernel that reads three views with one stride pair (``StrideOf(("q", "k", "v"), axis)``);
 ``key_mask`` and ``key_mask_any``, a ``[B]`` mask made from a device scalar, whose ``B`` only the ``Out`` tensor determines; and
 (``gpu_kernels_p5.py``) ``add_into``, an in-place kernel with two pointers whose ``Out`` may be written over an input (``MayAlias``).
@@ -120,6 +123,11 @@ def gpu_kernels_p4():
     return _with_triton("gpu_kernels_p4")
 
 
+def types_kernels():
+    """The kernels of 64-bit dimension scalars, null pointers and element-aligned specialisations (``types_kernels.py``)."""
+    return _with_triton("types_kernels")
+
+
 # -- prebuilt PTX that is checked in: hand-written (ptx/), so nothing here needs a toolchain -------------------------------------------------
 
 _N = Dim("n")
@@ -140,6 +148,7 @@ def ops():
     p1 = gpu_kernels_p1()
     p4 = gpu_kernels_p4()
     p5 = gpu_kernels_p5()
+    tk = types_kernels()
     return {
         "softmax": softmax,
         "layernorm": layernorm,
@@ -174,6 +183,14 @@ def ops():
         "key_mask_any": p4.key_mask_any,
         # an Out that may be written over an input (M3.3)
         "add_into": p5.add_into,
+        # a 64-bit dimension scalar, a null pointer, both in a prebuilt binary (M3.5)
+        "add_one_wide": tk.add_one_wide,
+        "scale_null": tk.scale_null,
+        "scale_bias": tk.scale_bias,
+        "scale_null_ptx": tk.scale_null_ptx,
+        "scale_bias_ptx": tk.scale_bias_ptx,
+        # the specialisation of a lowered kernel for a first pointer aligned to its element only (M3.5)
+        "add_rows_ua": tk.add_rows.unaligned("a"),
     }
 
 
