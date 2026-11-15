@@ -451,7 +451,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
     _int(d["index"], "arg index")
     _ident(d["name"], "arg name")
     kind, ty = d["kind"], d["type"]
-    kinds = ("pointer", "scalar", "constexpr") + (("fixed", "given", "tensordesc") if schema >= STRIDED_SCHEMA else ())
+    kinds = ("pointer", "scalar", "constexpr") + (("fixed", "given", "tensordesc", "null") if schema >= STRIDED_SCHEMA else ())
     if kind not in kinds or not isinstance(ty, str):
         bad(f"arg {d['name']}: kind must be {', '.join(kinds)} and type a string, got {kind!r}, {ty!r}")
     present = set(d) - {"index", "name", "kind", "type"}
@@ -462,6 +462,7 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         "fixed": {"dtype", "value"},
         "given": {"dtype"},  # a fixed argument per call: its value is the call's (a plan step's), not the spec's
         "tensordesc": {"access", "dtype", "shape", "tensor_map"},  # a TMA descriptor of a tensor: a pointer's facts, and the map
+        "null": {"dtype"},  # a pointer every launch passes as null (Null[dtype]): its element type, nothing a tensor would have
     }[kind]
     optional: "set[str]" = set()
     if kind == "constexpr" and schema >= DIGEST_SCHEMA:
@@ -500,7 +501,11 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
         if "strides" in d:
             _check_layout(d)
         return
-    if kind == "given":
+    if kind == "null":
+        dtype = ALL_DTYPES.get(d["dtype"]) if isinstance(d["dtype"], str) else None
+        if dtype is None or dtype.triton_ptr != ty:
+            bad(f"arg {d['name']}: a null pointer's type is the pointer type of its dtype, got {ty!r}/{d['dtype']!r}")
+    elif kind == "given":
         if ty not in ("i32", "i64") or d["dtype"] != ty:
             bad(f"arg {d['name']}: a fixed argument per call is i32 or i64, got {ty!r}/{d['dtype']!r}")
     elif kind == "fixed":
@@ -829,12 +834,15 @@ def validate_spec(d: Any) -> None:
                     bad(f"pointer_alignment of the descriptor {p['arg']} must be {ALIGNMENT} bytes (the global address of a TMA descriptor), got {p['bytes']}")
                 aligned.add(p["index"])
                 continue
-            if "strides" in a:  # a strided pointer is 16-byte aligned only when its declaration says so, else aligned to its element
+            # a strided pointer is 16-byte aligned only when its declaration says so, else aligned to its element; so is a dense one (a lowered
+            # kernel's specialisation for views that do not start on 16 bytes), but not a device scalar
+            if "strides" in a or a["shape"] != []:
                 itemsize = max(1, ALL_DTYPES[a["dtype"]].bits // 8)
                 if p["bytes"] not in (ALIGNMENT, itemsize):
-                    bad(f"pointer_alignment of the strided pointer {p['arg']} must be {ALIGNMENT} bytes or its element size {itemsize}, got {p['bytes']}")
+                    what = "strided pointer" if "strides" in a else "pointer"
+                    bad(f"pointer_alignment of the {what} {p['arg']} must be {ALIGNMENT} bytes or its element size {itemsize}, got {p['bytes']}")
             elif p["bytes"] != ALIGNMENT:
-                bad(f"pointer_alignment must be {ALIGNMENT} bytes, once, on a pointer argument ({p['arg']})")
+                bad(f"pointer_alignment of the device scalar {p['arg']} must be {ALIGNMENT} bytes, got {p['bytes']}")
             aligned.add(p["index"])
             if p["bytes"] == ALIGNMENT:
                 attr_pointers.add(p["index"])

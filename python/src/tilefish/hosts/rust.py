@@ -82,6 +82,7 @@ from .._library import library_specs, validate_entry as validate_library_entry
 from .._manifest import Manifest
 from .._specvalid import parse_expression, parse_grid
 from ..decorators import LibraryOp
+from ..dtypes import ALL_DTYPES
 from ..errors import TilefishManifestError, TilefishRuntimeError, TilefishSpecError
 
 RUST_ELEMENTS = {"bf16": "Bf16", "f16": "F16", "f32": "F32", "i32": "I32", "i64": "I64", "u8": "U8", "e4m3": "E4m3", "e5m2": "E5m2"}
@@ -143,6 +144,8 @@ _INT_RANGES = {"i32": (-(2**31), 2**31 - 1), "i64": (-(2**63), 2**63 - 1)}
 _MAX_EXTENT = 2**31 - 1  # the `value` of every `max_extent` precondition
 _PRECONDITIONS = ("pointer_alignment", "divisible", "static_size", "max_elements", "max_extent", "bucket")
 _DEFAULT_ALIGNMENT = 16
+# the pointer type of each dtype a manifest names (the type of a pointer or of a null pointer of that dtype)
+_POINTER_TYPES = {name: d.triton_ptr for name, d in ALL_DTYPES.items()}
 
 
 @dataclass
@@ -157,6 +160,7 @@ class _Binary:
     params: "list[dict[str, Any]]" = field(default_factory=list)  # the pointers of the ABI, in order
     scalars: "list[dict[str, Any]]" = field(default_factory=list)  # the runtime scalars (the ones `launch` derives)
     fixed: "list[dict[str, Any]]" = field(default_factory=list)  # the fixed arguments of a prebuilt binary
+    nulls: "list[dict[str, Any]]" = field(default_factory=list)  # the pointers every launch passes as null (Null[dtype])
     given: "list[dict[str, Any]]" = field(default_factory=list)  # its fixed arguments per call: parameters of `launch`
     arg_names: "dict[str, str]" = field(default_factory=dict)  # ABI name -> Rust name
     signature: "str | None" = None  # the tilefish signature of the declaration, when it was given
@@ -379,6 +383,12 @@ def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> No
             if kind != "binary":
                 _bad(who, f"{where} is a fixed argument, which only a prebuilt binary has (this is a {kind} kernel)")
             _validate_fixed(who, where, p)
+        elif pkind == "null":  # a pointer every launch passes as null: its dtype, whose pointer type is its type, and nothing else
+            _name(who, f"{where}.dtype", p.get("dtype"), _DTYPE)
+            if p.get("type") != _POINTER_TYPES.get(p["dtype"]) or p.get("ptx_type") != "u64" or p.get("size") != 8:
+                _bad(who, f"{where} is a null pointer: its type is the pointer type of its dtype, passed as a u64 of 8 bytes")
+            if any(k in p for k in ("value", "dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "alias")):
+                _bad(who, f"{where} is a null pointer: it has a dtype and nothing a tensor or a scalar has")
         elif pkind == "given":
             if kind != "binary":
                 _bad(who, f"{where} is a fixed argument per call, which only a prebuilt binary has (this is a {kind} kernel)")
@@ -387,7 +397,7 @@ def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> No
             if any(k in p for k in ("value", "dim", "count_of", "stride_of")):
                 _bad(who, f"{where} is a fixed argument per call: every launch gives its value, it has no value, dim, count_of or stride_of")
         else:
-            _bad(who, f"{where}.kind must be 'pointer', 'tensordesc', 'scalar', 'fixed' or 'given', got {pkind!r}")
+            _bad(who, f"{where}.kind must be 'pointer', 'tensordesc', 'scalar', 'fixed', 'given' or 'null', got {pkind!r}")
     for p in params:
         for axis, s in enumerate(p.get("strides", ()) if p.get("kind") == "pointer" else ()):
             if isinstance(s, str) and (p["name"], axis) not in carried:
@@ -440,7 +450,8 @@ def _validate_preconditions(who: str, entry: "dict[str, Any]", pointers: "dict[s
             if arg in aligned:
                 _bad(who, f"'{arg}' has two pointer_alignment preconditions")
             aligned.add(arg)
-            allowed = {_DEFAULT_ALIGNMENT} | ({_ITEMSIZE[p["dtype"]]} if strided and not desc and p["dtype"] in _ITEMSIZE else set())
+            # a strided pointer, or a dense one that is not a device scalar (a lowered kernel's specialisation for views), may promise its element's alignment
+            allowed = {_DEFAULT_ALIGNMENT} | ({_ITEMSIZE[p["dtype"]]} if (strided or not scalar) and not desc and p["dtype"] in _ITEMSIZE else set())
             if pre.get("bytes") not in allowed or isinstance(pre.get("bytes"), bool):
                 _bad(who, f"{where}.bytes must be {' or '.join(map(str, sorted(allowed)))} for '{arg}', got {pre.get('bytes')!r}")
         elif kind == "max_extent":  # (a kernel with index_bits=64 has none: at most once)
@@ -645,6 +656,7 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
         binary.scalars = [p for p in first["abi"]["params"] if p["kind"] == "scalar"]
         binary.fixed = [p for p in first["abi"]["params"] if p["kind"] == "fixed"]
         binary.given = [p for p in first["abi"]["params"] if p["kind"] == "given"]
+        binary.nulls = [p for p in first["abi"]["params"] if p["kind"] == "null"]
         for p in binary.params:
             if p["dtype"] not in RUST_ELEMENTS:
                 raise TilefishManifestError(
@@ -859,6 +871,13 @@ def _doc(binary: _Binary) -> "list[str]":
         lines += _wrap(
             "Fixed arguments (their values are in the manifest, and every launch passes them: they are not parameters of `launch`): "
             + ", ".join(f"`{f['name']}` = {_scalar_text(f['value'])} ({f['type']})" for f in binary.fixed)
+            + "."
+        )
+    if binary.nulls:
+        lines.append("")
+        lines += _wrap(
+            "Null pointers (every launch passes 0 for them: they are not parameters of `launch`): "
+            + ", ".join(f"`{p['name']}` ({p['type']})" for p in binary.nulls)
             + "."
         )
     if binary.given:

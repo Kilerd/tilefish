@@ -671,8 +671,8 @@ def launches():
 
         def prepare_call(call, after):
             if not given_outs:
-                return prepare(op, [fake(t) for t in call], next_slab=after)
-            return prepare(op, [fake(t) for t in call[:n_in]], next_slab=after, outputs=[fake(t) for t in call[n_in:]])
+                return prepare(op, [fake(t) for t in call], next_slab=after, specialise=False)
+            return prepare(op, [fake(t) for t in call[:n_in]], next_slab=after, outputs=[fake(t) for t in call[n_in:]], specialise=False)
 
         specs = {sp.stem: sp for sp in _target(op).compile_specs()}
         stems |= set(specs)

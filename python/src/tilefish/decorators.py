@@ -14,7 +14,7 @@ from typing import Any, Callable, Sequence
 
 from .dims import DimExpr, as_dim
 from ._specvalid import IMPLEMENTATION_FALLBACK as FALLBACK, MAX_ELEMENTS
-from .dtypes import DType
+from .dtypes import BlockScaled, DType
 from .errors import TilefishDeclarationError, TilefishError, TilefishPicklingError, TilefishRuntimeError, TilefishTypeError
 from .ir import Graph
 from .signature import MISSING, Param, Signature, _check_const_default, call_op, parse_signature
@@ -389,6 +389,17 @@ class KernelOp(GraphOp):
     into one FMA with one rounding (``True``, Triton's default) or must round twice (``False``);
     ``math`` is the f32 math of the body (``"fast"``, the default, or ``"ieee"``: note 13 of
     :mod:`tilefish.lower`); see :func:`tilefish.lower`.
+
+    **Pointers that are not 16-byte aligned.** Every pointer of a lowered kernel is compiled as 16-byte aligned (``tt.divisibility=16``,
+    and a ``pointer_alignment`` of 16 bytes a launch checks). :meth:`unaligned` is the same kernel compiled for some of its read-only tensor
+    parameters aligned to their element only: a *specialisation*, an operator of its own (named ``<kernel>__ua<indices>``, the indices of
+    those parameters: ``vq_sum__ua1``), whose binaries have no divisibility hint for those pointers and promise only their element's
+    alignment. It is keyed apart from the kernel everywhere a binary is: its stems, its declaration digest (the parameters' ``align``), its
+    Triton IR (the hint is in it, so its build cache key) and its manifest entries. The generated source is the kernel's. A graph that
+    passes a dense view that does not provably start on 16 bytes (``plane[k]``, a row of a ``[K, R]`` int32 plane with an odd ``R``) to a
+    read-only parameter calls the specialisation for it, and ``tilefish.run`` of the kernel on a tensor whose address is not 16-byte aligned
+    runs it (``replay`` needs its entries in the manifest: a graph's export has them, and ``export(kernel.unaligned("plane"), ...)`` writes
+    them for the kernel alone).
     """
 
     kind = "kernel"
@@ -407,12 +418,52 @@ class KernelOp(GraphOp):
         self.num_warps = num_warps
         self.fp_fusion = fp_fusion
         self.math = math
+        # a specialisation for pointers aligned to their element only (unaligned()): the kernel it is of, and the parameters it is for
+        self.base: "KernelOp | None" = None
+        self.unaligned_params: "frozenset[str]" = frozenset()
 
     def lower(self, **options: Any) -> Any:
         """Lower this kernel to Triton source: ``tilefish.lower(self, **options)``."""
         from .lower import lower
 
         return lower(self, **options)
+
+    def unaligned(self, *names: str) -> "KernelOp":
+        """The specialisation of this kernel for the read-only tensor parameters ``names`` aligned to their element only (see the class
+        docstring). The same names give the same operator; no name gives the kernel itself."""
+        base = self.base if self.base is not None else self
+        wanted = frozenset(names) | self.unaligned_params
+        if not wanted:
+            return base
+        by_name = {p.name: p for p in base.signature.params}
+        for nm in sorted(wanted):
+            p = by_name.get(nm)
+            if p is None or p.kind != "tensor" or p.access != "in" or p.is_devscalar or isinstance(p.type.dtype, BlockScaled):  # type: ignore[union-attr]
+                raise TilefishDeclarationError(
+                    f"kernel '{base.name}': {nm!r} is not a read-only tensor parameter of a plain dtype, so it has no specialisation for a pointer "
+                    "aligned to its element only (only an input is a view of another tensor; an Out or InOut tensor is the kernel's own)"
+                )
+        variants = base.__dict__.setdefault("_tf_unaligned", {})
+        found = variants.get(wanted)
+        if found is None:
+            indices = sorted(by_name[nm].index for nm in wanted)
+            found = KernelOp(
+                base.fn, f"{base.name}__ua{'_'.join(str(i) for i in indices)}", base.signature, base.graph, base.num_warps, base.fp_fusion, base.math
+            )
+            found.base, found.unaligned_params = base, wanted
+            found.__doc__ = base.__doc__
+            found = variants.setdefault(wanted, found)
+        return found
+
+    def __reduce__(self) -> Any:
+        if self.base is not None:  # a specialisation: by its kernel (which pickles by reference) and its parameters
+            return (_unaligned_of, (self.base, tuple(sorted(self.unaligned_params))))
+        return super().__reduce__()
+
+
+def _unaligned_of(kernel: KernelOp, names: "tuple[str, ...]") -> KernelOp:
+    """The specialisation ``kernel.unaligned(*names)`` (how one is unpickled: by its kernel, which pickles by reference)."""
+    return kernel.unaligned(*names)
 
 
 def _declare_traced(fn: Callable[..., Any], name: str | None, cls: type, kind: str, **options: Any) -> Any:
@@ -1277,7 +1328,7 @@ def extern(
         def scale(x: Tensor[n, bf16], y: Out[Tensor[n, bf16]], n_elem: n, alpha: const[f32] = 2.0): ...
 
     The stub lists the kernel's **C parameters, in order**: a tensor is a pointer (``Strided[...]`` and ``DevScalar[...]`` too), a
-    parameter annotated with a runtime ``Dim`` is an ``i32``, a ``StrideOf`` an ``i32`` (``i64`` for ``index_bits=64``, or its ``dtype=``), and a typed
+    parameter annotated with a runtime ``Dim`` is an ``i32`` (``i64[n]``: an ``i64``), a ``StrideOf`` an ``i32`` (``i64`` for ``index_bits=64``, or its ``dtype=``), and a typed
     ``const[i32]``, ``const[i64]`` or ``const[f32]`` with a default is a **fixed argument**: a scalar whose value is written in the
     manifest and passed at every launch (the way a prebuilt kernel takes its constants and its unused scratch slots; there are no
     constexprs, since nothing is compiled). A prebuilt binary has **no Triton scratch slots**: it is launched with exactly these
@@ -1319,7 +1370,14 @@ def extern(
     The decorated stub lists **the Triton kernel's parameters, in order**:
     a ``Tensor``/``InOut``/``Out`` is a pointer, a parameter annotated with a
     runtime ``Dim`` is an ``i32``, a ``const`` is a ``constexpr`` (it needs a
-    default: the compiled-in value). Python forbids a parameter without a
+    default: the compiled-in value).
+
+    **A 64-bit dimension scalar.** ``n_elem: i64[n]`` is a runtime scalar that carries the dimension ``n`` (any dimension expression) as an
+    ``i64``, where ``n_elem: n`` is an ``i32``: a kernel whose element count or size parameter is 64 bits wide (a prebuilt kernel's ``long n``,
+    a Triton kernel's ``i64`` scalar). Its value is derived from the shapes of the call like any dimension scalar's (it is never given by a
+    call, unlike a fixed argument per call), and a launch refuses one that does not fit (``0`` to ``2**63 - 1``). The type is in the
+    declaration digest (``"scalar_type": "i64"`` on the parameter; a declaration without one digests as before) and in the manifest (a
+    ``scalar`` of type ``i64``). Python forbids a parameter without a
     default after one with a default, so when a constexpr comes before other
     parameters, put a bare ``*`` before it::
 
@@ -1446,6 +1504,8 @@ def _parse_extern_stub(fn: Callable[..., Any], name: "str | None", index_bits: i
         allow_output_dims=True,
         allow_alias=True,
         allow_tensor_map=not prebuilt,
+        allow_wide_dims=True,
+        allow_null=True,
     )
     if sig.returns:
         raise TilefishDeclarationError(

@@ -98,13 +98,15 @@ class FakeTorch:
         return FakeTensor(shape, dtype, ptr)
 
 
-def prepare(op, args, *, next_slab, outputs=None):
+def prepare(op, args, *, next_slab, outputs=None, specialise=True):
     """``runtime._prepare`` of ``op`` on ``args`` (fake tensors): ``(prepared, None)``, or ``(None, error)``. ``outputs`` are the fake tensors its
-    results are written into (``tilefish.run(..., outputs=...)``) instead of allocated ones."""
+    results are written into (``tilefish.run(..., outputs=...)``) instead of allocated ones. ``specialise=False`` decides the call for the binaries of
+    ``op`` itself: a kernel's call on a tensor that is not 16-byte aligned is refused by them, where ``tilefish.run`` runs the kernel's specialisation
+    for it (``KernelOp.unaligned``); what a host decides for one binary is what the cross-language vectors record."""
     saved = runtime._torch
     runtime._torch = lambda: FakeTorch(next_slab)
     try:
-        return runtime._prepare(runtime._target(op), tuple(args), {}, outputs), None
+        return runtime._prepare(runtime._target(op), tuple(args), {}, outputs, specialise=specialise), None
     except TilefishError as e:
         return None, e
     finally:

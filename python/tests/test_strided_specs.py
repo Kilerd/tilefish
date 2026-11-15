@@ -421,7 +421,10 @@ def test_the_alignment_of_a_strided_pointer_is_16_bytes_or_its_element():
     p = next(i for i, p in enumerate(doc_of()["preconditions"]) if p["kind"] == "pointer_alignment" and p["arg"] == "x")
     rejects(lambda d: d["preconditions"][p].update(bytes=4), "must be 16 bytes or its element size 2")
     rejects(lambda d: d["preconditions"][p].update(bytes=16), "attrs must be at exactly")  # promised 16 bytes, but no attribute says so to Triton
-    rejects(lambda d: d["preconditions"][next(i for i, q in enumerate(d["preconditions"]) if q["arg"] == "y" and q["kind"] == "pointer_alignment")].update(bytes=2), "pointer_alignment must be 16 bytes")
+    y = next(i for i, q in enumerate(doc_of()["preconditions"]) if q["arg"] == "y" and q["kind"] == "pointer_alignment")
+    rejects(lambda d: d["preconditions"][y].update(bytes=4), "pointer_alignment of the pointer y must be 16 bytes or its element size 2")
+    # a dense pointer may promise its element's alignment (a lowered kernel's specialisation for views), but then Triton is given no attribute for it
+    rejects(lambda d: d["preconditions"][y].update(bytes=2), "attrs must be at exactly")
 
 
 def test_max_extent_and_max_elements_are_checked_on_the_right_pointers():

@@ -119,7 +119,7 @@ def check_ptx_abi(spec: "CompileSpec", ptx: str, symbol: str) -> None:
     if close < 0:
         raise TilefishBuildError(f"the PTX entry '{symbol}' of '{spec.stem}' has no parameter list end")
     found = _PARAM.findall(ptx[m.end() : close])
-    want = [("pointer" if a.kind == "pointer" else a.type) for a in spec.args]
+    want = [("pointer" if a.kind in ("pointer", "null") else a.type) for a in spec.args]  # a null pointer is a pointer of the C ABI
     ok = len(found) == len(want) and all(f in _ACCEPTED[w] for f, w in zip(found, want))
     if not ok:
         raise TilefishBuildError(

@@ -123,8 +123,10 @@ from ._launch import (
     tensor_info,
     tf_dtype_name,
 )
+from ._specvalid import ALIGNMENT
 from .aot import CompileSpec, compile_specs
 from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp, Op
+from .dtypes import BlockScaled
 from .dims import Dim, DimExpr
 from ._manifest import MANIFEST_NAME, Manifest, manifest_digest
 from .errors import (
@@ -367,13 +369,16 @@ def _given_outputs(target: _Target, outputs: Any, result_names: "list[str]") -> 
     return dict(zip(result_names, given))
 
 
-def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None) -> _Prepared:
+def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None, specialise: bool = True) -> _Prepared:
     """Check a call and decide its binary, scalars and grid. ``outputs`` are the tensors the results are written into (a tensor, or one per result in
     the order the call returns them) instead of allocated ones: their shapes bind the dimensions only the ``Out`` parameters mention, and each is held to
-    the dtype, the rank, the contiguity and the shape its parameter has."""
+    the dtype, the rank, the contiguity and the shape its parameter has. A ``@tilefish.kernel`` given a read-only tensor that is not 16-byte aligned runs
+    its specialisation for it (:func:`_specialised`), unless ``specialise=False``."""
     torch = _torch()
-    extern = target.launch_extern()
     call = bind_call(target.name, target.public, args, kwargs)
+    if specialise:
+        target = _specialised(target, call.infos)
+    extern = target.launch_extern()
     names = _extern_names(target, extern)
     result_names = _result_names(target, extern)
     given = _given_outputs(target, outputs, result_names)
@@ -410,6 +415,27 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]",
     infos = {name: tensor_info(name, t) for name, t in tensors.items()}
     scalars, grid = _finish_launch(extern, spec, dims, infos, {names[k]: v for k, v in call.consts.items()})
     return _Prepared(target, spec, str(device), tensors, scalars, grid, results)
+
+
+def _specialised(target: _Target, infos: "dict[str, TensorInfo]") -> _Target:
+    """The target that runs a call of a ``@tilefish.kernel`` whose read-only tensors include a dense one at an address that is not a multiple of 16
+    bytes (and is one of its element size): the kernel's specialisation for those parameters (:meth:`tilefish.decorators.KernelOp.unaligned`), whose
+    pointers are compiled aligned to their element only, as Triton's own launcher would specialise on the address. Any other call, and a kernel lowered
+    by the caller with options of its own (a :class:`~tilefish.lower.LoweredKernel`), runs as it is (an address that is not 16-byte aligned is then
+    refused by the binary's precondition)."""
+    kernel = target.kernel
+    if kernel is None or target.lowered is not None or target.extern is not None:
+        return target
+    names = []
+    for p in kernel.signature.tensor_inputs:
+        info = infos.get(p.name)
+        if p.access != "in" or p.is_devscalar or isinstance(p.type.dtype, BlockScaled) or info is None or not info.contiguous:  # type: ignore[union-attr]
+            continue
+        if info.ptr % ALIGNMENT and not info.ptr % max(1, info.itemsize):
+            names.append(p.name)
+    if not names:
+        return target
+    return _target(kernel.unaligned(*names))
 
 
 def _check_given(op_name: str, p: Param, info: TensorInfo, dims: "dict[Dim, int]") -> None:
@@ -497,8 +523,8 @@ def _launch_values(prep: _Prepared) -> "list[tuple[str, str, Any]]":
             out.append((a.kind, a.name, prep.tensors[a.name]))
         elif a.kind in ("scalar", "given"):  # a runtime scalar, or a fixed argument per call (the value the call gave)
             out.append((a.kind, a.name, prep.scalars[a.name]))
-        elif a.kind == "fixed":
-            continue  # a prebuilt binary's constant argument: its value is in the manifest, and the launch writes it
+        elif a.kind in ("fixed", "null"):
+            continue  # a prebuilt binary's constant argument, or a null pointer: the value is the ABI's, and the launch writes it
         else:
             out.append(("constexpr", a.name, a.value))
     return out
@@ -694,6 +720,15 @@ def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
     """Launch the prebuilt cubin of the manifest for this spec and this device's architecture."""
     torch = _torch()
     index = _device_index(torch, prep.device)
+    kernel = prep.target.kernel
+    if kernel is not None and kernel.base is not None and manifest.get(prep.spec.stem, f"sm_{_capability(torch, index)}") is None:
+        names = ", ".join(repr(n) for n in sorted(kernel.unaligned_params))
+        raise TilefishManifestError(
+            f"the call gives {names} of kernel '{kernel.base.name}' a tensor that is not 16-byte aligned, which runs the kernel's specialisation for "
+            f"pointers aligned to their element only, '{kernel.name}' (its binaries do not assume 16 bytes), and the manifest in {str(manifest.directory)!r} "
+            f"has no binary of it: export kernel.unaligned({names}) too (the export of a graph has the specialisations its calls use), or pass a "
+            "16-byte aligned tensor"
+        )
     _launch_built(prep, replay_built(prep.target, prep.spec, manifest, pinned, index), index)
 
 

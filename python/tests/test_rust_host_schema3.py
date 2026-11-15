@@ -357,7 +357,7 @@ KERNEL_FIELDS = {
     "max_extent with another value": ("head_copy", lambda e: next(p for p in e["preconditions"] if p["kind"] == "max_extent").update(value=5)),
     "max_elements on a strided pointer": ("head_copy", lambda e: e["preconditions"].append({"kind": "max_elements", "arg": "x", "index": 0, "value": 2**31 - 1, "shape": ["S"]})),
     "an alignment that is neither 16 nor the element size": ("head_copy", lambda e: next(p for p in e["preconditions"] if p["kind"] == "pointer_alignment").update(bytes=8)),
-    "an alignment of a dense pointer that is not 16": ("head_copy", lambda e: next(p for p in e["preconditions"] if p["kind"] == "pointer_alignment" and p["arg"] == "y").update(bytes=2)),
+    "an alignment of a dense pointer that is neither 16 nor the element size": ("head_copy", lambda e: next(p for p in e["preconditions"] if p["kind"] == "pointer_alignment" and p["arg"] == "y").update(bytes=4)),
     "no alignment": ("head_copy", lambda e: _drop(e, kind="pointer_alignment", arg="y")),
     "an alignment twice": ("head_copy", lambda e: e["preconditions"].append({"kind": "pointer_alignment", "arg": "x", "index": 0, "bytes": 2})),
     "an alignment with the wrong index": ("head_copy", lambda e: next(p for p in e["preconditions"] if p["kind"] == "pointer_alignment").update(index=7)),

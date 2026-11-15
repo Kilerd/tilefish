@@ -327,6 +327,12 @@ pub enum ParamKind {
         /// How it is passed.
         ty: ScalarType,
     },
+    /// A pointer that every launch passes as null (Python's `Null[dtype]`: a parameter of the kernel that the declaration does not use): the
+    /// 64-bit zero at its own slot. No tensor is bound to it, and it has no precondition.
+    Null {
+        /// The element dtype of the pointer as the manifest names it (its `type` is that dtype's pointer type).
+        dtype_name: String,
+    },
 }
 
 /// One non-constexpr parameter of the launch ABI.
@@ -373,7 +379,7 @@ impl Param {
     pub fn size(&self) -> usize {
         match &self.kind {
             ParamKind::Pointer { tensor_map: Some(_), .. } => 128,
-            ParamKind::Pointer { .. } => 8,
+            ParamKind::Pointer { .. } | ParamKind::Null { .. } => 8,
             ParamKind::Scalar { ty, .. } => match ty {
                 ScalarType::I32 => 4,
                 ScalarType::I64 => 8,
@@ -1665,9 +1671,40 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                 }
                 ParamKind::Given { ty }
             }
+            "null" => {
+                // a pointer every launch passes as null: its dtype, whose pointer type is its type, and nothing else
+                let dtype = p.dtype.as_deref().unwrap_or("");
+                if pointer_type_of(dtype) != Some(p.ty.as_str()) {
+                    return Err(format!(
+                        "parameter {name}: the type of a null pointer {:?} is not the pointer type of its dtype {dtype:?}",
+                        p.ty
+                    ));
+                }
+                if p.ptx_type != "u64" || p.size != 8 {
+                    return Err(format!(
+                        "parameter {name}: a null pointer is passed as a u64 of 8 bytes, got {} of {}",
+                        p.ptx_type, p.size
+                    ));
+                }
+                if p.dim.is_some()
+                    || p.count_of.is_some()
+                    || p.stride_of.is_some()
+                    || p.access.is_some()
+                    || p.shape.is_some()
+                    || p.strides.is_some()
+                    || p.offset.is_some()
+                    || p.value.is_some()
+                    || p.alias.is_some()
+                {
+                    return Err(format!(
+                        "parameter {name} is a null pointer: it has a dtype and nothing a tensor or a scalar has"
+                    ));
+                }
+                ParamKind::Null { dtype_name: dtype.to_owned() }
+            }
             other => {
                 return Err(format!(
-                    "parameter {name}: kind must be pointer, tensordesc, scalar, fixed or given, got {other:?}"
+                    "parameter {name}: kind must be pointer, tensordesc, scalar, fixed, given or null, got {other:?}"
                 ));
             }
         };
@@ -2089,7 +2126,7 @@ impl Entry {
                         }
                     }
                 }
-                ParamKind::Fixed { .. } | ParamKind::Given { .. } => {}
+                ParamKind::Fixed { .. } | ParamKind::Given { .. } | ParamKind::Null { .. } => {}
             }
         }
         for p in &self.params {
@@ -2139,7 +2176,9 @@ impl Entry {
                     let allowed = match kind_of(arg) {
                         // the global address of a TMA descriptor is 16-byte aligned, a view's too
                         Some(ParamKind::Pointer { tensor_map: Some(_), .. }) => Some(vec![ALIGNMENT]),
-                        Some(ParamKind::Pointer { view: Some(_), dtype_name, .. }) => {
+                        // a strided pointer, and a dense one that is not a device scalar (the specialisation of a lowered kernel for views
+                        // that do not start on 16 bytes), may promise only its element's alignment
+                        Some(ParamKind::Pointer { view, shape, dtype_name, .. }) if view.is_some() || !shape.is_empty() => {
                             let element = DType::from_name(dtype_name).map_or(1, |d| d.size() as u64);
                             Some(vec![ALIGNMENT, element])
                         }
@@ -2148,7 +2187,7 @@ impl Entry {
                     };
                     if !allowed.is_some_and(|a| a.contains(bytes)) || !aligned.insert(arg.clone()) {
                         return Err(format!(
-                            "pointer_alignment must be {ALIGNMENT} bytes (or, for a strided pointer, its element size), once, on a pointer argument ({arg})"
+                            "pointer_alignment must be {ALIGNMENT} bytes (or, for a pointer that is not a device scalar or a descriptor, its element size), once, on a pointer argument ({arg})"
                         ));
                     }
                 }

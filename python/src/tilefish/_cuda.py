@@ -168,8 +168,8 @@ class LoadedKernel:
 
     @property
     def _call_params(self) -> "list[dict[str, Any]]":
-        """The arguments a caller passes: every parameter but the ``fixed`` ones, whose value the manifest holds and the launch writes itself."""
-        return [p for p in self._abi if p["kind"] != "fixed"]
+        """The arguments a caller passes: every parameter but the ``fixed`` ones and the null pointers, whose value the manifest holds and the launch writes itself."""
+        return [p for p in self._abi if p["kind"] not in ("fixed", "null")]
 
     def _check_params(self) -> None:
         """The loaded function must take the parameters of the manifest's ABI (count and sizes), when the driver can say."""
@@ -265,6 +265,9 @@ class LoadedKernel:
         for p in self._abi:  # the manifest's order: the caller's arguments, with each fixed argument at its own slot
             if p["kind"] == "fixed":
                 put(_ctype(p["type"])(decode_scalar(p["value"], f"fixed argument {p['name']}")))
+                continue
+            if p["kind"] == "null":  # a pointer every launch passes as null: the 64-bit zero at its slot
+                put(ctypes.c_uint64(0))
                 continue
             kind, v = next(passed)
             if kind == "tensordesc":  # the 128 bytes of the CUtensorMap (64-byte aligned, as its PTX parameter is), its shape (i32), its strides (i64)

@@ -343,7 +343,7 @@ def test_expression_grammar_directly():
 def test_every_pointer_needs_one_16_byte_alignment_precondition():
     first = next(i for i, p in enumerate(GOOD["preconditions"]) if p["kind"] == "pointer_alignment")
     rejects(lambda d: d["preconditions"].pop(first), "every pointer argument needs exactly one")
-    rejects(lambda d: d["preconditions"][first].update(bytes=8), "pointer_alignment must be 16 bytes")
+    rejects(lambda d: d["preconditions"][first].update(bytes=8), r"pointer_alignment of the pointer \w+ must be 16 bytes or its element size")
     rejects(lambda d: d["preconditions"].append(copy.deepcopy(d["preconditions"][first])), "pointer_alignment must be 16 bytes")
     rejects(lambda d: d["preconditions"][first].update(arg=d["args"][INDEX["cnt"]]["name"]), "pointer_alignment|which is not an argument")
     rejects(lambda d: d["preconditions"][first].update(index=INDEX["w"]), "which is not an argument")

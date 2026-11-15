@@ -72,7 +72,7 @@ def ptx_type_of(kind: str, type_: str) -> "tuple[str, int]":
     """The PTX type name and the size in bytes of one launch parameter, as Triton declares it (a descriptor: its first slot, the CUtensorMap)."""
     if kind == "tensordesc":
         return (TENSORDESC_PTX, 128)
-    return ("u64", 8) if kind == "pointer" else _PTX_SCALARS[type_]
+    return ("u64", 8) if kind in ("pointer", "null") else _PTX_SCALARS[type_]
 
 
 def ptx_slots_of(kind: str, type_: str, rank: int = 0) -> "list[tuple[str, int]]":
@@ -379,6 +379,8 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
             entry["value"] = _encode(a.value)
         elif a.kind == "given":  # a fixed argument per call: the call (a step of a plan) gives the value
             pass
+        elif a.kind == "null":  # a pointer every launch passes as null: its element type (the pointer type is its `type`), and nothing else
+            entry["dtype"] = a.dtype
         else:
             entry["dim"] = a.dim
             if a.count_of is not None:  # the value is the element count of that pointer argument

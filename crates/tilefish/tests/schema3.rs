@@ -903,7 +903,7 @@ fn a_given_argument_that_is_not_what_it_says_is_refused() {
         ("with a dim", json!({"dim": "n"}), "it has no value, dim or shape"),
         ("an f32", json!({"type": "f32", "ptx_type": "f32"}), "is i32 or i64"),
         ("passed in 8 bytes", json!({"ptx_type": "u64", "size": 8}), "is passed as a u32 of 4 bytes"),
-        ("of an unknown kind", json!({"kind": "giving"}), "kind must be pointer, tensordesc, scalar, fixed or given"),
+        ("of an unknown kind", json!({"kind": "giving"}), "kind must be pointer, tensordesc, scalar, fixed, given or null"),
     ];
     for (what, change, why) in cases {
         let mut k = axpy_given();
