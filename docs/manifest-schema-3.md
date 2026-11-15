@@ -117,6 +117,13 @@ one machine checks a rebuild on another. Options that were considered and not ta
 * *normalise the paths inside the cubins before hashing*: the same, plus an ELF rewrite in both readers;
 * *drop the line information*: it removes and renumbers sections, so every `sha256_code` would change, and profilers lose the source lines.
 
+**Absolute paths for a profiler (opt-out).** A profiler that shows source lines (Nsight Compute's source view, `nvdisasm`) resolves these names
+against a source directory it is given. Where that is inconvenient, `TILEFISH_DEBUG_PATHS=absolute` in the environment of the build keeps the absolute
+paths Triton records (the checkout, the virtual environment, the cache directory of the generated sources), as before. It is off by default, and it
+**breaks reproducibility**: such an export has other cubin bytes, `sha256`s and digests in every other directory or on every other machine (the
+`sha256_code`s are the same), so a pin taken from it checks only that very export. A binary built with it is cached under a key of its own and never
+served to a build without it; any other value of the variable is refused.
+
 A manifest exported by 0.0.6 or earlier still names the directories of its build; it loads, pins and replays exactly as before. A prebuilt binary
 (section 8) is taken as it is: a PTX with `.file` directives or a cubin built elsewhere keeps whatever paths it has.
 

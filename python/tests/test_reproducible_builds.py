@@ -175,6 +175,28 @@ def test_an_extern_built_from_two_checkouts_is_the_same_bytes(fake, tmp_path, mo
     assert first.cubin == second.cubin and first.sha256 == second.sha256 and first.sha256_code == second.sha256_code
 
 
+def test_absolute_debug_paths_are_an_opt_out_that_is_cached_apart_and_keeps_the_machine_code(fake, tmp_path, monkeypatch):
+    """``TILEFISH_DEBUG_PATHS=absolute`` (for a profiler) keeps Triton's absolute path in the debug information: the same machine code, other
+    bytes, and a build cache key of its own, so neither build is served to the other; any other value is refused."""
+    monkeypatch.setenv("TILEFISH_CACHE_DIR", str(tmp_path / "cache"))
+    (spec,) = compile_specs(rb_extern)
+    fn = import_from(checkout(tmp_path / "a"), monkeypatch)
+    plain = build(spec, arch=SM90, fn=fn)
+    monkeypatch.setenv("TILEFISH_DEBUG_PATHS", "absolute")
+    assert _source.debug_paths() == "absolute"
+    absolute = build(spec, arch=SM90, fn=fn)
+    assert fake.count == 2  # not served the other build's binary
+    assert debug_names(absolute.cubin) == "line:" + str(tmp_path / "a" / "rb_pkg" / "kern.py")
+    assert debug_names(plain.cubin) == "line:rb_pkg/kern.py"
+    assert absolute.sha256 != plain.sha256 and absolute.sha256_code == plain.sha256_code
+    assert build(spec, arch=SM90, fn=fn).cubin == absolute.cubin and fake.count == 2  # its own cache entry
+    monkeypatch.setenv("TILEFISH_DEBUG_PATHS", "relative")
+    with pytest.raises(tilefish.TilefishBuildError, match="TILEFISH_DEBUG_PATHS='relative'"):
+        build(spec, arch=SM90, fn=fn)
+    monkeypatch.delenv("TILEFISH_DEBUG_PATHS")
+    assert _source.debug_paths() == "module" and build(spec, arch=SM90, fn=fn).cubin == plain.cubin and fake.count == 2
+
+
 def test_two_exports_from_two_checkouts_and_two_cache_directories_are_the_same_files_and_digest(fake, tmp_path, monkeypatch):
     kernel = scale_kernel()
     out = []

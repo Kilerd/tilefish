@@ -175,6 +175,10 @@ machine, gives the same files, the same manifest digest and the same plan digest
 recorded pin checks a rebuild. A manifest exported by tilefish 0.0.6 or earlier names the
 directory it was built in; it loads and replays as before, and only its digest is not what
 a new export of the same graph gives. Pin what you exported, and ship that directory.
+For a profiler that wants the absolute source paths in the cubins (rather than resolving
+`kernels/rms.py` against a source directory), build with `TILEFISH_DEBUG_PATHS=absolute`.
+It is off by default and breaks reproducibility: that export's cubins, `sha256`s and digests
+name where it was built (the `sha256_code`s are the same), and its binaries are cached apart.
 
 Arguments are torch tensors, matched to the signature the way a call is
 matched in a trace: inputs and `InOut` tensors are passed (an `InOut` tensor

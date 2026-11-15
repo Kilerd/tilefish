@@ -24,6 +24,9 @@ each section names the release that added it.
   module runs from the checked text, never from a byte code cache. When the directory is switched off or cannot be written, the
   source goes to a private scratch directory of the process (one `TilefishCacheWarning`); otherwise no scratch directory is made.
 - The build cache recipe is 5: entries stored by 0.0.6 named their build directory, so they are not read, and kernels are built again once.
+- `TILEFISH_DEBUG_PATHS=absolute` keeps the absolute source paths in a cubin's debug sections, for a profiler that opens the files where
+  they are. Off by default; it breaks reproducibility (that export's bytes and digests name where it was built; its `sha256_code`s do not
+  change), and its binaries are cached under a key of their own. Any other value is refused.
 - **Hosts.** The Rust crate embeds no path of its own. A host that embeds a manifest (`emit(..., embed=True)`) is reproducible once
   the manifest is (export one made by 0.0.6 or earlier again); the paths rustc writes for panic locations are remapped with
   `--remap-path-prefix` (crate README, "Reproducible builds of a host").

@@ -25,6 +25,7 @@ Nothing in this module imports Triton.
 from __future__ import annotations
 
 import hashlib
+import os
 import tokenize
 from typing import Any
 
@@ -32,6 +33,7 @@ from .errors import TilefishBuildError
 
 _MAX_UNWRAP = 8
 _SOURCE_NAMES: "dict[str, str]" = {}  # the path of a file tilefish wrote a generated source to -> the name its debug information gives it
+DEBUG_PATHS_ENV = "TILEFISH_DEBUG_PATHS"  # "absolute": a build keeps the absolute source paths in a binary's debug information (debug_paths)
 
 
 def _attr(obj: Any, name: str) -> Any:
@@ -155,3 +157,24 @@ def module_of(fn: Any) -> "str | None":
         if fn is None:
             return None
     return None
+
+
+def debug_paths() -> str:
+    """How a build names the source files in a binary's debug information: ``"module"`` (the default: :func:`source_name`, so that builds are the
+    same bytes on every host) or ``"absolute"``, when the environment variable ``TILEFISH_DEBUG_PATHS`` is ``absolute``: the paths Triton records,
+    as they are on this host, which a profiler (Nsight Compute's source view, ``cuobjdump``, ``nvdisasm``) opens without being given a source
+    directory.
+
+    **That opt-out breaks reproducibility**: the cubin then names the checkout, the virtual environment and the cache directory, so an export
+    from another directory or machine has other bytes, another ``sha256`` and another manifest and plan digest (the machine code,
+    ``sha256_code``, is the same). A binary built with it is cached apart (the build cache key has the setting), and is never served to a build
+    without it. Any other value is refused."""
+    value = os.environ.get(DEBUG_PATHS_ENV, "")
+    if value == "":
+        return "module"
+    if value == "absolute":
+        return "absolute"
+    raise TilefishBuildError(
+        f"{DEBUG_PATHS_ENV}={value!r}: set it to 'absolute' to keep the absolute source paths in a binary's debug information (for a profiler; "
+        "exports are then not reproducible across directories and machines), or leave it unset"
+    )

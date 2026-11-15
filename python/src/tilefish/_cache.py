@@ -34,7 +34,8 @@ unless :data:`NOT_CODEGEN` names it: a missing entry in that list can only cost 
 of each codegen knob as ``triton.knobs`` reports it (a program may set a knob without the environment): ``compilation`` (``override``,
 ``use_ir_loc``, ``enable_asan``, ``disable_line_info``, ``front_end_debugging``, ``allow_non_constexpr_globals``,
 ``enable_experimental_consan``), ``language`` (``fp32_default``, ``default_fp_fusion``), ``nvidia`` (``disable_ptxas_opt``,
-``mock_ptx_version``, ``libdevice_path``), ``runtime`` (``override_arch``), and the sha256 of the file that ``libdevice_path`` names.
+``mock_ptx_version``, ``libdevice_path``), ``runtime`` (``override_arch``), and the sha256 of the file that ``libdevice_path`` names; and
+``debug_paths: absolute`` where ``TILEFISH_DEBUG_PATHS=absolute`` keeps the absolute source paths in the debug sections (``tilefish._source.debug_paths``).
 
 Files. A path in a key says which file, not what is in it, and a file can be rewritten under the same name. Every setting of Triton
 3.5.1 that names a file read while compiling was audited (the options of the NVIDIA backend, ``triton.knobs``, and the environment
@@ -253,6 +254,10 @@ def codegen_environment() -> "dict[str, Any]":
     for name in FILE_ENV:
         if os.environ.get(name):
             out.setdefault("env_files", {})[name] = _sha256_file(os.environ[name], name)
+    from ._source import debug_paths
+
+    if debug_paths() == "absolute":  # TILEFISH_DEBUG_PATHS=absolute: other bytes in the debug sections (keyed only when set: other keys are unchanged)
+        out["debug_paths"] = "absolute"
     try:
         import triton
     except ImportError:

@@ -59,7 +59,7 @@ print(json.dumps({
 """
 
 
-def export_elsewhere(root: pathlib.Path, seed: str):
+def export_elsewhere(root: pathlib.Path, seed: str, **extra_env: str):
     """Copy the graph's sources under ``root`` and export it from a child process with a working directory, caches and a TMPDIR of its own."""
     sources = root / "sources"
     (sources / "ptx").mkdir(parents=True)
@@ -75,6 +75,7 @@ def export_elsewhere(root: pathlib.Path, seed: str):
         PYTHONHASHSEED=seed,
         PYTHONPATH=os.pathsep.join([str(SRC), str(TESTS), env.get("PYTHONPATH", "")]),
     )
+    env.update(extra_env)
     r = subprocess.run([sys.executable, "-c", CHILD, str(sources), str(root / "out")], cwd=root / "cwd", env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-4000:]
     result = json.loads(r.stdout.strip().splitlines()[-1])
@@ -137,3 +138,16 @@ def test_a_jit_build_has_the_bytes_of_the_exported_binary(exports):
         for spec in target.compile_specs():
             built = runtime.build_for_device(spec, target.jit_function(spec), 0)
             assert hashlib.sha256(built.cubin).hexdigest() == first["kernels"][spec.stem]["sha256"], spec.stem
+
+
+def test_absolute_debug_paths_name_the_build_directory_with_the_same_machine_code(exports, tmp_path):
+    """``TILEFISH_DEBUG_PATHS=absolute`` (for a profiler) keeps the absolute source paths in the cubins: the files name where the sources and the
+    generated sources were, so the export is not the reproducible one, but every ``sha256_code`` is."""
+    first, _ = exports
+    absolute = export_elsewhere(tmp_path / "absolute", "3", TILEFISH_DEBUG_PATHS="absolute")
+    assert absolute["kernels"].keys() == first["kernels"].keys()
+    assert all(absolute["kernels"][s]["sha256_code"] == k["sha256_code"] for s, k in first["kernels"].items())
+    assert absolute["manifest_digest"] != first["manifest_digest"]
+    root = str(absolute["root"]).encode()
+    named = [p.name for p in (absolute["root"] / "out").iterdir() if p.suffix == ".cubin" and root in p.read_bytes()]
+    assert any(n.startswith("softmax_rows") for n in named) and any(n.startswith("scale_rows") for n in named), named

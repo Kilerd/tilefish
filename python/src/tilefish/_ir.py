@@ -45,6 +45,8 @@ file by a path that does not depend on the host (:func:`tilefish._source.source_
 ``tilefish_generated/rmsnorm.py`` for a generated kernel, ``triton/language/standard.py`` for Triton's own), not by where the checkout, the
 virtual environment or a scratch directory happens to be (:func:`host_independent_paths`). Two builds of one kernel with one toolchain are
 then the same bytes on any machine, from any directory, in any process. The digest above never had a location in it.
+``TILEFISH_DEBUG_PATHS=absolute`` keeps the absolute paths instead, for a profiler that opens the source files where they are; the
+builds are then not reproducible (:func:`tilefish._source.debug_paths`).
 """
 
 from __future__ import annotations
@@ -255,7 +257,9 @@ def recording_source(ASTSource: Any) -> Any:
         ir_text: "str | None" = None
 
         def make_ir(self, target: Any, options: Any, codegen_fns: Any, module_map: Any, context: Any) -> Any:
-            with host_independent_paths():
+            # (TILEFISH_DEBUG_PATHS=absolute keeps Triton's absolute paths, for a profiler: not reproducible, _source.debug_paths)
+            naming = contextlib.nullcontext() if _source.debug_paths() == "absolute" else host_independent_paths()
+            with naming:
                 module = super().make_ir(target, options, codegen_fns, module_map, context)
             self.ir_text = str(module.str_nodebug())  # before the passes of the first stage change the module in place
             return module
