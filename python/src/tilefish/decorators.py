@@ -1372,6 +1372,10 @@ def extern(
     runtime ``Dim`` is an ``i32``, a ``const`` is a ``constexpr`` (it needs a
     default: the compiled-in value).
 
+    **A null pointer.** A pointer the kernel does not use in the declared use (one it reads only when it is not null, or only under a constexpr
+    flag the declaration turns off) is ``bias: Null[f32]``: a call does not pass it, it binds nothing, and every launch passes the null pointer
+    (manifest kind ``null``). A Triton kernel and a prebuilt binary take one alike.
+
     **A 64-bit dimension scalar.** ``n_elem: i64[n]`` is a runtime scalar that carries the dimension ``n`` (any dimension expression) as an
     ``i64``, where ``n_elem: n`` is an ``i32``: a kernel whose element count or size parameter is 64 bits wide (a prebuilt kernel's ``long n``,
     a Triton kernel's ``i64`` scalar). Its value is derived from the shapes of the call like any dimension scalar's (it is never given by a

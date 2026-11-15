@@ -16,6 +16,8 @@ everything the manifest can describe:
   ``TensorRef`` that is a dense tensor or a view made with ``TensorRef::from_cuda_strided`` or ``TensorRef::new_strided``. The crate
   derives the stride scalars from the view and checks ``max_extent`` and the alignment of its address;
 * a device scalar (a pointer with the shape ``[]``): a ``TensorRef`` over one element, with the shape ``&[]`` or ``&[1]``;
+* a null pointer (kind ``null``): not a parameter of ``launch`` (the crate passes 0 at its slot), listed in the docs of the struct; and a 64-bit dimension
+  scalar, derived from the shapes like any scalar;
 * a ``library`` entry (a pinned cuBLASLt GEMM): a struct that wraps ``Gemm`` and whose ``launch`` takes ``a``, ``b``, ``bias`` when it has
   one, ``out`` and a ``workspace`` (a ``u8`` tensor of at least ``workspace_required()`` bytes).
 
