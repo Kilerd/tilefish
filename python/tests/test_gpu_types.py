@@ -78,14 +78,16 @@ def test_a_null_pointer_is_null(exported, null_op, bias_op, n):
 
 
 def test_a_null_pointer_in_a_plan(tmp_path):
+    nb = tilefish.Dim("nb", buckets=[1, 4099])
+
     @tilefish.graph
-    def chain(x: Tensor[k.n, tilefish.f32], b: Tensor[k.n, tilefish.f32]):
+    def chain(x: Tensor[nb, tilefish.f32], b: Tensor[nb, tilefish.f32]):
         return k.scale_bias_ptx(k.scale_null(x), b)
 
     n = 4099
     x, b = randn((n,), F32, seed=3), randn((n,), F32, seed=4)
     want = x * 4.0 + b
-    plan = runtime.export(chain, tmp_path, buckets={"n": [n]})
+    plan = runtime.export(chain, tmp_path)
     for mode, extra in (("replay", {"plan": tmp_path, "pin": plan.digest}), ("jit", {})):
         assert same_bytes(tilefish.run(chain, x, b, mode=mode, **extra), want), mode
 
