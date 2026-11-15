@@ -1,10 +1,11 @@
 //! What the C boundary costs a launch, on a real GPU (built only with `--features gpu-gate`): the same kernel of the committed fixture
-//! (`gelu_erf`, for the device's architecture) launched through the crate's `Kernel::launch_raw` and through `tilefish_kernel_launch`, and a plan
-//! of the committed goldens run through `PlanRun::launch` and `tilefish_plan_run_launch`, in the same process; the host time per call of each is
+//! (`gelu_erf`, for the device's architecture) launched through the crate's `Kernel::launch_raw` and through `tilefish_kernel_launch`, and (with
+//! `TILEFISH_GATE_DIR`, the directory `rust_gate.py prepare` filled) its plan `block` run through `PlanRun::launch` and `tilefish_plan_run_launch`,
+//! in the same process; the host time per call of each is
 //! reported, and the C ABI's must stay within a few microseconds of the crate's.
 //!
 //! ```text
-//! cargo test -p tilefish-capi --features gpu-gate --test gpu_overhead -- --nocapture
+//! TILEFISH_GATE_DIR=$WORK cargo test -p tilefish-capi --features gpu-gate --test gpu_overhead -- --nocapture
 //! ```
 
 use std::ffi::CString;
@@ -109,24 +110,38 @@ fn the_c_boundary_costs_a_launch_little() {
     });
     stream.synchronize().unwrap();
 
-    // a plan: the golden `steps` (6 KiB of arena, every kind of step), through the crate and through the C ABI
-    let golden = repo().join("python/tests/golden/plans");
-    let plan_pin = pin_of(&golden.join("expected.json"), &["given", "plan_digest"]);
-    let plan = LaunchPlan::load(golden.join("given"), Pin::Digest(&plan_pin)).unwrap();
-    let plan_report = if plan.arch() == arch.to_string() {
+    // a plan: the `block` of the gate (`rust_gate.py prepare`, TILEFISH_GATE_DIR: nine steps, a GEMM among them), through the crate and through
+    // the C ABI, on the tensors of its first case
+    let plan_report = std::env::var_os("TILEFISH_GATE_DIR").map(PathBuf::from).map(|gate| {
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(gate.join("plans.json")).unwrap()).unwrap();
+        let entry =
+            doc["plans"].as_array().unwrap().iter().find(|p| p["name"] == "block").expect("the gate's plan 'block'");
+        let (dir, plan_pin) = (gate.join(entry["dir"].as_str().unwrap()), entry["digest"].as_str().unwrap().to_owned());
+        let case = &entry["cases"][0];
+        let plan = LaunchPlan::load(&dir, Pin::Digest(&plan_pin)).unwrap();
         let run = plan.instantiate_all(&stream).unwrap();
-        let externals: Vec<(String, DType, Vec<usize>, u64)> = plan
-            .buffers()
+        // (name, dtype, shape, bytes, written)
+        let externals: Vec<(String, DType, Vec<usize>, u64, bool)> = case["externals"]
+            .as_array()
+            .unwrap()
             .iter()
-            .filter(|b| b.role.is_external())
-            .map(|b| {
-                let shape: Vec<usize> = b.shape.iter().map(|d| d.to_string().parse().unwrap_or(64)).collect();
-                (b.name.clone(), b.dtype, shape, b.bytes)
+            .map(|t| {
+                let dtype = DType::from_name(t["dtype"].as_str().unwrap()).unwrap();
+                let shape: Vec<usize> =
+                    t["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap() as usize).collect();
+                let bytes = (shape.iter().product::<usize>() * dtype.size()) as u64;
+                let written = matches!(t["role"].as_str().unwrap(), "output" | "inout");
+                (t["name"].as_str().unwrap().to_owned(), dtype, shape, bytes, written)
             })
             .collect();
+        let values: Vec<(String, i64)> =
+            case["devscalars"].as_object().unwrap().iter().map(|(n, v)| (n.clone(), v.as_i64().unwrap())).collect();
         let memory: Vec<_> = externals.iter().map(|e| stream.alloc_zeros::<u8>(e.3 as usize).unwrap()).collect();
         let addrs: Vec<u64> = memory.iter().map(|s| s.device_ptr(&stream).0).collect();
         stream.synchronize().unwrap();
+        let rust_values: Vec<(&str, DevScalar)> =
+            values.iter().map(|(n, v)| (n.as_str(), DevScalar::Int(*v))).collect();
         let rust_plan = per_call(500, || {
             let mut args: Vec<(&str, TensorArg<'_>)> = externals
                 .iter()
@@ -134,14 +149,14 @@ fn the_c_boundary_costs_a_launch_little() {
                 .map(|(e, a)| {
                     // SAFETY: as above.
                     let r = unsafe { DevicePtr::from_raw(*a, e.3, 0) };
-                    let access = if e.0.starts_with("out") { tilefish::Access::InOut } else { tilefish::Access::In };
+                    let access = if e.4 { tilefish::Access::InOut } else { tilefish::Access::In };
                     (e.0.as_str(), TensorArg::new(r, &e.2, e.1, access).unwrap())
                 })
                 .collect();
-            run.launch(&stream, &mut args, &[] as &[(&str, DevScalar)]).unwrap();
+            run.launch(&stream, &mut args, &rust_values).unwrap();
         });
         stream.synchronize().unwrap();
-        let cplan = CString::new(golden.join("given").to_str().unwrap()).unwrap();
+        let cplan = CString::new(dir.to_str().unwrap()).unwrap();
         let cplan_pin = CString::new(plan_pin.clone()).unwrap();
         let (mut p, mut r) = (null_mut(), null_mut());
         unsafe {
@@ -163,9 +178,11 @@ fn the_c_boundary_costs_a_launch_little() {
                         DType::F32 => TILEFISH_DTYPE_F32,
                         DType::Bf16 => TILEFISH_DTYPE_BF16,
                         DType::F16 => TILEFISH_DTYPE_F16,
+                        DType::I64 => TILEFISH_DTYPE_I64,
+                        DType::U8 => TILEFISH_DTYPE_U8,
                         _ => TILEFISH_DTYPE_I32,
                     },
-                    access: if e.0.starts_with("out") { TILEFISH_ACCESS_INOUT } else { TILEFISH_ACCESS_IN },
+                    access: if e.4 { TILEFISH_ACCESS_INOUT } else { TILEFISH_ACCESS_IN },
                     rank: shapes[i].len() as u32,
                     shape: shapes[i].as_ptr(),
                     strides: std::ptr::null(),
@@ -173,9 +190,28 @@ fn the_c_boundary_costs_a_launch_little() {
                 },
             })
             .collect();
+        let value_names: Vec<CString> = values.iter().map(|(n, _)| CString::new(n.clone()).unwrap()).collect();
+        let c_values: Vec<tilefish_devscalar> = values
+            .iter()
+            .zip(&value_names)
+            .map(|((_, v), n)| tilefish_devscalar {
+                name: n.as_ptr(),
+                kind: TILEFISH_DEVSCALAR_INT,
+                f32_value: 0.0,
+                int_value: *v,
+                bits: 0,
+            })
+            .collect();
         let capi_plan = per_call(500, || {
             let status = unsafe {
-                tilefish_plan_run_launch(r, raw_stream.cast(), named.as_ptr(), named.len(), std::ptr::null(), 0)
+                tilefish_plan_run_launch(
+                    r,
+                    raw_stream.cast(),
+                    named.as_ptr(),
+                    named.len(),
+                    c_values.as_ptr(),
+                    c_values.len(),
+                )
             };
             assert_eq!(status, TILEFISH_OK);
         });
@@ -184,10 +220,8 @@ fn the_c_boundary_costs_a_launch_little() {
             tilefish_plan_run_destroy(r);
             tilefish_plan_destroy(p);
         }
-        Some((rust_plan, capi_plan))
-    } else {
-        None
-    };
+        (rust_plan, capi_plan)
+    });
     unsafe {
         tilefish_kernel_destroy(k);
         tilefish_context_destroy(c);
