@@ -519,7 +519,7 @@ SEQUENTIAL = ReductionOrder(1, 1, ())
 def _order(op: str, order: Any) -> "ReductionOrder | None":
     if order is None or isinstance(order, ReductionOrder):
         return order
-    if order == "sequential":
+    if isinstance(order, str) and order == "sequential":
         return SEQUENTIAL
     raise TilefishTypeError(f"{op}: order must be None (Triton's), 'sequential' or tilefish.tree(...), got {order!r}")
 
