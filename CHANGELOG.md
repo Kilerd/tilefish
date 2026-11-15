@@ -4,6 +4,61 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### Plan fusion: arithmetic in a graph body (`docs/rfcs/0001-plan-fusion.md`, phase 1)
+
+- **A graph body may compute.** Arithmetic traced in a `@tilefish.graph` body (casts, `+ - * /`, comparisons and `where`, math functions,
+  `iota` and `load`, reductions) is planned instead of refused: the planner groups it into regions, each a `@tilefish.kernel` that tilefish
+  generates (`fused_<hash>`, named by its content, so the same region in two graphs or two plans of a set is one manifest entry) and one kernel
+  step of the plan. Plan schema 1, manifest schema 3 and both hosts are unchanged; a graph without arithmetic plans exactly as before.
+- **Exact.** A fused plan writes the bytes of its unfused composition (each op a kernel of its own, every intermediate stored in its dtype, a
+  mask as `u8`): region kernels contract nothing and are lowered with `context_free=True` (note 20 of `tilefish.lower`): every float `+ - *` one
+  scalar `.rn` instruction of inline PTX, every narrowing float cast inline PTX, a negation's NaN canonical. A reduction is a kernel of its own
+  (version 1). A view that is not dense (a column block, a head, a transpose) is read where it is by a region of the elementwise template (a
+  `Strided[...]` parameter of its kernel, a stride per axis) and copied by `tilefish.contiguous` first for one of the row template; an op whose
+  value nothing reads is not computed.
+- **`tilefish.fusion(version=1, grouping="auto" | "none", math="fast" | "ieee", intermediates="declared" | "opmath", fp_contract="none" |
+  "mul-add", verify=True)`**, given as `@tilefish.graph(fusion=...)`: every choice exact; `"opmath"` (torch's eager rule for a 16-bit op with a
+  python scalar) and `"mul-add"` (an f32 product that nothing else reads, contracted into `tilefish.fma`) are rewrites of the IR made before
+  the regions are formed. `tilefish.barrier(x)` makes `x` a region boundary with a buffer of the plan (a tap reads it).
+- **Verified at export.** `export` (and `export([...])` of a plan set) runs every region of more than one op against its ops one by one on the
+  device at every bucket, on seeded inputs with special values, and raises `TilefishFusionError` before writing anything at a difference;
+  `export(..., verify=False)` opts out, and a device of another architecture skips the check with a `TilefishFusionWarning`. It writes
+  `<graph>.fusion.json`, the fusion report (the ops each region took, what it reads and writes, the roundings it keeps, the rewrites of the mode).
+  `tilefish.fusion_report(graph)` and `tilefish.verify_fusion(graph)` give them on demand. `reference` mode of a graph interprets its arithmetic.
+- **Found on the way** (sm_103, ptxas 12.9; `tests/test_gpu_fusion.py`): ptxas contracts a packed `mul.rn.f32x2` and `add.rn.f32x2`, which LLVM
+  makes of two lanes' f32 ops, into `FFMA2` even with `--fmad=false`, so `@tilefish.kernel(fp_fusion=False)` does not guarantee two roundings
+  on sm_100 and later where the ops are packed; and `neg.f32` folded into a select flips a NaN's sign where alone it gives the canonical NaN.
+  Fused regions avoid both (and so does every kernel now: "Fixed" below).
+
+### Fixed
+
+- **`fp_fusion=False` could still contract packed mul+add into FFMA2 on sm_100+.** On sm_100 and later LLVM packs two lanes' f32 operations
+  into `mul.rn.f32x2` / `add.rn.f32x2`, and ptxas 12.9 contracts such a pair whatever `--fmad` says (into `FFMA2` on sm_100 and sm_103, into
+  `FFMA` on sm_120), so `@tilefish.kernel(fp_fusion=False)` did not always round twice where its contract (note 2 of `tilefish.lower`) says it
+  does. A kernel with `fp_fusion=False` now has the code of a fused region: every float `+ - *` (f32, bf16, f16), and the multiplies of `silu`
+  and `gelu`, is one scalar `.rn` instruction of inline PTX, and every narrowing float cast is inline `cvt.rn`. Its outputs are the old ones
+  wherever the old binary kept two roundings; its source and declaration digest change (and its `sha256_code` where Triton's code was
+  packed or folded), so a manifest exported before is refused by a replay of the new declaration (export again). A product that an ordered sum without `fma` adds (note 17) is `mul.rn` in
+  every kernel.
+- **neg inside a select flipped the NaN sign.** `-x` (`tilefish.neg`) gives the canonical NaN (`0x7FFFFFFF`, `0x7FFF`) for every NaN in every
+  context now: the canonicalisation is written out (`testp.notanumber` / `setp.nan` and `selp` around `neg`), because ptxas folds a lone
+  `neg.f32` into a select as a negated operand, which flips the NaN's sign. Every kernel with a float negation gets another binary.
+- **A narrowing cast of a widened value kept an input NaN's payload.** `x.to(f32).to(bf16)` (and through a `where`) is inline `cvt.rn` in every
+  kernel, out of the reach of the MLIR and LLVM folds that turned it into `x`; it gives the canonical NaN, as the cast does alone (note 1).
+
+### New
+
+- **The extern SASS contraction check** (`tilefish._fpcontract`, `docs/numerics.md` section 4). Every binary built with
+  `enable_fp_fusion=False` (a hand-written Triton or Gluon extern that declares it, a lowered kernel with `fp_fusion=False`, a fused region, a
+  generated op) is disassembled at build, cache hits included, and compared with its PTX assembled again with every float multiply taken out; one
+  with more fused multiply-add lanes (`FFMA`, `FFMA2`, `HFMA2`) is refused with a `TilefishBuildError` that names the kernel, shows the
+  instructions and gives the fix (scalar `.rn` inline PTX, or `enable_fp_fusion=True`). `nvdisasm` is `$TILEFISH_NVDISASM_PATH`, Triton's, the
+  one next to its `ptxas`, an `nvidia-cuda-nvdisasm` wheel's or the `PATH`'s; where none decodes the architecture (Triton 3.5.1's CUDA 12.8
+  `nvdisasm` and sm_103) the PTX is assembled for the base of its family (`sm_100a`) and read. An extern that ptxas contracted is refused where
+  it used to build.
+
 ## tilefish 0.0.7, crate 0.0.5 (2026-11-15)
 
 ### Breaking changes

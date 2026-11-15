@@ -988,6 +988,7 @@ def export(
     overwrite: bool = False,
     buckets: Any = None,
     reuse: bool = False,
+    verify: "bool | None" = None,
 ) -> Any:
     """Build every binary of one or several kernels and externs and write them as a manifest directory.
 
@@ -1007,7 +1008,10 @@ def export(
     A graph exports its launch plan (``plan.json`` next to the manifest; returns the :class:`~tilefish._plan.Plan`); **several graphs** (or
     ``(graph, buckets)`` pairs) export a *plan set*: one manifest for all of them, each binary built once whichever plans launch it,
     ``<graph>.plan.json`` per graph and ``plans.json``, the index whose digest pins every plan (returns the :class:`~tilefish._plan.PlanSet`; a replay
-    takes ``plan=directory`` and ``pin=`` the plan's digest or the set's).
+    takes ``plan=directory`` and ``pin=`` the plan's digest or the set's). A graph whose body has arithmetic (fused regions, :mod:`tilefish._fusion`)
+    has every region of more than one op run against its ops one by one on this device, at every bucket, before anything is written, and a
+    difference refuses the export; ``verify=False`` skips that (``None``: the graph's ``tilefish.fusion(verify=...)``, ``True`` by default). Such a
+    graph also gets ``<graph>.fusion.json``, its fusion report.
 
     A library op with an ``impl`` (a cuBLASLt GEMM) is pinned for the device (``arch`` must be its architecture) and gets an entry in the manifest's
     ``library`` section; a prebuilt PTX is assembled by ``ptxas`` and a cubin is taken as it is (:mod:`tilefish._binary`).
@@ -1030,11 +1034,13 @@ def export(
         if len(items) > 1:  # a plan set: one manifest for every plan (docs/plan-schema-1.md, section 15)
             from ._planrun import export_graphs
 
-            return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse)
+            return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify)
         from ._planrun import export_graph
 
         graph, own = items[0] if isinstance(items[0], tuple) else (items[0], buckets)
-        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse)
+        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse, verify=verify)
+    if verify is not None:
+        raise TilefishRuntimeError("verify= is for exporting a graph (it checks the graph's fused regions); kernels and externs have none")
     if buckets is not None or reuse:
         raise TilefishRuntimeError("buckets= and reuse= are for exporting a graph (they shape its launch plan); kernels and externs are built for the buckets of their own dimensions")
     if arch is None:

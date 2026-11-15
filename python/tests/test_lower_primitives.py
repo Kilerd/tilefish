@@ -78,7 +78,12 @@ def test_the_generated_source_says_each_instruction():
     assert '"setp.ltu.f32 p0, t0, 0f3F8060FE; "' in src["erf_ieee"] and '"copysign.f32 t7, $1, t7; "' in src["erf_ieee"]
     assert '"sin.approx.f32 $0, $1;"' in src["sin_approx"]
     assert '"rcp.rn.f32 $0, $1;"' in src["rcp"]
-    assert '"neg.f32 $0, $1;"' in src["neg_f32"] and '"neg.bf16 $0, $1;"' in src["neg_bf16"] and '"neg.f16 $0, $1;"' in src["neg_f16"]
+    # CUDA's neg, and the canonical NaN for a NaN written out (a neg that ptxas folds into a select as a negated operand flips a NaN's sign)
+    assert '"testp.notanumber.f32 p, $1; "' in src["neg_f32"] and '"neg.f32 t, $1; "' in src["neg_f32"]
+    assert '"selp.f32 $0, 0f7FFFFFFF, t, p; "' in src["neg_f32"] and "v1 = _tf_negc_f32(v0)" in src["neg_f32"]
+    for dt in ("bf16", "f16"):
+        assert f'"setp.nan.{dt} p, $1, $1; "' in src[f"neg_{dt}"] and f'"neg.{dt} t, $1; "' in src[f"neg_{dt}"]
+        assert '"selp.b16 $0, 0x7FFF, t, p; "' in src[f"neg_{dt}"]
     assert "dtype=tl.bfloat16" in src["neg_bf16"] and '"=h,h"' in src["neg_bf16"]
     assert '"fma.rn.f32 $0, $1, $2, $3;"' in src["fma3"] and "v3 = _tf_fma(v0, v1, v2)" in src["fma3"]
     scalar = pc.fma_scalar.lower().source

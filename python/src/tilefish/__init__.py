@@ -84,7 +84,8 @@ from .ir import BucketRequirement, Graph, Node, Requirement, Scalar
 from .lower import LoweredKernel, lower
 from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in __all__, `from tilefish import *` must not shadow the module copy
 from .ops import argmax, argmin, cos, div, erf, exp, fma, gather_rows, gelu, iota, load, neg, rcp, rsqrt, scatter_rows, silu, sin, sin_approx
-from .ops import sqrt, tanh, tree, where, zeros_like
+from .ops import barrier, sqrt, tanh, tree, where, zeros_like
+from ._fusion import Fusion, TilefishFusionError, TilefishFusionWarning, fusion
 from ._copyops import col2im1d, contiguous, im2col, im2col1d
 from .ops import reduce_mean as mean
 from .runtime import capture, run
@@ -93,6 +94,25 @@ from .trace import Const, Value
 from .types import DevScalar, InOut, MayAlias, Null, Out, StrideOf, Strided, Tensor, TensorDesc, TensorType, const
 
 __version__ = "0.0.7"
+
+
+def fusion_report(graph: GraphOp) -> dict:
+    """The fusion report of a ``@tilefish.graph`` (what ``export`` writes as ``<graph>.fusion.json``): every fused region, the ops of the body it
+    took, what it reads and writes, every rounding it keeps and the rewrites of the graph's ``tilefish.fusion`` mode (``docs/rfcs/0001-plan-fusion.md``)."""
+    from ._fusion import report
+
+    return report(graph)
+
+
+def verify_fusion(graph: GraphOp, buckets: "dict | None" = None) -> dict:
+    """Run every fused region of ``graph`` of more than one op against its ops one by one, ``jit`` on torch's current CUDA device, on seeded
+    inputs with special values, at every bucket combination of its plan (``buckets=`` as for :func:`tilefish.plan`), and compare the bytes; raises
+    :class:`TilefishFusionError` at a difference. Returns the fusion report with what was checked (what ``export`` does by default)."""
+    from ._fusion import report, verify
+    from ._plan import bucket_combinations, plan as make_plan
+
+    combos = bucket_combinations(make_plan(graph, buckets).dims)
+    return report(graph, verify(graph, combos))
 
 # Reductions with numpy semantics. They share a name with a builtin, so they are not in
 # __all__ (`from tilefish import *` must not shadow the builtins); use tilefish.sum etc.
@@ -114,6 +134,7 @@ __all__ = [
     "Dim",
     "DimExpr",
     "ExternOp",
+    "Fusion",
     "Graph",
     "Implementation",
     "GraphOp",
@@ -151,10 +172,13 @@ __all__ = [
     "TilefishRuntimeError",
     "TilefishSpecError",
     "TilefishTypeError",
+    "TilefishFusionError",
+    "TilefishFusionWarning",
     "Value",
     "aot",
     "argmax",
     "argmin",
+    "barrier",
     "bf16",
     "bool_",
     "capture",
@@ -174,6 +198,8 @@ __all__ = [
     "f16",
     "f32",
     "fma",
+    "fusion",
+    "fusion_report",
     "gather_rows",
     "gelu",
     "graph",
@@ -203,6 +229,7 @@ __all__ = [
     "tree",
     "u8",
     "ue8m0",
+    "verify_fusion",
     "where",
     "zeros_like",
 ]

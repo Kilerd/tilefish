@@ -8,7 +8,9 @@ Written from scratch for these tests, and public; declared with ``tilefish.exter
   warp, and each thread holds four contiguous columns of every 128 (``BlockedLayout([1, 4], [1, 32], [4, 1], [1, 0])``), so the sum is each
   thread's own elements in order and then the warp's butterfly, the order the layout fixes and no compiler choice changes. ``C`` is a ``const``
   from the bucketed ``Cb`` (128 or 256: one binary per bucket) and ``SCALE`` a typed ``const[f32]``. ``row_dot`` is declared with
-  ``enable_fp_fusion=False`` (each product rounded, then added) and ``row_dot_fma`` with ``True`` (one FMA per element).
+  ``enable_fp_fusion=False`` (each product rounded, then added) and ``row_dot_fma`` with ``True`` (one FMA per element allowed). ``row_dot``'s
+  kernel, ``row_dot_rn_kernel``, writes its product as a scalar ``mul.rn.f32`` of inline PTX, which nothing contracts: with the plain ``*`` the
+  option alone does not keep it on sm_120, where ptxas 12.9 fuses the product with the sum's adds (and the contraction check refuses it).
 * ``halves_dot`` is a graph: a lowered kernel doubles ``x`` into the arena and ``row_dot`` reads its two halves, two views of one buffer, in one
   step of the plan.
 * ``row_sum_kernel`` is the same reduction of one view with another layout (eight columns per thread: ``[1, 8]``); ``row_sum4`` and ``row_sum8``
@@ -39,14 +41,32 @@ def row_dot_kernel(a, b, y, s_row, n_rows, C: gl.constexpr, SCALE: gl.constexpr)
     gl.store(y + rows, total * SCALE, mask=rows < n_rows)
 
 
+@gluon.jit
+def _mul_rn(x, z):
+    """``x * z`` as one ``mul.rn.f32``: what ``enable_fp_fusion=False`` promises, kept on sm_120 too, where ptxas 12.9 fuses a plain product
+    with the sum's adds (the contraction check refuses that binary)."""
+    return gl.inline_asm_elementwise("mul.rn.f32 $0, $1, $2;", "=f,f,f", [x, z], dtype=gl.float32, is_pure=True, pack=1)
+
+
+@gluon.jit
+def row_dot_rn_kernel(a, b, y, s_row, n_rows, C: gl.constexpr, SCALE: gl.constexpr):
+    layout: gl.constexpr = gl.BlockedLayout(size_per_thread=[1, 4], threads_per_warp=[1, 32], warps_per_cta=[4, 1], order=[1, 0])
+    rows = gl.program_id(0) * 4 + gl.arange(0, 4, layout=gl.SliceLayout(1, layout))
+    cols = gl.arange(0, C, layout=gl.SliceLayout(0, layout))
+    at = rows.to(gl.int64)[:, None] * s_row + cols[None, :]  # an i32 stride, 64-bit offsets
+    keep = rows[:, None] < n_rows
+    total = gl.sum(_mul_rn(gl.load(a + at, mask=keep, other=0.0), gl.load(b + at, mask=keep, other=0.0)), axis=1)
+    gl.store(y + rows, total * SCALE, mask=rows < n_rows)
+
+
 def row_dot_reference(a, b):
     """``0.5 * sum(a * b)`` per row, in float64: what the kernel computes, up to the rounding of its order."""
     return ((a.double() * b.double()).sum(-1) * 0.5).float()
 
 
-def _declare(name, fusion):
+def _declare(name, fusion, kernel):
     @tilefish.extern(
-        gluon=row_dot_kernel,
+        gluon=kernel,
         num_warps=4,
         grid=lambda R: (tilefish.cdiv(R, 4),),
         index_bits=64,
@@ -67,8 +87,8 @@ def _declare(name, fusion):
     return row_dot
 
 
-row_dot = _declare("row_dot", False)
-row_dot_fma = _declare("row_dot_fma", True)
+row_dot = _declare("row_dot", False, row_dot_rn_kernel)
+row_dot_fma = _declare("row_dot_fma", True, row_dot_kernel)
 
 
 @tilefish.kernel

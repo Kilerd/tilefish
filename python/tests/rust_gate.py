@@ -80,7 +80,9 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   inputs on the device; ``compare`` holds those to Python's bytes too. The plans ``strided_store`` (views that are not dense stored into ``InOut``
   parameters) and ``memset_steps`` (memset steps of an output and of an ``InOut`` tensor) are cases like the others; the plans of
   ``gpu_kernels_plans.CARRIED_SET`` are a plan set whose plans hand **carried buffers** to each other on one shared arena (:func:`prepare_carried`),
-  called in the order of :data:`CARRIED_CALLS` on one ``SharedArena`` by ``gpu_plan_gate.rs`` (launched, and captured and replayed).
+  called in the order of :data:`CARRIED_CALLS` on one ``SharedArena`` by ``gpu_plan_gate.rs`` (launched, and captured and replayed). The plans
+  ``fused_*`` are the graphs of ``fusion_graphs.CASES``, whose bodies compute: their arithmetic is fused regions (``docs/rfcs/0001-plan-fusion.md``),
+  kernel steps of generated kernels that the Rust host launches like any other (each export verifies its regions against their ops one by one).
 
 ``WORK/cases.json`` is what ``crates/tilefish/tests/gpu_gate.rs`` reads::
 
@@ -1361,6 +1363,39 @@ def plan_graphs():
     def memset_cases():  # the caller's InOut tensor is zeroed by a memset before it is updated (its input bytes are not zero)
         return [(f"Rs{rs}-seed{seed}", {"x": randn((rs, 64), F32, seed=140 + rs + seed), "state": randn((rs, 64), F32, seed=141 + rs + seed)}) for rs in (8, 24) for seed in (0, 1)]
 
+    import fusion_graphs as fg  # graphs whose bodies compute: their arithmetic is fused regions, kernel steps of generated kernels
+
+    def fused_cases(graph):
+        from tilefish._launch import eval_dim
+
+        dtypes = {"f32": F32, "bf16": BF16, "f16": F16}
+
+        def make():
+            out = []
+            for combo in tilefish._plan.bucket_combinations(tilefish.plan(graph).dims):
+                dims = {d: combo[d.name] for p in graph.signature.tensor_inputs for s in p.type.shape for d in s.free_dims() if d.name in combo}
+                for seed in (0, 1):
+                    args = {}
+                    for k, p in enumerate(graph.signature.tensor_inputs):
+                        if p.is_devscalar:
+                            args[p.name] = torch.tensor([5 + 300 * seed], dtype=I32, device="cuda")
+                            continue
+                        shape = tuple(eval_dim(s, dims) for s in p.type.shape)
+                        # a parameter of a static shape is a weight, which a host binds once: the same tensor in every case
+                        s = 170 + k + (seed * 10 if p.type.free_dims() else 0)
+                        name = p.type.dtype.name
+                        if name == "u8":
+                            gen = torch.Generator(device="cuda").manual_seed(s)
+                            args[p.name] = torch.randint(0, 256, shape, generator=gen, device="cuda", dtype=torch.int32).to(torch.uint8)
+                        else:
+                            args[p.name] = randn(shape, dtypes[name], seed=s, scale=4.0)
+                    out.append(("-".join(f"{n}{v}" for n, v in combo.items()) + f"-seed{seed}", args))
+            return out
+
+        return make
+
+    fused = [(f"fused_{name}", fg.CASES[name][0], False, fused_cases(fg.CASES[name][0])) for name in sorted(fg.CASES)]
+
     import conv_kernels as ck
 
     def conv_chain_cases():
@@ -1392,7 +1427,7 @@ def plan_graphs():
         ("product_strides-reuse", p7.attention_mask, True, attention_mask_cases),
         ("strided_store", kp.strided_store, False, strided_store_cases),  # views that are not dense stored into InOut parameters (tilefish.contiguous)
         ("memset_steps", kp.memset_steps, False, memset_cases),  # memset steps: the returned value's buffer and the caller's InOut tensor zeroed
-    ] + tma
+    ] + fused + tma
 
 
 TAPPED = ("block-reuse",)  # the plans whose cases also record debug taps (intermediates whose bytes later steps reuse)

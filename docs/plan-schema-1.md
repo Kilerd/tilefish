@@ -511,8 +511,10 @@ parameter a copy step or a launch of `tilefish.contiguous`, and `@tilefish.graph
 
 A graph body that a plan cannot make is refused by `tilefish.plan` with the rule that says so (`TilefishPlanError`):
 
-* **arithmetic traced in the graph body** (`x + y`, a cast, a reduction, a load): a plan launches declared operators; put it in a `@tilefish.kernel`. Views (`reshape`, `permute`, `select`, `split`,
-  `x[i]`) are fine. There is no fusion in this version: the steps are the calls the graph makes.
+* a **scatter** into an `InOut` parameter in the graph body, and a value read by `tilefish.load` that is returned, stored or passed to a call. (Other
+  **arithmetic traced in the graph body**, `x + y`, a cast, a comparison, a reduction, is planned: the writer groups it into fused regions, each a step of
+  kind `kernel` that launches a kernel tilefish generates, named `fused_<hash>` by its content, byte for byte the composition of one kernel per op;
+  `docs/rfcs/0001-plan-fusion.md`. The document has nothing new: a reader sees kernel steps of manifest entries, as for any `@tilefish.kernel`.)
 * an **`Out`** parameter of the graph (and so a `store` into one) and a runtime **`Dim`** parameter: a graph's results are its returned values (a `store` into an `InOut`
   parameter is a copy step, or a launch of `tilefish.contiguous` for a view that is not dense, section 7.5);
 * a call to **another graph** (it is not inlined yet).

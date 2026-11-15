@@ -73,7 +73,8 @@ def test_the_manifest_records_the_gluon_ir_of_each_binary(exported):
             entry = manifest.get(spec.stem, ARCH).entry
             assert entry["kind"] == "triton" and entry["source_digest_kind"] == "tilefish.gluon-ir.v1"
             inputs = spec.ast_source_inputs()
-            text = _ir.ttir_text(gk.row_dot_kernel, inputs, arch=CAP[0] * 10 + CAP[1], options=inputs.options)
+            kernel = gk.row_dot_rn_kernel if op is gk.row_dot else gk.row_dot_kernel
+            text = _ir.ttir_text(kernel, inputs, arch=CAP[0] * 10 + CAP[1], options=inputs.options)
             assert entry["source_digest"] == _ir.ir_digest(text, "gluon")
             assert '"ttg.num-warps" = 4' in text and "#ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [1, 32], warpsPerCTA = [4, 1]" in text
             (s_row,) = [p for p in entry["abi"]["params"] if p["name"] == "s_row"]

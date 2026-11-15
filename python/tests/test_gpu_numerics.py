@@ -520,11 +520,12 @@ def test_fp_fusion_false_is_a_different_spec_and_a_different_binary():
     (spec_on,), (spec_off,) = on.specs(), off.specs()
     assert spec_off.enable_fp_fusion is False and spec_off.ast_source_inputs().options["enable_fp_fusion"] is False
     assert spec_on.declaration_digest != spec_off.declaration_digest  # part of the digest of the declaration
-    assert on.source == off.source.replace("# fp_fusion: False (no FMA contraction: a * b + c rounds twice)\n", "")  # same code
+    assert "_tf_mul_rn_f32" in off.source and "_tf_mul_rn_f32" not in on.source  # every float + - * one scalar .rn instruction (note 2)
     b_on, b_off = built(on), built(off)
     assert b_on.options["enable_fp_fusion"] is True and b_off.options["enable_fp_fusion"] is False
     assert b_on.sha256_code != b_off.sha256_code
     assert instructions(b_on.ptx)["fma.rn.f32"] > 0 and instructions(b_off.ptx)["fma.rn.f32"] == 0
+    assert not any(k.endswith("f32x2") for k in instructions(b_off.ptx))  # nothing packed, so nothing ptxas could contract
 
 
 @tilefish.kernel(fp_fusion=False)
@@ -594,9 +595,11 @@ def golden_cases(rmsnorm, seed):
 
 
 def test_fma_contraction_of_the_goldens(rmsnorm):
-    """Build every golden with ``enable_fp_fusion`` True (what ``compile_specs`` asks for) and False, and compare.
+    """Build every golden as ``compile_specs`` asks for (contraction allowed) and lowered with ``fp_fusion=False``, and compare.
 
-    Measured on sm_103 (Triton 3.5.1), seeds 0 to 2; the numbers are printed (run with ``-s``):
+    ``fp_fusion=False`` is the lowering's (note 2: every float ``+ - *`` one scalar ``.rn`` instruction), not Triton's option alone: on sm_120
+    the option alone leaves the README rmsnorm's sum of squares contracted (ptxas fuses the split ``add.rn.f32x2`` with the product), which
+    the contraction check refuses. Measured on sm_103 (Triton 3.5.1), seeds 0 to 2; the numbers are printed (run with ``-s``):
 
     =====================  ===================  ==========================================  =====================
     golden                 FMA instructions     elements that differ, contraction on / off  machine code
@@ -604,18 +607,19 @@ def test_fma_contraction_of_the_goldens(rmsnorm):
     softmax                0 / 0                0 of 257000                                 identical
     layernorm              15 / 0               3 to 8 of 197376 (one bf16 ULP)             differs
     residual_add_rmsnorm   4 / 0 (``f32x2``)    1 to 2 of 657920; the InOut f32: 0          differs
-    gelu_exact             56 / 56 (erf's own)  0 of 1048576                                identical
+    gelu_exact             56 / 56 (erf's own)  0 of 1048576                                differs
     swiglu                 0 / 0                0 of 789504                                 differs
     =====================  ===================  ==========================================  =====================
 
-    (swiglu's instructions differ without an FMA: ``-fmad false`` also keeps ptxas from fusing other pairs; its
-    results stay the same.) The assertions are structural: switching contraction off never adds an FMA, and both
-    builds stay within the tolerance of the reference. ``compile_specs`` still asks for the default (contraction
-    on); this test only reports what switching it off would change.
+    (gelu's and swiglu's machine code differs without an FMA: the strict kernels' casts and ``.rn`` operations are scalar instructions where
+    Triton's are packed; their results are the same.) The assertions are structural: switching contraction off never adds an FMA, and both builds stay
+    within the tolerance of the reference. ``compile_specs`` still asks for the default (contraction on); this test only reports what
+    switching it off changes.
     """
     for seed in (0, 1, 2):
         for name, kernel, args in golden_cases(rmsnorm, seed):
-            on, off = built(kernel), built(kernel, enable_fp_fusion=False)
+            strict = tilefish.lower(kernel, fp_fusion=False)
+            on, off = built(kernel), built(strict)
 
             def count(b):
                 return sum(v for k, v in instructions(b.ptx).items() if k.startswith("fma."))
@@ -625,7 +629,7 @@ def test_fma_contraction_of_the_goldens(rmsnorm):
                 return elf.data(elf.section(f".text.{b.symbol}"))
 
             out_on = replay_all(kernel, args, {})
-            out_off = replay_all(kernel, args, {"enable_fp_fusion": False})
+            out_off = replay_all(kernel, args, {}, strict)
             out_ref = replay_all(kernel, args, None)
             report = []
             for label, a, b in zip(["out", *[f"inout{i}" for i in range(len(out_on) - 1)]], out_on, out_off):
@@ -640,14 +644,15 @@ def test_fma_contraction_of_the_goldens(rmsnorm):
                     assert (absolute <= 3e-5) if name == "gelu_exact" else (ulp <= (64 if built_output.dtype == F32 else 2)), name
 
 
-def replay_all(kernel, args, options):
-    """The outputs and the in-place tensors of a call, replayed with these build options (``None``: the reference)."""
+def replay_all(kernel, args, options, lowered=None):
+    """The outputs and the in-place tensors of a call, replayed with these build options (``None``: the reference), of ``lowered`` (another
+    lowering of ``kernel``) when it is given."""
     clones = [a.clone() if torch.is_tensor(a) else a for a in args]
     if options is None:
         result = tilefish.run(kernel, *clones, mode="reference")
     else:
         with runtime.build_options(**options):
-            result = tilefish.run(kernel, *clones, mode="jit")
+            result = tilefish.run(lowered if lowered is not None else kernel, *clones, mode="jit")
     outs = [result] if torch.is_tensor(result) else list(result or [])
     inouts = [c for c, p in zip(clones, [p for p in kernel.signature.params if p.kind == "tensor" and p.access != "out"]) if p.access == "inout"]
     return outs + inouts

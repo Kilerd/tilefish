@@ -1254,6 +1254,20 @@ def copy(x: Any) -> Value:
     return out
 
 
+def barrier(x: Any) -> Value:
+    """``tilefish.barrier(x)``: ``x`` itself, made a boundary of the fused regions of a graph body (``docs/rfcs/0001-plan-fusion.md``): the
+    value gets a buffer of the launch plan (which a tap can read, ``tilefish.run(..., taps=...)``) instead of living in a register of a fused
+    kernel. It never changes a byte: a fused plan is the unfused composition's bytes wherever its regions fall. A graph body only (a kernel body
+    is one kernel); a mask has no storage, so it has no barrier (store it with ``.to(u8)``)."""
+    x = _require_value("barrier", "the tensor", x)
+    if x.ctx.kind != "graph":
+        raise TilefishTypeError(f"barrier: {x.ref} is in a {x.ctx.kind} body, which is one kernel; a barrier separates the fused regions of a graph body")
+    if isinstance(x.dtype, DType) and x.dtype.is_bool:
+        raise TilefishTypeError(f"barrier: {x.ref} is a mask, which has no storage: make it a number first (.to(u8))")
+    x.ctx.emit("barrier", [x], {}, [])
+    return x
+
+
 def zeros_like(x: Any, *, dtype: "DType | None" = None) -> Value:
     """``tilefish.zeros_like(x)``: a new contiguous tensor of the shape of ``x`` (and its dtype, or ``dtype``) whose bytes are all zero, for a graph
     body.

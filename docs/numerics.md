@@ -1,6 +1,6 @@
 # Numerics: the CUDA math guard, the procedure on a CUDA or torch change, and decisions
 
-The numerics contract of a lowered kernel is the docstring of `tilefish.lower` (its table and notes 1 to 17): every op, the PTX it becomes,
+The numerics contract of a lowered kernel is the docstring of `tilefish.lower` (its table and notes 1 to 20): every op, the PTX it becomes,
 and what its bits are, measured. This document is about what that contract depends on outside tilefish, how to check it again when that
 changes, and the decisions the contract rests on.
 
@@ -16,6 +16,12 @@ tilefish changes them. Two kinds of op are different:
 * **libdevice functions.** `sin`, `cos` and `tanh` (either math), `gelu` and the default math's `erf` call libdevice, which Triton links from a file
   (its own `libdevice.10.bc`, or the one `TRITON_LIBDEVICE_PATH` names). Another file gives other bits, and their claim (note 10: "torch's bits but on
   a subnormal") holds only for the releases whose `sinf`, `cosf`, `tanhf` are libdevice's.
+
+* **Arithmetic that the PTX leaves to ptxas.** An op that is plain PTX (Triton's `a * b`, `a + b`) is assembled as ptxas decides: with
+  `enable_fp_fusion=True` it may contract a multiply and an add into one rounding, which the contract allows (note 2). With
+  `enable_fp_fusion=False` it must not, and ptxas 12.9 does anyway where LLVM has packed two lanes into `mul.rn.f32x2` / `add.rn.f32x2` (sm_100
+  and later: `FFMA2` on sm_100 and sm_103, `FFMA` on sm_120). So a kernel with `fp_fusion=False` writes each float `+ - *` as one scalar `.rn`
+  instruction of inline PTX (note 2), and the contraction check reads every binary built with `enable_fp_fusion=False` (section 4).
 
 These functions do change between releases. Measured over every f32 on a B300 (sm_103), compiled by each release's NVRTC with nvcc's defaults:
 
@@ -85,6 +91,26 @@ Triton (and so its libdevice) changes, or on a new GPU architecture.
 * **The primitives copy CUDA's spelling**, not an idealised one: `-x` is CUDA's negation (`neg.f32` gives the canonical NaN, where a flip of the
   sign bit would keep the payload), `sin_approx` is the hardware's `sin.approx.f32` with its subnormal flush, `erf` in IEEE math is the `erff` of
   CUDA 12.8 to 13.1. What a CUDA C++ kernel compiled with nvcc's defaults computes is what the DSL can say.
+* **"No contraction" is written out and checked on the binary.** `@tilefish.kernel(fp_fusion=False)` promises that every float `+`, `-` and `*`
+  rounds on its own, and an `extern` declared with `enable_fp_fusion=False` asks for the same. The compile option (`--fmad=false`) does not keep
+  that promise on sm_100 and later (above), so it is kept twice:
+  * **by the lowering**: a kernel with `fp_fusion=False` (and every fused region) writes each float `+ - *` as one scalar instruction of inline
+    PTX with `.rn`, which nothing packs and ptxas does not contract, and every narrowing cast as inline `cvt.rn` (notes 1 and 2 of
+    `tilefish.lower`);
+  * **by the contraction check** (`tilefish._fpcontract`, run by every build): a binary built with `enable_fp_fusion=False` (a lowered kernel, a
+    fused region, a generated op or a hand-written Triton or Gluon kernel) is disassembled, and so is its PTX assembled again with the same flags
+    and every float multiply replaced by a bitwise `or` of its operands, which multiplies nothing. A binary with more fused multiply-add lanes
+    (`FFMA`, `FFMA2`, `HFMA2`, `DFMA`, not the idioms that multiply or add nothing) than that is refused at build, with the kernel's name, the
+    instructions and the fix (scalar `.rn` inline PTX where the rounding matters, or `enable_fp_fusion=True`). The comparison takes in what
+    ptxas fuses on its own account (an explicit `fma`, the expansion of an IEEE division, square root or reciprocal) without listing it. The
+    disassembler is the first `nvdisasm` that decodes the architecture (`$TILEFISH_NVDISASM_PATH`, Triton's, the one next to its `ptxas`, an
+    `nvidia-cuda-nvdisasm` wheel, the `PATH`); Triton 3.5.1 bundles CUDA 12.8's, which does not decode sm_103, and there the PTX is assembled for
+    `sm_100a`, the base of its family, and read (`pip install nvidia-cuda-nvdisasm` reads sm_103 itself). A binary with no float multiply or
+    no float add is not disassembled. `tests/test_gpu_fpcontract.py` builds a Triton and a Gluon kernel that ptxas contracts (refused on
+    sm_100, sm_103 and sm_120, built on sm_90), the same kernel with scalar `.rn` instructions (built everywhere) and every case of the lowering
+    with `fp_fusion=False` on all four.
+  A negation's NaN is written out the same way (note 16): `neg.f32` gives the canonical NaN, but ptxas folds it into a select as a negated
+  operand, which flips the NaN's sign.
 * **The default GEMM posture keeps its rule: a GEMM with a bias gets no split-K** unless its declaration opts in (`allow_bf16_reduction`, or the
   opt-in of its operands' type). The rule is what lets the default posture promise one rounding of `A @ B + bias` for every pin it makes, on every
   device and cuBLASLt version, without a measurement per algorithm. A split-K with the bias epilogue was measured to add the bias to a sum already

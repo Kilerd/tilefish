@@ -2209,9 +2209,13 @@ def export_graph(
     overwrite: bool,
     buckets: Any,
     reuse: bool,
+    verify: "bool | None" = None,
 ) -> Plan:
     """:func:`tilefish.runtime.export` of a graph: build the binary of every step (and pin every GEMM), write the manifest (merged into one that is
-    already there) and ``plan.json`` next to it, read both back, and return the plan loaded from the directory, which has the digest to pin."""
+    already there) and ``plan.json`` next to it, read both back, and return the plan loaded from the directory, which has the digest to pin.
+
+    A graph whose body has arithmetic first has its fused regions verified against their unfused composition (``verify``: ``None`` takes the
+    graph's ``tilefish.fusion(verify=...)``, which is ``True`` by default) and gets its fusion report, ``<graph>.fusion.json``."""
     from ._build import build, parse_arch
     from ._binary import build_binary
 
@@ -2221,6 +2225,7 @@ def export_graph(
         cap = runtime._capability(torch, torch.cuda.current_device())
     else:
         cap = parse_arch(arch)
+    checked = _verify_fusion(graph, p, cap, verify)
     built: list = []
     pinned: list = []
     for stem, callee in sorted(p.callees.items(), key=lambda kv: kv[0]):
@@ -2232,7 +2237,30 @@ def export_graph(
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         else:
             built.append(build(spec, arch=cap, fn=callee.target.jit_function(spec)))
-    return write_export(p, built, pinned, directory, cap, overwrite)
+    written = write_export(p, built, pinned, directory, cap, overwrite)
+    _write_fusion_report(graph, directory, checked)
+    return written
+
+
+def _verify_fusion(graph: GraphOp, p: Plan, cap: int, verify: "bool | None") -> "dict[int, Any] | None":
+    """The export-time check of a graph's fused regions against their unfused composition, at every bucket of its plan (:mod:`tilefish._fusion`)."""
+    from . import _fusion
+
+    if verify is not None and not isinstance(verify, bool):
+        raise TilefishRuntimeError(f"verify= is True, False or None (the graph's tilefish.fusion(verify=...)), got {verify!r}")
+    return _fusion.verify_for_export(graph, _plan.bucket_combinations(p.dims), cap, verify)
+
+
+def _write_fusion_report(graph: GraphOp, directory: Any, checked: "dict[int, Any] | None") -> None:
+    """``<graph>.fusion.json`` next to the plan, for a graph whose body has arithmetic: its fused regions, what each took and keeps (informative: no
+    host reads it, and Python makes it again from the graph)."""
+    from . import _fusion
+    from ._build import write_file
+
+    if not _fusion.has_arithmetic(graph):
+        return
+    doc = _fusion.report(graph, checked)
+    write_file(pathlib.Path(directory) / f"{graph.graph.name}.fusion.json", (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode("utf-8"))
 
 
 def _pin_library(spec: Any, cap: int) -> Any:
@@ -2294,6 +2322,7 @@ def export_graphs(
     overwrite: bool,
     buckets: Any,
     reuse: bool,
+    verify: "bool | None" = None,
 ) -> "_plan.PlanSet":
     """:func:`tilefish.runtime.export` of several graphs: a **plan set**, one manifest for all of them (each binary built once, whichever plans
     launch it), ``<graph>.plan.json`` per graph and the index ``plans.json`` (``docs/plan-schema-1.md``, section 15). An item is a graph, or
@@ -2317,6 +2346,7 @@ def export_graphs(
         cap = runtime._capability(torch, torch.cuda.current_device())
     else:
         cap = parse_arch(arch)
+    checked = {p.name: _verify_fusion(p.graph, p, cap, verify) for p in plans}
     callees: "dict[str, Any]" = {}
     for p in plans:
         for stem, callee in p.callees.items():
@@ -2334,7 +2364,10 @@ def export_graphs(
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         else:
             built.append(build(spec, arch=cap, fn=callee.target.jit_function(spec)))
-    return write_plan_set(plans, built, pinned, directory, cap, overwrite)
+    written = write_plan_set(plans, built, pinned, directory, cap, overwrite)
+    for p in plans:
+        _write_fusion_report(p.graph, directory, checked[p.name])
+    return written
 
 
 def write_plan_set(
@@ -2409,15 +2442,18 @@ def _reference_dims(op: ExternOp, ins: "dict[str, Any]", outs: "Sequence[Value]"
 def reference_run(graph: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> Any:
     """``mode="reference"`` of a graph: the eager composition of the reference of each op, in torch, node by node.
 
-    A view operation is torch's (``reshape``, ``permute``, ``select``, ``split``); a call to a lowered ``@tilefish.kernel`` is its IR interpreted
+    A view operation is torch's (``reshape``, ``permute``, ``select``, ``split``); the arithmetic of the body is interpreted op by op (as the
+    fused regions of the plan, :mod:`tilefish._fusion`, whose IR is the body's); a call to a lowered ``@tilefish.kernel`` is its IR interpreted
     (:mod:`tilefish._reference`); a pinned cuBLASLt GEMM is an f32 matmul rounded once to its result's type; a hand-written extern is its ``reference=`` (a torch
     function given to ``@tilefish.extern``), and an extern that has none is refused. An in-place call on a view updates a copy of it: the IR says
     a chunk that is updated does not change its parent. Needs no CUDA: it runs where the tensors are. (A torch view of a tensor that an op then updates in place
     sees the update here, where the IR says a view keeps the contents it had: a plan refuses such a graph, so the two never disagree on a graph that can be planned.)
     """
+    from ._fusion import planned_graph
+
     torch = runtime._torch()
     sig = graph.signature
-    g = graph.graph
+    g = planned_graph(graph)  # the arithmetic of the body as the fused regions a plan launches, each interpreted op by op
     try:
         bound = sig.call_signature.bind(*args, **kwargs)
     except TypeError as e:
