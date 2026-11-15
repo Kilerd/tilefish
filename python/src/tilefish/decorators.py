@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, Sequence
 
 from .dims import DimExpr, as_dim
-from ._specvalid import IMPLEMENTATION_FALLBACK as FALLBACK, MAX_ELEMENTS
+from ._specvalid import IMPLEMENTATION_FALLBACK as FALLBACK, MAX_ELEMENTS, is_implementation_name
 from .dtypes import DType
 from .errors import TilefishDeclarationError, TilefishError, TilefishPicklingError, TilefishRuntimeError, TilefishTypeError
 from .ir import Graph
@@ -770,12 +770,21 @@ class ExternOp(Op):
         language: str = "triton",
         implementation: "str | None" = None,
         implementations: "dict[str, ExternOp] | None" = None,
+        selection: "dict[str, str] | None" = None,
+        fallback_key: "str | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
-        # extern(by_arch=...): the op that a graph calls and a caller runs has ``implementations`` (its key -> an ExternOp of its own, the
-        # architecture's or "fallback"), and each of those has ``implementation``, its key, which is in its declaration digest and its specs
+        # extern(by_arch=...): the op that a graph calls and a caller runs has ``implementations`` (its key -> an ExternOp of its own: the
+        # architecture's, "fallback", or the name of a named implementation), and each of those has ``implementation``, its key, which is in its
+        # declaration digest and its specs. ``selection`` maps each architecture of the map to the key of its implementation and ``fallback_key``
+        # is the key of the fallback (None: no fallback)
         self.implementation: "str | None" = implementation
         self.implementations: "dict[str, ExternOp] | None" = implementations
+        if implementations is not None and selection is None:
+            selection = {k: k for k in implementations if k != FALLBACK}
+            fallback_key = FALLBACK if FALLBACK in implementations else None
+        self.selection: "dict[str, str] | None" = selection
+        self.fallback_key: "str | None" = fallback_key
         if type(index_bits) is not int or index_bits not in (32, 64):
             raise TilefishDeclarationError(f"extern '{name}': index_bits must be 32 or 64, got {index_bits!r}")
         if language not in LANGUAGES:
@@ -836,7 +845,10 @@ class ExternOp(Op):
 
     @property
     def is_binary(self) -> bool:
-        """Whether this is a prebuilt PTX or cubin (``extern(ptx=...)`` / ``extern(cubin=...)``) rather than a Triton kernel."""
+        """Whether this is a prebuilt PTX or cubin (``extern(ptx=...)`` / ``extern(cubin=...)``) rather than a Triton kernel; for an op declared with
+        ``by_arch=``, whether every implementation is one (then its calls give the values of its fixed arguments per call)."""
+        if self.implementations is not None:
+            return all(one.binary is not None for one in self.implementations.values())
         return self.binary is not None
 
     @property
@@ -848,24 +860,26 @@ class ExternOp(Op):
 
     def for_arch(self, arch: "int | str") -> "ExternOp":
         """The implementation this op runs on ``arch`` (``103``, ``"sm_103"``): for an op declared with ``by_arch=``, the one declared for that
-        architecture, else its ``fallback``, else a :class:`~tilefish.errors.TilefishRuntimeError`; any other op is its own."""
+        architecture (a named one may be declared for several), else its ``fallback``, else a :class:`~tilefish.errors.TilefishRuntimeError`; any
+        other op is its own."""
         if self.implementations is None:
             return self
         from ._build import parse_arch
 
         name = f"sm_{parse_arch(arch)}"
-        found = self.implementations.get(name, self.implementations.get(FALLBACK))
-        if found is None:
-            archs = ", ".join(k for k in self.implementations)
+        assert self.selection is not None
+        key = self.selection.get(name, self.fallback_key)
+        if key is None:
+            archs = ", ".join(self.selection)
             raise TilefishRuntimeError(
                 f"extern op '{self.name}' has no implementation for {name}: it declares one for {archs} and no fallback. Declare one for "
                 f"{name} in by_arch= (or a fallback=) once it is known to be right there"
             )
-        return found
+        return self.implementations[key]
 
     def node_attrs(self) -> dict[str, Any]:
         if self.implementations is not None:
-            return {"by_arch": {k: v.triton for k, v in self.implementations.items()}}
+            return {"by_arch": {k: v.triton or f"{v.binary.kind}:{v.binary.symbol}" for k, v in self.implementations.items()}}  # type: ignore[union-attr]
         if self.binary is not None:
             return {"binary": self.binary.symbol}
         return {self.language: self.triton}
@@ -958,33 +972,60 @@ _UNSET: Any = object()  # num_warps= / num_stages= not passed (None is a value, 
 
 # -- per-architecture implementations: extern(by_arch=...) ------------------------------------------------------------------
 
-# FALLBACK ("fallback") is the key of the implementation an op declared with by_arch= runs on an architecture the map does not name.
+# FALLBACK ("fallback") is the key of the implementation an op declared with by_arch= runs on an architecture the map does not name (a named
+# implementation's key is its name, whichever architectures it is declared for).
 #
-# What every implementation of one op has in common, per binary (stem): the launch ABI, the buckets, the dimensions and the preconditions a
-# launch checks. What may differ is how the kernel is compiled and launched: the kernel, its constexpr values, warps, stages, options, grid.
-_SHARED_BY_IMPLEMENTATIONS = ("kind", "abi", "buckets", "dims", "preconditions")
+# What every implementation of one op has in common is its public signature, what a caller, a plan and a typed host launcher see: the tensors (by
+# name, in order, with their access, dtype, declared shape and whether a view is accepted), the fixed arguments per call of a prebuilt binary, and
+# the binaries (stems) with the dimensions of their buckets. Everything else is the implementation's own ABI and how it is built and launched: a
+# tensor passed as a pointer or as a TMA descriptor, its runtime scalars, constexprs or fixed arguments, scratch slots, kind, preconditions, the
+# dimensions its entries name, its kernel, compile options and grid. Each manifest entry carries its own ABI, and every host binds per entry.
+
+
+@dataclass(frozen=True)
+class _Prebuilt:
+    """The prebuilt binary of an implementation (``tilefish.impl(ptx=...)`` / ``tilefish.impl(cubin=...)``) as :func:`impl` was given it: its files
+    are read when the op is declared, a relative path relative to the file that declares the op (as for ``extern(ptx=...)``)."""
+
+    kind: str  # "ptx" | "cubin"
+    files: Any  # the PTX file, or {architecture: cubin file}
+    symbol: str
+    block: "tuple[int, int, int]"
+    shared: int
 
 
 @dataclass(frozen=True, eq=False)
 class Implementation:
     """One implementation of an op declared with ``@tilefish.extern(by_arch=...)``, made by :func:`impl`: a Triton or Gluon kernel and how it is
-    compiled and launched. The stub (the typed signature, so the ABI) is the op's; ``consts`` gives const parameters other compiled-in values,
-    ``grid`` another launch grid (``None``: the op's ``grid=``)."""
+    compiled and launched, or a prebuilt binary (``prebuilt``: PTX or cubins, the entry point, block and dynamic shared memory). ``stub`` is the
+    function whose parameters are its kernel's (its ABI), or ``None``: the op's stub; ``consts`` gives const parameters of that stub other values
+    (compiled in, or a prebuilt binary's fixed arguments); ``grid`` is its launch grid (``None``: the op's ``grid=``); ``name`` is the key that
+    every architecture mapped to it shares (``None``: each architecture's own key)."""
 
-    target: _TritonTarget
-    language: str
+    target: "_TritonTarget | None"
+    language: str  # "triton" | "gluon": the frontend that compiles it; "ptx" | "cubin": a prebuilt binary
     num_warps: int
     num_stages: int
     fp_fusion: "bool | None"
     grid: Any
     consts: "dict[str, Any]"
+    prebuilt: "_Prebuilt | None" = None
+    stub: "Callable[..., Any] | None" = None
+    name: "str | None" = None
 
     @property
     def ref(self) -> str:
-        return self.target.ref
+        return self.target.ref if self.target is not None else ""
+
+    @property
+    def is_binary(self) -> bool:
+        return self.prebuilt is not None
 
     def __repr__(self) -> str:
-        return f"<impl {self.language}={self.ref} num_warps={self.num_warps}>"
+        named = "" if self.name is None else f" name={self.name!r}"
+        if self.prebuilt is not None:
+            return f"<impl {self.language} symbol={self.prebuilt.symbol} block={self.prebuilt.block}{named}>"
+        return f"<impl {self.language}={self.ref} num_warps={self.num_warps}{named}>"
 
 
 def _check_options(num_warps: Any, num_stages: Any, enable_fp_fusion: Any) -> None:
@@ -1000,37 +1041,92 @@ def impl(
     *,
     triton: Any = None,
     gluon: Any = None,
-    num_warps: int = 4,
-    num_stages: int = 3,
+    ptx: Any = None,
+    cubin: Any = None,
+    symbol: "str | None" = None,
+    block: Any = None,
+    shared: int = 0,
+    num_warps: Any = _UNSET,
+    num_stages: Any = _UNSET,
     enable_fp_fusion: "bool | None" = None,
     grid: Any = None,
     consts: "dict[str, Any] | None" = None,
+    stub: "Callable[..., Any] | None" = None,
+    name: "str | None" = None,
 ) -> Implementation:
     """One implementation of an op with an implementation per architecture: ``@tilefish.extern(by_arch={"sm_103": tilefish.impl(triton=k_a,
     num_warps=8), "sm_120": tilefish.impl(triton=k_b)}, grid=...)``.
 
-    ``triton=`` (a ``triton.jit`` kernel) or ``gluon=`` (a Gluon kernel), a kernel object or a ``"module:function"`` string, as for
-    :func:`extern`; ``num_warps``, ``num_stages`` and ``enable_fp_fusion`` are its compile options; ``grid`` its launch grid when it is not the
-    op's (a callable over the names of the stub, or a tuple); ``consts`` other values for const parameters of the stub (``{"BLOCK": 64}``), which
-    are compiled in. The kernel takes the stub's parameters, in order, as the kernel of any extern does.
+    The kernel is one of ``triton=`` (a ``triton.jit`` kernel) and ``gluon=`` (a Gluon kernel), a kernel object or a ``"module:function"`` string as for
+    :func:`extern`, with its compile options ``num_warps``, ``num_stages`` and ``enable_fp_fusion``; or a **prebuilt binary**, ``ptx="k.ptx"`` or
+    ``cubin={"sm_120": "k.cubin"}`` with ``symbol=``, ``block=`` and ``shared=`` (a relative path is relative to the file that declares the op, as
+    for ``extern(ptx=...)``; a cubin implementation has a cubin for every architecture that runs it). ``grid`` is its launch grid when it is not the
+    op's (a callable over the names of its stub, or a tuple); ``consts`` other values for const parameters of its stub (``{"BLOCK": 64}``): compiled
+    in, or the values of a prebuilt binary's fixed arguments.
+
+    ``stub=`` is a function annotated like the stub of an extern whose parameters are this kernel's, in order (its ABI): ``x: TensorDesc(Tensor[R,
+    C, f16], block=(64, 64))`` where the op's stub has ``x: Tensor[R, C, f16]``, its own scalars, constexprs, fixed arguments. Without it the kernel
+    takes the op's stub. Either way it takes the op's tensors (names, order, access, dtype, shape, ``Strided`` or not) and its fixed arguments per
+    call: what a caller, a plan and a host launcher see is one signature, and each implementation's manifest entries have its own ABI.
+
+    ``name="tcgen05"`` makes the implementation one for every architecture that maps to it: its key, in its declaration digest, its compile specs
+    and its manifest entries (``"implementation": "tcgen05"``), is its name, so those architectures share one declaration digest and one set of
+    compile specs. A name is an ASCII identifier of at most 64 characters that is not ``"fallback"`` and does not look like an architecture (it does
+    not begin with ``sm_`` and a digit). Without a name an implementation's key is the architecture it is declared for (``"fallback"`` for the
+    fallback), as for an op declared before names existed.
     """
-    given = [k for k, v in (("triton", triton), ("gluon", gluon)) if v is not None]
+    given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin)) if v is not None]
     if len(given) != 1:
         raise TilefishDeclarationError(
-            f"tilefish.impl takes one kernel, triton= (a triton.jit kernel) or gluon= (a Gluon kernel), got {' and '.join(given) or 'none'}"
+            "tilefish.impl takes one kernel, triton= (a triton.jit kernel) or gluon= (a Gluon kernel), or a prebuilt binary, ptx= or cubin=, "
+            f"got {' and '.join(given) or 'none'}"
         )
     language = given[0]
-    target = _triton_target(triton if triton is not None else gluon, language)
-    _check_options(num_warps, num_stages, enable_fp_fusion)
     if consts is None:
         consts = {}
     if not isinstance(consts, dict) or not all(isinstance(k, str) for k in consts):
         raise TilefishDeclarationError(f"tilefish.impl: consts= maps const parameter names to values ({{'BLOCK': 64}}), got {consts!r}")
-    return Implementation(target, language, num_warps, num_stages, enable_fp_fusion, grid, dict(consts))
+    if stub is not None and (isinstance(stub, (Op, type)) or not callable(stub) or getattr(stub, "__code__", None) is None):
+        raise TilefishDeclarationError(
+            f"tilefish.impl: stub= is a function annotated like the stub of an extern, whose parameters are the kernel's in order, got {stub!r}"
+        )
+    if name is not None and not is_implementation_name(name):
+        raise TilefishDeclarationError(
+            "tilefish.impl: name= is the key of the implementation in its manifest entries: an ASCII identifier of at most 64 characters that is not "
+            f"'fallback' and does not look like an architecture (begin with sm_ and a digit), got {name!r}"
+        )
+    if language in ("ptx", "cubin"):
+        for key, value in (("num_warps", num_warps), ("num_stages", num_stages)):
+            if value is not _UNSET:
+                raise TilefishDeclarationError(f"tilefish.impl: {key}= is a Triton compile option; a prebuilt binary has its block= (and nothing is compiled)")
+        if enable_fp_fusion is not None:
+            raise TilefishDeclarationError(
+                "tilefish.impl: enable_fp_fusion= is a Triton compile option; a prebuilt binary is not compiled by Triton (its PTX says how each "
+                "instruction rounds)"
+            )
+        if symbol is None or block is None:
+            raise TilefishDeclarationError(f"tilefish.impl: {language}= needs symbol=<the kernel's entry point> and block=(x, y, z)")
+        files = ptx if language == "ptx" else cubin
+        padded = _check_prebuilt(language, files, symbol, block, shared)
+        prebuilt = _Prebuilt(language, files if language == "ptx" else dict(files), symbol, padded, shared)  # type: ignore[arg-type]
+        return Implementation(None, language, 0, 0, None, grid, dict(consts), prebuilt, stub, name)
+    for key, value in (("symbol", symbol), ("block", block)):
+        if value is not None:
+            raise TilefishDeclarationError(f"tilefish.impl: {key}= is for a prebuilt binary (ptx= or cubin=), not for a {language.title()} kernel")
+    if shared != 0:
+        raise TilefishDeclarationError("tilefish.impl: shared= is for a prebuilt binary; Triton records the shared memory of the kernel it compiles")
+    target = _triton_target(triton if triton is not None else gluon, language)
+    num_warps = 4 if num_warps is _UNSET else num_warps
+    num_stages = 3 if num_stages is _UNSET else num_stages
+    _check_options(num_warps, num_stages, enable_fp_fusion)
+    return Implementation(target, language, num_warps, num_stages, enable_fp_fusion, grid, dict(consts), None, stub, name)
 
 
 def _label(key: str) -> str:
-    return "the fallback" if key == FALLBACK else key
+    """How a message names the implementation of ``key``: ``the fallback``, its architecture (``sm_103``) or its name (``'tcgen05'``)."""
+    if key == FALLBACK:
+        return "the fallback"
+    return key if _ARCH_NAME.fullmatch(key) else repr(key)
 
 
 def _implementation_of(op: "ExternOp", key: str) -> "ExternOp":
@@ -1039,7 +1135,7 @@ def _implementation_of(op: "ExternOp", key: str) -> "ExternOp":
     return op.implementations[key]
 
 
-def _with_consts(nm: str, key: str, sig: Signature, consts: "dict[str, Any]") -> Signature:
+def _with_consts(nm: str, key: str, sig: Signature, consts: "dict[str, Any]", allow_dim: bool = True) -> Signature:
     """The stub's signature with the const values of one implementation (the same parameters, kinds and types: only compiled-in values differ)."""
     if not consts:
         return sig
@@ -1052,25 +1148,65 @@ def _with_consts(nm: str, key: str, sig: Signature, consts: "dict[str, Any]") ->
     params = []
     for p in sig.params:
         if p.kind == "const" and p.name in consts:
-            value = _check_const_default(f"extern op '{nm}' ({_label(key)})", p.name, p.const_dtype, consts[p.name], allow_dim=True)
+            value = _check_const_default(f"extern op '{nm}' ({_label(key)})", p.name, p.const_dtype, consts[p.name], allow_dim=allow_dim)
             p = replace(p, default=value)
         params.append(p)
     return Signature(params, sig.returns)
 
 
-def _check_implementations(nm: str, impls: "dict[str, ExternOp]") -> None:
-    """Every implementation has the binaries (stems) of the others, and each binary the same ABI, buckets, dimensions and preconditions: a caller,
-    a plan and a host launch any of them the same way, whichever architecture it runs on."""
-    from ._build import spec_entry
+def _public_facts(sig: Signature) -> "dict[str, Any]":
+    """What a caller, a plan and a typed host launcher see of a stub: its tensors in order (name, access, dtype, declared shape, whether a view is
+    accepted, a device scalar, the input an ``Out`` may be written over), the constraints of the dimensions their shapes name, and the fixed
+    arguments per call (a prebuilt binary's ``const[i32]`` with no default)."""
+    tensors: "list[dict[str, Any]]" = []
+    dims: "dict[str, Any]" = {}
+    for p in sig.params:
+        if p.kind != "tensor":
+            continue
+        t = p.type
+        assert t is not None
+        tensors.append(
+            {
+                "name": p.name,
+                "access": p.access,
+                "dtype": str(t.dtype),
+                "shape": [str(d.folded()) for d in t.shape],
+                "view": bool(p.strided),
+                "devscalar": bool(t.devscalar),
+                "alias": p.alias,
+            }
+        )
+        for d in t.shape:
+            for a in d.free_dims():
+                dims[a.name] = {"divisible_by": a.divisible_by, "buckets": None if a.buckets is None else list(a.buckets)}
+    given = [{"name": p.name, "type": None if p.const_dtype is None else p.const_dtype.name} for p in sig.consts if p.default is MISSING]
+    return {"tensors": tensors, "dims": dict(sorted(dims.items())), "given": given}
+
+
+def _check_implementations(nm: str, sig: Signature, impls: "dict[str, ExternOp]") -> None:
+    """Every implementation has the op's public signature (:func:`_public_facts` of its stub is the op's stub's) and the binaries (stems) of the
+    others, each with the same buckets: a caller, a plan and a typed host launcher call any of them the same way, whichever architecture runs it.
+    How an implementation passes its tensors, and the rest of its ABI, is its own: each manifest entry has its ABI, and every host binds per entry."""
     from .aot import _first_difference, _show, compile_specs
 
+    want = _public_facts(sig)
+    for key, op in impls.items():
+        diff = _first_difference(want, _public_facts(op.signature), "")
+        if diff is not None:
+            path, a, b = diff
+            raise TilefishDeclarationError(
+                f"extern op '{nm}': the implementation for {_label(key)} does not have the op's signature: its stub differs at {path} (the op's has "
+                f"{_show(a)}, its {_show(b)}). Every implementation takes the op's tensors (their names, order, access, dtype and shape, and whether a "
+                "view is accepted) and its fixed arguments per call; how it passes a tensor (a pointer or a TMA descriptor), its scalars, constexprs, "
+                "fixed arguments and preconditions are its own"
+            )
     found: "dict[str, dict[str, dict[str, Any]]]" = {}
     for key, op in impls.items():
         try:
             specs = compile_specs(op)
         except TilefishError as e:
             raise TilefishDeclarationError(f"extern op '{nm}': the implementation for {_label(key)}: {e}") from None
-        found[key] = {s.stem: {k: v for k, v in spec_entry(s).items() if k in _SHARED_BY_IMPLEMENTATIONS} for s in specs}
+        found[key] = {s.stem: {"buckets": dict(s.buckets), "dims": {d: s.dims.get(d) for d in s.buckets}} for s in specs}
     (first_key, first), *rest = found.items()
     for key, got in rest:
         if list(got) != list(first):
@@ -1078,21 +1214,103 @@ def _check_implementations(nm: str, impls: "dict[str, ExternOp]") -> None:
                 f"extern op '{nm}': the implementation for {_label(key)} has the binaries {list(got)}, the one for {_label(first_key)} {list(first)}: "
                 "every implementation has the same buckets (a const of one that depends on a bucketed dimension is one of the others too)"
             )
-        for stem, want in first.items():
-            diff = _first_difference(want, got[stem], "")
+        for stem, wanted in first.items():
+            diff = _first_difference(wanted, got[stem], "")
             if diff is not None:
                 path, a, b = diff
                 raise TilefishDeclarationError(
-                    f"extern op '{nm}': the implementations for {_label(first_key)} and {_label(key)} are not launched the same way: '{stem}' "
-                    f"differs at {path.lstrip('.')} ({_show(a)} and {_show(b)}). Every implementation has the op's typed signature and ABI; only the "
-                    "kernel, its compile options, its constexpr values and its grid may differ"
+                    f"extern op '{nm}': the implementations for {_label(first_key)} and {_label(key)} do not have the same buckets: '{stem}' differs at "
+                    f"{path.lstrip('.')} ({_show(a)} and {_show(b)}). Every implementation has the op's binaries, and a binary is selected by its buckets"
                 )
+
+
+def _check_prebuilt_archs(nm: str, key: str, binary: "BinaryTarget", archs: "list[str]") -> None:
+    """A prebuilt implementation builds for every architecture that ``by_arch=`` sends to it: a cubin for each, PTX whose target each can run.
+    (The architectures that fall back to it are not known here: the build refuses them, ``_binary.build_binary``.)"""
+    if binary.kind == "cubin":
+        missing = [a for a in archs if a not in binary.sources]
+        if missing:
+            raise TilefishDeclarationError(
+                f"extern op '{nm}': the implementation for {_label(key)} is a cubin for {', '.join(sorted(binary.sources))}, but by_arch= sends "
+                f"{', '.join(missing)} to it: a cubin is used as it is, for the architecture it was built for; give one for each "
+                f"(cubin={{'{missing[0]}': ...}}) or PTX (ptx=...)"
+            )
+        return
+    from ._binary import ptx_gpu_name
+    from ._build import parse_arch
+
+    try:
+        text = binary.sources["ptx"].decode("utf-8")
+    except UnicodeDecodeError:
+        raise TilefishDeclarationError(f"extern op '{nm}': the PTX of the implementation for {_label(key)} is not text: PTX is UTF-8 text") from None
+    for a in archs:
+        try:
+            ptx_gpu_name(text, parse_arch(a), f"the PTX of the implementation for {_label(key)}")
+        except TilefishError as e:
+            raise TilefishDeclarationError(f"extern op '{nm}': {e}, and by_arch= sends {a} to it") from None
+
+
+def _declaring_dir(fn: Callable[..., Any]) -> "pathlib.Path | None":
+    """The directory of the file that declares ``fn`` (what a relative path of a prebuilt binary is relative to), or ``None``."""
+    base = pathlib.Path(fn.__code__.co_filename).resolve().parent if getattr(fn, "__code__", None) is not None else None
+    if base is not None and not base.is_dir():
+        base = None
+    return base
+
+
+def _implementation_op(
+    fn: Callable[..., Any],
+    nm: str,
+    sig: Signature,
+    limits: "dict[str, int]",
+    key: str,
+    im: Implementation,
+    grid: Any,
+    index_bits: int,
+    reference: Any,
+    base: "pathlib.Path | None",
+) -> "ExternOp":
+    """The ``ExternOp`` of the implementation ``im`` under ``key``: its stub (its own, or the op's ``sig``) with its consts, its kernel or binary."""
+    where = f"extern op '{nm}': the implementation for {_label(key)}"
+    if im.stub is not None:
+        try:
+            _, sig, limits = _parse_extern_stub(im.stub, nm, index_bits, prebuilt=im.is_binary)
+        except TilefishDeclarationError as e:
+            raise TilefishDeclarationError(f"{where}: its stub: {e}") from None
+    own = _with_consts(nm, key, sig, im.consts, allow_dim=not im.is_binary)
+    binary = None
+    if im.prebuilt is not None:
+        _check_fixed_args(nm, own)
+        pb = im.prebuilt
+        binary = _binary_target(pb.kind, pb.files, pb.symbol, pb.block, pb.shared, base, nm)
+    else:
+        assert im.target is not None
+        _check_against_kernel(nm, own, im.target)
+    try:
+        return ExternOp(
+            fn,
+            nm,
+            own,
+            im.ref,
+            im.num_warps,
+            im.num_stages,
+            im.grid if im.grid is not None else grid,
+            max_elements=limits,
+            fp_fusion=im.fp_fusion,
+            index_bits=index_bits,
+            binary=binary,
+            reference=reference,
+            language="triton" if binary is not None else im.language,
+            implementation=key,
+        )
+    except TilefishDeclarationError as e:  # its grid, under its constexpr values
+        raise TilefishDeclarationError(f"{where}: {e}") from None
 
 
 def _extern_by_arch(
     by_arch: Any, fallback: Any, grid: Any, name: "str | None", index_bits: int, reference: Any, others: "dict[str, Any]"
 ) -> Callable[[Callable[..., Any]], ExternOp]:
-    """``@tilefish.extern(by_arch={...}, fallback=..., grid=...)``: one op, one typed signature, an implementation per architecture."""
+    """``@tilefish.extern(by_arch={...}, fallback=..., grid=...)``: one op, one public signature, an implementation per architecture."""
     misplaced = [k for k, v in others.items() if v is not None and v is not _UNSET and not (k == "shared" and v == 0)]
     if misplaced:
         raise TilefishDeclarationError(
@@ -1113,36 +1331,57 @@ def _extern_by_arch(
     if type(index_bits) is not int or index_bits not in (32, 64):
         raise TilefishDeclarationError(f"extern: index_bits must be 32 (the kernel indexes with i32) or 64 (with i64), got {index_bits!r}")
     _check_op_name(name)
-    chosen: "dict[str, Implementation]" = dict(by_arch)
-    if fallback is not None:
-        chosen[FALLBACK] = fallback
+    # the key of each architecture's implementation (its name, or the architecture), the fallback's, and the implementations under each key
+    selection = {arch: (im.name if im.name is not None else arch) for arch, im in by_arch.items()}
+    fallback_key = None if fallback is None else (fallback.name if fallback.name is not None else FALLBACK)
+    chosen: "dict[str, list[Implementation]]" = {}
+    for key, im in [*((selection[a], im) for a, im in by_arch.items()), *([(fallback_key, fallback)] if fallback is not None else [])]:
+        group = chosen.setdefault(key, [])  # type: ignore[arg-type]
+        if all(im is not other for other in group):
+            group.append(im)
+    everyone = [im for group in chosen.values() for im in group]
+    binary_on_stub = any(im.is_binary and im.stub is None for im in everyone)  # the op's stub is then a prebuilt binary's C ABI
+    all_binary = all(im.is_binary for im in everyone)  # only then may the op have fixed arguments per call (const[i32] with no default)
 
     def deco(fn: Callable[..., Any]) -> ExternOp:
-        nm, sig, limits = _parse_extern_stub(fn, name, index_bits, prebuilt=False)
+        from .aot import _canonical_declaration, _first_difference, _show
+
+        nm, sig, limits = _parse_extern_stub(fn, name, index_bits, prebuilt=binary_on_stub, givens=all_binary)
+        base = _declaring_dir(fn)
         impls: "dict[str, ExternOp]" = {}
-        for key, im in chosen.items():
-            own = _with_consts(nm, key, sig, im.consts)
-            _check_against_kernel(nm, own, im.target)
-            try:
-                impls[key] = ExternOp(
-                    fn,
-                    nm,
-                    own,
-                    im.ref,
-                    im.num_warps,
-                    im.num_stages,
-                    im.grid if im.grid is not None else grid,
-                    max_elements=limits,
-                    fp_fusion=im.fp_fusion,
-                    index_bits=index_bits,
-                    reference=reference,
-                    language=im.language,
-                    implementation=key,
-                )
-            except TilefishDeclarationError as e:  # its grid, under its constexpr values
-                raise TilefishDeclarationError(f"extern op '{nm}': the implementation for {_label(key)}: {e}") from None
-        _check_implementations(nm, impls)
-        op = ExternOp(fn, nm, sig, "", 0, 0, None, max_elements=limits, index_bits=index_bits, reference=reference, implementations=impls)
+        for key, group in chosen.items():
+            made = [_implementation_op(fn, nm, sig, limits, key, im, grid, index_bits, reference, base) for im in group]
+            for other in made[1:]:  # two tilefish.impl(..., name=key) objects: one implementation only if they declare the same
+                try:
+                    diff = _first_difference(_canonical_declaration(made[0]), _canonical_declaration(other), "")
+                except TilefishError as e:
+                    raise TilefishDeclarationError(f"extern op '{nm}': the implementation {key!r}: {e}") from None
+                if diff is not None:
+                    path, a, b = diff
+                    raise TilefishDeclarationError(
+                        f"extern op '{nm}': two different implementations are named {key!r} (they differ at {path}: {_show(a)} and {_show(b)}): a name "
+                        "is the key of one implementation, which every architecture mapped to it shares; name the other one apart"
+                    )
+            impls[key] = made[0]
+        for key, one in impls.items():
+            if one.binary is not None:
+                _check_prebuilt_archs(nm, key, one.binary, [a for a, k in selection.items() if k == key])
+        _check_implementations(nm, sig, impls)
+        op = ExternOp(
+            fn,
+            nm,
+            sig,
+            "",
+            0,
+            0,
+            None,
+            max_elements=limits,
+            index_bits=index_bits,
+            reference=reference,
+            implementations=impls,
+            selection=selection,
+            fallback_key=fallback_key,
+        )
         for one in impls.values():
             one.__dict__["_tf_of"] = op
         return op
@@ -1204,24 +1443,36 @@ def _block_of(block: Any) -> "tuple[int, int, int]":
     return padded  # type: ignore[return-value]
 
 
-def _binary_target(
-    kind: str, files: Any, symbol: Any, block: Any, shared: Any, base: "pathlib.Path | None", where: str
-) -> BinaryTarget:
+def _check_prebuilt(kind: str, files: Any, symbol: Any, block: Any, shared: Any) -> "tuple[int, int, int]":
+    """What a prebuilt binary's declaration says before its files are read: the entry point, the dynamic shared memory, the architectures of its
+    cubins; the block, padded to three sizes."""
     if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
         raise TilefishDeclarationError(f"extern: symbol= names the kernel's entry point (a PTX/ELF symbol), got {symbol!r}")
     if isinstance(shared, bool) or not isinstance(shared, int) or not 0 <= shared <= 1 << 30:
         raise TilefishDeclarationError(f"extern: shared must be a non-negative int (bytes of dynamic shared memory), got {shared!r}")
+    if kind == "ptx":
+        if not isinstance(files, (str, os.PathLike)):
+            raise TilefishDeclarationError(f"extern: ptx= must be a file path, got {files!r}")
+    else:
+        if not isinstance(files, dict) or not files:
+            raise TilefishDeclarationError(f"extern: cubin= maps architectures to files, {{'sm_103': 'k.cubin'}}, got {files!r}")
+        for arch in files:
+            if not isinstance(arch, str) or not _ARCH_NAME.fullmatch(arch):
+                raise TilefishDeclarationError(f"extern: cubin= keys are architectures such as 'sm_103', got {arch!r}")
+    return _block_of(block)
+
+
+def _binary_target(
+    kind: str, files: Any, symbol: Any, block: Any, shared: Any, base: "pathlib.Path | None", where: str
+) -> BinaryTarget:
+    padded = _check_prebuilt(kind, files, symbol, block, shared)
     sources: dict[str, bytes] = {}
     if kind == "ptx":
         sources["ptx"] = _read_binary_file("ptx=", where, files, base)
     else:
-        if not isinstance(files, dict) or not files:
-            raise TilefishDeclarationError(f"extern: cubin= maps architectures to files, {{'sm_103': 'k.cubin'}}, got {files!r}")
         for arch, path in files.items():
-            if not isinstance(arch, str) or not _ARCH_NAME.fullmatch(arch):
-                raise TilefishDeclarationError(f"extern: cubin= keys are architectures such as 'sm_103', got {arch!r}")
             sources[arch] = _read_binary_file(f"cubin[{arch!r}]", where, path, base)
-    return BinaryTarget(kind, symbol, _block_of(block), shared, sources)
+    return BinaryTarget(kind, symbol, padded, shared, sources)
 
 
 def extern(
@@ -1286,17 +1537,22 @@ def extern(
     architecture with fixed, recorded flags; a cubin is used as it is for the architecture it names and refused for another.
 
     **An implementation per architecture.** ``by_arch=`` maps architectures to implementations (:func:`impl`: a Triton or Gluon kernel with its
-    own compile options, constexpr values and grid) of one stub, and ``fallback=`` names the one of every other architecture::
+    own compile options, constexpr values and grid, or a prebuilt PTX or cubin) of one op, and ``fallback=`` names the one of every other
+    architecture::
 
         @tilefish.extern(by_arch={"sm_103": tilefish.impl(triton=k.sum_wide, num_warps=8), "sm_120": tilefish.impl(triton=k.sum_narrow)},
                          grid=lambda R: (R,))
         def row_sum(x: Tensor[R, 1024, f32], y: Out[Tensor[R, f32]], n_rows: R): ...
 
-    The op is one typed signature for a graph, a plan and a caller; ``export``, ``jit`` and ``replay`` run the implementation of the target's (or
-    the device's) architecture, and refuse an architecture with none. Every implementation has the stub's parameters and the same launch ABI,
-    buckets, dimensions and preconditions (checked here); each is an op of its own (``op.for_arch("sm_103")``), whose declaration digest, compile
-    specs and manifest entries carry its key (``"implementation": "sm_103"``, or ``"fallback"``), so a replay refuses a binary of another
-    implementation, or of one that changed. ``reference=``, ``index_bits=`` and ``name=`` are the op's.
+    The op is one public signature for a graph, a plan and a caller; ``export``, ``jit`` and ``replay`` run the implementation of the target's (or
+    the device's) architecture, and refuse an architecture with none. Every implementation takes the stub's tensors (names, order, access, dtype,
+    shape, ``Strided`` or not) and its fixed arguments per call, and has its buckets (checked here). An implementation may bring its own stub
+    (``tilefish.impl(..., stub=f)``: the kernel's parameters in order), so its ABI is its own: a tensor passed as a TMA descriptor (``TensorDesc``)
+    where another implementation takes a pointer, other scalars, constexprs or fixed arguments, a prebuilt binary beside a Triton kernel. Each is an
+    op of its own (``op.for_arch("sm_103")``), whose declaration digest, compile specs and manifest entries carry its key (``"implementation":
+    "sm_103"``, ``"fallback"``, or the name of a named implementation, ``tilefish.impl(..., name="tcgen05")``, which the architectures mapped to it
+    share), so a replay refuses a binary of another implementation, or of one that changed. ``reference=``, ``index_bits=`` and ``name=`` are the
+    op's.
 
     ``index_bits`` says how the kernel computes the offsets it loads and stores at. The default, ``32``, is the safe
     claim: every tensor parameter gets a ``max_elements`` precondition of ``2**31 - 1`` elements, which Python's ``replay`` and
@@ -1385,22 +1641,8 @@ def extern(
         nm, sig, limits = _parse_extern_stub(fn, name, index_bits, prebuilt)
         binary = None
         if prebuilt:
-            for p in sig.consts:  # a fixed argument: a scalar of a C type, with its value (none: each call gives it)
-                if p.default is MISSING:
-                    continue
-                dt = p.const_dtype
-                ok = dt is not None and dt.name in ("i32", "i64", "f32") and isinstance(p.default, (int, float)) and not isinstance(p.default, bool)
-                if ok and dt.is_int:  # type: ignore[union-attr]
-                    lo, hi = dt.int_range()  # type: ignore[union-attr]
-                    ok = isinstance(p.default, int) and lo <= p.default <= hi
-                if not ok:
-                    raise TilefishDeclarationError(
-                        f"extern op '{nm}': const parameter '{p.name}' of a prebuilt binary is an argument of its C ABI: write "
-                        f"`{p.name}: const[i32] = 0` (or const[i64], const[f32]) with a default that fits"
-                    )
-            base = pathlib.Path(fn.__code__.co_filename).resolve().parent if getattr(fn, "__code__", None) is not None else None
-            if base is not None and not base.is_dir():
-                base = None
+            _check_fixed_args(nm, sig)
+            base = _declaring_dir(fn)
             binary = _binary_target("ptx" if ptx is not None else "cubin", ptx if ptx is not None else cubin, symbol, block, shared, base, nm)
         else:
             assert target is not None
@@ -1432,8 +1674,33 @@ def _check_op_name(name: Any) -> None:
         )
 
 
-def _parse_extern_stub(fn: Callable[..., Any], name: "str | None", index_bits: int, prebuilt: bool) -> "tuple[str, Signature, dict[str, int]]":
-    """The op name, the typed signature of an extern's stub and the ``max_elements`` limits its ``index_bits`` gives its tensors."""
+def _check_fixed_args(nm: str, sig: Signature) -> None:
+    """Every const parameter of a prebuilt binary's stub with a default is a fixed argument: a scalar of a C type, with its value (one without a
+    default is a fixed argument per call: each call gives it)."""
+    for p in sig.consts:
+        if p.default is MISSING:
+            continue
+        dt = p.const_dtype
+        ok = dt is not None and dt.name in ("i32", "i64", "f32") and isinstance(p.default, (int, float)) and not isinstance(p.default, bool)
+        if ok and dt.is_int:  # type: ignore[union-attr]
+            lo, hi = dt.int_range()  # type: ignore[union-attr]
+            ok = isinstance(p.default, int) and lo <= p.default <= hi
+        if not ok:
+            raise TilefishDeclarationError(
+                f"extern op '{nm}': const parameter '{p.name}' of a prebuilt binary is an argument of its C ABI: write "
+                f"`{p.name}: const[i32] = 0` (or const[i64], const[f32]) with a default that fits"
+            )
+
+
+def _parse_extern_stub(
+    fn: Callable[..., Any], name: "str | None", index_bits: int, prebuilt: bool, givens: "bool | None" = None
+) -> "tuple[str, Signature, dict[str, int]]":
+    """The op name, the typed signature of an extern's stub and the ``max_elements`` limits its ``index_bits`` gives its tensors. ``prebuilt``: the
+    stub is a prebuilt binary's C ABI (no TMA descriptor, no constexpr that a dimension gives); ``givens``: a const parameter with no default is a
+    fixed argument per call (``const[i32]`` or ``const[i64]``), as it is for a prebuilt binary (the default) and for the stub of an op declared with
+    ``by_arch=`` whose implementations all are prebuilt binaries."""
+    if givens is None:
+        givens = prebuilt
     nm = name or fn.__name__
     if not _OP_NAME.fullmatch(nm):
         raise TilefishDeclarationError(f"extern: the function name {nm!r} is not a plain identifier; pass name=... to give the op one")
@@ -1452,7 +1719,7 @@ def _parse_extern_stub(fn: Callable[..., Any], name: "str | None", index_bits: i
             f"extern op '{nm}': {'a kernel' if prebuilt else 'a Triton kernel'} returns nothing; declare results as Out[...] parameters"
         )
     for p in sig.consts:
-        if p.default is MISSING and not prebuilt:
+        if p.default is MISSING and not givens:
             raise TilefishDeclarationError(f"extern op '{nm}': const parameter '{p.name}' needs a default, the value compiled in as constexpr")
         if p.default is MISSING and (p.const_dtype is None or p.const_dtype.name not in ("i32", "i64")):
             raise TilefishDeclarationError(

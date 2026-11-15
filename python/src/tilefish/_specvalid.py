@@ -549,11 +549,26 @@ def validate_arg(d: Any, schema: int = SCHEMA_VERSION) -> None:
 _SYMBOL = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*\Z")  # a PTX / ELF symbol of a kernel
 _ARCH_KEY = re.compile(r"^sm_[0-9]{2,3}\Z")
 IMPLEMENTATION_FALLBACK = "fallback"
+# the name of a named implementation (``tilefish.impl(..., name="tcgen05")``): an ASCII identifier of at most 64 characters that is not "fallback"
+# and does not look like an architecture (it does not begin with "sm_" and a digit), in any case
+_IMPLEMENTATION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+_LOOKS_LIKE_ARCH = re.compile(r"^sm_[0-9]", re.IGNORECASE)
+
+
+def is_implementation_name(x: Any) -> bool:
+    """Whether ``x`` is the name of a named implementation of an op declared with ``extern(by_arch=...)`` (see ``_IMPLEMENTATION_NAME``)."""
+    return (
+        isinstance(x, str)
+        and _IMPLEMENTATION_NAME.match(x) is not None
+        and x.lower() != IMPLEMENTATION_FALLBACK
+        and _LOOKS_LIKE_ARCH.match(x) is None
+    )
 
 
 def is_implementation(x: Any) -> bool:
-    """Whether ``x`` names an implementation of an op declared with ``extern(by_arch=...)``: an architecture (``"sm_103"``) or ``"fallback"``."""
-    return isinstance(x, str) and (x == IMPLEMENTATION_FALLBACK or _ARCH_KEY.match(x) is not None)
+    """Whether ``x`` names an implementation of an op declared with ``extern(by_arch=...)``: an architecture (``"sm_103"``), ``"fallback"`` or the
+    name of a named implementation."""
+    return isinstance(x, str) and (x == IMPLEMENTATION_FALLBACK or _ARCH_KEY.match(x) is not None or is_implementation_name(x))
 
 
 def validate_binary(b: Any) -> None:
@@ -690,7 +705,7 @@ def validate_spec(d: Any) -> None:
     required = TOP_KEYS_V2 if schema >= DIGEST_SCHEMA else TOP_KEYS
     if is_binary:
         required = [k for k in required if k not in ("triton", "num_warps", "num_stages")] + ["binary"]
-        optional = ["dims"]
+        optional = ["dims", "implementation"]  # (implementation: one implementation of an op declared with extern(by_arch=...))
     _keys(d, "spec", required, optional)
     if "source_sha256" in d and not (isinstance(d["source_sha256"], str) and _DIGEST.match(d["source_sha256"])):
         bad(f"source_sha256 must be 64 lowercase hex digits (a sha256), got {d['source_sha256']!r}")
@@ -701,7 +716,10 @@ def validate_spec(d: Any) -> None:
     if "language" in d and d["language"] != "gluon":  # written only for a Gluon kernel: a Triton kernel's spec has no key (one canonical form)
         bad(f"language is \"gluon\" (the spec of a Gluon kernel) or absent (a triton.jit kernel), got {d['language']!r}")
     if "implementation" in d and not is_implementation(d["implementation"]):
-        bad(f"implementation is an architecture such as \"sm_103\" or \"fallback\" (the implementation of an op declared with by_arch=), got {d['implementation']!r}")
+        bad(
+            f"implementation is an architecture such as \"sm_103\", \"fallback\" or the name of an implementation (an identifier that is not "
+            f"\"fallback\" and does not begin with sm_ and a digit) of an op declared with by_arch=, got {d['implementation']!r}"
+        )
 
     # names
     op = _ident(d["op"], "op")

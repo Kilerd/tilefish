@@ -107,6 +107,7 @@ from ._launch import (
     TORCH_DTYPE_NAMES,
     TensorInfo,
     bind_call,
+    bind_infos,
     bind_outputs,
     canonical_strides,
     check_tensor,
@@ -382,15 +383,24 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]",
     # the dimensions the inputs leave unbound, from the Out tensors given (a kernel's returned values are not parameters of its signature)
     dims = bind_outputs(target.name, target.public, {public_of[n]: i for n, i in given_infos.items() if n in public_of}, call.dims)
     check_dim_constraints(dims)
-    if extern.implementations is not None:  # an implementation per architecture: the one of the device's (the same names, the same ABI)
+    if extern.implementations is not None:  # an implementation per architecture: the one of the device's
+        _declared_consts(target.public, call.consts)  # a const of the op's stub restated: its value there (and the implementation's, below, if it has one)
         device = _device_of({**call.infos, **given_infos}, {**call.tensors, **given})
         if getattr(device, "type", None) != "cuda":
             raise TilefishRuntimeError(f"jit and replay run on a CUDA device; the tensors are on {device}")
         target = target.at(_capability(torch, _device_index(torch, str(device))))
         extern = target.launch_extern()
+        # its own ABI: the op's tensors (the same names, in the same order: the declaration checks it), and its own scalars, constexprs or fixed
+        # arguments, and the dimensions its stub names (the stride dimensions of a view passed as a TMA descriptor are its own)
+        names = _extern_names(target, extern)
+        result_names = _result_names(target, extern)
+        own = extern.signature
+        dims = bind_infos(target.name, own, {p.name: call.infos[p.name] for p in own.params if p.kind == "tensor" and p.access != "out"})
+        dims = bind_outputs(target.name, own, {n: i for n, i in given_infos.items() if n in names}, dims)
+        check_dim_constraints(dims)
     specs = target.compile_specs()
     spec = select_spec(target.name, specs, dims)
-    check_consts(spec, {names[k]: v for k, v in call.consts.items()})
+    check_consts(spec, {names.get(k, k): v for k, v in call.consts.items()})  # (a const of the op's stub that the implementation does not have: not its)
     device = _device_of({**call.infos, **given_infos}, {**call.tensors, **given})
     if getattr(device, "type", None) != "cuda":
         raise TilefishRuntimeError(f"jit and replay run on a CUDA device; the tensors are on {device}")
@@ -408,7 +418,7 @@ def _prepare(target: _Target, args: "tuple[Any, ...]", kwargs: "dict[str, Any]",
     results = [tensors[n] for n in result_names]
 
     infos = {name: tensor_info(name, t) for name, t in tensors.items()}
-    scalars, grid = _finish_launch(extern, spec, dims, infos, {names[k]: v for k, v in call.consts.items()})
+    scalars, grid = _finish_launch(extern, spec, dims, infos, {names.get(k, k): v for k, v in call.consts.items()})
     return _Prepared(target, spec, str(device), tensors, scalars, grid, results)
 
 
