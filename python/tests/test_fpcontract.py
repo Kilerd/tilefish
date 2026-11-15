@@ -112,6 +112,7 @@ class _Spec:
     triton = "kernels:row_axpb"
     binary = None
     source_sha256 = None
+    enable_fp_fusion = False
 
 
 def _verdict(proxy=False):
@@ -137,6 +138,14 @@ def test_a_contracted_lowered_kernel_is_a_bug_of_the_lowering(monkeypatch):
     monkeypatch.setattr(_fpcontract, "check", lambda *a, **k: _verdict())
     with pytest.raises(TilefishBuildError, match="bug of tilefish's lowering"):
         _build.check_contraction(spec, 103, PTX, b"", {"enable_fp_fusion": False}, "s")
+
+
+def test_a_lowered_kernel_built_with_the_option_over_the_default_code_is_told_to_lower_with_fp_fusion_false(monkeypatch):
+    spec = _Spec()
+    spec.source_sha256, spec.enable_fp_fusion = "0" * 64, True
+    monkeypatch.setattr(_fpcontract, "check", lambda *a, **k: _verdict())
+    with pytest.raises(TilefishBuildError, match="lowered with fp_fusion=True and built with enable_fp_fusion=False as a build option"):
+        _build.check_contraction(spec, 120, PTX, b"", {"enable_fp_fusion": False}, "s")
 
 
 def test_only_a_binary_compiled_without_fusion_is_checked(monkeypatch):

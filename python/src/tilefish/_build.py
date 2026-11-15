@@ -805,7 +805,12 @@ def check_contraction(spec: "CompileSpec", cap: int, ptx: str, cubin: bytes, opt
             f"read in the SASS of its PTX assembled for {verdict.target}, the base of its architecture's family, by {verdict.nvdisasm}, which cannot "
             f"decode sm_{cap} ({_fpcontract.NVDISASM_ENV} names one that can)"
         )
-    if spec.source_sha256 is not None:
+    if spec.source_sha256 is not None and spec.enable_fp_fusion is not False:
+        tail = (
+            "The kernel was lowered with fp_fusion=True and built with enable_fp_fusion=False as a build option, which Triton's option alone "
+            "does not keep: lower it with fp_fusion=False instead (every float + - * then one scalar .rn instruction, note 2 of tilefish.lower)."
+        )
+    elif spec.source_sha256 is not None:
         tail = (
             "Every float + - * of a kernel lowered with fp_fusion=False, and of a fused region, is one scalar .rn instruction (note 2 of "
             "tilefish.lower), so this is a bug of tilefish's lowering: please report it with the kernel."
