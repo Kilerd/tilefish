@@ -707,8 +707,9 @@ fn validate(doc: &Value) -> Check<Validated> {
                     ));
                 }
             };
-            if (kind == StepKind::Library) != st.contains_key("workspace") {
-                return refuse(format!("step #{si}: exactly the steps of kind 'library' have a workspace"));
+            // a library step has the workspace; a kernel step has it when its entry has a global scratch (`check_against_manifest`)
+            if kind == StepKind::Library && !st.contains_key("workspace") {
+                return refuse(format!("step #{si}: a step of kind 'library' has a workspace"));
             }
             let (workspace, workspace_buffer) = match st.get("workspace") {
                 Some(ws) => match ws.as_str().and_then(|w| index.get(w).map(|i| (w, *i))) {
@@ -773,7 +774,7 @@ fn validate(doc: &Value) -> Check<Validated> {
                 let b = &buffers[buffer];
                 if b.role == BufferRole::Workspace {
                     return refuse(format!(
-                        "step #{si} args[{ai}]: the workspace is not an argument, it is the workspace field of a library step"
+                        "step #{si} args[{ai}]: the workspace is not an argument, it is the workspace field of a step"
                     ));
                 }
                 names_here.push((name.clone(), b.name.clone()));
@@ -863,9 +864,11 @@ fn validate(doc: &Value) -> Check<Validated> {
         }
         buckets.push(PlanBucket { values: combo.clone(), steps, shapes });
     }
-    let uses_library = buckets[0].steps.iter().any(|s| s.kind == StepKind::Library);
-    if uses_library != buffers.iter().any(|b| b.role == BufferRole::Workspace) {
-        return refuse("there is a buffer of role workspace exactly when some step has kind library");
+    let uses_workspace = buckets[0].steps.iter().any(|s| s.workspace.is_some());
+    if uses_workspace != buffers.iter().any(|b| b.role == BufferRole::Workspace) {
+        return refuse(
+            "there is a buffer of role workspace exactly when some step has a workspace (a library step, a kernel step with a global scratch)",
+        );
     }
 
     // -- the arena: every region inside, overlaps only where the live ranges are disjoint
@@ -1087,6 +1090,19 @@ fn check_against_manifest(v: &Validated, manifest: &Manifest) -> Check<()> {
                                 "{at}: the value {value} of '{name}' does not fit the i32 the binary takes"
                             ));
                         }
+                    }
+                    // a kernel with a global scratch is given the plan's workspace (how much of it a launch needs depends on its grid, which a
+                    // host checks when it instantiates the bucket); any other kernel step has none
+                    let scratch = entry.launch.global_scratch_size;
+                    if (scratch != 0) != st.workspace.is_some() {
+                        return refuse(format!(
+                            "{at}: the binary has {scratch} bytes of global scratch per CTA, and the step {}",
+                            if scratch != 0 {
+                                "has no workspace"
+                            } else {
+                                "has a workspace (only a binary with a global scratch takes one)"
+                            }
+                        ));
                     }
                     pointers_of(&entry.params)
                 }

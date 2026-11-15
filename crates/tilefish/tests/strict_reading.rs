@@ -779,18 +779,48 @@ fn the_launch_attributes_are_read_strictly_and_each_one_a_plain_launch_cannot_se
     let copy = Copy::of("sm_103");
     copy.edit("\"cooperative\": false", "\"cooperative\": false, \"preferred_cluster\": [2, 1, 1]");
     assert!(refused(&copy).contains("unknown field"));
-    // each attribute is a blocker by itself, and says so
+    // each attribute this host does not set up is a blocker by itself, and says so (a global scratch of tilefish 0.0.6, which recorded no
+    // alignment, and one aligned to more than 256 bytes; a cluster that is not num_ctas CTAs, or more than the portable 8)
+    let scratch = |align: &str| format!(r#""global_scratch_size": 128, "global_scratch_align": {align}"#);
     for (from, to, want) in [
-        ("\"global_scratch_size\": 0", "\"global_scratch_size\": 128", "global_scratch_size=128"),
-        ("\"profile_scratch_size\": 0", "\"profile_scratch_size\": 8", "profile_scratch_size=8"),
-        ("\"launch_pdl\": false", "\"launch_pdl\": true", "launch_pdl=True"),
-        ("\"cluster_dims\": [1, 1, 1]", "\"cluster_dims\": [2, 1, 1]", "cluster_dims=[2, 1, 1], num_ctas=1"),
-        ("\"cluster_dims\": [1, 1, 1]", "\"cluster_dims\": [1, 1, 2]", "cluster_dims=[1, 1, 2], num_ctas=1"),
-        ("\"num_ctas\": 1", "\"num_ctas\": 2", "cluster_dims=[1, 1, 1], num_ctas=2"),
-        ("\"cooperative\": false", "\"cooperative\": true", "launch_cooperative_grid=True"),
+        (
+            "\"global_scratch_size\": 0".to_owned(),
+            "\"global_scratch_size\": 128".to_owned(),
+            "global_scratch_size=128 of an alignment the manifest does not record (export it again)",
+        ),
+        ("\"global_scratch_size\": 0".to_owned(), scratch("512"), "global_scratch_size=128 aligned to 512 bytes"),
+        ("\"profile_scratch_size\": 0".to_owned(), "\"profile_scratch_size\": 8".to_owned(), "profile_scratch_size=8"),
+        ("\"launch_pdl\": false".to_owned(), "\"launch_pdl\": true".to_owned(), "launch_pdl=True"),
+        (
+            "\"cluster_dims\": [1, 1, 1]".to_owned(),
+            "\"cluster_dims\": [2, 1, 1]".to_owned(),
+            "cluster_dims=(2, 1, 1), num_ctas=1",
+        ),
+        (
+            "\"cluster_dims\": [1, 1, 1]".to_owned(),
+            "\"cluster_dims\": [1, 1, 2]".to_owned(),
+            "cluster_dims=(1, 1, 2), num_ctas=1",
+        ),
+        ("\"num_ctas\": 1".to_owned(), "\"num_ctas\": 2".to_owned(), "cluster_dims=(1, 1, 1), num_ctas=2"),
+        (
+            "\"cluster_dims\": [1, 1, 1], \"num_ctas\": 1".to_owned(),
+            "\"cluster_dims\": [16, 1, 1], \"num_ctas\": 16".to_owned(),
+            "cluster_dims=(16, 1, 1), num_ctas=16",
+        ),
+        ("\"cooperative\": false".to_owned(), "\"cooperative\": true".to_owned(), "launch_cooperative_grid=True"),
     ] {
-        let attrs = read(&plain.replace(from, to)).unwrap();
+        let text = plain.replace("\n                    ", " ").replace(&from, &to);
+        let attrs = read(&text).unwrap();
         assert_eq!(attrs.blockers(), [want], "{to}");
+    }
+    // what this host launches: a cluster of num_ctas CTAs (cuLaunchKernelEx), a global scratch aligned to a divisor of 256 bytes
+    for (from, to) in [
+        ("\"cluster_dims\": [1, 1, 1], \"num_ctas\": 1", "\"cluster_dims\": [2, 1, 1], \"num_ctas\": 2"),
+        ("\"cluster_dims\": [1, 1, 1], \"num_ctas\": 1", "\"cluster_dims\": [2, 2, 2], \"num_ctas\": 8"),
+        ("\"global_scratch_size\": 0", r#""global_scratch_size": 256, "global_scratch_align": 128"#),
+    ] {
+        let attrs = read(&plain.replace("\n                    ", " ").replace(from, to)).unwrap();
+        assert!(attrs.blockers().is_empty(), "{to}: {:?}", attrs.blockers());
     }
     // several at once are all listed, in the order of the fields
     let many = plain
@@ -799,7 +829,11 @@ fn the_launch_attributes_are_read_strictly_and_each_one_a_plain_launch_cannot_se
         .replace("\"global_scratch_size\": 0", "\"global_scratch_size\": 1");
     assert_eq!(
         read(&many).unwrap().blockers(),
-        ["global_scratch_size=1", "launch_pdl=True", "launch_cooperative_grid=True"]
+        [
+            "global_scratch_size=1 of an alignment the manifest does not record (export it again)",
+            "launch_pdl=True",
+            "launch_cooperative_grid=True"
+        ]
     );
 }
 
