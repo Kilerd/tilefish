@@ -49,8 +49,10 @@ Everything schema 3 describes is launched: Triton kernels and prebuilt PTX and
 cubin binaries (launched with exactly their parameters, `fixed` arguments
 written at their slots, and the values of the `given` ones, fixed per call,
 passed by `Kernel::launch_with(stream, tensors, &[("h_out", 5)])` or a plan
-step), strided views (`TensorRef::from_cuda_strided`), device
-scalars (a tensor of one element), `i64` strides, and pinned cuBLASLt GEMMs
+step), null pointers (kind `null`: 0 at their slot, no tensor), strided views
+(`TensorRef::from_cuda_strided`), device scalars (a tensor of one element), `i64`
+strides and dimension scalars, dense pointers that promise only their element's
+alignment (a lowered kernel's specialisation for views), and pinned cuBLASLt GEMMs
 (`Manifest::gemm`, `Gemm::launch`: the cuBLASLt of the process must be the version
 that chose the algorithm, and the workspace is the caller's last tensor, so
 nothing is allocated in a launch and it can be captured in a CUDA graph). An
