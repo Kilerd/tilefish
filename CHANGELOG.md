@@ -31,6 +31,13 @@ each section names the release that added it.
   to the table's check. `docs/numerics.md` is the procedure on a CUDA or torch change, the `num_warps` decision, and a design for device-global
   state (counters), which waits for a memset step in plans.
 
+### Pinned GEMMs
+
+- `test_gpu_gemm.py` asserts that `heuristic="torch"` (with torch's default reduction) gives `torch.mm` / `torch.addmm` byte for byte on the 30
+  shapes whose default-posture rate it reports, with cuBLASLt 12.8.4 and 13.1.0. Why the default posture matches `addmm` on only 13 of the 15
+  biased shapes under cuBLASLt 13.1 is documented: it gives a GEMM with a bias no split-K, a rule of tilefish's, where `addmm` runs the split-K of
+  3 with f32 partial sums that the heuristic ranks first for 32 and 64 x 1024 x 3072. No pin changes.
+
 ## tilefish 0.0.6, crate 0.0.4
 
 ### Breaking changes

@@ -477,8 +477,12 @@ def proj32(a: Tensor[32, 512, bf16], b: Tensor[1536, 512, bf16], bias: Tensor[15
   (`CUBLASLT_WORKSPACE_SIZE`) and 8 519 680 for `gemm` (`torch.mm` runs `cublasGemmEx` with `CUBLAS_WORKSPACE_CONFIG`'s workspace, and the heuristic under that
   limit answers what it runs; on an sm_90 exactly torch's default is 32 MiB, `workspace_bytes=33_554_432`). With torch's default reduction
   (`allow_bf16_reduction=True`) the result is torch's byte for byte: `test_gpu_cublaslt.py` asserts it over 48 shapes, with and without a bias, on three
-  operand sets each, and it was measured on a B300 MIG slice (sm_103) and an RTX 5090 (sm_120) with cuBLASLt 12.8.4. The default posture, `"tilefish"`, adds
-  16-byte alignment minimums.
+  operand sets each, and it was measured on a B300 MIG slice (sm_103) and an RTX 5090 (sm_120) with cuBLASLt 12.8.4, and on the B300 slice with 13.1.0
+  (`test_gpu_gemm.py`, 30 shapes). The default posture, `"tilefish"`, adds 16-byte alignment minimums, asks for 8 results and, without the opt-in, gives a
+  GEMM with a bias no split-K (below), which torch does not do. It is not torch's, and how often its result is torch's depends on the cuBLASLt version: on
+  the 15 biased shapes of `test_gpu_gemm.py`, all of them with 12.8.4, 13 with 13.1.0, whose heuristic ranks a split-K of 3 with f32 partial sums first
+  for 32 and 64 x 1024 x 3072 (neither the workspace limit, nor the alignment minimums, nor the number of results asked changes its first answer there;
+  the reduction-scheme mask does).
 * `allow_bf16_reduction=True` lets split-K add its partial sums in bf16 (`INPLACE`, `OUTPUT_TYPE`: torch's default,
   `allow_bf16_reduced_precision_reduction`), which rounds more than once. Without it the heuristic is asked for f32 partial sums only, and a GEMM with a
   bias for no split-K at all (with the bias epilogue, a split-K with f32 partial sums was measured to round twice: cuBLASLt 12.8.4 on an RTX 5090); an
