@@ -1,6 +1,6 @@
 # RFC 0001: Plan fusion
 
-* **Status:** draft for review. Design only: nothing here is implemented.
+* **Status:** reviewed; the decisions of 2026-11-15 are recorded in "Decisions" below. Design only: nothing here is implemented yet.
 * **Date:** 2026-11-15.
 * **Scope:** the Python planner (`tilefish.plan`, `tilefish.runtime.export`), the lowering (`tilefish.lower`), the tracer of graph bodies and
   the `reference` mode. The hosts (the Python plan runner and the Rust crate) and both schemas are unchanged.
@@ -21,13 +21,14 @@ generated today. A fused region is an ordinary `kernel` step of the plan: no pla
 
 The numerics rule is the point of the design: **fusion never changes bytes by itself.** Every graph has a declared numerics mode; the default,
 and every mode called *exact*, makes the fused plan byte-identical to the *unfused composition*, the plan in which every arithmetic op is a
-kernel of its own and every intermediate is stored in its declared dtype. The modes that are not exact (compiler contraction, Triton tree
-reductions inside a region, library epilogues) are opt-in, named in the declaration, digested and pinned like every other choice, and reported.
-Section 5 states the claim, the obligations it rests on, the hazards found while designing it (one of them a compiler fold that can change
-NaN payloads), and the tests that prove it.
+kernel of its own and every intermediate is stored in its declared dtype, and `export` verifies it byte for byte by default. Version 1 has
+exact modes only; modes that would not be exact (compiler contraction, Triton tree reductions inside a region, library epilogues) are future
+work (section 11). Section 5 states the claim, the obligations it rests on, the hazards found while designing it (one of them a compiler fold
+that can change NaN payloads), and the tests that prove it.
 
 ## Contents
 
+Decisions (2026-11-15)
 0. Background: what exists
 1. Use cases and non-goals
 2. Surface syntax and capture
@@ -39,8 +40,30 @@ NaN payloads), and the tests that prove it.
 8. Schema impact and migration
 9. Staged implementation plan, test plan and open questions
 10. Prior art
+11. Future work: modes that are not exact, and other extensions
 
 Appendix A: a worked example.
+
+## Decisions (2026-11-15)
+
+The draft was reviewed on 2026-11-15. The questions of section 9.4 that are settled:
+
+* **D1 (Q1): on by default.** A graph whose body has arithmetic fuses it, in the exact default mode, without a declaration. No existing plan
+  changes: until now such a graph was refused.
+* **D2 (Q2): an unordered reduction runs alone.** A reduction with no `order=` is a kernel of its own, unfused, its operand stored (as in the
+  unfused composition); it joins a region once the body gives it an `order=`.
+* **D3 (Q3): no contraction by default.** A graph contracts nothing; one rounding of `a * b + c` is asked for with `tilefish.fma` or with the
+  declared rewrite `fp_contract="mul-add"` (an exact mode).
+* **D4 (Q4): scalars round to the tensor's dtype**, as in a kernel body; torch's rule is the opt-in exact mode `intermediates="opmath"`.
+* **D5 (Q5): exact modes only in version 1.** Compiler contraction, Triton tree reductions inside regions and rewrites into library epilogues
+  are future work (section 11).
+* **D6 (Q6): export verifies.** `export` runs the fused plan and the unfused composition byte for byte on seeded and special-value inputs at
+  every bucket and refuses a difference; `verify=False` opts out.
+* **D7 (Q7): frozen grouping rules.** `tilefish.fusion(version=N)` fixes the grouping rules, limits and rewrites; version 1 is the first, and a
+  later tilefish keeps every earlier version. A plan made with another version is refused as stale with a message that names the version.
+
+D3 and D4 were the recommended defaults and were not objected to. Q4b and Q8 to Q11 stay open; section 9.4 gives the recommended default of
+each.
 
 ## 0. Background: what exists
 
@@ -124,28 +147,28 @@ graph unchanged. What the graph adds is a declaration of how the arithmetic is e
 @tilefish.graph(fusion=tilefish.fusion(grouping="none"))     # the unfused composition: one kernel per op (the oracle, section 5.1)
 ```
 
-| parameter | values (default first) | what it says | exact? (section 5.4) |
+| parameter | values (default first) | what it says | phase |
 |---|---|---|---|
-| `version` | `1` | the grouping rules, limits and rewrite rules; a later tilefish keeps old versions | (identity) |
-| `grouping` | `"auto"`, `"none"` | regions as section 3 makes them, or one kernel per op | both |
-| `math` | `"fast"`, `"ieee"` | the default math of the body's f32 ops, as `@tilefish.kernel(math=...)` | both |
-| `intermediates` | `"declared"`, `"opmath"`, `"f32"` | how a 16-bit intermediate is rounded: as its IR dtype says; as torch's eager ops round; widened to f32 between calls | all three |
-| `fp_contract` | `"none"`, `"mul-add"`, `"compiler"` | no contraction; a declared rewrite into `tilefish.fma`; whatever LLVM and ptxas contract | `none`, `mul-add` |
-| `reductions` | `"ordered"`, `"tree"` | a reduction joins a region only with an `order=`; or Triton's tree reductions join regions too | `ordered` |
-| `epilogues` | `None`, `"cublaslt"` | no library epilogues; measured rewrites into cuBLASLt epilogues (section 7) | `None` |
-| `verify` | `True`, `False` | `export` runs the fused plan and the unfused composition on seeded inputs at every bucket and refuses a difference (section 5.6) | (check) |
+| `version` | `1` | the grouping rules, limits and rewrite rules, frozen (D7) | 1 |
+| `grouping` | `"auto"`, `"none"` | regions as section 3 makes them, or one kernel per op (the unfused composition) | 1 |
+| `math` | `"fast"`, `"ieee"` | the default math of the body's f32 ops, as `@tilefish.kernel(math=...)` | 1 |
+| `intermediates` | `"declared"`, `"opmath"`, `"f32"` | how a 16-bit intermediate is rounded: as its IR dtype says; as torch's eager ops round (D4); widened to f32 between calls | `"declared"`: 1, the others: 3 |
+| `fp_contract` | `"none"`, `"mul-add"` | no contraction (D3); a declared rewrite into `tilefish.fma` | `"none"`: 1, `"mul-add"`: 3 |
+| `verify` | `True`, `False` | `export` runs the fused plan and the unfused composition on seeded inputs at every bucket and refuses a difference; `False` opts out (D6, section 5.6) | 1 |
+
+Every value is an exact mode (section 5.4). A reduction joins a region only with an `order=`; without one it is a kernel of its own (D2).
+Knobs for modes that are not exact are future work (section 11).
 
 **Defaults.** A graph that declares nothing and has arithmetic gets `tilefish.fusion()`. This changes no existing plan: until now such a graph
-was refused, so every plan that exists has no arithmetic and fuses nothing. (Whether fusion should instead need an explicit opt-in is open
-question Q1.)
+was refused, so every plan that exists has no arithmetic and fuses nothing (D1).
 
 ### 2.3 Controls in the body
 
-* `tilefish.barrier(x)` returns `x` and makes it a region boundary: the value gets a buffer of the plan. In an exact mode a barrier never
-  changes bytes (that is what exact means); it exists to tap an intermediate, to keep a buffer for a later stage, and to shape the kernels by
+* `tilefish.barrier(x)` returns `x` and makes it a region boundary: the value gets a buffer of the plan. A barrier never changes bytes
+  (every mode is exact); it exists to tap an intermediate, to keep a buffer for a later stage, and to shape the kernels by
   hand. In a kernel body it is refused.
 * `with tilefish.fused(name="norm"):` asks for the ops traced inside to be one region; the plan is refused, with the rule that failed, when
-  they cannot be (a reduction without an order in `reductions="ordered"`, two iteration spaces, a cycle through a call). `name` prefixes the
+  they cannot be (a reduction without an order, two iteration spaces, a cycle through a call). `name` prefixes the
   generated op's name for profiles and reports. Regions may not nest or straddle a call.
 * `tilefish.sum(..., order=...)` exists; this RFC adds `order=` to `tilefish.mean` (`sum` with that order, then `* f32(1 / D)`, as `mean` is
   today) and proposes a total-order `max` if experiment E2 (section 9.2) shows that Triton's `tl.max` is not order-free on signed zeros and
@@ -164,8 +187,8 @@ Small, and confined to graph traces, so no kernel's IR, source or digest changes
 5. Masks may now cross a region boundary in `grouping="none"` and when a region must be split: such a mask is stored as `u8` (0 or 1) and read
    back as `!= 0`, which is exact (note 7).
 
-The tracer's dtype rules do not change: a 16-bit tensor still needs `.to(f32)` before `exp` (whether `intermediates="opmath"` should accept
-16-bit unary math, as torch does, is open question Q4).
+The tracer's dtype rules do not change: a 16-bit tensor still needs `.to(f32)` before `exp`, in every mode (whether `intermediates="opmath"`
+should accept 16-bit unary math, as torch does, is open question Q4b; recommended: no).
 
 ### 2.5 Dtype and broadcast semantics in a graph body
 
@@ -252,7 +275,7 @@ A union `A ∪ B` is legal when all of these hold; the check that decides is the
 2. **Acyclic through the rest of the graph.** No path leaves `A ∪ B` and comes back (through a call, a view, a move or another region). The
    edges are the data edges and the **anti-dependencies** of in-place updates: a node that reads version `k` of a buffer comes before the node
    that makes version `k + 1`.
-3. **Reductions** (`reductions="ordered"`): a reduction without an `order=` is a region of its own, and its operand is a stored value (its
+3. **Reductions** (D2): a reduction without an `order=` is a region of its own, and its operand is a stored value (its
    producer is in another region). Its bytes then depend on nothing but its own kernel, as in the unfused composition (section 5.3, hazard H4).
    An ordered sum, a total-order `max` and `argmax` / `argmin` join regions freely.
 4. **In-place writes.** A region may write an `InOut` or carried parameter (a `store` of one of its values into it, or the update a call would
@@ -302,7 +325,8 @@ The fusion pass builds, for each region, the `KernelOp` that a user would have w
   `Strided[...]` with its `StrideOf` scalars; a `DevScalar` as is; an `InOut` for rule 4), then one result per output;
 * **body**: the region's nodes, copied into a fresh kernel trace with `region` and `loc` stripped and the graph's default `math` applied to
   every node that has no `math=` of its own;
-* **options**: `fp_fusion=False` unless `fp_contract="compiler"`; `math` as declared; `num_warps` by the template's rule (4.4).
+* **options**: `fp_fusion=False` (D3: a declared contraction is an explicit `fma` node); `math` as declared; `num_warps` by the template's
+  rule (4.4).
 
 `tilefish.lower` turns it into Triton source exactly as it lowers any kernel. This is the central choice of the design: **a region inherits
 the numerics contract of the lowering, which is written down and measured, instead of a new code generator that would need all of it measured
@@ -345,8 +369,8 @@ already.
   `by_bucket` mechanism of externs (a smaller block for a small bucket). Changing it changes the binary and the pin, never the output bytes.
 * **Row regions** with ordered sums, `argmax` / `argmin` and per-element ops only are layout-independent too: `num_warps` per bucket
   (`clamp(BLOCK_D // 256, 1, 16)` today) is a speed choice.
-* **Row regions with a Triton tree reduction** (only under `reductions="tree"`) take the template's rule as part of their numerics, exactly as a
-  `@tilefish.kernel` does today: each bucket's warp count is its own (note 6), recorded and pinned.
+* **A reduction without an order** (D2) is a kernel of its own, the same kernel in the fused plan and in the unfused composition. Its warp
+  count follows the template's rule per bucket and is part of its numerics (note 6), recorded and pinned, as for any `@tilefish.kernel`.
 * Nothing is autotuned at export.
 
 ### 4.5 Grid or persistent
@@ -383,7 +407,7 @@ It holds by construction when these obligations hold. Each has a test (5.6) and,
 | O3 | nothing contracts across two ops | `enable_fp_fusion=False` (LLVM emits `mul.rn` / `add.rn`, ptxas gets `-fmad false`); a declared contraction is an explicit `tilefish.fma` (inline PTX); IEEE helpers carry `.rn` | the options in every entry; a PTX check that a region has no `fma` its nodes did not ask for |
 | O4 | no fold, reassociation or fast-math rewrite across two ops changes a bit | Triton is not expected to set fast-math flags other than contraction (the guard checks it on every build); LLVM folds only what it considers exact, and one fold it considers exact is not exact on NaN payloads (H1) | a guard scanning each region's LLVM IR for `reassoc`, `nnan`, `ninf`, `nsz`, `arcp`, `afn`; NaN-payload tests |
 | O5 | a per-element op's result depends only on its operands at that element | per-lane code; a packed `x2` instruction computes each half as the scalar one does; the block size, vector width and warp count only distribute lanes | the same region at several configurations gives the same bytes |
-| O6 | every reduction inside a region is layout-independent | ordered sums (note 17), `argmax` / `argmin` (note 8); a Triton tree reduction is not (H4), so `reductions="ordered"` keeps it alone | E1 and E2; ordered-sum tests at several warp counts |
+| O6 | every reduction inside a region is layout-independent | ordered sums (note 17), `argmax` / `argmin` (note 8); a Triton tree reduction is not (H4), so it runs alone (D2) | E1 and E2; ordered-sum tests at several warp counts |
 | O7 | `F` and `U` are compiled by one toolchain, with one libdevice and one CUDA math library | one export | the CUDA math guard and the manifest's `toolchain` |
 | O8 | the flush-to-zero behaviour of each op is its own | same compile options, same per-op code (`.ftz` comes from the op, note 5) | subnormal sweeps |
 
@@ -394,34 +418,26 @@ It holds by construction when these obligations hold. Each has a test (5.6) and,
 | H1 | LLVM's instcombine (and MLIR's arith folders) can fold `fptrunc(fpext(x))` to `x`, which they treat as exact, wherever a cast reaches them as an ordinary conversion. In `U` the widening and the narrowing are two kernels and the narrowing is `cvt.rn.bf16.f32`, which makes every NaN canonical (`0x7FFF`, note 1); fused and folded, the input's payload survives. Whether Triton 3.5.1's casts reach the fold is experiment E5 | `x.to(f32).to(bf16)` of an input NaN with a non-canonical payload differs (only NaNs, and only NaNs that come from an input: GPU arithmetic produces canonical ones) | a narrowing float cast whose operand is a widening cast in the same region is emitted as inline PTX (`cvt.rn.bf16.f32`, the instruction the standalone cast compiles to), which LLVM cannot fold; the rewrites never emit such a pair; NaN-payload tests on every cast pair |
 | H2 | a value `U` loads from memory becomes a constant in `F` (a memset folded into a region, a known zero), and MLIR or LLVM folders then apply (`x + (-0.0) -> x` keeps a NaN payload that a GPU `add` would canonicalise) | NaN payload and signed-zero differences | rule: **a value `U` loads, `F` loads or computes by the same ops; it is never replaced by a constant**. Constants are only the IR's own literals, which are per node and so folded identically in `F` and `U` |
 | H3 | contraction across an op boundary (`a * b` in one op, `+ c` in the next) | 23% of elements differ (note 2) | O3: no contraction unless declared |
-| H4 | a Triton tree reduction's operand layout (elements per thread, from the loads that anchor the layout) depends on the whole kernel, so the same `tl.sum` may add in another tree when other loads of other dtypes share its kernel | last-bit differences, data-dependent | `reductions="ordered"`: unordered reductions run alone, and their operand is stored; experiment E1 measures how often the tree really changes |
+| H4 | a Triton tree reduction's operand layout (elements per thread, from the loads that anchor the layout) depends on the whole kernel, so the same `tl.sum` may add in another tree when other loads of other dtypes share its kernel | last-bit differences, data-dependent | D2: unordered reductions run alone, and their operand is stored; experiment E1 measures how often the tree really changes |
 | H5 | `tl.max` on `+0.0` and `-0.0`, and on NaN, may depend on the order | a sign of zero | experiment E2; if it is not order-free, a total-order combine (as `argmax` has) replaces it in regions |
 | H6 | the library behind a math op changes with the CUDA or libdevice version (CUDA 13.2 changed `erff`) | other bytes, `F` and `U` alike | not a fusion hazard (O7); the CUDA math guard warns |
-| H7 | the `fp_contract="compiler"` mode contracts what LLVM sees, which depends on the region's shape | bytes depend on the grouping | declared non-exact (5.4), and reported per region |
 
 ### 5.4 Modes
 
-Every knob is either an IR rewrite (so an exact mode keeps `F(P) == U(P)` for the rewritten `P`) or a code-generation choice (so the mode is
-*binary-defined*). A rewrite is defined on the IR, before grouping, so its rounding points never depend on where the regions fall.
+Every knob of version 1 is an IR rewrite, so every mode keeps `F(P) == U(P)` for the rewritten `P`. A rewrite is defined on the IR, before
+grouping, so its rounding points never depend on where the regions fall.
 
 | knob | value | what it is | relation to the unfused composition |
 |---|---|---|---|
 | `intermediates` | `"declared"` (default) | the identity: every op rounds to the dtype the IR gives it (a `bf16 * bf16` is a bf16 multiply; `x.to(f32)` keeps f32 until a cast) | exact |
-| | `"opmath"` | torch's eager rule as a rewrite: a 16-bit op with a scalar operand becomes `op(a.to(f32), f32(c)).to(bf16)`, with the scalar's original Python value rounded to f32 (the IR keeps it). Two-tensor 16-bit `+ - *` are unchanged: an f32 product of two 16-bit values is exact, an f32 sum is exact or so far from a 16-bit midpoint that the second rounding cannot differ, so torch's bytes are the native op's (the exhaustive pair test of 5.6 checks it) | exact for the rewritten program; with `math="ieee"` and the ops whose IEEE form is torch's (notes 13, 15, 16) it is meant to be torch's eager composition byte for byte (to be measured, 5.6) |
+| | `"opmath"` | torch's eager rule as a rewrite (D4): a 16-bit op with a scalar operand becomes `op(a.to(f32), f32(c)).to(bf16)`, with the scalar's original Python value rounded to f32 (the IR keeps it). Two-tensor 16-bit `+ - *` are unchanged: an f32 product of two 16-bit values is exact, an f32 sum is exact or so far from a 16-bit midpoint that the second rounding cannot differ, so torch's bytes are the native op's (the exhaustive pair test of 5.6 checks it) | exact for the rewritten program; with `math="ieee"` and the ops whose IEEE form is torch's (notes 13, 15, 16) it is meant to be torch's eager composition byte for byte (to be measured, 5.6) |
 | | `"f32"` | Inductor-like widening as a rewrite: every 16-bit value made by an ARITH node is computed in f32 and rounded to its declared dtype only where it leaves the arithmetic: an argument of a call, a returned value, a store, a barrier. A cast written in the body stays a rounding point. Defined on the IR (calls, returns, stores, casts), not on regions | exact for the rewritten program (a region split stores the f32 value); not equal to `"declared"` |
-| `fp_contract` | `"none"` (default) | no contraction | exact |
+| `fp_contract` | `"none"` (default) | no contraction (D3) | exact |
 | | `"mul-add"` | a rewrite: an f32 `add(mul(a, b), c)` or `add(c, mul(a, b))` whose `mul` has no other use becomes `fma(a, b, c)`; `sub(mul(a, b), c)` becomes `fma(a, b, neg(c))`, `sub(c, mul(a, b))` becomes `fma(neg(a), b, c)`; when both operands of an `add` qualify, the left one is contracted. 16-bit contraction needs a 16-bit `fma` primitive (Q10) | exact for the rewritten program (`fma` and `neg` are exact in the reference, note 16) |
-| | `"compiler"` | `enable_fp_fusion=True`: LLVM and ptxas contract what they see, as a `@tilefish.kernel` does by default | binary-defined |
-| `reductions` | `"ordered"` (default) | only ordered and order-free reductions join regions | exact |
-| | `"tree"` | Triton tree reductions join regions; each row region's warp rule is part of its numerics | binary-defined |
 | `math` | `"fast"` / `"ieee"` | the per-op math (note 13) | exact either way (the same code in `F` and `U`) |
 | `grouping` | `"auto"` / `"none"` | `"none"` is `U(P)` itself | exact |
-| `epilogues` | `None` / `"cublaslt"` | section 7 | `"cublaslt"` is library-defined (measured, not proven) |
 
-**Binary-defined** means: the bytes are still deterministic, pinned and reproduced by every replay and both hosts, because the digest covers
-the machine code; but they are not those of any unfused composition, adding a barrier or upgrading the grouping may change them, the reference
-holds them only within the measured tolerance, and the fusion report marks each such region. This is the contract every `@tilefish.kernel`
-with a Triton reduction or default contraction has today, so nothing weaker is introduced; it is just never the default of a graph.
+A reduction without an order is not a mode: it is a kernel of its own in `F` and `U` alike (D2).
 
 ### 5.5 How it is digested, and what a pin means
 
@@ -431,11 +447,11 @@ with a Triton reduction or default contraction has today, so nothing weaker is i
 * The fusion settings are part of what Python derives the plan from, so a graph whose mode changed is refused as stale, like a graph whose ops
   changed.
 * In an exact mode a pin also implies, by 5.2, that the bytes are `U(P)`'s; `tilefish.verify_fusion(graph, *inputs, buckets=...)` checks it on
-  any inputs at any time, and `export(..., verify=True)` checks it on seeded inputs before writing anything (5.6).
+  any inputs at any time, and `export` checks it on seeded inputs before writing anything, unless `verify=False` (D6, 5.6).
 * **The fusion report.** `tilefish.fusion_report(graph, buckets=...)` and every `export` (as `<graph>.fusion.json` next to the plan) list each
   region: its generated op, template, iteration space, the graph nodes it took (index, op, `loc`), its inputs (and whether a view was read
   strided or materialised), its outputs, every rounding point it keeps, every rewrite applied (contractions made, roundings removed by
-  `"f32"`), every reduction and its order, and whether the region is exact or binary-defined. It is informative (hosts never read it) and
+  `"f32"`), every reduction and its order, and the mode. It is informative (hosts never read it) and
   derived (Python regenerates it from the graph). It is the "documented fusion step" that a port of a hand-fused engine needs: which original
   ops were merged, and what changed numerically.
 
@@ -461,11 +477,10 @@ with a Triton reduction or default contraction has today, so nothing weaker is i
   tolerances apply. `intermediates="opmath"` with IEEE math is compared with torch's eager composition of the same ops, and two-tensor
   bf16 and f16 `+`, `-` and `*` are compared with torch's eager op on every pair of bit patterns (`2**32` pairs per op and dtype), which is
   what lets `opmath` leave them unchanged.
-* **Binary-defined modes.** Deterministic across runs, `jit` equals `replay`, Rust equals Python, and within tolerance of the reference.
 * **Hosts.** The Rust gate gets fused plans: Rust against Python replay byte for byte, launched and in CUDA graphs, with carried buffers and a
   shared arena.
-* **Export-time verification.** `export(..., verify=True)` (default while fusion is new: Q6) runs `F` and `U` in `jit` on seeded inputs with
-  special values at every bucket on the export device and refuses a difference.
+* **Export-time verification** (D6). `export` runs `F` and `U` in `jit` on seeded inputs with special values at every bucket on the export
+  device and refuses a difference; `verify=False` opts out. Its own tests: a deliberately broken region (a contraction slipped in) is refused.
 * **Both architectures.** Everything above runs on sm_103 and sm_120. `F == U` is claimed per architecture; cross-architecture equality is
   not (it holds only where the ops' own PTX is the same, as today).
 
@@ -492,19 +507,17 @@ launch it like any Triton entry; nothing in either schema is new.
 
 ## 7. Epilogue and prologue fusion into library ops and externs
 
-Elementwise work after a GEMM can run as (a) a generated kernel after it (the default, phases 1 to 3), (b) a cuBLASLt or cuDNN epilogue, or
-(c) an epilogue inside an extern's own kernel. What can be pinned differs:
+Elementwise work after a GEMM can run as (a) a generated kernel after it, (b) a cuBLASLt or cuDNN epilogue, or (c) an epilogue inside an
+extern's own kernel. Version 1 has route (a) only (D5); route (c) is phase 4; route (b) and prologues are future work (section 11.2).
 
-| route | what is pinned | exact against `U`? | proposal |
+| route | what is pinned | exact against `U`? | status |
 |---|---|---|---|
-| (a) generated kernel after the call | the region's machine code | yes, by 5.2 | the default; one extra read and write of the call's output |
-| (b) cuBLASLt epilogues: bias, ReLU, GELU and their auxiliary-output variants, `beta * C` (a residual), per-tensor FP8 scales and an absolute-maximum output | the 64-byte algorithm, the cuBLASLt version, the SM count, a canary | only by measurement: the library has no IR, and its epilogue's rounding is not documented to match any tilefish op. The existing pins show the risk: the bias epilogue with a split-K and f32 partial sums was measured to round twice on one architecture, which is why, without the opt-in to reduced-precision partial sums, a pinned GEMM with a bias takes no split-K | (i) an epilogue the user declares is a library op of its own (`impl="cublaslt.gemm_bias"` exists; others would follow the same pattern), with its numerics stated as the library's. (ii) An automatic rewrite of graph arithmetic into an epilogue only under `epilogues="cublaslt"`, only for patterns whose rounding points agree on paper (`(gemm_f32(x, w) + b.to(f32)).to(bf16)` is `gemm_bias` with a bf16 output: an f32 sum, one rounding), and only after `export` measured the rewrite equal to `U` at every bucket on seeded and special-value inputs for that pin. A rewrite that changes a rounding point (`round(acc) + b` into `round(acc + b)`) is never automatic |
-| (b') cuDNN runtime-fusion engines (a convolution followed by pointwise ops) | engine configuration, version, canary | as (b) | a declared library op only; no automatic rewrite |
-| (c) an extern's epilogue hook | the extern's binary with the hook inlined (Triton folds a `tl.constexpr` jit function into the IR, so the TTIR digest covers it) | yes if the hook is applied to the value the kernel would store, after its own rounding to the output dtype, and its arithmetic cannot contract with the kernel's (the hook's ops emitted as `.rn` inline PTX, or a cast at the boundary); that the kernel's own arithmetic is unchanged is checked, not proven, by `verify` | phase 4: `@tilefish.extern(..., epilogue=tilefish.hook("EPILOGUE", out="c"))`; the kernel calls `c_tile = EPILOGUE(c_tile, ...)` before its store, and the plan passes a generated `@triton.jit` function of the region; each extern-plus-epilogue pair is a new binary |
-| (c') a prologue hook (dequantise or normalise the A operand as it is loaded) | as (c) | per element, as (c); the work is repeated for every tile that loads the element | after phase 4, open |
+| (a) generated kernel after the call | the region's machine code | yes, by 5.2 | the default, phases 1 to 3; one extra read and write of the call's output |
+| (c) an extern's epilogue hook | the extern's binary with the hook inlined (Triton folds a `tl.constexpr` jit function into the IR, so the TTIR digest covers it) | yes if the hook is applied to the value the kernel would store, after its own rounding to the output dtype, and its arithmetic cannot contract with the kernel's (the hook's ops emitted as `.rn` inline PTX, or a cast at the boundary); that the kernel's own arithmetic is unchanged is checked by the export-time verification (D6), not proven | phase 4: `@tilefish.extern(..., epilogue=tilefish.hook("EPILOGUE", out="c"))`; the kernel calls `c_tile = EPILOGUE(c_tile, ...)` before its store, and the plan passes a generated `@triton.jit` function of the region; each extern-plus-epilogue pair is a new binary, and a pair that verification refuses falls back to route (a) |
+| (b) cuBLASLt or cuDNN epilogues | the library's algorithm or engine pin, version, canary | only by measurement (section 11.2) | future work |
 
-Generated kernels are the only route that is exact by construction, so they are the default; the other routes are declared or measured, and
-the fusion report says which route each region took.
+An epilogue that a user declares as a library op (`impl="cublaslt.gemm_bias"` today) is an ordinary call with the library's stated numerics,
+not fusion, and is unaffected.
 
 ## 8. Schema impact and migration
 
@@ -522,10 +535,11 @@ the fusion report says which route each region took.
 
 * **Nothing has to migrate.** Every existing `@tilefish.kernel`, extern and generated op keeps its identity; a graph without arithmetic plans
   as before.
-* **A `@tilefish.kernel` body moved into a graph** keeps its bytes when its options are restated: `@tilefish.kernel` contracts by default and
-  a graph does not, so a body with a contractable `a * b + c` needs `fp_contract="compiler"` (and `reductions="tree"` if it has an unordered
-  reduction) and `with tilefish.fused():` around it. The region then generates the kernel's own source. The better migration is to say the
-  numerics: `tilefish.fma` where the kernel meant one rounding, `order=` where it meant an order, and keep the default modes.
+* **A `@tilefish.kernel` body moved into a graph** keeps its bytes when the kernel is already exact-expressible: declared
+  `fp_fusion=False` and every reduction ordered (or none). Under `with tilefish.fused():` the region then generates the kernel's own source. A
+  kernel that relies on compiler contraction (the kernel default) or on a Triton tree reduction stays a `@tilefish.kernel` in version 1 (the
+  matching graph modes are future work, section 11.1). The better migration is to say the numerics: `tilefish.fma` where the kernel meant one
+  rounding, `order=` where it meant an order.
 * **Hand-written elementwise externs** (bias plus activation, residual adds, casts) can be replaced by graph arithmetic once a test shows the
   graph's declared numerics reproduce them (`verify_fusion` against the extern on special-value inputs). The one-instruction primitives and
   ordered sums exist so that a hand-fused CUDA kernel's bytes can be written in the DSL.
@@ -540,21 +554,25 @@ the fusion report says which route each region took.
 
 | phase | content | milestone (done when) |
 |---|---|---|
-| 0: experiments | E1 to E5 below, on sm_103 and sm_120 | the answers decide the reductions default and the `max` lowering |
-| 1: elementwise regions | `tilefish.fusion` (default mode only: `declared`, `none`, `ordered`, `fast` / `ieee`), `grouping="none"`, `barrier`, `fused`; the fusion pass and the synthetic kernel; strided inputs in the elementwise template; the H1 cast emission; the fast-math flag guard; graph `reference` mode for ARITH nodes; fusion report; `verify_fusion` and `export(verify=True)`; a reduction runs as a region of its own (the row template as it is) | the README's `mlp` graph plans and runs; bias + activation, residual add, dequantisation, periodic activations and masks fuse; `F == U` on the exhaustive, grid and property-based suites; Rust gate green; exports reproducible |
+| 0: experiments | E1 to E5 below, on sm_103 (then sm_120) | the `max` lowering is decided, H1 is confirmed or ruled out, speed expectations are set; E1 and E4 inform future work |
+| 1: elementwise regions | `tilefish.fusion(version=1)` with the default mode (`intermediates="declared"`, `fp_contract="none"`, `math="fast"` / `"ieee"`), on by default (D1), `grouping="none"`, `barrier`, `fused`; the fusion pass and the synthetic kernel; strided inputs in the elementwise template; the H1 cast emission; the fast-math flag guard; graph `reference` mode for ARITH nodes; fusion report; `verify_fusion` and export-time verification on by default (D6); a reduction runs as a region of its own (the row template as it is) | the README's `mlp` graph plans and runs; bias + activation, residual add, dequantisation, periodic activations and masks fuse; `F == U` on the exhaustive, grid and property-based suites; Rust gate green; exports reproducible |
 | 2: row regions | ordered reductions in regions (`sum`, `mean(order=)`, order-free `max`, `argmax`); multiple outputs and side outputs; `InOut` and carried writes (rule 4); strided inputs in the row template; strided outputs; dense reshapes inside regions; per-bucket configurations | rmsnorm + residual, layer norm, softmax pieces and per-row quantisation fuse exactly and run at least as fast as the hand-written `@tilefish.kernel` equivalents |
-| 3: modes and movement | `intermediates="opmath"` and `"f32"`, `fp_contract="mul-add"` and `"compiler"`, `reductions="tree"`; row-local split / interleave / concatenate for rotary embeddings | each mode's tests: `opmath` + IEEE against torch eager; `mul-add` against explicit `fma`; binary-defined modes deterministic and within tolerance |
-| 4: epilogues | extern epilogue hooks; opt-in cuBLASLt epilogue rewrites with measurement at export; horizontal fusion and segmented reductions as separate items | an extern GEMM with a fused bias-activation epilogue equals `U` at every bucket |
+| 3: exact modes and movement | `intermediates="opmath"` and `"f32"`, `fp_contract="mul-add"` (with 16-bit `fma` if Q10 is accepted); row-local split / interleave / concatenate for rotary embeddings | each mode's tests: `opmath` + IEEE against torch eager; `mul-add` against explicit `fma`; `F == U` for every mode |
+| 4: extern epilogues | extern epilogue hooks (route (c)); horizontal fusion and segmented reductions as separate items | an extern GEMM with a fused bias-activation epilogue equals `U` at every bucket |
+
+Everything that is not exact is outside these phases (section 11).
 
 ### 9.2 Phase 0 experiments (each small, on a free GPU)
 
 * **E1, tree reductions in context.** The same `tl.sum` row kernel alone, and fused after loads of other dtypes (bf16 and f32 operands, as
-  rmsnorm has): count differing rows over the reduction-order suite. Decides whether `reductions="tree"` could ever be exact (expected: no).
+  rmsnorm has): count differing rows over the reduction-order suite. Confirms D2's premise and informs section 11.1 (expected: rows differ, so a tree
+  reduction can never join a region exactly).
 * **E2, `tl.max` order-freedom.** Rows with `+0.0` / `-0.0` mixes and NaNs at 1 to 16 warps. Decides the `max` lowering in regions.
 * **E3, speed.** Fused against unfused against the hand-written `@tilefish.kernel` for bias + SiLU, SwiGLU on strided halves, rmsnorm +
-  residual and softmax, at decode and prefill row counts, on a B300 slice and an RTX 5090. Sets expectations for Q2 (ordered reductions cost).
+  residual and softmax, at decode and prefill row counts, on a B300 slice and an RTX 5090. Measures what D2 costs (an unordered reduction alone against an ordered
+  one fused).
 * **E4, the cuBLASLt bias epilogue.** `(gemm_f32 + b.to(f32)).to(bf16)` against `gemm_bias` with a bf16 output, every pin of a test set,
-  special-value biases. Decides whether route (b) is worth building.
+  special-value biases. Informs section 11.2 (whether route (b) is worth building later).
 * **E5, H1.** Confirm the `fptrunc(fpext(x))` fold on Triton 3.5.1 and that the inline-PTX cast closes it.
 
 ### 9.3 Test plan summary
@@ -563,27 +581,23 @@ Section 5.6, by phase: construction tests and refusals on every machine (`pytest
 on GPU (`pytest -m gpu`, `rust_gate.py`), on sm_103 and sm_120; the reproducible-export tests on fused exports; the use-case
 graphs as goldens with their fusion reports committed.
 
-### 9.4 Open questions for review
+### 9.4 Open questions
 
-* **Q1. Default on or opt-in?** Recommended: on, in the exact default mode, for any graph with arithmetic (no existing plan can change, since
-  such graphs were refused). Alternative: require `fusion=` explicitly.
-* **Q2. An unordered reduction in a graph body.** (a) Recommended: it runs alone, its operand stored (exact; slower, rmsnorm becomes three
-  kernels until the body says `order=`); (b) a canonical default order chosen from `D` (exact and fused, but a second meaning of `sum` without
-  `order` next to the kernel body's); (c) Triton's tree inside regions (fast, binary-defined, bytes move when the grouping moves).
-* **Q3. FMA default.** Recommended: no contraction in graphs (the kernel default contracts). One rounding is asked for with `tilefish.fma` or
-  `fp_contract="mul-add"`.
-* **Q4. Scalars and 16-bit math.** Keep tilefish's rule (a scalar rounded to the tensor's dtype) as the graph default, with torch's rule as
-  `intermediates="opmath"`? And should `opmath` accept `exp(x_bf16)` and the like as torch does, which couples the tracer to the mode?
-* **Q5. Which binary-defined modes to offer.** All of `fp_contract="compiler"`, `reductions="tree"` and `epilogues="cublaslt"`, or exact modes
-  only in the first release?
-* **Q6. Export-time verification.** Default on (costs a GPU run per bucket at export) while fusion is new, or opt-in from the start?
-* **Q7. Versioning.** A newer tilefish whose grouping changed would re-derive another plan and refuse the old one as stale. Proposed:
-  `tilefish.fusion(version=N)` freezes the rules, old versions are kept, and the stale message names the version. Acceptable?
-* **Q8. A manifest field for the mode** (8.1), or the source header and the fusion report only?
-* **Q9. Names.** `tilefish.fusion`, `barrier`, `fused`, `fused_<hash>` for generated ops, `<graph>.fusion.json`.
-* **Q10. 16-bit `fma`.** Add `tilefish.fma` for bf16 and f16 (`fma.rn.bf16`, `fma.rn.f16`) so that `"mul-add"` covers 16-bit chains?
-* **Q11. Acceptance.** Which in-house model graphs, written in their original op structure, should phase 2 be measured on (exactness against
-  their unfused composition, speed against their hand-fused kernels)?
+Q1 to Q7 are decided (D1 to D7 above). Open, each with the default that will be implemented unless the review says otherwise:
+
+* **Q4b. 16-bit unary math under `opmath`.** Should `intermediates="opmath"` accept `exp(x_bf16)` and the like, as torch does? That couples
+  the tracer's dtype rules to the graph's mode. **Recommended default: no**; the body writes `.to(f32)`, in every mode.
+* **Q8. A manifest field for the mode.** **Recommended default: none in version 1**: the mode is in each generated source's header (in
+  `source_sha256`) and in the fusion report. A field would need both strict readers updated first, and older readers would refuse manifests
+  that have it.
+* **Q9. Names.** **Recommended default: as proposed**: `@tilefish.graph(fusion=tilefish.fusion(...))`, `tilefish.barrier`, `tilefish.fused`,
+  `tilefish.fusion_report`, `tilefish.verify_fusion`, `export(..., verify=False)` as the opt-out, generated ops named `fused_<hash>` (or
+  `<name>_<hash>`), and `<graph>.fusion.json`.
+* **Q10. 16-bit `fma`.** **Recommended default: yes, in phase 3** together with `fp_contract="mul-add"`: `tilefish.fma` for bf16 and f16
+  (`fma.rn.bf16`, `fma.rn.f16`, inline PTX), measured as the f32 `fma` is (note 16). Until then `"mul-add"` contracts f32 only.
+* **Q11. Acceptance.** **Recommended default:** phase 2 is measured on the models already ported to tilefish, each written in its original op
+  structure: `F == U` at every bucket, and speed against their hand-fused kernels, on sm_103 and sm_120; the use-case graphs of 1.1 are
+  committed as goldens with their fusion reports.
 
 ## 10. Prior art
 
@@ -593,11 +607,52 @@ graphs as goldens with their fusion reports committed.
 | XLA | HLO passes fuse elementwise ops into loop fusions, reductions into input fusions, multi-output fusions; a GEMM rewriter folds bias and activations into cuBLASLt epilogues | may normalise low-precision ops to f32 on some targets; algebraic simplification rewrites arithmetic | the backend's | the emitter's; flags exist for run-to-run determinism | no byte contract; determinism across runs, not against the unfused program |
 | TVM | fuses by operator pattern (injective, reduction, elementwise into an output-fusable op such as a dense layer); schedules come from a tuner | per the schedule | per the target | chosen by the schedule a tuner finds, so it can change with tuning | no byte contract; an optional pass swaps in fast approximations |
 | Triton-based fusers and kernel libraries | compilers that emit Triton from a graph, and libraries of hand-fused Triton kernels (norms, rotary embeddings, gated activations) | whatever the kernel computes, usually f32 | Triton's default (on) | Triton's tree | parity by tolerance tests |
-| tilefish (this RFC) | regions lowered by the DSL's own templates into generated ops, between pinned library calls | declared: `declared`, `opmath` or `f32`, each a rewrite defined on the IR | none unless declared (`tilefish.fma`, `mul-add`) | ordered or order-free in exact modes; Triton's tree only when declared | byte-identical to the unfused composition in exact modes, proven by construction and tested; other modes declared, digested and pinned |
+| tilefish (this RFC) | regions lowered by the DSL's own templates into generated ops, between pinned library calls | declared: `declared`, `opmath` or `f32`, each a rewrite defined on the IR | none unless declared (`tilefish.fma`, `mul-add`) | ordered or order-free inside a region; an unordered reduction is a kernel of its own | byte-identical to the unfused composition, by construction, tested, and verified at every export; no non-exact mode in version 1 |
 
 The difference is not the fusing, which these systems do more aggressively; it is that each of them treats the numerics of a fused kernel as
 an implementation detail checked within a tolerance, where tilefish makes the rounding points, the contraction and the reduction order part of
-the declaration, so that fusion is a change of kernel boundaries only, and every exception to that is named.
+the declaration, so that fusion is a change of kernel boundaries only.
+
+## 11. Future work: modes that are not exact, and other extensions
+
+Version 1 has exact modes only (D5). What follows was designed in the draft and is kept here so that a later RFC can start from it; none of
+it is planned.
+
+### 11.1 Binary-defined modes
+
+A *binary-defined* mode is one whose bytes are deterministic, pinned and reproduced by every replay and both hosts (the digest covers the
+machine code), but are not those of any unfused composition: adding a barrier or changing the grouping may change them, the reference holds
+them only within the measured tolerance, and the fusion report would mark each such region. It is the contract every `@tilefish.kernel` with
+a Triton reduction or with default contraction has today.
+
+* `fp_contract="compiler"`: `enable_fp_fusion=True`, so LLVM and ptxas contract what they see. What they see depends on the region's shape, so
+  the bytes depend on the grouping. It is what a migrated `@tilefish.kernel` that relies on contraction would need.
+* `reductions="tree"`: Triton tree reductions join regions, each row region's warp rule part of its numerics. E1 measures how often the tree
+  changes in context (hazard H4).
+* Tests such modes would need: determinism across runs, `jit` equal to `replay`, Rust equal to Python, within tolerance of the reference, and
+  a report entry per region; `verify` would compare against a pinned earlier export instead of `U`.
+
+### 11.2 Library epilogues (route (b))
+
+* **cuBLASLt epilogues** (bias, ReLU, GELU and their auxiliary-output variants, `beta * C` as a residual, per-tensor FP8 scales and an
+  absolute-maximum output) are pinned as the GEMM is: the 64-byte algorithm, the cuBLASLt version, the SM count, a canary. They are exact against
+  `U` only by measurement: the library has no IR, and its epilogue's rounding is not documented to match any tilefish op. The existing pins show
+  the risk: the bias epilogue with a split-K and f32 partial sums was measured to round twice on one architecture, which is why, without the
+  opt-in to reduced-precision partial sums, a pinned GEMM with a bias takes no split-K.
+* A rewrite of graph arithmetic into an epilogue (`epilogues="cublaslt"`) would only apply to patterns whose rounding points agree on paper
+  (`(gemm_f32(x, w) + b.to(f32)).to(bf16)` is `gemm_bias` with a bf16 output: an f32 sum, one rounding), and only after `export` measured the
+  rewrite equal to `U` at every bucket on seeded and special-value inputs for that pin (E4 is the first measurement). A rewrite that changes a
+  rounding point (`round(acc) + b` into `round(acc + b)`) would never be automatic.
+* **cuDNN runtime-fusion engines** (a convolution followed by pointwise ops) are the same class: a declared library op, no automatic rewrite.
+
+### 11.3 Other extensions (exact, not yet planned)
+
+* **Prologue hooks** (route (c')): dequantise or normalise a GEMM operand as an extern loads it; per element and exact under the conditions of
+  route (c), with the work repeated for every tile that loads the element.
+* **Horizontal fusion** and **recomputation** of cheap nodes into several regions (a new `version`).
+* **Inlining `@tilefish.kernel` calls** into regions (8.2), opt-in.
+* **A canonical default order** for unordered reductions, chosen from `D` (exact and fused, but a second meaning of `sum` without `order`
+  next to the kernel body's), if what D2 costs (E3) turns out to matter.
 
 ## Appendix A: a worked example
 
