@@ -89,6 +89,11 @@ add_library(tilefish_capi_shared INTERFACE)
 target_include_directories(tilefish_capi_shared INTERFACE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>")
 target_link_libraries(tilefish_capi_shared INTERFACE "${tilefish_lib_dir}/${tilefish_shared_file}")
 add_dependencies(tilefish_capi_shared tilefish_capi_cargo)
+if(APPLE AND NOT EXISTS "${tilefish_lib_dir}/${tilefish_shared_file}")
+    # the dylib's install name is @rpath/libtilefish_capi.dylib, which CMake reads from the file (and then puts the library's directory on the rpath of
+    # a program of the build tree) only once cargo has built it: before that, the directory is given here (on Linux CMake adds it for a full path)
+    target_link_options(tilefish_capi_shared INTERFACE "$<BUILD_INTERFACE:LINKER:-rpath,${tilefish_lib_dir}>")
+endif()
 add_library(tilefish::tilefish ALIAS tilefish_capi_shared)
 add_library(tilefish::tilefish_shared ALIAS tilefish_capi_shared)
 
