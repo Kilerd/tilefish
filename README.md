@@ -748,7 +748,8 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
 - **Primitives for reproducing a CUDA kernel.** `tilefish.erf(x, math="ieee")` is CUDA's `erff` without flush to zero (the default math's is
   libdevice's, `gelu`'s); `tilefish.sin_approx(x)` is `__sinf` (`sin.approx.f32`), `tilefish.rcp(x)` `__frcp_rn` (`rcp.rn.f32`),
   `tilefish.fma(a, b, c)` `fmaf` (one rounding, whatever `fp_fusion` says), and `-x` (`tilefish.neg`) is CUDA's negation, `-0.0` for `+0.0`
-  where Triton's `-x` is `0 - x`. Each is the bits of the CUDA C++ function on every f32, measured against NVRTC on the GPU (notes 15 and 16).
+  where Triton's `-x` is `0 - x` and the canonical NaN for every NaN (written out, so that a negation ptxas folds into a select keeps it). Each
+  is the bits of the CUDA C++ function on every f32, measured against NVRTC on the GPU (notes 15 and 16).
 - **The CUDA math guard.** `expf`, `erff`, `tanhf` and the other functions those ops copy are not the same in every CUDA release (CUDA 13.2
   changed `erff`). The manifest entry of a generated kernel records the functions it uses, the releases tilefish measured each on, and the
   libdevice it linked (`cuda_math`); a run warns (`TilefishCudaMathWarning`) where torch is built with another release or a replay's process would
@@ -908,10 +909,11 @@ def mlp(x: Tensor[M, H, bf16], w_gu: Tensor[2 * F, H, bf16], w_d: Tensor[H, F, b
 
 **Fusion never changes bytes.** A fused plan writes the bytes of its *unfused composition*: every op a kernel of its own, every intermediate stored in the dtype the
 IR gives it (`tilefish.fusion(grouping="none")` is that plan, and its taps show every intermediate). A region kernel contracts nothing (`fp_fusion=False`), and its code
-does not depend on its neighbours (note 20 of `tilefish.lower`): every float `+ - *` is one scalar `.rn` instruction of inline PTX, because LLVM packs two lanes' f32
-ops into `mul.rn.f32x2` / `add.rn.f32x2` and ptxas 12.9 contracts that pair into `FFMA2` even with `--fmad=false`; every narrowing float cast is inline PTX, because
-the folds of MLIR and LLVM keep an input NaN's payload through `x.to(f32).to(bf16)` in one kernel; and a negation gives the canonical NaN explicitly, because ptxas
-folds `neg.f32` into a select as a sign flip. A reduction is a kernel of its own (a Triton tree reduction adds in another tree when other loads share its kernel:
+does not depend on its neighbours (note 20 of `tilefish.lower`; the code of every kernel with `fp_fusion=False`, note 2): every float `+ - *` is one scalar `.rn`
+instruction of inline PTX, because LLVM packs two lanes' f32 ops into `mul.rn.f32x2` / `add.rn.f32x2` and ptxas 12.9 contracts that pair (into `FFMA2` on sm_100 and
+sm_103, `FFMA` on sm_120) even with `--fmad=false`; every narrowing float cast is inline PTX, because the folds of MLIR and LLVM keep an input NaN's payload through
+`x.to(f32).to(bf16)` in one kernel; and a negation gives the canonical NaN explicitly, as in every kernel, because ptxas folds `neg.f32` into a select as a sign flip.
+A reduction is a kernel of its own (a Triton tree reduction adds in another tree when other loads share its kernel:
 357 to 399 of 1024 rows differed, measured); an op whose value nothing reads is not computed. One rounding of `a * b + c` is asked for with `tilefish.fma`.
 
 **Checked at every export.** `export` runs every region of more than one op against its ops one by one, `jit` on the device, at every bucket, on seeded inputs that
@@ -1079,6 +1081,15 @@ says it with `@tilefish.extern(triton=..., enable_fp_fusion=False)` (Triton's
 compile option of that name; `None`, the default, leaves it to Triton). The
 setting is in the declaration digest, every compile spec and the `options` of
 the manifest entry, so a binary built with the other one is refused by a replay.
+"No" is kept, not hoped for: the compile option alone does not hold on sm_100
+and later, where LLVM packs two lanes' f32 operations and ptxas 12.9 contracts
+the packed pair whatever `--fmad` says. So a generated kernel with
+`fp_fusion=False` writes every float `+ - *` as one scalar `.rn` instruction,
+and every binary built with `enable_fp_fusion=False`, a hand-written Triton or
+Gluon kernel's included, is read back at build: one whose SASS has more fused
+multiply-adds than the SASS of its PTX with the multiplies taken out is refused,
+with the kernel's name and the fix (scalar `.rn` inline PTX for the roundings
+that matter, or `enable_fp_fusion=True`; `docs/numerics.md`).
 
 Whether a legal fusion is worth doing is still measured, not assumed. The
 measurements live in the repository next to the rules.

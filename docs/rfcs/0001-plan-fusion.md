@@ -116,8 +116,12 @@ Implemented on the integration branch of the next release, as `tilefish._fusion`
 * **Strided inputs** in the elementwise template, as rule 5 of 3.5 says: a view that is not dense is a `Strided[...]` parameter of the region's
   kernel with a `StrideOf` per axis, read at `sum(coordinate_k * stride_k)`; SwiGLU's halves are one kernel step over two views of the GEMM's
   output. A region the row template lowers still copies the view with `tilefish.contiguous` first.
-* **Not yet:** strided inputs in the row template; `tilefish.fused(...)` scopes; the `intermediates="f32"` mode. `@tilefish.kernel(fp_fusion=False)` keeps its code: H9 applies to it
-  too, which is the numerics contract's to decide (note 2).
+* **Not yet:** strided inputs in the row template; `tilefish.fused(...)` scopes; the `intermediates="f32"` mode.
+* **Since then** (the decision of 2026-11-15, "fix the implementation and keep the promises"): H8 and H9 apply to every kernel, and are closed
+  there too. A `@tilefish.kernel(fp_fusion=False)` has the code of a region (every float `+ - *` one scalar `.rn` instruction, every narrowing
+  cast inline PTX; note 2), every kernel's negation gives the canonical NaN explicitly (note 16), and a narrowing cast of a widened value is
+  inline PTX in every kernel (note 1). Every binary built with `enable_fp_fusion=False`, a region's and a hand-written extern's included, is
+  read back by the contraction check (`tilefish._fpcontract`), which refuses one whose SASS fused a multiply and an add.
 * **Tests:** `tests/test_fusion.py` (no GPU: grouping, legality, names, modes, report, refusals, the same plans in another process) and
   `tests/test_gpu_fusion.py` (sm_103; arch-agnostic): the inline casts are `.to()` on every f32 and every bf16 and f16 pattern; the use cases
   fused against unfused at every bucket on special values, and against the reference where it is exact; chains of ops on every bf16 and f16

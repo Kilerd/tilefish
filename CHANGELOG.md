@@ -4,6 +4,35 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### Fixed
+
+- **`fp_fusion=False` could still contract packed mul+add into FFMA2 on sm_100+.** On sm_100 and later LLVM packs two lanes' f32 operations
+  into `mul.rn.f32x2` / `add.rn.f32x2`, and ptxas 12.9 contracts such a pair whatever `--fmad` says (into `FFMA2` on sm_100 and sm_103, into
+  `FFMA` on sm_120), so `@tilefish.kernel(fp_fusion=False)` did not always round twice where its contract (note 2 of `tilefish.lower`) says it
+  does. A kernel with `fp_fusion=False` now has the code of a fused region: every float `+ - *` (f32, bf16, f16), and the multiplies of `silu`
+  and `gelu`, is one scalar `.rn` instruction of inline PTX, and every narrowing float cast is inline `cvt.rn`. Its outputs are the old ones
+  wherever the old binary kept two roundings; its source, declaration digest and `sha256_code` change, so a manifest exported before
+  is refused by a replay of the new declaration (export again). A product that an ordered sum without `fma` adds (note 17) is `mul.rn` in
+  every kernel.
+- **neg inside a select flipped the NaN sign.** `-x` (`tilefish.neg`) gives the canonical NaN (`0x7FFFFFFF`, `0x7FFF`) for every NaN in every
+  context now: the canonicalisation is written out (`testp.notanumber` / `setp.nan` and `selp` around `neg`), because ptxas folds a lone
+  `neg.f32` into a select as a negated operand, which flips the NaN's sign. Every kernel with a float negation gets another binary.
+- **A narrowing cast of a widened value kept an input NaN's payload.** `x.to(f32).to(bf16)` (and through a `where`) is inline `cvt.rn` in every
+  kernel, out of the reach of the MLIR and LLVM folds that turned it into `x`; it gives the canonical NaN, as the cast does alone (note 1).
+
+### New
+
+- **The extern SASS contraction check** (`tilefish._fpcontract`, `docs/numerics.md` section 4). Every binary built with
+  `enable_fp_fusion=False` (a hand-written Triton or Gluon extern that declares it, a lowered kernel with `fp_fusion=False`, a fused region, a
+  generated op) is disassembled at build, cache hits included, and compared with its PTX assembled again with every float multiply taken out; one
+  with more fused multiply-add lanes (`FFMA`, `FFMA2`, `HFMA2`) is refused with a `TilefishBuildError` that names the kernel, shows the
+  instructions and gives the fix (scalar `.rn` inline PTX, or `enable_fp_fusion=True`). `nvdisasm` is `$TILEFISH_NVDISASM_PATH`, Triton's, the
+  one next to its `ptxas`, an `nvidia-cuda-nvdisasm` wheel's or the `PATH`'s; where none decodes the architecture (Triton 3.5.1's CUDA 12.8
+  `nvdisasm` and sm_103) the PTX is assembled for the base of its family (`sm_100a`) and read. An extern that ptxas contracted is refused where
+  it used to build.
+
 ## tilefish 0.0.7, crate 0.0.5 (unreleased)
 
 ### Breaking changes
@@ -151,7 +180,7 @@ each section names the release that added it.
 - **Found on the way** (sm_103, ptxas 12.9; `tests/test_gpu_fusion.py`): ptxas contracts a packed `mul.rn.f32x2` and `add.rn.f32x2`, which LLVM
   makes of two lanes' f32 ops, into `FFMA2` even with `--fmad=false`, so `@tilefish.kernel(fp_fusion=False)` does not guarantee two roundings
   on sm_100 and later where the ops are packed; and `neg.f32` folded into a select flips a NaN's sign where alone it gives the canonical NaN.
-  Fused regions avoid both; a `@tilefish.kernel` is unchanged in this release.
+  Fused regions avoid both (and so does every kernel now: "Unreleased", "Fixed").
 
 ### Plans and arenas
 
