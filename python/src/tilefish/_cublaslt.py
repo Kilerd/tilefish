@@ -204,7 +204,8 @@ CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE = 4
 # RTX 5090, sm_120, algorithm 21: 32x1024x3072, 8409 of 32768 elements not the correctly rounded result and errors past what one rounding
 # and an f32 accumulation allow; the same configuration without the bias, and without split-K, keep the bound). Not every such split-K
 # rounds twice (algorithm 66 with a split-K of 3, which torch's addmm runs for 32x1024x3072 with cuBLASLt 13.1.0 on sm_103, keeps the one
-# rounding: 28 of 32768 elements not the correctly rounded result, measured), but the rule holds for every algorithm.
+# rounding: 28 of 32768 elements not the correctly rounded result, measured), but the rule holds for every algorithm: nothing in the
+# heuristic's answer tells the two apart, so the default posture keeps it and promises one rounding everywhere (docs/numerics.md, section 4).
 REDUCTION_SCHEME_MASK = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE
 NO_SPLIT_K_MASK = 0
 ALLOWED_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_NONE, CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)

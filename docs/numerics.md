@@ -85,6 +85,16 @@ Triton (and so its libdevice) changes, or on a new GPU architecture.
 * **The primitives copy CUDA's spelling**, not an idealised one: `-x` is CUDA's negation (`neg.f32` gives the canonical NaN, where a flip of the
   sign bit would keep the payload), `sin_approx` is the hardware's `sin.approx.f32` with its subnormal flush, `erf` in IEEE math is the `erff` of
   CUDA 12.8 to 13.1. What a CUDA C++ kernel compiled with nvcc's defaults computes is what the DSL can say.
+* **The default GEMM posture keeps its rule: a GEMM with a bias gets no split-K** unless its declaration opts in (`allow_bf16_reduction`, or the
+  opt-in of its operands' type). The rule is what lets the default posture promise one rounding of `A @ B + bias` for every pin it makes, on every
+  device and cuBLASLt version, without a measurement per algorithm. A split-K with the bias epilogue was measured to add the bias to a sum already
+  rounded to the output type, even with f32 partial sums (cuBLASLt 12.8.4, RTX 5090, algorithm 21, 32 x 1024 x 3072: 8409 of 32768 elements past
+  what one rounding and an f32 accumulation allow). Another algorithm keeps the one rounding (algorithm 66 with a split-K of 3, which `addmm` runs
+  for 32 and 64 x 1024 x 3072 with cuBLASLt 13.1.0 on sm_103), but nothing in the heuristic's answer tells the two apart, and the double rounding
+  is silent. So it costs the default posture `addmm`'s bytes on 2 of the 15 biased shapes of `test_gpu_gemm.py` under 13.1.0 (all 15 under
+  12.8.4), and a caller who wants `torch.addmm`'s bytes declares `heuristic="torch"`, which matches it on every shape measured (12.8.4 and
+  13.1.0). Relaxing the rule per algorithm would need an exhaustive check of each split-K algorithm with the bias epilogue on each device and
+  cuBLASLt version; it is not planned.
 
 ## 5. Device-global state: designed, not implemented
 

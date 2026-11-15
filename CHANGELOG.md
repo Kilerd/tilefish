@@ -114,7 +114,8 @@ each section names the release that added it.
 - `test_gpu_gemm.py` asserts that `heuristic="torch"` (with torch's default reduction) gives `torch.mm` / `torch.addmm` byte for byte on the 30
   shapes whose default-posture rate it reports, with cuBLASLt 12.8.4 and 13.1.0. Why the default posture matches `addmm` on only 13 of the 15
   biased shapes under cuBLASLt 13.1 is documented: it gives a GEMM with a bias no split-K, a rule of tilefish's, where `addmm` runs the split-K of
-  3 with f32 partial sums that the heuristic ranks first for 32 and 64 x 1024 x 3072. No pin changes.
+  3 with f32 partial sums that the heuristic ranks first for 32 and 64 x 1024 x 3072. No pin changes. The rule stays: it is what lets the
+  default posture promise one rounding for every pin without measuring each split-K algorithm (`docs/numerics.md`, section 4).
 
 ### Breaking changes
 

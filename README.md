@@ -594,7 +594,8 @@ def proj32(a: Tensor[32, 512, bf16], b: Tensor[1536, 512, bf16], bias: Tensor[15
 * `allow_bf16_reduction=True` lets split-K add its partial sums in bf16 (`INPLACE`, `OUTPUT_TYPE`: torch's default,
   `allow_bf16_reduced_precision_reduction`), which rounds more than once. Without it the heuristic is asked for f32 partial sums only, and a GEMM with a
   bias for no split-K at all (with the bias epilogue, a split-K with f32 partial sums was measured to round twice: cuBLASLt 12.8.4 on an RTX 5090); an
-  algorithm that breaks either is refused by both hosts.
+  algorithm that breaks either is refused by both hosts. The rule stays in the default posture although some split-K algorithms keep the one
+  rounding: nothing in the heuristic's answer tells them apart (`docs/numerics.md`, section 4); `heuristic="torch"` gives `addmm`'s bytes.
 * `algos=` imports the algorithms (`tilefish.AlgoTable(arch, sm_count, cublaslt_version, {(m, n, k, bias): config})`, a config being the nine
   `cublasLtMatmulAlgoConfig` attributes or the 128 hex digits of a pin): on the device a table is for, each entry pins the table's algorithm, encoded as
   cuBLASLt encodes it and held to the same checks (`cublasLtMatmulAlgoCheck` for the problem, the workspace limit, bf16 partial sums only with the
