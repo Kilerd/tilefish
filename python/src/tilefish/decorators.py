@@ -1325,7 +1325,7 @@ def _extern_by_arch(
         if not isinstance(arch, str) or not _ARCH_NAME.fullmatch(arch) or arch != f"sm_{int(arch[3:])}":
             raise TilefishDeclarationError(f"extern: by_arch= keys are architectures such as 'sm_103' (no leading zero), got {arch!r}")
         if not isinstance(value, Implementation):
-            raise TilefishDeclarationError(f"extern: by_arch[{arch!r}] must be a tilefish.impl(triton=... or gluon=...), got {value!r}")
+            raise TilefishDeclarationError(f"extern: by_arch[{arch!r}] must be a tilefish.impl(...) (a Triton or Gluon kernel, or a prebuilt PTX or cubin), got {value!r}")
     if fallback is not None and not isinstance(fallback, Implementation):
         raise TilefishDeclarationError(f"extern: fallback= is a tilefish.impl(...) (the implementation of every other architecture) or None, got {fallback!r}")
     if type(index_bits) is not int or index_bits not in (32, 64):
