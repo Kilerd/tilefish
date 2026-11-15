@@ -440,7 +440,8 @@ fn text_of(v: &Value) -> String {
             "set" => *node(&mut doc, path) = op[2].clone(),
             "delete" => {
                 let (last, parent) = path.split_last().unwrap();
-                node(&mut doc, parent).as_object_mut().unwrap().shift_remove(last.as_str().unwrap());
+                // (the others keep their order, whatever map serde_json was built with)
+                node(&mut doc, parent).as_object_mut().unwrap().retain(|k, _| k != last.as_str().unwrap());
             }
             other => panic!("unknown operation {other}"),
         }

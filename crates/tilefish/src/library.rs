@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
 use crate::expr::{Symbols, parse_expr};
+use crate::json::Members;
 use crate::manifest::{
     ALIGNMENT, Access, DimInfo, MAX_ELEMENTS, Param, ParamKind, Precondition, ShapeDim, by_name, is_arch, is_digest,
     is_ident, is_stem, parse_dims, parse_shape, precondition_of, want_ident, want_int,
@@ -198,7 +199,7 @@ pub struct LibraryEntry {
     pub params: Vec<Param>,
     /// The bucket value of each bucketed dimension, in the order of the stem.
     pub buckets: Vec<(String, u64)>,
-    /// The named dimensions and what is known of each.
+    /// The named dimensions and what is known of each, in the order of the file.
     pub dims: Vec<DimInfo>,
     /// What a launch must check: the 16-byte alignment of every pointer, the static sizes and the buckets.
     pub preconditions: Vec<Precondition>,
@@ -270,8 +271,8 @@ pub(crate) struct RawLibrary {
     #[serde(rename = "impl")]
     implementation: String,
     abi: RawLibraryAbi,
-    buckets: Map<String, Value>,
-    dims: Map<String, Value>,
+    pub(crate) buckets: Members,
+    pub(crate) dims: Members,
     preconditions: Vec<Value>,
     dtypes: Map<String, Value>,
     compute_type: String,

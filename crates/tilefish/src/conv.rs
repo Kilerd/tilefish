@@ -27,6 +27,7 @@ use serde_json::{Map, Value};
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::Symbols;
 use crate::ffi::cudnn::{self, Desc, Graph, Handle, Legacy};
+use crate::json::Members;
 use crate::kernel::Arch;
 use crate::library::{eval_static, present};
 use crate::manifest::{
@@ -322,14 +323,15 @@ impl ConvProblem {
         }
     }
 
-    /// The exact cuDNN-level problem (Python's `tilefish._cudnn.describe`, value for value: `tests/python_conv.rs` holds them together).
+    /// The exact cuDNN-level problem (Python's `tilefish._cudnn.describe`, value for value: `tests/python_conv.rs` holds them together). Its keys
+    /// are in code point order, whatever map serde_json was built with.
     pub fn describe(&self) -> Value {
         let data_type = match self.dtype {
             DType::F16 => "CUDNN_DATA_HALF",
             DType::Bf16 => "CUDNN_DATA_BFLOAT16",
             _ => "CUDNN_DATA_FLOAT",
         };
-        serde_json::json!({
+        let mut problem = serde_json::json!({
             "library": "cudnn",
             "operation": "convolution_forward",
             "data_type": data_type,
@@ -351,7 +353,9 @@ impl ConvProblem {
             "uids": {"x": cudnn::UID_X, "w": cudnn::UID_W, "y": cudnn::UID_Y},
             "alpha": 1.0,
             "beta": 0.0,
-        })
+        });
+        problem.sort_all_objects();
+        problem
     }
 
     fn what(&self) -> String {
@@ -434,7 +438,7 @@ pub struct ConvEntry {
     pub params: Vec<Param>,
     /// The bucket value of each bucketed dimension, in the order of the stem.
     pub buckets: Vec<(String, u64)>,
-    /// The named dimensions and what is known of each.
+    /// The named dimensions and what is known of each, in the order of the file.
     pub dims: Vec<DimInfo>,
     /// What a launch must check: the alignment of every pointer, the static sizes and the buckets.
     pub preconditions: Vec<Precondition>,
@@ -491,8 +495,8 @@ pub(crate) struct RawConv {
     #[serde(rename = "impl")]
     implementation: String,
     abi: RawConvAbi,
-    buckets: Map<String, Value>,
-    dims: Map<String, Value>,
+    pub(crate) buckets: Members,
+    pub(crate) dims: Members,
     preconditions: Vec<Value>,
     dtypes: Map<String, Value>,
     compute_type: String,
