@@ -13,8 +13,8 @@ each section names the release that added it.
   `FFMA` on sm_120), so `@tilefish.kernel(fp_fusion=False)` did not always round twice where its contract (note 2 of `tilefish.lower`) says it
   does. A kernel with `fp_fusion=False` now has the code of a fused region: every float `+ - *` (f32, bf16, f16), and the multiplies of `silu`
   and `gelu`, is one scalar `.rn` instruction of inline PTX, and every narrowing float cast is inline `cvt.rn`. Its outputs are the old ones
-  wherever the old binary kept two roundings; its source, declaration digest and `sha256_code` change, so a manifest exported before
-  is refused by a replay of the new declaration (export again). A product that an ordered sum without `fma` adds (note 17) is `mul.rn` in
+  wherever the old binary kept two roundings; its source and declaration digest change (and its `sha256_code` where Triton's code was
+  packed or folded), so a manifest exported before is refused by a replay of the new declaration (export again). A product that an ordered sum without `fma` adds (note 17) is `mul.rn` in
   every kernel.
 - **neg inside a select flipped the NaN sign.** `-x` (`tilefish.neg`) gives the canonical NaN (`0x7FFFFFFF`, `0x7FFF`) for every NaN in every
   context now: the canonicalisation is written out (`testp.notanumber` / `setp.nan` and `selp` around `neg`), because ptxas folds a lone
