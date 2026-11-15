@@ -7,7 +7,8 @@ that holds a verified plan and its manifest launches the steps in order on one s
 a CUDA graph once per bucket at fixed addresses.
 
 The Python package writes and reads this document (`tilefish.plan`, `tilefish.runtime.export`, `tilefish.run(graph, ..., mode="replay", plan=...)`). A Rust lane
-implements this specification. Everything is checked by tests in `python/tests/` (named in the last section) and the Python code that writes or checks each part is
+implements this specification, and the C++ host (`crates/tilefish-capi`, `docs/rfcs/0002-cpp-host.md`) runs plans through that Rust implementation, so what
+this document says of the Rust host holds for it too. Everything is checked by tests in `python/tests/` (named in the last section) and the Python code that writes or checks each part is
 named where the part is described (`python/src/tilefish/_plan.py`, `_planrun.py`).
 
 A reader of this document is assumed to know manifest schema 3 (`docs/manifest-schema-3.md`): the entries of `kernels` and `library`, the `abi`, the dimension
