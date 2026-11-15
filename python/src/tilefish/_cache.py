@@ -106,8 +106,10 @@ CACHE_FORMAT = "tilefish.build-cache.v2"
 # key, so a change of any of that must bump it: an entry made by an older recipe is then not found, instead of served as the binary
 # of the new one. The tilefish version is part of the key as well (a release can change what goes into a binary without anyone
 # remembering to bump this).
-CACHE_RECIPE = 4  # 3: a binary is keyed by the IR digest of its kernel (the source digest of 2 is gone), and by the Triton knobs that change code generation;
-# 4: a build refuses a kernel that asks for IEEE f32 dots and was compiled into TF32 MMAs (tilefish._tf32guard), so no entry stored without that check is served
+CACHE_RECIPE = 5  # 3: a binary is keyed by the IR digest of its kernel (the source digest of 2 is gone), and by the Triton knobs that change code generation;
+# 4: a build refuses a kernel that asks for IEEE f32 dots and was compiled into TF32 MMAs (tilefish._tf32guard), so no entry stored without that check is served;
+# 5: the debug information of a binary names its source files by host-independent paths (tilefish._ir.host_independent_paths), so an entry whose cubin
+# names the directory it was built in (the same machine code, other bytes) is not served into a manifest that is meant to be the same everywhere
 ENV_DIR = "TILEFISH_CACHE_DIR"
 _TAG = b"tilefish.build-cache-key.v1\0"
 _warned_writes: "set[str]" = set()

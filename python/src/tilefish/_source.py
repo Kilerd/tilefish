@@ -16,6 +16,9 @@ the process imported are not the ones in that file now (:func:`check_imported_li
 and says nothing about whether that is the source the spec claims, so without this check a process that holds an older version of
 the generated file would stamp the new source's sha256 on a binary of the old one.
 
+It also says how a binary's debug information names a source file (:func:`source_name`): by a path that does not depend on the
+host, so that two builds of one kernel on two machines, from two checkouts or two working directories, are the same bytes.
+
 Nothing in this module imports Triton.
 """
 
@@ -28,6 +31,7 @@ from typing import Any
 from .errors import TilefishBuildError
 
 _MAX_UNWRAP = 8
+_SOURCE_NAMES: "dict[str, str]" = {}  # the path of a file tilefish wrote a generated source to -> the name its debug information gives it
 
 
 def _attr(obj: Any, name: str) -> Any:
@@ -96,3 +100,58 @@ def check_imported_lines(fn: Any) -> None:
             f"{first + 1}-{first + len(fn.raw_src)} are not what the file has now. Restart the process, or reload the "
             "module, before building"
         )
+
+
+def register_source_name(path: str, name: str) -> None:
+    """Have the debug information of a binary name the file at ``path`` (a generated source tilefish wrote) ``name`` (its path relative to a source
+    root, ``tilefish_generated/rmsnorm.py``: :attr:`tilefish.lower.LoweredKernel.filename`)."""
+    _SOURCE_NAMES[path] = name
+
+
+def source_name(path: str, module: "str | None") -> str:
+    """The name a binary's debug information gives the source file ``path`` of a function defined in the module ``module``: a path that does not
+    depend on the host.
+
+    Triton records the path of a kernel's file (and of the file of every jit function it calls, Triton's own ``triton/language/standard.py``
+    among them) in the locations of its IR, and ``ptxas`` writes it into the cubin's ``.debug_line`` and ``.nv_debug_ptx_txt``. A path that
+    names the checkout, the virtual environment, the home directory or a temporary directory makes two builds of the same kernel differ byte
+    for byte. The name used instead is
+
+    * for a generated source tilefish wrote (:func:`register_source_name`), its path relative to its source root, ``tilefish_generated/<name>.py``,
+      what :meth:`tilefish.lower.LoweredKernel.write` writes and imports as ``tilefish_generated.<name>``;
+    * for a module ``a.b.c`` whose file is ``.../a/b/c.py`` (or ``.../a/b/c/__init__.py``), that tail, ``a/b/c.py``: the path relative to the
+      directory on ``sys.path`` it was imported from;
+    * for any other file (a script run as ``__main__``, a module imported under another name), its base name.
+
+    A name that is not a path (``<string>``) is kept. The name is a label for tools (a profiler resolves it against a source directory you give
+    it); it is not in the machine code, so it changes ``sha256`` and not ``sha256_code``.
+    """
+    if not path or (path.startswith("<") and path.endswith(">")):
+        return path
+    registered = _SOURCE_NAMES.get(path)
+    if registered is not None:
+        return registered
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    if not parts:
+        return path
+    if module and module != "__main__":
+        names = module.split(".")
+        for tail in (names[:-1] + [names[-1] + ".py"], names + ["__init__.py"]):
+            if parts[-len(tail) :] == tail:
+                return "/".join(tail)
+    return parts[-1]
+
+
+def module_of(fn: Any) -> "str | None":
+    """The name of the module the Python function behind ``fn`` (a jit function, or what wraps one as ``.fn``) is defined in, or ``None``."""
+    for _ in range(_MAX_UNWRAP):
+        if _attr(fn, "__code__") is not None:
+            namespace = _attr(fn, "__globals__")
+            name = namespace.get("__name__") if isinstance(namespace, dict) else None
+            if not isinstance(name, str):
+                name = _attr(fn, "__module__")
+            return name if isinstance(name, str) else None
+        fn = _attr(fn, "fn")
+        if fn is None:
+            return None
+    return None
