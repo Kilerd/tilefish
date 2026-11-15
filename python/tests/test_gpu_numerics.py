@@ -520,11 +520,12 @@ def test_fp_fusion_false_is_a_different_spec_and_a_different_binary():
     (spec_on,), (spec_off,) = on.specs(), off.specs()
     assert spec_off.enable_fp_fusion is False and spec_off.ast_source_inputs().options["enable_fp_fusion"] is False
     assert spec_on.declaration_digest != spec_off.declaration_digest  # part of the digest of the declaration
-    assert on.source == off.source.replace("# fp_fusion: False (no FMA contraction: a * b + c rounds twice)\n", "")  # same code
+    assert "_tf_mul_rn_f32" in off.source and "_tf_mul_rn_f32" not in on.source  # every float + - * one scalar .rn instruction (note 2)
     b_on, b_off = built(on), built(off)
     assert b_on.options["enable_fp_fusion"] is True and b_off.options["enable_fp_fusion"] is False
     assert b_on.sha256_code != b_off.sha256_code
     assert instructions(b_on.ptx)["fma.rn.f32"] > 0 and instructions(b_off.ptx)["fma.rn.f32"] == 0
+    assert not any(k.endswith("f32x2") for k in instructions(b_off.ptx))  # nothing packed, so nothing ptxas could contract
 
 
 @tilefish.kernel(fp_fusion=False)

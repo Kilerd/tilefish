@@ -167,15 +167,30 @@ def test_a_generated_kernel_writes_triton_default_into_its_spec():
     assert layernorm.lower().fp_fusion is True and layernorm.fp_fusion is True
 
 
-def test_fp_fusion_false_is_the_same_source_and_another_spec():
+def test_fp_fusion_false_writes_every_rounding_out_and_is_another_spec():
+    """fp_fusion=False: every float + - * is one scalar .rn instruction (LLVM packs two lanes' f32 ops into f32x2 on sm_100 and later, and
+    ptxas 12.9 contracts a packed multiply and add whatever --fmad says) and every narrowing cast inline PTX; the program is the same."""
     on, off = layernorm.lower(), layernorm.lower(fp_fusion=False)
     (spec_on,), (spec_off,) = on.specs(), off.specs()
     assert off.fp_fusion is False and spec_off.enable_fp_fusion is False
     assert spec_off.ast_source_inputs().options["enable_fp_fusion"] is False
-    assert off.source.replace("# fp_fusion: False (no FMA contraction: a * b + c rounds twice)\n", "") == on.source  # the code is the same
     assert "# fp_fusion: False" in off.source and "fp_fusion" not in on.source  # and a reviewer is told
+    for line in ("v5 = _tf_sub_rn_f32(v3, v4)", "v6 = _tf_mul_rn_f32(v5, v5)", "v8 = _tf_add_rn_f32(v7, eps)", "v15 = _tf_cvt_bf16(v14)"):
+        assert line in off.source
+    assert '"mul.rn.f32 $0, $1, $2;"' in off.source and '"cvt.rn.bf16.f32 $0, $1;"' in off.source
+    assert "v5 = v3 - v4" in on.source and "v15 = v14.to(tl.bfloat16)" in on.source and "inline_asm" not in on.source  # the compiler's choice
+    body = lambda src: [ln.split("=")[0] for ln in src.split("@triton.jit\ndef tf_")[1].splitlines()]  # noqa: E731
+    assert body(on.source) == body(off.source)  # the same statements, one per value
     assert declaration_digest(on.extern) != declaration_digest(off.extern)
     assert spec_on._fingerprint() != spec_off._fingerprint()
+
+
+def test_fp_fusion_false_is_the_context_free_code():
+    """A kernel with fp_fusion=False has the code of a fused region (note 20): the same source but for the header line that says so."""
+    for k in (layernorm, softmax):
+        off, cf = k.lower(fp_fusion=False).source, k.lower(fp_fusion=False, context_free=True).source
+        header = "# context-free: every narrowing float cast is inline PTX, a negation's NaN canonical (note 20: a fused region of a graph)\n"
+        assert header in cf and cf.replace(header, "") == off
 
 
 def test_the_kernel_decorator_and_lower_take_fp_fusion():

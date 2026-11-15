@@ -66,7 +66,7 @@ call to a declared operator is rejected), ``num_stages = 3`` in the spec (irrele
 Compile options in every spec of a generated kernel: ``num_warps`` and ``num_stages``, and
 ``enable_fp_fusion``, always written out: ``True``, which is Triton's default (the machine code is
 byte-identical to a spec without the key), or ``False`` for ``@tilefish.kernel(fp_fusion=False)`` /
-``lower(fp_fusion=False)``, which compiles without FMA contraction (note 2). The key is part of the
+``lower(fp_fusion=False)``, whose every float ``+ - *`` rounds on its own (note 2: written out, and checked on the binary). The key is part of the
 declaration digest and of what ``verify_against`` checks; a hand-written ``extern`` never has it.
 
 Parameters of the generated function, in this order: the kernel's own parameters under their own
@@ -110,7 +110,10 @@ load of a tensor            ``tl.load(p + offs, mask=mask, other=0)``           
                                                                                          A float to integer cast says its
                                                                                          rounding (the next row).
                                                                                          A narrowing cast gets ``# rounding
-                                                                                         point``. Nothing else is ever cast.
+                                                                                         point``; of a widened value, or with
+                                                                                         ``fp_fusion=False``, it is inline
+                                                                                         ``cvt.rn`` (note 1). Nothing else is
+                                                                                         ever cast.
 ``x.to(i32 | i64 | u8,      a helper of inline PTX: ``cvt.rni.s32.f32`` (``rzi``,        round to nearest even, toward zero,
 rounding="rn" | "rz" |      ``rmi``, ``rpi``); ``u8``: then ``max.s32``, ``min.s32``     down or up, no default; saturating
 "rd" | "ru",                (to [0, 255]); ``i64`` and every wrapping cast:              (the default): clamped to the type's
@@ -137,7 +140,9 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
                             ``const`` parameter's name                                      no promotion (note 3).
 ``a + b``, ``a - b``,       ``a + b``, ``a - b``, ``a * b``                                 dtypes f32, f16, bf16, i32, i64.
 ``a * b``                                                                                    ``a * b + c`` may round once, as
-                                                                                         one FMA (note 2).
+                                                                                         one FMA (note 2). ``fp_fusion=False``:
+                                                                                         one inline ``mul.rn`` / ``add.rn`` /
+                                                                                         ``sub.rn`` each, never contracted.
 ``a / b``                   ``a / b``                                                       f32 only (note 4): ``div.full.f32``,
                                                                                          not IEEE division; IEEE math (note 13):
                                                                                          ``div.rn.f32``.
@@ -170,7 +175,8 @@ python scalar / ``const``   a float literal written with ``repr()`` (``inf`` and
                                                                                          (CUDA 12.8 to 13.1; note 15).
 ``sin_approx(x)``,          a module-level helper of one PTX instruction (inline asm):      CUDA's ``__sinf``, ``__frcp_rn``,
 ``rcp(x)``, ``fma(a, b,     ``sin.approx.f32``, ``rcp.rn.f32``, ``fma.rn.f32``,         ``fmaf`` (one rounding, whatever
-c)``, ``neg(x)`` / ``-x``   ``neg.f32``, ``neg.bf16``, ``neg.f16``; integers ``-v``      ``fp_fusion``) and ``-x`` (a NaN gives
+c)``, ``neg(x)`` / ``-x``   ``neg.f32`` (``.bf16``, ``.f16``) with ``testp`` / ``selp``  ``fp_fusion``) and ``-x`` (a NaN gives
+                            for a NaN; integers ``-v``
                                                                                          the canonical NaN), in either math;
                                                                                          f32 (``neg``: f16, bf16, i32, i64
                                                                                          too). Note 16.
@@ -250,16 +256,36 @@ Notes (the facts behind the table):
    of an input. torch's own cast of a NaN is a third answer that depends on where it runs (``0x7FFF`` on CUDA, ``0x7FC0`` or ``0xFFFF``
    on the CPU); the ``reference`` mode computes the declared mode on the bits, so it is byte-identical to the binary in both.
    Only the f32 to bf16 cast has ``nan=``.
+   **A narrowing cast of a widened value** (``x.to(f32).to(bf16)``, and one of a ``where`` that selects a widened value, through any number of
+   them) is written out as inline PTX in every kernel, ``cvt.rn.bf16.f32`` / ``cvt.rn.f16.f32`` (a 16-bit source widened to f32 first, exactly):
+   the instruction ``.to()`` compiles to, out of the reach of the folds of MLIR and LLVM, which take ``fptrunc(fpext(x))`` for ``x`` and narrow a
+   select of widened values into a select of the values, keeping an input NaN's payload where the cast gives ``0x7FFF``. Measured on sm_103 (RFC
+   0001, experiment E5): with ``.to()``, ``x.to(f32).to(bf16)`` in one kernel kept the payload of every input NaN (254 of 254 bf16 NaNs, 2046 of
+   2046 f16 NaNs). Every other cast of a kernel with ``fp_fusion=True`` is ``.to()``; with ``fp_fusion=False`` every narrowing float cast is
+   inline PTX (note 2). The inline cast is ``.to()``'s bits on every f32 (``tests/test_gpu_fusion.py``), and gives the canonical NaN for every
+   NaN of a widened value (``tests/test_gpu_roundings.py``).
 2. **FMA contraction.** A generated kernel asks Triton for ``enable_fp_fusion=True`` (Triton's default, written
    into the spec), so ``a * b + c`` **may round once**: it is one FMA, ``fma.rn.f32`` for f32 and ``fma.rn.bf16x2``,
-   a native packed bf16 FMA, for bf16. With ``@tilefish.kernel(fp_fusion=False)`` it is ``mul.rn`` then ``add.rn``
-   (two roundings, "strict"). The two results differ in 23% of random elements (22.9% in bf16, 23.4% in f32), and
-   the contracted one is exactly the correctly rounded value of the exact product and sum. For the tail of layernorm,
+   a native packed bf16 FMA, for bf16. With ``@tilefish.kernel(fp_fusion=False)`` every float ``+``, ``-`` and ``*`` (f32, bf16, f16)
+   **rounds on its own** ("strict"), and that is written out, not left to the compile option: each is one scalar instruction of inline PTX with
+   an explicit rounding (``mul.rn.f32``, ``add.rn.bf16``, ...), and so are the last multiply of ``silu`` and the multiplies and add of ``gelu``;
+   every narrowing float cast is inline ``cvt.rn`` (note 1). That is the code of a fused region (note 20): a kernel with ``fp_fusion=False`` is
+   lowered as one, but for its header. The compile option alone (Triton's ``--fmad=false``) does not keep it: on sm_100 and later LLVM packs two
+   lanes' f32 operations into ``mul.rn.f32x2`` / ``add.rn.f32x2``, and ptxas 12.9 contracts such a pair whatever ``--fmad`` says, into ``FFMA2``
+   on sm_100 and sm_103 and into a scalar ``FFMA`` on sm_120 (which splits the packed PTX op). What LLVM packs depends on the kernel (measured
+   with Triton 3.5.1: ``x * w + b`` of a row of widened bf16 values with ``[D]`` operands is packed and contracted on all three, ``a * b + c``
+   of three f32 loads of one length is not, and on sm_120 a row sum of squares is); a scalar ``.rn`` instruction is never contracted (the random
+   graphs of ``tests/test_gpu_fusion.py`` found it first: 33 of 1536 elements of one graph one ULP off). It is also **checked on the binary**:
+   every kernel built with ``enable_fp_fusion=False`` is read back (:mod:`tilefish._fpcontract`, at build), and one whose SASS has more fused
+   multiply-adds than the SASS of its PTX with the multiplies taken out is refused (``tests/test_gpu_fpcontract.py`` builds every case of the
+   lowering with ``fp_fusion=False`` for sm_90, sm_100, sm_103 and sm_120). The two results differ in 23% of random elements (22.9% in bf16,
+   23.4% in f32), and the contracted one is exactly the correctly rounded value of the exact product and sum. For the tail of layernorm,
    ``(x - mean) * rstd * w + b`` in f32, contraction changes 25.7% of the elements and the strict build matches a
    reference that rounds every operation exactly. On the goldens contraction changes the bytes of the ones that
    have a contractable ``a * b + c`` (layernorm: 3 to 8 of 197376 elements, one bf16 ULP; the README rmsnorm: 1 to 2
    of 657920); softmax, gelu and swiglu come out byte-identical either way. The explicit FMAs inside libdevice's
-   ``erf`` stay with ``fp_fusion=False``.
+   ``erf`` stay with ``fp_fusion=False``; Triton's own reductions (``sum`` without ``order``, ``mean``) add as Triton compiles them, the
+   check included.
 3. **Scalars.** Triton 3.5.1 keeps the dtype of the tensor: a python float or a constexpr float combined with
    a bf16 tensor is bf16 (``tl.static_assert`` in a compiled kernel says so), and the scalar is rounded to
    bf16 first (0.1 becomes 0.10009765625). Nothing is promoted to f32: ``x * 0.1 + eps`` on bf16 is a single
@@ -427,9 +453,14 @@ Notes (the facts behind the table):
     with or without ``.ftz``, which give the same bits on every f32); ``tilefish.rcp(x)`` is ``rcp.rn.f32``, the correctly rounded ``1 / x`` with
     subnormals kept, CUDA's ``__frcp_rn`` and its ``1.0f / x`` without fast math, and ``torch.reciprocal``; ``tilefish.fma(a, b, c)`` is
     ``fma.rn.f32``, ``a * b + c`` rounded once with subnormals kept, CUDA's ``fmaf`` (operands broadcast like ``+``'s; a scalar is rounded to f32);
-    ``tilefish.neg(x)``, which ``-x`` is, is CUDA's negation: ``neg.f32`` (and ``neg.bf16`` / ``neg.f16`` for those dtypes) flips the sign of every
-    number, zeros and infinities included, where Triton's ``-x`` is ``0 - x`` (``+0.0`` for ``+0.0``), and gives the canonical NaN (``0x7FFFFFFF``,
-    ``0x7FFF``) for every NaN, which a flip of the sign bit does not; ``-x`` of an ``i32`` or ``i64`` is ``0 - x`` (two's complement). Measured
+    ``tilefish.neg(x)``, which ``-x`` is, is CUDA's negation: the sign of every number flipped, zeros and infinities included, where Triton's
+    ``-x`` is ``0 - x`` (``+0.0`` for ``+0.0``), and the canonical NaN (``0x7FFFFFFF``, ``0x7FFF``) for every NaN, which a flip of the sign bit does
+    not give. The NaN is written out, in every kernel: ``testp.notanumber.f32`` (``setp.nan.bf16`` / ``setp.nan.f16``) and ``selp`` of the canonical
+    NaN and ``neg.f32`` (``neg.bf16``, ``neg.f16``). ``neg.f32`` alone gives the canonical NaN only while ptxas keeps it an instruction: folded into
+    its consumer as a negated operand (a ``where`` of ``-x``: ``FSEL`` of ``-R``) it flips the sign of the NaN instead (``0xFFFFFFFF``; found by
+    the random graphs of ``tests/test_gpu_fusion.py``, 61 of 1536 elements of one graph), and the select's other operand is unchanged either
+    way; ``tests/test_gpu_roundings.py`` checks ``-x`` alone, in a ``where`` on either side and twice, on every f32 NaN and every bf16 and f16
+    pattern, in a kernel, with ``fp_fusion=False`` and in a fused region. ``-x`` of an ``i32`` or ``i64`` is ``0 - x`` (two's complement). Measured
     against CUDA C++ compiled by NVRTC and against PTX on every f32 (and every bf16 and f16 for ``neg``), and ``fma`` on 3 sets of ``2**24``
     operand triples (bit patterns, cancellations ``c ~ -a * b``, the subnormal range, every combination of the special values):
     ``tests/test_gpu_primitives.py``. The ``reference`` mode is exact for ``rcp`` (``torch.reciprocal``), ``neg`` and ``fma`` (an f64 product and
@@ -452,7 +483,8 @@ Notes (the facts behind the table):
     Measured byte for byte against CUDA C++ kernels of each order (one thread per row; 256 threads and a halving tree; 128 threads of 8 columns
     with ``acc += x * x``, a shuffle tree and the warps; 64 threads of ``fmaf`` chains of a dot product), on rows of 1 to 4096 columns of every
     magnitude, signed zeros, NaNs, infinities and subnormals, and an rmsnorm of 128 threads: ``tests/test_gpu_reduction_order.py``. Every add is
-    one rounding and never contracted, so with ``fma=False`` a product summed is rounded first (``acc + round(a * b)``). The cost is the order's:
+    one rounding and never contracted, so with ``fma=False`` a product summed is rounded first (``acc + round(a * b)``): the product is one
+    ``mul.rn.f32`` of inline PTX whatever ``fp_fusion`` says, which nothing packs or contracts with an add (note 2). The cost is the order's:
     a sequential row of 4096 columns is 4096 dependent adds. The ``reference`` mode computes the same order in torch (f32 adds, an fma as in note
     16, NaNs canonical): byte-identical to the binary.
 18. **Float to integer casts.** ``x.to(i32, rounding=..., saturate=...)`` (also ``i64`` and ``u8``; from f32, or from bf16, f16, e4m3 or e5m2,
@@ -493,31 +525,25 @@ Notes (the facts behind the table):
     (``elementwise.slice``). The ``reference`` mode is torch's ``select``: a raw read, byte-identical (``tests/test_gpu_slices.py``).
 20. **Fused regions** (``docs/rfcs/0001-plan-fusion.md``, :mod:`tilefish._fusion`). The arithmetic written in a ``@tilefish.graph`` body is
     planned as regions, each a kernel lowered here with ``fp_fusion=False`` and ``context_free=True``, so that a region is byte for byte the
-    composition of one kernel per op (the unfused composition). ``context_free`` makes the bits of the two ops whose PTX the compilers would
-    otherwise fit to their neighbours independent of them:
+    composition of one kernel per op (the unfused composition). Its code is the code of every kernel with ``fp_fusion=False`` (note 2), whose bits
+    do not depend on the ops around them:
 
     * **every narrowing float cast** (to bf16 or f16, from f32, f16 or bf16) is one helper of inline PTX, ``cvt.rn.bf16.f32`` /
-      ``cvt.rn.f16.f32`` (a 16-bit source widened to f32 first, exactly): the instruction ``.to()`` compiles to (note 1), but out of the reach of
-      the folds of MLIR and LLVM. Measured on sm_103 (the RFC's experiment E5): with ``.to()``, ``x.to(f32).to(bf16)`` in one kernel is folded to
-      ``x`` and keeps the payload of every input NaN (254 of 254 bf16 NaNs, 2046 of 2046 f16 NaNs), and a ``where`` between widened values
-      narrowed after it is folded too (506 NaN outputs differ), where two kernels give the canonical NaN (``0x7FFF``) for each;
-    * **a negation** (``-x``, note 16) gives the canonical NaN for a NaN explicitly (``testp.notanumber`` / ``setp.nan`` and ``selp``), and
-      ``neg`` for every other value. ``neg.f32`` alone gives the canonical NaN (what note 16 measured), but ptxas folds it into a consumer as a
-      negated operand when it can (a ``where`` of ``-x``: ``FSEL`` of ``-R``), which flips the sign of a NaN instead (``0xFFFFFFFF``): found by
-      the random graphs of ``tests/test_gpu_fusion.py``, 61 of 1536 elements of one graph;
+      ``cvt.rn.f16.f32`` (note 1): with ``.to()`` the folds of MLIR and LLVM keep an input NaN's payload through ``x.to(f32).to(bf16)`` in one
+      kernel, and through a ``where`` between widened values narrowed after it (506 NaN outputs differed), where two kernels give the canonical
+      NaN (``0x7FFF``) for each;
+    * **a negation** gives the canonical NaN explicitly (note 16, as in every kernel);
     * **every float ``+``, ``-`` and ``*``** (f32, f16, bf16), and the last multiply of ``silu`` and the multiplies and add of ``gelu``, is one
-      scalar instruction of inline PTX with ``.rn`` (``mul.rn.f32``, ``add.rn.bf16``, ...). ``fp_fusion=False`` is not enough on sm_100 and
-      later: LLVM packs two lanes' f32 ops into ``mul.rn.f32x2`` / ``add.rn.f32x2``, and ptxas 12.9 contracts a packed multiply and add into
-      ``FFMA2`` even with ``--fmad=false`` (found by the random graphs, 33 of 1536 elements of one graph one ULP off, and read in the SASS of
-      the same PTX assembled for sm_100a). A scalar ``.rn`` instruction is not contracted.
+      scalar instruction of inline PTX with ``.rn`` (note 2: ptxas 12.9 contracts a packed ``mul.rn.f32x2`` and ``add.rn.f32x2`` even with
+      ``--fmad=false``).
 
-    A context-free kernel may also take a **view where it is**: a ``Strided[...]`` parameter with a ``StrideOf`` per axis (a fused region's
-    input that is a column block, a head or a transpose), which the elementwise template reads at ``sum(coordinate_k * stride_k)``, the
-    coordinates as note 12 computes them (integer arithmetic, exact; a ``max_extent`` precondition holds the offsets within ``i32``). The row
-    template takes none (rule ``row.strided``): a fused region then copies the view with ``tilefish.contiguous`` first.
+    ``context_free`` adds the header line that says so, and lets a kernel take a **view where it is**: a ``Strided[...]`` parameter with a
+    ``StrideOf`` per axis (a fused region's input that is a column block, a head or a transpose), which the elementwise template reads at
+    ``sum(coordinate_k * stride_k)``, the coordinates as note 12 computes them (integer arithmetic, exact; a ``max_extent`` precondition holds the
+    offsets within ``i32``). The row template takes none (rule ``row.strided``): a fused region then copies the view with ``tilefish.contiguous``
+    first.
 
-    Every non-NaN value is the same either way, and the inline cast is ``.to()``'s bits on every f32 (``tests/test_gpu_fusion.py``). A
-    ``@tilefish.kernel`` keeps ``.to()`` and ``neg``.
+    Every non-NaN value is the same either way, and the inline cast is ``.to()``'s bits on every f32 (``tests/test_gpu_fusion.py``).
 
 **``num_warps`` and the numerics identity** (decided on measurements, ``tests/test_gpu_reduction_order.py``). What depends on ``num_warps`` is
 Triton's own reductions: ``tl.sum`` (``sum`` without ``order``, ``mean``) adds in a tree that the warp count shapes (note 6; on 1024 rows of
@@ -601,7 +627,7 @@ _COMPARE = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="
 _LOGICAL = {"and": "&", "or": "|", "xor": "^"}
 _UNARY = ("rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos", "tanh", "erf", "sin_approx", "rcp")
 _NEG = frozenset({"f32", "bf16", "f16", "i32", "i64"})
-_RN = frozenset({"f32", "bf16", "f16"})  # the float dtypes whose + - * a fused region writes as one inline instruction each (note 20)  # neg: the floats by CUDA's neg (note 16), the signed integers by 0 - x
+_RN = frozenset({"f32", "bf16", "f16"})  # the float dtypes whose + - * fp_fusion=False writes as one inline instruction each (note 2)  # neg: the floats by CUDA's neg (note 16), the signed integers by 0 - x
 _REDUCTIONS = ("sum", "mean", "max")
 _ARG_REDUCTIONS = ("argmax", "argmin")
 _OTHER_OPS = ("not", "where", "iota", "gather_rows", "scatter_rows", "floordiv", "mod")  # dtypes checked like a load's
@@ -721,34 +747,28 @@ _PTX: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {
             _asm(["rcp.rn.f32 $0, $1;"], "=f,f", "x")),
     "fma": ("a, b, c", ("fma.rn.f32: a * b + c rounded once, whatever fp_fusion says (CUDA's fmaf; note 16 of tilefish.lower)",),
             _asm(["fma.rn.f32 $0, $1, $2, $3;"], "=f,f,f,f", "a, b, c")),
-    "neg.f32": ("x", ("neg.f32: CUDA's -x, the sign flipped (-0.0 for +0.0; a NaN gives the canonical NaN; note 16 of tilefish.lower)",),
-                _asm(["neg.f32 $0, $1;"], "=f,f", "x")),
-    "neg.bf16": ("x", ("neg.bf16: CUDA's -x of a bf16, the sign flipped (note 16 of tilefish.lower)",),
-                 _asm(["neg.bf16 $0, $1;"], "=h,h", "x", dtype="bfloat16")),
-    "neg.f16": ("x", ("neg.f16: CUDA's -x of an f16, the sign flipped (note 16 of tilefish.lower)",),
-                _asm(["neg.f16 $0, $1;"], "=h,h", "x", dtype="float16")),
     "add.rn": ("a, b", ("add.rn.f32: one rounding, never contracted with a multiply (an ordered sum, note 17 of tilefish.lower)",),
                _asm(["add.rn.f32 $0, $1, $2;"], "=f,f,f", "a, b")),
-    # the arithmetic of a fused region (note 20): one scalar instruction each, which no compiler packs into f32x2 and contracts
+    # separate roundings (notes 2, 17 and 20): one scalar instruction each, which no compiler packs into f32x2 and contracts
     **{
         f"{op}.rn.{dt}": (
             "a, b",
-            (f"{op}.rn.{ptx}: one rounding, never packed or contracted with a neighbour (a fused region, note 20 of tilefish.lower)",),
+            (f"{op}.rn.{ptx}: one rounding, never packed or contracted with a neighbour (note 2 of tilefish.lower)",),
             _asm([f"{op}.rn.{ptx} $0, $1, $2;"], f"={reg},{reg},{reg}", "a, b", dtype=tl_name),
         )
         for op in ("add", "sub", "mul")
         for dt, ptx, reg, tl_name in (("f32", "f32", "f", "float32"), ("f16", "f16", "h", "float16"), ("bf16", "bf16", "h", "bfloat16"))
     },
-    "cvt.bf16": ("x", ("cvt.rn.bf16.f32: f32 to bf16, to nearest even, every NaN the canonical 0x7FFF (note 1); inline, out of the reach of folds (note 20)",),
+    "cvt.bf16": ("x", ("cvt.rn.bf16.f32: f32 to bf16, to nearest even, every NaN the canonical 0x7FFF (note 1); inline, out of the reach of folds",),
                  _asm(["cvt.rn.bf16.f32 $0, $1;"], "=h,f", "x", dtype="bfloat16")),
-    "cvt.f16": ("x", ("cvt.rn.f16.f32: f32 to f16, to nearest even, every NaN the canonical 0x7FFF (note 1); inline, out of the reach of folds (note 20)",),
+    "cvt.f16": ("x", ("cvt.rn.f16.f32: f32 to f16, to nearest even, every NaN the canonical 0x7FFF (note 1); inline, out of the reach of folds",),
                 _asm(["cvt.rn.f16.f32 $0, $1;"], "=h,f", "x", dtype="float16")),
-    # a negation whose NaN is the canonical one whatever ptxas folds it into (note 20): ptxas may make neg a negated operand of its consumer
-    "negc.f32": ("x", ("-x: neg.f32, and the canonical NaN 0x7FFFFFFF for a NaN, explicitly (note 20; a folded neg.f32 flips a NaN's sign)",),
+    # a negation whose NaN is the canonical one whatever ptxas folds it into (note 16): ptxas may make neg a negated operand of its consumer
+    "negc.f32": ("x", ("-x: neg.f32, and the canonical NaN 0x7FFFFFFF for a NaN, explicitly (note 16; a folded neg.f32 flips a NaN's sign)",),
                  _asm(["testp.notanumber.f32 p, $1;", "neg.f32 t, $1;", "selp.f32 $0, 0f7FFFFFFF, t, p;"], "=f,f", "x", ".reg .pred p; .reg .f32 t;")),
-    "negc.f16": ("x", ("-x: neg.f16, and the canonical NaN 0x7FFF for a NaN, explicitly (note 20)",),
+    "negc.f16": ("x", ("-x: neg.f16, and the canonical NaN 0x7FFF for a NaN, explicitly (note 16)",),
                  _asm(["setp.nan.f16 p, $1, $1;", "neg.f16 t, $1;", "selp.b16 $0, 0x7FFF, t, p;"], "=h,h", "x", ".reg .pred p; .reg .b16 t;", dtype="float16")),
-    "negc.bf16": ("x", ("-x: neg.bf16, and the canonical NaN 0x7FFF for a NaN, explicitly (note 20)",),
+    "negc.bf16": ("x", ("-x: neg.bf16, and the canonical NaN 0x7FFF for a NaN, explicitly (note 16)",),
                   _asm(["setp.nan.bf16 p, $1, $1;", "neg.bf16 t, $1;", "selp.b16 $0, 0x7FFF, t, p;"], "=h,h", "x", ".reg .pred p; .reg .b16 t;", dtype="bfloat16")),
 }
 
@@ -2052,9 +2072,12 @@ class _Body:
         rename: "dict[str, str]",
         math: str = "fast",
         context_free: bool = False,
+        fp_fusion: bool = True,
     ) -> None:
         self.graph = op.graph
-        self.context_free = context_free  # narrowing float casts inline, a negation's NaN canonical (note 20)
+        self.context_free = context_free  # a fused region's kernel (note 20)
+        # separate roundings (note 2): every float + - * one scalar .rn instruction, every narrowing float cast inline PTX
+        self.strict = context_free or not fp_fusion
         self.layout = layout
         self.names = names
         self.out_names = out_names
@@ -2074,6 +2097,14 @@ class _Body:
             for v, ns in users.items()
             if v in self.producer and all(u.op == "sum" and u.attrs.get("fma") for u in ns) and not any(v is o for o in op.graph.outputs)
         }
+        # a float product that an ordered sum without fma adds is rounded first, whatever fp_fusion says (note 17): one .rn instruction
+        self.rn_products = {
+            self.producer[v]
+            for v, ns in users.items()
+            if v in self.producer
+            and self.producer[v].op == "mul"
+            and any(u.op == "sum" and "order" in u.attrs and not u.attrs.get("fma") for u in ns)
+        }
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
         self.helpers: dict[tuple, tuple[str, list[str]]] = {}  # module-level @triton.jit functions the body calls (an argmax combine)
@@ -2084,6 +2115,27 @@ class _Body:
         name = self.names.fresh(f"v{self._count}")
         self._count += 1
         return name
+
+    def widened(self, x: "Value | Scalar") -> bool:
+        """Whether ``x`` is, or a ``where`` (through any number of them) selects, a 16-bit float widened by a cast: what MLIR and LLVM fold a
+        narrowing cast of (``fptrunc(fpext(x))`` is ``x``, and a ``select`` of widened values is narrowed into a select of the values), which
+        keeps an input NaN's payload where the cast gives the canonical NaN (note 1; the RFC's hazard H1)."""
+        seen: set[int] = set()
+        todo = [x]
+        while todo:
+            v = todo.pop()
+            if not isinstance(v, Value) or id(v) in seen:
+                continue
+            seen.add(id(v))
+            n = self.producer.get(v)
+            if n is None:
+                continue
+            src = n.inputs[0] if n.inputs else None
+            if n.op == "cast" and v.type.dtype.name == "f32" and isinstance(src, Value) and src.type.dtype.name in ("bf16", "f16"):
+                return True
+            if n.op == "where":
+                todo += [n.inputs[1], n.inputs[2]]
+        return False
 
     def emit(self, text: str, comment: str = "") -> None:
         self.lines.append("    " * self.indent + text + (f"  # {comment}" if comment else ""))
@@ -2553,10 +2605,11 @@ class _Body:
             return f"{self.ptx_helper(op)}({', '.join(a)})"
         if op == "neg":
             dt = n.outputs[0].type.dtype
-            if dt.is_float and self.context_free:  # a NaN canonical whatever ptxas folds the negation into (note 20)
+            if dt.is_float:  # CUDA's neg, its NaN the canonical one whatever ptxas folds the negation into (note 16)
                 return f"{self.ptx_helper('negc.' + dt.name)}({a[0]})"
-            return f"{self.ptx_helper('neg.' + dt.name)}({a[0]})" if dt.is_float else f"-{a[0]}"  # an integer: 0 - x, two's complement
-        if op in _BINARY and self.context_free and op != "div" and n.outputs[0].type.dtype.name in _RN:  # note 20: one rounding each
+            return f"-{a[0]}"  # an integer: 0 - x, two's complement
+        rn = self.strict or n in self.rn_products  # separate roundings (notes 2 and 17): one scalar .rn instruction, never packed or contracted
+        if op in _BINARY and rn and op != "div" and n.outputs[0].type.dtype.name in _RN:
             return f"{self.ptx_helper(op + '.rn.' + n.outputs[0].type.dtype.name)}({self.typed(n.inputs[0])}, {self.typed(n.inputs[1])})"
         if op in _BINARY:
             return f"{a[0]} {_BINARY[op]} {a[1]}"
@@ -2568,11 +2621,11 @@ class _Body:
             return f"tl.sqrt_rn({a[0]})"
         if op in ("sin", "cos"):
             return f"tl.{op}({a[0]})"
-        if op == "silu" and self.context_free:  # note 20: its last multiply one rounding, never contracted with what reads it
+        if op == "silu" and self.strict:  # notes 2 and 20: its last multiply one rounding, never contracted with what reads it
             return f"{self.ptx_helper('mul.rn.f32')}({a[0]}, tl.sigmoid({a[0]}))"
         if op == "silu":
             return f"{a[0]} * tl.sigmoid({a[0]})"
-        if op == "gelu" and self.context_free:  # the same evaluation, every multiply and add one rounding (note 20)
+        if op == "gelu" and self.strict:  # the same evaluation, every multiply and add one rounding (notes 2 and 20)
             mul, add = self.ptx_helper("mul.rn.f32"), self.ptx_helper("add.rn.f32")
             return f"{mul}({mul}(0.5, {a[0]}), {add}(1.0, tl.math.erf({mul}({a[0]}, 0.7071067811865476))))"
         if op == "gelu":
@@ -2588,7 +2641,8 @@ class _Body:
                 return f"tl.where({a[0]} != {a[0]}, {q}, {r}).to(tl.uint16).to(tl.bfloat16, bitcast=True)"
             dst = n.attrs["to"].name
             src = n.inputs[0].type.dtype.name  # type: ignore[union-attr]
-            if self.context_free and n.attrs.get("rounding") and dst in ("bf16", "f16") and src in ("f32", "bf16", "f16"):  # note 20
+            narrowing = n.attrs.get("rounding") and dst in ("bf16", "f16") and src in ("f32", "bf16", "f16")
+            if narrowing and (self.strict or self.widened(n.inputs[0])):  # inline cvt, out of the reach of the folds (notes 1, 2 and 20)
                 x = a[0]
                 if src != "f32":
                     x = self.names.fresh(f"{v}_x")
@@ -2648,8 +2702,8 @@ def lower(
     ``num_warps=`` and the template's rule, and pins the warp count of every bucket; without either,
     each bucket of a bucketed ``D`` gets the warps of its own size. ``fp_fusion`` overrides the kernel's
     own ``fp_fusion=`` (``False``: no FMA contraction), and ``math`` its ``math=`` (``"ieee"``: note 13; an op
-    that says its own keeps it). ``context_free`` overrides the kernel's own (``True``: every narrowing float cast
-    is inline PTX and a negation's NaN canonical, note 20; what a graph's fused regions are lowered with). Raises
+    that says its own keeps it). ``context_free`` overrides the kernel's own (``True``: the code of ``fp_fusion=False``, every
+    float ``+ - *`` and narrowing cast inline PTX, and views read where they are, note 20; what a graph's fused regions are lowered with). Raises
     :class:`~tilefish.errors.TilefishLoweringError` when the body fits no template.
     """
     module, fn_name = _check_names(op, module)
@@ -2766,13 +2820,17 @@ def _assemble(
         )
         element_counts.update({k: rename.get(v, v) for k, v in layout.counts.items()})  # a broadcast operand's own count
 
-    body_emitter = _Body(op, layout, names, out_names, rename, math, context_free)
+    body_emitter = _Body(op, layout, names, out_names, rename, math, context_free, fp_fusion)
     body = body_emitter.run()
     header = [
         f"Generated by tilefish.lower from the kernel '{op.base.name if op.base is not None else op.name}'. Do not edit.",  # (a specialisation has its kernel's source)
         *layout.header(),
         warps_header,
-        *(["fp_fusion: False (no FMA contraction: a * b + c rounds twice)"] if not fp_fusion else []),
+        *(
+            ["fp_fusion: False (no FMA contraction: a * b + c rounds twice; every float + - * is one scalar .rn instruction, every narrowing cast inline PTX: note 2)"]
+            if not fp_fusion
+            else []
+        ),
         *([_IEEE_HEADER] if math == "ieee" else []),
         *(["context-free: every narrowing float cast is inline PTX, a negation's NaN canonical (note 20: a fused region of a graph)"] if context_free else []),
         *[f"parameter '{old}' of the kernel is '{new}' here (the name is used by this module)" for old, new in rename.items()],

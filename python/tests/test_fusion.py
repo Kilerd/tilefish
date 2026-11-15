@@ -237,18 +237,24 @@ def test_long_chains_are_split_by_the_limit_of_a_region():
 # -- the numerics ------------------------------------------------------------------------------------------------------------------------
 
 
-def test_every_narrowing_float_cast_of_a_region_is_inline_ptx_and_a_kernel_keeps_to():
+def test_every_narrowing_float_cast_of_a_region_is_inline_ptx_and_a_default_kernel_keeps_to():
     f = _fusion.fused(fg.bias_act)
     source = f.regions[0].kernel.lower().source
     assert "cvt.rn.bf16.f32 $0, $1;" in source and ".to(tl.bfloat16)" not in source
     assert "context-free: every narrowing float cast is inline PTX" in source
 
+    @tilefish.kernel
+    def default(x: Tensor[R, D, bf16], b: Tensor[D, bf16]) -> Tensor[R, D, bf16]:
+        return tilefish.silu(x.to(f32) + b.to(f32)).to(bf16)
+
+    plain = lower(default).source  # fp_fusion=True: the compiler's choice, and no fold can reach this cast (its operand is not widened)
+    assert "cvt.rn" not in plain and ".to(tl.bfloat16)" in plain
+
     @tilefish.kernel(fp_fusion=False)
     def k(x: Tensor[R, D, bf16], b: Tensor[D, bf16]) -> Tensor[R, D, bf16]:
         return tilefish.silu(x.to(f32) + b.to(f32)).to(bf16)
 
-    plain = lower(k).source
-    assert "cvt.rn" not in plain and ".to(tl.bfloat16)" in plain
+    assert "cvt.rn.bf16.f32" in lower(k).source and ".to(tl.bfloat16)" not in lower(k).source  # fp_fusion=False: every rounding written out
     opaque = lower(k, context_free=True).source
     # the region's kernel is the hand-written kernel of the same ops, lowered with opaque casts: the same source but for the names
     def norm(s, name):

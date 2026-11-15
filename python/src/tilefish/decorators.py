@@ -433,7 +433,7 @@ class KernelOp(GraphOp):
         # a specialisation for pointers aligned to their element only (unaligned()): the kernel it is of, and the parameters it is for
         self.base: "KernelOp | None" = None
         self.unaligned_params: "frozenset[str]" = frozenset()
-        # narrowing float casts inline and a negation NaN-canonical (note 20 of tilefish.lower): set on the kernels of a graph's fused regions
+        # the code of fp_fusion=False and views read where they are (note 20 of tilefish.lower): set on the kernels of a graph's fused regions
         self.context_free = False
 
     def lower(self, **options: Any) -> Any:
