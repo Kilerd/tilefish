@@ -388,6 +388,15 @@ class _Pass:
             if n.attrs.get("kind") is None and n.op in _REFUSED_OPS:
                 self.fail(f"the op '{n.op}' (node #{origin[k]}): {_REFUSED_OPS[n.op]}")
         self.prepare(prog, origin)
+        nodes = self.select()
+        regions = self.regions(self.partition(nodes, self.settings.grouping))
+        graph = self._graph(regions)
+        return Fused(graph, regions, prog, origin, list(self.rewrites), self.settings, self.source)
+
+    def select(self) -> "list[int]":
+        """The ops the regions are made of (after :meth:`prepare`): every arithmetic op that is neither free (copied into each region that reads it)
+        nor dead (nothing reads its value)."""
+        prog, origin = self.prog, self.origin
         # a free op whose value something outside the arithmetic reads (a call, a move, a barrier, the graph's return) is a region of its own
         for k in sorted(self.free):
             v = prog[k].outputs[0]
@@ -414,10 +423,7 @@ class _Pass:
             else:
                 self.dead.add(k)
         self.free -= self.dead
-        nodes = [k for k, n in enumerate(prog) if _is_arith(n) and k not in self.free and k not in self.dead]
-        regions = self.regions(self.partition(nodes, self.settings.grouping))
-        graph = self._graph(regions)
-        return Fused(graph, regions, prog, origin, list(self.rewrites), self.settings, self.source)
+        return [k for k, n in enumerate(prog) if _is_arith(n) and k not in self.free and k not in self.dead]
 
     def partition(self, nodes: "list[int]", grouping: str) -> "list[list[int]]":
         """The regions of ``nodes`` (arithmetic ops that are not free): one per op, merged producer into consumer in IR order (``"auto"``); then a
@@ -516,10 +522,13 @@ class _Pass:
                         succ[w].add(k)
         return succ
 
-    def _try_merge(self, a: int, b: int, force: bool = False) -> bool:
+    def merge_problem(self, a: int, b: int, force: bool = False) -> "tuple[str, str] | None":
+        """The first rule of 3.5 the union of the regions whose first ops are ``a`` and ``b`` breaks, as ``(reason, what)``: ``"limit"`` (more ops or
+        tensors than a region of version 1 has), ``"cycle"`` (a path leaves the union and comes back: through a call, a view, a move or another
+        region), ``"template"`` (the union does not lower); ``None`` when the union is legal."""
         union = sorted(self.groups[a] + self.groups[b])
         if len(union) > MAX_REGION_NODES and not force:
-            return False
+            return "limit", f"together they are {len(union)} ops, more than the {MAX_REGION_NODES} of a region of version 1"
         members = set(union)
         last = union[-1]
         # a cycle: a path that leaves the union and comes back (every edge goes forward, so look only before its last node)
@@ -532,16 +541,30 @@ class _Pass:
             seen.add(x)
             for s in self.succ[x]:
                 if s in members:
-                    return False
+                    n = self.prog[x]
+                    what = f"the call to '{n.op}'" if n.attrs.get("kind") else f"the op '{n.op}'"
+                    detail = f"one region of both would make a cycle through {what} (node #{self.origin[x]}), which reads one and feeds the other"
+                    if _is_arith(n) and n.op in _SOLO_OPS:  # through a reduction: a row region of phase 2 takes all three
+                        unordered = n.op in ("sum", "mean") and "order" not in n.attrs
+                        return ("gather" if n.op == "gather_rows" else "reduction-unordered" if unordered else "reduction"), detail
+                    return "cycle", detail
                 if s < last and s not in seen:
                     stack.append(s)
         try:
             region = self._region(-1, union, trial=True)
-            if len(region.inputs) + len(region.outputs) > MAX_REGION_TENSORS and not force:
-                return False
+            tensors = len(region.inputs) + len(region.outputs)
+            if tensors > MAX_REGION_TENSORS and not force:
+                return "limit", f"together they read and write {tensors} tensors, more than the {MAX_REGION_TENSORS} of a region of version 1"
             self._kernel(region, trial=True)
-        except (TilefishLoweringError, TilefishPlanError):
+        except (TilefishLoweringError, TilefishPlanError) as e:
+            first = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+            return "template", f"one kernel of both does not lower: {first}"
+        return None
+
+    def _try_merge(self, a: int, b: int, force: bool = False) -> bool:
+        if self.merge_problem(a, b, force) is not None:
             return False
+        union = sorted(self.groups[a] + self.groups[b])
         keep, gone = (a, b) if a < b else (b, a)
         self.groups[keep] = union
         del self.groups[gone]
@@ -858,6 +881,148 @@ def report(gop: Any, verification: "Mapping[int, Any] | None" = None) -> "dict[s
             item["verified"] = verification[r.index]
         regions.append(item)
     return {"schema": REPORT_SCHEMA, "graph": f.source.name, "fusion": f.settings.canonical(), "regions": regions}
+
+
+# -- why the regions are where they are (tilefish.advise) ------------------------------------------------------------------------------------
+
+# reason -> (what to do, the phase of docs/rfcs/0001-plan-fusion.md that does it)
+BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
+    "barrier": ("remove tilefish.barrier: a tap of the unfused plan (grouping='none') shows the same bytes", "1"),
+    "view": ("a view between two ops ends a region (rule 6): compute on one shape, or wait for phase 2 (dense reshapes inside a region)", "2"),
+    "reduction-unordered": ("add order= to the reduction (D2): exact and layout-independent; phase 1 still runs it alone, phase 2 fuses it", "2"),
+    "reduction": ("needs phase 2 row fusion: a reduction is a region of its own in version 1", "2"),
+    "gather": ("needs phase 2: gather_rows is a region of its own in version 1", "2"),
+    "cycle": ("move the call out from between them (or accept two kernels)", "1"),
+    "limit": ("a region of version 1 has at most 64 ops and 32 tensors: a split is a speed choice only", "1"),
+    "template": ("the templates cannot compute both in one kernel (another iteration space, or a row region)", "2"),
+    "grouping": ("the greedy grouping of version 1 did not make this union (a later fusion version may)", "1"),
+    "materialised": ("needs phase 2: the row template reads no strided input, so the view is copied by tilefish.contiguous first", "2"),
+    "move": ("a copy or a store between them: return or store the value where it is made", "1"),
+    "epilogue-library": ("GEMM / convolution epilogue: future work (RFC 0001, section 7 route (b) and section 11.2)", "future"),
+    "epilogue-extern": ("an epilogue hook of the extern (RFC 0001, section 7 route (c)): phase 4", "4"),
+    "epilogue-kernel": ("write the @tilefish.kernel's body in the graph body so phase 1 fuses it (inlining kernel calls: RFC 0001, 8.2)", "1"),
+    "prologue-library": ("GEMM / convolution prologue: future work (RFC 0001, section 11.3)", "future"),
+    "prologue-extern": ("a prologue hook of the extern: future work (RFC 0001, section 11.3)", "future"),
+    "prologue-kernel": ("write the @tilefish.kernel's body in the graph body so phase 1 fuses it (inlining kernel calls: RFC 0001, 8.2)", "1"),
+}
+
+
+def _node_ref(f: Fused, k: int, region: "Region | None" = None) -> "dict[str, Any]":
+    n = f.program[k]
+    out: "dict[str, Any]" = {"node": f.origin[k], "op": n.op, "loc": f"{n.loc[0]}:{n.loc[1]}" if n.loc else None}
+    if region is not None:
+        out["region"] = region.index
+        out["kernel"] = region.kernel.name
+    elif n.attrs.get("kind"):
+        out["call"] = n.attrs["kind"]
+    return out
+
+
+def boundaries(gop: Any) -> "list[dict[str, Any]]":
+    """Why the arithmetic of a graph body is in the regions it is in (what ``tilefish.advise`` reports): one entry per value that crosses a boundary of a
+    region, from a region (or a call) to another region (or a call), and per view a region copies first. Each entry is ``{"reason", "from", "to", "value",
+    "detail", "fix", "phase"}``; ``from`` and ``to`` name the op of the traced graph (``node``, ``op``, ``loc``, and ``region`` and ``kernel`` for a region, or
+    ``call`` for a call). Reasons: ``barrier``, ``view``, ``move``, ``reduction-unordered`` (D2), ``reduction``, ``gather``, ``cycle``, ``limit``,
+    ``template``, ``grouping``, ``materialised``, ``epilogue-<library|extern|kernel>`` (a call's result read by a region) and ``prologue-...`` (a region's
+    value read by a call). Derived from the graph like the fusion report; no GPU."""
+    f = fused(gop)
+    if not f.regions:
+        return []
+    p = _Pass(f.source, f.settings)
+    p.prepare(f.program, f.origin)
+    p.select()
+    p.member_of = {k: r.nodes[0] for r in f.regions for k in r.nodes}
+    p.groups = {r.nodes[0]: list(r.nodes) for r in f.regions}
+    region_at = {r.nodes[0]: r for r in f.regions}
+    prog = f.program
+    out: "list[dict[str, Any]]" = []
+    seen: "set[tuple[Any, ...]]" = set()
+
+    def source(v: Value) -> "tuple[int | None, list[int]]":
+        """The node that makes the storage ``v`` reads (through views), and the views on the way."""
+        via: "list[int]" = []
+        while True:
+            k = p.producer.get(v)
+            if k is not None and prog[k].attrs.get("kind") is None and prog[k].op in _VIEW_OPS and isinstance(prog[k].inputs[0], Value):
+                via.append(k)
+                v = prog[k].inputs[0]  # type: ignore[assignment]
+                continue
+            return k, via
+
+    def add(reason: str, a: "dict[str, Any]", b: "dict[str, Any]", value: Value, detail: str) -> None:
+        key = (reason, a.get("region", a["node"]), b.get("region", b["node"]), value.ref)
+        if key in seen:
+            return
+        seen.add(key)
+        fix, phase = BOUNDARY_FIXES[reason]
+        out.append({"reason": reason, "from": a, "to": b, "value": value.ref, "detail": detail, "fix": fix, "phase": phase})
+
+    def solo(k: int) -> "str | None":
+        n = prog[k]
+        if n.op not in _SOLO_OPS:
+            return None
+        if n.op == "gather_rows":
+            return "gather"
+        if n.op in ("sum", "mean") and "order" not in n.attrs:
+            return "reduction-unordered"
+        return "reduction"
+
+    for r in f.regions:
+        root = r.nodes[0]
+        for k in r.nodes:
+            for i in prog[k].inputs:
+                if not isinstance(i, Value):
+                    continue
+                pk, via = source(i)
+                if pk is None or pk in r.nodes or pk in p.free:
+                    continue
+                pn = prog[pk]
+                to = _node_ref(f, k, r)
+                kind = pn.attrs.get("kind")
+                if kind in ("kernel", "extern", "library"):
+                    add(f"epilogue-{kind}", _node_ref(f, pk), to, i, f"the result of the call to '{pn.op}' is read by region {r.index}: no fusion across a call")
+                    continue
+                if kind is None and pn.op in _MOVE_OPS:
+                    add("move", _node_ref(f, pk), to, i, f"'{pn.op}' (node #{f.origin[pk]}) is between them")
+                    continue
+                other = p.member_of.get(pk)
+                if other is None or other == root:
+                    continue
+                frm = _node_ref(f, pk, region_at[other])
+                if i in p.barriered or any(v in p.barriered for v in (prog[v].inputs[0] for v in via)):
+                    add("barrier", frm, to, i, f"{i.ref} passes tilefish.barrier")
+                elif via:
+                    add("view", frm, to, i, f"the {', '.join(prog[v].op for v in via)} of {i.ref} is between them")
+                elif solo(pk) or solo(k):
+                    which = pk if solo(pk) else k
+                    reason = solo(which) or "reduction"
+                    n = prog[which]
+                    order = f" with order={n.attrs['order']}" if "order" in n.attrs else (" without order=" if reason == "reduction-unordered" else "")
+                    add(reason, frm, to, i, f"'{n.op}'{order} (node #{f.origin[which]}) is a region of its own in version 1")
+                else:
+                    problem = p.merge_problem(other, root)
+                    if problem is None:
+                        add("grouping", frm, to, i, "the union of the two regions is legal, but the greedy merge of version 1 did not make it")
+                    else:
+                        add(problem[0], frm, to, i, problem[1])
+        for v, how in r.reads.items():
+            if how == "materialised":
+                pk, _ = source(v)
+                a = _node_ref(f, pk) if pk is not None else {"node": None, "op": "parameter", "loc": None}
+                add("materialised", a, _node_ref(f, r.nodes[0], r), v, f"{v.ref} ({v.type}) is not dense, and region {r.index} is lowered by the row template")
+    for k, n in enumerate(prog):  # a region's value read by a call
+        kind = n.attrs.get("kind")
+        if kind not in ("kernel", "extern", "library"):
+            continue
+        for i in n.inputs:
+            if not isinstance(i, Value):
+                continue
+            pk, _ = source(i)
+            other = p.member_of.get(pk) if pk is not None else None
+            if other is None:
+                continue
+            add(f"prologue-{kind}", _node_ref(f, pk, region_at[other]), _node_ref(f, k), i, f"region {region_at[other].index}'s value is read by the call to '{n.op}': no fusion across a call")
+    return out
 
 
 # -- verification: each region against its ops one by one ------------------------------------------------------------------------------------

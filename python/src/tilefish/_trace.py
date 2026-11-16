@@ -17,7 +17,8 @@ by a script one does not edit) writes, for each binary it builds, ``trace/<stem>
   graph, its op, the line of the body it was written on; for a fused region the op's position in the region).
 
 ``trace/graphs/<graph>.json`` says, for a graph, what each step of its plan launches and, for a fused region, the ops of the graph body it
-took and their lines. ``trace/index.json`` (``tilefish.trace.v1``) lists every file with its sha256, the manifest digest the trace is of and
+took and their lines and its template, and why the regions are where they are (``boundaries``: :func:`tilefish._fusion.boundaries`, which the
+fusion advisor reads). ``trace/index.json`` (``tilefish.trace.v1``) lists every file with its sha256, the manifest digest the trace is of and
 the sha256 of each binary, and its own digest (``trace_digest``) over all of it.
 
 **It holds source code.** The kernels' own files, the graph body's and Triton's are copied in (only files this process has loaded: nothing is
@@ -271,8 +272,13 @@ def graph_doc(graph: Any, plan: Any, plan_file: str) -> "dict[str, Any]":
                 o = f.origin[k]
                 n = src[o]
                 ops.append({"node": o, "op": n.op, "loc": f"{n.loc[0]}:{n.loc[1]}" if n.loc else None})
+            template = r.kernel.lower().template
             for name in {r.kernel.name, r.call.name}:
-                doc["regions"][name] = {"kernel": r.kernel.name, "region": r.index, "body": ops}
+                doc["regions"][name] = {"kernel": r.kernel.name, "region": r.index, "template": template, "body": ops}
+        try:  # why the regions are where they are (tilefish.advise); a trace is never refused for it
+            doc["boundaries"] = _fusion.boundaries(graph)
+        except Exception as e:  # noqa: BLE001
+            doc["boundaries_error"] = f"{type(e).__name__}: {e}"
     return doc
 
 
