@@ -989,6 +989,7 @@ def export(
     buckets: Any = None,
     reuse: bool = False,
     verify: "bool | None" = None,
+    trace: "bool | None" = None,
 ) -> Any:
     """Build every binary of one or several kernels and externs and write them as a manifest directory.
 
@@ -1016,6 +1017,12 @@ def export(
     A library op with an ``impl`` (a cuBLASLt GEMM) is pinned for the device (``arch`` must be its architecture) and gets an entry in the manifest's
     ``library`` section; a prebuilt PTX is assembled by ``ptxas`` and a cubin is taken as it is (:mod:`tilefish._binary`).
 
+    ``trace=True`` (or ``TILEFISH_TRACE=1`` in the environment, when ``trace`` is ``None``) also writes ``trace/`` next to the manifest: every
+    level of every binary it builds (the sources, the frontend's IR, TTIR, TTGIR, LLVM IR, PTX, SASS with its line table, and for a lowered kernel
+    or a fused region what each line of its generated source was written for), with an index of its own (:mod:`tilefish._trace`), which
+    ``tilefish-explain`` reads. It is outside the pinned artefact: the manifest, the plans and every digest are the same with or without it (a
+    traced export compiles every Triton kernel instead of reading the build cache, which holds no IR).
+
     Returns the loaded and verified :class:`~tilefish.aot.Manifest` (``.pinned``: it is what ``hosts.rust.emit`` takes): ``.directory``, ``.path`` and ``.digest``, the
     digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
     ``run(..., mode="replay", manifest=directory, pin=digest)`` to refuse a directory that was changed after the export.
@@ -1028,17 +1035,20 @@ def export(
         or (isinstance(o, tuple) and len(o) == 2 and isinstance(o[0], GraphOp) and not isinstance(o[0], KernelOp))
         for o in items
     ]
+    from . import _trace
+
+    traced = _trace.wanted(trace)
     if any(is_graph):
         if not all(is_graph):
             raise TilefishRuntimeError("export takes graphs, or kernels and externs, not both (a manifest of a plan holds the binaries of its plans); export them separately")
         if len(items) > 1:  # a plan set: one manifest for every plan (docs/plan-schema-1.md, section 15)
             from ._planrun import export_graphs
 
-            return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify)
+            return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=traced)
         from ._planrun import export_graph
 
         graph, own = items[0] if isinstance(items[0], tuple) else (items[0], buckets)
-        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse, verify=verify)
+        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse, verify=verify, trace=traced)
     if verify is not None:
         raise TilefishRuntimeError("verify= is for exporting a graph (it checks the graph's fused regions); kernels and externs have none")
     if buckets is not None or reuse:
@@ -1052,6 +1062,7 @@ def export(
         cap = parse_arch(arch)
     built: "list[BuiltKernel]" = []
     pinned_library: "list[Any]" = []
+    traces: "list[Any]" = []
     for op in items:
         if isinstance(op, LibraryOp) and op.impl is not None:  # a pinned library operation (a cuBLASLt GEMM, a cuDNN convolution): an entry, no file
             from ._conv import build_conv, is_conv
@@ -1063,12 +1074,16 @@ def export(
         target = _target(op).at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
         extern = target.launch_extern()
         for spec in target.compile_specs():
+            jit = None
             if extern.binary is not None:
                 from ._binary import build_binary
 
                 built.append(build_binary(spec, extern.binary, arch=cap))
             else:
-                built.append(build(spec, arch=cap, fn=target.jit_function(spec)))
+                jit = target.jit_function(spec)
+                built.append(build(spec, arch=cap, fn=jit, stages=traced))
+            if traced:
+                traces.append(_trace.item_of(built[-1], target, jit))
     path, written = write_manifest_doc(
         built, pathlib.Path(directory) / MANIFEST_NAME, cubins=True, merge=True, overwrite=overwrite, library=pinned_library
     )
@@ -1080,6 +1095,8 @@ def export(
             f"written has digest {expected}: the directory changed while it was being exported"
         )
     loaded.pinned = True  # its digest is the one of the manifest this process wrote from its own builds
+    if traced:
+        _trace.write(directory, traces, loaded)
     return loaded
 
 

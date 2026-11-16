@@ -2210,14 +2210,14 @@ def export_graph(
     buckets: Any,
     reuse: bool,
     verify: "bool | None" = None,
+    trace: bool = False,
 ) -> Plan:
     """:func:`tilefish.runtime.export` of a graph: build the binary of every step (and pin every GEMM), write the manifest (merged into one that is
     already there) and ``plan.json`` next to it, read both back, and return the plan loaded from the directory, which has the digest to pin.
 
     A graph whose body has arithmetic first has its fused regions verified against their unfused composition (``verify``: ``None`` takes the
     graph's ``tilefish.fusion(verify=...)``, which is ``True`` by default) and gets its fusion report, ``<graph>.fusion.json``."""
-    from ._build import build, parse_arch
-    from ._binary import build_binary
+    from ._build import parse_arch
 
     p = make_plan(graph, buckets, reuse=reuse)
     if arch is None:
@@ -2226,20 +2226,44 @@ def export_graph(
     else:
         cap = parse_arch(arch)
     checked = _verify_fusion(graph, p, cap, verify)
+    built, pinned, traces = _build_callees(sorted(p.callees.items(), key=lambda kv: kv[0]), cap, trace, at=True)
+    written = write_export(p, built, pinned, directory, cap, overwrite)
+    _write_fusion_report(graph, directory, checked)
+    if trace:
+        from . import _trace
+        from ._manifest import Manifest
+
+        _trace.write(directory, traces, Manifest.load(directory), [(graph, written, PLAN_NAME)])
+    return written
+
+
+def _build_callees(callees: "Sequence[tuple[str, Any]]", cap: int, trace: bool, at: bool) -> "tuple[list, list, list]":
+    """Build (or pin) the binary of every ``(stem, callee)`` for ``sm_<cap>`` (``at``: take the callee's implementation of the architecture first);
+    with ``trace``, keep every level of each compile and the trace items (:mod:`tilefish._trace`)."""
+    from ._build import build
+    from ._binary import build_binary
+
     built: list = []
     pinned: list = []
-    for stem, callee in sorted(p.callees.items(), key=lambda kv: kv[0]):
-        callee = callee.at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
+    traces: list = []
+    for stem, callee in callees:
+        if at:
+            callee = callee.at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
         spec = callee.by_stem[stem]
+        jit = None
         if callee.kind == "library":
             pinned.append(_pin_library(spec, cap))
+            continue
         elif callee.extern.binary is not None:  # type: ignore[union-attr]
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         else:
-            built.append(build(spec, arch=cap, fn=callee.target.jit_function(spec)))
-    written = write_export(p, built, pinned, directory, cap, overwrite)
-    _write_fusion_report(graph, directory, checked)
-    return written
+            jit = callee.target.jit_function(spec)
+            built.append(build(spec, arch=cap, fn=jit, stages=trace))
+        if trace:
+            from . import _trace
+
+            traces.append(_trace.item_of(built[-1], callee.target, jit))
+    return built, pinned, traces
 
 
 def _verify_fusion(graph: GraphOp, p: Plan, cap: int, verify: "bool | None") -> "dict[int, Any] | None":
@@ -2323,12 +2347,12 @@ def export_graphs(
     buckets: Any,
     reuse: bool,
     verify: "bool | None" = None,
+    trace: bool = False,
 ) -> "_plan.PlanSet":
     """:func:`tilefish.runtime.export` of several graphs: a **plan set**, one manifest for all of them (each binary built once, whichever plans
     launch it), ``<graph>.plan.json`` per graph and the index ``plans.json`` (``docs/plan-schema-1.md``, section 15). An item is a graph, or
     ``(graph, buckets)``; ``buckets=`` may map a graph's name to its buckets instead. Returns the :class:`~tilefish._plan.PlanSet` loaded back."""
-    from ._build import build, parse_arch
-    from ._binary import build_binary
+    from ._build import parse_arch
 
     plans: "list[Plan]" = []
     for item in graphs:
@@ -2354,19 +2378,16 @@ def export_graphs(
             other = callees.setdefault(stem, callee)
             if other is not callee and callee.by_stem[stem] != other.by_stem[stem]:
                 raise TilefishRuntimeError(f"two plans of the set launch different binaries under one name '{stem}': rename one of the operators")
-    built: list = []
-    pinned: list = []
-    for stem, callee in sorted(callees.items(), key=lambda kv: kv[0]):
-        spec = callee.by_stem[stem]
-        if callee.kind == "library":
-            pinned.append(_pin_library(spec, cap))
-        elif callee.extern.binary is not None:  # type: ignore[union-attr]
-            built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
-        else:
-            built.append(build(spec, arch=cap, fn=callee.target.jit_function(spec)))
+    built, pinned, traces = _build_callees(sorted(callees.items(), key=lambda kv: kv[0]), cap, trace, at=False)
     written = write_plan_set(plans, built, pinned, directory, cap, overwrite)
     for p in plans:
         _write_fusion_report(p.graph, directory, checked[p.name])
+    if trace:
+        from . import _trace
+        from ._manifest import Manifest
+
+        graphs = [(p.graph, written.plans[p.name] if hasattr(written, "plans") else p, _plan.plan_file_name(p.name)) for p in plans]
+        _trace.write(directory, traces, Manifest.load(directory), graphs)
     return written
 
 

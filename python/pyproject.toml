@@ -9,6 +9,9 @@ authors = [{ name = "Kilerd Chan" }]
 readme = "README.md"
 classifiers = ["Development Status :: 2 - Pre-Alpha"]
 
+[project.scripts]
+tilefish-explain = "tilefish.explain:main"
+
 [project.urls]
 Repository = "https://github.com/Kilerd/tilefish"
 
