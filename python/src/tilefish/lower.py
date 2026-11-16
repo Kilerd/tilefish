@@ -602,9 +602,10 @@ Notes (the facts behind the table):
     * **The row template on a tile that holds whole rows** (``"hook-row"``, a Triton kernel, ``D`` static and the extern's tile ``BN >= D``): an
       ``[R, D]`` value is the tile, ``[D]`` is ``[BN]`` at ``cols``, ``[R]`` and ``[R, 1]`` are ``[BM, 1]``; an ordered sum of every row of the tile
       (``_tf_hsum_*``) makes the columns at or past ``D`` ``-0.0`` (as revision 2 does), reshapes the tile to ``[BM, lanes, K]`` (lane ``j``'s columns
-      in its order), takes the chains by halving splits (note 21's, with a leading axis of rows), a lane with no column ``+0.0`` (a tile narrower
-      than a round of the order: the lanes that have columns, then ``+0.0`` lanes joined, data movement), and revision 1's tree over the lanes by
-      splits: the terms of the row template's sum in its order, so its bits; ``max`` is order-free (E2 of RFC 0001). No unordered reduction (D2), no
+      in its order), takes the chains by halving splits (note 21's, with a leading axis of rows) and the tree over the lanes with ``tl.gather``
+      (revision 2's), lane 0's value by a select. A tile narrower than a round of the order computes only its ``BN / V`` lanes that have columns:
+      the others are ``+0.0`` all along, so a level of the tree whose offset is that many or more adds ``+0.0``, as the row template's does. The
+      terms of the row template's sum in its order, so its bits; ``max`` is order-free (E2 of RFC 0001). No unordered reduction (D2), no
       ``argmax``, gather or static slice.
 
 **``num_warps`` and the numerics identity** (decided on measurements, ``tests/test_gpu_reduction_order.py``). What depends on ``num_warps`` is
@@ -2118,6 +2119,20 @@ class _HookLayout(_ElementwiseLayout):
                 self.strided.pop(v, None)  # (held, never read through its strides)
         if not any(v.name in self.tiles for v in op.graph.inputs):
             raise _fail(name, "hook", "hook.no-tile", "the region does not read the extern's result")
+        # a per-row or a per-column operand is read as a vector (load): it needs no element count and no coordinates; the sizes the others need
+        self.vectors = {v for v in self.broadcast if self.per_axis(v) is not None}
+        for v in self.vectors:
+            self.general.pop(v, None)
+        r = len(self.shape)
+        runs = [run for kept in self.general.values() for run in _runs(kept)]
+        runs += [(r - n.outputs[0].type.rank,) * 2 for n in op.graph.nodes if n.op == "iota" and n.outputs[0] in self.broadcast]
+        runs += [(k, k) for _ in self.strided for k in range(r)]
+        size_axes: "set[int]" = set()
+        for a, b in runs:
+            size_axes.update(range(b + 1, r))
+            if a > 0:
+                size_axes.update(range(a, b + 1))
+        self.size_axes = sorted(k for k in size_axes if not self.shape[k].folded().is_static)
 
     def extras(self, names: _Names, taken_dims: "set[str]") -> "list[_Extra]":
         self.offs, self.mask = names.fresh("offs"), names.fresh("mask")
@@ -2133,7 +2148,7 @@ class _HookLayout(_ElementwiseLayout):
             self.last_text = nm
         self.counts = {}
         for v in self.broadcast:  # a broadcast parameter's element count, as in the elementwise template (a static one written as a number)
-            if not v.is_param or v in self.general or v.name in self.tiles:
+            if not v.is_param or v in self.general or v.name in self.tiles or v in self.vectors:
                 continue
             total = _product(v.type.shape)
             if total is not None and total.is_static:
@@ -2160,9 +2175,32 @@ class _HookLayout(_ElementwiseLayout):
     def header(self) -> "list[str]":
         return [f"template: hook (note 22); the tile is {_shape_text(self.shape)}: element (rows, cols) is offs = rows * {self.last_text} + cols"]
 
+    def per_axis(self, v: Value) -> "str | None":
+        """``"col"`` for an operand that has one value per column of the tile (its axes the kernel's last alone: element ``c``), ``"row"`` for one
+        that has one per row (the kernel's leading axes, size 1 along the last: element ``r``), else ``None``."""
+        if v not in self.broadcast or v in self.strided or not v.is_param:
+            return None
+        kept = _kept_axes(v.type.shape, self.shape)
+        if kept is None:  # pragma: no cover - a broadcast operand broadcasts
+            return None
+        r = len(self.shape)
+        has = [k for k in range(r) if kept[k] and not _is_one(self.shape[k])]
+        lead = [k for k in range(r - 1) if not _is_one(self.shape[k])]
+        if has == [r - 1]:
+            return "col"
+        if lead and has == lead:
+            return "row"
+        return None
+
     def load(self, p: str, v: Value) -> str:
         if v.name in self.tiles:
             return self.tiles[v.name]
+        # a per-column or a per-row operand: its vector, broadcast along the tile (the elements a lane would read at its offset, the same bits)
+        axis = self.per_axis(v)
+        if axis == "col":
+            return f"tl.load({p} + cols, mask=col_mask, other=0)[None, :]"
+        if axis == "row":
+            return f"tl.load({p} + rows, mask=row_mask, other=0)[:, None]"
         return super().load(p, v)
 
     def store(self, p: str, v: Value, value: str) -> str:
@@ -3543,75 +3581,66 @@ class _HookBody(_Body):
         ])
         return name
 
-    def hpad_helper(self) -> str:
-        """``p`` (``[BM, N]``) followed by lanes of ``+0.0`` up to ``L`` (lanes with no column: data movement)."""
-        key = ("hpad",)
-        if key not in self.helpers:
-            name = self.names.fresh("_tf_hpad")
-            self.helpers[key] = (name, [
-                "@triton.jit",
-                f"def {name}(p, BM: tl.constexpr, N: tl.constexpr, L: tl.constexpr):",
-                "    # p followed by L - N lanes of +0.0, the chains of lanes with no column (data movement; N and L powers of two; note 22 of tilefish.lower)",
-                "    if N < L:",
-                "        p = tl.reshape(tl.permute(tl.join(p, tl.zeros((BM, N), tl.float32)), (0, 2, 1)), (BM, 2 * N))",
-                f"        p = {name}(p, BM, 2 * N, L)",
-                "    return p",
-            ])
-        return self.helpers[key][0]
-
     def hsum_helper(self, order: Any, fused: bool) -> str:
         """An ordered sum of every row of a tile that holds whole rows (note 22): lane ``j`` of a row adds the columns ``c * W + j * V + v``
         (``W = lanes * vector``) in the order ``(c, v)`` from ``+0.0``, a column at or past ``D`` adding ``-0.0`` (it leaves every value a chain
-        holds as it is, as revision 2's padding does), a lane with no column ``+0.0``; then the tree ``p[j] + p[j + o]`` for each offset in turn
-        (revision 1's, by splits): the terms and the order of the row template's ordered sum, so the same bits (note 17)."""
+        holds as it is, as revision 2's padding does); then the tree ``p[j] + p[j + o]`` for each offset in turn, and lane 0's value: the terms and
+        the order of the row template's ordered sum, so the same bits (note 17). A tile narrower than a round of the order (``BN < W``) has
+        ``n = BN / V`` lanes with columns, the others ``+0.0`` all along: only those ``n`` are computed, and a level of the tree whose offset is ``n``
+        or more adds ``+0.0`` (the partner a lane with no column), which is what it adds in the row template. The tree takes each partner by
+        ``tl.gather`` along the lanes (revision 2's); a partner past the end is never one lane 0 reads."""
         key = ("hsum", order.lanes, order.vector, order.offsets, fused)
         if key in self.helpers:
             return self.helpers[key][0]
         lanes, vector, width = order.lanes, order.vector, order.lanes * order.vector
         add = self.ptx_helper("add.rn")
         chain = self.hchain_helper(fused)
-        pad = self.hpad_helper()
+        lane0 = self.lane0_helper()
         stem = f"_tf_hsum{'_fma' if fused else ''}_l{lanes}_v{vector}" + ("_o" + "_".join(map(str, order.offsets)) if order.offsets else "")
         name = self.names.fresh(stem)
         neg0 = "tl.full((BM, BN), -2147483648, tl.int32).to(tl.float32, bitcast=True)"  # -0.0 by its bits (note 3)
         first = "a" if fused else "x"
 
-        def lanes_of(v: str) -> str:
+        def lanes_of(v: str) -> str:  # whole rounds: lane j's columns in its order along the last axis
             return f"tl.reshape(tl.permute(tl.reshape({v}, (BM, BN // {width}, {lanes}, {vector})), (0, 2, 1, 3)), (BM, {lanes}, BN // {lanes}))"
+
+        def part_of(v: str) -> str:  # one partial round: the lanes with columns, V each
+            return f"tl.reshape({v}, (BM, BN // {vector}, {vector}))"
 
         lines = [
             "@triton.jit",
             f"def {name}({'a, b' if fused else 'x'}, D: tl.constexpr):",
             f"    # an ordered sum (note 17 of tilefish.lower), {order}, of every row of a tile [BM, BN] that holds whole rows (BN >= D, note 22): lane j adds",
             f"    # the columns c * {width} + j * {vector} + v in the order (c, v), each step " + ("fma(a, b, acc)" if fused else "acc + x") + " rounded once, from +0.0; a column at or",
-            "    # past D adds " + ("fma(-0.0, 1.0, acc)" if fused else "-0.0") + ", which leaves every value a chain holds as it is, and a lane with no column is +0.0; then",
-            f"    # p[j] = p[j] + p[j + o] for o = {', '.join(map(str, order.offsets)) or '(none)'} (add.rn): the row template's terms, in its order",
+            "    # past D adds " + ("fma(-0.0, 1.0, acc)" if fused else "-0.0") + ", which leaves every value a chain holds as it is; a lane with no column is +0.0 all",
+            f"    # along; then p[j] = p[j] + p[j + o] for o = {', '.join(map(str, order.offsets)) or '(none)'} (add.rn), lane 0's value: the row template's terms, in its order",
             f"    BM: tl.constexpr = {first}.shape[0]",
             f"    BN: tl.constexpr = {first}.shape[1]",
+            f'    tl.static_assert(BN >= {vector}, "a tile narrower than the vector of its order")',
+            f"    N: tl.constexpr = {lanes} if BN >= {width} else BN // {vector}  # the lanes that have columns",
             "    cols = tl.arange(0, BN)",
         ]
         if fused:
             lines += [f"    a = tl.where(cols[None, :] < D, a, {neg0})", "    b = tl.where(cols[None, :] < D, b, 1.0)"]
+            whole, part = f"{lanes_of('a')}, {lanes_of('b')}", f"{part_of('a')}, {part_of('b')}"
         else:
             lines += [f"    x = tl.where(cols[None, :] < D, x, {neg0})"]
-        operands = f"{lanes_of('a')}, {lanes_of('b')}" if fused else lanes_of("x")
-        lines += [f"    if BN >= {width}:", f"        p = {chain}(tl.zeros((BM, {lanes}), tl.float32), {operands}, BM, {lanes}, BN // {lanes})", "    else:"]
-        lines.append(f'        tl.static_assert(BN >= {vector}, "a tile narrower than the vector of its order")')
-        part = (
-            f"tl.reshape(a, (BM, BN // {vector}, {vector})), tl.reshape(b, (BM, BN // {vector}, {vector}))" if fused else f"tl.reshape(x, (BM, BN // {vector}, {vector}))"
-        )
+            whole, part = lanes_of("x"), part_of("x")
         lines += [
-            f"        p = {chain}(tl.zeros((BM, BN // {vector}), tl.float32), {part}, BM, BN // {vector}, {vector})",
-            f"        p = {pad}(p, BM, BN // {vector}, {lanes})",
+            f"    if BN >= {width}:",
+            f"        p = {chain}(tl.zeros((BM, N), tl.float32), {whole}, BM, N, BN // {lanes})",
+            "    else:",
+            f"        p = {chain}(tl.zeros((BM, N), tl.float32), {part}, BM, N, {vector})",
+            "    lane = tl.arange(0, N)[None, :] + tl.zeros((BM, N), tl.int32)",
         ]
-        n, removed = lanes, []
-        for o in order.offsets:  # revision 1's tree: the live lanes compacted by splits
-            q = o >> sum(1 for r in removed if r < o)
-            lines.append(f"    a_, b_ = tl.split(tl.permute(tl.reshape(p, (BM, {n // (2 * q)}, 2, {q})), (0, 1, 3, 2)))  # o = {o}: lanes j and j + {o}")
-            lines.append(f"    p = tl.reshape({add}(a_, b_), (BM, {n // 2}))")
-            n //= 2
-            removed.append(o)
-        lines.append("    return p  # [BM, 1]")
+        for o in order.offsets:
+            lines += [
+                f"    if {o} < N:  # o = {o}: lanes j and j + {o}",
+                f"        p = {add}(p, tl.gather(p, tl.minimum(lane + {o}, N - 1), 1))",
+                "    else:  # the partner has no column: +0.0",
+                f"        p = {add}(p, tl.zeros((BM, N), tl.float32))",
+            ]
+        lines += [f"    s, _ = tl.reduce((p, lane), 1, {lane0})", "    return s[:, None]  # [BM, 1]"]
         self.helpers[key] = (name, lines)
         return name
 

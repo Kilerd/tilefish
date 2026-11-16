@@ -94,6 +94,22 @@ def test_every_pattern_fused_writes_the_bytes_of_its_reference_at_every_bucket(g
         assert r["verified"]["runs"] >= 2 and r["verified"]["against"] == ("U(R_acc(P))" if r["contract"] == "accumulator" else "U(P)")
 
 
+def test_a_gemm_whose_epilogue_runs_on_sub_tiles_fuses_the_elementwise_patterns(externs):
+    """Each hook called once per sub-tile of the columns (fewer registers live): the same bytes; a norm is refused (no hook sees a whole row)."""
+    sub = eg.examples_subtiled(CAP)
+    built = eg.build((sub, externs[1], externs[2]), prefix="sub")
+    for pattern in ("bias_gelu", "periodic", "add_norm_f32"):
+        modes = built[pattern]
+        f = _fusion.fused(modes["fused"])
+        if pattern == "add_norm_f32":
+            assert not f.hooked and f.refused[0]["reason"] == "epilogue-row"
+            continue
+        for mode, ref in (("fused", "unfused"), ("acc", "acc_unfused")):
+            for combo in tilefish._plan.bucket_combinations(tilefish.plan(modes[mode]).dims):
+                args = args_of(modes[mode], combo, 6)
+                assert_same(run(modes[mode], args), run(modes[ref], args), f"sub-tiles {pattern} {mode} at {combo}")
+
+
 def test_the_accumulator_mode_has_one_rounding_fewer_and_other_bytes(graphs):
     """Contract (ii) is not contract (i): R_acc removes the rounding of the GEMM's result, which changes about a third of a bias + activation's
     outputs (RFC 0003, X1); and it is at least as close to the f32 composition."""
@@ -199,9 +215,11 @@ def random_body(seed, gemm):
 
 
 def test_random_regions_after_a_gemm_fused_write_the_bytes_of_their_reference(externs):
-    gemm = externs[0]
+    """Half of them in the GEMM whose epilogue runs on two sub-tiles of the columns (each hook called twice per tile)."""
+    sub = eg.examples_subtiled(CAP)
     fused_any = 0
     for seed in range(40):
+        gemm = externs[0] if seed % 2 else sub
         out = {}
         for mode, fusion in eg.MODES.items():
             body, params = random_body(seed, gemm)

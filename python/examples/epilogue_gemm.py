@@ -48,9 +48,20 @@ B, L = Dim("B"), Dim("L")
 
 
 @triton.jit
+def _gemm_epilogue(acc, c, rows, cols, row_mask, n, ACC: tl.constexpr, ACC_ARGS, EPILOGUE: tl.constexpr, EPILOGUE_ARGS):
+    """The epilogue of one (sub-)tile: the accumulator hook, the rounding to ``c``'s type, the hook on the rounded tile, the store."""
+    col_mask = cols < n
+    tile = ACC(acc, rows, cols, row_mask, col_mask, ACC_ARGS)  # the accumulator hook (value="acc")
+    tile = EPILOGUE(tile.to(c.dtype.element_ty), rows, cols, row_mask, col_mask, EPILOGUE_ARGS)  # the rounded tile (value="out")
+    tl.store(c + rows[:, None] * n + cols[None, :], tile, mask=row_mask[:, None] & col_mask[None, :])
+
+
+@triton.jit
 def gemm_kernel(a, b, c, m, n, k, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, SPLIT: tl.constexpr, GROUP_M: tl.constexpr,
-                ACC: tl.constexpr, ACC_ARGS, EPILOGUE: tl.constexpr, EPILOGUE_ARGS):  # fmt: skip
-    """``c = a @ b.T``: ``a`` and ``b`` TMA descriptors of ``[BM, BK]`` and ``[BN, BK]`` blocks, ``c`` ``[m, n // SPLIT * len(tiles)]``."""
+                EPI_SPLIT: tl.constexpr, ACC: tl.constexpr, ACC_ARGS, EPILOGUE: tl.constexpr, EPILOGUE_ARGS):  # fmt: skip
+    """``c = a @ b.T``: ``a`` and ``b`` TMA descriptors of ``[BM, BK]`` and ``[BN, BK]`` blocks, ``c`` ``[m, n // SPLIT * len(tiles)]``. With
+    ``SPLIT = 1`` the epilogue runs on ``EPI_SPLIT`` sub-tiles of ``BN // EPI_SPLIT`` columns (1, 2 or 4), the hooks called once per sub-tile: fewer
+    registers live at once for what the hooks compute."""
     chunk = n // SPLIT  # the columns of one tile's chunk (all of them for SPLIT = 1)
     pid = tl.program_id(0)
     num_m = tl.cdiv(m, BM)
@@ -75,9 +86,23 @@ def gemm_kernel(a, b, c, m, n, k, BM: tl.constexpr, BN: tl.constexpr, BK: tl.con
     col_mask = cols < chunk
     mask = row_mask[:, None] & col_mask[None, :]
     if SPLIT == 1:
-        tile = ACC(acc0, rows, cols, row_mask, col_mask, ACC_ARGS)  # the accumulator hook (value="acc")
-        tile = EPILOGUE(tile.to(c.dtype.element_ty), rows, cols, row_mask, col_mask, EPILOGUE_ARGS)  # the rounded tile (value="out")
-        tl.store(c + rows[:, None] * n + cols[None, :], tile, mask=mask)
+        if EPI_SPLIT == 1:
+            _gemm_epilogue(acc0, c, rows, cols, row_mask, n, ACC, ACC_ARGS, EPILOGUE, EPILOGUE_ARGS)
+        elif EPI_SPLIT == 2:
+            h0, h1 = acc0.reshape(BM, 2, BN // 2).permute(0, 2, 1).split()
+            half = off_n + tl.arange(0, BN // 2)
+            _gemm_epilogue(h0, c, rows, half, row_mask, n, ACC, ACC_ARGS, EPILOGUE, EPILOGUE_ARGS)
+            _gemm_epilogue(h1, c, rows, half + BN // 2, row_mask, n, ACC, ACC_ARGS, EPILOGUE, EPILOGUE_ARGS)
+        else:
+            tl.static_assert(EPI_SPLIT == 4, "EPI_SPLIT is 1, 2 or 4")
+            h0, h1 = acc0.reshape(BM, 2, BN // 2).permute(0, 2, 1).split()
+            q0, q1 = h0.reshape(BM, 2, BN // 4).permute(0, 2, 1).split()
+            q2, q3 = h1.reshape(BM, 2, BN // 4).permute(0, 2, 1).split()
+            quarter = off_n + tl.arange(0, BN // 4)
+            _gemm_epilogue(q0, c, rows, quarter, row_mask, n, ACC, ACC_ARGS, EPILOGUE, EPILOGUE_ARGS)
+            _gemm_epilogue(q1, c, rows, quarter + BN // 4, row_mask, n, ACC, ACC_ARGS, EPILOGUE, EPILOGUE_ARGS)
+            _gemm_epilogue(q2, c, rows, quarter + BN // 2, row_mask, n, ACC, ACC_ARGS, EPILOGUE, EPILOGUE_ARGS)
+            _gemm_epilogue(q3, c, rows, quarter + 3 * (BN // 4), row_mask, n, ACC, ACC_ARGS, EPILOGUE, EPILOGUE_ARGS)
     else:
         tiles = ACC((acc0, acc1), rows, cols, row_mask, col_mask, ACC_ARGS)
         if len(tiles) == 2:
@@ -125,11 +150,15 @@ def gemm(
     num_warps: int = 4,
     num_stages: int = 3,
     group_m: int = 8,
+    epilogue_subtiles: int = 1,
     sass=None,
 ):
     """The extern of :func:`gemm_kernel`: ``c = a @ b.T``, ``a: [M, K]``, ``b: [N, K]`` of ``dtype``, ``c: [M, N]`` of ``out_dtype`` (``dtype`` by
-    default), its hooks ``ACC`` and ``EPILOGUE`` on ``c`` (``split`` tiles at once), the tile ``BM x BN`` (``BN`` the hooks' ``block_n``: a norm over
-    rows of at most ``BN`` columns fuses into it), ``BK`` columns of ``K`` a step. ``M`` is a runtime size; ``N`` and ``K`` multiples of 16."""
+    default), its hooks ``ACC`` and ``EPILOGUE`` on ``c`` (``split`` tiles at once), the tile ``BM x BN``, ``BK`` columns of ``K`` a step, the epilogue
+    on ``epilogue_subtiles`` sub-tiles of the columns (1, 2 or 4; ``split=1``). With one, ``BN`` is the hooks' ``block_n``: a norm over rows of at
+    most ``BN`` columns fuses into it. ``M`` is a runtime size; ``N`` and ``K`` multiples of 16."""
+    if epilogue_subtiles not in (1, 2, 4) or (split != 1 and epilogue_subtiles != 1):
+        raise ValueError(f"epilogue_subtiles is 1, 2 or 4 (1 for a split GEMM), got {epilogue_subtiles}")
     odt = dtype if out_dtype is None else out_dtype
     stub = _stub(
         [
@@ -144,12 +173,14 @@ def gemm(
             ("BK", const, BK),
             ("SPLIT", const, split),
             ("GROUP_M", const, group_m),
+            ("EPI_SPLIT", const, epilogue_subtiles),
         ],
         name,
     )
+    block_n = "BN" if epilogue_subtiles == 1 else None  # (a hook that sees sub-tiles holds no whole row)
     hooks = (
-        tilefish.hook("ACC", value="acc", out="c", split=split, block_n="BN", reference=_acc_gemm),
-        tilefish.hook("EPILOGUE", value="out", out="c", split=split, block_n="BN"),
+        tilefish.hook("ACC", value="acc", out="c", split=split, block_n=block_n, reference=_acc_gemm),
+        tilefish.hook("EPILOGUE", value="out", out="c", split=split, block_n=block_n),
     )
     return tilefish.extern(
         triton=gemm_kernel,
@@ -164,16 +195,22 @@ def gemm(
 
 
 def gemm_sm100(**kw):
-    """:func:`gemm` for sm_100 and sm_103: ``tcgen05.mma`` (asserted in the PTX of every binary), tiles of 128 x 128, three stages."""
+    """:func:`gemm` for sm_100 and sm_103: ``tcgen05.mma`` (asserted in the PTX of every binary), tiles of 128 x 128, three stages, 8 warps, the
+    epilogue on two sub-tiles of 64 columns (measured on a B300 slice: the registers a hook's arithmetic needs; with 4 warps or a whole tile an
+    activation with ``sin`` spills). For a norm in the hook, ``epilogue_subtiles=1`` (a hook that sees whole rows) and a tile as wide as the row."""
+    kw.setdefault("num_warps", 8)
+    if kw.get("split", 1) == 1:
+        kw.setdefault("epilogue_subtiles", 2)
     kw.setdefault("sass", tilefish.sass(mma="tcgen05.mma kind::f16", no_tf32=True))
     return gemm(**kw)
 
 
 def gemm_sm120(**kw):
     """:func:`gemm` for sm_120: ``mma.sync`` (``HMMA.16816``, asserted in the SASS of every binary), tiles of 128 x 64, two stages (sm_120 has 100 KB
-    of shared memory a block)."""
+    of shared memory a block), 8 warps."""
     kw.setdefault("BN", 64)
     kw.setdefault("num_stages", 2)
+    kw.setdefault("num_warps", 8)
     kw.setdefault("sass", tilefish.sass(mma="mma.sync m16n8k16", no_tf32=True))
     return gemm(**kw)
 

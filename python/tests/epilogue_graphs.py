@@ -37,7 +37,18 @@ def examples(arch: int):
         sys.path.insert(0, str(EXAMPLES))
     import epilogue_gemm as eg
 
-    return eg.gemm_for(arch, name="epi_gemm"), eg.gemm_for(arch, name="epi_gemm_dual", split=2), eg.conv1d(CI, CO, KW, name="epi_conv")
+    # the GEMM's tiles are 128 columns wide on every architecture and its hooks see whole tiles (the norm's D: a tile holds a whole row)
+    wide = {"BN": 128, "epilogue_subtiles": 1}
+    return eg.gemm_for(arch, name="epi_gemm", **wide), eg.gemm_for(arch, name="epi_gemm_dual", split=2), eg.conv1d(CI, CO, KW, name="epi_conv")
+
+
+def examples_subtiled(arch: int):
+    """The example GEMM whose epilogue runs on two sub-tiles of the columns (its hooks called twice per tile), for the patterns that are elementwise."""
+    if str(EXAMPLES) not in sys.path:
+        sys.path.insert(0, str(EXAMPLES))
+    import epilogue_gemm as eg
+
+    return eg.gemm_for(arch, name="epi_gemm_sub", BN=128, epilogue_subtiles=2)
 
 
 def _stub(params, name):
@@ -64,7 +75,8 @@ def standin_gemm(name="epi_gemm", split=1, BN=128):
     """A stand-in with the stub and the hooks of the example GEMM (``epilogue_gemm.gemm``), its kernel named by a string (never imported here)."""
     stub = _stub(
         [("a", TensorDesc(Tensor[M, K, bf16], block=(128, 64)), _E), ("b", TensorDesc(Tensor[N, K, bf16], block=(BN, 64)), _E), ("c", Out[Tensor[M, N, bf16]], _E),
-         ("m", M, _E), ("n", N, _E), ("k", K, _E), ("BM", const, 128), ("BN", const, BN), ("BK", const, 64), ("SPLIT", const, split), ("GROUP_M", const, 8)],
+         ("m", M, _E), ("n", N, _E), ("k", K, _E), ("BM", const, 128), ("BN", const, BN), ("BK", const, 64), ("SPLIT", const, split), ("GROUP_M", const, 8),
+         ("EPI_SPLIT", const, 1)],
         name,
     )  # fmt: skip
     return tilefish.extern(triton="epilogue_gemm:gemm_kernel", name=name, grid=lambda M, N, BM, BN, SPLIT: (tilefish.cdiv(M, BM) * tilefish.cdiv(N, SPLIT * BN),),

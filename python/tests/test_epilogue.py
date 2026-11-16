@@ -152,7 +152,7 @@ def test_a_region_after_a_hooked_extern_is_one_step_with_it():
     assert node.callee is h.op and node.attrs["kind"] == "extern" and len(f.graph.nodes) == 1
     # the fused op: the extern's parameters, the hook's arguments after them, the result written into the extern's output
     sig = h.op.signature
-    assert [p.name for p in sig.params] == ["a", "b", "c", "m", "n", "k", "BM", "BN", "BK", "SPLIT", "GROUP_M", "ep_a1"]
+    assert [p.name for p in sig.params] == ["a", "b", "c", "m", "n", "k", "BM", "BN", "BK", "SPLIT", "GROUP_M", "EPI_SPLIT", "ep_a1"]
     assert sig.params[-1].keyword_only and str(sig.params[-1].type) == "Tensor[256, bf16]"
     source = h.op.__dict__["_tf_generated"].source
     assert "EPILOGUE=_tf_epilogue," in source and "EPILOGUE_ARGS=(ep_a1,)," in source and "ACC=_tf_identity," in source
