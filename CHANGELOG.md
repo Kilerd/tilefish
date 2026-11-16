@@ -42,6 +42,32 @@ entry of the new impl. Nothing changes bytes without a declaration: a graph plan
 - **The advisor** reports a region that the mode would make a cuBLASLt epilogue as the blocker `epilogue-library-cublaslt`, of the new phase `E2` (a
   mode to declare), with the epilogue and the contract; one that is not is `epilogue-library` with the reason (such as the order of the adds).
 
+### The Rust crate (`tilefish`) and the C ABI (`tilefish-capi`)
+
+- **`cublaslt.matmul` is read and run by the crate**: `LibraryEntry` gains `epilogue` (`GemmEpilogue::None`, `Bias`, `Relu`, `ReluBias`; `formula`,
+  `cublaslt_value`), `beta` (`has_bias()`, `has_c()`), `contract` (`MatmulContract`), `verification` (`MatmulVerification`, `MatmulAccumulator`) and
+  `canary` (`MatmulCanary`), each held to the rules of section 10 with Python's words; `LibraryImpl::Matmul`. Python's verdict on 576 vectors of the new
+  impl (each form, and each changed in one field) is the crate's (`tests/python_library.rs`). The entries of `cublaslt.gemm` and `cublaslt.gemm_bias` are
+  read as before (`GemmEpilogue::None` / `Bias`, `beta` 0), and the fields of a matmul on them are refused by name.
+- **`Manifest::gemm` loads a matmul with its epilogue**: every check (`cublasLtMatmulAlgoCheck`) and run sets the epilogue on the matmul descriptor (`BIAS_DATA_TYPE`
+  and `BIAS_POINTER` for the ones with a bias), and `beta = 1.0` with the call's `c` as `C` (the layout of `D`) when the entry has `c`. The vetting refuses
+  a split-K of every epilogue but `none` without the opt-in, in the words of Python's `reduction_problem`. A call is `a`, `b`, [`bias`], [`c`], `out`, workspace
+  (`Gemm::launch`, `launch_raw`, `check`, a launch plan's library step); `Gemm::epilogue`, `beta`, `has_c`, `contract`, `canary` and `implementation` say
+  what was loaded.
+- **The canary at load**, on by default: an entry with a `canary` runs it once per context before the pin is used, exactly as Python computes it (the PTX of
+  `canary.ptx`, `a` tag 0, `b` 1, `bias` 2, `c` 3, a zeroed `out` and workspace, on a non-blocking stream of its own, never the NULL stream), and another
+  digest is refused ("the canary of the cuBLASLt matmul '<stem>' (<arch>, algorithm id ..., epilogue ...) gives out with digest ... here, and the manifest
+  recorded ..."); `Gemm::check_canary` runs it again. The canary's kernels are one module per context, shared with the cuDNN convolutions (`src/canary.rs`;
+  `canary_bytes` and `canary_digest` are re-exported from there, unchanged).
+- **C ABI 1.1** (additive): `tilefish_gemm_epilogue(gemm, int32_t* epilogue, bool* has_c)` with `TILEFISH_EPILOGUE_NONE`, `_BIAS`, `_RELU`, `_RELU_BIAS`
+  (0 to 3, tilefish's values); `tilefish_gemm_launch` takes `c` before `out`; `tilefish::Gemm::epilogue()`, `has_c()` and `has_bias()` in `tilefish.hpp`.
+- **The emitters** (`tilefish.hosts.rust`, `tilefish.hosts.cpp`) write typed launchers of a matmul entry (`a`, `b`, [`bias`], [`c`], `out`, `workspace`; `EPILOGUE`
+  and `BETA`; docs of the formula with the launch's names, the epilogue, each architecture's contract and canary). The launchers of `gemm` and `gemm_bias`
+  are byte for byte what they were.
+- The Rust and C++ gates run 30 cases of ten matmul forms (every epilogue with `beta` 0 and 1, bf16 and f16, the four layouts, an opt-in, an SM count
+  target, three buckets of `M`, a canary and none) and the plan `epilogue_chain` byte for byte against Python's replay, capture each in a CUDA graph, run
+  every canary again with the NULL stream held, and refuse a forged canary (under a recomputed manifest pin in Rust, trusting the directory in C++).
+
 ### Smaller changes
 
 - `tilefish._cublaslt`: `pin_algo`, `check_algo`, `describe` and `matmul` take `epilogue=` (and `beta=`, `c_ptr=`); `reduction_problem` takes the
