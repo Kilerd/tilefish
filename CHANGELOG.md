@@ -5,6 +5,46 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+Manifest schema 3, plan schema 1 and both hosts are unchanged, and so is every digest of an export whose graphs have no arithmetic in their bodies:
+it writes the same manifest, plans and plan sets as 0.0.10. A graph whose body has arithmetic is now planned by fusion version 2 (the new default,
+below), so its fused regions, plan and pin are new; declared with `tilefish.fusion(version=1)` it plans as 0.0.10 and 0.0.9 planned it, byte for byte, and a
+plan of either loaded by the graph as it is (declaring nothing) is refused with a message that names version 1.
+
+### Fusion phase 2: row regions (`docs/rfcs/0001-plan-fusion.md`, "Phase 2")
+
+- **`tilefish.fusion(version=2)`, the default.** An ordered `sum` or `mean` (`order=`), the order-free `max`, `argmax`, `argmin` and `gather_rows`
+  join the ops around them in **row regions**: a residual add and an rmsnorm with the residual sum as a second output, a layer norm with an
+  elementwise tail, softmax (a scale, a mask from a device scalar, `max`, `exp`, an ordered sum, a divide), a row-wise fp8 quantisation with its scale
+  per row, a norm over two column blocks of one tensor, a gather and an argmax: one kernel each. Under the same exact contract as version 1: the
+  fused plan writes the bytes of its unfused composition (`grouping="none"`), `export` verifies it at every bucket, and the version is frozen into
+  every region's name and source. A `sum` or `mean` without `order=` still runs alone (D2). Version 1 is kept and plans as before (its regions,
+  sources, names and plan digests checked against 0.0.10's, which are 0.0.9's).
+- **Faster ordered sums: revision 2 of the lowering** (note 21 of `tilefish.lower`; `lower(..., lowering=2)`), which the regions of version 2
+  are lowered with. Revision 1 took each step of a lane's chain with a `tl.gather` of the row, through shared memory: an rmsnorm of 4096 rows of
+  1024 columns took 85 us on a B300 slice, its three unfused kernels with a Triton tree sum 61. Revision 2 makes the columns past the row's end
+  `-0.0` (which `add.rn` leaves every value of a chain as it is), reshapes the row to `[lanes, steps]` and takes the chains by halving splits (data
+  movement), the tree over the lanes through `tl.gather`: the same adds in the same order, checked against the CUDA kernels of each order at every
+  length and at every warp count, and 1.6 to 37 times faster than revision 1. A row of ordered sums gets the warps that suit it (one warp up to
+  `BLOCK_D = 2048`, then one per 1024 columns), and a fused row region reads views of rank 1 and 2 where they are (no `tilefish.contiguous` copy).
+  An fp8 cast of a region is inline `cvt.rn.satfinite`, `.to()`'s bits on every input. Hand-written kernels keep revision 1 and their sources.
+- **`tilefish.mean(x, axis, order=...)`**: the ordered sum times `1 / D` correctly rounded to f32, one rounding (`mul.rn`); the `reference`
+  mode computes the same.
+- **An ordered sum with `fma=True` in a graph body plans** (it raised a `KeyError` in 0.0.10): its product's multiply is part of the sum (each step
+  `fma(a, b, acc)`), so the two are one region in every grouping, the unfused composition's too.
+- **The advisor and `boundaries()`** follow the graph's fusion version (the fusion report's `fusion.version`): in version 2 an ordered reduction, a
+  `max`, an `argmax` or a gather is no longer reported, a row region no longer blocks its neighbours, and a fused row region reading a view is no
+  longer `materialised`; a graph of version 1 is told to use version 2 (the reasons `reduction`, `gather`, `materialised`).
+- **Speed** on a B300 MIG slice, rows 32 to 4096 and 512 to 4096 columns (the RFC's phase 2 table): the fused row region is the fastest in
+  every cell, 2.6 to 8 times faster than the same body with Triton's tree reductions run as three to five kernels (D2); an add + rmsnorm of 4096
+  rows of 1024 columns takes 16 us (tree composition 65, version 1 121, one kernel per op 103).
+- **`@tilefish.kernel(lowering=2)`** asks for revision 2 for a hand-written kernel (the same bytes, but a `-0.0` scalar's sign; other binaries
+  and pins).
+- **A literal `-0.0` is `+0.0` in Triton 3.5.1** (found here; note 21): revision 2 writes a `-0.0` scalar by its bits, so a region of version 2
+  computes `where(x > 0, x, -0.0)` as written; revision 1 (every hand-written kernel by default, and version 1's regions) still gives `+0.0`
+  there, its fused and unfused plans alike.
+
 ## tilefish 0.0.10, crate 0.0.8, tilefish-capi 0.0.1 (2026-11-16)
 
 Manifest schema 3, plan schema 1, both hosts and every digest are unchanged: an export writes the same manifest, plans, plan sets and fusion
