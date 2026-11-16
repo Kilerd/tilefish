@@ -2739,7 +2739,9 @@ def write_plan_set(
     _plan.validate_set(index)
     write_file(directory / _plan.PLAN_SET_NAME, (json.dumps(index, indent=2) + "\n").encode("utf-8"))
     doc = _plan.read_plan_set(directory, pin=index["set_digest"])
-    back = {p.name: _plan.load_plan(directory, p.graph, pin=index["set_digest"], instrumented=True) for p in plans}
+    # every plan read back against the manifest loaded above: one copy of it and its binaries for the whole set, not one per plan (a set of a thousand
+    # plans held a thousand copies of every cubin until the export returned)
+    back = {p.name: _plan.load_plan(directory, p.graph, pin=index["set_digest"], instrumented=True, manifest=loaded) for p in plans}
     return _plan.PlanSet(doc, directory, back)
 
 

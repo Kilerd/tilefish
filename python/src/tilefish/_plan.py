@@ -1852,7 +1852,13 @@ def check_anchor(pin: "str | None", trust_directory: bool) -> None:
 
 
 def load_plan(
-    path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" = None, trust_directory: bool = False, instrumented: bool = False
+    path: "str | pathlib.Path",
+    graph: GraphOp,
+    *,
+    pin: "str | None" = None,
+    trust_directory: bool = False,
+    instrumented: bool = False,
+    manifest: Any = None,
 ) -> Plan:
     """Load the plan of ``graph`` from an exported directory (or its ``plan.json``) for a replay, and refuse everything that is not it.
 
@@ -1863,6 +1869,10 @@ def load_plan(
     and the document must be exactly the plan this process derives from ``graph`` for the same buckets (:meth:`Plan.stale_reason`): a graph that
     changed since the export is refused, as a kernel that changed is. Raises :class:`~tilefish.errors.TilefishManifestError` (a
     :class:`~tilefish.errors.TilefishRuntimeError`). The plan of an instrumented export (``docs/instrument.md``) is refused unless ``instrumented=True``.
+
+    ``manifest`` is the manifest of the directory as the caller already loaded and verified it (``Manifest.load``, every cubin checked): the plans of a
+    set share it instead of each loading every binary again (an export of a set of many plans reads the set back plan by plan). It is held to the same
+    checks: its directory must be the plan's, and its digest the one the plan names.
     """
     from ._manifest import Manifest
 
@@ -1889,7 +1899,16 @@ def load_plan(
         raise TilefishManifestError(f"the plan in {str(directory)!r} is the plan of graph '{doc['graph']}', not of '{graph.graph.name}'")
     if set_pin is not None and doc["manifest_digest"] != index["manifest_digest"]:
         raise TilefishManifestError(f"the plan of graph '{graph.graph.name}' was built against the manifest {doc['manifest_digest']}, not the one of its plan set")
-    manifest = Manifest.load(directory, instrumented=instrumented)
+    if manifest is None:
+        manifest = Manifest.load(directory, instrumented=instrumented)
+    elif pathlib.Path(manifest.directory).resolve() != directory.resolve():
+        raise TilefishManifestError(
+            f"the manifest given for the plan in {str(directory)!r} is the one in {str(manifest.directory)!r}: a plan is checked against the manifest next to it"
+        )
+    elif manifest.instrumented and not instrumented:
+        raise TilefishManifestError(
+            f"the manifest in {str(directory)!r} is an instrumented export (docs/instrument.md): its plans are loaded with instrumented=True"
+        )
     check_against_manifest(doc, manifest)
     try:
         derived = plan(graph, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"])

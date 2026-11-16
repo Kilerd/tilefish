@@ -37,6 +37,32 @@ def test_the_plans_of_a_set_share_one_manifest_with_one_entry_per_binary(exporte
     assert index["schema"] == "tilefish.plan-set.v1" and index["arch"] == "sm_103"
 
 
+def test_a_set_is_read_back_against_the_one_manifest_it_wrote(tmp_path, monkeypatch):
+    """An export of a set reads every plan back against the manifest it loaded once: the plans share one ``Manifest`` (a set of a thousand plans held
+    a thousand copies of every binary while it was read back), and ``load_plan(manifest=...)`` refuses a manifest that is not the plan's directory's."""
+    from tilefish._manifest import Manifest
+
+    loads = []
+    load = Manifest.load.__func__
+
+    def counting(cls, path, **kw):
+        loads.append(path)
+        return load(cls, path, **kw)
+
+    monkeypatch.setattr(Manifest, "load", classmethod(counting))
+    s = plan_fakes.export_set([tilefish.plan(g) for g in GRAPHS], tmp_path / "set")
+    assert len(loads) == 1  # (one more per plan before)
+    assert len({id(p.manifest) for p in s.plans.values()}) == 1 and all(p.set_digest == s.digest for p in s.plans.values())
+    monkeypatch.undo()
+    own = Manifest.load(tmp_path / "set")
+    for g in GRAPHS:
+        given = _plan.load_plan(tmp_path / "set", g, pin=s.digest, manifest=own)
+        assert given.manifest is own and given.digest == _plan.load_plan(tmp_path / "set", g, pin=s.digest).digest
+    plan_fakes.export_set([tilefish.plan(g) for g in GRAPHS], tmp_path / "copy")  # the same set elsewhere: the same digests, another directory
+    with pytest.raises(TilefishManifestError, match="is checked against the manifest next to it"):
+        _plan.load_plan(tmp_path / "set", GRAPHS[0], pin=s.digest, manifest=Manifest.load(tmp_path / "copy"))
+
+
 def test_a_plan_of_the_set_loads_with_its_own_pin_or_the_sets(exported):
     directory, s = exported
     for g in GRAPHS:
