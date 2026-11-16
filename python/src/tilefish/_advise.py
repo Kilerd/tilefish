@@ -83,6 +83,7 @@ _ITEMSIZE = {"bf16": 2, "f16": 2, "f32": 4, "i32": 4, "i64": 8, "u8": 1, "e4m3":
 _GENERATED_COPY = re.compile(r"^(contiguous|im2col1d|im2col|col2im1d)_")
 _MMA = re.compile(r"\b(HMMA|IMMA|QMMA|OMMA|DMMA|HGMMA|IGMMA|QGMMA|UTCHMMA|UTCQMMA|UTCIMMA|UTCOMMA)\b")
 _PHASES = ("1", "2", "4", "future")
+STREAMING = 0.25  # a measured step moving its bytes (above the launch floor) at this share of the bandwidth or more is taken to be bound by them
 CLASSES = ("library", "fused", "elementwise", "row", "copy", "opaque")
 
 # blocker -> (what to do, the phase of docs/rfcs/0001-plan-fusion.md that does it). The reasons of the fusion pass (tilefish._fusion.boundaries) are
@@ -94,8 +95,12 @@ BLOCKERS: "dict[str, tuple[str, str]]" = {
         "phase 1 (or 2) fuses it; a GEMM, an attention or a convolution, an epilogue hook of it (phase 4)",
         "1",
     ),
-    "opaque-mma-epilogue": ("the extern computes MMAs (a GEMM, an attention, a convolution): an epilogue hook of it (RFC 0001, section 7 route (c)), phase 4", "4"),
-    "opaque-mma-prologue": ("the extern computes MMAs: a prologue hook of it, future work (RFC 0001, section 11.3)", "future"),
+    "opaque-compute-epilogue": (
+        "the extern is bound by its arithmetic (MMAs in its SASS, or measured far below the bandwidth: a GEMM, an attention, a convolution, a search): "
+        "an epilogue hook of it (RFC 0001, section 7 route (c)), phase 4",
+        "4",
+    ),
+    "opaque-compute-prologue": ("the extern is bound by its arithmetic: a prologue hook of it, future work (RFC 0001, section 11.3)", "future"),
     "dsl-kernel": ("write the @tilefish.kernel's body in the graph body so phase 1 fuses it (exact as it is when it declares fp_fusion=False; RFC 0001, 8.2)", "1"),
     "dsl-kernel-contracts": (
         "write the @tilefish.kernel's body in the graph body so phase 1 fuses it; it contracts (fp_fusion is not False): write tilefish.fma where it "
@@ -106,6 +111,12 @@ BLOCKERS: "dict[str, tuple[str, str]]" = {
     "generated-movement": ("a generated data-movement op (im2col, col2im) around a convolution: a convolution prologue or epilogue, future work", "future"),
     "unknown-boundary": ("two regions of the graph body: export with trace=True (or pass the graph) to say why (a barrier, a view, a limit, another iteration space)", "1"),
     "copy-step": ("a copy step: return or store the value where it is made (the step that makes it can write the destination)", "1"),
+    "library-in-the-middle": (
+        "a library op sits between them (the consumer also reads what it computes from the producer's value): one kernel of both would need the GEMM "
+        "or convolution inside it, future work (RFC 0001, section 7)",
+        "future",
+    ),
+    "step-in-the-middle": ("another step sits between them (a path from the producer to the consumer through it): one kernel would need it inside too", "1"),
 }
 
 
@@ -199,12 +210,13 @@ class StepInfo:
     contracts: bool = False  # a @tilefish.kernel that lets the compiler contract (fp_fusion not False)
     mma: "bool | None" = None  # an opaque kernel: whether its SASS has MMAs (None: unknown, no trace)
     region: "int | None" = None  # a fused region: its index in the fusion report
+    arith_bound: bool = False  # measured: it moves its bytes (above the launch floor) at less than STREAMING of the bandwidth
 
     def blocker(self, role: str) -> "str | None":
         """The blocker this step is for a fusion with a neighbour (``role``: ``"producer"`` or ``"consumer"`` of the intermediate)."""
         if self.cls == "opaque":
-            if self.mma:
-                return "opaque-mma-epilogue" if role == "producer" else "opaque-mma-prologue"
+            if self.mma or self.arith_bound:
+                return "opaque-compute-epilogue" if role == "producer" else "opaque-compute-prologue"
             return "opaque-extern" if self.mma is False else "opaque-unknown"
         if self.cls == "elementwise":
             return "dsl-kernel-contracts" if self.contracts else "dsl-kernel"
@@ -251,7 +263,7 @@ class _Export:
     """The parts of an export the advisor reads, indexed: the manifest's entries, the fusion report, the trace of the graph."""
 
     def __init__(self, manifest: "Mapping[str, Any]", arch: "str | None", report: "Mapping[str, Any] | None", gdoc: "Mapping[str, Any] | None",
-                 boundaries: "Sequence[Mapping[str, Any]] | None", trace_root: "pathlib.Path | None" = None, trace_index: "Mapping[str, Any] | None" = None) -> None:
+                 boundaries: "Sequence[Mapping[str, Any]] | None", trace: Any = None) -> None:
         self.kernels: "dict[str, dict[str, Any]]" = {}
         self.library: "dict[str, dict[str, Any]]" = {}
         for e in manifest.get("kernels") or []:
@@ -264,8 +276,7 @@ class _Export:
         self.report = report
         self.gdoc = gdoc
         self.boundaries = list(boundaries) if boundaries is not None else (list(gdoc.get("boundaries") or []) if gdoc and "boundaries" in gdoc else None)
-        self.trace_root = trace_root
-        self.trace_index = trace_index
+        self.trace = trace  # the export's trace (tilefish.explain.Trace), or None
         self.regions: "dict[str, dict[str, Any]]" = {}  # region kernel name -> {"index", "template", "ops", "body"}
         for i, r in enumerate((report or {}).get("regions") or []):
             self.regions[r.get("op")] = {"index": i, "template": r.get("template"), "nodes": r.get("nodes") or [], "roundings": r.get("roundings") or [],
@@ -284,18 +295,20 @@ class _Export:
         return self.regions.get(op) or self.regions.get(op.split("__ua", 1)[0])
 
     def mma(self, stem: str) -> "bool | None":
-        """Whether the SASS of a kernel (in the trace) has MMA instructions; ``None`` when the trace does not have it."""
+        """Whether the SASS of a kernel has MMA instructions, from the trace (its entry of this binary, checked as ``tilefish-explain`` checks it);
+        ``None`` when the trace has no SASS of it."""
         if stem in self._mma:
             return self._mma[stem]
         found: "bool | None" = None
-        if self.trace_root is not None and self.trace_index is not None and self.arch:
-            entry = (self.trace_index.get("kernels") or {}).get(f"{stem}.{self.arch}")
-            path = self.trace_root / f"{stem}.{self.arch}" / "sass.txt"
-            if isinstance(entry, dict) and path.is_file():
-                try:
+        entry = self.kernels.get(stem) or {}
+        if self.trace is not None and self.arch and entry.get("sha256"):
+            try:
+                t = self.trace.kernel(stem, self.arch, entry["sha256"])
+                path = self.trace.root / f"{stem}.{self.arch}" / "sass.txt"
+                if t is not None and "error" not in (t.get("sass") or {"error": ""}) and path.is_file():
                     found = bool(_MMA.search(path.read_text(encoding="utf-8", errors="replace")))
-                except OSError:
-                    found = None
+            except (TilefishError, OSError):
+                found = None
         self._mma[stem] = found
         return found
 
@@ -337,7 +350,8 @@ def _step_info(k: int, st: "Mapping[str, Any]", ex: _Export) -> StepInfo:
         nodes = (region or {}).get("nodes") or (region or {}).get("body") or []
         ops = [n.get("op") for n in nodes]
         sub = "reduction" if len(ops) == 1 and ops[0] in ("sum", "mean", "max", "argmax", "argmin") else template
-        body = ", ".join(f"#{n.get('index', n.get('node'))} {n.get('op')}" + (f" ({n['loc']})" if n.get("loc") else "") for n in nodes)
+        shown = (region or {}).get("body") or nodes  # the trace's: with the line of each op
+        body = ", ".join(f"#{n.get('index', n.get('node'))} {n.get('op')}" + (f" ({n['loc']})" if n.get("loc") else "") for n in shown)
         where = f"region {region['index']}" if region and region.get("index") is not None else "region"
         info = StepInfo(k, kind, entry_name, op, "fused", sub, f"{op} [fused {where}, {sub}" + (f": {body}]" if body else "]"), args)
         info.region = (region or {}).get("index")
@@ -385,13 +399,17 @@ class _Cost:
         return sum(self.reads.values()) + sum(self.writes.values())
 
 
-def _cost(info: StepInfo, shapes: "Mapping[str, tuple[str, tuple[int, ...]]]", ex: _Export, machine: Machine, entry_name: "str | None") -> _Cost:
+def _cost(info: StepInfo, shapes: "Mapping[str, tuple[str, tuple[int, ...]]]", ex: _Export, machine: Machine, step: "Mapping[str, Any]") -> _Cost:
+    """A step at one bucket: ``step`` is the bucket's own (its entry and its views' numbers are the bucket's; the bindings are every bucket's)."""
     reads: "dict[str, int]" = {}
     writes: "dict[str, int]" = {}
-    for a in info.args:
+    entry_name = step.get("entry")
+    views = [x.get("view") for x in step.get("args") or []]
+    for i, a in enumerate(info.args):
         if a.binding not in shapes:
             continue
-        b = _elements(a, shapes) * _itemsize(a.binding, shapes)
+        here = _Arg(a.name, a.binding, a.access, views[i] if i < len(views) else a.view)
+        b = _elements(here, shapes) * _itemsize(a.binding, shapes)
         if a.access in ("in", "inout"):
             reads[a.binding] = reads.get(a.binding, 0) + b
         if a.access in ("out", "inout"):
@@ -442,6 +460,44 @@ def _values(infos: "Sequence[StepInfo]") -> "tuple[list[_Value], dict[str, int]]
                 current[a.binding] = v
                 out.append(v)
     return out, writes
+
+
+def _reachability(infos: "Sequence[StepInfo]") -> "tuple[list[int], list[int]]":
+    """For every step, the steps that depend on it (``reach``, a bit set) and those it depends on (``coreach``), through the data (a step reads a
+    version another wrote) and the order of the accesses to a buffer (a write after reads of the version before it, a write after a write)."""
+    n = len(infos)
+    succ: "list[set[int]]" = [set() for _ in range(n)]
+    writer: "dict[str, int]" = {}
+    readers: "dict[str, list[int]]" = {}
+    for info in infos:
+        k = info.index
+        for a in info.args:
+            if a.access in ("in", "inout"):
+                w = writer.get(a.binding)
+                if w is not None and w != k:
+                    succ[w].add(k)
+                readers.setdefault(a.binding, []).append(k)
+        for a in info.args:
+            if a.access in ("out", "inout"):
+                w = writer.get(a.binding)
+                if w is not None and w != k:
+                    succ[w].add(k)
+                for r in readers.get(a.binding, []):
+                    if r != k:
+                        succ[r].add(k)
+                writer[a.binding] = k
+                readers[a.binding] = []
+    reach = [0] * n
+    for k in range(n - 1, -1, -1):  # the steps are in an order that respects these edges (every edge goes forward)
+        m = 0
+        for s in succ[k]:
+            m |= (1 << s) | reach[s]
+        reach[k] = m
+    coreach = [0] * n
+    for k in range(n):
+        for s in succ[k]:
+            coreach[s] |= (1 << k) | coreach[k]
+    return reach, coreach
 
 
 @dataclass
@@ -596,8 +652,7 @@ def analyse(
     machine: "Machine | str | None" = None,
     bandwidth: "float | None" = None,
     keep: "Iterable[str]" = (),
-    trace_root: "pathlib.Path | None" = None,
-    trace_index: "Mapping[str, Any] | None" = None,
+    trace: Any = None,
 ) -> "Advice":
     """The advice for a plan document and its manifest (the documents themselves; :func:`advise` reads them from a directory)."""
     from ._plan import buffer_shapes
@@ -620,7 +675,7 @@ def analyse(
         sms = ((timing.get("device") or {}).get("sm_count")) or None
     if bandwidth or measured_bw or sms:
         m = m.scaled(bandwidth=bandwidth or measured_bw, sms=sms)
-    ex = _Export(manifest, arch, report, gdoc, boundaries, trace_root, trace_index)
+    ex = _Export(manifest, arch, report, gdoc, boundaries, trace)
     infos = [_step_info(k, st, ex) for k, st in enumerate(buckets[0]["steps"])]
     wanted = _parse_bucket(bucket)
     if timing is not None:
@@ -638,13 +693,30 @@ def analyse(
     costs: "dict[str, list[_Cost]]" = {}
     for b in analysed:
         shapes = buffer_shapes(doc, b.get("values") or {})
-        costs[_key(b)] = [_cost(info, shapes, ex, m, st.get("entry")) for info, st in zip(infos, b["steps"])]
+        costs[_key(b)] = [_cost(info, shapes, ex, m, st) for info, st in zip(infos, b["steps"])]
     rank_bucket = max(analysed, key=lambda b: sum(c.nbytes for c in costs[_key(b)]))
+    if rank_bucket is not buckets[0]:  # the labels and entries of the bucket it is ranked at (a bucketed GEMM has an entry per bucket)
+        infos = [_step_info(k, st, ex) for k, st in enumerate(rank_bucket["steps"])]
     measured = _timing_steps(timing, doc, rank_bucket["values"]) if timing is not None else None
+    if measured is not None:  # a hand-written kernel far slower than its bytes is bound by its arithmetic (an attention of FMAs, a search), not glue
+        floor = _launch_floor(infos, measured)
+        rc = costs[_key(rank_bucket)]
+        for info in infos:
+            if info.cls == "opaque" and info.index in measured:
+                busy = max(measured[info.index] - floor, 1e-3)
+                info.arith_bound = rc[info.index].nbytes / (busy * 1e-6) < STREAMING * m.bandwidth * 1e9
     edges, fanouts, kept = _classify_values(doc, infos, keep)
     for e in edges:
         _edge_blockers(e, infos, ex)
     return Advice(doc, infos, costs, analysed, rank_bucket, m, edges, fanouts, kept, measured, ex, timing)
+
+
+def _launch_floor(infos: "Sequence[StepInfo]", measured: "Mapping[int, float] | None") -> float:
+    """The launch floor (µs): the shortest measured kernel step, what a kernel costs whatever it moves (0 without a timing file)."""
+    if not measured:
+        return 0.0
+    ks = [t for k, t in measured.items() if infos[k].kind == "kernel" and t > 0]
+    return min(ks) if ks else 0.0
 
 
 def _key(b: "Mapping[str, Any]") -> str:
@@ -666,11 +738,7 @@ class Advice:
     # -- the model of the time a fusion saves ----------------------------------------------------------------------------------------------------
 
     def _floor(self) -> float:
-        """The launch floor (µs): the shortest measured kernel step, what a kernel costs whatever it moves (0 without a timing file)."""
-        if not self.measured:
-            return 0.0
-        ks = [t for k, t in self.measured.items() if self.infos[k].kind == "kernel" and t > 0]
-        return min(ks) if ks else 0.0
+        return _launch_floor(self.infos, self.measured)
 
     def _saved_us(self, steps: "Sequence[int]", saved: "Mapping[int, int]", bkey: str) -> "tuple[float, int]":
         """The time one kernel of ``steps`` would save at a bucket, and the launches it removes. ``saved``: the bytes each step would no longer move."""
@@ -687,15 +755,15 @@ class Advice:
             s = saved.get(k, 0)
             if not s or (info.cls == "library" and c.bound == "compute"):
                 continue
-            # a step whose time is its bytes' (elementwise, row, a copy, a memory-bound GEMM, a kernel without MMAs): its time above the floor shrinks
-            # with the bytes it no longer moves; any other (an attention, a kernel whose MMAs are not known) saves what the bytes take at the bandwidth
-            streaming = info.cls in ("elementwise", "row", "fused", "copy") or (info.cls == "opaque" and info.mma is False) or info.cls == "library"
-            if measured is None or not streaming:
+            # a step whose time is its bytes' (it may be: elementwise, row, a copy, a memory-bound GEMM, a kernel without MMAs; and it moves them, above
+            # the launch floor, at a quarter of the bandwidth or more): its time above the floor shrinks with the bytes it no longer moves. Any other (an
+            # attention of FMAs or MMAs, a kernel whose MMAs are not known, a slow kernel) saves what the bytes take at the bandwidth
+            may = info.cls in ("elementwise", "row", "fused", "copy", "library") or (info.cls == "opaque" and info.mma is False)
+            busy = max((measured or {}).get(k, 0.0) - self.floor, 1e-3)
+            achieved = min(bw, c.nbytes / (busy * 1e-6)) if c.nbytes else bw
+            if measured is None or not may or achieved < STREAMING * bw:
                 total += s / bw * 1e6
             else:
-                t = measured.get(k, 0.0)
-                busy = max(t - self.floor, 1e-3)
-                achieved = min(bw, c.nbytes / (busy * 1e-6)) if c.nbytes else bw
                 total += min(busy, s / achieved * 1e6)
         if measured is not None:
             total += max(removed, 0) * self.floor
@@ -705,34 +773,79 @@ class Advice:
 
     # -- candidates ----------------------------------------------------------------------------------------------------------------------------
 
+    def _middle(self, members: "set[int]") -> "set[int]":
+        """The steps outside ``members`` on a path from one of them to another: one kernel of ``members`` would need them inside it too (rule 2 of
+        RFC 0001, 3.5: no path may leave a region and come back)."""
+        down = 0
+        up = 0
+        for g in members:
+            down |= self.reach[g]
+            up |= self.coreach[g]
+        mask = down & up
+        return {k for k in range(len(self.infos)) if mask >> k & 1 and k not in members}
+
     def _candidates(self) -> "list[dict[str, Any]]":
         infos = self.infos
-        parent = {k: k for k in range(len(infos))}
+        self.reach, self.coreach = _reachability(infos)
+        rk = _key(self.rank_bucket)
+        costs = self.costs[rk]
 
-        def find(x: int) -> int:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
+        def weight(e: Edge) -> int:
+            return costs[e.producer].writes.get(e.buffer, 0) + costs[e.consumer].reads.get(e.buffer, 0)
 
         inner = [e for e in self.edges if infos[e.producer].cls != "library" and infos[e.consumer].cls != "library"]
         anchored = [e for e in self.edges if infos[e.producer].cls == "library" or infos[e.consumer].cls == "library"]
         anchored = [e for e in anchored if not (infos[e.producer].cls == "library" and infos[e.consumer].cls == "library")]
-        for e in inner:
-            parent[find(e.producer)] = find(e.consumer)
-        groups: "dict[int, list[Edge]]" = {}
-        for e in inner:
-            groups.setdefault(find(e.producer), []).append(e)
+        # the largest intermediates first: an edge joins two groups only when one kernel of the union has no step between its members
+        group: "dict[int, set[int]]" = {}
+        edges_of: "dict[int, list[Edge]]" = {}
+        self.blocked: "list[dict[str, Any]]" = []
+        for e in sorted(inner, key=lambda e: (-weight(e), e.producer, e.consumer)):
+            a, b = group.get(e.producer, {e.producer}), group.get(e.consumer, {e.consumer})
+            union = a | b
+            middle = self._middle(union)
+            if middle:
+                self._block(e, middle)
+                continue
+            es = edges_of.get(id(a), []) + (edges_of.get(id(b), []) if a is not b else []) + [e]
+            for k in union:
+                group[k] = union
+            edges_of.pop(id(a), None)
+            edges_of.pop(id(b), None)
+            edges_of[id(union)] = es
         out = []
-        for es in groups.values():
-            out.append(self._candidate(es, "chain" if len({x for e in es for x in (e.producer, e.consumer)}) > 2 else "pair"))
+        for es in edges_of.values():
+            steps = {x for e in es for x in (e.producer, e.consumer)}
+            linear = all(sum(1 for e in es if e.producer == s) <= 1 and sum(1 for e in es if e.consumer == s) <= 1 for s in steps)
+            out.append(self._candidate(es, "pair" if len(steps) == 2 else ("chain" if linear else "group")))
         for e in anchored:
+            middle = self._middle({e.producer, e.consumer})
+            if middle:
+                self._block(e, middle)
+                continue
             out.append(self._candidate([e], "epilogue" if infos[e.producer].cls == "library" else "prologue"))
         rk = _key(self.rank_bucket)
         out.sort(key=lambda c: (-c["saved_us"][rk], -c["saved_bytes"][rk], c["steps"][0]))
         for i, c in enumerate(out, 1):
             c["rank"] = i
         return out
+
+    def _block(self, e: Edge, middle: "set[int]") -> None:
+        """An intermediate one kernel of its producer and consumer cannot save: another step sits between them (it reads what the producer made
+        and the consumer reads what it makes). A library op in the middle makes it future work; any other step, one kernel of all of them."""
+        infos = self.infos
+        lib = sorted(k for k in middle if infos[k].cls == "library")
+        reason = "library-in-the-middle" if lib else "step-in-the-middle"
+        shown = (lib or sorted(middle))[:3]
+        rk = _key(self.rank_bucket)
+        saved = self.costs[rk][e.producer].writes.get(e.buffer, 0) + self.costs[rk][e.consumer].reads.get(e.buffer, 0)
+        self.blocked.append({
+            "buffer": e.buffer, "producer": e.producer, "consumer": e.consumer, "reason": reason, "middle": sorted(middle),
+            "labels": [infos[e.producer].label, infos[e.consumer].label],
+            "why": f"step {e.consumer} also depends on step {e.producer} through " + ", ".join(f"step {k} ({infos[k].op or infos[k].kind})" for k in shown)
+            + (f" and {len(middle) - len(shown)} more" if len(middle) > len(shown) else ""),
+            "action": BLOCKERS[reason][0], "phase": BLOCKERS[reason][1], "saved_bytes": saved,
+        })
 
     def _candidate(self, es: "list[Edge]", shape: str) -> "dict[str, Any]":
         infos = self.infos
@@ -789,6 +902,10 @@ class Advice:
             }
             if self.measured is not None:
                 item["us"] = self.measured.get(info.index)
+                busy = max((item["us"] or 0.0) - self.floor, 1e-3)  # the bandwidth it moves its bytes at, above the launch floor
+                item["achieved_GBps"] = round(c.nbytes / busy / 1e3, 1)
+                if info.cls == "opaque":
+                    item["bound"] = "compute (measured)" if info.arith_bound else "memory (measured)"
             steps.append(item)
         by_class: "dict[str, dict[str, Any]]" = {}
         for info, c in zip(self.infos, costs):
@@ -798,6 +915,19 @@ class Advice:
             d["bytes"] += c.nbytes
             if self.measured is not None:
                 d["us"] += self.measured.get(info.index, 0.0)
+        by_op: "dict[str, dict[str, Any]]" = {}
+        for info, c in zip(self.infos, costs):
+            o = by_op.setdefault(info.op or info.kind, {"op": info.op or info.kind, "class": info.cls, "steps": 0, "est_us": 0.0, "bytes": 0,
+                                                       "us": 0.0 if self.measured is not None else None})
+            o["steps"] += 1
+            o["est_us"] += c.est_us
+            o["bytes"] += c.nbytes
+            if self.measured is not None:
+                o["us"] += self.measured.get(info.index, 0.0)
+        for o in by_op.values():
+            o["est_us"] = round(o["est_us"], 3)
+            if o["us"] is not None:
+                o["us"] = round(o["us"], 3)
         total_est = sum(d["est_us"] for d in by_class.values()) or 1.0
         total_us = sum(d["us"] for d in by_class.values()) if self.measured is not None else None
         for d in by_class.values():
@@ -847,11 +977,13 @@ class Advice:
             "estimate": "measured" if self.measured is not None else "bytes / bandwidth",
             "steps": steps,
             "by_class": dict(sorted(by_class.items(), key=lambda kv: CLASSES.index(kv[0]) if kv[0] in CLASSES else 99)),
+            "by_op": sorted(by_op.values(), key=lambda o: (-(o["us"] if o["us"] is not None else o["est_us"]), o["op"])),
             "total_us": None if total_us is None else round(total_us, 3),
             "total_est_us": round(total_est, 3),
             "candidates": [{**c, "saved_us": {k: round(v, 3) for k, v in c["saved_us"].items()}} for c in self.candidates],
             "patterns": sorted(patterns.values(), key=lambda p: (-p["saved_us"], -p["saved_bytes"])),
             "recurring": sorted(recurring.values(), key=lambda r: (-r["saved_us"], -r["saved_bytes"])),
+            "blocked": sorted(self.blocked, key=lambda b: (-b["saved_bytes"], b["producer"])),
             "fan_outs": self.fanouts,
             "kept": self.kept,
             "unfused_arithmetic": unfused,
@@ -907,14 +1039,24 @@ class Advice:
         if self.measured is not None:
             lines.append(f"  {'total':<12}{len(self.infos):5d} steps  {d['total_us']:10.1f} us")
         lines.append("")
+        lines.append("time by op (the ten longest):")
+        for o in d["by_op"][:10]:
+            t = o["us"] if o["us"] is not None else o["est_us"]
+            lines.append(f"  {t:10.1f} us  {o['steps']:4d} steps  {o['class']:<12} {o['op']}")
+        lines.append("")
         cands = self.candidates
         lines.append(f"fusion candidates ({len(cands)}), ranked by the time they would save at {d['bucket']}:")
         for c in cands[:top]:
             us = c["saved_us"][rk]
             launches = f", {c['launches_removed']} launch{'es' if c['launches_removed'] != 1 else ''} fewer" if c["launches_removed"] else ""
-            lines.append(f" #{c['rank']:<3} steps {' -> '.join(str(s) for s in c['steps'])} ({c['shape']}): saves {_mb(c['saved_bytes'][rk])}, ~{us:.2f} us{launches}; phase {c['phase']}")
-            for k, label in zip(c["steps"], c["labels"]):
+            sep = " -> " if c["shape"] in ("pair", "chain", "epilogue", "prologue") else ", "
+            ids = c["steps"] if len(c["steps"]) <= 8 else [*c["steps"][:5], "...", *c["steps"][-2:]]
+            lines.append(f" #{c['rank']:<3} steps {sep.join(str(s) for s in ids)} ({c['shape']}): saves {_mb(c['saved_bytes'][rk])}, ~{us:.2f} us{launches}; phase {c['phase']}")
+            shown = list(zip(c["steps"], c["labels"]))
+            for k, label in shown if len(shown) <= 8 else shown[:5]:
                 lines.append(f"        step {k}: {label}")
+            if len(shown) > 8:
+                lines.append(f"        ... {len(shown) - 5} more steps")
             for w in c["why"]:
                 lines.append(f"        why not today: {w}")
             for a in c["actions"]:
@@ -946,6 +1088,16 @@ class Advice:
                 lines.append(f"      fix: {u['fix']} (phase {u['phase']})")
             if len(d["unfused_arithmetic"]) > top:
                 lines.append(f"  ... {len(d['unfused_arithmetic']) - top} more (--json for all)")
+        if self.blocked:
+            lines.append("")
+            by: "dict[str, list[dict[str, Any]]]" = {}
+            for b in d["blocked"]:
+                by.setdefault(b["reason"], []).append(b)
+            lines.append("intermediates one kernel of their producer and consumer alone cannot save (a step sits between them):")
+            for reason, bs in sorted(by.items(), key=lambda kv: -sum(b["saved_bytes"] for b in kv[1])):
+                lines.append(f"  {len(bs):4d}  {_mb(sum(b['saved_bytes'] for b in bs)):>10}  {reason}: {BLOCKERS[reason][0]} (phase {BLOCKERS[reason][1]})")
+                for b in bs[:3]:
+                    lines.append(f"        {b['buffer']}: steps {b['producer']} -> {b['consumer']}: {b['why']}")
         if self.fanouts or self.kept:
             lines.append("")
             why: "dict[str, int]" = {}
@@ -1017,7 +1169,7 @@ def advise(
     if isinstance(timing, (str, pathlib.Path)):
         timing = _read_json(pathlib.Path(timing), "the timing file")
     return analyse(doc, manifest, report=report, gdoc=gdoc, boundaries=bounds, timing=timing, bucket=bucket, machine=machine, bandwidth=bandwidth,
-                   keep=keep, trace_root=trace.root if trace is not None else None, trace_index=trace.index if trace is not None else None)
+                   keep=keep, trace=trace)
 
 
 __all__ = ["ADVICE_SCHEMA", "Advice", "BLOCKERS", "MACHINES", "Machine", "TIMING_SCHEMA", "TilefishAdviseError", "advise", "analyse", "graphs_of"]

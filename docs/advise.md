@@ -99,6 +99,13 @@ argument bound to it). Steps joined by fusible intermediates form a **candidate*
 * **an epilogue** (a library step and the step that alone reads its result) or **a prologue** (a step whose result only a library step reads): a
   library op is never fused with another, and its epilogue and prologue are future work, so each is a candidate of its own, bounded by it.
 
+**No step may sit between them** (rule 2 of RFC 0001, 3.5): one kernel of a candidate's steps must not need a step outside it, one that depends on a
+member and that a member depends on. The candidates are grown from the largest intermediate down, and an intermediate whose union would have such a
+step in the middle is not saved: it is listed under `blocked`, with the steps in the middle, as **`library-in-the-middle`** (a GEMM or convolution
+between them: the residual stream of a transformer, written by one norm and read by the next, has the layer's GEMMs between them; future work) or
+**`step-in-the-middle`** (another kernel that cannot join them). The dependencies are the plan's: a step that reads a version another wrote, and the
+order of the accesses to a buffer.
+
 A version read by several steps is a **fan-out**, listed but not a candidate: one region of all of them, or recomputation, which version 1 does not do.
 The buffers kept stored are listed with why.
 
@@ -111,7 +118,7 @@ class gives one; the fusion pass gives the rest.
 |---|---|---|
 | `opaque-extern` | a hand-written kernel without MMAs: write its arithmetic in the graph body so phase 1 fuses it (a row one needs phase 2) | 1 |
 | `opaque-unknown` | the same, when there is no trace to tell whether it computes MMAs | 1 |
-| `opaque-mma-epilogue`, `-prologue` | a GEMM, attention or convolution of its own: an epilogue hook of the extern (route (c)); a prologue hook | 4, future |
+| `opaque-compute-epilogue`, `-prologue` | a hand-written kernel bound by its arithmetic: MMAs in its SASS, or (with a timing file) moving its bytes at less than a quarter of the bandwidth, such as an attention of FMAs or a search; an epilogue hook of the extern (route (c)); a prologue hook | 4, future |
 | `dsl-kernel` | a `@tilefish.kernel` (elementwise): write its body in the graph body (RFC 8.2); exact as it is when it declares `fp_fusion=False` | 1 |
 | `dsl-kernel-contracts` | the same, for a kernel that lets the compiler contract: write `tilefish.fma` where it meant one rounding, or its bytes change | 1 |
 | `row-kernel` | a row `@tilefish.kernel`: needs phase 2 row fusion (write it in the graph body, with `order=` on its sums) | 2 |
@@ -150,21 +157,26 @@ whose steps move the most bytes.
 * **Without a timing file**: the bytes saved over the bandwidth, `S / BW`, counting the bytes of every step but a compute-bound library step (a GEMM
   that is compute-bound does not get faster for writing less). The launches it removes are listed, not counted.
 * **With a timing file** (the steps' *net* times, section 6): the **launch floor** `t0` is the shortest kernel step, what a kernel costs whatever it
-  moves. A step whose time is its bytes' (elementwise, row, fused, copy, a memory-bound GEMM, a kernel without MMAs) spends `t - t0` moving its bytes at
-  its achieved bandwidth `min(BW, bytes / (t - t0))`, and saves `min(t - t0, S_step / achieved)`; any other step (an attention, a kernel whose MMAs
-  are not known) saves `S_step / BW`. Each kernel the fusion removes saves `t0`: one fewer than the candidate's kernel steps, or all of them when a
-  library op takes them in. The saving is at most the candidate's time less one floor.
+  moves. A step spends `t - t0` moving its bytes at its achieved bandwidth `min(BW, bytes / (t - t0))`. Where that can be its bytes' time (an
+  elementwise, row, fused or copy step, a GEMM, a kernel without MMAs) and it achieves a quarter of the bandwidth or more (`STREAMING`), it saves
+  `min(t - t0, S_step / achieved)`; any other step (an attention, a kernel whose MMAs are not known, a kernel far slower than its bytes) saves
+  `S_step / BW`, and a compute-bound GEMM nothing. Each kernel the fusion removes saves `t0`: one fewer than the candidate's kernel steps, or all of
+  them when a library op takes them in. The saving is at most the candidate's time less one floor. Candidates overlap (an elementwise step between
+  two GEMMs is an epilogue of one and a prologue of the other), so their savings do not add up.
 
 `patterns` sums the candidates by the blocker of the latest phase each needs removed (each candidate counted once; the others it needs are listed
 as `also`): what that phase of fusion would unlock. A candidate whose latest blocker is `epilogue-library` needs GEMM epilogues whatever else is done.
+`recurring` sums the candidates whose steps run the same ops in the same order (a layer of a model, repeated): the fusion patterns, in the model's
+terms, that would save the most.
 
-The **time by class** sums the steps' times (measured, and the roofline estimate) per class: `library`, `fused`, `elementwise`, `row`, `copy`, `opaque`.
+The **time by class** sums the steps' times (measured, and the roofline estimate) per class: `library`, `fused`, `elementwise`, `row`, `copy`,
+`opaque`; **the time by op** per manifest op.
 
 **The JSON** (`--json`, `Advice.doc`, `tilefish.advice.v1`): `graph`, `arch`, `plan_digest`, `bucket` (ranked at), `buckets` (analysed), `machine`,
-`timing`, `estimate`, `steps` (per step: `class`, `label`, `bytes_read`, `bytes_written`, `flops`, `intensity`, `bound`, `est_us`, and `us` when
-measured), `by_class`, `candidates` (each: `shape`, `steps`, `labels`, `classes`, `buffers`, `saved_bytes` and `saved_us` per bucket,
-`launches_removed`, `blockers`, `why`, `actions`, `phase`, `gate`, `rank`), `patterns`, `fan_outs`, `kept`, `unfused_arithmetic`. Informative, like
-the fusion report: no host reads it.
+`timing`, `estimate`, `steps` (per step: `class`, `label`, `bytes_read`, `bytes_written`, `flops`, `intensity`, `bound`, `est_us`, and `us` and
+`achieved_GBps` when measured), `by_class`, `by_op`, `candidates` (each: `shape`, `steps`, `labels`, `classes`, `buffers`, `saved_bytes` and
+`saved_us` per bucket, `launches_removed`, `blockers`, `why`, `actions`, `phase`, `gate`, `rank`), `patterns`, `recurring`, `blocked`, `fan_outs`,
+`kept`, `unfused_arithmetic`. Informative, like the fusion report: no host reads it.
 
 ## 6. The profiler
 
@@ -191,22 +203,42 @@ and the runs it makes are runs of the plan (a run after it writes the bytes a ru
 **Overhead and accuracy** (measured on a B300 MIG slice, sm_103, 30 SMs, on the plans of `plan_model` in `python/tests`, with Nsight Systems
 2026.5.2 on the same graph replays, `--cuda-graph-trace=node`):
 
-* **The events cost each step about 3 us** on this device: the 9 steps of `plan_model.block` at `M = 128` sum to 94 us between events, and the
-  plan alone takes 64 us, in either method. An event node waits for the step before it to finish, where consecutive kernels of a graph overlap one's
-  tail with the next one's launch. So the file records that cost (`event_us`: the steps' sum less the plan's time, shared evenly) and each step's
-  **`net`**: its trimmed mean less it. The nets add up to the plan's time, and the advisor ranks by them.
+* **The events cost each step about 3 us** on this device (3 to 4.5 us on larger plans): the 9 steps of `plan_model.block` at `M = 128` sum to
+  94 us between events, and the plan alone takes 64 us, in either method. An event node waits for the step before it to finish, where consecutive
+  kernels of a graph overlap one's tail with the next one's launch. So the file records that cost (`event_us`: the steps' sum less the plan's time,
+  shared evenly) and each step's **`net`**: its trimmed mean less it. The nets add up to the plan's time, and the advisor ranks by them.
 * **The timestamps tick in steps** (the medians of short steps are 4.096 and 6.144 us), which a median snaps to and a mean averages over: hence the
   trimmed mean.
-* **Against nsys**: <!-- nsys-table -->
+* **Against nsys** (200 replays of the plan's CUDA graph, without events, under `nsys profile --trace=cuda --cuda-graph-trace=node`; the
+  profiler's 200 replays with events; microseconds):
+
+  | step of `plan_model.block`, `M = 128` | profiler median | profiler net | nsys kernel | nsys kernel + gap before it |
+  |---|---|---|---|---|
+  | `rmsnorm` | 4.70 | 1.72 | 1.35 | 1.35 |
+  | `gemm_qkv` (cuBLASLt) | 6.18 | 2.91 | 2.50 | 2.54 |
+  | `attention` | 49.12 | 46.00 | 46.52 | 46.54 |
+  | `gemm_o` | 5.98 | 2.74 | 2.22 | 2.25 |
+  | `add_rmsnorm` | 4.29 | 1.28 | 1.20 | 1.23 |
+  | `gemm_up` | 6.14 | 2.88 | 2.52 | 2.56 |
+  | `gelu` | 6.14 | 2.87 | 1.65 | 1.68 |
+  | `gemm_down` | 6.14 | 2.88 | 3.04 | 3.08 |
+  | `add` | 4.10 | 0.83 | 1.08 | 1.09 |
+  | **sum** | 92.8 | **64.1** | 62.1 | **62.3** (first kernel to last: 62.3) |
+
+  The plan alone, timed by the profiler without events: 64.1 us. For `plan_model.deep_block(4)` (36 steps) the nets sum to 244.2 us and nsys's
+  kernels and gaps to 249.4 us. **A step's net is within 0.6 us of nsys's kernel time but for one step (1.2 us), and the nets' sum within 3% of
+  nsys's**; the medians, with the events in them, are 3 to 4 us too long each. Rank short steps by `net`, and take a difference of less than a
+  microsecond between two steps as noise.
 * **What it cannot see**: work inside a step (a library step of several kernels is one step), and the overlap of a step with the next one, which
   `net` shares evenly instead of measuring. For a time inside a kernel, see issue #5 section 2.
 
 ## 7. How it is tested
 
 * `python/tests/test_advise.py` (any machine): synthetic plans (bytes, FLOPs, classes and roofline; a pair, a prologue and an epilogue around a
-  GEMM; chains, groups and fan-outs; returned, carried, `InOut`, tapped and twice-written buffers kept; views of one buffer; the ranking by bytes and
-  by measured time, the floor and the achieved bandwidth; timing files of another plan, bucket or step refused); the golden plan `block` on the command
-  line; the boundaries of a graph body (a barrier, unordered and ordered sums, calls, a materialised view) with their fixes, and that they change no
+  GEMM; chains, groups and fan-outs; returned, carried, `InOut`, tapped and twice-written buffers kept; a GEMM or another kernel in the middle;
+  each bucket's entries and views; views of one buffer; the trace's SASS telling a kernel with MMAs from one without; a kernel bound by its arithmetic;
+  the ranking by bytes and by measured time, the floor and the achieved bandwidth; timing files of another plan, bucket or step refused); the golden
+  plan `block` on the command line (its residual, blocked by the MLP's GEMMs); the boundaries of a graph body (a barrier, unordered and ordered sums, calls, a materialised view) with their fixes, and that they change no
   region; a traced export by the fake compiler (its manifest, plan and fusion report the same bytes as without the trace; the trace's boundaries; the
   advice with the trace, without it, and with `gop=`); the profiler's runtime path on a fake backend (the events around each step, the same launches
   as a run, both methods).

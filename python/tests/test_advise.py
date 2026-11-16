@@ -150,6 +150,89 @@ def test_outputs_carried_inout_taps_and_buffers_written_twice_stay_stored():
     assert adv2.candidates == [] and {k["buffer"]: k["why"] for k in adv2.kept}["t0"].startswith("written more than once")
 
 
+def test_a_pair_with_a_step_between_them_is_no_candidate():
+    # a writes t0 and t1; the GEMM reads t1; c reads t0 and the GEMM's t2: c depends on a through the GEMM, so a and c alone are not one kernel
+    two = [("x", "in"), ("y0", "out"), ("y1", "out")]
+    buffers = [buf("x", "input"), buf("w", "weight", (1024, 1024)), *[buf(f"t{i}", "intermediate") for i in range(3)], buf("out0", "output"),
+               buf("out1", "output"), buf("workspace", "workspace", (1024,), "u8")]
+    steps = [kstep("a", ("x", "x"), ("y0", "t0"), ("y1", "t1")), lstep("gemm.M64", "t1", "w", "t2"), kstep("c", ("x", "t0"), ("y0", "t2"), ("y1", "out0"))]
+    manifest = {"kernels": [kernel("a", two, generated=True), kernel("c", [("x", "in"), ("y0", "in"), ("y1", "out")], generated=True)],
+                "library": [gemm("gemm.M64", M, 1024, 1024)]}
+    adv = _advise.analyse(plan(buffers, steps), manifest)
+    assert sorted(tuple(c["steps"]) for c in adv.candidates) == [(0, 1), (1, 2)]  # the GEMM's prologue and epilogue
+    (b,) = adv.blocked
+    assert (b["buffer"], b["reason"], b["middle"]) == ("t0", "library-in-the-middle", [1]) and b["phase"] == "future"
+    # a kernel in the middle that cannot join them (its input is read by another step too): a and c stay apart, the kernel and c are a pair
+    steps2 = [kstep("a", ("x", "x"), ("y0", "t0"), ("y1", "t1")), kstep("m", ("x", "t1"), ("y", "t2")),
+              kstep("c", ("x", "t0"), ("y0", "t2"), ("y1", "out0")), kstep("m", ("x", "t1"), ("y", "out1"))]
+    manifest2 = {"kernels": [*manifest["kernels"], kernel("m", IO, generated=True)], "library": []}
+    adv2 = _advise.analyse(plan(buffers, steps2), manifest2)
+    assert [c["steps"] for c in adv2.candidates] == [[1, 2]] and adv2.fanouts[0]["buffer"] == "t1"
+    assert [(b["buffer"], b["reason"], b["middle"]) for b in adv2.blocked] == [("t0", "step-in-the-middle", [1])]
+
+
+class FakeTrace:
+    """A trace whose SASS of each kernel is given: what ``tilefish.explain.Trace.kernel`` returns once it has checked the files."""
+
+    def __init__(self, root, listings):
+        self.root = root
+        for stem, text in listings.items():
+            (root / f"{stem}.sm_103").mkdir(parents=True)
+            (root / f"{stem}.sm_103" / "sass.txt").write_text(text)
+        self.listings = listings
+
+    def kernel(self, stem, arch, sha256):
+        return {"sass": {"label": "x"}} if stem in self.listings and sha256 == "ab" * 32 else None
+
+
+def test_the_trace_tells_a_hand_written_kernel_with_mmas_from_one_without(tmp_path):
+    doc, manifest = chain_plan()
+    manifest["kernels"][0]["sha256"] = "ab" * 32
+    with_mma = FakeTrace(tmp_path / "a", {"ext": "        /*0100*/                   UTCHMMA gdesc[UR4], gdesc[UR6], tmem[UR8], idesc[UR9], UPT ;\n"})
+    a = _advise.analyse(doc, manifest, trace=with_mma)
+    assert a.infos[0].mma is True and a.infos[0].label == "ext [Triton extern, MMA]"
+    assert a.doc["steps"][0]["bound"] == "unknown"
+    pair = next(c for c in a.candidates if c["steps"] == [0, 1])
+    assert pair["blockers"][0] == "opaque-compute-epilogue" and pair["phase"] == "4"
+    without = FakeTrace(tmp_path / "b", {"ext": "        /*0100*/                   FMUL R5, R2, 2 ;\n"})
+    b = _advise.analyse(doc, manifest, trace=without)
+    assert b.infos[0].mma is False and b.doc["steps"][0]["bound"] == "memory"
+    assert next(c for c in b.candidates if c["steps"] == [0, 1])["blockers"][0] == "opaque-extern"
+    stale = FakeTrace(tmp_path / "c", {"other": "HMMA"})  # no SASS of this binary in the trace: unknown
+    assert _advise.analyse(doc, manifest, trace=stale).infos[0].mma is None
+
+
+def test_a_hand_written_kernel_far_slower_than_its_bytes_is_bound_by_its_arithmetic():
+    doc, manifest = chain_plan()
+    adv = _advise.analyse(doc, manifest, timing=timing_of(doc, [400.0, 3.0, 10.0, 3.0], copy=1000.0))
+    assert adv.infos[0].arith_bound and adv.doc["steps"][0]["bound"] == "compute (measured)" and adv.doc["steps"][0]["achieved_GBps"] < 1
+    pair = next(c for c in adv.candidates if c["steps"] == [0, 1])
+    assert pair["blockers"][0] == "opaque-compute-epilogue" and "bound by its arithmetic" in pair["actions"][0]
+    fast = _advise.analyse(doc, manifest, timing=timing_of(doc, [3.3, 3.0, 10.0, 3.0], copy=1000.0))
+    assert not fast.infos[0].arith_bound and fast.doc["steps"][0]["bound"] == "memory (measured)"
+
+
+def test_each_bucket_has_its_own_entries_and_views():
+    # one plan for M in {32, 64}: the GEMM's entry and the view of its output are the bucket's (only the bindings are every bucket's)
+    buffers = [buf("x", "input"), buf("w", "weight", (1024, 1024)), buf("t0", "intermediate"), buf("t1", "intermediate"), buf("out0", "output"),
+               buf("workspace", "workspace", (1024,), "u8")]
+
+    def steps(m):
+        return [lstep(f"gemm.M{m}", "x", "w", "t0"), kstep("act", ("x", "t0", {"shape": [m * 1024], "strides": [1], "offset": 0}), ("y", "t1")),
+                kstep("act", ("x", "t1"), ("y", "out0"))]
+
+    doc = {**plan(buffers, steps(32), {"M": 32}), "dims": {"M": [32, 64]},
+           "buckets": [{"values": {"M": 32}, "steps": steps(32)}, {"values": {"M": 64}, "steps": steps(64)}]}
+    manifest = {"kernels": [kernel("act", IO, generated=True)], "library": [gemm("gemm.M32", 32, 1024, 1024), gemm("gemm.M64", 64, 1024, 1024)]}
+    adv = _advise.analyse(doc, manifest)
+    assert adv.doc["bucket"] == {"M": 64}
+    assert adv.doc["steps"][0]["entry"] == "gemm.M64" and "GEMM 64x1024x1024" in adv.doc["steps"][0]["label"]
+    assert adv.doc["steps"][0]["flops"] == 2 * 64 * 1024 * 1024
+    assert adv.doc["steps"][1]["bytes_read"] == 64 * 1024 * 2  # the view at M = 64, not M = 32's
+    epi = next(c for c in adv.candidates if c["steps"] == [0, 1])
+    assert epi["saved_bytes"] == {"M=32": 2 * 32 * 2048, "M=64": 2 * 64 * 2048}
+
+
 def test_views_of_one_buffer_count_once_each():
     buffers = [buf("x", "input"), buf("t0", "intermediate", ("M", 3072)), buf("out0", "output")]
     view = {"shape": [M, 1024], "strides": [3072, 1], "offset": 1024}
@@ -170,27 +253,32 @@ def timing_of(doc, us, copy=None):
 
 
 def test_ranking_by_bytes_without_timing_and_by_measured_time_with_it():
-    buffers = [buf("x", "input"), buf("big0", "intermediate", ("M", 8192)), buf("t0", "intermediate"), buf("small", "intermediate", ("M", 64)),
-               buf("out0", "output", ("M", 8192)), buf("out1", "output", ("M", 64))]
+    buffers = [buf("x", "input"), buf("big0", "intermediate", ("M", 8192)), buf("mid", "intermediate", ("M", 4096)),
+               buf("out0", "output", ("M", 8192)), buf("out1", "output", ("M", 4096))]
     steps = [kstep("p", ("x", "x"), ("y", "big0")), kstep("q", ("x", "big0"), ("y", "out0")),
-             kstep("r", ("x", "x"), ("y", "small")), kstep("s", ("x", "small"), ("y", "out1"))]
+             kstep("r", ("x", "x"), ("y", "mid")), kstep("s", ("x", "mid"), ("y", "out1"))]
     manifest = {"kernels": [kernel(n, IO, generated=True) for n in "pqrs"], "library": []}
     doc = plan(buffers, steps)
     static = _advise.analyse(doc, manifest)
-    assert [c["steps"] for c in static.candidates] == [[0, 1], [2, 3]]  # 2 MiB before 16 KiB
-    # measured: p and q run at the bandwidth, r and s take 40 us each for 16 KiB (a slow kernel); the floor is the fastest kernel, 3 us
-    timed = _advise.analyse(doc, manifest, timing=timing_of(doc, [3.0, 3.5, 40.0, 40.0]))
+    assert [c["steps"] for c in static.candidates] == [[0, 1], [2, 3]]  # 2 MiB saved before 1 MiB
+    big, mid, x = 8192 * M * 2, 4096 * M * 2, ROW
+    assert static.candidates[0]["saved_us"]["M=64"] == pytest.approx(2 * big / 8000e9 * 1e6)
+    # measured, at a copy bandwidth of 1000 GB/s: p takes the launch floor (3 us, the fastest step) and q moves its 2 MiB at the bandwidth; r and s move
+    # theirs at 260 GB/s, slower but still bound by their bytes (a quarter of the bandwidth or more)
+    bw, slow = 1000e9, 260e9
+    t = [3.0, 3.0 + 2 * big / bw * 1e6, 3.0 + (x + mid) / slow * 1e6, 3.0 + 2 * mid / slow * 1e6]
+    timed = _advise.analyse(doc, manifest, timing=timing_of(doc, t, copy=1000.0))
+    assert timed.machine.bandwidth == 1000.0 and timed.floor == 3.0
     assert [c["steps"] for c in timed.candidates] == [[2, 3], [0, 1]]
-    # p -> q: p takes the floor (its time above it, 0.001 us at least, is what its write of big0 can save); q spends 0.5 us above the floor moving 2 MiB,
-    # half of it big0's read: 0.25 us; and one kernel fewer saves the floor, 3 us
-    assert timed.floor == 3.0
-    assert timed.candidates[1]["saved_us"]["M=64"] == pytest.approx(0.001 + 0.25 + 3.0, abs=1e-6)
-    # r -> s: 37 us above the floor each; r's write of small is 8 KiB of its 136 KiB, s's read half of its 16 KiB
-    assert timed.candidates[0]["saved_us"]["M=64"] == pytest.approx(37 * 8192 / 139264 + 37 * 0.5 + 3.0, abs=1e-6)
-    assert timed.doc["estimate"] == "measured" and timed.doc["total_us"] == pytest.approx(86.5)
-    assert timed.doc["by_class"]["elementwise"]["us"] == pytest.approx(86.5)
-    # the copy bandwidth the timing measured is the roofline's
-    assert _advise.analyse(doc, manifest, timing=timing_of(doc, [3.0, 3.5, 40.0, 40.0], copy=1000.0)).machine.bandwidth == 1000.0
+    # p -> q: p saves what its time above the floor allows (0.001 us at least), q its read of big0 at the bandwidth, and one kernel fewer the floor
+    assert timed.candidates[1]["saved_us"]["M=64"] == pytest.approx(0.001 + big / bw * 1e6 + 3.0, abs=1e-3)
+    # r -> s: each side's bytes of mid at the 260 GB/s it achieves, and the floor
+    assert timed.candidates[0]["saved_us"]["M=64"] == pytest.approx(2 * mid / slow * 1e6 + 3.0, abs=1e-3)
+    assert timed.doc["estimate"] == "measured" and timed.doc["total_us"] == pytest.approx(sum(t), abs=1e-3)
+    assert timed.doc["by_class"]["elementwise"]["us"] == pytest.approx(sum(t), abs=1e-3)
+    # a step far slower than its bytes (an attention of FMAs, a slow kernel) is not bound by them: what it no longer moves saves the bytes' time only
+    slowest = _advise.analyse(doc, manifest, timing=timing_of(doc, [3.0, t[1], 400.0, 400.0], copy=1000.0))
+    assert next(c for c in slowest.candidates if c["steps"] == [2, 3])["saved_us"]["M=64"] == pytest.approx(2 * mid / bw * 1e6 + 3.0, abs=1e-3)
 
 
 def test_a_timing_file_of_another_plan_or_bucket_is_refused():
@@ -213,10 +301,14 @@ def test_the_golden_block_on_the_command_line(capsys):
     assert [s["class"] for s in doc["steps"]] == ["row", "library", "opaque", "library", "row", "library", "elementwise", "library", "elementwise"]
     first = doc["candidates"][0]
     assert first["steps"] == [5, 6] and first["shape"] == "epilogue"  # gemm_up's [M, 1024] output read by gelu
-    assert {p["blocker"] for p in doc["patterns"]} >= {"epilogue-library", "prologue-library", "row-kernel"}
+    assert {p["blocker"] for p in doc["patterns"]} == {"epilogue-library", "prologue-library"}
+    # the residual r of add_rmsnorm, read by the last add alone: the GEMMs of the MLP sit between them, so it is no candidate
+    (r,) = doc["blocked"]
+    assert (r["producer"], r["consumer"], r["reason"]) == (4, 8, "library-in-the-middle") and r["middle"] == [5, 6, 7]
+    assert "step 5 (gemm_up)" in r["why"]
     assert explain.main([str(GOLDEN / "block"), "--graph", "block", "--advise", "--bucket", "M=32", "--top", "2"]) == 0
     text = capsys.readouterr().out
-    assert "ranked at bucket {'M': 32}" in text and "#1 " in text and "... 7 more" in text and "time by class" in text
+    assert "ranked at bucket {'M': 32}" in text and "#1 " in text and "... 6 more" in text and "time by class" in text and "library-in-the-middle" in text
     assert explain.main([str(GOLDEN / "block"), "--graph", "nope", "--advise"]) == 2
     assert "no plan of the graph 'nope'" in capsys.readouterr().err
     assert explain.main([str(GOLDEN / "set"), "--advise"]) == 2  # a plan set: say which graph
