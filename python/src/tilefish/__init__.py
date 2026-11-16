@@ -38,6 +38,11 @@ or flush to zero (:func:`div`, note 13); and :func:`tanh` is libdevice's ``tanhf
 
 M3.5: the primitives a CUDA kernel is reproduced with: :func:`erf` (CUDA's ``erff`` in IEEE math), :func:`sin_approx`, :func:`rcp`, :func:`fma`
 and :func:`neg` (``-x``), and sums in a fixed order (``tilefish.sum(x, -1, order="sequential" | tree(...), fma=...)``, :func:`tree`); notes 15 to 17.
+
+M3.8: intra-kernel instrumentation (``docs/instrument.md``): :func:`probe` marks a phase boundary in a ``@tilefish.kernel``, a ``@triton.jit`` or a
+``@gluon.jit`` kernel; an instrumented build (``export(..., instrument=True)``, :func:`instrument`) records ``%globaltimer``, ``%clock``, the SM, the CTA
+and the warp there into a probe buffer, as a variant with binaries and digests of its own that a host refuses unless asked; :class:`Probes` collects
+the records of a run (``tilefish.run(..., probes=...)``) and :class:`ProbeTrace` explains them (``tilefish-explain DIR --probes FILE``).
 """
 
 from . import aot
@@ -87,6 +92,8 @@ from .ops import argmax, argmin, cos, div, erf, exp, fma, gather_rows, gelu, iot
 from .ops import barrier, sqrt, tanh, tree, where, zeros_like
 from ._fusion import Fusion, TilefishFusionError, TilefishFusionWarning, fusion
 from ._sass import SassChecks, sass
+from ._probe import Instrument, instrument, probe
+from ._probes import ProbeTrace, Probes, TilefishProbeError
 from ._copyops import col2im1d, contiguous, im2col, im2col1d
 from .ops import reduce_mean as mean
 from .runtime import capture, run
@@ -171,8 +178,11 @@ __all__ = [
     "Null",
     "Op",
     "Out",
+    "Instrument",
     "Persistent",
     "Plan",
+    "ProbeTrace",
+    "Probes",
     "Requirement",
     "SassChecks",
     "Scalar",
@@ -193,6 +203,7 @@ __all__ = [
     "TilefishPicklingError",
     "TilefishPlanError",
     "TilefishPreconditionError",
+    "TilefishProbeError",
     "TilefishRuntimeError",
     "TilefishSpecError",
     "TilefishTypeError",
@@ -233,6 +244,7 @@ __all__ = [
     "im2col",
     "im2col1d",
     "impl",
+    "instrument",
     "iota",
     "kernel",
     "library",
@@ -241,6 +253,7 @@ __all__ = [
     "mean",
     "neg",
     "plan",
+    "probe",
     "profile_plan",
     "persistent",
     "rcp",

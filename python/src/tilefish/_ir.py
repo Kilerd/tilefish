@@ -60,7 +60,7 @@ import tempfile
 import threading
 from typing import TYPE_CHECKING, Any, Iterator, Mapping
 
-from . import _source
+from . import _probe, _source
 from .errors import TilefishBuildError
 
 if TYPE_CHECKING:
@@ -194,7 +194,8 @@ def ttir_text(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "Mappi
             try:
                 ir.load_dialects(context)
                 backend.load_dialects(context)
-                module = src.make_ir(target, opts, backend.get_codegen_implementation(opts), backend.get_module_map(), context)
+                with _probe.frontend():  # (an instrumented build's probes, with the ids every run of the frontend gives them)
+                    module = src.make_ir(target, opts, backend.get_codegen_implementation(opts), backend.get_module_map(), context)
                 return str(module.str_nodebug())
             finally:
                 context.disable_multithreading()
@@ -318,7 +319,7 @@ def recording_source(ASTSource: Any) -> Any:
         def make_ir(self, target: Any, options: Any, codegen_fns: Any, module_map: Any, context: Any) -> Any:
             # (TILEFISH_DEBUG_PATHS=absolute keeps Triton's absolute paths, for a profiler: not reproducible, _source.debug_paths)
             naming = contextlib.nullcontext() if _source.debug_paths() == "absolute" else host_independent_paths()
-            with naming:
+            with naming, _probe.frontend():
                 module = super().make_ir(target, options, codegen_fns, module_map, context)
             self.ir_text = str(module.str_nodebug())  # before the passes of the first stage change the module in place
             return module

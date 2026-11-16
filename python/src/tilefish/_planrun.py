@@ -82,7 +82,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from . import _plan, runtime
+from . import _plan, _probe, runtime
 from ._build import check_launch_config
 from ._launch import (
     TORCH_DTYPE_NAMES,
@@ -523,8 +523,13 @@ class TorchBackend(Backend):
                     load(loaded.function)
         return loaded
 
-    def launch(self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int, scratch: "int | None" = None) -> None:
-        loaded.launch(grid, args, stream, scratch=scratch)
+    def launch(
+        self, loaded: Any, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int, scratch: "int | None" = None, probes: "int | None" = None
+    ) -> None:
+        if probes is None:
+            loaded.launch(grid, args, stream, scratch=scratch)
+        else:
+            loaded.launch(grid, args, stream, scratch=scratch, probes=probes)
 
     def encode_tensor_map(self, arguments: Any) -> bytes:
         from . import _cuda
@@ -585,10 +590,14 @@ class TorchBackend(Backend):
 
 
 class JitProvider:
-    """The binaries ``jit`` builds: the current source through its compile spec, in memory; a GEMM pinned in memory the way ``export`` pins it."""
+    """The binaries ``jit`` builds: the current source through its compile spec, in memory (the instrumented variant with ``instrument``); a GEMM
+    pinned in memory the way ``export`` pins it."""
+
+    def __init__(self, instrument: "Any" = None) -> None:
+        self.instrument = instrument
 
     def kernel(self, callee: _plan.Callee, spec: Any, index: int) -> Any:
-        return runtime.jit_built(callee.target, spec, index)
+        return runtime.jit_built(callee.target, spec, index, self.instrument)
 
     def pin(self, spec: Any, index: int) -> Any:
         return runtime.jit_pin(spec, index)
@@ -714,6 +723,17 @@ def _is_conv_spec(spec: Any) -> bool:
     return isinstance(spec, _conv.ConvSpec)
 
 
+@dataclass(frozen=True)
+class _ProbeStep:
+    """Where an instrumented step's records go (``docs/instrument.md``): ``offset`` bytes into the bucket's probe region, ``nbytes`` of them, for the
+    CUDA grid of its launch at the bucket; ``built`` is its binary (whose ``instrument`` says the capacity and the probes)."""
+
+    offset: int
+    nbytes: int
+    cuda_grid: "tuple[int, int, int]"
+    built: Any
+
+
 @dataclass
 class _StepRT:
     bound: "Bound | _CopyBound | _MemsetBound"
@@ -721,6 +741,7 @@ class _StepRT:
     order: "tuple[tuple[str, str], ...]"  # (kind, name) of the arguments of a launch, in the ABI's order
     algo: Any  # the pinned algorithm of a GEMM step (its hex), the BuiltConv of a convolution step; None for the other steps
     workspace: "str | None"
+    probe: "_ProbeStep | None" = None  # an instrumented binary of an instrumented runner: where its records go
 
 
 @dataclass
@@ -732,6 +753,10 @@ class _BucketRT:
     # and the ones they write (which hold this bucket's shape after the execution)
     carried_reads: "tuple[str, ...]" = ()
     carried_writes: "tuple[str, ...]" = ()
+    # an instrumented runner: the bytes of the probe region of the bucket (every instrumented step's records, at 256-byte aligned offsets) and the
+    # region itself, ``(handle, address)``, allocated with the bucket's binaries (outside any capture, like the arena); ``None`` when no step records
+    probe_bytes: int = 0
+    probe_region: "tuple[Any, int] | None" = None
 
 
 @dataclass
@@ -758,6 +783,9 @@ class _Call:
     # per step, its TMA descriptors by argument name (a TensorMapArg each), encoded from the checked tensors of this call: a run launches with them, and a
     # captured graph holds their bytes (a descriptor is a function of the addresses, shapes and strides the call binds, which a graph holds too)
     descs: "list[dict[str, Any]]" = dataclasses.field(default_factory=list)
+    # probes= of the call: per step the address of its records (None: a step that records nothing), and the tensor they are in
+    probes: "list[int | None]" = dataclasses.field(default_factory=list)
+    probe_tensor: Any = None
 
 
 def _ordered(be: Backend, arena: _Arena, stream: int, capturing: bool, work: Any) -> None:
@@ -913,10 +941,17 @@ class PlanRunner:
     :class:`SharedArena`, which several plans use one at a time, and where its carried buffers are (:class:`~tilefish._plan.CarriedLayout`)."""
 
     def __init__(
-        self, plan: Plan, provider: Any, backend: "Backend | None" = None, *, arena: "tuple[str, _plan.CarriedLayout] | None" = None
+        self,
+        plan: Plan,
+        provider: Any,
+        backend: "Backend | None" = None,
+        *,
+        arena: "tuple[str, _plan.CarriedLayout] | None" = None,
+        instrumented: bool = False,
     ) -> None:
         self.plan = plan
         self.provider = provider
+        self.instrumented = instrumented  # its binaries may record probes (docs/instrument.md): each bucket gets a probe region for them
         self._backend = backend
         self._doc = plan._doc
         self._buffers = {b["name"]: b for b in self._doc["buffers"]}
@@ -1029,6 +1064,7 @@ class PlanRunner:
         shapes = _plan.buffer_shapes(doc, values)
         callees = self.plan._callees
         steps: "list[_StepRT]" = []
+        probe_bytes = 0
         for i, st in enumerate(steps_doc):
             if st["kind"] == "copy":  # a device-to-device copy: no binary to build or load
                 steps.append(_StepRT(_CopyBound.of(st["args"], shapes), None, (), None, None))
@@ -1063,6 +1099,12 @@ class PlanRunner:
                 order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "tensordesc", "scalar", "given"))
                 loaded = be.load(built, index)
                 be.check_grid(loaded, bound.grid)
+                probe = None
+                if self.instrumented and getattr(built, "instrument", None) is not None:  # its records: a region of the bucket's probe region
+                    cuda_grid = tuple(loaded.launch_grid(bound.grid))
+                    nbytes = _probe.buffer_bytes(int(built.instrument["capacity"]), -(-built.block[0] // 32), math.prod(cuda_grid))
+                    probe = _ProbeStep(-(-probe_bytes // 256) * 256, nbytes, cuda_grid, built)  # type: ignore[arg-type]
+                    probe_bytes = probe.offset + nbytes
                 ws = st.get("workspace")  # a kernel with a global scratch: the workspace of the arena, every CTA of the launch its share
                 if (ws is None) != (bound.spec.global_scratch == 0):
                     raise TilefishManifestError(
@@ -1073,19 +1115,27 @@ class PlanRunner:
                     need = loaded.scratch_bytes(bound.grid)  # (of the programs a persistent grid runs on the SMs it was loaded for)
                     if shapes[ws][1][0] < need:
                         raise TilefishManifestError(f"{where}: the workspace '{ws}' has {shapes[ws][1][0]} bytes, but the global scratch of the launch is {need}")
-                steps.append(_StepRT(bound, loaded, order, None, ws))
+                steps.append(_StepRT(bound, loaded, order, None, ws, probe))
         be.warm(index, self.has_library)
-        return _BucketRT(dict(values), shapes, steps, *self._carried_uses)
+        rt = _BucketRT(dict(values), shapes, steps, *self._carried_uses)
+        if probe_bytes:  # the probe region of the bucket: allocated here, as the arena is, outside any capture (a captured graph holds its address)
+            rt.probe_bytes = probe_bytes
+            rt.probe_region = be.alloc_arena(probe_bytes, index)
+        return rt
 
     # -- running ----------------------------------------------------------------------------------------------------------------
 
-    def run(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None, taps: Any = None) -> Any:
+    def run(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", outputs: Any = None, taps: Any = None, probes: Any = None) -> Any:
         be = self.backend
         bound = self._bind(args, kwargs)
         index = bound.index
         with _gate.shared():
             capturing = be.capturing(index)
-            call = self._call(bound, outputs, slots_in_graph=capturing, taps=taps)
+            if capturing and probes is not None:
+                raise TilefishRuntimeError(
+                    "probes= reads the records back after the run, which a capture does not run: use tilefish.capture(..., probes=...) and CapturedPlan.collect()"
+                )
+            call = self._call(bound, outputs, slots_in_graph=capturing, taps=taps, probes=probes)
             arena = call.arena
             with arena.lock, be.scope(index):
                 stream = be.stream(index)
@@ -1099,7 +1149,33 @@ class PlanRunner:
                     done = True
                 finally:
                     _carried_written(arena, call.rt, done)
+            if probes is not None:
+                with be.scope(index):
+                    self.collect(call, probes)
         return runtime._result(call.results)
+
+    def collect(self, call: "_Call", probes: Any) -> None:
+        """Read back the records of every instrumented step of an executed call into ``probes`` (a :class:`tilefish.Probes`), after the stream it ran on."""
+        digest = getattr(getattr(self.provider, "manifest", None), "digest", None)
+        for i, st in enumerate(call.rt.steps):
+            address = call.probes[i] if call.probes else None
+            if st.probe is None or address is None:
+                continue
+            built = st.probe.built
+            probes.collect(
+                call.probe_tensor,
+                address,
+                built=built,
+                grid=st.probe.cuda_grid,
+                block=built.block,
+                stem=built.stem,
+                arch=built.arch,
+                op=st.bound.spec.op,  # type: ignore[union-attr]
+                graph=self.plan.name,
+                step=i,
+                bucket=call.rt.values,
+                manifest_digest=digest,
+            )
 
     def profile(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", *, reps: int, warmup: int, method: str) -> "dict[str, Any]":
         """The device time of every step of the bucket the arguments select (:func:`tilefish.profile_plan`): ``{"steps": [[µs per rep] per step],
@@ -1337,7 +1413,7 @@ class PlanRunner:
             equations.extend((p.name, axis, pattern, actual, str(p.type), "dimension") for axis, (pattern, actual) in enumerate(zip(p.type.shape, info.shape)))
         return Call(tensors, infos, {}, {}), equations
 
-    def _call(self, bound: "_BoundCall", outputs: Any, slots_in_graph: bool, taps: Any = None) -> "_Call":
+    def _call(self, bound: "_BoundCall", outputs: Any, slots_in_graph: bool, taps: Any = None, probes: Any = None) -> "_Call":
         """The bucket's binaries and the arena (made the first time, outside a capture), the outputs (the caller's, or allocated), the address of every
         buffer, and **every precondition of every step**, all before anything is enqueued. ``slots_in_graph``: the writes of the device scalars are captured
         in a ``torch.cuda.graph``, so a host value is refused (a captured copy of it would freeze it). Called with the gate held shared."""
@@ -1393,7 +1469,19 @@ class PlanRunner:
                     )
                 slots.append((b, source, on_device))
         results = [t for _, t in sorted(made, key=lambda p: p[0])]
-        return _Call(rt, arena, checked, bases, slots, results, self._taps(taps, rt, bases, arena, index), descs)
+        call = _Call(rt, arena, checked, bases, slots, results, self._taps(taps, rt, bases, arena, index), descs)
+        if probes is not None:  # the records of each instrumented step: in the bucket's probe region, or in the caller's buffer
+            if not self.instrumented:  # pragma: no cover - run_graph gives probes= to an instrumented runner only
+                raise TilefishRuntimeError(f"the plan of graph '{self.plan.name}' was not loaded with probes: run it with probes= from the start")
+            if probes.buffer is not None:
+                tensor, base = probes.region(rt.probe_bytes, index)
+            elif rt.probe_region is not None:
+                tensor, base = rt.probe_region
+            else:
+                tensor, base = None, 0
+            call.probes = [base + st.probe.offset if st.probe is not None and tensor is not None else None for st in rt.steps]
+            call.probe_tensor = tensor
+        return call
 
     def _descriptors(self, st: "_StepRT", real: Any) -> "dict[str, Any]":
         """The TMA descriptors of a checked kernel step (``real``: its tensors with the addresses of the call), by argument name: each encoded from
@@ -1413,13 +1501,20 @@ class PlanRunner:
         taps = iter(call.taps)  # sorted by the step they follow
         tap = next(taps, None)
         for i, (st, real) in enumerate(zip(call.rt.steps, call.checked)):
-            self._enqueue_step(st, real, call.bases, stream, index, call.descs[i] if call.descs else {})
+            self._enqueue_step(st, real, call.bases, stream, index, call.descs[i] if call.descs else {}, call.probes[i] if call.probes else None)
             while tap is not None and tap.after == i:  # a debug tap: the buffer as this step left it, copied out before the next step may reuse its bytes
                 be.copy(tap.dst, call.bases[tap.buffer], tap.nbytes, stream)
                 tap = next(taps, None)
 
     def _enqueue_step(
-        self, st: "_StepRT", real: Any, bases: "Mapping[str, int]", stream: int, index: int, descs: "Mapping[str, Any] | None" = None
+        self,
+        st: "_StepRT",
+        real: Any,
+        bases: "Mapping[str, int]",
+        stream: int,
+        index: int,
+        descs: "Mapping[str, Any] | None" = None,
+        probes: "int | None" = None,
     ) -> None:
         """Enqueue one checked step (``real``: what its ``check`` returned with the real addresses; ``descs``: its encoded TMA descriptors) on ``stream``."""
         be = self.backend
@@ -1446,10 +1541,11 @@ class PlanRunner:
                     launch_args.append(("tensordesc", (descs or {})[n]))
                 else:
                     launch_args.append((kind, st.bound.scalars[n]))
+            extra = {"probes": probes} if probes is not None else {}  # (an instrumented step: its probe buffer in the profile scratch slot)
             if st.workspace is None:
-                be.launch(st.loaded, st.bound.grid, launch_args, stream)
+                be.launch(st.loaded, st.bound.grid, launch_args, stream, **extra)
             else:  # the global scratch of the kernel: the arena's workspace
-                be.launch(st.loaded, st.bound.grid, launch_args, stream, scratch=bases[st.workspace])
+                be.launch(st.loaded, st.bound.grid, launch_args, stream, scratch=bases[st.workspace], **extra)
 
     def _written(self, st: "_StepRT") -> "set[str]":
         """The buffers a step writes: a copy's or a memset's destination, a GEMM's ``out``, the ``out`` and ``inout`` pointers of a kernel."""
@@ -1524,7 +1620,9 @@ class PlanRunner:
             )
         arena.captured = (capture, stream)
 
-    def capture(self, externals: "tuple[Any, ...]", devscalars: "Mapping[str, Any]", outputs: Any, stream: Any, taps: Any = None) -> "CapturedPlan":
+    def capture(
+        self, externals: "tuple[Any, ...]", devscalars: "Mapping[str, Any]", outputs: Any, stream: Any, taps: Any = None, probes: Any = None
+    ) -> "CapturedPlan":
         """:func:`capture` of this runner's plan (see there)."""
         be = self.backend
         sig = self.plan.graph.signature
@@ -1555,13 +1653,15 @@ class PlanRunner:
                     "tilefish.capture makes a CUDA graph of its own and is called outside a capture (the current stream is capturing one): to capture a plan in a "
                     "graph of yours, call tilefish.run inside torch.cuda.graph (see the docs for how its replays are ordered)"
                 )
-            call = self._call(bound, outputs, slots_in_graph=False, taps=taps)
+            call = self._call(bound, outputs, slots_in_graph=False, taps=taps, probes=probes)
             arena = call.arena
             epoch = _epoch[0]
             with arena.lock, be.scope(index):  # no other run of the plan is enqueued while the graph is captured
                 graph = be.capture_graph(index, stream, lambda s: self._enqueue(call, s, index, slots=False))
         held = tuple(bound.call.tensors.values()) + tuple(call.results) + tuple(t.tensor for t in call.taps)
-        return CapturedPlan(self, graph, call, index, epoch, held)
+        captured = CapturedPlan(self, graph, call, index, epoch, held)
+        captured.probes = probes
+        return captured
 
     def _given_outputs(self, outputs: Any, names: "Sequence[str]") -> "list[Any] | None":
         if outputs is None:
@@ -1741,6 +1841,19 @@ class CapturedPlan:
         self._slots = [(b, _host_copy(s, on_device), on_device) for b, s, on_device in call.slots]  # (buffer, source, on_device) of every device scalar: written before every replay
         self.outputs = runtime._result(list(call.results))  # what the graph writes its returned values into (the caller's outputs=, or allocated by capture)
         self.bucket = dict(call.rt.values)
+        self.probes: Any = None  # tilefish.capture(..., probes=): the recorder collect() reads the records into
+
+    def collect(self, probes: Any = None) -> None:
+        """Read the records the last replay of an instrumented plan made (``tilefish.capture(..., probes=rec)``, ``docs/instrument.md``) into
+        ``probes`` (default: the recorder given to the capture). Waits for the device to finish what was enqueued."""
+        rec = probes if probes is not None else self.probes
+        if rec is None or not self._call.probes:
+            raise TilefishRuntimeError("CapturedPlan.collect: the plan was captured without probes= (tilefish.capture(..., probes=tilefish.Probes()))")
+        be = self._runner.backend
+        with be.scope(self._index):
+            be.synchronize_stream(be.stream(self._index))
+            runtime._torch().cuda.synchronize(self._index)
+            self._runner.collect(self._call, rec)
 
     def __repr__(self) -> str:
         return f"CapturedPlan(graph={self._runner.plan.name!r}, bucket={self.bucket}, devscalars={[b['name'] for b, _, _ in self._slots]})"
@@ -1854,9 +1967,16 @@ def _default_plan(graph: GraphOp) -> Plan:
     return p
 
 
-def _jit_runner(p: Plan) -> PlanRunner:
-    """The runner of a plan that ``jit`` runs, kept on the plan (a plan and its runner are freed together; the arena is in the backend's registry)."""
+def _jit_runner(p: Plan, instrument: Any = None) -> PlanRunner:
+    """The runner of a plan that ``jit`` runs, kept on the plan (a plan and its runner are freed together; the arena is in the backend's registry). With
+    ``instrument`` (a run with ``probes=``): the runner of the instrumented variant, one per setting, kept on the plan too."""
     with _lock:
+        if instrument is not None:
+            runners = p.__dict__.setdefault("_tf_probe_runners", {})
+            r = runners.get(instrument)
+            if r is None:
+                r = runners[instrument] = PlanRunner(p, JitProvider(instrument), instrumented=True)
+            return r
         r = p._jit_runner
         if r is None:
             r = p._jit_runner = PlanRunner(p, JitProvider())
@@ -1878,14 +1998,14 @@ def directory_has_set(path: pathlib.Path) -> bool:
     return (directory / _plan.PLAN_SET_NAME).is_file()
 
 
-def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory: bool) -> PlanRunner:
+def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory: bool, instrumented: bool = False) -> PlanRunner:
     _plan.check_anchor(pin, trust_directory)
     try:
         p = pathlib.Path(path)
     except TypeError:
         raise TilefishRuntimeError(f"plan= takes a directory (or its plan.json) for replay, got {path!r}") from None
     where, stamp = _directory_stamp(p)
-    key = (where, id(graph))  # one runner per directory and graph: a directory that changed replaces it (its arena stays: a CUDA graph may hold it)
+    key = (where, id(graph), instrumented)  # one runner per directory and graph: a directory that changed replaces it (its arena stays: a CUDA graph may hold it)
     with _lock:
         found = _loaded.get(key)
     if found is not None and found[0] == stamp and found[1].graph is graph:
@@ -1898,8 +2018,13 @@ def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory
                 )
         elif (pin is not None) == runner.provider.pinned:  # a load with the other trust anchor is made again: the manifest's `pinned` differs
             return runner
-    loaded = _plan.load_plan(p, graph, pin=pin, trust_directory=trust_directory)
-    runner = PlanRunner(loaded, ReplayProvider(loaded.manifest, pinned=pin is not None))
+    loaded = _plan.load_plan(p, graph, pin=pin, trust_directory=trust_directory, instrumented=instrumented)
+    if instrumented and not loaded.manifest.instrumented:
+        raise TilefishManifestError(
+            f"probes= replays the plan of an instrumented export (tilefish.runtime.export(graph, directory, instrument=True), docs/instrument.md), and "
+            f"the plan in {str(loaded.directory)!r} is of a production one, whose binaries record nothing"
+        )
+    runner = PlanRunner(loaded, ReplayProvider(loaded.manifest, pinned=pin is not None), instrumented=instrumented)
     with _lock:
         _loaded[key] = (stamp, loaded, runner)
     return runner
@@ -1916,12 +2041,14 @@ def run_graph(
     trust_directory: bool = False,
     outputs: Any = None,
     taps: Any = None,
+    probes: Any = None,
 ) -> Any:
     """``tilefish.run`` of a graph (see :func:`tilefish.run`)."""
     if mode == "reference":
-        if plan is not None or outputs is not None or taps is not None:
-            raise TilefishRuntimeError("plan=, outputs= and taps= are for jit and replay of a graph; reference mode evaluates the ops in torch and returns fresh tensors")
+        if plan is not None or outputs is not None or taps is not None or probes is not None:
+            raise TilefishRuntimeError("plan=, outputs=, taps= and probes= are for jit and replay of a graph; reference mode evaluates the ops in torch and returns fresh tensors")
         return reference_run(graph, args, kwargs)
+    instrument = probes.instrument if probes is not None else None
     if mode == "jit":
         if isinstance(plan, Plan):
             p = plan
@@ -1931,8 +2058,8 @@ def run_graph(
             p = _default_plan(graph)
         else:
             raise TilefishRuntimeError("jit takes plan=<a Plan made by tilefish.plan(graph, ...)> or none; a directory is for mode='replay'")
-        return _jit_runner(p).run(args, kwargs, outputs, taps)
-    return _replay_runner(graph, _plan_directory(plan), pin, trust_directory).run(args, kwargs, outputs, taps)
+        return _jit_runner(p, instrument).run(args, kwargs, outputs, taps, probes)
+    return _replay_runner(graph, _plan_directory(plan), pin, trust_directory, probes is not None).run(args, kwargs, outputs, taps, probes)
 
 
 def capture(
@@ -1947,6 +2074,7 @@ def capture(
     outputs: Any = None,
     stream: Any = None,
     taps: Any = None,
+    probes: Any = None,
 ) -> CapturedPlan:
     """:func:`tilefish.capture`: the plan of ``graph`` (``jit`` or ``replay``, chosen as by :func:`tilefish.run`) captured in a CUDA graph of its own for the
     externals given, as a :class:`CapturedPlan` whose :meth:`~CapturedPlan.replay` is ordered with every other run of the plan.
@@ -1962,19 +2090,20 @@ def capture(
     if mode == "jit":
         if pin is not None or trust_directory:
             raise TilefishRuntimeError("pin= and trust_directory= are for mode='replay' (they vouch for a plan directory); mode 'jit' runs no plan directory")
+        instrument = probes.instrument if probes is not None else None
         if isinstance(plan, Plan):
             if plan.graph is not graph:
                 raise TilefishRuntimeError(f"plan= is the plan of graph '{plan.name}', not of '{graph.name}'")
-            runner = _jit_runner(plan)
+            runner = _jit_runner(plan, instrument)
         elif plan is None:
-            runner = _jit_runner(_default_plan(graph))
+            runner = _jit_runner(_default_plan(graph), instrument)
         else:
             raise TilefishRuntimeError("jit takes plan=<a Plan made by tilefish.plan(graph, ...)> or none; a directory is for mode='replay'")
     else:
         if trust_directory is not True and trust_directory is not False:
             raise TilefishRuntimeError(f"trust_directory= is True or False, got {trust_directory!r}")
-        runner = _replay_runner(graph, _plan_directory(plan), pin, trust_directory)
-    return runner.capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream, taps)
+        runner = _replay_runner(graph, _plan_directory(plan), pin, trust_directory, probes is not None)
+    return runner.capture(tuple(externals), {} if devscalars is None else devscalars, outputs, stream, taps, probes)
 
 
 def _runner_for(graph: GraphOp, what: str, mode: str, plan: Any, pin: "str | None", trust_directory: bool) -> PlanRunner:
@@ -2388,6 +2517,7 @@ def export_graph(
     reuse: bool,
     verify: "bool | None" = None,
     trace: bool = False,
+    instrument: Any = None,
 ) -> Plan:
     """:func:`tilefish.runtime.export` of a graph: build the binary of every step (and pin every GEMM), write the manifest (merged into one that is
     already there) and ``plan.json`` next to it, read both back, and return the plan loaded from the directory, which has the digest to pin.
@@ -2403,20 +2533,23 @@ def export_graph(
     else:
         cap = parse_arch(arch)
     checked = _verify_fusion(graph, p, cap, verify)
-    built, pinned, traces = _build_callees(sorted(p.callees.items(), key=lambda kv: kv[0]), cap, trace, at=True)
+    built, pinned, traces = _build_callees(sorted(p.callees.items(), key=lambda kv: kv[0]), cap, trace, at=True, instrument=instrument)
     written = write_export(p, built, pinned, directory, cap, overwrite)
     _write_fusion_report(graph, directory, checked)
     if trace:
         from . import _trace
         from ._manifest import Manifest
 
-        _trace.write(directory, traces, Manifest.load(directory), [(graph, written, PLAN_NAME)])
+        _trace.write(directory, traces, Manifest.load(directory, instrumented=True), [(graph, written, PLAN_NAME)])
     return written
 
 
-def _build_callees(callees: "Sequence[tuple[str, Any]]", cap: int, trace: bool, at: bool) -> "tuple[list, list, list]":
+def _build_callees(
+    callees: "Sequence[tuple[str, Any]]", cap: int, trace: bool, at: bool, instrument: Any = None
+) -> "tuple[list, list, list]":
     """Build (or pin) the binary of every ``(stem, callee)`` for ``sm_<cap>`` (``at``: take the callee's implementation of the architecture first);
-    with ``trace``, keep every level of each compile and the trace items (:mod:`tilefish._trace`)."""
+    with ``trace``, keep every level of each compile and the trace items (:mod:`tilefish._trace`); with ``instrument``, the instrumented variant of
+    every Triton binary of an operator it covers (``docs/instrument.md``)."""
     from ._build import build
     from ._binary import build_binary
 
@@ -2435,7 +2568,8 @@ def _build_callees(callees: "Sequence[tuple[str, Any]]", cap: int, trace: bool, 
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         else:
             jit = callee.target.jit_function(spec)
-            built.append(build(spec, arch=cap, fn=jit, stages=trace))
+            cfg = instrument if instrument is not None and instrument.covers(spec.op) else None
+            built.append(build(spec, arch=cap, fn=jit, stages=trace, instrument=cfg))
         if trace:
             from . import _trace
 
@@ -2495,7 +2629,7 @@ def write_export(p: Plan, built: "Sequence[Any]", pinned: "Sequence[Any]", direc
     path, written = write_manifest_doc(
         built, directory / MANIFEST_NAME, cubins=True, merge=True, overwrite=overwrite, library=pinned
     )
-    loaded = Manifest.load(path)
+    loaded = Manifest.load(path, instrumented=True)  # (what this export wrote: either variant, never the two merged)
     expected = manifest_digest(written)
     if loaded.digest != expected:
         raise TilefishManifestError(
@@ -2506,7 +2640,7 @@ def write_export(p: Plan, built: "Sequence[Any]", pinned: "Sequence[Any]", direc
     _plan.validate_doc(final._doc)
     _plan.check_against_manifest(final._doc, loaded)
     write_file(plan_path, final.to_json().encode("utf-8"))
-    return _plan.load_plan(plan_path, p.graph, pin=final.digest)
+    return _plan.load_plan(plan_path, p.graph, pin=final.digest, instrumented=True)
 
 
 def _graph_and_buckets(item: Any) -> "tuple[GraphOp, Any]":
@@ -2525,6 +2659,7 @@ def export_graphs(
     reuse: bool,
     verify: "bool | None" = None,
     trace: bool = False,
+    instrument: Any = None,
 ) -> "_plan.PlanSet":
     """:func:`tilefish.runtime.export` of several graphs: a **plan set**, one manifest for all of them (each binary built once, whichever plans
     launch it), ``<graph>.plan.json`` per graph and the index ``plans.json`` (``docs/plan-schema-1.md``, section 15). An item is a graph, or
@@ -2555,7 +2690,7 @@ def export_graphs(
             other = callees.setdefault(stem, callee)
             if other is not callee and callee.by_stem[stem] != other.by_stem[stem]:
                 raise TilefishRuntimeError(f"two plans of the set launch different binaries under one name '{stem}': rename one of the operators")
-    built, pinned, traces = _build_callees(sorted(callees.items(), key=lambda kv: kv[0]), cap, trace, at=False)
+    built, pinned, traces = _build_callees(sorted(callees.items(), key=lambda kv: kv[0]), cap, trace, at=False, instrument=instrument)
     written = write_plan_set(plans, built, pinned, directory, cap, overwrite)
     for p in plans:
         _write_fusion_report(p.graph, directory, checked[p.name])
@@ -2564,7 +2699,7 @@ def export_graphs(
         from ._manifest import Manifest
 
         graphs = [(p.graph, written.plans[p.name] if hasattr(written, "plans") else p, _plan.plan_file_name(p.name)) for p in plans]
-        _trace.write(directory, traces, Manifest.load(directory), graphs)
+        _trace.write(directory, traces, Manifest.load(directory, instrumented=True), graphs)
     return written
 
 
@@ -2581,7 +2716,7 @@ def write_plan_set(
     if (directory / PLAN_NAME).exists() and not overwrite:
         raise TilefishManifestError(f"{str(directory)!r} holds the plan of one graph (plan.json): a plan set goes to another directory (or pass overwrite=True)")
     path, written = write_manifest_doc(built, directory / MANIFEST_NAME, cubins=True, merge=True, overwrite=overwrite, library=pinned)
-    loaded = Manifest.load(path)
+    loaded = Manifest.load(path, instrumented=True)
     if loaded.digest != manifest_digest(written):
         raise TilefishManifestError(f"the manifest in {str(path.parent)!r} changed while the plan set was being exported")
     digests: "dict[str, str]" = {}
@@ -2602,7 +2737,7 @@ def write_plan_set(
     _plan.validate_set(index)
     write_file(directory / _plan.PLAN_SET_NAME, (json.dumps(index, indent=2) + "\n").encode("utf-8"))
     doc = _plan.read_plan_set(directory, pin=index["set_digest"])
-    back = {p.name: _plan.load_plan(directory, p.graph, pin=index["set_digest"]) for p in plans}
+    back = {p.name: _plan.load_plan(directory, p.graph, pin=index["set_digest"], instrumented=True) for p in plans}
     return _plan.PlanSet(doc, directory, back)
 
 

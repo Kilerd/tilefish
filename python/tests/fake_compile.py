@@ -220,6 +220,11 @@ class FakeCompiler:
         self.languages.append(src.language)
         module = src.make_ir(target, types.SimpleNamespace(**options), {}, {}, FakeContext())
         text = module.str_nodebug() + repr(sorted(options.items())) + repr(target.arch)
+        from tilefish import _probe
+
+        instrumented = _probe.active()  # an instrumented build: Triton's PTX stage is rewritten (tilefish._probe.install_stage_hook)
+        if instrumented is not None:
+            text += f"probes{instrumented.capacity}"
         ttgir = f"module {{\n  tt.func public @tf_k() {{\n{WARP_SPECIALIZE_TTGIR if self.total_warps else ''}{self.ttgir_body}    tt.return\n  }}\n}}\n"
         code = hashlib.sha256((text + (f"ws{self.total_warps}" if self.total_warps else "")).encode()).digest() * 2
         md = types.SimpleNamespace(
@@ -238,6 +243,8 @@ class FakeCompiler:
             md.num_warps = self.total_warps if self.total_warps is not None else self.metadata_warps
         reqntid = 32 * md.num_warps if self.reqntid == "block" else self.reqntid
         ptx = ptx_of(src.signature, target.arch, reqntid) + self.ptx_body
+        if instrumented is not None:
+            ptx = _probe.rewrite_ptx_stage(ptx + "\tret;\n}\n")
         cubin = cubin_like(code=code, shared=1024, debug=module.file_name, **arch_header(target.arch))
         asm = {"cubin": cubin, "ptx": ptx, "ttgir": ttgir, **({"ttir": self.ttir} if self.ttir is not None else {})}
         return types.SimpleNamespace(metadata=md, asm=asm)

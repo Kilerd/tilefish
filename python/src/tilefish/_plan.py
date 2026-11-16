@@ -1851,7 +1851,9 @@ def check_anchor(pin: "str | None", trust_directory: bool) -> None:
         )
 
 
-def load_plan(path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" = None, trust_directory: bool = False) -> Plan:
+def load_plan(
+    path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" = None, trust_directory: bool = False, instrumented: bool = False
+) -> Plan:
     """Load the plan of ``graph`` from an exported directory (or its ``plan.json``) for a replay, and refuse everything that is not it.
 
     The plan needs a trust anchor like a manifest does: ``pin`` (the digest of the plan, :attr:`Plan.digest`, which pins the manifest it was built
@@ -1860,7 +1862,7 @@ def load_plan(path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" =
     its digest must be the ``manifest_digest`` the plan names; every step must be what the manifest's entries say (:func:`check_against_manifest`);
     and the document must be exactly the plan this process derives from ``graph`` for the same buckets (:meth:`Plan.stale_reason`): a graph that
     changed since the export is refused, as a kernel that changed is. Raises :class:`~tilefish.errors.TilefishManifestError` (a
-    :class:`~tilefish.errors.TilefishRuntimeError`).
+    :class:`~tilefish.errors.TilefishRuntimeError`). The plan of an instrumented export (``docs/instrument.md``) is refused unless ``instrumented=True``.
     """
     from ._manifest import Manifest
 
@@ -1887,7 +1889,7 @@ def load_plan(path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" =
         raise TilefishManifestError(f"the plan in {str(directory)!r} is the plan of graph '{doc['graph']}', not of '{graph.graph.name}'")
     if set_pin is not None and doc["manifest_digest"] != index["manifest_digest"]:
         raise TilefishManifestError(f"the plan of graph '{graph.graph.name}' was built against the manifest {doc['manifest_digest']}, not the one of its plan set")
-    manifest = Manifest.load(directory)
+    manifest = Manifest.load(directory, instrumented=instrumented)
     check_against_manifest(doc, manifest)
     try:
         derived = plan(graph, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"])

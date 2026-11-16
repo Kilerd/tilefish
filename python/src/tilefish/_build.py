@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
 from ._elf import parse_elf, code_digest
-from . import _ir, _source
+from . import _ir, _probe, _source
 from ._specvalid import IMPLEMENTATION_FALLBACK, stride_of_json
 from .errors import TilefishBuildError, TilefishManifestError
 
@@ -535,6 +535,9 @@ class BuiltKernel:
     # how the declaration's SASS assertions were judged (``tilefish.sass``): ``None`` with none, else what was read: ``"its PTX and its ELF file"``,
     # or where the SASS came from (its own, or a re-assembly for the family base whose code is the binary's). Not in any digest or manifest.
     sass_checked: "str | None" = None
+    # an instrumented build (``build(..., instrument=...)``, :mod:`tilefish._probe`): the ``instrument`` of its manifest entry (the record format, the
+    # records each warp keeps, the kernel's probes and where each is written); ``None`` for a production build, which has no probe
+    instrument: "dict[str, Any] | None" = None
 
     @property
     def stem(self) -> str:
@@ -979,6 +982,7 @@ def build(
     ir_digest: "str | None" = None,
     cache: bool = True,
     stages: bool = False,
+    instrument: "_probe.Instrument | None" = None,
 ) -> BuiltKernel:
     """Compile one spec to a cubin for ``arch`` (``"sm_103"`` or ``103``) with Triton.
 
@@ -1045,6 +1049,11 @@ def build(
     an export with ``trace=True`` writes next to the manifest (:mod:`tilefish._trace`). The cache holds binaries, not their IR, so such a build
     compiles (it does not read the cache; it stores its entry): the same bytes as the entry, since a build is reproducible.
 
+    **Instrumented.** ``instrument=`` (a :class:`tilefish._probe.Instrument`) builds the instrumented variant (``docs/instrument.md``): the kernel's
+    ``tilefish.probe`` calls become records, the PTX of its entry gets ``@begin``, ``@calib`` and ``@end``, and the result's ``instrument`` is the
+    ``instrument`` of its manifest entry. Its IR digest is of the IR with the probes, and it neither reads nor writes the build cache. The SASS
+    assertions of the declaration are not judged on it (they are the production binary's); the TF32 guard and the contraction check are.
+
     **Concurrency.** Triton's frontend and compile are not known to be thread-safe, and a compile runs with a knob set that is
     process-wide, so a build holds one lock (:data:`tilefish._ir.LOCK`) for the *whole* compile, not only for the frontend. That is
     a latency trade-off: while one thread compiles (seconds, for a large kernel), every other thread's build, ``jit`` call and
@@ -1066,7 +1075,8 @@ def build(
 
     files = _cache.compile_files(opts)  # refuses ir_override; the sha256 of the files the options name (extern_libs)
     what = f"'{spec.stem}' ({spec.triton})"
-    frontend_ir = _ir.ttir_text(jit, inp, arch=cap, options=opts, what=what)
+    with _probe.instrumenting(instrument):  # (an instrumented build's IR has its probes)
+        frontend_ir = _ir.ttir_text(jit, inp, arch=cap, options=opts, what=what)
     digest = _ir.ir_digest(frontend_ir, spec.language)
     if ir_digest is not None and digest != ir_digest:
         raise TilefishBuildError(
@@ -1078,7 +1088,7 @@ def build(
     triton_version, ptxas = str(triton.__version__), ptxas_version()
     environment = _cache.codegen_environment()
     keyed = _cache.keyed_contents(files, environment)  # the content of every file the binary is identified by: hashed again after the compile
-    if cache:
+    if cache and instrument is None:  # (an instrumented variant is a diagnostic build: it is compiled every time, and never served for a production one)
         store = _cache.default_cache()
     if store is not None:
         cache_id = _cache.cache_key(
@@ -1103,8 +1113,10 @@ def build(
 
     src = _ir.recording_source(_ir.source_class(spec.language))(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
     src.constants = inp.constants
+    if instrument is not None:
+        _probe.install_stage_hook()  # (the PTX stage of an instrumented build adds @begin, @calib and @end)
     try:
-        with _always_compile(triton), _ir.ptxas_in_an_empty_directory():
+        with _always_compile(triton), _ir.ptxas_in_an_empty_directory(), _probe.instrumenting(instrument):
             compiled = triton.compile(src, target=GPUTarget("cuda", cap, 32), options=opts)
     except Exception as e:  # noqa: BLE001 - a compile failure of any kind is a build error, with Triton's message
         hint = _ptxas_target_hint(e, triton, ptxas)
@@ -1155,7 +1167,12 @@ def build(
     from hashlib import sha256
 
     check_contraction(spec, cap, ptx, cubin, opts, sha256(cubin).hexdigest())
-    checked = check_sass(spec, cap, cubin, ptx, symbol, opts)
+    entry_instrument = None
+    if instrument is None:
+        checked = check_sass(spec, cap, cubin, ptx, symbol, opts)
+    else:  # the instrumented variant: its probes and where each is written; the declaration's SASS assertions are the production binary's
+        checked = None
+        entry_instrument = _instrumented_entry(spec, instrument, ptx, _text_or_none(asm.get("source")))
 
     target = _PTX_TARGET.search(ptx)
     built = BuiltKernel(
@@ -1177,6 +1194,7 @@ def build(
         warp_specialized=warp_specialized,
         cuda_math=cuda_math,
         sass_checked=checked,
+        instrument=entry_instrument,
     )
     if store is not None:
         store.store(cache_id, built)
@@ -1184,6 +1202,26 @@ def build(
         kept = {k: v for k, v in ((k, _text_or_none(v)) for k, v in asm.items() if k != "cubin") if v is not None}
         built = dataclasses.replace(built, stages=kept)
     return built
+
+
+def _instrumented_entry(spec: "CompileSpec", cfg: "_probe.Instrument", ptx: str, source: "str | None") -> "dict[str, Any]":
+    """The ``instrument`` of the manifest entry of an instrumented build: its PTX must be instrumented (the registers of the probes in its entry),
+    and every probe of the PTX is in the table, with where the frontend's IR says it is written."""
+    if "%tfp_hdr" not in ptx:
+        raise TilefishBuildError(
+            f"'{spec.stem}': the instrumented build's PTX has no probes: Triton did not run the PTX stage tilefish instruments (this Triton's NVIDIA "
+            "backend registers its stages otherwise than 3.5.1's CUDABackend.add_stages)"
+        )
+    sites = _probe.probe_sites(source)
+    known = {s["id"] for s in sites}
+    for pid, name in sorted({(int(m.group(1)), m.group(2)) for m in _PTX_PROBE.finditer(ptx)}):
+        if pid >= _probe.FIRST_ID and pid not in known:  # a probe whose location the IR did not give
+            sites.append({"id": pid, "name": name, "sites": []})
+            known.add(pid)
+    return _probe.entry_field(cfg, sorted(sites, key=lambda s: s["id"]))
+
+
+_PTX_PROBE = re.compile(r"// tilefish\.probe (\d+) ([A-Za-z0-9_.:/\-]+)")
 
 
 # -- the manifest ---------------------------------------------------------------------------------------------------------
@@ -1289,6 +1327,8 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         entry["source_sha256"] = spec_part["source_sha256"]
     if b.cuda_math is not None:  # the CUDA math functions whose bits the binary has, and the libdevice it links (section 4.7, tilefish._cudamath)
         entry["cuda_math"] = json.loads(json.dumps(b.cuda_math))
+    if b.instrument is not None:  # an instrumented build: its probes (section 4.8, tilefish._probe); a production entry never has the field
+        entry["instrument"] = json.loads(json.dumps(b.instrument))
     if b.ir_digest is not None:  # the digest of the Triton IR the binary was compiled from (the field and its kind, so a reader of schema 2 reads it as before)
         entry["source_digest"] = b.ir_digest
         entry["source_digest_kind"] = _ir.digest_kind(b.spec.language)  # the TTIR of a triton.jit kernel, the TTGIR of a Gluon one
@@ -1403,9 +1443,16 @@ def write_manifest_doc(
     refuse_symlink(path)
     targets = [b.cubin_path(path.parent) for b in entries] if cubins else []  # every name is checked before a byte is written
     if merge and path.exists():
-        from ._manifest import Manifest
+        from ._manifest import Manifest, is_instrumented
 
-        existing = Manifest.load(path)
+        existing = Manifest.load(path, instrumented=True)
+        if existing.doc["kernels"] and doc["kernels"] and is_instrumented(existing.doc) != is_instrumented(doc):
+            have, new_kind = ("an instrumented", "a production") if is_instrumented(existing.doc) else ("a production", "an instrumented")
+            raise TilefishManifestError(
+                f"the manifest {str(path)!r} is {have} export, and this export is {new_kind} one: the two variants are never written into one "
+                "manifest (an instrumented binary must never be taken for, or pinned as, the production one). Export the instrumented variant into a "
+                "directory of its own (docs/instrument.md)"
+            )
         new_by_key = dict(zip(keys, doc["kernels"]))
         kept: list[dict[str, Any]] = []
         for old in existing.doc["kernels"]:

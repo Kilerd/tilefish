@@ -108,7 +108,8 @@ def _trace_body(fn: Callable[..., Any], signature: Signature, name: str, kind: s
     ctx.dims = frozenset(d for v in inputs for s in v.type.shape for d in s.free_dims())
     ctx.tracing = True
     try:
-        result = fn(**kwargs)
+        with ctx.running():
+            result = fn(**kwargs)
     except TilefishError as e:
         _name_scope(e, kind, name)
         raise
@@ -145,7 +146,9 @@ def _trace_body(fn: Callable[..., Any], signature: Signature, name: str, kind: s
                     f"{v.name}[...] = value (or pass it to an in-place operator)"
                 )
     finals = {v.name: v.live for v in inputs if v.access == "inout" and v.live is not v}
-    return Graph(name, kind, inputs, consts, ctx.nodes, outputs, ctx.requirements, finals)
+    graph = Graph(name, kind, inputs, consts, ctx.nodes, outputs, ctx.requirements, finals)
+    graph.probes = tuple(ctx.probes)
+    return graph
 
 
 def _name_scope(e: TilefishError, kind: str, name: str) -> None:

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import sys
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+import threading
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
 from .dims import Dim, DimExpr
 from .dtypes import DType
@@ -23,6 +25,7 @@ class _Missing:
 
 
 _MISSING = _Missing()
+_tracing = threading.local()  # .stack: the contexts whose bodies this thread is running (tilefish.probe marks a point of the innermost)
 _PACKAGE = os.path.dirname(os.path.abspath(__file__)) + os.sep  # tilefish's own files: a frame there is not the line an op was written on
 
 
@@ -42,6 +45,12 @@ def _written_at(stop: Any) -> "tuple[str, int] | None":
             return None
         f = f.f_back
     return None
+
+
+def current_context() -> "TraceContext | None":
+    """The trace whose body this thread is running (the innermost), or ``None``."""
+    stack = getattr(_tracing, "stack", None)
+    return stack[-1] if stack else None
 
 
 class TraceContext:
@@ -64,6 +73,20 @@ class TraceContext:
         # whether it is running
         self.body_code: Any = None
         self.tracing = False
+        # the probes of a kernel body (tilefish.probe): (name, the number of nodes emitted before it, the line it was written on)
+        self.probes: "list[tuple[str, int, tuple[str, int] | None]]" = []
+
+    @contextlib.contextmanager
+    def running(self) -> "Iterator[None]":
+        """The block in which this trace's body runs in this thread (what :func:`current_context` returns)."""
+        stack = getattr(_tracing, "stack", None)
+        if stack is None:
+            stack = _tracing.stack = []
+        stack.append(self)
+        try:
+            yield
+        finally:
+            stack.pop()
 
     def new_value(
         self,

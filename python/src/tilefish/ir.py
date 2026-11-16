@@ -166,6 +166,8 @@ class Graph:
         self.requirements = tuple(requirements)
         # The last version of every InOut parameter the body modified, by parameter name.
         self.finals: dict[str, "Value"] = dict(finals or {})
+        # The probes of a kernel body (tilefish.probe, docs/instrument.md): (name, the number of nodes before it, the line it was written on).
+        self.probes: "tuple[tuple[str, int, tuple[str, int] | None], ...]" = ()
 
     @property
     def symbols(self) -> tuple:

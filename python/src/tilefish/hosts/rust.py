@@ -1542,6 +1542,11 @@ def _trusted(manifest: Any, pin: "str | None") -> Manifest:
         return Manifest.load(manifest, pin=pin)
     if not isinstance(manifest, Manifest):
         raise TilefishManifestError(f"emit takes a manifest directory (with pin=) or a pinned Manifest, got {type(manifest).__name__}")
+    if manifest.instrumented:  # a diagnostic variant: the generated hosts are production code (docs/instrument.md)
+        raise TilefishManifestError(
+            f"the manifest in {str(manifest.directory)!r} is an instrumented export, whose binaries record probes: generate a host from the production "
+            "export (an instrumented one is collected with tilefish.run(..., probes=...) or the crate's Manifest::load_instrumented)"
+        )
     if pin is not None:
         return manifest.check_pin(pin)
     if not manifest.pinned:
