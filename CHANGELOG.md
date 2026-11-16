@@ -10,8 +10,9 @@ each section names the release that added it.
 Manifest schema 3 and plan schema 1 are unchanged but for one optional entry field, `instrument`, which only the instrumented variant writes (below).
 An export whose graphs have no arithmetic in their bodies and whose kernels write no `-0.0` scalar writes the same manifest, plans and plan sets as
 0.0.10 (checked: every kernel and plan of the test suite and the Rust and C++ gates but those below, and the plan sets of three ported models
-re-exported); a graph with arithmetic in its body is planned by fusion version 2 now (Breaking). An export of many buckets takes less memory and time,
-every byte the same. The crate gains the readers and launches of the instrumented variant; the C ABI is unchanged and refuses an instrumented export.
+re-exported); a graph with arithmetic in its body is planned by fusion version 2 now (Breaking). An export of many buckets or plans takes less memory
+and time, every byte the same. The crate gains the readers and launches of the instrumented variant; the C ABI is unchanged and refuses an
+instrumented export.
 
 ### Breaking
 
@@ -115,6 +116,11 @@ None of it changes a digest, `sha256`, `sha256_code`, manifest, plan or trace: a
 - **One copy of each binary.** In an export the entries that have the same cubin or PTX share one copy until the manifest is written, and a traced
   export (`trace=True`, `TILEFISH_TRACE=1`) keeps the stages of its builds in a temporary directory, one file per distinct text, until it writes the
   trace (`tilefish._build.export_session`).
+- **A plan set is read back against one manifest.** An export of a plan set read each plan back with a manifest of its own (`_plan.load_plan`
+  loaded the directory's manifest and every binary again for every plan, and each plan kept its copy until the export returned): a set of 1319
+  plans over 147 binaries and 1199 GEMM pins peaked at 54 GB of resident memory and took 10 minutes on an RTX 5090, and was killed at a pod's
+  32 GB on a B300. The plans now share the manifest the export loaded and checked (`load_plan(..., manifest=)`, the same checks): 1.3 GB and
+  4 minutes on the RTX 5090, 1.3 GB and 150 s on the B300, the same files.
 - An export of 132 buckets in three configurations of a Gluon kernel with a large IR (`python/tests/irmem_export.py`, B300): 77 s and 1.27 GB peak
   resident memory before, 9 s and 0.40 GB now (warm cache: 69 s and 1.17 GB before, 2.7 s and 0.25 GB now; traced: 371 s and 2.66 GB before,
   282 s and 0.43 GB now, the same trace).
