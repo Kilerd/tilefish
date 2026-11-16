@@ -952,6 +952,10 @@ class ExternOp(Op):
     """
 
     kind = "extern"
+    # epilogue hooks (``extern(epilogue=tilefish.hook(...))``, :mod:`tilefish._epilogue`): an extern with hooks is launched through a generated module
+    # (``triton`` is its reference) that calls the kernel, ``kernel_ref``, with the identity hook; none for every other extern
+    hooks: "tuple[Any, ...]" = ()
+    kernel_ref: "str | None" = None
 
     def __init__(
         self,
@@ -1037,6 +1041,7 @@ class ExternOp(Op):
         # gives a launch global_scratch * (CTAs of the grid) bytes, a plan from its arena
         self.global_scratch: int = global_scratch
         # by_bucket=: one compile-time configuration per bucket combination of the dimensions it names (_bucket_configs), and the grid of each
+        self._by_bucket = by_bucket  # (as declared: an op made of this one with another epilogue hook has the same configurations, tilefish._epilogue)
         self.by_bucket_dims: "tuple[Dim, ...]" = ()
         self.bucket_configs: "dict[tuple[tuple[str, int], ...], dict[str, Any]]" = {}
         if by_bucket is not None:
@@ -1877,6 +1882,7 @@ def extern(
     global_scratch: int = 0,
     by_bucket: Any = None,
     sass: Any = None,
+    epilogue: Any = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
 
@@ -2003,10 +2009,25 @@ def extern(
     * ``sass=tilefish.sass(no_tf32=True, mma="tcgen05.mma kind::f16", no_spills=True, max_registers=168)``: assertions about the SASS of every
       binary (:func:`tilefish.sass`; ``by_arch=`` inside it per architecture), checked at every build and cache hit, a violation refused with the
       instructions and source lines; in the declaration digest. With ``by_arch=`` they hold for every implementation.
+
+    **An epilogue hook** (``docs/rfcs/0003-epilogue-fusion.md``, :mod:`tilefish._epilogue`): ``epilogue=tilefish.hook("EPILOGUE", value="out", out="c")``
+    says that the kernel takes a jit function ``EPILOGUE`` (a ``tl.constexpr``) and its arguments ``EPILOGUE_ARGS``, which the stub does not list, and
+    calls it on each tile of ``c`` where it would store it (``tilefish._epilogue.ABI``). A graph that calls the extern then fuses the arithmetic its
+    body does to ``c`` into the kernel (one step instead of two), exactly (``value="out"``), or on the accumulator under
+    ``tilefish.fusion(epilogues="accumulator")`` (``value="acc"``). Without a fusion the hook is the identity: the extern is launched through a small
+    generated module that calls the kernel with it (its source is in the declaration digest), and its bytes are the kernel's. A Triton or Gluon kernel
+    of one implementation (not ``by_arch=``, not a prebuilt binary).
     """
     from ._sass import checks_or_none
 
     sass = checks_or_none(sass, "extern")
+    from ._epilogue import hooks_of
+
+    hooks = hooks_of(epilogue)
+    if hooks and (by_arch is not None or fallback is not None):
+        raise TilefishDeclarationError("extern: epilogue= is the hook of one Triton or Gluon kernel; an op declared with by_arch= does not take one yet")
+    if hooks and (ptx is not None or cubin is not None):
+        raise TilefishDeclarationError("extern: epilogue= is a hook of a Triton or Gluon kernel, which tilefish compiles with the hook in it; a prebuilt binary has none")
     if by_arch is not None or fallback is not None:
         if args:
             raise TilefishDeclarationError("@tilefish.extern takes keyword arguments only, not a bare @tilefish.extern")
@@ -2073,6 +2094,18 @@ def extern(
             binary = _binary_target("ptx" if ptx is not None else "cubin", ptx if ptx is not None else cubin, symbol, block, shared, base, nm, cluster)
         else:
             assert target is not None
+            if hooks:
+                from ._epilogue import check_hooks, make_extern_with_hooks
+
+                check_hooks(nm, sig, hooks, target.arg_names)
+                if target.constexpr is not None and target.arg_names is not None:  # the stub's consts are the kernel's constexprs (the hooks' aside)
+                    flags = dict(zip(target.arg_names, target.constexpr))
+                    _check_against_kernel(nm, sig, _TritonTarget(target.ref, [p.name for p in sig.params], [flags[p.name] for p in sig.params], target.is_gluon))
+                return make_extern_with_hooks(
+                    fn, nm, sig, hooks, target.ref, language,
+                    num_warps=num_warps, num_stages=num_stages, grid=grid, max_elements=limits, fp_fusion=enable_fp_fusion, index_bits=index_bits,
+                    reference=reference, persistent=persistent, num_ctas=num_ctas, global_scratch=global_scratch, by_bucket=by_bucket, sass=sass,
+                )  # fmt: skip
             _check_against_kernel(nm, sig, target)
         return ExternOp(
             fn,

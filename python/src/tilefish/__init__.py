@@ -91,6 +91,8 @@ from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in 
 from .ops import argmax, argmin, cos, div, erf, exp, fma, gather_rows, gelu, iota, load, neg, rcp, rsqrt, scatter_rows, silu, sin, sin_approx
 from .ops import barrier, sqrt, tanh, tree, where, zeros_like
 from ._fusion import Fusion, TilefishFusionError, TilefishFusionWarning, fusion
+from ._fusion import fused_scope as fused
+from ._epilogue import Hook, hook
 from ._sass import SassChecks, sass
 from ._probe import Instrument, instrument, probe
 from ._probes import ProbeTrace, Probes, TilefishProbeError
@@ -165,6 +167,7 @@ __all__ = [
     "DimExpr",
     "ExternOp",
     "Fusion",
+    "Hook",
     "Graph",
     "Implementation",
     "GraphOp",
@@ -234,11 +237,13 @@ __all__ = [
     "f16",
     "f32",
     "fma",
+    "fused",
     "fusion",
     "fusion_report",
     "gather_rows",
     "gelu",
     "graph",
+    "hook",
     "i32",
     "i64",
     "im2col",

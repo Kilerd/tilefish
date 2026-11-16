@@ -45,7 +45,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-from .dims import DimExpr
+from .dims import Dim, DimExpr, as_dim
 from .dtypes import DType, bool_, f32, u8
 from .errors import TilefishError, TilefishLoweringError, TilefishPlanError, TilefishRuntimeError
 from .ir import Graph, Node, Scalar
@@ -58,6 +58,10 @@ GROUPINGS = ("auto", "none")
 INTERMEDIATES = ("declared", "opmath")
 FP_CONTRACTS = ("none", "mul-add")
 MATHS = ("fast", "ieee")
+# docs/rfcs/0003-epilogue-fusion.md: how a region is fused into the call that makes its input. "exact" (the default): through epilogue hooks that see
+# the call's rounded result (contract (i), the bytes of the unfused composition); "accumulator": the declared rewrite R_acc (every widening of a
+# call's result is the call's f32 result) and hooks that see the accumulator (contract (ii))
+EPILOGUES = ("exact", "accumulator")
 MAX_REGION_NODES = 64  # ops of one region (versions 1 and 2)
 MAX_REGION_TENSORS = 32  # inputs and outputs of one region (versions 1 and 2)
 LOWERING_OF_VERSION = {1: 1, 2: 2}  # the revision of tilefish.lower each version's region kernels are lowered with (note 21), frozen with it
@@ -105,14 +109,21 @@ class Fusion:
     fp_contract: str = "none"
     verify: bool = True
     sass: Any = None  # the SASS assertions of every region's kernel (tilefish.sass), or None
+    epilogues: str = "exact"  # docs/rfcs/0003-epilogue-fusion.md: "exact" or "accumulator" (R_acc)
 
     def canonical(self) -> "dict[str, Any]":
         """What a region's kernel depends on (``verify`` is a check, not a choice of numerics, and is left out; ``sass`` only when given, so
-        every region of a graph without it is named as it was)."""
+        every region of a graph without it is named as it was; ``epilogues`` is not: a mode changes a region's nodes, through ``R_acc``, or nothing)."""
         out = {"version": self.version, "grouping": self.grouping, "math": self.math, "intermediates": self.intermediates, "fp_contract": self.fp_contract}
         if self.sass is not None:
             out["sass"] = self.sass.canonical()
         return out
+
+    def but(self, **changes: Any) -> "Fusion":
+        """These settings with ``changes``."""
+        import dataclasses
+
+        return dataclasses.replace(self, **changes)
 
 
 def fusion(
@@ -124,6 +135,7 @@ def fusion(
     fp_contract: str = "none",
     verify: bool = True,
     sass: Any = None,
+    epilogues: str = "exact",
 ) -> Fusion:
     """``@tilefish.graph(fusion=tilefish.fusion(...))``: how the arithmetic written in the graph body is planned. Every choice is exact: the plan
     writes the bytes of its unfused composition (each op a kernel of its own; ``grouping="none"`` is that plan).
@@ -142,6 +154,11 @@ def fusion(
       or ``False`` here skips it).
     * ``sass``: SASS assertions (:func:`tilefish.sass`) every region's kernel is built under (``tilefish.sass(no_spills=True, max_registers=64)``),
       checked at every build; in the regions' declaration digests and names (only when given).
+    * ``epilogues`` (``docs/rfcs/0003-epilogue-fusion.md``): how the arithmetic that reads an extern's result is fused into the extern's kernel, where
+      it declares an epilogue hook (``tilefish.hook``). ``"exact"``, the default: through a hook that sees the extern's rounded result, so the plan
+      writes the bytes of the extern followed by the region (contract (i)). ``"accumulator"``: the declared rewrite ``R_acc`` (every widening
+      ``y.to(f32)`` of such a result is the extern's f32 result, one rounding fewer) and a hook that sees the accumulator (contract (ii)): the bytes of
+      the unfused composition of the rewritten program, not of the extern and the region. Also per scope (:func:`tilefish.fused`).
     """
     if version not in VERSIONS or isinstance(version, bool):
         raise TilefishPlanError(f"fusion: version must be one of {list(VERSIONS)}, got {version!r}")
@@ -150,6 +167,7 @@ def fusion(
         ("math", math, MATHS),
         ("intermediates", intermediates, INTERMEDIATES),
         ("fp_contract", fp_contract, FP_CONTRACTS),
+        ("epilogues", epilogues, EPILOGUES),
     ):
         if value not in allowed:
             raise TilefishPlanError(f"fusion: {key} must be one of {list(allowed)}, got {value!r}")
@@ -157,7 +175,35 @@ def fusion(
         raise TilefishPlanError(f"fusion: verify must be True or False, got {verify!r}")
     from ._sass import checks_or_none
 
-    return Fusion(version, grouping, math, intermediates, fp_contract, verify, checks_or_none(sass, "fusion"))
+    return Fusion(version, grouping, math, intermediates, fp_contract, verify, checks_or_none(sass, "fusion"), epilogues)
+
+
+def fused_scope(*, epilogues: "str | None" = None) -> Any:
+    """``with tilefish.fused(epilogues="accumulator"):`` in a graph body: the ops traced in the block are planned with these settings instead of the
+    graph's (``docs/rfcs/0003-epilogue-fusion.md``, Q3: a mode is declared per graph or per scope, never per call). ``epilogues`` is a value of
+    ``tilefish.fusion(epilogues=...)``: a widening ``y.to(f32)`` of an extern's result written in an ``"accumulator"`` scope is ``R_acc``'s, in an
+    ``"exact"`` scope it is not, whatever the graph declares. Scopes nest (the innermost's settings win). A kernel body has no scope."""
+    from .trace import current_context, scope
+
+    settings: "dict[str, Any]" = {}
+    if epilogues is not None:
+        if epilogues not in EPILOGUES:
+            raise TilefishPlanError(f"tilefish.fused: epilogues must be one of {list(EPILOGUES)}, got {epilogues!r}")
+        settings["epilogues"] = epilogues
+    if not settings:
+        raise TilefishPlanError(
+            "tilefish.fused: say what the scope sets (epilogues=...); a scope that names a region (name=) is not planned yet (RFC 0001, section 2.3)"
+        )
+    ctx = current_context()
+    if ctx is None or ctx.kind != "graph":
+        raise TilefishPlanError("tilefish.fused is a scope of a @tilefish.graph body (it sets how the arithmetic traced in it is planned)")
+    return scope(settings)
+
+
+def epilogue_mode(n: Node, settings: Fusion) -> str:
+    """The ``epilogues`` mode of a node of a graph body: its ``tilefish.fused`` scope's, else the graph's."""
+    sc = getattr(n, "scope", None) or {}
+    return str(sc.get("epilogues", settings.epilogues))
 
 
 def settings_of(gop: Any) -> Fusion:
@@ -184,6 +230,26 @@ class Region:
 
 
 @dataclass(eq=False)
+class Hooked:
+    """A region fused into the extern call that makes its input, through the extern's epilogue hook (``docs/rfcs/0003-epilogue-fusion.md``): one call
+    of ``op`` (the extern with the region in its hook) in place of the call ``call`` (a program node), the region and the views of the call's result
+    only they read."""
+
+    call: int
+    region: Region
+    hook: Any
+    extern: Any
+    op: Any
+    contract: str  # "exact" (contract (i)) | "accumulator" (contract (ii))
+    inputs: "list[Value]" = field(default_factory=list)
+    outputs: "list[Value]" = field(default_factory=list)
+    views: "list[int]" = field(default_factory=list)  # program nodes (splits of the result) the unit takes
+    main: "Value | None" = None  # the region's output the kernel stores into the hook's output (None: the result itself)
+    tiles: "list[Value]" = field(default_factory=list)  # the values the hook holds (the result, its chunks, its rounding)
+    sources: "dict[str, Any]" = field(default_factory=dict)
+
+
+@dataclass(eq=False)
 class Fused:
     """What :func:`fused` makes of a graph: the graph the plan walks (each region one call), the regions, and the program they came from."""
 
@@ -194,11 +260,20 @@ class Fused:
     rewrites: "list[dict[str, Any]]"
     settings: Fusion
     source: Graph  # the traced graph
+    hooked: "list[Hooked]" = field(default_factory=list)  # regions fused into an extern's epilogue hook (docs/rfcs/0003-epilogue-fusion.md)
+    # an extern call whose result a region reads that no hook took: {"call": program node, "region": index, "reason", "detail"}
+    refused: "list[dict[str, Any]]" = field(default_factory=list)
+    renamed: "dict[Value, Value]" = field(default_factory=dict)  # R_acc: a returned value the rewrite replaced -> its replacement
 
     @property
     def fused_regions(self) -> "list[Region]":
-        """The regions of more than one op: what an export verifies."""
-        return [r for r in self.regions if len(r.nodes) > 1]
+        """The regions of more than one op that a plan launches as kernels of their own: what an export verifies against their ops one by one (a
+        region in an epilogue hook is verified with its extern, :attr:`hooked`)."""
+        taken = {id(h.region) for h in self.hooked}
+        return [r for r in self.regions if len(r.nodes) > 1 and id(r) not in taken]
+
+    def hooked_region(self, r: Region) -> "Hooked | None":
+        return next((h for h in self.hooked if h.region is r), None)
 
 
 _lock = threading.Lock()
@@ -209,7 +284,7 @@ def fused(gop: Any, grouping: "str | None" = None) -> Fused:
     """The fusion of a graph (cached on it): ``grouping`` overrides the declaration's (``"none"``: the unfused composition)."""
     settings = settings_of(gop)
     if grouping is not None and grouping != settings.grouping:
-        settings = Fusion(settings.version, grouping, settings.math, settings.intermediates, settings.fp_contract, settings.verify, settings.sass)
+        settings = settings.but(grouping=grouping)
     key = ("_tf_fused", settings)
     cache = gop.__dict__.setdefault("_tf_fused", {})
     found = cache.get(key)
@@ -225,7 +300,7 @@ def with_version(gop: Any, version: int) -> Any:
     s = settings_of(gop)
     other = object.__new__(type(gop))  # (not copy.copy: an operator pickles, so copies, by reference to itself)
     other.__dict__.update({k: v for k, v in gop.__dict__.items() if not k.startswith("_tf_")})
-    other.fusion = Fusion(version, s.grouping, s.math, s.intermediates, s.fp_contract, s.verify, s.sass)
+    other.fusion = s.but(version=version)
     return other
 
 
@@ -271,6 +346,14 @@ def _clean(attrs: Mapping[str, Any]) -> "dict[str, Any]":
     return {k: v for k, v in attrs.items() if k not in ("region", "loc")}
 
 
+def _is_split_of(n: Node, y: Value, parts: int) -> bool:
+    """Whether ``n`` splits ``y`` along its last axis into ``parts`` chunks of one size (the tiles of a hook that sees ``parts`` at once)."""
+    if n.op != "split" or n.attrs.get("kind") is not None or n.inputs[0] is not y or "start" in n.attrs:
+        return False
+    sizes = list(n.attrs.get("sizes") or ())
+    return n.attrs.get("axis") == y.type.rank - 1 and len(sizes) == parts and len(set(sizes)) == 1
+
+
 # -- the pass ----------------------------------------------------------------------------------------------------------------------------
 
 
@@ -302,14 +385,107 @@ class _Pass:
     def rewrite(self) -> "tuple[list[Node], list[int]]":
         nodes = list(self.source.nodes)
         origin = list(range(len(nodes)))
+        self.renamed: "dict[Value, Value]" = {}
         if self.settings.intermediates == "opmath":
             nodes, origin = self._opmath(nodes, origin)
         if self.settings.fp_contract == "mul-add":
             nodes, origin = self._mul_add(nodes, origin)
+        nodes, origin = self._r_acc(nodes, origin)
         for n, o in zip(nodes, origin):  # an op a rewrite made is where the op it was made of was written (tilefish.explain)
             if n.loc is None:
                 n.loc = self.source.nodes[o].loc
         return nodes, origin
+
+    def _r_acc(self, nodes: "list[Node]", origin: "list[int]") -> "tuple[list[Node], list[int]]":
+        """``R_acc`` (``docs/rfcs/0003-epilogue-fusion.md``, contract (ii)): a call of an extern with an ``acc`` hook whose result ``y`` (a 16-bit
+        float) is widened, ``y.to(f32)``, in an ``"accumulator"`` mode (the graph's or a ``tilefish.fused`` scope's), becomes a call of its
+        accumulator form, which also writes the f32 result ``acc``; every such widening is ``acc`` (of a split hook's chunk: that chunk of ``acc``),
+        one rounding fewer. What reads ``y`` in its own type still reads it, rounded by the kernel. Defined on the IR, before any region is formed."""
+        from ._epilogue import acc_form, hook_of
+
+        if not any(n.attrs.get("kind") == "extern" and hook_of(n.callee, "acc") is not None for n in nodes):
+            return nodes, origin
+        consumers: "dict[Value, list[int]]" = {}
+        for k, n in enumerate(nodes):
+            for i in n.inputs:
+                if isinstance(i, Value):
+                    consumers.setdefault(i, []).append(k)
+        replace: "dict[Value, Value]" = {}
+        insert: "dict[int, list[Node]]" = {}  # after node k: the nodes the rewrite adds
+        swap: "dict[int, Node]" = {}
+        for k, n in enumerate(nodes):
+            h = hook_of(n.callee, "acc") if n.attrs.get("kind") == "extern" and n.callee is not None else None
+            if h is None:
+                continue
+            sig = n.callee.signature
+            n_ret, outs = len(sig.returns), [p.name for p in sig.tensor_outputs]
+            y = n.outputs[n_ret + outs.index(h.out)]
+            if not isinstance(y.type.dtype, DType) or y.type.dtype.name not in _HALF:
+                continue  # an f32 result: no rounding to remove
+
+            def widening(m: int) -> bool:
+                c = nodes[m]
+                return (
+                    c.op == "cast" and c.attrs.get("kind") is None and c.attrs.get("to") == f32 and "round" not in c.attrs
+                    and epilogue_mode(c, self.settings) == "accumulator"
+                )  # fmt: skip
+
+            direct = [m for m in consumers.get(y, []) if widening(m)]
+            chunks: "list[tuple[int, int, int]]" = []  # (split node, chunk, widening)
+            if h.split > 1:
+                for m in consumers.get(y, []):
+                    s = nodes[m]
+                    if _is_split_of(s, y, h.split):
+                        for j, c in enumerate(s.outputs):
+                            chunks += [(m, j, w) for w in consumers.get(c, []) if widening(w)]
+            if not direct and not chunks:
+                continue
+            acc = acc_form(n.callee, h)
+            y32 = self.new(y.type.materialized().with_dtype(f32))
+            n_out = len(outs)
+            call = Node(acc.name, n.inputs, {**{a: v for a, v in n.attrs.items() if a not in ("triton", "gluon")}, **acc.node_attrs()},
+                        [*n.outputs[: n_ret + n_out], y32, *n.outputs[n_ret + n_out :]])  # fmt: skip
+            call.callee, call.loc, call.scope = acc, n.loc, n.scope
+            swap[k] = call
+            removed: "list[int]" = []
+            for w in direct:
+                replace[nodes[w].outputs[0]] = y32
+                removed.append(w)
+            views: "dict[int, list[Value]]" = {}
+            for m, j, w in chunks:
+                if m not in views:
+                    from .ops import _chunk_types
+
+                    s = nodes[m]
+                    outs32 = [self.new(t) for t in _chunk_types(y32, s.attrs["axis"], list(s.attrs["sizes"]))]
+                    node = Node(s.op, [y32], dict(s.attrs), outs32)
+                    node.loc, node.scope = s.loc, s.scope
+                    insert.setdefault(k, []).append(node)
+                    views[m] = outs32
+                replace[nodes[w].outputs[0]] = views[m][j]
+                removed.append(w)
+            self.rewrites.append({
+                "kind": "accumulator", "node": origin[k], "op": n.op, "value": y.ref, "dtype": str(y.type.dtype),
+                "widenings": sorted(origin[w] for w in removed),
+            })  # fmt: skip
+        if not swap:
+            return nodes, origin
+        out_nodes: "list[Node]" = []
+        out_origin: "list[int]" = []
+        for k, (n, o) in enumerate(zip(nodes, origin)):
+            n = swap.get(k, n)
+            if any(isinstance(i, Value) and i in replace for i in n.inputs):
+                m = Node(n.op, [replace.get(i, i) if isinstance(i, Value) else i for i in n.inputs], n.attrs, n.outputs)
+                m.callee, m.loc, m.scope, m.origin = n.callee, n.loc, n.scope, n.origin
+                n = m
+            out_nodes.append(n)
+            out_origin.append(o)
+            for extra in insert.get(k, []):
+                out_nodes.append(extra)
+                out_origin.append(o)
+        # a widening the graph returns (or leaves in an InOut parameter) is the accumulator now
+        self.renamed.update({v: replace[v] for v in (*self.source.outputs, *self.source.finals.values()) if v in replace})
+        return out_nodes, out_origin
 
     def _opmath(self, nodes: "list[Node]", origin: "list[int]") -> "tuple[list[Node], list[int]]":
         """torch's eager rule for a 16-bit op with a python scalar: ``op(a.to(f32), f32(c)).to(dt)``, the scalar's own value rounded to f32."""
@@ -415,16 +591,19 @@ class _Pass:
 
     # -- 2. the regions ------------------------------------------------------------------------------------------------------------
 
-    def prepare(self, prog: "list[Node]", origin: "list[int]") -> None:
+    def prepare(self, prog: "list[Node]", origin: "list[int]", renamed: "Mapping[Value, Value] | None" = None) -> None:
         """The tables every step of the pass reads: producers, consumers, what escapes the arithmetic, the edges, the free ops."""
         self.prog, self.origin = prog, origin
+        if renamed is not None:
+            self.renamed = dict(renamed)
+        self.renamed = getattr(self, "renamed", {})
         self.producer: "dict[Value, int]" = {o: k for k, n in enumerate(prog) for o in n.outputs}
         self.consumers: "dict[Value, list[int]]" = {}
         for k, n in enumerate(prog):
             for i in n.inputs:
                 if isinstance(i, Value):
                     self.consumers.setdefault(i, []).append(k)
-        self.escapes: "set[Value]" = set(self.source.outputs) | set(self.source.finals.values())
+        self.escapes: "set[Value]" = {self.renamed.get(v, v) for v in (*self.source.outputs, *self.source.finals.values())}
         self.succ = self._edges()
         self.free = {k for k, n in enumerate(prog) if _is_arith(n) and n.op in _FREE_OPS}
         self.masks_u8: "dict[Value, Value]" = {}
@@ -440,8 +619,12 @@ class _Pass:
         self.prepare(prog, origin)
         nodes = self.select()
         regions = self.regions(self.partition(nodes, self.settings.grouping))
+        self.hooked: "list[Hooked]" = []
+        self.refused: "list[dict[str, Any]]" = []
+        if self.settings.grouping == "auto":  # (the unfused composition calls every extern as it is)
+            self.epilogues(regions)
         graph = self._graph(regions)
-        return Fused(graph, regions, prog, origin, list(self.rewrites), self.settings, self.source)
+        return Fused(graph, regions, prog, origin, list(self.rewrites), self.settings, self.source, self.hooked, self.refused, dict(self.renamed))
 
     def select(self) -> "list[int]":
         """The ops the regions are made of (after :meth:`prepare`): every arithmetic op that is neither free (copied into each region that reads it)
@@ -743,11 +926,233 @@ class _Pass:
         r.reads = reads
         r.call_inputs = call_inputs  # type: ignore[attr-defined]
 
-    # -- 4. the graph the plan walks -----------------------------------------------------------------------------------------------
+    # -- 4. epilogue hooks (docs/rfcs/0003-epilogue-fusion.md) ------------------------------------------------------------------------
+
+    def epilogues(self, regions: "list[Region]") -> None:
+        """Fuse each region that reads the result of an extern call with an epilogue hook into that call, where it fits the hook: one call of the
+        extern with the region in its hook (``_epilogue.hooked``) in place of the call, the region and the views of the result only they read. A
+        call of an extern's accumulator form (``R_acc``) fuses through its ``acc`` hook (contract (ii)), any other through its ``out`` hook (contract
+        (i)). One region per call, the first that fits; every region that reads a hooked extern's result and is not fused is in ``self.refused``,
+        with why."""
+        from ._epilogue import hook_of, hooks_of_op
+
+        by_root = {r.nodes[0]: r for r in regions}
+        taken: "set[int]" = set()
+        for k, n in enumerate(self.prog):
+            if n.attrs.get("kind") != "extern" or n.callee is None:
+                continue
+            acc = getattr(n.callee, "acc_of", None)
+            if acc is not None:
+                extern, hook = acc
+            elif hooks_of_op(n.callee):
+                extern, hook = n.callee, hook_of(n.callee, "out")
+            else:
+                continue
+            values, views = self._tile_values(n, extern, hook if hook is not None else hook_of(extern, "acc"), acc is not None)
+            readers = sorted({self.member_of[c] for v in [*values, *self._result_values(n, extern)] for c in self.consumers.get(v, []) if c in self.member_of})
+            done: "Hooked | None" = None
+            for root in readers:
+                r = by_root[root]
+                if hook is None:
+                    self._refuse(k, r, "epilogue-acc-only", f"'{extern.name}' has an epilogue hook on its accumulator only, which the graph's mode (epilogues='exact') does not use")
+                    continue
+                if done is not None:
+                    self._refuse(k, r, "epilogue-taken", f"region {done.region.index} is fused into the call to '{extern.name}' already (one region per call)")
+                    continue
+                if id(r) in taken:  # pragma: no cover - a region reads one call's result
+                    continue
+                found = self._hook(k, n, extern, hook, acc is not None, r, values, views)
+                if isinstance(found, Hooked):
+                    self.hooked.append(found)
+                    taken.add(id(r))
+                    done = found
+                else:
+                    self._refuse(k, r, *found)
+
+    def _refuse(self, k: int, r: Region, reason: str, detail: str) -> None:
+        self.refused.append({"call": k, "region": r.index, "reason": reason, "detail": detail})
+
+    def _result_values(self, n: Node, extern: Any) -> "list[Value]":
+        """The outputs of the extern call ``n`` and every view of them."""
+        sig = extern.signature
+        out = list(n.outputs[len(sig.returns) : len(sig.returns) + len(sig.tensor_outputs) + (1 if getattr(n.callee, "acc_of", None) else 0)])
+        todo = list(out)
+        while todo:
+            v = todo.pop()
+            for c in self.consumers.get(v, []):
+                m = self.prog[c]
+                if m.attrs.get("kind") is None and m.op in _VIEW_OPS:
+                    out += m.outputs
+                    todo += m.outputs
+        return out
+
+    def _tile_values(self, n: Node, extern: Any, hook: Any, is_acc: bool) -> "tuple[dict[Value, tuple[str, int | None]], dict[int, list[Value]]]":
+        """What the hook of the call ``n`` holds: value -> ``("tile", chunk)`` or ``("rounded", chunk)`` (an ``acc`` hook's tile rounded as the
+        kernel rounds it), and the split nodes whose chunks they are."""
+        sig = extern.signature
+        n_ret = len(sig.returns)
+        outs = [p.name for p in sig.tensor_outputs]
+        y = n.outputs[n_ret + outs.index(hook.out)]
+        values: "dict[Value, tuple[str, int | None]]" = {}
+        if is_acc:
+            values[n.outputs[n_ret + len(outs)]] = ("tile", None)
+            values[y] = ("rounded", None)
+        else:
+            values[y] = ("tile", None)
+        views: "dict[int, list[Value]]" = {}
+        if hook.split > 1:  # a hook that holds several tiles: the chunks of a split of the result along its last axis
+            whole = dict(values)
+            values = {}
+            for v, (what, _) in whole.items():
+                for m in self.consumers.get(v, []):
+                    if _is_split_of(self.prog[m], v, hook.split):
+                        views[m] = list(self.prog[m].outputs)
+                        for j, c in enumerate(self.prog[m].outputs):
+                            values[c] = (what, j)
+        return values, views
+
+    def _hook(self, k: int, n: Node, extern: Any, hook: Any, is_acc: bool, r: Region, values: "Mapping[Value, Any]", views: "Mapping[int, list[Value]]") -> Any:
+        """The :class:`Hooked` of the call ``k`` and the region ``r``, or ``(reason, detail)``: why the hook does not take it."""
+        from . import _epilogue
+        from .aot import _bucket_dims, compile_specs
+
+        sig = extern.signature
+        n_ret, n_out = len(sig.returns), len(sig.tensor_outputs)
+        members = set(r.nodes)
+        made = set(self._result_values(n, extern))
+        for v in r.inputs:
+            if v in made and v not in values:
+                return "epilogue-view", f"region {r.index} reads {v.ref}, a part of the result of '{extern.name}' the hook does not hold (a hook holds its tile" + (
+                    f"s, the {hook.split} chunks of a split of the last axis)" if hook.split > 1 else ")")
+        used = [v for v in r.inputs if v in values]
+        held = set(used)  # (a set: == of two values is an op of the trace)
+        unit_views = [m for m, cs in views.items() if any(c in held for c in cs)]
+        unit = {k, *members, *unit_views}
+
+        def needed(v: Value) -> bool:
+            return v in self.escapes or v in self.barriered or any(c not in unit and c not in self.dead for c in self.consumers.get(v, []))
+
+        y = n.outputs[n_ret + [p.name for p in sig.tensor_outputs].index(hook.out)]
+        rounded = [y, *(c for m in views for c in self.prog[m].outputs if values.get(c, ("", 0))[0] == ("rounded" if is_acc else "tile"))]
+        y_needed = any(needed(v) for v in rounded)
+        if is_acc:
+            accs = [v for v, (what, _) in values.items() if what == "tile"]
+            acc_value = n.outputs[n_ret + n_out]
+            if any(needed(v) for v in (acc_value, *accs)):
+                return "epilogue-acc-shared", f"the f32 result of '{extern.name}' (R_acc) is read by more than region {r.index}, which a hook cannot store as well"
+        # a path from the call out of the unit and back into it (through a call, a view, a move or another region): one kernel would wait for itself
+        last = max(unit)
+        stack = [s for u in unit for s in self.succ[u] if s not in unit and s < last]
+        seen: "set[int]" = set()
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            for s in self.succ[x]:
+                if s in unit:
+                    what = f"the call to '{self.prog[x].op}'" if self.prog[x].attrs.get("kind") else f"the op '{self.prog[x].op}'"
+                    return "epilogue-cycle", f"{what} (node #{self.origin[x]}) reads the result of '{extern.name}' and feeds region {r.index}"
+                if s < last and s not in seen:
+                    stack.append(s)
+        tile_value = next(iter(values))
+        tile_type = tile_value.type
+        if any(self.prog[m].op in ("sum", "mean", "max", "argmax", "argmin") for m in r.nodes):  # a row region: whole rows in a tile
+            if extern.language == "gluon":
+                return "epilogue-row", f"region {r.index} reduces rows, which a hook fuses into a Triton kernel only (a Gluon kernel's tile has its layout)"
+            if hook.block_n is None:
+                return "epilogue-row", f"region {r.index} reduces rows, which a hook takes only where a tile holds whole rows: declare the tile's width (tilefish.hook(..., block_n=...))"
+            d = tile_type.shape[-1].folded()
+            if not d.is_static:
+                return "epilogue-row", f"region {r.index} reduces rows of {d} columns; a hook takes rows of a static length"
+            q = next(p for p in sig.params if p.name == hook.block_n)
+            widths = [c["consts"].get(hook.block_n, q.default) for c in extern.bucket_configs.values()] or [q.default]
+            narrow = [w for w in widths if not isinstance(w, int) or w < d.value]
+            if narrow:
+                return "epilogue-row", f"region {r.index} reduces rows of {d.value} columns, but a tile of '{extern.name}' is {narrow[0]} columns wide ({hook.block_n}): a hook takes a norm only where a tile holds whole rows"
+        # the region's types are the graph's: the extern's dimensions in their place, where a call binds one to the other
+        mapping: "dict[Dim, DimExpr]" = {}
+        for p, v in [*zip(sig.tensor_inputs, n.inputs), *zip(sig.tensor_outputs, n.outputs[n_ret:])]:
+            for s, g in zip(p.type.shape, v.type.shape):
+                g = g.folded()
+                if isinstance(g, Dim) and not g.is_static and g not in mapping:
+                    mapping[g] = s
+        stub_dims = {d.name: d for p in sig.params for d in (p.type.free_dims() if p.type is not None else p.dim.free_dims() if p.dim is not None else ())}
+
+        def translate(d: Any) -> Any:
+            d = as_dim(d).folded()
+            if d.is_static:
+                return d
+            if all(x in mapping for x in d.free_dims()):
+                return d.subst(mapping)
+            return d
+
+        out_param = next(p for p in sig.params if p.name == hook.out)
+        main: "int | None" = None
+        out_dtype = None
+        if not y_needed:
+            for i, o in enumerate(r.outputs):
+                dt = o.type.dtype
+                if tuple(o.type.shape) != tuple(tile_type.shape) or not isinstance(dt, DType) or dt.name not in ("f32", "bf16", "f16"):
+                    continue
+                if hook.value == "out" and dt != y.type.dtype:
+                    continue
+                if out_param.tensor_map is not None and dt != out_param.type.dtype:
+                    continue
+                main, out_dtype = i, dt
+                break
+            if main is None:
+                shape = "[" + ", ".join(str(d) for d in tile_type.shape) + "]"
+                return "epilogue-no-output", (
+                    f"region {r.index} writes no tensor of the result's shape {shape}" + (f" and type {y.type.dtype}" if hook.value == "out" else " and a float type")
+                    + f", which the kernel would store in place of '{hook.out}' (the result is read by nothing else)"
+                )
+        out_type = None
+        if main is not None:  # the hook's output holds the region's output instead: its dtype, and one chunk of the columns for a split hook
+            shape = list(out_param.type.shape)
+            if hook.split > 1:
+                shape[-1] = translate(tile_type.shape[-1])
+            out_type = TensorType(tuple(shape), out_dtype)
+        sources = {f"a{i}": values[v] for i, v in enumerate(r.inputs) if v in values}
+        try:
+            op = _epilogue.hooked(extern, hook, r.kernel, sources=sources, main=main, out_type=out_type, translate=translate)
+            for p in op.signature.params:
+                for d in p.type.free_dims() if p.type is not None else p.dim.free_dims() if p.dim is not None else ():
+                    if d.name in stub_dims and stub_dims[d.name] is not d and d not in mapping.values():
+                        return "epilogue-dims", f"region {r.index} has a dimension '{d.name}' that is not the extern's dimension of that name"
+            if {d.name for d in _bucket_dims(op)} - {d.name for d in _bucket_dims(extern)}:
+                extra = sorted({d.name for d in _bucket_dims(op)} - {d.name for d in _bucket_dims(extern)})
+                return "epilogue-dims", f"region {r.index} has bucketed dimensions {extra} that are none of the extern's (a binary per bucket of each)"
+            compile_specs(op)
+        except TilefishLoweringError as e:
+            return "epilogue-template", f"region {r.index} does not lower to a hook: {str(e).strip().splitlines()[0]}"
+        except TilefishError as e:
+            return "epilogue-hook", f"the hook of '{extern.name}' cannot take region {r.index}: {str(e).strip().splitlines()[0]}"
+        h = Hooked(k, r, hook, extern, op, "accumulator" if is_acc else "exact")
+        h.views = [m for m in unit_views if not any(needed(c) for c in self.prog[m].outputs)]  # (a split whose chunks something else reads stays)
+        h.main = r.outputs[main] if main is not None else None
+        h.tiles = used
+        h.sources = sources
+        tiles = set(values)
+        h.inputs = list(n.inputs)
+        h.region_inputs = [(v, given) for v, given in zip(r.inputs, r.call_inputs) if v not in tiles]  # type: ignore[attr-defined]
+        outs = list(n.outputs[n_ret : n_ret + n_out])
+        if h.main is not None:
+            outs[[p.name for p in sig.tensor_outputs].index(hook.out)] = h.main
+        side = [self.masks_u8.get(o, o) for i, o in enumerate(r.outputs) if i != main]
+        n_callee_out = len(n.callee.signature.tensor_outputs)
+        h.outputs = [*n.outputs[:n_ret], *outs, *side, *n.outputs[n_ret + n_callee_out :]]
+        return h
+
+    # -- 5. the graph the plan walks -----------------------------------------------------------------------------------------------
 
     def _graph(self, regions: "list[Region]") -> Graph:
         prog = self.prog
         region_of: "dict[int, Region]" = {k: r for r in regions for k in r.nodes}
+        hooked_at: "dict[int, Hooked]" = {}  # a call, its region and the views only they read: one unit, a call of the extern with the region in its hook
+        for h in getattr(self, "hooked", ()):
+            for k in (h.call, *h.region.nodes, *h.views):
+                hooked_at[k] = h
         dropped = set(self.free) | set(getattr(self, "dead", ())) | {k for k, n in enumerate(prog) if n.op == "barrier"}
         # units: a region, or one node that stays (a call, a view, a move)
         unit_of: "dict[int, Any]" = {}
@@ -755,7 +1160,12 @@ class _Pass:
         for k, n in enumerate(prog):
             if k in dropped:
                 continue
-            if k in region_of:
+            if k in hooked_at:
+                h = hooked_at[k]
+                if h.call == k:
+                    units.append(h)
+                unit_of[k] = h
+            elif k in region_of:
                 r = region_of[k]
                 if r.nodes[0] == k:
                     units.append(r)
@@ -763,7 +1173,7 @@ class _Pass:
             else:
                 units.append(k)
                 unit_of[k] = k
-        first = {id(u): (u.nodes[0] if isinstance(u, Region) else u) for u in units}
+        first = {id(u): (u.call if isinstance(u, Hooked) else u.nodes[0] if isinstance(u, Region) else u) for u in units}
         succ: "dict[int, set[int]]" = {id(u): set() for u in units}
         indeg: "dict[int, int]" = {id(u): 0 for u in units}
         by_id = {id(u): u for u in units}
@@ -795,26 +1205,36 @@ class _Pass:
 
         nodes: "list[Node]" = []
         materialised: "dict[Value, Value]" = {}
+
+        def given_of(r: Region, v: Value, given: Value) -> Value:
+            if r.reads.get(v) != "materialised":
+                return given
+            c = materialised.get(v)
+            if c is None:
+                t = v.type
+                last = t.shape[-1].folded()
+                op = contiguous_op(t.rank, t.dtype, last.value if last.is_static else None)
+                c = self.new(TensorType(t.shape, t.dtype))
+                node = Node(op.name, [v], {"kind": "extern"}, [c])
+                node.callee = op
+                nodes.append(node)
+                materialised[v] = c
+            return c
+
         for u in order:
+            if isinstance(u, Hooked):  # the extern with the region in its epilogue hook (docs/rfcs/0003-epilogue-fusion.md)
+                call = prog[u.call]
+                ins = [*u.inputs, *(given_of(u.region, v, given) for v, given in u.region_inputs)]  # type: ignore[attr-defined]
+                attrs = {a: v for a, v in call.attrs.items() if a not in ("triton", "gluon")}
+                attrs.update(u.op.node_attrs())
+                node = Node(u.op.name, ins, attrs, u.outputs)
+                node.callee, node.loc = u.op, call.loc
+                nodes.append(node)
+                continue
             if not isinstance(u, Region):
                 nodes.append(prog[u])
                 continue
-            ins: "list[Value]" = []
-            for v, given in zip(u.inputs, u.call_inputs):  # type: ignore[attr-defined]
-                if u.reads.get(v) == "materialised":
-                    c = materialised.get(v)
-                    if c is None:
-                        t = v.type
-                        last = t.shape[-1].folded()
-                        op = contiguous_op(t.rank, t.dtype, last.value if last.is_static else None)
-                        c = self.new(TensorType(t.shape, t.dtype))
-                        node = Node(op.name, [v], {"kind": "extern"}, [c])
-                        node.callee = op
-                        nodes.append(node)
-                        materialised[v] = c
-                    ins.append(c)
-                else:
-                    ins.append(given)
+            ins = [given_of(u, v, given) for v, given in zip(u.inputs, u.call_inputs)]  # type: ignore[attr-defined]
             outs = [self.masks_u8.get(o, o) for o in u.outputs]
             attrs: "dict[str, Any]" = {"kind": "kernel"}
             if u.call is not u.kernel:
@@ -823,7 +1243,10 @@ class _Pass:
             node.callee = u.call
             nodes.append(node)
         g = self.source
-        return Graph(g.name, g.kind, g.inputs, g.consts, nodes, g.outputs, g.requirements, g.finals)
+        renamed = getattr(self, "renamed", {})
+        outputs = tuple(renamed.get(v, v) for v in g.outputs)
+        finals = {k: renamed.get(v, v) for k, v in g.finals.items()}
+        return Graph(g.name, g.kind, g.inputs, g.consts, nodes, outputs, g.requirements, finals)
 
 
 # -- the synthetic kernel of a region ------------------------------------------------------------------------------------------------------

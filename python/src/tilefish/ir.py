@@ -96,7 +96,7 @@ class Node:
     versions, it has no output.
     """
 
-    __slots__ = ("op", "inputs", "attrs", "outputs", "callee", "loc", "origin")
+    __slots__ = ("op", "inputs", "attrs", "outputs", "callee", "loc", "origin", "scope")
 
     def __init__(
         self,
@@ -118,6 +118,9 @@ class Node:
         self.loc: "tuple[str, int] | None" = None
         # For a node of a fused region's kernel: its position in the region's body (the ops the region took, in order); ``None`` otherwise.
         self.origin: "int | None" = None
+        # The settings of the ``tilefish.fused`` scopes a node of a graph body was traced in (``{"epilogues": "accumulator"}``, the innermost's
+        # winning); ``None`` outside any. Like ``loc``, not printed and not compared: the fusion pass reads it (docs/rfcs/0003-epilogue-fusion.md, Q3).
+        self.scope: "dict[str, Any] | None" = None
 
     @property
     def output_types(self) -> "tuple[TensorType, ...]":
