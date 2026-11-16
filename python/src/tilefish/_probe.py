@@ -22,8 +22,8 @@ scratch slots every Triton kernel has, null in a production launch, so the ABI d
 and counts the rest: a count above the capacity says how many were dropped. A null buffer makes every probe skip its store.
 
 The build adds three probes of its own to every kernel it instruments: ``@begin`` at the entry of every warp (warp-specialised workers too),
-``@calib`` twice right after it, from the same instructions (the cycles from the first to the second are what one probe costs that warp, its code
-in the instruction cache), and ``@end`` before every ``ret`` (which writes the count). They are
+in warp 0 of each CTA ``@calib`` twice right after it, from the same instructions (the cycles from the first to the second are what one probe costs
+the warp, its code in the instruction cache), and ``@end`` before every ``ret`` (which writes the count). They are
 put in by rewriting the PTX of the entry, between Triton's ``ptx`` and ``cubin`` stages (:func:`instrument_ptx`); the kernel's probes are inline
 assembly that refers to the registers the rewrite declares (:func:`probe_asm`).
 
@@ -275,7 +275,7 @@ def _init(capacity: int, scratch: str) -> str:
         "\n\t// tilefish probes (docs/instrument.md): this warp's slot of the probe buffer, which the profile scratch parameter points to\n"
         "\t.reg .b64 %tfp_hdr, %tfp_rec;\n"
         "\t.reg .b32 %tfp_n, %tfp_cap, %tfp_k;\n"
-        "\t.reg .pred %tfp_again;\n"
+        "\t.reg .pred %tfp_again, %tfp_cal;\n"
         "\t{\n"
         "\t.reg .pred %tfon, %tflead;\n"
         "\t.reg .b64 %tfa, %tfo;\n"
@@ -303,14 +303,15 @@ def _init(capacity: int, scratch: str) -> str:
         "\tand.pred %tfon, %tfon, %tflead;\n"
         f"\tselp.u32 %tfp_cap, {capacity}, 0, %tfon;\n"
         "\tmov.u32 %tfp_n, 0;\n"
+        "\tsetp.eq.u32 %tfp_cal, %tfw, 0;\n"
         f"\t@%tfon st.global.v4.b32 [%tfp_hdr], {{{MAGIC}, %tfcta, %tfw, 0}};\n"
         "\t}\n"
         + _record(BEGIN)
-        # @calib twice, from the same instructions: the second's cycles after the first are what one probe costs the warp once its code is in the
-        # instruction cache (the first runs it cold)
-        + "\tmov.u32 %tfp_k, 0;\n$L__tfp_calib:\n"
+        # warp 0 of each CTA: @calib twice, from the same instructions (the second's cycles after the first are what one probe costs the warp once its
+        # code is in the instruction cache: the first runs it cold); the other warps go on (every warp paying for it would weigh on a short CTA)
+        + "\t@!%tfp_cal bra $L__tfp_nocal;\n\tmov.u32 %tfp_k, 0;\n$L__tfp_calib:\n"
         + _record(CALIB)
-        + "\tadd.u32 %tfp_k, %tfp_k, 1;\n\tsetp.lt.u32 %tfp_again, %tfp_k, 2;\n\t@%tfp_again bra $L__tfp_calib;\n"
+        + "\tadd.u32 %tfp_k, %tfp_k, 1;\n\tsetp.lt.u32 %tfp_again, %tfp_k, 2;\n\t@%tfp_again bra $L__tfp_calib;\n$L__tfp_nocal:\n"
     )
 
 

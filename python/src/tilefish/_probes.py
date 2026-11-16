@@ -132,8 +132,9 @@ class Launch:
         return statistics.median(rates) if rates else None
 
     def probe_cycles(self) -> "list[int]":
-        """What one probe costs each warp, in cycles: from its first ``@calib`` to its second (the same instructions back to back, the second with
-        its code in the instruction cache)."""
+        """What one probe costs a warp, in cycles, per warp 0 of each CTA (the warps that calibrate): from its first ``@calib`` to its second (the
+        same instructions back to back, the second with its code in the instruction cache). It is the latency of a probe in the warp; where the
+        warp would wait anyway (an ``mbarrier`` wait) a probe costs less."""
         out = []
         for w in self.warps:
             r = w.records
@@ -396,7 +397,7 @@ class ProbeTrace:
             )
             out.append(
                 f"  records {s['records']} kept, {s['dropped']} dropped (capacity {s['capacity']} per warp); SM clock {ghz}; a probe costs a warp "
-                f"{cost}; the probes' share of a warp's time, median over the warps: {over}"
+                f"{cost}; the probes' share of a warp's time at most (records times that cost, median over the warps): {over}"
             )
             if s["dropped"]:
                 out.append(f"  ! {s['dropped']} records were dropped: export with tilefish.instrument(capacity=...) larger to keep them")
