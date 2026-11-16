@@ -927,6 +927,24 @@ def _target_of(cubin: bytes, ptx: "str | None") -> str:
 _PROXY_BASE = {"sm_103a": "sm_100a", "sm_103f": "sm_100f", "sm_103": "sm_100", "sm_121a": "sm_120a", "sm_121f": "sm_120f", "sm_121": "sm_120"}
 
 
+_PTX_VERSION = re.compile(r"^(\s*\.version\s+)(\d+)\.(\d+)", re.M)
+_MIN_PTX_VERSION = {"sm_100": (8, 6), "sm_120": (8, 7)}  # the first PTX ISA with the target (a family base, and its a/f forms)
+
+
+def retarget(ptx: str, base: str) -> str:
+    """``ptx`` with its ``.target`` the family base ``base``, and its ``.version`` raised to the first PTX ISA that has that target where it is older
+    (a prebuilt PTX of ``.version 7.0`` / ``.target sm_80`` assembled for sm_103: ptxas refuses ``.target sm_100`` below 8.6). Nothing else changes."""
+    out = _TARGET_LINE.sub(lambda t: t.group(1) + base, ptx, count=1)
+    need = _MIN_PTX_VERSION.get(re.sub(r"[af]$", "", base))
+    m = _PTX_VERSION.search(out)
+    if need is not None and m is not None and (int(m.group(2)), int(m.group(3))) < need:
+        out = _PTX_VERSION.sub(lambda v: f"{v.group(1)}{need[0]}.{need[1]}", out, count=1)
+    return out
+
+
+_TARGET_LINE = re.compile(r"^(\s*\.target\s+)(sm_[0-9]+[a-z]?)", re.M)
+
+
 def disassemble(cubin: bytes, *, ptx: "str | None" = None, options: "Mapping[str, Any] | None" = None) -> Disassembly:
     """The SASS of ``cubin`` with line information (``nvdisasm -c -g`` and ``-c -gp``), by the first ``nvdisasm`` that decodes its architecture
     (:func:`tilefish._fpcontract.nvdisasm_candidates`). Where none does, ``ptx`` (the binary's PTX) is assembled for the base of the family
@@ -949,7 +967,7 @@ def disassemble(cubin: bytes, *, ptx: "str | None" = None, options: "Mapping[str
             raise TilefishBuildError(f"no nvdisasm here decodes {target} ({_fpcontract.nvdisasm_candidates() or 'none found'}); {how}")
         if not ptx:
             raise TilefishBuildError(f"no nvdisasm here decodes {target}, and the binary has no PTX to assemble for {base}, the base of its family; {how}")
-        proxied = _fpcontract._TARGET.sub(lambda t: t.group(1) + base, ptx, count=1)
+        proxied = retarget(ptx, base)
         binary = _fpcontract.assemble(proxied, base, proxy_flags(options or {}))
         nvdisasm = _fpcontract.disassembler_for(base, binary)
         if nvdisasm is None:

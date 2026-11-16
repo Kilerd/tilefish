@@ -463,6 +463,11 @@ def test_the_target_a_cubin_is_read_for():
     assert _sass._target_of(cubin, None) == "sm_103"
     assert _sass._target_of(cubin_like(**arch_header("sm_90")), ".target sm_90a\n") == "sm_90a"
     assert _sass._PROXY_BASE["sm_103"] == "sm_100" and _sass._PROXY_BASE["sm_103a"] == "sm_100a"
+    # the family base needs a PTX ISA new enough for it: an old prebuilt PTX's .version is raised (ptxas refuses .target sm_100 below 8.6)
+    old = ".version 7.0\n.target sm_80\n.address_size 64\n"
+    assert _sass.retarget(old, "sm_100") == ".version 8.6\n.target sm_100\n.address_size 64\n"
+    assert _sass.retarget(".version 8.8\n.target sm_103a\n", "sm_100a") == ".version 8.8\n.target sm_100a\n"
+    assert _sass.retarget(".version 8.0\n.target sm_121a\n", "sm_120a") == ".version 8.7\n.target sm_120a\n"
 
 
 def test_the_disassembly_label_says_when_the_sass_is_a_reassembly():
