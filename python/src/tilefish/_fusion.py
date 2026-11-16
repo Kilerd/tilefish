@@ -245,6 +245,7 @@ class Hooked:
     outputs: "list[Value]" = field(default_factory=list)
     views: "list[int]" = field(default_factory=list)  # program nodes (splits of the result) the unit takes
     main: "Value | None" = None  # the region's output the kernel stores into the hook's output (None: the result itself)
+    result_read: bool = True  # whether anything but the region reads the result (else, with no main, the kernel stores it into a buffer nothing reads)
     tiles: "list[Value]" = field(default_factory=list)  # the values the hook holds (the result, its chunks, its rounding)
     sources: "dict[str, Any]" = field(default_factory=dict)
 
@@ -1026,6 +1027,8 @@ class _Pass:
                     f"s, the {hook.split} chunks of a split of the last axis)" if hook.split > 1 else ")")
         used = [v for v in r.inputs if v in values]
         held = set(used)  # (a set: == of two values is an op of the trace)
+        if any(v in self.barriered for v in (*values, *made)):  # tilefish.barrier keeps the result stored and stops any epilogue fusion of it
+            return "barrier", f"the result of '{extern.name}' passes tilefish.barrier, which keeps it a boundary of the regions and of the call's hook"
         unit_views = [m for m, cs in views.items() if any(c in held for c in cs)]
         unit = {k, *members, *unit_views}
 
@@ -1101,12 +1104,8 @@ class _Pass:
                     continue
                 main, out_dtype = i, dt
                 break
-            if main is None:
-                shape = "[" + ", ".join(str(d) for d in tile_type.shape) + "]"
-                return "epilogue-no-output", (
-                    f"region {r.index} writes no tensor of the result's shape {shape}" + (f" and type {y.type.dtype}" if hook.value == "out" else " and a float type")
-                    + f", which the kernel would store in place of '{hook.out}' (the result is read by nothing else)"
-                )
+            # (no output of the result's shape and type: the kernel stores the result all the same, into a buffer nothing reads, and every output of
+            # the region is a side output: still one launch and one read of the result fewer than the region after the call)
         out_type = None
         if main is not None:  # the hook's output holds the region's output instead: its dtype, and one chunk of the columns for a split hook
             shape = list(out_param.type.shape)
@@ -1129,6 +1128,7 @@ class _Pass:
         except TilefishError as e:
             return "epilogue-hook", f"the hook of '{extern.name}' cannot take region {r.index}: {str(e).strip().splitlines()[0]}"
         h = Hooked(k, r, hook, extern, op, "accumulator" if is_acc else "exact")
+        h.result_read = y_needed
         h.views = [m for m in unit_views if not any(needed(c) for c in self.prog[m].outputs)]  # (a split whose chunks something else reads stays)
         h.main = r.outputs[main] if main is not None else None
         h.tiles = used
@@ -1378,6 +1378,8 @@ def report(gop: Any, verification: "Mapping[int, Any] | None" = None) -> "dict[s
                 "call": {"op": h.extern.name, "node": f.origin[h.call]}, "value": h.hook.value, "contract": h.contract,
                 "stored": h.main.ref if h.main is not None else "the result",
             })  # fmt: skip
+            if h.main is None and not h.result_read:
+                item["stored"] = "the result, which nothing reads (no output of the region has its shape and type)"
             if removed:
                 item["rounding_points_removed"] = [
                     {"value": w["value"], "dtype": w["dtype"], "widenings": w["widenings"], "reason": "R_acc: widened by the epilogue"} for w in removed
@@ -1482,7 +1484,6 @@ BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
         "Q10): a wider tile, or the split over tiles of E4",
         "4",
     ),
-    "epilogue-no-output": ("the region writes nothing of the result's shape (and type) for the kernel to store in its place: return such a value", "4"),
     "epilogue-template": ("the region does not lower to a hook (a gather, a scatter, a static slice, another iteration space than the result's)", "4"),
     "epilogue-hook": ("the extern's hook cannot take the region (its message says why)", "4"),
     "epilogue-dims": ("the region's sizes are not the extern's (a dimension of its own, bucketed): give it the extern's", "4"),
@@ -1587,6 +1588,11 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
                     refusal = next((x for x in f.refused if x["call"] == pk and x["region"] == r.index), None)
                     if refusal is not None:  # the call's extern has a hook, which does not take this region: why
                         add(refusal["reason"], _node_ref(f, pk), to, i, refusal["detail"])
+                        continue
+                    from ._epilogue import hooks_of_op
+
+                    if kind == "extern" and hooks_of_op(_extern_of(pn)) and f.settings.grouping == "none":
+                        add("unfused", _node_ref(f, pk), to, i, "the graph declares grouping='none': the extern is called as it is, every op a kernel of its own")
                         continue
                     what = "the extern declares no epilogue hook" if kind == "extern" else "no fusion across a call"
                     add(f"epilogue-{kind}", _node_ref(f, pk), to, i, f"the result of the call to '{pn.op}' is read by region {r.index}: {what}")
@@ -1712,10 +1718,11 @@ def _verify_hooked(f: Fused, h: Hooked, combos: "Sequence[Mapping[str, int]]", s
                 else:
                     env[v] = _sample(torch, t, sizes, seed * 1009 + k * 31 + sum(sizes), device)
             extra = [p.name for p in h.op.signature.tensor_inputs][len(call.inputs) :]  # (keyword-only parameters of the fused op)
-            got = runtime.run(h.op, *[env[v] for v in call.inputs], **{nm: env[v] for nm, v in zip(extra, region_in)})
+            # (each run on copies of the extern's operands: an InOut one is updated in place)
+            got = runtime.run(h.op, *[env[v].clone() for v in call.inputs], **{nm: env[v] for nm, v in zip(extra, region_in)})
             got = list(got) if isinstance(got, (tuple, list)) else [got]
             # the reference: the extern (or its accumulator form), every result stored, then the region's ops one kernel each
-            res = runtime.run(reference, *[env[v] for v in call.inputs])
+            res = runtime.run(reference, *[env[v].clone() for v in call.inputs])
             res = list(res) if isinstance(res, (tuple, list)) else [res]
             denv = dict(env)
             for o, val in zip(call.outputs[n_ret:], res):

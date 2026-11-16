@@ -81,6 +81,8 @@ MACHINES: "dict[str, Machine]" = {
 
 _ITEMSIZE = {"bf16": 2, "f16": 2, "f32": 4, "i32": 4, "i64": 8, "u8": 1, "e4m3": 1, "e5m2": 1}
 _GENERATED_COPY = re.compile(r"^(contiguous|im2col1d|im2col|col2im1d)_")
+_EPI = re.compile(r"_epi_[0-9a-f]{12}$")  # an extern with a region in its epilogue hook (docs/rfcs/0003-epilogue-fusion.md): <extern>_epi_<hash>
+_LOWERED_BLOCK = re.compile(r"^BLOCK(_D)?(_\d+)?$")  # the constexpr every kernel tilefish.lower writes has (the elementwise and the row template)
 _MMA = re.compile(r"\b(HMMA|IMMA|QMMA|OMMA|DMMA|HGMMA|IGMMA|QGMMA|UTCHMMA|UTCQMMA|UTCIMMA|UTCOMMA)\b")
 _PHASES = ("1", "2", "4", "future")
 STREAMING = 0.25  # a measured step moving its bytes (above the launch floor) at this share of the bandwidth or more is taken to be bound by them
@@ -92,12 +94,19 @@ BLOCKERS: "dict[str, tuple[str, str]]" = {
     "opaque-extern": ("write this extern's arithmetic in the graph body so fusion takes it (an elementwise one or, with order= on its sums, a row one)", "1"),
     "opaque-unknown": (
         "a hand-written kernel (export with trace=True to tell whether it computes MMAs): elementwise or row arithmetic, write it in the graph body so "
-        "phase 1 (or 2) fuses it; a GEMM, an attention or a convolution: an epilogue hook of it (phase 4) where it makes the intermediate, a prologue hook (future work) where it reads it",
+        "phase 1 (or 2) fuses it; a GEMM, an attention or a convolution: an epilogue hook of it (tilefish.hook, RFC 0003 E1) where it makes the "
+        "intermediate, a prologue hook (future work) where it reads it",
         "1",
     ),
     "opaque-compute-epilogue": (
         "the extern is bound by its arithmetic (MMAs in its SASS, or measured far below the bandwidth: a GEMM, an attention, a convolution, a search): "
-        "an epilogue hook of it (RFC 0001, section 7 route (c)), phase 4",
+        "declare an epilogue hook on it (tilefish.hook, RFC 0003 E1) and write the consumer's arithmetic in the graph body: exact (contract (i)) through a "
+        "value='out' hook, on the accumulator (contract (ii)) through a value='acc' one",
+        "4",
+    ),
+    "epilogue-hook-consumer": (
+        "the extern's epilogue hook takes graph-body arithmetic: write the consumer's arithmetic in the graph body (exact, contract (i), through its "
+        "value='out' hook; contract (ii) through its value='acc' hook under tilefish.fusion(epilogues='accumulator'))",
         "4",
     ),
     "opaque-compute-prologue": ("the extern is bound by its arithmetic: a prologue hook of it, future work (RFC 0001, section 11.3)", "future"),
@@ -212,10 +221,17 @@ class StepInfo:
     contracts: bool = False  # a @tilefish.kernel that lets the compiler contract (fp_fusion not False)
     mma: "bool | None" = None  # an opaque kernel: whether its SASS has MMAs (None: unknown, no trace)
     arith_bound: bool = False  # measured: it moves its bytes (above the launch floor) at less than STREAMING of the bandwidth
+    # an extern with epilogue hooks (docs/rfcs/0003-epilogue-fusion.md): the values of its hooks ("out", "acc"); ``None`` when it has hooks the export
+    # does not say (a generated module without a fusion report); and a step that is an extern with a region in its hook: the contract ("exact" or
+    # "accumulator")
+    hooks: "tuple[str, ...] | None" = ()
+    hooked: "str | None" = None
 
     def blocker(self, role: str) -> "str | None":
         """The blocker this step is for a fusion with a neighbour (``role``: ``"producer"`` or ``"consumer"`` of the intermediate)."""
         if self.cls == "opaque":
+            if role == "producer" and self.hooks != ():  # an extern with a hook: the consumer's arithmetic, in the graph body, fuses into it
+                return "epilogue-hook-consumer"
             if self.mma or self.arith_bound:
                 return "opaque-compute-epilogue" if role == "producer" else "opaque-compute-prologue"
             return "opaque-extern" if self.mma is False else "opaque-unknown"
@@ -282,7 +298,18 @@ class _Export:
         version = ((report or {}).get("fusion") or {}).get("version", 1)
         self.version = version if isinstance(version, int) and not isinstance(version, bool) else 1
         self.regions: "dict[str, dict[str, Any]]" = {}  # region kernel name -> {"index", "template", "ops", "body", "version"}
+        # docs/rfcs/0003-epilogue-fusion.md: the externs with epilogue hooks the graph calls (name -> the values of their hooks), the steps that are an
+        # extern with a region in its hook (op -> the report's entry), and the regions an extern's hook did not take (region kernel -> why)
+        self.hooks: "dict[str, tuple[str, ...]]" = {k: tuple(h.get("value") for h in v) for k, v in ((report or {}).get("hooks") or {}).items()}
+        self.hooked: "dict[str, dict[str, Any]]" = {}
+        self.refused: "dict[str, list[dict[str, Any]]]" = {}
+        self.epilogues = ((report or {}).get("fusion") or {}).get("epilogues", "exact")
         for i, r in enumerate((report or {}).get("regions") or []):
+            if r.get("route") == "hook":
+                self.hooked[r.get("op")] = r
+                continue
+            if r.get("epilogue_refused"):
+                self.refused[r.get("op")] = list(r["epilogue_refused"])
             self.regions[r.get("op")] = {"index": i, "template": r.get("template"), "nodes": r.get("nodes") or [], "roundings": r.get("roundings") or [],
                                          "inputs": r.get("inputs") or [], "version": self.version}
         for name, r in ((gdoc or {}).get("regions") or {}).items():
@@ -346,8 +373,31 @@ def _step_info(k: int, st: "Mapping[str, Any]", ex: _Export) -> StepInfo:
         info = StepInfo(k, kind, entry_name, op, "library", "conv" if (entry or {}).get("impl") == "cudnn.conv_fwd" else "gemm",
                         f"{op} [{_library_label(entry or {})}]", args)
         return info
-    region = ex.region_of(op)
     generated = bool((entry or {}).get("source_sha256"))
+    lang = "binary" if (entry or {}).get("kind") == "binary" else ("gluon" if (entry or {}).get("source_digest_kind") == "tilefish.gluon-ir.v1" else "triton")
+    hooked = ex.hooked.get(op or "")
+    if hooked is not None or (generated and _EPI.search(op or "")):  # an extern with a region in its epilogue hook: one step of both
+        call = ((hooked or {}).get("call") or {}).get("op") or _EPI.sub("", op or "")
+        contract = (hooked or {}).get("contract")
+        info = StepInfo(k, kind, entry_name, op, "opaque", "hooked", "", args)
+        info.hooked = contract or "exact"
+        info.mma = ex.mma(entry_name) if entry_name else None
+        body = ", ".join(f"#{n.get('index')} {n.get('op')}" for n in (hooked or {}).get("nodes") or [])
+        what = {"exact": "contract (i), exact", "accumulator": "contract (ii), on the accumulator"}.get(contract or "", "an epilogue hook")
+        info.label = f"{op} [{call} with a region in its {(hooked or {}).get('value', '?')} hook, {what}" + (f": {body}]" if body else "]")
+        return info
+    if generated and (op or "").endswith("__acc"):  # R_acc's accumulator form of an extern: it writes its f32 result too
+        info = StepInfo(k, kind, entry_name, op, "opaque", lang, f"{op} [{op[:-5]}'s accumulator form, R_acc: its f32 result written too]", args)
+        info.hooks = ex.hooks.get(op[:-5], None)
+        info.mma = ex.mma(entry_name) if entry_name else None
+        return info
+    if op in ex.hooks:  # an extern with epilogue hooks, called as it is
+        info = StepInfo(k, kind, entry_name, op, "opaque", lang, "", args)
+        info.hooks = ex.hooks[op]
+        info.mma = ex.mma(entry_name) if entry_name else None
+        info.label = f"{op} [{'Gluon' if lang == 'gluon' else 'Triton'} extern, epilogue hooks: {', '.join(info.hooks) or '-'}]"
+        return info
+    region = ex.region_of(op)
     if region is not None or (op or "").startswith("fused_"):
         template = (region or {}).get("template") or "elementwise"
         nodes = (region or {}).get("nodes") or (region or {}).get("body") or []
@@ -362,11 +412,15 @@ def _step_info(k: int, st: "Mapping[str, Any]", ex: _Export) -> StepInfo:
         return StepInfo(k, kind, entry_name, op, "copy", f"generated:{name}", f"{op} [generated {name}]", args)
     if generated:
         consts = {c.get("name") for c in (entry or {}).get("constexprs") or []}
+        if not any(_LOWERED_BLOCK.match(str(c)) for c in consts):  # a generated module of no template: an extern with hooks (no report says)
+            info = StepInfo(k, kind, entry_name, op, "opaque", lang, f"{op} [{'Gluon' if lang == 'gluon' else 'Triton'} extern, epilogue hooks]", args)
+            info.hooks = None
+            info.mma = ex.mma(entry_name) if entry_name else None
+            return info
         template = "row" if "BLOCK_D" in consts else "elementwise"
         info = StepInfo(k, kind, entry_name, op, template, "kernel", f"{op} [@tilefish.kernel, {template} template]", args)
         info.contracts = ((entry or {}).get("options") or {}).get("enable_fp_fusion") is not False
         return info
-    lang = "binary" if (entry or {}).get("kind") == "binary" else ("gluon" if (entry or {}).get("source_digest_kind") == "tilefish.gluon-ir.v1" else "triton")
     info = StepInfo(k, kind, entry_name, op, "opaque", lang, "", args)
     info.mma = ex.mma(entry_name) if entry_name else None
     what = {"binary": "prebuilt binary", "gluon": "Gluon extern", "triton": "Triton extern"}[lang]
@@ -592,6 +646,18 @@ def _region_reasons(a: StepInfo, b: StepInfo, ex: _Export) -> "list[tuple[str, s
     return out or _fallback_reasons(a, b, ex)
 
 
+def _hook_reasons(a: StepInfo, b: StepInfo, ex: _Export) -> "list[tuple[str, str]]":
+    """Why the epilogue hook of the extern step ``a`` did not take the region step ``b``: the fusion report's ``epilogue_refused`` of the region, else
+    the trace's (or the graph's) boundaries from the call to it."""
+    out = [(x.get("reason", "epilogue-hook"), x.get("detail", "")) for x in ex.refused.get(b.op or "", []) if (x.get("call") or {}).get("op") in (a.op, (a.op or "").removesuffix("__acc"))]
+    if not out and ex.boundaries is not None:
+        for bd in ex.boundaries:
+            fa, tb = bd.get("from") or {}, bd.get("to") or {}
+            if fa.get("op") in (a.op, (a.op or "").removesuffix("__acc")) and tb.get("kernel") in (b.op, (b.op or "").split("__ua", 1)[0]):
+                out.append((bd.get("reason", "epilogue-hook"), bd.get("detail", "")))
+    return [(r, d) for r, d in out if r in BLOCKERS]
+
+
 def _whole(view: "Mapping[str, Any] | None", shape: "Sequence[int]") -> bool:
     """Whether an argument's view is its whole buffer (or a dense reshape of all of it): what a region reads and writes in phase 1."""
     if view is None:
@@ -621,7 +687,8 @@ def _edge_blockers(e: Edge, infos: "Sequence[StepInfo]", ex: _Export, shapes: "M
         e.detail.append(f"step {b.index} (a row step) reads {e.buffer} through a view that is not dense")
     if a.cls == "library":
         e.blockers.append("epilogue-library")
-        e.detail.append(f"step {a.index} is a pinned {a.sub}: its epilogue is future work")
+        later = "E2 (a cuBLASLt epilogue) or E3 (a generated GEMM)" if a.sub == "gemm" else "E6 (a cuDNN fused graph) or E3 (a generated convolution)"
+        e.detail.append(f"step {a.index} is a pinned {a.sub}: its epilogue is RFC 0003's {later}, not yet; an extern with an epilogue hook fuses it today (E1)")
     if b.cls == "library":
         e.blockers.append("prologue-library")
         e.detail.append(f"step {b.index} is a pinned {b.sub}: its prologue is future work")
@@ -630,8 +697,15 @@ def _edge_blockers(e: Edge, infos: "Sequence[StepInfo]", ex: _Export, shapes: "M
             if reason not in e.blockers:
                 e.blockers.append(reason)
                 e.detail.append(detail)
+    hooked_reasons = _hook_reasons(a, b, ex) if a.cls == "opaque" and a.hooks != () and b.cls == "fused" else []
+    for reason, detail in hooked_reasons:  # an extern's hook that did not take the region: why (docs/rfcs/0003-epilogue-fusion.md)
+        if reason not in e.blockers:
+            e.blockers.append(reason)
+            e.detail.append(detail)
     for s, role in ((a, "producer"), (b, "consumer")):
         if s.cls == "library":
+            continue
+        if s is a and hooked_reasons:
             continue
         bl = s.blocker(role)
         if s.cls == "fused" and s.sub in ("row", "reduction") and not (a.cls == "fused" and b.cls == "fused"):
@@ -959,7 +1033,8 @@ class Advice:
         phase = max((BLOCKERS.get(b, ("", "future"))[1] for b in blockers), key=_phase_rank, default="1")
         # the blocker that decides when it can be one kernel: the one of the latest phase (the others are fixed sooner, or by the user)
         gate = max(blockers, key=lambda b: (_phase_rank(BLOCKERS.get(b, ("", "future"))[1]), -blockers.index(b)), default=None)
-        return {
+        routes = self._routes(steps, es, saved_us)
+        out = {
             "shape": shape,
             "steps": steps,
             "labels": [infos[k].label for k in steps],
@@ -974,6 +1049,57 @@ class Advice:
             "phase": phase,
             "gate": gate,
         }
+        if routes:  # (an epilogue of a GEMM or a convolution: only then, so every other candidate is as it was)
+            out["routes"] = routes
+        return out
+
+    def _routes(self, steps: "Sequence[int]", es: "Sequence[Edge]", saved_us: "Mapping[str, float]") -> "list[dict[str, Any]]":
+        """The routes into the producer of an epilogue candidate (docs/rfcs/0003-epilogue-fusion.md, section 5): for a pinned GEMM or convolution,
+        E2 / E6 (a library epilogue, contract (iii)), E3 (a generated op with hooks, its break-even slowdown) and E1 (an extern with a hook, today);
+        for an extern with epilogue hooks, each hook with its contract and what it needs; for an extern bound by its arithmetic, a hook to declare.
+        Each with the saving at the ranked bucket. The advisor never chooses between routes that give other bytes: the declaration does."""
+        infos = self.infos
+        producers = {e.producer for e in es} - {e.consumer for e in es}
+        if len(producers) != 1:
+            return []
+        p = infos[next(iter(producers))]
+        rk = _key(self.rank_bucket)
+        saving = round(saved_us[rk], 3)
+        if p.cls == "library":
+            t = (self.measured or {}).get(p.index) if self.measured is not None else None
+            t = t if t else self.costs[rk][p.index].est_us
+            breakeven = round(1.0 + saved_us[rk] / t, 3) if t else None
+            lib = (
+                {"route": "library epilogue", "milestone": "E2", "contract": "(iii) library: measured-exact against (ii) for bias, ReLU and beta * C; GELU binary-defined",
+                 "status": "not yet (tilefish.fusion(epilogues='library'))"}
+                if p.sub == "gemm"
+                else {"route": "cuDNN fused graph", "milestone": "E6", "contract": "(i) exact with a 16-bit intermediate (bias, ReLU); else (iii)", "status": "not yet"}
+            )  # fmt: skip
+            return [
+                {**lib, "saved_us": saving},
+                {"route": "generated op with hooks", "milestone": "E3", "contract": "(i) where measured equal to the pin (equal='cublaslt'), else (ii)",
+                 "status": "not yet", "saved_us": saving, "break_even": breakeven},
+                {"route": "extern with an epilogue hook", "milestone": "E1", "contract": "(i) through a value='out' hook, (ii) through value='acc'",
+                 "status": "available: call an extern of your own with tilefish.hook instead (python/examples/epilogue_gemm.py)", "saved_us": saving},
+            ]  # fmt: skip
+        if p.cls != "opaque" or p.hooked is not None:
+            return []
+        if p.hooks is None or p.hooks:
+            have = p.hooks or ("out", "acc")
+            mode = self.ex.epilogues
+            out = []
+            if "out" in have:
+                out.append({"route": "hook", "value": "out", "milestone": "E1", "contract": "(i) exact: the extern's bytes followed by the region's",
+                            "status": "available", "saved_us": saving})
+            if "acc" in have:
+                out.append({"route": "hook", "value": "acc", "milestone": "E1", "contract": "(ii) accumulator: one rounding fewer, other bytes",
+                            "status": "available" if mode == "accumulator" else "needs tilefish.fusion(epilogues='accumulator') or a tilefish.fused scope",
+                            "saved_us": saving})
+            return out
+        if p.mma or p.arith_bound:
+            return [{"route": "hook", "milestone": "E1", "contract": "(i) through a value='out' hook, (ii) through value='acc'",
+                     "status": "needs an epilogue hook declared on the extern (tilefish.hook)", "saved_us": saving}]
+        return []
 
     # -- the document --------------------------------------------------------------------------------------------------------------------------
 
@@ -1148,6 +1274,10 @@ class Advice:
                 lines.append(f"        why not today: {w}")
             for a in c["actions"]:
                 lines.append(f"        do: {a}")
+            for rt in c.get("routes") or []:  # an epilogue's routes, each with its contract (docs/rfcs/0003-epilogue-fusion.md)
+                be = f"; worth it while the generated op is under {rt['break_even']}x the pinned op's time" if rt.get("break_even") else ""
+                value = f" ({rt['value']})" if rt.get("value") else ""
+                lines.append(f"        route {rt['milestone']} {rt['route']}{value}: contract {rt['contract']}; {rt['status']}; ~{rt['saved_us']} us{be}")
         if len(cands) > top:
             lines.append(f"  ... {len(cands) - top} more (--json for all)")
         if d["patterns"]:
@@ -1257,7 +1387,9 @@ def advise(
         bounds = _fusion.boundaries(gop) if _fusion.has_arithmetic(gop) else []
         if _fusion.has_arithmetic(gop):
             ops = {str(e.get("op")).split("__ua", 1)[0] for e in manifest.get("kernels") or []}  # (an unaligned specialisation is its region's)
-            missing = sorted({r.kernel.name for r in _fusion.fused(gop).regions} - ops)
+            f = _fusion.fused(gop)
+            launched = {r.kernel.name for r in f.regions if f.hooked_region(r) is None} | {h.op.name for h in f.hooked}  # (a hooked region: its pair)
+            missing = sorted(launched - ops)
             if missing:
                 raise TilefishAdviseError(f"gop= is not the graph '{name}' was exported from: its fused regions {missing[:3]} are not in the manifest")
             if report is None:

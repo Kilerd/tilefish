@@ -61,7 +61,7 @@ At each bucket, for each step:
   | `fused` | a region of the graph body (`fused_<hash>`): elementwise, row, or a reduction alone |
   | `elementwise`, `row` | a `@tilefish.kernel`, lowered by that template |
   | `copy` | a copy or memset step, or a generated `tilefish.contiguous`, `im2col`, `im2col1d`, `col2im1d` |
-  | `opaque` | a hand-written Triton or Gluon extern, or a prebuilt binary (with the trace: with or without MMAs) |
+  | `opaque` | a hand-written Triton or Gluon extern, or a prebuilt binary (with the trace: with or without MMAs); an extern with epilogue hooks (its hooks in the label), its accumulator form (`<extern>__acc`), and an extern with a region in its hook (`<extern>_epi_<hash>`, sub `hooked`, the contract in the label) |
 
 * **the roofline**: a library step is memory-bound when its FLOPs per byte are below the machine balance (peak over bandwidth) and compute-bound
   above; an elementwise, row, fused or copy step is memory-bound; an opaque one is unknown (a kernel without MMAs: memory-bound). The estimate of
@@ -119,11 +119,12 @@ class gives one; the fusion pass gives the rest.
 |---|---|---|
 | `opaque-extern` | a hand-written kernel without MMAs: write its arithmetic in the graph body so fusion takes it (an elementwise one, or a row one with `order=` on its sums) | 1 |
 | `opaque-unknown` | the same, when there is no trace to tell whether it computes MMAs (and if it does: an epilogue hook where it makes the intermediate, a prologue hook where it reads it) | 1 |
-| `opaque-compute-epilogue`, `-prologue` | a hand-written kernel bound by its arithmetic: MMAs in its SASS, or (with a timing file) moving its bytes at less than a quarter of the bandwidth, such as an attention of FMAs or a search; an epilogue hook of the extern (route (c)); a prologue hook | 4, future |
+| `opaque-compute-epilogue`, `-prologue` | a hand-written kernel bound by its arithmetic: MMAs in its SASS, or (with a timing file) moving its bytes at less than a quarter of the bandwidth, such as an attention of FMAs or a search; declare an epilogue hook on the extern (`tilefish.hook`, RFC 0003 E1); a prologue hook | 4, future |
+| `epilogue-hook-consumer` | the producer is an extern with epilogue hooks, the consumer not graph-body arithmetic: write the consumer's arithmetic in the graph body, and the hook takes it (contract (i) through `value="out"`, (ii) through `value="acc"`) | 4 |
 | `dsl-kernel` | a `@tilefish.kernel` (elementwise): write its body in the graph body (RFC 8.2); exact as it is when it declares `fp_fusion=False` | 1 |
 | `dsl-kernel-contracts` | the same, for a kernel that lets the compiler contract: write `tilefish.fma` where it meant one rounding, or its bytes change | 1 |
 | `row-kernel` | a row `@tilefish.kernel`: write its body in the graph body, with `order=` on its sums, and fusion version 2 (the default) fuses it into a row region | 2 |
-| `epilogue-library`, `prologue-library` | a GEMM or convolution's epilogue or prologue: future work (RFC 0001, section 7 route (b), sections 11.2 and 11.3) | future |
+| `epilogue-library`, `prologue-library` | a pinned GEMM's or convolution's epilogue: RFC 0003's E2 (cuBLASLt epilogues: bias, ReLU, `beta * C`, contract (iii) under `epilogues="library"`), E3 (a generated GEMM or convolution with hooks) or E6 (a cuDNN fused graph); not yet. Today: call an extern with an epilogue hook instead (E1). A prologue: future work | future |
 | `copy-step` | a copy step: return or store the value where it is made | 1 |
 | `memset-step` | a memset step: its zeros are read from memory, never folded into a region (H2) | future |
 | `strided-output` | the producer writes the intermediate into part of a buffer (a column block, a head): a strided store (rule 7) | 2 |
@@ -147,7 +148,14 @@ entry per value that crosses a boundary, with the ops on both sides and their li
 | `cycle` | one region of both would make a cycle through a call or a move | move the call | 1 |
 | `limit` | more than 64 ops or 32 tensors in a region | a split is a speed choice only | 1 |
 | `move` | a copy or a store between them | return or store the value where it is made | 1 |
-| `epilogue-<kind>`, `prologue-<kind>` | a call's result read by a region, a region's value read by a call: no fusion across a call | library: future work; extern: a hook (phase 4); `@tilefish.kernel`: write its body in the graph body | future, 4, 1 |
+| `epilogue-<kind>`, `prologue-<kind>` | a call's result read by a region, a region's value read by a call: no fusion across a call (an extern: it declares no epilogue hook) | library: RFC 0003 E2, E3 or E6; extern: declare a hook (`tilefish.hook`, E1); `@tilefish.kernel`: write its body in the graph body | future, 4, 1 |
+| `epilogue-acc-only` | the extern hooks its accumulator only, and the graph is exact | declare `epilogues="accumulator"` (a graph or a `tilefish.fused` scope; contract (ii)), or give the kernel a `value="out"` hook (contract (i)) | 4 |
+| `epilogue-taken` | the call's hook took another region (one per call) | write both in one region | 4 |
+| `epilogue-view` | the region reads the result through a view the hook does not hold | read the result itself (or the chunks of a split hook) | 4 |
+| `epilogue-acc-shared` | the f32 result (`R_acc`) is read by more than the region | read it in one region | 4 |
+| `epilogue-cycle` | a call reads the result and feeds the region | move it out from between them | 4 |
+| `epilogue-row` | the region reduces rows, and a tile of the extern does not hold a whole row (`block_n`), or the kernel is a Gluon one | a wider tile; the split over tiles is E4 | 4 |
+| `epilogue-template`, `epilogue-hook`, `epilogue-dims` | the region does not lower to a hook, the hook cannot take it, or its sizes are not the extern's | the detail says | 4 |
 | `grouping` | the union is legal, but the greedy merge of the graph's fusion version did not make it | a later fusion version | 1 |
 | `unfused` | the graph declares `tilefish.fusion(grouping="none")`: one kernel per op | drop it (the default groups them) | 1 |
 
@@ -170,6 +178,15 @@ whose steps move the most bytes.
   them when a library op takes them in. The saving is at most the candidate's time less one floor. Candidates overlap (an elementwise step between
   two GEMMs is an epilogue of one and a prologue of the other), so their savings do not add up.
 
+**The routes of an epilogue** (`docs/rfcs/0003-epilogue-fusion.md`, section 5). A candidate whose producer is a GEMM or a convolution has `routes`:
+each a way the consumer's arithmetic could go into the producer, with the contract it gives, its status and the saving (the candidate's, at the ranked
+bucket). For a pinned cuBLASLt GEMM: E2 (a library epilogue, contract (iii)), E3 (a generated GEMM with hooks, contract (i) where it is measured equal
+to the pin, else (ii)) with its **break-even**, `1 + saving / T_gemm`, the slowdown of a generated GEMM at which the fusion stops paying (the advisor
+does not predict the generated GEMM's speed), and E1 (an extern of your own with an epilogue hook, available today); for a cuDNN convolution E6 (a
+fused graph) instead of E2. For an extern with epilogue hooks: its `value="out"` hook (contract (i), available) and its `value="acc"` hook (contract
+(ii), available under `epilogues="accumulator"`, else it says what to declare); for an extern bound by its arithmetic that declares no hook, the hook
+to declare. Routes that give other bytes are never chosen by the advisor or the planner on time: the measured times inform the declaration.
+
 `patterns` sums the candidates by the blocker of the latest phase each needs removed (each candidate counted once; the others it needs are listed
 as `also`): what that phase of fusion would unlock. A candidate whose latest blocker is `epilogue-library` needs GEMM epilogues whatever else is done.
 `recurring` sums the candidates whose steps run the same ops in the same order (a layer of a model, repeated): the fusion patterns, in the model's
@@ -181,8 +198,9 @@ The **time by class** sums the steps' times (measured, and the roofline estimate
 **The JSON** (`--json`, `Advice.doc`, `tilefish.advice.v1`): `graph`, `arch`, `plan_digest`, `bucket` (ranked at), `buckets` (analysed), `machine`,
 `timing`, `estimate`, `steps` (per step: `class`, `label`, `bytes_read`, `bytes_written`, `flops`, `intensity`, `bound`, `est_us`, and `us` and
 `achieved_GBps` when measured), `by_class`, `by_op`, `candidates` (each: `shape`, `steps`, `labels`, `classes`, `buffers`, `saved_bytes` and
-`saved_us` per bucket, `launches_removed`, `blockers`, `why`, `actions`, `phase`, `gate`, `rank`), `patterns`, `recurring`, `blocked`, `fan_outs`,
-`kept`, `unfused_arithmetic`. Informative, like the fusion report: no host reads it.
+`saved_us` per bucket, `launches_removed`, `blockers`, `why`, `actions`, `phase`, `gate`, `rank`, and `routes` for an epilogue of a GEMM or a
+convolution: each `route`, `milestone`, `contract`, `status`, `saved_us`, `value` for a hook and `break_even` for E3), `patterns`, `recurring`,
+`blocked`, `fan_outs`, `kept`, `unfused_arithmetic`. Informative, like the fusion report: no host reads it.
 
 ## 6. The profiler
 
@@ -260,7 +278,9 @@ after the plan that writes it, which the profiler does not set up).
   plan `block` on the command line (its residual, blocked by the MLP's GEMMs); the boundaries of a graph body (a barrier, unordered and ordered sums, calls, a materialised view) with their fixes, and that they change no
   region; a traced export by the fake compiler (its manifest, plan and fusion report the same bytes as without the trace; the trace's boundaries; the
   advice with the trace, without it, and with `gop=`); the profiler's runtime path on a fake backend (the events around each step, the same launches
-  as a run, both methods, a longer spin for a slow host).
+  as a run, both methods, a longer spin for a slow host). `python/tests/test_epilogue.py`: an extern with epilogue hooks next to a kernel step (an
+  actionable candidate, its hooks' routes and contracts), with and without the fusion report; a step of an extern with a region in its hook; the routes
+  of a GEMM's epilogue (E1, E2, E3 with its break-even); every reason a hook gives a fix.
 * `python/tests/test_gpu_advise.py` (a device; arch-agnostic: ran on sm_103 and sm_120, the sm_90 run is a later gate's): every step timed,
   the export's files and a run's bytes unchanged by profiling, the nets adding up to the plan's time, both methods agreeing, the command line
   (`--profile`, then `--advise --timing`).

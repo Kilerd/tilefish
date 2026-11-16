@@ -588,6 +588,25 @@ Notes (the facts behind the table):
     has no run of more than ``log2(D)`` equal bits, so the double is never on a midpoint of f32), as the ``reference`` mode computes it. Not
     ``rcp.rn.f32(D)``: ptxas expands that next to the multiply into fused multiply-adds, which the contraction check refuses.
 
+22. **Epilogue hooks** (``docs/rfcs/0003-epilogue-fusion.md``, :func:`lower_hook`, :mod:`tilefish._epilogue`). A region fused into an extern's
+    epilogue hook is lowered to a ``@triton.jit`` function ``hook(tile, rows, cols, row_mask, col_mask, args)`` that the extern's kernel calls on each
+    tile of its output where it would store it; the region's other inputs, its side outputs and the sizes it needs are ``args``. The code of every op
+    is the region's (note 20: context-free, no contraction, every narrowing cast inline PTX): only how an operand is addressed differs.
+
+    * **The elementwise template on a tile** (``"hook"``): the element a lane holds is ``offs = rows[:, None] * L + cols[None, :]`` of the output seen
+      as ``[R, L]``, the lane of note 12, so every operand is read at the offset the elementwise template reads it at (broadcasts along any axis,
+      views where they are, a broadcast count or a size a number where it is static); the tiles (the extern's result, its chunks, its rounding) are
+      held, never loaded. Every value is a full ``[BM, BN]`` tile: a per-column operand is loaded at ``offs % n`` like every other, so the layouts of a
+      Gluon kernel's tile agree (a Gluon kernel calls the same ``@triton.jit`` hook; a ``-0.0`` scalar is ``tl.cast(bits).to(..., bitcast=True)``
+      there, the same bits, as Gluon's ``tl.full`` needs a layout).
+    * **The row template on a tile that holds whole rows** (``"hook-row"``, a Triton kernel, ``D`` static and the extern's tile ``BN >= D``): an
+      ``[R, D]`` value is the tile, ``[D]`` is ``[BN]`` at ``cols``, ``[R]`` and ``[R, 1]`` are ``[BM, 1]``; an ordered sum of every row of the tile
+      (``_tf_hsum_*``) makes the columns at or past ``D`` ``-0.0`` (as revision 2 does), reshapes the tile to ``[BM, lanes, K]`` (lane ``j``'s columns
+      in its order), takes the chains by halving splits (note 21's, with a leading axis of rows), a lane with no column ``+0.0`` (a tile narrower
+      than a round of the order: the lanes that have columns, then ``+0.0`` lanes joined, data movement), and revision 1's tree over the lanes by
+      splits: the terms of the row template's sum in its order, so its bits; ``max`` is order-free (E2 of RFC 0001). No unordered reduction (D2), no
+      ``argmax``, gather or static slice.
+
 **``num_warps`` and the numerics identity** (decided on measurements, ``tests/test_gpu_reduction_order.py``). What depends on ``num_warps`` is
 Triton's own reductions: ``tl.sum`` (``sum`` without ``order``, ``mean``) adds in a tree that the warp count shapes (note 6; on 1024 rows of
 values of every magnitude, 669 to 878 rows differ between 1 warp and 2 to 16, at 96, 1000 and 4096 columns), and ``tl.max`` reduces in the same
