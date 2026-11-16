@@ -110,7 +110,7 @@ def test_the_declaration_is_checked_against_its_signature_at_every_bucket():
         tilefish.library("g", acc=f32, impl="cublaslt.gemm", stride=2)(_gemm)
     with pytest.raises(TilefishDeclarationError, match="need impl='cudnn.conv_fwd'"):
         tilefish.library("x", padding=1)
-    with pytest.raises(TilefishDeclarationError, match=r"impl must be one of \['cublaslt.gemm', 'cublaslt.gemm_bias', 'cudnn.conv_fwd'\]"):
+    with pytest.raises(TilefishDeclarationError, match=r"impl must be one of \['cublaslt.gemm', 'cublaslt.gemm_bias', 'cublaslt.matmul', 'cudnn.conv_fwd'\]"):
         tilefish.library("x", acc=f32, impl="cudnn.conv_bwd")(nhwc_k7)
 
 

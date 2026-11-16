@@ -210,6 +210,10 @@ class LibraryOp(Op):
         sm_count_target: "int | None" = None,
         allow_f32_reduction: bool = False,
         conv: Any = None,
+        epilogue: "str | None" = None,
+        beta: int = 0,
+        canary: bool = False,
+        contract: "str | None" = None,
     ) -> None:
         super().__init__(fn, name, signature)
         self.acc = acc
@@ -223,6 +227,12 @@ class LibraryOp(Op):
         self.sm_count_target = sm_count_target
         self.allow_f32_reduction = allow_f32_reduction
         self.conv = conv  # tilefish._conv.ConvOptions of a cudnn.conv_fwd, else None
+        # of a cublaslt.matmul (tilefish._library, docs/manifest-schema-3.md section 9.5): its epilogue, beta (1: it reads c), whether export records a
+        # canary, and the contract its pins must have ("measured-exact", or None: either is recorded)
+        self.epilogue = epilogue
+        self.beta = beta
+        self.canary = canary
+        self.contract = contract
 
     def node_attrs(self) -> dict[str, Any]:
         return {"acc": self.acc} if self.acc is not None else {}
@@ -248,6 +258,10 @@ def library(
     math: "str | None" = None,
     api: "str | None" = None,
     alignment: "int | None" = None,
+    epilogue: "str | None" = None,
+    beta: "int | None" = None,
+    canary: "bool | None" = None,
+    contract: "str | None" = None,
 ) -> Any:
     """``@tilefish.library("gemm", acc=f32)``: declare an operator by signature only.
 
@@ -274,6 +288,15 @@ def library(
     * ``sm_count_target``: the SM count the heuristic chooses for (``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET``, at least 8 and at most the
       device's), for a GEMM that runs on a partition of the device's SMs (a green context); every check and run of the pin sets it too
       (``docs/manifest-schema-3.md``, section 9.3).
+
+    ``impl="cublaslt.matmul"`` is a GEMM with a cuBLASLt epilogue (RFC 0003, E2; ``docs/manifest-schema-3.md``, section 9.5): ``epilogue=`` one of
+    ``"none"``, ``"bias"``, ``"relu"``, ``"relu_bias"``, and ``beta=1`` to add ``c``. The signature is ``(a, b[, bias: Tensor[N, T]][, c: Tensor[M,
+    N, T]]) -> Tensor[M, N, T]`` with ``T`` bf16 or f16 (the layouts above), and the result is ``epilogue(acc [+ c] [+ bias])`` on the f32
+    accumulator, in that order, rounded once to ``T``: the library's bytes under the pin (contract (iii)). Every pin is verified at the build
+    against that formula in f32 on seeded and special-value operands and recorded ``"measured-exact"`` or ``"binary-defined"`` (``contract=
+    "measured-exact"`` refuses a pin that is not); an epilogue gets no split-K unless the declaration opts in; ``canary=True`` (the default) has
+    ``export`` record a canary, which a load runs. ``heuristic``, ``workspace_bytes``, the opt-ins, ``layout`` and ``sm_count_target`` are as for
+    ``gemm``; ``algos`` is not taken yet.
 
     ``impl="cudnn.conv_fwd"`` says a pinned cuDNN forward convolution runs it (:mod:`tilefish._conv`, ``docs/manifest-schema-3.md``, section 9.4): the
     signature is ``(x, w) -> y`` in the order of ``layout`` (``"NCHW"``, the default: ``x [N, C, *S]``, ``w [K, C/G, *R]``; ``"NHWC"``: ``x [N, *S, C]``,
@@ -302,6 +325,8 @@ def library(
         )
     if impl is None and any(v is not None for v in (stride, padding, dilation, groups, math, api, alignment)):
         raise TilefishDeclarationError("library: stride, padding, dilation, groups, math, api and alignment need impl='cudnn.conv_fwd'")
+    if impl != "cublaslt.matmul" and any(v is not None for v in (epilogue, beta, canary, contract)):
+        raise TilefishDeclarationError("library: epilogue, beta, canary and contract need impl='cublaslt.matmul'")
 
     def make(fn: Callable[..., Any], op_name: str | None) -> LibraryOp:
         nm = op_name or fn.__name__
@@ -344,11 +369,17 @@ def library(
         f32_reduction = False if allow_f32_reduction is None else allow_f32_reduction
         lay = "TN" if layout is None else layout
         tables = _library.check_options(nm, posture, bf16_reduction, algos, f16_reduction, lay, sm_count_target, f32_reduction)
-        if impl not in _library.IMPLS:
-            raise TilefishDeclarationError(f"library op '{nm}': impl must be one of {sorted([*_library.IMPLS, _conv.IMPL])}, got {impl!r}")
-        ws = _library.default_workspace_bytes(impl, posture) if workspace_bytes is None else workspace_bytes
-        _library.check_declaration(nm, impl, sig, acc, ws, lay, bf16_reduction, f16_reduction, f32_reduction)
-        op = LibraryOp(fn, nm, sig, acc, impl, ws, posture, bf16_reduction, tables, lay, f16_reduction, sm_count_target, f32_reduction)
+        if impl not in _library.CUBLASLT_IMPLS:
+            raise TilefishDeclarationError(f"library op '{nm}': impl must be one of {sorted([*_library.CUBLASLT_IMPLS, _conv.IMPL])}, got {impl!r}")
+        matmul: "dict[str, Any]" = {}
+        if impl == _library.IMPL_MATMUL:
+            epi, b, can, con = _library.check_matmul_options(nm, epilogue, beta, canary, contract, algos)
+            matmul = {"epilogue": epi, "beta": b, "canary": can, "contract": con}
+        ws = _library.default_workspace_bytes(impl, posture, matmul.get("epilogue")) if workspace_bytes is None else workspace_bytes
+        _library.check_declaration(
+            nm, impl, sig, acc, ws, lay, bf16_reduction, f16_reduction, f32_reduction, matmul.get("epilogue"), matmul.get("beta", 0)
+        )
+        op = LibraryOp(fn, nm, sig, acc, impl, ws, posture, bf16_reduction, tables, lay, f16_reduction, sm_count_target, f32_reduction, **matmul)
         _library.check_coverage(op)
         return op
 

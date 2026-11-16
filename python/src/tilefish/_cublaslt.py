@@ -181,7 +181,13 @@ CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE = 26
 MIN_SM_COUNT_TARGET = 8
 # cublasLt.h, cublasLtEpilogue_t
 CUBLASLT_EPILOGUE_DEFAULT = 1
+CUBLASLT_EPILOGUE_RELU = 2
 CUBLASLT_EPILOGUE_BIAS = 4
+CUBLASLT_EPILOGUE_RELU_BIAS = 6  # CUBLASLT_EPILOGUE_RELU | CUBLASLT_EPILOGUE_BIAS
+# The epilogues of the impl cublaslt.matmul, by tilefish's name (docs/manifest-schema-3.md, section 9.5); "none" is DEFAULT. Every one but "none" acts
+# on the f32 accumulator, before the one rounding to the type of D (the header says so).
+EPILOGUES = {"none": CUBLASLT_EPILOGUE_DEFAULT, "bias": CUBLASLT_EPILOGUE_BIAS, "relu": CUBLASLT_EPILOGUE_RELU, "relu_bias": CUBLASLT_EPILOGUE_RELU_BIAS}
+EPILOGUES_WITH_BIAS = ("bias", "relu_bias")
 # cublasLt.h, cublasLtMatmulPreferenceAttributes_t (MAX_WORKSPACE_BYTES uint64_t, the others uint32_t)
 CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 1
 CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK = 3
@@ -307,10 +313,13 @@ def allowed_reduction_schemes(allow_bf16_reduction: bool, bias: bool = False) ->
     return (CUBLASLT_REDUCTION_SCHEME_NONE,) if bias else ALLOWED_REDUCTION_SCHEMES
 
 
-def reduction_problem(splitk_num: int, reduction_scheme: int, allow_bf16_reduction: bool, bias: bool = False, form: "Form | None" = None) -> "str | None":
+def reduction_problem(
+    splitk_num: int, reduction_scheme: int, allow_bf16_reduction: bool, bias: bool = False, form: "Form | None" = None, epilogue: str = "bias"
+) -> "str | None":
     """What is wrong with this split-K count and reduction scheme for a pin of a GEMM with or without a bias, of ``form`` (``None``: nothing).
     ``allow_bf16_reduction`` is the opt-in of the operands' type (:func:`opt_in`). Pure: the rule both hosts hold an algorithm to (the Rust crate's
-    ``reduction_problem`` has the same words); for the default form the words are tilefish 0.0.5's."""
+    ``reduction_problem`` has the same words); for the default form the words are tilefish 0.0.5's. ``bias`` stands for any epilogue but ``DEFAULT``
+    (the rule of a GEMM with a bias extends to every epilogue of ``cublaslt.matmul``), and ``epilogue`` names it in the message (``"relu"``)."""
     form = DEFAULT_FORM if form is None else form
     if splitk_num < 1:
         return f"split-K count {splitk_num} is below 1"
@@ -330,6 +339,12 @@ def reduction_problem(splitk_num: int, reduction_scheme: int, allow_bf16_reducti
     if reduction_scheme not in ALLOWED_REDUCTION_SCHEMES + BF16_REDUCTION_SCHEMES:
         return f"reduction scheme {reduction_scheme} is not one cuBLASLt defines (0, 1, 2 or 4)"
     if bias and splitk_num > 1 and not allow_bf16_reduction:
+        if epilogue != "bias":
+            return (
+                f"split-K count {splitk_num} with the {epilogue} epilogue may apply it to a sum already rounded to {form.out} (as the bias epilogue was "
+                f"measured to, with f32 partial sums too), which rounds twice; a GEMM with an epilogue has no split-K unless its declaration opts in "
+                f"with {form.opt_in}=True"
+            )
         return (
             f"split-K count {splitk_num} with the bias epilogue may add the bias to a sum already rounded to {form.out} (measured with f32 partial "
             f"sums too), which rounds twice; a GEMM with a bias has no split-K unless its declaration opts in with {form.opt_in}=True"
@@ -659,6 +674,33 @@ def _check_problem(m: object, n: object, k: object, bias: object) -> "tuple[int,
     return m, n, k, bias
 
 
+def _epilogue_of(bias: bool, epilogue: object) -> str:
+    """The epilogue of a call: ``epilogue`` (one of :data:`EPILOGUES`), or, when it is ``None``, the one of ``gemm`` and ``gemm_bias`` (``"bias"`` with a
+    bias, else ``"none"``). A bias given to an epilogue that has none is refused."""
+    if epilogue is None:
+        return "bias" if bias else "none"
+    if epilogue not in EPILOGUES:
+        raise TilefishRuntimeError(f"cuBLASLt matmul: epilogue must be one of {list(EPILOGUES)}, got {epilogue!r}")
+    if bias and epilogue not in EPILOGUES_WITH_BIAS:
+        raise TilefishRuntimeError(f"cuBLASLt matmul: the epilogue {epilogue!r} has no bias, and bias=True was given")
+    return str(epilogue)
+
+
+def _check_beta(beta: object) -> int:
+    """``beta``: ``0`` (``C`` is not read) or ``1`` (``D = epilogue(acc + C)``), an int."""
+    if isinstance(beta, bool) or beta not in (0, 1) or not isinstance(beta, int):
+        raise TilefishRuntimeError(f"cuBLASLt matmul: beta must be 0 or 1 (an int), got {beta!r}")
+    return int(beta)
+
+
+def _what(m: int, n: int, k: int, bias: bool, form: "Form", epilogue: "str | None", beta: int = 0) -> str:
+    """A problem as a message names it: tilefish 0.0.5's words for ``gemm`` and ``gemm_bias`` (``epilogue`` ``None``), the epilogue and ``beta`` of a
+    ``cublaslt.matmul``."""
+    if epilogue is None:
+        return f"the matmul m={m} n={n} k={k} bias={bias}{form.label}"
+    return f"the matmul m={m} n={n} k={k} epilogue={epilogue}{' beta=1' if beta else ''}{form.label}"
+
+
 def _check_pointer(name: str, value: object) -> int:
     value = _int_arg(f"{name} pointer", value, low=1, high=UINT64_MAX)
     if value % ALIGNMENT_BYTES:
@@ -708,18 +750,35 @@ def describe(
     allow_f32_reduction: bool = False,
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
+    epilogue: "str | None" = None,
+    beta: int = 0,
 ) -> "dict[str, Any]":
     """The exact cuBLAS-level problem that tilefish's ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` without the transpose for the
     layouts ``NN`` and ``NT``, ``A[k, m]^T`` for ``TT`` and ``NT``) is posed as (pure: no GPU, no library).
 
     The keys are what is passed to cuBLASLt: the types, the transposes, the compute and scale types, the sizes ``cublas_m = n``,
-    ``cublas_n = m``, ``cublas_k = k`` and the leading dimensions of the column-major operands.
+    ``cublas_n = m``, ``cublas_k = k`` and the leading dimensions of the column-major operands. ``epilogue`` (one of :data:`EPILOGUES`) and ``beta``
+    (0 or 1) are those of a ``cublaslt.matmul``; ``None`` is ``gemm`` or ``gemm_bias`` (by ``bias``), whose description is tilefish 0.0.5's.
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     form = check_form(form)
     allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)
     target = _check_target(sm_count_target)
     ab, cd = CUDA_TYPE_NAMES[form.dtype], CUDA_TYPE_NAMES[form.out]
+    if epilogue is not None:
+        name = _epilogue_of(bias, epilogue)
+        with_bias = name in EPILOGUES_WITH_BIAS
+        out = describe(
+            m, n, k, with_bias, allow_bf16_reduction=allow_bf16_reduction, allow_f16_reduction=allow_f16_reduction,
+            allow_f32_reduction=allow_f32_reduction, form=form, sm_count_target=sm_count_target,
+        )  # fmt: skip
+        beta = _check_beta(beta)
+        out["epilogue"] = name
+        out["cublaslt_epilogue"] = EPILOGUES[name]  # CUBLASLT_MATMUL_DESC_EPILOGUE
+        out["beta"] = float(beta)
+        out["c_pointer"] = "C[M, N]" if beta else "D (never read)"
+        out["reduction_schemes"] = list(allowed_reduction_schemes(allow, name != "none"))
+        return out
     return {
         "library": "cublasLt",
         "operation": "matmul",
@@ -792,9 +851,12 @@ class _Problem:
         preference: "list[tuple[int, int]] | None",
         form: "Form | None" = None,
         sm_count_target: "int | None" = None,
+        epilogue: "str | None" = None,
     ) -> None:
         self.lib = lib
-        self.bias = bias
+        self.epilogue = name = _epilogue_of(bias, epilogue)  # "bias" with a bias, else "none", for gemm and gemm_bias
+        self.bias = bias = name in EPILOGUES_WITH_BIAS
+        self.any_epilogue = name != "none"  # the rule of a GEMM with a bias (no split-K without the opt-in) holds for every epilogue but DEFAULT
         self.form = form = DEFAULT_FORM if form is None else form
         self.sm_count_target = sm_count_target
         ab, cd = CUDA_TYPES[form.dtype], CUDA_TYPES[form.out]
@@ -803,12 +865,10 @@ class _Problem:
             self.desc = self._create("cublasLtMatmulDescDestroy", "cublasLtMatmulDescCreate", CUBLAS_COMPUTE_32F, CUDA_R_32F)
             self._set(CUBLASLT_MATMUL_DESC_TRANSA, ctypes.c_int32(form.transa))
             self._set(CUBLASLT_MATMUL_DESC_TRANSB, ctypes.c_int32(form.transb))
+            self._set(CUBLASLT_MATMUL_DESC_EPILOGUE, ctypes.c_uint32(EPILOGUES[name]))
             if bias:
-                self._set(CUBLASLT_MATMUL_DESC_EPILOGUE, ctypes.c_uint32(CUBLASLT_EPILOGUE_BIAS))
                 self._set(CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, ctypes.c_int32(cd))  # the bias has the type of D (the only one the library takes)
                 self._set(CUBLASLT_MATMUL_DESC_BIAS_POINTER, ctypes.c_void_p(bias_ptr))
-            else:
-                self._set(CUBLASLT_MATMUL_DESC_EPILOGUE, ctypes.c_uint32(CUBLASLT_EPILOGUE_DEFAULT))
             if sm_count_target is not None:
                 self._set(CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, ctypes.c_int32(sm_count_target))
             if form.layout[0] == "T":
@@ -987,8 +1047,10 @@ def _validate_algo(
     allow_bf16_reduction: bool = False,
     bias: bool = False,
     form: "Form | None" = None,
+    epilogue: str = "bias",
 ) -> "dict[str, int]":
-    """Refuse an algorithm that cuBLASLt itself would not have produced, before ``cublasLtMatmulAlgoCheck`` sees it.
+    """Refuse an algorithm that cuBLASLt itself would not have produced, before ``cublasLtMatmulAlgoCheck`` sees it. (``bias`` is any epilogue but
+    ``DEFAULT``, which ``epilogue`` names in a refusal.)
 
     Measured (cuBLASLt 12.8.4 on a B300): ``cublasLtMatmulAlgoCheck`` accepts an algorithm with a changed version field, changed
     padding, a reserved CTA swizzling or an out-of-range custom option, and it crashes the process (SIGSEGV) on a tile id of
@@ -1008,7 +1070,7 @@ def _validate_algo(
         return cached
     head = f"the pinned cuBLASLt algorithm {algo_hex[:16]}... is not one cuBLASLt produces for {form.what} with f32 accumulation"
     try:
-        cfg = _validate_algo_bytes(lib, handle, algo_hex, head, allow_bf16_reduction, bias, form)
+        cfg = _validate_algo_bytes(lib, handle, algo_hex, head, allow_bf16_reduction, bias, form, epilogue)
     except TilefishRuntimeError as e:
         if str(e).startswith(head):
             raise
@@ -1031,6 +1093,7 @@ def _validate_algo_bytes(
     allow_bf16_reduction: bool = False,
     bias: bool = False,
     form: Form = DEFAULT_FORM,
+    epilogue: str = "bias",
 ) -> "dict[str, int]":
     algo = _algo_struct(algo_hex)
     cfg = _algo_config(lib, algo)
@@ -1053,7 +1116,7 @@ def _validate_algo_bytes(
     custom_max = _cap(lib, fresh, _CAP_CUSTOM_OPTION_MAX, ctypes.c_int32)
     if cfg["custom_option"] > custom_max:
         problems.append(f"custom option {cfg['custom_option']} is above the maximum {custom_max} of algorithm {cfg['id']}")
-    reduction = reduction_problem(cfg["splitk_num"], cfg["reduction_scheme"], allow_bf16_reduction, bias, form)
+    reduction = reduction_problem(cfg["splitk_num"], cfg["reduction_scheme"], allow_bf16_reduction, bias, form, epilogue)
     if reduction is not None:
         problems.append(reduction)
     problems += numerics_problems(_cap(lib, fresh, _CAP_NUMERICAL_IMPL_FLAGS, ctypes.c_uint64), compute_type_of(bytes(fresh)), form)
@@ -1103,9 +1166,12 @@ def pin_algo(
     allow_f32_reduction: bool = False,
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
+    epilogue: "str | None" = None,
 ) -> Pinned:
     """Ask the heuristic for the algorithm of ``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``form``: the types and the layout) under a workspace
-    limit, and pin the first.
+    limit, and pin the first. ``epilogue`` (one of :data:`EPILOGUES`; ``None``: ``"bias"`` or ``"none"`` by ``bias``) is the epilogue the heuristic
+    chooses for: every one but ``"none"`` is asked for an algorithm without split-K unless the declaration opts in, as a bias is. (``beta`` is no part
+    of what the heuristic is asked: a ``C`` has the layout of ``D``.)
 
     ``workspace_bytes`` is the limit the heuristic works under (:data:`DEFAULT_WORKSPACE_BYTES` is torch's default workspace
     config). ``heuristic`` is the posture (:data:`HEURISTICS`, see the module docstring): ``"tilefish"`` asks for a few results with
@@ -1126,9 +1192,14 @@ def pin_algo(
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    no_split_k = f"; a GEMM with a bias is asked for one without split-K, unless it opts in with {form.opt_in}=True" if bias and not allow else ""
-    what = f"the matmul m={m} n={n} k={k} bias={bias}{form.label}"
-    with _on_device(index), _Problem(lib, m, n, k, bias, dummy, preferences(heuristic, limit, allow, bias), form, target) as p:
+    name = _epilogue_of(bias, epilogue)
+    bias, any_epilogue = name in EPILOGUES_WITH_BIAS, name != "none"
+    no_split_k = f"; a GEMM with a bias is asked for one without split-K, unless it opts in with {form.opt_in}=True" if any_epilogue and not allow else ""
+    if epilogue is not None and no_split_k:
+        no_split_k = f"; a GEMM with an epilogue is asked for one without split-K, unless it opts in with {form.opt_in}=True"
+    what = _what(m, n, k, bias, form, epilogue)
+    prefs = preferences(heuristic, limit, allow, any_epilogue)
+    with _on_device(index), _Problem(lib, m, n, k, bias, dummy, prefs, form, target, epilogue) as p:
         results = (_HeuristicResult * count)()
         returned = ctypes.c_int(0)
         status = lib.call(
@@ -1231,7 +1302,8 @@ def _check(
     what: str,
     allow_bf16_reduction: bool = False,
 ) -> int:
-    _validate_algo(lib, handle, index, algo_hex, allow_bf16_reduction, p.bias, p.form)
+    named = {} if p.epilogue in ("none", "bias") else {"epilogue": p.epilogue}  # (the words of a refusal; gemm and gemm_bias call as 0.0.11 did)
+    _validate_algo(lib, handle, index, algo_hex, allow_bf16_reduction, p.any_epilogue, p.form, **named)
     algo = _algo_struct(algo_hex)
     result = _HeuristicResult()
     try:
@@ -1264,13 +1336,15 @@ def check_algo(
     allow_f32_reduction: bool = False,
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
+    epilogue: "str | None" = None,
+    beta: int = 0,
 ) -> int:
-    """The workspace the pinned algorithm needs for this problem (of ``form``, for ``sm_count_target`` SMs), after ``cublasLtMatmulAlgoCheck``
-    approved it.
+    """The workspace the pinned algorithm needs for this problem (of ``form``, for ``sm_count_target`` SMs, with ``epilogue``: see :func:`pin_algo`),
+    after ``cublasLtMatmulAlgoCheck`` approved it.
 
     Raises :class:`~tilefish.errors.TilefishRuntimeError` when the algorithm is not valid for the problem on this device, or needs
     more than ``workspace_bytes`` (the workspace recorded with the pin), or adds split-K partial sums in the output type without the opt-in
-    of the operands' type.
+    of the operands' type (or splits ``k`` at all with an epilogue, without it).
     """
     m, n, k, bias = _check_problem(m, n, k, bias)
     budget = _check_workspace(workspace_bytes)
@@ -1278,12 +1352,14 @@ def check_algo(
     form = check_form(form)
     allow = opt_in(form, allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)
     target = _check_target(sm_count_target)
+    name = _epilogue_of(bias, epilogue)
+    beta = _check_beta(beta)
     algo_from_hex(algo_hex)  # the format, before anything reaches the library
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    with _on_device(index), _Problem(lib, m, n, k, bias, HEURISTIC_BIAS_POINTER, None, form, target) as p:
-        return _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}{form.label}", allow)
+    with _on_device(index), _Problem(lib, m, n, k, bias, HEURISTIC_BIAS_POINTER, None, form, target, epilogue) as p:
+        return _check(lib, handle, index, p, algo_hex, budget, _what(m, n, k, name in EPILOGUES_WITH_BIAS, form, epilogue, beta), allow)
 
 
 def warm(device_index: "int | None" = None) -> None:
@@ -1312,10 +1388,16 @@ def matmul(
     allow_f32_reduction: bool = False,
     form: "Form | None" = None,
     sm_count_target: "int | None" = None,
+    epilogue: "str | None" = None,
+    c_ptr: "int | None" = None,
 ) -> None:
     """``D[m, n] = A[m, k] @ B[n, k]^T (+ bias[n])`` (``B[k, n]`` for the layouts ``NN`` and ``NT``, ``A[k, m]`` for ``TT`` and ``NT``; the types of
     ``form``) with the pinned algorithm,
     enqueued on ``stream`` (a ``CUstream`` as an int), for ``sm_count_target`` SMs when it is given (as the pin was chosen).
+
+    ``epilogue`` (one of :data:`EPILOGUES`, ``None``: ``gemm`` or ``gemm_bias`` by ``bias_ptr``) is the epilogue of a ``cublaslt.matmul``: a bias
+    pointer is given exactly when it has a bias. ``c_ptr`` (``None``: ``beta = 0``) is ``C[m, n]``, of the type and layout of ``D``: then
+    ``beta = 1`` and the epilogue acts on ``acc + C``.
 
     ``a_ptr``, ``b_ptr``, ``d_ptr`` and ``bias_ptr`` (``None`` for no bias) are device addresses, 16-byte aligned. The
     algorithm is checked for this problem first (see :func:`check_algo`); ``workspace_bytes`` is the workspace recorded with
@@ -1336,6 +1418,12 @@ def matmul(
     b = _check_pointer("B", b_ptr)
     d = _check_pointer("D", d_ptr)
     bias_address = _check_pointer("bias", bias_ptr) if bias else 0
+    if epilogue is not None and (_epilogue_of(False, epilogue) in EPILOGUES_WITH_BIAS) != bias:
+        raise TilefishRuntimeError(
+            f"cuBLASLt matmul: the epilogue {epilogue!r} {'takes' if not bias else 'has no'} a bias, and the call gives "
+            f"{'none' if not bias else 'one'}"
+        )
+    c = d if c_ptr is None else _check_pointer("C", c_ptr)
     budget = _check_workspace(workspace_bytes)
     stream = _int_arg("stream", stream, low=0, high=UINT64_MAX)
     device_index = _check_device_arg(device_index)
@@ -1347,8 +1435,8 @@ def matmul(
     lib = _lib()
     index = _device(device_index)
     handle = _handle(lib, index)
-    with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None, form, target) as p:
-        required = _check(lib, handle, index, p, algo_hex, budget, f"the matmul m={m} n={n} k={k} bias={bias}{form.label}", allow)
+    with _on_device(index), _Problem(lib, m, n, k, bias, bias_address, None, form, target, epilogue) as p:
+        required = _check(lib, handle, index, p, algo_hex, budget, _what(m, n, k, bias, form, epilogue, int(c_ptr is not None)), allow)
         workspace = None
         address = given
         if required and given is None:
@@ -1357,11 +1445,11 @@ def matmul(
                 workspace = torch.empty(required, dtype=torch.uint8, device=f"cuda:{index}")
             address = workspace.data_ptr()
         alpha = ctypes.c_float(1.0)
-        beta = ctypes.c_float(0.0)
-        # cuBLAS A operand = tilefish B, cuBLAS B operand = tilefish A; C is D (beta = 0, so it is never read)
+        beta = ctypes.c_float(0.0 if c_ptr is None else 1.0)
+        # cuBLAS A operand = tilefish B, cuBLAS B operand = tilefish A; C is D when beta = 0 (so it is never read), else the caller's C
         lib.call(
             "cublasLtMatmul",
-            handle, p.desc, ctypes.byref(alpha), b, p.a, a, p.b, ctypes.byref(beta), d, p.d, d, p.d,
+            handle, p.desc, ctypes.byref(alpha), b, p.a, a, p.b, ctypes.byref(beta), c, p.d, d, p.d,
             ctypes.byref(algo), address if required else None, required, stream,
         )
         del workspace
