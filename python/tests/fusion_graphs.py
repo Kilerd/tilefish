@@ -185,8 +185,159 @@ def views_unfused(x: Tensor[D, R, f32], y: Tensor[R, 2 * D, f32]):
     return _views(x, y)
 
 
+# -- row regions (fusion version 2, the default): ordered reductions fused with the ops around them -----------------------------------------------
+
+DR = Dim("DR", buckets=[96, 1000, 2304])  # a row shorter than one round of the lanes, one just under it, one of two rounds and a quarter
+DS = Dim("DS", 1024)
+NT = Dim("NT", 50)
+T128 = tilefish.tree(128, offsets=(16, 8, 4, 2, 1, 64, 32), vector=8)  # 128 threads of 8 columns, a warp-shuffle tree, then the 4 warps
+V1 = tilefish.fusion(version=1)
+
+
+def _add_rmsnorm(x, res, w):
+    h = x + res  # the residual stream: returned too (a side output of the region)
+    h32 = h.to(f32)
+    ms = tilefish.mean(h32 * h32, -1, keepdims=True, order=T128)
+    return (h32 * tilefish.rsqrt(ms + 1e-6) * w.to(f32)).to(bf16), h
+
+
+@tilefish.graph
+def add_rmsnorm(x: Tensor[R, DR, bf16], res: Tensor[R, DR, bf16], w: Tensor[DR, bf16]):
+    """A residual add and an rmsnorm, the residual sum a second output: one row region."""
+    return _add_rmsnorm(x, res, w)
+
+
+@tilefish.graph(fusion=UNFUSED)
+def add_rmsnorm_unfused(x: Tensor[R, DR, bf16], res: Tensor[R, DR, bf16], w: Tensor[DR, bf16]):
+    return _add_rmsnorm(x, res, w)
+
+
+@tilefish.graph(fusion=V1)
+def add_rmsnorm_v1(x: Tensor[R, DR, bf16], res: Tensor[R, DR, bf16], w: Tensor[DR, bf16]):
+    """The same in fusion version 1: the mean a region of its own."""
+    return _add_rmsnorm(x, res, w)
+
+
+def _rmsnorm_fma(x, w):
+    v = x.to(f32)
+    ss = tilefish.sum(v * v, -1, keepdims=True, order=T128, fma=True)  # acc = fma(v, v, acc): the multiply is part of the sum
+    return (v * tilefish.rsqrt(ss / 1024.0 + 1e-6) * w.to(f32)).to(bf16)
+
+
+@tilefish.graph
+def rmsnorm_fma(x: Tensor[R, DS, bf16], w: Tensor[DS, bf16]):
+    return _rmsnorm_fma(x, w)
+
+
+@tilefish.graph(fusion=UNFUSED)
+def rmsnorm_fma_unfused(x: Tensor[R, DS, bf16], w: Tensor[DS, bf16]):
+    return _rmsnorm_fma(x, w)
+
+
+def _layernorm_gelu(x, w, b, s):
+    v = x.to(f32)
+    mu = tilefish.mean(v, -1, keepdims=True, order=tilefish.tree(256))
+    d = v - mu
+    var = tilefish.mean(d * d, -1, keepdims=True, order=tilefish.tree(256))
+    n = d * tilefish.rsqrt(var + 1e-5) * w + b
+    return (tilefish.gelu(n) * s).to(bf16)  # an elementwise tail with a per-channel scale
+
+
+@tilefish.graph
+def layernorm_gelu(x: Tensor[R, DR, bf16], w: Tensor[DR, f32], b: Tensor[DR, f32], s: Tensor[DR, f32]):
+    """A layer norm (two ordered means) and an elementwise tail: one row region."""
+    return _layernorm_gelu(x, w, b, s)
+
+
+@tilefish.graph(fusion=UNFUSED)
+def layernorm_gelu_unfused(x: Tensor[R, DR, bf16], w: Tensor[DR, f32], b: Tensor[DR, f32], s: Tensor[DR, f32]):
+    return _layernorm_gelu(x, w, b, s)
+
+
+def _softmax(s, n):
+    z = s * 0.125
+    z = tilefish.where(tilefish.iota(z, -1) < tilefish.load(n), z, float("-inf"))  # the columns below a device-scalar length
+    m = tilefish.max(z, -1, keepdims=True)  # order-free
+    e = tilefish.exp(z - m)
+    return (e / tilefish.sum(e, -1, keepdims=True, order=tilefish.tree(32))).to(bf16)
+
+
+@tilefish.graph
+def softmax(s: Tensor[R, DR, f32], n: DevScalar[i32]):
+    """Scale, mask, max, exp, an ordered sum and a divide: one row region."""
+    return _softmax(s, n)
+
+
+@tilefish.graph(fusion=UNFUSED)
+def softmax_unfused(s: Tensor[R, DR, f32], n: DevScalar[i32]):
+    return _softmax(s, n)
+
+
+def _quantise(x):
+    v = x.to(f32)
+    amax = tilefish.max(tilefish.where(v < 0.0, -v, v), -1, keepdims=True)
+    scale = tilefish.where(amax > 0.0, amax * (1.0 / 448.0), 1.0)
+    return (v / scale).to(tilefish.e4m3), scale  # satfinite; the scale per row a second output
+
+
+@tilefish.graph
+def quantise(x: Tensor[R, DR, bf16]):
+    """Row-wise fp8 quantisation: the absolute maximum, a scale per row, the cast. One row region, two outputs."""
+    return _quantise(x)
+
+
+@tilefish.graph(fusion=UNFUSED)
+def quantise_unfused(x: Tensor[R, DR, bf16]):
+    return _quantise(x)
+
+
+def _split_norm(x):
+    g, u = x.split(DR, axis=-1)  # two column blocks: views a row region reads where they are
+    h = tilefish.silu(g.to(f32)) * u.to(f32)
+    return (h * tilefish.rsqrt(tilefish.mean(h * h, -1, keepdims=True, order=T128) + 1e-6)).to(bf16)
+
+
+@tilefish.graph
+def split_norm(x: Tensor[R, 2 * DR, bf16]):
+    """SwiGLU of two column blocks, then a norm: one row region over two strided views, no copy."""
+    return _split_norm(x)
+
+
+@tilefish.graph(fusion=UNFUSED)
+def split_norm_unfused(x: Tensor[R, 2 * DR, bf16]):
+    return _split_norm(x)
+
+
+def _embed_pick(table, idx, b):
+    e = tilefish.gather_rows(table, idx, oob="zero").to(f32)  # rows of a table at device indices
+    z = e * 2.0 + b
+    return z, tilefish.argmax(z, -1, dtype=i32)  # the first maximum of each row
+
+
+@tilefish.graph
+def embed_pick(table: Tensor[NT, DR, bf16], idx: Tensor[R, i32], b: Tensor[DR, f32]):
+    """A gather, an affine and an argmax: one row region."""
+    return _embed_pick(table, idx, b)
+
+
+@tilefish.graph(fusion=UNFUSED)
+def embed_pick_unfused(table: Tensor[NT, DR, bf16], idx: Tensor[R, i32], b: Tensor[DR, f32]):
+    return _embed_pick(table, idx, b)
+
+
+# the row regions of fusion version 2
+ROW_CASES = ("add_rmsnorm", "rmsnorm_fma", "layernorm_gelu", "softmax", "quantise", "split_norm", "embed_pick")
+
 # (fused graph, its unfused twin, how to make its arguments: {parameter: (shape at a bucket of R / N, dtype name)})
 CASES = {
+    "add_rmsnorm": (add_rmsnorm, add_rmsnorm_unfused),
+    "add_rmsnorm_v1": (add_rmsnorm_v1, add_rmsnorm_unfused),
+    "rmsnorm_fma": (rmsnorm_fma, rmsnorm_fma_unfused),
+    "layernorm_gelu": (layernorm_gelu, layernorm_gelu_unfused),
+    "softmax": (softmax, softmax_unfused),
+    "quantise": (quantise, quantise_unfused),
+    "split_norm": (split_norm, split_norm_unfused),
+    "embed_pick": (embed_pick, embed_pick_unfused),
     "views": (views, views_unfused),
     "bias_act": (bias_act, bias_act_unfused),
     "bias_act_ieee": (bias_act_ieee, bias_act_ieee_unfused),

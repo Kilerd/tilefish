@@ -37,8 +37,9 @@ def ops_of(region, f):
 
 def test_fusion_is_on_by_default_and_its_settings_are_checked():
     assert _fusion.settings_of(fg.bias_act) == tilefish.fusion() == tilefish.Fusion()
-    assert tilefish.fusion().canonical() == {"version": 1, "grouping": "auto", "math": "fast", "intermediates": "declared", "fp_contract": "none"}
-    for bad in (dict(version=2), dict(grouping="some"), dict(math="exact"), dict(intermediates="f32"), dict(fp_contract="compiler"), dict(verify=1)):
+    assert tilefish.fusion().canonical() == {"version": 2, "grouping": "auto", "math": "fast", "intermediates": "declared", "fp_contract": "none"}
+    assert tilefish.fusion(version=1).canonical()["version"] == 1
+    for bad in (dict(version=3), dict(version=True), dict(grouping="some"), dict(math="exact"), dict(intermediates="f32"), dict(fp_contract="compiler"), dict(verify=1)):
         with pytest.raises(TilefishPlanError, match="fusion:"):
             tilefish.fusion(**bad)
     with pytest.raises(tilefish.TilefishDeclarationError, match="fusion= takes tilefish.fusion"):
@@ -96,15 +97,193 @@ def test_a_region_never_spans_a_call_and_the_steps_keep_the_order_of_the_values(
 
 
 def test_a_reduction_without_an_order_is_a_kernel_of_its_own():
-    f = _fusion.fused(fg.rms)
+    f = _fusion.fused(fg.rms)  # version 2 (the default) too: D2
+    assert f.settings.version == 2
     assert [ops_of(r, f) for r in f.regions] == [["mul"], ["sum"], ["mul", "add", "rsqrt", "mul", "mul", "cast"]]
+
+    def body(x):
+        return tilefish.sum(x * x, axis=-1, keepdims=True, order=tilefish.tree(32)) * 2.0
 
     @tilefish.graph
     def ordered(x: Tensor[R, D, f32]):
-        return tilefish.sum(x * x, axis=-1, keepdims=True, order=tilefish.tree(32)) * 2.0
+        return body(x)
 
-    g = _fusion.fused(ordered)
+    @tilefish.graph(fusion=fg.V1)
+    def ordered_v1(x: Tensor[R, D, f32]):
+        return body(x)
+
+    assert [ops_of(r, _fusion.fused(ordered)) for r in _fusion.fused(ordered).regions] == [["mul", "sum", "mul"]]  # version 2: one row region
+    g = _fusion.fused(ordered_v1)
     assert [ops_of(r, g) for r in g.regions] == [["mul"], ["sum"], ["mul"]]  # version 1: every reduction alone, ordered or not
+
+
+# -- version 1 is frozen; the row regions of version 2 ----------------------------------------------------------------------------------------
+
+# the plan digests of these graphs as tilefish 0.0.9 planned them (fusion version 1, its default then): version 1 plans them the same, byte for byte
+V1_DIGESTS = {
+    "around_call": "968e4f545d2fdab1a7b53e2a67f944799c86902b56e09ff3a8465a6544917a97",
+    "bias_act": "209d35ba2b31f3a9dcc24ee8e0377118af57441b2a938ab8850f521fb46befe8",
+    "bias_act_ieee": "39c88afe2b81beeca53e8bfe9a0b17551c3285f731639cfc3138237f222204a2",
+    "dequant": "3036481bb0a773cd7b6b75ae6de8edf6139fcc0a47f01a1aacd43a6d46165969",
+    "masked": "d666b269599e0b4456d96aafaaebc01c4fee557fe13b29aab87e8cafc1d9d6a0",
+    "modes": "16287d0047efcb06e7a3d8f67544339f527ea8671c814989bb1e84eca28e52d3",
+    "periodic": "8ee6af059e2572861f595b7ee45c71df6d0fd1e7365ee3a926d6ade2ca3c9d0e",
+    "residual": "94c94bcaa359e8d6d151d7cee9efa2de47420d773f7127e86573827a8dcb3ea6",
+    "rms": "ba6df555c739da36354cf2f45392318a3d5fa6f0191ddfb096c2da0969d65b80",
+    "swiglu": "224019ec9fc75e0d7ebf7d32ad5993d6d6e79a14d9e69eaa111724ea51a2d2f6",
+    "views": "a15de9b99e0ffa6b44430aef66628e3e4c816d4c817de877fef40172018c0630",
+}
+
+
+def as_version_1(g):
+    s = _fusion.settings_of(g)
+    return tilefish.graph(g.fn, name=g.name, fusion=tilefish.fusion(version=1, grouping=s.grouping, math=s.math, intermediates=s.intermediates,
+                                                                    fp_contract=s.fp_contract))
+
+
+@pytest.mark.parametrize("name", sorted(V1_DIGESTS))
+def test_version_1_plans_what_it_planned(name):
+    """D7: a later tilefish keeps every earlier version. The use cases declared with fusion(version=1) plan as tilefish 0.0.9 planned them (its
+    default was version 1): the same regions, sources, names and plan digests."""
+    assert tilefish.plan(as_version_1(fg.CASES[name][0])).digest == V1_DIGESTS[name]
+
+
+def test_a_plan_of_another_version_is_refused_naming_it(tmp_path):
+    """D7: a plan made with another fusion version is refused as stale, with a message that names the version (a plan exported when version 1
+    was the default, loaded by a graph that declares nothing)."""
+    import plan_fakes
+
+    from tilefish import _plan
+    from tilefish.errors import TilefishManifestError
+
+    old = as_version_1(fg.bias_act)
+    exported = plan_fakes.export(tilefish.plan(old), tmp_path / "p")
+    with pytest.raises(TilefishManifestError, match=r"made with tilefish.fusion\(version=1\) and the graph is planned with version 2 \(the default\)"):
+        _plan.load_plan(tmp_path / "p", fg.bias_act, pin=exported.digest)
+    assert _fusion.settings_of(fg.bias_act).version == 2 and _fusion.fused(fg.bias_act).settings.version == 2  # the check changed nothing of the graph
+    assert _plan.load_plan(tmp_path / "p", old, pin=exported.digest).digest == exported.digest  # declared: it is that graph's plan
+
+    @tilefish.graph(name="bias_act")
+    def changed(x: Tensor[R, D, bf16], b: Tensor[D, bf16]):
+        return tilefish.silu(x.to(f32) - b.to(f32)).to(bf16)
+
+    with pytest.raises(TilefishManifestError, match="changed since the plan was exported"):  # not a matter of versions: no version named
+        _plan.load_plan(tmp_path / "p", changed, pin=exported.digest)
+
+
+def test_hand_written_kernels_keep_their_sources():
+    """Revision 2 of the lowering is the regions' of version 2 only: a kernel's own source (revision 1) is what it was (0.0.9)."""
+    import hashlib
+
+    import primitive_cases as pc
+
+    want = {
+        "sum_sequential": "07f04cce15ce149fe69fd9789bd9faf072de80a5a3aaba2b15d4c7d5c6881373",
+        "sumsq_shfl128v8": "bb6a5fc8ade0428ddc58c55d30b2d17707df6450f9c65641833e2fee33608412",
+        "dot_halving64": "356954f61252e522b1f44f11414c1185519587a430a3c0e20357dd248bb36188",
+        "rmsnorm_ordered": "7a24ae9addc61a9c84befaaa849a4ee4232bfb298d9af58abf83bb73fb18f805",
+    }
+    for name, sha in want.items():
+        k = getattr(pc, name)
+        assert k.lowering == 1 and hashlib.sha256(lower(k).source.encode()).hexdigest() == sha, name
+        assert "revision 2" not in lower(k).source and "revision 2" in lower(k, lowering=2).source
+    with pytest.raises(tilefish.TilefishLoweringError, match="lowering must be one of"):
+        lower(pc.sum_sequential, lowering=3)
+
+
+@pytest.mark.parametrize("name", fg.ROW_CASES)
+def test_a_row_pattern_is_one_kernel_of_its_ops(name):
+    fused, unfused = fg.CASES[name]
+    f = _fusion.fused(fused)
+    (r,) = f.regions
+    assert r.kernel.lowering == 2 and r.kernel.context_free and r.kernel.lower().template == "row"
+    assert len(r.outputs) == len(fused.signature.returns) if fused.signature.returns else True
+    assert [x["kind"] for x in steps(fused)] == ["kernel"]
+    u = _fusion.fused(unfused)  # one kernel per op (an fma sum with its product; a comparison with no tensor of its shape with its consumer)
+    assert len(u.regions) >= len(r.nodes) - 2 and all(len(x.nodes) <= 2 for x in u.regions)
+    assert not _fusion.boundaries(fused)  # nothing left that a later phase would fuse
+
+
+def test_the_residual_sum_is_a_second_output_of_the_norm():
+    f = _fusion.fused(fg.add_rmsnorm)
+    (r,) = f.regions
+    assert [o.type.dtype for o in r.outputs] == [bf16, bf16] and len(steps(fg.add_rmsnorm, R=8, DR=96)) == 1
+    v1 = _fusion.fused(fg.add_rmsnorm_v1)
+    assert [ops_of(x, v1) for x in v1.regions] == [["add", "cast", "mul"], ["mean"], ["add", "rsqrt", "mul", "cast", "mul", "cast"]]
+    assert {b["reason"] for b in _fusion.boundaries(fg.add_rmsnorm_v1)} == {"reduction"}
+    fix = next(b["fix"] for b in _fusion.boundaries(fg.add_rmsnorm_v1))
+    assert "version 2 (the default) fuses ordered sums" in fix
+
+
+def test_an_fma_sum_and_its_product_are_one_unit_in_every_grouping():
+    f = _fusion.fused(fg.rmsnorm_fma_unfused)
+    assert ["mul", "sum"] in [ops_of(r, f) for r in f.regions]  # the multiply is the sum's (each step fma(v, v, acc)): never rounded on its own
+
+    @tilefish.graph(fusion=fg.V1)
+    def fma_v1(x: Tensor[R, fg.DS, bf16], w: Tensor[fg.DS, bf16]):
+        return fg._rmsnorm_fma(x, w)
+
+    g = _fusion.fused(fma_v1)  # version 1 runs the sum alone: with its product
+    assert ["mul", "sum"] in [ops_of(r, g) for r in g.regions]
+    assert len(steps(fma_v1, R=8)) == 3
+
+
+def test_a_row_region_reads_views_where_they_are():
+    s = steps(fg.split_norm, R=8, DR=96)
+    assert [x["entry"].split("_")[0] for x in s] == ["fused"]  # no tilefish.contiguous copy
+    assert [a.get("view", {}).get("strides") for a in s[0]["args"]][:2] == [[192, 1], [192, 1]]
+    k = _fusion.fused(fg.split_norm).regions[0].kernel
+    src = k.lower().source
+    assert "tl.load(a0 + (row * a0_s0 + cols * a0_s1), mask=mask, other=0)" in src
+    assert "'a0' is a view read where it is: row r, column c at r * a0_s0 + c * a0_s1 (note 21)" in src
+
+    def half_mean(x):
+        g, _ = x.split(fg.DR, axis=-1)
+        return tilefish.mean(g, -1, keepdims=True, order=fg.T128) * 2.0
+
+    @tilefish.graph(fusion=fg.V1)
+    def half_mean_v1(x: Tensor[R, 2 * fg.DR, f32]):
+        return half_mean(x)
+
+    @tilefish.graph
+    def half_mean_v2(x: Tensor[R, 2 * fg.DR, f32]):
+        return half_mean(x)
+
+    # version 1: the mean is a region of its own, of the row template, which reads no view where it is: a copy first
+    assert [x["entry"].split("_")[0] for x in steps(half_mean_v1, R=8, DR=96)] == ["contiguous", "fused", "fused"]
+    assert {b["reason"] for b in _fusion.boundaries(half_mean_v1)} >= {"materialised", "reduction"}
+    assert [x["entry"].split("_")[0] for x in steps(half_mean_v2, R=8, DR=96)] == ["fused"]
+    assert not _fusion.boundaries(half_mean_v2)
+
+
+def test_a_region_is_the_hand_written_kernel_of_its_ops_lowered_by_revision_2():
+    """O2 for row regions: the region's source is the source of a @tilefish.kernel of the same ops, lowered context-free by revision 2."""
+    f = _fusion.fused(fg.add_rmsnorm)
+    source = f.regions[0].kernel.lower().source
+
+    @tilefish.kernel(fp_fusion=False)
+    def hand_norm(x: Tensor[R, fg.DR, bf16], res: Tensor[R, fg.DR, bf16], w: Tensor[fg.DR, bf16]) -> tuple[Tensor[R, fg.DR, bf16], Tensor[R, fg.DR, bf16]]:
+        y, h = fg._add_rmsnorm(x, res, w)
+        return h, y  # (the region writes its outputs in the order of the ops that make them)
+
+    def norm(s, name):
+        s = re.sub(rf"\b(tf_)?{name}\b", lambda m: (m.group(1) or "") + "K", s)
+        return re.sub(r"\ba2\b", "w", re.sub(r"\ba1\b", "res", re.sub(r"\ba0\b", "x", s)))
+
+    assert norm(source, f.regions[0].kernel.name) == norm(lower(hand_norm, context_free=True, lowering=2).source, "hand_norm")
+
+
+def test_revision_2_lowers_ordered_sums_by_splits_and_gives_a_row_of_them_its_own_warps():
+    r = _fusion.fused(fg.add_rmsnorm).regions[0]
+    low = r.kernel.lower()
+    assert "_split(" in low.source and "_tf_chain(" in low.source and "tl.gather(p, tl.minimum(lane + 16, 127), 0)" in low.source
+    assert low.extern.bucket_num_warps == {".DR96": 1, ".DR1000": 1, ".DR2304": 4}  # 1 warp up to BLOCK_D 2048, then one per 1024 columns
+    assert "_tf_rcp(D + 0.0)" in low.source  # mean(order=): the ordered sum times rcp.rn(D), one rounding each
+    # a Triton tree reduction keeps the template's rule (its numerics): the region of the unordered sum
+    tree = next(x for x in _fusion.fused(fg.rms).regions if [y for y in x.nodes if _fusion.fused(fg.rms).program[y].op == "sum"])
+    assert tree.kernel.lowering == 2 and tree.kernel.lower().num_warps == 1  # BLOCK_D 64: the template's 256 lanes per warp
+    q = _fusion.fused(fg.quantise).regions[0].kernel.lower().source  # an fp8 cast of a region of version 2 is inline cvt
+    assert "cvt.rn.satfinite.e4m3x2.f32 $0, 0f00000000, $1;" in q and ".to(tl.float8e4nv)" not in q
 
 
 def test_free_ops_are_copied_into_each_region_and_a_lone_chain_with_no_shape_joins_its_consumer():
@@ -168,17 +347,24 @@ def test_views_are_read_where_they_are_or_materialised_where_the_template_cannot
 
     assert [i["read"] for i in tilefish.fusion_report(transposed)["regions"][0]["inputs"]] == ["strided", "contiguous"]
 
-    # a row region (a per-row scale) cannot read a view where it is: the view is copied by tilefish.contiguous first
-    @tilefish.graph
-    def scaled_half(x: Tensor[R, 2 * D, f32], w: Tensor[D, f32]):
+    # a per-column scale of a view: read where it is by both versions (a row region of version 1 would copy it: see the row regions below)
+    def half(x, w):
         g, _ = x.split(D, axis=-1)
         return g * w + 1.0
 
-    rep = tilefish.fusion_report(scaled_half)
-    assert rep["regions"][0]["template"] in ("row", "elementwise")
-    if rep["regions"][0]["template"] == "row":
-        assert rep["regions"][0]["inputs"][0]["read"] == "materialised"
-        assert [x["entry"].split("_")[0] for x in steps(scaled_half, R=8)] == ["contiguous", "fused"]
+    @tilefish.graph(fusion=fg.V1)
+    def scaled_half(x: Tensor[R, 2 * D, f32], w: Tensor[D, f32]):
+        return half(x, w)
+
+    @tilefish.graph
+    def scaled_half_v2(x: Tensor[R, 2 * D, f32], w: Tensor[D, f32]):
+        return half(x, w)
+
+    rep = tilefish.fusion_report(scaled_half)  # version 1: the elementwise template, broadcasting w, reads the view
+    assert rep["regions"][0]["template"] == "elementwise" and rep["regions"][0]["inputs"][0]["read"] == "strided"
+    rep2 = tilefish.fusion_report(scaled_half_v2)  # version 2: the row template reads it where it is
+    assert rep2["regions"][0]["template"] == "row" and rep2["regions"][0]["inputs"][0]["read"] == "strided"
+    assert [x["entry"].split("_")[0] for x in steps(scaled_half_v2, R=8)] == ["fused"]
 
     P = Dim("P", 6)
 
@@ -255,7 +441,7 @@ def test_every_narrowing_float_cast_of_a_region_is_inline_ptx_and_a_default_kern
         return tilefish.silu(x.to(f32) + b.to(f32)).to(bf16)
 
     assert "cvt.rn.bf16.f32" in lower(k).source and ".to(tl.bfloat16)" not in lower(k).source  # fp_fusion=False: every rounding written out
-    opaque = lower(k, context_free=True).source
+    opaque = lower(k, context_free=True, lowering=2).source  # (a region of version 2, the default, is lowered by revision 2)
     # the region's kernel is the hand-written kernel of the same ops, lowered with opaque casts: the same source but for the names
     def norm(s, name):
         s = re.sub(rf"\b(tf_)?{name}\b", lambda m: (m.group(1) or "") + "K", s)

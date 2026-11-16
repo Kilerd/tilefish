@@ -15,8 +15,11 @@ unfused one, for every input, because
   ``x.to(f32).to(bf16)``), and a negation gives the canonical NaN explicitly (ptxas folds ``neg.f32`` into a select as a sign flip);
   ``tilefish.fma``, or the declared rewrite ``fp_contract="mul-add"``, asks for one rounding;
 * the lowering writes each op's code from the op alone, and a per-element op's result depends on nothing but its operands;
-* a reduction is a region of its own (version 1): a Triton tree reduction's bytes depend on the rest of its kernel (measured: 357 to 399 of
-  1024 rows differ when other loads share it), so it is never fused; its operand is stored, as in the unfused composition.
+* a reduction joins a region only when its bytes cannot depend on the kernel around it: an ordered ``sum`` or ``mean`` (``order=``), the
+  order-free ``max``, ``argmax`` and ``argmin`` (and ``gather_rows``, a copy) are fused into row regions by version 2 (the default), lowered by
+  revision 2 of the lowering (note 21 of :mod:`tilefish.lower`); a Triton tree reduction (a ``sum`` or ``mean`` without ``order=``) is a region of
+  its own in every version, its operand stored, because its bytes depend on the rest of its kernel (measured: 357 to 399 of 1024 rows differ when
+  other loads share it). Version 1 runs every reduction alone, as tilefish 0.0.9 did, and is kept unchanged (D7).
 
 ``export`` checks it: every region of more than one op is run against its ops one by one, on seeded inputs with special values, at every
 bucket, and a difference refuses the export (``verify=False`` opts out). The fusion report, ``<graph>.fusion.json`` next to the plan, says which
@@ -49,19 +52,30 @@ from .ir import Graph, Node, Scalar
 from .trace import Value
 from .types import TensorType
 
-VERSIONS = (1,)
+VERSIONS = (1, 2)
+DEFAULT_VERSION = 2  # what tilefish.fusion() and a graph that declares nothing get: the latest version (D7: every earlier one is kept)
 GROUPINGS = ("auto", "none")
 INTERMEDIATES = ("declared", "opmath")
 FP_CONTRACTS = ("none", "mul-add")
 MATHS = ("fast", "ieee")
-MAX_REGION_NODES = 64  # ops of one region (version 1)
-MAX_REGION_TENSORS = 32  # inputs and outputs of one region (version 1)
+MAX_REGION_NODES = 64  # ops of one region (versions 1 and 2)
+MAX_REGION_TENSORS = 32  # inputs and outputs of one region (versions 1 and 2)
+LOWERING_OF_VERSION = {1: 1, 2: 2}  # the revision of tilefish.lower each version's region kernels are lowered with (note 21), frozen with it
 REPORT_SCHEMA = "tilefish.fusion-report.v1"
 
 _VIEW_OPS = frozenset({"reshape", "permute", "select", "split"})
 _MOVE_OPS = frozenset({"copy", "store", "zeros"})
 _FREE_OPS = frozenset({"load", "iota"})  # no arithmetic on data: copied into every region that reads them, never stored
 _SOLO_OPS = frozenset({"sum", "mean", "max", "argmax", "argmin", "gather_rows"})  # a region of their own (version 1)
+
+
+def is_solo(op: str, attrs: Mapping[str, Any], version: int) -> bool:
+    """Whether an op of a graph body is a region of its own: in version 1 every reduction and ``gather_rows``; in version 2 a ``sum`` or ``mean``
+    without ``order=`` only (D2: a Triton tree reduction's bytes depend on the rest of its kernel), every other reduction (an ordered sum or mean,
+    the order-free ``max``, ``argmax``, ``argmin``) and ``gather_rows`` joining row regions."""
+    if version < 2:
+        return op in _SOLO_OPS
+    return op in ("sum", "mean") and "order" not in attrs
 _REFUSED_OPS = {"scatter_rows": "a scatter into an InOut parameter in a graph body is not planned yet: put it in a @tilefish.kernel"}
 _ROUNDING_OPS = frozenset({"add", "sub", "mul", "div", "fma", "rsqrt", "exp", "sqrt", "silu", "gelu", "sin", "cos", "tanh", "erf", "sin_approx", "rcp", "sum", "mean"})
 _HALF = frozenset({"bf16", "f16"})
@@ -84,7 +98,7 @@ class TilefishFusionError(TilefishPlanError):
 class Fusion:
     """How the arithmetic of a graph body is planned (:func:`fusion`)."""
 
-    version: int = 1
+    version: int = DEFAULT_VERSION
     grouping: str = "auto"
     math: str = "fast"
     intermediates: str = "declared"
@@ -103,7 +117,7 @@ class Fusion:
 
 def fusion(
     *,
-    version: int = 1,
+    version: int = DEFAULT_VERSION,
     grouping: str = "auto",
     math: str = "fast",
     intermediates: str = "declared",
@@ -114,7 +128,10 @@ def fusion(
     """``@tilefish.graph(fusion=tilefish.fusion(...))``: how the arithmetic written in the graph body is planned. Every choice is exact: the plan
     writes the bytes of its unfused composition (each op a kernel of its own; ``grouping="none"`` is that plan).
 
-    * ``version``: the grouping rules, limits and rewrites, frozen (1 is the only one).
+    * ``version``: the grouping rules, limits and rewrites, frozen (D7). ``2``, the default: row regions, an ordered ``sum`` or ``mean``, ``max``,
+      ``argmax``, ``argmin`` and ``gather_rows`` fused with the ops around them (one kernel of an rmsnorm and its residual add), lowered by
+      revision 2 of the lowering (note 21 of :mod:`tilefish.lower`: faster ordered sums, views read where they are by the row template). ``1``:
+      every reduction a region of its own: the regions of fusion's first version (tilefish 0.0.9), unchanged.
     * ``grouping``: ``"auto"`` (regions as large as the rules allow) or ``"none"`` (one kernel per op: the unfused composition, an oracle).
     * ``math``: ``"fast"`` or ``"ieee"``, the default f32 math of the body's ops (note 13 of :mod:`tilefish.lower`); an op's own ``math=`` wins.
     * ``intermediates``: ``"declared"`` (every op rounds to the dtype the IR gives it) or ``"opmath"`` (torch's eager rule: a bf16 or f16
@@ -200,6 +217,39 @@ def fused(gop: Any, grouping: "str | None" = None) -> Fused:
         found = _Pass(gop.graph, settings).run()
         found = cache.setdefault(key, found)
     return found
+
+
+def with_version(gop: Any, version: int) -> Any:
+    """The graph ``gop`` declared with fusion ``version`` instead of its own (its other settings kept): a copy, for a stale check to name the
+    version a plan was made with."""
+    s = settings_of(gop)
+    other = object.__new__(type(gop))  # (not copy.copy: an operator pickles, so copies, by reference to itself)
+    other.__dict__.update({k: v for k, v in gop.__dict__.items() if not k.startswith("_tf_")})
+    other.fusion = Fusion(version, s.grouping, s.math, s.intermediates, s.fp_contract, s.verify, s.sass)
+    return other
+
+
+def other_version_of_plan(gop: Any, doc: Mapping[str, Any], derive: Any) -> "str | None":
+    """When the plan document ``doc`` is not the plan of ``gop`` but is the plan of ``gop`` declared with another fusion version (D7: a plan made
+    with another version is refused, naming it), what to say; ``None`` otherwise (or when the graph has no arithmetic). ``derive(graph)`` plans a
+    graph for the document's buckets."""
+    if not has_arithmetic(gop):
+        return None
+    mine = settings_of(gop).version
+    for v in VERSIONS:
+        if v == mine:
+            continue
+        try:
+            if derive(with_version(gop, v)).stale_reason(doc) is None:
+                return (
+                    f"the plan was made with tilefish.fusion(version={v}) and the graph is planned with version {mine}"
+                    + (" (the default)" if mine == DEFAULT_VERSION else "")
+                    + f": declare @tilefish.graph(fusion=tilefish.fusion(version={v}, ...)) to keep that plan (every version is kept, D7), or export it "
+                    "again (and pin the new plan)"
+                )
+        except TilefishError:
+            continue
+    return None
 
 
 def planned_graph(gop: Any) -> Graph:
@@ -432,15 +482,23 @@ class _Pass:
         prog = self.prog
         self.member_of: "dict[int, int]" = {k: k for k in nodes}
         self.groups: "dict[int, list[int]]" = {k: [k] for k in nodes}
+        # an ordered sum with fma=True adds fma(a, b, acc) of its product's operands: the product's multiply is part of the sum (it is never rounded
+        # on its own for the sum), so the two are one unit in every grouping, the unfused composition's too (a kernel of the multiply and the sum)
+        for k in nodes:
+            n = prog[k]
+            if n.op == "sum" and n.attrs.get("fma") and isinstance(n.inputs[0], Value):
+                p = self.producer.get(n.inputs[0])
+                if p is not None and p in self.member_of and self.member_of[p] != self.member_of[k]:
+                    self._join(self.member_of[p], self.member_of[k])
         if grouping == "auto":
             for k in nodes:
-                if prog[k].op in _SOLO_OPS:
+                if self.solo_region(self.member_of[k]):
                     continue
                 for i in prog[k].inputs:
                     if not isinstance(i, Value) or i in self.barriered:
                         continue
                     p = self.producer.get(i)
-                    if p is None or p not in self.member_of or prog[p].op in _SOLO_OPS:
+                    if p is None or p not in self.member_of or self.solo_region(self.member_of[p]):
                         continue
                     a, b = self.member_of[p], self.member_of[k]
                     if a != b:
@@ -529,7 +587,7 @@ class _Pass:
         ``"template"`` (the union does not lower); ``None`` when the union is legal. The pass merges only when it is ``None``."""
         union = sorted(self.groups[a] + self.groups[b])
         if len(union) > MAX_REGION_NODES and not force:
-            return "limit", f"together they are {len(union)} ops, more than the {MAX_REGION_NODES} of a region of version 1"
+            return "limit", f"together they are {len(union)} ops, more than the {MAX_REGION_NODES} of a region"
         members = set(union)
         last = union[-1]
         # a cycle: a path that leaves the union and comes back (every edge goes forward, so look only before its last node)
@@ -545,15 +603,15 @@ class _Pass:
                     n = self.prog[x]
                     what = f"the call to '{n.op}'" if n.attrs.get("kind") else f"the op '{n.op}'"
                     detail = f"one region of both would make a cycle through {what} (node #{self.origin[x]}), which reads one and feeds the other"
-                    reason = reduction_reason(n.op, "order" in n.attrs) if _is_arith(n) else None
-                    return (reason or "cycle"), detail  # (through a reduction: a row region of phase 2 takes all three)
+                    reason = reduction_reason(n.op, "order" in n.attrs, self.settings.version) if _is_arith(n) else None
+                    return (reason or "cycle"), detail  # (through a reduction of version 1: a row region of version 2 takes all three)
                 if s < last and s not in seen:
                     stack.append(s)
         try:
             region = self._region(-1, union, trial=True)
             tensors = len(region.inputs) + len(region.outputs)
             if tensors > MAX_REGION_TENSORS and not force:
-                return "limit", f"together they read and write {tensors} tensors, more than the {MAX_REGION_TENSORS} of a region of version 1"
+                return "limit", f"together they read and write {tensors} tensors, more than the {MAX_REGION_TENSORS} of a region"
             self._kernel(region, trial=True)
         except (TilefishLoweringError, TilefishPlanError) as e:
             first = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
@@ -563,13 +621,25 @@ class _Pass:
     def _try_merge(self, a: int, b: int, force: bool = False) -> bool:
         if self.merge_problem(a, b, force) is not None:
             return False
+        self._join(a, b)
+        return True
+
+    def _join(self, a: int, b: int) -> None:
         union = sorted(self.groups[a] + self.groups[b])
         keep, gone = (a, b) if a < b else (b, a)
         self.groups[keep] = union
         del self.groups[gone]
         for k in union:
             self.member_of[k] = keep
-        return True
+
+    def solo(self, k: int) -> bool:
+        """Whether the program node ``k`` is a region of its own in this version (:func:`is_solo`)."""
+        return is_solo(self.prog[k].op, self.prog[k].attrs, self.settings.version)
+
+    def solo_region(self, root: int) -> bool:
+        """Whether the region whose first op is ``root`` holds an op that is a region of its own (with, for an fma sum, its product): it takes no
+        other op."""
+        return any(self.solo(k) for k in self.groups[root])
 
     def _region(self, index: int, nodes: "list[int]", trial: bool = False) -> Region:
         prog = self.prog
@@ -814,6 +884,7 @@ def _declare(name: str, params: "list[tuple[str, TensorType, Value, bool]]", mas
     graph = _trace_body(replay, sig, name, "kernel")
     op = KernelOp(replay, name, _with_traced_returns(sig, graph, "kernel", name), graph, None, False, settings.math, settings.sass)
     op.context_free = True
+    op.lowering = LOWERING_OF_VERSION[settings.version]  # version 2: revision 2 of the lowering (note 21 of tilefish.lower), frozen with it
     return op
 
 
@@ -888,21 +959,33 @@ def report(gop: Any, verification: "Mapping[int, Any] | None" = None) -> "dict[s
 BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
     "barrier": ("remove tilefish.barrier: a tap of the unfused plan (grouping='none') shows the same bytes", "1"),
     "view": (
-        "a view between two ops ends a region (rule 6): compute on one shape; phase 2 lets a dense reshape stay inside a region (a permute or a select "
-        "still ends one)",
+        "a view between two ops ends a region (rule 6): compute on one shape (a dense reshape inside a region, phase 2 work, is not planned yet; "
+        "a permute or a select would still end one)",
         "2",
     ),
-    "reduction-unordered": ("add order= to the reduction (D2): exact and layout-independent; phase 1 still runs it alone, phase 2 fuses it", "2"),
-    "reduction": ("needs phase 2 row fusion: a reduction is a region of its own in version 1", "2"),
-    "gather": ("needs phase 2: gather_rows is a region of its own in version 1", "2"),
+    "reduction-unordered": (
+        "add order= to the reduction (D2): exact and layout-independent, and fusion version 2 (the default) fuses it with the ops around it; "
+        "without an order it runs alone in every version",
+        "2",
+    ),
+    "reduction": (
+        "the graph declares tilefish.fusion(version=1), where every reduction is a region of its own: version 2 (the default) fuses ordered sums "
+        "and means, max, argmax and argmin into row regions",
+        "2",
+    ),
+    "gather": ("the graph declares tilefish.fusion(version=1), where gather_rows is a region of its own: version 2 (the default) fuses it", "2"),
     "cycle": ("move the call out from between them (or accept two kernels)", "1"),
-    "limit": (f"a region of version 1 has at most {MAX_REGION_NODES} ops and {MAX_REGION_TENSORS} tensors: a split is a speed choice only", "1"),
-    "template": ("the templates cannot compute both in one kernel (another iteration space, or a row region)", "2"),
-    "grouping": ("the greedy grouping of version 1 did not make this union (a later fusion version may)", "1"),
+    "limit": (f"a region has at most {MAX_REGION_NODES} ops and {MAX_REGION_TENSORS} tensors: a split is a speed choice only", "1"),
+    "template": (
+        "the templates cannot compute both in one kernel: another iteration space (rows of another length, a reduction over another axis, rows "
+        "of rank 3) or, in fusion version 1, a row region and an elementwise one (version 2 makes row regions)",
+        "2",
+    ),
+    "grouping": ("the greedy grouping of this version did not make this union (a later fusion version may)", "1"),
     "unfused": ("the graph declares tilefish.fusion(grouping='none'), one kernel per op: drop it (the default groups them)", "1"),
     "materialised": (
-        "a view that is not dense, copied by tilefish.contiguous first (a row region reads no strided input; a copy or a store of a view is a launch of "
-        "it): phase 2 reads and writes strided views in the row template",
+        "a view that is not dense, copied by tilefish.contiguous first (a copy or a store of a view is a launch of it; fusion version 1's row regions "
+        "read no view where it is): version 2 (the default) reads views of rank 1 and 2 where they are in the row template",
         "2",
     ),
     "move": (
@@ -919,10 +1002,11 @@ BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
 }
 
 
-def reduction_reason(op: str, ordered: bool) -> "str | None":
-    """Why an op of a graph body is a region of its own in version 1: ``"reduction-unordered"`` (a ``sum`` or ``mean`` without ``order=``, D2),
-    ``"reduction"`` (an ordered one, ``max``, ``argmax``, ``argmin``), ``"gather"`` (``gather_rows``); ``None`` for any other op."""
-    if op not in _SOLO_OPS:
+def reduction_reason(op: str, ordered: bool, version: int = 1) -> "str | None":
+    """Why an op of a graph body is a region of its own in fusion ``version``: ``"reduction-unordered"`` (a ``sum`` or ``mean`` without
+    ``order=``, D2, in every version), and in version 1 ``"reduction"`` (an ordered one, ``max``, ``argmax``, ``argmin``) and ``"gather"``
+    (``gather_rows``); ``None`` for any other op (in version 2 those join row regions)."""
+    if not is_solo(op, {"order": True} if ordered else {}, version):
         return None
     if op == "gather_rows":
         return "gather"
@@ -979,8 +1063,10 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
         fix, phase = BOUNDARY_FIXES[reason]
         out.append({"reason": reason, "from": a, "to": b, "value": value.ref, "detail": detail, "fix": fix, "phase": phase})
 
+    version = f.settings.version
+
     def solo(k: int) -> "str | None":
-        return reduction_reason(prog[k].op, "order" in prog[k].attrs)
+        return reduction_reason(prog[k].op, "order" in prog[k].attrs, version)
 
     for r in f.regions:
         root = r.nodes[0]
@@ -1013,13 +1099,13 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
                     reason = solo(which) or "reduction"
                     n = prog[which]
                     order = f" with order={n.attrs['order']}" if "order" in n.attrs else (" without order=" if reason == "reduction-unordered" else "")
-                    add(reason, frm, to, i, f"'{n.op}'{order} (node #{f.origin[which]}) is a region of its own in version 1")
+                    add(reason, frm, to, i, f"'{n.op}'{order} (node #{f.origin[which]}) is a region of its own in fusion version {version}")
                 elif f.settings.grouping == "none":
                     add("unfused", frm, to, i, "the graph declares grouping='none': every op is a kernel of its own")
                 else:
                     problem = p.merge_problem(other, root)
                     if problem is None:
-                        add("grouping", frm, to, i, "the union of the two regions is legal, but the greedy merge of version 1 did not make it")
+                        add("grouping", frm, to, i, f"the union of the two regions is legal, but the greedy merge of version {version} did not make it")
                     else:
                         add(problem[0], frm, to, i, problem[1])
         for v, how in r.reads.items():

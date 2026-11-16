@@ -1397,6 +1397,9 @@ def plan_graphs():
                         if name == "u8":
                             gen = torch.Generator(device="cuda").manual_seed(s)
                             args[p.name] = torch.randint(0, 256, shape, generator=gen, device="cuda", dtype=torch.int32).to(torch.uint8)
+                        elif name == "i32":  # row indices (a gather's): most in range, some out of it on both sides
+                            gen = torch.Generator(device="cuda").manual_seed(s)
+                            args[p.name] = torch.randint(-3, 56, shape, generator=gen, device="cuda", dtype=torch.int32)
                         else:
                             args[p.name] = randn(shape, dtypes[name], seed=s, scale=4.0)
                     out.append(("-".join(f"{n}{v}" for n, v in combo.items()) + f"-seed{seed}", args))

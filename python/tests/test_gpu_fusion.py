@@ -52,6 +52,10 @@ def args_of(graph, combo, seed):
             out.append(torch.tensor([7 + seed * 101 + k], dtype=TORCH[p.type.dtype.name], device=CUDA))
             continue
         sizes = tuple(int(eval_dim(s, dims)) for s in p.type.shape)
+        if p.type.dtype.name == "i32":  # row indices (a gather's): most in range, some out of it on both sides
+            gen = torch.Generator(device="cpu").manual_seed(seed * 1000 + k)
+            out.append(torch.randint(-3, 56, sizes, generator=gen, dtype=torch.int32).to(CUDA))
+            continue
         out.append(sample(p.type, sizes, seed * 1000 + k))
     return out
 
