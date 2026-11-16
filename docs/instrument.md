@@ -178,24 +178,36 @@ tilefish-explain DIR --probes FILE [KERNEL]           # the phases of each launc
   --json --limit N --source-root PATH
 ```
 
-The summary of the producer and consumer of `probe_kernels.ws_scale_p` (sm_103, 4 CTAs of 8 warps):
+The summary of the producer and consumer of `probe_kernels.ws_scale_p` (sm_103, 4 CTAs of 8 warps; `tilefish-explain build/inst --probes ws.json`):
 
 ```
 launch 0: ws_scale_p on sm_103, grid (4, 1, 1), block (256, 1, 1)
-  span 17.22 us (first record to last), 4 CTAs on 4 SMs, 32 warps (12 ran none of the kernel's probes: not in the phases)
-  records 2688 kept, 0 dropped (capacity 1024 per warp); SM clock 2.029 GHz; a probe costs a warp 60 cycles (29 ns); ...
+  span 17.25 us (first record to last), 4 CTAs on 4 SMs, 32 warps (12 ran none of the kernel's probes: not in the phases)
+  records 2632 kept, 0 dropped (capacity 256 per warp); SM clock 2.023 GHz; a probe costs a warp 53 cycles (26 ns); the probes' share of a warp's
+  time at most (records times that cost, median over the warps): 19.7%
   phase (role)                                   count     median       mean        p10        p90        max   share
-  compute.work -> compute.wait (default)           1008     200 ns     201 ns     198 ns     204 ns     222 ns   59.3%
-  compute.wait -> compute.work (default)           1024      53 ns      55 ns      48 ns      54 ns     282 ns   16.6%
-  load.wait -> load.issue (worker 0)                256     197 ns     188 ns     197 ns     197 ns     234 ns   14.1%
-  load.issue -> load.wait (worker 0)                252      56 ns      56 ns      56 ns      56 ns     102 ns    4.1%
+  compute.work -> compute.wait (default)           1008     202 ns     202 ns     199 ns     205 ns     223 ns   59.3%
+  compute.wait -> compute.work (default)           1024      53 ns      55 ns      48 ns      54 ns     284 ns   16.5%
+  load.wait -> load.issue (worker 0)                256     197 ns     188 ns     197 ns     198 ns     236 ns   14.1%
+  load.issue -> load.wait (worker 0)                252      56 ns      56 ns      56 ns      56 ns     109 ns    4.1%
+  @begin -> compute.wait (default)                   16     491 ns     483 ns     443 ns     511 ns     514 ns    2.3%
   ...
   probes:
-    compute.wait             probe_kernels.py:56 [default]   tilefish.probe("compute.wait")
-    load.wait                probe_kernels.py:43 [worker 0]  tilefish.probe("load.wait")
+    compute.wait             probe_kernels.py:62 [default]   tilefish.probe("compute.wait")
+    load.wait                probe_kernels.py:49 [worker 0]   tilefish.probe("load.wait")
+    ...
 ```
 
-The producer waits 197 ns of its 253 ns per tile for a free slot, the consumer 53 ns of its 253: the pipeline is bound by the consumer (its work and its
+and `--timeline role --limit 1`, one warp of each role of the first CTA:
+
+```
+  CTA 0 on SM 28: 0.000-17.248
+    warp  0 default     0.064: compute.wait +444 ns | compute.work +280 ns | compute.wait +207 ns | compute.work +54 ns | ...
+    warp  4 -           0.000: @end +17.21 us
+    warp  6 worker 0    0.000: load.wait +490 ns | load.issue +47 ns | load.wait +51 ns | load.issue +42 ns | ...
+```
+
+The producer waits 197 ns of its 253 ns per tile for a free slot, the consumer 53 ns of its 255: the pipeline is bound by the consumer (its work and its
 TMA store), and the two go round at one rate, as a pipeline in its steady state does.
 
 * **Durations** are cycles of `%clock` converted at the clock rate the launch measured (the median over its warps of cycles per nanosecond of
@@ -281,5 +293,5 @@ replayed 50 times (`test_gpu_instrument.py::test_what_the_probes_cost`, `-s` pri
   trace file), and the GPU gate's instrumented case (`python/tests/rust_gate_probed.py`, `crates/tilefish/tests/gpu_instrument_gate.rs`): the Rust host
   launches the probed kernels with a probe buffer, without one and with one too small, and the instrumented plan launched, captured and replayed;
   `rust_gate.py compare` checks the bytes against production and the records against Python's, warp by warp (ids, counts, roles).
-* The production path: the Rust gate's export of the whole GPU gate by this version with `TILEFISH_TRACE=1`, against the export of the release before
-  without a trace: 3650 files, 184 cubins, 106 manifest, plan and plan-set digests, all the same.
+* The production path: the Rust gate's export of the whole GPU gate by this version with `TILEFISH_TRACE=1`, against the export of 0.0.10 without a
+  trace: 3650 files, 184 cubins, 106 manifest, plan and plan-set digests, all the same (the gate's instrumented case is new, in a directory of its own).
