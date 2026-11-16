@@ -519,3 +519,15 @@ def test_a_run_hands_the_c_of_a_matmul_step_to_the_backend():
     out = run.run((x, w, b, r), {})
     (call,) = [e for e in be.log if e[0] == "gemm"]
     assert call[1:7] == ("up__relu_bias_c.M32", x._ptr, w._ptr, b._ptr, r._ptr, out._ptr)
+
+
+def test_a_declared_matmul_is_a_library_step_of_a_plan_in_any_mode():
+    op = matmul_op("relu_bias", 1, name="declared")
+
+    @tilefish.graph
+    def direct(x: Tensor[M, 256, bf16], w: Tensor[512, 256, bf16], bias: Tensor[512, bf16], r: Tensor[M, 512, bf16]):
+        return op(x, w, bias, r)
+
+    (step,) = tilefish.plan(direct).steps(M=32)
+    assert step["entry"] == "declared.M32" and step["kind"] == "library"
+    assert [(a["name"], a["binding"]) for a in step["args"]] == [("a", "x"), ("b", "w"), ("bias", "bias"), ("c", "r"), ("out", "out0")]
