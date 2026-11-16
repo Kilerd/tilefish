@@ -190,6 +190,14 @@ def test_hand_written_kernels_keep_their_sources():
     with pytest.raises(tilefish.TilefishLoweringError, match="lowering must be one of"):
         lower(pc.sum_sequential, lowering=3)
 
+    @tilefish.kernel(lowering=2)  # a hand-written kernel asks for revision 2: the same bytes, other code
+    def rev2_rows(x: Tensor[R, D, f32]) -> Tensor[R, f32]:
+        return tilefish.sum(x * x, -1, order=fg.T128, fma=True)
+
+    assert rev2_rows.lowering == 2 and "_split(" in rev2_rows.lower().source and rev2_rows.unaligned("x").lowering == 2
+    with pytest.raises(tilefish.TilefishDeclarationError, match="lowering must be 1 or 2"):
+        tilefish.kernel(lowering=3)
+
 
 @pytest.mark.parametrize("name", fg.ROW_CASES)
 def test_a_row_pattern_is_one_kernel_of_its_ops(name):
@@ -278,7 +286,7 @@ def test_revision_2_lowers_ordered_sums_by_splits_and_gives_a_row_of_them_its_ow
     low = r.kernel.lower()
     assert "_split(" in low.source and "_tf_chain(" in low.source and "tl.gather(p, tl.minimum(lane + 16, 127), 0)" in low.source
     assert low.extern.bucket_num_warps == {".DR96": 1, ".DR1000": 1, ".DR2304": 4}  # 1 warp up to BLOCK_D 2048, then one per 1024 columns
-    assert "_tf_rcp(D + 0.0)" in low.source  # mean(order=): the ordered sum times rcp.rn(D), one rounding each
+    assert "1.0 / D)" in low.source and "_tf_rcp" not in low.source  # mean(order=): the ordered sum times f32(1 / D), one mul.rn
     # a Triton tree reduction keeps the template's rule (its numerics): the region of the unordered sum
     tree = next(x for x in _fusion.fused(fg.rms).regions if [y for y in x.nodes if _fusion.fused(fg.rms).program[y].op == "sum"])
     assert tree.kernel.lowering == 2 and tree.kernel.lower().num_warps == 1  # BLOCK_D 64: the template's 256 lanes per warp

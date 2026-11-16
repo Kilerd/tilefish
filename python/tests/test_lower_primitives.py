@@ -168,7 +168,7 @@ def test_the_order_changes_the_binary():
 
 def test_a_mean_takes_an_order_and_a_max_has_none(tr):
     x = tr.val(Tensor[R, D, f32])
-    m = tilefish.mean(x, -1, order="sequential")  # the ordered sum times 1 / D (rcp.rn, mul.rn)
+    m = tilefish.mean(x, -1, order="sequential")  # the ordered sum times f32(1 / D), one mul.rn
     assert tr.ctx.nodes[-1].op == "mean" and tr.ctx.nodes[-1].attrs["order"] == tilefish.tree(1) and m.type.shape == (R,)
     tilefish.mean(x, -1)
     assert "order" not in tr.ctx.nodes[-1].attrs  # without order=: the attribute is not written (the IR of every existing kernel)
@@ -183,7 +183,7 @@ def test_a_mean_takes_an_order_and_a_max_has_none(tr):
         return tilefish.mean(x, -1, order=tilefish.tree(32))
 
     src = mean_rows.lower().source
-    assert "_tf_mul_rn_f32(_tf_sum_l32_v1_o16_8_4_2_1(v0, D, BLOCK_D), _tf_rcp(D + 0.0))" in src
+    assert "_tf_mul_rn_f32(_tf_sum_l32_v1_o16_8_4_2_1(v0, D, BLOCK_D), 1.0 / D)" in src
 
 
 def test_a_product_only_fma_sums_read_is_not_computed_and_one_read_elsewhere_is():

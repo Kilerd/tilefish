@@ -430,6 +430,7 @@ class KernelOp(GraphOp):
         fp_fusion: bool = True,
         math: str = "fast",
         sass: Any = None,
+        lowering: int = 1,
     ) -> None:
         super().__init__(fn, name, signature, graph)
         self.num_warps = num_warps
@@ -442,8 +443,8 @@ class KernelOp(GraphOp):
         self.unaligned_params: "frozenset[str]" = frozenset()
         # the code of fp_fusion=False and views read where they are (note 20 of tilefish.lower): set on the kernels of a graph's fused regions
         self.context_free = False
-        # the revision of the lowering (note 21 of tilefish.lower): 1 for every kernel; 2 on the region kernels of tilefish.fusion(version=2)
-        self.lowering = 1
+        # the revision of the lowering (note 21 of tilefish.lower): 1 by default; 2 on the region kernels of tilefish.fusion(version=2), or declared
+        self.lowering = lowering
 
     def lower(self, **options: Any) -> Any:
         """Lower this kernel to Triton source: ``tilefish.lower(self, **options)``."""
@@ -668,6 +669,7 @@ def kernel(
     fp_fusion: bool = True,
     math: str = "fast",
     sass: Any = None,
+    lowering: int = 1,
 ) -> Any:
     """``@tilefish.kernel``: trace and type-check a kernel body; ``.lower()`` turns it into Triton source.
 
@@ -680,6 +682,9 @@ def kernel(
     the default, ``"fast"``, is the contract of before. One op can say it alone: ``tilefish.exp(x, math="ieee")``.
     ``sass=tilefish.sass(no_spills=True, max_registers=64)`` declares assertions about the SASS of every binary, checked at every build
     (:func:`tilefish.sass`); they are in the declaration digest of the lowered kernel.
+    ``lowering=2`` lowers it by revision 2 of the lowering (note 21 of :mod:`tilefish.lower`: ordered sums by halving splits, the warp rule of a row
+    of ordered sums, an fp8 cast and a ``-0.0`` scalar written out): the bytes of revision 1 (but a ``-0.0`` scalar's sign, which revision 1
+    loses), other code, so other binaries and pins. The default, ``1``, keeps every kernel's source.
     """
     _check_decorator_arg("kernel", fn)
     if num_warps is not None and (
@@ -690,9 +695,13 @@ def kernel(
         raise TilefishDeclarationError(f"kernel: fp_fusion must be True or False, got {fp_fusion!r}")
     if math not in _MATH_MODES:
         raise TilefishDeclarationError(f"kernel: math must be one of {list(_MATH_MODES)}, got {math!r}")
+    if isinstance(lowering, bool) or lowering not in (1, 2):
+        raise TilefishDeclarationError(f"kernel: lowering must be 1 or 2, got {lowering!r}")
     from ._sass import checks_or_none
 
     options = {"num_warps": num_warps, "fp_fusion": fp_fusion, "math": math, "sass": checks_or_none(sass, "kernel")}
+    if lowering != 1:
+        options["lowering"] = lowering
     if fn is None:
         return lambda f: _declare_traced(f, name, KernelOp, "kernel", **options)
     return _declare_traced(fn, name, KernelOp, "kernel", **options)

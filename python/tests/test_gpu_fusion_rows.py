@@ -239,6 +239,36 @@ def test_the_inline_fp8_casts_are_to_on_every_pattern():
     assert_same(tilefish.run(g_half_fp8, x, y), tilefish.run(k_half_fp8, x, y), "16-bit to fp8")
 
 
+D1K = Dim("D1K", 1024)
+
+
+def _two_means(x, w, b):
+    v = x.to(f32)
+    mu = tilefish.mean(v, -1, keepdims=True, order=tilefish.tree(256))
+    d = v - mu
+    var = tilefish.mean(d * d, -1, keepdims=True, order=tilefish.tree(256))
+    return (d * tilefish.rsqrt(var + 1e-5) * w + b).to(bf16)
+
+
+@tilefish.graph
+def two_means(x: Tensor[fg.R, D1K, bf16], w: Tensor[D1K, f32], b: Tensor[D1K, f32]):
+    return _two_means(x, w, b)
+
+
+@tilefish.graph(fusion=fg.UNFUSED)
+def two_means_unfused(x: Tensor[fg.R, D1K, bf16], w: Tensor[D1K, f32], b: Tensor[D1K, f32]):
+    return _two_means(x, w, b)
+
+
+def test_an_ordered_mean_of_a_static_power_of_two_row_passes_the_contraction_check():
+    """A mean of 1024 columns multiplies by the constant f32(1 / 1024); an rcp.rn.f32 of the constant 1024 next to that multiply was expanded by
+    ptxas into fused multiply-adds, which the contraction check refused (revision 2 multiplies by the constant instead)."""
+    for combo in combos(two_means):
+        for seed in (0, 1):
+            got, want, _, _ = run_both(two_means, two_means_unfused, args_of(two_means, combo, seed))
+            assert_same(got, want, f"two means at {combo}, seed {seed}")
+
+
 NZ = Dim("NZ", buckets=[4096])
 
 

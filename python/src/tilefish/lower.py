@@ -579,8 +579,10 @@ Notes (the facts behind the table):
       stays exact; against the ``reference`` mode, and the declared op, it is wrong). Revision 2 writes a ``-0.0`` scalar (f32, bf16, f16) by its
       bits, ``tl.full((), -2147483648, tl.int32).to(tl.float32, bitcast=True)``, and so does its padding of ordered sums.
 
-    ``mean(x, -1, order=...)`` (either revision) is the ordered sum times ``rcp.rn.f32(D)``, one ``mul.rn``: the sum times ``1 / D`` correctly
-    rounded, rounded once, as the ``reference`` mode computes it.
+    ``mean(x, -1, order=...)`` (either revision) is the ordered sum times ``f32(1 / D)``, one ``mul.rn``: ``1.0 / D`` of the constexpr ``D``, a
+    Python float that Triton rounds to f32, which is ``1 / D`` correctly rounded for every ``D`` up to ``2**20`` (the binary expansion of ``1 / D``
+    has no run of more than ``log2(D)`` equal bits, so the double is never on a midpoint of f32), as the ``reference`` mode computes it. Not
+    ``rcp.rn.f32(D)``: ptxas expands that next to the multiply into fused multiply-adds, which the contraction check refuses.
 
 **``num_warps`` and the numerics identity** (decided on measurements, ``tests/test_gpu_reduction_order.py``). What depends on ``num_warps`` is
 Triton's own reductions: ``tl.sum`` (``sum`` without ``order``, ``mean``) adds in a tree that the warp count shapes (note 6; on 1024 rows of
@@ -2856,10 +2858,10 @@ class _Body:
             return self.arg_reduce(n, v)
         if op == "sum" and "order" in n.attrs:  # note 17 (an fma sum reads its product's operands, not the product)
             return self.ordered_sum(n)
-        if op == "mean" and "order" in n.attrs:  # note 17: the ordered sum times 1 / D correctly rounded, one rounding each (rcp.rn, mul.rn)
+        if op == "mean" and "order" in n.attrs:  # note 21: the ordered sum times f32(1 / D), one mul.rn
             layout = self.layout
             assert isinstance(layout, _RowLayout)
-            return f"{self.ptx_helper('mul.rn.f32')}({self.ordered_sum(n)}, {self.ptx_helper('rcp')}({layout.D_name} + 0.0))"
+            return f"{self.ptx_helper('mul.rn.f32')}({self.ordered_sum(n)}, 1.0 / {layout.D_name})"
         if op == "gather_rows":
             return self.gather(n, v)
         if op == "load":  # one element from device memory, broadcast: no mask, no offsets

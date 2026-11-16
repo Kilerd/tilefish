@@ -669,7 +669,7 @@ def reduce_mean(x: Value, axis: Any = None, keepdims: bool = False, *, order: An
     """Mean over ``axis`` with numpy semantics (floating-point tensors only): the sum times ``1 / D``.
 
     ``order`` (as :func:`reduce_sum`'s: ``"sequential"`` or :func:`tree`) adds in that order (note 17 of :mod:`tilefish.lower`), and the mean is the
-    ordered sum times ``1 / D`` correctly rounded to f32, one rounding (``rcp.rn``, ``mul.rn``); without it the sum is Triton's tree."""
+    ordered sum times ``1 / D`` correctly rounded to f32, one rounding (``mul.rn``); without it the sum is Triton's tree."""
     resolved = _order("mean", order)
     if resolved is None:
         return _reduce("mean", x, axis, keepdims)
