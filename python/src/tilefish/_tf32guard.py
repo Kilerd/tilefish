@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Sequence
 
 # InputPrecision of Triton 3.5.1 (TritonAttrDefs.td), as an attribute dictionary prints it (``{inputPrecision = 0 : i32}``)
 _PRECISION_NAMES = {"0": "tf32", "1": "tf32x3", "2": "ieee"}
@@ -93,6 +94,8 @@ def _element(shape: str) -> str:
 
 def _ops(text: str) -> "list[Op]":
     """The dots and the MMAv5 ops of an MLIR text (TTIR or TTGIR, custom form, as Triton prints it: one op per line), in order."""
+    if _OP.search(text) is None:  # (no op of any line matches when none of the text does: the text is not split)
+        return []
     table = _locations(text)
     mma_aliases = {m.group(1) for m in _MMA_ALIAS.finditer(text)}
     found = []
@@ -122,6 +125,12 @@ def _ops(text: str) -> "list[Op]":
             loc = _resolve(trailer.group(1), table) if trailer else None
             found.append(Op(name=name, precision=precision, f32=f32, tensor_core=tensor_core, loc=loc))
     return found
+
+
+def frontend_ops(text: str) -> "list[Op]":
+    """What :func:`problem` reads of the IR the frontend built: its dots and MMAv5 ops (:class:`Op`), in order. A build keeps these and not the
+    text (:class:`tilefish._ir.Frontend`)."""
+    return _ops(text)
 
 
 def f32_dots(text: str) -> "list[Op]":
@@ -156,16 +165,18 @@ def _counted(items: "list[str]") -> str:
     return ", ".join(f"{n} x {item}" for item, n in counts.items())
 
 
-def problem(frontend_ir: str, ptx: str, *, language: str = "triton", ttir: "str | None" = None, ttgir: "str | None" = None) -> "str | None":
+def problem(
+    frontend_ir: "str | Sequence[Op]", ptx: str, *, language: str = "triton", ttir: "str | None" = None, ttgir: "str | None" = None
+) -> "str | None":
     """What is wrong with a binary whose kernel asked for IEEE f32 dots (``None``: nothing). Pure.
 
-    ``frontend_ir`` is the IR the frontend built (:func:`tilefish._ir.ttir_text`; a Gluon kernel's TTGIR), ``ptx`` the binary's PTX, and
-    ``ttir`` and ``ttgir`` the TTIR and TTGIR of the compile with their locations (``compiled.asm``), when there was one: a build served by the
+    ``frontend_ir`` is the IR the frontend built (:func:`tilefish._ir.ttir_text`; a Gluon kernel's TTGIR) or its :func:`frontend_ops`, ``ptx``
+    the binary's PTX, and ``ttir`` and ``ttgir`` the TTIR and TTGIR of the compile with their locations (``compiled.asm``), when there was one: a build served by the
     cache has its PTX only, which judges every kernel but one that mixes IEEE dots with dots that allow TF32 (that one was judged, with its
     TTGIR, by the build that stored the entry). The message says what was asked, what was found and where, without the fixes
     (:func:`tilefish._build.check_tf32` adds them).
     """
-    ops = _ops(frontend_ir)
+    ops = _ops(frontend_ir) if isinstance(frontend_ir, str) else list(frontend_ir)
     asked = [op for op in ops if op.f32 and op.precision == IEEE]
     if not asked:
         return None

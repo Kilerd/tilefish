@@ -28,6 +28,10 @@ searched for, and a prebuilt binary's are never read). Do not ship ``trace/`` wi
 without it writes the same manifest and plans, byte for byte (a traced export compiles every Triton kernel instead of reading the build cache,
 which holds binaries, not their IR; the build is reproducible, so the binaries are the same). A host never reads it. ``tilefish-explain``
 (:mod:`tilefish.explain`) does, and checks it against the manifest (each binary's sha256) before it trusts a line of it.
+
+**Memory.** The levels of a binary are written after every binary of the export is built; until then they are files of a temporary directory
+(``TMPDIR``), one per distinct text, which goes when the export ends (:func:`tilefish._build.export_session`), so an export of many binaries
+does not hold every level of every one of them in memory.
 """
 
 from __future__ import annotations

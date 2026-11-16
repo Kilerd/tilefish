@@ -107,7 +107,7 @@ from types import SimpleNamespace
 from typing import Any, Iterator
 
 from . import _cache, _cuda, _cudamath, _ir, _source
-from ._build import BuiltKernel, build, check_launch_config, resolve_triton, write_file, write_manifest_doc
+from ._build import BuiltKernel, build, check_launch_config, export_session, resolve_triton, write_file, write_manifest_doc
 from ._cuda import sm_partition as sm_partition  # tilefish.runtime.sm_partition(sms): the partition (a green context) a persistent grid is resolved for
 from ._launch import (
     TORCH_DTYPE_NAMES,
@@ -677,7 +677,7 @@ def _ir_digest_of(spec: CompileSpec, fn: Any, cap: int, extra: "dict[str, Any]")
     """The IR digest of the kernel ``fn`` as this process holds it, for ``spec`` on architecture ``cap`` (see :mod:`tilefish._ir`)."""
     inputs = spec.ast_source_inputs()
     options = {**inputs.options, **extra}
-    return _ir.ir_digest(_ir.ttir_text(fn, inputs, arch=cap, options=options, what=f"'{spec.stem}' ({spec.triton})"), spec.language)
+    return _ir.frontend(fn, inputs, arch=cap, options=options, what=f"'{spec.stem}' ({spec.triton})").digest
 
 
 def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKernel:
@@ -1023,12 +1023,33 @@ def export(
     ``tilefish-explain`` reads. It is outside the pinned artefact: the manifest, the plans and every digest are the same with or without it (a
     traced export compiles every Triton kernel instead of reading the build cache, which holds no IR).
 
+    **Memory.** The export is one session of builds (:func:`tilefish._build.export_session`): Triton's frontend runs once per distinct kernel input, not
+    once per bucket (the buckets of one ``by_bucket=`` configuration have one IR and one binary), the entries that have the same cubin share one copy of it
+    until it is written, and a traced export keeps the stages of its builds in a temporary directory until it writes the trace. None of it changes a
+    byte of what is written.
+
     Returns the loaded and verified :class:`~tilefish.aot.Manifest` (``.pinned``: it is what ``hosts.rust.emit`` takes): ``.directory``, ``.path`` and ``.digest``, the
     digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
     ``run(..., mode="replay", manifest=directory, pin=digest)`` to refuse a directory that was changed after the export.
     The digest is the one of the manifest that was written from the builds in memory; the directory is read back and
     must have the same digest, or this raises :class:`~tilefish.errors.TilefishManifestError`.
     """
+    with export_session():
+        return _export(ops, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=trace)
+
+
+def _export(
+    ops: Any,
+    directory: "str | os.PathLike[str]",
+    *,
+    arch: "int | str | None",
+    overwrite: bool,
+    buckets: Any,
+    reuse: bool,
+    verify: "bool | None",
+    trace: "bool | None",
+) -> Any:
+    """:func:`export`, inside its session."""
     items = list(ops) if isinstance(ops, (list, tuple)) else [ops]
     is_graph = [
         (isinstance(o, GraphOp) and not isinstance(o, KernelOp))

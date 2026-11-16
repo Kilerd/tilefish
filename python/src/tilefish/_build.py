@@ -15,14 +15,17 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import importlib
 import json
 import math
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
@@ -64,6 +67,7 @@ _WARP_SPECIALIZE = re.compile(r"^\s*(?:%[^=\n]*=\s*)?ttg\.warp_specialize\(", re
 MAX_WARPS = 32  # 1024 threads: the most a block has
 _MISSING = object()
 _compile_lock = _ir.LOCK  # a Triton knob is process-wide state, and Triton's frontend is not known to be thread-safe: one compile (or frontend) at a time
+_session = threading.local()  # .state: the _Session of the export_session this thread is in (None outside one)
 
 # the PTX type of each kind of launch parameter: a pointer is 64 bits, a scalar is as wide as its C type says
 _PTX_SCALARS = {"i32": ("u32", 4), "i64": ("u64", 8), "f32": ("f32", 4)}
@@ -760,11 +764,19 @@ def _text_or_none(value: Any) -> "str | None":
 
 
 def check_tf32(
-    spec: "CompileSpec", cap: int, frontend_ir: str, ptx: str, triton_version: str, *, ttir: "str | None" = None, ttgir: "str | None" = None
+    spec: "CompileSpec",
+    cap: int,
+    frontend_ir: "str | Sequence[Any]",
+    ptx: str,
+    triton_version: str,
+    *,
+    ttir: "str | None" = None,
+    ttgir: "str | None" = None,
 ) -> None:
     """Refuse a binary whose kernel asks for IEEE f32 dots but was compiled into TF32 tensor-core MMAs (:mod:`tilefish._tf32guard`).
 
-    ``frontend_ir`` is the IR the frontend built (the text of the IR digest), ``ptx`` the binary's, and ``ttir`` and ``ttgir`` those of the compile
+    ``frontend_ir`` is the IR the frontend built (the text of the IR digest), or its dots (:attr:`tilefish._ir.Frontend.ops`, what a build keeps of
+    it), ``ptx`` the binary's, and ``ttir`` and ``ttgir`` those of the compile
     (``compiled.asm``; a cache hit has none). Every kernel Triton builds is checked, a lowered ``@kernel`` (it has no dot today) as much as an
     ``extern``; a kernel whose dots allow TF32 is never refused. Raises :class:`~tilefish.errors.TilefishBuildError` with the fixes.
     """
@@ -1066,8 +1078,8 @@ def build(
 
     files = _cache.compile_files(opts)  # refuses ir_override; the sha256 of the files the options name (extern_libs)
     what = f"'{spec.stem}' ({spec.triton})"
-    frontend_ir = _ir.ttir_text(jit, inp, arch=cap, options=opts, what=what)
-    digest = _ir.ir_digest(frontend_ir, spec.language)
+    frontend = _ir.frontend(jit, inp, arch=cap, options=opts, what=what)  # its digest and its dots: the IR itself is not kept
+    digest = frontend.digest
     if ir_digest is not None and digest != ir_digest:
         raise TilefishBuildError(
             f"the IR of {what} has digest {digest}, but {ir_digest} was expected: it is not the kernel the caller meant to build"
@@ -1093,15 +1105,15 @@ def build(
         )
         hit = None if stages else store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
-            check_tf32(spec, cap, frontend_ir, hit.ptx, triton_version)  # an entry has its PTX only, which the build that stored it was judged by too
+            check_tf32(spec, cap, frontend.ops, hit.ptx, triton_version)  # an entry has its PTX only, which the build that stored it was judged by too
             check_contraction(spec, cap, hit.ptx, hit.cubin, opts, hit.sha256)  # (an entry a tilefish without the check stored, too)
             check_launch_attributes(spec, hit.launch)  # the scratch and the cluster the declaration states, as for a compile
             checked = check_sass(spec, cap, hit.cubin, hit.ptx, hit.symbol, opts)  # the declaration's SASS assertions, on the binary the cache holds
-            return dataclasses.replace(hit, cuda_math=cuda_math, sass_checked=checked)  # (read from the source and the libdevice here, not from the cache)
+            return _kept(dataclasses.replace(hit, cuda_math=cuda_math, sass_checked=checked))  # (read from the source and the libdevice here, not from the cache)
 
     from triton.backends.compiler import GPUTarget
 
-    src = _ir.recording_source(_ir.source_class(spec.language))(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
+    src = _ir.recording_source(_ir.source_class(spec.language), spec.language)(jit, signature=inp.signature, constexprs=None, attrs=inp.attrs)
     src.constants = inp.constants
     try:
         with _always_compile(triton), _ir.ptxas_in_an_empty_directory():
@@ -1109,6 +1121,7 @@ def build(
     except Exception as e:  # noqa: BLE001 - a compile failure of any kind is a build error, with Triton's message
         hint = _ptxas_target_hint(e, triton, ptxas)
         raise TilefishBuildError(f"Triton could not compile '{spec.stem}' ({spec.triton}) for sm_{cap}: {hint}{type(e).__name__}: {e}") from e
+    src.release()  # what the compile left of the module (its stages are in compiled.asm, read from Triton's files): Triton would keep it
     changed = _cache.changed_contents(keyed, opts)
     if changed:
         raise TilefishBuildError(
@@ -1116,7 +1129,7 @@ def build(
             "build was identified by or of the new one, and the cache key (which holds the content of these files) cannot say which: "
             "the binary was neither returned nor stored. Build again when nothing is rewriting the file"
         )
-    if src.ir_text is None or _ir.ir_digest(src.ir_text, spec.language) != digest:
+    if src.recorded_digest is None or src.recorded_digest != digest:
         raise TilefishBuildError(
             f"'{spec.stem}': the IR Triton compiled is not the IR whose digest {digest} the build was identified by (Triton's frontend "
             "gave another module the second time it was run on the same kernel); refusing to record or cache the binary"
@@ -1151,7 +1164,7 @@ def build(
     launch = _launch_attributes(md)
     check_launch_attributes(spec, launch)
     asm = getattr(compiled, "asm", {})
-    check_tf32(spec, cap, frontend_ir, ptx, triton_version, ttir=_text_or_none(asm.get("ttir")), ttgir=_text_or_none(asm.get("ttgir")))
+    check_tf32(spec, cap, frontend.ops, ptx, triton_version, ttir=_text_or_none(asm.get("ttir")), ttgir=_text_or_none(asm.get("ttgir")))
     from hashlib import sha256
 
     check_contraction(spec, cap, ptx, cubin, opts, sha256(cubin).hexdigest())
@@ -1183,7 +1196,103 @@ def build(
     if stages:
         kept = {k: v for k, v in ((k, _text_or_none(v)) for k, v in asm.items() if k != "cubin") if v is not None}
         built = dataclasses.replace(built, stages=kept)
-    return built
+    return _kept(built)
+
+
+# -- the memory of an export ---------------------------------------------------------------------------------------------------------
+
+
+class SpilledStages(Mapping[str, str]):
+    """The stages of a traced build (:attr:`BuiltKernel.stages`) in the files of an :func:`export_session`, read back when they are asked for: the
+    trace of an export writes them after every binary is built (:mod:`tilefish._trace`), and a stage is then in memory only while it is written."""
+
+    def __init__(self, files: "Mapping[str, pathlib.Path]") -> None:
+        self._files = dict(files)
+
+    def __getitem__(self, stage: str) -> str:
+        try:
+            return self._files[stage].read_bytes().decode("utf-8")
+        except FileNotFoundError:
+            raise TilefishBuildError(
+                f"the {stage} stage of a traced build was kept in {str(self._files[stage])!r} for the export it was built in, which is over"
+            ) from None
+
+    def __iter__(self) -> "Iterator[str]":
+        return iter(self._files)
+
+    def __len__(self) -> int:
+        return len(self._files)
+
+
+class _Session:
+    """What an :func:`export_session` keeps: one copy of every cubin and PTX its builds have (by content), and the directory of their stages."""
+
+    def __init__(self) -> None:
+        self.cubins: "dict[str, bytes]" = {}  # sha256 -> the cubin
+        self.ptx: "dict[str, str]" = {}  # the text -> itself
+        self.directory: "str | None" = None  # the stages of traced builds, one file per distinct text (made when the first is kept)
+
+    def keep(self, built: BuiltKernel) -> BuiltKernel:
+        cubin = self.cubins.setdefault(built.sha256, built.cubin)  # (the sha256 of the cubin: the build made it, or the cache checked it)
+        ptx = self.ptx.setdefault(built.ptx, built.ptx)
+        stages = built.stages
+        if stages and not isinstance(stages, SpilledStages):
+            stages = self.spill(stages)
+        if cubin is built.cubin and ptx is built.ptx and stages is built.stages:
+            return built
+        return dataclasses.replace(built, cubin=cubin, ptx=ptx, stages=stages)
+
+    def spill(self, stages: "Mapping[str, str]") -> "Mapping[str, str]":
+        try:
+            if self.directory is None:
+                self.directory = tempfile.mkdtemp(prefix="tilefish-stages-")
+            files: "dict[str, pathlib.Path]" = {}
+            for stage, text in stages.items():
+                data = text.encode("utf-8")
+                path = pathlib.Path(self.directory) / hashlib.sha256(data).hexdigest()
+                if not path.exists():
+                    path.write_bytes(data)
+                files[stage] = path
+        except (OSError, UnicodeEncodeError):  # a temporary directory that cannot be written: the stages stay in memory
+            return stages
+        return SpilledStages(files)
+
+    def close(self) -> None:
+        self.cubins.clear()
+        self.ptx.clear()
+        if self.directory is not None:
+            shutil.rmtree(self.directory, ignore_errors=True)
+
+
+def _kept(built: BuiltKernel) -> BuiltKernel:
+    """``built`` as an :func:`export_session` keeps it (itself outside one)."""
+    state = getattr(_session, "state", None)
+    return built if state is None else state.keep(built)
+
+
+@contextlib.contextmanager
+def export_session() -> "Iterator[None]":
+    """Within the block, the builds of this thread are an export's (``tilefish.runtime.export`` runs in one; a session inside another is the outer one):
+
+    * the frontend runs once per distinct input (:func:`tilefish._ir.frontend_scope`): the buckets of one ``by_bucket=`` configuration have one IR,
+      and are one binary of the build cache;
+    * the builds that have the same cubin, or the same PTX, share one copy of it (a manifest of many buckets holds one copy of each binary until
+      it is written, not one per entry);
+    * the stages a traced build keeps (``build(..., stages=True)``) are written to a temporary directory, one file per distinct text, and read
+      back when the trace is written (:class:`SpilledStages`); the directory is removed when the block ends.
+
+    None of it changes a byte of a build, a digest or a manifest."""
+    if getattr(_session, "state", None) is not None:
+        yield
+        return
+    state = _Session()
+    _session.state = state
+    try:
+        with _ir.frontend_scope():
+            yield
+    finally:
+        _session.state = None
+        state.close()
 
 
 # -- the manifest ---------------------------------------------------------------------------------------------------------

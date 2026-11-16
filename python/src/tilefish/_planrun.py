@@ -82,7 +82,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from . import _plan, runtime
+from . import _ir, _plan, runtime
 from ._build import check_launch_config
 from ._launch import (
     TORCH_DTYPE_NAMES,
@@ -953,7 +953,7 @@ class PlanRunner:
         be = self.backend
         if be.capturing(index):
             raise TilefishRuntimeError("a plan cannot be prepared while a CUDA graph is being captured: its arena, binaries and handles are made outside the capture")
-        with _gate.shared(), self._lock:
+        with _gate.shared(), self._lock, _ir.frontend_scope():  # (the frontend runs once per distinct kernel input, not once per bucket)
             self._arena(index)
             for values in buckets if buckets is not None else self.plan.buckets():
                 self._bucket(dict(values), index)
