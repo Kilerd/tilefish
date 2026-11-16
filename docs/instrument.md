@@ -100,8 +100,8 @@ already has (the second of its two scratch slots, null in a production launch).
   `tilefish.hosts.rust.emit` and `tilefish.hosts.cpp.emit` refuse it (they write production hosts).
 * Rust: `Manifest::load` and `Manifest::from_embedded` refuse it; `Manifest::load_instrumented` takes it (and `LaunchPlan` likewise).
 * An export never merges the two: writing the variant into a directory that holds a production manifest (or the other way round) is refused.
-* Readers that predate it: the crate 0.0.7 refuses the entry field (it refuses every unknown field); tilefish 0.0.9's replay refuses a kernel with
-  probes (its IR digest is not the one the process computes). A kernel without probes would load there; launched with the null profile scratch an
+* Readers that predate it: the crate 0.0.8 and earlier refuse the entry field (they refuse every unknown field); the replay of tilefish 0.0.10 and
+  earlier refuses a kernel with probes (its IR digest is not the one the process computes). A kernel without probes would load there; launched with the null profile scratch an
   older host gives it, every probe skips its store (the slot pointer is null), so it runs and writes the production bytes.
 
 ## 3. The probe buffer and the records
