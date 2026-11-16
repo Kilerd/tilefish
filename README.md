@@ -238,7 +238,10 @@ process otherwise, about twice its text, at every frontend and every compile). A
 export of 132 buckets in three configurations of a Gluon kernel with a large IR
 (`python/tests/irmem_export.py`, on a B300) took 77 s and peaked at 1.27 GB of
 resident memory; it now takes 9 s and peaks at 0.40 GB (2.7 s and 0.25 GB with a warm
-cache; traced, 2.66 GB before and 0.43 GB now), and writes the same bytes.
+cache; traced, 2.66 GB before and 0.43 GB now), and writes the same bytes. A plan
+set is read back against the one manifest the export wrote, not a copy of it and its
+binaries per plan: a set of 1319 plans over 147 binaries and 1199 GEMM pins peaked at
+54 GB and now peaks at 1.3 GB.
 
 So an edit that was not reloaded is not a special case. `export` in the process
 that imported the module compiles, and stamps, what that process holds; a fresh
