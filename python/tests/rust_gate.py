@@ -1417,6 +1417,26 @@ def plan_graphs():
         return make
 
     fused = [(f"fused_{name}", fg.CASES[name][0], False, fused_cases(fg.CASES[name][0])) for name in sorted(fg.CASES)]
+    # docs/rfcs/0003-epilogue-fusion.md, E1: the patterns fused into the example externs' epilogue hooks (each one kernel step of a generated entry:
+    # nothing new for a host), exact and on the accumulator; the Gluon GEMM's on sm_100 and sm_103
+    import epilogue_graphs as epg
+
+    major, minor = torch.cuda.get_device_capability()
+    cap = major * 10 + minor
+    epi = epg.build(epg.examples(cap), prefix="gate_epi")
+    fused += [
+        (f"fused_epi_{name}" + ("" if mode == "fused" else "_acc"), epi[name][mode], False, fused_cases(epi[name][mode]))
+        for name in sorted(epi)
+        for mode in ("fused", "acc")
+        if not (name == "add_norm" and mode == "acc")  # (its residual add is in bf16: nothing for R_acc to rewrite, the same plan)
+    ]
+    if cap in (100, 103):
+        import epilogue_gemm as ex
+
+        gl_body, gl_params = epg.bodies(ex.gluon_gemm(name="gate_gluon_gemm"), None, None)["periodic"]
+        for mode in ("fused", "acc"):
+            g = epg.graph_of(gl_body, gl_params, epg.MODES[mode], f"gate_epi_gluon_periodic_{mode}")
+            fused.append(("fused_epi_gluon_periodic" + ("" if mode == "fused" else "_acc"), g, False, fused_cases(g)))
 
     import conv_kernels as ck
 

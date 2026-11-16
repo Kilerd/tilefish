@@ -5,6 +5,48 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+Manifest schema 3, plan schema 1, the crate and the C ABI are unchanged: a fused pair of an extern and a region is a generated `triton` entry, a kernel
+step like any. Every export that calls no extern with an epilogue hook writes the same manifest, plans and fusion reports as 0.0.11.
+
+### Epilogue hooks on externs (`docs/rfcs/0003-epilogue-fusion.md`, milestone E1)
+
+- **`tilefish.hook(name, value="out" | "acc", out=..., split=1, block_n=None)`**, given to `@tilefish.extern(..., epilogue=...)` (one hook or two of
+  different values): the kernel takes a `tl.constexpr` jit function `<name>` and its arguments `<name>_ARGS`, which the stub does not list, and calls
+  `tile = <name>(tile, rows, cols, row_mask, col_mask, <name>_ARGS)` on each output tile where it would store it (`tilefish._epilogue.ABI`). Without a
+  fusion the hook is the identity: an extern with hooks is launched through a small generated module (`tilefish_generated.<extern>__hooks`) that calls
+  its kernel with the identity, whose source is in the declaration digest. A Triton or a Gluon kernel of one implementation.
+- **A region of the graph body that reads the extern's result and fits its tile is fused into the kernel**: one step, `<extern>_epi_<hash>` (the
+  extern with the region's code, lowered by `tilefish.lower.lower_hook`, note 22, in its hook; the region's other inputs and side outputs extra
+  parameters, keyword-only). What a hook takes: elementwise regions over the result (a bias and an activation, a periodic activation, a residual add,
+  masks, casts; a side output stored by the hook), the tiles of a dual accumulator (`split=2`: a gated activation of the gate and up halves), and an
+  ordered norm where a tile holds whole rows (`block_n=`, a Triton kernel). Anything else stays a region after the call, and the fusion report, the
+  boundaries and the advisor say why (`epilogue-*` reasons: among them a cycle through another region or fused pair, `epilogue-cycle`, and a
+  tensor the extern updates in place, `epilogue-inout`). `tilefish.barrier(y)` keeps a result stored and stops its epilogue fusion.
+- **Contracts**: `tilefish.fusion(epilogues="exact")`, the default, fuses through `value="out"` hooks, which see the tile the kernel rounded: the
+  bytes of the extern followed by the region (contract (i)). `epilogues="accumulator"`, declared on the graph or in a new scope, `with
+  tilefish.fused(epilogues="accumulator"):`, is the rewrite `R_acc` on the IR: every widening of such a result is the extern's f32 result, written by
+  the extern's accumulator form (`<extern>__acc`) where no hook takes the region, and the region goes into the `value="acc"` hook: the bytes of the
+  unfused plan of the rewritten program (contract (ii)), one rounding fewer.
+- **Checked at every export**: each fused pair against the extern (or its accumulator form) followed by the region's ops one by one, at every bucket,
+  on seeded inputs with special values in every side input and in the extern's operands; a difference refuses the export (`verify=False` opts out).
+  `tilefish.verify_fusion` does the same on demand.
+- **The fusion report** gains, only for a graph that calls an extern with hooks: per fused region `route: "hook"`, `call`, `value`, `contract`,
+  `stored`, `rounding_points_removed` (under `R_acc`); per region a hook did not take, `epilogue_refused`; `hooks` (the externs with hooks the graph
+  calls); `fusion.epilogues` when it is not `"exact"`. The trace's regions name the fused pair.
+- **The advisor and `boundaries()`**: an extern with hooks is an `opaque` step whose epilogue candidate is actionable (`epilogue-hook-consumer`, or the
+  reason its hook did not take the region), with `routes` and the contract of each; an epilogue of a pinned GEMM or convolution points to RFC 0003's
+  E2, E3 (with its break-even slowdown) or E6, and to an extern with a hook today. The fixes of `epilogue-library`, `epilogue-extern`,
+  `opaque-unknown` and `opaque-compute-epilogue` are reworded.
+- **Examples** (`python/examples/epilogue_gemm.py`): a Triton GEMM with both hooks (`tcgen05.mma` on sm_100 and sm_103, `mma.sync` on sm_120, each
+  asserted in the SASS; its epilogue on sub-tiles of the columns), its dual-accumulator form, a Gluon `tcgen05` GEMM, and a 1-D convolution as an
+  implicit GEMM.
+- **Speed** (B300 slice, the example GEMM): bias + GELU after a 2048 x 4096 x 1024 GEMM 1.21 times faster fused than the GEMM and its region after
+  it, a gated activation 1.14 times, parity for a periodic activation and a norm at 2048 rows; slower where the epilogue is heavy for the kernel's
+  warps (a periodic activation after a convolution: 0.77 times). The hook's arithmetic runs on the extern's warps after its main loop; `tilefish.barrier`
+  keeps a region after the call (RFC 0003, E1 notes).
+
 ## tilefish 0.0.11, crate 0.0.9, tilefish-capi 0.0.1 (2026-11-17)
 
 Manifest schema 3 and plan schema 1 are unchanged but for one optional entry field, `instrument`, which only the instrumented variant writes (below).

@@ -973,7 +973,51 @@ boundary of the regions (it gets a buffer of the plan, which `taps=` reads); it 
 `order=` joined to a region, a store into an `InOut` or carried tensor made by a region (it is a copy step), a dense reshape inside a region, a strided store,
 `tilefish.fused(name=...)` scopes, `intermediates="f32"`, and modes that are not exact (`docs/rfcs/0001-plan-fusion.md`, section 11).
 Fusion into a GEMM or a convolution, epilogues and prologues, is designed in RFC 0003 (`docs/rfcs/0003-epilogue-fusion.md`: the three numerics
-contracts it keeps apart, the routes, and the experiments behind them); none of it is implemented yet.
+contracts it keeps apart, the routes, and the experiments behind them); its first milestone, epilogue hooks on externs, is below.
+
+### Epilogue hooks: the arithmetic after an extern's GEMM, in its kernel
+
+An extern says where its kernel takes an epilogue, and a graph that calls it and computes on its result gets one kernel instead of two (RFC 0003,
+milestone E1). The kernel has a `tl.constexpr` hook parameter and its arguments, which the stub does not list, and calls the hook on each output tile
+where it would store it (`tilefish._epilogue.ABI`):
+
+```python
+@triton.jit
+def gemm_kernel(a, b, c, m, n, k, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, ..., ACC: tl.constexpr, ACC_ARGS, EPILOGUE: tl.constexpr, EPILOGUE_ARGS):
+    ...                                                                   # the main loop: acc, an f32 [BM, BN] tile
+    tile = ACC(acc, rows, cols, rows < m, cols < n, ACC_ARGS)            # value="acc": the accumulator
+    tile = EPILOGUE(tile.to(c.dtype.element_ty), rows, cols, rows < m, cols < n, EPILOGUE_ARGS)   # value="out": the rounded tile
+    tl.store(c + rows[:, None] * n + cols[None, :], tile, mask=...)
+
+@tilefish.extern(triton=gemm_kernel, grid=..., epilogue=(tilefish.hook("ACC", value="acc", out="c"), tilefish.hook("EPILOGUE", value="out", out="c")))
+def gemm(a: TensorDesc(Tensor[M, K, bf16], block=(128, 64)), b: TensorDesc(Tensor[N, K, bf16], block=(128, 64)), c: Out[Tensor[M, N, bf16]], m: M, n: N, k: K, ...): ...
+
+@tilefish.graph
+def up(x: Tensor[T, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16]):
+    return tilefish.gelu(gemm(x, w).to(f32) + bias.to(f32)).to(bf16)     # one step: the GEMM with the bias and the GELU in its hook
+```
+
+* **Exact by default** (`tilefish.fusion()`, `epilogues="exact"`): the region goes into the `value="out"` hook, which sees the tile the kernel rounded to
+  its output type, as it would store it, so the fused op writes the bytes of the extern followed by the region (contract (i)), and `export` checks it
+  at every bucket on seeded inputs with special values (`verify_fusion` too).
+* **On the accumulator**, declared: `tilefish.fusion(epilogues="accumulator")`, or a scope, `with tilefish.fused(epilogues="accumulator"):` (never per
+  call). The graph is then the rewrite `R_acc` of its body: every widening `y.to(f32)` of the extern's result is the extern's f32 result (the
+  accumulator form of the extern writes it, `<extern>__acc`), one rounding fewer, and the region goes into the `value="acc"` hook. The bytes are
+  those of the unfused plan of the rewritten program (contract (ii)), checked at export; they are not the extern-then-region bytes (about a third of a
+  bias + activation's outputs differ), and they are at least as accurate.
+* **What a hook takes**: an elementwise region over the result's shape (a bias, an activation, a periodic activation with a per-channel parameter, a
+  residual add with the stream as a side output, a mask, a cast), the dual-accumulator tiles of a gated activation (`tilefish.hook(..., split=2)`: a
+  program holds the tile of the gate and the matching tile of the up projection), and a row region (an rmsnorm) where a tile of the extern holds whole
+  rows (`block_n=`, a Triton kernel). What it does not take stays route (a), a region after the call, and the fusion report, `boundaries()` and the
+  advisor say why (a barrier, a view the hook does not hold, a call in between, a row wider than a tile, ...).
+* **Speed is the kernel's**: the hook's arithmetic runs on the extern's warps after its main loop. On a B300 slice, with the example GEMM, a bias +
+  GELU after a 2048 x 4096 x 1024 GEMM is 1.21 times faster fused than the GEMM followed by its region, a gated activation 1.14 times; an epilogue
+  heavy for the kernel's warps can be slower (a `sin` per element after a convolution: 0.77 times; the table is in RFC 0003). `tilefish.barrier(y)`
+  keeps the region after the call.
+* **Nothing new for a host or a schema**: an extern with hooks is launched through a small generated module that calls its kernel with the identity
+  hook (in its declaration digest), and a fused pair is a generated entry of its own, `<extern>_epi_<hash>`, its identity the IR it compiles to.
+  `python/examples/epilogue_gemm.py` has a Triton GEMM (`tcgen05.mma` on sm_100/103, `mma.sync` on sm_120, both asserted in the SASS), its
+  dual-accumulator form, a Gluon `tcgen05` GEMM and a 1-D convolution as an implicit GEMM, each with both hooks.
 
 ## SASS: explained and asserted
 

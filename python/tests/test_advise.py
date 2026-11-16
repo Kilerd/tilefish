@@ -106,7 +106,13 @@ def test_an_intermediate_with_one_producer_and_one_consumer_is_a_candidate_bound
     assert pair["blockers"] == ["opaque-unknown", "dsl-kernel"] and pair["phase"] == "1"
     assert epi["blockers"][0] == "epilogue-library" and epi["phase"] == "future" and epi["gate"] == "epilogue-library"
     assert pro["blockers"][0] == "prologue-library"
-    assert any("GEMM / convolution epilogue: future work" in a for a in epi["actions"])
+    assert any("cuBLASLt epilogues (bias, ReLU, beta * C) are E2" in a and "generated GEMM or convolution with hooks is E3" in a for a in epi["actions"])
+    # docs/rfcs/0003-epilogue-fusion.md, section 5: the routes into the GEMM, each with its contract and the saving; E3 with its break-even
+    routes = {r["milestone"]: r for r in epi["routes"]}
+    assert set(routes) == {"E1", "E2", "E3"} and routes["E1"]["status"].startswith("available")
+    assert routes["E2"]["contract"].startswith("(iii)") and routes["E3"]["break_even"] > 1.0
+    assert all(r["saved_us"] == round(epi["saved_us"]["M=64"], 3) for r in epi["routes"])
+    assert "routes" not in pair and "routes" not in pro  # (only an epilogue of a GEMM or a convolution has them)
     # the GEMM is memory-bound at 64 rows: its read of t1 counts in what the prologue saves
     assert pro["saved_bytes"]["M=64"] == 2 * ROW
 

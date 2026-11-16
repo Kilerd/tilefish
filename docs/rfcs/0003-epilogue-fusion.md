@@ -1,7 +1,7 @@
 # RFC 0003: Epilogue and prologue fusion
 
-* **Status:** reviewed; the decisions of 2026-11-16 are recorded in "Decisions" below. Design and phase 0 experiments (section 6); nothing is
-  implemented yet.
+* **Status:** reviewed; the decisions of 2026-11-16 are recorded in "Decisions" below. Design and phase 0 experiments (section 6). Milestone E1,
+  epilogue hooks on externs, is implemented ("E1: implementation notes" below); the rest is design.
 * **Scope:** fusion across a call. An *epilogue* is the elementwise or row work that reads a GEMM's or a convolution's result; a *prologue* makes one
   of its operands. The RFC touches the planner and the fusion pass (`tilefish._plan`, `tilefish._fusion`), the library ops (`cublaslt.*`,
   `cudnn.conv_fwd`), externs, a new family of generated GEMM and convolution ops and the advisor. Only library epilogues touch the manifest and the
@@ -70,6 +70,7 @@ candidate with the routes and contracts that can take it.
 ## Contents
 
 Decisions (2026-11-16)
+E1: implementation notes (2026-11-17)
 0. Background: what exists
 1. Use cases
 2. The numerics problem and the three contracts
@@ -112,6 +113,106 @@ names, and "D6" in this RFC is still RFC 0001's export-time verification):
   * Q9: gated activations with two accumulators per program;
   * Q10: norms over whole-row tiles first, the split over tiles with a declared order in E4;
   * Q11: cuDNN fused graphs (E6) after E2 and X13, with cuDNN 9.13 or later required for fused entries on sm_103.
+
+## E1: implementation notes (2026-11-17)
+
+Implemented on tilefish 0.0.11 as `tilefish.hook`, `@tilefish.extern(..., epilogue=...)`, `tilefish.fusion(epilogues=...)` and the scope `with
+tilefish.fused(epilogues=...):`, the generated modules of `tilefish._epilogue`, the hook lowering (`tilefish.lower.lower_hook`, note 22), the merge, the
+rewrite `R_acc` and the check in `tilefish._fusion`, the fusion report's new fields and the advisor's routes. Neither schema, the crate nor the C ABI
+changes.
+
+* **As designed (3.2.1, 4, 5):** the two hook flavours (`value="out"` after the kernel's rounding, contract (i); `value="acc"` on the accumulator,
+  contract (ii)); `epilogues="exact"` on by default and `"accumulator"` declared per graph or per scope (Q2, Q3); `R_acc` on the IR before any region
+  is formed, so a region the hook does not take still runs `U(R_acc(P))`; one fused op per pair, named by its content; a pair the planner or the
+  check refuses stays route (a), with the reason in the report; the export-time check of every pair; dual accumulators for a gated activation (Q9,
+  `split=2`); norms over whole-row tiles only (Q10, `block_n=`); the advisor's routes with their contracts and savings.
+* **The ABI** (`tilefish._epilogue.ABI`). The kernel has two parameters per hook that the stub does not list, `<NAME>` (a `tl.constexpr`: a jit
+  function) and `<NAME>_ARGS` (a tuple), and calls `tile = NAME(tile, rows, cols, row_mask, col_mask, NAME_ARGS)` on each output tile where it would
+  store it: `tile` the rounded tile (`out`) or the f32 accumulator (`acc`), or a tuple of `S` tiles side by side (`split=S`); `rows` the tile's rows of
+  the output seen as `[R, L]`, `cols` its columns within a chunk, in a Gluon kernel in the slice layouts of the tile's layout; it returns what the
+  kernel stores (an `acc` hook's return converted to the output's type by the kernel, `tile.to(OUT.dtype.element_ty)`; a split hook's one or `S`
+  tiles side by side, the output's rows that many chunks wide). Triton 3.5.1 takes a jit function as a `constexpr` and a tuple of tensors and scalars
+  as a nested call's argument, measured.
+* **Decisions made in implementing it:**
+  * **A generated module, not a hook in the compile spec.** A spec, a manifest entry and both hosts describe values, not functions. So an extern
+    that declares hooks is compiled through a generated module: `tf_<extern>__hooks(<the stub's parameters>)` calls the kernel by keyword with the
+    identity hook; a pair, `tf_<extern>_epi_<hash>(<the stub's parameters>, ep_*)`, calls it with the region's hook and its arguments as a tuple. The
+    kernel's main loop is the same source in both, inlined into one IR, which identifies the binary (TTIR, or TTGIR for Gluon); the module's sha256 is
+    in the declaration digest (`source_sha256`). An extern without hooks is as it was.
+  * **What the kernel stores.** The result itself when anything else reads it (every output of the region then a side output, which the hook stores);
+    else the region's first output of the result's shape (and of its type, for `out`: the kernel rounds to the output's type before the hook), the
+    fused op's output given that type (`acc`) and, for a split hook, the shape of one chunk; else the result all the same, into a buffer nothing reads
+    (still one launch and one read fewer than route (a)).
+  * **The accumulator form** of `U(R_acc(P))` is not "the kernel with an f32 output", which a kernel that writes its output's type need not
+    support, but `<extern>__acc`: the extern with an `acc` hook that stores the f32 tile into one more output and returns it as it is. The same kernel
+    and accumulator, for any kernel with an `acc` hook; its rounded result is the extern's.
+  * **Types.** A region's types are the graph's, a fused op's the extern's: a graph dimension the call binds to a dimension of the extern is replaced
+    by it (a static one by its value), so the fused op has the extern's specs (stems, buckets, `by_bucket` configurations, grid, divisibility); a
+    bucketed dimension of the region alone is refused (`epilogue-dims`).
+  * **Gluon.** The hook is a `@triton.jit` function, which a Gluon kernel calls (measured). Every value of an elementwise hook is a full tile, so its
+    layout is the tile's; a `-0.0` scalar is `tl.cast(bits)` there (Gluon's `tl.full` needs a layout). A row region is refused in a Gluon kernel's hook
+    in E1 (a reduction's result has another layout).
+  * **Whole rows.** An ordered sum of every row of a tile (`_tf_hsum_*`, note 22 of `tilefish.lower`): the chains by halving splits, the tree over the
+    lanes by gathers, only the lanes that have columns computed (a lane with none is `+0.0` all along, what revision 2's padding gives, so a level of
+    the tree whose partner is such a lane adds `+0.0`): the row template's terms in its order; `max` order-free; no `argmax`, no sum without
+    `order=` (D2).
+  * **Per-row and per-column operands** (a bias, a scale, a norm's weight) are loaded once per tile as a vector and broadcast (the bits the
+    elementwise template reads at each lane's offset), not gathered per element.
+  * **Fusion versions.** The merge applies only to calls of externs with hooks, which no plan of 0.0.11 or before has, in versions 1 and 2 alike:
+    every graph without such a call plans as before (its plan, manifest and report the same bytes). No new version.
+  * **`tilefish.barrier(y)`** stops the epilogue fusion of `y` (section 4); **one region per call** (the first that fits; the others `epilogue-taken`),
+    and one call per region (a region that reads two results fuses into the first call's hook).
+  * **What a merge must not do.** Make a cycle in the graph of units, regions and fused pairs included (`epilogue-cycle`: a path may leave by one
+    node of a region and come back by another); read, in the hook, a tensor the extern updates in place, either version (`epilogue-inout`). A split
+    whose chunks the hook holds and something else reads too stays a view of the stored result after the fused call; a dense view at an offset that
+    is no multiple of 16 bytes is copied for the hook (its parameter is compiled for an aligned pointer); the hook's row template asserts that the
+    tile the kernel gives it holds a whole row.
+  * **`reference` mode** of a fused pair is the extern's `reference=` followed by the region interpreted; under `R_acc` the f32 result is the hook's
+    `reference=` (`tilefish.hook(..., reference=...)`), else the extern's reference widened.
+  * **A library call under `epilogues="accumulator"`** is not rewritten in E1: its f32 form is E2's (the pin re-encoded with an f32 `D`, 3.1.1); it
+    keeps route (a), and the advisor points to E2 and E3.
+* **The check** (D6 for pairs): every fused pair against the extern (or its accumulator form) followed by the region's ops one kernel each, every
+  intermediate stored, at every bucket, on two seeds: the extern's operands normal with the special values (both zeros and infinities, NaN, the largest
+  finite values, a subnormal) at their first elements, every side input with the special values and random bit patterns of `_sample`. A difference
+  refuses the export; a kernel that applies its `out` hook to the unrounded value is refused (tested).
+* **Examples** (`python/examples/epilogue_gemm.py`): a Triton GEMM with both hooks (TMA descriptors, `tl.dot`, a grouped order, its epilogue on 1, 2
+  or 4 sub-tiles of the columns, a hook call each; `tcgen05.mma` on sm_100/103 and `mma.sync` on sm_120, each asserted by `tilefish.sass`), its
+  dual-accumulator form, a Gluon `tcgen05` GEMM, and a 1-D convolution as an implicit GEMM (rows `B * Lo`).
+* **Measured** (B300 MIG slice, sm_103, 30 SMs; microseconds per plan run captured in a CUDA graph, `profile_plan`'s `plan_us`, trimmed mean of
+  200; the hook against route (a), the extern then the region in one kernel, which `tilefish.barrier` of the result gives, and the unfused
+  composition):
+
+  | pattern (bf16; `H = 1024`, `F = 4096`) | rows | hook (1 step) | route (a) (2 steps) | unfused (steps) | hook, `"accumulator"` | (a) / hook |
+  |---|---|---|---|---|---|---|
+  | GEMM + bias + GELU | 256 | 25.0 | 25.1 | 37.1 (6) | 26.7 | 1.00 |
+  | | 2048 | 111.6 | 135.3 | 231.1 (6) | 117.2 | 1.21 |
+  | GEMM + bias + periodic activation | 256 | 31.2 | 27.2 | 61.8 (10) | 32.6 | 0.87 |
+  | | 2048 | 139.2 | 143.9 | 402.9 (10) | 143.9 | 1.03 |
+  | dual GEMM (`2F` rows) + SwiGLU | 256 | 41.2 | 44.0 | 61.8 (6) | 41.0 | 1.07 |
+  | | 2048 | 229.8 | 261.1 | 410.2 (6) | 240.4 | 1.14 |
+  | GEMM (`D = 256`) + residual add + RMSNorm, residual returned | 256 | 17.0 | 14.9 | 23.2 (11) | 16.8 | 0.88 |
+  | | 2048 | 16.9 | 16.9 | 35.6 (11) | 16.9 | 1.00 |
+  | conv1d (`k = 7`, 512 to 512 channels, `L = 4096`) + bias + periodic | 4096 | 164.6 | 127.5 | 193.4 (10) | 167.6 | 0.77 |
+
+  The GEMMs are the example's (`gemm_sm100`: 8 warps, the epilogue on two sub-tiles of 64 columns; the norm's a tile of 128 x 256 that sees whole
+  rows; the convolution 8 warps), which are not persistent and not warp-specialised: the hook's arithmetic runs after the main loop on the kernel's
+  own warps, at its occupancy, overlapped with nothing. So the fusion pays where the epilogue is light and its operands are large (bias + GELU at
+  2048 rows: 1.21x; the gated activation, whose fused op stores half the columns: 1.07 to 1.14x), is even where the GEMM is short, and loses where the
+  epilogue is heavy for the kernel's few warps (a `sin` per element over a convolution: 0.77x). The configuration matters as much as the fusion: with
+  4 warps, or the whole 128-column tile in one hook, the hook's registers spill (`sin`: 255 registers and a stack frame) and the same periodic
+  activation was 0.30 to 0.45x; a first ordered row sum by reshapes and splits of an MMA-layout tile spilled 15 KB per thread (0.04x), which the
+  gather-based sum above removed. Getting the rest is the kernel work of X8 (an epilogue that overlaps the next tile's main loop), not the hook. The
+  route is a declaration's choice, never made on time (section 5): the advisor reports the saving each route would give.
+
+* **Tests:** `tests/test_epilogue.py` (no GPU: the declaration and its refusals, the generated module, the merge of every pattern in both modes, the
+  hook's code against the region's op by op, one op for one pair in two graphs, `R_acc` IR in and out, scopes, every refusal with its reason, the
+  report, the boundaries, the advisor's routes); `tests/test_gpu_epilogue.py` (every pattern fused against `U(P)` and `U(R_acc(P))` at every bucket
+  and through `verify_fusion`; every finite bf16 value as a tile through the activations' hooks; 40 random regions after a GEMM in both modes; the
+  Gluon GEMM; export, replay and capture; the fused binary's MMA sequence equal to the extern's; a lying hook refused; the reference); the Rust and C++
+  gates run the patterns as `fused_epi_*` plans, launched and captured. Arch-agnostic but the Gluon tests (sm_100, sm_103); sm_120 is a later gate's.
+* **Not yet:** prologues; a library call under `R_acc` (E2); norms over rows wider than a tile (E4); row regions in a Gluon kernel's hook; an extern
+  declared with `by_arch=` taking hooks; the MMA-sequence assertion as a declared SASS assertion (a test checks it); X12 on a real Gluon
+  implicit-GEMM convolution.
 
 ## 0. Background: what exists
 

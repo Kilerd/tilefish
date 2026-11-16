@@ -588,6 +588,26 @@ Notes (the facts behind the table):
     has no run of more than ``log2(D)`` equal bits, so the double is never on a midpoint of f32), as the ``reference`` mode computes it. Not
     ``rcp.rn.f32(D)``: ptxas expands that next to the multiply into fused multiply-adds, which the contraction check refuses.
 
+22. **Epilogue hooks** (``docs/rfcs/0003-epilogue-fusion.md``, :func:`lower_hook`, :mod:`tilefish._epilogue`). A region fused into an extern's
+    epilogue hook is lowered to a ``@triton.jit`` function ``hook(tile, rows, cols, row_mask, col_mask, args)`` that the extern's kernel calls on each
+    tile of its output where it would store it; the region's other inputs, its side outputs and the sizes it needs are ``args``. The code of every op
+    is the region's (note 20: context-free, no contraction, every narrowing cast inline PTX): only how an operand is addressed differs.
+
+    * **The elementwise template on a tile** (``"hook"``): the element a lane holds is ``offs = rows[:, None] * L + cols[None, :]`` of the output seen
+      as ``[R, L]``, the lane of note 12, so every operand is read at the offset the elementwise template reads it at (broadcasts along any axis,
+      views where they are, a broadcast count or a size a number where it is static); the tiles (the extern's result, its chunks, its rounding) are
+      held, never loaded. Every value is a full ``[BM, BN]`` tile: a per-column operand is loaded at ``offs % n`` like every other, so the layouts of a
+      Gluon kernel's tile agree (a Gluon kernel calls the same ``@triton.jit`` hook; a ``-0.0`` scalar is ``tl.cast(bits).to(..., bitcast=True)``
+      there, the same bits, as Gluon's ``tl.full`` needs a layout).
+    * **The row template on a tile that holds whole rows** (``"hook-row"``, a Triton kernel, ``D`` static and the extern's tile ``BN >= D``): an
+      ``[R, D]`` value is the tile, ``[D]`` is ``[BN]`` at ``cols``, ``[R]`` and ``[R, 1]`` are ``[BM, 1]``; an ordered sum of every row of the tile
+      (``_tf_hsum_*``) makes the columns at or past ``D`` ``-0.0`` (as revision 2 does), reshapes the tile to ``[BM, lanes, K]`` (lane ``j``'s columns
+      in its order), takes the chains by halving splits (note 21's, with a leading axis of rows) and the tree over the lanes with ``tl.gather``
+      (revision 2's), lane 0's value by a select. A tile narrower than a round of the order computes only its ``BN / V`` lanes that have columns:
+      the others are ``+0.0`` all along, so a level of the tree whose offset is that many or more adds ``+0.0``, as the row template's does. The
+      terms of the row template's sum in its order, so its bits; ``max`` is order-free (E2 of RFC 0001). No unordered reduction (D2), no
+      ``argmax``, gather or static slice.
+
 **``num_warps`` and the numerics identity** (decided on measurements, ``tests/test_gpu_reduction_order.py``). What depends on ``num_warps`` is
 Triton's own reductions: ``tl.sum`` (``sum`` without ``order``, ``mean``) adds in a tree that the warp count shapes (note 6; on 1024 rows of
 values of every magnitude, 669 to 878 rows differ between 1 warp and 2 to 16, at 96, 1000 and 4096 columns), and ``tl.max`` reduces in the same
@@ -619,7 +639,7 @@ import pathlib
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from ._specvalid import MAX_ELEMENTS
 from .aot import CompileSpec, compile_specs
@@ -2074,6 +2094,222 @@ class _ElementwiseLayout(_Layout):
         return self.coordinate(self.offs, k, k)
 
 
+class _HookLayout(_ElementwiseLayout):
+    """Note 22: the elementwise template on the tile an extern's kernel holds where it would store it (an epilogue hook,
+    ``docs/rfcs/0003-epilogue-fusion.md``). The kernel's shape is the extern's output (or one chunk of it): the hook's ``rows`` index its leading axes
+    flattened, ``cols`` its last axis, so the element a lane holds is ``offs = rows[:, None] * L + cols[None, :]``, the lane of the elementwise template
+    (note 12) with every operand addressed as there. The tiles (``tiles``: a parameter of the region's kernel -> the expression of the hook that holds
+    it) are never loaded. No gathers, scatters or static slices."""
+
+    template = "hook"
+
+    def __init__(self, op: KernelOp, tables: _Tables, tiles: "Mapping[str, str]") -> None:
+        name = op.name
+        if tables.params or tables.slices:
+            raise _fail(name, "hook", "hook.gather", "a gather, a scatter or a static slice in an epilogue hook is not planned")
+        super().__init__(op, tables, broadcast=True)
+        self.tiles = dict(tiles)
+        for v in op.graph.inputs:
+            if v.name in self.tiles:
+                if v.type.shape != self.shape:
+                    raise _fail(
+                        name, "hook", "hook.tile-shape",
+                        f"the tile {_label(v)} is not the shape {_shape_text(self.shape)} of the region: a hook computes what its tile holds",
+                    )  # fmt: skip
+                self.strided.pop(v, None)  # (held, never read through its strides)
+        if not any(v.name in self.tiles for v in op.graph.inputs):
+            raise _fail(name, "hook", "hook.no-tile", "the region does not read the extern's result")
+        # a per-row or a per-column operand is read as a vector (load): it needs no element count and no coordinates; the sizes the others need
+        self.vectors = {v for v in self.broadcast if self.per_axis(v) is not None}
+        for v in self.vectors:
+            self.general.pop(v, None)
+        r = len(self.shape)
+        runs = [run for kept in self.general.values() for run in _runs(kept)]
+        runs += [(r - n.outputs[0].type.rank,) * 2 for n in op.graph.nodes if n.op == "iota" and n.outputs[0] in self.broadcast]
+        runs += [(k, k) for _ in self.strided for k in range(r)]
+        size_axes: "set[int]" = set()
+        for a, b in runs:
+            size_axes.update(range(b + 1, r))
+            if a > 0:
+                size_axes.update(range(a, b + 1))
+        self.size_axes = sorted(k for k in size_axes if not self.shape[k].folded().is_static)
+
+    def extras(self, names: _Names, taken_dims: "set[str]") -> "list[_Extra]":
+        self.offs, self.mask = names.fresh("offs"), names.fresh("mask")
+        out: "list[_Extra]" = []
+        last = self.shape[-1].folded()
+        self.size_names = {}
+        by_expr: "dict[DimExpr, str]" = {}
+        if last.is_static:
+            self.last_text = str(last.value)
+        else:
+            nm = by_expr[last] = names.fresh(f"size_{last.name}" if isinstance(last, Dim) else "size_last")
+            out.append(_Extra(nm, False, Param(nm, 0, "dim", dim=last)))
+            self.last_text = nm
+        self.counts = {}
+        for v in self.broadcast:  # a broadcast parameter's element count, as in the elementwise template (a static one written as a number)
+            if not v.is_param or v in self.general or v.name in self.tiles or v in self.vectors:
+                continue
+            total = _product(v.type.shape)
+            if total is not None and total.is_static:
+                self.broadcast[v] = str(total.value)
+                continue
+            nm = self.broadcast[v] = names.fresh(f"{v.name}_n")
+            out.append(_Extra(nm, False, Param(nm, 0, "dim", dim=total if total is not None else Dim(nm))))
+            self.counts[nm] = v.name
+        for k in self.size_axes:
+            d = self.shape[k].folded()
+            if d not in by_expr:
+                nm = by_expr[d] = names.fresh(f"size_{d.name}" if isinstance(d, Dim) else f"size{k}")
+                out.append(_Extra(nm, False, Param(nm, 0, "dim", dim=d)))
+            self.size_names[k] = by_expr[d]
+        self.grid = ()
+        return out
+
+    def prologue(self) -> "list[str]":
+        return [
+            f"{self.offs} = rows[:, None] * {self.last_text} + cols[None, :]",
+            f"{self.mask} = row_mask[:, None] & col_mask[None, :]",
+        ]
+
+    def header(self) -> "list[str]":
+        return [f"template: hook (note 22); the tile is {_shape_text(self.shape)}: element (rows, cols) is offs = rows * {self.last_text} + cols"]
+
+    def per_axis(self, v: Value) -> "str | None":
+        """``"col"`` for an operand that has one value per column of the tile (its axes the kernel's last alone: element ``c``), ``"row"`` for one
+        that has one per row (the kernel's leading axes, size 1 along the last: element ``r``), else ``None``."""
+        if v not in self.broadcast or v in self.strided or not v.is_param:
+            return None
+        kept = _kept_axes(v.type.shape, self.shape)
+        if kept is None:  # pragma: no cover - a broadcast operand broadcasts
+            return None
+        r = len(self.shape)
+        has = [k for k in range(r) if kept[k] and not _is_one(self.shape[k])]
+        lead = [k for k in range(r - 1) if not _is_one(self.shape[k])]
+        if has == [r - 1]:
+            return "col"
+        if lead and has == lead:
+            return "row"
+        return None
+
+    def load(self, p: str, v: Value) -> str:
+        if v.name in self.tiles:
+            return self.tiles[v.name]
+        # a per-column or a per-row operand: its vector, broadcast along the tile (the elements a lane would read at its offset, the same bits)
+        axis = self.per_axis(v)
+        if axis == "col":
+            return f"tl.load({p} + cols, mask=col_mask, other=0)[None, :]"
+        if axis == "row":
+            return f"tl.load({p} + rows, mask=row_mask, other=0)[:, None]"
+        return super().load(p, v)
+
+    def store(self, p: str, v: Value, value: str) -> str:
+        if p == getattr(self, "main_out", None):
+            return f"{self.result} = {value}"
+        return super().store(p, v, value)
+
+
+class _HookRowLayout(_RowLayout):
+    """Note 22: the row template on a tile that holds whole rows (``BN >= D``: the extern's declared tile width at every bucket, checked by the
+    planner, and the width the kernel gives the hook, a ``tl.static_assert`` in it), for a Triton kernel. A value ``[R, D]`` is ``[BM, BN]`` (the columns past ``D`` masked), ``[D]`` is ``[BN]``, ``[R]`` and ``[R, 1]`` are
+    ``[BM, 1]``; an ordered sum of every row of the tile (``_tf_hsum_*``) adds the same terms in the same order as the row template's (note 17), and
+    ``max`` is order-free (E2). ``D`` is static. No unordered reduction (D2), no ``argmax`` / ``argmin``, no gathers or static slices."""
+
+    template = "hook-row"
+
+    def __init__(self, op: KernelOp, tables: _Tables, tiles: "Mapping[str, str]") -> None:
+        name = op.name
+        if tables.params or tables.slices:
+            raise _fail(name, "hook-row", "hook.gather", "a gather, a scatter or a static slice in an epilogue hook is not planned")
+        super().__init__(op, tables, lowering=2)
+        if not self.D.is_static:
+            raise _fail(name, "hook-row", "hook.dynamic-d", f"a row region in an epilogue hook has a static row length; D = {self.D}")
+        if self.chunk is not None:  # pragma: no cover - argmax refused below
+            raise _fail(name, "hook-row", "hook.chunk", "a chunked row")
+        for n in op.graph.nodes:
+            if n.op in _ARG_REDUCTIONS:
+                raise _fail(name, "hook-row", "hook.argmax", f"{n.op} in an epilogue hook is not planned")
+            if n.op in ("sum", "mean") and "order" not in n.attrs:
+                raise _fail(name, "hook-row", "hook.unordered", f"a {n.op} without order= runs alone (D2): it is never fused into a hook")
+        self.tiles = dict(tiles)
+        for v in op.graph.inputs:
+            if v.name in self.tiles:
+                if self.cls.get(v) != _FULL:
+                    raise _fail(name, "hook-row", "hook.tile-shape", f"the tile {_label(v)} is not an [R, D] value of the region")
+                self.strided.pop(v, None)
+        if not any(v.name in self.tiles for v in op.graph.inputs):
+            raise _fail(name, "hook-row", "hook.no-tile", "the region does not read the extern's result")
+
+    def extras(self, names: _Names, taken_dims: "set[str]") -> "list[_Extra]":
+        self.D_name = str(self.D.value)
+        self.BLOCK_name = names.fresh("BN")
+        self.BM_name = names.fresh("BM")
+        self.offs, self.mask, self.cols, self.row = (names.fresh(x) for x in ("offs", "mask", "cols_", "row_"))
+        self.grid = ()
+        return []
+
+    def prologue(self) -> "list[str]":
+        return [
+            f"{self.BM_name}: tl.constexpr = rows.shape[0]",
+            f"{self.BLOCK_name}: tl.constexpr = cols.shape[0]",
+            f'tl.static_assert({self.BLOCK_name} >= {self.D_name}, "a tile of the extern narrower than a row: a hook reduces whole rows only (note 22)")',
+            f"{self.cols} = cols",
+            f"{self.row} = rows[:, None]",
+            f"{self.offs} = rows[:, None] * {self.D_name} + cols[None, :]",
+            f"{self.mask} = row_mask[:, None] & col_mask[None, :]",
+        ]
+
+    def header(self) -> "list[str]":
+        return [f"template: hook-row (note 22); whole rows of D = {self.D_name} in a tile [BM, BN], BN >= D; [R, D] values are [BM, BN], per-row ones [BM, 1]"]
+
+    def default_num_warps(self) -> int:  # (the extern's)
+        return 4
+
+    def bucket_num_warps(self) -> "dict[str, int]":
+        return {}
+
+    def strided_offset(self, v: Value, row: str, cols: str) -> str:
+        s = self.strided[v]
+        c = self.cls[v]
+        if c == _FULL:
+            return f"rows[:, None] * {s[0]} + cols[None, :] * {s[1]}"
+        if c == _COL:
+            return f"cols * {s[0]}"
+        return f"rows[:, None] * {s[0]}"
+
+    def load(self, p: str, v: Value) -> str:
+        if v.name in self.tiles:
+            return self.tiles[v.name]
+        c = self.cls[v]
+        if v in self.strided:
+            off = self.strided_offset(v, "", "")
+            if c == _FULL:
+                return f"tl.load({p} + ({off}), mask={self.mask}, other=0)"
+            if c == _COL:
+                return f"tl.load({p} + ({off}), mask=col_mask, other=0)"
+            return f"tl.load({p} + ({off}), mask=row_mask[:, None], other=0)"
+        if c == _FULL:
+            return f"tl.load({p} + {self.offs}, mask={self.mask}, other=0)"
+        if c == _COL:
+            return f"tl.load({p} + cols, mask=col_mask, other=0)"
+        return f"tl.load({p} + rows[:, None], mask=row_mask[:, None], other=0)"
+
+    def store(self, p: str, v: Value, value: str) -> str:
+        if p == getattr(self, "main_out", None):
+            return f"{self.result} = {value}"
+        if self.cls[v] == _FULL:
+            return f"tl.store({p} + {self.offs}, {value}, mask={self.mask})"
+        return f"tl.store({p} + rows[:, None], {value}, mask=row_mask[:, None])"
+
+    def reduce(self, op: str, a: str) -> str:
+        if op == "max":
+            return f"tl.max(tl.where({self.mask}, {a}, float(\"-inf\")), axis=1, keep_dims=True)"
+        raise AssertionError(f"an unordered {op} in a hook")  # pragma: no cover - refused in __init__
+
+    def iota(self, v: Value) -> str:
+        return self.row if self.cls[v] == _ROW else self.cols
+
+
 def _kept_axes(shape: "tuple[DimExpr, ...]", kernel: "tuple[DimExpr, ...]") -> "list[bool] | None":
     """Whether an operand of ``shape`` broadcasts to ``kernel`` (numpy's rules: aligned on the last axes, an axis of size 1 or a missing leading axis
     repeats) and, if so, per axis of ``kernel``, whether the operand has it (its size is the kernel's) or repeats along it. ``None``: it does not."""
@@ -2252,6 +2488,8 @@ class _Body:
             self.probe_at.setdefault(min(position, len(op.graph.nodes)), []).append((name, loc))
         self.indent = 1
         self._count = 0
+        # an epilogue hook a Gluon kernel calls (note 22): a scalar made of its bits is a rank-0 cast (Gluon's tl.full needs a layout), never tl.full
+        self.gluon = False
 
     def local(self) -> str:
         name = self.names.fresh(f"v{self._count}")
@@ -2295,6 +2533,8 @@ class _Body:
             return self.var[x]
         if _is_negative_zero(x):  # notes 3 and 21: Triton 3.5.1 writes a literal -0.0 as +0.0; the bits of -0.0, bitcast (every revision)
             bits, ints, name = {"f32": (-(2**31), "int32", "float32"), "bf16": (-(2**15), "int16", "bfloat16"), "f16": (-(2**15), "int16", "float16")}[x.dtype.name]
+            if self.gluon:  # (note 22: the same bits, a scalar that needs no layout)
+                return f"tl.cast({bits}, tl.{ints}).to(tl.{name}, bitcast=True)"
             return f"tl.full((), {bits}, tl.{ints}).to(tl.{name}, bitcast=True)"
         return _scalar_text(x, self.rename)
 
@@ -3272,6 +3512,264 @@ def _line_map(op: KernelOp, first: int, body: "_Body", source: str, helpers: "Se
             out[k] = label
     total = source.count("\n")
     return tuple(out[:total] + [None] * (total - len(out)))
+
+
+# -- epilogue hooks (note 22) -----------------------------------------------------------------------------------------------------------------
+
+HOOK_ARGS = ("tile", "rows", "cols", "row_mask", "col_mask", "args")  # the parameters of every hook (tilefish._epilogue.ABI)
+
+
+class _HookBody(_Body):
+    """The body of an epilogue hook (note 22): the region's ops on the tile, with ordered sums over every row of a tile that holds whole rows."""
+
+    def ordered_sum(self, n: Node) -> str:
+        layout = self.layout
+        if not isinstance(layout, _HookRowLayout):  # pragma: no cover - an elementwise hook has no reduction
+            return super().ordered_sum(n)
+        x = n.inputs[0]
+        assert isinstance(x, Value)
+        fused = bool(n.attrs.get("fma"))
+        args = ", ".join(self.as_row(i) for i in self.producer[x].inputs) if fused else self.var[x]
+        return f"{self.hsum_helper(n.attrs['order'], fused)}({args}, {layout.D_name})"
+
+    def as_row(self, x: "Value | Scalar") -> str:
+        layout = self.layout
+        assert isinstance(layout, _HookRowLayout)
+        shape = f"({layout.BM_name}, {layout.BLOCK_name})"
+        if isinstance(x, Value):
+            if layout.cls[x] == _FULL:
+                return self.var[x]
+            return f"tl.broadcast_to({self.var[x]}, {shape})"
+        return f"tl.full({shape}, {self.operand(x)}, tl.float32)"
+
+    def hchain_helper(self, fused: bool) -> str:
+        """The chains of a tile's rows: ``p[m, j]`` takes the columns of ``[BM, L, K]`` along the last axis in order, by halving splits (data
+        movement), each step one rounding (``add.rn``, or ``fma.rn`` of a product's operands): note 21's chain with a leading axis of rows."""
+        key = ("hchain", fused)
+        if key in self.helpers:
+            return self.helpers[key][0]
+        name = self.names.fresh("_tf_hchain_fma" if fused else "_tf_hchain")
+        if fused:
+            step = self.ptx_helper("fma")
+            body = [
+                "    if K == 1:",
+                f"        p = {step}(tl.reshape(a, (BM, L)), tl.reshape(b, (BM, L)), p)",
+                "    else:",
+                "        a0, a1 = tl.split(tl.permute(tl.reshape(a, (BM, L, 2, K // 2)), (0, 1, 3, 2)))",
+                "        b0, b1 = tl.split(tl.permute(tl.reshape(b, (BM, L, 2, K // 2)), (0, 1, 3, 2)))",
+                f"        p = {name}(p, a0, b0, BM, L, K // 2)",
+                f"        p = {name}(p, a1, b1, BM, L, K // 2)",
+            ]
+            args, what = "p, a, b", "fma(a[m, j, k], b[m, j, k], p[m, j])"
+        else:
+            add = self.ptx_helper("add.rn")
+            body = [
+                "    if K == 1:",
+                f"        p = {add}(p, tl.reshape(x, (BM, L)))",
+                "    else:",
+                "        x0, x1 = tl.split(tl.permute(tl.reshape(x, (BM, L, 2, K // 2)), (0, 1, 3, 2)))",
+                f"        p = {name}(p, x0, BM, L, K // 2)",
+                f"        p = {name}(p, x1, BM, L, K // 2)",
+            ]
+            args, what = "p, x", "p[m, j] + x[m, j, k]"
+        self.helpers[key] = (name, [
+            "@triton.jit",
+            f"def {name}({args}, BM: tl.constexpr, L: tl.constexpr, K: tl.constexpr):",
+            f"    # the chains p[m, j] = {what} for k = 0, 1, ..., K - 1 in order (note 22 of tilefish.lower): the columns of the low half, then of the high",
+            "    # half, each half taken by a split (data movement); K is a power of two",
+            *body,
+            "    return p",
+        ])
+        return name
+
+    def hsum_helper(self, order: Any, fused: bool) -> str:
+        """An ordered sum of every row of a tile that holds whole rows (note 22): lane ``j`` of a row adds the columns ``c * W + j * V + v``
+        (``W = lanes * vector``) in the order ``(c, v)`` from ``+0.0``, a column at or past ``D`` adding ``-0.0`` (it leaves every value a chain
+        holds as it is, as revision 2's padding does); then the tree ``p[j] + p[j + o]`` for each offset in turn, and lane 0's value: the terms and
+        the order of the row template's ordered sum, so the same bits (note 17). A tile narrower than a round of the order (``BN < W``) has
+        ``n = BN / V`` lanes with columns, the others ``+0.0`` all along: only those ``n`` are computed, and a level of the tree whose offset is ``n``
+        or more adds ``+0.0`` (the partner a lane with no column), which is what it adds in the row template. The tree takes each partner by
+        ``tl.gather`` along the lanes (revision 2's); a partner past the end is never one lane 0 reads."""
+        key = ("hsum", order.lanes, order.vector, order.offsets, fused)
+        if key in self.helpers:
+            return self.helpers[key][0]
+        lanes, vector, width = order.lanes, order.vector, order.lanes * order.vector
+        add = self.ptx_helper("add.rn")
+        chain = self.hchain_helper(fused)
+        lane0 = self.lane0_helper()
+        stem = f"_tf_hsum{'_fma' if fused else ''}_l{lanes}_v{vector}" + ("_o" + "_".join(map(str, order.offsets)) if order.offsets else "")
+        name = self.names.fresh(stem)
+        neg0 = "tl.full((BM, BN), -2147483648, tl.int32).to(tl.float32, bitcast=True)"  # -0.0 by its bits (note 3)
+        first = "a" if fused else "x"
+
+        def lanes_of(v: str) -> str:  # whole rounds: lane j's columns in its order along the last axis
+            return f"tl.reshape(tl.permute(tl.reshape({v}, (BM, BN // {width}, {lanes}, {vector})), (0, 2, 1, 3)), (BM, {lanes}, BN // {lanes}))"
+
+        def part_of(v: str) -> str:  # one partial round: the lanes with columns, V each
+            return f"tl.reshape({v}, (BM, BN // {vector}, {vector}))"
+
+        lines = [
+            "@triton.jit",
+            f"def {name}({'a, b' if fused else 'x'}, D: tl.constexpr):",
+            f"    # an ordered sum (note 17 of tilefish.lower), {order}, of every row of a tile [BM, BN] that holds whole rows (BN >= D, note 22): lane j adds",
+            f"    # the columns c * {width} + j * {vector} + v in the order (c, v), each step " + ("fma(a, b, acc)" if fused else "acc + x") + " rounded once, from +0.0; a column at or",
+            "    # past D adds " + ("fma(-0.0, 1.0, acc)" if fused else "-0.0") + ", which leaves every value a chain holds as it is; a lane with no column is +0.0 all",
+            f"    # along; then p[j] = p[j] + p[j + o] for o = {', '.join(map(str, order.offsets)) or '(none)'} (add.rn), lane 0's value: the row template's terms, in its order",
+            f"    BM: tl.constexpr = {first}.shape[0]",
+            f"    BN: tl.constexpr = {first}.shape[1]",
+            f'    tl.static_assert(BN >= {vector}, "a tile narrower than the vector of its order")',
+            f"    N: tl.constexpr = {lanes} if BN >= {width} else BN // {vector}  # the lanes that have columns",
+            "    cols = tl.arange(0, BN)",
+        ]
+        if fused:
+            lines += [f"    a = tl.where(cols[None, :] < D, a, {neg0})", "    b = tl.where(cols[None, :] < D, b, 1.0)"]
+            whole, part = f"{lanes_of('a')}, {lanes_of('b')}", f"{part_of('a')}, {part_of('b')}"
+        else:
+            lines += [f"    x = tl.where(cols[None, :] < D, x, {neg0})"]
+            whole, part = lanes_of("x"), part_of("x")
+        lines += [
+            f"    if BN >= {width}:",
+            f"        p = {chain}(tl.zeros((BM, N), tl.float32), {whole}, BM, N, BN // {lanes})",
+            "    else:",
+            f"        p = {chain}(tl.zeros((BM, N), tl.float32), {part}, BM, N, {vector})",
+            "    lane = tl.arange(0, N)[None, :] + tl.zeros((BM, N), tl.int32)",
+        ]
+        for o in order.offsets:
+            lines += [
+                f"    if {o} < N:  # o = {o}: lanes j and j + {o}",
+                f"        p = {add}(p, tl.gather(p, tl.minimum(lane + {o}, N - 1), 1))",
+                "    else:  # the partner has no column: +0.0",
+                f"        p = {add}(p, tl.zeros((BM, N), tl.float32))",
+            ]
+        lines += [f"    s, _ = tl.reduce((p, lane), 1, {lane0})", "    return s[:, None]  # [BM, 1]"]
+        self.helpers[key] = (name, lines)
+        return name
+
+
+@dataclass(frozen=True, eq=False)
+class LoweredHook:
+    """An epilogue hook lowered from a region's kernel (:func:`lower_hook`): module-level code (its helpers, then the hook) and its arguments."""
+
+    fn_name: str
+    lines: "tuple[str, ...]"  # the helper functions, then the hook: module-level code, without imports
+    imports: "tuple[str, ...]"
+    # the hook's arguments, in the order of its argument tuple: the region's inputs that are not tiles (their strides with them), its side outputs,
+    # then the sizes its template needs; each named as in the hook (the generated kernel passes its own parameters in this order)
+    params: "tuple[Param, ...]"
+    template: str  # "hook" (elementwise) | "hook-row"
+    header: "tuple[str, ...]"
+    element_counts: "dict[str, str]"  # a broadcast operand's count -> the parameter it is the element count of
+    max_elements: "dict[str, int]"
+    line_map: "tuple[Any, ...]" = field(default=(), repr=False, compare=False)  # per line of ``lines``, as LoweredKernel.line_map
+
+
+def lower_hook(
+    op: KernelOp,
+    *,
+    tiles: "Mapping[str, str]",
+    main: "int | None",
+    returns: str,
+    fn_name: str = "_tf_epilogue",
+    taken: "Iterable[str]" = (),
+    gluon: bool = False,
+) -> LoweredHook:
+    """Lower a region's kernel ``op`` (:mod:`tilefish._fusion`) to an epilogue hook (note 22): ``def fn_name(tile, rows, cols, row_mask, col_mask, args)``.
+
+    ``tiles`` maps the parameters of ``op`` the hook holds to the expression that holds each (``"tile"``, ``"tile[1]"``, ``"tile.to(tl.bfloat16)"``):
+    they are never loaded. ``main`` is the index of the output of ``op`` the hook returns (``None``: none). ``returns`` is what it returns:
+    ``"main"`` (that output), ``"main-tuple"`` (it, as a tuple of one tile: a hook that sees several) or ``"tile"`` (the tile as it is, every output
+    a side output). Every other output is a side output, which the hook stores. The code of each op is the region's (context-free, no contraction:
+    note 20); the elementwise template addresses every operand by the element a lane holds, and a region with reductions of rows takes the row
+    template on a tile that holds whole rows (``BN >= D``, a Triton kernel only). ``gluon``: the kernel is a Gluon one."""
+    _check_common(op)
+    tables = _tables(op)
+    errors: "list[TilefishLoweringError]" = []
+    layout: "_Layout | None" = None
+    for make in (_HookLayout, _HookRowLayout):
+        if make is _HookRowLayout and gluon:
+            errors.append(_fail(op.name, "hook-row", "hook.gluon-row", "a region with reductions is fused into a Triton kernel's hook only (a Gluon tile's layout is the kernel's)"))
+            break
+        try:
+            layout = make(op, tables, tiles)
+            break
+        except TilefishLoweringError as e:
+            errors.append(e)
+    if layout is None:
+        if len(errors) == 1:
+            raise errors[0]
+        detail = "; ".join(f"{e.rule}: {str(e).split('failed: ', 1)[-1]}" for e in errors)
+        raise TilefishLoweringError(f"cannot lower the region '{op.name}' to an epilogue hook: {detail}", rule="hook", causes=tuple(errors))
+    graph = op.graph
+    user = list(op.signature.params)
+    names = _Names({p.name for p in user} | _RESERVED | set(HOOK_ARGS) | set(taken) | {fn_name})
+    out_names = [names.fresh("out")] if len(graph.outputs) == 1 else [names.fresh(f"out{k}") for k in range(len(graph.outputs))]
+    taken_dims: "set[str]" = set()
+    for p in user:
+        if p.kind == "tensor":
+            for d in p.type.shape:  # type: ignore[union-attr]
+                taken_dims.update(d.named_dims())
+    extras = layout.extras(names, taken_dims)
+    if main is not None:
+        layout.main_out = out_names[main]  # type: ignore[attr-defined]
+        layout.result = names.fresh("result")  # type: ignore[attr-defined]
+    body = _HookBody(op, layout, names, out_names, {}, getattr(op, "math", "fast"), True, False, getattr(op, "lowering", 1))
+    body.gluon = gluon
+    lines = body.run()
+    held = set(tiles)
+    params: "list[Param]" = []
+    for p in user:
+        if p.name in held:
+            continue
+        if p.kind == "dim" and p.stride_of is not None and any(a in held for a, _ in p.stride_of):
+            continue  # (the strides of a tile: it is never read through them)
+        params.append(p)
+    for k, v in enumerate(graph.outputs):
+        if k != main:
+            params.append(Param(out_names[k], 0, "tensor", "out", type=v.type))
+    params += [e.param for e in extras]
+    max_elements: "dict[str, int]" = {}
+    for p in params:
+        if p.kind == "tensor" and not p.type.devscalar and (p.strided or _numel_bounds(p.type.shape)[1] is None):  # type: ignore[union-attr]
+            max_elements[p.name] = INDEX_MAX
+    counts = dict(getattr(layout, "counts", {}))
+    unpack = [f"    {p.name} = args[{i}]" for i, p in enumerate(params)]
+    if returns == "main":
+        ret = f"    return {layout.result}"  # type: ignore[attr-defined]
+    elif returns == "main-tuple":
+        ret = f"    return ({layout.result},)"  # type: ignore[attr-defined]
+    elif returns == "tile":
+        ret = "    return tile"
+    else:  # pragma: no cover - the planner's
+        raise TilefishLoweringError(f"lower_hook: returns must be 'main', 'main-tuple' or 'tile', got {returns!r}", rule="hook")
+    header = (
+        *layout.header(),
+        "every float + - * is one scalar .rn instruction, every narrowing cast inline PTX, a negation's NaN canonical (notes 2 and 20: the code of a fused region)",
+    )
+    code: "list[str]" = []
+    helper_lines: "list[Any]" = []
+    for _, helper in body.helpers.values():
+        code += [*helper, "", ""]
+        helper_lines += [{"what": "helper"}] * (len(helper) + 2)
+    doc = f'    """The epilogue of {op.name} (note 22 of tilefish.lower): the tile the kernel would store, then the region\'s ops."""'
+    code += ["@triton.jit", f"def {fn_name}({', '.join(HOOK_ARGS)}):", doc, *unpack, *lines, ret]
+    index = {id(n): k for k, n in enumerate(graph.nodes)}
+
+    def entry(made: Any) -> Any:
+        if isinstance(made, Node):
+            e: "dict[str, Any]" = {"node": index.get(id(made)), "op": made.op}
+            if made.loc is not None:
+                e["loc"] = f"{made.loc[0]}:{made.loc[1]}"
+            if made.origin is not None:
+                e["origin"] = made.origin
+            return e
+        return {"what": made} if isinstance(made, str) else None
+
+    line_map = [*helper_lines, None, None, None] + [{"what": "arguments"}] * len(unpack)
+    for text, made in zip(lines, body.made_for):
+        line_map += [entry(made)] * (text.count("\n") + 1)
+    line_map.append(None)
+    imports = ("from triton.language.extra import libdevice",) if body.libdevice else ()
+    return LoweredHook(fn_name, tuple(code), imports, tuple(params), layout.template, header, counts, max_elements, tuple(line_map))
 
 
 def _reindexed(p: Param, index: int, name: str, unaligned: bool = False) -> Param:

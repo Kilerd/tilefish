@@ -47,6 +47,33 @@ def _written_at(stop: Any) -> "tuple[str, int] | None":
     return None
 
 
+_scopes = threading.local()  # .stack: the settings of the tilefish.fused scopes this thread is in, innermost last
+
+
+def current_scope() -> "dict[str, Any] | None":
+    """The settings of the ``tilefish.fused`` scopes this thread traces in, merged (the innermost's win), or ``None`` outside any."""
+    stack = getattr(_scopes, "stack", None)
+    if not stack:
+        return None
+    out: "dict[str, Any]" = {}
+    for s in stack:
+        out.update(s)
+    return out
+
+
+@contextlib.contextmanager
+def scope(settings: "Mapping[str, Any]") -> "Iterator[None]":
+    """Trace the nodes of the block with ``settings`` (what :func:`tilefish.fused` enters)."""
+    stack = getattr(_scopes, "stack", None)
+    if stack is None:
+        stack = _scopes.stack = []
+    stack.append(dict(settings))
+    try:
+        yield
+    finally:
+        stack.pop()
+
+
 def current_context() -> "TraceContext | None":
     """The trace whose body this thread is running (the innermost), or ``None``."""
     stack = getattr(_tracing, "stack", None)
@@ -112,6 +139,8 @@ class TraceContext:
         node = Node(op, inputs, attrs, outs)
         if self.tracing:  # (an op emitted after the body ran, by the planner or the fusion pass, was not written on a line of it)
             node.loc = _written_at(self.body_code)
+            if self.kind == "graph":
+                node.scope = current_scope()
         self.nodes.append(node)
         return outs
 
