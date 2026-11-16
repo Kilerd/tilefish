@@ -969,6 +969,8 @@ Each rewrite is made on the IR before the regions are formed, so its rounding po
 boundary of the regions (it gets a buffer of the plan, which `taps=` reads); it never changes a byte. Not yet planned: a scatter in a graph body, a reduction without
 `order=` joined to a region, a store into an `InOut` or carried tensor made by a region (it is a copy step), a dense reshape inside a region, a strided store,
 `tilefish.fused(name=...)` scopes, `intermediates="f32"`, and modes that are not exact (`docs/rfcs/0001-plan-fusion.md`, section 11).
+Fusion into a GEMM or a convolution, epilogues and prologues, is designed in RFC 0003 (`docs/rfcs/0003-epilogue-fusion.md`: the three numerics
+contracts it keeps apart, the routes, and the experiments behind them); none of it is implemented yet.
 
 ## SASS: explained and asserted
 
@@ -1028,8 +1030,8 @@ $ tilefish-explain build/mm mm --diff-arch sm_120       # or --diff OTHER_EXPORT
 
 **Which steps could be one kernel** (`docs/advise.md`): `tilefish-explain build/block --graph block --advise` ranks the fusion candidates of a plan
 (steps joined by intermediates one kernel would not store) by the bytes and time they would save, says why each is not one kernel today and what to do
-(write an extern's arithmetic in the graph body, add `order=`, remove a barrier, phase 2 row fusion, a GEMM epilogue: future work), and sums the plan's
-time by class. `tilefish.profile_plan(block, "build/block", bucket="M=128", ...)` (or `--profile`) measures every step on the device, a runtime path
+(write an extern's arithmetic in the graph body, add `order=` so that fusion version 2 takes a reduction into a row region, remove a barrier; a GEMM
+epilogue is future work, RFC 0003), and sums the plan's time by class. `tilefish.profile_plan(block, "build/block", bucket="M=128", ...)` (or `--profile`) measures every step on the device, a runtime path
 outside every artefact, and `--timing` ranks by what it measured.
 
 **What goes on inside a kernel** (`docs/instrument.md`): `tilefish.probe("load.wait")` marks a phase boundary in a `@tilefish.kernel` body, a

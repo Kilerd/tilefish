@@ -119,6 +119,15 @@ None of it changes a digest, `sha256`, `sha256_code`, manifest, plan or trace: a
   resident memory before, 9 s and 0.40 GB now (warm cache: 69 s and 1.17 GB before, 2.7 s and 0.25 GB now; traced: 371 s and 2.66 GB before,
   282 s and 0.43 GB now, the same trace).
 
+### Epilogue and prologue fusion: RFC 0003 (`docs/rfcs/0003-epilogue-fusion.md`)
+
+- A design, nothing implemented: fusion into a GEMM's or a convolution's call, which the advisor found is where nearly every fusible byte of the
+  ported models sits. It keeps three numerics contracts apart: (i) exact, the bytes of the unfused composition; (ii) accumulator, a declared rewrite
+  that drops the rounding of the result an epilogue widens to f32; (iii) library, a cuBLASLt epilogue or a cuDNN fused graph under a pin. The
+  phase 0 experiments behind them are in it (a plain Triton `tcgen05` GEMM writes the bits of the pinned cuBLASLt GEMM on sm_103 wherever the pin
+  does not split `k`; cuBLASLt's bias, ReLU and `beta * C` epilogues equal contract (ii); its GELU is defined by the binary). The decisions of
+  2026-11-16: `epilogues="exact"` is the default, the other two apply only when declared; hooks on externs (E1) and cuBLASLt epilogues (E2) first.
+
 ### Fixed
 
 - **A scalar `-0.0` keeps its sign** (note 3 of `tilefish.lower`): Triton 3.5.1 writes a literal `-0.0` as `+0.0`, so `where(x > 0, x, -0.0)`,
