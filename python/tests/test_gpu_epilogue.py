@@ -110,6 +110,37 @@ def test_a_gemm_whose_epilogue_runs_on_sub_tiles_fuses_the_elementwise_patterns(
                 assert_same(run(modes[mode], args), run(modes[ref], args), f"sub-tiles {pattern} {mode} at {combo}")
 
 
+def test_a_chunk_kept_an_unaligned_bias_and_two_hooked_calls_write_the_bytes_of_their_reference(externs):
+    """A split hook's chunk the graph returns too (the kernel stores the result, the chunk a view of it after the call), a bias at an element offset
+    that is no multiple of 16 bytes (copied for the hook), and two hooked calls whose regions each read both results (the first takes one, the
+    other stays after both): each plan the bytes of the unfused one."""
+    gemm, dual, _ = externs
+    X = [("x", Tensor[eg.T, eg.H, bf16]), ("w", Tensor[eg.F, eg.H, bf16])]
+
+    def chunk(x, w):
+        g, u = dual(x, w).split(eg.F, axis=-1)
+        return (tilefish.silu(g.to(f32)) * u.to(f32)).to(bf16), g
+
+    def unaligned(x, w, b2):
+        _, bb = b2.split([1, 256], axis=-1)
+        return (gemm(x, w).to(f32) + bb.to(f32)).to(bf16)
+
+    def two_calls(x, w):
+        y1, y2 = gemm(x, w), gemm(x, w)
+        return y1 * y2, y2 - y1
+
+    cases = {"chunk": (chunk, [X[0], ("w", Tensor[2 * eg.F, eg.H, bf16])]), "unaligned": (unaligned, [*X, ("b2", Tensor[257, bf16])]), "two_calls": (two_calls, X)}
+    for name, (body, params) in cases.items():
+        fused = eg.graph_of(body, params, tilefish.fusion(), f"rv_{name}")
+        unfused = eg.graph_of(body, params, tilefish.fusion(grouping="none"), f"rv_{name}_unfused")
+        assert len(_fusion.fused(fused).hooked) == 1, name
+        for combo in tilefish._plan.bucket_combinations(tilefish.plan(fused).dims):
+            for seed in (0, 1):
+                args = args_of(fused, combo, seed)
+                assert_same(run(fused, args), run(unfused, args), f"{name} at {combo}, seed {seed}")
+        assert any(r.get("route") == "hook" and r["verified"]["runs"] >= 2 for r in tilefish.verify_fusion(fused)["regions"]), name
+
+
 def test_the_accumulator_mode_has_one_rounding_fewer_and_other_bytes(graphs):
     """Contract (ii) is not contract (i): R_acc removes the rounding of the GEMM's result, which changes about a third of a bias + activation's
     outputs (RFC 0003, X1); and it is at least as close to the f32 composition."""

@@ -14,7 +14,7 @@ import epilogue_graphs as eg
 import pytest
 
 import tilefish
-from tilefish import Dim, Out, Tensor, TilefishDeclarationError, TilefishPlanError, bf16, const, f32, i32
+from tilefish import Dim, InOut, Out, Tensor, TensorDesc, TilefishDeclarationError, TilefishPlanError, bf16, const, f32, i32
 from tilefish import _advise, _epilogue, _fusion
 from tilefish.aot import compile_specs, declaration_digest
 
@@ -271,6 +271,23 @@ def test_a_scope_declares_the_mode_of_the_ops_traced_in_it():
 
     assert _fusion.fused(scoped).hooked[0].contract == "accumulator"
     assert _fusion.fused(exact_scope).hooked[0].contract == "exact" and not _fusion.fused(exact_scope).rewrites
+
+    # the widenings of intermediates="opmath" are in the scope of the op they are made for
+    def opmath(mode):
+        def body(x, w, b):
+            y = GEMM(x, w)
+            with tilefish.fused(epilogues=mode):
+                z = y * 2.0
+            return z
+
+        return body
+
+    params = [("x", Tensor[T, H, bf16]), ("w", Tensor[F, H, bf16]), ("b", Tensor[F, bf16])]
+    for graph_mode, scope_mode in (("accumulator", "exact"), ("exact", "accumulator")):
+        g = eg.graph_of(opmath(scope_mode), params, tilefish.fusion(epilogues=graph_mode, intermediates="opmath"), f"t_opmath_{scope_mode}")
+        f = _fusion.fused(g)
+        assert [r["kind"] for r in f.rewrites] == ["opmath"] + (["accumulator"] if scope_mode == "accumulator" else [])
+        assert f.hooked[0].contract == scope_mode
     with pytest.raises(TilefishPlanError, match="a scope of a @tilefish.graph body"):
         with tilefish.fused(epilogues="accumulator"):
             pass
@@ -344,6 +361,97 @@ def _cycle(x, w, b):
     y = GEMM(x, w)
     z = GEMM(y, w)  # another call reads y
     return (y.to(f32) + z.to(f32)).to(bf16)
+
+
+X3 = [("x", Tensor[T, H, bf16]), ("w", Tensor[F, H, bf16]), ("b", Tensor[F, bf16])]
+
+
+def _outcome(body, name, params=X3, fusion=None):
+    g = eg.graph_of(body, params, fusion or tilefish.fusion(), name)
+    f = _fusion.fused(g)
+    return g, f, [(r["call"], r["region"], r["reason"]) for r in f.refused], steps(g)
+
+
+def test_a_chunk_something_else_reads_stays_a_view_of_the_stored_result():
+    dual = [("x", Tensor[T, H, bf16]), ("w", Tensor[2 * F, H, bf16])]
+
+    def returned(x, w):
+        g, u = DUAL(x, w).split(F, axis=-1)
+        return (tilefish.silu(g.to(f32)) * u.to(f32)).to(bf16), g
+
+    def read_again(x, w):
+        g, u = DUAL(x, w).split(F, axis=-1)
+        return (tilefish.silu(g.to(f32)) * u.to(f32)).to(bf16), (u.to(f32) * 3.0).to(bf16)
+
+    _, f, refused, s = _outcome(returned, "t_chunk_returned", dual)
+    assert len(f.hooked) == 1 and f.hooked[0].result_read and not f.hooked[0].views and f.hooked[0].held_views
+    assert s[0].startswith("epi_gemm_dual_epi_") and s[1].startswith("contiguous_")  # the kernel stores the result; the chunk returned is copied from it
+    _, f, refused, s = _outcome(read_again, "t_chunk_read_again", dual)
+    assert len(f.hooked) == 1 and refused == [(0, 1, "epilogue-taken")] and len(s) == 2
+
+
+def test_a_cycle_through_a_fused_pair_or_another_region_is_refused():
+    def two_calls(x, w, b):
+        y1, y2 = GEMM(x, w), GEMM(x, w)
+        return y1 * y2, y2 - y1  # the first call takes y1 * y2; y2 - y1 into the second's would wait for the first, which waits for the second
+
+    g, f, refused, s = _outcome(two_calls, "t_two_calls")
+    assert [(h.call, h.region.index) for h in f.hooked] == [(0, 0)]
+    assert refused == [(0, 1, "epilogue-taken"), (1, 0, "epilogue-taken"), (1, 1, "epilogue-cycle")]
+    assert "one call per region" in f.refused[1]["detail"] and len(s) == 3
+    reasons = {b["reason"] for b in _fusion.boundaries(g)}
+    assert "epilogue-taken" in reasons and "epilogue-extern" not in reasons  # (not "declares no epilogue hook": both calls have one)
+
+
+def test_a_hook_reads_nothing_its_extern_updates_in_place():
+    def upd(a: TensorDesc(Tensor[M, K, bf16], block=(128, 64)), b: TensorDesc(Tensor[N, K, bf16], block=(128, 64)), c: Out[Tensor[M, N, bf16]],
+            s: InOut[Tensor[N, bf16]], m: M, n: N, k: K, BM: const = 128, BN: const = 128): ...
+
+    UPD = tilefish.extern(triton="mod:kernel", name="t_upd", grid=lambda M: (M,), epilogue=tilefish.hook("EPILOGUE", out="c", block_n="BN"))(upd)
+
+    def new_version(x, w, b):
+        s = b.to(f32).to(bf16)
+        y = UPD(x, w, s)
+        return (y.to(f32) + s.live.to(f32)).to(bf16)
+
+    def old_version(x, w, b):
+        s = b.to(f32).to(bf16)
+        t = s.to(f32) * 2.0  # read before the call
+        return (UPD(x, w, s).to(f32) + t).to(bf16)
+
+    _, f, refused, _ = _outcome(new_version, "t_inout_new")
+    assert not f.hooked and refused == [(2, 1, "epilogue-inout")] and "updates in place" in f.refused[0]["detail"]
+    _, f, refused, s = _outcome(old_version, "t_inout_old")
+    assert len(f.hooked) == 1 and not refused and len(s) == 2
+    fix, phase = _fusion.BOUNDARY_FIXES["epilogue-inout"]
+    assert "InOut" in fix and phase == "4"
+
+
+def test_a_view_at_an_unaligned_offset_is_copied_for_the_hook():
+    def unaligned(x, w, b2):
+        _, bb = b2.split([1, 256], axis=-1)  # at element 1: 2 bytes from a 16-byte boundary
+        return (GEMM(x, w).to(f32) + bb.to(f32)).to(bf16)
+
+    _, f, refused, s = _outcome(unaligned, "t_unaligned", [("x", Tensor[T, H, bf16]), ("w", Tensor[F, H, bf16]), ("b2", Tensor[257, bf16])])
+    assert len(f.hooked) == 1 and f.hooked[0].region.reads[f.hooked[0].region_inputs[0][0]] == "unaligned"
+    assert s[0].startswith("contiguous_") and s[1].startswith("epi_gemm_epi_")
+
+
+def test_r_acc_keeps_a_widening_a_call_updates_in_place_its_own():
+    def bump(s: InOut[Tensor[M, N, f32]], m: M): ...
+
+    BUMP = tilefish.extern(triton="mod:kernel", name="t_bump", grid=lambda M: (M,))(bump)
+
+    def body(x, w, b):
+        y = GEMM(x, w)
+        a, c = y.to(f32), y.to(f32)
+        BUMP(a)
+        return tilefish.silu(c + b.to(f32)).to(bf16), a.live
+
+    _, f, refused, s = _outcome(body, "t_racc_inplace", fusion=tilefish.fusion(epilogues="accumulator"))
+    (rw,) = [r for r in f.rewrites if r["kind"] == "accumulator"]
+    assert len(rw["widenings"]) == 1  # c only: a is updated in place, so it stays its own buffer, y widened
+    assert [h.contract for h in f.hooked] == ["accumulator"] and refused == [(0, 0, "epilogue-acc-shared")] and len(s) == 3
 
 
 # -- the report, the boundaries, the advisor --------------------------------------------------------------------------------------------

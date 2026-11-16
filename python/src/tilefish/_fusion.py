@@ -244,6 +244,9 @@ class Hooked:
     inputs: "list[Value]" = field(default_factory=list)
     outputs: "list[Value]" = field(default_factory=list)
     views: "list[int]" = field(default_factory=list)  # program nodes (splits of the result) the unit takes
+    # the splits whose chunks the hook holds; one of them that something else reads too stays a view of the stored result, after the unit
+    held_views: "list[int]" = field(default_factory=list)
+    unit: "set[int]" = field(default_factory=set)  # the call, the region's nodes and the held splits (the cycle check's unit)
     main: "Value | None" = None  # the region's output the kernel stores into the hook's output (None: the result itself)
     result_read: bool = True  # whether anything but the region reads the result (else, with no main, the kernel stores it into a buffer nothing reads)
     tiles: "list[Value]" = field(default_factory=list)  # the values the hook holds (the result, its chunks, its rounding)
@@ -411,6 +414,9 @@ class _Pass:
             for i in n.inputs:
                 if isinstance(i, Value):
                     consumers.setdefault(i, []).append(k)
+        # a widening a call updates in place stays its own buffer (the accumulator it would become is every widening's)
+        in_place = {v for c in nodes if c.attrs.get("inout") and c.callee is not None
+                    for p, v in zip(c.callee.signature.tensor_inputs, c.inputs) if p.access == "inout"}  # fmt: skip
         replace: "dict[Value, Value]" = {}
         insert: "dict[int, list[Node]]" = {}  # after node k: the nodes the rewrite adds
         swap: "dict[int, Node]" = {}
@@ -428,7 +434,7 @@ class _Pass:
                 c = nodes[m]
                 return (
                     c.op == "cast" and c.attrs.get("kind") is None and c.attrs.get("to") == f32 and "round" not in c.attrs
-                    and epilogue_mode(c, self.settings) == "accumulator"
+                    and epilogue_mode(c, self.settings) == "accumulator" and c.outputs[0] not in in_place
                 )  # fmt: skip
 
             direct = [m for m in consumers.get(y, []) if widening(m)]
@@ -502,19 +508,21 @@ class _Pass:
                 and any(isinstance(i, Scalar) for i in n.inputs)
             ):
                 ins: "list[Any]" = []
+                made: "list[Node]" = []
                 for i in n.inputs:
                     if isinstance(i, Scalar):
                         ins.append(Scalar(float(i.value), f32, i.name))
                     else:
                         wide = self.new(i.type.materialized().with_dtype(f32))
-                        out_nodes.append(Node("cast", [i], {"to": f32, "rounding": False}, [wide]))
-                        out_origin.append(o)
+                        made.append(Node("cast", [i], {"to": f32, "rounding": False}, [wide]))
                         ins.append(wide)
                 r = self.new(n.outputs[0].type.with_dtype(f32))
-                out_nodes.append(Node(n.op, ins, _clean(n.attrs), [r]))
-                out_origin.append(o)
-                out_nodes.append(Node("cast", [r], {"to": dt, "rounding": True}, [n.outputs[0]]))
-                out_origin.append(o)
+                made.append(Node(n.op, ins, _clean(n.attrs), [r]))
+                made.append(Node("cast", [r], {"to": dt, "rounding": True}, [n.outputs[0]]))
+                for m in made:  # in the op's tilefish.fused scope: its widenings are R_acc's under that scope's epilogues
+                    m.scope = n.scope
+                out_nodes += made
+                out_origin += [o] * len(made)
                 self.rewrites.append({"kind": "opmath", "node": o, "op": n.op})
                 continue
             out_nodes.append(n)
@@ -938,7 +946,10 @@ class _Pass:
         from ._epilogue import hook_of, hooks_of_op
 
         by_root = {r.nodes[0]: r for r in regions}
-        taken: "set[int]" = set()
+        taken: "dict[int, Hooked]" = {}
+        # the units of the graph so far (a region, a call with the region in its hook, one node): what a merge's cycle check walks
+        self.unit_key: "dict[int, Any]" = {x: ("r", r.index) for r in regions for x in r.nodes}
+        self.unit_nodes: "dict[Any, list[int]]" = {("r", r.index): list(r.nodes) for r in regions}
         for k, n in enumerate(self.prog):
             if n.attrs.get("kind") != "extern" or n.callee is None:
                 continue
@@ -960,13 +971,20 @@ class _Pass:
                 if done is not None:
                     self._refuse(k, r, "epilogue-taken", f"region {done.region.index} is fused into the call to '{extern.name}' already (one region per call)")
                     continue
-                if id(r) in taken:  # pragma: no cover - a region reads one call's result
+                other = taken.get(id(r))
+                if other is not None:  # a region that reads the results of two calls fuses into the first's hook; the second's is stored
+                    self._refuse(k, r, "epilogue-taken", f"region {r.index} is fused into the call to '{other.extern.name}' (node #{self.origin[other.call]}) already (one call per region)")
                     continue
                 found = self._hook(k, n, extern, hook, acc is not None, r, values, views)
                 if isinstance(found, Hooked):
                     self.hooked.append(found)
-                    taken.add(id(r))
+                    taken[id(r)] = found
                     done = found
+                    key = ("h", k)
+                    self.unit_nodes[key] = sorted(found.unit)
+                    self.unit_nodes.pop(("r", r.index), None)
+                    for x in found.unit:
+                        self.unit_key[x] = key
                 else:
                     self._refuse(k, r, *found)
 
@@ -976,7 +994,11 @@ class _Pass:
     def _result_values(self, n: Node, extern: Any) -> "list[Value]":
         """The outputs of the extern call ``n`` and every view of them."""
         sig = extern.signature
-        out = list(n.outputs[len(sig.returns) : len(sig.returns) + len(sig.tensor_outputs) + (1 if getattr(n.callee, "acc_of", None) else 0)])
+        return self._with_views(n.outputs[len(sig.returns) : len(sig.returns) + len(sig.tensor_outputs) + (1 if getattr(n.callee, "acc_of", None) else 0)])
+
+    def _with_views(self, values: "Sequence[Value]") -> "list[Value]":
+        """``values`` and every view of them."""
+        out = list(values)
         todo = list(out)
         while todo:
             v = todo.pop()
@@ -1012,6 +1034,30 @@ class _Pass:
                             values[c] = (what, j)
         return values, views
 
+    def _cycle(self, unit: "set[int]") -> "int | None":
+        """A node outside ``unit`` on a path from it back into it through the units of the graph so far (``self.unit_key``: a region, a call with a
+        region in its hook, else one node), or None. The units' graph, not the nodes': a path may leave by one node of a region and come back from
+        another."""
+
+        def key(x: int) -> Any:
+            return None if x in unit else self.unit_key.get(x, x)
+
+        stack = [key(s) for u in unit for s in self.succ[u] if s not in unit]
+        seen: "set[Any]" = set()
+        while stack:
+            u = stack.pop()
+            if u in seen:
+                continue
+            seen.add(u)
+            for x in self.unit_nodes.get(u, ()) if isinstance(u, tuple) else (u,):
+                for s in self.succ[x]:
+                    ks = key(s)
+                    if ks is None:
+                        return x
+                    if ks not in seen:
+                        stack.append(ks)
+        return None
+
     def _hook(self, k: int, n: Node, extern: Any, hook: Any, is_acc: bool, r: Region, values: "Mapping[Value, Any]", views: "Mapping[int, list[Value]]") -> Any:
         """The :class:`Hooked` of the call ``k`` and the region ``r``, or ``(reason, detail)``: why the hook does not take it."""
         from . import _epilogue
@@ -1025,6 +1071,12 @@ class _Pass:
             if v in made and v not in values:
                 return "epilogue-view", f"region {r.index} reads {v.ref}, a part of the result of '{extern.name}' the hook does not hold (a hook holds its tile" + (
                     f"s, the {hook.split} chunks of a split of the last axis)" if hook.split > 1 else ")")
+        # what the call updates in place (InOut): the kernel writes it, so the hook can read neither the version it writes nor the one it replaces
+        n_callee_out = len(n.callee.signature.tensor_outputs)
+        updated = set(self._with_views([*n.outputs[n_ret + n_callee_out :], *(v for p, v in zip(sig.tensor_inputs, n.inputs) if p.access == "inout")]))
+        for v in r.inputs:
+            if v in updated:
+                return "epilogue-inout", f"region {r.index} reads {v.ref}, which '{extern.name}' updates in place (InOut): its kernel would read what it writes"
         used = [v for v in r.inputs if v in values]
         held = set(used)  # (a set: == of two values is an op of the trace)
         if any(v in self.barriered for v in (*values, *made)):  # tilefish.barrier keeps the result stored and stops any epilogue fusion of it
@@ -1042,22 +1094,13 @@ class _Pass:
             accs = [v for v, (what, _) in values.items() if what == "tile"]
             acc_value = n.outputs[n_ret + n_out]
             if any(needed(v) for v in (acc_value, *accs)):
-                return "epilogue-acc-shared", f"the f32 result of '{extern.name}' (R_acc) is read by more than region {r.index}, which a hook cannot store as well"
-        # a path from the call out of the unit and back into it (through a call, a view, a move or another region): one kernel would wait for itself
-        last = max(unit)
-        stack = [s for u in unit for s in self.succ[u] if s not in unit and s < last]
-        seen: "set[int]" = set()
-        while stack:
-            x = stack.pop()
-            if x in seen:
-                continue
-            seen.add(x)
-            for s in self.succ[x]:
-                if s in unit:
-                    what = f"the call to '{self.prog[x].op}'" if self.prog[x].attrs.get("kind") else f"the op '{self.prog[x].op}'"
-                    return "epilogue-cycle", f"{what} (node #{self.origin[x]}) reads the result of '{extern.name}' and feeds region {r.index}"
-                if s < last and s not in seen:
-                    stack.append(s)
+                return "epilogue-acc-shared", f"the f32 result of '{extern.name}' (R_acc) is read outside region {r.index}, which a hook cannot store as well"
+        # a path from the unit out of it and back into it, through the units the graph has so far (a call, a view, a move, another region, a call
+        # with a region in its hook): one kernel would wait for itself
+        x = self._cycle(unit)
+        if x is not None:
+            what = f"the call to '{self.prog[x].op}'" if self.prog[x].attrs.get("kind") else f"the op '{self.prog[x].op}'"
+            return "epilogue-cycle", f"{what} (node #{self.origin[x]}) is on a path from the call to '{extern.name}' into region {r.index}"
         tile_value = next(iter(values))
         tile_type = tile_value.type
         if any(self.prog[m].op in ("sum", "mean", "max", "argmax", "argmin") for m in r.nodes):  # a row region: whole rows in a tile
@@ -1130,6 +1173,7 @@ class _Pass:
         h = Hooked(k, r, hook, extern, op, "accumulator" if is_acc else "exact")
         h.result_read = y_needed
         h.views = [m for m in unit_views if not any(needed(c) for c in self.prog[m].outputs)]  # (a split whose chunks something else reads stays)
+        h.held_views, h.unit = list(unit_views), set(unit)
         h.main = r.outputs[main] if main is not None else None
         h.tiles = used
         h.sources = sources
@@ -1177,6 +1221,9 @@ class _Pass:
         succ: "dict[int, set[int]]" = {id(u): set() for u in units}
         indeg: "dict[int, int]" = {id(u): 0 for u in units}
         by_id = {id(u): u for u in units}
+        # a split whose chunks a hook holds, and something else reads as well, stays a view of the stored result after the unit: the hook has those
+        # chunks as tiles, not through it, so it is no input of the unit
+        held = {m: id(h) for h in getattr(self, "hooked", ()) for m in h.held_views if m not in h.views}
         for k in range(len(prog)):
             if k not in unit_of:
                 continue
@@ -1184,6 +1231,8 @@ class _Pass:
                 if s not in unit_of:
                     continue
                 a, b = id(unit_of[k]), id(unit_of[s])
+                if held.get(k) == b:
+                    continue
                 if a != b and b not in succ[a]:
                     succ[a].add(b)
                     indeg[b] += 1
@@ -1206,8 +1255,8 @@ class _Pass:
         nodes: "list[Node]" = []
         materialised: "dict[Value, Value]" = {}
 
-        def given_of(r: Region, v: Value, given: Value) -> Value:
-            if r.reads.get(v) != "materialised":
+        def given_of(r: Region, v: Value, given: Value, copied: "tuple[str, ...]" = ("materialised",)) -> Value:
+            if r.reads.get(v) not in copied:
                 return given
             c = materialised.get(v)
             if c is None:
@@ -1224,7 +1273,8 @@ class _Pass:
         for u in order:
             if isinstance(u, Hooked):  # the extern with the region in its epilogue hook (docs/rfcs/0003-epilogue-fusion.md)
                 call = prog[u.call]
-                ins = [*u.inputs, *(given_of(u.region, v, given) for v, given in u.region_inputs)]  # type: ignore[attr-defined]
+                # (a dense view at an offset not a multiple of 16 bytes is copied first too: the hook's parameter is compiled for an aligned pointer)
+                ins = [*u.inputs, *(given_of(u.region, v, given, ("materialised", "unaligned")) for v, given in u.region_inputs)]  # type: ignore[attr-defined]
                 attrs = {a: v for a, v in call.attrs.items() if a not in ("triton", "gluon")}
                 attrs.update(u.op.node_attrs())
                 node = Node(u.op.name, ins, attrs, u.outputs)
@@ -1478,7 +1528,8 @@ BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
     "epilogue-taken": ("a hook takes one region of a call's result: the other reads the stored result (write both in one region to fuse both)", "4"),
     "epilogue-view": ("read the extern's result itself (or the chunks of a split hook's tiles), not another view of it, in the region the hook takes", "4"),
     "epilogue-acc-shared": ("read the extern's f32 result (R_acc) in one region only: a hook stores one result", "4"),
-    "epilogue-cycle": ("move the call out from between the extern and the region (it reads the extern's result and feeds the region)", "4"),
+    "epilogue-cycle": ("move the call out from between the extern and the region (it is on a path from the extern's result into the region)", "4"),
+    "epilogue-inout": ("read what the extern updates in place (InOut) outside the region its hook takes: its kernel cannot read what it writes", "4"),
     "epilogue-row": (
         "a region that reduces rows fuses into a hook only where a tile of the extern holds whole rows (block_n >= the row, a Triton kernel; RFC 0003 "
         "Q10): a wider tile, or the split over tiles of E4",

@@ -150,10 +150,11 @@ entry per value that crosses a boundary, with the ops on both sides and their li
 | `move` | a copy or a store between them | return or store the value where it is made | 1 |
 | `epilogue-<kind>`, `prologue-<kind>` | a call's result read by a region, a region's value read by a call: no fusion across a call (an extern: it declares no epilogue hook) | library: RFC 0003 E2, E3 or E6; extern: declare a hook (`tilefish.hook`, E1); `@tilefish.kernel`: write its body in the graph body | future, 4, 1 |
 | `epilogue-acc-only` | the extern hooks its accumulator only, and the graph is exact | declare `epilogues="accumulator"` (a graph or a `tilefish.fused` scope; contract (ii)), or give the kernel a `value="out"` hook (contract (i)) | 4 |
-| `epilogue-taken` | the call's hook took another region (one per call) | write both in one region | 4 |
+| `epilogue-taken` | the call's hook took another region (one per call), or the region is fused into another call's hook (one call per region) | write both in one region | 4 |
 | `epilogue-view` | the region reads the result through a view the hook does not hold | read the result itself (or the chunks of a split hook) | 4 |
 | `epilogue-acc-shared` | the f32 result (`R_acc`) is read by more than the region | read it in one region | 4 |
-| `epilogue-cycle` | a call reads the result and feeds the region | move it out from between them | 4 |
+| `epilogue-cycle` | a call (or a region, or another fused pair) is on a path from the result into the region | move it out from between them | 4 |
+| `epilogue-inout` | the region reads a tensor the extern updates in place (`InOut`), before or after the update | read it outside that region | 4 |
 | `epilogue-row` | the region reduces rows, and a tile of the extern does not hold a whole row (`block_n`), or the kernel is a Gluon one | a wider tile; the split over tiles is E4 | 4 |
 | `epilogue-template`, `epilogue-hook`, `epilogue-dims` | the region does not lower to a hook, the hook cannot take it, or its sizes are not the extern's | the detail says | 4 |
 | `grouping` | the union is legal, but the greedy merge of the graph's fusion version did not make it | a later fusion version | 1 |

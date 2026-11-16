@@ -2210,8 +2210,8 @@ class _HookLayout(_ElementwiseLayout):
 
 
 class _HookRowLayout(_RowLayout):
-    """Note 22: the row template on a tile that holds whole rows (``BN >= D``: the extern's tile width at every bucket, checked by the planner),
-    for a Triton kernel. A value ``[R, D]`` is ``[BM, BN]`` (the columns past ``D`` masked), ``[D]`` is ``[BN]``, ``[R]`` and ``[R, 1]`` are
+    """Note 22: the row template on a tile that holds whole rows (``BN >= D``: the extern's declared tile width at every bucket, checked by the
+    planner, and the width the kernel gives the hook, a ``tl.static_assert`` in it), for a Triton kernel. A value ``[R, D]`` is ``[BM, BN]`` (the columns past ``D`` masked), ``[D]`` is ``[BN]``, ``[R]`` and ``[R, 1]`` are
     ``[BM, 1]``; an ordered sum of every row of the tile (``_tf_hsum_*``) adds the same terms in the same order as the row template's (note 17), and
     ``max`` is order-free (E2). ``D`` is static. No unordered reduction (D2), no ``argmax`` / ``argmin``, no gathers or static slices."""
 
@@ -2252,6 +2252,7 @@ class _HookRowLayout(_RowLayout):
         return [
             f"{self.BM_name}: tl.constexpr = rows.shape[0]",
             f"{self.BLOCK_name}: tl.constexpr = cols.shape[0]",
+            f'tl.static_assert({self.BLOCK_name} >= {self.D_name}, "a tile of the extern narrower than a row: a hook reduces whole rows only (note 22)")',
             f"{self.cols} = cols",
             f"{self.row} = rows[:, None]",
             f"{self.offs} = rows[:, None] * {self.D_name} + cols[None, :]",
