@@ -546,13 +546,85 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--ptx", action="store_true", help="annotate: show the PTX line of each instruction")
     p.add_argument("--diff", metavar="OTHER_DIR", help="compare with the same kernel in another export directory")
     p.add_argument("--diff-arch", metavar="ARCH", help="compare with the same kernel for another architecture")
-    p.add_argument("--json", action="store_true", help="print the view as JSON (summary, lines)")
+    p.add_argument("--json", action="store_true", help="print the view as JSON (summary, lines, the advice)")
+    a = p.add_argument_group("fusion advice (docs/advise.md)")
+    a.add_argument("--advise", action="store_true", help="rank the fusion candidates of the plan of --graph: the steps, bytes and time saved, what to do")
+    a.add_argument("--timing", metavar="FILE", help="--advise with the measured times of one bucket (what --profile or tilefish.profile_plan writes)")
+    a.add_argument("--machine", metavar="ARCH", help="--advise with the roofline of this architecture (default: the plan's; sm_90, sm_100, sm_103, sm_120)")
+    a.add_argument("--bandwidth", type=float, metavar="GBPS", help="--advise with this memory bandwidth (GB/s: a partition's, a measured one)")
+    a.add_argument("--keep", action="append", default=[], metavar="BUFFER", help="--advise: a buffer the caller taps, which stays stored (repeatable)")
+    a.add_argument("--top", type=int, default=20, help="--advise: how many candidates the text lists (default 20)")
+    a.add_argument("--profile", metavar="OUT", help="measure the device time of every step of --graph's plan at --bucket and write it to OUT (needs a GPU and --load)")
+    a.add_argument("--load", metavar="MODULE:ATTR", help="--profile: the @tilefish.graph to replay the plan with (as every Python host does), imported from MODULE")
+    a.add_argument("--reps", type=int, default=50, help="--profile: timed runs (default 50)")
+    a.add_argument("--warmup", type=int, default=5, help="--profile: runs before the timed ones (default 5)")
+    a.add_argument("--method", choices=("graph", "events"), default="graph", help="--profile: a CUDA graph with event nodes (default), or launches with events")
+    a.add_argument("--devscalar", action="append", default=[], metavar="NAME=VALUE", help="--profile: the value of a device scalar (repeatable; every one is needed)")
+    a.add_argument("--pin", help="--profile: the plan's (or plan set's) digest the replay is checked against")
+    a.add_argument("--trust-directory", action="store_true", help="--profile: replay whatever plan the directory holds, without a pin")
     return p
+
+
+def _load_object(spec: str) -> Any:
+    import importlib
+
+    module, _, attr = spec.partition(":")
+    if not module or not attr:
+        raise TilefishExplainError(f"--load takes MODULE:ATTR (models.block:graph), got {spec!r}")
+    if "" not in sys.path and str(pathlib.Path.cwd()) not in sys.path:
+        sys.path.insert(0, str(pathlib.Path.cwd()))
+    obj: Any = importlib.import_module(module)
+    for part in attr.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def _advise_main(args: Any) -> int:
+    from . import _advise
+
+    timing: Any = args.timing
+    if args.profile:
+        from ._profile import profile_plan
+
+        if not args.load:
+            raise TilefishExplainError("--profile replays the plan with its graph: say where it is with --load MODULE:ATTR")
+        gop = _load_object(args.load)
+        if args.graph is not None and getattr(gop, "name", None) != args.graph:
+            raise TilefishExplainError(f"--load gives the graph '{getattr(gop, 'name', gop)}', not '{args.graph}'")
+        scalars = {}
+        for item in args.devscalar:
+            name, eq, value = item.partition("=")
+            if not eq:
+                raise TilefishExplainError(f"--devscalar takes NAME=VALUE, got {item!r}")
+            scalars[name.strip()] = int(value)
+        timing = profile_plan(gop, args.directory, bucket=args.bucket, reps=args.reps, warmup=args.warmup, method=args.method, pin=args.pin,
+                              trust_directory=args.trust_directory, devscalars=scalars, out=args.profile)
+        if not args.advise:
+            if args.json:
+                print(json.dumps(timing, indent=1))
+            else:
+                print(f"{args.profile}: {len(timing['steps'])} steps of '{timing['graph']}' at {timing['bucket']}, {timing['method']}, {timing['reps']} reps: "
+                      f"sum of the steps {timing['sum_us']} us, the plan alone {timing['plan_us']['median']} us (events {100 * (timing['overhead'] or 0):+.1f}%)")
+            return 0
+    adv = _advise.advise(args.directory, args.graph, bucket=args.bucket, timing=timing, machine=args.machine, bandwidth=args.bandwidth, keep=args.keep)
+    if args.json:
+        print(json.dumps(adv.doc, indent=1, default=str))
+    else:
+        sys.stdout.write(adv.text(top=args.top))
+    return 0
 
 
 def main(argv: "Sequence[str] | None" = None) -> int:
     """``tilefish-explain``; returns the exit status (2 for a request the export cannot answer)."""
     args = _parser().parse_args(argv)
+    if args.advise or args.profile:
+        from ._advise import TilefishAdviseError
+
+        try:
+            return _advise_main(args)
+        except (TilefishError, TilefishAdviseError) as err:
+            print(f"tilefish-explain: {err}", file=sys.stderr)
+            return 2
     region: "str | int | None" = args.region
     kw = dict(arch=args.arch, graph=args.graph, step=args.step, bucket=args.bucket, region=region, source_roots=args.source_root)
     try:

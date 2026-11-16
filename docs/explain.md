@@ -9,7 +9,8 @@ points that wait for it rather than to the work. tilefish makes the SASS of ever
    instruction, summarises the instruction mix, counts per source line and diffs two binaries (section 2).
 3. **SASS assertions** are part of a declaration and checked at every build like the TF32 guard and the contraction check (section 4).
 
-The code is `tilefish._trace`, `tilefish.explain` and `tilefish._sass`.
+The code is `tilefish._trace`, `tilefish.explain` and `tilefish._sass`. Which steps of a plan could be one kernel, and what that would save, is
+`tilefish-explain --advise` (`docs/advise.md`).
 
 ## 1. The trace
 
@@ -32,7 +33,8 @@ trace/
     sass.txt                         nvdisasm -c -g -gi: the SASS with its line information
     lines.json                       the line table: per instruction its address, source file and line, and PTX line (nvdisasm -gp)
     nodes.json                       a lowered kernel or a fused region: what each line of its generated source was written for
-  graphs/<graph>.json                a graph: the steps of each bucket of its plan, and the ops of the graph body each fused region took
+  graphs/<graph>.json                a graph: the steps of each bucket of its plan, the ops of the graph body each fused region took (and its
+                                     template), and why the regions are where they are ("boundaries", docs/advise.md section 4)
   graphs/source/<name>               the files of the graph body those ops were written on
 ```
 

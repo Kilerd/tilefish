@@ -507,6 +507,27 @@ def new_event() -> Any:
     return event
 
 
+def new_timing_event() -> Any:
+    """An event of the current context that records a time (``cuEventCreate(CU_EVENT_DEFAULT)``): for ``tilefish.profile_plan`` only."""
+    drv = _driver()
+    (event,) = _check(drv.cuEventCreate(drv.CUevent_flags.CU_EVENT_DEFAULT), "cuEventCreate")
+    return event
+
+
+def clock_khz(device_index: int) -> int:
+    """The SM clock of a device in kHz (``CU_DEVICE_ATTRIBUTE_CLOCK_RATE``): how many cycles a spinning kernel waits per millisecond."""
+    drv = _driver()
+    (device,) = _check(drv.cuDeviceGet(device_index), "cuDeviceGet")
+    (rate,) = _check(drv.cuDeviceGetAttribute(drv.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_CLOCK_RATE, device), "cuDeviceGetAttribute(CLOCK_RATE)")
+    return int(rate)
+
+
+def elapsed_ms(start: Any, end: Any) -> float:
+    """The time between the most recent records of two timing events, in milliseconds (``cuEventElapsedTime``; both done)."""
+    (ms,) = _check(_driver().cuEventElapsedTime(start, end), "cuEventElapsedTime")
+    return float(ms)
+
+
 def wait_event(stream: int, event: Any, external: bool) -> None:
     """Make the work submitted to ``stream`` after this wait for the most recent record of ``event``. ``external`` (while ``stream`` is being
     captured): the wait is captured as an event wait node, so every replay of the graph waits for the most recent record made before it is launched."""

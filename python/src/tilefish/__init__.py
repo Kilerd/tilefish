@@ -115,6 +115,27 @@ def verify_fusion(graph: GraphOp, buckets: "dict | None" = None) -> dict:
     combos = bucket_combinations(make_plan(graph, buckets).dims)
     return report(graph, verify(graph, combos))
 
+
+def advise(directory: "str | object", graph: "str | None" = None, **kwargs: object) -> object:
+    """The fusion advice for the plan of ``graph`` in an export directory (``tilefish-explain DIR --graph G --advise``; ``docs/advise.md``): every
+    candidate (steps joined by intermediates one kernel would not store), ranked by the time it would save, with why it is not one kernel today and what
+    to do; the time by class; the graph-body arithmetic that was not fused. Keywords: ``bucket=``, ``timing=`` (what :func:`profile_plan` wrote),
+    ``machine=``, ``bandwidth=``, ``keep=``, ``gop=``. Returns an ``Advice`` (``.text()``, ``.doc``). No GPU."""
+    from ._advise import advise as _advise
+
+    return _advise(directory, graph, **kwargs)  # type: ignore[arg-type]
+
+
+def profile_plan(graph: GraphOp, plan: object = None, **kwargs: object) -> dict:
+    """The device time of every step of the plan of ``graph`` at one bucket (``tilefish-explain DIR --graph G --profile OUT``; ``docs/advise.md``), as a
+    ``tilefish.step-timing.v1`` document that :func:`advise` reads. A runtime path of its own: it changes no artefact and no byte. Keywords:
+    ``bucket=``, ``reps=``, ``warmup=``, ``method=`` (``"graph"`` or ``"events"``), ``mode=``, ``pin=``, ``trust_directory=``, ``externals=``,
+    ``devscalars=``, ``seed=``, ``out=``. Needs a CUDA device."""
+    from ._profile import profile_plan as _profile_plan
+
+    return _profile_plan(graph, plan, **kwargs)  # type: ignore[arg-type]
+
+
 # Reductions with numpy semantics. They share a name with a builtin, so they are not in
 # __all__ (`from tilefish import *` must not shadow the builtins); use tilefish.sum etc.
 sum = _ops.reduce_sum  # noqa: A001
@@ -177,6 +198,7 @@ __all__ = [
     "TilefishFusionError",
     "TilefishFusionWarning",
     "Value",
+    "advise",
     "aot",
     "argmax",
     "argmin",
@@ -218,6 +240,7 @@ __all__ = [
     "mean",
     "neg",
     "plan",
+    "profile_plan",
     "persistent",
     "rcp",
     "rsqrt",

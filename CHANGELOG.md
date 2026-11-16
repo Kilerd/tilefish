@@ -5,6 +5,35 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+Manifest schema 3, plan schema 1, both hosts and every digest are unchanged: an export writes the same manifest, plans, plan sets and fusion
+reports as 0.0.9. The trace's graph file gains two keys (it is outside every digest).
+
+### The fusion advisor (`docs/advise.md`)
+
+- **`tilefish-explain DIR --graph G --advise`** (`tilefish.advise(directory, graph, ...)`, an `Advice` with `.text()` and `.doc`, JSON
+  `tilefish.advice.v1`): for a graph's plan, every fusion candidate (steps joined by intermediates that one producer writes and one consumer alone
+  reads, which one kernel would not store; returned, carried, `InOut`, twice-written and tapped buffers excluded; a GEMM or convolution bounds a
+  candidate as its epilogue or prologue), with its steps and op labels (the fusion report's and the trace's ops and lines), classes, bytes and
+  microseconds saved per bucket, the launches it removes, why it is not one kernel today and the action that would make it one (write an extern's
+  or a `@tilefish.kernel`'s arithmetic in the graph body, add `order=`, remove `tilefish.barrier`, phase 2 row fusion, a GEMM epilogue: future work),
+  ranked by the time it would save; the time of the plan by class (library, fused, elementwise, row, copy, opaque); per step the bytes read and
+  written, a GEMM's or convolution's FLOPs and a roofline against a per-architecture machine table (sm_90, sm_100, sm_103, sm_120); the blockers
+  that would unlock the most (which phase-2 patterns help most); and the graph-body arithmetic that was not fused, with the reason and the fix.
+  No GPU: it reads the export (the manifest, the plan, the fusion report, the trace). `--bucket`, `--timing`, `--machine`, `--bandwidth`, `--keep`,
+  `--top`, `--json`.
+- **`tilefish.profile_plan(graph, plan, bucket=, reps=, method=, devscalars=, out=)`** and `tilefish-explain DIR --graph G --profile OUT --load
+  MODULE:ATTR`: the device time of every step of a plan at one bucket, a runtime path of its own that changes no artefact and no byte (the plan run
+  as a run runs it, with timing events between its steps: event nodes of a CUDA graph, or events between launches behind a spinning kernel), as a
+  `tilefish.step-timing.v1` file the advisor ranks by. It records the device's SMs and copy bandwidth, the plan's time without the events and what
+  the events cost each step (about 3 us on a B300 slice), and each step's time net of it; `docs/advise.md` compares it with Nsight Systems.
+- **Why the regions are where they are**: `tilefish._fusion.boundaries(graph)` gives, for every value that crosses a boundary of a fused region,
+  the reason (`barrier`, `reduction-unordered` (D2), `reduction`, `view`, `materialised`, `cycle`, `limit`, `template`, `move`, a call's epilogue or
+  prologue, `grouping`), the ops on both sides and their lines, and the fix. It repeats the pass's rules (now one function, `merge_problem`, which
+  the pass itself calls) and changes no region. A traced export writes it into `trace/graphs/<graph>.json` (`boundaries`), with each region's
+  template.
+
 ## tilefish 0.0.9, crate 0.0.7, tilefish-capi 0.0.1 (2026-11-16)
 
 Manifest schema 3, plan schema 1 and both hosts are unchanged, and so is every digest of an export that declares no SASS assertion

@@ -999,6 +999,12 @@ $ tilefish-explain build/mm mm --diff-arch sm_120       # or --diff OTHER_EXPORT
   itself. `no_spills` and `max_registers` are the ELF file's, with no disassembly.
 * The trace holds source code: do not ship it with an export.
 
+**Which steps could be one kernel** (`docs/advise.md`): `tilefish-explain build/block --graph block --advise` ranks the fusion candidates of a plan
+(steps joined by intermediates one kernel would not store) by the bytes and time they would save, says why each is not one kernel today and what to do
+(write an extern's arithmetic in the graph body, add `order=`, remove a barrier, phase 2 row fusion, a GEMM epilogue: future work), and sums the plan's
+time by class. `tilefish.profile_plan(block, "build/block", bucket="M=128", ...)` (or `--profile`) measures every step on the device, a runtime path
+outside every artefact, and `--timing` ranks by what it measured.
+
 ## The Rust host
 
 The `tilefish` crate (`crates/tilefish`, version 0.0.1) is the

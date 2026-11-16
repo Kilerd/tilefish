@@ -283,6 +283,19 @@ class Backend:
     def destroy_event(self, event: Any, index: int) -> None:
         raise NotImplementedError
 
+    def new_timing_event(self, index: int) -> Any:
+        """An event that records a time (``tilefish.profile_plan``; recorded with :meth:`record_event`, read with :meth:`elapsed_ms`)."""
+        raise NotImplementedError
+
+    def elapsed_ms(self, start: Any, end: Any, index: int) -> float:
+        """Milliseconds between the most recent records of two timing events (both done)."""
+        raise NotImplementedError
+
+    def hold(self, stream: int, microseconds: float, index: int) -> None:
+        """Keep ``stream`` busy for about ``microseconds`` on the device (a spinning kernel), so that what the host enqueues after it is queued before
+        the device reaches it (``tilefish.profile_plan`` without a graph: the steps then run back to back, not as fast as the host launches them)."""
+        raise NotImplementedError
+
     def synchronize_stream(self, stream: int) -> None:
         """Wait on the host for everything enqueued on ``stream`` (what a run does when it cannot record the order event after its launches)."""
         raise NotImplementedError
@@ -414,6 +427,24 @@ class TorchBackend(Backend):
 
         with self.torch.cuda.device(index):
             _cuda.destroy_event(event)
+
+    def new_timing_event(self, index: int) -> Any:
+        from . import _cuda
+
+        with self.torch.cuda.device(index):
+            return _cuda.new_timing_event()
+
+    def elapsed_ms(self, start: Any, end: Any, index: int) -> float:
+        from . import _cuda
+
+        with self.torch.cuda.device(index):
+            return _cuda.elapsed_ms(start, end)
+
+    def hold(self, stream: int, microseconds: float, index: int) -> None:
+        from . import _cuda
+
+        rate = _cuda.clock_khz(index)  # cycles per millisecond
+        self.torch.cuda._sleep(max(1, int(microseconds * rate / 1000)))  # on torch's current stream, which is `stream` (the caller made it current)
 
     def synchronize_stream(self, stream: int) -> None:
         from . import _cuda
@@ -1064,6 +1095,100 @@ class PlanRunner:
                 finally:
                     _carried_written(arena, call.rt, done)
         return runtime._result(call.results)
+
+    def profile(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", *, reps: int, warmup: int, method: str) -> "dict[str, Any]":
+        """The device time of every step of the bucket the arguments select (:func:`tilefish.profile_plan`): ``{"steps": [[µs per rep] per step],
+        "plan": [µs per rep of the plan without the per-step events]}``. A runtime path of its own: the plan, its binaries and every byte it writes are
+        those of a run (it is one, repeated); between the steps it records timing events, which no run has.
+
+        ``method="graph"``: the steps are captured once in a CUDA graph with an event record node before the first and after each step, and the graph is
+        replayed (what a host that captures the plan runs; the device scalars are written once, before). ``method="events"``: the steps are launched as a
+        run launches them, with an event recorded on the stream before the first and after each; a spinning kernel first keeps the device busy while the
+        host enqueues them, so that they run back to back. Every replay or run is ordered on the plan's arena as a run is."""
+        if method not in ("graph", "events"):
+            raise TilefishRuntimeError(f"profile: method is 'graph' or 'events', got {method!r}")
+        be = self.backend
+        bound = self._bind(args, kwargs)
+        index = bound.index
+        with _gate.shared():
+            if be.capturing(index):
+                raise TilefishRuntimeError("tilefish.profile_plan is called outside a CUDA graph capture (it captures and replays its own)")
+            call = self._call(bound, None, slots_in_graph=False)
+            arena = call.arena
+            steps = list(zip(call.rt.steps, call.checked))
+            n = len(steps)
+            with arena.lock, be.scope(index):
+                stream = be.stream(index)
+                _check_carried(arena, call.rt, self.plan.name)
+                _note_thread(arena, self.plan.name)
+                events = [be.new_timing_event(index) for _ in range(n + 1)]
+                ends = [be.new_timing_event(index) for _ in range(2)]
+
+                def slots() -> None:
+                    for b, source, on_device in call.slots:
+                        be.write_devscalar(arena.handle, b["offset"], b["dtype"], source, on_device)
+
+                def enqueue(s: int, timed: bool, external: bool) -> None:
+                    if timed:
+                        be.record_event(events[0], s, external)
+                    for i, (st, real) in enumerate(steps):
+                        self._enqueue_step(st, real, call.bases, s, index, call.descs[i] if call.descs else {})
+                        if timed:
+                            be.record_event(events[i + 1], s, external)
+
+                def one(timed: bool, graphs: "dict[bool, Any]") -> None:
+                    def work() -> None:
+                        if method == "graph":
+                            if not timed:
+                                be.record_event(ends[0], stream, False)
+                            be.replay_graph(graphs[timed], stream)
+                            if not timed:
+                                be.record_event(ends[1], stream, False)
+                        else:
+                            slots()
+                            be.hold(stream, 20.0 * n + 50.0, index)
+                            if not timed:
+                                be.record_event(ends[0], stream, False)
+                            enqueue(stream, timed, False)
+                            if not timed:
+                                be.record_event(ends[1], stream, False)
+
+                    done = False
+                    try:
+                        _ordered(be, arena, stream, False, work)
+                        done = True
+                    finally:
+                        _carried_written(arena, call.rt, done)
+
+                out: "dict[str, Any]" = {"steps": [[] for _ in range(n)], "plan": [], "bucket": dict(bound.values)}
+                try:
+                    graphs: "dict[bool, Any]" = {}
+                    if method == "graph":
+                        _ordered(be, arena, stream, False, slots)  # the device scalars, once: the graphs hold the launches only
+                        graphs[True] = be.capture_graph(index, None, lambda s: enqueue(s, True, True))
+                        graphs[False] = be.capture_graph(index, None, lambda s: enqueue(s, False, False))
+                    for timed in (True, False):
+                        for _ in range(warmup):
+                            one(timed, graphs)
+                    be.synchronize_stream(stream)
+                    for _ in range(reps):
+                        one(True, graphs)
+                        be.synchronize_event(events[-1], index)
+                        prev = 0.0
+                        for i in range(n):
+                            at = be.elapsed_ms(events[0], events[i + 1], index)
+                            out["steps"][i].append((at - prev) * 1000.0)
+                            prev = at
+                        one(False, graphs)
+                        be.synchronize_event(ends[1], index)
+                        out["plan"].append(be.elapsed_ms(ends[0], ends[1], index) * 1000.0)
+                finally:
+                    with contextlib.suppress(Exception):
+                        be.synchronize_stream(stream)
+                    for e in events + ends:
+                        with contextlib.suppress(Exception):
+                            be.destroy_event(e, index)
+        return out
 
     def _bind(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> "_BoundCall":
         """Match the arguments to the graph's signature (a ``DevScalar`` passed as a number becomes a tensor of one element on the host), bind the
