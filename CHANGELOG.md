@@ -7,10 +7,28 @@ each section names the release that added it.
 
 ## Unreleased
 
-Manifest schema 3, plan schema 1 and both hosts are unchanged, and so is every digest of an export whose graphs have no arithmetic in their bodies:
-it writes the same manifest, plans and plan sets as 0.0.10. A graph whose body has arithmetic is now planned by fusion version 2 (the new default,
-below), so its fused regions, plan and pin are new; declared with `tilefish.fusion(version=1)` it plans as 0.0.10 and 0.0.9 planned it, byte for byte, and a
-plan of either loaded by the graph as it is (declaring nothing) is refused with a message that names version 1.
+Manifest schema 3, plan schema 1 and both hosts are unchanged. An export whose graphs have no arithmetic in their bodies and whose kernels write no
+`-0.0` scalar writes the same manifest, plans and plan sets as 0.0.10 (checked: every kernel and plan of the test suite and the Rust and C++ gates
+but those below, and the three pilot plan sets re-exported).
+
+### Breaking
+
+- **Fusion version 2 is the default.** A graph whose body has arithmetic and declares no version is now planned by `tilefish.fusion(version=2)`
+  (below): its fused regions have new names (the version is in each region's content hash), new sources (revision 2 of the lowering) and warp
+  counts, so its manifest entries, plan and pin are new, and an ordered reduction, `max`, `argmax`, `argmin` or `gather_rows` is fused with its
+  neighbours (fewer steps; an intermediate fused away has no buffer, so a `taps=` of it is refused: tap the unfused plan or add `tilefish.barrier`).
+  The bytes it writes are those of 0.0.10 (every region is its unfused composition, and so was 0.0.10's) but where a `-0.0` scalar meets a zero
+  (Fixed, below). A plan exported by 0.0.10 or 0.0.9 and loaded by the graph as it is is refused, and the message names version 1. **To keep
+  0.0.10's plans and pins**, declare `@tilefish.graph(fusion=tilefish.fusion(version=1))`: version 1 plans as 0.0.10 did, byte for byte (plan
+  digests of the use cases checked), but where it was wrong (Fixed).
+- **What else of 0.0.10 changes:**
+  - `tilefish._fusion.boundaries()`, the trace's `boundaries` and the advisor (`tilefish.advise`, `--advise`) report by the graph's fusion
+    version: for version 2 no `reduction`, `gather` or row-region `materialised` and `template` reasons, and the fixes of the reasons `reduction`,
+    `reduction-unordered`, `gather`, `materialised`, `template`, `limit`, `grouping`, `view` and the blockers `row-kernel` and `opaque-extern`
+    are reworded.
+  - A kernel or region that writes a `-0.0` scalar has a new source, binary and pin, and writes `-0.0` where 0.0.10 wrote `+0.0` (Fixed).
+    In the test suite and the gates only the kernels written to test it; version-1 plan digests change for such graphs only.
+  - A region that gathers rows from a view that is not dense copies it first (`tilefish.contiguous`, a new step) in both versions (Fixed).
 
 ### Fusion phase 2: row regions (`docs/rfcs/0001-plan-fusion.md`, "Phase 2")
 
@@ -39,11 +57,18 @@ plan of either loaded by the graph as it is (declaring nothing) is refused with 
 - **Speed** on a B300 MIG slice, rows 32 to 4096 and 512 to 4096 columns (the RFC's phase 2 table): the fused row region is the fastest in
   every cell, 2.6 to 8 times faster than the same body with Triton's tree reductions run as three to five kernels (D2); an add + rmsnorm of 4096
   rows of 1024 columns takes 16 us (tree composition 65, version 1 121, one kernel per op 103).
-- **`@tilefish.kernel(lowering=2)`** asks for revision 2 for a hand-written kernel (the same bytes, but a `-0.0` scalar's sign; other binaries
-  and pins).
-- **A literal `-0.0` is `+0.0` in Triton 3.5.1** (found here; note 21): revision 2 writes a `-0.0` scalar by its bits, so a region of version 2
-  computes `where(x > 0, x, -0.0)` as written; revision 1 (every hand-written kernel by default, and version 1's regions) still gives `+0.0`
-  there, its fused and unfused plans alike.
+- **`@tilefish.kernel(lowering=2)`** asks for revision 2 for a hand-written kernel (the same bytes; other binaries and pins).
+
+### Fixed
+
+- **A scalar `-0.0` keeps its sign** (note 3 of `tilefish.lower`): Triton 3.5.1 writes a literal `-0.0` as `+0.0`, so `where(x > 0, x, -0.0)`,
+  `x * -0.0` and the like gave `+0.0` in a `@tilefish.kernel` and in a fused region alike, against the declared op and the `reference` mode. Every
+  kernel (both revisions of the lowering, so also version 1's regions) now writes a `-0.0` scalar by its bits. Old and new binaries of the kernels
+  it changes differ only there: on 3 x 2**20 random inputs with special values and every bf16 pattern, every differing element is one where the
+  `-0.0` is selected, `+0.0` before and `-0.0` now. A `const` parameter whose value is `-0.0` is still `+0.0` (a `tl.constexpr`; open).
+- **A view gathered from is read at its rows.** A fused region that gathers rows from a view that is not dense read it as if it were dense (the
+  elementwise template of both versions, a rank-1 table: the wrong elements, fused and unfused alike); the view is now copied first.
+- **The warps of a row whose gather table has bucketed rows** name every bucket of its binaries (`compile_specs` refused such a kernel).
 
 ## tilefish 0.0.10, crate 0.0.8, tilefish-capi 0.0.1 (2026-11-16)
 

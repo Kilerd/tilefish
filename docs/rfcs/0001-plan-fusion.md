@@ -161,8 +161,9 @@ the export-time verification, the schemas and the hosts are those of phase 1.
   of the best of 1 to 8 warps over the measured grid. Checked against the CUDA kernels of each order at every length from 1 to 4096 columns and at
   every warp count; 1.6 to 37 times faster than revision 1.
 * **H10, found here: a literal `-0.0` is `+0.0` in Triton 3.5.1** (`tl.where(m, x, -0.0)`, `tl.full(..., -0.0)`, measured with and without a
-  `+0.0` in the kernel). Fusion stays exact (the fused and unfused kernels write the same literal), but a body's `where(x > 0, x, -0.0)` is not
-  what it says in revision 1. Revision 2 writes a `-0.0` scalar, and the padding of its ordered sums, by its bits (an `i32` bitcast).
+  `+0.0` in the kernel). Fusion stayed exact (the fused and unfused kernels wrote the same literal), but a body's `where(x > 0, x, -0.0)` was not
+  what it says, in a kernel and a region alike. Every kernel now writes a `-0.0` scalar by its bits (an `i32` bitcast; note 3), and so does
+  revision 2's padding of ordered sums.
 * **Also in revision 2:** views of rank 1 and 2 read where they are by the row template (rule 5; version 1's row regions copy them first), an
   fp8 cast inline (`cvt.rn.satfinite.e4m3x2.f32`, `.to()`'s bits on every input). A hand-written kernel may ask for revision 2
   (`@tilefish.kernel(lowering=2)`); by default it keeps revision 1 and its source.
