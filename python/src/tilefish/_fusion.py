@@ -247,7 +247,7 @@ def other_version_of_plan(gop: Any, doc: Mapping[str, Any], derive: Any) -> "str
                     + f": declare @tilefish.graph(fusion=tilefish.fusion(version={v}, ...)) to keep that plan (every version is kept, D7), or export it "
                     "again (and pin the new plan)"
                 )
-        except TilefishError:
+        except Exception:  # noqa: BLE001 - another version that cannot plan the graph names nothing; the stale error stands
             continue
     return None
 
@@ -582,8 +582,8 @@ class _Pass:
 
     def merge_problem(self, a: int, b: int, force: bool = False) -> "tuple[str, str] | None":
         """The first rule of 3.5 the union of the regions whose first ops are ``a`` and ``b`` breaks, as ``(reason, what)``: ``"limit"`` (more ops or
-        tensors than a region of version 1 has), ``"cycle"`` (a path leaves the union and comes back: through a call, a view, a move or another
-        region), or, for a path through a reduction (a region of its own in version 1), the reduction's reason (:func:`reduction_reason`),
+        tensors than a region has), ``"cycle"`` (a path leaves the union and comes back: through a call, a view, a move or another region), or, for
+        a path through a reduction that is a region of its own in this version (:func:`is_solo`), the reduction's reason (:func:`reduction_reason`),
         ``"template"`` (the union does not lower); ``None`` when the union is legal. The pass merges only when it is ``None``."""
         union = sorted(self.groups[a] + self.groups[b])
         if len(union) > MAX_REGION_NODES and not force:
@@ -1065,8 +1065,17 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
 
     version = f.settings.version
 
+    def solo_node(k: int) -> "int | None":
+        """The op of ``k``'s region that makes it a region of its own (``k`` itself, or the fma sum whose product ``k`` is), or ``None``."""
+        root = p.member_of.get(k)
+        for m in p.groups.get(root, [k]) if root is not None else [k]:
+            if reduction_reason(prog[m].op, "order" in prog[m].attrs, version) is not None:
+                return m
+        return None
+
     def solo(k: int) -> "str | None":
-        return reduction_reason(prog[k].op, "order" in prog[k].attrs, version)
+        m = solo_node(k)
+        return None if m is None else reduction_reason(prog[m].op, "order" in prog[m].attrs, version)
 
     for r in f.regions:
         root = r.nodes[0]
@@ -1095,7 +1104,8 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
                 elif via:
                     add("view", frm, to, i, f"the {', '.join(prog[v].op for v in via)} of {i.ref} is between them")
                 elif solo(pk) or solo(k):
-                    which = pk if solo(pk) else k
+                    which = solo_node(pk) if solo(pk) else solo_node(k)
+                    assert which is not None
                     reason = solo(which) or "reduction"
                     n = prog[which]
                     order = f" with order={n.attrs['order']}" if "order" in n.attrs else (" without order=" if reason == "reduction-unordered" else "")
@@ -1131,12 +1141,13 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
 # -- verification: each region against its ops one by one ------------------------------------------------------------------------------------
 
 
-def _unfused_region(f: Fused, r: Region) -> "list[tuple[Any, list[Value], list[Value]]]":
-    """The ops of a region as kernels of their own (as ``grouping="none"`` makes them): ``(kernel, inputs, outputs)`` in order."""
+def _unfused_region(f: Fused, r: Region) -> "list[tuple[Any, list[Value], list[Value], dict[Value, str]]]":
+    """The ops of a region as kernels of their own (as ``grouping="none"`` makes them): ``(kernel, inputs, outputs, how each input is read)`` in
+    order (a view one of them copies first, ``"materialised"``, is copied by ``tilefish.contiguous`` in the unfused plan)."""
     p = _Pass(f.source, f.settings)
     p.prepare(f.program, f.origin)
     p.free = set(r.free)
-    return [(one.kernel, list(one.inputs), list(one.outputs)) for one in p.regions(p.partition(list(r.nodes), "none"))]
+    return [(one.kernel, list(one.inputs), list(one.outputs), dict(one.reads)) for one in p.regions(p.partition(list(r.nodes), "none"))]
 
 
 def _sample(torch: Any, t: TensorType, sizes: "tuple[int, ...]", seed: int, device: Any) -> Any:
@@ -1217,9 +1228,10 @@ def verify(gop: Any, combos: "Sequence[Mapping[str, int]]", *, seeds: "Sequence[
                 denv = dict(env)
                 pending = list(steps)
                 while pending:  # in an order their values allow (a region joined to its consumer comes where its inputs are)
-                    kern, ins, outs = next((s for s in pending if all(v in denv for v in s[1])), pending[0])
-                    pending.remove((kern, ins, outs))
-                    res = runtime.run(kern, *[denv[v] for v in ins])
+                    step = next((s for s in pending if all(v in denv for v in s[1])), pending[0])
+                    pending.remove(step)
+                    kern, ins, outs, how = step
+                    res = runtime.run(kern, *[denv[v].contiguous() if how.get(v) == "materialised" else denv[v] for v in ins])
                     res = list(res) if isinstance(res, tuple) else [res]
                     for o, val in zip(outs, res):
                         denv[o] = val

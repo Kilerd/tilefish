@@ -1892,9 +1892,12 @@ def load_plan(path: "str | pathlib.Path", graph: GraphOp, *, pin: "str | None" =
     try:
         derived = plan(graph, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"])
     except (TilefishPlanError, TilefishPreconditionError) as e:  # the graph (or an operator it calls) is not what it was: the plan on disk is stale
+        from ._fusion import other_version_of_plan
+
+        version = other_version_of_plan(graph, doc, lambda g: plan(g, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"]))
         raise TilefishManifestError(
             f"the plan in {str(directory)!r} is not the plan of graph '{graph.graph.name}' as this process holds it: the graph can no longer be planned for the "
-            f"same buckets ({str(e)[:400]}); export it again (and pin the new plan)"
+            f"same buckets ({str(e)[:400]}); " + (version if version else "export it again (and pin the new plan)")
         ) from e
     why = derived.stale_reason(doc)
     if why is not None:

@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, sys};
 use serde_json::Value;
 use tilefish::{
-    Access, Bf16, BufferRole, DType, DevScalar, DevicePtr, Element, Error, F16, F32, I32, I64, LaunchPlan, Pin,
-    PlanSet, PreconditionKind, Tap, TensorArg, TensorMut, TensorRef, U8, plan_digest,
+    Access, Bf16, BufferRole, DType, DevScalar, DevicePtr, E4m3, E5m2, Element, Error, F16, F32, I32, I64, LaunchPlan,
+    Pin, PlanSet, PreconditionKind, Tap, TensorArg, TensorMut, TensorRef, U8, plan_digest,
 };
 
 fn gate_dir() -> PathBuf {
@@ -122,7 +122,8 @@ fn typed<'a>(slice: &'a mut CudaSlice<u8>, shape: &'a [usize], dtype: DType, wri
         DType::I32 => make::<I32>(slice, shape, write),
         DType::I64 => make::<I64>(slice, shape, write),
         DType::U8 => make::<U8>(slice, shape, write),
-        other => panic!("the gate does not know {other:?}"),
+        DType::E4m3 => make::<E4m3>(slice, shape, write),
+        DType::E5m2 => make::<E5m2>(slice, shape, write),
     }
 }
 

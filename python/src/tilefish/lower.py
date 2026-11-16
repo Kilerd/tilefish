@@ -545,8 +545,9 @@ Notes (the facts behind the table):
 
     Every non-NaN value is the same either way, and the inline cast is ``.to()``'s bits on every f32 (``tests/test_gpu_fusion.py``).
 21. **Revision 2 of the lowering** (``lower(..., lowering=2)``; the kernel's ``lowering`` attribute, which the regions of ``tilefish.fusion(version=2)``
-    are made with and every other kernel has as ``1``). The same bytes as revision 1, other code, so other binaries and pins: a kernel's revision is
-    frozen with what makes it (a hand-written kernel keeps revision 1 and its source).
+    are made with, a kernel declared ``@tilefish.kernel(lowering=2)`` has, and every other kernel has as ``1``). The bytes of revision 1 but where
+    revision 1 loses the sign of a ``-0.0`` scalar (the last bullet), other code, so other binaries and pins: a kernel's revision is frozen with what
+    makes it (a hand-written kernel keeps revision 1 and its source unless it declares 2).
 
     * **Ordered sums by halving splits.** Revision 1 takes each step of a lane's chain with a ``tl.gather`` of the row (a pass through shared memory
       per step: 85 us for an rmsnorm of 4096 rows of 1024 columns on a B300 slice, where its three unfused kernels with a Triton tree sum take
@@ -577,7 +578,10 @@ Notes (the facts behind the table):
       ``-0.0`` argument of an inline-asm helper) as ``+0.0`` (measured on sm_103: ``0x00000000`` where ``0x80000000`` was written, with or without a
       ``+0.0`` in the same kernel), so revision 1 computes ``where(x > 0, x, -0.0)`` with ``+0.0`` (its fused and unfused plans alike, so fusion
       stays exact; against the ``reference`` mode, and the declared op, it is wrong). Revision 2 writes a ``-0.0`` scalar (f32, bf16, f16) by its
-      bits, ``tl.full((), -2147483648, tl.int32).to(tl.float32, bitcast=True)``, and so does its padding of ordered sums.
+      bits, ``tl.full((), -2147483648, tl.int32).to(tl.float32, bitcast=True)``, and so does its padding of ordered sums. A ``const`` parameter of a
+      hand-written kernel whose value is ``-0.0`` is a ``tl.constexpr``, which Triton still makes ``+0.0`` (a graph's region writes its value as a
+      scalar, so it is covered). So a graph's version 1 and version 2 plans differ where a ``-0.0`` scalar meets a zero (also one that
+      ``fp_contract="mul-add"`` makes: ``a * b - 0.0`` is ``fma(a, b, -0.0)``).
 
     ``mean(x, -1, order=...)`` (either revision) is the ordered sum times ``f32(1 / D)``, one ``mul.rn``: ``1.0 / D`` of the constexpr ``D``, a
     Python float that Triton rounds to f32, which is ``1 / D`` correctly rounded for every ``D`` up to ``2**20`` (the binary expansion of ``1 / D``
@@ -1581,8 +1585,9 @@ class _RowLayout(_Layout):
         for v in graph.inputs:
             if v.name not in names:
                 continue
-            if v.access != "in" or tables.skip(v) or v in tables.slices or self.cls.get(v) not in (_FULL, _COL, _ROW):
-                raise _fail(name, "row", "row.strided", f"the view {_label(v)} is read where it is only as an [R, D], [D], [R] or [R, 1] operand")
+            if v.access != "in" or v in tables.params or tables.skip(v) or v in tables.slices or self.cls.get(v) not in (_FULL, _COL, _ROW):
+                # (a table's rows are addressed by an index, contiguously: a view gathered from is copied first)
+                raise _fail(name, "row", "row.strided", f"the view {_label(v)} is read where it is only as an [R, D], [D], [R] or [R, 1] operand, never gathered from")
             self.strided[v] = names[v.name]
         # revision 2 (note 21): a row whose reductions are ordered sums (and order-free ones) takes the warps of its BLOCK_D by the rule of
         # revision 2, a speed choice; a Triton tree reduction (sum or mean without order) keeps the template's rule, which is its numerics (note 6)
@@ -1843,12 +1848,12 @@ class _ElementwiseLayout(_Layout):
         names = _strided_params(op)
         for v in graph.inputs:
             if v.name in names:
-                if v.type.shape != self.shape or v.access != "in":
+                if v.type.shape != self.shape or v.access != "in" or v in tables.params:  # (a table is addressed by an index, contiguously)
                     raise _fail(
                         name,
                         "elementwise",
                         "elementwise.strided-shape",
-                        f"the view {_label(v)} is read where it is only with the kernel's shape {_shape_text(self.shape)}",
+                        f"the view {_label(v)} is read where it is only with the kernel's shape {_shape_text(self.shape)}, and never gathered from",
                     )
                 self.strided[v] = names[v.name]
         # an operand whose shape is the trailing axes of the kernel's shape (after leading 1s) broadcasts over the leading ones: lane o reads its
@@ -3002,7 +3007,7 @@ def lower(
     float ``+ - *`` and narrowing cast inline PTX, and views read where they are, note 20; what a graph's fused regions are lowered with).
     ``lowering`` overrides the kernel's own revision of the lowering (``1``, every kernel's; ``2``, what the regions of ``tilefish.fusion(version=2)``
     are lowered with: ordered sums by halving splits, the warp rule of note 21 and, context-free, views read where they are by the row template;
-    the same bytes, other code). Raises :class:`~tilefish.errors.TilefishLoweringError` when the body fits no template.
+    the bytes of revision 1 but a ``-0.0`` scalar's sign, other code). Raises :class:`~tilefish.errors.TilefishLoweringError` when the body fits no template.
     """
     module, fn_name = _check_names(op, module)
     if template is not None and template not in TEMPLATES:

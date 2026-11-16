@@ -374,7 +374,7 @@ class GraphOp(Op):
     of a shared arena hands it to the next (``docs/plan-schema-1.md``, section 15.2).
 
     ``fusion`` is how the arithmetic traced in the body is planned (``@tilefish.graph(fusion=tilefish.fusion(...))``, :mod:`tilefish._fusion`), or
-    ``None``: the default, :func:`tilefish.fusion` with no arguments (exact, ``version=1``)."""
+    ``None``: the default, :func:`tilefish.fusion` with no arguments (exact, ``version=2``)."""
 
     kind = "graph"
 

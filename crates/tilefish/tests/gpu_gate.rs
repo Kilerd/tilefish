@@ -61,8 +61,8 @@ use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, result};
 use serde_json::Value;
 use tilefish::{
-    Access, AlgoSource, Arch, Bf16, DType, DevicePtr, Element, Error, F16, F32, GemmLayout, I32, I64, Manifest, Pin,
-    PreconditionKind, TensorArg, TensorMut, TensorRef, U8, elf::sha256_hex,
+    Access, AlgoSource, Arch, Bf16, DType, DevicePtr, E4m3, E5m2, Element, Error, F16, F32, GemmLayout, I32, I64,
+    Manifest, Pin, PreconditionKind, TensorArg, TensorMut, TensorRef, U8, elf::sha256_hex,
 };
 
 fn gate_dir() -> PathBuf {
@@ -186,6 +186,8 @@ fn arg_of<'a>(buf: &'a mut Buf, dtype: &str, role: &str) -> Result<TensorArg<'a>
         "i32" => typed!(I32),
         "i64" => typed!(I64),
         "u8" => typed!(U8),
+        "e4m3" => typed!(E4m3),
+        "e5m2" => typed!(E5m2),
         other => panic!("the gate does not know the dtype {other}"),
     })
 }

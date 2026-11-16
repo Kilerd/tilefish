@@ -269,6 +269,34 @@ def test_an_ordered_mean_of_a_static_power_of_two_row_passes_the_contraction_che
             assert_same(got, want, f"two means at {combo}, seed {seed}")
 
 
+def _gather_half(x, idx):
+    h, _ = x.split(fg.DR, axis=-1)
+    return tilefish.gather_rows(h, idx, oob="clamp") + h
+
+
+@tilefish.graph
+def gather_half(x: Tensor[fg.R, 2 * fg.DR, f32], idx: Tensor[fg.R, i32]):
+    return _gather_half(x, idx)
+
+
+@tilefish.graph(fusion=fg.UNFUSED)
+def gather_half_unfused(x: Tensor[fg.R, 2 * fg.DR, f32], idx: Tensor[fg.R, i32]):
+    return _gather_half(x, idx)
+
+
+def test_a_view_gathered_from_is_read_at_its_rows():
+    """A view a region gathers rows of (and reads as an operand) is copied first: the fused plan, the unfused one and the reference agree."""
+    for combo in combos(gather_half):
+        for seed in (0, 1):
+            args = args_of(gather_half, combo, seed)
+            args[1] = torch.randint(0, combo["R"], (combo["R"],), dtype=torch.int32, device=CUDA)
+            got, want, _, _ = run_both(gather_half, gather_half_unfused, args)
+            assert_same(got, want, f"gathered view at {combo}")
+            ref = tilefish.run(gather_half, *args, mode="reference")
+            assert_same(got, [ref] if not isinstance(ref, tuple) else list(ref), f"gathered view at {combo} against the reference")
+    tilefish.verify_fusion(gather_half)
+
+
 NZ = Dim("NZ", buckets=[4096])
 
 

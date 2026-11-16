@@ -556,6 +556,8 @@ def _solo_reason(r: "Mapping[str, Any]") -> "tuple[str, str] | None":
     from ._fusion import reduction_reason
 
     ops = [n.get("op") for n in r.get("nodes") or []]
+    if len(ops) == 2 and ops == ["mul", "sum"]:  # an fma sum with its product (one unit in every grouping)
+        ops = ["sum"]
     if len(ops) != 1:
         return None
     ordered = any("order" in x for x in r.get("roundings") or [])

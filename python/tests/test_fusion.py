@@ -234,6 +234,8 @@ def test_an_fma_sum_and_its_product_are_one_unit_in_every_grouping():
     g = _fusion.fused(fma_v1)  # version 1 runs the sum alone: with its product
     assert ["mul", "sum"] in [ops_of(r, g) for r in g.regions]
     assert len(steps(fma_v1, R=8)) == 3
+    reasons = {b["reason"] for b in _fusion.boundaries(fma_v1)}
+    assert "reduction" in reasons and "grouping" not in reasons  # an edge into the product is an edge into the sum's region
 
 
 def test_a_row_region_reads_views_where_they_are():
@@ -262,6 +264,29 @@ def test_a_row_region_reads_views_where_they_are():
     assert {b["reason"] for b in _fusion.boundaries(half_mean_v1)} >= {"materialised", "reduction"}
     assert [x["entry"].split("_")[0] for x in steps(half_mean_v2, R=8, DR=96)] == ["fused"]
     assert not _fusion.boundaries(half_mean_v2)
+
+
+def test_a_view_gathered_from_is_copied_first():
+    """A gather addresses its table's rows by an index, contiguously: a view it reads is copied by tilefish.contiguous first, in the row template
+    (version 2) and in the elementwise one (both versions), even when the region also reads it as an operand."""
+
+    @tilefish.graph
+    def gather_half(x: Tensor[R, 2 * D, f32], idx: Tensor[R, i32]):
+        h, _ = x.split(D, axis=-1)
+        return tilefish.gather_rows(h, idx, oob="clamp") + h
+
+    s = steps(gather_half, R=8)
+    assert [x["entry"].split("_")[0] for x in s] == ["contiguous", "fused"]
+    src = _fusion.fused(gather_half).regions[0].kernel.lower().source
+    assert "_s0" not in src.split("def tf_")[1]
+
+    for version in (1, 2):
+        @tilefish.graph(fusion=tilefish.fusion(version=version))
+        def gather_column(x: Tensor[N, 2, f32], idx: Tensor[N, i32]):
+            return tilefish.gather_rows(x.select(1, 0), idx, oob="zero") * 2.0
+
+        want = ["contiguous", "fused", "fused"] if version == 1 else ["contiguous", "fused"]  # (version 1: the gather alone)
+        assert [x["entry"].split("_")[0] for x in steps(gather_column, N=1000)] == want, version
 
 
 def test_a_region_is_the_hand_written_kernel_of_its_ops_lowered_by_revision_2():
