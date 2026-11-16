@@ -859,6 +859,17 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-cuda-nvdisasm"
+version = "13.5.37"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/31/cc/2bb127b6043daf8f1685c227367f64577789a91f6bc3d8271ac08d78f723/nvidia_cuda_nvdisasm-13.5.37-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a3a8248074edb9fba63b74c38a5416b712a91ab09e70b8ab37186c3d293fc605", size = 5156579, upload-time = "2026-11-04T23:23:22.855Z" },
+    { url = "https://files.pythonhosted.org/packages/64/4a/c84a14209a549d97831a02d111d943f47c995d4d3beaa3416daa3b534abb/nvidia_cuda_nvdisasm-13.5.37-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:d3fdbdd49fa53e2e4aacd3db8259d052bd2b049ececdcb69e92e083c6728e7ca", size = 5170654, upload-time = "2026-11-04T23:23:28.577Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/d0/ce6612f79e40fc5c4fe8bccb764994ea0894be4425d0cf8932383f8f4805/nvidia_cuda_nvdisasm-13.5.37-py3-none-win_amd64.whl", hash = "sha256:aa42a3ecda8c58ff6ff2f9cbe1fc905d7f797a1ca4071941349fda114bf2a628", size = 5481227, upload-time = "2026-11-04T23:39:23.693Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/a2/8703fb4a138926b405333268c771ff2798debfc3b8094fdfc0a81f62d79b/nvidia_cuda_nvdisasm-13.5.37-py3-none-win_arm64.whl", hash = "sha256:93d069ab85936460323f4b180918398c06355df270d82b052161a807b60f983f", size = 5439578, upload-time = "2026-11-04T23:44:04.874Z" },
+]
+
+[[package]]
 name = "nvidia-cuda-nvrtc"
 version = "13.0.88"
 source = { registry = "https://pypi.org/simple" }
@@ -1230,6 +1241,9 @@ gpu = [
     { name = "triton", version = "3.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "triton", version = "3.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
+sass = [
+    { name = "nvidia-cuda-nvdisasm" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1239,10 +1253,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cuda-python", marker = "extra == 'gpu'", specifier = ">=12.8" },
+    { name = "nvidia-cuda-nvdisasm", marker = "extra == 'sass'", specifier = ">=13" },
     { name = "torch", marker = "extra == 'gpu'", specifier = ">=2.9" },
     { name = "triton", marker = "extra == 'gpu'", specifier = ">=3.5" },
 ]
-provides-extras = ["gpu"]
+provides-extras = ["gpu", "sass"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]

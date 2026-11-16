@@ -19,6 +19,9 @@ Repository = "https://github.com/Kilerd/tilefish"
 # Building cubins and running kernels (tilefish.aot.build, tilefish.run). The core package needs none of these,
 # and `import tilefish` never imports them.
 gpu = ["torch>=2.9", "triton>=3.5", "cuda-python>=12.8"]
+# CUDA 13's nvdisasm, which reads the SASS of every architecture tilefish builds for (Triton 3.5.1's bundled CUDA 12.8 one cannot decode sm_103): the
+# SASS assertions and tilefish-explain prefer it (docs/explain.md)
+sass = ["nvidia-cuda-nvdisasm>=13"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

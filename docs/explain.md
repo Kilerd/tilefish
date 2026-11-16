@@ -37,15 +37,21 @@ trace/
 ```
 
 * **Sources** are stored under the module-relative names the binary's debug information gives them (`kernels/mm.py`, `tilefish_generated/rmsnorm.py`,
-  `triton/language/standard.py`: `tilefish._source.source_name`), so a trace is read from any directory and on any machine. A name that is not one
-  (`TILEFISH_DEBUG_PATHS=absolute`) is not copied, and the index says so.
+  `triton/language/standard.py`: `tilefish._source.source_name`), so a trace is read from any directory and on any machine. Only files this process
+  holds are copied: a generated source, the file of the kernel's jit function, and the `__file__` of a module it has loaded whose module-relative name it
+  is. Nothing is searched for (not `sys.path`, not the working directory), and the files a prebuilt binary's PTX names are another build's: none is read.
+  A name that is not module-relative (`TILEFISH_DEBUG_PATHS=absolute`) is not copied either; the index says what was not.
+* **The trace holds source code.** Do not ship `trace/` with an export: it is for the people who build it, not for the hosts that run it.
 * **`nodes.json`** maps a line of a generated source to `{"node": <index in the kernel's graph>, "op": "mul", "loc": "model.py:17"}` (`loc`: the line of
   the `@tilefish.kernel` body, or of the graph body for a fused region, the op was written on), `{"what": "load x"}` for code of no op, and for the lines of a
   helper function (the inline PTX of a `mul.rn.f32`, a `cvt.rn.bf16.f32`) the op that calls it (`"helper": "_tf_mul_rn_f32"`). A fused region's entries
   carry `origin`, the op's position in the region; `graphs/<graph>.json` gives, per region, the op of the traced graph at each position (its index, as the
   fusion report numbers it, its op and its line), so a region that two graphs share is explained in each graph's terms.
 * **Where the SASS comes from**: the index entry's `"sass"` says which `nvdisasm` (version) read it and whether it is the binary's own SASS or the SASS of its
-  PTX assembled for the base of its family (`"proxy": true`, section 5).
+  PTX assembled for the base of its family (`"proxy": true`, and `"matches"`: whether that re-assembly has the binary's registers, stack frames and code
+  sizes, section 5); `"sass_checked"` says how the build judged the declaration's SASS assertions.
+* **`graphs/<graph>.json`** records the digest of the plan and of the manifest it describes; `tilefish-explain` ignores one of another plan (a later export
+  of the graph without a trace leaves it behind).
 
 **Outside the pinned artefact.** No manifest, plan or plan set names the trace and no digest covers it, so an export with or without it writes the same
 manifest and plans, byte for byte (checked on the whole GPU gate: section 6). A host never reads it. The build cache keeps binaries, not their IR, so a
@@ -145,7 +151,7 @@ The MMA of each architecture, as the recorded kernels show it (Triton 3.5.1, ptx
 @tilefish.extern(triton=mm_kernel, num_warps=8, grid=..., sass=tilefish.sass(
     no_tf32=True,                                  # no TF32 tensor-core MMA
     mma=["tcgen05.mma kind::f16", "UTCHMMA"],      # each used by at least one instruction
-    no_spills=True,                                # no LDL/STL
+    no_spills=True,                                # no local memory: no stack frame, no LDL/STL
     max_registers=168,                             # registers per thread, from the ELF file
     forbid=["atomic", "fp64", "ATOMG"],            # classes (section 3) or SASS opcode patterns
     by_arch={"sm_120": tilefish.sass(mma="HMMA.16816.F32", no_spills=False)},
@@ -160,17 +166,25 @@ is tilefish's and is covered by its tests.
 * **Patterns.** Lower case is a PTX pattern: its tokens (split on dots and spaces) appear in a PTX MMA opcode in order, the first two being the opcode's own
   (`"tcgen05.mma kind::f16"`, `"wgmma.mma_async bf16"`, `"mma.sync m16n8k16 bf16"`). Upper case is a SASS opcode pattern: the same opcode and the pattern's
   modifiers among the instruction's in order (`"HMMA.16816.F32"`, `"HGMMA.F32.BF16"`, `"UTCHMMA"`, `"LDL.64"`). On sm_100 and later say a tcgen05 kind in PTX.
-* **`no_tf32`** reads the PTX (`kind::tf32`, `.tf32`) and, when the SASS is read anyway or the binary has no PTX (a prebuilt cubin), the SASS (`.TF32`, or a
-  `UTCHMMA` whose descriptor says `kind::tf32`).
-* **`no_spills`** refuses any local-memory instruction, a spill or a local array, and names each (nvdisasm 13.x marks spills `SpillRefill`).
+* **`no_tf32`** reads the PTX (`kind::tf32`, `.tf32` of `tcgen05.mma`, `wgmma`, `wmma.mma` and `mma.sync`) and, when the SASS is read anyway or the binary
+  has no PTX (a prebuilt cubin), the SASS (`.TF32`, or a `UTCHMMA` whose descriptor says `kind::tf32`). In a cubin without PTX a `UTCHMMA` whose descriptor
+  the SASS does not set as a constant is `kind::f16` or `kind::tf32`, and which cannot be told: it is refused, with a message that says so.
+* **`no_spills`** is the ELF file's: the binary records no stack frame (`EIATTR_FRAME_SIZE` and the stack sizes), which catches a spill and a local array
+  whichever instruction reaches it (an `LD`/`ST` of a generic address as much as an `LDL`/`STL`), with no disassembly. A violation names the local-memory
+  instructions where the SASS can be read (nvdisasm 13.x marks spills `SpillRefill`); where the SASS is read anyway, an `LDL`/`STL` refuses too.
 * **`max_registers`** reads the ELF file of the binary itself (`EIATTR_REGCOUNT`), never a re-assembly.
 * **`by_arch`**: on an architecture with an entry, every field the entry says replaces the op's (`no_spills=False` there switches it off).
 * **Digest.** The assertions are in the declaration digest only when given (`sass=None` and `tilefish.sass()` leave every digest as it was); a region's name
   covers its fusion's assertions. They are not in a compile spec's document or a manifest entry (no schema changes): a spec read back gets them from
   `verify_against`.
+* **What is judged.** The entry and the functions it reaches through `CALL` (a `noinline` function, a subroutine of ptxas), every instruction of them:
+  each function's listing must have as many instructions as its code has 16-byte slots, or the build is refused (another nvdisasm format, an opcode or a
+  section the parser does not read: nothing is judged on a listing that does not cover the code, and an empty one never passes). Another `.entry` of a
+  multi-entry prebuilt binary is not judged with it, and the PTX checks read the entry and the `.func`s it calls.
 * **When.** At every build: a compile, a cache hit (the cache key does not cover them: the same IR under other assertions is judged again), a `jit` run's
-  build, every export, and a prebuilt binary's assembly. What needs only the PTX and the ELF file (`max_registers`, a PTX MMA pattern, `no_tf32` of a
-  binary with PTX) disassembles nothing; the rest reads the SASS (section 5), once per binary per process.
+  build, every export, and a prebuilt binary's assembly. What needs only the PTX and the ELF file (`max_registers`, `no_spills`, a PTX MMA pattern, `no_tf32`
+  of a binary with PTX) disassembles nothing; the rest reads the SASS (section 5), once per binary per process. `BuiltKernel.sass_checked` records what the
+  build read (`"its PTX and its ELF file"`, `"its SASS, read by nvdisasm 13.5.37"`, or a re-assembly whose code is the binary's).
 
 A violation refuses the build with every violated assertion, the instructions and their source lines, and where the SASS was read:
 
@@ -183,34 +197,47 @@ Refusing to build it: change the kernel (or its launch options) until its binary
 
 'spill_checked' (sass_kernels:spill_kernel) for sm_103 violates the SASS assertions of its declaration {"no_spills": true} (read in its SASS, read
 by nvdisasm 13.5.37):
-  - no_spills: 4618 local-memory instructions (spills or a local array; a stack frame of 4256 bytes per thread): /*0180*/ STL.64 [R1+0xa0], R4
-    (sass_kernels.py:79) [spill]; /*01b0*/ STL.64 [R1+0xa8], R6 (sass_kernels.py:79) [spill]; ... (4612 more)
+  - no_spills: local memory, spills or a local array: a stack frame of 4256 bytes per thread in its ELF file, 4618 local-memory instructions:
+    /*0180*/ STL.64 [R1+0xa0], R4 (sass_kernels.py:79) [spill]; /*01b0*/ STL.64 [R1+0xa8], R6 (sass_kernels.py:79) [spill]; ... (4612 more)
 ```
 
 The first needed no SASS (the PTX and the ELF file say it all), so it names no disassembler.
 
 ## 5. The disassembler
 
-The `nvdisasm` of the contraction check (`tilefish._fpcontract.nvdisasm_candidates`): `$TILEFISH_NVDISASM_PATH`, Triton's (`$TRITON_NVDISASM_PATH` or its
-bundled copy), the one next to its `ptxas`, an `nvidia-cuda-nvdisasm` wheel, then the `PATH` and `$CUDA_HOME/bin`; the first that decodes the architecture.
+The `nvdisasm` of the contraction check (`tilefish._fpcontract.nvdisasm_candidates`): `$TILEFISH_NVDISASM_PATH`, an `nvidia-cuda-nvdisasm` wheel's
+(`pip install 'tilefish[sass]'` installs CUDA 13's, which reads every architecture tilefish builds for), Triton's (`$TRITON_NVDISASM_PATH` or its bundled
+copy), the one next to its `ptxas`, then the `PATH` and `$CUDA_HOME/bin`; the first that decodes the architecture.
 The listing is `nvdisasm -c -g -gi` (the code, with line information and the lines an instruction was inlined at where `ptxas` has them) and the PTX lines
 `nvdisasm -c -gp`. The parser reads CUDA 12.8's and 13.x's listings: 12.8 prints scheduling annotations inside an sm_120 instruction (`&req={0}`,
 `?trans3`), 13.x notes after one (`(*"SpillRefill"*)`), an sm_90 listing names its target in its header flags.
 
-Triton 3.5.1 bundles CUDA 12.8's `nvdisasm`, which cannot decode sm_103. Where no `nvdisasm` decodes the architecture, the PTX is assembled again for the base
-of its family (`sm_100a` for `sm_103a`, `sm_120a` for `sm_121a`; the same instruction set) with the flags it was built with (`-lineinfo`, `--fmad=false`
-for `enable_fp_fusion=False`, `ptx_options`), and that SASS is read. Every message, view and trace entry says so ("the SASS of its PTX assembled again for
-sm_100a, the base of its family, read by nvdisasm 12.8.55, which cannot decode sm_103a"). The registers always come from the binary itself. `pip install
-nvidia-cuda-nvdisasm` (CUDA 13) or `TILEFISH_NVDISASM_PATH` reads sm_103 directly.
+Triton 3.5.1 bundles CUDA 12.8's `nvdisasm`, which cannot decode sm_103. Where no `nvdisasm` decodes the architecture, the PTX is assembled again for the
+base of its family (`sm_100a` for `sm_103a`, `sm_120a` for `sm_121a`; the same instruction set; only the member's `.target` is rewritten) by the `ptxas`
+and with the flags the binary was assembled with: Triton's (`TRITON_PTXAS_PATH` or its bundled one; `-lineinfo`, `--fmad=false` where the kernel does not
+contract, `-v`, `--opt-level 0` and `-g` with `disable_ptxas_opt`, `ptx_options`), or a prebuilt PTX's (`find_ptxas()`, `-lineinfo -v`). Its ELF file is then
+compared with the binary's: every function's registers, stack frame and code size.
+
+* **They match**: the SASS is judged on the re-assembly, and every message, view, trace entry and `BuiltKernel.sass_checked` says so ("the SASS of its PTX
+  assembled again for sm_100a, the base of its family, with the ptxas and the flags of the binary, read by nvdisasm 12.8.55, which cannot decode sm_103a:
+  judged on a re-assembly whose registers, stack frames and code sizes are the binary's").
+* **They do not** (measured: the one-warp softmax of `sass_kernels.py` has a 4264-byte stack frame and 211968 bytes of code for sm_100a, 4256 and 215936 for
+  sm_103a): an assertion that needs the SASS refuses the build, with the fix: `pip install 'tilefish[sass]'` (or `TILEFISH_NVDISASM_PATH`). A violation the
+  ELF file decided (`no_spills`, `max_registers`) is reported all the same, without naming instructions. A trace records the mismatch and explains the
+  re-assembly with a warning.
+
+The registers and the stack frame of an assertion always come from the binary itself. The disassemblies are kept per cubin, PTX, compile options, kind of
+build and list of `nvdisasm` candidates in this process. A failed `-gp` run leaves out the PTX lines and nothing else.
 
 ## 6. How it is tested
 
 * `python/tests/sass_fixtures/`: listings of four kernels (`tl.dot` in bf16 and in TF32, a kernel that spills, one with an atomic and f64 arithmetic) for
   sm_90, sm_100, sm_103 and sm_120, by CUDA 13.5's `nvdisasm` and, for sm_100 and sm_120, CUDA 12.8's; trimmed to windows around the instructions the tests
   look at (the line information and descriptor constants they are under are kept). `python/tests/record_sass_fixtures.py` records them again (Triton, no
-  GPU) and keeps its kernels on the lines the listings name. `test_sass.py` (parsing, classes, descriptors, the ELF attributes, the occupancy, the
-  declaration, every assertion, the refusal message, a cache hit judged again) and `test_explain.py` (traces and the views, with a fake compiler) run on
-  any machine.
+  GPU) and keeps its kernels on the lines the listings name. `test_sass.py` (parsing, classes, descriptors and their tracking, the call graph, the PTX of
+  one entry, the ELF attributes, the occupancy, the declaration, every assertion, the refusal message, a listing that does not cover the code, the choice of
+  disassembler, the re-assembly and its comparison, the cache, a cache hit judged again) and `test_explain.py` (traces and the views, with a fake compiler;
+  the sources a trace copies; a graph file of another plan) run on any machine.
 * `test_gpu_sass.py` on a device: a traced export of a Triton extern, a Gluon extern (`tcgen05_mma` on sm_100 and sm_103), a DSL kernel and a fused region,
   each with the manifest and plan of an export without a trace; the MMAs of `tl.dot` and of `tcgen05_mma` on their lines; each assertion met and violated;
   a cache hit refused; the registers and stack frame of the ELF file against the driver's (`cuFuncGetAttribute`); the family base on sm_103. It ran on

@@ -153,8 +153,22 @@ def test_the_sass_of_sm_103_is_read_from_the_family_base_where_no_nvdisasm_decod
     monkeypatch.setattr(_fpcontract, "nvdisasm_candidates", lambda: [bundled])  # Triton 3.5.1's: CUDA 12.8, which cannot decode sm_103
     out = runtime.export(mm_kernels.mm, tmp_path / "proxy", trace=True)
     e = explain.load(out.directory, "mm")
-    assert e.sass_label.startswith("the SASS of its PTX assembled again for sm_100a, the base of its family, read by nvdisasm 12.8")
+    assert e.sass_label.startswith(
+        "the SASS of its PTX assembled again for sm_100a, the base of its family, with the ptxas and the flags of the binary, read by nvdisasm 12.8"
+    )
     assert mma_rows(e) and {(r["file"], r["line"]) for r in mma_rows(e)} == {("mm_kernels.py", MM_DOT)}
+    # the assertions are judged on the re-assembly where its registers, stack frames and code sizes are the binary's, and refused otherwise
+    outcomes = {}
+    for op in (sk.mm_with(tilefish.sass(forbid="fp64"), name="mm_proxy"), sk.spill_with(tilefish.sass(forbid="fp64"), name="spill_proxy")):
+        try:
+            b = built(op)
+        except TilefishBuildError as err:
+            assert "which is not the binary" in str(err) and "pip install 'tilefish[sass]'" in str(err), str(err)
+            outcomes[op.name] = "refused"
+        else:
+            assert b.sass_checked.endswith("judged on a re-assembly whose registers, stack frames and code sizes are the binary's"), b.sass_checked
+            outcomes[op.name] = "judged"
+    assert outcomes["mm_proxy"] == "judged", outcomes  # the same ptxas and flags for the base of the family: the same code
 
 
 # -- the assertions ---------------------------------------------------------------------------------------------------------------------------
@@ -185,7 +199,11 @@ def test_a_kernel_that_meets_its_assertions_is_built():
         (sk.mm_with, tilefish.sass(mma="tcgen05.mma kind::f8f6f4", by_arch={"sm_120": tilefish.sass(mma="HMMA.16816.F32.BF16"),
                                                                            "sm_90": tilefish.sass(mma="HGMMA.F32.BF16")}),
          r"mma: it declares the (PTX|SASS) MMA"),
-        (sk.spill_with, tilefish.sass(no_spills=True), r"no_spills: \d+ local-memory instructions.*/\*[0-9a-f]{4}\*/ (STL|LDL)\S* .*\(sass_kernels\.py:\d+\)"),
+        # (the ELF file decides; the SASS names the instructions, where it can be read: on sm_103 with Triton's CUDA 12.8 nvdisasm this kernel's
+        # re-assembly for sm_100a has another stack frame and code size than the binary, measured, so it is not read)
+        (sk.spill_with, tilefish.sass(no_spills=True), r"no_spills: local memory, spills or a local array: a stack frame of \d+ bytes per thread in its ELF "
+         r"file(, \d+ local-memory instructions: /\*[0-9a-f]{4}\*/ (STL|LDL)\S* .*\(sass_kernels\.py:\d+\)| \(its SASS could not be read to name the "
+         r"instructions: .*which is not the binary)"),
         (sk.mm_with, tilefish.sass(max_registers=16), r"max_registers: the binary uses \d+ registers per thread, more than the 16 declared"),
         (sk.count_with, tilefish.sass(forbid="atomic"), r"forbid: \d+ instructions? of the class 'atomic'.*(RED|ATOM)\S* .*\(sass_kernels\.py:\d+\)"),
     ],

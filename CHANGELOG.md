@@ -31,10 +31,14 @@ Manifest schema 3, plan schema 1 and both hosts are unchanged, and so is every d
   every build, a cache hit and a prebuilt binary included, from the PTX (MMA kinds), the ELF file (registers) and the SASS; a violation refuses
   the build with the instructions and their source lines. `mma=` takes PTX patterns (`"tcgen05.mma kind::f16"`) and SASS opcode patterns
   (`"HMMA.16816.F32"`); `forbid=` instruction classes (`atomic`, `fp64`, `local`, ...) and opcode patterns.
-- **Disassembly** goes through the `nvdisasm` of the contraction check (`TILEFISH_NVDISASM_PATH`, Triton's, an `nvidia-cuda-nvdisasm` wheel,
-  the `PATH`); where none decodes the architecture (Triton 3.5.1's CUDA 12.8 tools on sm_103) the SASS of the PTX assembled for the family base
-  (`sm_100a`) is read and labelled so. The parser reads CUDA 12.8 and 13.x listings of sm_90, sm_100, sm_103 and sm_120 (recorded fixtures in
-  `python/tests/sass_fixtures`).
+- **Disassembly** goes through the `nvdisasm` of the contraction check (`TILEFISH_NVDISASM_PATH`, an `nvidia-cuda-nvdisasm` wheel, Triton's, the
+  `PATH`); the new extra `tilefish[sass]` installs CUDA 13's, which is preferred. Where none decodes the architecture (Triton 3.5.1's CUDA 12.8 tools
+  on sm_103) the PTX is assembled for the family base (`sm_100a`) by the binary's own ptxas and flags, and its SASS is judged only where its registers,
+  stack frames and code sizes are the binary's (else a build with assertions that need the SASS is refused with the fix); `BuiltKernel.sass_checked`
+  records what was read. `no_spills` and `max_registers` are decided from the binary's ELF file. A listing must cover every instruction of the code
+  it judges (the entry and the functions it calls, never a sibling entry), or nothing is judged. The parser reads CUDA 12.8 and 13.x listings of
+  sm_90, sm_100, sm_103 and sm_120 (recorded fixtures in `python/tests/sass_fixtures`).
+- **The trace holds source code** (only the files of modules the exporting process loaded; nothing is searched for): it is not to be shipped.
 - **Graph nodes record where they were written** (`Node.loc`, the module-relative file and line of the body) and a lowered kernel what each
   line of its source was written for (`LoweredKernel.line_map`); neither is printed, compared or in any digest or source.
 

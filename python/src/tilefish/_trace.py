@@ -9,15 +9,19 @@ by a script one does not edit) writes, for each binary it builds, ``trace/<stem>
   (:func:`tilefish._source.source_name`), so that the trace is read from any directory;
 * ``frontend.mlir`` (the IR the frontend built, with its locations), ``ttir.mlir``, ``ttgir.mlir``, ``llir.ll``, ``ptx.ptx``: what Triton made at
   each stage (a Gluon kernel has no TTIR; a prebuilt binary has its PTX, when it is one);
-* ``sass.txt``: the SASS, ``nvdisasm -c -g`` (line information in it), and ``lines.json``: the line table, for each instruction its address,
+* ``sass.txt``: the SASS, ``nvdisasm -c -g -gi`` (line information in it), and ``lines.json``: the line table, for each instruction its address,
   source file and line, and PTX line (``nvdisasm -gp``); where no ``nvdisasm`` decodes the architecture (sm_103 with Triton's bundled CUDA
-  12.8 tools) the SASS of the PTX assembled for the base of its family, which the index says (``"proxy": true``);
+  12.8 tools) the SASS of the PTX assembled for the base of its family, which the index says (``"proxy": true``, and ``"matches"``: whether
+  its registers, stack frames and code sizes are the binary's);
 * ``nodes.json`` for a lowered kernel or a fused region: what each line of the generated source was written for (the node of the kernel's
   graph, its op, the line of the body it was written on; for a fused region the op's position in the region).
 
 ``trace/graphs/<graph>.json`` says, for a graph, what each step of its plan launches and, for a fused region, the ops of the graph body it
 took and their lines. ``trace/index.json`` (``tilefish.trace.v1``) lists every file with its sha256, the manifest digest the trace is of and
 the sha256 of each binary, and its own digest (``trace_digest``) over all of it.
+
+**It holds source code.** The kernels' own files, the graph body's and Triton's are copied in (only files this process has loaded: nothing is
+searched for, and a prebuilt binary's are never read). Do not ship ``trace/`` with an export: it is for the people who build it.
 
 **Outside the pinned artefact.** Nothing in the manifest, a plan or a plan set names the trace, and no digest covers it: an export with or
 without it writes the same manifest and plans, byte for byte (a traced export compiles every Triton kernel instead of reading the build cache,
@@ -106,24 +110,27 @@ def _safe_name(name: str) -> bool:
 
 
 def _source_of(name: str, item: Item) -> "bytes | None":
-    """The bytes of the source file the debug information names ``name``: the generated source, the jit function's file, or the file under that
-    module-relative name on ``sys.path``."""
+    """The bytes of the source file the debug information names ``name``: the generated source, the jit function's file, or the file of a module
+    this process has loaded (``__file__``) whose module-relative name it is. Nothing is searched for (not ``sys.path``, not the working directory),
+    and a prebuilt binary's PTX names files of another build: none of them is read."""
     from ._source import function_file, module_of, source_name
 
+    if item.origin == "binary":
+        return None
     lowered = item.lowered
     if lowered is not None and getattr(lowered, "filename", None) == name:
         return lowered.source.encode("utf-8")
+    paths = []
     path = function_file(item.jit) if item.jit is not None else None
     if path is not None and source_name(path, module_of(item.jit)) == name:
+        paths.append(path)
+    for module_name, module in list(sys.modules.items()):
+        file = getattr(module, "__file__", None)
+        if isinstance(file, str) and file.endswith(".py") and source_name(file, module_name) == name:
+            paths.append(file)
+    for p in paths:
         try:
-            return pathlib.Path(path).read_bytes()
-        except OSError:
-            return None
-    for root in sys.path:
-        candidate = pathlib.Path(root or ".") / name
-        try:
-            if candidate.is_file():
-                return candidate.read_bytes()
+            return pathlib.Path(p).read_bytes()
         except OSError:
             continue
     return None
@@ -215,7 +222,7 @@ def write_kernel(root: pathlib.Path, item: Item) -> "dict[str, Any]":
     if b.ptxas_version:
         entry["ptxas"] = b.ptxas_version
     try:
-        d = _sass.disassemble(b.cubin, ptx=ptx or None, options=b.options)
+        d = _sass.disassemble(b.cubin, ptx=ptx or None, options=b.options, prebuilt=item.origin == "binary")
     except TilefishBuildError as e:
         problems.append(f"no SASS: {e}")
         entry["sass"] = {"error": str(e)}
@@ -223,6 +230,12 @@ def write_kernel(root: pathlib.Path, item: Item) -> "dict[str, Any]":
         put("sass.txt", d.text.encode("utf-8"))
         put("lines.json", _json(_line_table(d.listing)))
         entry["sass"] = {"target": d.target, "proxy": d.proxy, "nvdisasm": d.version, "label": d.label}
+        if d.proxy:  # a re-assembly for the family base: whether its registers, stack frames and code sizes are the binary's
+            entry["sass"]["matches"] = bool(d.matches)
+            if d.mismatch:
+                problems.append(f"the SASS is a re-assembly that is not the binary ({d.mismatch})")
+    if b.sass_checked:
+        entry["sass_checked"] = b.sass_checked  # how the build judged the declaration's SASS assertions
     entry["attributes"] = _sass.kernel_attributes(b.cubin, b.symbol)
     entry["launch"] = {"block": list(b.block), "shared": b.shared, "num_warps": b.num_warps}
     entry["files"] = dict(sorted(files.items()))
@@ -237,7 +250,14 @@ def graph_doc(graph: Any, plan: Any, plan_file: str) -> "dict[str, Any]":
     (their index, op and line) in the order of its kernel's body."""
     from . import _fusion
 
-    doc: "dict[str, Any]" = {"graph": graph.graph.name, "plan": plan_file, "buckets": [], "regions": {}}
+    doc: "dict[str, Any]" = {
+        "graph": graph.graph.name,
+        "plan": plan_file,
+        "plan_digest": plan.digest,  # the plan (and the manifest) this file describes: a reader ignores it for any other
+        "manifest_digest": plan.manifest_digest,
+        "buckets": [],
+        "regions": {},
+    }
     for b in plan.doc.get("buckets", []):
         steps = [{"index": k, "kind": s.get("kind"), "entry": s.get("entry")} for k, s in enumerate(b.get("steps", []))]
         doc["buckets"].append({"values": b.get("values", {}), "steps": steps})

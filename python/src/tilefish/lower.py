@@ -2305,7 +2305,9 @@ class _Body:
                 self.node(n, last_store)
         for k, v in enumerate(graph.outputs):
             if layout.cls[v] in (_FULL, _COL):
+                self.current = f"return value {k}"
                 self.emit(layout.store(self.out_names[k], v, self.var[v]), f"return value {k}")
+                self.current = None
         self.indent -= 1
         for n in args:
             v, bv, bi = carries[n]
@@ -2319,7 +2321,9 @@ class _Body:
                 self.node(n, last_store)
         for k, v in enumerate(graph.outputs):
             if layout.cls[v] not in (_FULL, _COL):
+                self.current = f"return value {k}"
                 self.emit(layout.store(self.out_names[k], v, self.var[v]), f"return value {k}")
+                self.current = None
         return self.lines
 
     def store(self, n: Node, last_store: "dict[str, Node]") -> None:

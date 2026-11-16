@@ -70,7 +70,7 @@ def listing(low, extra=()):
 
 
 def use_listing(monkeypatch, text, calls=None):
-    def disassemble(cubin, *, ptx=None, options=None):
+    def disassemble(cubin, *, ptx=None, options=None, prebuilt=False):
         if calls is not None:
             calls.append(hashlib.sha256(cubin).hexdigest())
         return _sass.Disassembly(text, "", _sass.parse_listing(text), "sm_103a", False, "/x/nvdisasm", "13.5.37", "sm_103a")
@@ -206,3 +206,41 @@ def test_the_diff_of_two_exports(fake, tmp_path, monkeypatch):
     text = explain.diff(explain.load(tmp_path / "a", "ex_scale"), explain.load(tmp_path / "b", "ex_scale"))
     assert "instructions: 4 -> 6" in text and "classes.local: 0 -> 1" in text and "spills.stores: 0 -> 1" in text
     assert f"      1 -> 3     {low.filename}:{line_of(low, 'mul')}  alu 1->2, local 0->1  | v1 = v0 * 2.0" in text
+
+
+def test_the_lines_of_a_row_walked_in_chunks_are_mapped():
+    import argmax_cases as ac
+
+    low = ac.argmax_bf16.lower()
+    lines = low.source.split("\n")
+    made = {lines[k - 1].strip(): m for k, m in enumerate(low.line_map, 1) if m}
+    store = next(text for text in made if text.startswith("tl.store(") and "return value 0" in text)
+    assert made[store] == {"what": "return value 0"}
+    combine = next(text for text in made if text.startswith("v0_bv, v0_bi = _tf_argmax_float("))
+    assert made[combine]["op"] == "argmax"
+
+
+def test_the_trace_copies_only_the_files_of_loaded_modules(tmp_path, monkeypatch):
+    (tmp_path / "ex_not_loaded.py").write_text("X = 1\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    item = _trace.Item(None, "extern")
+    assert _trace._source_of("ex_not_loaded.py", item) is None  # on sys.path and in the working directory, but never imported: not searched for
+    assert _trace._source_of("test_explain.py", item) == (HERE / "test_explain.py").read_bytes()  # a module this process loaded
+    assert _trace._source_of("test_explain.py", _trace.Item(None, "binary")) is None  # a prebuilt PTX's files are another build's
+
+
+def test_a_graph_trace_of_another_plan_or_outside_the_trace_is_not_used(fake, tmp_path, monkeypatch):
+    (region,) = _fusion.fused(ex_graph).regions
+    use_listing(monkeypatch, listing(region.kernel.lower()))
+    plan = runtime.export(ex_graph, tmp_path / "g", arch=ARCH, trace=True, verify=False)
+    trace = explain.Trace.load(tmp_path / "g")
+    assert trace.graph("ex_graph", plan.digest)["plan_digest"] == plan.digest
+    assert trace.graph("ex_graph", "0" * 64) is None  # (a later export of another plan of the graph)
+    index_path = tmp_path / "g" / "trace" / "index.json"
+    index = json.loads(index_path.read_text())
+    index["graphs"]["ex_graph"]["file"] = "../ex_graph.json"
+    index["trace_digest"] = _trace.index_digest(index)
+    index_path.write_text(json.dumps(index))
+    with pytest.raises(explain.TilefishExplainError, match="is not the one its index records"):
+        explain.Trace.load(tmp_path / "g").graph("ex_graph")

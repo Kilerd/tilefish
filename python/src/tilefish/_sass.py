@@ -51,6 +51,8 @@ _BODY = re.compile(r"^(@!?U?P[A-Z0-9]+\s+)?([A-Z][A-Z0-9_]*)((?:\.[A-Za-z0-9_]+)
 # scheduling annotations nvdisasm 12.8 prints inside an instruction (sm_120): ``&req={0}``, ``&wr=0x2``, ``?trans3``, ``?WAIT4_END_GROUP``
 _SCHED = re.compile(r"\s+(?:&\w+=\{?[^\s}]*\}?|\?[A-Za-z_][\w.]*)")
 _NOTE = re.compile(r'\(\*"([^"]*)"\*\)')
+_LABEL = re.compile(r"^\s*[.$\w]+:\s*$")  # ``.L_x_12:``, ``mm:``, ``.text.mm:``: the next instruction is a branch target (or a function's first)
+_CALL_TARGET = re.compile(r"`\(([^)`]+)\)")
 PTX_LINE_FILE = ".nv_debug_ptx_txt"  # the file ``nvdisasm -gp`` names: the PTX embedded in the cubin, whose lines are the PTX's
 
 
@@ -72,6 +74,7 @@ class Instruction:
     inlined: "tuple[tuple[str, int], ...]" = ()
     ptx_line: "int | None" = None
     notes: "tuple[str, ...]" = ()
+    labelled: bool = False  # a label is before it: a branch may land here
 
     @property
     def mnemonic(self) -> str:
@@ -120,12 +123,16 @@ def _parse(text: str) -> "tuple[str | None, dict[str, list[Instruction]]]":
     file: "str | None" = None
     line: "int | None" = None
     inlined: "tuple[tuple[str, int], ...]" = ()
-    for raw in text.splitlines():
+    labelled = False
+    for raw in text.split("\n"):
         s = _SECTION.match(raw)
         if s is not None:
             current = s.group(1)
             functions.setdefault(current, [])
-            file, line, inlined = None, None, ()
+            file, line, inlined, labelled = None, None, (), True
+            continue
+        if _LABEL.match(raw):
+            labelled = True
             continue
         li = _LINE_INFO.match(raw)
         if li is not None:
@@ -153,15 +160,31 @@ def _parse(text: str) -> "tuple[str | None, dict[str, list[Instruction]]]":
                 line=line,
                 inlined=inlined,
                 notes=notes,
+                labelled=labelled,
             )
         )
+        labelled = False
     return target, functions
 
 
+def reached(listing: Listing, symbol: str) -> "list[str]":
+    """The functions of a listing the kernel ``symbol`` runs: itself, then every function it reaches through ``CALL`` (a ``noinline`` function, a
+    subroutine of ptxas), in order; never another ``.entry`` of the binary (a kernel calls no kernel)."""
+    seen = [symbol] if symbol in listing.functions else []
+    todo = list(seen)
+    while todo:
+        for ins in listing.functions.get(todo.pop(0), ()):
+            if ins.opcode == "CALL":
+                for target in _CALL_TARGET.findall(ins.operands):
+                    if target in listing.functions and target not in seen:
+                        seen.append(target)
+                        todo.append(target)
+    return seen
+
+
 def kernel_instructions(listing: Listing, symbol: str) -> "tuple[Instruction, ...]":
-    """Every instruction of a binary's code: its kernel's function first, then any other function of the listing (a ``noinline`` function the
-    kernel calls, a subroutine ptxas added), which belong to the same binary."""
-    return listing.instructions(symbol) + tuple(i for name, f in listing.functions.items() if name != symbol for i in f)
+    """Every instruction the kernel ``symbol`` runs: its own function's, then those of the functions it calls (:func:`reached`)."""
+    return tuple(i for name in reached(listing, symbol) for i in listing.functions[name])
 
 
 def parse_listing(text: str, ptx_lines: "str | None" = None) -> Listing:
@@ -244,14 +267,15 @@ def class_of(ins: Instruction) -> str:
 # -- MMAs -------------------------------------------------------------------------------------------------------------------------------------
 
 _UMOV = re.compile(r"^(UR\d+),\s*(0x[0-9a-fA-F]+|\d+)$")
-_DEST = re.compile(r"^(U?R\d+|UP\d+)\b")
+_DEST = re.compile(r"^U?R(\d+)\b")
+_UDEST = re.compile(r"^UR(\d+)\b")
 _IDESC = re.compile(r"idesc\[(UR\d+)\]")
 # the type fields of a tcgen05 instruction descriptor (PTX ISA, "Instruction descriptor"), per SASS opcode: kind::f16 and kind::tf32 are UTCHMMA,
 # kind::f8f6f4 is UTCQMMA, kind::i8 is UTCIMMA; the D type is bits 4-5, A bits 7-9, B bits 10-12, N >> 3 bits 17-22, M >> 4 bits 24-28
 _ATYPES = {"UTCHMMA": {0: "f16", 1: "bf16", 2: "tf32"}, "UTCQMMA": {0: "e4m3", 1: "e5m2", 3: "e2m3", 4: "e3m2", 5: "e2m1"}, "UTCIMMA": {0: "u8", 1: "s8"}}
 _KINDS = {"UTCHMMA": {"f16": "f16", "bf16": "f16", "tf32": "tf32"}, "UTCQMMA": "f8f6f4", "UTCIMMA": "i8"}
 _DTYPES = {0: "f16", 1: "f32", 2: "s32"}
-_PTX_MMA = re.compile(r"(?<![\w.])(tcgen05\.mma[\w.:]*|wgmma\.mma_async[\w.:]*|mma(?:\.sp(?:::ordered_metadata)?)?\.sync[\w.:]*)")
+_PTX_MMA = re.compile(r"(?<![\w.])(tcgen05\.mma[\w.:]*|wgmma\.mma_async[\w.:]*|wmma\.mma[\w.:]*|mma(?:\.sp(?:::ordered_metadata)?)?\.sync[\w.:]*)")
 _SASS_SHAPE = re.compile(r"^(?:\d+x\d+x\d+|\d{3,5})$")
 
 
@@ -270,10 +294,12 @@ def decode_idesc(opcode: str, value: int) -> "dict[str, Any] | None":
 def mma_descriptors(instructions: "Sequence[Instruction]") -> "dict[int, dict[str, Any]]":
     """For each ``UTC*MMA`` of a function (by address) whose instruction descriptor the listing sets as a constant (``UMOV UR27, 0x8210490``
     before it, nothing writing the register in between), what the descriptor says (:func:`decode_idesc`). Best effort: a descriptor computed at
-    run time, or set on another path, is not found."""
+    run time, set on another path (the constants are forgotten at every label, where a branch may land) or written in part, is not found."""
     consts: "dict[str, int]" = {}
     out: "dict[int, dict[str, Any]]" = {}
     for ins in instructions:
+        if ins.labelled:
+            consts.clear()
         if ins.opcode.startswith("UTC") and ins.opcode.endswith("MMA"):
             m = _IDESC.search(ins.operands)
             if m is not None and m.group(1) in consts:
@@ -281,14 +307,16 @@ def mma_descriptors(instructions: "Sequence[Instruction]") -> "dict[int, dict[st
                 if found is not None:
                     out[ins.address] = found
             continue
-        if ins.opcode == "UMOV" and not ins.predicate:
+        if ins.opcode == "UMOV" and not ins.predicate and not ins.modifiers:
             u = _UMOV.match(ins.operands)
             if u is not None:
                 consts[u.group(1)] = int(u.group(2), 0)
                 continue
-        d = _DEST.match(ins.operands)
-        if d is not None:
-            consts.pop(d.group(1), None)
+        d = _UDEST.match(ins.operands)
+        if d is not None:  # a write of a uniform register: of two or four with .64 or .128 (LDCU.64 UR4: UR4 and UR5)
+            width = 4 if "128" in ins.modifiers else 2 if "64" in ins.modifiers else 1
+            for k in range(int(d.group(1)), int(d.group(1)) + width):
+                consts.pop(f"UR{k}", None)
     return out
 
 
@@ -303,14 +331,14 @@ def is_tf32_mma(ins: Instruction, descriptor: "Mapping[str, Any] | None" = None)
 
 
 def is_tf32_ptx(opcode: str) -> bool:
-    """Whether a PTX MMA opcode multiplies TF32: ``tcgen05.mma ... kind::tf32``, ``wgmma ... .tf32``, ``mma.sync ... .tf32``."""
+    """Whether a PTX MMA opcode multiplies TF32: ``tcgen05.mma ... kind::tf32``, ``wgmma ... .tf32``, ``wmma.mma ... .tf32``, ``mma.sync ... .tf32``."""
     return "kind::tf32" in opcode if opcode.startswith("tcgen05") else ".tf32" in opcode
 
 
 def ptx_instructions(ptx: str) -> "list[tuple[int, str]]":
     """The MMA instructions of a PTX text: ``(line, opcode)``, line from 1, comments skipped."""
     out = []
-    for n, line in enumerate(ptx.splitlines(), 1):
+    for n, line in enumerate(ptx.split("\n"), 1):  # (not splitlines: a form feed in a comment must not move the line numbers)
         code = line.split("//", 1)[0]
         for m in _PTX_MMA.finditer(code):
             out.append((n, m.group(1)))
@@ -323,10 +351,10 @@ _PTX_FILE = re.compile(r'^\s*\.file\s+(\d+)\s+"([^"]*)"')
 
 def ptx_locations(ptx: str) -> "dict[int, tuple[str, int]]":
     """The source line of each line of a PTX text (from 1): the file and line of the last ``.loc`` before it (line 0 is no line)."""
-    files = {m.group(1): m.group(2) for m in (_PTX_FILE.match(x) for x in ptx.splitlines()) if m}
+    files = {m.group(1): m.group(2) for m in (_PTX_FILE.match(x) for x in ptx.split("\n")) if m}
     out: "dict[int, tuple[str, int]]" = {}
     current: "tuple[str, int] | None" = None
-    for n, line in enumerate(ptx.splitlines(), 1):
+    for n, line in enumerate(ptx.split("\n"), 1):
         m = _PTX_LOC.match(line)
         if m is not None:
             current = (files.get(m.group(1), f"file {m.group(1)}"), int(m.group(2))) if int(m.group(2)) > 0 else None
@@ -334,6 +362,59 @@ def ptx_locations(ptx: str) -> "dict[int, tuple[str, int]]":
         if current is not None:
             out[n] = current
     return out
+
+
+_PTX_FUNC = re.compile(r"^\s*(?:\.(?:visible|weak|extern)\s+)*\.(entry|func)\b(?:\s*\([^)]*\))?\s*([\w$]+)")
+_PTX_CALL = re.compile(r"\bcall(?:\.uni)?\s+(?:\([^)]*\)\s*,\s*)?([\w$]+)")
+
+
+def ptx_for_entry(ptx: str, symbol: str) -> str:
+    """``ptx`` with the bodies of every function the entry ``symbol`` does not reach (another ``.entry``, a ``.func`` it never calls) blanked, the
+    lines kept in place (so the line numbers, the ``.file`` and the ``.loc`` directives are the PTX's); ``ptx`` itself when it has no such entry."""
+    lines = ptx.split("\n")
+    bodies: "dict[str, tuple[int, int]]" = {}
+    kinds: "dict[str, str]" = {}
+    k = 0
+    while k < len(lines):
+        m = _PTX_FUNC.match(lines[k])
+        if m is None:
+            k += 1
+            continue
+        depth, opened, start, end = 0, False, k, None
+        for j in range(k, len(lines)):
+            code = lines[j].split("//", 1)[0]
+            if not opened and "{" not in code and code.rstrip().endswith(";"):
+                break  # a prototype: no body
+            for ch in code:
+                if ch == "{":
+                    depth, opened = depth + 1, True
+                elif ch == "}":
+                    depth -= 1
+            if opened and depth == 0:
+                end = j
+                break
+        if end is None:
+            k += 1
+            continue
+        bodies[m.group(2)] = (start, end)
+        kinds[m.group(2)] = m.group(1)
+        k = end + 1
+    if kinds.get(symbol) != "entry":
+        return ptx
+    keep = [symbol]
+    todo = [symbol]
+    while todo:
+        s, e = bodies[todo.pop()]
+        for line in lines[s : e + 1]:
+            for callee in _PTX_CALL.findall(line.split("//", 1)[0]):
+                if callee in bodies and callee not in keep:
+                    keep.append(callee)
+                    todo.append(callee)
+    for name, (s, e) in bodies.items():
+        if name not in keep:
+            for j in range(s, e + 1):
+                lines[j] = ""
+    return "\n".join(lines)
 
 
 # -- what the ELF file says --------------------------------------------------------------------------------------------------------------------
@@ -391,7 +472,7 @@ def kernel_attributes(cubin: bytes, symbol: str) -> "dict[str, Any]":
     elf = parse_elf(cubin)
     out: "dict[str, Any]" = {"sm": sm_of(elf)}
     text = elf.section(f".text.{symbol}")
-    if text is not None:
+    if text is not None and text.info >> 24:  # (an older layout; EIATTR_REGCOUNT below says it where it is)
         out["registers"] = text.info >> 24
     symbols = _symbols(elf)
     info = elf.section(".nv.info")
@@ -413,24 +494,56 @@ def kernel_attributes(cubin: bytes, symbol: str) -> "dict[str, Any]":
                 out[name] = struct.unpack("<H", value)[0]
             elif fmt == 4 and len(value) >= 12:
                 out[name] = list(struct.unpack_from("<III", value))
-    out["static_shared"] = shared_sizes(elf, symbol)[0]
+    declared = shared_sizes(elf, symbol)[0]
+    sm = out["sm"] or 0
+    # the .nv.shared.<symbol> section of sm_90 and later holds the 1024 bytes the system reserves per block too (a Triton kernel's is those 1024
+    # bytes alone, a hand-written one with 4096 bytes of static shared memory has 5120: tilefish._elf.shared_sizes); the reserve is counted once,
+    # by the occupancy estimate
+    out["static_shared"] = max(0, declared - SHARED_RESERVE) if sm >= 90 else declared
+    out["local"] = max(out.get(k, 0) or 0 for k in ("frame_size", "min_stack_size", "max_stack_size"))
+    return out
+
+
+SHARED_RESERVE = 1024  # the shared memory the system reserves per block on sm_90 and later
+
+
+def code_shape(cubin: bytes) -> "dict[str, tuple[int, int, int]]":
+    """For every function of a cubin (``.text.<name>``): its registers, stack frame and code size, what a re-assembly must have to stand for the
+    binary (:func:`disassemble`)."""
+    from ._elf import parse_elf
+
+    elf = parse_elf(cubin)
+    symbols = _symbols(elf)
+    found: "dict[int, dict[str, int]]" = {0x2F: {}, 0x11: {}}  # EIATTR_REGCOUNT and EIATTR_FRAME_SIZE, per function
+    info = elf.section(".nv.info")
+    if info is not None:
+        for fmt, attr, value in _nv_info(elf.data(info)):
+            if fmt == 4 and attr in found and len(value) >= 8:
+                index, v = struct.unpack_from("<II", value)
+                found[attr][symbols.get(index, "")] = v
+    out = {}
+    for s in elf.sections:
+        if s.name.startswith(".text."):
+            name = s.name[len(".text.") :]
+            out[name] = (found[0x2F].get(name, s.info >> 24), found[0x11].get(name, 0), s.size)
     return out
 
 
 # -- occupancy (an estimate) ------------------------------------------------------------------------------------------------------------------
 
-# per SM: registers, warps, resident blocks, shared memory a block may take (bytes), and the shared memory the system reserves per block
+# per SM: registers, warps, resident blocks, shared memory (bytes), and the shared memory the system reserves per block
 _LIMITS = {
-    90: (65536, 64, 32, 233472, 1024),
-    100: (65536, 64, 32, 233472, 1024),
-    103: (65536, 64, 32, 233472, 1024),
-    120: (65536, 48, 32, 101376, 1024),
+    90: (65536, 64, 32, 233472, SHARED_RESERVE),
+    100: (65536, 64, 32, 233472, SHARED_RESERVE),
+    103: (65536, 64, 32, 233472, SHARED_RESERVE),
+    120: (65536, 48, 32, 102400, SHARED_RESERVE),
 }
 
 
 def occupancy(arch: int, registers: int, threads: int, shared: int) -> "dict[str, Any] | None":
     """An estimate of the blocks and warps per SM a launch of ``threads`` threads with ``registers`` per thread and ``shared`` bytes of shared
-    memory gets on ``arch`` (registers allocated per warp in units of 256), and what limits it; ``None`` for an architecture this does not know.
+    memory (static and dynamic, without the system's reserve, which is added once per block) gets on ``arch`` (registers allocated per warp in
+    units of 256), and what limits it; ``None`` for an architecture this does not know.
     Not the driver's figure (``cudaOccupancyMaxActiveBlocksPerMultiprocessor``): what the attributes allow."""
     limits = _LIMITS.get(arch)
     if limits is None or threads <= 0:
@@ -442,7 +555,7 @@ def occupancy(arch: int, registers: int, threads: int, shared: int) -> "dict[str
         "registers": regs_sm // (per_warp * warps) if per_warp * warps else blocks_sm,
         "warps": warps_sm // warps,
         "blocks": blocks_sm,
-        "shared": smem_sm // (shared + reserved) if shared else blocks_sm,
+        "shared": smem_sm // (shared + reserved),
     }
     blocks = min(by.values())
     return {
@@ -674,13 +787,9 @@ class SassChecks:
         return json.dumps(self.canonical(), sort_keys=True)
 
     def needs_sass(self, has_ptx: bool) -> bool:
-        """Whether judging a binary needs its SASS (an ``nvdisasm``), not only its PTX and its ELF file."""
-        return bool(
-            self.no_spills
-            or self.forbid
-            or any(_SASS_PATTERN.fullmatch(p) for p in self.mma or ())
-            or (self.no_tf32 and not has_ptx)
-        )
+        """Whether judging a binary needs its SASS (an ``nvdisasm``), not only its PTX and its ELF file (``no_spills`` and ``max_registers`` are
+        the ELF file's)."""
+        return bool(self.forbid or any(_SASS_PATTERN.fullmatch(p) for p in self.mma or ()) or (self.no_tf32 and not has_ptx))
 
 
 def sass(
@@ -701,7 +810,8 @@ def sass(
       among the opcode's in order (``"tcgen05.mma kind::f16"``, ``"wgmma.mma_async bf16"``, ``"mma.sync m16n8k16 bf16"``); upper case a SASS
       opcode pattern (``"HMMA.16816.F32.BF16"``, ``"HGMMA.64x128x16.F32"``, ``"UTCHMMA"``). On sm_100 and later the SASS of a tcgen05 MMA does not
       spell its kind: say it in PTX.
-    * ``no_spills=True``: no local-memory load or store (``LDL``, ``STL``): no spill, and no local array.
+    * ``no_spills=True``: no local memory: the ELF file of the binary records no stack frame (a spill, or a local array, whichever instruction
+      reaches it), and no ``LDL``/``STL`` where the SASS is read.
     * ``max_registers=128``: the registers per thread the ELF file records are at most that.
     * ``forbid=("atomic", "fp64", "ATOMG")``: no instruction of these classes (:data:`CLASSES`) or opcode patterns.
     * ``by_arch={"sm_120": tilefish.sass(mma="HMMA.16816.F32.BF16")}``: per architecture, every field it says replaces the op's (``no_spills=False``
@@ -787,7 +897,8 @@ def evaluate(
 ) -> "list[Violation]":
     """Judge one binary against the assertions of its architecture (``checks``, after :meth:`SassChecks.for_arch`): its PTX (``None`` for a
     prebuilt cubin), its ELF attributes (:func:`kernel_attributes`) and, when the assertions need them (:meth:`SassChecks.needs_sass`), the SASS
-    instructions of its function (``instructions``, called once). Pure; returns every violation."""
+    instructions of its code (``instructions``, called once; a failure to read them is raised, except where it only names the instructions of a
+    violation the ELF file decided). Pure; returns every violation."""
     out: "list[Violation]" = []
     sass_ins: "Sequence[Instruction] | None" = None
 
@@ -808,13 +919,25 @@ def evaluate(
     if checks.no_tf32:
         in_ptx = _ptx_where(ptx, [(n, op) for n, op in ptx_instructions(ptx) if is_tf32_ptx(op)]) if ptx is not None else ()
         in_sass: "tuple[str, ...]" = ()
+        undecided: "tuple[str, ...]" = ()
         if ptx is None or checks.needs_sass(True):  # the PTX spells every kind; the SASS is read when it is read anyway, or is all there is
             ins = get()
             descriptors = mma_descriptors(ins)
             in_sass = tuple(i.describe() for i in ins if is_tf32_mma(i, descriptors.get(i.address)))
+            if ptx is None:  # a UTCHMMA is kind::f16 or kind::tf32, and only its descriptor says which
+                undecided = tuple(i.describe() for i in ins if i.opcode == "UTCHMMA" and i.address not in descriptors)
         if in_ptx or in_sass:
             counts = [f"{len(x)} in its {w}" for x, w in ((in_ptx, "PTX"), (in_sass, "SASS")) if x]
             out.append(Violation("no_tf32", f"TF32 tensor-core MMAs, which keep 10 of the 23 bits of each f32 mantissa ({', '.join(counts)})", in_ptx + in_sass))
+        if undecided:
+            out.append(
+                Violation(
+                    "no_tf32",
+                    f"{len(undecided)} UTCHMMA (kind::f16 or kind::tf32) whose instruction descriptor the SASS does not set as a constant, in a binary "
+                    "without PTX: whether it multiplies TF32 cannot be told, so it is not taken to be exact (declare the binary as PTX)",
+                    undecided,
+                )
+            )
     if checks.mma:
         for p in checks.mma:
             if _SASS_PATTERN.fullmatch(p):
@@ -829,18 +952,20 @@ def evaluate(
                 elif not any(ptx_pattern_matches(p, op) for op in ops):
                     out.append(Violation("mma", f"it declares the PTX MMA {p!r}, and the PTX has none: its MMAs are {sorted(set(ops)) or 'none'}"))
     if checks.no_spills:
-        local = [i for i in get() if class_of(i) == "local"]
-        if local:
-            frame = attributes.get("frame_size")
-            out.append(
-                Violation(
-                    "no_spills",
-                    f"{len(local)} local-memory instruction{'s' if len(local) != 1 else ''} (spills or a local array"
-                    + (f"; a stack frame of {frame} bytes per thread" if frame else "")
-                    + ")",
-                    tuple(i.describe() + (" [spill]" if "SpillRefill" in i.notes else "") for i in local),
-                )
-            )
+        local_bytes = int(attributes.get("local", 0) or 0)
+        named: "tuple[str, ...]" = ()
+        unread = ""
+        if local_bytes or checks.needs_sass(ptx is not None):  # (the ELF file decides; the SASS names the instructions)
+            try:
+                named = tuple(i.describe() + (" [spill]" if "SpillRefill" in i.notes else "") for i in get() if class_of(i) == "local")
+            except TilefishBuildError as e:
+                if not local_bytes:
+                    raise
+                unread = f" (its SASS could not be read to name the instructions: {e})"
+        if local_bytes or named:
+            what = f"a stack frame of {local_bytes} bytes per thread in its ELF file" if local_bytes else "no stack frame in its ELF file"
+            count = f", {len(named)} local-memory instruction{'s' if len(named) != 1 else ''}" if named else ""
+            out.append(Violation("no_spills", f"local memory, spills or a local array: {what}{count}{unread}", named))
     for p in checks.forbid or ():
         ins = get()
         hit = [i for i in ins if (class_of(i) == p if p in CLASSES else sass_pattern_matches(p, i))]
@@ -852,12 +977,15 @@ def evaluate(
 
 # -- the disassembler -------------------------------------------------------------------------------------------------------------------------
 
+INSTALL = "install a CUDA 13 nvdisasm, which reads sm_103: pip install 'tilefish[sass]' (nvidia-cuda-nvdisasm), or set TILEFISH_NVDISASM_PATH"
+
 
 @dataclass(frozen=True)
 class Disassembly:
-    """The SASS of a binary: the ``nvdisasm -c -g`` listing (``text``), its ``-c -gp`` listing (``ptx_text``: the PTX line of each instruction),
-    both parsed (``listing``), the target they were read for, whether that is a re-assembly for the base of the family (``proxy``), and the
-    ``nvdisasm`` (its path and version)."""
+    """The SASS of a binary: the ``nvdisasm -c -g -gi`` listing (``text``), its ``-c -gp`` listing (``ptx_text``: the PTX line of each instruction;
+    empty when that run failed), both parsed (``listing``), the target they were read for, whether that is a re-assembly for the base of the family
+    (``proxy``) and, for one, whether its registers, stack frames and code sizes are the binary's (``matches``; ``mismatch`` says how not), the
+    ``nvdisasm`` (its path and version), and the size of the code of each function of what was read (``code_sizes``)."""
 
     text: str
     ptx_text: str
@@ -867,16 +995,22 @@ class Disassembly:
     nvdisasm: str
     version: str
     binary_target: str = ""
+    matches: "bool | None" = None
+    mismatch: str = ""
+    code_sizes: "Mapping[str, int]" = field(default_factory=dict)
 
     @property
     def label(self) -> str:
         """How a message or a view says where the SASS comes from."""
         tool = f"nvdisasm {self.version}" if self.version else self.nvdisasm
         if self.proxy:
-            return (
-                f"the SASS of its PTX assembled again for {self.target}, the base of its family, read by {tool}, which cannot decode "
-                f"{self.binary_target or 'the binary'} (set TILEFISH_NVDISASM_PATH to an nvdisasm that can: CUDA 12.9 or later for sm_103)"
+            reassembly = (
+                f"the SASS of its PTX assembled again for {self.target}, the base of its family, with the ptxas and the flags of the binary, read by "
+                f"{tool}, which cannot decode {self.binary_target or 'the binary'}"
             )
+            if self.matches:
+                return f"{reassembly}: judged on a re-assembly whose registers, stack frames and code sizes are the binary's"
+            return f"{reassembly}, and which is not the binary ({self.mismatch})"
         return f"its SASS, read by {tool}"
 
 
@@ -895,20 +1029,71 @@ def nvdisasm_version(path: str) -> str:
     return m.group(1) if m else ""
 
 
-def proxy_flags(options: "Mapping[str, Any]") -> "list[str]":
-    """The ``ptxas`` flags of Triton 3.5.1's ``make_cubin`` that change code generation, with line information: ``-lineinfo``, ``--fmad=false``
-    for ``enable_fp_fusion=False``, and ``ptx_options``. (``maxnreg`` is a directive of the PTX.)"""
-    flags = ["-lineinfo"]
-    if options.get("enable_fp_fusion") is False:
-        flags.append("--fmad=false")
+def triton_ptxas_flags(options: "Mapping[str, Any]") -> "list[str]":
+    """The flags Triton 3.5.1's ``make_cubin`` gives ``ptxas`` for a kernel compiled with ``options`` (before ``--gpu-name``): the line information
+    (``-lineinfo``; ``-lineinfo -suppress-debug-info`` with ``knobs.compilation.disable_line_info``; ``-g`` with ``knobs.nvidia.disable_ptxas_opt``),
+    ``--fmad=false`` where the kernel does not contract (``enable_fp_fusion``, else ``knobs.language.default_fp_fusion``), ``-v``, ``--opt-level 0``
+    with ``disable_ptxas_opt``, and ``ptx_options``. Without Triton the knobs are their defaults."""
+    knobs: Any = None
+    try:
+        import triton
+
+        knobs = triton.knobs
+    except Exception:  # noqa: BLE001 - no Triton (or one without knobs): the defaults
+        pass
+
+    def knob(group: str, name: str, default: Any) -> Any:
+        try:
+            return getattr(getattr(knobs, group), name)
+        except Exception:  # noqa: BLE001
+            return default
+
+    no_line_info = bool(knob("compilation", "disable_line_info", False))
+    no_opt = bool(knob("nvidia", "disable_ptxas_opt", False))
+    debug = ["-lineinfo", "-suppress-debug-info"] if no_line_info else ["-g"] if no_opt else ["-lineinfo"]
+    fused = options.get("enable_fp_fusion")
+    if fused is None:
+        fused = bool(knob("language", "default_fp_fusion", True))
+    flags = [*debug, *([] if fused else ["--fmad=false"]), "-v", *(["--opt-level", "0"] if no_opt else [])]
     extra = options.get("ptx_options")
     if extra:
         flags += str(extra).split()
     return flags
 
 
+def proxy_flags(options: "Mapping[str, Any]") -> "list[str]":
+    """The ``ptxas`` flags a Triton kernel compiled with ``options`` was assembled with (:func:`triton_ptxas_flags`)."""
+    return triton_ptxas_flags(options)
+
+
+def _assembler(prebuilt: bool, options: "Mapping[str, Any]") -> "tuple[str, list[str]]":
+    """The ``ptxas`` and the flags the binary was assembled with: a prebuilt PTX's (:func:`tilefish._binary.find_ptxas`, ``PTX_FLAGS``) or Triton's."""
+    if prebuilt:
+        from ._binary import PTX_FLAGS, find_ptxas
+
+        return find_ptxas(), list(PTX_FLAGS)
+    from . import _fpcontract
+
+    return _fpcontract.ptxas_path(), triton_ptxas_flags(options)
+
+
+def _assemble(ptxas: str, ptx: str, target: str, flags: "Sequence[str]") -> bytes:
+    """``ptx`` assembled by ``ptxas`` for ``target`` with ``flags``, in an empty directory (ptxas would record a source file it found there)."""
+    import pathlib
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="tilefish-sass-") as d:
+        src, out, cwd = pathlib.Path(d) / "k.ptx", pathlib.Path(d) / "k.cubin", pathlib.Path(d) / "cwd"
+        cwd.mkdir()
+        src.write_text(ptx)
+        r = subprocess.run([ptxas, *flags, f"--gpu-name={target}", str(src), "-o", str(out)], capture_output=True, text=True, cwd=cwd)
+        if r.returncode != 0:
+            raise TilefishBuildError(f"ptxas could not assemble the PTX for {target}: {r.stderr.strip()[:2000]}")
+        return out.read_bytes()
+
+
 _cache_lock = threading.Lock()
-_disassemblies: "dict[tuple[str, str], Disassembly]" = {}
+_disassemblies: "dict[tuple[Any, ...], Disassembly]" = {}
 
 
 def _target_of(cubin: bytes, ptx: "str | None") -> str:
@@ -925,82 +1110,123 @@ def _target_of(cubin: bytes, ptx: "str | None") -> str:
 
 # the base of a family, whose instruction set an architecture shares: the target a PTX is assembled for where no nvdisasm decodes its own
 _PROXY_BASE = {"sm_103a": "sm_100a", "sm_103f": "sm_100f", "sm_103": "sm_100", "sm_121a": "sm_120a", "sm_121f": "sm_120f", "sm_121": "sm_120"}
-
-
-_PTX_VERSION = re.compile(r"^(\s*\.version\s+)(\d+)\.(\d+)", re.M)
-_MIN_PTX_VERSION = {"sm_100": (8, 6), "sm_120": (8, 7)}  # the first PTX ISA with the target (a family base, and its a/f forms)
-
-
-def retarget(ptx: str, base: str) -> str:
-    """``ptx`` with its ``.target`` the family base ``base``, and its ``.version`` raised to the first PTX ISA that has that target where it is older
-    (a prebuilt PTX of ``.version 7.0`` / ``.target sm_80`` assembled for sm_103: ptxas refuses ``.target sm_100`` below 8.6). Nothing else changes."""
-    out = _TARGET_LINE.sub(lambda t: t.group(1) + base, ptx, count=1)
-    need = _MIN_PTX_VERSION.get(re.sub(r"[af]$", "", base))
-    m = _PTX_VERSION.search(out)
-    if need is not None and m is not None and (int(m.group(2)), int(m.group(3))) < need:
-        out = _PTX_VERSION.sub(lambda v: f"{v.group(1)}{need[0]}.{need[1]}", out, count=1)
-    return out
-
-
 _TARGET_LINE = re.compile(r"^(\s*\.target\s+)(sm_[0-9]+[a-z]?)", re.M)
 
 
-def disassemble(cubin: bytes, *, ptx: "str | None" = None, options: "Mapping[str, Any] | None" = None) -> Disassembly:
-    """The SASS of ``cubin`` with line information (``nvdisasm -c -g`` and ``-c -gp``), by the first ``nvdisasm`` that decodes its architecture
-    (:func:`tilefish._fpcontract.nvdisasm_candidates`). Where none does, ``ptx`` (the binary's PTX) is assembled for the base of the family
-    (``sm_100a`` for ``sm_103a``) with the flags it was built with (``options``: :func:`proxy_flags`) and that is read (``proxy``). Kept per
-    cubin in this process. Raises :class:`~tilefish.errors.TilefishBuildError` when nothing can read it."""
+def retarget(ptx: str, base: str) -> str:
+    """``ptx`` to assemble for the family base ``base``: a ``.target`` of the family's member (``sm_103a``, ``sm_103f``, ``sm_103``) becomes the base's,
+    with the same suffix; an older target (a prebuilt PTX of ``.target sm_80``) is left as it is, ptxas assembles it for any newer ``--gpu-name``.
+    Nothing else changes (a member's target needs a PTX ISA that has the base's already)."""
+    member = {v: k for k, v in _PROXY_BASE.items()}.get(base)
+
+    def one(t: "re.Match[str]") -> str:
+        return t.group(1) + base if t.group(2) == member else t.group(0)
+
+    return _TARGET_LINE.sub(one, ptx, count=1)
+
+
+def _shapes_differ(real: "Mapping[str, tuple[int, int, int]]", again: "Mapping[str, tuple[int, int, int]]") -> str:
+    """How the code of a re-assembly is not the binary's (``""``: the same functions, each with the same registers, stack frame and code size)."""
+    if set(real) != set(again):
+        return f"its functions are {sorted(again)}, the binary's {sorted(real)}"
+    out = []
+    for name in sorted(real):
+        if real[name] != again[name]:
+            (r, f, n), (r2, f2, n2) = real[name], again[name]
+            out.append(f"{name}: {r2} registers, a {f2}-byte stack frame and {n2} bytes of code where the binary has {r}, {f} and {n}")
+    return "; ".join(out)
+
+
+def disassemble(cubin: bytes, *, ptx: "str | None" = None, options: "Mapping[str, Any] | None" = None, prebuilt: bool = False) -> Disassembly:
+    """The SASS of ``cubin`` with line information (``nvdisasm -c -g -gi`` and ``-c -gp``), by the first ``nvdisasm`` that decodes its architecture
+    (:func:`tilefish._fpcontract.nvdisasm_candidates`: a ``tilefish[sass]`` wheel's CUDA 13 first). Where none does, ``ptx`` (the binary's PTX) is
+    assembled for the base of the family (``sm_100a`` for ``sm_103a``) by the ``ptxas`` and with the flags the binary was assembled with (Triton's
+    for ``options``, or a prebuilt PTX's), that is read (``proxy``), and its registers, stack frames and code sizes are compared with the binary's
+    (``matches``). Kept per cubin, assembler and disassembler in this process. Raises :class:`~tilefish.errors.TilefishBuildError` when nothing
+    can read it."""
     from . import _fpcontract
 
-    key = (hashlib.sha256(cubin).hexdigest(), json.dumps(proxy_flags(options or {})))
+    candidates = tuple(_fpcontract.nvdisasm_candidates())
+    key = (hashlib.sha256(cubin).hexdigest(), candidates, prebuilt, json.dumps(dict(options or {}), sort_keys=True, default=str), hashlib.sha256((ptx or "").encode()).hexdigest())
     with _cache_lock:
         found = _disassemblies.get(key)
     if found is not None:
         return found
     target = _target_of(cubin, ptx)
     nvdisasm = _fpcontract.disassembler_for(target, cubin)
-    binary, read_for, proxy = cubin, target, False
+    binary, read_for, proxy, matches, mismatch = cubin, target, False, None, ""
     if nvdisasm is None:
         base = _PROXY_BASE.get(target)
-        how = f"set {_fpcontract.NVDISASM_ENV} to an nvdisasm that does (CUDA 12.9 or later for sm_103: pip install nvidia-cuda-nvdisasm)"
         if base is None:
-            raise TilefishBuildError(f"no nvdisasm here decodes {target} ({_fpcontract.nvdisasm_candidates() or 'none found'}); {how}")
+            raise TilefishBuildError(f"no nvdisasm here decodes {target} ({list(candidates) or 'none found'}); {INSTALL}")
         if not ptx:
-            raise TilefishBuildError(f"no nvdisasm here decodes {target}, and the binary has no PTX to assemble for {base}, the base of its family; {how}")
-        proxied = retarget(ptx, base)
-        binary = _fpcontract.assemble(proxied, base, proxy_flags(options or {}))
+            raise TilefishBuildError(f"no nvdisasm here decodes {target}, and the binary has no PTX to assemble for {base}, the base of its family; {INSTALL}")
+        ptxas, flags = _assembler(prebuilt, options or {})
+        binary = _assemble(ptxas, retarget(ptx, base), base, flags)
         nvdisasm = _fpcontract.disassembler_for(base, binary)
         if nvdisasm is None:
-            raise TilefishBuildError(f"no nvdisasm here decodes {target} or {base} ({_fpcontract.nvdisasm_candidates() or 'none found'}); {how}")
+            raise TilefishBuildError(f"no nvdisasm here decodes {target} or {base} ({list(candidates) or 'none found'}); {INSTALL}")
         read_for, proxy = base, True
+        mismatch = _shapes_differ(code_shape(cubin), code_shape(binary))
+        matches = not mismatch
     text = _fpcontract._disassemble(nvdisasm, binary, LISTING_FLAGS)
-    ptx_text = _fpcontract._disassemble(nvdisasm, binary, PTX_LINE_FLAGS)
-    if text is None or ptx_text is None:
+    if text is None:
         raise TilefishBuildError(f"{nvdisasm} could not disassemble the binary for {read_for}")
-    out = Disassembly(text, ptx_text, parse_listing(text, ptx_text), read_for, proxy, nvdisasm, nvdisasm_version(nvdisasm), target)
+    ptx_text = _fpcontract._disassemble(nvdisasm, binary, PTX_LINE_FLAGS) or ""  # (the PTX lines are a help: without them the SASS is the same)
+    sizes = {name: size for name, (_, _, size) in code_shape(binary).items()}
+    out = Disassembly(
+        text, ptx_text, parse_listing(text, ptx_text or None), read_for, proxy, nvdisasm, nvdisasm_version(nvdisasm), target, matches, mismatch, sizes
+    )
     with _cache_lock:
         _disassemblies[key] = out
     return out
 
 
+def check_complete(d: Disassembly, symbol: str) -> "list[str]":
+    """The functions of ``symbol``'s code in a listing (:func:`reached`), each with exactly as many instructions as its code has 16-byte slots.
+    Raises :class:`~tilefish.errors.TilefishBuildError` otherwise: the listing is not what this parser reads (another nvdisasm format, an opcode
+    it does not know, a section that did not parse), and nothing is judged on it."""
+    names = reached(d.listing, symbol)
+    if not names:
+        raise TilefishBuildError(
+            f"the listing of the binary ({d.label}) has no function '{symbol}' (it has {sorted(d.listing.functions)}): nothing can be judged on it"
+        )
+    for name in names:
+        count, size = len(d.listing.functions[name]), d.code_sizes.get(name)
+        if size is None or count == 0 or count != size // 16:
+            raise TilefishBuildError(
+                f"the listing of '{name}' ({d.label}) has {count} instructions where its code ({size} bytes) has {None if size is None else size // 16}: "
+                "the nvdisasm output is not what tilefish reads, so nothing is judged on it (please report the nvdisasm version)"
+            )
+    return names
+
+
 @dataclass
 class Judged:
-    """What :func:`judge` found: the violations, and the label of the SASS it read (``""`` when it read none)."""
+    """What :func:`judge` found: the violations, and the label of what it read: where the SASS came from, or ``""`` when it needed none."""
 
     violations: "list[Violation]" = field(default_factory=list)
     label: str = ""
 
 
-def judge(checks: SassChecks, *, cubin: bytes, ptx: "str | None", symbol: str, options: "Mapping[str, Any] | None" = None) -> Judged:
-    """Judge a binary (its cubin, its PTX or ``None``, its entry ``symbol``) against ``checks`` (already for its architecture). Disassembles only
-    when the assertions need the SASS (:meth:`SassChecks.needs_sass`)."""
+def judge(
+    checks: SassChecks, *, cubin: bytes, ptx: "str | None", symbol: str, options: "Mapping[str, Any] | None" = None, prebuilt: bool = False
+) -> Judged:
+    """Judge a binary (its cubin, its PTX or ``None``, its entry ``symbol``) against ``checks`` (already for its architecture). The PTX checks read
+    the entry and the functions it calls (:func:`ptx_for_entry`), the SASS checks the code of the entry and of the functions it calls, every
+    instruction of it (:func:`check_complete`). Disassembles only when the assertions need the SASS (:meth:`SassChecks.needs_sass`), or to name the
+    instructions of a violation; a re-assembly for the family base that is not the binary (:class:`Disassembly`) refuses the build."""
     attributes = kernel_attributes(cubin, symbol)
+    own_ptx = ptx_for_entry(ptx, symbol) if ptx else None
     result = Judged()
 
     def instructions() -> "Sequence[Instruction]":
-        d = disassemble(cubin, ptx=ptx or None, options=options)
+        d = disassemble(cubin, ptx=ptx or None, options=options, prebuilt=prebuilt)
+        if d.proxy and not d.matches:
+            raise TilefishBuildError(f"its SASS cannot be judged: {d.label}. {INSTALL[0].upper() + INSTALL[1:]}")
+        check_complete(d, symbol)
         result.label = d.label
         return kernel_instructions(d.listing, symbol)
 
-    result.violations = evaluate(checks, ptx=ptx or None, attributes=attributes, instructions=instructions)
+    result.violations = evaluate(checks, ptx=own_ptx, attributes=attributes, instructions=instructions)
     return result

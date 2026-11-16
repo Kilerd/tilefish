@@ -18,9 +18,9 @@ values of ``S0`` are not computed; only its instructions are counted. (An ``or``
 0, and ptxas would fold away what reads it, the explicit ``fma`` of a polynomial in ``x * x`` included; ``x | x`` is ``x``.) The allowance is never
 below the lanes of the PTX's explicit ``fma`` instructions, in case ``S0`` lost one to a simplification.
 
-**The disassembler.** ``nvdisasm``: ``$TILEFISH_NVDISASM_PATH``, Triton's (``$TRITON_NVDISASM_PATH`` or its bundled copy), the one next to
-the ``ptxas`` Triton uses, the one of an ``nvidia-cuda-nvdisasm`` wheel, then the first on the ``PATH`` or in ``$CUDA_HOME/bin``, the first of
-them that decodes the binary's architecture. Triton 3.5.1 bundles CUDA 12.8's, which decodes sm_90, sm_100 and sm_120 but not sm_103: where
+**The disassembler.** ``nvdisasm``: ``$TILEFISH_NVDISASM_PATH``, the one of an ``nvidia-cuda-nvdisasm`` wheel (``pip install 'tilefish[sass]'``),
+Triton's (``$TRITON_NVDISASM_PATH`` or its bundled copy), the one next to the ``ptxas`` Triton uses, then the first on the ``PATH`` or in
+``$CUDA_HOME/bin``, the first of them that decodes the binary's architecture. Triton 3.5.1 bundles CUDA 12.8's, which decodes sm_90, sm_100 and sm_120 but not sm_103: where
 none decodes the architecture, ``S`` and ``S0`` are both the PTX assembled for the base architecture of its family (``sm_100a`` for
 ``sm_103a``, the same instruction set), and the message of a refusal says so. ``pip install nvidia-cuda-nvdisasm`` (CUDA 13) decodes sm_103.
 
@@ -163,13 +163,13 @@ def nvdisasm_candidates() -> "list[str]":
     env = os.environ.get(NVDISASM_ENV)
     if env:
         out.append(env)
+    out += _wheel_tool("nvdisasm")  # an nvidia-cuda-nvdisasm wheel (tilefish[sass]: CUDA 13, which reads every architecture tilefish builds for)
     triton_path = _triton_tool("nvdisasm")
     if triton_path:
         out.append(triton_path)
     ptxas = _triton_tool("ptxas")
     if ptxas:
         out.append(str(pathlib.Path(ptxas).with_name("nvdisasm")))
-    out += _wheel_tool("nvdisasm")
     which = shutil.which("nvdisasm")
     if which:
         out.append(which)

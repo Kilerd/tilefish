@@ -532,6 +532,9 @@ class BuiltKernel:
     # every level of the compile, for a trace (``build(..., stages=True)``, :mod:`tilefish._trace`): Triton's ``asm`` texts by stage (``source``, the
     # frontend's IR with its locations; ``ttir``, ``ttgir``, ``llir``, ``ptx``); ``None`` for a build that did not keep them. Not in any digest.
     stages: "dict[str, str] | None" = None
+    # how the declaration's SASS assertions were judged (``tilefish.sass``): ``None`` with none, else what was read: ``"its PTX and its ELF file"``,
+    # or where the SASS came from (its own, or a re-assembly for the family base whose code is the binary's). Not in any digest or manifest.
+    sass_checked: "str | None" = None
 
     @property
     def stem(self) -> str:
@@ -830,25 +833,32 @@ def check_contraction(spec: "CompileSpec", cap: int, ptx: str, cubin: bytes, opt
     )
 
 
-def check_sass(spec: "CompileSpec", cap: int, cubin: bytes, ptx: str, symbol: str, options: "Mapping[str, Any]") -> None:
+def check_sass(
+    spec: "CompileSpec", cap: int, cubin: bytes, ptx: str, symbol: str, options: "Mapping[str, Any]", prebuilt: bool = False
+) -> "str | None":
     """Refuse a binary that violates the SASS assertions of its declaration (``sass=tilefish.sass(...)``, :mod:`tilefish._sass`) on ``sm_<cap>``.
 
     Every build checks them, a cache hit as much as a compile, and a prebuilt binary too: from the PTX (the MMA kinds it spells), the ELF file
     (the registers) and, when an assertion needs it, the SASS, read by the ``nvdisasm`` of the contraction check (or from the PTX assembled
     for the base of the architecture's family, labelled so, where no ``nvdisasm`` decodes it). A spec without assertions is not looked at.
-    Raises :class:`~tilefish.errors.TilefishBuildError` naming each violated assertion, the instructions and their source lines."""
+    Raises :class:`~tilefish.errors.TilefishBuildError` naming each violated assertion, the instructions and their source lines, or when the SASS
+    cannot be judged (a re-assembly that is not the binary, a listing that does not parse). Returns what was read (:attr:`BuiltKernel.sass_checked`),
+    ``None`` without assertions."""
     checks = getattr(spec, "_sass", None)
     if checks is None:
-        return
+        return None
     mine = checks.for_arch(cap)
     if mine.empty:
-        return
+        return None
     from . import _sass
 
-    found = _sass.judge(mine, cubin=cubin, ptx=ptx or None, symbol=symbol, options=options)
-    if not found.violations:
-        return
     what = f"'{spec.stem}' ({spec.triton or 'prebuilt ' + str((spec.binary or {}).get('kind'))}) for sm_{cap}"
+    try:
+        found = _sass.judge(mine, cubin=cubin, ptx=ptx or None, symbol=symbol, options=options, prebuilt=prebuilt)
+    except TilefishBuildError as e:
+        raise TilefishBuildError(f"{what}: the SASS assertions of its declaration {mine.describe()} cannot be checked: {e}") from e
+    if not found.violations:
+        return found.label or "its PTX and its ELF file"
     read = f" (read in {found.label})" if found.label else ""
     listed = "\n".join(f"  - {v.describe()}" for v in found.violations)
     raise TilefishBuildError(
@@ -1086,8 +1096,8 @@ def build(
             check_tf32(spec, cap, frontend_ir, hit.ptx, triton_version)  # an entry has its PTX only, which the build that stored it was judged by too
             check_contraction(spec, cap, hit.ptx, hit.cubin, opts, hit.sha256)  # (an entry a tilefish without the check stored, too)
             check_launch_attributes(spec, hit.launch)  # the scratch and the cluster the declaration states, as for a compile
-            check_sass(spec, cap, hit.cubin, hit.ptx, hit.symbol, opts)  # the declaration's SASS assertions, on the binary the cache holds
-            return dataclasses.replace(hit, cuda_math=cuda_math)  # (read from the source and the libdevice here, not from the cache)
+            checked = check_sass(spec, cap, hit.cubin, hit.ptx, hit.symbol, opts)  # the declaration's SASS assertions, on the binary the cache holds
+            return dataclasses.replace(hit, cuda_math=cuda_math, sass_checked=checked)  # (read from the source and the libdevice here, not from the cache)
 
     from triton.backends.compiler import GPUTarget
 
@@ -1145,7 +1155,7 @@ def build(
     from hashlib import sha256
 
     check_contraction(spec, cap, ptx, cubin, opts, sha256(cubin).hexdigest())
-    check_sass(spec, cap, cubin, ptx, symbol, opts)
+    checked = check_sass(spec, cap, cubin, ptx, symbol, opts)
 
     target = _PTX_TARGET.search(ptx)
     built = BuiltKernel(
@@ -1166,6 +1176,7 @@ def build(
         ir_digest=digest,
         warp_specialized=warp_specialized,
         cuda_math=cuda_math,
+        sass_checked=checked,
     )
     if store is not None:
         store.store(cache_id, built)

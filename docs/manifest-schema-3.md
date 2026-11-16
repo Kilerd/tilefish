@@ -132,7 +132,8 @@ A manifest exported by 0.0.6 or earlier still names the directories of its build
 **A trace next to the manifest (unreleased).** An export with `trace=True` (or `TILEFISH_TRACE=1`) also writes `trace/` in the manifest's directory:
 every level of every binary, for `tilefish-explain` (`docs/explain.md`). No field of the manifest names it and no digest covers it, so the manifest,
 its digest and every pin are the same with or without it; neither reader looks at it (a reader reads `manifest.json` and the cubins it names, and nothing
-else of the directory). A tool that copies an export directory copies it too, or leaves it out: either is the same artifact.
+else of the directory). It holds source code (the kernels' files, the generated sources, Triton's): it is not part of what is shipped, and a tool that
+packages an export for a host leaves it out. The manifest and its digest are the same with or without it.
 
 ## 4. Kernel entries
 

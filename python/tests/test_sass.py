@@ -89,7 +89,7 @@ def test_the_scheduling_annotations_of_cuda_12_8_are_not_operands():
 def test_the_target_of_a_listing_and_of_the_family_base():
     assert listing("dot_bf16.sm_90.nvdisasm13").target == "sm_90a"  # from the header flags: an sm_90 listing has no .target
     assert listing("dot_bf16.sm_103.nvdisasm13").target == "sm_103a"
-    assert listing("dot_bf16.sm_100.nvdisasm12").target == "sm_100a"  # what CUDA 12.8 reads of a sm_103 kernel assembled for its family base
+    assert listing("dot_bf16.sm_100.nvdisasm12").target == "sm_100a"  # CUDA 12.8 decodes sm_100, the base of sm_103's family (and not sm_103)
 
 
 def test_a_listing_line_with_inlined_at_and_notes():
@@ -195,7 +195,9 @@ def test_the_attributes_of_a_function_from_its_elf_file():
         ]
     )
     a = _sass.kernel_attributes(cubin, "k")
-    assert a == {"sm": 103, "registers": 40, "frame_size": 16, "maxreg_count": 255, "num_barriers": 1, "reqntid": [128, 1, 1], "static_shared": 4096}
+    # (the .nv.shared section holds the 1024 bytes the system reserves per block too: the reserve is counted once, by the occupancy estimate)
+    assert a == {"sm": 103, "registers": 40, "frame_size": 16, "maxreg_count": 255, "num_barriers": 1, "reqntid": [128, 1, 1], "static_shared": 3072, "local": 16}
+    assert _sass.code_shape(cubin) == {"k": (40, 16, 32), "j": (99, 0, 32)}
     assert _sass.kernel_attributes(cubin, "j")["registers"] == 99
 
 
@@ -204,6 +206,9 @@ def test_the_occupancy_estimate():
     o = _sass.occupancy(103, 168, 256, 0)
     assert o["blocks_per_sm"] == 1 and o["limited_by"] == ["registers"]
     assert _sass.occupancy(120, 32, 128, 64 * 1024)["limited_by"] == ["shared"]
+    # the system's reserve is added once per block: 228 KiB per SM on sm_103 hold two blocks of 112 KiB (and one of 115), 100 KiB on sm_120 one of 49
+    assert _sass.occupancy(103, 32, 128, 112 * 1024 - 1024)["blocks_per_sm"] == 2 and _sass.occupancy(103, 32, 128, 114 * 1024)["blocks_per_sm"] == 1
+    assert _sass.occupancy(120, 32, 128, 49 * 1024)["blocks_per_sm"] == 2 and _sass.occupancy(120, 32, 128, 50 * 1024)["blocks_per_sm"] == 1
     assert _sass.occupancy(80, 32, 128, 0) is None
 
 
@@ -337,15 +342,24 @@ def judge(checks, name=None, *, ptx=None, attributes=None):
     return found, len(calls)
 
 
-def test_no_spills_names_each_local_memory_instruction_and_its_source_line():
-    found, _ = judge(tilefish.sass(no_spills=True), "dot_bf16.sm_120.nvdisasm13")
+def test_no_spills_is_the_elf_file_s_and_names_the_local_memory_instructions():
+    # the ELF file decides (a stack frame: a spill, or a local array reached by LD/ST as much as LDL/STL); the SASS names the instructions
+    found, calls = judge(tilefish.sass(no_spills=True), "dot_bf16.sm_120.nvdisasm13", attributes={"registers": 80, "local": 16})
     (v,) = found
-    assert v.check == "no_spills" and "4 local-memory instructions" in v.message
+    assert calls == 1 and v.check == "no_spills" and v.message == "local memory, spills or a local array: a stack frame of 16 bytes per thread in its ELF file, 4 local-memory instructions"
     # (CUDA 13.x's nvdisasm marks a spill: "SpillRefill")
     assert len(v.where) == 4 and all(re.search(r"/\*[0-9a-f]{4}\*/ (STL|LDL)\S* .* \(record_sass_fixtures\.py:\d+\) \[spill\]$", w) for w in v.where)
-    assert judge(tilefish.sass(no_spills=True), "dot_bf16.sm_103.nvdisasm13")[0] == []
-    spill = judge(tilefish.sass(no_spills=True), "spill.sm_120.nvdisasm13")[0][0]
+    assert judge(tilefish.sass(no_spills=True), "dot_bf16.sm_103.nvdisasm13", attributes={"local": 0}) == ([], 0)  # no frame: nothing to read
+    (v,), _ = judge(tilefish.sass(no_spills=True, forbid="BPT"), "dot_bf16.sm_120.nvdisasm13", attributes={"local": 0})  # read anyway: LDL/STL
+    assert v.message.startswith("local memory, spills or a local array: no stack frame in its ELF file, 4 local-memory instructions")
+    spill = judge(tilefish.sass(no_spills=True), "spill.sm_120.nvdisasm13", attributes={"local": 13608})[0][0]
     assert len(spill.where) == 26 and "..." in spill.describe()
+
+    def unreadable():
+        raise TilefishBuildError("no nvdisasm here decodes sm_103a")
+
+    (v,) = _sass.evaluate(tilefish.sass(no_spills=True), ptx=None, attributes={"local": 64}, instructions=unreadable)
+    assert v.where == () and "(its SASS could not be read to name the instructions: no nvdisasm here decodes sm_103a)" in v.message
 
 
 def test_no_tf32_reads_the_ptx_and_where_it_has_none_the_sass():
@@ -356,6 +370,22 @@ def test_no_tf32_reads_the_ptx_and_where_it_has_none_the_sass():
         assert calls == 1 and v.check == "no_tf32" and f":{TF32_LINE})" in v.where[0], name
     for name in ("dot_bf16.sm_120.nvdisasm13", "dot_bf16.sm_103.nvdisasm13"):
         assert judge(tilefish.sass(no_tf32=True), name)[0] == []
+    wmma = ".version 8.0\n.target sm_80\n.visible .entry k(){\n wmma.mma.sync.aligned.row.col.m16n16k8.f32.tf32.tf32.f32 {%f1}, {%r1}, {%r2}, {%f1};\n ret;\n}\n"
+    (v,), _ = judge(tilefish.sass(no_tf32=True), ptx=wmma)
+    assert "wmma.mma.sync.aligned.row.col.m16n16k8.f32.tf32.tf32.f32" in v.where[0]
+
+
+def test_a_utchmma_whose_kind_cannot_be_read_refuses_no_tf32_without_ptx():
+    text = (
+        '\t.section\t.text.k,"ax",@progbits\n'
+        "        /*0000*/                   LDCU UR27, c[0x0][0x380] ;\n"  # the descriptor is a run-time value: its kind is not in the SASS
+        "        /*0010*/                   UTCHMMA gdesc[UR6], gdesc[UR4], tmem[UR34], tmem[UR26], idesc[UR27], UPT ;\n"
+    )
+    ins = _sass.parse_listing(text).instructions("k")
+    (v,) = _sass.evaluate(tilefish.sass(no_tf32=True), ptx=None, attributes={}, instructions=lambda: ins)
+    assert v.check == "no_tf32" and "whose instruction descriptor the SASS does not set as a constant, in a binary without PTX" in v.message
+    assert v.where == ("/*0010*/ UTCHMMA gdesc[UR6], gdesc[UR4], tmem[UR34], tmem[UR26], idesc[UR27], UPT",)
+    assert _sass.evaluate(tilefish.sass(no_tf32=True), ptx=PTX.replace("kind::tf32", "kind::f16"), attributes={}, instructions=lambda: ins) == []
 
 
 def test_an_mma_kind_is_found_in_the_ptx_or_in_the_sass():
@@ -381,29 +411,124 @@ def test_max_registers_reads_the_elf_file_and_forbid_reads_the_sass():
     assert v.where and all(re.search(r" LDL(\.\w+)*\.64 ", w) for w in v.where)
 
 
+def _disassembly(text, *, proxy=False, matches=None, mismatch="", sizes=None):
+    listing_ = _sass.parse_listing(text)
+    if sizes is None:
+        sizes = {name: 16 * len(f) for name, f in listing_.functions.items()}
+    return _sass.Disassembly(text, "", listing_, "sm_100a" if proxy else "sm_120a", proxy, "/x/nvdisasm", "12.8.55" if proxy else "13.5.37",
+                             "sm_103a" if proxy else "sm_120a", matches, mismatch, sizes)  # fmt: skip
+
+
 def test_a_build_is_refused_with_the_assertions_the_instructions_and_where_the_sass_came_from(monkeypatch):
-    spec = compile_specs(_extern(tilefish.sass(no_spills=True, max_registers=64, by_arch={"sm_103": tilefish.sass(no_spills=False)})))[0]
+    spec = compile_specs(_extern(tilefish.sass(forbid="BPT", max_registers=64, by_arch={"sm_103": tilefish.sass(forbid=[])})))[0]
     text = (FIX / "dot_bf16.sm_120.nvdisasm13.g.txt").read_text()
     seen = []
 
-    def disassemble(cubin, *, ptx=None, options=None):
+    def disassemble(cubin, *, ptx=None, options=None, prebuilt=False):
         seen.append(ptx)
-        return _sass.Disassembly(text, "", _sass.parse_listing(text), "sm_100a", True, "/x/nvdisasm", "12.8.55", "sm_103a")
+        return _disassembly(text, proxy=True, matches=True)
 
     monkeypatch.setattr(_sass, "disassemble", disassemble)
-    monkeypatch.setattr(_sass, "kernel_attributes", lambda cubin, symbol: {"registers": 80})
-    spec_120 = compile_specs(_extern(tilefish.sass(no_spills=True, max_registers=64)))[0]
+    monkeypatch.setattr(_sass, "kernel_attributes", lambda cubin, symbol: {"registers": 80, "local": 32})
+    spec_120 = compile_specs(_extern(tilefish.sass(no_spills=True, max_registers=64, forbid="BPT")))[0]
     with pytest.raises(TilefishBuildError) as e:
         _build.check_sass(spec_120, 120, b"", PTX, "dot_bf16", {})
     message = str(e.value)
     assert "'sx_copy' (sx_mod:k) for sm_120 violates the SASS assertions of its declaration" in message
     assert "max_registers: the binary uses 80 registers per thread, more than the 64 declared" in message
-    assert "no_spills: 4 local-memory instructions" in message and "(record_sass_fixtures.py:" in message
-    assert "assembled again for sm_100a" in message and "nvdisasm 12.8.55" in message
+    assert "no_spills: local memory, spills or a local array: a stack frame of 32 bytes per thread in its ELF file, 4 local-memory instructions" in message
+    assert "(record_sass_fixtures.py:" in message
+    assert "assembled again for sm_100a" in message and "judged on a re-assembly whose registers, stack frames and code sizes are the binary's" in message
     with pytest.raises(TilefishBuildError, match="max_registers") as e:
-        _build.check_sass(spec, 103, b"", PTX, "dot_bf16", {})  # sm_103 switches no_spills off: the SASS is not read
-    assert "  - no_spills" not in str(e.value) and len(seen) == 1
-    _build.check_sass(compile_specs(_extern())[0], 103, b"", PTX, "dot_bf16", {})  # no assertions: nothing looked at
+        _build.check_sass(spec, 103, b"", PTX, "dot_bf16", {})  # sm_103 forbids nothing: the SASS is not read
+    assert "  - forbid" not in str(e.value) and len(seen) == 1
+    assert _build.check_sass(compile_specs(_extern())[0], 103, b"", PTX, "dot_bf16", {}) is None  # no assertions: nothing looked at
+    monkeypatch.setattr(_sass, "kernel_attributes", lambda cubin, symbol: {"registers": 8, "local": 0})
+    only_forbid = compile_specs(_extern(tilefish.sass(forbid="BPT")))[0]
+    assert _build.check_sass(only_forbid, 120, b"", PTX, "dot_bf16", {}).startswith("the SASS of its PTX assembled again for sm_100a")
+    assert _build.check_sass(compile_specs(_extern(tilefish.sass(max_registers=64)))[0], 120, b"", PTX, "dot_bf16", {}) == "its PTX and its ELF file"
+
+
+def test_a_reassembly_that_is_not_the_binary_refuses_the_build(monkeypatch):
+    text = (FIX / "dot_bf16.sm_120.nvdisasm13.g.txt").read_text()
+    differs = "dot_bf16: 74 registers, a 0-byte stack frame and 4096 bytes of code where the binary has 76, 0 and 4096"
+    monkeypatch.setattr(_sass, "disassemble", lambda cubin, **kw: _disassembly(text, proxy=True, matches=False, mismatch=differs))
+    monkeypatch.setattr(_sass, "kernel_attributes", lambda cubin, symbol: {"registers": 8, "local": 0})
+    spec = compile_specs(_extern(tilefish.sass(forbid="atomic")))[0]
+    with pytest.raises(TilefishBuildError) as e:
+        _build.check_sass(spec, 103, b"", PTX, "dot_bf16", {})
+    message = str(e.value)
+    assert "cannot be checked: its SASS cannot be judged" in message and "which is not the binary (" + differs + ")" in message
+    assert "pip install 'tilefish[sass]'" in message and "TILEFISH_NVDISASM_PATH" in message
+
+
+def test_a_listing_that_does_not_cover_the_code_is_never_judged(monkeypatch):
+    text = (FIX / "dot_bf16.sm_120.nvdisasm13.g.txt").read_text()  # trimmed: fewer instructions than its code has
+    monkeypatch.setattr(_sass, "kernel_attributes", lambda cubin, symbol: {"registers": 8, "local": 0})
+    monkeypatch.setattr(_sass, "disassemble", lambda cubin, **kw: _disassembly(text, sizes={"dot_bf16": 14336}))
+    with pytest.raises(TilefishBuildError, match=r"the listing of 'dot_bf16' \(its SASS, read by nvdisasm 13\.5\.37\) has \d+ instructions where its code \(14336 bytes\) has 896"):
+        _sass.judge(tilefish.sass(forbid="atomic"), cubin=b"", ptx=None, symbol="dot_bf16")
+    monkeypatch.setattr(_sass, "disassemble", lambda cubin, **kw: _disassembly(text))
+    with pytest.raises(TilefishBuildError, match=r"has no function 'other'"):
+        _sass.judge(tilefish.sass(forbid="atomic"), cubin=b"", ptx=None, symbol="other")
+    empty = '\t.section\t.text.k,"ax",@progbits\n'
+    monkeypatch.setattr(_sass, "disassemble", lambda cubin, **kw: _disassembly(empty, sizes={"k": 0}))
+    with pytest.raises(TilefishBuildError, match="has 0 instructions"):
+        _sass.judge(tilefish.sass(forbid="atomic"), cubin=b"", ptx=None, symbol="k")
+
+
+CALLS = (
+    '\t.section\t.text.other,"ax",@progbits\n'  # another entry of the binary: never judged with k
+    "        /*0000*/                   ATOMG.E.ADD.STRONG.GPU PT, RZ, desc[UR4][R2.64], R5 ;\n"
+    '\t.section\t.text.helper,"ax",@progbits\n'
+    "        /*0000*/                   STL [R1], R2 ;\n"
+    "        /*0010*/                   RET.REL.NODEC R20 `(k) ;\n"
+    '\t.section\t.text.k,"ax",@progbits\n'
+    "        /*0000*/                   CALL.REL.NOINC `(helper) ;\n"
+    "        /*0010*/                   EXIT ;\n"
+)
+
+
+def test_the_functions_a_kernel_calls_are_judged_and_its_sibling_entries_are_not(monkeypatch):
+    listing_ = _sass.parse_listing(CALLS)
+    assert _sass.reached(listing_, "k") == ["k", "helper"] and _sass.reached(listing_, "other") == ["other"]
+    assert [(i.function, i.opcode) for i in _sass.kernel_instructions(listing_, "k")] == [("k", "CALL"), ("k", "EXIT"), ("helper", "STL"), ("helper", "RET")]
+    monkeypatch.setattr(_sass, "disassemble", lambda cubin, **kw: _disassembly(CALLS))
+    monkeypatch.setattr(_sass, "kernel_attributes", lambda cubin, symbol: {"registers": 8, "local": 8})
+    found = _sass.judge(tilefish.sass(no_spills=True, forbid="atomic"), cubin=b"", ptx=None, symbol="k")
+    assert [v.check for v in found.violations] == ["no_spills"]  # the STL of the noinline callee; not the atomic of the other entry
+    assert found.violations[0].where == ("/*0000*/ STL [R1], R2",)
+
+
+def test_the_ptx_checks_read_the_entry_and_the_functions_it_calls():
+    ptx = (
+        ".version 8.8\n.target sm_90a\n.address_size 64\n"
+        ".func  (.param .b32 r) used(.param .b32 a)\n{\n wgmma.mma_async.sync.aligned.m64n64k8.f32.tf32.tf32 {%f1}, %rd1, %rd2, 1, 1, 1;\n ret;\n}\n"
+        ".func unused()\n{\n mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%f1}, {%r1}, {%r2}, {%f1};\n ret;\n}\n"
+        ".visible .entry k(\n .param .u64 p\n)\n.reqntid 128\n{\n call.uni (%r1), used, (%r2);\n ret;\n}\n"
+        ".visible .entry other()\n{\n mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%f1}, {%r1}, {%r2}, {%f1};\n ret;\n}\n"
+    )
+    own = _sass.ptx_for_entry(ptx, "k")
+    assert own.count("\n") == ptx.count("\n")  # the lines stay where they are
+    assert [op for _, op in _sass.ptx_instructions(own)] == ["wgmma.mma_async.sync.aligned.m64n64k8.f32.tf32.tf32"]
+    assert [n for n, _ in _sass.ptx_instructions(own)] == [6]
+    assert _sass.ptx_for_entry(ptx, "missing") == ptx
+    assert [op for _, op in _sass.ptx_instructions(_sass.ptx_for_entry(ptx, "other"))] == ["mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32"]
+
+
+def test_a_descriptor_is_forgotten_at_a_label_and_when_its_register_pair_is_written():
+    text = (
+        '\t.section\t.text.k,"ax",@progbits\n'
+        "        /*0000*/                   UMOV UR27, 0x8100910 ;\n"
+        "        /*0010*/                   UMOV UR29, 0x8100490 ;\n"
+        "        /*0020*/                   LDCU.64 UR26, c[0x0][0x358] ;\n"  # writes UR26 and UR27
+        "        /*0030*/                   UTCHMMA gdesc[UR6], gdesc[UR4], tmem[UR34], tmem[UR26], idesc[UR27], UPT ;\n"
+        "        /*0040*/                   UTCHMMA gdesc[UR6], gdesc[UR4], tmem[UR34], tmem[UR26], idesc[UR29], UPT ;\n"
+        ".L_x_3:\n"
+        "        /*0050*/                   UTCHMMA gdesc[UR6], gdesc[UR4], tmem[UR34], tmem[UR26], idesc[UR29], UPT ;\n"
+    )
+    found = _sass.mma_descriptors(_sass.parse_listing(text).instructions("k"))
+    assert set(found) == {0x40} and found[0x40]["kind"] == "f16"  # 0x30: UR27 rewritten by LDCU.64; 0x50: a branch may land at the label
 
 
 def test_every_build_checks_the_assertions_a_cache_hit_too(tmp_path, monkeypatch):
@@ -424,7 +549,7 @@ def test_every_build_checks_the_assertions_a_cache_hit_too(tmp_path, monkeypatch
 
     judged = []
 
-    def judge(checks, *, cubin, ptx, symbol, options=None):
+    def judge(checks, *, cubin, ptx, symbol, options=None, prebuilt=False):
         judged.append((checks.max_registers, symbol))
         found = _sass.Judged()
         if len(judged) > 1:
@@ -439,19 +564,53 @@ def test_every_build_checks_the_assertions_a_cache_hit_too(tmp_path, monkeypatch
     assert compiler.count == 1 and len(judged) == 2
 
 
-def test_every_function_of_the_binary_is_judged_and_the_kernel_s_comes_first():
-    text = (
-        '\t.section\t.text.helper,"ax",@progbits\n'
-        "        /*0000*/                   STL [R1], R2 ;\n"
-        "        /*0010*/                   RET.REL.NODEC R20 `(k) ;\n"
-        '\t.section\t.text.k,"ax",@progbits\n'
-        "        /*0000*/                   CALL.REL.NOINC `(helper) ;\n"
-        "        /*0010*/                   EXIT ;\n"
-    )
-    listing = _sass.parse_listing(text)
-    assert [(i.function, i.opcode) for i in _sass.kernel_instructions(listing, "k")] == [("k", "CALL"), ("k", "EXIT"), ("helper", "STL"), ("helper", "RET")]
-    found = _sass.evaluate(tilefish.sass(no_spills=True), ptx=None, attributes={}, instructions=lambda: _sass.kernel_instructions(listing, "k"))
-    assert [v.check for v in found] == ["no_spills"]
+def test_the_disassembler_choice_the_reassembly_and_the_cache(tmp_path, monkeypatch):
+    from elf_builder import arch_header, cubin_like
+
+    from tilefish import _fpcontract
+
+    real = cubin_like(**arch_header("sm_103"))
+    again = cubin_like(code=b"\0" * 128, **arch_header("sm_100"))  # another code size: a re-assembly that is not the binary
+    listing_text = '\t.target\tsm_100a\n\t.section\t.text.tf_k,"ax",@progbits\n' + "".join(f"        /*{k * 16:04x}*/                   NOP ;\n" for k in range(8))
+    runs, assembled = [], []
+
+    def fake_disassemble(nvdisasm, cubin, flags=()):
+        runs.append((nvdisasm, tuple(flags)))
+        if nvdisasm == "/old/nvdisasm" and cubin == real:
+            return None  # CUDA 12.8 cannot decode sm_103
+        return listing_text
+
+    def fake_assemble(ptxas, ptx, target, flags):
+        assembled.append((ptxas, ptx, target, tuple(flags)))
+        return again
+
+    monkeypatch.setattr(_sass, "_disassemblies", {})
+    monkeypatch.setattr(_fpcontract, "_decodes", {})
+    monkeypatch.setattr(_fpcontract, "_disassemble", fake_disassemble)
+    monkeypatch.setattr(_fpcontract, "nvdisasm_version", lambda path: "", raising=False)
+    monkeypatch.setattr(_sass, "nvdisasm_version", lambda path: "12.8.55" if path == "/old/nvdisasm" else "13.5.37")
+    monkeypatch.setattr(_sass, "_assemble", fake_assemble)
+    monkeypatch.setattr(_fpcontract, "ptxas_path", lambda: "/triton/ptxas")
+    monkeypatch.setattr(_fpcontract, "nvdisasm_candidates", lambda: ["/old/nvdisasm"])
+    ptx = ".version 8.8\n.target sm_103a\n.entry tf_k()\n{\n ret;\n}\n"
+    d = _sass.disassemble(real, ptx=ptx, options={"enable_fp_fusion": False, "num_warps": 4})
+    assert d.proxy and d.target == "sm_100a" and d.binary_target == "sm_103a" and d.matches is False  # (another file: other code shapes)
+    assert assembled == [("/triton/ptxas", ptx.replace("sm_103a", "sm_100a"), "sm_100a", ("-lineinfo", "--fmad=false", "-v"))]
+    assert runs[-2:] == [("/old/nvdisasm", _sass.LISTING_FLAGS), ("/old/nvdisasm", _sass.PTX_LINE_FLAGS)]
+    assert _sass.disassemble(real, ptx=ptx, options={"enable_fp_fusion": False, "num_warps": 4}) is d and len(assembled) == 1  # kept
+    # a prebuilt PTX is assembled again by the ptxas and the flags of a prebuilt build
+    monkeypatch.setattr("tilefish._binary.find_ptxas", lambda: "/prebuilt/ptxas")
+    _sass.disassemble(real, ptx=ptx, prebuilt=True)
+    assert assembled[-1][0] == "/prebuilt/ptxas" and assembled[-1][3] == ("-lineinfo", "-v")
+    # another nvdisasm is another key: one that decodes sm_103 reads the binary itself
+    monkeypatch.setattr(_fpcontract, "nvdisasm_candidates", lambda: ["/new/nvdisasm", "/old/nvdisasm"])
+    d2 = _sass.disassemble(real, ptx=ptx, options={"enable_fp_fusion": False, "num_warps": 4})
+    assert not d2.proxy and d2.nvdisasm == "/new/nvdisasm" and d2.label == "its SASS, read by nvdisasm 13.5.37" and len(assembled) == 2
+    # a failed -gp run leaves the PTX lines out and does not refuse
+    monkeypatch.setattr(_sass, "_disassemblies", {})
+    monkeypatch.setattr(_fpcontract, "_disassemble", lambda nvdisasm, cubin, flags=(): None if "-gp" in flags else listing_text)
+    d3 = _sass.disassemble(real, ptx=ptx)
+    assert d3.ptx_text == "" and len(d3.listing.instructions("tf_k")) == 8
 
 
 def test_the_target_a_cubin_is_read_for():
@@ -463,17 +622,21 @@ def test_the_target_a_cubin_is_read_for():
     assert _sass._target_of(cubin, None) == "sm_103"
     assert _sass._target_of(cubin_like(**arch_header("sm_90")), ".target sm_90a\n") == "sm_90a"
     assert _sass._PROXY_BASE["sm_103"] == "sm_100" and _sass._PROXY_BASE["sm_103a"] == "sm_100a"
-    # the family base needs a PTX ISA new enough for it: an old prebuilt PTX's .version is raised (ptxas refuses .target sm_100 below 8.6)
+    # only the family member's target is rewritten; an older target is assembled as it is (and its .version is left alone)
     old = ".version 7.0\n.target sm_80\n.address_size 64\n"
-    assert _sass.retarget(old, "sm_100") == ".version 8.6\n.target sm_100\n.address_size 64\n"
+    assert _sass.retarget(old, "sm_100") == old
     assert _sass.retarget(".version 8.8\n.target sm_103a\n", "sm_100a") == ".version 8.8\n.target sm_100a\n"
-    assert _sass.retarget(".version 8.0\n.target sm_121a\n", "sm_120a") == ".version 8.7\n.target sm_120a\n"
+    assert _sass.retarget(".version 8.8\n.target sm_103\n", "sm_100") == ".version 8.8\n.target sm_100\n"
+    assert _sass.retarget(".version 8.8\n.target sm_121a\n", "sm_120a") == ".version 8.8\n.target sm_120a\n"
 
 
 def test_the_disassembly_label_says_when_the_sass_is_a_reassembly():
     d = _sass.Disassembly("", "", _sass.Listing(None, {}), "sm_103a", False, "/x/nvdisasm", "13.5.37")
     assert d.label == "its SASS, read by nvdisasm 13.5.37"
-    p = _sass.Disassembly("", "", _sass.Listing(None, {}), "sm_100a", True, "/x/nvdisasm", "12.8.55", "sm_103a")
-    assert p.label.startswith("the SASS of its PTX assembled again for sm_100a, the base of its family, read by nvdisasm 12.8.55, which cannot decode sm_103a")
-    assert _sass.proxy_flags({"enable_fp_fusion": False, "ptx_options": "-O3"}) == ["-lineinfo", "--fmad=false", "-O3"]
-    assert _sass.proxy_flags({}) == ["-lineinfo"]
+    p = _sass.Disassembly("", "", _sass.Listing(None, {}), "sm_100a", True, "/x/nvdisasm", "12.8.55", "sm_103a", True)
+    assert p.label == (
+        "the SASS of its PTX assembled again for sm_100a, the base of its family, with the ptxas and the flags of the binary, read by nvdisasm "
+        "12.8.55, which cannot decode sm_103a: judged on a re-assembly whose registers, stack frames and code sizes are the binary's"
+    )
+    assert _sass.triton_ptxas_flags({"enable_fp_fusion": False, "ptx_options": "-O3"}) == ["-lineinfo", "--fmad=false", "-v", "-O3"]
+    assert _sass.triton_ptxas_flags({}) == ["-lineinfo", "-v"]  # (no Triton here: its knobs' defaults, fp fusion on)

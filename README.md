@@ -991,9 +991,13 @@ $ tilefish-explain build/mm mm --diff-arch sm_120       # or --diff OTHER_EXPORT
   anywhere, with no CUDA tool, against the module-relative source names (`--source-root`); without a trace it disassembles the manifest's cubin.
 * **SASS assertions** (`tilefish.sass(...)` on `@tilefish.kernel`, `@tilefish.extern` and `tilefish.fusion`) are in the declaration digest when given, and
   every build, a cache hit included, refuses a binary that violates one, naming the instructions and their source lines. They read the PTX (MMA kinds:
-  the SASS of a `tcgen05.mma` does not spell its kind), the ELF file (registers) and the SASS, through the `nvdisasm` of the contraction check; where none
-  decodes the architecture (Triton 3.5.1's CUDA 12.8 tools and sm_103) the SASS is that of the PTX assembled for the base of the family (`sm_100a`), and
-  every message says so. `pip install nvidia-cuda-nvdisasm` or `TILEFISH_NVDISASM_PATH` reads sm_103 itself.
+  the SASS of a `tcgen05.mma` does not spell its kind), the ELF file (registers, stack frame) and the SASS, through the `nvdisasm` of the contraction check;
+  where none decodes the architecture (Triton 3.5.1's CUDA 12.8 tools and sm_103) the SASS is that of the PTX assembled for the base of the family (`sm_100a`)
+  with the binary's ptxas and flags;
+  that re-assembly is judged only where its registers, stack frames and code sizes are the binary's (else the build is refused with the fix), and every
+  message says so. `pip install 'tilefish[sass]'` (CUDA 13's `nvidia-cuda-nvdisasm`, preferred when present) or `TILEFISH_NVDISASM_PATH` reads sm_103
+  itself. `no_spills` and `max_registers` are the ELF file's, with no disassembly.
+* The trace holds source code: do not ship it with an export.
 
 ## The Rust host
 

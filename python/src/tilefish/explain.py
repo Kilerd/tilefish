@@ -88,17 +88,25 @@ class Trace:
                 raise TilefishExplainError(f"the trace file {str(path)!r} is not the one its index records (changed or missing)")
         return entry
 
-    def graph(self, name: str) -> "dict[str, Any] | None":
+    def graph(self, name: str, plan_digest: "str | None" = None) -> "dict[str, Any] | None":
+        """The trace of the graph ``name`` (``graphs/<name>.json``), when it is of the plan whose digest is ``plan_digest`` (``None``: any) and of
+        the manifest the index is of; ``None`` otherwise (a later export of another plan left it behind)."""
         found = (self.index.get("graphs") or {}).get(name)
-        if not isinstance(found, dict):
+        if not isinstance(found, dict) or not isinstance(found.get("file"), str):
             return None
-        path = self.root / found["file"]
-        if not path.is_file() or _sha256(path) != found.get("sha256"):
+        rel = found["file"]
+        path = self.root / rel
+        if not _safe_name(rel) or not path.is_file() or _sha256(path) != found.get("sha256"):
             raise TilefishExplainError(f"the trace file {str(path)!r} is not the one its index records (changed or missing)")
-        for rel, digest in (found.get("files") or {}).items():
-            if not (self.root / rel).is_file() or _sha256(self.root / rel) != digest:
-                raise TilefishExplainError(f"the trace file {str(self.root / rel)!r} is not the one its index records (changed or missing)")
-        return _read_json(path, "the graph trace")
+        for other, digest in (found.get("files") or {}).items():
+            if not _safe_name(other) or not (self.root / other).is_file() or _sha256(self.root / other) != digest:
+                raise TilefishExplainError(f"the trace file {str(self.root / other)!r} is not the one its index records (changed or missing)")
+        doc = _read_json(path, "the graph trace")
+        if not isinstance(doc, dict) or doc.get("manifest_digest") != self.index.get("manifest_digest"):
+            return None
+        if plan_digest is not None and doc.get("plan_digest") != plan_digest:
+            return None
+        return doc
 
 
 # -- what is explained ------------------------------------------------------------------------------------------------------------------------
@@ -137,8 +145,8 @@ class Explained:
         candidates = [self.sources.get(name)] + [root / name for root in self.source_roots] + ([pathlib.Path(name)] if pathlib.Path(name).is_absolute() else [])
         for path in candidates:
             if path is not None and path.is_file():
-                try:
-                    found = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                try:  # (split on newlines only: a form feed or a line separator in a source must not move its line numbers)
+                    found = path.read_text(encoding="utf-8", errors="replace").split("\n")
                 except OSError:
                     continue
                 break
@@ -230,7 +238,7 @@ class Explained:
 
     def annotate(self, *, ptx: bool = False) -> str:
         """The SASS, each run of instructions under its source line (see the module docstring)."""
-        ptx_lines = self.ptx.splitlines() if (ptx and self.ptx) else None
+        ptx_lines = self.ptx.split("\n") if (ptx and self.ptx) else None
         out = self.header() + [""]
         last: "tuple[Any, Any] | None" = None
         function = self.symbol
@@ -404,7 +412,10 @@ def load(
     manifest = Manifest.load(directory)
     trace = Trace.load(directory)
     context: "dict[str, Any]" = {}
-    gdoc = trace.graph(graph) if (trace is not None and graph is not None) else None
+    plan_digest: "str | None" = None
+    if graph is not None:
+        plan_digest = _plan_doc(directory, graph).get("plan_digest")
+    gdoc = trace.graph(graph, plan_digest) if (trace is not None and graph is not None) else None
     if graph is not None and step is not None:
         doc = _plan_doc(directory, graph)
         chosen_bucket = _pick_bucket(doc, _parse_bucket(bucket))
@@ -467,9 +478,9 @@ def load(
         listing = _with_lines(_sass.parse_listing(text), table)
         ptx = (base / "ptx.ptx").read_text(encoding="utf-8") if (base / "ptx.ptx").is_file() else None
         nodes = _read_json(base / "nodes.json", "the line map") if (base / "nodes.json").is_file() else None
-        sources = {name: base / rel for name, rel in (entry.get("sources") or {}).items()}
+        sources = {name: base / rel for name, rel in (entry.get("sources") or {}).items() if _safe_name(rel)}
         if gdoc is not None:
-            sources.update({name: trace.root / rel for name, rel in (gdoc.get("sources") or {}).items() if name not in sources})  # type: ignore[union-attr]
+            sources.update({name: trace.root / rel for name, rel in (gdoc.get("sources") or {}).items() if name not in sources and _safe_name(rel)})  # type: ignore[union-attr]
         return Explained(
             stem, arch, entry["symbol"], listing, entry["sass"].get("label", ""), entry.get("attributes") or {}, entry.get("launch") or {},
             ptx, entry.get("origin", ""), entry.get("language", ""), nodes, sources, roots, context, traced=True,
