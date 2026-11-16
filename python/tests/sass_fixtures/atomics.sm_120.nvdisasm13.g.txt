@@ -1,0 +1,69 @@
+	.target	sm_120a
+
+	.elftype	@"ET_EXEC"
+
+
+//--------------------- .text.atomics             --------------------------
+	.section	.text.atomics,"ax",@progbits
+	.align	128
+        .global         atomics
+        .type           atomics,@function
+        .size           atomics,(.L_x_12 - atomics)
+        .other          atomics,@"STO_CUDA_ENTRY STV_DEFAULT"
+atomics:
+.text.atomics:
+	//## File "record_sass_fixtures.py", line 53
+        /*0000*/                   LDC R1, c[0x0][0x37c] ;
+	//## File "record_sass_fixtures.py", line 54
+        /*0010*/                   S2R R12, SR_TID.X ;
+	//## File "record_sass_fixtures.py", line 55
+        /*0020*/                   LDCU UR4, c[0x0][0x398] ;
+        /*0030*/                   CS2R R6, SRZ ;
+	//## File "record_sass_fixtures.py", line 54
+        /*0040*/                   S2R R3, SR_CTAID.X ;
+	//## File "record_sass_fixtures.py", line 55
+        /*0050*/                   LDCU.64 UR8, c[0x0][0x380] ;
+        /*0060*/                   LDCU.64 UR6, c[0x0][0x358] ;
+	//## File "record_sass_fixtures.py", line 54
+        /*0070*/                   LOP3.LUT R0, R12, 0x7f, RZ, 0xc0, !PT ;
+        /*0080*/                   IMAD R0, R3, 0x100, R0 ;
+	//## File "record_sass_fixtures.py", line 55
+        /*0090*/                   IMAD.SHL.U32 R2, R0.reuse, 0x4, RZ ;
+	//## File "record_sass_fixtures.py", line 54
+        /*00a0*/                   IADD3 R4, PT, PT, R0.reuse, 0x80, RZ ;
+	//## File "record_sass_fixtures.py", line 55
+        /*00b0*/                   ISETP.GE.AND P0, PT, R0.reuse, UR4, PT ;
+        /*00c0*/                   IMAD.HI R3, R0, 0x4, RZ ;
+        /*00d0*/                   ISETP.GE.AND P1, PT, R4, UR4, PT ;
+        /*00e0*/                   IADD.64 R2, R2, UR8 ;
+        /*00f0*/              @!P0 LDG.E R6, desc[UR6][R2.64] ;
+        // [trimmed]
+	//## File "record_sass_fixtures.py", line 57
+        // [trimmed]
+        /*02d0*/                   NOP ;
+        /*02e0*/                   NOP ;
+        /*02f0*/                   NOP ;
+        /*0300*/                   DMUL R4, R2, 3 ;
+.L_x_9:
+	//## File "triton/language/standard.py", line 291
+        /*0310*/                   SHFL.BFLY PT, R13, R10, 0x1, 0x1f ;
+        // [trimmed]
+	//## File "record_sass_fixtures.py", line 56
+        // [trimmed]
+        /*0380*/                   MEMBAR.ALL.GPU ;
+        /*0390*/                   ERRBAR;
+        /*03a0*/                   CGAERRBAR ;
+        /*03b0*/                   ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, RZ, desc[UR6][R2.64], R9 ;
+        /*03c0*/                   CCTL.IVALL ;
+.L_x_1:
+        /*03d0*/                   BSYNC.RECONVERGENT B0 ;
+        // [trimmed]
+	//## File "record_sass_fixtures.py", line 57
+        // [trimmed]
+        /*0460*/                   NOP ;
+        /*0470*/                   NOP ;
+        /*0480*/                   NOP ;
+        /*0490*/                   DMUL R4, R4, 3 ;
+        /*04a0*/                   STG.E.64 desc[UR6][R2.64+0x400], R4 ;
+.L_x_11:
+        /*04b0*/                   EXIT ;

@@ -96,7 +96,7 @@ class Node:
     versions, it has no output.
     """
 
-    __slots__ = ("op", "inputs", "attrs", "outputs", "callee")
+    __slots__ = ("op", "inputs", "attrs", "outputs", "callee", "loc", "origin")
 
     def __init__(
         self,
@@ -112,6 +112,12 @@ class Node:
         # The declared operator a call node calls (a kernel, extern, library or graph op), so that a plan can find what to launch;
         # ``None`` for a built-in op (arithmetic, a cast, a view, a store). It is not in ``attrs``: it is not printed and not compared.
         self.callee: Any = None
+        # Where the op was written: ``(file, line)`` of the line of the traced body (the file by its module-relative name,
+        # tilefish._source.source_name), for the traceability views (tilefish.explain); ``None`` when it was made by tilefish. Like ``callee`` it is
+        # not printed and not compared, so no digest, source or plan depends on it.
+        self.loc: "tuple[str, int] | None" = None
+        # For a node of a fused region's kernel: its position in the region's body (the ops the region took, in order); ``None`` otherwise.
+        self.origin: "int | None" = None
 
     @property
     def output_types(self) -> "tuple[TensorType, ...]":

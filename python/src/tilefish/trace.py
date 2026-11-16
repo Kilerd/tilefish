@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import os
+import sys
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from .dims import Dim, DimExpr
@@ -21,6 +23,25 @@ class _Missing:
 
 
 _MISSING = _Missing()
+_PACKAGE = os.path.dirname(os.path.abspath(__file__)) + os.sep  # tilefish's own files: a frame there is not the line an op was written on
+
+
+def _written_at(stop: Any) -> "tuple[str, int] | None":
+    """The line of the traced body an op is emitted from: the first frame up the stack outside tilefish's package, as ``(module-relative file,
+    line)``; ``None`` when the body itself is tilefish's (``stop``, the code of the body, is reached first: a fused region's kernel, a generated
+    op)."""
+    from ._source import source_name
+
+    f = sys._getframe(2)
+    while f is not None:
+        code = f.f_code
+        if not code.co_filename.startswith(_PACKAGE):
+            module = f.f_globals.get("__name__")
+            return (source_name(code.co_filename, module if isinstance(module, str) else None), f.f_lineno)
+        if code is stop:
+            return None
+        f = f.f_back
+    return None
 
 
 class TraceContext:
@@ -39,6 +60,10 @@ class TraceContext:
         # binds a dimension of its callee that no argument determines (one only its Out parameters mention) to the one of these that is the same Dim.
         self.dims: frozenset[Dim] = frozenset()
         self._next_id = 0
+        # the code object of the body being traced (decorators._trace_body), where the search for the line an op was written on stops, and
+        # whether it is running
+        self.body_code: Any = None
+        self.tracing = False
 
     def new_value(
         self,
@@ -61,7 +86,10 @@ class TraceContext:
         out_types: Sequence[TensorType],
     ) -> "tuple[Value, ...]":
         outs = tuple(self.new_value(t) for t in out_types)
-        self.nodes.append(Node(op, inputs, attrs, outs))
+        node = Node(op, inputs, attrs, outs)
+        if self.tracing:  # (an op emitted after the body ran, by the planner or the fusion pass, was not written on a line of it)
+            node.loc = _written_at(self.body_code)
+        self.nodes.append(node)
         return outs
 
     # -- facts about dimensions ---------------------------------------------

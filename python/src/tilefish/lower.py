@@ -575,8 +575,8 @@ import math
 import pathlib
 import re
 import struct
-from dataclasses import dataclass
-from typing import Any, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Sequence
 
 from ._specvalid import MAX_ELEMENTS
 from .aot import CompileSpec, compile_specs
@@ -819,6 +819,10 @@ class LoweredKernel:
     extern: ExternOp
     num_warps: int
     kernel: "KernelOp | None" = None
+    # what each line of ``source`` was written for (index 0 is line 1): ``None`` (the module's own code), or ``{"node": <index of the node in the
+    # kernel's graph>, "op": ..., "loc": "file:line" of the body}`` (``"origin"`` for a fused region's: the op's position in the region's body), or
+    # ``{"what": "load x"}`` for code of no op. For the traceability views (tilefish.explain); not in the source, so no digest depends on it.
+    line_map: "tuple[Any, ...]" = field(default=(), repr=False, compare=False)
 
     def run(self, /, *args: Any, mode: str = "jit", **kwargs: Any) -> Any:
         """``tilefish.run(self, *args, mode=mode, **kwargs)``."""
@@ -2107,6 +2111,8 @@ class _Body:
         }
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
+        self.made_for: "list[Any]" = []  # per line of ``lines``: the node (or a label of code of no op) it was emitted for
+        self.current: Any = None
         self.helpers: dict[tuple, tuple[str, list[str]]] = {}  # module-level @triton.jit functions the body calls (an argmax combine)
         self.indent = 1
         self._count = 0
@@ -2139,6 +2145,7 @@ class _Body:
 
     def emit(self, text: str, comment: str = "") -> None:
         self.lines.append("    " * self.indent + text + (f"  # {comment}" if comment else ""))
+        self.made_for.append(self.current)
 
     def operand(self, x: "Value | Scalar") -> str:
         return self.var[x] if isinstance(x, Value) else _scalar_text(x, self.rename)
@@ -2206,11 +2213,20 @@ class _Body:
     def load(self, p: Value) -> None:
         v = self.local()
         self.var[p] = v
+        self.current = f"load {p.name}"
         self.emit(f"{v} = {self.layout.load(self.rename.get(p.name, p.name), p)}", p.name)
+        self.current = None
 
     def node(self, n: Node, last_store: "dict[str, Node]") -> None:
         if n in self.fused_only:  # a product only fma sums read: they multiply in their chains
             return
+        self.current = n
+        try:
+            self._node(n, last_store)
+        finally:
+            self.current = None
+
+    def _node(self, n: Node, last_store: "dict[str, Node]") -> None:
         if n.op == "store":
             self.store(n, last_store)
         elif n.op == "scatter_rows":
@@ -2238,7 +2254,9 @@ class _Body:
         for n in graph.nodes:
             self.node(n, last_store)
         for k, v in enumerate(graph.outputs):
+            self.current = f"return value {k}"
             self.emit(layout.store(self.out_names[k], v, self.var[v]), f"return value {k}")
+        self.current = None
         return self.lines
 
     def run_chunked(self) -> "list[str]":
@@ -2279,8 +2297,10 @@ class _Body:
                 continue
             if n in carries:
                 v, bv, bi = carries[n]
+                self.current = n
                 value, index = self.arg_lanes(n, v)
                 self.emit(f"{bv}, {bi} = {self.combine(n)}({bv}, {bi}, {value}, {index})")
+                self.current = None
             else:
                 self.node(n, last_store)
         for k, v in enumerate(graph.outputs):
@@ -2289,9 +2309,11 @@ class _Body:
         self.indent -= 1
         for n in args:
             v, bv, bi = carries[n]
+            self.current = n
             self.emit(f"{v}_v, {v}_i = tl.reduce(({bv}, {bi}), 0, {self.combine(n)})")
             out = n.outputs[0].type.dtype.name
             self.emit(f"{v} = {v}_i" if out == "i32" else f"{v} = {v}_i.to(tl.{_TL[out]})")
+            self.current = None
         for n in graph.nodes:
             if phases.nodes[n] == "post":
                 self.node(n, last_store)
@@ -2840,12 +2862,20 @@ def _assemble(
     lines += ["import triton", "import triton.language as tl"]
     if body_emitter.libdevice:  # tanh: libdevice by name (note 14)
         lines.append("from triton.language.extra import libdevice")
+    helper_spans: "list[tuple[int, int, str]]" = []  # the lines of each helper function (0-based, end excluded), and its name
     for _, helper in body_emitter.helpers.values():
-        lines += ["", "", *helper]
+        lines += ["", ""]
+        start = _text_lines(lines)
+        lines += helper
+        named = re.search(r"^def (\w+)\(", "\n".join(helper), re.M)
+        helper_spans.append((start, _text_lines(lines), named.group(1) if named else "helper"))
     lines += ["", "", "@triton.jit", f"def {fn_name}("]
     lines += [f"    {d}," for d in decls]
-    lines += ["):", *body]
+    lines += ["):"]
+    first = _text_lines(lines)
+    lines += body
     source = "\n".join(lines) + "\n"
+    line_map = _line_map(op, first, body_emitter, source, helper_spans)
 
     extern = ExternOp(
         _stub(fn_name, module),
@@ -2860,8 +2890,52 @@ def _assemble(
         fp_fusion=fp_fusion,
         bucket_num_warps=bucket_warps,
         source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        sass=getattr(op, "sass", None),
     )
-    return LoweredKernel(op.name, fn_name, module, layout.template, source, extern, num_warps, op)
+    return LoweredKernel(op.name, fn_name, module, layout.template, source, extern, num_warps, op, line_map)
+
+
+def _text_lines(elements: "list[str]") -> int:
+    """The lines of text ``"\\n".join(elements)`` has (an element may hold several)."""
+    return sum(e.count("\n") + 1 for e in elements)
+
+
+def _line_map(op: KernelOp, first: int, body: "_Body", source: str, helpers: "Sequence[tuple[int, int, str]]" = ()) -> "tuple[Any, ...]":
+    """What each line of ``source`` was written for (:attr:`LoweredKernel.line_map`): the body's lines start after ``first`` lines (a line of the
+    body may hold several lines of text); the lines of a helper function (``helpers``: its span and name) were written for the ops whose lines
+    call it (one: that op, with ``"helper"``; several: ``{"what": "helper <name>", "used_by": [...]}``)."""
+    index = {id(n): k for k, n in enumerate(op.graph.nodes)}
+
+    def entry_of(made: Any) -> Any:
+        if isinstance(made, Node):
+            entry: "dict[str, Any]" = {"node": index.get(id(made)), "op": made.op}
+            if made.loc is not None:
+                entry["loc"] = f"{made.loc[0]}:{made.loc[1]}"
+            if made.origin is not None:
+                entry["origin"] = made.origin
+            return entry
+        return {"what": made} if isinstance(made, str) else None
+
+    out: "list[Any]" = [None] * first
+    users: "dict[str, list[Any]]" = {name: [] for _, _, name in helpers}
+    for text, made in zip(body.lines, body.made_for):
+        entry = entry_of(made)
+        out += [entry] * (text.count("\n") + 1)
+        if isinstance(made, Node):
+            for name in users:
+                if re.search(rf"(?<![\w.]){re.escape(name)}\(", text) and entry not in users[name]:
+                    users[name].append(entry)
+    for start, end, name in helpers:
+        found = users[name]
+        if len(found) == 1:
+            label: Any = {**found[0], "helper": name}
+        else:
+            ops = ", ".join(f"{u['node']} {u['op']}" for u in found)
+            label = {"what": f"helper {name}" + (f" (for nodes {ops})" if ops else ""), "used_by": found}
+        for k in range(start, min(end, len(out))):
+            out[k] = label
+    total = source.count("\n")
+    return tuple(out[:total] + [None] * (total - len(out)))
 
 
 def _reindexed(p: Param, index: int, name: str, unaligned: bool = False) -> Param:

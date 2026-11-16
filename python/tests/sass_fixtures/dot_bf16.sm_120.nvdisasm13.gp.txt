@@ -1,0 +1,135 @@
+	.target	sm_120a
+
+	.elftype	@"ET_EXEC"
+
+
+//--------------------- .text.dot_bf16            --------------------------
+	.section	.text.dot_bf16,"ax",@progbits
+	.align	128
+        .global         dot_bf16
+        .type           dot_bf16,@function
+        .size           dot_bf16,(.L_x_6 - dot_bf16)
+        .other          dot_bf16,@"STO_CUDA_ENTRY STV_DEFAULT"
+dot_bf16:
+.text.dot_bf16:
+	//## File ".nv_debug_ptx_txt", line 20
+        /*0000*/                   LDC R1, c[0x0][0x37c] ;
+	//## File ".nv_debug_ptx_txt", line 33
+        /*0010*/                   S2R R0, SR_TID.X ;
+	//## File ".nv_debug_ptx_txt", line 39
+        /*0020*/                   LDCU.128 UR4, c[0x0][0x380] ;
+	//## File ".nv_debug_ptx_txt", line 20
+        /*0030*/                   IADD3 R1, PT, PT, R1, -0x8, RZ ;
+        /*0040*/                   LDCU.64 UR8, c[0x0][0x358] ;
+	//## File ".nv_debug_ptx_txt", line 33
+        /*0050*/                   S2R R76, SR_TID.X ;
+	//## File ".nv_debug_ptx_txt", line 584
+        /*0060*/                   LDCU.64 UR10, c[0x0][0x390] ;
+	//## File ".nv_debug_ptx_txt", line 34
+        /*0070*/                   LOP3.LUT R3, R0.reuse, 0x60, RZ, 0xc0, !PT ;
+	//## File ".nv_debug_ptx_txt", line 41
+        /*0080*/                   LOP3.LUT R8, R0.reuse, 0x1f, RZ, 0xc0, !PT ;
+	//## File ".nv_debug_ptx_txt", line 36
+        /*0090*/                   LOP3.LUT R32, R0.reuse, 0x40, RZ, 0xc0, !PT ;
+	//## File ".nv_debug_ptx_txt", line 39
+        /*00a0*/                   IMAD.SHL.U32 R2, R3.reuse, 0x2, RZ ;
+	//## File ".nv_debug_ptx_txt", line 204
+        /*00b0*/                   LOP3.LUT R5, R0, 0x3f, RZ, 0xc0, !PT ;
+	//## File ".nv_debug_ptx_txt", line 39
+        /*00c0*/                   IMAD.HI.U32 R3, R3, 0x2, RZ ;
+	//## File ".nv_debug_ptx_txt", line 43
+        /*00d0*/                   IMAD.SHL.U32 R6, R8, 0x2, RZ ;
+	//## File ".nv_debug_ptx_txt", line 39
+        /*00e0*/                   IADD.64 R2, R2, UR4 ;
+	//## File ".nv_debug_ptx_txt", line 43
+        /*00f0*/                   IMAD.HI.U32 R7, R8, 0x2, RZ ;
+        // [trimmed]
+	//## File ".nv_debug_ptx_txt", line 389
+        /*09d0*/                   LDSM.16.M88.4 R64, [R60+UR4+0x1000] ;
+	//## File ".nv_debug_ptx_txt", line 429
+        /*09e0*/                   HMMA.16816.F32.BF16 R28, R8, R52, RZ ;
+        /*09f0*/                   NOP ;
+	//## File ".nv_debug_ptx_txt", line 436
+        /*0a00*/                   HMMA.16816.F32.BF16 R4, R8, R48, RZ ;
+        /*0a10*/                   NOP ;
+	//## File ".nv_debug_ptx_txt", line 443
+        /*0a20*/                   HMMA.16816.F32.BF16 R44, R8, R40, RZ ;
+        /*0a30*/                   NOP ;
+	//## File ".nv_debug_ptx_txt", line 457
+        /*0a40*/                   HMMA.16816.F32.BF16 R16, R56, R52, RZ ;
+	//## File ".nv_debug_ptx_txt", line 655
+        /*0a50*/                   SGXT R3, R3, 0x1 ;
+	//## File ".nv_debug_ptx_txt", line 208
+        // [trimmed]
+	//## File ".nv_debug_ptx_txt", line 393
+        /*0a80*/                   LDSM.16.M88.4 R60, [R60+UR4+0x1800] ;
+	//## File ".nv_debug_ptx_txt", line 450
+        /*0a90*/                   HMMA.16816.F32.BF16 R8, R8, R36, RZ ;
+	//## File ".nv_debug_ptx_txt", line 674
+        /*0aa0*/                   LOP3.LUT R2, R2, 0x1c00, RZ, 0xc0, !PT ;
+	//## File ".nv_debug_ptx_txt", line 658
+        /*0ab0*/                   LOP3.LUT R3, R0, 0x2010, R3, 0xf8, !PT ;
+	//## File ".nv_debug_ptx_txt", line 536
+        /*0ac0*/                   HMMA.16816.F32.BF16 R12, R20, R54, R28 ;
+	//## File ".nv_debug_ptx_txt", line 676
+        /*0ad0*/                   LOP3.LUT R0, R2, 0x70, R33, 0xf8, !PT ;
+	//## File ".nv_debug_ptx_txt", line 659
+        // [trimmed]
+	//## File ".nv_debug_ptx_txt", line 584
+        // [trimmed]
+        /*0b10*/                   IMAD.HI.U32 R3, R34, 0x4, RZ ;
+        /*0b20*/                   IADD.64 R2, R2, UR10 ;
+	//## File ".nv_debug_ptx_txt", line 539
+        /*0b30*/                   HMMA.16816.F32.BF16 R4, R20, R50, R4 ;
+        /*0b40*/                   NOP ;
+	//## File ".nv_debug_ptx_txt", line 542
+        /*0b50*/                   HMMA.16816.F32.BF16 R28, R20, R42, R44 ;
+.L_x_1:
+        /*0b60*/                   STL [R1+0x4], R15                            (*"SpillRefill"*);
+	//## File ".nv_debug_ptx_txt", line 376
+        /*0b70*/                   LDSM.16.M88.4 R44, [R32+UR4+0x1800] ;
+	//## File ".nv_debug_ptx_txt", line 548
+        /*0b80*/                   HMMA.16816.F32.BF16 R16, R24, R54, R16 ;
+.L_x_2:
+        /*0b90*/                   STL [R1], R13                                (*"SpillRefill"*);
+	//## File ".nv_debug_ptx_txt", line 545
+        /*0ba0*/                   HMMA.16816.F32.BF16 R20, R20, R38, R8 ;
+	//## File ".nv_debug_ptx_txt", line 586
+        /*0bb0*/                   IMAD.SHL.U32 R8, R33.reuse, 0x4, RZ ;
+        /*0bc0*/                   IMAD.HI.U32 R9, R33, 0x4, RZ ;
+        // [trimmed]
+	//## File ".nv_debug_ptx_txt", line 662
+        /*0be0*/                   MOV R8, R12 ;
+        /*0bf0*/                   MOV R9, R14 ;
+	//## File ".nv_debug_ptx_txt", line 471
+        /*0c00*/                   HMMA.16816.F32.BF16 R32, R56, R40, RZ ;
+	//## File ".nv_debug_ptx_txt", line 652
+        /*0c10*/                   IMAD.SHL.U32 R10, R76, 0x20, RZ ;
+	//## File ".nv_debug_ptx_txt", line 208
+        /*0c20*/                   UMOV UR5, 0x400 ;
+	//## File ".nv_debug_ptx_txt", line 485
+        /*0c30*/                   HMMA.16816.F32.BF16 R12, R68, R52, RZ ;
+	//## File ".nv_debug_ptx_txt", line 653
+        /*0c40*/                   LOP3.LUT R10, R10, 0x460, RZ, 0xc0, !PT ;
+	//## File ".nv_debug_ptx_txt", line 208
+        // [trimmed]
+	//## File ".nv_debug_ptx_txt", line 651
+        /*0c90*/                   BAR.SYNC.DEFER_BLOCKING 0x0 ;
+	//## File ".nv_debug_ptx_txt", line 554
+        /*0ca0*/                   HMMA.16816.F32.BF16 R32, R24, R42, R32 ;
+	//## File ".nv_debug_ptx_txt", line 662
+        /*0cb0*/                   STS.128 [R77+UR5], R8 ;
+	//## File ".nv_debug_ptx_txt", line 560
+        /*0cc0*/                   HMMA.16816.F32.BF16 R12, R64, R54, R12 ;
+        /*0cd0*/                   NOP ;
+	//## File ".nv_debug_ptx_txt", line 464
+        /*0ce0*/                   HMMA.16816.F32.BF16 R8, R56, R48, RZ ;
+        /*0cf0*/                   NOP ;
+	//## File ".nv_debug_ptx_txt", line 478
+        /*0d00*/                   HMMA.16816.F32.BF16 R56, R56, R36, RZ ;
+        /*0d10*/                   NOP ;
+	//## File ".nv_debug_ptx_txt", line 551
+        /*0d20*/                   HMMA.16816.F32.BF16 R8, R24, R50, R8 ;
+        /*0d30*/                   NOP ;
+	//## File ".nv_debug_ptx_txt", line 557
+        /*0d40*/                   HMMA.16816.F32.BF16 R24, R24, R38, R56 ;

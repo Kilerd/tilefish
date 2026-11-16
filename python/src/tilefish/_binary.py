@@ -208,6 +208,9 @@ def build_binary(spec: "CompileSpec", target: "BinaryTarget", *, arch: "int | st
     elf = parse_elf(cubin)
     if elf.section(f".text.{symbol}") is None:
         raise TilefishBuildError(f"the cubin of '{spec.stem}' has no code section '.text.{symbol}' (the entry point '{symbol}' of the declaration)")
+    from ._build import check_sass
+
+    check_sass(spec, cap, cubin, target.sources["ptx"].decode("utf-8") if target.kind == "ptx" else "", symbol, {})
     return BuiltKernel(
         spec=spec,
         arch=arch_name,

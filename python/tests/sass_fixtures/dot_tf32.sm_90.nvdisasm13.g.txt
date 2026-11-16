@@ -1,0 +1,61 @@
+	.headerflags	@"EF_CUDA_TEXMODE_UNIFIED EF_CUDA_64BIT_ADDRESS EF_CUDA_ACCELERATORS EF_CUDA_SM90 EF_CUDA_VIRTUAL_SM(EF_CUDA_SM90)"
+	.elftype	@"ET_EXEC"
+
+
+//--------------------- .text.dot_tf32            --------------------------
+	.section	.text.dot_tf32,"ax",@progbits
+	.sectionflags	@"SHF_BARRIERS=1"
+	.align	128
+        .global         dot_tf32
+        .type           dot_tf32,@function
+        .size           dot_tf32,(.L_x_2 - dot_tf32)
+        .other          dot_tf32,@"STO_CUDA_ENTRY STV_DEFAULT"
+dot_tf32:
+        // [trimmed]
+	//## File "record_sass_fixtures.py", line 34
+        /*0000*/                   LDC R1, c[0x0][0x28] ;
+	//## File "record_sass_fixtures.py", line 38
+        /*0010*/                   S2R R29, SR_TID.X ;
+	//## File "record_sass_fixtures.py", line 39
+        /*0020*/                   LDC.64 R4, c[0x0][0x218] ;
+	//## File "record_sass_fixtures.py", line 38
+        /*0030*/                   ULDC.64 UR4, c[0x0][0x210] ;
+        /*0040*/                   ULDC.64 UR14, c[0x0][0x208] ;
+        /*0050*/                   LOP3.LUT R0, R29, 0x70, RZ, 0xc0, !PT ;
+        /*0060*/                   LOP3.LUT R2, R29.reuse, 0xf, RZ, 0xc0, !PT ;
+        /*0070*/                   LOP3.LUT R3, R29, 0x40, RZ, 0xc0, !PT ;
+        /*0080*/                   IMAD.SHL.U32 R12, R0, 0x4, RZ ;
+        /*0090*/                   IMAD.SHL.U32 R13, R2, 0x4, RZ ;
+        /*00a0*/                   IMAD.HI.U32 R0, R0, 0x4, RZ ;
+        /*00b0*/                   IADD3 R12, P0, P1, R13, UR4, R12 ;
+        /*00c0*/                   IMAD.HI.U32 R7, R2, 0x4, RZ ;
+	//## File "record_sass_fixtures.py", line 39
+        /*00d0*/                   LOP3.LUT R2, R29, 0x3f, RZ, 0xc0, !PT ;
+        /*00e0*/                   IMAD.WIDE.U32 R4, R3, 0x4, R4 ;
+	//## File "record_sass_fixtures.py", line 38
+        /*00f0*/                   IADD3.X R13, R7, UR5, R0, P0, P1 ;
+        // [trimmed]
+	//## File "record_sass_fixtures.py", line 40
+        // [trimmed]
+        /*0610*/                   FENCE.VIEW.ASYNC.S ;
+        /*0620*/                   BAR.SYNC.DEFER_BLOCKING 0x0 ;
+        /*0630*/                   WARPGROUP.ARRIVE ;
+        /*0640*/                   HGMMA.64x64x8.F32.TF32 R56, gdesc[UR4], RZ, !UPT ;
+        /*0650*/                   UIADD3 UR5, UR12, 0x2020, URZ ;
+        /*0660*/                   UIADD3 UR4, UR12, 0x20, URZ ;
+        /*0670*/                   USHF.R.U32.HI UR5, URZ, 0x4, UR5 ;
+        // [trimmed]
+        /*06d0*/                   ULOP3.LUT UR4, UR8, 0x2000000, URZ, 0xfc, !UPT ;
+        /*06e0*/                   UMOV UR8, UR5 ;
+        /*06f0*/                   UMOV UR5, 0x80000020 ;
+        /*0700*/                   HGMMA.64x64x8.F32.TF32 R56, gdesc[UR8], R56 ;
+        /*0710*/                   HGMMA.64x64x8.F32.TF32 R24, gdesc[UR4], RZ, !UPT ;
+        /*0720*/                   UIADD3 UR4, UR12, 0x1020, URZ ;
+        /*0730*/                   USHF.R.U32.HI UR4, URZ, 0x4, UR4 ;
+        /*0740*/                   USGXT.U32 UR4, UR4, 0xe ;
+        /*0750*/                   ULOP3.LUT UR8, UR4, 0x2000000, URZ, 0xfc, !UPT ;
+        /*0760*/                   UMOV UR9, 0x80000020 ;
+        /*0770*/                   HGMMA.64x64x8.F32.TF32 R24, gdesc[UR8], R24, gsb0 ;
+	//## File "record_sass_fixtures.py", line 38
+        /*0780*/                   S2R R13, SR_TID.X ;
+        /*0790*/                   SHF.R.S32.HI R13, RZ, 0x6, R13 ;

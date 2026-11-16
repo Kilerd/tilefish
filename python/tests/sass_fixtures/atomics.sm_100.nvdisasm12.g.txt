@@ -1,0 +1,61 @@
+	.target	sm_100a
+
+	.elftype	@"ET_EXEC"
+
+
+//--------------------- .text.atomics             --------------------------
+	.section	.text.atomics,"ax",@progbits
+	.align	128
+        .global         atomics
+        .type           atomics,@function
+        .size           atomics,(.L_x_3 - atomics)
+        .other          atomics,@"STO_CUDA_ENTRY STV_DEFAULT"
+atomics:
+.text.atomics:
+	//## File "record_sass_fixtures.py", line 53
+        /*0000*/                   LDC R1, c[0x0][0x37c] ;
+	//## File "record_sass_fixtures.py", line 54
+        /*0010*/                   S2R R12, SR_TID.X ;
+	//## File "record_sass_fixtures.py", line 55
+        /*0020*/                   LDCU UR4, c[0x0][0x398] ;
+	//## File "record_sass_fixtures.py", line 54
+        /*0030*/                   S2R R3, SR_CTAID.X ;
+	//## File "record_sass_fixtures.py", line 55
+        /*0040*/                   LDCU.64 UR8, c[0x0][0x380] ;
+        /*0050*/                   LDCU.64 UR6, c[0x0][0x358] ;
+	//## File "record_sass_fixtures.py", line 54
+        /*0060*/                   LOP3.LUT R0, R12, 0x7f, RZ, 0xc0, !PT ;
+        /*0070*/                   IMAD R0, R3, 0x100, R0 ;
+        /*0080*/                   VIADD R2, R0.reuse, 0x80 ;
+	//## File "record_sass_fixtures.py", line 55
+        /*0090*/                   ISETP.GE.AND P0, PT, R0.reuse, UR4, PT ;
+        /*00a0*/                   LEA R4, P2, R0, UR8, 0x2 ;
+        /*00b0*/                   ISETP.GE.AND P1, PT, R2, UR4, PT ;
+        /*00c0*/                   CS2R R2, SRZ ;
+        /*00d0*/                   LEA.HI.X.SX32 R5, R0, UR9, 0x2, P2 ;
+        /*00e0*/              @!P0 LDG.E R3, desc[UR6][R4.64] ;
+        /*00f0*/              @!P1 LDG.E R2, desc[UR6][R4.64+0x200] ;
+        // [trimmed]
+	//## File "record_sass_fixtures.py", line 56
+        // [trimmed]
+        /*0310*/                   MEMBAR.ALL.GPU ;
+        /*0320*/                   ERRBAR;
+        /*0330*/                   CGAERRBAR ;
+        /*0340*/                   ATOMG.E.ADD.F32.FTZ.RN.STRONG.GPU PT, RZ, desc[UR6][R4.64], R7 ;
+        /*0350*/                   CCTL.IVALL ;
+.L_x_1:
+        /*0360*/                   BSYNC.RECONVERGENT B0 ;
+        // [trimmed]
+	//## File "record_sass_fixtures.py", line 57
+        /*0370*/                   LDCU.64 UR8, c[0x0][0x390] ;
+        /*0380*/                   F2F.F64.F32 R6, R3 ;
+        /*0390*/                   DMUL R6, R6, 3 ;
+        /*03a0*/                   LEA R4, P2, R0, UR8, 0x3 ;
+        /*03b0*/                   LEA.HI.X.SX32 R5, R0, UR9, 0x3, P2 ;
+        /*03c0*/              @!P0 STG.E.64 desc[UR6][R4.64], R6 ;
+        /*03d0*/               @P1 EXIT ;
+        /*03e0*/                   F2F.F64.F32 R2, R2 ;
+        /*03f0*/                   DMUL R6, R2, 3 ;
+        /*0400*/                   STG.E.64 desc[UR6][R4.64+0x400], R6 ;
+        /*0410*/                   EXIT ;
+.L_x_2:

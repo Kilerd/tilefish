@@ -188,12 +188,13 @@ def nvdisasm_candidates() -> "list[str]":
 _decodes: "dict[tuple[str, str], bool]" = {}
 
 
-def _disassemble(nvdisasm: str, cubin: bytes) -> "str | None":
-    """The listing of ``cubin`` by ``nvdisasm``, or ``None`` when this ``nvdisasm`` cannot decode its architecture."""
+def _disassemble(nvdisasm: str, cubin: bytes, flags: "Iterable[str]" = ()) -> "str | None":
+    """The listing of ``cubin`` by ``nvdisasm`` (with ``flags``: ``-c -g`` for the code with line information, :mod:`tilefish._sass`), or
+    ``None`` when this ``nvdisasm`` cannot decode its architecture."""
     with tempfile.TemporaryDirectory(prefix="tilefish-sass-") as d:
         path = pathlib.Path(d) / "k.cubin"
         path.write_bytes(cubin)
-        r = subprocess.run([nvdisasm, str(path)], capture_output=True, text=True, cwd=d)
+        r = subprocess.run([nvdisasm, *flags, str(path)], capture_output=True, text=True, cwd=d)
     if r.returncode != 0 or "Cannot decode architecture" in r.stderr or "fatal" in r.stderr:
         return None
     return r.stdout

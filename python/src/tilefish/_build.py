@@ -529,6 +529,9 @@ class BuiltKernel:
     # a generated kernel whose ops are the bits of CUDA math library functions, or that links libdevice: the ``cuda_math`` of its manifest entry
     # (:mod:`tilefish._cudamath`: the functions, the CUDA releases they were measured on, the sha256 of the libdevice linked); ``None`` otherwise
     cuda_math: "dict[str, Any] | None" = None
+    # every level of the compile, for a trace (``build(..., stages=True)``, :mod:`tilefish._trace`): Triton's ``asm`` texts by stage (``source``, the
+    # frontend's IR with its locations; ``ttir``, ``ttgir``, ``llir``, ``ptx``); ``None`` for a build that did not keep them. Not in any digest.
+    stages: "dict[str, str] | None" = None
 
     @property
     def stem(self) -> str:
@@ -827,6 +830,34 @@ def check_contraction(spec: "CompileSpec", cap: int, ptx: str, cubin: bytes, opt
     )
 
 
+def check_sass(spec: "CompileSpec", cap: int, cubin: bytes, ptx: str, symbol: str, options: "Mapping[str, Any]") -> None:
+    """Refuse a binary that violates the SASS assertions of its declaration (``sass=tilefish.sass(...)``, :mod:`tilefish._sass`) on ``sm_<cap>``.
+
+    Every build checks them, a cache hit as much as a compile, and a prebuilt binary too: from the PTX (the MMA kinds it spells), the ELF file
+    (the registers) and, when an assertion needs it, the SASS, read by the ``nvdisasm`` of the contraction check (or from the PTX assembled
+    for the base of the architecture's family, labelled so, where no ``nvdisasm`` decodes it). A spec without assertions is not looked at.
+    Raises :class:`~tilefish.errors.TilefishBuildError` naming each violated assertion, the instructions and their source lines."""
+    checks = getattr(spec, "_sass", None)
+    if checks is None:
+        return
+    mine = checks.for_arch(cap)
+    if mine.empty:
+        return
+    from . import _sass
+
+    found = _sass.judge(mine, cubin=cubin, ptx=ptx or None, symbol=symbol, options=options)
+    if not found.violations:
+        return
+    what = f"'{spec.stem}' ({spec.triton or 'prebuilt ' + str((spec.binary or {}).get('kind'))}) for sm_{cap}"
+    read = f" (read in {found.label})" if found.label else ""
+    listed = "\n".join(f"  - {v.describe()}" for v in found.violations)
+    raise TilefishBuildError(
+        f"{what} violates the SASS assertions of its declaration {mine.describe()}{read}:\n{listed}\nRefusing to build it: change the kernel "
+        "(or its launch options) until its binary is what the declaration says, or change the declaration. tilefish-explain shows the SASS of a "
+        "binary per source line."
+    )
+
+
 @contextlib.contextmanager
 def _always_compile(triton: Any) -> "Iterator[None]":
     """Make ``triton.compile`` compile, never read its disk cache, for the duration of the block.
@@ -937,6 +968,7 @@ def build(
     options: "Mapping[str, Any] | None" = None,
     ir_digest: "str | None" = None,
     cache: bool = True,
+    stages: bool = False,
 ) -> BuiltKernel:
     """Compile one spec to a cubin for ``arch`` (``"sm_103"`` or ``103``) with Triton.
 
@@ -999,6 +1031,10 @@ def build(
     virtual environment, the directory a generated source was written to, the working directory or the process: two builds of one
     spec with one toolchain are the same file. The machine code (``sha256_code``) is what it was before this naming.
 
+    **Stages.** ``stages=True`` keeps every level of the compile in :attr:`BuiltKernel.stages` (the frontend's IR, TTIR, TTGIR, LLVM IR, PTX), what
+    an export with ``trace=True`` writes next to the manifest (:mod:`tilefish._trace`). The cache holds binaries, not their IR, so such a build
+    compiles (it does not read the cache; it stores its entry): the same bytes as the entry, since a build is reproducible.
+
     **Concurrency.** Triton's frontend and compile are not known to be thread-safe, and a compile runs with a knob set that is
     process-wide, so a build holds one lock (:data:`tilefish._ir.LOCK`) for the *whole* compile, not only for the frontend. That is
     a latency trade-off: while one thread compiles (seconds, for a large kernel), every other thread's build, ``jit`` call and
@@ -1045,11 +1081,12 @@ def build(
             files=files,
             language=spec.language,
         )
-        hit = store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
+        hit = None if stages else store.load(cache_id, spec, arch=f"sm_{cap}", options=opts, triton_version=triton_version, ptxas_version=ptxas, ir_digest=digest)
         if hit is not None:
             check_tf32(spec, cap, frontend_ir, hit.ptx, triton_version)  # an entry has its PTX only, which the build that stored it was judged by too
             check_contraction(spec, cap, hit.ptx, hit.cubin, opts, hit.sha256)  # (an entry a tilefish without the check stored, too)
             check_launch_attributes(spec, hit.launch)  # the scratch and the cluster the declaration states, as for a compile
+            check_sass(spec, cap, hit.cubin, hit.ptx, hit.symbol, opts)  # the declaration's SASS assertions, on the binary the cache holds
             return dataclasses.replace(hit, cuda_math=cuda_math)  # (read from the source and the libdevice here, not from the cache)
 
     from triton.backends.compiler import GPUTarget
@@ -1108,6 +1145,7 @@ def build(
     from hashlib import sha256
 
     check_contraction(spec, cap, ptx, cubin, opts, sha256(cubin).hexdigest())
+    check_sass(spec, cap, cubin, ptx, symbol, opts)
 
     target = _PTX_TARGET.search(ptx)
     built = BuiltKernel(
@@ -1131,6 +1169,9 @@ def build(
     )
     if store is not None:
         store.store(cache_id, built)
+    if stages:
+        kept = {k: v for k, v in ((k, _text_or_none(v)) for k, v in asm.items() if k != "cubin") if v is not None}
+        built = dataclasses.replace(built, stages=kept)
     return built
 
 

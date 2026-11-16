@@ -88,6 +88,7 @@ class Op:
 
 def _trace_body(fn: Callable[..., Any], signature: Signature, name: str, kind: str) -> Graph:
     ctx = TraceContext(name, kind)
+    ctx.body_code = getattr(fn, "__code__", None)
     kwargs: dict[str, Any] = {}
     inputs: list[Value] = []
     consts: dict[str, Any] = {}
@@ -105,11 +106,14 @@ def _trace_body(fn: Callable[..., Any], signature: Signature, name: str, kind: s
         else:
             kwargs[p.name] = p.dim
     ctx.dims = frozenset(d for v in inputs for s in v.type.shape for d in s.free_dims())
+    ctx.tracing = True
     try:
         result = fn(**kwargs)
     except TilefishError as e:
         _name_scope(e, kind, name)
         raise
+    finally:
+        ctx.tracing, ctx.body_code = False, None  # (a code object does not pickle, and a graph's values hold their context)
     if result is None:
         outputs: tuple[Value, ...] = ()
     elif isinstance(result, Value):
@@ -425,11 +429,14 @@ class KernelOp(GraphOp):
         num_warps: "int | None" = None,
         fp_fusion: bool = True,
         math: str = "fast",
+        sass: Any = None,
     ) -> None:
         super().__init__(fn, name, signature, graph)
         self.num_warps = num_warps
         self.fp_fusion = fp_fusion
         self.math = math
+        # the SASS assertions of every binary (tilefish.sass(...)): in the declaration digest of the lowered kernel, checked at every build
+        self.sass = sass
         # a specialisation for pointers aligned to their element only (unaligned()): the kernel it is of, and the parameters it is for
         self.base: "KernelOp | None" = None
         self.unaligned_params: "frozenset[str]" = frozenset()
@@ -462,7 +469,8 @@ class KernelOp(GraphOp):
         if found is None:
             indices = sorted(by_name[nm].index for nm in wanted)
             found = KernelOp(
-                base.fn, f"{base.name}__ua{'_'.join(str(i) for i in indices)}", base.signature, base.graph, base.num_warps, base.fp_fusion, base.math
+                base.fn, f"{base.name}__ua{'_'.join(str(i) for i in indices)}", base.signature, base.graph, base.num_warps, base.fp_fusion, base.math,
+                base.sass,
             )
             found.base, found.unaligned_params = base, wanted
             found.context_free = base.context_free
@@ -656,6 +664,7 @@ def kernel(
     num_warps: int | None = None,
     fp_fusion: bool = True,
     math: str = "fast",
+    sass: Any = None,
 ) -> Any:
     """``@tilefish.kernel``: trace and type-check a kernel body; ``.lower()`` turns it into Triton source.
 
@@ -666,6 +675,8 @@ def kernel(
     ``sqrt`` are IEEE 754 (``div.rn.f32``, ``sqrt.rn.f32``), ``exp`` is ``expf``, ``silu`` is ``x / (1 + expf(-x))``
     (torch's), ``rsqrt`` is ``rsqrtf``, and ``sin`` and ``tanh`` keep a subnormal (note 13 of :mod:`tilefish.lower`);
     the default, ``"fast"``, is the contract of before. One op can say it alone: ``tilefish.exp(x, math="ieee")``.
+    ``sass=tilefish.sass(no_spills=True, max_registers=64)`` declares assertions about the SASS of every binary, checked at every build
+    (:func:`tilefish.sass`); they are in the declaration digest of the lowered kernel.
     """
     _check_decorator_arg("kernel", fn)
     if num_warps is not None and (
@@ -676,7 +687,9 @@ def kernel(
         raise TilefishDeclarationError(f"kernel: fp_fusion must be True or False, got {fp_fusion!r}")
     if math not in _MATH_MODES:
         raise TilefishDeclarationError(f"kernel: math must be one of {list(_MATH_MODES)}, got {math!r}")
-    options = {"num_warps": num_warps, "fp_fusion": fp_fusion, "math": math}
+    from ._sass import checks_or_none
+
+    options = {"num_warps": num_warps, "fp_fusion": fp_fusion, "math": math, "sass": checks_or_none(sass, "kernel")}
     if fn is None:
         return lambda f: _declare_traced(f, name, KernelOp, "kernel", **options)
     return _declare_traced(fn, name, KernelOp, "kernel", **options)
@@ -952,8 +965,13 @@ class ExternOp(Op):
         num_ctas: int = 1,
         global_scratch: int = 0,
         by_bucket: "Callable[..., Any] | None" = None,
+        sass: Any = None,
     ) -> None:
         super().__init__(fn, name, signature)
+        from ._sass import checks_or_none
+
+        # the SASS assertions of every binary (tilefish.sass(...)): in the declaration digest (only when given), checked at every build
+        self.sass = checks_or_none(sass, f"extern '{name}'")
         # extern(by_arch=...): the op that a graph calls and a caller runs has ``implementations`` (its key -> an ExternOp of its own: the
         # architecture's, "fallback", or the name of a named implementation), and each of those has ``implementation``, its key, which is in its
         # declaration digest and its specs. ``selection`` maps each architecture of the map to the key of its implementation and ``fallback_key``
@@ -1590,6 +1608,7 @@ def _implementation_op(
     reference: Any,
     base: "pathlib.Path | None",
     persistent: Any = None,
+    sass: Any = None,
 ) -> "ExternOp":
     """The ``ExternOp`` of the implementation ``im`` under ``key``: its stub (its own, or the op's ``sig``) with its consts, its kernel or binary."""
     where = f"extern op '{nm}': the implementation for {_label(key)}"
@@ -1627,13 +1646,15 @@ def _implementation_op(
             num_ctas=im.num_ctas,
             global_scratch=im.global_scratch,
             by_bucket=im.by_bucket,
+            sass=sass,
         )
     except TilefishDeclarationError as e:  # its grid, under its constexpr values
         raise TilefishDeclarationError(f"{where}: {e}") from None
 
 
 def _extern_by_arch(
-    by_arch: Any, fallback: Any, grid: Any, name: "str | None", index_bits: int, reference: Any, others: "dict[str, Any]", persistent: Any = None
+    by_arch: Any, fallback: Any, grid: Any, name: "str | None", index_bits: int, reference: Any, others: "dict[str, Any]", persistent: Any = None,
+    sass: Any = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(by_arch={...}, fallback=..., grid=..., persistent=...)``: one op, one public signature, an implementation per architecture."""
     misplaced = [k for k, v in others.items() if v is not None and v is not _UNSET and not (k in ("shared", "global_scratch") and v == 0)]
@@ -1675,7 +1696,7 @@ def _extern_by_arch(
         base = _declaring_dir(fn)
         impls: "dict[str, ExternOp]" = {}
         for key, group in chosen.items():
-            made = [_implementation_op(fn, nm, sig, limits, key, im, grid, index_bits, reference, base, persistent) for im in group]
+            made = [_implementation_op(fn, nm, sig, limits, key, im, grid, index_bits, reference, base, persistent, sass) for im in group]
             for other in made[1:]:  # two tilefish.impl(..., name=key) objects: one implementation only if they declare the same
                 try:
                     diff = _first_difference(_canonical_declaration(made[0]), _canonical_declaration(other), "")
@@ -1706,6 +1727,7 @@ def _extern_by_arch(
             implementations=impls,
             selection=selection,
             fallback_key=fallback_key,
+            sass=sass,
         )
         for one in impls.values():
             one.__dict__["_tf_of"] = op
@@ -1839,6 +1861,7 @@ def extern(
     cluster: Any = None,
     global_scratch: int = 0,
     by_bucket: Any = None,
+    sass: Any = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
 
@@ -1962,7 +1985,13 @@ def extern(
       configuration per bucket of the dimensions the callable names (each a ``Dim(..., buckets=[...])`` of the signature): the warps, stages and
       CTAs of that bucket's binary and the values of const parameters compiled into it (tile sizes), the grid evaluated with them. Each binary is
       built, keyed and digested with its own configuration; the declaration digest covers the configuration of every bucket.
+    * ``sass=tilefish.sass(no_tf32=True, mma="tcgen05.mma kind::f16", no_spills=True, max_registers=168)``: assertions about the SASS of every
+      binary (:func:`tilefish.sass`; ``by_arch=`` inside it per architecture), checked at every build and cache hit, a violation refused with the
+      instructions and source lines; in the declaration digest. With ``by_arch=`` they hold for every implementation.
     """
+    from ._sass import checks_or_none
+
+    sass = checks_or_none(sass, "extern")
     if by_arch is not None or fallback is not None:
         if args:
             raise TilefishDeclarationError("@tilefish.extern takes keyword arguments only, not a bare @tilefish.extern")
@@ -1973,7 +2002,7 @@ def extern(
             num_stages=num_stages, enable_fp_fusion=enable_fp_fusion, num_ctas=num_ctas, cluster=cluster, global_scratch=global_scratch,
             by_bucket=by_bucket,
         )  # fmt: skip
-        return _extern_by_arch(by_arch, fallback, grid, name, index_bits, reference, others, persistent)
+        return _extern_by_arch(by_arch, fallback, grid, name, index_bits, reference, others, persistent, sass)
     given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin)) if v is not None]
     if args or not given:
         raise TilefishDeclarationError(
@@ -2048,6 +2077,7 @@ def extern(
             num_ctas=num_ctas,
             global_scratch=global_scratch,
             by_bucket=by_bucket,
+            sass=sass,
         )
 
     return deco

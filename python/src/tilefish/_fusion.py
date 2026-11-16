@@ -90,10 +90,15 @@ class Fusion:
     intermediates: str = "declared"
     fp_contract: str = "none"
     verify: bool = True
+    sass: Any = None  # the SASS assertions of every region's kernel (tilefish.sass), or None
 
     def canonical(self) -> "dict[str, Any]":
-        """What a region's kernel depends on (``verify`` is a check, not a choice of numerics, and is left out)."""
-        return {"version": self.version, "grouping": self.grouping, "math": self.math, "intermediates": self.intermediates, "fp_contract": self.fp_contract}
+        """What a region's kernel depends on (``verify`` is a check, not a choice of numerics, and is left out; ``sass`` only when given, so
+        every region of a graph without it is named as it was)."""
+        out = {"version": self.version, "grouping": self.grouping, "math": self.math, "intermediates": self.intermediates, "fp_contract": self.fp_contract}
+        if self.sass is not None:
+            out["sass"] = self.sass.canonical()
+        return out
 
 
 def fusion(
@@ -104,6 +109,7 @@ def fusion(
     intermediates: str = "declared",
     fp_contract: str = "none",
     verify: bool = True,
+    sass: Any = None,
 ) -> Fusion:
     """``@tilefish.graph(fusion=tilefish.fusion(...))``: how the arithmetic written in the graph body is planned. Every choice is exact: the plan
     writes the bytes of its unfused composition (each op a kernel of its own; ``grouping="none"`` is that plan).
@@ -117,6 +123,8 @@ def fusion(
       ``a * b - c`` whose product nothing else reads becomes ``tilefish.fma``, one rounding; of two such products of one add, the left one).
     * ``verify``: whether ``export`` checks every region of more than one op against its ops one by one (``True``; ``export(..., verify=False)``
       or ``False`` here skips it).
+    * ``sass``: SASS assertions (:func:`tilefish.sass`) every region's kernel is built under (``tilefish.sass(no_spills=True, max_registers=64)``),
+      checked at every build; in the regions' declaration digests and names (only when given).
     """
     if version not in VERSIONS or isinstance(version, bool):
         raise TilefishPlanError(f"fusion: version must be one of {list(VERSIONS)}, got {version!r}")
@@ -130,7 +138,9 @@ def fusion(
             raise TilefishPlanError(f"fusion: {key} must be one of {list(allowed)}, got {value!r}")
     if not isinstance(verify, bool):
         raise TilefishPlanError(f"fusion: verify must be True or False, got {verify!r}")
-    return Fusion(version, grouping, math, intermediates, fp_contract, verify)
+    from ._sass import checks_or_none
+
+    return Fusion(version, grouping, math, intermediates, fp_contract, verify, checks_or_none(sass, "fusion"))
 
 
 def settings_of(gop: Any) -> Fusion:
@@ -182,7 +192,7 @@ def fused(gop: Any, grouping: "str | None" = None) -> Fused:
     """The fusion of a graph (cached on it): ``grouping`` overrides the declaration's (``"none"``: the unfused composition)."""
     settings = settings_of(gop)
     if grouping is not None and grouping != settings.grouping:
-        settings = Fusion(settings.version, grouping, settings.math, settings.intermediates, settings.fp_contract, settings.verify)
+        settings = Fusion(settings.version, grouping, settings.math, settings.intermediates, settings.fp_contract, settings.verify, settings.sass)
     key = ("_tf_fused", settings)
     cache = gop.__dict__.setdefault("_tf_fused", {})
     found = cache.get(key)
@@ -246,6 +256,9 @@ class _Pass:
             nodes, origin = self._opmath(nodes, origin)
         if self.settings.fp_contract == "mul-add":
             nodes, origin = self._mul_add(nodes, origin)
+        for n, o in zip(nodes, origin):  # an op a rewrite made is where the op it was made of was written (tilefish.explain)
+            if n.loc is None:
+                n.loc = self.source.nodes[o].loc
         return nodes, origin
 
     def _opmath(self, nodes: "list[Node]", origin: "list[int]") -> "tuple[list[Node], list[int]]":
@@ -750,10 +763,11 @@ def _declare(name: str, params: "list[tuple[str, TensorType, Value, bool]]", mas
                 (env[v],) = ctx.emit("ne", [val, Scalar(0, u8)], {}, [TensorType(v.type.shape, bool_)])
             else:
                 env[v] = val
-        for n in body:
+        for position, n in enumerate(body):
             # a const of the graph is its value here (a region's kernel has no such parameter)
             ins = [env[i] if isinstance(i, Value) else Scalar(i.value, i.dtype) if isinstance(i, Scalar) and i.name is not None else i for i in n.inputs]
             outs = ctx.emit(n.op, ins, _clean(n.attrs), [o.type for o in n.outputs])
+            ctx.nodes[-1].loc, ctx.nodes[-1].origin = n.loc, position  # where the op is in the graph's body (tilefish.explain); nothing depends on it
             for o, new in zip(n.outputs, outs):
                 env[o] = new
         results = []
@@ -776,7 +790,7 @@ def _declare(name: str, params: "list[tuple[str, TensorType, Value, bool]]", mas
     replay.__module__ = "tilefish_generated"
     sig = parse_signature(replay, what="kernel", name=name, check_derivable=True, allow_strided=True)
     graph = _trace_body(replay, sig, name, "kernel")
-    op = KernelOp(replay, name, _with_traced_returns(sig, graph, "kernel", name), graph, None, False, settings.math)
+    op = KernelOp(replay, name, _with_traced_returns(sig, graph, "kernel", name), graph, None, False, settings.math, settings.sass)
     op.context_free = True
     return op
 

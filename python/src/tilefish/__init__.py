@@ -86,6 +86,7 @@ from .ops import copy as copy  # tilefish.copy (a copy step of a graph): not in 
 from .ops import argmax, argmin, cos, div, erf, exp, fma, gather_rows, gelu, iota, load, neg, rcp, rsqrt, scatter_rows, silu, sin, sin_approx
 from .ops import barrier, sqrt, tanh, tree, where, zeros_like
 from ._fusion import Fusion, TilefishFusionError, TilefishFusionWarning, fusion
+from ._sass import SassChecks, sass
 from ._copyops import col2im1d, contiguous, im2col, im2col1d
 from .ops import reduce_mean as mean
 from .runtime import capture, run
@@ -151,6 +152,7 @@ __all__ = [
     "Persistent",
     "Plan",
     "Requirement",
+    "SassChecks",
     "Scalar",
     "StrideOf",
     "Strided",
@@ -220,6 +222,7 @@ __all__ = [
     "rcp",
     "rsqrt",
     "run",
+    "sass",
     "scatter_rows",
     "silu",
     "sin",

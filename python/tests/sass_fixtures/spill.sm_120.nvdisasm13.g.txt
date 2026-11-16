@@ -1,0 +1,118 @@
+	.target	sm_120a
+
+	.elftype	@"ET_EXEC"
+
+
+//--------------------- .text.spill               --------------------------
+	.section	.text.spill,"ax",@progbits
+	.align	128
+        .global         spill
+        .type           spill,@function
+        .size           spill,(.L_x_1046 - spill)
+        .other          spill,@"STO_CUDA_ENTRY STV_DEFAULT"
+spill:
+.text.spill:
+	//## File "record_sass_fixtures.py", line 45
+        /*0000*/                   LDC R1, c[0x0][0x37c] ;
+	//## File "record_sass_fixtures.py", line 47
+        /*0010*/                   S2R R0, SR_TID.X ;
+        /*0020*/                   LDC.64 R2, c[0x0][0x380] ;
+        /*0030*/                   LDCU.64 UR6, c[0x0][0x358] ;
+        /*0040*/                   IADD3 R1, PT, PT, R1, -0x888, RZ ;
+        /*0050*/                   LOP3.LUT R5, R0, 0x40, RZ, 0xc0, !PT ;
+        /*0060*/                   IMAD.WIDE.U32 R2, R5, 0x4, R2 ;
+        /*0070*/                   LOP3.LUT R5, R0, 0x3f, RZ, 0xc0, !PT ;
+        /*0080*/                   IMAD.WIDE.U32 R2, R5, 0x4, R2 ;
+        /*0090*/                   LDG.E R6, desc[UR6][R2.64+0x1400] ;
+        /*00a0*/                   LDG.E R7, desc[UR6][R2.64+0x1600] ;
+        /*00b0*/                   LDG.E R4, desc[UR6][R2.64+0x1000] ;
+        /*00c0*/                   LDG.E R5, desc[UR6][R2.64+0x1200] ;
+        /*00d0*/                   LDG.E R9, desc[UR6][R2.64+0xa00] ;
+        /*00e0*/                   LDG.E R10, desc[UR6][R2.64+0x800] ;
+        /*00f0*/                   LDG.E R0, desc[UR6][R2.64+0xe00] ;
+        // [trimmed]
+        /*0200*/                   LDG.E R26, desc[UR6][R2.64+0x3c00] ;
+        /*0210*/                   LDG.E R27, desc[UR6][R2.64+0x3e00] ;
+.L_x_1:
+        /*0220*/                   STL.64 [R1+0x878], R6                        (*"SpillRefill"*);
+.L_x_2:
+        /*0230*/                   STL.64 [R1+0x870], R4                        (*"SpillRefill"*);
+.L_x_3:
+        /*0240*/                   STL [R1+0x4], R9                             (*"SpillRefill"*);
+.L_x_4:
+        /*0250*/                   STL [R1], R10                                (*"SpillRefill"*);
+.L_x_5:
+        /*0260*/                   LDL.LU.64 R4, [R1]                           (*"SpillRefill"*);
+        /*0270*/                   LDG.E R9, desc[UR6][R2.64+0x1a00] ;
+        /*0280*/                   LDG.E R10, desc[UR6][R2.64+0x1c00] ;
+.L_x_6:
+        /*0290*/                   STL [R1+0x884], R4                           (*"SpillRefill"*);
+.L_x_7:
+        /*02a0*/                   STL [R1+0x880], R5                           (*"SpillRefill"*);
+.L_x_8:
+        /*02b0*/                   STL [R1+0xc], R0                             (*"SpillRefill"*);
+.L_x_9:
+        /*02c0*/                   STL [R1+0x8], R8                             (*"SpillRefill"*);
+        /*02d0*/                   S2R R5, SR_TID.X ;
+.L_x_10:
+        /*02e0*/                   LDL.LU.64 R6, [R1+0x8]                       (*"SpillRefill"*);
+        /*02f0*/                   LDG.E R8, desc[UR6][R2.64+0x1800] ;
+        /*0300*/                   SHF.R.S32.HI R0, RZ, 0x6, R5 ;
+        /*0310*/                   IMAD.SHL.U32 R29, R5, 0x40, RZ ;
+        // [trimmed]
+        /*0360*/                   UMOV UR4, 0x400 ;
+        /*0370*/                   ULEA UR4, UR5, UR4, 0x18 ;
+.L_x_11:
+        /*0380*/                   STL [R1+0x85c], R8                           (*"SpillRefill"*);
+.L_x_12:
+        /*0390*/                   STL [R1+0x860], R9                           (*"SpillRefill"*);
+.L_x_13:
+        /*03a0*/                   STL [R1+0x864], R10                          (*"SpillRefill"*);
+.L_x_14:
+        /*03b0*/                   STL [R1+0x868], R11                          (*"SpillRefill"*);
+.L_x_15:
+        /*03c0*/                   STL [R1+0x14], R14                           (*"SpillRefill"*);
+.L_x_16:
+        /*03d0*/                   STL [R1+0x10], R15                           (*"SpillRefill"*);
+.L_x_17:
+        /*03e0*/                   LDL.64 R8, [R1+0x10]                         (*"SpillRefill"*);
+.L_x_18:
+        /*03f0*/                   STL [R1+0x1c], R12                           (*"SpillRefill"*);
+.L_x_19:
+        /*0400*/                   STL [R1+0x18], R13                           (*"SpillRefill"*);
+        /*0410*/                   LDG.E R14, desc[UR6][R2.64+0x2400] ;
+        /*0420*/                   LDG.E R12, desc[UR6][R2.64+0x2000] ;
+        /*0430*/                   LDG.E R13, desc[UR6][R2.64+0x2200] ;
+        /*0440*/                   LDG.E R15, desc[UR6][R2.64+0x2600] ;
+.L_x_20:
+        /*0450*/                   LDL.64 R10, [R1+0x18]                        (*"SpillRefill"*);
+        /*0460*/                   IMAD.SHL.U32 R3, R5, 0x4, RZ ;
+        /*0470*/                   LOP3.LUT R2, R29, 0x600, RZ, 0xc0, !PT ;
+        /*0480*/                   LOP3.LUT R2, R2, 0x70, R4, 0xf8, !PT ;
+        // [trimmed]
+        /*0510*/                   SGXT R3, R3, 0x1 ;
+        /*0520*/                   LOP3.LUT R0, R0, 0x70, R4, 0xf8, !PT ;
+.L_x_21:
+        /*0530*/                   STL [R1+0x858], R24                          (*"SpillRefill"*);
+        /*0540*/                   LOP3.LUT R2, R2, 0x120, R3, 0xf8, !PT ;
+        /*0550*/                   IMAD.SHL.U32 R3, R5.reuse, 0x10, RZ ;
+        /*0560*/                   LOP3.LUT R29, R5.reuse, 0x10, RZ, 0xc0, !PT ;
+.L_x_22:
+        /*0570*/                   LDL.LU R4, [R1+0x884]                        (*"SpillRefill"*);
+        /*0580*/                   LOP3.LUT R0, R0, 0x10, R5, 0x78, !PT ;
+        /*0590*/                   LOP3.LUT R24, R5, 0x1c, RZ, 0xc0, !PT ;
+.L_x_23:
+        /*05a0*/                   LDL.LU R5, [R1+0x880]                        (*"SpillRefill"*);
+        /*05b0*/                   LOP3.LUT R3, R2, 0x70, R3, 0x78, !PT ;
+        /*05c0*/                   IADD3 R2, PT, PT, R28, UR4, RZ ;
+        /*05d0*/                   S2R R28, SR_TID.X ;
+        // [trimmed]
+        /*06e0*/                   STSM.16.M88.4 [R2+0x800], R4 ;
+        /*06f0*/                   MOV R10, R5 ;
+.L_x_24:
+        /*0700*/                   LDL.LU.64 R6, [R1+0x878]                     (*"SpillRefill"*);
+.L_x_25:
+        /*0710*/                   LDL.LU.64 R4, [R1+0x870]                     (*"SpillRefill"*);
+.L_x_26:
+        /*0720*/                   STL.64 [R1+0x840], R6                        (*"SpillRefill"*);
+        /*0730*/                   STSM.16.M88.4 [R2+0x1000], R4 ;

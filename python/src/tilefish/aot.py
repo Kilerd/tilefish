@@ -372,6 +372,9 @@ class CompileSpec:
     # ``(((architecture, key), ...), the fallback's key or None)``, known when the spec was generated or verified against the declaration (the
     # build refuses an architecture that does not run this implementation: ``_build.check_implementation_arch``). Not serialized, not compared.
     _selection: "tuple[tuple[tuple[str, str], ...], str | None] | None" = field(default=None, init=False, repr=False, compare=False)
+    # The SASS assertions of the declaration (``tilefish.sass``), which the build checks: in the declaration digest, not serialized (a spec read
+    # back gets them from ``verify_against``), not compared.
+    _sass: Any = field(default=None, init=False, repr=False, compare=False)
 
     @property
     def triton_module(self) -> str:
@@ -629,6 +632,7 @@ class CompileSpec:
                 f"first difference at {path}: the spec has {_show(got)}, the declaration gives {_show(want)}"
             )
         object.__setattr__(self, "_selection", expected._selection)  # which architectures run its implementation, as the declaration says
+        object.__setattr__(self, "_sass", expected._sass)  # the SASS assertions (in the declaration digest just compared)
         self._mark_verified()
 
     @classmethod
@@ -868,6 +872,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc["global_scratch"] = op.global_scratch
     if op.binary is not None and tuple(op.binary.cluster) != (1, 1, 1):
         doc["binary"]["cluster"] = list(op.binary.cluster)
+    if getattr(op, "sass", None) is not None:  # the SASS assertions (tilefish.sass), only when declared: every other digest is as it was
+        doc["sass"] = op.sass.canonical()
     if op.by_bucket_dims:  # the whole configuration of every bucket by_bucket= names, the grid under its consts included
         doc["by_bucket"] = [
             {
@@ -1207,6 +1213,7 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
     parent = op.__dict__.get("_tf_of") if op.implementation is not None else None  # the op declared with by_arch= this is an implementation of
     if parent is not None and parent.selection is not None:
         object.__setattr__(spec, "_selection", (tuple(sorted(parent.selection.items())), parent.fallback_key))
+    object.__setattr__(spec, "_sass", getattr(op, "sass", None))  # the SASS assertions the build checks (in the declaration digest)
     spec._mark_verified()  # generated from the declaration just now
     return spec
 
