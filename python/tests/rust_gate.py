@@ -93,6 +93,15 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   ``fused_*`` are the graphs of ``fusion_graphs.CASES``, whose bodies compute: their arithmetic is fused regions (``docs/rfcs/0001-plan-fusion.md``),
   kernel steps of generated kernels that the Rust host launches like any other (each export verifies its regions against their ops one by one).
 
+* **instrumented binaries** (:func:`prepare_instrumented`, ``WORK/instrumented.json``; on sm_90 or newer): the probed kernels of ``rust_gate_probed.py`` (a
+  warp-specialised Gluon kernel with a probe around each wait of each partition, and a ``@tilefish.kernel`` with probes) exported as an instrumented
+  variant (``export(..., instrument=True)``, ``docs/instrument.md``), and the graph ``probed_chain`` as an instrumented plan. Python replays each with
+  ``probes=tilefish.Probes()`` (its outputs checked to be the production build's bytes) and saves its records; ``crates/tilefish/tests/gpu_instrument_gate.rs``
+  launches the kernels with a probe buffer (``Kernel::launch_probed``), and without one (the same bytes, nothing recorded), and runs the plan with probes
+  (``LaunchPlan::instantiate_probed``: launched, and captured and replayed), and ``compare`` holds its outputs to the production bytes and its records
+  to Python's, warp by warp: the same CTAs, warps, roles and the same probes in the same order (``--host cpp`` has none: the C++ host refuses an
+  instrumented export, as ``Manifest::load`` does).
+
 ``WORK/cases.json`` is what ``crates/tilefish/tests/gpu_gate.rs`` reads::
 
     {"arch": "sm_103", "digest": ..., "manifest": "manifest", "cublaslt_version": 120804 (when there are library entries),
@@ -1767,7 +1776,197 @@ def compare(work, host="rust"):
             f"{host} plan vs python plan replay: {plan_passed} of {plan_cases} cases byte-identical (the launch and the CUDA graph replay of each case; the "
             "cases of the plans of a shared arena again, one plan after the other on one SharedArena)"
         )
-    return 0 if not failed and not plan_failed else 1
+    inst_passed, inst_cases, inst_failed = compare_instrumented(work, host)
+    for case_id, bad in inst_failed:
+        print(f"FAIL {case_id}: {'; '.join(bad)}")
+    if inst_cases:
+        print(
+            f"{host} instrumented vs python: {inst_passed} of {inst_cases} cases (the outputs the production bytes, with a probe buffer and without one; "
+            "the records Python's, warp by warp; the instrumented plan launched, replayed and instantiated without probes)"
+        )
+    return 0 if not failed and not plan_failed and not inst_failed else 1
+
+
+# -- instrumented binaries (docs/instrument.md) -------------------------------------------------------------------------------------------------
+
+
+def prepare_instrumented(work):
+    """The instrumented export of ``rust_gate_probed.ops()`` (``WORK/instrumented/manifest``) and the instrumented plan of ``probed_chain``
+    (``WORK/instrumented/plan``), each case replayed by Python with ``probes=`` (its outputs checked to be the bytes of the production build, which records
+    nothing) and its records saved; ``WORK/instrumented.json`` for ``gpu_instrument_gate.rs``::
+
+        {"arch", "manifest", "digest", "cases": [{"id", "stem", "tensors": [...as cases.json...], "probes"}],
+         "plan": {"dir", "digest", "bucket": {dim: value}, "externals": [{"name", "role", "dtype", "shape", "input"?, "expect"?}], "probes"}}
+
+    ``probes`` is the file of Python's records of the case (``tilefish.probe-trace.v1``). Nothing on a device older than sm_90 (the kernels use TMA)."""
+    work = pathlib.Path(work).resolve()
+    if not tma_capable():
+        print("no instrumented cases: the probed kernels use TMA (sm_90 or newer)", file=sys.stderr)
+        return
+    import rust_gate_probed as rp
+
+    major, minor = torch.cuda.get_device_capability()
+    arch = f"sm_{major * 10 + minor}"
+    root = work / "instrumented"
+    if root.exists():
+        shutil.rmtree(root)
+    declared = rp.ops()
+    inst = runtime.export(list(declared.values()), root / "manifest", instrument=True)
+    assert inst.instrumented and all("instrument" in e for e in inst.doc["kernels"])
+    cases = []
+    for case_id, name, args in (
+        ("ws_scale_probed-256x1024", "ws_scale_probed", (randn((256, 1024), F16, seed=41),)),
+        ("ws_scale_probed-130x200", "ws_scale_probed", (randn((130, 200), F16, seed=42),)),
+        ("scale_add_probed-65536", "scale_add_probed", (randn((65536,), F32, seed=43), randn((65536,), F32, seed=44))),
+    ):
+        op = declared[name]
+        tensors, inputs, outputs = abi_of(op)
+        want = tilefish.run(op, *[a.clone() for a in args])  # the production build: its probes are nothing
+        rec = tilefish.Probes()
+        got = tilefish.run(op, *[a.clone() for a in args], mode="replay", manifest=root / "manifest", pin=inst.digest, probes=rec)
+        assert same_bytes(got, want), f"{case_id}: the instrumented variant does not give the production bytes"
+        assert len(rec.launches) == 1 and not rec.launches[0].missing, case_id
+        case_dir = root / "cases" / case_id
+        case_dir.mkdir(parents=True)
+        rec.trace().save(case_dir / "python_probes.json")
+        post = {**dict(zip(inputs, args)), **dict(zip(outputs, [got]))}
+        entries = []
+        for tname, access in tensors:
+            fields, expect = describe(post[tname])
+            entry = {"name": tname, "role": access, "dtype": DTYPES[post[tname].dtype], **fields, "expect": f"instrumented/cases/{case_id}/{tname}.expect.bin"}
+            (work / entry["expect"]).write_bytes(expect)
+            if access != "out":
+                entry["input"] = f"instrumented/cases/{case_id}/{tname}.in.bin"
+                (work / entry["input"]).write_bytes(describe(args[inputs.index(tname)])[1])
+            entries.append(entry)
+        cases.append({"id": case_id, "stem": _stem_of(inst, name, arch), "tensors": entries,
+                      "probes": f"instrumented/cases/{case_id}/python_probes.json"})
+    # the instrumented plan: two instrumented steps
+    plan = runtime.export(rp.probed_chain, root / "plan", instrument=True)
+    x = randn((192, 512), F16, seed=45)
+    want = tilefish.run(rp.probed_chain, x.clone())
+    rec = tilefish.Probes()
+    got = tilefish.run(rp.probed_chain, x.clone(), mode="replay", plan=root / "plan", pin=plan.digest, probes=rec)
+    assert same_bytes(got, want), "probed_chain: the instrumented plan does not give the production bytes"
+    assert [launch.step for launch in rec.launches] == [0, 1], [launch.step for launch in rec.launches]
+    (root / "plan_case").mkdir(parents=True)
+    rec.trace().save(root / "plan_case" / "python_probes.json")
+    (root / "plan_case" / "x.in.bin").write_bytes(raw(x))
+    (root / "plan_case" / "out0.expect.bin").write_bytes(raw(got))
+    doc = plan.doc
+    bucket = doc["buckets"][0]["values"]
+    externals = [
+        {"name": "x", "role": "input", "dtype": "f16", "shape": list(x.shape), "input": "instrumented/plan_case/x.in.bin"},
+        {"name": doc["outputs"][0], "role": "output", "dtype": "f16", "shape": list(got.shape), "expect": "instrumented/plan_case/out0.expect.bin"},
+    ]
+    record = {
+        "arch": arch,
+        "manifest": "instrumented/manifest",
+        "digest": inst.digest,
+        "cases": cases,
+        "plan": {"dir": "instrumented/plan", "digest": plan.digest, "bucket": bucket, "externals": externals, "probes": "instrumented/plan_case/python_probes.json"},
+    }
+    (work / "instrumented.json").write_text(json.dumps(record, indent=1) + "\n", encoding="utf-8")
+    print(f"prepared {len(cases)} instrumented cases and the instrumented plan probed_chain (manifest digest {inst.digest})", file=sys.stderr)
+
+
+def _stem_of(manifest, op_name, arch):
+    """The stem of the one binary of ``op_name`` on ``arch`` in ``manifest``."""
+    (stem,) = [e["stem"] for e in manifest.doc["kernels"] if e["op"] == op_name and e["arch"] == arch]
+    return stem
+
+
+def _same_records(name, got, want):
+    """What two collections of one launch's records must share, warp by warp (``tilefish._probes.Launch``): the binary, its grid, block and probes,
+    and every warp with its role and its probes in the same order (the times differ). Returns the problems."""
+    bad = []
+    for field in ("stem", "arch", "grid", "block", "capacity", "probes", "graph", "step"):
+        if getattr(got, field) != getattr(want, field):
+            bad.append(f"{name}: {field} is {getattr(got, field)!r}, Python's {getattr(want, field)!r}")
+    if got.missing or want.missing:
+        bad.append(f"{name}: warp slots without records: {got.missing[:4]} (Python: {want.missing[:4]})")
+    g = {(w.cta, w.warp): w for w in got.warps}
+    p = {(w.cta, w.warp): w for w in want.warps}
+    if set(g) != set(p):
+        bad.append(f"{name}: {len(g)} warps recorded, Python's {len(p)}")
+        return bad
+    for key, w in p.items():
+        r = g[key]
+        if [x[0] for x in r.records] != [x[0] for x in w.records] or r.count != w.count:
+            bad.append(f"{name}: CTA {key[0]} warp {key[1]} recorded {[x[0] for x in r.records][:12]} ({r.count}), Python {[x[0] for x in w.records][:12]} ({w.count})")
+            break
+        if got.role_of(r) != want.role_of(w):
+            bad.append(f"{name}: CTA {key[0]} warp {key[1]} has role {got.role_of(r)!r}, Python's {want.role_of(w)!r}")
+            break
+        if not r.records or r.records[0][0] != 0 or r.records[-1][0] != 1:
+            bad.append(f"{name}: CTA {key[0]} warp {key[1]} does not run from @begin to @end")
+            break
+    return bad
+
+
+def compare_instrumented(work, host="rust"):
+    """The outputs of the Rust host's instrumented launches (with a probe buffer, and without one) and of its instrumented plan (launched, and replayed)
+    against the production bytes, and its records against Python's (:func:`_same_records`). Returns ``(passed, cases, failures)``."""
+    path = work / "instrumented.json"
+    if not path.exists() or host != "rust":  # (the C++ host refuses an instrumented export)
+        return 0, 0, []
+    from tilefish._probes import ProbeTrace
+
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    out = work / "rust_instrumented"
+    failed, passed, count = [], 0, 0
+    traces = {}
+    for name in ("probes.json", "plan_probes.json", "plan_graph_probes.json"):
+        try:
+            traces[name] = ProbeTrace.load(out / name)
+        except Exception as e:  # noqa: BLE001 - a missing or malformed file is a failure of the gate
+            failed.append((f"rust_instrumented/{name}", [f"{type(e).__name__}: {e}"]))
+    rust_launches = traces["probes.json"].launches if "probes.json" in traces else []
+    for k, case in enumerate(doc["cases"]):
+        count += 1
+        bad = []
+        for t in case["tensors"]:
+            expect = (work / t["expect"]).read_bytes()
+            for suffix in ("", ".null"):  # with a probe buffer, and launched without one (the profile scratch null: nothing recorded)
+                got_path = out / case["id"] / f"{t['name']}{suffix}.bin"
+                got = got_path.read_bytes() if got_path.exists() else None
+                if got != expect:
+                    bad.append(f"{t['name']}{suffix} ({'missing' if got is None else sum(a != b for a, b in zip(got, expect))} bytes differ)")
+        want = ProbeTrace.load(work / case["probes"]).launches[0]
+        if k < len(rust_launches):
+            bad += _same_records(case["id"], rust_launches[k], want)
+        else:
+            bad.append(f"{case['id']}: the Rust trace has no launch of it")
+        if bad:
+            failed.append((f"rust_instrumented/{case['id']}", bad))
+        else:
+            passed += 1
+    plan = doc["plan"]
+    want = ProbeTrace.load(work / plan["probes"]).launches
+    for label, trace, suffix in (("launch", "plan_probes.json", ""), ("graph replay", "plan_graph_probes.json", ".graph"), ("no probes", None, ".null")):
+        count += 1
+        bad = []
+        for t in plan["externals"]:
+            if "expect" not in t:
+                continue
+            expect = (work / t["expect"]).read_bytes()
+            got_path = out / "plan" / f"{t['name']}{suffix}.bin"
+            got = got_path.read_bytes() if got_path.exists() else None
+            if got != expect:
+                bad.append(f"{t['name']} ({'missing' if got is None else sum(a != b for a, b in zip(got, expect))} bytes differ)")
+        if trace is not None and trace in traces:
+            launches = traces[trace].launches
+            if len(launches) != len(want):
+                bad.append(f"{len(launches)} instrumented steps collected, Python's {len(want)}")
+            for got_launch, want_launch in zip(launches, want):
+                bad += _same_records(f"step {want_launch.step}", got_launch, want_launch)
+                if got_launch.bucket != want_launch.bucket:
+                    bad.append(f"step {want_launch.step}: bucket {got_launch.bucket}, Python's {want_launch.bucket}")
+        if bad:
+            failed.append((f"rust_instrumented/plan ({label})", bad))
+        else:
+            passed += 1
+    return passed, count, failed
 
 
 def main(argv=None):
@@ -1788,6 +1987,7 @@ def main(argv=None):
 
         rust_workspace_case.main(args.work)
         prepare_plans(args.work)  # the launch plans (gpu_gate.rs reads WORK/plans.json)
+        prepare_instrumented(args.work)  # the instrumented binaries and plan (gpu_instrument_gate.rs reads WORK/instrumented.json)
         return 0
     return compare(args.work, args.host)
 

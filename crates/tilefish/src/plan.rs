@@ -540,6 +540,12 @@ impl Plan {
         self.scratch
     }
 
+    /// The scratch slots a launch passes after the parameters: 2 for a Triton kernel (the global scratch, the profile scratch), 0 for a prebuilt
+    /// binary.
+    pub fn scratch_slots(&self) -> usize {
+        self.scratch_slots
+    }
+
     /// The persistent grid of the entry, when it has one.
     pub fn persistent(&self) -> Option<Persistent> {
         self.persistent

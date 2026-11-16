@@ -219,6 +219,43 @@
 //! # }
 //! ```
 //!
+//! # Instrumented exports
+//!
+//! An **instrumented export** (Python's `tilefish.runtime.export(..., instrument=True)`, `docs/instrument.md`) is a diagnostic variant whose Triton
+//! binaries record the kernel's `tilefish.probe("name")` phase boundaries (`%globaltimer`, `%clock`, the SM, the CTA and the warp) into a probe buffer
+//! each launch is given in its profile scratch parameter. Its entries have [`Entry::instrument`], and it has binaries and a digest of its own:
+//! [`Manifest::load`], [`Manifest::from_embedded`], [`LaunchPlan::load`] and [`PlanSet::load`] refuse it, and [`Manifest::load_instrumented`],
+//! [`LaunchPlan::load_instrumented`] and [`PlanSet::load_instrumented`] read it. A kernel records with [`Kernel::launch_probed`] into a
+//! [`ProbeBuffer`] ([`Kernel::probe_bytes`] says how large), read back with [`ProbeBuffer::collect`]; a plan instantiated with
+//! [`LaunchPlan::instantiate_probed`] gives every instrumented step its region of a probe buffer of its own, and [`PlanRun::collect_probes`] reads the
+//! records of the last launch or replay. [`ProbeTrace::save`] writes them as `tilefish.probe-trace.v1`, which `tilefish-explain DIR --probes FILE`
+//! renders (phases with their distributions, timelines per SM, CTA and warp role, a Chrome trace).
+//!
+//! ```no_run
+//! use tilefish::cudarc::driver::CudaContext;
+//! use tilefish::{Arch, F32, Manifest, Pin, ProbeBuffer, ProbeTrace, TensorMut, TensorRef};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # if !tilefish::driver_available() { return Ok(()); }
+//! let manifest = Manifest::load_instrumented("build-instrumented/", Pin::Digest("<the digest of the instrumented export>"))?;
+//! let ctx = CudaContext::new(0)?;
+//! let stream = ctx.new_stream()?;
+//! let kernel = manifest.kernel(&ctx, "scale_add", &[], Arch::of_context(&ctx)?)?;
+//! let (x, y, mut out) = (stream.alloc_zeros::<u8>(4096 * 4)?, stream.alloc_zeros::<u8>(4096 * 4)?, stream.alloc_zeros::<u8>(4096 * 4)?);
+//! let shape = [4096usize];
+//! let mut args = [
+//!     TensorRef::<F32>::from_cuda(&x, &shape)?.into_arg(),
+//!     TensorRef::<F32>::from_cuda(&y, &shape)?.into_arg(),
+//!     TensorMut::<F32>::from_cuda(&mut out, &shape)?.into_arg(),
+//! ];
+//! let bytes = kernel.probe_bytes(&kernel.check(&args)?).expect("an instrumented binary");
+//! let mut probes = ProbeBuffer::new(&stream, bytes as usize)?;
+//! kernel.launch_probed(&stream, &mut args, &mut probes)?;
+//! ProbeTrace { launches: vec![probes.collect()?] }.save("probes.json")?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # `unsafe`
 //!
 //! The CUDA driver is cudarc's safe layer (contexts, modules, functions, attributes, streams, the launch builder, graphs), with four calls to
@@ -266,6 +303,7 @@ mod par;
 mod plan;
 mod plan_run;
 mod plan_set;
+mod probes;
 mod region;
 mod tensor;
 
@@ -293,6 +331,12 @@ pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, GLOBAL_SCRATCH, Plan, Prepared, TensorMapEncode};
 pub use plan_run::{CapturedPlan, CarriedLayout, DevScalar, PlanRun, SharedArena, Tap, WeightedRun};
 pub use plan_set::{PLAN_SET_NAME, PLAN_SET_SCHEMA, PlanSet, SetRun, plan_file_name, plan_set_digest};
+pub use probes::{
+    DecodedProbes, IMPLICIT_PROBES, Instrument, PROBE_ALIGNMENT, PROBE_FIRST_ID, PROBE_FORMAT, PROBE_HEADER_BYTES,
+    PROBE_MAGIC, PROBE_MAX_CAPACITY, PROBE_MAX_ID, PROBE_RECORD_BYTES, PROBE_TRACE_SCHEMA, Probe, ProbeBuffer,
+    ProbeLaunch, ProbeRecord, ProbeSite, ProbeTrace, WarpRecords, decode_probes, is_probe_name, probe_buffer_bytes,
+    warps_of,
+};
 pub use region::DevicePtr;
 pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, Readable, TensorArg, TensorMut, TensorRef, U8};
 

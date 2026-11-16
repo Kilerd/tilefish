@@ -69,7 +69,7 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
-from . import _source
+from . import _probe, _source
 from .errors import TilefishBuildError
 
 if TYPE_CHECKING:
@@ -205,8 +205,9 @@ def frontend(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "Mappin
 
     Inside a :func:`frontend_scope` of this thread the frontend runs once per distinct input, the function ``jit`` and the signature, attributes,
     constants, language, options and architecture (each a value of a plain type: ``bool``, ``int``, ``float``, ``str``, ``None``, and lists, tuples and
-    dicts of them; an input with any other value is not shared, and runs its own frontend), and a later call with the same input is given what the
-    first one got. Outside a scope every call runs the frontend. A run that raises is not kept."""
+    dicts of them; an input with any other value is not shared, and runs its own frontend), and the variant being built (production, or the
+    instrumented build :func:`tilefish._probe.active` names, whose IR has its probes), and a later call with the same input is given what the first one
+    got. Outside a scope every call runs the frontend. A run that raises is not kept."""
     key = _input_key(jit, inputs, arch, options)
     table = getattr(_scope, "table", None)
     if table is not None and key is not None:
@@ -261,7 +262,9 @@ def _plain(value: Any) -> Any:
 
 
 def _input_key(jit: Any, inputs: "AstSourceInputs", arch: int, options: "Mapping[str, Any]") -> "tuple[Any, ...] | None":
-    """The key of a frontend run in a :func:`frontend_scope`: everything ``triton.compile`` gives the frontend, or ``None`` when a value is not plain."""
+    """The key of a frontend run in a :func:`frontend_scope`: everything ``triton.compile`` gives the frontend, and the variant this thread builds
+    (production, or the instrumented build :func:`tilefish._probe.instrumenting` names, whose IR has its probes), or ``None`` when a value is not plain."""
+    variant = _probe.active()
     try:
         return (
             id(jit),
@@ -271,6 +274,7 @@ def _input_key(jit: Any, inputs: "AstSourceInputs", arch: int, options: "Mapping
             _plain(dict(inputs.attrs)),
             _plain(dict(inputs.constants)),
             _plain(dict(options)),
+            _plain(None if variant is None else variant.key()),
         )
     except TypeError:
         return None
@@ -339,7 +343,8 @@ def _run_frontend(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "M
             try:
                 ir.load_dialects(context)
                 backend.load_dialects(context)
-                module = src.make_ir(target, opts, backend.get_codegen_implementation(opts), backend.get_module_map(), context)
+                with _probe.frontend():  # (an instrumented build's probes, with the ids every run of the frontend gives them)
+                    module = src.make_ir(target, opts, backend.get_codegen_implementation(opts), backend.get_module_map(), context)
                 try:
                     return read(module)
                 finally:
@@ -469,7 +474,7 @@ def recording_source(ASTSource: Any, language: str = "triton") -> Any:
         def make_ir(self, target: Any, options: Any, codegen_fns: Any, module_map: Any, context: Any) -> Any:
             # (TILEFISH_DEBUG_PATHS=absolute keeps Triton's absolute paths, for a profiler: not reproducible, _source.debug_paths)
             naming = contextlib.nullcontext() if _source.debug_paths() == "absolute" else host_independent_paths()
-            with naming:
+            with naming, _probe.frontend():
                 module = super().make_ir(target, options, codegen_fns, module_map, context)
             self.recorded_digest = ir_digest(str(module.str_nodebug()), language)  # before the passes of the first stage change the module in place
             self.module = module

@@ -639,14 +639,22 @@ class Manifest:
         """The digest of the whole manifest (see :func:`manifest_digest`): what ``run(..., pin=...)`` compares."""
         return manifest_digest(self.doc)
 
+    @property
+    def instrumented(self) -> bool:
+        """Whether this is an instrumented export: one of its entries has ``instrument`` (its kernel records probes, ``docs/instrument.md``)."""
+        return is_instrumented(self.doc)
+
     @classmethod
-    def load(cls, path: "str | pathlib.Path", *, pin: "str | None" = None) -> "Manifest":
+    def load(cls, path: "str | pathlib.Path", *, pin: "str | None" = None, instrumented: bool = False) -> "Manifest":
         """Load ``<directory>/manifest.json`` (or the manifest file itself) and every cubin it names.
 
         Raises :class:`~tilefish.errors.TilefishManifestError` when a file is missing or malformed, a cubin is not
         an ELF file with the code section the manifest's symbol names, or its ``sha256`` or ``sha256_code`` is not
         the one the manifest records. With ``pin=`` (the digest of the manifest, from a trusted place) a manifest with any
         other digest is refused, before a cubin is read, and the result is :attr:`pinned`.
+
+        An **instrumented** export (an entry with ``instrument``: ``export(..., instrument=True)``, ``docs/instrument.md``) is a diagnostic
+        variant, never a production artefact: it is refused unless ``instrumented=True`` says the caller means to load one.
         """
         path = pathlib.Path(path)
         manifest_path = path / MANIFEST_NAME if path.is_dir() else path
@@ -680,6 +688,12 @@ class Manifest:
             raise TilefishManifestError(
                 f"the manifest {str(manifest_path)!r} is not a tilefish manifest of schema {MANIFEST_SCHEMA} with a 'kernels' list and a "
                 f"'library' list (schema {doc.get('schema') if isinstance(doc, dict) else None!r})"
+            )
+        if is_instrumented(doc) and not instrumented:
+            raise TilefishManifestError(
+                f"the manifest {str(manifest_path)!r} is an instrumented export (its kernels record probes: docs/instrument.md), a diagnostic variant "
+                "with binaries and a digest of its own, never the production artefact: load it with instrumented=True (tilefish.run(..., probes=...), "
+                "Manifest.load(..., instrumented=True)) to collect its probes, and run the production export everywhere else"
             )
         if pin is not None:
             _check_pin(manifest_path.parent, doc, pin)
@@ -747,6 +761,14 @@ class Manifest:
             if problem is not None:
                 raise TilefishManifestError(problem)
         _check_launch(who, entry, entry_kind)
+        if "instrument" in entry:  # section 4.8: an instrumented build's probes, of a Triton kernel only
+            from ._probe import check_field as check_instrument
+
+            problem = check_instrument(who, entry["instrument"])
+            if problem is None and entry_kind != ENTRY_KIND_TRITON:
+                problem = f"{who}: instrument is only on the entry of a Triton kernel (a prebuilt binary is never instrumented)"
+            if problem is not None:
+                raise TilefishManifestError(problem)
         if entry_kind == ENTRY_KIND_BINARY:
             extra = [k for k in ("options", "num_warps", "num_stages") if k in entry]
             if extra:
@@ -969,6 +991,7 @@ class Manifest:
                 binary_build=dict(entry["binary"]) if spec.binary is not None else None,
                 warp_specialized=total is not None,
                 cuda_math=entry.get("cuda_math"),
+                instrument=entry.get("instrument"),
             )
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             raise TilefishManifestError(f"'{spec.stem}' ({arch}): the manifest entry is malformed: {type(e).__name__}: {e}") from e
@@ -1063,6 +1086,12 @@ class Manifest:
     def __repr__(self) -> str:
         library = f", {len(self._library)} library entries" if self._library else ""
         return f"<Manifest {str(self.directory)!r}: {len(self._artifacts)} binaries{library}>"
+
+
+def is_instrumented(doc: Any) -> bool:
+    """Whether a manifest document is an instrumented export: a kernel entry has ``instrument`` (manifest schema 3, section 4.8)."""
+    kernels = doc.get("kernels") if isinstance(doc, dict) else None
+    return isinstance(kernels, list) and any(isinstance(e, dict) and "instrument" in e for e in kernels)
 
 
 def _frontend(language: str) -> str:

@@ -344,11 +344,14 @@ class LoadedKernel:
                 )
         return blocks
 
-    def launch(self, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int, scratch: "int | None" = None) -> None:
+    def launch(
+        self, grid: "Sequence[int]", args: "Sequence[tuple[str, Any]]", stream: int, scratch: "int | None" = None, probes: "int | None" = None
+    ) -> None:
         """Launch on ``stream`` (a ``CUstream`` handle as an int). ``args`` are ``("pointer", address)``, ``("scalar", i32)`` or, for a TMA
         descriptor, ``("tensordesc", TensorMapArg)`` (its encoded CUtensorMap, then its shape and strides, each in a slot of its own) in the
         manifest's order; the two scratch slots are appended here: ``scratch`` (the address of :meth:`scratch_bytes` bytes of device memory, 256-byte
-        aligned, which a kernel with a global scratch must be given and any other must not) and a null profile scratch.
+        aligned, which a kernel with a global scratch must be given and any other must not) and the profile scratch: null, or for an instrumented
+        binary ``probes``, the address of its probe buffer (16-byte aligned; ``docs/instrument.md``), which no other binary is given.
 
         ``grid`` is the entry's grid of programs: a persistent kernel's is cut to the programs the SMs it was loaded for run, and a kernel of clusters
         is launched with ``cuLaunchKernelEx``, ``grid * cluster`` blocks in clusters of its ``cluster_dims``.
@@ -365,6 +368,11 @@ class LoadedKernel:
             )
         if scratch is not None and (isinstance(scratch, bool) or not isinstance(scratch, int) or not 0 < scratch <= UINT64_MAX or scratch % 256):
             raise TilefishRuntimeError(f"'{self.built.stem}': the global scratch must be a 256-byte aligned address, got {scratch!r}")
+        if probes is not None and (self.built.instrument is None or isinstance(probes, bool) or not isinstance(probes, int) or not 0 < probes <= UINT64_MAX or probes % 16):
+            raise TilefishRuntimeError(
+                f"'{self.built.stem}': "
+                + ("a probe buffer is for an instrumented binary, and this one has no probes" if self.built.instrument is None else f"the probe buffer must be a 16-byte aligned address, got {probes!r}")
+            )
         drv = _driver()
         values: list[Any] = []
         addresses: list[int] = []
@@ -395,7 +403,8 @@ class LoadedKernel:
                 continue
             put(ctypes.c_uint64(v) if kind == "pointer" else _ctype(p["type"])(v))
         for k, _ in enumerate(self.built.abi()["scratch"]):  # global_scratch, profile_scratch: a Triton kernel's; a prebuilt binary has none
-            put(ctypes.c_uint64(scratch if k == 0 and scratch is not None else 0))
+            given = scratch if k == 0 else probes  # (the profile scratch of an instrumented binary: its probe buffer)
+            put(ctypes.c_uint64(given if given is not None else 0))
         slots = (ctypes.c_void_p * len(addresses))(*addresses)
         b = self.block
         launch = self.built.launch

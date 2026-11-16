@@ -106,7 +106,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Iterator
 
-from . import _cache, _cuda, _cudamath, _ir, _source
+from . import _cache, _cuda, _cudamath, _ir, _probe, _source
 from ._build import BuiltKernel, build, check_launch_config, export_session, resolve_triton, write_file, write_manifest_doc
 from ._cuda import sm_partition as sm_partition  # tilefish.runtime.sm_partition(sms): the partition (a green context) a persistent grid is resolved for
 from ._launch import (
@@ -680,31 +680,37 @@ def _ir_digest_of(spec: CompileSpec, fn: Any, cap: int, extra: "dict[str, Any]")
     return _ir.frontend(fn, inputs, arch=cap, options=options, what=f"'{spec.stem}' ({spec.triton})").digest
 
 
-def build_for_device(spec: CompileSpec, fn: Any, device_index: int) -> BuiltKernel:
+def build_for_device(spec: CompileSpec, fn: Any, device_index: int, instrument: "_probe.Instrument | None" = None) -> BuiltKernel:
     """The (cached, in memory) build of ``spec`` for the architecture of device ``device_index``.
 
     The cache is keyed by the digest of the IR Triton's frontend builds for ``fn`` now (a few milliseconds per call), so a kernel
     whose process state changed is not served the binary of the old one, and the same Triton knobs that key the disk cache.
+    ``instrument`` builds the instrumented variant (``docs/instrument.md``) when it covers the spec's operator.
     """
     torch = _torch()
     cap = _capability(torch, device_index)
+    cfg = instrument if instrument is not None and instrument.covers(spec.op) else None
     extra = dict(getattr(_options, "value", {}))
     files = _cache.compile_files({**spec.ast_source_inputs().options, **extra})  # refuses ir_override; the content of extern_libs
-    digest = _ir_digest_of(spec, fn, cap, extra)
+    with _probe.instrumenting(cfg):
+        digest = _ir_digest_of(spec, fn, cap, extra)
     environment = repr(sorted(_cache.codegen_environment().items()))
     key = (spec.stem, cap, spec._fingerprint(), digest, repr(sorted(extra.items())), tuple(sorted(files.items())), environment)
+    if cfg is not None:
+        key += (repr(sorted(cfg.key().items())),)
     with _lock:
         built = _builds.get(key)
     if built is None:
-        built = build(spec, arch=cap, fn=fn, options=extra, ir_digest=digest)
+        built = build(spec, arch=cap, fn=fn, options=extra, ir_digest=digest, instrument=cfg)
         with _lock:
             _builds[key] = built
     _cudamath.check(f"'{spec.stem}' (sm_{cap})", built.cuda_math)  # torch's CUDA release against the one its math was measured on
     return built
 
 
-def _launch_built(prep: _Prepared, built: BuiltKernel, index: int) -> None:
-    """Launch a binary through the CUDA driver on torch's current stream, with the ABI of the manifest."""
+def _launch_built(prep: _Prepared, built: BuiltKernel, index: int, probes: Any = None, manifest_digest: "str | None" = None) -> None:
+    """Launch a binary through the CUDA driver on torch's current stream, with the ABI of the manifest. ``probes`` (a :class:`tilefish.Probes`)
+    collects the records of an instrumented binary: its probe buffer is given in the profile scratch slot, and read back after the launch."""
     torch = _torch()
     check_launch_config(built, prep.spec)  # its warps are the declared ones (a warp-specialised kernel: those of its default partition, and more)
     with torch.cuda.device(index):
@@ -718,13 +724,24 @@ def _launch_built(prep: _Prepared, built: BuiltKernel, index: int) -> None:
                 args.append((kind, int(v)))
         loaded = _cuda.load(built, index)
         stream = torch.cuda.current_stream(index).cuda_stream
+        region = None
+        if probes is not None and built.instrument is not None:  # the records of the launch: every warp of every CTA its slot
+            cuda_grid = loaded.launch_grid(prep.grid)
+            nbytes = _probe.buffer_bytes(int(built.instrument["capacity"]), -(-built.block[0] // 32), math.prod(cuda_grid))
+            region = probes.region(nbytes, index)
+        extra = {"probes": region[1]} if region is not None else {}  # (the profile scratch of an instrumented binary: its probe buffer)
         if not built.launch.global_scratch_size:
-            loaded.launch(prep.grid, args, stream)
-            return
-        # the global scratch of this launch: allocated on its stream (torch's blocks start on 512 bytes), freed after it (the caching allocator
-        # reuses it on this stream only after the launch, which is ordered before any later work of the stream)
-        scratch = torch.empty(max(loaded.scratch_bytes(prep.grid), 1), dtype=torch.uint8, device=f"cuda:{index}")
-        loaded.launch(prep.grid, args, stream, scratch=int(scratch.data_ptr()))
+            loaded.launch(prep.grid, args, stream, **extra)
+        else:
+            # the global scratch of this launch: allocated on its stream (torch's blocks start on 512 bytes), freed after it (the caching allocator
+            # reuses it on this stream only after the launch, which is ordered before any later work of the stream)
+            scratch = torch.empty(max(loaded.scratch_bytes(prep.grid), 1), dtype=torch.uint8, device=f"cuda:{index}")
+            loaded.launch(prep.grid, args, stream, scratch=int(scratch.data_ptr()), **extra)
+        if region is not None:
+            probes.collect(
+                region[0], region[1], built=built, grid=cuda_grid, block=built.block, stem=built.stem, arch=built.arch, op=prep.spec.op,
+                manifest_digest=manifest_digest,
+            )
 
 
 def build_binary_for_device(spec: CompileSpec, target: Any, device_index: int) -> BuiltKernel:
@@ -743,25 +760,32 @@ def build_binary_for_device(spec: CompileSpec, target: Any, device_index: int) -
     return built
 
 
-def jit_built(target: _Target, spec: CompileSpec, index: int) -> BuiltKernel:
+def jit_built(target: _Target, spec: CompileSpec, index: int, instrument: "_probe.Instrument | None" = None) -> BuiltKernel:
     """The binary of ``spec`` as ``jit`` builds it (in memory, for the architecture of device ``index``): the current source through the compile
-    spec, or a prebuilt PTX assembled / a cubin taken for the device."""
+    spec (its instrumented variant with ``instrument``), or a prebuilt PTX assembled / a cubin taken for the device (never instrumented)."""
     extern = target.launch_extern()
     if extern.binary is not None:
         return build_binary_for_device(spec, extern.binary, index)
-    return build_for_device(spec, target.jit_function(spec), index)
+    fn = target.jit_function(spec)
+    return build_for_device(spec, fn, index) if instrument is None else build_for_device(spec, fn, index, instrument)
 
 
-def _run_jit(prep: _Prepared) -> None:
-    """Build the current source through the compile spec, in memory, and launch that binary."""
+def _run_jit(prep: _Prepared, probes: Any = None) -> None:
+    """Build the current source through the compile spec, in memory, and launch that binary (its instrumented variant, recorded into ``probes``)."""
     torch = _torch()
     index = _device_index(torch, prep.device)
-    _launch_built(prep, jit_built(prep.target, prep.spec, index), index)
+    _launch_built(prep, jit_built(prep.target, prep.spec, index, probes.instrument if probes is not None else None), index, probes)
 
 
-def _load_manifest(manifest: Any) -> Manifest:
-    """A :class:`Manifest` from a directory, a manifest file or a loaded manifest (a directory is cached until a file in it changes)."""
+def _load_manifest(manifest: Any, instrumented: bool = False) -> Manifest:
+    """A :class:`Manifest` from a directory, a manifest file or a loaded manifest (a directory is cached until a file in it changes). An
+    instrumented export is refused unless ``instrumented`` (a run with ``probes=``)."""
     if isinstance(manifest, Manifest):
+        if manifest.instrumented and not instrumented:
+            raise TilefishManifestError(
+                f"the manifest in {str(manifest.directory)!r} is an instrumented export (docs/instrument.md): replay it with probes=tilefish.Probes() "
+                "to collect its records; run the production export everywhere else"
+            )
         return manifest
     try:
         path = pathlib.Path(manifest)
@@ -772,11 +796,11 @@ def _load_manifest(manifest: Any) -> Manifest:
         stamp = tuple(sorted((e.name, e.stat().st_mtime_ns, e.stat().st_size) for e in os.scandir(directory) if e.is_file()))
     except OSError as e:
         raise TilefishManifestError(f"cannot read the manifest directory {str(directory)!r}: {e}") from e
-    key = (str(path.resolve()), stamp)
+    key = (str(path.resolve()), stamp, instrumented)
     with _lock:
         loaded = _manifests.get(key)
     if loaded is None:
-        loaded = Manifest.load(path)
+        loaded = Manifest.load(path, instrumented=instrumented)
         with _lock:
             _manifests[key] = loaded
     return loaded
@@ -818,14 +842,17 @@ def replay_built(target: _Target, spec: CompileSpec, manifest: Manifest, pinned:
     # an entry with no IR digest has nothing to compare, and one of the other frontend's IR is refused by the manifest without a frontend run
     if artifact is not None and artifact.entry.get("source_digest_kind") == _ir.digest_kind(spec.language):
         toolchain = artifact.entry.get("toolchain")
-        digest, version = _current_ir(SimpleNamespace(target=target, spec=spec), cap, toolchain.get("triton") if isinstance(toolchain, dict) else None)  # type: ignore[arg-type]
+        field = artifact.entry.get("instrument")
+        # (an instrumented entry is of the IR with its probes: the frontend runs as an instrumented build's, whose IR does not depend on the capacity)
+        with _probe.instrumenting(_probe.Instrument(int(field["capacity"])) if field is not None else None):
+            digest, version = _current_ir(SimpleNamespace(target=target, spec=spec), cap, toolchain.get("triton") if isinstance(toolchain, dict) else None)  # type: ignore[arg-type]
     built = manifest.built_kernel(spec, arch, ir_digest=digest, ir_triton=version, pinned=pinned)
     if built.cuda_math:  # torch's CUDA release, and the libdevice a build here would link, against the entry's (tilefish._cudamath)
         _cudamath.check(f"'{spec.stem}' ({arch})", built.cuda_math, libdevice_here=_cudamath.libdevice_sha256(built.options))
     return built
 
 
-def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
+def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool, probes: Any = None) -> None:
     """Launch the prebuilt cubin of the manifest for this spec and this device's architecture."""
     torch = _torch()
     index = _device_index(torch, prep.device)
@@ -838,7 +865,7 @@ def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool) -> None:
             f"has no binary of it: export kernel.unaligned({names}) too (the export of a graph has the specialisations its calls use), or pass a "
             "16-byte aligned tensor"
         )
-    _launch_built(prep, replay_built(prep.target, prep.spec, manifest, pinned, index), index)
+    _launch_built(prep, replay_built(prep.target, prep.spec, manifest, pinned, index), index, probes, manifest.digest)
 
 
 _library_specs: "weakref.WeakKeyDictionary[LibraryOp, list[Any]]" = weakref.WeakKeyDictionary()  # an op is immutable
@@ -990,6 +1017,7 @@ def export(
     reuse: bool = False,
     verify: "bool | None" = None,
     trace: "bool | None" = None,
+    instrument: Any = None,
 ) -> Any:
     """Build every binary of one or several kernels and externs and write them as a manifest directory.
 
@@ -1028,6 +1056,11 @@ def export(
     until it is written, and a traced export keeps the stages of its builds in a temporary directory until it writes the trace. None of it changes a
     byte of what is written.
 
+    ``instrument=True`` (or ``tilefish.instrument(capacity=..., ops=...)``) exports the **instrumented variant** (``docs/instrument.md``): every
+    Triton, Gluon and ``@tilefish.kernel`` binary (of the operators ``ops`` names) records its ``tilefish.probe`` calls, ``@begin``, ``@calib`` and ``@end``
+    into the probe buffer a host gives it, and its entry has ``instrument``. It has binaries, a manifest digest and plan digests of its own; a host
+    refuses it unless asked to load it (``probes=``, ``instrumented=True``), and it is never merged into a directory of the production export.
+
     Returns the loaded and verified :class:`~tilefish.aot.Manifest` (``.pinned``: it is what ``hosts.rust.emit`` takes): ``.directory``, ``.path`` and ``.digest``, the
     digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
     ``run(..., mode="replay", manifest=directory, pin=digest)`` to refuse a directory that was changed after the export.
@@ -1035,7 +1068,7 @@ def export(
     must have the same digest, or this raises :class:`~tilefish.errors.TilefishManifestError`.
     """
     with export_session():
-        return _export(ops, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=trace)
+        return _export(ops, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=trace, instrument=instrument)
 
 
 def _export(
@@ -1048,6 +1081,7 @@ def _export(
     reuse: bool,
     verify: "bool | None",
     trace: "bool | None",
+    instrument: Any,
 ) -> Any:
     """:func:`export`, inside its session."""
     items = list(ops) if isinstance(ops, (list, tuple)) else [ops]
@@ -1059,17 +1093,18 @@ def _export(
     from . import _trace
 
     traced = _trace.wanted(trace)
+    cfg = _probe.config(instrument)
     if any(is_graph):
         if not all(is_graph):
             raise TilefishRuntimeError("export takes graphs, or kernels and externs, not both (a manifest of a plan holds the binaries of its plans); export them separately")
         if len(items) > 1:  # a plan set: one manifest for every plan (docs/plan-schema-1.md, section 15)
             from ._planrun import export_graphs
 
-            return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=traced)
+            return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=traced, instrument=cfg)
         from ._planrun import export_graph
 
         graph, own = items[0] if isinstance(items[0], tuple) else (items[0], buckets)
-        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse, verify=verify, trace=traced)
+        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse, verify=verify, trace=traced, instrument=cfg)
     if verify is not None:
         raise TilefishRuntimeError("verify= is for exporting a graph (it checks the graph's fused regions); kernels and externs have none")
     if buckets is not None or reuse:
@@ -1102,13 +1137,13 @@ def _export(
                 built.append(build_binary(spec, extern.binary, arch=cap))
             else:
                 jit = target.jit_function(spec)
-                built.append(build(spec, arch=cap, fn=jit, stages=traced))
+                built.append(build(spec, arch=cap, fn=jit, stages=traced, instrument=cfg if cfg is not None and cfg.covers(spec.op) else None))
             if traced:
                 traces.append(_trace.item_of(built[-1], target, jit))
     path, written = write_manifest_doc(
         built, pathlib.Path(directory) / MANIFEST_NAME, cubins=True, merge=True, overwrite=overwrite, library=pinned_library
     )
-    loaded = Manifest.load(path)
+    loaded = Manifest.load(path, instrumented=True)  # (what this export wrote: the instrumented variant with instrument=, never merged with the other)
     expected = manifest_digest(written)
     if loaded.digest != expected:
         raise TilefishManifestError(
@@ -1127,6 +1162,7 @@ def _run_graph(op: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", m
     plan = kwargs.pop("plan", None)
     outputs = kwargs.pop("outputs", None)
     taps = kwargs.pop("taps", None)
+    probes = _probes_of(kwargs.pop("probes", None))
     if manifest is not None:
         raise TilefishRuntimeError("manifest= is for a kernel or an extern; a graph replays plan=<directory> (written by tilefish.runtime.export(graph, directory))")
     if mode != "replay" and (pin is not None or trust_directory):
@@ -1137,7 +1173,18 @@ def _run_graph(op: GraphOp, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", m
         raise TilefishRuntimeError(f"pin= is the 64 lowercase hex digits of a plan digest, got {pin!r}")
     from ._planrun import run_graph
 
-    return run_graph(op, args, kwargs, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, outputs=outputs, taps=taps)
+    return run_graph(op, args, kwargs, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, outputs=outputs, taps=taps, probes=probes)
+
+
+def _probes_of(value: Any) -> Any:
+    """``probes=`` of a run: ``None`` or a :class:`tilefish.Probes`."""
+    if value is None:
+        return None
+    from ._probes import Probes
+
+    if not isinstance(value, Probes):
+        raise TilefishRuntimeError(f"probes= takes a tilefish.Probes() that collects the records of the instrumented binaries the run launches, got {value!r}")
+    return value
 
 
 def capture(
@@ -1152,6 +1199,7 @@ def capture(
     outputs: Any = None,
     stream: Any = None,
     taps: Any = None,
+    probes: Any = None,
 ) -> Any:
     """Capture the launch plan of a ``@tilefish.graph`` in a CUDA graph of its own: a :class:`~tilefish._planrun.CapturedPlan`, whose ``replay(stream=None)``
     is ordered with every other run and replay of the plan, from any thread and on any stream (it takes the arena's lock and waits for and records the arena's
@@ -1160,15 +1208,19 @@ def capture(
     ``externals`` are the graph's arguments in the order of its signature without its ``DevScalar`` parameters, whose values ``devscalars={name: value}``
     gives; ``outputs=`` the tensors the returned values are written into (allocated before the capture by default: ``CapturedPlan.outputs``). ``mode``,
     ``plan``, ``pin`` and ``trust_directory`` choose the plan as for :func:`run`. The ``CapturedPlan`` keeps the externals and the arena alive. See
-    :func:`tilefish._planrun.capture` and ``docs/plan-schema-1.md``, section 10."""
+    :func:`tilefish._planrun.capture` and ``docs/plan-schema-1.md``, section 10. ``probes=`` (a :class:`tilefish.Probes`) captures the instrumented
+    variant, whose steps record into a probe region the graph holds the address of: ``CapturedPlan.collect()`` reads a replay's records
+    (``docs/instrument.md``)."""
     if not isinstance(op, GraphOp) or isinstance(op, KernelOp):
         raise TilefishRuntimeError(f"tilefish.capture takes a @tilefish.graph, got {op!r}")
+    probes = _probes_of(probes)
     if pin is not None and not (isinstance(pin, str) and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin)):
         raise TilefishRuntimeError(f"pin= is the 64 lowercase hex digits of a plan digest, got {pin!r}")
     from ._planrun import capture as _capture
 
     return _capture(
-        op, externals, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, devscalars=devscalars, outputs=outputs, stream=stream, taps=taps
+        op, externals, mode=mode, plan=plan, pin=pin, trust_directory=trust_directory, devscalars=devscalars, outputs=outputs, stream=stream, taps=taps,
+        probes=probes,
     )
 
 
@@ -1271,7 +1323,9 @@ def run(
     returns them) instead of allocating them; each must have the dtype, the rank and the shape of its parameter and be contiguous,
     and it is what binds a dimension that only an ``Out`` parameter mentions (an extern that writes a ``[B]`` tensor and reads
     no tensor of ``B``), which a call cannot run without. ``mode``, ``manifest``, ``pin``, ``trust_directory`` and ``outputs`` are
-    the only keywords that are not arguments of ``op`` (an operator with a parameter of one of those names takes it positionally). Raises
+    the only keywords that are not arguments of ``op`` (an operator with a parameter of one of those names takes it positionally), with
+    ``probes=``: a :class:`tilefish.Probes` that collects the records of the instrumented binaries the run launches (``jit`` builds the
+    instrumented variant; ``replay`` takes an instrumented export, which it refuses without it; ``docs/instrument.md``). Raises
     :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks a precondition of the binary,
     :class:`~tilefish.errors.TilefishManifestError` when the manifest is not what was built, not what the operator asks
     for, or not the pinned one, and :class:`~tilefish.errors.TilefishRuntimeError` when the call cannot run (a replay
@@ -1282,6 +1336,7 @@ def run(
     if isinstance(op, GraphOp) and not isinstance(op, KernelOp):
         return _run_graph(op, args, kwargs, mode, manifest, pin, trust_directory)
     outputs = kwargs.pop("outputs", None)
+    probes = _probes_of(kwargs.pop("probes", None))
     if mode == "replay" and manifest is None:
         raise TilefishRuntimeError(
             "replay runs prebuilt cubins from a manifest directory: pass manifest=<directory> (write one with "
@@ -1316,11 +1371,18 @@ def run(
             "outputs= gives the tensors a kernel or an extern writes its results into, in jit and replay (and a graph's, in any mode); "
             + ("a library op allocates its result" if is_library else "reference mode allocates the results it computes")
         )
+    if probes is not None and (is_library or mode == "reference"):
+        raise TilefishRuntimeError("probes= records the probes of a kernel or an extern run in jit or replay (docs/instrument.md); " + ("a library op has none" if is_library else "reference mode runs no binary"))
     if mode == "reference" and not is_library:
         return _run_reference(target, args, kwargs)
     loaded = None
     if mode == "replay":
-        loaded = _load_manifest(manifest)
+        loaded = _load_manifest(manifest) if probes is None else _load_manifest(manifest, instrumented=True)
+        if probes is not None and not loaded.instrumented:
+            raise TilefishManifestError(
+                f"probes= replays an instrumented export (tilefish.runtime.export(..., instrument=True), docs/instrument.md), and the manifest in "
+                f"{str(loaded.directory)!r} is a production one, whose binaries record nothing"
+            )
         if pin is not None and loaded.digest != pin:
             raise TilefishManifestError(
                 f"the manifest in {str(loaded.directory)!r} has digest {loaded.digest}, but pin= says {pin}: "
@@ -1331,8 +1393,8 @@ def run(
     assert target is not None
     prep = _prepare(target, args, kwargs, outputs)
     if mode == "jit":
-        _run_jit(prep)
+        _run_jit(prep, probes)
     else:
         assert loaded is not None
-        _run_replay(prep, loaded, pinned=pin is not None)
+        _run_replay(prep, loaded, pinned=pin is not None, probes=probes)
     return _result(prep.results)

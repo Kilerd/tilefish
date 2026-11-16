@@ -604,6 +604,15 @@ INDEX_MAX = MAX_ELEMENTS  # offsets are i32: a tensor has at most 2**31 - 1 elem
 # Names a kernel parameter cannot keep in the generated function: what the module itself uses, and what
 # Triton's JIT launcher takes as launch options (a parameter of that name could not be passed by keyword).
 _RESERVED = frozenset({"tl", "triton", "float", "libdevice", "grid", "warmup", "debug", "num_warps", "num_stages", "num_ctas", "maxnreg"})
+_PROBE = "_tf_probe"  # what the generated module of a kernel with probes calls tilefish's probe (and so a name a parameter cannot keep there)
+
+
+@dataclass(frozen=True)
+class _ProbeMark:
+    """A line of a generated source written for a probe of the kernel body (``tilefish.probe``): its name and the line of the body."""
+
+    name: str
+    loc: "tuple[str, int] | None"
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")  # ASCII only, like the identifiers a compile spec accepts
 _MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
@@ -2114,6 +2123,9 @@ class _Body:
         self.made_for: "list[Any]" = []  # per line of ``lines``: the node (or a label of code of no op) it was emitted for
         self.current: Any = None
         self.helpers: dict[tuple, tuple[str, list[str]]] = {}  # module-level @triton.jit functions the body calls (an argmax combine)
+        self.probe_at: "dict[int, list[tuple[str, Any]]]" = {}  # the probes of the body (tilefish.probe), by the number of nodes before each
+        for name, position, loc in getattr(op.graph, "probes", ()):
+            self.probe_at.setdefault(min(position, len(op.graph.nodes)), []).append((name, loc))
         self.indent = 1
         self._count = 0
 
@@ -2146,6 +2158,13 @@ class _Body:
     def emit(self, text: str, comment: str = "") -> None:
         self.lines.append("    " * self.indent + text + (f"  # {comment}" if comment else ""))
         self.made_for.append(self.current)
+
+    def probes_before(self, position: int) -> None:
+        """The probes of the body written after ``position`` nodes (``tilefish.probe``: nothing in a production build, docs/instrument.md)."""
+        for name, loc in self.probe_at.get(position, ()):
+            self.current = _ProbeMark(name, loc)
+            self.emit(f'{_PROBE}("{name}")', "probe" + (f" ({loc[0]}:{loc[1]})" if loc else ""))
+            self.current = None
 
     def operand(self, x: "Value | Scalar") -> str:
         return self.var[x] if isinstance(x, Value) else _scalar_text(x, self.rename)
@@ -2251,8 +2270,10 @@ class _Body:
         loads, last_store = self._reads()
         for p in loads:  # inputs first, in declaration order
             self.load(p)
-        for n in graph.nodes:
+        for i, n in enumerate(graph.nodes):
+            self.probes_before(i)
             self.node(n, last_store)
+        self.probes_before(len(graph.nodes))
         for k, v in enumerate(graph.outputs):
             self.current = f"return value {k}"
             self.emit(layout.store(self.out_names[k], v, self.var[v]), f"return value {k}")
@@ -2272,8 +2293,9 @@ class _Body:
         for p in loads:
             if phases.values[p] == "pre":
                 self.load(p)
-        for n in graph.nodes:
+        for i, n in enumerate(graph.nodes):
             if phases.nodes[n] == "pre":
+                self.probes_before(i)
                 self.node(n, last_store)
         args = [n for n in graph.nodes if n.op in _ARG_REDUCTIONS]
         carries: dict[Node, tuple[str, str, str]] = {}
@@ -2292,9 +2314,10 @@ class _Body:
         for p in loads:
             if phases.values[p] == "loop":
                 self.load(p)
-        for n in graph.nodes:
+        for i, n in enumerate(graph.nodes):
             if phases.nodes[n] != "loop":
                 continue
+            self.probes_before(i)  # (in the loop: every chunk)
             if n in carries:
                 v, bv, bi = carries[n]
                 self.current = n
@@ -2316,9 +2339,11 @@ class _Body:
             out = n.outputs[0].type.dtype.name
             self.emit(f"{v} = {v}_i" if out == "i32" else f"{v} = {v}_i.to(tl.{_TL[out]})")
             self.current = None
-        for n in graph.nodes:
+        for i, n in enumerate(graph.nodes):
             if phases.nodes[n] == "post":
+                self.probes_before(i)
                 self.node(n, last_store)
+        self.probes_before(len(graph.nodes))
         for k, v in enumerate(graph.outputs):
             if layout.cls[v] not in (_FULL, _COL):
                 self.current = f"return value {k}"
@@ -2790,9 +2815,11 @@ def _assemble(
 ) -> LoweredKernel:
     graph = op.graph
     user = list(op.signature.params)
-    names = _Names({p.name for p in user} | _RESERVED)
+    probes = getattr(graph, "probes", ())
+    reserved = _RESERVED | {_PROBE} if probes else _RESERVED  # (a kernel without probes: the names it always had)
+    names = _Names({p.name for p in user} | reserved)
     # a kernel parameter that has the name of something the generated module uses would shadow it
-    rename = {p.name: names.fresh(p.name) for p in user if p.name in _RESERVED}
+    rename = {p.name: names.fresh(p.name) for p in user if p.name in reserved}
     out_names = (
         [names.fresh("out")] if len(graph.outputs) == 1 else [names.fresh(f"out{k}") for k in range(len(graph.outputs))]
     )
@@ -2860,10 +2887,17 @@ def _assemble(
         *([_IEEE_HEADER] if math == "ieee" else []),
         *(["context-free: every narrowing float cast is inline PTX, a negation's NaN canonical (note 20: a fused region of a graph)"] if context_free else []),
         *[f"parameter '{old}' of the kernel is '{new}' here (the name is used by this module)" for old, new in rename.items()],
+        *(
+            [f"probes: {', '.join(dict.fromkeys(name for name, _, _ in probes))} (tilefish.probe: nothing in a production build, docs/instrument.md)"]
+            if probes
+            else []
+        ),
         "Numerics contract: see the docstring of tilefish.lower.",
     ]
     lines = [f"# {h}" for h in header]
     lines += ["import triton", "import triton.language as tl"]
+    if probes:
+        lines.append(f"from tilefish._probe import generated_probe as {_PROBE}")
     if body_emitter.libdevice:  # tanh: libdevice by name (note 14)
         lines.append("from triton.language.extra import libdevice")
     helper_spans: "list[tuple[int, int, str]]" = []  # the lines of each helper function (0-based, end excluded), and its name
@@ -2918,6 +2952,11 @@ def _line_map(op: KernelOp, first: int, body: "_Body", source: str, helpers: "Se
             if made.origin is not None:
                 entry["origin"] = made.origin
             return entry
+        if isinstance(made, _ProbeMark):  # a probe of the body (tilefish.probe): its name and the line it was written on
+            probe: "dict[str, Any]" = {"what": f"probe {made.name}"}
+            if made.loc is not None:
+                probe["loc"] = f"{made.loc[0]}:{made.loc[1]}"
+            return probe
         return {"what": made} if isinstance(made, str) else None
 
     out: "list[Any]" = [None] * first

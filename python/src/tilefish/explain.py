@@ -19,6 +19,9 @@ it disassembles the cubin of the manifest (an ``nvdisasm`` that decodes the arch
 an op then). The module-relative source names of the line information (``kernels/mm.py``, ``tilefish_generated/rmsnorm.py``) are resolved in
 the trace's copies first, then under each ``--source-root`` (default: the working directory), so it works from any directory.
 
+``--probes FILE`` explains the records of an instrumented run (:mod:`tilefish._probes`, ``docs/instrument.md``): the phases between the probes with
+their durations and distributions per warp role, what a probe costs and the overhead; ``--timeline sm|cta|role`` and ``--chrome OUT`` (Perfetto).
+
 ``--graph G --advise`` is the plan-level fusion advisor (:mod:`tilefish._advise`, ``docs/advise.md``): which steps of the plan could be one kernel,
 what that would save and what to do; ``--profile OUT`` times every step of the plan on the device first (:mod:`tilefish._profile`).
 """
@@ -412,7 +415,7 @@ def load(
     from ._manifest import Manifest
 
     directory = pathlib.Path(directory)
-    manifest = Manifest.load(directory)
+    manifest = Manifest.load(directory, instrumented=True)  # (an instrumented export is explained like any other)
     trace = Trace.load(directory)
     context: "dict[str, Any]" = {}
     plan_digest: "str | None" = None
@@ -565,7 +568,63 @@ def _parser() -> argparse.ArgumentParser:
     a.add_argument("--devscalar", action="append", default=[], metavar="NAME=VALUE", help="--profile: the value of a device scalar (repeatable; every one is needed)")
     a.add_argument("--pin", help="--profile: the plan's (or plan set's) digest the replay is checked against")
     a.add_argument("--trust-directory", action="store_true", help="--profile: replay whatever plan the directory holds, without a pin")
+    r = p.add_argument_group("the probes of an instrumented run (docs/instrument.md)")
+    r.add_argument("--probes", metavar="FILE", help="the records of an instrumented run (ProbeTrace.save, the Rust host's ProbeTrace::save): phases and their durations")
+    r.add_argument("--timeline", choices=("sm", "cta", "role"), help="--probes: the timeline per SM, per CTA (every warp) or per warp role (one warp each)")
+    r.add_argument("--chrome", metavar="OUT", help="--probes: also write a Chrome trace of the phases to OUT (chrome://tracing, ui.perfetto.dev)")
+    r.add_argument("--limit", type=int, default=16, help="--probes --timeline: how many SMs or CTAs (default 16)")
     return p
+
+
+def _probes_main(args: Any) -> int:
+    """``tilefish-explain DIR --probes FILE``: the phases of the launches of a probe trace (``KERNEL``: those of that stem or op), with the lines of
+    the probes from the export's trace (or ``--source-root``); ``--timeline``, ``--chrome``, ``--json``."""
+    from ._probes import ProbeTrace
+
+    found = ProbeTrace.load(args.probes)
+    if args.kernel:
+        found = ProbeTrace([launch for launch in found.launches if args.kernel in (launch.stem, launch.op, launch.stem.split(".", 1)[0])])
+        if not found.launches:
+            raise TilefishExplainError(f"the probe trace {args.probes!r} has no launch of {args.kernel!r}")
+    directory = pathlib.Path(args.directory)
+    roots = tuple(pathlib.Path(r) for r in (args.source_root or [pathlib.Path.cwd()]))
+    explained: "dict[tuple[str, str], Explained | None]" = {}
+
+    def text_of(loc: str) -> "str | None":
+        name, _, line = loc.rpartition(":")
+        if not line.isdigit():
+            return None
+        for launch in found.launches:  # the trace's copy of the source, and what a generated line was written for
+            key = (launch.stem, launch.arch)
+            if key not in explained:
+                try:
+                    explained[key] = load(directory, launch.stem, arch=launch.arch, source_roots=roots) if (directory / "manifest.json").is_file() else None
+                except TilefishError:
+                    explained[key] = None
+            e = explained[key]
+            if e is None:
+                continue
+            text = e.source_text(name, int(line))
+            if text:
+                made = e.written_for(name, int(line))
+                return text + (f"   [{made['what']}" + (f" at {made['loc']}" if made.get("loc") else "") + "]" if made and made.get("what") else "")
+        for root in roots:
+            path = root / name
+            if path.is_file():
+                lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
+                if int(line) <= len(lines):
+                    return lines[int(line) - 1].strip()
+        return None
+
+    if args.chrome:
+        pathlib.Path(args.chrome).write_text(json.dumps(found.chrome()) + "\n", encoding="utf-8")
+    if args.json:
+        print(json.dumps(found.summaries(), indent=1, default=str))
+    elif args.timeline:
+        sys.stdout.write(found.timeline_text(by=args.timeline, limit=args.limit))
+    else:
+        sys.stdout.write(found.summary_text(text_of))
+    return 0
 
 
 def _load_object(spec: str) -> Any:
@@ -626,6 +685,12 @@ def _advise_main(args: Any) -> int:
 def main(argv: "Sequence[str] | None" = None) -> int:
     """``tilefish-explain``; returns the exit status (2 for a request the export cannot answer)."""
     args = _parser().parse_args(argv)
+    if args.probes:
+        try:
+            return _probes_main(args)
+        except TilefishError as err:  # (TilefishProbeError is one)
+            print(f"tilefish-explain: {err}", file=sys.stderr)
+            return 2
     if args.advise or args.profile:
         try:
             return _advise_main(args)

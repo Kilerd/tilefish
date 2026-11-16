@@ -1014,6 +1014,13 @@ $ tilefish-explain build/mm mm --diff-arch sm_120       # or --diff OTHER_EXPORT
 time by class. `tilefish.profile_plan(block, "build/block", bucket="M=128", ...)` (or `--profile`) measures every step on the device, a runtime path
 outside every artefact, and `--timing` ranks by what it measured.
 
+**What goes on inside a kernel** (`docs/instrument.md`): `tilefish.probe("load.wait")` marks a phase boundary in a `@tilefish.kernel` body, a
+`@triton.jit` or a `@gluon.jit` kernel, and a production build compiles it to nothing. The instrumented variant (`runtime.export(..., instrument=True)`,
+or `tilefish.run(..., probes=tilefish.Probes())` in jit) records `%globaltimer`, `%clock`, the SM and the probe for every warp into a buffer the host
+gives in the profile scratch slot, with binaries and digests of its own that every host refuses unless asked; Python and Rust collect the records after a
+launch, a plan run or a captured replay, and `tilefish-explain DIR --probes FILE` gives the phases with their distributions per warp role (the
+partitions of a warp-specialised kernel), timelines per SM and CTA, and a Chrome trace.
+
 ## The Rust host
 
 The `tilefish` crate (`crates/tilefish`, version 0.0.1) is the
