@@ -729,14 +729,14 @@ def _launch_built(prep: _Prepared, built: BuiltKernel, index: int, probes: Any =
             cuda_grid = loaded.launch_grid(prep.grid)
             nbytes = _probe.buffer_bytes(int(built.instrument["capacity"]), -(-built.block[0] // 32), math.prod(cuda_grid))
             region = probes.region(nbytes, index)
-        address = region[1] if region is not None else None
+        extra = {"probes": region[1]} if region is not None else {}  # (the profile scratch of an instrumented binary: its probe buffer)
         if not built.launch.global_scratch_size:
-            loaded.launch(prep.grid, args, stream, probes=address)
+            loaded.launch(prep.grid, args, stream, **extra)
         else:
             # the global scratch of this launch: allocated on its stream (torch's blocks start on 512 bytes), freed after it (the caching allocator
             # reuses it on this stream only after the launch, which is ordered before any later work of the stream)
             scratch = torch.empty(max(loaded.scratch_bytes(prep.grid), 1), dtype=torch.uint8, device=f"cuda:{index}")
-            loaded.launch(prep.grid, args, stream, scratch=int(scratch.data_ptr()), probes=address)
+            loaded.launch(prep.grid, args, stream, scratch=int(scratch.data_ptr()), **extra)
         if region is not None:
             probes.collect(
                 region[0], region[1], built=built, grid=cuda_grid, block=built.block, stem=built.stem, arch=built.arch, op=prep.spec.op,
@@ -766,7 +766,8 @@ def jit_built(target: _Target, spec: CompileSpec, index: int, instrument: "_prob
     extern = target.launch_extern()
     if extern.binary is not None:
         return build_binary_for_device(spec, extern.binary, index)
-    return build_for_device(spec, target.jit_function(spec), index, instrument)
+    fn = target.jit_function(spec)
+    return build_for_device(spec, fn, index) if instrument is None else build_for_device(spec, fn, index, instrument)
 
 
 def _run_jit(prep: _Prepared, probes: Any = None) -> None:

@@ -597,6 +597,8 @@ class JitProvider:
         self.instrument = instrument
 
     def kernel(self, callee: _plan.Callee, spec: Any, index: int) -> Any:
+        if self.instrument is None:
+            return runtime.jit_built(callee.target, spec, index)
         return runtime.jit_built(callee.target, spec, index, self.instrument)
 
     def pin(self, spec: Any, index: int) -> Any:
