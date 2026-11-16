@@ -13,7 +13,7 @@ import fake_compile
 import pytest
 
 import tilefish
-from tilefish import Dim, Tensor, TilefishBuildError, TilefishManifestError, TilefishTypeError, _probe, explain, f32, runtime
+from tilefish import Dim, Tensor, TilefishBuildError, TilefishManifestError, TilefishTypeError, _probe, bf16, explain, f32, runtime
 from tilefish._probes import Launch, ProbeTrace, TilefishProbeError
 from tilefish._probe import BEGIN, CALIB, END, MAGIC, WarpRecords
 from tilefish.aot import build, compile_specs, write_manifest
@@ -359,6 +359,71 @@ def test_a_probe_is_in_a_kernel():
     from tilefish._probe import generated_probe
 
     assert generated_probe("anything") is None  # a generated source run as Python (an interpreter): nothing
+
+
+def test_no_fused_region_has_a_probe_and_a_probed_kernel_is_a_step_of_its_own():
+    """Fusion version 2 (the default, its row regions lowered by revision 2) and probes. A probe is in a kernel body only (a graph body refuses it),
+    so no region of either version has one; a ``@tilefish.kernel`` with probes that a graph calls is a step of its own (a call is never fused), with
+    its probes; and revision 2 of the lowering puts a kernel's probes where revision 1 puts them."""
+    import fusion_graphs as fg
+    from tilefish import _fusion
+    from tilefish.lower import lower
+
+    R, DR = fg.R, fg.DR
+
+    @tilefish.kernel
+    def rows_p(x: Tensor[R, DR, f32]) -> Tensor[R, DR, f32]:
+        a = x * 2.0
+        tilefish.probe("scaled")
+        return a + 1.0
+
+    def body(x, res, w):
+        out, h = fg._add_rmsnorm(x, res, w)
+        return out, rows_p(h.to(f32) * 0.5)
+
+    @tilefish.graph
+    def g2(x: Tensor[R, DR, bf16], res: Tensor[R, DR, bf16], w: Tensor[DR, bf16]):
+        return body(x, res, w)
+
+    @tilefish.graph(fusion=tilefish.fusion(version=1))
+    def g1(x: Tensor[R, DR, bf16], res: Tensor[R, DR, bf16], w: Tensor[DR, bf16]):
+        return body(x, res, w)
+
+    for g, version in ((g2, 2), (g1, 1)):
+        f = _fusion.fused(g)
+        assert f.settings.version == version
+        assert f.regions and all(r.kernel.graph.probes == () and "_tf_probe" not in r.kernel.lower().source for r in f.regions), version
+        assert {r.kernel.lowering for r in f.regions} == {version}
+        calls = [n.op for n in f.graph.nodes if n.attrs.get("kind") == "kernel" and n.op == "rows_p"]
+        assert calls == ["rows_p"], version  # the probed kernel: one step of the plan, not a region's op
+    assert any(n.op in ("sum", "mean") for r in _fusion.fused(g2).regions for n in (_fusion.fused(g2).program[k] for k in r.nodes) if len(r.nodes) > 1)
+
+    with pytest.raises(TilefishTypeError, match="graph body"):
+
+        @tilefish.graph(fusion=tilefish.fusion(version=2))
+        def refused(x: Tensor[R, DR, f32]) -> Tensor[R, DR, f32]:
+            y = x * 2.0
+            tilefish.probe("in-a-graph")
+            return y + 1.0
+
+    @tilefish.kernel
+    def rows_sum_p(x: Tensor[R, DR, f32]) -> Tensor[R, f32]:
+        sq = x * x
+        tilefish.probe("squared")
+        s = tilefish.sum(sq, -1, order=fg.T128)
+        tilefish.probe("summed")
+        return s * 0.5
+
+    def probes_in(low):
+        """The probe calls of a lowered kernel's source, in order, with what its line map says of each."""
+        lines = low.source.splitlines()
+        at = [i for i, line in enumerate(lines) if line.strip().startswith("_tf_probe(")]
+        return [(lines[i].split("#")[0].strip(), low.line_map[i]["what"]) for i in at]
+
+    one, two = lower(rows_sum_p), lower(rows_sum_p, lowering=2)
+    assert "revision 2" in two.source and two.source != one.source
+    want = [('_tf_probe("squared")', "probe squared"), ('_tf_probe("summed")', "probe summed")]
+    assert probes_in(one) == probes_in(two) == want
 
 
 # -- the instrumented variant ---------------------------------------------------------------------------------------------------------------
