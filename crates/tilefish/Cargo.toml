@@ -53,3 +53,7 @@ required-features = ["gpu-gate"]
 [[test]]
 name = "gpu_plan_gate"
 required-features = ["gpu-gate"]
+
+[[test]]
+name = "gpu_instrument_gate"
+required-features = ["gpu-gate"]
