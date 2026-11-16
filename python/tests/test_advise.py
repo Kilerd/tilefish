@@ -281,6 +281,22 @@ def test_ranking_by_bytes_without_timing_and_by_measured_time_with_it():
     assert next(c for c in slowest.candidates if c["steps"] == [2, 3])["saved_us"]["M=64"] == pytest.approx(2 * mid / bw * 1e6 + 3.0, abs=1e-3)
 
 
+def test_the_machine_is_the_plans_architecture_and_a_partition_scales_it():
+    doc, manifest = chain_plan()
+    for arch, example in (("sm_90", "H100 SXM"), ("sm_100", "B200"), ("sm_103", "B300"), ("sm_120", "RTX 5090")):
+        adv = _advise.analyse({**doc, "arch": arch}, {**manifest, "kernels": [{**k, "arch": arch} for k in manifest["kernels"]],
+                                                         "library": [{**g, "arch": arch} for g in manifest["library"]]})
+        assert adv.machine.example == example and adv.doc["machine"]["balance"] == pytest.approx(_advise.MACHINES[arch].balance, abs=0.1)
+        assert adv.doc["steps"][2]["flops"] == 2 * M * 1024 * 1024  # the GEMM found in the manifest of that architecture
+    # on an RTX 5090 (balance 117) the 64-row GEMM (56 FLOPs per byte) is still memory-bound; a 4096-row one compute-bound
+    assert _advise.analyse(doc, manifest, machine="sm_120").doc["steps"][2]["bound"] == "memory"
+    with pytest.raises(_advise.TilefishAdviseError, match="no machine balance for sm_75"):
+        _advise.analyse(doc, manifest, machine="sm_75")
+    slice_ = _advise.MACHINES["sm_103"].scaled(bandwidth=1614.0, sms=30)
+    assert slice_.bandwidth == 1614.0 and slice_.tensor16 == pytest.approx(2250.0 * 30 / 148) and 280 < slice_.balance < 286
+    assert _advise.analyse(doc, manifest, bandwidth=1000.0).machine.bandwidth == 1000.0
+
+
 def test_a_timing_file_of_another_plan_or_bucket_is_refused():
     doc, manifest = chain_plan()
     t = timing_of(doc, [1.0, 1.0, 1.0, 1.0])

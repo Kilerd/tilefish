@@ -18,6 +18,9 @@ against the manifest (each binary's sha256) and its own digest, and needs no CUD
 it disassembles the cubin of the manifest (an ``nvdisasm`` that decodes the architecture is needed; no line of a generated source is mapped to
 an op then). The module-relative source names of the line information (``kernels/mm.py``, ``tilefish_generated/rmsnorm.py``) are resolved in
 the trace's copies first, then under each ``--source-root`` (default: the working directory), so it works from any directory.
+
+``--graph G --advise`` is the plan-level fusion advisor (:mod:`tilefish._advise`, ``docs/advise.md``): which steps of the plan could be one kernel,
+what that would save and what to do; ``--profile OUT`` times every step of the plan on the device first (:mod:`tilefish._profile`).
 """
 
 from __future__ import annotations
@@ -537,7 +540,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("directory", help="an export directory (manifest.json; trace/ when exported with trace=True)")
     p.add_argument("kernel", nargs="?", help="a stem of the manifest, or an op name with one binary")
     p.add_argument("--arch", help="the architecture (sm_103), when the binary is built for several")
-    p.add_argument("--graph", help="a graph whose plan is in the directory (with --step or --region)")
+    p.add_argument("--graph", help="a graph whose plan is in the directory (with --step, --region, --advise or --profile)")
     p.add_argument("--step", type=int, help="a step of the graph's plan (its index in the bucket's steps)")
     p.add_argument("--bucket", help="the bucket of the plan (D=96,T=128), when it has several")
     p.add_argument("--region", help="a fused region of the graph: its kernel's name (fused_...) or its index in <graph>.fusion.json")
