@@ -405,7 +405,7 @@ private:
     detail::Handle<tilefish_kernel, tilefish_kernel_destroy> h_;
 };
 
-/// A pinned cuBLASLt GEMM loaded in a context: launch with a, b, bias (when it has one), out and a workspace.
+/// A pinned cuBLASLt GEMM loaded in a context: launch with a, b, bias (when it has one), c (when it has one: `has_c`), out and a workspace.
 class Gemm {
 public:
     explicit Gemm(tilefish_gemm* p) : h_(p) {}
@@ -416,6 +416,24 @@ public:
     void check(detail::Span<Tensor> tensors) const {
         auto t = detail::raw(tensors);
         detail::check(tilefish_gemm_check(h_.get(), t.data(), t.size()));
+    }
+    /// The epilogue, one of `TILEFISH_EPILOGUE_*` (ABI 1.1).
+    int32_t epilogue() const {
+        int32_t value = TILEFISH_EPILOGUE_NONE;
+        detail::check(tilefish_gemm_epilogue(h_.get(), &value, nullptr));
+        return value;
+    }
+    /// Whether a launch takes `c`, the tensor before `out` (a `cublaslt.matmul` with `beta` 1: the epilogue acts on `acc + c`; ABI 1.1).
+    bool has_c() const {
+        bool value = false;
+        detail::check(tilefish_gemm_epilogue(h_.get(), nullptr, &value));
+        return value;
+    }
+    /// Whether a launch takes `bias`.
+    bool has_bias() const {
+        bool value = false;
+        detail::check(tilefish_gemm_sizes(h_.get(), nullptr, nullptr, nullptr, &value));
+        return value;
     }
     uint64_t workspace_bytes() const noexcept { return tilefish_gemm_workspace_bytes(h_.get()); }
     uint64_t workspace_required() const noexcept { return tilefish_gemm_workspace_required(h_.get()); }

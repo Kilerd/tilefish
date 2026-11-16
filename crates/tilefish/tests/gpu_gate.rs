@@ -44,7 +44,8 @@
 //! `the_gate_has_a_case_for_every_feature_of_m3_3` and `views_that_share_a_stride_must_all_have_it`, and `the_gate_has_a_gluon_kernel`;
 //! `the_gate_has_generated_ops` checks that it runs the generated ops of `tilefish.im2col1d` and `tilefish.col2im1d`. M3.4 adds
 //! TMA descriptors: `the_gate_has_tma_descriptors`, `a_descriptor_of_a_tensor_the_driver_refuses_is_refused_before_the_launch` and
-//! `graph_capture_of_kernels_with_tma_descriptors`.
+//! `graph_capture_of_kernels_with_tma_descriptors`. GEMMs with a cuBLASLt epilogue (`cublaslt.matmul`): `the_gate_has_gemms_with_an_epilogue` (their
+//! loads and canaries, a capture of each, a forged canary refused) and `the_canary_of_a_gemm_is_never_on_the_null_stream`.
 
 #[allow(dead_code)]
 mod generated {
@@ -62,7 +63,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr as _, result}
 use serde_json::Value;
 use tilefish::{
     Access, AlgoSource, Arch, Bf16, DType, DevicePtr, E4m3, E5m2, Element, Error, F16, F32, GemmLayout, I32, I64,
-    Manifest, Pin, PreconditionKind, TensorArg, TensorMut, TensorRef, U8, elf::sha256_hex,
+    LibraryImpl, Manifest, Pin, PreconditionKind, TensorArg, TensorMut, TensorRef, U8, elf::sha256_hex,
 };
 
 fn gate_dir() -> PathBuf {
@@ -1659,6 +1660,220 @@ fn the_gate_has_gemms_of_every_form() {
             of_op.len()
         );
     }
+}
+
+/// The cases of the gate's GEMMs with a cuBLASLt epilogue (`impl: "cublaslt.matmul"`, `rust_gate.MATMUL_FORMS`).
+fn matmul_cases(cases: &Value, manifest: &Manifest, arch: &str) -> Vec<Value> {
+    cases_where(cases, |c| {
+        is_gemm(c)
+            && manifest
+                .library_entry(c["stem"].as_str().unwrap(), arch)
+                .is_some_and(|e| e.implementation == LibraryImpl::Matmul)
+    })
+}
+
+/// GEMMs with a cuBLASLt epilogue (`impl: "cublaslt.matmul"`, `rust_gate.MATMUL_FORMS`, `docs/manifest-schema-3.md`, section 9.5): every epilogue,
+/// `beta` 0 and 1 (`c` the tensor before `out`), bf16 and f16, the four layouts, an opt-in, an SM count target, three buckets of `M`, with
+/// a canary and without. Rust reads each entry and loads it (the epilogue on the descriptor of every check and run; the canary, run before the
+/// pin is used, gives the digest Python's export recorded, and runs again); `byte_identity` holds each case to Python's replay; the largest bucket
+/// of each is captured in a CUDA graph with `launch_raw` and regions and replays to Python's bytes; and a manifest whose canary was changed, pinned
+/// with its own digest recomputed, is refused at the load (an entry without a canary loads).
+#[test]
+fn the_gate_has_gemms_with_an_epilogue() {
+    use tilefish::GemmEpilogue;
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no GEMM with an epilogue");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let archs = arch.to_string();
+    let matmuls = matmul_cases(&cases, &manifest, &archs);
+    assert!(matmuls.len() >= 24, "{} cases of GEMMs with an epilogue", matmuls.len());
+    let mut forms = std::collections::BTreeSet::new();
+    let mut ms = std::collections::BTreeSet::new();
+    let mut ops = std::collections::BTreeMap::new();
+    for case in &matmuls {
+        let stem = case["stem"].as_str().unwrap();
+        let entry = manifest.library_entry(stem, &archs).unwrap();
+        let gemm = manifest.gemm(&gpu.ctx, stem, &[], arch).unwrap();
+        assert_eq!(
+            (gemm.implementation(), gemm.epilogue(), gemm.beta(), gemm.has_c(), gemm.has_bias()),
+            (LibraryImpl::Matmul, entry.epilogue, entry.beta, entry.has_c(), entry.has_bias()),
+            "{stem}"
+        );
+        assert_eq!((gemm.contract(), gemm.canary()), (entry.contract, entry.canary.as_ref()), "{stem}");
+        assert_eq!(
+            entry.verification.as_ref().map(|v| (v.formula.clone(), v.elements)),
+            Some((entry.epilogue.formula(entry.beta), 2 * entry.m * entry.n)),
+            "{stem}: the verification export ran"
+        );
+        // the tensors of the case are the entry's: a, b, [bias], [c], out
+        let names: Vec<&str> = tensors_json(case).iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, entry.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), "{stem}");
+        // the canary again, as the load ran it (on a stream of its own)
+        gemm.check_canary().unwrap_or_else(|e| panic!("{stem}: {e}"));
+        forms.insert((
+            entry.epilogue.as_str(),
+            entry.beta,
+            entry.dtype.name(),
+            entry.layout.as_str(),
+            entry.canary.is_some(),
+        ));
+        ms.insert(entry.m);
+        ops.entry(entry.op.clone()).or_insert_with(Vec::new).push(case.clone());
+    }
+    for epilogue in GemmEpilogue::ALL {
+        for beta in [0, 1] {
+            assert!(
+                forms.iter().any(|f| f.0 == epilogue.as_str() && f.1 == beta),
+                "no case of {epilogue} with beta {beta}: {forms:?}"
+            );
+        }
+    }
+    for (what, ok) in [
+        ("bf16", forms.iter().any(|f| f.2 == "bf16")),
+        ("f16", forms.iter().any(|f| f.2 == "f16")),
+        ("NN", forms.iter().any(|f| f.3 == "NN")),
+        ("TT", forms.iter().any(|f| f.3 == "TT")),
+        ("NT", forms.iter().any(|f| f.3 == "NT")),
+        ("a canary", forms.iter().any(|f| f.4)),
+        ("no canary", forms.iter().any(|f| !f.4)),
+    ] {
+        assert!(ok, "the GEMMs with an epilogue have no case of {what}: {forms:?}");
+    }
+    assert_eq!(ms.into_iter().collect::<Vec<_>>(), [32, 64, 320], "a case per bucket of M");
+    assert_eq!(
+        cublaslt_version_of(&cases),
+        tilefish::cublaslt_version(),
+        "the process maps the cuBLASLt that chose the pins"
+    );
+    // the largest bucket of each, captured in a CUDA graph with launch_raw and regions, three times
+    for (op, of_op) in &ops {
+        let case = of_op.iter().max_by_key(|c| tensors_json(c)[0]["shape"][0].as_u64().unwrap()).unwrap();
+        let stem = case["stem"].as_str().unwrap().to_owned();
+        let gemm = manifest.gemm(&gpu.ctx, &stem, &[], arch).unwrap();
+        let mut workspace = gemm.alloc_workspace(&gpu.stream).unwrap();
+        let mut tensors = tensors_of(&gpu, case);
+        let last = tensors.len() - 1;
+        let expect = read(&gate_dir().join(case["tensors"][last]["expect"].as_str().unwrap()));
+        let shapes: Vec<Vec<usize>> = tensors_json(case).iter().map(|t| usizes(&t["shape"])).collect();
+        let dtypes: Vec<DType> =
+            tensors_json(case).iter().map(|t| DType::from_name(t["dtype"].as_str().unwrap()).unwrap()).collect();
+        let ws_shape = [workspace.len()];
+        gpu.stream.synchronize().unwrap();
+        // SAFETY: the buffers outlive the graph; nothing else uses them meanwhile.
+        let regions: Vec<DevicePtr<'static>> =
+            unsafe { tensors.iter().map(|(_, b)| gpu.unbound_region(b, b.nbytes())).collect() };
+        let ws = unsafe { DevicePtr::from_raw(workspace.device_ptr(&gpu.stream).0, workspace.len() as u64, 0) };
+        let stream = gpu.stream.cu_stream();
+        let launch = || {
+            let mut args: Vec<TensorArg<'_>> = Vec::new();
+            for (i, shape) in shapes.iter().enumerate() {
+                let access = if i == last { Access::InOut } else { Access::In };
+                args.push(TensorArg::new(regions[i], shape, dtypes[i], access)?);
+            }
+            args.push(TensorArg::new(ws, &ws_shape, DType::U8, Access::InOut)?);
+            // SAFETY: the stream is the GEMM's; the regions are the buffers' own, which outlive the graph.
+            unsafe { gemm.launch_raw(stream, &args) }
+        };
+        capture_and_run(&gpu, &launch, &mut tensors[last].1.slice, &expect);
+        let _ = &mut workspace;
+        println!(
+            "rust gate: {op}: {} cases; {stem} captured in a CUDA graph ran 3 times and matched Python's replay",
+            of_op.len()
+        );
+    }
+    // a forged canary: the digest of one entry changed and the manifest pinned with its digest recomputed (what a writer of the file can do): the
+    // load runs the canary and refuses the pin; the same with another seed; and the entry without a canary loads
+    let case = matmuls
+        .iter()
+        .find(|c| manifest.library_entry(c["stem"].as_str().unwrap(), &archs).unwrap().canary.is_some())
+        .unwrap();
+    let stem = case["stem"].as_str().unwrap();
+    let tmp = copy_of_the_manifest("matmul-canary");
+    let original = read_json(&tmp.join("manifest.json"));
+    let forge = |change: &dyn Fn(&mut Value)| {
+        let mut doc = original.clone();
+        for e in doc["library"].as_array_mut().unwrap() {
+            if e["stem"] == stem && e["arch"] == archs.as_str() {
+                change(e);
+            }
+        }
+        write_json(&tmp.join("manifest.json"), &doc);
+        let digest = tilefish::manifest_digest(&doc).unwrap();
+        let forged = Manifest::load(&tmp, Pin::Digest(&digest)).expect("the forged manifest loads with its own digest");
+        forged.gemm(&gpu.ctx, stem, &[], arch)
+    };
+    let zeros = "0".repeat(32);
+    let refused = forge(&|e| e["canary"]["out_digest"] = Value::from(zeros.clone()));
+    assert!(
+        matches!(&refused, Err(Error::Manifest(m)) if m.contains(&format!("the canary of the cuBLASLt matmul '{stem}' ({archs}, algorithm id "))
+            && m.contains(&format!("and the manifest recorded {zeros} (seed 1)"))),
+        "{refused:?}"
+    );
+    println!("rust gate: a forged canary of {stem} is refused at the load: {}", refused.as_ref().unwrap_err());
+    let refused = forge(&|e| e["canary"]["seed"] = Value::from(2));
+    assert!(
+        matches!(&refused, Err(Error::Manifest(m)) if m.contains("(seed 2)")),
+        "another seed gives another digest: {refused:?}"
+    );
+    let plain = forge(&|e| {
+        e.as_object_mut().unwrap().remove("canary");
+    });
+    assert!(plain.is_ok_and(|g| g.canary().is_none()), "an entry without a canary loads");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The canary of a GEMM with an epilogue is on a stream of its own, never on the NULL stream, as a convolution's: with the NULL stream held by a host
+/// function for four seconds, the canary of every GEMM of the gate that has one runs again ([`tilefish::Gemm::check_canary`], the code of the load:
+/// the zeroed buffers, the fills, the GEMM, the digest, the copy back, the frees) and passes, and the NULL stream is still busy when they return.
+#[test]
+fn the_canary_of_a_gemm_is_never_on_the_null_stream() {
+    extern "C" fn hold(_: *mut c_void) {
+        std::thread::sleep(Duration::from_secs(4));
+    }
+    let cases = cases();
+    if cases["manifest"] != "manifest" {
+        eprintln!("the gate runs a committed fixture, which has no GEMM with an epilogue");
+        return;
+    }
+    let (gpu, manifest) = (Gpu::new(), manifest());
+    let arch = Arch::of_context(&gpu.ctx).unwrap();
+    let loaded: Vec<_> = matmul_cases(&cases, &manifest, &arch.to_string())
+        .iter()
+        .map(|c| manifest.gemm(&gpu.ctx, c["stem"].as_str().unwrap(), &[], arch).unwrap())
+        .filter(|g| g.canary().is_some())
+        .collect();
+    assert!(loaded.len() >= 20, "{} GEMMs with a canary", loaded.len());
+    gpu.ctx.bind_to_thread().unwrap();
+    // SAFETY: the context is current; the null stream is its legacy default stream; `hold` takes no data.
+    let held = unsafe { sys::cuLaunchHostFunc(std::ptr::null_mut(), Some(hold), std::ptr::null_mut()) };
+    assert_eq!(held, sys::CUresult::CUDA_SUCCESS, "cuLaunchHostFunc");
+    let began = std::time::Instant::now();
+    let checked: Vec<_> = loaded.iter().map(|g| (g.stem().to_owned(), g.check_canary())).collect();
+    let took = began.elapsed();
+    // SAFETY (the two calls below): the context is current; the null stream is its legacy default stream.
+    let busy = unsafe { sys::cuStreamQuery(std::ptr::null_mut()) } == sys::CUresult::CUDA_ERROR_NOT_READY;
+    let _ = unsafe { sys::cuStreamSynchronize(std::ptr::null_mut()) };
+    for (stem, check) in &checked {
+        assert!(check.is_ok(), "{stem}: {:?}", check.as_ref().err());
+    }
+    assert!(
+        busy,
+        "the {} canaries took {took:?}, and the NULL stream was done when they returned: one of them waited for it",
+        checked.len()
+    );
+    println!(
+        "rust gate: {} canaries of GEMMs ran in {took:?} with the NULL stream held, and none of them waited for it",
+        checked.len()
+    );
+}
+
+/// The cuBLASLt version `rust_gate.py prepare` recorded (the one the pins were chosen with).
+fn cublaslt_version_of(cases: &Value) -> Option<u64> {
+    cases["cublaslt_version"].as_u64()
 }
 
 /// The cuDNN convolutions (`conv_kernels.py`: a backend pin and legacy ones, NHWC and NCHW, one and two spatial axes, f16, bf16 and f32): Rust reads each

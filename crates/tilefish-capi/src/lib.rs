@@ -40,7 +40,7 @@ pub use types::*;
 pub const TILEFISH_ABI_MAJOR: u32 = 1;
 /// The minor version of the ABI this header describes: a library of the same major version and at least this minor version has everything
 /// the header declares (a minor version only adds functions and values).
-pub const TILEFISH_ABI_MINOR: u32 = 0;
+pub const TILEFISH_ABI_MINOR: u32 = 1;
 
 /// The ABI version of the library loaded: `TILEFISH_ABI_MAJOR << 16 | TILEFISH_ABI_MINOR` of the header it was built with.
 #[unsafe(no_mangle)]

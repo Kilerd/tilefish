@@ -71,6 +71,14 @@ int main(int argc, char **argv) {
     CHECK(tilefish_manifest_schema() == 3);
     CHECK(strcmp(tilefish_plan_schema(), "tilefish.plan.v1") == 0);
     CHECK(strcmp(tilefish_status_name(TILEFISH_ERROR_PIN_MISMATCH), "TILEFISH_ERROR_PIN_MISMATCH") == 0);
+    CHECK((tilefish_abi_version() & 0xffffu) >= 1 && TILEFISH_ABI_MINOR >= 1);
+
+    /* the epilogue of a GEMM (ABI 1.1): its values, and a NULL handle refused with nothing written */
+    CHECK(TILEFISH_EPILOGUE_NONE == 0 && TILEFISH_EPILOGUE_BIAS == 1 && TILEFISH_EPILOGUE_RELU == 2 && TILEFISH_EPILOGUE_RELU_BIAS == 3);
+    int32_t epilogue = -1;
+    bool has_c = true;
+    expect_status(tilefish_gemm_epilogue(NULL, &epilogue, &has_c), TILEFISH_ERROR_INVALID_ARGUMENT, "the epilogue of no GEMM");
+    CHECK(epilogue == -1 && has_c);
 
     /* a manifest, with its pin, a wrong pin, a bad pin, trusting the directory, a missing directory */
     tilefish_manifest *m = NULL;

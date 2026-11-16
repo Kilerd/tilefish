@@ -27,7 +27,7 @@ from test_library_ops import ALGO, SMS, VERSION, gemm, gemm_bias
 from test_rust_host import check_golden, needs_new_crate, pinned
 
 import tilefish
-from tilefish import Dim, Out, StrideOf, Strided, Tensor, TilefishBuildError, TilefishManifestError, bf16, const, f32, i32, i64, runtime
+from tilefish import Dim, Out, StrideOf, Strided, Tensor, TilefishBuildError, TilefishManifestError, bf16, const, f16, f32, i32, i64, runtime
 from tilefish._elf import code_digest
 from tilefish._library import BuiltLibrary, library_specs
 from tilefish.aot import Manifest, write_manifest
@@ -157,6 +157,125 @@ def test_launchers_for_pinned_gemms(tmp_path):
     assert 'pub const PINNED_WITH: &\'static [(&\'static str, u64)] = &[("sm_103", 120804), ("sm_90", 120704)];' in source  # one struct for the two architectures
     assert "Pinned with: sm_103: cuBLASLt 12.8.4 (120804) on 30 SMs, sm_90: cuBLASLt 12.7.4 (120704) on 132 SMs." in docs(source)
     assert 'pub const SHAPES: &\'static [&\'static [&\'static str]] = &[&["M", "Kb"], &["2048", "Kb"], &["2048"], &["M", "2048"]];' in source
+
+
+# -- GEMMs with a cuBLASLt epilogue (cublaslt.matmul, docs/manifest-schema-3.md section 9.5) ---------------------------------------------------
+
+MM = Dim("M", buckets=[32, 64])
+
+
+def matmul_op(name, epilogue, beta, dtype=bf16, layout="TN", **kw):
+    """A ``cublaslt.matmul`` ``name`` of ``a [M, 256]`` by ``b`` (``[512, 256]`` in TN, ``[256, 512]`` in NN), with the bias and ``c`` its epilogue
+    and ``beta`` take."""
+    import inspect
+
+    params = {"a": Tensor[MM, 256, dtype], "b": Tensor[512, 256, dtype] if layout == "TN" else Tensor[256, 512, dtype]}
+    if epilogue in ("bias", "relu_bias"):
+        params["bias"] = Tensor[512, dtype]
+    if beta:
+        params["c"] = Tensor[MM, 512, dtype]
+
+    def fn(*args): ...
+
+    fn.__signature__ = inspect.Signature(
+        [inspect.Parameter(k, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=v) for k, v in params.items()], return_annotation=Tensor[MM, 512, dtype]
+    )
+    return tilefish.library(name, acc=f32, impl="cublaslt.matmul", epilogue=epilogue, beta=beta, layout=layout, **kw)(fn)
+
+
+def matmul_ops():
+    """``{name: op}``: relu_bias with c (bf16, TN), none with c (f16), relu (f16, NN) and bias (bf16)."""
+    return {
+        "up": matmul_op("up", "relu_bias", 1),
+        "res": matmul_op("res", "none", 1, f16),
+        "act": matmul_op("act", "relu", 0, f16, "NN"),
+        "proj": matmul_op("proj", "bias", 0),
+    }
+
+
+def matmul_pins(op, arch="sm_103", contract="measured-exact", canary=True, algo=ALGO, version=VERSION, sm_count=SMS):
+    """The entries of every bucket of a ``cublaslt.matmul`` as pinned on ``arch``: verified ``contract`` (``binary-defined``: 64 elements differ),
+    with a canary of seed 1 (its digest made up from the stem) or none."""
+    from tilefish._library import formula
+
+    out = []
+    for spec in library_specs(op):
+        differ = 0 if contract == "measured-exact" else 64
+        v = {"formula": formula(spec.epilogue, spec.beta), "accumulator": "f32-form", "operand_sets": 2, "elements": 2 * spec.m * spec.n,
+             "differ": differ, "max_ulp": 15176 if differ else 0}  # fmt: skip
+        made = {"seed": 1, "out_digest": hashlib.sha256(spec.stem.encode()).hexdigest()[:32]} if canary else None
+        out.append(BuiltLibrary(spec, arch, algo, version, sm_count, contract, v, made))
+    return out
+
+
+def matmul_library(ops):
+    """The entries of :func:`matmul_ops` on sm_103, and ``proj`` on sm_90 too: binary-defined there, without a canary."""
+    sm90 = matmul_pins(ops["proj"], "sm_90", "binary-defined", canary=False, algo=ALGO2, version=VERSION - 100, sm_count=132)
+    return [*(b for op in ops.values() for b in matmul_pins(op)), *sm90]
+
+
+def test_launchers_for_gemms_with_an_epilogue(tmp_path):
+    ops = matmul_ops()
+    manifest = build_manifest(tmp_path / "m", (), matmul_library(ops))
+    source = rust.render(manifest, ops=list(ops.values()))
+    check_golden("rust_matmul.rs", source)
+    text = docs(source)
+    up = source.split("pub struct UpM32 ")[1].split("pub struct ")[0]
+    # the tensors, in the order a, b, [bias], [c], out, then the workspace
+    assert (
+        "a: TensorRef<'a, Bf16>,\n        b: TensorRef<'a, Bf16>,\n        bias: TensorRef<'a, Bf16>,\n        c: TensorRef<'a, Bf16>,\n"
+        "        out: TensorMut<'a, Bf16>,\n        workspace: TensorMut<'a, U8>,\n"
+    ) in up
+    assert "self.gemm.launch(stream, &mut [a.into_arg(), b.into_arg(), bias.into_arg(), c.into_arg(), out.into_arg(), workspace.into_arg()])" in up
+    assert "unsafe { self.gemm.launch_raw(stream, &[a.into_arg(), b.into_arg(), bias.into_arg(), c.into_arg(), out.into_arg(), workspace.into_arg()]) }" in up
+    assert 'pub const EPILOGUE: &\'static str = "relu_bias";' in up and "pub const BETA: u32 = 1;" in up and "pub const BIAS: bool = true;" in up
+    assert 'pub const SHAPES: &\'static [&\'static [&\'static str]] = &[&["M", "256"], &["512", "256"], &["512"], &["M", "512"], &["M", "512"]];' in up
+    res = source.split("pub struct ResM64 ")[1].split("pub struct ")[0]
+    assert "c: TensorRef<'a, F16>,\n        out: TensorMut<'a, F16>," in res and "bias: TensorRef" not in res and "pub const BIAS: bool = false;" in res
+    # the docs: the formula with the names of the launch, the epilogue, the contract each architecture's pin was verified to and its canary
+    assert "It computes `out[32, 512] = relu((a[32, 256] @ b[512, 256]^T + c[32, 512]) + bias[512])` on bf16 operands with an f32 accumulator" in text
+    assert "cuBLASLt's epilogue `relu_bias` (`CUBLASLT_EPILOGUE_RELU_BIAS`, beta 1) runs on the accumulator, `relu((acc + c) + bias)`" in text
+    assert "It computes `out[64, 512] = a[64, 256] @ b[512, 256]^T + c[64, 512]` on f16 operands" in text
+    assert "It computes `out[32, 512] = relu(a[32, 256] @ b[256, 512])` on f16 operands" in text  # NN
+    assert "`CUBLASLT_EPILOGUE_BIAS`) runs on the accumulator, `acc + bias`" in text
+    assert "sm_103: measured-exact (all 32768 elements of 2 operand sets equal)" in text and "(all 65536 elements" in text
+    assert "sm_90: binary-defined (64 of 32768 elements differ, by up to 15176 ULP where both are finite)" in text
+    assert f"(sm_103: seed 1, digest `{hashlib.sha256(b'up.M32').hexdigest()[:32]}`)" in text and "The entries of sm_90 have none." in text
+    assert 'pub const PINNED_WITH: &\'static [(&\'static str, u64)] = &[("sm_103", 120804), ("sm_90", 120704)];' in source  # proj on both
+    # a struct per stem of each: 4 ops of two buckets
+    assert source.count("    gemm: Gemm,\n") == 8
+
+
+def test_a_matmul_entry_the_reader_refuses_is_refused_and_writes_nothing(tmp_path):
+    ops = matmul_ops()
+    for change in (
+        lambda e: e.update(beta=2),
+        lambda e: e.update(epilogue="gelu"),
+        lambda e: e["canary"].update(out_digest="x\n}\npub fn pwned() {}"),
+        lambda e: e["verification"].update(formula="acc\n}\npub fn pwned() {}"),
+        lambda e: e.update(contract="measured-exact\n"),
+        lambda e: e.pop("verification"),
+        lambda e: e.update(algo_source="imported"),
+    ):
+        manifest = build_manifest(tmp_path / "m", (), matmul_pins(ops["up"])[:1])
+        change(manifest.library_entries[0])
+        out = tmp_path / "launchers.rs"
+        with pytest.raises(TilefishManifestError, match="cannot write Rust launchers for"):
+            rust.emit(manifest, out)
+        assert not out.exists()
+        shutil.rmtree(tmp_path / "m")
+
+
+def test_the_entries_of_a_matmul_on_several_architectures_must_agree_but_on_what_their_pins_found(tmp_path):
+    ops = matmul_ops()
+    manifest = build_manifest(tmp_path / "m", (), matmul_library(ops))
+    assert "pub struct ProjM32 " in rust.render(manifest)  # a contract, a verification and a canary of their own on sm_90
+    doc = json.loads(manifest.path.read_text())
+    proj = [e for e in doc["library"] if e["stem"] == "proj.M32" and e["arch"] == "sm_90"][0]
+    proj["epilogue"], proj["verification"]["formula"] = "relu_bias", "relu(acc + bias)"
+    (tmp_path / "m" / "manifest.json").write_text(json.dumps(doc))
+    with pytest.raises(TilefishManifestError, match="disagree about 'epilogue'"):
+        rust.render(pinned(Manifest.load(tmp_path / "m")))
 
 
 def test_a_manifest_of_kernels_and_library_entries_embeds_the_cubins_and_no_library_file(p1, prebuilt, tmp_path):
@@ -521,7 +640,11 @@ def test_the_launchers_of_schema_3_compile_against_the_crate(p1, prebuilt, tmp_p
     shapes = [ls.desc, ls.plain]
     text = rust.emit(build_manifest(tmp / "m6", shapes), crate / "src" / "shapes.rs", ops=shapes).read_text()
     assert "global_scratch: TensorMut<'a, U8>,\n" in text and "self.kernel.launch(stream, &mut [x.into_arg(), y.into_arg(), global_scratch.into_arg()])" in text
-    (crate / "src" / "lib.rs").write_text("pub mod binary;\npub mod embedded;\npub mod given;\npub mod library;\npub mod shapes;\npub mod strided;\n")
+    matmuls = matmul_ops()  # GEMMs with a cuBLASLt epilogue: launch takes c before out
+    rust.emit(build_manifest(tmp / "m7", (), matmul_library(matmuls)), crate / "src" / "matmul.rs", ops=list(matmuls.values()))
+    (crate / "src" / "lib.rs").write_text(
+        "pub mod binary;\npub mod embedded;\npub mod given;\npub mod library;\npub mod matmul;\npub mod shapes;\npub mod strided;\n"
+    )
     env = {**os.environ, "RUSTFLAGS": "-D warnings", "CARGO_TARGET_DIR": str(REPO_ROOT / "target" / "launchers-check-schema3")}
     done = subprocess.run(["cargo", "check", "--manifest-path", str(crate / "Cargo.toml"), "--color", "never"], capture_output=True, text=True, env=env, timeout=900)
     assert done.returncode == 0, done.stderr[-4000:]
