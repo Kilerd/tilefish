@@ -292,6 +292,12 @@ Notes (the facts behind the table):
    ``fma.rn.bf16x2`` (or ``mul.rn.bf16x2`` and ``add.rn.bf16x2`` without contraction), with no ``cvt`` to f32.
    The one exception is ``/``, which Triton does in f32 for bf16 and f16 and returns as f32; that is why a
    division of those dtypes is rejected.
+   **A scalar ``-0.0``** is written by its bits, ``tl.full((), -2147483648, tl.int32).to(tl.float32, bitcast=True)`` (``-32768`` and ``tl.int16`` for
+   bf16 and f16): Triton 3.5.1 writes a literal ``-0.0`` (``tl.where(m, x, -0.0)``, ``tl.full(..., -0.0, ...)``, a ``-0.0`` argument of an
+   inline-asm helper) as ``+0.0`` (measured on sm_103: ``0x00000000`` where ``0x80000000`` was written, with or without a ``+0.0`` in the same
+   kernel), so ``where(x > 0, x, -0.0)`` gave ``+0.0`` in tilefish 0.0.10 and earlier, in a kernel and in a fused region alike, against the
+   ``reference`` mode and the declared op. A ``const`` parameter whose value is ``-0.0`` is a ``tl.constexpr``, which Triton still makes ``+0.0``
+   (a graph's fused region writes a const's value as a scalar, so it is covered there).
 4. **Division.** ``a / b`` is ``div.full.f32``, never ``div.rn.f32``: the numerator times an approximate
    reciprocal, at most 2 ULP from the correctly rounded quotient (measured: 2 ULP, 29% of random elements
    differ, relative error below 1.8e-7). With a constant divisor (``x / D`` with ``D`` a constexpr or a
@@ -545,9 +551,9 @@ Notes (the facts behind the table):
 
     Every non-NaN value is the same either way, and the inline cast is ``.to()``'s bits on every f32 (``tests/test_gpu_fusion.py``).
 21. **Revision 2 of the lowering** (``lower(..., lowering=2)``; the kernel's ``lowering`` attribute, which the regions of ``tilefish.fusion(version=2)``
-    are made with, a kernel declared ``@tilefish.kernel(lowering=2)`` has, and every other kernel has as ``1``). The bytes of revision 1 but where
-    revision 1 loses the sign of a ``-0.0`` scalar (the last bullet), other code, so other binaries and pins: a kernel's revision is frozen with what
-    makes it (a hand-written kernel keeps revision 1 and its source unless it declares 2).
+    are made with, a kernel declared ``@tilefish.kernel(lowering=2)`` has, and every other kernel has as ``1``). The bytes of revision 1, other
+    code, so other binaries and pins: a kernel's revision is frozen with what makes it (a hand-written kernel keeps revision 1 and its source unless
+    it declares 2).
 
     * **Ordered sums by halving splits.** Revision 1 takes each step of a lane's chain with a ``tl.gather`` of the row (a pass through shared memory
       per step: 85 us for an rmsnorm of 4096 rows of 1024 columns on a B300 slice, where its three unfused kernels with a Triton tree sum take
@@ -574,14 +580,8 @@ Notes (the facts behind the table):
       ``.e5m2x2.f32`` of ``(+0.0, x)``, its low byte: the instruction ``.to()`` compiles to (note 1), out of the reach of the folds; ``.to()``'s bits
       on every f32 and every bf16 and f16 pattern (``tests/test_gpu_fusion_rows.py``).
 
-    * **A scalar ``-0.0`` keeps its sign.** Triton 3.5.1 writes a literal ``-0.0`` (``tl.where(m, x, -0.0)``, ``tl.full(..., -0.0, ...)``, a
-      ``-0.0`` argument of an inline-asm helper) as ``+0.0`` (measured on sm_103: ``0x00000000`` where ``0x80000000`` was written, with or without a
-      ``+0.0`` in the same kernel), so revision 1 computes ``where(x > 0, x, -0.0)`` with ``+0.0`` (its fused and unfused plans alike, so fusion
-      stays exact; against the ``reference`` mode, and the declared op, it is wrong). Revision 2 writes a ``-0.0`` scalar (f32, bf16, f16) by its
-      bits, ``tl.full((), -2147483648, tl.int32).to(tl.float32, bitcast=True)``, and so does its padding of ordered sums. A ``const`` parameter of a
-      hand-written kernel whose value is ``-0.0`` is a ``tl.constexpr``, which Triton still makes ``+0.0`` (a graph's region writes its value as a
-      scalar, so it is covered). So a graph's version 1 and version 2 plans differ where a ``-0.0`` scalar meets a zero (also one that
-      ``fp_contract="mul-add"`` makes: ``a * b - 0.0`` is ``fma(a, b, -0.0)``).
+    * The padding of an ordered sum is written by its bits (``-0.0`` as ``tl.full(..., -2147483648, tl.int32).to(tl.float32, bitcast=True)``):
+      Triton 3.5.1 writes a literal ``-0.0`` as ``+0.0`` (note 3).
 
     ``mean(x, -1, order=...)`` (either revision) is the ordered sum times ``f32(1 / D)``, one ``mul.rn``: ``1.0 / D`` of the constexpr ``D``, a
     Python float that Triton rounds to f32, which is ``1 / D`` correctly rounded for every ``D`` up to ``2**20`` (the binary expansion of ``1 / D``
@@ -2274,7 +2274,7 @@ class _Body:
     def operand(self, x: "Value | Scalar") -> str:
         if isinstance(x, Value):
             return self.var[x]
-        if self.lowering >= 2 and _is_negative_zero(x):  # note 21: Triton 3.5.1 writes a literal -0.0 as +0.0; the bits of -0.0, bitcast
+        if _is_negative_zero(x):  # notes 3 and 21: Triton 3.5.1 writes a literal -0.0 as +0.0; the bits of -0.0, bitcast (every revision)
             bits, ints, name = {"f32": (-(2**31), "int32", "float32"), "bf16": (-(2**15), "int16", "bfloat16"), "f16": (-(2**15), "int16", "float16")}[x.dtype.name]
             return f"tl.full((), {bits}, tl.{ints}).to(tl.{name}, bitcast=True)"
         return _scalar_text(x, self.rename)
@@ -2285,7 +2285,7 @@ class _Body:
         already rounded (through f32, as torch rounds a python float), so the constant is exact whatever Triton makes of it."""
         if not isinstance(x, Scalar) or x.dtype.name in _LITERAL_DTYPES:
             return self.operand(x)
-        if self.lowering >= 2 and _is_negative_zero(x):  # already of its dtype (note 21)
+        if _is_negative_zero(x):  # already of its dtype (notes 3 and 21)
             return self.operand(x)
         if x.name is None and x.dtype.is_float:
             x = Scalar(_round_float(float(x.value), x.dtype.name), x.dtype)
@@ -3013,7 +3013,7 @@ def lower(
     float ``+ - *`` and narrowing cast inline PTX, and views read where they are, note 20; what a graph's fused regions are lowered with).
     ``lowering`` overrides the kernel's own revision of the lowering (``1``, every kernel's; ``2``, what the regions of ``tilefish.fusion(version=2)``
     are lowered with: ordered sums by halving splits, the warp rule of note 21 and, context-free, views read where they are by the row template;
-    the bytes of revision 1 but a ``-0.0`` scalar's sign, other code). Raises :class:`~tilefish.errors.TilefishLoweringError` when the body fits no template.
+    the bytes of revision 1, other code). Raises :class:`~tilefish.errors.TilefishLoweringError` when the body fits no template.
     """
     module, fn_name = _check_names(op, module)
     if template is not None and template not in TEMPLATES:

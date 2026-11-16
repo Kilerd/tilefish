@@ -683,8 +683,8 @@ def kernel(
     ``sass=tilefish.sass(no_spills=True, max_registers=64)`` declares assertions about the SASS of every binary, checked at every build
     (:func:`tilefish.sass`); they are in the declaration digest of the lowered kernel.
     ``lowering=2`` lowers it by revision 2 of the lowering (note 21 of :mod:`tilefish.lower`: ordered sums by halving splits, the warp rule of a row
-    of ordered sums, an fp8 cast and a ``-0.0`` scalar written out): the bytes of revision 1 (but a ``-0.0`` scalar's sign, which revision 1
-    loses), other code, so other binaries and pins. The default, ``1``, keeps every kernel's source.
+    of ordered sums, an fp8 cast written out): the bytes of revision 1, other code, so other binaries and pins. The default, ``1``, keeps every
+    kernel's source.
     """
     _check_decorator_arg("kernel", fn)
     if num_warps is not None and (

@@ -266,6 +266,20 @@ def test_a_row_region_reads_views_where_they_are():
     assert not _fusion.boundaries(half_mean_v2)
 
 
+def test_a_negative_zero_scalar_is_written_by_its_bits_in_every_revision():
+    """Triton 3.5.1 writes a literal -0.0 as +0.0 (note 3): every kernel writes a -0.0 scalar by its bits; a +0.0 one stays a literal."""
+
+    @tilefish.kernel
+    def nz(x: Tensor[R, D, f32], h: Tensor[R, D, bf16]) -> tuple[Tensor[R, D, f32], Tensor[R, D, bf16]]:
+        return tilefish.where(x > 0.0, x, -0.0) * 1.0, h * -0.0 + 0.0
+
+    for lowering in (1, 2):
+        src = lower(nz, lowering=lowering).source
+        assert "tl.full((), -2147483648, tl.int32).to(tl.float32, bitcast=True)" in src
+        assert "tl.full((), -32768, tl.int16).to(tl.bfloat16, bitcast=True)" in src
+        assert "-0.0" not in src.split("def tf_")[1]
+
+
 def test_a_view_gathered_from_is_copied_first():
     """A gather addresses its table's rows by an index, contiguously: a view it reads is copied by tilefish.contiguous first, in the row template
     (version 2) and in the elementwise one (both versions), even when the region also reads it as an operand."""

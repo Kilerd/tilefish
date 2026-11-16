@@ -316,9 +316,19 @@ def neg_zero_unfused(x: Tensor[NZ, f32], h: Tensor[NZ, bf16]):
     return _neg_zero(x, h)
 
 
-def test_a_scalar_negative_zero_keeps_its_sign_in_revision_2():
-    """Triton 3.5.1 writes a literal -0.0 as +0.0; revision 2 writes it by its bits: where(x > 0, x, -0.0) * 1.0 is -0.0 where x <= 0, the bytes
-    of the reference, fused and unfused alike."""
+@tilefish.graph(fusion=fg.V1)
+def neg_zero_v1(x: Tensor[NZ, f32], h: Tensor[NZ, bf16]):
+    return _neg_zero(x, h)
+
+
+@tilefish.kernel
+def k_neg_zero(x: Tensor[NZ, f32], h: Tensor[NZ, bf16]) -> tuple[Tensor[NZ, f32], Tensor[NZ, f32], Tensor[NZ, bf16]]:
+    return _neg_zero(x, h)
+
+
+def test_a_scalar_negative_zero_keeps_its_sign():
+    """Triton 3.5.1 writes a literal -0.0 as +0.0; every kernel writes it by its bits (note 3): where(x > 0, x, -0.0) * 1.0 is -0.0 where x <= 0,
+    the bytes of the reference, in a region of either version, its unfused composition and a hand-written kernel (revision 1) alike."""
     x = -torch.rand(4096, device=CUDA)
     h = -torch.rand(4096, device=CUDA).to(torch.bfloat16)
     got, want, _, _ = run_both(neg_zero, neg_zero_unfused, [x, h])
@@ -327,6 +337,8 @@ def test_a_scalar_negative_zero_keeps_its_sign_in_revision_2():
     assert bool((got[1].view(torch.int32) == 0).all())  # -0.0 + 0.0 is +0.0
     ref = tilefish.run(neg_zero, x, h, mode="reference")
     assert_same(got, list(ref), "-0.0 against the reference")
+    assert_same(list(tilefish.run(neg_zero_v1, x, h)), got, "-0.0, version 1")
+    assert_same(list(tilefish.run(k_neg_zero, x, h)), got, "-0.0, a @tilefish.kernel")
 
 
 # -- export -----------------------------------------------------------------------------------------------------------------------------------
