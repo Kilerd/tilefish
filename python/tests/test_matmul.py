@@ -49,7 +49,7 @@ def declare(params, ret, name, **kw):
 
 
 def built(spec, contract="measured-exact", differ=0, canary=True, **kw):
-    v = dict(EXACT, formula=formula(spec.epilogue, spec.beta), differ=differ, max_ulp=3 if differ else 0)
+    v = dict(EXACT, formula=formula(spec.epilogue, spec.beta), elements=2 * spec.m * spec.n, differ=differ, max_ulp=3 if differ else 0)
     made = {"seed": 1, "out_digest": "0123456789abcdef" * 2} if canary else None
     return BuiltLibrary(spec, kw.pop("arch", "sm_103"), kw.pop("algo", ALGO), kw.pop("version", VERSION), kw.pop("sm_count", SMS), contract, v, made)
 
@@ -190,7 +190,9 @@ def mutated(entry, path, value, also=()):
         (["verification", "accumulator"], "torch", "verification.accumulator must be one of"),
         (["verification", "elements"], 0, "verification.elements must be a positive int"),
         (["verification", "differ"], -1, "verification.differ must be an int of at least 0"),
-        (["verification", "differ"], 5000, "verification.differ \\(5000\\) is more than verification.elements"),
+        (["verification", "differ"], 50000, "verification.differ \\(50000\\) is more than verification.elements"),
+        (["verification", "elements"], 4096, "verification.elements must be operand_sets \\* m \\* n = 32768, got 4096"),
+        (["verification", "operand_sets"], 3, "verification.elements must be operand_sets \\* m \\* n = 49152, got 32768"),
         (["verification", "max_ulp"], 2, "verification.max_ulp is 2, but no element differs"),
         (["verification", "seed"], 3, "verification must be an object of exactly"),
         (["verification", "max_ulp"], None, "verification must be an object of exactly"),
@@ -280,10 +282,14 @@ def test_a_replay_compares_the_entry_with_the_declaration_and_runs_the_canary(tm
     m2 = write(tmp_path / "b", *(built(s, contract="binary-defined", differ=9) for s in library_specs(strict)))
     with pytest.raises(TilefishManifestError, match=r"is binary-defined, and the declaration asks for contract='measured-exact'"):
         built_from_manifest(m2, library_specs(strict)[0], "sm_103", SMS)
-    # without a canary in the entry nothing runs
-    ran.clear()
+    # an entry without a canary is refused by a declaration that has one (the default), and taken by one declared canary=False, which runs none
     m3 = write(tmp_path / "c", *(built(s, canary=False) for s in library_specs(op)))
-    built_from_manifest(m3, library_specs(op)[0], "sm_103", SMS)
+    with pytest.raises(TilefishManifestError, match=r"the library entry for 'mm.M32' \(sm_103\) has no canary, and the declaration has one"):
+        built_from_manifest(m3, library_specs(op)[0], "sm_103", SMS)
+    ran.clear()
+    quiet = matmul_op(canary=False)
+    m4 = write(tmp_path / "d", *(built(s, canary=False) for s in library_specs(quiet)))
+    built_from_manifest(m4, library_specs(quiet)[0], "sm_103", SMS)
     assert ran == []
 
 
@@ -379,7 +385,7 @@ def test_a_library_epilogue_replaces_the_gemm_and_its_arithmetic(label, body, in
     assert [e for e, _ in steps_of(exact)][0] in ("up.M32", "up_b.M32") and len(steps_of(exact)) == 2  # the default: the GEMM and a region
     (w,) = _fusion.report(g)["library_epilogues"]
     assert (w["matched"], w["applied"], w["into"]) == (True, True, into)
-    assert w["contract"] == ("exact" if label in ("relu", "gemm_bias, relu") else "measured-exact")  # ReLU alone commutes with the rounding
+    assert w["contract"] == "measured-exact"  # (iii) measured against (ii), on the accumulator of the rewrite's own pin
     # planned exact, the report says what the mode would do (the advisor reads it), with the same epilogue
     (c,) = _fusion.report(exact)["library_epilogues"]
     assert (c["matched"], c["applied"], c["epilogue"], c["beta"]) == (True, False, w["epilogue"], w["beta"])

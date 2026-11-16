@@ -22,7 +22,7 @@ entry of the new impl. Nothing changes bytes without a declaration: a graph plan
   computed in f32 on the pin's own accumulator (its configuration re-encoded with an f32 result) and rounded once. The entry records `contract`
   (`"measured-exact"` or `"binary-defined"`) and `verification` (the formula, where the accumulator came from, the elements that differ and their largest
   distance); `contract="measured-exact"` refuses a pin that is not. Measured on a B300 MIG slice over 14 shapes, bf16 and f16, both postures and seven
-  cases (392 pins per version): every pin measured-exact with cuBLASLt 12.8.4; with 13.1.0, 376 of 392, the others the pins of algorithm 21 at
+  cases (392 pins per version): every pin measured-exact with cuBLASLt 12.8.4; with 13.1.0, 372 of 392, the others the pins of algorithm 21 at
   32 x 1024 x 3072, which adds a bias to `c` in neither order and whose ReLU maps a NaN to 0 (`docs/rfcs/0003-epilogue-fusion.md`, section 7.3).
 - **A canary, on by default** (`canary=True`): `export` records the digest of the pin's result on operands made on the device from a seed (the PTX
   module of the cuDNN canaries); a replay runs it once per process and device and refuses another digest (and a first replay inside a capture), as the
@@ -33,8 +33,8 @@ entry of the new impl. Nothing changes bytes without a declaration: a graph plan
 - **The arithmetic after a cuBLASLt GEMM as one of its epilogues**, declared per graph: `y.to(f32)`, `+ c.to(f32)`, `+ bias.to(f32)`,
   `tilefish.where(h <= 0.0, 0.0, h)` (ReLU, `torch.relu`'s bits) and `.to()` the GEMM's type, after a `cublaslt.gemm` of a 16-bit result (or the ReLU after
   a `gemm_bias`), become one step of a `cublaslt.matmul` (`<gemm>__<epilogue>[_c]`) declared `contract="measured-exact"`: the rounding of `y` is removed
-  (contract (ii)), and every pin is verified equal to the region's arithmetic on the accumulator or the build is refused. A ReLU alone keeps the bytes
-  of the unfused plan (contract (i)). Another order, an f32 bias, a value read elsewhere or barriered is left as it is. `mode="reference"` interprets the
+  (contract (ii)), and every pin is verified equal to the region's arithmetic on its accumulator or the build is refused (the pin is chosen for the
+  epilogue, RFC 0003 section 3.1.1: its accumulator is the GEMM's where the two pins compute the same sum). Another order, an f32 bias, a value read elsewhere or barriered is left as it is. `mode="reference"` interprets the
   rewritten program. On a B300 slice the rewritten plans take 0 to 35% less time than the GEMM and its region (`README.md`, the table).
 - The fusion report gains `library_epilogues`: the rewrites, and why a widened GEMM result was not rewritten; a graph planned `"exact"` lists what the
   mode would do (so a 0.0.11 export of a graph whose body widens a cuBLASLt GEMM's result gets that list in its informative report; no digest has it).

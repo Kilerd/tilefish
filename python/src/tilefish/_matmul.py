@@ -13,9 +13,10 @@ order), so every pin is verified when it is made (:func:`verify`, at ``jit`` and
 * the accumulator is the f32 output of the pin's own configuration re-encoded with an f32 ``D`` (``"f32-form"``: X1 found it observable this way,
   its rounding the 16-bit output bit for bit), or, when cuBLASLt does not take that configuration with an f32 ``D``, of the f32 GEMM the same posture
   pins (``"plain-f32-pin"``);
-* the operands are two seeded sets: ``a ~ N(0, 1)``, ``b ~ N(0, 1/k)``, a bias ``~ N(0, 1/4)`` and ``c ~ N(0, 1)``, each with special values in its
-  first columns (``+0``, ``-0``, ``+inf``, ``-inf``, NaN, the largest finite value of both signs, a subnormal), and in the second set two rows of
-  ``a`` that make the accumulator overflow to ``+inf`` and ``-inf``;
+* the operands are two seeded sets: ``a ~ N(0, 1)``, ``b ~ N(0, 1/k)``, a bias ``~ N(0, 1/4)`` and ``c ~ N(0, 1)``, the bias and ``c`` with
+  special values in their first columns (``+0``, ``-0``, ``+inf``, ``-inf``, NaN, the largest finite value of both signs, a subnormal), and rows of
+  ``a`` that make special accumulators, which every epilogue sees: a NaN, a zero and an infinity in each set, and in the second set two rows that
+  overflow to ``+inf`` and ``-inf``;
 * the reference is computed by torch on the device in f32 (``torch.relu``, IEEE adds) and rounded by torch's cast, which on CUDA gives the bits of
   tilefish's own lowering of the same ops (the canonical NaN; ``tilefish.lower`` note 1);
 * ``"measured-exact"`` when every element of both sets is equal bit for bit, ``"binary-defined"`` otherwise, with the count of elements that
@@ -78,7 +79,16 @@ def operands(spec: Any, seed: int, device: Any) -> "dict[str, Any]":
     m, n, k = spec.m, spec.n, spec.k
     g = torch.Generator(device=device).manual_seed(1_000_003 * seed + 7919)
     a = torch.randn(m, k, device=device, generator=g)
-    if seed % 2 == 1 and m >= 3:  # two rows whose accumulators overflow (to +inf and -inf on most columns), and their bias and c added to them
+    # rows of special accumulators, which every epilogue sees (a ReLU without a bias or c too): a NaN, a zero, an infinity of each sign by the column,
+    # and, in the second set, rows that overflow to +inf and -inf on most columns
+    special = {0: float("nan"), 1: 0.0, 2: float("inf")} if seed % 2 == 0 else {3: float("nan"), 4: 0.0, 5: float("-inf")}
+    for row, value in special.items():
+        if row < m:
+            if value == 0.0:
+                a[row] = 0.0  # every product +-0: the accumulator is +0
+            else:
+                a[row, 0] = value  # one element: NaN, or +-inf times b[:, 0] (NaN where b is 0), and finite products after it
+    if seed % 2 == 1 and m >= 3:
         a[1] = float(torch.finfo(t).max)
         a[2] = -float(torch.finfo(t).max)
     b = torch.randn(n, k, device=device, generator=g) / k**0.5
@@ -151,6 +161,12 @@ def verify(spec: Any, algo: str, index: int) -> "tuple[str, dict[str, Any]]":
 
     torch = _torch()
     device = f"cuda:{index}"
+    with torch.cuda.device(index):
+        if torch.cuda.is_current_stream_capturing():
+            raise TilefishRuntimeError(
+                f"the cuBLASLt matmul '{spec.stem}' is pinned and its pin verified at its first jit run in the process, and this one is inside a CUDA "
+                "graph capture: run it once before the capture"
+            )
     acc_algo, source = _accumulator_algo(spec, algo, index)
     elements = differ = max_ulp = 0
     with torch.cuda.device(index):
@@ -296,7 +312,7 @@ def check_canary(built: Any, device_index: int) -> None:
     if canary is None:
         return
     spec = built.spec
-    key = (device_index, built.stem, built.arch, built.algo, built.cublaslt_version, spec.workspace_bytes, canary["seed"], canary["out_digest"])
+    key = (device_index, spec.pinned_digest(built.sm_count), built.stem, built.arch, built.algo, built.cublaslt_version, canary["seed"], canary["out_digest"])
     with _canary_lock:
         if key in _canaries_passed:
             return

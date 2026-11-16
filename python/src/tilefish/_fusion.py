@@ -475,7 +475,7 @@ class _Pass:
                 "beta": beta,
                 "nodes": sorted(origin[j] for j in chain),
                 "rounding_removed": {"value": n.outputs[0].ref, "dtype": str(n.outputs[0].type.dtype)},
-                "contract": epilogue_contract(n.callee, epilogue, beta),
+                "contract": "measured-exact",
             })  # fmt: skip
         out_nodes: "list[Node]" = []
         out_origin: "list[int]" = []
@@ -909,15 +909,6 @@ class _Pass:
 # -- library epilogues (RFC 0003, E2) --------------------------------------------------------------------------------------------------------
 
 
-def epilogue_contract(gemm: Any, epilogue: str, beta: int) -> str:
-    """The contract of RFC 0003 a rewrite into a cuBLASLt epilogue gives: ``"exact"`` (the bytes of the unfused plan, contract (i)) when the region
-    only takes the ReLU of the GEMM's result (a ``cublaslt.gemm``'s alone, or a ``cublaslt.gemm_bias``'s, whose bias is in the GEMM already): ReLU
-    commutes with the rounding (X1); ``"measured-exact"`` otherwise: the rounding of the GEMM's result is removed (contract (ii)), and every pin is
-    verified equal to the formula on the accumulator."""
-    relu_only = not beta and (epilogue == "relu" or (epilogue == "relu_bias" and getattr(gemm, "impl", None) == "cublaslt.gemm_bias"))
-    return "exact" if relu_only else "measured-exact"
-
-
 def _is_widening(n: Node, to: Any = f32) -> bool:
     """A plain cast to ``to`` that cannot round (``x.to(f32)`` of a bf16 or f16 tensor)."""
     return n.op == "cast" and n.attrs.get("kind") is None and set(_clean(n.attrs)) == {"to", "rounding"} and n.attrs["to"] == to and not n.attrs["rounding"]
@@ -1189,7 +1180,7 @@ def library_epilogue_candidates(graph: Graph) -> "list[dict[str, Any]]":
         out.append({
             "kind": "library-epilogue", "node": k, "call": n.callee.name, "matched": True, "applied": False, "epilogue": epilogue, "beta": beta,
             "nodes": sorted(chain), "rounding_removed": {"value": n.outputs[0].ref, "dtype": str(n.outputs[0].type.dtype)},
-            "contract": epilogue_contract(n.callee, epilogue, beta),
+            "contract": "measured-exact",
         })  # fmt: skip
     return out
 

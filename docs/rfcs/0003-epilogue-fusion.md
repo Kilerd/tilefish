@@ -796,8 +796,8 @@ An entry has `beta`, `contract`, `verification` and an optional `canary`; a read
 load and launch, the C ABI (an accessor of the epilogue and of `c`, a minor version) and the generated hosts take it.
 
 **Verification per pin** (Q6, contract (iii) measured against (ii)). Every pin is verified when it is made, at `jit` and at `export`: the pin runs on two
-seeded operand sets (the operands of X1; special values in the first eight columns of the bias and of `c`; in the second set rows of `a` whose
-accumulators overflow) and is compared bit for bit with the formula computed by torch in f32 on the accumulator of the same configuration re-encoded with
+seeded operand sets (the operands of X1; special values in the first eight columns of the bias and of `c`; rows of `a` that give every epilogue a
+NaN, a zero and an infinite accumulator, and in the second set rows whose accumulators overflow) and is compared bit for bit with the formula computed by torch in f32 on the accumulator of the same configuration re-encoded with
 an f32 `D` (`"f32-form"`; the f32 pin of the same posture where cuBLASLt does not take that, `"plain-f32-pin"`, which no pin needed here), rounded once.
 torch on CUDA gives the bits of tilefish's own lowering of the same ops (an f32 add, `torch.relu`, which is `where(h <= 0, 0, h)` bit for bit, and the cast
 to the canonical NaN). The entry records `"measured-exact"` (no element differs) or `"binary-defined"` with the count of elements that differ and their
@@ -807,11 +807,13 @@ X1 as a GPU test (`python/tests/test_gpu_matmul.py`): 14 shapes (`M` 32, 128, 64
 32 x 4096 x 4096, 100 x 1000 x 1000), bf16 and f16, both postures, seven cases (`none`, `bias`, `relu`, `relu_bias` without and the last three with `c`,
 and `none` with `c`): 392 pins per cuBLASLt version on a B300 MIG slice (sm_103, 30 SMs).
 
-* **cuBLASLt 12.8.4: 392 of 392 measured-exact**, the special values and the overflowing rows included. No pin splits `k`.
-* **cuBLASLt 13.1.0: 376 of 392 measured-exact.** The 16 others are the pins of algorithm 21 at 32 x 1024 x 3072, both types, both postures:
-  * `bias` with `c`: 29% of the elements differ, by up to 15 176 ULP (bf16) and 2 481 (f16), as X6 found;
-  * `relu_bias`, `relu` with `c` and `relu_bias` with `c`: 64 or 65 of 65 536 elements, all of them NaN pre-activations: **this algorithm's ReLU gives `0`
-    for a NaN**, where every other pin keeps the NaN (`torch.relu`). A finding beyond X6: an epilogue's NaN rule is a property of the pin too.
+* **cuBLASLt 12.8.4: 392 of 392 measured-exact**, the special values and accumulators included (rows of `a` that give a NaN, a zero, an infinity
+  and an overflow to every epilogue). No pin splits `k`.
+* **cuBLASLt 13.1.0: 372 of 392 measured-exact.** The 20 others are the pins of algorithm 21 at 32 x 1024 x 3072, both types, both postures:
+  * `bias` with `c`: 26% of the elements differ, by up to 15 176 ULP (bf16) and 2 481 (f16), as X6 found;
+  * `relu`, `relu_bias`, `relu` with `c` and `relu_bias` with `c`: 2048 to 2111 of 65 536 elements, all of them NaN pre-activations: **this algorithm's
+    ReLU gives `0` for a NaN**, where every other pin keeps the NaN (`torch.relu`). A finding beyond X6: an epilogue's NaN rule is a property of the pin
+    too, which only special accumulators show (a NaN in a bias or `c` showed it for the cases with them; the rows of `a` for a ReLU alone).
   * The pins of `none` with `c` that split `k` at `M = 32` (3 and 4, f32 partial sums) are measured-exact, as X6 found.
 
 A run of the test on another architecture or version checks every record again on operand sets of its own and reports the outcome; on sm_120 a test
@@ -826,10 +828,13 @@ digest; a Python replay inside a capture that would run it is refused.
 16-bit result whose `y` is read only by `y.to(f32)`, followed by `+ c.to(f32)` (`[M, N]`), `+ bias.to(f32)` (`[N]`) and `tilefish.where(h <= 0.0, 0.0,
 h)`, each optional but one and each read by the next alone, then `.to()` the GEMM's type, with `c` and the bias made before the GEMM, becomes one call
 of a `cublaslt.matmul` (`<gemm>__<epilogue>[_c]`, the GEMM's options, `contract="measured-exact"`, its canary on). A `cublaslt.gemm_bias` followed by the
-ReLU becomes `relu_bias`. That is contract (ii) (`R_acc` of the matched values): the verification of every pin is the check of the rewrite against
-`U(R_acc(P))`, because the formula is the region's arithmetic on the accumulator, op for op; a pin that is not measured-exact refuses the build
-(`tilefish.barrier(y)` keeps the GEMM unfused). A ReLU alone (of a `cublaslt.gemm`, or of a `cublaslt.gemm_bias` with its bias) keeps the bytes of
-`U(P)`, contract (i): ReLU commutes with the rounding (X1), and the fusion report says `"exact"` for it. Anything else is left as it is: `(y + bias) + c`
+ReLU becomes `relu_bias`. That is contract (iii) measured against (ii) (`R_acc` of the matched values): the verification of every pin is the check of
+the rewrite against `U(R_acc(P))` computed, as 3.1.1 says, with the f32 form of the rewrite's own pin, because the formula is the region's arithmetic on
+the accumulator, op for op; a pin that is not measured-exact refuses the build (`tilefish.barrier(y)` keeps the GEMM unfused). The pin is chosen for
+the epilogue, not taken from the GEMM it replaces: its accumulator is the GEMM's where the two pins compute the same sum (X1: the same pin on 14 of 16
+shapes and the same bytes on the others; under 13.1.0 the plain GEMM's pin splits `k` at `M = 32` where an epilogue's may not), which no build
+checks yet. Where it is, a ReLU alone (of a `cublaslt.gemm`, or of a `cublaslt.gemm_bias` with its bias) writes the bytes of `U(P)`, because ReLU
+commutes with the rounding (X1): measured on the test's shapes, not promised. Anything else is left as it is: `(y + bias) + c`
 (another rounding in f32), an f32 bias, a value read twice, returned or barriered, a ReLU written as `where(h > 0.0, h, 0.0)` (it maps a NaN to 0, which
 `torch.relu` does not). The fusion report gains `library_epilogues`: the rewrites and the reasons of what was not rewritten; in a graph planned
 `"exact"`, what the mode would do. `mode="reference"` interprets the rewritten program (the formula on an f32 accumulator). Measured (the test above, both
@@ -858,6 +863,8 @@ No case is slower; the residual add with a bias at 640 x 1024 x 4096 saves nothi
 * GELU and `GELU_BIAS` (binary-defined, with a declared tolerance), and the auxiliary outputs (`RELU_AUX`, `GELU_AUX`): not offered yet.
 * `algos=` for `cublaslt.matmul` (a port of a stack that fuses through cuBLASLt imports its pins): refused at the declaration for now.
 * A rewrite whose pin is not measured-exact at one bucket refuses the build: a fallback per bucket to route (a) (or to `U(R_acc(P))`) is not made.
+* Whether a rewrite's pin computes the sum of the GEMM's pin is not recorded: a build could compare the two accumulators on the verification's
+  operands (or pin the rewrite with the GEMM's configuration, where cuBLASLt takes it with the epilogue), and say when the plan keeps `U(P)`'s GEMM.
 * `beta * C` written in place (`D == C`, an `alias`) and f32 results; the accumulator mode (`R_acc` everywhere, E1) and the scopes of
   `tilefish.fused(epilogues=...)`.
 * sm_120 and sm_90 (X7): the matrix and the split-K pins of sm_120 are tests that wait for a gate on those devices.

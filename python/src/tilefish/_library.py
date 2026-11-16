@@ -1018,6 +1018,11 @@ def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str, sm_count: i
             f"the library entry for '{spec.stem}' ({arch}) is {entry['contract']}, and the declaration asks for contract='measured-exact': its pin was "
             "not verified equal to its formula, so it is refused (export it again from this declaration, which refuses such a pin)"
         )
+    if spec.canary and "canary" not in entry:
+        raise TilefishManifestError(
+            f"the library entry for '{spec.stem}' ({arch}) has no canary, and the declaration has one (canary=True, the default): the pin cannot be "
+            "told from another build of this cuBLASLt version, so it is refused (export it again, or declare canary=False)"
+        )
     built = BuiltLibrary(spec, arch, entry["algo"], pinned_by, pinned_on, entry["contract"], entry["verification"], entry.get("canary"))
     if built.canary is not None:
         from . import _matmul
@@ -1075,6 +1080,9 @@ def _validate_matmul_fields(entry: "dict[str, Any]", where: str) -> None:
             _bad(where, f"verification.{key} must be an int of at least 0, got {v[key]!r}")
     if v["differ"] > v["elements"]:
         _bad(where, f"verification.differ ({v['differ']}) is more than verification.elements ({v['elements']})")
+    m, n = entry["m"], entry["n"]
+    if sv.is_int(m) and sv.is_int(n) and v["elements"] != v["operand_sets"] * m * n:
+        _bad(where, f"verification.elements must be operand_sets * m * n = {v['operand_sets'] * m * n}, got {v['elements']}")
     if (contract == "measured-exact") != (v["differ"] == 0):
         _bad(where, f"contract is {contract!r}, but the verification found {v['differ']} elements that differ (measured-exact is exactly none)")
     if v["differ"] == 0 and v["max_ulp"] != 0:

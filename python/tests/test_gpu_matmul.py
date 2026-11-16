@@ -40,7 +40,7 @@ CASES = [("none", 1), ("bias", 0), ("relu", 0), ("relu_bias", 0), ("bias", 1), (
 # what was measured on a B300 MIG slice (sm_103, 30 SMs): the binary-defined pins per cuBLASLt version, as (m, n, k, epilogue, beta); none else
 BINARY_DEFINED_SM103 = {
     120804: set(),
-    130100: {(32, 1024, 3072, "relu_bias", 0), (32, 1024, 3072, "bias", 1), (32, 1024, 3072, "relu", 1), (32, 1024, 3072, "relu_bias", 1)},
+    130100: {(32, 1024, 3072, e, b) for e, b in (("relu", 0), ("relu_bias", 0), ("bias", 1), ("relu", 1), ("relu_bias", 1))},
 }
 
 
@@ -394,3 +394,26 @@ def test_a_rewrite_whose_pin_is_not_measured_exact_is_refused(tmp_path):
         return
     with pytest.raises(TilefishBuildError, match=r"cannot pin 'up__relu_bias_c.M32' .* asks for contract='measured-exact'"):
         runtime.export(g, tmp_path / "refused")
+
+
+def test_every_epilogue_sees_special_accumulators():
+    """The verification's rows of ``a`` give every epilogue NaN, zero and infinite pre-activations, a ReLU without a bias or ``c`` too (the NaN rule
+    of a ReLU is a property of the pin: algorithm 21 of cuBLASLt 13.1.0 maps a NaN to 0)."""
+    op = matmul_op("special_relu", 128, 512, 256, "bf16", "relu", 0)
+    (spec,) = _library.library_specs(op)
+    for seed in _matmul.VERIFY_SEEDS:
+        ops = _matmul.operands(spec, seed, "cuda")
+        acc = ops["a"].float() @ ops["b"].float().t()
+        assert bool(torch.isnan(acc).any()) and bool((acc == 0).any()) and bool(torch.isinf(acc).any()), seed
+        assert bool(torch.isnan(_matmul.reference(spec, acc, ops).float()).any())  # a NaN reaches the ReLU, and torch.relu keeps it
+
+
+def test_a_first_jit_pin_inside_a_capture_is_refused():
+    op = matmul_op("in_capture", 64, 512, 256, "bf16", "bias", 0)
+    args = [randn((64, 256), torch.bfloat16, seed=1), randn((512, 256), torch.bfloat16, seed=2, scale=1 / 16), randn((512,), torch.bfloat16, seed=3)]
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with pytest.raises(TilefishRuntimeError, match="is pinned and its pin verified at its first jit run in the process, and this one is inside a CUDA graph capture"):
+        with torch.cuda.graph(g):
+            tilefish.run(op, *args)
+    tilefish.run(op, *args)  # outside: pinned and verified

@@ -686,11 +686,11 @@ def up(a: Tensor[M, H, bf16], b: Tensor[F, H, bf16], bias: Tensor[F, bf16], c: T
 `epilogue` is `"none"`, `"bias"`, `"relu"` or `"relu_bias"` (cuBLASLt's `DEFAULT`, `BIAS`, `RELU`, `RELU_BIAS`), `beta=1` adds `c [M, N]`; the operands
 are bf16 or f16 and the result their type, in any of the four layouts, with `heuristic`, `workspace_bytes`, the opt-ins and `sm_count_target` as above
 (`algos=` is not taken yet). The bytes are the library's under the pin, so **every pin is verified when it is made** (`jit` and `export`): run on two
-seeded operand sets with special values in the bias and `c` and rows that overflow, and compared bit for bit with the formula computed in f32 on the
+seeded operand sets with special values in the bias and `c` and rows of `a` that make NaN, zero, infinite and overflowing accumulators, and compared bit for bit with the formula computed in f32 on the
 pin's own accumulator (its configuration re-encoded with an f32 result) and rounded once. The entry records `"measured-exact"` or `"binary-defined"`
 with the count of elements that differ and their largest distance; `contract="measured-exact"` refuses a pin that is not. Measured on a B300 MIG slice
 (14 shapes, bf16 and f16, both postures, seven cases: 392 pins per version, `test_gpu_matmul.py`): every pin is measured-exact with cuBLASLt 12.8.4; with
-13.1.0, 376 are, and the 16 others are algorithm 21 at 32 x 1024 x 3072, which adds a bias to `c` in neither order (29% of the elements differ) and
+13.1.0, 372 are, and the 20 others are algorithm 21 at 32 x 1024 x 3072, which adds a bias to `c` in neither order (26% of the elements differ) and
 whose ReLU gives `0` for a NaN where the others keep it. An epilogue gets no split-K without the opt-in, as a bias does. `export` records a canary
 (`canary=True`, the default): the pin run on operands made of a seed on the device and the digest of its result, which a replay (Python) and a load
 (the Rust and C++ hosts) run before the pin is used, refusing another digest: two builds of one cuBLASLt version are told apart. See
@@ -1009,8 +1009,9 @@ def block(x: Tensor[M, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16], r
 The pattern is `y.to(f32)`, then `+ c.to(f32)` (`[M, N]`), then `+ bias.to(f32)` (`[N]`), then `tilefish.where(h <= 0.0, 0.0, h)`, then `.to()` the GEMM's
 type, each step optional but one, every value read by the next step alone and `c` and the bias made before the GEMM. It becomes one step of a
 `cublaslt.matmul` declared `contract="measured-exact"`: the rounding of `y` is removed (contract (ii)), and every pin is verified equal to the region's
-arithmetic on the accumulator, or the build is refused (`tilefish.barrier(y)` keeps the GEMM unfused). A ReLU alone keeps the bytes of the unfused
-plan (it commutes with the rounding: contract (i)). Another order (`(y + bias) + c` rounds otherwise in f32), an f32 bias or a value read elsewhere
+arithmetic on the accumulator, or the build is refused (`tilefish.barrier(y)` keeps the GEMM unfused). The pin is chosen for the epilogue, so its
+accumulator is the GEMM's where the two pins compute the same sum (X1 found them the same on every shape but where 13.1.0 splits `k`); then a ReLU
+alone writes the unfused plan's bytes (it commutes with the rounding), as the tests measured, but nothing checks that per pin. Another order (`(y + bias) + c` rounds otherwise in f32), an f32 bias or a value read elsewhere
 is left as it is, and the fusion report (`library_epilogues`) says why; in an exact graph it lists what the mode would do, and the advisor reports such a
 region as an action (`epilogue-library-cublaslt`). Measured on a B300 MIG slice (sm_103, cuBLASLt 12.8.4, CUDA graphs of 20 replays), the exact plan
 (the pinned GEMM and a region) against the rewritten one, in microseconds:
