@@ -117,17 +117,17 @@ class gives one; the fusion pass gives the rest.
 
 | blocker | what to do | phase |
 |---|---|---|
-| `opaque-extern` | a hand-written kernel without MMAs: write its arithmetic in the graph body so phase 1 fuses it (a row one needs phase 2) | 1 |
+| `opaque-extern` | a hand-written kernel without MMAs: write its arithmetic in the graph body so fusion takes it (an elementwise one, or a row one with `order=` on its sums) | 1 |
 | `opaque-unknown` | the same, when there is no trace to tell whether it computes MMAs (and if it does: an epilogue hook where it makes the intermediate, a prologue hook where it reads it) | 1 |
 | `opaque-compute-epilogue`, `-prologue` | a hand-written kernel bound by its arithmetic: MMAs in its SASS, or (with a timing file) moving its bytes at less than a quarter of the bandwidth, such as an attention of FMAs or a search; an epilogue hook of the extern (route (c)); a prologue hook | 4, future |
 | `dsl-kernel` | a `@tilefish.kernel` (elementwise): write its body in the graph body (RFC 8.2); exact as it is when it declares `fp_fusion=False` | 1 |
 | `dsl-kernel-contracts` | the same, for a kernel that lets the compiler contract: write `tilefish.fma` where it meant one rounding, or its bytes change | 1 |
-| `row-kernel` | a row `@tilefish.kernel`: needs phase 2 row fusion (write it in the graph body, with `order=` on its sums) | 2 |
+| `row-kernel` | a row `@tilefish.kernel`: write its body in the graph body, with `order=` on its sums, and fusion version 2 (the default) fuses it into a row region | 2 |
 | `epilogue-library`, `prologue-library` | a GEMM or convolution's epilogue or prologue: future work (RFC 0001, section 7 route (b), sections 11.2 and 11.3) | future |
 | `copy-step` | a copy step: return or store the value where it is made | 1 |
 | `memset-step` | a memset step: its zeros are read from memory, never folded into a region (H2) | future |
 | `strided-output` | the producer writes the intermediate into part of a buffer (a column block, a head): a strided store (rule 7) | 2 |
-| `materialised` | a `tilefish.contiguous` copy of a view, or a row step reading the intermediate through a view that is not dense (rule 5) | 2 |
+| `materialised` | a `tilefish.contiguous` copy of a view, or a row step reading the intermediate through a view that is not dense (rule 5; a row region of fusion version 2 reads it where it is) | 2 |
 | `generated-movement` | `im2col` / `col2im` around a convolution: its prologue or epilogue, future work | future |
 | `unknown-boundary` | two regions, without the trace or the graph to say why | 1 |
 
@@ -138,21 +138,22 @@ entry per value that crosses a boundary, with the ops on both sides and their li
 | reason | why | fix | phase |
 |---|---|---|---|
 | `barrier` | the value passes `tilefish.barrier` | remove it: a tap of the unfused plan (`grouping="none"`) shows the same bytes | 1 |
-| `reduction-unordered` | a `sum` / `mean` without `order=` runs alone (D2) | add `order=`: phase 1 still runs it alone, phase 2 fuses it | 2 |
-| `reduction` | an ordered reduction, `max`, `argmax`: a region of its own in version 1 (also a cycle through one) | phase 2 row regions | 2 |
-| `gather` | `gather_rows` is a region of its own | phase 2 | 2 |
-| `view` | a view between two ops ends a region (rule 6) | compute on one shape, or phase 2 (dense reshapes inside a region) | 2 |
-| `materialised` | a view a row region reads is copied by `tilefish.contiguous` first | phase 2 (strided inputs in the row template) | 2 |
-| `template` | the templates cannot compute both in one kernel | phase 2 where it is a row region | 2 |
+| `reduction-unordered` | a `sum` / `mean` without `order=` runs alone (D2), in every fusion version | add `order=`: fusion version 2 (the default) fuses it | 2 |
+| `reduction` | the graph declares `tilefish.fusion(version=1)`: an ordered reduction, `max`, `argmax` is a region of its own (also a cycle through one) | version 2 (the default) fuses them into row regions | 2 |
+| `gather` | the graph declares `tilefish.fusion(version=1)`: `gather_rows` is a region of its own | version 2 fuses it | 2 |
+| `view` | a view between two ops ends a region (rule 6) | compute on one shape (dense reshapes inside a region: phase 2 work, not planned yet) | 2 |
+| `materialised` | a view a row region of version 1 reads is copied by `tilefish.contiguous` first | version 2 reads views of rank 1 and 2 where they are in the row template | 2 |
+| `template` | the templates cannot compute both in one kernel: another iteration space (rows of another length, a reduction over another axis, rows of rank 3), or in version 1 a row region | version 2 where it is a row region; otherwise compute on one shape | 2 |
 | `cycle` | one region of both would make a cycle through a call or a move | move the call | 1 |
 | `limit` | more than 64 ops or 32 tensors in a region | a split is a speed choice only | 1 |
 | `move` | a copy or a store between them | return or store the value where it is made | 1 |
 | `epilogue-<kind>`, `prologue-<kind>` | a call's result read by a region, a region's value read by a call: no fusion across a call | library: future work; extern: a hook (phase 4); `@tilefish.kernel`: write its body in the graph body | future, 4, 1 |
-| `grouping` | the union is legal, but the greedy merge of version 1 did not make it | a later fusion version | 1 |
+| `grouping` | the union is legal, but the greedy merge of the graph's fusion version did not make it | a later fusion version | 1 |
 | `unfused` | the graph declares `tilefish.fusion(grouping="none")`: one kernel per op | drop it (the default groups them) | 1 |
 
 Without the trace or the graph, the fusion report says which regions are a reduction alone (and whether it has an order) and which read a view
-copied first; two regions joined by an intermediate are then `unknown-boundary`.
+copied first; two regions joined by an intermediate are then `unknown-boundary`. What is a region of its own depends on the graph's fusion version, which the
+report records (`fusion.version`): in version 2 only a reduction without `order=`, in version 1 every reduction and every gather.
 
 ## 5. Ranking
 
