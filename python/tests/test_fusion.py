@@ -119,7 +119,7 @@ def test_a_reduction_without_an_order_is_a_kernel_of_its_own():
 
 # -- version 1 is frozen; the row regions of version 2 ----------------------------------------------------------------------------------------
 
-# the plan digests of these graphs as tilefish 0.0.9 planned them (fusion version 1, its default then): version 1 plans them the same, byte for byte
+# the plan digests of these graphs as tilefish 0.0.9 and 0.0.10 planned them (fusion version 1, their default): version 1 plans them the same, byte for byte
 V1_DIGESTS = {
     "around_call": "968e4f545d2fdab1a7b53e2a67f944799c86902b56e09ff3a8465a6544917a97",
     "bias_act": "209d35ba2b31f3a9dcc24ee8e0377118af57441b2a938ab8850f521fb46befe8",
@@ -143,7 +143,7 @@ def as_version_1(g):
 
 @pytest.mark.parametrize("name", sorted(V1_DIGESTS))
 def test_version_1_plans_what_it_planned(name):
-    """D7: a later tilefish keeps every earlier version. The use cases declared with fusion(version=1) plan as tilefish 0.0.9 planned them (its
+    """D7: a later tilefish keeps every earlier version. The use cases declared with fusion(version=1) plan as tilefish 0.0.9 and 0.0.10 planned them (their
     default was version 1): the same regions, sources, names and plan digests."""
     assert tilefish.plan(as_version_1(fg.CASES[name][0])).digest == V1_DIGESTS[name]
 
@@ -172,7 +172,7 @@ def test_a_plan_of_another_version_is_refused_naming_it(tmp_path):
 
 
 def test_hand_written_kernels_keep_their_sources():
-    """Revision 2 of the lowering is the regions' of version 2 only: a kernel's own source (revision 1) is what it was (0.0.9)."""
+    """Revision 2 of the lowering is the regions' of version 2 only: a kernel's own source (revision 1) is what it was (0.0.10)."""
     import hashlib
 
     import primitive_cases as pc

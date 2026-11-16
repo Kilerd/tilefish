@@ -19,7 +19,7 @@ unfused one, for every input, because
   order-free ``max``, ``argmax`` and ``argmin`` (and ``gather_rows``, a copy) are fused into row regions by version 2 (the default), lowered by
   revision 2 of the lowering (note 21 of :mod:`tilefish.lower`); a Triton tree reduction (a ``sum`` or ``mean`` without ``order=``) is a region of
   its own in every version, its operand stored, because its bytes depend on the rest of its kernel (measured: 357 to 399 of 1024 rows differ when
-  other loads share it). Version 1 runs every reduction alone, as tilefish 0.0.9 did, and is kept unchanged (D7).
+  other loads share it). Version 1 runs every reduction alone, as tilefish 0.0.9 and 0.0.10 did, and is kept unchanged (D7).
 
 ``export`` checks it: every region of more than one op is run against its ops one by one, on seeded inputs with special values, at every
 bucket, and a difference refuses the export (``verify=False`` opts out). The fusion report, ``<graph>.fusion.json`` next to the plan, says which
@@ -131,7 +131,7 @@ def fusion(
     * ``version``: the grouping rules, limits and rewrites, frozen (D7). ``2``, the default: row regions, an ordered ``sum`` or ``mean``, ``max``,
       ``argmax``, ``argmin`` and ``gather_rows`` fused with the ops around them (one kernel of an rmsnorm and its residual add), lowered by
       revision 2 of the lowering (note 21 of :mod:`tilefish.lower`: faster ordered sums, views read where they are by the row template). ``1``:
-      every reduction a region of its own: the regions of fusion's first version (tilefish 0.0.9), unchanged.
+      every reduction a region of its own: the regions of fusion's first version (tilefish 0.0.9 and 0.0.10), unchanged.
     * ``grouping``: ``"auto"`` (regions as large as the rules allow) or ``"none"`` (one kernel per op: the unfused composition, an oracle).
     * ``math``: ``"fast"`` or ``"ieee"``, the default f32 math of the body's ops (note 13 of :mod:`tilefish.lower`); an op's own ``math=`` wins.
     * ``intermediates``: ``"declared"`` (every op rounds to the dtype the IR gives it) or ``"opmath"`` (torch's eager rule: a bf16 or f16

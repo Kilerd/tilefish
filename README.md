@@ -949,7 +949,7 @@ on the row patterns above at every bucket (every bf16 pattern, rows of special v
 
 | parameter | values (default first) | what it says |
 |---|---|---|
-| `version` | `2`, `1` | the grouping rules, limits and rewrites, frozen: `2` fuses ordered reductions into row regions; `1` runs every reduction alone (the plans of tilefish 0.0.9, unchanged). A plan made with another version is refused, naming it |
+| `version` | `2`, `1` | the grouping rules, limits and rewrites, frozen: `2` fuses ordered reductions into row regions; `1` runs every reduction alone (the plans of tilefish 0.0.9 and 0.0.10, unchanged). A plan made with another version is refused, naming it |
 | `grouping` | `"auto"`, `"none"` | regions as large as the rules allow (a region never spans a call, at most 64 ops), or one kernel per op |
 | `math` | `"fast"`, `"ieee"` | the default math of the body's f32 ops; an op's own `math=` wins |
 | `intermediates` | `"declared"`, `"opmath"` | every op rounds to its IR dtype; or torch's eager rule for a bf16 or f16 `+ - *` with a python scalar (computed in f32 with the scalar in f32, rounded once): with `math="ieee"` the bits are torch's eager composition (every non-NaN value, checked on every bit pattern) |

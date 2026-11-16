@@ -146,7 +146,7 @@ the export-time verification, the schemas and the hosts are those of phase 1.
   a residual add and an rmsnorm with the residual stream a second output (one kernel; the unfused composition has ten), the same with an fma
   sum, a layer norm with a gelu and per-channel tail, softmax with a mask from a device scalar, a row-wise fp8 quantisation, a SwiGLU of two
   column blocks and a norm, a gather and an argmax.
-* **Version 1 is frozen** with its lowering: its regions keep revision 1, and every use case declared `fusion(version=1)` plans as 0.0.9 planned
+* **Version 1 is frozen** with its lowering: its regions keep revision 1, and every use case declared `fusion(version=1)` plans as 0.0.9 and 0.0.10 planned
   it (plan digests checked in `tests/test_fusion.py`). A plan made with another version is refused as stale with a message that names it
   (`_fusion.other_version_of_plan`, tried only when a plan is stale).
 * **Why the ordered sum was slow (E3), and revision 2.** Revision 1 takes each step of a lane's chain with `tl.gather(x, k, 0)` of the whole
