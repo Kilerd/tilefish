@@ -5,6 +5,39 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+Manifest schema 3, plan schema 1 and both hosts are unchanged, and so is every digest of an export that declares no SASS assertion
+(`docs/explain.md`, issue #5 section 1).
+
+### SASS traceability and checks
+
+- **Traced exports.** `export(..., trace=True)` (or `TILEFISH_TRACE=1` in the environment) writes `trace/` next to the manifest: for every binary
+  it builds the source files under their module-relative names, the frontend's IR, TTIR, TTGIR, LLVM IR, PTX, the SASS with line information and
+  its line table (each instruction's source line and PTX line), and for a lowered kernel or a fused region what each line of its generated source
+  was written for (the op of the kernel's graph and the line of the body); for a graph, the steps of its plan and the ops of the body each fused
+  region took. It has its own index and digest (`tilefish.trace.v1`) and is outside the pinned artefact: the manifest, the plans and every digest
+  are the same with or without it (the whole GPU gate, traced, writes the bytes of an untraced export). A traced export compiles every Triton
+  kernel (the build cache holds no IR).
+- **`tilefish-explain`** (a console script; `python -m tilefish.explain`; `tilefish.explain.load`) for a kernel, a plan step or a fused region of
+  an export: the SASS annotated with the source line of each instruction (a Triton or Gluon kernel's line; a generated line, its op and the line of
+  the `@tilefish.kernel` body; a fused region's op of the graph body), the instruction mix (classes, MMA kinds and shapes, decoded from a
+  `tcgen05` instruction descriptor where the SASS does not spell them, the PTX MMAs, TMA, local-memory traffic, barriers and fences, registers,
+  stack frame, shared memory, an occupancy estimate), instructions per source line by class, and a diff of two exports or two architectures.
+  It reads the trace with no CUDA tool, from any directory (`--source-root`), and checks it against the manifest; without one it disassembles
+  the manifest's cubin.
+- **SASS assertions**: `tilefish.sass(no_tf32=, mma=, no_spills=, max_registers=, forbid=, by_arch=)` on `@tilefish.kernel(sass=...)`,
+  `@tilefish.extern(sass=...)` and `tilefish.fusion(sass=...)`. In the declaration digest when given (a fused region's name too), checked at
+  every build, a cache hit and a prebuilt binary included, from the PTX (MMA kinds), the ELF file (registers) and the SASS; a violation refuses
+  the build with the instructions and their source lines. `mma=` takes PTX patterns (`"tcgen05.mma kind::f16"`) and SASS opcode patterns
+  (`"HMMA.16816.F32"`); `forbid=` instruction classes (`atomic`, `fp64`, `local`, ...) and opcode patterns.
+- **Disassembly** goes through the `nvdisasm` of the contraction check (`TILEFISH_NVDISASM_PATH`, Triton's, an `nvidia-cuda-nvdisasm` wheel,
+  the `PATH`); where none decodes the architecture (Triton 3.5.1's CUDA 12.8 tools on sm_103) the SASS of the PTX assembled for the family base
+  (`sm_100a`) is read and labelled so. The parser reads CUDA 12.8 and 13.x listings of sm_90, sm_100, sm_103 and sm_120 (recorded fixtures in
+  `python/tests/sass_fixtures`).
+- **Graph nodes record where they were written** (`Node.loc`, the module-relative file and line of the body) and a lowered kernel what each
+  line of its source was written for (`LoweredKernel.line_map`); neither is printed, compared or in any digest or source.
+
 ## tilefish 0.0.8, crate 0.0.6, tilefish-capi 0.0.1 (2026-11-15)
 
 `tilefish-capi` 0.0.1 (`libtilefish_capi`, ABI 1.0, `tilefish.h`, `tilefish.hpp` and the CMake package) is built from the release commit with cargo or CMake; it is
