@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from . import _sass
-from ._trace import INDEX_NAME, TRACE_DIR, TRACE_SCHEMA, index_digest
+from ._trace import INDEX_NAME, TRACE_DIR, TRACE_SCHEMA, _safe_name, index_digest
 from .errors import TilefishError
 
 VIEWS = ("annotate", "summary", "lines", "diff")
@@ -84,7 +84,7 @@ class Trace:
         base = self.root / f"{stem}.{arch}"
         for rel, digest in (entry.get("files") or {}).items():
             path = base / rel
-            if not path.is_file() or _sha256(path) != digest:
+            if not _safe_name(rel) or not path.is_file() or _sha256(path) != digest:  # (a name inside the trace: no "..", not absolute)
                 raise TilefishExplainError(f"the trace file {str(path)!r} is not the one its index records (changed or missing)")
         return entry
 
@@ -169,7 +169,8 @@ class Explained:
 
     @property
     def instructions(self) -> "tuple[_sass.Instruction, ...]":
-        return self.listing.instructions(self.symbol)
+        """The binary's instructions: its kernel's function, then any other function of its code (:func:`tilefish._sass.kernel_instructions`)."""
+        return _sass.kernel_instructions(self.listing, self.symbol)
 
     def summary(self) -> "dict[str, Any]":
         """The instruction mix and the attributes (:func:`tilefish._sass.summary`), with what is explained and where its SASS comes from."""
@@ -232,7 +233,11 @@ class Explained:
         ptx_lines = self.ptx.splitlines() if (ptx and self.ptx) else None
         out = self.header() + [""]
         last: "tuple[Any, Any] | None" = None
+        function = self.symbol
         for i in self.instructions:
+            if i.function != function:  # another function of the binary's code (a noinline function, a subroutine of ptxas)
+                function, last = i.function, None
+                out += ["", f"== function {function}"]
             key = (i.file, i.line)
             if key != last:
                 out.append(self._label(i.file, i.line))
@@ -473,10 +478,13 @@ def load(
     try:
         d = _sass.disassemble(artifact.cubin)
     except TilefishError as e:
-        raise TilefishExplainError(
-            f"'{stem}' on {arch} has no trace in {str(directory)!r} ({'its trace is of another binary' if trace is not None else 'export it with trace=True'}), "
-            f"and its cubin cannot be disassembled here: {e}"
-        ) from e
+        if entry is not None:
+            why = f"its trace has no SASS ({entry['sass'].get('error')}: export it again where an nvdisasm reads it)"
+        elif trace is not None:
+            why = "its trace is of another binary or has none of it"
+        else:
+            why = "export it with trace=True"
+        raise TilefishExplainError(f"'{stem}' on {arch} has no SASS in the trace of {str(directory)!r} ({why}), and its cubin cannot be disassembled here: {e}") from e
     launch = {"block": artifact.entry.get("block"), "shared": artifact.entry.get("shared", 0)}
     return Explained(
         stem, arch, symbol, d.listing, d.label, _sass.kernel_attributes(artifact.cubin, symbol), launch, None, "", artifact.entry.get("kind", ""),

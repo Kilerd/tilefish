@@ -577,6 +577,9 @@ fn refusals() {
     std::fs::create_dir_all(&tmp).unwrap();
     for f in std::fs::read_dir(&dir).unwrap() {
         let f = f.unwrap();
+        if f.file_type().unwrap().is_dir() {
+            continue; // the trace of a traced export (trace/), which no host reads
+        }
         std::fs::copy(f.path(), tmp.join(f.file_name())).unwrap();
     }
     let cubin = tmp.join(format!("softmax.{}.cubin", cases()["arch"].as_str().unwrap()));
@@ -2059,6 +2062,9 @@ fn copy_of_the_manifest(name: &str) -> PathBuf {
     std::fs::create_dir_all(&tmp).unwrap();
     for f in std::fs::read_dir(&dir).unwrap() {
         let f = f.unwrap();
+        if f.file_type().unwrap().is_dir() {
+            continue; // the trace of a traced export (trace/), which no host reads
+        }
         std::fs::copy(f.path(), tmp.join(f.file_name())).unwrap();
     }
     tmp

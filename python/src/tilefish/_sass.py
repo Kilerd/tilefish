@@ -158,6 +158,12 @@ def _parse(text: str) -> "tuple[str | None, dict[str, list[Instruction]]]":
     return target, functions
 
 
+def kernel_instructions(listing: Listing, symbol: str) -> "tuple[Instruction, ...]":
+    """Every instruction of a binary's code: its kernel's function first, then any other function of the listing (a ``noinline`` function the
+    kernel calls, a subroutine ptxas added), which belong to the same binary."""
+    return listing.instructions(symbol) + tuple(i for name, f in listing.functions.items() if name != symbol for i in f)
+
+
 def parse_listing(text: str, ptx_lines: "str | None" = None) -> Listing:
     """Parse an ``nvdisasm -c -g`` listing (``-c`` alone parses too: no line information), and, given the ``nvdisasm -c -gp`` listing of the same
     binary (``ptx_lines``), the PTX line of each instruction. Pure; lines that are not instructions, sections or line information are skipped."""
@@ -906,13 +912,19 @@ _disassemblies: "dict[tuple[str, str], Disassembly]" = {}
 
 
 def _target_of(cubin: bytes, ptx: "str | None") -> str:
-    m = _TARGET.search(ptx) if ptx else None
-    if m is not None:
-        return m.group(1)
+    """The target the cubin is code for: the PTX's ``.target`` when it names the cubin's architecture (``sm_103a``), else the architecture of the
+    cubin's ELF header (``sm_103`` for a prebuilt PTX of an older generic target assembled for it)."""
     from ._elf import parse_elf, sm_of
 
     sm = sm_of(parse_elf(cubin))
-    return f"sm_{sm}a" if sm and sm >= 90 else f"sm_{sm}"
+    m = _TARGET.search(ptx) if ptx else None
+    if m is not None and (sm is None or re.fullmatch(rf"sm_{sm}[af]?", m.group(1))):
+        return m.group(1)
+    return f"sm_{sm}" if sm is not None else "sm_unknown"
+
+
+# the base of a family, whose instruction set an architecture shares: the target a PTX is assembled for where no nvdisasm decodes its own
+_PROXY_BASE = {"sm_103a": "sm_100a", "sm_103f": "sm_100f", "sm_103": "sm_100", "sm_121a": "sm_120a", "sm_121f": "sm_120f", "sm_121": "sm_120"}
 
 
 def disassemble(cubin: bytes, *, ptx: "str | None" = None, options: "Mapping[str, Any] | None" = None) -> Disassembly:
@@ -931,7 +943,7 @@ def disassemble(cubin: bytes, *, ptx: "str | None" = None, options: "Mapping[str
     nvdisasm = _fpcontract.disassembler_for(target, cubin)
     binary, read_for, proxy = cubin, target, False
     if nvdisasm is None:
-        base = _fpcontract._FAMILY_BASE.get(target)
+        base = _PROXY_BASE.get(target)
         how = f"set {_fpcontract.NVDISASM_ENV} to an nvdisasm that does (CUDA 12.9 or later for sm_103: pip install nvidia-cuda-nvdisasm)"
         if base is None:
             raise TilefishBuildError(f"no nvdisasm here decodes {target} ({_fpcontract.nvdisasm_candidates() or 'none found'}); {how}")
@@ -970,7 +982,7 @@ def judge(checks: SassChecks, *, cubin: bytes, ptx: "str | None", symbol: str, o
     def instructions() -> "Sequence[Instruction]":
         d = disassemble(cubin, ptx=ptx or None, options=options)
         result.label = d.label
-        return d.listing.instructions(symbol)
+        return kernel_instructions(d.listing, symbol)
 
     result.violations = evaluate(checks, ptx=ptx or None, attributes=attributes, instructions=instructions)
     return result

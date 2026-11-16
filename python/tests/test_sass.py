@@ -439,6 +439,32 @@ def test_every_build_checks_the_assertions_a_cache_hit_too(tmp_path, monkeypatch
     assert compiler.count == 1 and len(judged) == 2
 
 
+def test_every_function_of_the_binary_is_judged_and_the_kernel_s_comes_first():
+    text = (
+        '\t.section\t.text.helper,"ax",@progbits\n'
+        "        /*0000*/                   STL [R1], R2 ;\n"
+        "        /*0010*/                   RET.REL.NODEC R20 `(k) ;\n"
+        '\t.section\t.text.k,"ax",@progbits\n'
+        "        /*0000*/                   CALL.REL.NOINC `(helper) ;\n"
+        "        /*0010*/                   EXIT ;\n"
+    )
+    listing = _sass.parse_listing(text)
+    assert [(i.function, i.opcode) for i in _sass.kernel_instructions(listing, "k")] == [("k", "CALL"), ("k", "EXIT"), ("helper", "STL"), ("helper", "RET")]
+    found = _sass.evaluate(tilefish.sass(no_spills=True), ptx=None, attributes={}, instructions=lambda: _sass.kernel_instructions(listing, "k"))
+    assert [v.check for v in found] == ["no_spills"]
+
+
+def test_the_target_a_cubin_is_read_for():
+    from elf_builder import arch_header, cubin_like
+
+    cubin = cubin_like(**arch_header("sm_103"))
+    assert _sass._target_of(cubin, ".version 8.8\n.target sm_103a\n") == "sm_103a"
+    assert _sass._target_of(cubin, ".version 7.0\n.target sm_80\n") == "sm_103"  # a prebuilt PTX of an older target, assembled for sm_103
+    assert _sass._target_of(cubin, None) == "sm_103"
+    assert _sass._target_of(cubin_like(**arch_header("sm_90")), ".target sm_90a\n") == "sm_90a"
+    assert _sass._PROXY_BASE["sm_103"] == "sm_100" and _sass._PROXY_BASE["sm_103a"] == "sm_100a"
+
+
 def test_the_disassembly_label_says_when_the_sass_is_a_reassembly():
     d = _sass.Disassembly("", "", _sass.Listing(None, {}), "sm_103a", False, "/x/nvdisasm", "13.5.37")
     assert d.label == "its SASS, read by nvdisasm 13.5.37"

@@ -131,6 +131,20 @@ def test_a_traced_export_of_a_dsl_kernel_and_of_a_fused_region(tmp_path):
     assert re.search(r"FMUL R\d+, R\d+, R\d+ ;", text)
 
 
+def test_a_traced_prebuilt_ptx_has_its_ptx_and_its_sass(tmp_path):
+    require_ptxas_for(CC)
+    import host_ops
+
+    out = runtime.export(host_ops.axpy_ptx, tmp_path / "ptx", trace=True)
+    base = out.directory / "trace" / f"axpy_ptx.sm_{CC}"
+    assert (base / "ptx.ptx").read_text() == (HERE / "ptx" / "axpy_f32.ptx").read_text()
+    assert (base / "sass.txt").is_file() and not (base / "ttir.mlir").exists()
+    e = explain.load(out.directory, "axpy_ptx")
+    assert e.origin == "binary" and e.symbol == "axpy_f32"
+    s = e.summary()
+    assert s["classes"].get("global_load") and s["classes"].get("global_store") and s["mma"] == []
+
+
 def test_the_sass_of_sm_103_is_read_from_the_family_base_where_no_nvdisasm_decodes_it(tmp_path, monkeypatch):
     if CC != 103:
         pytest.skip("the family base is sm_103's question")
