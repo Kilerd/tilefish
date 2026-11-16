@@ -1,7 +1,7 @@
 """The per-step profiler (:func:`tilefish.profile_plan`, ``tilefish-explain --profile``) on a device, and the advisor with what it measured: the plan's
 steps are timed, the export and the bytes a run writes are not changed, and the times are sane (positive, their sum close to the plan's own time).
 
-Arch-agnostic: it ran on sm_103 (a B300 MIG slice); the sm_120 and sm_90 runs are a later gate's. No ``from __future__ import annotations``.
+Arch-agnostic: it ran on sm_103 (a B300 MIG slice) and sm_120 (an RTX 5090); the sm_90 run is a later gate's. No ``from __future__ import annotations``.
 """
 
 import hashlib

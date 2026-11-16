@@ -25,10 +25,11 @@ reports as 0.0.9. The trace's graph file gains two keys (it is outside every dig
   `--top`, `--json`.
 - **`tilefish.profile_plan(graph, plan, bucket=, reps=, method=, devscalars=, out=)`** and `tilefish-explain DIR --graph G --profile OUT --load
   MODULE:ATTR`: the device time of every step of a plan at one bucket, a runtime path of its own that changes no artefact (the plan run as a run
-  runs it, with timing events between its steps: event nodes of a CUDA graph, or events between launches behind a spinning kernel; the caller's
-  `InOut` tensors and the carried buffers the runs write are put back as they were), as a
-  `tilefish.step-timing.v1` file the advisor ranks by. It records the device's SMs and copy bandwidth, the plan's time without the events and what
-  the events cost each step (about 3 us on a B300 slice), and each step's time net of it; `docs/advise.md` compares it with Nsight Systems.
+  runs it, with timing events between its steps: event nodes of a CUDA graph, or events between launches behind a spinning kernel, which every run
+  checks was long enough for the host to enqueue the steps; the caller's `InOut` tensors and the carried buffers the runs write are put back as
+  they were), as a `tilefish.step-timing.v1` file the advisor ranks by. It records the device's SMs and copy bandwidth, the plan's time without
+  the events and what the events cost each step (about 3 us on a B300 slice), and each step's time net of it; `docs/advise.md` compares it with
+  Nsight Systems.
 - **Why the regions are where they are**: `tilefish._fusion.boundaries(graph)` gives, for every value that crosses a boundary of a fused region,
   the reason (`barrier`, `reduction-unordered` (D2), `reduction`, `view`, `materialised`, `cycle`, `limit`, `template`, `move`, a call's epilogue or
   prologue, `grouping`), the ops on both sides and their lines, and the fix. It repeats the pass's rules (now one function, `merge_problem`, which

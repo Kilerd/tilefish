@@ -194,8 +194,11 @@ where a kernel branches on them); every device scalar must be given (`devscalars
   first step and after each, and replayed `reps` times after `warmup`: how a host that captures a plan runs it. A step's time is the time between
   the nodes around it. The plan is captured again without the events and timed as a whole.
 * **`method="events"`**: the steps are launched as a run launches them, with an event recorded on the stream before the first and after each; a
-  spinning kernel first keeps the device busy while the host enqueues them (about `20 n + 50` microseconds for `n` steps), so that they run back to
-  back and not as fast as the host launches them. For plans of up to about a thousand steps (the driver's queue).
+  spinning kernel first keeps the device busy while the host enqueues them, so that they run back to back and not as fast as the host launches them.
+  The spin is `20 n + 50` microseconds for `n` steps at first, and every run checks it: an event before the spin times it on the device, and a run
+  whose host took longer to enqueue the steps than the device spent in the spin is made again with a longer one (a host may take 30 us a step, and
+  on an RTX 5090 the spin runs about 15% shorter than the clock rate it is sized by). A host that cannot keep up even with a spin of 2 s is refused:
+  use `method="graph"`. For plans of up to about a thousand steps (the driver's queue).
 
 **The timing file** (`tilefish.step-timing.v1`): `graph`, `plan_digest`, `manifest_digest`, `arch`, `bucket`, `method`, `reps`, `warmup`,
 `device` (`name`, `arch`, `sm_count`, `clock_khz`, `copy_GBps`), `steps` (per step: `index`, `kind`, `entry`, `us`: `median`, `mean`, `trimmed`
@@ -252,6 +255,6 @@ after the plan that writes it, which the profiler does not set up).
   region; a traced export by the fake compiler (its manifest, plan and fusion report the same bytes as without the trace; the trace's boundaries; the
   advice with the trace, without it, and with `gop=`); the profiler's runtime path on a fake backend (the events around each step, the same launches
   as a run, both methods).
-* `python/tests/test_gpu_advise.py` (a device; arch-agnostic: ran on sm_103, the sm_120 and sm_90 runs are a later gate's): every step timed,
+* `python/tests/test_gpu_advise.py` (a device; arch-agnostic: ran on sm_103 and sm_120, the sm_90 run is a later gate's): every step timed,
   the export's files and a run's bytes unchanged by profiling, the nets adding up to the plan's time, both methods agreeing, the command line
   (`--profile`, then `--advise --timing`).

@@ -485,13 +485,17 @@ def test_a_traced_export_says_why_and_an_untraced_one_says_what_the_report_can(f
 
 
 class TimedBackend(FakeBackend):
-    """A fake backend whose timing events read a clock that every launch advances by a step's own duration (step k: k + 1 microseconds)."""
+    """A fake backend whose timing events read a clock that every launch advances by a step's own duration (step k: k + 1 microseconds), and the
+    spin by its microseconds times ``spin``; each launch takes the host ``host_step`` seconds (``host``: the host's clock, for ``_host_clock``)."""
 
-    def __init__(self):
+    def __init__(self, spin=1.0, host_step=0.0):
         super().__init__()
         self.clock = 0.0
         self.k = 0
         self.timed = 0
+        self.spin = spin
+        self.host_step = host_step
+        self.host = 0.0
 
     def new_timing_event(self, index):
         self.timed += 1
@@ -511,8 +515,10 @@ class TimedBackend(FakeBackend):
 
     def hold(self, stream, microseconds, index):
         self.log.append(("hold", microseconds))
+        self.clock += microseconds * self.spin
 
     def _advance(self):
+        self.host += self.host_step
         self.k += 1
         self.clock += float(self.k % 9 or 9)  # the steps of one run take 1 to 9 us, in order
 
@@ -550,6 +556,32 @@ def test_the_profile_times_every_step_between_events_and_launches_what_a_run_lau
     assert sum(1 for e in be2.log if e[0] == "graph") == 4  # warmup and timed replays of each graph
     with pytest.raises(tilefish.TilefishRuntimeError, match="method is 'graph' or 'events'"):
         r3.profile(w.args(), {}, reps=1, warmup=0, method="nvtx")
+
+
+def test_the_events_method_spins_longer_for_a_slow_host(monkeypatch):
+    # a host that takes 30 us to enqueue a step (270 us for the 9 steps) and a spin that runs faster than it is sized (an RTX 5090 boosts past the
+    # clock rate the spin is sized by): the first spin (230 us, 184 us on the device) ends before the host is done, so the steps would run as fast as
+    # the host launches them. That run is made again with a spin long enough for what it measured; only runs whose steps were all enqueued before
+    # the device left the spin are measured
+    be = TimedBackend(spin=0.8, host_step=30e-6)
+    monkeypatch.setattr(tilefish._planrun, "_host_clock", lambda: be.host)
+    r, _ = fake_runner(backend=be)
+    out = r.profile(Weights(64).args(), {}, reps=2, warmup=0, method="events")
+    holds = [e[1] for e in be.log if e[0] == "hold"]
+    assert holds[0] == 20.0 * 9 + 50.0 and holds[1:] == [pytest.approx(1.5 * 270 * 230 / 184)] * 4  # one run again, then 2 reps of 2 runs
+    assert [round(t[0], 6) for t in out["steps"]] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0] and len(out["plan"]) == 2
+    # a host that never keeps up: refused, with the method that does not depend on it
+    be2 = TimedBackend(host_step=1.0)
+    monkeypatch.setattr(tilefish._planrun, "_host_clock", lambda: be2.host)
+    r2, _ = fake_runner(backend=be2)
+    with pytest.raises(tilefish.TilefishRuntimeError, match="host took .* to enqueue the 9 steps.*Use method='graph'"):
+        r2.profile(Weights(64).args(), {}, reps=1, warmup=0, method="events")
+    # the graph method has no spin
+    be3 = TimedBackend(host_step=1.0)
+    monkeypatch.setattr(tilefish._planrun, "_host_clock", lambda: be3.host)
+    r3, _ = fake_runner(backend=be3)
+    r3.profile(Weights(64).args(), {}, reps=1, warmup=1, method="graph")
+    assert not any(e[0] == "hold" for e in be3.log)
 
 
 def test_the_profile_puts_back_what_the_runs_change_that_outlives_them():

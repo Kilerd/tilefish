@@ -75,6 +75,7 @@ import json
 import os
 import pathlib
 import threading
+import time
 import warnings
 import weakref
 import dataclasses
@@ -107,6 +108,9 @@ _loaded: "dict[tuple, tuple[tuple, Plan, PlanRunner]]" = {}  # (directory, graph
 _runners: "weakref.WeakSet[PlanRunner]" = weakref.WeakSet()  # every runner alive, so that clear_caches can reset them (a runner is kept by its plan or by _loaded, never by a global)
 _torch_backend: "list[TorchBackend]" = []
 _epoch = [0]  # how many times clear_caches has run: a CapturedPlan is replayed only in the epoch it was captured in (its binaries are unloaded after)
+_host_clock = time.perf_counter  # tilefish.profile_plan(method="events"): the host's time to enqueue the steps (a test gives its own clock)
+_HOLD_TRIES = 12  # ... and how often a run is made again with a longer spin before it gives up
+_HOLD_MAX_US = 2e6  # (a spin of more than 2 s: the host cannot keep up with the device, or the driver's queue is full)
 
 
 class _Gate:
@@ -1151,7 +1155,15 @@ class PlanRunner:
                         if timed:
                             be.record_event(events[i + 1], s, external)
 
+                # the events method: how long the spinning kernel keeps the device busy while the host enqueues the steps. 20 us a step at first;
+                # every run checks it (the host's time to enqueue the steps against the device's time in the spin, measured by an event before
+                # it) and a run whose host was slower is made again with a longer one: a host may take 30 us a step, and the spin may run faster
+                # than the clock rate it is sized by (an RTX 5090 boosts past it)
+                hold = [20.0 * n + 50.0]
+
                 def one(timed: bool) -> None:
+                    host = [0.0]
+
                     def work() -> None:
                         if method == "graph":
                             if not timed:
@@ -1161,21 +1173,39 @@ class PlanRunner:
                                 be.record_event(ends[1], stream, False)
                         else:
                             slots()
-                            be.hold(stream, 20.0 * n + 50.0, index)
+                            be.record_event(ends[2], stream, False)
+                            be.hold(stream, hold[0], index)
+                            t0 = _host_clock()
                             if not timed:
                                 be.record_event(ends[0], stream, False)
                             enqueue(stream, timed, False)
                             if not timed:
                                 be.record_event(ends[1], stream, False)
+                            host[0] = (_host_clock() - t0) * 1e6
 
-                    _ordered(be, arena, stream, False, work)
+                    for _ in range(_HOLD_TRIES):
+                        _ordered(be, arena, stream, False, work)
+                        if method == "graph":
+                            return
+                        be.synchronize_event(events[-1] if timed else ends[1], index)
+                        held = be.elapsed_ms(ends[2], events[0] if timed else ends[0], index) * 1000.0
+                        if host[0] < 0.9 * held:
+                            return  # every step was enqueued before the device left the spin: they ran back to back
+                        # the device waited for the host: again, with a spin long enough for what this run measured (of the host, and of the spin)
+                        hold[0] = max(2.0 * hold[0], 1.5 * host[0] * hold[0] / max(held, 1.0))
+                        if hold[0] > _HOLD_MAX_US:
+                            break
+                    raise TilefishRuntimeError(
+                        f"tilefish.profile_plan(method='events'): the host took {host[0]:.0f} us to enqueue the {n} steps of '{self.plan.name}', longer "
+                        f"than a spinning kernel of up to {_HOLD_MAX_US / 1e6:.0f} s kept the device busy: the steps would run as fast as the host launches "
+                        "them. Use method='graph'")
 
                 out: "dict[str, Any]" = {"steps": [[] for _ in range(n)], "plan": [], "bucket": dict(bound.values), "device": index}
                 try:
                     saved = [(be.empty((nbytes,), "u8", index), addr, nbytes) for addr, nbytes in state]
                     _ordered(be, arena, stream, False, lambda: [be.copy(int(t.data_ptr()), addr, nbytes, stream) for t, addr, nbytes in saved])
                     events = [be.new_timing_event(index) for _ in range(n + 1)]
-                    ends = [be.new_timing_event(index) for _ in range(2)]
+                    ends = [be.new_timing_event(index) for _ in range(3)]  # the plan's start and end without the per-step events; the spin's start
                     if method == "graph":
                         _ordered(be, arena, stream, False, slots)  # the device scalars, once: the graphs hold the launches only
                         graphs[True] = be.capture_graph(index, None, lambda s: enqueue(s, True, True))
