@@ -42,6 +42,13 @@ Manifest schema 3, plan schema 1 and both hosts are unchanged, and so is every d
 - **Graph nodes record where they were written** (`Node.loc`, the module-relative file and line of the body) and a lowered kernel what each
   line of its source was written for (`LoweredKernel.line_map`); neither is printed, compared or in any digest or source.
 
+### Fixed
+
+- **The `nvidia-cuda-nvdisasm` wheel is found wherever pip installed it.** The contraction check (and now the SASS tooling) looked for its `nvdisasm`
+  only under the directory `import nvidia` resolves to; with a regular `nvidia` package elsewhere on the path (the `nvidia/__init__.py` of CUDA 12
+  wheels), a wheel installed with `--user`, `--target` or into a virtual environment over the system's packages was not found, and Triton's CUDA 12.8
+  `nvdisasm` was used instead. Its installed files are now read first (`importlib.metadata`).
+
 ## tilefish 0.0.8, crate 0.0.6, tilefish-capi 0.0.1 (2026-11-15)
 
 `tilefish-capi` 0.0.1 (`libtilefish_capi`, ABI 1.0, `tilefish.h`, `tilefish.hpp` and the CMake package) is built from the release commit with cargo or CMake; it is

@@ -5,6 +5,7 @@ The check on real binaries, on sm_90, sm_100, sm_103 and sm_120: ``test_gpu_fpco
 
 import os
 import stat
+import sys
 
 import pytest
 
@@ -105,6 +106,51 @@ def test_the_nvdisasm_named_by_the_environment_is_tried_first(tmp_path, monkeypa
     assert _fpcontract.nvdisasm_candidates()[0] == mine
     monkeypatch.setenv(_fpcontract.NVDISASM_ENV, str(tmp_path / "missing"))
     assert str(tmp_path / "missing") not in _fpcontract.nvdisasm_candidates()  # a path that is not an executable file is skipped
+
+
+def _wheel_site(root, name):
+    """A site directory holding the nvidia-cuda-nvdisasm wheel as pip installs it: its tool and its dist-info."""
+    tools = root / "nvidia" / "cu13" / "bin"
+    tools.mkdir(parents=True)
+    info = root / f"{name}-13.5.37.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: nvidia-cuda-nvdisasm\nVersion: 13.5.37\n")
+    (info / "RECORD").write_text(f"nvidia/cu13/bin/nvdisasm,,\n{info.name}/METADATA,,\n{info.name}/RECORD,,\n")
+    return _tool(tools, "nvdisasm")
+
+
+def test_the_nvdisasm_of_the_wheel_is_found_where_pip_put_it(tmp_path, monkeypatch):
+    # pip install --user (or --target, or into a virtual environment over the system's packages) 'tilefish[sass]', with a regular nvidia package
+    # (the nvidia/__init__.py of CUDA 12 wheels) first on the path: import nvidia finds that one, and not the wheel's directory
+    system = tmp_path / "system"
+    (system / "nvidia").mkdir(parents=True)
+    (system / "nvidia" / "__init__.py").write_text("")
+    tool = _wheel_site(tmp_path / "user", "nvidia_cuda_nvdisasm")
+    monkeypatch.syspath_prepend(str(tmp_path / "user"))
+    monkeypatch.syspath_prepend(str(system))
+    monkeypatch.delitem(sys.modules, "nvidia", raising=False)
+    monkeypatch.delenv(_fpcontract.NVDISASM_ENV, raising=False)
+    import nvidia
+
+    assert list(nvidia.__path__) == [str(system / "nvidia")]
+    assert _fpcontract.nvdisasm_candidates()[0] == tool
+    # the variable still comes first
+    mine = _tool(tmp_path, "nvdisasm")
+    monkeypatch.setenv(_fpcontract.NVDISASM_ENV, mine)
+    assert _fpcontract.nvdisasm_candidates()[:2] == [mine, tool]
+
+
+def test_a_tool_under_the_nvidia_package_is_found_without_a_record(tmp_path, monkeypatch):
+    site = tmp_path / "site"
+    tools = site / "nvidia" / "cu13" / "bin"
+    tools.mkdir(parents=True)
+    (site / "nvidia" / "__init__.py").write_text("")
+    tool = _tool(tools, "nvdisasm")
+    monkeypatch.syspath_prepend(str(site))
+    monkeypatch.delitem(sys.modules, "nvidia", raising=False)
+    monkeypatch.delenv(_fpcontract.NVDISASM_ENV, raising=False)
+    monkeypatch.setattr(_fpcontract, "_WHEELS", {})
+    assert _fpcontract.nvdisasm_candidates()[0] == tool
 
 
 class _Spec:

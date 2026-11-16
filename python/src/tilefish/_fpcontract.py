@@ -136,13 +136,28 @@ def _triton_tool(name: str) -> "str | None":
         return None
 
 
+_WHEELS = {"nvdisasm": "nvidia-cuda-nvdisasm"}  # the wheel that ships a tool (tilefish[sass])
+
+
 def _wheel_tool(name: str) -> "list[str]":
-    """``nvidia/*/bin/<name>`` of the ``nvidia`` namespace packages (the ``nvidia-cuda-nvdisasm`` wheel puts it in ``nvidia/cu13/bin``)."""
+    """``bin/<name>`` among the installed files of the wheel that ships it (``nvidia-cuda-nvdisasm``: ``nvidia/cu13/bin/nvdisasm``), wherever pip
+    put it, then ``nvidia/*/bin/<name>`` of the ``nvidia`` package. The installed files come first: ``import nvidia`` finds one directory when
+    another location on the path has a regular ``nvidia`` package (the ``nvidia/__init__.py`` of CUDA 12 wheels), so a wheel installed with
+    ``--user``, ``--target`` or into a virtual environment over the system's packages is not under it."""
+    found = []
+    wheel = _WHEELS.get(name)
+    if wheel is not None:
+        try:
+            from importlib import metadata
+
+            dist = metadata.distribution(wheel)
+            found += [str(dist.locate_file(f)) for f in dist.files or () if f.name == name and f.parent.name == "bin"]
+        except Exception:  # noqa: BLE001 - not installed, or a record that cannot be read
+            pass
     try:
         import nvidia  # type: ignore[import-not-found]
     except ImportError:
-        return []
-    found = []
+        return found
     for root in list(getattr(nvidia, "__path__", [])):
         for p in sorted(pathlib.Path(root).glob(f"*/bin/{name}")):
             found.append(str(p))
