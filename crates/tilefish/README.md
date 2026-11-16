@@ -151,6 +151,14 @@ taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a st
 captures them as memcpy nodes, copied again at every replay). `PlanRun::launch_step` launches one step of a bucket on the caller's tensors, with the
 binary and the binding of the pinned plan (not on a capturing stream).
 
+An **instrumented export** (`tilefish.runtime.export(..., instrument=True)`, `docs/instrument.md`) is a diagnostic variant whose binaries record the
+`tilefish.probe("name")` phase boundaries of their kernels into a probe buffer given in their profile scratch parameter; it has a digest of its own,
+and `Manifest::load`, `Manifest::from_embedded`, `LaunchPlan::load` and `PlanSet::load` refuse it. `Manifest::load_instrumented` (and
+`LaunchPlan::load_instrumented`, `PlanSet::load_instrumented`) read it; `Kernel::launch_probed` records one launch into a `ProbeBuffer`
+(`Kernel::probe_bytes` says how large; `ProbeBuffer::collect` reads the records back), `LaunchPlan::instantiate_probed` gives every instrumented step
+of a plan its region of a probe buffer of the instantiation (launched or captured), read with `PlanRun::collect_probes`, and `ProbeTrace::save`
+writes `tilefish.probe-trace.v1` for `tilefish-explain DIR --probes FILE`.
+
 Safe code cannot free a slice under a running kernel or GEMM, and a launch of
 slices on a stream that is capturing a CUDA graph is refused, in every cudarc
 context. The per-thread default stream (`ctx.per_thread_stream()`) is refused
