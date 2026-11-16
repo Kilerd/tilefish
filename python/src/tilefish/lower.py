@@ -1357,6 +1357,7 @@ class _Layout:
         """One parameter per table, after the template's own: its number of rows ``N``, which an index is checked against. A ``tl.constexpr``
         when ``N`` is static or bucketed (one binary per bucket), a runtime ``i32`` when it is dynamic."""
         self.rows_name = {}
+        self.table_bucket_dims: "list[DimExpr]" = []
         out = []
         by_plane: dict[Any, str] = {}  # the slices of one parameter share its rows parameter (note 19)
         for t in self.tables.params:
@@ -1372,6 +1373,7 @@ class _Layout:
                 out.append(_Extra(nm, True, _const_param(nm, n.value)))
             elif all(d.buckets for d in n.free_dims()):
                 out.append(_Extra(nm, True, _const_param(nm, n)))
+                self.table_bucket_dims.append(n)  # (a binary per bucket of it too: the stems of the specs name it)
             else:
                 out.append(_Extra(nm, False, Param(nm, 0, "dim", dim=n)))
         return out
@@ -1705,10 +1707,14 @@ class _RowLayout(_Layout):
         """One warp count per bucket of ``D``, from the ``BLOCK_D`` of that bucket alone (none for a static ``D``)."""
         if self.D.is_static or self.chunk is not None:  # a chunked row has the same block in every bucket
             return {}
-        free = sorted(self.D.free_dims(), key=lambda x: x.name)  # the order compile_specs walks the buckets in
+        d_dims = sorted(self.D.free_dims(), key=lambda x: x.name)
+        # the order compile_specs walks the buckets in: the constexprs' dims in order of appearance, D's first, then a bucketed table's rows
+        free = list(d_dims)
+        for n in getattr(self, "table_bucket_dims", []):
+            free += [x for x in sorted(n.free_dims(), key=lambda x: x.name) if x not in free]
         out: dict[str, int] = {}
         for combo in itertools.product(*(x.buckets for x in free)):  # type: ignore[misc]
-            value = self.D.subst(dict(zip(free, combo))).value
+            value = self.D.subst(dict(zip(free[: len(d_dims)], combo[: len(d_dims)]))).value
             out["".join(f".{x.name}{v}" for x, v in zip(free, combo))] = self.warps_of(next_pow2(value))
         return out
 

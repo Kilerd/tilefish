@@ -280,6 +280,16 @@ def test_a_view_gathered_from_is_copied_first():
     src = _fusion.fused(gather_half).regions[0].kernel.lower().source
     assert "_s0" not in src.split("def tf_")[1]
 
+    @tilefish.graph
+    def gather_half_buckets(x: Tensor[R, 2 * fg.DR, f32], idx: Tensor[R, i32]):
+        h, _ = x.split(fg.DR, axis=-1)
+        return tilefish.gather_rows(h, idx, oob="clamp") + h
+
+    # a table of bucketed rows next to a bucketed row length: a binary per combination, each with the warps of its own row length
+    low = _fusion.fused(gather_half_buckets).regions[0].kernel.lower()
+    assert low.extern.bucket_num_warps[".DR2304.R24"] == low.extern.bucket_num_warps[".DR2304.R8"] and len(low.extern.bucket_num_warps) == 6
+    assert len(steps(gather_half_buckets, R=24, DR=2304)) == 2
+
     for version in (1, 2):
         @tilefish.graph(fusion=tilefish.fusion(version=version))
         def gather_column(x: Tensor[N, 2, f32], idx: Tensor[N, i32]):
