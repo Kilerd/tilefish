@@ -1010,6 +1010,10 @@ def up(x: Tensor[T, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16]):
   program holds the tile of the gate and the matching tile of the up projection), and a row region (an rmsnorm) where a tile of the extern holds whole
   rows (`block_n=`, a Triton kernel). What it does not take stays route (a), a region after the call, and the fusion report, `boundaries()` and the
   advisor say why (a barrier, a view the hook does not hold, a call in between, a row wider than a tile, ...).
+* **Speed is the kernel's**: the hook's arithmetic runs on the extern's warps after its main loop. On a B300 slice, with the example GEMM, a bias +
+  GELU after a 2048 x 4096 x 1024 GEMM is 1.21 times faster fused than the GEMM followed by its region, a gated activation 1.14 times; an epilogue
+  heavy for the kernel's warps can be slower (a `sin` per element after a convolution: 0.77 times; the table is in RFC 0003). `tilefish.barrier(y)`
+  keeps the region after the call.
 * **Nothing new for a host or a schema**: an extern with hooks is launched through a small generated module that calls its kernel with the identity
   hook (in its declaration digest), and a fused pair is a generated entry of its own, `<extern>_epi_<hash>`, its identity the IR it compiles to.
   `python/examples/epilogue_gemm.py` has a Triton GEMM (`tcgen05.mma` on sm_100/103, `mma.sync` on sm_120, both asserted in the SASS), its

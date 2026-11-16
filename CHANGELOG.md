@@ -39,7 +39,12 @@ step like any. Every export that calls no extern with an epilogue hook writes th
   E2, E3 (with its break-even slowdown) or E6, and to an extern with a hook today. The fixes of `epilogue-library`, `epilogue-extern`,
   `opaque-unknown` and `opaque-compute-epilogue` are reworded.
 - **Examples** (`python/examples/epilogue_gemm.py`): a Triton GEMM with both hooks (`tcgen05.mma` on sm_100 and sm_103, `mma.sync` on sm_120, each
-  asserted in the SASS), its dual-accumulator form, a Gluon `tcgen05` GEMM, and a 1-D convolution as an implicit GEMM.
+  asserted in the SASS; its epilogue on sub-tiles of the columns), its dual-accumulator form, a Gluon `tcgen05` GEMM, and a 1-D convolution as an
+  implicit GEMM.
+- **Speed** (B300 slice, the example GEMM): bias + GELU after a 2048 x 4096 x 1024 GEMM 1.21 times faster fused than the GEMM and its region after
+  it, a gated activation 1.14 times, parity for a periodic activation and a norm at 2048 rows; slower where the epilogue is heavy for the kernel's
+  warps (a periodic activation after a convolution: 0.77 times). The hook's arithmetic runs on the extern's warps after its main loop; `tilefish.barrier`
+  keeps a region after the call (RFC 0003, E1 notes).
 
 ## tilefish 0.0.11, crate 0.0.9, tilefish-capi 0.0.1 (2026-11-17)
 

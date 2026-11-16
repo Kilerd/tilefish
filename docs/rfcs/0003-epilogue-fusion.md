@@ -152,8 +152,12 @@ changes.
   * **Gluon.** The hook is a `@triton.jit` function, which a Gluon kernel calls (measured). Every value of an elementwise hook is a full tile, so its
     layout is the tile's; a `-0.0` scalar is `tl.cast(bits)` there (Gluon's `tl.full` needs a layout). A row region is refused in a Gluon kernel's hook
     in E1 (a reduction's result has another layout).
-  * **Whole rows.** An ordered sum of every row of a tile (`_tf_hsum_*`, note 22 of `tilefish.lower`): the row template's terms in its order, a lane
-    with no column `+0.0` (what revision 2's padding gives); `max` order-free; no `argmax`, no sum without `order=` (D2).
+  * **Whole rows.** An ordered sum of every row of a tile (`_tf_hsum_*`, note 22 of `tilefish.lower`): the chains by halving splits, the tree over the
+    lanes by gathers, only the lanes that have columns computed (a lane with none is `+0.0` all along, what revision 2's padding gives, so a level of
+    the tree whose partner is such a lane adds `+0.0`): the row template's terms in its order; `max` order-free; no `argmax`, no sum without
+    `order=` (D2).
+  * **Per-row and per-column operands** (a bias, a scale, a norm's weight) are loaded once per tile as a vector and broadcast (the bits the
+    elementwise template reads at each lane's offset), not gathered per element.
   * **Fusion versions.** The merge applies only to calls of externs with hooks, which no plan of 0.0.11 or before has, in versions 1 and 2 alike:
     every graph without such a call plans as before (its plan, manifest and report the same bytes). No new version.
   * **`tilefish.barrier(y)`** stops the epilogue fusion of `y` (section 4); **one region per call** (the first that fits; the others `epilogue-taken`).
@@ -165,13 +169,34 @@ changes.
   intermediate stored, at every bucket, on two seeds: the extern's operands normal with the special values (both zeros and infinities, NaN, the largest
   finite values, a subnormal) at their first elements, every side input with the special values and random bit patterns of `_sample`. A difference
   refuses the export; a kernel that applies its `out` hook to the unrounded value is refused (tested).
-* **Examples** (`python/examples/epilogue_gemm.py`): a Triton GEMM with both hooks (TMA descriptors, `tl.dot`, a grouped order; `tcgen05.mma` on
-  sm_100/103 and `mma.sync` on sm_120, each asserted by `tilefish.sass`), its dual-accumulator form, a Gluon `tcgen05` GEMM, and a 1-D convolution
-  as an implicit GEMM (rows `B * Lo`).
-* **Measured** (B300 MIG slice, sm_103, 30 SMs; microseconds per plan run captured in a CUDA graph, `profile_plan`'s `plan_us`; the hook against
-  route (a), the extern then the region in one kernel, which `tilefish.barrier` of the result gives, and the unfused composition):
+* **Examples** (`python/examples/epilogue_gemm.py`): a Triton GEMM with both hooks (TMA descriptors, `tl.dot`, a grouped order, its epilogue on 1, 2
+  or 4 sub-tiles of the columns, a hook call each; `tcgen05.mma` on sm_100/103 and `mma.sync` on sm_120, each asserted by `tilefish.sass`), its
+  dual-accumulator form, a Gluon `tcgen05` GEMM, and a 1-D convolution as an implicit GEMM (rows `B * Lo`).
+* **Measured** (B300 MIG slice, sm_103, 30 SMs; microseconds per plan run captured in a CUDA graph, `profile_plan`'s `plan_us`, trimmed mean of
+  200; the hook against route (a), the extern then the region in one kernel, which `tilefish.barrier` of the result gives, and the unfused
+  composition):
 
-  SPEED_TABLE
+  | pattern (bf16; `H = 1024`, `F = 4096`) | rows | hook (1 step) | route (a) (2 steps) | unfused (steps) | hook, `"accumulator"` | (a) / hook |
+  |---|---|---|---|---|---|---|
+  | GEMM + bias + GELU | 256 | 25.0 | 25.1 | 37.1 (6) | 26.7 | 1.00 |
+  | | 2048 | 111.6 | 135.3 | 231.1 (6) | 117.2 | 1.21 |
+  | GEMM + bias + periodic activation | 256 | 31.2 | 27.2 | 61.8 (10) | 32.6 | 0.87 |
+  | | 2048 | 139.2 | 143.9 | 402.9 (10) | 143.9 | 1.03 |
+  | dual GEMM (`2F` rows) + SwiGLU | 256 | 41.2 | 44.0 | 61.8 (6) | 41.0 | 1.07 |
+  | | 2048 | 229.8 | 261.1 | 410.2 (6) | 240.4 | 1.14 |
+  | GEMM (`D = 256`) + residual add + RMSNorm, residual returned | 256 | 17.0 | 14.9 | 23.2 (11) | 16.8 | 0.88 |
+  | | 2048 | 16.9 | 16.9 | 35.6 (11) | 16.9 | 1.00 |
+  | conv1d (`k = 7`, 512 to 512 channels, `L = 4096`) + bias + periodic | 4096 | 164.6 | 127.5 | 193.4 (10) | 167.6 | 0.77 |
+
+  The GEMMs are the example's (`gemm_sm100`: 8 warps, the epilogue on two sub-tiles of 64 columns; the norm's a tile of 128 x 256 that sees whole
+  rows; the convolution 8 warps), which are not persistent and not warp-specialised: the hook's arithmetic runs after the main loop on the kernel's
+  own warps, at its occupancy, overlapped with nothing. So the fusion pays where the epilogue is light and its operands are large (bias + GELU at
+  2048 rows: 1.21x; the gated activation, whose fused op stores half the columns: 1.07 to 1.14x), is even where the GEMM is short, and loses where the
+  epilogue is heavy for the kernel's few warps (a `sin` per element over a convolution: 0.77x). The configuration matters as much as the fusion: with
+  4 warps, or the whole 128-column tile in one hook, the hook's registers spill (`sin`: 255 registers and a stack frame) and the same periodic
+  activation was 0.30 to 0.45x; a first ordered row sum by reshapes and splits of an MMA-layout tile spilled 15 KB per thread (0.04x), which the
+  gather-based sum above removed. Getting the rest is the kernel work of X8 (an epilogue that overlaps the next tile's main loop), not the hook. The
+  route is a declaration's choice, never made on time (section 5): the advisor reports the saving each route would give.
 
 * **Tests:** `tests/test_epilogue.py` (no GPU: the declaration and its refusals, the generated module, the merge of every pattern in both modes, the
   hook's code against the region's op by op, one op for one pair in two graphs, `R_acc` IR in and out, scopes, every refusal with its reason, the
