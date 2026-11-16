@@ -168,6 +168,16 @@ def test_the_summary_of_two_listings_differs_where_they_do():
     assert _sass.diff_summaries(a, a) == []
 
 
+def test_a_summary_without_ptx_has_no_ptx_mmas_to_compare():
+    # a traced export (its PTX) against the same binary without a trace (no PTX): the same code, and no "ptx ...: 2 -> 0"
+    listing = instructions("dot_bf16.sm_103.nvdisasm13")
+    ptx = "\ttcgen05.mma.cta_group::1.kind::f16 [%r1], %rd1, %rd2, %r2, %p1;\n\ttcgen05.mma.cta_group::1.kind::f16 [%r1], %rd3, %rd4, %r2, %p1;\n"
+    traced, plain = _sass.summary(listing, ptx=ptx), _sass.summary(listing)
+    assert traced["ptx_mma"] == [{"ptx": "tcgen05.mma.cta_group::1.kind::f16", "count": 2}] and "ptx_mma" not in plain
+    assert _sass.diff_summaries(traced, plain) == [] and _sass.diff_summaries(plain, traced) == []
+    assert _sass.diff_summaries(traced, _sass.summary(listing, ptx=ptx.splitlines()[0] + "\n")) == ["ptx tcgen05.mma.cta_group::1.kind::f16: 2 -> 1"]
+
+
 # -- the ELF file and the occupancy -----------------------------------------------------------------------------------------------------------
 
 

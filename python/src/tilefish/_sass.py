@@ -682,11 +682,12 @@ def diff_summaries(a: "Mapping[str, Any]", b: "Mapping[str, Any]") -> "list[str]
     for k in sorted(set(ma) | set(mb)):
         if ma.get(k, 0) != mb.get(k, 0):
             out.append(f"mma {k}: {ma.get(k, 0)} -> {mb.get(k, 0)}")
-    pa = {e["ptx"]: e["count"] for e in a.get("ptx_mma", [])}
-    pb = {e["ptx"]: e["count"] for e in b.get("ptx_mma", [])}
-    for k in sorted(set(pa) | set(pb)):
-        if pa.get(k, 0) != pb.get(k, 0):
-            out.append(f"ptx {k}: {pa.get(k, 0)} -> {pb.get(k, 0)}")
+    if "ptx_mma" in a and "ptx_mma" in b:  # a binary without its PTX (an export without a trace) has no PTX MMAs to compare, not none
+        pa = {e["ptx"]: e["count"] for e in a["ptx_mma"]}
+        pb = {e["ptx"]: e["count"] for e in b["ptx_mma"]}
+        for k in sorted(set(pa) | set(pb)):
+            if pa.get(k, 0) != pb.get(k, 0):
+                out.append(f"ptx {k}: {pa.get(k, 0)} -> {pb.get(k, 0)}")
     oa, ob = a.get("occupancy"), b.get("occupancy")
     if oa and ob and oa.get("occupancy") != ob.get("occupancy"):
         out.append(f"occupancy (estimate): {oa['occupancy']} -> {ob['occupancy']}")
