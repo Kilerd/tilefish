@@ -9,8 +9,8 @@ each section names the release that added it.
 
 Manifest schema 3 and plan schema 1 are unchanged but for one optional entry field, `instrument`, which only the instrumented variant writes
 (below). An export whose graphs have no arithmetic in their bodies and whose kernels write no `-0.0` scalar writes the same manifest, plans and plan
-sets as 0.0.10 (checked: every kernel and plan of the test suite and the Rust and C++ gates but those below, and the three pilot plan sets
-re-exported); a graph with arithmetic in its body is planned by fusion version 2 now (Breaking). An export takes less memory and time, every byte
+sets as 0.0.10 (checked: every kernel and plan of the test suite and the Rust and C++ gates but those below, and the plan sets of three
+ported models re-exported); a graph with arithmetic in its body is planned by fusion version 2 now (Breaking). An export takes less memory and time, every byte
 the same. The crate gains the readers and launches of the instrumented variant; the C ABI is unchanged and refuses an instrumented export.
 
 ### Breaking
