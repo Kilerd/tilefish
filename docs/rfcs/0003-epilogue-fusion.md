@@ -1,0 +1,845 @@
+# RFC 0003: Epilogue and prologue fusion
+
+* **Status:** draft for review, 2026-11-16. Design and phase 0 experiments (section 6). Nothing is implemented. Section 8 lists the decisions
+  the review is asked for, each with a recommended default.
+* **Scope:** fusion across a call. An *epilogue* is the elementwise or row work that reads a GEMM's or a convolution's result; a *prologue* makes one
+  of its operands. The RFC touches the planner and the fusion pass (`tilefish._plan`, `tilefish._fusion`), the library ops (`cublaslt.*`,
+  `cudnn.conv_fwd`), externs, a new family of generated GEMM and convolution ops and the advisor. Only library epilogues touch the manifest and the
+  hosts.
+* **Baseline:** tilefish 0.0.10 / crate 0.0.8, which include the fusion advisor (`docs/advise.md`).
+* **Relation to RFC 0001.** RFC 0001 (plan fusion) fuses graph-body arithmetic between calls and promises that fusion never changes bytes. Its
+  section 7 sketched three routes into a call, and its section 11.2 deferred library epilogues. This RFC replaces those sketches. It is a separate
+  document, not a section of 0001, for two reasons. RFC 0001 is reviewed, and its decisions D1 to D7 rest on a contract that has exact modes only.
+  This RFC has to introduce the first contracts whose bytes are *not* those of the unfused composition, and it asks for decisions of its own. Every
+  decision of RFC 0001 stands. Where this RFC builds on a phase of 0001, it says which.
+
+## Summary
+
+The fusion advisor measured three models already ported to tilefish on a B300 MIG slice: two transformer stacks and a convolutional encoder and
+decoder. Nearly every byte that could be fused sits next to a GEMM or a convolution:
+
+* the candidates that need a GEMM or convolution epilogue add up to 3.6 to 13.3% of the measured plan time per plan, and 6 to 13% on every plan but
+  one, which an attention kernel dominates;
+* the prologues of the convolutional model add up to another 10.9%, overlapping the epilogues;
+* the candidates that phases 1 and 2 of RFC 0001 can reach add up to less than 0.2%.
+
+So the fusion that pays is fusion into the compute op.
+
+That fusion collides with tilefish's promise. Today a pinned cuBLASLt or cuDNN op writes the bytes that a reference stack writes (the same library
+version and the same algorithm), and the kernel after it reads those *rounded* bytes. A fused epilogue sees the f32 accumulator instead. If it uses
+the accumulator, one rounding disappears and the bytes change: X1 measured that a bias added to the accumulator differs from a bias added to the
+rounded output on about 30% of the elements. If it rounds first, the bytes still change unless the GEMM inside the fused kernel computes the same
+bits as the library's GEMM. This RFC therefore defines three contracts and keeps them apart:
+
+* **(i) Exact.** The fused plan writes the bytes of the unfused composition, with the same GEMM bits. Four kinds of fusion keep this contract:
+  * a hook after the rounding of a kernel that is itself the reference;
+  * any prologue into a kernel that stays the same;
+  * a generated GEMM that is measured equal to the library GEMM it replaces;
+  * a library fusion that rounds where the composition rounds.
+
+  Two experiments show that the last two exist. X3 found that a plain Triton `tcgen05` GEMM writes the bits of cuBLASLt's pinned GEMM on sm_103: on
+  every shape, every one of 99 tile configurations and both postures, with special values in the operands, whenever the library's pin does not split
+  `k`. X5 found that a cuDNN 9.13 fused graph with a 16-bit intermediate equals the unfused convolution + bias (+ ReLU) bit for bit.
+* **(ii) Accumulator.** The user declares a rewrite of the program that removes the rounding of a GEMM or convolution result wherever an epilogue
+  widens that result to f32. The fused plan is then exact against the unfused composition *of the rewritten program*: fusion still changes no byte
+  by itself, the declared mode does. The result is faster and at least as accurate, and it is digested, pinned and reproduced by every host. It does
+  not have the two-kernel stack's bytes. cuBLASLt's bias, ReLU and `beta * C` epilogues were measured equal to this contract on every element.
+* **(iii) Library.** A cuBLASLt epilogue or a cuDNN fused graph writes the library's bytes under a pin: the algorithm or engine, the version, the SM
+  count and the epilogue. Where the epilogue's arithmetic can be written down, export measures it equal to (ii). Otherwise the bytes are defined by
+  the binary: cuBLASLt's GELU equals no formula tried on every element, and the best candidate matches 99.8% of them. At load, a canary checks the
+  bytes.
+
+A user who needs the bytes of an existing stack keeps contract (i), or takes (iii) with the stack's own library epilogue if the stack fuses that way.
+A new model can take (ii). Nothing changes bytes without a declaration. There are three routes:
+
+* **route (b), library epilogues**;
+* **route (c), hooks in tilefish's own kernels**: first in user externs, then in GEMM and convolution ops that tilefish generates per architecture
+  (tcgen05, wgmma, mma.sync);
+* **prologues** into the A operand.
+
+The measurements also bound the speed:
+
+* a cuBLASLt epilogue saves 9 to 48% of the time of a GEMM followed by its epilogue kernel when its pin keeps a fast algorithm. It loses time when
+  the epilogue's pin is a slower algorithm, which happened for GELU on two of five shapes;
+* a straightforward Triton GEMM takes 1.22 to 1.44 times cuBLASLt's time, and fusing a naive epilogue into it was slower than leaving the epilogue
+  unfused. Generated GEMMs need kernel work (experiment X8) before they pay.
+
+Section 7 therefore proposes hooks on externs and cuBLASLt epilogues first, and generated GEMMs after X8. The advisor then reports each epilogue
+candidate with the routes and contracts that can take it.
+
+## Contents
+
+0. Background: what exists
+1. Use cases
+2. The numerics problem and the three contracts
+3. Routes
+4. Surface syntax
+5. Interaction with plans, reports, the advisor, SASS assertions, traces, hosts and schemas
+6. Experiments: phase 0 results and the experiments still needed
+7. Staged plan, milestones and tests
+8. Open questions and recommended defaults
+9. Prior art
+
+Appendix A: a worked example.
+
+## 0. Background: what exists
+
+* **Library ops promise one rounding.** `cublaslt.gemm` computes `out = a @ b^T` with an f32 accumulator and rounds once to the output type.
+  `cublaslt.gemm_bias` adds a bias of the output type in f32 before that rounding (`CUBLASLT_EPILOGUE_BIAS`, the only epilogue tilefish uses
+  today). The algorithm is pinned (its 64 bytes, the cuBLASLt version and the SM count). The pin is vetted against what cuBLASLt itself encodes and
+  checked by `cublasLtMatmulAlgoCheck` at load. It is chosen as tilefish or torch would choose it, or imported from another engine (`AlgoTable`). A
+  GEMM with a bias gets no split-K unless it opts in, because a split-K with the bias epilogue was measured to round twice (`docs/numerics.md`,
+  section 4). `cudnn.conv_fwd` has no bias. Its engine configuration is pinned per cuDNN version and SM count and checked at load by a canary
+  (`docs/manifest-schema-3.md`, section 9.4).
+* **Plan fusion stops at a call.** Phase 1 of RFC 0001 fuses the arithmetic of a graph body into generated regions. Each region is byte-identical to
+  the unfused composition `U(P)`, and every export verifies it (D6). A call to a library op, an extern or a kernel is a region boundary. The
+  arithmetic after a GEMM runs as route (a) of 0001 section 7: a generated kernel that reads the GEMM's stored, rounded result.
+* **Ports already contain hand-fused compute kernels.** A port of a hand-fused engine reproduces the engine's kernels byte for byte. Some of those
+  kernels are convolutions with a fused activation epilogue, written by hand as Gluon externs (`tcgen05` on sm_100 and sm_103, `mma.sync` on
+  sm_120) that follow the original kernel's order of accumulation and its epilogue. To tilefish such an epilogue is just part of an extern. Route (c)
+  below makes the same thing a feature of the planner.
+* **The advisor sees the gap.** `tilefish-explain --advise` lists every candidate whose latest blocker is `epilogue-library` or `prologue-library` as
+  future work (`docs/advise.md`, section 4). It lists every residual stream between two norms as `library-in-the-middle`. On the three ported models
+  it ranks those candidates first by measured time. The largest single patterns are:
+  * a GEMM followed by col2im, overlap-add and a periodic activation: 0.1 to 1.2 ms per instance, at short and long buckets;
+  * a convolution followed by a bias and a periodic activation: 0.2 to 0.3 ms each;
+  * a residual add and a norm after the output projection of every transformer layer;
+  * gated activations;
+  * a per-head norm with rotary embeddings after the QKV projection.
+
+## 1. Use cases
+
+This section lists what a model needs between the GEMMs and convolutions it pins. Two columns of the table need a definition:
+
+* **Tile-local** says whether one output tile of the GEMM (`BM` rows by `BN` columns) has everything its epilogue needs. That decides how hard
+  route (c) is.
+* **Library** says whether a library epilogue exists for the pattern.
+
+| use case | pattern (graph-body sketch) | tile-local? | library | notes |
+|---|---|---|---|---|
+| bias + activation | `act(y.to(f32) + b.to(f32)).to(bf16)`, where `act` is GELU (erf or tanh), SiLU or ReLU | yes (a per-column vector) | cuBLASLt `BIAS`, `RELU_BIAS`, `GELU_BIAS` (tanh GELU only); cuDNN fused graphs for convolutions | the most common epilogue |
+| gated activation | `g, u = gemm(x, w).split(F, -1)`; `(silu(g.to(f32)) * u.to(f32)).to(bf16)` | no: column `j` needs column `F + j` | none | needs a tile of `g` and the matching tile of `u`: two accumulators per program, or the weight's rows interleaved |
+| periodic activation | `s = sin(a * h)`; `h + s * s / a`, with `h = y + b` and a per-channel `a` | yes | a cuDNN pointwise chain for convolutions (X5); nothing in cuBLASLt | the convolutional model's largest pattern |
+| residual add (+ norm), with the residual as a side output | `h = y + r` (stored: the residual stream); `n = rmsnorm(h, w)` | the add: yes; the norm: only when a tile holds whole rows (`BN >= N`) | cuBLASLt `beta * C` for the add; no library norm | the norm's row reduction crosses tiles for hidden sizes larger than a tile (3.2.3) |
+| convolution + bias + activation | `act(conv(x, w) + b)` | yes (implicit GEMM) | cuDNN fused graphs (X5) | the convolution itself is an extern or `cudnn.conv_fwd` |
+| transposed convolution as GEMM + col2im, then overlap-add + bias + activation | `cols = gemm(x, w)`; `y = col2im(cols)`; `act(y + b)` | no: an output sample sums `kernel / stride` rows of `cols` | none | needs a halo of `kernel / stride - 1` rows per tile, or a different algorithm (3.2.3) |
+| per-head norm + rotary embedding | `q, k, v = qkv(x).split(...)`; per head `rope(rmsnorm(q_h))`, and the same for `k` | yes, when `BN` is a multiple of the head size and no tile straddles `q`, `k` and `v` | none | needs row-local movement (RFC 0001 phase 3) and segmented reductions (phase 4) inside a tile, and strided stores into `q`, `k`, `v` |
+| norm into the next GEMM (a prologue) | `a = (x * rstd[:, None] * w).to(bf16)`; `gemm(a, W)` | an A-operand transform; `rstd` is a stored per-row value | none | recomputed for every column tile of the GEMM |
+| dequantisation prologue | `w = (q.to(f32) * scale).to(bf16)`, with a per-channel or per-group `scale` | yes | cuBLASLt FP8 per-tensor and block scales only | exact only while the GEMM multiplies the dequantised operand |
+| quantisation epilogue | `amax` per row or per 32-element block; `q = (y / scale).to(e4m3)` | per block of 32 columns: yes; per row: as the norm | cuBLASLt FP8 output with `D_SCALE` and `AMAX_D` (delayed scaling) | MX block scales are tile-local; they need RFC 0001 phase 4 segmented reductions |
+
+**Non-goals.**
+
+* No fusion of two compute ops into one kernel (a chain of GEMMs, attention).
+* No algebraic rewrite in an exact mode. Two examples are moving a per-row scale from the A operand to the output, and folding a norm's weight into
+  the next GEMM's weight. Each changes bytes, and the rule of RFC 0001 against algebraic simplification holds. A rewrite like this that is worth
+  having becomes a mode of its own, in a later RFC.
+* No autotuning that changes bytes. A choice between routes that give different bytes is never made by timing (section 5).
+
+## 2. The numerics problem and the three contracts
+
+### 2.1 What byte identity rests on today
+
+Write the GEMM step as `y = ρ_T(acc_π(a, b) [+ bias])`:
+
+* `π` is the pinned library configuration: the algorithm, the library version and the SM count;
+* `acc_π` is the f32 value that its kernel holds before the final conversion;
+* `ρ_T` is the rounding to the declared output type `T`.
+
+The epilogue is a region `R` of the graph body (RFC 0001), and `z = R(y, s)` for the region's other inputs `s`. A port is byte-identical to its
+reference stack for two reasons. The stack runs the same `π` (the same cuBLASLt version and an imported algorithm), so it writes the same `y`. And
+the region reproduces the stack's epilogue kernel under RFC 0001's contract.
+
+### 2.2 What a fused epilogue changes
+
+Three things can change, and each route changes a different subset of them:
+
+1. **The rounding between the GEMM and the epilogue.** A fused epilogue that reads the accumulator computes `ρ(f(acc))`, where the stack computes
+   `ρ(f(ρ_T(acc)))`. Even `f(x) = x + b` rounds twice in the stack and once fused. X1 measured how often the results differ, with bf16 and f16
+   outputs alike:
+   * a bias add: 30% of elements;
+   * a residual add: 29%;
+   * a bias add and ReLU: 15%;
+   * a bias add and tanh GELU: 31%.
+
+   Only ReLU without a bias is unaffected, because it commutes with the rounding.
+2. **The GEMM itself.** If the fused kernel is not the library's kernel, `acc` is another kernel's accumulator, with another order for the sum over
+   `k`. The order can differ in the MMA instruction's own `k` step, the tile's `k` loop, split-K or stream-K reductions, or two-CTA MMAs. An epilogue
+   that rounds first, `ρ(f(ρ_T(acc')))`, therefore equals the stack's result only where `acc' == acc_π` bit for bit. On sm_103, X3 found
+   `acc' == acc_π` whenever the library's kernel does not split `k` (section 6). It is a measurement on one architecture, not a property that holds
+   in general.
+3. **The epilogue's own arithmetic.** A library epilogue computes its activation by its own formula, and it adds its operands in its own order:
+   * cuBLASLt's GELU is a tanh approximation whose instruction sequence is not documented (X2);
+   * cuBLASLt adds `beta * C` before the bias (X1).
+
+| route | rounding removed (1) | GEMM changed (2) | epilogue arithmetic changed (3) |
+|---|---|---|---|
+| (a) a generated kernel after the call (today) | no | no | no (RFC 0001 regions are exact) |
+| (b) a cuBLASLt epilogue | yes: every cuBLASLt epilogue acts before the conversion | no under 12.8.4: another algorithm, but X1 found the same accumulator; sometimes under 13.1.0 (X6) | only where the epilogue cannot be written down exactly (GELU) |
+| (b) a cuDNN fused graph with a 16-bit intermediate | no (X5, cuDNN 9.13) | no (X5) | where its pointwise ops are not the region's (GELU, `sin`) |
+| (c) a hook after the rounding of an extern that is the reference | no | no: same source, verified | no: the region's code |
+| (c) a hook on the accumulator | yes | no | no |
+| (c) a generated GEMM that replaces a library GEMM | either | not where the library does not split `k` (X3, sm_103); measured per bucket | no |
+| a prologue into a kernel that stays the same | no: the operand bytes are the region's output | no | no |
+
+### 2.3 The contracts
+
+Notation:
+
+* `P` is the declared program of the graph body (RFC 0001, section 5.1);
+* `U(P)` is its unfused composition: every region alone, and every intermediate stored in its declared type;
+* `F(P)` is the fused plan.
+
+"Exact" means byte for byte on every output, `InOut` and carried buffer, for every input bit pattern, which is RFC 0001's claim (section 5.2).
+
+**(i) Exact: `F(P) == U(P)`, with the reference GEMM.** The reference GEMM is whatever `U(P)` calls: the pinned library configuration, or an
+extern. The fused plan must compute the GEMM's rounded result `y` bit for bit and then apply `R` to it. There are five ways to do that:
+
+* **(i-a) The default route**: a region after the call. This is what happens today, and it saves no time.
+* **(i-b) A hook after the rounding of a kernel that is the reference.** This applies when the GEMM or convolution is an extern (a user's Triton or
+  Gluon kernel) or a tilefish-generated op, and `U(P)` calls that same kernel. The hook is applied to the value the kernel would store, after its
+  rounding, so the kernel's arithmetic stays as it is:
+  * the main loop's source is unchanged;
+  * the hook's arithmetic is the region's context-free code (RFC 0001 obligations O2 and O3, and hazards H1, H8 and H9).
+
+  This is exact by construction, and the export-time verification (D6) checks it.
+* **(i-c) Any prologue into a kernel that stays the same.** A prologue computes, with the region's code, the operand tile that the kernel would have
+  read from memory. So the kernel multiplies the same bytes. The prologue is repeated for every column tile, which is exact: it is recomputation of
+  a context-free region.
+* **(i-d) A replacement GEMM measured equal.** A generated GEMM `κ` replaces the library's `π` only at the buckets where `κ`'s output equals `π`'s.
+  This cannot be proven, because the library has no IR and its kernels are not documented. It can be measured. A GEMM's order of operations does
+  not depend on the data, so two kernels that sum in different orders differ on random inputs with near certainty. Equality on seeded random and
+  special-value inputs at a bucket is therefore strong evidence that the order is the same. The equality holds per shape, library version, pin and
+  toolchain, and it is *measured-exact*, the status that E4 of RFC 0001 gave the bias epilogue.
+
+  X3 measured that it holds far more often than expected. On sm_103 a plain Triton `tcgen05` GEMM equals cuBLASLt's pin on every shape measured,
+  with every tile configuration, with special values in the operands, and under cuBLASLt 12.8.4 and 13.1.0. It fails only where the library's pin
+  splits `k`: cuBLASLt 13.1.0 does that for 32-row problems. sm_120 and sm_90 are not measured yet (X7).
+* **(i-e) A library fusion that rounds where the composition rounds.** cuBLASLt has none: every cuBLASLt epilogue acts on the f32 value before the
+  conversion (the header says so, and X1 measures it). ReLU without a bias is the one exception, because it commutes with the rounding. cuDNN does
+  have such a fusion. In a cuDNN 9.13 fused graph whose convolution output is a virtual tensor typed f16, convolution + bias and convolution + bias +
+  ReLU equal the standalone convolution followed by the epilogue bit for bit (X5).
+
+**(ii) Accumulator: `F(P) == U(R_acc(P))`.** `R_acc` is a declared rewrite of the program. Like the rewrites of RFC 0001 section 5.4, it is defined
+on the IR before grouping. It applies to a call whose op declares an f32 form: a library GEMM or convolution, an extern with an accumulator hook, or
+a generated op.
+
+* Every widening `y.to(f32)` of the call's result `y` is replaced by the f32 result of the same call: `acc`, before the rounding.
+* A consumer that reads `y` in its declared type keeps reading `ρ_T(acc)`.
+* When `y` is also returned, tapped or read by another call, it is still stored, rounded.
+
+The rewritten program has one rounding fewer on every such path. Then:
+
+* the fused plan is exact against the unfused composition of the rewritten program. In that composition the call writes its f32 result (the same
+  kernel configuration with an f32 output) and the region reads it. Fusion therefore still changes no byte by itself, as RFC 0001 promises; choosing
+  the mode does. Export verifies `F == U(R_acc(P))` as D6 does;
+* the bytes are those of the kernel (`κ`, `π` or the extern) and of the region's declared numerics. They are deterministic, digested, pinned by the
+  plan digest, and reproduced by `jit`, `replay`, both hosts and CUDA graphs;
+* they are not those of `U(P)`, nor of any stack that rounds between the GEMM and its epilogue;
+* they are at least as accurate, with one rounding fewer on the same arithmetic;
+* when no hook or library epilogue can take the region, `U(R_acc(P))` is what runs: the GEMM writes f32 and the region reads it, which is slower
+  than `U(P)`. The planner reports it (section 5) instead of silently keeping the rounding, so that a plan's numerics never depend on whether a
+  fusion happened. X1 confirms that this reference is observable for cuBLASLt: the same algorithm configuration, re-encoded with an f32 `D`, is
+  accepted by cuBLASLt, and rounding its output gives the 16-bit output bit for bit, in every run of both postures. The GELU algorithms are the
+  exception: their configuration cannot be encoded with an f32 `D` (3.1.1).
+
+**(iii) Library: bytes defined by the library under a pin.** A cuBLASLt epilogue or a cuDNN fused graph computes `L_{π,e}(a, b, s)` for the pin
+`π` and the epilogue `e` with its attributes (the bias type, `beta`, the auxiliary output). There are two cases:
+
+* **Measured-exact against (ii).** The epilogue's arithmetic can be written as a region: a bias add, ReLU, `beta * C` with `beta = 1`, or a
+  per-channel scale. Export runs the library epilogue and `U(R_acc(P))` on seeded and special-value inputs at every bucket and refuses a difference.
+  `U(R_acc(P))` uses the library's f32 form of the same configuration. X1 found cuBLASLt's `BIAS`, `RELU_BIAS` and `beta * C` measured-exact on every
+  element of 64 runs each. It also found an algorithm whose bias + `beta * C` is not (cuBLASLt 13.1.0, section 6.1). The verification has to be per
+  pin, never per epilogue.
+* **Binary-defined** (RFC 0001, section 11.1). The arithmetic cannot be written down exactly, as for cuBLASLt's GELU (X2). The bytes are the
+  binary's: deterministic and pinned. Export records their distance from `U(R_acc(P))` and refuses a distance above a declared tolerance. The fusion
+  report marks the region.
+
+In both cases the cuBLASLt version and the SM count are checked at load as today. A canary tells two builds of one version apart: the digest of the
+epilogue's output on seeded operands, as cuDNN entries have. A plan that uses the same library epilogue with the same pin as an existing stack is
+byte-identical to that stack. Contract (iii) is how a port matches an engine that itself fuses through cuBLASLt.
+
+### 2.4 Who takes which contract
+
+| situation | contract | routes |
+|---|---|---|
+| a port that must match a stack that does not fuse its epilogues | (i) | (a); (i-b) hooks on its own externs; (i-c) prologues; (i-d) a generated GEMM where measured equal; (i-e) cuDNN graphs with a 16-bit intermediate |
+| a port of a stack that fuses through cuBLASLt or cuDNN | (iii), with the stack's pins | (b) |
+| a port of a stack that fuses in its own kernels (CUTLASS) | (i) against that stack | an extern that reproduces the stack's kernel and epilogue, as ports do now |
+| a new model, or a port accepted by tolerance against its original model | (ii), or (iii) | (c) on the accumulator, (b) |
+
+Nothing changes bytes without a declaration (section 4):
+
+* the default stays exact;
+* a mode is part of what the plan is derived from, so a graph whose mode changed is refused as stale;
+* the fusion report lists every rounding point that a mode removed.
+
+A user who needs the bytes of a stack and wants the speed has two choices. The speed can come from routes that keep the bytes, which (i-d) and (i-e)
+make larger than expected. Or the user accepts that the bytes are a new reference: validated against the original model by tolerance, and from then
+on pinned and reproduced exactly, like any other plan.
+
+### 2.5 What does not change
+
+* Pins and digests.
+* `jit == replay`, and the Rust and C++ hosts against Python.
+* CUDA graph capture.
+* The plan's arena and its order.
+* Equality per architecture stays per architecture: an epilogue on `tcgen05` and the same epilogue on `mma.sync` are two binaries with two pins.
+* RFC 0001's contract for the region itself (no contraction unless declared, every narrowing cast in inline PTX, context-free code) applies
+  unchanged to the code that a hook inlines.
+
+## 3. Routes
+
+### 3.1 Route (b): library epilogues
+
+#### 3.1.1 cuBLASLt
+
+The table lists what cuBLASLt offers for f16 and bf16 operands with an f32 accumulator. "Exact" in the X1 column means equal to contract (ii) on
+every element, special values included.
+
+| epilogue | arithmetic | side output | X1 (sm_103, cuBLASLt 12.8.4, 64 runs each) |
+|---|---|---|---|
+| `BIAS` | `acc + bias` (a bias of the output type), one rounding | none | exact |
+| `RELU` | `max(acc, 0)` | `RELU_AUX`: a bit mask | exact, and also equal to contract (i): ReLU commutes with the rounding |
+| `RELU_BIAS` | `max(acc + bias, 0)` | `RELU_AUX_BIAS`: a bit mask | exact |
+| `GELU`, `GELU_BIAS` | tanh-approximated GELU of `acc [+ bias]` | `GELU_AUX[_BIAS]`: the pre-activation, rounded | binary-defined: differs from torch's tanh GELU of the same accumulator on 0.1 to 0.2% (bf16) and 0.8 to 1.1% (f16) of elements, by up to 16 ULP (f16); the auxiliary output is exactly `ρ(acc + b)` |
+| `beta * C` (`beta = 1`) | `acc + C`, one rounding | none | exact |
+| `BIAS` with `beta * C` | `(acc + C) + bias`, one rounding | none | exact in that order on 12.8.4; one algorithm of 13.1.0 is not (6.1) |
+| per-channel `alpha` vector | `alpha[n] * acc` (`POINTER_MODE_ALPHA_DEVICE_VECTOR_BETA_HOST`) | none | not measured |
+| FP8 scales, `AMAX_D` | per-tensor and block scales, an absolute maximum | `amax` | not measured |
+
+What cuBLASLt cannot do:
+
+* SiLU, erf GELU, periodic activations, gated activations, norms, rotary embeddings or overlap-add;
+* a bias of another type than the output, so a graph whose bias is f32 for a bf16 output does not match;
+* the per-row (token) scale that a norm prologue would need: in tilefish's row-major layout, cuBLASLt's alpha vector runs along `N`, not `M`.
+
+* **Pinning.** The epilogue is part of the heuristic query and of `cublasLtMatmulAlgoCheck`, so the pin is chosen for the epilogue. The GELU
+  epilogues got another algorithm than the plain GEMM on every shape (ids 70, 71 and 21 instead of 66). Everything else stays as today: the 64-byte
+  algorithm re-encoded from its configuration, the version, the SM count, the postures and imported tables, and the vetting of the bytes. The
+  no-split-K rule of a GEMM with a bias extends to every epilogue but `DEFAULT`, unless the declaration opts in.
+* **Verification at export**, per bucket and per pin, on seeded and special-value inputs. A measured-exact epilogue is checked against
+  `U(R_acc(P))`, computed with the library's f32 form of the same configuration. A binary-defined one is checked against the same reference, within
+  its declared tolerance. An algorithm encodes its output type, so the f32 form is the same configuration re-encoded with an f32 `D`. That f32 form
+  cannot be encoded for the GELU algorithms. X1 then used the f32 output of the plain GEMM's pin, whose accumulator was the same in every run, as the
+  auxiliary outputs show. Q6 (section 8) recommends making that the rule for such algorithms.
+* **At load**: the version and SM count checks as today, `cublasLtMatmulAlgoCheck` with the epilogue's descriptor, and a canary. The canary is the
+  digest of `D` (and of the auxiliary output) for operands made on the device from a seed, by the PTX module that cuDNN canaries use
+  (`tilefish._canary`). It is optional per entry and written by default for epilogue entries.
+* **Speed is not a given.** On three of five shapes `GELU_BIAS` saved 22 to 48% over the plain GEMM followed by a generated bias + GELU kernel. On two
+  shapes its pin was a slower algorithm and lost 9 to 31% (X4). The library epilogue changes the bytes, so the planner cannot choose it by timing.
+  The advisor reports the measured times, and the declaration chooses.
+* **Declared, or rewritten.** A library epilogue can be used in two ways:
+  * as a library op declared with the epilogue (`impl="cublaslt.matmul", epilogue="gelu_bias"`). That is an ordinary call with the library's
+    numerics, as `gemm_bias` is today;
+  * as a rewrite of graph arithmetic into an epilogue. The planner does it only under `epilogues="library"` (section 4), only for the patterns of
+    the table, and only where verification passes. Otherwise it falls back to route (a).
+
+#### 3.1.2 cuDNN fused graphs
+
+cuDNN's backend graphs fuse a convolution with pointwise operations into one engine: a bias add, GELU, SiLU (through `SWISH`), `SIN`, a multiply or
+an add. Most of these engines are runtime-fusion engines, which compile a kernel with NVRTC when the plan is built. They cover convolution + bias +
+periodic activation, which cuBLASLt cannot. X5 (sm_103, f16, 1-D convolutions with 7 taps) measured the following:
+
+* **cuDNN 9.10.2**, the version tilefish pins today, with NVRTC 12.8 or 12.9: only convolution + bias and convolution + bias + ReLU with an f32
+  intermediate have engines, and those engines are precompiled. Every runtime-fusion engine fails to compile on sm_103: GELU, the periodic
+  activation, any 16-bit intermediate, an f32 output.
+* **cuDNN 9.13.0** with NVRTC 13.0: every graph builds.
+  * With an f32 intermediate, bias and bias + ReLU differ from the rounded composition on 31% and 15.5% of elements (contract (ii)-like).
+  * With the convolution's virtual output typed f16, the fused graph rounds there. Convolution + bias and convolution + bias + ReLU equal the
+    standalone pinned convolution followed by the epilogue, **bit for bit**, on all three shapes: contract (i).
+  * The periodic activation differs from torch's `sin` composition by 1 ULP on 0.04% of elements; tanh GELU differs on 1.1%, by up to 16 ULP.
+
+The engine configuration of a fused graph would be pinned as a convolution's is (engine index, knobs, cuDNN version, SM count) and checked by the
+canary. The costs are larger than cuBLASLt's:
+
+* the Rust host's cuDNN binding has to build the same operation graph from the manifest entry, which needs new node kinds in the entry;
+* NVRTC compiles at load, which costs start-up time and must happen before any capture;
+* a runtime-compiled kernel's bytes depend on the NVRTC that compiled it, and also on the cuDNN version, as the move from 9.10.2 to 9.13 showed. A
+  canary catches that; a version number does not.
+
+### 3.2 Route (c): epilogue and prologue hooks in tilefish's kernels
+
+#### 3.2.1 Hooks on externs
+
+An extern declares where its kernel would accept an epilogue, as RFC 0001 section 7 sketched:
+
+```python
+@tilefish.extern(gluon=conv_kernel, ...,
+                 epilogue=tilefish.hook("EPILOGUE", value="acc", out="y"),     # or value="out": after the kernel's own rounding
+                 prologue=tilefish.hook("PROLOGUE", operand="x"))
+def conv(x: Tensor[...], w: Tensor[...], y: Out[Tensor[...]], ...): ...
+```
+
+The kernel calls the hook in its source where it would store (`tile = EPILOGUE(acc, rows, cols, row_mask, col_mask, *EPILOGUE_ARGS)`), or after it
+loads an operand tile. Without a fusion the hook is the identity and the extern compiles as before. Its digest is unchanged too, because the hook
+parameter defaults to an identity function that tilefish provides. With a fusion, the planner passes a generated `@triton.jit` (or `@gluon.jit`)
+function, which `tilefish.lower` makes from the region, and the region's other inputs become extra arguments of the step:
+
+* **The value.** `value="acc"` passes the f32 accumulator tile (contract (ii)). `value="out"` passes the tile after the kernel's rounding to its
+  output type (contract (i)). An extern that can offer both declares both.
+* **What the hook may read**: the tile, its row and column indices, side inputs per row, per column and per element (strided, through the existing
+  `Strided[...]` and `StrideOf` machinery), and device scalars.
+* **What the hook may write**: the main output, which it returns to the kernel, and side outputs, which it stores itself, each per element of the
+  tile. The kernel keeps its own store path (TMA or pointers) for the main output. An example of a side output is the residual stream of an add +
+  norm.
+* **Gluon.** A Gluon kernel holds the accumulator in tensor memory and loads it into registers in a layout of its choice. The generated hook takes
+  that layout as a `constexpr` and builds its index vectors in the matching slice layouts. A Gluon kernel that splits its epilogue into sub-tiles
+  calls the hook once per sub-tile.
+* **Identity.** Each pair of an extern and a region is a new op (`<extern>+<region hash>`) with its own entries and pins. The region's content hash
+  is in its name, as fused regions' hashes are (RFC 0001, section 4.2). If export-time verification refuses a pair, the pair falls back to route (a),
+  with the reason in the fusion report.
+
+This is the cheapest route that saves time. Ports whose convolutions are already Gluon externs get their bias + activation epilogues fused without
+writing them into the kernel by hand. When the hook takes the rounded value, the fusion is under contract (i).
+
+#### 3.2.2 Generated GEMM and convolution ops
+
+For GEMMs that are library calls today, route (c) needs a GEMM of tilefish's own. It would be a generated op, as `tilefish.contiguous` and `im2col`
+are: tilefish writes its source per architecture, and the planner fills its epilogue and prologue hooks.
+
+| arch | MMA | kernel structure |
+|---|---|---|
+| sm_100, sm_103 | `tcgen05.mma` (`kind::f16`), with the accumulator in tensor memory | Gluon (or Triton): TMA loads, a warp-specialised pipeline, a persistent data-parallel tile order (bytes independent of the SM count), epilogue sub-tiles that overlap the next tile's main loop, and two-CTA MMAs as a later option |
+| sm_120 | `mma.sync.m16n8k16` | Triton `tl.dot` or Gluon, TMA loads |
+| sm_90 | `wgmma.mma_async` | Triton `tl.dot` or Gluon |
+
+* **Numerics.**
+  * The accumulation is in f32.
+  * There is no split-K and no stream-K by default. Their reduction order would depend on a split count or on the SM count, and a persistent extern
+    may only depend on the SM count when it declares it (manifest schema 3, section 4.3).
+  * TF32 is refused for f32 operands by the existing guard (`tilefish._tf32guard`). Triton has been seen to compile an IEEE f32 `tl.dot` into TF32
+    `tcgen05` MMAs.
+  * X3 measured that on sm_103 neither the tile configuration nor the kernel changes the bytes: all 99 configurations wrote the same bytes, and those
+    were cuBLASLt's whenever cuBLASLt did not split `k`. A configuration per bucket is then a speed choice, as an elementwise region's is (RFC 0001,
+    O5). This has to be measured per architecture, not assumed.
+* **Configuration per bucket** goes through the existing `by_bucket` mechanism: tile sizes, stages, warps, CTAs and clusters. It is chosen at export
+  by a fixed rule or read from a recorded table (like `AlgoTable`), and never autotuned silently. Every binary is pinned like any Triton entry.
+* **SASS assertions.** The generator declares assertions on its own kernels: the architecture's MMA (`tcgen05.mma kind::f16`, `HGMMA` or
+  `HMMA.16816.F32`), `no_tf32` and `no_spills`. A new structural assertion would make "the hook did not change the GEMM" visible at build: the MMA
+  instruction sequence of a hooked binary equals the unhooked binary's (opcodes, shapes, kinds and accumulate flags, in order). It is a necessary
+  condition, not a proof, and the byte verification stays the guard.
+* **Choice of implementation.** The GEMM's declaration says which implementation it is (`impl="cublaslt.gemm"` or `impl="tilefish.gemm"`). The
+  planner never swaps a library GEMM for a generated one on its own. Contract (i-d) is an explicit opt-in (Q4): a generated GEMM declared to equal
+  the library pin it replaces. Export verifies that at every bucket and keeps the library GEMM, with route (a), at the buckets where it does not hold.
+* **The risk is speed.** A generated GEMM that is slower than the pinned library GEMM it replaces can cost more than the epilogue saves:
+  * X3 measured a straightforward Triton `tcgen05` GEMM, the best of 99 configurations, at 1.22 to 1.44 times cuBLASLt's time on five shapes of a
+    30-SM slice;
+  * X4 measured a naive epilogue in that kernel, non-warp-specialised, with its side inputs in the accumulator's layout. It was slower than the
+    library GEMM followed by a separate epilogue kernel on every shape.
+
+  Route (c) with a generated GEMM is worth it where `saving > (r - 1) * T_gemm` for the measured ratio `r`. Getting there needs the kernel structure
+  of the table above (X8).
+
+#### 3.2.3 What an epilogue tile can compute
+
+* **Lane-local work and per-row or per-column inputs** (bias, activations, residual add, dequantisation scales, casts): any tile shape.
+* **Segments inside a tile** (a per-head norm, MX block scales over 32 columns, rotary pairs within a head). The tile's columns must hold whole
+  segments: `BN` is a multiple of the segment, and no tile straddles a boundary between `q`, `k` and `v`. The reduction needs an order, because an
+  unordered reduction runs alone (RFC 0001, D2). So this waits for ordered segmented reductions (0001 phase 4) and row-local movement (phase 3).
+* **Whole rows** (a norm over the hidden size, a per-row quantisation scale). A tile holds a whole row only when `N <= BN`, which `tcgen05` allows up
+  to 256 to 512 columns (its tensor memory holds 128 x 512 f32 values per SM). Larger rows have to be split:
+  * the epilogue stores the side output and a partial sum per tile (`[M, N / BN]`, an ordered sum over the tile's columns);
+  * the next GEMM's prologue, or a small kernel, finishes the norm by summing the partials in tile order.
+
+  That is exact against `U(P)` only when the region declares that very order (`tilefish.sum(order=...)` over tiles of `BN`). A graph can declare it,
+  because tilefish's orders are explicit. The norm's rounding of `h` itself follows contract (i) or (ii), as above.
+* **Halos** (overlap-add after a transposed convolution computed as GEMM + col2im). An output sample sums `kernel / stride` rows of the GEMM's result.
+  A tile that recomputes `kernel / stride - 1` extra rows completes its outputs without atomics; the recomputation is that fraction of the GEMM. The
+  tile adds the contributions in col2im's order, then applies the bias and the activation. That is exact under (ii) against `U(R_acc(P))` with the
+  same order. A polyphase direct convolution would instead fold the overlap-add into the `k` loop: another summation order, so another algorithm,
+  outside these contracts.
+
+#### 3.2.4 Prologues
+
+A prologue computes an operand tile instead of loading it: a norm's `(x * rstd * w).to(bf16)`, or a dequantisation `(q.to(f32) * scale).to(bf16)`.
+With `tcgen05` and `wgmma` the operand goes from global memory to shared memory by TMA, and the MMA reads shared memory directly. A transform
+therefore needs one of two things:
+
+* a round trip through registers on warps of its own: load the tile, transform it, store it back and fence;
+* an MMA that reads the operand from registers (`mma.sync`, `wgmma`) or from tensor memory (`tcgen05`).
+
+The work is repeated for every column tile, `N / BN` times per element. At `BN = 256` that is about 0.6% of the MMA's operations, but on CUDA cores,
+so it has to overlap with the MMAs.
+
+The numerics are the easy part. The operand bytes are the region's, so a prologue keeps contract (i) whenever the kernel stays the same (i-c), and,
+on sm_103, X3 suggests a generated kernel can be the library's bits. Library GEMMs take no prologue (FP8 scale factors aside), so a prologue into a
+library GEMM means a generated GEMM, with route (c)'s speed risk.
+
+### 3.3 What each route is worth and costs
+
+| route | saves | speed risk | covers | engineering cost |
+|---|---|---|---|---|
+| (a) a generated kernel after the call | nothing (today) | none | everything | done |
+| (b) a cuBLASLt epilogue | the round trip of `y` and one launch, while the GEMM stays the library's: 9 to 48% of GEMM + epilogue on the measured shapes | the epilogue's pin may be a slower algorithm (GELU: slower than unfused on 2 of 5 shapes) | bias, ReLU, tanh GELU, residual add, per-channel scale, FP8 | small to medium: binding, a new library impl in both hosts, verification, canary |
+| (b) a cuDNN fused graph | the same, for convolutions | engine choice, NVRTC at load; needs cuDNN 9.13+ on sm_103 | conv + bias + pointwise chains, contract (i) with a 16-bit intermediate | medium to large: graph building in both hosts, runtime compilation |
+| (c) a hook on an extern | the round trip and one launch | none: the kernel is the user's | whatever the extern is | medium: hook ABI, planner, generating the hook, verification |
+| (c) a generated GEMM or convolution | the round trip and one launch, plus patterns no library has, with contract (i) where measured equal | `r` of 1.22 to 1.44 for a straightforward Triton GEMM; a naive fused epilogue loses | everything tile-local | large: a kernel family per architecture, configurations per bucket, performance parity work |
+| prologue | the round trip of the operand | the transform must overlap the MMAs | norm, dequantisation | large (part of the generated GEMM) |
+
+The advisor's estimates rank the patterns (section 0):
+
+* The convolutional model's GEMM and convolution epilogues, with periodic activations and overlap-add, have the largest absolute savings. cuBLASLt
+  does not cover them; cuDNN fused graphs (for convolutions, cuDNN 9.13) and route (c) do.
+* The transformer models' add + norm, gated and GELU epilogues are partly covered by cuBLASLt (bias + GELU, the residual add) and fully by route (c).
+
+## 4. Surface syntax
+
+A sketch; the names are open question Q8.
+
+```python
+@tilefish.graph(fusion=tilefish.fusion())                              # epilogues="exact": the default, contract (i) only
+@tilefish.graph(fusion=tilefish.fusion(epilogues="accumulator"))       # contract (ii): R_acc, hooks on the accumulator
+@tilefish.graph(fusion=tilefish.fusion(epilogues="library"))           # (ii) and (iii): library epilogues where they exist
+with tilefish.fused(epilogues="accumulator"):                          # per region, as RFC 0001's scopes
+    h = (gemm_up(x, w).to(f32) + b.to(f32))
+
+@tilefish.library("gemm_gelu", impl="cublaslt.matmul", epilogue="gelu_bias")   # a declared library epilogue: an ordinary call
+@tilefish.library("gemm", impl="tilefish.gemm", acc=f32)                       # a generated GEMM, with hooks the planner may fill
+@tilefish.library("gemm", impl="tilefish.gemm", acc=f32, equal="cublaslt")     # (i-d): must equal the cuBLASLt pin, bucket by bucket
+```
+
+* `epilogues="exact"` is the default. It fuses only what keeps `U(P)`'s bytes:
+  * hooks with `value="out"` on externs and generated ops that are the reference;
+  * prologues into kernels that stay the same;
+  * library fusions that round where `U(P)` rounds.
+
+  It is on by default, as phase 1 of RFC 0001 is (D1), because it cannot change a byte. Export verifies every such fusion.
+* `epilogues="accumulator"` applies `R_acc` and uses hooks with `value="acc"`.
+* `epilogues="library"` adds the rewrite into library epilogues.
+* `tilefish.barrier(y)` keeps `y` stored and stops any epilogue fusion of it, as in RFC 0001.
+
+## 5. Interaction with plans, reports, the advisor, SASS assertions, traces, hosts and schemas
+
+* **Plans.** A hooked extern or a generated GEMM is a `kernel` step of a generated entry, with the region's inputs as extra arguments. A library
+  epilogue is a `library` step whose arguments follow the entry's ABI (bias, auxiliary output, `C`). Plan schema 1 is unchanged.
+  * Results that are fused away get no buffer, so arenas shrink.
+  * A residual add through `beta * C` can update the residual stream in place (`D == C`, an `alias` of manifest schema 3 section 5.4).
+  * A hook may write an `InOut` or carried buffer under RFC 0001's rule 4, which allows only lane-local reads of the old version.
+* **Taps and `run_step`.** A GEMM result that is fused away has no buffer. `taps=` refuses it, with the advice to add `tilefish.barrier` or to tap
+  `U(P)` (or `U(R_acc(P))`), whose intermediates are, under the contract, the values the fused kernel computes.
+* **`reference` mode** interprets `R_acc(P)`. The call's f32 result is torch's f32 GEMM or convolution, within the library's tolerance as today.
+* **CUDA graphs.** Unchanged. cuDNN runtime-fusion engines compile at load, before any capture.
+* **The fusion report** (`<graph>.fusion.json`) gains these fields for each region fused into a call:
+  * the call and the route (`library`, `hook`, `prologue`);
+  * the hook's value (`acc` or `out`);
+  * the contract (`exact`, `accumulator`, `measured-exact`, `binary-defined`);
+  * the rounding points that `R_acc` removed;
+  * the library epilogue and its pin;
+  * the verification's result: equal, or the largest ULP distance for a binary-defined epilogue.
+
+  A requested fusion that did not happen is listed with its reason, and under `accumulator` with the f32 intermediate it costs.
+* **The advisor** turns `epilogue-library` and `prologue-library` from future work into actions. For each candidate it reports the routes that can
+  take it under the graph's declared mode, the contract each route gives, and the saving.
+  * For a generated GEMM it also reports the break-even slowdown, `saving / T_gemm`: how much slower the GEMM may be before the fusion loses. It
+    does not predict the generated GEMM's speed.
+  * A candidate that needs a mode the graph does not declare says so, for example "exact: none; accumulator: hook on the extern, 150 us".
+  * Patterns are grouped by route, so that the report says which route would unlock the most.
+  * Routes that give different bytes are never chosen by the advisor or the planner on time; the advisor's measured times inform the declaration.
+* **SASS assertions** (`tilefish.sass`). A hooked binary is judged as any build is. The generated GEMMs declare their own assertions (MMA kind,
+  `no_tf32`, `no_spills`). The MMA-sequence assertion of 3.2.2 is new.
+* **Traces** (`trace/`). A hook's generated source carries the graph body's lines (the region's `loc`s), so `tilefish-explain annotate` attributes
+  the epilogue's instructions to the graph-body lines that wrote them. In-kernel instrumentation (issue #5, section 2) can time the epilogue phase of
+  a fused kernel.
+* **Hosts and the C ABI.** Route (c) needs nothing from either host: kernel steps with pointers, TMA descriptors (`tensordesc`) and global scratch
+  already exist. Route (b) needs:
+  * the new library impl in Python (`tilefish._cublaslt`, `_library`) and in the crate (`ffi/cublaslt.rs`, `gemm.rs`, `library.rs`);
+  * the canary;
+  * in the C ABI, an additive accessor for a GEMM's epilogue and its extra tensors (a minor ABI version). The C++ gate covers it through the crate.
+
+  cuDNN fused graphs need the graph builder in both hosts.
+* **Schemas.** Route (c) changes nothing: its entries are generated `triton` entries. Route (b) is additive: a new library impl (`cublaslt.matmul`)
+  with an `epilogue` field that has more values, `aux` and `beta`, and the optional `canary`.
+  * The two existing impls stay byte for byte as they are, so every manifest that exists keeps loading.
+  * A reader that predates the new impl refuses an entry that has it.
+  * The change is documented in `docs/manifest-schema-3.md` section 9, with the Python writer, both readers and the vectors in step.
+  * The modes need no manifest field (as RFC 0001 Q8): they are in each generated source's header and in the fusion report.
+
+## 6. Experiments
+
+### 6.1 Phase 0 results (2026-11-16, sm_103)
+
+The setup for every experiment:
+
+* a B300 MIG slice: sm_103, 30 SMs;
+* torch 2.9.1, Triton 3.5.1 and ptxas 12.9;
+* cuBLASLt 12.8.4 unless stated otherwise;
+* the tilefish cuBLASLt binding, extended in the experiment scripts with the descriptor attributes of each epilogue;
+* both heuristic postures: `tilefish`, which asks for no split-K for any epilogue but `DEFAULT`, and `torch`;
+* times are medians over CUDA graphs of 20 back-to-back calls.
+
+The scripts are not part of the repository; each experiment says enough to repeat it.
+
+**X1: which cuBLASLt epilogues equal a composition.**
+
+The matrix:
+
+* 16 shapes: `M` in {32, 128, 640, 2048}, by `N x K` in {1536 x 512, 3072 x 1024, 1024 x 3072, 4096 x 4096};
+* bf16 and f16 operands and outputs;
+* both postures, so 64 runs per epilogue.
+
+The inputs: `A ~ N(0, 1)` and `B ~ N(0, 1/K)`, so that the accumulators are of order 1 and GELU sees its curved part. The bias is `N(0, 0.25)` and
+`C` is `N(0, 1)`. Both have eight special columns: `+0`, `-0`, `+inf`, `-inf`, NaN, the largest finite values of both signs, and a subnormal.
+
+Each epilogue ran with its own pin and was compared bit for bit with two references:
+
+* **(ii)**: `ρ(epi(acc))`, computed in f32 by torch, where `acc` is the f32 output of the same algorithm configuration re-encoded with an f32 `D`
+  (for the GELU algorithms, which cannot be encoded that way, the f32 output of the plain GEMM's pin);
+* **(i)**: `ρ(epi(ρ(acc)))`, where `ρ(acc)` is the 16-bit plain output of the same configuration (or of the plain pin).
+
+| epilogue | equal to (ii) | elements that differ from (i) | notes |
+|---|---|---|---|
+| `DEFAULT` | 64/64 runs | 0 | the f32 re-encoding's output, rounded, is the 16-bit output in 64/64 runs: the accumulator is observable |
+| `BIAS` | 64/64, special values included | 30.3 to 31.0% | the pin is the plain GEMM's on 14 of 16 shapes; the same bytes on the other two |
+| `RELU` | 64/64 | 0 | commutes with the rounding |
+| `RELU_BIAS` | 64/64 | 15.1 to 15.6% | |
+| `beta * C` | 64/64 | 28.9 to 29.6% | |
+| `BIAS` + `beta * C` | 64/64 as `ρ((acc + C) + b)`; as `ρ((acc + b) + C)` only 6/64 | 26.2 to 26.7% | the library's order |
+| `GELU` | 0/64: 0.11 to 0.14% of elements differ (bf16), 0.81 to 0.94% (f16), by up to 16 ULP (f16) | 26.8 to 28.6% | another algorithm than the plain GEMM's on 16/16 shapes |
+| `GELU_BIAS` | 0/64: 0.18 to 0.21% (bf16), 1.02 to 1.11% (f16) | 31.1 to 31.6% | |
+| `GELU_AUX_BIAS` | `D` as `GELU_BIAS`; the auxiliary output equals `ρ(acc + b)` in 64/64 | `D` differs from `gelu(aux)` on 28 to 30% | GELU is applied to the unrounded pre-activation; the GELU kernels' accumulator is the plain GEMM's |
+
+Every pin of X1 had a split-K of 1, so X1 says nothing about split-K with an epilogue.
+
+**X6: X1 under cuBLASLt 13.1.0** (torch 2.9.1+cu130, the same matrix). The conclusions of X1 hold, with three findings:
+
+* The `tilefish` posture now pins split-K (3 or 4, with f32 partial sums) for the plain GEMM and for `beta * C` at `M = 32` and `N x K` of
+  1024 x 3072 and 4096 x 4096. These pins remain equal to (ii), computed with the same configuration's f32 output.
+* `BIAS` + `beta * C` with algorithm 21 at 32 x 1024 x 3072 differs from both orders on 30% of elements, with both output types. The other 15 shapes
+  are exact. A library epilogue's arithmetic is a property of the pin, so verification must be per pin.
+* The GELU distances grow (up to 2.4% of elements, 47 ULP in f16). The GELU kernels' auxiliary output now differs from `ρ(acc + b)` on 1 or 2 of 16
+  shapes per group: their accumulator is no longer always the plain pin's.
+
+**X2: what cuBLASLt's GELU computes.** We ran the GELU epilogue with an f32 `D` on the plain GEMM's algorithm (shapes 640 x 3072 x 1024 and
+2048 x 4096 x 4096), so that its input is the plain GEMM's f32 output. We compared it with candidate formulas, each written as scalar PTX (`mul.rn`,
+`add.rn`, `fma.rn`, `tanh.approx.f32`) so that no compiler contraction blurs them:
+
+| candidate | elements equal |
+|---|---|
+| torch's tanh GELU | 6.8% |
+| torch's erf GELU | 2.7% |
+| the best of 64 variants (8 inner forms, 4 outer forms, 2 roundings of the constants): `0.5 x (1 + tanh.approx(k x fma(c, x^2, 1)))`, with `k = f32(sqrt(2/pi))` and `c = f32(0.044715)` | 99.80% |
+
+The remaining 0.2% of elements have `|x|` from 0.07 to 4.5 and differ by a median relative 1.7e-6, at most 2.1e-2. So cuBLASLt's GELU is
+binary-defined: close to a known formula, equal to none of those tried.
+
+**X3: a Triton GEMM against the pinned cuBLASLt GEMM.**
+
+The kernel: TMA descriptors, `tl.dot` to `tcgen05` (`kind::f16`), a grouped tile order and no split-K.
+
+The sweep: 99 configurations (`BM` 64 or 128, `BN` 64 to 256, `BK` 64 or 128, 2 to 5 stages, 4 or 8 warps, with and without a warp-specialised
+loop) on five shapes.
+
+The bytes:
+
+* Every configuration wrote the same bytes as every other (99/99 on every shape).
+* Those bytes are cuBLASLt's pin, under both postures, on every element.
+
+X3b extended the comparison to six more shapes (32 x 1024 x 3072, 32 x 4096 x 4096, 640 x 3072 x 1024 in bf16 and f16, 2048 x 4096 x 4096 in f16,
+and 100 x 1000 x 1000) and three configurations, with random operands and with special values in the operands. The special values were subnormals,
+products that underflow, rows that overflow to infinity, `+inf`, `-inf`, a NaN with a payload, and `-0`.
+
+* Under cuBLASLt 12.8.4 the outputs are equal everywhere.
+* Under 13.1.0 they are equal wherever the pin has no split-K. They differ on 0.19 to 0.20% of elements where it has one (63 of 32 768 and 259 of
+  131 072, the 32-row shapes).
+
+The GELU kernels of X1 (algorithms 70, 71 and 21) also have the plain GEMM's accumulator. Taken together: on sm_103 the bytes of these `kind::f16`
+GEMMs depend on the summation order over `k`, and not on the tile, the algorithm or the library, as long as nobody splits `k`. That is a
+measurement on 11 combinations of shape and type and two cuBLASLt versions; sm_120 and sm_90 are not measured.
+
+The speed, in microseconds, alongside X4 (`r` = Triton / cuBLASLt):
+
+| shape `M x N x K` | cuBLASLt | Triton (best config) | `r` |
+|---|---|---|---|
+| 640 x 4096 x 1024, bf16 | 18.9 | 23.2 | 1.24 |
+| 640 x 1024 x 4096, bf16 | 15.0 | 21.4 | 1.43 |
+| 2048 x 3072 x 1024, bf16 | 39.6 | 48.3 | 1.22 |
+| 128 x 3072 x 1024, bf16 | 4.4 | 6.4 | 1.44 |
+| 8192 x 3072 x 768, f16 | 121.3 | 152.8 | 1.26 |
+
+**X4: the routes for GEMM followed by bias + tanh GELU, and GEMM followed by a residual add** (microseconds, the shapes of X3).
+
+The bias + GELU routes:
+
+* **(a)** is the pinned GEMM followed by a generated elementwise kernel;
+* **(b)** is `GELU_BIAS`;
+* **(c, acc)** is the Triton GEMM with the epilogue on the accumulator;
+* **(c, rounded)** is the same kernel with the epilogue applied after rounding to the output type.
+
+| shape | (a) | (b) | (c, acc) | (c, rounded) | residual (a) | residual: `beta * C` |
+|---|---|---|---|---|---|---|
+| 640 x 4096 x 1024 | 31.2 | 24.2 | 33.4 | 35.7 | 24.3 | 20.5 |
+| 640 x 1024 x 4096 | 18.9 | 24.8 | 29.1 | 30.2 | 17.0 | 15.5 |
+| 2048 x 3072 x 1024 | 68.4 | 40.8 | 75.6 | 82.2 | 60.2 | 44.4 |
+| 128 x 3072 x 1024 | 7.1 | 7.7 | 10.3 | 10.8 | 5.9 | 4.9 |
+| 8192 x 3072 x 768 | 231.8 | 120.2 | 239.8 | 264.6 | 206.8 | 134.8 |
+
+* **The library's residual add** (`beta * C`) beats (a) on every shape, by 9 to 35%.
+* **`GELU_BIAS`** beats (a) on three shapes, by 22 to 48%. It loses on two, where its pin is algorithm 71 and the plain GEMM's is 66.
+* **The naive Triton epilogue** loses everywhere: it is not warp-specialised, it uses `exp` and a division for `tanh`, and it loads side inputs in the
+  accumulator's register layout. A Triton residual add in that layout was 1.3 to 2.2 times slower than (a), and is not in the table.
+* **(c, rounded) equals (a) bit for bit** on all five shapes. That is contract (i) with a generated GEMM in practice, at a speed that does not pay
+  yet.
+
+**X5: cuDNN fused graphs.** The graphs: convolution + bias, + ReLU, + tanh GELU, and + a periodic activation (`h + sin(a h)^2 / a`), each with an
+f32 and with an f16 intermediate. The convolutions are 1-D with 7 taps, posed as 2-D, NHWC, f16: `N x C x L` of 1 x 256 x 4096, 1 x 512 x 2048 and
+4 x 128 x 8192, with `K = C`. We used cuDNN's Python frontend 1.32.3. Section 3.1.2 gives the results. Times were not measured: the harness did not
+capture the frontend's launches in the CUDA graph (X13).
+
+**What the results change.** Before these measurements, contract (i) for a fused epilogue looked reachable only through hooks on externs. Now:
+
+* on sm_103, a generated GEMM can be exact against the library stack wherever the library does not split `k` (i-d);
+* cuDNN 9.13 fused graphs with a 16-bit intermediate are exact for bias and ReLU (i-e);
+* cuBLASLt's bias, ReLU and residual epilogues are measured-exact against (ii);
+* the price of the generated route is the GEMM's speed, not its numerics.
+
+### 6.2 Experiments still needed
+
+| | experiment | decides | needs |
+|---|---|---|---|
+| X7 | X1, X3 and X3b on sm_120 (`mma.sync`, cuBLASLt's f16 split-K pins) and on sm_90 (`wgmma`) | whether (i-d) holds beyond sm_103 | an sm_120 and an sm_90 device |
+| X8 | a Gluon `tcgen05` GEMM: persistent, warp-specialised, epilogue sub-tiles overlapping the next tile, TMA loads of side inputs, two-CTA MMAs; against cuBLASLt on a fixed suite of shapes, with and without a bias + GELU and a residual epilogue under contracts (i) and (ii) | whether E3 is worth building (Q5) | sm_103 |
+| X9 | a generated split-K GEMM that reproduces cuBLASLt's split-K order (f32 partial sums in a workspace, reduced in a fixed order) | whether (i-d) can cover split-K pins | sm_103 |
+| X10 | a norm prologue (`x * rstd * w` into the A operand) in the X8 kernel, against a separate kernel + GEMM | E5 | sm_103 |
+| X11 | add + norm with the partial-sum split and a declared tile order; overlap-add with a halo; against their unfused plans | E4 | sm_103, sm_120 |
+| X12 | an `out` hook and an `acc` hook on a real Gluon implicit-GEMM convolution extern: the hooked binary against the unhooked one followed by the region, at every bucket; the MMA-sequence assertion | E1 | sm_103, sm_120 |
+| X13 | cuDNN fused graphs: times with the handle's stream captured, the canary's cost, NVRTC's compile time at load, and whether the bytes change with the NVRTC version | Q11 | sm_103 |
+| X14 | cuBLASLt epilogues with `alpha` vectors and FP8 scales; `GELU_AUX`; the split-K rule with epilogues (the `torch` posture) | E2's scope | sm_103, sm_120 |
+
+## 7. Staged plan, milestones and tests
+
+### 7.1 Milestones
+
+| milestone | content | done when |
+|---|---|---|
+| E0: experiments | X1 to X6 (section 6.1, done); X7 to X14 (6.2), each before the milestone that needs it | every decision of section 8 that depends on an experiment has its number |
+| E1: hooks on externs | `tilefish.hook` (`value="out"` and `"acc"`); the hook functions generated from regions (Triton and Gluon, layouts as `constexpr`); the planner's merge of a region into a hooked call (lane-local work, per-row and per-column inputs, side outputs per element, `InOut` under rule 4); `epilogues="exact"` on by default and `"accumulator"` with `R_acc`; export verification of every pair against `U(P)` or `U(R_acc(P))`, with fallback to route (a); the fusion report's new fields; the advisor's routes and contracts for extern candidates | a Triton and a Gluon GEMM or convolution extern fuse bias + GELU, bias + periodic activation, and residual add with a side output, under (i) and under (ii), byte for byte against their references at every bucket on sm_103 and sm_120; the Rust and C++ gates run the fused plans launched and captured |
+| E2: cuBLASLt epilogues | the `cublaslt.matmul` impl (bias, ReLU, GELU and their auxiliary outputs, `beta * C`), its canary, both hosts and the C ABI accessor; `epilogues="library"` for the measured-exact patterns; GELU as binary-defined with a tolerance; verification per pin | X1's matrix is a GPU test on sm_103 and sm_120 under both postures; every rewrite is verified at export; a forged canary is refused at load |
+| E3: generated GEMMs | `impl="tilefish.gemm"`: the X8 kernel for sm_100 and sm_103 with hooks, configurations per bucket, SASS assertions and the MMA-sequence assertion; `equal="cublaslt"` (i-d) with verification per bucket; then `mma.sync` for sm_120 and `wgmma` for sm_90 (after X7); convolutions by implicit GEMM on the same templates | bytes that do not depend on the configuration are a test per architecture; on a fixed suite of shapes the generated GEMM is within the ratio the review sets (Q5) of the pinned library GEMM; the advisor's break-even says where it is worth using |
+| E4: rows, segments and halos | per-head norm + rotary (with RFC 0001 phases 3 and 4 inside a tile); add + norm with a side output (whole rows, then the split over tiles with a declared order); gated activations with two accumulators; overlap-add with a halo | each use case of section 1 fused, equal to its reference under (i) or (ii), and faster than its unfused plan on sm_103 and sm_120 |
+| E5: prologues and quantisation | norm and dequantisation prologues into generated GEMMs; MX block-scale and per-row quantisation epilogues | as E4 |
+| E6: cuDNN fused graphs | if X13 confirms speed: `cudnn.conv_fwd` with a pointwise chain, a 16-bit intermediate for contract (i), cuDNN 9.13 or later on sm_103 | as E2, for convolutions |
+
+E1 needs none of the others. It serves the ported models whose convolutions are externs already. E2 is independent of E1. E3 is the large one, and
+it is the precondition of E4 and E5 for GEMMs that are library calls today.
+
+### 7.2 Tests
+
+* **Construction (no GPU).**
+  * `R_acc`, IR in and IR out: a widening of a call's result is replaced; a 16-bit consumer, a returned or tapped result, and a fan-out keep the
+    rounded value.
+  * The planner's merges and refusals: a barrier, a fan-out, a reduction across tiles, a broadcast read of an `InOut` that is being written, a call
+    between the two steps.
+  * The names and identities of pairs of an extern and a region: the same region in two graphs is one op.
+  * The hook's source equals the region's lowered source.
+  * The fusion report and the advisor's labels.
+  * The manifest vectors of the new library impl, in the Python and Rust readers.
+  * Refusals of a malformed hook declaration.
+* **Against the reference (GPU, the core).** Every fused plan is compared byte for byte with `U(P)` (contract (i)) or `U(R_acc(P))` (contract (ii)) at
+  every bucket, on sm_103 and sm_120. The inputs are seeded random values, and special values in every side input: both zeros, infinities, NaNs with
+  non-canonical payloads, subnormals. The plans are the use cases of section 1 as graphs, and random regions (RFC 0001's generator) fused into a
+  Triton and a Gluon GEMM extern.
+* **Library epilogues.**
+  * X1 as a test: each epilogue against its measured-exact reference or its tolerance, per posture, output type and pin.
+  * The canary is computed the same in both hosts.
+  * A different build, simulated by a forged digest, is refused.
+* **Generated GEMMs.**
+  * The bytes are equal across every configuration of a bucket (X3's check).
+  * `equal="cublaslt"` holds where the pin has no split-K and is refused where it has (X3b's cases).
+  * `no_tf32` holds on f32 operands.
+  * The MMA-sequence assertion holds, hooked against unhooked.
+  * The TF32 guard.
+* **Hosts.** The Rust gate and the C++ gate get fused plans of each route: launched, in CUDA graphs, with shared arenas and carried buffers. Rust
+  and C++ are compared with Python byte for byte.
+* **Speed (informative).** The advisor's estimate before fusion and the profiler's measurement after it, on synthetic models in `python/tests`. The
+  ported models are measured privately.
+
+## 8. Open questions and recommended defaults
+
+Each question has the default that would be implemented unless the review says otherwise.
+
+* **Q1. The three contracts.** Should (i) exact, (ii) accumulator and (iii) library, as defined in 2.3, be the contracts that tilefish offers for
+  fusion into a call? And does RFC 0001's principle "fusion never changes bytes by itself; a declared mode does" extend to them? That means `R_acc`
+  is defined on the IR, so a failed fusion still runs `U(R_acc(P))`. **Recommended: yes.**
+* **Q2. Defaults.** **Recommended: `epilogues="exact"` on by default.** It cannot change a byte, and every export verifies it, as with D1 and D6 of
+  RFC 0001. `"accumulator"` and `"library"` apply only when declared, per graph or per `tilefish.fused` scope.
+* **Q3. Where the accumulator mode is declared.** Per graph and per scope, as RFC 0001's knobs are, or also per call
+  (`gemm(x, w, epilogue="acc")`)? **Recommended: per graph and per scope only.** A knob at the call site would put numerics in two places.
+* **Q4. A generated GEMM that must equal the library pin it replaces (i-d).** X3 and X3b found it equal on sm_103 wherever the pin does not split
+  `k`. **Recommended: yes, as an explicit opt-in in E3** (`equal="cublaslt"`). Export verifies it at every bucket on seeded random and special-value
+  operands. At a bucket where it fails (a split-K pin), the library GEMM stays, with route (a). This makes fused epilogues exact against an existing
+  stack. It is a measured contract, not a proven one, and it is re-verified at every export and on every library version.
+* **Q5. When a generated GEMM is good enough.** **Recommended: E3 is accepted per architecture when the X8 kernel is within 1.10 times the pinned
+  cuBLASLt GEMM on a fixed suite of the shapes the ported models use.** The advisor's break-even says where a slower one still pays. Until then,
+  E1 and E2 come first, and E3 stays a research item. The straightforward Triton kernel is at 1.22 to 1.44 times.
+* **Q6. Which cuBLASLt epilogues first.** **Recommended: bias, ReLU and `beta * C`, measured-exact against (ii) and verified per pin; then GELU as
+  binary-defined**, behind `epilogues="library"`, with the canary on by default for epilogue entries. GELU's bytes may change with a cuBLASLt
+  version, like any pin's. Where the f32 form of the epilogue's own algorithm cannot be encoded (the GELU algorithms), use the plain pin's f32
+  output as the reference, and require that the auxiliary output equals `ρ(acc + b)` (X1 found it always does).
+* **Q7. The schema of library epilogues.** **Recommended: a new impl, `cublaslt.matmul`**, with an `epilogue` field (more values), `aux`, `beta` and
+  the optional `canary`. `cublaslt.gemm` and `cublaslt.gemm_bias` stay exactly as they are.
+* **Q8. Names.** **Recommended:**
+  * `tilefish.fusion(epilogues="exact" | "accumulator" | "library")`;
+  * `tilefish.hook(name, value="acc" | "out", out=...)`, and `tilefish.hook(name, operand=...)` for prologues;
+  * `impl="tilefish.gemm"` with `equal="cublaslt"`;
+  * the fusion report's `contract` values `exact`, `accumulator`, `measured-exact`, `binary-defined`.
+* **Q9. Gated activations.** Two accumulators per program (one tile of the gate and one of the up projection), or the weight's rows interleaved so
+  that one tile holds both? **Recommended: two accumulators.** There is no weight transform, and the bytes of each accumulator are the plain GEMM's.
+* **Q10. Norms over rows longer than a tile.** **Recommended: whole-row tiles first** (`N <= BN`: per-head norms, small hidden sizes). The split over
+  tiles, with a declared tile order, comes in E4, after RFC 0001 phase 2 makes ordered sums fast.
+* **Q11. cuDNN fused graphs.** X5 found them exact against the unfused composition for bias and ReLU with a 16-bit intermediate, but only with
+  cuDNN 9.13 and NVRTC 13 on sm_103. tilefish pins 9.10.2 today. **Recommended: E6 after E2 and X13.** It needs speed measured, a cuDNN 9.13
+  requirement for fused entries on sm_103, and the graph builder in both hosts.
+* **Q12. Order of work.** **Recommended: E1 (hooks on externs) and E2 (cuBLASLt epilogues) first, in parallel.** E3 (generated GEMMs) comes after X8
+  shows that a Gluon GEMM closes the gap X3 measured. E4 and E5 come after the RFC 0001 phases they need. The advisor's change (section 5) ships with
+  E1.
+
+## 9. Prior art
+
+| system | epilogue fusion | numerics |
+|---|---|---|
+| cuBLASLt | fixed epilogues (bias, ReLU, GELU, auxiliary outputs, `beta * C`, alpha vectors, FP8 scales and `amax`) chosen per call | the library's; one conversion at the end |
+| CUTLASS | epilogue visitor trees: arbitrary elementwise and row- or column-broadcast trees compiled into the GEMM | the user's C++; the accumulator is visible |
+| cuDNN graphs | a convolution or matmul plus pointwise and reduction nodes, fused at run time | the compute type of the graph, and a data type per virtual tensor |
+| XLA | a GEMM rewriter folds bias, activations and `beta * C` into cuBLASLt epilogues; Triton GEMM fusions handle the rest | no byte contract against the unfused program |
+| torch.compile / Inductor | Triton GEMM templates with fused epilogues and prologues, chosen by autotuning against the library | no byte contract; tolerance tests against eager |
+| tilefish (this RFC) | hooks in its own kernels, library epilogues where they exist, prologues | three named contracts: exact against the unfused composition, exact against a declared accumulator rewrite, or defined by the library and pinned |
+
+## Appendix A: a worked example
+
+A GEMM and its bias + GELU, planned for `M` in `{128, 640}`, with `F = 4096` and `H = 1024`:
+
+```python
+@tilefish.library("up", impl="cublaslt.gemm", acc=f32)            # or impl="tilefish.gemm", or an extern with hooks
+def up(a: Tensor[M, H, bf16], b: Tensor[F, H, bf16]) -> Tensor[M, F, bf16]: ...
+
+def gelu_tanh(h):                                                   # a plain helper traces inline
+    return 0.5 * h * (1.0 + tilefish.tanh(0.7978845608 * (h + 0.044715 * h * h * h)))
+
+@tilefish.graph(fusion=tilefish.fusion(epilogues=MODE))
+def mlp_up(x: Tensor[M, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16]):
+    y = up(x, w)
+    return gelu_tanh(y.to(f32) + bias.to(f32)).to(bf16)
+```
+
+| `MODE`, implementation of `up` | steps per bucket | what the output equals |
+|---|---|---|
+| `"exact"`, `cublaslt.gemm` | `up` (library) writes `y` in bf16; `fused_<hash>` reads `y` and `bias` and writes the output | `U(P)`: the stack's bytes |
+| `"exact"`, an extern with an `out` hook | one step: the extern with the region in its hook, after its rounding | `U(P)` with the extern as the GEMM, by construction, verified |
+| `"exact"`, `tilefish.gemm` with `equal="cublaslt"` | one step at every bucket where the generated GEMM equals the pin; route (a) elsewhere | `U(P)` with the cuBLASLt pin as the GEMM: the stack's bytes, measured per bucket |
+| `"accumulator"`, an extern with an `acc` hook, or `tilefish.gemm` | one step: the kernel with the region in its hook, on the accumulator | `U(R_acc(P))`: the kernel writing f32, then the region; one rounding fewer than `U(P)` |
+| `"accumulator"`, `cublaslt.gemm` | `up` writes f32; `fused_<hash>` reads it (the report says no route took the region) | `U(R_acc(P))`, slower than `U(P)` |
+| `"library"`, `cublaslt.gemm` | one step: `cublaslt.matmul` with `GELU_BIAS`, pinned with its canary | binary-defined: within the measured distance of `U(R_acc(P))` (X1, X2) |
+
+The library row needs the tanh form of GELU, because cuBLASLt has no erf GELU. Whether the rewrite should recognise a hand-written tanh GELU as
+`GELU_BIAS` at all is part of Q6. The epilogue is binary-defined, so the recognition is a declared equivalence, not an exact one.
+
+`R_acc(P)` here is the program in which `y.to(f32)` is replaced by the f32 result of `up`: `gelu_tanh(up_f32(x, w) + bias.to(f32)).to(bf16)`. The
+fusion report entry of the accumulator case would read:
+
+```json
+{"op": "up+fused_<hash>", "route": "hook", "value": "acc", "contract": "accumulator", "call": "up",
+ "rounding_points_removed": [{"value": "y", "dtype": "bf16", "reason": "R_acc: widened by the epilogue"}],
+ "nodes": [{"index": 1, "op": "cast"}, {"index": 2, "op": "cast"}, {"index": 3, "op": "add"}, "...", {"index": 12, "op": "cast"}],
+ "verified": {"against": "U(R_acc(P))", "buckets": ["M=128", "M=640"], "equal": true}}
+```

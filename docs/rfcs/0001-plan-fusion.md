@@ -573,6 +573,8 @@ launch it like any Triton entry; nothing in either schema is new.
 
 ## 7. Epilogue and prologue fusion into library ops and externs
 
+RFC 0003 (`docs/rfcs/0003-epilogue-fusion.md`) replaces the sketch of this section and of 11.2 and 11.3 with a design, its contracts and measurements.
+
 Elementwise work after a GEMM can run as (a) a generated kernel after it, (b) a cuBLASLt or cuDNN epilogue, or (c) an epilogue inside an
 extern's own kernel. Version 1 has route (a) only (D5); route (c) is phase 4; route (b) and prologues are future work (section 11.2).
 
@@ -699,6 +701,8 @@ a Triton reduction or with default contraction has today.
   a report entry per region; `verify` would compare against a pinned earlier export instead of `U`.
 
 ### 11.2 Library epilogues (route (b))
+
+Continued by RFC 0003, which measures these epilogues (its section 6).
 
 * **cuBLASLt epilogues** (bias, ReLU, GELU and their auxiliary-output variants, `beta * C` as a residual, per-tensor FP8 scales and an
   absolute-maximum output) are pinned as the GEMM is: the 64-byte algorithm, the cuBLASLt version, the SM count, a canary. They are exact against
