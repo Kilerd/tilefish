@@ -45,7 +45,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | kernel entry (0.0.7, crate 0.0.5) | — | an optional `persistent`: a persistent grid, the tiles cut at launch to the programs the SMs of the device (or of its partition) run (section 4.3) |
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.cluster_dims` and `launch.num_ctas` of a thread-block cluster (a Triton kernel's `num_ctas`, a prebuilt binary's declared cluster) are launched with `cuLaunchKernelEx`, and `options.num_ctas` says it (section 4.5) |
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.global_scratch_size` above 0 is launched with a scratch of that many bytes per CTA, and `launch.global_scratch_align` records its alignment (section 4.6) |
-| kernel entry (Unreleased) | — | an optional `instrument` on the entry of an instrumented build (`export(..., instrument=True)`): its probes, recorded into the buffer a host gives in the profile scratch slot; a manifest with such an entry is an instrumented export, which both readers refuse unless asked to load one (section 4.8) |
+| kernel entry (0.0.11, crate 0.0.9) | — | an optional `instrument` on the entry of an instrumented build (`export(..., instrument=True)`): its probes, recorded into the buffer a host gives in the profile scratch slot; a manifest with such an entry is an instrumented export, which both readers refuse unless asked to load one (section 4.8) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -444,7 +444,7 @@ are built on `expf`, `rsqrt` is `rsqrtf` and `erf` is `erff` (inline PTX read fr
   a `binary` entry or on an entry without `source_sha256`.
 * Where it is measured and kept: `docs/numerics.md` (the procedure to run on a CUDA or torch change), `python/tests/test_gpu_cuda_math.py`.
 
-### 4.8 The probes of an instrumented build: `instrument` (Unreleased)
+### 4.8 The probes of an instrumented build: `instrument` (tilefish 0.0.11, crate 0.0.9)
 
 An instrumented build (`tilefish.runtime.export(..., instrument=True)` or `tilefish.instrument(capacity=..., ops=...)`, `docs/instrument.md`) records the
 kernel's `tilefish.probe` calls, and `@begin`, `@calib` and `@end`, into a probe buffer that a host gives in the profile scratch slot (the second slot of

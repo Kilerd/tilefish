@@ -101,7 +101,7 @@ from ._planrun import CapturedPlan
 from .trace import Const, Value
 from .types import DevScalar, InOut, MayAlias, Null, Out, StrideOf, Strided, Tensor, TensorDesc, TensorType, const
 
-__version__ = "0.0.10"
+__version__ = "0.0.11"
 
 
 def fusion_report(graph: GraphOp) -> dict:

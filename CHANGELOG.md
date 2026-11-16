@@ -5,7 +5,7 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## Unreleased
+## tilefish 0.0.11, crate 0.0.9, tilefish-capi 0.0.1 (2026-11-17)
 
 Manifest schema 3 and plan schema 1 are unchanged but for one optional entry field, `instrument`, which only the instrumented variant writes (below).
 An export whose graphs have no arithmetic in their bodies and whose kernels write no `-0.0` scalar writes the same manifest, plans and plan sets as
@@ -13,6 +13,9 @@ An export whose graphs have no arithmetic in their bodies and whose kernels writ
 re-exported); a graph with arithmetic in its body is planned by fusion version 2 now (Breaking). An export of many buckets or plans takes less memory
 and time, every byte the same. The crate gains the readers and launches of the instrumented variant; the C ABI is unchanged and refuses an
 instrumented export.
+
+The crate's sources change for the first time since 0.0.6 (the instrumented variant). `tilefish-capi`'s sources are unchanged (only a test of its GPU
+gate reads two more dtypes), so it stays 0.0.1, built from the release commit.
 
 ### Breaking
 
