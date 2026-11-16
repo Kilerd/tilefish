@@ -8,6 +8,11 @@
 //! shapes of the operands follow from it, `impl`, `m`, `n` and `k`, which may be any size (an algorithm that cannot take the leading
 //! dimensions they make is refused by `cublasLtMatmulAlgoCheck` when it is loaded). The pinned algorithm is 64 bytes (128 lowercase hex digits) that
 //! only the library that made them can judge: running one is [`crate::gemm`].
+//!
+//! An entry of `impl: "cublaslt.matmul"` (section 9.5) is a GEMM with a cuBLASLt epilogue ([`GemmEpilogue`]) and `beta` (`out = epilogue(acc +
+//! c)` when it is 1): the fields of a GEMM's with `beta`, `contract` and `verification` added and an optional `canary` (Python's `MATMUL_ENTRY_KEYS`,
+//! `_validate_matmul_fields`), bf16 or f16 operands and a result of their type, a `bias` exactly for the epilogues with one and a `c` exactly for
+//! `beta` 1. `cublaslt.gemm` and `cublaslt.gemm_bias` are read as they always were.
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -35,6 +40,141 @@ pub enum LibraryImpl {
     Gemm,
     /// `cublaslt.gemm_bias`: the same with `bias[N]` added in f32 before the rounding (`CUBLASLT_EPILOGUE_BIAS`).
     GemmBias,
+    /// `cublaslt.matmul`: the same with a cuBLASLt epilogue ([`LibraryEntry::epilogue`]) on the f32 accumulator, and `c[M, N]` added to it first
+    /// when [`LibraryEntry::beta`] is 1, before the one rounding (`docs/manifest-schema-3.md`, section 9.5).
+    Matmul,
+}
+
+/// What cuBLASLt does to the f32 accumulator of a GEMM before the one rounding to the result's type (`epilogue` of an entry; Python's
+/// `tilefish._cublaslt.EPILOGUES`). `cublaslt.gemm` has [`GemmEpilogue::None`] and `cublaslt.gemm_bias` [`GemmEpilogue::Bias`]; a
+/// `cublaslt.matmul` has any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GemmEpilogue {
+    /// `"none"`: `CUBLASLT_EPILOGUE_DEFAULT` (1), the accumulator as it is.
+    None,
+    /// `"bias"`: `CUBLASLT_EPILOGUE_BIAS` (4), `acc + bias`.
+    Bias,
+    /// `"relu"`: `CUBLASLT_EPILOGUE_RELU` (2), `relu(acc)`.
+    Relu,
+    /// `"relu_bias"`: `CUBLASLT_EPILOGUE_RELU_BIAS` (6), `relu(acc + bias)`.
+    ReluBias,
+}
+
+impl GemmEpilogue {
+    /// Every epilogue, in the order of the manifest schema (section 9.5).
+    pub const ALL: [Self; 4] = [Self::None, Self::Bias, Self::Relu, Self::ReluBias];
+
+    /// The word an entry uses (`"none"`, `"bias"`, `"relu"`, `"relu_bias"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bias => "bias",
+            Self::Relu => "relu",
+            Self::ReluBias => "relu_bias",
+        }
+    }
+
+    /// The epilogue of a word, `None` for any other.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == name)
+    }
+
+    /// Whether the epilogue reads a `bias` operand (`"bias"` and `"relu_bias"`).
+    pub fn has_bias(self) -> bool {
+        matches!(self, Self::Bias | Self::ReluBias)
+    }
+
+    /// The `cublasLtEpilogue_t` value the matmul descriptor is given (`CUBLASLT_MATMUL_DESC_EPILOGUE`).
+    pub fn cublaslt_value(self) -> u32 {
+        match self {
+            Self::None => 1,
+            Self::Bias => 4,
+            Self::Relu => 2,
+            Self::ReluBias => 6,
+        }
+    }
+
+    /// The arithmetic on the f32 accumulator `acc`, before the one rounding, in the order the library adds (`c` before the bias), as an entry's
+    /// `verification.formula` says it (Python's `tilefish._library.formula`): `"relu((acc + c) + bias)"`.
+    pub fn formula(self, beta: u8) -> String {
+        let mut x = if beta == 1 { "acc + c".to_owned() } else { "acc".to_owned() };
+        if self.has_bias() {
+            x = if beta == 1 { format!("({x}) + bias") } else { format!("{x} + bias") };
+        }
+        if matches!(self, Self::Relu | Self::ReluBias) { format!("relu({x})") } else { x }
+    }
+}
+
+impl std::fmt::Display for GemmEpilogue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the verification of a `cublaslt.matmul` pin found when it was made (`contract` of the entry, section 9.5): its bytes are the library's
+/// under the pin either way (contract (iii) of RFC 0003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatmulContract {
+    /// `"measured-exact"`: every element of the verification equals the formula computed in f32 on the pin's own accumulator and rounded once.
+    MeasuredExact,
+    /// `"binary-defined"`: some do not; the bytes are what the pinned binary computes.
+    BinaryDefined,
+}
+
+impl MatmulContract {
+    /// The word an entry uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MeasuredExact => "measured-exact",
+            Self::BinaryDefined => "binary-defined",
+        }
+    }
+}
+
+/// Where the accumulator the verification of a `cublaslt.matmul` pin compared with came from (`verification.accumulator`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatmulAccumulator {
+    /// `"f32-form"`: the f32 output of the pin's configuration re-encoded with an f32 `D`.
+    F32Form,
+    /// `"plain-f32-pin"`: the f32 GEMM the same posture pins (cuBLASLt does not take the configuration with an f32 `D`).
+    PlainF32Pin,
+}
+
+impl MatmulAccumulator {
+    /// The word an entry uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F32Form => "f32-form",
+            Self::PlainF32Pin => "plain-f32-pin",
+        }
+    }
+}
+
+/// The record of the verification of a `cublaslt.matmul` pin (`verification` of the entry; Python's `tilefish._matmul.verify`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatmulVerification {
+    /// The formula of the epilogue and `beta` ([`GemmEpilogue::formula`]): what the pin was compared with.
+    pub formula: String,
+    /// Where the accumulator of the reference came from.
+    pub accumulator: MatmulAccumulator,
+    /// The seeded operand sets the pin ran on (2).
+    pub operand_sets: u64,
+    /// The elements compared (`2 * m * n`).
+    pub elements: u64,
+    /// The elements whose bits differ from the reference (0 exactly when the contract is [`MatmulContract::MeasuredExact`]).
+    pub differ: u64,
+    /// The largest distance in units in the last place over the elements where both are finite (0 when none differs).
+    pub max_ulp: u64,
+}
+
+/// The canary of a `cublaslt.matmul` entry (`canary`): the digest of the `out` its pin computed at export from operands made of `seed` on the
+/// device (section 9.5, with the operands and the digest of section 9.4), which [`crate::Manifest::gemm`] computes again before the pin is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatmulCanary {
+    /// The seed of the operands (0 to 2^32 - 1; export records 1).
+    pub seed: u64,
+    /// 32 lowercase hex digits: the two sums of the digest of `out` (`tilefish::canary_digest` of its bytes).
+    pub out_digest: String,
 }
 
 /// How `b` and `a` are stored, named by the transposes cuBLASLt is called with (`transa`, then `transb`; cuBLAS's A operand is tilefish's `b`,
@@ -161,15 +301,17 @@ pub enum AlgoSource {
 }
 
 impl LibraryImpl {
-    /// The word a manifest uses (`"cublaslt.gemm"`, `"cublaslt.gemm_bias"`).
+    /// The word a manifest uses (`"cublaslt.gemm"`, `"cublaslt.gemm_bias"`, `"cublaslt.matmul"`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Gemm => "cublaslt.gemm",
             Self::GemmBias => "cublaslt.gemm_bias",
+            Self::Matmul => "cublaslt.matmul",
         }
     }
 
-    /// Whether the operation has a `bias` operand.
+    /// Whether every operation of the impl has a `bias` operand (`cublaslt.gemm_bias`): a `cublaslt.matmul` has one by its epilogue
+    /// ([`LibraryEntry::has_bias`]).
     pub fn has_bias(self) -> bool {
         self == Self::GemmBias
     }
@@ -195,7 +337,8 @@ pub struct LibraryEntry {
     /// How `b` and `a` are stored (`transa`, `transb`).
     pub layout: GemmLayout,
     /// The operands in launch order: `a [M, K]` (`[K, M]` for [`GemmLayout::Tt`] and [`GemmLayout::Nt`]), `b [N, K]` (`[K, N]` for
-    /// [`GemmLayout::Nn`] and [`GemmLayout::Nt`]), `bias [N]` (only for `gemm_bias`), `out [M, N]`, pointers of their dtypes (`out` is written).
+    /// [`GemmLayout::Nn`] and [`GemmLayout::Nt`]), `bias [N]` (for `gemm_bias` and an epilogue with a bias), `c [M, N]` (for `beta` 1), `out [M,
+    /// N]`, pointers of their dtypes (`out` is written).
     pub params: Vec<Param>,
     /// The bucket value of each bucketed dimension, in the order of the stem.
     pub buckets: Vec<(String, u64)>,
@@ -239,12 +382,47 @@ pub struct LibraryEntry {
     /// The same opt-in of f32 operands (`allow_f32_reduction: true`, only on f32 operands; absent: no): split-K may add its partial sums in the
     /// output (`INPLACE`, `OUTPUT_TYPE`), not only in a workspace of the compute type.
     pub allow_f32_reduction: bool,
+    /// What cuBLASLt does to the accumulator (`epilogue`): [`GemmEpilogue::None`] for `gemm`, [`GemmEpilogue::Bias`] for `gemm_bias`, any for a
+    /// `cublaslt.matmul`.
+    pub epilogue: GemmEpilogue,
+    /// `beta` of a `cublaslt.matmul` (0, or 1: `c [M, N]` is an operand and `out = epilogue(acc + c)`); 0 for `gemm` and `gemm_bias`.
+    pub beta: u8,
+    /// What the verification of a `cublaslt.matmul` pin found (`contract`); `None` for `gemm` and `gemm_bias`.
+    pub contract: Option<MatmulContract>,
+    /// The record of that verification (`verification`); `None` for `gemm` and `gemm_bias`.
+    pub verification: Option<MatmulVerification>,
+    /// The canary of a `cublaslt.matmul` (`canary`), which [`crate::Manifest::gemm`] runs before the pin is used; `None` without one.
+    pub canary: Option<MatmulCanary>,
 }
 
 impl LibraryEntry {
     /// The operand parameter called `name`.
     pub fn param(&self, name: &str) -> Option<&Param> {
         self.params.iter().find(|p| p.name == name)
+    }
+
+    /// Whether the GEMM has a `bias` operand (`gemm_bias`, and a `cublaslt.matmul` whose epilogue has one).
+    pub fn has_bias(&self) -> bool {
+        self.epilogue.has_bias()
+    }
+
+    /// Whether the GEMM has a `c` operand (a `cublaslt.matmul` with `beta` 1).
+    pub fn has_c(&self) -> bool {
+        self.beta == 1
+    }
+
+    /// The canary's operands of the entry as `(name, tag, elements)`, in the order of its ABI: `a` (tag 0, `m * k` elements), `b` (tag 1, `n *
+    /// k`), the bias (tag 2, `n`) and `c` (tag 3, `m * n`) when the entry has them, each dense in its layout, of the operands' type (Python's
+    /// `tilefish._matmul.canary_elements`).
+    pub fn canary_elements(&self) -> Vec<(&'static str, u8, u64)> {
+        let mut out = vec![("a", 0, self.m * self.k), ("b", 1, self.n * self.k)];
+        if self.has_bias() {
+            out.push(("bias", 2, self.n));
+        }
+        if self.has_c() {
+            out.push(("c", 3, self.m * self.n));
+        }
+        out
     }
 
     /// Whether split-K may add its partial sums in the output type: the opt-in of the operands' type.
@@ -305,7 +483,64 @@ pub(crate) struct RawLibrary {
     allow_f32_reduction: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     sm_count_target: Option<Value>,
+    // the fields of a `cublaslt.matmul` (section 9.5): `beta`, `contract` and `verification` required of it, `canary` optional, all four refused
+    // on `gemm` and `gemm_bias` (`LibraryEntry::read` holds each impl to its list)
+    #[serde(default, deserialize_with = "present")]
+    beta: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    contract: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    verification: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    canary: Option<Value>,
 }
+
+/// The fields every `cublaslt.gemm` and `cublaslt.gemm_bias` entry has (Python's `ENTRY_KEYS`), in its order.
+const ENTRY_KEYS: [&str; 26] = [
+    "stem",
+    "op",
+    "arch",
+    "impl",
+    "abi",
+    "buckets",
+    "dims",
+    "preconditions",
+    "dtypes",
+    "compute_type",
+    "scale_type",
+    "transa",
+    "transb",
+    "m",
+    "n",
+    "k",
+    "lda",
+    "ldb",
+    "ldc",
+    "ldd",
+    "epilogue",
+    "workspace_bytes",
+    "algo",
+    "cublaslt_version",
+    "sm_count",
+    "declaration_digest",
+];
+/// The fields of a `cublaslt.matmul` entry besides those of [`ENTRY_KEYS`] (Python's `MATMUL_ENTRY_KEYS`).
+const MATMUL_KEYS: [&str; 3] = ["beta", "contract", "verification"];
+/// The optional fields of a `gemm` or `gemm_bias` entry (Python's `OPTIONAL_ENTRY_FIELDS` and `OPTIONAL_COUNT_FIELDS`).
+const OPTIONAL_KEYS: [&str; 6] = [
+    "heuristic",
+    "algo_source",
+    "allow_bf16_reduction",
+    "allow_f16_reduction",
+    "allow_f32_reduction",
+    "sm_count_target",
+];
+/// The optional fields of a `cublaslt.matmul` entry (Python's `MATMUL_OPTIONAL_FIELDS`): not `algo_source` (it imports no algorithm), and a canary.
+const MATMUL_OPTIONAL_KEYS: [&str; 6] =
+    ["heuristic", "allow_bf16_reduction", "allow_f16_reduction", "allow_f32_reduction", "sm_count_target", "canary"];
+/// The fields of a `verification` record, in Python's order (`VERIFICATION_KEYS`).
+const VERIFICATION_KEYS: [&str; 6] = ["formula", "accumulator", "operand_sets", "elements", "differ", "max_ulp"];
+const MAX_CANARY_SEED: u64 = (1 << 32) - 1;
 
 /// A field that is there, whatever its value: `null` included (serde's `Option` would read a `null` as an absent field, which Python does not).
 pub(crate) fn present<'de, D: serde::Deserializer<'de>>(
@@ -392,11 +627,32 @@ impl LibraryEntry {
         let implementation = match raw.implementation.as_str() {
             "cublaslt.gemm" => LibraryImpl::Gemm,
             "cublaslt.gemm_bias" => LibraryImpl::GemmBias,
+            "cublaslt.matmul" => LibraryImpl::Matmul,
             other => {
-                return Err(format!("impl must be one of [\"cublaslt.gemm\", \"cublaslt.gemm_bias\"], got {other:?}"));
+                return Err(format!(
+                    "impl must be one of [\"cublaslt.gemm\", \"cublaslt.gemm_bias\", \"cublaslt.matmul\"], got {other:?}"
+                ));
             }
         };
-        let bias = implementation.has_bias();
+        let matmul = implementation == LibraryImpl::Matmul;
+        fields_of(&raw, matmul)?;
+        // the epilogue: the impl's for gemm and gemm_bias, any of the four for a cublaslt.matmul, with its beta, contract, verification and canary
+        let (epilogue, beta, contract, verification, canary) = if matmul {
+            matmul_fields(&raw)?
+        } else {
+            let want = if implementation.has_bias() { GemmEpilogue::Bias } else { GemmEpilogue::None };
+            if raw.epilogue != want.as_str() {
+                return Err(format!(
+                    "the epilogue of {} must be {:?}, got {:?}",
+                    raw.implementation,
+                    want.as_str(),
+                    raw.epilogue
+                ));
+            }
+            (want, 0, None, None, None)
+        };
+        let bias = epilogue.has_bias();
+        let with_c = beta == 1;
         let (m, n, k) = (size_field(&raw.m, "m")?, size_field(&raw.n, "n")?, size_field(&raw.k, "k")?);
         let ld = [
             size_field(&raw.lda, "lda")?,
@@ -423,31 +679,35 @@ impl LibraryEntry {
         if raw.compute_type != COMPUTE_TYPE || raw.scale_type != SCALE_TYPE {
             return Err(format!("compute_type and scale_type must be {COMPUTE_TYPE:?} and {SCALE_TYPE:?}"));
         }
-        let want_epilogue = if bias { "bias" } else { "none" };
-        if raw.epilogue != want_epilogue {
-            return Err(format!(
-                "the epilogue of {} must be {want_epilogue:?}, got {:?}",
-                raw.implementation, raw.epilogue
-            ));
-        }
-        // a and b of one type, bf16, f16 or f32; the result (and a bias) of theirs or f32; anything else is held to the default form in the message
+        // a and b of one type, bf16, f16 or f32; the result (and a bias) of theirs or f32; anything else is held to the default form in the message.
+        // A cublaslt.matmul: bf16 or f16, and the result, a bias and c of their type.
         let named = |key: &str| raw.dtypes.get(key).and_then(Value::as_str).and_then(DType::from_name);
         let (dtype, out_dtype) = match (named("a"), named("out")) {
-            (Some(a @ (DType::Bf16 | DType::F16 | DType::F32)), Some(out)) if out == a || out == DType::F32 => (a, out),
+            (Some(a @ (DType::Bf16 | DType::F16)), Some(out)) if matmul && out == a => (a, out),
+            (Some(a @ (DType::Bf16 | DType::F16 | DType::F32)), Some(out))
+                if !matmul && (out == a || out == DType::F32) =>
+            {
+                (a, out)
+            }
             _ => (DType::Bf16, DType::Bf16),
         };
         let mut want_dtypes = Map::new();
         for (name, dt) in [("a", dtype), ("b", dtype)]
             .into_iter()
             .chain(bias.then_some(("bias", out_dtype)))
+            .chain(with_c.then_some(("c", out_dtype)))
             .chain([("out", out_dtype)])
         {
             want_dtypes.insert(name.to_owned(), Value::String(dt.name().to_owned()));
         }
         if raw.dtypes != want_dtypes {
+            let why = if matmul {
+                "a and b are both bf16 or both f16, the result, a bias and c are of their type"
+            } else {
+                "a and b are both bf16, both f16 or both f32, the result is of their type or f32, a bias of the result's type"
+            };
             return Err(format!(
-                "dtypes must be {}, got {} (a and b are both bf16, both f16 or both f32, the result is of their type or f32, a bias of the \
-                 result's type)",
+                "dtypes must be {}, got {} ({why})",
                 Value::Object(want_dtypes),
                 Value::Object(raw.dtypes)
             ));
@@ -525,20 +785,27 @@ impl LibraryEntry {
             stem.push_str(&format!(".{name}{v}"));
             buckets.push((name.clone(), v));
         }
-        // the operands: a [M, K] (TN, NN) or [K, M] (TT, NT), b [N, K] (TN, TT) or [K, N] (NN, NT), [bias [N]], out [M, N], in this order, each
-        // of its type in dtypes
+        // the operands: a [M, K] (TN, NN) or [K, M] (TT, NT), b [N, K] (TN, TT) or [K, N] (NN, NT), [bias [N]], [c [M, N]], out [M, N], in this
+        // order, each of its type in dtypes
         let expected: Vec<(Vec<u64>, DType)> =
             [(layout.a_shape(m, k).to_vec(), dtype), (layout.b_shape(n, k).to_vec(), dtype)]
                 .into_iter()
                 .chain(bias.then(|| (vec![n], out_dtype)))
+                .chain(with_c.then(|| (vec![m, n], out_dtype)))
                 .chain([(vec![m, n], out_dtype)])
                 .collect();
         let params_raw = &raw.abi.params;
         if params_raw.len() != expected.len() {
+            let names: Vec<&str> = ["a", "b"]
+                .into_iter()
+                .chain(bias.then_some("bias"))
+                .chain(with_c.then_some("c"))
+                .chain(["out"])
+                .collect();
             return Err(format!(
                 "abi.params must list {} pointers ({} in this order)",
                 expected.len(),
-                if bias { "a, b, bias, out" } else { "a, b, out" }
+                names.join(", ")
             ));
         }
         let mut params = Vec::with_capacity(params_raw.len());
@@ -669,8 +936,153 @@ impl LibraryEntry {
             allow_bf16_reduction,
             allow_f16_reduction,
             allow_f32_reduction,
+            epilogue,
+            beta,
+            contract,
+            verification,
+            canary,
         })
     }
+}
+
+/// Hold an entry to the field list of its impl (Python's `ENTRY_KEYS` and `OPTIONAL_ENTRY_FIELDS` for `gemm` and `gemm_bias`, `MATMUL_ENTRY_KEYS` and
+/// `MATMUL_OPTIONAL_FIELDS` for `cublaslt.matmul`), in the words of Python's refusal: serde has refused a missing field of [`ENTRY_KEYS`] and any field
+/// of no list, and this refuses the fields of a `cublaslt.matmul` on the others, theirs missing on it, and `algo_source` on it.
+fn fields_of(raw: &RawLibrary, matmul: bool) -> std::result::Result<(), String> {
+    let matmul_only = [
+        ("beta", &raw.beta),
+        ("contract", &raw.contract),
+        ("verification", &raw.verification),
+        ("canary", &raw.canary),
+    ];
+    let (missing, unknown): (Vec<&str>, Vec<&str>) = if matmul {
+        let missing = matmul_only[..3].iter().filter(|(_, v)| v.is_none()).map(|(k, _)| *k).collect();
+        let unknown = raw.algo_source.is_some().then_some("algo_source").into_iter().collect();
+        (missing, unknown)
+    } else {
+        (Vec::new(), matmul_only.iter().filter(|(_, v)| v.is_some()).map(|(k, _)| *k).collect())
+    };
+    if missing.is_empty() && unknown.is_empty() {
+        return Ok(());
+    }
+    let (keys, optional): (Vec<&str>, &[&str]) = if matmul {
+        (ENTRY_KEYS.iter().chain(&MATMUL_KEYS).copied().collect(), &MATMUL_OPTIONAL_KEYS)
+    } else {
+        (ENTRY_KEYS.to_vec(), &OPTIONAL_KEYS)
+    };
+    let mut why = format!("must have exactly the fields {keys:?} and may have {optional:?}");
+    if !missing.is_empty() {
+        why.push_str(&format!("; missing {missing:?}"));
+    }
+    if !unknown.is_empty() {
+        why.push_str(&format!("; unknown {unknown:?}"));
+    }
+    Err(why)
+}
+
+/// The fields of a `cublaslt.matmul` entry that a GEMM's has not (Python's `_validate_matmul_fields`): its `epilogue`, `beta`, `contract`,
+/// `verification` and optional `canary`, each exactly typed, and the redundant ones agreeing (the formula is the one of the epilogue and `beta`;
+/// the contract is `measured-exact` exactly when no element differed).
+#[allow(clippy::type_complexity)]
+fn matmul_fields(
+    raw: &RawLibrary,
+) -> std::result::Result<
+    (GemmEpilogue, u8, Option<MatmulContract>, Option<MatmulVerification>, Option<MatmulCanary>),
+    String,
+> {
+    let names: Vec<&str> = GemmEpilogue::ALL.iter().map(|e| e.as_str()).collect();
+    let epilogue = GemmEpilogue::from_name(&raw.epilogue)
+        .ok_or_else(|| format!("the epilogue of cublaslt.matmul must be one of {names:?}, got {:?}", raw.epilogue))?;
+    let beta_value = raw.beta.as_ref().expect("checked by fields_of");
+    let beta = match beta_value.as_u64() {
+        Some(b @ (0 | 1)) => b as u8,
+        _ => return Err(format!("beta must be the int 0 or 1, got {beta_value}")),
+    };
+    let contract_value = raw.contract.as_ref().expect("checked by fields_of");
+    let contract = match contract_value.as_str() {
+        Some("measured-exact") => MatmulContract::MeasuredExact,
+        Some("binary-defined") => MatmulContract::BinaryDefined,
+        _ => {
+            return Err(format!(
+                "contract must be one of [\"measured-exact\", \"binary-defined\"], got {contract_value}"
+            ));
+        }
+    };
+    let v = raw.verification.as_ref().expect("checked by fields_of");
+    let record = match v.as_object() {
+        Some(map) if map.len() == VERIFICATION_KEYS.len() && VERIFICATION_KEYS.iter().all(|k| map.contains_key(*k)) => {
+            map
+        }
+        _ => return Err(format!("verification must be an object of exactly {VERIFICATION_KEYS:?}, got {v}")),
+    };
+    let want = epilogue.formula(beta);
+    if record["formula"].as_str() != Some(want.as_str()) {
+        return Err(format!(
+            "verification.formula must be {want:?} (the arithmetic of the epilogue {:?} with beta {beta}), got {}",
+            epilogue.as_str(),
+            record["formula"]
+        ));
+    }
+    let accumulator = match record["accumulator"].as_str() {
+        Some("f32-form") => MatmulAccumulator::F32Form,
+        Some("plain-f32-pin") => MatmulAccumulator::PlainF32Pin,
+        _ => {
+            return Err(format!(
+                "verification.accumulator must be one of [\"f32-form\", \"plain-f32-pin\"], got {}",
+                record["accumulator"]
+            ));
+        }
+    };
+    let count = |key: &str, low: u64| match record[key].as_u64() {
+        Some(c) if c >= low => Ok(c),
+        _ if low == 1 => Err(format!("verification.{key} must be a positive int, got {}", record[key])),
+        _ => Err(format!("verification.{key} must be an int of at least 0, got {}", record[key])),
+    };
+    let (operand_sets, elements) = (count("operand_sets", 1)?, count("elements", 1)?);
+    let (differ, max_ulp) = (count("differ", 0)?, count("max_ulp", 0)?);
+    if differ > elements {
+        return Err(format!("verification.differ ({differ}) is more than verification.elements ({elements})"));
+    }
+    // the elements compared are those of every operand set: `operand_sets * m * n` (when `m` and `n` are ints: else they are refused below)
+    if let (Some(m), Some(n)) = (raw.m.as_u64(), raw.n.as_u64()) {
+        let want = u128::from(operand_sets).checked_mul(u128::from(m)).and_then(|x| x.checked_mul(u128::from(n)));
+        if want != Some(u128::from(elements)) {
+            let want = want.map_or_else(|| "a number beyond 128 bits".to_owned(), |w| w.to_string());
+            return Err(format!("verification.elements must be operand_sets * m * n = {want}, got {elements}"));
+        }
+    }
+    if (contract == MatmulContract::MeasuredExact) != (differ == 0) {
+        return Err(format!(
+            "contract is {:?}, but the verification found {differ} elements that differ (measured-exact is exactly none)",
+            contract.as_str()
+        ));
+    }
+    if differ == 0 && max_ulp != 0 {
+        return Err(format!("verification.max_ulp is {max_ulp}, but no element differs"));
+    }
+    let canary = match &raw.canary {
+        None => None,
+        Some(c) => Some(matmul_canary(c)?),
+    };
+    let verification = MatmulVerification { formula: want, accumulator, operand_sets, elements, differ, max_ulp };
+    Ok((epilogue, beta, Some(contract), Some(verification), canary))
+}
+
+/// The canary of a `cublaslt.matmul` entry: an object of exactly `seed` (an int from 0 to 2^32 - 1) and `out_digest` (32 lowercase hex digits).
+fn matmul_canary(v: &Value) -> std::result::Result<MatmulCanary, String> {
+    let bad = || {
+        format!(
+            "canary must be {{\"seed\": an int from 0 to 2**32 - 1, \"out_digest\": 32 lowercase hex digits}}, got {v}"
+        )
+    };
+    let map = v.as_object().filter(|m| m.len() == 2).ok_or_else(bad)?;
+    let seed = map.get("seed").and_then(Value::as_u64).filter(|s| *s <= MAX_CANARY_SEED).ok_or_else(bad)?;
+    let digest = map
+        .get("out_digest")
+        .and_then(Value::as_str)
+        .filter(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .ok_or_else(bad)?;
+    Ok(MatmulCanary { seed, out_digest: digest.to_owned() })
 }
 
 /// The 64 bytes of a pinned algorithm from its 128 lowercase hex digits (strict: nothing else).

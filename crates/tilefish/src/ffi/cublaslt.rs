@@ -17,7 +17,7 @@ use cudarc::cublaslt::sys;
 use cudarc::driver::CudaContext;
 
 use crate::error::{Error, Result};
-use crate::library::GemmForm;
+use crate::library::{GemmEpilogue, GemmForm};
 use crate::tensor::DType;
 
 const COMPUTE_32F: sys::cublasComputeType_t = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
@@ -34,9 +34,6 @@ fn data_type(dtype: DType) -> sys::cudaDataType {
 /// `cublasOperation_t`: `CUBLAS_OP_N` and `CUBLAS_OP_T`.
 const OP_N: i32 = 0;
 const OP_T: i32 = 1;
-/// `cublasLtEpilogue_t`: `CUBLASLT_EPILOGUE_DEFAULT` and `CUBLASLT_EPILOGUE_BIAS`.
-const EPILOGUE_DEFAULT: u32 = 1;
-const EPILOGUE_BIAS: u32 = 4;
 
 /// Whether libcublasLt can be loaded on this machine (it is opened and kept open when it is there; nothing in it is called).
 #[allow(unsafe_code)]
@@ -314,8 +311,9 @@ impl Drop for Layout {
 /// tilefish's `out` (`n x m` column-major, `ldc = ldd = n`). For the layouts NN and NT, `b` is `[k, n]`: an `n x k` column-major matrix with
 /// `lda = n`, used with `transa = N`; for TT and NT, `a` is `[k, m]`: an `m x k` column-major matrix with `ldb = m`, used with `transb = T`. `a`
 /// and `b` have the operand type of the form, `C`, `D` and a bias its result type; the compute type is
-/// `CUBLAS_COMPUTE_32F`, the scale type `CUDA_R_32F`. A bias goes through `CUBLASLT_EPILOGUE_BIAS` with `BIAS_DATA_TYPE` the result type. Python's
-/// `describe` is the reference.
+/// `CUBLAS_COMPUTE_32F`, the scale type `CUDA_R_32F`. The descriptor's `EPILOGUE` is the entry's ([`GemmEpilogue::cublaslt_value`]: `DEFAULT` for
+/// `gemm`, `BIAS` for `gemm_bias`, any of the four for a `cublaslt.matmul`, section 9.5), and an epilogue with a bias has `BIAS_DATA_TYPE` the result
+/// type and `BIAS_POINTER` the bias. Python's `describe` and `_Problem` are the reference.
 #[derive(Debug)]
 pub(crate) struct Problem {
     desc: sys::cublasLtMatmulDesc_t,
@@ -339,12 +337,13 @@ fn desc_set<T: Copy>(
 }
 
 impl Problem {
-    /// The problem of sizes `m`, `n`, `k` (tilefish's) of `form`, with `bias` the address of the bias vector for a `gemm_bias`, for
-    /// `sm_count_target` SMs (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`; `None`: unset, the device's count).
+    /// The problem of sizes `m`, `n`, `k` (tilefish's) of `form` with `epilogue`, `bias` the address of the bias vector of an epilogue that has
+    /// one (and only of one), for `sm_count_target` SMs (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`; `None`: unset, the device's count).
     pub(crate) fn new(
         m: u64,
         n: u64,
         k: u64,
+        epilogue: GemmEpilogue,
         bias: Option<u64>,
         form: &GemmForm,
         sm_count_target: Option<u64>,
@@ -365,14 +364,21 @@ impl Problem {
         let transb = if form.layout.a_transposed() { OP_T } else { OP_N };
         desc_set(desc, D::CUBLASLT_MATMUL_DESC_TRANSA, transa)?;
         desc_set(desc, D::CUBLASLT_MATMUL_DESC_TRANSB, transb)?;
-        match bias {
-            Some(pointer) => {
-                desc_set(desc, D::CUBLASLT_MATMUL_DESC_EPILOGUE, EPILOGUE_BIAS)?;
+        // the epilogue is set for every one, DEFAULT included (as Python's `_Problem` does)
+        desc_set(desc, D::CUBLASLT_MATMUL_DESC_EPILOGUE, epilogue.cublaslt_value())?;
+        match (epilogue.has_bias(), bias) {
+            (true, Some(pointer)) => {
                 // the bias has the type of D: the only one the library takes (an other is CUBLAS_STATUS_INVALID_VALUE, measured on 12.8.4)
                 desc_set(desc, D::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE, data_type(form.out) as i32)?;
                 desc_set(desc, D::CUBLASLT_MATMUL_DESC_BIAS_POINTER, pointer as *const c_void)?;
             }
-            None => desc_set(desc, D::CUBLASLT_MATMUL_DESC_EPILOGUE, EPILOGUE_DEFAULT)?,
+            (false, None) => {}
+            (true, None) => {
+                return Err(Error::Launch(format!("the {epilogue} epilogue needs a bias, and none is given")));
+            }
+            (false, Some(_)) => {
+                return Err(Error::Launch(format!("the {epilogue} epilogue has no bias, and one is given")));
+            }
         }
         if let Some(target) = sm_count_target {
             let target = i32::try_from(target)
@@ -442,24 +448,28 @@ pub(crate) fn check(handle: &Handle, problem: &Problem, algo: &Algo) -> Result<C
     Ok(Checked { workspace: answer.workspaceSize })
 }
 
-/// The addresses of one call: tilefish's `a`, `b`, `out` (and, in the descriptor of the problem, the bias) and the workspace.
+/// The addresses of one call: tilefish's `a`, `b`, `c` (of a `cublaslt.matmul` with `beta` 1), `out` (and, in the descriptor of the problem, the
+/// bias) and the workspace.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Addresses {
     pub a: u64,
     pub b: u64,
+    /// `C`: `beta` is 1 with it, and 0 without it (`C` is then `out`, which is never read).
+    pub c: Option<u64>,
     pub out: u64,
     /// The workspace, or 0 (a null pointer) when the algorithm needs none.
     pub workspace: u64,
 }
 
-/// Enqueue `cublasLtMatmul` of the pinned algorithm on `stream`: `out = 1.0 * (a @ b^T) + 0.0 * out` (`a @ b` for the layout NN; with the problem's epilogue), the
-/// workspace being `workspace_size` bytes at `addresses.workspace`.
+/// Enqueue `cublasLtMatmul` of the pinned algorithm on `stream`: `out = epilogue(1.0 * (a @ b^T) + 0.0 * out)` (`a @ b` for the layout NN; the
+/// problem's epilogue), or `out = epilogue(1.0 * (a @ b^T) + 1.0 * c)` when the call has `c` (of the layout and the type of `out`), the workspace
+/// being `workspace_size` bytes at `addresses.workspace`.
 ///
 /// # Safety
 ///
 /// `stream` must be a valid `CUstream` of the context the handle was made in, which must be current on this thread; the addresses must be
-/// device memory of that context holding what `problem` says (`a` `[m, k]` or `[k, m]`, `b` `[n, k]` or `[k, n]`, `out` `[m, n]`, of its types, and the bias `[n]` of the
-/// problem), allocated until the work has completed on `stream`, and the workspace at least `workspace_size` bytes.
+/// device memory of that context holding what `problem` says (`a` `[m, k]` or `[k, m]`, `b` `[n, k]` or `[k, n]`, `out` and `c` `[m, n]`, of its
+/// types, and the bias `[n]` of the problem), allocated until the work has completed on `stream`, and the workspace at least `workspace_size` bytes.
 #[allow(unsafe_code)]
 pub(crate) unsafe fn matmul(
     handle: &Handle,
@@ -469,8 +479,9 @@ pub(crate) unsafe fn matmul(
     workspace_size: usize,
     stream: cudarc::driver::sys::CUstream,
 ) -> Result<()> {
-    let (alpha, beta) = (1.0f32, 0.0f32);
-    // cuBLAS A operand = tilefish b, cuBLAS B operand = tilefish a; C is D (beta = 0, so it is never read)
+    let (alpha, beta) = (1.0f32, if addresses.c.is_some() { 1.0f32 } else { 0.0f32 });
+    // cuBLAS A operand = tilefish b, cuBLAS B operand = tilefish a; C is D when beta = 0 (so it is never read), else the call's c (the layout of D)
+    let c = addresses.c.unwrap_or(addresses.out);
     // SAFETY: the handle, the descriptor, the layouts and the algorithm are live; alpha and beta are live locals (host pointer mode); the
     // rest is the caller's contract.
     unsafe {
@@ -483,7 +494,7 @@ pub(crate) unsafe fn matmul(
             problem.a.0,
             addresses.a as *const c_void,
             problem.b.0,
-            addresses.out as *const c_void,
+            c as *const c_void,
             problem.d.0,
             addresses.out as *mut c_void,
             problem.d.0,

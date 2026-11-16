@@ -875,6 +875,11 @@ def library_entries():
                     e["abi"]["params"][2]["dtype"] = out
                 e["abi"]["params"][-1]["dtype"] = out
                 cases.append(e)
+    # the fields of a cublaslt.matmul are refused on the impls of section 9
+    for good in goods[:3]:
+        for key, value in (("beta", 0), ("contract", "measured-exact"), ("canary", {"seed": 1, "out_digest": "ab" * 16})):
+            cases.append(changed(good, [key], value))
+    cases += matmul_library_entries()
     out = []
     for entry in cases:
         try:
@@ -891,8 +896,199 @@ def library_entries():
             entry.get("sm_count_target"),
             "allow_f32_reduction" in entry,
         ]
-        out.append({"entry": entry, "accepted": True, "form": form})
+        case = {"entry": entry, "accepted": True, "form": form}
+        if entry["impl"] == "cublaslt.matmul":
+            case["matmul"] = matmul_reading(entry)
+        out.append(case)
     return out
+
+
+def matmul_library_entries():
+    """``cublaslt.matmul`` entries (``docs/manifest-schema-3.md``, section 9.5) of every form, as ``tilefish._library.BuiltLibrary.entry`` writes them
+    (each epilogue with ``beta`` 0 and 1, bf16 and f16, the layouts TN, NN, TT and NT, the opt-in of the operands' type, the ``"torch"`` posture, an SM
+    count target, with a canary and without, measured-exact and binary-defined), and each changed in one field: every rule of the matmul bullet of
+    section 10."""
+    import copy
+    import inspect
+
+    import tilefish
+    from tilefish import Dim, Tensor, bf16, f16, f32
+    from tilefish._library import BuiltLibrary, formula, library_specs
+
+    M = Dim("M", buckets=[32, 64])
+    t = {"bf16": bf16, "f16": f16}
+
+    def declare(name, dtype, layout, epilogue, beta, n=1536, k=1024, **kw):
+        params = {
+            "a": Tensor[M, k, t[dtype]] if layout[1] == "N" else Tensor[k, M, t[dtype]],
+            "b": Tensor[n, k, t[dtype]] if layout[0] == "T" else Tensor[k, n, t[dtype]],
+        }
+        if epilogue in ("bias", "relu_bias"):
+            params["bias"] = Tensor[n, t[dtype]]
+        if beta:
+            params["c"] = Tensor[M, n, t[dtype]]
+
+        def fn(*args): ...
+
+        fn.__signature__ = inspect.Signature(
+            [inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=v) for p, v in params.items()], return_annotation=Tensor[M, n, t[dtype]]
+        )
+        return tilefish.library(name, acc=f32, impl="cublaslt.matmul", epilogue=epilogue, beta=beta, layout=layout, **kw)(fn)
+
+    forms = [  # (name, dtype, layout, epilogue, beta, options, contract, canary)
+        ("mm_none", "bf16", "TN", "none", 0, {}, "measured-exact", True),
+        ("mm_none_c", "f16", "TN", "none", 1, {}, "measured-exact", False),
+        ("mm_bias", "bf16", "TN", "bias", 0, {"heuristic": "torch"}, "measured-exact", True),
+        ("mm_bias_c", "f16", "NN", "bias", 1, {}, "binary-defined", True),
+        ("mm_relu", "f16", "TN", "relu", 0, {"allow_f16_reduction": True}, "measured-exact", True),
+        ("mm_relu_c", "bf16", "TT", "relu", 1, {"sm_count_target": 16}, "binary-defined", False),
+        ("mm_relu_bias", "bf16", "NT", "relu_bias", 0, {"allow_bf16_reduction": True, "heuristic": "torch"}, "measured-exact", True),
+        ("mm_relu_bias_c", "bf16", "TN", "relu_bias", 1, {}, "binary-defined", True),
+        ("mm_relu_bias_c_f16", "f16", "NT", "relu_bias", 1, {"sm_count_target": 8}, "measured-exact", True),
+    ]
+    goods = []
+    for i, (name, dtype, layout, epilogue, beta, kw, contract, canary) in enumerate(forms):
+        op = declare(name, dtype, layout, epilogue, beta, **kw)
+        spec = library_specs(op)[0]
+        elements = 2 * spec.m * spec.n
+        differ = 0 if contract == "measured-exact" else 64 + i
+        verification = {"formula": formula(epilogue, beta), "accumulator": "plain-f32-pin" if i % 3 == 2 else "f32-form", "operand_sets": 2,
+                        "elements": elements, "differ": differ, "max_ulp": 15176 if differ else 0}  # fmt: skip
+        made = {"seed": [1, 0, (1 << 32) - 1][i % 3], "out_digest": hashlib.sha256(spec.stem.encode()).hexdigest()[:32]} if canary else None
+        goods.append(BuiltLibrary(spec, "sm_103", "0123456789abcdef" * 8, 120804, 30, contract, verification, made).entry())
+
+    def changed(entry, path, value):
+        e = copy.deepcopy(entry)
+        target = e
+        for key in path[:-1]:
+            target = target[key]
+        if value is _DELETE:
+            del target[path[-1]]
+        else:
+            target[path[-1]] = value
+        return e
+
+    cases = list(goods)
+    for good in goods:
+        last = len(good["abi"]["params"]) - 1
+        bias = good["epilogue"] in ("bias", "relu_bias")
+        other_type = "f16" if good["dtypes"]["a"] == "bf16" else "bf16"
+        for path, value in [
+            (["beta"], _DELETE),
+            (["contract"], _DELETE),
+            (["verification"], _DELETE),
+            (["algo_source"], "imported"),
+            (["note"], 1),
+            (["epilogue"], "gelu"),
+            (["epilogue"], "relu_bias" if good["epilogue"] != "relu_bias" else "relu"),
+            (["beta"], 2),
+            (["beta"], 1.0),
+            (["beta"], True),
+            (["beta"], None),
+            (["beta"], 1 - good["beta"]),
+            (["contract"], "exact"),
+            (["contract"], "binary-defined" if good["contract"] == "measured-exact" else "measured-exact"),
+            (["verification", "note"], 0),
+            (["verification", "max_ulp"], _DELETE),
+            (["verification"], []),
+            (["verification"], None),
+            (["verification", "formula"], "acc + bias" if good["verification"]["formula"] != "acc + bias" else "acc"),
+            (["verification", "formula"], 1),
+            (["verification", "accumulator"], "f64"),
+            (["verification", "operand_sets"], 0),
+            (["verification", "operand_sets"], 2.0),
+            (["verification", "elements"], 0),
+            (["verification", "elements"], True),
+            (["verification", "elements"], 4096),
+            (["verification", "elements"], good["verification"]["elements"] + 2 * good["n"]),
+            (["verification", "operand_sets"], 3),
+            (["verification", "operand_sets"], 1),
+            (["verification", "differ"], -1),
+            (["verification", "differ"], good["verification"]["elements"] + 1),
+            (["verification", "differ"], 0 if good["verification"]["differ"] else 3),
+            (["verification", "max_ulp"], 1.5),
+            (["verification", "max_ulp"], 5 if good["contract"] == "measured-exact" else 0),
+            (["canary"], None),
+            (["canary"], {"seed": 1}),
+            (["canary"], {"seed": 1, "y_digest": "ab" * 16}),
+            (["canary"], {"seed": 1, "out_digest": "ab" * 16, "note": 0}),
+            (["canary"], ["seed", "out_digest"]),
+            (["canary"], {"seed": 7, "out_digest": "cd" * 16}),
+            (["canary"], _DELETE),
+            (["canary", "seed"], -1),
+            (["canary", "seed"], 1 << 32),
+            (["canary", "seed"], 1.0),
+            (["canary", "seed"], True),
+            (["canary", "seed"], "1"),
+            (["canary", "out_digest"], "AB" * 16),
+            (["canary", "out_digest"], "ab" * 15),
+            (["canary", "out_digest"], "ab" * 32),
+            (["canary", "out_digest"], 7),
+            (["dtypes", "a"], other_type),
+            (["dtypes", "out"], "f32"),
+            (["dtypes", "bias"], good["dtypes"]["a"]),
+            (["dtypes", "c"], good["dtypes"]["a"]),
+            (["abi", "params", 0, "dtype"], other_type),
+            (["abi", "params", last, "dtype"], other_type),
+            (["abi", "params", last - 1, "name"], "c2"),
+            (["abi", "params", 0, "shape"], list(reversed(good["abi"]["params"][0]["shape"]))),
+            (["allow_f32_reduction"], True),
+            (["allow_bf16_reduction"], True),
+            (["allow_f16_reduction"], True),
+            (["allow_f16_reduction"], False),
+            (["heuristic"], "tilefish"),
+            (["sm_count_target"], 7),
+            (["sm_count_target"], 31),
+            (["transa"], "N" if good["transa"] == "T" else "T"),
+        ]:
+            if path[0] == "canary" and len(path) > 1 and "canary" not in good:
+                continue
+            if path[0] == "canary" and value is _DELETE and "canary" not in good:
+                continue
+            if path[0] == "dtypes" and len(path) > 1 and path[1] in ("bias", "c") and path[1] in good["dtypes"]:
+                continue  # (it has it: the change of its type is below)
+            cases.append(changed(good, path, value))
+        if bias:
+            cases.append(changed(good, ["dtypes", "bias"], other_type))
+            cases.append(changed(good, ["abi", "params", 2, "dtype"], other_type))
+        if good["beta"] == 1:
+            cases.append(changed(good, ["dtypes", "c"], other_type))
+            cases.append(changed(good, ["abi", "params", last - 1, "dtype"], other_type))
+            cases.append(changed(good, ["abi", "params", last - 1, "shape"], list(reversed(good["abi"]["params"][last - 1]["shape"]))))
+            e = changed(good, ["beta"], 0)  # beta 0 with every other field of beta 1: the formula is the epilogue's of beta 0
+            e["verification"]["formula"] = formula(e["epilogue"], 0)
+            cases.append(e)
+        e = changed(good, ["dtypes"], {k: "f32" for k in good["dtypes"]})  # f32 operands, a result and every operand of their type: not a matmul's
+        for p in e["abi"]["params"]:
+            p["dtype"] = "f32"
+        cases.append(e)
+    return cases
+
+
+def matmul_reading(entry):
+    """What the reader of a ``cublaslt.matmul`` entry reads: the epilogue, ``beta``, the contract, the verification, the canary, and the canary's
+    operands (``tilefish._matmul.canary_elements``: name, tag and element count of each, and the sha256 of the first 512 elements each makes on the host,
+    ``tilefish._canary.canary_bytes``)."""
+    import types
+
+    from tilefish import _canary, _matmul
+    from tilefish._library import MATMUL_WITH_BIAS
+
+    spec = types.SimpleNamespace(m=entry["m"], n=entry["n"], k=entry["k"], bias=entry["epilogue"] in MATMUL_WITH_BIAS, beta=entry["beta"])
+    seed = entry["canary"]["seed"] if "canary" in entry else 7
+    operands = [
+        {"name": name, "tag": tag, "elements": elements, "head_sha256": hashlib.sha256(_canary.canary_bytes(entry["dtypes"]["a"], seed, tag, min(512, elements))).hexdigest()}
+        for name, tag, elements in _matmul.canary_elements(spec)
+    ]
+    return {
+        "epilogue": entry["epilogue"],
+        "beta": entry["beta"],
+        "contract": entry["contract"],
+        "verification": entry["verification"],
+        "canary": entry.get("canary"),
+        "canary_seed": seed,
+        "canary_operands": operands,
+    }
 
 
 _DELETE = object()

@@ -979,3 +979,285 @@ fn a_cubin_is_for_the_architecture_the_entry_says() {
     let k = axpy().with_cubin(odd.clone());
     assert!(refusal(&[k], &[]).contains("architecture cannot be read"));
 }
+
+// -- a GEMM with a cuBLASLt epilogue: impl cublaslt.matmul (section 9.5) ----------------------------------------------------------------------
+
+/// The formula of each epilogue and `beta`, as the table of section 9.5 has it (Python's `tilefish._library.formula`).
+const FORMULAS: [(&str, u64, &str); 8] = [
+    ("none", 0, "acc"),
+    ("none", 1, "acc + c"),
+    ("bias", 0, "acc + bias"),
+    ("bias", 1, "(acc + c) + bias"),
+    ("relu", 0, "relu(acc)"),
+    ("relu", 1, "relu(acc + c)"),
+    ("relu_bias", 0, "relu(acc + bias)"),
+    ("relu_bias", 1, "relu((acc + c) + bias)"),
+];
+
+/// The entry Python writes for a `cublaslt.matmul` `mm` of `dtype` operands in TN at the bucket `m`, with `epilogue` and `beta` (`c [M, n]` before
+/// `out` when it is 1), measured-exact, with a canary.
+fn matmul(epilogue: &str, beta: u64, m: u64, n: u64, k: u64, dtype: &str) -> Value {
+    let bias = epilogue == "bias" || epilogue == "relu_bias";
+    let mut e = gemm_of(bias, m, n, k, dtype, dtype, "TN");
+    e["impl"] = "cublaslt.matmul".into();
+    e["op"] = "mm".into();
+    e["stem"] = format!("mm.M{m}").into();
+    e["epilogue"] = epilogue.into();
+    e["beta"] = beta.into();
+    if beta == 1 {
+        let params = e["abi"]["params"].as_array_mut().unwrap();
+        let mut out = params.pop().unwrap();
+        let i = params.len();
+        params.push(
+            json!({"index": i, "name": "c", "kind": "pointer", "dtype": dtype, "access": "in", "shape": ["M", n]}),
+        );
+        out["index"] = (i + 1).into();
+        params.push(out);
+        let pres = e["preconditions"].as_array_mut().unwrap();
+        for p in pres.iter_mut() {
+            if p["arg"] == "out" {
+                p["index"] = (i + 1).into();
+            }
+        }
+        pres.push(alignment(i, "c", 16));
+        pres.push(json!({"kind": "static_size", "arg": "c", "index": i, "axis": 1, "value": n}));
+        e["dtypes"]["c"] = dtype.into();
+    }
+    let formula = FORMULAS.iter().find(|(ep, b, _)| *ep == epilogue && *b == beta).map_or("acc", |(.., f)| *f);
+    e["contract"] = "measured-exact".into();
+    e["verification"] = json!({"formula": formula, "accumulator": "f32-form", "operand_sets": 2, "elements": 2 * m * n, "differ": 0, "max_ulp": 0});
+    e["canary"] = json!({"seed": 1, "out_digest": "0123456789abcdef0123456789abcdef"});
+    e
+}
+
+#[test]
+fn a_matmul_entry_is_read_with_its_epilogue_its_beta_its_verification_and_its_canary() {
+    use tilefish::{GemmEpilogue, MatmulAccumulator, MatmulContract};
+    for (epilogue, beta, formula) in FORMULAS {
+        let manifest = read(&[], &[matmul(epilogue, beta, 64, 1024, 512, "f16")]).unwrap();
+        let e = manifest.library_entry("mm.M64", "sm_103").unwrap();
+        let ep = GemmEpilogue::from_name(epilogue).unwrap();
+        assert_eq!((e.implementation, e.epilogue, u64::from(e.beta)), (LibraryImpl::Matmul, ep, beta));
+        assert_eq!((e.dtype, e.out_dtype, e.layout), (DType::F16, DType::F16, GemmLayout::Tn));
+        assert_eq!(ep.formula(beta as u8), formula, "the formula of {epilogue} with beta {beta}");
+        let mut names = vec!["a", "b"];
+        if ep.has_bias() {
+            names.push("bias");
+        }
+        if beta == 1 {
+            names.push("c");
+        }
+        names.push("out");
+        assert_eq!(e.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), names);
+        assert_eq!((e.has_bias(), e.has_c()), (ep.has_bias(), beta == 1));
+        assert_eq!(e.contract, Some(MatmulContract::MeasuredExact));
+        let v = e.verification.as_ref().unwrap();
+        assert_eq!(
+            (v.formula.as_str(), v.accumulator, v.operand_sets, v.elements, v.differ, v.max_ulp),
+            (formula, MatmulAccumulator::F32Form, 2, 2 * 64 * 1024, 0, 0)
+        );
+        let canary = e.canary.as_ref().unwrap();
+        assert_eq!((canary.seed, canary.out_digest.as_str()), (1, "0123456789abcdef0123456789abcdef"));
+        // the canary's operands: a, b, the bias and c when the entry has them, by their tags
+        let mut want = vec![("a", 0, 64 * 512), ("b", 1, 1024 * 512)];
+        if ep.has_bias() {
+            want.push(("bias", 2, 1024));
+        }
+        if beta == 1 {
+            want.push(("c", 3, 64 * 1024));
+        }
+        assert_eq!(e.canary_elements(), want);
+        // the plan of a call: the operands in that order, c of the shape of out
+        let plan = manifest.library_plan("mm", &[("M", 64)], Arch::sm(103)).unwrap();
+        assert_eq!(plan.tensor_names().collect::<Vec<_>>(), names);
+    }
+    // the cuBLASLt values of the epilogues (CUBLASLT_EPILOGUE_DEFAULT, BIAS, RELU, RELU_BIAS)
+    assert_eq!(GemmEpilogue::ALL.map(GemmEpilogue::cublaslt_value), [1, 4, 2, 6]);
+    // a binary-defined pin and no canary: read as they are
+    let mut entry = matmul("relu_bias", 1, 32, 1024, 3072, "bf16");
+    entry["contract"] = "binary-defined".into();
+    entry["verification"]["differ"] = 64.into();
+    entry["verification"]["max_ulp"] = 15176.into();
+    entry["verification"]["accumulator"] = "plain-f32-pin".into();
+    entry.as_object_mut().unwrap().remove("canary");
+    let manifest = read(&[], &[entry]).unwrap();
+    let e = &manifest.library()[0];
+    assert_eq!(e.contract, Some(MatmulContract::BinaryDefined));
+    assert_eq!(
+        e.verification.as_ref().map(|v| (v.differ, v.max_ulp, v.accumulator)),
+        Some((64, 15176, MatmulAccumulator::PlainF32Pin))
+    );
+    assert!(e.canary.is_none());
+    // a GEMM of the impls of section 9 has the epilogue of its impl, beta 0 and none of the rest
+    let manifest = read(&[], &[gemm(true, 64, 1024, 1024), gemm(false, 32, 1024, 1024)]).unwrap();
+    for (stem, epilogue) in [("gemm_bias.M64", GemmEpilogue::Bias), ("gemm.M32", GemmEpilogue::None)] {
+        let e = manifest.library_entry(stem, "sm_103").unwrap();
+        assert_eq!(
+            (e.epilogue, e.beta, e.contract, e.verification.is_none(), e.canary.is_none()),
+            (epilogue, 0, None, true, true)
+        );
+    }
+}
+
+/// Every operand of a matmul entry of `dtype`.
+fn set_dtype(e: &mut Value, dtype: &str) {
+    for key in ["a", "b", "bias", "c", "out"] {
+        if e["dtypes"].get(key).is_some() {
+            e["dtypes"][key] = dtype.into();
+        }
+    }
+    for p in e["abi"]["params"].as_array_mut().unwrap() {
+        p["dtype"] = dtype.into();
+    }
+}
+
+fn remove(e: &mut Value, key: &str) {
+    e.as_object_mut().unwrap().remove(key);
+}
+
+#[test]
+fn a_matmul_entry_that_is_not_what_python_writes_is_refused() {
+    type Change = fn(&mut Value);
+    let cases: [(&str, Change, &str); 35] = [
+        ("no beta", |e| remove(e, "beta"), "missing [\"beta\"]"),
+        ("no contract", |e| remove(e, "contract"), "missing [\"contract\"]"),
+        ("no verification", |e| remove(e, "verification"), "missing [\"verification\"]"),
+        ("an imported algorithm", |e| e["algo_source"] = "imported".into(), "unknown [\"algo_source\"]"),
+        ("an unknown field", |e| e["note"] = 1.into(), "unknown field"),
+        (
+            "an epilogue that is not one",
+            |e| e["epilogue"] = "gelu".into(),
+            "the epilogue of cublaslt.matmul must be one of",
+        ),
+        ("beta 2", |e| e["beta"] = 2.into(), "beta must be the int 0 or 1"),
+        ("beta 1.0", |e| e["beta"] = 1.0.into(), "beta must be the int 0 or 1"),
+        ("beta true", |e| e["beta"] = true.into(), "beta must be the int 0 or 1"),
+        ("beta null", |e| e["beta"] = Value::Null, "beta must be the int 0 or 1"),
+        ("a contract that is not one", |e| e["contract"] = "exact".into(), "contract must be one of"),
+        (
+            "a verification of another field",
+            |e| e["verification"]["note"] = 0.into(),
+            "verification must be an object of exactly",
+        ),
+        (
+            "a verification without one",
+            |e| remove(&mut e["verification"], "max_ulp"),
+            "verification must be an object of exactly",
+        ),
+        (
+            "a verification that is a list",
+            |e| e["verification"] = json!([]),
+            "verification must be an object of exactly",
+        ),
+        (
+            "the formula of another epilogue",
+            |e| e["verification"]["formula"] = "acc + bias".into(),
+            "verification.formula must be",
+        ),
+        (
+            "an accumulator that is not one",
+            |e| e["verification"]["accumulator"] = "f64".into(),
+            "verification.accumulator must be one of",
+        ),
+        (
+            "no operand set",
+            |e| e["verification"]["operand_sets"] = 0.into(),
+            "verification.operand_sets must be a positive int",
+        ),
+        ("no element", |e| e["verification"]["elements"] = 0.into(), "verification.elements must be a positive int"),
+        (
+            "elements of another count",
+            |e| e["verification"]["elements"] = 4096.into(),
+            "verification.elements must be operand_sets * m * n = 131072, got 4096",
+        ),
+        (
+            "three operand sets",
+            |e| e["verification"]["operand_sets"] = 3.into(),
+            "verification.elements must be operand_sets * m * n = 196608, got 131072",
+        ),
+        (
+            "a negative differ",
+            |e| e["verification"]["differ"] = (-1).into(),
+            "verification.differ must be an int of at least 0",
+        ),
+        (
+            "a max_ulp that is a float",
+            |e| e["verification"]["max_ulp"] = 1.5.into(),
+            "verification.max_ulp must be an int of at least 0",
+        ),
+        (
+            "more elements that differ than elements",
+            |e| {
+                e["contract"] = "binary-defined".into();
+                e["verification"]["differ"] = (2 * 64 * 1024 + 1).into();
+            },
+            "is more than verification.elements",
+        ),
+        (
+            "measured-exact with elements that differ",
+            |e| e["verification"]["differ"] = 3.into(),
+            "but the verification found 3 elements",
+        ),
+        (
+            "binary-defined with none that differs",
+            |e| e["contract"] = "binary-defined".into(),
+            "but the verification found 0 elements",
+        ),
+        ("a max_ulp with none that differs", |e| e["verification"]["max_ulp"] = 5.into(), "but no element differs"),
+        ("a canary of null", |e| e["canary"] = Value::Null, "canary must be"),
+        ("a canary without its digest", |e| remove(&mut e["canary"], "out_digest"), "canary must be"),
+        (
+            "a canary of a convolution",
+            |e| e["canary"] = json!({"seed": 1, "y_digest": "ab".repeat(16)}),
+            "canary must be",
+        ),
+        ("a canary seed of 2^32", |e| e["canary"]["seed"] = (1u64 << 32).into(), "canary must be"),
+        ("a canary digest in upper case", |e| e["canary"]["out_digest"] = "AB".repeat(16).into(), "canary must be"),
+        ("f32 operands", |e| set_dtype(e, "f32"), "dtypes must be"),
+        ("an f32 result", |e| e["dtypes"]["out"] = "f32".into(), "dtypes must be"),
+        (
+            "the opt-in of f32 operands",
+            |e| e["allow_f32_reduction"] = true.into(),
+            "allow_f32_reduction is the opt-in of f32 operands",
+        ),
+        (
+            "the opt-in of f16 operands",
+            |e| e["allow_f16_reduction"] = true.into(),
+            "allow_f16_reduction is the opt-in of f16 operands",
+        ),
+    ];
+    for (what, change, why) in cases {
+        let mut entry = matmul("relu_bias", 1, 64, 1024, 512, "bf16");
+        change(&mut entry);
+        let message = refusal(&[], &[entry]);
+        assert!(message.contains(why), "{what}: {message}");
+        assert!(message.contains("library entry #0"), "{what}: {message}");
+    }
+    // a bias exactly for bias and relu_bias, c exactly for beta 1: in dtypes and in the ABI
+    let mut entry = matmul("relu", 0, 64, 1024, 512, "bf16");
+    entry["dtypes"]["bias"] = "bf16".into();
+    assert!(refusal(&[], &[entry]).contains("dtypes must be"));
+    let mut entry = matmul("none", 0, 64, 1024, 512, "bf16");
+    entry["dtypes"]["c"] = "bf16".into();
+    assert!(refusal(&[], &[entry]).contains("dtypes must be"));
+    let mut entry = matmul("bias", 1, 64, 1024, 512, "bf16");
+    entry["beta"] = 0.into();
+    entry["verification"]["formula"] = "acc + bias".into();
+    let message = refusal(&[], &[entry]);
+    assert!(message.contains("dtypes must be"), "{message}");
+    let mut entry = matmul("bias", 1, 64, 1024, 512, "bf16");
+    entry["abi"]["params"].as_array_mut().unwrap().remove(3);
+    let message = refusal(&[], &[entry]);
+    assert!(message.contains("abi.params must list 5 pointers (a, b, bias, c, out in this order)"), "{message}");
+    // the fields of a cublaslt.matmul are refused on the impls of section 9, each by its name
+    for key in ["beta", "contract", "verification", "canary"] {
+        let mut entry = gemm(true, 32, 1024, 1024);
+        entry[key] = matmul("bias", 0, 32, 1024, 1024, "bf16")[key].clone();
+        let message = refusal(&[], &[entry]);
+        assert!(message.contains(&format!("unknown [\"{key}\"]")), "{key}: {message}");
+    }
+    // and a gemm is not a cublaslt.matmul of another epilogue: its impl's holds
+    let mut entry = gemm(false, 32, 1024, 1024);
+    entry["epilogue"] = "relu".into();
+    assert!(refusal(&[], &[entry]).contains("the epilogue of cublaslt.gemm must be \"none\""));
+}
