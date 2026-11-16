@@ -8,8 +8,8 @@ Held here:
 * the outputs of an instrumented launch are the production bytes (jit and replay), and a null probe buffer records nothing and changes no byte;
 * the records say what the kernels do: the partitions of a warp-specialised kernel are told apart, the producer and the consumer of a pipeline run at
   one rate, the epilogue of a matmul waits as long as its main loop runs, each program of a persistent grid walks its own tiles on an SM of its own;
-* a plan records every instrumented step (jit, replay of an instrumented export, a captured replay), and ``tilefish-explain --probes`` reads a real
-  trace with the lines of the probes;
+* a plan records every instrumented step (jit, replay of an instrumented export, a captured replay), into its probe region or the caller's buffer,
+  and ``tilefish-explain --probes`` reads a real trace with the lines of the probes;
 * what the probes cost: each kernel captured in a CUDA graph with and without probes, replayed and timed; the numbers are printed (``-s``) and bounded.
 
 Ran on sm_103 (a B300 MIG slice); written to run on sm_120 too (the tcgen05 matmul is skipped there).
@@ -288,6 +288,22 @@ def test_a_plan_records_every_instrumented_step(tmp_path):
     captured.replay()  # every replay writes its records again
     captured.collect()
     assert len(rec.launches) == 2 and rec.launches[0].t0 > t0[1]
+
+
+def test_the_records_go_to_the_callers_buffer():
+    x = randn((256, 1024), F16, seed=18)
+    want = tilefish.run(pk.probe_chain, x)
+    buffer = torch.full((8 << 20,), 0xAB, dtype=torch.uint8, device="cuda")
+    rec = tilefish.Probes(buffer=buffer)
+    assert same_bytes(tilefish.run(pk.probe_chain, x, probes=rec), want)
+    assert [launch.op for launch in rec.launches] == ["bump_p", "ws_scale_p"] and all(not launch.missing for launch in rec.launches)
+    assert int((buffer[:16].view(torch.int32)[0] == 0x31706674).item())  # the first step's first warp, at the start of the caller's buffer
+    single = tilefish.Probes(buffer=buffer)
+    tilefish.run(pk.ws_scale_p, randn((128, 512), F16, seed=19), probes=single)
+    assert len(single.launches) == 1 and not single.launches[0].missing
+    small = tilefish.Probes(buffer=torch.empty(1024, dtype=torch.uint8, device="cuda"))
+    with pytest.raises(tilefish.TilefishProbeError, match="give a larger buffer"):
+        tilefish.run(pk.probe_chain, x, probes=small)
 
 
 def test_explain_reads_a_real_trace(exported, tmp_path, capsys):

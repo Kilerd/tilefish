@@ -1149,8 +1149,7 @@ class PlanRunner:
                     done = True
                 finally:
                     _carried_written(arena, call.rt, done)
-            if probes is not None:
-                with be.scope(index):
+                if probes is not None:  # (under the arena's lock: no later run of the plan writes the probe region before it is read back)
                     self.collect(call, probes)
         return runtime._result(call.results)
 
@@ -1659,6 +1658,8 @@ class PlanRunner:
             with arena.lock, be.scope(index):  # no other run of the plan is enqueued while the graph is captured
                 graph = be.capture_graph(index, stream, lambda s: self._enqueue(call, s, index, slots=False))
         held = tuple(bound.call.tensors.values()) + tuple(call.results) + tuple(t.tensor for t in call.taps)
+        if call.probe_tensor is not None:  # (the caller's probe buffer: the graph holds its address)
+            held += (call.probe_tensor,)
         captured = CapturedPlan(self, graph, call, index, epoch, held)
         captured.probes = probes
         return captured
@@ -1850,8 +1851,7 @@ class CapturedPlan:
         if rec is None or not self._call.probes:
             raise TilefishRuntimeError("CapturedPlan.collect: the plan was captured without probes= (tilefish.capture(..., probes=tilefish.Probes()))")
         be = self._runner.backend
-        with be.scope(self._index):
-            be.synchronize_stream(be.stream(self._index))
+        with be.scope(self._index), self._arena.lock:  # (no run or replay of the plan is enqueued while its records are read back)
             runtime._torch().cuda.synchronize(self._index)
             self._runner.collect(self._call, rec)
 

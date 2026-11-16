@@ -434,8 +434,9 @@ class ProbeTrace:
                 for c in ctas:
                     per_sm.setdefault(c["sm"], []).append(c)
                 for sm in sorted(per_sm)[:limit]:
-                    runs = ", ".join(f"CTA {c['cta']} {_us(c['start'])}-{_us(c['end'])}" for c in sorted(per_sm[sm], key=lambda c: c["start"]))
-                    out.append(f"  SM {sm:3d}: {runs}")
+                    mine = sorted(per_sm[sm], key=lambda c: c["start"])
+                    runs = ", ".join(f"CTA {c['cta']} {_us(c['start'])}-{_us(c['end'])}" for c in mine[:limit])
+                    out.append(f"  SM {sm:3d}: {runs}" + (f", ... ({len(mine) - limit} more CTAs, the last ending at {_us(max(c['end'] for c in mine))})" if len(mine) > limit else ""))
                 if len(per_sm) > limit:
                     out.append(f"  ... ({len(per_sm) - limit} more SMs)")
             else:
@@ -566,7 +567,7 @@ class Probes:
         ctas = math.prod(int(g) for g in grid)
         nbytes = _probe.buffer_bytes(capacity, warps, ctas)
         start = address - int(tensor.data_ptr())
-        data = tensor.view(-1)[start : start + nbytes].cpu().numpy().tobytes() if hasattr(tensor, "view") else bytes(tensor)[start : start + nbytes]
+        data = _host_bytes(tensor, start, nbytes)
         recs, missing = _probe.decode(data, capacity, warps, ctas)
         launch = Launch(
             stem=stem,
@@ -585,6 +586,17 @@ class Probes:
         )
         self.launches.append(launch)
         return launch
+
+
+def _host_bytes(tensor: Any, start: int, nbytes: int) -> bytes:
+    """``nbytes`` bytes of a device tensor of bytes from ``start``, read back (after the work its stream has)."""
+    if not hasattr(tensor, "view"):
+        return bytes(tensor)[start : start + nbytes]
+    host = tensor.view(-1)[start : start + nbytes].cpu()
+    try:
+        return host.numpy().tobytes()
+    except (ImportError, RuntimeError):  # torch without numpy
+        return bytes(host.tolist())
 
 
 def merge(traces: "Iterable[ProbeTrace]") -> ProbeTrace:
