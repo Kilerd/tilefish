@@ -5,6 +5,42 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+Manifest schema 3, plan schema 1 and every digest of a production export are unchanged: an export writes the same manifest, plans, plan sets
+and fusion reports as 0.0.10 (the Rust gate's whole export, traced, against 0.0.10's without a trace: every file and digest the same). Manifest
+schema 3 gains one optional entry field, `instrument`, written only by the instrumented variant (below).
+
+### Intra-kernel instrumentation (`docs/instrument.md`)
+
+- **`tilefish.probe("name")`** marks a phase boundary in a `@tilefish.kernel` body (between the ops written before and after it), a `@triton.jit`
+  or a `@gluon.jit` kernel (a builtin Triton's code generator calls; importing tilefish still imports neither Triton nor torch). A production build
+  compiles it to nothing: the IR and the machine code of the kernel without it (on sm_103 the production binary of a probed Gluon kernel has the
+  `sha256_code` of the same kernel written without probes).
+- **The instrumented variant**: `tilefish.runtime.export(ops, directory, instrument=True)` (or `tilefish.instrument(capacity=..., ops=...)`; graphs
+  and plan sets too) builds every Triton, Gluon and lowered binary with its probes as inline PTX, and rewrites the PTX of each entry between Triton's
+  `ptx` and `cubin` stages to add `@begin`, `@calib` (twice, in warp 0) and `@end`: lane 0 of every warp records `%globaltimer`, `%clock`, the probe
+  and `%smid` into its slot of a probe buffer the host passes in the profile scratch slot (null in production, so the ABI is unchanged; a null buffer
+  records nothing). Its entries carry `instrument` (manifest schema 3, section 4.8: the format, the capacity and the table of the kernel's probes
+  with their lines, the partition of a warp-specialised kernel each runs in and the jit function), so its binaries, its manifest digest and the
+  digests of its plans are its own. It is compiled every time (never from or into the build cache); the SASS assertions of a declaration are not
+  judged on it.
+- **It is never taken for the production artefact**: Python's `Manifest.load` refuses it unless `instrumented=True`, `tilefish.run(..., mode="replay")`
+  and `tilefish.capture` refuse it unless `probes=` (and refuse `probes=` on a production export), `tilefish.hosts.rust.emit` and
+  `tilefish.hosts.cpp.emit` refuse it, and an export refuses to write one variant into a directory of the other.
+- **Collecting**: `rec = tilefish.Probes()`; `tilefish.run(op, ..., probes=rec)` (jit builds the variant in memory; replay takes an instrumented export),
+  `tilefish.run(graph, ..., probes=rec)` (each bucket of an instrumented plan has a probe region, allocated with its binaries outside any capture, or
+  the caller's `Probes(buffer=...)`), `tilefish.capture(..., probes=rec)` and `CapturedPlan.collect()`; `rec.trace()` is a `ProbeTrace`
+  (`summary_text()`, `timeline_text(by="sm" | "cta" | "role")`, `chrome()`, `save()`), whose file `tilefish.probe-trace.v1` the Rust host writes too.
+- **`tilefish-explain DIR --probes FILE`**: per launch its span, the SM clock it measured, what a probe costs a warp (from `@calib`), the records kept
+  and dropped, and the phases between consecutive probes of a warp with their count and distribution per warp role (the partitions of
+  `gl.warp_specialize`, from the frontend's IR), with each probe's source line from the export's trace; `--timeline sm | cta | role`, `--chrome OUT`
+  (Perfetto), `--json`.
+- Measured on sm_103 (B300 slice): a probe costs a warp 45 to 80 cycles where it does not wait anyway; the instrumented kernels of the tests took
+  -6% to +8% of their production time (a Gluon producer and consumer, a persistent kernel of 552 records per warp, an elementwise kernel of 4096
+  short CTAs, a tcgen05 matmul); no shared memory, no stack frame. Triton's Proton was evaluated first and not used (`docs/instrument.md`, section 5:
+  a shared-memory buffer, 131 to 197 KB on the tcgen05 matmul; the SM clock only; process-wide state).
+
 ## tilefish 0.0.10, crate 0.0.8, tilefish-capi 0.0.1 (2026-11-16)
 
 Manifest schema 3, plan schema 1, both hosts and every digest are unchanged: an export writes the same manifest, plans, plan sets and fusion

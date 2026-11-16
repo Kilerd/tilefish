@@ -11,7 +11,7 @@ field that is not mentioned is as in schema 2.
 
 Contents: 1 what changed; 2 the top level; 3 the digest (3.1 what a pin vouches for, reproducible exports); 4 kernel entries (4.1 an implementation per
 architecture, 4.2 warp-specialised kernels, 4.3 persistent grids, 4.4 a configuration per bucket, 4.5 thread-block clusters, 4.6 a global scratch,
-4.7 the CUDA math functions of a generated kernel); 5 the ABI (strided views, device scalars, fixed arguments, scratch slots, an `out` written over its
+4.7 the CUDA math functions of a generated kernel, 4.8 the probes of an instrumented build); 5 the ABI (strided views, device scalars, fixed arguments, scratch slots, an `out` written over its
 input, TMA descriptors, null pointers, 64-bit dimension scalars); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM, and in 9.4 a pinned cuDNN convolution); 10 strict reading, every
 refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where it is tested.
 
@@ -45,6 +45,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | kernel entry (0.0.7, crate 0.0.5) | — | an optional `persistent`: a persistent grid, the tiles cut at launch to the programs the SMs of the device (or of its partition) run (section 4.3) |
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.cluster_dims` and `launch.num_ctas` of a thread-block cluster (a Triton kernel's `num_ctas`, a prebuilt binary's declared cluster) are launched with `cuLaunchKernelEx`, and `options.num_ctas` says it (section 4.5) |
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.global_scratch_size` above 0 is launched with a scratch of that many bytes per CTA, and `launch.global_scratch_align` records its alignment (section 4.6) |
+| kernel entry (Unreleased) | — | an optional `instrument` on the entry of an instrumented build (`export(..., instrument=True)`): its probes, recorded into the buffer a host gives in the profile scratch slot; a manifest with such an entry is an instrumented export, which both readers refuse unless asked to load one (section 4.8) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -142,7 +143,7 @@ A `kernels` entry has a `kind`, which is required and is exactly one of `"triton
 **`kind: "triton"`** is schema 2's entry plus `kind` and `abi.scratch_slots`. Its fields are
 
 `stem op kind arch ptx_target symbol cubin abi grid block shared num_warps num_stages launch constexprs buckets dims preconditions options
-declaration_digest sha256 sha256_code toolchain` and optionally `implementation` (section 4.1), `total_num_warps` (section 4.2), `persistent` (section 4.3), `cuda_math` (section 4.7), `source_sha256`,
+declaration_digest sha256 sha256_code toolchain` and optionally `implementation` (section 4.1), `total_num_warps` (section 4.2), `persistent` (section 4.3), `cuda_math` (section 4.7), `instrument` (section 4.8), `source_sha256`,
 `source_digest` + `source_digest_kind` (as in schema 2:
 `source_digest_kind` is `"tilefish.triton-ir.v1"` for the digest of the Triton IR, the TTIR of a `triton.jit` kernel, and `"tilefish.gluon-ir.v1"` for that of
 a Gluon kernel, `@tilefish.extern(gluon=...)`: the TTGIR Gluon's frontend builds, layouts and `num_warps` included, hashed under its own tag. A Gluon kernel is
@@ -442,6 +443,37 @@ are built on `expf`, `rsqrt` is `rsqrtf` and `erf` is `erff` (inline PTX read fr
   above, not sorted or with a repeat; `cuda` not empty for no function; a `libdevice` that is not a sha256; no function and no libdevice; the field on
   a `binary` entry or on an entry without `source_sha256`.
 * Where it is measured and kept: `docs/numerics.md` (the procedure to run on a CUDA or torch change), `python/tests/test_gpu_cuda_math.py`.
+
+### 4.8 The probes of an instrumented build: `instrument` (Unreleased)
+
+An instrumented build (`tilefish.runtime.export(..., instrument=True)` or `tilefish.instrument(capacity=..., ops=...)`, `docs/instrument.md`) records the
+kernel's `tilefish.probe` calls, and `@begin`, `@calib` and `@end`, into a probe buffer that a host gives in the profile scratch slot (the second slot of
+`abi.scratch`, which a production launch passes as null). Its entry says so:
+
+```json
+"instrument": {"format": "tilefish.probes.v1", "capacity": 256,
+               "probes": [{"id": 3, "name": "load.wait", "sites": [{"loc": "kernels/ws.py:44", "role": "worker 0", "function": "kernels.ws._load"}]}]}
+```
+
+| field | type and rule |
+|---|---|
+| `instrument` | optional object of exactly these three fields, only on a `triton` entry. Absent from every entry of a production export |
+| `instrument.format` | `"tilefish.probes.v1"`: the record format, the layout of the buffer and the probes the build adds (`docs/instrument.md`, section 3) |
+| `instrument.capacity` | integer from 1 to 65536: the records each warp keeps per launch; a launch's buffer is `ctas * warps * (16 + 16 * capacity)` bytes, `warps` the block's warps, `ctas` its CUDA grid |
+| `instrument.probes` | list of the kernel's probes, each `{"id", "name", "sites"}`: `id` an integer from 3 to 65535 (0, 1 and 2 are the build's `@begin`, `@end`, `@calib`), `name` the probe's (1 to 64 characters, a letter or `_` first, then letters, digits and `_ . : / -`), each id and each name once; `sites` a list of `{"loc", "role", "function"}`, all strings: the module-relative line it is written on, the partition of a warp-specialised kernel it runs in (`"default"`, `"worker 0"`, ...; `""` when the kernel is not partitioned) and the jit function. A kernel without probes has `[]` |
+
+* **What it is.** The entry of a binary that is not the production one: its `sha256`, `sha256_code` (and, for a kernel with probes, its
+  `source_digest`: the IR with its probes) are its own, and the field is in the manifest digest like every field, so an instrumented export has another
+  digest, and so have its plans. The declaration digest, the ABI, the grid and the launch attributes are the production entry's: nothing a host passes
+  changes but the profile scratch, the address of the buffer (16-byte aligned) instead of null.
+* **An instrumented export.** A manifest with an entry that has `instrument` is an instrumented export: Python's `Manifest.load` refuses it unless
+  `instrumented=True`, a replay refuses it unless it collects probes (`probes=`), and the Rust host's `Manifest::load` and `from_embedded` refuse it
+  (`Manifest::load_instrumented` takes it). An export never writes the two variants into one manifest. A reader that predates the field: the crate
+  0.0.7 refuses it (an unknown field); a launch of such a binary with a null profile scratch records nothing and writes the production bytes.
+* **Readers.** Both refuse: an `instrument` that is not an object of the three fields; another `format`; a capacity out of range (or a boolean); a
+  probe that is not an object of the three fields, an id out of range or repeated, a name that is not one or repeated; a site that is not an object of
+  three strings; the field on a `binary` entry.
+* Where it is tested: `python/tests/test_instrument.py`, `python/tests/test_gpu_instrument.py`, the crate's tests.
 
 ## 5. The ABI
 
@@ -1243,7 +1275,8 @@ document tilefish writes next to a build and the host does not read):
   `shared` not a non-negative int; `toolchain`, `launch`, `abi`, `options` not objects; `abi.scratch_slots` present and not `2`/`0` by kind;
   `source_sha256`/`source_digest` not 64 lowercase hex digits; `source_digest` and `source_digest_kind` not both present or both absent; an
   `implementation` (section 4.1) that is not the entry's `arch`, `"fallback"` or a name (an identifier of at most 64 characters, not `fallback` and not
-  beginning with `sm_` and a digit, in any case); a `cuda_math` (section 4.7) that is malformed or not on a generated kernel's `triton` entry; a
+  beginning with `sm_` and a digit, in any case); a `cuda_math` (section 4.7) that is malformed or not on a generated kernel's `triton` entry; an
+  `instrument` (section 4.8) that is malformed or on a `binary` entry, and any entry with one unless the reader was asked for an instrumented export; a
   `total_num_warps` (section 4.2) on a
   `binary` entry, not an integer, not more than `num_warps` or more than 32, or with a `block` that is not `[32 * total_num_warps, 1, 1]` (the Rust
   reader refuses a Triton entry whose `block` is not `[32 * num_warps, 1, 1]` without it; Python compares that block with the spec's); a `persistent`

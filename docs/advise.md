@@ -248,7 +248,7 @@ after the plan that writes it, which the profiler does not set up).
   `plan_model.deep_block(4)`, 110.4 us against 104.6 us. A step's net is within 1.1 us of nsys's kernel and gap but for one step (1.9 us). The
   events method's nets sum to 30.7 and 114.7 us.
 * **What it cannot see**: work inside a step (a library step of several kernels is one step), and the overlap of a step with the next one, which
-  `net` shares evenly instead of measuring. For a time inside a kernel, see issue #5 section 2.
+  `net` shares evenly instead of measuring. For a time inside a kernel: probes and the instrumented variant, `docs/instrument.md`.
 
 ## 7. How it is tested
 

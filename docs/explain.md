@@ -10,7 +10,8 @@ points that wait for it rather than to the work. tilefish makes the SASS of ever
 3. **SASS assertions** are part of a declaration and checked at every build like the TF32 guard and the contraction check (section 4).
 
 The code is `tilefish._trace`, `tilefish.explain` and `tilefish._sass`. Which steps of a plan could be one kernel, and what that would save, is
-`tilefish-explain --advise` (`docs/advise.md`).
+`tilefish-explain --advise` (`docs/advise.md`); what goes on inside a kernel, timed at the phase boundaries it declares, is `tilefish-explain --probes`
+(`docs/instrument.md`).
 
 ## 1. The trace
 
