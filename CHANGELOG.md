@@ -5,6 +5,50 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+Manifest schema 3 gains a library impl, `cublaslt.matmul` (section 9.5): additive, so every manifest, plan and pin of 0.0.11 is read and written as
+it was (the entries of `cublaslt.gemm` and `cublaslt.gemm_bias` and their digests are unchanged), and a reader of 0.0.11 or crate 0.0.9 refuses an
+entry of the new impl. Nothing changes bytes without a declaration: a graph planned as before (`epilogues="exact"`, the default) has the plan it had.
+
+### cuBLASLt epilogues: `cublaslt.matmul` (RFC 0003, milestone E2)
+
+- **A GEMM with a declared epilogue**: `@tilefish.library(..., impl="cublaslt.matmul", epilogue=..., beta=...)` with `epilogue` one of `"none"`,
+  `"bias"`, `"relu"`, `"relu_bias"` (cuBLASLt's `DEFAULT`, `BIAS`, `RELU`, `RELU_BIAS`) and `beta=1` to add `c [M, N]`: `out = epilogue(acc [+ c] [+
+  bias])` on the f32 accumulator, `c` before the bias (the library's order), rounded once; bf16 or f16 operands and result, the four layouts, both
+  postures, the opt-ins and `sm_count_target`. The bytes are the library's under the pin (contract (iii)). An epilogue gets no split-K without the opt-in,
+  as a bias does. `algos=` is not taken yet.
+- **Every pin is verified when it is made** (`jit` and `export`): two seeded operand sets with special values, compared bit for bit with the formula
+  computed in f32 on the pin's own accumulator (its configuration re-encoded with an f32 result) and rounded once. The entry records `contract`
+  (`"measured-exact"` or `"binary-defined"`) and `verification` (the formula, where the accumulator came from, the elements that differ and their largest
+  distance); `contract="measured-exact"` refuses a pin that is not. Measured on a B300 MIG slice over 14 shapes, bf16 and f16, both postures and seven
+  cases (392 pins per version): every pin measured-exact with cuBLASLt 12.8.4; with 13.1.0, 376 of 392, the others the pins of algorithm 21 at
+  32 x 1024 x 3072, which adds a bias to `c` in neither order and whose ReLU maps a NaN to 0 (`docs/rfcs/0003-epilogue-fusion.md`, section 7.3).
+- **A canary, on by default** (`canary=True`): `export` records the digest of the pin's result on operands made on the device from a seed (the PTX
+  module of the cuDNN canaries); a replay runs it once per process and device and refuses another digest (and a first replay inside a capture), as the
+  Rust and C++ hosts do at load.
+
+### `tilefish.fusion(epilogues="library")`
+
+- **The arithmetic after a cuBLASLt GEMM as one of its epilogues**, declared per graph: `y.to(f32)`, `+ c.to(f32)`, `+ bias.to(f32)`,
+  `tilefish.where(h <= 0.0, 0.0, h)` (ReLU, `torch.relu`'s bits) and `.to()` the GEMM's type, after a `cublaslt.gemm` of a 16-bit result (or the ReLU after
+  a `gemm_bias`), become one step of a `cublaslt.matmul` (`<gemm>__<epilogue>[_c]`) declared `contract="measured-exact"`: the rounding of `y` is removed
+  (contract (ii)), and every pin is verified equal to the region's arithmetic on the accumulator or the build is refused. A ReLU alone keeps the bytes
+  of the unfused plan (contract (i)). Another order, an f32 bias, a value read elsewhere or barriered is left as it is. `mode="reference"` interprets the
+  rewritten program. On a B300 slice the rewritten plans take 0 to 35% less time than the GEMM and its region (`README.md`, the table).
+- The fusion report gains `library_epilogues`: the rewrites, and why a widened GEMM result was not rewritten; a graph planned `"exact"` lists what the
+  mode would do (so a 0.0.11 export of a graph whose body widens a cuBLASLt GEMM's result gets that list in its informative report; no digest has it).
+  The report's `fusion` says `epilogues` when it is declared; the regions' names do not depend on the mode.
+- **The advisor** reports a region that the mode would make a cuBLASLt epilogue as the blocker `epilogue-library-cublaslt`, of the new phase `E2` (a
+  mode to declare), with the epilogue and the contract; one that is not is `epilogue-library` with the reason (such as the order of the adds).
+
+### Smaller changes
+
+- `tilefish._cublaslt`: `pin_algo`, `check_algo`, `describe` and `matmul` take `epilogue=` (and `beta=`, `c_ptr=`); `reduction_problem` takes the
+  epilogue's name for its words. Called without them, every call is 0.0.11's.
+- A plan backend's `gemm` is passed `c=` for a `cublaslt.matmul` step that reads `c` (only then). A re-export whose `contract` differs from the manifest's
+  entry is another binary (`overwrite=True` to replace it).
+
 ## tilefish 0.0.11, crate 0.0.9, tilefish-capi 0.0.1 (2026-11-17)
 
 Manifest schema 3 and plan schema 1 are unchanged but for one optional entry field, `instrument`, which only the instrumented variant writes (below).
