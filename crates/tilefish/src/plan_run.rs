@@ -70,6 +70,7 @@ use crate::launch_plan::{BufferRole, LaunchPlan, PlanBuffer, StepKind, describe_
 use crate::manifest::{Access, ParamKind, ShapeDim};
 use crate::memory::sealed;
 use crate::plan::Prepared;
+use crate::probes::{ProbeLaunch, ProbeMeta};
 use crate::tensor::{Backing, DType, TensorArg};
 
 /// The value of a device scalar (a buffer of role `devscalar`), which a launch writes into its slot of the arena.
@@ -476,6 +477,8 @@ impl ArenaCore {
 struct Instance {
     plan: LaunchPlan,
     arena: Arc<ArenaCore>,
+    /// An instantiation of an instrumented plan made with probes ([`LaunchPlan::instantiate_probed`]): where every instrumented step records.
+    probes: Option<ProbeRegion>,
     buckets: Vec<BucketRun>,
     by_name: HashMap<String, usize>,
     /// The dimensions, numbered in the order of the plan's `dims` (what the externals' shapes bind).
@@ -511,6 +514,40 @@ impl Instance {
     fn lock_arena(&self) -> MutexGuard<'_, Arena> {
         self.arena.lock()
     }
+}
+
+/// The probe buffer of an instantiation made with probes (`docs/instrument.md`): allocated with it, on the stream it was instantiated with (outside
+/// any capture, as the arena is), of the bytes of the largest bucket's records; each instrumented step of a bucket has its region of it, at a
+/// 256-byte aligned offset, of a slot per warp of every CTA of the step's CUDA grid at that bucket. The steps address it as they address the arena
+/// (a captured graph holds the addresses of its regions); every execution writes the regions of the steps it runs, so the buffer holds the records
+/// of the last one, which [`PlanRun::collect_probes`] reads.
+struct ProbeRegion {
+    /// Held, not read by cudarc: the steps write it, the executions are ordered by the arena's order event, and it is read after that event.
+    slice: CudaSlice<u8>,
+    /// The stream it was allocated on (and is read and freed on).
+    home: Arc<CudaStream>,
+    addr: u64,
+    /// Per instantiated bucket, per step: where its records go (`None`: a step that records nothing).
+    layouts: Vec<Vec<Option<ProbeSlot>>>,
+    /// The bucket (an index into `Instance::buckets`) of the last execution that recorded.
+    last: Mutex<Option<usize>>,
+}
+
+impl std::fmt::Debug for ProbeRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeRegion")
+            .field("addr", &self.addr)
+            .field("bytes", &self.slice.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where one instrumented step records: `offset` bytes into the probe buffer, `bytes` of them, and what decodes them.
+#[derive(Debug)]
+struct ProbeSlot {
+    offset: u64,
+    bytes: u64,
+    meta: ProbeMeta,
 }
 
 /// An arena shared by several plans that a host runs **one at a time** (`docs/plan-schema-1.md`, section 15.1): the plans of a set (stage A,
@@ -680,26 +717,39 @@ impl LaunchPlan {
     /// allocate the arena on `stream` (which it is freed on; the first launch on that stream does not wait for the allocation). The device must
     /// be of the plan's architecture.
     pub fn instantiate(&self, stream: &Arc<CudaStream>, values: &[(&str, u64)]) -> Result<PlanRun> {
-        PlanRun::new(self, Place::Own(stream), &self.bucket_indices(values)?)
+        PlanRun::new(self, Place::Own(stream), &self.bucket_indices(values)?, false)
     }
 
     /// Instantiate the plan for every bucket combination: one arena serves all of them (a buffer is at the same offset in every bucket).
     pub fn instantiate_all(&self, stream: &Arc<CudaStream>) -> Result<PlanRun> {
         let all: Vec<usize> = (0..self.buckets().len()).collect();
-        PlanRun::new(self, Place::Own(stream), &all)
+        PlanRun::new(self, Place::Own(stream), &all, false)
+    }
+
+    /// [`LaunchPlan::instantiate`] of the plan of an **instrumented** export ([`LaunchPlan::load_instrumented`], `docs/instrument.md`) that records
+    /// its probes: a probe buffer is allocated with the arena, on `stream`, and every instrumented step of a launch or a replay records into its region
+    /// of it; [`PlanRun::collect_probes`] reads the records of the last one. Refused for the plan of a production export.
+    pub fn instantiate_probed(&self, stream: &Arc<CudaStream>, values: &[(&str, u64)]) -> Result<PlanRun> {
+        PlanRun::new(self, Place::Own(stream), &self.bucket_indices(values)?, true)
+    }
+
+    /// [`LaunchPlan::instantiate_probed`] for every bucket combination (one probe buffer of the largest bucket's records serves all of them).
+    pub fn instantiate_all_probed(&self, stream: &Arc<CudaStream>) -> Result<PlanRun> {
+        let all: Vec<usize> = (0..self.buckets().len()).collect();
+        PlanRun::new(self, Place::Own(stream), &all, true)
     }
 
     /// [`LaunchPlan::instantiate`] on a [`SharedArena`] instead of an arena of its own: the kernels and GEMMs are loaded in the arena's context,
     /// and every launch and replay of the returned [`PlanRun`] is ordered with those of every other plan on the arena. The plan must be one the
     /// arena was made for (the same digest): another is refused, whatever its size.
     pub fn instantiate_in(&self, arena: &SharedArena, values: &[(&str, u64)]) -> Result<PlanRun> {
-        PlanRun::new(self, Place::Shared(arena), &self.bucket_indices(values)?)
+        PlanRun::new(self, Place::Shared(arena), &self.bucket_indices(values)?, false)
     }
 
     /// [`LaunchPlan::instantiate_all`] on a [`SharedArena`] (see [`LaunchPlan::instantiate_in`]).
     pub fn instantiate_all_in(&self, arena: &SharedArena) -> Result<PlanRun> {
         let all: Vec<usize> = (0..self.buckets().len()).collect();
-        PlanRun::new(self, Place::Shared(arena), &all)
+        PlanRun::new(self, Place::Shared(arena), &all, false)
     }
 }
 
@@ -835,7 +885,14 @@ fn tracked(
 }
 
 impl PlanRun {
-    fn new(plan: &LaunchPlan, place: Place<'_>, buckets: &[usize]) -> Result<Self> {
+    fn new(plan: &LaunchPlan, place: Place<'_>, buckets: &[usize], probed: bool) -> Result<Self> {
+        if probed && !plan.manifest().is_instrumented() {
+            return Err(Error::Launch(format!(
+                "the plan of graph '{}' is of a production export, whose binaries record no probes: instantiate_probed runs the plan of an \
+                 instrumented export (LaunchPlan::load_instrumented)",
+                plan.graph()
+            )));
+        }
         let ctx = match place {
             Place::Own(stream) => {
                 // the arena is allocated and freed on this stream, and its order event first recorded there: it cannot be the per-thread
@@ -1016,10 +1073,11 @@ impl PlanRun {
         // -- every step's preconditions that no address can change, with made-up addresses for the externals (Python's virtual ones, distinct
         // per buffer): a refusal comes now, not at the first launch
         let bases: Vec<u64> = buffers.iter().enumerate().map(|(i, b)| place_of(i, b)).collect();
-        let run = Self {
+        let mut run = Self {
             inner: Arc::new(Instance {
                 plan: plan.clone(),
                 arena,
+                probes: None,
                 buckets: runs,
                 by_name,
                 syms,
@@ -1028,12 +1086,110 @@ impl PlanRun {
                 carried_writes,
             }),
         };
+        let mut layouts: Vec<Vec<Option<ProbeSlot>>> = Vec::with_capacity(run.inner.buckets.len());
+        let mut probe_bytes = 0u64;
         for (k, bucket) in run.inner.buckets.iter().enumerate() {
             let bases = bases.clone();
-            run.ready(&Bound { bucket: k, bases, slots: Vec::new() })
+            let ready = run
+                .ready(&Bound { bucket: k, bases, slots: Vec::new() })
                 .map_err(|e| in_step(e, &format!("at {}", describe_values(&plan.buckets()[bucket.index].values))))?;
+            if probed {
+                // where each instrumented step records at this bucket: its CUDA grid is the bucket's (the shapes of a bucket are exact)
+                let mut offset = 0u64;
+                let mut slots = Vec::with_capacity(ready.len());
+                for r in &ready {
+                    let meta = match r {
+                        Ready::Kernel(kernel, prepared) => kernel.probe_meta(prepared),
+                        _ => None,
+                    };
+                    slots.push(match meta {
+                        Some(meta) => {
+                            let bytes = meta.bytes().ok_or_else(|| {
+                                Error::Unsupported(format!(
+                                    "the records of a step of the plan of graph '{}' do not fit 64 bits",
+                                    plan.graph()
+                                ))
+                            })?;
+                            let at = offset.div_ceil(256) * 256;
+                            offset = at + bytes;
+                            Some(ProbeSlot { offset: at, bytes, meta })
+                        }
+                        None => None,
+                    });
+                }
+                probe_bytes = probe_bytes.max(offset);
+                layouts.push(slots);
+            }
+        }
+        if probed {
+            let home = match place {
+                Place::Own(stream) => Arc::clone(stream),
+                Place::Shared(shared) => Arc::clone(&shared.core.home),
+            };
+            let bytes = usize::try_from(probe_bytes.max(1))
+                .map_err(|_| Error::Unsupported("the probe buffer does not fit the address space".to_owned()))?;
+            let slice = home.alloc_zeros::<u8>(bytes).map_err(Error::driver("cuMemAllocAsync"))?;
+            let addr = sealed::Memory::region(&slice).addr;
+            let region = ProbeRegion { slice, home, addr, layouts, last: Mutex::new(None) };
+            Arc::get_mut(&mut run.inner).expect("the only handle of a new instantiation").probes = Some(region);
         }
         Ok(run)
+    }
+
+    /// Whether the instantiation records probes ([`LaunchPlan::instantiate_probed`]).
+    pub fn probed(&self) -> bool {
+        self.inner.probes.is_some()
+    }
+
+    /// The records of the last launch or replay of an instantiation made with probes ([`LaunchPlan::instantiate_probed`], `docs/instrument.md`):
+    /// one [`ProbeLaunch`] per instrumented step of its bucket, with the graph, the step and the bucket. Waits on the host for every execution on the
+    /// arena (its order event), then reads the probe buffer back on the stream it was allocated on. Collect a run's records before the next run of
+    /// the instantiation, which writes over them.
+    pub fn collect_probes(&self) -> Result<Vec<ProbeLaunch>> {
+        let inner = &*self.inner;
+        let Some(region) = inner.probes.as_ref() else {
+            return Err(Error::Launch(format!(
+                "the plan of graph '{}' was instantiated without probes: instantiate the plan of an instrumented export with \
+                 LaunchPlan::instantiate_probed",
+                inner.plan.graph()
+            )));
+        };
+        let Some(bucket) = *region.last.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) else {
+            return Err(Error::Launch(format!(
+                "no launch or replay of the plan of graph '{}' has recorded probes yet",
+                inner.plan.graph()
+            )));
+        };
+        {
+            let arena = inner.lock_arena();
+            match arena.order.as_ref() {
+                Some(order) => order.synchronize()?,
+                None => inner.arena.context.synchronize().map_err(Error::driver("cuCtxSynchronize"))?,
+            }
+        }
+        let data = region.home.clone_dtoh(&region.slice).map_err(Error::driver("cuMemcpyDtoHAsync"))?;
+        region.home.synchronize().map_err(Error::driver("cuStreamSynchronize"))?;
+        let plan = &inner.plan;
+        let values = plan.buckets()[inner.buckets[bucket].index].values.clone();
+        let mut out = Vec::new();
+        for (si, slot) in region.layouts[bucket].iter().enumerate() {
+            let Some(slot) = slot else { continue };
+            let (from, to) = (slot.offset as usize, (slot.offset + slot.bytes) as usize);
+            let mut launch = slot.meta.decode(&data[from..to])?;
+            launch.graph = Some(plan.graph().to_owned());
+            launch.step = Some(si);
+            launch.bucket = Some(values.clone());
+            launch.manifest_digest = Some(plan.manifest_digest().to_owned());
+            out.push(launch);
+        }
+        Ok(out)
+    }
+
+    /// Note that the execution of bucket `bucket` recorded probes (its records are the probe buffer's now).
+    fn recorded(&self, bucket: usize) {
+        if let Some(region) = &self.inner.probes {
+            *region.last.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bucket);
+        }
     }
 
     /// The plan.
@@ -1488,7 +1644,18 @@ impl PlanRun {
     /// each kernel, the addresses of each GEMM. A refusal is the step's, and nothing is launched.
     fn ready(&self, bound: &Bound) -> Result<Vec<Ready<'_>>> {
         let steps = self.inner.buckets[bound.bucket].steps.len();
-        (0..steps).map(|si| self.ready_step(bound.bucket, si, &bound.bases)).collect()
+        let mut ready: Vec<Ready<'_>> =
+            (0..steps).map(|si| self.ready_step(bound.bucket, si, &bound.bases)).collect::<Result<_>>()?;
+        if let Some(region) = &self.inner.probes {
+            // an instrumented step of an instantiation with probes: its region of the probe buffer is its profile scratch (the last slot)
+            for (r, slot) in ready.iter_mut().zip(&region.layouts[bound.bucket]) {
+                if let (Ready::Kernel(_, prepared), Some(slot)) = (r, slot) {
+                    let at = prepared.count - 1;
+                    prepared.values[at] = region.addr + slot.offset;
+                }
+            }
+        }
+        Ok(ready)
     }
 
     /// Step `si` of the instantiated bucket `bucket` checked with the addresses `bases` (one per buffer), as a single launch is checked.
@@ -1817,6 +1984,9 @@ impl PlanRun {
         };
         arena.slots_of = 0;
         self.carried_written(&mut arena, bound.bucket, launched.is_ok());
+        if launched.is_ok() {
+            self.recorded(bound.bucket);
+        }
         launched
     }
 
@@ -2178,6 +2348,9 @@ impl<'ext> CapturedPlan<'ext> {
             })
         };
         self.run.carried_written(&mut arena, self.bucket, replayed.is_ok());
+        if replayed.is_ok() {
+            self.run.recorded(self.bucket);
+        }
         match replayed {
             Ok(()) => {
                 if write {

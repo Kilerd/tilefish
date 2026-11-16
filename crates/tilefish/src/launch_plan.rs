@@ -1375,9 +1375,19 @@ impl LaunchPlan {
     /// digests are only as good as its permissions). Either way the file's own `plan_digest` must be its digest (an edit that did not rewrite it
     /// is refused), every rule of the format must hold, the manifest in the same directory must have the digest the plan names (it is loaded
     /// with that pin, every cubin verified), and every step must be what the manifest's entries say. A plan of another architecture than the
-    /// device is refused when it is instantiated.
+    /// device is refused when it is instantiated. The plan of an **instrumented** export (`docs/instrument.md`) is refused, as its manifest is
+    /// ([`Manifest::load`]): load it with [`LaunchPlan::load_instrumented`].
     pub fn load(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::load_variant(path.as_ref(), pin, false)
+    }
+
+    /// [`LaunchPlan::load`] of the plan of an **instrumented** export (`docs/instrument.md`): verified the same way, its manifest loaded with
+    /// [`Manifest::load_instrumented`]. Run it with [`LaunchPlan::instantiate_probed`] to collect its probes.
+    pub fn load_instrumented(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
+        Self::load_variant(path.as_ref(), pin, true)
+    }
+
+    fn load_variant(path: &Path, pin: Pin<'_>, instrumented: bool) -> Result<Self> {
         let (directory, file): (PathBuf, PathBuf) = if path.is_dir() {
             (path.to_owned(), path.join(PLAN_NAME))
         } else {
@@ -1386,7 +1396,13 @@ impl LaunchPlan {
         let label = file.display().to_string();
         let bytes = read_plan_file(&file)?;
         let (validated, digest) = read_document(&label, &bytes, pin)?;
-        let manifest = match Manifest::load(directory.join(MANIFEST_NAME), Pin::Digest(&validated.manifest_digest)) {
+        let pinned = Pin::Digest(&validated.manifest_digest);
+        let loaded = if instrumented {
+            Manifest::load_instrumented(directory.join(MANIFEST_NAME), pinned)
+        } else {
+            Manifest::load(directory.join(MANIFEST_NAME), pinned)
+        };
+        let manifest = match loaded {
             Ok(m) => m,
             Err(Error::PinMismatch { directory, found, pinned }) => {
                 return Err(bad(format!(

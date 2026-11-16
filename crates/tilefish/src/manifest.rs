@@ -30,6 +30,9 @@ use crate::gemm::CachedGemm;
 use crate::json::{Members, PathStep, canonical, parse_strict_keeping, type_name};
 use crate::kernel::Cached;
 use crate::library::{LibraryEntry, RawLibrary};
+use crate::probes::{
+    Instrument, PROBE_FIRST_ID, PROBE_FORMAT, PROBE_MAX_CAPACITY, PROBE_MAX_ID, Probe, ProbeSite, is_probe_name,
+};
 use crate::tensor::DType;
 
 /// The only manifest schema this host reads. Python's `MANIFEST_SCHEMA`. Schema 3 adds to schema 2 (where every pointer records its declared
@@ -727,6 +730,10 @@ pub struct Entry {
     /// A persistent grid (manifest schema 3, section 4.3): the grid is the tiles, and a launch runs at most `programs_per_sm` programs per SM of
     /// the device (or partition) the kernel was loaded for. `None` for every other kernel.
     pub persistent: Option<Persistent>,
+    /// The probes of an **instrumented** binary (manifest schema 3, section 4.8; `docs/instrument.md`): the records each warp keeps and the kernel's
+    /// probes. Only a Triton kernel of an instrumented export has it, and only [`Manifest::load_instrumented`] loads such a manifest; a
+    /// launch gives the binary a probe buffer ([`crate::Kernel::launch_probed`]). `None` for every production binary.
+    pub instrument: Option<Instrument>,
     /// The verified cubin.
     pub cubin: Arc<[u8]>,
 }
@@ -868,6 +875,9 @@ by_name! {
     RawOptions => RawOptions::deserialize, "options";
     RawToolchain => RawToolchain::deserialize, "toolchain";
     RawCudaMath => RawCudaMath::deserialize, "cuda_math";
+    RawInstrument => RawInstrument::deserialize, "instrument";
+    RawProbe => RawProbe::deserialize, "a probe of instrument.probes";
+    RawProbeSite => RawProbeSite::deserialize, "a site of a probe";
 }
 
 #[derive(Deserialize)]
@@ -926,6 +936,91 @@ struct RawEntry {
     source_digest_kind: Option<String>,
     #[serde(default)]
     persistent: Option<RawPersistent>,
+    #[serde(default)]
+    instrument: Option<RawInstrument>,
+}
+
+/// `instrument` of an instrumented binary's entry (section 4.8): every field by name, none unknown (Python's `_probe.check_field`).
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct RawInstrument {
+    format: String,
+    capacity: u64,
+    probes: Vec<RawProbe>,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct RawProbe {
+    id: u64,
+    name: String,
+    sites: Vec<RawProbeSite>,
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "Self", deny_unknown_fields)]
+struct RawProbeSite {
+    loc: String,
+    role: String,
+    function: String,
+}
+
+/// What is wrong with an entry's `instrument` (Python's `_probe.check_field`): the format this host reads, a capacity from 1 to 65536, ids from 3
+/// to 65535 and names of probes, each once.
+fn check_instrument(raw: &RawInstrument) -> std::result::Result<(), String> {
+    if raw.format != PROBE_FORMAT {
+        return Err(format!(
+            "instrument.format is {:?}, which this host does not read (it reads {PROBE_FORMAT:?})",
+            raw.format
+        ));
+    }
+    if !(1..=PROBE_MAX_CAPACITY).contains(&raw.capacity) {
+        return Err(format!(
+            "instrument.capacity must be an integer from 1 to {PROBE_MAX_CAPACITY}, got {}",
+            raw.capacity
+        ));
+    }
+    let mut ids = HashSet::new();
+    let mut names = HashSet::new();
+    for (k, p) in raw.probes.iter().enumerate() {
+        if !(PROBE_FIRST_ID..=PROBE_MAX_ID).contains(&p.id) || !ids.insert(p.id) {
+            return Err(format!(
+                "instrument.probes[{k}].id must be an integer from {PROBE_FIRST_ID} to {PROBE_MAX_ID}, each once, got {}",
+                p.id
+            ));
+        }
+        if !is_probe_name(&p.name) || !names.insert(p.name.as_str()) {
+            return Err(format!(
+                "instrument.probes[{k}].name must be the name of a probe, each once, got {:?}",
+                p.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn instrument_of(raw: RawInstrument) -> Instrument {
+    Instrument {
+        capacity: raw.capacity as u32,
+        probes: raw
+            .probes
+            .into_iter()
+            .map(|p| Probe {
+                id: p.id as u16,
+                name: p.name,
+                sites: p
+                    .sites
+                    .into_iter()
+                    .map(|s| ProbeSite { loc: s.loc, role: s.role, function: s.function })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Whether a manifest document is an instrumented export: one of its kernel entries has `instrument` (section 4.8; Python's `is_instrumented`).
+fn instrumented_doc(kernels: &[Value]) -> bool {
+    kernels.iter().any(|k| k.get("instrument").is_some())
 }
 
 #[derive(Deserialize)]
@@ -1971,6 +2066,7 @@ impl Entry {
             source_digest: raw.source_digest,
             source_digest_kind: raw.source_digest_kind,
             persistent: raw.persistent.map(|p| Persistent { programs_per_sm: p.programs_per_sm, sm_count: p.sm_count }),
+            instrument: raw.instrument.map(instrument_of),
             cubin,
         };
         strictly(entry.check_consistent(&mut syms), &who)?;
@@ -2030,6 +2126,15 @@ impl Entry {
             check_cuda_math(math)?;
             if kind != EntryKind::Triton || raw.source_sha256.is_none() {
                 return Err("cuda_math is only on the entry of a kernel tilefish generated (a triton entry with a source_sha256)".to_owned());
+            }
+        }
+        if let Some(instrument) = &raw.instrument {
+            check_instrument(instrument)?;
+            if kind != EntryKind::Triton {
+                return Err(
+                    "instrument is only on the entry of a Triton kernel (a prebuilt binary is never instrumented)"
+                        .to_owned(),
+                );
             }
         }
         match kind {
@@ -2661,21 +2766,42 @@ impl Manifest {
     /// export it again), one whose digest is not the pinned one (before any cubin is read), a cubin that is a symbolic link or whose name
     /// is not a plain file name in the directory, and a cubin whose `sha256` or `sha256_code` is not the manifest's, that is not an ELF
     /// file with the code section of the manifest's symbol, or that is for another architecture than the entry says.
+    ///
+    /// An **instrumented** export (an entry with `instrument`: Python's `export(..., instrument=True)`, `docs/instrument.md`) is a diagnostic
+    /// variant, never a production artefact: it is refused here, and loaded with [`Manifest::load_instrumented`] only.
     pub fn load(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::load_variant(path.as_ref(), pin, false)
+    }
+
+    /// [`Manifest::load`] of an **instrumented** export (`docs/instrument.md`): verified the same way, and accepted whether or not its entries have
+    /// `instrument`. Its instrumented binaries are launched with a probe buffer ([`crate::Kernel::launch_probed`], a plan with
+    /// [`crate::LaunchPlan::instantiate_probed`]); it is never the manifest a production host runs.
+    pub fn load_instrumented(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
+        Self::load_variant(path.as_ref(), pin, true)
+    }
+
+    fn load_variant(path: &Path, pin: Pin<'_>, instrumented: bool) -> Result<Self> {
         let (directory, manifest_path): (PathBuf, PathBuf) = if path.is_dir() {
             (path.to_owned(), path.join(MANIFEST_NAME))
         } else {
             (path.parent().map_or_else(|| PathBuf::from("."), Path::to_owned), path.to_owned())
         };
         let bytes = read_file(&manifest_path)?;
-        Self::from_parts(&directory.display().to_string(), &bytes, pin, |name| read_file(&directory.join(name)))
+        Self::from_parts(&directory.display().to_string(), &bytes, pin, instrumented, |name| {
+            read_file(&directory.join(name))
+        })
+    }
+
+    /// Whether this is an instrumented export: one of its entries has [`Entry::instrument`].
+    pub fn is_instrumented(&self) -> bool {
+        self.entries.iter().any(|e| e.instrument.is_some())
     }
 
     /// A manifest whose files are in memory (what `include_bytes!` gives a generated module): `manifest` is the
-    /// contents of `manifest.json` and `cubins` are `(file name, contents)` pairs. Verified exactly like [`Manifest::load`].
+    /// contents of `manifest.json` and `cubins` are `(file name, contents)` pairs. Verified exactly like [`Manifest::load`] (an instrumented
+    /// export is refused: an embedded manifest is a production host's).
     pub fn from_embedded(manifest: &[u8], cubins: &[(&str, &[u8])], pin: Pin<'_>) -> Result<Self> {
-        Self::from_parts("<embedded>", manifest, pin, |name| {
+        Self::from_parts("<embedded>", manifest, pin, false, |name| {
             cubins
                 .iter()
                 .find(|(n, _)| *n == name)
@@ -2688,6 +2814,7 @@ impl Manifest {
         label: &str,
         manifest: &[u8],
         pin: Pin<'_>,
+        instrumented: bool,
         mut read_cubin: impl FnMut(&str) -> Result<Vec<u8>>,
     ) -> Result<Self> {
         if let Pin::Digest(d) = pin
@@ -2725,6 +2852,14 @@ impl Manifest {
             return Err(Error::manifest(format!(
                 "the manifest {label:?} is not a tilefish manifest of schema {MANIFEST_SCHEMA} (schema {})",
                 raw.schema
+            )));
+        }
+        // an instrumented export, before anything else of it is read (Python's `Manifest.load` refuses it there too)
+        if instrumented_doc(&raw.kernels) && !instrumented {
+            return Err(Error::manifest(format!(
+                "the manifest {label:?} is an instrumented export (its kernels record probes: docs/instrument.md), a diagnostic variant with \
+                 binaries and a digest of its own, never the production artefact: load it with Manifest::load_instrumented to collect its probes, \
+                 and run the production export everywhere else"
             )));
         }
         let mut raws = Vec::with_capacity(raw.kernels.len());

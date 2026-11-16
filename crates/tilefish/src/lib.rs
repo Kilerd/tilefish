@@ -266,6 +266,7 @@ mod par;
 mod plan;
 mod plan_run;
 mod plan_set;
+mod probes;
 mod region;
 mod tensor;
 
@@ -293,6 +294,12 @@ pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, GLOBAL_SCRATCH, Plan, Prepared, TensorMapEncode};
 pub use plan_run::{CapturedPlan, CarriedLayout, DevScalar, PlanRun, SharedArena, Tap, WeightedRun};
 pub use plan_set::{PLAN_SET_NAME, PLAN_SET_SCHEMA, PlanSet, SetRun, plan_file_name, plan_set_digest};
+pub use probes::{
+    DecodedProbes, IMPLICIT_PROBES, Instrument, PROBE_ALIGNMENT, PROBE_FIRST_ID, PROBE_FORMAT, PROBE_HEADER_BYTES,
+    PROBE_MAGIC, PROBE_MAX_CAPACITY, PROBE_MAX_ID, PROBE_RECORD_BYTES, PROBE_TRACE_SCHEMA, Probe, ProbeBuffer,
+    ProbeLaunch, ProbeRecord, ProbeSite, ProbeTrace, WarpRecords, decode_probes, is_probe_name, probe_buffer_bytes,
+    warps_of,
+};
 pub use region::DevicePtr;
 pub use tensor::{Bf16, DType, E4m3, E5m2, Element, F16, F32, I32, I64, Readable, TensorArg, TensorMut, TensorRef, U8};
 

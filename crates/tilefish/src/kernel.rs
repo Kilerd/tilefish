@@ -28,11 +28,12 @@ use cudarc::nvrtc::Ptx;
 pub use cudarc::driver::sys::CUstream;
 pub use cudarc::driver::{CudaContext, CudaStream};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, PreconditionKind, Result};
 use crate::ffi;
 use crate::manifest::{Manifest, Param};
 use crate::plan::{DeviceInfo, Plan, Prepared};
-use crate::tensor::TensorArg;
+use crate::probes::{Instrument, PROBE_ALIGNMENT, ProbeBuffer, ProbeMeta};
+use crate::tensor::{TensorArg, TensorMut, U8};
 
 /// Dynamic shared memory above this needs `cuFuncSetAttribute`.
 const DEFAULT_SHARED_LIMIT: u32 = 48 * 1024;
@@ -85,6 +86,9 @@ struct Loaded {
     sm_count: Option<u64>,
     stem: String,
     arch: String,
+    op: String,
+    /// The probes of an instrumented binary (its entry's `instrument`); `None` for a production one.
+    instrument: Option<Arc<Instrument>>,
 }
 
 impl fmt::Debug for Loaded {
@@ -147,6 +151,34 @@ impl Kernel {
 
     pub(crate) fn function(&self) -> &CudaFunction {
         &self.loaded.function
+    }
+
+    /// The operator of the binary.
+    pub fn op(&self) -> &str {
+        &self.loaded.op
+    }
+
+    /// The probes of an **instrumented** binary (`docs/instrument.md`: its entry's [`Instrument`]), `None` for a production one.
+    pub fn instrument(&self) -> Option<&Instrument> {
+        self.loaded.instrument.as_deref()
+    }
+
+    /// The bytes of the probe buffer a launch checked as `prepared` needs ([`Kernel::check`]): a slot per warp of every CTA of its CUDA grid
+    /// (`docs/instrument.md`); `None` for a production binary, which takes none.
+    pub fn probe_bytes(&self, prepared: &Prepared) -> Option<u64> {
+        self.probe_meta(prepared).and_then(|m| m.bytes())
+    }
+
+    pub(crate) fn probe_meta(&self, prepared: &Prepared) -> Option<ProbeMeta> {
+        let instrument = self.loaded.instrument.as_ref()?;
+        Some(ProbeMeta {
+            stem: self.loaded.stem.clone(),
+            arch: self.loaded.arch.clone(),
+            op: self.loaded.op.clone(),
+            grid: prepared.grid,
+            block: self.plan.block(),
+            instrument: Arc::clone(instrument),
+        })
     }
 
     /// Check a call without launching it: every precondition of the manifest, and the grid against the device's limits.
@@ -221,6 +253,86 @@ impl Kernel {
         }
         let prepared = self.check_with(tensors, given)?;
         ffi::enqueue(&self.loaded.function, stream, &prepared, self.plan.block(), self.plan.shared(), tensors)
+    }
+
+    /// [`Kernel::launch`] of an **instrumented** binary (`docs/instrument.md`), which records its probes into `probes`: the buffer's address is the
+    /// kernel's profile scratch (the second scratch slot of a Triton kernel, null in a production launch), and the buffer is memory the launch writes,
+    /// ordered as a written tensor's (its own stream waits for the kernel), so [`ProbeBuffer::collect`] then reads this launch's records.
+    ///
+    /// Refused for a production binary, and when the buffer is in another context or has fewer bytes than the launch's records need
+    /// ([`Kernel::probe_bytes`]: a slot of `16 + 16 * capacity` bytes per warp of every CTA of the CUDA grid). Everything [`Kernel::launch`]
+    /// checks is checked first.
+    pub fn launch_probed(
+        &self,
+        stream: &CudaStream,
+        tensors: &mut [TensorArg<'_>],
+        probes: &mut ProbeBuffer,
+    ) -> Result<()> {
+        self.launch_probed_with(stream, tensors, &[], probes)
+    }
+
+    /// [`Kernel::launch_probed`] of a call that gives the values of the binary's fixed arguments per call (see [`Kernel::launch_with`]).
+    pub fn launch_probed_with(
+        &self,
+        stream: &CudaStream,
+        tensors: &mut [TensorArg<'_>],
+        given: &[(&str, i64)],
+        probes: &mut ProbeBuffer,
+    ) -> Result<()> {
+        let stem = self.loaded.stem.as_str();
+        if self.loaded.instrument.is_none() {
+            return Err(Error::Launch(format!(
+                "'{stem}' is a production binary, which records no probes: launch it with Kernel::launch (an instrumented export, loaded with \
+                 Manifest::load_instrumented, has binaries that record)"
+            )));
+        }
+        for (what, ctx) in [("the stream", stream.context()), ("the probe buffer", probes.stream().context())] {
+            if **ctx != *self.loaded.context {
+                return Err(Error::Launch(format!(
+                    "{what} is in another CUDA context than the one '{stem}' was loaded in: give one of that context"
+                )));
+            }
+        }
+        let mut prepared = self.check_with(tensors, given)?;
+        let meta = self.probe_meta(&prepared).expect("an instrumented binary");
+        let need = meta
+            .bytes()
+            .ok_or_else(|| Error::Unsupported(format!("'{stem}': the records of this launch do not fit 64 bits")))?;
+        if (probes.bytes() as u64) < need {
+            return Err(Error::precondition(
+                PreconditionKind::Shape,
+                Some("probes"),
+                format!(
+                    "'{stem}': the records of this launch need {need} bytes of probe buffer (a slot of {} bytes per warp of the {} CTAs of its grid), \
+                     but the buffer has {}",
+                    meta.instrument.slot_bytes(),
+                    prepared.grid.iter().map(|g| u64::from(*g)).product::<u64>(),
+                    probes.bytes()
+                ),
+            ));
+        }
+        let Some(slot) = prepared.count.checked_sub(1).filter(|_| self.plan.scratch_slots() == 2) else {
+            return Err(Error::Launch(format!("'{stem}' has no profile scratch slot (it is not a Triton kernel)")));
+        };
+        {
+            // the probe buffer: memory the kernel writes, the last tensor of the launch (its slot, the profile scratch, after every other)
+            let shape = [probes.slice.len()];
+            let arg = TensorMut::<U8>::from_cuda(&mut probes.slice, &shape)?.into_arg();
+            if !arg.addr().is_multiple_of(PROBE_ALIGNMENT) {
+                return Err(Error::Launch(format!(
+                    "the probe buffer is at {:#x}, not aligned to {PROBE_ALIGNMENT} bytes",
+                    arg.addr()
+                )));
+            }
+            prepared.values[slot] = arg.addr();
+            prepared.tensor_of[slot] =
+                u8::try_from(tensors.len()).map_err(|_| Error::Launch("too many tensors".to_owned()))?;
+            let mut all: Vec<TensorArg<'_>> = tensors.iter_mut().map(TensorArg::reborrow).collect();
+            all.push(arg);
+            ffi::enqueue(&self.loaded.function, stream, &prepared, self.plan.block(), self.plan.shared(), &mut all)?;
+        }
+        probes.pending = Some(meta);
+        Ok(())
     }
 }
 
@@ -330,6 +442,8 @@ impl Manifest {
                 sm_count,
                 stem: entry.stem.clone(),
                 arch: entry.arch.clone(),
+                op: entry.op.clone(),
+                instrument: entry.instrument.clone().map(Arc::new),
             }),
             plan: Arc::new(plan),
         };

@@ -169,8 +169,19 @@ impl PlanSet {
     /// `pin` is the trust anchor: [`Pin::Digest`] with the set's digest (what Python's export returned, `PlanSet.digest`), and an index with any
     /// other content is refused; or [`Pin::TrustDirectory`]. Either way the index's own `set_digest` must be its digest, every rule of the index must
     /// hold, and the manifest is loaded with the index's `manifest_digest` as its pin (every cubin verified). The plans are read by [`PlanSet::plan`].
+    /// The set of an **instrumented** export (`docs/instrument.md`) is refused: load it with [`PlanSet::load_instrumented`].
     pub fn load(directory: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
-        let directory = directory.as_ref().to_owned();
+        Self::load_variant(directory.as_ref(), pin, false)
+    }
+
+    /// [`PlanSet::load`] of the set of an **instrumented** export (`docs/instrument.md`), its manifest loaded with
+    /// [`Manifest::load_instrumented`]; its plans are run with [`LaunchPlan::instantiate_probed`] to collect their probes.
+    pub fn load_instrumented(directory: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
+        Self::load_variant(directory.as_ref(), pin, true)
+    }
+
+    fn load_variant(directory: &Path, pin: Pin<'_>, instrumented: bool) -> Result<Self> {
+        let directory = directory.to_owned();
         let file = directory.join(PLAN_SET_NAME);
         let label = file.display().to_string();
         if let Pin::Digest(d) = pin
@@ -251,9 +262,17 @@ impl PlanSet {
         }
         let label = directory.display().to_string();
         let loaded = verified(&found, &manifest_digest, &label, || {
-            Manifest::load(directory.join(MANIFEST_NAME), Pin::Digest(&manifest_digest))
+            Manifest::load_instrumented(directory.join(MANIFEST_NAME), Pin::Digest(&manifest_digest))
         });
         let manifest = match loaded {
+            // (verified once per set and served from then on: whichever load verified it, an instrumented one is refused here unless asked for)
+            Ok(m) if m.is_instrumented() && !instrumented => {
+                return Err(Error::Manifest(format!(
+                    "the manifest of the plan set in {label:?} is an instrumented export (its kernels record probes: docs/instrument.md), a \
+                     diagnostic variant: load the set with PlanSet::load_instrumented to collect its probes, and run the production export \
+                     everywhere else"
+                )));
+            }
             Ok(m) => m,
             Err(Error::PinMismatch { directory, found, pinned }) => {
                 return Err(bad(format!(
