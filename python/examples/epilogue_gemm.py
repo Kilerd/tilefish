@@ -16,16 +16,29 @@ fewer (contract (ii)). Without a fusion both hooks are the identity, and the ker
   projection), so ``silu(g) * u`` fuses into it.
 * :func:`gemm_sm100` and :func:`gemm_sm120` are its configurations for sm_100/103 (``tcgen05.mma``, asserted in the SASS) and for sm_120
   (``mma.sync``, ``HMMA.16816``, asserted; tiles that fit its shared memory).
+* :func:`gluon_gemm`: the same GEMM written in Gluon for sm_100 and sm_103 (``tcgen05_mma`` into tensor memory), whose hooks see the tile in the
+  register layout the kernel loads it in.
 * :func:`conv1d`: a 1-D convolution of a channel-last ``[B, L, C]`` input as an implicit GEMM (its rows are the output positions ``B * Lo``, its
   columns the output channels), with the same hooks: a convolution followed by a bias and an activation is one kernel.
 
-Importing this module imports Triton. No ``from __future__ import annotations``: tilefish evaluates annotations.
+Importing this module imports Triton and its Gluon. No ``from __future__ import annotations``: tilefish evaluates annotations.
 """
 
 import inspect
 
 import triton
 import triton.language as tl
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.nvidia.blackwell import (
+    TensorMemoryLayout,
+    allocate_tensor_memory,
+    get_tmem_32x32b_reg_layout,
+    mbarrier,
+    tcgen05_commit,
+    tcgen05_mma,
+    tma,
+)
 
 import tilefish
 from tilefish import Dim, Out, Tensor, TensorDesc, bf16, const
@@ -173,6 +186,83 @@ def gemm_for(arch: int, **kw):
     if arch == 120:
         return gemm_sm120(**kw)
     return gemm(**kw)
+
+
+# -- a Gluon GEMM ---------------------------------------------------------------------------------------------------------------------------
+
+
+@gluon.jit
+def gluon_gemm_kernel(a, b, c, m, n, k, BM: gl.constexpr, BN: gl.constexpr, BK: gl.constexpr, WARPS: gl.constexpr,
+                      ACC: gl.constexpr, ACC_ARGS, EPILOGUE: gl.constexpr, EPILOGUE_ARGS):  # fmt: skip
+    """``c = a @ b.T`` in Gluon on sm_100 and sm_103: TMA copies of ``a`` and ``b`` into shared memory, ``tcgen05_mma`` into a tensor-memory
+    accumulator (one stage, not pipelined: an example of the hooks of a Gluon kernel, not a fast GEMM), the accumulator loaded into registers in the
+    layout of ``tcgen05.ld 32x32b``; the hooks see it in that layout, ``rows`` and ``cols`` in its slice layouts."""
+    off_m = gl.program_id(0) * BM
+    off_n = gl.program_id(1) * BN
+    a_s = gl.allocate_shared_memory(a.dtype, [BM, BK], a.layout)
+    b_s = gl.allocate_shared_memory(b.dtype, [BN, BK], b.layout)
+    tma_bar = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
+    mma_bar = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
+    mbarrier.init(tma_bar, count=1)
+    mbarrier.init(mma_bar, count=1)
+    tmem: gl.constexpr = TensorMemoryLayout([BM, BN], unpacked=True)
+    acc_t = allocate_tensor_memory(gl.float32, [BM, BN], tmem)
+    phase = 0
+    use_acc = False
+    for kk in range(0, k, BK):
+        mbarrier.expect(tma_bar, a.block_type.nbytes + b.block_type.nbytes)
+        tma.async_copy_global_to_shared(a, [off_m, kk], tma_bar, a_s)
+        tma.async_copy_global_to_shared(b, [off_n, kk], tma_bar, b_s)
+        mbarrier.wait(tma_bar, phase)
+        tcgen05_mma(a_s, b_s.permute((1, 0)), acc_t, use_acc=use_acc)
+        tcgen05_commit(mma_bar)
+        mbarrier.wait(mma_bar, phase)
+        use_acc = True
+        phase ^= 1
+    mbarrier.invalidate(tma_bar)
+    mbarrier.invalidate(mma_bar)
+    reg: gl.constexpr = get_tmem_32x32b_reg_layout(BM, BN, [BM, BN], WARPS)
+    acc = acc_t.load(reg)
+    rows = off_m + gl.arange(0, BM, layout=gl.SliceLayout(1, reg))
+    cols = off_n + gl.arange(0, BN, layout=gl.SliceLayout(0, reg))
+    row_mask = rows < m
+    col_mask = cols < n
+    tile = ACC(acc, rows, cols, row_mask, col_mask, ACC_ARGS)
+    tile = EPILOGUE(tile.to(c.dtype.element_ty), rows, cols, row_mask, col_mask, EPILOGUE_ARGS)
+    gl.store(c + rows[:, None] * n + cols[None, :], tile, mask=row_mask[:, None] & col_mask[None, :])
+
+
+def gluon_gemm(*, name: str = "gluon_gemm", dtype=bf16, BM: int = 128, BN: int = 128, BK: int = 64, num_warps: int = 4, sass=None):
+    """The extern of :func:`gluon_gemm_kernel` (sm_100 and sm_103): ``c = a @ b.T`` as :func:`gemm`, with the same hooks (elementwise regions fuse
+    into a Gluon kernel's hooks; a norm does not: a Gluon tile has the layout its kernel chose)."""
+    stub = _stub(
+        [
+            ("a", TensorDesc(Tensor[M, K, dtype], block=(BM, BK)), _E),
+            ("b", TensorDesc(Tensor[N, K, dtype], block=(BN, BK)), _E),
+            ("c", Out[Tensor[M, N, dtype]], _E),
+            ("m", M, _E),
+            ("n", N, _E),
+            ("k", K, _E),
+            ("BM", const, BM),
+            ("BN", const, BN),
+            ("BK", const, BK),
+            ("WARPS", const, num_warps),
+        ],
+        name,
+    )
+    hooks = (
+        tilefish.hook("ACC", value="acc", out="c", reference=_acc_gemm),
+        tilefish.hook("EPILOGUE", value="out", out="c"),
+    )
+    return tilefish.extern(
+        gluon=gluon_gemm_kernel,
+        name=name,
+        num_warps=num_warps,
+        grid=lambda M, N, BM, BN: (tilefish.cdiv(M, BM), tilefish.cdiv(N, BN)),
+        reference=_reference_gemm(None),
+        epilogue=hooks,
+        sass=sass,
+    )(stub)
 
 
 # -- a 1-D convolution as an implicit GEMM ------------------------------------------------------------------------------------------------
