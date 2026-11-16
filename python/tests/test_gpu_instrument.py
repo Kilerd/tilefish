@@ -99,6 +99,25 @@ def test_a_production_build_of_a_kernel_with_probes_has_none(exported):
     assert with_probes.sha256_code == plain.sha256_code  # the probes compiled to nothing: the machine code of the kernel written without them
 
 
+def test_one_export_session_keeps_the_production_and_the_instrumented_ir_apart():
+    """An export's session runs the frontend once per distinct input, and the variant is part of it: in one session the production and the
+    instrumented build of a kernel with probes (a Triton and a Gluon one) get the IR digest and the binary each gets alone, in either order."""
+    from tilefish import _build
+
+    cfg = tilefish.instrument(capacity=64)
+    for op, fn in ((pk.persistent_scale_p, pk._persistent_scale), (pk.ws_scale_p, pk.ws_scale_kernel)):
+        spec = compile_specs(op)[0]
+        plain = build(spec, arch=ARCH, fn=fn, cache=False)
+        inst = build(spec, arch=ARCH, fn=fn, instrument=cfg)
+        assert inst.ir_digest != plain.ir_digest and inst.instrument is not None and plain.instrument is None, op.name
+        for order in ((None, cfg, None), (cfg, None, cfg)):
+            with _build.export_session():
+                got = [build(spec, arch=ARCH, fn=fn, cache=False, instrument=c) for c in order]
+            for c, b in zip(order, got):
+                want = plain if c is None else inst
+                assert (b.ir_digest, b.sha256, b.instrument) == (want.ir_digest, want.sha256, want.instrument), (op.name, c)
+
+
 def test_the_instrumented_export_is_a_variant_the_hosts_refuse_unless_asked(exported):
     d, prod, inst = exported
     assert inst.instrumented and inst.digest != prod.digest

@@ -27,10 +27,20 @@ D = Dim("D", buckets=[128, 256, 384, 512, 640, 768])
 
 KERNELS = '''from fake_jit import gluon_jit
 
+from tilefish import _probe
+
 
 @gluon_jit
 def chain(x, y, n_t, n_d, BLOCK, STEPS, WARPS):
     return (x * n_d + y, BLOCK, STEPS, WARPS)
+
+
+@gluon_jit
+def probed(x, y, n_t, n_d, BLOCK, STEPS, WARPS):
+    # tilefish.probe("scaled") as Triton's code generator meets it: the frontend of an instrumented build emits it into the IR (it has a table of
+    # probe ids then, tilefish._probe.frontend), a production one emits nothing
+    mark = "probe scaled" if getattr(_probe._state, "registry", None) is not None else ""
+    return (x * n_d + y, BLOCK, STEPS, WARPS, mark)
 '''
 
 
@@ -48,6 +58,13 @@ def declare(name="chain"):
     def chain(x: Tensor[T, D, f32], y: Out[Tensor[T, D, f32]], n_t: T, n_d: D, BLOCK: const = 256, STEPS: const = 64, WARPS: const = 4): ...
 
     return chain
+
+
+def declare_probed(name="probed"):
+    @tilefish.extern(gluon="fo_kernels:probed", num_warps=4, grid=lambda T, D, BLOCK: (T, tilefish.cdiv(D, BLOCK)), by_bucket=config, name=name)
+    def probed(x: Tensor[T, D, f32], y: Out[Tensor[T, D, f32]], n_t: T, n_d: D, BLOCK: const = 256, STEPS: const = 64, WARPS: const = 4): ...
+
+    return probed
 
 
 @pytest.fixture
@@ -242,6 +259,41 @@ def test_an_input_that_is_not_plain_is_not_shared_and_a_failure_is_not_kept(worl
         compiler.fail_frontend = None
         _ir.frontend(jit, good, arch=ARCH, options=good.options)
         assert compiler.frontends == 4
+
+
+def test_a_production_and_an_instrumented_build_of_one_kernel_in_one_session_have_their_own_ir(world):
+    """The IR of an instrumented build has its probes, so the variant is part of the input a session runs the frontend once for: in one export
+    session the two builds of a kernel get the IR and the digest each gets alone, in either order."""
+    compiler = world
+    spec = compile_specs(declare_probed())[0]
+    cfg = tilefish.instrument(capacity=8)
+    plain = _build.build(spec, arch=ARCH)
+    inst = _build.build(spec, arch=ARCH, instrument=cfg)
+    assert inst.ir_digest != plain.ir_digest and inst.sha256 != plain.sha256 and inst.instrument is not None and plain.instrument is None
+    for order in ((None, cfg, None, cfg), (cfg, None, cfg, None)):
+        frontends, compiles = compiler.frontends, compiler.count
+        with _build.export_session():
+            got = [_build.build(spec, arch=ARCH, instrument=c) for c in order]
+        for c, b in zip(order, got):
+            want = plain if c is None else inst
+            assert (b.ir_digest, b.sha256, b.instrument) == (want.ir_digest, want.sha256, want.instrument)
+        # one digest per variant; the instrumented builds compile every time (never from the build cache), each running the frontend once more
+        assert compiler.count - compiles == 2 and compiler.frontends - frontends == 2 + 2
+
+
+def test_an_export_that_instruments_one_of_two_ops_of_one_kernel_writes_what_each_bucket_alone_writes(world, tmp_path, monkeypatch):
+    """Two operators of one kernel function, one of them instrumented (``tilefish.instrument(ops=...)``): in the export's session each keeps its own
+    IR, and the export is the one the frontend of every bucket makes alone."""
+    a, b = declare_probed("probed_a"), declare_probed("probed_b")
+    cfg = tilefish.instrument(capacity=8, ops=["probed_a"])
+    exported = runtime.export([a, b], tmp_path / "once", arch=ARCH, instrument=cfg)
+    kernels = exported.doc["kernels"]
+    digests = {op: {e["source_digest"] for e in kernels if e["op"] == op} for op in ("probed_a", "probed_b")}
+    assert all("instrument" in e for e in kernels if e["op"] == "probed_a") and not any("instrument" in e for e in kernels if e["op"] == "probed_b")
+    assert len(digests["probed_a"]) == len(digests["probed_b"]) == 3 and not digests["probed_a"] & digests["probed_b"]
+    with per_bucket(monkeypatch):
+        alone = runtime.export([a, b], tmp_path / "per-bucket", arch=ARCH, instrument=cfg)
+    assert alone.digest == exported.digest and files(tmp_path / "once") == files(tmp_path / "per-bucket")
 
 
 def test_the_prepare_of_a_plan_loads_every_bucket_in_one_scope():
