@@ -22,7 +22,8 @@ step like any. Every export that calls no extern with an epilogue hook writes th
   parameters, keyword-only). What a hook takes: elementwise regions over the result (a bias and an activation, a periodic activation, a residual add,
   masks, casts; a side output stored by the hook), the tiles of a dual accumulator (`split=2`: a gated activation of the gate and up halves), and an
   ordered norm where a tile holds whole rows (`block_n=`, a Triton kernel). Anything else stays a region after the call, and the fusion report, the
-  boundaries and the advisor say why (`epilogue-*` reasons). `tilefish.barrier(y)` keeps a result stored and stops its epilogue fusion.
+  boundaries and the advisor say why (`epilogue-*` reasons: among them a cycle through another region or fused pair, `epilogue-cycle`, and a
+  tensor the extern updates in place, `epilogue-inout`). `tilefish.barrier(y)` keeps a result stored and stops its epilogue fusion.
 - **Contracts**: `tilefish.fusion(epilogues="exact")`, the default, fuses through `value="out"` hooks, which see the tile the kernel rounded: the
   bytes of the extern followed by the region (contract (i)). `epilogues="accumulator"`, declared on the graph or in a new scope, `with
   tilefish.fused(epilogues="accumulator"):`, is the rewrite `R_acc` on the IR: every widening of such a result is the extern's f32 result, written by

@@ -160,7 +160,13 @@ changes.
     elementwise template reads at each lane's offset), not gathered per element.
   * **Fusion versions.** The merge applies only to calls of externs with hooks, which no plan of 0.0.11 or before has, in versions 1 and 2 alike:
     every graph without such a call plans as before (its plan, manifest and report the same bytes). No new version.
-  * **`tilefish.barrier(y)`** stops the epilogue fusion of `y` (section 4); **one region per call** (the first that fits; the others `epilogue-taken`).
+  * **`tilefish.barrier(y)`** stops the epilogue fusion of `y` (section 4); **one region per call** (the first that fits; the others `epilogue-taken`),
+    and one call per region (a region that reads two results fuses into the first call's hook).
+  * **What a merge must not do.** Make a cycle in the graph of units, regions and fused pairs included (`epilogue-cycle`: a path may leave by one
+    node of a region and come back by another); read, in the hook, a tensor the extern updates in place, either version (`epilogue-inout`). A split
+    whose chunks the hook holds and something else reads too stays a view of the stored result after the fused call; a dense view at an offset that
+    is no multiple of 16 bytes is copied for the hook (its parameter is compiled for an aligned pointer); the hook's row template asserts that the
+    tile the kernel gives it holds a whole row.
   * **`reference` mode** of a fused pair is the extern's `reference=` followed by the region interpreted; under `R_acc` the f32 result is the hook's
     `reference=` (`tilefish.hook(..., reference=...)`), else the extern's reference widened.
   * **A library call under `epilogues="accumulator"`** is not rewritten in E1: its f32 form is E2's (the pin re-encoded with an f32 `D`, 3.1.1); it
