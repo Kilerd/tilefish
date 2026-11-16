@@ -36,6 +36,11 @@ schema 3 gains one optional entry field, `instrument`, written only by the instr
   and dropped, and the phases between consecutive probes of a warp with their count and distribution per warp role (the partitions of
   `gl.warp_specialize`, from the frontend's IR), with each probe's source line from the export's trace; `--timeline sm | cta | role`, `--chrome OUT`
   (Perfetto), `--json`.
+- **The Rust host** (crate): `Manifest::load_instrumented` (and `LaunchPlan::load_instrumented`, `PlanSet::load_instrumented`) reads an
+  instrumented export, which `Manifest::load`, `from_embedded` and the plain plan loaders refuse; `Entry::instrument`; `Kernel::probe_bytes`,
+  `ProbeBuffer::new`, `Kernel::launch_probed` (the buffer in the profile scratch slot) and `ProbeBuffer::collect`; `LaunchPlan::instantiate_probed`
+  (a probe region with the run, per bucket; captured graphs hold its addresses) and `PlanRun::collect_probes`; `ProbeTrace::save` writes
+  `tilefish.probe-trace.v1`. The C ABI has no probe calls and refuses an instrumented export.
 - Measured on sm_103 (B300 slice): a probe costs a warp 45 to 80 cycles where it does not wait anyway; the instrumented kernels of the tests took
   -6% to +8% of their production time (a Gluon producer and consumer, a persistent kernel of 552 records per warp, an elementwise kernel of 4096
   short CTAs, a tcgen05 matmul); no shared memory, no stack frame. Triton's Proton was evaluated first and not used (`docs/instrument.md`, section 5:

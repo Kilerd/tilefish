@@ -473,7 +473,10 @@ kernel's `tilefish.probe` calls, and `@begin`, `@calib` and `@end`, into a probe
 * **Readers.** Both refuse: an `instrument` that is not an object of the three fields; another `format`; a capacity out of range (or a boolean); a
   probe that is not an object of the three fields, an id out of range or repeated, a name that is not one or repeated; a site that is not an object of
   three strings; the field on a `binary` entry.
-* Where it is tested: `python/tests/test_instrument.py`, `python/tests/test_gpu_instrument.py`, the crate's tests.
+* **The Rust host** reads it into `Entry::instrument` (`Instrument { capacity, probes }`, each `Probe { id, name, sites }`); `Kernel::launch_probed`
+  passes a `ProbeBuffer` in the profile scratch slot and refuses it for a production binary (`docs/instrument.md`, section 4).
+* Where it is tested: `python/tests/test_instrument.py`, `python/tests/test_gpu_instrument.py`, `crates/tilefish/tests/instrument.rs`, the Rust gate's
+  instrumented case.
 
 ## 5. The ABI
 

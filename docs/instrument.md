@@ -150,8 +150,26 @@ and block, the plan's graph, step and bucket, the manifest's digest, the entry's
 `tilefish.probe-trace.v1` holds the launches (times from the launch's first `%globaltimer`, which is a decimal string: it does not fit a JSON number);
 the Rust host writes the same file.
 
-**Rust** (`crates/tilefish/src/probes.rs`): see the crate's documentation of `Manifest::load_instrumented`, `ProbeBuffer`, `Kernel::launch_probed`,
-`PlanRun` with probes and `ProbeTrace::save`; the file it writes is the one `tilefish-explain --probes` reads.
+**Rust** (`crates/tilefish/src/probes.rs`):
+
+```rust
+let manifest = Manifest::load_instrumented("build/inst", Pin::Digest(digest))?;      // Manifest::load refuses it
+let kernel = manifest.kernel(&ctx, "attn", &[], arch)?;                               // kernel.instrument(): its capacity and probes
+let prepared = kernel.check(&tensors)?;
+let mut probes = ProbeBuffer::new(&stream, kernel.probe_bytes(&prepared).unwrap() as usize)?;
+kernel.launch_probed(&stream, &mut tensors, &mut probes)?;                            // the buffer in the profile scratch slot
+let launch = probes.collect()?;                                                       // a ProbeLaunch, decoded after the stream
+
+let plan = LaunchPlan::load_instrumented("build/inst", Pin::Digest(plan_digest))?;    // LaunchPlan::load refuses it
+let mut run = plan.instantiate_probed(&stream, &[("M", 128)])?;                       // a probe region with the run, per bucket
+run.launch(&stream, &mut externals, &devscalars)?;                                    // or capture(...) and replay(&stream)
+ProbeTrace { launches: run.collect_probes()? }.save("run.json")?;                     // tilefish.probe-trace.v1
+```
+
+`Manifest::is_instrumented`, `Entry::instrument` (`Instrument { capacity, probes }`), `Kernel::launch_probed_with` (given arguments),
+`LaunchPlan::instantiate_all_probed`, `PlanSet::load_instrumented` and `PlanRun::probed` complete it; a production binary, a buffer of another context
+and a buffer too small are refused, and `instantiate_probed` refuses the plan of a production export. The C ABI (`tilefish-capi`) has no probe calls:
+it loads through `Manifest::load`, so it refuses an instrumented export.
 
 ```console
 tilefish-explain DIR --probes FILE [KERNEL]           # the phases of each launch (of KERNEL: a stem or an op)
@@ -258,6 +276,10 @@ replayed 50 times (`test_gpu_instrument.py::test_what_the_probes_cost`, `-s` pri
   production bytes (jit and replay), a null buffer, the producer and consumer, the tcgen05 pipeline (its epilogue waits as long as the main loop runs),
   the persistent kernel (each program on an SM of its own, walking its own tiles), the elementwise kernel, a plan (jit, replay of an instrumented
   export, a captured replay) and `tilefish-explain` on a real trace.
-* The Rust host's tests (`crates/tilefish/tests/probes.rs` and the GPU gate's instrumented case) read the same entries and write traces Python reads.
+* The Rust host's tests: `crates/tilefish/tests/instrument.rs` (any machine: the field read only by `load_instrumented`, every malformed case of
+  section 4.8 refused, instrumented copies of the golden plan and plan set refused by `load`), the unit tests of `probes.rs` (the decoder, names, the
+  trace file), and the GPU gate's instrumented case (`python/tests/rust_gate_probed.py`, `crates/tilefish/tests/gpu_instrument_gate.rs`): the Rust host
+  launches the probed kernels with a probe buffer, without one and with one too small, and the instrumented plan launched, captured and replayed;
+  `rust_gate.py compare` checks the bytes against production and the records against Python's, warp by warp (ids, counts, roles).
 * The production path: the Rust gate's export of the whole GPU gate by this version with `TILEFISH_TRACE=1`, against the export of the release before
   without a trace: 3650 files, 184 cubins, 106 manifest, plan and plan-set digests, all the same.
