@@ -212,6 +212,22 @@ def test_the_occupancy_estimate():
     assert _sass.occupancy(80, 32, 128, 0) is None
 
 
+def test_the_occupancy_estimate_follows_cuda_s_calculator():
+    # the figures an RTX 5090 (sm_120) and a B300 (sm_103) driver gave for kernels of these attributes (cuOccupancyMaxActiveBlocksPerMultiprocessor)
+    # sm_120 holds 24 resident blocks, not 32: a block of one warp
+    assert _sass.occupancy(120, 16, 32, 0) == {"blocks_per_sm": 24, "warps_per_sm": 24, "occupancy": 0.5, "limited_by": ["blocks"]}
+    assert _sass.occupancy(103, 16, 32, 0)["blocks_per_sm"] == 32
+    # shared memory is allocated per block in units of 128 bytes: 8200 + 1024 bytes take 9344, ten of which fit in 100 KiB, not eleven
+    assert _sass.occupancy(120, 24, 128, 8200) == {"blocks_per_sm": 10, "warps_per_sm": 40, "occupancy": 0.833, "limited_by": ["shared"]}
+    # registers are allocated within each of the 4 sub-partitions: 80 per thread is 2560 per warp, 6 warps in 16384, 24 per SM (not 25)
+    assert _sass.occupancy(103, 80, 32, 0) == {"blocks_per_sm": 24, "warps_per_sm": 24, "occupancy": 0.375, "limited_by": ["registers"]}
+    assert _sass.occupancy(103, 80, 160, 0)["blocks_per_sm"] == 4  # 24 warps of 5 per block (not 65536 // (2560 * 5) = 5)
+    # block barriers: two per resident block on sm_90 to sm_103, one on sm_120
+    assert _sass.occupancy(103, 16, 32, 0, barriers=4) == {"blocks_per_sm": 16, "warps_per_sm": 16, "occupancy": 0.25, "limited_by": ["barriers"]}
+    assert _sass.occupancy(120, 16, 32, 0, barriers=1)["limited_by"] == ["barriers", "blocks"]
+    assert _sass.occupancy(120, 16, 32, 0, barriers=2)["blocks_per_sm"] == 12
+
+
 # -- the declaration --------------------------------------------------------------------------------------------------------------------------
 
 

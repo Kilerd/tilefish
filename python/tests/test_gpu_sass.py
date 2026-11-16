@@ -239,3 +239,25 @@ def test_the_registers_the_elf_file_records_are_the_driver_s():
         attrs = _sass.kernel_attributes(b.cubin, b.symbol)
         assert err == drv.CUresult.CUDA_SUCCESS and err2 == drv.CUresult.CUDA_SUCCESS
         assert regs == attrs["registers"] and local == attrs.get("frame_size", 0), (b.stem, regs, local, attrs)
+
+
+def test_the_occupancy_estimate_is_the_driver_s():
+    require_ptxas_for(CC)
+    from cuda.bindings import driver as drv
+
+    from tilefish import _cuda
+
+    torch.cuda.init()
+    seen = {}
+    for op in (sk.mm_with(None, name="mm_occ"), sk.spill_with(None, name="spill_occ"), sk.count_with(None, name="count_occ"),
+               sk.copy_with(None, name="copy_occ"), sk.mm_tf32_with(None, name="mm_tf32_occ")):  # fmt: skip
+        b = built(op)
+        loaded = _cuda.load(b, torch.cuda.current_device())
+        attrs = _sass.kernel_attributes(b.cubin, b.symbol)
+        threads = b.block[0] * b.block[1] * b.block[2]
+        est = _sass.occupancy(CC, attrs["registers"], threads, b.shared + attrs.get("static_shared", 0), attrs.get("num_barriers", 0))
+        err, blocks = drv.cuOccupancyMaxActiveBlocksPerMultiprocessor(loaded.function, threads, b.shared)
+        assert err == drv.CUresult.CUDA_SUCCESS
+        seen[b.stem] = (est["blocks_per_sm"], blocks, est["limited_by"], attrs["registers"], threads, b.shared)
+    assert all(e == d for e, d, *_ in seen.values()), seen
+    assert "blocks" in seen["copy_occ"][2], seen  # one warp and few registers: the resident blocks of the architecture (24 on sm_120, 32 before)

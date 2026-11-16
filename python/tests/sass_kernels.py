@@ -6,6 +6,7 @@
 * ``spill_with(sass)``: a row softmax of one warp over a ``[8, 2048]`` f32 tile, 512 values per thread, more than the 255 registers a thread has:
   it spills to local memory on every architecture.
 * ``count_with(sass)``: a sum whose result is added to a counter with ``tl.atomic_add``.
+* ``copy_with(sass)``: a copy of 32 values by a block of one warp with few registers: as many resident blocks as the architecture allows.
 
 Importing this module imports Triton. No ``from __future__ import annotations``: tilefish evaluates annotations.
 """
@@ -99,3 +100,16 @@ def count_with(sass, name="count_checked"):
     def count(x_ptr: Tensor[C, f32], acc_ptr: Out[Tensor[1, f32]], n: C, *, BLOCK: const = 1024): ...
 
     return count
+
+
+@triton.jit
+def copy_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(y_ptr + offs, tl.load(x_ptr + offs, mask=offs < n), mask=offs < n)
+
+
+def copy_with(sass, name="copy_checked"):
+    @tilefish.extern(triton=copy_kernel, num_warps=1, grid=lambda C: (tilefish.cdiv(C, 32),), name=name, sass=sass)
+    def copy(x_ptr: Tensor[C, f32], y_ptr: Out[Tensor[C, f32]], n: C, *, BLOCK: const = 32): ...
+
+    return copy

@@ -531,32 +531,41 @@ def code_shape(cubin: bytes) -> "dict[str, tuple[int, int, int]]":
 
 # -- occupancy (an estimate) ------------------------------------------------------------------------------------------------------------------
 
-# per SM: registers, warps, resident blocks, shared memory (bytes), and the shared memory the system reserves per block
+# per SM: registers, warps, resident blocks, shared memory (bytes), the shared memory the system reserves per block, and the block barriers (CUDA's
+# occupancy calculator, cuda_occupancy.h: sm_120 holds 24 resident blocks, not 32, and one block barrier per resident block, sm_90 to sm_103 two)
 _LIMITS = {
-    90: (65536, 64, 32, 233472, SHARED_RESERVE),
-    100: (65536, 64, 32, 233472, SHARED_RESERVE),
-    103: (65536, 64, 32, 233472, SHARED_RESERVE),
-    120: (65536, 48, 32, 102400, SHARED_RESERVE),
+    90: (65536, 64, 32, 233472, SHARED_RESERVE, 64),
+    100: (65536, 64, 32, 233472, SHARED_RESERVE, 64),
+    103: (65536, 64, 32, 233472, SHARED_RESERVE, 64),
+    120: (65536, 48, 24, 102400, SHARED_RESERVE, 24),
 }
+_REGISTER_UNIT = 256  # registers are allocated per warp in units of 256, in each of the 4 sub-partitions of an SM
+_SUB_PARTITIONS = 4
+_SHARED_UNIT = 128  # shared memory is allocated per block in units of 128 bytes (sm_80 and later)
 
 
-def occupancy(arch: int, registers: int, threads: int, shared: int) -> "dict[str, Any] | None":
-    """An estimate of the blocks and warps per SM a launch of ``threads`` threads with ``registers`` per thread and ``shared`` bytes of shared
-    memory (static and dynamic, without the system's reserve, which is added once per block) gets on ``arch`` (registers allocated per warp in
-    units of 256), and what limits it; ``None`` for an architecture this does not know.
-    Not the driver's figure (``cudaOccupancyMaxActiveBlocksPerMultiprocessor``): what the attributes allow."""
+def occupancy(arch: int, registers: int, threads: int, shared: int, barriers: int = 0) -> "dict[str, Any] | None":
+    """An estimate of the blocks and warps per SM a launch of ``threads`` threads with ``registers`` per thread, ``shared`` bytes of shared
+    memory (static and dynamic, without the system's reserve, which is added once per block) and ``barriers`` block barriers (``num_barriers``
+    of the ELF file) gets on ``arch``, and what limits it; ``None`` for an architecture this does not know. The rules of CUDA's occupancy
+    calculator (``cuda_occupancy.h``) with its default carveout (the most shared memory): registers allocated per warp in units of 256 within each
+    of the 4 sub-partitions of an SM, shared memory per block in units of 128 bytes, the resident blocks and the block barriers of the
+    architecture. Not the driver's figure (``cudaOccupancyMaxActiveBlocksPerMultiprocessor``): what the attributes allow."""
     limits = _LIMITS.get(arch)
     if limits is None or threads <= 0:
         return None
-    regs_sm, warps_sm, blocks_sm, smem_sm, reserved = limits
+    regs_sm, warps_sm, blocks_sm, smem_sm, reserved, barriers_sm = limits
     warps = -(-threads // 32)
-    per_warp = -(-max(registers, 1) * 32 // 256) * 256
+    per_warp = -(-max(registers, 1) * 32 // _REGISTER_UNIT) * _REGISTER_UNIT
+    per_block = -(-(shared + reserved) // _SHARED_UNIT) * _SHARED_UNIT
     by = {
-        "registers": regs_sm // (per_warp * warps) if per_warp * warps else blocks_sm,
+        "registers": regs_sm // _SUB_PARTITIONS // per_warp * _SUB_PARTITIONS // warps,
         "warps": warps_sm // warps,
         "blocks": blocks_sm,
-        "shared": smem_sm // (shared + reserved),
+        "shared": smem_sm // per_block,
     }
+    if barriers > 0:
+        by["barriers"] = barriers_sm // barriers
     blocks = min(by.values())
     return {
         "blocks_per_sm": blocks,
@@ -629,7 +638,9 @@ def summary(
             if key in attributes:
                 out[key] = attributes[key]
         if arch is not None and "registers" in attributes and threads:
-            occ = occupancy(arch, int(attributes["registers"]), threads, shared + int(attributes.get("static_shared", 0) or 0))
+            occ = occupancy(
+                arch, int(attributes["registers"]), threads, shared + int(attributes.get("static_shared", 0) or 0), int(attributes.get("num_barriers", 0) or 0)
+            )
             if occ is not None:
                 out["occupancy"] = occ
     return out

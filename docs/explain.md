@@ -103,8 +103,11 @@ body. A plan step names the step, its bucket and its entry; a region lists the o
 **summary** counts the instructions per class (section 3), lists the SASS MMAs (opcode and shape; for a `UTC*MMA` the kind, types and shape its
 instruction descriptor says where the listing sets it as a constant), the PTX MMAs (whose opcode spells the kind), the TF32 MMAs, local-memory loads and
 stores (and how many nvdisasm 13.x marks as spills), TMA, barriers and fences, and from the ELF file the registers per thread, the stack frame, the static
-and dynamic shared memory, the named barriers, with an estimate of the occupancy (blocks and warps per SM and what limits them: from the attributes, not the
-driver's figure).
+and dynamic shared memory, the named barriers, with an estimate of the occupancy (blocks and warps per SM and what limits them: from the attributes, by the
+rules of CUDA's occupancy calculator, `cuda_occupancy.h`, with the most shared memory as the carveout: registers allocated per warp in units of 256 within each
+of an SM's 4 sub-partitions, shared memory per block in units of 128 bytes, the resident blocks and block barriers of the architecture, 24 blocks on sm_120 and
+32 on sm_90 to sm_103. Not the driver's figure, which can be lower for a reason the attributes do not show: measured on sm_103, a `tl.dot` of TMA
+descriptors gets one block per SM where its attributes allow two).
 
 **lines** counts the instructions of each source line by column: `mma`, `gmem` (global loads and stores), `smem`, `tma`, `tmem` (tensor memory), `local`,
 `atom`, `sync` (barriers and fences), `alu` (the rest).
