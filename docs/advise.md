@@ -242,6 +242,11 @@ after the plan that writes it, which the profiler does not set up).
   kernels and gaps to 249.4 us. **A step's net is within 0.6 us of nsys's kernel time but for one step (1.2 us), and the nets' sum within 3% of
   nsys's**; the medians, with the events in them, are 3 to 4 us too long each. Rank short steps by `net`, and take a difference of less than a
   microsecond between two steps as noise.
+* **On an RTX 5090** (sm_120, 170 SMs; the same comparison, nsys 2026.5.2): the events cost about 1.1 us a step, and the timestamps tick in
+  2.048 us steps. The nets of `plan_model.block` at `M = 128` sum to 31.6 us and nsys's kernels and gaps to 26.0 us (the profiler's own time of
+  the plan without events is 31.6 us too: about 5 us more than nsys's first-to-last kernel, a fixed cost that weighs on so short a plan); for
+  `plan_model.deep_block(4)`, 110.4 us against 104.6 us. A step's net is within 1.1 us of nsys's kernel and gap but for one step (1.9 us). The
+  events method's nets sum to 30.7 and 114.7 us.
 * **What it cannot see**: work inside a step (a library step of several kernels is one step), and the overlap of a step with the next one, which
   `net` shares evenly instead of measuring. For a time inside a kernel, see issue #5 section 2.
 
@@ -254,7 +259,7 @@ after the plan that writes it, which the profiler does not set up).
   plan `block` on the command line (its residual, blocked by the MLP's GEMMs); the boundaries of a graph body (a barrier, unordered and ordered sums, calls, a materialised view) with their fixes, and that they change no
   region; a traced export by the fake compiler (its manifest, plan and fusion report the same bytes as without the trace; the trace's boundaries; the
   advice with the trace, without it, and with `gop=`); the profiler's runtime path on a fake backend (the events around each step, the same launches
-  as a run, both methods).
+  as a run, both methods, a longer spin for a slow host).
 * `python/tests/test_gpu_advise.py` (a device; arch-agnostic: ran on sm_103 and sm_120, the sm_90 run is a later gate's): every step timed,
   the export's files and a run's bytes unchanged by profiling, the nets adding up to the plan's time, both methods agreeing, the command line
   (`--profile`, then `--advise --timing`).
