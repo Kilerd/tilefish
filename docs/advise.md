@@ -113,7 +113,8 @@ The buffers kept stored are listed with why.
 ## 4. Why it is not one kernel today, and what to do
 
 Each candidate lists its **blockers**, each with the action that removes it and the phase of RFC 0001 that would; its phase is the latest. A step's
-class gives one; the fusion pass gives the rest.
+class gives one; the fusion pass gives the rest. The phase `E2` is not one of RFC 0001: it is a mode to declare now, RFC 0003's cuBLASLt epilogues, which
+changes the bytes (so the advisor names it, and never chooses it); it ranks after `1` and before `2`.
 
 | blocker | what to do | phase |
 |---|---|---|
@@ -123,7 +124,8 @@ class gives one; the fusion pass gives the rest.
 | `dsl-kernel` | a `@tilefish.kernel` (elementwise): write its body in the graph body (RFC 8.2); exact as it is when it declares `fp_fusion=False` | 1 |
 | `dsl-kernel-contracts` | the same, for a kernel that lets the compiler contract: write `tilefish.fma` where it meant one rounding, or its bytes change | 1 |
 | `row-kernel` | a row `@tilefish.kernel`: write its body in the graph body, with `order=` on its sums, and fusion version 2 (the default) fuses it into a row region | 2 |
-| `epilogue-library`, `prologue-library` | a GEMM or convolution's epilogue or prologue: future work (RFC 0001, section 7 route (b), sections 11.2 and 11.3) | future |
+| `epilogue-library-cublaslt` | the region after a `cublaslt.gemm` (or `gemm_bias`) is one of cuBLASLt's epilogues, as the fusion report's `library_epilogues` says (a bias, ReLU, a residual add, in the library's order): declare `tilefish.fusion(epilogues="library")`, which makes them one `cublaslt.matmul` step, its bytes the library's under the pin and verified at every pin equal to the region's arithmetic on the f32 accumulator (contract (ii) of RFC 0003: one rounding fewer than now); the detail names the epilogue and the contract (`exact` for a ReLU alone, which commutes with the rounding) | E2 |
+| `epilogue-library`, `prologue-library` | a GEMM or convolution's epilogue or prologue: future work (RFC 0003; a region that is a cuBLASLt epilogue but for its form is this, with the reason in the detail, such as the order of the adds) | future |
 | `copy-step` | a copy step: return or store the value where it is made | 1 |
 | `memset-step` | a memset step: its zeros are read from memory, never folded into a region (H2) | future |
 | `strided-output` | the producer writes the intermediate into part of a buffer (a column block, a head): a strided store (rule 7) | 2 |

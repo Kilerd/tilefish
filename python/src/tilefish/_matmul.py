@@ -30,6 +30,7 @@ different digest; the crate's load does the same (``docs/manifest-schema-3.md``,
 
 from __future__ import annotations
 
+import inspect
 import threading
 from typing import Any
 
@@ -187,6 +188,56 @@ def _run_f32(spec: Any, algo: str, ops: "dict[str, Any]", acc: Any, stream: int,
         ops["a"].data_ptr(), ops["b"].data_ptr(), acc.data_ptr(), None, spec.m, spec.n, spec.k, algo, workspace_bytes=spec.workspace_bytes,
         stream=stream, device_index=index, form=f32, sm_count_target=spec.sm_count_target, **spec.opt_ins,
     )  # fmt: skip
+
+
+# -- the op a plan's rewrite calls -----------------------------------------------------------------------------------------------------------
+
+_epilogue_ops: "dict[tuple[Any, ...], Any]" = {}
+_epilogue_lock = threading.Lock()
+
+
+def epilogue_op(gemm: Any, epilogue: str, beta: int) -> Any:
+    """The ``cublaslt.matmul`` that ``tilefish.fusion(epilogues="library")`` calls instead of the GEMM ``gemm`` (a ``cublaslt.gemm`` or
+    ``cublaslt.gemm_bias`` library op) and the arithmetic after it: named ``<gemm>__<epilogue>`` (``_c`` with ``beta=1``), the operands, layout,
+    posture, workspace, opt-ins and SM count target of ``gemm``, a bias ``[N]`` and ``c [M, N]`` of the result's type (named ``bias`` and ``c``), its
+    canary on and ``contract="measured-exact"``: a pin that is not equal to the formula is refused (the rewrite is exact against the graph's own
+    arithmetic on the accumulator, which the formula is). The same GEMM and epilogue in two graphs is one operator."""
+    from . import _library
+    from .decorators import library
+    from .dtypes import f32
+    from .types import TensorType
+
+    key = (gemm.name, _library.declaration_digest(gemm), epilogue, beta)
+    with _epilogue_lock:
+        found = _epilogue_ops.get(key)
+    if found is not None:
+        return found
+    sig = gemm.signature
+    out = sig.returns[0]
+    positional = inspect.Parameter.POSITIONAL_OR_KEYWORD
+    params = [inspect.Parameter("a", positional, annotation=sig.params[0].type), inspect.Parameter("b", positional, annotation=sig.params[1].type)]
+    if epilogue in _library.MATMUL_WITH_BIAS:
+        bias_t = sig.params[2].type if gemm.impl == _library.IMPL_GEMM_BIAS else TensorType((out.shape[1],), out.dtype)
+        params.append(inspect.Parameter("bias", positional, annotation=bias_t))
+    if beta:
+        params.append(inspect.Parameter("c", positional, annotation=TensorType(tuple(out.shape), out.dtype)))
+    name = f"{gemm.name}__{epilogue}{'_c' if beta else ''}"
+
+    def fn(*args: Any) -> Any:  # a signature only: a library op has no body
+        raise NotImplementedError
+
+    fn.__signature__ = inspect.Signature(params, return_annotation=out)  # type: ignore[attr-defined]
+    fn.__name__ = fn.__qualname__ = name
+    fn.__module__ = "tilefish_generated"
+    options = {
+        flag: True for flag in ("allow_bf16_reduction", "allow_f16_reduction") if getattr(gemm, flag, False)
+    }
+    op = library(
+        name, acc=f32, impl=_library.IMPL_MATMUL, epilogue=epilogue, beta=beta, heuristic=gemm.heuristic, workspace_bytes=gemm.workspace_bytes,
+        layout=gemm.layout, sm_count_target=gemm.sm_count_target, contract="measured-exact", canary=True, **options,
+    )(fn)  # fmt: skip
+    with _epilogue_lock:
+        return _epilogue_ops.setdefault(key, op)
 
 
 # -- the canary ------------------------------------------------------------------------------------------------------------------------------
