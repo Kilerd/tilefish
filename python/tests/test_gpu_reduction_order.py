@@ -152,12 +152,43 @@ def test_each_order_is_the_cuda_kernel_of_that_order(cuda_c, d):
         assert differing(tilefish.run(pc.sum_default, x), cases[0][3]) > ROWS // 4
 
 
+@pytest.mark.parametrize("d", LENGTHS)
+def test_revision_2_of_each_order_is_the_cuda_kernel_of_that_order(cuda_c, d):
+    """Revision 2 of the lowering (note 21: the chains by halving splits, the columns past the row's end adding -0.0, the tree through
+    ``tl.gather``; what the row regions of fusion version 2 are lowered with) is the same order: the CUDA kernels' bytes, at every length."""
+    x = rows(d)
+    w = tiny_weights(d)
+    cases = [
+        ("halving256", pc.sum_halving256, (x,), launch(cuda_c, "k_halving256", 256, x)),
+        ("sumsq_shfl128v8", pc.sumsq_shfl128v8, (x,), launch(cuda_c, "k_sumsq_shfl128v8", 128, x)),
+        ("dot_halving64", pc.dot_halving64, (x, w), launch(cuda_c, "k_dot_halving64", 64, x, w)),
+        ("sequential", pc.sum_sequential, (x,), launch(cuda_c, "k_seq", 1, x)),
+    ]
+    for name, op, args, want in cases:
+        low = tilefish.lower(op, lowering=2, module=f"tf_rev2_{op.name}")
+        assert "revision 2" in low.source
+        got = low.run(*args)
+        assert same_bytes(got, want), f"{name} D={d} (revision 2): {differing(got, want)} of {x.shape[0]} rows differ"
+
+
+@pytest.mark.parametrize("d", [96, 1000, 4096])
+def test_revision_2_has_the_same_bytes_at_every_num_warps(d):
+    x = rows(d, seed=4)
+    for op in (pc.sum_halving256, pc.sumsq_shfl128v8):
+        outs = {w: tilefish.lower(op, num_warps=w, lowering=2, module=f"tf_rev2w_{op.name}_{w}").run(x) for w in (1, 2, 4, 8, 16)}
+        for w, out in outs.items():
+            assert same_bytes(out, outs[1]), f"{op.name} D={d} (revision 2): num_warps={w} differs from 1 warp in {differing(out, outs[1])} rows"
+
+
 def test_a_dot_chain_keeps_a_negative_zero_as_the_cuda_loop_does(cuda_c):
     d = 100  # not a multiple of the 64 lanes: the lanes past the row's end are skipped, not given +0.0 products
     x = -torch.full((8, d), 1e-30, device=CUDA)
     w = torch.full((d,), 1e-30, device=CUDA)
     got = tilefish.run(pc.dot_halving64, x, w)
     assert same_bytes(got, launch(cuda_c, "k_dot_halving64", 64, x, w))
+    # revision 2 pads the row with fma(-0.0, 1.0, acc), which keeps the -0.0 of the chains (a literal -0.0 would be +0.0 in Triton 3.5.1)
+    rev2 = tilefish.lower(pc.dot_halving64, lowering=2, module="tf_rev2_dot_zero").run(x, w)
+    assert same_bytes(rev2, got) and bool((rev2.view(I32) == -(2**31)).all())
 
 
 def test_an_rmsnorm_of_128_threads_is_the_cuda_kernels_bytes():

@@ -442,6 +442,8 @@ class KernelOp(GraphOp):
         self.unaligned_params: "frozenset[str]" = frozenset()
         # the code of fp_fusion=False and views read where they are (note 20 of tilefish.lower): set on the kernels of a graph's fused regions
         self.context_free = False
+        # the revision of the lowering (note 21 of tilefish.lower): 1 for every kernel; 2 on the region kernels of tilefish.fusion(version=2)
+        self.lowering = 1
 
     def lower(self, **options: Any) -> Any:
         """Lower this kernel to Triton source: ``tilefish.lower(self, **options)``."""
@@ -474,6 +476,7 @@ class KernelOp(GraphOp):
             )
             found.base, found.unaligned_params = base, wanted
             found.context_free = base.context_free
+            found.lowering = base.lowering
             found.__doc__ = base.__doc__
             found = variants.setdefault(wanted, found)
         return found
