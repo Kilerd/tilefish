@@ -37,7 +37,15 @@ equal to, one of the other's. Which frontend is the declaration's (``CompileSpec
 function must then be a kernel of that frontend (``tilefish._build`` refuses another).
 
 What this costs: the frontend, about 2 to 4 ms per kernel on a B300 (no compile, no GPU), once for each build, ``jit`` call or
-replay call. Nothing here compiles anything.
+replay call (a large kernel takes longer: an unrolled loop of 4096 steps, half a second). Nothing here compiles anything.
+
+**Memory.** What is kept of a frontend run is its digest and the dots of its IR (:class:`Frontend`: what the TF32 guard reads), not the IR.
+The text is hashed in pieces (:func:`ir_digest`) and dropped, and the module is freed (:func:`release_module`): Triton's Python binding of a
+module does not own its operations, so a module that is only dropped stays allocated for the life of the process, about twice the size of
+its text, at every run of the frontend and at every compile (measured with Triton 3.5.1). Within an export, or the ``prepare`` of a plan,
+the frontend runs once per distinct input (:func:`frontend_scope`): the buckets of one ``by_bucket=`` configuration are one kernel with one
+IR, and the scope is one point in time of the process, so its digest is computed once for all of them. Outside a scope (a ``jit`` call, a
+replay call) every call runs the frontend, as the process holds the kernel then.
 
 **Where the source is, in the binary.** The locations of the IR a compile builds name the file of the kernel and of every jit function it
 calls, and ``ptxas`` writes those names into the cubin's debug sections. So the frontend of a compile (:func:`recording_source`) names each
@@ -58,12 +66,14 @@ import hashlib
 import shutil
 import tempfile
 import threading
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from . import _source
 from .errors import TilefishBuildError
 
 if TYPE_CHECKING:
+    from ._tf32guard import Op
     from .aot import AstSourceInputs
 
 IR_DIGEST_KIND = "tilefish.triton-ir.v1"  # the ``source_digest_kind`` of a manifest entry whose ``source_digest`` is an IR digest
@@ -81,6 +91,8 @@ _TAGS = {"triton": _TAG, "gluon": b"tilefish.gluon-ir-digest.v1\0"}
 LOCK = threading.RLock()
 _naming = threading.local()  # .depth > 0 in a thread whose frontend names source files by host-independent paths (host_independent_paths)
 _ptxas_cwd = threading.local()  # .depth > 0 (and .directory) in a thread whose compile runs Triton's ptxas in an empty directory
+_scope = threading.local()  # .table: the frontends a frontend_scope of this thread has run, by their input (None outside one)
+_CHUNK = 1 << 20  # the characters of IR text encoded and hashed at a time (ir_digest)
 
 
 def triton_importable() -> bool:
@@ -101,8 +113,13 @@ def triton_version() -> "str | None":
 
 
 def ir_digest(text: str, language: str = "triton") -> str:
-    """The digest (lowercase hex sha256) of the IR text :func:`ttir_text` made for a kernel of ``language`` (each has its own tag)."""
-    return hashlib.sha256(_TAGS[language] + text.encode("utf-8")).hexdigest()
+    """The digest (lowercase hex sha256) of the IR text :func:`ttir_text` made for a kernel of ``language`` (each has its own tag).
+
+    ``sha256(tag + text.encode("utf-8"))``, hashed a megabyte of text at a time, so that no copy of a large IR is made to hash it."""
+    h = hashlib.sha256(_TAGS[language])
+    for start in range(0, len(text), _CHUNK):
+        h.update(text[start : start + _CHUNK].encode("utf-8"))
+    return h.hexdigest()
 
 
 def digest_kind(language: str) -> str:
@@ -168,8 +185,136 @@ def ttir_text(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "Mappi
     the compile options (the spec's, and any a caller added), exactly as :func:`tilefish._build.build` hands them to ``triton.compile``.
     This is the first thing ``triton.compile`` does, and none of the later stages is run. Raises
     :class:`~tilefish.errors.TilefishBuildError` when Triton is missing or too old to have the entry points, or when the
-    frontend cannot build the kernel (``what`` names it in the message).
+    frontend cannot build the kernel (``what`` names it in the message). The module is freed before this returns (:func:`release_module`).
+    A build, a ``jit`` call and a replay take :func:`frontend` instead, which keeps the digest and not the text.
     """
+    return _run_frontend(jit, inputs, arch=arch, options=options, what=what, read=lambda module: str(module.str_nodebug()))
+
+
+@dataclass(frozen=True)
+class Frontend:
+    """What is kept of a run of the frontend: the digest of its IR (:func:`ir_digest`), and its dots and MMAs (:func:`tilefish._tf32guard.frontend_ops`:
+    what the TF32 guard reads of the IR). Not the IR itself, which is hashed and dropped."""
+
+    digest: str
+    ops: "tuple[Op, ...]"
+
+
+def frontend(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "Mapping[str, Any]", what: str = "the kernel") -> Frontend:
+    """:func:`ttir_text`, digested: the :class:`Frontend` of the IR the frontend builds for ``inputs`` on ``arch`` with ``options``.
+
+    Inside a :func:`frontend_scope` of this thread the frontend runs once per distinct input, the function ``jit`` and the signature, attributes,
+    constants, language, options and architecture (each a value of a plain type: ``bool``, ``int``, ``float``, ``str``, ``None``, and lists, tuples and
+    dicts of them; an input with any other value is not shared, and runs its own frontend), and a later call with the same input is given what the
+    first one got. Outside a scope every call runs the frontend. A run that raises is not kept."""
+    key = _input_key(jit, inputs, arch, options)
+    table = getattr(_scope, "table", None)
+    if table is not None and key is not None:
+        hit = table.get(key)
+        if hit is not None:
+            return hit[1]
+    language = inputs.language
+
+    def read(module: Any) -> Frontend:
+        from ._tf32guard import frontend_ops
+
+        text = str(module.str_nodebug())
+        return Frontend(digest=ir_digest(text, language), ops=tuple(frontend_ops(text)))
+
+    got = _run_frontend(jit, inputs, arch=arch, options=options, what=what, read=read)
+    if table is not None and key is not None:
+        table[key] = (jit, got)  # (the function is kept with it, so that its id is not another function's while the scope lasts)
+    return got
+
+
+@contextlib.contextmanager
+def frontend_scope() -> "Iterator[None]":
+    """Within the block, :func:`frontend` runs the frontend of this thread once per distinct input: what an export (``tilefish.runtime.export``) and
+    the ``prepare`` of a plan run in. A scope inside another is the outer one. The block is one point in time of the process: a kernel whose IR would
+    change between two of its builds in it (a module constant rewritten while the export runs) is given the IR of its first."""
+    if getattr(_scope, "table", None) is not None:
+        yield
+        return
+    _scope.table = {}
+    try:
+        yield
+    finally:
+        _scope.table = None
+
+
+_PLAIN = (bool, int, str, type(None))
+
+
+def _plain(value: Any) -> Any:
+    """``value`` as a hashable key that tells apart every two values Triton's frontend might build differently (``1``, ``1.0``, ``True``; ``0.0`` and
+    ``-0.0``; a list and a tuple); raises ``TypeError`` for a value of any other type."""
+    kind = type(value)
+    if kind in _PLAIN:
+        return (kind.__name__, value)
+    if kind is float:
+        return ("float", repr(value))  # (repr: -0.0 is not 0.0, nan is nan)
+    if kind in (list, tuple):
+        return (kind.__name__, tuple(_plain(v) for v in value))
+    if kind is dict:
+        return ("dict", tuple((_plain(k), _plain(v)) for k, v in value.items()))  # in order: a signature's order is the arguments'
+    raise TypeError(kind.__name__)
+
+
+def _input_key(jit: Any, inputs: "AstSourceInputs", arch: int, options: "Mapping[str, Any]") -> "tuple[Any, ...] | None":
+    """The key of a frontend run in a :func:`frontend_scope`: everything ``triton.compile`` gives the frontend, or ``None`` when a value is not plain."""
+    try:
+        return (
+            id(jit),
+            _plain(inputs.language),
+            _plain(arch),
+            _plain(dict(inputs.signature)),
+            _plain(dict(inputs.attrs)),
+            _plain(dict(inputs.constants)),
+            _plain(dict(options)),
+        )
+    except TypeError:
+        return None
+
+
+def release_module(module: Any) -> bool:
+    """Free the operations of a module Triton built (its frontend's, or what a compile left of it); ``True`` when they were freed.
+
+    Triton's Python binding of a module does not own the operation: when the object goes, the module and everything in it stay allocated for the
+    life of the process, and so does every module the frontend builds (a build, a ``jit`` call, a replay call) and every module a compile lowers
+    (measured with Triton 3.5.1: about twice the size of the IR text, at every run). Erasing the module's body (its one block) frees every operation
+    in it; what is left is the empty module, a few hundred bytes. The module's object holds its MLIR context (``module.context``), so the context is
+    alive while the body is erased. Call it only when nothing will read the module again. Nothing is freed (``False``) for a module whose binding
+    has no ``walk`` or whose body cannot be found (another Triton, or no Triton): that only leaves it as Triton leaves it.
+
+    The body is the block of the module's last top-level operation, which a post-order walk visits just before the module itself."""
+    walk = getattr(module, "walk", None)
+    if walk is None:
+        return False
+    last: "list[Any]" = []
+
+    def visit(op: Any) -> None:
+        last.append(op)
+        if len(last) > 2:
+            del last[0]
+
+    try:
+        with LOCK:
+            walk(visit)
+            if len(last) != 2 or last[1].get_name() != "builtin.module":
+                return False
+            block = last[0].get_block()
+            if block is None:
+                return False
+            block.erase()
+            return True
+    except Exception:  # noqa: BLE001 - a binding that does not have what this needs: the module stays as Triton leaves it
+        return False
+    finally:
+        last.clear()
+
+
+def _run_frontend(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "Mapping[str, Any]", what: str, read: "Callable[[Any], Any]") -> Any:
+    """Run the frontend, give ``read`` the module (under :data:`LOCK`, its context alive), free the module, and return what ``read`` returned."""
     try:
         from triton._C.libtriton import ir
         from triton.backends.compiler import GPUTarget
@@ -195,7 +340,11 @@ def ttir_text(jit: Any, inputs: "AstSourceInputs", *, arch: int, options: "Mappi
                 ir.load_dialects(context)
                 backend.load_dialects(context)
                 module = src.make_ir(target, opts, backend.get_codegen_implementation(opts), backend.get_module_map(), context)
-                return str(module.str_nodebug())
+                try:
+                    return read(module)
+                finally:
+                    release_module(module)
+                    del module
             finally:
                 context.disable_multithreading()
     except TilefishBuildError:
@@ -303,24 +452,33 @@ def ptxas_in_an_empty_directory() -> "Iterator[None]":
                 shutil.rmtree(_ptxas_cwd.directory, ignore_errors=True)
 
 
-def recording_source(ASTSource: Any) -> Any:
-    """A subclass of ``ASTSource`` (or of Gluon's ``GluonASTSource``, :func:`source_class`) that keeps the IR text its ``make_ir`` builds in
-    ``.ir_text`` (what a compile then takes), and whose frontend names the source files by host-independent paths
-    (:func:`host_independent_paths`), so that the binary's debug information does not depend on where the files are.
+def recording_source(ASTSource: Any, language: str = "triton") -> Any:
+    """A subclass of ``ASTSource`` (or of Gluon's ``GluonASTSource``, :func:`source_class`, with ``language`` ``"gluon"``) that records the digest
+    of the IR its ``make_ir`` builds in ``.recorded_digest`` (of what a compile then takes) and keeps the module, and whose frontend names the source files
+    by host-independent paths (:func:`host_independent_paths`), so that the binary's debug information does not depend on where the files are.
 
-    ``build`` compiles from this and checks that the text it recorded has the digest it looked the cache up with, so a binary is
-    only ever stored under the digest of the IR it was compiled from.
+    ``build`` compiles from this and checks that the IR it recorded has the digest it looked the cache up with, so a binary is
+    only ever stored under the digest of the IR it was compiled from; then it calls ``release()``, which frees what the compile left of the module
+    (:func:`release_module`: Triton keeps every module it lowers otherwise).
     """
 
     class RecordingSource(ASTSource):  # type: ignore[misc, valid-type]
-        ir_text: "str | None" = None
+        recorded_digest: "str | None" = None
+        module: Any = None
 
         def make_ir(self, target: Any, options: Any, codegen_fns: Any, module_map: Any, context: Any) -> Any:
             # (TILEFISH_DEBUG_PATHS=absolute keeps Triton's absolute paths, for a profiler: not reproducible, _source.debug_paths)
             naming = contextlib.nullcontext() if _source.debug_paths() == "absolute" else host_independent_paths()
             with naming:
                 module = super().make_ir(target, options, codegen_fns, module_map, context)
-            self.ir_text = str(module.str_nodebug())  # before the passes of the first stage change the module in place
+            self.recorded_digest = ir_digest(str(module.str_nodebug()), language)  # before the passes of the first stage change the module in place
+            self.module = module
             return module
+
+        def release(self) -> None:
+            """Free the module the compile lowered (once the compile is done: nothing reads it again)."""
+            module, self.module = self.module, None
+            if module is not None:
+                release_module(module)
 
     return RecordingSource

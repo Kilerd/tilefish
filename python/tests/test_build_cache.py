@@ -1452,7 +1452,7 @@ def test_replay_compares_the_triton_versions_before_it_runs_the_frontend(world, 
         ran.append(1)
         raise TilefishBuildError("the entry points of another Triton")
 
-    monkeypatch.setattr(_ir, "ttir_text", frontend)
+    monkeypatch.setattr(_ir, "_run_frontend", frontend)  # (every run of the frontend: _ir.frontend and _ir.ttir_text)
     assert runtime._current_ir(prep, 90, "3.5.1") == (None, "9.9.9") and ran == []
     assert runtime._current_ir(prep, 90, None) == (None, "9.9.9") and ran == []  # an entry that does not say which Triton made it
     monkeypatch.setitem(sys.modules, "triton", None)  # no Triton: nothing to recompute, nothing said of a version

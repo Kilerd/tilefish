@@ -5,6 +5,28 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### The memory of an export of many buckets
+
+Every digest, `sha256`, `sha256_code`, manifest, plan and trace is unchanged: an export writes the same bytes.
+
+- **The frontend runs once per distinct input in an export.** An export (`tilefish.runtime.export`, a graph's and a plan set's too) and the
+  `prepare` of a plan run Triton's frontend once per distinct kernel input (the function, signature, attributes, constants, options and
+  architecture), not once per bucket: the buckets of one `by_bucket=` configuration share one IR digest (`tilefish._ir.frontend_scope`). A `jit` call
+  and a replay call outside them run it every time, as before.
+- **Modules are freed.** Triton 3.5.1's Python binding does not own a module, so every module its frontend built and every module a compile lowered
+  stayed allocated for the life of the process (about twice the size of the IR text, at every run): tilefish now erases the body of each module it
+  is done with (`tilefish._ir.release_module`), after the digest and after the compile.
+- **The IR is not kept.** A build keeps the digest of its frontend's IR and its dots (what the TF32 guard reads: `tilefish._ir.Frontend`), not the
+  text, and hashes the text a megabyte at a time.
+- **One copy of each binary.** In an export the entries that have the same cubin or PTX share one copy until the manifest is written, and a traced
+  export (`trace=True`, `TILEFISH_TRACE=1`) keeps the stages of its builds in a temporary directory, one file per distinct text, until it writes the
+  trace (`tilefish._build.export_session`).
+- An export of 132 buckets in three configurations of a Gluon kernel with a large IR (`python/tests/irmem_export.py`, B300): 77 s and 1.27 GB peak
+  resident memory before, 9 s and 0.40 GB now (warm cache: 69 s and 1.17 GB before, 2.7 s and 0.25 GB now; traced: 371 s and 2.66 GB before,
+  282 s and 0.43 GB now, the same trace).
+
 ## tilefish 0.0.10, crate 0.0.8, tilefish-capi 0.0.1 (2026-11-16)
 
 Manifest schema 3, plan schema 1, both hosts and every digest are unchanged: an export writes the same manifest, plans, plan sets and fusion

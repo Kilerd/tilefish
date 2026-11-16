@@ -230,6 +230,15 @@ are compared first, so a Triton whose frontend differs is never asked to run it)
 The frontend costs 2 to 8 ms per kernel on a B300 (no compile, no GPU), once for
 each build, `jit` call and `replay` call. It runs under the same lock as a
 compile, so no two frontends, a compile's own included, run at once in any threads.
+An export (and the `prepare` of a plan) runs it once per distinct input, not once per
+bucket: the buckets of one `by_bucket=` configuration are one IR, one digest and one
+binary of the build cache. What is kept of a run is its digest, not its IR, and the
+module is freed (Triton's binding keeps every module it builds for the life of the
+process otherwise, about twice its text, at every frontend and every compile). An
+export of 132 buckets in three configurations of a Gluon kernel with a large IR
+(`python/tests/irmem_export.py`, on a B300) took 77 s and peaked at 1.27 GB of
+resident memory; it now takes 9 s and peaks at 0.40 GB (2.7 s and 0.25 GB with a warm
+cache; traced, 2.66 GB before and 0.43 GB now), and writes the same bytes.
 
 So an edit that was not reloaded is not a special case. `export` in the process
 that imported the module compiles, and stamps, what that process holds; a fresh
