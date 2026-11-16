@@ -1,7 +1,7 @@
 # RFC 0003: Epilogue and prologue fusion
 
-* **Status:** draft for review, 2026-11-16. Design and phase 0 experiments (section 6). Nothing is implemented. Section 8 lists the decisions
-  the review is asked for, each with a recommended default.
+* **Status:** reviewed; the decisions of 2026-11-16 are recorded in "Decisions" below. Design and phase 0 experiments (section 6); nothing is
+  implemented yet.
 * **Scope:** fusion across a call. An *epilogue* is the elementwise or row work that reads a GEMM's or a convolution's result; a *prologue* makes one
   of its operands. The RFC touches the planner and the fusion pass (`tilefish._plan`, `tilefish._fusion`), the library ops (`cublaslt.*`,
   `cudnn.conv_fwd`), externs, a new family of generated GEMM and convolution ops and the advisor. Only library epilogues touch the manifest and the
@@ -64,11 +64,12 @@ The measurements also bound the speed:
 * a straightforward Triton GEMM takes 1.22 to 1.44 times cuBLASLt's time, and fusing a naive epilogue into it was slower than leaving the epilogue
   unfused. Generated GEMMs need kernel work (experiment X8) before they pay.
 
-Section 7 therefore proposes hooks on externs and cuBLASLt epilogues first, and generated GEMMs after X8. The advisor then reports each epilogue
+Section 7 therefore proposes hooks on externs and cuBLASLt epilogues first, and generated GEMMs after X8; the review decided that order ("Decisions"). The advisor then reports each epilogue
 candidate with the routes and contracts that can take it.
 
 ## Contents
 
+Decisions (2026-11-16)
 0. Background: what exists
 1. Use cases
 2. The numerics problem and the three contracts
@@ -77,10 +78,40 @@ candidate with the routes and contracts that can take it.
 5. Interaction with plans, reports, the advisor, SASS assertions, traces, hosts and schemas
 6. Experiments: phase 0 results and the experiments still needed
 7. Staged plan, milestones and tests
-8. Open questions and recommended defaults
+8. Questions (resolved 2026-11-16)
 9. Prior art
 
 Appendix A: a worked example.
+
+## Decisions (2026-11-16)
+
+The draft was reviewed on 2026-11-16. Every question of section 8 is settled. The labels are the questions' (RFC 0001's D1 to D7 keep their
+names, and "D6" in this RFC is still RFC 0001's export-time verification):
+
+* **Q1 and Q2: the three contracts are adopted.** (i) exact, (ii) accumulator and (iii) library, as section 2.3 defines them, are the contracts
+  for fusion into a call, and RFC 0001's principle extends to them: fusion never changes bytes by itself; a declared mode does (`R_acc` is defined
+  on the IR, so a failed fusion still runs `U(R_acc(P))`). **The default is `epilogues="exact"`**, on without a declaration. `"accumulator"` and
+  `"library"` apply only when declared explicitly.
+* **Q3: where a mode is declared.** At the graph level (`tilefish.fusion(epilogues=...)`) or in a `tilefish.fused` scope, never per call.
+* **Q12: the order of work.** E1 and E2 go first, in parallel:
+  * **E1**: epilogue hooks on externs, `value="out"` and `value="acc"`, with the advisor's changes of section 5;
+  * **E2**: cuBLASLt epilogues through the new impl `cublaslt.matmul`: `BIAS`, ReLU and `beta * C` first, verified per pin, with the canary on;
+    GELU later, as binary-defined.
+
+  E3 (generated GEMMs) and E6 (cuDNN fused graphs) come later; E4 and E5 after the RFC 0001 phases they need.
+* **Q4 to Q11: the recommended defaults of section 8.** In short:
+  * Q4: a generated GEMM that must equal the library pin it replaces is an explicit opt-in of E3 (`equal="cublaslt"`), verified at every bucket,
+    with the library GEMM and route (a) kept where it fails;
+  * Q5: E3 is accepted per architecture when the generated GEMM is within 1.10 times the pinned cuBLASLt GEMM on a fixed suite of the shapes the
+    ported models use;
+  * Q6: bias, ReLU and `beta * C` first, measured-exact against (ii) and verified per pin; GELU later, binary-defined, behind `epilogues="library"`;
+    the canary on by default for epilogue entries; where an epilogue's algorithm has no f32 form, the plain pin's f32 output is the reference and
+    the auxiliary output must equal `ρ(acc + b)`;
+  * Q7: a new impl `cublaslt.matmul` (`epilogue`, `aux`, `beta`, the optional `canary`); `cublaslt.gemm` and `cublaslt.gemm_bias` stay as they are;
+  * Q8: the names as proposed;
+  * Q9: gated activations with two accumulators per program;
+  * Q10: norms over whole-row tiles first, the split over tiles with a declared order in E4;
+  * Q11: cuDNN fused graphs (E6) after E2 and X13, with cuDNN 9.13 or later required for fused entries on sm_103.
 
 ## 0. Background: what exists
 
@@ -485,7 +516,7 @@ The advisor's estimates rank the patterns (section 0):
 
 ## 4. Surface syntax
 
-A sketch; the names are open question Q8.
+A sketch; the names were question Q8, decided as proposed.
 
 ```python
 @tilefish.graph(fusion=tilefish.fusion())                              # epilogues="exact": the default, contract (i) only
@@ -754,9 +785,10 @@ it is the precondition of E4 and E5 for GEMMs that are library calls today.
 * **Speed (informative).** The advisor's estimate before fusion and the profiler's measurement after it, on synthetic models in `python/tests`. The
   ported models are measured privately.
 
-## 8. Open questions and recommended defaults
+## 8. Questions (resolved 2026-11-16)
 
-Each question has the default that would be implemented unless the review says otherwise.
+The questions as the review saw them, each with the default it recommended. All were decided on 2026-11-16 with these defaults, and Q12's order
+as the review stated it ("Decisions", above).
 
 * **Q1. The three contracts.** Should (i) exact, (ii) accumulator and (iii) library, as defined in 2.3, be the contracts that tilefish offers for
   fusion into a call? And does RFC 0001's principle "fusion never changes bytes by itself; a declared mode does" extend to them? That means `R_acc`
