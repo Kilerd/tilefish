@@ -82,6 +82,28 @@ def test_jit_needs_every_device_scalar_and_a_bucket():
     assert t["bucket"] == {"M": 32} and len(t["steps"]) == 9
 
 
+def test_the_profile_leaves_an_inout_tensor_and_a_carried_buffer_as_it_found_them():
+    import gpu_kernels_plans as kp
+
+    # the caller's InOut tensor: every run updates it in place; after the profile it holds its bytes again
+    a = torch.randn(16, 128, device="cuda")
+    state = torch.randn(16, 128, device="cuda")
+    before = state.clone()
+    t = tilefish.profile_plan(pm.accumulate, bucket="Q=16", reps=3, warmup=1, externals={"a": a, "state": state})
+    assert len(t["steps"]) == 5 and same_bytes(state, before)
+    # a carried buffer the plan writes: a run of stage_a leaves h = 3x in its arena; the profile's runs (of other inputs) overwrite it, and it puts
+    # back the bytes and what the arena notes of them (read here from the arena itself, at h's region)
+    x = torch.randn(8, 64, device="cuda")
+    tilefish.run(kp.stage_a, x)
+    runner = tilefish._planrun._jit_runner(tilefish._planrun._default_plan(kp.stage_a))
+    arena = runner.arena_of(torch.cuda.current_device())
+    offset = runner._carried.regions["h"][0]
+    h = lambda: arena.handle[offset:offset + 8 * 64 * 4].clone()  # noqa: E731
+    held = h()
+    tilefish.profile_plan(kp.stage_a, bucket="Rs=8", reps=2, warmup=1, method="events")
+    assert torch.equal(h(), held) and arena.shapes.get("h") == (8, 64)
+
+
 def test_the_advice_with_measured_times_and_the_command_line(exported, tmp_path, capsys):
     directory, p = exported
     out = tmp_path / "timing.json"

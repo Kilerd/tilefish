@@ -100,11 +100,12 @@ argument bound to it). Steps joined by fusible intermediates form a **candidate*
   library op is never fused with another, and its epilogue and prologue are future work, so each is a candidate of its own, bounded by it.
 
 **No step may sit between them** (rule 2 of RFC 0001, 3.5): one kernel of a candidate's steps must not need a step outside it, one that depends on a
-member and that a member depends on. The candidates are grown from the largest intermediate down, and an intermediate whose union would have such a
-step in the middle is not saved: it is listed under `blocked`, with the steps in the middle, as **`library-in-the-middle`** (a GEMM or convolution
-between them: the residual stream of a transformer, written by one norm and read by the next, has the layer's GEMMs between them; future work) or
-**`step-in-the-middle`** (another kernel that cannot join them). The dependencies are the plan's: a step that reads a version another wrote, and the
-order of the accesses to a buffer.
+member and that a member depends on. The candidates are grown from the largest intermediate down; an intermediate whose union would have such a
+step in the middle waits, and is tried again once the others have joined their groups (the step may have joined one), until nothing changes. One that
+still has a step in the middle is not saved: it is listed under `blocked`, with the steps in the middle, as **`library-in-the-middle`** (a GEMM or
+convolution between them: the residual stream of a transformer, written by one norm and read by the next, has the layer's GEMMs between them; future
+work) or **`step-in-the-middle`** (another kernel that cannot join them); an intermediate between two library ops is listed as **`library-library`**.
+The dependencies are the plan's: a step that reads a version another wrote, and the order of the accesses to a buffer.
 
 A version read by several steps is a **fan-out**, listed but not a candidate: one region of all of them, or recomputation, which version 1 does not do.
 The buffers kept stored are listed with why.
@@ -117,13 +118,16 @@ class gives one; the fusion pass gives the rest.
 | blocker | what to do | phase |
 |---|---|---|
 | `opaque-extern` | a hand-written kernel without MMAs: write its arithmetic in the graph body so phase 1 fuses it (a row one needs phase 2) | 1 |
-| `opaque-unknown` | the same, when there is no trace to tell whether it computes MMAs | 1 |
+| `opaque-unknown` | the same, when there is no trace to tell whether it computes MMAs (and if it does: an epilogue hook where it makes the intermediate, a prologue hook where it reads it) | 1 |
 | `opaque-compute-epilogue`, `-prologue` | a hand-written kernel bound by its arithmetic: MMAs in its SASS, or (with a timing file) moving its bytes at less than a quarter of the bandwidth, such as an attention of FMAs or a search; an epilogue hook of the extern (route (c)); a prologue hook | 4, future |
 | `dsl-kernel` | a `@tilefish.kernel` (elementwise): write its body in the graph body (RFC 8.2); exact as it is when it declares `fp_fusion=False` | 1 |
 | `dsl-kernel-contracts` | the same, for a kernel that lets the compiler contract: write `tilefish.fma` where it meant one rounding, or its bytes change | 1 |
 | `row-kernel` | a row `@tilefish.kernel`: needs phase 2 row fusion (write it in the graph body, with `order=` on its sums) | 2 |
 | `epilogue-library`, `prologue-library` | a GEMM or convolution's epilogue or prologue: future work (RFC 0001, section 7 route (b), sections 11.2 and 11.3) | future |
 | `copy-step` | a copy step: return or store the value where it is made | 1 |
+| `memset-step` | a memset step: its zeros are read from memory, never folded into a region (H2) | future |
+| `strided-output` | the producer writes the intermediate into part of a buffer (a column block, a head): a strided store (rule 7) | 2 |
+| `materialised` | a `tilefish.contiguous` copy of a view, or a row step reading the intermediate through a view that is not dense (rule 5) | 2 |
 | `generated-movement` | `im2col` / `col2im` around a convolution: its prologue or epilogue, future work | future |
 | `unknown-boundary` | two regions, without the trace or the graph to say why | 1 |
 
@@ -145,6 +149,7 @@ entry per value that crosses a boundary, with the ops on both sides and their li
 | `move` | a copy or a store between them | return or store the value where it is made | 1 |
 | `epilogue-<kind>`, `prologue-<kind>` | a call's result read by a region, a region's value read by a call: no fusion across a call | library: future work; extern: a hook (phase 4); `@tilefish.kernel`: write its body in the graph body | future, 4, 1 |
 | `grouping` | the union is legal, but the greedy merge of version 1 did not make it | a later fusion version | 1 |
+| `unfused` | the graph declares `tilefish.fusion(grouping="none")`: one kernel per op | drop it (the default groups them) | 1 |
 
 Without the trace or the graph, the fusion report says which regions are a reduction alone (and whether it has an order) and which read a view
 copied first; two regions joined by an intermediate are then `unknown-boundary`.
@@ -195,10 +200,15 @@ where a kernel branches on them); every device scalar must be given (`devscalars
 **The timing file** (`tilefish.step-timing.v1`): `graph`, `plan_digest`, `manifest_digest`, `arch`, `bucket`, `method`, `reps`, `warmup`,
 `device` (`name`, `arch`, `sm_count`, `clock_khz`, `copy_GBps`), `steps` (per step: `index`, `kind`, `entry`, `us`: `median`, `mean`, `trimmed`
 (the mean of the middle 80%), `min`, `p10`, `p90`, `net`), `sum_us` (of the trimmed means), `plan_us` (the plan without the events), `event_us`
-and `overhead` (`sum_us / plan_us - 1`). The advisor refuses a file of another plan, graph, bucket or step list.
+and `overhead` (`sum_us / plan_us - 1`). The advisor refuses a file without a `plan_digest` or of another plan, graph or bucket, one that does not
+time every step of the bucket exactly once, a time that is not a finite number of microseconds, and a device number that is not positive.
 
-**What it changes: nothing.** It is a runtime path of its own: no manifest, plan, plan set or digest names it, it writes no file of the export,
-and the runs it makes are runs of the plan (a run after it writes the bytes a run before it wrote: `test_gpu_advise.py`).
+**What it changes: nothing that outlives it.** It is a runtime path of its own: no manifest, plan, plan set or digest names it, it writes no file of
+the export, and the runs it makes are runs of the plan. What those runs change that would outlive them, the caller's `InOut` tensors and the carried
+buffers the plan writes, is copied aside (in the arena's order) before the first run and back after the last, and what the arena notes of each
+carried buffer is as before: a run after the profile writes the bytes a run before it wrote, and finds the state it would have found
+(`test_gpu_advise.py`). A plan that reads a carried buffer before it writes it is refused, as a run of it alone is (it runs on a shared arena
+after the plan that writes it, which the profiler does not set up).
 
 **Overhead and accuracy** (measured on a B300 MIG slice, sm_103, 30 SMs, on the plans of `plan_model` in `python/tests`, with Nsight Systems
 2026.5.2 on the same graph replays, `--cuda-graph-trace=node`):

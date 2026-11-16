@@ -92,7 +92,7 @@ BLOCKERS: "dict[str, tuple[str, str]]" = {
     "opaque-extern": ("write this extern's arithmetic in the graph body so phase 1 fuses it (an elementwise one; a row one needs phase 2)", "1"),
     "opaque-unknown": (
         "a hand-written kernel (export with trace=True to tell whether it computes MMAs): elementwise or row arithmetic, write it in the graph body so "
-        "phase 1 (or 2) fuses it; a GEMM, an attention or a convolution, an epilogue hook of it (phase 4)",
+        "phase 1 (or 2) fuses it; a GEMM, an attention or a convolution: an epilogue hook of it (phase 4) where it makes the intermediate, a prologue hook (future work) where it reads it",
         "1",
     ),
     "opaque-compute-epilogue": (
@@ -116,6 +116,9 @@ BLOCKERS: "dict[str, tuple[str, str]]" = {
         "or convolution inside it, future work (RFC 0001, section 7)",
         "future",
     ),
+    "strided-output": ("the producer writes the intermediate into part of a buffer (a column block, a head): a strided store, phase 2 (RFC 0001, 3.5 rule 7)", "2"),
+    "memset-step": ("a memset step: its zeros are read from memory, never folded into a region (RFC 0001, H2)", "future"),
+    "library-library": ("two library ops: a GEMM or a convolution is never fused with another", "future"),
     "step-in-the-middle": ("another step sits between them (a path from the producer to the consumer through it): one kernel would need it inside too", "1"),
 }
 
@@ -206,10 +209,8 @@ class StepInfo:
     sub: str
     label: str
     args: "list[_Arg]"
-    peak: "str | None" = None  # the peak of a library step ("tensor16", "tf32", "fp32")
     contracts: bool = False  # a @tilefish.kernel that lets the compiler contract (fp_fusion not False)
     mma: "bool | None" = None  # an opaque kernel: whether its SASS has MMAs (None: unknown, no trace)
-    region: "int | None" = None  # a fused region: its index in the fusion report
     arith_bound: bool = False  # measured: it moves its bytes (above the launch floor) at less than STREAMING of the bandwidth
 
     def blocker(self, role: str) -> "str | None":
@@ -227,7 +228,7 @@ class StepInfo:
                 return "materialised"
             if self.sub.startswith("generated"):
                 return "generated-movement"
-            return "copy-step"
+            return "memset-step" if self.sub == "memset" else "copy-step"
         return None
 
 
@@ -341,20 +342,17 @@ def _step_info(k: int, st: "Mapping[str, Any]", ex: _Export) -> StepInfo:
     if kind == "library":
         info = StepInfo(k, kind, entry_name, op, "library", "conv" if (entry or {}).get("impl") == "cudnn.conv_fwd" else "gemm",
                         f"{op} [{_library_label(entry or {})}]", args)
-        info.peak = _flops(entry or {})[1]
         return info
     region = ex.region_of(op)
     generated = bool((entry or {}).get("source_sha256"))
     if region is not None or (op or "").startswith("fused_"):
         template = (region or {}).get("template") or "elementwise"
         nodes = (region or {}).get("nodes") or (region or {}).get("body") or []
-        ops = [n.get("op") for n in nodes]
-        sub = "reduction" if len(ops) == 1 and ops[0] in ("sum", "mean", "max", "argmax", "argmin") else template
+        sub = "reduction" if _solo_reason(region or {}) is not None else template
         shown = (region or {}).get("body") or nodes  # the trace's: with the line of each op
         body = ", ".join(f"#{n.get('index', n.get('node'))} {n.get('op')}" + (f" ({n['loc']})" if n.get("loc") else "") for n in shown)
         where = f"region {region['index']}" if region and region.get("index") is not None else "region"
         info = StepInfo(k, kind, entry_name, op, "fused", sub, f"{op} [fused {where}, {sub}" + (f": {body}]" if body else "]"), args)
-        info.region = (region or {}).get("index")
         return info
     if generated and _GENERATED_COPY.match(op or ""):
         name = _GENERATED_COPY.match(op or "").group(1)  # type: ignore[union-attr]
@@ -523,7 +521,7 @@ def _classify_values(doc: "Mapping[str, Any]", infos: "Sequence[StepInfo]", keep
         if v.writer is None:
             continue
         role = roles.get(v.buffer)
-        readers = [r for r in v.readers if r != v.writer]
+        readers = v.readers  # (a step that reads and writes a buffer reads the version before the one it writes)
         why = None
         if role in ("output", "carried", "inout"):
             why = {"output": "returned", "carried": "carried to a later plan", "inout": "updated in place (an InOut parameter)"}[role]
@@ -549,17 +547,23 @@ def _classify_values(doc: "Mapping[str, Any]", infos: "Sequence[StepInfo]", keep
 # -- why a pair is not one kernel -----------------------------------------------------------------------------------------------------------------
 
 
+def _solo_reason(r: "Mapping[str, Any]") -> "tuple[str, str] | None":
+    """What the fusion report says of a region that is one op a region of its own in version 1 (a reduction, a gather): ``(reason, what)``."""
+    from ._fusion import reduction_reason
+
+    ops = [n.get("op") for n in r.get("nodes") or []]
+    if len(ops) != 1:
+        return None
+    ordered = any("order" in x for x in r.get("roundings") or [])
+    reason = reduction_reason(ops[0], ordered)
+    if reason is None:
+        return None
+    return reason, f"region {r.get('index')} is a '{ops[0]}'" + (" with order=" if ordered else " without order=" if reason == "reduction-unordered" else "")
+
+
 def _fallback_reasons(a: StepInfo, b: StepInfo, ex: _Export) -> "list[tuple[str, str]]":
     """Without the trace's boundaries: what the fusion report says of two regions."""
-    out = []
-    for s in (a, b):
-        r = ex.region_of(s.op) or {}
-        ops = [n.get("op") for n in r.get("nodes") or []]
-        if len(ops) == 1 and ops[0] in ("sum", "mean"):
-            ordered = any("order" in x for x in r.get("roundings") or [])
-            out.append(("reduction" if ordered else "reduction-unordered", f"region {r.get('index')} is a '{ops[0]}'" + (" with order=" if ordered else " without order=")))
-        elif len(ops) == 1 and ops[0] in ("max", "argmax", "argmin", "gather_rows"):
-            out.append(("gather" if ops[0] == "gather_rows" else "reduction", f"region {r.get('index')} is a '{ops[0]}'"))
+    out = [found for found in (_solo_reason(ex.region_of(s.op) or {}) for s in (a, b)) if found is not None]
     if not out:
         if "row" in (a.sub, b.sub):
             out.append(("template", "one of them is a row region"))
@@ -582,8 +586,31 @@ def _region_reasons(a: StepInfo, b: StepInfo, ex: _Export) -> "list[tuple[str, s
     return out or _fallback_reasons(a, b, ex)
 
 
-def _edge_blockers(e: Edge, infos: "Sequence[StepInfo]", ex: _Export) -> None:
+def _whole(view: "Mapping[str, Any] | None", shape: "Sequence[int]") -> bool:
+    """Whether an argument's view is its whole buffer (or a dense reshape of all of it): what a region reads and writes in phase 1."""
+    if view is None:
+        return True
+    vshape = [int(x) for x in view.get("shape") or []]
+    if view.get("offset", 0) != 0 or math.prod(vshape) != math.prod(shape):
+        return False
+    want, stride = [], 1
+    for size in reversed(vshape):
+        want.append(stride)
+        stride *= size
+    return all(s == w or n == 1 for s, w, n in zip(view.get("strides") or [], reversed(want), vshape))
+
+
+def _edge_blockers(e: Edge, infos: "Sequence[StepInfo]", ex: _Export, shapes: "Mapping[str, tuple[str, tuple[int, ...]]]") -> None:
     a, b = infos[e.producer], infos[e.consumer]
+    shape = shapes.get(e.buffer, ("", ()))[1]
+    # the producer writes the intermediate into part of its buffer (a column block, a head): a strided store, phase 2 (RFC 0001, 3.5 rule 7);
+    # a row step reads it through a view that is not dense: phase 2 too (rule 5); an elementwise one reads it where it is in phase 1
+    if any(x.binding == e.buffer and x.access in ("out", "inout") and not _whole(x.view, shape) for x in a.args):
+        e.blockers.append("strided-output")
+        e.detail.append(f"step {a.index} writes {e.buffer} through a view of part of it")
+    if (b.cls == "row" or b.sub in ("row", "reduction")) and any(x.binding == e.buffer and x.access in ("in", "inout") and not _whole(x.view, shape) for x in b.args):
+        e.blockers.append("materialised")
+        e.detail.append(f"step {b.index} (a row step) reads {e.buffer} through a view that is not dense")
     if a.cls == "library":
         e.blockers.append("epilogue-library")
         e.detail.append(f"step {a.index} is a pinned {a.sub}: its epilogue is future work")
@@ -626,18 +653,36 @@ def _timing_steps(timing: "Mapping[str, Any]", doc: "Mapping[str, Any]", bucket:
         raise TilefishAdviseError(f"the timing file is not a {TIMING_SCHEMA} document (tilefish.profile_plan writes one)")
     if timing.get("graph") != doc.get("graph"):
         raise TilefishAdviseError(f"the timing file is of the graph '{timing.get('graph')}', not '{doc.get('graph')}'")
-    if doc.get("plan_digest") and timing.get("plan_digest") and timing["plan_digest"] != doc["plan_digest"]:
-        raise TilefishAdviseError(f"the timing file is of the plan {timing['plan_digest'][:12]}..., not of this export's ({doc['plan_digest'][:12]}...)")
+    digest = timing.get("plan_digest")
+    if not isinstance(digest, str) or (doc.get("plan_digest") and digest != doc["plan_digest"]):
+        raise TilefishAdviseError(f"the timing file is of the plan {str(digest)[:12]}..., not of this export's ({str(doc.get('plan_digest'))[:12]}...)")
     steps = next((b["steps"] for b in doc.get("buckets") or [] if b.get("values") == dict(bucket)), None)
-    out = {}
-    for s in timing.get("steps") or []:
-        k = s.get("index")
-        if steps is None or not isinstance(k, int) or not 0 <= k < len(steps) or steps[k].get("entry") != s.get("entry"):
-            raise TilefishAdviseError(f"the timing file's step {k} ({s.get('entry')}) is not step {k} of the plan at {dict(bucket)}")
+    if steps is None:
+        raise TilefishAdviseError(f"the plan of '{doc.get('graph')}' has no bucket {dict(bucket)}, which the timing file is of")
+    listed = timing.get("steps")
+    if not isinstance(listed, list) or len(listed) != len(steps):
+        raise TilefishAdviseError(f"the timing file times {len(listed) if isinstance(listed, list) else 'no'} steps, but the plan has {len(steps)} at {dict(bucket)}")
+    out: "dict[int, float]" = {}
+    for s in listed:
+        k = s.get("index") if isinstance(s, Mapping) else None
+        if type(k) is not int or not 0 <= k < len(steps) or k in out or steps[k].get("entry") != s.get("entry"):
+            raise TilefishAdviseError(f"the timing file's step {k} is not step {k} of the plan at {dict(bucket)} (or is listed twice)")
         us = s.get("us")
         # the median less the cost of the events around it (what profile_plan measured of them), when the file says it
-        out[k] = float((us.get("net", us["median"])) if isinstance(us, Mapping) else us)
+        value = (us["net"] if "net" in us else us.get("median")) if isinstance(us, Mapping) else us
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise TilefishAdviseError(f"the timing file's step {k} has no time in microseconds (us: {us!r})")
+        out[k] = float(value)
     return out
+
+
+def _device_number(timing: "Mapping[str, Any]", key: str) -> "float | None":
+    """A number the timing file records of its device (``copy_GBps``, ``sm_count``), or ``None``; refused when it is not a positive number."""
+    device = timing.get("device") or {}
+    v = device.get(key) if isinstance(device, Mapping) else None
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v <= 0):
+        raise TilefishAdviseError(f"the timing file's device {key} is not a positive number ({v!r})")
+    return v
 
 
 def analyse(
@@ -671,15 +716,21 @@ def analyse(
         m = MACHINES[key]
     measured_bw = sms = None
     if timing is not None:
-        measured_bw = ((timing.get("device") or {}).get("copy_GBps")) or None
-        sms = ((timing.get("device") or {}).get("sm_count")) or None
+        if not isinstance(timing, Mapping):
+            raise TilefishAdviseError("the timing file is not a JSON object (tilefish.profile_plan writes one)")
+        measured_bw = _device_number(timing, "copy_GBps")
+        sms = _device_number(timing, "sm_count")
+        sms = int(sms) if sms else None
     if bandwidth or measured_bw or sms:
         m = m.scaled(bandwidth=bandwidth or measured_bw, sms=sms)
     ex = _Export(manifest, arch, report, gdoc, boundaries, trace)
     infos = [_step_info(k, st, ex) for k, st in enumerate(buckets[0]["steps"])]
     wanted = _parse_bucket(bucket)
     if timing is not None:
-        tb = {str(k): int(v) for k, v in (timing.get("bucket") or {}).items()}
+        tbk = timing.get("bucket") or {}
+        if not isinstance(tbk, Mapping) or not all(type(v) is int for v in tbk.values()):
+            raise TilefishAdviseError(f"the timing file's bucket is not an object of dimension sizes ({tbk!r})")
+        tb = {str(k): v for k, v in tbk.items()}
         if wanted is not None and wanted != tb:
             raise TilefishAdviseError(f"the timing file is of the bucket {tb}, not {wanted}")
         wanted = tb
@@ -705,9 +756,10 @@ def analyse(
             if info.cls == "opaque" and info.index in measured:
                 busy = max(measured[info.index] - floor, 1e-3)
                 info.arith_bound = rc[info.index].nbytes / (busy * 1e-6) < STREAMING * m.bandwidth * 1e9
+    shapes0 = buffer_shapes(doc, rank_bucket.get("values") or {})  # (the views of `infos` are the ranked bucket's)
     edges, fanouts, kept = _classify_values(doc, infos, keep)
     for e in edges:
-        _edge_blockers(e, infos, ex)
+        _edge_blockers(e, infos, ex, shapes0)
     return Advice(doc, infos, costs, analysed, rank_bucket, m, edges, fanouts, kept, measured, ex, timing)
 
 
@@ -731,14 +783,11 @@ class Advice:
         self.plan, self.infos, self.costs, self.analysed = plan, infos, costs, analysed
         self.rank_bucket, self.machine, self.edges, self.fanouts, self.kept = rank_bucket, machine, edges, fanouts, kept
         self.measured, self.ex, self.timing = measured, ex, timing
-        self.floor = self._floor()
+        self.floor = _launch_floor(self.infos, self.measured)
         self.candidates = self._candidates()
         self.doc = self._doc()
 
     # -- the model of the time a fusion saves ----------------------------------------------------------------------------------------------------
-
-    def _floor(self) -> float:
-        return _launch_floor(self.infos, self.measured)
 
     def _saved_us(self, steps: "Sequence[int]", saved: "Mapping[int, int]", bkey: str) -> "tuple[float, int]":
         """The time one kernel of ``steps`` would save at a bucket, and the launches it removes. ``saved``: the bytes each step would no longer move."""
@@ -793,26 +842,48 @@ class Advice:
         def weight(e: Edge) -> int:
             return costs[e.producer].writes.get(e.buffer, 0) + costs[e.consumer].reads.get(e.buffer, 0)
 
-        inner = [e for e in self.edges if infos[e.producer].cls != "library" and infos[e.consumer].cls != "library"]
-        anchored = [e for e in self.edges if infos[e.producer].cls == "library" or infos[e.consumer].cls == "library"]
-        anchored = [e for e in anchored if not (infos[e.producer].cls == "library" and infos[e.consumer].cls == "library")]
-        # the largest intermediates first: an edge joins two groups only when one kernel of the union has no step between its members
-        group: "dict[int, set[int]]" = {}
-        edges_of: "dict[int, list[Edge]]" = {}
+        lib = {k for k, info in enumerate(infos) if info.cls == "library"}
+        inner = [e for e in self.edges if e.producer not in lib and e.consumer not in lib]
+        anchored = [e for e in self.edges if (e.producer in lib) != (e.consumer in lib)]
         self.blocked: "list[dict[str, Any]]" = []
-        for e in sorted(inner, key=lambda e: (-weight(e), e.producer, e.consumer)):
-            a, b = group.get(e.producer, {e.producer}), group.get(e.consumer, {e.consumer})
-            union = a | b
-            middle = self._middle(union)
-            if middle:
-                self._block(e, middle)
-                continue
-            es = edges_of.get(id(a), []) + (edges_of.get(id(b), []) if a is not b else []) + [e]
-            for k in union:
-                group[k] = union
-            edges_of.pop(id(a), None)
-            edges_of.pop(id(b), None)
-            edges_of[id(union)] = es
+        for e in self.edges:
+            if e.producer in lib and e.consumer in lib:  # (two library ops are never one kernel; listed, so that every intermediate is accounted for)
+                self._block(e, set(), "library-library")
+        # the largest intermediates first: an edge joins two groups only when one kernel of the union has no step between its members. An edge
+        # refused is tried again after the others joined their groups (its middle step may have joined one), until nothing changes
+        root = {k: k for k in range(len(infos))}
+        members: "dict[int, set[int]]" = {}
+        edges_of: "dict[int, list[Edge]]" = {}
+
+        def find(x: int) -> int:
+            while root[x] != x:
+                root[x] = root[root[x]]
+                x = root[x]
+            return x
+
+        def join(e: Edge) -> bool:
+            a, b = find(e.producer), find(e.consumer)
+            if a == b:
+                edges_of[a].append(e)
+                return True
+            union = members.get(a, {a}) | members.get(b, {b})
+            if self._middle(union):
+                return False
+            root[b] = a
+            members[a] = union
+            members.pop(b, None)
+            edges_of[a] = edges_of.get(a, []) + edges_of.pop(b, []) + [e]
+            return True
+
+        pending = [e for e in sorted(inner, key=lambda e: (-weight(e), e.producer, e.consumer)) if not join(e)]
+        changed = True
+        while pending and changed:
+            left = [e for e in pending if not join(e)]
+            changed = len(left) < len(pending)
+            pending = left
+        for e in pending:
+            union = members.get(find(e.producer), {e.producer}) | members.get(find(e.consumer), {e.consumer})
+            self._block(e, self._middle(union))
         out = []
         for es in edges_of.values():
             steps = {x for e in es for x in (e.producer, e.consumer)}
@@ -823,27 +894,30 @@ class Advice:
             if middle:
                 self._block(e, middle)
                 continue
-            out.append(self._candidate([e], "epilogue" if infos[e.producer].cls == "library" else "prologue"))
-        rk = _key(self.rank_bucket)
+            out.append(self._candidate([e], "epilogue" if e.producer in lib else "prologue"))
         out.sort(key=lambda c: (-c["saved_us"][rk], -c["saved_bytes"][rk], c["steps"][0]))
         for i, c in enumerate(out, 1):
             c["rank"] = i
         return out
 
-    def _block(self, e: Edge, middle: "set[int]") -> None:
+    def _block(self, e: Edge, middle: "set[int]", reason: "str | None" = None) -> None:
         """An intermediate one kernel of its producer and consumer cannot save: another step sits between them (it reads what the producer made
-        and the consumer reads what it makes). A library op in the middle makes it future work; any other step, one kernel of all of them."""
+        and the consumer reads what it makes; a library op in the middle makes it future work, any other step one kernel of all of them), or both
+        are library ops."""
         infos = self.infos
         lib = sorted(k for k in middle if infos[k].cls == "library")
-        reason = "library-in-the-middle" if lib else "step-in-the-middle"
+        reason = reason or ("library-in-the-middle" if lib else "step-in-the-middle")
         shown = (lib or sorted(middle))[:3]
         rk = _key(self.rank_bucket)
         saved = self.costs[rk][e.producer].writes.get(e.buffer, 0) + self.costs[rk][e.consumer].reads.get(e.buffer, 0)
+        if reason == "library-library":
+            why = f"steps {e.producer} and {e.consumer} are both library ops"
+        else:
+            why = f"step {e.consumer} also depends on step {e.producer} through " + ", ".join(f"step {k} ({infos[k].op or infos[k].kind})" for k in shown)
+            why += f" and {len(middle) - len(shown)} more" if len(middle) > len(shown) else ""
         self.blocked.append({
             "buffer": e.buffer, "producer": e.producer, "consumer": e.consumer, "reason": reason, "middle": sorted(middle),
-            "labels": [infos[e.producer].label, infos[e.consumer].label],
-            "why": f"step {e.consumer} also depends on step {e.producer} through " + ", ".join(f"step {k} ({infos[k].op or infos[k].kind})" for k in shown)
-            + (f" and {len(middle) - len(shown)} more" if len(middle) > len(shown) else ""),
+            "labels": [infos[e.producer].label, infos[e.consumer].label], "why": why,
             "action": BLOCKERS[reason][0], "phase": BLOCKERS[reason][1], "saved_bytes": saved,
         })
 
@@ -902,8 +976,8 @@ class Advice:
             }
             if self.measured is not None:
                 item["us"] = self.measured.get(info.index)
-                busy = max((item["us"] or 0.0) - self.floor, 1e-3)  # the bandwidth it moves its bytes at, above the launch floor
-                item["achieved_GBps"] = round(c.nbytes / busy / 1e3, 1)
+                busy = (item["us"] or 0.0) - self.floor  # the bandwidth it moves its bytes at above the launch floor (none for a step at the floor)
+                item["achieved_GBps"] = round(c.nbytes / busy / 1e3, 1) if busy >= 0.1 else None
                 if info.cls == "opaque":
                     item["bound"] = "compute (measured)" if info.arith_bound else "memory (measured)"
             steps.append(item)
@@ -1007,12 +1081,11 @@ class Advice:
             if r.get("index") is None or id(r) in done:
                 continue
             done.add(id(r))
-            ops = [n.get("op") for n in r.get("nodes") or []]
-            if len(ops) == 1 and ops[0] in ("sum", "mean"):
-                ordered = any("order" in x for x in r.get("roundings") or [])
-                reason = "reduction" if ordered else "reduction-unordered"
-                out.append({"reason": reason, "region": r["index"], "kernel": name, "detail": f"a '{ops[0]}'" + (" with order=" if ordered else " without order="),
-                            "fix": BLOCKERS[reason][0], "phase": BLOCKERS[reason][1], "steps": steps_of.get(name, [])})
+            solo = _solo_reason(r)
+            if solo is not None:
+                reason, what = solo
+                out.append({"reason": reason, "region": r["index"], "kernel": name, "detail": what, "fix": BLOCKERS[reason][0], "phase": BLOCKERS[reason][1],
+                            "steps": steps_of.get(name, [])})
             for i in r.get("inputs") or []:
                 if i.get("read") == "materialised":
                     out.append({"reason": "materialised", "region": r["index"], "kernel": name, "detail": f"{i.get('value')} ({i.get('type')}) is copied first",
@@ -1065,7 +1138,7 @@ class Advice:
             lines.append(f"  ... {len(cands) - top} more (--json for all)")
         if d["patterns"]:
             lines.append("")
-            lines.append("what would help most (each candidate under the blocker of the latest phase it needs removed):")
+            lines.append("what would help most (each candidate under the blocker of the latest phase it needs removed; candidates overlap: upper bounds):")
             for p in d["patterns"]:
                 also = "; also needs " + ", ".join(f"{k} ({n})" for k, n in sorted(p["also"].items(), key=lambda kv: -kv[1])) if p["also"] else ""
                 lines.append(f"  {p['saved_us']:9.2f} us  {_mb(p['saved_bytes']):>10}  {p['candidates']:4d} candidates  phase {p['phase']:<6} {p['blocker']}{also}")
@@ -1073,7 +1146,7 @@ class Advice:
         rec = [r for r in d["recurring"] if r["count"] > 1]
         if rec:
             lines.append("")
-            lines.append("recurring candidates (the same ops in the same order, summed):")
+            lines.append("recurring candidates (the same ops in the same order, summed: upper bounds):")
             for r in rec[:top]:
                 lines.append(f"  {r['saved_us']:9.2f} us  {_mb(r['saved_bytes']):>10}  {r['count']:4d}x  phase {r['phase']:<6} {r['shape']}: {r['pattern']}  ({r['gate']})")
         if d["unfused_arithmetic"]:
@@ -1153,6 +1226,10 @@ def advise(
     doc = _plan_doc(d, graph)
     name = doc["graph"]
     manifest = _read_json(d / "manifest.json", "the manifest")
+    from ._manifest import manifest_digest
+
+    if not isinstance(manifest, dict) or (doc.get("manifest_digest") and manifest_digest(manifest) != doc["manifest_digest"]):
+        raise TilefishAdviseError(f"the plan of '{name}' in {str(d)!r} was made against another manifest than the manifest.json next to it")
     report_path = d / f"{name}.fusion.json"
     report = _read_json(report_path, "the fusion report") if report_path.is_file() else None
     trace = Trace.load(d)
@@ -1164,8 +1241,13 @@ def advise(
         if getattr(gop, "name", None) != name:
             raise TilefishAdviseError(f"gop= is the graph '{getattr(gop, 'name', gop)}', not '{name}'")
         bounds = _fusion.boundaries(gop) if _fusion.has_arithmetic(gop) else []
-        if report is None and _fusion.has_arithmetic(gop):
-            report = _fusion.report(gop)
+        if _fusion.has_arithmetic(gop):
+            ops = {str(e.get("op")).split("__ua", 1)[0] for e in manifest.get("kernels") or []}  # (an unaligned specialisation is its region's)
+            missing = sorted({r.kernel.name for r in _fusion.fused(gop).regions} - ops)
+            if missing:
+                raise TilefishAdviseError(f"gop= is not the graph '{name}' was exported from: its fused regions {missing[:3]} are not in the manifest")
+            if report is None:
+                report = _fusion.report(gop)
     if isinstance(timing, (str, pathlib.Path)):
         timing = _read_json(pathlib.Path(timing), "the timing file")
     return analyse(doc, manifest, report=report, gdoc=gdoc, boundaries=bounds, timing=timing, bucket=bucket, machine=machine, bandwidth=bandwidth,

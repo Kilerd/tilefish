@@ -2,7 +2,9 @@
 
 A runtime path of its own, outside every artefact: it runs the plan as :func:`tilefish.run` runs it (the same verified plan, the same binaries, the same
 arena and its order), repeatedly, with timing events between the steps, and writes what it measured as a ``tilefish.step-timing.v1`` document, which
-the advisor (:mod:`tilefish._advise`) reads. Nothing it does is in a manifest, a plan or a digest, and it writes no byte a run would not write.
+the advisor (:mod:`tilefish._advise`) reads. Nothing it does is in a manifest, a plan or a digest, its runs write what a run writes, and what they
+change that outlives them (the caller's ``InOut`` tensors, the carried buffers the plan writes) is copied aside before the first run and back after
+the last.
 
 * ``method="graph"`` (the default): the steps are captured once in a CUDA graph with an event record node (``CU_EVENT_RECORD_EXTERNAL``) before the
   first step and after each, and the graph is replayed ``reps`` times; a step's time is the time between the nodes around it. That is how a host that
@@ -21,9 +23,8 @@ import statistics
 from typing import Any, Mapping, Sequence
 
 from ._advise import TIMING_SCHEMA, _parse_bucket
+from ._launch import TORCH_DTYPE_NAMES
 from .errors import TilefishRuntimeError
-
-_TORCH_DTYPES = {"bf16": "bfloat16", "f16": "float16", "f32": "float32", "i32": "int32", "i64": "int64", "u8": "uint8", "e4m3": "float8_e4m3fn", "e5m2": "float8_e5m2"}
 
 
 def _stats(xs: "Sequence[float]") -> "dict[str, float]":
@@ -53,7 +54,7 @@ def synthesize(doc: "Mapping[str, Any]", values: "Mapping[str, int]", device: An
     for b in doc["buffers"]:
         if b["role"] not in ("input", "weight", "inout"):
             continue
-        dt = getattr(torch, _TORCH_DTYPES[b["dtype"]])
+        dt = getattr(torch, TORCH_DTYPE_NAMES[b["dtype"]].split(".")[1])
         shape = shapes[b["name"]][1]
         if b["dtype"] in ("i32", "i64", "u8"):
             out[b["name"]] = torch.zeros(shape, dtype=dt, device=device)
@@ -103,7 +104,9 @@ def profile_plan(
     ``None`` (``mode="jit"``). ``bucket``: ``"M=64"`` or ``{"M": 64}`` (needed when the plan has several and ``externals`` does not say). ``externals``:
     ``{name: tensor}`` for the parameters given at a call (default: :func:`synthesize`, seeded by ``seed``); ``devscalars``: ``{name: value}`` for every
     device scalar (no default: a count changes what the kernels do). ``reps`` timed runs after ``warmup``; ``method``: ``"graph"`` or ``"events"`` (the
-    module's doc). Needs torch and a CUDA device of the plan's architecture."""
+    module's doc). The runs change what outlives them (the caller's ``InOut`` tensors, the carried buffers the plan writes); their bytes are copied
+    aside before the first run and back after the last, and what the arena notes of the carried buffers is as before. A plan that reads a carried
+    buffer before it writes it is refused, as a run of it alone is. Needs torch and a CUDA device of the plan's architecture."""
     import torch
 
     from . import __version__, _cuda, _planrun
@@ -134,7 +137,7 @@ def profile_plan(
     kwargs = {**dict(externals), **devscalars}
     result = runner.profile((), kwargs, reps=reps, warmup=warmup, method=method)
     values = result.get("bucket") or wanted
-    index = torch.cuda.current_device()
+    index = result.get("device", torch.cuda.current_device())  # the device the plan ran on (its tensors')
     device = torch.device("cuda", index)
     steps_doc = next((b["steps"] for b in doc["buckets"] if values is not None and b["values"] == values), None)
     steps = []

@@ -443,7 +443,8 @@ class TorchBackend(Backend):
     def hold(self, stream: int, microseconds: float, index: int) -> None:
         from . import _cuda
 
-        rate = _cuda.clock_khz(index)  # cycles per millisecond
+        rates = self.__dict__.setdefault("_clock_khz", {})
+        rate = rates.get(index) or rates.setdefault(index, _cuda.clock_khz(index))  # cycles per millisecond
         self.torch.cuda._sleep(max(1, int(microseconds * rate / 1000)))  # on torch's current stream, which is `stream` (the caller made it current)
 
     def synchronize_stream(self, stream: int) -> None:
@@ -1099,7 +1100,9 @@ class PlanRunner:
     def profile(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]", *, reps: int, warmup: int, method: str) -> "dict[str, Any]":
         """The device time of every step of the bucket the arguments select (:func:`tilefish.profile_plan`): ``{"steps": [[µs per rep] per step],
         "plan": [µs per rep of the plan without the per-step events]}``. A runtime path of its own: the plan, its binaries and every byte it writes are
-        those of a run (it is one, repeated); between the steps it records timing events, which no run has.
+        those of a run (it is one, repeated); between the steps it records timing events, which no run has. What the runs change that outlives them (the
+        carried buffers the plan writes, the caller's ``InOut`` tensors) is copied aside before the first and back after the last, and what the arena
+        notes of the carried buffers is as before.
 
         ``method="graph"``: the steps are captured once in a CUDA graph with an event record node before the first and after each step, and the graph is
         replayed (what a host that captures the plan runs; the device scalars are written once, before). ``method="events"``: the steps are launched as a
@@ -1121,8 +1124,20 @@ class PlanRunner:
                 stream = be.stream(index)
                 _check_carried(arena, call.rt, self.plan.name)
                 _note_thread(arena, self.plan.name)
-                events = [be.new_timing_event(index) for _ in range(n + 1)]
-                ends = [be.new_timing_event(index) for _ in range(2)]
+                # what the runs change that outlives them: the carried buffers the plan writes (and what the arena notes of them) and the caller's
+                # InOut tensors. Copied aside before the first run and back after the last, so that profiling leaves the state a run would find
+                state: "list[tuple[int, int]]" = []
+                for name in call.rt.carried_writes:
+                    state.append((call.bases[name], self._carried.regions[name][1]))
+                for b in self._doc["buffers"]:
+                    if b["role"] == "inout":
+                        dtype, shape = call.rt.shapes[b["name"]]
+                        state.append((call.bases[b["name"]], math.prod(shape) * _plan.ITEMSIZE[dtype]))
+                noted = {name: arena.shapes.get(name) for name in call.rt.carried_writes}
+                events: "list[Any]" = []
+                ends: "list[Any]" = []
+                graphs: "dict[bool, Any]" = {}
+                saved: "list[tuple[Any, int, int]]" = []
 
                 def slots() -> None:
                     for b, source, on_device in call.slots:
@@ -1136,7 +1151,7 @@ class PlanRunner:
                         if timed:
                             be.record_event(events[i + 1], s, external)
 
-                def one(timed: bool, graphs: "dict[bool, Any]") -> None:
+                def one(timed: bool) -> None:
                     def work() -> None:
                         if method == "graph":
                             if not timed:
@@ -1153,41 +1168,48 @@ class PlanRunner:
                             if not timed:
                                 be.record_event(ends[1], stream, False)
 
-                    done = False
-                    try:
-                        _ordered(be, arena, stream, False, work)
-                        done = True
-                    finally:
-                        _carried_written(arena, call.rt, done)
+                    _ordered(be, arena, stream, False, work)
 
-                out: "dict[str, Any]" = {"steps": [[] for _ in range(n)], "plan": [], "bucket": dict(bound.values)}
+                out: "dict[str, Any]" = {"steps": [[] for _ in range(n)], "plan": [], "bucket": dict(bound.values), "device": index}
                 try:
-                    graphs: "dict[bool, Any]" = {}
+                    saved = [(be.empty((nbytes,), "u8", index), addr, nbytes) for addr, nbytes in state]
+                    _ordered(be, arena, stream, False, lambda: [be.copy(int(t.data_ptr()), addr, nbytes, stream) for t, addr, nbytes in saved])
+                    events = [be.new_timing_event(index) for _ in range(n + 1)]
+                    ends = [be.new_timing_event(index) for _ in range(2)]
                     if method == "graph":
                         _ordered(be, arena, stream, False, slots)  # the device scalars, once: the graphs hold the launches only
                         graphs[True] = be.capture_graph(index, None, lambda s: enqueue(s, True, True))
                         graphs[False] = be.capture_graph(index, None, lambda s: enqueue(s, False, False))
                     for timed in (True, False):
                         for _ in range(warmup):
-                            one(timed, graphs)
+                            one(timed)
                     be.synchronize_stream(stream)
                     for _ in range(reps):
-                        one(True, graphs)
+                        one(True)
                         be.synchronize_event(events[-1], index)
                         prev = 0.0
                         for i in range(n):
                             at = be.elapsed_ms(events[0], events[i + 1], index)
                             out["steps"][i].append((at - prev) * 1000.0)
                             prev = at
-                        one(False, graphs)
+                        one(False)
                         be.synchronize_event(ends[1], index)
                         out["plan"].append(be.elapsed_ms(ends[0], ends[1], index) * 1000.0)
                 finally:
-                    with contextlib.suppress(Exception):
-                        be.synchronize_stream(stream)
-                    for e in events + ends:
+                    restored = False
+                    try:
+                        if len(saved) == len(state):
+                            _ordered(be, arena, stream, False, lambda: [be.copy(addr, int(t.data_ptr()), nbytes, stream) for t, addr, nbytes in saved])
+                            restored = True
+                    finally:
+                        for name, shape in noted.items():  # what the arena notes of each: as before the runs, or unknown if the bytes were not put back
+                            arena.shapes[name] = shape if restored else None
                         with contextlib.suppress(Exception):
-                            be.destroy_event(e, index)
+                            be.synchronize_stream(stream)
+                        graphs.clear()  # (they hold event record nodes of the events destroyed next)
+                        for e in events + ends:
+                            with contextlib.suppress(Exception):
+                                be.destroy_event(e, index)
         return out
 
     def _bind(self, args: "tuple[Any, ...]", kwargs: "dict[str, Any]") -> "_BoundCall":

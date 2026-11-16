@@ -576,9 +576,12 @@ def _load_object(spec: str) -> Any:
         raise TilefishExplainError(f"--load takes MODULE:ATTR (models.block:graph), got {spec!r}")
     if "" not in sys.path and str(pathlib.Path.cwd()) not in sys.path:
         sys.path.insert(0, str(pathlib.Path.cwd()))
-    obj: Any = importlib.import_module(module)
-    for part in attr.split("."):
-        obj = getattr(obj, part)
+    try:
+        obj: Any = importlib.import_module(module)
+        for part in attr.split("."):
+            obj = getattr(obj, part)
+    except (ImportError, AttributeError) as e:
+        raise TilefishExplainError(f"--load {spec}: {e}") from e
     return obj
 
 
@@ -586,19 +589,22 @@ def _advise_main(args: Any) -> int:
     from . import _advise
 
     timing: Any = args.timing
+    gop: Any = None
+    graph = args.graph
     if args.profile:
         from ._profile import profile_plan
 
         if not args.load:
             raise TilefishExplainError("--profile replays the plan with its graph: say where it is with --load MODULE:ATTR")
         gop = _load_object(args.load)
-        if args.graph is not None and getattr(gop, "name", None) != args.graph:
-            raise TilefishExplainError(f"--load gives the graph '{getattr(gop, 'name', gop)}', not '{args.graph}'")
+        if graph is not None and getattr(gop, "name", None) != graph:
+            raise TilefishExplainError(f"--load gives the graph '{getattr(gop, 'name', gop)}', not '{graph}'")
+        graph = graph or getattr(gop, "name", None)
         scalars = {}
         for item in args.devscalar:
             name, eq, value = item.partition("=")
-            if not eq:
-                raise TilefishExplainError(f"--devscalar takes NAME=VALUE, got {item!r}")
+            if not eq or not value.strip().lstrip("-").isdigit():
+                raise TilefishExplainError(f"--devscalar takes NAME=VALUE with an integer VALUE, got {item!r}")
             scalars[name.strip()] = int(value)
         timing = profile_plan(gop, args.directory, bucket=args.bucket, reps=args.reps, warmup=args.warmup, method=args.method, pin=args.pin,
                               trust_directory=args.trust_directory, devscalars=scalars, out=args.profile)
@@ -609,7 +615,7 @@ def _advise_main(args: Any) -> int:
                 print(f"{args.profile}: {len(timing['steps'])} steps of '{timing['graph']}' at {timing['bucket']}, {timing['method']}, {timing['reps']} reps: "
                       f"sum of the steps {timing['sum_us']} us, the plan alone {timing['plan_us']['median']} us (events {100 * (timing['overhead'] or 0):+.1f}%)")
             return 0
-    adv = _advise.advise(args.directory, args.graph, bucket=args.bucket, timing=timing, machine=args.machine, bandwidth=args.bandwidth, keep=args.keep)
+    adv = _advise.advise(args.directory, graph, bucket=args.bucket, timing=timing, machine=args.machine, bandwidth=args.bandwidth, keep=args.keep, gop=gop)
     if args.json:
         print(json.dumps(adv.doc, indent=1, default=str))
     else:
@@ -621,11 +627,9 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     """``tilefish-explain``; returns the exit status (2 for a request the export cannot answer)."""
     args = _parser().parse_args(argv)
     if args.advise or args.profile:
-        from ._advise import TilefishAdviseError
-
         try:
             return _advise_main(args)
-        except (TilefishError, TilefishAdviseError) as err:
+        except TilefishError as err:  # (TilefishAdviseError is one)
             print(f"tilefish-explain: {err}", file=sys.stderr)
             return 2
     region: "str | int | None" = args.region

@@ -128,7 +128,8 @@ def advise(directory: "str | object", graph: "str | None" = None, **kwargs: obje
 
 def profile_plan(graph: GraphOp, plan: object = None, **kwargs: object) -> dict:
     """The device time of every step of the plan of ``graph`` at one bucket (``tilefish-explain DIR --graph G --profile OUT``; ``docs/advise.md``), as a
-    ``tilefish.step-timing.v1`` document that :func:`advise` reads. A runtime path of its own: it changes no artefact and no byte. Keywords:
+    ``tilefish.step-timing.v1`` document that :func:`advise` reads. A runtime path of its own: it changes no artefact, and puts back what its runs change
+    that outlives them (the caller's ``InOut`` tensors, the carried buffers). Keywords:
     ``bucket=``, ``reps=``, ``warmup=``, ``method=`` (``"graph"`` or ``"events"``), ``mode=``, ``pin=``, ``trust_directory=``, ``externals=``,
     ``devscalars=``, ``seed=``, ``out=``. Needs a CUDA device."""
     from ._profile import profile_plan as _profile_plan

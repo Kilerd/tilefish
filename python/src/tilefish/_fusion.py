@@ -525,7 +525,8 @@ class _Pass:
     def merge_problem(self, a: int, b: int, force: bool = False) -> "tuple[str, str] | None":
         """The first rule of 3.5 the union of the regions whose first ops are ``a`` and ``b`` breaks, as ``(reason, what)``: ``"limit"`` (more ops or
         tensors than a region of version 1 has), ``"cycle"`` (a path leaves the union and comes back: through a call, a view, a move or another
-        region), ``"template"`` (the union does not lower); ``None`` when the union is legal."""
+        region), or, for a path through a reduction (a region of its own in version 1), the reduction's reason (:func:`reduction_reason`),
+        ``"template"`` (the union does not lower); ``None`` when the union is legal. The pass merges only when it is ``None``."""
         union = sorted(self.groups[a] + self.groups[b])
         if len(union) > MAX_REGION_NODES and not force:
             return "limit", f"together they are {len(union)} ops, more than the {MAX_REGION_NODES} of a region of version 1"
@@ -544,10 +545,8 @@ class _Pass:
                     n = self.prog[x]
                     what = f"the call to '{n.op}'" if n.attrs.get("kind") else f"the op '{n.op}'"
                     detail = f"one region of both would make a cycle through {what} (node #{self.origin[x]}), which reads one and feeds the other"
-                    if _is_arith(n) and n.op in _SOLO_OPS:  # through a reduction: a row region of phase 2 takes all three
-                        unordered = n.op in ("sum", "mean") and "order" not in n.attrs
-                        return ("gather" if n.op == "gather_rows" else "reduction-unordered" if unordered else "reduction"), detail
-                    return "cycle", detail
+                    reason = reduction_reason(n.op, "order" in n.attrs) if _is_arith(n) else None
+                    return (reason or "cycle"), detail  # (through a reduction: a row region of phase 2 takes all three)
                 if s < last and s not in seen:
                     stack.append(s)
         try:
@@ -888,16 +887,29 @@ def report(gop: Any, verification: "Mapping[int, Any] | None" = None) -> "dict[s
 # reason -> (what to do, the phase of docs/rfcs/0001-plan-fusion.md that does it)
 BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
     "barrier": ("remove tilefish.barrier: a tap of the unfused plan (grouping='none') shows the same bytes", "1"),
-    "view": ("a view between two ops ends a region (rule 6): compute on one shape, or wait for phase 2 (dense reshapes inside a region)", "2"),
+    "view": (
+        "a view between two ops ends a region (rule 6): compute on one shape; phase 2 lets a dense reshape stay inside a region (a permute or a select "
+        "still ends one)",
+        "2",
+    ),
     "reduction-unordered": ("add order= to the reduction (D2): exact and layout-independent; phase 1 still runs it alone, phase 2 fuses it", "2"),
     "reduction": ("needs phase 2 row fusion: a reduction is a region of its own in version 1", "2"),
     "gather": ("needs phase 2: gather_rows is a region of its own in version 1", "2"),
     "cycle": ("move the call out from between them (or accept two kernels)", "1"),
-    "limit": ("a region of version 1 has at most 64 ops and 32 tensors: a split is a speed choice only", "1"),
+    "limit": (f"a region of version 1 has at most {MAX_REGION_NODES} ops and {MAX_REGION_TENSORS} tensors: a split is a speed choice only", "1"),
     "template": ("the templates cannot compute both in one kernel (another iteration space, or a row region)", "2"),
     "grouping": ("the greedy grouping of version 1 did not make this union (a later fusion version may)", "1"),
-    "materialised": ("needs phase 2: the row template reads no strided input, so the view is copied by tilefish.contiguous first", "2"),
-    "move": ("a copy or a store between them: return or store the value where it is made", "1"),
+    "unfused": ("the graph declares tilefish.fusion(grouping='none'), one kernel per op: drop it (the default groups them)", "1"),
+    "materialised": (
+        "a view that is not dense, copied by tilefish.contiguous first (a row region reads no strided input; a copy or a store of a view is a launch of "
+        "it): phase 2 reads and writes strided views in the row template",
+        "2",
+    ),
+    "move": (
+        "a copy, a store or a memset step makes the value (zeros are read from memory, never folded into a region: H2): return or store a value where "
+        "it is made",
+        "1",
+    ),
     "epilogue-library": ("GEMM / convolution epilogue: future work (RFC 0001, section 7 route (b) and section 11.2)", "future"),
     "epilogue-extern": ("an epilogue hook of the extern (RFC 0001, section 7 route (c)): phase 4", "4"),
     "epilogue-kernel": ("write the @tilefish.kernel's body in the graph body so phase 1 fuses it (inlining kernel calls: RFC 0001, 8.2)", "1"),
@@ -905,6 +917,16 @@ BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
     "prologue-extern": ("a prologue hook of the extern: future work (RFC 0001, section 11.3)", "future"),
     "prologue-kernel": ("write the @tilefish.kernel's body in the graph body so phase 1 fuses it (inlining kernel calls: RFC 0001, 8.2)", "1"),
 }
+
+
+def reduction_reason(op: str, ordered: bool) -> "str | None":
+    """Why an op of a graph body is a region of its own in version 1: ``"reduction-unordered"`` (a ``sum`` or ``mean`` without ``order=``, D2),
+    ``"reduction"`` (an ordered one, ``max``, ``argmax``, ``argmin``), ``"gather"`` (``gather_rows``); ``None`` for any other op."""
+    if op not in _SOLO_OPS:
+        return None
+    if op == "gather_rows":
+        return "gather"
+    return "reduction-unordered" if op in ("sum", "mean") and not ordered else "reduction"
 
 
 def _node_ref(f: Fused, k: int, region: "Region | None" = None) -> "dict[str, Any]":
@@ -958,14 +980,7 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
         out.append({"reason": reason, "from": a, "to": b, "value": value.ref, "detail": detail, "fix": fix, "phase": phase})
 
     def solo(k: int) -> "str | None":
-        n = prog[k]
-        if n.op not in _SOLO_OPS:
-            return None
-        if n.op == "gather_rows":
-            return "gather"
-        if n.op in ("sum", "mean") and "order" not in n.attrs:
-            return "reduction-unordered"
-        return "reduction"
+        return reduction_reason(prog[k].op, "order" in prog[k].attrs)
 
     for r in f.regions:
         root = r.nodes[0]
@@ -999,6 +1014,8 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
                     n = prog[which]
                     order = f" with order={n.attrs['order']}" if "order" in n.attrs else (" without order=" if reason == "reduction-unordered" else "")
                     add(reason, frm, to, i, f"'{n.op}'{order} (node #{f.origin[which]}) is a region of its own in version 1")
+                elif f.settings.grouping == "none":
+                    add("unfused", frm, to, i, "the graph declares grouping='none': every op is a kernel of its own")
                 else:
                     problem = p.merge_problem(other, root)
                     if problem is None:

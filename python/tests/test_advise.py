@@ -162,13 +162,20 @@ def test_a_pair_with_a_step_between_them_is_no_candidate():
     assert sorted(tuple(c["steps"]) for c in adv.candidates) == [(0, 1), (1, 2)]  # the GEMM's prologue and epilogue
     (b,) = adv.blocked
     assert (b["buffer"], b["reason"], b["middle"]) == ("t0", "library-in-the-middle", [1]) and b["phase"] == "future"
-    # a kernel in the middle that cannot join them (its input is read by another step too): a and c stay apart, the kernel and c are a pair
+    # a kernel in the middle whose input another step reads too (stored either way): a and c alone would have it between them, but once it joined c
+    # (t2) the union of all three has no step in the middle, so a joins them too (t0, tried again): one group saving t0 and t2
     steps2 = [kstep("a", ("x", "x"), ("y0", "t0"), ("y1", "t1")), kstep("m", ("x", "t1"), ("y", "t2")),
               kstep("c", ("x", "t0"), ("y0", "t2"), ("y1", "out0")), kstep("m", ("x", "t1"), ("y", "out1"))]
     manifest2 = {"kernels": [*manifest["kernels"], kernel("m", IO, generated=True)], "library": []}
     adv2 = _advise.analyse(plan(buffers, steps2), manifest2)
-    assert [c["steps"] for c in adv2.candidates] == [[1, 2]] and adv2.fanouts[0]["buffer"] == "t1"
-    assert [(b["buffer"], b["reason"], b["middle"]) for b in adv2.blocked] == [("t0", "step-in-the-middle", [1])]
+    (g,) = adv2.candidates
+    assert g["steps"] == [0, 1, 2] and g["shape"] == "group" and sorted(g["buffers"]) == ["t0", "t2"] and adv2.blocked == []
+    assert adv2.fanouts[0]["buffer"] == "t1"
+    # with a step that cannot join (a GEMM) in the middle, a and c stay apart however long it is tried
+    steps3 = [kstep("a", ("x", "x"), ("y0", "t0"), ("y1", "t1")), lstep("gemm.M64", "t1", "w", "t2"), kstep("m", ("x", "t2"), ("y", "out1")),
+              kstep("c", ("x", "t0"), ("y0", "out1"), ("y1", "out0"))]
+    adv3 = _advise.analyse(plan([*buffers], steps3), {**manifest2, "library": manifest["library"]})
+    assert [(b["buffer"], b["reason"]) for b in adv3.blocked] == [("t0", "library-in-the-middle")]
 
 
 class FakeTrace:
@@ -210,6 +217,7 @@ def test_a_hand_written_kernel_far_slower_than_its_bytes_is_bound_by_its_arithme
     assert pair["blockers"][0] == "opaque-compute-epilogue" and "bound by its arithmetic" in pair["actions"][0]
     fast = _advise.analyse(doc, manifest, timing=timing_of(doc, [3.3, 3.0, 10.0, 3.0], copy=1000.0))
     assert not fast.infos[0].arith_bound and fast.doc["steps"][0]["bound"] == "memory (measured)"
+    assert fast.doc["steps"][1]["achieved_GBps"] is None  # a step at the launch floor: its bandwidth is not measured
 
 
 def test_each_bucket_has_its_own_entries_and_views():
@@ -231,6 +239,28 @@ def test_each_bucket_has_its_own_entries_and_views():
     assert adv.doc["steps"][1]["bytes_read"] == 64 * 1024 * 2  # the view at M = 64, not M = 32's
     epi = next(c for c in adv.candidates if c["steps"] == [0, 1])
     assert epi["saved_bytes"] == {"M=32": 2 * 32 * 2048, "M=64": 2 * 64 * 2048}
+
+
+def test_a_strided_store_a_memset_and_two_library_ops_are_said_so():
+    buffers = [buf("x", "input"), buf("w", "weight", (1024, 1024)), buf("t0", "intermediate", ("M", 2048)), buf("z", "intermediate"),
+               buf("g0", "intermediate"), buf("g1", "intermediate"), buf("out0", "output"), buf("out1", "output"), buf("out2", "output"),
+               buf("workspace", "workspace", (1024,), "u8")]
+    block = {"shape": [M, 1024], "strides": [2048, 1], "offset": 1024}  # the right half of t0's columns
+    steps = [
+        kstep("p", ("x", "x"), ("y", "t0", block)),  # writes a column block of t0
+        kstep("q", ("x", "t0"), ("y", "out0")),
+        {"kind": "memset", "args": [{"name": "dst", "binding": "z"}]},
+        kstep("q", ("x", "z"), ("y", "out1")),
+        lstep("gemm.M64", "x", "w", "g0"),
+        lstep("gemm.M64", "g0", "w", "g1"),  # a GEMM of a GEMM's result
+        kstep("q", ("x", "g1"), ("y", "out2")),
+    ]
+    manifest = {"kernels": [kernel("p", IO, generated=True), kernel("q", IO, generated=True)], "library": [gemm("gemm.M64", M, 1024, 1024)]}
+    adv = _advise.analyse(plan(buffers, steps), manifest)
+    by = {tuple(c["buffers"]): c for c in adv.candidates}
+    assert "strided-output" in by[("t0",)]["blockers"] and by[("t0",)]["phase"] == "2"
+    assert by[("z",)]["blockers"][0] == "memset-step" and by[("z",)]["phase"] == "future"
+    assert [(b["buffer"], b["reason"]) for b in adv.blocked] == [("g0", "library-library")]
 
 
 def test_views_of_one_buffer_count_once_each():
@@ -308,6 +338,22 @@ def test_a_timing_file_of_another_plan_or_bucket_is_refused():
         _advise.analyse(doc, manifest, timing=t, bucket="M=1")
     with pytest.raises(_advise.TilefishAdviseError, match="step-timing"):
         _advise.analyse(doc, manifest, timing={**t, "schema": "x"})
+    bad = [
+        ({"plan_digest": None}, "of the plan"),
+        ({"steps": t["steps"][:3]}, "times 3 steps, but the plan has 4"),
+        ({"steps": []}, "times 0 steps"),
+        ({"steps": [t["steps"][0], t["steps"][0], *t["steps"][2:]]}, "listed twice"),
+        ({"steps": [{**s, "us": "fast"} for s in t["steps"]]}, "no time in microseconds"),
+        ({"steps": [{**s, "us": {"median": float("nan")}} for s in t["steps"]]}, "no time in microseconds"),
+        ({"device": {"copy_GBps": -1}}, "copy_GBps is not a positive number"),
+        ({"bucket": {"M": "64"}}, "bucket is not an object of dimension sizes"),
+    ]
+    for change, message in bad:
+        with pytest.raises(_advise.TilefishAdviseError, match=message):
+            _advise.analyse(doc, manifest, timing={**t, **change})
+    # a step with only its net time (no median) is read
+    nets = _advise.analyse(doc, manifest, timing={**t, "steps": [{**s, "us": {"net": 2.0}} for s in t["steps"]]})
+    assert nets.doc["total_us"] == 8.0
 
 
 def test_the_golden_block_on_the_command_line(capsys):
@@ -374,6 +420,14 @@ def test_every_boundary_of_the_regions_has_a_reason_and_a_fix():
     view = _fusion.boundaries(adv_view)
     if _fusion.report(adv_view)["regions"][-1]["template"] == "row":
         assert any(b["reason"] == "materialised" and "row template" in b["detail"] for b in view)
+
+
+def test_a_graph_that_declares_no_grouping_is_told_so():
+    import fusion_graphs as fg
+
+    got = _fusion.boundaries(fg.bias_act_unfused)
+    assert got and {b["reason"] for b in got} == {"unfused"} and "grouping='none'" in got[0]["fix"]
+    assert all(b["reason"] != "unfused" for b in _fusion.boundaries(fg.bias_act))
 
 
 def test_the_reasons_do_not_change_the_fusion():
@@ -496,3 +550,36 @@ def test_the_profile_times_every_step_between_events_and_launches_what_a_run_lau
     assert sum(1 for e in be2.log if e[0] == "graph") == 4  # warmup and timed replays of each graph
     with pytest.raises(tilefish.TilefishRuntimeError, match="method is 'graph' or 'events'"):
         r3.profile(w.args(), {}, reps=1, warmup=0, method="nvtx")
+
+
+def test_the_profile_puts_back_what_the_runs_change_that_outlives_them():
+    # an InOut parameter (and a carried buffer alike) is updated by every run: its bytes are copied aside before the first run and back after the last
+    import plan_model as pm
+    from fake_torch import FakeTensor
+
+    be = TimedBackend()
+    r, _ = fake_runner(tilefish.plan(pm.accumulate), backend=be)
+    a = FakeTensor((16, 128), "f32", 1 << 36)
+    state = FakeTensor((16, 128), "f32", 1 << 37)
+    r.profile((a, state), {}, reps=2, warmup=1, method="events")
+    copies = [e for e in be.log if e[0] == "copy"]
+    assert len(copies) == 2
+    (save, restore) = copies
+    assert save[2] == state._ptr and save[3] == 16 * 128 * 4  # before the first launch: the caller's tensor into scratch
+    assert restore[1] == state._ptr and restore[2] == save[1]  # after the last: back from that scratch
+    first, last = be.log.index(save), be.log.index(restore)
+    assert all(be.log.index(e) > first for e in be.launches() if e[0] == "launch") and last > max(i for i, e in enumerate(be.log) if e[0] == "launch")
+    assert len([e for e in be.log if e[0] == "allocated" or e[0] == "record"]) >= 2
+    # a carried buffer the plan writes: its region of the arena, aside and back; what the arena notes of it is as before
+    import gpu_kernels_plans as kp
+
+    be2 = TimedBackend()
+    r2, _ = fake_runner(tilefish.plan(kp.stage_a), backend=be2)
+    region = r2._carried.regions["h"]
+    r2.profile((FakeTensor((8, 64), "f32", 1 << 36),), {}, reps=1, warmup=0, method="events")
+    c2 = [e for e in be2.log if e[0] == "copy"]
+    assert [c2[0][2], c2[1][1]] == [ARENA + region[0]] * 2 and c2[0][3] == region[1]
+    assert r2.arena_of(0).shapes.get("h") is None  # no run wrote it before the profile, and none has after it
+
+
+ARENA = 1 << 46  # the fake arena's address (test_planrun)
