@@ -54,7 +54,7 @@ def test_the_frontend_frees_the_module_it_builds():
     before = rss_mib()
     for _ in range(runs):  # outside a scope: every call runs the frontend
         _ir.frontend(jit, inputs, arch=ARCH, options=inputs.options)
-    gc.collect()
+        gc.collect()  # (the code generator's Python objects are cycles: collected at each run, so that their pages are reused, not grown)
     grown = rss_mib() - before
     # a module kept per run would be about twice its text (2.2 MiB of text here): 40 MiB over the runs; freed, the allocator's noise
     assert size > 1.5 and grown < runs * size / 2, f"{grown:.1f} MiB more after {runs} runs of a frontend whose IR is {size:.1f} MiB of text"

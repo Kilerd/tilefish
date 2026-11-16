@@ -188,7 +188,7 @@ def test_a_pinned_replay_under_another_triton_falls_back_to_the_pin_and_never_ru
         raise TilefishBuildError("a frontend whose entry points are not those of the Triton 3.5 tilefish calls")
 
     monkeypatch.setattr(_ir, "triton_version", lambda: "9.9.9")  # the Triton of this process, as far as a replay can tell
-    monkeypatch.setattr(_ir, "ttir_text", frontend)
+    monkeypatch.setattr(_ir, "_run_frontend", frontend)  # (every run of the frontend: _ir.frontend and _ir.ttir_text)
     with pytest.raises(TilefishManifestError, match=r"the entry was built with Triton \S+, this process has Triton 9.9.9, .*cannot be compared"):
         tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, trust_directory=True)
     assert torch.equal(tilefish.run(ext_scale, x, mode="replay", manifest=manifest.directory, pin=manifest.digest), x * 2)  # the pin vouches
@@ -862,8 +862,8 @@ def test_the_ir_is_built_for_every_jit_call_and_the_binary_only_when_it_changes(
     write_ext_module(ext_dir, "2.0")
     runtime.clear_caches()
     frontends = []
-    real = _ir.ttir_text
-    monkeypatch.setattr(_ir, "ttir_text", lambda *a, **k: (frontends.append(1), real(*a, **k))[1])
+    real = _ir._run_frontend  # (every run of the frontend for a digest: _ir.frontend and _ir.ttir_text)
+    monkeypatch.setattr(_ir, "_run_frontend", lambda *a, **k: (frontends.append(1), real(*a, **k))[1])
     compiles = []
     monkeypatch.setattr(triton, "compile", lambda *a, **k: (compiles.append(1), REAL_COMPILE(*a, **k))[1])
     for _ in range(3):
