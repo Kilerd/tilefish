@@ -5,7 +5,7 @@ quantization format of every tensor live in its type, operators come from a
 typed library, and a model is built once into GPU binaries plus a manifest.
 Thin Python, C++ and Rust hosts are generated from the same signatures.
 
-**Status: early preview (0.0.9 on PyPI, 0.0.7 on crates.io; the C++ host builds from this repository).** The Python package type-checks:
+**Status: early preview (0.0.10 on PyPI, 0.0.8 on crates.io; the C++ host builds from this repository).** The Python package type-checks:
 tensor types and block-scaled formats, the four declarations below, tracing
 into a typed IR, and Triton ahead-of-time compile specs for `extern` kernels,
 in pure Python with no dependencies. A `@kernel` also lowers to Triton

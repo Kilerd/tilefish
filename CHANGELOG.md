@@ -5,10 +5,11 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## Unreleased
+## tilefish 0.0.10, crate 0.0.8, tilefish-capi 0.0.1 (2026-11-16)
 
 Manifest schema 3, plan schema 1, both hosts and every digest are unchanged: an export writes the same manifest, plans, plan sets and fusion
-reports as 0.0.9. The trace's graph file gains two keys (it is outside every digest).
+reports as 0.0.9. The trace's graph file gains two keys (it is outside every digest). The crate's sources are those of 0.0.6 (only its version
+moves, in step with the Python package); `tilefish-capi` is unchanged and stays 0.0.1, built from the release commit.
 
 ### The fusion advisor (`docs/advise.md`)
 

@@ -48,7 +48,7 @@ pub extern "C" fn tilefish_abi_version() -> u32 {
     (TILEFISH_ABI_MAJOR << 16) | TILEFISH_ABI_MINOR
 }
 
-/// The version of the tilefish crate the library is built from (`"0.0.7"`), a static string.
+/// The version of the tilefish crate the library is built from (`"0.0.8"`), a static string.
 #[unsafe(no_mangle)]
 pub extern "C" fn tilefish_version() -> *const c_char {
     static VERSION: &str = concat!(env!("TILEFISH_CRATE_VERSION"), "\0");
