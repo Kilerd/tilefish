@@ -1,6 +1,6 @@
 [project]
 name = "tilefish"
-version = "0.0.8"
+version = "0.0.9"
 description = "Typed tensor DSL for GPU kernels: shapes, dtypes and quantization formats in the type, one compiled artifact for Python, C++ and Rust hosts. Early preview: types, tracing and Triton AOT compile specs."
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"
@@ -21,7 +21,7 @@ Repository = "https://github.com/Kilerd/tilefish"
 gpu = ["torch>=2.9", "triton>=3.5", "cuda-python>=12.8"]
 # CUDA 13's nvdisasm, which reads the SASS of every architecture tilefish builds for (Triton 3.5.1's bundled CUDA 12.8 one cannot decode sm_103): the
 # SASS assertions and tilefish-explain prefer it (docs/explain.md)
-sass = ["nvidia-cuda-nvdisasm>=13"]
+sass = ["nvidia-cuda-nvdisasm>=13; sys_platform == 'linux' or sys_platform == 'win32'"]
 
 [dependency-groups]
 dev = ["pytest>=8"]

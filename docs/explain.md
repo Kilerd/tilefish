@@ -209,7 +209,7 @@ The first needed no SASS (the PTX and the ELF file say it all), so it names no d
 ## 5. The disassembler
 
 The `nvdisasm` of the contraction check (`tilefish._fpcontract.nvdisasm_candidates`): `$TILEFISH_NVDISASM_PATH`, an `nvidia-cuda-nvdisasm` wheel's
-(`pip install 'tilefish[sass]'` installs CUDA 13's, which reads every architecture tilefish builds for; found by the wheel's installed files, wherever pip put
+(`pip install 'tilefish[sass]'` installs CUDA 13's, which reads every architecture tilefish builds for, on Linux and Windows; on macOS it installs nothing, since there is no wheel there and reading a trace needs none; found by the wheel's installed files, wherever pip put
 it), Triton's (`$TRITON_NVDISASM_PATH` or its bundled
 copy), the one next to its `ptxas`, then the `PATH` and `$CUDA_HOME/bin`; the first that decodes the architecture.
 The listing is `nvdisasm -c -g -gi` (the code, with line information and the lines an instruction was inlined at where `ptxas` has them) and the PTX lines

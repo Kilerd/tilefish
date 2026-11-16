@@ -1229,7 +1229,7 @@ wheels = [
 
 [[package]]
 name = "tilefish"
-version = "0.0.8"
+version = "0.0.9"
 source = { editable = "." }
 
 [package.optional-dependencies]
@@ -1242,7 +1242,7 @@ gpu = [
     { name = "triton", version = "3.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 sass = [
-    { name = "nvidia-cuda-nvdisasm" },
+    { name = "nvidia-cuda-nvdisasm", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 
 [package.dev-dependencies]
@@ -1253,7 +1253,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cuda-python", marker = "extra == 'gpu'", specifier = ">=12.8" },
-    { name = "nvidia-cuda-nvdisasm", marker = "extra == 'sass'", specifier = ">=13" },
+    { name = "nvidia-cuda-nvdisasm", marker = "(sys_platform == 'linux' and extra == 'sass') or (sys_platform == 'win32' and extra == 'sass')", specifier = ">=13" },
     { name = "torch", marker = "extra == 'gpu'", specifier = ">=2.9" },
     { name = "triton", marker = "extra == 'gpu'", specifier = ">=3.5" },
 ]

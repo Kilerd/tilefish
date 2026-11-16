@@ -129,7 +129,7 @@ served to a build without it; any other value of the variable is refused.
 A manifest exported by 0.0.6 or earlier still names the directories of its build; it loads, pins and replays exactly as before. A prebuilt binary
 (section 8) is taken as it is: a PTX with `.file` directives or a cubin built elsewhere keeps whatever paths it has.
 
-**A trace next to the manifest (unreleased).** An export with `trace=True` (or `TILEFISH_TRACE=1`) also writes `trace/` in the manifest's directory:
+**A trace next to the manifest (tilefish 0.0.9).** An export with `trace=True` (or `TILEFISH_TRACE=1`) also writes `trace/` in the manifest's directory:
 every level of every binary, for `tilefish-explain` (`docs/explain.md`). No field of the manifest names it and no digest covers it, so the manifest,
 its digest and every pin are the same with or without it; neither reader looks at it (a reader reads `manifest.json` and the cubins it names, and nothing
 else of the directory). It holds source code (the kernels' files, the generated sources, Triton's): it is not part of what is shipped, and a tool that

@@ -5,10 +5,12 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## Unreleased
+## tilefish 0.0.9, crate 0.0.7, tilefish-capi 0.0.1 (2026-11-16)
 
 Manifest schema 3, plan schema 1 and both hosts are unchanged, and so is every digest of an export that declares no SASS assertion
-(`docs/explain.md`, issue #5 section 1).
+(`docs/explain.md`, issue #5 section 1): an export of 0.0.8 loads, pins and replays as before, and exporting it again writes the same manifest and
+plans. The crate's sources are those of 0.0.6 (only its version moves, in step with the Python package); `tilefish-capi` is unchanged and stays
+0.0.1, built from the release commit.
 
 ### SASS traceability and checks
 
