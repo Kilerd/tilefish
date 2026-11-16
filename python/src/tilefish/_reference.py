@@ -338,7 +338,7 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 r = neg(torch, a[0])
             elif op == "fma":
                 r = fma_f32(torch, a[0], a[1], a[2])
-            elif op == "sum" and "order" in n.attrs:  # an ordered sum (note 17): exact, the binary's order
+            elif op in ("sum", "mean") and "order" in n.attrs:  # an ordered sum (note 17): exact, the binary's order
                 (ax,) = n.attrs["axes"]
                 if n.attrs.get("fma"):  # each step fma(a, b, acc) of the product's operands
                     product = producer[n.inputs[0]]  # type: ignore[index]
@@ -348,6 +348,8 @@ def interpret(kernel: KernelOp, tensors: "dict[str, Any]", dims: "dict[Any, int]
                 shape = torch.broadcast_shapes(*(t.shape for t in terms))
                 terms = tuple(t.expand(shape).movedim(ax, -1) for t in terms)
                 r = ordered_sum(torch, terms, n.attrs["order"])
+                if op == "mean":  # times 1 / D correctly rounded, one rounding (mul.rn); a NaN the canonical one, as the GPU's multiply gives
+                    r = canonical_nan(torch, r * reciprocal(torch, float(shape[ax]), torch.float32, device))
                 if n.attrs["keepdims"]:
                     r = r.unsqueeze(ax)
             elif op == "sin" and n.attrs.get("math", math) == "ieee":  # without flush to zero: torch's

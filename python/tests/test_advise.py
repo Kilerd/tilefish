@@ -387,39 +387,62 @@ def adv_scale(x: Tensor[R, 256, f32]) -> Tensor[R, 256, f32]:
     return x * 2.0
 
 
-@tilefish.graph
-def adv_body(x: Tensor[R, 256, bf16], w: Tensor[R, 256, bf16]) -> Tensor[R, 256, bf16]:
+def _adv_body(x, w):
     h = tilefish.barrier(x.to(f32) * w.to(f32))
     h2 = h + 1.0  # across the barrier
     s = adv_scale(h2)  # a call between regions
     n = tilefish.sum(s * s, axis=-1, keepdims=True)  # no order=: a region of its own, its operand stored (D2)
-    o = tilefish.sum(s, axis=-1, keepdims=True, order=tilefish.tree(128))  # ordered: still a region of its own in version 1
+    o = tilefish.sum(s, axis=-1, keepdims=True, order=tilefish.tree(128))  # ordered: a region of its own in version 1, fused in version 2
     return (s * tilefish.rsqrt(n + o)).to(bf16)
 
 
 @tilefish.graph
-def adv_view(x: Tensor[R, 512, f32]) -> Tensor[R, 256, f32]:
+def adv_body(x: Tensor[R, 256, bf16], w: Tensor[R, 256, bf16]) -> Tensor[R, 256, bf16]:
+    return _adv_body(x, w)
+
+
+@tilefish.graph(fusion=tilefish.fusion(version=1))
+def adv_body_v1(x: Tensor[R, 256, bf16], w: Tensor[R, 256, bf16]) -> Tensor[R, 256, bf16]:
+    return _adv_body(x, w)
+
+
+def _adv_view(x):
     g, _ = x.split(256, axis=-1)
-    n = tilefish.sum(g * g, axis=-1, keepdims=True, order=tilefish.tree(128))
-    return g * tilefish.rsqrt(n)  # a per-row operand: the row template, which reads no strided input
+    n = tilefish.sum(g, axis=-1, keepdims=True, order=tilefish.tree(128))  # version 1: the sum alone, of the row template, which reads no view
+    return g * tilefish.rsqrt(n * n + 1.0)
+
+
+@tilefish.graph
+def adv_view(x: Tensor[R, 512, f32]) -> Tensor[R, 256, f32]:
+    return _adv_view(x)
+
+
+@tilefish.graph(fusion=tilefish.fusion(version=1))
+def adv_view_v1(x: Tensor[R, 512, f32]) -> Tensor[R, 256, f32]:
+    return _adv_view(x)
 
 
 def test_every_boundary_of_the_regions_has_a_reason_and_a_fix():
-    got = _fusion.boundaries(adv_body)
-    reasons = [(b["reason"], b["from"]["op"], b["to"]["op"]) for b in got]
-    assert ("barrier", "mul", "add") in reasons
-    assert ("prologue-kernel", "add", "adv_scale") in reasons and ("epilogue-kernel", "adv_scale", "mul") in reasons
-    assert ("reduction-unordered", "mul", "sum") in reasons and ("reduction-unordered", "sum", "add") in reasons
-    assert any(r == "reduction" and t == "add" for r, _, t in reasons)  # the ordered sum feeds the tail: phase 2
-    for b in got:
-        fix, phase = _fusion.BOUNDARY_FIXES[b["reason"]]
-        assert b["fix"] == fix and b["phase"] == phase and b["detail"]
-        assert _advise.BLOCKERS[b["reason"]] == (fix, phase)
-    assert [b for b in got if b["reason"] == "barrier"][0]["fix"].startswith("remove tilefish.barrier")
-    assert "add order=" in [b for b in got if b["reason"] == "reduction-unordered"][0]["fix"]
-    view = _fusion.boundaries(adv_view)
-    if _fusion.report(adv_view)["regions"][-1]["template"] == "row":
-        assert any(b["reason"] == "materialised" and "row template" in b["detail"] for b in view)
+    for graph in (adv_body, adv_body_v1):
+        got = _fusion.boundaries(graph)
+        reasons = [(b["reason"], b["from"]["op"], b["to"]["op"]) for b in got]
+        assert ("barrier", "mul", "add") in reasons
+        assert ("prologue-kernel", "add", "adv_scale") in reasons and ("epilogue-kernel", "adv_scale", "mul") in reasons
+        assert ("reduction-unordered", "mul", "sum") in reasons  # D2, in every version
+        for b in got:
+            fix, phase = _fusion.BOUNDARY_FIXES[b["reason"]]
+            assert b["fix"] == fix and b["phase"] == phase and b["detail"]
+            assert _advise.BLOCKERS[b["reason"]] == (fix, phase)
+        assert [b for b in got if b["reason"] == "barrier"][0]["fix"].startswith("remove tilefish.barrier")
+        assert "add order=" in [b for b in got if b["reason"] == "reduction-unordered"][0]["fix"]
+    v1 = [(b["reason"], b["from"]["op"], b["to"]["op"]) for b in _fusion.boundaries(adv_body_v1)]
+    assert ("reduction-unordered", "sum", "add") in v1
+    assert any(r == "reduction" and t == "add" for r, _, t in v1)  # version 1: the ordered sum feeds the tail
+    v2 = [(b["reason"], b["from"]["op"], b["to"]["op"]) for b in _fusion.boundaries(adv_body)]
+    assert not any(r == "reduction" for r, _, _ in v2)  # version 2 fuses the ordered sum with the tail: nothing to report
+    assert "version 2 (the default) fuses ordered sums" in _fusion.BOUNDARY_FIXES["reduction"][0]
+    assert any(b["reason"] == "materialised" and "row template" in b["detail"] for b in _fusion.boundaries(adv_view_v1))
+    assert not _fusion.boundaries(adv_view)  # version 2: one row region that reads the view where it is
 
 
 def test_a_graph_that_declares_no_grouping_is_told_so():
@@ -464,7 +487,11 @@ def test_a_traced_export_says_why_and_an_untraced_one_says_what_the_report_can(f
     classes = [s["class"] for s in adv.doc["steps"]]
     assert "fused" in classes and "elementwise" in classes  # the regions, and adv_scale (a @tilefish.kernel)
     reasons = {u["reason"] for u in adv.doc["unfused_arithmetic"]}
-    assert {"barrier", "reduction-unordered", "reduction"} <= reasons
+    assert {"barrier", "reduction-unordered"} <= reasons and "reduction" not in reasons  # version 2 fused the ordered sum
+    with pytest.warns(Warning):
+        runtime.export(adv_body_v1, tmp_path / "v1", arch=103, trace=True, verify=False)
+    old = tilefish.advise(tmp_path / "v1", "adv_body_v1")
+    assert {"barrier", "reduction-unordered", "reduction"} <= {u["reason"] for u in old.doc["unfused_arithmetic"]}
     assert any("reduction-unordered" in c["blockers"] for c in adv.candidates)
     barrier = next(c for c in adv.candidates if "barrier" in c["blockers"])
     assert barrier["phase"] == "1" and any(a.startswith("remove tilefish.barrier") for a in barrier["actions"])

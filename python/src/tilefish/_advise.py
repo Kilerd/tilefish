@@ -89,7 +89,7 @@ CLASSES = ("library", "fused", "elementwise", "row", "copy", "opaque")
 # blocker -> (what to do, the phase of docs/rfcs/0001-plan-fusion.md that does it). The reasons of the fusion pass (tilefish._fusion.boundaries) are
 # merged in at import below.
 BLOCKERS: "dict[str, tuple[str, str]]" = {
-    "opaque-extern": ("write this extern's arithmetic in the graph body so phase 1 fuses it (an elementwise one; a row one needs phase 2)", "1"),
+    "opaque-extern": ("write this extern's arithmetic in the graph body so fusion takes it (an elementwise one or, with order= on its sums, a row one)", "1"),
     "opaque-unknown": (
         "a hand-written kernel (export with trace=True to tell whether it computes MMAs): elementwise or row arithmetic, write it in the graph body so "
         "phase 1 (or 2) fuses it; a GEMM, an attention or a convolution: an epilogue hook of it (phase 4) where it makes the intermediate, a prologue hook (future work) where it reads it",
@@ -107,7 +107,7 @@ BLOCKERS: "dict[str, tuple[str, str]]" = {
         "meant one rounding, or its bytes change (RFC 0001, 8.2)",
         "1",
     ),
-    "row-kernel": ("needs phase 2 row fusion: a row @tilefish.kernel or a reduction is a kernel of its own in version 1 (write it in the graph body, with order= on its sums)", "2"),
+    "row-kernel": ("a row @tilefish.kernel: write its body in the graph body, with order= on its sums, and fusion version 2 (the default) fuses it into a row region", "2"),
     "generated-movement": ("a generated data-movement op (im2col, col2im) around a convolution: a convolution prologue or epilogue, future work", "future"),
     "unknown-boundary": ("two regions of the graph body: export with trace=True (or pass the graph) to say why (a barrier, a view, a limit, another iteration space)", "1"),
     "copy-step": ("a copy step: return or store the value where it is made (the step that makes it can write the destination)", "1"),
@@ -278,12 +278,15 @@ class _Export:
         self.gdoc = gdoc
         self.boundaries = list(boundaries) if boundaries is not None else (list(gdoc.get("boundaries") or []) if gdoc and "boundaries" in gdoc else None)
         self.trace = trace  # the export's trace (tilefish.explain.Trace), or None
-        self.regions: "dict[str, dict[str, Any]]" = {}  # region kernel name -> {"index", "template", "ops", "body"}
+        # the fusion version of the graph (the report's settings): what is a region of its own depends on it (tilefish._fusion.is_solo)
+        version = ((report or {}).get("fusion") or {}).get("version", 1)
+        self.version = version if isinstance(version, int) and not isinstance(version, bool) else 1
+        self.regions: "dict[str, dict[str, Any]]" = {}  # region kernel name -> {"index", "template", "ops", "body", "version"}
         for i, r in enumerate((report or {}).get("regions") or []):
             self.regions[r.get("op")] = {"index": i, "template": r.get("template"), "nodes": r.get("nodes") or [], "roundings": r.get("roundings") or [],
-                                         "inputs": r.get("inputs") or []}
+                                         "inputs": r.get("inputs") or [], "version": self.version}
         for name, r in ((gdoc or {}).get("regions") or {}).items():
-            have = self.regions.setdefault(r.get("kernel", name), {"index": r.get("region")})
+            have = self.regions.setdefault(r.get("kernel", name), {"index": r.get("region"), "version": self.version})
             have.setdefault("template", r.get("template"))
             have["body"] = r.get("body")
             if name != r.get("kernel"):
@@ -548,14 +551,17 @@ def _classify_values(doc: "Mapping[str, Any]", infos: "Sequence[StepInfo]", keep
 
 
 def _solo_reason(r: "Mapping[str, Any]") -> "tuple[str, str] | None":
-    """What the fusion report says of a region that is one op a region of its own in version 1 (a reduction, a gather): ``(reason, what)``."""
+    """What the fusion report says of a region that is one op a region of its own in its fusion version (a reduction without an order in every
+    version; in version 1 any reduction, or a gather): ``(reason, what)``."""
     from ._fusion import reduction_reason
 
     ops = [n.get("op") for n in r.get("nodes") or []]
+    if len(ops) == 2 and ops == ["mul", "sum"]:  # an fma sum with its product (one unit in every grouping)
+        ops = ["sum"]
     if len(ops) != 1:
         return None
     ordered = any("order" in x for x in r.get("roundings") or [])
-    reason = reduction_reason(ops[0], ordered)
+    reason = reduction_reason(ops[0], ordered, r.get("version", 1))
     if reason is None:
         return None
     return reason, f"region {r.get('index')} is a '{ops[0]}'" + (" with order=" if ordered else " without order=" if reason == "reduction-unordered" else "")
@@ -565,7 +571,7 @@ def _fallback_reasons(a: StepInfo, b: StepInfo, ex: _Export) -> "list[tuple[str,
     """Without the trace's boundaries: what the fusion report says of two regions."""
     out = [found for found in (_solo_reason(ex.region_of(s.op) or {}) for s in (a, b)) if found is not None]
     if not out:
-        if "row" in (a.sub, b.sub):
+        if "row" in (a.sub, b.sub) and ex.version < 2:  # (version 2 makes row regions of elementwise ops and reductions alike)
             out.append(("template", "one of them is a row region"))
         else:
             out.append(("unknown-boundary", "the trace (or the graph) says why"))
@@ -604,11 +610,13 @@ def _edge_blockers(e: Edge, infos: "Sequence[StepInfo]", ex: _Export, shapes: "M
     a, b = infos[e.producer], infos[e.consumer]
     shape = shapes.get(e.buffer, ("", ()))[1]
     # the producer writes the intermediate into part of its buffer (a column block, a head): a strided store, phase 2 (RFC 0001, 3.5 rule 7);
-    # a row step reads it through a view that is not dense: phase 2 too (rule 5); an elementwise one reads it where it is in phase 1
+    # a row step reads it through a view that is not dense: phase 2 too (rule 5); an elementwise one reads it where it is in phase 1, and so does a
+    # row region of fusion version 2
     if any(x.binding == e.buffer and x.access in ("out", "inout") and not _whole(x.view, shape) for x in a.args):
         e.blockers.append("strided-output")
         e.detail.append(f"step {a.index} writes {e.buffer} through a view of part of it")
-    if (b.cls == "row" or b.sub in ("row", "reduction")) and any(x.binding == e.buffer and x.access in ("in", "inout") and not _whole(x.view, shape) for x in b.args):
+    row_reader = b.cls == "row" or (b.sub in ("row", "reduction") and ex.version < 2)
+    if row_reader and any(x.binding == e.buffer and x.access in ("in", "inout") and not _whole(x.view, shape) for x in b.args):
         e.blockers.append("materialised")
         e.detail.append(f"step {b.index} (a row step) reads {e.buffer} through a view that is not dense")
     if a.cls == "library":
@@ -627,7 +635,13 @@ def _edge_blockers(e: Edge, infos: "Sequence[StepInfo]", ex: _Export, shapes: "M
             continue
         bl = s.blocker(role)
         if s.cls == "fused" and s.sub in ("row", "reduction") and not (a.cls == "fused" and b.cls == "fused"):
-            bl = "reduction" if s.sub == "reduction" else "template"
+            # a row region next to a step that is not a region: in fusion version 1 it would stay a kernel of its own even with the other written in
+            # the graph body (a reduction alone, or a row region the elementwise one cannot join); version 2 joins them but a reduction without an order
+            if ex.version >= 2:
+                solo = _solo_reason(ex.region_of(s.op) or {})
+                bl = solo[0] if solo is not None else None
+            else:
+                bl = "reduction" if s.sub == "reduction" else "template"
         if bl is not None and bl not in e.blockers:
             e.blockers.append(bl)
             anchored = "library" in (a.cls, b.cls)

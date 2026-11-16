@@ -1894,15 +1894,21 @@ def load_plan(
     try:
         derived = plan(graph, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"])
     except (TilefishPlanError, TilefishPreconditionError) as e:  # the graph (or an operator it calls) is not what it was: the plan on disk is stale
+        from ._fusion import other_version_of_plan
+
+        version = other_version_of_plan(graph, doc, lambda g: plan(g, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"]))
         raise TilefishManifestError(
             f"the plan in {str(directory)!r} is not the plan of graph '{graph.graph.name}' as this process holds it: the graph can no longer be planned for the "
-            f"same buckets ({str(e)[:400]}); export it again (and pin the new plan)"
+            f"same buckets ({str(e)[:400]}); " + (version if version else "export it again (and pin the new plan)")
         ) from e
     why = derived.stale_reason(doc)
     if why is not None:
+        from ._fusion import other_version_of_plan
+
+        version = other_version_of_plan(graph, doc, lambda g: plan(g, {n: v for n, v in doc["dims"].items()}, reuse=doc["reuse"]))
         raise TilefishManifestError(
-            f"the plan in {str(directory)!r} is not the plan of graph '{graph.graph.name}' as this process holds it: {why}; the graph (or an operator it calls) "
-            "changed since the plan was exported, so its steps are stale: export it again (and pin the new plan)"
+            f"the plan in {str(directory)!r} is not the plan of graph '{graph.graph.name}' as this process holds it: {why}; "
+            + (version if version else "the graph (or an operator it calls) changed since the plan was exported, so its steps are stale: export it again (and pin the new plan)")
         )
     loaded = derived.with_document(doc)
     loaded.directory = directory

@@ -360,10 +360,10 @@ class Value:
 
         return ops.reduce_sum(self, axis, keepdims, order=order, fma=fma)
 
-    def mean(self, axis: Any = None, keepdims: bool = False) -> "Value":
+    def mean(self, axis: Any = None, keepdims: bool = False, *, order: Any = None) -> "Value":
         from . import ops
 
-        return ops.reduce_mean(self, axis, keepdims)
+        return ops.reduce_mean(self, axis, keepdims, order=order)
 
     def max(self, axis: Any = None, keepdims: bool = False) -> "Value":
         from . import ops

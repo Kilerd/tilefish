@@ -7,29 +7,59 @@ each section names the release that added it.
 
 ## Unreleased
 
-Manifest schema 3, plan schema 1 and every digest of a production export are unchanged: an export writes the same manifest, plans, plan sets
-and fusion reports as 0.0.10 (the Rust gate's whole export, traced, against 0.0.10's without a trace: every file and digest the same). Manifest
-schema 3 gains one optional entry field, `instrument`, written only by the instrumented variant (below).
+Manifest schema 3 and plan schema 1 are unchanged but for one optional entry field, `instrument`, which only the instrumented variant writes
+(below). An export whose graphs have no arithmetic in their bodies and whose kernels write no `-0.0` scalar writes the same manifest, plans and plan
+sets as 0.0.10 (checked: every kernel and plan of the test suite and the Rust and C++ gates but those below, and the three pilot plan sets
+re-exported); a graph with arithmetic in its body is planned by fusion version 2 now (Breaking). An export takes less memory and time, every byte
+the same. The crate gains the readers and launches of the instrumented variant; the C ABI is unchanged and refuses an instrumented export.
 
-### The memory of an export of many buckets
+### Breaking
 
-Every digest, `sha256`, `sha256_code`, manifest, plan and trace is unchanged: an export writes the same bytes.
+- **Fusion version 2 is the default.** A graph whose body has arithmetic and declares no version is now planned by `tilefish.fusion(version=2)`
+  (below): its fused regions have new names (the version is in each region's content hash), new sources (revision 2 of the lowering) and warp
+  counts, so its manifest entries, plan and pin are new, and an ordered reduction, `max`, `argmax`, `argmin` or `gather_rows` is fused with its
+  neighbours (fewer steps; an intermediate fused away has no buffer, so a `taps=` of it is refused: tap the unfused plan or add `tilefish.barrier`).
+  The bytes it writes are those of 0.0.10 (every region is its unfused composition, and so was 0.0.10's) but where a `-0.0` scalar meets a zero
+  (Fixed, below). A plan exported by 0.0.10 or 0.0.9 and loaded by the graph as it is is refused, and the message names version 1. **To keep
+  0.0.10's plans and pins**, declare `@tilefish.graph(fusion=tilefish.fusion(version=1))`: version 1 plans as 0.0.10 did, byte for byte (plan
+  digests of the use cases checked), but where it was wrong (Fixed).
+- **What else of 0.0.10 changes:**
+  - `tilefish._fusion.boundaries()`, the trace's `boundaries` and the advisor (`tilefish.advise`, `--advise`) report by the graph's fusion
+    version: for version 2 no `reduction`, `gather` or row-region `materialised` and `template` reasons, and the fixes of the reasons `reduction`,
+    `reduction-unordered`, `gather`, `materialised`, `template`, `limit`, `grouping`, `view` and the blockers `row-kernel` and `opaque-extern`
+    are reworded.
+  - A kernel or region that writes a `-0.0` scalar has a new source, binary and pin, and writes `-0.0` where 0.0.10 wrote `+0.0` (Fixed).
+    In the test suite and the gates only the kernels written to test it; version-1 plan digests change for such graphs only.
+  - A region that gathers rows from a view that is not dense copies it first (`tilefish.contiguous`, a new step) in both versions (Fixed).
 
-- **The frontend runs once per distinct input in an export.** An export (`tilefish.runtime.export`, a graph's and a plan set's too) and the
-  `prepare` of a plan run Triton's frontend once per distinct kernel input (the function, signature, attributes, constants, options and
-  architecture), not once per bucket: the buckets of one `by_bucket=` configuration share one IR digest (`tilefish._ir.frontend_scope`). A `jit` call
-  and a replay call outside them run it every time, as before.
-- **Modules are freed.** Triton 3.5.1's Python binding does not own a module, so every module its frontend built and every module a compile lowered
-  stayed allocated for the life of the process (about twice the size of the IR text, at every run): tilefish now erases the body of each module it
-  is done with (`tilefish._ir.release_module`), after the digest and after the compile.
-- **The IR is not kept.** A build keeps the digest of its frontend's IR and its dots (what the TF32 guard reads: `tilefish._ir.Frontend`), not the
-  text, and hashes the text a megabyte at a time.
-- **One copy of each binary.** In an export the entries that have the same cubin or PTX share one copy until the manifest is written, and a traced
-  export (`trace=True`, `TILEFISH_TRACE=1`) keeps the stages of its builds in a temporary directory, one file per distinct text, until it writes the
-  trace (`tilefish._build.export_session`).
-- An export of 132 buckets in three configurations of a Gluon kernel with a large IR (`python/tests/irmem_export.py`, B300): 77 s and 1.27 GB peak
-  resident memory before, 9 s and 0.40 GB now (warm cache: 69 s and 1.17 GB before, 2.7 s and 0.25 GB now; traced: 371 s and 2.66 GB before,
-  282 s and 0.43 GB now, the same trace).
+### Fusion phase 2: row regions (`docs/rfcs/0001-plan-fusion.md`, "Phase 2")
+
+- **`tilefish.fusion(version=2)`, the default.** An ordered `sum` or `mean` (`order=`), the order-free `max`, `argmax`, `argmin` and `gather_rows`
+  join the ops around them in **row regions**: a residual add and an rmsnorm with the residual sum as a second output, a layer norm with an
+  elementwise tail, softmax (a scale, a mask from a device scalar, `max`, `exp`, an ordered sum, a divide), a row-wise fp8 quantisation with its scale
+  per row, a norm over two column blocks of one tensor, a gather and an argmax: one kernel each. Under the same exact contract as version 1: the
+  fused plan writes the bytes of its unfused composition (`grouping="none"`), `export` verifies it at every bucket, and the version is frozen into
+  every region's name and source. A `sum` or `mean` without `order=` still runs alone (D2). Version 1 is kept and plans as before (its regions,
+  sources, names and plan digests checked against 0.0.10's, which are 0.0.9's).
+- **Faster ordered sums: revision 2 of the lowering** (note 21 of `tilefish.lower`; `lower(..., lowering=2)`), which the regions of version 2
+  are lowered with. Revision 1 took each step of a lane's chain with a `tl.gather` of the row, through shared memory: an rmsnorm of 4096 rows of
+  1024 columns took 85 us on a B300 slice, its three unfused kernels with a Triton tree sum 61. Revision 2 makes the columns past the row's end
+  `-0.0` (which `add.rn` leaves every value of a chain as it is), reshapes the row to `[lanes, steps]` and takes the chains by halving splits (data
+  movement), the tree over the lanes through `tl.gather`: the same adds in the same order, checked against the CUDA kernels of each order at every
+  length and at every warp count, and 1.6 to 37 times faster than revision 1. A row of ordered sums gets the warps that suit it (one warp up to
+  `BLOCK_D = 2048`, then one per 1024 columns), and a fused row region reads views of rank 1 and 2 where they are (no `tilefish.contiguous` copy).
+  An fp8 cast of a region is inline `cvt.rn.satfinite`, `.to()`'s bits on every input. Hand-written kernels keep revision 1 and their sources.
+- **`tilefish.mean(x, axis, order=...)`**: the ordered sum times `1 / D` correctly rounded to f32, one rounding (`mul.rn`); the `reference`
+  mode computes the same.
+- **An ordered sum with `fma=True` in a graph body plans** (it raised a `KeyError` in 0.0.10): its product's multiply is part of the sum (each step
+  `fma(a, b, acc)`), so the two are one region in every grouping, the unfused composition's too.
+- **The advisor and `boundaries()`** follow the graph's fusion version (the fusion report's `fusion.version`): in version 2 an ordered reduction, a
+  `max`, an `argmax` or a gather is no longer reported, a row region no longer blocks its neighbours, and a fused row region reading a view is no
+  longer `materialised`; a graph of version 1 is told to use version 2 (the reasons `reduction`, `gather`, `materialised`).
+- **Speed** on a B300 MIG slice, rows 32 to 4096 and 512 to 4096 columns (the RFC's phase 2 table): the fused row region is the fastest in
+  every cell, 2.6 to 8 times faster than the same body with Triton's tree reductions run as three to five kernels (D2); an add + rmsnorm of 4096
+  rows of 1024 columns takes 16 us (tree composition 65, version 1 121, one kernel per op 103).
+- **`@tilefish.kernel(lowering=2)`** asks for revision 2 for a hand-written kernel (the same bytes; other binaries and pins).
 
 ### Intra-kernel instrumentation (`docs/instrument.md`)
 
@@ -48,6 +78,9 @@ Every digest, `sha256`, `sha256_code`, manifest, plan and trace is unchanged: an
 - **It is never taken for the production artefact**: Python's `Manifest.load` refuses it unless `instrumented=True`, `tilefish.run(..., mode="replay")`
   and `tilefish.capture` refuse it unless `probes=` (and refuse `probes=` on a production export), `tilefish.hosts.rust.emit` and
   `tilefish.hosts.cpp.emit` refuse it, and an export refuses to write one variant into a directory of the other.
+- **Probes and fused regions.** A probe is in a kernel body only (a graph body refuses it), so no fused region of either fusion version has one: in
+  the instrumented variant a region's kernel records `@begin`, `@calib` and `@end` only. A `@tilefish.kernel` with probes that a graph calls stays a step
+  of its own (a call is never fused), with its probes, and revision 2 of the lowering puts a kernel's probes where revision 1 does.
 - **Collecting**: `rec = tilefish.Probes()`; `tilefish.run(op, ..., probes=rec)` (jit builds the variant in memory; replay takes an instrumented export),
   `tilefish.run(graph, ..., probes=rec)` (each bucket of an instrumented plan has a probe region, allocated with its binaries outside any capture, or
   the caller's `Probes(buffer=...)`), `tilefish.capture(..., probes=rec)` and `CapturedPlan.collect()`; `rec.trace()` is a `ProbeTrace`
@@ -65,6 +98,37 @@ Every digest, `sha256`, `sha256_code`, manifest, plan and trace is unchanged: an
   -6% to +8% of their production time (a Gluon producer and consumer, a persistent kernel of 552 records per warp, an elementwise kernel of 4096
   short CTAs, a tcgen05 matmul); no shared memory, no stack frame. Triton's Proton was evaluated first and not used (`docs/instrument.md`, section 5:
   a shared-memory buffer, 131 to 197 KB on the tcgen05 matmul; the SM clock only; process-wide state).
+
+### The memory of an export of many buckets
+
+None of it changes a digest, `sha256`, `sha256_code`, manifest, plan or trace: an export writes the same bytes.
+
+- **The frontend runs once per distinct input in an export.** An export (`tilefish.runtime.export`, a graph's and a plan set's too) and the
+  `prepare` of a plan run Triton's frontend once per distinct kernel input (the function, signature, attributes, constants, options, architecture
+  and variant: an instrumented build's IR has its probes), not once per bucket: the buckets of one `by_bucket=` configuration share one IR digest
+  (`tilefish._ir.frontend_scope`). A `jit` call and a replay call outside them run it every time, as before.
+- **Modules are freed.** Triton 3.5.1's Python binding does not own a module, so every module its frontend built and every module a compile lowered
+  stayed allocated for the life of the process (about twice the size of the IR text, at every run): tilefish now erases the body of each module it
+  is done with (`tilefish._ir.release_module`), after the digest and after the compile.
+- **The IR is not kept.** A build keeps the digest of its frontend's IR and its dots (what the TF32 guard reads: `tilefish._ir.Frontend`), not the
+  text, and hashes the text a megabyte at a time.
+- **One copy of each binary.** In an export the entries that have the same cubin or PTX share one copy until the manifest is written, and a traced
+  export (`trace=True`, `TILEFISH_TRACE=1`) keeps the stages of its builds in a temporary directory, one file per distinct text, until it writes the
+  trace (`tilefish._build.export_session`).
+- An export of 132 buckets in three configurations of a Gluon kernel with a large IR (`python/tests/irmem_export.py`, B300): 77 s and 1.27 GB peak
+  resident memory before, 9 s and 0.40 GB now (warm cache: 69 s and 1.17 GB before, 2.7 s and 0.25 GB now; traced: 371 s and 2.66 GB before,
+  282 s and 0.43 GB now, the same trace).
+
+### Fixed
+
+- **A scalar `-0.0` keeps its sign** (note 3 of `tilefish.lower`): Triton 3.5.1 writes a literal `-0.0` as `+0.0`, so `where(x > 0, x, -0.0)`,
+  `x * -0.0` and the like gave `+0.0` in a `@tilefish.kernel` and in a fused region alike, against the declared op and the `reference` mode. Every
+  kernel (both revisions of the lowering, so also version 1's regions) now writes a `-0.0` scalar by its bits. Old and new binaries of the kernels
+  it changes differ only there: on 3 x 2**20 random inputs with special values and every bf16 pattern, every differing element is one where the
+  `-0.0` is selected, `+0.0` before and `-0.0` now. A `const` parameter whose value is `-0.0` is still `+0.0` (a `tl.constexpr`; open).
+- **A view gathered from is read at its rows.** A fused region that gathers rows from a view that is not dense read it as if it were dense (the
+  elementwise template of both versions, a rank-1 table: the wrong elements, fused and unfused alike); the view is now copied first.
+- **The warps of a row whose gather table has bucketed rows** name every bucket of its binaries (`compile_specs` refused such a kernel).
 
 ## tilefish 0.0.10, crate 0.0.8, tilefish-capi 0.0.1 (2026-11-16)
 

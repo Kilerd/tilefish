@@ -1,7 +1,7 @@
 # RFC 0001: Plan fusion
 
-* **Status:** reviewed; the decisions of 2026-11-15 are recorded in "Decisions" below. Phase 0 is measured and phase 1 is implemented
-  ("Phase 1" below); the rest is design.
+* **Status:** reviewed; the decisions of 2026-11-15 are recorded in "Decisions" below. Phase 0 is measured, phase 1 is implemented
+  ("Phase 1" below), and phase 2's row regions are implemented as `tilefish.fusion(version=2)` ("Phase 2" below); the rest is design.
 * **Date:** 2026-11-15.
 * **Scope:** the Python planner (`tilefish.plan`, `tilefish.runtime.export`), the lowering (`tilefish.lower`), the tracer of graph bodies and
   the `reference` mode. The hosts (the Python plan runner and the Rust crate) and both schemas are unchanged.
@@ -32,6 +32,7 @@ that can change NaN payloads), and the tests that prove it.
 Decisions (2026-11-15)
 Phase 0 results (2026-11-15, sm_103)
 Phase 1 (2026-11-15)
+Phase 2 (2026-11-16): row regions, fusion version 2
 0. Background: what exists
 1. Use cases and non-goals
 2. Surface syntax and capture
@@ -129,6 +130,73 @@ Implemented on the integration branch of the next release, as `tilefish._fusion`
   against torch's eager ops on every bit pattern, and two-tensor 16-bit `+ - *` against torch's on every pair (`2**32` per op and dtype); the
   export check refuses a contracting region, writes the report, and the plan replays and captures.
 
+## Phase 2 (2026-11-16): row regions, fusion version 2
+
+Implemented as `tilefish.fusion(version=2)`, now the default (D1: fusion on by default; D7: version 1 kept). What changed is the grouping rules
+(so the version) and, for the regions of version 2 only, the code of the lowering (revision 2, note 21 of `tilefish.lower`); the exact contract,
+the export-time verification, the schemas and the hosts are those of phase 1.
+
+* **Row regions.** An ordered `sum` or `mean` (`mean(order=)` is new: the ordered sum times `f32(1 / D)`, one `mul.rn`), the order-free `max`
+  (E2), `argmax`, `argmin` and `gather_rows` (a copy) join the ops around them; the dry run of the lowering decides, as in phase 1, and a union
+  that includes a reduction is lowered by the row template. A `sum` or `mean` without `order=` is still a region of its own, its operand stored
+  (D2). A region may write several values (an rmsnorm and its residual sum; a quantised row and its scale). An ordered sum with `fma=True` and the
+  multiply whose operands each of its steps takes are one unit in every grouping, the unfused composition's too (version 1 raised a `KeyError`
+  on one: its sum ran alone without its product).
+* **The use cases of 1.1** as graphs (`tests/fusion_graphs.py`, each with its unfused twin, run by the Rust and C++ gates as `fused_*` plans):
+  a residual add and an rmsnorm with the residual stream a second output (one kernel; the unfused composition has ten), the same with an fma
+  sum, a layer norm with a gelu and per-channel tail, softmax with a mask from a device scalar, a row-wise fp8 quantisation, a SwiGLU of two
+  column blocks and a norm, a gather and an argmax.
+* **Version 1 is frozen** with its lowering: its regions keep revision 1, and every use case declared `fusion(version=1)` plans as 0.0.9 and 0.0.10 planned
+  it (plan digests checked in `tests/test_fusion.py`). A plan made with another version is refused as stale with a message that names it
+  (`_fusion.other_version_of_plan`, tried only when a plan is stale).
+* **Why the ordered sum was slow (E3), and revision 2.** Revision 1 takes each step of a lane's chain with `tl.gather(x, k, 0)` of the whole
+  row; Triton lowers a gather whose source spans warps through shared memory, so every step stores the row, waits at a barrier and loads
+  (`lanes * vector` columns a step: 8 steps for `tree(128, vector=8)` at 1024 columns, 128 for `tree(32)` at 4096, where it took 2.5 ms for
+  4096 rows), and the template's warp rule (a warp per 256 columns) gave 16 warps to 128 lanes at 4096 columns. Revision 2 reshapes the row to
+  `[lanes, K]` (lane `j`'s columns in its order along the last axis, the columns past `D` made `-0.0`, which `add.rn` leaves every chain value as
+  it is) and takes each chain by halving splits, register moves where each thread holds its lane's columns, which the layout of the loads gives.
+  A first version that also took the tree over the lanes by splits made Triton's layout propagation give every value of the row to every
+  thread (926 spills, 4 ms): the tree goes through `tl.gather` of `[lanes]` instead (warp shuffles within a warp), and lane 0 comes out of a
+  `tl.reduce` with a select combine. The warps: one up to `BLOCK_D = 2048`, then one per 1024 columns (per 512 for 512 lanes or more), within 2%
+  of the best of 1 to 8 warps over the measured grid. Checked against the CUDA kernels of each order at every length from 1 to 4096 columns and at
+  every warp count; 1.6 to 37 times faster than revision 1.
+* **H10, found here: a literal `-0.0` is `+0.0` in Triton 3.5.1** (`tl.where(m, x, -0.0)`, `tl.full(..., -0.0)`, measured with and without a
+  `+0.0` in the kernel). Fusion stayed exact (the fused and unfused kernels wrote the same literal), but a body's `where(x > 0, x, -0.0)` was not
+  what it says, in a kernel and a region alike. Every kernel now writes a `-0.0` scalar by its bits (an `i32` bitcast; note 3), and so does
+  revision 2's padding of ordered sums.
+* **Also in revision 2:** views of rank 1 and 2 read where they are by the row template (rule 5; version 1's row regions copy them first), an
+  fp8 cast inline (`cvt.rn.satfinite.e4m3x2.f32`, `.to()`'s bits on every input). A hand-written kernel may ask for revision 2
+  (`@tilefish.kernel(lowering=2)`); by default it keeps revision 1 and its source.
+* **The advisor** (`docs/advise.md`) and `boundaries()` follow the graph's version: in version 2 an ordered reduction, `max`, `argmax` or a gather
+  is not reported, and a row region neither blocks its neighbours nor copies a view.
+* **Speed** (B300 MIG slice, sm_103, 30 SMs; microseconds per plan run captured in a CUDA graph; v2: the region, one kernel; tree: the same body
+  without `order=`, D2's three to five kernels with Triton's tree reductions, other bytes; v1: version 1, the reductions alone in revision 1;
+  unfused: one kernel per op; v1 and unfused write v2's bytes, checked in every cell). Over the whole grid, rows 32, 128, 512, 1024 and 4096 and
+  512, 1024, 2048 and 4096 columns, v2 is the fastest in every cell: 2.6 to 8 times faster than the tree composition.
+
+  | pattern | rows | D = 512: v2 / tree / v1 / unfused | D = 1024 | D = 2048 | D = 4096 |
+  |---|---|---|---|---|---|
+  | add + rmsnorm, residual returned (`mean`, `tree(128, vector=8)`) | 32 | 1.3 / 5.3 / 6.4 / 10.8 | 1.7 / 9.9 / 10.9 / 16.7 | 1.6 / 9.5 / 12.9 / 16.0 | 2.1 / 10.8 / 22.1 / 18.1 |
+  | | 4096 | 8.1 / 37.1 / 66.3 / 62.6 | 15.6 / 64.7 / 120.9 / 102.7 | 39.8 / 125.8 / 300.9 / 228.3 | 81.4 / 246.8 / 887.8 / 462.9 |
+  | layer norm (two means, `tree(256)`) | 32 | 2.7 / 11.4 / 11.2 / 18.1 | 3.0 / 12.2 / 13.6 / 18.3 | 3.5 / 12.3 / 16.1 / 18.3 | 3.0 / 13.5 / 24.3 / 20.8 |
+  | | 4096 | 31.2 / 49.5 / 58.0 / 75.0 | 40.2 / 84.8 / 135.1 / 124.7 | 56.2 / 174.0 / 369.4 / 290.4 | 131.9 / 347.2 / 903.8 / 610.9 |
+  | softmax (`max`, `exp`, sum `tree(32)`) | 32 | 1.2 / 8.6 / 11.1 / 11.2 | 1.4 / 9.1 / 13.5 / 11.8 | 1.8 / 9.4 / 18.1 / 11.8 | 2.4 / 10.9 / 35.6 / 14.0 |
+  | | 4096 | 9.0 / 28.6 / 71.5 / 62.5 | 15.0 / 43.6 / 175.2 / 95.9 | 33.5 / 95.7 / 545.5 / 227.8 | 95.6 / 193.6 / 1769.6 / 477.4 |
+  | fp8 quantisation (`max`; no sum: no tree) | 32 | 1.1 / - / 8.9 / 14.2 | 1.1 / - / 8.9 / 13.8 | 1.3 / - / 9.4 / 14.0 | 1.7 / - / 10.5 / 16.0 |
+  | | 4096 | 8.5 / - / 32.1 / 58.6 | 15.9 / - / 55.6 / 97.8 | 31.6 / - / 107.0 / 236.1 | 69.4 / - / 204.9 / 483.9 |
+
+  At 4096 rows of 4096 columns the add + rmsnorm moves 134 MB in 81 us, the bandwidth of the slice (1.6 TB/s).
+* **Tests:** `tests/test_fusion.py` (version 1 frozen, row regions, the fma unit, strided row inputs, the region's source as a hand-written
+  kernel's lowered by revision 2, the warp rule, the stale message); `tests/test_gpu_fusion_rows.py` (each row pattern fused against unfused at
+  every bucket on seeded inputs, on rows of special values and on every bf16 pattern; every warp count; 80 random graphs of row ops, a quarter also
+  through `verify_fusion`; the inline fp8 casts on every f32 and 16-bit pattern; `-0.0`; export, replay and capture); `tests/test_gpu_reduction_order.py`
+  (revision 2 against the CUDA kernels of each order, at every warp count); the use cases in `tests/test_gpu_fusion.py`, the Rust and C++ gates.
+  Every GPU test is arch-agnostic; on sm_120 they are a later gate's, and so are the speed rule's measurements there.
+* **Not yet** (phase 2 work left open): a store into an `InOut` or carried tensor made by a region (rule 4: it is still a copy step), strided
+  outputs (rule 7), dense reshapes inside a region (rule 6), configurations per bucket other than the warp count, `tilefish.fused(name=...)`
+  scopes, `intermediates="f32"`, revision 2's split form for the sequential order (one lane: revision 1's helper), and the reference against
+  the RFC's acceptance (Q11): the ported models' norms and activations written in the graph body.
+
 ## 0. Background: what exists
 
 * **Graph bodies already trace arithmetic.** A graph body runs over the same `Value` proxies as a kernel body, so `x + y`, a cast or a
@@ -213,7 +281,7 @@ graph unchanged. What the graph adds is a declaration of how the arithmetic is e
 
 | parameter | values (default first) | what it says | phase |
 |---|---|---|---|
-| `version` | `1` | the grouping rules, limits and rewrite rules, frozen (D7) | 1 |
+| `version` | `2`, `1` | the grouping rules, limits and rewrite rules, frozen (D7): `2` makes row regions (phase 2), `1` runs every reduction alone | 1, 2 |
 | `grouping` | `"auto"`, `"none"` | regions as section 3 makes them, or one kernel per op (the unfused composition) | 1 |
 | `math` | `"fast"`, `"ieee"` | the default math of the body's f32 ops, as `@tilefish.kernel(math=...)` | 1 |
 | `intermediates` | `"declared"`, `"opmath"`, `"f32"` | how a 16-bit intermediate is rounded: as its IR dtype says; as torch's eager ops round (D4); widened to f32 between calls | `"declared"`: 1, the others: 3 |

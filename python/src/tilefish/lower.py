@@ -292,6 +292,12 @@ Notes (the facts behind the table):
    ``fma.rn.bf16x2`` (or ``mul.rn.bf16x2`` and ``add.rn.bf16x2`` without contraction), with no ``cvt`` to f32.
    The one exception is ``/``, which Triton does in f32 for bf16 and f16 and returns as f32; that is why a
    division of those dtypes is rejected.
+   **A scalar ``-0.0``** is written by its bits, ``tl.full((), -2147483648, tl.int32).to(tl.float32, bitcast=True)`` (``-32768`` and ``tl.int16`` for
+   bf16 and f16): Triton 3.5.1 writes a literal ``-0.0`` (``tl.where(m, x, -0.0)``, ``tl.full(..., -0.0, ...)``, a ``-0.0`` argument of an
+   inline-asm helper) as ``+0.0`` (measured on sm_103: ``0x00000000`` where ``0x80000000`` was written, with or without a ``+0.0`` in the same
+   kernel), so ``where(x > 0, x, -0.0)`` gave ``+0.0`` in tilefish 0.0.10 and earlier, in a kernel and in a fused region alike, against the
+   ``reference`` mode and the declared op. A ``const`` parameter whose value is ``-0.0`` is a ``tl.constexpr``, which Triton still makes ``+0.0``
+   (a graph's fused region writes a const's value as a scalar, so it is covered there).
 4. **Division.** ``a / b`` is ``div.full.f32``, never ``div.rn.f32``: the numerator times an approximate
    reciprocal, at most 2 ULP from the correctly rounded quotient (measured: 2 ULP, 29% of random elements
    differ, relative error below 1.8e-7). With a constant divisor (``x / D`` with ``D`` a constexpr or a
@@ -540,10 +546,47 @@ Notes (the facts behind the table):
     ``context_free`` adds the header line that says so, and lets a kernel take a **view where it is**: a ``Strided[...]`` parameter with a
     ``StrideOf`` per axis (a fused region's input that is a column block, a head or a transpose), which the elementwise template reads at
     ``sum(coordinate_k * stride_k)``, the coordinates as note 12 computes them (integer arithmetic, exact; a ``max_extent`` precondition holds the
-    offsets within ``i32``). The row template takes none (rule ``row.strided``): a fused region then copies the view with ``tilefish.contiguous``
-    first.
+    offsets within ``i32``). The row template takes none in revision 1 (rule ``row.strided``): a fused region of fusion version 1 then copies the
+    view with ``tilefish.contiguous`` first; revision 2 reads it where it is (note 21).
 
     Every non-NaN value is the same either way, and the inline cast is ``.to()``'s bits on every f32 (``tests/test_gpu_fusion.py``).
+21. **Revision 2 of the lowering** (``lower(..., lowering=2)``; the kernel's ``lowering`` attribute, which the regions of ``tilefish.fusion(version=2)``
+    are made with, a kernel declared ``@tilefish.kernel(lowering=2)`` has, and every other kernel has as ``1``). The bytes of revision 1, other
+    code, so other binaries and pins: a kernel's revision is frozen with what makes it (a hand-written kernel keeps revision 1 and its source unless
+    it declares 2).
+
+    * **Ordered sums by halving splits.** Revision 1 takes each step of a lane's chain with a ``tl.gather`` of the row (a pass through shared memory
+      per step: 85 us for an rmsnorm of 4096 rows of 1024 columns on a B300 slice, where its three unfused kernels with a Triton tree sum take
+      61). Revision 2 makes the columns at or past ``D`` ``-0.0`` (``fma(-0.0, 1.0, acc)`` for an fma sum), which ``add.rn`` without flush to zero
+      leaves every value a chain can hold as it is (``+0.0 + -0.0`` is ``+0.0``, ``-0.0 + -0.0`` is ``-0.0``, a NaN a chain holds is already the
+      canonical one), so a column past the end is skipped as revision 1 skips it; pads the row with such columns to whole rounds of ``lanes *
+      vector`` (``tl.join``, data movement); reshapes it to ``[lanes, K]``, lane ``j``'s columns ``c * lanes * vector + j * vector + v`` in their order
+      along the last axis; adds each lane's chain by a recursive helper that takes the low half of the columns, then the high half, each by a
+      ``tl.split`` (data movement, exact) down to one column, one ``add.rn`` (``fma.rn``) each; then the tree over the lanes, each offset ``p[j] +
+      p[j + o]`` for every lane at once with ``tl.gather`` (a lane whose partner is past the end is not read again: only live lanes reach lane 0), and
+      lane 0's value by ``tl.reduce`` of (value, lane) pairs with a combine that keeps the lower lane (a select: any tree gives lane 0's bits). Every
+      add is the one revision 1 makes, in its order: checked against the CUDA kernels of each order at every length from 1 to 4096 columns, on rows of
+      every magnitude, signed zeros, NaNs, infinities and subnormals, and at every ``num_warps`` (``tests/test_gpu_reduction_order.py``). A
+      sequential order (one lane), or a lane of more than ``SPLIT_MAX_STEPS = 1024`` steps at a bucket, keeps revision 1's helper. Measured (B300
+      MIG slice, rows of 32 to 4096 and 512 to 16384 columns): 1.6 to 37 times faster than revision 1 (a lane of 512 steps 37 times), at the
+      bandwidth of the row's bytes at 4096 columns.
+    * **The warps of a row of ordered sums.** A row whose reductions are ordered sums or means of more than one lane (and order-free ones: ``max``,
+      ``argmax``) has one warp up to ``BLOCK_D = 2048``, then one per 1024 columns (per 512 for an order of 512 lanes or more), at most 16: within 2%
+      of the best of 1, 2, 4 and 8 warps over the measured grid (the template's rule, a warp per 256 columns, is up to 1.7 times slower). A row with a
+      Triton tree reduction keeps the template's rule, which is its numerics (note 6); the warp count of a row of ordered sums is a speed choice.
+    * **Views read where they are by the row template** (a context-free kernel): an ``[R, D]`` view at ``r * s0 + c * s1``, a ``[D]`` one at ``c * s0``,
+      an ``[R]`` or ``[R, 1]`` one at ``r * s0``, the strides scalar arguments as in note 20.
+    * **An fp8 cast of a context-free kernel** (or one with ``fp_fusion=False``) is inline PTX, ``cvt.rn.satfinite.e4m3x2.f32`` /
+      ``.e5m2x2.f32`` of ``(+0.0, x)``, its low byte: the instruction ``.to()`` compiles to (note 1), out of the reach of the folds; ``.to()``'s bits
+      on every f32 and every bf16 and f16 pattern (``tests/test_gpu_fusion_rows.py``).
+
+    * The padding of an ordered sum is written by its bits (``-0.0`` as ``tl.full(..., -2147483648, tl.int32).to(tl.float32, bitcast=True)``):
+      Triton 3.5.1 writes a literal ``-0.0`` as ``+0.0`` (note 3).
+
+    ``mean(x, -1, order=...)`` (either revision) is the ordered sum times ``f32(1 / D)``, one ``mul.rn``: ``1.0 / D`` of the constexpr ``D``, a
+    Python float that Triton rounds to f32, which is ``1 / D`` correctly rounded for every ``D`` up to ``2**20`` (the binary expansion of ``1 / D``
+    has no run of more than ``log2(D)`` equal bits, so the double is never on a midpoint of f32), as the ``reference`` mode computes it. Not
+    ``rcp.rn.f32(D)``: ptxas expands that next to the multiply into fused multiply-adds, which the contraction check refuses.
 
 **``num_warps`` and the numerics identity** (decided on measurements, ``tests/test_gpu_reduction_order.py``). What depends on ``num_warps`` is
 Triton's own reductions: ``tl.sum`` (``sum`` without ``order``, ``mean``) adds in a tree that the warp count shapes (note 6; on 1024 rows of
@@ -598,6 +641,11 @@ ARG_CHUNK_WARPS = 2
 MAX_BLOCK = 1 << 20  # Triton's limit on the number of elements of a tensor
 NUM_STAGES = 3
 NUM_WARPS = (1, 2, 4, 8, 16, 32)
+LOWERINGS = (1, 2)  # the revisions of the lowering (note 21): 1 is every kernel's, 2 the regions' of tilefish.fusion(version=2)
+SPLIT_MAX_STEPS = 1024  # revision 2: an ordered sum takes its lanes' chains by halving splits when each lane has at most this many steps (note 21)
+ORDERED_ONE_WARP = 2048  # revision 2: a row of ordered sums of BLOCK_D up to this has one warp (note 21) ...
+ORDERED_LANES_PER_WARP = 1024  # ... a longer one a warp per this many columns ...
+ORDERED_WIDE_LANES = 512  # ... or per half as many when an order has this many lanes or more
 DEFAULT_MODULE = "tilefish_generated"
 TEMPLATES = ("elementwise", "row")
 INDEX_MAX = MAX_ELEMENTS  # offsets are i32: a tensor has at most 2**31 - 1 elements
@@ -772,6 +820,16 @@ _PTX: "dict[str, tuple[str, tuple[str, ...], list[str]]]" = {
                  _asm(["cvt.rn.bf16.f32 $0, $1;"], "=h,f", "x", dtype="bfloat16")),
     "cvt.f16": ("x", ("cvt.rn.f16.f32: f32 to f16, to nearest even, every NaN the canonical 0x7FFF (note 1); inline, out of the reach of folds",),
                 _asm(["cvt.rn.f16.f32 $0, $1;"], "=h,f", "x", dtype="float16")),
+    # revision 2 (note 21): a narrowing cast to fp8 of a context-free kernel, the instruction .to() compiles to (note 1), its result in the low byte
+    **{
+        f"cvt.{dt}": (
+            "x",
+            (f"cvt.rn.satfinite.{dt}x2.f32 of (+0.0, x): x in the low byte, to nearest even, saturated at the largest finite value, NaN 0x7F (note 1); "
+             "inline, out of the reach of folds (note 21)",),
+            _asm([f"cvt.rn.satfinite.{dt}x2.f32 $0, 0f00000000, $1;"], "=h,f", "x", dtype="uint16"),
+        )
+        for dt in ("e4m3", "e5m2")
+    },
     # a negation whose NaN is the canonical one whatever ptxas folds it into (note 16): ptxas may make neg a negated operand of its consumer
     "negc.f32": ("x", ("-x: neg.f32, and the canonical NaN 0x7FFFFFFF for a NaN, explicitly (note 16; a folded neg.f32 flips a NaN's sign)",),
                  _asm(["testp.notanumber.f32 p, $1;", "neg.f32 t, $1;", "selp.f32 $0, 0f7FFFFFFF, t, p;"], "=f,f", "x", ".reg .pred p; .reg .f32 t;")),
@@ -1308,6 +1366,7 @@ class _Layout:
         """One parameter per table, after the template's own: its number of rows ``N``, which an index is checked against. A ``tl.constexpr``
         when ``N`` is static or bucketed (one binary per bucket), a runtime ``i32`` when it is dynamic."""
         self.rows_name = {}
+        self.table_bucket_dims: "list[DimExpr]" = []
         out = []
         by_plane: dict[Any, str] = {}  # the slices of one parameter share its rows parameter (note 19)
         for t in self.tables.params:
@@ -1323,6 +1382,7 @@ class _Layout:
                 out.append(_Extra(nm, True, _const_param(nm, n.value)))
             elif all(d.buckets for d in n.free_dims()):
                 out.append(_Extra(nm, True, _const_param(nm, n)))
+                self.table_bucket_dims.append(n)  # (a binary per bucket of it too: the stems of the specs name it)
             else:
                 out.append(_Extra(nm, False, Param(nm, 0, "dim", dim=n)))
         return out
@@ -1398,10 +1458,12 @@ def _chunk_phases(graph: Graph, cls: "dict[Value, str]", tables: _Tables) -> "_P
 class _RowLayout(_Layout):
     template = "row"
 
-    def __init__(self, op: KernelOp, tables: _Tables) -> None:
+    def __init__(self, op: KernelOp, tables: _Tables, lowering: int = 1) -> None:
         graph, name = op.graph, op.name
         self.tables = tables
-        if _strided_params(op):
+        self.lowering = lowering
+        names = _strided_params(op)
+        if names and lowering < 2:
             raise _fail(name, "row", "row.strided", "a fused region that reads a view where it is is lowered by the elementwise template")
         values = [v for v in _all_values(graph) if not tables.skip(v)]
         for v in values:
@@ -1528,6 +1590,25 @@ class _RowLayout(_Layout):
                     "is [R] (one row each) or [R, D]",
                 )
         self.grid = (self.R.folded(),)
+        # revision 2, context-free (a fused region, note 21): a view read where it is, row r column c at r * s0 + c * s1 ([R, D]), c * s0 ([D]),
+        # r * s0 ([R], [R, 1]); a view is read, never written, and is not a table
+        self.strided: dict[Value, list[str]] = {}
+        for v in graph.inputs:
+            if v.name not in names:
+                continue
+            if v.access != "in" or v in tables.params or tables.skip(v) or v in tables.slices or self.cls.get(v) not in (_FULL, _COL, _ROW):
+                # (a table's rows are addressed by an index, contiguously: a view gathered from is copied first)
+                raise _fail(name, "row", "row.strided", f"the view {_label(v)} is read where it is only as an [R, D], [D], [R] or [R, 1] operand, never gathered from")
+            self.strided[v] = names[v.name]
+        # revision 2 (note 21): a row whose reductions are ordered sums (and order-free ones) takes the warps of its BLOCK_D by the rule of
+        # revision 2, a speed choice; a Triton tree reduction (sum or mean without order) keeps the template's rule, which is its numerics (note 6)
+        # (a sequential order, one lane, is revision 1's helper whatever the revision: the template's rule)
+        self.ordered_rule = (
+            lowering >= 2
+            and any(n.op in ("sum", "mean") and "order" in n.attrs for n in graph.nodes)
+            and not any(n.op in ("sum", "mean") and ("order" not in n.attrs or n.attrs["order"].lanes == 1) for n in graph.nodes)
+        )
+        self.order_lanes = max((n.attrs["order"].lanes for n in graph.nodes if n.op in ("sum", "mean") and "order" in n.attrs), default=1)
         # an argmax or argmin of a long row walks it in chunks (note 8): each lane keeps its best (value, index) over the chunks, then one
         # tree reduce. Only where the order cannot matter: no sum, mean or max in the kernel, and nothing per element depends on a result
         self.chunk: "int | None" = None
@@ -1622,20 +1703,28 @@ class _RowLayout(_Layout):
             f"    {self.offs} = {self.row} * {self.D_name} + {self.cols}",
         ]
 
+    def warps_of(self, block: int) -> int:
+        """The warp count of a row of ``BLOCK_D = block``: the template's rule (note 6), or revision 2's for a row of ordered sums (note 21)."""
+        return _ordered_row_warps(block, self.order_lanes) if self.ordered_rule else _row_warps(block)
+
     def default_num_warps(self) -> int:
         if self.chunk is not None:
             return ARG_CHUNK_WARPS
-        return _row_warps(self.block_max)
+        return self.warps_of(self.block_max)
 
     def bucket_num_warps(self) -> "dict[str, int]":
         """One warp count per bucket of ``D``, from the ``BLOCK_D`` of that bucket alone (none for a static ``D``)."""
         if self.D.is_static or self.chunk is not None:  # a chunked row has the same block in every bucket
             return {}
-        free = sorted(self.D.free_dims(), key=lambda x: x.name)  # the order compile_specs walks the buckets in
+        d_dims = sorted(self.D.free_dims(), key=lambda x: x.name)
+        # the order compile_specs walks the buckets in: the constexprs' dims in order of appearance, D's first, then a bucketed table's rows
+        free = list(d_dims)
+        for n in getattr(self, "table_bucket_dims", []):
+            free += [x for x in sorted(n.free_dims(), key=lambda x: x.name) if x not in free]
         out: dict[str, int] = {}
         for combo in itertools.product(*(x.buckets for x in free)):  # type: ignore[misc]
-            value = self.D.subst(dict(zip(free, combo))).value
-            out["".join(f".{x.name}{v}" for x, v in zip(free, combo))] = _row_warps(next_pow2(value))
+            value = self.D.subst(dict(zip(free[: len(d_dims)], combo[: len(d_dims)]))).value
+            out["".join(f".{x.name}{v}" for x, v in zip(free, combo))] = self.warps_of(next_pow2(value))
         return out
 
     def header(self) -> "list[str]":
@@ -1644,16 +1733,34 @@ class _RowLayout(_Layout):
             f"'{n.inputs[0].name}[{n.attrs['index']}]' {_shape_text(v.type.shape)} is read at {n.inputs[0].name} + {self.slice_offset(v) or 0} (a static slice, note 19)"  # type: ignore[union-attr]
             for v, n in self.tables.slices.items()
         ]
+        views = [f"'{v.name}' is a view read where it is: row r, column c at {self.strided_offset(v, 'r', 'c')} (note 21)" for v in self.strided]
         if self.chunk is not None:
             return [
                 f"template: row; one program per row, grid {_grid_text(self.grid)}",
                 f"D = {d}, walked in chunks of BLOCK_D = {self.chunk} columns (argmax / argmin; note 8)",
                 *slices,
+                *views,
             ]
-        return [f"template: row; one program per row, grid {_grid_text(self.grid)}", f"D = {d}, BLOCK_D = next_pow2(D)", *slices]
+        return [f"template: row; one program per row, grid {_grid_text(self.grid)}", f"D = {d}, BLOCK_D = next_pow2(D)", *slices, *views]
+
+    def strided_offset(self, v: Value, row: str, cols: str) -> str:
+        """The element of the strided operand ``v`` (revision 2, note 21) at row ``row`` and columns ``cols``: each coordinate it has times the
+        stride the call passes (an ``[R, 1]`` view has no column coordinate)."""
+        s = self.strided[v]
+        c = self.cls[v]
+        if c == _FULL:
+            return f"{row} * {s[0]} + {cols} * {s[1]}"
+        if c == _COL:
+            return f"{cols} * {s[0]}"
+        return f"{row} * {s[0]}"
 
     def load(self, p: str, v: Value) -> str:
         c = self.cls[v]
+        if v in self.strided:
+            off = self.strided_offset(v, self.row, self.cols)
+            if c in (_FULL, _COL):
+                return f"tl.load({p} + ({off}), mask={self.mask}, other=0)"
+            return f"tl.load({p} + {off})"
         if c == _FULL:
             return f"tl.load({p} + {self.offs}, mask={self.mask}, other=0)"
         if c == _COL:
@@ -1678,6 +1785,15 @@ class _RowLayout(_Layout):
 def _row_warps(block: int) -> int:
     """The row template's warp rule: one warp per 256 lanes of ``BLOCK_D``, between 1 and 16."""
     return max(1, min(ROW_MAX_WARPS, block // ROW_LANES_PER_WARP))
+
+
+def _ordered_row_warps(block: int, lanes: int) -> int:
+    """Revision 2's warp rule of a row whose reductions are ordered (note 21; measured on sm_103), ``lanes`` the most lanes of its orders: one
+    warp up to ``BLOCK_D = 2048``, then one warp per 1024 columns (per 512 for an order of 512 lanes or more), at most 16."""
+    if block <= ORDERED_ONE_WARP:
+        return 1
+    per = ORDERED_LANES_PER_WARP // 2 if lanes >= ORDERED_WIDE_LANES else ORDERED_LANES_PER_WARP
+    return max(1, min(ROW_MAX_WARPS, block // per))
 
 
 def _max_block(kernel: str, d: DimExpr) -> int:
@@ -1747,12 +1863,12 @@ class _ElementwiseLayout(_Layout):
         names = _strided_params(op)
         for v in graph.inputs:
             if v.name in names:
-                if v.type.shape != self.shape or v.access != "in":
+                if v.type.shape != self.shape or v.access != "in" or v in tables.params:  # (a table is addressed by an index, contiguously)
                     raise _fail(
                         name,
                         "elementwise",
                         "elementwise.strided-shape",
-                        f"the view {_label(v)} is read where it is only with the kernel's shape {_shape_text(self.shape)}",
+                        f"the view {_label(v)} is read where it is only with the kernel's shape {_shape_text(self.shape)}, and never gathered from",
                     )
                 self.strided[v] = names[v.name]
         # an operand whose shape is the trailing axes of the kernel's shape (after leading 1s) broadcasts over the leading ones: lane o reads its
@@ -2045,6 +2161,12 @@ def _scalar_text(s: Scalar, rename: "dict[str, str]") -> str:
     return repr(v)
 
 
+def _is_negative_zero(s: Scalar) -> bool:
+    """Whether ``s`` is a literal ``-0.0`` of a float dtype (f32, bf16, f16)."""
+    v = s.value
+    return s.name is None and isinstance(v, float) and v == 0.0 and math.copysign(1.0, v) < 0 and s.dtype.name in ("f32", "bf16", "f16")
+
+
 def _round_float(value: float, dtype: str) -> float:
     """A python float rounded to nearest even in ``dtype`` (``f32``, ``bf16`` or ``f16``) through f32, as torch rounds one; NaN stays NaN."""
     if math.isnan(value) or math.isinf(value):
@@ -2086,9 +2208,11 @@ class _Body:
         math: str = "fast",
         context_free: bool = False,
         fp_fusion: bool = True,
+        lowering: int = 1,
     ) -> None:
         self.graph = op.graph
         self.context_free = context_free  # a fused region's kernel (note 20)
+        self.lowering = lowering  # the revision of the lowering (note 21)
         # separate roundings (note 2): every float + - * one scalar .rn instruction, every narrowing float cast inline PTX
         self.strict = context_free or not fp_fusion
         self.layout = layout
@@ -2116,7 +2240,7 @@ class _Body:
             for v, ns in users.items()
             if v in self.producer
             and self.producer[v].op == "mul"
-            and any(u.op == "sum" and "order" in u.attrs and not u.attrs.get("fma") for u in ns)
+            and any(u.op in ("sum", "mean") and "order" in u.attrs and not u.attrs.get("fma") for u in ns)
         }
         self.var: dict[Value, str] = {}
         self.lines: list[str] = []
@@ -2167,13 +2291,20 @@ class _Body:
             self.current = None
 
     def operand(self, x: "Value | Scalar") -> str:
-        return self.var[x] if isinstance(x, Value) else _scalar_text(x, self.rename)
+        if isinstance(x, Value):
+            return self.var[x]
+        if _is_negative_zero(x):  # notes 3 and 21: Triton 3.5.1 writes a literal -0.0 as +0.0; the bits of -0.0, bitcast (every revision)
+            bits, ints, name = {"f32": (-(2**31), "int32", "float32"), "bf16": (-(2**15), "int16", "bfloat16"), "f16": (-(2**15), "int16", "float16")}[x.dtype.name]
+            return f"tl.full((), {bits}, tl.{ints}).to(tl.{name}, bitcast=True)"
+        return _scalar_text(x, self.rename)
 
     def typed(self, x: "Value | Scalar") -> str:
         """An operand of a comparison or a ``where``: a scalar of a dtype that is not Triton's own literal type is a typed constant,
         so that it is rounded to its dtype (Triton would compare a bf16 tensor with an f32 literal, unrounded). A literal is written
         already rounded (through f32, as torch rounds a python float), so the constant is exact whatever Triton makes of it."""
         if not isinstance(x, Scalar) or x.dtype.name in _LITERAL_DTYPES:
+            return self.operand(x)
+        if _is_negative_zero(x):  # already of its dtype (notes 3 and 21)
             return self.operand(x)
         if x.name is None and x.dtype.is_float:
             x = Scalar(_round_float(float(x.value), x.dtype.name), x.dtype)
@@ -2497,7 +2628,146 @@ class _Body:
 
     def sum_helper(self, order: Any, fused: bool) -> str:
         """The name of the module-level helper of an ordered sum (note 17): ``order.lanes`` chains over the columns of the row, in the order the
-        order says, then its tree over the lanes; ``fused``: each step of a chain is ``fma(a, b, acc)``."""
+        order says, then its tree over the lanes; ``fused``: each step of a chain is ``fma(a, b, acc)``. Revision 2 of the lowering takes the
+        chains by halving splits where a lane has few enough steps (note 21), the same adds in the same order."""
+        if self.lowering >= 2 and order.lanes > 1:
+            return self.split_sum_helper(order, fused)
+        return self.gather_sum_helper(order, fused)
+
+    def chain_helper(self, fused: bool) -> str:
+        """Revision 2 (note 21): the helper that adds the columns of a ``[L, K]`` tensor into the ``[L]`` chains ``p`` in the order of the last axis
+        (``K`` a power of two): the low half first, then the high half, each by a halving split (``tl.split`` of a reshape and a permute: data
+        movement, exact), down to one column, each one rounding (``add.rn``, or ``fma.rn`` of the two operands of a product)."""
+        key = ("chain", fused)
+        if key in self.helpers:
+            return self.helpers[key][0]
+        name = self.names.fresh("_tf_chain_fma" if fused else "_tf_chain")
+        if fused:
+            step = self.ptx_helper("fma")
+            lines = [
+                "@triton.jit",
+                f"def {name}(p, a, b, L: tl.constexpr, K: tl.constexpr):",
+                "    # the chains p[j] = fma(a[j, k], b[j, k], p[j]) for k = 0, 1, ..., K - 1 in order (note 21 of tilefish.lower): the columns of the low",
+                "    # half, then of the high half, each half taken by a split (data movement); K is a power of two",
+                "    if K == 1:",
+                f"        p = {step}(tl.reshape(a, (L,)), tl.reshape(b, (L,)), p)",
+                "    else:",
+                "        a0, a1 = tl.split(tl.permute(tl.reshape(a, (L, 2, K // 2)), (0, 2, 1)))",
+                "        b0, b1 = tl.split(tl.permute(tl.reshape(b, (L, 2, K // 2)), (0, 2, 1)))",
+                f"        p = {name}(p, a0, b0, L, K // 2)",
+                f"        p = {name}(p, a1, b1, L, K // 2)",
+                "    return p",
+            ]
+        else:
+            add = self.ptx_helper("add.rn")
+            lines = [
+                "@triton.jit",
+                f"def {name}(p, x, L: tl.constexpr, K: tl.constexpr):",
+                "    # the chains p[j] = p[j] + x[j, k] for k = 0, 1, ..., K - 1 in order (note 21 of tilefish.lower): the columns of the low half, then of",
+                "    # the high half, each half taken by a split (data movement); K is a power of two",
+                "    if K == 1:",
+                f"        p = {add}(p, tl.reshape(x, (L,)))",
+                "    else:",
+                "        x0, x1 = tl.split(tl.permute(tl.reshape(x, (L, 2, K // 2)), (0, 2, 1)))",
+                f"        p = {name}(p, x0, L, K // 2)",
+                f"        p = {name}(p, x1, L, K // 2)",
+                "    return p",
+            ]
+        self.helpers[key] = (name, lines)
+        return name
+
+    def pad_helper(self) -> str:
+        """Revision 2 (note 21): the helper that appends columns of one value (given by its bits: Triton 3.5.1 writes a literal ``-0.0`` as
+        ``+0.0``) to a row (``tl.join``, a permute and a reshape: data movement) until it has ``W`` of them (``N`` and ``W`` powers of two)."""
+        key = ("pad",)
+        if key not in self.helpers:
+            name = self.names.fresh("_tf_pad")
+            self.helpers[key] = (name, [
+                "@triton.jit",
+                f"def {name}(x, bits: tl.constexpr, N: tl.constexpr, W: tl.constexpr):",
+                "    # x followed by W - N columns of the f32 whose bits are the i32 bits (data movement; note 21 of tilefish.lower: a literal -0.0",
+                "    # would be +0.0)",
+                "    if N < W:",
+                "        x = tl.reshape(tl.permute(tl.join(x, tl.full((N,), bits, tl.int32).to(tl.float32, bitcast=True)), (1, 0)), (2 * N,))",
+                f"        x = {name}(x, bits, 2 * N, W)",
+                "    return x",
+            ])
+        return self.helpers[key][0]
+
+    def lane0_helper(self) -> str:
+        """Revision 2 (note 21): the combine of ``(value, lane)`` pairs that keeps the lower lane: ``tl.reduce`` with it gives lane 0's value, bit
+        for bit, whatever its tree (a select, and a total order on the lanes)."""
+        key = ("lane0",)
+        if key not in self.helpers:
+            name = self.names.fresh("_tf_lane0")
+            self.helpers[key] = (name, [
+                "@triton.jit",
+                f"def {name}(v1, i1, v2, i2):",
+                "    # the pair of the lower lane, as it is (note 21 of tilefish.lower)",
+                "    w = i1 < i2",
+                "    return tl.where(w, v1, v2), tl.where(w, i1, i2)",
+            ])
+        return self.helpers[key][0]
+
+    def split_sum_helper(self, order: Any, fused: bool) -> str:
+        """Revision 2 of an ordered sum of ``lanes > 1`` (note 21): the columns past ``D`` made ``-0.0`` (``fma(-0.0, 1.0, acc)``), which leaves
+        every value a chain can hold as it is, the row padded with such columns to whole rounds of ``lanes * vector``, reshaped to ``[lanes, K]``
+        (lane ``j``'s columns in its order along the last axis), the chains taken by :meth:`chain_helper`, then the tree over the lanes, each
+        ``p[j] + p[j + o]`` with ``tl.gather`` (data movement), and lane 0's value by :meth:`lane0_helper`. A lane of more than
+        ``SPLIT_MAX_STEPS`` steps at a bucket takes the helper of revision 1 there (the same bytes)."""
+        key = ("sum2", order.lanes, order.vector, order.offsets, fused)
+        if key in self.helpers:
+            return self.helpers[key][0]
+        lanes, vector, width = order.lanes, order.vector, order.lanes * order.vector
+        add = self.ptx_helper("add.rn")
+        chain = self.chain_helper(fused)
+        pad = self.pad_helper()
+        lane0 = self.lane0_helper()
+        fallback = self.gather_sum_helper(order, fused)
+        stem = f"_tf_sum{'_fma' if fused else ''}_l{lanes}_v{vector}_o" + "_".join(map(str, order.offsets)) + "_split"
+        name = self.names.fresh(stem)
+        what = "fma(a, b, acc)" if fused else "acc + x"
+        args = "a, b" if fused else "x"
+        lines = [
+            "@triton.jit",
+            f"def {name}({args}, D: tl.constexpr, BLOCK: tl.constexpr):",
+            f"    # an ordered sum (note 17 of tilefish.lower), {order}: lane j adds the columns c * {width} + j * {vector} + v in the order (c, v), each",
+            f"    # step {what} rounded once, from +0.0; then p[j] = p[j] + p[j + o] for o = {', '.join(map(str, order.offsets))} (add.rn); the sum is lane 0's.",
+            "    # Revision 2 (note 21): a column at or past D adds " + ("fma(-0.0, 1.0, acc)" if fused else "-0.0") + ", which leaves every value a chain holds as it is; the row",
+            f"    # is padded with such columns to whole rounds and reshaped to [{lanes}, K], lane j's columns in order along the last axis; data movement",
+            f"    P: tl.constexpr = BLOCK if BLOCK >= {width} else {width}",
+            f"    if P // {lanes} <= {SPLIT_MAX_STEPS}:",
+            "        cols = tl.arange(0, BLOCK)",
+        ]
+        neg0 = "tl.full((BLOCK,), -2147483648, tl.int32).to(tl.float32, bitcast=True)"  # -0.0 (a literal -0.0 would be +0.0)
+        if fused:
+            lines += [
+                f"        a = {pad}(tl.where(cols < D, a, {neg0}), -2147483648, BLOCK, P)",
+                f"        b = {pad}(tl.where(cols < D, b, 1.0), 1065353216, BLOCK, P)",
+                f"        a = tl.reshape(tl.permute(tl.reshape(a, (P // {width}, {lanes}, {vector})), (1, 0, 2)), ({lanes}, P // {lanes}))",
+                f"        b = tl.reshape(tl.permute(tl.reshape(b, (P // {width}, {lanes}, {vector})), (1, 0, 2)), ({lanes}, P // {lanes}))",
+                f"        p = {chain}(tl.zeros(({lanes},), tl.float32), a, b, {lanes}, P // {lanes})",
+            ]
+        else:
+            lines += [
+                f"        x = {pad}(tl.where(cols < D, x, {neg0}), -2147483648, BLOCK, P)",
+                f"        x = tl.reshape(tl.permute(tl.reshape(x, (P // {width}, {lanes}, {vector})), (1, 0, 2)), ({lanes}, P // {lanes}))",
+                f"        p = {chain}(tl.zeros(({lanes},), tl.float32), x, {lanes}, P // {lanes})",
+            ]
+        lines.append(f"        lane = tl.arange(0, {lanes})")
+        for o in order.offsets:  # every lane at once; a lane whose partner is past the end is not read again (only the live lanes reach lane 0)
+            lines.append(f"        p = {add}(p, tl.gather(p, tl.minimum(lane + {o}, {lanes - 1}), 0))  # o = {o}: lanes j and j + {o}")
+        lines += [
+            f"        s, _ = tl.reduce((p, lane), 0, {lane0})",
+            "    else:",
+            f"        s = {fallback}({args}, D, BLOCK)  # a lane of more steps: revision 1's helper (the same order)",
+            "    return s",
+        ]
+        self.helpers[key] = (name, lines)
+        return name
+
+    def gather_sum_helper(self, order: Any, fused: bool) -> str:
+        """Revision 1 of an ordered sum (note 17): a loop over a lane's steps that takes each step's terms with ``tl.gather``, then the tree."""
         key = ("sum", order.lanes, order.vector, order.offsets, fused)
         if key in self.helpers:
             return self.helpers[key][0]
@@ -2624,6 +2894,10 @@ class _Body:
             return self.arg_reduce(n, v)
         if op == "sum" and "order" in n.attrs:  # note 17 (an fma sum reads its product's operands, not the product)
             return self.ordered_sum(n)
+        if op == "mean" and "order" in n.attrs:  # note 21: the ordered sum times f32(1 / D), one mul.rn
+            layout = self.layout
+            assert isinstance(layout, _RowLayout)
+            return f"{self.ptx_helper('mul.rn.f32')}({self.ordered_sum(n)}, 1.0 / {layout.D_name})"
         if op == "gather_rows":
             return self.gather(n, v)
         if op == "load":  # one element from device memory, broadcast: no mask, no offsets
@@ -2699,6 +2973,12 @@ class _Body:
                     x = self.names.fresh(f"{v}_x")
                     self.emit(f"{x} = {a[0]}.to(tl.float32)", "exact")
                 return f"{self.ptx_helper('cvt.' + dst)}({x})"
+            if self.lowering >= 2 and self.strict and dst in ("e4m3", "e5m2") and src in ("f32", "bf16", "f16"):  # note 21: an inline fp8 cvt
+                x = a[0]
+                if src != "f32":
+                    x = self.names.fresh(f"{v}_x")
+                    self.emit(f"{x} = {a[0]}.to(tl.float32)", "exact")
+                return f"{self.ptx_helper('cvt.' + dst)}({x}).to(tl.uint8).to(tl.{_TL[dst]}, bitcast=True)"  # the low byte, as it is
             return f"{a[0]}.to(tl.{_TL[dst]})"
         if op in _REDUCTIONS:
             return self.layout.reduce(op, a[0])
@@ -2743,6 +3023,7 @@ def lower(
     fp_fusion: "bool | None" = None,
     math: "str | None" = None,
     context_free: "bool | None" = None,
+    lowering: "int | None" = None,
 ) -> LoweredKernel:
     """Lower a ``@tilefish.kernel`` to Triton source.
 
@@ -2754,8 +3035,10 @@ def lower(
     each bucket of a bucketed ``D`` gets the warps of its own size. ``fp_fusion`` overrides the kernel's
     own ``fp_fusion=`` (``False``: no FMA contraction), and ``math`` its ``math=`` (``"ieee"``: note 13; an op
     that says its own keeps it). ``context_free`` overrides the kernel's own (``True``: the code of ``fp_fusion=False``, every
-    float ``+ - *`` and narrowing cast inline PTX, and views read where they are, note 20; what a graph's fused regions are lowered with). Raises
-    :class:`~tilefish.errors.TilefishLoweringError` when the body fits no template.
+    float ``+ - *`` and narrowing cast inline PTX, and views read where they are, note 20; what a graph's fused regions are lowered with).
+    ``lowering`` overrides the kernel's own revision of the lowering (``1``, every kernel's; ``2``, what the regions of ``tilefish.fusion(version=2)``
+    are lowered with: ordered sums by halving splits, the warp rule of note 21 and, context-free, views read where they are by the row template;
+    the bytes of revision 1, other code). Raises :class:`~tilefish.errors.TilefishLoweringError` when the body fits no template.
     """
     module, fn_name = _check_names(op, module)
     if template is not None and template not in TEMPLATES:
@@ -2772,6 +3055,10 @@ def lower(
         context_free = bool(getattr(op, "context_free", False))
     if not isinstance(context_free, bool):
         raise TilefishLoweringError(f"lower: context_free must be True or False, got {context_free!r}", rule="context-free")
+    if lowering is None:
+        lowering = getattr(op, "lowering", 1)
+    if isinstance(lowering, bool) or lowering not in LOWERINGS:
+        raise TilefishLoweringError(f"lower: lowering must be one of {list(LOWERINGS)}, got {lowering!r}", rule="lowering")
     if num_warps is None:
         num_warps = op.num_warps
     if num_warps is not None and (isinstance(num_warps, bool) or not isinstance(num_warps, int) or num_warps not in NUM_WARPS):
@@ -2788,12 +3075,12 @@ def lower(
     failed: list[tuple[str, TilefishLoweringError]] = []
     for t, bcast in attempts:
         try:
-            layout = _ElementwiseLayout(op, tables, broadcast=bcast) if t == "elementwise" else _RowLayout(op, tables)
+            layout = _ElementwiseLayout(op, tables, broadcast=bcast) if t == "elementwise" else _RowLayout(op, tables, lowering)
         except TilefishLoweringError as e:
             if not (t == "elementwise" and not bcast):  # the broadcasting attempt says more
                 failed.append((t, e))
             continue
-        return _assemble(op, layout, module, fn_name, num_warps, fp_fusion, math, context_free)
+        return _assemble(op, layout, module, fn_name, num_warps, fp_fusion, math, context_free, lowering)
     errors = [e for _, e in sorted(failed, key=lambda f: TEMPLATES.index(f[0]))]
     if len(errors) == 1:
         raise errors[0]
@@ -2812,6 +3099,7 @@ def _assemble(
     fp_fusion: bool,
     math: str = "fast",
     context_free: bool = False,
+    lowering: int = 1,
 ) -> LoweredKernel:
     graph = op.graph
     user = list(op.signature.params)
@@ -2873,7 +3161,7 @@ def _assemble(
         )
         element_counts.update({k: rename.get(v, v) for k, v in layout.counts.items()})  # a broadcast operand's own count
 
-    body_emitter = _Body(op, layout, names, out_names, rename, math, context_free, fp_fusion)
+    body_emitter = _Body(op, layout, names, out_names, rename, math, context_free, fp_fusion, lowering)
     body = body_emitter.run()
     header = [
         f"Generated by tilefish.lower from the kernel '{op.base.name if op.base is not None else op.name}'. Do not edit.",  # (a specialisation has its kernel's source)
@@ -2886,6 +3174,11 @@ def _assemble(
         ),
         *([_IEEE_HEADER] if math == "ieee" else []),
         *(["context-free: every narrowing float cast is inline PTX, a negation's NaN canonical (note 20: a fused region of a graph)"] if context_free else []),
+        *(
+            ["lowering: revision 2 (note 21: ordered sums by halving splits, the warp rule of rows with ordered sums, views read where they are by the row template)"]
+            if lowering >= 2
+            else []
+        ),
         *[f"parameter '{old}' of the kernel is '{new}' here (the name is used by this module)" for old, new in rename.items()],
         *(
             [f"probes: {', '.join(dict.fromkeys(name for name, _, _ in probes))} (tilefish.probe: nothing in a production build, docs/instrument.md)"]

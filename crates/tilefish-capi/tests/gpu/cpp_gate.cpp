@@ -527,7 +527,7 @@ std::vector<Ext> upload(const json::Value& c) {
         e.shape = dims_of(t["shape"]);
         uint64_t elements = 1;
         for (size_t i = 0; i < e.shape.size(); ++i) elements *= e.shape[i];
-        static const std::map<std::string, uint64_t> sizes = {{"bf16", 2}, {"f16", 2}, {"f32", 4}, {"i32", 4}, {"i64", 8}, {"u8", 1}};
+        static const std::map<std::string, uint64_t> sizes = {{"bf16", 2}, {"f16", 2}, {"f32", 4}, {"i32", 4}, {"i64", 8}, {"u8", 1}, {"e4m3", 1}, {"e5m2", 1}};
         uint64_t bytes = elements * sizes.at(e.dtype);
         if (t.has("input")) e.input = read_bytes(gate / t["input"].str());
         if (t.has("expect")) e.expect = read_bytes(gate / t["expect"].str());

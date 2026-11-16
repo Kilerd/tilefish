@@ -924,23 +924,41 @@ does not depend on its neighbours (note 20 of `tilefish.lower`; the code of ever
 instruction of inline PTX, because LLVM packs two lanes' f32 ops into `mul.rn.f32x2` / `add.rn.f32x2` and ptxas 12.9 contracts that pair (into `FFMA2` on sm_100 and
 sm_103, `FFMA` on sm_120) even with `--fmad=false`; every narrowing float cast is inline PTX, because the folds of MLIR and LLVM keep an input NaN's payload through
 `x.to(f32).to(bf16)` in one kernel; and a negation gives the canonical NaN explicitly, as in every kernel, because ptxas folds `neg.f32` into a select as a sign flip.
-A reduction is a kernel of its own (a Triton tree reduction adds in another tree when other loads share its kernel:
-357 to 399 of 1024 rows differed, measured); an op whose value nothing reads is not computed. One rounding of `a * b + c` is asked for with `tilefish.fma`.
+A reduction joins a region when its bytes cannot depend on the region: an ordered `sum` or `mean` (`order=`), the order-free `max`, `argmax`
+and `argmin` (and `gather_rows`) are fused with the ops around them into **row regions**; a `sum` or `mean` without `order=` is a kernel of its own, its operand
+stored (a Triton tree reduction adds in another tree when other loads share its kernel: 357 to 399 of 1024 rows differed, measured). An op whose value nothing reads
+is not computed. One rounding of `a * b + c` is asked for with `tilefish.fma`.
+
+```python
+@tilefish.graph
+def add_rmsnorm(x: Tensor[R, D, bf16], res: Tensor[R, D, bf16], w: Tensor[D, bf16]):
+    h = x + res                                                           # the residual stream, returned too
+    h32 = h.to(f32)
+    ms = tilefish.mean(h32 * h32, -1, keepdims=True, order=tilefish.tree(128, offsets=(16, 8, 4, 2, 1, 64, 32), vector=8))
+    return (h32 * tilefish.rsqrt(ms + 1e-6) * w.to(f32)).to(bf16), h      # one kernel, two outputs: the unfused composition is ten
+```
+
+A layer norm (two ordered means and an affine tail), softmax (a scale, a mask from a device scalar, `max`, `exp`, an ordered sum, a divide), a row-wise fp8
+quantisation (an absolute maximum, a scale per row returned too, a saturating cast) and a norm over two column blocks of a GEMM's output (read where they are) are
+each one kernel too. Row regions are lowered by revision 2 of the lowering (note 21 of `tilefish.lower`): an ordered sum takes its lanes' chains by halving
+splits instead of a gather per step (the same adds in the same order, checked against CUDA kernels of each order at every length), a row of ordered sums has the
+warps that suit it, and an fp8 cast is inline PTX. On a B300 slice the fused add + rmsnorm of 4096 rows of 1024 columns takes 16 us, its three kernels with a Triton
+tree sum 65 us and its ten unfused kernels 103 us (the speed table is in `docs/rfcs/0001-plan-fusion.md`, phase 2).
 
 **Checked at every export.** `export` runs every region of more than one op against its ops one by one, `jit` on the device, at every bucket, on seeded inputs that
 reach every corner (NaNs with payloads, infinities, subnormals, signed zeros), and refuses the export at a difference (`verify=False` opts out; on a device of
 another architecture the check is skipped with a `TilefishFusionWarning`). It writes `<graph>.fusion.json` next to the plan, the **fusion report**: for every
 region the ops of the body it took, what it reads (where it is, or a copy), what it writes, every rounding it
 keeps and the rewrites of the mode; `tilefish.fusion_report(graph)` and `tilefish.verify_fusion(graph)` give the same on demand. A view that is not
-dense (the halves above, a head, a transpose) is read where it is, a stride per axis, by a region of the elementwise template, and copied by
-`tilefish.contiguous` first for a region of the row template. The tests hold fused to unfused
-on every bf16 and f16 bit pattern, on grids of 2**22 bit patterns, on 120 random graphs of up to 24 ops, and the inline casts to `.to()` on every f32.
+dense (the halves above, a head, a transpose) is read where it is, a stride per axis (by a row region of version 1, copied by `tilefish.contiguous`
+first). The tests hold fused to unfused on every bf16 and f16 bit pattern, on grids of 2**22 bit patterns, on 120 random graphs of up to 24 ops and 80 of row ops,
+on the row patterns above at every bucket (every bf16 pattern, rows of special values), and the inline casts to `.to()` on every f32.
 
 **The mode** is declared, `@tilefish.graph(fusion=tilefish.fusion(...))`, and every choice is exact (the region's source carries it, so the pin does):
 
 | parameter | values (default first) | what it says |
 |---|---|---|
-| `version` | `1` | the grouping rules, limits and rewrites, frozen |
+| `version` | `2`, `1` | the grouping rules, limits and rewrites, frozen: `2` fuses ordered reductions into row regions; `1` runs every reduction alone (the plans of tilefish 0.0.9 and 0.0.10, unchanged). A plan made with another version is refused, naming it |
 | `grouping` | `"auto"`, `"none"` | regions as large as the rules allow (a region never spans a call, at most 64 ops), or one kernel per op |
 | `math` | `"fast"`, `"ieee"` | the default math of the body's f32 ops; an op's own `math=` wins |
 | `intermediates` | `"declared"`, `"opmath"` | every op rounds to its IR dtype; or torch's eager rule for a bf16 or f16 `+ - *` with a python scalar (computed in f32 with the scalar in f32, rounded once): with `math="ieee"` the bits are torch's eager composition (every non-NaN value, checked on every bit pattern) |
@@ -948,9 +966,9 @@ on every bf16 and f16 bit pattern, on grids of 2**22 bit patterns, on 120 random
 | `verify` | `True`, `False` | whether `export` checks the regions |
 
 Each rewrite is made on the IR before the regions are formed, so its rounding points never depend on where the regions fall. `tilefish.barrier(x)` makes `x` a
-boundary of the regions (it gets a buffer of the plan, which `taps=` reads); it never changes a byte. Not yet planned: a scatter in a graph body, a reduction joined to
-a region (it runs alone), a view read where it is by a row region (it is copied first), modes that are not exact (`docs/rfcs/0001-plan-fusion.md`,
-section 11).
+boundary of the regions (it gets a buffer of the plan, which `taps=` reads); it never changes a byte. Not yet planned: a scatter in a graph body, a reduction without
+`order=` joined to a region, a store into an `InOut` or carried tensor made by a region (it is a copy step), a dense reshape inside a region, a strided store,
+`tilefish.fused(name=...)` scopes, `intermediates="f32"`, and modes that are not exact (`docs/rfcs/0001-plan-fusion.md`, section 11).
 
 ## SASS: explained and asserted
 

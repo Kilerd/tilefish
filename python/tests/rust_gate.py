@@ -149,7 +149,7 @@ MASKED_N = (0, 1, 5, 17, 63, 64, 40)
 SCALES = (0.5, -3.25, 1e-3)
 GEMM_M = (32, 64, 320)
 
-DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32", torch.int32: "i32", torch.uint8: "u8"}
+DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32", torch.int32: "i32", torch.uint8: "u8", torch.float8_e4m3fn: "e4m3", torch.float8_e5m2: "e5m2"}
 TORCH_OF = {v: k for k, v in DTYPES.items()}
 
 
@@ -1406,6 +1406,9 @@ def plan_graphs():
                         if name == "u8":
                             gen = torch.Generator(device="cuda").manual_seed(s)
                             args[p.name] = torch.randint(0, 256, shape, generator=gen, device="cuda", dtype=torch.int32).to(torch.uint8)
+                        elif name == "i32":  # row indices (a gather's): most in range, some out of it on both sides
+                            gen = torch.Generator(device="cuda").manual_seed(s)
+                            args[p.name] = torch.randint(-3, 56, shape, generator=gen, device="cuda", dtype=torch.int32)
                         else:
                             args[p.name] = randn(shape, dtypes[name], seed=s, scale=4.0)
                     out.append(("-".join(f"{n}{v}" for n, v in combo.items()) + f"-seed{seed}", args))
