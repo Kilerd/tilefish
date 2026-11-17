@@ -302,12 +302,14 @@ def test_a_cublaslt_epilogue_and_a_hooked_extern_on_its_accumulator_in_one_graph
     assert kinds == [("gmix_up__bias", "library"), (externs[0].name, "kernel")]
     assert [h.contract for h in _fusion.fused(fused).hooked] == ["accumulator"]
 
+    types = {p.name: p.type for p in fused.signature.tensor_inputs}
+
     def args_at(t, seed):
         gen = torch.Generator(device="cpu").manual_seed(seed)
         x = torch.randn(t, eg.H.value, generator=gen).to(torch.bfloat16).to(CUDA)
         w1 = (torch.randn(eg.F.value, eg.H.value, generator=gen) / 16).to(torch.bfloat16).to(CUDA)
         w2 = (torch.randn(eg.F.value, eg.F.value, generator=gen) / 16).to(torch.bfloat16).to(CUDA)
-        b1, b2 = (_fusion._sample(torch, bf16, (eg.F.value,), seed * 10 + k, CUDA) for k in (1, 2))
+        b1, b2 = (_fusion._sample(torch, types[name], (eg.F.value,), seed * 10 + k, CUDA) for k, name in ((1, "b1"), (2, "b2")))
         return [x, w1, b1, w2, b2]
 
     for t in eg.T.buckets:
