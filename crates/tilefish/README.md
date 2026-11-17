@@ -7,7 +7,11 @@ and no Triton, making every check Python's `replay` makes. The machine code is
 the exact bytes Python's `replay` runs, and `tilefish.hosts.rust.emit`
 generates typed launchers for a manifest.
 
-**Status: early preview.** The API will change.
+**Status: early preview.** The API will change. The guide to this host is
+[`docs/guide/rust.md`](https://github.com/Kilerd/tilefish/blob/main/docs/guide/rust.md), the manifest and the plan it reads are
+specified in [`docs/manifest-schema-3.md`](https://github.com/Kilerd/tilefish/blob/main/docs/manifest-schema-3.md) and
+[`docs/plan-schema-1.md`](https://github.com/Kilerd/tilefish/blob/main/docs/plan-schema-1.md), and every document is listed in
+[`docs/README.md`](https://github.com/Kilerd/tilefish/blob/main/docs/README.md).
 
 ```rust
 use tilefish::cudarc::driver::CudaContext;
@@ -132,7 +136,7 @@ refused by the version check.
 A whole forward pass runs from a **launch plan** (`plan.json`, which
 `tilefish.runtime.export` writes next to the manifest for a `@tilefish.graph`):
 `LaunchPlan::load` verifies it (a pin, the digests, every rule of
-`docs/plan-schema-1.md`, the manifest it was built against, every step against
+[`docs/plan-schema-1.md`](https://github.com/Kilerd/tilefish/blob/main/docs/plan-schema-1.md), the manifest it was built against, every step against
 its entry), `instantiate` loads its binaries and allocates its one arena (the
 intermediates, the device scalars, the cuBLASLt workspace), and
 `PlanRun::launch` binds the caller's tensors by name, checks every step before
@@ -169,7 +173,7 @@ taps: each `Tap` copies a buffer of the plan into a `TensorMut` right after a st
 captures them as memcpy nodes, copied again at every replay). `PlanRun::launch_step` launches one step of a bucket on the caller's tensors, with the
 binary and the binding of the pinned plan (not on a capturing stream).
 
-An **instrumented export** (`tilefish.runtime.export(..., instrument=True)`, `docs/instrument.md`) is a diagnostic variant whose binaries record the
+An **instrumented export** (`tilefish.runtime.export(..., instrument=True)`, [`docs/instrument.md`](https://github.com/Kilerd/tilefish/blob/main/docs/instrument.md)) is a diagnostic variant whose binaries record the
 `tilefish.probe("name")` phase boundaries of their kernels into a probe buffer given in their profile scratch parameter; it has a digest of its own,
 and `Manifest::load`, `Manifest::from_embedded`, `LaunchPlan::load` and `PlanSet::load` refuse it. `Manifest::load_instrumented` (and
 `LaunchPlan::load_instrumented`, `PlanSet::load_instrumented`) read it; `Kernel::launch_probed` records one launch into a `ProbeBuffer`

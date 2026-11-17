@@ -33,4 +33,27 @@ can share one arena. The `tilefish` crate on crates.io runs the
 same manifest and plan from Rust, and `tilefish.hosts.rust.emit` generates
 typed Rust launchers for it. The API will change.
 
-The design and the roadmap are at https://github.com/Kilerd/tilefish.
+What tilefish is and is not, and how features are added from 0.0.13 on, is in
+[`docs/scope.md`](https://github.com/Kilerd/tilefish/blob/main/docs/scope.md).
+
+## Install
+
+```sh
+pip install tilefish                  # types, tracing, lowering, compile specs: pure Python, no dependencies
+pip install "tilefish[gpu]"           # torch, Triton and cuda-python: build, jit, replay, plans
+pip install "tilefish[sass]"          # CUDA 13's nvdisasm, for tilefish-explain and SASS assertions on sm_103
+```
+
+## Documentation
+
+- [The README](https://github.com/Kilerd/tilefish#readme): an example, how it works, a quick start for each host
+  and the features at a glance.
+- [The documents' index](https://github.com/Kilerd/tilefish/blob/main/docs/README.md), with the guide: [the build](https://github.com/Kilerd/tilefish/blob/main/docs/guide/build.md),
+  [operators](https://github.com/Kilerd/tilefish/blob/main/docs/guide/operators.md), [lowered kernels](https://github.com/Kilerd/tilefish/blob/main/docs/guide/lowering.md),
+  [launch plans](https://github.com/Kilerd/tilefish/blob/main/docs/guide/plans.md), [fusion](https://github.com/Kilerd/tilefish/blob/main/docs/guide/fusion.md),
+  [rewrites](https://github.com/Kilerd/tilefish/blob/main/docs/guide/rewrites.md), [SASS](https://github.com/Kilerd/tilefish/blob/main/docs/guide/sass.md), [the Rust host](https://github.com/Kilerd/tilefish/blob/main/docs/guide/rust.md)
+  and [the C++ host](https://github.com/Kilerd/tilefish/blob/main/docs/guide/cpp.md).
+- [The changelog](https://github.com/Kilerd/tilefish/blob/main/CHANGELOG.md): what each release changed.
+
+Licensed under either of Apache License, Version 2.0 or MIT license at your
+option.
