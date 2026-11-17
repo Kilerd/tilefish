@@ -1401,24 +1401,8 @@ measurements live in the repository next to the rules.
 
 ## Roadmap
 
-- **V0: one real model, end to end.** The whole GPU forward of a production
-  model of about 0.6B parameters (a convolutional front end, a bidirectional
-  encoder and a causal GQA decoder) is written in tilefish. The generated Rust
-  host replaces the hand-written launch code of an existing engine and
-  reproduces its output byte for byte on every architecture it ships for.
-  Starting from a naive version of the model, the rewrite rules rediscover the
-  fusions that were made by hand. V0 needs typed signatures and manifests,
-  `extern` for Triton functions and prebuilt PTX or cubins, strided views,
-  device-side scalars, gather / scatter / im2col style index kernels, a static
-  launch and memory plan per shape bucket, pinned GEMMs, and a numerics
-  contract on every operator.
-- **V1: quantization as types.** MXFP8, MXFP4 and NVFP4, with generated
-  quantize and dequantize references and per-architecture scale layouts.
-- **V2: more of the forward generated.** Row reductions and elementwise
-  families lowered natively, and GEMM epilogue fusion through CUTLASS or
-  CuTe DSL.
-- **V3: C++ and Rust as first-class deploy targets**, with the Python
-  frontend used only at build time.
+There is no list of features to come. A feature is added when a real model migration needs it (`docs/scope.md`); the open items are tracked in
+issues [#4](https://github.com/Kilerd/tilefish/issues/4) and [#5](https://github.com/Kilerd/tilefish/issues/5).
 
 ## License
 
