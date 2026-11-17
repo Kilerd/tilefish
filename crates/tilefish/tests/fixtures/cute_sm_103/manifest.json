@@ -1,0 +1,419 @@
+{
+  "schema": 3,
+  "tilefish": "0.0.11",
+  "kernels": [
+    {
+      "stem": "gemm.M128",
+      "op": "gemm",
+      "kind": "binary",
+      "arch": "sm_103",
+      "ptx_target": "sm_103a",
+      "symbol": "kernel_cutlass_gemm_0",
+      "cubin": "gemm.M128.sm_103.cubin",
+      "abi": {
+        "params": [
+          {
+            "slot": 0,
+            "index": 0,
+            "name": "a",
+            "kind": "tensormap",
+            "type": "tensormap",
+            "ptx_type": "b8[128]",
+            "size": 128,
+            "dtype": "f16",
+            "access": "in",
+            "shape": [
+              "M",
+              64
+            ],
+            "template": "000000000000000008090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "slot": 1,
+            "index": 1,
+            "name": "b",
+            "kind": "tensormap",
+            "type": "tensormap",
+            "ptx_type": "b8[128]",
+            "size": 128,
+            "dtype": "f16",
+            "access": "in",
+            "shape": [
+              64,
+              64
+            ],
+            "template": "000000000000000008090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "slot": 2,
+            "index": 2,
+            "name": "param_2",
+            "kind": "bytes",
+            "type": "bytes",
+            "ptx_type": "b8[4]",
+            "size": 4,
+            "value": "00040000"
+          },
+          {
+            "slot": 3,
+            "index": 2,
+            "name": "c",
+            "kind": "pointer",
+            "type": "*fp16",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f16",
+            "access": "out",
+            "shape": [
+              "M",
+              64
+            ]
+          }
+        ],
+        "scratch": [],
+        "scratch_slots": 0
+      },
+      "grid": "(1, 2, 1)",
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "shared": 213248,
+      "launch": {
+        "global_scratch_size": 0,
+        "profile_scratch_size": 0,
+        "launch_pdl": false,
+        "cluster_dims": [
+          2,
+          1,
+          1
+        ],
+        "num_ctas": 2,
+        "cooperative": false
+      },
+      "constexprs": [],
+      "buckets": {
+        "M": 128
+      },
+      "dims": {
+        "M": {
+          "buckets": [
+            128,
+            256
+          ],
+          "bucket": 128
+        }
+      },
+      "preconditions": [
+        {
+          "kind": "pointer_alignment",
+          "arg": "a",
+          "index": 0,
+          "bytes": 16
+        },
+        {
+          "kind": "static_size",
+          "arg": "a",
+          "index": 0,
+          "axis": 1,
+          "value": 64
+        },
+        {
+          "kind": "max_elements",
+          "arg": "a",
+          "index": 0,
+          "value": 2147483647,
+          "shape": [
+            "128",
+            "64"
+          ]
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "b",
+          "index": 1,
+          "bytes": 16
+        },
+        {
+          "kind": "static_size",
+          "arg": "b",
+          "index": 1,
+          "axis": 0,
+          "value": 64
+        },
+        {
+          "kind": "static_size",
+          "arg": "b",
+          "index": 1,
+          "axis": 1,
+          "value": 64
+        },
+        {
+          "kind": "max_elements",
+          "arg": "b",
+          "index": 1,
+          "value": 2147483647,
+          "shape": [
+            "64",
+            "64"
+          ]
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "c",
+          "index": 2,
+          "bytes": 16
+        },
+        {
+          "kind": "static_size",
+          "arg": "c",
+          "index": 2,
+          "axis": 1,
+          "value": 64
+        },
+        {
+          "kind": "max_elements",
+          "arg": "c",
+          "index": 2,
+          "value": 2147483647,
+          "shape": [
+            "128",
+            "64"
+          ]
+        },
+        {
+          "kind": "bucket",
+          "value": 128,
+          "dim": "M",
+          "buckets": [
+            128,
+            256
+          ]
+        }
+      ],
+      "declaration_digest": "572827857ba003b59ce82adca0a04949ad3009fa56cca5be02684a4c73df3c4d",
+      "sha256": "d508998e1e3057997f0270f8a7e8c0b7e22283bd86cbefa6418d61207f643a07",
+      "sha256_code": "9c08c2f0c37c735f6573d16a387e5d123d554c08eecd2858b7674d2073939950",
+      "toolchain": {
+        "cutlass_dsl": "4.8.1",
+        "nvvm": "Cuda compilation tools, release 13.4, V13.4.59",
+        "ptxas": "Cuda compilation tools, release 12.9, V12.9.83"
+      },
+      "binary": {
+        "source": "cute",
+        "cutlass_dsl": "4.8.1",
+        "options": ""
+      },
+      "source_digest": "b885016867aee2df26e90e3cba8f578f87bc19b13cc73274e2cb45883279afca",
+      "source_digest_kind": "tilefish.cute.v1"
+    },
+    {
+      "stem": "gemm.M256",
+      "op": "gemm",
+      "kind": "binary",
+      "arch": "sm_103",
+      "ptx_target": "sm_103a",
+      "symbol": "kernel_cutlass_gemm_0",
+      "cubin": "gemm.M256.sm_103.cubin",
+      "abi": {
+        "params": [
+          {
+            "slot": 0,
+            "index": 0,
+            "name": "a",
+            "kind": "tensormap",
+            "type": "tensormap",
+            "ptx_type": "b8[128]",
+            "size": 128,
+            "dtype": "f16",
+            "access": "in",
+            "shape": [
+              "M",
+              64
+            ],
+            "template": "000000000000000008090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "slot": 1,
+            "index": 1,
+            "name": "b",
+            "kind": "tensormap",
+            "type": "tensormap",
+            "ptx_type": "b8[128]",
+            "size": 128,
+            "dtype": "f16",
+            "access": "in",
+            "shape": [
+              64,
+              64
+            ],
+            "template": "000000000000000008090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+          },
+          {
+            "slot": 2,
+            "index": 2,
+            "name": "param_2",
+            "kind": "bytes",
+            "type": "bytes",
+            "ptx_type": "b8[4]",
+            "size": 4,
+            "value": "00040000"
+          },
+          {
+            "slot": 3,
+            "index": 2,
+            "name": "c",
+            "kind": "pointer",
+            "type": "*fp16",
+            "ptx_type": "u64",
+            "size": 8,
+            "dtype": "f16",
+            "access": "out",
+            "shape": [
+              "M",
+              64
+            ]
+          }
+        ],
+        "scratch": [],
+        "scratch_slots": 0
+      },
+      "grid": "(1, 2, 1)",
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "shared": 213248,
+      "launch": {
+        "global_scratch_size": 0,
+        "profile_scratch_size": 0,
+        "launch_pdl": false,
+        "cluster_dims": [
+          2,
+          1,
+          1
+        ],
+        "num_ctas": 2,
+        "cooperative": false
+      },
+      "constexprs": [],
+      "buckets": {
+        "M": 256
+      },
+      "dims": {
+        "M": {
+          "buckets": [
+            128,
+            256
+          ],
+          "bucket": 256
+        }
+      },
+      "preconditions": [
+        {
+          "kind": "pointer_alignment",
+          "arg": "a",
+          "index": 0,
+          "bytes": 16
+        },
+        {
+          "kind": "static_size",
+          "arg": "a",
+          "index": 0,
+          "axis": 1,
+          "value": 64
+        },
+        {
+          "kind": "max_elements",
+          "arg": "a",
+          "index": 0,
+          "value": 2147483647,
+          "shape": [
+            "256",
+            "64"
+          ]
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "b",
+          "index": 1,
+          "bytes": 16
+        },
+        {
+          "kind": "static_size",
+          "arg": "b",
+          "index": 1,
+          "axis": 0,
+          "value": 64
+        },
+        {
+          "kind": "static_size",
+          "arg": "b",
+          "index": 1,
+          "axis": 1,
+          "value": 64
+        },
+        {
+          "kind": "max_elements",
+          "arg": "b",
+          "index": 1,
+          "value": 2147483647,
+          "shape": [
+            "64",
+            "64"
+          ]
+        },
+        {
+          "kind": "pointer_alignment",
+          "arg": "c",
+          "index": 2,
+          "bytes": 16
+        },
+        {
+          "kind": "static_size",
+          "arg": "c",
+          "index": 2,
+          "axis": 1,
+          "value": 64
+        },
+        {
+          "kind": "max_elements",
+          "arg": "c",
+          "index": 2,
+          "value": 2147483647,
+          "shape": [
+            "256",
+            "64"
+          ]
+        },
+        {
+          "kind": "bucket",
+          "value": 256,
+          "dim": "M",
+          "buckets": [
+            128,
+            256
+          ]
+        }
+      ],
+      "declaration_digest": "572827857ba003b59ce82adca0a04949ad3009fa56cca5be02684a4c73df3c4d",
+      "sha256": "d508998e1e3057997f0270f8a7e8c0b7e22283bd86cbefa6418d61207f643a07",
+      "sha256_code": "9c08c2f0c37c735f6573d16a387e5d123d554c08eecd2858b7674d2073939950",
+      "toolchain": {
+        "cutlass_dsl": "4.8.1",
+        "nvvm": "Cuda compilation tools, release 13.4, V13.4.59",
+        "ptxas": "Cuda compilation tools, release 12.9, V12.9.83"
+      },
+      "binary": {
+        "source": "cute",
+        "cutlass_dsl": "4.8.1",
+        "options": ""
+      },
+      "source_digest": "b885016867aee2df26e90e3cba8f578f87bc19b13cc73274e2cb45883279afca",
+      "source_digest_kind": "tilefish.cute.v1"
+    }
+  ],
+  "library": []
+}

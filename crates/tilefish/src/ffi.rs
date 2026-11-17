@@ -289,8 +289,9 @@ fn cluster_attributes(cluster: [u32; 3]) -> [sys::CUlaunchAttribute; 2] {
 }
 
 /// Launch `function` on the raw `stream` with the `kernelParams` of `prepared` (each slot pointing at its value, the slot of a TMA descriptor at
-/// the 128 bytes of its encoded map): `cuLaunchKernel` (cudarc's `result::launch_kernel`), or for a kernel of clusters `cuLaunchKernelEx` with the
-/// cluster attribute (cudarc has no wrapper of it); the grid is `prepared.grid`, the blocks of the launch.
+/// the 128 bytes of its encoded map, the slot of a CuTe DSL kernel's descriptor or constant bytes at its bytes): `cuLaunchKernel` (cudarc's
+/// `result::launch_kernel`), or for a kernel of clusters `cuLaunchKernelEx` with the cluster attribute (cudarc has no wrapper of it); the grid is
+/// `prepared.grid`, the blocks of the launch.
 ///
 /// # Safety
 ///
@@ -320,10 +321,16 @@ pub(crate) unsafe fn launch_prepared(
     for (map, bytes) in prepared.maps.iter().zip(maps.iter_mut()) {
         params[map.slot] = std::ptr::from_mut(bytes).cast::<c_void>(); // the slot of a TMA descriptor: its 128 bytes, by value
     }
+    for p in &prepared.passed {
+        // a CuTe DSL kernel's descriptor (its template with the address, 64-byte aligned) or constant bytes, by value: the driver only reads
+        // them (as many bytes as the parameter has, which the loaded function was checked to report)
+        params[p.slot] = p.bytes.as_slice().as_ptr().cast_mut().cast::<c_void>();
+    }
     let grid = prepared.grid;
     match prepared.cluster {
-        // SAFETY: `params[..count]` point at the live slots copied from `prepared` (and the maps' bytes), which the driver reads before it
-        // returns, in the order of the manifest's ABI; the rest is the contract of this function.
+        // SAFETY: `params[..count]` point at the live slots copied from `prepared` (and the maps' bytes, and the bytes `prepared` passes by value,
+        // borrowed for the call), which the driver reads before it returns, in the order of the manifest's ABI; the rest is the contract of
+        // this function.
         None => unsafe {
             result::launch_kernel(
                 function,
@@ -361,7 +368,9 @@ pub(crate) unsafe fn launch_prepared(
 
 /// Enqueue `function` on `stream` with the arguments of `prepared` in the order of the ABI of the manifest: a tensor's pointer, a scalar or
 /// a fixed argument in its slot, then the scratch pointers a Triton kernel has (null, but the global scratch of a kernel that has one). A kernel of
-/// clusters is launched with `cuLaunchKernelEx` ([`launch_prepared`]), its tensors ordered through cudarc's guards as a GEMM's are.
+/// clusters is launched with `cuLaunchKernelEx` ([`launch_prepared`]), its tensors ordered through cudarc's guards as a GEMM's are; so is a kernel
+/// with parameters passed by value from bytes of their own (a CuTe DSL kernel's descriptors and constant bytes, which cudarc's builder has no
+/// argument type for), with `cuLaunchKernel`.
 ///
 /// This is cudarc's launch builder (`CudaStream::launch_builder`, `.arg`, `.launch`): it binds the stream's context to the thread
 /// and calls `cuLaunchKernel`, which copies the arguments before it returns. A tensor that is cudarc's own memory is given to the
@@ -385,10 +394,11 @@ pub(crate) fn enqueue(
     if prepared.maps.iter().any(|m| m.bytes.is_none()) {
         return Err(Error::Launch("a tensor map of the launch was not encoded".to_owned()));
     }
-    if prepared.cluster.is_some() {
+    if prepared.cluster.is_some() || !prepared.passed.is_empty() {
         return ordered(stream, tensors, |tensors, want_end| {
             // cudarc's tracking of every slice through its guards (the wait for its earlier uses now, the record of this use when the guard is
-            // dropped, after the launch), as `enqueue_gemm` does: cudarc's launch builder has no cluster attribute
+            // dropped, after the launch), as `enqueue_gemm` does: cudarc's launch builder has no cluster attribute (and no argument of bytes
+            // passed by value but of a type of a known size)
             let mut guards = Vec::with_capacity(tensors.len());
             for tensor in tensors.iter_mut() {
                 match &mut tensor.backing {

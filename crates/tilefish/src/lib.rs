@@ -46,6 +46,10 @@
 //!
 //! * a **Triton kernel**, or a **prebuilt binary** (`kind: "binary"`: PTX that `ptxas` assembled, or a cubin used as it is, for its own
 //!   architecture), which is launched with exactly its parameters and no scratch slots ([`EntryKind`], [`BinarySource`]);
+//! * a **CuTe DSL kernel** (a `binary` entry of source `cute`, [`BinarySource::Cute`]), launched as its compiled host function launches it: its
+//!   tensors as pointers or as the TMA descriptors the DSL encoded (kind `tensormap`, a [`ParamKind::Pointer`] with a `template`: a launch is
+//!   given the tensor and passes the template with the tensor's address in its first eight bytes), and its constant bytes (kind `bytes`,
+//!   [`ParamKind::Bytes`]), each by value in its slot;
 //! * a pointer that takes a **strided view** of a tensor (`Strided[...]` in Python): any element strides and any starting offset, the
 //!   kernel is given the address of the view's first element and the strides as scalars. A view is made with
 //!   [`TensorRef::from_cuda_strided`] (or `new_strided`, over a region): its shape, its element strides and the element offset of its
@@ -323,9 +327,10 @@ pub use launch_plan::{
 };
 pub use library::{AlgoSource, GemmLayout, Heuristic, LibraryEntry, LibraryImpl};
 pub use manifest::{
-    Access, BinarySource, Constexpr, CudaMath, DimInfo, Entry, EntryKind, FixedValue, IMPLEMENTATION_FALLBACK,
-    LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Persistent, Pin, Precondition,
-    ScalarType, ShapeDim, StrideEntry, StrideOf, TensorMap, View, manifest_digest,
+    Access, BinarySource, CUTE_ADDRESS_LIMIT, Constexpr, CudaMath, DimInfo, Entry, EntryKind, FixedValue,
+    IMPLEMENTATION_FALLBACK, LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, MAX_PARAM_BYTES, Manifest, Param,
+    ParamKind, Persistent, Pin, Precondition, ScalarType, ShapeDim, StrideEntry, StrideOf, TensorMap, View,
+    manifest_digest,
 };
 pub use memory::{CudaRead, CudaWrite};
 pub use plan::{DeviceInfo, GLOBAL_SCRATCH, Plan, Prepared, TensorMapEncode};
