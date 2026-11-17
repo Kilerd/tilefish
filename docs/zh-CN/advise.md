@@ -2,7 +2,7 @@
 
 [English](../advise.md) | **简体中文**
 
-`tilefish-explain` 解释的是单个 kernel（核函数）；它不会告诉你模型的哪些部分合成更少的 kernel 后会更快。advisor（建议器）为整个 plan（计划）做这件事：它按能节省的时间，对一个 graph（计算图）的 plan 中的**融合候选**（由中间张量连接起来的步骤，合成一个 kernel 后就不必存储这些中间张量）排序，说明每个候选为什么现在还不是一个 kernel、该怎么办，并按步骤类别汇总 plan 的时间。一个 profiler 测量每个步骤的设备时间，从而可以按实测时间排序。它还会指出哪些融合模式帮助最大，这正是 plan 融合第 2 阶段（`docs/rfcs/0001-plan-fusion.md`）应当优先做的。
+`tilefish-explain` 解释的是单个 kernel（核函数）；它不会告诉你模型的哪些部分合成更少的 kernel 后会更快。advisor（建议器）为整个 plan（计划）做这件事：它按能节省的时间，对一个 graph（计算图）的 plan 中的**融合候选**（由中间张量连接起来的步骤，合成一个 kernel 后就不必存储这些中间张量）排序，说明每个候选为什么现在还不是一个 kernel、该怎么办，并按步骤类别汇总 plan 的时间。一个 profiler 测量每个步骤的设备时间，从而可以按实测时间排序。它还会指出哪些融合形态（pattern）帮助最大，这正是 plan 融合第 2 阶段（`docs/rfcs/0001-plan-fusion.md`）应当优先做的。
 
 代码在 `tilefish._advise`（分析）和 `tilefish._profile`（profiler）。
 
@@ -28,7 +28,7 @@ t = tilefish.profile_plan(block, "build/block", pin=p.digest, bucket="M=128", de
 
 全部来自导出目录，不需要 GPU，也不需要任何 CUDA 工具：
 
-* **plan**（`plan.json`，或 plan set 中的 `<graph>.plan.json`）：每个 bucket（分桶）的步骤，每个步骤绑定的缓冲区和视图，缓冲区的角色（input、weight、output、intermediate、carried、inout、workspace）；
+* **plan**（`plan.json`，或 plan set 中的 `<graph>.plan.json`）：每个 bucket（分桶）的步骤，每个步骤绑定的缓冲区和视图，缓冲区的角色（input、weight、output、intermediate、carried、inout、workspace（工作区））；
 * **manifest**：每个步骤启动什么。library 条目的尺寸（GEMM（通用矩阵乘）的 `m`、`n`、`k`；卷积的 `n`、`c`、`k`、输出和滤波器尺寸以及分组数）和数据类型；kernel 条目的 ABI（每个指针的访问方式：`in`、`out`、`inout`），它是否由 tilefish 生成（`source_sha256`）、用的是哪个模板（行模板下沉（lowering）生成的 kernel 有一个 `BLOCK_D` 常量），以及它的选项（`enable_fp_fusion`）；
 * **融合报告**（`<graph>.fusion.json`）：graph 函数体的各个区域，每个区域包含的算子、它的模板、它如何读取输入（由 `tilefish.contiguous` `materialised` 的视图）、它的归约及其顺序；
 * **trace**，在导出带有 trace 时（`trace/graphs/<graph>.json`，`docs/explain.md`）：每个区域的算子和源码行，以及新增的各区域**边界**及其原因（第 4 节），还有每个 kernel 的 SASS，advisor 据此判断一个手写 kernel 是否计算 MMA。属于另一个 plan 的 trace 会被忽略。没有 trace 时，`tilefish.advise(..., gop=graph)` 从 graph 计算边界。
@@ -47,7 +47,7 @@ t = tilefish.profile_plan(block, "build/block", pin=p.digest, bucket="M=128", de
   | `fused` | graph 函数体中的一个区域（`fused_<hash>`）：逐元素、行，或单独的一个归约 |
   | `elementwise`、`row` | 用对应模板下沉的 `@tilefish.kernel` |
   | `copy` | copy 或 memset 步骤，或生成的 `tilefish.contiguous`、`im2col`、`im2col1d`、`col2im1d` |
-  | `opaque` | 手写的 Triton 或 Gluon extern（外部 kernel），或预编译二进制文件（有 trace 时：区分有无 MMA）；带 epilogue（尾部）hook 的 extern（标签中写出它的 hook）、它的累加器形式（`<extern>__acc`），以及 hook 中带有区域的 extern（`<extern>_epi_<hash>`，子类 `hooked`，标签中写出契约） |
+  | `opaque` | 手写的 Triton 或 Gluon extern（外部 kernel），或预构建二进制文件（有 trace 时：区分有无 MMA）；带 epilogue（尾部）hook（钩子）的 extern（标签中写出它的 hook）、它的累加器形式（`<extern>__acc`），以及 hook 中带有区域的 extern（`<extern>_epi_<hash>`，子类 `hooked`，标签中写出契约） |
 
 * **roofline**：library 步骤的每字节 FLOPs 低于机器平衡点（峰值除以带宽）时为访存受限，高于时为计算受限；elementwise、row、fused 或 copy 步骤为访存受限；opaque 步骤未知（没有 MMA 的 kernel：访存受限）。其时间估计为 `max(bytes / bandwidth, FLOPs / peak)`，是一个下界。
 
@@ -91,7 +91,7 @@ t = tilefish.profile_plan(block, "build/block", pin=p.digest, bucket="M=128", de
 | `opaque-compute-epilogue`、`-prologue` | 受自身运算限制的手写 kernel：SASS 中有 MMA，或者（有计时文件时）搬运字节的速度不到带宽的四分之一，例如由 FMA 构成的 attention 或一次搜索；在 extern 上声明 epilogue hook（`tilefish.hook`，RFC 0003 E1）；prologue hook | 4，将来 |
 | `epilogue-hook-consumer` | 生产者是带 epilogue hook 的 extern，消费者不是 graph 函数体中的运算：把消费者的运算写进 graph 函数体，由 hook 接管（通过 `value="out"` 得到契约 (i)，通过 `value="acc"` 得到契约 (ii)） | 4 |
 | `dsl-kernel` | 一个（逐元素的）`@tilefish.kernel`：把它的函数体写进 graph 函数体（RFC 8.2）；它声明了 `fp_fusion=False` 时，照原样写就是精确（exact）的 | 1 |
-| `dsl-kernel-contracts` | 同上，适用于允许编译器做收缩的 kernel：在本意是一次舍入的地方写 `tilefish.fma`，否则它的字节会改变 | 1 |
+| `dsl-kernel-contracts` | 同上，适用于允许编译器做收缩（contraction）的 kernel：在本意是一次舍入的地方写 `tilefish.fma`，否则它的字节会改变 | 1 |
 | `row-kernel` | 一个行 `@tilefish.kernel`：把它的函数体写进 graph 函数体，并在求和上加 `order=`，融合第 2 版（默认）会把它融合进一个行区域 | 2 |
 | `epilogue-library-cublaslt` | `cublaslt.gemm`（或 `gemm_bias`）之后的区域是 cuBLASLt 的某个 epilogue，如融合报告的 `library_epilogues` 所示（bias、ReLU、残差加法，按库的顺序）：声明 `tilefish.fusion(epilogues="library")`，把它们合成一个 `cublaslt.matmul` 步骤，其字节是 pin 下库给出的字节，并在每次 pin 时验证与该区域在 f32 累加器上的运算相等（RFC 0003 的契约 (ii)：比现在少一次舍入）；详情中会写明 epilogue 和契约 | E2 |
 | `epilogue-library`、`prologue-library` | `epilogues="library"` 接不了的已 pin GEMM 或卷积的 epilogue（详情说明原因：加法的顺序、在别处读取的值……），或者卷积的 epilogue：RFC 0003 的 E3（带 hook 的生成 GEMM 或卷积）或 E6（cuDNN fused graph）；尚未实现。目前：改为调用带 epilogue hook 的 extern（E1）。prologue：将来的工作 | 将来 |
@@ -139,7 +139,7 @@ t = tilefish.profile_plan(block, "build/block", pin=p.digest, bucket="M=128", de
 
 **epilogue 的路径**（`docs/rfcs/0003-epilogue-fusion.md` 第 5 节）。生产者为 GEMM 或卷积的候选带有 `routes`：每条路径是把消费者的运算并入生产者的一种方式，附上它给出的契约、它的状态和节省（即该候选在排序所用 bucket 下的节省）。对已 pin 的 cuBLASLt GEMM：E2（库 epilogue，契约 (iii)：在融合报告把该区域匹配为 cuBLASLt 的某个 epilogue 时可用，否则说明原因）、E3（带 hook 的生成 GEMM，实测与 pin 相等时为契约 (i)，否则为 (ii)）及其**盈亏平衡点**（break-even）`1 + saving / T_gemm`，即生成 GEMM 慢到什么程度时融合就不再划算（advisor 不预测生成 GEMM 的速度），以及 E1（你自己写的带 epilogue hook 的 extern，现在可用）；对 cuDNN 卷积，用 E6（fused graph）代替 E2。对带 epilogue hook 的 extern：它的 `value="out"` hook（契约 (i)，可用）和 `value="acc"` hook（契约 (ii)，在 `epilogues="accumulator"` 下可用，否则说明要声明什么）；对受自身运算限制、没有声明 hook 的 extern，给出要声明的 hook。给出不同字节的路径永远不会被 advisor 或 planner 按时间自动选择：实测时间只为声明提供参考。
 
-`patterns` 按每个候选需要消除的最晚阶段的阻碍项汇总候选（每个候选只计一次；它需要的其他阻碍项列在 `also` 下）：即该融合阶段能解锁什么。最晚阻碍项为 `epilogue-library` 的候选，无论做了其他什么，都需要 GEMM epilogue。`recurring` 汇总那些步骤以相同顺序运行相同算子的候选（模型中重复的一层）：即用模型的语言来说，节省最多的融合模式。
+`patterns` 按每个候选需要消除的最晚阶段的阻碍项汇总候选（每个候选只计一次；它需要的其他阻碍项列在 `also` 下）：即该融合阶段能解锁什么。最晚阻碍项为 `epilogue-library` 的候选，无论做了其他什么，都需要 GEMM epilogue。`recurring` 汇总那些步骤以相同顺序运行相同算子的候选（模型中重复的一层）：即用模型的语言来说，节省最多的融合形态。
 
 **按类别的时间**按类别汇总步骤的时间（实测值和 roofline 估计）：`library`、`fused`、`elementwise`、`row`、`copy`、`opaque`；**按算子的时间**按 manifest 算子汇总。
 

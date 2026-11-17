@@ -9,9 +9,9 @@
 
 ## 概要
 
-目前 `@tilefish.graph` 的函数体只能调用已声明的算子和取视图；graph 体中的 `y * scale + bias` 会被拒绝，因此模型的每个逐元素步骤都需要一个手写的 kernel（核函数）或一个专门的 `@tilefish.kernel`。就连 README 第一个示例中的 graph（两个 GEMM（通用矩阵乘）之间的 `silu(g) * u`）也无法规划。
+目前 `@tilefish.graph` 的函数体只能调用已声明的算子和取视图；graph 函数体中的 `y * scale + bias` 会被拒绝，因此模型的每个逐元素步骤都需要一个手写的 kernel（核函数）或一个专门的 `@tilefish.kernel`。就连 README 第一个示例中的 graph（两个 GEMM（通用矩阵乘）之间的 `silu(g) * u`）也无法规划。
 
-本 RFC 提出 **plan 融合**：规划器把 graph 体中追踪到的算术分组成区域，并用 `@tilefish.kernel` 已有的模板和数值语义契约，把每个区域下沉为一个*生成的算子*，就像如今生成 `tilefish.contiguous` 和 `im2col` 那样。融合区域是 plan 中一个普通的 `kernel` 步骤：plan 和 manifest（清单）的 schema 都不变，host 也不变。
+本 RFC 提出 **plan 融合**：规划器把 graph 函数体中追踪到的算术分组成区域，并用 `@tilefish.kernel` 已有的模板和数值语义契约，把每个区域下沉为一个*生成的算子*，就像如今生成 `tilefish.contiguous` 和 `im2col` 那样。融合区域是 plan 中一个普通的 `kernel` 步骤：plan 和 manifest（清单）的 schema 都不变，host 也不变。
 
 数值语义规则是这个设计的要点：**融合本身永远不改变字节。** 每个 graph 都有一个声明的数值语义模式；默认模式以及每个称为*精确（exact）*的模式，都让融合后的 plan 与*未融合组合（unfused composition）*逐字节一致——未融合组合是指每个算术算子都是单独的 kernel、每个中间值都以其声明的 dtype 存储的 plan——并且 `export` 默认逐字节验证这一点。版本 1 只有精确模式；不精确的模式（编译器收缩（contraction）、区域内的 Triton 树形归约、库 epilogue（尾部））是未来工作（第 11 节）。第 5 节陈述这一论断、它所依赖的义务、设计过程中发现的隐患（其中之一是一个可能改变 NaN 载荷的编译器折叠），以及证明它的测试。
 
@@ -43,7 +43,7 @@
 * **D1（Q1）：默认开启。** 函数体中有算术的 graph 会以精确的默认模式融合这些算术，不需要任何声明。已有的 plan 都不会改变：在此之前这样的 graph 会被拒绝。
 * **D2（Q2）：无序归约单独运行。** 没有 `order=` 的归约是一个单独的 kernel，不融合，它的操作数被存储下来（与未融合组合中一样）；一旦函数体给它一个 `order=`，它就加入区域。
 * **D3（Q3）：默认不收缩。** graph 不做任何收缩；要让 `a * b + c` 只舍入一次，就用 `tilefish.fma` 或声明的改写 `fp_contract="mul-add"`（一个精确模式）。
-* **D4（Q4）：标量舍入到张量的 dtype**，与 kernel 体中相同；torch 的规则是需要选择加入的精确模式 `intermediates="opmath"`。
+* **D4（Q4）：标量舍入到张量的 dtype**，与 kernel 函数体中相同；torch 的规则是需要选择加入的精确模式 `intermediates="opmath"`。
 * **D5（Q5）：版本 1 只有精确模式。** 编译器收缩、区域内的 Triton 树形归约以及改写为库 epilogue 都是未来工作（第 11 节）。
 * **D6（Q6）：导出时验证。** `export` 在每个 bucket 上用带种子的输入和特殊值输入运行融合后的 plan 和未融合组合，逐字节比较，有差异就拒绝；`verify=False` 可以退出这一验证。
 * **D7（Q7）：冻结的分组规则。** `tilefish.fusion(version=N)` 固定分组规则、限制和改写；版本 1 是第一个，以后的 tilefish 保留每个更早的版本。用另一个版本做出的 plan 会被当作过期而拒绝，消息中会写明该版本。
@@ -87,13 +87,13 @@ D3 和 D4 是推荐的默认选项，没有人提出反对。Q4b 以及 Q8 到 Q
 * **行区域。** 有序的 `sum` 或 `mean`（`mean(order=)` 是新增的：有序求和乘以 `f32(1 / D)`，一条 `mul.rn`）、与顺序无关的 `max`（E2）、`argmax`、`argmin` 和 `gather_rows`（一次复制）会与周围的算子合并；与阶段 1 一样，由下沉的试运行来决定，包含归约的合并结果由行模板下沉。没有 `order=` 的 `sum` 或 `mean` 仍然是单独的区域，其操作数被存储（D2）。一个区域可以写出多个值（rmsnorm 及其残差和；量化后的行及其 scale）。`fma=True` 的有序求和，与它每一步所取操作数来自的那个乘法，在每种分组中都是一个整体，未融合组合中也是如此（版本 1 遇到这种情况会抛出 `KeyError`：它的求和在没有乘积的情况下单独运行）。
 * **1.1 的用例**写成 graph（`tests/fusion_graphs.py`，每个都有对应的未融合孪生版本，由 Rust 和 C++ 门禁作为 `fused_*` plan 运行）：残差相加和 rmsnorm，残差流作为第二个输出（一个 kernel；未融合组合有十个），同样的计算但用 fma 求和，带 gelu 和按通道尾部的 layer norm，带来自设备标量的 mask 的 softmax，按行的 fp8 量化，两个列块的 SwiGLU 加一个 norm，一个 gather 和一个 argmax。
 * **版本 1 已冻结**，连同它的下沉一起：它的区域保持 revision 1，每个声明 `fusion(version=1)` 的用例都规划得与 0.0.9 和 0.0.10 的规划完全一样（plan 的 digest（摘要）在 `tests/test_fusion.py` 中检查）。用另一个版本做出的 plan 会被当作过期而拒绝，消息中会写明该版本（`_fusion.other_version_of_plan`，只在 plan 过期时才尝试）。
-* **有序求和为什么慢（E3），以及 revision 2。** revision 1 用对整行的 `tl.gather(x, k, 0)` 取 lane（通道）链上的每一步；Triton 把源跨越多个 warp 的 gather 通过共享内存下沉，因此每一步都要存储整行、在 barrier 处等待、再加载（每步 `lanes * vector` 列：`tree(128, vector=8)` 在 1024 列时 8 步，`tree(32)` 在 4096 列时 128 步，4096 行时耗时 2.5 ms），而且模板的 warp 规则（每 256 列一个 warp）在 4096 列时给 128 个 lane 分配了 16 个 warp。revision 2 把行重塑为 `[lanes, K]`（lane `j` 的各列沿最后一个轴按其顺序排列，超出 `D` 的列置为 `-0.0`，`add.rn` 加上它会让每个链值保持原样），并通过对半拆分来求每条链，也就是在每个线程持有自己 lane 的各列时做寄存器搬移，而加载的布局正好给出这种分布。第一个版本把 lane 之间的树也用拆分来求，结果 Triton 的布局传播把行的每个值都给了每个线程（926 次 spill，4 ms）：因此树改为通过对 `[lanes]` 的 `tl.gather` 进行（warp 内的 warp shuffle），lane 0 则通过一个带 select 合并函数的 `tl.reduce` 取出。warp 数：`BLOCK_D = 2048` 及以下为一个，之后每 1024 列一个（512 个及以上 lane 时每 512 列一个），在测量网格上与 1 到 8 个 warp 中的最佳值相差不超过 2%。已在 1 到 4096 列的每个长度和每个 warp 数下对照每种顺序的 CUDA kernel 检查；比 revision 1 快 1.6 到 37 倍。
+* **有序求和为什么慢（E3），以及 revision 2。** revision 1 用对整行的 `tl.gather(x, k, 0)` 取 lane（通道）链上的每一步；Triton 把源跨越多个 warp 的 gather 通过共享内存下沉，因此每一步都要存储整行、在 barrier 处等待、再加载（每步 `lanes * vector` 列：`tree(128, vector=8)` 在 1024 列时 8 步，`tree(32)` 在 4096 列时 128 步，4096 行时耗时 2.5 ms），而且模板的 warp 规则（每 256 列一个 warp）在 4096 列时给 128 个 lane 分配了 16 个 warp。revision 2 把行重塑为 `[lanes, K]`（lane `j` 的各列沿最后一个轴按其顺序排列，超出 `D` 的列置为 `-0.0`，`add.rn` 加上它会让每个链值保持原样），并通过对半拆分来求每条链，也就是在每个线程持有自己 lane 的各列时做寄存器搬移，而加载的布局正好给出这种分布。第一个版本把 lane 之间的树也用拆分来求，结果 Triton 的布局传播把行的每个值都给了每个线程（926 次 spill（寄存器溢出），4 ms）：因此树改为通过对 `[lanes]` 的 `tl.gather` 进行（warp 内的 warp shuffle），lane 0 则通过一个带 select 合并函数的 `tl.reduce` 取出。warp 数：`BLOCK_D = 2048` 及以下为一个，之后每 1024 列一个（512 个及以上 lane 时每 512 列一个），在测量网格上与 1 到 8 个 warp 中的最佳值相差不超过 2%。已在 1 到 4096 列的每个长度和每个 warp 数下对照每种顺序的 CUDA kernel 检查；比 revision 1 快 1.6 到 37 倍。
 * **H10，在这里发现：Triton 3.5.1 中字面量 `-0.0` 就是 `+0.0`**（`tl.where(m, x, -0.0)`、`tl.full(..., -0.0)`，在 kernel 中有和没有 `+0.0` 两种情况下都测量过）。融合仍然精确（融合和未融合的 kernel 写的是同一个字面量），但函数体中的 `where(x > 0, x, -0.0)` 并不是它字面上的意思，在 kernel 和区域中都是如此。现在每个 kernel 都按位写出 `-0.0` 标量（一次 `i32` bitcast；note 3），revision 2 对有序求和的填充也是如此。
 * **revision 2 中还有：** 秩为 1 和 2 的视图由行模板就地读取（规则 5；版本 1 的行区域先复制它们），内联的 fp8 类型转换（`cvt.rn.satfinite.e4m3x2.f32`，在每个输入上与 `.to()` 的位相同）。手写的 kernel 可以要求使用 revision 2（`@tilefish.kernel(lowering=2)`）；默认情况下它保持 revision 1 及其源码。
 * **advisor（建议器）**（`docs/advise.md`）和 `boundaries()` 跟随 graph 的版本：在版本 2 中，有序归约、`max`、`argmax` 或 gather 不会被报告，行区域既不阻挡相邻算子，也不复制视图。
 * **速度**（B300 MIG 切片，sm_103，30 个 SM（流式多处理器）；捕获在 CUDA graph 中的每次 plan 运行的微秒数；v2：区域，一个 kernel；tree：同样的函数体但不带 `order=`，即 D2 的三到五个使用 Triton 树形归约的 kernel，字节不同；v1：版本 1，归约以 revision 1 单独运行；unfused：每个算子一个 kernel；v1 和 unfused 写出的字节与 v2 相同，每个单元格都检查过）。在整个网格上，即 32、128、512、1024 和 4096 行与 512、1024、2048 和 4096 列，v2 在每个单元格中都最快：比树形组合快 2.6 到 8 倍。
 
-  | 形态 | 行数 | D = 512：v2 / tree / v1 / unfused | D = 1024 | D = 2048 | D = 4096 |
+  | 形态（pattern）| 行数 | D = 512：v2 / tree / v1 / unfused | D = 1024 | D = 2048 | D = 4096 |
   |---|---|---|---|---|---|
   | add + rmsnorm，返回残差（`mean`、`tree(128, vector=8)`） | 32 | 1.3 / 5.3 / 6.4 / 10.8 | 1.7 / 9.9 / 10.9 / 16.7 | 1.6 / 9.5 / 12.9 / 16.0 | 2.1 / 10.8 / 22.1 / 18.1 |
   | | 4096 | 8.1 / 37.1 / 66.3 / 62.6 | 15.6 / 64.7 / 120.9 / 102.7 | 39.8 / 125.8 / 300.9 / 228.3 | 81.4 / 246.8 / 887.8 / 462.9 |
@@ -106,15 +106,15 @@ D3 和 D4 是推荐的默认选项，没有人提出反对。Q4b 以及 Q8 到 Q
 
   在 4096 行、4096 列时，add + rmsnorm 在 81 us 内搬运 134 MB，达到该切片的带宽（1.6 TB/s）。
 * **测试：** `tests/test_fusion.py`（版本 1 冻结、行区域、fma 单元、带步长的行输入、区域的源码等于以 revision 2 下沉的手写 kernel 的源码、warp 规则、过期消息）；`tests/test_gpu_fusion_rows.py`（每种行形态在每个 bucket 上对比融合与未融合，使用带种子的输入、特殊值组成的行以及每个 bf16 位模式；每个 warp 数；80 个由行算子组成的随机 graph，其中四分之一也经过 `verify_fusion`；内联 fp8 类型转换在每个 f32 和 16 位位模式上的测试；`-0.0`；导出、回放和捕获）；`tests/test_gpu_reduction_order.py`（revision 2 在每个 warp 数下对照每种顺序的 CUDA kernel）；`tests/test_gpu_fusion.py` 中的用例，Rust 和 C++ 门禁。每个 GPU 测试都与架构无关；在 sm_120 上运行它们属于以后的门禁，那里的速度规则测量也是如此。
-* **尚未实现**（阶段 2 遗留的工作）：由区域对 `InOut` 或 carried 张量进行的存储（规则 4：它仍然是一个复制步骤）、带步长的输出（规则 7）、区域内的稠密 reshape（规则 6）、除 warp 数以外的按 bucket 配置、`tilefish.fused(name=...)` 作用域、`intermediates="f32"`、revision 2 对 sequential 顺序的拆分形式（单个 lane：用 revision 1 的辅助函数），以及对照本 RFC 验收（Q11）的参照：用 graph 体写出的已移植模型的 norm 和激活函数。
+* **尚未实现**（阶段 2 遗留的工作）：由区域对 `InOut` 或 carried 张量进行的存储（规则 4：它仍然是一个复制步骤）、带步长的输出（规则 7）、区域内的稠密 reshape（规则 6）、除 warp 数以外的按 bucket 配置、`tilefish.fused(name=...)` 作用域、`intermediates="f32"`、revision 2 对 sequential 顺序的拆分形式（单个 lane：用 revision 1 的辅助函数），以及对照本 RFC 验收（Q11）的参照：用 graph 函数体写出的已移植模型的 norm 和激活函数。
 
 ## 0. 背景：已有的东西
 
-* **graph 体本来就追踪算术。** graph 体运行在与 kernel 体相同的 `Value` 代理之上，所以 graph 中的 `x + y`、类型转换或归约都会成为 graph IR 中的一个类型化节点。规划器（`_plan._walk`）拒绝这样的节点（“arithmetic traced in the graph body ... put it in a `@tilefish.kernel`”），graph 的 `reference` 模式也拒绝它。
+* **graph 函数体本来就追踪算术。** graph 函数体运行在与 kernel 函数体相同的 `Value` 代理之上，所以 graph 中的 `x + y`、类型转换或归约都会成为 graph IR 中的一个类型化节点。规划器（`_plan._walk`）拒绝这样的节点（“arithmetic traced in the graph body ... put it in a `@tilefish.kernel`”），graph 的 `reference` 模式也拒绝它。
 * **下沉本身已经是一个融合器。** `tilefish.lower` 用两个模板之一把 `@tilefish.kernel` 的 SSA IR 变成一个 Triton 函数：*逐元素*模板（每个元素一个 lane，可沿任意轴广播，note 12）和*行*模板（每行一个 program，在最后一个轴上归约，note 6、8、17）。它生成的每个算子都有一份数值语义契约，是在 Triton 3.5.1 和 ptxas 12.9 产出的 PTX 上测量的（note 1 到 19），其中大部分是在全部 `2**32` 个 f32 位模式上测量的。
 * **生成的算子已经存在。** `tilefish.contiguous`、`im2col`、`im2col1d` 和 `col2im1d` 是由 tilefish 编写 Triton 源码的 extern 算子（`_copyops.py`）：每个形状类别一个算子，第一次被请求时生成并缓存，带一个 torch 参考实现。plan 在 graph 需要的地方启动它（非稠密复制是 `tilefish.contiguous` 的一个 `kernel` 步骤），“所以文档中没有新东西”。
-* **身份是机械确定的。** 生成的 kernel 的 spec 带有 `source_sha256`；前端构建的 TTIR 会被哈希（`source_digest`）；编译选项（`num_warps`、`num_stages`、`enable_fp_fusion`）在声明 digest 和 manifest 条目中；plan digest 覆盖 manifest digest。导出在不同机器间可复现（源码按内容寻址，调试路径与机器无关）。
-* **归约的字节取决于什么是已知的。** Triton 的 `tl.sum` 和 `tl.max` 按一棵由 `num_warps` 决定形状的树归约（不同 warp 数之间，1024 行中有 669 到 878 行不同）；逐元素算子、类型转换、`argmax` / `argmin` 和有序求和不依赖于它。
+* **身份是机械确定的。** 生成的 kernel 的规格带有 `source_sha256`；前端构建的 TTIR 会被哈希（`source_digest`）；编译选项（`num_warps`、`num_stages`、`enable_fp_fusion`）在声明 digest 和 manifest 条目中；plan digest 覆盖 manifest digest。导出在不同机器间可复现（源码按内容寻址，调试路径与机器无关）。
+* **归约的字节取决于什么是已知的。** Triton 的 `tl.sum` 和 `tl.max` 按一棵由 `num_warps` 决定形状的树形归约（不同 warp 数之间，1024 行中有 669 到 878 行不同）；逐元素算子、类型转换、`argmax` / `argmin` 和有序求和不依赖于它。
 * **FMA（乘加融合）收缩是一个声明的选项。** `enable_fp_fusion=False` 让 Triton 生成 `mul.rn` / `add.rn`，并向 ptxas 传 `-fmad false`；无论该选项如何，`tilefish.fma` 都是一条 `fma.rn.f32`。
 
 ## 1. 用例与非目标
@@ -123,7 +123,7 @@ D3 和 D4 是推荐的默认选项，没有人提出反对。Q4b 以及 Q8 到 Q
 
 下面这些算子链，是一个典型的解码器、编码器或编解码器在 GEMM 被 pin 住之后，库调用与手写的注意力和卷积 kernel 之间剩下的部分。每条链都受内存带宽限制：如果每个算子一个 kernel 地运行，每个算子都要把它的张量读写一遍。
 
-| 用例 | graph 体写法（草图） | 模板 | 阶段 |
+| 用例 | graph 函数体写法（草图） | 模板 | 阶段 |
 |---|---|---|---|
 | GEMM 之后的 bias + 激活 | `silu(h.to(f32) + b.to(f32)).to(bf16)`，`b: [F]` 沿行广播 | 逐元素 | 1 |
 | 门控激活（SwiGLU、GeGLU） | `g, u = gemm(x, w).split(F, -1)`；`(silu(g.to(f32)) * u.to(f32)).to(bf16)`：`g`、`u` 是同一个缓冲区的列块 | 逐元素，带步长的输入 | 1 |
@@ -151,9 +151,9 @@ D3 和 D4 是推荐的默认选项，没有人提出反对。Q4b 以及 Q8 到 Q
 
 ## 2. 表面语法与捕获
 
-### 2.1 graph 体
+### 2.1 graph 函数体
 
-graph 体中的算术写法与 kernel 体中完全相同：
+graph 函数体中的算术写法与 kernel 函数体中完全相同：
 
 ```python
 @tilefish.graph(inputs=("x",))
@@ -163,7 +163,7 @@ def mlp(x: Tensor[M, H, bf16], w_gu: Tensor[2 * F, H, bf16], w_d: Tensor[H, F, b
     return gemm_d(a, w_d)
 ```
 
-算子、它们的 dtype 规则和广播都与 kernel 体相同（第 2.5 节），所以函数体可以原样在 `@tilefish.kernel` 和 graph 之间移动。graph 增加的是一个关于算术如何求值的声明。
+算子、它们的 dtype 规则和广播都与 kernel 函数体相同（第 2.5 节），所以函数体可以原样在 `@tilefish.kernel` 和 graph 之间移动。graph 增加的是一个关于算术如何求值的声明。
 
 ### 2.2 声明数值语义：`tilefish.fusion(...)`
 
@@ -188,7 +188,7 @@ def mlp(x: Tensor[M, H, bf16], w_gu: Tensor[2 * F, H, bf16], w_d: Tensor[H, F, b
 
 ### 2.3 函数体中的控制手段
 
-* `tilefish.barrier(x)` 返回 `x`，并使它成为区域边界：该值获得 plan 的一个缓冲区。barrier 永远不改变字节（每个模式都是精确的）；它的用途是给中间值设 tap（观测点）、为后续阶段保留缓冲区，以及手动塑造 kernel。在 kernel 体中它会被拒绝。
+* `tilefish.barrier(x)` 返回 `x`，并使它成为区域边界：该值获得 plan 的一个缓冲区。barrier 永远不改变字节（每个模式都是精确的）；它的用途是给中间值设 tap（观测点）、为后续阶段保留缓冲区，以及手动塑造 kernel。在 kernel 函数体中它会被拒绝。
 * `with tilefish.fused(name="norm"):` 要求其中追踪到的算子构成一个区域；如果做不到（没有顺序的归约、两个迭代空间、经过调用的环），plan 会被拒绝，并给出未通过的规则。`name` 作为生成的算子名的前缀，用于 profile 和报告。区域不能嵌套，也不能跨越调用。
 * `tilefish.sum(..., order=...)` 已经存在；本 RFC 给 `tilefish.mean` 增加 `order=`（以该顺序 `sum`，然后 `* f32(1 / D)`，与现在的 `mean` 相同），并且如果实验 E2（第 9.2 节）表明 Triton 的 `tl.max` 在带符号零和 NaN 上与顺序有关，则提出一个全序 `max`。
 
@@ -197,16 +197,16 @@ def mlp(x: Tensor[M, H, bf16], w_gu: Tensor[2 * F, H, bf16], w_d: Tensor[H, F, b
 改动很小，并且只限于 graph 的 trace（追踪记录），所以任何 kernel 的 IR、源码或 digest 都不变：
 
 1. `@tilefish.graph(fusion=...)` 在 `GraphOp` 上存储一个 `Fusion` 值（仅 Python；它是推导 plan 的依据之一）。
-2. graph 体的节点获得两个 kernel 体从来没有的属性：`region`（`tilefish.fused` 作用域，如果有）和 `loc`（文件和行号，按可复现构建的路径方式命名，用于报告和消息）。融合 pass 在构建区域的 kernel 之前把两者都去掉，所以它们都不会进入生成的源码。
+2. graph 函数体的节点获得两个 kernel 函数体从来没有的属性：`region`（`tilefish.fused` 作用域，如果有）和 `loc`（文件和行号，按可复现构建的路径方式命名，用于报告和消息）。融合 pass 在构建区域的 kernel 之前把两者都去掉，所以它们都不会进入生成的源码。
 3. 新节点 `barrier`（仅限 graph 的 trace）。
 4. `mean(order=)`，以及在需要时的全序 `max`：新属性只在给出时才写入，所以已有的 kernel 保持它们的 IR。
 5. 在 `grouping="none"` 下以及区域必须拆分时，mask 现在可以跨越区域边界：这样的 mask 以 `u8`（0 或 1）存储，读回时为 `!= 0`，这是精确的（note 7）。
 
 追踪器的 dtype 规则不变：在每种模式下，16 位张量在 `exp` 之前仍然需要 `.to(f32)`（`intermediates="opmath"` 是否应像 torch 那样接受 16 位的一元数学函数，是开放问题 Q4b；推荐：否）。
 
-### 2.5 graph 体中的 dtype 与广播语义
+### 2.5 graph 函数体中的 dtype 与广播语义
 
-与 kernel 体相同。最后一列是 torch 的行为，因为 graph 经常是从 torch 模型移植过来的。
+与 kernel 函数体相同。最后一列是 torch 的行为，因为 graph 经常是从 torch 模型移植过来的。
 
 | 构造 | 操作数 dtype | 广播 | 数值语义（note） | torch eager 的不同之处 |
 |---|---|---|---|---|
@@ -346,7 +346,7 @@ P with each region replaced by one call to its generated op  --(the existing _wa
 
 ### 5.1 声明的程序与未融合组合
 
-* **声明的程序** `P = R_mode(G)` 是 graph 体经过其模式所指定的数值语义改写（5.4）之后的结果。每个改写都是一个 IR 到 IR 的函数，不取决于区域如何形成；在默认模式下它是恒等变换。`P` 的每个 ARITH 节点都有一个 dtype，其结果是按其算子的契约计算出的该 dtype 的值：算术运算符或类型转换舍入一次，数学函数则是其 note 中固定的指令序列。
+* **声明的程序** `P = R_mode(G)` 是 graph 函数体经过其模式所指定的数值语义改写（5.4）之后的结果。每个改写都是一个 IR 到 IR 的函数，不取决于区域如何形成；在默认模式下它是恒等变换。`P` 的每个 ARITH 节点都有一个 dtype，其结果是按其算子的契约计算出的该 dtype 的值：算术运算符或类型转换舍入一次，数学函数则是其 note 中固定的指令序列。
 * **未融合组合** `U(P)` 是 `grouping="none"` 下 `P` 的 plan：`P` 的每个 ARITH 节点都是单独生成的 kernel，用同样的模板和同样的逐节点选项下沉，每个中间值都以其 dtype 存储（mask 存为 `u8`，秩 0 的值存为单元素张量）。不对数据做算术的节点（设备标量的 `load`、`iota`）在每个消费者中重新计算而不是存储，这是精确的。
 * `U(P)` 是一个真正的 plan：它能规划、导出、在 `jit` 和 `replay` 中运行、捕获，它的 tap 能显示每个中间值。它就是判定基准（oracle）。
 
@@ -536,7 +536,7 @@ Q1 到 Q7 已经决定（上面的 D1 到 D7）。以下仍然开放，每一项
 * **prologue hook**（路线 (c')）：在 extern 加载 GEMM 操作数时对其反量化或归一化；逐元素进行，在路线 (c) 的条件下是精确的，但每个加载该元素的 tile 都要重复这项工作。
 * **水平融合**，以及把廉价节点**重计算**进多个区域（一个新的 `version`）。
 * 把 **`@tilefish.kernel` 调用内联**进区域（8.2），需选择加入。
-* 如果 D2 的代价（E3）被证明很重要，为无序归约提供一个根据 `D` 选择的**规范默认顺序**（精确且可融合，但会让不带 `order` 的 `sum` 在 kernel 体中的含义之外多出第二种含义）。
+* 如果 D2 的代价（E3）被证明很重要，为无序归约提供一个根据 `D` 选择的**规范默认顺序**（精确且可融合，但会让不带 `order` 的 `sum` 在 kernel 函数体中的含义之外多出第二种含义）。
 
 ## 附录 A：一个完整示例
 

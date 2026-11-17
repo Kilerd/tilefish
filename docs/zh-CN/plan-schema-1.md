@@ -2,9 +2,9 @@
 
 [English](../plan-schema-1.md) | **简体中文**
 
-*launch plan*（启动计划）是把一个 `@tilefish.graph` 编译成的结果：对其各维度的 bucket（分桶）值的每一种组合，都有一个有序的 **步骤（step）** 列表（每个步骤是对一个 manifest（清单）条目的一次启动：一个 Triton kernel（核函数）、一个预编译的 PTX 或 cubin，或一个已 pin（固定）的 cuBLASLt GEMM（通用矩阵乘）），其中每个指针参数都绑定到一个 **缓冲区** 或它的一个视图；另外还有一份 **内存计划**：每个不由调用方提供的缓冲区都位于唯一一个 **arena**（内存池）中的固定字节偏移处，在每个 bucket 中都相同。持有一份经过验证的 plan（计划）及其 manifest 的 host（宿主）在一个 stream 上按顺序启动这些步骤，期间不分配任何内存，因此整个执行可以在固定地址上、按每个 bucket 一次 capture（捕获）进一个 CUDA graph（CUDA 图）。
+*launch plan*（启动计划）是把一个 `@tilefish.graph` 编译成的结果：对其各维度的 bucket（分桶）值的每一种组合，都有一个有序的 **步骤（step）** 列表（每个步骤是对一个 manifest（清单）条目的一次启动：一个 Triton kernel（核函数）、一个预构建的 PTX 或 cubin，或一个已 pin（固定）的 cuBLASLt GEMM（通用矩阵乘）），其中每个指针参数都绑定到一个 **缓冲区** 或它的一个视图；另外还有一份 **内存计划**：每个不由调用方提供的缓冲区都位于唯一一个 **arena**（内存池）中的固定字节偏移处，在每个 bucket 中都相同。持有一份经过验证的 plan（计划）及其 manifest 的 host（宿主）在一个 stream 上按顺序启动这些步骤，期间不分配任何内存，因此整个执行可以在固定地址上、按每个 bucket 一次 capture（捕获）进一个 CUDA graph（CUDA 图）。
 
-Python 包写入并读取本文档（`tilefish.plan`、`tilefish.runtime.export`、`tilefish.run(graph, ..., mode="replay", plan=...)`）。一个 Rust 实现（Rust lane）实现了本规范，C++ host（`crates/tilefish-capi`、`docs/rfcs/0002-cpp-host.md`）通过这个 Rust 实现运行 plan，所以本文档对 Rust host 所说的内容对它同样成立。所有内容都由 `python/tests/` 中的测试检查（在最后一节列出），写入或检查每个部分的 Python 代码在描述该部分的地方给出（`python/src/tilefish/_plan.py`、`_planrun.py`）。
+Python 包写入并读取本文档（`tilefish.plan`、`tilefish.runtime.export`、`tilefish.run(graph, ..., mode="replay", plan=...)`）。一个 Rust 实现（Rust lane（通道））实现了本规范，C++ host（`crates/tilefish-capi`、`docs/rfcs/0002-cpp-host.md`）通过这个 Rust 实现运行 plan，所以本文档对 Rust host 所说的内容对它同样成立。所有内容都由 `python/tests/` 中的测试检查（在最后一节列出），写入或检查每个部分的 Python 代码在描述该部分的地方给出（`python/src/tilefish/_plan.py`、`_planrun.py`）。
 
 本文档假定读者了解 manifest schema（模式）3（`docs/manifest-schema-3.md`）：`kernels` 和 `library` 的条目、`abi`、维度表达式语法、`preconditions`、规范 JSON，以及 host 对一次启动所做的启动检查。plan 不在这些之上增加任何东西：**一个步骤就是对一个 manifest 条目的一次启动，其检查和执行方式与单次启动完全相同；plan 只说明是哪个条目、使用哪块内存。**
 
@@ -12,8 +12,8 @@ Python 包写入并读取本文档（`tilefish.plan`、`tilefish.runtime.export`
 
 ## 1. plan 由什么组成
 
-* **`dims`**：graph（计算图）的维度（其参数形状中的自由维度），每个维度带有为它规划的尺寸列表（它的 *bucket*）。一个 bucket 组合是为每个维度各取一个尺寸。每个组合有一个步骤列表，一次调用按其张量的尺寸选择其中一个，这些尺寸必须恰好等于某个 bucket（没有 padding）。
-* **`buffers`**：plan 命名的每个张量，放在一张表中。缓冲区要么是 *外部的*（由调用方提供：一个参数或一个返回值），要么位于 *arena* 中（一个中间张量、一个设备标量的槽位、各 GEMM 的 workspace），要么是 *carried* 的（一个参数，其张量由 arena 在多次执行之间保存，位于 host 放在各 plan 自身区域之后的一块区域中：第 15.2 节）。它的 dtype 和形状由 graph 固定；形状是关于 `dims` 的表达式。
+* **`dims`**：graph（计算图）的维度（其参数形状中的自由维度），每个维度带有为它规划的尺寸列表（它的 *bucket*）。一个 bucket 组合是为每个维度各取一个尺寸。每个组合有一个步骤列表，一次调用按其张量的尺寸选择其中一个，这些尺寸必须恰好等于某个 bucket（没有填充）。
+* **`buffers`**：plan 命名的每个张量，放在一张表中。缓冲区要么是 *外部的*（由调用方提供：一个参数或一个返回值），要么位于 *arena* 中（一个中间张量、一个设备标量的槽位、各 GEMM 的 workspace（工作区）），要么是 *carried* 的（一个参数，其张量由 arena 在多次执行之间保存，位于 host 放在各 plan 自身区域之后的一块区域中：第 15.2 节）。它的 dtype 和形状由 graph 固定；形状是关于 `dims` 的表达式。
 * **`buckets[i].steps`**：一个 bucket 组合的各次启动，按顺序排列。一个步骤指定一个 manifest 条目（`entry`，其 stem 包含该条目自身的 bucket，例如 `gemm_up.M64`），并按该条目 ABI 的顺序把它的每个指针参数绑定到一个缓冲区，以及可选地绑定到该缓冲区的一个视图。
 * **内存计划**：`arena_bytes` 以及每个 arena 缓冲区的 `offset`，单位是距 arena 起点的字节数，按 256 对齐，在每个 bucket 中都相同。
 
@@ -119,10 +119,10 @@ sha256( b"tilefish.plan-digest.v1\0" + canonical_json(body) ),   body = doc with
 | 字段 | 类型与规则 |
 |---|---|
 | `entry` | 字符串：manifest 条目的 stem（`rmsnorm`、`attention`、`gemm_qkv.M64`：一个标识符，然后算子每个分 bucket 的维度一个 `.<Dim><value>`）。它是条目自身的 bucket，对于二进制文件按 bucket 划分的算子，它在 plan 的不同 bucket 之间不同。 |
-| `kind` | `"kernel"`：manifest 的 `kernels` 中的一个条目（Triton 或预编译二进制文件）。`"library"`：它的 `library` 中的一个条目（一个已 pin 的 GEMM）。manifest 必须在该部分中有 **针对 `arch`** 的这个条目。`"copy"`：一次设备到设备的复制（第 7.5 节），不指定条目。`"memset"`：把字节置零（第 7.6 节），不指定条目。 |
+| `kind` | `"kernel"`：manifest 的 `kernels` 中的一个条目（Triton 或预构建二进制文件）。`"library"`：它的 `library` 中的一个条目（一个已 pin 的 GEMM）。manifest 必须在该部分中有 **针对 `arch`** 的这个条目。`"copy"`：一次设备到设备的复制（第 7.5 节），不指定条目。`"memset"`：把字节置零（第 7.6 节），不指定条目。 |
 | `args` | 非空列表，**条目 `abi.params` 中的每个指针参数按顺序** 对应一个对象（kernel 的标量参数和 `fixed` 参数不是 args 项：由 host 推导）。`tensordesc` 参数（张量的 TMA 描述符，manifest schema 3，第 5.5 节）在这里算作指针参数：步骤绑定它的张量。同一步骤中的名字互不相同。 |
 | `workspace` | `kind` 为 `"library"` 时出现；在 kind 为 `"kernel"` 的步骤上，当且仅当其条目带有 global scratch 时出现（`launch.global_scratch_size` 大于 0，manifest schema 3，第 4.6 节；tilefish 0.0.7，crate 0.0.5）：角色为 `workspace` 的缓冲区的名字。早于 kernel 步骤 `workspace` 的读取方拒绝它。 |
-| `given` | 在 kind 为 `"kernel"` 的步骤上，当且仅当条目带有按调用给出的固定参数时出现（manifest schema 3，第 5.3 节：预编译二进制文件的 `kind: "given"` 参数）：一个非空对象，把其中每一个参数的名字（标识符）映射到调用给出的 JSON 整数，在其类型范围内（`i32`、`i64`；plan 中的数绝对值至多为 `2**53`）。值可以在不同 bucket 之间不同（调用可以给出关于 graph 维度的表达式，`c=Rg`，在每个 bucket 下求值）；名字不可以。它是 digest 的一部分。 |
+| `given` | 在 kind 为 `"kernel"` 的步骤上，当且仅当条目带有按调用给出的固定参数时出现（manifest schema 3，第 5.3 节：预构建二进制文件的 `kind: "given"` 参数）：一个非空对象，把其中每一个参数的名字（标识符）映射到调用给出的 JSON 整数，在其类型范围内（`i32`、`i64`；plan 中的数绝对值至多为 `2**53`）。值可以在不同 bucket 之间不同（调用可以给出关于 graph 维度的表达式，`c=Rg`，在每个 bucket 下求值）；名字不可以。它是 digest 的一部分。 |
 
 一个参数是 `{"name": <string>, "binding": <buffer name>}`，可选地带 `"view"`：恰好是键 `name`、`binding` 和 `view`。
 
@@ -134,13 +134,13 @@ sha256( b"tilefish.plan-digest.v1\0" + canonical_json(body) ),   body = doc with
 
 ### 7.2 host 如何处理一个步骤
 
-该步骤是用其参数的张量对 manifest 条目 `entry` 的一次启动：指针 = 如上，形状 = `view.shape`（或缓冲区的形状），元素步长 = `view.strides`（或行主序步长）。其余一切与 manifest schema 3 中的单次启动相同：host **根据这些形状和步长绑定条目的维度**（那里的第 5.1 节，对大小为 1 的轴使用其规范步长；条目读取的参数没有绑定的维度从其 `out` 参数的形状绑定，那里的第 7 节），推导运行时标量（维度、元素个数、步长、`fixed` 值）并把步骤的 `given` 值传到它们的槽位，对 grid 表达式求值，并检查条目的每个前置条件（所传指针的 `pointer_alignment`、`static_size`、`divisible`、`bucket`、`max_elements`、`max_extent`），检查 ABI 条目中没有 `strides` 的指针拿到的是 **稠密** 张量（其大小 > 1 的轴的步长为行主序步长），检查秩和 dtype 与 ABI 一致，检查被写的指针（`access` 为 `out` 或 `inout`）不与该步骤的其他参数重叠（带 `alias` 的 `out` 指针与它所指的 `in` 指针除外，二者可以恰好是同一个张量：manifest schema 3，第 5.4 节），并对照设备的限制检查 grid。kernel 用 `cuLaunchKernel` 启动（Triton kernel 带上它的两个为零的 scratch 槽位，预编译 kernel 恰好带它自己的参数），使用条目的 `block`（对 warp（线程束）特化的 kernel：其所有分区的 warp，manifest schema 3，第 4.2 节）和它的 `shared` 内存；manifest schema 3 的启动形态与单次启动相同：持久化 grid 被截到 host 为之加载它的那些 SM（流式多处理器）所运行的 program 数（第 4.3 节：设备的 SM，或分区的 SM，所以在分区上准备的 plan 运行该分区对应的 program），使用 cluster 的 kernel 用 `cuLaunchKernelEx` 及其 cluster 启动（第 4.5 节），带 global scratch 的 kernel（第 4.6 节）以步骤的 `workspace` 所指的缓冲区作为它的 scratch，位于该缓冲区在 arena 中的地址，host 在准备该 bucket 时检查它能容纳该 bucket 下这次启动的 scratch；library 条目用 `cublasLtMatmul` 及其已 pin 的算法启动（manifest schema 3，第 9 节），其 **workspace 是 `workspace` 所指的缓冲区**，位于它在 arena 中的地址（条目的 `workspace_bytes` 总是在那里；matmul 得到的是算法所需的大小，至多为此），所以调用不分配任何内存。
+该步骤是用其参数的张量对 manifest 条目 `entry` 的一次启动：指针 = 如上，形状 = `view.shape`（或缓冲区的形状），元素步长 = `view.strides`（或行主序步长）。其余一切与 manifest schema 3 中的单次启动相同：host **根据这些形状和步长绑定条目的维度**（那里的第 5.1 节，对大小为 1 的轴使用其规范步长；条目读取的参数没有绑定的维度从其 `out` 参数的形状绑定，那里的第 7 节），推导运行时标量（维度、元素个数、步长、`fixed` 值）并把步骤的 `given` 值传到它们的槽位，对 grid 表达式求值，并检查条目的每个前置条件（所传指针的 `pointer_alignment`、`static_size`、`divisible`、`bucket`、`max_elements`、`max_extent`），检查 ABI 条目中没有 `strides` 的指针拿到的是 **稠密** 张量（其大小 > 1 的轴的步长为行主序步长），检查秩和 dtype 与 ABI 一致，检查被写的指针（`access` 为 `out` 或 `inout`）不与该步骤的其他参数重叠（带 `alias` 的 `out` 指针与它所指的 `in` 指针除外，二者可以恰好是同一个张量：manifest schema 3，第 5.4 节），并对照设备的限制检查 grid。kernel 用 `cuLaunchKernel` 启动（Triton kernel 带上它的两个为零的 scratch 槽位，预构建 kernel 恰好带它自己的参数），使用条目的 `block`（对 warp（线程束）特化的 kernel：其所有分区的 warp，manifest schema 3，第 4.2 节）和它的 `shared` 内存；manifest schema 3 的启动形状与单次启动相同：持久化 grid 被截到 host 为之加载它的那些 SM（流式多处理器）所运行的 program 数（第 4.3 节：设备的 SM，或分区的 SM，所以在分区上准备的 plan 运行该分区对应的 program），使用 cluster（线程块簇）的 kernel 用 `cuLaunchKernelEx` 及其 cluster 启动（第 4.5 节），带 global scratch 的 kernel（第 4.6 节）以步骤的 `workspace` 所指的缓冲区作为它的 scratch，位于该缓冲区在 arena 中的地址，host 在准备该 bucket 时检查它能容纳该 bucket 下这次启动的 scratch；library 条目用 `cublasLtMatmul` 及其已 pin 的算法启动（manifest schema 3，第 9 节），其 **workspace 是 `workspace` 所指的缓冲区**，位于它在 arena 中的地址（条目的 `workspace_bytes` 总是在那里；matmul 得到的是算法所需的大小，至多为此），所以调用不分配任何内存。
 
 **TMA 描述符参数**（条目的 `tensordesc` 参数：manifest schema 3，第 5.5 节）按该节所说进行检查（其地址 16 字节对齐，步长为 16 字节的倍数，维度在 `i32` 范围内：kind `tensor_map`），它的 `CUtensorMap` **在每次执行时根据参数的张量编码，并带有第 9 节第 3 步的每项检查**：地址 `address(buffer) + view.offset * itemsize`（arena 缓冲区位于 `arena + offset`，外部张量位于调用方的张量），视图的形状和规范步长，以及条目的 map。因此驱动拒绝的编码不会启动任何东西，步骤以它在本次执行中所绑定内存的 map 启动；生成或加载 plan 时不计算任何 map（文档中没有地址）。Python 按参数保留最近的 4096 个编码结果，这使同一绑定的重复执行无需重新编码，而任何其他绑定都对应另一个键。
 
 **每个架构各有一个实现的算子**（manifest schema 3，第 4.1 节）无论运行哪个实现，都是一个条目名，即它的 stem，它的步骤的 `args` 指定算子的张量，每个实现都以相同顺序接收这些张量；plan 的 `arch` 对应的 manifest 中有该架构所运行实现的条目，带有它自己的 ABI（张量以 `pointer` 或 `tensordesc` 传入，它自己的标量和 `fixed` 参数，它自己的前置条件），host 像对待任何条目一样遵循它。plan 中没有任何内容说明是哪个实现，所以一个 graph 的 plan 对所有架构是同一份文档。Python 的规划器用每个实现解析每个步骤，包括它们的前置条件（比如 TMA 描述符的 16 字节步长），所以只有当每个实现都能运行时才会生成 plan。
 
-条目所指的那一个二进制文件服务于其未分 bucket 维度的每个尺寸：一个行 kernel 针对 `M in {32, 64, 128}` 的 plan 在全部三个 bucket 中都指定条目 `rmsnorm`，`M` 从视图的形状绑定；它也服务于其按调用给出的固定参数的每个取值：同一预编译二进制文件的两个 `given` 值不同的步骤指定同一个条目。
+条目所指的那一个二进制文件服务于其未分 bucket 维度的每个尺寸：一个行 kernel 针对 `M in {32, 64, 128}` 的 plan 在全部三个 bucket 中都指定条目 `rmsnorm`，`M` 从视图的形状绑定；它也服务于其按调用给出的固定参数的每个取值：同一预构建二进制文件的两个 `given` 值不同的步骤指定同一个条目。
 
 ### 7.3 plan 对照 manifest 检查什么
 
@@ -204,7 +204,7 @@ host 可以按 bucket 缓存第 1 至 3 步中不依赖地址的一切（维度�
 
 **只绑定一次的权重（不属于文档）。** 对于带 `"roles": "declared"` 的 plan，host 可以只接收一次角色为 `weight` 的缓冲区的张量，而在每次调用时接收其他每个外部张量：它检查和启动的内容恰好是带着所有这些张量的第 2 至 5 步。权重在绑定时按外部张量的方式检查（dtype、秩、稠密性、静态尺寸；权重只会被读），并在每次调用时与其余张量一起再次检查（权重形状中提到的维度、重叠）。在调用时再次给出的权重被拒绝。Python：`tilefish.runtime.bind_weights(graph, {"w": t, ...}, mode=, plan=, pin=)`，得到一个 `WeightedRun`，其 `run(*inputs)` 和 `capture(*inputs, devscalars=...)` 接收不是权重的参数；Rust：`PlanRun::bind_weights(vec![("w", t), ...])`，得到一个 `WeightedRun<'w>`（它借用权重），其 `launch`、`launch_tapped`、`check` 和 `capture` 接收其他外部张量。两者都拒绝没有 `roles` 的 plan。
 
-**调试 tap（不属于文档）。** host 可以在执行期间把 plan 的某个缓冲区复制出来，以观察产品实际运行的那个 plan 的中间张量：plan 及其 digest 不变。一个 *tap*（观测点）指定一个缓冲区（除 workspace 外的任何缓冲区；返回值按名字或 `out<i>` 指定）和该 bucket 的一个步骤（默认是写该缓冲区的最后一个步骤：kernel 的 `out` 或 `inout` 指针、GEMM 的 `out`、copy 的 `dst`），并给出一个 dtype 与缓冲区相同、形状为该 bucket 下缓冲区形状的稠密张量，它不与任何外部张量、任何其他 tap 以及 arena 重叠。它在第 3 步与其他一切一起检查，在第 5 步中，紧接在它的步骤之后、在下一个步骤可能覆写该缓冲区的字节之前，把整个缓冲区复制进去（`cuMemcpyDtoDAsync`，在 stream 上）（有 `reuse` 时，中间张量的字节会被复用）。Python：`tilefish.run(graph, ..., taps={"t3": tensor, ("t5", 4): tensor})` 和 `tilefish.capture(..., taps=...)`（这些复制是 graph 的 memcpy 节点）；Rust：`PlanRun::launch_tapped(stream, externals, devscalars, &mut [Tap { buffer, after, into }])`，以及 `PlanRun::capture_tapped(stream, externals, devscalars, taps)`，其 graph 把这些复制作为 memcpy 节点持有（每次 replay 都会再次复制；`CapturedPlan` 借用 tap 张量，`CapturedPlan::tap(buffer)` 是其中一个的内存）。
+**调试 tap（观测点，不属于文档）。** host 可以在执行期间把 plan 的某个缓冲区复制出来，以观察产品实际运行的那个 plan 的中间张量：plan 及其 digest 不变。一个 *tap* 指定一个缓冲区（除 workspace 外的任何缓冲区；返回值按名字或 `out<i>` 指定）和该 bucket 的一个步骤（默认是写该缓冲区的最后一个步骤：kernel 的 `out` 或 `inout` 指针、GEMM 的 `out`、copy 的 `dst`），并给出一个 dtype 与缓冲区相同、形状为该 bucket 下缓冲区形状的稠密张量，它不与任何外部张量、任何其他 tap 以及 arena 重叠。它在第 3 步与其他一切一起检查，在第 5 步中，紧接在它的步骤之后、在下一个步骤可能覆写该缓冲区的字节之前，把整个缓冲区复制进去（`cuMemcpyDtoDAsync`，在 stream 上）（有 `reuse` 时，中间张量的字节会被复用）。Python：`tilefish.run(graph, ..., taps={"t3": tensor, ("t5", 4): tensor})` 和 `tilefish.capture(..., taps=...)`（这些复制是 graph 的 memcpy 节点）；Rust：`PlanRun::launch_tapped(stream, externals, devscalars, &mut [Tap { buffer, after, into }])`，以及 `PlanRun::capture_tapped(stream, externals, devscalars, taps)`，其 graph 把这些复制作为 memcpy 节点持有（每次 replay 都会再次复制；`CapturedPlan` 借用 tap 张量，`CapturedPlan::tap(buffer)` 是其中一个的内存）。
 
 **单独一个步骤（不属于文档）。** host 可以在调用方的张量上启动某个 bucket 的一个步骤：使用经过验证的 manifest（即 plan 的 pin 所 pin 住的那个）中该步骤条目的二进制文件和该步骤的绑定（每个参数是步骤指定的缓冲区和视图，由为该缓冲区给出的张量构成），并先用这些地址完成该步骤一次启动的每项检查（第 7.2 节）。调用方为步骤绑定的每个缓冲区给出一个张量，不为其他任何缓冲区给出（返回值按名字或 `out<i>`；不包括 workspace，它属于 arena），张量的 dtype 与缓冲区相同，形状为该 bucket 下缓冲区的形状（设备标量：一个元素），稠密，既不与 arena 重叠，在步骤写其中某个张量时彼此也不重叠。这次启动与该 plan 的各次执行一起排序（第 9 节第 1 步）。这就是在产品所用的 pin 下、用参考实现的输入回放已导出 plan 中某一个算子的方法。Python：`tilefish.runtime.run_step(graph, step, buffers, mode=, plan=, pin=, bucket=None)`（当某个 bucket 适合这些形状时，从形状找出该 bucket）；Rust：`PlanRun::launch_step(stream, bucket, step, buffers)`。**它不会被 capture**（两个 host 都拒绝正在 capture 的 stream）：它是在产品的 pin 下、用参考实现的输入对一个算子做的检查，只做一次，graph 在这里没有任何好处，而且步骤会在 arena 的顺序下读取 plan 的 arena（GEMM 的 workspace）；想把 plan 的某一个二进制文件放进自己的 graph 的 host，从 plan 所 pin 住的 manifest 启动它（`LaunchPlan::manifest().kernel(...)`、`Kernel::launch_raw`），或者 capture 整个 plan。
 
@@ -257,7 +257,7 @@ tilefish.runtime.replay_graph(g)                                            # re
 * graph 中某个调用给出的值不同于声明默认值的编译期参数（`const`），在生成 plan 时被拒绝，与单次启动时一样（二进制文件中编译进了声明的值）；`reference` 模式下也是如此。
 * `tilefish.capture(graph, *externals, mode=..., plan=..., pin=..., trust_directory=..., devscalars=..., outputs=..., stream=None)` 准备 plan，然后在 `stream`（默认：一个新 stream）上、以线程局部的 capture 模式，把外部张量所选 bucket 的各次启动 capture 进它自己的 `torch.cuda.CUDAGraph`，内部不分配任何东西。`externals` 是 graph 按签名顺序的参数，不含其 `DevScalar` 参数，后者的值由 `devscalars=` 给出（每一个都要给：一个数，或 host 或设备上的单元素张量）；`outputs=` 默认是在 capture 之前分配的张量（`cap.outputs`）。`CapturedPlan` 让外部张量和 arena 保持存活。在 capture 内以及在 `clear_caches` 之后，`replay` 被拒绝。
 * `tilefish.runtime.clear_caches()` 等待每个线程上进行中的执行，重置每个 runner 并释放每个 arena（在其上最后一次执行完成之后），所以只有在不会再回放任何用 `torch.cuda.graph` capture 的 graph 时才调用它（`CapturedPlan` 让它的 arena 保持存活，但会拒绝 replay：需要重新 capture）。
-* `jit` 在内存中用相同的编译 spec 构建 plan 的二进制文件，并在内存中 pin 相同的 GEMM 算法，运行与 `replay` *相同* 的 runner，`replay` 的不同之处在于二进制文件的来源（一个对照 spec 验证过的 manifest）；所以两者在构造上就是一致的（有测试要求它们逐字节相等）。`jit` 运行的 plan 要遵守读取方要求文件遵守的每一条规则（第 2 节以及第 5 至 8 节，`validate_doc(doc, made=True)`，其中包括对 arena 的重叠扫描；只有它的 `arch` 和 `manifest_digest` 为 `null`）：`tilefish.plan` 检查它生成的每个 plan。
+* `jit` 在内存中用相同的编译规格构建 plan 的二进制文件，并在内存中 pin 相同的 GEMM 算法，运行与 `replay` *相同* 的 runner，`replay` 的不同之处在于二进制文件的来源（一个对照规格验证过的 manifest）；所以两者在构造上就是一致的（有测试要求它们逐字节一致）。`jit` 运行的 plan 要遵守读取方要求文件遵守的每一条规则（第 2 节以及第 5 至 8 节，`validate_doc(doc, made=True)`，其中包括对 arena 的重叠扫描；只有它的 `arch` 和 `manifest_digest` 为 `null`）：`tilefish.plan` 检查它生成的每个 plan。
 
 ## 12. plan 不做什么（版本 1）
 
@@ -312,7 +312,7 @@ plan 无法生成的 graph 函数体会被 `tilefish.plan` 拒绝，并给出相
 | 带 TMA 描述符的步骤（第 7.2 节和第 10 节）：在第一次启动之前根据所绑定的缓冲区编码，在 graph 中按值持有 | `test_tensordesc.py`（假的后端）；GPU 上 `test_gpu_tma.py`（jit、replay、`tilefish.capture`、`torch.cuda.graph`、单独一个步骤）以及门禁 plan `tma_chain`、`tma_chain-reuse`、`tma_view`（`gpu_plan_gate.rs`：启动，并从 graph 回放） |
 | 调试 tap（第 9 节） | `test_plan_taps.py`；GPU 上 `test_gpu_plan_taps.py` 和 `gpu_plan_gate.rs`（`taps_are_pythons_bytes`：Rust 的 tap 对照 Python 的） |
 | 参数的角色，声明的或按形状选定的（第 2、6 节），以及只绑定一次的权重（第 9 节） | `test_plan_roles.py`；golden plan `steps`（`launch_plans.rs`）；GPU 上 `test_gpu_plan_roles.py` 和 `gpu_plan_gate.rs`（`weights_bound_once_give_pythons_bytes`） |
-| 预编译二进制文件按调用给出的固定参数：步骤的 `given`（第 7 节） | `test_given_args.py`；golden plan `given`（`launch_plans.rs`，以及 `python_plans.json` 中的 `given ...` 文档）；GPU 上 `test_gpu_given_args.py`、`gpu_gate.rs`（`one_binary_serves_the_values_each_call_gives`）以及门禁 plan `given_steps` |
+| 预构建二进制文件按调用给出的固定参数：步骤的 `given`（第 7 节） | `test_given_args.py`；golden plan `given`（`launch_plans.rs`，以及 `python_plans.json` 中的 `given ...` 文档）；GPU 上 `test_gpu_given_args.py`、`gpu_gate.rs`（`one_binary_serves_the_values_each_call_gives`）以及门禁 plan `given_steps` |
 | 被返回或被复制的不稠密视图：`tilefish.contiguous` 的启动（第 7.5 节） | `test_plan_materialise.py`；GPU 上 `test_gpu_plan_materialise.py` 以及门禁 plan `strided_returns` |
 | 返回值的名字（第 6 节） | `test_plan_names.py`；golden plan `steps`（`launch_plans.rs`）；GPU 上 `gpu_plan_gate.rs`（`a_named_output_is_given_by_its_name_or_by_out_i`） |
 | 内存计划：对齐、无重叠、对照模拟 arena 的按存活性复用 | `test_plan_arena.py` |

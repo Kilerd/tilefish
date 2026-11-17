@@ -5,7 +5,7 @@
 * **状态：** 已评审；2026-11-16 的决定记录在下文“决定”一节。设计和阶段 0 实验（第 6 节）。里程碑 E1（extern（外部 kernel）上的 epilogue（尾部）hook（钩子），见下文“E1：实现说明”）和 E2（cuBLASLt epilogue，见 7.3 节：构建了什么、测量了什么、还剩下什么）已经实现，并能在同一个 graph（计算图）中协同工作（见下文“E1 与 E2 结合”）；实验 X8（一个带这些 hook 的持久化、warp（线程束）特化的 GEMM（通用矩阵乘））已经测量（见下文“X8：结果”；该 kernel（核函数）是 `python/examples/` 下的一个示例，不是受支持的功能）；其余部分是设计。
 * **范围：** 跨调用的融合。*epilogue* 是读取 GEMM 或卷积结果的逐元素或行级工作；*prologue*（头部）生成其某个操作数。本 RFC 涉及规划器和融合 pass（`tilefish._plan`、`tilefish._fusion`）、library op（库算子）（`cublaslt.*`、`cudnn.conv_fwd`）、extern、一族新的生成的 GEMM 和卷积算子，以及 advisor（建议器）。只有库 epilogue 涉及 manifest（清单）和 host（宿主）。
 * **基线：** tilefish 0.0.10 / crate 0.0.8，其中包含融合 advisor（`docs/advise.md`）。
-* **与 RFC 0001 的关系。** RFC 0001（plan（计划）融合）融合各调用之间的 graph 体算术，并承诺融合本身绝不改变字节。它的第 7 节勾勒了进入调用的三条路线，第 11.2 节推迟了库 epilogue。本 RFC 取代这些草案。它是一份独立的文档，而不是 0001 的一节，原因有二。RFC 0001 已经评审，它的决定 D1 到 D7 建立在一个只有精确（exact）模式的契约之上。本 RFC 必须引入第一批字节*不*等于未融合组合（unfused composition）字节的契约，并且需要它自己的决定。RFC 0001 的每个决定都仍然成立。本 RFC 在 0001 某个阶段之上构建的地方，会说明是哪个阶段。
+* **与 RFC 0001 的关系。** RFC 0001（plan（计划）融合）融合各调用之间的 graph 函数体算术，并承诺融合本身绝不改变字节。它的第 7 节勾勒了进入调用的三条路线，第 11.2 节推迟了库 epilogue。本 RFC 取代这些草案。它是一份独立的文档，而不是 0001 的一节，原因有二。RFC 0001 已经评审，它的决定 D1 到 D7 建立在一个只有精确（exact）模式的契约之上。本 RFC 必须引入第一批字节*不*等于未融合组合（unfused composition）字节的契约，并且需要它自己的决定。RFC 0001 的每个决定都仍然成立。本 RFC 在 0001 某个阶段之上构建的地方，会说明是哪个阶段。
 
 ## 概要
 
@@ -88,10 +88,10 @@ X8：结果（2026-11-17）
 * **按设计实现的部分（3.2.1、4、5）：** 两种 hook（`value="out"` 在 kernel 的舍入之后，契约 (i)；`value="acc"` 作用于累加器，契约 (ii)）；`epilogues="exact"` 默认开启，`"accumulator"` 按 graph 或按作用域声明（Q2、Q3）；`R_acc` 在形成任何区域之前作用于 IR，所以 hook 没有接收的区域仍然运行 `U(R_acc(P))`；每个配对一个融合算子，以其内容命名；被规划器或检查拒绝的配对保持路线 (a)，原因写在报告中；导出时检查每个配对；门控激活用双累加器（Q9，`split=2`）；norm 只覆盖整行 tile（Q10，`block_n=`）；advisor 的路线及其契约和节省。
 * **ABI**（`tilefish._epilogue.ABI`）。kernel 每个 hook 有两个 stub 不列出的参数：`<NAME>`（一个 `tl.constexpr`：一个 jit 函数）和 `<NAME>_ARGS`（一个元组），并在每个输出 tile 本来要存储的地方调用 `tile = NAME(tile, rows, cols, row_mask, col_mask, NAME_ARGS)`：`tile` 是已舍入的 tile（`out`）或 f32 累加器（`acc`），或者是并排的 `S` 个 tile 组成的元组（`split=S`）；`rows` 是该 tile 在视为 `[R, L]` 的输出中的行，`cols` 是它在一个块内的列，在 Gluon kernel 中采用该 tile 布局的切片布局；它返回 kernel 要存储的内容（`acc` hook 的返回值由 kernel 转换为输出的类型，`tile.to(OUT.dtype.element_ty)`；split hook 返回一个 tile 或并排的 `S` 个 tile，输出的行宽为那么多个块）。Triton 3.5.1 接受 jit 函数作为 `constexpr`，也接受由张量和标量组成的元组作为嵌套调用的参数，已实测。
 * **实现过程中做出的决定：**
-  * **生成模块，而不是编译 spec 中的 hook。** spec、manifest 条目和两个 host 描述的是值，不是函数。因此，声明了 hook 的 extern 通过一个生成模块编译：`tf_<extern>__hooks(<the stub's parameters>)` 以关键字方式调用 kernel，传入恒等 hook；一个配对 `tf_<extern>_epi_<hash>(<the stub's parameters>, ep_*)` 则以区域的 hook 及其参数（作为元组）调用它。kernel 的主循环在两者中是同一份源码，内联进一个 IR，由这个 IR 标识二进制文件（TTIR，Gluon 则为 TTGIR）；模块的 sha256 计入声明 digest（`source_sha256`）。没有 hook 的 extern 保持原样。
+  * **生成模块，而不是编译规格中的 hook。** 规格、manifest 条目和两个 host 描述的是值，不是函数。因此，声明了 hook 的 extern 通过一个生成模块编译：`tf_<extern>__hooks(<the stub's parameters>)` 以关键字方式调用 kernel，传入恒等 hook；一个配对 `tf_<extern>_epi_<hash>(<the stub's parameters>, ep_*)` 则以区域的 hook 及其参数（作为元组）调用它。kernel 的主循环在两者中是同一份源码，内联进一个 IR，由这个 IR 标识二进制文件（TTIR，Gluon 则为 TTGIR）；模块的 sha256 计入声明 digest（`source_sha256`）。没有 hook 的 extern 保持原样。
   * **kernel 存储什么。** 当有其他东西读取结果时，存储结果本身（此时区域的每个输出都是旁路输出，由 hook 存储）；否则存储区域中第一个与结果形状相同的输出（对 `out` 还要求类型相同：kernel 在 hook 之前舍入到输出的类型），融合算子的输出取该类型（`acc`），对于 split hook，则取一个块的形状；否则照样存储结果，写入一个没有任何东西读取的缓冲区（仍然比路线 (a) 少一次启动和一次读取）。
   * **`U(R_acc(P))` 的累加器形式** 不是“带 f32 输出的 kernel”（一个写出其输出类型的 kernel 不必支持这种形式），而是 `<extern>__acc`：带一个 `acc` hook 的 extern，这个 hook 把 f32 tile 存入额外的一个输出，并原样返回它。对任何带 `acc` hook 的 kernel，这都是同一个 kernel、同一个累加器；它舍入后的结果就是该 extern 的结果。
-  * **类型。** 区域的类型是 graph 的类型，融合算子的类型是 extern 的类型：调用把某个 graph 维度绑定到 extern 的某个维度时，该 graph 维度被替换为 extern 的维度（静态维度替换为它的值），因此融合算子拥有 extern 的 spec（stem、bucket、`by_bucket` 配置、网格、整除性）；只属于区域的带 bucket 的维度会被拒绝（`epilogue-dims`）。
+  * **类型。** 区域的类型是 graph 的类型，融合算子的类型是 extern 的类型：调用把某个 graph 维度绑定到 extern 的某个维度时，该 graph 维度被替换为 extern 的维度（静态维度替换为它的值），因此融合算子拥有 extern 的规格（stem、bucket、`by_bucket` 配置、grid、整除性）；只属于区域的带 bucket 的维度会被拒绝（`epilogue-dims`）。
   * **Gluon。** hook 是一个 `@triton.jit` 函数，Gluon kernel 可以调用它（已实测）。逐元素 hook 的每个值都是完整的 tile，所以它的布局就是 tile 的布局；在那里 `-0.0` 标量写作 `tl.cast(bits)`（Gluon 的 `tl.full` 需要一个布局）。在 E1 中，Gluon kernel 的 hook 里的行区域会被拒绝（归约的结果是另一种布局）。
   * **整行。** 对一个 tile 的每一行做有序求和（`_tf_hsum_*`，`tilefish.lower` 的 note 22）：各条链通过对半拆分求得，lane（通道）之上的树通过 gather 求得，只计算有列的 lane（没有列的 lane 始终为 `+0.0`，即 revision 2 的填充给出的值，所以伙伴是这种 lane 的那一级树加的是 `+0.0`）：按行模板的顺序得到行模板的各项；`max` 与顺序无关；没有 `argmax`，没有不带 `order=` 的 sum（D2）。
   * **按行和按列的操作数**（bias、scale、norm 的权重）每个 tile 作为一个向量加载一次再广播（与逐元素模板在每个 lane 的偏移处读到的位相同），而不是逐元素 gather。
@@ -104,7 +104,7 @@ X8：结果（2026-11-17）
 * **示例**（`python/examples/epilogue_gemm.py`）：一个带两种 hook 的 Triton GEMM（TMA 描述符、`tl.dot`、分组顺序，epilogue 作用在列的 1、2 或 4 个子 tile 上，每个子 tile 调用一次 hook；sm_100/103 上为 `tcgen05.mma`，sm_120 上为 `mma.sync`，各自由 `tilefish.sass` 断言），它的双累加器形式，一个 Gluon `tcgen05` GEMM，以及一个作为隐式 GEMM 的一维卷积（行数为 `B * Lo`）。
 * **测量结果**（B300 MIG 切片，sm_103，30 个 SM；在 CUDA graph（CUDA 图）中 capture（捕获）的每次 plan 运行的微秒数，`profile_plan` 的 `plan_us`，200 次的截尾均值；hook 与路线 (a)（先 extern，再把区域作为一个 kernel，对结果做 `tilefish.barrier` 即得到这种形式）以及未融合组合对比）：
 
-  | 形态（bf16；`H = 1024`，`F = 4096`） | 行数 | hook（1 个步骤） | 路线 (a)（2 个步骤） | 未融合（步骤数） | hook，`"accumulator"` | (a) / hook |
+  | 形态（pattern；bf16；`H = 1024`，`F = 4096`） | 行数 | hook（1 个步骤） | 路线 (a)（2 个步骤） | 未融合（步骤数） | hook，`"accumulator"` | (a) / hook |
   |---|---|---|---|---|---|---|
   | GEMM + bias + GELU | 256 | 25.0 | 25.1 | 37.1 (6) | 26.7 | 1.00 |
   | | 2048 | 111.6 | 135.3 | 231.1 (6) | 117.2 | 1.21 |
@@ -116,7 +116,7 @@ X8：结果（2026-11-17）
   | | 2048 | 16.9 | 16.9 | 35.6 (11) | 16.9 | 1.00 |
   | conv1d（`k = 7`，512 到 512 通道，`L = 4096`）+ bias + 周期激活 | 4096 | 164.6 | 127.5 | 193.4 (10) | 167.6 | 0.77 |
 
-  这些 GEMM 是示例中的（`gemm_sm100`：8 个 warp，epilogue 作用在两个 64 列的子 tile 上；norm 用的是一个能看到整行的 128 x 256 tile；卷积 8 个 warp），它们既不是持久化的，也不是 warp 特化的：hook 的算术在主循环之后、在 kernel 自己的 warp 上、以 kernel 的占用率运行，不与任何东西重叠。所以，在 epilogue 轻而其操作数大的地方融合划算（2048 行时的 bias + GELU：1.21x；门控激活，其融合算子只存储一半的列：1.07 到 1.14x），在 GEMM 短的地方持平，在 epilogue 对 kernel 那几个 warp 来说太重的地方亏损（卷积上每个元素一个 `sin`：0.77x）。配置与融合一样重要：用 4 个 warp，或在一个 hook 中处理整个 128 列的 tile 时，hook 的寄存器溢出（`sin`：255 个寄存器和一个栈帧），同样的周期激活只有 0.30 到 0.45x；第一版通过对 MMA 布局的 tile 做 reshape 和拆分来实现的有序行求和，每个线程溢出 15 KB（0.04x），上面基于 gather 的求和消除了这个问题。拿到剩下的部分是 X8 的 kernel 工作（让 epilogue 与下一个 tile 的主循环重叠），而不是 hook 的工作。路线是声明的选择，从不根据耗时来决定（第 5 节）：advisor 报告每条路线会带来的节省。
+  这些 GEMM 是示例中的（`gemm_sm100`：8 个 warp，epilogue 作用在两个 64 列的子 tile 上；norm 用的是一个能看到整行的 128 x 256 tile；卷积 8 个 warp），它们既不是持久化的，也不是 warp 特化的：hook 的算术在主循环之后、在 kernel 自己的 warp 上、以 kernel 的 occupancy（占用率）运行，不与任何东西重叠。所以，在 epilogue 轻而其操作数大的地方融合划算（2048 行时的 bias + GELU：1.21x；门控激活，其融合算子只存储一半的列：1.07 到 1.14x），在 GEMM 短的地方持平，在 epilogue 对 kernel 那几个 warp 来说太重的地方亏损（卷积上每个元素一个 `sin`：0.77x）。配置与融合一样重要：用 4 个 warp，或在一个 hook 中处理整个 128 列的 tile 时，hook 的寄存器发生 spill（寄存器溢出；`sin`：255 个寄存器和一个栈帧），同样的周期激活只有 0.30 到 0.45x；第一版通过对 MMA 布局的 tile 做 reshape 和拆分来实现的有序行求和，每个线程 spill 了 15 KB（0.04x），上面基于 gather 的求和消除了这个问题。拿到剩下的部分是 X8 的 kernel 工作（让 epilogue 与下一个 tile 的主循环重叠），而不是 hook 的工作。路线是声明的选择，从不根据耗时来决定（第 5 节）：advisor 报告每条路线会带来的节省。
 
 * **测试：** `tests/test_epilogue.py`（无 GPU：声明及其拒绝、生成模块、每个形态在两种模式下的合并、hook 的代码与区域逐个算子对比、两个 graph 中的同一配对是同一个算子、`R_acc` 的 IR 输入与输出、作用域、每种拒绝及其原因、报告、边界、advisor 的路线）；`tests/test_gpu_epilogue.py`（每个形态在每个 bucket 上并通过 `verify_fusion` 与 `U(P)` 和 `U(R_acc(P))` 比较；每个有限 bf16 值作为一个 tile 经过各激活的 hook；GEMM 之后的 40 个随机区域，两种模式；Gluon GEMM；导出、replay（回放）和 capture；融合二进制文件的 MMA 序列与 extern 的相同；撒谎的 hook 被拒绝；参考）；Rust 和 C++ 门禁把这些形态作为 `fused_epi_*` plan 运行，既启动也 capture。除 Gluon 测试（sm_100、sm_103）外都与架构无关；sm_120 属于以后的门禁。
 * **尚未实现：** prologue；`R_acc` 下的库调用（E2 中也没有：见“E1 与 E2 结合”）；比一个 tile 更宽的行上的 norm（E4）；Gluon kernel 的 hook 中的行区域；用 `by_arch=` 声明的 extern 接收 hook；把 MMA 序列断言作为声明的 SASS 断言（目前由一个测试检查）；在真正的 Gluon 隐式 GEMM 卷积上做 X12。
@@ -143,7 +143,7 @@ X8 要回答的是：tilefish 自己的 GEMM 能否快到让融合进它变得�
 
 **kernel。** `c = a @ b`，bf16 或 f16 操作数，f32 累加器，`cublaslt.gemm` 的四种布局（`TN`、`NN`、`TT`、`NT`），E1 的 hook `ACC` 和 `EPILOGUE`，以及门控激活的双累加器（`split=2`）。
 
-* **sm_100 和 sm_103**（`gemm_sm100_kernel`，Gluon）。一个持久化网格（`tilefish.persistent()`，每个 SM 一个 program，分组的 tile 顺序），其各个分区运行在各自的 warp 上：
+* **sm_100 和 sm_103**（`gemm_sm100_kernel`，Gluon）。一个持久化 grid（`tilefish.persistent()`，每个 SM 一个 program，分组的 tile 顺序），其各个分区运行在各自的 warp 上：
   * 一个单 warp 的 TMA 生产者，填充一个最多 8 个共享内存 stage 的环，每个 stage 有一个 `ready` 和一个 `empty` mbarrier；
   * 一个单 warp 的 `tcgen05_mma` 发射者，把每个 tile 累加到两个张量内存缓冲区之一（`2 * split * BN <= 512` 列）；
   * epilogue 运行在 `PARTS` 个分区上，每个分区 `NW` 个 warp，默认是两个分区、每个八个 warp，每个分区排空一个缓冲区，同时发射者填充另一个。它以 32 列的子 tile 读取累加器（`tcgen05.ld 32x32b`），每个子 tile 调用一次 hook，并经由共享内存用 TMA 存储。子 tile 循环不展开，所以 hook 的代码在二进制文件中只有一份。
@@ -201,7 +201,7 @@ X8 要回答的是：tilefish 自己的 GEMM 能否快到让融合进它变得�
 * **每次启动的固定开销。** 在 `k = 64` 时，这个 GEMM 用时 2.95 us，cuBLASLt 用时 2.03 us，差距随 `k` 只缓慢增长。
   * probe（探针）显示，在生产者第一次加载之前约有 1.2 us：barrier 初始化、张量内存分配，以及各个分区的准备。
   * 在两个 GEMM 之间放一个空 kernel，两者的时间都不变，所以 cuBLASLt 并没有从重叠启动中获益。
-* **在 30 个 SM 上的量化。** 例如，2048 x 1024 可以分成 128 个 128 x 128 的 tile，即 4.3 轮，或 64 个 128 x 256 的 tile，即 2.1 轮。cuBLASLt 的 pin 使用 cluster（`cluster_shape_id` 3 和 5）。
+* **在 30 个 SM 上的量化。** 例如，2048 x 1024 可以分成 128 个 128 x 128 的 tile，即 4.3 轮，或 64 个 128 x 256 的 tile，即 2.1 轮。cuBLASLt 的 pin 使用 cluster（线程块簇；`cluster_shape_id` 3 和 5）。
 * **进入 SM 的字节。** 单 CTA 的 tile 每个步骤读取 `(BM + BN) * BK` 个操作数。双 CTA 的 tile，或向一个 cluster 多播，每个 CTA 读得更少，而 Triton 3.5.1 的 Gluon 两者都无法表达。
   * 在 tile 填满 SM 的地方（2048 和 8192 行，`N` 为 3072 或更大），kernel 的用时是 pin 的 0.9 到 1.1 倍。在那里发射者约 88% 的时间处于忙碌：它在三分之一的步骤中等待一个槽位。
   * 在 32 和 256 行时，启动开销和轮数占主导。
@@ -270,7 +270,7 @@ X8 要回答的是：tilefish 自己的 GEMM 能否快到让融合进它变得�
 ## 0. 背景：已有的东西
 
 * **library op 承诺一次舍入。** `cublaslt.gemm` 用 f32 累加器计算 `out = a @ b^T`，并一次舍入到输出类型。`cublaslt.gemm_bias` 在这次舍入之前以 f32 加上一个输出类型的 bias（`CUBLASLT_EPILOGUE_BIAS`，tilefish 目前唯一使用的 epilogue）。算法被 pin 住（它的 64 字节、cuBLASLt 版本和 SM 数）。pin 会对照 cuBLASLt 自己的编码进行审核，并在加载时由 `cublasLtMatmulAlgoCheck` 检查。它按 tilefish 或 torch 的方式选择，或者从另一个引擎导入（`AlgoTable`）。带 bias 的 GEMM 除非显式选择加入，否则不使用 split-K，因为测得带 bias epilogue 的 split-K 会舍入两次（`docs/numerics.md`，第 4 节）。`cudnn.conv_fwd` 没有 bias。它的引擎配置按 cuDNN 版本和 SM 数被 pin 住，并在加载时由 canary 检查（`docs/manifest-schema-3.md`，第 9.4 节）。
-* **plan 融合止于调用。** RFC 0001 的阶段 1 把 graph 体的算术融合进生成的区域。每个区域都与未融合组合 `U(P)` 逐字节一致，每次导出都会验证这一点（D6）。对 library op、extern 或 kernel 的调用是区域边界。GEMM 之后的算术按 0001 第 7 节的路线 (a) 运行：一个读取 GEMM 已存储、已舍入结果的生成 kernel。
+* **plan 融合止于调用。** RFC 0001 的阶段 1 把 graph 函数体的算术融合进生成的区域。每个区域都与未融合组合 `U(P)` 逐字节一致，每次导出都会验证这一点（D6）。对 library op、extern 或 kernel 的调用是区域边界。GEMM 之后的算术按 0001 第 7 节的路线 (a) 运行：一个读取 GEMM 已存储、已舍入结果的生成 kernel。
 * **移植中已经包含手工融合的计算 kernel。** 对手工融合引擎的移植会逐字节复现该引擎的 kernel。其中一些 kernel 是带融合激活 epilogue 的卷积，以 Gluon extern 的形式手写（sm_100 和 sm_103 上为 `tcgen05`，sm_120 上为 `mma.sync`），遵循原 kernel 的累加顺序及其 epilogue。对 tilefish 来说，这样的 epilogue 只是 extern 的一部分。下面的路线 (c) 把同样的事情变成规划器的一个功能。
 * **advisor 看到了这个缺口。** `tilefish-explain --advise` 把最后的阻碍项为 `epilogue-library` 或 `prologue-library` 的每个候选列为未来工作（`docs/advise.md`，第 4 节）。它把两个 norm 之间的每条残差流列为 `library-in-the-middle`。在三个移植模型上，它按测得的时间把这些候选排在最前。最大的单个形态是：
   * GEMM 后接 col2im、overlap-add 和周期激活：每个实例 0.1 到 1.2 ms，在短 bucket 和长 bucket 上都是如此；
@@ -286,7 +286,7 @@ X8 要回答的是：tilefish 自己的 GEMM 能否快到让融合进它变得�
 * **tile 局部** 表示 GEMM 的一个输出 tile（`BM` 行乘 `BN` 列）是否拥有其 epilogue 需要的一切。这决定了路线 (c) 的难度。
 * **库** 表示该形态是否存在库 epilogue。
 
-| 用例 | 形态（graph 体草图） | tile 局部？ | 库 | 说明 |
+| 用例 | 形态（graph 函数体草图） | tile 局部？ | 库 | 说明 |
 |---|---|---|---|---|
 | bias + 激活 | `act(y.to(f32) + b.to(f32)).to(bf16)`，其中 `act` 是 GELU（erf 或 tanh）、SiLU 或 ReLU | 是（一个按列的向量） | cuBLASLt `BIAS`、`RELU_BIAS`、`GELU_BIAS`（仅 tanh GELU）；卷积用 cuDNN 融合图 | 最常见的 epilogue |
 | 门控激活 | `g, u = gemm(x, w).split(F, -1)`；`(silu(g.to(f32)) * u.to(f32)).to(bf16)` | 否：第 `j` 列需要第 `F + j` 列 | 无 | 需要 `g` 的一个 tile 和 `u` 的对应 tile：每个 program 两个累加器，或者把权重的行交错排列 |
@@ -315,7 +315,7 @@ X8 要回答的是：tilefish 自己的 GEMM 能否快到让融合进它变得�
 * `acc_π` 是其 kernel 在最终转换之前持有的 f32 值；
 * `ρ_T` 是舍入到声明的输出类型 `T`。
 
-epilogue 是 graph 体的一个区域 `R`（RFC 0001），对区域的其他输入 `s`，有 `z = R(y, s)`。移植与其参考栈逐字节一致，原因有二。参考栈运行相同的 `π`（相同的 cuBLASLt 版本和一个导入的算法），所以写出相同的 `y`。而区域在 RFC 0001 的契约下复现了参考栈的 epilogue kernel。
+epilogue 是 graph 函数体的一个区域 `R`（RFC 0001），对区域的其他输入 `s`，有 `z = R(y, s)`。移植与其参考栈逐字节一致，原因有二。参考栈运行相同的 `π`（相同的 cuBLASLt 版本和一个导入的算法），所以写出相同的 `y`。而区域在 RFC 0001 的契约下复现了参考栈的 epilogue kernel。
 
 ### 2.2 融合的 epilogue 改变了什么
 
@@ -347,7 +347,7 @@ epilogue 是 graph 体的一个区域 `R`（RFC 0001），对区域的其他输�
 
 记号：
 
-* `P` 是 graph 体的声明程序（RFC 0001，第 5.1 节）；
+* `P` 是 graph 函数体的声明程序（RFC 0001，第 5.1 节）；
 * `U(P)` 是它的未融合组合：每个区域单独运行，每个中间值都以其声明的类型存储；
 * `F(P)` 是融合后的 plan。
 
@@ -598,7 +598,7 @@ with tilefish.fused(epilogues="accumulator"):                          # per reg
   * 形态按路线分组，这样报告能说明哪条路线解锁得最多。
   * 给出不同字节的路线永远不会被 advisor 或规划器根据耗时选择；advisor 测得的时间为声明提供参考。
 * **SASS 断言**（`tilefish.sass`）。带 hook 的二进制文件与任何构建一样被评判。生成的 GEMM 声明它们自己的断言（MMA kind、`no_tf32`、`no_spills`）。3.2.2 的 MMA 序列断言是新的。
-* **trace**（`trace/`）。hook 的生成源码带有 graph 体的行（区域的 `loc`），所以 `tilefish-explain annotate` 会把 epilogue 的指令归到写出它们的 graph 体行。kernel 内插桩（issue #5，第 2 节）可以对融合 kernel 的 epilogue 阶段计时。
+* **trace**（`trace/`）。hook 的生成源码带有 graph 函数体的行（区域的 `loc`），所以 `tilefish-explain annotate` 会把 epilogue 的指令归到写出它们的 graph 函数体行。kernel 内插桩（issue #5，第 2 节）可以对融合 kernel 的 epilogue 阶段计时。
 * **host 和 C ABI。** 路线 (c) 对两个 host 都没有要求：带指针的 kernel 步骤、TMA 描述符（`tensordesc`）和全局 scratch 都已经存在。路线 (b) 需要：
   * Python 中（`tilefish._cublaslt`、`_library`）和 crate 中（`ffi/cublaslt.rs`、`gemm.rs`、`library.rs`）的新库 impl；
   * canary；

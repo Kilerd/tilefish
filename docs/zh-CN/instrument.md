@@ -6,7 +6,7 @@
 
 1. **probe**（探针，第 1 节）：写在 `@tilefish.kernel` 函数体、`@triton.jit` 或 `@gluon.jit` kernel 中的 `tilefish.probe("name")`。生产构建会把它们编译成空；
 2. **插桩变体**（第 2 节）：`export(..., instrument=True)`，或 `jit` 中的 `tilefish.run(..., probes=tilefish.Probes())`，会把每个 kernel 连同它的 probe 以及 tilefish 自己的三个 probe（`@begin`、`@calib`、`@end`）一起构建，得到各自独立的二进制文件、manifest（清单）digest（摘要）和 plan（计划）digest；除非明确要求加载，host（宿主）会拒绝它们；
-3. **记录**（第 3 节）：每个到达 probe 的 warp 由其 lane 0 把 `%globaltimer`、`%clock`、probe 标识和 `%smid` 写进 probe 缓冲区中属于它的槽位，这个缓冲区由 host 通过 kernel 的 profile scratch 参数传入；
+3. **记录**（第 3 节）：每个到达 probe 的 warp 由其 lane（通道）0 把 `%globaltimer`、`%clock`、probe 标识和 `%smid` 写进 probe 缓冲区中属于它的槽位，这个缓冲区由 host 通过 kernel 的 profile scratch 参数传入；
 4. **host 端工具**（第 4 节）：Python 和 Rust 在一次启动、一次 plan 运行或一次被 capture（捕获）的 replay（回放）之后收集缓冲区；`tilefish-explain DIR --probes FILE` 按 warp 角色呈现各阶段及其耗时和分布，按 SM（流式多处理器）、CTA（线程块）和角色呈现时间线，并生成 Chrome trace（Perfetto），附上每个 probe 的源码行。
 
 代码在 `tilefish._probe`（probe、PTX 改写、缓冲区）、`tilefish._probes`（`Probes`、`ProbeTrace`、各个视图），以及 crate 中的 `crates/tilefish/src/probes.rs`。第 5 节说明为什么不用 Triton 的 Proton，第 6 节说明它的开销，第 7 节说明它的限制。
@@ -57,11 +57,11 @@ runtime.export(block, "build/inst", instrument=tilefish.instrument(capacity=1024
 rec = tilefish.Probes(tilefish.instrument(capacity=512)); tilefish.run(op, *args, probes=rec)      # jit: built in memory
 ```
 
-`instrument=True` 就是 `tilefish.instrument()`：`capacity` 是每个 warp 每次启动的记录数（默认 256），`ops` 是要插桩的算子（默认全部；预编译 PTX 和 cubin 的 extern 以及 library op（库算子）从不插桩）。每个二进制文件的构建：
+`instrument=True` 就是 `tilefish.instrument()`：`capacity` 是每个 warp 每次启动的记录数（默认 256），`ops` 是要插桩的算子（默认全部；预构建 PTX 和 cubin 的 extern 以及 library op（库算子）从不插桩）。每个二进制文件的构建：
 
 * 在打开 probe 的情况下运行前端，因此 IR 中包含它们（每个都是一条内联汇编语句），其 digest 也是这份 IR 的；
 * 在 Triton 的 `ptx` 和 `cubin` 阶段之间改写入口函数的 PTX（通过包装 `CUDABackend.add_stages` 实现，只在构建插桩变体的线程中生效）：先是 probe 用到的寄存器和该 warp 在缓冲区中的槽位，然后是 `@begin`；在每个 CTA 的 warp 0 中，用同样的指令记录两次 `@calib`；在每条 `ret` 之前记录 `@end`，连同该 warp 的记录数（带谓词的 `ret` 会以分支绕过它）；
-* 每次都重新编译：插桩变体从不读写构建缓存，所以插桩二进制文件永远不会被交给生产构建，反之亦然。TF32 防护和收缩检查会判定它；声明中的 SASS 断言不会（它们针对的是生产二进制文件：probe 会多用几个寄存器和几条指令）。
+* 每次都重新编译：插桩变体从不读写构建缓存，所以插桩二进制文件永远不会被交给生产构建，反之亦然。TF32 防护和收缩（contraction）检查会判定它；声明中的 SASS 断言不会（它们针对的是生产二进制文件：probe 会多用几个寄存器和几条指令）。
 
 **有自己的键和 digest。** 它的条目带有 `instrument`（manifest schema（模式）3 第 4.8 节：记录格式、容量和 kernel 的 probe 表：id、名称，以及每个位置的模块相对行号、所在分区和 jit 函数）；这些条目的二进制文件、`sha256`、`sha256_code` 和 `source_digest`（对含 probe 的 kernel）都是插桩变体自己的，所以插桩变体的 manifest digest 以及每个 plan 和 plan set（plan 集）的 digest 也都是它自己的。声明 digest 和 ABI 与生产条目相同：probe 缓冲区就是每个 Triton kernel 本来就有的 profile scratch 参数（它两个 scratch 槽中的第二个，在生产启动中为空）。
 
@@ -74,7 +74,7 @@ rec = tilefish.Probes(tilefish.instrument(capacity=512)); tilefish.run(op, *args
 
 ## 3. probe 缓冲区与记录
 
-一次启动的缓冲区为每个 CTA 的每个 warp 提供一个槽位，共 `ctas * warps * (16 + 16 * capacity)` 字节，16 字节对齐；其中 `ctas` 是实际启动的 CUDA grid（cluster 中的 CTA 都计入，持久化 grid 按裁剪到设备后的大小计），`warps` 是 block 的 warp 数（warp 特化 kernel 取 `total_num_warps`）。线性索引为 `c = x + y * nx + z * nx * ny` 的 CTA 中 warp `w` 的槽位位于 `(c * warps + w) * (16 + 16 * capacity)`：
+一次启动的缓冲区为每个 CTA 的每个 warp 提供一个槽位，共 `ctas * warps * (16 + 16 * capacity)` 字节，16 字节对齐；其中 `ctas` 是实际启动的 CUDA grid（cluster（线程块簇）中的 CTA 都计入，持久化 grid 按裁剪到设备后的大小计），`warps` 是 block 的 warp 数（warp 特化 kernel 取 `total_num_warps`）。线性索引为 `c = x + y * nx + z * nx * ny` 的 CTA 中 warp `w` 的槽位位于 `(c * warps + w) * (16 + 16 * capacity)`：
 
 | 槽内偏移 | 类型 | 内容 |
 |---|---|---|
@@ -171,7 +171,7 @@ launch 0: ws_scale_p on sm_103, grid (4, 1, 1), block (256, 1, 1)
 
 Triton 3.5.1 带有 Proton 的 kernel 内插桩（`triton.profiler.language.enter_scope` / `exit_scope`、`proton.start(backend="instrumentation")`）。在编写本功能之前，已在同样的 kernel 上评估过它：
 
-* 它把记录保存在 **shared memory** 中，在每个 CTA 结束时再拷出：普通循环 kernel 多用了 8 KB shared memory，`ws_kernels` 中的 tcgen05 矩阵乘从 131 260 字节增加到 196 800 字节（缓冲区占满 kernel 用剩的 SM 容量），这会改变 occupancy，对接近上限的 kernel 会失败；由线程 0 完成的拷出会拉长每个 CTA；
+* 它把记录保存在 **共享内存** 中，在每个 CTA 结束时再拷出：普通循环 kernel 多用了 8 KB 共享内存，`ws_kernels` 中的 tcgen05 矩阵乘从 131 260 字节增加到 196 800 字节（缓冲区占满 kernel 用剩的 SM 容量），这会改变 occupancy（占用率），对接近上限的 kernel 会失败；由线程 0 完成的拷出会拉长每个 CTA；
 * 它的记录**只有 SM 的时钟**（43 位），没有 `%globaltimer`：不同 SM 上的 CTA 无法放到同一条时间轴上（它的 Chrome trace 让每个 CTA 都从 0 开始，并假定 1 GHz）；
 * 它是**进程级状态**（前端读取的全局标志 `CUDABackend.instrumentation`、被打补丁的 `JITFunction.run`），而 tilefish 的构建有理由拒绝这种状态（`_refuse_unidentified`：二进制文件将不是从标识它的那份 IR 编译出来的），并且 Triton kernel 默认关闭（只支持 Gluon）；
 * 它的缓冲区格式是 Triton 自己的，由 `libproton` 中的 C++ 读取：Rust host 需要为每个 Triton 版本移植一份；
@@ -191,7 +191,7 @@ Triton 3.5.1 带有 Proton 的 kernel 内插桩（`triton.profiler.language.ente
 | `ws_matmul_p`（tcgen05，512 x 512 x 8192 f16） | 28.8 us | 30.8 us（+7%） | 259 | 58 个周期 |
 
 * **一个 probe** 大约是十条 SASS 指令（读 `%globaltimer` 和 `%clock` 的 `CS2R`、读 `%smid` 的 `S2R`、地址计算、从 lane 0 发出的带谓词 `STG.128`、计数），让一个 warp 付出 45 到 80 个周期的延迟（它的存储要等特殊寄存器）；在 warp 反正要等待的地方（在 `mbarrier` 后面），开销更小，这就是生产者和消费者 kernel 没有变慢的原因。短 CTA 要承担固定部分的开销（槽位、`@begin`、`@end` 和计数；`@calib` 只在 warp 0 中）。
-* **资源**：不用 shared memory，没有栈帧；寄存器：`scale_add_p` 从 26 个增加到 30 个，其他不变（warp 特化 kernel 已经处于其 `maxnreg`）；代码：多出约五分之一（`ws_scale_p` 的 cubin 从 28 040 字节增加到 35 688 字节）。
+* **资源**：不用共享内存，没有栈帧；寄存器：`scale_add_p` 从 26 个增加到 30 个，其他不变（warp 特化 kernel 已经处于其 `maxnreg`）；代码：多出约五分之一（`ws_scale_p` 的 cubin 从 28 040 字节增加到 35 688 字节）。
 * **内存**：缓冲区，每个 warp `16 + 16 * capacity` 字节（默认 256 时为 4.1 KB）。
 
 ## 7. 限制
@@ -201,7 +201,7 @@ Triton 3.5.1 带有 Proton 的 kernel 内插桩（`triton.profiler.language.ente
 * 由每个 warp 的 **lane 0** 记录：位于 lane 0 不走的路径上的 probe 不会被记录；没有到达 `ret` 的 warp（trap）不写计数，所以它的记录不会被读取。每条记录都带有 `%smid`（被抢占的 CTA 可能会迁移）。
 * **Triton（非 Gluon）kernel**：编译器可能移动或复制 probe 周围的代码（软件流水线、它对 `tl.range(..., warp_specialize=True)` 循环自行做的 warp 特化），而且它生成的分区没有角色（前端 IR 中没有）：只能按 id 区分 warp。
 * **`noinline` jit 函数中的 probe** 会被拒绝（它要记录到 kernel 入口函数的寄存器中）。
-* **预编译 PTX 或 cubin 的 extern 以及 library op**（cuBLASLt、cuDNN）不插桩：这类 plan 步骤不记录任何内容。
+* **预构建 PTX 或 cubin 的 extern 以及 library op**（cuBLASLt、cuDNN）不插桩：这类 plan 步骤不记录任何内容。
 * **容量**：一个 warp 保留它的前 `capacity` 条记录；summary 会说明丢弃了多少条。
 
 ## 8. 如何测试

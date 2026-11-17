@@ -4,7 +4,7 @@
 
 一门面向 GPU 推理的类型化张量语言。每个张量的形状、dtype、布局和量化格式都写在它的类型里，算子来自一个类型化的算子库，一个模型只需构建一次，得到 GPU 二进制文件和一份 manifest（清单）。轻量的 Python、C++ 和 Rust host（宿主）由同一套签名生成。
 
-**状态：早期预览（PyPI 上为 0.0.13，crates.io 上为 0.0.11；C++ host 从本仓库构建）。** tilefish 为这些 GPU kernel（内核）赋予类型：用 Triton、Gluon、CuTe DSL 或 PTX 编写的 kernel，已 pin（固定）的 cuBLASLt 和 cuDNN 调用，以及它自己下沉（lowering）生成的 kernel。它把一个模型的 graph（计算图）构建成基于同一个 arena（内存池）的 launch plan（启动计划），并在 Python、Rust 和 C++ 中运行同一份已 pin 的产物。tilefish 是什么、不是什么，以及今后如何添加功能，见 [`docs/scope.md`](docs/zh-CN/scope.md)；其他文档列在 [`docs/README.md`](docs/zh-CN/README.md) 中。
+**状态：早期预览（PyPI 上为 0.0.13，crates.io 上为 0.0.11；C++ host 从本仓库构建）。** tilefish 为这些 GPU kernel（核函数）赋予类型：用 Triton、Gluon、CuTe DSL 或 PTX 编写的 kernel，已 pin（固定）的 cuBLASLt 和 cuDNN 调用，以及它自己下沉（lowering）生成的 kernel。它把一个模型的 graph（计算图）构建成基于同一个 arena（内存池）的 launch plan（启动计划），并在 Python、Rust 和 C++ 中运行同一份已 pin 的产物。tilefish 是什么、不是什么，以及今后如何添加功能，见 [`docs/scope.md`](docs/zh-CN/scope.md)；其他文档列在 [`docs/README.md`](docs/zh-CN/README.md) 中。
 
 ## 为什么
 
@@ -12,7 +12,7 @@
 
 - 形状、dtype、对齐和别名规则散落在一段 docstring、几个 `assert` 和 C ABI 上方的一段注释里；
 - 块缩放的权重格式（MXFP8、MXFP4、NVFP4）用文字描述，连同它的缩放因子在各个架构上的字节布局；
-- 同一个 kernel 被手工从 Triton 移植到 CUDA C++，再移植到 Rust，一致性测试事后去追最后一个 ULP（FMA（乘加融合）收缩、flush-to-zero、归约顺序）；
+- 同一个 kernel 被手工从 Triton 移植到 CUDA C++，再移植到 Rust，一致性测试事后去追最后一个 ULP（FMA（乘加融合）收缩（contraction）、flush-to-zero、归约顺序）；
 - 在哪块 GPU 上、对哪个 `(M, N, K)` 运行哪个实现，是某人曾经测过一次的一张表。
 
 tilefish 把这些全部移进类型里，让编译器可以检查它们、生成它们并对它们进行推理。
@@ -75,9 +75,9 @@ def mlp(x: Tensor[M, H, bf16], w_gu: Tensor[2 * F, H, mxfp8], w_d: Tensor[H, F, 
 ## 工作原理
 
 1. **声明。** 类型（`Dim`、`Tensor`、`BlockScaled`、`DevScalar`、视图）和四种声明：`@tilefish.kernel`（一段由 tilefish 自己下沉到 Triton 的函数体）、`@tilefish.extern`（一个被赋予类型的 Triton、Gluon 或 CuTe DSL kernel，或预构建的 PTX 或 cubin）、`@tilefish.library`（一个已 pin 的 cuBLASLt GEMM（通用矩阵乘）或 cuDNN 卷积）和 `@tilefish.graph`（基于它们的一个模型步骤）。
-2. **一次构建。** `tilefish.runtime.export` 追踪并检查 graph，预先编译每个 kernel，pin 住每个库算法，并写出 cubin、`manifest.json` 和 launch plan（`plan.json`：一个步骤在同一个 arena 上的每一次启动）。manifest 的 digest（摘要）覆盖每个二进制文件和每个 pin，plan 的 digest 覆盖 plan 及其 manifest；host pin 住其中一个。一次导出在任意目录下都可复现，在工具链和 GPU 架构相同的另一台机器上也可复现。
+2. **一次构建。** `tilefish.runtime.export` 追踪并检查 graph，预先编译每个 kernel，pin 住每个库算法，并写出 cubin、`manifest.json` 和 launch plan（`plan.json`：一个步骤在同一个 arena 上的每一次启动）。manifest 的 digest（摘要）覆盖每个二进制文件和每个 pin，plan（计划）的 digest 覆盖 plan 及其 manifest；host pin 住其中一个。一次导出在任意目录下都可复现，在工具链和 GPU 架构相同的另一台机器上也可复现。
 3. **运行同一份产物。** Python（`replay`）、Rust crate 和 C/C++ 库加载这个目录，按 pin 校验它，并在启动前检查每一个前置条件。`jit` 运行在内存中构建出的同一份机器码，`reference` 则在 torch 中运行同样的函数体。
-4. **看清内部。** `tilefish-explain` 把每条 SASS 指令映射到它的源代码行，SASS 断言在每次构建时都会检查；probe（探针）为 kernel 内部的各个阶段计时；`tilefish-explain --advise` 为 plan 中可以合成一个 kernel 的步骤排序。
+4. **看清内部。** `tilefish-explain` 把每条 SASS 指令映射到它的源码行，SASS 断言在每次构建时都会检查；probe（探针）为 kernel 内部的各个阶段计时；`tilefish-explain --advise` 为 plan 中可以合成一个 kernel 的步骤排序。
 
 各个阶段的细节见[指南](docs/zh-CN/README.md#指南)。
 
@@ -144,7 +144,7 @@ run.launch(stream, {{"x", xt}, {"out0", yt}}, {{"n", 64}});
 | 作为 extern（外部 kernel）的 CuTe DSL kernel | [`docs/cute.md`](docs/zh-CN/cute.md) |
 | 下沉生成的 kernel：掩码、索引、`argmax`、gather 与 scatter、整数类型转换、IEEE 数学函数、有序求和、广播、`contiguous`、`im2col`、`col2im1d` | [`docs/guide/lowering.md`](docs/zh-CN/guide/lowering.md) |
 | launch plan：同一个 arena、CUDA graph（CUDA 图）、copy 和 memset 步骤、只绑定一次的权重、plan set（plan 集）、shared arena（共享内存池）、carried buffer（携带缓冲区）、调试 tap（观测点） | [`docs/guide/plans.md`](docs/zh-CN/guide/plans.md) |
-| graph 函数体中算术运算的融合、extern 上的 epilogue 钩子、cuBLASLt epilogue | [`docs/guide/fusion.md`](docs/zh-CN/guide/fusion.md) |
+| graph 函数体中算术运算的融合、extern 上的 epilogue hook（钩子）、cuBLASLt epilogue | [`docs/guide/fusion.md`](docs/zh-CN/guide/fusion.md) |
 | 舍入点、精确（exact）重写与改变数值语义的重写、`num_warps` 与 FMA 收缩 | [`docs/guide/rewrites.md`](docs/zh-CN/guide/rewrites.md) |
 | CUDA 数学函数防护，以及 CUDA 或 torch 变更后需要重新检查的内容 | [`docs/numerics.md`](docs/zh-CN/numerics.md) |
 | trace（追踪记录）、`tilefish-explain` 与 SASS 断言 | [`docs/guide/sass.md`](docs/zh-CN/guide/sass.md)、[`docs/explain.md`](docs/zh-CN/explain.md) |

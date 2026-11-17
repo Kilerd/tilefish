@@ -36,10 +36,10 @@ cpp.emit_plan("build/", "runner.hpp", pin=plan_digest)
 host 拥有什么，以及边界上的行为：
 
 - **内存** 是一块区域（`tilefish_tensor`、`tilefish::Region`）：由 host 担保的一个地址、一个长度和一个设备，与 Rust 中的 `DevicePtr::from_raw` 一样；host 要让它一直保持分配，直到使用它的启动完成（对于被 capture（捕获）的 plan，直到该 plan 被销毁），并负责它与自己其他 stream 之间的排序。其余一切都在任何工作入队之前检查，包括张量是否放得进其区域。
-- **上下文和 stream** 属于 host。上下文 handle 要么是设备的 primary context（会被 retain 和 release），要么是 host 借出的上下文（`Context::borrow`，例如一个 green context），tilefish 从不销毁后者。stream 是一个 `CUstream`，与 `cudaStream_t` 是同一类型。每次调用都让线程的当前上下文保持调用前的状态。
-- **CUDA graph（CUDA 图）。** 在 host 正在 capture 的 stream 上的单次启动，会像任何 kernel（内核）节点一样被 capture。plan 用 `capture` 来 capture（在正在 capture 的 stream 上启动 plan 会被拒绝）：被 capture 的 plan 拥有自己的图，并负责它的 arena（内存池）与其他每次运行之间的排序。
+- **context 和 stream** 属于 host。context 句柄要么是设备的 primary context（会被 retain 和 release），要么是 host 借出的 context（`Context::borrow`，例如一个 green context），tilefish 从不销毁后者。stream 是一个 `CUstream`，与 `cudaStream_t` 是同一类型。每次调用都让线程的当前 context 保持调用前的状态。
+- **CUDA graph（CUDA 图）。** 在 host 正在 capture 的 stream 上的单次启动，会像任何 kernel（核函数）节点一样被 capture。plan 用 `capture` 来 capture（在正在 capture 的 stream 上启动 plan 会被拒绝）：被 capture 的 plan 拥有自己的图，并负责它的 arena（内存池）与其他每次运行之间的排序。
 - **错误** 是每次调用返回的一个状态（`TILEFISH_ERROR_*`：crate 的每种错误各一个，另有无效参数、没有驱动和捕获到的 panic），以及线程的最后一个错误（`tilefish_last_error`：消息、前置条件、`CUresult`）；`tilefish.hpp` 把它们作为 `tilefish::Error` 抛出。不启用异常构建的程序使用 `tilefish.h`。
-- **线程。** 每个 handle 都可以同时被多个线程使用，被 capture 的 plan 除外（同一时间只能一个线程）。同时在多个 stream 上运行需要各用一个 arena。
+- **线程。** 每个句柄都可以同时被多个线程使用，被 capture 的 plan 除外（同一时间只能一个线程）。同时在多个 stream 上运行需要各用一个 arena。
 - **cuBLASLt 和 cuDNN** 在运行时按名字打开（`LD_LIBRARY_PATH`，或 host 先行加载的一份副本），与 Rust 中一样，用其他版本做出的 pin 在加载时会被拒绝。
 - **版本。** `tilefish_abi_version()` 以及头文件中的 `TILEFISH_ABI_MAJOR` 和 `TILEFISH_ABI_MINOR`：次版本只会新增函数和值，`tilefish.hpp` 会拒绝主版本不同的库。
 

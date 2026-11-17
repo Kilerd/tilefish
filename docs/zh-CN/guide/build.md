@@ -16,13 +16,13 @@ k = tilefish.aot.build(spec, arch="sm_100")        # one cubin
 ```
 
 1. 把 graph（计算图）追踪成类型化的 IR 并检查：形状、dtype、整除性、别名，以及每个算子支持哪些架构。
-2. 运行重写规则（[`rewrites.md`](rewrites.md)），确定最终的 kernel（内核）列表。
+2. 运行重写规则（[`rewrites.md`](rewrites.md)），确定最终的 kernel（核函数）列表。
 3. 把每个 `@kernel` 下沉（lowering）为 Triton 源码，写到磁盘上供审阅。
 4. 从类型推导出 Triton 的编译输入：指针的 dtype 和 16 字节对齐，由静态维度得到的 `constexpr` 值，由 `divisible_by` 得到的整除性提示，以及分桶维度每个 bucket（分桶）一个二进制文件。提前编译，每个架构一个 cubin。
 5. 写出 manifest（清单）：符号、按顺序排列的参数 ABI、grid 规则、block 大小、共享内存、启动属性、工具链版本，以及机器码的 digest（摘要）。
 6. 由 `tilefish.hosts` 从 manifest 和类型生成各个 host（宿主）：类型化的启动器和 plan（计划）运行器，C++ 的一个头文件和 Rust crate 的一个模块（Python 自己启动 manifest，即 `replay`）。每个用来选中某个二进制文件的前置条件（对齐、整除性、静态大小）都会变成生成的启动器中的一项检查，所以任何 host 都不能在一个二进制文件编译时未曾假定的条件下运行它。
 
-library operator（库算子）在同一种 manifest 条目背后放的是另一种代码对象：一个已 pin（固定）的 cuBLASLt 算法，连同它的 workspace 大小一起记录，并原样回放；或者一个已 pin 的 cuDNN 卷积（[`operators.md`](operators.md)）。CuTe DSL 的提前编译导出是一个预构建 cubin 的 extern（外部 kernel；[`../cute.md`](../cute.md)）。
+library operator（库算子）在同一种 manifest 条目背后放的是另一种代码对象：一个已 pin（固定）的 cuBLASLt 算法，连同它的 workspace（工作区）大小一起记录，并原样回放；或者一个已 pin 的 cuDNN 卷积（[`operators.md`](operators.md)）。CuTe DSL 的提前编译导出是一个预构建 cubin 的 extern（外部 kernel；[`../cute.md`](../cute.md)）。
 
 Python 这边有三种模式：
 
