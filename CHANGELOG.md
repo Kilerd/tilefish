@@ -7,6 +7,24 @@ each section names the release that added it.
 
 ## Unreleased
 
+### Locked exports: an export without a GPU (`docs/guide/locked-export.md`)
+
+- **`tilefish.runtime.write_lock(directory, path)`** writes the lock of an export directory, made on a GPU of the target device: the facts the
+  export learnt from the device (each library entry's cuBLASLt algorithm or cuDNN pin with its workspace limit, a `cublaslt.matmul`'s contract and
+  verification, every canary digest, the cuBLASLt and cuDNN versions, the architecture and the SM count, the verification of each graph's fused
+  regions), the Triton and ptxas versions, the digests to pin (manifest, plans, set) and the sha256 of every file, as canonical JSON
+  (`tilefish.lock.v1`). It reads files only, and refuses a directory that is not one export of one device (or that has a CuTe DSL kernel).
+- **`tilefish.runtime.export(..., lock=path)`** is a locked export: no GPU, no CUDA driver, no torch, no heuristic, nothing run on a device even when
+  one is there. Every binary is built for the lock's architecture, every device fact comes from the lock, each binary is held to the lock's sha256
+  before anything is written and every file of the directory after; the output is the GPU export's byte for byte (the plan set of
+  `python/tests/locked_graphs.py`, a step of every kind of callee: 14 files, 0 differences between a B300 MIG slice and a CPU-only machine). A pin,
+  a region or a binary the lock does not have, another tilefish, Triton or ptxas, another architecture or a file of other bytes raises the new
+  `tilefish.TilefishLockError`, naming the first difference and what to do (re-lock on a GPU): there is no fallback. A CuTe DSL kernel, compiled and
+  captured on a GPU, is refused.
+- The manifest, the plans and every digest of an export are unchanged, and so are the readers: a host verifies pins, versions, the SM count and
+  canaries at the load as before (the guide page says what is checked where). No crate change.
+- `python/tests/rust_gate.py prepare --locked DIR --lock FILE` runs the gate's hosts (Python, Rust, C++) on a locked export made elsewhere.
+
 ### Documentation
 
 - **The README is an overview** (about 200 lines): what tilefish is, an example, how it works, the install, a quick start for each host, the

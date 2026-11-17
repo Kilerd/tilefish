@@ -240,3 +240,7 @@ data with a large mean has tiny outputs), so a bf16 output is bounded by half a
 bf16 step of the largest reference value and a fraction of elements that may
 differ, the f32 softmax by an absolute error of 5e-7, the gelu by 3e-5. An
 experiment that passes in `replay` is, kernel for kernel, what production runs.
+
+**An export without a GPU.** A cubin needs no device (Triton compiles ahead of time for an architecture), but a pinned library call and the
+verification of fused regions do. `tilefish.runtime.write_lock(directory, path)` records what an export on a GPU learnt from its device, and
+`export(..., lock=path)` writes the same files byte for byte on a machine without one, held to the lock's hashes ([`locked-export.md`](locked-export.md)).

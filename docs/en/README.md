@@ -22,6 +22,8 @@ The reference of each stage, from a declaration to a launch from a host:
 * [`guide/plans.md`](guide/plans.md): launch plans: a graph as a static list of launches over one arena, CUDA graphs, an `Out` written over its
   input, copy and memset steps, returned views, named outputs, inputs and weights, plan sets, an arena shared by the plans of a set, carried
   buffers, debug taps and one step alone.
+* [`guide/locked-export.md`](guide/locked-export.md): locked exports: a lock file made once on a GPU of the target device, and an export from it on a
+  machine without a GPU (CI, an image build) that writes the same files byte for byte; what a device contributes, the lock's format, what is checked where.
 * [`guide/fusion.md`](guide/fusion.md): fusion of the arithmetic in a graph body, its modes, epilogue hooks on externs and cuBLASLt epilogues.
 * [`guide/rewrites.md`](guide/rewrites.md): rewrites that know about rounding: exact and numerics-changing rules, `num_warps` and FMA contraction.
 * [`guide/sass.md`](guide/sass.md): SASS explained and asserted: traces, `tilefish-explain`, SASS assertions, the advisor and probes in short.

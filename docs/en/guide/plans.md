@@ -76,6 +76,8 @@ parameter by its shape, as before (`weight` when it mentions no dimension: every
 *plan set*: one manifest (each binary once, whichever plans launch it), `<graph>.plan.json` per graph and `plans.json`, an index whose digest pins every
 plan, their manifest and every binary. A replay takes `plan="build/"` and the set's digest or the plan's; Rust `PlanSet::load(dir, pin)` and
 `set.plan("g2")` (the plans share the manifest and its loaded modules). `docs/en/plan-schema-1.md`, section 15, says why a set and not a repeated step range.
+A set (or a plan, or a manifest) is exported on a machine without a GPU, byte for byte, from a lock made on a GPU of the target device:
+`export([g1, g2, ...], "build/", lock="sm_103.lock.json")` ([`locked-export.md`](locked-export.md)).
 
 **An arena shared by the plans of a set.** A host that runs plans of a set one at a time (a request's stage A, then B, then C) can give them one
 arena: `s = tilefish.runtime.share_arena([a, b, c], mode="replay", plan="build/", pin=planset.digest)`, then `s.run(a, x)`, `s.capture(b, ...)`,
