@@ -209,6 +209,29 @@ def test_a_dual_accumulator_hook_holds_both_chunks_and_stores_one():
     assert len(h.views) == 1  # the split of the result: in the unit, no node of the plan's graph
 
 
+def test_under_r_acc_a_dual_accumulator_hook_stores_one_chunk_too():
+    # R_acc replaces the widenings of the split's chunks by the chunks of the accumulator; the split of the rounded result that only they read
+    # goes with them, so nothing keeps the result live and the pair stores the hook's one chunk, as in the exact mode (it stored [M, 2F] as well)
+    for mode in ("fused", "acc"):
+        (h,) = _fusion.fused(G["swiglu"][mode]).hooked
+        assert not h.result_read and h.main is not None, mode
+        c = next(p for p in h.op.signature.params if p.name == "c")
+        assert [str(d) for d in c.type.shape] == ["M", "256"], mode
+    f = _fusion.fused(G["swiglu"]["acc"])
+    assert [n.op for n in f.program].count("split") == 1 and f.program[0].op == "epi_gemm_dual__acc"  # the accumulator's split only
+    assert f.hooked[0].contract == "accumulator" and len(steps(G["swiglu"]["acc"])) == 1
+    # a chunk that something reads in its own type keeps the split and the result stored (the hook reads the accumulator's chunks)
+    dual = [("x", Tensor[T, H, bf16]), ("w", Tensor[2 * F, H, bf16])]
+
+    def returned(x, w):
+        g, u = DUAL(x, w).split(F, axis=-1)
+        return (tilefish.silu(g.to(f32)) * u.to(f32)).to(bf16), g
+
+    _, f, refused, s = _outcome(returned, "t_acc_chunk_returned", dual, tilefish.fusion(epilogues="accumulator"))
+    assert [n.op for n in f.program].count("split") == 2 and len(f.hooked) == 1 and f.hooked[0].result_read and not refused
+    assert s[0].startswith("epi_gemm_dual_epi_") and s[1].startswith("contiguous_")
+
+
 def test_a_norm_fuses_where_a_tile_holds_whole_rows_and_its_residual_is_a_side_output():
     f = _fusion.fused(G["add_norm"]["fused"])
     (h,) = f.hooked

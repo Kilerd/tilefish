@@ -448,6 +448,8 @@ class _Pass:
         replace: "dict[Value, Value]" = {}
         insert: "dict[int, list[Node]]" = {}  # after node k: the nodes the rewrite adds
         swap: "dict[int, Node]" = {}
+        drop: "set[int]" = set()  # the splits of a result that only the replaced widenings read, and those widenings
+        escaping = {*self.source.outputs, *self.source.finals.values()}
         for k, n in enumerate(nodes):
             h = hook_of(n.callee, "acc") if n.attrs.get("kind") == "extern" and n.callee is not None else None
             if h is None:
@@ -499,6 +501,14 @@ class _Pass:
                     views[m] = outs32
                 replace[nodes[w].outputs[0]] = views[m][j]
                 removed.append(w)
+            # a split of y whose chunks only the replaced widenings read goes with them: left in the program, the view would read y for nothing
+            # and keep the rounded result live, so a hook that takes the region would still store it (the dual GEMM's pair writing [M, 2F] as
+            # well as the hook's output); y itself is still written by the call, for whatever else reads it
+            for m in sorted(views):
+                readers = {c for o in nodes[m].outputs for c in consumers.get(o, [])}
+                if readers <= set(removed) and not any(o in escaping for o in nodes[m].outputs):
+                    drop.add(m)
+                    drop.update(readers)
             self.rewrites.append({
                 "kind": "accumulator", "node": origin[k], "op": n.op, "value": y.ref, "dtype": str(y.type.dtype),
                 "widenings": sorted(origin[w] for w in removed),
@@ -508,6 +518,8 @@ class _Pass:
         out_nodes: "list[Node]" = []
         out_origin: "list[int]" = []
         for k, (n, o) in enumerate(zip(nodes, origin)):
+            if k in drop:
+                continue
             n = swap.get(k, n)
             if any(isinstance(i, Value) and i in replace for i in n.inputs):
                 m = Node(n.op, [replace.get(i, i) if isinstance(i, Value) else i for i in n.inputs], n.attrs, n.outputs)
