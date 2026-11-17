@@ -1,5 +1,7 @@
 # SASS: explained and asserted
 
+**English** | [简体中文](../zh-CN/guide/sass.md)
+
 Every kernel goes DSL / Triton / Gluon → TTIR → TTGIR → LLVM IR → PTX → ptxas → SASS. tilefish keeps every level of an export on request, maps each SASS
 instruction back to the line and the op that produced it, and checks declared facts about the SASS at every build (`docs/explain.md`).
 

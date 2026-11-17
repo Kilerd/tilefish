@@ -1,5 +1,7 @@
 # Rewrites that know about rounding
 
+**English** | [简体中文](../zh-CN/guide/rewrites.md)
+
 Types make fusion legality mechanical: elementwise chains into GEMM
 epilogues, a norm into the preceding residual add, quantization into the next
 GEMM's prologue, permutations into strides instead of copy kernels, in-place

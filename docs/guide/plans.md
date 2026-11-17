@@ -1,5 +1,7 @@
 # Launch plans: a graph as a static list of launches over one arena
 
+**English** | [简体中文](../zh-CN/guide/plans.md)
+
 A model forward is not one kernel. `tilefish.plan(graph, buckets=...)` compiles a `@tilefish.graph` into a **launch plan**: for every combination of the bucket values of its
 dimensions, the ordered launches of manifest entries (a lowered kernel, a hand-written Triton extern, a prebuilt binary or a pinned cuBLASLt GEMM), with every pointer argument bound to a
 buffer or to a *view* of one (a `reshape`, `permute`, `select` or `split` copies nothing), and **one arena of device memory** for everything the caller does not provide: the intermediates, one
