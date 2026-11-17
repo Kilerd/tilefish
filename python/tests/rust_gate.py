@@ -1437,6 +1437,22 @@ def plan_graphs():
         for mode in ("fused", "acc"):
             g = epg.graph_of(gl_body, gl_params, epg.MODES[mode], f"gate_epi_gluon_periodic_{mode}")
             fused.append(("fused_epi_gluon_periodic" + ("" if mode == "fused" else "_acc"), g, False, fused_cases(g)))
+    if cap in (100, 103, 120):
+        # RFC 0003, X8: the persistent, warp-specialised GEMM of python/examples/persistent_gemm.py (Gluon on sm_100 and sm_103: a persistent grid,
+        # TMA descriptors in and out, two epilogue partitions; its Triton form on sm_120), a bias + GELU and the dual GEMM's SwiGLU in its hooks
+        examples = str(pathlib.Path(__file__).resolve().parents[1] / "examples")
+        if examples not in sys.path:
+            sys.path.insert(0, examples)
+        import persistent_gemm as pgm
+
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        pge = (pgm.gemm(cap, M=epg.T, n=256, k=256, sm_count=sms, name="gate_pgemm"),
+               pgm.gemm(cap, M=epg.T, n=512, k=256, split=2, sm_count=sms, name="gate_pgemm_dual"))  # fmt: skip
+        pg_bodies = epg.bodies(*pge, None)
+        for name in ("bias_gelu", "swiglu"):
+            for mode in ("fused", "acc"):
+                g = epg.graph_of(*pg_bodies[name], epg.MODES[mode], f"gate_epi_pgemm_{name}_{mode}")
+                fused.append((f"fused_epi_pgemm_{name}" + ("" if mode == "fused" else "_acc"), g, False, fused_cases(g)))
 
     import conv_kernels as ck
 
