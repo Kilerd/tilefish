@@ -824,6 +824,7 @@ impl ConvEntry {
                     view: None,
                     alias: None,
                     tensor_map: None,
+                    template: None,
                 },
             });
         }

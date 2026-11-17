@@ -97,6 +97,11 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   ``fused_*`` are the graphs of ``fusion_graphs.CASES``, whose bodies compute: their arithmetic is fused regions (``docs/rfcs/0001-plan-fusion.md``),
   kernel steps of generated kernels that the Rust host launches like any other (each export verifies its regions against their ops one by one).
 
+* **CuTe DSL kernels** (``cute_kernels.py``, exported only, with the CuTe DSL and ``TILEFISH_CUTLASS_EXAMPLES``: :func:`cute_ops`): the elementwise kernel of
+  the CUTLASS examples as ``cute_add`` (checked here to be torch's ``a + b``), ``cute_leaky_relu`` and ``cute_add_mn`` (pointers and constant bytes), and on
+  sm_100, sm_103 and sm_120 the persistent GEMM of the examples, ``cute_gemm`` (on sm_100 and sm_103 three TMA descriptors the DSL encoded, a cluster of
+  2, the fast divisors of its tile scheduler), and on sm_100 and sm_103 the non-persistent ``cute_gemm_dense``, each over its buckets; the plan ``cute_chain`` (a CuTe GEMM step and a CuTe add step).
+
 * **instrumented binaries** (:func:`prepare_instrumented`, ``WORK/instrumented.json``; on sm_90 or newer): the probed kernels of ``rust_gate_probed.py`` (a
   warp-specialised Gluon kernel with a probe around each wait of each partition, and a ``@tilefish.kernel`` with probes) exported as an instrumented
   variant (``export(..., instrument=True)``, ``docs/instrument.md``), and the graph ``probed_chain`` as an instrumented plan. Python replays each with
@@ -641,6 +646,38 @@ def launch_ops():
     return {name: op for name, op in lk.ops().items() if name != "persistent_pinned" or sms == 30}
 
 
+def cute_ops():
+    """``{name: extern}``: the CuTe DSL kernels of ``cute_kernels.py`` this device runs, when the CuTe DSL is installed and ``TILEFISH_CUTLASS_EXAMPLES``
+    names the CUTLASS examples (``docs/cute.md``); ``{}`` otherwise. Not in the committed fixtures."""
+    import importlib.util
+    import os
+
+    if importlib.util.find_spec("cutlass") is None or not os.environ.get("TILEFISH_CUTLASS_EXAMPLES"):
+        return {}
+    import cute_kernels
+
+    return cute_kernels.ops(torch.cuda.get_device_capability())
+
+
+def args_cute_rows(dtype, inputs):
+    def make(rows, seed):
+        return tuple(randn((rows, 1024), dtype, seed + 31 * i) for i in range(inputs))
+
+    return make
+
+
+def args_cute_mn(m, seed):
+    return (randn((m, 2048), F16, seed), randn((m, 2048), F16, seed + 1))
+
+
+def args_cute_gemm(m, seed):
+    return (randn((m, 1024), F16, seed, scale=0.5), randn((2048, 1024), F16, seed + 100, scale=0.5))
+
+
+def must_add(args, got):
+    assert same_bytes(got, args[0] + args[1])
+
+
 def args_flat(shape, seed):
     return (randn(shape, F32, seed),)
 
@@ -833,6 +870,15 @@ def build_cases():
     cases += plain("cluster_swap", "cluster_swap", args_flat, ((1,),), seeds=(0,), check=must_be(swap_reference), may_be_zero=("y",))
     cases += plain("cluster_swap", "cluster_swap", args_flat, ((200,), (1000,), (70000,)), seeds=(0,), check=must_be(swap_reference))
     cases += plain("desc_scale", "desc_scale", args_flat, ((1, 64), (100, 64), (1000, 64)), seeds=(0,), check=must_be(lambda x: x * 2))
+    # -- CuTe DSL kernels (cute_kernels.py, with the DSL and the CUTLASS examples): one binary per bucket, each launched with the parameters, grid and
+    # cluster of the compiled host function (pointers, the TMA descriptors the DSL encoded, constant bytes)
+    for rows in (64, 4096):
+        cases += plain("cute_add", f"cute_add.R{rows}", args_cute_rows(F16, 2), (rows,), seeds=(0, 1), check=must_add)
+        cases += plain("cute_leaky_relu", f"cute_leaky_relu.R{rows}", args_cute_rows(F32, 1), (rows,), seeds=(0,))
+    for m in (256, 1024, 4096):
+        cases += plain("cute_add_mn", f"cute_add_mn.M{m}", args_cute_mn, (m,), seeds=(0,), check=must_add)
+        cases += plain("cute_gemm", f"cute_gemm.M{m}", args_cute_gemm, (m,), seeds=(0, 1), check=must_be_a_matmul)
+        cases += plain("cute_gemm_dense", f"cute_gemm_dense.M{m}", args_cute_gemm, (m,), seeds=(0,), check=must_be_a_matmul)
     return cases
 
 
@@ -1187,6 +1233,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(conv_ops())
         declared.update(launch_ops())
         declared.update(matmul_ops())
+        declared.update(cute_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -1445,6 +1492,20 @@ def plan_graphs():
             ("cluster_plan", lk.cluster_plan, False, flat_cases),
             ("scratch_plan", lk.scratch_plan, False, scratch_cases),
         ]
+
+    cute = cute_ops()
+    if "cute_gemm" in cute:  # a CuTe GEMM step and a CuTe add step (cute_kernels.py)
+        import cute_kernels as cutek
+
+        def cute_chain_cases():
+            b = randn((2048, 1024), F16, seed=180, scale=0.5)
+            return [
+                (f"M{m}-seed{seed}", {"a": randn((m, 1024), F16, seed=181 + m + seed, scale=0.5), "b": b, "r": randn((m, 2048), F16, seed=182 + m + seed)})
+                for m in (256, 1024)
+                for seed in (0, 1)
+            ]
+
+        tma.append(("cute_chain", cutek.gemm_then_add, False, cute_chain_cases))
 
     import gpu_kernels_p7 as p7
 

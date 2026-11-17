@@ -153,8 +153,8 @@ def test_a_kernel_object_says_what_it_is_and_the_wrong_argument_is_refused():
 @pytest.mark.parametrize(
     "kwargs, message",
     [
-        (dict(gluon="m:f", triton="m:f"), "one of triton=, gluon=, ptx= and cubin=, got triton and gluon"),
-        (dict(gluon="m:f", ptx="x.ptx"), "one of triton=, gluon=, ptx= and cubin=, got gluon and ptx"),
+        (dict(gluon="m:f", triton="m:f"), "one of triton=, gluon=, ptx=, cubin= and cute=, got triton and gluon"),
+        (dict(gluon="m:f", ptx="x.ptx"), "one of triton=, gluon=, ptx=, cubin= and cute=, got gluon and ptx"),
         (dict(gluon="m:f", symbol="k"), "symbol= is for a prebuilt binary"),
         (dict(gluon="m:f", block=(32,)), "block= is for a prebuilt binary"),
         (dict(gluon="m:f", shared=16), "shared= is for a prebuilt binary"),

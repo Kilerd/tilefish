@@ -132,6 +132,34 @@ pub fn tensordesc(
     p
 }
 
+/// The 128 bytes of a CuTe DSL kernel's TMA descriptor template as the build writes it: zero where a launch writes the address (bytes 0 to 7) and
+/// after the 64 bytes the DSL's host code writes, the bytes 8 to 63 here `8, 9, ..., 63` (as `python/tests/test_cute_externs.py` has them).
+pub fn cute_template() -> [u8; 128] {
+    let mut t = [0u8; 128];
+    for (i, b) in t.iter_mut().enumerate().take(64).skip(8) {
+        *b = i as u8;
+    }
+    t
+}
+
+/// Lowercase hex digits of bytes.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A TMA descriptor of a CuTe DSL kernel (kind `tensormap`) of a tensor of `dtype` and `shape`, at `slot`, position `index` of the declaration,
+/// with the template [`cute_template`].
+pub fn tensormap(slot: usize, index: usize, name: &str, dtype: &str, access: &str, shape: Value) -> Value {
+    json!({"slot": slot, "index": index, "name": name, "kind": "tensormap", "type": "tensormap", "ptx_type": "b8[128]", "size": 128,
+           "dtype": dtype, "access": access, "shape": shape, "template": hex(&cute_template())})
+}
+
+/// Constant bytes of a CuTe DSL kernel (kind `bytes`) at `slot`: its index is its slot, its name `param_<slot>`.
+pub fn bytes_param(slot: usize, value: &[u8]) -> Value {
+    json!({"slot": slot, "index": slot, "name": format!("param_{slot}"), "kind": "bytes", "type": "bytes",
+           "ptx_type": format!("b8[{}]", value.len()), "size": value.len(), "value": hex(value)})
+}
+
 /// The `kernelParams` slots the parameters of an ABI take: a descriptor `1 + 2 * rank`, every other one 1.
 pub fn slots_of(params: &[Value]) -> usize {
     params
@@ -234,6 +262,32 @@ impl Kernel {
             entry["source_digest_kind"] = "tilefish.binary.v1".into();
         }
         Self { entry, cubin }
+    }
+
+    /// The entry of a CuTe DSL kernel (a `binary` entry of source `cute`, manifest schema 3 section 4.9) of `stem` for `sm_<sm>`: the DSL 4.8.1
+    /// with the options `--opt-level 3`, its toolchain, the digest of its PTX, `ptx_target` `sm_<sm>a`, a block of 128 threads, `grid` (integers)
+    /// and a cluster of `cluster` CTAs along x.
+    pub fn cute(
+        stem: &str,
+        sm: u32,
+        params: Vec<Value>,
+        preconditions: Vec<Value>,
+        dims: Value,
+        grid: &str,
+        cluster: u32,
+    ) -> Self {
+        let mut k = Self::new("binary", stem, sm, params, preconditions, dims, grid);
+        let e = &mut k.entry;
+        e["binary"] = json!({"source": "cute", "cutlass_dsl": "4.8.1", "options": "--opt-level 3"});
+        e["toolchain"] = json!({"cutlass_dsl": "4.8.1", "nvvm": "Cuda compilation tools, release 13.4, V13.4.59", "ptxas": "ptxas 12.9"});
+        e["source_digest"] = "8".repeat(64).into();
+        e["source_digest_kind"] = "tilefish.cute.v1".into();
+        e["ptx_target"] = format!("sm_{sm}a").into();
+        e["block"] = json!([128, 1, 1]);
+        e["shared"] = 213248.into();
+        e["launch"]["cluster_dims"] = json!([cluster, 1, 1]);
+        e["launch"]["num_ctas"] = cluster.into();
+        k
     }
 
     /// The same entry with its cubin replaced (the digests of the entry follow it).

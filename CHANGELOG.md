@@ -37,6 +37,39 @@ each section names the release that added it.
   by the Gluon kernel and fused into the Triton one, the fused binary's MMAs, the sm_120 builds, the probes, a speed smoke test with margins of a
   factor); the Rust and C++ gates run its fused bias + GELU and SwiGLU plans (`fused_epi_pgemm_*`).
 
+### CuTe DSL kernels as externs (issue #5, section 3; `docs/cute.md`)
+
+- **`@tilefish.extern(cute=host, cute_args=..., cute_options=...)`** declares a kernel written in CUTLASS's CuTe DSL (`nvidia-cutlass-dsl`): a
+  `@cute.jit` host function, or an object whose `__call__` is one (the kernel classes of the CUTLASS examples), and a stub of the operator's tensors of
+  static shapes (numbers or bucketed dimensions: one binary per bucket). `tilefish.impl(cute=...)` is one implementation of an operator declared with
+  `by_arch=` (the tcgen05 GEMM of sm_100/sm_103 beside the sm_120 one). `cute_args=` makes the host function's arguments from the tensors; tilefish
+  appends the stream.
+- **The build** compiles it with the DSL for the device's architecture (the DSL's own cubin and PTX, its file cache off) and takes the launch from the
+  compiled host function without running the kernel: it calls it three times on a stream captured into a CUDA graph, each time with the tensors at other
+  addresses, and reads the kernel node (grid, block, cluster, dynamic shared memory, every parameter's bytes). Every byte the kernel reads (its PTX's
+  `ld.param` loads; all of a parameter whose address it takes) must be constant or a tensor's address: a parameter is a `pointer`, a `tensormap` (a TMA
+  descriptor the DSL encoded for a static shape: a template with the address in its first 8 bytes) or `bytes`. Padding the kernel does not read (the fast
+  divisors of a persistent tile scheduler) and the 64 bytes after a descriptor that the DSL does not write are passed as zeros. Anything else (a dynamic
+  shape, a pointer inside a structure, a pointer the host function allocates) is refused with what it is. SASS assertions and traces apply.
+- **Manifest schema 3, additively** (section 4.9): a `binary` entry of `binary.source` `"cute"` (`{"source", "cutlass_dsl", "options"}`), its toolchain
+  `{"cutlass_dsl", "nvvm", "ptxas"}`, `source_digest_kind` `"tilefish.cute.v1"` (the sha256 of its PTX), a grid of integers, and the ABI kinds `tensormap`
+  and `bytes` (on such an entry only). Both readers refuse every malformed form; a reader of 0.0.11 refuses such an entry. Manifests without one, and
+  their digests, are unchanged.
+- **Pins.** The declaration digest has the host function, the sha256 of its file, the DSL's version and the options; Python's replay compiles the
+  declaration again and compares the PTX (refused if it differs, pinned or not; accepted only pinned where it cannot compile it). The Rust crate and the
+  C ABI launch the entry from the manifest alone (`tensormap`: the template with the tensor's address; `bytes`: as written), in a single launch, a plan
+  and a captured graph; the Rust and C++ emitters type it by its tensors.
+- **Measured on sm_103** (a 30-SM partition, nvidia-cutlass-dsl 4.8.1 with its CUDA 12.9 libraries): tilefish's launch of the examples' tcgen05 GEMMs
+  (persistent and not) and elementwise kernels is byte for byte the DSL's own launch; two exports in different processes and directories are the same
+  files and digest; `cute_add` is torch's `a + b` byte for byte. The persistent tcgen05 GEMM (2-CTA 256x128, cluster 2x1) is byte for byte the pinned
+  cuBLASLt GEMM's output and, at `N = 2048, K = 1024`, 0.71x, 0.92x and 1.17x its speed at `M` = 256, 1024 and 4096 (256x256 tiles: 1.25x at 4096; the
+  non-persistent GEMM 0.49x to 0.59x).
+- **Tests**: `test_cute_externs.py` (no GPU, no DSL), `test_gpu_cute.py` (the DSL and a CUTLASS checkout's examples in `TILEFISH_CUTLASS_EXAMPLES`), the
+  cases of `cute_kernels.py` in the Rust and C++ gates, and the crate's strict-reading and packing tests. The examples are BSD-3-Clause and are not
+  copied here; the DSL is NVIDIA software under its own licence, which tilefish neither ships nor depends on.
+- Messages that changed: the kinds an extern takes (`a kernel is one of triton=, gluon=, ptx=, cubin= and cute=`), the kinds of a parameter (`... given,
+  null, tensormap or bytes`) and of a spec's `binary` (`'ptx', 'cubin' or 'cute'`).
+
 ## tilefish 0.0.12, crate 0.0.10, tilefish-capi 0.0.2 (2026-11-17)
 
 Manifest schema 3 gains a library impl, `cublaslt.matmul` (section 9.5): additive, so every manifest, plan and pin of 0.0.11 is read and written as

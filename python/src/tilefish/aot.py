@@ -105,7 +105,7 @@ from ._specvalid import (
     validate_spec,
 )
 from .decorators import ExternOp, grid_to_string
-from .dims import Dim, DimExpr, _NextPow2, _Prod
+from .dims import Dim, DimExpr, _NextPow2, _Prod, as_dim
 from .dtypes import BlockScaled
 from .errors import TilefishError, TilefishSpecError
 from .signature import MISSING
@@ -837,6 +837,8 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc.update({"triton": op.triton, "num_warps": op.num_warps, "num_stages": op.num_stages})
         if op.language != "triton":  # a Gluon kernel (only then: every other declaration digests as it did)
             doc["language"] = op.language
+    elif op.binary.kind == "cute":  # a CuTe DSL kernel: its host function, the sha256 of its file, the DSL's version, its compile options
+        doc["binary"] = op.binary.spec_section()  # type: ignore[union-attr]
     else:  # a prebuilt binary: what it is made of (the sha256 of its PTX or cubin), its entry point, block and shared memory
         doc["binary"] = {
             "kind": op.binary.kind,
@@ -870,7 +872,7 @@ def _canonical_declaration(op: ExternOp) -> dict[str, Any]:
         doc["persistent"] = op.persistent.to_json()
     if op.global_scratch:
         doc["global_scratch"] = op.global_scratch
-    if op.binary is not None and tuple(op.binary.cluster) != (1, 1, 1):
+    if op.binary is not None and op.binary.kind != "cute" and tuple(op.binary.cluster) != (1, 1, 1):
         doc["binary"]["cluster"] = list(op.binary.cluster)
     if getattr(op, "sass", None) is not None:  # the SASS assertions (tilefish.sass), only when declared: every other digest is as it was
         doc["sass"] = op.sass.canonical()
@@ -934,6 +936,12 @@ def _bucket_dims(op: ExternOp) -> list[Dim]:
     """Bucketed dims used by const defaults, in order of first appearance, then those ``by_bucket=`` chooses a configuration by (in the order of
     its parameters): one binary per bucket combination of these."""
     dims: list[Dim] = []
+    if op.binary is not None and op.binary.kind == "cute":  # a CuTe DSL kernel is compiled for static shapes: one binary per bucket of its tensors
+        for p in op.signature.params:
+            for d in p.type.shape if p.type is not None else ():
+                for x in sorted(d.free_dims(), key=lambda x: x.name):
+                    if x not in dims:
+                        dims.append(x)
     for p in op.signature.consts:
         if isinstance(p.default, DimExpr):
             for d in sorted(p.default.free_dims(), key=lambda x: x.name):
@@ -1156,7 +1164,10 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         preconditions.append(Precondition("bucket", dim=d.name, value=v, buckets=d.buckets))
         note(d)
 
+    cute = op.binary is not None and op.binary.kind == "cute"
     op_grid = chosen["grid"] if chosen is not None else op.grid
+    if cute:  # the grid of a CuTe DSL kernel is the compiled kernel's (the build captures it): one program in the spec, as a placeholder
+        op_grid = (as_dim(1),)
     assert op_grid is not None
     for g in op_grid:
         note(g)
@@ -1177,6 +1188,11 @@ def _build(op: ExternOp, mapping: dict[Dim, int], digest: str) -> CompileSpec:
         if chosen is not None:  # an extern's by_bucket= configuration of this bucket
             num_warps = chosen["num_warps"]
         block = (32 * num_warps, 1, 1)
+    elif cute:  # a CuTe DSL kernel: launched with the parameters, grid, block, cluster and shared memory of the compiled kernel (the build's)
+        attrs = {}
+        num_warps = 0
+        block = (1, 1, 1)  # (a placeholder, as the grid: the entry has the compiled kernel's)
+        binary = op.binary.spec_section()  # type: ignore[union-attr]
     else:  # a prebuilt binary is launched with exactly its C parameters: no scratch slots, no warps; its block is declared
         attrs = {}  # (no Triton compiles it: no divisibility attributes)
         num_warps = 0
@@ -1240,7 +1256,7 @@ def compile_specs(op: ExternOp, arch: "int | str | None" = None) -> list[Compile
             op = op.for_arch(arch)  # type: ignore[arg-type]
         except TilefishError as e:
             raise TilefishSpecError(str(e)) from None
-    if op.grid is None:
+    if op.grid is None and (op.binary is None or op.binary.kind != "cute"):  # (a CuTe DSL kernel's grid is the compiled kernel's)
         raise TilefishSpecError(f"extern op '{op.name}' has no grid; pass grid=... to @tilefish.extern")
     dims = _bucket_dims(op)
     combos = itertools.product(*(d.buckets for d in dims)) if dims else [()]  # type: ignore[arg-type]

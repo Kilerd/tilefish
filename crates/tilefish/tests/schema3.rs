@@ -923,7 +923,7 @@ fn a_given_argument_that_is_not_what_it_says_is_refused() {
         (
             "of an unknown kind",
             json!({"kind": "giving"}),
-            "kind must be pointer, tensordesc, scalar, fixed, given or null",
+            "kind must be pointer, tensordesc, scalar, fixed, given, null, tensormap or bytes",
         ),
     ];
     for (what, change, why) in cases {

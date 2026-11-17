@@ -10,7 +10,9 @@
 //! expression, or the size of a static axis) and the entry has the constraints of its named dimensions. A pointer may also take a
 //! *strided view* (its `strides` are fixed to 1 or are dimensions to bind, its `offset` is the address of the view's first element),
 //! or be a *device scalar* (the empty shape: one element); a runtime scalar is an `i32` or an `i64`, and a `fixed` argument is a
-//! value the manifest holds.
+//! value the manifest holds. A CuTe DSL kernel (manifest schema 3, section 4.9) takes its tensors as pointers or as TMA descriptors the DSL
+//! encoded (kind `tensormap`: a tensor like a pointer, whose launch passes the template with the tensor's address in its first eight bytes,
+//! 128 bytes by value), and constant bytes (kind `bytes`) the manifest holds.
 //!
 //! The checks are Python's, in the order of `runtime._prepare`, so that a call that breaks several preconditions is refused for the one
 //! Python finds first: the number of tensors; for each tensor the kernel reads (`In`, `InOut`: what Python is given) its dtype and rank (a
@@ -34,12 +36,14 @@
 //! view broadcast along huge axes has more), which every limit refuses. A call has nothing but its tensors: there is no way to tell a launch
 //! what a dimension is.
 
+use std::sync::Arc;
+
 use crate::error::{Error, PreconditionKind, Result};
 use crate::expr::{Expr, MAX_DIMS, Pattern, Solved, Symbols, Unsolvable, parse_grid};
 use crate::library::LibraryEntry;
 use crate::manifest::{
-    Access, DimInfo, Entry, LaunchAttributes, Param, ParamKind, Persistent, Precondition, SCRATCH_ALIGNMENT,
-    ScalarType, ShapeDim, StrideEntry,
+    Access, CUTE_ADDRESS_LIMIT, DESCRIPTOR_BYTES, DimInfo, Entry, LaunchAttributes, Param, ParamKind, Persistent,
+    Precondition, SCRATCH_ALIGNMENT, ScalarType, ShapeDim, StrideEntry,
 };
 use crate::tensor::{DType, TensorArg, reach};
 
@@ -82,6 +86,8 @@ struct TensorPlan {
     alias: Option<usize>,
     /// A TMA descriptor of the tensor: what its map is encoded with besides the tensor.
     map: Option<MapPlan>,
+    /// The TMA descriptor of a CuTe DSL kernel's tensor (manifest kind `tensormap`): its template, into which a launch writes the address.
+    template: Option<Box<[u8; DESCRIPTOR_BYTES]>>,
 }
 
 /// The map of a TMA descriptor parameter: the numbers of `cuTensorMapEncodeTiled` that are not the tensor's.
@@ -134,6 +140,60 @@ pub(crate) struct MapSlot {
     pub(crate) bytes: Option<crate::ffi::TensorMapBytes>,
 }
 
+/// The 128 bytes of a CuTe DSL kernel's TMA descriptor as a launch passes them, 64-byte aligned in the host's memory as the PTX parameter is
+/// (`.param .align 64 .b8 [128]`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C, align(64))]
+pub(crate) struct Descriptor(pub(crate) [u8; DESCRIPTOR_BYTES]);
+
+impl std::fmt::Debug for Descriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Descriptor(")?;
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+/// What a launch passes by value at a slot of `kernelParams` that is no 64-bit word of [`Prepared::params`] (a parameter of a CuTe DSL kernel,
+/// manifest schema 3 section 4.9).
+#[derive(Debug, Clone)]
+pub(crate) enum PassedBytes {
+    /// A TMA descriptor (kind `tensormap`): its template with the tensor's address in bytes 0 to 7.
+    Descriptor(Descriptor),
+    /// Constant bytes (kind `bytes`), as the manifest has them (shared with the plan).
+    Constant(Arc<[u8]>),
+}
+
+impl PassedBytes {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Descriptor(d) => &d.0,
+            Self::Constant(bytes) => bytes,
+        }
+    }
+}
+
+/// One parameter a checked launch passes by value from bytes of its own ([`PassedBytes`]): its slot and the bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct PassedSlot {
+    pub(crate) slot: usize,
+    pub(crate) bytes: PassedBytes,
+}
+
+/// The 128 bytes a launch passes for a CuTe DSL kernel's TMA descriptor (manifest kind `tensormap`): its `template` with the tensor's `address`,
+/// a little-endian `u64`, in bytes 0 to 7 (Python's `_cute.descriptor`; the template is zero there). The address is not null, 16-byte aligned
+/// and below 2**57 (the DSL keeps 53 bits of `address / 16`): `None` for any other.
+pub(crate) fn descriptor(template: &[u8; DESCRIPTOR_BYTES], address: u64) -> Option<Descriptor> {
+    if address == 0 || !address.is_multiple_of(16) || address >= CUTE_ADDRESS_LIMIT {
+        return None;
+    }
+    let mut bytes = *template;
+    bytes[..8].copy_from_slice(&address.to_le_bytes());
+    Some(Descriptor(bytes))
+}
+
 #[derive(Debug, Clone)]
 struct ScalarPlan {
     name: String,
@@ -181,6 +241,10 @@ enum Slot {
     MapShape(usize, usize),
     /// The element stride of an axis of the tensor of a TMA descriptor (an `i64`), after its shape.
     MapStride(usize, usize),
+    /// The TMA descriptor of a CuTe DSL kernel's tensor: its template with the tensor's address, 128 bytes passed by value.
+    Descriptor(usize),
+    /// Constant bytes of a CuTe DSL kernel: the index of its bytes among the plan's `constants`, passed by value.
+    Bytes(usize),
 }
 
 /// One manifest entry, ready to check a call against.
@@ -195,6 +259,8 @@ pub struct Plan {
     given: Vec<(String, ScalarType)>,
     checks: Vec<Check>,
     slots: Vec<Slot>,
+    /// The constant bytes of a CuTe DSL kernel's parameters (kind `bytes`), in the order of the ABI ([`Slot::Bytes`]).
+    constants: Vec<Arc<[u8]>>,
     scratch_slots: usize,
     /// The entries of the grid, evaluated in their folded form as Python evaluates its grid.
     grid: Vec<Pattern>,
@@ -231,6 +297,9 @@ pub struct Prepared {
     pub(crate) tensor_of: [u8; MAX_PARAMS],
     /// The TMA descriptors of the call, in the order of their slots.
     pub(crate) maps: Vec<MapSlot>,
+    /// The parameters a launch passes by value from bytes of their own (a CuTe DSL kernel's descriptors and constant bytes), in the order of
+    /// their slots.
+    pub(crate) passed: Vec<PassedSlot>,
 }
 
 /// What `Prepared::tensor_of` holds for a slot that is not a tensor.
@@ -239,9 +308,17 @@ pub(crate) const NOT_A_TENSOR: u8 = u8::MAX;
 impl Prepared {
     /// The `kernelParams` values, one 64-bit slot each: an address, an `i32` or an `f32` in the low four bytes, an `i64`, then the scratch
     /// slots of a Triton kernel (null pointers; a prebuilt binary has none). The slot of the map of a TMA descriptor holds 0 here: the launch
-    /// passes the 128 bytes of the map it encoded ([`Prepared::tensor_maps`]); its shape and strides follow in slots of their own.
+    /// passes the 128 bytes of the map it encoded ([`Prepared::tensor_maps`]); its shape and strides follow in slots of their own. So does the
+    /// slot of a CuTe DSL kernel's descriptor or constant bytes: the launch passes [`Prepared::by_value`] there.
     pub fn params(&self) -> &[u64] {
         &self.values[..self.count]
+    }
+
+    /// The bytes a launch passes by value at `slot` for a parameter of a CuTe DSL kernel that is no 64-bit word (manifest schema 3, section
+    /// 4.9): the 128 bytes of a TMA descriptor (kind `tensormap`: its template with the address of the call's tensor, little-endian, in bytes 0
+    /// to 7), or constant bytes (kind `bytes`, as the manifest has them). `None` for any other slot.
+    pub fn by_value(&self, slot: usize) -> Option<&[u8]> {
+        self.passed.iter().find(|p| p.slot == slot).map(|p| p.bytes.as_slice())
     }
 
     /// The `cuTensorMapEncodeTiled` arguments of each TMA descriptor of the call, in the order of their slots: what a launch encodes.
@@ -361,9 +438,10 @@ impl Plan {
         let mut scalars: Vec<ScalarPlan> = Vec::new();
         let mut given: Vec<(String, ScalarType)> = Vec::new();
         let mut slots = Vec::new();
+        let mut constants: Vec<Arc<[u8]>> = Vec::new();
         for p in source.params {
             match &p.kind {
-                ParamKind::Pointer { dtype_name, dtype, access, shape, view, tensor_map, .. } => {
+                ParamKind::Pointer { dtype_name, dtype, access, shape, view, tensor_map, template, .. } => {
                     let Some(dtype) = *dtype else {
                         return Err(Error::Unsupported(format!(
                             "{who}: parameter '{}' has dtype {dtype_name}, which has no storage type here (packed formats cannot be run yet)",
@@ -414,6 +492,9 @@ impl Plan {
                         slots.push(Slot::Map(t));
                         slots.extend((0..shape.len()).map(|axis| Slot::MapShape(t, axis)));
                         slots.extend((0..shape.len()).map(|axis| Slot::MapStride(t, axis)));
+                    } else if template.is_some() {
+                        // a CuTe DSL kernel's descriptor: its template with the tensor's address, one slot of 128 bytes
+                        slots.push(Slot::Descriptor(t));
                     } else {
                         slots.push(Slot::Tensor(t));
                     }
@@ -427,6 +508,7 @@ impl Plan {
                         alignment: 16,
                         alias: None,
                         map,
+                        template: template.clone(),
                     });
                 }
                 ParamKind::Scalar { ty, dim, .. } => {
@@ -440,6 +522,11 @@ impl Plan {
                 ParamKind::Given { ty } => {
                     slots.push(Slot::Given(given.len()));
                     given.push((p.name.clone(), *ty));
+                }
+                // constant bytes of a CuTe DSL kernel: passed by value at its slot, as the manifest has them (a call gives nothing for it)
+                ParamKind::Bytes { value } => {
+                    slots.push(Slot::Bytes(constants.len()));
+                    constants.push(Arc::from(value.as_slice()));
                 }
             }
         }
@@ -512,6 +599,7 @@ impl Plan {
             given,
             checks,
             slots,
+            constants,
             scratch_slots: source.scratch_slots,
             grid,
             grid_text: source.grid.to_owned(),
@@ -1208,15 +1296,36 @@ impl Plan {
             })?;
         }
 
-        // -- the kernelParams values (every scalar is in the range of its type: checked above)
+        // -- the kernelParams values (every scalar is in the range of its type: checked above), and the bytes of a CuTe DSL kernel's descriptors
+        // and constant bytes, passed by value (a descriptor's address is checked last, where Python's launch checks it)
         let mut values = [0u64; MAX_PARAMS];
         let mut tensor_of = [NOT_A_TENSOR; MAX_PARAMS];
         let mut maps = Vec::new();
+        let mut passed = Vec::new();
         for (k, slot) in self.slots.iter().enumerate() {
             values[k] = match slot {
                 Slot::Tensor(t) => {
                     tensor_of[k] = *t as u8; // at most MAX_PARAMS tensors: `Plan::new` refuses more parameters
                     tensors[*t].ptr
+                }
+                Slot::Descriptor(t) => {
+                    tensor_of[k] = *t as u8;
+                    let (plan, a) = (&self.tensors[*t], &tensors[*t]);
+                    let template =
+                        plan.template.as_ref().expect("a descriptor slot is of a CuTe DSL kernel's descriptor");
+                    let Some(bytes) = descriptor(template, a.ptr) else {
+                        return Err(Error::Launch(format!(
+                            "'{stem}': argument '{}' is at address {:#x}, but the TMA descriptor of a CuTe DSL kernel holds the address of its tensor \
+                             16-byte aligned and below 2**57 (the DSL keeps 53 bits of address / 16): give it memory there",
+                            plan.name, a.ptr
+                        )));
+                    };
+                    passed.push(PassedSlot { slot: k, bytes: PassedBytes::Descriptor(bytes) });
+                    0 // the descriptor's 128 bytes are passed from `passed`
+                }
+                Slot::Bytes(i) => {
+                    passed.push(PassedSlot { slot: k, bytes: PassedBytes::Constant(Arc::clone(&self.constants[*i])) });
+                    0 // the bytes are passed from `passed`
                 }
                 Slot::Map(t) => {
                     tensor_of[k] = *t as u8;
@@ -1271,6 +1380,7 @@ impl Plan {
             count: self.slots.len() + self.scratch_slots,
             tensor_of,
             maps,
+            passed,
         })
     }
 
@@ -1640,5 +1750,28 @@ mod tests {
         assert_eq!(reach_canonical(&[4, 8], &[]), 32, "a dense tensor: its elements");
         // unbounded: the product exceeds 64 bits and is still compared as it is
         assert!(reach_canonical(&[1 << 40, 1 << 40], &[1 << 40, 1]) > u128::from(u64::MAX));
+    }
+
+    #[test]
+    fn a_cute_descriptor_is_its_template_with_the_address_in_its_first_eight_bytes() {
+        let mut template = [0u8; DESCRIPTOR_BYTES];
+        for (i, b) in template.iter_mut().enumerate().take(64).skip(8) {
+            *b = i as u8;
+        }
+        let d = descriptor(&template, 0x7F00_0010_0000).unwrap();
+        assert_eq!(&d.0[..8], &0x7F00_0010_0000u64.to_le_bytes());
+        assert_eq!(&d.0[8..], &template[8..]);
+        // 64-byte aligned in the host's memory, as the kernel parameter is
+        assert_eq!((std::mem::align_of::<Descriptor>(), std::mem::size_of::<Descriptor>()), (64, 128));
+        assert_eq!(PassedBytes::Descriptor(d).as_slice(), &d.0[..]);
+        // the addresses the DSL's descriptor holds: not null, 16-byte aligned, below 2**57 (Python's `_cute.descriptor`)
+        for refused in [0, 8, 0x7F00_0010_0008, CUTE_ADDRESS_LIMIT, CUTE_ADDRESS_LIMIT + 16, !15u64] {
+            assert!(descriptor(&template, refused).is_none(), "{refused:#x}");
+        }
+        assert!(descriptor(&template, 16).is_some());
+        assert_eq!(
+            &descriptor(&template, CUTE_ADDRESS_LIMIT - 16).unwrap().0[..8],
+            &(CUTE_ADDRESS_LIMIT - 16).to_le_bytes()
+        );
     }
 }

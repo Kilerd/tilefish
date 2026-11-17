@@ -35,6 +35,7 @@ from ._specvalid import IMPLEMENTATION_FALLBACK, stride_of_json
 from .errors import TilefishBuildError, TilefishManifestError
 
 BINARY_DIGEST_KIND = "tilefish.binary.v1"  # the ``source_digest_kind`` of an entry whose ``source_digest`` is the sha256 of a prebuilt PTX or cubin
+CUTE_DIGEST_KIND = "tilefish.cute.v1"  # the ``source_digest_kind`` of a CuTe DSL binary: the sha256 of the PTX the DSL generated (:mod:`tilefish._cute`)
 
 if TYPE_CHECKING:
     from .aot import CompileSpec
@@ -474,6 +475,12 @@ def abi_of(spec: "CompileSpec") -> dict[str, Any]:
     return {"params": params, "scratch": scratch, "scratch_slots": len(scratch)}
 
 
+def is_cute(spec: "CompileSpec") -> bool:
+    """Whether ``spec`` is of a CuTe DSL kernel (``binary.kind`` ``"cute"``): its ABI, grid, block, cluster and shared memory are the compiled
+    kernel's, which the build finds (:mod:`tilefish._cute`), not the spec's."""
+    return spec.binary is not None and spec.binary.get("kind") == "cute"
+
+
 def abi_slot_sizes(abi: "Mapping[str, Any]") -> "list[int]":
     """The size of every ``kernelParams`` slot of a manifest's ABI, in order: each parameter's (a descriptor's ``1 + 2 * rank`` slots), then the
     scratch slots. What the loaded function must report (``cuFuncGetParamInfo``)."""
@@ -542,6 +549,10 @@ class BuiltKernel:
     # an instrumented build (``build(..., instrument=...)``, :mod:`tilefish._probe`): the ``instrument`` of its manifest entry (the record format, the
     # records each warp keeps, the kernel's probes and where each is written); ``None`` for a production build, which has no probe
     instrument: "dict[str, Any] | None" = None
+    # a CuTe DSL kernel (:mod:`tilefish._cute`): what its build found of its launch, which its spec does not say: ``abi`` (its parameters: pointers,
+    # TMA descriptors and constant bytes), ``grid`` (programs: clusters, as an entry counts them), ``block`` and ``nvvm`` (the release of the NVVM
+    # that made its PTX); ``None`` for every other binary
+    cute: "dict[str, Any] | None" = None
 
     @property
     def stem(self) -> str:
@@ -551,6 +562,8 @@ class BuiltKernel:
     def block(self) -> "tuple[int, int, int]":
         """The thread block a launch takes: ``32 * num_warps`` threads of the compiled kernel (every partition of a warp-specialised one), or the
         block a prebuilt binary declares."""
+        if self.cute is not None:
+            return tuple(self.cute["block"])  # type: ignore[return-value]
         if self.spec.binary is not None:
             return tuple(self.spec.block)  # type: ignore[return-value]
         return (32 * self.num_warps, 1, 1)
@@ -584,8 +597,16 @@ class BuiltKernel:
         return path
 
     def abi(self) -> dict[str, Any]:
-        """The launch ABI of the spec; see :func:`abi_of`."""
+        """The launch ABI of the spec (see :func:`abi_of`), or of a CuTe DSL kernel the compiled kernel's (its build's)."""
+        if self.cute is not None:
+            return json.loads(json.dumps(self.cute["abi"]))
         return abi_of(self.spec)
+
+    @property
+    def grid(self) -> "tuple[int, ...] | None":
+        """The grid of programs every launch of a CuTe DSL kernel takes (its shapes are static: the compiled host function's); ``None`` for any other
+        binary, whose grid is its spec's expression."""
+        return tuple(self.cute["grid"]) if self.cute is not None else None
 
     def __repr__(self) -> str:
         return (
@@ -1365,7 +1386,7 @@ def spec_entry(spec: "CompileSpec") -> dict[str, Any]:
     entry["preconditions"] = [p.to_dict() for p in spec.preconditions]
     if spec.binary is None:
         entry["options"] = dict(spec.ast_source_inputs().options)
-    else:  # a prebuilt binary declares its dynamic shared memory, and the symbol of its kernel
+    elif not is_cute(spec):  # a prebuilt binary declares its dynamic shared memory, and the symbol of its kernel (a CuTe DSL kernel's are its build's)
         entry["symbol"] = spec.binary["symbol"]
         entry["shared"] = spec.binary["shared"]
     entry["declaration_digest"] = spec.declaration_digest
@@ -1386,7 +1407,46 @@ def expected_entry(spec: "CompileSpec", entry: "Mapping[str, Any]") -> dict[str,
     total = entry.get("total_num_warps")
     if total is not None and spec.binary is None:
         expected["block"] = [32 * total, 1, 1]
+    if is_cute(spec):  # the compiled kernel's ABI, grid, block (which the reader checked, and check_cute_entry against the spec's tensors)
+        for key in ("abi", "grid", "block"):
+            expected[key] = json.loads(json.dumps(entry.get(key)))
     return expected
+
+
+def check_cute_entry(spec: "CompileSpec", entry: "Mapping[str, Any]") -> "str | None":
+    """What makes the ABI of a CuTe DSL entry not one of ``spec``'s binary (``None``: it is): every tensor of the spec in exactly one parameter, a
+    ``pointer`` or a ``tensormap`` of its index, name, dtype, access and declared shape, every other parameter ``bytes``; the grid integers."""
+    from ._specvalid import parse_grid
+
+    abi = entry.get("abi")
+    params = abi.get("params") if isinstance(abi, dict) else None
+    if not isinstance(params, list):
+        return "abi.params is not a list"
+    want = {a.name: a for a in spec.args if a.kind == "pointer"}
+    seen: "set[str]" = set()
+    for p in params:
+        if not isinstance(p, dict):
+            return "a parameter is not an object"
+        kind = p.get("kind")
+        if kind == "bytes":
+            continue
+        if kind not in ("pointer", "tensormap"):
+            return f"parameter {p.get('name')!r} is a {kind}: a CuTe DSL kernel takes pointers, TMA descriptors (tensormap) and bytes"
+        a = want.get(p.get("name"))  # type: ignore[arg-type]
+        if a is None or p.get("name") in seen:
+            return f"parameter {p.get('name')!r} is no tensor of the operator, or is one twice"
+        seen.add(a.name)
+        got = (p.get("index"), p.get("dtype"), p.get("access"), p.get("shape"))
+        expected = (a.index, a.dtype, a.access, list(a.shape_dims or ()))
+        if got != expected:
+            return f"parameter {a.name!r} has (index, dtype, access, shape) {got}, the operator's tensor {expected}"
+        if any(k in p for k in ("strides", "offset", "alias")):
+            return f"parameter {a.name!r} is a view: a CuTe DSL kernel takes dense tensors"
+    if seen != set(want):
+        return f"the tensors {sorted(set(want) - seen)} are in no parameter"
+    if parse_grid(entry.get("grid")):
+        return f"the grid {entry.get('grid')!r} names dimensions: a CuTe DSL kernel's is integers (its shapes are static)"
+    return None
 
 
 def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
@@ -1399,8 +1459,8 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
         "ptx_target": b.ptx_target,
         "symbol": b.symbol,
         "cubin": b.cubin_name,
-        "abi": spec_part["abi"],
-        "grid": spec_part["grid"],
+        "abi": spec_part["abi"] if b.cute is None else b.abi(),  # (a CuTe DSL kernel: the compiled kernel's parameters)
+        "grid": spec_part["grid"] if b.cute is None else _cute_grid(b),
         "block": list(b.block),  # the compiled kernel's: 32 * the warps of every partition of a warp-specialised kernel
         "shared": b.shared,
     }
@@ -1428,6 +1488,10 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     entry["sha256_code"] = b.sha256_code
     if b.spec.binary is None:
         entry["toolchain"] = {"triton": b.triton_version, "ptxas": b.ptxas_version}
+    elif b.cute is not None:  # a CuTe DSL kernel: the DSL, and the NVVM and ptxas it carries (what its PTX and its cubin say)
+        assert b.binary_build is not None
+        entry["toolchain"] = {"cutlass_dsl": b.binary_build["cutlass_dsl"], "nvvm": b.cute.get("nvvm", ""), "ptxas": b.ptxas_version}
+        entry["binary"] = json.loads(json.dumps(b.binary_build))
     else:  # a prebuilt PTX is assembled by ptxas (recorded, with its flags); a cubin is used as it is
         entry["toolchain"] = {"ptxas": b.ptxas_version} if b.ptxas_version else {}
         assert b.binary_build is not None
@@ -1441,10 +1505,16 @@ def _kernel_entry(b: BuiltKernel) -> dict[str, Any]:
     if b.ir_digest is not None:  # the digest of the Triton IR the binary was compiled from (the field and its kind, so a reader of schema 2 reads it as before)
         entry["source_digest"] = b.ir_digest
         entry["source_digest_kind"] = _ir.digest_kind(b.spec.language)  # the TTIR of a triton.jit kernel, the TTGIR of a Gluon one
-    elif b.binary_digest is not None:  # the digest of the PTX or cubin bytes a prebuilt binary is made of
+    elif b.binary_digest is not None:  # the digest of the PTX or cubin bytes a prebuilt binary is made of (of a CuTe DSL kernel: the PTX the DSL made)
         entry["source_digest"] = b.binary_digest
-        entry["source_digest_kind"] = BINARY_DIGEST_KIND
+        entry["source_digest_kind"] = CUTE_DIGEST_KIND if b.cute is not None else BINARY_DIGEST_KIND
     return entry
+
+
+def _cute_grid(b: BuiltKernel) -> str:
+    """The grid of the entry of a CuTe DSL kernel: its programs, integers (``"(4, 8, 1)"``)."""
+    assert b.cute is not None
+    return "(" + ", ".join(str(int(g)) for g in b.cute["grid"]) + ")"
 
 
 def manifest_dict(built: "Iterable[BuiltKernel]", library: "Iterable[Any]" = ()) -> dict[str, Any]:
@@ -1484,6 +1554,11 @@ def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
     ):
         if old.get(key) != new.get(key):
             return key
+    # a CuTe DSL kernel: its launch is its build's (the host function's), not its declaration's alone
+    if CUTE_DIGEST_KIND in (old.get("source_digest_kind"), new.get("source_digest_kind")):
+        for key in ("abi", "grid", "block", "binary", "toolchain"):
+            if old.get(key) != new.get(key):
+                return key
     # a cuDNN convolution's canary: two of them that differ are two builds of cuDNN (an entry without one, an older export, is replaced by one with it)
     if "canary" in old and "canary" in new and old["canary"] != new["canary"]:
         return "canary"

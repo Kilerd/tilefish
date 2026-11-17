@@ -135,11 +135,13 @@ pub(crate) fn check_region<'a>(addr: u64, len: u64, device: i32) -> DevicePtr<'a
 pub(crate) fn enqueue_steps(stream: &CudaStream, steps: &[Ready<'_>]) -> Result<()> {
     for step in steps {
         match step {
-            Ready::Kernel(kernel, prepared) if prepared.cluster.is_some() => {
+            Ready::Kernel(kernel, prepared) if prepared.cluster.is_some() || !prepared.passed.is_empty() => {
                 stream.context().bind_to_thread().map_err(Error::driver("cuCtxSetCurrent"))?;
-                // SAFETY: a kernel of thread-block clusters, launched with `cuLaunchKernelEx` (cudarc's builder has no cluster attribute): the
-                // `Prepared` that `Plan::prepare` made for this very kernel (its slots, its grid of blocks, its cluster), on a cudarc stream of its
-                // context made current above, with the addresses the doc comment of this function says.
+                // SAFETY: a kernel of thread-block clusters, launched with `cuLaunchKernelEx` (cudarc's builder has no cluster attribute), or one
+                // with parameters passed by value from bytes of their own (a CuTe DSL kernel's descriptors and constant bytes, which the builder
+                // cannot push), with `cuLaunchKernel`: the `Prepared` that `Plan::prepare` made for this very kernel (its slots and those bytes, its
+                // grid of blocks, its cluster), on a cudarc stream of its context made current above, with the addresses the doc comment of this
+                // function says (a graph captured here holds the descriptors' bytes by value, of the addresses it holds).
                 unsafe {
                     crate::ffi::launch_prepared(
                         kernel.function().cu_function(),

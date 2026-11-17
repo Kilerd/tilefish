@@ -351,6 +351,27 @@ def _validate_tensordesc(who: str, kind: str, where: str, p: "dict[str, Any]") -
         _bad(who, f"{where}: {why}")
 
 
+_HEX = re.compile(r"[0-9a-f]*\Z")
+
+
+def _is_cute(entry: "dict[str, Any]") -> bool:
+    """Whether an entry is of a CuTe DSL kernel (a binary entry of ``binary.source`` ``"cute"``, manifest schema 3 section 4.9)."""
+    b = entry.get("binary")
+    return entry.get("kind") == "binary" and isinstance(b, dict) and b.get("source") == "cute"
+
+
+def _validate_tensormap(who: str, entry: "dict[str, Any]", where: str, p: "dict[str, Any]") -> None:
+    """A TMA descriptor of a CuTe DSL kernel (``kind`` ``tensormap``): of such an entry, 128 bytes, a dense tensor, and its ``template`` (256 lowercase
+    hex digits, zero where a launch writes the address, bytes 0 to 7, and from byte 64 on)."""
+    if not _is_cute(entry):
+        _bad(who, f"{where} is a TMA descriptor of a CuTe DSL kernel (tensormap), and this entry is not one")
+    if p.get("type") != "tensormap" or p.get("ptx_type") != "b8[128]" or p.get("size") != 128 or any(k in p for k in ("alias", "strides", "offset")):
+        _bad(who, f"{where} is a TMA descriptor of a CuTe DSL kernel: its type is 'tensormap', passed as 128 bytes, of a dense tensor")
+    template = p.get("template")
+    if not isinstance(template, str) or len(template) != 256 or not _HEX.fullmatch(template) or template[:16] != "0" * 16 or template[128:] != "0" * 128:
+        _bad(who, f"{where}.template must be 256 lowercase hex digits, zero in bytes 0 to 7 and from byte 64 on")
+
+
 def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> None:
     """The scalars and fixed arguments of the ABI, once every pointer is known (a stride scalar names the pointer it carries a stride of)."""
     by_name = {p["name"]: p for p in params}
@@ -358,7 +379,15 @@ def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> No
     for i, p in enumerate(params):
         where = f"abi.params[{i}] ('{p['name']}')"
         pkind = p.get("kind")
-        if pkind in ("pointer", "tensordesc"):
+        if pkind in ("pointer", "tensordesc", "tensormap"):
+            continue
+        if pkind == "bytes":  # constant bytes of a CuTe DSL kernel (the reader holds it to such an entry): its size and its value
+            size = p.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 32764 or p.get("type") != "bytes" or p.get("ptx_type") != f"b8[{size}]":
+                _bad(who, f"{where} is constant bytes: type 'bytes', a size from 1 to 32764, ptx_type 'b8[<size>]'")
+            value = p.get("value")
+            if not isinstance(value, str) or len(value) != 2 * size or not _HEX.fullmatch(value):
+                _bad(who, f"{where}.value must be {2 * size} lowercase hex digits")
             continue
         if pkind == "scalar":
             if p.get("type") not in ("i32", "i64"):
@@ -408,7 +437,7 @@ def _validate_scalars(who: str, kind: str, params: "list[dict[str, Any]]") -> No
             if any(k in p for k in ("value", "dim", "count_of", "stride_of")):
                 _bad(who, f"{where} is a fixed argument per call: every launch gives its value, it has no value, dim, count_of or stride_of")
         else:
-            _bad(who, f"{where}.kind must be 'pointer', 'tensordesc', 'scalar', 'fixed', 'given' or 'null', got {pkind!r}")
+            _bad(who, f"{where}.kind must be 'pointer', 'tensordesc', 'scalar', 'fixed', 'given', 'null', 'tensormap' or 'bytes', got {pkind!r}")
     for p in params:
         for axis, s in enumerate(p.get("strides", ()) if p.get("kind") == "pointer" else ()):
             if isinstance(s, str) and (p["name"], axis) not in carried:
@@ -501,8 +530,24 @@ def _validate_dims(who: str, entry: "dict[str, Any]") -> None:
 
 
 def _validate_binary_section(who: str, entry: "dict[str, Any]") -> None:
-    """The ``binary`` section of a prebuilt entry: ``{"source": "cubin"}`` or ``{"source": "ptx", "ptxas_flags": [...]}``, and its digest."""
+    """The ``binary`` section of a prebuilt entry: ``{"source": "cubin"}`` or ``{"source": "ptx", "ptxas_flags": [...]}``, and its digest; or of a
+    CuTe DSL kernel, ``{"source": "cute", "cutlass_dsl", "options"}``, its toolchain and the digest of its PTX."""
     b = entry.get("binary")
+    if _is_cute(entry):
+        ok = set(b) == {"source", "cutlass_dsl", "options"} and isinstance(b["cutlass_dsl"], str) and isinstance(b["options"], str)  # type: ignore[arg-type]
+        ok = ok and re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}[A-Za-z0-9.+_-]*", b["cutlass_dsl"]) is not None and re.fullmatch(r"[A-Za-z0-9 =,._:/+-]*", b["options"]) is not None  # type: ignore[index]
+        if not ok:
+            _bad(who, f"binary of a CuTe DSL kernel must be {{'source': 'cute', 'cutlass_dsl': <version>, 'options': <options>}}, got {b!r}")
+        digest = entry.get("source_digest")
+        if not isinstance(digest, str) or not _DIGEST.fullmatch(digest) or entry.get("source_digest_kind") != "tilefish.cute.v1":
+            _bad(who, "a CuTe DSL kernel has the sha256 of its PTX as source_digest, with source_digest_kind 'tilefish.cute.v1'")
+        toolchain = entry.get("toolchain")
+        if not isinstance(toolchain, dict) or set(toolchain) != {"cutlass_dsl", "nvvm", "ptxas"} or toolchain["cutlass_dsl"] != b["cutlass_dsl"]:  # type: ignore[index]
+            _bad(who, f"the toolchain of a CuTe DSL kernel is {{'cutlass_dsl', 'nvvm', 'ptxas'}}, its DSL the binary's, got {toolchain!r}")
+        for key in ("options", "num_warps", "num_stages", "total_num_warps", "persistent"):
+            if key in entry:
+                _bad(who, f"a CuTe DSL kernel has no '{key}'")
+        return
     ok = isinstance(b, dict) and b.get("source") in ("ptx", "cubin")
     if ok and b["source"] == "ptx":
         flags = b.get("ptxas_flags")
@@ -552,11 +597,17 @@ def _validate_entry(entry: Any) -> None:
         names.add(name)
     pointers = {}
     for i, p in enumerate(params):
-        if p.get("kind") in ("pointer", "tensordesc"):
+        if p.get("kind") in ("pointer", "tensordesc", "tensormap"):
             _validate_pointer(who, f"abi.params[{i}] ('{p['name']}')", p)
             pointers[p["name"]] = p
         if p.get("kind") == "tensordesc":
             _validate_tensordesc(who, kind, f"abi.params[{i}] ('{p['name']}')", p)
+        if p.get("kind") == "tensormap":
+            _validate_tensormap(who, entry, f"abi.params[{i}] ('{p['name']}')", p)
+        if p.get("kind") in ("tensormap", "bytes") and not _is_cute(entry):
+            _bad(who, f"abi.params[{i}] ('{p['name']}') is a {p.get('kind')}, which only a CuTe DSL kernel takes")
+        if _is_cute(entry) and p.get("kind") not in ("pointer", "tensormap", "bytes"):
+            _bad(who, f"abi.params[{i}] ('{p['name']}') is a {p.get('kind')}: a CuTe DSL kernel takes pointers, TMA descriptors and constant bytes")
     _validate_scalars(who, kind, params)
     _validate_preconditions(who, entry, pointers)
     _validate_dims(who, entry)
@@ -643,7 +694,7 @@ def _public_abi(entry: "dict[str, Any]") -> "dict[str, Any]":
     tensors = [
         {"name": p["name"], "access": p["access"], "dtype": p["dtype"], "shape": p["shape"], "view": "strides" in p, "alias": p.get("alias")}
         for p in params
-        if p["kind"] in ("pointer", "tensordesc")
+        if p["kind"] in ("pointer", "tensordesc", "tensormap")
     ]
     return {"tensors": tensors, "given": [{"name": p["name"], "type": p["type"]} for p in params if p["kind"] == "given"]}
 
@@ -652,7 +703,7 @@ def _public_dims(entry: "dict[str, Any]") -> "dict[str, Any]":
     """The constraints of the dimensions an entry's tensor shapes and buckets name (what a call is held to whichever implementation runs)."""
     names = set(entry["buckets"])
     for p in entry["abi"]["params"]:
-        if p["kind"] in ("pointer", "tensordesc"):
+        if p["kind"] in ("pointer", "tensordesc", "tensormap"):
             for d in p["shape"]:
                 if isinstance(d, str):
                     names |= parse_expression(d, "a dimension")
@@ -679,7 +730,8 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
         first = entries[0]
         # the binaries of the implementations of an op declared with by_arch= share the public part of the ABI (the tensors, the fixed arguments per
         # call) and the constraints of their dimensions, and each has an ABI of its own and is compiled and launched as it is
-        per_arch = all("implementation" in e for e in entries)
+        # (a CuTe DSL kernel's ABI, grid and block are its build's on each architecture, as an implementation's: they share the public ABI)
+        per_arch = all("implementation" in e for e in entries) or all(_is_cute(e) for e in entries)
         shared = [k for k in _SHARED_FIELDS if not (per_arch and k in _IMPLEMENTATION_FIELDS)]
         for other in entries[1:]:
             for key in shared + ["implementation"] * (not per_arch):
@@ -697,7 +749,7 @@ def _group(manifest: Manifest) -> "tuple[list[_Binary], list[_Gemm]]":
                             "signature, and the implementations of an operator declared with by_arch= share it (each has its own ABI otherwise)"
                         )
         binary = _Binary(stem, first, [e["arch"] for e in entries], struct=_camel(stem), entries=entries)
-        binary.params = [p for p in first["abi"]["params"] if p["kind"] in ("pointer", "tensordesc")]  # every tensor: a pointer or a descriptor's
+        binary.params = [p for p in first["abi"]["params"] if p["kind"] in ("pointer", "tensordesc", "tensormap")]  # every tensor: a pointer or a descriptor's
         binary.scalars = [p for p in first["abi"]["params"] if p["kind"] == "scalar"]
         binary.fixed = [p for p in first["abi"]["params"] if p["kind"] == "fixed"]
         binary.given = [p for p in first["abi"]["params"] if p["kind"] == "given"]
@@ -849,6 +901,8 @@ def _pointer_line(binary: _Binary, p: "dict[str, Any]") -> str:
             f", passed as a TMA descriptor (box `[{_shape_text(m['box'])}]`, {m['swizzle'].removeprefix('CU_TENSOR_MAP_')}, "
             f"{m['l2_promotion'].removeprefix('CU_TENSOR_MAP_')}, {m['oob_fill'].removeprefix('CU_TENSOR_MAP_')})"
         )
+    if p.get("kind") == "tensormap":
+        line += ", passed as the TMA descriptor the CuTe DSL encoded (its template in the manifest, with the address `launch` writes into it)"
     return line
 
 
@@ -859,25 +913,29 @@ def _constexprs_text(e: "dict[str, Any]") -> str:
 def _own_abi(entry: "dict[str, Any]") -> "tuple[Any, ...]":
     """What an implementation of an operator declared with by_arch= has of its own besides how it is compiled: its kind, ABI, dimensions and
     preconditions (a prebuilt binary: its source too)."""
-    return (entry["kind"], entry["abi"], entry["dims"], entry["preconditions"], entry.get("binary"), entry.get("source_digest") if entry["kind"] == "binary" else None)
+    return (entry["kind"], entry["abi"], entry["dims"], entry["preconditions"], entry.get("binary"), entry.get("source_digest") if entry["kind"] == "binary" else None,
+            entry.get("grid") if _is_cute(entry) else None, entry.get("block") if _is_cute(entry) else None)
 
 
 def _abis_per_arch(binary: _Binary) -> bool:
     """Whether the docs say each architecture's ABI: the implementations of an operator declared with by_arch= whose ABIs differ, or one of which is a
     prebuilt binary (its source is its own)."""
     if "implementation" not in binary.entry:
-        return False
+        return any(_own_abi(x) != _own_abi(binary.entry) for x in binary.entries) and all(_is_cute(x) for x in binary.entries)
     return any(_own_abi(x) != _own_abi(binary.entry) or x["kind"] == "binary" for x in binary.entries)
 
 
 def _abi_lines(binary: _Binary, x: "dict[str, Any]") -> "list[str]":
     """The docs of the implementation of one architecture, ABI included."""
-    if x["kind"] == "binary":
+    if _is_cute(x):
+        what = f"a CuTe DSL kernel (nvidia-cutlass-dsl {x['binary']['cutlass_dsl']}, PTX sha256 {x['source_digest']}), launched with its compiled parameters"
+    elif x["kind"] == "binary":
         source = "PTX that ptxas assembled" if x["binary"]["source"] == "ptx" else "a cubin used as it is"
         what = f"a prebuilt binary ({source}, sha256 {x['source_digest']}), launched with exactly its parameters"
     else:
         what = "a Triton kernel"
-    text = f"- {x['arch']}: the implementation `{x['implementation']}`, {what}; grid `{x['grid']}`, block {_block_text(x['block'])}{_warps_text(x)}, "
+    label = f"the implementation `{x['implementation']}`" if "implementation" in x else "its binary"
+    text = f"- {x['arch']}: {label}, {what}; grid `{x['grid']}`, block {_block_text(x['block'])}{_warps_text(x)}, "
     text += f"{x['shared']} bytes of dynamic shared memory"
     if x["constexprs"]:
         text += "; compiled in: " + _constexprs_text(x)
@@ -967,11 +1025,17 @@ def _doc_by_arch(binary: _Binary) -> "list[str]":
             + "."
         )
     lines.append("")
-    lines += _wrap(
-        "An implementation per architecture (an operator declared with `by_arch=`): one signature (the tensors, and the fixed arguments per call), "
-        "and on each architecture its own kernel or prebuilt binary and its own ABI (how it takes each tensor, its scalars and preconditions), "
-        "which its manifest entry says and `launch` follows; `load` takes the one of the device's architecture."
-    )
+    if "implementation" not in e:  # a CuTe DSL kernel built for several architectures: its launch is each build's
+        lines += _wrap(
+            "A CuTe DSL kernel built for each architecture: one signature (the tensors), and on each architecture the parameters, grid, block and "
+            "shared memory of its build, which its manifest entry says and `launch` follows; `load` takes the one of the device's architecture."
+        )
+    else:
+        lines += _wrap(
+            "An implementation per architecture (an operator declared with `by_arch=`): one signature (the tensors, and the fixed arguments per call), "
+            "and on each architecture its own kernel or prebuilt binary and its own ABI (how it takes each tensor, its scalars and preconditions), "
+            "which its manifest entry says and `launch` follows; `load` takes the one of the device's architecture."
+        )
     for x in binary.entries:
         lines += _abi_lines(binary, x)
     return lines
@@ -984,7 +1048,16 @@ def _doc(binary: _Binary) -> "list[str]":
     lines: "list[str]" = []
     if binary.signature:
         lines += [f"`{binary.signature}`", ""]
-    if binary.prebuilt:
+    if _is_cute(e):
+        lines += _wrap(
+            f"The CuTe DSL kernel `{binary.stem}` of operator `{e['op']}`, built for {', '.join(binary.archs)} by nvidia-cutlass-dsl "
+            f"{e['binary']['cutlass_dsl']} (its PTX has sha256 {e['source_digest']}), not compiled by Triton."
+        )
+        lines += _wrap(
+            f"It is launched with the parameters, grid `{e['grid']}`, block {_block_text(e['block'])} and {e['shared']} bytes of dynamic shared memory "
+            "of the compiled kernel (its shapes are static): its tensors, as pointers or as the TMA descriptors the DSL encoded, and constant bytes."
+        )
+    elif binary.prebuilt:
         source = "PTX that ptxas assembled" if e["binary"]["source"] == "ptx" else "a cubin used as it is"
         lines += _wrap(f"The prebuilt binary `{binary.stem}` of operator `{e['op']}`, built for {', '.join(binary.archs)}: {source}, not compiled by Triton.")
         lines += _wrap(f"Its source file has sha256 {e['source_digest']}. It is launched with exactly its parameters: there are no Triton scratch slots.")

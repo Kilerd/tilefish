@@ -1102,7 +1102,11 @@ class PlanRunner:
             else:
                 built = self.provider.kernel(callee, bound.spec, index)
                 check_launch_config(built, bound.spec)  # the declared warps (a warp-specialised kernel's default partition, and more)
-                order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "tensordesc", "scalar", "given"))
+                if getattr(built, "cute", None) is not None:  # a CuTe DSL kernel: the parameters and the grid of the compiled kernel (its build's)
+                    order = tuple((p["kind"], p["name"]) for p in built.abi()["params"] if p["kind"] in ("pointer", "tensormap"))
+                    bound = dataclasses.replace(bound, grid=built.grid)
+                else:
+                    order = tuple((a.kind, a.name) for a in bound.spec.args if a.kind in ("pointer", "tensordesc", "scalar", "given"))
                 loaded = be.load(built, index)
                 be.check_grid(loaded, bound.grid)
                 probe = None
@@ -1544,8 +1548,8 @@ class PlanRunner:
         else:
             launch_args: "list[tuple[str, Any]]" = []
             for kind, n in st.order:
-                if kind == "pointer":
-                    launch_args.append(("pointer", real[n].ptr))
+                if kind in ("pointer", "tensormap"):  # (a CuTe DSL kernel's TMA descriptor: the launch writes the address into its template)
+                    launch_args.append((kind, real[n].ptr))
                 elif kind == "tensordesc":
                     launch_args.append(("tensordesc", (descs or {})[n]))
                 else:
@@ -2562,6 +2566,7 @@ def _build_callees(
     every Triton binary of an operator it covers (``docs/instrument.md``)."""
     from ._build import build
     from ._binary import build_binary
+    from ._cute import build_cute
 
     built: list = []
     pinned: list = []
@@ -2574,6 +2579,8 @@ def _build_callees(
         if callee.kind == "library":
             pinned.append(_pin_library(spec, cap))
             continue
+        elif callee.extern.binary is not None and callee.extern.binary.kind == "cute":  # type: ignore[union-attr]
+            built.append(build_cute(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         elif callee.extern.binary is not None:  # type: ignore[union-attr]
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         else:

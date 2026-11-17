@@ -109,7 +109,15 @@ execution) checks what the driver would refuse (`PreconditionKind::TensorMap`)
 and encodes the `CUtensorMap` of that tensor with `cuTensorMapEncodeTiled`
 (cudarc's `sys`), then passes it by value with the tensor's shape and strides,
 as Triton launches a host `TensorDescriptor`; a captured graph holds the map
-of the addresses it captured. A warp-specialised kernel (Gluon's
+of the addresses it captured. A CuTe DSL kernel (a `binary` entry of source
+`cute`, `BinarySource::Cute`) is launched as its compiled host function
+launches it: the entry's grid of integers, block, cluster and shared memory,
+its tensors as pointers or as the TMA descriptors the DSL encoded (kind
+`tensormap`, `ParamKind::Pointer` with a `template`: a tensor like a pointer,
+whose launch passes the template with the tensor's address in its first eight
+bytes, 128 bytes by value; an address of 2^57 or more is refused) and its
+constant bytes (kind `bytes`, `ParamKind::Bytes`, passed as the manifest has
+them), in a single launch, a plan step and a captured graph alike. A warp-specialised kernel (Gluon's
 `gl.warp_specialize`, or Triton's own warp specialisation) has the warps of all
 its partitions in `Entry::total_num_warps` (next to `Entry::num_warps`, the
 declared warps of its default partition), and every launch, step of a plan and

@@ -3,7 +3,7 @@
 //! A port of `python/src/tilefish/_manifest.py` (`Manifest.load`) and of the schema checks of `_specvalid.py`, for manifest schema 3
 //! (`docs/manifest-schema-3.md`). A manifest is read as strict JSON (see [`crate::json`]), every field has the type it needs (an object is
 //! an object, never the list of its values) and no key is unknown, and the entries are checked for being consistent with themselves: the ABI (pointers, strided views, device scalars,
-//! scalars, `fixed` arguments, scratch slots), the preconditions, the buckets, the grid. Then each cubin is read, and refused unless
+//! scalars, `fixed` arguments, TMA descriptors, the descriptors and constant bytes of a CuTe DSL kernel, scratch slots), the preconditions, the buckets, the grid. Then each cubin is read, and refused unless
 //! its `sha256` (the file) and `sha256_code` (the machine code, see [`crate::elf`]) are the manifest's, it has the code section of
 //! the manifest's symbol, and it is for the architecture the entry says. A Triton kernel that does not use shared memory in the
 //! manifest's account must not have a shared memory section.
@@ -61,6 +61,20 @@ pub const IMPLEMENTATION_FALLBACK: &str = "fallback";
 const MAX_IMPLEMENTATION_NAME: usize = 64;
 /// The `source_digest_kind` of a prebuilt binary: its `source_digest` is the sha256 of the PTX or cubin file.
 const BINARY_DIGEST_KIND: &str = "tilefish.binary.v1";
+/// The `source_digest_kind` of a CuTe DSL kernel (manifest schema 3, section 4.9): its `source_digest` is the sha256 of the PTX the DSL generated.
+/// Python's `_cute.DIGEST_KIND`.
+const CUTE_DIGEST_KIND: &str = "tilefish.cute.v1";
+/// The bytes of a TMA descriptor (a `CUtensorMap`), passed by value.
+pub(crate) const DESCRIPTOR_BYTES: usize = 128;
+/// The bytes of a CuTe DSL kernel's TMA descriptor its host code writes (eight 64-bit words): the template is zero after them, and in its first
+/// eight bytes, where a launch writes the tensor's address. Python's `_cute.DESCRIPTOR_WRITTEN`.
+const DESCRIPTOR_WRITTEN: usize = 64;
+/// The largest parameter of constant bytes (kind `bytes`) of a CuTe DSL kernel: the parameter space of a kernel (sm_70 and up). Python's
+/// `_manifest.MAX_PARAM_BYTES`.
+pub const MAX_PARAM_BYTES: usize = 32764;
+/// The addresses a CuTe DSL kernel's TMA descriptor holds are below this: the DSL encodes `(address / 16) & (2**53 - 1)` at bit 4 of its first
+/// word, 57 bits of address. Python's `_cute.ADDRESS_LIMIT`.
+pub const CUTE_ADDRESS_LIMIT: u64 = 1 << 57;
 
 /// What vouches for a manifest directory.
 #[derive(Debug, Clone, Copy)]
@@ -292,6 +306,10 @@ pub enum ParamKind {
     /// and passes the `CUtensorMap` it encodes of it (`cuTensorMapEncodeTiled`: the tensor's address, shape and strides, and the map's box,
     /// swizzle, L2 promotion and fill), by value, then the tensor's shape (`i32` each) and element strides (`i64` each): `1 + 2 * rank` slots
     /// of `kernelParams` ([`Param::slots`]), as Triton passes a host `TensorDescriptor`.
+    ///
+    /// With a `template` it is the **TMA descriptor of a CuTe DSL kernel** (manifest kind `tensormap`, section 4.9): a launch is given the tensor,
+    /// as for a pointer (it binds dimensions, has its preconditions, is in [`crate::Plan::tensor_names`]), and passes the template with the
+    /// tensor's address in its first eight bytes, 128 bytes by value in one slot of `kernelParams`.
     Pointer {
         /// The element dtype as the manifest names it (`"bf16"`, `"e2m1"`, ...).
         dtype_name: String,
@@ -308,6 +326,10 @@ pub enum ParamKind {
         alias: Option<String>,
         /// A TMA descriptor of the tensor (`TensorDesc(...)` in Python): the map it is encoded with. `None` for a pointer.
         tensor_map: Option<TensorMap>,
+        /// A TMA descriptor of a CuTe DSL kernel (manifest kind `tensormap`): the 128 bytes of the `CUtensorMap` the DSL's host code encoded for
+        /// the tensor's static shape, zero in bytes 0 to 7 (where a launch writes the tensor's address, a little-endian `u64`) and 64 to 127
+        /// (which the DSL does not write). Such a pointer is dense (no `view`, no `alias`). `None` for any other pointer.
+        template: Option<Box<[u8; DESCRIPTOR_BYTES]>>,
     },
     /// A runtime integer: the value of a dimension expression, the element count of a pointer, or one stride of a strided pointer.
     Scalar {
@@ -339,6 +361,13 @@ pub enum ParamKind {
         /// The element dtype of the pointer as the manifest names it (its `type` is that dtype's pointer type).
         dtype_name: String,
     },
+    /// Constant bytes of a CuTe DSL kernel (manifest kind `bytes`, section 4.9: a static layout, an empty structure, a value compiled for the
+    /// bucket): every launch passes them, by value, at its own slot, and a call gives nothing for it (as for a `fixed` argument). Its `index` is
+    /// its slot and its name `param_<slot>`: it is no parameter of the declaration.
+    Bytes {
+        /// The bytes, 1 to [`MAX_PARAM_BYTES`] of them.
+        value: Vec<u8>,
+    },
 }
 
 /// One non-constexpr parameter of the launch ABI.
@@ -346,11 +375,11 @@ pub enum ParamKind {
 pub struct Param {
     /// Position in `kernelParams` of its first slot (a TMA descriptor takes `1 + 2 * rank` slots from there: [`Param::slots`]).
     pub slot: usize,
-    /// Position among all the kernel's parameters, constexprs included.
+    /// Position among all the kernel's parameters, constexprs included (constant bytes of a CuTe DSL kernel: its slot).
     pub index: usize,
     /// The parameter's name.
     pub name: String,
-    /// Pointer, scalar or fixed argument.
+    /// Pointer (or TMA descriptor), scalar, fixed argument, null pointer or constant bytes.
     pub kind: ParamKind,
 }
 
@@ -368,11 +397,20 @@ impl Param {
         }
     }
 
+    /// Whether this is the TMA descriptor of a CuTe DSL kernel (a pointer with a `template`: manifest kind `tensormap`), and its template.
+    pub fn template(&self) -> Option<&[u8; DESCRIPTOR_BYTES]> {
+        match &self.kind {
+            ParamKind::Pointer { template, .. } => template.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The bytes of each `kernelParams` slot the parameter takes: one slot of [`Param::size`] bytes, or for a TMA descriptor of a tensor of
-    /// rank `r` the 128 bytes of its `CUtensorMap`, then `r` of 4 (its shape) and `r` of 8 (its strides).
+    /// rank `r` the 128 bytes of its `CUtensorMap`, then `r` of 4 (its shape) and `r` of 8 (its strides). (A CuTe DSL kernel's descriptor and
+    /// its constant bytes are one slot each: `[128]`, `[size]`.)
     pub fn slots(&self) -> Vec<usize> {
         match &self.kind {
-            ParamKind::Pointer { tensor_map: Some(_), shape, .. } => std::iter::once(128)
+            ParamKind::Pointer { tensor_map: Some(_), shape, .. } => std::iter::once(DESCRIPTOR_BYTES)
                 .chain(std::iter::repeat_n(4, shape.len()))
                 .chain(std::iter::repeat_n(8, shape.len()))
                 .collect(),
@@ -380,12 +418,16 @@ impl Param {
         }
     }
 
-    /// The bytes the parameter takes in `kernelParams` (its first slot, for a TMA descriptor): 8 for a pointer, 128 for a descriptor, as many
-    /// as its type for a scalar or a fixed argument (the `size` of the manifest, which the loaded function is asked to report).
+    /// The bytes the parameter takes in `kernelParams` (its first slot, for a TMA descriptor): 8 for a pointer, 128 for a descriptor (of either
+    /// kind), as many as its type for a scalar or a fixed argument, as many as it has for constant bytes (the `size` of the manifest, which the
+    /// loaded function is asked to report).
     pub fn size(&self) -> usize {
         match &self.kind {
-            ParamKind::Pointer { tensor_map: Some(_), .. } => 128,
+            ParamKind::Pointer { tensor_map: Some(_), .. } | ParamKind::Pointer { template: Some(_), .. } => {
+                DESCRIPTOR_BYTES
+            }
             ParamKind::Pointer { .. } | ParamKind::Null { .. } => 8,
+            ParamKind::Bytes { value } => value.len(),
             ParamKind::Scalar { ty, .. } => match ty {
                 ScalarType::I32 => 4,
                 ScalarType::I64 => 8,
@@ -600,7 +642,8 @@ const MAX_SM_COUNT: u64 = 1 << 20;
 pub enum EntryKind {
     /// A kernel Triton compiled (`num_warps`, `num_stages` and `options` are its compile settings; two scratch slots follow its parameters).
     Triton,
-    /// A prebuilt PTX (assembled by `ptxas`) or cubin: launched with exactly its parameters, no scratch slots.
+    /// A prebuilt PTX (assembled by `ptxas`) or cubin, or the cubin of a CuTe DSL kernel ([`BinarySource::Cute`]): launched with exactly its
+    /// parameters, no scratch slots.
     Binary,
 }
 
@@ -632,6 +675,15 @@ pub enum BinarySource {
         /// The flags, in their spelling (`ptxas` records them in the cubin, so the machine code depends on them).
         ptxas_flags: Vec<String>,
     },
+    /// A kernel of CUTLASS's CuTe DSL (manifest schema 3, section 4.9): the cubin the DSL compiled (its NVVM, then the `ptxas` it carries) for
+    /// the static shapes of one bucket, launched as its compiled host function launches it (the entry's grid of integers, block, cluster, shared
+    /// memory and parameters: pointers, TMA descriptors of kind `tensormap`, constant `bytes`). Its `source_digest` is the sha256 of its PTX.
+    Cute {
+        /// The version of the DSL package (`nvidia-cutlass-dsl`) that compiled it (`"4.8.1"`), which is the toolchain's.
+        cutlass_dsl: String,
+        /// The DSL compile options the declaration gives (`"--opt-level 3"`), one space apart; possibly empty.
+        options: String,
+    },
 }
 
 /// The CUDA math library functions a generated kernel's bits are (`docs/manifest-schema-3.md` section 4.7, `docs/numerics.md`): in IEEE math
@@ -660,7 +712,8 @@ pub struct Entry {
     pub kind: EntryKind,
     /// The architecture the cubin is for (`sm_103`).
     pub arch: String,
-    /// The `.target` of the PTX it was assembled from (`""` for a cubin that was used as it is).
+    /// The `.target` of the PTX it was assembled from (`""` for a cubin that was used as it is; for a CuTe DSL kernel the `sm_<arch>` of the
+    /// entry with an optional letter, `sm_103a`).
     pub ptx_target: String,
     /// The kernel's symbol in the cubin.
     pub symbol: String,
@@ -712,9 +765,11 @@ pub struct Entry {
     pub sha256_code: String,
     /// The Triton version that built it (a Triton kernel).
     pub triton: Option<String>,
-    /// The `ptxas` that assembled it (always for a Triton kernel; for a prebuilt binary only when it was made from PTX).
+    /// The `ptxas` that assembled it (always for a Triton kernel and a CuTe DSL kernel; for a prebuilt binary only when it was made from PTX).
     pub ptxas: Option<String>,
-    /// How a prebuilt binary was made.
+    /// The NVVM release the PTX header of a CuTe DSL kernel names (`toolchain.nvvm`); `None` for every other kernel.
+    pub nvvm: Option<String>,
+    /// How a prebuilt binary (or a CuTe DSL kernel) was made.
     pub binary: Option<BinarySource>,
     /// The sha256 of the Triton source of a generated kernel.
     pub source_sha256: Option<String>,
@@ -722,10 +777,12 @@ pub struct Entry {
     pub cuda_math: Option<CudaMath>,
     /// The identity of what was built: the digest of the Triton IR (TTIR without locations) the binary was built from, for generated and
     /// hand-written kernels alike (the TTGIR of Gluon's frontend for a Gluon kernel; Python recomputes it to tell a stale binary; a Rust
-    /// host has no Triton and trusts it through the pinned manifest digest), or, for a prebuilt binary, the sha256 of its PTX or cubin file.
+    /// host has no Triton and trusts it through the pinned manifest digest), or, for a prebuilt binary, the sha256 of its PTX or cubin file,
+    /// or, for a CuTe DSL kernel, the sha256 of the PTX the DSL generated (which Python's replay makes again; a Rust host trusts the pin).
     pub source_digest: Option<String>,
-    /// How `source_digest` was computed (`tilefish.triton-ir.v1`, `tilefish.gluon-ir.v1` for a Gluon kernel, or `tilefish.binary.v1` for a
-    /// prebuilt binary). A Gluon kernel is a `triton` entry like any other: Triton compiled it, and it is launched the same way.
+    /// How `source_digest` was computed (`tilefish.triton-ir.v1`, `tilefish.gluon-ir.v1` for a Gluon kernel, `tilefish.binary.v1` for a
+    /// prebuilt binary, or `tilefish.cute.v1` for a CuTe DSL kernel). A Gluon kernel is a `triton` entry like any other: Triton compiled it, and
+    /// it is launched the same way.
     pub source_digest_kind: Option<String>,
     /// A persistent grid (manifest schema 3, section 4.3): the grid is the tiles, and a launch runs at most `programs_per_sm` programs per SM of
     /// the device (or partition) the kernel was loaded for. `None` for every other kernel.
@@ -1114,6 +1171,8 @@ struct RawParam {
     alias: Option<Value>,
     #[serde(default)]
     tensor_map: Option<Value>,
+    #[serde(default)]
+    template: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1167,6 +1226,28 @@ struct RawToolchain {
     triton: Option<String>,
     #[serde(default)]
     ptxas: Option<String>,
+    /// A CuTe DSL kernel's (section 4.9): the DSL's version and the NVVM release its PTX header names.
+    #[serde(default)]
+    cutlass_dsl: Option<String>,
+    #[serde(default)]
+    nvvm: Option<String>,
+}
+
+impl RawToolchain {
+    /// The fields present, as a JSON object, for a message.
+    fn shown(&self) -> String {
+        let fields = [
+            ("triton", &self.triton),
+            ("ptxas", &self.ptxas),
+            ("cutlass_dsl", &self.cutlass_dsl),
+            ("nvvm", &self.nvvm),
+        ];
+        let map: Map<String, Value> = fields
+            .into_iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k.to_owned(), Value::String(v.clone()))))
+            .collect();
+        Value::Object(map).to_string()
+    }
 }
 
 pub(crate) fn is_ident(s: &str) -> bool {
@@ -1209,6 +1290,48 @@ fn is_symbol(s: &str) -> bool {
 /// The `sm_103` of an architecture name as its number.
 fn arch_number(arch: &str) -> Option<u32> {
     arch.strip_prefix("sm_")?.parse().ok()
+}
+
+/// Whether an entry is of a CuTe DSL kernel: a `binary` entry whose `binary` is an object of `source` `"cute"` (section 4.9; Python's `cute` of
+/// `_check_params` and `Manifest._read`). What else its `binary` holds is [`read_binary`]'s to say.
+fn is_cute(raw: &RawEntry) -> bool {
+    raw.kind == "binary" && raw.binary.as_ref().and_then(|b| b.get("source")).and_then(Value::as_str) == Some("cute")
+}
+
+/// The version of a CuTe DSL package (`binary.cutlass_dsl`): Python's `[0-9]+(\.[0-9]+){1,3}[A-Za-z0-9.+_-]*`, which is a number, a dot, a number
+/// and then any characters of the suffix (its dots and digits included).
+fn is_dsl_version(s: &str) -> bool {
+    let b = s.as_bytes();
+    let major = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    if major == 0 || b.get(major) != Some(&b'.') {
+        return false;
+    }
+    let rest = &b[major + 1..];
+    let minor = rest.iter().take_while(|c| c.is_ascii_digit()).count();
+    minor > 0 && rest[minor..].iter().all(|c| c.is_ascii_alphanumeric() || b".+_-".contains(c))
+}
+
+/// The compile options of a CuTe DSL kernel (`binary.options`): characters of `[A-Za-z0-9 =,._:/+-]`, the words one space apart (no leading,
+/// trailing or double space: the form Python's `" ".join(options.split())` gives), possibly empty.
+fn is_dsl_options(s: &str) -> bool {
+    s.bytes().all(|c| c.is_ascii_alphanumeric() || b" =,._:/+-".contains(&c))
+        && !s.starts_with(' ')
+        && !s.ends_with(' ')
+        && !s.contains("  ")
+}
+
+/// The bytes of `2 * n` lowercase hex digits (a `template` or a `value` of a CuTe DSL kernel's parameter), `None` for any other text.
+fn lowercase_hex(text: &str, n: usize) -> Option<Vec<u8>> {
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let b = text.as_bytes();
+    if b.len() != 2 * n {
+        return None;
+    }
+    b.as_chunks::<2>().0.iter().map(|[hi, lo]| Some(digit(*hi)? << 4 | digit(*lo)?)).collect()
 }
 
 /// The Triton spelling of a pointer to each dtype a manifest may name (Python's `ALL_DTYPES`).
@@ -1582,7 +1705,11 @@ fn read_tensor_map(v: Option<&Value>, dtype: &str, rank: usize, name: &str) -> s
 }
 
 /// The ABI parameters of an entry, each checked on its own (the kinds, the types and their widths, which fields each has).
+///
+/// A CuTe DSL kernel (section 4.9) takes `pointer`s that are dense (no `strides`, `offset` or `alias`), `tensormap`s and `bytes` only, and no
+/// other entry takes the last two (Python's `_check_params`).
 fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param>, String> {
+    let cute = is_cute(raw);
     let mut out = Vec::with_capacity(raw.abi.params.len());
     let mut next_slot = 0usize; // where the slots of the next parameter begin: a TMA descriptor takes 1 + 2 * rank, every other one 1
     for (position, p) in raw.abi.params.iter().enumerate() {
@@ -1604,7 +1731,30 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                 p.kind
             ));
         }
+        if p.template.is_some() && p.kind != "tensormap" {
+            return Err(format!(
+                "parameter {name} is a {} and has a template: only a TMA descriptor of a CuTe DSL kernel (kind tensormap) has one",
+                p.kind
+            ));
+        }
+        if cute && !matches!(p.kind.as_str(), "pointer" | "tensormap" | "bytes") {
+            return Err(format!(
+                "parameter {name} is a {}: a CuTe DSL kernel takes pointers, TMA descriptors (tensormap) and constant bytes (bytes)",
+                p.kind
+            ));
+        }
+        if cute && p.kind == "pointer" && (p.strides.is_some() || p.offset.is_some() || p.alias.is_some()) {
+            return Err(format!("parameter {name} is a view or an alias: a CuTe DSL kernel takes dense tensors"));
+        }
+        if !cute && matches!(p.kind.as_str(), "tensormap" | "bytes") {
+            return Err(format!(
+                "parameter {name} is a {}, which is a parameter of a CuTe DSL kernel (a binary entry of source 'cute'), and this is not one",
+                p.kind
+            ));
+        }
         let kind_of = match p.kind.as_str() {
+            "tensormap" => read_tensormap(p)?,
+            "bytes" => read_bytes(p)?,
             "pointer" | "tensordesc" => {
                 let desc = p.kind == "tensordesc";
                 let dtype = p.dtype.as_deref().unwrap_or("");
@@ -1757,6 +1907,7 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
                     view,
                     alias,
                     tensor_map,
+                    template: None,
                 }
             }
             "scalar" => {
@@ -1928,7 +2079,7 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
             }
             other => {
                 return Err(format!(
-                    "parameter {name}: kind must be pointer, tensordesc, scalar, fixed, given or null, got {other:?}"
+                    "parameter {name}: kind must be pointer, tensordesc, scalar, fixed, given, null, tensormap or bytes, got {other:?}"
                 ));
             }
         };
@@ -1937,12 +2088,142 @@ fn read_params(raw: &RawEntry, kind: EntryKind) -> std::result::Result<Vec<Param
     Ok(out)
 }
 
+/// The names of the fields of `p` among `keys` that it has, for a message of a field it may not have.
+fn present(p: &RawParam, keys: &[&'static str]) -> Vec<&'static str> {
+    keys.iter()
+        .copied()
+        .filter(|k| match *k {
+            "dim" => p.dim.is_some(),
+            "count_of" => p.count_of.is_some(),
+            "stride_of" => p.stride_of.is_some(),
+            "value" => p.value.is_some(),
+            "alias" => p.alias.is_some(),
+            "strides" => p.strides.is_some(),
+            "offset" => p.offset.is_some(),
+            "tensor_map" => p.tensor_map.is_some(),
+            "dtype" => p.dtype.is_some(),
+            "access" => p.access.is_some(),
+            "shape" => p.shape.is_some(),
+            _ => false,
+        })
+        .collect()
+}
+
+/// A `tensormap` parameter (a TMA descriptor of a tensor of a CuTe DSL kernel, section 4.9; Python's `_check_tensormap`): `type` `"tensormap"`,
+/// passed as 128 bytes (`ptx_type` `b8[128]`); the fields of a dense pointer (`dtype`, `access`, `shape`) and its `template`, 256 lowercase hex
+/// digits whose bytes 0 to 7 (where a launch writes the tensor's address) and 64 to 127 (which the DSL's host code does not write, and a launch
+/// passes as zeros) are zero; nothing else.
+fn read_tensormap(p: &RawParam) -> std::result::Result<ParamKind, String> {
+    let name = p.name.as_str();
+    if p.ty != "tensormap" || p.ptx_type != "b8[128]" || p.size != DESCRIPTOR_BYTES {
+        return Err(format!(
+            "parameter {name}: a TMA descriptor of a CuTe DSL kernel has type 'tensormap' and is passed as 128 bytes (ptx_type 'b8[128]', size 128)"
+        ));
+    }
+    let extra = present(p, &["dim", "count_of", "stride_of", "value", "alias", "strides", "offset", "tensor_map"]);
+    if !extra.is_empty() {
+        return Err(format!(
+            "parameter {name} is a TMA descriptor of a CuTe DSL kernel: it has a dtype, an access, a shape and a template, and no {extra:?}"
+        ));
+    }
+    let dtype = p.dtype.as_deref().unwrap_or("");
+    if pointer_type_of(dtype).is_none() {
+        let got = p.dtype.as_ref().map_or("None".to_owned(), |d| format!("{d:?}"));
+        return Err(format!("parameter {name}: dtype must be a dtype of the manifest, got {got}"));
+    }
+    let access = match p.access.as_deref() {
+        Some("in") => Access::In,
+        Some("inout") => Access::InOut,
+        Some("out") => Access::Out,
+        other => return Err(format!("parameter {name}: access must be in, inout or out, got {other:?}")),
+    };
+    let Some(shape) = &p.shape else {
+        return Err(format!("parameter {name}: shape must be a list, got None"));
+    };
+    let shape = parse_shape(name, shape)?;
+    let bytes = match &p.template {
+        Some(Value::String(text)) => lowercase_hex(text, DESCRIPTOR_BYTES),
+        _ => None,
+    };
+    let Some(bytes) = bytes else {
+        return Err(format!(
+            "parameter {name}: template must be 256 lowercase hex digits (the 128 bytes of the descriptor), got {}",
+            p.template.as_ref().map_or("None".to_owned(), ToString::to_string)
+        ));
+    };
+    if bytes[..8].iter().chain(&bytes[DESCRIPTOR_WRITTEN..]).any(|b| *b != 0) {
+        return Err(format!(
+            "parameter {name}: the bytes 0 to 7 (the tensor's address, written at a launch) and 64 to 127 of the template must be zero"
+        ));
+    }
+    let template: Box<[u8; DESCRIPTOR_BYTES]> =
+        bytes.into_boxed_slice().try_into().map_err(|_| format!("parameter {name}: the template is not 128 bytes"))?;
+    Ok(ParamKind::Pointer {
+        dtype: DType::from_name(dtype),
+        dtype_name: dtype.to_owned(),
+        access,
+        shape,
+        view: None,
+        alias: None,
+        tensor_map: None,
+        template: Some(template),
+    })
+}
+
+/// A `bytes` parameter (constant bytes of a CuTe DSL kernel, section 4.9; Python's `_check_bytes`): `type` `"bytes"`, `size` from 1 to 32764,
+/// `ptx_type` `b8[<size>]` and `value`, its `2 * size` lowercase hex digits; nothing else.
+fn read_bytes(p: &RawParam) -> std::result::Result<ParamKind, String> {
+    let (name, size) = (p.name.as_str(), p.size);
+    if p.ty != "bytes" || !(1..=MAX_PARAM_BYTES).contains(&size) || p.ptx_type != format!("b8[{size}]") {
+        return Err(format!(
+            "parameter {name}: constant bytes have type 'bytes', a size from 1 to {MAX_PARAM_BYTES} and ptx_type 'b8[<size>]', got {:?}, {size}, {:?}",
+            p.ty, p.ptx_type
+        ));
+    }
+    let extra = present(
+        p,
+        &["dim", "count_of", "stride_of", "alias", "strides", "offset", "tensor_map", "dtype", "access", "shape"],
+    );
+    if !extra.is_empty() {
+        return Err(format!("parameter {name} is constant bytes: it has a value and no {extra:?}"));
+    }
+    let value = match &p.value {
+        Some(Value::String(text)) => lowercase_hex(text, size),
+        _ => None,
+    };
+    let Some(value) = value else {
+        return Err(format!(
+            "parameter {name}: value must be {} lowercase hex digits (its {size} bytes), got {}",
+            2 * size,
+            p.value.as_ref().map_or("None".to_owned(), ToString::to_string)
+        ));
+    };
+    Ok(ParamKind::Bytes { value })
+}
+
+/// The `binary` section of a `binary` entry: `{"source": "cubin"}`, `{"source": "ptx", "ptxas_flags": [...]}`, or the section of a CuTe DSL
+/// kernel, exactly `{"source": "cute", "cutlass_dsl": <version>, "options": <options>}` (section 4.9; Python's `_check_cute_entry`).
 fn read_binary(v: &Value) -> std::result::Result<BinarySource, String> {
     let bad = || {
-        format!("binary must be {{\"source\": \"cubin\"}} or {{\"source\": \"ptx\", \"ptxas_flags\": [...]}}, got {v}")
+        format!(
+            "binary must be {{\"source\": \"cubin\"}}, {{\"source\": \"ptx\", \"ptxas_flags\": [...]}} or {{\"source\": \"cute\", ...}}, got {v}"
+        )
     };
     let obj = v.as_object().ok_or_else(bad)?;
     match obj.get("source").and_then(Value::as_str) {
+        Some("cute") => {
+            let text = |k: &str| obj.get(k).and_then(Value::as_str);
+            match (text("cutlass_dsl"), text("options")) {
+                (Some(version), Some(options))
+                    if obj.len() == 3 && is_dsl_version(version) && is_dsl_options(options) =>
+                {
+                    Ok(BinarySource::Cute { cutlass_dsl: version.to_owned(), options: options.to_owned() })
+                }
+                _ => Err(format!(
+                    "binary of a CuTe DSL kernel must be {{\"source\": \"cute\", \"cutlass_dsl\": <version>, \"options\": <options>}}, got {v}"
+                )),
+            }
+        }
         Some("cubin") if obj.len() == 1 => Ok(BinarySource::Cubin),
         Some("ptx") if obj.len() == 2 => {
             let flags = obj
@@ -2060,6 +2341,7 @@ impl Entry {
             sha256_code: raw.sha256_code,
             triton: raw.toolchain.triton,
             ptxas: raw.toolchain.ptxas,
+            nvvm: raw.toolchain.nvvm,
             binary,
             source_sha256: raw.source_sha256,
             cuda_math: raw.cuda_math.map(|c| CudaMath { functions: c.functions, cuda: c.cuda, libdevice: c.libdevice }),
@@ -2197,8 +2479,17 @@ impl Entry {
                 if raw.binary.is_some() {
                     return Err("a triton kernel is not a prebuilt binary: it has no `binary` section".to_owned());
                 }
-                if raw.toolchain.triton.is_none() || raw.toolchain.ptxas.is_none() {
+                if raw.toolchain.triton.is_none()
+                    || raw.toolchain.ptxas.is_none()
+                    || raw.toolchain.cutlass_dsl.is_some()
+                    || raw.toolchain.nvvm.is_some()
+                {
                     return Err("the toolchain of a triton kernel is {\"triton\": ..., \"ptxas\": ...}".to_owned());
+                }
+                if raw.source_digest_kind.as_deref() == Some(CUTE_DIGEST_KIND) {
+                    return Err(format!(
+                        "source_digest_kind '{CUTE_DIGEST_KIND}' is a CuTe DSL kernel's (a binary entry of source 'cute')"
+                    ));
                 }
             }
             EntryKind::Binary => {
@@ -2218,29 +2509,47 @@ impl Entry {
                     return Err("a prebuilt binary has a `binary` section: {\"source\": \"cubin\"} or {\"source\": \"ptx\", \"ptxas_flags\": [...]}".to_owned());
                 };
                 let source = read_binary(binary)?;
-                if raw.source_digest_kind.as_deref() != Some(BINARY_DIGEST_KIND) || raw.source_digest.is_none() {
-                    return Err(format!(
-                        "a prebuilt binary records the sha256 of its PTX or cubin as source_digest, with source_digest_kind '{BINARY_DIGEST_KIND}'"
-                    ));
-                }
-                if raw.source_sha256.is_some() {
-                    return Err(
-                        "a prebuilt binary has no source_sha256 (that is the source of a generated Triton kernel)"
-                            .to_owned(),
-                    );
-                }
-                if source == BinarySource::Cubin && raw.source_digest.as_deref() != Some(raw.sha256.as_str()) {
-                    return Err("the source_digest of a cubin used as it is is the sha256 of the cubin file".to_owned());
-                }
-                if raw.toolchain.triton.is_some() {
-                    return Err(
-                        "the toolchain of a prebuilt binary has no triton: it is {} or {\"ptxas\": ...}".to_owned()
-                    );
-                }
-                if (source == BinarySource::Cubin) != raw.toolchain.ptxas.is_none() {
-                    return Err(
-                        "the toolchain of a prebuilt binary is {} for a cubin and {\"ptxas\": ...} for PTX".to_owned()
-                    );
+                if let BinarySource::Cute { cutlass_dsl, .. } = &source {
+                    Self::check_cute(raw, cutlass_dsl)?;
+                } else {
+                    if raw.source_digest_kind.as_deref() == Some(CUTE_DIGEST_KIND) {
+                        return Err(format!(
+                            "source_digest_kind '{CUTE_DIGEST_KIND}' is a CuTe DSL kernel's (a binary entry of source 'cute')"
+                        ));
+                    }
+                    if raw.source_digest_kind.as_deref() != Some(BINARY_DIGEST_KIND) || raw.source_digest.is_none() {
+                        return Err(format!(
+                            "a prebuilt binary records the sha256 of its PTX or cubin as source_digest, with source_digest_kind '{BINARY_DIGEST_KIND}'"
+                        ));
+                    }
+                    if raw.source_sha256.is_some() {
+                        return Err(
+                            "a prebuilt binary has no source_sha256 (that is the source of a generated Triton kernel)"
+                                .to_owned(),
+                        );
+                    }
+                    if source == BinarySource::Cubin && raw.source_digest.as_deref() != Some(raw.sha256.as_str()) {
+                        return Err(
+                            "the source_digest of a cubin used as it is is the sha256 of the cubin file".to_owned()
+                        );
+                    }
+                    if raw.toolchain.triton.is_some() {
+                        return Err(
+                            "the toolchain of a prebuilt binary has no triton: it is {} or {\"ptxas\": ...}".to_owned()
+                        );
+                    }
+                    if raw.toolchain.cutlass_dsl.is_some() || raw.toolchain.nvvm.is_some() {
+                        return Err(format!(
+                            "the toolchain of a prebuilt binary is {{}} or {{\"ptxas\": ...}} (cutlass_dsl and nvvm are a CuTe DSL kernel's), got {}",
+                            raw.toolchain.shown()
+                        ));
+                    }
+                    if (source == BinarySource::Cubin) != raw.toolchain.ptxas.is_none() {
+                        return Err(
+                            "the toolchain of a prebuilt binary is {} for a cubin and {\"ptxas\": ...} for PTX"
+                                .to_owned(),
+                        );
+                    }
                 }
                 if !raw.constexprs.is_empty() {
                     return Err("a prebuilt binary has no constexprs".to_owned());
@@ -2339,14 +2648,16 @@ impl Entry {
                 return Err("the scratch slots must be global_scratch and profile_scratch, null 64-bit pointers after the arguments".to_owned());
             }
         }
-        // every parameter index once, parameters and constexprs together
+        // every parameter index once, parameters and constexprs together (the constant bytes of a CuTe DSL kernel are no parameter of the
+        // declaration: each has its slot as its index, and the tensors the indices of the declaration)
+        let declared: Vec<&RawParam> = raw.abi.params.iter().filter(|p| p.kind != "bytes").collect(); // (`read_params` holds them to such an entry)
         let mut indices: Vec<usize> =
-            raw.abi.params.iter().map(|p| p.index).chain(raw.constexprs.iter().map(|c| c.index)).collect();
+            declared.iter().map(|p| p.index).chain(raw.constexprs.iter().map(|c| c.index)).collect();
         indices.sort_unstable();
         if indices.iter().enumerate().any(|(i, v)| i != *v) {
             return Err("the parameters and the constexprs must have the indices 0, 1, 2, ... once each".to_owned());
         }
-        if !raw.abi.params.windows(2).all(|w| w[0].index < w[1].index) {
+        if !declared.windows(2).all(|w| w[0].index < w[1].index) {
             return Err("the parameters must be in declaration order".to_owned());
         }
         let mut names: Vec<&str> = raw
@@ -2359,6 +2670,61 @@ impl Entry {
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             return Err("argument names must be unique".to_owned());
+        }
+        Ok(())
+    }
+
+    /// What the entry of a CuTe DSL kernel says of itself besides its `binary` section (section 4.9; Python's `_check_cute_entry`): `toolchain`
+    /// exactly `{cutlass_dsl, nvvm, ptxas}`, the DSL the binary's (`cutlass_dsl`); the source digest of kind `tilefish.cute.v1` (its PTX); the
+    /// `ptx_target` of its architecture (`sm_103a`); a grid that names no dimension (its shapes are static); no persistent grid and no
+    /// `source_sha256`.
+    fn check_cute(raw: &RawEntry, cutlass_dsl: &str) -> std::result::Result<(), String> {
+        let t = &raw.toolchain;
+        let (Some(dsl), Some(_), Some(_), None) = (&t.cutlass_dsl, &t.nvvm, &t.ptxas, &t.triton) else {
+            return Err(format!(
+                "the toolchain of a CuTe DSL kernel is {{\"cutlass_dsl\", \"nvvm\", \"ptxas\"}} (strings), got {}",
+                t.shown()
+            ));
+        };
+        if dsl != cutlass_dsl {
+            return Err(format!("toolchain.cutlass_dsl {dsl:?} is not binary.cutlass_dsl {cutlass_dsl:?}"));
+        }
+        if raw.source_digest_kind.as_deref() != Some(CUTE_DIGEST_KIND) || raw.source_digest.is_none() {
+            return Err(format!(
+                "a CuTe DSL kernel records the sha256 of its PTX as source_digest, with source_digest_kind '{CUTE_DIGEST_KIND}'"
+            ));
+        }
+        // `sm_<digits>` and an optional lowercase letter, of the entry's architecture (by number: `sm_090` is sm_90, as the reader parses it)
+        let target =
+            raw.ptx_target.strip_prefix("sm_").map(|n| n.strip_suffix(|c: char| c.is_ascii_lowercase()).unwrap_or(n));
+        let ok = target.is_some_and(|n| {
+            (2..=3).contains(&n.len())
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && n.parse::<u32>().ok() == arch_number(&raw.arch)
+        });
+        if !ok {
+            return Err(format!(
+                "ptx_target of a CuTe DSL kernel is the .target of its PTX for {} (\"sm_103a\"), got {:?}",
+                raw.arch, raw.ptx_target
+            ));
+        }
+        let mut names = Symbols::default();
+        parse_grid(&raw.grid, &mut names)?;
+        if names.len() > 0 {
+            return Err(format!(
+                "the grid of a CuTe DSL kernel is integers (its shapes are static), got {:?}",
+                raw.grid
+            ));
+        }
+        if raw.persistent.is_some() {
+            return Err(
+                "a CuTe DSL kernel has no persistent grid (its grid is the compiled host function's)".to_owned()
+            );
+        }
+        if raw.source_sha256.is_some() {
+            return Err(
+                "a CuTe DSL kernel has no source_sha256 (that is the source of a generated Triton kernel)".to_owned()
+            );
         }
         Ok(())
     }
@@ -2378,12 +2744,13 @@ impl Entry {
                 shape: target_shape,
                 view,
                 tensor_map,
+                template,
                 ..
             }) = self.param(alias).map(|t| &t.kind)
             else {
                 return Err(format!("arg {} may alias '{alias}', which is not an `in` pointer argument", p.name));
             };
-            if *access != Access::In || tensor_map.is_some() {
+            if *access != Access::In || tensor_map.is_some() || template.is_some() {
                 return Err(format!("arg {} may alias '{alias}', which is not an `in` pointer argument", p.name));
             }
             if view.is_some() || target_shape.is_empty() {
@@ -2462,7 +2829,10 @@ impl Entry {
                         }
                     }
                 }
-                ParamKind::Fixed { .. } | ParamKind::Given { .. } | ParamKind::Null { .. } => {}
+                ParamKind::Fixed { .. }
+                | ParamKind::Given { .. }
+                | ParamKind::Null { .. }
+                | ParamKind::Bytes { .. } => {}
             }
         }
         for p in &self.params {
@@ -2510,8 +2880,10 @@ impl Entry {
             match pre {
                 Precondition::PointerAlignment { arg, bytes, .. } => {
                     let allowed = match kind_of(arg) {
-                        // the global address of a TMA descriptor is 16-byte aligned, a view's too
-                        Some(ParamKind::Pointer { tensor_map: Some(_), .. }) => Some(vec![ALIGNMENT]),
+                        // the global address of a TMA descriptor is 16-byte aligned, a view's too (and the address a CuTe DSL kernel's descriptor
+                        // holds: the DSL keeps `address / 16`)
+                        Some(ParamKind::Pointer { tensor_map: Some(_), .. })
+                        | Some(ParamKind::Pointer { template: Some(_), .. }) => Some(vec![ALIGNMENT]),
                         // a strided pointer, and a dense one that is not a device scalar (the specialisation of a lowered kernel for views
                         // that do not start on 16 bytes), may promise only its element's alignment
                         Some(ParamKind::Pointer { view, shape, dtype_name, .. })

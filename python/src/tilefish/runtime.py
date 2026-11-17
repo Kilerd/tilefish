@@ -104,10 +104,10 @@ import threading
 import weakref
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from . import _cache, _cuda, _cudamath, _ir, _probe, _source
-from ._build import BuiltKernel, build, check_launch_config, export_session, resolve_triton, write_file, write_manifest_doc
+from ._build import BuiltKernel, build, check_launch_config, export_session, is_cute, resolve_triton, write_file, write_manifest_doc
 from ._cuda import sm_partition as sm_partition  # tilefish.runtime.sm_partition(sms): the partition (a green context) a persistent grid is resolved for
 from ._launch import (
     TORCH_DTYPE_NAMES,
@@ -134,7 +134,7 @@ from ._specvalid import ALIGNMENT
 from .aot import CompileSpec, compile_specs
 from .decorators import ExternOp, GraphOp, KernelOp, LibraryOp, Op
 from .dtypes import BlockScaled
-from .dims import Dim, DimExpr
+from .dims import Dim, DimExpr, as_dim
 from ._manifest import MANIFEST_NAME, Manifest, manifest_digest
 from .errors import (
     TilefishBuildError,
@@ -180,6 +180,7 @@ def clear_caches() -> None:
             _builds.clear()
             _manifests.clear()
             _pins.clear()
+            _cute_digests.clear()
         _planrun.clear_caches()  # the runners of launch plans, and the arenas they hold
         _cuda.unload_all()  # nothing to do (and no driver imported) when no module was loaded
 
@@ -532,7 +533,10 @@ def _specialised(target: _Target, infos: "dict[str, TensorInfo]") -> _Target:
 
 
 def _grid_of(extern: ExternOp, spec: CompileSpec) -> "tuple[DimExpr, ...]":
-    """The grid expressions of the binary ``spec`` of ``extern``: its declared grid, or the one ``by_bucket=`` gives that bucket."""
+    """The grid expressions of the binary ``spec`` of ``extern``: its declared grid, or the one ``by_bucket=`` gives that bucket. A CuTe DSL kernel's
+    grid is its build's (:attr:`~tilefish._build.BuiltKernel.grid`): one program here, which its launch replaces."""
+    if is_cute(spec):
+        return (as_dim(1),)
     grid = extern.grid_for(spec.buckets)
     assert grid is not None
     return grid
@@ -708,11 +712,27 @@ def build_for_device(spec: CompileSpec, fn: Any, device_index: int, instrument: 
     return built
 
 
+def cute_launch_args(built: BuiltKernel, tensors: "Mapping[str, Any]") -> "list[tuple[str, int]]":
+    """The arguments of a launch of a CuTe DSL kernel, in the order of its ABI: ``("pointer", address)`` and ``("tensormap", address)`` of each tensor
+    (``tensors`` by name: anything with ``data_ptr()``, or an int address); its constant ``bytes`` are the launch's to write."""
+    out = []
+    for p in built.abi()["params"]:
+        if p["kind"] in ("pointer", "tensormap"):
+            t = tensors[p["name"]]
+            out.append((p["kind"], int(t) if isinstance(t, int) else int(t.data_ptr())))
+    return out
+
+
 def _launch_built(prep: _Prepared, built: BuiltKernel, index: int, probes: Any = None, manifest_digest: "str | None" = None) -> None:
     """Launch a binary through the CUDA driver on torch's current stream, with the ABI of the manifest. ``probes`` (a :class:`tilefish.Probes`)
     collects the records of an instrumented binary: its probe buffer is given in the profile scratch slot, and read back after the launch."""
     torch = _torch()
     check_launch_config(built, prep.spec)  # its warps are the declared ones (a warp-specialised kernel: those of its default partition, and more)
+    if built.cute is not None:  # a CuTe DSL kernel: the parameters and the grid of the compiled kernel (its build's)
+        with torch.cuda.device(index):
+            loaded = _cuda.load(built, index)
+            loaded.launch(built.grid, cute_launch_args(built, prep.tensors), torch.cuda.current_stream(index).cuda_stream)
+        return
     with torch.cuda.device(index):
         args: "list[tuple[str, Any]]" = []
         for kind, name, v in _launch_values(prep):
@@ -760,10 +780,30 @@ def build_binary_for_device(spec: CompileSpec, target: Any, device_index: int) -
     return built
 
 
+def build_cute_for_device(spec: CompileSpec, target: Any, device_index: int) -> BuiltKernel:
+    """The (cached, in memory) build of a CuTe DSL kernel on device ``device_index`` (:func:`tilefish._cute.build_cute`): compiled by the DSL, its
+    launch captured there. Cached by the spec and the device's architecture (the declaration digest has the DSL's version and the host's file)."""
+    from ._cute import build_cute
+
+    torch = _torch()
+    cap = _capability(torch, device_index)
+    key = ("cute", spec.stem, cap, spec._fingerprint())
+    with _lock:
+        built = _builds.get(key)
+    if built is None:
+        built = build_cute(spec, target, arch=cap, device_index=device_index)
+        with _lock:
+            _builds[key] = built
+    return built
+
+
 def jit_built(target: _Target, spec: CompileSpec, index: int, instrument: "_probe.Instrument | None" = None) -> BuiltKernel:
     """The binary of ``spec`` as ``jit`` builds it (in memory, for the architecture of device ``index``): the current source through the compile
-    spec (its instrumented variant with ``instrument``), or a prebuilt PTX assembled / a cubin taken for the device (never instrumented)."""
+    spec (its instrumented variant with ``instrument``), or a prebuilt PTX assembled / a cubin taken for the device (never instrumented), or a CuTe
+    DSL kernel compiled and its launch captured on the device (never instrumented)."""
     extern = target.launch_extern()
+    if extern.binary is not None and extern.binary.kind == "cute":
+        return build_cute_for_device(spec, extern.binary, index)
     if extern.binary is not None:
         return build_binary_for_device(spec, extern.binary, index)
     fn = target.jit_function(spec)
@@ -835,6 +875,8 @@ def replay_built(target: _Target, spec: CompileSpec, manifest: Manifest, pinned:
     torch = _torch()
     cap = _capability(torch, index)
     arch = f"sm_{cap}"
+    if is_cute(spec):  # a CuTe DSL kernel is identified by the PTX the DSL makes of it, made again here (as a Triton kernel's IR)
+        return manifest.built_kernel(spec, arch, pinned=pinned, **_cute_digest(target, spec, index))
     if spec.binary is not None:  # a prebuilt binary is identified by the sha256 of its PTX or cubin, compared without Triton
         return manifest.built_kernel(spec, arch, pinned=pinned)
     artifact = manifest.get(spec.stem, arch)
@@ -850,6 +892,32 @@ def replay_built(target: _Target, spec: CompileSpec, manifest: Manifest, pinned:
     if built.cuda_math:  # torch's CUDA release, and the libdevice a build here would link, against the entry's (tilefish._cudamath)
         _cudamath.check(f"'{spec.stem}' ({arch})", built.cuda_math, libdevice_here=_cudamath.libdevice_sha256(built.options))
     return built
+
+
+_cute_digests: "dict[tuple, str]" = {}  # (stem, spec fingerprint, architecture) -> the sha256 of the PTX the DSL made of it in this process
+
+
+def _cute_digest(target: _Target, spec: CompileSpec, index: int) -> "dict[str, Any]":
+    """``{cute_digest, cute_why}`` for :meth:`~tilefish._manifest.Manifest.built_kernel`: the sha256 of the PTX the CuTe DSL makes of the declaration
+    on device ``index`` now (once per process), or ``None`` and why it could not be made (the DSL is not importable, or is another version)."""
+    from . import _cute
+
+    extern = target.launch_extern()
+    torch = _torch()
+    key = (spec.stem, spec._fingerprint(), _capability(torch, index))
+    with _lock:
+        known = _cute_digests.get(key)
+    if known is not None:
+        return {"cute_digest": known, "cute_why": None}
+    here = _cute.dsl_version()
+    if here is None:
+        return {"cute_digest": None, "cute_why": f"the CuTe DSL ({_cute.DISTRIBUTION}) is not installed here"}
+    if here != extern.binary.dsl:  # type: ignore[union-attr]
+        return {"cute_digest": None, "cute_why": f"this process has {_cute.DISTRIBUTION} {here}, the declaration {extern.binary.dsl}"}  # type: ignore[union-attr]
+    digest = _cute.ptx_digest(spec, extern.binary, index)  # type: ignore[arg-type]
+    with _lock:
+        _cute_digests[key] = digest
+    return {"cute_digest": digest, "cute_why": None}
 
 
 def _run_replay(prep: _Prepared, manifest: Manifest, pinned: bool, probes: Any = None) -> None:
@@ -1131,7 +1199,11 @@ def _export(
         extern = target.launch_extern()
         for spec in target.compile_specs():
             jit = None
-            if extern.binary is not None:
+            if extern.binary is not None and extern.binary.kind == "cute":  # compiled by the DSL, its launch captured on the device (of arch)
+                from ._cute import build_cute
+
+                built.append(build_cute(spec, extern.binary, arch=cap))
+            elif extern.binary is not None:
                 from ._binary import build_binary
 
                 built.append(build_binary(spec, extern.binary, arch=cap))
