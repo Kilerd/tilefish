@@ -621,14 +621,36 @@ def check_launch_shapes(d: "dict[str, Any]") -> None:
         bad(f"global_scratch is an int from 1 to {MAX_GLOBAL_SCRATCH} (bytes per CTA; not written when it is 0), got {d['global_scratch']!r}")
 
 
+CUTE_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_<>][A-Za-z0-9_<>]*)*(?:\(\))?\Z")
+CUTE_VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}[A-Za-z0-9.+_-]*\Z")
+CUTE_OPTIONS = re.compile(r"^[A-Za-z0-9 =,._:/+-]*\Z")
+
+
+def validate_cute_binary(b: Any) -> None:
+    """The ``binary`` section of a spec of a CuTe DSL kernel (:mod:`tilefish._cute`): ``kind`` ``"cute"``, the ``host`` function (``module:qualname``),
+    the ``source_sha256`` of its file, the ``cutlass_dsl`` version and the compile ``options``."""
+    _keys(b, "binary", ["kind", "host", "source_sha256", "cutlass_dsl", "options"])
+    if not isinstance(b["host"], str) or not CUTE_REF.match(b["host"]):
+        bad(f"binary host must name a host function as module:qualname, got {b['host']!r}")
+    if not (isinstance(b["source_sha256"], str) and _DIGEST.match(b["source_sha256"])):
+        bad(f"binary source_sha256 must be 64 lowercase hex digits (a sha256), got {b['source_sha256']!r}")
+    if not isinstance(b["cutlass_dsl"], str) or not CUTE_VERSION.match(b["cutlass_dsl"]):
+        bad(f"binary cutlass_dsl must be a version string, got {b['cutlass_dsl']!r}")
+    if not isinstance(b["options"], str) or not CUTE_OPTIONS.match(b["options"]) or b["options"] != " ".join(b["options"].split()):
+        bad(f"binary options must be CuTe DSL compile options, one space apart, got {b['options']!r}")
+
+
 def validate_binary(b: Any) -> None:
     """The ``binary`` section of a spec of a prebuilt (non-Triton) kernel: ``kind``, ``symbol``, dynamic ``shared`` memory and the sha256 of the
-    source, and its thread-block ``cluster`` when it has one."""
+    source, and its thread-block ``cluster`` when it has one; or of a CuTe DSL kernel (:func:`validate_cute_binary`)."""
+    if isinstance(b, dict) and b.get("kind") == "cute":
+        validate_cute_binary(b)
+        return
     _keys(b, "binary", ["kind", "symbol", "shared", "digests"], ["cluster"])
     if "cluster" in b:
         check_cluster(b["cluster"], "binary cluster")
     if b["kind"] not in ("ptx", "cubin"):
-        bad(f"binary kind must be 'ptx' or 'cubin', got {b['kind']!r}")
+        bad(f"binary kind must be 'ptx', 'cubin' or 'cute', got {b['kind']!r}")
     if not isinstance(b["symbol"], str) or not _SYMBOL.match(b["symbol"]):
         bad(f"binary symbol must be a kernel symbol, got {b['symbol']!r}")
     _int(b["shared"], "binary shared")

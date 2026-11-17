@@ -47,6 +47,7 @@ DEFAULT_SHARED_LIMIT = 48 * 1024  # dynamic shared memory above this needs cuFun
 INT32_MIN, INT32_MAX = -(1 << 31), (1 << 31) - 1
 INT64_MIN, INT64_MAX = -(1 << 63), (1 << 63) - 1
 UINT64_MAX = (1 << 64) - 1
+CUTE_ADDRESS_LIMIT = 1 << 57  # the addresses a CuTe DSL kernel's TMA descriptor holds (tilefish._cute.ADDRESS_LIMIT)
 
 
 def _ctype(type_: str) -> Any:
@@ -246,8 +247,9 @@ class LoadedKernel:
 
     @property
     def _call_params(self) -> "list[dict[str, Any]]":
-        """The arguments a caller passes: every parameter but the ``fixed`` ones and the null pointers, whose value the manifest holds and the launch writes itself."""
-        return [p for p in self._abi if p["kind"] not in ("fixed", "null")]
+        """The arguments a caller passes: every parameter but the ``fixed`` ones, the null pointers and the constant ``bytes`` of a CuTe DSL kernel, whose
+        value the manifest holds and the launch writes itself."""
+        return [p for p in self._abi if p["kind"] not in ("fixed", "null", "bytes")]
 
     def _check_params(self) -> None:
         """The loaded function must take the parameters of the manifest's ABI (count and sizes), when the driver can say."""
@@ -317,6 +319,13 @@ class LoadedKernel:
                 continue
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TilefishRuntimeError(f"{name} argument {position} ('{param['name']}') must be an int, got {value!r}")
+            if kind == "tensormap":  # the address a CuTe DSL kernel's TMA descriptor holds: 16-byte aligned, below 2**57 (tilefish._cute.descriptor)
+                if not 0 < value < CUTE_ADDRESS_LIMIT or value % 16:
+                    raise TilefishRuntimeError(
+                        f"{name} argument {position} ('{param['name']}') is the address of a TMA descriptor of a CuTe DSL kernel: 16-byte aligned and "
+                        f"below 2**57, got {value:#x}"
+                    )
+                continue
             if kind == "pointer":
                 lo, hi, what = 0, UINT64_MAX, "64-bit address"
             elif param["type"] == "i64":
@@ -386,10 +395,23 @@ class LoadedKernel:
             if p["kind"] == "fixed":
                 put(_ctype(p["type"])(decode_scalar(p["value"], f"fixed argument {p['name']}")))
                 continue
+            if p["kind"] == "bytes":  # constant bytes of a CuTe DSL kernel, as the manifest has them
+                raw = bytes.fromhex(p["value"])
+                put((ctypes.c_uint8 * len(raw)).from_buffer_copy(raw))
+                continue
             if p["kind"] == "null":  # a pointer every launch passes as null: the 64-bit zero at its slot
                 put(ctypes.c_uint64(0))
                 continue
             kind, v = next(passed)
+            if kind == "tensormap":  # a CuTe DSL kernel's TMA descriptor: its template with the tensor's address in its first 8 bytes, 64-byte aligned
+                from ._cute import descriptor
+
+                held = (ctypes.c_uint8 * (2 * DESCRIPTOR_BYTES))()
+                at = (ctypes.addressof(held) + 63) & ~63
+                ctypes.memmove(at, descriptor(p["template"], v), DESCRIPTOR_BYTES)
+                values.append(held)
+                addresses.append(at)
+                continue
             if kind == "tensordesc":  # the 128 bytes of the CUtensorMap (64-byte aligned, as its PTX parameter is), its shape (i32), its strides (i64)
                 held = (ctypes.c_uint8 * (2 * DESCRIPTOR_BYTES))()
                 at = (ctypes.addressof(held) + 63) & ~63

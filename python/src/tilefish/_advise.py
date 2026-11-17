@@ -326,7 +326,7 @@ def _access_table(entry: "Mapping[str, Any] | None", kind: str) -> "dict[str, st
         return {}
     if kind == "library":
         return {p.get("name"): ("out" if p.get("name") == "out" else "in") for p in (entry.get("abi") or {}).get("params") or []}
-    return {p.get("name"): p.get("access", "in") for p in (entry.get("abi") or {}).get("params") or [] if p.get("kind") in ("pointer", "tensordesc")}
+    return {p.get("name"): p.get("access", "in") for p in (entry.get("abi") or {}).get("params") or [] if p.get("kind") in ("pointer", "tensordesc", "tensormap")}
 
 
 def _step_info(k: int, st: "Mapping[str, Any]", ex: _Export) -> StepInfo:

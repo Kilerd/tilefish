@@ -1122,7 +1122,9 @@ class ExternOp(Op):
 
     def node_attrs(self) -> dict[str, Any]:
         if self.implementations is not None:
-            return {"by_arch": {k: v.triton or f"{v.binary.kind}:{v.binary.symbol}" for k, v in self.implementations.items()}}  # type: ignore[union-attr]
+            return {"by_arch": {k: v.triton or _binary_label(v.binary) for k, v in self.implementations.items()}}  # type: ignore[arg-type]
+        if self.binary is not None and self.binary.kind == "cute":
+            return {"cute": self.binary.ref}  # type: ignore[union-attr]
         if self.binary is not None:
             return {"binary": self.binary.symbol}
         return {self.language: self.triton}
@@ -1293,6 +1295,11 @@ class ExternOp(Op):
         return entries
 
 
+def _binary_label(binary: Any) -> str:
+    """How a graph node names a prebuilt binary (``ptx:<symbol>``) or a CuTe DSL kernel (``cute:<module:qualname>``)."""
+    return f"cute:{binary.ref}" if binary.kind == "cute" else f"{binary.kind}:{binary.symbol}"
+
+
 def grid_to_string(grid: "tuple[DimExpr, ...]") -> str:
     """Render a grid as a tuple expression: ``(M,)``, ``(S, 32)``."""
     body = ", ".join(str(g) for g in grid)
@@ -1350,6 +1357,8 @@ class Implementation:
     num_ctas: int = 1
     global_scratch: int = 0
     by_bucket: Any = None
+    # a CuTe DSL kernel (``tilefish.impl(cute=...)``): ``(host, cute_args, cute_options)`` as given (``None``: not one)
+    cute: "tuple[Any, Any, Any] | None" = None
 
     @property
     def ref(self) -> str:
@@ -1357,10 +1366,13 @@ class Implementation:
 
     @property
     def is_binary(self) -> bool:
-        return self.prebuilt is not None
+        """Whether nothing of Triton's compiles it: a prebuilt binary, or a CuTe DSL kernel (its stub lists tensors, as a prebuilt binary's C ABI)."""
+        return self.prebuilt is not None or self.cute is not None
 
     def __repr__(self) -> str:
         named = "" if self.name is None else f" name={self.name!r}"
+        if self.cute is not None:
+            return f"<impl cute={self.cute[0]!r}{named}>"
         if self.prebuilt is not None:
             return f"<impl {self.language} symbol={self.prebuilt.symbol} block={self.prebuilt.block}{named}>"
         return f"<impl {self.language}={self.ref} num_warps={self.num_warps}{named}>"
@@ -1395,6 +1407,9 @@ def impl(
     num_ctas: int = 1,
     global_scratch: int = 0,
     by_bucket: Any = None,
+    cute: Any = None,
+    cute_args: Any = None,
+    cute_options: Any = None,
 ) -> Implementation:
     """One implementation of an op with an implementation per architecture: ``@tilefish.extern(by_arch={"sm_103": tilefish.impl(triton=k_a,
     num_warps=8), "sm_120": tilefish.impl(triton=k_b)}, grid=...)``.
@@ -1419,14 +1434,20 @@ def impl(
 
     ``persistent``, ``num_ctas``, ``global_scratch`` and ``by_bucket`` are those of :func:`extern`, for this implementation (``persistent=None``
     takes the op's); a prebuilt binary has none of the last three (nothing is compiled, and it has no scratch slot).
+
+    ``cute=`` (with ``cute_args=`` and ``cute_options=``) is a CuTe DSL kernel, as for :func:`extern`: its launch is the compiled kernel's, so it takes
+    none of the other arguments but ``stub=`` and ``name=`` (and the op's ``grid=`` does not apply to it). Its stub lists the op's tensors, of static
+    shapes.
     """
-    given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin)) if v is not None]
+    given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin), ("cute", cute)) if v is not None]
     if len(given) != 1:
         raise TilefishDeclarationError(
-            "tilefish.impl takes one kernel, triton= (a triton.jit kernel) or gluon= (a Gluon kernel), or a prebuilt binary, ptx= or cubin=, "
-            f"got {' and '.join(given) or 'none'}"
+            "tilefish.impl takes one kernel, triton= (a triton.jit kernel) or gluon= (a Gluon kernel), a prebuilt binary, ptx= or cubin=, or a "
+            f"CuTe DSL kernel, cute=, got {' and '.join(given) or 'none'}"
         )
     language = given[0]
+    if cute is None and (cute_args is not None or cute_options is not None):
+        raise TilefishDeclarationError("tilefish.impl: cute_args= and cute_options= are for a CuTe DSL kernel (cute=)")
     if consts is None:
         consts = {}
     if not isinstance(consts, dict) or not all(isinstance(k, str) for k in consts):
@@ -1440,6 +1461,20 @@ def impl(
             "tilefish.impl: name= is the key of the implementation in its manifest entries: an ASCII identifier of at most 64 characters that is not "
             f"'fallback' and does not look like an architecture (begin with sm_ and a digit), got {name!r}"
         )
+    if language == "cute":
+        others = dict(
+            symbol=symbol, block=block, num_warps=num_warps, num_stages=num_stages, enable_fp_fusion=enable_fp_fusion, grid=grid, persistent=persistent,
+            by_bucket=by_bucket,
+        )  # fmt: skip
+        misplaced = [k for k, v in others.items() if v is not None and v is not _UNSET]
+        misplaced += [k for k, v in (("shared", shared), ("global_scratch", global_scratch), ("consts", consts)) if v]
+        misplaced += ["num_ctas"] if num_ctas != 1 else []
+        if misplaced:
+            raise TilefishDeclarationError(
+                f"tilefish.impl: {', '.join(k + '=' for k in misplaced)} is not an argument of a CuTe DSL kernel: its launch is the compiled kernel's "
+                "(the build takes it from its launch), and the DSL compiles it (cute_options= are its compile options)"
+            )
+        return Implementation(None, "cute", 0, 0, None, None, {}, None, stub, name, cute=(cute, cute_args, cute_options))
     if language in ("ptx", "cubin"):
         for key, value in (("num_warps", num_warps), ("num_stages", num_stages)):
             if value is not _UNSET:
@@ -1633,8 +1668,14 @@ def _implementation_op(
         except TilefishDeclarationError as e:
             raise TilefishDeclarationError(f"{where}: its stub: {e}") from None
     own = _with_consts(nm, key, sig, im.consts, allow_dim=not im.is_binary)
-    binary = None
-    if im.prebuilt is not None:
+    binary: Any = None
+    if im.cute is not None:
+        from ._cute import cute_target
+
+        _check_cute_stub(nm, own)
+        binary = cute_target(*im.cute, where)
+        grid = None  # its launch is the compiled kernel's: the op's grid= is the other implementations'
+    elif im.prebuilt is not None:
         _check_fixed_args(nm, own)
         pb = im.prebuilt
         binary = _binary_target(pb.kind, pb.files, pb.symbol, pb.block, pb.shared, base, nm)
@@ -1725,7 +1766,7 @@ def _extern_by_arch(
                     )
             impls[key] = made[0]
         for key, one in impls.items():
-            if one.binary is not None:
+            if one.binary is not None and one.binary.kind != "cute":
                 _check_prebuilt_archs(nm, key, one.binary, [a for a, k in selection.items() if k == key])
         _check_implementations(nm, sig, impls)
         op = ExternOp(
@@ -1877,6 +1918,9 @@ def extern(
     global_scratch: int = 0,
     by_bucket: Any = None,
     sass: Any = None,
+    cute: Any = None,
+    cute_args: Any = None,
+    cute_options: Any = None,
 ) -> Callable[[Callable[..., Any]], ExternOp]:
     """``@tilefish.extern(triton="module:fn", num_warps=4, grid=...)``: type an existing Triton kernel.
 
@@ -1919,6 +1963,23 @@ def extern(
     parameters. A relative path is relative to the file that declares the operator, and the bytes are read once, there: the identity of
     the binary is their sha256 (``source_digest`` of kind ``tilefish.binary.v1``). PTX is assembled by ``ptxas`` for the target
     architecture with fixed, recorded flags; a cubin is used as it is for the architecture it names and refused for another.
+
+    **A CuTe DSL kernel** (CUTLASS's ``cutlass.cute``: a ``@cute.jit`` host function that launches a ``@cute.kernel``) is declared with ``cute=``,
+    the host function (or an object whose ``__call__`` is one, an instance of a kernel class of the CUTLASS examples), and a stub of the operator's
+    tensors only, of static shapes (a number or a bucketed ``Dim`` per axis: the DSL compiles for the layouts it is given, so one binary per bucket)::
+
+        @tilefish.extern(cute=DenseGemm(...), cute_args=lambda a, b, c: (a[..., None], b[..., None], c[..., None]))
+        def gemm(a: Tensor[M, 1024, f16], b: Tensor[2048, 1024, f16], c: Out[Tensor[M, 2048, f16]]): ...
+
+    ``cute_args=`` makes the positional arguments of the host function from the tensors (torch tensors, views of them: an added axis, a
+    permutation; each made a CuTe tensor of its static layout, 16-byte aligned), and tilefish appends the stream; ``cute_options=`` adds compile
+    options of the DSL (``"--opt-level 3"``). The build compiles it with the DSL for the device it runs on (its cubin and its PTX), and takes the launch
+    from the compiled host function without running the kernel (a captured CUDA graph): the grid, block, cluster and dynamic shared memory, and every
+    kernel parameter, a tensor's pointer, a TMA descriptor of a tensor (the DSL encodes it on the host) or constant bytes (:mod:`tilefish._cute`,
+    ``docs/cute.md``). The declaration digest has the version of the DSL and the sha256 of the file of the host function; the entry's
+    ``source_digest`` is the PTX's. ``sass=``, ``index_bits=``, ``reference=`` and ``name=`` are as for any extern; a grid, a block, shared memory, a
+    cluster and compile options of Triton are the compiled kernel's, so not arguments. ``tilefish.impl(cute=...)`` is one implementation of an op
+    declared with ``by_arch=`` (the GEMM of sm_100 and sm_103 is not the one of sm_120).
 
     **An implementation per architecture.** ``by_arch=`` maps architectures to implementations (:func:`impl`: a Triton or Gluon kernel with its
     own compile options, constexpr values and grid, or a prebuilt PTX or cubin) of one op, and ``fallback=`` names the one of every other
@@ -2015,17 +2076,24 @@ def extern(
         others = dict(
             triton=triton, gluon=gluon, ptx=ptx, cubin=cubin, symbol=symbol, block=block, shared=shared, num_warps=num_warps,
             num_stages=num_stages, enable_fp_fusion=enable_fp_fusion, num_ctas=num_ctas, cluster=cluster, global_scratch=global_scratch,
-            by_bucket=by_bucket,
+            by_bucket=by_bucket, cute=cute, cute_args=cute_args, cute_options=cute_options,
         )  # fmt: skip
         return _extern_by_arch(by_arch, fallback, grid, name, index_bits, reference, others, persistent, sass)
-    given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin)) if v is not None]
+    given = [k for k, v in (("triton", triton), ("gluon", gluon), ("ptx", ptx), ("cubin", cubin), ("cute", cute)) if v is not None]
     if args or not given:
         raise TilefishDeclarationError(
             '@tilefish.extern takes arguments: write @tilefish.extern(triton="module:function", grid=...) (gluon= for a Gluon kernel, '
-            "ptx=/cubin= for a prebuilt binary), not a bare @tilefish.extern"
+            "ptx=/cubin= for a prebuilt binary, cute= for a CuTe DSL kernel), not a bare @tilefish.extern"
         )
     if len(given) > 1:
-        raise TilefishDeclarationError(f"extern: a kernel is one of triton=, gluon=, ptx= and cubin=, got {' and '.join(given)}")
+        raise TilefishDeclarationError(f"extern: a kernel is one of triton=, gluon=, ptx=, cubin= and cute=, got {' and '.join(given)}")
+    if cute is None and (cute_args is not None or cute_options is not None):
+        raise TilefishDeclarationError("extern: cute_args= and cute_options= are for a CuTe DSL kernel (cute=)")
+    if cute is not None:
+        return _extern_cute(cute, cute_args, cute_options, name, index_bits, reference, sass, dict(
+            grid=grid, symbol=symbol, block=block, shared=shared, num_warps=num_warps, num_stages=num_stages, enable_fp_fusion=enable_fp_fusion,
+            persistent=persistent, num_ctas=num_ctas, cluster=cluster, global_scratch=global_scratch, by_bucket=by_bucket,
+        ))  # fmt: skip
     prebuilt = triton is None and gluon is None
     language = "gluon" if gluon is not None else "triton"
     if enable_fp_fusion is not None and not isinstance(enable_fp_fusion, bool):
@@ -2094,6 +2162,57 @@ def extern(
             by_bucket=by_bucket,
             sass=sass,
         )
+
+    return deco
+
+
+def _check_cute_stub(nm: str, sig: Signature) -> None:
+    """The stub of a CuTe DSL kernel: the operator's tensors only (dense, of the dtype and shape a call gives), every axis a number or an expression
+    of bucketed dimensions (the DSL compiles for static layouts: one binary per bucket). The kernel's parameters are the compiled kernel's."""
+    for p in sig.params:
+        if p.kind != "tensor":
+            raise TilefishDeclarationError(
+                f"extern op '{nm}': parameter '{p.name}' is not a tensor: the stub of a CuTe DSL kernel lists the operator's tensors only (its kernel's "
+                "parameters are the compiled kernel's: pointers, TMA descriptors and constants, found by the build)"
+            )
+        if p.strided or p.tensor_map is not None or p.null_dtype is not None or p.alias is not None:
+            what = "a strided view" if p.strided else "a TMA descriptor" if p.tensor_map is not None else "a null pointer" if p.null_dtype is not None else "an alias"
+            raise TilefishDeclarationError(
+                f"extern op '{nm}': parameter '{p.name}' is {what}: a CuTe DSL kernel takes dense tensors (the DSL encodes the TMA descriptors it uses "
+                "itself; cute_args= makes views of the tensors for the host function)"
+            )
+        if isinstance(p.type.dtype, BlockScaled):  # type: ignore[union-attr]
+            raise TilefishDeclarationError(f"extern op '{nm}': parameter '{p.name}' is block-scaled, which a CuTe DSL extern does not take")
+        for d in p.type.shape:  # type: ignore[union-attr]
+            dynamic = sorted(x.name for x in d.free_dims() if not x.buckets)
+            if dynamic:
+                raise TilefishDeclarationError(
+                    f"extern op '{nm}': parameter '{p.name}' has the axis {d}, of the dimension(s) {dynamic} that have no buckets: a CuTe DSL kernel is "
+                    "compiled for static shapes, so every axis is a number or a bucketed dimension (Dim(name, buckets=[...]): one binary per bucket)"
+                )
+
+
+def _extern_cute(
+    cute: Any, cute_args: Any, cute_options: Any, name: "str | None", index_bits: int, reference: Any, sass: Any, others: "dict[str, Any]"
+) -> Callable[[Callable[..., Any]], ExternOp]:
+    """``@tilefish.extern(cute=host, cute_args=..., cute_options=...)``: a CuTe DSL kernel (:mod:`tilefish._cute`)."""
+    misplaced = [k for k, v in others.items() if v is not None and v is not _UNSET and not (k in ("shared", "global_scratch") and v == 0)]
+    if misplaced:
+        raise TilefishDeclarationError(
+            f"extern: {', '.join(k + '=' for k in misplaced)} is not an argument of a CuTe DSL kernel: its grid, block, cluster and shared memory are "
+            "the compiled kernel's (the build takes them from its launch), and the DSL compiles it (cute_options= are its compile options)"
+        )
+    if type(index_bits) is not int or index_bits not in (32, 64):
+        raise TilefishDeclarationError(f"extern: index_bits must be 32 (the kernel indexes with i32) or 64 (with i64), got {index_bits!r}")
+    _check_op_name(name)
+
+    def deco(fn: Callable[..., Any]) -> ExternOp:
+        from ._cute import cute_target
+
+        nm, sig, limits = _parse_extern_stub(fn, name, index_bits, prebuilt=True)
+        _check_cute_stub(nm, sig)
+        target = cute_target(cute, cute_args, cute_options, f"extern '{nm}'")
+        return ExternOp(fn, nm, sig, "", 0, 0, None, max_elements=limits, index_bits=index_bits, binary=target, reference=reference, sass=sass)  # type: ignore[arg-type]
 
     return deco
 

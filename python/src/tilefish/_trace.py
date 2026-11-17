@@ -100,6 +100,8 @@ def item_of(built: Any, target: Any, jit: Any) -> Item:
         origin = "binary"
         if extern.binary.kind == "ptx":
             ptx = extern.binary.sources["ptx"].decode("utf-8", "replace")
+        elif extern.binary.kind == "cute":  # a CuTe DSL kernel: the PTX the DSL generated (its build keeps it)
+            ptx = getattr(built, "ptx", "") or None
     elif getattr(target, "kernel", None) is not None:
         origin = "fused" if getattr(target.kernel, "context_free", False) else "kernel"
     elif lowered is not None:
@@ -215,7 +217,7 @@ def write_kernel(root: pathlib.Path, item: Item) -> "dict[str, Any]":
         "arch": b.arch,
         "op": b.spec.op,
         "origin": item.origin,
-        "language": "binary" if b.spec.binary is not None else b.spec.language,
+        "language": ("cute" if b.spec.binary.get("kind") == "cute" else "binary") if b.spec.binary is not None else b.spec.language,
         "symbol": b.symbol,
         "sha256": b.sha256,
         "sha256_code": b.sha256_code,

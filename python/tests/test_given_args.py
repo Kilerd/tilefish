@@ -154,7 +154,7 @@ def test_a_run_launches_the_values_at_their_slots():
         (lambda p: p.update(dim="Nn"), "it has no value, dim or shape"),
         (lambda p: p.update(type="f32", ptx_type="f32"), "is i32 or i64"),
         (lambda p: p.update(ptx_type="u64", size=8), "is passed as a u32 of 4 bytes"),
-        (lambda p: p.update(kind="giving"), "kind must be pointer, tensordesc, scalar, fixed, given or null"),
+        (lambda p: p.update(kind="giving"), "kind must be pointer, tensordesc, scalar, fixed, given, null, tensormap or bytes"),
     ],
 )
 def test_the_manifest_reader_holds_a_given_argument_to_its_rules(tmp_path, change, message):

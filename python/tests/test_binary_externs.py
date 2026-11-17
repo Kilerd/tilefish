@@ -103,7 +103,7 @@ def test_a_relative_path_is_relative_to_the_file_that_declares_the_op(tmp_path):
 @pytest.mark.parametrize(
     "kwargs, message",
     [
-        (dict(triton="m:f", ptx="x.ptx", symbol="s", block=(1,)), "a kernel is one of triton=, gluon=, ptx= and cubin="),
+        (dict(triton="m:f", ptx="x.ptx", symbol="s", block=(1,)), "a kernel is one of triton=, gluon=, ptx=, cubin= and cute="),
         (dict(ptx="x.ptx", block=(1,)), "needs symbol=<the kernel's entry point> and block"),
         (dict(ptx="x.ptx", symbol="s"), "needs symbol=<the kernel's entry point> and block"),
         (dict(ptx="x.ptx", symbol="s", block=(1,), num_warps=4), "num_warps= is a Triton compile option"),
@@ -256,7 +256,7 @@ def rejects(change, message, op_):
 
 
 def test_the_binary_section_of_a_spec_is_checked(op):
-    rejects(lambda d: d["binary"].update(kind="elf"), "binary kind must be 'ptx' or 'cubin'", op)
+    rejects(lambda d: d["binary"].update(kind="elf"), "binary kind must be 'ptx', 'cubin' or 'cute'", op)
     rejects(lambda d: d["binary"].update(symbol="a b"), "binary symbol must be a kernel symbol", op)
     rejects(lambda d: d["binary"].update(shared=-1), "binary shared must be an int >= 0", op)
     rejects(lambda d: d["binary"].update(digests={}), "binary digests must be a non-empty object", op)

@@ -56,13 +56,16 @@ from typing import TYPE_CHECKING, Any, NoReturn
 
 from ._build import (
     BINARY_DIGEST_KIND,
+    CUTE_DIGEST_KIND,
     ENTRY_KIND_BINARY,
     ENTRY_KIND_TRITON,
     MANIFEST_SCHEMA,
     MAX_WARPS,
     BuiltKernel,
     LaunchAttributes,
+    check_cute_entry,
     expected_entry,
+    is_cute,
 )
 from ._ir import LANGUAGE_OF_KIND, digest_kind
 from ._elf import code_digest, parse_elf, sm_of, uses_shared
@@ -168,7 +171,11 @@ _ARCH = re.compile(r"sm_[0-9]{2,3}", re.ASCII)  # `is_arch`
 _SHA256 = re.compile(r"[0-9a-f]{64}", re.ASCII)  # `is_digest`
 _U64_MAX = 2**64 - 1
 # every field a parameter of the ABI may have (`RawParam`), the ones it must have, and the width each scalar type is passed with
-_PARAM_FIELDS = frozenset("slot index name kind type ptx_type size dtype access shape dim count_of strides offset stride_of value alias tensor_map".split())
+_PARAM_FIELDS = frozenset("slot index name kind type ptx_type size dtype access shape dim count_of strides offset stride_of value alias tensor_map template".split())
+_HEX = re.compile(r"[0-9a-f]*\Z")
+MAX_PARAM_BYTES = 32764  # the parameter space of a kernel: the largest constant parameter (``bytes``) of a CuTe DSL kernel
+_CUTE_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){1,3}[A-Za-z0-9.+_-]*\Z")
+_CUTE_OPTIONS = re.compile(r"[A-Za-z0-9 =,._:/+-]*\Z")
 _PARAM_REQUIRED = ("slot", "index", "name", "kind", "type", "ptx_type", "size")
 _PASSED_AS = {"scalar": {"i32": ("u32", 4), "i64": ("u64", 8)}, "fixed": {"i32": ("u32", 4), "i64": ("u64", 8), "f32": ("f32", 4)}}
 
@@ -310,6 +317,8 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
     params = abi.get("params")
     if not isinstance(params, list):
         bad(f"abi.params must be a list, got {params!r}")
+    binary = entry.get("binary")
+    cute = kind == ENTRY_KIND_BINARY and isinstance(binary, dict) and binary.get("source") == "cute"  # a CuTe DSL kernel (section 4.9)
     slot = 0  # where the next parameter's slots begin: a descriptor takes 1 + 2 * rank, every other parameter one
     for position, p in enumerate(params):
         if not isinstance(p, dict):
@@ -338,7 +347,19 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
         slot += 1 + 2 * len(p["shape"]) if pkind == "tensordesc" and isinstance(p.get("shape"), list) else 1
         if _has(p, "tensor_map") and pkind != "tensordesc":
             bad(f"parameter {name} is a {pkind} and has a tensor_map: only a tensor descriptor (kind tensordesc) has one")
-        if pkind == "tensordesc":
+        if _has(p, "template") and pkind != "tensormap":
+            bad(f"parameter {name} is a {pkind} and has a template: only a TMA descriptor of a CuTe DSL kernel (kind tensormap) has one")
+        if cute and pkind not in ("pointer", "tensormap", "bytes"):
+            bad(f"parameter {name} is a {pkind}: a CuTe DSL kernel takes pointers, TMA descriptors (tensormap) and constant bytes (bytes)")
+        if cute and pkind == "pointer" and any(_has(p, k) for k in ("strides", "offset", "alias")):
+            bad(f"parameter {name} is a view or an alias: a CuTe DSL kernel takes dense tensors")
+        if pkind in ("tensormap", "bytes") and not cute:
+            bad(f"parameter {name} is a {pkind}, which is a parameter of a CuTe DSL kernel (a binary entry of source 'cute'), and this is not one")
+        if pkind == "tensormap":
+            _check_tensormap(name, p, bad)
+        elif pkind == "bytes":
+            _check_bytes(name, p, bad)
+        elif pkind == "tensordesc":
             _check_tensordesc(name, p, kind, bad)
         elif pkind == "pointer":
             dtype = p.get("dtype") or ""
@@ -446,7 +467,7 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
             if any(_has(p, k) for k in ("dim", "count_of", "stride_of", "access", "shape", "strides", "offset", "dtype", "alias", "value")):
                 bad(f"parameter {name} is a fixed argument per call: it has no value, dim or shape (each call gives its value)")
         else:
-            bad(f"parameter {name}: kind must be pointer, tensordesc, scalar, fixed, given or null, got {pkind!r}")
+            bad(f"parameter {name}: kind must be pointer, tensordesc, scalar, fixed, given, null, tensormap or bytes, got {pkind!r}")
     # an out pointer that may be written over an in pointer (`alias`, the Rust reader's `check_consistent`): that pointer is an `in` one, not strided and
     # not a device scalar, of the same dtype and declared shape, and no other out pointer names it
     from ._specvalid import check_alias_target
@@ -463,6 +484,80 @@ def _check_params(who: str, entry: "dict[str, Any]", kind: str) -> None:
         if p["alias"] in taken:
             bad(f"the out pointers {taken[p['alias']]} and {p['name']} both may alias '{p['alias']}': at most one is written over an input")
         taken[p["alias"]] = p["name"]
+
+
+def _check_tensormap(name: str, p: "dict[str, Any]", bad: Any) -> None:
+    """A ``tensormap`` parameter (a TMA descriptor of a tensor of a CuTe DSL kernel, manifest schema 3 section 4.9): ``type`` ``"tensormap"``,
+    passed as 128 bytes (``ptx_type`` ``b8[128]``); the fields of a dense pointer (``dtype``, ``access``, ``shape``) and its ``template``, 256
+    lowercase hex digits whose bytes 0 to 7 (where a launch writes the tensor's address) and 64 to 127 (which the DSL's host code does not write,
+    and a launch passes as zeros) are zero; nothing else."""
+    if p["type"] != "tensormap" or p["ptx_type"] != "b8[128]" or p["size"] != 128:
+        bad(f"parameter {name}: a TMA descriptor of a CuTe DSL kernel has type 'tensormap' and is passed as 128 bytes (ptx_type 'b8[128]', size 128)")
+    extra = [k for k in ("dim", "count_of", "stride_of", "value", "alias", "strides", "offset", "tensor_map") if _has(p, k)]
+    if extra:
+        bad(f"parameter {name} is a TMA descriptor of a CuTe DSL kernel: it has a dtype, an access, a shape and a template, and no {extra}")
+    dtype, access, shape = p.get("dtype"), p.get("access"), p.get("shape")
+    if not isinstance(dtype, str) or ALL_DTYPES.get(dtype) is None:
+        bad(f"parameter {name}: dtype must be a dtype of the manifest, got {dtype!r}")
+    if access not in ("in", "inout", "out"):
+        bad(f"parameter {name}: access must be in, inout or out, got {access!r}")
+    if not isinstance(shape, list):
+        bad(f"parameter {name}: shape must be a list, got {shape!r}")
+    for axis, d in enumerate(shape):
+        if not (_is_count(d, 1) or isinstance(d, str)):
+            bad(f"parameter {name}: shape[{axis}] must be an int size of at least 1 or a dimension expression, got {d!r}")
+    template = p.get("template")
+    if not isinstance(template, str) or len(template) != 256 or not _HEX.fullmatch(template):
+        bad(f"parameter {name}: template must be 256 lowercase hex digits (the 128 bytes of the descriptor), got {template!r}")
+    if template[:16] != "0" * 16 or template[128:] != "0" * 128:
+        bad(f"parameter {name}: the bytes 0 to 7 (the tensor's address, written at a launch) and 64 to 127 of the template must be zero")
+
+
+def _check_bytes(name: str, p: "dict[str, Any]", bad: Any) -> None:
+    """A ``bytes`` parameter (constant bytes of a CuTe DSL kernel, manifest schema 3 section 4.9): ``type`` ``"bytes"``, ``size`` from 1 to 32764,
+    ``ptx_type`` ``b8[<size>]`` and ``value``, its ``2 * size`` lowercase hex digits; nothing else."""
+    size = p["size"]
+    if p["type"] != "bytes" or not 1 <= size <= MAX_PARAM_BYTES or p["ptx_type"] != f"b8[{size}]":
+        bad(f"parameter {name}: constant bytes have type 'bytes', a size from 1 to {MAX_PARAM_BYTES} and ptx_type 'b8[<size>]', got {p['type']!r}, {size!r}, {p['ptx_type']!r}")
+    extra = [k for k in ("dim", "count_of", "stride_of", "alias", "strides", "offset", "tensor_map", "dtype", "access", "shape") if _has(p, k)]
+    if extra:
+        bad(f"parameter {name} is constant bytes: it has a value and no {extra}")
+    value = p.get("value")
+    if not isinstance(value, str) or len(value) != 2 * size or not _HEX.fullmatch(value):
+        bad(f"parameter {name}: value must be {2 * size} lowercase hex digits (its {size} bytes), got {value!r}")
+
+
+def _check_cute_entry(who: str, entry: "dict[str, Any]") -> None:
+    """What a binary entry of a CuTe DSL kernel says of itself (manifest schema 3, section 4.9), as the Rust reader reads it: ``binary`` is exactly
+    ``{source: "cute", cutlass_dsl, options}``, ``toolchain`` exactly ``{cutlass_dsl, nvvm, ptxas}`` (strings, the DSL the same), the source digest of kind
+    ``tilefish.cute.v1`` (the PTX), the ``ptx_target`` of its architecture, a grid of integers (its shapes are static) and no persistent grid."""
+    b, toolchain = entry["binary"], entry["toolchain"]
+    if (
+        set(b) != {"source", "cutlass_dsl", "options"}
+        or not isinstance(b["cutlass_dsl"], str)
+        or not _CUTE_VERSION.fullmatch(b["cutlass_dsl"])
+        or not isinstance(b["options"], str)
+        or not _CUTE_OPTIONS.fullmatch(b["options"])
+        or b["options"] != " ".join(b["options"].split())
+    ):
+        raise TilefishManifestError(f"{who}: binary of a CuTe DSL kernel must be {{'source': 'cute', 'cutlass_dsl': <version>, 'options': <options>}}, got {b!r}")
+    if not isinstance(toolchain, dict) or set(toolchain) != {"cutlass_dsl", "nvvm", "ptxas"} or not all(isinstance(v, str) for v in toolchain.values()):
+        raise TilefishManifestError(f"{who}: the toolchain of a CuTe DSL kernel is {{'cutlass_dsl', 'nvvm', 'ptxas'}} (strings), got {toolchain!r}")
+    if toolchain["cutlass_dsl"] != b["cutlass_dsl"]:
+        raise TilefishManifestError(f"{who}: toolchain.cutlass_dsl {toolchain['cutlass_dsl']!r} is not binary.cutlass_dsl {b['cutlass_dsl']!r}")
+    if entry.get("source_digest_kind") != CUTE_DIGEST_KIND or entry.get("source_digest") is None:
+        raise TilefishManifestError(f"{who}: a CuTe DSL kernel records the sha256 of its PTX as source_digest, with source_digest_kind '{CUTE_DIGEST_KIND}'")
+    target = entry.get("ptx_target")
+    if not isinstance(target, str) or re.fullmatch(r"sm_([0-9]{2,3})[a-z]?", target) is None or int(target[3:].rstrip("abcdefghijklmnopqrstuvwxyz")) != int(entry["arch"][3:]):
+        raise TilefishManifestError(f"{who}: ptx_target of a CuTe DSL kernel is the .target of its PTX for {entry['arch']} ('sm_103a'), got {target!r}")
+    try:
+        names = parse_grid(entry["grid"])
+    except TilefishSpecError as e:
+        raise TilefishManifestError(f"{who}: {str(e).removeprefix('malformed compile spec: ')}") from None
+    if names:
+        raise TilefishManifestError(f"{who}: the grid of a CuTe DSL kernel is integers (its shapes are static), got {entry['grid']!r}")
+    if entry.get("persistent") is not None:
+        raise TilefishManifestError(f"{who}: a CuTe DSL kernel has no persistent grid (its grid is the compiled host function's)")
 
 
 def _check_tensordesc(name: str, p: "dict[str, Any]", kind: str, bad: Any) -> None:
@@ -587,7 +682,7 @@ def _check_dimension_names(who: str, entry: "dict[str, Any]") -> None:
             for axis, d in enumerate(shape):
                 expression(d, f"preconditions[{i}] (max_elements) shape[{axis}]")
     for p in entry["abi"]["params"]:  # (each read by `_check_params`)
-        if p["kind"] in ("pointer", "tensordesc"):
+        if p["kind"] in ("pointer", "tensordesc", "tensormap"):
             for axis, d in enumerate(p["shape"]):
                 if isinstance(d, str):
                     expression(d, f"parameter {p['name']} shape[{axis}]")
@@ -821,7 +916,14 @@ class Manifest:
                     f"'{stem}' ({arch}): a {entry_kind} kernel has {2 if entry_kind == ENTRY_KIND_TRITON else 0} scratch slots, "
                     f"but abi.scratch_slots is {slots!r}"
                 )
-        if entry_kind == ENTRY_KIND_BINARY:
+        cute = entry_kind == ENTRY_KIND_BINARY and isinstance(entry["binary"], dict) and entry["binary"].get("source") == "cute"
+        if cute:
+            _check_cute_entry(f"'{stem}' ({arch})", entry)
+            if entry.get("source_sha256") is not None:
+                raise TilefishManifestError(f"'{stem}' ({arch}): a CuTe DSL kernel has no source_sha256 (that is the source of a generated Triton kernel)")
+        elif entry.get("source_digest_kind") == CUTE_DIGEST_KIND:
+            raise TilefishManifestError(f"'{stem}' ({arch}): source_digest_kind '{CUTE_DIGEST_KIND}' is a CuTe DSL kernel's (a binary entry of source 'cute')")
+        if entry_kind == ENTRY_KIND_BINARY and not cute:
             b = entry["binary"]
             ok = isinstance(b, dict) and b.get("source") in ("ptx", "cubin")
             if ok and b["source"] == "ptx":
@@ -831,7 +933,7 @@ class Manifest:
                 ok = set(b) == {"source"}
             if not ok:
                 raise TilefishManifestError(
-                    f"'{stem}' ({arch}): binary must be {{'source': 'cubin'}} or {{'source': 'ptx', 'ptxas_flags': [...]}}, got {b!r}"
+                    f"'{stem}' ({arch}): binary must be {{'source': 'cubin'}}, {{'source': 'ptx', 'ptxas_flags': [...]}} or {{'source': 'cute', ...}}, got {b!r}"
                 )
             if entry.get("source_digest_kind") != BINARY_DIGEST_KIND or entry.get("source_digest") is None:
                 raise TilefishManifestError(
@@ -898,6 +1000,8 @@ class Manifest:
         ir_digest: "str | None" = None,
         ir_triton: "str | None" = None,
         pinned: bool = False,
+        cute_digest: "str | None" = None,
+        cute_why: "str | None" = None,
     ) -> BuiltKernel:
         """The binary for ``spec`` on ``arch``, as a :class:`~tilefish.aot.BuiltKernel` a replay can launch.
 
@@ -936,7 +1040,12 @@ class Manifest:
                 + (f"its implementation '{want}' on {arch}" if want is not None else "one implementation on every architecture")
                 + ": its binary is stale; export it again (and pin the new manifest)"
             )
-        if spec.binary is not None:
+        if is_cute(spec):  # a CuTe DSL kernel: the PTX the DSL makes of it now (cute_digest), its launch against the spec's tensors
+            self._check_cute_source(spec, arch, entry, cute_digest, cute_why, pinned)
+            problem = check_cute_entry(spec, entry)
+            if problem is not None:
+                raise TilefishManifestError(f"the manifest entry for '{spec.stem}' ({arch}) is not a binary of the compile spec: {problem}")
+        elif spec.binary is not None:
             self._check_binary_source(spec, arch, entry)
         else:
             self._check_source(spec, arch, entry, ir_digest, ir_triton, pinned)
@@ -959,7 +1068,9 @@ class Manifest:
         # the cluster, the global scratch and the persistent grid a launch is given are the declaration's (a binary of another one is another
         # binary): a prebuilt binary's cluster as declared, a Triton kernel's num_ctas CTAs (its compiler lays them out); the persistent grid both
         # ways (a host launches an entry's own)
-        if spec.binary is not None:
+        if is_cute(spec):  # the compiled kernel's cluster (the reader held it to at most 8 CTAs)
+            same_cluster = True
+        elif spec.binary is not None:
             same_cluster = list(launch.cluster_dims) == list(spec.binary.get("cluster", [1, 1, 1]))
         else:
             same_cluster = launch.num_ctas == spec.num_ctas == math.prod(launch.cluster_dims)
@@ -987,11 +1098,12 @@ class Manifest:
                 options=dict(entry.get("options", {})),
                 launch=launch,
                 ir_digest=entry.get("source_digest") if entry.get("source_digest_kind") in LANGUAGE_OF_KIND else None,
-                binary_digest=entry.get("source_digest") if entry.get("source_digest_kind") == BINARY_DIGEST_KIND else None,
+                binary_digest=entry.get("source_digest") if entry.get("source_digest_kind") in (BINARY_DIGEST_KIND, CUTE_DIGEST_KIND) else None,
                 binary_build=dict(entry["binary"]) if spec.binary is not None else None,
                 warp_specialized=total is not None,
                 cuda_math=entry.get("cuda_math"),
                 instrument=entry.get("instrument"),
+                cute=_cute_facts(entry) if is_cute(spec) else None,
             )
         except (KeyError, TypeError, ValueError, AttributeError) as e:
             raise TilefishManifestError(f"'{spec.stem}' ({arch}): the manifest entry is malformed: {type(e).__name__}: {e}") from e
@@ -1022,6 +1134,31 @@ class Manifest:
             raise TilefishManifestError(
                 f"the manifest entry for {where} was made from a {entry['binary'].get('source')}, but the declaration says {spec.binary['kind']}"
             )
+
+    @staticmethod
+    def _check_cute_source(
+        spec: "CompileSpec", arch: str, entry: "dict[str, Any]", cute_digest: "str | None", why: "str | None", pinned: bool
+    ) -> None:
+        """A CuTe DSL kernel is identified by the PTX the DSL makes of it (kind ``tilefish.cute.v1``), as a Triton kernel by its IR: ``cute_digest`` is
+        the sha256 of the PTX the DSL of this process makes of the declaration now (the caller compiled it; ``None`` where it could not, ``why``
+        says why). A digest that differs from the entry's is a refusal, pinned or not; one that cannot be made is accepted only with ``pinned=True``.
+        (The DSL's version and the host function's file are in the declaration digest, compared too.)"""
+        where = f"'{spec.stem}' ({arch})"
+        recorded = entry.get("source_digest")
+        if entry.get("source_digest_kind") != CUTE_DIGEST_KIND or recorded is None:
+            raise TilefishManifestError(f"the manifest entry for {where} is not a CuTe DSL kernel's (its source_digest_kind is {entry.get('source_digest_kind')!r})")
+        if cute_digest is not None and cute_digest != recorded:
+            raise TilefishManifestError(
+                f"the manifest entry for {where} was built from PTX with sha256 {recorded}, but the CuTe DSL kernel {spec.binary['host']} now compiles to "  # type: ignore[index]
+                f"PTX with sha256 {cute_digest}: the kernel, its configuration or something it reads changed since the manifest was written, so this "
+                "binary is stale; export it again (and pin the new manifest)"
+            )
+        if cute_digest is not None or pinned:
+            return
+        raise TilefishManifestError(
+            f"cannot tell whether the binary for {where} was built from the CuTe DSL kernel {spec.binary['host']} as the process holds it: "  # type: ignore[index]
+            f"{why or 'its PTX cannot be made here'}. Pass pin=<the manifest's digest> to vouch for the manifest, or rebuild it"
+        )
 
     @staticmethod
     def _check_source(
@@ -1086,6 +1223,12 @@ class Manifest:
     def __repr__(self) -> str:
         library = f", {len(self._library)} library entries" if self._library else ""
         return f"<Manifest {str(self.directory)!r}: {len(self._artifacts)} binaries{library}>"
+
+
+def _cute_facts(entry: "dict[str, Any]") -> "dict[str, Any]":
+    """The launch of a CuTe DSL entry, as a :class:`~tilefish._build.BuiltKernel` holds it (``cute``): its ABI, grid (integers), block and NVVM."""
+    grid = [int(g) for g in entry["grid"].strip().lstrip("(").rstrip(")").replace(" ", "").split(",") if g]
+    return {"abi": json.loads(json.dumps(entry["abi"])), "grid": grid, "block": list(entry["block"]), "nvvm": entry["toolchain"]["nvvm"]}
 
 
 def is_instrumented(doc: Any) -> bool:
