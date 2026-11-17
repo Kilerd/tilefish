@@ -7,35 +7,26 @@ each section names the release that added it.
 
 ## Unreleased
 
-### A persistent, warp-specialised GEMM with epilogue hooks (`docs/rfcs/0003-epilogue-fusion.md`, experiment X8)
+### Scope
 
-- **`python/examples/persistent_gemm.py`** (public, generic): `c = a @ b` with bf16 or f16 operands and an f32 accumulator, in the four layouts of
-  `cublaslt.gemm` (`TN`, `NN`, `TT`, `NT`), with the hooks `ACC` and `EPILOGUE` of E1 and the dual accumulator of a gated activation (`split=2`).
-  - **sm_100 and sm_103** (`gemm_sm100_kernel`, Gluon): persistent (`tilefish.persistent()`, a grouped tile order), warp-specialised: a one-warp
-    TMA producer filling a ring of up to 8 shared-memory stages, a one-warp `tcgen05_mma` issuer accumulating into two tensor-memory buffers, and
-    the epilogue on one or two partitions of 4 or 8 warps (each draining one buffer while the next tile accumulates), which reads the accumulator in
-    sub-tiles, calls the hooks once per sub-tile in a loop that is not unrolled (a heavy hook's code once in the binary) and stores through TMA.
-    The whole `k` of a tile is one program's, in order: no split-K, so no configuration changes the bytes. Its phases carry `tilefish.probe`s
-    (nothing in a production build).
-  - **sm_120** (`gemm_sm120_kernel`, Triton): TMA loads, a software-pipelined `tl.dot` (`mma.sync m16n8k16`, asserted), a persistent loop, the
-    epilogue on sub-tiles; built and its SASS assertions checked on sm_103, its logic run there compiled to `tcgen05` (`impl="triton"`); not
-    measured on an sm_120 device yet.
-  - **`persistent_gemm.gemm(arch, M=..., n=..., k=..., layout=..., split=...)`** declares either with one configuration per bucket of `M`
-    (`by_bucket=`): the tile from a cost model fitted on a B300 slice (`config_sm100`: tensor-core time against the operands' bytes into an SM, and
-    the rounds of tiles over the SMs), as many stages as shared memory holds. A configuration may take larger tiles than the descriptors' blocks
-    the declaration fixes (copied as several boxes), so every bucket has its tile.
-- **Measured** (B300 MIG slice, sm_103, 30 SMs, cuBLASLt 12.8.4; RFC 0003, "X8: results"): against cuBLASLt's pinned GEMM (`heuristic="torch"`)
-  on the 64 shapes of the suite, 0.89 to 1.07 times its time at 8192 rows, 0.93 to 1.53 at 2048 (27 of the 64 within 1.10, 25 of the 32 at 2048
-  and 8192 rows) and 1.07 to 1.68 at 32 and 256 rows (about 1 us more fixed cost a launch, tiles that quantise over 30 SMs, and no TMA multicast or
-  two-CTA MMA in Triton 3.5.1's Gluon); against the fastest algorithm cuBLASLt offers, 6 of 64 within 1.10. Its bytes are the pin's on every one of
-  the 64 shapes and on 48 more in the other layouts and f16 (no pin splits `k` there), and differ from a split-K algorithm's on 0.2 to 1.2% of the
-  elements. Fused into it, bias + GELU at 2048 x 4096 x 1024 is 1.33 times faster than cuBLASLt followed by the region and 2.6 times faster than
-  the unfused plan, a gated activation 1.70 times; a periodic activation, issue-bound on the epilogue's warps, 0.88 times; at 256 rows the
-  slower GEMM outweighs the fusion (0.77 to 1.11).
-- **Tests**: `tests/test_gpu_persistent_gemm.py` (the bytes against the pin at every bucket, every configuration the same bytes, the Triton kernel
-  the Gluon one's bytes, every elementwise pattern fused against the unfused plan in both modes at every bucket with special values, a norm refused
-  by the Gluon kernel and fused into the Triton one, the fused binary's MMAs, the sm_120 builds, the probes, a speed smoke test with margins of a
-  factor); the Rust and C++ gates run its fused bias + GELU and SwiGLU plans (`fused_epi_pgemm_*`).
+- **`docs/scope.md`** says what tilefish is (types, the four declarations, build once and pin, thin hosts, numerics written down) and what it is not
+  (a competitor of the libraries on kernel speed, a general optimising compiler, a benchmark suite). 0.0.13 is the last release that adds features
+  ahead of a need: from now on a feature is added when a real model migration needs it. The README's opening is shorter and points to it and to the
+  documents' index, `docs/README.md`.
+
+### Example: a persistent GEMM with epilogue hooks (`python/examples/persistent_gemm.py`)
+
+- **An example kernel, not a supported feature** (`docs/scope.md`): it shows E1's epilogue hooks in a persistent, warp-specialised GEMM. `c = a @ b`
+  with bf16 or f16 operands and an f32 accumulator, in the layouts `TN`, `NN`, `TT` and `NT`, with the hooks `ACC` and `EPILOGUE` and the dual
+  accumulator of a gated activation (`split=2`): in Gluon on sm_100 and sm_103 (a TMA producer warp, a `tcgen05` issuer warp, and epilogue partitions
+  that drain one tensor-memory buffer while the next tile accumulates), in Triton on sm_120 (`mma.sync`, asserted in the SASS).
+  `persistent_gemm.gemm(arch, M=..., n=..., k=..., layout=..., split=...)` declares it with a configuration per bucket of `M`. The whole `k` of a tile
+  is one program's, so no configuration changes the bytes: on sm_103 they are the cuBLASLt pin's wherever the pin does not split `k`. What it measured
+  as RFC 0003's experiment X8 is recorded there ("X8: results").
+- **Tests**: `tests/test_gpu_persistent_gemm.py` (its bytes against the pin at every bucket, every configuration the same bytes, the Triton kernel the
+  Gluon one's bytes, every elementwise pattern fused against the unfused plan in both modes at every bucket with special values, a norm refused by the
+  Gluon kernel and fused into the Triton one, the fused binary's MMAs, the sm_120 builds, the probes); the Rust and C++ gates run its fused bias +
+  GELU and SwiGLU plans (`fused_epi_pgemm_*`).
 
 ### CuTe DSL kernels as externs (issue #5, section 3; `docs/cute.md`)
 

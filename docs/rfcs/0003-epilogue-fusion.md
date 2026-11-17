@@ -3,7 +3,7 @@
 * **Status:** reviewed; the decisions of 2026-11-16 are recorded in "Decisions" below. Design and phase 0 experiments (section 6). Milestones E1,
   epilogue hooks on externs ("E1: implementation notes" below), and E2, cuBLASLt epilogues (section 7.3: what was built, what was measured and what
   is left), are implemented, and work together in one graph ("E1 and E2 together" below); experiment X8, a persistent warp-specialised GEMM with
-  the hooks, is measured ("X8: results" below); the rest is design.
+  the hooks, is measured ("X8: results" below; the kernel is an example under `python/examples/`, not a supported feature); the rest is design.
 * **Scope:** fusion across a call. An *epilogue* is the elementwise or row work that reads a GEMM's or a convolution's result; a *prologue* makes one
   of its operands. The RFC touches the planner and the fusion pass (`tilefish._plan`, `tilefish._fusion`), the library ops (`cublaslt.*`,
   `cudnn.conv_fwd`), externs, a new family of generated GEMM and convolution ops and the advisor. Only library epilogues touch the manifest and the
@@ -257,7 +257,9 @@ graph's for the ops traced in it (Q3):
 ## X8: results (2026-11-17)
 
 X8 asked whether a GEMM of tilefish's own can be fast enough that fusing into it pays (Q5), and whether its bytes are the library's (the E3
-question, contract (i-d)). The kernel is public: `python/examples/persistent_gemm.py`.
+question, contract (i-d)). The kernel is an example, `python/examples/persistent_gemm.py`, which shows the hooks in a kernel fast enough to
+fuse into; it is not a supported feature (`docs/scope.md`: tilefish does not compete with the libraries on kernel speed). What follows is the
+experiment's record.
 
 **The kernel.** `c = a @ b`, bf16 or f16 operands, an f32 accumulator, the four layouts of `cublaslt.gemm` (`TN`, `NN`, `TT`, `NT`), the hooks
 `ACC` and `EPILOGUE` of E1 and the dual accumulator of a gated activation (`split=2`).
