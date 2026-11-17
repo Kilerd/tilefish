@@ -1,0 +1,143 @@
+# The documentation site, https://kilerd.github.io/tilefish/: the English pages of docs/en/ at /, the Chinese ones of docs/zh-CN/ at /zh-CN/.
+# Build it with the pinned tools of docs/requirements.txt: `mkdocs build --strict` (or `mkdocs serve`); .github/workflows/docs.yml does.
+site_name: tilefish
+site_description: A typed tensor language for GPU inference
+site_url: https://kilerd.github.io/tilefish/
+repo_url: https://github.com/Kilerd/tilefish
+repo_name: Kilerd/tilefish
+edit_uri: edit/main/docs/
+copyright: Licensed under either of Apache License, Version 2.0 or MIT license at your option.
+
+docs_dir: docs
+strict: true
+exclude_docs: |
+  /hooks.py
+  /requirements.txt
+  __pycache__/
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+hooks:
+  - docs/hooks.py
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  # Material's search; jieba (docs/requirements.txt) cuts Chinese text into words at build time and joins them with U+200B, which the
+  # separator splits on, so a Chinese word is found inside a sentence.
+  - search:
+      separator: '[\s​　\-_,:!=\[\]()"`/、。，．？！；：（）《》“”]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  - i18n:
+      docs_structure: folder
+      fallback_to_default: false
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          name: English
+          default: true
+          build: true
+        - locale: zh-CN
+          name: 简体中文
+          build: true
+          theme:
+            language: zh
+          nav_translations:
+            Home: 首页
+            Scope: 范围
+            Guide: 指南
+            The build: 构建
+            Operators: 算子
+            Lowered kernels: 下沉生成的 kernel
+            Launch plans: 启动计划
+            Fusion: 融合
+            Rewrites: 感知舍入的重写
+            SASS: SASS
+            The Rust host: Rust host
+            The C++ host: C++ host
+            Reference: 参考
+            Manifest schema 3: Manifest schema 3
+            Plan schema 1: Plan schema 1
+            Numerics: 数值语义
+            CuTe DSL externs: CuTe DSL extern
+            Tools: 工具
+            SASS traceability: SASS 溯源
+            Instrumentation: kernel 内插桩
+            Fusion advisor: 融合 advisor
+            RFCs: RFC
+            "0001: Plan fusion": "0001：plan 融合"
+            "0002: A C++ host": "0002：C++ host"
+            "0003: Epilogue and prologue fusion": "0003：epilogue 与 prologue 融合"
+
+nav:
+  - Home: README.md
+  - Scope: scope.md
+  - Guide:
+      - The build: guide/build.md
+      - Operators: guide/operators.md
+      - Lowered kernels: guide/lowering.md
+      - Launch plans: guide/plans.md
+      - Fusion: guide/fusion.md
+      - Rewrites: guide/rewrites.md
+      - SASS: guide/sass.md
+      - The Rust host: guide/rust.md
+      - The C++ host: guide/cpp.md
+  - Reference:
+      - Manifest schema 3: manifest-schema-3.md
+      - Plan schema 1: plan-schema-1.md
+      - Numerics: numerics.md
+      - CuTe DSL externs: cute.md
+      - Tools:
+          - SASS traceability: explain.md
+          - Instrumentation: instrument.md
+          - Fusion advisor: advise.md
+  - RFCs:
+      - "0001: Plan fusion": rfcs/0001-plan-fusion.md
+      - "0002: A C++ host": rfcs/0002-cpp-host.md
+      - "0003: Epilogue and prologue fusion": rfcs/0003-epilogue-fusion.md
+
+markdown_extensions:
+  - toc:
+      permalink: true
+      # GitHub's anchors: lower case, Unicode kept (the Chinese headings), so a link that works on GitHub works on the site
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - tables
+  - admonition
+  - attr_list
+  - pymdownx.highlight
+  - pymdownx.superfences
+  # the pages nest lists by two spaces, as GitHub reads them; Python-Markdown wants four without this
+  - mdx_truly_sane_lists:
+      nested_indent: 2
+      truly_sane: true
