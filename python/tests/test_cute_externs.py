@@ -707,3 +707,23 @@ def test_a_launch_writes_each_address_into_its_template_and_passes_the_bytes(mon
         loaded.launch(b.grid, [("tensormap", 0x7F0000100008), args[1], args[2]], stream=0)
     with pytest.raises(TilefishRuntimeError, match="takes 3 arguments"):
         loaded.launch(b.grid, args[:2], stream=0)
+
+
+# -- the fixture of the Rust crate -------------------------------------------------------------------------------------------------------------
+
+
+def test_the_rust_fixture_is_what_export_rust_fixtures_writes(tmp_path):
+    import cute_fixture
+
+    fixtures = pathlib.Path(__file__).resolve().parents[2] / "crates" / "tilefish" / "tests" / "fixtures"
+    committed, fresh = fixtures / cute_fixture.NAME, tmp_path / cute_fixture.NAME
+    manifest = cute_fixture.write(fresh)
+    hint = "regenerate it with python/tests/export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --cute-only"
+    assert sorted(p.name for p in committed.iterdir()) == sorted(p.name for p in fresh.iterdir()), hint
+    for p in sorted(committed.iterdir()):
+        assert p.read_bytes() == (fresh / p.name).read_bytes(), f"{p.name}: {hint}"
+    want = json.loads((fixtures / "expected.json").read_text())["cute"][cute_fixture.NAME]
+    assert want["manifest_digest"] == manifest.digest, hint
+    assert [(k["stem"], k["cubin"], k["sha256"], k["sha256_code"]) for k in want["kernels"]] == [
+        (a.stem, a.entry["cubin"], hashlib.sha256(a.cubin).hexdigest(), code_digest(a.cubin)) for a in sorted(manifest.artifacts, key=lambda a: a.stem)
+    ]

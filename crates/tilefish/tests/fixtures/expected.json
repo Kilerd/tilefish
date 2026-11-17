@@ -713,5 +713,29 @@
       ],
       "library": []
     }
+  },
+  "cute": {
+    "cute_sm_103": {
+      "manifest_digest": "d805a9fd57b83e6874a8f9edf5cce9e43c856bbb0b51eada3df70f6bfc3f8be1",
+      "kernels": [
+        {
+          "stem": "gemm.M128",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "gemm.M128.sm_103.cubin",
+          "sha256": "d508998e1e3057997f0270f8a7e8c0b7e22283bd86cbefa6418d61207f643a07",
+          "sha256_code": "9c08c2f0c37c735f6573d16a387e5d123d554c08eecd2858b7674d2073939950"
+        },
+        {
+          "stem": "gemm.M256",
+          "arch": "sm_103",
+          "kind": "binary",
+          "cubin": "gemm.M256.sm_103.cubin",
+          "sha256": "d508998e1e3057997f0270f8a7e8c0b7e22283bd86cbefa6418d61207f643a07",
+          "sha256_code": "9c08c2f0c37c735f6573d16a387e5d123d554c08eecd2858b7674d2073939950"
+        }
+      ],
+      "library": []
+    }
   }
 }

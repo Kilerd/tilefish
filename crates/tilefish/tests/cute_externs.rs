@@ -1,8 +1,8 @@
 //! CuTe DSL kernels as externs (`docs/manifest-schema-3.md` section 4.9), read and checked with no GPU: a `binary` entry of source `cute`, its
 //! toolchain, the digest of its PTX, its grid of integers, and the parameter kinds `tensormap` (a TMA descriptor the DSL encoded: a tensor, whose
 //! launch passes the template with the tensor's address in its first eight bytes) and `bytes` (constant bytes), on synthetic manifests
-//! (`common::synthetic`) and on the manifest Python's `python/tests/test_cute_externs.py` exports (`tests/fixtures/cute_sm_103`, its digest the one
-//! Python computed). The refusals are those of Python's reader (`_manifest._check_tensormap`, `_check_bytes`, `_check_cute_entry`).
+//! (`common::synthetic`) and on the manifest Python's fake CuTe build exports (`tests/fixtures/cute_sm_103`, written by
+//! `python/tests/export_rust_fixtures.py`, its digest and the `sha256` of its cubins the ones Python computed: `expected.json`, `"cute"`). The refusals are those of Python's reader (`_manifest._check_tensormap`, `_check_bytes`, `_check_cute_entry`).
 
 mod common;
 
@@ -194,13 +194,23 @@ fn an_address_the_descriptor_cannot_hold_is_refused_naming_the_parameter() {
 
 #[test]
 fn the_cute_export_python_wrote_is_read_with_pythons_digest() {
-    // `exported(tmp_path)` of `python/tests/test_cute_externs.py`, as Python wrote it, and the digest Python's `Manifest.load(...).digest` gave
-    const PYTHON_DIGEST: &str = "01c515806a96aaf4624d090c11b26f83a4dcee5cb4465eac400bdc2f46246cf5";
+    // `python/tests/cute_fixture.py` (the fake CuTe build of `test_cute_externs.py`), as `export_rust_fixtures.py` wrote it, and what Python
+    // computed of it: the digest `Manifest.load(...).digest` gave and the `sha256` of each cubin
+    let want = &common::expected()["cute"]["cute_sm_103"];
+    let python_digest = want["manifest_digest"].as_str().expect("the digest of the CuTe fixture in expected.json");
     let dir = common::fixtures().join("cute_sm_103");
     let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
-    assert_eq!(manifest_digest(&tilefish::json::parse_strict(&text).unwrap()).unwrap(), PYTHON_DIGEST);
-    let m = Manifest::load(&dir, Pin::Digest(PYTHON_DIGEST)).unwrap();
+    assert_eq!(manifest_digest(&tilefish::json::parse_strict(&text).unwrap()).unwrap(), python_digest);
+    let m = Manifest::load(&dir, Pin::Digest(python_digest)).unwrap();
     assert_eq!(m.entries().len(), 2);
+    let kernels = want["kernels"].as_array().unwrap();
+    assert_eq!(kernels.len(), 2);
+    for k in kernels {
+        let entry = m.entry(k["stem"].as_str().unwrap(), k["arch"].as_str().unwrap()).unwrap();
+        assert_eq!(entry.cubin_name, k["cubin"].as_str().unwrap());
+        let bytes = std::fs::read(dir.join(&entry.cubin_name)).unwrap();
+        assert_eq!(tilefish::elf::sha256_hex(&bytes), k["sha256"].as_str().unwrap(), "{}", entry.cubin_name);
+    }
     let e = m.entry("gemm.M256", "sm_103").unwrap();
     assert_eq!(e.binary, Some(BinarySource::Cute { cutlass_dsl: "4.8.1".into(), options: String::new() }));
     let kinds: Vec<(&str, Vec<usize>, bool)> =

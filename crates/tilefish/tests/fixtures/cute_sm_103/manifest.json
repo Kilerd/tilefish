@@ -1,6 +1,6 @@
 {
   "schema": 3,
-  "tilefish": "0.0.11",
+  "tilefish": "0.0.12",
   "kernels": [
     {
       "stem": "gemm.M128",
@@ -192,7 +192,7 @@
           ]
         }
       ],
-      "declaration_digest": "572827857ba003b59ce82adca0a04949ad3009fa56cca5be02684a4c73df3c4d",
+      "declaration_digest": "7ce937299494e44ba7cbdd7672b3450cd2efc69b47b38541dfe3f97e6f85a62e",
       "sha256": "d508998e1e3057997f0270f8a7e8c0b7e22283bd86cbefa6418d61207f643a07",
       "sha256_code": "9c08c2f0c37c735f6573d16a387e5d123d554c08eecd2858b7674d2073939950",
       "toolchain": {
@@ -398,7 +398,7 @@
           ]
         }
       ],
-      "declaration_digest": "572827857ba003b59ce82adca0a04949ad3009fa56cca5be02684a4c73df3c4d",
+      "declaration_digest": "7ce937299494e44ba7cbdd7672b3450cd2efc69b47b38541dfe3f97e6f85a62e",
       "sha256": "d508998e1e3057997f0270f8a7e8c0b7e22283bd86cbefa6418d61207f643a07",
       "sha256_code": "9c08c2f0c37c735f6573d16a387e5d123d554c08eecd2858b7674d2073939950",
       "toolchain": {

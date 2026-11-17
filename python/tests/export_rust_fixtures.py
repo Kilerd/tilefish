@@ -42,6 +42,14 @@ fresh export would give the same machine code in other files)::
 
 which exports, for each architecture, the operators of ``ops()`` that the fixture has no binary of into its directory (``tilefish.runtime.export`` merges
 into a manifest that is there), then writes ``expected.json`` and ``generated.rs`` again.
+
+Every run also writes ``OUTPUT_DIR/cute_sm_103``, the manifest of a CuTe DSL kernel (``cute_fixture.py``: the fake build of ``test_cute_externs.py``,
+no GPU and no DSL), and its entry ``"cute"`` of ``expected.json``, which ``tests/cute_externs.rs`` reads it with. Only that, with no build and no
+GPU (every other file stays)::
+
+    python export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --cute-only
+
+``test_cute_externs.py`` requires the committed files to be what this writes.
 """
 
 import argparse
@@ -50,6 +58,7 @@ import pathlib
 import shutil
 import sys
 
+import cute_fixture
 from host_ops import GEMM_SHAPES, GEMM_SHAPES_COMMITTED, gpu_ops, library_ops, ops
 
 from tilefish import runtime
@@ -84,6 +93,14 @@ def expected(manifest):
             for e in sorted(manifest.library_entries, key=lambda e: (e["stem"], e["arch"]))
         ],
     }
+
+
+def write_expected(output, summary):
+    """Write ``output/expected.json``: ``summary`` (the fixtures of the architectures) and the CuTe DSL fixture, written again into ``output``."""
+    cute = expected(cute_fixture.write(output / cute_fixture.NAME))
+    doc = {"fixtures": summary, "cute": {cute_fixture.NAME: cute}}
+    (output / "expected.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    print(f"{cute_fixture.NAME}: {len(cute['kernels'])} binaries, manifest digest {cute['manifest_digest']}", file=sys.stderr)
 
 
 def native_capability():
@@ -152,7 +169,7 @@ def migrate_sm_count(output, sm_count):
         if manifest.library_entries:
             write_generated(manifest, output, list(ops().values()) + list(library_ops(GEMM_SHAPES_COMMITTED).values()))
         print(f"{name}: manifest digest {manifest.digest}", file=sys.stderr)
-    (output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
+    write_expected(output, summary)
 
 
 def add_missing(output, caps):
@@ -177,7 +194,7 @@ def add_missing(output, caps):
             write_generated(manifest, output, plain + gemms)
         summary[name] = expected(manifest)
         print(f"{name}: added {[op.name for op in missing]}, manifest digest {manifest.digest}", file=sys.stderr)
-    (output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
+    write_expected(output, summary)
 
 
 def main(argv=None):
@@ -197,6 +214,11 @@ def main(argv=None):
         help="build only the operators of ops() that the fixtures in OUTPUT have no binary of, merge them in, and write expected.json and generated.rs again",
     )
     parser.add_argument(
+        "--cute-only",
+        action="store_true",
+        help="no build: write the CuTe DSL fixture (cute_sm_103) and its entry of expected.json again",
+    )
+    parser.add_argument(
         "--generated-only",
         action="store_true",
         help="no build: write generated.rs again from the committed fixture in OUTPUT (for a change of the emitter)",
@@ -204,6 +226,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.migrate_sm_count is not None:
         migrate_sm_count(args.output, args.migrate_sm_count)
+        return
+    if args.cute_only:
+        write_expected(args.output, json.loads((args.output / "expected.json").read_text())["fixtures"])
         return
     caps = [int(c) for c in args.archs.split(",")]
     if args.add_missing:
@@ -238,7 +263,7 @@ def main(argv=None):
             f"sm_{cap}: {len(manifest.artifacts)} binaries and {len(manifest.library_entries)} library entries, manifest digest {manifest.digest}",
             file=sys.stderr,
         )
-    (args.output / "expected.json").write_text(json.dumps({"fixtures": summary}, indent=2) + "\n", encoding="utf-8")
+    write_expected(args.output, summary)
 
 
 if __name__ == "__main__":
