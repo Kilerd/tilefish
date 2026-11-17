@@ -712,6 +712,22 @@ and a legacy pin of
 ctypes on the `libcudnn` the process has (torch's), and the Rust crate loads cuDNN only for a manifest that has a convolution (`Manifest::conv`, `Conv`). See
 `docs/manifest-schema-3.md`, section 9.4.
 
+**A CuTe DSL kernel.** A kernel of CUTLASS's CuTe DSL (`nvidia-cutlass-dsl`: TMA, `tcgen05`, clusters, persistent tile schedulers, in Python) is an
+extern too, compiled by the DSL and launched by every host as a prebuilt cubin with the launch the compiled host function makes (`docs/cute.md`):
+
+```python
+@tilefish.extern(cute=PersistentDenseGemmKernel(cutlass.Float32, True, (256, 128), (2, 1), True),   # a CUTLASS example's kernel class
+                 cute_args=lambda a, b, c: (a.unsqueeze(-1), b.unsqueeze(-1), c.unsqueeze(-1), max_active_clusters))
+def gemm(a: Tensor[M, 1024, f16], b: Tensor[2048, 1024, f16], c: Out[Tensor[M, 2048, f16]]): ...   # static shapes: one binary per bucket of M
+```
+
+The build compiles it for the device (the DSL's own cubin and PTX) and calls the compiled host function on a stream captured into a CUDA graph, so the
+kernel does not run: the grid, block, cluster and dynamic shared memory, and every kernel parameter, which must be a tensor's pointer, a TMA descriptor
+the DSL encoded (a template the host writes the tensor's address into) or constant bytes, checked over three captures at other addresses. The entry is a
+`binary` entry of source `cute` (section 4.9 of the schema), pinned like any other; its identity is the PTX, which a Python replay compiles again. On a
+30-SM partition of an sm_103 GPU the persistent tcgen05 GEMM of the examples writes the bytes of the pinned cuBLASLt GEMM, and runs at 1.17x its speed at
+`4096 x 2048 x 1024` (0.92x at `M = 1024`).
+
 ## Masks, indices, gathers and copies
 
 A lowered `@kernel` also compares, selects, counts positions, reduces to an index, and gathers and scatters rows at indices that are device

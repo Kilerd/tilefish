@@ -11,7 +11,7 @@ field that is not mentioned is as in schema 2.
 
 Contents: 1 what changed; 2 the top level; 3 the digest (3.1 what a pin vouches for, reproducible exports); 4 kernel entries (4.1 an implementation per
 architecture, 4.2 warp-specialised kernels, 4.3 persistent grids, 4.4 a configuration per bucket, 4.5 thread-block clusters, 4.6 a global scratch,
-4.7 the CUDA math functions of a generated kernel, 4.8 the probes of an instrumented build); 5 the ABI (strided views, device scalars, fixed arguments, scratch slots, an `out` written over its
+4.7 the CUDA math functions of a generated kernel, 4.8 the probes of an instrumented build, 4.9 CuTe DSL kernels); 5 the ABI (strided views, device scalars, fixed arguments, scratch slots, an `out` written over its
 input, TMA descriptors, null pointers, 64-bit dimension scalars); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM, and in 9.4 a pinned cuDNN convolution); 10 strict reading, every
 refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where it is tested.
 
@@ -46,6 +46,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.cluster_dims` and `launch.num_ctas` of a thread-block cluster (a Triton kernel's `num_ctas`, a prebuilt binary's declared cluster) are launched with `cuLaunchKernelEx`, and `options.num_ctas` says it (section 4.5) |
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.global_scratch_size` above 0 is launched with a scratch of that many bytes per CTA, and `launch.global_scratch_align` records its alignment (section 4.6) |
 | kernel entry (0.0.11, crate 0.0.9) | — | an optional `instrument` on the entry of an instrumented build (`export(..., instrument=True)`): its probes, recorded into the buffer a host gives in the profile scratch slot; a manifest with such an entry is an instrumented export, which both readers refuse unless asked to load one (section 4.8) |
+| kernel entry (unreleased) | — | a `binary` entry of `binary.source` `"cute"`: a CuTe DSL kernel (`@tilefish.extern(cute=...)`), its toolchain the DSL's, its `source_digest` the sha256 of its PTX (kind `tilefish.cute.v1`), its grid integers; and the ABI kinds `tensormap` (a TMA descriptor the DSL encodes: a template with the tensor's address written into its first 8 bytes) and `bytes` (constant bytes), of such an entry only (section 4.9) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -478,6 +479,65 @@ kernel's `tilefish.probe` calls, and `@begin`, `@calib` and `@end`, into a probe
 * Where it is tested: `python/tests/test_instrument.py`, `python/tests/test_gpu_instrument.py`, `crates/tilefish/tests/instrument.rs`, the Rust gate's
   instrumented case.
 
+### 4.9 CuTe DSL kernels: `binary.source: "cute"`, the kinds `tensormap` and `bytes` (unreleased)
+
+A kernel written in CUTLASS's CuTe DSL (`nvidia-cutlass-dsl`, `import cutlass.cute as cute`: a `@cute.jit` host function that launches a `@cute.kernel`)
+is declared with `@tilefish.extern(cute=host, cute_args=..., cute_options=...)` (`docs/cute.md`). The DSL compiles it for the layouts of its arguments,
+so its shapes are static: one binary per bucket. Its cubin is the DSL's own (the PTX of the NVVM and the cubin of the `ptxas` the DSL carries), and the
+launch is the compiled host function's, captured when it is built (a CUDA graph: the kernel does not run): the grid, the block, the cluster, the
+dynamic shared memory and the bytes of every kernel parameter. Its entry is a `binary` entry of section 8 with these differences:
+
+| field | type and rule |
+|---|---|
+| `binary` | exactly `{"source": "cute", "cutlass_dsl": <version>, "options": <string>}`: the version of the DSL package (`[0-9]+(\.[0-9]+){1,3}` and an optional suffix of `[A-Za-z0-9.+_-]`) and the DSL compile options the declaration gives (characters of `[A-Za-z0-9 =,._:/+-]`, one space apart, possibly empty) |
+| `toolchain` | exactly `{"cutlass_dsl", "nvvm", "ptxas"}`, strings: the DSL (`binary.cutlass_dsl`), the NVVM release its PTX header names, the `ptxas` release its cubin's `.note.nv.tkinfo` names |
+| `source_digest`, `source_digest_kind` | the sha256 of the PTX the DSL generated, of kind `"tilefish.cute.v1"` (required) |
+| `ptx_target` | the `.target` of the PTX, `sm_<arch>` with an optional letter (`sm_103a`), of the entry's architecture |
+| `grid` | integers only (no dimension name: the shapes are static), the programs of the launch: its grid of blocks divided by its cluster, axis by axis (section 4.5) |
+| `block`, `shared` | the compiled kernel's block and dynamic shared memory |
+| `launch` | the zero value but for the cluster of the compiled launch (at most 8 CTAs, launched with the spread scheduling policy as every cluster is) |
+| `persistent`, `options`, `num_warps`, `num_stages`, `source_sha256` | absent |
+| `abi.params` | kinds `pointer` (dense: no `strides`, `offset` or `alias`), `tensormap` and `bytes` only, one slot each; every tensor of the operator in exactly one `pointer` or `tensormap`, in the order of the declaration; `scratch` empty, `scratch_slots` 0 |
+
+**The kinds.**
+
+* `tensormap`: `{"slot", "index", "name", "kind": "tensormap", "type": "tensormap", "ptx_type": "b8[128]", "size": 128, "dtype", "access", "shape",
+  "template"}`. A tensor (it binds dimensions, has preconditions and is passed by a call as a `pointer` is) passed as a TMA descriptor, 128 bytes by value,
+  as the DSL's host code encodes one for a static shape: `template` is 256 lowercase hex digits, the 128 bytes with the bytes 0 to 7 and 64 to 127 zero. A
+  launch passes the template with the tensor's address, a little-endian `u64`, in its bytes 0 to 7 (64-byte aligned in the host's memory, as the PTX
+  parameter is); the address is 16-byte aligned (its `pointer_alignment`) and below 2^57 (the DSL keeps 53 bits of `address / 16`), or the launch is
+  refused. It has no `dim`, `count_of`, `stride_of`, `value`, `alias`, `strides`, `offset` or `tensor_map`.
+* `bytes`: `{"slot", "index", "name", "kind": "bytes", "type": "bytes", "ptx_type": "b8[<size>]", "size": <1 to 32764>, "value"}`, `value` the `2 * size`
+  lowercase hex digits of the parameter. A launch passes the bytes; a call gives nothing for it. It has no other field. Its `index` is its `slot` and its
+  `name` `param_<slot>` (it is no parameter of the declaration).
+
+**Where the template comes from.** The DSL encodes the `CUtensorMap` of a static shape in its own host code, not with `cuTensorMapEncodeTiled`: it writes
+eight 64-bit words, the first of which holds the address (`((address / 16) & (2^53 - 1)) << 4`) and the seven others constants of the shape, the box,
+the swizzle and the type, and leaves the 64 bytes after them as they were on its stack (the driver ignores them; a host passes zeros). The build
+captures the launch three times, each time with every tensor at another address, and requires every byte of a parameter that the kernel reads to be
+the same in the three, or to be a tensor's address (an aligned 8-byte word, read whole, equal to that tensor's address in each capture); the bytes the
+kernel reads are those its PTX loads with `ld.param` at constant offsets, or all of a parameter whose address the code takes otherwise (a descriptor),
+and a descriptor is a parameter of 128 bytes aligned to 64 whose first word is an address, its bytes 64 to 127 excepted. A byte the kernel does not read
+(the padding of a structure, which the DSL's host code leaves as it was on its stack) is zero in `value` and in a template. A parameter that holds an address elsewhere (a pointer
+inside a structure), a byte that varies and is no address (a value of the host function's own: a pointer it allocated, a dynamic shape), a tensor in
+two parameters or in none, and the tensors in another order than the declaration's are refused: the kernel would take something a host cannot
+reproduce from the manifest.
+
+**Identity.** The declaration digest has, in place of a prebuilt binary's section, `{"kind": "cute", "host": "<module>:<qualname>", "source_sha256":
+<the sha256 of the file of the host function>, "cutlass_dsl": <the DSL's version>, "options": <the options>}` (the compile spec's `binary` section is the
+same), so another DSL, another file or other options is another declaration. The binary is identified, as a Triton kernel by its IR, by its PTX:
+Python's replay compiles the declaration with the DSL of the process (it must be the declaration's version) and compares the sha256 of the PTX with
+`source_digest`; a mismatch is refused, pinned or not, and where it cannot be compiled the entry is accepted only pinned. The Rust host and the C ABI
+compare nothing but the pin (the manifest digest covers every field and every file, as always). The compile spec's `grid` (`"(1,)"`) and `block`
+(`[1, 1, 1]`) are placeholders: the entry's are the compiled kernel's, and a replay compares the entry's tensors (index, name, dtype, access and shape
+of each) with the spec's.
+
+**Readers.** Both readers refuse what this section does not allow: a `binary` section, a toolchain, a source digest, a `ptx_target` or a grid of another
+form; a `persistent` grid; a parameter of another kind, a view or an alias, on such an entry; a `tensormap` or a `bytes` parameter on any other entry; a
+template or a value of another length, not lowercase hex, or a template not zero in its bytes 0 to 7 and 64 to 127; a `bytes` size out of range or a
+`ptx_type` that is not `b8[<size>]`; a field another kind has. A reader that predates the section (tilefish 0.0.11, crate 0.0.9) refuses an entry of
+source `cute` (`binary must be {"source": "cubin"} or ...`). A manifest without such an entry, and its digest, are unchanged.
+
 ## 5. The ABI
 
 `abi` is `{"params": [...], "scratch": [...], "scratch_slots": <int>}`. `params` are the kernel's launch arguments in order, one `kernelParams` slot
@@ -497,6 +557,8 @@ Every `params` entry has `slot`, `index` (the position in the declaration), `nam
 | `fixed` (prebuilt binaries only) | `i32`, `i64` or `f32` | `u32`/4, `u64`/8, `f32`/4 | `value` |
 | `given` (prebuilt binaries only) | `i32` or `i64` | `u32`/4 or `u64`/8 | none: every call gives the value (section 5.3) |
 | `null` | `*bf16`, `*fp32`, ... (the pointer type of its `dtype`) | `u64`, 8 | `dtype`: the launch passes 0 (section 5.6) |
+| `tensormap` (CuTe DSL kernels only) | `tensormap` | `b8[128]`, 128 | the fields of a dense pointer (`dtype`, `access`, `shape`) and `template`: the launch writes the tensor's address into it (section 4.9) |
+| `bytes` (CuTe DSL kernels only) | `bytes` | `b8[<size>]`, 1 to 32764 | `value`: the launch passes these bytes (section 4.9) |
 
 A launch passes: a `pointer` as its 64-bit address (see 5.1), a `null` as the 64-bit zero, a `scalar` as a signed integer of its `type`, a `fixed` as its `value` in its `type`
 (`ctypes.c_int32`/`c_int64`/`c_float`: an `f32` value is the JSON number rounded to the nearest `f32`). It is `cuLaunchKernel` with the grid the
@@ -1339,7 +1401,16 @@ document tilefish writes next to a build and the host does not read):
   or on a legacy pin that was not imported; a `canary` that is not exactly `{seed, y_digest}` (a seed out of 0..2^32 - 1, not an int, or `true`; a
   digest not 32 lowercase hex digits), `null` included, and the first form `{seed, y_sha256}`; a knob of the value -1 (not set: left out of a pin); the
   shapes of `x`, `w`, `out` not the problem's in the layout under the buckets.
-* *spec* only, for prebuilt binaries: a `binary` section that is not `{kind, symbol, shared, digests}`; `attrs` not empty; `launch_params` not every arg
+* a CuTe DSL entry (section 4.9): a `binary` that is not exactly `{source: "cute", cutlass_dsl, options}` (a version and options of their forms), a
+  `toolchain` that is not exactly `{cutlass_dsl, nvvm, ptxas}` (strings, the DSL the binary's), a `source_digest_kind` other than `"tilefish.cute.v1"` or
+  no `source_digest`, a `ptx_target` that is not of the entry's architecture, a grid that names a dimension, a `persistent` grid, a `source_sha256`; a
+  parameter that is not a `pointer`, a `tensormap` or a `bytes`, or a `pointer` with `strides`, `offset` or `alias`; a `tensormap` whose `type`,
+  `ptx_type`, `size` are not `tensormap`, `b8[128]`, 128, with a field of another kind, without a dtype, an access or a shape, or with a `template` that is
+  not 256 lowercase hex digits zero in its bytes 0 to 7 and 64 to 127; a `bytes` whose `type` is not `bytes`, whose `size` is not from 1 to 32764 or
+  `ptx_type` not `b8[<size>]`, with any other field, or whose `value` is not `2 * size` lowercase hex digits; a `tensormap` or `bytes` parameter, or a
+  `source_digest_kind` `"tilefish.cute.v1"`, on any other entry.
+* *spec* only, for prebuilt binaries: a `binary` section that is not `{kind, symbol, shared, digests}` (for a CuTe DSL kernel: `{kind: "cute", host,
+  source_sha256, cutlass_dsl, options}`); `attrs` not empty; `launch_params` not every arg
   in order; a `block` that is not three ints from 1 to 1024 with product ≤ 1024; a `constexpr` argument.
 
 ## 11. Migrating a schema 2 manifest
