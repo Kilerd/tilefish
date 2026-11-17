@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "tilefish"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "cudarc",
  "ryu",

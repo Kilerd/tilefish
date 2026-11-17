@@ -47,7 +47,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.global_scratch_size` above 0 is launched with a scratch of that many bytes per CTA, and `launch.global_scratch_align` records its alignment (section 4.6) |
 | library entry (0.0.12, crate 0.0.10) | — | `impl: "cublaslt.matmul"`: a GEMM with a cuBLASLt epilogue (`none`, `bias`, `relu`, `relu_bias`, and `beta` 1 to add `c`), its pin verified against the epilogue's formula and recorded `measured-exact` or `binary-defined` (`contract`, `verification`), and an optional `canary` (section 9.5) |
 | kernel entry (0.0.11, crate 0.0.9) | — | an optional `instrument` on the entry of an instrumented build (`export(..., instrument=True)`): its probes, recorded into the buffer a host gives in the profile scratch slot; a manifest with such an entry is an instrumented export, which both readers refuse unless asked to load one (section 4.8) |
-| kernel entry (unreleased) | — | a `binary` entry of `binary.source` `"cute"`: a CuTe DSL kernel (`@tilefish.extern(cute=...)`), its toolchain the DSL's, its `source_digest` the sha256 of its PTX (kind `tilefish.cute.v1`), its grid integers; and the ABI kinds `tensormap` (a TMA descriptor the DSL encodes: a template with the tensor's address written into its first 8 bytes) and `bytes` (constant bytes), of such an entry only (section 4.9) |
+| kernel entry (0.0.13, crate 0.0.11) | — | a `binary` entry of `binary.source` `"cute"`: a CuTe DSL kernel (`@tilefish.extern(cute=...)`), its toolchain the DSL's, its `source_digest` the sha256 of its PTX (kind `tilefish.cute.v1`), its grid integers; and the ABI kinds `tensormap` (a TMA descriptor the DSL encodes: a template with the tensor's address written into its first 8 bytes) and `bytes` (constant bytes), of such an entry only (section 4.9) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
 
@@ -480,7 +480,7 @@ kernel's `tilefish.probe` calls, and `@begin`, `@calib` and `@end`, into a probe
 * Where it is tested: `python/tests/test_instrument.py`, `python/tests/test_gpu_instrument.py`, `crates/tilefish/tests/instrument.rs`, the Rust gate's
   instrumented case.
 
-### 4.9 CuTe DSL kernels: `binary.source: "cute"`, the kinds `tensormap` and `bytes` (unreleased)
+### 4.9 CuTe DSL kernels: `binary.source: "cute"`, the kinds `tensormap` and `bytes` (tilefish 0.0.13, crate 0.0.11)
 
 A kernel written in CUTLASS's CuTe DSL (`nvidia-cutlass-dsl`, `import cutlass.cute as cute`: a `@cute.jit` host function that launches a `@cute.kernel`)
 is declared with `@tilefish.extern(cute=host, cute_args=..., cute_options=...)` (`docs/cute.md`). The DSL compiles it for the layouts of its arguments,

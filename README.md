@@ -5,7 +5,7 @@ quantization format of every tensor live in its type, operators come from a
 typed library, and a model is built once into GPU binaries plus a manifest.
 Thin Python, C++ and Rust hosts are generated from the same signatures.
 
-**Status: early preview (0.0.12 on PyPI, 0.0.10 on crates.io; the C++ host builds from this repository).** tilefish types GPU kernels
+**Status: early preview (0.0.13 on PyPI, 0.0.11 on crates.io; the C++ host builds from this repository).** tilefish types GPU kernels
 written in Triton, Gluon, CuTe DSL or PTX, pinned cuBLASLt and cuDNN calls and kernels it lowers itself, builds a model's graphs into launch plans
 over one arena, and runs the same pinned artefact from Python, Rust and C++. What it is and is not, and how features are added from now on, is in
 [`docs/scope.md`](docs/scope.md); the other documents are listed in [`docs/README.md`](docs/README.md).

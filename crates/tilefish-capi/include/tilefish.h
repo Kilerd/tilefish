@@ -639,7 +639,7 @@ extern "C" {
 uint32_t tilefish_abi_version(void);
 
 /**
- * The version of the tilefish crate the library is built from (`"0.0.10"`), a static string.
+ * The version of the tilefish crate the library is built from (`"0.0.11"`), a static string.
  */
 const char *tilefish_version(void);
 

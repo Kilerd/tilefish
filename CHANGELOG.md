@@ -5,13 +5,16 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## Unreleased
+## tilefish 0.0.13, crate 0.0.11, tilefish-capi 0.0.2 (2026-11-17)
 
 The last release that adds features ahead of a need (`docs/scope.md`). Manifest schema 3 gains one form of kernel entry, a CuTe DSL kernel
 (`binary.source` `"cute"` and the parameter kinds `tensormap` and `bytes`, section 4.9): additive, so every manifest, plan and pin of 0.0.12 is read
 and written as it was, and a reader of 0.0.12 or crate 0.0.10 refuses such an entry. Plan schema 1 and the C ABI (1.1) are unchanged. An export
 without a CuTe DSL kernel writes the manifests and plans of 0.0.12, but for a graph that declares `epilogues="accumulator"` around a hook of a dual
 accumulator: its fused pair no longer stores the rounded result as well (below); its outputs are the same bytes.
+
+The crate reads and launches CuTe DSL entries (0.0.11). `tilefish-capi`'s sources are unchanged, so it stays 0.0.2 (ABI 1.1), built from the release
+commit with cargo or CMake; built from this release it launches CuTe DSL entries through the crate (`tilefish_version()` says `"0.0.11"`).
 
 ### Scope
 
