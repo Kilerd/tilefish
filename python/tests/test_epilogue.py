@@ -292,11 +292,11 @@ def test_a_scope_declares_the_mode_of_the_ops_traced_in_it():
         with tilefish.fused(epilogues="accumulator"):
             pass
     with pytest.raises(TilefishPlanError, match="epilogues must be one of"):
-        tilefish.fused(epilogues="library")
+        tilefish.fused(epilogues="libraries")
     with pytest.raises(TilefishPlanError, match="name= ..* not planned yet|say what the scope sets"):
         tilefish.fused()
     with pytest.raises(TilefishPlanError, match="epilogues must be one of"):
-        tilefish.fusion(epilogues="library")
+        tilefish.fusion(epilogues="libraries")
     assert tilefish.fusion(epilogues="accumulator").canonical() == tilefish.fusion().canonical()  # (a mode changes nodes, not a region's name)
 
 

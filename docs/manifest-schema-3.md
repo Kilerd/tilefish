@@ -12,7 +12,7 @@ field that is not mentioned is as in schema 2.
 Contents: 1 what changed; 2 the top level; 3 the digest (3.1 what a pin vouches for, reproducible exports); 4 kernel entries (4.1 an implementation per
 architecture, 4.2 warp-specialised kernels, 4.3 persistent grids, 4.4 a configuration per bucket, 4.5 thread-block clusters, 4.6 a global scratch,
 4.7 the CUDA math functions of a generated kernel, 4.8 the probes of an instrumented build); 5 the ABI (strided views, device scalars, fixed arguments, scratch slots, an `out` written over its
-input, TMA descriptors, null pointers, 64-bit dimension scalars); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM, and in 9.4 a pinned cuDNN convolution); 10 strict reading, every
+input, TMA descriptors, null pointers, 64-bit dimension scalars); 6 preconditions; 7 the table of dimensions; 8 prebuilt binaries; 9 the `library` section (a pinned cuBLASLt GEMM, in 9.4 a pinned cuDNN convolution, in 9.5 a GEMM with a cuBLASLt epilogue); 10 strict reading, every
 refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where it is tested.
 
 ## 1. What changed
@@ -45,6 +45,7 @@ refusal; 11 migrating a schema 2 manifest; 12 what the Rust host does; 13 where 
 | kernel entry (0.0.7, crate 0.0.5) | — | an optional `persistent`: a persistent grid, the tiles cut at launch to the programs the SMs of the device (or of its partition) run (section 4.3) |
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.cluster_dims` and `launch.num_ctas` of a thread-block cluster (a Triton kernel's `num_ctas`, a prebuilt binary's declared cluster) are launched with `cuLaunchKernelEx`, and `options.num_ctas` says it (section 4.5) |
 | kernel entry (0.0.7, crate 0.0.5) | — | `launch.global_scratch_size` above 0 is launched with a scratch of that many bytes per CTA, and `launch.global_scratch_align` records its alignment (section 4.6) |
+| library entry (0.0.12, crate 0.0.10) | — | `impl: "cublaslt.matmul"`: a GEMM with a cuBLASLt epilogue (`none`, `bias`, `relu`, `relu_bias`, and `beta` 1 to add `c`), its pin verified against the epilogue's formula and recorded `measured-exact` or `binary-defined` (`contract`, `verification`), and an optional `canary` (section 9.5) |
 | kernel entry (0.0.11, crate 0.0.9) | — | an optional `instrument` on the entry of an instrumented build (`export(..., instrument=True)`): its probes, recorded into the buffer a host gives in the profile scratch slot; a manifest with such an entry is an instrumented export, which both readers refuse unless asked to load one (section 4.8) |
 
 Nothing is removed. A schema 2 manifest of Triton kernels becomes a schema 3 manifest by three additions (section 11).
@@ -1266,6 +1267,101 @@ MIG slice); the plans' captures of `test_gpu_conv.py` and the Rust gate's `launc
   these convolutions finalizes in cuDNN 9.10.2 or 9.13.0 (the heuristic answers nothing, and the engine of the plain pin is
   `CUDNN_STATUS_NOT_SUPPORTED`), so a declaration with such a target is refused at the build, never run without its target.
 
+### 9.5 A GEMM with a cuBLASLt epilogue: `impl: "cublaslt.matmul"` (tilefish 0.0.12, crate 0.0.10)
+
+A `library` entry whose `impl` is `"cublaslt.matmul"` is a GEMM whose epilogue cuBLASLt runs on the f32 accumulator, before the one rounding to the
+result's type (RFC 0003, milestone E2). The two impls of section 9 stay byte for byte as they are; a reader of 0.0.11 or of crate 0.0.9 refuses an entry
+of this impl (its `impl` is not one it knows).
+
+**The operation.** In tilefish's row-major terms, with the layouts and the problem of sections 9 and 9.2:
+
+`out[M, N] = ρ(f(acc))`, `acc = a @ b^T` (`a @ b` for `NN`, and `a^T` for `TT` and `NT`) in f32, `ρ` the one rounding to the result's type, and `f` by
+`epilogue` and `beta`, in this order (the library adds `c` before the bias: measured, RFC 0003 X1):
+
+| `epilogue` | cuBLASLt's | `beta` 0 | `beta` 1 |
+|---|---|---|---|
+| `"none"` | `CUBLASLT_EPILOGUE_DEFAULT` (1) | `acc` | `acc + c` |
+| `"bias"` | `CUBLASLT_EPILOGUE_BIAS` (4) | `acc + bias` | `(acc + c) + bias` |
+| `"relu"` | `CUBLASLT_EPILOGUE_RELU` (2) | `relu(acc)` | `relu(acc + c)` |
+| `"relu_bias"` | `CUBLASLT_EPILOGUE_RELU_BIAS` (6) | `relu(acc + bias)` | `relu((acc + c) + bias)` |
+
+`a` and `b` are bf16 or f16 (both one type `T`); `out`, the `bias [N]` and `c [M, N]` (the layout of `out`) are `T` too. That formula is what the entry's
+pin is verified against (below), not a promise: the bytes are the library's under the pin (contract (iii)). Every operand is contiguous and 16-byte
+aligned.
+
+**How cuBLASLt is called.** As in section 9, with the matmul descriptor's `EPILOGUE` the value of the table (set for every epilogue, `DEFAULT` included),
+and `BIAS_DATA_TYPE` (the result's type) and `BIAS_POINTER` for the two with a bias. `alpha = 1.0f`; `beta = 0.0f` with `C` the `out` pointer (never read)
+when `beta` is 0, and `beta = 1.0f` with `C` the `c` pointer when it is 1; the layout of `C` is the layout of `D`. Every check and run (Python's
+`tilefish._cublaslt.matmul(..., epilogue=, c_ptr=)`, the crate's `cublaslt::Problem` with an epilogue) sets the same descriptor, so
+`cublasLtMatmulAlgoCheck` judges the algorithm with its epilogue.
+
+**The fields.** Those of section 9 (`ENTRY_KEYS`), with `beta`, `contract` and `verification` added, and these rules where they differ:
+
+| field | type and rule |
+|---|---|
+| `impl` | `"cublaslt.matmul"` |
+| `epilogue` | `"none"`, `"bias"`, `"relu"` or `"relu_bias"` |
+| `beta` | the int `0` or `1` (not `1.0`, not `true`) |
+| `dtypes` | `{"a": T, "b": T, ["bias": T,] ["c": T,] "out": T}`, `T` `"bf16"` or `"f16"`: `bias` exactly for `"bias"` and `"relu_bias"`, `c` exactly for `beta` 1 |
+| `abi.params` | the pointers `a`, `b`, [`bias` `[n]`], [`c` `[m, n]`], `out` `[m, n]`, in this order, of the types of `dtypes` (`out` is `out`, the others `in`) |
+| `contract` | `"measured-exact"` or `"binary-defined"`: what the verification of the pin found (below) |
+| `verification` | an object of exactly `formula`, `accumulator`, `operand_sets`, `elements`, `differ`, `max_ulp` (below) |
+| `canary` | *optional*: `{"seed": s, "out_digest": d}`, `s` an int from 0 to 2^32 - 1, `d` 32 lowercase hex digits (below) |
+| `heuristic`, `allow_bf16_reduction`, `allow_f16_reduction`, `sm_count_target` | *optional*, as in sections 9.1 to 9.3 (`allow_f32_reduction` is refused by the rule of the operands' type) |
+
+`algo_source` is refused: the impl imports no algorithm yet. The `declaration_digest` covers the declaration's `epilogue`, `beta`, `canary` (whether
+export records one) and `contract` (when it requires `"measured-exact"`).
+
+**The pin.** It is chosen and vetted as a GEMM's (section 9, step 4), for the epilogue: the heuristic is asked with the descriptor above, and **every
+epilogue but `"none"` gets no split-K** unless the declaration opts in (the reduction-scheme mask `0` of a GEMM with a bias; with `"none"` and `beta` 1
+split-K with f32 partial sums is taken, as for `cublaslt.gemm`). The rule of step 4 holds with the words of the epilogue: "split-K count 3 with the relu
+epilogue may apply it to a sum already rounded to bf16 (as the bias epilogue was measured to, with f32 partial sums too), which rounds twice; a GEMM with an
+epilogue has no split-K unless its declaration opts in with allow_bf16_reduction=True" (Python's `reduction_problem`, the crate's `reduction_problem`;
+for `"bias"` the words of section 9).
+
+**The verification** (`tilefish._matmul.verify`, at every pin: `jit` and `export`). Where an epilogue's arithmetic can be written down its bytes may be
+contract (ii): the formula on the pin's own accumulator, in f32, rounded once. That is a property of the pin, not of the epilogue, so each pin is run on
+two seeded operand sets and compared bit for bit with that reference:
+
+| field | what it records |
+|---|---|
+| `formula` | the formula of the table for the entry's `epilogue` and `beta` (a reader checks it is that one) |
+| `accumulator` | `"f32-form"`: the accumulator is the f32 output of the pin's configuration re-encoded with an f32 `D` (`DEFAULT`, `beta` 0), which X1 found observable this way; `"plain-f32-pin"`: cuBLASLt does not take that configuration with an f32 `D`, and the f32 GEMM the same posture pins gave it |
+| `operand_sets` | 2: `a ~ N(0, 1)` and `b ~ N(0, 1/k)` in their layouts, a bias `~ N(0, 1/4)` and `c ~ N(0, 1)`, with `+0`, `-0`, `+inf`, `-inf`, NaN, the largest finite values of both signs and a subnormal in the first 8 columns of the bias and of `c` (the second set has `c`'s next to them), and rows of `a` that give every epilogue special accumulators: a NaN, a zero and an infinity in each set, and two rows that overflow in the second |
+| `elements` | the elements compared: `operand_sets * m * n` (a reader checks it) |
+| `differ` | the elements whose bits differ from the reference (torch on the device: f32 adds, `torch.relu`, its cast, which on CUDA gives the bits of tilefish's own lowering of the same ops: the canonical NaN) |
+| `max_ulp` | the largest distance between the two in units in the last place over the elements where both are finite (0 when none differs) |
+
+`contract` is `"measured-exact"` exactly when `differ` is 0, and a reader refuses an entry where they disagree. A declaration with
+`contract="measured-exact"` (and every rewrite of a plan's arithmetic into an epilogue, which declares it) refuses a pin that is not, at the build, and
+its replay refuses an entry that is not.
+
+What the verification found on a B300 MIG slice (sm_103, 30 SMs), for 14 shapes (`M` 32, 128, 640, 2048 by `N x K` of 1536 x 512, 3072 x 1024,
+1024 x 3072, and 32 x 4096 x 4096, 100 x 1000 x 1000), bf16 and f16, both postures and the seven cases `none`+`c`, `bias`, `relu`, `relu_bias`,
+`bias`+`c`, `relu`+`c`, `relu_bias`+`c` (392 pins per version; `python/tests/test_gpu_matmul.py`):
+
+* **cuBLASLt 12.8.4: every pin is measured-exact**, the special accumulators and values included; no pin splits `k`.
+* **cuBLASLt 13.1.0: 372 of 392 are measured-exact.** The 20 others are the pins of algorithm 21 at 32 x 1024 x 3072 (`relu`, `relu_bias`, `bias`+`c`,
+  `relu`+`c` and `relu_bias`+`c`, both types, both postures): `bias`+`c` differs on 26% of the elements, by up to 15176 ULP (bf16), as X6 found; the
+  four with a ReLU differ on 2048 to 2111 of 65 536 elements, all of them NaN pre-activations: this algorithm's ReLU gives `0` for NaN, where the others
+  give the NaN (`torch.relu`). The `none`+`c` pins that split `k` (a split-K of 3 and 4 with f32 partial sums at `M = 32`) are measured-exact.
+
+**The canary.** cuBLASLt exposes no build number, so `export` records `{"seed": 1, "out_digest": d}` for a declaration with `canary=True` (the
+default), and a load runs it before the pin is used: Python at the first replay of the entry in the process and device
+(`tilefish._matmul.check_canary`), the crate in `Manifest::gemm` (once per context), each refusing a different digest ("the canary of the cuBLASLt
+matmul '<stem>' (<arch>, ...) gives out with digest ... here, and the manifest recorded ..."). An entry without one loads as before. Its operands are
+made on the device by the PTX module of section 9.4 (`tilefish._canary`, the crate's `src/canary.ptx`), with the element rule of section 9.4 for the
+entry's type `T`: `a` (tag 0, `m * k` elements), `b` (tag 1, `n * k`), `bias` (tag 2, `n`) and `c` (tag 3, `m * n`) when the entry has them, each dense
+in its layout; `out` (`m * n` elements, zero-padded to a whole 32-bit word) and a workspace of the entry's `workspace_bytes` start zeroed; the pin runs
+with the entry's descriptor, on a stream of its own (non-blocking, ordered with no other: as a convolution's canary); the digest is that of section 9.4
+over the words of `out`.
+
+**Replay**, after the steps of section 9: the entry's `epilogue`, `beta`, `dtypes` and operands must be the declaration's (Python compares the entry with
+the spec), a declaration with `contract="measured-exact"` refuses a `"binary-defined"` entry, one with a canary (the default) refuses an entry without
+one, and the canary runs. A launch takes `a`, `b`, [`bias`],
+[`c`], `out` and the workspace, in this order, checked as a GEMM's (the crate's `Gemm::launch` and `launch_raw`, the C ABI's `tilefish_gemm_launch`;
+`tilefish_gemm_epilogue` says the epilogue and whether it reads `c`). A launch plan's `library` step of this impl lists the same arguments.
+
 ## 10. Strict reading: every refusal
 
 A reader of schema 3 refuses (Python: `TilefishManifestError` unless marked *spec*, which are `TilefishSpecError` of the per-binary compile spec, a
@@ -1330,6 +1426,13 @@ document tilefish writes next to a build and the host does not read):
   `sm_count`; a form section 9.2 does not list (operands of two types or of
   another type than bf16, f16 and f32, a result of another type than theirs or f32, a bias of another type than the result, a `transa` or `transb`
   other than `T` and `N`, an `lda`, an `ldb`, an `a` or `b` shape or a pointer `dtype` that is not the form's); the opt-in of the other operand type.
+* every `cublaslt.matmul` entry (section 9.5): the rules of a GEMM's entry with its own field list (`beta`, `contract`, `verification` required;
+  `canary` and the options of sections 9.1 to 9.3 but `algo_source` optional); an `epilogue` not of the four; a `beta` that is not the int 0 or 1; operands
+  or a result that are not one type of bf16 and f16; a `bias` in `dtypes` and the ABI exactly for `bias` and `relu_bias`, a `c` exactly for `beta` 1; a
+  `contract` not of the two; a `verification` that is not exactly its six fields, with a `formula` that is not the epilogue's, an `accumulator` not of the
+  two, an `operand_sets` or `elements` below 1, a `differ` or `max_ulp` below 0, a `differ` above `elements`, a `contract` of `measured-exact` with a
+  `differ` above 0 or the reverse, a `max_ulp` above 0 with no element that differs; a `canary` that is not exactly `{seed, out_digest}` (a seed out of
+  0..2^32 - 1, a digest not 32 lowercase hex digits), `null` included.
 * every `cudnn.conv_fwd` entry (section 9.4): a missing or unknown field; `dtypes` that are not one type of `f16`, `bf16`, `f32`; another `compute_type`;
   a `math` not of section 9.4 or not of the data type; a `layout` other than `NCHW`/`NHWC`; `n`, `c`, `k`, `groups` not ints from 1, `groups` not dividing
   `c` and `k`; spatial lists not of one length from 1 to 3, with values out of range, or a problem with no output or too many elements; an `output` that is
@@ -1430,7 +1533,7 @@ cudarc's launch builder and orders the tensor's slice through cudarc's tracking 
 a capture holds them in the kernel node.
 
 **Launching a library entry** (`gemm.rs`, `ffi/cublaslt.rs`). `Manifest::gemm(&ctx, name, buckets, arch)` loads a `Gemm` for the device of `ctx` once and
-`Gemm::launch(&stream, &mut [a, b, [bias], out, workspace])` runs it:
+`Gemm::launch(&stream, &mut [a, b, [bias], [c], out, workspace])` runs it:
 
 * Load refuses, in Python's order: a cuBLASLt that cannot be opened (cudarc opens it when first used, and *panics* if it is missing, so `ffi/cublaslt.rs` asks
   first), a cuBLASLt whose `cublasLtGetVersion()` is not `cublaslt_version` (an error naming both versions), an algorithm that fails the vetting of section 9
@@ -1453,6 +1556,31 @@ a capture holds them in the kernel node.
 * The operands go through the plan of the entry (shapes bound to the entry's dimensions, the exact bucket, dtype, contiguity, 16-byte alignment, device,
   context, aliasing), the stream and context are checked, and the slices are ordered as a kernel's (cudarc's wait and record through the guards of
   `device_ptr`, the owners' wait for the end of the work, a refusal while a stream is capturing). `unsafe Gemm::launch_raw` with regions captures a GEMM.
+* **A GEMM with an epilogue** (`impl: "cublaslt.matmul"`, section 9.5) is read into the same `LibraryEntry` (`implementation` `LibraryImpl::Matmul`), with
+  `epilogue` (`GemmEpilogue::None`, `Bias`, `Relu` or `ReluBias`; `GemmEpilogue::formula` is Python's `formula`), `beta` (0 or 1; `has_bias()`,
+  `has_c()`), `contract` (`MatmulContract`), `verification` (`MatmulVerification`) and `canary` (`MatmulCanary`), all held to the rules of section 10
+  with Python's words (`fields_of`, `matmul_fields`; the fields of a `cublaslt.matmul` on `gemm` and `gemm_bias`, and `algo_source` on it, are refused
+  by name); an entry of `gemm` has `GemmEpilogue::None`, one of `gemm_bias` `GemmEpilogue::Bias`, `beta` 0 and no contract. Every check and run sets
+  the entry's epilogue on the matmul descriptor (`DEFAULT` included, as Python's `_Problem` does), `BIAS_DATA_TYPE` and `BIAS_POINTER` for the
+  epilogues with a bias, and `beta = 1.0` with the call's `c` as `C` (the layout of `D`) when the entry has `c`, else `beta = 0.0` with `C` the
+  `out` pointer; the vetting holds every epilogue but `none` to no split-K without the opt-in, in the words of Python's `reduction_problem` with
+  its `epilogue=` (`reduction_problem` takes the `GemmEpilogue`: Python's `bias` and `epilogue` in one). A call is `a`, `b`, [`bias`], [`c`],
+  `out` and the workspace, in that order, checked as a GEMM's (`c` is `[m, n]` of the result's type and overlaps nothing written); a launch
+  plan's library step lists the same arguments (`Call::c`). `Gemm::epilogue`, `beta`, `has_c`, `contract`, `canary` and `implementation` say
+  what was loaded. **The canary**: `Manifest::gemm` of an entry with one runs it once per context before the pin is used, after the vetting and
+  the check, exactly as Python's `canary_digest` computes it: on a stream of its own (`ctx.new_stream()`, never the NULL stream), the operands made
+  by the fill kernel of `canary.ptx` (`a` tag 0, `b` tag 1, `bias` tag 2, `c` tag 3, of the entry's type, dense in their layouts:
+  `LibraryEntry::canary_elements`), `out` zero-padded to a whole word and a workspace of the entry's `workspace_bytes` zeroed, the GEMM with the
+  entry's descriptor, the digest kernel over `out`, and only its 16 bytes copied back; another digest is refused with the words of Python's
+  `check_canary` ("the canary of the cuBLASLt matmul '<stem>' (<arch>, algorithm id ..., epilogue ...) gives out with digest ... here, and the
+  manifest recorded ... (seed s): ..."). The canary's kernels are loaded once per context while a loaded GEMM or convolution holds them
+  (`src/canary.rs`, shared with the convolutions); `Gemm::check_canary` runs it again. The contract is read and said, not enforced: a host that
+  wants only measured-exact pins checks `Gemm::contract` (Python's replay refuses a binary-defined entry only for a declaration that asks for
+  `contract="measured-exact"`, which a host without the declaration does not have).
+* **The C ABI** (ABI 1.1): `tilefish_gemm_launch` takes the tensors in the same order (`c` before `out`), and `tilefish_gemm_epilogue(gemm,
+  &epilogue, &has_c)` says the epilogue as `TILEFISH_EPILOGUE_NONE`, `_BIAS`, `_RELU` or `_RELU_BIAS` (0 to 3: tilefish's values, not cuBLASLt's
+  `cublasLtEpilogue_t`) and whether a launch takes `c`; `tilefish::Gemm::epilogue()`, `has_c()` and `has_bias()` in `tilefish.hpp`. A load
+  refused by the canary is `TILEFISH_ERROR_MANIFEST`.
 
 **Launching a convolution** (`conv.rs`, `ffi/cudnn.rs`). `Manifest::conv(&ctx, name, buckets, arch)` loads a `Conv` once per context and
 `Conv::launch(&stream, &mut [x, w, out, workspace])` runs it (`launch_raw` with regions captures it). Load refuses, in order: a partition the pin was
@@ -1468,7 +1596,10 @@ shares (`Conv::shares_cudnn_handle`). A launch takes the handle's lock (the hand
 
 **The emitter** (`tilefish.hosts.rust`). It writes a struct for each kernel (Triton or prebuilt: `launch` takes every pointer as a `TensorRef` or `TensorMut`;
 stride scalars, `fixed` arguments and `null` pointers are not parameters) and for each library entry (`launch` takes `a`, `b`, `bias`, `out`, `workspace`; `gemm()`, `M`, `N`, `K`,
-`BIAS`, `WORKSPACE_BYTES`, `PINNED_WITH`), with the digest of the manifest embedded. It refuses what the reader refuses. The entries of one stem on several
+`BIAS`, `WORKSPACE_BYTES`, `PINNED_WITH`; a `cublaslt.matmul` also takes `c` before `out` when its `beta` is 1, has `EPILOGUE` and `BETA`, and its
+docs say the formula with the names of the launch, the epilogue, the contract the pin of each architecture was verified to and its canary; the
+structs of `gemm` and `gemm_bias` are what they were), with the digest of the manifest embedded. `tilefish.hosts.cpp` writes the same classes for
+C++ (`EPILOGUE` and `BETA` as `static constexpr` members). It refuses what the reader refuses. The entries of one stem on several
 architectures must agree on everything but the device, except that the entries of an operator with an implementation per architecture (each with an
 `implementation`) may differ in what section 4.1 lets differ, their ABI included: they must share the tensors (name, order, access, dtype, shape, a view or
 not), the fixed arguments per call and the constraints of the dimensions of their tensors and buckets, which is what `launch` is typed from; the docs of the
@@ -1498,6 +1629,7 @@ descriptors, scalars, fixed arguments and views; and `ops=` checks each entry ag
 | a cuDNN convolution (section 9.4) | `test_library_conv.py` (the declaration, the entry, the reader, a replay's checks, a plan, the emitter, the binding's rules); on a GPU `test_gpu_conv.py` (torch's bytes, torch's legacy path, repeatability across processes, jit, replay, a plan and its capture, imported pins, the refusals, the SM count target, the canary and its stream, global-mode captures) and the Rust gate |
 | f32 operands, TF32 off, `allow_f32_reduction` (section 9.2) | `test_library_f32.py` (the declaration, the vetting rule, the digests of older entries); on a GPU `test_gpu_gemm_f32.py` (torch's bytes in both layouts and two workspace configurations, the TF32 and layout traps, the f64 reference, TF32 and emulation refused, jit, replay, plans, imported tables, the opt-in) |
 | `sm_count_target` (section 9.3) | `test_library_sm_target.py`; on a GPU `test_gpu_gemm_sm_target.py` (a green context: the first-handle rule and the target; the bytes do not depend on the target) |
+| a GEMM with a cuBLASLt epilogue (section 9.5) | `test_matmul.py`; the emitters: `test_rust_host_schema3.py` (`golden/rust_matmul.rs`, `cargo check` of the launchers), `test_hosts_cpp.py`; on a GPU `test_gpu_matmul.py`, and the Rust and C++ gates (`rust_gate.py`: `MATMUL_FORMS`, every epilogue with `beta` 0 and 1, bf16 and f16, the four layouts, three buckets of `M`, with a canary and without; the plan `epilogue_chain`) |
 | the emitter | `test_rust_host.py`, `test_rust_host_schema3.py` (goldens in `python/tests/golden/`) |
 | `options.enable_fp_fusion` of a hand-written kernel (`@tilefish.extern(enable_fp_fusion=...)`) | `test_lower_options.py`; on a GPU `test_gpu_extern_fusion.py` |
 | `implementation`: an operator with an implementation per architecture (section 4.1) | `test_per_arch.py`; on a GPU `test_gpu_per_arch.py` (and the Rust gate) |
@@ -1516,6 +1648,7 @@ The Rust crate (`crates/tilefish/tests/`):
 |---|---|
 | strict reading of schema 3, the older schemas | `strict_reading.rs`, `library_section.rs` (the optional fields of section 9.1 and the forms of 9.2 too), `schema3.rs` (synthetic manifests, `common/synthetic.rs`; `implementation` of section 4.1; `null` pointers, 64-bit dimension scalars and dense pointers aligned to their element) |
 | the forms of section 9.2: Python's verdict on entries of every form and on each changed in one field | `python_library.rs` (`data/python_library.json`, made by `export_rust_vectors.py`) |
+| the GEMMs with an epilogue of section 9.5: reading and every refusal; Python's verdict on entries of every form and on each changed in one field (and on `gemm` entries with the fields of a matmul), the epilogue, `beta`, contract, verification and canary read, the canary's operands; the checks of a call with `c`, the rule of split-K with an epilogue | `library_section.rs` (`a_matmul_entry_...`); `python_library.rs` (`matmul_library_entries`, `matmul_reading` of `export_rust_vectors.py`); `gemm.rs` (`a_call_of_a_matmul_has_its_bias_and_c_before_out`, `every_epilogue_but_none_has_no_split_k_unless_the_entry_opts_in`); the C ABI's values: `tilefish-capi/tests/abi.rs`, `tests/c/abi.c`, `tests/cpp/wrapper.cpp`; on a GPU `gpu_gate.rs` (`the_gate_has_gemms_with_an_epilogue`: the loads and their canaries, a capture of each, a forged canary refused under a recomputed pin; `the_canary_of_a_gemm_is_never_on_the_null_stream`), `gpu_plan_gate.rs` (the plan `epilogue_chain`) and `cpp_gate.cpp` (`matmuls`: `tilefish_gemm_epilogue`, a forged canary refused) |
 | the convolutions of section 9.4: Python's verdict on entries of every form and on each changed in one field, the pin, the canary and the cuDNN problem each describes, and the canary's operands | `python_conv.rs` (`data/python_conv.json`, made by `export_rust_vectors.py`); the checks of a call with no GPU: `conv.rs` |
 | views, device scalars, fixed arguments, binaries, the plan of a GEMM, the digests | `schema3.rs`, `library_section.rs`, `launch_checks.rs` |
 | Python's decision on 992 calls (views, device scalars, binaries included), the digest vectors, Python's refusals of digesting | `python_launches.rs`, `python_canonical.rs`, `cross_language.rs` |

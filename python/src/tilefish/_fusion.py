@@ -42,7 +42,7 @@ import inspect
 import json
 import threading
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 from .dims import Dim, DimExpr, as_dim
@@ -58,10 +58,13 @@ GROUPINGS = ("auto", "none")
 INTERMEDIATES = ("declared", "opmath")
 FP_CONTRACTS = ("none", "mul-add")
 MATHS = ("fast", "ieee")
-# docs/rfcs/0003-epilogue-fusion.md: how a region is fused into the call that makes its input. "exact" (the default): through epilogue hooks that see
-# the call's rounded result (contract (i), the bytes of the unfused composition); "accumulator": the declared rewrite R_acc (every widening of a
-# call's result is the call's f32 result) and hooks that see the accumulator (contract (ii))
-EPILOGUES = ("exact", "accumulator")
+# docs/rfcs/0003-epilogue-fusion.md: how the arithmetic after a call is fused into it. "exact" (the default): through the epilogue hooks of externs,
+# which see the call's rounded result (contract (i), the bytes of the unfused composition); nothing else changes. "accumulator": the declared rewrite
+# R_acc (every widening of the result of an extern with an accumulator hook is the extern's f32 result) and hooks that see the accumulator (contract
+# (ii)); a library call is left as it is (R_acc of a library call is not planned). "library": the hooks of "exact", and the arithmetic after a cuBLASLt
+# GEMM rewritten into one of its epilogues (cublaslt.matmul, contract (iii), verified per pin against contract (ii)) where it matches one. A graph
+# declares one, a tilefish.fused scope another for the ops traced in it, so a graph may mix extern hooks of either contract and library epilogues
+EPILOGUES = ("exact", "accumulator", "library")
 MAX_REGION_NODES = 64  # ops of one region (versions 1 and 2)
 MAX_REGION_TENSORS = 32  # inputs and outputs of one region (versions 1 and 2)
 LOWERING_OF_VERSION = {1: 1, 2: 2}  # the revision of tilefish.lower each version's region kernels are lowered with (note 21), frozen with it
@@ -109,11 +112,12 @@ class Fusion:
     fp_contract: str = "none"
     verify: bool = True
     sass: Any = None  # the SASS assertions of every region's kernel (tilefish.sass), or None
-    epilogues: str = "exact"  # docs/rfcs/0003-epilogue-fusion.md: "exact" or "accumulator" (R_acc)
+    epilogues: str = "exact"  # docs/rfcs/0003-epilogue-fusion.md: "exact", "accumulator" (R_acc) or "library" (cuBLASLt's epilogues)
 
     def canonical(self) -> "dict[str, Any]":
         """What a region's kernel depends on (``verify`` is a check, not a choice of numerics, and is left out; ``sass`` only when given, so
-        every region of a graph without it is named as it was; ``epilogues`` is not: a mode changes a region's nodes, through ``R_acc``, or nothing)."""
+        every region of a graph without it is named as it was; ``epilogues`` is not: a mode changes a region's nodes, through ``R_acc``, or which ops
+        become a library call, or nothing, and a region it leaves is the same kernel in every mode, so the same operator)."""
         out = {"version": self.version, "grouping": self.grouping, "math": self.math, "intermediates": self.intermediates, "fp_contract": self.fp_contract}
         if self.sass is not None:
             out["sass"] = self.sass.canonical()
@@ -121,9 +125,14 @@ class Fusion:
 
     def but(self, **changes: Any) -> "Fusion":
         """These settings with ``changes``."""
-        import dataclasses
+        return replace(self, **changes)
 
-        return dataclasses.replace(self, **changes)
+    def described(self) -> "dict[str, Any]":
+        """The settings as the fusion report says them: :meth:`canonical`, and ``epilogues`` when it is not the default."""
+        out = self.canonical()
+        if self.epilogues != "exact":
+            out["epilogues"] = self.epilogues
+        return out
 
 
 def fusion(
@@ -137,8 +146,9 @@ def fusion(
     sass: Any = None,
     epilogues: str = "exact",
 ) -> Fusion:
-    """``@tilefish.graph(fusion=tilefish.fusion(...))``: how the arithmetic written in the graph body is planned. Every choice is exact: the plan
-    writes the bytes of its unfused composition (each op a kernel of its own; ``grouping="none"`` is that plan).
+    """``@tilefish.graph(fusion=tilefish.fusion(...))``: how the arithmetic written in the graph body is planned. Every choice but ``epilogues=
+    "accumulator"`` and ``epilogues="library"`` is exact: the plan writes the bytes of its unfused composition (each op a kernel of its own;
+    ``grouping="none"`` is that plan).
 
     * ``version``: the grouping rules, limits and rewrites, frozen (D7). ``2``, the default: row regions, an ordered ``sum`` or ``mean``, ``max``,
       ``argmax``, ``argmin`` and ``gather_rows`` fused with the ops around them (one kernel of an rmsnorm and its residual add), lowered by
@@ -154,11 +164,24 @@ def fusion(
       or ``False`` here skips it).
     * ``sass``: SASS assertions (:func:`tilefish.sass`) every region's kernel is built under (``tilefish.sass(no_spills=True, max_registers=64)``),
       checked at every build; in the regions' declaration digests and names (only when given).
-    * ``epilogues`` (``docs/rfcs/0003-epilogue-fusion.md``): how the arithmetic that reads an extern's result is fused into the extern's kernel, where
-      it declares an epilogue hook (``tilefish.hook``). ``"exact"``, the default: through a hook that sees the extern's rounded result, so the plan
-      writes the bytes of the extern followed by the region (contract (i)). ``"accumulator"``: the declared rewrite ``R_acc`` (every widening
-      ``y.to(f32)`` of such a result is the extern's f32 result, one rounding fewer) and a hook that sees the accumulator (contract (ii)): the bytes of
-      the unfused composition of the rewritten program, not of the extern and the region. Also per scope (:func:`tilefish.fused`).
+    * ``epilogues`` (``docs/rfcs/0003-epilogue-fusion.md``): how the arithmetic that reads a call's result is fused into the call.
+
+      * ``"exact"``, the default: into an extern that declares an epilogue hook (``tilefish.hook``), through a hook that sees the extern's rounded
+        result, so the plan writes the bytes of the extern followed by the region (contract (i)); nothing changes a byte.
+      * ``"accumulator"``: the declared rewrite ``R_acc`` (every widening ``y.to(f32)`` of such an extern's result is the extern's f32 result, one
+        rounding fewer) and a hook that sees the accumulator (contract (ii)): the bytes of the unfused composition of the rewritten program, not of
+        the extern and the region. A library call is left as it is (``R_acc`` of a ``cublaslt.gemm`` is not planned): the fusion report's
+        ``library_epilogues`` says so of every cuBLASLt GEMM whose result the graph widens there.
+      * ``"library"``: the hooks of ``"exact"``, and the arithmetic after a cuBLASLt GEMM (``cublaslt.gemm``, ``cublaslt.gemm_bias``) of a 16-bit
+        result as one of its epilogues: ``y.to(f32)``, then ``+ c.to(f32)`` (a ``[M, N]`` residual, ``beta * C``), then ``+ bias.to(f32)`` (a ``[N]``
+        bias, of a ``cublaslt.gemm``), then ``tilefish.where(h <= 0.0, 0.0, h)`` (ReLU: ``torch.relu``'s bits), then ``.to()`` the GEMM's type, each
+        step optional but one, becomes one call of a ``cublaslt.matmul`` (``BIAS``, ``RELU``, ``RELU_BIAS``, ``beta * C``) on the accumulator: the
+        rounding of ``y`` is removed (contract (ii) of RFC 0003), and the bytes are the library's, required ``measured-exact`` against the formula at
+        every pin (``export`` and ``jit`` refuse a pin that is not). Where the pattern does not match (another order, an f32 bias, a value read
+        elsewhere) nothing changes; the fusion report lists every rewrite.
+
+      Also per scope (:func:`tilefish.fused`), whose mode wins over the graph's for the ops traced in it: a graph may mix them (``"library"`` for
+      its cuBLASLt GEMMs and an ``"accumulator"`` scope around the arithmetic after an extern, say).
     """
     if version not in VERSIONS or isinstance(version, bool):
         raise TilefishPlanError(f"fusion: version must be one of {list(VERSIONS)}, got {version!r}")
@@ -182,7 +205,9 @@ def fused_scope(*, epilogues: "str | None" = None) -> Any:
     """``with tilefish.fused(epilogues="accumulator"):`` in a graph body: the ops traced in the block are planned with these settings instead of the
     graph's (``docs/rfcs/0003-epilogue-fusion.md``, Q3: a mode is declared per graph or per scope, never per call). ``epilogues`` is a value of
     ``tilefish.fusion(epilogues=...)``: a widening ``y.to(f32)`` of an extern's result written in an ``"accumulator"`` scope is ``R_acc``'s, in an
-    ``"exact"`` scope it is not, whatever the graph declares. Scopes nest (the innermost's settings win). A kernel body has no scope."""
+    ``"exact"`` or ``"library"`` scope it is not, whatever the graph declares; the arithmetic after a cuBLASLt GEMM is rewritten into one of its
+    epilogues where every op of the pattern (from ``y.to(f32)`` to the last ``.to()``) is in a ``"library"`` mode. Scopes nest (the innermost's
+    settings win). A kernel body has no scope."""
     from .trace import current_context, scope
 
     settings: "dict[str, Any]" = {}
@@ -390,6 +415,8 @@ class _Pass:
         nodes = list(self.source.nodes)
         origin = list(range(len(nodes)))
         self.renamed: "dict[Value, Value]" = {}
+        if any(epilogue_mode(n, self.settings) == "library" for n in nodes):  # first: the pattern is the graph's own arithmetic, as written
+            nodes, origin = self._library_epilogues(nodes, origin)
         if self.settings.intermediates == "opmath":
             nodes, origin = self._opmath(nodes, origin)
         if self.settings.fp_contract == "mul-add":
@@ -589,6 +616,70 @@ class _Pass:
             for m in replaced.get(k, [n]):
                 out_nodes.append(m)
                 out_origin.append(o)
+        return out_nodes, out_origin
+
+    def _library_epilogues(self, nodes: "list[Node]", origin: "list[int]") -> "tuple[list[Node], list[int]]":
+        """``epilogues="library"``: a cuBLASLt GEMM and the arithmetic after it that one of its epilogues computes become one call of a
+        ``cublaslt.matmul`` (:func:`match_library_epilogue`); the other ops are left as they are (a cast that only the epilogue read is dead
+        code then, which the regions drop)."""
+        from . import _matmul
+
+        uses: "dict[Value, list[int]]" = {}
+        for k, n in enumerate(nodes):
+            for i in n.inputs:
+                if isinstance(i, Value):
+                    uses.setdefault(i, []).append(k)
+        escapes = set(self.source.outputs) | set(self.source.finals.values())
+        barriered = {i for n in nodes if n.op == "barrier" and n.attrs.get("kind") is None for i in n.inputs if isinstance(i, Value)}
+        producer = {o: k for k, n in enumerate(nodes) for o in n.outputs}
+        removed: "set[int]" = set()
+        replaced: "dict[int, Node]" = {}
+        for k, n in enumerate(nodes):
+            if n.attrs.get("kind") != "library" or getattr(n.callee, "impl", None) not in ("cublaslt.gemm", "cublaslt.gemm_bias"):
+                continue
+            found = match_library_epilogue(nodes, k, uses, escapes | barriered, producer)
+            if isinstance(found, str):
+                self.rewrites.append({"kind": "library-epilogue", "node": origin[k], "call": n.callee.name, "matched": False, "applied": False, "reason": found})
+                continue
+            chain, epilogue, beta, bias, c, z = found
+            modes = sorted({epilogue_mode(nodes[j], self.settings) for j in chain})
+            if modes != ["library"]:  # (a tilefish.fused scope: the pattern's ops are not all in a "library" mode, so none is rewritten)
+                self.rewrites.append({
+                    "kind": "library-epilogue", "node": origin[k], "call": n.callee.name, "matched": True, "applied": False, "epilogue": epilogue,
+                    "beta": beta, "nodes": sorted(origin[j] for j in chain),
+                    "rounding_removed": {"value": n.outputs[0].ref, "dtype": str(n.outputs[0].type.dtype)}, "contract": "measured-exact",
+                    "mode": "/".join(modes),
+                    "note": _ACC_LEAVES_LIBRARY if modes == ["accumulator"] else (
+                        f"the ops of the pattern are in the modes {modes} (tilefish.fused scopes): it is rewritten only where all are in 'library'"),
+                })  # fmt: skip
+                continue
+            op = _matmul.epilogue_op(n.callee, epilogue, beta)
+            ins = [n.inputs[0], n.inputs[1]] + ([bias] if bias is not None else []) + ([c] if c is not None else [])
+            call = Node(op.name, ins, {"kind": "library", **op.node_attrs()}, [z])
+            call.callee = op
+            call.loc, call.scope = n.loc, n.scope
+            replaced[k] = call
+            removed.update(chain)
+            self.rewrites.append({
+                "kind": "library-epilogue",
+                "node": origin[k],
+                "call": n.callee.name,
+                "matched": True,
+                "applied": True,
+                "into": op.name,
+                "epilogue": epilogue,
+                "beta": beta,
+                "nodes": sorted(origin[j] for j in chain),
+                "rounding_removed": {"value": n.outputs[0].ref, "dtype": str(n.outputs[0].type.dtype)},
+                "contract": "measured-exact",
+            })  # fmt: skip
+        out_nodes: "list[Node]" = []
+        out_origin: "list[int]" = []
+        for k, (n, o) in enumerate(zip(nodes, origin)):
+            if k in removed:
+                continue
+            out_nodes.append(replaced.get(k, n))
+            out_origin.append(o)
         return out_nodes, out_origin
 
     def _negated(self, x: Any, into: "list[Node]") -> Any:
@@ -966,7 +1057,9 @@ class _Pass:
             for root in readers:
                 r = by_root[root]
                 if hook is None:
-                    self._refuse(k, r, "epilogue-acc-only", f"'{extern.name}' has an epilogue hook on its accumulator only, which the graph's mode (epilogues='exact') does not use")
+                    mode = epilogue_mode(self.prog[r.nodes[0]], self.settings)
+                    self._refuse(k, r, "epilogue-acc-only", f"'{extern.name}' has an epilogue hook on its accumulator only, which this region does not use (epilogues='{mode}' here: only a "
+                                 "widening y.to(f32) of the result in an 'accumulator' mode is R_acc's)")
                     continue
                 if done is not None:
                     self._refuse(k, r, "epilogue-taken", f"region {done.region.index} is fused into the call to '{extern.name}' already (one region per call)")
@@ -1299,6 +1392,119 @@ class _Pass:
         return Graph(g.name, g.kind, g.inputs, g.consts, nodes, outputs, g.requirements, finals)
 
 
+# -- library epilogues (RFC 0003, E2) --------------------------------------------------------------------------------------------------------
+
+
+def _is_widening(n: Node, to: Any = f32) -> bool:
+    """A plain cast to ``to`` that cannot round (``x.to(f32)`` of a bf16 or f16 tensor)."""
+    return n.op == "cast" and n.attrs.get("kind") is None and set(_clean(n.attrs)) == {"to", "rounding"} and n.attrs["to"] == to and not n.attrs["rounding"]
+
+
+def _is_zero(x: Any) -> bool:
+    """The scalar ``+0.0`` of f32 (not ``-0.0``: a ReLU gives ``+0``)."""
+    import math
+
+    return isinstance(x, Scalar) and x.name is None and x.dtype == f32 and float(x.value) == 0.0 and math.copysign(1.0, float(x.value)) > 0
+
+
+def match_library_epilogue(
+    nodes: "Sequence[Node]", k: int, uses: "Mapping[Value, list[int]]", kept: "set[Value]", producer: "Mapping[Value, int]"
+) -> "tuple[list[int], str, int, Any, Any, Value] | str":
+    """Whether the cuBLASLt GEMM called by ``nodes[k]`` and the ops after it are one of its epilogues (``epilogues="library"``): ``(chain, epilogue,
+    beta, bias, c, z)`` (the nodes the call replaces, the epilogue, ``beta``, the bias and ``c`` values it reads, the value it makes), or why not.
+
+    The pattern, each step optional but one, every value read by the next step alone (not returned, not barriered, not read elsewhere)::
+
+        y = gemm(a, b)                      # cublaslt.gemm (or cublaslt.gemm_bias, then ReLU only) of a bf16 or f16 result T
+        h = y.to(f32)
+        h = h + c.to(f32)                   # c [M, N] of T, defined before the call: beta * C
+        h = h + bias.to(f32)                # bias [N] of T, defined before the call (a cublaslt.gemm): BIAS
+        h = tilefish.where(h <= 0.0, 0.0, h)  # torch.relu's bits: NaN stays NaN, -0.0 becomes +0.0
+        z = h.to(T)
+
+    That is the library's order (``c`` before the bias, measured: RFC 0003, X1); ``(acc + b) + c`` rounds otherwise in f32 and is not matched."""
+    n = nodes[k]
+    op = n.callee
+    if getattr(op, "algos", None):
+        return f"'{op.name}' imports its algorithms (algos=), and cublaslt.matmul imports none yet"
+    sig = op.signature
+    out_t = sig.returns[0]
+    t = out_t.dtype
+    if getattr(t, "name", None) not in _HALF or sig.params[0].type.dtype != t:
+        return f"'{op.name}' has a result of {out_t.dtype} from {sig.params[0].type.dtype} operands: library epilogues are planned for a 16-bit result of the operands' type"
+    y = n.outputs[0]
+
+    def only_use(v: Value) -> "int | None":
+        found = uses.get(v, [])
+        return found[0] if len(found) == 1 and v not in kept else None
+
+    def defined_before(v: Value) -> bool:
+        p = producer.get(v)
+        return p is None or p < k
+
+    def dense(v: Value) -> bool:
+        return v.type.contiguous and v.type.strides is None and not v.type.devscalar
+
+    j = only_use(y)
+    if j is None or not _is_widening(nodes[j]):
+        return "the GEMM's result is read by something else than one y.to(f32) (or returned, or barriered)"
+    chain = [j]
+    h = nodes[j].outputs[0]
+    bias = c = None
+    with_bias = op.impl == "cublaslt.gemm_bias"
+    relu = False
+    while True:
+        j = only_use(h) if h is not None else None
+        nxt = nodes[j] if j is not None else None
+        if nxt is not None and nxt.op == "add" and nxt.attrs.get("kind") is None and not relu:
+            other = nxt.inputs[1] if nxt.inputs[0] is h else nxt.inputs[0]
+            p = producer.get(other) if isinstance(other, Value) else None
+            if p is None or not _is_widening(nodes[p]):
+                return "an add after the GEMM is not of a widened 16-bit tensor (other.to(f32))"
+            src = nodes[p].inputs[0]
+            if not isinstance(src, Value) or src.type.dtype != t or not dense(src) or not defined_before(src):
+                return f"an add after the GEMM reads {getattr(src, 'ref', src)}, which is not a dense tensor of {t} made before the GEMM"
+            if tuple(src.type.shape) == tuple(out_t.shape) and tuple(src.type.shape) == tuple(y.type.shape):
+                if c is not None or bias is not None or with_bias:
+                    return "the residual is added after the bias: the library adds c before the bias ((acc + c) + bias), so write (y + c) + bias"
+                c = src
+            elif len(src.type.shape) == 1 and src.type.shape[0] == y.type.shape[-1]:
+                if bias is not None or with_bias:
+                    return "a second bias after the GEMM"
+                bias = src
+            else:
+                return f"an add after the GEMM reads {src.ref} of shape {list(src.type.shape)}, neither a bias [N] nor a residual [M, N]"
+            chain.append(j)
+            h = nxt.outputs[0]
+            continue
+        found = uses.get(h, [])
+        if not relu and len(found) == 2 and h not in kept:
+            le_k, wh_k = sorted(found)
+            le, wh = nodes[le_k], nodes[wh_k]
+            if (
+                le.op == "le" and le.attrs.get("kind") is None and le.inputs[0] is h and _is_zero(le.inputs[1])
+                and only_use(le.outputs[0]) == wh_k
+                and wh.op == "where" and wh.attrs.get("kind") is None and wh.inputs[0] is le.outputs[0] and _is_zero(wh.inputs[1]) and wh.inputs[2] is h
+            ):  # fmt: skip
+                relu = True
+                chain += [le_k, wh_k]
+                h = wh.outputs[0]
+                continue
+        break
+    j = only_use(h)
+    last = nodes[j] if j is not None else None
+    if last is None or last.op != "cast" or last.attrs.get("kind") is not None or set(_clean(last.attrs)) != {"to", "rounding"} or last.attrs["to"] != t:
+        return f"the arithmetic after the GEMM does not end in one plain .to({t}) of a value read by it alone"
+    chain.append(j)
+    if bias is None and c is None and not relu:
+        return "nothing between y.to(f32) and .to() for an epilogue to compute"
+    epilogue = ("relu_" if relu else "") + ("bias" if bias is not None or with_bias else "")
+    epilogue = epilogue.rstrip("_") or "none"
+    if with_bias:
+        bias = n.inputs[2]
+    return chain, epilogue, int(c is not None), bias, c, last.outputs[0]
+
+
 # -- the synthetic kernel of a region ------------------------------------------------------------------------------------------------------
 
 
@@ -1441,9 +1647,12 @@ def report(gop: Any, verification: "Mapping[int, Any] | None" = None) -> "dict[s
         if verification is not None and r.index in verification:
             item["verified"] = verification[r.index]
         regions.append(item)
-    doc: "dict[str, Any]" = {"schema": REPORT_SCHEMA, "graph": f.source.name, "fusion": f.settings.canonical(), "regions": regions}
-    if f.settings.epilogues != "exact":
-        doc["fusion"]["epilogues"] = f.settings.epilogues
+    doc: "dict[str, Any]" = {"schema": REPORT_SCHEMA, "graph": f.source.name, "fusion": f.settings.described(), "regions": regions}
+    epilogues = [w for w in f.rewrites if w["kind"] == "library-epilogue"]
+    if not epilogues:  # (no op is in a "library" mode: what the mode would do)
+        epilogues = library_epilogue_candidates(f.source, f.settings)
+    if epilogues:  # (only where a GEMM's result is widened by the graph, or a "library" mode looked: every other report is what it was)
+        doc["library_epilogues"] = epilogues
     hooks = _hook_externs(f)
     if hooks:  # (only a graph that calls an extern with an epilogue hook has it: every other report is as it was)
         doc["hooks"] = hooks
@@ -1466,6 +1675,48 @@ def _hook_externs(f: Fused) -> "dict[str, list[dict[str, Any]]]":
             ext = _extern_of(n)
             if hooks_of_op(ext):
                 out[ext.name] = [h.canonical() for h in hooks_of_op(ext)]
+    return out
+
+
+_ACC_LEAVES_LIBRARY = (
+    "epilogues='accumulator' leaves a library call as it is (R_acc of a cuBLASLt GEMM is not planned: the GEMM keeps its rounding); declare "
+    "epilogues='library' (the graph's or a tilefish.fused scope's) for its epilogue"
+)
+
+
+def library_epilogue_candidates(graph: Graph, settings: "Fusion | None" = None) -> "list[dict[str, Any]]":
+    """What ``epilogues="library"`` would do with the cuBLASLt GEMMs of a graph planned without it (the fusion report's ``library_epilogues``, which
+    the advisor reads): each call whose result the graph widens to f32, with the epilogue it would become (``"applied": False``) or why it would not
+    (the order of the adds, a value read elsewhere, ...). A GEMM whose result is not widened is not listed. One widened in an ``"accumulator"`` mode
+    says that the mode leaves it as it is (``"mode"``, ``"note"``)."""
+    nodes = list(graph.nodes)
+    uses: "dict[Value, list[int]]" = {}
+    for k, n in enumerate(nodes):
+        for i in n.inputs:
+            if isinstance(i, Value):
+                uses.setdefault(i, []).append(k)
+    kept = set(graph.outputs) | set(graph.finals.values())
+    kept |= {i for n in nodes if n.op == "barrier" and n.attrs.get("kind") is None for i in n.inputs if isinstance(i, Value)}
+    producer = {o: k for k, n in enumerate(nodes) for o in n.outputs}
+    out: "list[dict[str, Any]]" = []
+    for k, n in enumerate(nodes):
+        if n.attrs.get("kind") != "library" or getattr(n.callee, "impl", None) not in ("cublaslt.gemm", "cublaslt.gemm_bias"):
+            continue
+        widenings = [j for j in uses.get(n.outputs[0], []) if _is_widening(nodes[j])]
+        if not widenings:
+            continue
+        mode = {"mode": "accumulator", "note": _ACC_LEAVES_LIBRARY} if settings is not None and any(
+            epilogue_mode(nodes[j], settings) == "accumulator" for j in widenings) else {}  # fmt: skip
+        found = match_library_epilogue(nodes, k, uses, kept, producer)
+        if isinstance(found, str):
+            out.append({"kind": "library-epilogue", "node": k, "call": n.callee.name, "matched": False, "applied": False, "reason": found, **mode})
+            continue
+        chain, epilogue, beta, _, _, _ = found
+        out.append({
+            "kind": "library-epilogue", "node": k, "call": n.callee.name, "matched": True, "applied": False, "epilogue": epilogue, "beta": beta,
+            "nodes": sorted(chain), "rounding_removed": {"value": n.outputs[0].ref, "dtype": str(n.outputs[0].type.dtype)},
+            "contract": "measured-exact", **mode,
+        })  # fmt: skip
     return out
 
 
@@ -1510,10 +1761,17 @@ BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
         "1",
     ),
     "epilogue-library": (
-        "a pinned cuBLASLt GEMM's or cuDNN convolution's epilogue (RFC 0003): cuBLASLt epilogues (bias, ReLU, beta * C) are E2, contract (iii) under "
-        "tilefish.fusion(epilogues='library'); a generated GEMM or convolution with hooks is E3; a cuDNN fused graph E6. Today: call an extern with an "
-        "epilogue hook instead (E1), whose fusion is exact (contract (i))",
+        "a pinned cuBLASLt GEMM's or cuDNN convolution's epilogue (RFC 0003): cuBLASLt's bias, ReLU and beta * C are an epilogue of cublaslt.matmul "
+        "(E2) under tilefish.fusion(epilogues='library') when written as its pattern (docs/advise.md); another epilogue of a cuBLASLt GEMM (GELU, ...) "
+        "and a generated GEMM or convolution with hooks are E3, a cuDNN fused graph E6, future work. Today: call an extern with an epilogue hook "
+        "instead (E1), whose fusion is exact (contract (i))",
         "future",
+    ),
+    "epilogue-library-cublaslt": (
+        "declare tilefish.fusion(epilogues='library'): the region is a cuBLASLt epilogue of the GEMM (cublaslt.matmul, RFC 0003 E2), one step; the "
+        "bytes are the library's under the pin (contract (iii)), verified equal to the region's arithmetic on the f32 accumulator at every pin "
+        "(measured-exact against contract (ii)): one rounding fewer than now, so they change",
+        "E2",
     ),
     "epilogue-extern": (
         "declare an epilogue hook on the extern (tilefish.hook, RFC 0003 E1): value='out' fuses the region exactly (contract (i)), value='acc' on the "

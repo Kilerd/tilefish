@@ -1480,6 +1480,7 @@ def _conflicts(old: "dict[str, Any]", new: "dict[str, Any]") -> "str | None":
         "workspace_bytes",
         "pin",
         "cudnn_version",
+        "contract",  # a cublaslt.matmul's: what the verification of its pin found
     ):
         if old.get(key) != new.get(key):
             return key

@@ -113,7 +113,8 @@ The buffers kept stored are listed with why.
 ## 4. Why it is not one kernel today, and what to do
 
 Each candidate lists its **blockers**, each with the action that removes it and the phase of RFC 0001 that would; its phase is the latest. A step's
-class gives one; the fusion pass gives the rest.
+class gives one; the fusion pass gives the rest. The phase `E2` is not one of RFC 0001: it is a mode to declare now, RFC 0003's cuBLASLt epilogues, which
+changes the bytes (so the advisor names it, and never chooses it); it ranks after `1` and before `2`.
 
 | blocker | what to do | phase |
 |---|---|---|
@@ -124,7 +125,8 @@ class gives one; the fusion pass gives the rest.
 | `dsl-kernel` | a `@tilefish.kernel` (elementwise): write its body in the graph body (RFC 8.2); exact as it is when it declares `fp_fusion=False` | 1 |
 | `dsl-kernel-contracts` | the same, for a kernel that lets the compiler contract: write `tilefish.fma` where it meant one rounding, or its bytes change | 1 |
 | `row-kernel` | a row `@tilefish.kernel`: write its body in the graph body, with `order=` on its sums, and fusion version 2 (the default) fuses it into a row region | 2 |
-| `epilogue-library`, `prologue-library` | a pinned GEMM's or convolution's epilogue: RFC 0003's E2 (cuBLASLt epilogues: bias, ReLU, `beta * C`, contract (iii) under `epilogues="library"`), E3 (a generated GEMM or convolution with hooks) or E6 (a cuDNN fused graph); not yet. Today: call an extern with an epilogue hook instead (E1). A prologue: future work | future |
+| `epilogue-library-cublaslt` | the region after a `cublaslt.gemm` (or `gemm_bias`) is one of cuBLASLt's epilogues, as the fusion report's `library_epilogues` says (a bias, ReLU, a residual add, in the library's order): declare `tilefish.fusion(epilogues="library")`, which makes them one `cublaslt.matmul` step, its bytes the library's under the pin and verified at every pin equal to the region's arithmetic on the f32 accumulator (contract (ii) of RFC 0003: one rounding fewer than now); the detail names the epilogue and the contract | E2 |
+| `epilogue-library`, `prologue-library` | a pinned GEMM's or convolution's epilogue that `epilogues="library"` does not take (the detail says why: the order of the adds, a value read elsewhere, ...), or a convolution's: RFC 0003's E3 (a generated GEMM or convolution with hooks) or E6 (a cuDNN fused graph); not yet. Today: call an extern with an epilogue hook instead (E1). A prologue: future work | future |
 | `copy-step` | a copy step: return or store the value where it is made | 1 |
 | `memset-step` | a memset step: its zeros are read from memory, never folded into a region (H2) | future |
 | `strided-output` | the producer writes the intermediate into part of a buffer (a column block, a head): a strided store (rule 7) | 2 |
@@ -149,7 +151,7 @@ entry per value that crosses a boundary, with the ops on both sides and their li
 | `limit` | more than 64 ops or 32 tensors in a region | a split is a speed choice only | 1 |
 | `move` | a copy or a store between them | return or store the value where it is made | 1 |
 | `epilogue-<kind>`, `prologue-<kind>` | a call's result read by a region, a region's value read by a call: no fusion across a call (an extern: it declares no epilogue hook) | library: RFC 0003 E2, E3 or E6; extern: declare a hook (`tilefish.hook`, E1); `@tilefish.kernel`: write its body in the graph body | future, 4, 1 |
-| `epilogue-acc-only` | the extern hooks its accumulator only, and the graph is exact | declare `epilogues="accumulator"` (a graph or a `tilefish.fused` scope; contract (ii)), or give the kernel a `value="out"` hook (contract (i)) | 4 |
+| `epilogue-acc-only` | the extern hooks its accumulator only, and the region is not in an `"accumulator"` mode (the graph or its scope is `"exact"` or `"library"`) | declare `epilogues="accumulator"` (a graph or a `tilefish.fused` scope; contract (ii)), or give the kernel a `value="out"` hook (contract (i)) | 4 |
 | `epilogue-taken` | the call's hook took another region (one per call), or the region is fused into another call's hook (one call per region) | write both in one region | 4 |
 | `epilogue-view` | the region reads the result through a view the hook does not hold | read the result itself (or the chunks of a split hook) | 4 |
 | `epilogue-acc-shared` | the f32 result (`R_acc`) is read by more than the region | read it in one region | 4 |
@@ -181,7 +183,8 @@ whose steps move the most bytes.
 
 **The routes of an epilogue** (`docs/rfcs/0003-epilogue-fusion.md`, section 5). A candidate whose producer is a GEMM or a convolution has `routes`:
 each a way the consumer's arithmetic could go into the producer, with the contract it gives, its status and the saving (the candidate's, at the ranked
-bucket). For a pinned cuBLASLt GEMM: E2 (a library epilogue, contract (iii)), E3 (a generated GEMM with hooks, contract (i) where it is measured equal
+bucket). For a pinned cuBLASLt GEMM: E2 (a library epilogue, contract (iii): available where the fusion report matched the region as one of
+cuBLASLt's epilogues, else why not), E3 (a generated GEMM with hooks, contract (i) where it is measured equal
 to the pin, else (ii)) with its **break-even**, `1 + saving / T_gemm`, the slowdown of a generated GEMM at which the fusion stops paying (the advisor
 does not predict the generated GEMM's speed), and E1 (an extern of your own with an epilogue hook, available today); for a cuDNN convolution E6 (a
 fused graph) instead of E2. For an extern with epilogue hooks: its `value="out"` hook (contract (i), available) and its `value="acc"` hook (contract

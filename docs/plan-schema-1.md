@@ -180,7 +180,8 @@ magnitude, so that every language reads the same number); a file larger than
 An argument is `{"name": <string>, "binding": <buffer name>}` and optionally `"view"`: exactly the keys `name`, `binding` and `view`.
 
 * `name` is the name of the ABI pointer parameter (it must equal it; it is there so that a reader can check the order). For a library entry the pointers are the operands of the
-  operation as its `abi.params` name them (`a`, `b`, `bias` for a bias GEMM, as declared) and then `out`; for a lowered kernel they include the generated names of its results (`out`,
+  operation as its `abi.params` name them (`a`, `b`, `bias` for a bias GEMM, as declared, and `c` for a `cublaslt.matmul` with `beta` 1, manifest schema 3
+  section 9.5) and then `out`; for a lowered kernel they include the generated names of its results (`out`,
   `out0`, `out1`).
 * `binding` names a buffer of the plan. It must not be the `workspace`.
 * `view` is `{"shape": [...], "strides": [...], "offset": n}`: `shape` a list of integers >= 1, `strides` a list of integers >= 0 of the same length, `offset` an integer >= 0, **in elements

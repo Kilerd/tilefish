@@ -206,6 +206,23 @@ fn null_and_invalid_arguments_are_refused() {
     unsafe { tilefish_manifest_destroy(null_mut()) };
     unsafe { tilefish_captured_plan_destroy(null_mut()) };
     unsafe { tilefish_last_error(null_mut()) };
+    // a GEMM's epilogue (ABI 1.1) needs a handle, and writes nothing without one
+    let (mut epilogue, mut has_c) = (-1i32, true);
+    assert_eq!(unsafe { tilefish_gemm_epilogue(null(), &mut epilogue, &mut has_c) }, TILEFISH_ERROR_INVALID_ARGUMENT);
+    assert_eq!((epilogue, has_c), (-1, true));
+    assert!(last().1.contains("the GEMM"), "{}", last().1);
+}
+
+/// The epilogues of a GEMM (`tilefish_gemm_epilogue`, ABI 1.1): tilefish's own values, one per epilogue of `docs/manifest-schema-3.md`, section 9.5,
+/// in its order (`tilefish::GemmEpilogue::ALL`).
+#[test]
+fn the_epilogues_of_a_gemm_have_values_of_their_own() {
+    const { assert!(TILEFISH_ABI_MINOR >= 1, "tilefish_gemm_epilogue is of ABI 1.1") };
+    assert_eq!(tilefish_abi_version() & 0xffff, TILEFISH_ABI_MINOR);
+    let values = [TILEFISH_EPILOGUE_NONE, TILEFISH_EPILOGUE_BIAS, TILEFISH_EPILOGUE_RELU, TILEFISH_EPILOGUE_RELU_BIAS];
+    assert_eq!(values, [0, 1, 2, 3]);
+    let names: Vec<&str> = tilefish::GemmEpilogue::ALL.iter().map(|e| e.as_str()).collect();
+    assert_eq!(names, ["none", "bias", "relu", "relu_bias"]);
 }
 
 #[test]

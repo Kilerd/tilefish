@@ -175,7 +175,7 @@ def callee_of(op: Any) -> Callee:
             if op.impl is None:
                 raise TilefishPlanError(
                     f"the library op '{op.name}' has no implementation (impl=...), so there is nothing to launch: declare it with "
-                    "impl='cublaslt.gemm', 'cublaslt.gemm_bias' or 'cudnn.conv_fwd'"
+                    "impl='cublaslt.gemm', 'cublaslt.gemm_bias', 'cublaslt.matmul' or 'cudnn.conv_fwd'"
                 )
             specs = runtime.library_specs_of(op)
             callee = Callee("library", op, op.name, op.signature, None, None, {}, list(specs))

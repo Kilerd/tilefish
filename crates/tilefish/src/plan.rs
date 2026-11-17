@@ -295,7 +295,7 @@ impl Plan {
     }
 
     /// The plan of a library entry (a pinned GEMM): what its operands are checked against. It launches nothing by itself (its grid is
-    /// `(1,)` and it has no scalars): the checks are those of a kernel, on the pointers `a`, `b`, `bias` and `out`.
+    /// `(1,)` and it has no scalars): the checks are those of a kernel, on the pointers `a`, `b`, `bias`, `c` and `out` it has.
     pub(crate) fn for_library(entry: &LibraryEntry) -> Result<Self> {
         Self::build(&Source {
             stem: &entry.stem,

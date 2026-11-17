@@ -878,17 +878,20 @@ impl Gemm {
     /// `Gemm::check_call` checks of the tensors they came from.
     #[allow(unsafe_code)]
     pub(crate) unsafe fn run(&self, stream: sys::CUstream, call: &Call) -> Result<()> {
-        let (handle, algo, required, [m, n, k], form, target) = self.engine();
-        let problem = cublaslt::Problem::new(m, n, k, call.bias, &form, target)?;
-        let addresses = cublaslt::Addresses { a: call.a, b: call.b, out: call.out, workspace: call.workspace };
+        let engine = self.engine();
+        let [m, n, k] = engine.sizes;
+        let problem =
+            cublaslt::Problem::new(m, n, k, engine.epilogue, call.bias, &engine.form, engine.sm_count_target)?;
+        let addresses =
+            cublaslt::Addresses { a: call.a, b: call.b, c: call.c, out: call.out, workspace: call.workspace };
         // SAFETY: the contract of this function.
-        unsafe { cublaslt::matmul(handle, &problem, algo, &addresses, required, stream) }
+        unsafe { cublaslt::matmul(engine.handle, &problem, engine.algo, &addresses, engine.required, stream) }
     }
 
     /// Check the call and run the GEMM on a raw `CUstream`: [`Gemm::launch`] for a handle that nothing owns, or the stream a CUDA graph is
     /// being captured on (the call is captured like any other; the workspace is the caller's, so nothing is allocated).
     ///
-    /// `tensors` are `a`, `b`, `bias` (for `gemm_bias`), `out` and the workspace, as for [`Gemm::launch`]. The GEMM's context is made
+    /// `tensors` are `a`, `b`, `bias` (when it has one), `c` (when it has one), `out` and the workspace, as for [`Gemm::launch`]. The GEMM's context is made
     /// current on this thread for the call, and what was current is put back afterwards (also when it fails).
     ///
     /// **This is how a GEMM is captured in a CUDA graph**, with tensors made of regions ([`DevicePtr::from_raw`](crate::DevicePtr::from_raw)):

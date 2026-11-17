@@ -84,7 +84,7 @@ _GENERATED_COPY = re.compile(r"^(contiguous|im2col1d|im2col|col2im1d)_")
 _EPI = re.compile(r"_epi_[0-9a-f]{12}$")  # an extern with a region in its epilogue hook (docs/rfcs/0003-epilogue-fusion.md): <extern>_epi_<hash>
 _LOWERED_BLOCK = re.compile(r"^BLOCK(_D)?(_\d+)?$")  # the constexpr every kernel tilefish.lower writes has (the elementwise and the row template)
 _MMA = re.compile(r"\b(HMMA|IMMA|QMMA|OMMA|DMMA|HGMMA|IGMMA|QGMMA|UTCHMMA|UTCQMMA|UTCIMMA|UTCOMMA)\b")
-_PHASES = ("1", "2", "4", "future")
+_PHASES = ("1", "E2", "2", "4", "future")  # "E2": a mode to declare (RFC 0003, cuBLASLt epilogues), available now
 STREAMING = 0.25  # a measured step moving its bytes (above the launch floor) at this share of the bandwidth or more is taken to be bound by them
 CLASSES = ("library", "fused", "elementwise", "row", "copy", "opaque")
 
@@ -250,7 +250,7 @@ class StepInfo:
 
 def _flops(entry: "Mapping[str, Any]") -> "tuple[int | None, str | None]":
     impl = entry.get("impl")
-    if impl in ("cublaslt.gemm", "cublaslt.gemm_bias"):
+    if impl in ("cublaslt.gemm", "cublaslt.gemm_bias", "cublaslt.matmul"):
         m, n, k = int(entry.get("m", 0)), int(entry.get("n", 0)), int(entry.get("k", 0))
         dt = (entry.get("dtypes") or {}).get("a", "bf16")
         peak = "tensor16" if dt in ("bf16", "f16") else ("tf32" if "TF32" in str(entry.get("compute_type", "")) else "fp32")
@@ -269,6 +269,9 @@ def _library_label(entry: "Mapping[str, Any]") -> str:
     impl = entry.get("impl", "")
     if impl.startswith("cublaslt"):
         dt = (entry.get("dtypes") or {}).get("a", "?")
+        if impl == "cublaslt.matmul":  # the epilogue the library runs on the accumulator (RFC 0003, E2)
+            epi = {"none": "", "bias": " + bias", "relu": ", relu", "relu_bias": " + bias, relu"}.get(str(entry.get("epilogue")), "")
+            return f"GEMM {entry.get('m')}x{entry.get('n')}x{entry.get('k')} {dt}" + (" + c" if entry.get("beta") else "") + epi + f" ({entry.get('contract')})"
         return f"GEMM {entry.get('m')}x{entry.get('n')}x{entry.get('k')} {dt}" + (" + bias" if impl.endswith("_bias") else "")
     if impl == "cudnn.conv_fwd":
         dt = (entry.get("dtypes") or {}).get("x", "?")
@@ -324,6 +327,18 @@ class _Export:
         if not op:
             return None
         return self.regions.get(op) or self.regions.get(op.split("__ua", 1)[0])
+
+    def library_epilogue(self, gemm: "StepInfo", consumer: "StepInfo") -> "dict[str, Any] | None":
+        """What the fusion report says ``epilogues="library"`` would do with the GEMM step ``gemm`` and the region ``consumer`` that reads it
+        (``library_epilogues``: matched, with the ops of the region, or why not), or ``None``."""
+        found = [w for w in (self.report or {}).get("library_epilogues") or [] if w.get("call") == gemm.op and not w.get("applied")]
+        region = self.region_of(consumer.op) or {}
+        nodes = {n.get("index", n.get("node")) for n in (region.get("nodes") or region.get("body") or [])}
+        for w in found:
+            if w.get("matched") and nodes & set(w.get("nodes") or []):
+                return w
+        unmatched = [w for w in found if not w.get("matched")]
+        return unmatched[0] if len(unmatched) == 1 and not any(w.get("matched") for w in found) else None
 
     def mma(self, stem: str) -> "bool | None":
         """Whether the SASS of a kernel has MMA instructions, from the trace (its entry of this binary, checked as ``tilefish-explain`` checks it);
@@ -686,9 +701,23 @@ def _edge_blockers(e: Edge, infos: "Sequence[StepInfo]", ex: _Export, shapes: "M
         e.blockers.append("materialised")
         e.detail.append(f"step {b.index} (a row step) reads {e.buffer} through a view that is not dense")
     if a.cls == "library":
-        e.blockers.append("epilogue-library")
-        later = "E2 (a cuBLASLt epilogue) or E3 (a generated GEMM)" if a.sub == "gemm" else "E6 (a cuDNN fused graph) or E3 (a generated convolution)"
-        e.detail.append(f"step {a.index} is a pinned {a.sub}: its epilogue is RFC 0003's {later}, not yet; an extern with an epilogue hook fuses it today (E1)")
+        found = ex.library_epilogue(a, b)
+        if found is not None and found.get("matched"):
+            e.blockers.append("epilogue-library-cublaslt")
+            e.detail.append(
+                f"step {a.index} is a pinned {a.sub} whose epilogue in step {b.index} is cuBLASLt's {found['epilogue']}"
+                + (" with beta * C" if found.get("beta") else "")
+                + f" (the rounding of {found.get('rounding_removed', {}).get('value', 'its result')} removed; contract {found.get('contract')})"
+            )
+        else:
+            e.blockers.append("epilogue-library")
+            why = f" ({found['reason']})" if found is not None and found.get("reason") else ""
+            later = (
+                "not one of the cuBLASLt epilogues E2 rewrites" + why + "; RFC 0003's E3 (a generated GEMM) is later"
+                if a.sub == "gemm"
+                else "RFC 0003's E6 (a cuDNN fused graph) or E3 (a generated convolution), not yet"
+            )
+            e.detail.append(f"step {a.index} is a pinned {a.sub}: its epilogue is {later}; an extern with an epilogue hook fuses it today (E1)")
     if b.cls == "library":
         e.blockers.append("prologue-library")
         e.detail.append(f"step {b.index} is a pinned {b.sub}: its prologue is future work")
@@ -1069,12 +1098,19 @@ class Advice:
             t = (self.measured or {}).get(p.index) if self.measured is not None else None
             t = t if t else self.costs[rk][p.index].est_us
             breakeven = round(1.0 + saved_us[rk] / t, 3) if t else None
-            lib = (
-                {"route": "library epilogue", "milestone": "E2", "contract": "(iii) library: measured-exact against (ii) for bias, ReLU and beta * C; GELU binary-defined",
-                 "status": "not yet (tilefish.fusion(epilogues='library'))"}
-                if p.sub == "gemm"
-                else {"route": "cuDNN fused graph", "milestone": "E6", "contract": "(i) exact with a 16-bit intermediate (bias, ReLU); else (iii)", "status": "not yet"}
-            )  # fmt: skip
+            if p.sub == "gemm":
+                # E2 (merged with E1): available where the fusion report matched the region as one of cuBLASLt's epilogues, with why not otherwise
+                found = next((w for w in (self.ex.library_epilogue(p, infos[e.consumer]) for e in es if e.producer == p.index) if w is not None), None)
+                if found is not None and found.get("matched"):
+                    status = (f"available: tilefish.fusion(epilogues='library') makes the GEMM and the region one cublaslt.matmul ({found['epilogue']}"
+                              + (", beta * C" if found.get("beta") else "") + ")")
+                else:
+                    why = f" ({found['reason']})" if found is not None and found.get("reason") else ""
+                    status = f"not this epilogue{why}: tilefish.fusion(epilogues='library') rewrites cuBLASLt's bias, ReLU and beta * C; GELU not yet"
+                lib = {"route": "library epilogue", "milestone": "E2", "contract": "(iii) library: measured-exact against (ii) for bias, ReLU and beta * C; GELU binary-defined",
+                       "status": status}
+            else:
+                lib = {"route": "cuDNN fused graph", "milestone": "E6", "contract": "(i) exact with a 16-bit intermediate (bias, ReLU); else (iii)", "status": "not yet"}  # fmt: skip
             return [
                 {**lib, "saved_us": saving},
                 {"route": "generated op with hooks", "milestone": "E3", "contract": "(i) where measured equal to the pin (equal='cublaslt'), else (ii)",

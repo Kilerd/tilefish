@@ -170,8 +170,9 @@ tilefish_status tilefish_kernel_check(const tilefish_kernel *k, const tilefish_t
                                       const tilefish_given *given, size_t n_given);
 ```
 
-A GEMM takes `a`, `b`, `bias` if it has one, `out` and the caller's workspace, which is a `U8` tensor of at least `tilefish_gemm_workspace_required`
-bytes (`tilefish_gemm_workspace_bytes` is what the entry was pinned with). A convolution takes `x`, `w`, `y` and its workspace. A kernel with a global
+A GEMM takes `a`, `b`, `bias` if it has one, `c` if it has one (a `cublaslt.matmul` with `beta` 1), `out` and the caller's workspace, which is a `U8`
+tensor of at least `tilefish_gemm_workspace_required` bytes (`tilefish_gemm_workspace_bytes` is what the entry was pinned with); `tilefish_gemm_epilogue`
+(ABI 1.1) says its epilogue and whether it takes `c`. A convolution takes `x`, `w`, `y` and its workspace. A kernel with a global
 scratch takes it last, as the crate's `GLOBAL_SCRATCH` tensor (`tilefish_kernel_tensor_name` names it). What M3.5 added to launches needs nothing from
 the ABI: a `null` parameter is not a call argument (the crate passes 0 at its slot), an `i64` dimension is derived from the shapes, a persistent grid is
 sized from the device's SM count (or the partition of `tilefish_manifest_with_sm_partition`), and a cluster launch goes through `cuLaunchKernelEx` in the
@@ -242,7 +243,8 @@ thread-local. Concurrent runs on different streams need one arena each (a run or
   field means a new struct and a new function (`..._v2`). Anything else is a new major version.
 * **Shared library.** It is `libtilefish_capi.so.1` with that SONAME (set by the crate's build script; a test holds the build script, the CMake file and
   `TILEFISH_ABI_MAJOR` to one number), and on macOS its install name is `@rpath/libtilefish_capi.dylib`. It exports only the `tilefish_*` symbols
-  (`#[unsafe(no_mangle)] extern "C"`). The first ABI is 1.0.
+  (`#[unsafe(no_mangle)] extern "C"`). The first ABI is 1.0; 1.1 adds `tilefish_gemm_epilogue` and the `TILEFISH_EPILOGUE_*` values (a GEMM with a
+  cuBLASLt epilogue, manifest schema 3 section 9.5).
 * **Header and exports stay in sync.** `tilefish.h` is generated from the crate's `extern "C"` items by cbindgen (`=0.29.4`, a dev-dependency, with
   `cbindgen.toml`) and committed. A test regenerates it and fails on any difference (`TILEFISH_BLESS=1` writes it), and another fails on an export the
   header does not declare. A C99 program and a C++17 program compile the header (twice: the include guard), and the C one checks `sizeof` and

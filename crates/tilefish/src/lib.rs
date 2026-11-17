@@ -266,7 +266,8 @@
 //! the heuristic and cannot take a pinned algorithm). There is no hand-written driver FFI. A kernel or a GEMM holds the context it was loaded in
 //! ([`Manifest::kernel`] and [`Manifest::gemm`] take an `&Arc<CudaContext>`), and so keeps it, its module (or its cuBLASLt handle) and its
 //! function alive. The host takes on obligations in exactly two places (and the items of `src/region.rs`, `src/ffi.rs`,
-//! `src/ffi/cublaslt.rs` and `src/ffi/plan.rs`, the only ones with `unsafe`, each say why they are sound):
+//! `src/ffi/cublaslt.rs`, `src/ffi/plan.rs`, `src/ffi/cudnn.rs` and `src/canary.rs` (the launches of a canary's kernels), and the runs of a canary in
+//! `src/conv.rs` and `src/gemm.rs`, the only ones with `unsafe`, each say why they are sound):
 //!
 //! * [`DevicePtr::from_raw`] (`unsafe`): the host vouches for a region of device memory, by address, byte length, device and lifetime:
 //!   that it is allocated there, and stays allocated (and is not raced on) until every launch that was given a tensor made of it has
@@ -287,6 +288,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+mod canary;
 mod conv;
 pub mod elf;
 mod error;
@@ -307,10 +309,11 @@ mod probes;
 mod region;
 mod tensor;
 
+pub use canary::{canary_bytes, canary_digest};
 pub use conv::{
     CONV_COMPUTE_TYPE, CONV_IMPL, Conv, ConvCanary, ConvChoice, ConvEntry, ConvLayout, ConvMath, ConvPin, ConvProblem,
-    CudnnHandle, TF32_OVERRIDE, canary_bytes, canary_digest, canary_operands, cudnn_version, dense_strides,
-    knobs_problem, math_problem, notes_problem, output_size,
+    CudnnHandle, TF32_OVERRIDE, canary_operands, cudnn_version, dense_strides, knobs_problem, math_problem,
+    notes_problem, output_size,
 };
 pub use cudarc;
 pub use error::{Error, PreconditionKind, Result};
@@ -321,7 +324,10 @@ pub use launch_plan::{
     ARENA_ALIGNMENT, BufferRole, LaunchPlan, PLAN_NAME, PLAN_SCHEMA, PlanArg, PlanBucket, PlanBuffer, PlanStep,
     PlanView, StepKind, plan_digest,
 };
-pub use library::{AlgoSource, GemmLayout, Heuristic, LibraryEntry, LibraryImpl};
+pub use library::{
+    AlgoSource, GemmEpilogue, GemmLayout, Heuristic, LibraryEntry, LibraryImpl, MatmulAccumulator, MatmulCanary,
+    MatmulContract, MatmulVerification,
+};
 pub use manifest::{
     Access, BinarySource, Constexpr, CudaMath, DimInfo, Entry, EntryKind, FixedValue, IMPLEMENTATION_FALLBACK,
     LaunchAttributes, MANIFEST_NAME, MANIFEST_SCHEMA, Manifest, Param, ParamKind, Persistent, Pin, Precondition,

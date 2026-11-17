@@ -39,7 +39,7 @@ import pathlib
 from typing import Any, Callable, Iterable, Iterator
 
 from .._build import write_file
-from .._library import IMPLS as LIBRARY_IMPLS
+from .._library import IMPL_MATMUL, bias_of
 from .._manifest import Manifest, manifest_digest
 from ..errors import TilefishManifestError
 from . import rust
@@ -64,7 +64,7 @@ _CPP_RESERVED = frozenset(
 )
 # the members of a generated class: a class of one of these names (a stem of capitals) gets `Op` after it, as one named like an import of the
 # Rust module does
-_MEMBER_NAMES = frozenset({"STEM", "BUCKETS", "M", "N", "K", "BIAS"})
+_MEMBER_NAMES = frozenset({"STEM", "BUCKETS", "M", "N", "K", "BIAS", "EPILOGUE", "BETA"})
 _SCRATCH = "global_scratch"
 
 # the host type of a device scalar's value in a plan runner, by dtype (a dtype that is none of these is given as its bits)
@@ -286,7 +286,7 @@ def _render_library(g: Any) -> str:
     out.append("    " + _buckets(e))
     out += _shape_constants(g.arg_names, g.params, False, f"'{g.stem}'")
     if not g.conv:
-        bias = LIBRARY_IMPLS[e["impl"]]
+        bias = bias_of(e["impl"], e["epilogue"])
         layout = e["transa"] + e["transb"]
         if e["transb"] == "N":
             out.append("    /// Rows of `a` and of the result.\n")
@@ -304,6 +304,11 @@ def _render_library(g: Any) -> str:
         out.append(f"    static constexpr uint64_t K = {e['k']};\n")
         out.append("    /// Whether the GEMM adds a bias.\n")
         out.append(f"    static constexpr bool BIAS = {'true' if bias else 'false'};\n")
+        if e["impl"] == IMPL_MATMUL:  # (a GEMM of cublaslt.gemm or gemm_bias has the class of tilefish 0.0.11)
+            out.append("    /// The cuBLASLt epilogue on the accumulator (`none`, `bias`, `relu` or `relu_bias`: `Gemm::epilogue()` is its `TILEFISH_EPILOGUE_*`).\n")
+            out.append(f"    static constexpr const char* EPILOGUE = {_cpp_str(e['epilogue'])};\n")
+            out.append("    /// `beta`: 1 when `launch` takes `c` (the epilogue acts on the accumulator plus `c`), 0 otherwise.\n")
+            out.append(f"    static constexpr uint32_t BETA = {_count(f'{g.stem!r}', 'beta', e['beta'], 0)};\n")
         out.append("    /// The workspace the algorithm was pinned under: the size of the workspace to give `launch`, in bytes.\n")
     else:
         out.append("    /// The workspace the pin was chosen under: the size of the workspace to give `launch`, in bytes.\n")

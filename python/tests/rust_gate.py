@@ -81,6 +81,10 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   f32) and in ``TN`` under ``heuristic="torch"`` (checked to be ``torch.mm``'s); and ``a`` stored ``[K, M]``: bf16 in ``TT`` under
   ``heuristic="torch"`` (checked to be ``torch.mm(a.t(), b.t())``'s bytes), f16 in ``NT`` with a bias, f32 in ``TT`` with ``K = 8`` under
   ``heuristic="torch"`` (``torch.mm``'s bytes) and f32 in ``NT`` with a bias;
+* **GEMMs with a cuBLASLt epilogue** (``cublaslt.matmul``, :data:`MATMUL_FORMS`, on a fresh export): every epilogue (``none``, ``bias``, ``relu``,
+  ``relu_bias``) with ``beta`` 0 and 1 (``c`` before ``out``), bf16 and f16, the four layouts, the ``"torch"`` posture with the opt-in, an SM count target,
+  each over the three buckets of ``M``, every pin verified at the export and with a canary, which each load in Rust and C++ runs (one without), checked here
+  to leave no negative element after a ReLU; and the plan ``epilogue_chain`` (two of them in one graph, the second's ``c`` the graph's input);
 * **launch plans** (:func:`prepare_plans`, ``WORK/plans.json``): the transformer block of ``plan_model`` (``M`` in 32, 64 and 128, two values of the device
   scalar each), without and with reuse, the four-layer unrolled forward (both), the graph of prebuilt binaries and the graph with an in-place tensor,
   exported and run through Python's plan replay; ``crates/tilefish/tests/gpu_plan_gate.rs`` launches and captures each case, and ``compare`` holds the
@@ -973,6 +977,88 @@ def must_be_torchs(layout):
     return check
 
 
+# (name: (dtype, layout, epilogue, beta, N, K, options)): GEMMs with a cuBLASLt epilogue (impl cublaslt.matmul, section 9.5 of the manifest schema), on
+# a fresh export; each pin is verified at the export and records a canary (but the one with canary=False), which every load in Rust and C++ runs
+MATMUL_FORMS = {
+    "mm_none": ("f16", "NT", "none", 0, 1024, 1024, {}),
+    "mm_bias": ("bf16", "TN", "bias", 0, 1536, 512, {}),
+    "mm_relu": ("f16", "TN", "relu", 0, 3072, 1024, {}),
+    "mm_relu_bias": ("bf16", "TN", "relu_bias", 0, 1024, 3072, {"heuristic": "torch", "allow_bf16_reduction": True}),
+    "mm_none_c": ("bf16", "TN", "none", 1, 1024, 3072, {}),
+    "mm_bias_c": ("f16", "TN", "bias", 1, 1536, 512, {}),
+    "mm_relu_c": ("f16", "NN", "relu", 1, 3072, 1024, {"heuristic": "torch"}),
+    "mm_relu_bias_c": ("bf16", "TN", "relu_bias", 1, 3072, 1024, {"sm_count_target": 16}),
+    "mm_relu_tt_c": ("bf16", "TT", "relu", 1, 1024, 1024, {}),
+    "mm_relu_bias_plain": ("f16", "TN", "relu_bias", 0, 1536, 512, {"canary": False, "contract": "measured-exact"}),
+}
+
+
+def matmul_op(name, dtype, layout, epilogue, beta, n, k, M, **kw):
+    """A ``cublaslt.matmul`` over ``M``: ``a`` (``[M, K]``, ``[K, M]`` for TT and NT), ``b`` (``[N, K]``, ``[K, N]`` for NN and NT), the ``bias [N]`` of an
+    epilogue with one and ``c [M, N]`` of ``beta`` 1, to ``[M, N]``, all of ``dtype``."""
+    import inspect
+
+    from tilefish import bf16, f16, f32
+
+    t = {"bf16": bf16, "f16": f16}[dtype]
+    params = {
+        "a": tilefish.Tensor[M, k, t] if layout[1] == "N" else tilefish.Tensor[k, M, t],
+        "b": tilefish.Tensor[n, k, t] if layout[0] == "T" else tilefish.Tensor[k, n, t],
+    }
+    if epilogue in ("bias", "relu_bias"):
+        params["bias"] = tilefish.Tensor[n, t]
+    if beta:
+        params["c"] = tilefish.Tensor[M, n, t]
+
+    def fn(*args): ...
+
+    fn.__signature__ = inspect.Signature(
+        [inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=v) for p, v in params.items()],
+        return_annotation=tilefish.Tensor[M, n, t],
+    )
+    return tilefish.library(name, acc=f32, impl="cublaslt.matmul", epilogue=epilogue, beta=beta, layout=layout, **kw)(fn)
+
+
+def matmul_ops():
+    """``{name: library op}`` of :data:`MATMUL_FORMS`, over the buckets ``GEMM_M`` of ``M``."""
+    from tilefish import Dim
+
+    M = Dim("M", buckets=list(GEMM_M))
+    return {name: matmul_op(name, dtype, layout, ep, beta, n, k, M, **kw) for name, (dtype, layout, ep, beta, n, k, kw) in MATMUL_FORMS.items()}
+
+
+def matmul_operands(name, m, seed):
+    dtype, layout, epilogue, beta, n, k, _ = MATMUL_FORMS[name]
+    t = TORCH_OF[dtype]
+    out = [randn((m, k) if layout[1] == "N" else (k, m), t, seed + m), randn((n, k) if layout[0] == "T" else (k, n), t, seed + m + 1, scale=1 / k**0.5)]
+    if epilogue in ("bias", "relu_bias"):
+        out.append(randn((n,), t, seed + m + 2))
+    if beta:
+        out.append(randn((m, n), t, seed + m + 3))
+    return tuple(out)
+
+
+def must_be_nonnegative(args, got):
+    """A ReLU epilogue leaves no negative element (on these operands, no NaN either)."""
+    assert bool((got.float() >= 0).all()), "a ReLU epilogue left a negative element"
+
+
+def matmul_cases(declared):
+    return [
+        Case(
+            name,
+            f"{name}.M{m}",
+            "seed0",
+            lambda name=name, m=m: matmul_operands(name, m, 0),
+            kind="gemm",
+            check=must_be_nonnegative if MATMUL_FORMS[name][2].startswith("relu") else None,
+        )
+        for name in MATMUL_FORMS
+        if name in declared
+        for m in GEMM_M
+    ]
+
+
 def conv_ops():
     """The cuDNN convolutions of ``conv_kernels`` (both APIs, both layouts, one and two spatial axes, f16, bf16 and f32)."""
     import conv_kernels as ck
@@ -1099,6 +1185,7 @@ def prepare(work, manifest_dir=None, pin=None):
         declared.update(ws_ops())
         declared.update(conv_ops())
         declared.update(launch_ops())
+        declared.update(matmul_ops())
     all_ops = list(declared.values())
     if manifest_dir is None:
         manifest = runtime.export(all_ops, work / "manifest", arch=cap)
@@ -1112,7 +1199,7 @@ def prepare(work, manifest_dir=None, pin=None):
     rust.emit(manifest, work / "generated.rs", ops=all_ops, embed=True)
     cpp.emit(manifest, work / "generated.hpp", ops=all_ops, embed=True)  # and generated_embedded.cpp: the C++ gate's launchers
     cases, skipped, tensors_total = [], [], 0
-    for case in [*build_cases(), *gemm_cases(), *option_cases(declared), *f16_cases(declared), *conv_cases(declared)]:
+    for case in [*build_cases(), *gemm_cases(), *option_cases(declared), *f16_cases(declared), *conv_cases(declared), *matmul_cases(declared)]:
         if manifest.get(case.stem, arch) is None and manifest.library_entry(case.stem, arch) is None:
             skipped.append(case.stem)
             continue
@@ -1145,6 +1232,9 @@ def prepare(work, manifest_dir=None, pin=None):
             entries.append(entry)
         tensors_total += len(entries)
         record = {"id": case.id, "launcher": rust._camel(case.stem), "stem": case.stem, "kind": case.kind, "tensors": entries}
+        lib_entry = manifest.library_entry(case.stem, arch) if case.kind == "gemm" else None
+        if lib_entry is not None and lib_entry["impl"] == "cublaslt.matmul":  # what the C++ gate holds tilefish_gemm_epilogue to
+            record["epilogue"], record["beta"], record["canary"] = lib_entry["epilogue"], lib_entry["beta"], "canary" in lib_entry
         if case.given:
             record["given"] = case.given
         if not library and getattr(op, "global_scratch", 0):  # the scratch tensor a launch of the case is given (the Rust test allocates it)
@@ -1445,9 +1535,34 @@ def plan_graphs():
         _, w2 = ck.operands(ck.conv_k7_dil, {"T": 64}, seed=121)
         return [(f"T{t}-seed{seed}", {"x": ck.operands(ck.conv_k7, {"T": t}, seed=122 + t + seed)[0], "w1": w1, "w2": w2}) for t in (64, 646) for seed in (0, 1)]
 
+    # two GEMMs with a cuBLASLt epilogue (cublaslt.matmul): h = relu((x @ w_up^T + r) + b_up), then h @ w_down^T + x; their canaries run when a host
+    # loads the plan's GEMMs, and their workspace is the arena's
+    from tilefish import Dim, Tensor, bf16
+
+    MP = Dim("M", buckets=[32, 64])
+    mm_up = matmul_op("plan_mm_up", "bf16", "TN", "relu_bias", 1, 512, 256, MP)
+    mm_down = matmul_op("plan_mm_down", "bf16", "TN", "none", 1, 256, 512, MP)
+
+    @tilefish.graph
+    def epilogue_chain(
+        x: Tensor[MP, 256, bf16], w_up: Tensor[512, 256, bf16], b_up: Tensor[512, bf16], r: Tensor[MP, 512, bf16], w_down: Tensor[256, 512, bf16]
+    ) -> Tensor[MP, 256, bf16]:
+        h = mm_up(x, w_up, b_up, r)
+        return mm_down(h, w_down, x)
+
+    def epilogue_chain_cases():
+        w_up, b_up = randn((512, 256), BF16, seed=170, scale=256**-0.5), randn((512,), BF16, seed=171)
+        w_down = randn((256, 512), BF16, seed=172, scale=512**-0.5)
+        return [
+            (f"M{m}-seed{seed}", {"x": randn((m, 256), BF16, seed=173 + m + seed), "w_up": w_up, "b_up": b_up, "r": randn((m, 512), BF16, seed=174 + m + seed), "w_down": w_down})
+            for m in (32, 64)
+            for seed in (0, 1)
+        ]
+
     return [
         ("block", pm.block, False, block_cases),
         ("conv_chain", ck.conv_chain, False, conv_chain_cases),  # two cuDNN convolutions, a backend pin and a legacy one, the workspace in the arena
+        ("epilogue_chain", epilogue_chain, False, epilogue_chain_cases),  # two cuBLASLt matmuls with epilogues and c, canaries at the load
         ("block-reuse", pm.block, True, block_cases),
         (f"deep{layers}", deep, False, deep_cases),
         (f"deep{layers}-reuse", deep, True, deep_cases),

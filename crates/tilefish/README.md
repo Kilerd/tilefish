@@ -71,7 +71,17 @@ split-K partial sums in the output with `allow_f32_reduction`
 (`LibraryEntry::allow_f32_reduction`). An entry pinned for a partition of the device's SMs
 (`sm_count_target`) sets that target on every launch, and a host that runs on a
 partition says so with `Manifest::with_sm_partition(Some(sms))`: entries chosen
-for another count are refused. A library entry may also be a pinned cuDNN
+for another count are refused. A GEMM may have a cuBLASLt epilogue on its f32
+accumulator (`impl: "cublaslt.matmul"`: `LibraryEntry::epilogue`, a
+`GemmEpilogue` of `none`, `bias`, `relu` or `relu_bias`, and `beta` 1 adds a
+`c [M, N]` before it): a launch takes `a`, `b`, [`bias`], [`c`], `out` and the
+workspace, every check and run sets the epilogue, an epilogue gets no split-K
+without the opt-in, the entry says what the verification of its pin found
+(`LibraryEntry::contract`, `verification`), and the load runs its canary
+(`LibraryEntry::canary`: the pin's output on operands made of a seed on the
+device, on a stream of its own) and refuses other bytes, since cuBLASLt has no
+build number to compare (`Gemm::epilogue`, `has_c`, `contract`,
+`check_canary`). A library entry may also be a pinned cuDNN
 forward convolution (`impl: "cudnn.conv_fwd"`, `Manifest::conv`, `Conv`,
 `ConvEntry`): the pin is a legacy algorithm enum or a backend engine
 configuration (an engine and its knobs), with the cuDNN version that chose it;

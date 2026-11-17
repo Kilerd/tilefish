@@ -55,6 +55,12 @@ static_assert(std::is_base_of<std::runtime_error, tilefish::Error>::value, "tile
 static_assert(std::is_convertible<tilefish::TensorRef<tilefish::Bf16>, tilefish::Tensor>::value, "a typed tensor is a tensor");
 static_assert(!std::is_convertible<tilefish::TensorRef<tilefish::Bf16>, tilefish::TensorRef<tilefish::F32>>::value,
               "a bf16 tensor is not an f32 one");
+// a GEMM says its epilogue and whether it takes c (ABI 1.1)
+static_assert(TILEFISH_ABI_MINOR >= 1, "the header describes ABI 1.1");
+static_assert(std::is_same<decltype(std::declval<const tilefish::Gemm&>().epilogue()), int32_t>::value, "Gemm::epilogue");
+static_assert(std::is_same<decltype(std::declval<const tilefish::Gemm&>().has_c()), bool>::value, "Gemm::has_c");
+static_assert(TILEFISH_EPILOGUE_NONE == 0 && TILEFISH_EPILOGUE_BIAS == 1 && TILEFISH_EPILOGUE_RELU == 2 && TILEFISH_EPILOGUE_RELU_BIAS == 3,
+              "the epilogues of a GEMM");
 
 }  // namespace
 

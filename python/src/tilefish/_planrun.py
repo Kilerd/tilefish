@@ -356,6 +356,8 @@ class Backend:
         raise NotImplementedError
 
     def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
+        """Run a pinned cuBLASLt GEMM on device addresses, the workspace in the arena (a ``cublaslt.matmul`` with ``beta=1`` is given its ``c`` as the
+        keyword ``c=``, which only such a step passes)."""
         raise NotImplementedError
 
     def conv(self, built: Any, x: int, w: int, out: int, workspace: int, stream: int, index: int) -> None:
@@ -546,10 +548,12 @@ class TorchBackend(Backend):
 
         _cuda.memset_async(dst, nbytes, stream)
 
-    def gemm(self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int) -> None:
+    def gemm(
+        self, spec: Any, algo: str, a: int, b: int, bias: "int | None", out: int, workspace: int, stream: int, index: int, c: "int | None" = None
+    ) -> None:
         from . import _library
 
-        _library.run_gemm_ptrs(spec, algo, a, b, bias, out, stream, index, workspace_ptr=workspace)
+        _library.run_gemm_ptrs(spec, algo, a, b, bias, out, stream, index, workspace_ptr=workspace, c_ptr=c)
 
     def conv(self, built: Any, x: int, w: int, out: int, workspace: int, stream: int, index: int) -> None:
         from . import _conv
@@ -577,7 +581,7 @@ class TorchBackend(Backend):
 
         _cublaslt.check_algo(
             spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form,
-            sm_count_target=spec.sm_count_target, **spec.opt_ins,
+            sm_count_target=spec.sm_count_target, **spec.opt_ins, **({"epilogue": spec.epilogue, "beta": spec.beta} if spec.matmul else {}),
         )  # fmt: skip
 
     def check_conv(self, built: Any, index: int) -> None:
@@ -1530,9 +1534,13 @@ class PlanRunner:
             be.conv(st.algo, real[names[0]].ptr, real[names[1]].ptr, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
         elif st.algo is not None:
             names = [a for a in st.bound.names]
+            spec = st.bound.spec
             a_ptr, b_ptr = real[names[0]].ptr, real[names[1]].ptr
-            bias = real[names[2]].ptr if len(names) == 4 else None
-            be.gemm(st.bound.spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
+            bias = real[names[2]].ptr if spec.bias else None
+            if spec.beta:  # a cublaslt.matmul that reads c: the operand before out (only such a step passes c=, so a backend of 0.0.11 runs the others)
+                be.gemm(spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index, c=real[names[-2]].ptr)  # type: ignore[index, call-arg]
+            else:
+                be.gemm(spec, st.algo, a_ptr, b_ptr, bias, real[names[-1]].ptr, bases[st.workspace], stream, index)  # type: ignore[index]
         else:
             launch_args: "list[tuple[str, Any]]" = []
             for kind, n in st.order:
@@ -2604,7 +2612,7 @@ def _pin_library(spec: Any, cap: int) -> Any:
     """Pin a library step's spec for ``cap``: a cuBLASLt GEMM's algorithm or a cuDNN convolution's pin."""
     from . import _conv, _library
 
-    return _conv.build_conv(spec, arch=cap, canary=True) if isinstance(spec, _conv.ConvSpec) else _library.build_library(spec, arch=cap)
+    return _conv.build_conv(spec, arch=cap, canary=True) if isinstance(spec, _conv.ConvSpec) else _library.build_library(spec, arch=cap, canary=True)
 
 
 def write_export(p: Plan, built: "Sequence[Any]", pinned: "Sequence[Any]", directory: "str | os.PathLike[str]", cap: int, overwrite: bool) -> Plan:

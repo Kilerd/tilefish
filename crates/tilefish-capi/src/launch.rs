@@ -8,7 +8,7 @@ use std::ffi::{CString, c_char};
 use std::sync::Arc;
 
 use tilefish::cudarc::driver::sys::CUstream;
-use tilefish::{Arch, Conv, Gemm, Kernel, TensorArg};
+use tilefish::{Arch, Conv, Gemm, GemmEpilogue, Kernel, TensorArg};
 
 use crate::context::{Ctx, destroy_keeping_current, tilefish_context};
 use crate::error::{Outcome, c_string, call, quiet, tilefish_status};
@@ -243,8 +243,9 @@ pub unsafe extern "C" fn tilefish_kernel_tensor_name(kernel: *const tilefish_ker
     })
 }
 
-/// Load the pinned GEMM `stem` of `manifest` in `context`: the cuBLASLt of the process must be the version that chose its algorithm, and the
-/// algorithm is vetted and approved by the library for the problem.
+/// Load the pinned GEMM `stem` of `manifest` in `context`: the cuBLASLt of the process must be the version that chose its algorithm, the
+/// algorithm is vetted and approved by the library for the problem (with its epilogue), and the entry's canary, when it has one (a
+/// `cublaslt.matmul`), runs and must give its bytes.
 ///
 /// # Safety
 ///
@@ -293,8 +294,9 @@ pub unsafe extern "C" fn tilefish_gemm_check(
     })
 }
 
-/// Check the call and run the pinned GEMM on `stream`: the tensors are `a`, `b`, `bias` when the GEMM has one, `out`, and the caller's
-/// workspace, a `u8` tensor of at least `tilefish_gemm_workspace_required` bytes.
+/// Check the call and run the pinned GEMM on `stream`: the tensors are `a`, `b`, `bias` when the GEMM has one, `c` when it has one (a
+/// `cublaslt.matmul` with `beta` 1: `tilefish_gemm_epilogue`), `out`, and the caller's workspace, a `u8` tensor of at least
+/// `tilefish_gemm_workspace_required` bytes.
 ///
 /// # Safety
 ///
@@ -361,6 +363,47 @@ pub unsafe extern "C" fn tilefish_gemm_sizes(
         }
         if !has_bias.is_null() {
             unsafe { put_value(has_bias, gemm.gemm.has_bias()) }?;
+        }
+        Ok(())
+    })
+}
+
+/// No epilogue: `out = acc` (`cublaslt.gemm`, and a `cublaslt.matmul` of `epilogue: "none"`). ABI 1.1.
+pub const TILEFISH_EPILOGUE_NONE: i32 = 0;
+/// The bias epilogue: `out = acc + bias` (`cublaslt.gemm_bias`, and `"bias"`). ABI 1.1.
+pub const TILEFISH_EPILOGUE_BIAS: i32 = 1;
+/// The ReLU epilogue: `out = relu(acc)` (`"relu"`). ABI 1.1.
+pub const TILEFISH_EPILOGUE_RELU: i32 = 2;
+/// The ReLU of the bias epilogue: `out = relu(acc + bias)` (`"relu_bias"`). ABI 1.1.
+pub const TILEFISH_EPILOGUE_RELU_BIAS: i32 = 3;
+
+/// The epilogue of a GEMM, one of `TILEFISH_EPILOGUE_*` (tilefish's values, not cuBLASLt's `cublasLtEpilogue_t`): what cuBLASLt does to the f32
+/// accumulator before the one rounding, and whether a launch takes `c` (a `cublaslt.matmul` with `beta` 1: the epilogue acts on `acc + c`, and
+/// `c`, of the shape and type of `out`, is the tensor before `out`). Either out-pointer may be NULL. ABI 1.1.
+///
+/// # Safety
+///
+/// `gemm` is a live handle; each out-pointer is NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tilefish_gemm_epilogue(
+    gemm: *const tilefish_gemm,
+    epilogue: *mut i32,
+    has_c: *mut bool,
+) -> tilefish_status {
+    call(|| {
+        // SAFETY: the caller's contract, for every argument below.
+        let gemm = unsafe { handle(gemm, "the GEMM") }?;
+        if !epilogue.is_null() {
+            let value = match gemm.gemm.epilogue() {
+                GemmEpilogue::None => TILEFISH_EPILOGUE_NONE,
+                GemmEpilogue::Bias => TILEFISH_EPILOGUE_BIAS,
+                GemmEpilogue::Relu => TILEFISH_EPILOGUE_RELU,
+                GemmEpilogue::ReluBias => TILEFISH_EPILOGUE_RELU_BIAS,
+            };
+            unsafe { put_value(epilogue, value) }?;
+        }
+        if !has_c.is_null() {
+            unsafe { put_value(has_c, gemm.gemm.has_c()) }?;
         }
         Ok(())
     })

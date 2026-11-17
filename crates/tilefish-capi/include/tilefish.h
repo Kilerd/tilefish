@@ -46,7 +46,7 @@ typedef struct CUstream_st *CUstream;
  * The minor version of the ABI this header describes: a library of the same major version and at least this minor version has everything
  * the header declares (a minor version only adds functions and values).
  */
-#define TILEFISH_ABI_MINOR 0
+#define TILEFISH_ABI_MINOR 1
 
 /**
  * `tilefish_error_info.precondition` of an error that is not `TILEFISH_ERROR_PRECONDITION`.
@@ -127,6 +127,26 @@ typedef struct CUstream_st *CUstream;
  * A tensor given for a TMA descriptor is one the driver refuses to encode.
  */
 #define TILEFISH_PRECONDITION_TENSOR_MAP 14
+
+/**
+ * No epilogue: `out = acc` (`cublaslt.gemm`, and a `cublaslt.matmul` of `epilogue: "none"`). ABI 1.1.
+ */
+#define TILEFISH_EPILOGUE_NONE 0
+
+/**
+ * The bias epilogue: `out = acc + bias` (`cublaslt.gemm_bias`, and `"bias"`). ABI 1.1.
+ */
+#define TILEFISH_EPILOGUE_BIAS 1
+
+/**
+ * The ReLU epilogue: `out = relu(acc)` (`"relu"`). ABI 1.1.
+ */
+#define TILEFISH_EPILOGUE_RELU 2
+
+/**
+ * The ReLU of the bias epilogue: `out = relu(acc + bias)` (`"relu_bias"`). ABI 1.1.
+ */
+#define TILEFISH_EPILOGUE_RELU_BIAS 3
 
 /**
  * A graph parameter that a call gives every time (an activation), read.
@@ -870,8 +890,9 @@ const char *tilefish_kernel_tensor_name(const struct tilefish_kernel *kernel,
                                         size_t index);
 
 /**
- * Load the pinned GEMM `stem` of `manifest` in `context`: the cuBLASLt of the process must be the version that chose its algorithm, and the
- * algorithm is vetted and approved by the library for the problem.
+ * Load the pinned GEMM `stem` of `manifest` in `context`: the cuBLASLt of the process must be the version that chose its algorithm, the
+ * algorithm is vetted and approved by the library for the problem (with its epilogue), and the entry's canary, when it has one (a
+ * `cublaslt.matmul`), runs and must give its bytes.
  *
  * # Safety
  *
@@ -895,8 +916,9 @@ tilefish_status tilefish_gemm_load(const struct tilefish_manifest *manifest,
 tilefish_status tilefish_gemm_check(const struct tilefish_gemm *gemm, const struct tilefish_tensor *tensors, size_t n_tensors);
 
 /**
- * Check the call and run the pinned GEMM on `stream`: the tensors are `a`, `b`, `bias` when the GEMM has one, `out`, and the caller's
- * workspace, a `u8` tensor of at least `tilefish_gemm_workspace_required` bytes.
+ * Check the call and run the pinned GEMM on `stream`: the tensors are `a`, `b`, `bias` when the GEMM has one, `c` when it has one (a
+ * `cublaslt.matmul` with `beta` 1: `tilefish_gemm_epilogue`), `out`, and the caller's workspace, a `u8` tensor of at least
+ * `tilefish_gemm_workspace_required` bytes.
  *
  * # Safety
  *
@@ -933,6 +955,19 @@ uint64_t tilefish_gemm_workspace_required(const struct tilefish_gemm *gemm);
  * `gemm` is a live handle; each out-pointer is NULL or writable.
  */
 tilefish_status tilefish_gemm_sizes(const struct tilefish_gemm *gemm, uint64_t *m, uint64_t *n, uint64_t *k, bool *has_bias);
+
+/**
+ * The epilogue of a GEMM, one of `TILEFISH_EPILOGUE_*` (tilefish's values, not cuBLASLt's `cublasLtEpilogue_t`): what cuBLASLt does to the f32
+ * accumulator before the one rounding, and whether a launch takes `c` (a `cublaslt.matmul` with `beta` 1: the epilogue acts on `acc + c`, and
+ * `c`, of the shape and type of `out`, is the tensor before `out`). Either out-pointer may be NULL. ABI 1.1.
+ *
+ * # Safety
+ *
+ * `gemm` is a live handle; each out-pointer is NULL or writable.
+ */
+tilefish_status tilefish_gemm_epilogue(const struct tilefish_gemm *gemm,
+                                       int32_t *epilogue,
+                                       bool *has_c);
 
 /**
  * Load the pinned convolution `stem` of `manifest` in `context`: the cuDNN of the process must be the version that chose its pin, the pin is

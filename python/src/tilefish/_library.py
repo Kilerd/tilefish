@@ -59,7 +59,31 @@ if TYPE_CHECKING:
 
 IMPL_GEMM = "cublaslt.gemm"
 IMPL_GEMM_BIAS = "cublaslt.gemm_bias"
-IMPLS = {IMPL_GEMM: False, IMPL_GEMM_BIAS: True}  # impl -> whether it has a bias
+IMPLS = {IMPL_GEMM: False, IMPL_GEMM_BIAS: True}  # impl -> whether it has a bias (the two impls of tilefish 0.0.4, unchanged)
+# A GEMM with a declared cuBLASLt epilogue (RFC 0003, milestone E2; docs/manifest-schema-3.md, section 9.5): out = epilogue(acc [+ c] [+ bias]), the
+# library's bytes under the pin (contract (iii)), each pin verified at the build against contract (ii) and recorded "measured-exact" or
+# "binary-defined", with a canary.
+IMPL_MATMUL = "cublaslt.matmul"
+MATMUL_EPILOGUES = ("none", "bias", "relu", "relu_bias")  # cuBLASLt's DEFAULT, BIAS, RELU, RELU_BIAS
+MATMUL_WITH_BIAS = ("bias", "relu_bias")
+MATMUL_DTYPES = ("bf16", "f16")  # of a and b, and of the result, a bias and c (the same type): an f32 accumulator, one rounding to it
+CONTRACTS = ("measured-exact", "binary-defined")  # what an entry's verification found (contract (iii) either way)
+CUBLASLT_IMPLS = (IMPL_GEMM, IMPL_GEMM_BIAS, IMPL_MATMUL)
+
+
+def formula(epilogue: str, beta: int) -> str:
+    """The arithmetic of a ``cublaslt.matmul`` on the f32 accumulator ``acc``, before its one rounding, in the order the library adds (measured: X1 of
+    RFC 0003, ``C`` before the bias): ``"relu((acc + c) + bias)"``. What a pin is verified against (contract (ii)) and what an entry's
+    ``verification.formula`` says."""
+    x = "acc + c" if beta else "acc"
+    if epilogue in MATMUL_WITH_BIAS:
+        x = f"({x}) + bias" if beta else f"{x} + bias"
+    return f"relu({x})" if epilogue.startswith("relu") else x
+
+
+def bias_of(impl: str, epilogue: "str | None") -> bool:
+    """Whether an entry of ``impl`` (with ``epilogue``, for ``cublaslt.matmul``) has a ``bias`` operand."""
+    return epilogue in MATMUL_WITH_BIAS if impl == IMPL_MATMUL else IMPLS[impl]
 DEFAULT_WORKSPACE_BYTES = 8_519_680  # torch's default CUBLAS_WORKSPACE_CONFIG (":4096:2:16:8": 4096 KiB * 2 + 16 KiB * 8)
 TORCH_LT_WORKSPACE_BYTES = 1_048_576  # torch's default CUBLASLT_WORKSPACE_SIZE (1024 KiB): the limit its addmm asks the heuristic under
 HEURISTICS = ("tilefish", "torch")
@@ -95,6 +119,14 @@ OPTIONAL_ENTRY_FIELDS = {
 OPT_INS = ("allow_bf16_reduction", "allow_f16_reduction", "allow_f32_reduction")  # the opt-in of each operand type, in the order of OPERAND_DTYPES
 # An optional field with a count: present only when the declaration targets an SM count (sm_count_target=), an int from 8 to the entry's sm_count.
 OPTIONAL_COUNT_FIELDS = ("sm_count_target",)
+# An entry of cublaslt.matmul (section 9.5): the fields of a GEMM's and its beta, the contract its verification found and the record of that
+# verification; optionally the options of section 9.1 to 9.3 (not algo_source: it imports no algorithm) and a canary.
+MATMUL_ENTRY_KEYS = [*ENTRY_KEYS, "beta", "contract", "verification"]
+MATMUL_OPTIONAL_FIELDS = ("heuristic", "allow_bf16_reduction", "allow_f16_reduction", "allow_f32_reduction", "sm_count_target", "canary")
+VERIFICATION_KEYS = ("formula", "accumulator", "operand_sets", "elements", "differ", "max_ulp")
+ACCUMULATORS = ("f32-form", "plain-f32-pin")  # where the reference's accumulator came from: the pin's configuration with an f32 D, or the f32 pin
+CANARY_KEYS = ("seed", "out_digest")
+_HEX32 = re.compile(r"^[0-9a-f]{32}\Z")
 
 
 def has_bias(impl: str) -> bool:
@@ -144,10 +176,41 @@ def leading_dimensions_rule(layout: str) -> str:
     )
 
 
-def default_workspace_bytes(impl: str, heuristic: str) -> int:
-    """The workspace limit of a declaration that gives none: torch's ``addmm`` limit for a biased GEMM under the ``"torch"`` posture, torch's
-    cuBLAS workspace otherwise."""
+def default_workspace_bytes(impl: str, heuristic: str, epilogue: "str | None" = None) -> int:
+    """The workspace limit of a declaration that gives none: torch's ``addmm`` limit for a biased GEMM under the ``"torch"`` posture (and for a
+    ``cublaslt.matmul`` with an epilogue: torch runs ``addmm`` with a bias and ``_addmm_activation`` through cuBLASLt), torch's cuBLAS workspace
+    otherwise."""
+    if impl == IMPL_MATMUL:
+        return TORCH_LT_WORKSPACE_BYTES if heuristic == "torch" and epilogue != "none" else DEFAULT_WORKSPACE_BYTES
     return TORCH_LT_WORKSPACE_BYTES if heuristic == "torch" and IMPLS[impl] else DEFAULT_WORKSPACE_BYTES
+
+
+def check_matmul_options(name: str, epilogue: Any, beta: Any, canary: Any, contract: Any, algos: Any) -> "tuple[str, int, bool, str | None]":
+    """Check the options of a ``cublaslt.matmul`` declaration: ``epilogue`` (one of :data:`MATMUL_EPILOGUES`, required), ``beta`` (0 or 1),
+    ``canary`` (a bool) and ``contract`` (``None``, or ``"measured-exact"``: a pin that is not is refused at the build); ``algos=`` is not taken yet.
+    Returns them with their defaults (beta 0, canary on)."""
+    where = f"library op '{name}'"
+    if epilogue not in MATMUL_EPILOGUES:
+        raise TilefishDeclarationError(
+            f"{where}: {IMPL_MATMUL} needs epilogue= one of {list(MATMUL_EPILOGUES)} (cuBLASLt's DEFAULT, BIAS, RELU, RELU_BIAS; GELU is not offered "
+            f"yet), got {epilogue!r}"
+        )
+    beta = 0 if beta is None else beta
+    if isinstance(beta, bool) or not isinstance(beta, int) or beta not in (0, 1):
+        raise TilefishDeclarationError(f"{where}: beta must be 0 (no c) or 1 (out = epilogue(acc + c), with c: Tensor[M, N, D]), got {beta!r}")
+    canary = True if canary is None else canary
+    if not isinstance(canary, bool):
+        raise TilefishDeclarationError(f"{where}: canary must be True (the default: export records one, a load runs it) or False, got {canary!r}")
+    if contract not in (None, "measured-exact"):
+        raise TilefishDeclarationError(
+            f"{where}: contract must be None (the library's bytes, measured-exact or binary-defined, recorded per pin) or 'measured-exact' (a pin "
+            f"whose output is not contract (ii) is refused at the build), got {contract!r}"
+        )
+    if algos is not None:
+        raise TilefishDeclarationError(
+            f"{where}: {IMPL_MATMUL} does not import algorithms (algos=) yet: its pins are the heuristic's, under heuristic='tilefish' or 'torch'"
+        )
+    return str(epilogue), int(beta), canary, contract
 
 
 # -- imported algorithms ----------------------------------------------------------------------------------------------------------------------
@@ -304,21 +367,32 @@ def check_declaration(
     allow_bf16_reduction: bool = False,
     allow_f16_reduction: bool = False,
     allow_f32_reduction: bool = False,
+    epilogue: "str | None" = None,
+    beta: int = 0,
 ) -> None:
     """Check that a ``@library(impl=...)`` declaration has the signature of its implementation in its layout, and that its opt-in is the one of
-    its operands' type; raise a ``TilefishDeclarationError``."""
+    its operands' type; raise a ``TilefishDeclarationError``. ``epilogue`` and ``beta`` are those of a ``cublaslt.matmul``
+    (:func:`check_matmul_options`)."""
     where = f"library op '{name}'"
-    if impl not in IMPLS:
+    if impl not in CUBLASLT_IMPLS:
         raise TilefishDeclarationError(f"{where}: impl must be one of {sorted(IMPLS)}, got {impl!r}")
     if acc is not None and getattr(acc, "name", None) != "f32":
         raise TilefishDeclarationError(f"{where}: {impl} accumulates in f32 (acc=f32), got acc={acc!r}")
     if isinstance(workspace_bytes, bool) or not isinstance(workspace_bytes, int) or not 1 <= workspace_bytes <= MAX_WORKSPACE_BYTES:
         raise TilefishDeclarationError(f"{where}: workspace_bytes must be an int from 1 to 2**40, got {workspace_bytes!r}")
-    bias = IMPLS[impl]
+    matmul = impl == IMPL_MATMUL
+    bias = bias_of(impl, epilogue)
+    with_c = matmul and beta == 1
     params = list(sig.params)
-    want = 3 if bias else 2
+    want = 2 + bias + with_c
     b_text = f"b: Tensor[{b_dims(layout)}, T]"
     if len(params) != want or any(p.kind != "tensor" or p.access != "in" or p.strided or p.is_devscalar for p in params):
+        if matmul:
+            raise TilefishDeclarationError(
+                f"{where}: {impl} with epilogue={epilogue!r} and beta={beta} takes {want} input tensors (a: Tensor[{a_dims(layout)}, T], {b_text}"
+                f"{', bias: Tensor[N, T]' if bias else ''}{', c: Tensor[M, N, T]' if with_c else ''}), and returns Tensor[M, N, T], where T is bf16 or f16 "
+                f"(layout {layout}); the signature is {sig}"
+            )
         raise TilefishDeclarationError(
             f"{where}: {impl} takes {want} input tensors "
             f"(a: Tensor[{a_dims(layout)}, T], {b_text}{', bias: Tensor[N, D]' if bias else ''}), and returns Tensor[M, N, D], where T is bf16, f16 or "
@@ -341,6 +415,16 @@ def check_declaration(
         )
     if out.dtype.name not in (dtype, "f32"):  # type: ignore[union-attr]
         raise TilefishDeclarationError(f"{where}: the result of {dtype} operands must be a {dtype} or an f32 tensor, got {out}")
+    if matmul and (dtype not in MATMUL_DTYPES or out.dtype.name != dtype):  # type: ignore[union-attr]
+        raise TilefishDeclarationError(
+            f"{where}: {impl} takes bf16 or f16 operands and returns their type (an f32 accumulator, rounded once after the epilogue), got {a}, {b} "
+            f"and {out}"
+        )
+    if with_c:
+        ct = params[2 + bias].type
+        assert ct is not None
+        if ct.rank != 2 or not ct.contiguous or ct.dtype.name != out.dtype.name:  # type: ignore[union-attr]
+            raise TilefishDeclarationError(f"{where}: c must be a contiguous {out.dtype.name} tensor of rank 2, the type of the result, got {ct}")  # type: ignore[union-attr]
     if bias:
         bt = params[2].type
         assert bt is not None
@@ -360,6 +444,8 @@ def check_declaration(
         )
     if tuple(out.shape) != (m, n) or (bias and params[2].type.shape != (n,)):  # type: ignore[union-attr]
         raise TilefishDeclarationError(f"{where}: the result must be [M, N] = [{m}, {n}]" + (f" and bias [N] = [{n}]" if bias else ""))
+    if with_c and tuple(params[2 + bias].type.shape) != (m, n):  # type: ignore[union-attr]
+        raise TilefishDeclarationError(f"{where}: c must be [M, N] = [{m}, {n}], the shape of the result")
     for flag, value in zip(OPT_INS, (allow_bf16_reduction, allow_f16_reduction, allow_f32_reduction)):
         if value and flag != f"allow_{dtype}_reduction":
             raise TilefishDeclarationError(
@@ -432,7 +518,7 @@ def _problem_keys(op: "LibraryOp") -> "list[tuple[Any, ...]]":
     for combo in itertools.product(*(d.buckets for d in dims)) if dims else [()]:  # type: ignore[arg-type]
         mapping = dict(zip(dims, combo))
         m, n, k = (int(e.subst(mapping).folded().value) for e in (m_expr, n_expr, k_expr))
-        keys.add(table_key(m, n, k, IMPLS[op.impl], layout_of(op)))  # type: ignore[index]
+        keys.add(table_key(m, n, k, bias_of(op.impl, getattr(op, "epilogue", None)), layout_of(op)))  # type: ignore[arg-type]
     return sorted(keys)
 
 
@@ -470,6 +556,12 @@ def _canonical(op: "LibraryOp") -> "dict[str, Any]":
         out["layout"] = layout_of(op)  # b is [K, N]: with K = N the signature alone would not tell the layouts apart
     if getattr(op, "sm_count_target", None) is not None:
         out["sm_count_target"] = op.sm_count_target
+    if op.impl == IMPL_MATMUL:  # (only on the new impl: the digests of gemm and gemm_bias are what they were)
+        out["epilogue"] = op.epilogue
+        out["beta"] = op.beta
+        out["canary"] = op.canary
+        if op.contract is not None:
+            out["contract"] = op.contract
     tables = getattr(op, "algos", None)
     if tables:
         keys = _problem_keys(op)
@@ -523,10 +615,24 @@ class LibrarySpec:
     allow_f16_reduction: bool = False  # whether split-K may add its partial sums in the output type (the opt-in of f16 operands)
     sm_count_target: "int | None" = None  # the SM count the heuristic is asked for (CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET), None: the device's
     allow_f32_reduction: bool = False  # whether split-K may add its partial sums in the output (the opt-in of f32 operands)
+    epilogue: "str | None" = None  # of a cublaslt.matmul (MATMUL_EPILOGUES); None for gemm and gemm_bias
+    beta: int = 0  # of a cublaslt.matmul: 1 when it reads c (out = epilogue(acc + c))
+    canary: bool = False  # whether export records a canary (a cublaslt.matmul's declaration: on by default)
+    contract: "str | None" = None  # "measured-exact": a pin that is not is refused at the build; None: either is recorded
 
     @property
     def bias(self) -> bool:
-        return IMPLS[self.impl]
+        return bias_of(self.impl, self.epilogue)
+
+    @property
+    def matmul(self) -> bool:
+        """Whether the spec is a ``cublaslt.matmul`` (an epilogue, ``beta``, a verification per pin and a canary)."""
+        return self.impl == IMPL_MATMUL
+
+    @property
+    def call_epilogue(self) -> "str | None":
+        """The ``epilogue=`` the binding is called with: the declaration's for a ``cublaslt.matmul``, ``None`` (by the bias) for the others."""
+        return self.epilogue if self.matmul else None
 
     @property
     def form(self) -> Any:
@@ -555,8 +661,16 @@ class LibrarySpec:
 
     def entry(self, sm_count: int) -> "dict[str, Any]":
         """The fields of the library entry that the declaration and the SM count of the device determine (a replay checks the manifest's entry
-        against them); the build adds ``arch``, ``algo`` and ``cublaslt_version``."""
-        dtypes = {"a": self.dtype, "b": self.dtype, **({"bias": self.out_dtype} if self.bias else {}), "out": self.out_dtype}
+        against them); the build adds ``arch``, ``algo`` and ``cublaslt_version`` (and, for a ``cublaslt.matmul``, ``contract``, ``verification`` and
+        ``canary``)."""
+        dtypes = {
+            "a": self.dtype,
+            "b": self.dtype,
+            **({"bias": self.out_dtype} if self.bias else {}),
+            **({"c": self.out_dtype} if self.beta else {}),
+            "out": self.out_dtype,
+        }
+        extra = {"beta": self.beta} if self.matmul else {}
         return {
             "stem": self.stem,
             "op": self.op,
@@ -574,7 +688,8 @@ class LibrarySpec:
             "n": self.n,
             "k": self.k,
             **dict(zip(("lda", "ldb", "ldc", "ldd"), leading_dimensions(self.layout, self.m, self.n, self.k))),
-            "epilogue": "bias" if self.bias else "none",
+            "epilogue": self.epilogue if self.matmul else ("bias" if self.bias else "none"),
+            **extra,
             "workspace_bytes": self.workspace_bytes,
             "sm_count": sm_count,
             "declaration_digest": self.pinned_digest(sm_count),
@@ -684,6 +799,10 @@ def library_specs(op: "LibraryOp") -> "list[LibrarySpec]":
                 allow_f16_reduction=getattr(op, "allow_f16_reduction", False),
                 sm_count_target=getattr(op, "sm_count_target", None),
                 allow_f32_reduction=getattr(op, "allow_f32_reduction", False),
+                epilogue=getattr(op, "epilogue", None) if op.impl == IMPL_MATMUL else None,
+                beta=getattr(op, "beta", 0) if op.impl == IMPL_MATMUL else 0,
+                canary=bool(getattr(op, "canary", False)) if op.impl == IMPL_MATMUL else False,
+                contract=getattr(op, "contract", None) if op.impl == IMPL_MATMUL else None,
             )
         )
     return specs
@@ -703,6 +822,10 @@ class BuiltLibrary:
     algo: str  # 128 lowercase hex digits: the 64 bytes of the cublasLtMatmulAlgo_t
     cublaslt_version: int
     sm_count: int
+    # of a cublaslt.matmul: what the verification of the pin found (CONTRACTS), its record, and the canary export made ({"seed", "out_digest"})
+    contract: "str | None" = None
+    verification: "dict[str, Any] | None" = None
+    canary: "dict[str, Any] | None" = None
 
     @property
     def stem(self) -> str:
@@ -718,15 +841,25 @@ class BuiltLibrary:
         out["arch"] = self.arch
         out["algo"] = self.algo
         out["cublaslt_version"] = self.cublaslt_version
+        if self.spec.matmul:
+            assert self.contract is not None and self.verification is not None
+            out["contract"] = self.contract
+            out["verification"] = dict(self.verification)
+            if self.canary is not None:
+                out["canary"] = dict(self.canary)
         return out
 
 
-def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | None" = None) -> BuiltLibrary:
+def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | None" = None, canary: bool = False) -> BuiltLibrary:
     """Pin the algorithm of ``spec`` for ``arch``: ask cuBLASLt's heuristic, under the spec's posture and workspace limit, for its best algorithm,
     or, for a declaration with ``algos=``, take the algorithm its table for this device gives (refused when it has none for this device). Either
     way the algorithm must pass the checks a run makes (``tilefish._cublaslt.check_algo``) before it is pinned.
 
     The heuristic is asked on a device of that architecture (a pin is per architecture), so the device must be one.
+
+    A ``cublaslt.matmul`` is pinned for its epilogue, and its pin is then verified against contract (ii) (:func:`tilefish._matmul.verify`): the
+    result, ``"measured-exact"`` or ``"binary-defined"``, is part of the pin (a declaration with ``contract="measured-exact"`` refuses the other).
+    With ``canary`` (what ``export`` does) and a declaration that has one (the default), its canary is run and recorded too.
     """
     from . import _cublaslt
     from ._build import parse_arch
@@ -756,17 +889,36 @@ def build_library(spec: LibrarySpec, *, arch: "int | str", device_index: "int | 
     else:
         algo = _cublaslt.pin_algo(
             spec.m, spec.n, spec.k, spec.bias, workspace_bytes=spec.workspace_bytes, device_index=index, heuristic=spec.heuristic,
-            form=spec.form, sm_count_target=spec.sm_count_target, **spec.opt_ins,
+            form=spec.form, sm_count_target=spec.sm_count_target, **spec.opt_ins, **_epilogue_kw(spec),
         ).algo_hex  # fmt: skip
     try:
         _cublaslt.check_algo(
             spec.m, spec.n, spec.k, spec.bias, algo, workspace_bytes=spec.workspace_bytes, device_index=index, form=spec.form,
-            sm_count_target=spec.sm_count_target, **spec.opt_ins,
+            sm_count_target=spec.sm_count_target, **spec.opt_ins, **_epilogue_kw(spec, beta=True),
         )  # fmt: skip
     except TilefishRuntimeError as e:
         source = "the imported" if spec.algos else "the heuristic's"
         raise TilefishBuildError(f"cannot pin '{spec.stem}' on sm_{cap}: {source} algorithm is refused: {e}") from e
-    return BuiltLibrary(spec, f"sm_{cap}", algo, version, sms)
+    if not spec.matmul:
+        return BuiltLibrary(spec, f"sm_{cap}", algo, version, sms)
+    from . import _matmul
+
+    contract, verification = _matmul.verify(spec, algo, index)
+    if spec.contract == "measured-exact" and contract != "measured-exact":
+        raise TilefishBuildError(
+            f"cannot pin '{spec.stem}' on sm_{cap}: the declaration asks for contract='measured-exact', and the pinned algorithm "
+            f"{_matmul.algo_text(algo)} with cuBLASLt {version} computes {spec.epilogue}{' with beta=1' if spec.beta else ''} as no rounding of "
+            f"{verification['formula']} does: {_matmul.verification_text(verification)}"
+        )
+    made = {"seed": _matmul.CANARY_SEED, "out_digest": _matmul.canary_digest(spec, algo, _matmul.CANARY_SEED, index)} if canary and spec.canary else None
+    return BuiltLibrary(spec, f"sm_{cap}", algo, version, sms, contract, verification, made)
+
+
+def _epilogue_kw(spec: LibrarySpec, beta: bool = False) -> "dict[str, Any]":
+    """The binding's ``epilogue=`` (and ``beta=``) of a ``cublaslt.matmul`` spec; nothing for ``gemm`` and ``gemm_bias`` (their calls are 0.0.4's)."""
+    if not spec.matmul:
+        return {}
+    return {"epilogue": spec.epilogue, "beta": spec.beta} if beta else {"epilogue": spec.epilogue}
 
 
 def imported_algo(spec: LibrarySpec, arch: str, sms: int, version: int, device_index: "int | None") -> "str | None":
@@ -859,7 +1011,24 @@ def built_from_manifest(manifest: Any, spec: LibrarySpec, arch: str, sm_count: i
                 + (f"{want[:16]}... for this device" if want else f"none for {arch} with {sm_count} SMs and cuBLASLt {pinned_by}")
                 + ": it is not what the declaration asks for"
             )
-    return BuiltLibrary(spec, arch, entry["algo"], pinned_by, pinned_on)
+    if not spec.matmul:
+        return BuiltLibrary(spec, arch, entry["algo"], pinned_by, pinned_on)
+    if spec.contract == "measured-exact" and entry["contract"] != "measured-exact":
+        raise TilefishManifestError(
+            f"the library entry for '{spec.stem}' ({arch}) is {entry['contract']}, and the declaration asks for contract='measured-exact': its pin was "
+            "not verified equal to its formula, so it is refused (export it again from this declaration, which refuses such a pin)"
+        )
+    if spec.canary and "canary" not in entry:
+        raise TilefishManifestError(
+            f"the library entry for '{spec.stem}' ({arch}) has no canary, and the declaration has one (canary=True, the default): the pin cannot be "
+            "told from another build of this cuBLASLt version, so it is refused (export it again, or declare canary=False)"
+        )
+    built = BuiltLibrary(spec, arch, entry["algo"], pinned_by, pinned_on, entry["contract"], entry["verification"], entry.get("canary"))
+    if built.canary is not None:
+        from . import _matmul
+
+        _matmul.check_canary(built, _device_index(device_index))
+    return built
 
 
 # -- reading an entry back ---------------------------------------------------------------------------------------------------------
@@ -882,6 +1051,55 @@ def _eval_static(text: str, buckets: "dict[str, int]", where: str) -> int:
     return value.value
 
 
+def _validate_matmul_fields(entry: "dict[str, Any]", where: str) -> None:
+    """The fields of a ``cublaslt.matmul`` entry that a GEMM's has not (section 9.5): ``epilogue``, ``beta``, ``contract``, ``verification`` and the
+    optional ``canary``, each exactly typed, and the redundant ones agreeing (the formula is the one of the epilogue and ``beta``; the contract is
+    ``measured-exact`` exactly when no element differed)."""
+    epilogue = entry["epilogue"]
+    if epilogue not in MATMUL_EPILOGUES:
+        _bad(where, f"the epilogue of {IMPL_MATMUL} must be one of {list(MATMUL_EPILOGUES)}, got {epilogue!r}")
+    beta = entry["beta"]
+    if not sv.is_int(beta) or beta not in (0, 1):
+        _bad(where, f"beta must be the int 0 or 1, got {beta!r}")
+    contract = entry["contract"]
+    if contract not in CONTRACTS:
+        _bad(where, f"contract must be one of {list(CONTRACTS)}, got {contract!r}")
+    v = entry["verification"]
+    if not isinstance(v, dict) or sorted(v) != sorted(VERIFICATION_KEYS):
+        _bad(where, f"verification must be an object of exactly {list(VERIFICATION_KEYS)}, got {v!r}")
+    want = formula(epilogue, beta)
+    if v["formula"] != want:
+        _bad(where, f"verification.formula must be {want!r} (the arithmetic of the epilogue {epilogue!r} with beta {beta}), got {v['formula']!r}")
+    if v["accumulator"] not in ACCUMULATORS:
+        _bad(where, f"verification.accumulator must be one of {list(ACCUMULATORS)}, got {v['accumulator']!r}")
+    for key in ("operand_sets", "elements"):
+        if not sv.is_int(v[key]) or v[key] < 1:
+            _bad(where, f"verification.{key} must be a positive int, got {v[key]!r}")
+    for key in ("differ", "max_ulp"):
+        if not sv.is_int(v[key]) or v[key] < 0:
+            _bad(where, f"verification.{key} must be an int of at least 0, got {v[key]!r}")
+    if v["differ"] > v["elements"]:
+        _bad(where, f"verification.differ ({v['differ']}) is more than verification.elements ({v['elements']})")
+    m, n = entry["m"], entry["n"]
+    if sv.is_int(m) and sv.is_int(n) and v["elements"] != v["operand_sets"] * m * n:
+        _bad(where, f"verification.elements must be operand_sets * m * n = {v['operand_sets'] * m * n}, got {v['elements']}")
+    if (contract == "measured-exact") != (v["differ"] == 0):
+        _bad(where, f"contract is {contract!r}, but the verification found {v['differ']} elements that differ (measured-exact is exactly none)")
+    if v["differ"] == 0 and v["max_ulp"] != 0:
+        _bad(where, f"verification.max_ulp is {v['max_ulp']}, but no element differs")
+    if "canary" in entry:
+        c = entry["canary"]
+        if (
+            not isinstance(c, dict)
+            or sorted(c) != sorted(CANARY_KEYS)
+            or not sv.is_int(c["seed"])
+            or not 0 <= c["seed"] < 1 << 32
+            or not isinstance(c["out_digest"], str)
+            or not _HEX32.match(c["out_digest"])
+        ):
+            _bad(where, f"canary must be {{\"seed\": an int from 0 to 2**32 - 1, \"out_digest\": 32 lowercase hex digits}}, got {c!r}")
+
+
 def validate_entry(entry: Any, index: int = 0) -> None:
     """Strict reading of one entry of the manifest's ``library`` section (raises :class:`~tilefish.errors.TilefishManifestError`).
 
@@ -901,18 +1119,23 @@ def validate_entry(entry: Any, index: int = 0) -> None:
     if not isinstance(entry, dict):
         _bad(where, f"is not an object: {entry!r}")
     where = f"#{index} ({entry.get('stem')!r})"
-    missing = [k for k in ENTRY_KEYS if k not in entry]
-    unknown = sorted(str(k) for k in set(entry) - set(ENTRY_KEYS) - set(OPTIONAL_ENTRY_FIELDS) - set(OPTIONAL_COUNT_FIELDS))
+    matmul = entry.get("impl") == IMPL_MATMUL
+    keys = MATMUL_ENTRY_KEYS if matmul else ENTRY_KEYS
+    optional = [*MATMUL_OPTIONAL_FIELDS] if matmul else [*OPTIONAL_ENTRY_FIELDS, *OPTIONAL_COUNT_FIELDS]
+    missing = [k for k in keys if k not in entry]
+    unknown = sorted(str(k) for k in set(entry) - set(keys) - set(optional))
     if missing or unknown:
         _bad(
             where,
-            f"must have exactly the fields {ENTRY_KEYS} and may have {list(OPTIONAL_ENTRY_FIELDS) + list(OPTIONAL_COUNT_FIELDS)}"
+            f"must have exactly the fields {keys} and may have {optional}"
             + (f"; missing {missing}" if missing else "")
             + (f"; unknown {unknown}" if unknown else ""),
         )
     for key, only in OPTIONAL_ENTRY_FIELDS.items():  # present only when not the default, and then with its one value (true is not 1)
         if key in entry and (type(entry[key]) is not type(only) or entry[key] != only):
             _bad(where, f"{key} is absent (the default) or {json.dumps(only)}, got {entry[key]!r}")
+    if matmul:
+        _validate_matmul_fields(entry, where)
     try:
         stem = entry["stem"]
         if not isinstance(stem, str) or not sv._STEM.match(stem):
@@ -921,9 +1144,10 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         if not isinstance(entry["arch"], str) or not _ARCH.match(entry["arch"]):
             _bad(where, f"arch must look like 'sm_103', got {entry['arch']!r}")
         impl = entry["impl"]
-        if impl not in IMPLS:
-            _bad(where, f"impl must be one of {sorted([*IMPLS, 'cudnn.conv_fwd'])}, got {impl!r}")
-        bias = IMPLS[impl]
+        if impl not in CUBLASLT_IMPLS:
+            _bad(where, f"impl must be one of {sorted([*CUBLASLT_IMPLS, 'cudnn.conv_fwd'])}, got {impl!r}")
+        bias = bias_of(impl, entry["epilogue"])
+        with_c = matmul and entry["beta"] == 1
         for key in ("m", "n", "k", "lda", "ldb", "ldc", "ldd"):
             v = entry[key]
             if not sv.is_int(v) or not 1 <= v <= sv.MAX_ELEMENTS:
@@ -940,14 +1164,18 @@ def validate_entry(entry: Any, index: int = 0) -> None:
             _bad(where, leading_dimensions_rule(layout))
         if entry["compute_type"] != COMPUTE_TYPE or entry["scale_type"] != SCALE_TYPE:
             _bad(where, f"compute_type and scale_type must be {COMPUTE_TYPE!r} and {SCALE_TYPE!r}")
-        if entry["epilogue"] != ("bias" if bias else "none"):
+        if not matmul and entry["epilogue"] != ("bias" if bias else "none"):
             _bad(where, f"the epilogue of {impl} must be {'bias' if bias else 'none'!r}, got {entry['epilogue']!r}")
         dtypes = entry["dtypes"]
         dtype = dtypes.get("a") if isinstance(dtypes, dict) else None
         out_dtype = dtypes.get("out") if isinstance(dtypes, dict) else None
+        if matmul and (dtype not in MATMUL_DTYPES or out_dtype != dtype):
+            dtype, out_dtype = "bf16", "bf16"  # the message names the default form
         if dtype not in OPERAND_DTYPES or out_dtype not in (dtype, "f32"):  # (f32 operands: dtype and "f32" are one type)
             dtype, out_dtype = "bf16", "bf16"  # the message names the default form
-        want_dtypes = {"a": dtype, "b": dtype, **({"bias": out_dtype} if bias else {}), "out": out_dtype}
+        want_dtypes = {"a": dtype, "b": dtype, **({"bias": out_dtype} if bias else {}), **({"c": out_dtype} if with_c else {}), "out": out_dtype}
+        if dtypes != want_dtypes and matmul:
+            _bad(where, f"dtypes must be {want_dtypes}, got {dtypes!r} (a and b are both bf16 or both f16, the result, a bias and c are of their type)")
         if dtypes != want_dtypes:
             _bad(
                 where,
@@ -983,9 +1211,9 @@ def validate_entry(entry: Any, index: int = 0) -> None:
         abi = entry["abi"]
         sv._keys(abi, "abi", ["params"])
         params = abi["params"]
-        names = ["a", "b"] + (["bias"] if bias else []) + ["out"]
-        expected_shapes = [*operand_shapes(layout, m, n, k)] + ([(n,)] if bias else []) + [(m, n)]
-        expected_dtypes = [dtype, dtype] + ([out_dtype] if bias else []) + [out_dtype]
+        names = ["a", "b"] + (["bias"] if bias else []) + (["c"] if with_c else []) + ["out"]
+        expected_shapes = [*operand_shapes(layout, m, n, k)] + ([(n,)] if bias else []) + ([(m, n)] if with_c else []) + [(m, n)]
+        expected_dtypes = [dtype, dtype] + ([out_dtype] if bias else []) + ([out_dtype] if with_c else []) + [out_dtype]
         if not isinstance(params, list) or len(params) != len(names):
             _bad(where, f"abi.params must list {len(names)} pointers ({', '.join(names)} in this order)")
         seen: "set[str]" = set()
@@ -1064,12 +1292,13 @@ def validate_entry(entry: Any, index: int = 0) -> None:
 
 
 def run_gemm(spec: LibrarySpec, algo: str, tensors: "dict[str, Any]", out: Any, stream: int, device_index: int) -> None:
-    """Launch ``cublasLtMatmul`` with the pinned ``algo`` on ``stream``: ``tensors`` are ``a``, ``b`` (and ``bias``) by the op's parameter
-    names in order, ``out`` the result tensor; all are contiguous, 16-byte aligned and have the shapes of ``spec`` (the caller checked)."""
+    """Launch ``cublasLtMatmul`` with the pinned ``algo`` on ``stream``: ``tensors`` are ``a``, ``b`` (and ``bias``, and ``c`` of a ``cublaslt.matmul``
+    with ``beta=1``) by the op's parameter names in order, ``out`` the result tensor; all are contiguous, 16-byte aligned and have the shapes of
+    ``spec`` (the caller checked)."""
     a, b, *rest = tensors.values()
-    run_gemm_ptrs(
-        spec, algo, int(a.data_ptr()), int(b.data_ptr()), int(rest[0].data_ptr()) if rest else None, int(out.data_ptr()), stream, device_index
-    )
+    bias = int(rest[0].data_ptr()) if spec.bias else None
+    c = int(rest[-1].data_ptr()) if spec.beta else None
+    run_gemm_ptrs(spec, algo, int(a.data_ptr()), int(b.data_ptr()), bias, int(out.data_ptr()), stream, device_index, c_ptr=c)
 
 
 def run_gemm_ptrs(
@@ -1082,11 +1311,15 @@ def run_gemm_ptrs(
     stream: int,
     device_index: int,
     workspace_ptr: "int | None" = None,
+    c_ptr: "int | None" = None,
 ) -> None:
     """:func:`run_gemm` on device addresses. With ``workspace_ptr`` (``spec.workspace_bytes`` bytes, 256-byte aligned: a buffer of a launch plan's
-    arena) the workspace is that memory and the call allocates nothing; without it the workspace comes from torch's caching allocator."""
+    arena) the workspace is that memory and the call allocates nothing; without it the workspace comes from torch's caching allocator. ``c_ptr`` is
+    the ``c`` of a ``cublaslt.matmul`` with ``beta=1`` (and only of one)."""
     from . import _cublaslt
 
+    if (c_ptr is not None) != bool(spec.beta):
+        raise TilefishRuntimeError(f"'{spec.stem}': {'a c is given to a GEMM without beta=1' if c_ptr is not None else 'its c (beta=1) is not given'}")
     _cublaslt.matmul(
         a_ptr,
         b_ptr,
@@ -1103,6 +1336,7 @@ def run_gemm_ptrs(
         form=spec.form,
         sm_count_target=spec.sm_count_target,
         **spec.opt_ins,
+        **({"epilogue": spec.epilogue, "c_ptr": c_ptr} if spec.matmul else {}),
     )
 
 
@@ -1122,8 +1356,27 @@ def reference_gemm(tensors: "dict[str, Any]", layout: str = "TN", out_dtype: "st
     return acc.to(a.dtype if out_dtype is None else getattr(torch, _TORCH_DTYPES[out_dtype]))
 
 
+def reference_matmul(tensors: "dict[str, Any]", layout: str, epilogue: str, beta: int) -> Any:
+    """The result of a ``cublaslt.matmul`` in torch, as its formula says (:func:`formula`): an f32 matmul of the operands, ``c`` (with ``beta=1``)
+    and then the bias added in f32, ReLU, one rounding to the operands' type."""
+    import torch
+
+    a, b, *rest = tensors.values()
+    lhs = a.to(torch.float32) if layout[1] == "N" else a.to(torch.float32).t()
+    acc = lhs @ (b.to(torch.float32).t() if layout[0] == "T" else b.to(torch.float32))
+    if beta:
+        acc = acc + rest[-1].to(torch.float32)
+    if epilogue in MATMUL_WITH_BIAS:
+        acc = acc + rest[0].to(torch.float32)
+    if epilogue.startswith("relu"):
+        acc = torch.relu(acc)
+    return acc.to(a.dtype)
+
+
 def reference_of(op: "LibraryOp", tensors: "dict[str, Any]") -> Any:
-    """:func:`reference_gemm` of a library op: its layout and the type of its result."""
+    """:func:`reference_gemm` of a library op: its layout and the type of its result (:func:`reference_matmul` of a ``cublaslt.matmul``)."""
+    if op.impl == IMPL_MATMUL:
+        return reference_matmul(tensors, layout_of(op), op.epilogue, op.beta)  # type: ignore[attr-defined]
     return reference_gemm(tensors, layout_of(op), op.signature.returns[0].dtype.name)  # type: ignore[union-attr]
 
 

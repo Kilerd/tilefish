@@ -17,8 +17,9 @@
 // `plan_set` (a set loaded with one pin), `shared` (the stages of a set on one shared arena, launched and replayed one after the other,
 // cpp_shared/ and cpp_shared_graph/), `carried` (carried buffers handed from plan to plan on a shared arena, launched and replayed, cpp_carried/
 // and cpp_carried_graph/, and the refusals of a fresh arena), `weighted` (weights bound once), `runner` (the generated runner of the plan
-// `block`), `fused_runners` (every plan `fused_*`, whose graph body computes, through the runner generated for it, cpp_fused_runners/) and
-// `capturing` (a plan launch on a stream the host is capturing is refused).
+// `block`), `fused_runners` (every plan `fused_*`, whose graph body computes, through the runner generated for it, cpp_fused_runners/),
+// `capturing` (a plan launch on a stream the host is capturing is refused) and `matmuls` (the GEMMs with a cuBLASLt epilogue say their epilogue
+// and whether they take `c`, and a forged canary is refused at the load).
 
 #include <algorithm>
 #include <cstdio>
@@ -422,6 +423,71 @@ void test_refusals() {
     expect_refused([&] { manifest.kernel(g.ctx, "gelu_erf", {}, other); }, TILEFISH_ERROR_NO_BINARY, -1, "another architecture");
     expect_refused([&] { manifest.kernel(g.ctx, "no_such_stem"); }, TILEFISH_ERROR_NO_BINARY, -1, "an unknown stem");
     std::printf("cpp gate: refusals (shape, access, region, dtype, pin, tampered cubin, architecture, stem) launch nothing\n");
+}
+
+// -- GEMMs with a cuBLASLt epilogue (cublaslt.matmul) ----------------------------------------------------------------------------------------
+
+int32_t epilogue_code(const std::string& name) {
+    if (name == "none") return TILEFISH_EPILOGUE_NONE;
+    if (name == "bias") return TILEFISH_EPILOGUE_BIAS;
+    if (name == "relu") return TILEFISH_EPILOGUE_RELU;
+    if (name == "relu_bias") return TILEFISH_EPILOGUE_RELU_BIAS;
+    throw std::runtime_error("the gate does not know the epilogue " + name);
+}
+
+/// Every GEMM with an epilogue of the gate (its cases ran in `cases`, `c` before `out`): loaded through the C ABI (which ran its canary), it says its
+/// epilogue and whether it takes `c` (`tilefish_gemm_epilogue`, ABI 1.1) as the manifest does; and a manifest whose canary of one of them was changed
+/// is refused at the load of that GEMM, before it runs.
+void test_matmuls() {
+    Gpu& g = gpu();
+    auto manifest = gate_manifest();
+    auto doc = json::read_file((gate / "cases.json").string());
+    size_t n = 0;
+    std::string with_canary;
+    for (const auto& c : doc["cases"].array()) {
+        if (!c.has("epilogue")) continue;
+        const std::string& stem = c["stem"].str();
+        auto gemm = manifest.gemm(g.ctx, stem.c_str());
+        const bool bias = c["epilogue"] == "bias" || c["epilogue"] == "relu_bias", has_c = c["beta"].u64() == 1;
+        CHECK(gemm.epilogue() == epilogue_code(c["epilogue"].str()), "%s: epilogue %d", stem.c_str(), gemm.epilogue());
+        CHECK(gemm.has_c() == has_c && gemm.has_bias() == bias, "%s: c %d, bias %d", stem.c_str(), gemm.has_c(), gemm.has_bias());
+        CHECK(c["tensors"].size() == 3u + bias + has_c, "%s: %zu tensors", stem.c_str(), c["tensors"].size());
+        if (with_canary.empty() && c["canary"].boolean()) with_canary = stem;
+        ++n;
+    }
+    CHECK(n >= 24, "%zu cases of GEMMs with an epilogue", n);
+    CHECK(!with_canary.empty(), "a GEMM with a canary");
+    if (with_canary.empty()) return;
+    // the canary of one entry changed (its digest, which is unique in the file, written as zeros): the load is refused
+    fs::path dir = doc["manifest"].str();
+    if (dir.is_relative()) dir = gate / dir;
+    const std::string arch = "sm_" + std::to_string(g.ctx.arch());
+    std::string digest;
+    const auto original = json::read_file((dir / "manifest.json").string());
+    for (const auto& e : original["library"].array()) {
+        if (e["stem"] == with_canary && e["arch"] == arch) digest = e["canary"]["out_digest"].str();
+    }
+    CHECK(digest.size() == 32, "%s: the digest of its canary", with_canary.c_str());
+    if (digest.size() != 32) return;
+    fs::path copy = fs::temp_directory_path() / "tilefish-cpp-gate-canary";
+    fs::remove_all(copy);
+    fs::copy(dir, copy, fs::copy_options::recursive);
+    auto bytes = read_bytes(copy / "manifest.json");
+    std::string text(bytes.begin(), bytes.end());
+    size_t at = text.find("\"" + digest + "\"");
+    CHECK(at != std::string::npos && text.find("\"" + digest + "\"", at + 1) == std::string::npos, "the digest is in the file once");
+    text.replace(at + 1, 32, std::string(32, '0'));
+    write_bytes(copy / "manifest.json", std::vector<uint8_t>(text.begin(), text.end()));
+    auto forged = tilefish::Manifest::load_trusting_directory(copy.string());
+    try {
+        forged.gemm(g.ctx, with_canary.c_str());
+        CHECK(false, "%s: a forged canary is not refused", with_canary.c_str());
+    } catch (const tilefish::Error& e) {
+        CHECK(e.status() == TILEFISH_ERROR_MANIFEST && std::strstr(e.what(), "the canary of the cuBLASLt matmul") != nullptr, "%s: %s",
+              e.status_name(), e.what());
+    }
+    fs::remove_all(copy);
+    std::printf("cpp gate: %zu GEMMs with an epilogue say theirs, and a forged canary of %s is refused at the load\n", n, with_canary.c_str());
 }
 
 // -- single launches in the host's own CUDA graph ---------------------------------------------------------------------------------------
@@ -1009,6 +1075,7 @@ int main(int argc, char** argv) {
         {"context", test_context},   {"plans", test_plans},       {"plan_set", test_plan_set},
         {"shared", test_shared},     {"carried", test_carried},   {"weighted", test_weighted},
         {"runner", test_runner},     {"fused_runners", test_fused_runners}, {"capturing", test_capturing},
+        {"matmuls", test_matmuls},
     };
     std::set<std::string> wanted(argv + std::min(argc, 2), argv + argc);
     int ran = 0;

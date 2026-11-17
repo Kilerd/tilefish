@@ -19,7 +19,8 @@ everything the manifest can describe:
 * a null pointer (kind ``null``): not a parameter of ``launch`` (the crate passes 0 at its slot), listed in the docs of the struct; and a 64-bit dimension
   scalar, derived from the shapes like any scalar;
 * a ``library`` entry (a pinned cuBLASLt GEMM): a struct that wraps ``Gemm`` and whose ``launch`` takes ``a``, ``b``, ``bias`` when it has
-  one, ``out`` and a ``workspace`` (a ``u8`` tensor of at least ``workspace_required()`` bytes).
+  one, ``c`` when it has one (a ``cublaslt.matmul`` with ``beta=1``), ``out`` and a ``workspace`` (a ``u8`` tensor of at least
+  ``workspace_required()`` bytes).
 
 It still **refuses** what is invalid, with the strictness of the crate's reader (``docs/manifest-schema-3.md``, section 10): ``fixed`` on a
 Triton kernel, ``strides`` without ``offset`` or on a pointer that is written, a ``stride_of`` that no strided pointer owns, a fixed stride
@@ -45,7 +46,8 @@ What the module holds, in order:
   ``load(&Manifest, &Arc<CudaContext>)`` loads the binary for the device of a context and ``launch(&CudaStream, tensors...)`` checks the call and
   launches, and ``unsafe launch_raw(CUstream, tensors...)`` does the same on a raw handle. A CUDA graph is captured with regions
   and ``launch_raw`` (a launch of cudarc slices on a capturing stream is an error). A library struct adds ``M``, ``N``, ``K``, ``BIAS``,
-  ``WORKSPACE_BYTES`` and ``PINNED_WITH`` (the cuBLASLt version of each architecture's pin; its doc names the SM count each was pinned on) and ``gemm()``.
+  ``WORKSPACE_BYTES`` and ``PINNED_WITH`` (the cuBLASLt version of each architecture's pin; its doc names the SM count each was pinned on) and ``gemm()``;
+  a ``cublaslt.matmul`` also ``EPILOGUE`` and ``BETA``, and its doc says the formula, the contract each pin was verified to and its canary.
 
 The output is deterministic: the same manifest gives the same bytes. Nothing in it depends on where the manifest was
 written, except the ``include_bytes!`` paths with ``embed=True`` (relative to the generated file). An export is reproducible (a cubin
@@ -81,7 +83,7 @@ from typing import Any, Iterable
 
 from .._build import expected_entry, write_file
 from .._conv import IMPL as CONV_IMPL
-from .._library import IMPLS as LIBRARY_IMPLS
+from .._library import CUBLASLT_IMPLS, IMPL_MATMUL, bias_of
 from .._conv import conv_specs
 from .._library import library_specs, validate_entry as validate_library_entry
 from .._manifest import Manifest
@@ -124,6 +126,7 @@ _IMPLEMENTATION_FIELDS = (
 _LIBRARY_SHARED_FIELDS = (
     "op impl abi buckets dims preconditions dtypes compute_type scale_type transa transb m n k lda ldb ldc ldd epilogue workspace_bytes "
     "heuristic algo_source allow_bf16_reduction allow_f16_reduction allow_f32_reduction sm_count_target"  # (the last six are absent by default: compared as present or not too)
+    " beta"  # (of a cublaslt.matmul: its contract, verification and canary are what the pin of each architecture found)
 ).split()
 # what the entries of a cuDNN convolution on several architectures share (the pin, its cuDNN, the device and the digest are per architecture)
 _CONV_SHARED_FIELDS = (
@@ -615,13 +618,14 @@ def _validate_library_entry(entry: Any) -> None:
             _validate_pointer(who, f"{where} ('{p['name']}')", p)
         _validate_dims(who, entry)
         return
-    if impl not in LIBRARY_IMPLS:
-        _bad(who, f"impl must be one of {sorted([*LIBRARY_IMPLS, CONV_IMPL])}, got {impl!r}")
+    if impl not in CUBLASLT_IMPLS:
+        _bad(who, f"impl must be one of {sorted([*CUBLASLT_IMPLS, CONV_IMPL])}, got {impl!r}")
     for key in ("m", "n", "k", "workspace_bytes", "cublaslt_version", "sm_count"):
         _count(who, key, entry.get(key), 1)
     params = _field(who, "abi.params", _field(who, "abi", entry, "abi", dict), "params", list)
-    if len(params) != (4 if LIBRARY_IMPLS[impl] else 3):
-        _bad(who, f"{impl} has {4 if LIBRARY_IMPLS[impl] else 3} pointers, the ABI lists {len(params)}")
+    want = 3 + bias_of(impl, entry.get("epilogue")) + (impl == IMPL_MATMUL and entry.get("beta") == 1)  # a, b, [bias], [c], out
+    if len(params) != want:
+        _bad(who, f"{impl} has {want} pointers, the ABI lists {len(params)}")
     for i, p in enumerate(params):
         where = f"abi.params[{i}]"
         _name(who, f"{where}.name", p.get("name") if isinstance(p, dict) else None)
@@ -1240,9 +1244,14 @@ def _cublaslt_text(version: int) -> str:
     return f"{version // 10000}.{version // 100 % 100}.{version % 100} ({version})"
 
 
+_CUBLASLT_EPILOGUES = {"none": "DEFAULT", "bias": "BIAS", "relu": "RELU", "relu_bias": "RELU_BIAS"}
+
+
 def _doc_gemm(g: _Gemm) -> "list[str]":
     e = g.entry
-    m, n, k, bias = e["m"], e["n"], e["k"], LIBRARY_IMPLS[e["impl"]]
+    matmul = e["impl"] == IMPL_MATMUL
+    m, n, k, bias = e["m"], e["n"], e["k"], bias_of(e["impl"], e["epilogue"])
+    with_c = matmul and e["beta"] == 1
     lines: "list[str]" = []
     if g.signature:
         lines += [f"`{g.signature}`", ""]
@@ -1252,16 +1261,28 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
     dtype, out_dtype = e["dtypes"]["a"], e["dtypes"]["out"]
     nn = e["transa"] == "N"  # the layouts NN and NT: b is [k, n] and is not transposed
     at = e["transb"] == "T"  # the layouts TT and NT: a is [k, m] and is transposed
+    product = (f"{a}[{k}, {m}]^T @ " if at else f"{a}[{m}, {k}] @ ") + (f"{b}[{k}, {n}]" if nn else f"{b}[{n}, {k}]^T")
     lines.append("")
-    lines += _wrap(
-        f"It computes `{out}[{m}, {n}] = "
-        + (f"{a}[{k}, {m}]^T @ " if at else f"{a}[{m}, {k}] @ ")
-        + (f"{b}[{k}, {n}]" if nn else f"{b}[{n}, {k}]^T")
-        + (f" + {g.arg_names[g.params[2]['name']]}[{n}]" if bias else "")
-        + f"` on {dtype} operands with an f32 accumulator, and rounds to {out_dtype} once"
-        + (" (the bias is added in f32 before the rounding)" if bias else "")
-        + ". Every operand is contiguous and 16-byte aligned."
-    )
+    if matmul:  # the formula of the epilogue on the product (docs/manifest-schema-3.md, section 9.5), with the names of the launch
+        x = product + (f" + {g.arg_names[g.params[2 + bias]['name']]}[{m}, {n}]" if with_c else "")
+        if bias:
+            x = (f"({x})" if with_c else x) + f" + {g.arg_names[g.params[2]['name']]}[{n}]"
+        x = f"relu({x})" if e["epilogue"].startswith("relu") else x
+        v = e["verification"]
+        lines += _wrap(
+            f"It computes `{out}[{m}, {n}] = {x}` on {dtype} operands with an f32 accumulator: cuBLASLt's epilogue `{e['epilogue']}` "
+            f"(`CUBLASLT_EPILOGUE_{_CUBLASLT_EPILOGUES[e['epilogue']]}`{', beta 1' if with_c else ''}) runs on the accumulator, `{v['formula']}`, and "
+            f"the result is rounded to {out_dtype} once. Every operand is contiguous and 16-byte aligned."
+        )
+    else:
+        lines += _wrap(
+            f"It computes `{out}[{m}, {n}] = "
+            + product
+            + (f" + {g.arg_names[g.params[2]['name']]}[{n}]" if bias else "")
+            + f"` on {dtype} operands with an f32 accumulator, and rounds to {out_dtype} once"
+            + (" (the bias is added in f32 before the rounding)" if bias else "")
+            + ". Every operand is contiguous and 16-byte aligned."
+        )
     lines.append("")
     lines.append("Tensors, in the order of `launch`:")
     for p in g.params:
@@ -1313,12 +1334,39 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
             "The declaration allows split-K to add its partial sums in the output (`allow_f32_reduction`), not only in a workspace of the "
             "compute type."
         )
+    if matmul:
+        lines.append("")
+        lines += _wrap(
+            "Its bytes are the library's under the pin; each pin was verified against the formula computed in f32 on its own accumulator and "
+            "rounded once, on seeded operand sets with special values: "
+            + ", ".join(f"{x['arch']}: {_contract_text(x)}" for x in g.entries)
+            + "."
+        )
+        with_canary = [x for x in g.entries if "canary" in x]
+        lines.append("")
+        if with_canary:
+            lines += _wrap(
+                "The load runs the canary export recorded before the pin is used ("
+                + ", ".join(f"{x['arch']}: seed {x['canary']['seed']}, digest `{x['canary']['out_digest']}`" for x in with_canary)
+                + "), and refuses a cuBLASLt build or a device that gives other bytes for the pin."
+                + (f" The entries of {', '.join(x['arch'] for x in g.entries if 'canary' not in x)} have none." if len(with_canary) < len(g.entries) else "")
+            )
+        else:
+            lines += _wrap("The manifest records no canary for it: the load runs none.")
     return lines
+
+
+def _contract_text(entry: "dict[str, Any]") -> str:
+    """What the verification of a ``cublaslt.matmul`` pin found, as its doc says it (the fields were validated as ints and words)."""
+    v = entry["verification"]
+    if entry["contract"] == "measured-exact":
+        return f"measured-exact (all {v['elements']} elements of {v['operand_sets']} operand sets equal)"
+    return f"binary-defined ({v['differ']} of {v['elements']} elements differ, by up to {v['max_ulp']} ULP where both are finite)"
 
 
 def _render_gemm(g: _Gemm) -> str:
     e = g.entry
-    bias = LIBRARY_IMPLS[e["impl"]]
+    bias = bias_of(e["impl"], e["epilogue"])
     tensor_params = [
         f"{g.arg_names[p['name']]}: {'TensorMut' if p['access'] == 'out' else 'TensorRef'}<'a, {RUST_ELEMENTS[p['dtype']]}>" for p in g.params
     ]
@@ -1351,6 +1399,11 @@ def _render_gemm(g: _Gemm) -> str:
     out.append(f"    pub const K: usize = {e['k']};\n")
     out.append("    /// Whether the GEMM adds a bias.\n")
     out.append(f"    pub const BIAS: bool = {'true' if bias else 'false'};\n")
+    if e["impl"] == IMPL_MATMUL:  # (a GEMM of cublaslt.gemm or gemm_bias has the launcher of tilefish 0.0.11)
+        out.append("    /// The cuBLASLt epilogue on the accumulator (`tilefish::GemmEpilogue`: `none`, `bias`, `relu` or `relu_bias`).\n")
+        out.append(f"    pub const EPILOGUE: &'static str = {_rs_str(e['epilogue'])};\n")
+        out.append("    /// `beta`: 1 when `launch` takes `c` (the epilogue acts on the accumulator plus `c`), 0 otherwise.\n")
+        out.append(f"    pub const BETA: u32 = {_count(f'{g.stem!r}', 'beta', e['beta'], 0)};\n")
     out.append("    /// The workspace the algorithm was pinned under: the size of the workspace to give `launch`, in bytes.\n")
     out.append(f"    pub const WORKSPACE_BYTES: usize = {e['workspace_bytes']};\n")
     pins = ", ".join(f"({_rs_str(x['arch'])}, {x['cublaslt_version']})" for x in g.entries)

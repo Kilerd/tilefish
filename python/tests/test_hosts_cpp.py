@@ -314,6 +314,35 @@ def test_pinned_gemms(tmp_path):
     assert "the host allocates it)" in source and "alloc_workspace" not in source
 
 
+def test_pinned_gemms_with_an_epilogue(tmp_path):
+    from test_rust_host_schema3 import matmul_library, matmul_ops
+
+    ops = matmul_ops()
+    source = cpp.render(schema3(tmp_path / "m", (), matmul_library(ops)), ops=list(ops.values()))
+    body = class_body(source, "UpM32")
+    assert 'static constexpr const char* EPILOGUE = "relu_bias";' in body and "static constexpr uint32_t BETA = 1;" in body
+    assert "static constexpr bool BIAS = true;" in body and "static constexpr std::array<const char*, 2> C_SHAPE = {{\"M\", \"512\"}};" in body
+    assert launch_params(body).endswith(
+        "const tilefish::TensorRef<tilefish::Bf16>& bias,\n        const tilefish::TensorRef<tilefish::Bf16>& c,\n"
+        "        const tilefish::TensorMut<tilefish::Bf16>& out,\n        const tilefish::TensorMut<tilefish::U8>& workspace"
+    )
+    assert "gemm_.launch(stream, {a, b, bias, c, out, workspace});" in body and "gemm_.check({a, b, bias, c, out, workspace});" in body
+    res = class_body(source, "ResM32")
+    assert "gemm_.launch(stream, {a, b, c, out, workspace});" in res and 'EPILOGUE = "none";' in res and "BIAS = false;" in res
+    act = class_body(source, "ActM64")
+    assert "gemm_.launch(stream, {a, b, out, workspace});" in act and "static constexpr uint32_t BETA = 0;" in act
+    # the docs are the Rust emitter's: the formula, the contract of each architecture's pin and the canary
+    text = " ".join(line.strip().removeprefix("///").strip() for line in source.splitlines())
+    assert "It computes `out[32, 512] = relu((a[32, 256] @ b[512, 256]^T + c[32, 512]) + bias[512])`" in text
+    assert "sm_90: binary-defined (64 of 32768 elements differ" in text and "The entries of sm_90 have none." in text
+    # a GEMM of section 9 has the class it had: no EPILOGUE, no BETA
+    from test_library_ops import gemm
+    from test_rust_host_schema3 import pins
+
+    plain = cpp.render(schema3(tmp_path / "g", (), pins(gemm)), ops=[gemm])
+    assert "EPILOGUE" not in plain and "BETA" not in plain
+
+
 def test_pinned_convolutions(tmp_path):
     from test_library_conv import built, conv, nchw_down, nhwc_k7
 
@@ -446,6 +475,10 @@ def test_the_headers_compile_against_tilefish_hpp(tmp_path, fake_manifest):
     convs = [conv("k7", layout="NHWC", padding=6)(nhwc_k7)]
     write_manifest([], tmp_path / "c" / "manifest.json", cubins=True, library=[b for op in convs for b in built(op)])
     headers["conv.hpp"] = lambda p: cpp.emit(pinned(Manifest.load(tmp_path / "c")), p, namespace="convs")
+    from test_rust_host_schema3 import matmul_library, matmul_ops
+
+    matmuls = matmul_ops()
+    headers["matmul.hpp"] = lambda p: cpp.emit(schema3(tmp_path / "mm", (), matmul_library(matmuls)), p, ops=list(matmuls.values()), namespace="matmul")
     for name, make in headers.items():
         make(out / name)
     main = out / "all.cpp"

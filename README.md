@@ -674,6 +674,28 @@ context of the process's first cuBLASLt handle. `sm_count_target=P` pins the alg
 (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`, which every check and run sets too), the same in any context; the entry records it, and a Rust host on a
 partition of `P` SMs takes only pins chosen for it with `Manifest::with_sm_partition(Some(P))` (`docs/manifest-schema-3.md`, section 9.3).
 
+**A GEMM with a cuBLASLt epilogue.** `impl="cublaslt.matmul"` (RFC 0003, milestone E2) runs a bias, ReLU and a residual add (`beta * C`) on the f32
+accumulator, before the one rounding, with the algorithm pinned for the epilogue:
+
+```python
+# out = relu((acc + c) + bias), rounded once to bf16: the library adds c before the bias
+@tilefish.library("up", acc=f32, impl="cublaslt.matmul", epilogue="relu_bias", beta=1)
+def up(a: Tensor[M, H, bf16], b: Tensor[F, H, bf16], bias: Tensor[F, bf16], c: Tensor[M, F, bf16]) -> Tensor[M, F, bf16]: ...
+```
+
+`epilogue` is `"none"`, `"bias"`, `"relu"` or `"relu_bias"` (cuBLASLt's `DEFAULT`, `BIAS`, `RELU`, `RELU_BIAS`), `beta=1` adds `c [M, N]`; the operands
+are bf16 or f16 and the result their type, in any of the four layouts, with `heuristic`, `workspace_bytes`, the opt-ins and `sm_count_target` as above
+(`algos=` is not taken yet). The bytes are the library's under the pin, so **every pin is verified when it is made** (`jit` and `export`): run on two
+seeded operand sets with special values in the bias and `c` and rows of `a` that make NaN, zero, infinite and overflowing accumulators, and compared bit for bit with the formula computed in f32 on the
+pin's own accumulator (its configuration re-encoded with an f32 result) and rounded once. The entry records `"measured-exact"` or `"binary-defined"`
+with the count of elements that differ and their largest distance; `contract="measured-exact"` refuses a pin that is not. Measured on a B300 MIG slice
+(14 shapes, bf16 and f16, both postures, seven cases: 392 pins per version, `test_gpu_matmul.py`): every pin is measured-exact with cuBLASLt 12.8.4; with
+13.1.0, 372 are, and the 20 others are algorithm 21 at 32 x 1024 x 3072, which adds a bias to `c` in neither order (26% of the elements differ) and
+whose ReLU gives `0` for a NaN where the others keep it. An epilogue gets no split-K without the opt-in, as a bias does. `export` records a canary
+(`canary=True`, the default): the pin run on operands made of a seed on the device and the digest of its result, which a replay (Python) and a load
+(the Rust and C++ hosts) run before the pin is used, refusing another digest: two builds of one cuBLASLt version are told apart. See
+`docs/manifest-schema-3.md`, section 9.5.
+
 **A pinned cuDNN convolution.** `impl="cudnn.conv_fwd"` declares a forward convolution by its signature, `(x, w) -> y` in the order of `layout`
 (`"NCHW"`, the default: `x [N, C, *S]`, `w [K, C/G, *R]`; `"NHWC"`: `x [N, *S, C]`, `w [K, *R, C/G]`) with one to three spatial axes, f16, bf16 or f32
 data, an f32 accumulator and one rounding, and pins what cuDNN runs for every bucket:
@@ -973,7 +995,8 @@ boundary of the regions (it gets a buffer of the plan, which `taps=` reads); it 
 `order=` joined to a region, a store into an `InOut` or carried tensor made by a region (it is a copy step), a dense reshape inside a region, a strided store,
 `tilefish.fused(name=...)` scopes, `intermediates="f32"`, and modes that are not exact (`docs/rfcs/0001-plan-fusion.md`, section 11).
 Fusion into a GEMM or a convolution, epilogues and prologues, is designed in RFC 0003 (`docs/rfcs/0003-epilogue-fusion.md`: the three numerics
-contracts it keeps apart, the routes, and the experiments behind them); its first milestone, epilogue hooks on externs, is below.
+contracts it keeps apart, the routes, and the experiments behind them); its first milestones, epilogue hooks on externs (E1) and cuBLASLt epilogues
+(E2), are below. Nothing changes bytes without a declaration: `epilogues="exact"` is the default.
 
 ### Epilogue hooks: the arithmetic after an extern's GEMM, in its kernel
 
@@ -1018,6 +1041,52 @@ def up(x: Tensor[T, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16]):
   hook (in its declaration digest), and a fused pair is a generated entry of its own, `<extern>_epi_<hash>`, its identity the IR it compiles to.
   `python/examples/epilogue_gemm.py` has a Triton GEMM (`tcgen05.mma` on sm_100/103, `mma.sync` on sm_120, both asserted in the SASS), its
   dual-accumulator form, a Gluon `tcgen05` GEMM and a 1-D convolution as an implicit GEMM, each with both hooks.
+
+### cuBLASLt epilogues: the arithmetic after a cuBLASLt GEMM, in the library
+
+`tilefish.fusion(epilogues="library")` (RFC 0003, milestone E2) declares that the arithmetic after a `cublaslt.gemm` (or `gemm_bias`) of a 16-bit result may run as one of its epilogues, on the accumulator:
+
+```python
+@tilefish.graph(fusion=tilefish.fusion(epilogues="library"))
+def block(x: Tensor[M, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16], r: Tensor[M, F, bf16]):
+    h = (proj(x, w).to(f32) + r.to(f32)) + bias.to(f32)                # c before the bias: the library's order
+    return tilefish.where(h <= 0.0, 0.0, h).to(bf16)                   # ReLU with torch.relu's bits: one step, cublaslt.matmul
+```
+
+The pattern is `y.to(f32)`, then `+ c.to(f32)` (`[M, N]`), then `+ bias.to(f32)` (`[N]`), then `tilefish.where(h <= 0.0, 0.0, h)`, then `.to()` the GEMM's
+type, each step optional but one, every value read by the next step alone and `c` and the bias made before the GEMM. It becomes one step of a
+`cublaslt.matmul` declared `contract="measured-exact"`: the rounding of `y` is removed (contract (ii)), and every pin is verified equal to the region's
+arithmetic on the accumulator, or the build is refused (`tilefish.barrier(y)` keeps the GEMM unfused). The pin is chosen for the epilogue, so its
+accumulator is the GEMM's where the two pins compute the same sum (X1 found them the same on every shape but where 13.1.0 splits `k`); then a ReLU
+alone writes the unfused plan's bytes (it commutes with the rounding), as the tests measured, but nothing checks that per pin. Another order (`(y + bias) + c` rounds otherwise in f32), an f32 bias or a value read elsewhere
+is left as it is, and the fusion report (`library_epilogues`) says why; in an exact graph it lists what the mode would do, and the advisor reports such a
+region as an action (`epilogue-library-cublaslt`). Measured on a B300 MIG slice (sm_103, cuBLASLt 12.8.4, CUDA graphs of 20 replays), the exact plan
+(the pinned GEMM and a region) against the rewritten one, in microseconds:
+
+| shape `M x N x K` | bias | bias + ReLU | residual | residual + bias |
+|---|---|---|---|---|
+| 640 x 4096 x 1024, bf16 | 24.8 → 20.6 (-17%) | 24.8 → 22.2 (-10%) | 24.9 → 22.6 (-9%) | 26.8 → 24.7 (-8%) |
+| 640 x 1024 x 4096, bf16 | 18.5 → 16.5 (-11%) | 18.5 → 16.6 (-11%) | 18.6 → 16.6 (-11%) | 18.6 → 18.5 (-0%) |
+| 2048 x 3072 x 1024, bf16 | 54.5 → 41.1 (-25%) | 55.3 → 43.1 (-22%) | 61.8 → 46.5 (-25%) | 65.8 → 49.3 (-25%) |
+| 128 x 3072 x 1024, bf16 | 8.3 → 6.3 (-24%) | 8.3 → 6.3 (-24%) | 8.3 → 6.3 (-24%) | 8.3 → 6.3 (-24%) |
+| 8192 x 3072 x 768, f16 | 192.7 → 124.7 (-35%) | 192.5 → 135.7 (-30%) | 208.0 → 136.3 (-34%) | 215.9 → 147.0 (-32%) |
+
+The bytes differ from the exact plan's on 14 to 29% of the elements (one rounding fewer). GELU (binary-defined), cuDNN fused graphs and generated
+GEMMs come later.
+
+**One graph, several modes.** `epilogues=` is `"exact"` (the default), `"accumulator"` or `"library"`, per graph or per `tilefish.fused` scope (the
+innermost wins for the ops traced in it; never per call). `"library"` keeps the exact hooks of externs and adds the cuBLASLt rewrite; `"accumulator"`
+applies `R_acc` to the externs with a `value="acc"` hook and leaves a cuBLASLt GEMM as it is (`R_acc` of a library call is not planned: the GEMM keeps
+its rounding, and the fusion report's `library_epilogues` says so). A cuBLASLt pattern is rewritten only where all its ops are in a `"library"` mode. A
+graph that wants both declares one and scopes the other:
+
+```python
+@tilefish.graph(fusion=tilefish.fusion(epilogues="library"))            # the cuBLASLt GEMM's bias: one cublaslt.matmul
+def layer(x: Tensor[M, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16], w2: Tensor[N, F, bf16], b2: Tensor[N, bf16]):
+    h = (proj(x, w).to(f32) + bias.to(f32)).to(bf16)
+    with tilefish.fused(epilogues="accumulator"):                         # the extern's GELU on its accumulator (contract (ii))
+        return tilefish.gelu(gemm(h, w2).to(f32) + b2.to(f32)).to(bf16)
+```
 
 ## SASS: explained and asserted
 
