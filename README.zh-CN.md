@@ -144,6 +144,7 @@ run.launch(stream, {{"x", xt}, {"out0", yt}}, {{"n", 64}});
 | 作为 extern（外部 kernel）的 CuTe DSL kernel | [`docs/zh-CN/cute.md`](docs/zh-CN/cute.md) |
 | 下沉生成的 kernel：掩码、索引、`argmax`、gather 与 scatter、整数类型转换、IEEE 数学函数、有序求和、广播、`contiguous`、`im2col`、`col2im1d` | [`docs/zh-CN/guide/lowering.md`](docs/zh-CN/guide/lowering.md) |
 | launch plan：同一个 arena、CUDA graph（CUDA 图）、copy 和 memset 步骤、只绑定一次的权重、plan set（plan 集）、shared arena（共享内存池）、carried buffer（携带缓冲区）、调试 tap（观测点） | [`docs/zh-CN/guide/plans.md`](docs/zh-CN/guide/plans.md) |
+| 锁定导出（locked export）：在一块 GPU 上生成一次 lock（锁定表），然后在一台没有 GPU 的机器（CI、镜像构建）上导出同样的文件 | [`docs/zh-CN/guide/locked-export.md`](docs/zh-CN/guide/locked-export.md) |
 | graph 函数体中算术运算的融合、extern 上的 epilogue hook（钩子）、cuBLASLt epilogue | [`docs/zh-CN/guide/fusion.md`](docs/zh-CN/guide/fusion.md) |
 | 舍入点、精确（exact）重写与改变数值语义的重写、`num_warps` 与 FMA 收缩 | [`docs/zh-CN/guide/rewrites.md`](docs/zh-CN/guide/rewrites.md) |
 | CUDA 数学函数防护，以及 CUDA 或 torch 变更后需要重新检查的内容 | [`docs/zh-CN/numerics.md`](docs/zh-CN/numerics.md) |

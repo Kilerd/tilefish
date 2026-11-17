@@ -79,6 +79,7 @@ plugins:
             Operators: 算子
             Lowered kernels: 下沉生成的 kernel
             Launch plans: 启动计划
+            Locked exports: 锁定导出
             Fusion: 融合
             Rewrites: 感知舍入的重写
             SASS: SASS
@@ -106,6 +107,7 @@ nav:
       - Operators: guide/operators.md
       - Lowered kernels: guide/lowering.md
       - Launch plans: guide/plans.md
+      - Locked exports: guide/locked-export.md
       - Fusion: guide/fusion.md
       - Rewrites: guide/rewrites.md
       - SASS: guide/sass.md

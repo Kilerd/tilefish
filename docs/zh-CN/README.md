@@ -14,6 +14,7 @@
 * [`guide/operators.md`](guide/operators.md)：视图、设备标量、预构建的二进制文件和已 pin 的库调用：带步长的视图与共享的步长，起始地址不在 16 字节边界上的视图，设备标量，只有 `Out` 张量才有的维度，预构建的 PTX 和 cubin，空指针与 64 位维度标量，Gluon kernel（核函数），每个架构一个实现，TMA 描述符，warp（线程束）特化的 kernel，启动形状，已 pin 的 cuBLASLt GEMM（通用矩阵乘；f16、关闭 TF32 的 f32、四种布局、SM（流式多处理器）分区、cuBLASLt epilogue（尾部）），已 pin 的 cuDNN 卷积，以及 CuTe DSL kernel。
 * [`guide/lowering.md`](guide/lowering.md)：下沉（lowering）生成的 `@kernel` 中的掩码、索引、gather 和复制，以及它们的数值语义：比较与 select，`iota`，`argmax`，`gather_rows` 与 `scatter_rows`，整数类型转换，IEEE 数学函数，复现一个 CUDA kernel 所需的原语，CUDA 数学函数防护，有序求和，广播，`contiguous`，`im2col`、`im2col1d` 和 `col2im1d`。
 * [`guide/plans.md`](guide/plans.md)：launch plan（启动计划）：graph（计算图）作为基于同一个 arena（内存池）的一份静态启动列表，CUDA graph（CUDA 图），写在自身输入之上的 `Out`，copy 和 memset 步骤，返回的视图，具名的输出、输入和权重，plan set（plan 集），一个 plan set 中各个 plan（计划）共享的 arena，carried buffer（携带缓冲区），调试 tap（观测点），以及单独运行一个步骤。
+* [`guide/locked-export.md`](guide/locked-export.md)：锁定导出（locked export）：在目标设备的一块 GPU 上生成一次的 lock（锁定表）文件，以及在一台没有 GPU 的机器（CI、镜像构建）上按它进行、逐字节一致地写出同样文件的导出；设备提供了什么、lock 的格式、什么在哪里检查。
 * [`guide/fusion.md`](guide/fusion.md)：graph 函数体中算术运算的融合、它的几种模式、extern（外部 kernel）上的 epilogue hook（钩子），以及 cuBLASLt epilogue。
 * [`guide/rewrites.md`](guide/rewrites.md)：感知舍入的重写：精确（exact）规则与改变数值语义的规则，`num_warps` 与 FMA（乘加融合）收缩（contraction）。
 * [`guide/sass.md`](guide/sass.md)：SASS 的解释与断言：trace（追踪记录）、`tilefish-explain`、SASS 断言，以及 advisor（建议器）和 probe（探针）的简介。

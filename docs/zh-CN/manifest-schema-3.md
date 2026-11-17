@@ -89,6 +89,8 @@ sha256( b"tilefish.manifest-digest.v3\0" + canonical_json({"schema": 3, "kernels
 
 由 0.0.6 或更早版本导出的 manifest 仍然带有其构建目录的名称；它的加载、pin 和 replay（回放）都与以前完全一样。预构建二进制文件（第 8 节）按原样接受：带 `.file` 指令的 PTX 或在别处构建的 cubin 保留其原有的任何路径。
 
+**锁定导出（locked export；未发布）。** `tilefish.runtime.export(..., lock=path)` 在一台没有 GPU 的机器上逐字节一致地写出这个文档：由设备决定的字段（每个库条目的 `algo` 或 `pin`、`cublaslt_version` 或 `cudnn_version`、`sm_count`，`cublaslt.matmul` 的 `contract` 和 `verification`，每个 `canary`）取自 `tilefish.runtime.write_lock` 根据设备上的一次导出生成的 lock（锁定表）文件，并且每个文件都与 lock 记录的 sha256 对照（`docs/zh-CN/guide/locked-export.md`）。schema 中没有为它设的字段：读取方无法、也无需分辨是哪台机器写出了一个 manifest。
+
 **manifest 旁边的 trace（追踪记录）（tilefish 0.0.9）。** 使用 `trace=True`（或 `TILEFISH_TRACE=1`）的导出还会在 manifest 所在目录中写入 `trace/`：每个二进制文件的每一层，供 `tilefish-explain` 使用（`docs/zh-CN/explain.md`）。manifest 中没有任何字段提到它，也没有 digest 覆盖它，因此不论有没有它，manifest、其 digest 和每个 pin 都相同；两个读取器都不查看它（读取器读取 `manifest.json` 及其提到的 cubin，不读该目录的其他内容）。它包含源码（kernel 的文件、生成的源码、Triton 的源码）：它不属于交付的内容，为 host 打包导出的工具会把它排除在外。
 
 ## 4. kernel 条目
