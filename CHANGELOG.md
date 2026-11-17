@@ -24,7 +24,7 @@ body widens a cuBLASLt GEMM's result).
   call is not planned, and the fusion report's `library_epilogues` entry of every such GEMM whose result is widened there says so (`"mode":
   "accumulator"` and a `note`).
 - `"library"`: the extern hooks of `"exact"`, and the cuBLASLt rewrite below. A pattern is rewritten only where all its ops (from `y.to(f32)` to the
-  last `.to()`) are in a `"library"` mode; otherwise the report lists it as matched but not applied, with the modes it is in.
+  last `.to()`, and the widenings of `c` and the bias) are in a `"library"` mode; otherwise the report lists it as matched but not applied, with the modes it is in.
 
 ### Epilogue hooks on externs (`docs/rfcs/0003-epilogue-fusion.md`, milestone E1)
 

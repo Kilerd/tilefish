@@ -151,3 +151,32 @@ def test_the_modes_are_three_in_the_graph_and_in_a_scope():
                 return x
 
         tilefish.plan(bad_scope)
+
+
+def test_a_pattern_that_reads_a_widening_of_another_mode_is_left_to_that_mode():
+    """The widenings of ``c`` and the bias are ops of the pattern: a residual widened in an ``"accumulator"`` scope (the f32 result of an extern, by
+    ``R_acc``) is not read as a rounded ``c`` by a rewrite of the graph's ``"library"`` mode; the GEMM stays, and ``R_acc`` is the widening's."""
+
+    def body(x, w1, b1, w2, b2):
+        r = GEMM(x, w1)
+        with tilefish.fused(epilogues="accumulator"):
+            r32 = r.to(f32)
+        return (up(x, w1).to(f32) + r32).to(bf16)
+
+    g = graph(body, "library", "modes_residual_acc")
+    f = _fusion.fused(g)
+    assert not any("__" in e for e in entries(g)), entries(g)
+    (w,) = library_epilogues(g)
+    assert (w["matched"], w["applied"], w["mode"]) == (True, False, "accumulator/library")
+    assert [r["kind"] for r in f.rewrites if r.get("applied", True)] == ["accumulator"]
+
+
+def test_an_unmatched_gemm_widened_in_an_accumulator_scope_has_the_note_on_either_path_of_the_report():
+    def body(x, w1, b1, w2, b2):
+        with tilefish.fused(epilogues="accumulator"):
+            a = (up(x, w1).to(f32) * 2.0).to(bf16)  # no epilogue of the library, widened in an "accumulator" scope
+        return (a.to(f32) + b1.to(f32)).to(bf16)  # the graph's mode (in a "library" graph, the rewrite's pass runs)
+
+    for mode in ("exact", "library"):
+        (w,) = library_epilogues(graph(body, mode, f"modes_note_{mode}"))
+        assert (w["matched"], w["mode"]) == (False, "accumulator") and "R_acc of a cuBLASLt GEMM is not planned" in w["note"], (mode, w)

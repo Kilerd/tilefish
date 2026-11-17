@@ -206,7 +206,8 @@ def fused_scope(*, epilogues: "str | None" = None) -> Any:
     graph's (``docs/rfcs/0003-epilogue-fusion.md``, Q3: a mode is declared per graph or per scope, never per call). ``epilogues`` is a value of
     ``tilefish.fusion(epilogues=...)``: a widening ``y.to(f32)`` of an extern's result written in an ``"accumulator"`` scope is ``R_acc``'s, in an
     ``"exact"`` or ``"library"`` scope it is not, whatever the graph declares; the arithmetic after a cuBLASLt GEMM is rewritten into one of its
-    epilogues where every op of the pattern (from ``y.to(f32)`` to the last ``.to()``) is in a ``"library"`` mode. Scopes nest (the innermost's
+    epilogues where every op of the pattern (from ``y.to(f32)`` to the last ``.to()``, the widenings of ``c`` and the bias included) is in a
+    ``"library"`` mode. Scopes nest (the innermost's
     settings win). A kernel body has no scope."""
     from .trace import current_context, scope
 
@@ -606,6 +607,8 @@ class _Pass:
             if pi in removed:  # pragma: no cover - a product has one use
                 continue
             removed.add(pi)
+            for m in new_nodes:  # in the op's tilefish.fused scope, as the ops _opmath makes
+                m.scope = n.scope
             replaced[k] = new_nodes
             self.rewrites.append({"kind": "mul-add", "node": origin[k], "product": origin[pi]})
         out_nodes: "list[Node]" = []
@@ -639,10 +642,15 @@ class _Pass:
                 continue
             found = match_library_epilogue(nodes, k, uses, escapes | barriered, producer)
             if isinstance(found, str):
-                self.rewrites.append({"kind": "library-epilogue", "node": origin[k], "call": n.callee.name, "matched": False, "applied": False, "reason": found})
+                self.rewrites.append({
+                    "kind": "library-epilogue", "node": origin[k], "call": n.callee.name, "matched": False, "applied": False, "reason": found,
+                    **_accumulator_note(nodes, k, uses, self.settings),
+                })  # fmt: skip
                 continue
             chain, epilogue, beta, bias, c, z = found
-            modes = sorted({epilogue_mode(nodes[j], self.settings) for j in chain})
+            # the pattern's ops: the chain and the widenings of c and the bias it reads (a widening in an "accumulator" scope is R_acc's)
+            ops = set(chain) | {producer[i] for j in chain for i in nodes[j].inputs if isinstance(i, Value) and i in producer and _is_widening(nodes[producer[i]])}
+            modes = sorted({epilogue_mode(nodes[j], self.settings) for j in ops})
             if modes != ["library"]:  # (a tilefish.fused scope: the pattern's ops are not all in a "library" mode, so none is rewritten)
                 self.rewrites.append({
                     "kind": "library-epilogue", "node": origin[k], "call": n.callee.name, "matched": True, "applied": False, "epilogue": epilogue,
@@ -1684,6 +1692,15 @@ _ACC_LEAVES_LIBRARY = (
 )
 
 
+def _accumulator_note(nodes: "Sequence[Node]", k: int, uses: "Mapping[Value, list[int]]", settings: "Fusion | None") -> "dict[str, Any]":
+    """``{"mode": "accumulator", "note": ...}`` when the result of the cuBLASLt GEMM ``nodes[k]`` is widened in an ``"accumulator"`` mode (which leaves
+    a library call as it is), else ``{}``: what a ``library_epilogues`` entry says of it on either path of the report."""
+    if settings is None:
+        return {}
+    widenings = [j for j in uses.get(nodes[k].outputs[0], []) if _is_widening(nodes[j])]
+    return {"mode": "accumulator", "note": _ACC_LEAVES_LIBRARY} if any(epilogue_mode(nodes[j], settings) == "accumulator" for j in widenings) else {}
+
+
 def library_epilogue_candidates(graph: Graph, settings: "Fusion | None" = None) -> "list[dict[str, Any]]":
     """What ``epilogues="library"`` would do with the cuBLASLt GEMMs of a graph planned without it (the fusion report's ``library_epilogues``, which
     the advisor reads): each call whose result the graph widens to f32, with the epilogue it would become (``"applied": False``) or why it would not
@@ -1705,8 +1722,7 @@ def library_epilogue_candidates(graph: Graph, settings: "Fusion | None" = None) 
         widenings = [j for j in uses.get(n.outputs[0], []) if _is_widening(nodes[j])]
         if not widenings:
             continue
-        mode = {"mode": "accumulator", "note": _ACC_LEAVES_LIBRARY} if settings is not None and any(
-            epilogue_mode(nodes[j], settings) == "accumulator" for j in widenings) else {}  # fmt: skip
+        mode = _accumulator_note(nodes, k, uses, settings)
         found = match_library_epilogue(nodes, k, uses, kept, producer)
         if isinstance(found, str):
             out.append({"kind": "library-epilogue", "node": k, "call": n.callee.name, "matched": False, "applied": False, "reason": found, **mode})

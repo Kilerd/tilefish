@@ -239,8 +239,9 @@ graph's for the ops traced in it (Q3):
   cuBLASLt epilogue declares one and scopes the other, e.g. `epilogues="library"` on the graph and `with tilefish.fused(epilogues="accumulator"):`
   around the extern's arithmetic.
 * **Scopes and the library rewrite.** E2 read the graph's mode only. Merged, a cuBLASLt pattern is rewritten where every op of it (from `y.to(f32)` to
-  the last `.to()`) is in a `"library"` mode; a pattern whose ops are in other modes is listed in the report as matched and not applied, with the
-  modes. The rewrite runs first, on the graph's own arithmetic, then `opmath`, `mul-add` and `R_acc`, as both lanes ordered them; the
+  the last `.to()`, and the widenings of `c` and the bias) is in a `"library"` mode (a widening of an extern's result in an `"accumulator"` scope
+  is `R_acc`'s, so a pattern that reads it is left to it); a pattern whose ops are in other modes is listed in the report as matched and not
+  applied, with the modes. The rewrite runs first, on the graph's own arithmetic, then `opmath`, `mul-add` and `R_acc`, as both lanes ordered them; the
   `cublaslt.matmul` call keeps the GEMM's scope and location.
 * **Names and digests.** `epilogues` is in no region's canonical settings in either lane, so a region the mode leaves is the same operator in every mode;
   the fusion report's `fusion` says the mode when it is not `"exact"`. The advisor's blockers are both lanes': `epilogue-hook-consumer` (E1, phase
