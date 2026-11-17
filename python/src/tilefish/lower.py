@@ -616,7 +616,7 @@ warp count. ``num_warps`` is part of every kernel's identity all the same: recor
 spec, the manifest entry (a replay refuses an entry whose ``num_warps`` is not the spec's) and the manifest digest. A binary of another warp
 count is other machine code, and one rule for every kernel is checked mechanically where a per-kernel argument would not be. For a kernel with a
 Triton reduction it is also its numerics: the same kernel with another warp count differs in the last bits, like a changed reduction order or
-accumulator dtype (a numerics-changing rewrite in the README's terms). Pin it (``@tilefish.kernel(num_warps=N)``) where bytes must not move when a
+accumulator dtype (a numerics-changing rewrite, ``docs/guide/rewrites.md``). Pin it (``@tilefish.kernel(num_warps=N)``) where bytes must not move when a
 size is added to a bucketed dimension, and treat a change of it, or of the rule that picks it (``clamp(BLOCK_D // 256, 1, 16)``), as a change of
 the numerics contract; or give every reduction an ``order``, and the warp count is a choice of speed only.
 

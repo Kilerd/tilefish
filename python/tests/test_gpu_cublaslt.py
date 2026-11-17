@@ -706,7 +706,7 @@ def special(x, kind, seed):
 
 @pytest.mark.parametrize("with_bias", [False, True])
 def test_the_torch_posture_pins_what_torch_runs(with_bias):
-    """The README's claim: under ``heuristic="torch"`` (with torch's default reduction) the pinned result is ``torch.addmm(bias, a, b.t())``
+    """The claim of ``docs/guide/operators.md``: under ``heuristic="torch"`` (with torch's default reduction) the pinned result is ``torch.addmm(bias, a, b.t())``
     (``torch.mm(a, b.t())`` without a bias) byte for byte. ``addmm`` asks cuBLASLt's heuristic as this posture does; ``mm`` runs
     ``cublasGemmEx``, whose choice the posture reproduces with torch's cuBLAS workspace. Measured, on the shapes of a transformer's
     projections and of a split-K; the 3 operand sets of each are normal values, values of every exponent, and exact powers of two with

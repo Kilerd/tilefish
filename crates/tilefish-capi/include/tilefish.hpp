@@ -3,7 +3,7 @@
 // Licensed under either of Apache License, Version 2.0 or MIT license at your option.
 //
 // RAII handles that own one C handle each (move-only; share one with std::shared_ptr), typed tensors, and tilefish::Error, which every call
-// that fails throws. A program built without exceptions uses tilefish.h. See docs/rfcs/0002-cpp-host.md and the README's "The C++ host".
+// that fails throws. A program built without exceptions uses tilefish.h. See docs/rfcs/0002-cpp-host.md and docs/guide/cpp.md.
 //
 //     auto ctx = tilefish::Context::primary(0);
 //     auto manifest = tilefish::Manifest::load("build/", "<the manifest's digest>");
