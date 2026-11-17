@@ -134,7 +134,7 @@ served to a build without it; any other value of the variable is refused.
 A manifest exported by 0.0.6 or earlier still names the directories of its build; it loads, pins and replays exactly as before. A prebuilt binary
 (section 8) is taken as it is: a PTX with `.file` directives or a cubin built elsewhere keeps whatever paths it has.
 
-**A locked export (unreleased).** `tilefish.runtime.export(..., lock=path)` writes this document, byte for byte, on a machine without a GPU: the fields
+**A locked export (tilefish 0.0.14).** `tilefish.runtime.export(..., lock=path)` writes this document, byte for byte, on a machine without a GPU: the fields
 a device determines (each library entry's `algo` or `pin`, `cublaslt_version` or `cudnn_version`, `sm_count`, a `cublaslt.matmul`'s `contract` and
 `verification`, every `canary`) come from a lock file that `tilefish.runtime.write_lock` made of an export on the device, and every file is held to the
 sha256 the lock records (`docs/en/guide/locked-export.md`). The schema has no field for it: a reader cannot tell, and need not, which machine wrote a manifest.

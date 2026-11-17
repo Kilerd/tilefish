@@ -4,7 +4,7 @@
 
 一门面向 GPU 推理的类型化张量语言。每个张量的形状、dtype、布局和量化格式都写在它的类型里，算子来自一个类型化的算子库，一个模型只需构建一次，得到 GPU 二进制文件和一份 manifest（清单）。轻量的 Python、C++ 和 Rust host（宿主）由同一套签名生成。
 
-**状态：早期预览（PyPI 上为 0.0.13，crates.io 上为 0.0.11；C++ host 从本仓库构建）。** tilefish 为这些 GPU kernel（核函数）赋予类型：用 Triton、Gluon、CuTe DSL 或 PTX 编写的 kernel，已 pin（固定）的 cuBLASLt 和 cuDNN 调用，以及它自己下沉（lowering）生成的 kernel。它把一个模型的 graph（计算图）构建成基于同一个 arena（内存池）的 launch plan（启动计划），并在 Python、Rust 和 C++ 中运行同一份已 pin 的产物。tilefish 是什么、不是什么，以及今后如何添加功能，见 [`docs/zh-CN/scope.md`](docs/zh-CN/scope.md)；其他文档列在 [`docs/zh-CN/README.md`](docs/zh-CN/README.md) 中。
+**状态：早期预览（PyPI 上为 0.0.14，crates.io 上为 0.0.11；C++ host 从本仓库构建）。** tilefish 为这些 GPU kernel（核函数）赋予类型：用 Triton、Gluon、CuTe DSL 或 PTX 编写的 kernel，已 pin（固定）的 cuBLASLt 和 cuDNN 调用，以及它自己下沉（lowering）生成的 kernel。它把一个模型的 graph（计算图）构建成基于同一个 arena（内存池）的 launch plan（启动计划），并在 Python、Rust 和 C++ 中运行同一份已 pin 的产物。tilefish 是什么、不是什么，以及今后如何添加功能，见 [`docs/zh-CN/scope.md`](docs/zh-CN/scope.md)；其他文档列在 [`docs/zh-CN/README.md`](docs/zh-CN/README.md) 中。
 
 ## 为什么
 
@@ -167,7 +167,7 @@ run.launch(stream, {{"x", xt}, {"out0", yt}}, {{"n", 64}});
 
 | 包 | 版本 | 来源 |
 |---|---|---|
-| `tilefish`（Python） | 0.0.13 | PyPI |
+| `tilefish`（Python） | 0.0.14 | PyPI |
 | `tilefish`（Rust host） | 0.0.11 | crates.io |
 | `tilefish-capi`（C ABI 1.1，`tilefish.h` 和 `tilefish.hpp`） | 0.0.2 | 本仓库 |
 

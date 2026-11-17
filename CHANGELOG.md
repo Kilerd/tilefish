@@ -5,7 +5,12 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/en/manifest-schema-3.md` and `docs/en/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## Unreleased
+## tilefish 0.0.14 (2026-11-17)
+
+A Python release, for a model migration whose CI and image builds have no GPU (`docs/en/scope.md`): locked exports. The crates are unchanged, so
+the `tilefish` crate stays 0.0.11 and `tilefish-capi` 0.0.2 (ABI 1.1). Manifest schema 3, plan schema 1 and every digest are unchanged: a 0.0.14
+export of 0.0.13's operators has the manifest, plan and set digests of 0.0.13 and the same cubins (its `manifest.json` and plan files name the
+version that wrote them, as every release's do).
 
 ### Locked exports: an export without a GPU (`docs/en/guide/locked-export.md`)
 
