@@ -1,5 +1,7 @@
 # Plan schema 1 (`plan.json`, `"tilefish.plan.v1"`)
 
+**English** | [简体中文](zh-CN/plan-schema-1.md)
+
 A *launch plan* is a `@tilefish.graph` compiled into, for every combination of the bucket values of its dimensions, an ordered list of **steps** (each one
 launch of a manifest entry: a Triton kernel, a prebuilt PTX or cubin, or a pinned cuBLASLt GEMM) with every pointer argument bound to a **buffer** or a view of one,
 and one **memory plan**: every buffer that is not provided by the caller lives in a single **arena** at a fixed byte offset, the same in every bucket. A host
