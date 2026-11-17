@@ -18,6 +18,10 @@ each section names the release that added it.
   the README and the PyPI and crates.io pages have `README.zh-CN.md` mirrors. Each page starts with a line that switches language, and
   `python/tests/test_docs_zh.py` holds every pair to the same headings and the same code blocks. A page `docs/X.md` that an entry below
   names is now `docs/en/X.md`.
+- **A documentation site**, https://kilerd.github.io/tilefish/ (Chinese at `/zh-CN/`): MkDocs Material builds the two trees (`mkdocs.yml`,
+  tools pinned in `docs/requirements.txt`), with a language switcher and a search that finds Chinese words, and
+  `.github/workflows/docs.yml` builds it with `--strict` on every pull request that touches it and publishes it from `main`. The PyPI and
+  crates.io pages link it.
 - **Corrections the translation found** in the English pages: three hosts where a page said two, the order in which `nvdisasm` is searched
   (`docs/en/numerics.md`), memset steps and the `workspace` of kernel steps in `docs/en/plan-schema-1.md`, and the contents, a table
   cell and a list of test cases in RFCs 0001 and 0003.
