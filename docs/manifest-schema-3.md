@@ -138,7 +138,7 @@ A manifest exported by 0.0.6 or earlier still names the directories of its build
 every level of every binary, for `tilefish-explain` (`docs/explain.md`). No field of the manifest names it and no digest covers it, so the manifest,
 its digest and every pin are the same with or without it; neither reader looks at it (a reader reads `manifest.json` and the cubins it names, and nothing
 else of the directory). It holds source code (the kernels' files, the generated sources, Triton's): it is not part of what is shipped, and a tool that
-packages an export for a host leaves it out. The manifest and its digest are the same with or without it.
+packages an export for a host leaves it out.
 
 ## 4. Kernel entries
 
@@ -186,7 +186,7 @@ Validation rules that are new (Python: `Manifest._read`):
   set), and a manifest whose `shared` was edited may as well have had its cubin replaced. What vouches for `shared` is what vouches for the cubin:
   the pin (the manifest digest covers `shared`, and the export wrote Triton's value). Without a pin (`trust_directory=True`) the directory is
   trusted for both. The test fails when a later Triton or ptxas records the size, and a check at load becomes possible then.
-* `toolchain` for `binary` is `{}` (a cubin used as it is) or `{"ptxas": <the `--version` text>}` (PTX that was assembled).
+* `toolchain` for `binary` is `{}` (a cubin used as it is) or ``{"ptxas": <the `--version` text>}`` (PTX that was assembled).
 
 ### 4.1 An implementation per architecture: `implementation` (tilefish 0.0.5, crate 0.0.3; names, prebuilt binaries and an ABI per implementation: tilefish 0.0.7, crate 0.0.5)
 

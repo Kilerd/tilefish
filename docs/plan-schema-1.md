@@ -8,9 +8,9 @@ and one **memory plan**: every buffer that is not provided by the caller lives i
 that holds a verified plan and its manifest launches the steps in order on one stream and allocates nothing while it does, so the whole execution can be captured in
 a CUDA graph once per bucket at fixed addresses.
 
-The Python package writes and reads this document (`tilefish.plan`, `tilefish.runtime.export`, `tilefish.run(graph, ..., mode="replay", plan=...)`). A Rust lane
+The Python package writes and reads this document (`tilefish.plan`, `tilefish.runtime.export`, `tilefish.run(graph, ..., mode="replay", plan=...)`). The Rust crate
 implements this specification, and the C++ host (`crates/tilefish-capi`, `docs/rfcs/0002-cpp-host.md`) runs plans through that Rust implementation, so what
-this document says of the Rust host holds for it too. Everything is checked by tests in `python/tests/` (named in the last section) and the Python code that writes or checks each part is
+this document says of the Rust host holds for it too. Everything is checked by tests in `python/tests/` (named in section 14) and the Python code that writes or checks each part is
 named where the part is described (`python/src/tilefish/_plan.py`, `_planrun.py`).
 
 A reader of this document is assumed to know manifest schema 3 (`docs/manifest-schema-3.md`): the entries of `kernels` and `library`, the `abi`, the dimension
@@ -169,7 +169,7 @@ magnitude, so that every language reads the same number); a file larger than
 
 ### 7.1 The fields
 
-`buckets[i].steps` is a list (the same length in every bucket) of objects with the fields `entry kind args` and, for kind `library` only, `workspace`, and for a kernel step whose entry has fixed arguments given per call, `given`; a step of kind `copy` has exactly the fields `kind args` (section 7.5), and so does a step of kind `memset` (section 7.6):
+`buckets[i].steps` is a list (the same length in every bucket) of objects with the fields `entry kind args` and, for kind `library` and for a kernel step whose entry has a global scratch, `workspace`, and for a kernel step whose entry has fixed arguments given per call, `given`; a step of kind `copy` has exactly the fields `kind args` (section 7.5), and so does a step of kind `memset` (section 7.6):
 
 | field | type and rule |
 |---|---|
@@ -265,7 +265,7 @@ A step of kind `"copy"` is `{"kind": "copy", "args": [{"name": "src", ...}, {"na
 * each of `src` and `dst` is **dense**: the whole buffer, or a view whose axes of a size other than 1 have the row-major strides (one run of elements, from the view's
   `offset`);
 * the two have **the same dtype** (their buffers') and **the same number of elements** (their shapes may differ: a copy is of bytes);
-* `dst` is a buffer a step may write (`intermediate`, `output`, `inout`), and in one buffer the two runs of elements do not overlap.
+* `dst` is a buffer a step may write (`intermediate`, `output`, `inout`, `carried`), and in one buffer the two runs of elements do not overlap.
 
 **What a host does.** The copy is `cuMemcpyDtoDAsync(address(dst) + dst.offset * itemsize, address(src) + src.offset * itemsize, count * itemsize)` on the plan's stream, in
 its place among the steps; with the real addresses the two runs of bytes must not overlap (two externals that overlap are refused before, section 9). A stream that is being

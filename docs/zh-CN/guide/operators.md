@@ -69,7 +69,7 @@ def row_sum(x: Strided[Tensor[R, 256, f32]], y: Out[Tensor[R, f32]], s_row: Stri
 def row_sum(x: Tensor[R, 1024, f32], y: Out[Tensor[R, f32]], n_rows: R, ROWS: const = 1): ...
 ```
 
-对 graph、plan、调用方和 `reference=` 模式而言，这个算子是同一个类型化签名。`export` 构建目标架构（`arch=`，或设备的架构）的实现，`jit` 构建设备架构的实现，二者都拒绝既没有自己的实现也没有 `fallback` 的架构。每个实现是一个 Triton 或 Gluon kernel，有自己的编译选项（`num_warps`、`num_stages`、`enable_fp_fusion`）、constexpr 值（`consts=`）和 `grid=`；每个实现都接受 stub 的参数，并具有相同的启动 ABI、bucket、维度和前置条件，这由声明检查，所以无论运行哪个实现，plan 都是同一份文档，host 也以同样方式启动每个实现。每个实现都是一个独立的算子（`row_sum.for_arch("sm_103")`、`tilefish.aot.compile_specs(row_sum, arch=103)`）：它的键在它的声明 digest 和编译规格中，它的 manifest 条目也记录了它（`"implementation": "sm_103"` 或 `"fallback"`；`docs/manifest-schema-3.md`，第 4.1 节）。`replay` 像导出时一样选择设备架构的实现，所以另一个实现的条目，或一个已改变（kernel、选项、常量或 grid 改变）的实现的条目，会作为过时而被拒绝；另一个架构的实现改变时，本架构的 manifest 仍然有效。Rust crate 读取这个字段（`Entry::implementation`），并启动其设备架构的条目。
+对 graph、plan、调用方和 `mode="reference"` 而言，这个算子是同一个类型化签名。`export` 构建目标架构（`arch=`，或设备的架构）的实现，`jit` 构建设备架构的实现，二者都拒绝既没有自己的实现也没有 `fallback` 的架构。每个实现是一个 Triton 或 Gluon kernel，有自己的编译选项（`num_warps`、`num_stages`、`enable_fp_fusion`）、constexpr 值（`consts=`）和 `grid=`；每个实现都接受 stub 的参数，并具有相同的启动 ABI、bucket、维度和前置条件，这由声明检查，所以无论运行哪个实现，plan 都是同一份文档，host 也以同样方式启动每个实现。每个实现都是一个独立的算子（`row_sum.for_arch("sm_103")`、`tilefish.aot.compile_specs(row_sum, arch=103)`）：它的键在它的声明 digest 和编译规格中，它的 manifest 条目也记录了它（`"implementation": "sm_103"` 或 `"fallback"`；`docs/manifest-schema-3.md`，第 4.1 节）。`replay` 像导出时一样选择设备架构的实现，所以另一个实现的条目，或一个已改变（kernel、选项、常量或 grid 改变）的实现的条目，会作为过时而被拒绝；另一个架构的实现改变时，本架构的 manifest 仍然有效。Rust crate 读取这个字段（`Entry::implementation`），并启动其设备架构的条目。
 
 一个实现可以被共享，可以是预构建的二进制文件，也可以有自己的 ABI：
 

@@ -121,7 +121,7 @@ instructions on other architectures, and those may add the products of a wide do
 def row_sum(x: Tensor[R, 1024, f32], y: Out[Tensor[R, f32]], n_rows: R, ROWS: const = 1): ...
 ```
 
-The op is one typed signature for a graph, a plan, a caller and `reference=` mode. `export` builds the implementation of the target architecture (`arch=`,
+The op is one typed signature for a graph, a plan, a caller and `mode="reference"`. `export` builds the implementation of the target architecture (`arch=`,
 or the device's), `jit` the one of the device's, and both refuse an architecture that has neither its own nor a `fallback`. Each implementation is a Triton or
 Gluon kernel with its own compile options (`num_warps`, `num_stages`, `enable_fp_fusion`), constexpr values (`consts=`) and `grid=`; every one takes the stub's
 parameters and has the same launch ABI, buckets, dimensions and preconditions, which the declaration checks, so a plan is the same document whichever runs

@@ -89,7 +89,7 @@ sha256( b"tilefish.manifest-digest.v3\0" + canonical_json({"schema": 3, "kernels
 
 由 0.0.6 或更早版本导出的 manifest 仍然带有其构建目录的名称；它的加载、pin 和 replay（回放）都与以前完全一样。预构建二进制文件（第 8 节）按原样接受：带 `.file` 指令的 PTX 或在别处构建的 cubin 保留其原有的任何路径。
 
-**manifest 旁边的 trace（追踪记录）（tilefish 0.0.9）。** 使用 `trace=True`（或 `TILEFISH_TRACE=1`）的导出还会在 manifest 所在目录中写入 `trace/`：每个二进制文件的每一层，供 `tilefish-explain` 使用（`docs/explain.md`）。manifest 中没有任何字段提到它，也没有 digest 覆盖它，因此不论有没有它，manifest、其 digest 和每个 pin 都相同；两个读取器都不查看它（读取器读取 `manifest.json` 及其提到的 cubin，不读该目录的其他内容）。它包含源码（kernel 的文件、生成的源码、Triton 的源码）：它不属于交付的内容，为 host 打包导出的工具会把它排除在外。不论有没有它，manifest 及其 digest 都相同。
+**manifest 旁边的 trace（追踪记录）（tilefish 0.0.9）。** 使用 `trace=True`（或 `TILEFISH_TRACE=1`）的导出还会在 manifest 所在目录中写入 `trace/`：每个二进制文件的每一层，供 `tilefish-explain` 使用（`docs/explain.md`）。manifest 中没有任何字段提到它，也没有 digest 覆盖它，因此不论有没有它，manifest、其 digest 和每个 pin 都相同；两个读取器都不查看它（读取器读取 `manifest.json` 及其提到的 cubin，不读该目录的其他内容）。它包含源码（kernel 的文件、生成的源码、Triton 的源码）：它不属于交付的内容，为 host 打包导出的工具会把它排除在外。
 
 ## 4. kernel 条目
 
@@ -113,7 +113,7 @@ toolchain binary source_digest source_digest_kind`，以及可选的 `implementa
 * 如果存在 `abi.scratch_slots`，它是一个整数（不是 bool），对 `triton` 等于 2，对 `binary` 等于 0。（Python 的读取器在该字段存在时检查它，而与算子编译规格的比较要求它恰好等于规格所写的值；不依赖规格读取的 host 必须要求它存在，并要求 `len(abi.scratch) == abi.scratch_slots`。）
 * 对 `triton`，原有规则仍然有效：`shared` 为 0 但 cubin 中有 `.nv.shared.<symbol>` 段的条目被拒绝。**对 `binary` 不适用**：使用*静态*共享内存的手写 kernel 也有这个段，而声明（`shared`）说明的是它寻址多少*动态*共享内存；加载器的检查（静态 + 动态 ≤ 设备的 opt-in 最大值）起保护作用。
 * **非零但过小的 `shared` 检测不出来，也无法从文件中检测出来。** Triton 给需要共享内存的 kernel 一个*动态*共享内存的 `extern` 数组，其大小由 Triton 决定（`metadata.shared`，来自它对 TTGIR 的分配），ptxas 从不知道这个大小：cubin 不记录它。在 sm_103 上用 Triton 3.5.1 和 ptxas 12.9 测量（`python/tests/test_gpu_shared_size.py`）：三个 `metadata.shared` 分别为 16 400、49 168 和 65 552 字节的 `tl.dot` kernel 有相同的 `.nv.shared.<symbol>` 段（1024 字节：sm_90 起每个块的系统保留），除参数记录外相同的 `.nv.info.<symbol>` 属性，以及驱动报告的相同静态共享内存（`CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES`，0）。因此加载器能检查文件所写的内容（该段，以及 `shared ≠ 0`；静态 + `shared` ≤ opt-in 最大值），仅此而已；要再次得知该大小，就意味着在加载时再次编译 kernel 的 TTGIR（只有 Python 能做，并且对于大的集合需要数秒），而 `shared` 被编辑过的 manifest 也同样可能被替换了 cubin。为 `shared` 担保的，正是为 cubin 担保的东西：pin（manifest digest 覆盖 `shared`，而导出写入的是 Triton 的值）。没有 pin 时（`trust_directory=True`），二者都信任目录。当以后的 Triton 或 ptxas 记录该大小时，这个测试会失败，那时就可以在加载时检查了。
-* `binary` 的 `toolchain` 是 `{}`（按原样使用的 cubin）或 `{"ptxas": <the `--version` text>}`（经过汇编的 PTX）。
+* `binary` 的 `toolchain` 是 `{}`（按原样使用的 cubin）或 ``{"ptxas": <the `--version` text>}``（经过汇编的 PTX）。
 
 ### 4.1 每个架构一个实现：`implementation`（tilefish 0.0.5，crate 0.0.3；名称、预构建二进制文件以及每个实现一个 ABI：tilefish 0.0.7，crate 0.0.5）
 

@@ -63,11 +63,11 @@ the last call puts into the caller's output. A view that is not dense (a transpo
 `tilefish.contiguous`.
 
 **Named outputs.** `@tilefish.graph(outputs=("y", "residual"))` names the returned values: the plan's output buffers have those names (else `out0`,
-`out1`, ...), `tilefish.run(..., outputs={"y": y, "residual": r})` takes them by name, and the Rust host binds them by name; both hosts also take `out<i>` for
+`out1`, ...), `tilefish.run(..., outputs={"y": y, "residual": r})` takes them by name, and the Rust and C++ hosts bind them by name; all three hosts also take `out<i>` for
 the `i`-th returned value, so a host written for the names of before keeps working.
 
 **Inputs and weights.** `@tilefish.graph(inputs=("x",))` (or `weights=(...)`, or both) says which parameters a call gives every time and which a
-host binds once, when it loads the model. The plan records the roles (`"roles": "declared"`), and both hosts bind the weights once:
+host binds once, when it loads the model. The plan records the roles (`"roles": "declared"`), and all three hosts bind the weights once:
 `w = tilefish.runtime.bind_weights(graph, {"w1": t1, ...}, mode="replay", plan="build/", pin=p.digest)`, then `w.run(x)` and `w.capture(x, ...)`
 (Rust: `PlanRun::bind_weights`, a `WeightedRun` whose `launch` and `capture` take the inputs only). Without the declaration a plan labels a
 parameter by its shape, as before (`weight` when it mentions no dimension: every parameter of a fully static graph), and `bind_weights` refuses it.
@@ -91,7 +91,7 @@ parameter `h` a buffer the arena holds (role `carried`), in a region after the p
 `stage_a(x, h: InOut[...])` writes it (`h[...] = encode(x)`: the launch of `encode` writes the arena's `h` directly), `stage_b(h)` reads it, and a run gives
 every parameter but the carried ones: `s.run(stage_a, x)`, then `s.run(stage_b)`, whose sizes are the ones `h` was written with. A run that reads `h` before
 any run on the arena wrote it, or in another shape, is refused before anything is enqueued; the captures of `tilefish.capture` check and note `h` at every
-replay. Both hosts compute the same layout from the documents, which the pins cover (`docs/plan-schema-1.md`, section 15.2).
+replay. All three hosts compute the same layout from the documents, which the pins cover (`docs/plan-schema-1.md`, section 15.2).
 
 **Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
 last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest

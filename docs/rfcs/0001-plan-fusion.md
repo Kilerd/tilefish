@@ -31,22 +31,22 @@ that can change NaN payloads), and the tests that prove it.
 
 ## Contents
 
-Decisions (2026-11-15)
-Phase 0 results (2026-11-15, sm_103)
-Phase 1 (2026-11-15)
-Phase 2 (2026-11-16): row regions, fusion version 2
-0. Background: what exists
-1. Use cases and non-goals
-2. Surface syntax and capture
-3. The fusion algorithm
-4. Code generation
-5. The numerics contract and its modes
-6. Interaction with plans
-7. Epilogue and prologue fusion into library ops and externs
-8. Schema impact and migration
-9. Staged implementation plan, test plan and open questions
-10. Prior art
-11. Future work: modes that are not exact, and other extensions
+* Decisions (2026-11-15)
+* Phase 0 results (2026-11-15, sm_103)
+* Phase 1 (2026-11-15)
+* Phase 2 (2026-11-16): row regions, fusion version 2
+* 0\. Background: what exists
+* 1\. Use cases and non-goals
+* 2\. Surface syntax and capture
+* 3\. The fusion algorithm
+* 4\. Code generation
+* 5\. The numerics contract and its modes
+* 6\. Interaction with plans
+* 7\. Epilogue and prologue fusion into library ops and externs
+* 8\. Schema impact and migration
+* 9\. Staged implementation plan, test plan and open questions
+* 10\. Prior art
+* 11\. Future work: modes that are not exact, and other extensions
 
 Appendix A: a worked example.
 
@@ -155,8 +155,8 @@ the export-time verification, the schemas and the hosts are those of phase 1.
   row; Triton lowers a gather whose source spans warps through shared memory, so every step stores the row, waits at a barrier and loads
   (`lanes * vector` columns a step: 8 steps for `tree(128, vector=8)` at 1024 columns, 128 for `tree(32)` at 4096, where it took 2.5 ms for
   4096 rows), and the template's warp rule (a warp per 256 columns) gave 16 warps to 128 lanes at 4096 columns. Revision 2 reshapes the row to
-  `[lanes, K]` (lane `j`'s columns in its order along the last axis, the columns past `D` made `-0.0`, which `add.rn` leaves every chain value as
-  it is) and takes each chain by halving splits, register moves where each thread holds its lane's columns, which the layout of the loads gives.
+  `[lanes, K]` (lane `j`'s columns in its order along the last axis, the columns past `D` made `-0.0`, which leaves every chain value as it is
+  under `add.rn`) and takes each chain by halving splits, register moves where each thread holds its lane's columns, which the layout of the loads gives.
   A first version that also took the tree over the lanes by splits made Triton's layout propagation give every value of the row to every
   thread (926 spills, 4 ms): the tree goes through `tl.gather` of `[lanes]` instead (warp shuffles within a warp), and lane 0 comes out of a
   `tl.reduce` with a select combine. The warps: one up to `BLOCK_D = 2048`, then one per 1024 columns (per 512 for 512 lanes or more), within 2%
@@ -335,7 +335,7 @@ The same as a kernel body. Torch's behaviour is in the last column, because a gr
 | `a / b` | f32 only | numpy's | `div.full.f32` in fast math, a constant divisor a multiply by `f32(1 / c)` (4); `div.rn.f32` in IEEE math (13) | IEEE math is torch's division of tensors |
 | `i // c`, `i % c` | integers, positive constant | numpy's | Python's floor semantics, exact (11) | none |
 | `==`, `!=`, `<`, ... | one dtype; a scalar rounded to it | numpy's | IEEE comparison, gives a mask (7) | none once the scalar is rounded |
-| `&`, `|`, `^`, `~` | masks | numpy's | exact (7) | none |
+| `&`, `\|`, `^`, `~` | masks | numpy's | exact (7) | none |
 | `where(m, a, b)` | `a`, `b` one dtype | numpy's | selects bits, NaN payloads and signed zeros kept (7) | none |
 | `iota(x, axis)` | gives i32 or i64 | (a coordinate) | exact (12) | none |
 | `rsqrt exp sqrt silu gelu sin cos tanh erf` | f32 only | (unary) | per math mode (5, 10, 13, 14, 15) | IEEE math is torch's CUDA op on every f32 for `exp sqrt rsqrt sin tanh silu erf`; `gelu` keeps libdevice's `erf` |
@@ -555,6 +555,7 @@ It holds by construction when these obligations hold. Each has a test (5.6) and,
 | H4 | a Triton tree reduction's operand layout (elements per thread, from the loads that anchor the layout) depends on the whole kernel, so the same `tl.sum` may add in another tree when other loads of other dtypes share its kernel | last-bit differences, data-dependent | D2: unordered reductions run alone, and their operand is stored; experiment E1 measures how often the tree really changes |
 | H5 | `tl.max` on `+0.0` and `-0.0`, and on NaN, might depend on the order | a sign of zero | E2: order-free on every tested row at 1 to 16 warps and under permutation; `max` may join row regions, and the phase 2 tests keep checking it |
 | H6 | the library behind a math op changes with the CUDA or libdevice version (CUDA 13.2 changed `erff`) | other bytes, `F` and `U` alike | not a fusion hazard (O7); the CUDA math guard warns |
+| H7 | withdrawn at the review of 2026-11-15 with the mode it was about, `fp_contract="compiler"`, which D5 leaves to future work (section 11) | — | — |
 | H8 | (found in phase 1) ptxas folds `neg.f32` into its consumer as a negated operand (a `where` of `-x`: `FSEL` of `-R`), which flips a NaN's sign, where `neg.f32` alone gives the canonical NaN | a NaN `0xFFFFFFFF` fused, `0x7FFFFFFF` unfused (61 of 1536 elements of a random graph) | a region's negation gives the canonical NaN explicitly (`testp.notanumber` or `setp.nan`, `selp`) |
 | H9 | (found in phase 1) LLVM packs two lanes' f32 ops into `mul.rn.f32x2` / `add.rn.f32x2`, and ptxas 12.9 contracts that pair into `FFMA2` even with `--fmad=false` (read in the SASS of the same PTX assembled for sm_100a) | one ULP, 33 of 1536 elements of a random graph; and `@tilefish.kernel(fp_fusion=False)` is not two roundings where its ops are packed | a region writes every float `+ - *` (and the multiplies of `silu` and `gelu`) as scalar `.rn` inline PTX: separate `FMUL` and `FADD` in the SASS |
 

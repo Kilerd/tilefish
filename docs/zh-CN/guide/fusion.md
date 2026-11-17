@@ -2,7 +2,7 @@
 
 [English](../../guide/fusion.md) | **简体中文**
 
-graph（计算图）的函数体可以做计算。两次调用之间的算术（两个 GEMM（通用矩阵乘）之间的 `silu(g.to(f32)) * u.to(f32)`、一个 bias 加一个激活、一次残差加、一个由设备标量得到的掩码、一次反量化）会像 kernel（核函数）函数体一样被追踪，并遵循同样的规则（没有隐式类型提升，标量舍入到张量的 dtype，f32 数学函数）；规划器再把它分组成 **区域**（region）：每个区域是 tilefish 生成的一个独立的 `@tilefish.kernel`（按内容命名为 `fused_<hash>`，用同样的模板下沉（lowering）），也是 plan（计划）中一个普通的 kernel 步骤。schema（模式）和 host（宿主）都不变（`docs/rfcs/0001-plan-fusion.md`）。
+graph（计算图）的函数体可以做计算。两次调用之间的算术（两个 GEMM（通用矩阵乘）之间的 `silu(g.to(f32)) * u.to(f32)`、一个 bias 加一个激活、一次残差加、一个由设备标量得到的掩码、一次反量化）会像 kernel（核函数）函数体一样被追踪，并遵循同样的规则（没有隐式类型提升，标量舍入到张量的 dtype，f32 数学函数）；规划器再把它分组成 **区域**（region）：每个区域是 tilefish 生成的一个独立的 `@tilefish.kernel`（按内容命名为 `fused_<hash>`，用同样的模板下沉（lowering）），也是 plan（计划）中一个普通的 kernel 步骤。两种 schema（模式）和三个 host（宿主）都不变（`docs/rfcs/0001-plan-fusion.md`）。
 
 ```python
 @tilefish.graph(inputs=("x",))

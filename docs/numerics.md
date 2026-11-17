@@ -10,7 +10,7 @@ changes, and the decisions the contract rests on.
 
 Most ops of a lowered kernel are one PTX instruction or a fixed sequence that tilefish writes (`div.rn.f32`, `fma.rn.f32`, `sin.approx.f32`, the
 `add.rn` chains of an ordered sum, ...). Their bits depend on the PTX, which is in the generated source, and on the hardware; nothing outside
-tilefish changes them. Two kinds of op are different:
+tilefish changes them. Three kinds of op are different:
 
 * **Copies of a CUDA math library function.** In IEEE math (note 13 of `tilefish.lower`) `exp` and `silu` are built on CUDA's `expf`, `rsqrt` is
   `rsqrtf` and `erf` is `erff` (note 15): the inline PTX that NVRTC emits for each, copied once. The binary's bits do not move, but their claim, "the
@@ -105,8 +105,8 @@ Triton (and so its libdevice) changes, or on a new GPU architecture.
     (`FFMA`, `FFMA2`, `HFMA2`, `DFMA`, not the idioms that multiply or add nothing) than that is refused at build, with the kernel's name, the
     instructions and the fix (scalar `.rn` inline PTX where the rounding matters, or `enable_fp_fusion=True`). The comparison takes in what
     ptxas fuses on its own account (an explicit `fma`, the expansion of an IEEE division, square root or reciprocal) without listing it. The
-    disassembler is the first `nvdisasm` that decodes the architecture (`$TILEFISH_NVDISASM_PATH`, Triton's, the one next to its `ptxas`, an
-    `nvidia-cuda-nvdisasm` wheel, the `PATH`); Triton 3.5.1 bundles CUDA 12.8's, which does not decode sm_103, and there the PTX is assembled for
+    disassembler is the first `nvdisasm` that decodes the architecture (`$TILEFISH_NVDISASM_PATH`, an `nvidia-cuda-nvdisasm` wheel, Triton's,
+    the one next to its `ptxas`, the `PATH`, then `$CUDA_HOME` or `$CUDA_PATH`); Triton 3.5.1 bundles CUDA 12.8's, which does not decode sm_103, and there the PTX is assembled for
     `sm_100a`, the base of its family, and read (`pip install nvidia-cuda-nvdisasm` reads sm_103 itself). A binary with no float multiply or
     no float add is not disassembled. `tests/test_gpu_fpcontract.py` builds a Triton and a Gluon kernel that ptxas contracts (refused on
     sm_100, sm_103 and sm_120, built on sm_90), the same kernel with scalar `.rn` instructions (built everywhere) and every case of the lowering
@@ -145,7 +145,7 @@ It fits the model under three restrictions, which keep a run's bytes a function 
 * **One run at a time per buffer.** The state lives in the plan's arena, which runs of one plan already serialise (and concurrent streams already
   need an arena each), so two runs never update one counter.
 
-It should wait for two pieces it needs, which other work owns: a memset step in the plan schema (an open item: plan schema 1 has none, and the reset
-is one), and the atomic ops in the DSL with their lowering in both templates. With those, the state buffer is an additive field of the plan
+It should wait for the piece it still needs, which other work owns: the atomic ops in the DSL with their lowering in both templates (the reset is
+a memset step, which plan schema 1 has had since tilefish 0.0.7, section 7.6). With them, the state buffer is an additive field of the plan
 (`role: "state"`, its reset) and of the manifest ABI (an `inout` device scalar that a kernel may update atomically), read by both hosts; until
 then a hand-written `extern` that atomically updates an `InOut` tensor the caller zeroes is the way to count.

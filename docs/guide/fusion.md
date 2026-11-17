@@ -5,7 +5,7 @@
 A graph body may compute. The arithmetic between two calls (`silu(g.to(f32)) * u.to(f32)` between two GEMMs, a bias and an activation, a residual add, a mask
 from a device scalar, a dequantisation) is traced like a kernel body, with its rules (no implicit promotion, a scalar rounded to the tensor's dtype, f32 math
 functions), and the planner groups it into **regions**: each a `@tilefish.kernel` of its own that tilefish generates (named `fused_<hash>` by its content, lowered
-by the same templates), and one ordinary kernel step of the plan. Neither schema and neither host changes (`docs/rfcs/0001-plan-fusion.md`).
+by the same templates), and one ordinary kernel step of the plan. Neither schema nor any of the three hosts changes (`docs/rfcs/0001-plan-fusion.md`).
 
 ```python
 @tilefish.graph(inputs=("x",))

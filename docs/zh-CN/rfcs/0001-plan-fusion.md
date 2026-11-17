@@ -17,22 +17,22 @@
 
 ## 目录
 
-决定（2026-11-15）
-阶段 0 结果（2026-11-15，sm_103）
-阶段 1（2026-11-15）
-阶段 2（2026-11-16）：行区域，融合版本 2
-0. 背景：已有的东西
-1. 用例与非目标
-2. 表面语法与捕获
-3. 融合算法
-4. 代码生成
-5. 数值语义契约及其模式
-6. 与 plan 的交互
-7. 把 epilogue 和 prologue（头部）融合进 library op（库算子）与 extern（外部 kernel）
-8. 对 schema 的影响与迁移
-9. 分阶段实现计划、测试计划与开放问题
-10. 已有工作
-11. 未来工作：不精确的模式，以及其他扩展
+* 决定（2026-11-15）
+* 阶段 0 结果（2026-11-15，sm_103）
+* 阶段 1（2026-11-15）
+* 阶段 2（2026-11-16）：行区域，融合版本 2
+* 0\. 背景：已有的东西
+* 1\. 用例与非目标
+* 2\. 表面语法与捕获
+* 3\. 融合算法
+* 4\. 代码生成
+* 5\. 数值语义契约及其模式
+* 6\. 与 plan 的交互
+* 7\. 把 epilogue 和 prologue（头部）融合进 library op（库算子）与 extern（外部 kernel）
+* 8\. 对 schema 的影响与迁移
+* 9\. 分阶段实现计划、测试计划与开放问题
+* 10\. 已有工作
+* 11\. 未来工作：不精确的模式，以及其他扩展
 
 附录 A：一个完整示例。
 
@@ -87,7 +87,7 @@ D3 和 D4 是推荐的默认选项，没有人提出反对。Q4b 以及 Q8 到 Q
 * **行区域。** 有序的 `sum` 或 `mean`（`mean(order=)` 是新增的：有序求和乘以 `f32(1 / D)`，一条 `mul.rn`）、与顺序无关的 `max`（E2）、`argmax`、`argmin` 和 `gather_rows`（一次复制）会与周围的算子合并；与阶段 1 一样，由下沉的试运行来决定，包含归约的合并结果由行模板下沉。没有 `order=` 的 `sum` 或 `mean` 仍然是单独的区域，其操作数被存储（D2）。一个区域可以写出多个值（rmsnorm 及其残差和；量化后的行及其 scale）。`fma=True` 的有序求和，与它每一步所取操作数来自的那个乘法，在每种分组中都是一个整体，未融合组合中也是如此（版本 1 遇到这种情况会抛出 `KeyError`：它的求和在没有乘积的情况下单独运行）。
 * **1.1 的用例**写成 graph（`tests/fusion_graphs.py`，每个都有对应的未融合孪生版本，由 Rust 和 C++ 门禁作为 `fused_*` plan 运行）：残差相加和 rmsnorm，残差流作为第二个输出（一个 kernel；未融合组合有十个），同样的计算但用 fma 求和，带 gelu 和按通道尾部的 layer norm，带来自设备标量的 mask 的 softmax，按行的 fp8 量化，两个列块的 SwiGLU 加一个 norm，一个 gather 和一个 argmax。
 * **版本 1 已冻结**，连同它的下沉一起：它的区域保持 revision 1，每个声明 `fusion(version=1)` 的用例都规划得与 0.0.9 和 0.0.10 的规划完全一样（plan 的 digest（摘要）在 `tests/test_fusion.py` 中检查）。用另一个版本做出的 plan 会被当作过期而拒绝，消息中会写明该版本（`_fusion.other_version_of_plan`，只在 plan 过期时才尝试）。
-* **有序求和为什么慢（E3），以及 revision 2。** revision 1 用对整行的 `tl.gather(x, k, 0)` 取 lane（通道）链上的每一步；Triton 把源跨越多个 warp 的 gather 通过共享内存下沉，因此每一步都要存储整行、在 barrier 处等待、再加载（每步 `lanes * vector` 列：`tree(128, vector=8)` 在 1024 列时 8 步，`tree(32)` 在 4096 列时 128 步，4096 行时耗时 2.5 ms），而且模板的 warp 规则（每 256 列一个 warp）在 4096 列时给 128 个 lane 分配了 16 个 warp。revision 2 把行重塑为 `[lanes, K]`（lane `j` 的各列沿最后一个轴按其顺序排列，超出 `D` 的列置为 `-0.0`，`add.rn` 加上它会让每个链值保持原样），并通过对半拆分来求每条链，也就是在每个线程持有自己 lane 的各列时做寄存器搬移，而加载的布局正好给出这种分布。第一个版本把 lane 之间的树也用拆分来求，结果 Triton 的布局传播把行的每个值都给了每个线程（926 次 spill（寄存器溢出），4 ms）：因此树改为通过对 `[lanes]` 的 `tl.gather` 进行（warp 内的 warp shuffle），lane 0 则通过一个带 select 合并函数的 `tl.reduce` 取出。warp 数：`BLOCK_D = 2048` 及以下为一个，之后每 1024 列一个（512 个及以上 lane 时每 512 列一个），在测量网格上与 1 到 8 个 warp 中的最佳值相差不超过 2%。已在 1 到 4096 列的每个长度和每个 warp 数下对照每种顺序的 CUDA kernel 检查；比 revision 1 快 1.6 到 37 倍。
+* **有序求和为什么慢（E3），以及 revision 2。** revision 1 用对整行的 `tl.gather(x, k, 0)` 取 lane（通道）链上的每一步；Triton 把源跨越多个 warp 的 gather 通过共享内存下沉，因此每一步都要存储整行、在 barrier 处等待、再加载（每步 `lanes * vector` 列：`tree(128, vector=8)` 在 1024 列时 8 步，`tree(32)` 在 4096 列时 128 步，4096 行时耗时 2.5 ms），而且模板的 warp 规则（每 256 列一个 warp）在 4096 列时给 128 个 lane 分配了 16 个 warp。revision 2 把行重塑为 `[lanes, K]`（lane `j` 的各列沿最后一个轴按其顺序排列，超出 `D` 的列置为 `-0.0`，在 `add.rn` 下它让每个链值保持原样），并通过对半拆分来求每条链，也就是在每个线程持有自己 lane 的各列时做寄存器搬移，而加载的布局正好给出这种分布。第一个版本把 lane 之间的树也用拆分来求，结果 Triton 的布局传播把行的每个值都给了每个线程（926 次 spill（寄存器溢出），4 ms）：因此树改为通过对 `[lanes]` 的 `tl.gather` 进行（warp 内的 warp shuffle），lane 0 则通过一个带 select 合并函数的 `tl.reduce` 取出。warp 数：`BLOCK_D = 2048` 及以下为一个，之后每 1024 列一个（512 个及以上 lane 时每 512 列一个），在测量网格上与 1 到 8 个 warp 中的最佳值相差不超过 2%。已在 1 到 4096 列的每个长度和每个 warp 数下对照每种顺序的 CUDA kernel 检查；比 revision 1 快 1.6 到 37 倍。
 * **H10，在这里发现：Triton 3.5.1 中字面量 `-0.0` 就是 `+0.0`**（`tl.where(m, x, -0.0)`、`tl.full(..., -0.0)`，在 kernel 中有和没有 `+0.0` 两种情况下都测量过）。融合仍然精确（融合和未融合的 kernel 写的是同一个字面量），但函数体中的 `where(x > 0, x, -0.0)` 并不是它字面上的意思，在 kernel 和区域中都是如此。现在每个 kernel 都按位写出 `-0.0` 标量（一次 `i32` bitcast；note 3），revision 2 对有序求和的填充也是如此。
 * **revision 2 中还有：** 秩为 1 和 2 的视图由行模板就地读取（规则 5；版本 1 的行区域先复制它们），内联的 fp8 类型转换（`cvt.rn.satfinite.e4m3x2.f32`，在每个输入上与 `.to()` 的位相同）。手写的 kernel 可以要求使用 revision 2（`@tilefish.kernel(lowering=2)`）；默认情况下它保持 revision 1 及其源码。
 * **advisor（建议器）**（`docs/advise.md`）和 `boundaries()` 跟随 graph 的版本：在版本 2 中，有序归约、`max`、`argmax` 或 gather 不会被报告，行区域既不阻挡相邻算子，也不复制视图。
@@ -215,7 +215,7 @@ def mlp(x: Tensor[M, H, bf16], w_gu: Tensor[2 * F, H, bf16], w_d: Tensor[H, F, b
 | `a / b` | 仅 f32 | numpy 的规则 | fast math 下为 `div.full.f32`，常量除数变为乘以 `f32(1 / c)`（4）；IEEE math 下为 `div.rn.f32`（13） | IEEE math 就是 torch 的张量除法 |
 | `i // c`, `i % c` | 整数，正常量 | numpy 的规则 | Python 的向下取整语义，精确（11） | 无 |
 | `==`, `!=`, `<`, ... | 单一 dtype；标量舍入到该 dtype | numpy 的规则 | IEEE 比较，得到 mask（7） | 标量舍入之后无差异 |
-| `&`, `|`, `^`, `~` | mask | numpy 的规则 | 精确（7） | 无 |
+| `&`, `\|`, `^`, `~` | mask | numpy 的规则 | 精确（7） | 无 |
 | `where(m, a, b)` | `a`、`b` 为同一 dtype | numpy 的规则 | 按位选择，保留 NaN 载荷和带符号零（7） | 无 |
 | `iota(x, axis)` | 得到 i32 或 i64 | （一个坐标） | 精确（12） | 无 |
 | `rsqrt exp sqrt silu gelu sin cos tanh erf` | 仅 f32 | （一元） | 取决于 math 模式（5、10、13、14、15） | 对 `exp sqrt rsqrt sin tanh silu erf`，IEEE math 在每个 f32 上都等于 torch 的 CUDA 算子；`gelu` 保留 libdevice 的 `erf` |
@@ -377,6 +377,7 @@ P with each region replaced by one call to its generated op  --(the existing _wa
 | H4 | Triton 树形归约的操作数布局（每个线程的元素数，来自锚定布局的那些加载）取决于整个 kernel，所以当其他 dtype 的其他加载与它共处一个 kernel 时，同一个 `tl.sum` 可能按另一棵树相加 | 最后一位的差异，与数据有关 | D2：无序归约单独运行，并且它们的操作数被存储；实验 E1 测量树实际改变的频率 |
 | H5 | `tl.max` 在 `+0.0` 和 `-0.0` 上以及在 NaN 上可能与顺序有关 | 零的符号 | E2：在 1 到 16 个 warp 下以及打乱顺序后，在每个测试过的行上都与顺序无关；`max` 可以加入行区域，阶段 2 的测试会持续检查它 |
 | H6 | 数学算子背后的库随 CUDA 或 libdevice 版本变化（CUDA 13.2 改变了 `erff`） | 字节不同，`F` 和 `U` 一样 | 不是融合隐患（O7）；CUDA 数学守卫检查会发出警告 |
+| H7 | 已在 2026-11-15 的评审中随它所针对的模式 `fp_contract="compiler"` 一起撤回，D5 把该模式留作未来工作（第 11 节） | — | — |
 | H8 | （在阶段 1 中发现）ptxas 把 `neg.f32` 折叠进它的消费者，作为取负的操作数（`-x` 的 `where`：`-R` 的 `FSEL`），这会翻转 NaN 的符号，而单独的 `neg.f32` 给出规范 NaN | 融合时 NaN 为 `0xFFFFFFFF`，未融合时为 `0x7FFFFFFF`（一个随机 graph 的 1536 个元素中有 61 个） | 区域的取负显式给出规范 NaN（`testp.notanumber` 或 `setp.nan`，`selp`） |
 | H9 | （在阶段 1 中发现）LLVM 把两个 lane 的 f32 运算打包成 `mul.rn.f32x2` / `add.rn.f32x2`，而 ptxas 12.9 即使在 `--fmad=false` 下也会把这一对收缩成 `FFMA2`（在为 sm_100a 汇编同一份 PTX 得到的 SASS 中读到） | 一个 ULP，一个随机 graph 的 1536 个元素中有 33 个；并且在运算被打包的地方，`@tilefish.kernel(fp_fusion=False)` 不是两次舍入 | 区域把每个浮点 `+ - *`（以及 `silu` 和 `gelu` 中的乘法）写成标量 `.rn` 内联 PTX：SASS 中是分开的 `FMUL` 和 `FADD` |
 

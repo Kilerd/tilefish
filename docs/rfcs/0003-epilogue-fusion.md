@@ -75,19 +75,20 @@ candidate with the routes and contracts that can take it.
 
 ## Contents
 
-Decisions (2026-11-16)
-E1: implementation notes (2026-11-17)
-X8: results (2026-11-17)
-0. Background: what exists
-1. Use cases
-2. The numerics problem and the three contracts
-3. Routes
-4. Surface syntax
-5. Interaction with plans, reports, the advisor, SASS assertions, traces, hosts and schemas
-6. Experiments: phase 0 results and the experiments still needed
-7. Staged plan, milestones and tests
-8. Questions (resolved 2026-11-16)
-9. Prior art
+* Decisions (2026-11-16)
+* E1: implementation notes (2026-11-17)
+* E1 and E2 together (2026-11-17)
+* X8: results (2026-11-17)
+* 0\. Background: what exists
+* 1\. Use cases
+* 2\. The numerics problem and the three contracts
+* 3\. Routes
+* 4\. Surface syntax
+* 5\. Interaction with plans, reports, the advisor, SASS assertions, traces, hosts and schemas
+* 6\. Experiments: phase 0 results and the experiments still needed
+* 7\. Staged plan, milestones and tests
+* 8\. Questions (resolved 2026-11-16)
+* 9\. Prior art
 
 Appendix A: a worked example.
 
@@ -1125,13 +1126,13 @@ to the canonical NaN). The entry records `"measured-exact"` (no element differs)
 largest distance in ULP. `contract="measured-exact"` makes the build refuse the other.
 
 X1 as a GPU test (`python/tests/test_gpu_matmul.py`): 14 shapes (`M` 32, 128, 640, 2048 by `N x K` of 1536 x 512, 3072 x 1024, 1024 x 3072, and
-32 x 4096 x 4096, 100 x 1000 x 1000), bf16 and f16, both postures, seven cases (`none`, `bias`, `relu`, `relu_bias` without and the last three with `c`,
+32 x 4096 x 4096, 100 x 1000 x 1000), bf16 and f16, both postures, seven cases (`bias`, `relu` and `relu_bias`, without and with `c`,
 and `none` with `c`): 392 pins per cuBLASLt version on a B300 MIG slice (sm_103, 30 SMs).
 
 * **cuBLASLt 12.8.4: 392 of 392 measured-exact**, the special values and accumulators included (rows of `a` that give a NaN, a zero, an infinity
   and an overflow to every epilogue). No pin splits `k`.
 * **cuBLASLt 13.1.0: 372 of 392 measured-exact.** The 20 others are the pins of algorithm 21 at 32 x 1024 x 3072, both types, both postures:
-  * `bias` with `c`: 26% of the elements differ, by up to 15 176 ULP (bf16) and 2 481 (f16), as X6 found;
+  * `bias` with `c`: 26% of the elements differ, by up to 15 176 ULP (bf16) and 2481 (f16), as X6 found;
   * `relu`, `relu_bias`, `relu` with `c` and `relu_bias` with `c`: 2048 to 2111 of 65 536 elements, all of them NaN pre-activations: **this algorithm's
     ReLU gives `0` for a NaN**, where every other pin keeps the NaN (`torch.relu`). A finding beyond X6: an epilogue's NaN rule is a property of the pin
     too, which only special accumulators show (a NaN in a bias or `c` showed it for the cases with them; the rows of `a` for a ReLU alone).
@@ -1192,7 +1193,7 @@ No case is slower; the residual add with a bias at 640 x 1024 x 4096 saves nothi
 * **sm_120, measured at the 0.0.12 gate** (RTX 5090, 170 SMs; `tests/test_gpu_matmul.py` and the matrix above): cuBLASLt 12.8.4 and 13.1.0 alike
   answer every epilogue but `none` with algorithm 21 (every candidate the heuristic returned, for the six problems asked). Of the 392 pins per
   version 140 are measured-exact (`bias`, `none` with `c`, half of `bias` with `c`); every ReLU (224) is binary-defined, its ReLU mapping a NaN to 0
-  (every finite value is the formula's), and 28 of `bias` with `c` add the two in neither order (up to 15298 ULP). So on sm_120
+  (every finite value is the formula's), and 28 of `bias` with `c` add the two in neither order (up to 15 298 ULP). So on sm_120
   `epilogues="library"` refuses a ReLU, and those `bias` with `c` problems, at export and at the first jit run, as its declaration asks: no plan
   writes other bytes, and the gate's plans there take a bias. f16 split-K pins with the opt-in are taken and verified like any other (all
   binary-defined); without it no epilogue splits `k`. Two ways forward: a ReLU written `tilefish.where(h > 0.0, h, 0.0)` (a NaN to 0) is algorithm
