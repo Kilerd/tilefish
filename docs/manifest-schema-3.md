@@ -1,5 +1,7 @@
 # Manifest schema 3
 
+**English** | [简体中文](zh-CN/manifest-schema-3.md)
+
 This is the specification of what manifest schema 3 adds to schema 2. The Python package writes and reads schema 3 (`tilefish.runtime.export`,
 `tilefish.Manifest.load`), and so does the Rust crate `tilefish` of this repository (the published 0.0.1 reads schema 2 only; section 12 says what the
 crate does with each part of this document). Everything here is checked by tests in `python/tests/` and in `crates/tilefish/tests/` (named in the last
