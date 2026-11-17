@@ -172,6 +172,7 @@ run.launch(stream, {{"x", xt}, {"out0", yt}}, {{"n", 64}});
 | CuTe DSL kernels as externs | [`docs/en/cute.md`](docs/en/cute.md) |
 | Lowered kernels: masks, indices, `argmax`, gathers and scatters, integer casts, IEEE math, ordered sums, broadcasts, `contiguous`, `im2col`, `col2im1d` | [`docs/en/guide/lowering.md`](docs/en/guide/lowering.md) |
 | Launch plans: one arena, CUDA graphs, copy and memset steps, weights bound once, plan sets, shared arenas, carried buffers, debug taps | [`docs/en/guide/plans.md`](docs/en/guide/plans.md) |
+| Locked exports: a lock made once on a GPU, then the same files exported on a machine without one (CI, an image build) | [`docs/en/guide/locked-export.md`](docs/en/guide/locked-export.md) |
 | Fusion of a graph body's arithmetic, epilogue hooks on externs, cuBLASLt epilogues | [`docs/en/guide/fusion.md`](docs/en/guide/fusion.md) |
 | Rounding points, exact and numerics-changing rewrites, `num_warps` and FMA contraction | [`docs/en/guide/rewrites.md`](docs/en/guide/rewrites.md) |
 | The CUDA math guard and what to check again on a CUDA or torch change | [`docs/en/numerics.md`](docs/en/numerics.md) |

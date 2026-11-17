@@ -59,8 +59,8 @@ changed. Every field is required:
 | `files` | the sha256 of every file of the directory, by its path (`trace/` is left out, as it is outside every digest) |
 
 `write_lock` refuses a directory that is not one export of one device: entries of two architectures, two toolchains or two SM counts, a file an export
-does not write, a fusion report whose regions were not verified (an export made off the device warns and records `skipped`; export on the device, or
-with `verify=False`), and a CuTe DSL kernel (below).
+does not write, entries or a fusion report no plan of the directory has (left by an export of another graph into it), a fusion report whose regions were
+not verified (an export made off the device warns and records `skipped`; export on the device, or with `verify=False`), and a CuTe DSL kernel (below).
 
 ## What a locked export checks, in order
 
@@ -68,12 +68,15 @@ with `verify=False`), and a CuTe DSL kernel (below).
    ptxas Triton compiles with, `TRITON_PTXAS_PATH`, or for an export of prebuilt PTX only, `TILEFISH_PTXAS_PATH`).
 2. Each library step takes the lock's record of its stem, whose `declaration_digest` must be the declaration's on a device of the lock's SM count (an
    operator, option or bucket that changed is refused); a `cublaslt.matmul` declared `contract="measured-exact"` is refused a `binary-defined` pin,
-   and one with a canary (the default) needs the lock's canary, as an export does. **No heuristic is asked, no library is loaded, nothing runs on a
-   device, with a device or without one.**
+   and one with a canary (the default) needs the lock's canary, as an export does; the entry it makes must pass every rule a manifest reader has
+   (section 9 of `docs/manifest-schema-3.md`). **No heuristic is asked, no library is loaded, nothing runs on a device, with a device or without one.**
 3. Each fused region the export would verify (the graph's `verify`, or `verify=`) takes the lock's record of it.
 4. Each binary is built and held to `kernels.<stem>` (its toolchain, then its `sha256`, saying whether the machine code differs) before anything is written.
 5. The files are written as an export writes them, and every file of the directory is held to `files`: a missing file, a file of other bytes (the cubins
-   first, then the manifest, then the rest) and a file the lock does not have (export into an empty directory) are refused.
+   first, then the manifest, then the rest) and a file the lock does not have (export into an empty directory) are refused. The files a refusal at this
+   step leaves are there to be compared with the export on the GPU; do not ship them.
+6. The directory, locked again, gives the lock itself: the digests a host is told to pin, the binaries' `sha256_code`, the pins and the regions'
+   records are what the files say, so a lock edited by hand where no file shows it is refused too.
 
 A stem, a region or a binary the lock does not have is refused with **re-lock on a GPU of the target device**: there is no fallback to a heuristic.
 
