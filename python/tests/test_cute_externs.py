@@ -140,6 +140,11 @@ def test_cute_args_without_cute_is_refused():
         def op(a: Tensor[16, f32]): ...
 
 
+def test_an_epilogue_hook_is_refused():
+    with pytest.raises(TilefishDeclarationError, match="the CuTe DSL compiles a cute= kernel, which has none"):
+        declare(epilogue=tilefish.hook("EPILOGUE", value="out", out="c"))
+
+
 def test_a_host_that_is_not_callable_is_refused():
     with pytest.raises(TilefishDeclarationError, match="cute= is a @cute.jit host function"):
         declare(cute="module:host")

@@ -2120,6 +2120,8 @@ def extern(
         raise TilefishDeclarationError("extern: epilogue= is the hook of one Triton or Gluon kernel; an op declared with by_arch= does not take one yet")
     if hooks and (ptx is not None or cubin is not None):
         raise TilefishDeclarationError("extern: epilogue= is a hook of a Triton or Gluon kernel, which tilefish compiles with the hook in it; a prebuilt binary has none")
+    if hooks and cute is not None:
+        raise TilefishDeclarationError("extern: epilogue= is a hook of a Triton or Gluon kernel, which tilefish compiles with the hook in it; the CuTe DSL compiles a cute= kernel, which has none")
     if by_arch is not None or fallback is not None:
         if args:
             raise TilefishDeclarationError("@tilefish.extern takes keyword arguments only, not a bare @tilefish.extern")
