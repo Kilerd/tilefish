@@ -5,6 +5,16 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
+## Unreleased
+
+### Documentation
+
+- **The README is an overview** (about 200 lines): what tilefish is, an example, how it works, the install, a quick start for each host, the
+  features at a glance and the status. Its reference sections moved, with their text unchanged, to `docs/guide/`: `build.md` (how a build works),
+  `operators.md` (views, device scalars, prebuilt binaries, pinned GEMMs and convolutions), `lowering.md` (masks, indices, gathers and copies),
+  `plans.md` (launch plans), `fusion.md` (fusion, epilogue hooks, cuBLASLt epilogues), `rewrites.md` (rewrites that know about rounding),
+  `sass.md`, `rust.md` and `cpp.md`. A README section that an entry below names is the page of that title; `docs/README.md` lists them.
+
 ## tilefish 0.0.13, crate 0.0.11, tilefish-capi 0.0.2 (2026-11-17)
 
 The last release that adds features ahead of a need (`docs/scope.md`). Manifest schema 3 gains one form of kernel entry, a CuTe DSL kernel
