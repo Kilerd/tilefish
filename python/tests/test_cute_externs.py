@@ -721,7 +721,12 @@ def test_the_rust_fixture_is_what_export_rust_fixtures_writes(tmp_path):
     hint = "regenerate it with python/tests/export_rust_fixtures.py ../../crates/tilefish/tests/fixtures --cute-only"
     assert sorted(p.name for p in committed.iterdir()) == sorted(p.name for p in fresh.iterdir()), hint
     for p in sorted(committed.iterdir()):
-        assert p.read_bytes() == (fresh / p.name).read_bytes(), f"{p.name}: {hint}"
+        if p.name == "manifest.json":  # (but the version of the package that wrote it: not digested, so not compared, as for the golden plans)
+            a, b = (json.loads(f.read_text()) for f in (p, fresh / p.name))
+            a.pop("tilefish", None), b.pop("tilefish", None)
+            assert a == b, f"{p.name}: {hint}"
+        else:
+            assert p.read_bytes() == (fresh / p.name).read_bytes(), f"{p.name}: {hint}"
     want = json.loads((fixtures / "expected.json").read_text())["cute"][cute_fixture.NAME]
     assert want["manifest_digest"] == manifest.digest, hint
     assert [(k["stem"], k["cubin"], k["sha256"], k["sha256_code"]) for k in want["kernels"]] == [
