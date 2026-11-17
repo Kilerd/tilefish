@@ -2,7 +2,8 @@
 
 * **Status:** reviewed; the decisions of 2026-11-16 are recorded in "Decisions" below. Design and phase 0 experiments (section 6). Milestones E1,
   epilogue hooks on externs ("E1: implementation notes" below), and E2, cuBLASLt epilogues (section 7.3: what was built, what was measured and what
-  is left), are implemented, and work together in one graph ("E1 and E2 together" below); the rest is design.
+  is left), are implemented, and work together in one graph ("E1 and E2 together" below); experiment X8, a persistent warp-specialised GEMM with
+  the hooks, is measured ("X8: results" below); the rest is design.
 * **Scope:** fusion across a call. An *epilogue* is the elementwise or row work that reads a GEMM's or a convolution's result; a *prologue* makes one
   of its operands. The RFC touches the planner and the fusion pass (`tilefish._plan`, `tilefish._fusion`), the library ops (`cublaslt.*`,
   `cudnn.conv_fwd`), externs, a new family of generated GEMM and convolution ops and the advisor. Only library epilogues touch the manifest and the
@@ -63,7 +64,9 @@ The measurements also bound the speed:
 * a cuBLASLt epilogue saves 9 to 48% of the time of a GEMM followed by its epilogue kernel when its pin keeps a fast algorithm. It loses time when
   the epilogue's pin is a slower algorithm, which happened for GELU on two of five shapes;
 * a straightforward Triton GEMM takes 1.22 to 1.44 times cuBLASLt's time, and fusing a naive epilogue into it was slower than leaving the epilogue
-  unfused. Generated GEMMs need kernel work (experiment X8) before they pay.
+  unfused. Generated GEMMs need kernel work (experiment X8) before they pay. X8's persistent warp-specialised Gluon GEMM is within 1.10 times the
+  pinned GEMM on 25 of the suite's 32 shapes at 2048 and 8192 rows (not at 32 and 256 rows), writes its bytes on every shape measured, and a bias +
+  GELU or a gated activation fused into it is 1.33 to 1.70 times faster than the library GEMM followed by the region ("X8: results").
 
 Section 7 therefore proposes hooks on externs and cuBLASLt epilogues first, and generated GEMMs after X8; the review decided that order ("Decisions"). The advisor then reports each epilogue
 candidate with the routes and contracts that can take it.
@@ -72,6 +75,7 @@ candidate with the routes and contracts that can take it.
 
 Decisions (2026-11-16)
 E1: implementation notes (2026-11-17)
+X8: results (2026-11-17)
 0. Background: what exists
 1. Use cases
 2. The numerics problem and the three contracts
@@ -249,6 +253,181 @@ graph's for the ops traced in it (Q3):
 * **Tests:** `tests/test_epilogue_modes.py` (no GPU: the three modes and scopes on one graph that calls an extern with both hooks and a cuBLASLt
   GEMM, the report's entries in each, the refusal of an unknown mode) and its GPU counterpart in `tests/test_gpu_epilogue.py` (the mixed graph
   exported, replayed and compared byte for byte with `U(R_acc(P))` for the extern and the formula for the GEMM).
+
+## X8: results (2026-11-17)
+
+X8 asked whether a GEMM of tilefish's own can be fast enough that fusing into it pays (Q5), and whether its bytes are the library's (the E3
+question, contract (i-d)). The kernel is public: `python/examples/persistent_gemm.py`.
+
+**The kernel.** `c = a @ b`, bf16 or f16 operands, an f32 accumulator, the four layouts of `cublaslt.gemm` (`TN`, `NN`, `TT`, `NT`), the hooks
+`ACC` and `EPILOGUE` of E1 and the dual accumulator of a gated activation (`split=2`).
+
+* **sm_100 and sm_103** (`gemm_sm100_kernel`, Gluon). A persistent grid (`tilefish.persistent()`, one program per SM, a grouped tile order) whose
+  partitions run on warps of their own:
+  * a one-warp TMA producer filling a ring of up to 8 shared-memory stages, each with a `ready` and an `empty` mbarrier;
+  * a one-warp `tcgen05_mma` issuer accumulating each tile into one of two tensor-memory buffers (`2 * split * BN <= 512` columns);
+  * the epilogue on `PARTS` partitions of `NW` warps, by default two of eight, each draining one buffer while the issuer fills the other. It reads
+    the accumulator in sub-tiles of 32 columns (`tcgen05.ld 32x32b`), calls the hooks once per sub-tile and stores through shared memory by TMA.
+    The sub-tile loop is not unrolled, so a hook's code is in the binary once.
+
+  The whole `k` of a tile is one program's, in order, 64 columns a step. Its phases carry `tilefish.probe`s.
+* **sm_120** (`gemm_sm120_kernel`, Triton): TMA loads, a software-pipelined `tl.dot` (`mma.sync m16n8k16`), a persistent loop, the epilogue on
+  sub-tiles. It is built for sm_120 and held to its SASS assertions on sm_103; its logic runs on sm_103 compiled to `tcgen05` (`impl="triton"`,
+  the Gluon kernel's bytes). Its speed is a later sm_120 gate's.
+* **Configurations per bucket** (`by_bucket=` on `M`). `config_sm100` takes the tile of least modelled time: a `k` step costs
+  `BN / 256 * 271 ns` of tensor core for 128 rows (half that for 64) or its operands' bytes at 220 GB/s into an SM, whichever is longer, plus 0.3
+  us a tile, over `ceil(tiles / SMs)` rounds. It takes as many stages as shared memory holds. Over the suite's 64 shapes its tile is 0.4% slower
+  than the best of a sweep of 16 tiles on average, 8% at most.
+* **Descriptor boxes.** The descriptors' blocks are fixed by the declaration. Each block is the smallest tile of any bucket, and a larger tile is
+  copied as several boxes, so the tile still varies per bucket.
+* **What Triton 3.5.1 does not allow.**
+  * Gluon has no two-CTA MMA (`cta_group::2`) and no TMA multicast, so a tile is one CTA's. A `tl.dot` with `num_ctas=2` emitted `cta_group::2`
+    but faulted when run.
+  * Every Gluon shape is a power of two, so tiles of 96, 160 or 192 columns, which would quantise better over 30 SMs, are refused.
+  * A tensor-memory load is lowered for 4 or 8 warps only.
+
+**The setup.** A B300 MIG slice: sm_103, 30 SMs, torch 2.9.1, Triton 3.5.1, ptxas 12.9, cuBLASLt 12.8.4. A GEMM's time is the median of 30 replays
+of a CUDA graph of 20 back-to-back calls. A plan's time is `profile_plan`'s `plan_us`, the trimmed mean of 200 replays.
+
+**Speed against cuBLASLt (Q5).** Each cell of the table below gives three times in microseconds and two ratios:
+
+* the times are this GEMM's, the pinned cuBLASLt GEMM's (`heuristic="torch"`, what `torch.mm` runs), and the fastest of the 8 algorithms the
+  heuristic offers;
+* the ratios are this GEMM over the pin, and this GEMM over the fastest algorithm (an imported algorithm, `algos=AlgoTable`).
+
+The operands are bf16 in the `TN` layout.
+
+| M | N \ K | 768 | 1024 | 3072 | 4096 |
+|---|---|---|---|---|---|
+| 32 | 768 | 4.7 / 2.9 / 2.8 (1.64, 1.65) | 4.9 / 3.1 / 3.2 (1.55, 1.55) | 8.0 / 5.5 / 5.5 (1.46, 1.46) | 9.6 / 6.6 / 6.6 (1.45, 1.45) |
+| 32 | 1024 | 4.6 / 3.2 / 2.9 (1.44, 1.61) | 5.0 / 3.5 / 3.1 (1.41, 1.60) | 8.2 / 6.7 / 5.3 (1.21, 1.54) | 9.8 / 8.3 / 6.5 (1.19, 1.50) |
+| 32 | 3072 | 5.3 / 3.3 / 3.3 (1.59, 1.60) | 6.2 / 3.7 / 3.7 (1.68, 1.68) | 10.0 / 6.8 / 6.8 (1.48, 1.46) | 12.1 / 8.4 / 8.4 (1.44, 1.44) |
+| 32 | 4096 | 7.1 / 4.8 / 4.2 (1.49, 1.69) | 8.2 / 5.3 / 4.7 (1.54, 1.73) | 16.8 / 14.2 / 10.9 (1.18, 1.54) | 23.0 / 16.8 / 17.1 (1.37, 1.35) |
+| 256 | 768 | 5.2 / 3.4 / 3.2 (1.55, 1.65) | 5.7 / 3.7 / 3.5 (1.56, 1.65) | 9.6 / 6.0 / 6.0 (1.60, 1.60) | 11.5 / 7.2 / 7.2 (1.61, 1.61) |
+| 256 | 1024 | 5.8 / 4.0 / 3.6 (1.45, 1.62) | 6.3 / 4.5 / 3.9 (1.41, 1.64) | 10.9 / 8.2 / 6.5 (1.34, 1.67) | 13.3 / 10.0 / 8.2 (1.32, 1.62) |
+| 256 | 3072 | 7.8 / 5.6 / 5.6 (1.38, 1.38) | 8.8 / 7.5 / 6.3 (1.18, 1.39) | 17.4 / 16.1 / 14.1 (1.08, 1.23) | 21.8 / 20.4 / 17.8 (1.07, 1.22) |
+| 256 | 4096 | 10.5 / 6.6 / 6.6 (1.59, 1.59) | 12.2 / 7.5 / 7.5 (1.61, 1.61) | 26.1 / 17.2 / 17.2 (1.52, 1.52) | 42.5 / 27.9 / 28.0 (1.52, 1.52) |
+| 2048 | 768 | 11.8 / 9.5 / 8.9 (1.25, 1.33) | 14.0 / 13.0 / 10.6 (1.08, 1.32) | 31.3 / 30.3 / 26.0 (1.03, 1.20) | 39.9 / 38.9 / 33.7 (1.03, 1.19) |
+| 2048 | 1024 | 15.3 / 10.0 / 10.0 (1.53, 1.53) | 18.0 / 12.4 / 12.4 (1.45, 1.45) | 41.0 / 31.7 / 31.8 (1.29, 1.29) | 52.1 / 41.5 / 41.5 (1.26, 1.26) |
+| 2048 | 3072 | 31.1 / 32.2 / 25.4 (0.97, 1.22) | 38.2 / 39.6 / 31.7 (0.96, 1.20) | 108.5 / 98.7 / 92.1 (1.10, 1.18) | 145.6 / 127.5 / 122.2 (1.14, 1.19) |
+| 2048 | 4096 | 39.1 / 42.2 / 32.0 (0.93, 1.22) | 48.3 / 52.0 / 40.7 (0.93, 1.19) | 142.4 / 130.1 / 120.6 (1.09, 1.18) | 186.3 / 168.7 / 159.3 (1.10, 1.17) |
+| 8192 | 768 | 31.2 / 32.2 / 25.3 (0.97, 1.23) | 38.3 / 39.5 / 31.9 (0.97, 1.20) | 103.5 / 98.3 / 93.2 (1.05, 1.11) | 135.1 / 127.6 / 122.3 (1.06, 1.10) |
+| 8192 | 1024 | 39.4 / 42.8 / 32.2 (0.92, 1.22) | 51.6 / 53.2 / 43.9 (0.97, 1.18) | 131.4 / 130.5 / 120.6 (1.01, 1.09) | 171.7 / 170.5 / 158.4 (1.01, 1.08) |
+| 8192 | 3072 | 108.7 / 121.0 / 94.3 (0.90, 1.15) | 135.9 / 148.8 / 119.9 (0.91, 1.13) | 388.4 / 371.9 / 370.6 (1.04, 1.05) | 518.3 / 483.7 / 481.5 (1.07, 1.08) |
+| 8192 | 4096 | 142.2 / 159.5 / 124.0 (0.89, 1.15) | 177.7 / 196.6 / 157.5 (0.90, 1.13) | 519.3 / 493.9 / 493.8 (1.05, 1.05) | 680.8 / 645.2 / 645.4 (1.05, 1.05) |
+
+How many shapes are within 1.10 of the pin, by rows (the geometric mean of the ratio in brackets):
+
+| rows | within 1.10 of the pin | ratio to the pin |
+|---|---|---|
+| 8192 | 16 of 16 (0.98) | 0.89 to 1.07 |
+| 2048 | 9 of 16 (1.12) | 0.93 to 1.53 |
+| 256 | 2 of 16 (1.41) | 1.07 to 1.61 |
+| 32 | 0 of 16 (1.44) | 1.18 to 1.68 |
+
+That is 27 of 64 shapes in all. Against the fastest algorithm, only 6 of 64 are within 1.10; it is faster than the pin at `k` of 768 and 1024.
+The other layouts and f16 behave the same on a subset of 12 shapes each (`NN`, `NT`, `TT` in bf16, `TN` in f16): from 0.87 to 1.70 times the pin,
+the same pattern by rows.
+
+What costs the time is measured, not guessed:
+
+* **A fixed cost per launch.** At `k = 64` this GEMM takes 2.95 us and cuBLASLt 2.03 us, and the difference grows only slowly with `k`.
+  * The probes put about 1.2 us before the producer's first load: barrier initialisation, the tensor-memory allocation, and the partitions'
+    setup.
+  * Placing an empty kernel between the GEMMs changes neither library's time, so cuBLASLt gains nothing from overlapping its launches.
+* **Quantisation over 30 SMs.** For example, 2048 x 1024 makes 128 tiles of 128 x 128, which is 4.3 rounds, or 64 tiles of 128 x 256, which is
+  2.1. cuBLASLt's pins use clusters (`cluster_shape_id` 3 and 5).
+* **Bytes into an SM.** A one-CTA tile reads `(BM + BN) * BK` operands a step. A two-CTA tile, or a multicast to a cluster, reads fewer per CTA,
+  and Triton 3.5.1's Gluon can express neither.
+  * Where the tiles fill the SMs (2048 and 8192 rows, `N` of 3072 or more), the kernel runs at 0.9 to 1.1 times the pin. The issuer is busy
+    about 88% of the time there: it waits for a slot in a third of the steps.
+  * At 32 and 256 rows the launch cost and the rounds dominate.
+
+**Q5 reading.** The acceptance line of E3 (within 1.10 times the pinned GEMM on a fixed suite) is met at 2048 and 8192 rows, on 25 of those 32
+shapes. It is not met at 32 and 256 rows, and not against the fastest imported algorithm. A generated GEMM in place of a library call pays
+where the shape is large and the epilogue is fused (next paragraph). Below that it needs what Triton 3.5.1 lacks: two-CTA MMAs or multicast, and
+tiles that are not powers of two. A cheaper prologue would help too.
+
+**Bytes (contract (i-d)).** The kernel's bytes are the cuBLASLt pin's on every one of the 64 shapes above. They are also the pin's on the 48 shapes
+of the other layouts and f16, at every bucket of the tests (`tests/test_gpu_persistent_gemm.py`), and the fastest algorithm's bytes. No pin of
+cuBLASLt 12.8.4 on this slice splits `k` for these shapes.
+
+On six shapes with a long `k` (`32 x 768 x 4096`, `32 x 1024 x 4096`, `32 x 4096 x 4096`, `256 x 768 x 4096`, `256 x 1024 x 3072` in f16 and
+`2048 x 1024 x 4096`):
+
+* every algorithm the heuristic offers that does not split `k` (8 per shape: other ids, tiles and clusters) wrote this kernel's bytes, with no
+  element different;
+* the pin's configuration with `splitk_num` 2, 3 or 4 and f32 partial sums (reduction scheme `COMPUTE_TYPE`) differed on 0.18 to 0.24% of the
+  elements in bf16 and 1.06 to 1.19% in f16. X3b found the same 0.2% for 13.1.0's split-K pins at 32 rows.
+
+So on sm_103 the bytes of a `kind::f16` GEMM depend on the summation order over `k` and on nothing else measured.
+
+**What equality costs.** Where the pin does not split `k`, nothing: the kernel's bytes are the pin's whatever its configuration (tested: tiles,
+stages, epilogue partitions and warps), so a configuration is chosen for speed alone.
+
+To equal a split-K pin, the kernel would have to split `k` into the pin's chunks and add the f32 partial sums in the pin's order (X9). That is a
+workspace, a second pass and a kernel per split count. Every split-K algorithm above was slower than the fastest unsplit algorithm, so nothing
+was given up for equality here. At 32 rows a split of this kernel would be faster than the kernel as it is (cuBLASLt's split of 2 takes 8.5 us at
+32 x 768 x 4096, this kernel 9.6 us), but its bytes would then match no unsplit pin.
+
+**Epilogue fusion with it (E1's table again).** The patterns and sizes are E1's (bf16, `H = 1024`, `F = 4096`), in microseconds per plan. The
+columns are:
+
+* *hook*: the pair, one step, exact;
+* *hook, acc*: the pair under `epilogues="accumulator"`;
+* *(a), this GEMM*: this GEMM, then the region (a barrier);
+* *(a), cuBLASLt*: route (a) as the RFC defines it, the pinned cuBLASLt GEMM (torch posture) followed by the generated region;
+* *unfused*: cuBLASLt followed by the region's ops one kernel each, with its number of steps.
+
+| pattern | rows | hook | hook, acc | (a), this GEMM | (a), cuBLASLt | unfused (steps) | (a), cuBLASLt / hook |
+|---|---|---|---|---|---|---|---|
+| GEMM + bias + GELU (erf) | 256 | 21.7 | 20.8 | 22.8 | 18.7 | 29.9 (6) | 0.86 |
+| | 2048 | 77.8 | 75.9 | 103.5 | 103.5 | 199.0 (6) | 1.33 |
+| GEMM + bias + periodic activation | 256 | 26.6 | 26.6 | 24.6 | 20.5 | 51.2 (10) | 0.77 |
+| | 2048 | 127.9 | 124.5 | 112.5 | 112.4 | 370.5 (10) | 0.88 |
+| dual GEMM (`2F` rows) + SwiGLU | 256 | 22.4 | 26.5 | 28.8 | 24.9 | 43.0 (6) | 1.11 |
+| | 2048 | 90.1 | 124.8 | 153.5 | 153.5 | 302.5 (6) | 1.70 |
+| GEMM (`D = 256`) + residual add + RMSNorm | 256 | 10.8 (not fused) | 10.9 (not fused) | 11.3 | 9.1 | 18.0 (11) | (0.84) |
+| | 2048 | 17.0 (not fused) | 17.1 (not fused) | 16.9 | 14.1 | 32.8 (11) | (0.83) |
+
+* **Where it pays.** Fusing into this GEMM pays where its main loop is long enough to hide the epilogue and the GEMM is near the library's speed:
+  * at 2048 rows bias + GELU is 1.33 times faster than route (a) and 2.6 times faster than the unfused plan;
+  * the gated activation, whose fused op stores half the columns, is 1.70 times faster than route (a).
+
+  Against E1's naive example GEMM the fused times fall from 111.6 to 77.8 us (GELU) and from 229.8 to 90.1 us (SwiGLU).
+* **Where it does not.** At 256 rows the GEMM itself is 1.4 to 1.6 times slower than cuBLASLt's (the speed table), and the fusion saves less than
+  that.
+* **The periodic activation** (`sin` and a division per element) is issue-bound on the epilogue's warps. The probes show it:
+  * the hook takes 2.5 us per 128 x 32 sub-tile (1.2 us for erf GELU, 0.04 us for the identity), so a tile's epilogue takes 11 us on two
+    partitions against 5 us of main loop;
+  * the issuer waits for an accumulator buffer for 6.6 us a tile on average (2.6 us with GELU, nothing without a hook).
+
+  Two partitions of 8 warps are the most Triton 3.5.1's tensor-memory loads allow per partition. A periodic activation after this GEMM is 0.88
+  times route (a); E1's naive GEMM gave 1.03, against its own slower route (a).
+* **Configuration matters as much as the fusion.** On the bias + GELU pair at 2048 rows:
+  * one partition of 4 warps is 1.9 times slower (155 us) than two partitions of 8;
+  * an unrolled sub-tile loop doubled a periodic hook's code (4000 to 7900 instructions), with no other change.
+* **The norm is not fused into the Gluon kernel.** E1 fuses no row region into a Gluon hook, so the first two columns of the norm rows are route
+  (a) with this GEMM. The Triton form of the kernel (`impl="triton"`, whose sub-tile holds the whole row of 256) fuses it, but at 18.3 us, slower
+  than route (a). Its main loop is Triton's own pipeline, not this kernel's.
+* **Under `epilogues="accumulator"` the dual GEMM's pair stores the rounded result too.** The view that splits it is left in the program after
+  `R_acc` and keeps it live (`y_needed` in `tilefish._fusion`), so the kernel writes `[M, 2F]` besides the hook's output: 124.8 against 90.1 us. This
+  is a planner follow-up of E1: a view nothing reads after the rewrite should not keep the result live.
+* **Not measured.** The convolution as a GEMM was not measured with this kernel: its operands are TMA tiles of 2-D tensors, and an implicit-GEMM
+  producer (im2col boxes) is X12's and E3's work.
+* **Contract (i) held in every case.** The fused pairs equal the unfused plans byte for byte at every bucket with the special values (tests). Every
+  binary, fused or not, holds `tilefish.sass(mma="tcgen05.mma kind::f16", no_tf32=True)` at its build, and the fused binary's MMA sequence is the
+  GEMM's (tested).
+
+**The pipeline, probed** (an instrumented run of the 2048 x 4096 x 1024 plan; `tilefish.probe` around each wait). Without a hook:
+
+* the epilogue partitions wait 6.7 us for each accumulator (median), so the GEMM is bound by its main loop;
+* the issuer spends 159 ns issuing a step and waits 138 ns on average for the producer;
+* the producer waits 137 ns on average for a free slot.
+
+With bias + GELU the epilogue's wait falls to 2.8 us, the hook takes 1.2 us a sub-tile, and the issuer waits 2.6 us a tile for an accumulator:
+the epilogue is now the bottleneck by about 20%. With the periodic activation the issuer's wait is 6.6 us. Production builds hold none of the
+probes (`docs/instrument.md`).
 
 ## 0. Background: what exists
 
@@ -866,7 +1045,7 @@ capture the frontend's launches in the CUDA graph (X13).
 | | experiment | decides | needs |
 |---|---|---|---|
 | X7 | X1, X3 and X3b on sm_120 (`mma.sync`, cuBLASLt's f16 split-K pins) and on sm_90 (`wgmma`) | whether (i-d) holds beyond sm_103 | an sm_120 and an sm_90 device |
-| X8 | a Gluon `tcgen05` GEMM: persistent, warp-specialised, epilogue sub-tiles overlapping the next tile, TMA loads of side inputs, two-CTA MMAs; against cuBLASLt on a fixed suite of shapes, with and without a bias + GELU and a residual epilogue under contracts (i) and (ii) | whether E3 is worth building (Q5) | sm_103 |
+| X8 | a Gluon `tcgen05` GEMM: persistent, warp-specialised, epilogue sub-tiles overlapping the next tile, TMA loads of side inputs, two-CTA MMAs; against cuBLASLt on a fixed suite of shapes, with and without a bias + GELU and a residual epilogue under contracts (i) and (ii). **Done** ("X8: results"), without two-CTA MMAs, which Triton 3.5.1's Gluon cannot express | whether E3 is worth building (Q5) | sm_103 |
 | X9 | a generated split-K GEMM that reproduces cuBLASLt's split-K order (f32 partial sums in a workspace, reduced in a fixed order) | whether (i-d) can cover split-K pins | sm_103 |
 | X10 | a norm prologue (`x * rstd * w` into the A operand) in the X8 kernel, against a separate kernel + GEMM | E5 | sm_103 |
 | X11 | add + norm with the partial-sum split and a declared tile order; overlap-add with a halo; against their unfused plans | E4 | sm_103, sm_120 |

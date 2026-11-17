@@ -1036,7 +1036,11 @@ def up(x: Tensor[T, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16]):
 * **Speed is the kernel's**: the hook's arithmetic runs on the extern's warps after its main loop. On a B300 slice, with the example GEMM, a bias +
   GELU after a 2048 x 4096 x 1024 GEMM is 1.21 times faster fused than the GEMM followed by its region, a gated activation 1.14 times; an epilogue
   heavy for the kernel's warps can be slower (a `sin` per element after a convolution: 0.77 times; the table is in RFC 0003). `tilefish.barrier(y)`
-  keeps the region after the call.
+  keeps the region after the call. `python/examples/persistent_gemm.py` is a GEMM built for it (RFC 0003, X8): persistent and warp-specialised in
+  Gluon on sm_100/103 (a TMA producer, a `tcgen05` issuer, its epilogue on partitions of its own that overlap the next tile's main loop). On a B300
+  slice it is within 1.10 times cuBLASLt's pinned GEMM on 25 of 32 suite shapes at 2048 and 8192 rows (1.1 to 1.7 times at 32 and 256 rows), with
+  the pin's bytes on every shape measured; bias + GELU fused into it is 1.33 times faster than cuBLASLt followed by the region at
+  2048 x 4096 x 1024, a gated activation 1.70 times.
 * **Nothing new for a host or a schema**: an extern with hooks is launched through a small generated module that calls its kernel with the identity
   hook (in its declaration digest), and a fused pair is a generated entry of its own, `<extern>_epi_<hash>`, its identity the IR it compiles to.
   `python/examples/epilogue_gemm.py` has a Triton GEMM (`tcgen05.mma` on sm_100/103, `mma.sync` on sm_120, both asserted in the SASS), its
