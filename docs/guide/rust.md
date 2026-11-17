@@ -1,6 +1,6 @@
 # The Rust host
 
-The `tilefish` crate (`crates/tilefish`, version 0.0.1) is the
+The `tilefish` crate (`crates/tilefish`, version 0.0.11) is the
 host of a manifest directory, without Python or Triton: it reads the manifest as
 strict JSON, recomputes the digests exactly as Python does (the `sha256` of each
 cubin, the `sha256_code` of its machine code, and the digest of the whole
@@ -65,7 +65,7 @@ one that chose it, when the algorithm is not one cuBLASLt would have produced,
 and when the library does not approve it for the problem. Its workspace is the
 caller's last tensor (`Gemm::alloc_workspace` allocates the size the entry says),
 so a launch allocates nothing and can be captured; the slices of a GEMM are
-ordered like a kernel's. The published crate 0.0.1 reads schema 2 only. `emit`
+ordered like a kernel's. Crate 0.0.11 reads manifest schema 3 (and refuses an older one) and plan schema 1 (`tilefish.plan.v1`). `emit`
 writes typed launchers for all of it; the committed fixtures of the crate are
 schema 3 manifests.
 

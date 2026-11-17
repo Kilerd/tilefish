@@ -1,7 +1,16 @@
 # How a build works
 
-```sh
-tilefish build --arch sm_90,sm_100,sm_120 --host python,rust,cpp
+A build is the Python API; there is no build command line:
+
+```python
+from tilefish.hosts import cpp, rust
+
+p = tilefish.runtime.export(block, "build/")      # binaries, manifest.json and plan.json for the device's architecture (or arch="sm_100")
+rust.emit_plan(p, "runner.rs")                     # a typed Rust runner of the pinned plan (rust.emit: launchers of a manifest)
+cpp.emit_plan(p, "runner.hpp")                     # the same for C++ (cpp.emit)
+
+(spec,) = tilefish.aot.compile_specs(gelu)         # step 4 for one extern: its compile inputs, one spec per bucket
+k = tilefish.aot.build(spec, arch="sm_100")        # one cubin
 ```
 
 1. Trace the graph into a typed IR and check it: shapes, dtypes, divisibility,
@@ -15,16 +24,17 @@ tilefish build --arch sm_90,sm_100,sm_120 --host python,rust,cpp
 5. Write a manifest: symbol, parameter ABI in order, grid rule, block size,
    shared memory, launch attributes, toolchain versions, and a digest of the
    machine code.
-6. Generate the hosts from the manifest and the types: a `torch.library`
-   custom op for Python, a header for C++, a `cudarc` crate for Rust. Every
+6. Generate the hosts from the manifest and the types (`tilefish.hosts`): typed
+   launchers and plan runners, a header for C++ and a module for the Rust
+   crate (Python launches the manifest itself, `replay`). Every
    precondition that selected a binary (alignment, divisibility, static sizes)
    becomes a check in the generated launcher, so no host can run a binary
    under assumptions it was not compiled for.
 
 Library operators put a different code object behind the same kind of
-manifest entry: a CUTLASS instantiation with a C entry point, a CuTe DSL
-ahead-of-time export, or a pinned cuBLASLt algorithm recorded with its
-workspace size and replayed as is (the last exists: a bf16 GEMM, in [`operators.md`](operators.md)).
+manifest entry: a pinned cuBLASLt algorithm recorded with its workspace size
+and replayed as is, or a pinned cuDNN convolution ([`operators.md`](operators.md)); a CuTe DSL
+ahead-of-time export is an extern of a prebuilt cubin ([`../cute.md`](../cute.md)).
 
 The Python side has three modes:
 

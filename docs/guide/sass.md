@@ -57,7 +57,7 @@ $ tilefish-explain build/mm mm --diff-arch sm_120       # or --diff OTHER_EXPORT
 **Which steps could be one kernel** (`docs/advise.md`): `tilefish-explain build/block --graph block --advise` ranks the fusion candidates of a plan
 (steps joined by intermediates one kernel would not store) by the bytes and time they would save, says why each is not one kernel today and what to do
 (write an extern's arithmetic in the graph body, add `order=` so that fusion version 2 takes a reduction into a row region, remove a barrier; a GEMM
-epilogue is future work, RFC 0003), and sums the plan's time by class. `tilefish.profile_plan(block, "build/block", bucket="M=128", ...)` (or `--profile`) measures every step on the device, a runtime path
+epilogue: an epilogue hook on an extern, or `tilefish.fusion(epilogues="library")` for a cuBLASLt GEMM, [`fusion.md`](fusion.md)), and sums the plan's time by class. `tilefish.profile_plan(block, "build/block", bucket="M=128", ...)` (or `--profile`) measures every step on the device, a runtime path
 outside every artefact, and `--timing` ranks by what it measured.
 
 **What goes on inside a kernel** (`docs/instrument.md`): `tilefish.probe("load.wait")` marks a phase boundary in a `@tilefish.kernel` body, a
