@@ -65,10 +65,11 @@ def test_readme_dims_and_formats(ns):
 def test_the_masks_section_runs_and_lowers():
     import re
 
-    if not (REPO_ROOT / "README.md").exists():
-        pytest.skip("README.md is not available (not running from a source checkout)")
-    m = re.search(r"## Masks, indices, gathers and copies\n.*?```python\n(.*?)```", (REPO_ROOT / "README.md").read_text(), re.S)
-    assert m, "README.md has no python block under '## Masks, indices, gathers and copies'"
+    page = REPO_ROOT / "docs" / "guide" / "lowering.md"
+    if not page.exists():
+        pytest.skip("docs/guide/lowering.md is not available (not running from a source checkout)")
+    m = re.search(r"# Masks, indices, gathers and copies\n.*?```python\n(.*?)```", page.read_text(), re.S)
+    assert m, "docs/guide/lowering.md has no python block under '# Masks, indices, gathers and copies'"
     namespace: dict = {}
-    exec(compile(m.group(1), "README.md", "exec"), namespace)
+    exec(compile(m.group(1), "docs/guide/lowering.md", "exec"), namespace)
     assert namespace["embed"].lower().template == "row" and "static_range" in namespace["greedy"].lower().source

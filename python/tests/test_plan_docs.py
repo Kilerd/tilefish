@@ -54,11 +54,11 @@ def test_the_steps_with_views_and_the_arena_numbers_of_the_block_are_the_ones_th
         assert spaced(n) in text, n
 
 
-def test_the_arena_numbers_of_the_readme_are_the_ones_the_plans_have():
-    readme = REPO_ROOT / "README.md"
-    if not readme.exists():
-        pytest.skip("README.md is not available (not running from a source checkout)")
-    text = readme.read_text(encoding="utf-8")
+def test_the_arena_numbers_of_the_plans_guide_are_the_ones_the_plans_have():
+    guide = REPO_ROOT / "docs" / "guide" / "plans.md"
+    if not guide.exists():
+        pytest.skip("docs/guide/plans.md is not available (not running from a source checkout)")
+    text = guide.read_text(encoding="utf-8")
     block = tilefish.plan(pm.block, reuse=True)
     deep = tilefish.plan(pm.deep_block(24), reuse=True)
     spaced = lambda n: f"{n:,}".replace(",", " ")  # noqa: E731
