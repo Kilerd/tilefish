@@ -3,8 +3,8 @@
 **English** | [简体中文](../zh-CN/README.md)
 
 * [`scope.md`](scope.md): what tilefish is and is not, and how features are added.
-* [`../README.md`](../../README.md): the overview, the install and a quick start for each host.
-* [`zh-CN/README.md`](../zh-CN/README.md): this index in Simplified Chinese, which lists the Chinese pages.
+* [`../../README.md`](../../README.md): the overview, the install and a quick start for each host.
+* [`../zh-CN/README.md`](../zh-CN/README.md): this index in Simplified Chinese, which lists the Chinese pages.
 
 ## Guide
 
@@ -39,10 +39,10 @@ The reference of each stage, from a declaration to a launch from a host:
   * [`explain.md`](explain.md): traces, `tilefish-explain` and SASS assertions;
   * [`instrument.md`](instrument.md): probes and the instrumented variant;
   * [`advise.md`](advise.md): the fusion advisor.
-* The Rust crate's own page: [`../crates/tilefish/README.md`](../../crates/tilefish/README.md).
+* The Rust crate's own page: [`../../crates/tilefish/README.md`](../../crates/tilefish/README.md).
 
 ## Design records and history
 
 * [`rfcs/`](rfcs): [0001, plan fusion](rfcs/0001-plan-fusion.md); [0002, the C++ host](rfcs/0002-cpp-host.md);
   [0003, epilogue and prologue fusion](rfcs/0003-epilogue-fusion.md).
-* [`../CHANGELOG.md`](../../CHANGELOG.md): what each release changed.
+* [`../../CHANGELOG.md`](../../CHANGELOG.md): what each release changed.

@@ -4,7 +4,7 @@
 
 * [`scope.md`](scope.md)：tilefish 是什么、不是什么，以及如何添加功能。
 * [`../../README.zh-CN.md`](../../README.zh-CN.md)：概览、安装，以及每种 host（宿主）的快速上手。
-* [`../README.md`](../en/README.md)：本索引的英文版，列出英文页面。
+* [`../en/README.md`](../en/README.md)：本索引的英文版，列出英文页面。
 
 ## 指南
 
