@@ -1,5 +1,7 @@
 # RFC 0001: Plan fusion
 
+**English** | [简体中文](../zh-CN/rfcs/0001-plan-fusion.md)
+
 * **Status:** reviewed; the decisions of 2026-11-15 are recorded in "Decisions" below. Phase 0 is measured, phase 1 is implemented
   ("Phase 1" below), and phase 2's row regions are implemented as `tilefish.fusion(version=2)` ("Phase 2" below); the rest is design.
 * **Date:** 2026-11-15.
