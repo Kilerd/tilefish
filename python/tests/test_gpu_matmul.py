@@ -325,6 +325,12 @@ def residual_block_1024(mode):
     return block_1024
 
 
+def _relu_is_binary_defined_here():
+    """Whether this device's cuBLASLt answers a ReLU epilogue with an algorithm that maps a NaN to 0 (cuBLASLt 12.8.4 and 13.1.0 on sm_120:
+    algorithm 21, the only one they return for an epilogue there, measured), so that a rewrite into it, declared measured-exact, is refused."""
+    return torch.cuda.get_device_capability() == (12, 0) and _cublaslt.version() in (120804, 130100)
+
+
 def biased_relu(mode):
     @tilefish.graph(fusion=tilefish.fusion(epilogues=mode))
     def ffn(x: Tensor[M, 1024, f16], w: Tensor[3072, 1024, f16], bias: Tensor[3072, f16]):
@@ -355,6 +361,12 @@ def test_a_rewritten_plan_writes_the_formula_on_the_accumulator_in_jit_replay_an
     lib, exact = make("library"), make("exact")
     plan = tilefish.plan(lib)
     assert [s["kind"] for s in plan.steps(M=32)] == ["library"] and len(tilefish.plan(exact).steps(M=32)) == 2
+    if _relu_is_binary_defined_here():  # (both plans end in a ReLU)
+        # cuBLASLt 12.8.4 and 13.1.0 on sm_120 have algorithm 21 alone for an epilogue, whose ReLU maps a NaN to 0: the rewrite, declared measured-exact, is
+        # refused at export and at its first jit run, never run with other bytes (RFC 0003, 7.3)
+        with pytest.raises(TilefishBuildError, match=r"asks for contract='measured-exact'.*relu"):
+            runtime.export(lib, tmp_path / "refused")
+        return
     written = runtime.export(lib, tmp_path / "lib")
     doc = json.loads((tmp_path / "lib" / "manifest.json").read_text())
     assert {e["contract"] for e in doc["library"]} == {"measured-exact"} and all("canary" in e for e in doc["library"])

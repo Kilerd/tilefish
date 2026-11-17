@@ -989,7 +989,8 @@ MATMUL_FORMS = {
     "mm_relu_c": ("f16", "NN", "relu", 1, 3072, 1024, {"heuristic": "torch"}),
     "mm_relu_bias_c": ("bf16", "TN", "relu_bias", 1, 3072, 1024, {"sm_count_target": 16}),
     "mm_relu_tt_c": ("bf16", "TT", "relu", 1, 1024, 1024, {}),
-    "mm_relu_bias_plain": ("f16", "TN", "relu_bias", 0, 1536, 512, {"canary": False, "contract": "measured-exact"}),
+    # no canary, and contract="measured-exact" declared: a bias (not a ReLU, which cuBLASLt 12.8.4 computes with a NaN to 0 on sm_120, binary-defined)
+    "mm_bias_plain": ("f16", "TN", "bias", 0, 1536, 512, {"canary": False, "contract": "measured-exact"}),
 }
 
 

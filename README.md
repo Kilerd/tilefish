@@ -1071,8 +1071,9 @@ region as an action (`epilogue-library-cublaslt`). Measured on a B300 MIG slice 
 | 128 x 3072 x 1024, bf16 | 8.3 → 6.3 (-24%) | 8.3 → 6.3 (-24%) | 8.3 → 6.3 (-24%) | 8.3 → 6.3 (-24%) |
 | 8192 x 3072 x 768, f16 | 192.7 → 124.7 (-35%) | 192.5 → 135.7 (-30%) | 208.0 → 136.3 (-34%) | 215.9 → 147.0 (-32%) |
 
-The bytes differ from the exact plan's on 14 to 29% of the elements (one rounding fewer). GELU (binary-defined), cuDNN fused graphs and generated
-GEMMs come later.
+The bytes differ from the exact plan's on 14 to 29% of the elements (one rounding fewer). On sm_120 (an RTX 5090) cuBLASLt's one algorithm for an
+epilogue maps a ReLU's NaN to 0, so a ReLU (and some bias + residual shapes) is refused there under `"library"`, never run with other bytes (RFC
+0003, 7.3). GELU (binary-defined), cuDNN fused graphs and generated GEMMs come later.
 
 **One graph, several modes.** `epilogues=` is `"exact"` (the default), `"accumulator"` or `"library"`, per graph or per `tilefish.fused` scope (the
 innermost wins for the ops traced in it; never per call). `"library"` keeps the exact hooks of externs and adds the cuBLASLt rewrite; `"accumulator"`

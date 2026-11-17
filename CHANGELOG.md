@@ -76,6 +76,8 @@ body widens a cuBLASLt GEMM's result).
   distance); `contract="measured-exact"` refuses a pin that is not. Measured on a B300 MIG slice over 14 shapes, bf16 and f16, both postures and seven
   cases (392 pins per version): every pin measured-exact with cuBLASLt 12.8.4; with 13.1.0, 372 of 392, the others the pins of algorithm 21 at
   32 x 1024 x 3072, which adds a bias to `c` in neither order and whose ReLU maps a NaN to 0 (`docs/rfcs/0003-epilogue-fusion.md`, section 7.3).
+  On an RTX 5090 (sm_120) both versions answer every epilogue with algorithm 21: 140 of 392 pins measured-exact (`bias`, `c`, half of `bias` with
+  `c`), every ReLU binary-defined (a NaN to 0), so `epilogues="library"` refuses a ReLU there.
 - **A canary, on by default** (`canary=True`): `export` records the digest of the pin's result on operands made on the device from a seed (the PTX
   module of the cuDNN canaries); a replay runs it once per process and device and refuses another digest (and a first replay inside a capture), as the
   Rust and C++ hosts do at load.

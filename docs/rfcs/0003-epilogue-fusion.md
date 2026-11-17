@@ -1003,7 +1003,15 @@ No case is slower; the residual add with a bias at 640 x 1024 x 4096 saves nothi
   operands (or pin the rewrite with the GEMM's configuration, where cuBLASLt takes it with the epilogue), and say when the plan keeps `U(P)`'s GEMM.
 * `beta * C` written in place (`D == C`, an `alias`) and f32 results; `R_acc` of a library call (under `"accumulator"` a cuBLASLt GEMM is left as
   it is). The scopes of `tilefish.fused(epilogues=...)` apply to the rewrite since the merge with E1 ("E1 and E2 together").
-* sm_120 and sm_90 (X7): the matrix and the split-K pins of sm_120 are tests that wait for a gate on those devices.
+* sm_90 (X7).
+* **sm_120, measured at the 0.0.12 gate** (RTX 5090, 170 SMs; `tests/test_gpu_matmul.py` and the matrix above): cuBLASLt 12.8.4 and 13.1.0 alike
+  answer every epilogue but `none` with algorithm 21 (every candidate the heuristic returned, for the six problems asked). Of the 392 pins per
+  version 140 are measured-exact (`bias`, `none` with `c`, half of `bias` with `c`); every ReLU (224) is binary-defined, its ReLU mapping a NaN to 0
+  (every finite value is the formula's), and 28 of `bias` with `c` add the two in neither order (up to 15298 ULP). So on sm_120
+  `epilogues="library"` refuses a ReLU, and those `bias` with `c` problems, at export and at the first jit run, as its declaration asks: no plan
+  writes other bytes, and the gate's plans there take a bias. f16 split-K pins with the opt-in are taken and verified like any other (all
+  binary-defined); without it no epilogue splits `k`. Two ways forward: a ReLU written `tilefish.where(h > 0.0, h, 0.0)` (a NaN to 0) is algorithm
+  21's formula, which a matcher of that form could verify measured-exact; or a binary-defined contract with a declared tolerance, as for GELU.
 
 ## 8. Questions (resolved 2026-11-16)
 
