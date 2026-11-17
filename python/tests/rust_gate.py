@@ -102,6 +102,13 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   sm_100, sm_103 and sm_120 the persistent GEMM of the examples, ``cute_gemm`` (on sm_100 and sm_103 three TMA descriptors the DSL encoded, a cluster of
   2, the fast divisors of its tile scheduler), and on sm_100 and sm_103 the non-persistent ``cute_gemm_dense``, each over its buckets; the plan ``cute_chain`` (a CuTe GEMM step and a CuTe add step).
 
+* **the locked set** (``locked_graphs.py``, on sm_90 or newer): a plan set with a step of every kind of callee an export builds or pins (a generated
+  kernel, Triton, Gluon, a prebuilt PTX and cubin, a pinned cuBLASLt GEMM, a cuBLASLt matmul with an epilogue and a canary, a cuDNN convolution with a
+  canary, fused regions, a global scratch in the workspace), its plans ``locked-lk_mlp`` and ``locked-lk_conv`` cases like the others. ``prepare
+  --locked DIR --lock FILE`` takes the set from ``DIR``, the directory a **locked export** wrote on a machine without a GPU
+  (``export(..., lock=FILE)``, ``docs/guide/locked-export.md``), held to the lock's sha256 and replayed under the set digest the lock records, instead
+  of exporting it here: Python's replay, the Rust host and the C++ host then load and run those artefacts (and their canaries).
+
 * **instrumented binaries** (:func:`prepare_instrumented`, ``WORK/instrumented.json``; on sm_90 or newer): the probed kernels of ``rust_gate_probed.py`` (a
   warp-specialised Gluon kernel with a probe around each wait of each partition, and a ``@tilefish.kernel`` with probes) exported as an instrumented
   variant (``export(..., instrument=True)``, ``docs/en/instrument.md``), and the graph ``probed_chain`` as an instrumented plan. Python replays each with
@@ -1749,9 +1756,10 @@ def write_fused_runners(work, fused):
     (work / "fused_runners.hpp").write_text("".join(out), encoding="utf-8")
 
 
-def prepare_plans(work):
+def prepare_plans(work, locked=None, lock=None):
     """Export the plans of :func:`plan_graphs` to ``WORK/plans/<name>`` and run every case through ``tilefish.run(..., mode="replay", plan=...)`` with
-    the pin; write ``WORK/plans.json`` for ``gpu_gate.rs``::
+    the pin; write ``WORK/plans.json`` for ``gpu_gate.rs``. ``locked`` (with ``lock``, its lock file) is the directory of the plan set of
+    ``locked_graphs`` a locked export wrote (on a machine without a GPU), which the gate takes instead of exporting the set::
 
         {"plans": [{"name", "dir", "digest", "graph", "reuse", "arena_bytes", "cases": [{"id", "bucket": {dim: value}, "devscalars": {name: int},
           "externals": [{"name", "role", "dtype", "shape", "input"?, "expect"?}]}]}]}
@@ -1793,6 +1801,31 @@ def prepare_plans(work):
     for g, make_cases in stage_cases(stages_dir, stages.digest):
         extra = {"dir": f"plans/shared/{g.name}.plan.json", "set": "plans/shared", "set_digest": stages.digest, "shared": True}
         exports.append((f"shared-{g.name}", g, False, make_cases, stages_dir, stages[g.name], stages.digest, extra))
+    # the plan set of locked_graphs (a step of every kind of callee an export builds or pins): exported here, or with --locked the directory a
+    # locked export wrote on a machine without a GPU (docs/guide/locked-export.md), held to its lock and replayed under the set digest the lock records
+    import locked_graphs as lg
+
+    locked_dir = root / "locked"
+    if not tma_capable():  # (a step of the set has device-side TMA descriptors)
+        if locked is not None:
+            sys.exit("--locked: the locked set has device-side TMA descriptors, and this device is older than sm_90")
+        lg_graphs = ()
+    elif locked is None:
+        locked_set, lg_graphs = runtime.export(list(lg.GRAPHS), locked_dir), lg.GRAPHS
+    else:
+        from tilefish import _lock
+
+        held = _lock.read_lock(lock)
+        shutil.copytree(locked, locked_dir)
+        _lock.verify_tree(locked_dir, held)
+        set_pin = held.doc["digests"]["set"]
+        index = tilefish._plan.read_plan_set(locked_dir, pin=set_pin)
+        locked_set = tilefish._plan.PlanSet(index, locked_dir, {g.name: tilefish._plan.load_plan(locked_dir, g, pin=set_pin) for g in lg.GRAPHS})
+        lg_graphs = lg.GRAPHS
+        print(f"the locked set: {locked} ({len(held.doc['files'])} files, the lock's), set digest {set_pin}", file=sys.stderr)
+    for g in lg_graphs:
+        extra = {"dir": f"plans/locked/{g.name}.plan.json", "set": "plans/locked", "set_digest": locked_set.digest}
+        exports.append((f"locked-{g.name}", g, False, lambda g=g: lg.cases(g), locked_dir, locked_set[g.name], locked_set.digest, extra))
     for name, graph, reuse, make_cases, directory, exported, pin, extra in exports:
         doc = exported.doc
         params = [b for b in doc["buffers"] if b["role"] in ("input", "weight", "inout", "devscalar")]
@@ -2197,17 +2230,23 @@ def main(argv=None):
     p.add_argument("work", type=pathlib.Path)
     p.add_argument("--manifest", type=pathlib.Path, help="use this manifest directory instead of exporting one")
     p.add_argument("--pin", help="the digest of --manifest (default: the one expected.json next to a fixture directory has)")
+    p.add_argument(
+        "--locked", type=pathlib.Path, help="the plan set of locked_graphs as a locked export wrote it (no GPU), instead of exporting it here (with --lock)"
+    )
+    p.add_argument("--lock", type=pathlib.Path, help="the lock file of --locked: the directory is held to it, and replayed under its set digest")
     c = sub.add_parser("compare")
     c.add_argument("work", type=pathlib.Path)
     c.add_argument("--host", choices=("rust", "cpp"), default="rust", help="whose files to compare: the Rust test's, or the C++ gate's")
     args = parser.parse_args(argv)
     if args.command == "prepare":
+        if (args.locked is None) != (args.lock is None):
+            sys.exit("--locked and --lock go together: the directory of a locked export and its lock file")
         prepare(args.work, args.manifest, args.pin)
         # The GEMM whose pinned algorithm needs a workspace (gpu_gate.rs reads WORK/workspace_case); after prepare, which empties WORK.
         import rust_workspace_case
 
         rust_workspace_case.main(args.work)
-        prepare_plans(args.work)  # the launch plans (gpu_gate.rs reads WORK/plans.json)
+        prepare_plans(args.work, args.locked, args.lock)  # the launch plans (gpu_gate.rs reads WORK/plans.json)
         prepare_instrumented(args.work)  # the instrumented binaries and plan (gpu_instrument_gate.rs reads WORK/instrumented.json)
         return 0
     return compare(args.work, args.host)
