@@ -287,6 +287,42 @@ def test_a_gluon_externs_hooks_take_elementwise_regions_in_both_modes():
     assert not f.hooked and f.refused[0]["reason"] == "epilogue-row"  # (a Gluon tile has its kernel's layout: no row regions in E1)
 
 
+# -- E1 and E2 in one graph ---------------------------------------------------------------------------------------------------------------
+
+
+def test_a_cublaslt_epilogue_and_a_hooked_extern_on_its_accumulator_in_one_graph(externs, tmp_path):
+    """docs/rfcs/0003-epilogue-fusion.md, "E1 and E2 together": a graph declared epilogues="library" with an "accumulator" scope around an extern's
+    arithmetic is one cublaslt.matmul (the GEMM and its bias) and one fused pair on the extern's accumulator, and writes the bytes of its unfused
+    composition (both rewrites, no fusion) at every bucket, through jit, export and replay."""
+    up = eg.cublaslt_up("gmix_up")
+    fused = eg.mixed(externs[0], up, "gmix")
+    unfused = eg.mixed(externs[0], up, "gmix_unfused", grouping="none")
+    plan = tilefish.plan(fused)
+    kinds = [(s["entry"].split(".")[0].split("_epi_")[0], s["kind"]) for s in plan.steps(T=64)]
+    assert kinds == [("gmix_up__bias", "library"), (externs[0].name, "kernel")]
+    assert [h.contract for h in _fusion.fused(fused).hooked] == ["accumulator"]
+
+    def args_at(t, seed):
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        x = torch.randn(t, eg.H.value, generator=gen).to(torch.bfloat16).to(CUDA)
+        w1 = (torch.randn(eg.F.value, eg.H.value, generator=gen) / 16).to(torch.bfloat16).to(CUDA)
+        w2 = (torch.randn(eg.F.value, eg.F.value, generator=gen) / 16).to(torch.bfloat16).to(CUDA)
+        b1, b2 = (_fusion._sample(torch, bf16, (eg.F.value,), seed * 10 + k, CUDA) for k in (1, 2))
+        return [x, w1, b1, w2, b2]
+
+    for t in eg.T.buckets:
+        for seed in (0, 1):
+            args = args_at(t, seed)
+            assert_same(run(fused, args), run(unfused, args), f"mixed at T={t}, seed {seed}")
+    p = runtime.export(fused, tmp_path)
+    rep = json.loads((tmp_path / f"{fused.name}.fusion.json").read_text())
+    assert [w["into"] for w in rep["library_epilogues"] if w["applied"]] == ["gmix_up__bias"]
+    assert [r["contract"] for r in rep["regions"] if r.get("route") == "hook"] == ["accumulator"]
+    args = args_at(200, 7)
+    replayed = tilefish.run(fused, *[a.clone() for a in args], mode="replay", plan=tmp_path, pin=p.digest)
+    assert_same([replayed], run(fused, args), "replay")
+
+
 # -- export, replay, capture, the binary, the reference ------------------------------------------------------------------------------------
 
 

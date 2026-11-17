@@ -1,7 +1,8 @@
 """Graphs whose bodies compute on the result of an extern with epilogue hooks (``docs/rfcs/0003-epilogue-fusion.md``, milestone E1): the patterns of
 E1, each in four modes (``MODES``: fused and unfused, exact and accumulator), built over a set of externs by :func:`build`: the example externs
 (``python/examples/epilogue_gemm.py``, :func:`examples`) on a GPU, and stand-ins with the same stubs and hooks (:func:`standins`, never compiled) on
-any machine. For ``test_epilogue.py`` (no GPU), ``test_gpu_epilogue.py`` and the Rust and C++ gates (``rust_gate.py``: ``fused_epi_*``).
+any machine. For ``test_epilogue.py`` (no GPU), ``test_gpu_epilogue.py`` and the Rust and C++ gates (``rust_gate.py``: ``fused_epi_*``). :func:`mixed`
+is a graph of E1 and E2 together (a cuBLASLt epilogue and a hooked extern on its accumulator).
 
 No ``from __future__ import annotations``: tilefish evaluates annotations at declaration.
 """
@@ -182,3 +183,38 @@ def build(externs, prefix="epi"):
     for name, (body, params) in bodies(*externs).items():
         out[name] = {mode: graph_of(body, params, fusion, f"{prefix}_{name}_{mode}") for mode, fusion in MODES.items()}
     return out
+
+
+# -- E1 and E2 in one graph -----------------------------------------------------------------------------------------------------------------
+
+
+def cublaslt_up(name):
+    """A ``cublaslt.gemm`` of ``x [T, H]`` by ``w [F, H]`` (bf16, the default posture): the GEMM of :func:`mixed` that ``epilogues="library"`` rewrites."""
+    sig = inspect.Signature(
+        [inspect.Parameter("a", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Tensor[T, H, bf16]),
+         inspect.Parameter("b", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Tensor[F, H, bf16])],
+        return_annotation=Tensor[T, F, bf16],
+    )  # fmt: skip
+
+    def stub(*args): ...
+
+    stub.__signature__ = sig
+    stub.__name__ = stub.__qualname__ = name
+    return tilefish.library(name, acc=f32, impl="cublaslt.gemm")(stub)
+
+
+MIXED_PARAMS = [("x", Tensor[T, H, bf16]), ("w1", Tensor[F, H, bf16]), ("b1", Tensor[F, bf16]), ("w2", Tensor[F, F, bf16]), ("b2", Tensor[F, bf16])]
+
+
+def mixed(gemm, up, name, mode="library", scope="accumulator", grouping="auto"):
+    """E1 and E2 in one graph (``docs/rfcs/0003-epilogue-fusion.md``, "E1 and E2 together"): the cuBLASLt GEMM ``up`` (:func:`cublaslt_up`) and a
+    bias, a cuBLASLt epilogue (``BIAS``) under ``mode``, then the extern ``gemm`` (with both hooks) and a bias + SiLU in a ``tilefish.fused(epilogues=
+    scope)`` scope. With the defaults: one ``cublaslt.matmul`` step and one fused pair on the extern's accumulator; ``grouping="none"`` is its unfused
+    composition (both rewrites kept: they are numerics, not fusion), which the fused plan must equal byte for byte."""
+
+    def body(x, w1, b1, w2, b2):
+        h = (up(x, w1).to(f32) + b1.to(f32)).to(bf16)
+        with tilefish.fused(epilogues=scope):
+            return tilefish.silu(gemm(h, w2).to(f32) + b2.to(f32)).to(bf16)
+
+    return graph_of(body, MIXED_PARAMS, tilefish.fusion(epilogues=mode, grouping=grouping), name)

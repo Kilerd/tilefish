@@ -1513,13 +1513,18 @@ def plan_graphs():
 
     major, minor = torch.cuda.get_device_capability()
     cap = major * 10 + minor
-    epi = epg.build(epg.examples(cap), prefix="gate_epi")
+    externs = epg.examples(cap)
+    epi = epg.build(externs, prefix="gate_epi")
     fused += [
         (f"fused_epi_{name}" + ("" if mode == "fused" else "_acc"), epi[name][mode], False, fused_cases(epi[name][mode]))
         for name in sorted(epi)
         for mode in ("fused", "acc")
         if not (name == "add_norm" and mode == "acc")  # (its residual add is in bf16: nothing for R_acc to rewrite, the same plan)
     ]
+    # E1 and E2 in one graph (RFC 0003, "E1 and E2 together"): a cuBLASLt GEMM and its bias as one cublaslt.matmul (epilogues="library", its canary
+    # at the load) and the example GEMM with a bias + SiLU in its value="acc" hook (a tilefish.fused(epilogues="accumulator") scope)
+    mixed = epg.mixed(externs[0], epg.cublaslt_up("gate_mix_up"), "gate_epi_mixed")
+    fused.append(("fused_epi_mixed", mixed, False, fused_cases(mixed)))
     if cap in (100, 103):
         import epilogue_gemm as ex
 
