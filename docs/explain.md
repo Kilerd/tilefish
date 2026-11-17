@@ -1,5 +1,7 @@
 # SASS traceability: traces, `tilefish-explain` and SASS assertions
 
+**English** | [简体中文](zh-CN/explain.md)
+
 Every kernel goes DSL / Triton / Gluon → TTIR → TTGIR → LLVM IR → PTX → `ptxas` → SASS. Tracing a hot spot or a bit difference back through that
 chain used to mean dumping and diffing every level by hand, and sampling profilers attribute the time of asynchronous `wgmma` / `tcgen05` code to the
 points that wait for it rather than to the work. tilefish makes the SASS of every kernel explainable and checkable:

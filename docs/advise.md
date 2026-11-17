@@ -1,5 +1,7 @@
 # The fusion advisor: which steps of a plan could be one kernel
 
+**English** | [简体中文](zh-CN/advise.md)
+
 `tilefish-explain` explains one kernel; it does not say which parts of a model would go faster as fewer kernels. The advisor does that for a whole
 plan: it ranks the **fusion candidates** of a graph's plan (steps joined by intermediates that one kernel would never store) by the time they would
 save, says why each is not one kernel today and what to do about it, and sums the time of the plan by class of step. A profiler measures the device

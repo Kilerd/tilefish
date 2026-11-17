@@ -1,5 +1,7 @@
 # Numerics: the CUDA math guard, the procedure on a CUDA or torch change, and decisions
 
+**English** | [简体中文](zh-CN/numerics.md)
+
 The numerics contract of a lowered kernel is the docstring of `tilefish.lower` (its table and notes 1 to 20): every op, the PTX it becomes,
 and what its bits are, measured. This document is about what that contract depends on outside tilefish, how to check it again when that
 changes, and the decisions the contract rests on.
