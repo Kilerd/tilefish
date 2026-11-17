@@ -41,7 +41,8 @@ are all made from the declarations and the binaries. Measured: the plan set of `
 extern, a prebuilt PTX and cubin, a pinned cuBLASLt GEMM, a `cublaslt.matmul` with an epilogue, a cuDNN convolution, two fused regions, a kernel whose
 global scratch is the plan's workspace, two buckets per graph, three canaries), exported on a B300 MIG slice (sm_103, 30 SMs, Python 3.11) and locked
 there, then exported from the lock on a CPU-only machine (Python 3.12, no torch, no CUDA driver) with the same Triton 3.5.1 and ptxas 12.9.86: 14 files, 0
-differences, in 1.3 s from a cold build cache.
+differences, in 1.3 s from a cold build cache. Locked on an RTX 5090 (sm_120, 170 SMs) and exported from that lock on the same CPU-only machine: 14
+files, 0 differences.
 
 ## The lock file (`tilefish.lock.v1`)
 

@@ -17,7 +17,8 @@ each section names the release that added it.
 - **`tilefish.runtime.export(..., lock=path)`** is a locked export: no GPU, no CUDA driver, no torch, no heuristic, nothing run on a device even when
   one is there. Every binary is built for the lock's architecture, every device fact comes from the lock, each binary is held to the lock's sha256
   before anything is written and every file of the directory after; the output is the GPU export's byte for byte (the plan set of
-  `python/tests/locked_graphs.py`, a step of every kind of callee: 14 files, 0 differences between a B300 MIG slice and a CPU-only machine). A pin,
+  `python/tests/locked_graphs.py`, a step of every kind of callee: 14 files, 0 differences between a B300 MIG slice and a CPU-only machine, and
+  between an RTX 5090 and the CPU-only machine). A pin,
   a region or a binary the lock does not have, another tilefish, Triton or ptxas, another architecture or a file of other bytes raises the new
   `tilefish.TilefishLockError`, naming the first difference and what to do (re-lock on a GPU): there is no fallback. A CuTe DSL kernel, compiled and
   captured on a GPU, is refused.
