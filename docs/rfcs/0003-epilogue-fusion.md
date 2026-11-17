@@ -117,7 +117,7 @@ names, and "D6" in this RFC is still RFC 0001's export-time verification):
 
 ## E1: implementation notes (2026-11-17)
 
-Implemented on tilefish 0.0.11 as `tilefish.hook`, `@tilefish.extern(..., epilogue=...)`, `tilefish.fusion(epilogues=...)` and the scope `with
+Implemented on tilefish 0.0.11, released in 0.0.12, as `tilefish.hook`, `@tilefish.extern(..., epilogue=...)`, `tilefish.fusion(epilogues=...)` and the scope `with
 tilefish.fused(epilogues=...):`, the generated modules of `tilefish._epilogue`, the hook lowering (`tilefish.lower.lower_hook`, note 22), the merge, the
 rewrite `R_acc` and the check in `tilefish._fusion`, the fusion report's new fields and the advisor's routes. Neither schema, the crate nor the C ABI
 changes.

@@ -1,6 +1,6 @@
 [package]
 name = "tilefish-capi"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "The C ABI of the tilefish Rust host (libtilefish_capi and tilefish.h), with a header-only C++17 wrapper (tilefish.hpp): a C or C++ program loads and verifies a tilefish manifest and its plans, and launches its kernels, pinned GEMMs, pinned convolutions and plans, with every check of the tilefish crate."
 license = "MIT OR Apache-2.0"

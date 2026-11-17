@@ -5,7 +5,7 @@ Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish`
 plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
-## Unreleased
+## tilefish 0.0.12, crate 0.0.10, tilefish-capi 0.0.2 (2026-11-17)
 
 Manifest schema 3 gains a library impl, `cublaslt.matmul` (section 9.5): additive, so every manifest, plan and pin of 0.0.11 is read and written as
 it was (the entries of `cublaslt.gemm` and `cublaslt.gemm_bias` and their digests are unchanged), and a reader of 0.0.11 or crate 0.0.9 refuses an
@@ -13,6 +13,10 @@ entry of the new impl. The C ABI is 1.1 (additive); plan schema 1 is unchanged. 
 a kernel step like any. Nothing changes bytes without a declaration: a graph planned as before (`epilogues="exact"`, the default) has the plan it had,
 and an export that calls no extern with an epilogue hook writes the manifest and plans of 0.0.11 (its fusion report gains `library_epilogues` where the
 body widens a cuBLASLt GEMM's result).
+
+The crate reads and runs `cublaslt.matmul` (0.0.10). `tilefish-capi` is 0.0.2, ABI 1.1 (`tilefish_gemm_epilogue`, additive: a program built against
+ABI 1.0 runs as it did), built from the release commit with cargo or CMake; it is not on crates.io.
+
 
 ### `epilogues=`: three modes, per graph or per scope (RFC 0003)
 

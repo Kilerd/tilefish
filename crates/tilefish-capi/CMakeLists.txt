@@ -10,7 +10,7 @@
 #
 # The libraries link nothing of CUDA at build time: the driver, cuBLASLt and cuDNN are opened at run time (docs/rfcs/0002-cpp-host.md, section 8).
 cmake_minimum_required(VERSION 3.19)
-project(tilefish_capi VERSION 0.0.1 LANGUAGES C CXX)
+project(tilefish_capi VERSION 0.0.2 LANGUAGES C CXX)
 
 set(TILEFISH_ABI_MAJOR 1)  # TILEFISH_ABI_MAJOR of src/lib.rs and build.rs: the shared library's SONAME
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

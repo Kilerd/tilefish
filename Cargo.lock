@@ -358,7 +358,7 @@ dependencies = [
 
 [[package]]
 name = "tilefish"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "cudarc",
  "ryu",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "tilefish-capi"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "cbindgen",
  "serde_json",
