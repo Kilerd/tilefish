@@ -536,7 +536,7 @@ of each) with the spec's.
 **Readers.** Both readers refuse what this section does not allow: a `binary` section, a toolchain, a source digest, a `ptx_target` or a grid of another
 form; a `persistent` grid; a parameter of another kind, a view or an alias, on such an entry; a `tensormap` or a `bytes` parameter on any other entry; a
 template or a value of another length, not lowercase hex, or a template not zero in its bytes 0 to 7 and 64 to 127; a `bytes` size out of range or a
-`ptx_type` that is not `b8[<size>]`; a field another kind has. A reader that predates the section (tilefish 0.0.11, crate 0.0.9) refuses an entry of
+`ptx_type` that is not `b8[<size>]`; a field another kind has. A reader that predates the section (tilefish 0.0.12, crate 0.0.10, and older) refuses an entry of
 source `cute` (`binary must be {"source": "cubin"} or ...`). A manifest without such an entry, and its digest, are unchanged.
 
 ## 5. The ABI

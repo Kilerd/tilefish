@@ -7,6 +7,12 @@ each section names the release that added it.
 
 ## Unreleased
 
+The last release that adds features ahead of a need (`docs/scope.md`). Manifest schema 3 gains one form of kernel entry, a CuTe DSL kernel
+(`binary.source` `"cute"` and the parameter kinds `tensormap` and `bytes`, section 4.9): additive, so every manifest, plan and pin of 0.0.12 is read
+and written as it was, and a reader of 0.0.12 or crate 0.0.10 refuses such an entry. Plan schema 1 and the C ABI (1.1) are unchanged. An export
+without a CuTe DSL kernel writes the manifests and plans of 0.0.12, but for a graph that declares `epilogues="accumulator"` around a hook of a dual
+accumulator: its fused pair no longer stores the rounded result as well (below); its outputs are the same bytes.
+
 ### Scope
 
 - **`docs/scope.md`** says what tilefish is (types, the four declarations, build once and pin, thin hosts, numerics written down) and what it is not
@@ -44,7 +50,7 @@ each section names the release that added it.
   shape, a pointer inside a structure, a pointer the host function allocates) is refused with what it is. SASS assertions and traces apply.
 - **Manifest schema 3, additively** (section 4.9): a `binary` entry of `binary.source` `"cute"` (`{"source", "cutlass_dsl", "options"}`), its toolchain
   `{"cutlass_dsl", "nvvm", "ptxas"}`, `source_digest_kind` `"tilefish.cute.v1"` (the sha256 of its PTX), a grid of integers, and the ABI kinds `tensormap`
-  and `bytes` (on such an entry only). Both readers refuse every malformed form; a reader of 0.0.11 refuses such an entry. Manifests without one, and
+  and `bytes` (on such an entry only). Both readers refuse every malformed form; a reader of 0.0.12 or crate 0.0.10 refuses such an entry. Manifests without one, and
   their digests, are unchanged.
 - **Pins.** The declaration digest has the host function, the sha256 of its file, the DSL's version and the options; Python's replay compiles the
   declaration again and compares the PTX (refused if it differs, pinned or not; accepted only pinned where it cannot compile it). The Rust crate and the
@@ -63,6 +69,25 @@ each section names the release that added it.
   or redistributing them is the user's responsibility under NVIDIA's licence (`docs/cute.md`, section 6).
 - Messages that changed: the kinds an extern takes (`a kernel is one of triton=, gluon=, ptx=, cubin= and cute=`), the kinds of a parameter (`... given,
   null, tensormap or bytes`) and of a spec's `binary` (`'ptx', 'cubin' or 'cute'`).
+
+### Fixes
+
+- **`epilogues="accumulator"` and a hook of a dual accumulator** (`split=2`, a gated activation): `R_acc` replaced the widenings of the split's chunks
+  by the chunks of the accumulator and left the split of the rounded result in the program. Nothing read it, but a view is never dead code, so the
+  result stayed live and the fused pair stored all of it (`[M, 2F]`) besides the hook's output. `R_acc` now removes a split of the result that only
+  the widenings it replaced read, with those widenings; a chunk read in its own type, or returned, keeps it. The outputs are the same bytes (the
+  dual GEMM + SwiGLU of the persistent GEMM example, and the gate's `fused_epi_swiglu_acc`, compared with 0.0.12's); the fused entry, which stores
+  one chunk now, and the plan digest are new. On a B300 slice that example at 2048 rows takes 89.7 us under `"accumulator"` (124.5 us before), and
+  90.2 us under `"exact"`.
+- **An epilogue hook on a CuTe DSL extern** (`@tilefish.extern(cute=..., epilogue=...)`) is refused: the DSL compiles the kernel, which has no hook.
+  The declaration dropped the hook without a word.
+
+### Tests
+
+- The crate's CuTe DSL fixture (`crates/tilefish/tests/fixtures/cute_sm_103`) is written by `export_rust_fixtures.py` (every run, or `--cute-only`,
+  which needs no GPU) from `tests/cute_fixture.py`, with its digest and its cubins' `sha256` in `expected.json` (`"cute"`), which `cute_externs.rs`
+  reads. It was written once by hand, its digest a constant of the Rust test, and went stale with each edit of `test_cute_externs.py` (a declaration
+  digest has the sha256 of the host function's file); `test_cute_externs.py` now requires the committed files to be what the script writes.
 
 ## tilefish 0.0.12, crate 0.0.10, tilefish-capi 0.0.2 (2026-11-17)
 

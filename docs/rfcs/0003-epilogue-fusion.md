@@ -412,9 +412,10 @@ columns are:
 * **The norm is not fused into the Gluon kernel.** E1 fuses no row region into a Gluon hook, so the first two columns of the norm rows are route
   (a) with this GEMM. The Triton form of the kernel (`impl="triton"`, whose sub-tile holds the whole row of 256) fuses it, but at 18.3 us, slower
   than route (a). Its main loop is Triton's own pipeline, not this kernel's.
-* **Under `epilogues="accumulator"` the dual GEMM's pair stores the rounded result too.** The view that splits it is left in the program after
-  `R_acc` and keeps it live (`y_needed` in `tilefish._fusion`), so the kernel writes `[M, 2F]` besides the hook's output: 124.8 against 90.1 us. This
-  is a planner follow-up of E1: a view nothing reads after the rewrite should not keep the result live.
+* **Under `epilogues="accumulator"` the dual GEMM's pair stored the rounded result too** (fixed in 0.0.13). The view that splits it was left in
+  the program after `R_acc` and kept it live (`y_needed` in `tilefish._fusion`), so the kernel wrote `[M, 2F]` besides the hook's output: 124.8
+  against 90.1 us. `R_acc` now removes a split of the result that only the widenings it replaced read: the same bytes, 89.7 us against 90.2 us
+  under `"exact"` (the hook, acc column above, is the measurement before the fix).
 * **Not measured.** The convolution as a GEMM was not measured with this kernel: its operands are TMA tiles of 2-D tensors, and an implicit-GEMM
   producer (im2col boxes) is X12's and E3's work.
 * **Contract (i) held in every case.** The fused pairs equal the unfused plans byte for byte at every bucket with the special values (tests). Every
