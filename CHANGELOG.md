@@ -127,6 +127,13 @@ body widens a cuBLASLt GEMM's result).
 - A plan backend's `gemm` is passed `c=` for a `cublaslt.matmul` step that reads `c` (only then). A re-export whose `contract` differs from the manifest's
   entry is another binary (`overwrite=True` to replace it).
 
+### Tests
+
+- The C++ GPU gate's own buffers (`crates/tilefish-capi/tests/gpu/driver.hpp`) finish their writes before the call returns. Their zeros and uploads
+  run on the legacy stream, which the gate's non-blocking stream does not wait for, and a cuDNN convolution's workspace zeroed there while the
+  convolution used it gave all-zero outputs now and then (the gate's `conv_k7.T646` and others; 34 of 397 runs on a busy B300 slice). Test code
+  only: the crate and the C ABI order their own memory on the launch stream. The new gate test `buffers` checks it.
+
 ## tilefish 0.0.11, crate 0.0.9, tilefish-capi 0.0.1 (2026-11-17)
 
 Manifest schema 3 and plan schema 1 are unchanged but for one optional entry field, `instrument`, which only the instrumented variant writes (below).

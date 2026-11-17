@@ -276,6 +276,62 @@ void test_embedded() {
     std::printf("cpp gate: launched %zu cases with the embedded manifest\n", n);
 }
 
+// -- the gate's own buffers --------------------------------------------------------------------------------------------------------------------
+
+/// Every write of a `driver::Buffer` is finished when the call returns (`driver.hpp`): its zeros, an upload, `zero` and `fill` run on the legacy
+/// stream, which the gate's non-blocking stream does not wait for. With the legacy stream kept busy by a fill of a large buffer queued just
+/// before, each write leaves it idle. Then every convolution case, launched as `run_cases` launches it (its workspace a new buffer) right after a
+/// fill of the legacy stream of 0 to 31 MiB (about the time a convolution takes, swept), writes Python's bytes: before the buffers finished
+/// their writes, the zeros of a workspace landed now and then while cuDNN used it, and the convolution wrote zeros (`conv_k7.T646`, among others).
+void test_buffers() {
+    Gpu& g = gpu();
+    const auto& api = driver::api();
+    driver::Buffer slow(size_t(1) << 30);  // a fill of 1 GiB keeps the legacy stream busy far longer than a call takes on the host
+    auto busy = [&](size_t bytes) { driver::check(api.cuMemsetD8(slow.address(), 0x5A, bytes), "cuMemsetD8"); };  // queued, not waited for
+    auto idle = [&] { return api.cuStreamQuery(nullptr) == 0; };
+    std::vector<uint8_t> data(size_t(1) << 20, 7);
+    busy(slow.bytes());
+    {
+        driver::Buffer made(data.size());
+        CHECK(idle(), "the zeros of a new buffer are not finished when it is made");
+    }
+    driver::Buffer b(data.size());
+    busy(slow.bytes());
+    b.upload(data);
+    CHECK(idle(), "an upload is not finished when it returns");
+    busy(slow.bytes());
+    b.zero();
+    CHECK(idle(), "zero() is not finished when it returns");
+    busy(slow.bytes());
+    b.fill(1);
+    CHECK(idle(), "fill() is not finished when it returns");
+    auto manifest = gate_manifest();
+    auto doc = json::read_file((gate / "cases.json").string());
+    int runs = 0, wrong = 0;
+    for (const auto& c : doc["cases"].array()) {
+        if (c["kind"] != "conv") continue;
+        size_t out = 0;
+        for (size_t i = 0; i < c["tensors"].size(); ++i) {
+            if (c["tensors"][i]["role"] == "out") out = i;
+        }
+        auto expect = read_bytes(gate / c["tensors"][out]["expect"].str());
+        for (size_t mib = 0; mib < 32; ++mib) {
+            auto bufs = tensors_of(c);
+            if (mib) busy(mib << 20);
+            Keep keep;
+            launch_case(manifest, c, bufs, keep);
+            g.stream.sync();
+            if (bufs[out].mem.download() != expect) {
+                ++wrong;
+                std::fprintf(stderr, "cpp gate: %s after %zu MiB of zeros in the legacy stream: not Python's bytes\n", c["id"].str().c_str(), mib);
+            }
+            ++runs;
+        }
+    }
+    CHECK(runs > 0 && wrong == 0, "%d of %d convolutions after a busy legacy stream wrote other bytes than Python's", wrong, runs);
+    std::printf("cpp gate: a buffer's writes are finished when they return; %d convolutions after a busy legacy stream: Python's bytes\n", runs);
+}
+
 // -- a GEMM whose algorithm needs a workspace ----------------------------------------------------------------------------------------------
 
 /// Capture `launch` in the host's own CUDA graph on the gate's stream, check that the capture ran nothing, replay it and compare `out`.
@@ -1075,7 +1131,7 @@ int main(int argc, char** argv) {
         {"context", test_context},   {"plans", test_plans},       {"plan_set", test_plan_set},
         {"shared", test_shared},     {"carried", test_carried},   {"weighted", test_weighted},
         {"runner", test_runner},     {"fused_runners", test_fused_runners}, {"capturing", test_capturing},
-        {"matmuls", test_matmuls},
+        {"matmuls", test_matmuls},   {"buffers", test_buffers},
     };
     std::set<std::string> wanted(argv + std::min(argc, 2), argv + argc);
     int ran = 0;

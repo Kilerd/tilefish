@@ -39,6 +39,7 @@ struct Api {
     CUresult (*cuStreamCreate)(CUstream*, unsigned);
     CUresult (*cuStreamDestroy)(CUstream);
     CUresult (*cuStreamSynchronize)(CUstream);
+    CUresult (*cuStreamQuery)(CUstream);
     CUresult (*cuStreamBeginCapture)(CUstream, int);
     CUresult (*cuStreamEndCapture)(CUstream, CUgraph*);
     CUresult (*cuGraphInstantiateWithFlags)(CUgraphExec*, CUgraph, unsigned long long);
@@ -74,6 +75,7 @@ inline const Api& api() {
         bind(lib, x.cuStreamCreate, "cuStreamCreate");
         bind(lib, x.cuStreamDestroy, "cuStreamDestroy_v2");
         bind(lib, x.cuStreamSynchronize, "cuStreamSynchronize");
+        bind(lib, x.cuStreamQuery, "cuStreamQuery");
         bind(lib, x.cuStreamBeginCapture, "cuStreamBeginCapture_v2");
         bind(lib, x.cuStreamEndCapture, "cuStreamEndCapture");
         bind(lib, x.cuGraphInstantiateWithFlags, "cuGraphInstantiateWithFlags");
@@ -90,13 +92,21 @@ inline void check(CUresult r, const char* what) {
     if (r != 0) throw std::runtime_error(std::string(what) + " failed: CUresult " + std::to_string(r));
 }
 
-/// Device memory the gate owns (freed with it).
+/// Wait for the legacy default stream (the NULL stream), where `cuMemsetD8` and `cuMemcpyHtoD` run: their work is finished when they return to
+/// the host only in part (a memset is asynchronous, a copy from pageable memory may still be in flight), and the gate's kernels run on a
+/// non-blocking stream, which does not wait for the legacy stream.
+inline void finish_legacy() { check(api().cuStreamSynchronize(nullptr), "cuStreamSynchronize(NULL)"); }
+
+/// Device memory the gate owns (freed with it). Every write of it (the zeros it is made with, `upload`, `zero`, `fill`) is finished when the
+/// call returns, so a kernel on any stream may read it next: a workspace whose zeros landed while a cuDNN convolution used it gave all-zero
+/// outputs, now and then (the C++ gate's `conv_k7.T646`, and others).
 class Buffer {
 public:
     Buffer() = default;
     explicit Buffer(size_t bytes) : bytes_(bytes) {
         check(api().cuMemAlloc(&ptr_, bytes ? bytes : 1), "cuMemAlloc");
         check(api().cuMemsetD8(ptr_, 0, bytes ? bytes : 1), "cuMemsetD8");
+        finish_legacy();
     }
     Buffer(const std::vector<uint8_t>& data) : Buffer(data.size()) { upload(data); }  // NOLINT
     Buffer(const Buffer&) = delete;
@@ -116,14 +126,18 @@ public:
     void upload(const std::vector<uint8_t>& data) {
         if (data.size() != bytes_) throw std::runtime_error("an upload of another size");
         if (!data.empty()) check(api().cuMemcpyHtoD(ptr_, data.data(), data.size()), "cuMemcpyHtoD");
+        finish_legacy();
     }
     std::vector<uint8_t> download() const {
         std::vector<uint8_t> out(bytes_);
         if (bytes_) check(api().cuMemcpyDtoH(out.data(), ptr_, bytes_), "cuMemcpyDtoH");
         return out;
     }
-    void zero() { check(api().cuMemsetD8(ptr_, 0, bytes_ ? bytes_ : 1), "cuMemsetD8"); }
-    void fill(unsigned char v) { check(api().cuMemsetD8(ptr_, v, bytes_ ? bytes_ : 1), "cuMemsetD8"); }
+    void zero() { fill(0); }
+    void fill(unsigned char v) {
+        check(api().cuMemsetD8(ptr_, v, bytes_ ? bytes_ : 1), "cuMemsetD8");
+        finish_legacy();
+    }
     uint64_t address() const { return ptr_; }
     size_t bytes() const { return bytes_; }
 
