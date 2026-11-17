@@ -1,5 +1,7 @@
 # Locked exports: an export without a GPU
 
+**English** | [简体中文](../../zh-CN/guide/locked-export.md)
+
 An export learns some facts from the device it runs on, and everything else is a function of the sources, the declarations and the toolchain. A
 **lock** records those facts once, on a GPU of the target device; a **locked export** then writes the same files byte for byte on a machine with no
 GPU, no CUDA driver and no torch, such as a CI runner or an image build, and fails when a file is not the lock's.
@@ -69,7 +71,7 @@ not verified (an export made off the device warns and records `skipped`; export 
 2. Each library step takes the lock's record of its stem, whose `declaration_digest` must be the declaration's on a device of the lock's SM count (an
    operator, option or bucket that changed is refused); a `cublaslt.matmul` declared `contract="measured-exact"` is refused a `binary-defined` pin,
    and one with a canary (the default) needs the lock's canary, as an export does; the entry it makes must pass every rule a manifest reader has
-   (section 9 of `docs/manifest-schema-3.md`). **No heuristic is asked, no library is loaded, nothing runs on a device, with a device or without one.**
+   (section 9 of `docs/en/manifest-schema-3.md`). **No heuristic is asked, no library is loaded, nothing runs on a device, with a device or without one.**
 3. Each fused region the export would verify (the graph's `verify`, or `verify=`) takes the lock's record of it.
 4. Each binary is built and held to `kernels.<stem>` (its toolchain, then its `sha256`, saying whether the machine code differs) before anything is written.
 5. The files are written as an export writes them, and every file of the directory is held to `files`: a missing file, a file of other bytes (the cubins
@@ -107,7 +109,7 @@ differs; re-lock on a GPU of that device and review the diff.
 ## Limitations
 
 * **CuTe DSL kernels** are compiled by the DSL on a GPU, and their launch (grid, cluster, the parameters of the compiled host function) is captured on
-  it (`docs/cute.md`): a locked export refuses them, and so does `write_lock`. Export a set with a CuTe DSL kernel on a GPU.
+  it (`docs/en/cute.md`): a locked export refuses them, and so does `write_lock`. Export a set with a CuTe DSL kernel on a GPU.
 * **The same toolchain on both machines**: the tilefish, Triton and ptxas versions are checked; anything else that changes a binary (a Triton setting,
   `TILEFISH_DEBUG_PATHS`) changes its `sha256`, and the locked export refuses it. The Python version does not reach a binary (3.11 and 3.12 above).
 * **One lock per device.** The architecture is checked; two devices of one architecture with other SM counts (a MIG slice, the whole GPU) are not told

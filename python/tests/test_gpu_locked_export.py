@@ -1,4 +1,4 @@
-"""The locked export (``docs/guide/locked-export.md``) on a real GPU: the plan set of ``locked_graphs`` (a generated kernel, Triton, Gluon, a prebuilt
+"""The locked export (``docs/en/guide/locked-export.md``) on a real GPU: the plan set of ``locked_graphs`` (a generated kernel, Triton, Gluon, a prebuilt
 PTX and cubin, a pinned cuBLASLt GEMM, a cuBLASLt matmul with an epilogue, a cuDNN convolution, fused regions, a global scratch in the workspace,
 buckets, canaries) exported on the device and locked; the locked export of it, in a process that sees no CUDA device and cannot import torch, writes
 the same files byte for byte; its plans replay (with the canaries run at the load) to the bytes ``jit`` gives; and every refusal, made by a locked

@@ -619,7 +619,7 @@ Rust: `PlanSet::load(directory, Pin::Digest(set_digest))`, `set.plan("tiles2")` 
 binaries are loaded once per context for all the plans), `set.names()`, `set.manifest()`; `LaunchPlan::load_with_manifest(file, &manifest, pin)` for
 a plan file with a manifest already loaded. A directory holds one plan (`plan.json`) or one plan set, not both: an export of one into a directory of
 the other is refused (without `overwrite=True`). An export of a set with another graph builds another manifest, so every plan of the set gets a new
-digest, and so does the set. A locked export (`export(..., lock=path)`, `docs/guide/locked-export.md`) writes a plan, a set and its fusion reports byte
+digest, and so does the set. A locked export (`export(..., lock=path)`, `docs/en/guide/locked-export.md`) writes a plan, a set and its fusion reports byte
 for byte on a machine without a GPU; the documents are the ones specified here (a lock adds no field), and the lock records the digests to pin.
 
 Why sets and not a plan whose steps repeat: a repeated step range would need loop-carried rules both readers agree on (liveness, the order of

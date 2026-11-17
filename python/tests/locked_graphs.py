@@ -1,5 +1,5 @@
 """The graphs of the locked export's gate: a plan set with a step of every kind of callee an export builds or pins (not collected: the name has no
-``test_`` prefix). ``docs/guide/locked-export.md``; ``test_gpu_locked_export.py`` and ``rust_gate.py prepare --locked`` export it.
+``test_`` prefix). ``docs/en/guide/locked-export.md``; ``test_gpu_locked_export.py`` and ``rust_gate.py prepare --locked`` export it.
 
 Importing this module imports Triton (and its Gluon) and runs ptxas (the cubin extern is the PTX ``ptx/axpy_f32.ptx`` assembled here, the same bytes on
 every machine with the same ptxas), so only the gpu tests, the gate and a machine that makes the locked export do. Written for these tests, and public.

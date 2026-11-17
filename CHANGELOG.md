@@ -7,7 +7,7 @@ each section names the release that added it.
 
 ## Unreleased
 
-### Locked exports: an export without a GPU (`docs/guide/locked-export.md`)
+### Locked exports: an export without a GPU (`docs/en/guide/locked-export.md`)
 
 - **`tilefish.runtime.write_lock(directory, path)`** writes the lock of an export directory, made on a GPU of the target device: the facts the
   export learnt from the device (each library entry's cuBLASLt algorithm or cuDNN pin with its workspace limit, a `cublaslt.matmul`'s contract and

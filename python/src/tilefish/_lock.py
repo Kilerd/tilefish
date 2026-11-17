@@ -1,4 +1,4 @@
-"""Locked exports: an export that needs no GPU, from a lock file made once on a GPU (``docs/guide/locked-export.md``).
+"""Locked exports: an export that needs no GPU, from a lock file made once on a GPU (``docs/en/guide/locked-export.md``).
 
 An export learns some facts from the device it runs on: the cuBLASLt algorithm and the cuDNN engine each library entry pins (and the cuBLASLt and
 cuDNN versions that chose them, and the SM count of the device), the verification of each ``cublaslt.matmul`` pin, the canary digests, and the
@@ -137,7 +137,7 @@ def lock_of(directory: "str | os.PathLike[str]") -> "dict[str, Any]":
         if e.get("source_digest_kind") == CUTE_DIGEST_KIND:
             raise TilefishLockError(
                 f"'{e['stem']}' is a CuTe DSL kernel: its build compiles it on a GPU and captures its launch there, which a locked export cannot do "
-                "without one; a directory with a CuTe DSL kernel is not locked (docs/guide/locked-export.md, limitations)"
+                "without one; a directory with a CuTe DSL kernel is not locked (docs/en/guide/locked-export.md, limitations)"
             )
         for key in ("triton", "ptxas"):
             if e["toolchain"].get(key):
@@ -501,7 +501,7 @@ def check_built(built: "BuiltKernel", lock: Lock) -> None:
 def refuse_cute(stem: str, lock: Lock) -> NoReturn:
     raise TilefishLockError(
         f"'{stem}' is a CuTe DSL kernel, which is compiled on a GPU and whose launch is captured there: a locked export runs without a GPU and cannot "
-        "build it (docs/guide/locked-export.md, limitations); export it on a GPU"
+        "build it (docs/en/guide/locked-export.md, limitations); export it on a GPU"
     )
 
 

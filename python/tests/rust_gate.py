@@ -106,7 +106,7 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   kernel, Triton, Gluon, a prebuilt PTX and cubin, a pinned cuBLASLt GEMM, a cuBLASLt matmul with an epilogue and a canary, a cuDNN convolution with a
   canary, fused regions, a global scratch in the workspace), its plans ``locked-lk_mlp`` and ``locked-lk_conv`` cases like the others. ``prepare
   --locked DIR --lock FILE`` takes the set from ``DIR``, the directory a **locked export** wrote on a machine without a GPU
-  (``export(..., lock=FILE)``, ``docs/guide/locked-export.md``), held to the lock's sha256 and replayed under the set digest the lock records, instead
+  (``export(..., lock=FILE)``, ``docs/en/guide/locked-export.md``), held to the lock's sha256 and replayed under the set digest the lock records, instead
   of exporting it here: Python's replay, the Rust host and the C++ host then load and run those artefacts (and their canaries).
 
 * **instrumented binaries** (:func:`prepare_instrumented`, ``WORK/instrumented.json``; on sm_90 or newer): the probed kernels of ``rust_gate_probed.py`` (a
@@ -1802,7 +1802,7 @@ def prepare_plans(work, locked=None, lock=None):
         extra = {"dir": f"plans/shared/{g.name}.plan.json", "set": "plans/shared", "set_digest": stages.digest, "shared": True}
         exports.append((f"shared-{g.name}", g, False, make_cases, stages_dir, stages[g.name], stages.digest, extra))
     # the plan set of locked_graphs (a step of every kind of callee an export builds or pins): exported here, or with --locked the directory a
-    # locked export wrote on a machine without a GPU (docs/guide/locked-export.md), held to its lock and replayed under the set digest the lock records
+    # locked export wrote on a machine without a GPU (docs/en/guide/locked-export.md), held to its lock and replayed under the set digest the lock records
     locked_dir = root / "locked"
     lg_graphs = ()
     if tma_capable():  # (a step of the set has device-side TMA descriptors: sm_90 or newer)

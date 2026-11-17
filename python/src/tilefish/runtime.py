@@ -1130,7 +1130,7 @@ def export(
     into the probe buffer a host gives it, and its entry has ``instrument``. It has binaries, a manifest digest and plan digests of its own; a host
     refuses it unless asked to load it (``probes=``, ``instrumented=True``), and it is never merged into a directory of the production export.
 
-    ``lock=`` (the path of a lock file, :func:`write_lock`) is a **locked export** (``docs/guide/locked-export.md``): it needs no GPU and runs nothing
+    ``lock=`` (the path of a lock file, :func:`write_lock`) is a **locked export** (``docs/en/guide/locked-export.md``): it needs no GPU and runs nothing
     on one, with or without one. Every binary is built for the lock's architecture (Triton compiles ahead of time, ptxas assembles), every fact an
     export learns from a device (each library entry's pin, its verification and its canary, the cuBLASLt and cuDNN versions, the SM count, the
     verification of the fused regions) is taken from the lock, no heuristic is asked, and the files are what an export on that device with those pins
@@ -1155,7 +1155,7 @@ def export(
 
 
 def write_lock(directory: "str | os.PathLike[str]", path: "str | os.PathLike[str]") -> "dict[str, Any]":
-    """Write the **lock** of an export directory to ``path`` (``docs/guide/locked-export.md``): every fact the export learnt from its device (each
+    """Write the **lock** of an export directory to ``path`` (``docs/en/guide/locked-export.md``): every fact the export learnt from its device (each
     library entry's pin, with its verification and its canary, the cuBLASLt and cuDNN versions, the architecture and the SM count, the verification
     of each graph's fused regions), the Triton and ptxas versions of its binaries, the digests to pin (the manifest's, each plan's, the set's), and the
     sha256 of every file. Run it on the directory an export on a GPU of the target device wrote (into an empty directory), once per device, whenever an

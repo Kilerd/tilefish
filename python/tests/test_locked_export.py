@@ -1,4 +1,4 @@
-"""Locked exports (``docs/guide/locked-export.md``) with no GPU: a lock made from an export directory (``tilefish.runtime.write_lock``), and an export
+"""Locked exports (``docs/en/guide/locked-export.md``) with no GPU: a lock made from an export directory (``tilefish.runtime.write_lock``), and an export
 from it (``export(..., lock=...)``) that asks no heuristic, runs nothing on a device and writes the same bytes; and every refusal of either. The builds are
 the fake compiler's (``fake_compile``) and the pins of the "GPU" export are made here; the real thing, a lock made on a GPU and the locked export on a
 machine without one, is ``test_gpu_locked_export.py`` and ``rust_gate.py prepare --locked``.
