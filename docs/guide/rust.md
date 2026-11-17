@@ -1,5 +1,7 @@
 # The Rust host
 
+**English** | [简体中文](../zh-CN/guide/rust.md)
+
 The `tilefish` crate (`crates/tilefish`, version 0.0.11) is the
 host of a manifest directory, without Python or Triton: it reads the manifest as
 strict JSON, recomputes the digests exactly as Python does (the `sha256` of each

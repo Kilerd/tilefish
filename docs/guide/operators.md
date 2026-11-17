@@ -1,5 +1,7 @@
 # Views, device scalars, prebuilt binaries and a pinned GEMM
 
+**English** | [简体中文](../zh-CN/guide/operators.md)
+
 A real model needs four things that a dense, compiled-in, Triton-only operator cannot say. Each is part of the manifest, which is schema 3
 (`docs/manifest-schema-3.md` specifies every field; the Python package reads and writes only schema 3, and says "re-export" for schema 2).
 

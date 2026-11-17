@@ -1,5 +1,7 @@
 # tilefish
 
+**English** | [简体中文](https://github.com/Kilerd/tilefish/blob/main/python/README.zh-CN.md)
+
 A typed tensor language for GPU inference: shapes, dtypes, layouts and
 quantization formats in the type, one build into GPU binaries, and generated
 Python, C++ and Rust hosts.

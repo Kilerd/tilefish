@@ -1,5 +1,7 @@
 # tilefish
 
+**English** | [简体中文](README.zh-CN.md)
+
 A typed tensor language for GPU inference. The shape, dtype, layout and
 quantization format of every tensor live in its type, operators come from a
 typed library, and a model is built once into GPU binaries plus a manifest.

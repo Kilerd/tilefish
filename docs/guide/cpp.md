@@ -1,5 +1,7 @@
 # The C++ host
 
+**English** | [简体中文](../zh-CN/guide/cpp.md)
+
 `crates/tilefish-capi` is the C ABI of the Rust host: `libtilefish_capi` (a
 shared and a static library) and `tilefish.h`, which cbindgen generates from the
 crate and a test keeps current, with a header-only C++17 wrapper, `tilefish.hpp`.

@@ -1,5 +1,7 @@
 # Masks, indices, gathers and copies
 
+**English** | [简体中文](../zh-CN/guide/lowering.md)
+
 A lowered `@kernel` also compares, selects, counts positions, reduces to an index, and gathers and scatters rows at indices that are device
 data; a graph materialises a view or the patches of a convolution. Each has an exact numerics contract (notes 7 to 11 of `tilefish.lower`) and
 runs in `jit`, `replay` and `reference`, alone and in a plan.

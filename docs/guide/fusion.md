@@ -1,5 +1,7 @@
 # Fusion: arithmetic in a graph body
 
+**English** | [简体中文](../zh-CN/guide/fusion.md)
+
 A graph body may compute. The arithmetic between two calls (`silu(g.to(f32)) * u.to(f32)` between two GEMMs, a bias and an activation, a residual add, a mask
 from a device scalar, a dequantisation) is traced like a kernel body, with its rules (no implicit promotion, a scalar rounded to the tensor's dtype, f32 math
 functions), and the planner groups it into **regions**: each a `@tilefish.kernel` of its own that tilefish generates (named `fused_<hash>` by its content, lowered

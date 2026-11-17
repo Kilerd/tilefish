@@ -1,7 +1,10 @@
 # Documentation
 
+**English** | [简体中文](zh-CN/README.md)
+
 * [`scope.md`](scope.md): what tilefish is and is not, and how features are added.
 * [`../README.md`](../README.md): the overview, the install and a quick start for each host.
+* [`zh-CN/README.md`](zh-CN/README.md): this index in Simplified Chinese, which lists the Chinese pages.
 
 ## Guide
 

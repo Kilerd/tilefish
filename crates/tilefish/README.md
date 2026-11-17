@@ -1,5 +1,7 @@
 # tilefish (Rust host)
 
+**English** | [简体中文](https://github.com/Kilerd/tilefish/blob/main/crates/tilefish/README.zh-CN.md)
+
 The Rust host of a [tilefish](https://github.com/Kilerd/tilefish) manifest.
 tilefish builds kernels once into CUDA binaries plus a `manifest.json`. This
 crate loads that directory and launches its cubins from Rust, with no Python
