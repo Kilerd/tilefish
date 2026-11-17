@@ -73,6 +73,12 @@ class TilefishManifestError(TilefishRuntimeError):
     the manifest records, or the binary is not the one the compile spec of the operator asks for."""
 
 
+class TilefishLockError(TilefishError, RuntimeError):
+    """A locked export (``tilefish.runtime.export(..., lock=...)``) cannot write what its lock says: the lock is malformed, was made by another
+    tilefish or toolchain or for another device, has no pin for a library operation the export has, or a file the export wrote does not have the
+    sha256 the lock records. The message names the first difference and what to do (most often: re-lock on a GPU of the target device)."""
+
+
 class TilefishPreconditionError(TilefishRuntimeError):
     """An argument violates a precondition of the binary it would run on (the types and the compile spec).
 

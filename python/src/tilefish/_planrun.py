@@ -2532,22 +2532,27 @@ def export_graph(
     verify: "bool | None" = None,
     trace: bool = False,
     instrument: Any = None,
+    lock: Any = None,
 ) -> Plan:
     """:func:`tilefish.runtime.export` of a graph: build the binary of every step (and pin every GEMM), write the manifest (merged into one that is
     already there) and ``plan.json`` next to it, read both back, and return the plan loaded from the directory, which has the digest to pin.
 
     A graph whose body has arithmetic first has its fused regions verified against their unfused composition (``verify``: ``None`` takes the
-    graph's ``tilefish.fusion(verify=...)``, which is ``True`` by default) and gets its fusion report, ``<graph>.fusion.json``."""
+    graph's ``tilefish.fusion(verify=...)``, which is ``True`` by default) and gets its fusion report, ``<graph>.fusion.json``. With ``lock`` (a
+    :class:`tilefish._lock.Lock`: a locked export) the pins and the verification come from the lock, and every file is held to it."""
+    from . import _lock
     from ._build import parse_arch
 
     p = make_plan(graph, buckets, reuse=reuse)
-    if arch is None:
+    if lock is not None:
+        cap = _lock.target(lock, arch)
+    elif arch is None:
         torch = runtime._torch()
         cap = runtime._capability(torch, torch.cuda.current_device())
     else:
         cap = parse_arch(arch)
-    checked = _verify_fusion(graph, p, cap, verify)
-    built, pinned, traces = _build_callees(sorted(p.callees.items(), key=lambda kv: kv[0]), cap, trace, at=True, instrument=instrument)
+    checked = _verify_fusion(graph, p, cap, verify) if lock is None else _lock.locked_fusion(graph, verify, lock)
+    built, pinned, traces = _build_callees(sorted(p.callees.items(), key=lambda kv: kv[0]), cap, trace, at=True, instrument=instrument, lock=lock)
     written = write_export(p, built, pinned, directory, cap, overwrite)
     _write_fusion_report(graph, directory, checked)
     if trace:
@@ -2555,15 +2560,19 @@ def export_graph(
         from ._manifest import Manifest
 
         _trace.write(directory, traces, Manifest.load(directory, instrumented=True), [(graph, written, PLAN_NAME)])
+    if lock is not None:
+        _lock.verify_tree(directory, lock)
     return written
 
 
 def _build_callees(
-    callees: "Sequence[tuple[str, Any]]", cap: int, trace: bool, at: bool, instrument: Any = None
+    callees: "Sequence[tuple[str, Any]]", cap: int, trace: bool, at: bool, instrument: Any = None, lock: Any = None
 ) -> "tuple[list, list, list]":
     """Build (or pin) the binary of every ``(stem, callee)`` for ``sm_<cap>`` (``at``: take the callee's implementation of the architecture first);
     with ``trace``, keep every level of each compile and the trace items (:mod:`tilefish._trace`); with ``instrument``, the instrumented variant of
-    every Triton binary of an operator it covers (``docs/en/instrument.md``)."""
+    every Triton binary of an operator it covers (``docs/en/instrument.md``). With ``lock`` (a locked export) a library step's pin is the lock's, a
+    CuTe DSL kernel is refused, and every binary is held to the lock's before it is returned."""
+    from . import _lock
     from ._build import build
     from ._binary import build_binary
     from ._cute import build_cute
@@ -2577,9 +2586,11 @@ def _build_callees(
         spec = callee.by_stem[stem]
         jit = None
         if callee.kind == "library":
-            pinned.append(_pin_library(spec, cap))
+            pinned.append(_pin_library(spec, cap) if lock is None else _lock.locked_library(spec, lock, cap))
             continue
         elif callee.extern.binary is not None and callee.extern.binary.kind == "cute":  # type: ignore[union-attr]
+            if lock is not None:
+                _lock.refuse_cute(stem, lock)
             built.append(build_cute(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
         elif callee.extern.binary is not None:  # type: ignore[union-attr]
             built.append(build_binary(spec, callee.extern.binary, arch=cap))  # type: ignore[union-attr]
@@ -2587,6 +2598,8 @@ def _build_callees(
             jit = callee.target.jit_function(spec)
             cfg = instrument if instrument is not None and instrument.covers(spec.op) else None
             built.append(build(spec, arch=cap, fn=jit, stages=trace, instrument=cfg))
+        if lock is not None:
+            _lock.check_built(built[-1], lock)
         if trace:
             from . import _trace
 
@@ -2677,10 +2690,13 @@ def export_graphs(
     verify: "bool | None" = None,
     trace: bool = False,
     instrument: Any = None,
+    lock: Any = None,
 ) -> "_plan.PlanSet":
     """:func:`tilefish.runtime.export` of several graphs: a **plan set**, one manifest for all of them (each binary built once, whichever plans
     launch it), ``<graph>.plan.json`` per graph and the index ``plans.json`` (``docs/en/plan-schema-1.md``, section 15). An item is a graph, or
-    ``(graph, buckets)``; ``buckets=`` may map a graph's name to its buckets instead. Returns the :class:`~tilefish._plan.PlanSet` loaded back."""
+    ``(graph, buckets)``; ``buckets=`` may map a graph's name to its buckets instead. Returns the :class:`~tilefish._plan.PlanSet` loaded back.
+    With ``lock`` (a locked export) the pins and the verification come from the lock, and every file is held to it."""
+    from . import _lock
     from ._build import parse_arch
 
     plans: "list[Plan]" = []
@@ -2694,12 +2710,17 @@ def export_graphs(
     names = [p.name for p in plans]
     if len(set(names)) != len(names):
         raise TilefishRuntimeError(f"the graphs of a plan set have distinct names (a plan's file is <graph>.plan.json), got {names}")
-    if arch is None:
+    if lock is not None:
+        cap = _lock.target(lock, arch)
+    elif arch is None:
         torch = runtime._torch()
         cap = runtime._capability(torch, torch.cuda.current_device())
     else:
         cap = parse_arch(arch)
-    checked = {p.name: _verify_fusion(p.graph, p, cap, verify) for p in plans}
+    if lock is None:
+        checked = {p.name: _verify_fusion(p.graph, p, cap, verify) for p in plans}
+    else:
+        checked = {p.name: _lock.locked_fusion(p.graph, verify, lock) for p in plans}
     callees: "dict[str, Any]" = {}
     for p in plans:
         for stem, callee in p.callees.items():
@@ -2707,7 +2728,7 @@ def export_graphs(
             other = callees.setdefault(stem, callee)
             if other is not callee and callee.by_stem[stem] != other.by_stem[stem]:
                 raise TilefishRuntimeError(f"two plans of the set launch different binaries under one name '{stem}': rename one of the operators")
-    built, pinned, traces = _build_callees(sorted(callees.items(), key=lambda kv: kv[0]), cap, trace, at=False, instrument=instrument)
+    built, pinned, traces = _build_callees(sorted(callees.items(), key=lambda kv: kv[0]), cap, trace, at=False, instrument=instrument, lock=lock)
     written = write_plan_set(plans, built, pinned, directory, cap, overwrite)
     for p in plans:
         _write_fusion_report(p.graph, directory, checked[p.name])
@@ -2717,6 +2738,8 @@ def export_graphs(
 
         graphs = [(p.graph, written.plans[p.name] if hasattr(written, "plans") else p, _plan.plan_file_name(p.name)) for p in plans]
         _trace.write(directory, traces, Manifest.load(directory, instrumented=True), graphs)
+    if lock is not None:
+        _lock.verify_tree(directory, lock)
     return written
 
 

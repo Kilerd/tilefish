@@ -1086,6 +1086,7 @@ def export(
     verify: "bool | None" = None,
     trace: "bool | None" = None,
     instrument: Any = None,
+    lock: Any = None,
 ) -> Any:
     """Build every binary of one or several kernels and externs and write them as a manifest directory.
 
@@ -1129,14 +1130,41 @@ def export(
     into the probe buffer a host gives it, and its entry has ``instrument``. It has binaries, a manifest digest and plan digests of its own; a host
     refuses it unless asked to load it (``probes=``, ``instrumented=True``), and it is never merged into a directory of the production export.
 
+    ``lock=`` (the path of a lock file, :func:`write_lock`) is a **locked export** (``docs/guide/locked-export.md``): it needs no GPU and runs nothing
+    on one, with or without one. Every binary is built for the lock's architecture (Triton compiles ahead of time, ptxas assembles), every fact an
+    export learns from a device (each library entry's pin, its verification and its canary, the cuBLASLt and cuDNN versions, the SM count, the
+    verification of the fused regions) is taken from the lock, no heuristic is asked, and the files are what an export on that device with those pins
+    writes, byte for byte: each binary is held to the lock's sha256 before anything is written, and every file of ``directory`` (but ``trace/``) to it
+    afterwards. Whatever differs (another tilefish, Triton or ptxas, an ``arch=`` that is not the lock's, a library operation or a fused region the lock
+    has no record of, a file of other bytes) raises :class:`~tilefish.errors.TilefishLockError` naming the first difference and what to do: most often,
+    re-lock on a GPU. A CuTe DSL kernel is compiled on a GPU, and a locked export refuses it.
+
     Returns the loaded and verified :class:`~tilefish.aot.Manifest` (``.pinned``: it is what ``hosts.rust.emit`` takes): ``.directory``, ``.path`` and ``.digest``, the
     digest of the whole manifest, which is what to record (in a build log, a lock file) and pass back as
     ``run(..., mode="replay", manifest=directory, pin=digest)`` to refuse a directory that was changed after the export.
     The digest is the one of the manifest that was written from the builds in memory; the directory is read back and
     must have the same digest, or this raises :class:`~tilefish.errors.TilefishManifestError`.
     """
+    from . import _lock
+
+    locked = None if lock is None else _lock.lock_arg(lock)
     with export_session():
-        return _export(ops, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=trace, instrument=instrument)
+        return _export(
+            ops, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=trace, instrument=instrument, lock=locked
+        )
+
+
+def write_lock(directory: "str | os.PathLike[str]", path: "str | os.PathLike[str]") -> "dict[str, Any]":
+    """Write the **lock** of an export directory to ``path`` (``docs/guide/locked-export.md``): every fact the export learnt from its device (each
+    library entry's pin, with its verification and its canary, the cuBLASLt and cuDNN versions, the architecture and the SM count, the verification
+    of each graph's fused regions), the Triton and ptxas versions of its binaries, the digests to pin (the manifest's, each plan's, the set's), and the
+    sha256 of every file. Run it on the directory an export on a GPU of the target device wrote (into an empty directory), once per device, whenever an
+    implementation changes; commit the lock, and export with ``export(..., lock=path)`` on a machine without a GPU. The file is canonical JSON (a
+    re-lock that changes nothing changes no byte). It reads files only. Returns the lock document. Raises :class:`~tilefish.errors.TilefishLockError`
+    for a directory that is not one export of one architecture (a CuTe DSL kernel, files an export does not write, fused regions it did not verify)."""
+    from . import _lock
+
+    return _lock.write_lock(directory, path)
 
 
 def _export(
@@ -1150,8 +1178,11 @@ def _export(
     verify: "bool | None",
     trace: "bool | None",
     instrument: Any,
+    lock: Any = None,
 ) -> Any:
-    """:func:`export`, inside its session."""
+    """:func:`export`, inside its session (``lock``: a :class:`tilefish._lock.Lock`, a locked export)."""
+    from . import _lock
+
     items = list(ops) if isinstance(ops, (list, tuple)) else [ops]
     is_graph = [
         (isinstance(o, GraphOp) and not isinstance(o, KernelOp))
@@ -1168,16 +1199,20 @@ def _export(
         if len(items) > 1:  # a plan set: one manifest for every plan (docs/en/plan-schema-1.md, section 15)
             from ._planrun import export_graphs
 
-            return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=traced, instrument=cfg)
+            return export_graphs(
+                items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=traced, instrument=cfg, lock=lock
+            )
         from ._planrun import export_graph
 
         graph, own = items[0] if isinstance(items[0], tuple) else (items[0], buckets)
-        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse, verify=verify, trace=traced, instrument=cfg)
+        return export_graph(graph, directory, arch=arch, overwrite=overwrite, buckets=own, reuse=reuse, verify=verify, trace=traced, instrument=cfg, lock=lock)
     if verify is not None:
         raise TilefishRuntimeError("verify= is for exporting a graph (it checks the graph's fused regions); kernels and externs have none")
     if buckets is not None or reuse:
         raise TilefishRuntimeError("buckets= and reuse= are for exporting a graph (they shape its launch plan); kernels and externs are built for the buckets of their own dimensions")
-    if arch is None:
+    if lock is not None:  # a locked export: the lock's architecture, and no device
+        cap = _lock.target(lock, arch)
+    elif arch is None:
         torch = _torch()
         cap = _capability(torch, torch.cuda.current_device())
     else:
@@ -1193,6 +1228,9 @@ def _export(
             from ._library import build_library
 
             for lspec in library_specs_of(op):
+                if lock is not None:  # what the export on the lock's device pinned, from the lock: no heuristic, no library
+                    pinned_library.append(_lock.locked_library(lspec, lock, cap))
+                    continue
                 pinned_library.append(build_conv(lspec, arch=cap, canary=True) if is_conv(op) else build_library(lspec, arch=cap, canary=True))
             continue
         target = _target(op).at(cap)  # an extern declared with by_arch=: the implementation of the target architecture
@@ -1202,6 +1240,8 @@ def _export(
             if extern.binary is not None and extern.binary.kind == "cute":  # compiled by the DSL, its launch captured on the device (of arch)
                 from ._cute import build_cute
 
+                if lock is not None:
+                    _lock.refuse_cute(spec.stem, lock)
                 built.append(build_cute(spec, extern.binary, arch=cap))
             elif extern.binary is not None:
                 from ._binary import build_binary
@@ -1210,6 +1250,8 @@ def _export(
             else:
                 jit = target.jit_function(spec)
                 built.append(build(spec, arch=cap, fn=jit, stages=traced, instrument=cfg if cfg is not None and cfg.covers(spec.op) else None))
+            if lock is not None:  # the lock's binary, before anything is written
+                _lock.check_built(built[-1], lock)
             if traced:
                 traces.append(_trace.item_of(built[-1], target, jit))
     path, written = write_manifest_doc(
@@ -1225,6 +1267,8 @@ def _export(
     loaded.pinned = True  # its digest is the one of the manifest this process wrote from its own builds
     if traced:
         _trace.write(directory, traces, loaded)
+    if lock is not None:  # every file of the directory, the lock's
+        _lock.verify_tree(directory, lock)
     return loaded
 
 
