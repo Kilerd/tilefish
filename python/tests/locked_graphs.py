@@ -94,19 +94,24 @@ def lk_axpy_ptx(x: Tensor[n, f32], y: Tensor[n, f32], out: Out[Tensor[n, f32]], 
 
 
 def _assemble() -> "dict[str, pathlib.Path]":
-    """``ptx/axpy_f32.ptx`` assembled for each of :data:`CUBIN_ARCHES` by the ptxas a build uses (``tilefish._binary.find_ptxas``), with the flags a
-    prebuilt PTX is assembled with, from a directory of its own (so the command line ptxas records names no path of this machine)."""
+    """``ptx/axpy_f32.ptx`` assembled for each of :data:`CUBIN_ARCHES` the ptxas a build uses can target (``tilefish._binary.find_ptxas``; Triton
+    3.5.1's own, CUDA 12.8's, has no sm_103), with the flags a prebuilt PTX is assembled with, from a directory of its own (so the command line
+    ptxas records names no path of this machine). The same ptxas on two machines gives the same cubins, so the same declaration."""
     out = {}
     root = pathlib.Path(tempfile.mkdtemp(prefix="tilefish-locked-"))
     (root / "axpy_f32.ptx").write_bytes(PTX.read_bytes())
     for arch in CUBIN_ARCHES:
         name = f"axpy_f32.{arch}.cubin"
-        subprocess.run([_binary.find_ptxas(), *_binary.PTX_FLAGS, f"--gpu-name={arch}", "axpy_f32.ptx", "-o", name], cwd=root, check=True, capture_output=True)
-        out[arch] = root / name
+        done = subprocess.run([_binary.find_ptxas(), *_binary.PTX_FLAGS, f"--gpu-name={arch}", "axpy_f32.ptx", "-o", name], cwd=root, capture_output=True)
+        if done.returncode == 0:
+            out[arch] = root / name
     return out
 
 
-@tilefish.extern(cubin=_assemble(), symbol="axpy_f32", block=(128,), grid=lambda n: (tilefish.cdiv(n, 128),), name="lk_axpy_cubin")
+CUBINS = _assemble()  # the architectures the set exports for: those the cubin extern has a cubin of
+
+
+@tilefish.extern(cubin=CUBINS, symbol="axpy_f32", block=(128,), grid=lambda n: (tilefish.cdiv(n, 128),), name="lk_axpy_cubin")
 def lk_axpy_cubin(x: Tensor[n, f32], y: Tensor[n, f32], out: Out[Tensor[n, f32]], n_elem: n, alpha: const[f32] = 0.5): ...
 
 

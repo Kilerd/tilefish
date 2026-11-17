@@ -215,6 +215,30 @@ def test_a_tampered_hash_is_refused_naming_the_file(fake, monkeypatch, tmp_path)
     (tmp_path / "e" / "notes.txt").write_text("left over")
     with pytest.raises(TilefishLockError, match=r"has 'notes.txt', a file the lock .* does not have: export into an empty directory"):
         runtime.export(GRAPHS, tmp_path / "e", lock=lock)
+    # the digests a host is told to pin, and every other record, are what the files say: a lock edited by hand where no file shows it is refused too
+    for edit, where in (
+        (lambda d: d["digests"].update(manifest="0" * 64), "digests.manifest"),
+        (lambda d: d["digests"].update(set="1" * 64), "digests.set"),
+        (lambda d: d["digests"]["plans"].update(lt_mlp="2" * 64), r"digests.plans.lt_mlp"),
+        (lambda d: d["kernels"][cubin].update(sha256_code="3" * 64), rf"kernels.{cubin}.sha256_code"),
+    ):
+        with pytest.raises(TilefishLockError, match=rf"is not the lock of the files it holds: at {where} it has '[0-9]{{64}}', and the directory"):
+            runtime.export(GRAPHS, tmp_path / where.replace("\\", ""), lock=edited(lock, tmp_path, edit))
+    (tmp_path / "f").mkdir()
+    (tmp_path / "f" / "trace").symlink_to(tmp_path)  # a link where the trace goes is not skipped, it is refused
+    with pytest.raises(TilefishLockError, match=r"is a symbolic link; an export directory has none"):
+        runtime.export(GRAPHS, tmp_path / "f", lock=lock)
+
+
+def test_a_record_that_makes_no_valid_entry_is_refused_before_anything_is_written(fake, monkeypatch, tmp_path):
+    _, lock, _ = lock_on_gpu(monkeypatch, tmp_path)
+    bad = edited(lock, tmp_path, lambda d: d["library"]["lt_down.M32"]["verification"].update(formula="nonsense"))
+    with pytest.raises(TilefishLockError, match=r"a record of 'lt_down.M32' that makes no valid manifest entry: .*verification.formula must be"):
+        runtime.export(GRAPHS, tmp_path / "a", lock=bad)
+    bad = edited(lock, tmp_path, lambda d: d["library"]["lt_down.M64"]["verification"].update(differ=3))  # measured-exact, but elements differ
+    with pytest.raises(TilefishLockError, match=r"'lt_down.M64' that makes no valid manifest entry: .*contract is 'measured-exact'"):
+        runtime.export(GRAPHS, tmp_path / "b", lock=bad)
+    assert not (tmp_path / "a").exists() and not (tmp_path / "b").exists()
 
 
 def test_a_missing_pin_or_verification_is_refused_with_a_re_lock(fake, monkeypatch, tmp_path):
@@ -299,6 +323,11 @@ def test_write_lock_takes_one_export_of_one_device_whose_regions_were_verified(f
         runtime.write_lock(out, tmp_path / "x.lock.json")
     with pytest.raises(TilefishLockError, match="has no manifest.json"):
         runtime.write_lock(tmp_path / "nothing", tmp_path / "x.lock.json")
+    # one graph exported over another's directory: the manifest keeps the other's entries, and its fusion report stays
+    runtime.export(lt_conv, tmp_path / "over", arch=ARCH)
+    runtime.export(lt_mlp, tmp_path / "over", arch=ARCH, overwrite=True)
+    with pytest.raises(TilefishLockError, match=r"has entries no plan of the directory launches \(fused_[0-9a-f]+, lt_axpy, lt_conv1d.T128, lt_conv1d.T64\): they are left"):
+        runtime.write_lock(tmp_path / "over", tmp_path / "x.lock.json")
     # an export whose regions were not verified (no device of the architecture: the export warns and records why)
     gpu.setattr(_planrun, "_verify_fusion", lambda g, p, cap, verify: {r.index: {"skipped": "no CUDA device"} for r in _fusion.fused(g).fused_regions} if _fusion.has_arithmetic(g) else None)
     runtime.export(GRAPHS, tmp_path / "skipped", arch=ARCH)

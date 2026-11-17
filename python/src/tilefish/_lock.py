@@ -60,15 +60,18 @@ def tree(directory: pathlib.Path) -> "dict[str, str]":
     export is outside the pinned artefact, as it is outside every digest). A symbolic link is refused: an export writes none."""
     from ._trace import TRACE_DIR
 
+    def unreadable(e: OSError) -> NoReturn:
+        raise TilefishLockError(f"cannot read the export directory {str(directory)!r}: {e}")
+
     out: "dict[str, str]" = {}
-    for root, dirs, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory, onerror=unreadable):
         here = pathlib.Path(root)
         rel = here.relative_to(directory)
-        if rel == pathlib.Path("."):
-            dirs[:] = [d for d in dirs if d != TRACE_DIR]
         for name in [*dirs, *files]:
             if (here / name).is_symlink():
                 raise TilefishLockError(f"{str(here / name)!r} is a symbolic link; an export directory has none")
+        if rel == pathlib.Path("."):
+            dirs[:] = [d for d in dirs if d != TRACE_DIR]
         for name in files:
             key = (rel / name).as_posix() if rel != pathlib.Path(".") else name
             out[key] = _sha256((here / name).read_bytes())
@@ -153,6 +156,7 @@ def lock_of(directory: "str | os.PathLike[str]") -> "dict[str, Any]":
     sm_count = next(iter(sm_counts["sm_count"])) if sm_counts else None
     known = {MANIFEST_NAME, *(k["cubin"] for k in kernels.values())}
     digests: "dict[str, Any]" = {"manifest": m.digest, "plans": {}}
+    docs = []
     if (directory / PLAN_SET_NAME).is_file():
         index = read_plan_set(directory)
         if index["manifest_digest"] != m.digest:
@@ -163,6 +167,7 @@ def lock_of(directory: "str | os.PathLike[str]") -> "dict[str, Any]":
                 raise TilefishLockError(f"the plan of '{name}' in {str(directory)!r} is not the one {PLAN_SET_NAME} lists: lock the directory an export wrote")
             digests["plans"][name] = digest
             known.add(plan_file_name(name))
+            docs.append(doc)
         digests["set"] = index["set_digest"]
         known.add(PLAN_SET_NAME)
     elif (directory / PLAN_NAME).is_file():
@@ -171,6 +176,15 @@ def lock_of(directory: "str | os.PathLike[str]") -> "dict[str, Any]":
             raise TilefishLockError(f"{PLAN_NAME} in {str(directory)!r} is of another manifest than the one next to it: lock the directory an export wrote")
         digests["plans"][doc["graph"]] = doc["plan_digest"]
         known.add(PLAN_NAME)
+        docs.append(doc)
+    if docs:  # an export of graphs writes the entries its plans launch, and no other (one left from an export of another graph is not this export's)
+        launched = {st["entry"] for d in docs for b in d["buckets"] for st in b["steps"] if "entry" in st}
+        stray = sorted({*kernels, *library} - launched)
+        if stray:
+            raise TilefishLockError(
+                f"the manifest in {str(directory)!r} has entries no plan of the directory launches ({', '.join(stray[:5])}{' ...' if len(stray) > 5 else ''}): "
+                "they are left from another export into it; a lock is of one export, so export into an empty directory and lock that"
+            )
     fusion: "dict[str, Any]" = {}
     for report_file in sorted(directory.glob("*.fusion.json")) if digests["plans"] else []:  # <graph>.fusion.json, of a graph whose body computes
         known.add(report_file.name)
@@ -179,10 +193,19 @@ def lock_of(directory: "str | os.PathLike[str]") -> "dict[str, Any]":
         except (OSError, ValueError) as e:
             raise TilefishLockError(f"cannot read the fusion report {str(report_file)!r}: {e}") from None
         name = report.get("graph") if isinstance(report, dict) else None
-        if not isinstance(report, dict) or report.get("schema") != REPORT_SCHEMA or f"{name}.fusion.json" != report_file.name:
+        regions = report.get("regions") if isinstance(report, dict) else None
+        if (
+            not isinstance(report, dict)
+            or report.get("schema") != REPORT_SCHEMA
+            or f"{name}.fusion.json" != report_file.name
+            or not isinstance(regions, list)
+            or any(not isinstance(item, dict) or not isinstance(item.get("op"), str) or not isinstance(item.get("verified", {}), dict) for item in regions)
+        ):
             raise TilefishLockError(f"{str(report_file)!r} is not the fusion report of a graph of the export")
+        if name not in digests["plans"]:
+            raise TilefishLockError(f"{str(report_file)!r} is the fusion report of '{name}', which has no plan in {str(directory)!r}: it is left from another export")
         verified = []
-        for i, item in enumerate(report.get("regions", [])):
+        for i, item in enumerate(regions):
             if "verified" not in item:
                 continue
             if "skipped" in item["verified"]:
@@ -513,10 +536,10 @@ def locked_library(spec: Any, lock: Lock, cap: int) -> Any:
             raise TilefishLockError(f"the lock {lock.path!r} has a {pin.api} pin for '{spec.stem}', and the declaration's api is {spec.api!r}; {RELOCK}")
         if "canary" not in rec:  # (an export records a canary in every convolution entry)
             raise TilefishLockError(f"the lock {lock.path!r} has no canary for the cuDNN convolution '{spec.stem}'; {RELOCK}")
-        return _conv.BuiltConv(spec, arch, pin, lock.toolchain["cudnn"], sms, _ordered(rec["canary"], ("seed", "y_digest")))
+        return _valid(_conv.BuiltConv(spec, arch, pin, lock.toolchain["cudnn"], sms, _ordered(rec["canary"], ("seed", "y_digest"))), lock)
     version = lock.toolchain["cublaslt"]
     if not spec.matmul:
-        return BuiltLibrary(spec, arch, rec["algo"], version, sms)
+        return _valid(BuiltLibrary(spec, arch, rec["algo"], version, sms), lock)
     if spec.contract == "measured-exact" and rec["contract"] != "measured-exact":
         raise TilefishLockError(
             f"the lock {lock.path!r} records the pin of '{spec.stem}' as {rec['contract']}, and the declaration asks for contract='measured-exact' (an "
@@ -525,7 +548,19 @@ def locked_library(spec: Any, lock: Lock, cap: int) -> Any:
     if spec.canary and "canary" not in rec:
         raise TilefishLockError(f"the lock {lock.path!r} has no canary for '{spec.stem}', and its declaration has one (canary=True); {RELOCK}")
     canary = _ordered(rec["canary"], CANARY_KEYS) if spec.canary else None
-    return BuiltLibrary(spec, arch, rec["algo"], version, sms, rec["contract"], _ordered(rec["verification"], VERIFICATION_KEYS), canary)
+    return _valid(BuiltLibrary(spec, arch, rec["algo"], version, sms, rec["contract"], _ordered(rec["verification"], VERIFICATION_KEYS), canary), lock)
+
+
+def _valid(built: Any, lock: Lock) -> Any:
+    """``built`` (from the lock), after its entry passed every rule a manifest reader holds a library entry to (``validate_entry``): a record of the
+    lock that would make an entry no host reads is refused here, before anything is written."""
+    from ._library import validate_entry
+
+    try:
+        validate_entry(json.loads(json.dumps(built.entry())))
+    except TilefishManifestError as e:
+        raise TilefishLockError(f"the lock {lock.path!r} has a record of '{built.stem}' that makes no valid manifest entry: {e}") from None
+    return built
 
 
 def _ordered(record: "dict[str, Any]", keys: "tuple[str, ...]") -> "dict[str, Any]":
@@ -598,6 +633,17 @@ def verify_tree(directory: "str | os.PathLike[str]", lock: Lock) -> None:
         raise TilefishLockError(
             f"{str(directory)!r} has {extra[0]!r}, a file the lock {lock.path!r} does not have: export into an empty directory (a locked export holds "
             f"every file of it to the lock), or {RELOCK}"
+        )
+    # the directory locks to the very lock: what the files say (the digests to pin, the binaries, the pins, the regions) is what the lock says, so a lock
+    # whose files and digests disagree (a digest a host would be told to pin, edited by hand) is refused too
+    from .aot import _first_difference, _show
+
+    found = _first_difference(lock.doc, lock_of(directory), "")
+    if found is not None:
+        path, want, got = found
+        raise TilefishLockError(
+            f"the lock {lock.path!r} is not the lock of the files it holds: at {path} it has {_show(want)}, and the directory, whose every file is the "
+            f"lock's, gives {_show(got)}; the lock was edited by hand: {RELOCK}"
         )
 
 

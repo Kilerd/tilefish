@@ -1803,25 +1803,31 @@ def prepare_plans(work, locked=None, lock=None):
         exports.append((f"shared-{g.name}", g, False, make_cases, stages_dir, stages[g.name], stages.digest, extra))
     # the plan set of locked_graphs (a step of every kind of callee an export builds or pins): exported here, or with --locked the directory a
     # locked export wrote on a machine without a GPU (docs/guide/locked-export.md), held to its lock and replayed under the set digest the lock records
-    import locked_graphs as lg
-
     locked_dir = root / "locked"
-    if not tma_capable():  # (a step of the set has device-side TMA descriptors)
-        if locked is not None:
-            sys.exit("--locked: the locked set has device-side TMA descriptors, and this device is older than sm_90")
-        lg_graphs = ()
-    elif locked is None:
-        locked_set, lg_graphs = runtime.export(list(lg.GRAPHS), locked_dir), lg.GRAPHS
-    else:
+    lg_graphs = ()
+    if tma_capable():  # (a step of the set has device-side TMA descriptors: sm_90 or newer)
+        import locked_graphs as lg  # (it assembles its cubin extern with ptxas, for the architectures that ptxas can target)
+
+        arch = "sm_{}{}".format(*torch.cuda.get_device_capability())
+        if arch not in lg.CUBINS:
+            print(f"the locked set is not run: its cubin extern has no cubin for {arch} (the ptxas found cannot target it)", file=sys.stderr)
+        else:
+            lg_graphs = lg.GRAPHS
+    if locked is not None and not lg_graphs:
+        sys.exit("--locked: the locked set does not run on this device (it needs sm_90 or newer, and a cubin of its architecture)")
+    if lg_graphs and locked is None:
+        locked_set = runtime.export(list(lg.GRAPHS), locked_dir)
+    elif lg_graphs:
         from tilefish import _lock
 
         held = _lock.read_lock(lock)
         shutil.copytree(locked, locked_dir)
         _lock.verify_tree(locked_dir, held)
-        set_pin = held.doc["digests"]["set"]
+        set_pin = held.doc["digests"].get("set")
+        if set_pin is None:
+            sys.exit(f"--lock {lock} is the lock of one graph or of kernels, not of the plan set of locked_graphs")
         index = tilefish._plan.read_plan_set(locked_dir, pin=set_pin)
         locked_set = tilefish._plan.PlanSet(index, locked_dir, {g.name: tilefish._plan.load_plan(locked_dir, g, pin=set_pin) for g in lg.GRAPHS})
-        lg_graphs = lg.GRAPHS
         print(f"the locked set: {locked} ({len(held.doc['files'])} files, the lock's), set digest {set_pin}", file=sys.stderr)
     for g in lg_graphs:
         extra = {"dir": f"plans/locked/{g.name}.plan.json", "set": "plans/locked", "set_digest": locked_set.digest}

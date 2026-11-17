@@ -22,7 +22,7 @@ from gpu_util import same_bytes  # noqa: E402
 
 import tilefish  # noqa: E402
 from tilefish import TilefishLockError, runtime  # noqa: E402
-from tilefish import _conv, _cublaslt, _cudnn, _fusion, _library, _lock, _planrun  # noqa: E402
+from tilefish import _conv, _cublaslt, _cudnn, _fusion, _library, _planrun  # noqa: E402
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -40,6 +40,9 @@ def locked(tmp_path_factory):
     """The set exported on this device into ``gpu/`` and its lock."""
     import locked_graphs as lg
 
+    arch = "sm_{}{}".format(*torch.cuda.get_device_capability())
+    if arch not in lg.CUBINS:
+        pytest.skip(f"the cubin extern of the locked set has no cubin for {arch}: the ptxas found cannot target it (set TRITON_PTXAS_PATH)")
     root = tmp_path_factory.mktemp("locked")
     runtime.export(list(lg.GRAPHS), root / "gpu")
     doc = runtime.write_lock(root / "gpu", root / "device.lock.json")
