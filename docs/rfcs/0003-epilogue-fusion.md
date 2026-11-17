@@ -1,5 +1,7 @@
 # RFC 0003: Epilogue and prologue fusion
 
+**English** | [简体中文](../zh-CN/rfcs/0003-epilogue-fusion.md)
+
 * **Status:** reviewed; the decisions of 2026-11-16 are recorded in "Decisions" below. Design and phase 0 experiments (section 6). Milestones E1,
   epilogue hooks on externs ("E1: implementation notes" below), and E2, cuBLASLt epilogues (section 7.3: what was built, what was measured and what
   is left), are implemented, and work together in one graph ("E1 and E2 together" below); experiment X8, a persistent warp-specialised GEMM with
