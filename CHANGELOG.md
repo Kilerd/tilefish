@@ -133,8 +133,9 @@ body widens a cuBLASLt GEMM's result).
 
 - The C++ GPU gate's own buffers (`crates/tilefish-capi/tests/gpu/driver.hpp`) finish their writes before the call returns. Their zeros and uploads
   run on the legacy stream, which the gate's non-blocking stream does not wait for, and a cuDNN convolution's workspace zeroed there while the
-  convolution used it gave all-zero outputs now and then (the gate's `conv_k7.T646` and others; 34 of 397 runs on a busy B300 slice). Test code
-  only: the crate and the C ABI order their own memory on the launch stream. The new gate test `buffers` checks it.
+  convolution used it gave all-zero outputs now and then (the gate's `conv_k7.T646` and others: 77 of 1000 runs of its convolutions on a busy B300
+  slice, none of 900 on an RTX 5090; none of 300 with the fix). Test code only: the crate and the C ABI order their own memory on the launch stream.
+  The new gate test `buffers` checks it.
 
 ## tilefish 0.0.11, crate 0.0.9, tilefish-capi 0.0.1 (2026-11-17)
 
