@@ -36,7 +36,7 @@ same manifest and plan from Rust, and `tilefish.hosts.rust.emit` generates
 typed Rust launchers for it. The API will change.
 
 What tilefish is and is not, and how features are added from 0.0.13 on, is in
-[`docs/scope.md`](https://github.com/Kilerd/tilefish/blob/main/docs/scope.md).
+[`docs/en/scope.md`](https://kilerd.github.io/tilefish/scope/).
 
 ## Install
 
@@ -50,11 +50,11 @@ pip install "tilefish[sass]"          # CUDA 13's nvdisasm, for tilefish-explain
 
 - [The README](https://github.com/Kilerd/tilefish#readme): an example, how it works, a quick start for each host
   and the features at a glance.
-- [The documents' index](https://github.com/Kilerd/tilefish/blob/main/docs/README.md), with the guide: [the build](https://github.com/Kilerd/tilefish/blob/main/docs/guide/build.md),
-  [operators](https://github.com/Kilerd/tilefish/blob/main/docs/guide/operators.md), [lowered kernels](https://github.com/Kilerd/tilefish/blob/main/docs/guide/lowering.md),
-  [launch plans](https://github.com/Kilerd/tilefish/blob/main/docs/guide/plans.md), [fusion](https://github.com/Kilerd/tilefish/blob/main/docs/guide/fusion.md),
-  [rewrites](https://github.com/Kilerd/tilefish/blob/main/docs/guide/rewrites.md), [SASS](https://github.com/Kilerd/tilefish/blob/main/docs/guide/sass.md), [the Rust host](https://github.com/Kilerd/tilefish/blob/main/docs/guide/rust.md)
-  and [the C++ host](https://github.com/Kilerd/tilefish/blob/main/docs/guide/cpp.md).
+- [The documents' index](https://kilerd.github.io/tilefish/), with the guide: [the build](https://kilerd.github.io/tilefish/guide/build/),
+  [operators](https://kilerd.github.io/tilefish/guide/operators/), [lowered kernels](https://kilerd.github.io/tilefish/guide/lowering/),
+  [launch plans](https://kilerd.github.io/tilefish/guide/plans/), [fusion](https://kilerd.github.io/tilefish/guide/fusion/),
+  [rewrites](https://kilerd.github.io/tilefish/guide/rewrites/), [SASS](https://kilerd.github.io/tilefish/guide/sass/), [the Rust host](https://kilerd.github.io/tilefish/guide/rust/)
+  and [the C++ host](https://kilerd.github.io/tilefish/guide/cpp/).
 - [The changelog](https://github.com/Kilerd/tilefish/blob/main/CHANGELOG.md): what each release changed.
 
 Licensed under either of Apache License, Version 2.0 or MIT license at your

@@ -1,6 +1,6 @@
 # The Rust host
 
-**English** | [简体中文](../zh-CN/guide/rust.md)
+**English** | [简体中文](../../zh-CN/guide/rust.md)
 
 The `tilefish` crate (`crates/tilefish`, version 0.0.11) is the
 host of a manifest directory, without Python or Triton: it reads the manifest as
@@ -54,7 +54,7 @@ no way to tell a launch what a dimension is. A manifest of an older schema is
 refused by both hosts: export it again.
 
 **Schema 3 and the crate.** The crate reads manifest schema 3
-(`docs/manifest-schema-3.md`) in full and launches everything it describes:
+(`docs/en/manifest-schema-3.md`) in full and launches everything it describes:
 Triton kernels and prebuilt PTX and cubin binaries (exactly their parameters, no
 scratch slots, `fixed` arguments at their slots), strided views
 (`TensorRef::from_cuda_strided`, or over a region with `new_strided`; any element

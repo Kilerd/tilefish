@@ -3,7 +3,7 @@
  *
  * Licensed under either of Apache License, Version 2.0 or MIT license at your option.
  *
- * The conventions (docs/rfcs/0002-cpp-host.md, section 5):
+ * The conventions (docs/en/rfcs/0002-cpp-host.md, section 5):
  *
  *  - Every function that can fail returns a tilefish_status (TILEFISH_OK is 0) and writes its result through an out-parameter, which is NULL
  *    after a failure; tilefish_last_error has the details of the last failure of the thread.
@@ -296,7 +296,7 @@ typedef struct tilefish_kernel tilefish_kernel;
 typedef struct tilefish_manifest tilefish_manifest;
 
 /**
- * A launch plan (`plan.json`), verified against its pin, the manifest next to it and every rule of `docs/plan-schema-1.md`.
+ * A launch plan (`plan.json`), verified against its pin, the manifest next to it and every rule of `docs/en/plan-schema-1.md`.
  */
 typedef struct tilefish_plan tilefish_plan;
 
@@ -569,7 +569,7 @@ typedef struct tilefish_tap {
 #define TILEFISH_ERROR_PIN_MISMATCH 4
 
 /**
- * A plan or plan set is refused (a rule of `docs/plan-schema-1.md`, another manifest, a step that is not its entry).
+ * A plan or plan set is refused (a rule of `docs/en/plan-schema-1.md`, another manifest, a step that is not its entry).
  */
 #define TILEFISH_ERROR_PLAN 5
 

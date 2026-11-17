@@ -1,6 +1,6 @@
 # 构建如何进行
 
-[English](../../guide/build.md) | **简体中文**
+[English](../../en/guide/build.md) | **简体中文**
 
 构建就是 Python API，没有构建用的命令行：
 

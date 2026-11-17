@@ -1,8 +1,8 @@
 # 融合：graph 函数体中的算术
 
-[English](../../guide/fusion.md) | **简体中文**
+[English](../../en/guide/fusion.md) | **简体中文**
 
-graph（计算图）的函数体可以做计算。两次调用之间的算术（两个 GEMM（通用矩阵乘）之间的 `silu(g.to(f32)) * u.to(f32)`、一个 bias 加一个激活、一次残差加、一个由设备标量得到的掩码、一次反量化）会像 kernel（核函数）函数体一样被追踪，并遵循同样的规则（没有隐式类型提升，标量舍入到张量的 dtype，f32 数学函数）；规划器再把它分组成 **区域**（region）：每个区域是 tilefish 生成的一个独立的 `@tilefish.kernel`（按内容命名为 `fused_<hash>`，用同样的模板下沉（lowering）），也是 plan（计划）中一个普通的 kernel 步骤。两种 schema（模式）和三个 host（宿主）都不变（`docs/rfcs/0001-plan-fusion.md`）。
+graph（计算图）的函数体可以做计算。两次调用之间的算术（两个 GEMM（通用矩阵乘）之间的 `silu(g.to(f32)) * u.to(f32)`、一个 bias 加一个激活、一次残差加、一个由设备标量得到的掩码、一次反量化）会像 kernel（核函数）函数体一样被追踪，并遵循同样的规则（没有隐式类型提升，标量舍入到张量的 dtype，f32 数学函数）；规划器再把它分组成 **区域**（region）：每个区域是 tilefish 生成的一个独立的 `@tilefish.kernel`（按内容命名为 `fused_<hash>`，用同样的模板下沉（lowering）），也是 plan（计划）中一个普通的 kernel 步骤。两种 schema（模式）和三个 host（宿主）都不变（`docs/zh-CN/rfcs/0001-plan-fusion.md`）。
 
 ```python
 @tilefish.graph(inputs=("x",))
@@ -23,7 +23,7 @@ def add_rmsnorm(x: Tensor[R, D, bf16], res: Tensor[R, D, bf16], w: Tensor[D, bf1
     return (h32 * tilefish.rsqrt(ms + 1e-6) * w.to(f32)).to(bf16), h      # one kernel, two outputs: the unfused composition is ten
 ```
 
-layer norm（两个有序均值和一个仿射收尾）、softmax（一次缩放、一个由设备标量得到的掩码、`max`、`exp`、一次有序求和、一次除法）、按行的 fp8 量化（一个绝对值最大值、一个同样被返回的每行缩放因子、一次饱和转换），以及对 GEMM 输出的两个列块做的 norm（就地读取）也都各自是一个 kernel。行区域使用第 2 版下沉（`tilefish.lower` 的第 21 条说明）：有序求和通过对半拆分得到各 lane 的链，而不是每一步做一次 gather（同样的加法、同样的顺序，已在每种长度上对照每种顺序的 CUDA kernel 检查过），一行有序求和使用适合它的 warp（线程束）数，fp8 转换是内联 PTX。在一个 B300 切片上，4096 行、每行 1024 列的融合 add + rmsnorm 耗时 16 us，使用 Triton 树形求和的三个 kernel 耗时 65 us，十个未融合 kernel 耗时 103 us（速度表见 `docs/rfcs/0001-plan-fusion.md` 第 2 阶段）。
+layer norm（两个有序均值和一个仿射收尾）、softmax（一次缩放、一个由设备标量得到的掩码、`max`、`exp`、一次有序求和、一次除法）、按行的 fp8 量化（一个绝对值最大值、一个同样被返回的每行缩放因子、一次饱和转换），以及对 GEMM 输出的两个列块做的 norm（就地读取）也都各自是一个 kernel。行区域使用第 2 版下沉（`tilefish.lower` 的第 21 条说明）：有序求和通过对半拆分得到各 lane 的链，而不是每一步做一次 gather（同样的加法、同样的顺序，已在每种长度上对照每种顺序的 CUDA kernel 检查过），一行有序求和使用适合它的 warp（线程束）数，fp8 转换是内联 PTX。在一个 B300 切片上，4096 行、每行 1024 列的融合 add + rmsnorm 耗时 16 us，使用 Triton 树形求和的三个 kernel 耗时 65 us，十个未融合 kernel 耗时 103 us（速度表见 `docs/zh-CN/rfcs/0001-plan-fusion.md` 第 2 阶段）。
 
 **每次导出都会检查。** `export` 会把每个包含多个算子的区域与它的各个算子逐一对照运行：在设备上用 `jit`，覆盖每个 bucket（分桶），输入带种子并覆盖所有边角情况（带载荷的 NaN、无穷大、次正规数、带符号零），一旦出现差异就拒绝导出（`verify=False` 可以关闭检查；在其他架构的设备上，检查会被跳过并给出 `TilefishFusionWarning`）。它在 plan 旁边写出 `<graph>.fusion.json`，即 **融合报告**：对每个区域，列出它取走的函数体算子、它读取什么（就地读取，或读一份拷贝）、写出什么、保留的每次舍入以及该模式的改写；`tilefish.fusion_report(graph)` 和 `tilefish.verify_fusion(graph)` 可以按需给出同样的内容。非稠密的视图（上面的两半、一个 head、一次转置）按每个轴一个步长就地读取（版本 1 的行区域则先用 `tilefish.contiguous` 拷贝）。测试在每个 bf16 和 f16 位模式上、在 2**22 个位模式组成的网格上、在 120 个最多 24 个算子的随机 graph 和 80 个由行算子组成的随机 graph 上、在上述行形态（pattern）的每个 bucket 上（每个 bf16 位模式、由特殊值组成的行），保证融合与未融合的结果一致，并在每个 f32 上保证内联转换与 `.to()` 一致。
 
@@ -38,7 +38,7 @@ layer norm（两个有序均值和一个仿射收尾）、softmax（一次缩放
 | `fp_contract` | `"none"`、`"mul-add"` | 不收缩任何运算；或者把乘积不被其他地方读取的 f32 `a * b + c`（或 `- c`）变成 `tilefish.fma`，只舍入一次 |
 | `verify` | `True`、`False` | `export` 是否检查区域 |
 
-每个改写都在区域形成之前在 IR 上完成，因此它的舍入点从不取决于区域落在哪里。`tilefish.barrier(x)` 让 `x` 成为区域的边界（它得到 plan 中的一个缓冲区，`taps=` 可以读取它）；它从不改变任何字节。尚未规划的有：graph 函数体中的 scatter、并入区域的不带 `order=` 的归约、由区域完成的对 `InOut` 张量或 carried（携带）张量的写入（它是一个拷贝步骤）、区域内的稠密 reshape、带步长的写入、`tilefish.fused(name=...)` 作用域、`intermediates="f32"`，以及非精确的模式（`docs/rfcs/0001-plan-fusion.md` 第 11 节）。融合进 GEMM 或卷积，即 epilogue（尾部）和 prologue（头部），在 RFC 0003 中设计（`docs/rfcs/0003-epilogue-fusion.md`：它区分开的三种数值语义契约、各条路线，以及背后的实验）；它最初的里程碑，extern（外部 kernel）上的 epilogue hook（钩子；E1）和 cuBLASLt epilogue（E2），见下文。没有声明就不会改变任何字节：`epilogues="exact"` 是默认值。
+每个改写都在区域形成之前在 IR 上完成，因此它的舍入点从不取决于区域落在哪里。`tilefish.barrier(x)` 让 `x` 成为区域的边界（它得到 plan 中的一个缓冲区，`taps=` 可以读取它）；它从不改变任何字节。尚未规划的有：graph 函数体中的 scatter、并入区域的不带 `order=` 的归约、由区域完成的对 `InOut` 张量或 carried（携带）张量的写入（它是一个拷贝步骤）、区域内的稠密 reshape、带步长的写入、`tilefish.fused(name=...)` 作用域、`intermediates="f32"`，以及非精确的模式（`docs/zh-CN/rfcs/0001-plan-fusion.md` 第 11 节）。融合进 GEMM 或卷积，即 epilogue（尾部）和 prologue（头部），在 RFC 0003 中设计（`docs/zh-CN/rfcs/0003-epilogue-fusion.md`：它区分开的三种数值语义契约、各条路线，以及背后的实验）；它最初的里程碑，extern（外部 kernel）上的 epilogue hook（钩子；E1）和 cuBLASLt epilogue（E2），见下文。没有声明就不会改变任何字节：`epilogues="exact"` 是默认值。
 
 ## Epilogue hook：extern 的 GEMM 之后的算术，放进它的 kernel
 
@@ -63,7 +63,7 @@ def up(x: Tensor[T, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16]):
 * **默认精确**（`tilefish.fusion()`，`epilogues="exact"`）：区域放进 `value="out"` hook，它看到的是 kernel 已舍入到输出类型、正准备存储的 tile，因此融合后的算子写出的字节与先运行 extern、再运行区域的字节相同（契约 (i)），`export` 会在每个 bucket 上用带种子、含特殊值的输入检查这一点（`verify_fusion` 也会）。
 * **作用于累加器**，需要声明：`tilefish.fusion(epilogues="accumulator")`，或一个作用域 `with tilefish.fused(epilogues="accumulator"):`（从不按单次调用声明）。此时 graph 就是其函数体的改写 `R_acc`：对 extern 结果的每个加宽 `y.to(f32)` 都变成 extern 的 f32 结果（由 extern 的累加器形式 `<extern>__acc` 写出），少一次舍入，区域放进 `value="acc"` hook。字节是改写后程序的未融合 plan 的字节（契约 (ii)），在导出时检查；它们不是先 extern 后区域的字节（一个 bias + 激活的输出中约有三分之一不同），而且精度至少一样高。
 * **hook 接受什么**：在结果形状上的逐元素区域（bias、激活、带逐通道参数的周期激活、把残差流作为旁路输出的残差加、掩码、类型转换），门控激活的双累加器 tile（`tilefish.hook(..., split=2)`：一个 program 持有 gate 的 tile 和对应的 up projection 的 tile），以及在 extern 的一个 tile 包含整行时的行区域（rmsnorm）（`block_n=`，Triton kernel）。它不接受的部分仍走路线 (a)，即调用之后的一个区域，融合报告、`boundaries()` 和 advisor（建议器）会说明原因（一个 barrier、hook 不持有的视图、中间夹着一次调用、比 tile 更宽的行……）。
-* **速度取决于 kernel**：hook 的算术在 extern 的主循环之后，在 extern 的 warp 上运行。在一个 B300 切片上，用示例 GEMM，2048 x 4096 x 1024 GEMM 之后的 bias + GELU 融合后的速度是 GEMM 后接其区域的 1.21 倍，门控激活是 1.14 倍；对 kernel 的 warp 来说过重的 epilogue 可能更慢（卷积之后逐元素做一次 `sin`：0.77 倍；表格见 RFC 0003）。`tilefish.barrier(y)` 把区域留在调用之后。`python/examples/persistent_gemm.py` 是一个示例 kernel（不是受支持的功能，见 `docs/scope.md`），展示了持久化、warp 特化的 GEMM 中的 hook：sm_100/103 上是 Gluon（一个 TMA 生产者、一个 `tcgen05` 发射者，它的 epilogue 在自己的分区上运行，与下一个 tile 的主循环重叠），sm_120 上是 Triton；它的测量结果就是 RFC 0003 的实验 X8。
+* **速度取决于 kernel**：hook 的算术在 extern 的主循环之后，在 extern 的 warp 上运行。在一个 B300 切片上，用示例 GEMM，2048 x 4096 x 1024 GEMM 之后的 bias + GELU 融合后的速度是 GEMM 后接其区域的 1.21 倍，门控激活是 1.14 倍；对 kernel 的 warp 来说过重的 epilogue 可能更慢（卷积之后逐元素做一次 `sin`：0.77 倍；表格见 RFC 0003）。`tilefish.barrier(y)` 把区域留在调用之后。`python/examples/persistent_gemm.py` 是一个示例 kernel（不是受支持的功能，见 `docs/zh-CN/scope.md`），展示了持久化、warp 特化的 GEMM 中的 hook：sm_100/103 上是 Gluon（一个 TMA 生产者、一个 `tcgen05` 发射者，它的 epilogue 在自己的分区上运行，与下一个 tile 的主循环重叠），sm_120 上是 Triton；它的测量结果就是 RFC 0003 的实验 X8。
 * **对 host 和 schema 来说没有新东西**：带 hook 的 extern 通过一个生成的小模块启动，该模块用恒等 hook 调用它的 kernel（计入它的声明 digest（摘要）），融合后的一对是一个独立生成的条目 `<extern>_epi_<hash>`，其身份是它编译成的 IR。`python/examples/epilogue_gemm.py` 包含一个 Triton GEMM（sm_100/103 上是 `tcgen05.mma`，sm_120 上是 `mma.sync`，两者都在 SASS 中断言）、它的双累加器形式、一个 Gluon `tcgen05` GEMM，以及一个以隐式 GEMM 实现的 1-D 卷积，每个都带两个 hook。
 
 ## cuBLASLt epilogue：cuBLASLt GEMM 之后的算术，放进库里

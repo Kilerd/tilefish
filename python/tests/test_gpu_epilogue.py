@@ -1,4 +1,4 @@
-"""Epilogue hooks on a GPU (``docs/rfcs/0003-epilogue-fusion.md``, milestone E1): an extern with a region fused into its hook writes the bytes of
+"""Epilogue hooks on a GPU (``docs/en/rfcs/0003-epilogue-fusion.md``, milestone E1): an extern with a region fused into its hook writes the bytes of
 its reference, for every input.
 
 * every pattern of E1 (``epilogue_graphs.py``: a GEMM followed by a bias and GELU, SiLU, tanh GELU or a periodic activation; the dual-accumulator
@@ -291,7 +291,7 @@ def test_a_gluon_externs_hooks_take_elementwise_regions_in_both_modes():
 
 
 def test_a_cublaslt_epilogue_and_a_hooked_extern_on_its_accumulator_in_one_graph(externs, tmp_path):
-    """docs/rfcs/0003-epilogue-fusion.md, "E1 and E2 together": a graph declared epilogues="library" with an "accumulator" scope around an extern's
+    """docs/en/rfcs/0003-epilogue-fusion.md, "E1 and E2 together": a graph declared epilogues="library" with an "accumulator" scope around an extern's
     arithmetic is one cublaslt.matmul (the GEMM and its bias) and one fused pair on the extern's accumulator, and writes the bytes of its unfused
     composition (both rewrites, no fusion) at every bucket, through jit, export and replay."""
     up = eg.cublaslt_up("gmix_up")

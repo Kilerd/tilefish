@@ -1,4 +1,4 @@
-"""On a GPU: the plans of a set run one after the other on one shared arena (``tilefish.runtime.share_arena``, ``docs/plan-schema-1.md`` section 15.1).
+"""On a GPU: the plans of a set run one after the other on one shared arena (``tilefish.runtime.share_arena``, ``docs/en/plan-schema-1.md`` section 15.1).
 
 * The three stages of ``plan_model`` (the transformer block cut into ``stage_attn``, ``stage_mix`` and ``stage_ffn``), exported as a plan set and replayed
   through its pin on one arena of the largest stage's bytes (9 109 504, where three arenas take 26 476 800): every bucket and two values of the device

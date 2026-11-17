@@ -2,7 +2,7 @@
 
 Versions are the Python package `tilefish` on PyPI and the Rust crate `tilefish` on crates.io (and, from 0.0.8, the C ABI crate
 `tilefish-capi`, which is built from this repository). The manifest is schema 3 and the
-plan is `tilefish.plan.v1` in both releases below; `docs/manifest-schema-3.md` and `docs/plan-schema-1.md` specify every field, and
+plan is `tilefish.plan.v1` in both releases below; `docs/en/manifest-schema-3.md` and `docs/en/plan-schema-1.md` specify every field, and
 each section names the release that added it.
 
 ## Unreleased
@@ -10,10 +10,17 @@ each section names the release that added it.
 ### Documentation
 
 - **The README is an overview** (about 200 lines): what tilefish is, an example, how it works, the install, a quick start for each host, the
-  features at a glance and the status. Its reference sections moved, with their text unchanged, to `docs/guide/`: `build.md` (how a build works),
+  features at a glance and the status. Its reference sections moved, with their text unchanged, to `docs/en/guide/`: `build.md` (how a build works),
   `operators.md` (views, device scalars, prebuilt binaries, pinned GEMMs and convolutions), `lowering.md` (masks, indices, gathers and copies),
   `plans.md` (launch plans), `fusion.md` (fusion, epilogue hooks, cuBLASLt epilogues), `rewrites.md` (rewrites that know about rounding),
-  `sass.md`, `rust.md` and `cpp.md`. A README section that an entry below names is the page of that title; `docs/README.md` lists them.
+  `sass.md`, `rust.md` and `cpp.md`. A README section that an entry below names is the page of that title; `docs/en/README.md` lists them.
+- **Every page in English and Simplified Chinese.** The English pages moved to `docs/en/`, and `docs/zh-CN/` mirrors them page for page;
+  the README and the PyPI and crates.io pages have `README.zh-CN.md` mirrors. Each page starts with a line that switches language, and
+  `python/tests/test_docs_zh.py` holds every pair to the same headings and the same code blocks. A page `docs/X.md` that an entry below
+  names is now `docs/en/X.md`.
+- **Corrections the translation found** in the English pages: three hosts where a page said two, the order in which `nvdisasm` is searched
+  (`docs/en/numerics.md`), memset steps and the `workspace` of kernel steps in `docs/en/plan-schema-1.md`, and the contents, a table
+  cell and a list of test cases in RFCs 0001 and 0003.
 
 ## tilefish 0.0.13, crate 0.0.11, tilefish-capi 0.0.2 (2026-11-17)
 

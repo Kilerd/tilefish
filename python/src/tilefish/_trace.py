@@ -279,7 +279,7 @@ def graph_doc(graph: Any, plan: Any, plan_file: str) -> "dict[str, Any]":
                 n = src[o]
                 ops.append({"node": o, "op": n.op, "loc": f"{n.loc[0]}:{n.loc[1]}" if n.loc else None})
             h = f.hooked_region(r)
-            if h is not None:  # in an extern's epilogue hook (docs/rfcs/0003-epilogue-fusion.md): the step is the extern with the region's ops
+            if h is not None:  # in an extern's epilogue hook (docs/en/rfcs/0003-epilogue-fusion.md): the step is the extern with the region's ops
                 doc["regions"][h.op.name] = {
                     "kernel": h.op.name, "region": r.index, "template": h.op.__dict__["_tf_generated"].template, "body": ops,
                     "hook": {"call": h.extern.name, "value": h.hook.value, "contract": h.contract, "region_kernel": r.kernel.name},

@@ -1,4 +1,4 @@
-"""CuTe DSL kernels as externs (``@tilefish.extern(cute=...)``, :mod:`tilefish._cute`, ``docs/cute.md``), without a GPU and without the DSL.
+"""CuTe DSL kernels as externs (``@tilefish.extern(cute=...)``, :mod:`tilefish._cute`, ``docs/en/cute.md``), without a GPU and without the DSL.
 
 The DSL's version is the one thing a declaration reads of it (``importlib.metadata``): a fixture stands in for it. The build (the DSL's compile and
 the captured launches) is replaced by what it hands on, the captured parameters and launch facts (:func:`tilefish._cute.classify_params`,

@@ -1,4 +1,4 @@
-//! CuTe DSL kernels as externs (`docs/manifest-schema-3.md` section 4.9), read and checked with no GPU: a `binary` entry of source `cute`, its
+//! CuTe DSL kernels as externs (`docs/en/manifest-schema-3.md` section 4.9), read and checked with no GPU: a `binary` entry of source `cute`, its
 //! toolchain, the digest of its PTX, its grid of integers, and the parameter kinds `tensormap` (a TMA descriptor the DSL encoded: a tensor, whose
 //! launch passes the template with the tensor's address in its first eight bytes) and `bytes` (constant bytes), on synthetic manifests
 //! (`common::synthetic`) and on the manifest Python's fake CuTe build exports (`tests/fixtures/cute_sm_103`, written by

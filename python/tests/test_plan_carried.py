@@ -1,4 +1,4 @@
-"""Carried buffers (``@tilefish.graph(carried=("h",))``, ``docs/plan-schema-1.md`` section 15.2), with no GPU: plans and runners on a fake backend.
+"""Carried buffers (``@tilefish.graph(carried=("h",))``, ``docs/en/plan-schema-1.md`` section 15.2), with no GPU: plans and runners on a fake backend.
 
 A carried parameter is a buffer of role ``carried`` (offset ``null``: the host places it): the arena holds it in a region of its own after the plans'
 regions, the same for every plan of the arena that names it, so one plan hands an intermediate to the next without a tensor of the caller's. A run takes

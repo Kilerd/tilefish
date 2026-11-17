@@ -4,7 +4,7 @@
 //! (the legacy and the backend API and every choice, both layouts, one to three spatial axes, f16, bf16 and f32 with each math, groups, strides,
 //! paddings and dilations, a bucketed length, the alignments, an SM count target, an imported pin), each changed in one field, with what Python's
 //! `validate_entry` decides: accepted, with the pin and the cuDNN-level problem it reads (`tilefish._cudnn.describe`), or refused. Rust reads each in
-//! a manifest of its own and must accept exactly those, with the same pin, the same canary and the same `describe` (`docs/manifest-schema-3.md`,
+//! a manifest of its own and must accept exactly those, with the same pin, the same canary and the same `describe` (`docs/en/manifest-schema-3.md`,
 //! section 9.4), and make the canary's operands (their first elements) and digests Python makes, on the host. No GPU.
 
 mod common;

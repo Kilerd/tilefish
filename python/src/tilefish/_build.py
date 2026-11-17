@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 # 3: strided views (a pointer records ``strides`` and ``offset``, a stride scalar ``stride_of``, the ``max_extent`` precondition), device
 # scalars (a pointer with the shape ``[]``), prebuilt binaries (an entry of ``kind`` ``"binary"``, ``fixed`` arguments, no scratch
 # slots: the ABI records ``scratch_slots``), the ``library`` section (a pinned cuBLASLt GEMM) and the digest tag ``v3``.
-# ``docs/manifest-schema-3.md`` specifies every field.
+# ``docs/en/manifest-schema-3.md`` specifies every field.
 MANIFEST_SCHEMA = 3
 LEGACY_MANIFEST_SCHEMA = 2  # what the Rust host reads; a manifest of this schema is refused here (export it again)
 ENTRY_KIND_TRITON = "triton"
@@ -1082,7 +1082,7 @@ def build(
     an export with ``trace=True`` writes next to the manifest (:mod:`tilefish._trace`). The cache holds binaries, not their IR, so such a build
     compiles (it does not read the cache; it stores its entry): the same bytes as the entry, since a build is reproducible.
 
-    **Instrumented.** ``instrument=`` (a :class:`tilefish._probe.Instrument`) builds the instrumented variant (``docs/instrument.md``): the kernel's
+    **Instrumented.** ``instrument=`` (a :class:`tilefish._probe.Instrument`) builds the instrumented variant (``docs/en/instrument.md``): the kernel's
     ``tilefish.probe`` calls become records, the PTX of its entry gets ``@begin``, ``@calib`` and ``@end``, and the result's ``instrument`` is the
     ``instrument`` of its manifest entry. Its IR digest is of the IR with the probes, and it neither reads nor writes the build cache. The SASS
     assertions of the declaration are not judged on it (they are the production binary's); the TF32 guard and the contraction check are.
@@ -1636,7 +1636,7 @@ def write_manifest_doc(
             raise TilefishManifestError(
                 f"the manifest {str(path)!r} is {have} export, and this export is {new_kind} one: the two variants are never written into one "
                 "manifest (an instrumented binary must never be taken for, or pinned as, the production one). Export the instrumented variant into a "
-                "directory of its own (docs/instrument.md)"
+                "directory of its own (docs/en/instrument.md)"
             )
         new_by_key = dict(zip(keys, doc["kernels"]))
         kept: list[dict[str, Any]] = []

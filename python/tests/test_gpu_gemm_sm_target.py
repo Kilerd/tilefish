@@ -6,7 +6,7 @@
 * In a process whose first cuBLASLt handle was made in a **green context** of 16 SMs (an SM partition made with the driver's green-context
   API), the pins with ``sm_count_target=16`` are the pins of a process whose first handle was made in the primary context, byte for byte; the
   pins without a target are counted (they may differ: the heuristic's answers depend on the context of the process's first handle, measured
-  with cuBLASLt 12.8.4, ``docs/manifest-schema-3.md``, section 9.3), and printed.
+  with cuBLASLt 12.8.4, ``docs/en/manifest-schema-3.md``, section 9.3), and printed.
 """
 
 import json

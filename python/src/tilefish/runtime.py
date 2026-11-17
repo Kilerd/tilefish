@@ -32,7 +32,7 @@ assumed wherever it happens to hold) that make its machine code differ from the 
 C compiler (Triton's JIT launcher does, to build a stub). ``replay`` of a generated kernel needs neither Triton nor
 ``ptxas``, only a manifest directory and the CUDA driver.
 
-A ``@tilefish.graph`` runs through its launch plan (:mod:`tilefish._plan`, :mod:`tilefish._planrun`, ``docs/plan-schema-1.md``): ``jit`` builds the plan's binaries in memory, ``replay`` runs the
+A ``@tilefish.graph`` runs through its launch plan (:mod:`tilefish._plan`, :mod:`tilefish._planrun`, ``docs/en/plan-schema-1.md``): ``jit`` builds the plan's binaries in memory, ``replay`` runs the
 plan of a directory that :func:`export` wrote (``plan=``, with ``pin=`` the plan's digest, which pins the manifest and so every binary), ``reference`` composes the references of its
 ops in torch. Every step's preconditions are checked before the first launch, a run allocates and waits for nothing, and a replay can be captured in a CUDA graph.
 
@@ -689,7 +689,7 @@ def build_for_device(spec: CompileSpec, fn: Any, device_index: int, instrument: 
 
     The cache is keyed by the digest of the IR Triton's frontend builds for ``fn`` now (a few milliseconds per call), so a kernel
     whose process state changed is not served the binary of the old one, and the same Triton knobs that key the disk cache.
-    ``instrument`` builds the instrumented variant (``docs/instrument.md``) when it covers the spec's operator.
+    ``instrument`` builds the instrumented variant (``docs/en/instrument.md``) when it covers the spec's operator.
     """
     torch = _torch()
     cap = _capability(torch, device_index)
@@ -823,7 +823,7 @@ def _load_manifest(manifest: Any, instrumented: bool = False) -> Manifest:
     if isinstance(manifest, Manifest):
         if manifest.instrumented and not instrumented:
             raise TilefishManifestError(
-                f"the manifest in {str(manifest.directory)!r} is an instrumented export (docs/instrument.md): replay it with probes=tilefish.Probes() "
+                f"the manifest in {str(manifest.directory)!r} is an instrumented export (docs/en/instrument.md): replay it with probes=tilefish.Probes() "
                 "to collect its records; run the production export everywhere else"
             )
         return manifest
@@ -1124,7 +1124,7 @@ def export(
     until it is written, and a traced export keeps the stages of its builds in a temporary directory until it writes the trace. None of it changes a
     byte of what is written.
 
-    ``instrument=True`` (or ``tilefish.instrument(capacity=..., ops=...)``) exports the **instrumented variant** (``docs/instrument.md``): every
+    ``instrument=True`` (or ``tilefish.instrument(capacity=..., ops=...)``) exports the **instrumented variant** (``docs/en/instrument.md``): every
     Triton, Gluon and ``@tilefish.kernel`` binary (of the operators ``ops`` names) records its ``tilefish.probe`` calls, ``@begin``, ``@calib`` and ``@end``
     into the probe buffer a host gives it, and its entry has ``instrument``. It has binaries, a manifest digest and plan digests of its own; a host
     refuses it unless asked to load it (``probes=``, ``instrumented=True``), and it is never merged into a directory of the production export.
@@ -1165,7 +1165,7 @@ def _export(
     if any(is_graph):
         if not all(is_graph):
             raise TilefishRuntimeError("export takes graphs, or kernels and externs, not both (a manifest of a plan holds the binaries of its plans); export them separately")
-        if len(items) > 1:  # a plan set: one manifest for every plan (docs/plan-schema-1.md, section 15)
+        if len(items) > 1:  # a plan set: one manifest for every plan (docs/en/plan-schema-1.md, section 15)
             from ._planrun import export_graphs
 
             return export_graphs(items, directory, arch=arch, overwrite=overwrite, buckets=buckets, reuse=reuse, verify=verify, trace=traced, instrument=cfg)
@@ -1280,9 +1280,9 @@ def capture(
     ``externals`` are the graph's arguments in the order of its signature without its ``DevScalar`` parameters, whose values ``devscalars={name: value}``
     gives; ``outputs=`` the tensors the returned values are written into (allocated before the capture by default: ``CapturedPlan.outputs``). ``mode``,
     ``plan``, ``pin`` and ``trust_directory`` choose the plan as for :func:`run`. The ``CapturedPlan`` keeps the externals and the arena alive. See
-    :func:`tilefish._planrun.capture` and ``docs/plan-schema-1.md``, section 10. ``probes=`` (a :class:`tilefish.Probes`) captures the instrumented
+    :func:`tilefish._planrun.capture` and ``docs/en/plan-schema-1.md``, section 10. ``probes=`` (a :class:`tilefish.Probes`) captures the instrumented
     variant, whose steps record into a probe region the graph holds the address of: ``CapturedPlan.collect()`` reads a replay's records
-    (``docs/instrument.md``)."""
+    (``docs/en/instrument.md``)."""
     if not isinstance(op, GraphOp) or isinstance(op, KernelOp):
         raise TilefishRuntimeError(f"tilefish.capture takes a @tilefish.graph, got {op!r}")
     probes = _probes_of(probes)
@@ -1332,7 +1332,7 @@ def run_step(op: GraphOp, step: int, buffers: Any, **options: Any) -> None:
     ``run_step(graph, 3, {"t2": a, "w_o": w, "t3": o}, mode="replay", plan="build/", pin=p.digest, bucket=None)``. ``buffers`` gives a tensor for every
     buffer the step binds (by name; a returned value also as ``out<i>``; not the workspace, which is the plan's arena), each of the buffer's dtype and its
     shape at the bucket, contiguous; the step reads and writes them through the views the plan gives it. ``bucket`` is found from the shapes when one
-    bucket fits them. A single-op replay under the plan's pin: see :func:`tilefish._planrun.run_step` and ``docs/plan-schema-1.md``, section 9."""
+    bucket fits them. A single-op replay under the plan's pin: see :func:`tilefish._planrun.run_step` and ``docs/en/plan-schema-1.md``, section 9."""
     from ._planrun import run_step as _run_step
 
     _run_step(op, step, buffers, **options)
@@ -1345,7 +1345,7 @@ def share_arena(graphs: Any, **options: Any) -> Any:
     each plan's buffers at their own offsets in it, then the carried buffers the plans declare; every execution on it, of any of the plans, is ordered with
     every other (one lock, one order event). What a later plan reads is a returned value of an earlier one, or a carried buffer (``@tilefish.graph(carried=
     ("h",))``), which the arena holds between executions. ``name=`` makes another arena of the same plans (one per stream: executions on two arenas run
-    concurrently). See :func:`tilefish._planrun.share_arena` and ``docs/plan-schema-1.md``, sections 15.1 and 15.2."""
+    concurrently). See :func:`tilefish._planrun.share_arena` and ``docs/en/plan-schema-1.md``, sections 15.1 and 15.2."""
     from ._planrun import share_arena as _share_arena
 
     return _share_arena(graphs, **options)
@@ -1354,7 +1354,7 @@ def share_arena(graphs: Any, **options: Any) -> Any:
 def replay_graph(graph: Any, stream: Any = None) -> None:
     """Replay a ``torch.cuda.CUDAGraph`` in which ``tilefish.run`` of plans was captured, ordered with every execution of those plans on any thread
     (under the lock of the arenas such graphs hold): ``replay_graph(g)`` instead of ``g.replay()`` where another thread may run the same plans. See
-    :func:`tilefish._planrun.replay_graph` and ``docs/plan-schema-1.md``, section 10, item 7."""
+    :func:`tilefish._planrun.replay_graph` and ``docs/en/plan-schema-1.md``, section 10, item 7."""
     from ._planrun import replay_graph as _replay_graph
 
     _replay_graph(graph, stream)
@@ -1378,7 +1378,7 @@ def run(
     returned values into instead of allocating them (a list in order, or a mapping by name). ``taps={"t3": tensor, ("t5", 4): tensor}`` copies buffers of the
     plan into the caller's tensors right after a step (by default the last one that writes the buffer), to observe the intermediates of the very plan a
     product runs: the plan and its digest are unchanged (``Plan.shape_of`` gives a buffer's shape at a bucket). See :mod:`tilefish._plan` and
-    ``docs/plan-schema-1.md``.
+    ``docs/en/plan-schema-1.md``.
 
     ``op`` is a ``@tilefish.kernel`` (or its :class:`~tilefish.lower.LoweredKernel`) or an ``@tilefish.extern`` whose
     Triton function can be imported. ``mode`` is ``"jit"``, ``"replay"`` or ``"reference"``. ``manifest`` is the
@@ -1397,7 +1397,7 @@ def run(
     no tensor of ``B``), which a call cannot run without. ``mode``, ``manifest``, ``pin``, ``trust_directory`` and ``outputs`` are
     the only keywords that are not arguments of ``op`` (an operator with a parameter of one of those names takes it positionally), with
     ``probes=``: a :class:`tilefish.Probes` that collects the records of the instrumented binaries the run launches (``jit`` builds the
-    instrumented variant; ``replay`` takes an instrumented export, which it refuses without it; ``docs/instrument.md``). Raises
+    instrumented variant; ``replay`` takes an instrumented export, which it refuses without it; ``docs/en/instrument.md``). Raises
     :class:`~tilefish.errors.TilefishPreconditionError` when an argument breaks a precondition of the binary,
     :class:`~tilefish.errors.TilefishManifestError` when the manifest is not what was built, not what the operator asks
     for, or not the pinned one, and :class:`~tilefish.errors.TilefishRuntimeError` when the call cannot run (a replay
@@ -1444,7 +1444,7 @@ def run(
             + ("a library op allocates its result" if is_library else "reference mode allocates the results it computes")
         )
     if probes is not None and (is_library or mode == "reference"):
-        raise TilefishRuntimeError("probes= records the probes of a kernel or an extern run in jit or replay (docs/instrument.md); " + ("a library op has none" if is_library else "reference mode runs no binary"))
+        raise TilefishRuntimeError("probes= records the probes of a kernel or an extern run in jit or replay (docs/en/instrument.md); " + ("a library op has none" if is_library else "reference mode runs no binary"))
     if mode == "reference" and not is_library:
         return _run_reference(target, args, kwargs)
     loaded = None
@@ -1452,7 +1452,7 @@ def run(
         loaded = _load_manifest(manifest) if probes is None else _load_manifest(manifest, instrumented=True)
         if probes is not None and not loaded.instrumented:
             raise TilefishManifestError(
-                f"probes= replays an instrumented export (tilefish.runtime.export(..., instrument=True), docs/instrument.md), and the manifest in "
+                f"probes= replays an instrumented export (tilefish.runtime.export(..., instrument=True), docs/en/instrument.md), and the manifest in "
                 f"{str(loaded.directory)!r} is a production one, whose binaries record nothing"
             )
         if pin is not None and loaded.digest != pin:

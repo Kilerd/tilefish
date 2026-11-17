@@ -16,7 +16,7 @@ import pathlib
 
 import pytest
 
-pytestmark = [pytest.mark.gpu, pytest.mark.cuda_math]  # the exhaustive comparisons with CUDA's math library: docs/numerics.md
+pytestmark = [pytest.mark.gpu, pytest.mark.cuda_math]  # the exhaustive comparisons with CUDA's math library: docs/en/numerics.md
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("triton")

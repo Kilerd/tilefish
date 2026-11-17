@@ -1,6 +1,6 @@
 # Launch plans: a graph as a static list of launches over one arena
 
-**English** | [简体中文](../zh-CN/guide/plans.md)
+**English** | [简体中文](../../zh-CN/guide/plans.md)
 
 A model forward is not one kernel. `tilefish.plan(graph, buckets=...)` compiles a `@tilefish.graph` into a **launch plan**: for every combination of the bucket values of its
 dimensions, the ordered launches of manifest entries (a lowered kernel, a hand-written Triton extern, a prebuilt binary or a pinned cuBLASLt GEMM), with every pointer argument bound to a
@@ -26,7 +26,7 @@ cap.set_devscalar("n", 17); cap.replay()                                      # 
 verifies the file and its manifest (a tampered plan, a wrong pin, a plan built against another manifest, and a plan of a graph that changed are all refused), allocates the arena once per device
 and keeps it, and checks **every step's preconditions before the first launch**: a failure launches nothing, not even the write of a device scalar. A run allocates nothing but its outputs
 (`outputs=` gives them) and waits for nothing: the GEMM workspace is in the arena, a device scalar is written by a stream-ordered copy. So **a replay under `torch.cuda.graph` captures and the
-graph replays byte-identically** (`runtime.prepare` does the allocating and the loading that cannot happen inside a capture; `docs/plan-schema-1.md` lists every reason a plan could fail to
+graph replays byte-identically** (`runtime.prepare` does the allocating and the loading that cannot happen inside a capture; `docs/en/plan-schema-1.md` lists every reason a plan could fail to
 capture). Every run of a plan on a device uses the one arena, so **runs of one plan on several streams (or threads) are ordered on the device** by an event of the arena: a run waits on its
 stream for the run before it and records the event after its last launch, so they never overlap and their results are correct, at the cost of running one after the other
 (a run on the stream of the event's last record skips the wait: runs that stay on one stream cost one `cuEventRecord` each).
@@ -44,18 +44,18 @@ eager composition of the same ops give the same bytes for every bucket and two v
 **An `Out` written over its input.** A hand-written kernel `k(x, r, y, r_out)` that reads every element of `r` before it writes the same element of `r_out`
 declares `r_out: Out[Tensor[M, D, f32], MayAlias("r")]`: a launch (Python or Rust) then accepts `r_out` and `r` that are exactly one tensor and refuses any
 other overlap, and a plan writes `r_out` over `r` when nothing reads that `r` after the call (a whole intermediate, no later reader, not returned), with no
-buffer of its own; otherwise the result gets one, so the values are the same either way (manifest schema 3, section 5.4; `docs/plan-schema-1.md`, section 8).
+buffer of its own; otherwise the result gets one, so the values are the same either way (manifest schema 3, section 5.4; `docs/en/plan-schema-1.md`, section 8).
 
 **Copy steps.** `r = tilefish.copy(x)` in a graph is a step of kind `copy`: the dense bytes of `x` (a tensor, or a dense view such as `x[1]`) copied into a
 buffer of its own with `cuMemcpyDtoDAsync`, a memcpy node in a CUDA graph. The copy is an intermediate an in-place call may update, where `x`, the caller's,
 is never written. `state[...] = r` into an `InOut` parameter is a copy step into the caller's tensor. A copy of a view that is not dense is a launch of
 `tilefish.contiguous` instead (a strided view of rank 1 to 4 into a dense tensor), as the
-plan is made, and so is a store of one: `state[...] = t.permute(1, 0)` writes the transpose into the caller's tensor (`docs/plan-schema-1.md`, section 7.5).
+plan is made, and so is a store of one: `state[...] = t.permute(1, 0)` writes the transpose into the caller's tensor (`docs/en/plan-schema-1.md`, section 7.5).
 
 **Memset steps.** `acc = tilefish.zeros_like(x)` (or `zeros_like(x, dtype=i32)`) in a graph is a step of kind `memset`: a buffer of its own whose bytes are
 set to zero with `cuMemsetD8Async` (a memset node in a CUDA graph), which an in-place call may then accumulate into, or which the graph returns (the memset
 writes your output). `state[...] = tilefish.zeros_like(state)` is one memset of your `InOut` tensor. No kernel has to zero a buffer any more
-(`docs/plan-schema-1.md`, section 7.6).
+(`docs/en/plan-schema-1.md`, section 7.6).
 
 **Returned views.** A graph may return a reshape of a result at no cost (`return y.reshape(M, N)` of a flat `y`: the caller's output is `y`'s buffer, in the
 returned shape, and the step that writes it binds it through a flat view), and any other dense view, a parameter or a value twice, which a copy step after
@@ -75,7 +75,7 @@ parameter by its shape, as before (`weight` when it mentions no dimension: every
 **Plan sets.** A stage whose launch count depends on a key is one plan per key; `tilefish.runtime.export([g1, g2, ...], "build/")` exports them as a
 *plan set*: one manifest (each binary once, whichever plans launch it), `<graph>.plan.json` per graph and `plans.json`, an index whose digest pins every
 plan, their manifest and every binary. A replay takes `plan="build/"` and the set's digest or the plan's; Rust `PlanSet::load(dir, pin)` and
-`set.plan("g2")` (the plans share the manifest and its loaded modules). `docs/plan-schema-1.md`, section 15, says why a set and not a repeated step range.
+`set.plan("g2")` (the plans share the manifest and its loaded modules). `docs/en/plan-schema-1.md`, section 15, says why a set and not a repeated step range.
 
 **An arena shared by the plans of a set.** A host that runs plans of a set one at a time (a request's stage A, then B, then C) can give them one
 arena: `s = tilefish.runtime.share_arena([a, b, c], mode="replay", plan="build/", pin=planset.digest)`, then `s.run(a, x)`, `s.capture(b, ...)`,
@@ -84,14 +84,14 @@ instead of 26 476 800), each plan's buffers at their own offsets in it, so the d
 fixed addresses. Every run, capture and replay of any of the plans is ordered with all the others (one lock, one order event), so two of them never
 overlap on the device; nothing in the plans' own regions outlives a run, and a tensor of yours anywhere in the arena is refused. Rust:
 `set.instantiate(&stream, &["a", "b", "c"])`, a `SetRun` of `PlanRun`s on one `SharedArena`. `share_arena(..., name="lane1")` is another arena of the
-same plans, for a lane that runs concurrently. `docs/plan-schema-1.md`, section 15.1.
+same plans, for a lane that runs concurrently. `docs/en/plan-schema-1.md`, section 15.1.
 
 **Carried buffers.** A stage can hand an intermediate to the next with no tensor of yours: `@tilefish.graph(carried=("h",))` on both graphs makes the
 parameter `h` a buffer the arena holds (role `carried`), in a region after the plans' own regions, the same for every plan of the arena that names it.
 `stage_a(x, h: InOut[...])` writes it (`h[...] = encode(x)`: the launch of `encode` writes the arena's `h` directly), `stage_b(h)` reads it, and a run gives
 every parameter but the carried ones: `s.run(stage_a, x)`, then `s.run(stage_b)`, whose sizes are the ones `h` was written with. A run that reads `h` before
 any run on the arena wrote it, or in another shape, is refused before anything is enqueued; the captures of `tilefish.capture` check and note `h` at every
-replay. All three hosts compute the same layout from the documents, which the pins cover (`docs/plan-schema-1.md`, section 15.2).
+replay. All three hosts compute the same layout from the documents, which the pins cover (`docs/en/plan-schema-1.md`, section 15.2).
 
 **Debug taps.** `tilefish.run(graph, ..., taps={"t3": t, ("t5", 4): u})` copies buffers of the plan into your tensors right after a step (by default the
 last one that writes the buffer), before a later step may reuse their bytes: the intermediates of the very plan a product runs, with the plan and its digest
@@ -103,5 +103,5 @@ plan on your tensors, with the binary and the binding of its arguments that the 
 replayed on a reference's inputs, under the pin a product uses.
 
 A plan launches declared operators, views and the arithmetic of the body as fused regions ([`fusion.md`](fusion.md)). An `Out` parameter, a call to another graph, an in-place call on a view
-and a view read after its tensor was updated in place are refused with the rule that says so. `docs/plan-schema-1.md` specifies the file exactly (every field, the validation
+and a view read after its tensor was updated in place are refused with the rule that says so. `docs/en/plan-schema-1.md` specifies the file exactly (every field, the validation
 rules, the digest) for the host that will run it without Python.

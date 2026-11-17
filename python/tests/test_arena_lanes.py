@@ -2,7 +2,7 @@
 
 * ``share_arena(graphs, name=...)`` (``SharedArena(..., name=...)``): every arena of the same plans and the same name on a device is one, another name
   is another arena, with its own memory, lock, order event and carried buffers; so executions that must run concurrently (one per stream) take an
-  arena each (``docs/plan-schema-1.md``, sections 9 and 15.1). A plan alone is a shared arena of one plan.
+  arena each (``docs/en/plan-schema-1.md``, sections 9 and 15.1). A plan alone is a shared arena of one plan.
 * ``tilefish.run`` inside ``torch.cuda.graph`` captures a graph whose replay takes no lock of tilefish (section 10, item 7): an arena that such a graph
   holds and that a second thread uses gets one ``TilefishOrderWarning``; ``tilefish.runtime.replay_graph`` (which takes the locks) silences it.
 

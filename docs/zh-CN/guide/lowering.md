@@ -1,6 +1,6 @@
 # 掩码、索引、gather 和拷贝
 
-[English](../../guide/lowering.md) | **简体中文**
+[English](../../en/guide/lowering.md) | **简体中文**
 
 下沉（lowering）生成的 `@kernel` 还能做比较、选择、计数位置、归约到索引，以及在由设备数据给出的索引处 gather 和 scatter 行；graph（计算图）可以物化一个视图或卷积的 patch。每一种都有精确（exact）的数值语义契约（`tilefish.lower` 的第 7 到 11 条说明），并且都能在 `jit`、`replay` 和 `reference` 中运行，既可以单独运行，也可以在 plan（计划）中运行。
 
@@ -31,7 +31,7 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
 - `x.to(bf16, nan="preserve")` 保留 NaN 的符号和载荷（默认值 `"canonical"` 给出 `0x7FFF`）；`tilefish.sin`、`tilefish.cos` 和 `tilefish.tanh` 是 libdevice 的实现（`sinf`、`cosf`、`tanhf`），和 Triton 链接的所有 libdevice 函数一样以 flush-to-zero 构建：在所有 f32 上，它们与 torch 的 CUDA 位相同，但次正规数的 `sin` 和 `tanh` 除外，它们是与其同号的零（第 10 和 14 条说明）。
 - **IEEE 数学。** `@tilefish.kernel(math="ieee")`，或在单个算子上用 `math="ieee"`（`tilefish.div(a, b, math="ieee")`、`tilefish.exp(x, math="ieee")`），让 f32 数学与不开 fast math、不开 flush to zero 的 CUDA C++ 一致，torch 的 CUDA kernel（核函数）正是这样构建的：`/` 和 `sqrt` 符合 IEEE 754（`div.rn.f32`、`sqrt.rn.f32`；除数为常数时也做除法），`exp` 是 `expf`，`silu` 是 torch 的 `x / (1 + expf(-x))`，`rsqrt` 是 `rsqrtf`，`sin` 和 `tanh` 保留次正规数，每一个都写成 nvcc 生成的那种内联 PTX（Triton 以 flush to zero 链接 libdevice）。在全部 2**32 个 f32 位模式上，这些都是 torch 的 CUDA 位，`/` 就是 torch 的张量除法；再加上 `fp_fusion=False`，由这些算子组成的函数体与 torch 对相同算子的 eager 组合逐字节一致。默认值 `math="fast"` 就是以前的契约（`tilefish.lower` 的第 13 条说明）。
 - **复现 CUDA kernel 的原语。** `tilefish.erf(x, math="ieee")` 是不开 flush to zero 的 CUDA `erff`（默认数学下用的是 libdevice 的，即 `gelu` 所用的）；`tilefish.sin_approx(x)` 是 `__sinf`（`sin.approx.f32`），`tilefish.rcp(x)` 是 `__frcp_rn`（`rcp.rn.f32`），`tilefish.fma(a, b, c)` 是 `fmaf`（一次舍入，无论 `fp_fusion` 怎么设），`-x`（`tilefish.neg`）是 CUDA 的取负：对 `+0.0` 得到 `-0.0`（而 Triton 的 `-x` 是 `0 - x`），对每个 NaN 得到规范 NaN（显式写出，这样即使 ptxas 把取负折叠进 select 也能保留它）。每一个都在所有 f32 上与对应 CUDA C++ 函数的位相同，已在 GPU 上对照 NVRTC 测量（第 15 和 16 条说明）。
-- **CUDA 数学守卫。** `expf`、`erff`、`tanhf` 以及这些算子复刻的其他函数在不同的 CUDA 版本中并不相同（CUDA 13.2 改了 `erff`）。生成的 kernel 的 manifest（清单）条目记录它用到的函数、tilefish 测量每个函数时所用的版本，以及它链接的 libdevice（`cuda_math`）；当 torch 用另一个版本构建，或者 replay（回放）的进程会链接另一个 libdevice 时，运行会发出警告（`TilefishCudaMathWarning`），Rust host（宿主）则用 `Manifest::check_cuda_math` 拒绝这样的版本。`docs/numerics.md` 给出了表格，以及在 CUDA 或 torch 变更时要执行的步骤（`pytest -m cuda_math`）。
+- **CUDA 数学守卫。** `expf`、`erff`、`tanhf` 以及这些算子复刻的其他函数在不同的 CUDA 版本中并不相同（CUDA 13.2 改了 `erff`）。生成的 kernel 的 manifest（清单）条目记录它用到的函数、tilefish 测量每个函数时所用的版本，以及它链接的 libdevice（`cuda_math`）；当 torch 用另一个版本构建，或者 replay（回放）的进程会链接另一个 libdevice 时，运行会发出警告（`TilefishCudaMathWarning`），Rust host（宿主）则用 `Manifest::check_cuda_math` 拒绝这样的版本。`docs/zh-CN/numerics.md` 给出了表格，以及在 CUDA 或 torch 变更时要执行的步骤（`pytest -m cuda_math`）。
 - **有序求和。** `tilefish.sum(x, axis=-1, order=...)` 按 CUDA kernel 的顺序做加法：`order="sequential"` 是一个线程从 `+0.0` 开始的循环，`tilefish.tree(256)` 是 256 个线程按步长遍历各列，再加一棵共享内存对半归约树，`tilefish.tree(128, offsets=(16, 8, 4, 2, 1, 64, 32), vector=8)` 是 128 个线程各处理 8 个连续列，先做一棵 warp（线程束）shuffle 树，再在各 warp 之间归约；对 `tilefish.sum(a * b, ...)`，`fma=True` 让链上的每一步都是 `acc = fma(a, b, acc)`，就像 nvcc 编译 `acc += a * b` 那样。得到的字节就是那些 kernel 的字节，并且在每个 `num_warps` 下都相同（第 17 条说明）：
 
   ```python

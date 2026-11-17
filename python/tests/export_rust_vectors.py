@@ -228,7 +228,7 @@ def manifest_documents():
         return {"stem": stem, "arch": arch, "shared": 16, "shape": ["M", 1024], "dims": {"M": {}}, **extra}
 
     # an entry of schema 3: what a Triton kernel, a strided pointer, a device scalar, a prebuilt binary and a library entry write (the fields are
-    # the ones of docs/manifest-schema-3.md, which the digest takes as they are)
+    # the ones of docs/en/manifest-schema-3.md, which the digest takes as they are)
     def triton(stem, arch="sm_103", **extra):
         return entry(
             stem,
@@ -904,7 +904,7 @@ def library_entries():
 
 
 def matmul_library_entries():
-    """``cublaslt.matmul`` entries (``docs/manifest-schema-3.md``, section 9.5) of every form, as ``tilefish._library.BuiltLibrary.entry`` writes them
+    """``cublaslt.matmul`` entries (``docs/en/manifest-schema-3.md``, section 9.5) of every form, as ``tilefish._library.BuiltLibrary.entry`` writes them
     (each epilogue with ``beta`` 0 and 1, bf16 and f16, the layouts TN, NN, TT and NT, the opt-in of the operands' type, the ``"torch"`` posture, an SM
     count target, with a canary and without, measured-exact and binary-defined), and each changed in one field: every rule of the matmul bullet of
     section 10."""

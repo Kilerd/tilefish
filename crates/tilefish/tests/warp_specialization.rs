@@ -1,4 +1,4 @@
-//! Warp-specialised kernels (`total_num_warps`, `docs/manifest-schema-3.md` section 4.2), read and checked with no GPU, on synthetic manifests
+//! Warp-specialised kernels (`total_num_warps`, `docs/en/manifest-schema-3.md` section 4.2), read and checked with no GPU, on synthetic manifests
 //! (`common::synthetic`): the block of such an entry is its partitions' warps in all, which is what a launch and a plan take; the reader refuses
 //! a total that is not more than the warps of the default partition (`num_warps`), a block that is not the total's, and the field on a prebuilt
 //! binary; and the field is in the manifest digest (`python/tests/test_warp_specialization.py` has the same refusals).

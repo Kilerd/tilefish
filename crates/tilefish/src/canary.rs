@@ -1,5 +1,5 @@
 //! The canary of a pinned library entry: operands made of a seed, and the digest of the result the pin computes from them, both made on the device
-//! by the two kernels of `canary.ptx` (`docs/manifest-schema-3.md`, section 9.4; a cuDNN convolution's canary, `crate::conv`, and a cuBLASLt
+//! by the two kernels of `canary.ptx` (`docs/en/manifest-schema-3.md`, section 9.4; a cuDNN convolution's canary, `crate::conv`, and a cuBLASLt
 //! matmul's, section 9.5, `crate::gemm`).
 //!
 //! The PTX is the same text as Python's `tilefish._canary.CANARY_PTX`, which the driver compiles for the device it is loaded on, once per context

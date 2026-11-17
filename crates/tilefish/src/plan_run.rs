@@ -24,7 +24,7 @@
 //! [`CapturedPlan::set_devscalar`] (its slot is written on the stream right before the next replay, so a launch or another graph of the same
 //! instantiation in between does not change what this graph reads).
 //!
-//! **The order of the runs of one instantiation** (`docs/plan-schema-1.md`, section 9, step 1: two executions that use one arena must not
+//! **The order of the runs of one instantiation** (`docs/en/plan-schema-1.md`, section 9, step 1: two executions that use one arena must not
 //! overlap on the device). The arena has an *order event*, as Python's arena has: every launch and every replay of an instantiation, whatever
 //! its stream and its thread, takes the arena's lock, makes its stream wait for the event's most recent record before it writes anything, and
 //! records the event on its stream after its last launch (also when a launch fails after others were enqueued). The wait is skipped when that
@@ -41,12 +41,12 @@
 //! other streams go on meanwhile. Dropping the last handle of an instantiation waits on the host for the event's most recent record, so nothing
 //! of the plan runs when its arena is freed and its modules unloaded.
 //!
-//! **An arena shared by several plans** ([`SharedArena`], `docs/plan-schema-1.md` section 15.1). Plans that a host runs one at a time (the plans
+//! **An arena shared by several plans** ([`SharedArena`], `docs/en/plan-schema-1.md` section 15.1). Plans that a host runs one at a time (the plans
 //! of a set: [`PlanSet::instantiate`](crate::PlanSet::instantiate)) can be instantiated on one arena of the largest one's bytes
 //! ([`LaunchPlan::instantiate_in`]), each with its buffers at its own offsets from the first byte. Their instantiations hold the one arena, with
 //! its one lock and its one order event, so everything above is said of all of them together: a launch, a replay or a `launch_step` of any
 //! plan of the arena is ordered with those of every other, and they never overlap on the device. Nothing in the plans' own regions outlives a
-//! launch; a **carried buffer** (`docs/plan-schema-1.md` section 15.2) lives in a region of the arena after them ([`CarriedLayout`]), and the arena
+//! launch; a **carried buffer** (`docs/en/plan-schema-1.md` section 15.2) lives in a region of the arena after them ([`CarriedLayout`]), and the arena
 //! notes, in the order of the executions, what each holds: a launch or a replay that reads one it does not hold in the right shape is refused.
 //! Every arena is its own: executions that must run concurrently take an instantiation (or a [`SharedArena`]) each.
 //!
@@ -258,7 +258,7 @@ struct Arena {
 }
 
 /// The order of the executions on an arena: its **order event**, recorded on an execution's stream after the execution, and waited for by the
-/// next execution on its own stream before it writes anything, as Python's `_planrun._Arena` does (`docs/plan-schema-1.md`, section 9, step 1).
+/// next execution on its own stream before it writes anything, as Python's `_planrun._Arena` does (`docs/en/plan-schema-1.md`, section 9, step 1).
 ///
 /// The wait is skipped when the event's most recent record was made on the same stream (`last`): stream order already puts the execution after
 /// the work that record stands for. The record is always made, so a later execution on another stream waits for this one; and since every
@@ -316,7 +316,7 @@ impl Order {
     }
 }
 
-/// Where the carried buffers of the plans of one arena are (`docs/plan-schema-1.md`, section 15.2): after the plans' own regions.
+/// Where the carried buffers of the plans of one arena are (`docs/en/plan-schema-1.md`, section 15.2): after the plans' own regions.
 ///
 /// `base` is the largest `arena_bytes` of the plans (each plan's buffers keep their offsets from the arena's first byte, below it); every carried
 /// name of any of the plans has one region from there, in code point order of the names, each `bytes` rounded up to 256 long, where `bytes` is the
@@ -516,7 +516,7 @@ impl Instance {
     }
 }
 
-/// The probe buffer of an instantiation made with probes (`docs/instrument.md`): allocated with it, on the stream it was instantiated with (outside
+/// The probe buffer of an instantiation made with probes (`docs/en/instrument.md`): allocated with it, on the stream it was instantiated with (outside
 /// any capture, as the arena is), of the bytes of the largest bucket's records; each instrumented step of a bucket has its region of it, at a
 /// 256-byte aligned offset, of a slot per warp of every CTA of the step's CUDA grid at that bucket. The steps address it as they address the arena
 /// (a captured graph holds the addresses of its regions); every execution writes the regions of the steps it runs, so the buffer holds the records
@@ -550,7 +550,7 @@ struct ProbeSlot {
     meta: ProbeMeta,
 }
 
-/// An arena shared by several plans that a host runs **one at a time** (`docs/plan-schema-1.md`, section 15.1): the plans of a set (stage A,
+/// An arena shared by several plans that a host runs **one at a time** (`docs/en/plan-schema-1.md`, section 15.1): the plans of a set (stage A,
 /// then B, then C of a request; a variable number of tile plans), each of which would otherwise have an arena of its own.
 ///
 /// **The layout.** The arena has the bytes of the largest arena of the plans ([`SharedArena::bytes_for`]: the largest `arena_bytes` of their
@@ -726,7 +726,7 @@ impl LaunchPlan {
         PlanRun::new(self, Place::Own(stream), &all, false)
     }
 
-    /// [`LaunchPlan::instantiate`] of the plan of an **instrumented** export ([`LaunchPlan::load_instrumented`], `docs/instrument.md`) that records
+    /// [`LaunchPlan::instantiate`] of the plan of an **instrumented** export ([`LaunchPlan::load_instrumented`], `docs/en/instrument.md`) that records
     /// its probes: a probe buffer is allocated with the arena, on `stream`, and every instrumented step of a launch or a replay records into its region
     /// of it; [`PlanRun::collect_probes`] reads the records of the last one. Refused for the plan of a production export.
     pub fn instantiate_probed(&self, stream: &Arc<CudaStream>, values: &[(&str, u64)]) -> Result<PlanRun> {
@@ -1141,7 +1141,7 @@ impl PlanRun {
         self.inner.probes.is_some()
     }
 
-    /// The records of the last launch or replay of an instantiation made with probes ([`LaunchPlan::instantiate_probed`], `docs/instrument.md`):
+    /// The records of the last launch or replay of an instantiation made with probes ([`LaunchPlan::instantiate_probed`], `docs/en/instrument.md`):
     /// one [`ProbeLaunch`] per instrumented step of its bucket, with the graph, the step and the bucket. Waits on the host for every execution on the
     /// arena (its order event), then reads the probe buffer back on the stream it was allocated on. Collect a run's records before the next run of
     /// the instantiation, which writes over them.

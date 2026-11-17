@@ -1,4 +1,4 @@
-"""Epilogue hooks on externs (``docs/rfcs/0003-epilogue-fusion.md``, milestone E1, :mod:`tilefish._epilogue`) without a GPU: the declaration and
+"""Epilogue hooks on externs (``docs/en/rfcs/0003-epilogue-fusion.md``, milestone E1, :mod:`tilefish._epilogue`) without a GPU: the declaration and
 its refusals; the generated module an extern with hooks is launched through; the planner's merge of a region into a hooked call (one step) and its
 refusals, each with its reason; ``R_acc`` on the IR; ``tilefish.fused`` scopes; names and identity; the hook's code against the region's; the fusion
 report, the boundaries and the advisor's routes.

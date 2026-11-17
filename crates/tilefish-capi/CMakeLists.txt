@@ -8,7 +8,7 @@
 #   find_package(tilefish CONFIG REQUIRED)                       # or add_subdirectory(<repo>/crates/tilefish-capi)
 #   target_link_libraries(app PRIVATE tilefish::tilefish)        # the shared library; tilefish::tilefish_static for the static one
 #
-# The libraries link nothing of CUDA at build time: the driver, cuBLASLt and cuDNN are opened at run time (docs/rfcs/0002-cpp-host.md, section 8).
+# The libraries link nothing of CUDA at build time: the driver, cuBLASLt and cuDNN are opened at run time (docs/en/rfcs/0002-cpp-host.md, section 8).
 cmake_minimum_required(VERSION 3.19)
 project(tilefish_capi VERSION 0.0.2 LANGUAGES C CXX)
 

@@ -1,5 +1,5 @@
 //! The C ABI of the tilefish Rust host: `libtilefish_capi` and `include/tilefish.h` (generated from this crate by cbindgen), with the header-only
-//! C++17 wrapper `include/tilefish.hpp`. See `docs/rfcs/0002-cpp-host.md`.
+//! C++17 wrapper `include/tilefish.hpp`. See `docs/en/rfcs/0002-cpp-host.md`.
 //!
 //! Every entry point is a thin layer over the `tilefish` crate: a manifest, a plan and a plan set are loaded and verified by the crate, a
 //! kernel, a GEMM and a convolution are launched with its `launch_raw`, and a plan is run, captured and replayed by its `PlanRun` and

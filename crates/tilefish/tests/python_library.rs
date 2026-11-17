@@ -7,7 +7,7 @@
 //! opt-in of another type or written out as `false`, an SM count target in and out of its range, a 16-bit result of f32 operands), with what
 //! Python's `validate_entry` decides of each: accepted, with the form it reads (operand type, result type, layout, the opt-ins of bf16 and f16,
 //! the SM count target, the opt-in of f32), or refused. Rust reads each in a manifest of its own and must accept exactly those, with the same form
-//! (`docs/manifest-schema-3.md`, section 9.2). No GPU.
+//! (`docs/en/manifest-schema-3.md`, section 9.2). No GPU.
 //!
 //! The vectors also have `cublaslt.matmul` entries (section 9.5) of every form (each epilogue with `beta` 0 and 1, bf16 and f16, the four layouts, the
 //! opt-ins, the `"torch"` posture, SM count targets, with a canary and without, both contracts), each changed in one field (every rule of the matmul

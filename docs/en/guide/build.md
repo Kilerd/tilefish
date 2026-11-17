@@ -1,6 +1,6 @@
 # How a build works
 
-**English** | [简体中文](../zh-CN/guide/build.md)
+**English** | [简体中文](../../zh-CN/guide/build.md)
 
 A build is the Python API; there is no build command line:
 

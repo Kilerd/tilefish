@@ -1,6 +1,6 @@
 # SASS 溯源：trace、`tilefish-explain` 与 SASS 断言
 
-[English](../explain.md) | **简体中文**
+[English](../en/explain.md) | **简体中文**
 
 每个 kernel（核函数）都要经过 DSL / Triton / Gluon → TTIR → TTGIR → LLVM IR → PTX → `ptxas` → SASS。过去要把一个热点或一处比特差异沿这条链追溯回去，就得手动导出每一层再逐层 diff；而采样式 profiler 会把异步 `wgmma` / `tcgen05` 代码的时间算到等待它的位置上，而不是算到真正干活的地方。tilefish 让每个 kernel 的 SASS 都可解释、可检查：
 
@@ -8,7 +8,7 @@
 2. **`tilefish-explain`** 为一个 kernel、一个 plan（计划）步骤或一个融合区域的 SASS 标注产生每条指令的源码行和 graph（计算图）算子，汇总指令构成，按源码行计数，并对比两个二进制文件（第 2 节）。
 3. **SASS 断言**是声明的一部分，和 TF32 防护、收缩（contraction）检查一样，在每次构建时检查（第 4 节）。
 
-代码在 `tilefish._trace`、`tilefish.explain` 和 `tilefish._sass`。一个 plan 的哪些步骤可以合成一个 kernel、这样能省多少，由 `tilefish-explain --advise` 给出（`docs/advise.md`）；kernel 内部发生了什么、按它声明的阶段边界计时，由 `tilefish-explain --probes` 给出（`docs/instrument.md`）。
+代码在 `tilefish._trace`、`tilefish.explain` 和 `tilefish._sass`。一个 plan 的哪些步骤可以合成一个 kernel、这样能省多少，由 `tilefish-explain --advise` 给出（`docs/zh-CN/advise.md`）；kernel 内部发生了什么、按它声明的阶段边界计时，由 `tilefish-explain --probes` 给出（`docs/zh-CN/instrument.md`）。
 
 ## 1. trace
 
@@ -30,7 +30,7 @@ trace/
     lines.json                       the line table: per instruction its address, source file and line, and PTX line (nvdisasm -gp)
     nodes.json                       a lowered kernel or a fused region: what each line of its generated source was written for
   graphs/<graph>.json                a graph: the steps of each bucket of its plan, the ops of the graph body each fused region took (and its
-                                     template), and why the regions are where they are ("boundaries", docs/advise.md section 4)
+                                     template), and why the regions are where they are ("boundaries", docs/en/advise.md section 4)
   graphs/source/<name>               the files of the graph body those ops were written on
 ```
 

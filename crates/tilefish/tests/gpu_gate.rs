@@ -1672,7 +1672,7 @@ fn matmul_cases(cases: &Value, manifest: &Manifest, arch: &str) -> Vec<Value> {
     })
 }
 
-/// GEMMs with a cuBLASLt epilogue (`impl: "cublaslt.matmul"`, `rust_gate.MATMUL_FORMS`, `docs/manifest-schema-3.md`, section 9.5): every epilogue,
+/// GEMMs with a cuBLASLt epilogue (`impl: "cublaslt.matmul"`, `rust_gate.MATMUL_FORMS`, `docs/en/manifest-schema-3.md`, section 9.5): every epilogue,
 /// `beta` 0 and 1 (`c` the tensor before `out`), bf16 and f16, the four layouts, an opt-in, an SM count target, three buckets of `M`, with
 /// a canary and without. Rust reads each entry and loads it (the epilogue on the descriptor of every check and run; the canary, run before the
 /// pin is used, gives the digest Python's export recorded, and runs again); `byte_identity` holds each case to Python's replay; the largest bucket
@@ -3081,7 +3081,7 @@ fn has_launch_shapes(cases: &Value) -> bool {
     has_tma(cases) && !cases_where(cases, |c| c["stem"] == "product_scale").is_empty()
 }
 
-/// The launch shapes of `docs/manifest-schema-3.md`, sections 4.3 to 4.6, in a fresh export: a grid that multiplies two dimensions, a persistent
+/// The launch shapes of `docs/en/manifest-schema-3.md`, sections 4.3 to 4.6, in a fresh export: a grid that multiplies two dimensions, a persistent
 /// grid, a configuration per bucket (each bucket's warps), clusters of a Triton kernel (its compile option and its launch) and of a prebuilt binary,
 /// a global scratch (its size per CTA and its alignment); each kernel loads, and the gate runs at least two cases of each (compared with Python's
 /// replay by `rust_gate.py compare`).
@@ -3449,7 +3449,7 @@ fn capture_f16_kernels(cases: &Value, stems: &[&str]) {
     }
 }
 
-/// The warp-specialised kernels of the gate (`python/tests/ws_kernels.py`; docs/manifest-schema-3.md section 4.2), which a fresh export on sm_90 or
+/// The warp-specialised kernels of the gate (`python/tests/ws_kernels.py`; docs/en/manifest-schema-3.md section 4.2), which a fresh export on sm_90 or
 /// newer has: each entry keeps the declared `num_warps` (its default partition's) and records the warps of all its partitions (`total_num_warps`),
 /// whose block every launch takes; the Gluon matmuls (tcgen05) are on sm_100 and sm_103 only, and Triton warp-specialises a loop from sm_100 on.
 fn warp_specialised_stems(manifest: &tilefish::Manifest, arch: &str) -> Vec<(&'static str, u32, Option<u32>)> {

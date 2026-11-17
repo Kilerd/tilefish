@@ -4,7 +4,7 @@
 
 一门面向 GPU 推理的类型化张量语言。每个张量的形状、dtype、布局和量化格式都写在它的类型里，算子来自一个类型化的算子库，一个模型只需构建一次，得到 GPU 二进制文件和一份 manifest（清单）。轻量的 Python、C++ 和 Rust host（宿主）由同一套签名生成。
 
-**状态：早期预览（PyPI 上为 0.0.13，crates.io 上为 0.0.11；C++ host 从本仓库构建）。** tilefish 为这些 GPU kernel（核函数）赋予类型：用 Triton、Gluon、CuTe DSL 或 PTX 编写的 kernel，已 pin（固定）的 cuBLASLt 和 cuDNN 调用，以及它自己下沉（lowering）生成的 kernel。它把一个模型的 graph（计算图）构建成基于同一个 arena（内存池）的 launch plan（启动计划），并在 Python、Rust 和 C++ 中运行同一份已 pin 的产物。tilefish 是什么、不是什么，以及今后如何添加功能，见 [`docs/scope.md`](docs/zh-CN/scope.md)；其他文档列在 [`docs/README.md`](docs/zh-CN/README.md) 中。
+**状态：早期预览（PyPI 上为 0.0.13，crates.io 上为 0.0.11；C++ host 从本仓库构建）。** tilefish 为这些 GPU kernel（核函数）赋予类型：用 Triton、Gluon、CuTe DSL 或 PTX 编写的 kernel，已 pin（固定）的 cuBLASLt 和 cuDNN 调用，以及它自己下沉（lowering）生成的 kernel。它把一个模型的 graph（计算图）构建成基于同一个 arena（内存池）的 launch plan（启动计划），并在 Python、Rust 和 C++ 中运行同一份已 pin 的产物。tilefish 是什么、不是什么，以及今后如何添加功能，见 [`docs/zh-CN/scope.md`](docs/zh-CN/scope.md)；其他文档列在 [`docs/zh-CN/README.md`](docs/zh-CN/README.md) 中。
 
 ## 为什么
 
@@ -137,22 +137,22 @@ run.launch(stream, {{"x", xt}, {"out0", yt}}, {{"n", 64}});
 
 | 功能 | 文档 |
 |---|---|
-| tilefish 是什么、不是什么，以及如何添加功能 | [`docs/scope.md`](docs/zh-CN/scope.md) |
-| 构建：各个步骤，`jit`、`reference` 和 `replay`，pin，可复现的导出，什么标识一个二进制文件，构建缓存，TF32 防护，信任 | [`docs/guide/build.md`](docs/zh-CN/guide/build.md) |
-| 带步长的视图、设备标量、预构建的 PTX 和 cubin、Gluon kernel、每个架构一个实现、TMA 描述符、warp（线程束）特化的 kernel、启动形状 | [`docs/guide/operators.md`](docs/zh-CN/guide/operators.md) |
-| 已 pin 的 cuBLASLt GEMM（bf16、f16，以及关闭 TF32 的 f32；四种布局；SM（流式多处理器）分区；epilogue（尾部））和已 pin 的 cuDNN 卷积 | [`docs/guide/operators.md`](docs/zh-CN/guide/operators.md) |
-| 作为 extern（外部 kernel）的 CuTe DSL kernel | [`docs/cute.md`](docs/zh-CN/cute.md) |
-| 下沉生成的 kernel：掩码、索引、`argmax`、gather 与 scatter、整数类型转换、IEEE 数学函数、有序求和、广播、`contiguous`、`im2col`、`col2im1d` | [`docs/guide/lowering.md`](docs/zh-CN/guide/lowering.md) |
-| launch plan：同一个 arena、CUDA graph（CUDA 图）、copy 和 memset 步骤、只绑定一次的权重、plan set（plan 集）、shared arena（共享内存池）、carried buffer（携带缓冲区）、调试 tap（观测点） | [`docs/guide/plans.md`](docs/zh-CN/guide/plans.md) |
-| graph 函数体中算术运算的融合、extern 上的 epilogue hook（钩子）、cuBLASLt epilogue | [`docs/guide/fusion.md`](docs/zh-CN/guide/fusion.md) |
-| 舍入点、精确（exact）重写与改变数值语义的重写、`num_warps` 与 FMA 收缩 | [`docs/guide/rewrites.md`](docs/zh-CN/guide/rewrites.md) |
-| CUDA 数学函数防护，以及 CUDA 或 torch 变更后需要重新检查的内容 | [`docs/numerics.md`](docs/zh-CN/numerics.md) |
-| trace（追踪记录）、`tilefish-explain` 与 SASS 断言 | [`docs/guide/sass.md`](docs/zh-CN/guide/sass.md)、[`docs/explain.md`](docs/zh-CN/explain.md) |
-| 融合 advisor（建议器）与 plan 性能分析器 | [`docs/advise.md`](docs/zh-CN/advise.md) |
-| probe 与插桩变体 | [`docs/instrument.md`](docs/zh-CN/instrument.md) |
-| Rust host 与生成的 Rust 启动器 | [`docs/guide/rust.md`](docs/zh-CN/guide/rust.md)、[`crates/tilefish/README.md`](crates/tilefish/README.zh-CN.md) |
-| C ABI、C++ 封装与生成的 C++ 启动器 | [`docs/guide/cpp.md`](docs/zh-CN/guide/cpp.md)、[RFC 0002](docs/zh-CN/rfcs/0002-cpp-host.md) |
-| host 读取的文件 | [`docs/manifest-schema-3.md`](docs/zh-CN/manifest-schema-3.md)、[`docs/plan-schema-1.md`](docs/zh-CN/plan-schema-1.md) |
+| tilefish 是什么、不是什么，以及如何添加功能 | [`docs/zh-CN/scope.md`](docs/zh-CN/scope.md) |
+| 构建：各个步骤，`jit`、`reference` 和 `replay`，pin，可复现的导出，什么标识一个二进制文件，构建缓存，TF32 防护，信任 | [`docs/zh-CN/guide/build.md`](docs/zh-CN/guide/build.md) |
+| 带步长的视图、设备标量、预构建的 PTX 和 cubin、Gluon kernel、每个架构一个实现、TMA 描述符、warp（线程束）特化的 kernel、启动形状 | [`docs/zh-CN/guide/operators.md`](docs/zh-CN/guide/operators.md) |
+| 已 pin 的 cuBLASLt GEMM（bf16、f16，以及关闭 TF32 的 f32；四种布局；SM（流式多处理器）分区；epilogue（尾部））和已 pin 的 cuDNN 卷积 | [`docs/zh-CN/guide/operators.md`](docs/zh-CN/guide/operators.md) |
+| 作为 extern（外部 kernel）的 CuTe DSL kernel | [`docs/zh-CN/cute.md`](docs/zh-CN/cute.md) |
+| 下沉生成的 kernel：掩码、索引、`argmax`、gather 与 scatter、整数类型转换、IEEE 数学函数、有序求和、广播、`contiguous`、`im2col`、`col2im1d` | [`docs/zh-CN/guide/lowering.md`](docs/zh-CN/guide/lowering.md) |
+| launch plan：同一个 arena、CUDA graph（CUDA 图）、copy 和 memset 步骤、只绑定一次的权重、plan set（plan 集）、shared arena（共享内存池）、carried buffer（携带缓冲区）、调试 tap（观测点） | [`docs/zh-CN/guide/plans.md`](docs/zh-CN/guide/plans.md) |
+| graph 函数体中算术运算的融合、extern 上的 epilogue hook（钩子）、cuBLASLt epilogue | [`docs/zh-CN/guide/fusion.md`](docs/zh-CN/guide/fusion.md) |
+| 舍入点、精确（exact）重写与改变数值语义的重写、`num_warps` 与 FMA 收缩 | [`docs/zh-CN/guide/rewrites.md`](docs/zh-CN/guide/rewrites.md) |
+| CUDA 数学函数防护，以及 CUDA 或 torch 变更后需要重新检查的内容 | [`docs/zh-CN/numerics.md`](docs/zh-CN/numerics.md) |
+| trace（追踪记录）、`tilefish-explain` 与 SASS 断言 | [`docs/zh-CN/guide/sass.md`](docs/zh-CN/guide/sass.md)、[`docs/zh-CN/explain.md`](docs/zh-CN/explain.md) |
+| 融合 advisor（建议器）与 plan 性能分析器 | [`docs/zh-CN/advise.md`](docs/zh-CN/advise.md) |
+| probe 与插桩变体 | [`docs/zh-CN/instrument.md`](docs/zh-CN/instrument.md) |
+| Rust host 与生成的 Rust 启动器 | [`docs/zh-CN/guide/rust.md`](docs/zh-CN/guide/rust.md)、[`crates/tilefish/README.md`](crates/tilefish/README.zh-CN.md) |
+| C ABI、C++ 封装与生成的 C++ 启动器 | [`docs/zh-CN/guide/cpp.md`](docs/zh-CN/guide/cpp.md)、[RFC 0002](docs/zh-CN/rfcs/0002-cpp-host.md) |
+| host 读取的文件 | [`docs/zh-CN/manifest-schema-3.md`](docs/zh-CN/manifest-schema-3.md)、[`docs/zh-CN/plan-schema-1.md`](docs/zh-CN/plan-schema-1.md) |
 
 ## tilefish 不是什么
 
@@ -170,7 +170,7 @@ run.launch(stream, {{"x", xt}, {"out0", yt}}, {{"n", 64}});
 | `tilefish`（Rust host） | 0.0.11 | crates.io |
 | `tilefish-capi`（C ABI 1.1，`tilefish.h` 和 `tilefish.hpp`） | 0.0.2 | 本仓库 |
 
-manifest 采用 schema（模式）3，plan 采用 `tilefish.plan.v1`。没有一份待开发功能的清单。只有当真实的模型迁移需要某个功能时，才会添加它（`docs/scope.md`）；未完成的事项记录在 issue [#4](https://github.com/Kilerd/tilefish/issues/4) 中，[#5](https://github.com/Kilerd/tilefish/issues/5)（SASS 溯源、probe、CuTe DSL extern）已关闭。每个版本改了什么见 [`CHANGELOG.md`](CHANGELOG.md)，所有文档都列在 [`docs/README.md`](docs/zh-CN/README.md) 中。
+manifest 采用 schema（模式）3，plan 采用 `tilefish.plan.v1`。没有一份待开发功能的清单。只有当真实的模型迁移需要某个功能时，才会添加它（`docs/zh-CN/scope.md`）；未完成的事项记录在 issue [#4](https://github.com/Kilerd/tilefish/issues/4) 中，[#5](https://github.com/Kilerd/tilefish/issues/5)（SASS 溯源、probe、CuTe DSL extern）已关闭。每个版本改了什么见 [`CHANGELOG.md`](CHANGELOG.md)，所有文档都列在 [`docs/zh-CN/README.md`](docs/zh-CN/README.md) 中。
 
 ## 许可证
 

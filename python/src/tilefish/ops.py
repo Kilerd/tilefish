@@ -1261,7 +1261,7 @@ def copy(x: Any) -> Value:
 
 
 def barrier(x: Any) -> Value:
-    """``tilefish.barrier(x)``: ``x`` itself, made a boundary of the fused regions of a graph body (``docs/rfcs/0001-plan-fusion.md``): the
+    """``tilefish.barrier(x)``: ``x`` itself, made a boundary of the fused regions of a graph body (``docs/en/rfcs/0001-plan-fusion.md``): the
     value gets a buffer of the launch plan (which a tap can read, ``tilefish.run(..., taps=...)``) instead of living in a register of a fused
     kernel. It never changes a byte: a fused plan is the unfused composition's bytes wherever its regions fall. A graph body only (a kernel body
     is one kernel); a mask has no storage, so it has no barrier (store it with ``.to(u8)``)."""

@@ -4,7 +4,7 @@
 * **a reshape of all of it** (offset 0, the row-major strides, as many elements) costs nothing either: the buffer is the caller's output in the returned
   shape, and the steps that write and read it bind it through a view of their own shape;
 * **any other dense view** (a ``select`` of the first axis, a chunk of a ``split`` along it), **a parameter** and **a value returned twice** are a copy
-  step (``docs/plan-schema-1.md``, section 7.5) at the end of the steps, into a buffer of the caller's;
+  step (``docs/en/plan-schema-1.md``, section 7.5) at the end of the steps, into a buffer of the caller's;
 * a view that is not dense is refused (a copy step copies one run of bytes), and so are a device scalar and a view of a tensor updated in place after it.
 
 Nothing here needs a GPU (``test_gpu_plan_returns.py``).

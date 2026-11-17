@@ -42,7 +42,7 @@
 //!
 //! # What a manifest can describe
 //!
-//! Manifest schema 3 (`docs/manifest-schema-3.md`) is read in full, and everything it describes is launched:
+//! Manifest schema 3 (`docs/en/manifest-schema-3.md`) is read in full, and everything it describes is launched:
 //!
 //! * a **Triton kernel**, or a **prebuilt binary** (`kind: "binary"`: PTX that `ptxas` assembled, or a cubin used as it is, for its own
 //!   architecture), which is launched with exactly its parameters and no scratch slots ([`EntryKind`], [`BinarySource`]);
@@ -176,7 +176,7 @@
 //!
 //! # Launch plans
 //!
-//! A *launch plan* (`plan.json`, `docs/plan-schema-1.md`) is a `@tilefish.graph` compiled by Python into, for every bucket of its dimensions,
+//! A *launch plan* (`plan.json`, `docs/en/plan-schema-1.md`) is a `@tilefish.graph` compiled by Python into, for every bucket of its dimensions,
 //! the ordered launches of manifest entries over the caller's tensors (the *externals*) and one *arena* (the intermediates, the device scalars,
 //! the cuBLASLt workspace). [`LaunchPlan::load`] reads and verifies it (a pin, the digests, every rule of the format, the manifest it was built
 //! against, every step against its entry); [`LaunchPlan::instantiate`] loads its kernels and GEMMs and allocates the arena, once;
@@ -225,7 +225,7 @@
 //!
 //! # Instrumented exports
 //!
-//! An **instrumented export** (Python's `tilefish.runtime.export(..., instrument=True)`, `docs/instrument.md`) is a diagnostic variant whose Triton
+//! An **instrumented export** (Python's `tilefish.runtime.export(..., instrument=True)`, `docs/en/instrument.md`) is a diagnostic variant whose Triton
 //! binaries record the kernel's `tilefish.probe("name")` phase boundaries (`%globaltimer`, `%clock`, the SM, the CTA and the warp) into a probe buffer
 //! each launch is given in its profile scratch parameter. Its entries have [`Entry::instrument`], and it has binaries and a digest of its own:
 //! [`Manifest::load`], [`Manifest::from_embedded`], [`LaunchPlan::load`] and [`PlanSet::load`] refuse it, and [`Manifest::load_instrumented`],

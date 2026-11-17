@@ -1,6 +1,6 @@
 # tilefish 是什么，不是什么
 
-[English](../scope.md) | **简体中文**
+[English](../en/scope.md) | **简体中文**
 
 tilefish 是一门面向 GPU 推理的类型化 DSL。你用类型（形状、dtype、布局、量化格式）描述张量和算子，把一个模型一次构建成 GPU 二进制文件和一份 manifest（清单），再在 Python、Rust 或 C/C++ 中运行同一份产物。
 

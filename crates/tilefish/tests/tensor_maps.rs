@@ -1,4 +1,4 @@
-//! TMA descriptors (manifest kind `tensordesc`, `docs/manifest-schema-3.md` section 5.5), read and checked with no GPU, on synthetic manifests
+//! TMA descriptors (manifest kind `tensordesc`, `docs/en/manifest-schema-3.md` section 5.5), read and checked with no GPU, on synthetic manifests
 //! (`common::synthetic`): the reader takes a descriptor as a pointer with its `tensor_map` and `1 + 2 * rank` slots of `kernelParams`, refuses one
 //! that is not what it says, and a launch binds the descriptor's tensor as a pointer's, refuses with a kind what the driver could not encode, and
 //! computes the arguments of `cuTensorMapEncodeTiled` as Python does (`python/tests/test_tensordesc.py` has the same numbers).

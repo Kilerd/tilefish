@@ -1,11 +1,11 @@
 # Fusion: arithmetic in a graph body
 
-**English** | [简体中文](../zh-CN/guide/fusion.md)
+**English** | [简体中文](../../zh-CN/guide/fusion.md)
 
 A graph body may compute. The arithmetic between two calls (`silu(g.to(f32)) * u.to(f32)` between two GEMMs, a bias and an activation, a residual add, a mask
 from a device scalar, a dequantisation) is traced like a kernel body, with its rules (no implicit promotion, a scalar rounded to the tensor's dtype, f32 math
 functions), and the planner groups it into **regions**: each a `@tilefish.kernel` of its own that tilefish generates (named `fused_<hash>` by its content, lowered
-by the same templates), and one ordinary kernel step of the plan. Neither schema nor any of the three hosts changes (`docs/rfcs/0001-plan-fusion.md`).
+by the same templates), and one ordinary kernel step of the plan. Neither schema nor any of the three hosts changes (`docs/en/rfcs/0001-plan-fusion.md`).
 
 ```python
 @tilefish.graph(inputs=("x",))
@@ -40,7 +40,7 @@ quantisation (an absolute maximum, a scale per row returned too, a saturating ca
 each one kernel too. Row regions are lowered by revision 2 of the lowering (note 21 of `tilefish.lower`): an ordered sum takes its lanes' chains by halving
 splits instead of a gather per step (the same adds in the same order, checked against CUDA kernels of each order at every length), a row of ordered sums has the
 warps that suit it, and an fp8 cast is inline PTX. On a B300 slice the fused add + rmsnorm of 4096 rows of 1024 columns takes 16 us, its three kernels with a Triton
-tree sum 65 us and its ten unfused kernels 103 us (the speed table is in `docs/rfcs/0001-plan-fusion.md`, phase 2).
+tree sum 65 us and its ten unfused kernels 103 us (the speed table is in `docs/en/rfcs/0001-plan-fusion.md`, phase 2).
 
 **Checked at every export.** `export` runs every region of more than one op against its ops one by one, `jit` on the device, at every bucket, on seeded inputs that
 reach every corner (NaNs with payloads, infinities, subnormals, signed zeros), and refuses the export at a difference (`verify=False` opts out; on a device of
@@ -65,8 +65,8 @@ on the row patterns above at every bucket (every bf16 pattern, rows of special v
 Each rewrite is made on the IR before the regions are formed, so its rounding points never depend on where the regions fall. `tilefish.barrier(x)` makes `x` a
 boundary of the regions (it gets a buffer of the plan, which `taps=` reads); it never changes a byte. Not yet planned: a scatter in a graph body, a reduction without
 `order=` joined to a region, a store into an `InOut` or carried tensor made by a region (it is a copy step), a dense reshape inside a region, a strided store,
-`tilefish.fused(name=...)` scopes, `intermediates="f32"`, and modes that are not exact (`docs/rfcs/0001-plan-fusion.md`, section 11).
-Fusion into a GEMM or a convolution, epilogues and prologues, is designed in RFC 0003 (`docs/rfcs/0003-epilogue-fusion.md`: the three numerics
+`tilefish.fused(name=...)` scopes, `intermediates="f32"`, and modes that are not exact (`docs/en/rfcs/0001-plan-fusion.md`, section 11).
+Fusion into a GEMM or a convolution, epilogues and prologues, is designed in RFC 0003 (`docs/en/rfcs/0003-epilogue-fusion.md`: the three numerics
 contracts it keeps apart, the routes, and the experiments behind them); its first milestones, epilogue hooks on externs (E1) and cuBLASLt epilogues
 (E2), are below. Nothing changes bytes without a declaration: `epilogues="exact"` is the default.
 
@@ -108,7 +108,7 @@ def up(x: Tensor[T, H, bf16], w: Tensor[F, H, bf16], bias: Tensor[F, bf16]):
 * **Speed is the kernel's**: the hook's arithmetic runs on the extern's warps after its main loop. On a B300 slice, with the example GEMM, a bias +
   GELU after a 2048 x 4096 x 1024 GEMM is 1.21 times faster fused than the GEMM followed by its region, a gated activation 1.14 times; an epilogue
   heavy for the kernel's warps can be slower (a `sin` per element after a convolution: 0.77 times; the table is in RFC 0003). `tilefish.barrier(y)`
-  keeps the region after the call. `python/examples/persistent_gemm.py` is an example kernel (not a supported feature, `docs/scope.md`) that shows
+  keeps the region after the call. `python/examples/persistent_gemm.py` is an example kernel (not a supported feature, `docs/en/scope.md`) that shows
   the hooks in a persistent, warp-specialised GEMM: Gluon on sm_100/103 (a TMA producer, a `tcgen05` issuer, its epilogue on partitions of its own
   that overlap the next tile's main loop), Triton on sm_120; what it measured is RFC 0003's experiment X8.
 * **Nothing new for a host or a schema**: an extern with hooks is launched through a small generated module that calls its kernel with the identity

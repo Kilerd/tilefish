@@ -1,4 +1,4 @@
-// The kernels of a cuDNN convolution's canary (docs/manifest-schema-3.md, section 9.4): the operands, made on the device, and the digest of y.
+// The kernels of a cuDNN convolution's canary (docs/en/manifest-schema-3.md, section 9.4): the operands, made on the device, and the digest of y.
 // The same text is in the Python package (tilefish/_canary.py, CANARY_PTX) and in the crate (src/canary.ptx, include_str!): a test holds them
 // equal. The driver compiles it for the device it is loaded on (PTX for sm_70 and later), so neither host needs a compiler.
 //

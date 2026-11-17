@@ -3,7 +3,7 @@
 The declaration's ``sm_count_target`` is the SM count cuBLASLt's heuristic chooses for (``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET``), and every check and
 run of the pin sets it too. It reaches the canonical declaration (the digest) and the entry, as an optional field present only when it is set; the
 reader holds it to an int from 8 to the entry's ``sm_count``. The entry's ``sm_count`` stays the device's count, which a replay compares with the
-device (a green context reports the device's count: measured, ``docs/manifest-schema-3.md``, section 9.3). What it does on a GPU, in a green context
+device (a green context reports the device's count: measured, ``docs/en/manifest-schema-3.md``, section 9.3). What it does on a GPU, in a green context
 too, is ``test_gpu_gemm_sm_target.py``.
 """
 

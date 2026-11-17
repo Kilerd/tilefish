@@ -360,7 +360,7 @@ class LoadedKernel:
         descriptor, ``("tensordesc", TensorMapArg)`` (its encoded CUtensorMap, then its shape and strides, each in a slot of its own) in the
         manifest's order; the two scratch slots are appended here: ``scratch`` (the address of :meth:`scratch_bytes` bytes of device memory, 256-byte
         aligned, which a kernel with a global scratch must be given and any other must not) and the profile scratch: null, or for an instrumented
-        binary ``probes``, the address of its probe buffer (16-byte aligned; ``docs/instrument.md``), which no other binary is given.
+        binary ``probes``, the address of its probe buffer (16-byte aligned; ``docs/en/instrument.md``), which no other binary is given.
 
         ``grid`` is the entry's grid of programs: a persistent kernel's is cut to the programs the SMs it was loaded for run, and a kernel of clusters
         is launched with ``cuLaunchKernelEx``, ``grid * cluster`` blocks in clusters of its ``cluster_dims``.

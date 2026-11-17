@@ -15,10 +15,10 @@ how Python imports modules. The identity of a binary is the Triton IR its kernel
 M3.2 (P1): strided views (``reshape``, ``permute``, ``select``, ``split`` give views; an ``extern`` parameter ``Strided[...]`` takes one, with its
 strides as ``StrideOf`` scalars), device scalars (``DevScalar[dtype]``, read with :func:`load`), prebuilt PTX and cubin externs
 (``extern(ptx=...)``, ``extern(cubin=...)``), a cuBLASLt GEMM as a ``library`` op with a pinned algorithm, and manifest schema 3
-(``docs/manifest-schema-3.md``).
+(``docs/en/manifest-schema-3.md``).
 
 M3.2 (P2): :func:`plan` compiles a graph into a static launch plan with an arena memory plan per shape bucket (:mod:`tilefish._plan`), :func:`tilefish.runtime.export` writes it as
-``plan.json`` next to the manifest (``docs/plan-schema-1.md``), and :func:`run` of a graph executes it in ``jit``, ``replay`` and ``reference`` modes, capturable in a CUDA graph.
+``plan.json`` next to the manifest (``docs/en/plan-schema-1.md``), and :func:`run` of a graph executes it in ``jit``, ``replay`` and ``reference`` modes, capturable in a CUDA graph.
 
 M3.3: a lowered kernel compares (a mask, :data:`bool_`), selects (:func:`where`), counts positions (:func:`iota`, integer ``//`` and ``%``),
 reduces to an index (:func:`argmax`, :func:`argmin`), gathers and scatters rows (:func:`gather_rows`, :func:`scatter_rows`), takes
@@ -39,7 +39,7 @@ or flush to zero (:func:`div`, note 13); and :func:`tanh` is libdevice's ``tanhf
 M3.5: the primitives a CUDA kernel is reproduced with: :func:`erf` (CUDA's ``erff`` in IEEE math), :func:`sin_approx`, :func:`rcp`, :func:`fma`
 and :func:`neg` (``-x``), and sums in a fixed order (``tilefish.sum(x, -1, order="sequential" | tree(...), fma=...)``, :func:`tree`); notes 15 to 17.
 
-M3.8: intra-kernel instrumentation (``docs/instrument.md``): :func:`probe` marks a phase boundary in a ``@tilefish.kernel``, a ``@triton.jit`` or a
+M3.8: intra-kernel instrumentation (``docs/en/instrument.md``): :func:`probe` marks a phase boundary in a ``@tilefish.kernel``, a ``@triton.jit`` or a
 ``@gluon.jit`` kernel; an instrumented build (``export(..., instrument=True)``, :func:`instrument`) records ``%globaltimer``, ``%clock``, the SM, the CTA
 and the warp there into a probe buffer, as a variant with binaries and digests of its own that a host refuses unless asked; :class:`Probes` collects
 the records of a run (``tilefish.run(..., probes=...)``) and :class:`ProbeTrace` explains them (``tilefish-explain DIR --probes FILE``).
@@ -108,7 +108,7 @@ __version__ = "0.0.13"
 
 def fusion_report(graph: GraphOp) -> dict:
     """The fusion report of a ``@tilefish.graph`` (what ``export`` writes as ``<graph>.fusion.json``): every fused region, the ops of the body it
-    took, what it reads and writes, every rounding it keeps and the rewrites of the graph's ``tilefish.fusion`` mode (``docs/rfcs/0001-plan-fusion.md``)."""
+    took, what it reads and writes, every rounding it keeps and the rewrites of the graph's ``tilefish.fusion`` mode (``docs/en/rfcs/0001-plan-fusion.md``)."""
     from ._fusion import report
 
     return report(graph)
@@ -126,7 +126,7 @@ def verify_fusion(graph: GraphOp, buckets: "dict | None" = None) -> dict:
 
 
 def advise(directory: "str | object", graph: "str | None" = None, **kwargs: object) -> object:
-    """The fusion advice for the plan of ``graph`` in an export directory (``tilefish-explain DIR --graph G --advise``; ``docs/advise.md``): every
+    """The fusion advice for the plan of ``graph`` in an export directory (``tilefish-explain DIR --graph G --advise``; ``docs/en/advise.md``): every
     candidate (steps joined by intermediates one kernel would not store), ranked by the time it would save, with why it is not one kernel today and what
     to do; the time by class; the graph-body arithmetic that was not fused. Keywords: ``bucket=``, ``timing=`` (what :func:`profile_plan` wrote),
     ``machine=``, ``bandwidth=``, ``keep=``, ``gop=``. Returns an ``Advice`` (``.text()``, ``.doc``). No GPU."""
@@ -136,7 +136,7 @@ def advise(directory: "str | object", graph: "str | None" = None, **kwargs: obje
 
 
 def profile_plan(graph: GraphOp, plan: object = None, **kwargs: object) -> dict:
-    """The device time of every step of the plan of ``graph`` at one bucket (``tilefish-explain DIR --graph G --profile OUT``; ``docs/advise.md``), as a
+    """The device time of every step of the plan of ``graph`` at one bucket (``tilefish-explain DIR --graph G --profile OUT``; ``docs/en/advise.md``), as a
     ``tilefish.step-timing.v1`` document that :func:`advise` reads. A runtime path of its own: it changes no artefact, and puts back what its runs change
     that outlives them (the caller's ``InOut`` tensors, the carried buffers). Keywords:
     ``bucket=``, ``reps=``, ``warmup=``, ``method=`` (``"graph"`` or ``"events"``), ``mode=``, ``pin=``, ``trust_directory=``, ``externals=``,

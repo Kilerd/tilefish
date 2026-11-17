@@ -1,4 +1,4 @@
-"""Why a manifest ``shared`` that is nonzero but too small cannot be detected without ``pin`` (``docs/manifest-schema-3.md``, section 4): the cubin does
+"""Why a manifest ``shared`` that is nonzero but too small cannot be detected without ``pin`` (``docs/en/manifest-schema-3.md``, section 4): the cubin does
 not say how much dynamic shared memory its code addresses.
 
 Triton gives a kernel that needs shared memory an ``extern`` array of dynamic shared memory and records its size in its metadata (``shared``), which a

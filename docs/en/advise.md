@@ -1,12 +1,12 @@
 # The fusion advisor: which steps of a plan could be one kernel
 
-**English** | [简体中文](zh-CN/advise.md)
+**English** | [简体中文](../zh-CN/advise.md)
 
 `tilefish-explain` explains one kernel; it does not say which parts of a model would go faster as fewer kernels. The advisor does that for a whole
 plan: it ranks the **fusion candidates** of a graph's plan (steps joined by intermediates that one kernel would never store) by the time they would
 save, says why each is not one kernel today and what to do about it, and sums the time of the plan by class of step. A profiler measures the device
 time of every step, so that the ranking can be by measured time. It also says which fusion patterns would help most, which is what phase 2 of plan
-fusion (`docs/rfcs/0001-plan-fusion.md`) should do first.
+fusion (`docs/en/rfcs/0001-plan-fusion.md`) should do first.
 
 The code is `tilefish._advise` (the analysis) and `tilefish._profile` (the profiler).
 
@@ -42,7 +42,7 @@ Everything from the export directory, with no GPU and no CUDA tool:
   (`source_sha256`) and with which template (a lowered kernel of the row template has a `BLOCK_D` constant), and its options (`enable_fp_fusion`);
 * **the fusion report** (`<graph>.fusion.json`): the regions of the graph body, the ops each took, its template, how it reads its inputs (a view
   `materialised` by `tilefish.contiguous`), its reductions and their order;
-* **the trace** when the export has one (`trace/graphs/<graph>.json`, `docs/explain.md`): the ops and source lines of each region and, new, the
+* **the trace** when the export has one (`trace/graphs/<graph>.json`, `docs/en/explain.md`): the ops and source lines of each region and, new, the
   **boundaries** of the regions with their reasons (section 4), and each kernel's SASS, from which the advisor tells whether a hand-written kernel
   computes MMAs. A trace of another plan is ignored. Without a trace, `tilefish.advise(..., gop=graph)` computes the boundaries from the graph.
 
@@ -183,7 +183,7 @@ whose steps move the most bytes.
   them when a library op takes them in. The saving is at most the candidate's time less one floor. Candidates overlap (an elementwise step between
   two GEMMs is an epilogue of one and a prologue of the other), so their savings do not add up.
 
-**The routes of an epilogue** (`docs/rfcs/0003-epilogue-fusion.md`, section 5). A candidate whose producer is a GEMM or a convolution has `routes`:
+**The routes of an epilogue** (`docs/en/rfcs/0003-epilogue-fusion.md`, section 5). A candidate whose producer is a GEMM or a convolution has `routes`:
 each a way the consumer's arithmetic could go into the producer, with the contract it gives, its status and the saving (the candidate's, at the ranked
 bucket). For a pinned cuBLASLt GEMM: E2 (a library epilogue, contract (iii): available where the fusion report matched the region as one of
 cuBLASLt's epilogues, else why not), E3 (a generated GEMM with hooks, contract (i) where it is measured equal
@@ -273,7 +273,7 @@ after the plan that writes it, which the profiler does not set up).
   `plan_model.deep_block(4)`, 110.4 us against 104.6 us. A step's net is within 1.1 us of nsys's kernel and gap but for one step (1.9 us). The
   events method's nets sum to 30.7 and 114.7 us.
 * **What it cannot see**: work inside a step (a library step of several kernels is one step), and the overlap of a step with the next one, which
-  `net` shares evenly instead of measuring. For a time inside a kernel: probes and the instrumented variant, `docs/instrument.md`.
+  `net` shares evenly instead of measuring. For a time inside a kernel: probes and the instrumented variant, `docs/en/instrument.md`.
 
 ## 7. How it is tested
 

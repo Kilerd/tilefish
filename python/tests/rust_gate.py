@@ -94,7 +94,7 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
   parameters) and ``memset_steps`` (memset steps of an output and of an ``InOut`` tensor) are cases like the others; the plans of
   ``gpu_kernels_plans.CARRIED_SET`` are a plan set whose plans hand **carried buffers** to each other on one shared arena (:func:`prepare_carried`),
   called in the order of :data:`CARRIED_CALLS` on one ``SharedArena`` by ``gpu_plan_gate.rs`` (launched, and captured and replayed). The plans
-  ``fused_*`` are the graphs of ``fusion_graphs.CASES``, whose bodies compute: their arithmetic is fused regions (``docs/rfcs/0001-plan-fusion.md``),
+  ``fused_*`` are the graphs of ``fusion_graphs.CASES``, whose bodies compute: their arithmetic is fused regions (``docs/en/rfcs/0001-plan-fusion.md``),
   kernel steps of generated kernels that the Rust host launches like any other (each export verifies its regions against their ops one by one).
 
 * **CuTe DSL kernels** (``cute_kernels.py``, exported only, with the CuTe DSL and ``TILEFISH_CUTLASS_EXAMPLES``: :func:`cute_ops`): the elementwise kernel of
@@ -104,7 +104,7 @@ requires the files the Rust test wrote to be equal, byte for byte, to those. The
 
 * **instrumented binaries** (:func:`prepare_instrumented`, ``WORK/instrumented.json``; on sm_90 or newer): the probed kernels of ``rust_gate_probed.py`` (a
   warp-specialised Gluon kernel with a probe around each wait of each partition, and a ``@tilefish.kernel`` with probes) exported as an instrumented
-  variant (``export(..., instrument=True)``, ``docs/instrument.md``), and the graph ``probed_chain`` as an instrumented plan. Python replays each with
+  variant (``export(..., instrument=True)``, ``docs/en/instrument.md``), and the graph ``probed_chain`` as an instrumented plan. Python replays each with
   ``probes=tilefish.Probes()`` (its outputs checked to be the production build's bytes) and saves its records; ``crates/tilefish/tests/gpu_instrument_gate.rs``
   launches the kernels with a probe buffer (``Kernel::launch_probed``), and without one (the same bytes, nothing recorded), and runs the plan with probes
   (``LaunchPlan::instantiate_probed``: launched, and captured and replayed), and ``compare`` holds its outputs to the production bytes and its records
@@ -648,7 +648,7 @@ def launch_ops():
 
 def cute_ops():
     """``{name: extern}``: the CuTe DSL kernels of ``cute_kernels.py`` this device runs, when the CuTe DSL is installed and ``TILEFISH_CUTLASS_EXAMPLES``
-    names the CUTLASS examples (``docs/cute.md``); ``{}`` otherwise. Not in the committed fixtures."""
+    names the CUTLASS examples (``docs/en/cute.md``); ``{}`` otherwise. Not in the committed fixtures."""
     import importlib.util
     import os
 
@@ -1569,7 +1569,7 @@ def plan_graphs():
         return make
 
     fused = [(f"fused_{name}", fg.CASES[name][0], False, fused_cases(fg.CASES[name][0])) for name in sorted(fg.CASES)]
-    # docs/rfcs/0003-epilogue-fusion.md, E1: the patterns fused into the example externs' epilogue hooks (each one kernel step of a generated entry:
+    # docs/en/rfcs/0003-epilogue-fusion.md, E1: the patterns fused into the example externs' epilogue hooks (each one kernel step of a generated entry:
     # nothing new for a host), exact and on the accumulator; the Gluon GEMM's on sm_100 and sm_103
     import epilogue_graphs as epg
 
@@ -2008,7 +2008,7 @@ def compare(work, host="rust"):
     return 0 if not failed and not plan_failed and not inst_failed else 1
 
 
-# -- instrumented binaries (docs/instrument.md) -------------------------------------------------------------------------------------------------
+# -- instrumented binaries (docs/en/instrument.md) -------------------------------------------------------------------------------------------------
 
 
 def prepare_instrumented(work):

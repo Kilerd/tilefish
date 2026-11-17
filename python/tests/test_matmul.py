@@ -3,7 +3,7 @@ with no GPU.
 
 ``@tilefish.library("up", acc=f32, impl="cublaslt.matmul", epilogue="relu_bias", beta=1)`` over ``(a, b, bias, c) -> out`` is
 ``out = relu((acc + c) + bias)`` on the f32 accumulator, rounded once: the library's bytes under the pin, each pin verified at the build against that
-formula and recorded ``measured-exact`` or ``binary-defined`` (``docs/manifest-schema-3.md``, section 9.5). ``tilefish.fusion(epilogues="library")``
+formula and recorded ``measured-exact`` or ``binary-defined`` (``docs/en/manifest-schema-3.md``, section 9.5). ``tilefish.fusion(epilogues="library")``
 rewrites a GEMM and the arithmetic after it into one. What the GPU does (the pins, the verification, the canary, the plans' bytes) is
 ``test_gpu_matmul.py``.
 """

@@ -1,4 +1,4 @@
-"""Intra-kernel instrumentation: probes at the phase boundaries a kernel declares, built into a variant of its own (``docs/instrument.md``).
+"""Intra-kernel instrumentation: probes at the phase boundaries a kernel declares, built into a variant of its own (``docs/en/instrument.md``).
 
 A kernel marks a phase boundary with ``tilefish.probe("name")``: in a ``@tilefish.kernel`` body, a ``@triton.jit`` kernel or a ``@gluon.jit`` kernel
 (an extern). In a production build a probe is nothing: Triton's frontend emits no operation for it, so the IR, the binary's machine code and every
@@ -148,7 +148,7 @@ def frontend() -> "Iterator[None]":
 
 def probe(name: str, _semantic: Any = None) -> None:
     """``tilefish.probe("name")``: a phase boundary of the kernel, recorded by lane 0 of every warp that reaches it in an instrumented build and
-    nothing at all in a production one (``docs/instrument.md``).
+    nothing at all in a production one (``docs/en/instrument.md``).
 
     In a ``@triton.jit`` or ``@gluon.jit`` kernel (Triton's code generator calls it as a builtin: ``import tilefish`` and write
     ``tilefish.probe("mma.issue")``), and in a ``@tilefish.kernel`` body, where it marks the point between the ops written before it and after it
@@ -170,7 +170,7 @@ def probe(name: str, _semantic: Any = None) -> None:
     if ctx.kind != "kernel":
         raise TilefishTypeError(
             f"tilefish.probe({name!r}) is in a {ctx.kind} body, which has no kernel of its own: put probes in the kernels it calls (every kernel of an "
-            "instrumented build records @begin and @end, docs/instrument.md)"
+            "instrumented build records @begin and @end, docs/en/instrument.md)"
         )
     from .trace import _written_at
 
@@ -271,6 +271,7 @@ def _record(pid: int) -> str:
 def _init(capacity: int, scratch: str) -> str:
     """The registers of the probes and this warp's slot, then ``@begin`` and ``@calib``: the first statements of the entry."""
     block = HEADER_BYTES + RECORD_BYTES * capacity
+    # docs/instrument.md is the page's path of 0.0.13 (now docs/en/instrument.md), kept: this text is in the instrumented PTX and its digests
     return (
         "\n\t// tilefish probes (docs/instrument.md): this warp's slot of the probe buffer, which the profile scratch parameter points to\n"
         "\t.reg .b64 %tfp_hdr, %tfp_rec;\n"

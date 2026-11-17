@@ -1203,7 +1203,7 @@ fn launches_that_skip_the_wait_on_their_stream_are_still_ordered_with_another_st
     );
 }
 
-/// The order of the runs of one instantiation (`docs/plan-schema-1.md`, section 9: two executions that use one arena must not overlap on the
+/// The order of the runs of one instantiation (`docs/en/plan-schema-1.md`, section 9: two executions that use one arena must not overlap on the
 /// device): two threads at once, one launching a case of one bucket 12 times on its stream (each into an output of its own), the other replaying
 /// the graph of a case of another bucket 12 times on its stream (copying the output after each replay), with no synchronization between them.
 /// They share the arena; every one of the 24 results is Python's.
@@ -1768,7 +1768,7 @@ fn carried_doc() -> Value {
     doc["carried"].clone()
 }
 
-/// The plans of `plans/carried` (`gpu_kernels_plans.CARRIED_SET`, `docs/plan-schema-1.md` section 15.2) instantiated on one `SharedArena`
+/// The plans of `plans/carried` (`gpu_kernels_plans.CARRIED_SET`, `docs/en/plan-schema-1.md` section 15.2) instantiated on one `SharedArena`
 /// (`PlanSet::instantiate`) and called in the order `rust_gate.py` called them (`CARRIED_CALLS`): a stage writes `h` into the arena's carried region,
 /// the next reads it (`stage_b` is given nothing but its output: its dimension is the size `h` was written with), another updates it in place, zeroes
 /// it (a memset of the carried buffer) or writes the other carried buffer `g`. Every call's outputs are Python's bytes, launched, and again on a fresh

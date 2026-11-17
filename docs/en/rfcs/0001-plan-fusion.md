@@ -1,6 +1,6 @@
 # RFC 0001: Plan fusion
 
-**English** | [简体中文](../zh-CN/rfcs/0001-plan-fusion.md)
+**English** | [简体中文](../../zh-CN/rfcs/0001-plan-fusion.md)
 
 * **Status:** reviewed; the decisions of 2026-11-15 are recorded in "Decisions" below. Phase 0 is measured, phase 1 is implemented
   ("Phase 1" below), and phase 2's row regions are implemented as `tilefish.fusion(version=2)` ("Phase 2" below); the rest is design.
@@ -169,7 +169,7 @@ the export-time verification, the schemas and the hosts are those of phase 1.
 * **Also in revision 2:** views of rank 1 and 2 read where they are by the row template (rule 5; version 1's row regions copy them first), an
   fp8 cast inline (`cvt.rn.satfinite.e4m3x2.f32`, `.to()`'s bits on every input). A hand-written kernel may ask for revision 2
   (`@tilefish.kernel(lowering=2)`); by default it keeps revision 1 and its source.
-* **The advisor** (`docs/advise.md`) and `boundaries()` follow the graph's version: in version 2 an ordered reduction, `max`, `argmax` or a gather
+* **The advisor** (`docs/en/advise.md`) and `boundaries()` follow the graph's version: in version 2 an ordered reduction, `max`, `argmax` or a gather
   is not reported, and a row region neither blocks its neighbours nor copies a view.
 * **Speed** (B300 MIG slice, sm_103, 30 SMs; microseconds per plan run captured in a CUDA graph; v2: the region, one kernel; tree: the same body
   without `order=`, D2's three to five kernels with Triton's tree reductions, other bytes; v1: version 1, the reductions alone in revision 1;
@@ -644,7 +644,7 @@ launch it like any Triton entry; nothing in either schema is new.
 
 ## 7. Epilogue and prologue fusion into library ops and externs
 
-RFC 0003 (`docs/rfcs/0003-epilogue-fusion.md`) replaces the sketch of this section and of 11.2 and 11.3 with a design, its contracts and measurements.
+RFC 0003 (`docs/en/rfcs/0003-epilogue-fusion.md`) replaces the sketch of this section and of 11.2 and 11.3 with a design, its contracts and measurements.
 
 Elementwise work after a GEMM can run as (a) a generated kernel after it, (b) a cuBLASLt or cuDNN epilogue, or (c) an epilogue inside an
 extern's own kernel. Version 1 has route (a) only (D5); route (c) is phase 4; route (b) and prologues are future work (section 11.2).

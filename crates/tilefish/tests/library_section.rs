@@ -311,7 +311,7 @@ fn a_library_entry_that_is_not_what_python_writes_is_refused() {
     }
 }
 
-/// The fields an entry has only when its declaration is not the default (`docs/manifest-schema-3.md`, section 9): absent they are the
+/// The fields an entry has only when its declaration is not the default (`docs/en/manifest-schema-3.md`, section 9): absent they are the
 /// default (an entry tilefish 0.0.4 wrote reads as before), present they have their one value, and anything else is refused.
 #[test]
 fn how_an_algorithm_was_chosen_is_read_from_fields_that_are_absent_by_default() {

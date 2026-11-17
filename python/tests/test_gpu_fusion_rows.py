@@ -1,4 +1,4 @@
-"""Row regions on a GPU (fusion version 2, ``docs/rfcs/0001-plan-fusion.md`` phase 2): an ordered sum or mean, ``max``, ``argmax`` and a gather
+"""Row regions on a GPU (fusion version 2, ``docs/en/rfcs/0001-plan-fusion.md`` phase 2): an ordered sum or mean, ``max``, ``argmax`` and a gather
 fused with the ops around them write the bytes of their unfused composition (every op a kernel of its own, every intermediate stored), for
 every input.
 

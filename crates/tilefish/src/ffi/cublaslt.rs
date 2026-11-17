@@ -305,7 +305,7 @@ impl Drop for Layout {
 /// The descriptors of one call: the matmul descriptor and the layouts of the two operands and of `D` (`C` is the same). Made per call and
 /// destroyed at its end, so nothing mutable is shared between threads (the bias pointer is in the descriptor).
 ///
-/// The problem is the one `docs/manifest-schema-3.md` (section 9) gives, tilefish's `out[m, n] = a[m, k] @ b[n, k]^T (+ bias[n])` posed to the
+/// The problem is the one `docs/en/manifest-schema-3.md` (section 9) gives, tilefish's `out[m, n] = a[m, k] @ b[n, k]^T (+ bias[n])` posed to the
 /// column-major library as the TN gemm `m_cublas = n`, `n_cublas = m`, `k_cublas = k`: the cuBLAS "A" operand is tilefish's `b` (`transa = T`,
 /// a `k x n` column-major matrix with `lda = k`), the "B" operand is tilefish's `a` (`transb = N`, `k x m`, `ldb = k`), and `C` and `D` are
 /// tilefish's `out` (`n x m` column-major, `ldc = ldd = n`). For the layouts NN and NT, `b` is `[k, n]`: an `n x k` column-major matrix with

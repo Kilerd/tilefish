@@ -1,4 +1,4 @@
-"""The records of instrumented launches, collected and explained (``docs/instrument.md``): :class:`Probes` collects them from ``tilefish.run``,
+"""The records of instrumented launches, collected and explained (``docs/en/instrument.md``): :class:`Probes` collects them from ``tilefish.run``,
 :class:`ProbeTrace` holds them (and reads and writes ``tilefish.probe-trace.v1``, which the Rust host writes too), and renders phase durations
 with their distributions, timelines per SM, CTA and warp role (text), and a Chrome trace that Perfetto opens.
 

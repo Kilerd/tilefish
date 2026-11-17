@@ -1,4 +1,4 @@
-"""Graphs whose bodies compute (``docs/rfcs/0001-plan-fusion.md``): the use cases of fusion's first version, each with its unfused twin
+"""Graphs whose bodies compute (``docs/en/rfcs/0001-plan-fusion.md``): the use cases of fusion's first version, each with its unfused twin
 (``grouping="none"``), for ``test_fusion.py`` (no GPU), ``test_gpu_fusion.py`` and the Rust gate (``rust_gate.py``).
 
 No ``from __future__ import annotations``: tilefish evaluates annotations at declaration.

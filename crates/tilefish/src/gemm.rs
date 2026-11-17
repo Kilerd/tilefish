@@ -2,7 +2,7 @@
 //!
 //! `out[M, N] = a[M, K] @ b[N, K]^T (+ bias[N])` in tilefish's row-major terms (`b[K, N]` and no transpose for the layout NN): bf16, f16
 //! or f32 operands (f32 ones multiplied as f32, TF32 off), an f32 accumulator, one rounding to the result's type (theirs, or f32) at the end,
-//! the bias (of the result's type) added in f32 before it (`docs/manifest-schema-3.md`, section 9). The entry pins the 64 bytes of the algorithm that
+//! the bias (of the result's type) added in f32 before it (`docs/en/manifest-schema-3.md`, section 9). The entry pins the 64 bytes of the algorithm that
 //! cuBLASLt's heuristic ranked first under a workspace limit, with the cuBLASLt version that chose it and the SM count of the device it
 //! was chosen on; [`Manifest::gemm`] refuses a device of another SM count (an algorithm is chosen for the multiprocessors it runs on: a MIG
 //! slice has fewer than the whole GPU), another version (an algorithm id names other kernels in another version), vets the 64 bytes the way Python's binding does (a weak check by the
@@ -381,7 +381,7 @@ impl Manifest {
     /// This manifest for a host that runs its GEMMs on a partition of `sms` SMs of the device (a green context): [`Manifest::gemm`] (and a plan
     /// made over it) then refuses an entry whose algorithm was chosen for another count ([`LibraryEntry::sm_count_chosen_for`]: its
     /// `sm_count_target`, or the device's count when it has none). `None` (the default) refuses none for this reason. What a pinned algorithm
-    /// computes does not depend on the partition (measured with cuBLASLt 12.8.4: `docs/manifest-schema-3.md`, section 9.3); the check is
+    /// computes does not depend on the partition (measured with cuBLASLt 12.8.4: `docs/en/manifest-schema-3.md`, section 9.3); the check is
     /// that the pin was chosen for the SMs the host gives it. The clone shares the modules and GEMMs this manifest loaded.
     pub fn with_sm_partition(&self, sms: Option<u64>) -> Manifest {
         Manifest { sm_partition: sms, ..self.clone() }

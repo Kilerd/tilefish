@@ -26,7 +26,7 @@ used, on a stream of its own (never the NULL stream, which a green context does 
 differs. The field is optional: an entry without one loads as before.
 
 The math is part of the declaration: 16-bit data takes ``"tensor_op"`` (the default) or ``"fma"``; f32 data must say ``"fma"`` (TF32 off) or
-``"tf32"`` (TF32 on). See ``docs/manifest-schema-3.md``, section 9.4.
+``"tf32"`` (TF32 on). See ``docs/en/manifest-schema-3.md``, section 9.4.
 """
 
 from __future__ import annotations

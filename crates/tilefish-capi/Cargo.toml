@@ -5,7 +5,7 @@ edition = "2024"
 description = "The C ABI of the tilefish Rust host (libtilefish_capi and tilefish.h), with a header-only C++17 wrapper (tilefish.hpp): a C or C++ program loads and verifies a tilefish manifest and its plans, and launches its kernels, pinned GEMMs, pinned convolutions and plans, with every check of the tilefish crate."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Kilerd/tilefish"
-# Not on crates.io yet: the C++ host is built from this repository (cargo, or CMake), and prebuilt libraries come later (docs/rfcs/0002-cpp-host.md).
+# Not on crates.io yet: the C++ host is built from this repository (cargo, or CMake), and prebuilt libraries come later (docs/en/rfcs/0002-cpp-host.md).
 publish = false
 build = "build.rs"
 

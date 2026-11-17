@@ -1,6 +1,6 @@
 # Manifest schema 3
 
-**English** | [简体中文](zh-CN/manifest-schema-3.md)
+**English** | [简体中文](../zh-CN/manifest-schema-3.md)
 
 This is the specification of what manifest schema 3 adds to schema 2. The Python package writes and reads schema 3 (`tilefish.runtime.export`,
 `tilefish.Manifest.load`), and so does the Rust crate `tilefish` of this repository (the published 0.0.1 reads schema 2 only; section 12 says what the
@@ -135,7 +135,7 @@ A manifest exported by 0.0.6 or earlier still names the directories of its build
 (section 8) is taken as it is: a PTX with `.file` directives or a cubin built elsewhere keeps whatever paths it has.
 
 **A trace next to the manifest (tilefish 0.0.9).** An export with `trace=True` (or `TILEFISH_TRACE=1`) also writes `trace/` in the manifest's directory:
-every level of every binary, for `tilefish-explain` (`docs/explain.md`). No field of the manifest names it and no digest covers it, so the manifest,
+every level of every binary, for `tilefish-explain` (`docs/en/explain.md`). No field of the manifest names it and no digest covers it, so the manifest,
 its digest and every pin are the same with or without it; neither reader looks at it (a reader reads `manifest.json` and the cubins it names, and nothing
 else of the directory). It holds source code (the kernels' files, the generated sources, Triton's): it is not part of what is shipped, and a tool that
 packages an export for a host leaves it out.
@@ -446,11 +446,11 @@ are built on `expf`, `rsqrt` is `rsqrtf` and `erf` is `erff` (inline PTX read fr
 * **Readers.** Both readers refuse: a `cuda_math` that is not an object or has another field; `functions` or `cuda` missing, not lists of the forms
   above, not sorted or with a repeat; `cuda` not empty for no function; a `libdevice` that is not a sha256; no function and no libdevice; the field on
   a `binary` entry or on an entry without `source_sha256`.
-* Where it is measured and kept: `docs/numerics.md` (the procedure to run on a CUDA or torch change), `python/tests/test_gpu_cuda_math.py`.
+* Where it is measured and kept: `docs/en/numerics.md` (the procedure to run on a CUDA or torch change), `python/tests/test_gpu_cuda_math.py`.
 
 ### 4.8 The probes of an instrumented build: `instrument` (tilefish 0.0.11, crate 0.0.9)
 
-An instrumented build (`tilefish.runtime.export(..., instrument=True)` or `tilefish.instrument(capacity=..., ops=...)`, `docs/instrument.md`) records the
+An instrumented build (`tilefish.runtime.export(..., instrument=True)` or `tilefish.instrument(capacity=..., ops=...)`, `docs/en/instrument.md`) records the
 kernel's `tilefish.probe` calls, and `@begin`, `@calib` and `@end`, into a probe buffer that a host gives in the profile scratch slot (the second slot of
 `abi.scratch`, which a production launch passes as null). Its entry says so:
 
@@ -462,7 +462,7 @@ kernel's `tilefish.probe` calls, and `@begin`, `@calib` and `@end`, into a probe
 | field | type and rule |
 |---|---|
 | `instrument` | optional object of exactly these three fields, only on a `triton` entry. Absent from every entry of a production export |
-| `instrument.format` | `"tilefish.probes.v1"`: the record format, the layout of the buffer and the probes the build adds (`docs/instrument.md`, section 3) |
+| `instrument.format` | `"tilefish.probes.v1"`: the record format, the layout of the buffer and the probes the build adds (`docs/en/instrument.md`, section 3) |
 | `instrument.capacity` | integer from 1 to 65536: the records each warp keeps per launch; a launch's buffer is `ctas * warps * (16 + 16 * capacity)` bytes, `warps` the block's warps, `ctas` its CUDA grid |
 | `instrument.probes` | list of the kernel's probes, each `{"id", "name", "sites"}`: `id` an integer from 3 to 65535 (0, 1 and 2 are the build's `@begin`, `@end`, `@calib`), `name` the probe's (1 to 64 characters, a letter or `_` first, then letters, digits and `_ . : / -`), each id and each name once; `sites` a list of `{"loc", "role", "function"}`, all strings: the module-relative line it is written on, the partition of a warp-specialised kernel it runs in (`"default"`, `"worker 0"`, ...; `""` when the kernel is not partitioned) and the jit function. A kernel without probes has `[]` |
 
@@ -478,14 +478,14 @@ kernel's `tilefish.probe` calls, and `@begin`, `@calib` and `@end`, into a probe
   probe that is not an object of the three fields, an id out of range or repeated, a name that is not one or repeated; a site that is not an object of
   three strings; the field on a `binary` entry.
 * **The Rust host** reads it into `Entry::instrument` (`Instrument { capacity, probes }`, each `Probe { id, name, sites }`); `Kernel::launch_probed`
-  passes a `ProbeBuffer` in the profile scratch slot and refuses it for a production binary (`docs/instrument.md`, section 4).
+  passes a `ProbeBuffer` in the profile scratch slot and refuses it for a production binary (`docs/en/instrument.md`, section 4).
 * Where it is tested: `python/tests/test_instrument.py`, `python/tests/test_gpu_instrument.py`, `crates/tilefish/tests/instrument.rs`, the Rust gate's
   instrumented case.
 
 ### 4.9 CuTe DSL kernels: `binary.source: "cute"`, the kinds `tensormap` and `bytes` (tilefish 0.0.13, crate 0.0.11)
 
 A kernel written in CUTLASS's CuTe DSL (`nvidia-cutlass-dsl`, `import cutlass.cute as cute`: a `@cute.jit` host function that launches a `@cute.kernel`)
-is declared with `@tilefish.extern(cute=host, cute_args=..., cute_options=...)` (`docs/cute.md`). The DSL compiles it for the layouts of its arguments,
+is declared with `@tilefish.extern(cute=host, cute_args=..., cute_options=...)` (`docs/en/cute.md`). The DSL compiles it for the layouts of its arguments,
 so its shapes are static: one binary per bucket. Its cubin is the DSL's own (the PTX of the NVVM and the cubin of the `ptxas` the DSL carries), and the
 launch is the compiled host function's, captured when it is built (a CUDA graph: the kernel does not run): the grid, the block, the cluster, the
 dynamic shared memory and the bytes of every kernel parameter. Its entry is a `binary` entry of section 8 with these differences:
@@ -639,7 +639,7 @@ no tensor of the call determines). It has `type` `i32` or `i64` (`u32`/4 or `u64
 entry has one. **One entry serves every value**: a launch passes the value the call gives at the parameter's slot, as a signed integer of its type (any
 sign; a value that does not fit is refused, and so is a launch that gives no value for one of them, or one for a name the entry does not have:
 Python `tilefish.run(op, x, h_out=5)`, Rust `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`); a step of a launch plan records the values
-of its call (`"given"`, `docs/plan-schema-1.md` section 7). A float stays a `fixed` argument (fixed per declaration). The declaration digest has the
+of its call (`"given"`, `docs/en/plan-schema-1.md` section 7). A float stays a `fixed` argument (fixed per declaration). The declaration digest has the
 parameter as given (`"given": true`, no default), so a declaration with a default is another operator. A reader that predates the kind (tilefish
 0.0.4, the published crate 0.0.2) refuses a manifest that has one.
 
@@ -1538,7 +1538,7 @@ The Rust crate `tilefish` of this repository reads schema 3 in full and launches
 schema 2 launches (`DevicePtr<'a>` lifetimes, `from_cuda` sealed to cudarc's slices and views, the safe `launch` on a `CudaStream` with owner waits and
 writer-waits-for-readers, the refusal of a capture of slices; `unsafe` only in `region.rs` and `ffi.rs` with its `ffi/cublaslt.rs`; cudarc's safe layer
 and its `cublaslt::result`, no hand-written driver FFI). Where it is stricter than Python, or differs from it, it is listed here. The C++ host
-(`crates/tilefish-capi`: the C ABI `tilefish.h` and `tilefish.hpp`, `docs/rfcs/0002-cpp-host.md`) reads a manifest through this crate, so everything
+(`crates/tilefish-capi`: the C ABI `tilefish.h` and `tilefish.hpp`, `docs/en/rfcs/0002-cpp-host.md`) reads a manifest through this crate, so everything
 here holds for it as written; its tensors are regions (`DevicePtr::from_raw`).
 
 **Reading** (`crates/tilefish/src/manifest.rs`, `library.rs`).
@@ -1683,7 +1683,7 @@ not), the fixed arguments per call and the constraints of the dimensions of thei
 struct then say each architecture's implementation, grid, block and constexprs and, when their ABIs differ or one is a prebuilt binary, each one's kind,
 descriptors, scalars, fixed arguments and views; and `ops=` checks each entry against the implementation its architecture selects.
 
-**Launch plans** (not read by the crate yet). `docs/plan-schema-1.md`: `plan.json` pins a manifest and orders the launches of its entries over one arena, so a host runs a whole forward from it, capturable in a CUDA graph (`test_gpu_plan.py`; the golden fixtures `python/tests/golden/plans/` have the digests to reproduce).
+**Launch plans** (not read by the crate yet). `docs/en/plan-schema-1.md`: `plan.json` pins a manifest and orders the launches of its entries over one arena, so a host runs a whole forward from it, capturable in a CUDA graph (`test_gpu_plan.py`; the golden fixtures `python/tests/golden/plans/` have the digests to reproduce).
 
 ## 13. Where it is tested
 

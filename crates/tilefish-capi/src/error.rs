@@ -22,7 +22,7 @@ pub const TILEFISH_ERROR_MANIFEST: tilefish_status = 2;
 pub const TILEFISH_ERROR_BAD_PIN: tilefish_status = 3;
 /// The manifest has another digest than the pin.
 pub const TILEFISH_ERROR_PIN_MISMATCH: tilefish_status = 4;
-/// A plan or plan set is refused (a rule of `docs/plan-schema-1.md`, another manifest, a step that is not its entry).
+/// A plan or plan set is refused (a rule of `docs/en/plan-schema-1.md`, another manifest, a step that is not its entry).
 pub const TILEFISH_ERROR_PLAN: tilefish_status = 5;
 /// The plan or plan set has another digest than the pin.
 pub const TILEFISH_ERROR_PLAN_PIN_MISMATCH: tilefish_status = 6;

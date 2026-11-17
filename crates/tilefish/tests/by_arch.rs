@@ -1,4 +1,4 @@
-//! An operator with an implementation per architecture whose implementations have ABIs of their own (`docs/manifest-schema-3.md`, section 4.1),
+//! An operator with an implementation per architecture whose implementations have ABIs of their own (`docs/en/manifest-schema-3.md`, section 4.1),
 //! read and checked with no GPU on synthetic manifests (`common::synthetic`).
 //!
 //! `copy2d(x: Strided[Tensor[R, C, f16]], y: Out[Tensor[R, C, f16]])` is one signature with three implementations, as Python writes their entries

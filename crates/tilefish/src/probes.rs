@@ -1,4 +1,4 @@
-//! The records of an **instrumented** binary (`docs/instrument.md`): what its probes are, the probe buffer a launch gives it, and the records read
+//! The records of an **instrumented** binary (`docs/en/instrument.md`): what its probes are, the probe buffer a launch gives it, and the records read
 //! back from that buffer, as `tilefish.probe-trace.v1` that `tilefish-explain DIR --probes FILE` renders.
 //!
 //! An instrumented export (Python's `tilefish.runtime.export(..., instrument=True)`) is a diagnostic variant: its Triton binaries record, at every

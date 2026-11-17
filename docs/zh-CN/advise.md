@@ -1,8 +1,8 @@
 # 融合 advisor：plan 的哪些步骤可以合成一个 kernel
 
-[English](../advise.md) | **简体中文**
+[English](../en/advise.md) | **简体中文**
 
-`tilefish-explain` 解释的是单个 kernel（核函数）；它不会告诉你模型的哪些部分合成更少的 kernel 后会更快。advisor（建议器）为整个 plan（计划）做这件事：它按能节省的时间，对一个 graph（计算图）的 plan 中的**融合候选**（由中间张量连接起来的步骤，合成一个 kernel 后就不必存储这些中间张量）排序，说明每个候选为什么现在还不是一个 kernel、该怎么办，并按步骤类别汇总 plan 的时间。一个 profiler 测量每个步骤的设备时间，从而可以按实测时间排序。它还会指出哪些融合形态（pattern）帮助最大，这正是 plan 融合第 2 阶段（`docs/rfcs/0001-plan-fusion.md`）应当优先做的。
+`tilefish-explain` 解释的是单个 kernel（核函数）；它不会告诉你模型的哪些部分合成更少的 kernel 后会更快。advisor（建议器）为整个 plan（计划）做这件事：它按能节省的时间，对一个 graph（计算图）的 plan 中的**融合候选**（由中间张量连接起来的步骤，合成一个 kernel 后就不必存储这些中间张量）排序，说明每个候选为什么现在还不是一个 kernel、该怎么办，并按步骤类别汇总 plan 的时间。一个 profiler 测量每个步骤的设备时间，从而可以按实测时间排序。它还会指出哪些融合形态（pattern）帮助最大，这正是 plan 融合第 2 阶段（`docs/zh-CN/rfcs/0001-plan-fusion.md`）应当优先做的。
 
 代码在 `tilefish._advise`（分析）和 `tilefish._profile`（profiler）。
 
@@ -31,7 +31,7 @@ t = tilefish.profile_plan(block, "build/block", pin=p.digest, bucket="M=128", de
 * **plan**（`plan.json`，或 plan set 中的 `<graph>.plan.json`）：每个 bucket（分桶）的步骤，每个步骤绑定的缓冲区和视图，缓冲区的角色（input、weight、output、intermediate、carried、inout、workspace（工作区））；
 * **manifest**：每个步骤启动什么。library 条目的尺寸（GEMM（通用矩阵乘）的 `m`、`n`、`k`；卷积的 `n`、`c`、`k`、输出和滤波器尺寸以及分组数）和数据类型；kernel 条目的 ABI（每个指针的访问方式：`in`、`out`、`inout`），它是否由 tilefish 生成（`source_sha256`）、用的是哪个模板（行模板下沉（lowering）生成的 kernel 有一个 `BLOCK_D` 常量），以及它的选项（`enable_fp_fusion`）；
 * **融合报告**（`<graph>.fusion.json`）：graph 函数体的各个区域，每个区域包含的算子、它的模板、它如何读取输入（由 `tilefish.contiguous` `materialised` 的视图）、它的归约及其顺序；
-* **trace**，在导出带有 trace 时（`trace/graphs/<graph>.json`，`docs/explain.md`）：每个区域的算子和源码行，以及新增的各区域**边界**及其原因（第 4 节），还有每个 kernel 的 SASS，advisor 据此判断一个手写 kernel 是否计算 MMA。属于另一个 plan 的 trace 会被忽略。没有 trace 时，`tilefish.advise(..., gop=graph)` 从 graph 计算边界。
+* **trace**，在导出带有 trace 时（`trace/graphs/<graph>.json`，`docs/zh-CN/explain.md`）：每个区域的算子和源码行，以及新增的各区域**边界**及其原因（第 4 节），还有每个 kernel 的 SASS，advisor 据此判断一个手写 kernel 是否计算 MMA。属于另一个 plan 的 trace 会被忽略。没有 trace 时，`tilefish.advise(..., gop=graph)` 从 graph 计算边界。
 
 ## 2. 每个步骤
 
@@ -137,7 +137,7 @@ t = tilefish.profile_plan(block, "build/block", pin=p.digest, bucket="M=128", de
 * **没有计时文件时**：节省的字节数除以带宽，`S / BW`，计入除计算受限的 library 步骤之外每个步骤的字节（计算受限的 GEMM 不会因为少写一些就变快）。它省掉的启动只列出，不计入。
 * **有计时文件时**（步骤的*净*时间，第 6 节）：**启动下限** `t0` 是最短的 kernel 步骤，即一个 kernel 无论搬运多少都要付出的开销。一个步骤用 `t - t0` 以其实际带宽 `min(BW, bytes / (t - t0))` 搬运字节。如果这段时间可以就是它搬运字节的时间（elementwise、row、fused 或 copy 步骤、GEMM、没有 MMA 的 kernel），并且实际带宽达到带宽的四分之一或以上（`STREAMING`），它节省 `min(t - t0, S_step / achieved)`；其他步骤（attention、MMA 情况未知的 kernel、远慢于其字节量的 kernel）节省 `S_step / BW`，计算受限的 GEMM 不节省。融合每省掉一个 kernel 就节省 `t0`：省掉的 kernel 数比候选的 kernel 步骤数少一个，或者在 library op 吸收它们时全部省掉。节省最多为候选的时间减去一个下限。候选之间会重叠（两个 GEMM 之间的 elementwise 步骤既是一个的 epilogue，又是另一个的 prologue），所以它们的节省不能相加。
 
-**epilogue 的路径**（`docs/rfcs/0003-epilogue-fusion.md` 第 5 节）。生产者为 GEMM 或卷积的候选带有 `routes`：每条路径是把消费者的运算并入生产者的一种方式，附上它给出的契约、它的状态和节省（即该候选在排序所用 bucket 下的节省）。对已 pin 的 cuBLASLt GEMM：E2（库 epilogue，契约 (iii)：在融合报告把该区域匹配为 cuBLASLt 的某个 epilogue 时可用，否则说明原因）、E3（带 hook 的生成 GEMM，实测与 pin 相等时为契约 (i)，否则为 (ii)）及其**盈亏平衡点**（break-even）`1 + saving / T_gemm`，即生成 GEMM 慢到什么程度时融合就不再划算（advisor 不预测生成 GEMM 的速度），以及 E1（你自己写的带 epilogue hook 的 extern，现在可用）；对 cuDNN 卷积，用 E6（fused graph）代替 E2。对带 epilogue hook 的 extern：它的 `value="out"` hook（契约 (i)，可用）和 `value="acc"` hook（契约 (ii)，在 `epilogues="accumulator"` 下可用，否则说明要声明什么）；对受自身运算限制、没有声明 hook 的 extern，给出要声明的 hook。给出不同字节的路径永远不会被 advisor 或 planner 按时间自动选择：实测时间只为声明提供参考。
+**epilogue 的路径**（`docs/zh-CN/rfcs/0003-epilogue-fusion.md` 第 5 节）。生产者为 GEMM 或卷积的候选带有 `routes`：每条路径是把消费者的运算并入生产者的一种方式，附上它给出的契约、它的状态和节省（即该候选在排序所用 bucket 下的节省）。对已 pin 的 cuBLASLt GEMM：E2（库 epilogue，契约 (iii)：在融合报告把该区域匹配为 cuBLASLt 的某个 epilogue 时可用，否则说明原因）、E3（带 hook 的生成 GEMM，实测与 pin 相等时为契约 (i)，否则为 (ii)）及其**盈亏平衡点**（break-even）`1 + saving / T_gemm`，即生成 GEMM 慢到什么程度时融合就不再划算（advisor 不预测生成 GEMM 的速度），以及 E1（你自己写的带 epilogue hook 的 extern，现在可用）；对 cuDNN 卷积，用 E6（fused graph）代替 E2。对带 epilogue hook 的 extern：它的 `value="out"` hook（契约 (i)，可用）和 `value="acc"` hook（契约 (ii)，在 `epilogues="accumulator"` 下可用，否则说明要声明什么）；对受自身运算限制、没有声明 hook 的 extern，给出要声明的 hook。给出不同字节的路径永远不会被 advisor 或 planner 按时间自动选择：实测时间只为声明提供参考。
 
 `patterns` 按每个候选需要消除的最晚阶段的阻碍项汇总候选（每个候选只计一次；它需要的其他阻碍项列在 `also` 下）：即该融合阶段能解锁什么。最晚阻碍项为 `epilogue-library` 的候选，无论做了其他什么，都需要 GEMM epilogue。`recurring` 汇总那些步骤以相同顺序运行相同算子的候选（模型中重复的一层）：即用模型的语言来说，节省最多的融合形态。
 
@@ -177,7 +177,7 @@ t = tilefish.profile_plan(block, "build/block", pin=p.digest, bucket="M=128", de
 
   profiler 不带事件单独为 plan 计时：64.1 us。对 `plan_model.deep_block(4)`（36 个步骤），各 net 合计 244.2 us，nsys 的 kernel 加间隙合计 249.4 us。**除一个步骤（1.2 us）外，每个步骤的 net 与 nsys 的 kernel 时间相差不超过 0.6 us，各 net 之和与 nsys 的相差不超过 3%**；包含事件的中位数每个都长了 3 到 4 us。短步骤请按 `net` 排序，两个步骤之间不到一微秒的差异请视为噪声。
 * **在 RTX 5090 上**（sm_120，170 个 SM；同样的对照，nsys 2026.5.2）：事件让每个步骤多花约 1.1 us，时间戳以 2.048 us 为步长跳动。`plan_model.block` 在 `M = 128` 下的各 net 合计 31.6 us，nsys 的 kernel 加间隙合计 26.0 us（profiler 自己测得的不带事件的 plan 时间也是 31.6 us：比 nsys 从第一个到最后一个 kernel 的时间多约 5 us，这是一个固定开销，对这么短的 plan 影响很大）；对 `plan_model.deep_block(4)`，是 110.4 us 对 104.6 us。除一个步骤（1.9 us）外，每个步骤的 net 与 nsys 的 kernel 加间隙相差不超过 1.1 us。events 方法的各 net 合计分别为 30.7 和 114.7 us。
-* **它看不到的**：步骤内部的工作（由多个 kernel 组成的 library 步骤算一个步骤），以及一个步骤与下一个步骤的重叠，`net` 是把它平均分摊而不是测量出来的。要测 kernel 内部的时间：用 probe（探针）和插桩变体，见 `docs/instrument.md`。
+* **它看不到的**：步骤内部的工作（由多个 kernel 组成的 library 步骤算一个步骤），以及一个步骤与下一个步骤的重叠，`net` 是把它平均分摊而不是测量出来的。要测 kernel 内部的时间：用 probe（探针）和插桩变体，见 `docs/zh-CN/instrument.md`。
 
 ## 7. 如何测试
 

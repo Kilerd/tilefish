@@ -119,7 +119,7 @@ class Node:
         # For a node of a fused region's kernel: its position in the region's body (the ops the region took, in order); ``None`` otherwise.
         self.origin: "int | None" = None
         # The settings of the ``tilefish.fused`` scopes a node of a graph body was traced in (``{"epilogues": "accumulator"}``, the innermost's
-        # winning); ``None`` outside any. Like ``loc``, not printed and not compared: the fusion pass reads it (docs/rfcs/0003-epilogue-fusion.md, Q3).
+        # winning); ``None`` outside any. Like ``loc``, not printed and not compared: the fusion pass reads it (docs/en/rfcs/0003-epilogue-fusion.md, Q3).
         self.scope: "dict[str, Any] | None" = None
 
     @property
@@ -169,7 +169,7 @@ class Graph:
         self.requirements = tuple(requirements)
         # The last version of every InOut parameter the body modified, by parameter name.
         self.finals: dict[str, "Value"] = dict(finals or {})
-        # The probes of a kernel body (tilefish.probe, docs/instrument.md): (name, the number of nodes before it, the line it was written on).
+        # The probes of a kernel body (tilefish.probe, docs/en/instrument.md): (name, the number of nodes before it, the line it was written on).
         self.probes: "tuple[tuple[str, int, tuple[str, int] | None], ...]" = ()
 
     @property

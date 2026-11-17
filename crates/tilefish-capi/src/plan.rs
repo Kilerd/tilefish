@@ -68,7 +68,7 @@ pub struct tilefish_buffer_info {
     pub bytes: u64,
 }
 
-/// A launch plan (`plan.json`), verified against its pin, the manifest next to it and every rule of `docs/plan-schema-1.md`.
+/// A launch plan (`plan.json`), verified against its pin, the manifest next to it and every rule of `docs/en/plan-schema-1.md`.
 #[allow(non_camel_case_types)]
 pub struct tilefish_plan {
     pub(crate) plan: LaunchPlan,

@@ -1,8 +1,8 @@
 # 视图、设备标量、预构建二进制文件和已 pin 的 GEMM
 
-[English](../../guide/operators.md) | **简体中文**
+[English](../../en/guide/operators.md) | **简体中文**
 
-一个真实的模型需要四样东西，而一个稠密的、编译期写死的、只用 Triton 的算子表达不了它们。每一样都是 manifest（清单）的一部分，manifest 是 schema（模式）3（`docs/manifest-schema-3.md` 规定了每个字段；Python 包只读写 schema 3，遇到 schema 2 会提示 "re-export"）。
+一个真实的模型需要四样东西，而一个稠密的、编译期写死的、只用 Triton 的算子表达不了它们。每一样都是 manifest（清单）的一部分，manifest 是 schema（模式）3（`docs/zh-CN/manifest-schema-3.md` 规定了每个字段；Python 包只读写 schema 3，遇到 schema 2 会提示 "re-export"）。
 
 **带步长的视图。** 张量类型有以元素计的步长和以元素计的偏移，用维度代数表示（`TensorType.strides`、`.offset`）；默认是稠密且 16 字节对齐（`contiguous`）。`x.reshape(M, 3, H, D)`（对稠密输入）、`x.permute(1, 0, 2)`、`x[:, 1]` / `x.select(axis, i)` 和 `x.split(...)` 都不复制任何东西：它们是视图，具有该操作对应的步长和偏移。块数取决于某个维度的 split（`x: [M, C]` 且 `C = Dim("C", divisible_by=16)` 时的 `x.split(16, axis=1)`）返回 `Chunks`，一个长度为符号的序列：`chunks[0]` 和 `chunks[-1]` 总是存在，其他块只在该维度的最小尺寸能证明其存在时才存在，`len()` 和解包会抛出异常。步长或偏移可以是符号尺寸的乘积：`[H, L, L]` 张量沿第一个轴的步长是 `L*L`，`x[h]` 的偏移是 `h*L*L`（`tilefish.dims.mul`；形状仍是仿射的，`L * L` 在形状中依然被拒绝，只有启动 grid 可以让维度相乘），`Strided[...]` 参数会绑定它，plan（计划）会在每个 bucket（分桶）上对它求值，所以注意力分数 `[H, L, L]` 是 plan 的一个缓冲区，它的转置和各个 head 都是它的视图。视图是 `View[...]`，可以进入被追踪的逐元素运算和归约运算；声明的算子只在其参数注明时才接受视图。kernel（核函数）、extern（外部 kernel）、library op（库算子）或 graph（计算图）的其他所有张量参数（以及结果）都是连续的：注解如果是带有其他步长、带偏移或没有对齐的 `TensorType`，会在声明时被拒绝；对这样的参数，启动时会拒绝不连续的张量。`extern` 参数 `x: Strided[Tensor[S, H, D, bf16]]` 接受一个视图，kernel 的步长是 stub 按 kernel 参数顺序声明的标量参数：
 
@@ -29,7 +29,7 @@ def plane_sum(plane: Tensor[3, R, i32]):
 y = tilefish.run(add_rows, plane[1], plane[0])   # an address that is not 16-byte aligned runs add_rows__ua0 too
 ```
 
-graph 的导出包含其 plan 的步骤所启动的特化版本；`tilefish.runtime.export(add_rows.unaligned("a"), directory)` 为单独的 kernel 写出一个特化版本，对缺少它的 manifest 做 replay（回放）时会指出这一点（`docs/manifest-schema-3.md`，第 6 节）。
+graph 的导出包含其 plan 的步骤所启动的特化版本；`tilefish.runtime.export(add_rows.unaligned("a"), directory)` 为单独的 kernel 写出一个特化版本，对缺少它的 manifest 做 replay（回放）时会指出这一点（`docs/zh-CN/manifest-schema-3.md`，第 6 节）。
 
 **设备标量。** `n_tok: DevScalar[i32]` 是设备内存中的一个元素：在 ABI 中是一个形状为 `[]` 的指针，在 API 中是一个只有一个元素的张量。二进制文件用 `tl.load` 读取它，所以一个二进制文件适用于所有取值，改变取值靠写内存，而绝不靠构建；下沉生成的 kernel 用 `tilefish.load(s)` 读取它（一次 `tl.load(ptr)`，再广播）。
 
@@ -37,7 +37,7 @@ graph 的导出包含其 plan 的步骤所启动的特化版本；`tilefish.runt
 
 **预构建的二进制文件。** `@tilefish.extern(ptx="k.ptx", symbol="k", block=(256,), grid=...)` 或 `cubin={"sm_103": "k.cubin"}` 按 C ABI 声明一个不由 Triton 编译的 kernel：依次是指针、`Dim` 标量和类型化的 `const[i32|i64|f32]` 固定参数，并且**没有 Triton 的 scratch 槽位**。它的身份是文件字节的 sha256（kind 为 `tilefish.binary.v1` 的 `source_digest`）；PTX 由 `ptxas` 用固定且有记录的参数汇编（即 Triton 传的那些参数，所以一份 Triton 构建产出的 PTX 以这种方式声明时，得到的机器码和输出字节与走 Triton 路径时相同）；cubin 在其本身的架构上原样使用，在其他架构上被拒绝。`replay` 拒绝不是构建 manifest 时所用的那个文件。
 
-预构建二进制文件的一个**没有默认值**的 `const[i32]` 或 `const[i64]`，是一个*每次调用时给出*的固定参数：即没有任何张量决定的调用几何信息（输出尺寸、偏移）。一个声明和一个二进制文件适用于所有取值：`k(x, h_out=5)`、`tilefish.run(k, x, h_out=5)`、Rust 的 `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`；在 graph 中，取值可以是 graph 维度的表达式（`h_out=H // 2`），plan 的每个步骤都会记录它在自己 bucket 上那次调用的取值（`"given": {"h_out": 5}`），所以这些值在 plan 的 digest 中，两个 host（宿主）都会对照条目检查它们（`docs/manifest-schema-3.md`，第 5.3 节）。
+预构建二进制文件的一个**没有默认值**的 `const[i32]` 或 `const[i64]`，是一个*每次调用时给出*的固定参数：即没有任何张量决定的调用几何信息（输出尺寸、偏移）。一个声明和一个二进制文件适用于所有取值：`k(x, h_out=5)`、`tilefish.run(k, x, h_out=5)`、Rust 的 `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`；在 graph 中，取值可以是 graph 维度的表达式（`h_out=H // 2`），plan 的每个步骤都会记录它在自己 bucket 上那次调用的取值（`"given": {"h_out": 5}`），所以这些值在 plan 的 digest 中，两个 host（宿主）都会对照条目检查它们（`docs/zh-CN/manifest-schema-3.md`，第 5.3 节）。
 
 **空指针和 64 位维度标量。** extern 的 kernel 在所声明的用法下不使用的指针（一个只有非空时才读取的 bias，或只在某个被声明关闭的 constexpr 开关下才读取的 bias）声明为 `Null[dtype]`：调用时不传它，两个 host 都在它的位置上传空指针（manifest kind `null`，第 5.6 节）。维度标量是 `i32`，除非声明为 `i64[n]`：同一个标量以 `i64` 传入，其值仍由形状推出并对照形状检查，用于计数宽度为 64 位的 kernel（第 5.7 节）。两者合用：
 
@@ -69,7 +69,7 @@ def row_sum(x: Strided[Tensor[R, 256, f32]], y: Out[Tensor[R, f32]], s_row: Stri
 def row_sum(x: Tensor[R, 1024, f32], y: Out[Tensor[R, f32]], n_rows: R, ROWS: const = 1): ...
 ```
 
-对 graph、plan、调用方和 `mode="reference"` 而言，这个算子是同一个类型化签名。`export` 构建目标架构（`arch=`，或设备的架构）的实现，`jit` 构建设备架构的实现，二者都拒绝既没有自己的实现也没有 `fallback` 的架构。每个实现是一个 Triton 或 Gluon kernel，有自己的编译选项（`num_warps`、`num_stages`、`enable_fp_fusion`）、constexpr 值（`consts=`）和 `grid=`；每个实现都接受 stub 的参数，并具有相同的启动 ABI、bucket、维度和前置条件，这由声明检查，所以无论运行哪个实现，plan 都是同一份文档，host 也以同样方式启动每个实现。每个实现都是一个独立的算子（`row_sum.for_arch("sm_103")`、`tilefish.aot.compile_specs(row_sum, arch=103)`）：它的键在它的声明 digest 和编译规格中，它的 manifest 条目也记录了它（`"implementation": "sm_103"` 或 `"fallback"`；`docs/manifest-schema-3.md`，第 4.1 节）。`replay` 像导出时一样选择设备架构的实现，所以另一个实现的条目，或一个已改变（kernel、选项、常量或 grid 改变）的实现的条目，会作为过时而被拒绝；另一个架构的实现改变时，本架构的 manifest 仍然有效。Rust crate 读取这个字段（`Entry::implementation`），并启动其设备架构的条目。
+对 graph、plan、调用方和 `mode="reference"` 而言，这个算子是同一个类型化签名。`export` 构建目标架构（`arch=`，或设备的架构）的实现，`jit` 构建设备架构的实现，二者都拒绝既没有自己的实现也没有 `fallback` 的架构。每个实现是一个 Triton 或 Gluon kernel，有自己的编译选项（`num_warps`、`num_stages`、`enable_fp_fusion`）、constexpr 值（`consts=`）和 `grid=`；每个实现都接受 stub 的参数，并具有相同的启动 ABI、bucket、维度和前置条件，这由声明检查，所以无论运行哪个实现，plan 都是同一份文档，host 也以同样方式启动每个实现。每个实现都是一个独立的算子（`row_sum.for_arch("sm_103")`、`tilefish.aot.compile_specs(row_sum, arch=103)`）：它的键在它的声明 digest 和编译规格中，它的 manifest 条目也记录了它（`"implementation": "sm_103"` 或 `"fallback"`；`docs/zh-CN/manifest-schema-3.md`，第 4.1 节）。`replay` 像导出时一样选择设备架构的实现，所以另一个实现的条目，或一个已改变（kernel、选项、常量或 grid 改变）的实现的条目，会作为过时而被拒绝；另一个架构的实现改变时，本架构的 manifest 仍然有效。Rust crate 读取这个字段（`Entry::implementation`），并启动其设备架构的条目。
 
 一个实现可以被共享，可以是预构建的二进制文件，也可以有自己的 ABI：
 
@@ -146,10 +146,10 @@ def proj32(a: Tensor[32, 512, bf16], b: Tensor[1536, 512, bf16], bias: Tensor[15
 ```
 
 * `heuristic="torch"` 像 torch 2.9 的 `addmm`（`at::cuda::blas::gemm_and_bias`）那样询问启发式：只要一个结果，只受 workspace 上限约束（没有对齐下限：torch 的指针是 256 字节对齐的，即库的默认值），默认使用 torch 的上限，`gemm_bias` 为 1 048 576 字节（`CUBLASLT_WORKSPACE_SIZE`），`gemm` 为 8 519 680（`torch.mm` 用 `CUBLAS_WORKSPACE_CONFIG` 的 workspace 运行 `cublasGemmEx`，而该上限下启发式的答案正是它运行的算法；在恰为 sm_90 的设备上，torch 的默认值是 32 MiB，即 `workspace_bytes=33_554_432`）。使用 torch 的默认归约（`allow_bf16_reduction=True`）时，结果与 torch 逐字节一致：`test_gpu_cublaslt.py` 在 48 种形状上断言这一点，有 bias 和无 bias 都测，每种各用三组操作数；在 B300 MIG 切片（sm_103）和 RTX 5090（sm_120）上用 cuBLASLt 12.8.4、在 B300 切片上用 13.1.0 实测过（`test_gpu_gemm.py`，30 种形状）。默认姿态（posture）`"tilefish"` 增加 16 字节的对齐下限，请求 8 个结果，并且在没有显式开启时，不给带 bias 的 GEMM 使用 split-K（K 维切分；见下文），而 torch 不这样做。它不是 torch 的姿态，它的结果有多少与 torch 一致取决于 cuBLASLt 版本：在 `test_gpu_gemm.py` 的 15 种带 bias 的形状上，12.8.4 全部一致，13.1.0 有 13 种一致，13.1.0 的启发式在 32 和 64 x 1024 x 3072 上把使用 f32 部分和、切分数为 3 的 split-K 排在第一（在这两处，workspace 上限、对齐下限、请求的结果数都不会改变它的第一个答案；归约方案掩码会）。
-* `allow_bf16_reduction=True` 允许 split-K 以 bf16 累加部分和（`INPLACE`、`OUTPUT_TYPE`：torch 的默认值，`allow_bf16_reduced_precision_reduction`），这会舍入不止一次。没有它时，只向启发式请求 f32 部分和，带 bias 的 GEMM 则完全不用 split-K（实测在 bias epilogue（尾部）下，使用 f32 部分和的 split-K 会舍入两次：RTX 5090 上的 cuBLASLt 12.8.4）；违反其中任一条的算法会被两个 host 拒绝。尽管有些 split-K 算法保持了一次舍入，这条规则仍保留在默认姿态中：启发式的答案里没有任何东西能把它们区分开（`docs/numerics.md`，第 4 节）；`heuristic="torch"` 给出与 `addmm` 相同的字节。
+* `allow_bf16_reduction=True` 允许 split-K 以 bf16 累加部分和（`INPLACE`、`OUTPUT_TYPE`：torch 的默认值，`allow_bf16_reduced_precision_reduction`），这会舍入不止一次。没有它时，只向启发式请求 f32 部分和，带 bias 的 GEMM 则完全不用 split-K（实测在 bias epilogue（尾部）下，使用 f32 部分和的 split-K 会舍入两次：RTX 5090 上的 cuBLASLt 12.8.4）；违反其中任一条的算法会被两个 host 拒绝。尽管有些 split-K 算法保持了一次舍入，这条规则仍保留在默认姿态中：启发式的答案里没有任何东西能把它们区分开（`docs/zh-CN/numerics.md`，第 4 节）；`heuristic="torch"` 给出与 `addmm` 相同的字节。
 * `algos=` 导入算法（`tilefish.AlgoTable(arch, sm_count, cublaslt_version, {(m, n, k, bias): config})`，config 是九个 `cublasLtMatmulAlgoConfig` 属性，或一个 pin 的 128 个十六进制数字）：在表所针对的设备上，每个条目 pin 住表中的算法，按 cuBLASLt 的方式编码，并接受同样的检查（针对该问题的 `cublasLtMatmulAlgoCheck`、workspace 上限、只有显式开启时才允许 bf16 部分和）；没有任何表针对的设备会被拒绝，绝不会交给启发式。
 
-manifest 条目把它们记录为 `heuristic`、`algo_source` 和 `allow_bf16_reduction`，只有不是默认值时才会出现（`docs/manifest-schema-3.md`，第 9 节）。pin 是启发式所选的配置，由库编码：启发式返回的 64 字节中可能带有不属于配置的字节，这些字节在不同进程间会变化。
+manifest 条目把它们记录为 `heuristic`、`algo_source` 和 `allow_bf16_reduction`，只有不是默认值时才会出现（`docs/zh-CN/manifest-schema-3.md`，第 9 节）。pin 是启发式所选的配置，由库编码：启发式返回的 64 字节中可能带有不属于配置的字节，这些字节在不同进程间会变化。
 
 **f16、f32 结果、`[K, N]` 形式的 `b`。** 操作数可以是 f16（两者同一类型），结果可以是 f32（bias 的类型与结果相同：实测 cuBLASLt 不接受别的类型），`layout="NN"` 接受 `b: Tensor[K, N, T]` 并计算 `a @ b`（默认的 `"TN"` 是 `b: Tensor[N, K, T]` 时的 `a @ b.T`）：
 
@@ -161,7 +161,7 @@ def up(a: Tensor[M, 7168, f16], b: Tensor[7168, 1536, f16], bias: Tensor[1536, f
 def down(a: Tensor[M, 3072, f16], b: Tensor[1024, 3072, f16]) -> Tensor[M, 1024, f32]: ...   # a @ b.T, rounded once to f32
 ```
 
-允许 split-K 以输出类型累加部分和的开关，按操作数类型命名，与 torch 的开关一样（f16 操作数用 `allow_f16_reduction`）。在 `heuristic="torch"` 下打开它，结果在两种布局下都与 f16 的 `torch.mm` / `torch.addmm` 逐字节一致（`test_gpu_gemm_f16.py`：63 种形状，每种三组操作数，在 B300 MIG 切片上用 cuBLASLt 12.8.4 实测）。布局 `NN` 的 `AlgoTable` 行以 `(m, n, k, bias, "NN")` 为键；配置按声明的类型编码。条目在 `dtypes`、`transa` 和 `lda` 中说明这种形式（`docs/manifest-schema-3.md`，第 9.2 节）。
+允许 split-K 以输出类型累加部分和的开关，按操作数类型命名，与 torch 的开关一样（f16 操作数用 `allow_f16_reduction`）。在 `heuristic="torch"` 下打开它，结果在两种布局下都与 f16 的 `torch.mm` / `torch.addmm` 逐字节一致（`test_gpu_gemm_f16.py`：63 种形状，每种三组操作数，在 B300 MIG 切片上用 cuBLASLt 12.8.4 实测）。布局 `NN` 的 `AlgoTable` 行以 `(m, n, k, bias, "NN")` 为键；配置按声明的类型编码。条目在 `dtypes`、`transa` 和 `lda` 中说明这种形式（`docs/zh-CN/manifest-schema-3.md`，第 9.2 节）。
 
 **以 `[K, M]` 存储的 `a`。** `layout="TT"` 接受 `a: Tensor[K, M, T]` 和 `b: Tensor[N, K, T]`，计算 `a.T @ b.T`；`layout="NT"` 接受同样的 `a` 和 `b: Tensor[K, N, T]`，计算 `a.T @ b`，上面每种操作数类型都适用：
 
@@ -170,7 +170,7 @@ def down(a: Tensor[M, 3072, f16], b: Tensor[1024, 3072, f16]) -> Tensor[M, 1024,
 def scores(a: Tensor[8, M, f32], b: Tensor[1024, 8, f32]) -> Tensor[M, 1024, f32]: ...   # torch.mm(a.t(), b.t()), TF32 off, byte for byte
 ```
 
-在 `heuristic="torch"` 下，对连续的 `a [K, M]`，pin 就是 torch 为 `torch.mm(a.t(), b.t())` / `torch.mm(a.t(), b)` 和 `torch.addmm` 运行的算法，在 bf16、f16 和 f32 下都逐字节一致（`test_gpu_gemm_layouts.py`，`M` 从 2 到 2048；在 `M = 1` 时，torch 把 `a [K, 1]` 当作它同时也是的连续 `[1, K]` 来乘，所以单行 GEMM 要声明为 `TN` 或 `NN`）。条目在 `transb` 和 `ldb` 中说明这一点（`docs/manifest-schema-3.md`，第 9.2 节）。
+在 `heuristic="torch"` 下，对连续的 `a [K, M]`，pin 就是 torch 为 `torch.mm(a.t(), b.t())` / `torch.mm(a.t(), b)` 和 `torch.addmm` 运行的算法，在 bf16、f16 和 f32 下都逐字节一致（`test_gpu_gemm_layouts.py`，`M` 从 2 到 2048；在 `M = 1` 时，torch 把 `a [K, 1]` 当作它同时也是的连续 `[1, K]` 来乘，所以单行 GEMM 要声明为 `TN` 或 `NN`）。条目在 `transb` 和 `ldb` 中说明这一点（`docs/zh-CN/manifest-schema-3.md`，第 9.2 节）。
 
 **f32，关闭 TF32。** f32 操作数的结果是 f32（bias 也是 f32），并按 f32 相乘：
 
@@ -179,9 +179,9 @@ def scores(a: Tensor[8, M, f32], b: Tensor[1024, 8, f32]) -> Tensor[M, 1024, f32
 def proj32(a: Tensor[M, 1024, f32], b: Tensor[3072, 1024, f32], bias: Tensor[3072, f32]) -> Tensor[M, 3072, f32]: ...   # torch.addmm(bias, a, b.t()), TF32 off
 ```
 
-计算类型是 `CUBLAS_COMPUTE_32F`，绝不是 `CUBLAS_COMPUTE_32F_FAST_TF32`（torch 的 `allow_tf32` 所选的类型），也不是 cuBLAS 13 的 bf16x9 模拟（`CUBLAS_COMPUTE_32F_EMULATED_16BFX9`）。两个 host 都拒绝不会把 f32 按 f32 相乘的 f32 算法：为另一种计算类型编码的算法（cuBLASLt 会把计算类型写进那 64 字节，而 TF32 和模拟算法的 id 根本无法在 `CUBLAS_COMPUTE_32F` 下编码），numerical-implementation 标志表明 TF32 或 16 位输入的算法，以及在 cuBLASLt 把 `CUBLAS_COMPUTE_32F` 按 TF32（`NVIDIA_TF32_OVERRIDE=1`）或按模拟（`CUBLAS_EMULATE_SINGLE_PRECISION=1`）运行的进程中的每个 f32 pin：实测，编码能体现这两者。允许 split-K 以输出类型累加部分和的开关是 `allow_f32_reduction`；torch 没有这样的开关，也从不限制 f32 GEMM 的归约，所以要得到 torch 的选择就需要打开它。在 `heuristic="torch"` 下打开它并使用 torch 的 workspace（`mm` 为 8 519 680 字节，即 `CUBLAS_WORKSPACE_CONFIG` 的值；`addmm` 为 1 MiB），结果在两种布局下都与关闭 TF32 的 f32 `torch.mm` / `torch.addmm` 逐字节一致（`test_gpu_gemm_f32.py`：756 次运行中 756 次一致，63 种形状、`M` 从 1 到 2048，三组操作数，`mm` 和 `addmm`，`TN` 和 `NN`，分别用默认 workspace 以及 `CUBLAS_WORKSPACE_CONFIG=:4096:8` 加 32 MiB 上限；在 B300 MIG 切片上用 cuBLASLt 12.8.4 和 13.1.0、在 RTX 5090 上用 13.1.0 实测）。torch 的 `mm` 运行 `cublasSgemm`，cuBLAS 为它选择的算法就是 cuBLASLt 启发式在该姿态下给出的答案。见 `docs/manifest-schema-3.md`，第 9.2 节。
+计算类型是 `CUBLAS_COMPUTE_32F`，绝不是 `CUBLAS_COMPUTE_32F_FAST_TF32`（torch 的 `allow_tf32` 所选的类型），也不是 cuBLAS 13 的 bf16x9 模拟（`CUBLAS_COMPUTE_32F_EMULATED_16BFX9`）。两个 host 都拒绝不会把 f32 按 f32 相乘的 f32 算法：为另一种计算类型编码的算法（cuBLASLt 会把计算类型写进那 64 字节，而 TF32 和模拟算法的 id 根本无法在 `CUBLAS_COMPUTE_32F` 下编码），numerical-implementation 标志表明 TF32 或 16 位输入的算法，以及在 cuBLASLt 把 `CUBLAS_COMPUTE_32F` 按 TF32（`NVIDIA_TF32_OVERRIDE=1`）或按模拟（`CUBLAS_EMULATE_SINGLE_PRECISION=1`）运行的进程中的每个 f32 pin：实测，编码能体现这两者。允许 split-K 以输出类型累加部分和的开关是 `allow_f32_reduction`；torch 没有这样的开关，也从不限制 f32 GEMM 的归约，所以要得到 torch 的选择就需要打开它。在 `heuristic="torch"` 下打开它并使用 torch 的 workspace（`mm` 为 8 519 680 字节，即 `CUBLAS_WORKSPACE_CONFIG` 的值；`addmm` 为 1 MiB），结果在两种布局下都与关闭 TF32 的 f32 `torch.mm` / `torch.addmm` 逐字节一致（`test_gpu_gemm_f32.py`：756 次运行中 756 次一致，63 种形状、`M` 从 1 到 2048，三组操作数，`mm` 和 `addmm`，`TN` 和 `NN`，分别用默认 workspace 以及 `CUBLAS_WORKSPACE_CONFIG=:4096:8` 加 32 MiB 上限；在 B300 MIG 切片上用 cuBLASLt 12.8.4 和 13.1.0、在 RTX 5090 上用 13.1.0 实测）。torch 的 `mm` 运行 `cublasSgemm`，cuBLAS 为它选择的算法就是 cuBLASLt 启发式在该姿态下给出的答案。见 `docs/zh-CN/manifest-schema-3.md`，第 9.2 节。
 
-**SM 分区。** 在 green context（设备 SM 的一个分区）上，每次 SM 数查询报告的仍是整个设备的数量，已 pin 的算法无论有无分区都计算出相同的字节（实测，cuBLASLt 12.8.4）；改变的是启发式的选择，它经由进程第一个 cuBLASLt 句柄的 context 起作用。`sm_count_target=P` pin 住启发式为 `P` 个 SM 所选的算法（`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`，每次检查和运行也都会设置它），在任何 context 中都一样；条目记录它，运行在 `P` 个 SM 的分区上的 Rust host 通过 `Manifest::with_sm_partition(Some(P))` 只接受为该分区选出的 pin（`docs/manifest-schema-3.md`，第 9.3 节）。
+**SM 分区。** 在 green context（设备 SM 的一个分区）上，每次 SM 数查询报告的仍是整个设备的数量，已 pin 的算法无论有无分区都计算出相同的字节（实测，cuBLASLt 12.8.4）；改变的是启发式的选择，它经由进程第一个 cuBLASLt 句柄的 context 起作用。`sm_count_target=P` pin 住启发式为 `P` 个 SM 所选的算法（`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`，每次检查和运行也都会设置它），在任何 context 中都一样；条目记录它，运行在 `P` 个 SM 的分区上的 Rust host 通过 `Manifest::with_sm_partition(Some(P))` 只接受为该分区选出的 pin（`docs/zh-CN/manifest-schema-3.md`，第 9.3 节）。
 
 **带 cuBLASLt epilogue 的 GEMM。** `impl="cublaslt.matmul"`（RFC 0003，里程碑 E2）在那一次舍入之前，对 f32 累加器执行 bias、ReLU 和残差加（`beta * C`），所用算法是为该 epilogue pin 住的：
 
@@ -191,7 +191,7 @@ def proj32(a: Tensor[M, 1024, f32], b: Tensor[3072, 1024, f32], bias: Tensor[307
 def up(a: Tensor[M, H, bf16], b: Tensor[F, H, bf16], bias: Tensor[F, bf16], c: Tensor[M, F, bf16]) -> Tensor[M, F, bf16]: ...
 ```
 
-`epilogue` 取 `"none"`、`"bias"`、`"relu"` 或 `"relu_bias"`（cuBLASLt 的 `DEFAULT`、`BIAS`、`RELU`、`RELU_BIAS`），`beta=1` 加上 `c [M, N]`；操作数是 bf16 或 f16，结果与操作数同类型，四种布局都可用，`heuristic`、`workspace_bytes`、各个开关和 `sm_count_target` 与上文相同（尚不接受 `algos=`）。在 pin 之下，字节由库决定，所以**每个 pin 在生成时都会被验证**（`jit` 和 `export`）：在两组带种子的操作数上运行，bias 和 `c` 中含特殊值，`a` 中的某些行会让累加器出现 NaN、零、无穷和溢出，然后与在 pin 自己的累加器（其配置以 f32 结果重新编码）上用 f32 计算公式、再舍入一次的结果逐位比较。条目记录 `"measured-exact"` 或 `"binary-defined"`，以及不同元素的个数和它们的最大距离；`contract="measured-exact"` 会拒绝不是 measured-exact 的 pin。在 B300 MIG 切片上实测（14 种形状，bf16 和 f16，两种姿态，七种情形：每个版本 392 个 pin，`test_gpu_matmul.py`）：用 cuBLASLt 12.8.4 时每个 pin 都是 measured-exact；用 13.1.0 时有 372 个是，其余 20 个都是 32 x 1024 x 3072 上的算法 21，它把 bias 加到 `c` 上的方式不符合任何一种顺序（26% 的元素不同），而且它的 ReLU 对 NaN 给出 `0`，而其他算法会保留 NaN。与 bias 一样，没有显式开启时，epilogue 不使用 split-K。`export` 记录一个 canary（哨兵值，`canary=True`，默认）：在设备上由种子生成的操作数上运行该 pin，记录其结果的 digest；回放（Python）和加载（Rust 和 C++ host）在使用该 pin 之前都会运行它，digest 不同就拒绝：这样同一 cuBLASLt 版本的两个不同构建也能区分开。见 `docs/manifest-schema-3.md`，第 9.5 节。
+`epilogue` 取 `"none"`、`"bias"`、`"relu"` 或 `"relu_bias"`（cuBLASLt 的 `DEFAULT`、`BIAS`、`RELU`、`RELU_BIAS`），`beta=1` 加上 `c [M, N]`；操作数是 bf16 或 f16，结果与操作数同类型，四种布局都可用，`heuristic`、`workspace_bytes`、各个开关和 `sm_count_target` 与上文相同（尚不接受 `algos=`）。在 pin 之下，字节由库决定，所以**每个 pin 在生成时都会被验证**（`jit` 和 `export`）：在两组带种子的操作数上运行，bias 和 `c` 中含特殊值，`a` 中的某些行会让累加器出现 NaN、零、无穷和溢出，然后与在 pin 自己的累加器（其配置以 f32 结果重新编码）上用 f32 计算公式、再舍入一次的结果逐位比较。条目记录 `"measured-exact"` 或 `"binary-defined"`，以及不同元素的个数和它们的最大距离；`contract="measured-exact"` 会拒绝不是 measured-exact 的 pin。在 B300 MIG 切片上实测（14 种形状，bf16 和 f16，两种姿态，七种情形：每个版本 392 个 pin，`test_gpu_matmul.py`）：用 cuBLASLt 12.8.4 时每个 pin 都是 measured-exact；用 13.1.0 时有 372 个是，其余 20 个都是 32 x 1024 x 3072 上的算法 21，它把 bias 加到 `c` 上的方式不符合任何一种顺序（26% 的元素不同），而且它的 ReLU 对 NaN 给出 `0`，而其他算法会保留 NaN。与 bias 一样，没有显式开启时，epilogue 不使用 split-K。`export` 记录一个 canary（哨兵值，`canary=True`，默认）：在设备上由种子生成的操作数上运行该 pin，记录其结果的 digest；回放（Python）和加载（Rust 和 C++ host）在使用该 pin 之前都会运行它，digest 不同就拒绝：这样同一 cuBLASLt 版本的两个不同构建也能区分开。见 `docs/zh-CN/manifest-schema-3.md`，第 9.5 节。
 
 **已 pin 的 cuDNN 卷积。** `impl="cudnn.conv_fwd"` 按签名声明一个前向卷积：`(x, w) -> y`，维度顺序由 `layout` 决定（默认 `"NCHW"`：`x [N, C, *S]`、`w [K, C/G, *R]`；`"NHWC"`：`x [N, *S, C]`、`w [K, *R, C/G]`），有一到三个空间轴，f16、bf16 或 f32 数据，f32 累加器和一次舍入，并为每个 bucket pin 住 cuDNN 运行的东西：
 
@@ -209,9 +209,9 @@ def down(x: Tensor[1, T, 64, f16], w: Tensor[128, 4, 64, f16]) -> Tensor[1, tile
 
 声明的结果在每个 bucket 上都必须是卷积的输出（`(S + 2 * padding - dilation * (R - 1) - 1) // stride + 1`；这里就是 `cdiv(T, 2)`）。math 是声明的一部分：`"tensor_op"`（16 位数据的默认值）或 `"fma"`；对 f32 数据则是 `"fma"`（关闭 TF32）或 `"tf32"`，需显式写明。`api="backend"` pin 住一个 engine 配置（engine 的全局索引和每个 knob 的选择：它指定了一个 kernel），在 `heuristic="instant"` 下选出，即 torch 2.9 在 `deterministic = True` 和 `benchmark = False` 时的姿态（`CUDNN_HEUR_MODE_INSTANT`，然后是 fallback 列表，按确定性、无降精度转换以及对 `"fma"` 不用 tensor core 过滤），或在 `"mode_b"` 下选出；`api="legacy"` pin 住算法枚举值。`algos=tilefish.CudnnTable(arch, sm_count, cudnn_version, {(n, c, k, input, filter, stride, padding, dilation, groups): pin})` 则导入 pin。条目记录问题、math、pin、它是如何选出的、cuDNN 版本（`cudnnGetVersion()`）、SM 数和一个 `sm_count_target`；`replay` 和 Rust host 拒绝其他 cuDNN 版本、其他 SM 数，以及设置了 `NVIDIA_TF32_OVERRIDE` 的进程（它会在声明的 math 背后改变 cuDNN 的选择），并审核 pin（是 `cudnnGetConvolutionForwardAlgorithm_v7` 的一个确定性答案；是 note 都被允许、knob 都在范围内且其执行计划可以 finalize 的 engine）。由于同一 cuDNN 版本的两个构建对 `cudnnGetVersion()` 给出相同的答案，`export` 还为每个条目记录一个 canary：pin 在由种子生成的操作数上的输出的 digest（在两个 host 中，两者都由同一个 PTX 模块在设备上生成：一个含 743 个条目的 plan set（plan 集）加载耗时 1 到 2 s），`replay` 和 Rust host 会再运行一次（一次，在它们自己的 stream 上，绝不是 NULL stream），digest 不同就拒绝；没有 canary 的条目照旧加载。导入的 pin 中值为 -1 的 knob 是 cuDNN 的“未设置”，会被略去。每次调用都会把 cuDNN 的 stream 设为传给它的那个 stream。没有 bias（torch 的 cuDNN 卷积用单独的 `add_` 加 bias，tilefish 的 kernel 也是这样做的）。
 
-在 torch 运行 cuDNN 的情况下，`"instant"` pin 给出 `torch.nn.functional.conv1d` / `conv2d` / `conv3d` 的字节（`test_gpu_conv.py`：15 个问题，三组操作数，1-D、2-D 和 3-D，f16、bf16 和关闭 TF32 的 f32，各种 stride、dilation 和 group；B300 MIG 切片上用 cuDNN 9.10.2 和 9.13.0，RTX 5090 上用 9.13.0），而 `IMPLICIT_PRECOMP_GEMM` 的 legacy pin 给出 torch legacy 路径的字节。两种 API 都能在 launch plan（启动计划）中运行（workspace 来自 arena（内存池）），也都能被 capture 进 CUDA graph；绑定是通过 ctypes 调用进程已有的 `libcudnn`（torch 的那个），Rust crate 只在 manifest 含有卷积时才加载 cuDNN（`Manifest::conv`、`Conv`）。见 `docs/manifest-schema-3.md`，第 9.4 节。
+在 torch 运行 cuDNN 的情况下，`"instant"` pin 给出 `torch.nn.functional.conv1d` / `conv2d` / `conv3d` 的字节（`test_gpu_conv.py`：15 个问题，三组操作数，1-D、2-D 和 3-D，f16、bf16 和关闭 TF32 的 f32，各种 stride、dilation 和 group；B300 MIG 切片上用 cuDNN 9.10.2 和 9.13.0，RTX 5090 上用 9.13.0），而 `IMPLICIT_PRECOMP_GEMM` 的 legacy pin 给出 torch legacy 路径的字节。两种 API 都能在 launch plan（启动计划）中运行（workspace 来自 arena（内存池）），也都能被 capture 进 CUDA graph；绑定是通过 ctypes 调用进程已有的 `libcudnn`（torch 的那个），Rust crate 只在 manifest 含有卷积时才加载 cuDNN（`Manifest::conv`、`Conv`）。见 `docs/zh-CN/manifest-schema-3.md`，第 9.4 节。
 
-**CuTe DSL kernel。** CUTLASS 的 CuTe DSL（`nvidia-cutlass-dsl`：用 Python 写 TMA、`tcgen05`、cluster、持久化 tile 调度器）的 kernel 也是 extern，由 DSL 编译，每个 host 都把它当作预构建 cubin，按编译出的 host 函数所做的那种启动方式来启动（`docs/cute.md`）：
+**CuTe DSL kernel。** CUTLASS 的 CuTe DSL（`nvidia-cutlass-dsl`：用 Python 写 TMA、`tcgen05`、cluster、持久化 tile 调度器）的 kernel 也是 extern，由 DSL 编译，每个 host 都把它当作预构建 cubin，按编译出的 host 函数所做的那种启动方式来启动（`docs/zh-CN/cute.md`）：
 
 ```python
 @tilefish.extern(cute=PersistentDenseGemmKernel(cutlass.Float32, True, (256, 128), (2, 1), True),   # a CUTLASS example's kernel class
@@ -219,4 +219,4 @@ def down(x: Tensor[1, T, 64, f16], w: Tensor[128, 4, 64, f16]) -> Tensor[1, tile
 def gemm(a: Tensor[M, 1024, f16], b: Tensor[2048, 1024, f16], c: Out[Tensor[M, 2048, f16]]): ...   # static shapes: one binary per bucket of M
 ```
 
-构建为设备编译它（DSL 自己的 cubin 和 PTX），并在一个被 capture 进 CUDA graph 的 stream 上调用编译出的 host 函数，因此 kernel 并不真正运行：由此得到的是 grid、block、cluster 和动态共享内存，以及每个 kernel 参数，参数必须是张量的指针、DSL 编码的 TMA 描述符（host 把张量地址写进去的模板）或常量字节，并通过在其他地址上的三次 capture 来检查。条目是 source 为 `cute` 的 `binary` 条目（schema 第 4.9 节），像其他条目一样被 pin；它的身份是 PTX，Python 回放时会重新编译它。在一块 sm_103 GPU 的 30-SM 分区上，示例中的持久化 tcgen05 GEMM 写出的字节与已 pin 的 cuBLASLt GEMM 相同，在 `4096 x 2048 x 1024` 时速度是它的 1.17 倍（`M = 1024` 时为 0.92 倍）。请自行安装经过测试的 DSL 版本并固定它（`nvidia-cutlass-dsl==4.8.1`：它处于 beta 阶段，换一个版本就是另一个声明）。它是 NVIDIA 的软件，有自己的许可证，tilefish 既不随附它也不依赖它；导出写出的 cubin 和 PTX 是它的输出：分发它们是你的责任（`docs/cute.md`，第 6 节）。
+构建为设备编译它（DSL 自己的 cubin 和 PTX），并在一个被 capture 进 CUDA graph 的 stream 上调用编译出的 host 函数，因此 kernel 并不真正运行：由此得到的是 grid、block、cluster 和动态共享内存，以及每个 kernel 参数，参数必须是张量的指针、DSL 编码的 TMA 描述符（host 把张量地址写进去的模板）或常量字节，并通过在其他地址上的三次 capture 来检查。条目是 source 为 `cute` 的 `binary` 条目（schema 第 4.9 节），像其他条目一样被 pin；它的身份是 PTX，Python 回放时会重新编译它。在一块 sm_103 GPU 的 30-SM 分区上，示例中的持久化 tcgen05 GEMM 写出的字节与已 pin 的 cuBLASLt GEMM 相同，在 `4096 x 2048 x 1024` 时速度是它的 1.17 倍（`M = 1024` 时为 0.92 倍）。请自行安装经过测试的 DSL 版本并固定它（`nvidia-cutlass-dsl==4.8.1`：它处于 beta 阶段，换一个版本就是另一个声明）。它是 NVIDIA 的软件，有自己的许可证，tilefish 既不随附它也不依赖它；导出写出的 cubin 和 PTX 是它的输出：分发它们是你的责任（`docs/zh-CN/cute.md`，第 6 节）。

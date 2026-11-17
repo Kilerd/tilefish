@@ -450,7 +450,7 @@ Notes (the facts behind the table):
     ``x`` put back with ``copysign``; nvcc's one branch is a select), every ``add`` and ``mul`` ``.rn``. Measured over every one of the ``2**32`` f32
     bit patterns (``tests/test_gpu_primitives.py``, sm_103): the bits of CUDA 12.8's ``erff`` (NVRTC, and torch's ``erf`` built with CUDA 12.8),
     of 12.9's, 13.0's and 13.1's, which are the same function; CUDA 13.2 changed ``erff`` (other coefficients and threshold), which differs on
-    353 987 744 inputs by one ULP. The CUDA math guard records this (``docs/numerics.md``). ``gelu`` keeps libdevice's ``erf`` in both maths (its
+    353 987 744 inputs by one ULP. The CUDA math guard records this (``docs/en/numerics.md``). ``gelu`` keeps libdevice's ``erf`` in both maths (its
     bits are part of its contract); CUDA's exact gelu in IEEE math is written with ``tilefish.erf``. The ``reference`` mode is ``torch.erf``:
     byte-identical in IEEE math where torch is built with CUDA 12.8 to 13.1, within ``2**-22`` in the default math (asserted on normal data).
 16. **One-instruction primitives**, each a module-level helper of one inline PTX instruction, in either math and whatever ``fp_fusion`` says
@@ -529,7 +529,7 @@ Notes (the facts behind the table):
     axis, of a computed value or of a parameter the kernel writes, an element of a rank-1 parameter (a ``DevScalar`` is that), an offset that is a
     product of two dynamic sizes; so is a returned slice (``view-value``: return ``x[k] + 0``), and the elementwise template takes none
     (``elementwise.slice``). The ``reference`` mode is torch's ``select``: a raw read, byte-identical (``tests/test_gpu_slices.py``).
-20. **Fused regions** (``docs/rfcs/0001-plan-fusion.md``, :mod:`tilefish._fusion`). The arithmetic written in a ``@tilefish.graph`` body is
+20. **Fused regions** (``docs/en/rfcs/0001-plan-fusion.md``, :mod:`tilefish._fusion`). The arithmetic written in a ``@tilefish.graph`` body is
     planned as regions, each a kernel lowered here with ``fp_fusion=False`` and ``context_free=True``, so that a region is byte for byte the
     composition of one kernel per op (the unfused composition). Its code is the code of every kernel with ``fp_fusion=False`` (note 2), whose bits
     do not depend on the ops around them:
@@ -588,7 +588,7 @@ Notes (the facts behind the table):
     has no run of more than ``log2(D)`` equal bits, so the double is never on a midpoint of f32), as the ``reference`` mode computes it. Not
     ``rcp.rn.f32(D)``: ptxas expands that next to the multiply into fused multiply-adds, which the contraction check refuses.
 
-22. **Epilogue hooks** (``docs/rfcs/0003-epilogue-fusion.md``, :func:`lower_hook`, :mod:`tilefish._epilogue`). A region fused into an extern's
+22. **Epilogue hooks** (``docs/en/rfcs/0003-epilogue-fusion.md``, :func:`lower_hook`, :mod:`tilefish._epilogue`). A region fused into an extern's
     epilogue hook is lowered to a ``@triton.jit`` function ``hook(tile, rows, cols, row_mask, col_mask, args)`` that the extern's kernel calls on each
     tile of its output where it would store it; the region's other inputs, its side outputs and the sizes it needs are ``args``. The code of every op
     is the region's (note 20: context-free, no contraction, every narrowing cast inline PTX): only how an operand is addressed differs.
@@ -616,7 +616,7 @@ warp count. ``num_warps`` is part of every kernel's identity all the same: recor
 spec, the manifest entry (a replay refuses an entry whose ``num_warps`` is not the spec's) and the manifest digest. A binary of another warp
 count is other machine code, and one rule for every kernel is checked mechanically where a per-kernel argument would not be. For a kernel with a
 Triton reduction it is also its numerics: the same kernel with another warp count differs in the last bits, like a changed reduction order or
-accumulator dtype (a numerics-changing rewrite, ``docs/guide/rewrites.md``). Pin it (``@tilefish.kernel(num_warps=N)``) where bytes must not move when a
+accumulator dtype (a numerics-changing rewrite, ``docs/en/guide/rewrites.md``). Pin it (``@tilefish.kernel(num_warps=N)``) where bytes must not move when a
 size is added to a bucketed dimension, and treat a change of it, or of the rule that picks it (``clamp(BLOCK_D // 256, 1, 16)``), as a change of
 the numerics contract; or give every reduction an ``order``, and the warp count is a choice of speed only.
 
@@ -2096,7 +2096,7 @@ class _ElementwiseLayout(_Layout):
 
 class _HookLayout(_ElementwiseLayout):
     """Note 22: the elementwise template on the tile an extern's kernel holds where it would store it (an epilogue hook,
-    ``docs/rfcs/0003-epilogue-fusion.md``). The kernel's shape is the extern's output (or one chunk of it): the hook's ``rows`` index its leading axes
+    ``docs/en/rfcs/0003-epilogue-fusion.md``). The kernel's shape is the extern's output (or one chunk of it): the hook's ``rows`` index its leading axes
     flattened, ``cols`` its last axis, so the element a lane holds is ``offs = rows[:, None] * L + cols[None, :]``, the lane of the elementwise template
     (note 12) with every operand addressed as there. The tiles (``tiles``: a parameter of the region's kernel -> the expression of the hook that holds
     it) are never loaded. No gathers, scatters or static slices."""
@@ -2522,7 +2522,7 @@ class _Body:
         self.made_for.append(self.current)
 
     def probes_before(self, position: int) -> None:
-        """The probes of the body written after ``position`` nodes (``tilefish.probe``: nothing in a production build, docs/instrument.md)."""
+        """The probes of the body written after ``position`` nodes (``tilefish.probe``: nothing in a production build, docs/en/instrument.md)."""
         for name, loc in self.probe_at.get(position, ()):
             self.current = _ProbeMark(name, loc)
             self.emit(f'{_PROBE}("{name}")', "probe" + (f" ({loc[0]}:{loc[1]})" if loc else ""))
@@ -3420,7 +3420,7 @@ def _assemble(
             else []
         ),
         *[f"parameter '{old}' of the kernel is '{new}' here (the name is used by this module)" for old, new in rename.items()],
-        *(
+        *(  # docs/instrument.md: the page's path of 0.0.13 (now docs/en/), kept because the header is in the source digest
             [f"probes: {', '.join(dict.fromkeys(name for name, _, _ in probes))} (tilefish.probe: nothing in a production build, docs/instrument.md)"]
             if probes
             else []

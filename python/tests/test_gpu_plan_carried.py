@@ -1,4 +1,4 @@
-"""Carried buffers on a real GPU (``@tilefish.graph(carried=("h",))``, ``docs/plan-schema-1.md`` section 15.2).
+"""Carried buffers on a real GPU (``@tilefish.graph(carried=("h",))``, ``docs/en/plan-schema-1.md`` section 15.2).
 
 The stages of ``gpu_kernels_plans`` hand ``h`` to each other through the arena they share, with no tensor of the caller's: ``stage_a`` writes it
 (``3x``), ``stage_b`` reads it (``h + 1``; it is given nothing), ``stage_update`` adds to it in place, ``stage_zero`` zeroes it (a memset of the carried

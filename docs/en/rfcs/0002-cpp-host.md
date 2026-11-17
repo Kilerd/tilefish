@@ -1,6 +1,6 @@
 # RFC 0002: a C++ host
 
-**English** | [简体中文](../zh-CN/rfcs/0002-cpp-host.md)
+**English** | [简体中文](../../zh-CN/rfcs/0002-cpp-host.md)
 
 Status: accepted and implemented, 2026-11-15 (the defaults of section 12 were accepted). It addresses the open item "C++ host: a header generated
 from the same manifest and plan" (carried over from issue #3 into issue #4). The sections below describe what was built; where the implementation

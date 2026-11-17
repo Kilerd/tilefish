@@ -1,4 +1,4 @@
-//! The CUDA math functions of a generated kernel (`cuda_math`, `docs/manifest-schema-3.md` section 4.7), read and checked with no GPU on
+//! The CUDA math functions of a generated kernel (`cuda_math`, `docs/en/manifest-schema-3.md` section 4.7), read and checked with no GPU on
 //! synthetic manifests (`common::synthetic`): the reader takes the field on a generated kernel's entry and refuses a malformed one or one on
 //! another entry, it is in the manifest digest, and `Manifest::check_cuda_math` refuses a release the functions were not measured on
 //! (`python/tests/test_cudamath.py` has the same refusals).

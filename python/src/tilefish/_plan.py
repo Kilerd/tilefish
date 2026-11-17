@@ -14,13 +14,13 @@ dimensions,
   the order of the IR (an in-place call keeps the storage of the version it consumes), and with ``reuse=True`` two intermediates share bytes only
   where no step uses both: their live ranges, from the first step that touches a buffer to the last, do not intersect.
 
-The plan is a document (``plan.json``, schema ``tilefish.plan.v1``, specified in ``docs/plan-schema-1.md``) with a digest that includes the digest
+The plan is a document (``plan.json``, schema ``tilefish.plan.v1``, specified in ``docs/en/plan-schema-1.md``) with a digest that includes the digest
 of the manifest it was built against, so a pin of the plan digest pins every binary it launches. This module is pure Python: it needs no torch, no
 Triton and no GPU. :mod:`tilefish._planrun` runs a plan.
 
 What a plan accepts. A graph body is calls to declared operators (``kernel``, ``extern``, ``library`` with an ``impl``), views and traced
 arithmetic (``x + y``, a cast, a comparison, a reduction): the arithmetic is grouped into fused regions, each a launch of a kernel tilefish
-generates, byte for byte the unfused composition of its ops (:mod:`tilefish._fusion`, ``docs/rfcs/0001-plan-fusion.md``). A call to another
+generates, byte for byte the unfused composition of its ops (:mod:`tilefish._fusion`, ``docs/en/rfcs/0001-plan-fusion.md``). A call to another
 ``graph``, a ``Dim`` parameter and an ``Out`` parameter are refused with the rule that says so (a graph's results are its returned values); ``tilefish.copy``
 and a ``store`` into an ``InOut`` parameter are copy steps (a device-to-device copy of dense bytes), ``tilefish.zeros_like`` a memset step, and a parameter
 declared ``carried=`` a buffer of role ``carried`` that the arena holds between executions (section 15.2 of the plan schema). An in-place
@@ -389,7 +389,7 @@ def _store_in_place(
 def _walk(gop: GraphOp) -> _Walk:
     from ._fusion import planned_graph
 
-    g = planned_graph(gop)  # the arithmetic of the body as fused regions, each a call of a generated kernel (docs/rfcs/0001-plan-fusion.md)
+    g = planned_graph(gop)  # the arithmetic of the body as fused regions, each a call of a generated kernel (docs/en/rfcs/0001-plan-fusion.md)
     name = g.name
     sig = gop.signature
     buffers: "list[_Buffer]" = []
@@ -968,7 +968,7 @@ def plan_arena(items: "Sequence[ArenaItem]", reuse: bool) -> "tuple[dict[str, in
 
 @dataclass(frozen=True)
 class CarriedLayout:
-    """Where the carried buffers of the plans of one arena are (``docs/plan-schema-1.md``, section 15.2): after the plans' own regions.
+    """Where the carried buffers of the plans of one arena are (``docs/en/plan-schema-1.md``, section 15.2): after the plans' own regions.
 
     ``base`` is the largest ``arena_bytes`` of the plans (each plan's buffers keep their offsets from the arena's first byte, below it); every carried
     name of any of the plans has one region from there, in code point order of the names, each ``align_up(bytes)`` long, where ``bytes`` is the largest
@@ -1501,7 +1501,7 @@ def _keys(obj: Any, where: str, keys: "Sequence[str]", optional: "Sequence[str]"
 
 
 def validate_doc(doc: Any, *, made: bool = False) -> None:
-    """Strict reading of a plan document, with the rules of ``docs/plan-schema-1.md`` (raises :class:`~tilefish.errors.TilefishManifestError`).
+    """Strict reading of a plan document, with the rules of ``docs/en/plan-schema-1.md`` (raises :class:`~tilefish.errors.TilefishManifestError`).
 
     Structure and types of every field; the buffers (names, roles, dtypes, shapes over the dimensions, the arena offsets: aligned, inside the arena,
     and overlapping only where ``reuse`` allows it and the buffers' live ranges are disjoint); the buckets (exactly the combinations of ``dims``, in
@@ -1868,7 +1868,7 @@ def load_plan(
     its digest must be the ``manifest_digest`` the plan names; every step must be what the manifest's entries say (:func:`check_against_manifest`);
     and the document must be exactly the plan this process derives from ``graph`` for the same buckets (:meth:`Plan.stale_reason`): a graph that
     changed since the export is refused, as a kernel that changed is. Raises :class:`~tilefish.errors.TilefishManifestError` (a
-    :class:`~tilefish.errors.TilefishRuntimeError`). The plan of an instrumented export (``docs/instrument.md``) is refused unless ``instrumented=True``.
+    :class:`~tilefish.errors.TilefishRuntimeError`). The plan of an instrumented export (``docs/en/instrument.md``) is refused unless ``instrumented=True``.
 
     ``manifest`` is the manifest of the directory as the caller already loaded and verified it (``Manifest.load``, every cubin checked): the plans of a
     set share it instead of each loading every binary again (an export of a set of many plans reads the set back plan by plan). It is held to the same
@@ -1907,7 +1907,7 @@ def load_plan(
         )
     elif manifest.instrumented and not instrumented:
         raise TilefishManifestError(
-            f"the manifest in {str(directory)!r} is an instrumented export (docs/instrument.md): its plans are loaded with instrumented=True"
+            f"the manifest in {str(directory)!r} is an instrumented export (docs/en/instrument.md): its plans are loaded with instrumented=True"
         )
     check_against_manifest(doc, manifest)
     try:

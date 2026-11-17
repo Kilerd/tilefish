@@ -227,7 +227,7 @@ class LibraryOp(Op):
         self.sm_count_target = sm_count_target
         self.allow_f32_reduction = allow_f32_reduction
         self.conv = conv  # tilefish._conv.ConvOptions of a cudnn.conv_fwd, else None
-        # of a cublaslt.matmul (tilefish._library, docs/manifest-schema-3.md section 9.5): its epilogue, beta (1: it reads c), whether export records a
+        # of a cublaslt.matmul (tilefish._library, docs/en/manifest-schema-3.md section 9.5): its epilogue, beta (1: it reads c), whether export records a
         # canary, and the contract its pins must have ("measured-exact", or None: either is recorded)
         self.epilogue = epilogue
         self.beta = beta
@@ -287,9 +287,9 @@ def library(
       heuristic, on the devices they are for;
     * ``sm_count_target``: the SM count the heuristic chooses for (``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET``, at least 8 and at most the
       device's), for a GEMM that runs on a partition of the device's SMs (a green context); every check and run of the pin sets it too
-      (``docs/manifest-schema-3.md``, section 9.3).
+      (``docs/en/manifest-schema-3.md``, section 9.3).
 
-    ``impl="cublaslt.matmul"`` is a GEMM with a cuBLASLt epilogue (RFC 0003, E2; ``docs/manifest-schema-3.md``, section 9.5): ``epilogue=`` one of
+    ``impl="cublaslt.matmul"`` is a GEMM with a cuBLASLt epilogue (RFC 0003, E2; ``docs/en/manifest-schema-3.md``, section 9.5): ``epilogue=`` one of
     ``"none"``, ``"bias"``, ``"relu"``, ``"relu_bias"``, and ``beta=1`` to add ``c``. The signature is ``(a, b[, bias: Tensor[N, T]][, c: Tensor[M,
     N, T]]) -> Tensor[M, N, T]`` with ``T`` bf16 or f16 (the layouts above), and the result is ``epilogue(acc [+ c] [+ bias])`` on the f32
     accumulator, in that order, rounded once to ``T``: the library's bytes under the pin (contract (iii)). Every pin is verified at the build
@@ -298,7 +298,7 @@ def library(
     ``export`` record a canary, which a load runs. ``heuristic``, ``workspace_bytes``, the opt-ins, ``layout`` and ``sm_count_target`` are as for
     ``gemm``; ``algos`` is not taken yet.
 
-    ``impl="cudnn.conv_fwd"`` says a pinned cuDNN forward convolution runs it (:mod:`tilefish._conv`, ``docs/manifest-schema-3.md``, section 9.4): the
+    ``impl="cudnn.conv_fwd"`` says a pinned cuDNN forward convolution runs it (:mod:`tilefish._conv`, ``docs/en/manifest-schema-3.md``, section 9.4): the
     signature is ``(x, w) -> y`` in the order of ``layout`` (``"NCHW"``, the default: ``x [N, C, *S]``, ``w [K, C/G, *R]``; ``"NHWC"``: ``x [N, *S, C]``,
     ``w [K, *R, C/G]``) with 1 to 3 spatial axes, one type ``f16``, ``bf16`` or ``f32``, and the convolution is ``stride``, ``padding`` (symmetric,
     zeros), ``dilation`` (an int, or one per spatial axis) and ``groups``; ``math`` is ``"tensor_op"`` (the default of 16-bit data) or ``"fma"``, and
@@ -405,7 +405,7 @@ class GraphOp(Op):
 
     ``carried`` are the tensor parameters (``In`` or ``InOut``) whose tensor the plan's arena holds instead of the caller
     (``@tilefish.graph(carried=("h",))``): a run takes the other parameters, and the arena keeps the carried buffer between executions, so one plan
-    of a shared arena hands it to the next (``docs/plan-schema-1.md``, section 15.2).
+    of a shared arena hands it to the next (``docs/en/plan-schema-1.md``, section 15.2).
 
     ``fusion`` is how the arithmetic traced in the body is planned (``@tilefish.graph(fusion=tilefish.fusion(...))``, :mod:`tilefish._fusion`), or
     ``None``: the default, :func:`tilefish.fusion` with no arguments (exact, ``version=2``)."""
@@ -673,7 +673,7 @@ def graph(
     """``@tilefish.graph``: trace and type-check a model body.
 
     ``outputs=("y", "residual")`` names the returned values, in order: a launch plan gives their buffers those names (instead of ``out0``,
-    ``out1``, ...), so that a host without Python binds them by name (``docs/plan-schema-1.md``, section 6).
+    ``out1``, ...), so that a host without Python binds them by name (``docs/en/plan-schema-1.md``, section 6).
 
     ``inputs=("x",)`` and/or ``weights=("w1", "w2")`` declare which read-only tensor parameters a call gives every time (the inputs) and which a
     host binds once, when it loads the model (the weights). One list makes the rest of those parameters the other role; two must name every one
@@ -684,11 +684,11 @@ def graph(
     ``carried=("h",)`` names tensor parameters (``In`` or ``InOut``) whose tensor the plan's **arena** holds, not the caller: a run takes the other
     parameters, a plan that writes ``h`` leaves it in the arena, and a later execution on the same arena (of this plan, or of another plan of a
     shared arena that names ``h`` too) reads it there: stage A hands an intermediate to stage B without a tensor of the caller's
-    (``docs/plan-schema-1.md``, section 15.2). ``reference`` mode, which has no arena, takes it as an argument like any other.
+    (``docs/en/plan-schema-1.md``, section 15.2). ``reference`` mode, which has no arena, takes it as an argument like any other.
 
     ``fusion=tilefish.fusion(...)`` says how the arithmetic written in the body (``x * scale + bias``, casts, comparisons, math functions,
     reductions) is planned: grouped into regions, each a kernel tilefish generates, byte for byte the composition of one kernel per op
-    (``docs/rfcs/0001-plan-fusion.md``; :mod:`tilefish._fusion`). Without it the default applies, ``tilefish.fusion()``."""
+    (``docs/en/rfcs/0001-plan-fusion.md``; :mod:`tilefish._fusion`). Without it the default applies, ``tilefish.fusion()``."""
     _check_decorator_arg("graph", fn)
     if fn is None:
         return lambda f: _declare_graph(f, name, outputs, inputs, weights, carried, fusion)
@@ -2013,7 +2013,7 @@ def extern(
     options of the DSL (``"--opt-level 3"``). The build compiles it with the DSL for the device it runs on (its cubin and its PTX), and takes the launch
     from the compiled host function without running the kernel (a captured CUDA graph): the grid, block, cluster and dynamic shared memory, and every
     kernel parameter, a tensor's pointer, a TMA descriptor of a tensor (the DSL encodes it on the host) or constant bytes (:mod:`tilefish._cute`,
-    ``docs/cute.md``). The declaration digest has the version of the DSL and the sha256 of the file of the host function; the entry's
+    ``docs/en/cute.md``). The declaration digest has the version of the DSL and the sha256 of the file of the host function; the entry's
     ``source_digest`` is the PTX's. ``sass=``, ``index_bits=``, ``reference=`` and ``name=`` are as for any extern; a grid, a block, shared memory, a
     cluster and compile options of Triton are the compiled kernel's, so not arguments. ``tilefish.impl(cute=...)`` is one implementation of an op
     declared with ``by_arch=`` (the GEMM of sm_100 and sm_103 is not the one of sm_120).
@@ -2102,7 +2102,7 @@ def extern(
       binary (:func:`tilefish.sass`; ``by_arch=`` inside it per architecture), checked at every build and cache hit, a violation refused with the
       instructions and source lines; in the declaration digest. With ``by_arch=`` they hold for every implementation.
 
-    **An epilogue hook** (``docs/rfcs/0003-epilogue-fusion.md``, :mod:`tilefish._epilogue`): ``epilogue=tilefish.hook("EPILOGUE", value="out", out="c")``
+    **An epilogue hook** (``docs/en/rfcs/0003-epilogue-fusion.md``, :mod:`tilefish._epilogue`): ``epilogue=tilefish.hook("EPILOGUE", value="out", out="c")``
     says that the kernel takes a jit function ``EPILOGUE`` (a ``tl.constexpr``) and its arguments ``EPILOGUE_ARGS``, which the stub does not list, and
     calls it on each tile of ``c`` where it would store it (``tilefish._epilogue.ABI``). A graph that calls the extern then fuses the arithmetic its
     body does to ``c`` into the kernel (one step instead of two), exactly (``value="out"``), or on the accumulator under

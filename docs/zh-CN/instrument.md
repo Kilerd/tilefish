@@ -1,8 +1,8 @@
 # kernel 内插桩：probe、插桩变体、时间线
 
-[English](../instrument.md) | **简体中文**
+[English](../en/instrument.md) | **简体中文**
 
-采样式 profiler 会把异步 `wgmma` 或 `tcgen05` MMA 的时间算到等待它的指令上；而对于外部的计时器，一个 warp（线程束）特化或持久化的 kernel（核函数）只是一次很长的启动（`tilefish.profile_plan` 按步骤计时，见 `docs/advise.md`）。这类 kernel 内部发生了什么，最好从 kernel 自身读出来：在作者指定的阶段起止位置记录时间戳。tilefish 用以下几部分做到这一点：
+采样式 profiler 会把异步 `wgmma` 或 `tcgen05` MMA 的时间算到等待它的指令上；而对于外部的计时器，一个 warp（线程束）特化或持久化的 kernel（核函数）只是一次很长的启动（`tilefish.profile_plan` 按步骤计时，见 `docs/zh-CN/advise.md`）。这类 kernel 内部发生了什么，最好从 kernel 自身读出来：在作者指定的阶段起止位置记录时间戳。tilefish 用以下几部分做到这一点：
 
 1. **probe**（探针，第 1 节）：写在 `@tilefish.kernel` 函数体、`@triton.jit` 或 `@gluon.jit` kernel 中的 `tilefish.probe("name")`。生产构建会把它们编译成空；
 2. **插桩变体**（第 2 节）：`export(..., instrument=True)`，或 `jit` 中的 `tilefish.run(..., probes=tilefish.Probes())`，会把每个 kernel 连同它的 probe 以及 tilefish 自己的三个 probe（`@begin`、`@calib`、`@end`）一起构建，得到各自独立的二进制文件、manifest（清单）digest（摘要）和 plan（计划）digest；除非明确要求加载，host（宿主）会拒绝它们；
@@ -165,7 +165,7 @@ launch 0: ws_scale_p on sm_103, grid (4, 1, 1), block (256, 1, 1)
 
 * **耗时**是 `%clock` 的周期数，按该次启动测得的时钟频率换算（在 2 us 及以上的区间内，各 warp 每纳秒 `%globaltimer` 对应周期数的中位数）；**起始时刻**取 `%globaltimer`，所有 SM 共用一条时间轴。`@calib` 给出一个 probe 让一个 warp 付出的周期数（两条背靠背记录中的第二条，此时其代码已在指令缓存中）；"the probes' share of a warp's time" 是记录数乘以这个开销再除以该 warp 的时间跨度，是一个上界（在反正要等待的 warp 中，probe 的开销更小：第 6 节）。
 * **角色**是 Gluon `gl.warp_specialize` 的分区，取自前端 IR：`default` 和 `worker N`（以及各自运行的 jit 函数）；分区之外的 probe 在 default warp 上运行；没有分区的 kernel 只有一个角色 `""`。一个 warp 的角色就是它记录的 probe 的角色；没有记录 kernel 任何 probe 的 warp（没有 probe 的分区，或 Triton 为把分区凑整到 warp group 而添加的 warp：4 + 1 个 warp 的 `ws_scale` 以 8 个 warp 启动，它的生产者在 warp 6 上）标为 `-`，不计入各阶段。
-* **源码行**：表中的每个 probe 都有它的模块相对行号（`kernels/attn.py:88`、`tilefish_generated/scale_add.py:26`）；有导出的 trace（`trace=True`，`docs/explain.md`）或 `--source-root` 时，summary 会打印这一行，对下沉生成的 kernel 还会打印它写在函数体中的那一行。
+* **源码行**：表中的每个 probe 都有它的模块相对行号（`kernels/attn.py:88`、`tilefish_generated/scale_add.py:26`）；有导出的 trace（`trace=True`，`docs/zh-CN/explain.md`）或 `--source-root` 时，summary 会打印这一行，对下沉生成的 kernel 还会打印它写在函数体中的那一行。
 
 ## 5. 为什么不用 Proton
 

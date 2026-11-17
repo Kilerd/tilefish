@@ -1,7 +1,7 @@
 """CuTe DSL kernels of the public CUTLASS examples, declared as tilefish externs (not collected: the name has no ``test_`` prefix).
 
 Needs the CuTe DSL (``nvidia-cutlass-dsl``) and the examples of a CUTLASS checkout: ``TILEFISH_CUTLASS_EXAMPLES`` is its
-``examples/python/CuTeDSL`` directory (the examples are BSD-3-Clause and are not copied into this repository; ``docs/cute.md`` says which release
+``examples/python/CuTeDSL`` directory (the examples are BSD-3-Clause and are not copied into this repository; ``docs/en/cute.md`` says which release
 the gate ran). Each example module is loaded under a name of its own (two of them are ``dense_gemm.py``).
 
 * ``gemm``: ``C = A @ B.T`` in f16 with an f32 accumulator, ``A`` of ``[M, K]``, ``B`` of ``[N, K]``: on sm_100 and sm_103 the persistent tcgen05 GEMM

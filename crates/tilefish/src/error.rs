@@ -104,7 +104,7 @@ pub enum Error {
         pinned: String,
     },
     /// A launch plan (`plan.json`) is refused: it is not strict JSON of schema `tilefish.plan.v1`, a rule of the format does not hold
-    /// (`docs/plan-schema-1.md`), it was edited after it was written, or it was built against another manifest than the one next to it, or a
+    /// (`docs/en/plan-schema-1.md`), it was edited after it was written, or it was built against another manifest than the one next to it, or a
     /// step is not what the manifest's entry says.
     #[error("{0}")]
     Plan(String),

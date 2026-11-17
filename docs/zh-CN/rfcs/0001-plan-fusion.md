@@ -1,6 +1,6 @@
 # RFC 0001：plan 融合
 
-[English](../../rfcs/0001-plan-fusion.md) | **简体中文**
+[English](../../en/rfcs/0001-plan-fusion.md) | **简体中文**
 
 * **状态：** 已评审；2026-11-15 的决定记录在下文“决定”一节。阶段 0 已测量，阶段 1 已实现（见下文“阶段 1”），阶段 2 的行区域已实现为 `tilefish.fusion(version=2)`（见下文“阶段 2”）；其余部分是设计。
 * **日期：** 2026-11-15。
@@ -90,7 +90,7 @@ D3 和 D4 是推荐的默认选项，没有人提出反对。Q4b 以及 Q8 到 Q
 * **有序求和为什么慢（E3），以及 revision 2。** revision 1 用对整行的 `tl.gather(x, k, 0)` 取 lane（通道）链上的每一步；Triton 把源跨越多个 warp 的 gather 通过共享内存下沉，因此每一步都要存储整行、在 barrier 处等待、再加载（每步 `lanes * vector` 列：`tree(128, vector=8)` 在 1024 列时 8 步，`tree(32)` 在 4096 列时 128 步，4096 行时耗时 2.5 ms），而且模板的 warp 规则（每 256 列一个 warp）在 4096 列时给 128 个 lane 分配了 16 个 warp。revision 2 把行重塑为 `[lanes, K]`（lane `j` 的各列沿最后一个轴按其顺序排列，超出 `D` 的列置为 `-0.0`，在 `add.rn` 下它让每个链值保持原样），并通过对半拆分来求每条链，也就是在每个线程持有自己 lane 的各列时做寄存器搬移，而加载的布局正好给出这种分布。第一个版本把 lane 之间的树也用拆分来求，结果 Triton 的布局传播把行的每个值都给了每个线程（926 次 spill（寄存器溢出），4 ms）：因此树改为通过对 `[lanes]` 的 `tl.gather` 进行（warp 内的 warp shuffle），lane 0 则通过一个带 select 合并函数的 `tl.reduce` 取出。warp 数：`BLOCK_D = 2048` 及以下为一个，之后每 1024 列一个（512 个及以上 lane 时每 512 列一个），在测量网格上与 1 到 8 个 warp 中的最佳值相差不超过 2%。已在 1 到 4096 列的每个长度和每个 warp 数下对照每种顺序的 CUDA kernel 检查；比 revision 1 快 1.6 到 37 倍。
 * **H10，在这里发现：Triton 3.5.1 中字面量 `-0.0` 就是 `+0.0`**（`tl.where(m, x, -0.0)`、`tl.full(..., -0.0)`，在 kernel 中有和没有 `+0.0` 两种情况下都测量过）。融合仍然精确（融合和未融合的 kernel 写的是同一个字面量），但函数体中的 `where(x > 0, x, -0.0)` 并不是它字面上的意思，在 kernel 和区域中都是如此。现在每个 kernel 都按位写出 `-0.0` 标量（一次 `i32` bitcast；note 3），revision 2 对有序求和的填充也是如此。
 * **revision 2 中还有：** 秩为 1 和 2 的视图由行模板就地读取（规则 5；版本 1 的行区域先复制它们），内联的 fp8 类型转换（`cvt.rn.satfinite.e4m3x2.f32`，在每个输入上与 `.to()` 的位相同）。手写的 kernel 可以要求使用 revision 2（`@tilefish.kernel(lowering=2)`）；默认情况下它保持 revision 1 及其源码。
-* **advisor（建议器）**（`docs/advise.md`）和 `boundaries()` 跟随 graph 的版本：在版本 2 中，有序归约、`max`、`argmax` 或 gather 不会被报告，行区域既不阻挡相邻算子，也不复制视图。
+* **advisor（建议器）**（`docs/zh-CN/advise.md`）和 `boundaries()` 跟随 graph 的版本：在版本 2 中，有序归约、`max`、`argmax` 或 gather 不会被报告，行区域既不阻挡相邻算子，也不复制视图。
 * **速度**（B300 MIG 切片，sm_103，30 个 SM（流式多处理器）；捕获在 CUDA graph 中的每次 plan 运行的微秒数；v2：区域，一个 kernel；tree：同样的函数体但不带 `order=`，即 D2 的三到五个使用 Triton 树形归约的 kernel，字节不同；v1：版本 1，归约以 revision 1 单独运行；unfused：每个算子一个 kernel；v1 和 unfused 写出的字节与 v2 相同，每个单元格都检查过）。在整个网格上，即 32、128、512、1024 和 4096 行与 512、1024、2048 和 4096 列，v2 在每个单元格中都最快：比树形组合快 2.6 到 8 倍。
 
   | 形态（pattern）| 行数 | D = 512：v2 / tree / v1 / unfused | D = 1024 | D = 2048 | D = 4096 |
@@ -435,7 +435,7 @@ P with each region replaced by one call to its generated op  --(the existing _wa
 
 ## 7. 把 epilogue 和 prologue 融合进 library op 与 extern
 
-RFC 0003（`docs/rfcs/0003-epilogue-fusion.md`）用一份设计及其契约和测量结果取代了本节以及 11.2 和 11.3 中的草图。
+RFC 0003（`docs/zh-CN/rfcs/0003-epilogue-fusion.md`）用一份设计及其契约和测量结果取代了本节以及 11.2 和 11.3 中的草图。
 
 GEMM 之后的逐元素工作可以这样运行：(a) 在它之后的一个生成的 kernel，(b) cuBLASLt 或 cuDNN 的 epilogue，或 (c) extern 自己 kernel 内部的 epilogue。版本 1 只有路线 (a)（D5）；路线 (c) 是阶段 4；路线 (b) 和 prologue 是未来工作（第 11.2 节）。
 

@@ -1,4 +1,4 @@
-"""An arena shared by the plans of a set (``tilefish.runtime.share_arena``, ``docs/plan-schema-1.md`` section 15.1), with no GPU: runners on a fake backend.
+"""An arena shared by the plans of a set (``tilefish.runtime.share_arena``, ``docs/en/plan-schema-1.md`` section 15.1), with no GPU: runners on a fake backend.
 
 The three stages of ``plan_model`` (the transformer block cut into ``stage_attn``, ``stage_mix`` and ``stage_ffn``, each stage's result a returned value the
 next one reads) run one after the other on one arena: it has the bytes of the largest of their arenas, each plan's buffers at the offsets of its own

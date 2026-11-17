@@ -23,7 +23,7 @@ dimensions) when the algorithm is pinned and before every run.
 **A binary is a pinned algorithm.** For every ``(M, N, K, bias)`` (``M``, ``N`` and ``K`` are static or bucketed: one entry per bucket
 combination, like a kernel) the heuristic of cuBLASLt is asked, with a fixed workspace limit (``workspace_bytes``), for its best
 algorithm; result 0 is the pin, the 64 bytes of its ``cublasLtMatmulAlgo_t`` written as 128 lowercase hex digits. A manifest records it
-in its ``library`` section (see ``docs/manifest-schema-3.md``) with the cuBLASLt version that chose it, and ``jit`` pins in memory the same
+in its ``library`` section (see ``docs/en/manifest-schema-3.md``) with the cuBLASLt version that chose it, and ``jit`` pins in memory the same
 way, so ``jit`` and ``replay`` run the same algorithm by construction. ``replay`` refuses a cuBLASLt of another version (an algorithm id
 means other kernels there) and an entry that is not what the declaration asks for.
 
@@ -60,7 +60,7 @@ if TYPE_CHECKING:
 IMPL_GEMM = "cublaslt.gemm"
 IMPL_GEMM_BIAS = "cublaslt.gemm_bias"
 IMPLS = {IMPL_GEMM: False, IMPL_GEMM_BIAS: True}  # impl -> whether it has a bias (the two impls of tilefish 0.0.4, unchanged)
-# A GEMM with a declared cuBLASLt epilogue (RFC 0003, milestone E2; docs/manifest-schema-3.md, section 9.5): out = epilogue(acc [+ c] [+ bias]), the
+# A GEMM with a declared cuBLASLt epilogue (RFC 0003, milestone E2; docs/en/manifest-schema-3.md, section 9.5): out = epilogue(acc [+ c] [+ bias]), the
 # library's bytes under the pin (contract (iii)), each pin verified at the build against contract (ii) and recorded "measured-exact" or
 # "binary-defined", with a canary.
 IMPL_MATMUL = "cublaslt.matmul"

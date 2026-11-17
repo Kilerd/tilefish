@@ -1,12 +1,12 @@
 # Plan schema 1（`plan.json`，`"tilefish.plan.v1"`）
 
-[English](../plan-schema-1.md) | **简体中文**
+[English](../en/plan-schema-1.md) | **简体中文**
 
 *launch plan*（启动计划）是把一个 `@tilefish.graph` 编译成的结果：对其各维度的 bucket（分桶）值的每一种组合，都有一个有序的 **步骤（step）** 列表（每个步骤是对一个 manifest（清单）条目的一次启动：一个 Triton kernel（核函数）、一个预构建的 PTX 或 cubin，或一个已 pin（固定）的 cuBLASLt GEMM（通用矩阵乘）），其中每个指针参数都绑定到一个 **缓冲区** 或它的一个视图；另外还有一份 **内存计划**：每个不由调用方提供的缓冲区都位于唯一一个 **arena**（内存池）中的固定字节偏移处，在每个 bucket 中都相同。持有一份经过验证的 plan（计划）及其 manifest 的 host（宿主）在一个 stream 上按顺序启动这些步骤，期间不分配任何内存，因此整个执行可以在固定地址上、按每个 bucket 一次 capture（捕获）进一个 CUDA graph（CUDA 图）。
 
-Python 包写入并读取本文档（`tilefish.plan`、`tilefish.runtime.export`、`tilefish.run(graph, ..., mode="replay", plan=...)`）。Rust crate 实现了本规范，C++ host（`crates/tilefish-capi`、`docs/rfcs/0002-cpp-host.md`）通过这个 Rust 实现运行 plan，所以本文档对 Rust host 所说的内容对它同样成立。所有内容都由 `python/tests/` 中的测试检查（在第 14 节列出），写入或检查每个部分的 Python 代码在描述该部分的地方给出（`python/src/tilefish/_plan.py`、`_planrun.py`）。
+Python 包写入并读取本文档（`tilefish.plan`、`tilefish.runtime.export`、`tilefish.run(graph, ..., mode="replay", plan=...)`）。Rust crate 实现了本规范，C++ host（`crates/tilefish-capi`、`docs/zh-CN/rfcs/0002-cpp-host.md`）通过这个 Rust 实现运行 plan，所以本文档对 Rust host 所说的内容对它同样成立。所有内容都由 `python/tests/` 中的测试检查（在第 14 节列出），写入或检查每个部分的 Python 代码在描述该部分的地方给出（`python/src/tilefish/_plan.py`、`_planrun.py`）。
 
-本文档假定读者了解 manifest schema（模式）3（`docs/manifest-schema-3.md`）：`kernels` 和 `library` 的条目、`abi`、维度表达式语法、`preconditions`、规范 JSON，以及 host 对一次启动所做的启动检查。plan 不在这些之上增加任何东西：**一个步骤就是对一个 manifest 条目的一次启动，其检查和执行方式与单次启动完全相同；plan 只说明是哪个条目、使用哪块内存。**
+本文档假定读者了解 manifest schema（模式）3（`docs/zh-CN/manifest-schema-3.md`）：`kernels` 和 `library` 的条目、`abi`、维度表达式语法、`preconditions`、规范 JSON，以及 host 对一次启动所做的启动检查。plan 不在这些之上增加任何东西：**一个步骤就是对一个 manifest 条目的一次启动，其检查和执行方式与单次启动完全相同；plan 只说明是哪个条目、使用哪块内存。**
 
 目录：1 plan 由什么组成；2 顶层；3 digest（摘要）与 pin；4 严格读取；5 维度、bucket 与形状表达式；6 缓冲区与 arena；7 步骤（7.5 copy 步骤，7.6 memset 步骤）；8 顺序、存活性与复用；9 host 做什么；10 CUDA graph；11 Python API；12 plan 不做什么（版本 1）；13 一个示例；14 在哪里测试；15 plan set（plan 集，一个 manifest 上的多个 plan），15.1 一个 set 的各 plan 共享的 arena，15.2 carried buffer（携带缓冲区）。
 
@@ -263,7 +263,7 @@ tilefish.runtime.replay_graph(g)                                            # re
 
 plan 无法生成的 graph 函数体会被 `tilefish.plan` 拒绝，并给出相应的规则（`TilefishPlanError`）：
 
-* graph 函数体中对 `InOut` 参数的 **scatter**，以及由 `tilefish.load` 读出、又被返回、存储或传给某个调用的值。（其他 **在 graph 函数体中追踪到的算术**，如 `x + y`、类型转换、比较、归约，都会被规划：写入方把它们分组为融合区域，每个融合区域是一个 kind 为 `kernel` 的步骤，启动一个由 tilefish 生成、按内容命名为 `fused_<hash>` 的 kernel，与每个算子一个 kernel 的组合逐字节一致；`docs/rfcs/0001-plan-fusion.md`。文档中没有新东西：读取方看到的是 manifest 条目的 kernel 步骤，与任何 `@tilefish.kernel` 一样。）
+* graph 函数体中对 `InOut` 参数的 **scatter**，以及由 `tilefish.load` 读出、又被返回、存储或传给某个调用的值。（其他 **在 graph 函数体中追踪到的算术**，如 `x + y`、类型转换、比较、归约，都会被规划：写入方把它们分组为融合区域，每个融合区域是一个 kind 为 `kernel` 的步骤，启动一个由 tilefish 生成、按内容命名为 `fused_<hash>` 的 kernel，与每个算子一个 kernel 的组合逐字节一致；`docs/zh-CN/rfcs/0001-plan-fusion.md`。文档中没有新东西：读取方看到的是 manifest 条目的 kernel 步骤，与任何 `@tilefish.kernel` 一样。）
 * graph 的 **`Out`** 参数（因此也包括对它的 `store`）以及运行时的 **`Dim`** 参数：graph 的结果就是它的返回值（对 `InOut` 参数的 `store` 是一个 copy 步骤，对不稠密的视图则是一次 `tilefish.contiguous` 的启动，第 7.5 节）；
 * 对 **另一个 graph** 的调用（目前尚不内联）。
 * 对另一个张量的 **视图做原地调用**（IR 规定更新视图不会改变其父张量；plan 没有能使之成立的复制），以及 **在其张量被原地更新之后被读取** 的视图。

@@ -1,9 +1,9 @@
 # Views, device scalars, prebuilt binaries and a pinned GEMM
 
-**English** | [简体中文](../zh-CN/guide/operators.md)
+**English** | [简体中文](../../zh-CN/guide/operators.md)
 
 A real model needs four things that a dense, compiled-in, Triton-only operator cannot say. Each is part of the manifest, which is schema 3
-(`docs/manifest-schema-3.md` specifies every field; the Python package reads and writes only schema 3, and says "re-export" for schema 2).
+(`docs/en/manifest-schema-3.md` specifies every field; the Python package reads and writes only schema 3, and says "re-export" for schema 2).
 
 **Strided views.** A tensor type has element strides and an element offset, in the dimension algebra (`TensorType.strides`, `.offset`); dense
 and 16-byte aligned (`contiguous`) is the default. `x.reshape(M, 3, H, D)` (a dense input), `x.permute(1, 0, 2)`, `x[:, 1]` / `x.select(axis, i)` and
@@ -57,7 +57,7 @@ y = tilefish.run(add_rows, plane[1], plane[0])   # an address that is not 16-byt
 ```
 
 A graph's export has the specialisations its plan's steps launch; `tilefish.runtime.export(add_rows.unaligned("a"), directory)` writes one for the kernel
-alone, and a replay of a manifest that lacks it says so (`docs/manifest-schema-3.md`, section 6).
+alone, and a replay of a manifest that lacks it says so (`docs/en/manifest-schema-3.md`, section 6).
 
 **Device scalars.** `n_tok: DevScalar[i32]` is one element in device memory: in the ABI a pointer with the shape `[]`, at the API a tensor of one
 element. A binary reads it with `tl.load`, so one binary serves every value and a value changes by writing memory, never by building; a lowered kernel
@@ -78,7 +78,7 @@ A `const[i32]` or `const[i64]` of a prebuilt binary **without a default** is a f
 size, an offset) that no tensor determines. One declaration and one binary serve every value: `k(x, h_out=5)`, `tilefish.run(k, x, h_out=5)`,
 Rust `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`; in a graph the value may be an expression of the graph's dimensions (`h_out=H // 2`),
 and each step of the plan records the values of its call at its bucket (`"given": {"h_out": 5}`), so they are in the plan's digest and both hosts
-check them against the entry (`docs/manifest-schema-3.md`, section 5.3).
+check them against the entry (`docs/en/manifest-schema-3.md`, section 5.3).
 
 **Null pointers and 64-bit dimension scalars.** A pointer an extern's kernel does not use in the declared use (a bias it reads only when it is not
 null, or only under a constexpr flag the declaration turns off) is declared `Null[dtype]`: a call does not pass it, and both hosts pass the null pointer
@@ -127,7 +127,7 @@ Gluon kernel with its own compile options (`num_warps`, `num_stages`, `enable_fp
 parameters and has the same launch ABI, buckets, dimensions and preconditions, which the declaration checks, so a plan is the same document whichever runs
 and a host launches each the same way. Each is an op of its own (`row_sum.for_arch("sm_103")`, `tilefish.aot.compile_specs(row_sum, arch=103)`): its key is in
 its declaration digest and its compile specs, and its manifest entries record it (`"implementation": "sm_103"`, or `"fallback"`;
-`docs/manifest-schema-3.md`, section 4.1). `replay` selects the implementation of the device's architecture as the export did, so an entry of another
+`docs/en/manifest-schema-3.md`, section 4.1). `replay` selects the implementation of the device's architecture as the export did, so an entry of another
 implementation, or of one that changed (its kernel, options, constants or grid), is refused as stale; another architecture's implementation changing
 leaves this architecture's manifest valid. The Rust crate reads the field (`Entry::implementation`) and launches the entry of its device's architecture.
 
@@ -260,14 +260,14 @@ def proj32(a: Tensor[32, 512, bf16], b: Tensor[1536, 512, bf16], bias: Tensor[15
   `allow_bf16_reduced_precision_reduction`), which rounds more than once. Without it the heuristic is asked for f32 partial sums only, and a GEMM with a
   bias for no split-K at all (with the bias epilogue, a split-K with f32 partial sums was measured to round twice: cuBLASLt 12.8.4 on an RTX 5090); an
   algorithm that breaks either is refused by both hosts. The rule stays in the default posture although some split-K algorithms keep the one
-  rounding: nothing in the heuristic's answer tells them apart (`docs/numerics.md`, section 4); `heuristic="torch"` gives `addmm`'s bytes.
+  rounding: nothing in the heuristic's answer tells them apart (`docs/en/numerics.md`, section 4); `heuristic="torch"` gives `addmm`'s bytes.
 * `algos=` imports the algorithms (`tilefish.AlgoTable(arch, sm_count, cublaslt_version, {(m, n, k, bias): config})`, a config being the nine
   `cublasLtMatmulAlgoConfig` attributes or the 128 hex digits of a pin): on the device a table is for, each entry pins the table's algorithm, encoded as
   cuBLASLt encodes it and held to the same checks (`cublasLtMatmulAlgoCheck` for the problem, the workspace limit, bf16 partial sums only with the
   opt-in); a device no table is for is refused, never handed to the heuristic.
 
 A manifest entry records them as `heuristic`, `algo_source` and `allow_bf16_reduction`, which are there only when they are not the default
-(`docs/manifest-schema-3.md`, section 9). A pin is the configuration the heuristic chose, encoded by the library: the 64 bytes the heuristic returns can carry
+(`docs/en/manifest-schema-3.md`, section 9). A pin is the configuration the heuristic chose, encoded by the library: the 64 bytes the heuristic returns can carry
 bytes that are no part of it, which change from process to process.
 
 **f16, an f32 result, `b` as `[K, N]`.** The operands may be f16 (both of one type), the result f32 (and a bias has the result's type: cuBLASLt takes no
@@ -284,7 +284,7 @@ def down(a: Tensor[M, 3072, f16], b: Tensor[1024, 3072, f16]) -> Tensor[M, 1024,
 The opt-in to split-K partial sums in the output type is named by the operands' type, as torch's flags are (`allow_f16_reduction` for f16 operands). Under
 `heuristic="torch"` with it, the result is `torch.mm` / `torch.addmm` in f16 byte for byte in both layouts (`test_gpu_gemm_f16.py`: 63 shapes, three
 operand sets each, measured on a B300 MIG slice with cuBLASLt 12.8.4). An `AlgoTable` row of the layout `NN` is keyed `(m, n, k, bias, "NN")`; a
-configuration is encoded with the declaration's types. The entry says the form in `dtypes`, `transa` and `lda` (`docs/manifest-schema-3.md`, section 9.2).
+configuration is encoded with the declaration's types. The entry says the form in `dtypes`, `transa` and `lda` (`docs/en/manifest-schema-3.md`, section 9.2).
 
 **`a` stored `[K, M]`.** `layout="TT"` takes `a: Tensor[K, M, T]` with `b: Tensor[N, K, T]` and computes `a.T @ b.T`; `layout="NT"` takes it with
 `b: Tensor[K, N, T]` and computes `a.T @ b`, for every operand type above:
@@ -296,7 +296,7 @@ def scores(a: Tensor[8, M, f32], b: Tensor[1024, 8, f32]) -> Tensor[M, 1024, f32
 
 Under `heuristic="torch"` the pin is what torch runs for `torch.mm(a.t(), b.t())` / `torch.mm(a.t(), b)` and `torch.addmm` of a contiguous `a [K, M]`, byte
 for byte, for bf16, f16 and f32 (`test_gpu_gemm_layouts.py`, `M` from 2 to 2048; at `M = 1` torch multiplies `a [K, 1]` as the contiguous `[1, K]` it also
-is, so a one-row GEMM is declared `TN` or `NN`). The entry says it in `transb` and `ldb` (`docs/manifest-schema-3.md`, section 9.2).
+is, so a one-row GEMM is declared `TN` or `NN`). The entry says it in `transb` and `ldb` (`docs/en/manifest-schema-3.md`, section 9.2).
 
 **f32, TF32 off.** f32 operands have an f32 result (and an f32 bias), and are multiplied as f32:
 
@@ -315,13 +315,13 @@ in the output is `allow_f32_reduction`; torch has no such flag and never restric
 `torch.addmm` in f32 with TF32 off, byte for byte, in both layouts (`test_gpu_gemm_f32.py`: 756 of 756 runs, 63 shapes with `M` from 1 to 2048, three
 operand sets, `mm` and `addmm`, `TN` and `NN`, with the default workspace and with `CUBLAS_WORKSPACE_CONFIG=:4096:8` and a 32 MiB limit; measured on a B300
 MIG slice with cuBLASLt 12.8.4 and 13.1.0 and on an RTX 5090 with 13.1.0). torch's `mm` runs `cublasSgemm`, and cuBLAS chooses for it the algorithm the
-cuBLASLt heuristic answers under that posture. See `docs/manifest-schema-3.md`, section 9.2.
+cuBLASLt heuristic answers under that posture. See `docs/en/manifest-schema-3.md`, section 9.2.
 
 **SM partitions.** On a green context (a partition of the device's SMs) every SM-count query still reports the device's count, and a pinned
 algorithm computes the same bytes with or without a partition (measured, cuBLASLt 12.8.4); what changes is the heuristic's choice, through the
 context of the process's first cuBLASLt handle. `sm_count_target=P` pins the algorithm the heuristic chooses for `P` SMs
 (`CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`, which every check and run sets too), the same in any context; the entry records it, and a Rust host on a
-partition of `P` SMs takes only pins chosen for it with `Manifest::with_sm_partition(Some(P))` (`docs/manifest-schema-3.md`, section 9.3).
+partition of `P` SMs takes only pins chosen for it with `Manifest::with_sm_partition(Some(P))` (`docs/en/manifest-schema-3.md`, section 9.3).
 
 **A GEMM with a cuBLASLt epilogue.** `impl="cublaslt.matmul"` (RFC 0003, milestone E2) runs a bias, ReLU and a residual add (`beta * C`) on the f32
 accumulator, before the one rounding, with the algorithm pinned for the epilogue:
@@ -343,7 +343,7 @@ with the count of elements that differ and their largest distance; `contract="me
 whose ReLU gives `0` for a NaN where the others keep it. An epilogue gets no split-K without the opt-in, as a bias does. `export` records a canary
 (`canary=True`, the default): the pin run on operands made of a seed on the device and the digest of its result, which a replay (Python) and a load
 (the Rust and C++ hosts) run before the pin is used, refusing another digest: two builds of one cuBLASLt version are told apart. See
-`docs/manifest-schema-3.md`, section 9.5.
+`docs/en/manifest-schema-3.md`, section 9.5.
 
 **A pinned cuDNN convolution.** `impl="cudnn.conv_fwd"` declares a forward convolution by its signature, `(x, w) -> y` in the order of `layout`
 (`"NCHW"`, the default: `x [N, C, *S]`, `w [K, C/G, *R]`; `"NHWC"`: `x [N, *S, C]`, `w [K, *R, C/G]`) with one to three spatial axes, f16, bf16 or f32
@@ -381,10 +381,10 @@ The `"instant"` pin is `torch.nn.functional.conv1d` / `conv2d` / `conv3d`'s byte
 and a legacy pin of
 `IMPLICIT_PRECOMP_GEMM` is torch's legacy path's. Both APIs run in launch plans (the workspace is the arena's) and capture in CUDA graphs; the binding is
 ctypes on the `libcudnn` the process has (torch's), and the Rust crate loads cuDNN only for a manifest that has a convolution (`Manifest::conv`, `Conv`). See
-`docs/manifest-schema-3.md`, section 9.4.
+`docs/en/manifest-schema-3.md`, section 9.4.
 
 **A CuTe DSL kernel.** A kernel of CUTLASS's CuTe DSL (`nvidia-cutlass-dsl`: TMA, `tcgen05`, clusters, persistent tile schedulers, in Python) is an
-extern too, compiled by the DSL and launched by every host as a prebuilt cubin with the launch the compiled host function makes (`docs/cute.md`):
+extern too, compiled by the DSL and launched by every host as a prebuilt cubin with the launch the compiled host function makes (`docs/en/cute.md`):
 
 ```python
 @tilefish.extern(cute=PersistentDenseGemmKernel(cutlass.Float32, True, (256, 128), (2, 1), True),   # a CUTLASS example's kernel class
@@ -399,4 +399,4 @@ the DSL encoded (a template the host writes the tensor's address into) or consta
 30-SM partition of an sm_103 GPU the persistent tcgen05 GEMM of the examples writes the bytes of the pinned cuBLASLt GEMM, and runs at 1.17x its speed at
 `4096 x 2048 x 1024` (0.92x at `M = 1024`). Install the DSL yourself at the tested version and pin it (`nvidia-cutlass-dsl==4.8.1`: it is in beta, and
 another version is another declaration). It is NVIDIA software under its own licence, which tilefish neither ships nor depends on, and the cubins
-and PTX an export writes are its output: shipping them is your responsibility (`docs/cute.md`, section 6).
+and PTX an export writes are its output: shipping them is your responsibility (`docs/en/cute.md`, section 6).

@@ -107,7 +107,7 @@ def test_an_intermediate_with_one_producer_and_one_consumer_is_a_candidate_bound
     assert epi["blockers"][0] == "epilogue-library" and epi["phase"] == "future" and epi["gate"] == "epilogue-library"
     assert pro["blockers"][0] == "prologue-library"
     assert any("bias, ReLU and beta * C are an epilogue of cublaslt.matmul" in a and "(E2)" in a and "with hooks are E3" in a for a in epi["actions"])
-    # docs/rfcs/0003-epilogue-fusion.md, section 5: the routes into the GEMM, each with its contract and the saving; E3 with its break-even
+    # docs/en/rfcs/0003-epilogue-fusion.md, section 5: the routes into the GEMM, each with its contract and the saving; E3 with its break-even
     routes = {r["milestone"]: r for r in epi["routes"]}
     assert set(routes) == {"E1", "E2", "E3"} and routes["E1"]["status"].startswith("available")
     assert routes["E2"]["contract"].startswith("(iii)") and routes["E3"]["break_even"] > 1.0

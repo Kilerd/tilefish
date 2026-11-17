@@ -2,7 +2,7 @@
 
 Schema 3 is schema 2 plus: ``kind`` on every kernel entry, ``abi.scratch_slots``, the ``library`` section and a digest of its own (tag ``v3``); for strided
 views, ``strides`` and ``offset`` on a pointer of the ABI, ``stride_of`` on a scalar and the ``max_extent`` precondition; for device scalars, a pointer with
-the shape ``[]``; for prebuilt binaries, an entry of kind ``binary`` and ``fixed`` arguments. ``docs/manifest-schema-3.md`` specifies it, field by field.
+the shape ``[]``; for prebuilt binaries, an entry of kind ``binary`` and ``fixed`` arguments. ``docs/en/manifest-schema-3.md`` specifies it, field by field.
 """
 
 import copy
@@ -62,7 +62,7 @@ def test_the_two_digests_have_their_own_tags_and_schema_3_has_the_library_in_it(
     import hashlib
 
     doc = {"schema": 3, "kernels": [], "library": []}
-    assert manifest_digest(doc) == "f66955caeb4e878dbe95483da2607d19ea4f734977e86282fff6f92f1a87fe6e"  # the vector of docs/manifest-schema-3.md
+    assert manifest_digest(doc) == "f66955caeb4e878dbe95483da2607d19ea4f734977e86282fff6f92f1a87fe6e"  # the vector of docs/en/manifest-schema-3.md
     assert manifest_digest({"schema": 2, "kernels": []}) == "a3593eed6b463f7408711b92645197eda2e7bc5f2830b138b40e33ceedc1cfc8"
     text = json.dumps({"schema": 3, "kernels": [], "library": []}, sort_keys=True, separators=(",", ":"))
     assert DIGEST_TAG == b"tilefish.manifest-digest.v3\0" and manifest_digest(doc) == hashlib.sha256(DIGEST_TAG + text.encode()).hexdigest()

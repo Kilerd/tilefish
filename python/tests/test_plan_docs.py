@@ -1,4 +1,4 @@
-"""``docs/plan-schema-1.md`` says what the code does: its example is a valid plan that the code makes, its test vectors and its numbers are the ones computed here.
+"""``docs/en/plan-schema-1.md`` says what the code does: its example is a valid plan that the code makes, its test vectors and its numbers are the ones computed here.
 
 A specification for another implementation (the Rust lane) is only as good as its examples, so the examples are run.
 """
@@ -13,13 +13,13 @@ from conftest import REPO_ROOT
 import tilefish
 from tilefish import _plan
 
-DOC = REPO_ROOT / "docs" / "plan-schema-1.md"
+DOC = REPO_ROOT / "docs" / "en" / "plan-schema-1.md"
 
 
 @pytest.fixture(scope="module")
 def text():
     if not DOC.exists():
-        pytest.skip("docs/plan-schema-1.md is not available (not running from a source checkout)")
+        pytest.skip("docs/en/plan-schema-1.md is not available (not running from a source checkout)")
     return DOC.read_text(encoding="utf-8")
 
 
@@ -55,9 +55,9 @@ def test_the_steps_with_views_and_the_arena_numbers_of_the_block_are_the_ones_th
 
 
 def test_the_arena_numbers_of_the_plans_guide_are_the_ones_the_plans_have():
-    guide = REPO_ROOT / "docs" / "guide" / "plans.md"
+    guide = REPO_ROOT / "docs" / "en" / "guide" / "plans.md"
     if not guide.exists():
-        pytest.skip("docs/guide/plans.md is not available (not running from a source checkout)")
+        pytest.skip("docs/en/guide/plans.md is not available (not running from a source checkout)")
     text = guide.read_text(encoding="utf-8")
     block = tilefish.plan(pm.block, reuse=True)
     deep = tilefish.plan(pm.deep_block(24), reuse=True)

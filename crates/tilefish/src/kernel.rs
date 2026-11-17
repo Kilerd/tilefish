@@ -158,13 +158,13 @@ impl Kernel {
         &self.loaded.op
     }
 
-    /// The probes of an **instrumented** binary (`docs/instrument.md`: its entry's [`Instrument`]), `None` for a production one.
+    /// The probes of an **instrumented** binary (`docs/en/instrument.md`: its entry's [`Instrument`]), `None` for a production one.
     pub fn instrument(&self) -> Option<&Instrument> {
         self.loaded.instrument.as_deref()
     }
 
     /// The bytes of the probe buffer a launch checked as `prepared` needs ([`Kernel::check`]): a slot per warp of every CTA of its CUDA grid
-    /// (`docs/instrument.md`); `None` for a production binary, which takes none.
+    /// (`docs/en/instrument.md`); `None` for a production binary, which takes none.
     pub fn probe_bytes(&self, prepared: &Prepared) -> Option<u64> {
         self.probe_meta(prepared).and_then(|m| m.bytes())
     }
@@ -255,7 +255,7 @@ impl Kernel {
         ffi::enqueue(&self.loaded.function, stream, &prepared, self.plan.block(), self.plan.shared(), tensors)
     }
 
-    /// [`Kernel::launch`] of an **instrumented** binary (`docs/instrument.md`), which records its probes into `probes`: the buffer's address is the
+    /// [`Kernel::launch`] of an **instrumented** binary (`docs/en/instrument.md`), which records its probes into `probes`: the buffer's address is the
     /// kernel's profile scratch (the second scratch slot of a Triton kernel, null in a production launch), and the buffer is memory the launch writes,
     /// ordered as a written tensor's (its own stream waits for the kernel), so [`ProbeBuffer::collect`] then reads this launch's records.
     ///

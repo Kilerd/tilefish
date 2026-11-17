@@ -9,7 +9,7 @@ the format, the digests and the plan; the machine code is not, so the fixtures v
 the documents name, not one a driver loads the cubins on: ``cuModuleLoadData`` refuses them, with ``CUDA_ERROR_INVALID_IMAGE`` on a B300 (sm_103), and
 no test instantiates them; a test that launches a plan exports it on its device, as ``rust_gate.py prepare`` does). Each directory has ``manifest.json`` (schema 3),
 the cubins and ``plan.json``; ``expected.json`` has, for each, the plan digest and the manifest digest that Python computes, the arena size and every buffer's offset, which a
-reader in another language must reproduce from the files alone (``docs/plan-schema-1.md``). Two plan sets: ``set`` (one stage per key) and ``carried`` (stages
+reader in another language must reproduce from the files alone (``docs/en/plan-schema-1.md``). Two plan sets: ``set`` (one stage per key) and ``carried`` (stages
 that hand carried buffers to each other, with the layout of the arena they share and its carried regions in ``expected.json``). ``test_plan_fixtures.py`` regenerates all of it and requires the committed files
 to be the same bytes (the ``tilefish`` version in a file is not compared: it is not digested), and loads each directory as a replay does.
 """
@@ -29,7 +29,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT = HERE / "golden" / "plans"
 PLANS = {"block": ("block", False), "block-reuse": ("block", True), "steps": ("steps", False), "given": ("two_scales", False)}  # directory: (the graph of plan_model, reuse)
 SET = "set"  # a plan set: the plans of gpu_kernels_p6.tile_chain for 1, 2 and 3 tiles over one manifest (plans.json, <graph>.plan.json)
-CARRIED = "carried"  # a plan set with carried buffers: gpu_kernels_plans.CARRIED_SET (docs/plan-schema-1.md, section 15.2)
+CARRIED = "carried"  # a plan set with carried buffers: gpu_kernels_plans.CARRIED_SET (docs/en/plan-schema-1.md, section 15.2)
 
 
 def export_all(output: pathlib.Path) -> dict:
@@ -68,7 +68,7 @@ def export_all(output: pathlib.Path) -> dict:
         "manifest_digest": exported_set.manifest_digest,
         "plans": {name: p.digest for name, p in exported_set.plans.items()},
         "steps": {name: len(p.steps()) for name, p in exported_set.plans.items()},
-        # the arena the three plans share (docs/plan-schema-1.md, section 15.1): the largest of their arenas, each plan at its own offsets
+        # the arena the three plans share (docs/en/plan-schema-1.md, section 15.1): the largest of their arenas, each plan at its own offsets
         "arena_bytes": {name: p.arena_bytes for name, p in exported_set.plans.items()},
         "shared_arena_bytes": max(p.arena_bytes for p in exported_set.plans.values()),
     }
@@ -87,7 +87,7 @@ def export_all(output: pathlib.Path) -> dict:
         "plans": {name: p.digest for name, p in carried_set.plans.items()},
         "carried_of": {name: p.carried for name, p in carried_set.plans.items()},
         "arena_bytes": {name: p.arena_bytes for name, p in carried_set.plans.items()},
-        # the arena of all of them (docs/plan-schema-1.md, section 15.2): the largest plan's region, then each carried name's, in code point order
+        # the arena of all of them (docs/en/plan-schema-1.md, section 15.2): the largest plan's region, then each carried name's, in code point order
         "shared_arena_bytes": layout.total,
         "carried_base": layout.base,
         "carried": {name: list(region) for name, region in layout.regions.items()},

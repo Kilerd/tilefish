@@ -1,4 +1,4 @@
-"""Externs with epilogue hooks (``docs/rfcs/0003-epilogue-fusion.md``, milestone E1): a GEMM and a 1-D convolution written in Triton, whose epilogue
+"""Externs with epilogue hooks (``docs/en/rfcs/0003-epilogue-fusion.md``, milestone E1): a GEMM and a 1-D convolution written in Triton, whose epilogue
 a ``@tilefish.graph`` fuses into the kernel.
 
 Each kernel takes two hooks, which the stubs do not list (``tilefish._epilogue.ABI``):

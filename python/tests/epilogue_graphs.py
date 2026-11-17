@@ -1,4 +1,4 @@
-"""Graphs whose bodies compute on the result of an extern with epilogue hooks (``docs/rfcs/0003-epilogue-fusion.md``, milestone E1): the patterns of
+"""Graphs whose bodies compute on the result of an extern with epilogue hooks (``docs/en/rfcs/0003-epilogue-fusion.md``, milestone E1): the patterns of
 E1, each in four modes (``MODES``: fused and unfused, exact and accumulator), built over a set of externs by :func:`build`: the example externs
 (``python/examples/epilogue_gemm.py``, :func:`examples`) on a GPU, and stand-ins with the same stubs and hooks (:func:`standins`, never compiled) on
 any machine. For ``test_epilogue.py`` (no GPU), ``test_gpu_epilogue.py`` and the Rust and C++ gates (``rust_gate.py``: ``fused_epi_*``). :func:`mixed`
@@ -207,7 +207,7 @@ MIXED_PARAMS = [("x", Tensor[T, H, bf16]), ("w1", Tensor[F, H, bf16]), ("b1", Te
 
 
 def mixed(gemm, up, name, mode="library", scope="accumulator", grouping="auto"):
-    """E1 and E2 in one graph (``docs/rfcs/0003-epilogue-fusion.md``, "E1 and E2 together"): the cuBLASLt GEMM ``up`` (:func:`cublaslt_up`) and a
+    """E1 and E2 in one graph (``docs/en/rfcs/0003-epilogue-fusion.md``, "E1 and E2 together"): the cuBLASLt GEMM ``up`` (:func:`cublaslt_up`) and a
     bias, a cuBLASLt epilogue (``BIAS``) under ``mode``, then the extern ``gemm`` (with both hooks) and a bias + SiLU in a ``tilefish.fused(epilogues=
     scope)`` scope. With the defaults: one ``cublaslt.matmul`` step and one fused pair on the extern's accumulator; ``grouping="none"`` is its unfused
     composition (both rewrites kept: they are numerics, not fusion), which the fused plan must equal byte for byte."""

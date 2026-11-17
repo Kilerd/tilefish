@@ -124,7 +124,7 @@ def test_a_pin_and_its_verification_are_deterministic():
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0), reason="the split-K pins of sm_120 (RTX 5090)")
 def test_split_k_pins_with_the_opt_in_are_verified_on_sm120(capsys):
     """On sm_120 cuBLASLt answers f16 problems of few rows with split-K (cuBLASLt 12.8.4: a split-K of the bias epilogue was measured to round twice
-    there, ``docs/numerics.md``, section 4): with ``allow_f16_reduction=True`` such pins are taken, and each is verified like any other; without the
+    there, ``docs/en/numerics.md``, section 4): with ``allow_f16_reduction=True`` such pins are taken, and each is verified like any other; without the
     opt-in no pin with an epilogue splits ``k``."""
     found = []
     for m in (32, 64):

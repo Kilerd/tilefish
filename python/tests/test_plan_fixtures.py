@@ -2,7 +2,7 @@
 
 ``export_plan_fixtures.py`` writes them (the transformer block of ``plan_model``, with and without reuse, on fake builds: the format is real, the machine code is not). Here the
 committed files are required to be what the code makes now, byte for byte (but the ``tilefish`` version, which is not digested), each directory is loaded as a replay loads
-it, and the digests are recomputed with nothing but ``json`` and ``hashlib``, the way an implementation of ``docs/plan-schema-1.md`` does.
+it, and the digests are recomputed with nothing but ``json`` and ``hashlib``, the way an implementation of ``docs/en/plan-schema-1.md`` does.
 """
 
 import hashlib

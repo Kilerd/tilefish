@@ -1,9 +1,9 @@
 # Intra-kernel instrumentation: probes, the instrumented variant, timelines
 
-**English** | [简体中文](zh-CN/instrument.md)
+**English** | [简体中文](../zh-CN/instrument.md)
 
 A sampling profiler attributes the time of an asynchronous `wgmma` or `tcgen05` MMA to the instructions that wait for it, and a warp-specialised or
-persistent kernel is one long launch to a timer outside it (`tilefish.profile_plan` times steps, `docs/advise.md`). What goes on inside such a kernel
+persistent kernel is one long launch to a timer outside it (`tilefish.profile_plan` times steps, `docs/en/advise.md`). What goes on inside such a kernel
 is best read from the kernel itself: timestamps taken where its author says a phase begins and ends. tilefish does that with
 
 1. **probes** (section 1): `tilefish.probe("name")` in a `@tilefish.kernel` body, a `@triton.jit` or a `@gluon.jit` kernel. A production build
@@ -221,7 +221,7 @@ TMA store), and the two go round at one rate, as a pipeline in its steady state 
   recorded; a warp that recorded none of the kernel's probes (a partition without probes, or a warp Triton adds to round the partitions up to warp
   groups: `ws_scale` of 4 + 1 warps is launched with 8, its producer on warp 6) is `-` and is not in the phases.
 * **Source lines**: every probe of the table has its module-relative line (`kernels/attn.py:88`, `tilefish_generated/scale_add.py:26`); with the
-  export's trace (`trace=True`, `docs/explain.md`) or `--source-root` the summary prints the line, and for a lowered kernel the line of the body it was
+  export's trace (`trace=True`, `docs/en/explain.md`) or `--source-root` the summary prints the line, and for a lowered kernel the line of the body it was
   written on.
 
 ## 5. Why not Proton

@@ -12,7 +12,7 @@ the last.
 * ``method="events"``: the steps are launched as a run launches them, with an event recorded on the stream before the first and after each; a spinning
   kernel first keeps the device busy while the host enqueues them, so that they run back to back rather than as fast as the host launches them.
 
-``docs/advise.md`` says how accurate it is (its overhead, and an nsys run of the same plan).
+``docs/en/advise.md`` says how accurate it is (its overhead, and an nsys run of the same plan).
 """
 
 from __future__ import annotations

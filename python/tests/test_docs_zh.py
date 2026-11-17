@@ -1,8 +1,9 @@
 """The Simplified Chinese pages are mirrors of the English ones: ``README.md`` -> ``README.zh-CN.md``, ``python/README.md`` ->
-``python/README.zh-CN.md``, ``crates/tilefish/README.md`` -> ``crates/tilefish/README.zh-CN.md``, ``docs/X.md`` -> ``docs/zh-CN/X.md``.
+``python/README.zh-CN.md``, ``crates/tilefish/README.md`` -> ``crates/tilefish/README.zh-CN.md``, ``docs/en/X.md`` -> ``docs/zh-CN/X.md``.
 
 A mirror has the headings of its English page (the same levels in the same order), the same fenced code blocks byte for byte and in the
-same order, and both pages have the language switch line right after the H1. Every English page has a mirror.
+same order, and both pages have the language switch line right after the H1. Every English page has a mirror, every Chinese page has
+its English page, and no page lives under ``docs/`` outside ``docs/en/`` and ``docs/zh-CN/`` (the site is built from those two trees).
 """
 
 import pathlib
@@ -11,21 +12,22 @@ import re
 import pytest
 from conftest import REPO_ROOT
 
+DOCS = REPO_ROOT / "docs"
+
 
 def english_pages() -> list[pathlib.Path]:
-    """The English pages that have a Chinese mirror: the three READMEs and every page under ``docs/`` but ``docs/zh-CN/``."""
-    docs = REPO_ROOT / "docs"
-    if not docs.is_dir():
+    """The English pages that have a Chinese mirror: the three READMEs and every page under ``docs/en/``."""
+    if not DOCS.is_dir():
         pytest.skip("docs/ is not available (not running from a source checkout)")
     pages = [REPO_ROOT / "README.md", REPO_ROOT / "python" / "README.md", REPO_ROOT / "crates" / "tilefish" / "README.md"]
-    pages += sorted(p for p in docs.rglob("*.md") if "zh-CN" not in p.relative_to(docs).parts)
+    pages += sorted((DOCS / "en").rglob("*.md"))
     return [p for p in pages if p.exists()]
 
 
 def zh_path(en: pathlib.Path) -> pathlib.Path:
     rel = en.relative_to(REPO_ROOT)
-    if rel.parts[0] == "docs":
-        return REPO_ROOT / "docs" / "zh-CN" / pathlib.Path(*rel.parts[1:])
+    if rel.parts[:2] == ("docs", "en"):
+        return DOCS / "zh-CN" / pathlib.Path(*rel.parts[2:])
     return en.with_name(en.stem + ".zh-CN.md")
 
 
@@ -84,3 +86,13 @@ def test_every_zh_cn_mirror_matches_its_english_page():
 def test_completeness_every_english_page_has_a_zh_cn_mirror():
     missing = [f"{zh_path(en).relative_to(REPO_ROOT)} (of {en.relative_to(REPO_ROOT)})" for en in english_pages() if not zh_path(en).exists()]
     assert not missing, "no Chinese mirror:\n" + "\n".join(missing)
+
+
+def test_the_two_trees_mirror_each_other_and_nothing_lives_beside_them():
+    english_pages()  # skips outside a source checkout
+    en = {p.relative_to(DOCS / "en") for p in (DOCS / "en").rglob("*.md")}
+    zh = {p.relative_to(DOCS / "zh-CN") for p in (DOCS / "zh-CN").rglob("*.md")}
+    stray = sorted(str(p.relative_to(DOCS)) for p in DOCS.rglob("*.md") if p.relative_to(DOCS).parts[0] not in ("en", "zh-CN"))
+    assert not stray, "pages outside docs/en and docs/zh-CN (the site has no place for them):\n" + "\n".join(stray)
+    orphans = sorted(str(p) for p in zh - en)
+    assert not orphans, "Chinese pages with no English page under docs/en:\n" + "\n".join(orphans)

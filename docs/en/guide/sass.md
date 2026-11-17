@@ -1,9 +1,9 @@
 # SASS: explained and asserted
 
-**English** | [简体中文](../zh-CN/guide/sass.md)
+**English** | [简体中文](../../zh-CN/guide/sass.md)
 
 Every kernel goes DSL / Triton / Gluon → TTIR → TTGIR → LLVM IR → PTX → ptxas → SASS. tilefish keeps every level of an export on request, maps each SASS
-instruction back to the line and the op that produced it, and checks declared facts about the SASS at every build (`docs/explain.md`).
+instruction back to the line and the op that produced it, and checks declared facts about the SASS at every build (`docs/en/explain.md`).
 
 ```python
 # every level of every binary next to the manifest: sources, frontend IR, TTIR, TTGIR, LLVM IR, PTX, SASS and its line table
@@ -56,13 +56,13 @@ $ tilefish-explain build/mm mm --diff-arch sm_120       # or --diff OTHER_EXPORT
   itself. `no_spills` and `max_registers` are the ELF file's, with no disassembly.
 * The trace holds source code: do not ship it with an export.
 
-**Which steps could be one kernel** (`docs/advise.md`): `tilefish-explain build/block --graph block --advise` ranks the fusion candidates of a plan
+**Which steps could be one kernel** (`docs/en/advise.md`): `tilefish-explain build/block --graph block --advise` ranks the fusion candidates of a plan
 (steps joined by intermediates one kernel would not store) by the bytes and time they would save, says why each is not one kernel today and what to do
 (write an extern's arithmetic in the graph body, add `order=` so that fusion version 2 takes a reduction into a row region, remove a barrier; a GEMM
 epilogue: an epilogue hook on an extern, or `tilefish.fusion(epilogues="library")` for a cuBLASLt GEMM, [`fusion.md`](fusion.md)), and sums the plan's time by class. `tilefish.profile_plan(block, "build/block", bucket="M=128", ...)` (or `--profile`) measures every step on the device, a runtime path
 outside every artefact, and `--timing` ranks by what it measured.
 
-**What goes on inside a kernel** (`docs/instrument.md`): `tilefish.probe("load.wait")` marks a phase boundary in a `@tilefish.kernel` body, a
+**What goes on inside a kernel** (`docs/en/instrument.md`): `tilefish.probe("load.wait")` marks a phase boundary in a `@tilefish.kernel` body, a
 `@triton.jit` or a `@gluon.jit` kernel, and a production build compiles it to nothing. The instrumented variant (`runtime.export(..., instrument=True)`,
 or `tilefish.run(..., probes=tilefish.Probes())` in jit) records `%globaltimer`, `%clock`, the SM and the probe for every warp into a buffer the host
 gives in the profile scratch slot, with binaries and digests of its own that every host refuses unless asked; Python and Rust collect the records after a

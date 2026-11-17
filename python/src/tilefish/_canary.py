@@ -1,4 +1,4 @@
-"""The kernels of a cuDNN convolution's canary (``docs/manifest-schema-3.md``, section 9.4): the operands, made on the device, and the digest of ``y``.
+"""The kernels of a cuDNN convolution's canary (``docs/en/manifest-schema-3.md``, section 9.4): the operands, made on the device, and the digest of ``y``.
 
 A canary is ``{"seed": s, "y_digest": d}``: the pin run on operands made of the seed at the entry's shape gives a ``y`` whose digest is ``d``. Both
 are made on the device by the PTX below (:data:`CANARY_PTX`, the same text as the crate's ``src/canary.ptx``: a test holds them equal), which the
@@ -128,7 +128,7 @@ def hex_of(s1: int, s2: int) -> str:
     return f"{s1 & M64:016x}{s2 & M64:016x}"
 
 # the crate's src/canary.ptx, character for character (test_library_conv.py holds them equal)
-CANARY_PTX = """// The kernels of a cuDNN convolution's canary (docs/manifest-schema-3.md, section 9.4): the operands, made on the device, and the digest of y.
+CANARY_PTX = """// The kernels of a cuDNN convolution's canary (docs/en/manifest-schema-3.md, section 9.4): the operands, made on the device, and the digest of y.
 // The same text is in the Python package (tilefish/_canary.py, CANARY_PTX) and in the crate (src/canary.ptx, include_str!): a test holds them
 // equal. The driver compiles it for the device it is loaded on (PTX for sm_70 and later), so neither host needs a compiler.
 //

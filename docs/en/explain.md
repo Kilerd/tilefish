@@ -1,6 +1,6 @@
 # SASS traceability: traces, `tilefish-explain` and SASS assertions
 
-**English** | [简体中文](zh-CN/explain.md)
+**English** | [简体中文](../zh-CN/explain.md)
 
 Every kernel goes DSL / Triton / Gluon → TTIR → TTGIR → LLVM IR → PTX → `ptxas` → SASS. Tracing a hot spot or a bit difference back through that
 chain used to mean dumping and diffing every level by hand, and sampling profilers attribute the time of asynchronous `wgmma` / `tcgen05` code to the
@@ -12,8 +12,8 @@ points that wait for it rather than to the work. tilefish makes the SASS of ever
 3. **SASS assertions** are part of a declaration and checked at every build like the TF32 guard and the contraction check (section 4).
 
 The code is `tilefish._trace`, `tilefish.explain` and `tilefish._sass`. Which steps of a plan could be one kernel, and what that would save, is
-`tilefish-explain --advise` (`docs/advise.md`); what goes on inside a kernel, timed at the phase boundaries it declares, is `tilefish-explain --probes`
-(`docs/instrument.md`).
+`tilefish-explain --advise` (`docs/en/advise.md`); what goes on inside a kernel, timed at the phase boundaries it declares, is `tilefish-explain --probes`
+(`docs/en/instrument.md`).
 
 ## 1. The trace
 
@@ -37,7 +37,7 @@ trace/
     lines.json                       the line table: per instruction its address, source file and line, and PTX line (nvdisasm -gp)
     nodes.json                       a lowered kernel or a fused region: what each line of its generated source was written for
   graphs/<graph>.json                a graph: the steps of each bucket of its plan, the ops of the graph body each fused region took (and its
-                                     template), and why the regions are where they are ("boundaries", docs/advise.md section 4)
+                                     template), and why the regions are where they are ("boundaries", docs/en/advise.md section 4)
   graphs/source/<name>               the files of the graph body those ops were written on
 ```
 

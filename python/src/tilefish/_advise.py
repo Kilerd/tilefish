@@ -1,5 +1,5 @@
 """The plan-level fusion advisor (``tilefish-explain DIR --graph G --advise``, :func:`tilefish.advise`): which steps of a launch plan could be one
-kernel, how many bytes and microseconds that would save, and what to do about it (``docs/advise.md``).
+kernel, how many bytes and microseconds that would save, and what to do about it (``docs/en/advise.md``).
 
 It reads an export directory and needs no GPU: the plan (the steps of each bucket, their buffers and views), the manifest (what each step launches: a
 pinned GEMM or convolution and its sizes, a kernel and the access of each of its pointers, whether tilefish generated it and with which template), the
@@ -81,14 +81,14 @@ MACHINES: "dict[str, Machine]" = {
 
 _ITEMSIZE = {"bf16": 2, "f16": 2, "f32": 4, "i32": 4, "i64": 8, "u8": 1, "e4m3": 1, "e5m2": 1}
 _GENERATED_COPY = re.compile(r"^(contiguous|im2col1d|im2col|col2im1d)_")
-_EPI = re.compile(r"_epi_[0-9a-f]{12}$")  # an extern with a region in its epilogue hook (docs/rfcs/0003-epilogue-fusion.md): <extern>_epi_<hash>
+_EPI = re.compile(r"_epi_[0-9a-f]{12}$")  # an extern with a region in its epilogue hook (docs/en/rfcs/0003-epilogue-fusion.md): <extern>_epi_<hash>
 _LOWERED_BLOCK = re.compile(r"^BLOCK(_D)?(_\d+)?$")  # the constexpr every kernel tilefish.lower writes has (the elementwise and the row template)
 _MMA = re.compile(r"\b(HMMA|IMMA|QMMA|OMMA|DMMA|HGMMA|IGMMA|QGMMA|UTCHMMA|UTCQMMA|UTCIMMA|UTCOMMA)\b")
 _PHASES = ("1", "E2", "2", "4", "future")  # "E2": a mode to declare (RFC 0003, cuBLASLt epilogues), available now
 STREAMING = 0.25  # a measured step moving its bytes (above the launch floor) at this share of the bandwidth or more is taken to be bound by them
 CLASSES = ("library", "fused", "elementwise", "row", "copy", "opaque")
 
-# blocker -> (what to do, the phase of docs/rfcs/0001-plan-fusion.md that does it). The reasons of the fusion pass (tilefish._fusion.boundaries) are
+# blocker -> (what to do, the phase of docs/en/rfcs/0001-plan-fusion.md that does it). The reasons of the fusion pass (tilefish._fusion.boundaries) are
 # merged in at import below.
 BLOCKERS: "dict[str, tuple[str, str]]" = {
     "opaque-extern": ("write this extern's arithmetic in the graph body so fusion takes it (an elementwise one or, with order= on its sums, a row one)", "1"),
@@ -221,7 +221,7 @@ class StepInfo:
     contracts: bool = False  # a @tilefish.kernel that lets the compiler contract (fp_fusion not False)
     mma: "bool | None" = None  # an opaque kernel: whether its SASS has MMAs (None: unknown, no trace)
     arith_bound: bool = False  # measured: it moves its bytes (above the launch floor) at less than STREAMING of the bandwidth
-    # an extern with epilogue hooks (docs/rfcs/0003-epilogue-fusion.md): the values of its hooks ("out", "acc"); ``None`` when it has hooks the export
+    # an extern with epilogue hooks (docs/en/rfcs/0003-epilogue-fusion.md): the values of its hooks ("out", "acc"); ``None`` when it has hooks the export
     # does not say (a generated module without a fusion report); and a step that is an extern with a region in its hook: the contract ("exact" or
     # "accumulator")
     hooks: "tuple[str, ...] | None" = ()
@@ -301,7 +301,7 @@ class _Export:
         version = ((report or {}).get("fusion") or {}).get("version", 1)
         self.version = version if isinstance(version, int) and not isinstance(version, bool) else 1
         self.regions: "dict[str, dict[str, Any]]" = {}  # region kernel name -> {"index", "template", "ops", "body", "version"}
-        # docs/rfcs/0003-epilogue-fusion.md: the externs with epilogue hooks the graph calls (name -> the values of their hooks), the steps that are an
+        # docs/en/rfcs/0003-epilogue-fusion.md: the externs with epilogue hooks the graph calls (name -> the values of their hooks), the steps that are an
         # extern with a region in its hook (op -> the report's entry), and the regions an extern's hook did not take (region kernel -> why)
         self.hooks: "dict[str, tuple[str, ...]]" = {k: tuple(h.get("value") for h in v) for k, v in ((report or {}).get("hooks") or {}).items()}
         self.hooked: "dict[str, dict[str, Any]]" = {}
@@ -727,7 +727,7 @@ def _edge_blockers(e: Edge, infos: "Sequence[StepInfo]", ex: _Export, shapes: "M
                 e.blockers.append(reason)
                 e.detail.append(detail)
     hooked_reasons = _hook_reasons(a, b, ex) if a.cls == "opaque" and a.hooks != () and b.cls == "fused" else []
-    for reason, detail in hooked_reasons:  # an extern's hook that did not take the region: why (docs/rfcs/0003-epilogue-fusion.md)
+    for reason, detail in hooked_reasons:  # an extern's hook that did not take the region: why (docs/en/rfcs/0003-epilogue-fusion.md)
         if reason not in e.blockers:
             e.blockers.append(reason)
             e.detail.append(detail)
@@ -1083,7 +1083,7 @@ class Advice:
         return out
 
     def _routes(self, steps: "Sequence[int]", es: "Sequence[Edge]", saved_us: "Mapping[str, float]") -> "list[dict[str, Any]]":
-        """The routes into the producer of an epilogue candidate (docs/rfcs/0003-epilogue-fusion.md, section 5): for a pinned GEMM or convolution,
+        """The routes into the producer of an epilogue candidate (docs/en/rfcs/0003-epilogue-fusion.md, section 5): for a pinned GEMM or convolution,
         E2 / E6 (a library epilogue, contract (iii)), E3 (a generated op with hooks, its break-even slowdown) and E1 (an extern with a hook, today);
         for an extern with epilogue hooks, each hook with its contract and what it needs; for an extern bound by its arithmetic, a hook to declare.
         Each with the saving at the ranked bucket. The advisor never chooses between routes that give other bytes: the declaration does."""
@@ -1310,7 +1310,7 @@ class Advice:
                 lines.append(f"        why not today: {w}")
             for a in c["actions"]:
                 lines.append(f"        do: {a}")
-            for rt in c.get("routes") or []:  # an epilogue's routes, each with its contract (docs/rfcs/0003-epilogue-fusion.md)
+            for rt in c.get("routes") or []:  # an epilogue's routes, each with its contract (docs/en/rfcs/0003-epilogue-fusion.md)
                 be = f"; worth it while the generated op is under {rt['break_even']}x the pinned op's time" if rt.get("break_even") else ""
                 value = f" ({rt['value']})" if rt.get("value") else ""
                 lines.append(f"        route {rt['milestone']} {rt['route']}{value}: contract {rt['contract']}; {rt['status']}; ~{rt['saved_us']} us{be}")
@@ -1394,7 +1394,7 @@ def advise(
     keep: "Iterable[str]" = (),
     gop: Any = None,
 ) -> Advice:
-    """The fusion advice for the plan of ``graph`` in the export ``directory`` (see the module's doc and ``docs/advise.md``).
+    """The fusion advice for the plan of ``graph`` in the export ``directory`` (see the module's doc and ``docs/en/advise.md``).
 
     ``bucket``: one bucket (``"M=64"`` or ``{"M": 64}``), else every bucket, ranked at the one that moves the most bytes; ``timing``: the file (or the
     document) :func:`tilefish.profile_plan` wrote for one bucket, whose times replace the estimates; ``machine``: an architecture of :data:`MACHINES` or a

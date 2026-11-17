@@ -1,13 +1,13 @@
 # The C++ host
 
-**English** | [简体中文](../zh-CN/guide/cpp.md)
+**English** | [简体中文](../../zh-CN/guide/cpp.md)
 
 `crates/tilefish-capi` is the C ABI of the Rust host: `libtilefish_capi` (a
 shared and a static library) and `tilefish.h`, which cbindgen generates from the
 crate and a test keeps current, with a header-only C++17 wrapper, `tilefish.hpp`.
 Every load, verification, check and launch is the `tilefish` crate's: there is
 no second implementation, so a C++ host refuses what the Rust host refuses and
-runs the same machine code (`docs/rfcs/0002-cpp-host.md`). No manifest or plan
+runs the same machine code (`docs/en/rfcs/0002-cpp-host.md`). No manifest or plan
 schema changes.
 
 ```sh

@@ -1,4 +1,4 @@
-//! Reading a launch plan: `plan.json`, schema `tilefish.plan.v1` (`docs/plan-schema-1.md`).
+//! Reading a launch plan: `plan.json`, schema `tilefish.plan.v1` (`docs/en/plan-schema-1.md`).
 //!
 //! A port of `read_plan`, `validate_doc`, `plan_digest` and `check_against_manifest` of `python/src/tilefish/_plan.py`. A plan is a
 //! `@tilefish.graph` compiled into, for every combination of the bucket values of its dimensions, an ordered list of *steps* (each one
@@ -76,7 +76,7 @@ const COPY_KEYS: [&str; 2] = ["kind", "args"];
 /// A memset step neither: the bytes of its one argument, `dst`, set to zero.
 const MEMSET_KEYS: [&str; 2] = ["kind", "args"];
 
-/// What a buffer of a plan is, and who provides it (`docs/plan-schema-1.md`, section 6).
+/// What a buffer of a plan is, and who provides it (`docs/en/plan-schema-1.md`, section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BufferRole {
     /// A graph parameter that a call gives every time (an activation): the caller's, read. Declared by the graph when the plan says
@@ -95,7 +95,7 @@ pub enum BufferRole {
     Devscalar,
     /// The cuBLASLt workspace of the GEMMs: in the arena.
     Workspace,
-    /// A parameter whose tensor the arena holds, not the caller (`docs/plan-schema-1.md`, section 15.2): in the arena's carried region, after the
+    /// A parameter whose tensor the arena holds, not the caller (`docs/en/plan-schema-1.md`, section 15.2): in the arena's carried region, after the
     /// regions of its plans, where the host places it (its `offset` is `null`). A step may read it (an earlier execution on the arena wrote it) and
     /// write it.
     Carried,
@@ -1368,20 +1368,20 @@ fn read_document(label: &str, bytes: &[u8], pin: Pin<'_>) -> Result<(Validated, 
 }
 
 impl LaunchPlan {
-    /// Load `<directory>/plan.json` (or the plan file itself) and the manifest next to it, and verify both (`docs/plan-schema-1.md`, section 3).
+    /// Load `<directory>/plan.json` (or the plan file itself) and the manifest next to it, and verify both (`docs/en/plan-schema-1.md`, section 3).
     ///
     /// `pin` is the trust anchor, as for a manifest: [`Pin::Digest`] with the plan's digest (what Python's `tilefish.runtime.export` returned,
     /// `Plan.digest`), and a plan with any other content is refused; or [`Pin::TrustDirectory`], which accepts whatever the directory holds (its
     /// digests are only as good as its permissions). Either way the file's own `plan_digest` must be its digest (an edit that did not rewrite it
     /// is refused), every rule of the format must hold, the manifest in the same directory must have the digest the plan names (it is loaded
     /// with that pin, every cubin verified), and every step must be what the manifest's entries say. A plan of another architecture than the
-    /// device is refused when it is instantiated. The plan of an **instrumented** export (`docs/instrument.md`) is refused, as its manifest is
+    /// device is refused when it is instantiated. The plan of an **instrumented** export (`docs/en/instrument.md`) is refused, as its manifest is
     /// ([`Manifest::load`]): load it with [`LaunchPlan::load_instrumented`].
     pub fn load(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
         Self::load_variant(path.as_ref(), pin, false)
     }
 
-    /// [`LaunchPlan::load`] of the plan of an **instrumented** export (`docs/instrument.md`): verified the same way, its manifest loaded with
+    /// [`LaunchPlan::load`] of the plan of an **instrumented** export (`docs/en/instrument.md`): verified the same way, its manifest loaded with
     /// [`Manifest::load_instrumented`]. Run it with [`LaunchPlan::instantiate_probed`] to collect its probes.
     pub fn load_instrumented(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
         Self::load_variant(path.as_ref(), pin, true)
@@ -1523,7 +1523,7 @@ impl LaunchPlan {
     }
 
     /// The parameters of role `carried`, in the order of the graph's signature: the buffers the arena holds between executions, not the caller
-    /// (`docs/plan-schema-1.md`, section 15.2).
+    /// (`docs/en/plan-schema-1.md`, section 15.2).
     pub fn carried(&self) -> impl Iterator<Item = &str> {
         self.inner.buffers.iter().filter(|b| b.role == BufferRole::Carried).map(|b| b.name.as_str())
     }

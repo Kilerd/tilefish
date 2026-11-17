@@ -1,4 +1,4 @@
-"""The persistent, warp-specialised GEMM of ``python/examples/persistent_gemm.py`` on a GPU (``docs/rfcs/0003-epilogue-fusion.md``, experiment X8).
+"""The persistent, warp-specialised GEMM of ``python/examples/persistent_gemm.py`` on a GPU (``docs/en/rfcs/0003-epilogue-fusion.md``, experiment X8).
 
 * its bytes are cuBLASLt's pinned GEMM's (``heuristic="torch"``) wherever the pin does not split ``k``, in every layout and both 16-bit types,
   at every bucket (sm_100 and sm_103: X3 and X8 measured it there; X7, the same question on sm_120, is a later gate's);

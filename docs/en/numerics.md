@@ -1,6 +1,6 @@
 # Numerics: the CUDA math guard, the procedure on a CUDA or torch change, and decisions
 
-**English** | [简体中文](zh-CN/numerics.md)
+**English** | [简体中文](../zh-CN/numerics.md)
 
 The numerics contract of a lowered kernel is the docstring of `tilefish.lower` (its table and notes 1 to 20): every op, the PTX it becomes,
 and what its bits are, measured. This document is about what that contract depends on outside tilefish, how to check it again when that
@@ -122,7 +122,7 @@ Triton (and so its libdevice) changes, or on a new GPU architecture.
   is silent. So it costs the default posture `addmm`'s bytes on 2 of the 15 biased shapes of `test_gpu_gemm.py` under 13.1.0 (all 15 under
   12.8.4), and a caller who wants `torch.addmm`'s bytes declares `heuristic="torch"`, which matches it on every shape measured (12.8.4 and
   13.1.0). Relaxing the rule per algorithm would need an exhaustive check of each split-K algorithm with the bias epilogue on each device and
-  cuBLASLt version; it is not planned. The rule extends to every epilogue of `cublaslt.matmul` but `none` (`docs/manifest-schema-3.md`, section 9.5):
+  cuBLASLt version; it is not planned. The rule extends to every epilogue of `cublaslt.matmul` but `none` (`docs/en/manifest-schema-3.md`, section 9.5):
   a ReLU applied to a sum already rounded would round twice the same way. There, where a declaration opts in, the verification of each pin (the
   formula on the accumulator, bit for bit) says whether a split-K pin keeps the one rounding: such a pin is recorded binary-defined when it does not.
 

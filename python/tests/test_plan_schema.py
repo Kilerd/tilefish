@@ -1,4 +1,4 @@
-"""The plan document (``plan.json``, ``tilefish.plan.v1``): what is written, how it is digested, and everything a reader refuses (``docs/plan-schema-1.md``).
+"""The plan document (``plan.json``, ``tilefish.plan.v1``): what is written, how it is digested, and everything a reader refuses (``docs/en/plan-schema-1.md``).
 
 These tests export the plan of a transformer block into a real manifest directory with fake builds (``plan_fakes``: no GPU), then read it back as a replay does:
 the digest, the pin, the manifest it names, every rule of the format, and that the document is the plan of the graph in this process. A Rust reader implements the

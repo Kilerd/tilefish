@@ -20,7 +20,7 @@ Repository = "https://github.com/Kilerd/tilefish"
 # and `import tilefish` never imports them.
 gpu = ["torch>=2.9", "triton>=3.5", "cuda-python>=12.8"]
 # CUDA 13's nvdisasm, which reads the SASS of every architecture tilefish builds for (Triton 3.5.1's bundled CUDA 12.8 one cannot decode sm_103): the
-# SASS assertions and tilefish-explain prefer it (docs/explain.md)
+# SASS assertions and tilefish-explain prefer it (docs/en/explain.md)
 sass = ["nvidia-cuda-nvdisasm>=13; sys_platform == 'linux' or sys_platform == 'win32'"]
 
 [dependency-groups]
@@ -30,7 +30,7 @@ dev = ["pytest>=8"]
 testpaths = ["tests"]
 markers = [
     "gpu: needs a CUDA device with torch, triton and cuda-python; skipped automatically when any is missing",
-    "cuda_math: the exhaustive comparisons with CUDA's math library, to run again on a CUDA or torch change (docs/numerics.md)",
+    "cuda_math: the exhaustive comparisons with CUDA's math library, to run again on a CUDA or torch change (docs/en/numerics.md)",
 ]
 
 [build-system]

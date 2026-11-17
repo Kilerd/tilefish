@@ -1,5 +1,5 @@
 //! A pinned cuDNN forward convolution of a manifest's `library` section (`impl: "cudnn.conv_fwd"`), read strictly, loaded and launched with the
-//! checks of a kernel (`docs/manifest-schema-3.md`, section 9.4).
+//! checks of a kernel (`docs/en/manifest-schema-3.md`, section 9.4).
 //!
 //! `y = conv(x, w)`: the cross-correlation of `x` (`[N, C, *S]` in the layout NCHW, `[N, *S, C]` in NHWC) with `w` (`[K, C/G, *R]` or
 //! `[K, *R, C/G]`), with `G` groups and, per spatial axis (one, two or three), a stride, a symmetric zero padding and a dilation; f16, bf16 or f32

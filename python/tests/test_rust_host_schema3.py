@@ -1,6 +1,6 @@
 """The Rust emitter on manifest schema 3: strided views, device scalars, prebuilt binaries with fixed arguments, and pinned cuBLASLt GEMMs.
 
-``tilefish.hosts.rust.emit`` writes one launcher per stem for everything the manifest can describe (``docs/manifest-schema-3.md``): the
+``tilefish.hosts.rust.emit`` writes one launcher per stem for everything the manifest can describe (``docs/en/manifest-schema-3.md``): the
 snapshots are in ``tests/golden/`` (regenerate with ``UPDATE_GOLDEN=1 pytest tests/test_rust_host_schema3.py`` and review the diff). The manifests here are
 built from fake binaries, so nothing needs a GPU, Triton or the Rust crate; ``cargo check`` of the emitted modules against the crate is the last
 test (it runs once the crate in the checkout reads schema 3 and has ``Gemm``). What the emitter refuses is checked field by field, like
@@ -159,7 +159,7 @@ def test_launchers_for_pinned_gemms(tmp_path):
     assert 'pub const SHAPES: &\'static [&\'static [&\'static str]] = &[&["M", "Kb"], &["2048", "Kb"], &["2048"], &["M", "2048"]];' in source
 
 
-# -- GEMMs with a cuBLASLt epilogue (cublaslt.matmul, docs/manifest-schema-3.md section 9.5) ---------------------------------------------------
+# -- GEMMs with a cuBLASLt epilogue (cublaslt.matmul, docs/en/manifest-schema-3.md section 9.5) ---------------------------------------------------
 
 MM = Dim("M", buckets=[32, 64])
 

@@ -1,4 +1,4 @@
-"""The instrumented variant on a GPU (``docs/instrument.md``): the kernels of ``probe_kernels.py``, a warp-specialised Gluon producer and consumer, a
+"""The instrumented variant on a GPU (``docs/en/instrument.md``): the kernels of ``probe_kernels.py``, a warp-specialised Gluon producer and consumer, a
 tcgen05 MMA pipeline (sm_100 and sm_103), a persistent Triton kernel and an elementwise ``@tilefish.kernel``, built with their probes.
 
 Held here:

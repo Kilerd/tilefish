@@ -103,5 +103,5 @@ class TilefishCacheWarning(UserWarning):
 class TilefishOrderWarning(RuntimeWarning):
     """A plan's arena is used in a way whose order tilefish cannot see: a CUDA graph the caller captured from a plan (``tilefish.run`` inside
     ``torch.cuda.graph``) is replayed without a lock of tilefish, so on an arena that more than one thread uses it can overlap an execution of
-    another thread (``docs/plan-schema-1.md``, section 10, item 7). Turn it into an error with ``warnings.simplefilter("error",
+    another thread (``docs/en/plan-schema-1.md``, section 10, item 7). Turn it into an error with ``warnings.simplefilter("error",
     tilefish.TilefishOrderWarning)``."""

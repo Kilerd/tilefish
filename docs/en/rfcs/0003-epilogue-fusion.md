@@ -1,6 +1,6 @@
 # RFC 0003: Epilogue and prologue fusion
 
-**English** | [简体中文](../zh-CN/rfcs/0003-epilogue-fusion.md)
+**English** | [简体中文](../../zh-CN/rfcs/0003-epilogue-fusion.md)
 
 * **Status:** reviewed; the decisions of 2026-11-16 are recorded in "Decisions" below. Design and phase 0 experiments (section 6). Milestones E1,
   epilogue hooks on externs ("E1: implementation notes" below), and E2, cuBLASLt epilogues (section 7.3: what was built, what was measured and what
@@ -10,7 +10,7 @@
   of its operands. The RFC touches the planner and the fusion pass (`tilefish._plan`, `tilefish._fusion`), the library ops (`cublaslt.*`,
   `cudnn.conv_fwd`), externs, a new family of generated GEMM and convolution ops and the advisor. Only library epilogues touch the manifest and the
   hosts.
-* **Baseline:** tilefish 0.0.10 / crate 0.0.8, which include the fusion advisor (`docs/advise.md`).
+* **Baseline:** tilefish 0.0.10 / crate 0.0.8, which include the fusion advisor (`docs/en/advise.md`).
 * **Relation to RFC 0001.** RFC 0001 (plan fusion) fuses graph-body arithmetic between calls and promises that fusion never changes bytes. Its
   section 7 sketched three routes into a call, and its section 11.2 deferred library epilogues. This RFC replaces those sketches. It is a separate
   document, not a section of 0001, for two reasons. RFC 0001 is reviewed, and its decisions D1 to D7 rest on a contract that has exact modes only.
@@ -261,7 +261,7 @@ graph's for the ops traced in it (Q3):
 
 X8 asked whether a GEMM of tilefish's own can be fast enough that fusing into it pays (Q5), and whether its bytes are the library's (the E3
 question, contract (i-d)). The kernel is an example, `python/examples/persistent_gemm.py`, which shows the hooks in a kernel fast enough to
-fuse into; it is not a supported feature (`docs/scope.md`: tilefish does not compete with the libraries on kernel speed). What follows is the
+fuse into; it is not a supported feature (`docs/en/scope.md`: tilefish does not compete with the libraries on kernel speed). What follows is the
 experiment's record.
 
 **The kernel.** `c = a @ b`, bf16 or f16 operands, an f32 accumulator, the four layouts of `cublaslt.gemm` (`TN`, `NN`, `TT`, `NT`), the hooks
@@ -433,7 +433,7 @@ columns are:
 
 With bias + GELU the epilogue's wait falls to 2.8 us, the hook takes 1.2 us a sub-tile, and the issuer waits 2.6 us a tile for an accumulator:
 the epilogue is now the bottleneck by about 20%. With the periodic activation the issuer's wait is 6.6 us. Production builds hold none of the
-probes (`docs/instrument.md`).
+probes (`docs/en/instrument.md`).
 
 ## 0. Background: what exists
 
@@ -441,9 +441,9 @@ probes (`docs/instrument.md`).
   `cublaslt.gemm_bias` adds a bias of the output type in f32 before that rounding (`CUBLASLT_EPILOGUE_BIAS`, the only epilogue tilefish uses
   today). The algorithm is pinned (its 64 bytes, the cuBLASLt version and the SM count). The pin is vetted against what cuBLASLt itself encodes and
   checked by `cublasLtMatmulAlgoCheck` at load. It is chosen as tilefish or torch would choose it, or imported from another engine (`AlgoTable`). A
-  GEMM with a bias gets no split-K unless it opts in, because a split-K with the bias epilogue was measured to round twice (`docs/numerics.md`,
+  GEMM with a bias gets no split-K unless it opts in, because a split-K with the bias epilogue was measured to round twice (`docs/en/numerics.md`,
   section 4). `cudnn.conv_fwd` has no bias. Its engine configuration is pinned per cuDNN version and SM count and checked at load by a canary
-  (`docs/manifest-schema-3.md`, section 9.4).
+  (`docs/en/manifest-schema-3.md`, section 9.4).
 * **Plan fusion stops at a call.** Phase 1 of RFC 0001 fuses the arithmetic of a graph body into generated regions. Each region is byte-identical to
   the unfused composition `U(P)`, and every export verifies it (D6). A call to a library op, an extern or a kernel is a region boundary. The
   arithmetic after a GEMM runs as route (a) of 0001 section 7: a generated kernel that reads the GEMM's stored, rounded result.
@@ -452,7 +452,7 @@ probes (`docs/instrument.md`).
   sm_120) that follow the original kernel's order of accumulation and its epilogue. To tilefish such an epilogue is just part of an extern. Route (c)
   below makes the same thing a feature of the planner.
 * **The advisor sees the gap.** `tilefish-explain --advise` lists every candidate whose latest blocker is `epilogue-library` or `prologue-library` as
-  future work (`docs/advise.md`, section 4). It lists every residual stream between two norms as `library-in-the-middle`. On the three ported models
+  future work (`docs/en/advise.md`, section 4). It lists every residual stream between two norms as `library-in-the-middle`. On the three ported models
   it ranks those candidates first by measured time. The largest single patterns are:
   * a GEMM followed by col2im, overlap-add and a periodic activation: 0.1 to 1.2 ms per instance, at short and long buckets;
   * a convolution followed by a bias and a periodic activation: 0.2 to 0.3 ms each;
@@ -905,7 +905,7 @@ with tilefish.fused(epilogues="accumulator"):                          # per reg
   with an `epilogue` field that has more values, `aux` and `beta`, and the optional `canary`.
   * The two existing impls stay byte for byte as they are, so every manifest that exists keeps loading.
   * A reader that predates the new impl refuses an entry that has it.
-  * The change is documented in `docs/manifest-schema-3.md` section 9, with the Python writer, both readers and the vectors in step.
+  * The change is documented in `docs/en/manifest-schema-3.md` section 9, with the Python writer, both readers and the vectors in step.
   * The modes need no manifest field (as RFC 0001 Q8): they are in each generated source's header and in the fusion report.
 
 ## 6. Experiments
@@ -1109,7 +1109,7 @@ it is the precondition of E4 and E5 for GEMMs that are library calls today.
 
 ### 7.3 E2 as built (2026-11-17)
 
-**The impl `cublaslt.matmul`** (Q7; `docs/manifest-schema-3.md`, section 9.5). `@tilefish.library(..., impl="cublaslt.matmul", epilogue=..., beta=...)`:
+**The impl `cublaslt.matmul`** (Q7; `docs/en/manifest-schema-3.md`, section 9.5). `@tilefish.library(..., impl="cublaslt.matmul", epilogue=..., beta=...)`:
 `epilogue` is `none`, `bias`, `relu` or `relu_bias` (cuBLASLt's `DEFAULT`, `BIAS`, `RELU`, `RELU_BIAS`), `beta=1` reads `c [M, N]` (`beta * C` with
 `beta = 1`); bf16 or f16 operands and a result of their type, the four layouts of `cublaslt.gemm`, both postures, the opt-ins, `sm_count_target` and
 `workspace_bytes`. Its arithmetic is `ρ(f(acc))` with `c` added before the bias, the library's order (X1). `cublaslt.gemm` and `cublaslt.gemm_bias` are

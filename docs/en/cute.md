@@ -1,12 +1,12 @@
 # CuTe DSL kernels as externs
 
-**English** | [简体中文](zh-CN/cute.md)
+**English** | [简体中文](../zh-CN/cute.md)
 
 CUTLASS's CuTe DSL (the `nvidia-cutlass-dsl` package, `import cutlass.cute as cute`) writes peak-performance kernels with asynchronous MMA pipelines
 (TMA, `tcgen05`, warp specialisation, clusters) in Python. tilefish takes such a kernel like any other extern: it compiles it to a cubin per
 architecture, pins it, and launches it from Python, Rust and the C ABI, in a single launch, a launch plan and a CUDA graph, with the launch
 attributes the compiled kernel has (its grid, block, cluster, dynamic shared memory and TMA descriptors). The manifest entry is specified in
-`docs/manifest-schema-3.md`, section 4.9; the code is `python/src/tilefish/_cute.py`.
+`docs/en/manifest-schema-3.md`, section 4.9; the code is `python/src/tilefish/_cute.py`.
 
 Contents: 1 declaring one; 2 how it is built; 3 what a host launches; 4 identity, pins and reproducibility; 5 limits; 6 the licence; 7 how it is tested.
 
@@ -84,7 +84,7 @@ refused; a cuBLASLt pin is per device too):
 4. **Check the launch.** The block must be the PTX entry's `.reqntid` and the cluster its `.reqnctapercluster` when it has them; a cluster of at most 8
    CTAs with the spread (or default) scheduling policy, no programmatic dependent or cooperative launch, a grid of blocks that is a whole number of
    clusters (the entry's grid counts clusters, section 4.5 of the schema), and no function attribute but the dynamic shared memory size.
-5. **SASS assertions** (`sass=tilefish.sass(...)`) are judged on the cubin and its PTX as for a prebuilt binary (`docs/explain.md`), and a traced export
+5. **SASS assertions** (`sass=tilefish.sass(...)`) are judged on the cubin and its PTX as for a prebuilt binary (`docs/en/explain.md`), and a traced export
    (`trace=True`) keeps the PTX the DSL generated and the SASS (`trace/<stem>.<arch>/ptx.ptx`, `sass.txt`). Probes are not available (the DSL compiles
    the kernel, not Triton).
 

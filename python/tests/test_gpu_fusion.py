@@ -1,4 +1,4 @@
-"""Plan fusion on a GPU (``docs/rfcs/0001-plan-fusion.md``): a fused plan writes the bytes of its unfused composition (every op a kernel of its
+"""Plan fusion on a GPU (``docs/en/rfcs/0001-plan-fusion.md``): a fused plan writes the bytes of its unfused composition (every op a kernel of its
 own, every intermediate stored in its dtype), for every input.
 
 * the inline casts of a region (note 20 of :mod:`tilefish.lower`) are ``.to()``'s bits on every f32, and keep no input NaN's payload through

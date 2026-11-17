@@ -1,4 +1,4 @@
-"""Plan fusion: the arithmetic written in a ``@tilefish.graph`` body, planned as generated kernels (``docs/rfcs/0001-plan-fusion.md``).
+"""Plan fusion: the arithmetic written in a ``@tilefish.graph`` body, planned as generated kernels (``docs/en/rfcs/0001-plan-fusion.md``).
 
 A graph body may compute: ``silu(h.to(f32) + b.to(f32)).to(bf16)`` between two GEMMs is traced like any kernel body. A launch plan launches
 declared operators, so the planner groups the traced arithmetic into **regions** and makes each region a ``@tilefish.kernel`` of its own (a
@@ -58,7 +58,7 @@ GROUPINGS = ("auto", "none")
 INTERMEDIATES = ("declared", "opmath")
 FP_CONTRACTS = ("none", "mul-add")
 MATHS = ("fast", "ieee")
-# docs/rfcs/0003-epilogue-fusion.md: how the arithmetic after a call is fused into it. "exact" (the default): through the epilogue hooks of externs,
+# docs/en/rfcs/0003-epilogue-fusion.md: how the arithmetic after a call is fused into it. "exact" (the default): through the epilogue hooks of externs,
 # which see the call's rounded result (contract (i), the bytes of the unfused composition); nothing else changes. "accumulator": the declared rewrite
 # R_acc (every widening of the result of an extern with an accumulator hook is the extern's f32 result) and hooks that see the accumulator (contract
 # (ii)); a library call is left as it is (R_acc of a library call is not planned). "library": the hooks of "exact", and the arithmetic after a cuBLASLt
@@ -112,7 +112,7 @@ class Fusion:
     fp_contract: str = "none"
     verify: bool = True
     sass: Any = None  # the SASS assertions of every region's kernel (tilefish.sass), or None
-    epilogues: str = "exact"  # docs/rfcs/0003-epilogue-fusion.md: "exact", "accumulator" (R_acc) or "library" (cuBLASLt's epilogues)
+    epilogues: str = "exact"  # docs/en/rfcs/0003-epilogue-fusion.md: "exact", "accumulator" (R_acc) or "library" (cuBLASLt's epilogues)
 
     def canonical(self) -> "dict[str, Any]":
         """What a region's kernel depends on (``verify`` is a check, not a choice of numerics, and is left out; ``sass`` only when given, so
@@ -164,7 +164,7 @@ def fusion(
       or ``False`` here skips it).
     * ``sass``: SASS assertions (:func:`tilefish.sass`) every region's kernel is built under (``tilefish.sass(no_spills=True, max_registers=64)``),
       checked at every build; in the regions' declaration digests and names (only when given).
-    * ``epilogues`` (``docs/rfcs/0003-epilogue-fusion.md``): how the arithmetic that reads a call's result is fused into the call.
+    * ``epilogues`` (``docs/en/rfcs/0003-epilogue-fusion.md``): how the arithmetic that reads a call's result is fused into the call.
 
       * ``"exact"``, the default: into an extern that declares an epilogue hook (``tilefish.hook``), through a hook that sees the extern's rounded
         result, so the plan writes the bytes of the extern followed by the region (contract (i)); nothing changes a byte.
@@ -203,7 +203,7 @@ def fusion(
 
 def fused_scope(*, epilogues: "str | None" = None) -> Any:
     """``with tilefish.fused(epilogues="accumulator"):`` in a graph body: the ops traced in the block are planned with these settings instead of the
-    graph's (``docs/rfcs/0003-epilogue-fusion.md``, Q3: a mode is declared per graph or per scope, never per call). ``epilogues`` is a value of
+    graph's (``docs/en/rfcs/0003-epilogue-fusion.md``, Q3: a mode is declared per graph or per scope, never per call). ``epilogues`` is a value of
     ``tilefish.fusion(epilogues=...)``: a widening ``y.to(f32)`` of an extern's result written in an ``"accumulator"`` scope is ``R_acc``'s, in an
     ``"exact"`` or ``"library"`` scope it is not, whatever the graph declares; the arithmetic after a cuBLASLt GEMM is rewritten into one of its
     epilogues where every op of the pattern (from ``y.to(f32)`` to the last ``.to()``, the widenings of ``c`` and the bias included) is in a
@@ -257,7 +257,7 @@ class Region:
 
 @dataclass(eq=False)
 class Hooked:
-    """A region fused into the extern call that makes its input, through the extern's epilogue hook (``docs/rfcs/0003-epilogue-fusion.md``): one call
+    """A region fused into the extern call that makes its input, through the extern's epilogue hook (``docs/en/rfcs/0003-epilogue-fusion.md``): one call
     of ``op`` (the extern with the region in its hook) in place of the call ``call`` (a program node), the region and the views of the call's result
     only they read."""
 
@@ -290,7 +290,7 @@ class Fused:
     rewrites: "list[dict[str, Any]]"
     settings: Fusion
     source: Graph  # the traced graph
-    hooked: "list[Hooked]" = field(default_factory=list)  # regions fused into an extern's epilogue hook (docs/rfcs/0003-epilogue-fusion.md)
+    hooked: "list[Hooked]" = field(default_factory=list)  # regions fused into an extern's epilogue hook (docs/en/rfcs/0003-epilogue-fusion.md)
     # an extern call whose result a region reads that no hook took: {"call": program node, "region": index, "reason", "detail"}
     refused: "list[dict[str, Any]]" = field(default_factory=list)
     renamed: "dict[Value, Value]" = field(default_factory=dict)  # R_acc: a returned value the rewrite replaced -> its replacement
@@ -429,7 +429,7 @@ class _Pass:
         return nodes, origin
 
     def _r_acc(self, nodes: "list[Node]", origin: "list[int]") -> "tuple[list[Node], list[int]]":
-        """``R_acc`` (``docs/rfcs/0003-epilogue-fusion.md``, contract (ii)): a call of an extern with an ``acc`` hook whose result ``y`` (a 16-bit
+        """``R_acc`` (``docs/en/rfcs/0003-epilogue-fusion.md``, contract (ii)): a call of an extern with an ``acc`` hook whose result ``y`` (a 16-bit
         float) is widened, ``y.to(f32)``, in an ``"accumulator"`` mode (the graph's or a ``tilefish.fused`` scope's), becomes a call of its
         accumulator form, which also writes the f32 result ``acc``; every such widening is ``acc`` (of a split hook's chunk: that chunk of ``acc``),
         one rounding fewer. What reads ``y`` in its own type still reads it, rounded by the kernel. Defined on the IR, before any region is formed."""
@@ -1046,7 +1046,7 @@ class _Pass:
         r.reads = reads
         r.call_inputs = call_inputs  # type: ignore[attr-defined]
 
-    # -- 4. epilogue hooks (docs/rfcs/0003-epilogue-fusion.md) ------------------------------------------------------------------------
+    # -- 4. epilogue hooks (docs/en/rfcs/0003-epilogue-fusion.md) ------------------------------------------------------------------------
 
     def epilogues(self, regions: "list[Region]") -> None:
         """Fuse each region that reads the result of an extern call with an epilogue hook into that call, where it fits the hook: one call of the
@@ -1384,7 +1384,7 @@ class _Pass:
             return c
 
         for u in order:
-            if isinstance(u, Hooked):  # the extern with the region in its epilogue hook (docs/rfcs/0003-epilogue-fusion.md)
+            if isinstance(u, Hooked):  # the extern with the region in its epilogue hook (docs/en/rfcs/0003-epilogue-fusion.md)
                 call = prog[u.call]
                 # (a dense view at an offset not a multiple of 16 bytes is copied first too: the hook's parameter is compiled for an aligned pointer)
                 ins = [*u.inputs, *(given_of(u.region, v, given, ("materialised", "unaligned")) for v, given in u.region_inputs)]  # type: ignore[attr-defined]
@@ -1647,7 +1647,7 @@ def report(gop: Any, verification: "Mapping[int, Any] | None" = None) -> "dict[s
             "exact": True,
         }
         h = f.hooked_region(r)
-        if h is not None:  # fused into an extern's epilogue hook (docs/rfcs/0003-epilogue-fusion.md): one step, the extern's kernel with the region
+        if h is not None:  # fused into an extern's epilogue hook (docs/en/rfcs/0003-epilogue-fusion.md): one step, the extern's kernel with the region
             removed = [w for w in f.rewrites if w["kind"] == "accumulator" and w["node"] == f.origin[h.call]]
             item.update({
                 "op": h.op.name, "region": r.kernel.name, "template": h.op.__dict__["_tf_generated"].template, "route": "hook",
@@ -1750,7 +1750,7 @@ def library_epilogue_candidates(graph: Graph, settings: "Fusion | None" = None) 
 
 # -- why the regions are where they are (tilefish.advise) ------------------------------------------------------------------------------------
 
-# reason -> (what to do, the phase of docs/rfcs/0001-plan-fusion.md that does it)
+# reason -> (what to do, the phase of docs/en/rfcs/0001-plan-fusion.md that does it)
 BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
     "barrier": ("remove tilefish.barrier: a tap of the unfused plan (grouping='none') shows the same bytes", "1"),
     "view": (
@@ -1790,7 +1790,7 @@ BOUNDARY_FIXES: "dict[str, tuple[str, str]]" = {
     ),
     "epilogue-library": (
         "a pinned cuBLASLt GEMM's or cuDNN convolution's epilogue (RFC 0003): cuBLASLt's bias, ReLU and beta * C are an epilogue of cublaslt.matmul "
-        "(E2) under tilefish.fusion(epilogues='library') when written as its pattern (docs/advise.md); another epilogue of a cuBLASLt GEMM (GELU, ...) "
+        "(E2) under tilefish.fusion(epilogues='library') when written as its pattern (docs/en/advise.md); another epilogue of a cuBLASLt GEMM (GELU, ...) "
         "and a generated GEMM or convolution with hooks are E3, a cuDNN fused graph E6, future work. Today: call an extern with an epilogue hook "
         "instead (E1), whose fusion is exact (contract (i))",
         "future",
@@ -1920,7 +1920,7 @@ def boundaries(gop: Any) -> "list[dict[str, Any]]":
                 kind = pn.attrs.get("kind")
                 if kind in ("kernel", "extern", "library"):
                     h = f.hooked_region(r)
-                    if h is not None and h.call == pk:  # fused into the call's epilogue hook (docs/rfcs/0003-epilogue-fusion.md): no boundary
+                    if h is not None and h.call == pk:  # fused into the call's epilogue hook (docs/en/rfcs/0003-epilogue-fusion.md): no boundary
                         continue
                     refusal = next((x for x in f.refused if x["call"] == pk and x["region"] == r.index), None)
                     if refusal is not None:  # the call's extern has a hook, which does not take this region: why
@@ -2193,7 +2193,7 @@ def verify(gop: Any, combos: "Sequence[Mapping[str, int]]", *, seeds: "Sequence[
                         )
                 checked += 1
         results[r.index] = {"runs": checked, "buckets": len(combos), "seeds": len(seeds)}
-    for h in f.hooked:  # a region in an extern's epilogue hook: the pair against the extern and the region's ops (docs/rfcs/0003-epilogue-fusion.md)
+    for h in f.hooked:  # a region in an extern's epilogue hook: the pair against the extern and the region's ops (docs/en/rfcs/0003-epilogue-fusion.md)
         results[h.region.index] = _verify_hooked(f, h, combos, seeds, device)
     return results
 

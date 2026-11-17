@@ -1,4 +1,4 @@
-//! The instrumented cases of the Rust gate, on a real GPU (`docs/instrument.md`): the instrumented export and plan that `python/tests/rust_gate.py
+//! The instrumented cases of the Rust gate, on a real GPU (`docs/en/instrument.md`): the instrumented export and plan that `python/tests/rust_gate.py
 //! prepare` wrote (`WORK/instrumented.json`, `prepare_instrumented`), launched by this host with probes, for `rust_gate.py compare` to hold the outputs to
 //! the production bytes and the records to Python's.
 //!

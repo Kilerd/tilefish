@@ -1,6 +1,6 @@
 # Plan schema 1 (`plan.json`, `"tilefish.plan.v1"`)
 
-**English** | [简体中文](zh-CN/plan-schema-1.md)
+**English** | [简体中文](../zh-CN/plan-schema-1.md)
 
 A *launch plan* is a `@tilefish.graph` compiled into, for every combination of the bucket values of its dimensions, an ordered list of **steps** (each one
 launch of a manifest entry: a Triton kernel, a prebuilt PTX or cubin, or a pinned cuBLASLt GEMM) with every pointer argument bound to a **buffer** or a view of one,
@@ -9,11 +9,11 @@ that holds a verified plan and its manifest launches the steps in order on one s
 a CUDA graph once per bucket at fixed addresses.
 
 The Python package writes and reads this document (`tilefish.plan`, `tilefish.runtime.export`, `tilefish.run(graph, ..., mode="replay", plan=...)`). The Rust crate
-implements this specification, and the C++ host (`crates/tilefish-capi`, `docs/rfcs/0002-cpp-host.md`) runs plans through that Rust implementation, so what
+implements this specification, and the C++ host (`crates/tilefish-capi`, `docs/en/rfcs/0002-cpp-host.md`) runs plans through that Rust implementation, so what
 this document says of the Rust host holds for it too. Everything is checked by tests in `python/tests/` (named in section 14) and the Python code that writes or checks each part is
 named where the part is described (`python/src/tilefish/_plan.py`, `_planrun.py`).
 
-A reader of this document is assumed to know manifest schema 3 (`docs/manifest-schema-3.md`): the entries of `kernels` and `library`, the `abi`, the dimension
+A reader of this document is assumed to know manifest schema 3 (`docs/en/manifest-schema-3.md`): the entries of `kernels` and `library`, the `abi`, the dimension
 expression grammar, the `preconditions`, canonical JSON and the launch checks a host makes for one launch. A plan adds nothing to those: **a step is a launch of
 a manifest entry, checked and made exactly as a single launch is; the plan says which entry, with which memory.**
 
@@ -518,7 +518,7 @@ A graph body that a plan cannot make is refused by `tilefish.plan` with the rule
 * a **scatter** into an `InOut` parameter in the graph body, and a value read by `tilefish.load` that is returned, stored or passed to a call. (Other
   **arithmetic traced in the graph body**, `x + y`, a cast, a comparison, a reduction, is planned: the writer groups it into fused regions, each a step of
   kind `kernel` that launches a kernel tilefish generates, named `fused_<hash>` by its content, byte for byte the composition of one kernel per op;
-  `docs/rfcs/0001-plan-fusion.md`. The document has nothing new: a reader sees kernel steps of manifest entries, as for any `@tilefish.kernel`.)
+  `docs/en/rfcs/0001-plan-fusion.md`. The document has nothing new: a reader sees kernel steps of manifest entries, as for any `@tilefish.kernel`.)
 * an **`Out`** parameter of the graph (and so a `store` into one) and a runtime **`Dim`** parameter: a graph's results are its returned values (a `store` into an `InOut`
   parameter is a copy step, or a launch of `tilefish.contiguous` for a view that is not dense, section 7.5);
 * a call to **another graph** (it is not inlined yet).

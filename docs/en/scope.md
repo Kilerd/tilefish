@@ -1,6 +1,6 @@
 # What tilefish is, and what it is not
 
-**English** | [简体中文](zh-CN/scope.md)
+**English** | [简体中文](../zh-CN/scope.md)
 
 tilefish is a typed DSL for GPU inference. You describe tensors and operators with types (shape, dtype, layout,
 quantization format), build a model once into GPU binaries plus a manifest, and run that same artifact from Python,

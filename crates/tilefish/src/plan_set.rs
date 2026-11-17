@@ -1,4 +1,4 @@
-//! A plan set: several launch plans exported to one directory with **one manifest** (`docs/plan-schema-1.md`, section 15).
+//! A plan set: several launch plans exported to one directory with **one manifest** (`docs/en/plan-schema-1.md`, section 15).
 //!
 //! Python's `tilefish.runtime.export([g1, g2, ...], directory)` writes one `manifest.json` for all the plans (each binary once, whichever plans launch
 //! it), `<graph>.plan.json` per graph and the index `plans.json`, which lists the digest of every plan and has a digest of its own (`set_digest`). A
@@ -164,17 +164,17 @@ pub struct PlanSet {
 }
 
 impl PlanSet {
-    /// Read `<directory>/plans.json` and the manifest next to it (`docs/plan-schema-1.md`, section 15).
+    /// Read `<directory>/plans.json` and the manifest next to it (`docs/en/plan-schema-1.md`, section 15).
     ///
     /// `pin` is the trust anchor: [`Pin::Digest`] with the set's digest (what Python's export returned, `PlanSet.digest`), and an index with any
     /// other content is refused; or [`Pin::TrustDirectory`]. Either way the index's own `set_digest` must be its digest, every rule of the index must
     /// hold, and the manifest is loaded with the index's `manifest_digest` as its pin (every cubin verified). The plans are read by [`PlanSet::plan`].
-    /// The set of an **instrumented** export (`docs/instrument.md`) is refused: load it with [`PlanSet::load_instrumented`].
+    /// The set of an **instrumented** export (`docs/en/instrument.md`) is refused: load it with [`PlanSet::load_instrumented`].
     pub fn load(directory: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
         Self::load_variant(directory.as_ref(), pin, false)
     }
 
-    /// [`PlanSet::load`] of the set of an **instrumented** export (`docs/instrument.md`), its manifest loaded with
+    /// [`PlanSet::load`] of the set of an **instrumented** export (`docs/en/instrument.md`), its manifest loaded with
     /// [`Manifest::load_instrumented`]; its plans are run with [`LaunchPlan::instantiate_probed`] to collect their probes.
     pub fn load_instrumented(directory: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
         Self::load_variant(directory.as_ref(), pin, true)
@@ -268,7 +268,7 @@ impl PlanSet {
             // (verified once per set and served from then on: whichever load verified it, an instrumented one is refused here unless asked for)
             Ok(m) if m.is_instrumented() && !instrumented => {
                 return Err(Error::Manifest(format!(
-                    "the manifest of the plan set in {label:?} is an instrumented export (its kernels record probes: docs/instrument.md), a \
+                    "the manifest of the plan set in {label:?} is an instrumented export (its kernels record probes: docs/en/instrument.md), a \
                      diagnostic variant: load the set with PlanSet::load_instrumented to collect its probes, and run the production export \
                      everywhere else"
                 )));
@@ -369,7 +369,7 @@ impl PlanSet {
         SharedArena::bytes_for(&plans.iter().collect::<Vec<_>>())
     }
 
-    /// Instantiate the plans of graphs `names` on **one arena they share** (`docs/plan-schema-1.md`, section 15.1): a [`SharedArena`] of the
+    /// Instantiate the plans of graphs `names` on **one arena they share** (`docs/en/plan-schema-1.md`, section 15.1): a [`SharedArena`] of the
     /// largest of their arenas, allocated on `stream`, and every plan instantiated on it for every bucket combination
     /// ([`LaunchPlan::instantiate_all_in`]). A host that runs them one at a time (a request's stage A, then B, then C) pays for one arena, not
     /// one per plan: every launch and replay of any of them is ordered with those of the others, so none run concurrently, and nothing in the

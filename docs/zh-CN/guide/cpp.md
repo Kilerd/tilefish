@@ -1,8 +1,8 @@
 # C++ host
 
-[English](../../guide/cpp.md) | **简体中文**
+[English](../../en/guide/cpp.md) | **简体中文**
 
-`crates/tilefish-capi` 是 Rust host（宿主）的 C ABI：`libtilefish_capi`（一个共享库和一个静态库）和 `tilefish.h`（由 cbindgen 从 crate 生成，并由一个测试保持最新），外加一个仅头文件的 C++17 封装 `tilefish.hpp`。每一次加载、验证、检查和启动都由 `tilefish` crate 完成：没有第二套实现，因此 C++ host 拒绝 Rust host 所拒绝的，并运行相同的机器码（`docs/rfcs/0002-cpp-host.md`）。manifest（清单）和 plan（计划）的 schema（模式）都没有变化。
+`crates/tilefish-capi` 是 Rust host（宿主）的 C ABI：`libtilefish_capi`（一个共享库和一个静态库）和 `tilefish.h`（由 cbindgen 从 crate 生成，并由一个测试保持最新），外加一个仅头文件的 C++17 封装 `tilefish.hpp`。每一次加载、验证、检查和启动都由 `tilefish` crate 完成：没有第二套实现，因此 C++ host 拒绝 Rust host 所拒绝的，并运行相同的机器码（`docs/zh-CN/rfcs/0002-cpp-host.md`）。manifest（清单）和 plan（计划）的 schema（模式）都没有变化。
 
 ```sh
 cmake -S crates/tilefish-capi -B build && cmake --build build   # cargo builds the library

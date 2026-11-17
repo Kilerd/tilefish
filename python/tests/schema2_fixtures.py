@@ -1,4 +1,4 @@
-"""Migrating a manifest of schema 2 to schema 3 (``docs/manifest-schema-3.md``, section 11). Not collected: the name has no ``test_`` prefix.
+"""Migrating a manifest of schema 2 to schema 3 (``docs/en/manifest-schema-3.md``, section 11). Not collected: the name has no ``test_`` prefix.
 
 The committed fixtures of the Rust crate (``crates/tilefish/tests/fixtures``) were manifests of schema 2, which the crate 0.0.1 read; they are manifests of
 schema 3 now, written by ``export_rust_fixtures.py``. Python reads schema 3 only: a schema 2 manifest of Triton kernels becomes a schema 3 manifest by the

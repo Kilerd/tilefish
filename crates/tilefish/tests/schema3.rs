@@ -1,7 +1,7 @@
 //! What manifest schema 3 adds, read and checked with no GPU: strided views, device scalars, 64-bit scalars, fixed arguments, prebuilt
 //! binaries (no scratch slots) and the `library` section, on synthetic manifests around a small ELF file (`common::synthetic`).
 //!
-//! Each test builds one entry the way Python writes it (`docs/manifest-schema-3.md`), loads it through `Manifest::from_embedded`, and
+//! Each test builds one entry the way Python writes it (`docs/en/manifest-schema-3.md`), loads it through `Manifest::from_embedded`, and
 //! either asks the plan of the entry what it decides for a call made of regions (nothing is dereferenced: `Plan::prepare` looks at the
 //! numbers) or breaks the entry in one way and shows it refused.
 

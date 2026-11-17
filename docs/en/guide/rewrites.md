@@ -1,6 +1,6 @@
 # Rewrites that know about rounding
 
-**English** | [简体中文](../zh-CN/guide/rewrites.md)
+**English** | [简体中文](../../zh-CN/guide/rewrites.md)
 
 Types make fusion legality mechanical: elementwise chains into GEMM
 epilogues, a norm into the preceding residual add, quantization into the next
@@ -24,7 +24,7 @@ and the manifest, and a replay refuses an entry that has another. Measured, it
 is Triton's own reductions that depend on it; per-element ops, `argmax` and
 sums with an `order=` have the same bytes at every warp count, so a kernel
 whose every reduction has an order may change it for speed alone
-(`docs/numerics.md`). So is FMA
+(`docs/en/numerics.md`). So is FMA
 contraction: a generated kernel always says whether `a * b + c` may be one
 rounding (`@tilefish.kernel(fp_fusion=False)` says no), and a hand-written one
 says it with `@tilefish.extern(triton=..., enable_fp_fusion=False)` (Triton's
@@ -39,7 +39,7 @@ and every binary built with `enable_fp_fusion=False`, a hand-written Triton or
 Gluon kernel's included, is read back at build: one whose SASS has more fused
 multiply-adds than the SASS of its PTX with the multiplies taken out is refused,
 with the kernel's name and the fix (scalar `.rn` inline PTX for the roundings
-that matter, or `enable_fp_fusion=True`; `docs/numerics.md`).
+that matter, or `enable_fp_fusion=True`; `docs/en/numerics.md`).
 
 Whether a legal fusion is worth doing is still measured, not assumed. The
 measurements live in the repository next to the rules.

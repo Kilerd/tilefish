@@ -19,10 +19,10 @@ it disassembles the cubin of the manifest (an ``nvdisasm`` that decodes the arch
 an op then). The module-relative source names of the line information (``kernels/mm.py``, ``tilefish_generated/rmsnorm.py``) are resolved in
 the trace's copies first, then under each ``--source-root`` (default: the working directory), so it works from any directory.
 
-``--probes FILE`` explains the records of an instrumented run (:mod:`tilefish._probes`, ``docs/instrument.md``): the phases between the probes with
+``--probes FILE`` explains the records of an instrumented run (:mod:`tilefish._probes`, ``docs/en/instrument.md``): the phases between the probes with
 their durations and distributions per warp role, what a probe costs and the overhead; ``--timeline sm|cta|role`` and ``--chrome OUT`` (Perfetto).
 
-``--graph G --advise`` is the plan-level fusion advisor (:mod:`tilefish._advise`, ``docs/advise.md``): which steps of the plan could be one kernel,
+``--graph G --advise`` is the plan-level fusion advisor (:mod:`tilefish._advise`, ``docs/en/advise.md``): which steps of the plan could be one kernel,
 what that would save and what to do; ``--profile OUT`` times every step of the plan on the device first (:mod:`tilefish._profile`).
 """
 
@@ -553,7 +553,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--diff", metavar="OTHER_DIR", help="compare with the same kernel in another export directory")
     p.add_argument("--diff-arch", metavar="ARCH", help="compare with the same kernel for another architecture")
     p.add_argument("--json", action="store_true", help="print the view as JSON (summary, lines, the advice)")
-    a = p.add_argument_group("fusion advice (docs/advise.md)")
+    a = p.add_argument_group("fusion advice (docs/en/advise.md)")
     a.add_argument("--advise", action="store_true", help="rank the fusion candidates of the plan of --graph: the steps, bytes and time saved, what to do")
     a.add_argument("--timing", metavar="FILE", help="--advise with the measured times of one bucket (what --profile or tilefish.profile_plan writes)")
     a.add_argument("--machine", metavar="ARCH", help="--advise with the roofline of this architecture (default: the plan's; sm_90, sm_100, sm_103, sm_120)")
@@ -568,7 +568,7 @@ def _parser() -> argparse.ArgumentParser:
     a.add_argument("--devscalar", action="append", default=[], metavar="NAME=VALUE", help="--profile: the value of a device scalar (repeatable; every one is needed)")
     a.add_argument("--pin", help="--profile: the plan's (or plan set's) digest the replay is checked against")
     a.add_argument("--trust-directory", action="store_true", help="--profile: replay whatever plan the directory holds, without a pin")
-    r = p.add_argument_group("the probes of an instrumented run (docs/instrument.md)")
+    r = p.add_argument_group("the probes of an instrumented run (docs/en/instrument.md)")
     r.add_argument("--probes", metavar="FILE", help="the records of an instrumented run (ProbeTrace.save, the Rust host's ProbeTrace::save): phases and their durations")
     r.add_argument("--timeline", choices=("sm", "cta", "role"), help="--probes: the timeline per SM, per CTA (every warp) or per warp role (one warp each)")
     r.add_argument("--chrome", metavar="OUT", help="--probes: also write a Chrome trace of the phases to OUT (chrome://tracing, ui.perfetto.dev)")

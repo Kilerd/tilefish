@@ -1,7 +1,7 @@
 """Typed C++ launchers for a manifest: ``emit(manifest, "launchers.hpp")``; and a typed runner of a launch plan: ``emit_plan(directory, "runner.hpp", pin=...)``.
 
 The C++ host is the C ABI of the Rust host (``libtilefish_capi``, ``crates/tilefish-capi``) with its header-only C++17 wrapper
-``tilefish.hpp`` (``docs/rfcs/0002-cpp-host.md``): it loads a manifest directory, verifies its digests and launches what it describes with
+``tilefish.hpp`` (``docs/en/rfcs/0002-cpp-host.md``): it loads a manifest directory, verifies its digests and launches what it describes with
 every check of the Rust crate. :func:`emit` writes the part that is specific to one manifest, as :mod:`tilefish.hosts.rust` does for Rust:
 one header with a class per binary (per stem, so per bucket) whose ``launch`` takes the tensors by name, with the element type in the C++
 type (``tilefish::TensorRef<tilefish::Bf16>``), so that an ``f32`` tensor cannot be passed where a ``bf16`` one is wanted, and whose doc

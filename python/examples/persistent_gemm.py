@@ -1,4 +1,4 @@
-"""A persistent, warp-specialised GEMM with epilogue hooks (``docs/rfcs/0003-epilogue-fusion.md``, experiment X8).
+"""A persistent, warp-specialised GEMM with epilogue hooks (``docs/en/rfcs/0003-epilogue-fusion.md``, experiment X8).
 
 ``c = a @ b`` with 16-bit operands (bf16 or f16) and an f32 accumulator, in the four layouts of ``cublaslt.gemm`` (``a`` is ``[M, K]`` or stored
 transposed as ``[K, M]``, ``b`` is ``[N, K]`` or ``[K, N]``), whose epilogue a ``@tilefish.graph`` fuses into the kernel through the hooks of
@@ -13,7 +13,7 @@ transposed as ``[K, M]``, ``b`` is ``[N, K]`` or ``[K, N]``), whose epilogue a `
   issuer accumulates the next tile into the other buffer. The sub-tile loop is not unrolled, so a heavy hook's code is in the binary once. The
   whole ``k`` of a tile is one program's, in order, ``BK`` columns a step: no split-K and no stream-K, so the bytes depend on no configuration,
   number of programs or SM count (measured equal to cuBLASLt's pin on sm_103 wherever that pin does not split ``k``: RFC 0003, X3 and X8). The
-  phases carry ``tilefish.probe``s, which a production build does not contain (``docs/instrument.md``). Triton 3.5.1's Gluon has no two-CTA MMA
+  phases carry ``tilefish.probe``s, which a production build does not contain (``docs/en/instrument.md``). Triton 3.5.1's Gluon has no two-CTA MMA
   and no TMA multicast, so a tile is one CTA's.
 * :func:`gemm_sm120_kernel` (sm_120, Triton): TMA loads and ``tl.dot`` (``mma.sync`` ``m16n8k16``, ``HMMA.16816.F32`` in the SASS) in a
   software-pipelined persistent loop, with the epilogue on sub-tiles. On sm_100 and sm_103 the same kernel compiles to ``tcgen05``, which is how

@@ -1,6 +1,6 @@
 # Manifest schema 3
 
-[English](../manifest-schema-3.md) | **简体中文**
+[English](../en/manifest-schema-3.md) | **简体中文**
 
 本文是 manifest（清单）schema（模式）3 相对 schema 2 新增内容的规范。Python 包写入和读取 schema 3（`tilefish.runtime.export`、`tilefish.Manifest.load`），本仓库的 Rust crate `tilefish` 也是如此（已发布的 0.0.1 只读取 schema 2；第 12 节说明 crate 如何处理本文的每个部分）。这里的所有内容都由 `python/tests/` 和 `crates/tilefish/tests/` 中的测试检查（在最后一节列出），每个字段在描述处都写明了写入它的 Python 代码。
 
@@ -89,7 +89,7 @@ sha256( b"tilefish.manifest-digest.v3\0" + canonical_json({"schema": 3, "kernels
 
 由 0.0.6 或更早版本导出的 manifest 仍然带有其构建目录的名称；它的加载、pin 和 replay（回放）都与以前完全一样。预构建二进制文件（第 8 节）按原样接受：带 `.file` 指令的 PTX 或在别处构建的 cubin 保留其原有的任何路径。
 
-**manifest 旁边的 trace（追踪记录）（tilefish 0.0.9）。** 使用 `trace=True`（或 `TILEFISH_TRACE=1`）的导出还会在 manifest 所在目录中写入 `trace/`：每个二进制文件的每一层，供 `tilefish-explain` 使用（`docs/explain.md`）。manifest 中没有任何字段提到它，也没有 digest 覆盖它，因此不论有没有它，manifest、其 digest 和每个 pin 都相同；两个读取器都不查看它（读取器读取 `manifest.json` 及其提到的 cubin，不读该目录的其他内容）。它包含源码（kernel 的文件、生成的源码、Triton 的源码）：它不属于交付的内容，为 host 打包导出的工具会把它排除在外。
+**manifest 旁边的 trace（追踪记录）（tilefish 0.0.9）。** 使用 `trace=True`（或 `TILEFISH_TRACE=1`）的导出还会在 manifest 所在目录中写入 `trace/`：每个二进制文件的每一层，供 `tilefish-explain` 使用（`docs/zh-CN/explain.md`）。manifest 中没有任何字段提到它，也没有 digest 覆盖它，因此不论有没有它，manifest、其 digest 和每个 pin 都相同；两个读取器都不查看它（读取器读取 `manifest.json` 及其提到的 cubin，不读该目录的其他内容）。它包含源码（kernel 的文件、生成的源码、Triton 的源码）：它不属于交付的内容，为 host 打包导出的工具会把它排除在外。
 
 ## 4. kernel 条目
 
@@ -250,11 +250,11 @@ tilefish 生成的 kernel 中，有些算子按照数值语义契约（contract�
 * **Python** 在每次运行时检查它：当 `functions` 不为空而 `torch.version.cuda`（torch 自身算子构建所用的版本）不在 `cuda` 中时，以及在 replay 中，当进程内的构建会链接与 `libdevice` 不同的 libdevice 时，它用 `TilefishCudaMathWarning` 发出警告（在 `warnings.simplefilter("error", TilefishCudaMathWarning)` 下是错误）。二进制文件仍然运行：警告说的是，在那里 torch 的算子以及建立在其上的参考模式可能与它的位不一致。参考模式也以同样方式根据 kernel 的 IR 发出警告。
 * **Rust host** 把它读入 `Entry::cuda_math`（`CudaMath { functions, cuda, libdevice }`），自己不检查任何内容（它无法得知 host 其他 CUDA 代码的版本）；`Manifest::check_cuda_math("13.0")` 拒绝这样的 manifest：其中有条目的 `functions` 不为空而其 `cuda` 不包含该版本，并逐一列出。
 * **读取器。** 两个读取器都拒绝：不是对象或含有其他字段的 `cuda_math`；缺少 `functions` 或 `cuda`，或者它们不是上述形式的列表、未排序或有重复；没有函数时 `cuda` 不为空；不是 sha256 的 `libdevice`；既没有函数也没有 libdevice；出现在 `binary` 条目或没有 `source_sha256` 的条目上的该字段。
-* 测量和维护它的地方：`docs/numerics.md`（CUDA 或 torch 变化时要执行的步骤）、`python/tests/test_gpu_cuda_math.py`。
+* 测量和维护它的地方：`docs/zh-CN/numerics.md`（CUDA 或 torch 变化时要执行的步骤）、`python/tests/test_gpu_cuda_math.py`。
 
 ### 4.8 插桩构建的 probe：`instrument`（tilefish 0.0.11，crate 0.0.9）
 
-插桩构建（`tilefish.runtime.export(..., instrument=True)` 或 `tilefish.instrument(capacity=..., ops=...)`，`docs/instrument.md`）把 kernel 的 `tilefish.probe` 调用，以及 `@begin`、`@calib` 和 `@end`，记录到 host 在 profile scratch 槽位（`abi.scratch` 的第二个槽位，生产启动传入空指针）中给出的 probe 缓冲区。它的条目会说明这一点：
+插桩构建（`tilefish.runtime.export(..., instrument=True)` 或 `tilefish.instrument(capacity=..., ops=...)`，`docs/zh-CN/instrument.md`）把 kernel 的 `tilefish.probe` 调用，以及 `@begin`、`@calib` 和 `@end`，记录到 host 在 profile scratch 槽位（`abi.scratch` 的第二个槽位，生产启动传入空指针）中给出的 probe 缓冲区。它的条目会说明这一点：
 
 ```json
 "instrument": {"format": "tilefish.probes.v1", "capacity": 256,
@@ -264,19 +264,19 @@ tilefish 生成的 kernel 中，有些算子按照数值语义契约（contract�
 | 字段 | 类型与规则 |
 |---|---|
 | `instrument` | 可选对象，恰好包含这三个字段，仅用于 `triton` 条目。生产导出的所有条目都没有它 |
-| `instrument.format` | `"tilefish.probes.v1"`：记录格式、缓冲区的布局以及构建添加的 probe（`docs/instrument.md`，第 3 节） |
+| `instrument.format` | `"tilefish.probes.v1"`：记录格式、缓冲区的布局以及构建添加的 probe（`docs/zh-CN/instrument.md`，第 3 节） |
 | `instrument.capacity` | 1 到 65536 的整数：每个 warp 每次启动保留的记录数；一次启动的缓冲区为 `ctas * warps * (16 + 16 * capacity)` 字节，`warps` 是块的 warp 数，`ctas` 是其 CUDA grid |
 | `instrument.probes` | kernel 的 probe 列表，每项为 `{"id", "name", "sites"}`：`id` 是 3 到 65535 的整数（0、1 和 2 是构建的 `@begin`、`@end`、`@calib`），`name` 是 probe 的名称（1 到 64 个字符，首字符为字母或 `_`，之后为字母、数字和 `_ . : / -`），每个 id 和每个名称各出现一次；`sites` 是 `{"loc", "role", "function"}` 的列表，均为字符串：写它的那一行（相对于模块）、它所运行的 warp 特化 kernel 的分区（`"default"`、`"worker 0"`……；kernel 没有分区时为 `""`），以及 jit 函数。没有 probe 的 kernel 为 `[]` |
 
 * **它是什么。** 它是一个非生产二进制文件的条目：它的 `sha256`、`sha256_code`（以及对于有 probe 的 kernel，它的 `source_digest`：带 probe 的 IR）都是它自己的，该字段像每个字段一样在 manifest digest 中，因此插桩导出有不同的 digest，它的 plan 也是如此。声明 digest、ABI、grid 和启动属性都与生产条目相同：host 传入的内容中，除了 profile scratch 是缓冲区的地址（16 字节对齐）而不是空指针之外，没有任何变化。
 * **插桩导出。** 含有带 `instrument` 条目的 manifest 是一个插桩导出：Python 的 `Manifest.load` 拒绝它，除非 `instrumented=True`；replay 拒绝它，除非它收集 probe（`probes=`）；Rust host 的 `Manifest::load` 和 `from_embedded` 拒绝它（`Manifest::load_instrumented` 接受它）。导出从不把两种变体写进同一个 manifest。早于该字段的读取器：crate 0.0.7 拒绝它（未知字段）；以空的 profile scratch 启动这种二进制文件时什么都不记录，写出生产的字节。
 * **读取器。** 两者都拒绝：不是由这三个字段组成的对象的 `instrument`；其他 `format`；超出范围的 capacity（或布尔值）；不是由这三个字段组成的对象的 probe，超出范围或重复的 id，不合规或重复的名称；不是由三个字符串组成的对象的 site；出现在 `binary` 条目上的该字段。
-* **Rust host** 把它读入 `Entry::instrument`（`Instrument { capacity, probes }`，每项为 `Probe { id, name, sites }`）；`Kernel::launch_probed` 在 profile scratch 槽位中传入一个 `ProbeBuffer`，并对生产二进制文件拒绝这样做（`docs/instrument.md`，第 4 节）。
+* **Rust host** 把它读入 `Entry::instrument`（`Instrument { capacity, probes }`，每项为 `Probe { id, name, sites }`）；`Kernel::launch_probed` 在 profile scratch 槽位中传入一个 `ProbeBuffer`，并对生产二进制文件拒绝这样做（`docs/zh-CN/instrument.md`，第 4 节）。
 * 测试位置：`python/tests/test_instrument.py`、`python/tests/test_gpu_instrument.py`、`crates/tilefish/tests/instrument.rs`、Rust 门禁 的插桩用例。
 
 ### 4.9 CuTe DSL kernel：`binary.source: "cute"`、种类 `tensormap` 和 `bytes`（tilefish 0.0.13，crate 0.0.11）
 
-用 CUTLASS 的 CuTe DSL 编写的 kernel（`nvidia-cutlass-dsl`，`import cutlass.cute as cute`：一个启动 `@cute.kernel` 的 `@cute.jit` host 函数）用 `@tilefish.extern(cute=host, cute_args=..., cute_options=...)` 声明（`docs/cute.md`）。DSL 针对其参数的布局编译它，因此它的形状是静态的：每个 bucket 一个二进制文件。它的 cubin 是 DSL 自己的（NVVM 生成的 PTX 和 DSL 自带的 `ptxas` 生成的 cubin），启动则是编译后 host 函数的启动，在构建时被 capture（一个 CUDA graph：kernel 并不运行）：grid、block、cluster、动态共享内存以及每个 kernel 参数的字节。它的条目是第 8 节的 `binary` 条目，有以下不同：
+用 CUTLASS 的 CuTe DSL 编写的 kernel（`nvidia-cutlass-dsl`，`import cutlass.cute as cute`：一个启动 `@cute.kernel` 的 `@cute.jit` host 函数）用 `@tilefish.extern(cute=host, cute_args=..., cute_options=...)` 声明（`docs/zh-CN/cute.md`）。DSL 针对其参数的布局编译它，因此它的形状是静态的：每个 bucket 一个二进制文件。它的 cubin 是 DSL 自己的（NVVM 生成的 PTX 和 DSL 自带的 `ptxas` 生成的 cubin），启动则是编译后 host 函数的启动，在构建时被 capture（一个 CUDA graph：kernel 并不运行）：grid、block、cluster、动态共享内存以及每个 kernel 参数的字节。它的条目是第 8 节的 `binary` 条目，有以下不同：
 
 | 字段 | 类型与规则 |
 |---|---|
@@ -354,7 +354,7 @@ tilefish 生成的 kernel 中，有些算子按照数值语义契约（contract�
 
 `fixed` 参数是值写在 manifest 中的标量：预构建二进制文件的常量参数（一个 `float alpha`、一个必须为零的 `long`、一个写成显式参数的 Triton scratch 槽位）。它有 `value`，没有 `dim`。对 `i32`/`i64`，`value` 是一个 JSON 整数（不是 bool，在该类型的范围内）；对 `f32`，是一个**带小数部分或指数**的 JSON 数（`2.0`）；非有限的 `f32` 是带标签的对象 `{"float": "inf" | "-inf" | "nan"}`（与 schema 2 中 constexpr 值的写法相同）。算子的调用者可以重述这个值，但不能改变它。
 
-**每次调用给出的固定参数**（`"kind": "given"`）是预构建二进制文件中值不在 manifest 中的标量：每次调用给出它（Python：`h_out: const[i32]` 或 `const[i64]`，**没有默认值**，`k(x, h_out=5)`；调用的几何信息，例如输出大小或偏移，调用中没有张量能确定它）。它的 `type` 是 `i32` 或 `i64`（`u32`/4 或 `u64`/8），没有 `value`、`dim` 或任何其他字段，并且只有 `binary` 条目才有它。**一个条目适用于每个值**：启动时在该参数的槽位传入调用给出的值，作为其类型的有符号整数（任意符号；放不进的值被拒绝；没有为其中某个参数给值的启动，或为条目中没有的名称给值的启动，也被拒绝：Python `tilefish.run(op, x, h_out=5)`，Rust `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`）；launch plan 的步骤记录其调用的值（`"given"`，`docs/plan-schema-1.md` 第 7 节）。浮点数仍是 `fixed` 参数（每个声明固定）。声明 digest 中该参数记为 given（`"given": true`，没有默认值），因此带默认值的声明是另一个算子。早于这一种类的读取器（tilefish 0.0.4、已发布的 crate 0.0.2）拒绝含有它的 manifest。
+**每次调用给出的固定参数**（`"kind": "given"`）是预构建二进制文件中值不在 manifest 中的标量：每次调用给出它（Python：`h_out: const[i32]` 或 `const[i64]`，**没有默认值**，`k(x, h_out=5)`；调用的几何信息，例如输出大小或偏移，调用中没有张量能确定它）。它的 `type` 是 `i32` 或 `i64`（`u32`/4 或 `u64`/8），没有 `value`、`dim` 或任何其他字段，并且只有 `binary` 条目才有它。**一个条目适用于每个值**：启动时在该参数的槽位传入调用给出的值，作为其类型的有符号整数（任意符号；放不进的值被拒绝；没有为其中某个参数给值的启动，或为条目中没有的名称给值的启动，也被拒绝：Python `tilefish.run(op, x, h_out=5)`，Rust `Kernel::launch_with(stream, tensors, &[("h_out", 5)])`）；launch plan 的步骤记录其调用的值（`"given"`，`docs/zh-CN/plan-schema-1.md` 第 7 节）。浮点数仍是 `fixed` 参数（每个声明固定）。声明 digest 中该参数记为 given（`"given": true`，没有默认值），因此带默认值的声明是另一个算子。早于这一种类的读取器（tilefish 0.0.4、已发布的 crate 0.0.2）拒绝含有它的 manifest。
 
 ### 5.4 可以写在输入之上的 `out` 指针：`alias`
 
@@ -771,7 +771,7 @@ schema 3 的读取器拒绝以下情形（Python：`TilefishManifestError`，标
 
 ## 12. Rust host 做什么
 
-本仓库的 Rust crate `tilefish` 完整读取 schema 3，并启动本文描述的一切，安全模型与其 schema 2 的启动相同（`DevicePtr<'a>` 生命周期，`from_cuda` 只对 cudarc 的 slice 和视图开放，在 `CudaStream` 上的安全 `launch` 带有所有者等待以及写者等待读者，拒绝对 slice 的 capture；`unsafe` 只出现在 `region.rs` 和 `ffi.rs` 及其 `ffi/cublaslt.rs` 中；使用 cudarc 的安全层及其 `cublaslt::result`，没有手写的驱动 FFI）。它比 Python 更严格或与之不同的地方在此列出。C++ host（`crates/tilefish-capi`：C ABI `tilefish.h` 和 `tilefish.hpp`，`docs/rfcs/0002-cpp-host.md`）通过这个 crate 读取 manifest，因此这里的一切照原样适用于它；它的张量是 region（`DevicePtr::from_raw`）。
+本仓库的 Rust crate `tilefish` 完整读取 schema 3，并启动本文描述的一切，安全模型与其 schema 2 的启动相同（`DevicePtr<'a>` 生命周期，`from_cuda` 只对 cudarc 的 slice 和视图开放，在 `CudaStream` 上的安全 `launch` 带有所有者等待以及写者等待读者，拒绝对 slice 的 capture；`unsafe` 只出现在 `region.rs` 和 `ffi.rs` 及其 `ffi/cublaslt.rs` 中；使用 cudarc 的安全层及其 `cublaslt::result`，没有手写的驱动 FFI）。它比 Python 更严格或与之不同的地方在此列出。C++ host（`crates/tilefish-capi`：C ABI `tilefish.h` 和 `tilefish.hpp`，`docs/zh-CN/rfcs/0002-cpp-host.md`）通过这个 crate 读取 manifest，因此这里的一切照原样适用于它；它的张量是 region（`DevicePtr::from_raw`）。
 
 **读取**（`crates/tilefish/src/manifest.rs`、`library.rs`）。
 
@@ -807,7 +807,7 @@ schema 3 的读取器拒绝以下情形（Python：`TilefishManifestError`，标
 
 **代码生成器**（`tilefish.hosts.rust`）。它为每个 kernel（Triton 或预构建：`launch` 以 `TensorRef` 或 `TensorMut` 接受每个指针；步长标量、`fixed` 参数和 `null` 指针不是参数）以及每个 library 条目（`launch` 接受 `a`、`b`、`bias`、`out`、`workspace`；`gemm()`、`M`、`N`、`K`、`BIAS`、`WORKSPACE_BYTES`、`PINNED_WITH`；`cublaslt.matmul` 在其 `beta` 为 1 时还在 `out` 之前接受 `c`，有 `EPILOGUE` 和 `BETA`，其文档用启动的名称写出公式、epilogue、每个架构的 pin 所验证的契约及其 canary；`gemm` 和 `gemm_bias` 的结构体保持原样）写一个结构体，并嵌入 manifest 的 digest。`tilefish.hosts.cpp` 为 C++ 写出同样的类（`EPILOGUE` 和 `BETA` 为 `static constexpr` 成员）。它拒绝读取器拒绝的内容。同一个 stem 在多个架构上的条目，除了设备之外必须在一切方面一致，但按架构声明实现的算子的条目（每个都有 `implementation`）可以在第 4.1 节允许的方面不同，包括它们的 ABI：它们必须共享张量（名称、顺序、access、dtype、形状、是否为视图）、每次调用的固定参数以及其张量和 bucket 的维度约束，这就是 `launch` 的类型来源；结构体的文档随后写出每个架构的实现、grid、block 和 constexpr，并在它们的 ABI 不同或其中之一是预构建二进制文件时，写出每一个的种类、描述符、标量、固定参数和视图；`ops=` 对照每个条目的架构所选的实现检查该条目。
 
-**launch plan**（crate 尚未读取）。`docs/plan-schema-1.md`：`plan.json` pin 一个 manifest，并在一个 arena 上安排其条目的启动顺序，因此 host 可以据此运行一次完整的前向，并且可以在 CUDA graph 中 capture（`test_gpu_plan.py`；golden fixture `python/tests/golden/plans/` 带有要复现的 digest）。
+**launch plan**（crate 尚未读取）。`docs/zh-CN/plan-schema-1.md`：`plan.json` pin 一个 manifest，并在一个 arena 上安排其条目的启动顺序，因此 host 可以据此运行一次完整的前向，并且可以在 CUDA graph 中 capture（`test_gpu_plan.py`；golden fixture `python/tests/golden/plans/` 带有要复现的 digest）。
 
 ## 13. 测试位置
 

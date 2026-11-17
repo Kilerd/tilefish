@@ -736,7 +736,7 @@ class Manifest:
 
     @property
     def instrumented(self) -> bool:
-        """Whether this is an instrumented export: one of its entries has ``instrument`` (its kernel records probes, ``docs/instrument.md``)."""
+        """Whether this is an instrumented export: one of its entries has ``instrument`` (its kernel records probes, ``docs/en/instrument.md``)."""
         return is_instrumented(self.doc)
 
     @classmethod
@@ -748,7 +748,7 @@ class Manifest:
         the one the manifest records. With ``pin=`` (the digest of the manifest, from a trusted place) a manifest with any
         other digest is refused, before a cubin is read, and the result is :attr:`pinned`.
 
-        An **instrumented** export (an entry with ``instrument``: ``export(..., instrument=True)``, ``docs/instrument.md``) is a diagnostic
+        An **instrumented** export (an entry with ``instrument``: ``export(..., instrument=True)``, ``docs/en/instrument.md``) is a diagnostic
         variant, never a production artefact: it is refused unless ``instrumented=True`` says the caller means to load one.
         """
         path = pathlib.Path(path)
@@ -786,7 +786,7 @@ class Manifest:
             )
         if is_instrumented(doc) and not instrumented:
             raise TilefishManifestError(
-                f"the manifest {str(manifest_path)!r} is an instrumented export (its kernels record probes: docs/instrument.md), a diagnostic variant "
+                f"the manifest {str(manifest_path)!r} is an instrumented export (its kernels record probes: docs/en/instrument.md), a diagnostic variant "
                 "with binaries and a digest of its own, never the production artefact: load it with instrumented=True (tilefish.run(..., probes=...), "
                 "Manifest.load(..., instrumented=True)) to collect its probes, and run the production export everywhere else"
             )

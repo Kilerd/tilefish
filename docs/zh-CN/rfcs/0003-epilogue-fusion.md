@@ -1,10 +1,10 @@
 # RFC 0003：epilogue 与 prologue 融合
 
-[English](../../rfcs/0003-epilogue-fusion.md) | **简体中文**
+[English](../../en/rfcs/0003-epilogue-fusion.md) | **简体中文**
 
 * **状态：** 已评审；2026-11-16 的决定记录在下文“决定”一节。设计和阶段 0 实验（第 6 节）。里程碑 E1（extern（外部 kernel）上的 epilogue（尾部）hook（钩子），见下文“E1：实现说明”）和 E2（cuBLASLt epilogue，见 7.3 节：构建了什么、测量了什么、还剩下什么）已经实现，并能在同一个 graph（计算图）中协同工作（见下文“E1 与 E2 结合”）；实验 X8（一个带这些 hook 的持久化、warp（线程束）特化的 GEMM（通用矩阵乘））已经测量（见下文“X8：结果”；该 kernel（核函数）是 `python/examples/` 下的一个示例，不是受支持的功能）；其余部分是设计。
 * **范围：** 跨调用的融合。*epilogue* 是读取 GEMM 或卷积结果的逐元素或行级工作；*prologue*（头部）生成其某个操作数。本 RFC 涉及规划器和融合 pass（`tilefish._plan`、`tilefish._fusion`）、library op（库算子）（`cublaslt.*`、`cudnn.conv_fwd`）、extern、一族新的生成的 GEMM 和卷积算子，以及 advisor（建议器）。只有库 epilogue 涉及 manifest（清单）和 host（宿主）。
-* **基线：** tilefish 0.0.10 / crate 0.0.8，其中包含融合 advisor（`docs/advise.md`）。
+* **基线：** tilefish 0.0.10 / crate 0.0.8，其中包含融合 advisor（`docs/zh-CN/advise.md`）。
 * **与 RFC 0001 的关系。** RFC 0001（plan（计划）融合）融合各调用之间的 graph 函数体算术，并承诺融合本身绝不改变字节。它的第 7 节勾勒了进入调用的三条路线，第 11.2 节推迟了库 epilogue。本 RFC 取代这些草案。它是一份独立的文档，而不是 0001 的一节，原因有二。RFC 0001 已经评审，它的决定 D1 到 D7 建立在一个只有精确（exact）模式的契约之上。本 RFC 必须引入第一批字节*不*等于未融合组合（unfused composition）字节的契约，并且需要它自己的决定。RFC 0001 的每个决定都仍然成立。本 RFC 在 0001 某个阶段之上构建的地方，会说明是哪个阶段。
 
 ## 概要
@@ -140,7 +140,7 @@ E1 和 E2 从 0.0.11 开始并行构建，各自带有一个两值的 `epilogues
 
 ## X8：结果（2026-11-17）
 
-X8 要回答的是：tilefish 自己的 GEMM 能否快到让融合进它变得划算（Q5），以及它的字节是否就是库的字节（E3 的问题，契约 (i-d)）。该 kernel 是一个示例，`python/examples/persistent_gemm.py`，它在一个快到值得融合进去的 kernel 中展示这些 hook；它不是受支持的功能（`docs/scope.md`：tilefish 不在 kernel 速度上与库竞争）。下面是该实验的记录。
+X8 要回答的是：tilefish 自己的 GEMM 能否快到让融合进它变得划算（Q5），以及它的字节是否就是库的字节（E3 的问题，契约 (i-d)）。该 kernel 是一个示例，`python/examples/persistent_gemm.py`，它在一个快到值得融合进去的 kernel 中展示这些 hook；它不是受支持的功能（`docs/zh-CN/scope.md`：tilefish 不在 kernel 速度上与库竞争）。下面是该实验的记录。
 
 **kernel。** `c = a @ b`，bf16 或 f16 操作数，f32 累加器，`cublaslt.gemm` 的四种布局（`TN`、`NN`、`TT`、`NT`），E1 的 hook `ACC` 和 `EPILOGUE`，以及门控激活的双累加器（`split=2`）。
 
@@ -266,14 +266,14 @@ X8 要回答的是：tilefish 自己的 GEMM 能否快到让融合进它变得�
 * 发射者发射一个步骤用 159 ns，平均为生产者等待 138 ns；
 * 生产者平均为一个空闲槽位等待 137 ns。
 
-有 bias + GELU 时，epilogue 的等待降到 2.8 us，hook 每个子 tile 用 1.2 us，发射者每个 tile 为一个累加器等待 2.6 us：现在 epilogue 成了瓶颈，约高出 20%。有周期激活时，发射者的等待是 6.6 us。生产构建不含任何 probe（`docs/instrument.md`）。
+有 bias + GELU 时，epilogue 的等待降到 2.8 us，hook 每个子 tile 用 1.2 us，发射者每个 tile 为一个累加器等待 2.6 us：现在 epilogue 成了瓶颈，约高出 20%。有周期激活时，发射者的等待是 6.6 us。生产构建不含任何 probe（`docs/zh-CN/instrument.md`）。
 
 ## 0. 背景：已有的东西
 
-* **library op 承诺一次舍入。** `cublaslt.gemm` 用 f32 累加器计算 `out = a @ b^T`，并一次舍入到输出类型。`cublaslt.gemm_bias` 在这次舍入之前以 f32 加上一个输出类型的 bias（`CUBLASLT_EPILOGUE_BIAS`，tilefish 目前唯一使用的 epilogue）。算法被 pin 住（它的 64 字节、cuBLASLt 版本和 SM 数）。pin 会对照 cuBLASLt 自己的编码进行审核，并在加载时由 `cublasLtMatmulAlgoCheck` 检查。它按 tilefish 或 torch 的方式选择，或者从另一个引擎导入（`AlgoTable`）。带 bias 的 GEMM 除非显式选择加入，否则不使用 split-K，因为测得带 bias epilogue 的 split-K 会舍入两次（`docs/numerics.md`，第 4 节）。`cudnn.conv_fwd` 没有 bias。它的引擎配置按 cuDNN 版本和 SM 数被 pin 住，并在加载时由 canary 检查（`docs/manifest-schema-3.md`，第 9.4 节）。
+* **library op 承诺一次舍入。** `cublaslt.gemm` 用 f32 累加器计算 `out = a @ b^T`，并一次舍入到输出类型。`cublaslt.gemm_bias` 在这次舍入之前以 f32 加上一个输出类型的 bias（`CUBLASLT_EPILOGUE_BIAS`，tilefish 目前唯一使用的 epilogue）。算法被 pin 住（它的 64 字节、cuBLASLt 版本和 SM 数）。pin 会对照 cuBLASLt 自己的编码进行审核，并在加载时由 `cublasLtMatmulAlgoCheck` 检查。它按 tilefish 或 torch 的方式选择，或者从另一个引擎导入（`AlgoTable`）。带 bias 的 GEMM 除非显式选择加入，否则不使用 split-K，因为测得带 bias epilogue 的 split-K 会舍入两次（`docs/zh-CN/numerics.md`，第 4 节）。`cudnn.conv_fwd` 没有 bias。它的引擎配置按 cuDNN 版本和 SM 数被 pin 住，并在加载时由 canary 检查（`docs/zh-CN/manifest-schema-3.md`，第 9.4 节）。
 * **plan 融合止于调用。** RFC 0001 的阶段 1 把 graph 函数体的算术融合进生成的区域。每个区域都与未融合组合 `U(P)` 逐字节一致，每次导出都会验证这一点（D6）。对 library op、extern 或 kernel 的调用是区域边界。GEMM 之后的算术按 0001 第 7 节的路线 (a) 运行：一个读取 GEMM 已存储、已舍入结果的生成 kernel。
 * **移植中已经包含手工融合的计算 kernel。** 对手工融合引擎的移植会逐字节复现该引擎的 kernel。其中一些 kernel 是带融合激活 epilogue 的卷积，以 Gluon extern 的形式手写（sm_100 和 sm_103 上为 `tcgen05`，sm_120 上为 `mma.sync`），遵循原 kernel 的累加顺序及其 epilogue。对 tilefish 来说，这样的 epilogue 只是 extern 的一部分。下面的路线 (c) 把同样的事情变成规划器的一个功能。
-* **advisor 看到了这个缺口。** `tilefish-explain --advise` 把最后的阻碍项为 `epilogue-library` 或 `prologue-library` 的每个候选列为未来工作（`docs/advise.md`，第 4 节）。它把两个 norm 之间的每条残差流列为 `library-in-the-middle`。在三个移植模型上，它按测得的时间把这些候选排在最前。最大的单个形态是：
+* **advisor 看到了这个缺口。** `tilefish-explain --advise` 把最后的阻碍项为 `epilogue-library` 或 `prologue-library` 的每个候选列为未来工作（`docs/zh-CN/advise.md`，第 4 节）。它把两个 norm 之间的每条残差流列为 `library-in-the-middle`。在三个移植模型上，它按测得的时间把这些候选排在最前。最大的单个形态是：
   * GEMM 后接 col2im、overlap-add 和周期激活：每个实例 0.1 到 1.2 ms，在短 bucket 和长 bucket 上都是如此；
   * 卷积后接 bias 和周期激活：每个 0.2 到 0.3 ms；
   * 每个 transformer 层的输出投影之后的残差相加和 norm；
@@ -609,7 +609,7 @@ with tilefish.fused(epilogues="accumulator"):                          # per reg
 * **schema。** 路线 (c) 什么都不改变：它的条目是生成的 `triton` 条目。路线 (b) 是增量的：一个新的库 impl（`cublaslt.matmul`），带有一个取值更多的 `epilogue` 字段、`aux` 和 `beta`，以及可选的 `canary`。
   * 两个现有的 impl 逐字节保持原样，所以现存的每个 manifest 都能继续加载。
   * 早于新 impl 的读取器会拒绝含有它的条目。
-  * 这一变化记录在 `docs/manifest-schema-3.md` 第 9 节，Python 写入器、两个读取器和向量同步更新。
+  * 这一变化记录在 `docs/zh-CN/manifest-schema-3.md` 第 9 节，Python 写入器、两个读取器和向量同步更新。
   * 模式不需要 manifest 字段（同 RFC 0001 Q8）：它们在每个生成源码的文件头和融合报告中。
 
 ## 6. 实验
@@ -786,7 +786,7 @@ E1 不需要其他任何里程碑。它服务于卷积已经是 extern 的那些
 
 ### 7.3 E2 的实现情况（2026-11-17）
 
-**impl `cublaslt.matmul`**（Q7；`docs/manifest-schema-3.md`，第 9.5 节）。`@tilefish.library(..., impl="cublaslt.matmul", epilogue=..., beta=...)`：`epilogue` 为 `none`、`bias`、`relu` 或 `relu_bias`（cuBLASLt 的 `DEFAULT`、`BIAS`、`RELU`、`RELU_BIAS`），`beta=1` 读取 `c [M, N]`（`beta = 1` 的 `beta * C`）；bf16 或 f16 操作数，结果为同一类型，`cublaslt.gemm` 的四种布局，两种姿态，各项选择加入，`sm_count_target` 和 `workspace_bytes`。它的算术是 `ρ(f(acc))`，`c` 在 bias 之前加上，这是库的顺序（X1）。`cublaslt.gemm` 和 `cublaslt.gemm_bias` 不变，字节和 digest 都与原来一致。带 bias 的 GEMM 不做 split-K 的规则推广到除 `none` 之外的每个 epilogue（3.1.1），用它自己的措辞表述。一个条目带有 `beta`、`contract`、`verification` 和可选的 `canary`；0.0.11 的读取器会拒绝它。Python 绑定、两个读取器、crate 的加载和启动、C ABI（一个 epilogue 和 `c` 的访问器，一个次版本）以及生成的 host 都支持它。
+**impl `cublaslt.matmul`**（Q7；`docs/zh-CN/manifest-schema-3.md`，第 9.5 节）。`@tilefish.library(..., impl="cublaslt.matmul", epilogue=..., beta=...)`：`epilogue` 为 `none`、`bias`、`relu` 或 `relu_bias`（cuBLASLt 的 `DEFAULT`、`BIAS`、`RELU`、`RELU_BIAS`），`beta=1` 读取 `c [M, N]`（`beta = 1` 的 `beta * C`）；bf16 或 f16 操作数，结果为同一类型，`cublaslt.gemm` 的四种布局，两种姿态，各项选择加入，`sm_count_target` 和 `workspace_bytes`。它的算术是 `ρ(f(acc))`，`c` 在 bias 之前加上，这是库的顺序（X1）。`cublaslt.gemm` 和 `cublaslt.gemm_bias` 不变，字节和 digest 都与原来一致。带 bias 的 GEMM 不做 split-K 的规则推广到除 `none` 之外的每个 epilogue（3.1.1），用它自己的措辞表述。一个条目带有 `beta`、`contract`、`verification` 和可选的 `canary`；0.0.11 的读取器会拒绝它。Python 绑定、两个读取器、crate 的加载和启动、C ABI（一个 epilogue 和 `c` 的访问器，一个次版本）以及生成的 host 都支持它。
 
 **按 pin 验证**（Q6，契约 (iii) 相对 (ii) 测量）。每个 pin 在生成时都会验证，在 `jit` 和 `export` 时都是如此：pin 在两组带种子的操作数上运行（X1 的操作数；bias 和 `c` 的前八列放特殊值；`a` 的若干行使每个 epilogue 得到 NaN、零和无穷的累加器，第二组中还有累加器溢出的行），并与 torch 以 f32 计算的公式逐位比较；公式作用于同一配置以 f32 的 `D` 重新编码后的累加器（`"f32-form"`；当 cuBLASLt 不接受这种编码时，用同一姿态的 f32 pin，即 `"plain-f32-pin"`，这里没有 pin 需要它），只舍入一次。CUDA 上的 torch 给出的位与 tilefish 自己对相同算子的下沉相同（一次 f32 加法；`torch.relu`，它逐位等于 `where(h <= 0, 0, h)`；以及转换到规范 NaN 的类型转换）。条目记录 `"measured-exact"`（没有元素不同），或者 `"binary-defined"` 以及不同元素的数量和它们以 ULP 计的最大距离。`contract="measured-exact"` 使构建拒绝后者。
 

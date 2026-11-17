@@ -10,7 +10,7 @@ Thin Python, C++ and Rust hosts are generated from the same signatures.
 **Status: early preview (0.0.13 on PyPI, 0.0.11 on crates.io; the C++ host builds from this repository).** tilefish types GPU kernels
 written in Triton, Gluon, CuTe DSL or PTX, pinned cuBLASLt and cuDNN calls and kernels it lowers itself, builds a model's graphs into launch plans
 over one arena, and runs the same pinned artefact from Python, Rust and C++. What it is and is not, and how features are added from now on, is in
-[`docs/scope.md`](docs/scope.md); the other documents are listed in [`docs/README.md`](docs/README.md).
+[`docs/en/scope.md`](docs/en/scope.md); the other documents are listed in [`docs/en/README.md`](docs/en/README.md).
 
 ## Why
 
@@ -100,7 +100,7 @@ def mlp(x: Tensor[M, H, bf16], w_gu: Tensor[2 * F, H, mxfp8], w_d: Tensor[H, F, 
 4. **Look inside.** `tilefish-explain` maps each SASS instruction to its source line, and SASS assertions are checked at every
    build; probes time the phases inside a kernel; `tilefish-explain --advise` ranks the steps of a plan that could be one kernel.
 
-The details of each stage are in the [guide](docs/README.md#guide).
+The details of each stage are in the [guide](docs/en/README.md#guide).
 
 ## Install
 
@@ -131,7 +131,7 @@ y = tilefish.run(residual_add_rmsnorm, x, residual, w, mode="reference")      # 
 ```
 
 A `@tilefish.graph` exports its launch plan next to the manifest, and `tilefish.run(graph, ..., mode="replay", plan="build/",
-pin=p.digest)` replays it ([build](docs/guide/build.md), [plans](docs/guide/plans.md)).
+pin=p.digest)` replays it ([build](docs/en/guide/build.md), [plans](docs/en/guide/plans.md)).
 
 ### The Rust host
 
@@ -145,7 +145,7 @@ let run = plan.instantiate_all(&stream)?;
 run.launch(&stream, &mut [("x", x.into_arg()), ("out0", y.into_arg())], &[("n", DevScalar::Int(64))])?;
 ```
 
-`tilefish.hosts.rust.emit` writes typed launchers for a pinned manifest ([guide](docs/guide/rust.md),
+`tilefish.hosts.rust.emit` writes typed launchers for a pinned manifest ([guide](docs/en/guide/rust.md),
 [`crates/tilefish/README.md`](crates/tilefish/README.md)).
 
 ### The C++ host
@@ -159,28 +159,28 @@ run.launch(stream, {{"x", xt}, {"out0", yt}}, {{"n", 64}});
 ```
 
 `find_package(tilefish)` after `cmake --install`; `tilefish.hosts.cpp.emit` writes typed launchers and plan runners
-([guide](docs/guide/cpp.md)).
+([guide](docs/en/guide/cpp.md)).
 
 ## Features at a glance
 
 | feature | documented in |
 |---|---|
-| What tilefish is and is not, and how features are added | [`docs/scope.md`](docs/scope.md) |
-| The build: the steps, `jit`, `reference` and `replay`, pins, reproducible exports, what identifies a binary, the build cache, the TF32 guard, trust | [`docs/guide/build.md`](docs/guide/build.md) |
-| Strided views, device scalars, prebuilt PTX and cubin, Gluon kernels, one implementation per architecture, TMA descriptors, warp-specialised kernels, launch shapes | [`docs/guide/operators.md`](docs/guide/operators.md) |
-| Pinned cuBLASLt GEMMs (bf16, f16, f32 with TF32 off; four layouts; SM partitions; epilogues) and pinned cuDNN convolutions | [`docs/guide/operators.md`](docs/guide/operators.md) |
-| CuTe DSL kernels as externs | [`docs/cute.md`](docs/cute.md) |
-| Lowered kernels: masks, indices, `argmax`, gathers and scatters, integer casts, IEEE math, ordered sums, broadcasts, `contiguous`, `im2col`, `col2im1d` | [`docs/guide/lowering.md`](docs/guide/lowering.md) |
-| Launch plans: one arena, CUDA graphs, copy and memset steps, weights bound once, plan sets, shared arenas, carried buffers, debug taps | [`docs/guide/plans.md`](docs/guide/plans.md) |
-| Fusion of a graph body's arithmetic, epilogue hooks on externs, cuBLASLt epilogues | [`docs/guide/fusion.md`](docs/guide/fusion.md) |
-| Rounding points, exact and numerics-changing rewrites, `num_warps` and FMA contraction | [`docs/guide/rewrites.md`](docs/guide/rewrites.md) |
-| The CUDA math guard and what to check again on a CUDA or torch change | [`docs/numerics.md`](docs/numerics.md) |
-| Traces, `tilefish-explain` and SASS assertions | [`docs/guide/sass.md`](docs/guide/sass.md), [`docs/explain.md`](docs/explain.md) |
-| The fusion advisor and the plan profiler | [`docs/advise.md`](docs/advise.md) |
-| Probes and the instrumented variant | [`docs/instrument.md`](docs/instrument.md) |
-| The Rust host and generated Rust launchers | [`docs/guide/rust.md`](docs/guide/rust.md), [`crates/tilefish/README.md`](crates/tilefish/README.md) |
-| The C ABI, the C++ wrapper and generated C++ launchers | [`docs/guide/cpp.md`](docs/guide/cpp.md), [RFC 0002](docs/rfcs/0002-cpp-host.md) |
-| The files a host reads | [`docs/manifest-schema-3.md`](docs/manifest-schema-3.md), [`docs/plan-schema-1.md`](docs/plan-schema-1.md) |
+| What tilefish is and is not, and how features are added | [`docs/en/scope.md`](docs/en/scope.md) |
+| The build: the steps, `jit`, `reference` and `replay`, pins, reproducible exports, what identifies a binary, the build cache, the TF32 guard, trust | [`docs/en/guide/build.md`](docs/en/guide/build.md) |
+| Strided views, device scalars, prebuilt PTX and cubin, Gluon kernels, one implementation per architecture, TMA descriptors, warp-specialised kernels, launch shapes | [`docs/en/guide/operators.md`](docs/en/guide/operators.md) |
+| Pinned cuBLASLt GEMMs (bf16, f16, f32 with TF32 off; four layouts; SM partitions; epilogues) and pinned cuDNN convolutions | [`docs/en/guide/operators.md`](docs/en/guide/operators.md) |
+| CuTe DSL kernels as externs | [`docs/en/cute.md`](docs/en/cute.md) |
+| Lowered kernels: masks, indices, `argmax`, gathers and scatters, integer casts, IEEE math, ordered sums, broadcasts, `contiguous`, `im2col`, `col2im1d` | [`docs/en/guide/lowering.md`](docs/en/guide/lowering.md) |
+| Launch plans: one arena, CUDA graphs, copy and memset steps, weights bound once, plan sets, shared arenas, carried buffers, debug taps | [`docs/en/guide/plans.md`](docs/en/guide/plans.md) |
+| Fusion of a graph body's arithmetic, epilogue hooks on externs, cuBLASLt epilogues | [`docs/en/guide/fusion.md`](docs/en/guide/fusion.md) |
+| Rounding points, exact and numerics-changing rewrites, `num_warps` and FMA contraction | [`docs/en/guide/rewrites.md`](docs/en/guide/rewrites.md) |
+| The CUDA math guard and what to check again on a CUDA or torch change | [`docs/en/numerics.md`](docs/en/numerics.md) |
+| Traces, `tilefish-explain` and SASS assertions | [`docs/en/guide/sass.md`](docs/en/guide/sass.md), [`docs/en/explain.md`](docs/en/explain.md) |
+| The fusion advisor and the plan profiler | [`docs/en/advise.md`](docs/en/advise.md) |
+| Probes and the instrumented variant | [`docs/en/instrument.md`](docs/en/instrument.md) |
+| The Rust host and generated Rust launchers | [`docs/en/guide/rust.md`](docs/en/guide/rust.md), [`crates/tilefish/README.md`](crates/tilefish/README.md) |
+| The C ABI, the C++ wrapper and generated C++ launchers | [`docs/en/guide/cpp.md`](docs/en/guide/cpp.md), [RFC 0002](docs/en/rfcs/0002-cpp-host.md) |
+| The files a host reads | [`docs/en/manifest-schema-3.md`](docs/en/manifest-schema-3.md), [`docs/en/plan-schema-1.md`](docs/en/plan-schema-1.md) |
 
 ## What tilefish is not
 
@@ -204,9 +204,9 @@ Early preview: the API will change.
 | `tilefish-capi` (C ABI 1.1, `tilefish.h` and `tilefish.hpp`) | 0.0.2 | this repository |
 
 The manifest is schema 3 and the plan `tilefish.plan.v1`. There is no list of features to come. A feature is added when a real
-model migration needs it (`docs/scope.md`); the open items are tracked in issue [#4](https://github.com/Kilerd/tilefish/issues/4),
+model migration needs it (`docs/en/scope.md`); the open items are tracked in issue [#4](https://github.com/Kilerd/tilefish/issues/4),
 and [#5](https://github.com/Kilerd/tilefish/issues/5) (SASS traceability, probes, CuTe DSL externs) is closed. What each release
-changed is in [`CHANGELOG.md`](CHANGELOG.md), and every document is listed in [`docs/README.md`](docs/README.md).
+changed is in [`CHANGELOG.md`](CHANGELOG.md), and every document is listed in [`docs/en/README.md`](docs/en/README.md).
 
 ## License
 

@@ -17,7 +17,7 @@ header = """
  *
  * Licensed under either of Apache License, Version 2.0 or MIT license at your option.
  *
- * The conventions (docs/rfcs/0002-cpp-host.md, section 5):
+ * The conventions (docs/en/rfcs/0002-cpp-host.md, section 5):
  *
  *  - Every function that can fail returns a tilefish_status (TILEFISH_OK is 0) and writes its result through an out-parameter, which is NULL
  *    after a failure; tilefish_last_error has the details of the last failure of the thread.

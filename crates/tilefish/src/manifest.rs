@@ -1,7 +1,7 @@
 //! Reading a manifest directory: the cubins, checked against what the manifest says.
 //!
 //! A port of `python/src/tilefish/_manifest.py` (`Manifest.load`) and of the schema checks of `_specvalid.py`, for manifest schema 3
-//! (`docs/manifest-schema-3.md`). A manifest is read as strict JSON (see [`crate::json`]), every field has the type it needs (an object is
+//! (`docs/en/manifest-schema-3.md`). A manifest is read as strict JSON (see [`crate::json`]), every field has the type it needs (an object is
 //! an object, never the list of its values) and no key is unknown, and the entries are checked for being consistent with themselves: the ABI (pointers, strided views, device scalars,
 //! scalars, `fixed` arguments, TMA descriptors, the descriptors and constant bytes of a CuTe DSL kernel, scratch slots), the preconditions, the buckets, the grid. Then each cubin is read, and refused unless
 //! its `sha256` (the file) and `sha256_code` (the machine code, see [`crate::elf`]) are the manifest's, it has the code section of
@@ -686,7 +686,7 @@ pub enum BinarySource {
     },
 }
 
-/// The CUDA math library functions a generated kernel's bits are (`docs/manifest-schema-3.md` section 4.7, `docs/numerics.md`): in IEEE math
+/// The CUDA math library functions a generated kernel's bits are (`docs/en/manifest-schema-3.md` section 4.7, `docs/en/numerics.md`): in IEEE math
 /// `exp` and `silu` are built on `expf`, `rsqrt` is `rsqrtf` and `erf` `erff`, and `sin`, `cos` and `tanh` are libdevice's `sinf`, `cosf` and
 /// `tanhf`. Those functions are not the same in every CUDA release (13.2 changed `erff`), so the entry records which it uses and the releases
 /// tilefish measured each on; [`Manifest::check_cuda_math`] refuses a manifest whose functions were not measured on a host's release.
@@ -787,7 +787,7 @@ pub struct Entry {
     /// A persistent grid (manifest schema 3, section 4.3): the grid is the tiles, and a launch runs at most `programs_per_sm` programs per SM of
     /// the device (or partition) the kernel was loaded for. `None` for every other kernel.
     pub persistent: Option<Persistent>,
-    /// The probes of an **instrumented** binary (manifest schema 3, section 4.8; `docs/instrument.md`): the records each warp keeps and the kernel's
+    /// The probes of an **instrumented** binary (manifest schema 3, section 4.8; `docs/en/instrument.md`): the records each warp keeps and the kernel's
     /// probes. Only a Triton kernel of an instrumented export has it, and only [`Manifest::load_instrumented`] loads such a manifest; a
     /// launch gives the binary a probe buffer ([`crate::Kernel::launch_probed`]). `None` for every production binary.
     pub instrument: Option<Instrument>,
@@ -3139,13 +3139,13 @@ impl Manifest {
     /// is not a plain file name in the directory, and a cubin whose `sha256` or `sha256_code` is not the manifest's, that is not an ELF
     /// file with the code section of the manifest's symbol, or that is for another architecture than the entry says.
     ///
-    /// An **instrumented** export (an entry with `instrument`: Python's `export(..., instrument=True)`, `docs/instrument.md`) is a diagnostic
+    /// An **instrumented** export (an entry with `instrument`: Python's `export(..., instrument=True)`, `docs/en/instrument.md`) is a diagnostic
     /// variant, never a production artefact: it is refused here, and loaded with [`Manifest::load_instrumented`] only.
     pub fn load(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
         Self::load_variant(path.as_ref(), pin, false)
     }
 
-    /// [`Manifest::load`] of an **instrumented** export (`docs/instrument.md`): verified the same way, and accepted whether or not its entries have
+    /// [`Manifest::load`] of an **instrumented** export (`docs/en/instrument.md`): verified the same way, and accepted whether or not its entries have
     /// `instrument`. Its instrumented binaries are launched with a probe buffer ([`crate::Kernel::launch_probed`], a plan with
     /// [`crate::LaunchPlan::instantiate_probed`]); it is never the manifest a production host runs.
     pub fn load_instrumented(path: impl AsRef<Path>, pin: Pin<'_>) -> Result<Self> {
@@ -3229,7 +3229,7 @@ impl Manifest {
         // an instrumented export, before anything else of it is read (Python's `Manifest.load` refuses it there too)
         if instrumented_doc(&raw.kernels) && !instrumented {
             return Err(Error::manifest(format!(
-                "the manifest {label:?} is an instrumented export (its kernels record probes: docs/instrument.md), a diagnostic variant with \
+                "the manifest {label:?} is an instrumented export (its kernels record probes: docs/en/instrument.md), a diagnostic variant with \
                  binaries and a digest of its own, never the production artefact: load it with Manifest::load_instrumented to collect its probes, \
                  and run the production export everywhere else"
             )));
@@ -3253,7 +3253,7 @@ impl Manifest {
             let what = |e: serde_json::Error| {
                 Error::manifest(format!("library entry #{i} ({:?}): {e}", value.get("stem").and_then(Value::as_str)))
             };
-            // a cuDNN convolution has its own fields (`docs/manifest-schema-3.md`, section 9.4); every other entry is a cuBLASLt GEMM's
+            // a cuDNN convolution has its own fields (`docs/en/manifest-schema-3.md`, section 9.4); every other entry is a cuBLASLt GEMM's
             if value.get("impl").and_then(Value::as_str) == Some(CONV_IMPL) {
                 let mut entry: RawConv = serde_json::from_value(value.clone()).map_err(what)?;
                 entry.buckets.follow(file_order("library", i, "buckets"));
@@ -3354,7 +3354,7 @@ impl Manifest {
         }
         Err(Error::manifest(format!(
             "the manifest in {:?} has kernels whose CUDA math functions were not measured on CUDA {cuda}, so their bits may not be that \
-             release's: {}. Re-run the CUDA math tests on it (docs/numerics.md) and export again",
+             release's: {}. Re-run the CUDA math tests on it (docs/en/numerics.md) and export again",
             self.label,
             off.join("; ")
         )))

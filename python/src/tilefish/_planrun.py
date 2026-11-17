@@ -731,7 +731,7 @@ def _is_conv_spec(spec: Any) -> bool:
 
 @dataclass(frozen=True)
 class _ProbeStep:
-    """Where an instrumented step's records go (``docs/instrument.md``): ``offset`` bytes into the bucket's probe region, ``nbytes`` of them, for the
+    """Where an instrumented step's records go (``docs/en/instrument.md``): ``offset`` bytes into the bucket's probe region, ``nbytes`` of them, for the
     CUDA grid of its launch at the bucket; ``built`` is its binary (whose ``instrument`` says the capacity and the probes)."""
 
     offset: int
@@ -924,7 +924,7 @@ def _carried_written(arena: _Arena, rt: "_BucketRT", done: bool) -> None:
 def _note_thread(arena: _Arena, graph: str, caller_graph: bool = False) -> None:
     """Note the thread that uses the arena (under its lock), and warn once when an arena that a CUDA graph of the caller's holds is used by a second
     thread: a replay of such a graph takes no lock of tilefish, so it is not ordered with an execution another thread has between its wait for the
-    order event and its record (docs/plan-schema-1.md, section 10, item 7). ``caller_graph``: this use is the capture of such a graph."""
+    order event and its record (docs/en/plan-schema-1.md, section 10, item 7). ``caller_graph``: this use is the capture of such a graph."""
     arena.threads.add(threading.get_ident())
     arena.caller_graphs = arena.caller_graphs or caller_graph
     if arena.caller_graphs and len(arena.threads) > 1 and not arena.warned and not arena.ordered:
@@ -933,7 +933,7 @@ def _note_thread(arena: _Arena, graph: str, caller_graph: bool = False) -> None:
             f"the arena of the plan of graph '{graph}' is used by a CUDA graph you captured (tilefish.run inside torch.cuda.graph) and from more than "
             "one thread: the replay of such a graph takes no lock of tilefish, so it can overlap an execution of the arena on another thread (wrong "
             "bytes, no error). Capture with tilefish.capture (its replays are ordered), replay your graphs with tilefish.runtime.replay_graph(graph), "
-            "or order them yourself (docs/plan-schema-1.md, section 10, item 7)",
+            "or order them yourself (docs/en/plan-schema-1.md, section 10, item 7)",
             TilefishOrderWarning,
             stacklevel=2,
         )
@@ -957,7 +957,7 @@ class PlanRunner:
     ) -> None:
         self.plan = plan
         self.provider = provider
-        self.instrumented = instrumented  # its binaries may record probes (docs/instrument.md): each bucket gets a probe region for them
+        self.instrumented = instrumented  # its binaries may record probes (docs/en/instrument.md): each bucket gets a probe region for them
         self._backend = backend
         self._doc = plan._doc
         self._buffers = {b["name"]: b for b in self._doc["buffers"]}
@@ -1859,7 +1859,7 @@ class CapturedPlan:
         self.probes: Any = None  # tilefish.capture(..., probes=): the recorder collect() reads the records into
 
     def collect(self, probes: Any = None) -> None:
-        """Read the records the last replay of an instrumented plan made (``tilefish.capture(..., probes=rec)``, ``docs/instrument.md``) into
+        """Read the records the last replay of an instrumented plan made (``tilefish.capture(..., probes=rec)``, ``docs/en/instrument.md``) into
         ``probes`` (default: the recorder given to the capture). Waits for the device to finish what was enqueued."""
         rec = probes if probes is not None else self.probes
         if rec is None or not self._call.probes:
@@ -2035,7 +2035,7 @@ def _replay_runner(graph: GraphOp, path: Any, pin: "str | None", trust_directory
     loaded = _plan.load_plan(p, graph, pin=pin, trust_directory=trust_directory, instrumented=instrumented)
     if instrumented and not loaded.manifest.instrumented:
         raise TilefishManifestError(
-            f"probes= replays the plan of an instrumented export (tilefish.runtime.export(graph, directory, instrument=True), docs/instrument.md), and "
+            f"probes= replays the plan of an instrumented export (tilefish.runtime.export(graph, directory, instrument=True), docs/en/instrument.md), and "
             f"the plan in {str(loaded.directory)!r} is of a production one, whose binaries record nothing"
         )
     runner = PlanRunner(loaded, ReplayProvider(loaded.manifest, pinned=pin is not None), instrumented=instrumented)
@@ -2274,7 +2274,7 @@ SHARED_ARENA_TAG = b"tilefish.shared-arena.v1\0"
 
 
 class SharedArena:
-    """Several plans that a host runs **one at a time** on **one arena** (``docs/plan-schema-1.md``, section 15.1): the plans of a set (stage A, then
+    """Several plans that a host runs **one at a time** on **one arena** (``docs/en/plan-schema-1.md``, section 15.1): the plans of a set (stage A, then
     B, then C of a request; a variable number of tile plans), which would otherwise each have an arena of their own.
 
     **The layout.** The arena has the bytes of the largest arena of the plans (``arena_bytes``: the largest ``arena_bytes`` of their documents), and
@@ -2405,7 +2405,7 @@ def share_arena(
     trust_directory: bool = False,
     name: "str | None" = None,
 ) -> SharedArena:
-    """The plans of ``graphs`` on **one arena** they share, run one at a time (:class:`SharedArena`; ``docs/plan-schema-1.md``, section 15.1).
+    """The plans of ``graphs`` on **one arena** they share, run one at a time (:class:`SharedArena`; ``docs/en/plan-schema-1.md``, section 15.1).
 
     ``replay``: the plans of the graphs in the plan set ``plan=<directory>``, verified with ``pin=`` (the set's digest) or ``trust_directory=True``, as
     :func:`tilefish.run` loads them. ``jit``: an item is a graph (its default plan) or a :class:`~tilefish._plan.Plan` that ``tilefish.plan`` made.
@@ -2433,7 +2433,7 @@ def share_arena(
 def replay_graph(graph: Any, stream: Any = None) -> None:
     """Replay a CUDA graph of the caller's (a ``torch.cuda.CUDAGraph`` in which ``tilefish.run`` of plans was captured) **ordered with every
     execution of those plans on any thread**: ``graph.replay()`` on ``stream`` (default: the current stream) under the lock of every arena such a
-    graph was captured on. Its event nodes order it on the device (``docs/plan-schema-1.md``, section 10, item 7), and the lock makes sure no
+    graph was captured on. Its event nodes order it on the device (``docs/en/plan-schema-1.md``, section 10, item 7), and the lock makes sure no
     execution of another thread is between its wait for the order event and its record while the graph is launched. A replay that bypasses this
     (``graph.replay()`` itself) is ordered only with what the thread that issues it does; ``tilefish.capture`` makes a graph whose own replay is
     ordered."""
@@ -2563,7 +2563,7 @@ def _build_callees(
 ) -> "tuple[list, list, list]":
     """Build (or pin) the binary of every ``(stem, callee)`` for ``sm_<cap>`` (``at``: take the callee's implementation of the architecture first);
     with ``trace``, keep every level of each compile and the trace items (:mod:`tilefish._trace`); with ``instrument``, the instrumented variant of
-    every Triton binary of an operator it covers (``docs/instrument.md``)."""
+    every Triton binary of an operator it covers (``docs/en/instrument.md``)."""
     from ._build import build
     from ._binary import build_binary
     from ._cute import build_cute
@@ -2679,7 +2679,7 @@ def export_graphs(
     instrument: Any = None,
 ) -> "_plan.PlanSet":
     """:func:`tilefish.runtime.export` of several graphs: a **plan set**, one manifest for all of them (each binary built once, whichever plans
-    launch it), ``<graph>.plan.json`` per graph and the index ``plans.json`` (``docs/plan-schema-1.md``, section 15). An item is a graph, or
+    launch it), ``<graph>.plan.json`` per graph and the index ``plans.json`` (``docs/en/plan-schema-1.md``, section 15). An item is a graph, or
     ``(graph, buckets)``; ``buckets=`` may map a graph's name to its buckets instead. Returns the :class:`~tilefish._plan.PlanSet` loaded back."""
     from ._build import parse_arch
 

@@ -1,7 +1,7 @@
 //! Launch plans read with no GPU: the golden plan directories of `python/tests/golden/plans` (written by `export_plan_fixtures.py`: the
 //! transformer block of `plan_model.py`, without and with reuse, with a real manifest of fake cubins: reader fixtures, which no GPU loads, since a
 //! driver refuses their cubins as an invalid image whatever architecture the documents name; the GPU gates export their own) load with their pins and give every
-//! number `expected.json` has; the digests are reproduced from the files; and every refusal of section 3 of `docs/plan-schema-1.md` (a wrong pin,
+//! number `expected.json` has; the digests are reproduced from the files; and every refusal of section 3 of `docs/en/plan-schema-1.md` (a wrong pin,
 //! an edit, an edit that rewrites the digest, a plan of another manifest, a manifest or a cubin changed under the plan) is a refusal here.
 //!
 //! `python_plans.json` (`tests/data`, written by `export_rust_vectors.py`) holds documents made from the golden plans by every mutation of
@@ -206,7 +206,7 @@ fn a_plan_set_verified_in_the_process_is_not_verified_again_while_it_is_alive() 
     assert!(e.to_string().contains("has sha256"), "{e}");
 }
 
-/// The arena the plans of the golden set share (`docs/plan-schema-1.md`, section 15.1): the largest `arena_bytes` of the plans, read from their
+/// The arena the plans of the golden set share (`docs/en/plan-schema-1.md`, section 15.1): the largest `arena_bytes` of the plans, read from their
 /// pinned files, as Python's `share_arena` has it (`expected.json`), for every subset; the documents are unchanged, so the set's pin still covers
 /// them; no plan, a plan given twice and a plan the set does not list are refused.
 #[test]
@@ -236,7 +236,7 @@ fn the_plans_of_the_golden_set_share_an_arena_of_the_largest_of_theirs() {
     assert!(e5.to_string().contains("'tiles1' is given twice"), "{e5}");
 }
 
-/// The golden plan set `carried` (`gpu_kernels_plans.CARRIED_SET`, `docs/plan-schema-1.md` section 15.2): plans whose carried buffers (role
+/// The golden plan set `carried` (`gpu_kernels_plans.CARRIED_SET`, `docs/en/plan-schema-1.md` section 15.2): plans whose carried buffers (role
 /// `carried`, offset `null`) the arena they share holds after the largest plan's region, a region per carried name in code point order, as
 /// Python's `carried_layout` has it (`expected.json`); a plan alone has its own carried regions after its own region.
 #[test]

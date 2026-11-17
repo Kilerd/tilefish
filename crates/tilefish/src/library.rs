@@ -1,5 +1,5 @@
 //! The `library` section of a manifest: operations that a vendor library runs, with no file. Today: a GEMM of bf16, f16 or f32 operands
-//! through cuBLASLt with the algorithm pinned (`docs/manifest-schema-3.md`, section 9).
+//! through cuBLASLt with the algorithm pinned (`docs/en/manifest-schema-3.md`, section 9).
 //!
 //! A port of `validate_entry` of `python/src/tilefish/_library.py`. An entry has exactly the fields of [`ENTRY_KEYS`], each of the type it
 //! needs, and the redundant ones must agree: the dtypes are two operands of one type (`bf16`, `f16` or `f32`) and a result of their type or
@@ -41,7 +41,7 @@ pub enum LibraryImpl {
     /// `cublaslt.gemm_bias`: the same with `bias[N]` added in f32 before the rounding (`CUBLASLT_EPILOGUE_BIAS`).
     GemmBias,
     /// `cublaslt.matmul`: the same with a cuBLASLt epilogue ([`LibraryEntry::epilogue`]) on the f32 accumulator, and `c[M, N]` added to it first
-    /// when [`LibraryEntry::beta`] is 1, before the one rounding (`docs/manifest-schema-3.md`, section 9.5).
+    /// when [`LibraryEntry::beta`] is 1, before the one rounding (`docs/en/manifest-schema-3.md`, section 9.5).
     Matmul,
 }
 
@@ -330,7 +330,7 @@ pub struct LibraryEntry {
     /// Which routine runs it.
     pub implementation: LibraryImpl,
     /// The type of `a` and `b` (`dtypes.a`): [`DType::Bf16`], [`DType::F16`] or [`DType::F32`] (multiplied as f32, TF32 off: the crate
-    /// refuses an algorithm that would not; `docs/manifest-schema-3.md`, section 9.2).
+    /// refuses an algorithm that would not; `docs/en/manifest-schema-3.md`, section 9.2).
     pub dtype: DType,
     /// The type of the result and of a bias (`dtypes.out`): `dtype`, or [`DType::F32`] (f32 for f32 operands).
     pub out_dtype: DType,
@@ -470,7 +470,7 @@ pub(crate) struct RawLibrary {
     cublaslt_version: Value,
     sm_count: Value,
     declaration_digest: String,
-    // present only when not the default, each with its one value (`docs/manifest-schema-3.md`, section 9); a JSON null is present (and refused)
+    // present only when not the default, each with its one value (`docs/en/manifest-schema-3.md`, section 9); a JSON null is present (and refused)
     #[serde(default, deserialize_with = "present")]
     heuristic: Option<Value>,
     #[serde(default, deserialize_with = "present")]

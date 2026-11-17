@@ -1,4 +1,4 @@
-"""Intra-kernel instrumentation (``tilefish._probe``, ``tilefish._probes``, ``docs/instrument.md``) on any machine: the PTX rewrite, the probe
+"""Intra-kernel instrumentation (``tilefish._probe``, ``tilefish._probes``, ``docs/en/instrument.md``) on any machine: the PTX rewrite, the probe
 table of the frontend's IR, the records and what they say, the trace file and ``tilefish-explain --probes``, a kernel body's probes and their
 lowering, and the instrumented variant (its manifest entry, its digest, the refusals of the hosts) with the fake compiler. The real thing, on a
 device: ``test_gpu_instrument.py``.

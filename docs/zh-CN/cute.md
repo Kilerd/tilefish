@@ -1,8 +1,8 @@
 # 作为 extern 的 CuTe DSL kernel
 
-[English](../cute.md) | **简体中文**
+[English](../en/cute.md) | **简体中文**
 
-CUTLASS 的 CuTe DSL（`nvidia-cutlass-dsl` 包，`import cutlass.cute as cute`）用 Python 编写带异步 MMA 流水线（TMA、`tcgen05`、warp（线程束）特化、cluster（线程块簇））的峰值性能 kernel（核函数）。tilefish 像对待任何其他 extern（外部 kernel）一样接纳这样的 kernel：按架构把它编译成 cubin，pin（固定）它，并从 Python、Rust 和 C ABI 启动它，可以是单次启动、启动 plan（计划）或 CUDA graph（CUDA 图），使用编译后 kernel 自带的启动属性（它的 grid、block、cluster、动态共享内存和 TMA 描述符）。manifest（清单）条目的规范见 `docs/manifest-schema-3.md` 第 4.9 节；代码在 `python/src/tilefish/_cute.py`。
+CUTLASS 的 CuTe DSL（`nvidia-cutlass-dsl` 包，`import cutlass.cute as cute`）用 Python 编写带异步 MMA 流水线（TMA、`tcgen05`、warp（线程束）特化、cluster（线程块簇））的峰值性能 kernel（核函数）。tilefish 像对待任何其他 extern（外部 kernel）一样接纳这样的 kernel：按架构把它编译成 cubin，pin（固定）它，并从 Python、Rust 和 C ABI 启动它，可以是单次启动、启动 plan（计划）或 CUDA graph（CUDA 图），使用编译后 kernel 自带的启动属性（它的 grid、block、cluster、动态共享内存和 TMA 描述符）。manifest（清单）条目的规范见 `docs/zh-CN/manifest-schema-3.md` 第 4.9 节；代码在 `python/src/tilefish/_cute.py`。
 
 目录：1 声明；2 如何构建；3 host（宿主）启动什么；4 身份、pin 与可复现性；5 限制；6 许可证；7 如何测试。
 
@@ -49,7 +49,7 @@ c = tilefish.run(gemm, a, b)  # a @ b.T, compiled by the DSL and launched by til
 2. **capture 启动，三次。** 在一个正被 capture 进 CUDA graph 的 stream 上调用编译后的 host 函数，因此 kernel 并不会运行；每次调用时每个张量都位于不同的地址。graph（计算图）必须恰好包含一个操作，即编译后 kernel 的一个 kernel 节点；tilefish 从中读取 grid、block、动态共享内存、cluster 及其调度策略、启动属性，以及每个 kernel 参数的字节（按 `cuFuncGetParamInfo` 给出的大小，必须与 PTX 入口函数的一致）。
 3. **构造 ABI**（`classify_params`）。kernel 读取的参数字节，就是它的 PTX 加载的那些字节（常量偏移处的 `ld.param`：`ld.param.v2.b8 {%rs2, %rs3}, [k_param_4+8]` 读取第 8 和第 9 字节）；如果代码以其他方式取参数的地址，则是整个参数（TMA 描述符，`cp.async.bulk.tensor` 通过其地址读取它）。kernel 读取的每个字节要么在三次 capture 中都相同，要么是算子某个张量的地址（一个对齐的 8 字节字，被整体读取，并在每次 capture 中都等于该张量的地址）。于是一个参数是 `pointer`（8 字节，一个张量的地址）、`tensormap`（128 字节、按 64 对齐，第一个字是一个张量的地址：DSL 的 host 代码为静态形状编码出的 TMA 描述符；其第 64 到 127 字节那段代码不写，因此不记录，并以零传入），或 `bytes`（常量：静态布局、空结构体、为该 bucket 编译的值、持久化 tile 调度器的快速除数）。kernel 不读取的字节（结构体的填充，host 函数让它保持在其栈上原来的样子）不参与比较，并以零传入，因此重新构建会写出同样的 manifest。其他任何情况都会被拒绝，并说明是什么情况：会变化但不是地址的字节（host 函数分配的指针、动态形状）、结构体内部的地址、出现在两个参数中或没有出现在任何参数中的张量、顺序与桩函数不同的张量。
 4. **检查启动。** 当 PTX 入口函数有 `.reqntid` 和 `.reqnctapercluster` 时，block 必须等于前者，cluster 必须等于后者；cluster 最多 8 个 CTA（线程块），调度策略为 spread（或默认），没有 programmatic dependent launch 或 cooperative launch，block 构成的 grid 必须是整数个 cluster（条目的 grid 以 cluster 计数，见 schema（模式）第 4.5 节），除动态共享内存大小外没有任何函数属性。
-5. **SASS 断言**（`sass=tilefish.sass(...)`）与预构建二进制文件一样，在 cubin 及其 PTX 上判定（`docs/explain.md`）；带 trace（追踪记录）的导出（`trace=True`）会保留 DSL 生成的 PTX 和 SASS（`trace/<stem>.<arch>/ptx.ptx`、`sass.txt`）。probe（探针）不可用（编译 kernel 的是 DSL，而不是 Triton）。
+5. **SASS 断言**（`sass=tilefish.sass(...)`）与预构建二进制文件一样，在 cubin 及其 PTX 上判定（`docs/zh-CN/explain.md`）；带 trace（追踪记录）的导出（`trace=True`）会保留 DSL 生成的 PTX 和 SASS（`trace/<stem>.<arch>/ptx.ptx`、`sass.txt`）。probe（探针）不可用（编译 kernel 的是 DSL，而不是 Triton）。
 
 在 sm_103 上用 nvidia-cutlass-dsl 4.8.1 实测（cu12 库：CUDA 13.4 的 NVVM，`ptxas` 12.9.83）：示例中的 tcgen05 GEMM 每个 bucket 编译约 0.25 秒，逐元素 kernel 更快。非持久化 GEMM 的 ABI 是一个 64 字节的常量和三个 TMA 描述符（A、B 和 C 的 TMA 存储），cluster 为 2 个 CTA，动态共享内存为 213 248 字节；持久化 GEMM 另外加上其 tile 调度器的四个快速除数（12 字节的结构体，最后 2 字节是 kernel 不读取的填充），它的 grid 是设备能同时运行的 cluster 数。
 

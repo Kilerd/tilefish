@@ -6,7 +6,7 @@ part that is specific to one manifest: one module with a struct per binary (per 
 takes the tensors by name, with the element type in the Rust type, so that a ``bf16`` tensor cannot be passed where an
 ``f32`` one is wanted, and whose doc comments carry what the manifest says of the binary.
 
-**Manifest schema 3.** Python writes manifest schema 3 (``docs/manifest-schema-3.md``) and the crate reads it, so the module launches
+**Manifest schema 3.** Python writes manifest schema 3 (``docs/en/manifest-schema-3.md``) and the crate reads it, so the module launches
 everything the manifest can describe:
 
 * a Triton kernel (``kind: "triton"``) and a prebuilt PTX or cubin (``kind: "binary"``): the same struct, wrapping ``Kernel``. A prebuilt
@@ -22,7 +22,7 @@ everything the manifest can describe:
   one, ``c`` when it has one (a ``cublaslt.matmul`` with ``beta=1``), ``out`` and a ``workspace`` (a ``u8`` tensor of at least
   ``workspace_required()`` bytes).
 
-It still **refuses** what is invalid, with the strictness of the crate's reader (``docs/manifest-schema-3.md``, section 10): ``fixed`` on a
+It still **refuses** what is invalid, with the strictness of the crate's reader (``docs/en/manifest-schema-3.md``, section 10): ``fixed`` on a
 Triton kernel, ``strides`` without ``offset`` or on a pointer that is written, a ``stride_of`` that no strided pointer owns, a fixed stride
 other than a ``1`` on the last axis, ``max_extent`` where it does not belong, and so on.
 
@@ -63,7 +63,7 @@ values, the grid, sizes, the fields of a library entry: each must be what it is 
 of its comment, an item, or a string literal into the generated file; and the doc comments are written a line at a time, with line breaks
 that a field might carry split into lines that are all comments.
 
-**Launch plans.** :func:`emit_plan` writes a typed runner of a ``plan.json`` (``docs/plan-schema-1.md``) for the crate's ``LaunchPlan`` and
+**Launch plans.** :func:`emit_plan` writes a typed runner of a ``plan.json`` (``docs/en/plan-schema-1.md``) for the crate's ``LaunchPlan`` and
 ``PlanRun``: a struct named after the graph whose ``load`` pins the plan (and so its manifest), and whose ``launch`` and ``capture`` take one field
 per external tensor, with its element type, and one per device scalar. It takes a pinned plan only, and validates every name that reaches the
 output, as :func:`emit` does.
@@ -654,7 +654,7 @@ def _validate_library_entry(entry: Any) -> None:
     arch = _name(who, "the architecture", entry.get("arch"), _ARCH)
     who = f"'{stem}' ({arch})"
     try:
-        validate_library_entry(entry)  # the fields, their types and the cross-field equalities of docs/manifest-schema-3.md, section 9
+        validate_library_entry(entry)  # the fields, their types and the cross-field equalities of docs/en/manifest-schema-3.md, section 9
     except TilefishManifestError as e:
         _bad(who, str(e))
     _name(who, "the operator", entry.get("op"))
@@ -1336,7 +1336,7 @@ def _doc_gemm(g: _Gemm) -> "list[str]":
     at = e["transb"] == "T"  # the layouts TT and NT: a is [k, m] and is transposed
     product = (f"{a}[{k}, {m}]^T @ " if at else f"{a}[{m}, {k}] @ ") + (f"{b}[{k}, {n}]" if nn else f"{b}[{n}, {k}]^T")
     lines.append("")
-    if matmul:  # the formula of the epilogue on the product (docs/manifest-schema-3.md, section 9.5), with the names of the launch
+    if matmul:  # the formula of the epilogue on the product (docs/en/manifest-schema-3.md, section 9.5), with the names of the launch
         x = product + (f" + {g.arg_names[g.params[2 + bias]['name']]}[{m}, {n}]" if with_c else "")
         if bias:
             x = (f"({x})" if with_c else x) + f" + {g.arg_names[g.params[2]['name']]}[{n}]"
@@ -1668,7 +1668,7 @@ def _trusted(manifest: Any, pin: "str | None") -> Manifest:
         return Manifest.load(manifest, pin=pin)
     if not isinstance(manifest, Manifest):
         raise TilefishManifestError(f"emit takes a manifest directory (with pin=) or a pinned Manifest, got {type(manifest).__name__}")
-    if manifest.instrumented:  # a diagnostic variant: the generated hosts are production code (docs/instrument.md)
+    if manifest.instrumented:  # a diagnostic variant: the generated hosts are production code (docs/en/instrument.md)
         raise TilefishManifestError(
             f"the manifest in {str(manifest.directory)!r} is an instrumented export, whose binaries record probes: generate a host from the production "
             "export (an instrumented one is collected with tilefish.run(..., probes=...) or the crate's Manifest::load_instrumented)"

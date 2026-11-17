@@ -1,4 +1,4 @@
-"""CuTe DSL kernels as externs: ``@tilefish.extern(cute=host, cute_args=..., cute_options=...)`` (``docs/cute.md``).
+"""CuTe DSL kernels as externs: ``@tilefish.extern(cute=host, cute_args=..., cute_options=...)`` (``docs/en/cute.md``).
 
 CUTLASS's CuTe DSL (the ``nvidia-cutlass-dsl`` package, ``import cutlass.cute as cute``) compiles a ``@cute.jit`` host function and the
 ``@cute.kernel`` it launches: Python to MLIR, MLIR to PTX with the NVVM it carries, PTX to a cubin with the ``ptxas`` it carries. The host function

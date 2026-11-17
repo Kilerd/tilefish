@@ -1,4 +1,4 @@
-"""Plan fusion (``docs/rfcs/0001-plan-fusion.md``, :mod:`tilefish._fusion`) without a GPU: how the arithmetic of a graph body becomes regions,
+"""Plan fusion (``docs/en/rfcs/0001-plan-fusion.md``, :mod:`tilefish._fusion`) without a GPU: how the arithmetic of a graph body becomes regions,
 each a kernel step of a generated kernel; what the regions read and write; the numerics rewrites; the fusion report; and what is refused.
 
 No ``from __future__ import annotations`` here: tilefish evaluates annotations at declaration.

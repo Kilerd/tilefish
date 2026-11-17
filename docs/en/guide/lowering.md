@@ -1,6 +1,6 @@
 # Masks, indices, gathers and copies
 
-**English** | [简体中文](../zh-CN/guide/lowering.md)
+**English** | [简体中文](../../zh-CN/guide/lowering.md)
 
 A lowered `@kernel` also compares, selects, counts positions, reduces to an index, and gathers and scatters rows at indices that are device
 data; a graph materialises a view or the patches of a convolution. Each has an exact numerics contract (notes 7 to 11 of `tilefish.lower`) and
@@ -55,7 +55,7 @@ def greedy(logits: Tensor[R, C, bf16]) -> Tensor[R, i64]:
 - **The CUDA math guard.** `expf`, `erff`, `tanhf` and the other functions those ops copy are not the same in every CUDA release (CUDA 13.2
   changed `erff`). The manifest entry of a generated kernel records the functions it uses, the releases tilefish measured each on, and the
   libdevice it linked (`cuda_math`); a run warns (`TilefishCudaMathWarning`) where torch is built with another release or a replay's process would
-  link another libdevice, and the Rust host refuses a release with `Manifest::check_cuda_math`. `docs/numerics.md` has the table and the procedure
+  link another libdevice, and the Rust host refuses a release with `Manifest::check_cuda_math`. `docs/en/numerics.md` has the table and the procedure
   to run on a CUDA or torch change (`pytest -m cuda_math`).
 - **Ordered sums.** `tilefish.sum(x, axis=-1, order=...)` adds in the order a CUDA kernel does: `order="sequential"` is one thread's loop from
   `+0.0`, `tilefish.tree(256)` is 256 threads over strided columns and a shared-memory halving tree, and

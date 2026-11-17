@@ -26,7 +26,7 @@ order), so every pin is verified when it is made (:func:`verify`, at ``jit`` and
 **The canary.** cuBLASLt exposes no build number (``tilefish._cublaslt.version``), so ``export`` records ``{"seed": s, "out_digest": d}``: the pin run
 on operands made of the seed on the device (:mod:`tilefish._canary`: ``a`` tag 0, ``b`` tag 1, ``bias`` tag 2, ``c`` tag 3, dense in their layouts),
 ``out`` and the workspace zeroed, and the digest of ``out``. A replay runs it once per process and device before the pin is used, and refuses a
-different digest; the crate's load does the same (``docs/manifest-schema-3.md``, section 9.5).
+different digest; the crate's load does the same (``docs/en/manifest-schema-3.md``, section 9.5).
 """
 
 from __future__ import annotations

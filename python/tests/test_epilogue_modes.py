@@ -1,4 +1,4 @@
-"""The three modes of ``epilogues=`` in one graph (``docs/rfcs/0003-epilogue-fusion.md``, "E1 and E2 together"), without a GPU: ``"exact"`` (the
+"""The three modes of ``epilogues=`` in one graph (``docs/en/rfcs/0003-epilogue-fusion.md``, "E1 and E2 together"), without a GPU: ``"exact"`` (the
 default: extern hooks through ``value="out"``), ``"accumulator"`` (E1: ``R_acc`` and ``value="acc"`` hooks; a cuBLASLt GEMM left as it is, with a
 note in the report) and ``"library"`` (E2: the cuBLASLt rewrite, and the extern hooks of ``"exact"``), per graph and per ``tilefish.fused`` scope, on
 a graph that calls both a cuBLASLt GEMM and an extern with both hooks. ``test_gpu_epilogue.py`` runs the mixed graph.

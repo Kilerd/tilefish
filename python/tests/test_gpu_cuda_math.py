@@ -1,4 +1,4 @@
-"""The CUDA math guard on a real GPU (``tilefish._cudamath``, ``docs/numerics.md``): its table, measured, and what an export and a replay do.
+"""The CUDA math guard on a real GPU (``tilefish._cudamath``, ``docs/en/numerics.md``): its table, measured, and what an export and a replay do.
 
 * **The table.** For every CUDA release whose NVRTC is here (torch's, and each ``libnvrtc.so`` that ``$TILEFISH_NVRTC_PATHS`` names, separated by
   ``:``), every function of :data:`tilefish._cudamath.VERIFIED`, compiled by that NVRTC with nvcc's defaults, is compared with the ops built on it over

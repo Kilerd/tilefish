@@ -213,7 +213,7 @@ fn null_and_invalid_arguments_are_refused() {
     assert!(last().1.contains("the GEMM"), "{}", last().1);
 }
 
-/// The epilogues of a GEMM (`tilefish_gemm_epilogue`, ABI 1.1): tilefish's own values, one per epilogue of `docs/manifest-schema-3.md`, section 9.5,
+/// The epilogues of a GEMM (`tilefish_gemm_epilogue`, ABI 1.1): tilefish's own values, one per epilogue of `docs/en/manifest-schema-3.md`, section 9.5,
 /// in its order (`tilefish::GemmEpilogue::ALL`).
 #[test]
 fn the_epilogues_of_a_gemm_have_values_of_their_own() {

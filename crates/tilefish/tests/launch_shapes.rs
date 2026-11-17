@@ -1,4 +1,4 @@
-//! Launch shapes (`docs/manifest-schema-3.md`, sections 4.3 to 4.6), read and checked with no GPU, on synthetic manifests (`common::synthetic`): a
+//! Launch shapes (`docs/en/manifest-schema-3.md`, sections 4.3 to 4.6), read and checked with no GPU, on synthetic manifests (`common::synthetic`): a
 //! grid that multiplies dimensions, a persistent grid (cut to the programs the SMs run), thread-block clusters (the grid counts clusters, a launch
 //! has the grid times the cluster in blocks, and the compile option says so) and a global scratch (the last tensor of a launch, held to the bytes
 //! the launch needs and the alignment every scratch is given at). The refusals are Python's (`python/tests/test_launch_shapes.py`), and every new

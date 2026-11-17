@@ -58,7 +58,7 @@ and to vet a pinned algorithm, ``cublasLtMatmulAlgoInit``, ``cublasLtMatmulAlgoC
   (:data:`TORCH_LT_WORKSPACE_BYTES` for ``addmm``, :data:`DEFAULT_WORKSPACE_BYTES` for ``mm``, which runs ``cublasGemmEx`` and
   is matched by this posture with its workspace) the heuristic answers what torch runs. For f32 operands with TF32 off ``mm`` runs
   ``cublasSgemm``, matched the same way, and ``addmm`` asks with no reduction-scheme mask, so the posture needs ``allow_f32_reduction=True``
-  (measured byte for byte, ``docs/manifest-schema-3.md``, section 9.2).
+  (measured byte for byte, ``docs/en/manifest-schema-3.md``, section 9.2).
 
 In both, the reduction-scheme mask lets split-K add its partial sums only in f32 (a bf16 or f16 partial sum rounds more than once),
 which is what torch does with ``allow_bf16_reduced_precision_reduction = False`` (``allow_fp16_reduced_precision_reduction`` for f16
@@ -93,7 +93,7 @@ its operands and result (``cublasLtMatmulAlgoInit`` writes them), so a pin of on
 **An SM count to target.** ``sm_count_target`` (``None``, or an int of at least :data:`MIN_SM_COUNT_TARGET`) sets
 ``CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET`` on the matmul descriptor of the heuristic, of the check and of the run alike: the heuristic then
 chooses for that many SMs (a partition of the device, a green context), not for the count the device reports. Measured with cuBLASLt 12.8.4
-on a B300 MIG slice of 30 SMs (``docs/manifest-schema-3.md``, section 9.3): every SM-count query reports the device's count in a green context,
+on a B300 MIG slice of 30 SMs (``docs/en/manifest-schema-3.md``, section 9.3): every SM-count query reports the device's count in a green context,
 and the heuristic's answers there depend on the context of the process's *first* ``cublasLtCreate``, not on an SM count; with a target ``T``
 the answers are the same in the primary context and in a green context of at least ``T`` SMs; a target of the device's count (or more)
 answers as no target; targets below 8 kill the process (``SIGFPE`` inside ``cublasLtMatmulAlgoGetHeuristic``), so they are refused; and what
@@ -184,7 +184,7 @@ CUBLASLT_EPILOGUE_DEFAULT = 1
 CUBLASLT_EPILOGUE_RELU = 2
 CUBLASLT_EPILOGUE_BIAS = 4
 CUBLASLT_EPILOGUE_RELU_BIAS = 6  # CUBLASLT_EPILOGUE_RELU | CUBLASLT_EPILOGUE_BIAS
-# The epilogues of the impl cublaslt.matmul, by tilefish's name (docs/manifest-schema-3.md, section 9.5); "none" is DEFAULT. Every one but "none" acts
+# The epilogues of the impl cublaslt.matmul, by tilefish's name (docs/en/manifest-schema-3.md, section 9.5); "none" is DEFAULT. Every one but "none" acts
 # on the f32 accumulator, before the one rounding to the type of D (the header says so).
 EPILOGUES = {"none": CUBLASLT_EPILOGUE_DEFAULT, "bias": CUBLASLT_EPILOGUE_BIAS, "relu": CUBLASLT_EPILOGUE_RELU, "relu_bias": CUBLASLT_EPILOGUE_RELU_BIAS}
 EPILOGUES_WITH_BIAS = ("bias", "relu_bias")
@@ -211,7 +211,7 @@ CUBLASLT_REDUCTION_SCHEME_OUTPUT_TYPE = 4
 # and an f32 accumulation allow; the same configuration without the bias, and without split-K, keep the bound). Not every such split-K
 # rounds twice (algorithm 66 with a split-K of 3, which torch's addmm runs for 32x1024x3072 with cuBLASLt 13.1.0 on sm_103, keeps the one
 # rounding: 28 of 32768 elements not the correctly rounded result, measured), but the rule holds for every algorithm: nothing in the
-# heuristic's answer tells the two apart, so the default posture keeps it and promises one rounding everywhere (docs/numerics.md, section 4).
+# heuristic's answer tells the two apart, so the default posture keeps it and promises one rounding everywhere (docs/en/numerics.md, section 4).
 REDUCTION_SCHEME_MASK = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE
 NO_SPLIT_K_MASK = 0
 ALLOWED_REDUCTION_SCHEMES = (CUBLASLT_REDUCTION_SCHEME_NONE, CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)
@@ -649,7 +649,7 @@ def version() -> int:
     This is all a pin is compared on: cuBLASLt exposes no build number. ``cublasLtGetVersion`` is ``major * 10000 + minor * 100 + patch``, and
     ``cublasLtGetProperty`` answers the same three (``MAJOR_VERSION``, ``MINOR_VERSION``, ``PATCH_LEVEL``; checked on 12.8.4, whose library has no
     other version or build entry point), so two builds of one version are not told apart. The library that ran the pin is the one torch maps, and a
-    different build of the same version is not refused by this check (``docs/manifest-schema-3.md``, section 9)."""
+    different build of the same version is not refused by this check (``docs/en/manifest-schema-3.md``, section 9)."""
     return int(_lib().cublasLtGetVersion())  # type: ignore[attr-defined]
 
 

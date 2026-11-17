@@ -1,4 +1,4 @@
-"""CuTe DSL kernels as externs on a real GPU (``@tilefish.extern(cute=...)``, ``docs/cute.md``), with public kernels of the CUTLASS examples.
+"""CuTe DSL kernels as externs on a real GPU (``@tilefish.extern(cute=...)``, ``docs/en/cute.md``), with public kernels of the CUTLASS examples.
 
 Needs, besides the ``gpu`` extra, the CuTe DSL (``nvidia-cutlass-dsl``) and ``TILEFISH_CUTLASS_EXAMPLES``, the ``examples/python/CuTeDSL`` directory of a
 CUTLASS checkout (``cute_kernels.py``); skipped otherwise. What is held:

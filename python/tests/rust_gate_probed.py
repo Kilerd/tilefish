@@ -1,4 +1,4 @@
-"""Kernels with probes (``tilefish.probe``, ``docs/instrument.md``) for the instrumented cases of the Rust gate (``rust_gate.py``: an instrumented export the
+"""Kernels with probes (``tilefish.probe``, ``docs/en/instrument.md``) for the instrumented cases of the Rust gate (``rust_gate.py``: an instrumented export the
 Rust host launches with a probe buffer, and an instrumented plan it runs with probes). Not collected: the name has no ``test_`` prefix.
 
 Written from scratch for these tests, and public. Importing this module imports Triton and its Gluon, so only the gate does.

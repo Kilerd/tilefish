@@ -1,4 +1,4 @@
-//! Instrumented exports read with no GPU (`docs/instrument.md`, manifest schema 3 section 4.8): the `instrument` of an entry is read only by
+//! Instrumented exports read with no GPU (`docs/en/instrument.md`, manifest schema 3 section 4.8): the `instrument` of an entry is read only by
 //! `Manifest::load_instrumented` and refused by `Manifest::load` and `Manifest::from_embedded`, malformed fields are refused with the rules of
 //! Python's `_probe.check_field` (`python/tests/test_instrument.py` has the same cases), only a Triton entry has one, the field is digested like
 //! every other, and the plans and plan sets of an instrumented export are refused unless loaded with `load_instrumented`.

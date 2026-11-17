@@ -1,4 +1,4 @@
-"""The CUDA math library a lowered kernel's bits reproduce, and the guard on it (``docs/numerics.md``; manifest schema 3, section 4.7).
+"""The CUDA math library a lowered kernel's bits reproduce, and the guard on it (``docs/en/numerics.md``; manifest schema 3, section 4.7).
 
 Some ops of a lowered kernel are, by their numerics contract, the bits of a function of CUDA's math library: in IEEE math ``exp`` and ``silu``
 are built on ``expf``, ``rsqrt`` is ``rsqrtf`` and ``erf`` is ``erff`` (inline PTX read from NVRTC), and in either math ``sin``, ``cos`` and
@@ -17,7 +17,7 @@ every CUDA release (CUDA 13.2 changed ``erff``), and libdevice is a file Triton 
   still the binary that was exported; what the warning says is that torch's ops, and the reference mode built on them, may not be its bits here.
   The Rust host refuses a mismatch with ``Manifest::check_cuda_math``.
 
-:data:`VERIFIED` is kept by the test procedure of ``docs/numerics.md`` (``pytest -m cuda_math``, with ``TILEFISH_NVRTC_PATHS`` naming the NVRTC
+:data:`VERIFIED` is kept by the test procedure of ``docs/en/numerics.md`` (``pytest -m cuda_math``, with ``TILEFISH_NVRTC_PATHS`` naming the NVRTC
 of each release): a release is listed for a function only when that function compiled by its NVRTC is the op's bits on every f32.
 """
 
@@ -214,7 +214,7 @@ def check(who: str, field: "Mapping[str, Any] | None", *, libdevice_here: "str |
         warnings.warn(
             f"{who}: its {', '.join(functions)} {'is' if len(functions) == 1 else 'are'} the bits of CUDA's math library on CUDA "
             f"{', '.join(field.get('cuda') or ()) or 'no release measured'}, and torch here is built with CUDA {release}: torch's own ops (and the "
-            "reference mode, which uses them) may not be the binary's bits. Re-run the CUDA math tests on this CUDA (docs/numerics.md)",
+            "reference mode, which uses them) may not be the binary's bits. Re-run the CUDA math tests on this CUDA (docs/en/numerics.md)",
             TilefishCudaMathWarning,
             stacklevel=3,
         )

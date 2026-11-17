@@ -1,4 +1,4 @@
-"""Kernels with probes (``tilefish.probe``) for the gpu tests of the instrumented variant (``docs/instrument.md``), not collected: the name has no
+"""Kernels with probes (``tilefish.probe``) for the gpu tests of the instrumented variant (``docs/en/instrument.md``), not collected: the name has no
 ``test_`` prefix. Written from scratch for these tests, and public. Importing this module imports Triton and its Gluon, so only the gpu tests do.
 No ``from __future__ import annotations``: tilefish evaluates annotations.
 

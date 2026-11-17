@@ -5,7 +5,7 @@
   another arena of the same plan does not wait for them: behind a stream that sleeps 600 ms before a run on arena ``lane0``, a run on ``lane1`` on
   another stream is done at once, and a run on ``lane0`` itself waits for the sleep. Runs on two arenas from two threads give their own bytes.
 * **A graph of the caller's.** ``tilefish.run`` inside ``torch.cuda.graph`` captures a graph whose ``replay()`` takes no lock of tilefish, so a run of the
-  same plan on another thread can overlap it (``docs/plan-schema-1.md``, section 10, item 7: 3 of 4 000 runs wrong on a B300). The second thread that
+  same plan on another thread can overlap it (``docs/en/plan-schema-1.md``, section 10, item 7: 3 of 4 000 runs wrong on a B300). The second thread that
   uses such an arena gets a ``TilefishOrderWarning``; replays through ``tilefish.runtime.replay_graph(g)`` take the arena's lock, and not one of the
   runs racing them is wrong.
 
