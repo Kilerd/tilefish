@@ -58,6 +58,9 @@ each section names the release that added it.
 - **Tests**: `test_cute_externs.py` (no GPU, no DSL), `test_gpu_cute.py` (the DSL and a CUTLASS checkout's examples in `TILEFISH_CUTLASS_EXAMPLES`), the
   cases of `cute_kernels.py` in the Rust and C++ gates, and the crate's strict-reading and packing tests. The examples are BSD-3-Clause and are not
   copied here; the DSL is NVIDIA software under its own licence, which tilefish neither ships nor depends on.
+- **Pin the DSL**: tilefish is tested with `nvidia-cutlass-dsl==4.8.1`; install that version and pin it where you export and replay (the DSL is in
+  beta; another version is another declaration, whose binaries a replay refuses). The cubins and PTX an export writes are the DSL's output: shipping
+  or redistributing them is the user's responsibility under NVIDIA's licence (`docs/cute.md`, section 6).
 - Messages that changed: the kinds an extern takes (`a kernel is one of triton=, gluon=, ptx=, cubin= and cute=`), the kinds of a parameter (`... given,
   null, tensormap or bytes`) and of a spec's `binary` (`'ptx', 'cubin' or 'cute'`).
 

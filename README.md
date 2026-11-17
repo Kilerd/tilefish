@@ -717,7 +717,9 @@ kernel does not run: the grid, block, cluster and dynamic shared memory, and eve
 the DSL encoded (a template the host writes the tensor's address into) or constant bytes, checked over three captures at other addresses. The entry is a
 `binary` entry of source `cute` (section 4.9 of the schema), pinned like any other; its identity is the PTX, which a Python replay compiles again. On a
 30-SM partition of an sm_103 GPU the persistent tcgen05 GEMM of the examples writes the bytes of the pinned cuBLASLt GEMM, and runs at 1.17x its speed at
-`4096 x 2048 x 1024` (0.92x at `M = 1024`).
+`4096 x 2048 x 1024` (0.92x at `M = 1024`). Install the DSL yourself at the tested version and pin it (`nvidia-cutlass-dsl==4.8.1`: it is in beta, and
+another version is another declaration). It is NVIDIA software under its own licence, which tilefish neither ships nor depends on, and the cubins
+and PTX an export writes are its output: shipping them is your responsibility (`docs/cute.md`, section 6).
 
 ## Masks, indices, gathers and copies
 

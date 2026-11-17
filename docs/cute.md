@@ -53,7 +53,8 @@ c = tilefish.run(gemm, a, b)  # a @ b.T, compiled by the DSL and launched by til
   ```
 
 The declaration reads the DSL's version (`importlib.metadata`) and the file of the host function; it imports neither the DSL nor torch. The DSL
-must be installed (`pip install nvidia-cutlass-dsl`: Linux or Windows, a driver of CUDA 12.9 or 13).
+must be installed, at the version tilefish is tested with: `pip install nvidia-cutlass-dsl==4.8.1` (Linux or Windows, a driver of CUDA 12.9 or 13).
+Pin it in the lock file of every environment that exports or replays (section 4): the DSL is in beta, and another version is another declaration.
 
 ## 2. How it is built
 
@@ -151,7 +152,8 @@ it was captured with, as it holds their addresses.
 
 The CuTe DSL is NVIDIA software under the NVIDIA Software License Agreement (a proprietary licence; it is in beta). tilefish does not ship it, depend
 on it, or import it unless a CuTe DSL kernel is declared; install it yourself and read its terms. The cubins and PTX an export writes are the DSL's
-output from your kernels: check the agreement before you redistribute them. The CUTLASS examples the tests use (`examples/python/CuTeDSL`, BSD-3-Clause)
+output from your kernels, and what you do with them is your responsibility: check the agreement before you ship or redistribute them (in a
+manifest directory, a package or an embedded host). The CUTLASS examples the tests use (`examples/python/CuTeDSL`, BSD-3-Clause)
 are not copied into this repository: the tests load them from a checkout (`TILEFISH_CUTLASS_EXAMPLES`).
 
 ## 7. How it is tested
