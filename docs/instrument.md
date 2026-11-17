@@ -1,5 +1,7 @@
 # Intra-kernel instrumentation: probes, the instrumented variant, timelines
 
+**English** | [简体中文](zh-CN/instrument.md)
+
 A sampling profiler attributes the time of an asynchronous `wgmma` or `tcgen05` MMA to the instructions that wait for it, and a warp-specialised or
 persistent kernel is one long launch to a timer outside it (`tilefish.profile_plan` times steps, `docs/advise.md`). What goes on inside such a kernel
 is best read from the kernel itself: timestamps taken where its author says a phase begins and ends. tilefish does that with
